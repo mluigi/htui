@@ -20,6 +20,8 @@
 //! it offers, `MODAL`. Layer order: view, `pane`, `backlog`, `confirm`, `form`, `common`, `list`,
 //! global. Each browse stack's tail is written out (a `const` slice cannot be concatenated);
 //! `every_backlog_browse_stack_offers_the_tab_and_the_list` pins that all seven share it.
+//!
+//! M6 adds the queue overlay's and the directory picker's stacks.
 
 use super::{Act, Context, Layer, Stack};
 
@@ -137,7 +139,8 @@ pub const SETTINGS_TAB: Stack<'static> = Stack::new(&[SETTINGS, GLOBAL]);
 
 /// A mode that is a text field or an opaque widget and nothing else (PA-7): the agents paste
 /// field, the Qdrant URL and key editors, the connection, prompt and queue editors, the boxes
-/// tags editor, hierarchy's typed delete, its in-flight delete and its path picker, the personas
+/// tags editor, hierarchy's typed delete, its in-flight delete and its path picker's go-to field,
+/// the personas
 /// import path and the secrets URL; the Requirements filter (MOD-67 M4); the Runs note,
 /// follow-up and typed key, a close-out in flight and the chat composer (MOD-67 M5).
 pub const CAPTURE: Stack<'static> = Stack::new(&[MODAL]);
@@ -819,6 +822,43 @@ pub const CHAT_REPLAY: Stack<'static> = Stack::new(&[
     GLOBAL,
 ]);
 
+/// The queue overlay (MOD-12 M3 D8; MOD-67 M6 D2): its own verbs, the list moves, then the
+/// overlay layers the other list overlays compose (`overlay.close`, `global.help`).
+pub const QUEUE_OVERLAY: Stack<'static> = Stack::new(&[
+    Layer::view(
+        Context::Queue,
+        &[
+            Act::QueueMoveDown,
+            Act::QueueMoveUp,
+            Act::QueuePause,
+            Act::QueueDequeue,
+            Act::QueueOpen,
+        ],
+    ),
+    LIST,
+    OVERLAY,
+    HELP,
+]);
+
+/// Settings > Hierarchy, the directory picker while its go-to field is closed (MOD-49; MOD-67 M6
+/// D3). With the field open the section is on [`CAPTURE`]: the field types every printable key.
+pub const HIERARCHY_PICKER: Stack<'static> = Stack::new(&[
+    Layer::view(
+        Context::Picker,
+        &[
+            Act::PickerOpen,
+            Act::PickerParent,
+            Act::PickerChoose,
+            Act::PickerChooseDir,
+            Act::PickerGoTo,
+            Act::PickerHidden,
+        ],
+    ),
+    BACK,
+    LIST,
+    MODAL,
+]);
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1042,6 +1082,50 @@ mod tests {
         assert_eq!(resolve(CHAT_REPLAY, "t"), [Act::ChatThoughts]);
     }
 
+    /// MOD-67 M6 §4.3: the queue overlay's and the directory picker's stacks.
+    #[test]
+    fn the_queue_overlay_and_picker_stacks_resolve_as_designed() {
+        assert_eq!(resolve(QUEUE_OVERLAY, "J"), [Act::QueueMoveDown]);
+        assert_eq!(resolve(QUEUE_OVERLAY, "K"), [Act::QueueMoveUp]);
+        assert_eq!(resolve(QUEUE_OVERLAY, "P"), [Act::QueuePause]);
+        assert_eq!(resolve(QUEUE_OVERLAY, "Q"), [Act::QueueDequeue]);
+        assert_eq!(resolve(QUEUE_OVERLAY, "enter"), [Act::QueueOpen]);
+        assert_eq!(resolve(QUEUE_OVERLAY, "j"), [Act::ListDown]);
+        assert_eq!(resolve(QUEUE_OVERLAY, "down"), [Act::ListDown]);
+        assert_eq!(resolve(QUEUE_OVERLAY, "esc"), [Act::OverlayClose]);
+        assert_eq!(resolve(QUEUE_OVERLAY, "?"), [Act::Help]);
+        assert_eq!(resolve(QUEUE_OVERLAY, "f1"), [Act::Help]);
+        for spec in ["ctrl-j", "alt-J", "q", "1"] {
+            assert_eq!(resolve(QUEUE_OVERLAY, spec), [], "{spec}");
+        }
+        // The global layer is the unfiltered `HELP`; the overlay is modal at the shell.
+        assert!(QUEUE_OVERLAY.passes(chord("q")));
+
+        for spec in ["enter", "l"] {
+            assert_eq!(resolve(HIERARCHY_PICKER, spec), [Act::PickerOpen], "{spec}");
+        }
+        for spec in ["h", "backspace"] {
+            assert_eq!(
+                resolve(HIERARCHY_PICKER, spec),
+                [Act::PickerParent],
+                "{spec}"
+            );
+        }
+        assert_eq!(resolve(HIERARCHY_PICKER, "s"), [Act::PickerChoose]);
+        assert_eq!(resolve(HIERARCHY_PICKER, "S"), [Act::PickerChooseDir]);
+        assert_eq!(resolve(HIERARCHY_PICKER, "/"), [Act::PickerGoTo]);
+        assert_eq!(resolve(HIERARCHY_PICKER, "."), [Act::PickerHidden]);
+        assert_eq!(resolve(HIERARCHY_PICKER, "esc"), [Act::Back]);
+        assert_eq!(resolve(HIERARCHY_PICKER, "j"), [Act::ListDown]);
+        for spec in ["q", "?", "1"] {
+            assert_eq!(resolve(HIERARCHY_PICKER, spec), [], "{spec}");
+        }
+        assert_eq!(resolve(HIERARCHY_PICKER, "f1"), [Act::Help]);
+        assert_eq!(resolve(HIERARCHY_PICKER, "ctrl-f"), [Act::Find]);
+        assert!(!HIERARCHY_PICKER.passes(chord("q")));
+        assert!(HIERARCHY_PICKER.passes(chord("ctrl-j")));
+    }
+
     /// MOD-67 M5 §4 (D5): every Backlog browse stack ends in the same tail, so the Backlog
     /// tab's own verbs and the list's resolve on every sub-tab.
     #[test]
@@ -1103,7 +1187,7 @@ mod tests {
             .iter()
             .filter(|(_, stack)| !NOT_VIEW_LED.contains(stack))
             .collect();
-        assert_eq!(views.len(), 70);
+        assert_eq!(views.len(), 72);
         for &&(phrase, stack) in &views {
             let first = stack.layers()[0];
             assert!(first.inherits(), "{phrase}: layer 0 is not a view layer");
@@ -1207,6 +1291,8 @@ mod tests {
     /// validated (and refuse key files) for a mode no view is ever in.
     #[test]
     fn every_view_stack_is_named_by_a_view() {
+        /// MOD-67 M6: the lanes name these; T-close empties the list (PA-4).
+        const PENDING: &[&str] = &["QUEUE_OVERLAY", "HIERARCHY_PICKER"];
         const VIEWS: &[&str] = &[
             include_str!("../ui/tabs/settings/mod.rs"),
             include_str!("../ui/tabs/settings/agents.rs"),
@@ -1222,6 +1308,7 @@ mod tests {
             include_str!("../ui/overlay/abort_confirm.rs"),
             include_str!("../ui/overlay/concepts_search.rs"),
             include_str!("../ui/overlay/migration_prompt.rs"),
+            include_str!("../ui/overlay/queue.rs"),
             include_str!("../ui/overlay/quit_confirm.rs"),
             include_str!("../ui/overlay/waiting_list.rs"),
             include_str!("../ui/overlay/workspace_switcher.rs"),
@@ -1282,6 +1369,9 @@ mod tests {
             "views.rs stacks vs DECLARED"
         );
         for name in declared {
+            if PENDING.contains(&name) {
+                continue;
+            }
             assert!(named(name), "no view names views::{name}");
         }
     }

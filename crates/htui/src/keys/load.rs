@@ -1073,6 +1073,31 @@ quit = ["x", "shift-a"]
         );
     }
 
+    /// MOD-67 M6 §4.1: `[queue]` and `[picker]` rebind their views' own verbs, and `[picker]`
+    /// lists what it has and may override (the plan's `cancel` is `common.back`, PA-10).
+    #[test]
+    fn a_queue_or_picker_table_rebinds_its_view() {
+        let keys = load_str("[queue]\nmove_down = \"D\"\n").expect("loads");
+        assert_eq!(
+            keys.actions(views::QUEUE_OVERLAY, chord("D")),
+            [Act::QueueMoveDown]
+        );
+        assert_eq!(keys.actions(views::QUEUE_OVERLAY, chord("J")), []);
+        let keys = load_str("[picker]\nopen = \"o\"\n").expect("loads");
+        assert_eq!(
+            keys.actions(views::HIERARCHY_PICKER, chord("o")),
+            [Act::PickerOpen]
+        );
+        assert_eq!(
+            errors("[picker]\ncancel = \"c\"\n"),
+            one(
+                2,
+                "[picker] cancel: no such action; [picker] has open, parent, choose, choose_dir, \
+                 go_to, hidden, and may override down, up, back"
+            )
+        );
+    }
+
     /// MOD-67 M4 §3.1: `[skills.library]` overrides a `[skills]` verb in the Library alone;
     /// `[skills.templates]` lists what it has and may override.
     #[test]

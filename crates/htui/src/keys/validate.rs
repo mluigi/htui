@@ -688,13 +688,22 @@ mod tests {
     }
 
     /// PA-2: the allow-list is per chord. `esc` is a default of both `back` and `dismiss`, so
-    /// adding `backspace` to `back` keeps that share allowed, and `dismiss` keeps `esc`; a chord
-    /// the user gives both is not.
+    /// adding `f2` to `back` keeps that share allowed, and `dismiss` keeps `esc`; a chord the user
+    /// gives both is not.
     #[test]
     fn a_state_guarded_pair_is_allowed_only_on_a_chord_both_have_by_default() {
-        assert_eq!(errors("[common]\nback = [\"esc\", \"backspace\"]\n"), []);
-        let keys = load_str("[common]\nback = [\"esc\", \"backspace\"]\n").expect("loads");
+        assert_eq!(errors("[common]\nback = [\"esc\", \"f2\"]\n"), []);
+        let keys = load_str("[common]\nback = [\"esc\", \"f2\"]\n").expect("loads");
         assert_eq!(keys.chords(Context::Common, Act::Dismiss), [chord("esc")]);
+        // MOD-67 M6: `backspace` (this test's chord before M6) is the directory picker's
+        // `picker.parent`, which offers `common.back` too.
+        assert_eq!(
+            errors("[common]\nback = [\"esc\", \"backspace\"]\n"),
+            one(
+                2,
+                r#"[common] back = "backspace": "backspace" is already picker.parent (default) in the Hierarchy directory picker"#
+            )
+        );
         assert_eq!(
             errors("[common]\ndismiss = [\"z\"]\nback = [\"z\"]\n"),
             one(
@@ -872,11 +881,12 @@ mod tests {
             fixed("prev_row", "left")
         );
         // A shared act the form offers is refused there too, once, naming the first stack.
+        // MOD-67 M6: the first declared stack that keeps the key fixed.
         assert_eq!(
             errors("[form]\nnext_field = [\"tab\", \"right\"]\n"),
             one(
                 2,
-                r#"[form] next_field = "right": "right" is fixed in the Backlog filter form"#
+                r#"[form] next_field = "right": "right" is fixed in a Requirements form"#
             )
         );
     }
@@ -885,9 +895,13 @@ mod tests {
     /// Runs close-out warning keeps its resolution keys.
     #[test]
     fn a_rebind_onto_an_item_form_or_runs_question_fixed_key_is_refused() {
+        // MOD-67 M6: the first declared stack that keeps the key fixed.
         assert_eq!(
             errors("[form]\nsave = [\"ctrl-s\", \"esc\"]\n"),
-            one(2, r#"[form] save = "esc": "esc" is fixed in the item form"#)
+            one(
+                2,
+                r#"[form] save = "esc": "esc" is fixed in the Attachments form"#
+            )
         );
         assert_eq!(
             errors("[backlog.runs]\nyes = [\"y\", \"right\"]\n"),
@@ -916,11 +930,12 @@ mod tests {
                 r#"[backlog.filter_form] next_row = "shift-right": "shift-right" is fixed in the Backlog filter form"#
             )
         );
+        // MOD-67 M6: the first declared stack that keeps the key fixed.
         assert_eq!(
             errors("[form]\nsave = [\"ctrl-s\", \"shift-left\"]\n"),
             one(
                 2,
-                r#"[form] save = "shift-left": "shift-left" is fixed in the item form"#
+                r#"[form] save = "shift-left": "shift-left" is fixed in a Requirements form"#
             )
         );
         assert_eq!(
@@ -934,6 +949,33 @@ mod tests {
         assert_eq!(
             errors("[backlog.filter_form]\nclear = [\"x\", \"shift-up\"]\n"),
             []
+        );
+    }
+
+    /// MOD-67 M6 D5: the Requirements forms' priority keys and the Attachments form's activation
+    /// keys are matched ahead of the resolver, so no act of their stacks may take one.
+    #[test]
+    fn a_rebind_onto_a_requirements_priority_or_attachment_key_is_refused() {
+        assert_eq!(
+            errors("[requirements]\nnext_field = [\"tab\", \"right\"]\n"),
+            one(
+                2,
+                r#"[requirements] next_field = "right": "right" is fixed in a Requirements form"#
+            )
+        );
+        assert_eq!(
+            errors("[form]\nnext_field = [\"tab\", \"enter\"]\n"),
+            one(
+                2,
+                r#"[form] next_field = "enter": "enter" is fixed in the Attachments form"#
+            )
+        );
+        assert_eq!(
+            errors("[form]\nsave = [\"ctrl-s\", \"left\"]\n"),
+            one(
+                2,
+                r#"[form] save = "left": "left" is fixed in a Requirements form"#
+            )
         );
     }
 
