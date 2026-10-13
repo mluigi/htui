@@ -16,7 +16,7 @@
 
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{ErrorKind, Write as _};
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Map, Value};
@@ -399,18 +399,31 @@ fn fill(root: &Path, files: &[(&str, String)]) -> Result<(), EmitExit> {
     Ok(())
 }
 
-/// Writes the plugin into `dir`: stages it in a sibling `<dir>.emit-<pid>`, then renames it into
-/// place (D4). With `force`, an earlier emit is moved aside to `<dir>.old-<pid>` first, and
-/// removed once the new tree is in place. Nothing outside `dir`, those two siblings and `dir`'s
-/// missing parents is written.
+/// A rename, a parameter so that a test can fail one (F5): [`write_to`] passes `fs::rename`.
+type Rename<'a> = &'a dyn Fn(&Path, &Path) -> std::io::Result<()>;
+
+/// A target [`prepare`] found `emit` may write: what [`install`] needs, nothing written yet.
+#[derive(Debug)]
+struct Prepared {
+    /// The target, absolute and plain ([`target_path`]).
+    dir: PathBuf,
+    /// Its last component.
+    name: std::ffi::OsString,
+    /// Its parent.
+    parent: PathBuf,
+    /// How the staged tree goes into place.
+    install: Install,
+}
+
+/// Normalises `dir` and classifies it (D4), touching nothing: every refusal comes from here, so
+/// [`run`] gives it before it runs `claude --version`.
 ///
 /// # Errors
 ///
 /// [`EmitExit::Refused`] for a target `emit` did not write (even with `force`), a file, a path
-/// naming no directory, or an earlier emit without `force`; nothing is touched then.
-/// [`EmitExit::Failed`] when a directory cannot be read, made or renamed, or a file cannot be
-/// written; the staging directory is removed, and a moved-aside emit is put back.
-pub fn write_to(dir: &Path, options: &Options) -> Result<Report, EmitExit> {
+/// naming no directory, with a `..` or not UTF-8, or an earlier emit without `force`;
+/// [`EmitExit::Failed`] when the target cannot be read.
+fn prepare(dir: &Path, force: bool) -> Result<Prepared, EmitExit> {
     let dir = target_path(dir)?;
     let (Some(name), Some(parent)) = (dir.file_name(), dir.parent()) else {
         return Err(EmitExit::Refused(format!(
@@ -418,10 +431,11 @@ pub fn write_to(dir: &Path, options: &Options) -> Result<Report, EmitExit> {
             dir.display()
         )));
     };
+    let (name, parent) = (name.to_os_string(), parent.to_path_buf());
     let install = match classify(&dir)? {
         Target::Absent => Install::Create,
         Target::Empty => Install::FillEmpty,
-        Target::Ours if options.force => Install::Replace,
+        Target::Ours if force => Install::Replace,
         Target::Ours => {
             return Err(EmitExit::Refused(format!(
                 "{} already holds the htui plugin; pass --force to replace it",
@@ -442,12 +456,36 @@ pub fn write_to(dir: &Path, options: &Options) -> Result<Report, EmitExit> {
             )));
         }
     };
-    let files = files_for(options.variant)?;
-    fs::create_dir_all(parent).map_err(|error| {
+    Ok(Prepared {
+        dir,
+        name,
+        parent,
+        install,
+    })
+}
+
+/// Writes `variant` into the prepared target: stages it in a sibling `<dir>.emit-<pid>`, then
+/// moves it into place with `rename` (D4). An earlier emit is moved aside to `<dir>.old-<pid>`
+/// first, and removed once the new tree is in place.
+///
+/// # Errors
+///
+/// [`EmitExit::Failed`] when a directory cannot be made or renamed, or a file cannot be written.
+/// The staging directory is removed, a moved-aside emit is put back (or the sentence names where
+/// it is), and an emptied target is made again.
+fn install(prepared: Prepared, variant: Variant, rename: Rename<'_>) -> Result<Report, EmitExit> {
+    let Prepared {
+        dir,
+        name,
+        parent,
+        install,
+    } = prepared;
+    let files = files_for(variant)?;
+    fs::create_dir_all(&parent).map_err(|error| {
         EmitExit::Failed(format!("cannot create {}: {error}", parent.display()))
     })?;
     // `create_dir`, not `_all`: a path already there fails, and nothing is touched.
-    let staging = sibling(parent, name, "emit");
+    let staging = sibling(&parent, &name, "emit");
     fs::create_dir(&staging).map_err(|error| {
         EmitExit::Failed(format!("cannot create {}: {error}", staging.display()))
     })?;
@@ -466,16 +504,20 @@ pub fn write_to(dir: &Path, options: &Options) -> Result<Report, EmitExit> {
 
     let mut leftover = None;
     match install {
-        Install::Create => fs::rename(&staging, &dir)
+        Install::Create => rename(&staging, &dir)
             .map_err(into_place)
             .map_err(discard)?,
-        Install::FillEmpty => fs::remove_dir(&dir)
-            .and_then(|()| fs::rename(&staging, &dir))
-            .map_err(into_place)
-            .map_err(discard)?,
+        Install::FillEmpty => {
+            fs::remove_dir(&dir).map_err(into_place).map_err(discard)?;
+            if let Err(error) = rename(&staging, &dir) {
+                // Best effort: the empty directory the person made is there again.
+                let _ = fs::create_dir(&dir);
+                return Err(discard(into_place(error)));
+            }
+        }
         Install::Replace => {
-            let old = sibling(parent, name, "old");
-            fs::rename(&dir, &old)
+            let old = sibling(&parent, &name, "old");
+            rename(&dir, &old)
                 .map_err(|error| {
                     EmitExit::Failed(format!(
                         "cannot move {} aside to {}: {error}",
@@ -484,9 +526,9 @@ pub fn write_to(dir: &Path, options: &Options) -> Result<Report, EmitExit> {
                     ))
                 })
                 .map_err(discard)?;
-            if let Err(error) = fs::rename(&staging, &dir) {
+            if let Err(error) = rename(&staging, &dir) {
                 let mut sentence = into_place(error).to_string();
-                if let Err(back) = fs::rename(&old, &dir) {
+                if let Err(back) = rename(&old, &dir) {
                     sentence.push_str(&format!(
                         "; putting it back failed too ({back}): the previous plugin is at {}",
                         old.display()
@@ -501,10 +543,28 @@ pub fn write_to(dir: &Path, options: &Options) -> Result<Report, EmitExit> {
     }
     Ok(Report {
         dir,
-        variant: options.variant,
+        variant,
         replaced: install == Install::Replace,
         leftover,
     })
+}
+
+/// Writes the plugin into `dir`: [`prepare`], then [`install`] with `fs::rename`. Nothing outside
+/// `dir`, its siblings `<dir>.emit-<pid>` and `<dir>.old-<pid>`, and `dir`'s missing parents is
+/// written.
+///
+/// # Errors
+///
+/// [`EmitExit::Refused`] for a target `emit` may not write (even with `force`), a file, a path
+/// naming no directory, with a `..` or not UTF-8, or an earlier emit without `force`; nothing is
+/// touched then. [`EmitExit::Failed`] when a directory cannot be read, made or renamed, or a file
+/// cannot be written; the staging directory is removed, and a moved-aside emit is put back.
+pub fn write_to(dir: &Path, options: &Options) -> Result<Report, EmitExit> {
+    install(
+        prepare(dir, options.force)?,
+        options.variant,
+        &|from, to| fs::rename(from, to),
+    )
 }
 
 /// `<local data dir>/htui/claude-plugin` (`~/.local/share/htui/claude-plugin` on Linux), the
@@ -575,35 +635,45 @@ pub fn render(report: &Report, check: &ClaudeCheck) -> String {
     out
 }
 
-/// `htui claude emit`: picks the directory, checks `claude`'s version, writes, and prints the
-/// report.
+/// `htui claude emit`: picks the directory, checks it, then checks `claude`'s version, writes,
+/// and prints the report.
 ///
 /// # Errors
 ///
-/// [`EmitExit::Refused`] when there is no `--dir` and no local data directory, or [`write_to`]
-/// refuses; [`EmitExit::Failed`] when it fails or stdout fails (a closed pipe excepted).
+/// [`EmitExit::Refused`] when there is no `--dir` and no local data directory, or the target is
+/// refused (before `claude` runs); [`EmitExit::Failed`] when the write fails or stdout fails (a
+/// closed pipe excepted).
 pub async fn run(args: cli::EmitArgs) -> Result<(), EmitExit> {
+    run_with(args, probe_claude, &mut std::io::stdout()).await
+}
+
+/// [`run`] with its version probe and its stdout given (F4, V-stdout).
+async fn run_with<Probe, Checked>(
+    args: cli::EmitArgs,
+    probe: Probe,
+    out: &mut impl std::io::Write,
+) -> Result<(), EmitExit>
+where
+    Probe: FnOnce() -> Checked,
+    Checked: Future<Output = ClaudeCheck>,
+{
     let Some(dir) = args.dir.or_else(default_dir) else {
         return Err(EmitExit::Refused(
             "this machine has no local data directory; pass --dir PATH".to_owned(),
         ));
     };
-    let check = probe_claude().await;
-    let report = write_to(
-        &dir,
-        &Options {
-            force: args.force,
-            variant: check.variant(),
-        },
-    )?;
-    let mut stdout = std::io::stdout().lock();
-    match stdout
+    // Every refusal before `claude --version` runs.
+    let prepared = prepare(&dir, args.force)?;
+    let check = probe().await;
+    let report = install(prepared, check.variant(), &|from, to| fs::rename(from, to))?;
+    match out
         .write_all(render(&report, &check).as_bytes())
-        .and_then(|()| stdout.flush())
+        .and_then(|()| out.flush())
     {
-        Err(error) if error.kind() != ErrorKind::BrokenPipe => {
-            Err(EmitExit::Failed(format!("cannot write to stdout: {error}")))
-        }
+        Err(error) if error.kind() != ErrorKind::BrokenPipe => Err(EmitExit::Failed(format!(
+            "the plugin was written to {}; cannot write to stdout: {error}",
+            report.dir.display()
+        ))),
         _ => Ok(()),
     }
 }
@@ -638,8 +708,9 @@ mod tests {
     use super::{
         CLAUDE_FLOOR, CLAUDE_VERSION_PATTERN, ClaudeCheck, EmitExit, FILES, Options, PLUGIN_JSON,
         Report, SOURCE_VERSION, VERSION, VERSION_TS, VERSION_TS_LITERAL, Variant, default_dir,
-        files_for, render, write_to,
+        files_for, install, prepare, render, run_with, write_to,
     };
+    use crate::cli::EmitArgs;
 
     /// The source tree the table embeds.
     const SOURCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/claude-plugin");
@@ -1190,6 +1261,204 @@ mod tests {
             assert!(dir.ends_with("htui/claude-plugin"), "{}", dir.display());
             assert!(dir.is_absolute(), "{}", dir.display());
         }
+    }
+
+    /// `<root>/plugin.<kind>-<pid>`, a sibling `emit` makes beside `<root>/plugin`.
+    fn sibling_of(root: &Path, kind: &str) -> std::path::PathBuf {
+        root.join(format!("plugin.{kind}-{}", std::process::id()))
+    }
+
+    /// The failure's sentence; panics on anything else.
+    fn failure<T: core::fmt::Debug>(outcome: Result<T, EmitExit>) -> String {
+        match outcome {
+            Err(EmitExit::Failed(sentence)) => sentence,
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    /// `htui claude emit --dir <dir> [--force]`, run with a probe answering `check` that counts
+    /// its calls, printing into `out`. The outcome and how often `claude` was probed.
+    fn run_counted(
+        dir: &Path,
+        force: bool,
+        out: &mut impl std::io::Write,
+    ) -> (Result<(), EmitExit>, usize) {
+        let probed = std::cell::Cell::new(0);
+        let outcome = futures::executor::block_on(run_with(
+            EmitArgs {
+                dir: Some(dir.to_path_buf()),
+                force,
+            },
+            || {
+                probed.set(probed.get() + 1);
+                async { ClaudeCheck::Met("2.1.296".to_owned()) }
+            },
+            out,
+        ));
+        (outcome, probed.get())
+    }
+
+    /// F4: every refusal returns before `claude --version` runs; a write runs it once and prints
+    /// the report.
+    #[test]
+    fn a_refusal_returns_before_claude_is_probed() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let file = root.path().join("file");
+        std::fs::write(&file, "mine\n").expect("the file");
+        let ours = root.path().join("ours");
+        emit(&ours, false, Variant::WithMod).expect("an earlier emit");
+        let foreign_dir = root.path().join("foreign");
+        std::fs::create_dir(&foreign_dir).expect("the foreign dir");
+        std::fs::write(foreign_dir.join("notes.txt"), "mine\n").expect("the foreign file");
+        let up = root.path().join("a").join("..").join("b");
+        for (dir, force) in [
+            (&file, true),
+            (&ours, false),
+            (&foreign_dir, true),
+            (&up, false),
+        ] {
+            let mut out = Vec::new();
+            let (outcome, probed) = run_counted(dir, force, &mut out);
+            assert!(
+                matches!(outcome, Err(EmitExit::Refused(_))),
+                "{}: {outcome:?}",
+                dir.display()
+            );
+            assert_eq!(probed, 0, "{}: claude was probed", dir.display());
+            assert!(out.is_empty(), "{}", dir.display());
+        }
+
+        let dir = root.path().join("fresh");
+        let mut out = Vec::new();
+        let (outcome, probed) = run_counted(&dir, false, &mut out);
+        outcome.expect("the emit succeeds");
+        assert_eq!(probed, 1);
+        let expected = render(
+            &Report {
+                dir: dir.clone(),
+                variant: Variant::WithMod,
+                replaced: false,
+                leftover: None,
+            },
+            &ClaudeCheck::Met("2.1.296".to_owned()),
+        );
+        assert_eq!(String::from_utf8(out).expect("UTF-8"), expected);
+    }
+
+    /// Fails every write with `kind`.
+    struct Broken(std::io::ErrorKind);
+
+    impl std::io::Write for Broken {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(self.0, "stdout is gone"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(self.0, "stdout is gone"))
+        }
+    }
+
+    /// V-stdout: stdout failing after the write still says where the plugin went; a closed pipe
+    /// is no failure.
+    #[test]
+    fn a_stdout_failure_after_the_write_names_the_written_dir() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let dir = root.path().join("plugin");
+        let (outcome, _) = run_counted(&dir, false, &mut Broken(std::io::ErrorKind::Other));
+        assert_eq!(
+            failure(outcome),
+            format!(
+                "the plugin was written to {}; cannot write to stdout: stdout is gone",
+                dir.display()
+            )
+        );
+        assert_eq!(files_of(&dir), written_files(Variant::WithMod));
+
+        let (outcome, _) = run_counted(&dir, true, &mut Broken(std::io::ErrorKind::BrokenPipe));
+        outcome.expect("a closed pipe is no failure");
+    }
+
+    /// F5: when the new tree cannot be renamed into place, the earlier emit is put back byte for
+    /// byte and neither sibling is left.
+    #[test]
+    fn a_failed_swap_puts_the_old_copy_back_byte_for_byte() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let dir = root.path().join("plugin");
+        emit(&dir, false, Variant::WithMod).expect("the first emit");
+        let before = tree(&dir);
+        let staging = sibling_of(root.path(), "emit");
+        let prepared = prepare(&dir, true).expect("an earlier emit with --force");
+        let sentence = failure(install(prepared, Variant::SkillOnly, &|from, to| {
+            if from == staging {
+                return Err(std::io::Error::other("rename refused"));
+            }
+            std::fs::rename(from, to)
+        }));
+        assert_eq!(
+            sentence,
+            format!(
+                "cannot move {} to {}: rename refused",
+                staging.display(),
+                dir.display()
+            )
+        );
+        assert_eq!(tree(&dir), before);
+        assert_eq!(names_in(root.path()), ["plugin"]);
+    }
+
+    /// F5: when putting the earlier emit back fails too, the sentence names where it sits, and it
+    /// sits there whole.
+    #[test]
+    fn a_failed_put_back_names_where_the_old_copy_is() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let dir = root.path().join("plugin");
+        emit(&dir, false, Variant::WithMod).expect("the first emit");
+        let before = tree(&dir);
+        let staging = sibling_of(root.path(), "emit");
+        let old = sibling_of(root.path(), "old");
+        let prepared = prepare(&dir, true).expect("an earlier emit with --force");
+        let sentence = failure(install(prepared, Variant::WithMod, &|from, to| {
+            if to == dir {
+                return Err(std::io::Error::other("rename refused"));
+            }
+            std::fs::rename(from, to)
+        }));
+        assert_eq!(
+            sentence,
+            format!(
+                "cannot move {} to {}: rename refused; putting it back failed too (rename \
+                 refused): the previous plugin is at {}",
+                staging.display(),
+                dir.display(),
+                old.display()
+            )
+        );
+        assert_eq!(tree(&old), before);
+        assert_eq!(
+            names_in(root.path()),
+            [format!("plugin.old-{}", std::process::id())]
+        );
+    }
+
+    /// V-FillEmpty: an empty target whose fill fails is an empty directory again; an absent one
+    /// stays absent.
+    #[test]
+    fn a_failed_fill_leaves_the_target_as_it_was() {
+        let refuse = |_: &Path, _: &Path| Err(std::io::Error::other("rename refused"));
+        let root = tempfile::tempdir().expect("a temp dir");
+        let dir = root.path().join("plugin");
+        std::fs::create_dir(&dir).expect("the empty target");
+        let prepared = prepare(&dir, false).expect("an empty target");
+        let sentence = failure(install(prepared, Variant::WithMod, &refuse));
+        assert!(sentence.ends_with(": rename refused"), "{sentence}");
+        assert!(dir.is_dir(), "the empty directory is back");
+        assert!(names_in(&dir).is_empty());
+        assert_eq!(names_in(root.path()), ["plugin"]);
+
+        std::fs::remove_dir(&dir).expect("the target removed");
+        let prepared = prepare(&dir, false).expect("an absent target");
+        failure(install(prepared, Variant::WithMod, &refuse));
+        assert!(names_in(root.path()).is_empty());
     }
 
     /// The foreign refusal for `dir`, naming `why`.
