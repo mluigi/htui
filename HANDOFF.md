@@ -483,6 +483,26 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   (`docs/htui-mcp.md:33-35`). Document the change in `docs/htui-mcp.md` and the README. Not
   blocked.
 
+- [ ] **MOD-96 - Settings-file permission rules and the permission mode still pre-approve calls in htui-driven sessions**
+  (from MOD-91 review M1, `docs/decisions/mod/mod-91.md`). `R-TUI-6`, `R-HIS-1`, `R-AGT-4`. MOD-91
+  stops the user's mods, settings hooks and skills, but its levers
+  (`--settings '{"disableAllHooks":true}'`, `--disable-slash-commands`, the ACP `_meta` block) leave
+  two things in force:
+  - `permissions.allow`/`deny` rules in the user's, the project's and the local `settings.json`;
+  - the row's permission mode (the seeded `claude-cli` row runs `acceptEdits`).
+
+  Both settle a tool call before `mcp__htui__permission_prompt` is asked, so the call never reaches
+  htui's policy or its record. A managed repo that commits `.claude/settings.json` with
+  `{"permissions":{"allow":["Bash"]}}` runs Bash unasked in `local`/`shared_serialized` isolation.
+  MOD-91's probe showed `--setting-sources project,local` is not a usable lever on its own (the
+  skills-directory mod still loads). Open:
+  - whether htui should neutralise settings-file permission rules in the sessions it drives (for
+    example a `--settings` `permissions` override, probed like MOD-91), or treat them as the
+    operator's and the repository's intended policy and only show them;
+  - whether `acceptEdits` stays the seed's default once the relay is the approval path.
+
+  Not blocked.
+
 - [ ] **MOD-92 - Read-only `--json` CLI for htui state** (from ANA-29, `docs/ANA-29.md` §5.3).
   `R-TUI-11`, `R-ID-2`, `R-ID-6`, `R-STO-1`, `R-NF-2`. Nothing outside the TUI can read htui's
   state: the CLI has no `status`, `waiting` or `--json`. Add read-only subcommands that print
@@ -611,6 +631,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
-| MOD-N   | 24 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-89 `.env` in a worktree, MOD-91 session isolation from user mods, MOD-92 `--json` CLI, MOD-93 consumer Claude Code plugin, MOD-94 permission answers outside the TUI, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 25 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-89 `.env` in a worktree, MOD-91 session isolation from user mods, MOD-92 `--json` CLI, MOD-93 consumer Claude Code plugin, MOD-94 permission answers outside the TUI, MOD-96 settings-file permission rules in driven sessions, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 3 (CLEAN-10 `cargo doc` private links, CLEAN-11 CLEAN-9 deferred review residuals, CLEAN-12 `.claude/` hygiene) |
 | TOOL-N  | 3 (TOOL-8 `htui-dev` mod, TOOL-9 gate script and git hooks, TOOL-10 sandbox mod hardening) |
