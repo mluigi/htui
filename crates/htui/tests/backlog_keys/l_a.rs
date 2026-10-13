@@ -154,3 +154,65 @@ async fn a_backlog_table_moves_the_filter_key() {
         harness.render()
     );
 }
+
+/// The status line of a capturing mode under `register_all` (D9).
+const FILTERED: &str = "Ctrl+c quit · F1 help · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue";
+
+/// The status line: the frame's last row, trailing blanks dropped.
+fn status_line(harness: &mut Harness) -> String {
+    harness
+        .render()
+        .lines()
+        .last()
+        .unwrap_or_default()
+        .trim_end()
+        .to_owned()
+}
+
+/// User-visible item 3: `F1` opens help from the item form (it swallowed function keys), the box
+/// lists the form's own layer, and a second `F1` closes it over the form, text kept.
+#[tokio::test]
+async fn f1_opens_help_from_the_item_form_and_the_form_stays() {
+    let mut harness = shell(None).await;
+    press(&mut harness, "N").await;
+    for c in ["F", "r", "e", "s", "h"] {
+        harness.key(c);
+    }
+    assert!(
+        harness.render().contains("> title    Fresh"),
+        "{}",
+        harness.render()
+    );
+
+    press(&mut harness, "f1").await;
+    let help = harness.render();
+    assert!(help.contains("Form: "), "the form's layer:\n{help}");
+    assert!(help.contains("F1 closes this box"), "{help}");
+
+    press(&mut harness, "f1").await;
+    let frame = harness.render();
+    assert!(!frame.contains("F1 closes this box"), "closed:\n{frame}");
+    assert!(frame.contains(" New item "), "the form stays:\n{frame}");
+    assert!(
+        frame.contains("> title    Fresh"),
+        "with its text:\n{frame}"
+    );
+}
+
+/// D9: a capturing Backlog form reports its modal stack, so the status line is the filtered one:
+/// `Ctrl+c quit · F1 help`, then the chords `register_all` offers (`Ctrl+f`, `Ctrl+w`, `Ctrl+q`),
+/// and none of the browse keys (`q`, `Tab`, digits, `?`, `w`).
+#[tokio::test]
+async fn a_capturing_backlog_form_shows_the_filtered_status_line() {
+    let mut harness = shell(None).await;
+    let browsing = status_line(&mut harness);
+    assert!(browsing.starts_with("q quit · Tab next tab"), "{browsing}");
+    press(&mut harness, "N").await;
+    assert!(harness.render().contains(" New item "));
+    assert_eq!(status_line(&mut harness), FILTERED, "item form");
+
+    press(&mut harness, "esc").await;
+    press(&mut harness, "f").await;
+    assert!(harness.render().contains(" Filter "));
+    assert_eq!(status_line(&mut harness), FILTERED, "filter form");
+}

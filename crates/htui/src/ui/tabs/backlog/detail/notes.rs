@@ -392,7 +392,15 @@ impl DetailTab for NotesTab {
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         if let Some(compose) = &self.compose {
-            let body = compose::render(frame, area, compose, " New note ", None, ctx.theme);
+            let body = compose::render(
+                frame,
+                area,
+                compose,
+                " New note ",
+                None,
+                ctx.keys(),
+                ctx.theme,
+            );
             ctx.claim_editor_area(body);
             return;
         }

@@ -508,13 +508,14 @@ impl BacklogTab {
     /// A key while the item form is open (D8, A7).
     ///
     /// Every plain key is consumed, used by the form or not: a passed `q`, digit, `w`, `?` or
-    /// `Tab` would act globally (blueprint §8). The form itself passes chords but Ctrl+S (A6) and
-    /// Ctrl+E (milestone 4 D1).
+    /// `Tab` would act globally (blueprint §8). The form already applied its stack's pass rule
+    /// (`ITEM_FORM`/`ITEM_DIVERGENCE`, MOD-67 M5): a `Pass` is a CONTROL, ALT or function key it
+    /// did not use.
     fn on_item_form_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
         let Some(form) = self.item_form.as_mut() else {
             return Handled::Pass;
         };
-        match form.on_key(key) {
+        match form.on_key(key, ctx.keys()) {
             ItemFormOutcome::Pass => return Handled::Pass,
             ItemFormOutcome::Stay => {}
             ItemFormOutcome::Cancel => self.item_form = None,
@@ -812,11 +813,7 @@ impl Tab for BacklogTab {
             return Some(views::BACKLOG_FILTER);
         }
         if let Some(form) = &self.item_form {
-            return Some(if form.resolving().is_some() {
-                views::ITEM_DIVERGENCE
-            } else {
-                views::ITEM_FORM
-            });
+            return Some(form.key_stack());
         }
         Some(self.detail.key_stack())
     }
@@ -937,7 +934,7 @@ impl Tab for BacklogTab {
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         // MOD-13 milestone 3 D4: the divergence view takes the whole tab area, list pane included.
         if let Some(view) = self.item_form.as_ref().and_then(ItemForm::resolving) {
-            divergence::render(frame, area, view, ctx.theme);
+            divergence::render(frame, area, view, ctx.keys(), ctx.theme);
             return;
         }
         let [left, right] = panes(area);
@@ -967,7 +964,9 @@ impl Tab for BacklogTab {
         }
         // MOD-13 milestone 2 D8: the open item form takes the detail pane's place.
         match &self.item_form {
-            Some(form) => ctx.claim_editor_area(item_form::render(frame, right, form, ctx.theme)),
+            Some(form) => {
+                ctx.claim_editor_area(item_form::render(frame, right, form, ctx.keys(), ctx.theme))
+            }
             None => detail::render(
                 frame,
                 right,
@@ -2702,7 +2701,7 @@ mod tests {
         let mut form = ItemForm::open_new(context, &bench.projects, None);
         // Title, Priority, Tags, Graph, Paths, Body.
         for _ in 0..5 {
-            let _ = form.on_key(KeyEvent::from(KeyCode::Tab));
+            let _ = form.on_key(KeyEvent::from(KeyCode::Tab), Keys::compiled());
         }
         form.on_paste("First line.");
         tab.item_form = Some(form);
@@ -2719,6 +2718,7 @@ mod tests {
                     frame,
                     right,
                     tab.item_form.as_ref().expect("open"),
+                    Keys::compiled(),
                     &Theme::default(),
                 ));
             })
@@ -2751,10 +2751,13 @@ mod tests {
         let mut form = ItemForm::open_new(context, &bench.projects, None);
         // Title, Priority, Tags, Graph, Paths.
         for _ in 0..4 {
-            let _ = form.on_key(KeyEvent::from(KeyCode::Tab));
+            let _ = form.on_key(KeyEvent::from(KeyCode::Tab), Keys::compiled());
         }
         form.on_paste("src/**");
-        let handed = form.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        let handed = form.on_key(
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            Keys::compiled(),
+        );
         assert!(
             matches!(&handed, ItemFormOutcome::External(edit) if edit.text == "src/**"),
             "{handed:?}"

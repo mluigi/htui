@@ -29,6 +29,7 @@ use crate::editor::{
     without_controls,
 };
 use crate::hand_written::{ADD_NOTE_NAME, HandText, WRITE_DOCUMENT_NAME};
+use crate::keys::{Keys, Stack, views};
 use crate::store_worker::StoreRequest;
 use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::backlog::filter::CHORD;
@@ -272,6 +273,16 @@ impl Compose {
     pub fn settle(&mut self, notice: Option<String>) {
         self.busy = None;
         self.notice = notice;
+    }
+
+    /// The stack that holds the area's keys (MOD-67 M5 D4): [`views::NOTES_COMPOSE`] for a note
+    /// (no kind), [`views::DOCS_COMPOSE`] for a document.
+    #[must_use]
+    pub const fn stack(&self) -> Stack<'static> {
+        match self.kind {
+            None => views::NOTES_COMPOSE,
+            Some(_) => views::DOCS_COMPOSE,
+        }
     }
 
     /// The parts `Tab` cycles: the body alone for a note, title and body under a fixed kind, all
@@ -538,8 +549,8 @@ pub fn could_not_check(why: &str, reread: &str) -> String {
 }
 
 /// Draws the area over the sub-tab's whole content rect (D6): a top rule titled `title`, the
-/// one-line rows, the body, the notice and the hint. `kinds` is the Docs pane's hint text,
-/// drawn under a typed kind only.
+/// one-line rows, the body, the notice and the hint (through [`Compose::stack`], MOD-67 M5).
+/// `kinds` is the Docs pane's hint text, drawn under a typed kind only.
 ///
 /// Returns the body's rect, which the pane claims for an in-pane editor (MOD-57 P2).
 pub fn render(
@@ -548,6 +559,7 @@ pub fn render(
     compose: &Compose,
     title: &str,
     kinds: Option<&str>,
+    keys: &Keys,
     theme: &Theme,
 ) -> Rect {
     let block = Block::new()
@@ -623,12 +635,13 @@ pub fn render(
         ),
         notice,
     );
-    let text = match compose.focus {
+    let spec = match compose.focus {
         Part::Kind | Part::Title => HINT_TEXT,
         Part::Body => HINT_AREA,
     };
+    let text = keys.hint(compose.stack(), spec);
     frame.render_widget(
-        Paragraph::new(Line::styled(cells::clip(text, all), theme.dim)),
+        Paragraph::new(Line::styled(cells::clip(&text, all), theme.dim)),
         hint,
     );
     body
@@ -757,6 +770,12 @@ mod tests {
 
     use super::bench::{ctrl, drawn, key};
     use super::*;
+    use crate::keys::HintSpec;
+
+    /// `spec` through `compose`'s stack under the default keys.
+    fn rendered(compose: &Compose, spec: HintSpec) -> String {
+        Keys::compiled().hint(compose.stack(), spec)
+    }
 
     fn note() -> Compose {
         Compose::note(ids::HTUI_FEAT_1, Some("FEAT-1"))
@@ -1087,10 +1106,18 @@ mod tests {
     fn the_area_draws_its_hint_inside_the_pane() {
         let compose = note();
         let text = drawn(43, 23, |frame, area| {
-            render(frame, area, &compose, " New note ", None, &Theme::default());
+            render(
+                frame,
+                area,
+                &compose,
+                " New note ",
+                None,
+                Keys::compiled(),
+                &Theme::default(),
+            );
         });
         assert!(text.contains(" New note "), "{text}");
-        assert!(text.contains(HINT_AREA), "{text}");
+        assert!(text.contains(&rendered(&compose, HINT_AREA)), "{text}");
 
         let compose = typed("FEAT-1");
         let text = drawn(43, 23, |frame, area| {
@@ -1100,10 +1127,11 @@ mod tests {
                 &compose,
                 " New document ",
                 Some("plan, prd, summary"),
+                Keys::compiled(),
                 &Theme::default(),
             );
         });
-        assert!(text.contains(HINT_TEXT), "{text}");
+        assert!(text.contains(&rendered(&compose, HINT_TEXT)), "{text}");
         assert!(text.contains("kinds: plan"), "{text}");
         assert!(text.contains("> kind"), "{text}");
         assert!(text.contains("  title"), "{text}");
@@ -1118,6 +1146,7 @@ mod tests {
                 &fixed,
                 " New version of plan (from v2) ",
                 Some("plan, prd, summary"),
+                Keys::compiled(),
                 &Theme::default(),
             );
         });
@@ -1145,6 +1174,7 @@ mod tests {
                 &compose,
                 " New note ",
                 None,
+                Keys::compiled(),
                 &Theme::default(),
             ));
         });
@@ -1168,6 +1198,7 @@ mod tests {
                 &compose,
                 " New document ",
                 Some("plan, prd, summary"),
+                Keys::compiled(),
                 &Theme::default(),
             ));
         });
@@ -1196,10 +1227,18 @@ mod tests {
             "thread",
         )));
         let text = drawn(43, 8, |frame, area| {
-            render(frame, area, &compose, " New note ", None, &Theme::default());
+            render(
+                frame,
+                area,
+                &compose,
+                " New note ",
+                None,
+                Keys::compiled(),
+                &Theme::default(),
+            );
         });
         assert!(text.contains("re-read to check"), "{text}");
-        assert!(text.contains(HINT_AREA), "{text}");
+        assert!(text.contains(&rendered(&compose, HINT_AREA)), "{text}");
     }
 
     /// The maintainer's answer to blueprint §6 Q1: `v` with nothing changed is `unchanged`, in

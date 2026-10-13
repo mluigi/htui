@@ -2626,7 +2626,8 @@ async fn the_divergence_view_renders_over_the_whole_tab() {
         "--- ancestor v1",
         "+++ theirs v2",
         "+++ mine",
-        "t theirs wins  m mine wins  Esc back",
+        // MOD-67 M5 PA-3, D9: the hint's parts join with ` · `.
+        "t theirs wins · m mine wins · Esc back",
     ] {
         assert!(frame.contains(wanted), "{wanted:?} in the view:\n{frame}");
     }

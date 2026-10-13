@@ -589,7 +589,15 @@ impl DetailTab for DocumentsTab {
         if let Some(compose) = &self.compose {
             let title = self.compose_title(compose);
             let kinds = self.kinds();
-            let body = compose::render(frame, area, compose, &title, Some(&kinds), ctx.theme);
+            let body = compose::render(
+                frame,
+                area,
+                compose,
+                &title,
+                Some(&kinds),
+                ctx.keys(),
+                ctx.theme,
+            );
             ctx.claim_editor_area(body);
             return;
         }
