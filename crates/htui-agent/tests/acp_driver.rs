@@ -1369,7 +1369,8 @@ fn old_history() -> Vec<Value> {
 /// Every request's method and params go to `seen`.
 ///
 /// MOD-96 D4: `modes`, when `Some`, rides on the `session/new` answer and on every successful
-/// restore answer as the session's mode state, and `session/set_mode` is answered `result: {}`.
+/// restore answer as the session's mode state, and `session/set_mode` is answered per `set_mode`:
+/// `result: {}`, or [`Answer::Refuse`]'s error (review R1 #3).
 ///
 /// Raw newline-delimited JSON-RPC in [`refuse_session_new`]'s style. Notifications from the client
 /// (`session/cancel`) are recorded and get no answer.
@@ -1382,6 +1383,7 @@ async fn restoring_agent(
     replay: Vec<Value>,
     seen: tokio::sync::mpsc::UnboundedSender<(String, Value)>,
     modes: Option<Value>,
+    set_mode: Answer,
 ) {
     // `{}` plus the mode state when the case gives one: every successful opening answer's result.
     let opened = |mut result: Value| {
@@ -1425,6 +1427,7 @@ async fn restoring_agent(
                 "id": id,
                 "result": opened(json!({ "sessionId": FRESH_SESSION })),
             }),
+            "session/set_mode" if matches!(set_mode, Answer::Refuse) => answered(set_mode),
             "session/set_mode" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
             "session/resume" | "session/load" => {
                 let resuming = method == "session/resume";
@@ -1558,14 +1561,15 @@ async fn open_restoring_with(
         resume,
         load,
         None,
+        Answer::Ok,
         settings,
         with_child,
     )
     .await
 }
 
-/// Opens `spec` against [`restoring_agent`] reporting `modes` (MOD-96 D4), under the row settings
-/// `settings` and, when `with_child`, with a `sleep 1000` child whose pid the case can assert on.
+/// Opens `spec` against [`restoring_agent`] reporting `modes` and answering `session/set_mode` per
+/// `set_mode` (MOD-96 D4), under the row settings `settings` and, when `with_child`, with a `sleep 1000` child whose pid the case can assert on.
 /// A `spec` with no `resume` opens with `session/new`.
 #[cfg(unix)]
 #[expect(
@@ -1583,6 +1587,7 @@ async fn open_against(
     resume: Answer,
     load: Answer,
     modes: Option<Value>,
+    set_mode: Answer,
     settings: AgentSettings,
     with_child: bool,
 ) -> Restore {
@@ -1617,6 +1622,7 @@ async fn open_against(
         old_history(),
         seen_tx,
         modes,
+        set_mode,
     ));
     let io = AcpIo {
         reader: Box::new(reader),
@@ -2401,6 +2407,7 @@ async fn a_pinned_mode_is_set_after_session_new() {
         Answer::Ok,
         Answer::Ok,
         Some(agent_modes("acceptEdits")),
+        Answer::Ok,
         pinned("default"),
         false,
     )
@@ -2435,6 +2442,7 @@ async fn a_pinned_mode_is_set_after_a_resume_and_a_load() {
             Answer::Ok,
             Answer::Ok,
             Some(agent_modes("acceptEdits")),
+            Answer::Ok,
             pinned("default"),
             false,
         )
@@ -2454,11 +2462,12 @@ async fn a_pinned_mode_is_set_after_a_resume_and_a_load() {
     }
 }
 
-/// D4: a mode that is already current is not set again, on a new session or a restored one.
+/// D4: a mode that is already current is not set again, on every opening route (review R1 #9:
+/// `session/load` included).
 #[cfg(unix)]
 #[tokio::test]
 async fn a_mode_already_current_sends_no_set_mode() {
-    for route in ["session/new", "session/resume"] {
+    for route in OPENING_ROUTES {
         let tmp = tempfile::tempdir().expect("temp cwd");
         let (spec, caps) = opening(route, tmp.path());
         let mut restore = open_against(
@@ -2468,6 +2477,7 @@ async fn a_mode_already_current_sends_no_set_mode() {
             Answer::Ok,
             Answer::Ok,
             Some(agent_modes("default")),
+            Answer::Ok,
             pinned("default"),
             false,
         )
@@ -2491,11 +2501,11 @@ async fn a_mode_already_current_sends_no_set_mode() {
 }
 
 /// D4: a row that pins nothing (`agy`'s, and every pre-MOD-96 row's) sends no `session/set_mode`,
-/// whatever mode the agent reports: today's behaviour.
+/// whatever mode the agent reports, on every opening route (review R1 #9): today's behaviour.
 #[cfg(unix)]
 #[tokio::test]
 async fn no_pinned_mode_sends_no_set_mode() {
-    for route in ["session/new", "session/resume"] {
+    for route in OPENING_ROUTES {
         let tmp = tempfile::tempdir().expect("temp cwd");
         let (spec, caps) = opening(route, tmp.path());
         let mut restore = open_against(
@@ -2505,6 +2515,7 @@ async fn no_pinned_mode_sends_no_set_mode() {
             Answer::Ok,
             Answer::Ok,
             Some(agent_modes("acceptEdits")),
+            Answer::Ok,
             AgentSettings::default(),
             false,
         )
@@ -2556,6 +2567,7 @@ async fn an_agent_without_the_pinned_mode_is_refused() {
                 Answer::Ok,
                 Answer::Ok,
                 modes.clone(),
+                Answer::Ok,
                 pinned("default"),
                 true,
             )
@@ -2578,5 +2590,56 @@ async fn an_agent_without_the_pinned_mode_is_refused() {
             restore.agent.abort();
             let _ = restore.agent.await;
         }
+    }
+}
+
+/// D4, review R1 #3: an agent that offers the pinned mode but answers `session/set_mode` with a
+/// JSON-RPC error fails the start, on every opening route. The error names `session/set_mode` and
+/// carries the agent's own text; the pin was sent once and no prompt followed it; and the child
+/// is reaped by the time `start` returns (the owed path, review L-4).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_refused_set_mode_fails_the_start() {
+    for route in OPENING_ROUTES {
+        let tmp = tempfile::tempdir().expect("temp cwd");
+        let (spec, caps) = opening(route, tmp.path());
+        let mut restore = open_against(
+            tmp.path(),
+            spec,
+            caps,
+            Answer::Ok,
+            Answer::Ok,
+            Some(agent_modes("acceptEdits")),
+            Answer::Refuse,
+            pinned("default"),
+            true,
+        )
+        .await;
+
+        let message = transport_message(&restore.opened).to_owned();
+        assert!(
+            message.contains("session/set_mode"),
+            "{route}: the error names the refused pin: {message}"
+        );
+        assert!(
+            message.contains(VENDOR_REFUSAL),
+            "{route}: and carries the agent's own text: {message}"
+        );
+        let seen = restore.seen();
+        assert_eq!(
+            set_modes(&seen).len(),
+            1,
+            "{route}: the pin was sent once: {:?}",
+            methods(&seen)
+        );
+        assert!(
+            !methods(&seen).contains(&"session/prompt"),
+            "{route}: no prompt follows a refused pin: {:?}",
+            methods(&seen)
+        );
+        assert_reaped_already(restore.pid.expect("the case spawned a child"), route);
+
+        restore.agent.abort();
+        let _ = restore.agent.await;
     }
 }
