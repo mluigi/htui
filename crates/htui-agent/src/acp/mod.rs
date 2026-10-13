@@ -1264,6 +1264,19 @@ async fn session_main(
         ready.lock().unwrap_or_else(PoisonError::into_inner).owed = Some(err);
         return;
     }
+    // Review R1 #2: an isolated row that pins nothing runs in whatever mode the agent chose, which
+    // for `claude-agent-acp` is the user's `defaultMode` (`_meta` cannot reach it). Not refused,
+    // since the row asked for nothing, but said: the approval path is then the agent's.
+    if unpinned_under_isolation(&options.settings) {
+        tracing::warn!(
+            agent = %options.agent_name,
+            current_mode = session
+                .modes()
+                .map_or("(none reported)", |modes| &*modes.current_mode_id.0),
+            "the session's permission mode was not pinned: `settings.acp.permission_mode` is unset \
+             on an isolated row, so the agent's own starting mode stands (MOD-96 D4)"
+        );
+    }
 
     // 3. The banner is the session's first row (§4.4): resuming a step is a query for it.
     let models = model_values(&session, options.settings.acp.model_config_id.as_deref());
@@ -1970,6 +1983,13 @@ fn mode_to_set(
     ))
 }
 
+/// Whether a session under `settings` is isolated (`user_extensions` false) yet pins no permission
+/// mode, so the agent's starting mode stands unchosen by `htui` (MOD-96 review R1 #2). A row that
+/// opts back in is left out: the user's `defaultMode` is what it asked for.
+fn unpinned_under_isolation(settings: &AgentSettings) -> bool {
+    !settings.user_extensions && settings.acp.permission_mode.is_none()
+}
+
 /// Pins `wanted` on `session` (MOD-96 D4), after any of the three opening requests. The step is
 /// recorded first, as the opening requests' are, so a refusal answered from the connection names
 /// `session/set_mode`. ANA-4 risk 11: `block_task` only here.
@@ -2099,8 +2119,8 @@ mod tests {
     };
     use serde_json::json;
 
-    use super::{Restore, mode_to_set, restore_route};
-    use crate::launch::SessionSettings;
+    use super::{Restore, mode_to_set, restore_route, unpinned_under_isolation};
+    use crate::launch::{AcpSettings, AgentSettings, SessionSettings};
 
     fn caps(document: serde_json::Value) -> AgentCapabilities {
         serde_json::from_value(document).expect("the capabilities parse")
@@ -2168,5 +2188,24 @@ mod tests {
                 && missing.contains("plan"),
             "{missing}"
         );
+    }
+
+    /// MOD-96 review R1 #2: only an isolated row that pins no mode is warned about. A pinned row
+    /// is `pin_mode`'s, and a row that opts back in takes the user's `defaultMode` on purpose.
+    #[test]
+    fn only_an_isolated_row_without_a_pin_is_warned_about() {
+        let row = |user_extensions: bool, permission_mode: Option<&str>| AgentSettings {
+            acp: AcpSettings {
+                permission_mode: permission_mode.map(ToOwned::to_owned),
+                ..AcpSettings::default()
+            },
+            user_extensions,
+            ..AgentSettings::default()
+        };
+
+        assert!(unpinned_under_isolation(&row(false, None)));
+        assert!(!unpinned_under_isolation(&row(false, Some("default"))));
+        assert!(!unpinned_under_isolation(&row(true, None)));
+        assert!(!unpinned_under_isolation(&row(true, Some("default"))));
     }
 }
