@@ -865,6 +865,27 @@ cmd_up() {
 
 # ---- attach ----
 
+# Runs in the container for a run made with `up --headroom` (TOOL-11). A dead ANTHROPIC_BASE_URL
+# makes claude hang rather than fail, so the variable is set only once the proxy answers /readyz;
+# otherwise the session runs direct. A missing proxy process (a restarted container, or one made before
+# the flag existed) is started here (pgrep -x: the process name is "headroom"; -f would match this
+# script's own command line), with its state off the shared ~/.headroom and the upload beacon off.
+# $1 = claude | shell. HR_HEADROOM_WAIT (seconds, default 15) is the readiness bound; tests lower it.
+# No single quote may appear in the text: it is one single-quoted constant.
+HEADROOM_GUARD='u=http://localhost:8787
+ready() { curl -fs -m 2 "$u/readyz" >/dev/null 2>&1; }
+if ! ready; then
+    if ! pgrep -x headroom >/dev/null 2>&1; then
+        mkdir -p /tmp/headroom
+        HEADROOM_WORKSPACE_DIR=/tmp/headroom HEADROOM_BEACON=off setsid nohup headroom proxy --port 8787 >>/tmp/headroom/proxy.out 2>&1 </dev/null &
+    fi
+    end=$((SECONDS + ${HR_HEADROOM_WAIT:-15}))
+    while [ "$SECONDS" -lt "$end" ] && ! ready; do sleep 0.5; done
+fi
+if ready; then export ANTHROPIC_BASE_URL="$u"; else echo "hr: headroom is not answering; this session runs direct" >&2; fi
+if [ "$1" = shell ]; then exec bash -l; fi
+exec claude --dangerously-skip-permissions'
+
 cmd_attach() {
     local item='' shell=0
     while [[ $# -gt 0 ]]; do
@@ -892,6 +913,11 @@ cmd_attach() {
     fi
     local -a tty=()
     [[ -t 0 && -t 1 ]] || tty=(-T)
+    if [[ "${RUN[headroom]:-0}" == 1 ]]; then
+        local mode=claude
+        [[ "$shell" -eq 1 ]] && mode=shell
+        exec "${COMPOSE[@]}" exec "${tty[@]}" -e TERM -e COLORTERM dev bash -c "$HEADROOM_GUARD" hr-headroom "$mode"
+    fi
     if [[ "$shell" -eq 1 ]]; then
         exec "${COMPOSE[@]}" exec "${tty[@]}" -e TERM -e COLORTERM dev bash -l
     fi

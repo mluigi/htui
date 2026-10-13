@@ -222,6 +222,78 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     [[ "$(jq -r '.services.dev.environment.HR_HEADROOM' <<<"$cfg")" == 1 ]]
 }
 
+@test "3i. attach: a headroom=0 run keeps the plain exec; a headroom=1 run goes through the guard (claude and --shell)" {
+    mk_run MOD-5
+    mk_run MOD-4 --headroom
+    : >"$HR_TEST_DOCKER_LOG"
+    HR_TEST_DOCKER_RUNNING=hr-mod-4 run --separate-stderr "$HR" attach MOD-4 </dev/null
+    [[ $status -eq 0 ]]
+    grep -qE -- " exec (-T )?-e TERM -e COLORTERM dev bash -c " "$HR_TEST_DOCKER_LOG"
+    grep -qF 'exec claude --dangerously-skip-permissions' "$HR_TEST_DOCKER_LOG"
+    grep -qF '/readyz' "$HR_TEST_DOCKER_LOG"
+    grep -qE -- 'hr-headroom claude$' "$HR_TEST_DOCKER_LOG"
+    ! grep -qE -- 'dev claude --dangerously-skip-permissions$' "$HR_TEST_DOCKER_LOG" || false
+
+    : >"$HR_TEST_DOCKER_LOG"
+    HR_TEST_DOCKER_RUNNING=hr-mod-4 run --separate-stderr "$HR" attach MOD-4 --shell </dev/null
+    [[ $status -eq 0 ]]
+    grep -qE -- 'hr-headroom shell$' "$HR_TEST_DOCKER_LOG"
+
+    # headroom=0: byte-identical argv to before TOOL-11.
+    : >"$HR_TEST_DOCKER_LOG"
+    HR_TEST_DOCKER_RUNNING=hr-mod-5 run --separate-stderr "$HR" attach MOD-5 </dev/null
+    grep -qE -- " exec (-T )?-e TERM -e COLORTERM dev claude --dangerously-skip-permissions$" "$HR_TEST_DOCKER_LOG"
+    ! grep -qF 'readyz' "$HR_TEST_DOCKER_LOG" || false
+}
+
+# guard_run MODE — run the container-side guard (HEADROOM_GUARD in scripts/hr) with fake curl, pgrep,
+# headroom, setsid, nohup and claude on PATH. Controls, as files in $FB: up (the proxy answers),
+# running (a proxy process exists), works (a started proxy comes up). $FB/started counts starts.
+guard_run() {
+    eval "$(sed -n "/^HEADROOM_GUARD='/,/^exec claude.*'\$/p" "$HR")"
+    [[ -n "${HEADROOM_GUARD:-}" ]]
+    FB="$BATS_TEST_TMPDIR/fb"
+    mkdir -p "$FB"
+    printf '#!/bin/sh\n[ -e "%s/up" ]\n' "$FB" >"$FB/curl"
+    printf '#!/bin/sh\n[ -e "%s/running" ]\n' "$FB" >"$FB/pgrep"
+    printf '#!/bin/sh\necho x >>"%s/started"\n[ -e "%s/works" ] && touch "%s/up"\nexit 0\n' "$FB" "$FB" "$FB" >"$FB/headroom"
+    printf '#!/bin/sh\nexec "$@"\n' >"$FB/setsid"
+    cp "$FB/setsid" "$FB/nohup"
+    printf '#!/bin/sh\necho "BASE=${ANTHROPIC_BASE_URL-unset} ARGS=$*"\n' >"$FB/claude"
+    chmod +x "$FB"/curl "$FB"/pgrep "$FB"/headroom "$FB"/setsid "$FB"/nohup "$FB"/claude
+    run --separate-stderr env PATH="$FB:$PATH" HR_HEADROOM_WAIT="${HR_HEADROOM_WAIT:-3}" bash -c "$HEADROOM_GUARD" hr-headroom "$1"
+}
+
+@test "3j. guard: proxy already answering -> base URL set, nothing started" {
+    mkdir -p "$BATS_TEST_TMPDIR/fb"; touch "$BATS_TEST_TMPDIR/fb/up"
+    guard_run claude
+    [[ $status -eq 0 ]]
+    [[ "$output" == 'BASE=http://localhost:8787 ARGS=--dangerously-skip-permissions' ]]
+    [[ ! -e "$FB/started" ]]
+}
+
+@test "3k. guard: no proxy process -> started once, then ready -> base URL set" {
+    mkdir -p "$BATS_TEST_TMPDIR/fb"; touch "$BATS_TEST_TMPDIR/fb/works"
+    guard_run claude
+    [[ $status -eq 0 ]]
+    [[ "$output" == 'BASE=http://localhost:8787 ARGS=--dangerously-skip-permissions' ]]
+    [[ "$(wc -l <"$FB/started")" -eq 1 ]]
+}
+
+@test "3l. guard: proxy never answers -> says so, runs direct, finishes (no hang)" {
+    HR_HEADROOM_WAIT=1 guard_run claude
+    [[ $status -eq 0 ]]
+    [[ "$output" == 'BASE=unset ARGS=--dangerously-skip-permissions' ]]
+    [[ "$stderr" == *'headroom is not answering; this session runs direct'* ]]
+}
+
+@test "3m. guard: a proxy process that is still starting is waited for, not started twice" {
+    mkdir -p "$BATS_TEST_TMPDIR/fb"; touch "$BATS_TEST_TMPDIR/fb/running"
+    HR_HEADROOM_WAIT=1 guard_run claude
+    [[ ! -e "$FB/started" ]]
+    [[ "$stderr" == *'runs direct'* ]]
+}
+
 @test "4. up warns on uncommitted workflow files; the clone takes the committed ref" {
     printf 'local edit\n' >>"$HR_HOST_REPO/HANDOFF.md"
     mkdir -p "$HR_HOST_REPO/.claude"
