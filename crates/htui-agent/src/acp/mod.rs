@@ -1106,6 +1106,12 @@ enum Step {
 /// `CLAUDE_MODEL_CONFIG`, which `htui` itself never sets but a row's launch `env` can). The CLI's
 /// counterpart is [`crate::cli::ISOLATION_ARGS`]; this function is the one place the ACP lever
 /// lives (blueprint B1), pinned by one literal test.
+///
+/// MOD-96 D4: `settingSources: []` is the CLI's `--setting-sources ""`, so no user, project or
+/// local settings file is read. The adapter's own `settingSources: ["user","project","local"]`
+/// precedes the spread (`acp-agent.js:5933-5935`), so ours wins. The adapter's `SettingsManager`
+/// still reads `defaultMode` from those files (`:5827`), which is why the mode is pinned
+/// separately ([`AcpSettings::permission_mode`]).
 #[must_use]
 pub fn isolation_meta() -> Meta {
     Meta::from_iter([(
@@ -1114,6 +1120,7 @@ pub fn isolation_meta() -> Meta {
             "options": {
                 "settings": { "disableAllHooks": true },
                 "extraArgs": { "disable-slash-commands": "" },
+                "settingSources": [],
             },
         }),
     )])
@@ -1247,6 +1254,16 @@ async fn session_main(
     };
     let session_id = session.session_id().clone();
     let session_ref = AgentSessionRef::new(session_id.0.to_string());
+
+    // 2½. MOD-96 D4: the permission mode the row pins, on every route and before the banner, so a
+    //     refused start records nothing. Owed, as a failed restore is (review L-4): `run_session`
+    //     kills and reaps the child before `start` answers.
+    if let Some(wanted) = options.settings.acp.permission_mode.as_deref()
+        && let Err(err) = pin_mode(&cx, &session, wanted, ready, child).await
+    {
+        ready.lock().unwrap_or_else(PoisonError::into_inner).owed = Some(err);
+        return;
+    }
 
     // 3. The banner is the session's first row (§4.4): resuming a step is a query for it.
     let models = model_values(&session, options.settings.acp.model_config_id.as_deref());
@@ -1920,16 +1937,60 @@ async fn restore_session(
     }
 }
 
-/// MOD-96 D4: what pinning `wanted` takes. Red-phase stub.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "MOD-96 T3 red phase: the stub is wired in by the green commit")
-)]
+/// MOD-96 D4: what pinning `wanted` takes. `Ok(None)` when it is already current; `Ok(Some(id))`
+/// when the agent offers it and is elsewhere; `Err(why)` when the agent reports no modes, or none
+/// with that id. Fails closed: an unknown starting mode is an unknown approval path.
 fn mode_to_set(
-    _modes: Option<&SessionModeState>,
-    _wanted: &str,
+    modes: Option<&SessionModeState>,
+    wanted: &str,
 ) -> std::result::Result<Option<SessionModeId>, String> {
-    Ok(None)
+    let Some(modes) = modes else {
+        return Err(format!(
+            "cannot pin `settings.acp.permission_mode` `{wanted}`: the agent reports no session modes"
+        ));
+    };
+    if &*modes.current_mode_id.0 == wanted {
+        return Ok(None);
+    }
+    if modes
+        .available_modes
+        .iter()
+        .any(|mode| &*mode.id.0 == wanted)
+    {
+        return Ok(Some(SessionModeId::new(wanted)));
+    }
+    let offered: Vec<&str> = modes
+        .available_modes
+        .iter()
+        .map(|mode| &*mode.id.0)
+        .collect();
+    Err(format!(
+        "cannot pin `settings.acp.permission_mode` `{wanted}`: the agent offers no such mode \
+         (it offers {offered:?})"
+    ))
+}
+
+/// Pins `wanted` on `session` (MOD-96 D4), after any of the three opening requests. The step is
+/// recorded first, as the opening requests' are, so a refusal answered from the connection names
+/// `session/set_mode`. ANA-4 risk 11: `block_task` only here.
+async fn pin_mode(
+    cx: &ConnectionTo<Agent>,
+    session: &agent_client_protocol::ActiveSession<'static, Agent>,
+    wanted: &str,
+    ready: &Mutex<ReadyCell>,
+    child: &Mutex<ChildGuard>,
+) -> Result<()> {
+    let Some(mode_id) = mode_to_set(session.modes(), wanted).map_err(DriverError::Transport)?
+    else {
+        return Ok(());
+    };
+    at_step(ready, "session/set_mode");
+    let request = SetSessionModeRequest::new(session.session_id().clone(), mode_id);
+    cx.send_request(request)
+        .block_task()
+        .await
+        .map(|_| ())
+        .map_err(|err| handshake_error("session/set_mode", &err, child))
 }
 
 /// Discards every update already queued on `session`, without waiting: the history a
@@ -2099,7 +2160,8 @@ mod tests {
             "{none}"
         );
 
-        let missing = mode_to_set(Some(&without), "default").expect_err("an absent mode is refused");
+        let missing =
+            mode_to_set(Some(&without), "default").expect_err("an absent mode is refused");
         assert!(
             missing.contains("`default`")
                 && missing.contains("acceptEdits")
