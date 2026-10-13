@@ -12,6 +12,19 @@ stay on plan, because the probe has already answered the open questions a PRD wo
 **Staffing**: every agent inherits the session model. The reviewer is `rust-reviewer`
 (`.claude/workflow-config.json`).
 
+
+**Amended 2026-10-13 after review R1 (finding 1, HIGH): Q2 reversed by the maintainer (option 1).** `acceptEdits`
+allows an edit only inside the working directories, and only after the CLI's safety checks (2.1.296
+bundle: `let H=Kg(path,…); if(mode==="acceptEdits"&&H) return allow`; the safety checks return `ask`
+first). The planned `{"tool_kind":"edit"} → allow_once` rule had no path condition, so out-of-tree
+and safety-checked edits (`~/.bashrc`, `~/.claude/settings.json`, `.git/hooks/*`) would have been
+allowed unasked. The `claude-cli` seed therefore **keeps `acceptEdits` and `rules: []`**:
+- D5's CLI half and Q2 are withdrawn;
+- `0018` pins only the `claude` ACP row;
+- F5 no longer applies.
+
+D1–D4, and the ACP half of D5 and D6, stand.
+
 ## Summary
 
 MOD-91's levers stop the user's mods, hooks and skills, but three things still settle a tool call
