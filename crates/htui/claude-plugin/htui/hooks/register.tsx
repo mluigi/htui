@@ -190,8 +190,9 @@ async function checkVersion($: EngineInterface): Promise<void> {
   let line: string | null = null
   try {
     const r = await $.process.run(['htui', '--version'], { timeoutMs: 10000 })
-    const bin = r.exitCode === 0 ? /^htui (\S+)/m.exec(r.stdout)?.[1] : undefined
-    if (bin !== undefined && bin !== VERSION) {
+    // The version is htui-supplied text like any other: stripped of control characters (F7c).
+    const bin = r.exitCode === 0 ? clean(/^htui (\S+)/m.exec(r.stdout)?.[1]) : ''
+    if (bin !== '' && bin !== VERSION) {
       line = `htui ${bin} ≠ plugin ${VERSION}: run htui claude emit --force, then /reload-plugins`
     }
   } catch {

@@ -69,6 +69,19 @@ test('a matching binary shows no skew line', async ($, on) => {
   expect(await run($, 'status')).toBe('Platform · desk · online · 1 working · 2 waiting')
 })
 
+test('the skew line is stripped of control characters', async ($, on) => {
+  const clock = mock.clock(on)
+  const answers: Record<string, Answer> = { status: ok(STATUS), '--version': ok('htui 9.9\u001b[31m.9\u0007\n') }
+  htui(on, answers, [])
+  await begin($, on, clock)
+  expect(await run($, 'status')).toBe(`Platform · desk · online · 1 working · 2 waiting\n${SKEW.replace('9.9.9', '9.9[31m.9')}`)
+  // A version of control characters alone names nothing: no skew line.
+  answers['--version'] = ok('htui \u0007\u001b\n')
+  await $.session.start({ source: 'startup', cwd: '/tmp' } as never)
+  await clock.settle()
+  expect(await run($, 'status')).toBe('Platform · desk · online · 1 working · 2 waiting')
+})
+
 test('waiting prints one line per row, and a sentence when none', async ($, on) => {
   const clock = mock.clock(on)
   const answers: Record<string, Answer> = { waiting: ok(WAITING) }
