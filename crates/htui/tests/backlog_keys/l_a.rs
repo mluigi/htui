@@ -400,3 +400,118 @@ async fn a_rebound_external_editor_hands_the_body_out() {
         .expect("`F3` asked for the editor");
     assert_eq!(edit.text, "A note by hand.");
 }
+
+/// The filter form's four rows and its hint, as drawn in the list pane: borders and padding off.
+fn filter_rows(frame: &str) -> Vec<String> {
+    let lines: Vec<&str> = frame.lines().collect();
+    let title = lines
+        .iter()
+        .position(|line| line.contains("┌ Filter "))
+        .unwrap_or_else(|| panic!("the filter form is open:\n{frame}"));
+    lines[title + 1..=title + 5]
+        .iter()
+        .map(|line| {
+            let left = line.split("││").next().unwrap_or_default();
+            left.trim_start_matches('│')
+                .trim_end_matches(['│', ' '])
+                .to_owned()
+        })
+        .collect()
+}
+
+/// The focused row's label (the row drawn with `>`).
+fn focused(harness: &mut Harness) -> String {
+    let rows = filter_rows(&harness.render());
+    rows.iter()
+        .find_map(|row| row.strip_prefix("> "))
+        .and_then(|row| row.split_whitespace().next())
+        .unwrap_or_else(|| panic!("a focused row in {rows:#?}"))
+        .to_owned()
+}
+
+/// D5, borderline keys (blueprint §1): an option row's value keys are the form's own, plain keys
+/// only (`alt-l`, `alt-x` change nothing); `x` is `backlog.filter_form.clear`; `j`, `Down` and
+/// `Tab` move the row. On the Tags row `j` and `x` are typed, and `Down`/`Tab` move on.
+#[tokio::test]
+async fn the_filter_form_keeps_its_value_keys_and_x_clears() {
+    let mut harness = shell(None).await;
+    press(&mut harness, "f").await;
+    let status = |harness: &mut Harness| filter_rows(&harness.render())[0].clone();
+    assert_eq!(status(&mut harness), "> status  ‹[ ] open›  any");
+
+    press(&mut harness, "l").await;
+    let queued = status(&mut harness);
+    assert_eq!(
+        queued, "> status  ‹[ ] queued›  any",
+        "`l` moves the option"
+    );
+    press(&mut harness, "right").await;
+    let third = status(&mut harness);
+    assert_ne!(third, queued, "`Right` moves it on");
+    for chord in ["alt-l", "alt-h", "alt-space"] {
+        press(&mut harness, chord).await;
+        assert_eq!(status(&mut harness), third, "`{chord}` changed nothing");
+    }
+    press(&mut harness, "space").await;
+    let ticked = status(&mut harness);
+    assert!(ticked.contains("‹[x] "), "Space ticks: {ticked}");
+    press(&mut harness, "alt-x").await;
+    assert_eq!(status(&mut harness), ticked, "`alt-x` cleared nothing");
+    press(&mut harness, "x").await;
+    let cleared = status(&mut harness);
+    assert!(
+        cleared.contains("‹[ ] ") && cleared.ends_with("any"),
+        "`x` clears: {cleared}"
+    );
+
+    press(&mut harness, "j").await;
+    assert_eq!(focused(&mut harness), "project", "`j`");
+    press(&mut harness, "k").await;
+    press(&mut harness, "down").await;
+    assert_eq!(focused(&mut harness), "project", "`Down`");
+    press(&mut harness, "tab").await;
+    assert_eq!(focused(&mut harness), "tags", "`Tab`");
+
+    press(&mut harness, "j").await;
+    press(&mut harness, "x").await;
+    let rows = filter_rows(&harness.render());
+    assert_eq!(rows[2], "> tags    jx", "typed, not moved or cleared");
+    assert_eq!(rows[4], "comma list · Tab row · Enter apply · Esc cancel");
+    press(&mut harness, "down").await;
+    assert_eq!(focused(&mut harness), "ready", "`Down` moves on");
+    press(&mut harness, "backtab").await;
+    assert_eq!(focused(&mut harness), "tags", "`BackTab` comes back");
+    press(&mut harness, "tab").await;
+    assert_eq!(focused(&mut harness), "ready", "`Tab` moves on");
+}
+
+/// The lane's rebinding test (D12): `[backlog.docs] new_version = "V"` moves the Docs pane's
+/// new-version key, so the pane-first Backlog hands `V` to Docs, the old `v` opens nothing, and
+/// the Docs hint names the new key.
+#[tokio::test]
+async fn a_rebound_new_version_key_opens_the_form_and_v_is_inert() {
+    let mut harness = shell(Some(keys("[backlog.docs]\nnew_version = \"V\"\n"))).await;
+    for _ in 0..TO_FEAT_1 {
+        press(&mut harness, "j").await;
+    }
+    for _ in 0..TO_DOCS {
+        press(&mut harness, "l").await;
+    }
+    let frame = harness.render();
+    assert!(
+        frame.contains("J/K move · a new · V new version"),
+        "the Docs hint:\n{frame}"
+    );
+    press(&mut harness, "v").await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains(" New version of "),
+        "`v` is inert:\n{frame}"
+    );
+    press(&mut harness, "V").await;
+    let frame = harness.render();
+    assert!(
+        frame.contains(" New version of plan (from v2) "),
+        "`V` opens the form on the cursor's plan:\n{frame}"
+    );
+}
