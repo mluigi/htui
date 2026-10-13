@@ -2,6 +2,7 @@
 
 **Source**: `HANDOFF.md` MOD-95 (routed **plan**, 2026-10-13)
 **Complexity**: Small - one test, one file, no product code
+**Status**: done (2026-10-13) - `eb23a817`, `cb9f5d07`; write-up `docs/decisions/mod/mod-95.md`
 
 ## Summary
 
@@ -93,6 +94,6 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 
 ## Acceptance
 
-- [ ] The overshoot test passes on Postgres and fails if the drain close is removed
-- [ ] No product code changes
-- [ ] Gate green; rust-reviewer run; MOD-95 closed out (write-up, DECISIONS, HANDOFF)
+- [x] The overshoot test passes on Postgres and fails if the drain close is removed
+- [x] No product code changes
+- [x] Gate green; rust-reviewer run; MOD-95 closed out (write-up, DECISIONS, HANDOFF)

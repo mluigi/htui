@@ -14,21 +14,16 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-13):** **TOOL-11 is done** (`docs/decisions/tool/tool-11.md`): `scripts/hr up --headroom`
-makes a sandbox run's Claude go through the run's own headroom proxy (started by `attach`, readiness-checked, falls
-back to a direct session; default off). Owed on the host: a real `up --headroom` run. Before it, **MOD-91 is done** (`docs/decisions/mod/mod-91.md`): every Claude Code
-session htui drives (`claude-cli` argv, ACP `_meta` on new/resume/load) runs with
-`disableAllHooks` and `--disable-slash-commands`, so the user's and the repo's mods, settings hooks and skills
-stay out; a per-row `mods (y/n)` in Settings > Agents opts back in, `HTUI_SESSION=1` marks the session, and an
-`extra_args` `--settings` that would undo it is refused. Filed **MOD-96** (settings-file permission rules and the
-permission mode still pre-approve). Beside it, **MOD-92 is done** (`docs/decisions/mod/mod-92.md`): `htui status`,
-`htui waiting` and `htui --search-items … --json` print one versioned JSON document each (schema and exit codes in
-`docs/htui-cli.md`) over a read-only Postgres session; an unreachable store answers `"store":"offline"` and exit 3,
-never cached data. With both done, MOD-93 is unblocked. Filed **MOD-95** for an `auto_queue` test that fails
-on `main` too. Owed on the host: the Postgres gate on the merged tree. Before them, **ANA-29 was concluded** (`docs/ANA-29.md`, `docs/decisions/ana/ana-29.md`): Claude Code mods
-for developing htui and for using it elsewhere - MOD-91 (done) isolates htui-driven sessions first; dev side
-**TOOL-8**/**TOOL-9**/**TOOL-10** and **CLEAN-12**; consumer side MOD-92 (done), then **MOD-93**, with **MOD-94**
-behind a maintainer decision.
+**Current status (2026-10-13):** **MOD-95 is done** (`docs/decisions/mod/mod-95.md`): the `auto_queue` overshoot test
+pinned its batch open, a pre-L4 assertion from CLEAN-9's branch; under MOD-12 review L4 the batch closes `drained`, so
+the test now pins that (test-only, no product change). Before it, **TOOL-11 is done** (`docs/decisions/tool/tool-11.md`):
+`scripts/hr up --headroom` makes a sandbox run's Claude go through the run's own headroom proxy (started by `attach`,
+readiness-checked, falls back to a direct session; default off). Owed on the host: a real `up --headroom` run. Before
+them, **MOD-91 and MOD-92 are done** (`docs/decisions/mod/mod-91.md`, `docs/decisions/mod/mod-92.md`): htui-driven
+Claude Code sessions run with `disableAllHooks` and `--disable-slash-commands` (per-row `mods (y/n)` opts back in;
+**MOD-96** filed for settings-file permission rules), and `htui status`, `htui waiting` and `htui --search-items … --json`
+print one versioned JSON document each over a read-only Postgres session (`docs/htui-cli.md`). With both done, MOD-93
+is unblocked; MOD-94 stays behind a maintainer decision. Owed on the host: the Postgres gate on the merged tree.
 Live coordinates after MOD-70 and MOD-12 M1: migrations run through `0017_follow_up` (`run_command.run_step_id`,
 `text`; `follow_up_window`; MOD-12's `0016_auto_queue`: `queue_entry`, `queue_batch`, `run.batch_id`), so **the next
 migration is `0018`** (cache: `0005`). MOD-37's `0014_run_step_opening` and MOD-11's queue migration both landed as
@@ -484,14 +479,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 
 ### Deferred backlog
 
-- [ ] **MOD-95 - auto_queue overshoot test: the batch closes as drained** (found at MOD-92's gate).
-  `R-ORCH-6`, `R-AGT-7`. `htui-worker` `tests/auto_queue.rs`
-  `a_batch_overshoots_its_cap_by_at_most_one_attempt_pg` fails at `:2210`: after the overshoot the
-  batch reads `closed_reason = 'drained'` where the test pins it open ("the batch is still open after
-  the overshoot"). It fails identically on `main` `19b708fa`, so it predates MOD-92. The open-batch
-  assertion came from CLEAN-9 (`d0be442f`), the drain close from MOD-12 (`b9604b57`), built in
-  separate sandboxes; decide which behaviour is right (the next sweep declining by cap, or the batch
-  closing as drained) and fix the code or the test. Not blocked.
 - [ ] **CLEAN-10 - `cargo doc` fails on private intra-doc links** (found at MOD-12 M2's gate).
   `cargo doc --workspace --no-deps --all-features` stops with 17 errors in `htui-core` and
   `htui-store`. They are public docs linking to private items (`close_batch` →
@@ -580,6 +567,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
-| MOD-N   | 23 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-89 `.env` in a worktree, MOD-93 consumer Claude Code plugin, MOD-94 permission answers outside the TUI, MOD-95 auto_queue overshoot test, MOD-96 settings-file permission rules in driven sessions, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 22 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-89 `.env` in a worktree, MOD-93 consumer Claude Code plugin, MOD-94 permission answers outside the TUI, MOD-96 settings-file permission rules in driven sessions, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 3 (CLEAN-10 `cargo doc` private links, CLEAN-11 CLEAN-9 deferred review residuals, CLEAN-12 `.claude/` hygiene) |
 | TOOL-N  | 3 (TOOL-8 `htui-dev` mod, TOOL-9 gate script and git hooks, TOOL-10 sandbox mod hardening) |
