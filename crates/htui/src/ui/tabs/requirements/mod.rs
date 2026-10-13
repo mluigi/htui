@@ -1052,9 +1052,11 @@ impl RequirementsTab {
         );
     }
 
-    /// The hint row for the current mode, through its stack and `keys` (MOD-67 M4 D9).
-    fn hint(&self, keys: &Keys, theme: &Theme) -> Line<'static> {
-        match &self.mode {
+    /// The keys of the current mode for the shell's hint row, through its stack and `keys`
+    /// (MOD-67 M4 D9, M6 T2): Browse's three groups, the writes greyed where a write would be
+    /// refused; a form's spec. `None` when no key of it is bound.
+    fn keys_line(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
+        let line = match &self.mode {
             Mode::Browse => {
                 let writes = if self.writes_allowed() {
                     theme.base
@@ -1064,7 +1066,7 @@ impl RequirementsTab {
                 // Three groups, the writes in their own style; an unbound group drops out with
                 // its separator.
                 let stack = self.stack();
-                let mut spans = vec![Span::styled(" ", theme.base)];
+                let mut spans = Vec::new();
                 for (spec, style) in [
                     (HINT_MOVE, theme.base),
                     (HINT_WRITES, writes),
@@ -1074,39 +1076,38 @@ impl RequirementsTab {
                     if text.is_empty() {
                         continue;
                     }
-                    if spans.len() > 1 {
+                    if !spans.is_empty() {
                         spans.push(Span::styled(" \u{b7} ", theme.base));
                     }
                     spans.push(Span::styled(text, style));
                 }
                 Line::from(spans)
             }
-            Mode::Filter { field } => {
-                let mut spans = vec![Span::styled(" /", theme.accent)];
-                spans.extend(field.line(FILTER_WIDTH, true, theme).spans);
-                spans.push(Span::styled(
-                    format!("  {}", keys.hint(self.stack(), FILTER_HINT)),
-                    theme.dim,
-                ));
-                Line::from(spans)
-            }
-            Mode::NewArea(_) => Line::styled(
-                format!(" {}", keys.hint(self.stack(), FORM_HINT)),
-                theme.dim,
-            ),
+            Mode::Filter { .. } => Line::styled(keys.hint(self.stack(), FILTER_HINT), theme.dim),
+            Mode::NewArea(_) => Line::styled(keys.hint(self.stack(), FORM_HINT), theme.dim),
             Mode::Requirement(form) => {
                 let mut text = keys.hint(self.stack(), FORM_HINT);
                 if form.focus == FormFocus::Priority {
                     text.push_str(" \u{b7} ");
                     text.push_str(&keys.hint(self.stack(), PRIORITY_HINT));
                 }
-                Line::styled(format!(" {text}"), theme.dim)
+                Line::styled(text, theme.dim)
             }
-            Mode::Withdraw(_) => Line::styled(
-                format!(" {}", keys.hint(self.stack(), WITHDRAW_HINT)),
-                theme.dim,
-            ),
-        }
+            Mode::Withdraw(_) => Line::styled(keys.hint(self.stack(), WITHDRAW_HINT), theme.dim),
+        };
+        (line.width() > 0).then_some(line)
+    }
+
+    /// The row under the notice: the filter's input (` /` and the field) while it is open, blank
+    /// otherwise. Kept in every mode so the tree's height does not move; the keys that shared it
+    /// are the shell's hint row (MOD-67 M6 T2, [`Tab::key_hint`]).
+    fn filter_row(&self, theme: &Theme) -> Line<'static> {
+        let Mode::Filter { field } = &self.mode else {
+            return Line::default();
+        };
+        let mut spans = vec![Span::styled(" /", theme.accent)];
+        spans.extend(field.line(FILTER_WIDTH, true, theme).spans);
+        Line::from(spans)
     }
 }
 
@@ -1261,6 +1262,10 @@ impl Tab for RequirementsTab {
         }
     }
 
+    fn key_hint(&self, _width: u16, ctx: &Ctx<'_>) -> Option<Line<'static>> {
+        self.keys_line(ctx.keys(), ctx.theme)
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let (notice, style) = match &self.notice {
             Some(Notice::Info(text)) => (text.as_str(), ctx.theme.dim),
@@ -1292,7 +1297,7 @@ impl Tab for RequirementsTab {
             ),
             notice_row,
         );
-        frame.render_widget(Paragraph::new(self.hint(ctx.keys(), ctx.theme)), hint_row);
+        frame.render_widget(Paragraph::new(self.filter_row(ctx.theme)), hint_row);
     }
 
     fn reveal(&mut self, target: &RevealTarget, ctx: &mut Ctx<'_>) -> bool {
@@ -1550,7 +1555,8 @@ mod tests {
     /// The style the Browse hint draws the four write words in.
     fn write_words_style(tab: &RequirementsTab, theme: &Theme) -> Style {
         let writes = Keys::compiled().hint(views::REQUIREMENTS_BROWSE, HINT_WRITES);
-        tab.hint(Keys::compiled(), theme)
+        tab.keys_line(Keys::compiled(), theme)
+            .expect("the defaults bind the keys")
             .spans
             .iter()
             .find(|span| span.content == writes)

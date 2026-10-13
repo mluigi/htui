@@ -611,6 +611,20 @@ impl Harness {
         buffer_text(term.backend().buffer())
     }
 
+    /// Draws a frame and returns its buffer, for a check on a cell's style rather than its text
+    /// (MOD-67 M6 T2: the hint row's greyed write keys).
+    ///
+    /// # Panics
+    ///
+    /// If the `TestBackend` fails to draw, which it only does when a widget panics.
+    pub fn render_buffer(&mut self) -> Buffer {
+        let Self { term, app, .. } = self;
+        if let Err(error) = term.draw(|frame| app.render(frame)) {
+            panic!("the test backend failed to draw: {error}");
+        }
+        term.backend().buffer().clone()
+    }
+
     /// How many requests are queued and not yet served: what the next [`Harness::settle`] or
     /// [`Harness::drive`] answers. A case that queues requests with `key` or `Action::Tick` and
     /// serves them later can pin that they were in flight (MOD-13 milestone 4 review L1).
