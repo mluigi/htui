@@ -37,6 +37,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{Ctx, Handled};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::run_worker::{OrchReply, Via};
 use crate::store_worker::{ChatFrame, StoreReply, StoreRequest};
 use crate::ui::cells::{self, cell_width};
@@ -60,12 +61,55 @@ const NONE: &str = "\u{2014}";
 /// this is.
 const STEP_TAIL: usize = 8;
 
-/// The last line while a replay is open: the three keys that do anything, and the way out.
-const REPLAY_HINT: &str = "Esc leave replay · t thoughts · j/k scroll";
+/// The last line while a replay is open (`CHAT_REPLAY`): the three keys that do anything, and the
+/// way out.
+const REPLAY_HINT: HintSpec = &[
+    Hint::One(Act::Back, "leave replay"),
+    Hint::One(Act::ChatThoughts, "thoughts"),
+    Hint::Pair(Act::ListDown, Act::ListUp, "scroll"),
+];
+
+/// The open composer's keys (`CAPTURE`): its own, fixed (ANA-26 §6.1).
+const COMPOSE_HINT: HintSpec = &[Hint::Text("Enter send"), Hint::Text("Esc leave")];
+
+/// A parked permission request (`CHAT_LIVE`): the digits are fixed ahead of the resolver (D5).
+const PARKED_HINT: HintSpec = &[
+    Hint::Text("1-9 answer"),
+    Hint::One(Act::ChatCompose, "compose"),
+    Hint::One(Act::ChatThoughts, "thoughts"),
+];
+
+/// A chat that has ended (`CHAT_LIVE`).
+const ENDED_HINT: HintSpec = &[
+    Hint::Text("this chat has ended"),
+    Hint::One(Act::ChatCompose, "compose"),
+];
+
+/// A live chat (`CHAT_LIVE`), before the doubled end key.
+const LIVE_HINT: HintSpec = &[Hint::One(Act::ChatCompose, "compose")];
+
+/// A live chat (`CHAT_LIVE`), after the doubled end key.
+const LIVE_HINT_TAIL: HintSpec = &[
+    Hint::One(Act::ChatThoughts, "thoughts"),
+    Hint::Pair(Act::ListDown, Act::ListUp, "scroll"),
+];
+
+/// No chat yet (`CHAT_LIVE`).
+const IDLE_HINT: HintSpec = &[
+    Hint::One(Act::ChatCompose, "compose the first prompt"),
+    Hint::One(Act::ChatNextAgent, "next agent"),
+];
 
 /// `StoreRequest::name` of a promotion (blueprint D209): its refusal is this tab's to show, since
 /// the shell asked for it on the tab's behalf.
 const PROMOTE_STEP: &str = crate::run_worker::ORCH_NAMES[5];
+
+/// A key with no modifier but `SHIFT`, which is how a terminal reports a capital: the keys the
+/// tab keeps fixed ahead of the resolver (replay's swallow, the parked request's digits, MOD-67
+/// M5 D5) match only these, so a chord passes exactly as the old CONTROL/ALT guard made it.
+fn plain(key: &KeyEvent) -> bool {
+    (key.modifiers - KeyModifiers::SHIFT).is_empty()
+}
 
 /// The live chat, once one has been accepted.
 #[derive(Debug, Clone)]
@@ -103,9 +147,9 @@ pub struct PromotedHeader {
 /// A past step, reopened read-only (D40, `R-HIS-2`).
 ///
 /// "Read-only" is a property of what the tab can **send**, not of what it draws greyed out: while
-/// this is `Some` the whole key path is `ChatTab::on_key_replay`, which is handed no [`Ctx`] and
-/// so cannot issue a request even by mistake. The live session underneath is untouched and comes
-/// back exactly as it was when `Esc` closes this.
+/// this is `Some` the whole key path is `ChatTab::on_key_replay`, which is handed the keys in force
+/// and no [`Ctx`], and so cannot issue a request even by mistake. The live session underneath is
+/// untouched and comes back exactly as it was when `Esc` closes this.
 #[derive(Debug)]
 pub struct ReplayState {
     /// The step whose log is on screen.
@@ -219,45 +263,76 @@ impl ChatTab {
 
     /// Every key while a replay is open — the whole of D40's read-only guarantee.
     ///
-    /// It takes no [`Ctx`], which is the point: a mode that *cannot* reach the request sink is
-    /// one a reviewer can check by looking at this signature, rather than by trusting that no
-    /// arm below grew a `ctx.request` later. `Esc` leaves; the keys the live tab would act on
+    /// It takes the keys in force and no [`Ctx`], which is the point: a mode that *cannot* reach
+    /// the request sink is one a reviewer can check by looking at this signature, rather than by
+    /// trusting that no arm below grew a `ctx.request` later. The keys the live tab would act on
     /// (`i`, `Enter`, a digit, `a`) are consumed and do nothing, because a finished step takes no
-    /// prompt and answers no permission request (D41); everything else is the transcript's, so
-    /// scrolling and `t` work exactly as they do live.
+    /// prompt and answers no permission request (D41): fixed, first and on plain keys only
+    /// (MOD-67 M5 D5), so `alt-2` still reaches the shell. The rest resolves through
+    /// [`views::CHAT_REPLAY`]: `common.back` (`Esc`) leaves, and the transcript's acts scroll and
+    /// fold exactly as they do live; anything else is the shell's (`q`, `Tab`, `?`).
     ///
     /// The digits are *consumed* rather than passed on for the same reason the live tab consumes
     /// them: a `2` typed at a permission row must not fall through to the global tab-select
     /// binding and move the user off the conversation they are reading.
-    fn on_key_replay(&mut self, key: KeyEvent) -> Handled {
-        if key.code == KeyCode::Esc {
-            // Nothing else is touched: the session, its transcript and the composer's text are
-            // all exactly as replay found them. The cancel is disarmed rather than restored, and
-            // deliberately so - it was disarmed when the replay opened, precisely so that *this*
-            // key cannot be the second half of an `Esc Esc` that ends the live chat.
-            self.replay = None;
+    fn on_key_replay(&mut self, key: KeyEvent, keys: &Keys) -> Handled {
+        if plain(&key)
+            && matches!(
+                key.code,
+                KeyCode::Char('1'..='9' | 'i' | 'a') | KeyCode::Enter
+            )
+        {
             return Handled::Consumed;
         }
-        match key.code {
-            KeyCode::Char('1'..='9' | 'i' | 'a') | KeyCode::Enter => Handled::Consumed,
-            _ => self
+        match keys
+            .actions(views::CHAT_REPLAY, KeyChord::from_event(key))
+            .first()
+            .copied()
+        {
+            Some(Act::Back) => {
+                // Nothing else is touched: the session, its transcript and the composer's text
+                // are all exactly as replay found them. The cancel is disarmed rather than
+                // restored, and deliberately so - it was disarmed when the replay opened,
+                // precisely so that *this* key cannot be the second half of an `Esc Esc` that
+                // ends the live chat.
+                self.replay = None;
+                Handled::Consumed
+            }
+            Some(act) => self
                 .replay
                 .as_mut()
-                .map_or(Handled::Pass, |replay| replay.transcript.on_key(key)),
+                .map_or(Handled::Pass, |replay| replay.transcript.on_act(act)),
+            None => Handled::Pass,
         }
     }
 
-    /// The replay header: which step is on screen, how much of it there is, and that it is over.
+    /// The replay header: which step is on screen, how much of it there is, and that it is over,
+    /// naming the key that leaves it (`common.back` through `CHAT_REPLAY`; unbound, no key).
     fn replay_header(replay: &ReplayState, ctx: &Ctx<'_>) -> Line<'static> {
         let id = replay.step_id.to_string();
         let step = id.get(id.len().saturating_sub(STEP_TAIL)..).unwrap_or(&id);
+        let leave = ctx.keys().label(views::CHAT_REPLAY, Act::Back).map_or_else(
+            || " · read-only".to_owned(),
+            |label| format!(" · read-only · {label} leave"),
+        );
         Line::from(vec![
             Span::styled(
                 format!("replay · step …{step} · {} rows", replay.transcript.len()),
                 ctx.theme.accent,
             ),
-            Span::styled(" · read-only · Esc leave", ctx.theme.dim),
+            Span::styled(leave, ctx.theme.dim),
         ])
+    }
+
+    /// The current mode's stack, which [`Tab::key_stack`] reports and the hints label through.
+    fn stack(&self) -> Stack<'static> {
+        if self.replay.is_some() {
+            views::CHAT_REPLAY
+        } else if self.composer.is_active() {
+            views::CAPTURE
+        } else {
+            views::CHAT_LIVE
+        }
     }
 
     /// Sends what the composer submitted: the first text starts a chat, later ones are follow-ups.
@@ -401,14 +476,16 @@ impl ChatTab {
         (!missing.is_empty()).then(|| format!("this agent cannot: {}", missing.join(", ")))
     }
 
-    /// The hint under the transcript.
+    /// The hint under the transcript, each key labelled through the current mode's stack (MOD-67
+    /// M5 D9), so a rebound key shows its new chord.
     ///
     /// A refusal takes this line while there is a live conversation to keep on screen, and is
     /// cleared by the next key or the next frame.
-    fn hint(&self) -> String {
+    fn hint(&self, keys: &Keys) -> String {
+        let stack = self.stack();
         // A replay offers three keys and no refusal can apply to it: nothing it can do fails.
         if self.replay.is_some() {
-            return REPLAY_HINT.to_owned();
+            return keys.hint(stack, REPLAY_HINT);
         }
         if let Some(refusal) = &self.refusal
             && self.session.is_some()
@@ -416,18 +493,31 @@ impl ChatTab {
             return refusal.clone();
         }
         if self.composer.is_active() {
-            return "Enter send · Esc leave".to_owned();
+            return keys.hint(stack, COMPOSE_HINT);
         }
         if self.cancel_armed {
+            // Key prose, M6's (MOD-67 D11).
             return "Esc again ends this chat".to_owned();
         }
         if self.transcript.parked().is_some() {
-            return "1-9 answer · i compose · t thoughts".to_owned();
+            return keys.hint(stack, PARKED_HINT);
         }
         match &self.session {
-            Some(state) if state.ended.is_some() => "this chat has ended · i compose".to_owned(),
-            Some(_) => "i compose · Esc Esc end · t thoughts · j/k scroll".to_owned(),
-            None => "i compose the first prompt · a next agent".to_owned(),
+            Some(state) if state.ended.is_some() => keys.hint(stack, ENDED_HINT),
+            // The end key is pressed twice, which no `Hint` element spells: its label is doubled
+            // by hand, and an unbound end drops out like any element.
+            Some(_) => [
+                keys.hint(stack, LIVE_HINT),
+                keys.label(stack, Act::ChatEnd)
+                    .map(|label| format!("{label} {label} end"))
+                    .unwrap_or_default(),
+                keys.hint(stack, LIVE_HINT_TAIL),
+            ]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · "),
+            None => keys.hint(stack, IDLE_HINT),
         }
     }
 }
@@ -452,41 +542,52 @@ impl Tab for ChatTab {
         // header keeps naming the new scope's first project, which is where the *next* chat goes.
     }
 
+    /// The stack of the Chat's current mode (MOD-67 M5 D4, PA-4): the replay's while one is open,
+    /// `CAPTURE` while the composer is, else the live view's (idle, live, parked or ended: one key
+    /// set, the agent cycle declined once a session exists, the digits fixed ahead of it).
+    fn key_stack(&self) -> Option<Stack<'static>> {
+        Some(self.stack())
+    }
+
+    /// Each mode resolves through its stack (MOD-67 M5 D4, D5): the replay's swallow, the open
+    /// composer and the parked request's digits stay fixed ahead of the resolver (ANA-26 §6.1),
+    /// each on plain keys only, so a chord passes exactly as the old CONTROL/ALT guard made it.
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         // A refusal is transient: it says what the last key could not do, and the next one clears
         // it whatever it was.
         self.refusal = None;
-        // A chord is the shell's (`Ctrl+F`, `Ctrl+C`), never composer text: every other text widget
-        // passes it the same way (`TextField::on_key`, MOD-64 F7).
-        if key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        {
-            return Handled::Pass;
-        }
+        let chord = KeyChord::from_event(key);
         // Before the composer, before the digits, before anything that could send: a replay is a
         // mode with no command path at all (D40), and `on_key_replay` is handed no `ctx` to prove
         // it. An open composer underneath keeps its text — it simply cannot be typed into until
         // `Esc` puts the live view back.
         if self.replay.is_some() {
-            return self.on_key_replay(key);
+            return self.on_key_replay(key, ctx.keys());
         }
         // The composer owns every key while it is open, so the tab's own single letters stay
-        // single letters everywhere else.
-        match self.composer.on_key(key) {
-            ComposerOutcome::Consumed => return Handled::Consumed,
-            ComposerOutcome::Submit(text) => {
-                self.submit(text, ctx);
-                return Handled::Consumed;
+        // single letters everywhere else; but it is offered only what `CAPTURE` does not pass. A
+        // chord or a function key is the shell's (`Ctrl+F`, `Ctrl+C`, `F1`), never composer text:
+        // every other text widget passes it the same way (`TextField::on_key`, MOD-64 F7).
+        if self.composer.is_active() {
+            if views::CAPTURE.passes(chord) {
+                return Handled::Pass;
             }
-            ComposerOutcome::Leave => return Handled::Consumed,
-            ComposerOutcome::Pass => {}
+            match self.composer.on_key(key) {
+                ComposerOutcome::Consumed => return Handled::Consumed,
+                ComposerOutcome::Submit(text) => {
+                    self.submit(text, ctx);
+                    return Handled::Consumed;
+                }
+                ComposerOutcome::Leave => return Handled::Consumed,
+                ComposerOutcome::Pass => {}
+            }
         }
 
         // A digit answers the parked request, and **every** digit is consumed while one is
         // waiting: a `4` with three options on screen must not fall through to the global
         // tab-select binding and move the user off the conversation the agent is blocked on.
-        if let KeyCode::Char(digit @ '1'..='9') = key.code
+        if plain(&key)
+            && let KeyCode::Char(digit @ '1'..='9') = key.code
             && self.transcript.parked().is_some()
         {
             self.answer(digit, ctx);
@@ -494,16 +595,19 @@ impl Tab for ChatTab {
             return Handled::Consumed;
         }
 
-        let handled = match key.code {
-            KeyCode::Char('i') | KeyCode::Enter => {
+        let first = ctx.keys().actions(views::CHAT_LIVE, chord).first().copied();
+        let handled = match first {
+            Some(Act::ChatCompose) => {
                 self.composer.enter();
                 Handled::Consumed
             }
-            KeyCode::Char('a') if self.session.is_none() && !self.agents.is_empty() => {
+            // Declined with a session or no agent: `chat.next_agent` is no transcript act, so the
+            // arm below passes it.
+            Some(Act::ChatNextAgent) if self.session.is_none() && !self.agents.is_empty() => {
                 self.agent_index = (self.agent_index + 1) % self.agents.len();
                 Handled::Consumed
             }
-            KeyCode::Esc => {
+            Some(Act::ChatEnd) => {
                 match (self.cancel_armed, self.session.as_ref()) {
                     (true, Some(session)) => {
                         ctx.request(StoreRequest::ChatCancel {
@@ -519,9 +623,12 @@ impl Tab for ChatTab {
                 }
                 Handled::Consumed
             }
-            _ => self.transcript.on_key(key),
+            Some(act) => self.transcript.on_act(act),
+            None => Handled::Pass,
         };
-        if key.code != KeyCode::Esc {
+        // Any key but the end disarms it; a chord never did (the old guard returned before
+        // this), so a rebound `[chat] end = "ctrl-e"` still arms on `ctrl-e`.
+        if first != Some(Act::ChatEnd) && plain(&key) {
             self.cancel_armed = false;
         }
         handled
@@ -746,10 +853,16 @@ impl Tab for ChatTab {
             // Not `Composer::render`: the composer belongs to the live view, and a replay must
             // not show an input line for a step that can take no input.
             Some(_) => frame.render_widget(
-                Paragraph::new(Line::styled(self.hint(), ctx.theme.dim)),
+                Paragraph::new(Line::styled(self.hint(ctx.keys()), ctx.theme.dim)),
                 composer,
             ),
-            None => Composer::render(frame, composer, &self.composer, &self.hint(), ctx.theme),
+            None => Composer::render(
+                frame,
+                composer,
+                &self.composer,
+                &self.hint(ctx.keys()),
+                ctx.theme,
+            ),
         }
     }
 }
@@ -1562,7 +1675,7 @@ mod tests {
             &mut shell.ctx(),
         );
 
-        assert_eq!(tab.hint(), sentence);
+        assert_eq!(tab.hint(Keys::compiled()), sentence);
         assert!(
             tab.session().is_some_and(|session| session.ended.is_none()),
             "the session is still live"
