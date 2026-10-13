@@ -1,0 +1,24 @@
+{
+  "name": "htui",
+  "version": "0.0.0-source",
+  "description": "Read htui's state from Claude Code and hand work to htui",
+  "author": {
+    "name": "htui"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "panel": {
+      "type": "string",
+      "title": "Panel",
+      "description": "auto: a band above the prompt when something waits, and /htui opens a pane; command: no band, /htui opens the pane; off: /htui prints the rows as text",
+      "default": "auto",
+      "options": ["auto", "command", "off"]
+    },
+    "poll_seconds": {
+      "type": "number",
+      "title": "Poll seconds",
+      "description": "Seconds between htui waiting polls while the band or pane shows (at least 5)",
+      "default": 30
+    }
+  }
+}
