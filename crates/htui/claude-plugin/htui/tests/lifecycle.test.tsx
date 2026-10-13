@@ -60,29 +60,49 @@ test('command polls nothing until /htui and stops when the pane closes', { optio
   await clock.settle()
   await clock.advance(30000)
   expect(waitingCalls(calls)).toBe(0)
-  expect(panes).toBe(0)
+  // V2: session.start asks once whether the pane stayed open; it did not.
+  expect(panes).toBe(1)
   const r = await $.command.run({ command: 'htui', args: '' } as never)
   expect(r.text).toBeUndefined()
   await clock.settle()
   expect(waitingCalls(calls)).toBe(1)
   await clock.advance(30000)
   expect(waitingCalls(calls)).toBe(2)
-  expect(panes).toBe(1)
+  expect(panes).toBe(2)
   isOpen = false
   // The first tick after the close finds the pane gone and cancels the timer: no tick follows.
   await clock.advance(30000)
-  expect(panes).toBe(2)
+  expect(panes).toBe(3)
   await clock.advance(30000)
   await clock.advance(30000)
-  expect(panes).toBe(2)
+  expect(panes).toBe(3)
   expect(waitingCalls(calls)).toBe(2)
   // /htui again starts a new timer.
   await $.command.run({ command: 'htui', args: '' } as never)
   await clock.settle()
   expect(waitingCalls(calls)).toBe(3)
   await clock.advance(30000)
-  expect(panes).toBe(3)
+  expect(panes).toBe(4)
   expect(waitingCalls(calls)).toBe(4)
+})
+
+test('command resumes polling when the pane stayed open across a reload', { options: { panel: 'command' } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const calls: Call[] = []
+  htui(on, { waiting: ok(WAITING) }, calls)
+  let isOpen = true
+  on('ui.panes', async () => ({
+    value: isOpen ? [{ id: 'htui', title: 'htui', isShown: true, isFocused: false, isPlaced: true }] : [],
+  }))
+  await start($, on)
+  await clock.settle()
+  expect(waitingCalls(calls)).toBe(1)
+  await clock.advance(30000)
+  expect(waitingCalls(calls)).toBe(2)
+  isOpen = false
+  await clock.advance(30000)
+  await clock.advance(30000)
+  expect(waitingCalls(calls)).toBe(2)
 })
 
 test('off never polls and never opens a pane', { options: { panel: 'off' } }, async ($, on) => {

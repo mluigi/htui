@@ -157,15 +157,20 @@ async function poll($: EngineInterface): Promise<void> {
   }
 }
 
+/** Whether the engine lists the `htui` pane as open (A-4), or null when it cannot say. */
+async function paneOpen($: EngineInterface): Promise<boolean | null> {
+  try {
+    return (await $.ui.panes()).some(p => p.id === PANE)
+  } catch {
+    return null
+  }
+}
+
 /** One period: under `command`, stops the timer once the pane is closed; otherwise polls. */
 async function tick($: EngineInterface): Promise<void> {
   if (panel === 'command') {
-    let isOpen: boolean
-    try {
-      isOpen = (await $.ui.panes()).some(p => p.id === PANE)
-    } catch {
-      return
-    }
+    const isOpen = await paneOpen($)
+    if (isOpen === null) return
     if (!isOpen) {
       timer?.cancel()
       timer = null
@@ -173,6 +178,13 @@ async function tick($: EngineInterface): Promise<void> {
     }
   }
   await poll($)
+}
+
+/** V2: under `command`, a pane that stayed open across a reload polls again, as /htui would. */
+async function resume($: EngineInterface): Promise<void> {
+  if ((await paneOpen($)) !== true) return
+  void poll($)
+  startTimer($)
 }
 
 /** Starts the poll timer unless one runs. */
@@ -223,6 +235,8 @@ export const register: Register = (on, options) => {
     if (panel === 'auto') {
       void poll($)
       startTimer($)
+    } else if (panel === 'command') {
+      void resume($)
     }
     return next(e)
   })
