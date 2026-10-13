@@ -254,8 +254,9 @@ async fn state_target<'w>(
 }
 
 /// `--cwd`: the project whose repository, registered on this box, holds `cwd` (the deepest
-/// checkout). Both sides go through `std::fs::canonicalize` on this machine, so symlinks, Windows'
-/// verbatim prefixes and its casing compare alike. Shared by `status`, `waiting` and
+/// checkout). `cwd` goes through `std::fs::canonicalize` on this machine and the stored paths went
+/// through it when they were written ([`checkouts`]), so symlinks, Windows' verbatim prefixes and
+/// its casing compare alike, and only `cwd` is resolved on disk. Shared by `status`, `waiting` and
 /// `--search-items`.
 pub(crate) async fn cwd_project(
     pg: &PgStore,
@@ -299,7 +300,7 @@ pub(crate) async fn cwd_project(
                 .map(|project| (*project, row.local_path))
         })
         .collect();
-    match project_for_cwd(&canonical, &canonical_checkouts(rows)) {
+    match project_for_cwd(&canonical, &checkouts(rows)) {
         CwdMatch::None => Err(cwd_unmatched(cwd)),
         CwdMatch::One(project) => Ok(project),
         CwdMatch::Ambiguous(projects) => {
@@ -1031,7 +1032,7 @@ enum CwdMatch {
 }
 
 /// The deepest checkout holding `cwd`, component-wise (`/src/htui2` is not inside `/src/htui`).
-/// Pure; both sides already canonical.
+/// Pure: `cwd` canonical, the checkouts as stored (canonical when written, [`checkouts`]).
 fn project_for_cwd(cwd: &Path, checkouts: &[(ProjectId, PathBuf)]) -> CwdMatch {
     let mut deepest = 0;
     let mut found: Vec<ProjectId> = Vec::new();
@@ -1059,11 +1060,15 @@ fn project_for_cwd(cwd: &Path, checkouts: &[(ProjectId, PathBuf)]) -> CwdMatch {
     }
 }
 
-/// The stored checkout paths through `std::fs::canonicalize`; a path that does not resolve (gone
-/// from this box) cannot hold an existing `cwd` and is skipped.
-fn canonical_checkouts(rows: Vec<(ProjectId, String)>) -> Vec<(ProjectId, PathBuf)> {
+/// The stored checkout paths as written (review R1 L8). Every writer of
+/// `repo_box_path.local_path` (`SetRepoPath`, the checkout inference) stores what
+/// `std::fs::canonicalize` answered on this box, so they compare with the canonical `cwd` as they
+/// are, Windows' verbatim prefix and casing included. None is touched on disk: a registered
+/// checkout on a dead network mount cannot stall `--cwd`, and one that is gone simply holds no
+/// existing `cwd`.
+fn checkouts(rows: Vec<(ProjectId, String)>) -> Vec<(ProjectId, PathBuf)> {
     rows.into_iter()
-        .filter_map(|(project, path)| std::fs::canonicalize(path).ok().map(|path| (project, path)))
+        .map(|(project, path)| (project, PathBuf::from(path)))
         .collect()
 }
 
@@ -1697,17 +1702,39 @@ mod tests {
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&checkout, &link).expect("symlink");
         let a = project(0xa);
-        let checkouts = canonical_checkouts(vec![
-            (a, checkout.display().to_string()),
-            (project(0xb), dir.path().join("gone").display().to_string()),
-        ]);
-        assert_eq!(
-            checkouts.len(),
-            1,
-            "a path that does not resolve is skipped"
-        );
+        // As `SetRepoPath` stores it: canonical.
+        let stored = std::fs::canonicalize(&checkout).expect("resolves");
+        let checkouts = checkouts(vec![(a, stored.display().to_string())]);
         let cwd = std::fs::canonicalize(link.join("sub")).expect("resolves");
         assert_eq!(project_for_cwd(&cwd, &checkouts), CwdMatch::One(a));
+    }
+
+    /// Review R1 L8: stored checkouts are compared as written, never resolved on disk, so a path
+    /// that is gone, or on a mount that would block, costs nothing and holds no `cwd`.
+    #[test]
+    fn cwd_compares_stored_paths_as_written() {
+        let (a, b) = (project(0xa), project(0xb));
+        let rows = vec![
+            (a, "/net/dead-mount/checkout".to_owned()),
+            (b, "/src/live".to_owned()),
+        ];
+        let checkouts = checkouts(rows);
+        assert_eq!(
+            checkouts,
+            [
+                (a, PathBuf::from("/net/dead-mount/checkout")),
+                (b, PathBuf::from("/src/live")),
+            ],
+            "kept as written, nothing resolved"
+        );
+        assert_eq!(
+            project_for_cwd(Path::new("/src/live/sub"), &checkouts),
+            CwdMatch::One(b)
+        );
+        assert_eq!(
+            project_for_cwd(Path::new("/net/dead-mount2"), &checkouts),
+            CwdMatch::None
+        );
     }
 
     #[cfg(windows)]
@@ -1723,7 +1750,7 @@ mod tests {
             stored.display()
         );
         let a = project(0xa);
-        let checkouts = canonical_checkouts(vec![(a, stored.display().to_string())]);
+        let checkouts = checkouts(vec![(a, stored.display().to_string())]);
         let typed = checkout.join("Sub").display().to_string().to_uppercase();
         let cwd = std::fs::canonicalize(typed).expect("resolves case-insensitively");
         assert_eq!(project_for_cwd(&cwd, &checkouts), CwdMatch::One(a));

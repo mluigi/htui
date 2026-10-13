@@ -65,12 +65,14 @@ the top level need `--search-items`; `htui --json` alone is a usage error.
   project can belong to several workspaces; the document then reports the first of them by name.
   A slug no workspace lists is refused with `unknown_project`.
 - **`--cwd <PATH>`** reads the project whose checkout on this box contains `PATH`:
-  - `PATH` and every repository path registered for this box are put through the file system's
-    canonical form on this machine. A relative `PATH` resolves against the current directory,
-    symlinks are followed, and on Windows the drive prefix and the casing compare alike.
+  - `PATH` is put through the file system's canonical form on this machine. A relative `PATH`
+    resolves against the current directory, symlinks are followed, and on Windows the drive
+    prefix and the casing compare alike. The registered paths are compared as stored: htui stores
+    them in that same canonical form when a path is set or found, and never touches them on disk
+    here, so a registered checkout on an unreachable network mount cannot stall the command.
   - Containment is per path component: `/src/htui2` is not inside `/src/htui`.
   - The deepest checkout wins, so a checkout nested inside another one is found.
-  - A registered path that no longer exists on disk is skipped.
+  - A registered path that no longer exists on disk cannot contain `PATH`, so it never matches.
   - `PATH` that cannot be resolved is refused with `cwd_unresolved`; `PATH` in no registered
     checkout with `cwd_unmatched`.
   - When the deepest checkout is registered for two or more projects, htui does not pick one: it
