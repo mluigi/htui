@@ -620,7 +620,7 @@ mod tests {
                 provider: "infisical".into(),
                 files: crate::isolate::EnvFiles {
                     paths: vec![".env".into()],
-                    truncated: false,
+                    truncated: None,
                 },
             }
             .to_string(),

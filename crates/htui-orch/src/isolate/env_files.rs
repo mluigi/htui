@@ -13,6 +13,7 @@
 //! Everything here is synchronous and touches no store and no `gix`; it is called by
 //! `GixIsolator::env_files` under `spawn_blocking`, as [`copy`](super::copy)'s walk is.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
@@ -40,8 +41,10 @@ pub const TEMPLATE_SUFFIXES: [&str; 6] = [
 pub struct EnvFiles {
     /// The paths.
     pub paths: Vec<String>,
-    /// The walk stopped at [`SCAN_CAP`] entries; more may exist.
-    pub truncated: bool,
+    /// `Some(cap)`: the walk stopped at `cap` entries ([`SCAN_CAP`] in production); more may
+    /// exist. The cap rides along so [`listed`] names the one the walk actually met (MOD-89
+    /// review L8).
+    pub truncated: Option<usize>,
 }
 
 impl EnvFiles {
@@ -57,15 +60,22 @@ impl EnvFiles {
 /// [`TEMPLATE_SUFFIXES`] word; ASCII case-insensitive, so Windows and macOS read as Linux does.
 ///
 /// A name, not a path: whether the entry is a file is [`scan`]'s question.
+///
+/// Compared in place, without a lowercased copy: it is asked of every entry the walk yields
+/// (MOD-89 review L10). `get(..5)` is `None` off a char boundary, where no `.env.` can end.
 #[must_use]
 pub fn is_env_file(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    if lower == ".env" || lower == ".envrc" {
+    if name.eq_ignore_ascii_case(".env") || name.eq_ignore_ascii_case(".envrc") {
         return true;
     }
-    lower
-        .strip_prefix(".env.")
-        .is_some_and(|suffix| !suffix.is_empty() && !TEMPLATE_SUFFIXES.contains(&suffix))
+    name.get(..5)
+        .is_some_and(|head| head.eq_ignore_ascii_case(".env."))
+        && name.get(5..).is_some_and(|suffix| {
+            !suffix.is_empty()
+                && !TEMPLATE_SUFFIXES
+                    .iter()
+                    .any(|template| template.eq_ignore_ascii_case(suffix))
+        })
 }
 
 /// D2: walks `cwd`, then each of `extra_dirs`, for env files. Never fails.
@@ -73,34 +83,83 @@ pub fn is_env_file(name: &str) -> bool {
 /// Links are never followed; a symlink is a finding when its own name is one. `.git` is pruned
 /// whatever its type, and so is a *directory* named like an env file (a Python venv called
 /// `.env/`) or matched by one of `excludes` — directories only, so a project that excludes `.env*`
-/// from its copies does not hide a real `.env` from this check. `cap` bounds the entries visited
-/// across all roots together, one budget per session.
+/// from its copies does not hide a real `.env` from this check.
+///
+/// `cap` bounds the entries visited (each root itself aside) across all roots together, one
+/// budget per session, and it is spent where an env file most likely sits (MOD-89 review M1):
+/// every root's top level first, in root order, and only then each root's deeper levels; and
+/// within any directory its files before its subdirectories, each kind by name. So a big
+/// subdirectory of `cwd` cannot exhaust the cap before `cwd/.env` or an extra dir's own `.env`
+/// is seen, while an extra dir's nested files wait behind `cwd`'s whole subtree. The top level is
+/// read twice for this (one extra `read_dir` per root), and a directory's entries are read whole
+/// before the first is visited, which the sort needs.
 #[must_use]
 pub fn scan(cwd: &Path, extra_dirs: &[PathBuf], excludes: &[Exclude], cap: usize) -> EnvFiles {
-    let mut found = Vec::new();
-    let mut visited = 0_usize;
-    let mut truncated = false;
-
     // `cwd`'s paths are bare; an `extra_dirs` root's carry its last component (D7), so two repos'
-    // `.env` files read apart. A root with no last component (`/`) gets no prefix.
-    let roots = std::iter::once((cwd, None)).chain(extra_dirs.iter().map(|dir| {
-        (
-            dir.as_path(),
-            dir.file_name()
-                .map(|name| name.to_string_lossy().into_owned()),
-        )
-    }));
-    'roots: for (root, prefix) in roots {
-        // A missing root answers nothing (D2). `is_dir` follows a symlinked root, as `WalkDir`
-        // does for its own root.
-        if !root.is_dir() {
-            continue;
+    // `.env` files read apart. A root with no last component (`/`) gets no prefix. A missing root
+    // answers nothing (D2); `is_dir` follows a symlinked root, as `WalkDir` does for its own root.
+    let roots: Vec<(&Path, Option<String>)> = std::iter::once((cwd, None))
+        .chain(extra_dirs.iter().map(|dir| {
+            (
+                dir.as_path(),
+                dir.file_name()
+                    .map(|name| name.to_string_lossy().into_owned()),
+            )
+        }))
+        .filter(|(root, _)| root.is_dir())
+        .collect();
+    let mut walk = Walk {
+        excludes,
+        cap,
+        visited: 0,
+        found: Vec::new(),
+    };
+    // `all` stops at the first walk the cap cut.
+    let whole = roots
+        .iter()
+        .all(|(root, prefix)| walk.root(root, prefix.as_deref(), Level::Top))
+        && roots
+            .iter()
+            .all(|(root, prefix)| walk.root(root, prefix.as_deref(), Level::Below));
+
+    if !whole {
+        tracing::warn!(cap, "the env-file scan stopped at its cap");
+    }
+    let mut found = walk.found;
+    found.sort();
+    found.dedup();
+    EnvFiles {
+        paths: found,
+        truncated: (!whole).then_some(cap),
+    }
+}
+
+/// Which of a root's levels one [`Walk::root`] pass visits (MOD-89 review M1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Level {
+    /// The root's own entries.
+    Top,
+    /// Everything under the root's subdirectories.
+    Below,
+}
+
+/// [`scan`]'s state across its roots and passes: one budget, one finding list.
+struct Walk<'a> {
+    excludes: &'a [Exclude],
+    cap: usize,
+    visited: usize,
+    found: Vec<String>,
+}
+
+impl Walk<'_> {
+    /// One pass over `root` at `level`; `false` when the cap cut it.
+    fn root(&mut self, root: &Path, prefix: Option<&str>, level: Level) -> bool {
+        let mut walk = WalkDir::new(root).follow_links(false).sort_by(files_first);
+        if level == Level::Top {
+            walk = walk.max_depth(1);
         }
-        let walk = WalkDir::new(root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| keep(entry, excludes));
-        for item in walk {
+        let excludes = self.excludes;
+        for item in walk.into_iter().filter_entry(|entry| keep(entry, excludes)) {
             let entry = match item {
                 Ok(entry) => entry,
                 Err(err) => {
@@ -112,16 +171,17 @@ pub fn scan(cwd: &Path, extra_dirs: &[PathBuf], excludes: &[Exclude], cap: usize
                     continue;
                 }
             };
-            // The budget is spent on what the walk yields after pruning, across every root.
-            if visited == cap {
-                truncated = true;
-                break 'roots;
-            }
-            visited += 1;
-            if entry.depth() == 0 || entry.file_type().is_dir() {
+            // The root is not an entry, and the `Top` pass already spent the budget on its
+            // level; the `Below` pass walks through it to reach the levels under it.
+            if entry.depth() == 0 || (level == Level::Below && entry.depth() == 1) {
                 continue;
             }
-            if !is_env_file(&entry.file_name().to_string_lossy()) {
+            // The budget is spent on what the walk yields after pruning, across every root.
+            if self.visited == self.cap {
+                return false;
+            }
+            self.visited += 1;
+            if entry.file_type().is_dir() || !is_env_file(&entry.file_name().to_string_lossy()) {
                 continue;
             }
             // The walk only yields paths under its own root, so the prefix always strips.
@@ -133,22 +193,23 @@ pub fn scan(cwd: &Path, extra_dirs: &[PathBuf], excludes: &[Exclude], cap: usize
                 .map(|component| component.as_os_str().to_string_lossy())
                 .collect::<Vec<_>>()
                 .join("/");
-            found.push(match &prefix {
+            self.found.push(match prefix {
                 Some(prefix) => format!("{prefix}/{relative}"),
                 None => relative,
             });
         }
+        true
     }
+}
 
-    if truncated {
-        tracing::warn!(cap, "the env-file scan stopped at its cap");
-    }
-    found.sort();
-    found.dedup();
-    EnvFiles {
-        paths: found,
-        truncated,
-    }
+/// MOD-89 review M1: a directory's non-directories (files and links, which are never followed)
+/// before its subdirectories, each kind by name, so the walk's order is deterministic and a big
+/// subdirectory cannot spend the cap before a sibling `.env` is seen.
+fn files_first(a: &walkdir::DirEntry, b: &walkdir::DirEntry) -> std::cmp::Ordering {
+    a.file_type()
+        .is_dir()
+        .cmp(&b.file_type().is_dir())
+        .then_with(|| a.file_name().cmp(b.file_name()))
 }
 
 /// [`scan`]'s prune rule, asked of every entry before the walk yields or enters it: the root is
@@ -167,10 +228,11 @@ fn keep(entry: &walkdir::DirEntry, excludes: &[Exclude]) -> bool {
 }
 
 /// D7's `<list>`: the first [`LISTED`] paths backticked and joined with `, `, then
-/// ` and {n} more`, then ` (scan cut at {SCAN_CAP} entries)` when truncated.
+/// ` and {n} more`, then ` (scan cut at {cap} entries)` when the walk stopped at `cap`.
 ///
 /// A control character renders as `?`: Linux allows a newline in a file name, and `run.failure`
-/// and an item note are single-line in the TUI.
+/// and an item note are single-line in the TUI. So does a backtick, which would close the path's
+/// code span early (MOD-89 review L9).
 #[must_use]
 pub fn listed(files: &EnvFiles) -> String {
     let mut list = files
@@ -180,17 +242,24 @@ pub fn listed(files: &EnvFiles) -> String {
         .map(|path| {
             let shown: String = path
                 .chars()
-                .map(|ch| if ch.is_control() { '?' } else { ch })
+                .map(|ch| {
+                    if ch.is_control() || ch == '`' {
+                        '?'
+                    } else {
+                        ch
+                    }
+                })
                 .collect();
             format!("`{shown}`")
         })
         .collect::<Vec<_>>()
         .join(", ");
+    // Writing to a `String` cannot fail.
     if files.paths.len() > LISTED {
-        list.push_str(&format!(" and {} more", files.paths.len() - LISTED));
+        let _ = write!(list, " and {} more", files.paths.len() - LISTED);
     }
-    if files.truncated {
-        list.push_str(&format!(" (scan cut at {SCAN_CAP} entries)"));
+    if let Some(cap) = files.truncated {
+        let _ = write!(list, " (scan cut at {cap} entries)");
     }
     list
 }
@@ -233,7 +302,7 @@ mod tests {
     fn found(paths: &[&str]) -> EnvFiles {
         EnvFiles {
             paths: paths.iter().map(|path| (*path).to_owned()).collect(),
-            truncated: false,
+            truncated: None,
         }
     }
 
@@ -284,7 +353,7 @@ mod tests {
         let files = scan(dir.path(), &[], &excludes(&[]), SCAN_CAP);
 
         assert_eq!(files.paths, [".env", "web/.env.local"]);
-        assert!(!files.truncated);
+        assert_eq!(files.truncated, None);
     }
 
     /// D2: `.git` and the default build-directory list are never entered, at any depth.
@@ -363,11 +432,55 @@ mod tests {
         }
         touch(dir.path(), ".env");
 
-        assert!(scan(dir.path(), &[], &excludes(&[]), 3).truncated);
+        assert_eq!(scan(dir.path(), &[], &excludes(&[]), 3).truncated, Some(3));
 
         let whole = scan(dir.path(), &[], &excludes(&[]), SCAN_CAP);
         assert_eq!(whole.paths, [".env"]);
-        assert!(!whole.truncated);
+        assert_eq!(whole.truncated, None);
+    }
+
+    /// MOD-89 review M1: a directory's files are visited before its subdirectories, so a big
+    /// subdirectory cannot spend the cap before the root's own `.env` is seen.
+    #[test]
+    fn a_root_s_files_are_visited_before_its_subdirectories() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        for sub in ["a", "b", "c", "m", "x", "z"] {
+            for index in 0..20 {
+                touch(dir.path(), &format!("{sub}/f{index}"));
+            }
+        }
+        touch(dir.path(), ".env");
+        touch(dir.path(), "zz.envrc/.env");
+
+        let files = scan(dir.path(), &[], &excludes(&[]), 5);
+
+        assert_eq!(files.paths, [".env"]);
+        assert_eq!(files.truncated, Some(5));
+    }
+
+    /// MOD-89 review M1: the cap is one budget across every root, spent on each root's top level
+    /// first: a `cwd` subtree that exhausts it still leaves an extra dir's own `.env` found, but
+    /// not one nested under it, and the result says it was cut.
+    #[test]
+    fn the_cap_is_one_budget_spent_on_every_root_s_top_level_first() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let cwd = dir.path().join("cwd");
+        for index in 0..20 {
+            touch(&cwd, &format!("sub/f{index}"));
+        }
+        touch(dir.path(), "docs/.env");
+        touch(dir.path(), "docs/deep/.env.local");
+        let extra: Vec<PathBuf> = vec![dir.path().join("docs")];
+
+        // The top levels hold `cwd/sub`, `docs/.env` and `docs/deep`: 3 of the 5.
+        let files = scan(&cwd, &extra, &excludes(&[]), 5);
+
+        assert_eq!(files.paths, ["docs/.env"]);
+        assert_eq!(files.truncated, Some(5));
+
+        let whole = scan(&cwd, &extra, &excludes(&[]), SCAN_CAP);
+        assert_eq!(whole.paths, ["docs/.env", "docs/deep/.env.local"]);
+        assert_eq!(whole.truncated, None);
     }
 
     /// D2: a root that does not exist answers nothing rather than an error.
@@ -429,7 +542,8 @@ mod tests {
         assert_eq!(files.paths, [".env"]);
     }
 
-    /// D7's `<list>`: five names, then a count; the cut marker last; a control character as `?`.
+    /// D7's `<list>`: five names, then a count; the cut marker last, naming the cap the walk met
+    /// (review L8); a control character or a backtick as `?` (review L9).
     #[test]
     fn the_list_names_five_then_counts_the_rest() {
         assert_eq!(listed(&found(&[".env"])), "`.env`");
@@ -443,12 +557,20 @@ mod tests {
         );
         assert_eq!(
             listed(&EnvFiles {
-                truncated: true,
+                truncated: Some(SCAN_CAP),
                 ..found(&[".env"])
             }),
             "`.env` (scan cut at 100000 entries)"
         );
+        assert_eq!(
+            listed(&EnvFiles {
+                truncated: Some(5),
+                ..found(&[".env"])
+            }),
+            "`.env` (scan cut at 5 entries)"
+        );
         assert_eq!(listed(&found(&["a\nb/.env"])), "`a?b/.env`");
+        assert_eq!(listed(&found(&["a`b/.env"])), "`a?b/.env`");
     }
 
     /// D7's two sentences, byte for byte.

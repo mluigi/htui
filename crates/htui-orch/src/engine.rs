@@ -6361,7 +6361,7 @@ where
             run = %run.id,
             step = %step.id,
             files = files.paths.len(),
-            truncated = files.truncated,
+            truncated = ?files.truncated,
             "env files in the session's trees"
         );
         let Some(item) = run.item_id else {
@@ -20934,7 +20934,7 @@ mod tests {
             fn found(paths: &[&str]) -> EnvFiles {
                 EnvFiles {
                     paths: paths.iter().map(|path| (*path).to_owned()).collect(),
-                    truncated: false,
+                    truncated: None,
                 }
             }
 

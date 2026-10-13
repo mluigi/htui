@@ -2802,11 +2802,11 @@ mod tests {
         let extra = vec![std::path::PathBuf::from("/fake/trees/docs")];
         let first = EnvFiles {
             paths: vec![".env".to_owned()],
-            truncated: false,
+            truncated: None,
         };
         let second = EnvFiles {
             paths: vec!["docs/.envrc".to_owned()],
-            truncated: true,
+            truncated: Some(crate::isolate::env_files::SCAN_CAP),
         };
         isolator.script_env_files(first.clone());
         isolator.script_env_files(second.clone());
