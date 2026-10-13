@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use htui::agent_worker::AgentRuntime;
-use htui::app::{Action, TabAction};
+use htui::app::{Action, TabAction, register_all};
 use htui::run_worker::{OrchReply, OrchRequest, RunRuntime, StepAuthor};
 use htui::store_worker::{Origin, RequestEnvelope, StoreReply, StoreRequest};
 use htui::testkit::Harness;
@@ -98,6 +98,15 @@ async fn harness(script: Script) -> (Harness, MemStore) {
 
 /// [`harness`] over a chosen transport, so a test can ask for the degraded capability profile.
 async fn harness_with(script: Script, transport: Transport) -> (Harness, MemStore) {
+    harness_over(script, transport, |harness| harness).await
+}
+
+/// [`harness_with`], the harness passed through `shape` (keys, size) before its first drive.
+async fn harness_over(
+    script: Script,
+    transport: Transport,
+    shape: impl FnOnce(Harness) -> Harness,
+) -> (Harness, MemStore) {
     let store = MemStore::demo();
     // The fixture's own agents are `acp` rows this build has no adapter for; disabling them leaves
     // the tab exactly one agent to talk to, which is what makes the header deterministic and the
@@ -121,13 +130,15 @@ async fn harness_with(script: Script, transport: Transport) -> (Harness, MemStor
     factory.register("acp", Box::new(SharedAdapter(Arc::clone(&adapter))));
     factory.register("cli/fake", Box::new(SharedAdapter(Arc::clone(&adapter))));
 
-    let mut harness = Harness::over(store.clone())
-        .with_tab(Box::new(ChatTab::new()))
-        // `register_all` names the Chat tab as the replay tab (D39); a hand-registered shell has
-        // to say so itself, and the replay cases below go through the same `Action::Replay` the
-        // Runs pane emits rather than reaching into the tab.
-        .with_replay_tab(ChatTab::ID)
-        .with_agent_runtime(AgentRuntime::new(factory).with_grace(Duration::from_millis(0)));
+    let mut harness = shape(
+        Harness::over(store.clone())
+            .with_tab(Box::new(ChatTab::new()))
+            // `register_all` names the Chat tab as the replay tab (D39); a hand-registered shell
+            // has to say so itself, and the replay cases below go through the same
+            // `Action::Replay` the Runs pane emits rather than reaching into the tab.
+            .with_replay_tab(ChatTab::ID)
+            .with_agent_runtime(AgentRuntime::new(factory).with_grace(Duration::from_millis(0))),
+    );
     harness.drive().await;
     (harness, store)
 }
@@ -2034,4 +2045,157 @@ async fn a_harness_without_a_runtime_renders_the_refusal() {
     compose(&mut harness, "anyone there");
     harness.drive().await;
     stable().bind(|| insta::assert_snapshot!("chat_refused", harness.render()));
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-67 M5 (L-D): the Chat dispatches through its stacks, `CHAT_LIVE` (idle, live, parked,
+// ended), `CHAT_REPLAY` and, while the composer is open, `CAPTURE` (PA-4).
+// ---------------------------------------------------------------------------------------------
+
+/// The status line: the frame's last line.
+fn status(frame: &str) -> &str {
+    frame.lines().last().unwrap_or_default().trim_end()
+}
+
+/// The Chat's last row inside its border: the hint, or the composer's line while it is open.
+fn hint_row(frame: &str) -> &str {
+    let lines: Vec<&str> = frame.lines().collect();
+    lines[lines.len() - 3]
+        .trim_end()
+        .trim_start_matches('│')
+        .trim_end_matches('│')
+        .trim_end()
+}
+
+/// MOD-67 M5 (D12, PA-4): an open composer is `CAPTURE`. The status line drops `q quit`, `?` is
+/// text, and `F1` opens the box (the composer used to swallow it) and closes it again over a
+/// composer that keeps its text.
+#[tokio::test]
+async fn the_composer_status_line_and_box() {
+    let (mut harness, _) = harness(Script::default()).await;
+    harness.key("i");
+    let frame = harness.render();
+    assert_eq!(status(&frame), "Ctrl+c quit · F1 help", "{frame}");
+
+    harness.key("?");
+    assert!(!harness.app().help_visible, "`?` is text in the composer");
+    let frame = harness.render();
+    assert_eq!(hint_row(&frame), "> ?_", "{frame}");
+
+    harness.key("f1");
+    assert!(harness.app().help_visible, "`F1` opens the box");
+    let frame = harness.render();
+    assert_eq!(frame.matches("Global: ").count(), 1, "{frame}");
+    assert!(frame.contains("Global: Ctrl+c quit · F1 help"), "{frame}");
+    assert!(
+        !frame.contains("Chat: "),
+        "no Chat line over a capture: {frame}"
+    );
+    assert!(frame.contains("F1 closes this box"), "{frame}");
+    assert!(!frame.contains("?/F1 closes this box"), "{frame}");
+    harness.key("f1");
+    assert!(!harness.app().help_visible, "`F1` closes it");
+    let frame = harness.render();
+    assert_eq!(hint_row(&frame), "> ?_", "the text is intact: {frame}");
+
+    // With every view registered, the offered chords join the capture's status line.
+    let mut full = Harness::demo().with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
+    register_all(full.app());
+    full.drive_to_end().await;
+    full.key("5");
+    full.key("i");
+    let frame = full.render();
+    assert_eq!(
+        status(&frame),
+        "Ctrl+c quit · F1 help · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue",
+        "{frame}"
+    );
+}
+
+/// MOD-67 M5 (D12): a live chat's `?` box renders `CHAT_LIVE`, one line per layer.
+#[tokio::test]
+async fn the_live_chat_box_lists_chat_list_and_global() {
+    let (mut harness, _) = harness_over(
+        Script::one_turn(vec![chunk("hello"), done()]),
+        Transport::Acp,
+        // Wide enough that the Chat line packs into one row of the box.
+        |harness| harness.size(120, 30),
+    )
+    .await;
+    compose(&mut harness, "hi");
+    harness.drive().await;
+    harness.key("?");
+    assert!(harness.app().help_visible, "`?` opens the box");
+    let frame = harness.render();
+    for line in [
+        "Chat: i/Enter compose · a next agent · Esc end chat (twice) · t thoughts · g top · G \
+         bottom",
+        "List: j/Down down · k/Up up",
+        "Global: ",
+        "?/F1 closes this box",
+    ] {
+        assert!(frame.contains(line), "`{line}` is in the box: {frame}");
+    }
+}
+
+/// MOD-67 M5 (D5): the replay's swallow stays fixed and first, on plain keys only: `2` stays on
+/// the replay, and `alt-2` (bound to nothing) neither switches tabs nor closes it.
+#[tokio::test]
+async fn replay_swallows_plain_digits_and_passes_alt_digits() {
+    let mut harness = Harness::demo()
+        .with_tab(Box::new(ChatTab::new()))
+        .with_tab(Box::new(BacklogTab::new()))
+        .with_replay_tab(ChatTab::ID);
+    harness.settle().await;
+    replay(&mut harness, ids::STEP_PLAN).await;
+    assert!(harness.render().contains("read-only"), "the replay is open");
+    for pressed in ["2", "alt-2"] {
+        harness.key(pressed);
+        harness.drive().await;
+        assert_eq!(
+            harness.app().tabs.active_id().map(|id| id.0),
+            Some("chat"),
+            "`{pressed}` stays on Chat"
+        );
+        let frame = harness.render();
+        assert!(
+            frame.contains("read-only"),
+            "`{pressed}` leaves the replay open: {frame}"
+        );
+    }
+}
+
+/// MOD-67 M5 (D7): the CONTROL/ALT guard is gone, and a chord still does not disarm `Esc Esc`
+/// (it used to return before the disarm); a plain key does.
+#[tokio::test]
+async fn a_chord_does_not_disarm_esc_esc() {
+    let (mut harness, _) = harness(Script::one_turn(vec![chunk("hello"), done()])).await;
+    compose(&mut harness, "hi");
+    harness.drive().await;
+    let live = "i compose · Esc Esc end · t thoughts · j/k scroll";
+    assert_eq!(hint_row(&harness.render()), live);
+
+    for pressed in ["esc", "x", "esc"] {
+        harness.key(pressed);
+    }
+    harness.drive().await;
+    let frame = harness.render();
+    assert_eq!(
+        hint_row(&frame),
+        "Esc again ends this chat",
+        "`x` disarmed, so the second `Esc` only armed: {frame}"
+    );
+    harness.key("x");
+    assert_eq!(hint_row(&harness.render()), live, "`x` disarms");
+
+    for pressed in ["esc", "alt-x", "esc"] {
+        harness.key(pressed);
+    }
+    harness.drive().await;
+    let frame = harness.render();
+    assert_eq!(
+        hint_row(&frame),
+        "this chat has ended · i compose",
+        "`alt-x` did not disarm, so the second `Esc` ended the chat: {frame}"
+    );
 }
