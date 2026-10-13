@@ -116,7 +116,10 @@ pub const UNPARSED: &str = "<unparsed>";
 /// 2. the fixed flags §4.4 verified: `-p` with **no positional prompt**, because the prompt travels
 ///    on stdin as the first user message and an argv is visible in `ps` to every account on the box
 ///    (blueprint P-2);
-/// 3. the row's `--permission-mode`, omitted when the row names none rather than guessed at;
+/// 3. the row's `--permission-mode`, as written; when the row names none, [`ISOLATED_PERMISSION_MODE`]
+///    on an isolated session (MOD-96 D3: no settings file is read, and the CLI's own default was
+///    `auto`, probe F3) and nothing on one that opts back in, whose settings files' `defaultMode`
+///    still applies. Omitted on a tool-less session (6¾);
 /// 4. the session id **or** the resume id, never both — `--session-id` mints (D84), `--resume`
 ///    continues, and the CLI refuses the pair (blueprint H-18);
 /// 5. the spec's model and extra directories;
@@ -142,10 +145,11 @@ pub const UNPARSED: &str = "<unparsed>";
 ///    is what keeps 7 from undoing it;
 ///
 ///    6⅞. the isolation levers [`ISOLATION_ARGS`] unless the row opts back in
-///    (`settings.user_extensions`, MOD-91 D1–D3): after the narrowing, on **every** session —
-///    tool-less help turns and resumes included — and before 7, so the operator's `extra_args`
-///    still win. That is also why a later `--settings` that drops `disableAllHooks` is refused
-///    before the spawn ([`refuse_settings_override`], D8) rather than allowed to win silently;
+///    (`settings.user_extensions`, MOD-91 D1–D3, MOD-96 D1): after the narrowing, on **every**
+///    session — tool-less help turns and resumes included — and before 7, so the operator's
+///    `extra_args` still win. That is also why a later `--settings` that drops `disableAllHooks`,
+///    or any later `--setting-sources`, is refused before the spawn ([`refuse_settings_override`],
+///    MOD-91 D8, MOD-96 D2) rather than allowed to win silently;
 /// 7. `settings.cli.extra_args` **last**, so an operator's repeated flag is the one the CLI keeps.
 ///
 /// **The budget flag is omitted at zero, and that is a measurement, not a nicety** (plan F-10):
@@ -184,11 +188,16 @@ pub fn argv(
             args.push(flag.to_owned());
             args.push(value.to_owned());
         };
-        // MOD-55 review M1: a tool-less session has nothing a mode could approve, and the seeded
-        // row's `acceptEdits` must not make help unusable, so the row's mode is dropped rather
-        // than refused.
-        if !cli.permission_mode.is_empty() && !spec.tools.no_tools {
-            push("--permission-mode", &cli.permission_mode);
+        // MOD-55 review M1: a tool-less session has nothing a mode could approve, so the row's mode
+        // is dropped rather than refused (an `acceptEdits` row must not make help unusable).
+        // MOD-96 D3: an isolated row that names no mode says `default` rather than leave the CLI to
+        // pick one; an opted-in row's settings files still supply their `defaultMode`.
+        let mode = match cli.permission_mode.as_str() {
+            "" if !user_extensions => ISOLATED_PERMISSION_MODE,
+            mode => mode,
+        };
+        if !mode.is_empty() && !spec.tools.no_tools {
+            push("--permission-mode", mode);
         }
         match spec.resume.as_ref() {
             Some(resume) => push("--resume", resume.as_str()),
@@ -246,17 +255,27 @@ pub fn argv(
     args
 }
 
-/// The isolation levers (MOD-91 D1, probed in T1 case 1): `disableAllHooks` stops settings hooks
-/// and every plugin's mods (user-scope and skills-directory), `--disable-slash-commands` drops
-/// skills and slash commands. Auth, `htui`'s `--mcp-config` server and `--permission-prompt-tool`
-/// keep working under both. `--settings` takes one value, so the pair is spaced, as probed.
-/// Plugin agents and plugin MCP servers survive (T1 case 5, D7). Changing this changes
-/// `isolation_args_are_the_probed_levers` and, if `disableAllHooks` goes, [`HOOKS_OFF`]'s check.
-pub const ISOLATION_ARGS: [&str; 3] = [
+/// The isolation levers. MOD-91 D1 (its T1 case 1): `disableAllHooks` stops settings hooks and every
+/// plugin's mods (user-scope and skills-directory); `--disable-slash-commands` drops skills and slash
+/// commands. MOD-96 D1 (probe B4): `--setting-sources ""` loads no user, project or local settings
+/// file, so their `permissions` rules and `defaultMode` cannot settle a call before `htui` is asked.
+/// The CLI still applies flag and policy settings (`flagSettings`/`policySettings`), so `htui`'s own
+/// `--settings` keeps working. Auth, `htui`'s `--mcp-config` server and `--permission-prompt-tool`
+/// keep working under all three (B4). Each flag takes one value, so both pairs are spaced, as probed;
+/// `""` is one argv element. Plugin agents and plugin MCP servers survived MOD-91's levers (its T1
+/// case 5); MOD-96 T1 re-checks them under `--setting-sources ""`. Changing this changes
+/// `isolation_args_are_the_probed_levers`, and [`HOOKS_OFF`]'s or [`SETTING_SOURCES`]'s check.
+pub const ISOLATION_ARGS: [&str; 5] = [
     "--settings",
     r#"{"disableAllHooks":true}"#,
     "--disable-slash-commands",
+    "--setting-sources",
+    "",
 ];
+
+/// The flag MOD-96 D2 refuses in an isolated row's `extra_args`, whatever its value: the CLI keeps
+/// the **last** `--setting-sources` (probe E1), so a later one would read the settings files again.
+const SETTING_SOURCES: &str = "--setting-sources";
 
 /// The permission mode an isolated, tool-carrying session gets when its row names none (MOD-96
 /// D3): with no settings file read, the CLI otherwise picks its own, and probe F3 saw `auto`.
@@ -286,8 +305,8 @@ const WIDENING_MODES: [&str; 2] = ["bypassPermissions", "acceptEdits"];
 /// Refused rather than stripped (MOD-55 review M1): `extra_args` are the operator's, passed
 /// verbatim and last so their copy wins ([`argv`], 7), and silently dropping one would be a second
 /// meaning nobody configured. The row's own `permission_mode` is the exception — [`argv`] drops it
-/// — because the seeded `claude-cli` row carries `acceptEdits` and refusing it would refuse help
-/// on every default install.
+/// — because a row may carry `acceptEdits` (the seed did until MOD-96), and refusing it would
+/// refuse help on that row.
 ///
 /// # Errors
 /// [`DriverError::Transport`] naming the first widening flag. Never [`DriverError::Spawn`]:
@@ -317,15 +336,17 @@ pub fn refuse_widening(cli: &CliSettings, tools: &ToolExposure) -> Result<()> {
     Ok(())
 }
 
-/// Refuses an isolated session (`user_extensions` false) on a row whose `extra_args` carry a
-/// `--settings` that would undo [`ISOLATION_ARGS`] (MOD-91 D8): they come last on [`argv`] and the
-/// CLI keeps the last `--settings` whole (T1 case 1a). Spaced or `=`-joined. Allowed only when the
+/// Refuses an isolated session (`user_extensions` false) on a row whose `extra_args` would undo
+/// [`ISOLATION_ARGS`]: a `--settings` that does not itself keep `disableAllHooks` on (MOD-91 D8),
+/// or any `--setting-sources` at all (MOD-96 D2: the CLI keeps the last one, probe E1, so even
+/// `""` is refused rather than judged). They come last on [`argv`] and the CLI keeps the last
+/// `--settings` whole (T1 case 1a). Spaced or `=`-joined. A `--settings` is allowed only when the
 /// value is inline JSON whose object sets `"disableAllHooks": true`; a path is refused, because
 /// `htui` does not read the operator's file. A row that opts back in is never checked.
 /// Refused rather than rewritten, for [`refuse_widening`]'s reason.
 ///
 /// # Errors
-/// [`DriverError::Transport`] naming the flag and both fixes, never the value (`R-SEC-2`: a
+/// [`DriverError::Transport`] naming the flag and the fix, never the value (`R-SEC-2`: a
 /// settings value can carry an `env` block). Never [`DriverError::Spawn`]: nothing was spawned.
 pub fn refuse_settings_override(cli: &CliSettings, user_extensions: bool) -> Result<()> {
     if user_extensions {
@@ -338,7 +359,15 @@ pub fn refuse_settings_override(cli: &CliSettings, user_extensions: bool) -> Res
         let (flag, joined) = arg
             .split_once('=')
             .map_or((arg, None), |(flag, value)| (flag, Some(value)));
-        // Exactly the flag: `--setting-sources` shares the prefix and is not this check's.
+        if flag == SETTING_SOURCES {
+            return Err(DriverError::Transport(format!(
+                "an isolated session refuses this row's `{SETTING_SOURCES}` extra argument: a later \
+                 `{SETTING_SOURCES}` replaces htui's own and would let your settings files' \
+                 permission rules answer before htui, so remove it, or set `mods (y/n)` to `y` in \
+                 Settings > Agents"
+            )));
+        }
+        // Exactly the flag: `--setting-sources` shares the prefix and is matched above.
         if flag != "--settings" {
             continue;
         }
