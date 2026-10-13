@@ -1103,9 +1103,9 @@ enum Step {
 /// because `htui` sends no slash command. Sent from the transport, never on the agent's name
 /// (`R-AGT-5`): ACP requires an agent to ignore `_meta` keys it does not know, which is what
 /// `agy` gets. `options.settings` replaces any adapter-derived settings object (the risk row:
-/// `CLAUDE_MODEL_CONFIG`, which `htui` never sets). The CLI's counterpart is
-/// [`crate::cli::ISOLATION_ARGS`]; this function is the one place the ACP lever lives (blueprint
-/// B1), pinned by one literal test.
+/// `CLAUDE_MODEL_CONFIG`, which `htui` itself never sets but a row's launch `env` can). The CLI's
+/// counterpart is [`crate::cli::ISOLATION_ARGS`]; this function is the one place the ACP lever
+/// lives (blueprint B1), pinned by one literal test.
 #[must_use]
 pub fn isolation_meta() -> Meta {
     Meta::from_iter([(

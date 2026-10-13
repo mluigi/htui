@@ -385,10 +385,10 @@ permission_prompt tool` (unlike the selection-time skip above, it carries the sp
 
 ## Isolation from your Claude Code setup
 
-By default, a Claude Code session that htui starts does not load your own Claude Code extensions.
-A mod or a settings hook could otherwise answer a tool call before htui's
-[permission prompt](#permission-prompts-for-claude-cli) or the ACP permission request is asked,
-and the call would then never reach htui's policy or its record.
+By default, a Claude Code session that htui starts does not load your own Claude Code extensions,
+so that no mod or settings hook answers a tool call before htui is asked. One that did would settle
+the call before htui's [permission prompt](#permission-prompts-for-claude-cli) or the ACP
+permission request, and the call would then never reach htui's policy or its record.
 
 **Off by default:**
 
@@ -403,6 +403,9 @@ and the call would then never reach htui's policy or its record.
 - the MCP servers you configured for Claude Code yourself, and the prompts they offer as
   commands;
 - the repository's `CLAUDE.md`;
+- permission rules (`permissions.allow`/`deny`) in your and the repository's settings files, and
+  the agent's permission mode: a call they settle never reaches htui either. MOD-96 in
+  `HANDOFF.md` tracks this;
 - Claude Code's built-in mods, which it loads whatever the settings say;
 - htui's own `htui` server and its `permission_prompt` tool.
 
@@ -417,7 +420,8 @@ The `claude` adapter's own hooks keep working: `disableAllHooks` stops hooks fro
 and plugins, not the ones the adapter registers in code. Over ACP, `--disable-slash-commands` also
 empties the list of built-in commands the adapter reports. htui sends no slash command, so nothing
 is lost. Every ACP agent receives the same `_meta`; an agent that does not know the `claudeCode`
-key ignores it, as ACP requires.
+key ignores it, as ACP requires. On an isolated ACP session, the `_meta` `settings` block replaces
+the settings the adapter would derive from a `CLAUDE_MODEL_CONFIG` set in the row's launch `env`.
 
 **Letting your extensions back in.** In **Settings › Agents**, edit the agent (`e`) and set
 `mods (y/n)` to `y`. That row's sessions then start as they did before: no `--settings` or
@@ -438,8 +442,8 @@ refused, because htui does not read your file. The error names the flag but neve
 
 ```
 an isolated session refuses this row's `--settings` extra argument: a later `--settings`
-replaces htui's own, so it must set `"disableAllHooks": true` itself, or set `mods` to y in
-Settings > Agents
+replaces htui's own, so it must set `"disableAllHooks": true` itself, or set `mods (y/n)` to `y`
+in Settings > Agents
 ```
 
 Nothing is started. Fix it by adding `"disableAllHooks":true` to that JSON, or by setting

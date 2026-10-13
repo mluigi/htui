@@ -441,9 +441,10 @@ Use `claude` when you can. `claude-cli` uses the same Claude Code login but has 
 ### Your Claude Code mods, hooks and skills
 
 A Claude Code session that `htui` starts leaves out your own mods, the hooks in your
-`settings.json` files, and your skills and slash commands, so that nothing approves a tool call
-before `htui` is asked. Your plugins' agents and MCP servers, your own MCP servers and the
-repository's `CLAUDE.md` still load.
+`settings.json` files, and your skills and slash commands, so that no mod or settings hook answers
+a tool call before `htui` is asked. Your plugins' agents and MCP servers, your own MCP servers and
+the repository's `CLAUDE.md` still load, and the permission rules in your settings files and the
+agent's permission mode still settle calls first.
 
 The agent form's `mods (y/n)` field turns this off for one agent. It defaults to `n`. Set it to `y`
 to load your mods, settings hooks and skills in that agent's sessions again, as before. It only
