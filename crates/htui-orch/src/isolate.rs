@@ -12,16 +12,18 @@
 use core::fmt;
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use htui_core::model::{Isolation, RepoId, RunId, RunStepCommit, RunStepTree, StepId};
 use htui_core::prompt::DiffBlock;
 
 pub mod copy;
+pub mod env_files;
 pub mod git;
 pub mod real;
 
+pub use env_files::EnvFiles;
 pub use htui_core::clock::{Clock, SystemClock};
 pub use real::{GixIsolator, IsolatorConfig, RepoCheckout};
 
@@ -132,9 +134,9 @@ pub struct ChangedPaths {
     pub truncated: bool,
 }
 
-/// ANA-2 §4.6's four verbs plus three reads (milestone 4's two, and `changed_paths`, MOD-9 D119)
-/// and milestone 5's two recovery verbs; the four are named there verbatim (`docs/ANA-2.md:1769`),
-/// and all nine sit behind plan D6's seam.
+/// ANA-2 §4.6's four verbs plus four reads (milestone 4's two, `changed_paths`, MOD-9 D119, and
+/// `env_files`, MOD-89) and milestone 5's two recovery verbs; the four are named there verbatim
+/// (`docs/ANA-2.md:1769`), and all ten sit behind plan D6's seam.
 ///
 /// **An isolator touches no store.** The engine persists what these return —
 /// `upsert_step_tree` after [`prepare`](Isolator::prepare), `record_commits` after
@@ -208,6 +210,16 @@ pub trait Isolator: Send + Sync + fmt::Debug {
         trees: &'a [RunStepTree],
         commits: &'a [RunStepCommit],
     ) -> IsolatorFuture<'a, ChangedPaths>;
+
+    /// MOD-89 D1, D2: the env files a session started in `cwd` with `extra_dirs` could read, by
+    /// root-relative name; never their contents. A read: no guard, no `git` child, no store. A
+    /// missing root answers nothing and an unreadable entry is skipped, so a real isolator fails
+    /// open; the engine also reads an `Err` as "nothing found" (D2).
+    fn env_files<'a>(
+        &'a self,
+        cwd: &'a Path,
+        extra_dirs: &'a [PathBuf],
+    ) -> IsolatorFuture<'a, EnvFiles>;
 
     /// §4.6 step 4: the winning candidate's branch merged into the primary tree, one commit row
     /// per repo.

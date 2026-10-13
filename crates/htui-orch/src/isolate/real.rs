@@ -19,6 +19,7 @@ use htui_core::prompt::DiffBlock;
 use tokio::sync::OwnedMutexGuard;
 
 use super::copy;
+use super::env_files::{self, EnvFiles};
 use super::git::{self, Cli, blocking};
 use super::{
     ChangedPaths, FanoutSlot, IsolateError, Isolator, IsolatorFuture, Prepared, PreparedTree,
@@ -1560,6 +1561,30 @@ impl Isolator for GixIsolator {
             changed.paths.sort();
             changed.paths.dedup();
             Ok(changed)
+        })
+    }
+
+    /// MOD-89 D2: [`env_files::scan`] on the blocking pool, pruning `.git` and
+    /// [`copy::excludes`] of the configured list — `copy`'s own, so a `local` step on a large
+    /// checkout skips `target/` and `node_modules/`. Only a blocking task that did not finish is
+    /// an `Err`; the scan itself fails open.
+    fn env_files<'a>(
+        &'a self,
+        cwd: &'a Path,
+        extra_dirs: &'a [PathBuf],
+    ) -> IsolatorFuture<'a, EnvFiles> {
+        Box::pin(async move {
+            let excludes = copy::excludes(&self.config.copy_exclude);
+            let (cwd, extra_dirs) = (cwd.to_path_buf(), extra_dirs.to_vec());
+            blocking(move || {
+                Ok(env_files::scan(
+                    &cwd,
+                    &extra_dirs,
+                    &excludes,
+                    env_files::SCAN_CAP,
+                ))
+            })
+            .await
         })
     }
 

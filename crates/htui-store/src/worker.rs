@@ -163,6 +163,9 @@ impl htui_core::store::WorkerStore for PgStore {
     ) -> Result<Vec<ResolvedInput>> {
         ReadStore::resolve_inputs(self, item, run, kinds).await
     }
+    async fn notes(&self, id: ItemId) -> Result<Vec<Note>> {
+        ReadStore::notes(self, id).await
+    }
     async fn repos(&self, project: ProjectId) -> Result<Vec<Repo>> {
         WriteStore::repos(self, project).await
     }
@@ -540,6 +543,9 @@ impl htui_core::store::WorkerStore for Writer {
         kinds: &[String],
     ) -> Result<Vec<ResolvedInput>> {
         ReadStore::resolve_inputs(self, item, run, kinds).await
+    }
+    async fn notes(&self, id: ItemId) -> Result<Vec<Note>> {
+        ReadStore::notes(self, id).await
     }
     async fn repos(&self, project: ProjectId) -> Result<Vec<Repo>> {
         WriteStore::repos(self, project).await

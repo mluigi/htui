@@ -308,6 +308,9 @@ secrets_refused: no Infisical machine identity is stored in the OS keyring
 - **A chat** is refused with the same sentence and starts nothing. A new chat leaves no run
   behind.
 
+A provider project whose session trees hold env files is refused too, see
+[Env files in the session's trees](#env-files-in-the-sessions-trees).
+
 Transient causes (`Unreachable`, `RateLimited`, `LoginCoolingDown`, `IdentityLocked`) fail the run
 too. htui never retries a resolution by itself, so it never chases a cool-down or a lockout: fix
 the cause, or wait, then run again.
@@ -445,6 +448,74 @@ was cut, htui therefore drops the tail's first bytes before masking it again, as
 longest resolved value (or 76 for the credential rules, whichever is larger), less one, and opens
 the stored tail with `[… earlier output truncated]`. An `unavailable` verify keeps its reason line
 whole above the tail.
+
+### Env files in the session's trees
+
+Moving a project's secrets into Infisical only helps once its `.env` is gone: an agent can read a
+file in its tree, and from there the values reach the model and the stored transcript. So before
+every agent session of a run, htui looks for env files in the trees that session can read.
+
+**What counts.** `.env`, and `.env.<anything>` except the committed templates `.env.example`,
+`.env.sample`, `.env.template`, `.env.dist`, `.env.defaults` and `.env.schema`; also direnv's
+`.envrc`. Letter case is ignored. The part after `.env.` is compared whole, so
+`.env.local.example` counts. Files and symlinks count (a symlink is never followed); a directory
+never does, so a Python virtualenv named `.env/` is skipped and not entered. htui reads names
+only, never contents.
+
+**Where htui looks.** The session's working directory and every extra directory it may read,
+recursively, skipping `.git` and the build directories `copy` mode skips (`target/`, `build/`,
+`cmake-build-*/`, `node_modules/`, `.venv/`, `out/`, `dist/`), up to 100 000 entries across all
+of them. The top level of every directory is read before anything below it, and in each directory
+its files come before its subdirectories, so a large subtree cannot use up the budget before a
+top-level `.env` is seen. A longer walk stops there, ends its list with
+`(scan cut at 100000 entries)` and logs a warning. An entry htui cannot read is skipped with a
+warning: the check never stops a run over an I/O error.
+
+**Which mode exposes what.**
+
+| Isolation | What the session sees |
+|---|---|
+| `local` | The checkout itself, so a git-ignored `.env` is there |
+| `shared_serialized` | The checkout itself, as `local` |
+| `copy` | A byte-for-byte copy of the checkout, `.env` included |
+| `worktree` | Tracked files only: an env file shows up only when it is committed |
+
+Paths are shown relative to their tree. The second repository of a `local` step is named by its
+directory (`docs/.env`); under `worktree` and `copy` every path starts with the repository's name
+(`core/.env`). At most five are named, then `and N more`.
+
+**Refuse or warn.** A project with `secret_provider` set is refused before its agent starts. The
+step's tree and its prompt record already exist by then; the agent never starts. The run's failure
+reads:
+
+```
+env_files_refused: `.env`, `web/.env.local` in the session's trees; the project resolves its secrets from infisical. Remove them, or set allow_env_files.
+```
+
+A group of fan-out candidates that are all refused fails the run with the same sentence, each
+candidate noted as for `secrets_refused` ([When htui refuses](#when-htui-refuses)); a group where
+only some are refused goes on with the others. A resumed group counts the candidates that finished
+before the restart too: if one of them is done, the group goes on with it. A run cancelled while
+the trees are being checked ends cancelled, not refused. A project without a provider is never
+refused: its item gets a note, once per run, and the run goes on (if the note cannot be written,
+htui logs a warning and the run still goes on):
+
+```
+env files in the session's trees: `.env`; the agent can read them
+```
+
+Fan-out candidates that start together may each leave that note before any of them sees the
+others'.
+
+**`allow_env_files`.** A project switch in Settings > Prompt, in the project's group: `on` or
+`off`, `off` by default. When it is on, a provider project gets the note instead of the refusal.
+It is for an env file that holds no secret (`PORT=3000`). It changes nothing for a project
+without a provider.
+
+**Clearing a refusal.** Move the file out of the checkout or delete it (for `worktree` mode,
+commit its removal), or turn `allow_env_files` on, then run again.
+
+**Not checked:** chats. They start in htui's own working directory, not in a run's tree.
 
 ## Logins, tokens and lockout safety
 

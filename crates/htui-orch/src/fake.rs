@@ -14,7 +14,7 @@
 //! as its documented stand-in (plan D20, blueprint A-1).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -50,7 +50,7 @@ use crate::command::{Command, CommandOutcome, EngineError};
 use crate::engine::{ControlFor, DeadWalks, PolicyFor, SessionKey, Tails};
 use crate::graph::GraphSource;
 use crate::isolate::{
-    ChangedPaths, Clock, FanoutSlot, IsolateError, Isolator, IsolatorFuture, Prepared,
+    ChangedPaths, Clock, EnvFiles, FanoutSlot, IsolateError, Isolator, IsolatorFuture, Prepared,
     PreparedTree, ResetReport,
 };
 use crate::tools::{ToolHost, ToolHostError, ToolLease, ToolScope};
@@ -135,6 +135,16 @@ pub struct FakeIsolator {
     /// Where `prepare` roots its trees, when a case points it at a real directory (MOD-7
     /// milestone 4); `None` keeps `FAKE_TREE_ROOT/<run>/<step>`.
     tree_root: Mutex<Option<PathBuf>>,
+    /// MOD-89: scripted [`env_files`](Isolator::env_files) answers, FIFO, one consumed per call;
+    /// unscripted is `EnvFiles::default()`; `Err` is a scripted
+    /// [`fail_env_files`](Self::fail_env_files). Not named `env_files`: a field and the trait
+    /// method of one name read badly.
+    env_file_answers: Mutex<VecDeque<std::result::Result<EnvFiles, IsolateError>>>,
+    /// Every [`env_files`](Isolator::env_files) call's `(cwd, extra_dirs)`, in call order.
+    env_file_requests: Mutex<Vec<(PathBuf, Vec<PathBuf>)>>,
+    /// MOD-89 review L5: the signal the next [`env_files`](Isolator::env_files) call sends, and
+    /// the grace of the cancel it sends, before it answers. One-shot.
+    cancel_at_env_files: Mutex<Option<(watch::Sender<Signal>, std::time::Duration)>>,
 }
 
 /// One [`diff`](Isolator::diff) call as [`FakeIsolator`] saw it: the `run_step_id` of every tree
@@ -282,6 +292,43 @@ impl FakeIsolator {
     #[must_use]
     pub fn changed_path_requests(&self) -> Vec<DiffRequest> {
         self.changed_path_requests
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .clone()
+    }
+
+    /// MOD-89 D2: queue the answer of the next [`env_files`](Isolator::env_files). An unscripted
+    /// call answers `EnvFiles::default()`: trees that hold no env file.
+    pub fn script_env_files(&self, files: EnvFiles) {
+        self.env_file_answers
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .push_back(Ok(files));
+    }
+
+    /// MOD-89 D2: make the next [`env_files`](Isolator::env_files) fail with a `git` error, which
+    /// the engine reads as "nothing found" plus a `warn`.
+    pub fn fail_env_files(&self, reason: &str) {
+        self.env_file_answers
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .push_back(Err(IsolateError::Git(reason.to_owned())));
+    }
+
+    /// MOD-89 review L5: the next [`env_files`](Isolator::env_files) call sends
+    /// `Cancel { grace }` on `signal` before it answers, as a cancel landing mid-scan would.
+    fn cancel_at_env_files(&self, signal: watch::Sender<Signal>, grace: std::time::Duration) {
+        *self
+            .cancel_at_env_files
+            .lock()
+            .expect("no panic holds the fake isolator's lock") = Some((signal, grace));
+    }
+
+    /// MOD-89: every [`env_files`](Isolator::env_files) call so far, as `(cwd, extra_dirs)`,
+    /// failed ones included.
+    #[must_use]
+    pub fn env_file_requests(&self) -> Vec<(PathBuf, Vec<PathBuf>)> {
+        self.env_file_requests
             .lock()
             .expect("no panic holds the fake isolator's lock")
             .clone()
@@ -664,6 +711,36 @@ impl Isolator for FakeIsolator {
                 .expect("no panic holds the fake isolator's lock")
                 .pop_front()
                 .unwrap_or_else(|| Ok(ChangedPaths::default()))
+        })
+    }
+
+    /// The next [`script_env_files`](FakeIsolator::script_env_files) or
+    /// [`fail_env_files`](FakeIsolator::fail_env_files) answer, or the empty set unscripted; the
+    /// roots are recorded for [`env_file_requests`](FakeIsolator::env_file_requests) either way.
+    /// Touches no filesystem: the paths are synthetic.
+    fn env_files<'a>(
+        &'a self,
+        cwd: &'a Path,
+        extra_dirs: &'a [PathBuf],
+    ) -> IsolatorFuture<'a, EnvFiles> {
+        Box::pin(async move {
+            self.env_file_requests
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .push((cwd.to_path_buf(), extra_dirs.to_vec()));
+            let cancel = self
+                .cancel_at_env_files
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .take();
+            if let Some((signal, grace)) = cancel {
+                signal.send_replace(Signal::Cancel { grace });
+            }
+            self.env_file_answers
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .pop_front()
+                .unwrap_or_else(|| Ok(EnvFiles::default()))
         })
     }
 
@@ -1873,6 +1950,13 @@ impl FakeOrchestrator {
         self.relays.signal.send_replace(Signal::Cancel { grace });
     }
 
+    /// MOD-89 review L5: [`cancel_walks`](Self::cancel_walks), sent by the next env-file scan
+    /// while it runs — a cancel that lands mid-scan, after the walk's last check before it.
+    pub fn cancel_walks_during_env_files(&self, grace: std::time::Duration) {
+        self.isolator
+            .cancel_at_env_files(self.relays.signal.clone(), grace);
+    }
+
     /// The policy lookup `fake_parts` lends.
     #[must_use = "the lookup is lent to an engine's parts; dropping it lends nothing"]
     pub fn policy_for(&self) -> PolicyFor<'_> {
@@ -2431,7 +2515,7 @@ mod tests {
     use crate::engine::SessionKey;
     use crate::graph::{ResolveError, Resolved, resolve};
     use crate::isolate::{
-        ChangedPaths, Clock as _, FanoutSlot, IsolateError, Isolator as _, ResetReport,
+        ChangedPaths, Clock as _, EnvFiles, FanoutSlot, IsolateError, Isolator as _, ResetReport,
     };
 
     /// `graph::resolve` of `HTUI_FEAT-1`, manual, no `app_setting`, no requested scope.
@@ -2734,6 +2818,54 @@ mod tests {
             assert_eq!(request.commits, vec![step; scope.len()]);
         }
         assert!(requests[3].trees.is_empty() && requests[3].commits.is_empty());
+    }
+
+    /// MOD-89: the fake's `env_files` answers what a case queued, FIFO, the empty set unscripted,
+    /// a scripted failure as a `git` error, and records every call's `(cwd, extra_dirs)`.
+    #[tokio::test]
+    async fn env_files_answers_its_script_then_nothing_and_records_the_roots() {
+        let isolator = FakeIsolator::new();
+        let cwd = std::path::PathBuf::from("/fake/trees/run/step");
+        let extra = vec![std::path::PathBuf::from("/fake/trees/docs")];
+        let first = EnvFiles {
+            paths: vec![".env".to_owned()],
+            truncated: None,
+        };
+        let second = EnvFiles {
+            paths: vec!["docs/.envrc".to_owned()],
+            truncated: Some(crate::isolate::env_files::SCAN_CAP),
+        };
+        isolator.script_env_files(first.clone());
+        isolator.script_env_files(second.clone());
+
+        assert_eq!(
+            isolator.env_files(&cwd, &extra).await.expect("scripted"),
+            first
+        );
+        assert_eq!(
+            isolator.env_files(&cwd, &[]).await.expect("scripted"),
+            second
+        );
+        assert_eq!(
+            isolator.env_files(&cwd, &extra).await.expect("unscripted"),
+            EnvFiles::default()
+        );
+        isolator.fail_env_files("x");
+        match isolator.env_files(&cwd, &[]).await {
+            Err(IsolateError::Git(reason)) => assert_eq!(reason, "x"),
+            other => panic!("expected a git error, got {other:?}"),
+        }
+
+        assert_eq!(
+            isolator.env_file_requests(),
+            vec![
+                (cwd.clone(), extra.clone()),
+                (cwd.clone(), Vec::new()),
+                (cwd.clone(), extra.clone()),
+                (cwd.clone(), Vec::new()),
+            ],
+            "every call is recorded, in order, the failed one included"
+        );
     }
 
     /// D92/D99: the fake's `reset` is empty unless scripted, a scripted refusal is consumed once

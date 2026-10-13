@@ -12,7 +12,7 @@
 //! [`WriteStore`] method of the same name by path (UFCS): this module defines the new traits, so
 //! both families are in scope here and a method-call body would be ambiguous.
 //!
-//! `WorkerStore` is 59 methods: 13 [`ReadStore`] reads, 6 [`WriteStore`] reads, 25 writes,
+//! `WorkerStore` is 60 methods: 14 [`ReadStore`] reads, 6 [`WriteStore`] reads, 25 writes,
 //! `write_document`, MOD-42's three command methods, MOD-11's four agent writes and
 //! `item_by_key` (plan D13, B-4), its five command-queue methods (plan D14) and MOD-12 M2's
 //! `run_batch_spend`; [`RelayStore`] is nine (MOD-42 plan D2, MOD-70 plan D4).
@@ -139,7 +139,7 @@ pub trait RelayStore: Send + Sync {
 /// `graph::override_graph`'s eight extra methods are deliberately absent: it has no production
 /// caller and keeps its [`WriteStore`] bound.
 pub trait WorkerStore: RecorderStore + RelayStore {
-    // -- 13 ReadStore reads
+    // -- 14 ReadStore reads
     /// [`ReadStore::item`].
     fn item(&self, id: ItemId) -> impl Future<Output = Result<Option<Item>>> + Send;
     /// [`ReadStore::documents`].
@@ -184,6 +184,8 @@ pub trait WorkerStore: RecorderStore + RelayStore {
         run: RunId,
         kinds: &[String],
     ) -> impl Future<Output = Result<Vec<ResolvedInput>>> + Send;
+    /// [`ReadStore::notes`]: MOD-89 D6's dedupe reads the item's notes before it writes one.
+    fn notes(&self, id: ItemId) -> impl Future<Output = Result<Vec<Note>>> + Send;
 
     // -- 5 WriteStore reads
     /// [`WriteStore::repos`].
@@ -726,6 +728,9 @@ impl WorkerStore for MemStore {
         kinds: &[String],
     ) -> Result<Vec<ResolvedInput>> {
         ReadStore::resolve_inputs(self, item, run, kinds).await
+    }
+    async fn notes(&self, id: ItemId) -> Result<Vec<Note>> {
+        ReadStore::notes(self, id).await
     }
     async fn repos(&self, project: ProjectId) -> Result<Vec<Repo>> {
         WriteStore::repos(self, project).await

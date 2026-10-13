@@ -14,16 +14,14 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-13):** **MOD-95 is done** (`docs/decisions/mod/mod-95.md`): the `auto_queue` overshoot test
-pinned its batch open, a pre-L4 assertion from CLEAN-9's branch; under MOD-12 review L4 the batch closes `drained`, so
-the test now pins that (test-only, no product change). Before it, **TOOL-11 is done** (`docs/decisions/tool/tool-11.md`):
-`scripts/hr up --headroom` makes a sandbox run's Claude go through the run's own headroom proxy (started by `attach`,
-readiness-checked, falls back to a direct session; default off). Owed on the host: a real `up --headroom` run. Before
-them, **MOD-91 and MOD-92 are done** (`docs/decisions/mod/mod-91.md`, `docs/decisions/mod/mod-92.md`): htui-driven
-Claude Code sessions run with `disableAllHooks` and `--disable-slash-commands` (per-row `mods (y/n)` opts back in;
-**MOD-96** filed for settings-file permission rules), and `htui status`, `htui waiting` and `htui --search-items … --json`
-print one versioned JSON document each over a read-only Postgres session (`docs/htui-cli.md`). With both done, MOD-93
-is unblocked; MOD-94 stays behind a maintainer decision. Owed on the host: the Postgres gate on the merged tree.
+**Current status (2026-10-13):** **MOD-89 is done** (`docs/decisions/mod/mod-89.md`): before every agent
+session of a run htui scans the session's trees for env files (`.env`, `.env.*` but templates, `.envrc`); a provider
+project is refused (`env_files_refused: …`) unless its `allow_env_files` switch is on, a provider-less one gets one
+item note per run (`docs/htui-secrets.md`). Owed on the host: the Postgres gate on the merged tree. Before it,
+**MOD-95 is done** (`docs/decisions/mod/mod-95.md`): the `auto_queue` overshoot test now pins the batch closing
+`drained` (MOD-12 review L4; test-only). Before them, **TOOL-11 is done** (`docs/decisions/tool/tool-11.md`):
+`scripts/hr up --headroom` routes a sandbox run's Claude through the run's own headroom proxy (default off). Owed on
+the host: a real `up --headroom` run.
 Live coordinates after MOD-70 and MOD-12 M1: migrations run through `0017_follow_up` (`run_command.run_step_id`,
 `text`; `follow_up_window`; MOD-12's `0016_auto_queue`: `queue_entry`, `queue_batch`, `run.batch_id`), so **the next
 migration is `0018`** (cache: `0005`). MOD-37's `0014_run_step_opening` and MOD-11's queue migration both landed as
@@ -436,15 +434,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   several parents, re-rooting from a node (the tree's `Enter` emits `Action::Reveal`), and how the hop depth
   (`+`/`-`) sits beside the flow's zoom. Not blocked. After MOD-67, which owns the key catalogue.
 
-- [ ] **MOD-89 - Warn or refuse when a run's worktree holds a `.env` file** (from MOD-10,
-  `docs/decisions/mod/mod-10.md`; PRD open question decided 2026-10-03: "follow-up item, filed at close-out").
-  `R-SEC-2`, `R-ID-7`. MOD-10 lets a project drop its `.env` by resolving secrets from Infisical into the agent's
-  `SessionSpec.env` only, but nothing stops a run on a tree that still holds one: the agent can read it, and from
-  there it reaches the LLM context and the stored transcript. Detect a `.env` (and similar files) in a run's
-  worktree at run start and warn or refuse. Open: which file names count,
-  warn vs refuse (and whether per project), whether a provider-less project is checked too, and where the warning
-  shows. Out of MOD-10's MVP by PRD scope. Not blocked.
-
 - [ ] **MOD-96 - Settings-file permission rules and the permission mode still pre-approve calls in htui-driven sessions**
   (from MOD-91 review M1, `docs/decisions/mod/mod-91.md`). `R-TUI-6`, `R-HIS-1`, `R-AGT-4`. MOD-91
   stops the user's mods, settings hooks and skills, but its levers
@@ -583,6 +572,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
-| MOD-N   | 22 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-89 `.env` in a worktree, MOD-93 consumer Claude Code plugin, MOD-94 permission answers outside the TUI, MOD-96 settings-file permission rules in driven sessions, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 21 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-93 consumer Claude Code plugin, MOD-94 permission answers outside the TUI, MOD-96 settings-file permission rules in driven sessions, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 3 (CLEAN-10 `cargo doc` private links, CLEAN-11 CLEAN-9 deferred review residuals, CLEAN-12 `.claude/` hygiene) |
 | TOOL-N  | 3 (TOOL-8 `htui-dev` mod, TOOL-9 gate script and git hooks, TOOL-10 sandbox mod hardening) |

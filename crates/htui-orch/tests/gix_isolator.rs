@@ -44,8 +44,8 @@ use htui_orch::isolate::git::testkit::{
 };
 use htui_orch::isolate::real::{dirty_tree_not_reset, local_moved};
 use htui_orch::isolate::{
-    ChangedPaths, FanoutSlot, GixIsolator, Isolator, IsolatorConfig, IsolatorFuture, Prepared,
-    RepoCheckout, ResetReport,
+    ChangedPaths, EnvFiles, FanoutSlot, GixIsolator, Isolator, IsolatorConfig, IsolatorFuture,
+    Prepared, RepoCheckout, ResetReport,
 };
 use htui_orch::secrets::RunSecrets;
 use htui_orch::skip_without_git;
@@ -2045,6 +2045,14 @@ impl Isolator for StallAfterReconcile<'_> {
         self.inner.changed_paths(trees, commits)
     }
 
+    fn env_files<'a>(
+        &'a self,
+        cwd: &'a Path,
+        extra_dirs: &'a [PathBuf],
+    ) -> IsolatorFuture<'a, EnvFiles> {
+        self.inner.env_files(cwd, extra_dirs)
+    }
+
     fn reconcile<'a>(
         &'a self,
         winner: StepId,
@@ -3544,4 +3552,118 @@ async fn a_merge_dropped_mid_hook_still_lands_and_leaves_no_merge_head() {
         "the merge landed with D25's parents [before, after]"
     );
     assert_eq!(porcelain_status(&git, &primary).await, "", "and clean");
+}
+
+/// MOD-89: `core` ignores `.env` (a committed `.gitignore`) and holds one in its checkout — the
+/// shape every project with a local `.env` has, and the one `local` reads directly.
+fn ignore_env(fix: &Fixture) {
+    commit_file(&fix.core.path, ".gitignore", ".env\n", "ignore env");
+    std::fs::write(fix.core.path.join(".env"), "A=1\n").expect("the env file is written");
+}
+
+/// MOD-89: one step of a run of its own over `scope`, prepared directly under `isolation`, as
+/// [`committed_worktree_step`] does — the trees a session would start in.
+async fn prepared_step(fix: &Fixture, scope: &[RepoId], isolation: Isolation) -> Prepared {
+    fix.isolator
+        .prepare(RunId::new(), StepId::new(), scope, isolation, None)
+        .await
+        .expect("the mode prepares")
+}
+
+/// The env files [`GixIsolator::env_files`] finds in `prepared`'s trees, by path.
+async fn env_files_of(fix: &Fixture, prepared: &Prepared) -> Vec<String> {
+    fix.isolator
+        .env_files(&prepared.cwd, &prepared.extra_dirs)
+        .await
+        .expect("the scan fails open")
+        .paths
+}
+
+/// MOD-89 D2: a `local` step runs in the primary checkout itself, so a gitignored `.env` there is
+/// in its trees, named root-relative because the checkout is the session's `cwd`. No `git`
+/// needed: `local` reads the checkout and creates nothing.
+#[tokio::test]
+async fn a_local_step_s_trees_hold_a_gitignored_env_file() {
+    let fix = Fixture::new(Isolation::Local, None).await;
+    ignore_env(&fix);
+
+    let prepared = prepared_step(&fix, &[fix.core.id, fix.docs.id], Isolation::Local).await;
+
+    assert_eq!(env_files_of(&fix, &prepared).await, [".env"]);
+}
+
+/// MOD-89 D7: the second repo of a `local` step is an `extra_dirs` root (plan D28), so its env
+/// file is named by that root's last component.
+#[tokio::test]
+async fn a_local_step_names_the_second_repo_s_env_file_by_its_name() {
+    let fix = Fixture::new(Isolation::Local, None).await;
+    std::fs::write(fix.docs.path.join(".env"), "A=1\n").expect("the env file is written");
+
+    let prepared = prepared_step(&fix, &[fix.core.id, fix.docs.id], Isolation::Local).await;
+
+    assert_eq!(env_files_of(&fix, &prepared).await, ["docs/.env"]);
+}
+
+/// MOD-89: `copy` copies the checkout byte for byte and `.env` is in no exclude list, so the
+/// gitignored file rides along; the session's `cwd` is the step's directory and the copy is
+/// `core/` under it.
+#[tokio::test]
+async fn a_copy_step_carries_a_gitignored_env_file() {
+    let Some(_git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Copy, None).await;
+    ignore_env(&fix);
+
+    let prepared = prepared_step(&fix, &[fix.core.id], Isolation::Copy).await;
+
+    assert_eq!(env_files_of(&fix, &prepared).await, ["core/.env"]);
+}
+
+/// MOD-89: `worktree` checks out tracked files only, so a gitignored `.env` never reaches it.
+#[tokio::test]
+async fn a_worktree_step_omits_a_gitignored_env_file() {
+    let Some(_git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    ignore_env(&fix);
+
+    let prepared = prepared_step(&fix, &[fix.core.id], Isolation::Worktree).await;
+
+    assert_eq!(env_files_of(&fix, &prepared).await, Vec::<String>::new());
+}
+
+/// MOD-89: a committed `.env` is a tracked file, so `worktree` checks it out like any other.
+#[tokio::test]
+async fn a_worktree_step_holds_a_committed_env_file() {
+    let Some(_git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    commit_file(&fix.core.path, ".env", "A=1\n", "commit env");
+
+    let prepared = prepared_step(&fix, &[fix.core.id], Isolation::Worktree).await;
+
+    assert_eq!(env_files_of(&fix, &prepared).await, ["core/.env"]);
+}
+
+/// MOD-89 T3, the real wiring end to end: a provider-less project's `local` run over a checkout
+/// holding a gitignored `.env` walks to its gate, and the item carries D7's warning once. No `git`
+/// needed under `local` (as [`criterion_12_a_local_step_on_a_dirty_tree`]).
+#[tokio::test]
+async fn a_local_run_over_a_gitignored_env_file_writes_the_warning() {
+    let fix = Fixture::new(Isolation::Local, None).await;
+    ignore_env(&fix);
+
+    let run = fix.start(&fix.orch).await;
+    fix.parked(run).await;
+
+    let warning = "env files in the session's trees: `.env`; the agent can read them";
+    let notes = fix.feat_notes().await;
+    assert_eq!(
+        notes.iter().filter(|body| *body == warning).count(),
+        1,
+        "{notes:?}"
+    );
 }

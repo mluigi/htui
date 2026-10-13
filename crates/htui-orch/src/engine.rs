@@ -18,7 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::future::Either;
@@ -70,7 +70,7 @@ use crate::fanout::{
 };
 use crate::gate::{self, GateContext, Landing, LoopOutcome, Settle, SettleInput};
 use crate::graph::{self, GraphSource, ResolveError};
-use crate::isolate::{Clock, FanoutSlot, Isolator};
+use crate::isolate::{Clock, EnvFiles, FanoutSlot, Isolator, env_files};
 use crate::kill_point::{KillPoint, Site};
 use crate::promote::{self, OpeningKind};
 use crate::recover::{self, Adjudication, Heartbeat, LeaseTimes, StepKind};
@@ -4013,7 +4013,11 @@ where
     /// frame's `prompt`, `base` and rows, and `join_all` is awaited here, so no `'static` bound
     /// applies. No `std` guard is held across its `.await`. Only a candidate's own failure write
     /// can raise: [`run_candidate`](Self::run_candidate) owns every other failure, so a failed
-    /// sibling never fails the others (plan D48).
+    /// sibling never fails the others (plan D48). MOD-89 (blueprint F-1): a group **every**
+    /// candidate of which was refused over env files fails the run with that sentence
+    /// ([`fail_refused_group`](Self::fail_refused_group)); a mixed group routes as before, and a
+    /// slot with a member this call did not fail — a resumed slot's `done` candidate — is mixed
+    /// (review M2).
     ///
     /// **Dropping this future is the intended abandon** (plan D86). A walk whose lease another
     /// orchestrator took is dropped mid-`join_all`, and every candidate future stops where it
@@ -4135,7 +4139,43 @@ where
             })
         }))
         .await;
-        group_error(run.id, settled).map_or(Ok(None), Err)
+        let mut errors = Vec::new();
+        let mut refusals = Vec::with_capacity(settled.len());
+        for outcome in settled {
+            match outcome {
+                Ok(refusal) => refusals.push(refusal),
+                Err(err) => errors.push(Err(err)),
+            }
+        }
+        if let Some(err) = group_error(run.id, errors) {
+            return Err(err);
+        }
+        // MOD-89 (blueprint F-1): every candidate refused over env files fails the run with the
+        // sentence, as a secrets refusal does at the group's entry; no retry, no selection. The
+        // refusal is deterministic until a human removes the file, so a retry would only
+        // re-prepare every tree to refuse again.
+        //
+        // Review M2: "every candidate" is the whole slot, re-read now that the group settled, not
+        // only the `pending` ones this call drove: a resumed slot's `done` candidate (or a row
+        // another process moved) makes it a mixed group, which routes on to `Select` as before.
+        //
+        // Review L7, accepted: a crash after the candidates' failures and before this fold leaves
+        // every member `failed` with its note and the run `running`. The resumed walk finds no
+        // `pending` candidate and routes the slot through `Select` as any all-failed group (plan
+        // D49: a retry, a park or the group's failure), so the run's failure is not the env-files
+        // sentence then; each candidate's note still names the files.
+        if !refusals.is_empty() && refusals.iter().all(Option::is_some) {
+            let steps = self.parts.store.run_steps(run.id).await?;
+            let all_failed = group_at(&steps, phase.position, attempt)
+                .iter()
+                .all(|step| step.status == StepStatus::Failed);
+            if all_failed && let Some(failure) = refusals.into_iter().flatten().next() {
+                return Box::pin(self.fail_refused_group(run, phase, failure))
+                    .await
+                    .map(Some);
+            }
+        }
+        Ok(None)
     }
 
     /// The group's base per repo (plan D54(b)): the `before_hash`es a candidate of the slot already
@@ -4256,6 +4296,32 @@ where
         })
     }
 
+    /// MOD-89 (blueprint F-1): every candidate of the group already failed with its note over
+    /// the same env-file refusal; the run fails with `failure` and is cleaned up, as
+    /// `Route::GroupFailed`'s terminal arm does. The item mirrors `failed`, it is not blocked.
+    async fn fail_refused_group(
+        &self,
+        run: &Run,
+        phase: &SnapshotPhase,
+        failure: RunFailure,
+    ) -> Result<Rest, EngineError> {
+        self.parts
+            .store
+            .finish_run(
+                run.id,
+                RunStatus::Failed,
+                Some(&failure.to_string()),
+                self.now(),
+            )
+            .await?;
+        self.cleanup_run(run.id).await?;
+        Ok(Rest {
+            run: RunStatus::Failed,
+            position: Some(phase.position),
+            failure: Some(failure),
+        })
+    }
+
     /// One candidate's stages 2 to 5 (plan D48): it lands `done` or `failed` on its own and never
     /// parks, and an error once it is live fails **that candidate** — never the run, and never its
     /// siblings. The errors raised are a failure write that itself failed, and plan D144's
@@ -4265,7 +4331,14 @@ where
     /// best-effort on the way out (plan D78, blueprint A-7): a `shared_serialized` guard is released
     /// only at `capture`, and D48 removed the `fail_hard -> cleanup_run` path that used to release
     /// it, so without this the siblings in the same `join_all` would wait on it forever.
-    async fn run_candidate(&self, stage: CandidateStage<'_>) -> Result<(), EngineError> {
+    ///
+    /// `Some` is MOD-89's env-file refusal, which [`drive_group`](Self::drive_group) folds into
+    /// the run's failure when every candidate met it (blueprint F-1), and only when this call's
+    /// `fail_candidate` moved the row (review M3); `None` is every other path, success included.
+    async fn run_candidate(
+        &self,
+        stage: CandidateStage<'_>,
+    ) -> Result<Option<RunFailure>, EngineError> {
         let started_at = self.now();
         // Plan D144: a candidate another writer moved is `StaleWrite` (D125), raised once the
         // group's `join_all` has settled every sibling.
@@ -4281,7 +4354,7 @@ where
         let mut trees = None;
         let mut captured = false;
         match self.candidate_live(&stage, &mut trees, &mut captured).await {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(None),
             Err(err) => {
                 // Plan D78's capture still runs: it releases a `shared_serialized` guard a sibling
                 // in this `join_all` may be waiting on (it records commits; it settles nothing).
@@ -4293,13 +4366,26 @@ where
                 if matches!(err, EngineError::Cancelled { .. }) || is_fenced(&err) {
                     return Err(err);
                 }
-                self.fail_candidate(
-                    stage.run,
-                    stage.phase,
-                    stage.step,
-                    &failure_text(&stage.phase.name, &err),
-                )
-                .await
+                let refused = match &err {
+                    EngineError::EnvFiles { provider, files } => {
+                        Some(RunFailure::EnvFilesRefused {
+                            provider: provider.clone(),
+                            files: files.clone(),
+                        })
+                    }
+                    _ => None,
+                };
+                let moved = self
+                    .fail_candidate(
+                        stage.run,
+                        stage.phase,
+                        stage.step,
+                        &failure_text(&stage.phase.name, &err),
+                    )
+                    .await?;
+                // Review M3: a row another process already moved (plan D17) is not this call's,
+                // so its refusal is not folded into the run's failure either.
+                Ok(refused.filter(|_| moved))
             }
         }
     }
@@ -4502,25 +4588,32 @@ where
             }
             Settle::Failed(failure) => {
                 self.fail_candidate(run, phase, step, &failure.to_string())
-                    .await
+                    .await?;
+                Ok(())
             }
             // Plan D64 refuses `fan_out > 1` on `review` at resolution, so no candidate reads a
             // verdict; were one to, a rejection is still not a candidate's to act on.
             Settle::Rejected { verdict_line } => {
-                self.fail_candidate(run, phase, step, &verdict_line).await
+                self.fail_candidate(run, phase, step, &verdict_line).await?;
+                Ok(())
             }
         }
     }
 
     /// One candidate `running -> failed`, with the reason as an `item_note` naming it (plan D48).
     /// A step another process already moved is left alone and gets no note (plan D17).
+    ///
+    /// `true` when this call moved the row, as [`fail_hard`](Self::fail_hard) answers (MOD-89
+    /// review M3): [`run_candidate`](Self::run_candidate) reports an env-file refusal to the
+    /// group's fold only then, so a lost compare-and-set never ends a run that is not this
+    /// call's to end. The other callers keep their behaviour and ignore it.
     async fn fail_candidate(
         &self,
         run: &Run,
         phase: &SnapshotPhase,
         step: &RunStep,
         reason: &str,
-    ) -> Result<(), EngineError> {
+    ) -> Result<bool, EngineError> {
         let now = self.now();
         if !self
             .parts
@@ -4528,10 +4621,10 @@ where
             .transition_step(step.id, StepStatus::Running, StepStatus::Failed, now)
             .await?
         {
-            return Ok(());
+            return Ok(false);
         }
         let Some(item) = run.item_id else {
-            return Ok(());
+            return Ok(true);
         };
         self.note(
             item,
@@ -4542,7 +4635,8 @@ where
             Some(step.id),
             now,
         )
-        .await
+        .await?;
+        Ok(true)
     }
 
     /// Plan D59's `Select`: route a settled group (plan D49) and land it.
@@ -6248,6 +6342,104 @@ where
         Ok(self.parts.secrets.prepare(&project).await)
     }
 
+    /// MOD-89 D2-D7: the trees a session of `run` can read, scanned for env files before its
+    /// driver is built. A provider project refuses ([`EngineError::EnvFiles`]) unless
+    /// `allow_env_files` is on (D3, D4); any other finding is one item note per run and a `warn`
+    /// that carries the count only, never a name (D6). A scan fault fails open (D2): logged,
+    /// nothing found, never `?` (which would fail the step as [`EngineError::Isolate`]). So does
+    /// a store error reading or writing the warning note, a lost fence aside (review L6); the
+    /// refusal stays strict.
+    ///
+    /// The dedupe reads the item's notes, then writes; two concurrent fan-out candidates can both
+    /// read before either writes, so a fanned group may leave one note per candidate (blueprint
+    /// T3 hazard, accepted). Sequential sessions of a run leave one. Called boxed from
+    /// [`drive_once`](Self::drive_once) (MOD-10 M3's debug stack).
+    async fn check_env_files(
+        &self,
+        run: &Run,
+        step: &RunStep,
+        project: &Project,
+        cwd: &Path,
+        extra_dirs: &[PathBuf],
+    ) -> Result<(), EngineError> {
+        let files = match self.parts.isolator.env_files(cwd, extra_dirs).await {
+            Ok(files) => files,
+            Err(err) => {
+                tracing::warn!(
+                    run = %run.id,
+                    step = %step.id,
+                    %err,
+                    "the env-file scan failed; the session starts unchecked"
+                );
+                return Ok(());
+            }
+        };
+        if files.is_empty() {
+            return Ok(());
+        }
+        if let Some(provider) = project.secret_provider.as_deref()
+            && !settings::resolve_allow_env_files(Some(&project.settings))
+        {
+            return Err(EngineError::EnvFiles {
+                provider: provider.to_owned(),
+                files,
+            });
+        }
+        tracing::warn!(
+            run = %run.id,
+            step = %step.id,
+            files = files.paths.len(),
+            truncated = ?files.truncated,
+            "env files in the session's trees"
+        );
+        let Some(item) = run.item_id else {
+            return Ok(());
+        };
+        // Review L6: the note is a best-effort warning (D2 fails open), so a store error reading
+        // or writing it is logged and the session starts; only a lost fence still propagates,
+        // because the walk must not go on for a run another process holds.
+        match Box::pin(self.warn_env_files(run, step, item, &files)).await {
+            Err(err) if !is_fenced(&err) => {
+                tracing::warn!(
+                    run = %run.id,
+                    step = %step.id,
+                    %err,
+                    "the env-file warning note was not written; the session starts"
+                );
+                Ok(())
+            }
+            written => written,
+        }
+    }
+
+    /// D6: `files`' warning as an item note via `step`, unless a note of that body via any step of
+    /// this run already says it (one note per run). [`check_env_files`](Self::check_env_files)
+    /// logs this call's store errors rather than fail the step (review L6).
+    async fn warn_env_files(
+        &self,
+        run: &Run,
+        step: &RunStep,
+        item: ItemId,
+        files: &EnvFiles,
+    ) -> Result<(), EngineError> {
+        let body = env_files::warning(files);
+        let steps: BTreeSet<StepId> = self
+            .parts
+            .store
+            .run_steps(run.id)
+            .await?
+            .iter()
+            .map(|row| row.id)
+            .collect();
+        let noted = self.parts.store.notes(item).await?.iter().any(|note| {
+            note.body == body && note.via_step_id.is_some_and(|id| steps.contains(&id))
+        });
+        if !noted {
+            self.note(item, body, Some(step.id), self.now()).await?;
+        }
+        Ok(())
+    }
+
     /// One driver session under `recorder`: the driver for `key`, `start` with `text`, and
     /// `drive` to its `done` (MOD-42 plan D6), with the agent's own policy (D9), the permission
     /// relay and the run's control (D10).
@@ -6293,6 +6485,20 @@ where
             .env_for(&project)
             .await
             .map_err(EngineError::Secrets)?;
+        // MOD-89 D2-D6: the trees this session can read, checked once its secrets are known (a
+        // secrets refusal wins) and before any tool host or driver exists. Boxed: the walk's
+        // frames sit near the debug stack (MOD-10 M3).
+        //
+        // Review L5 (MOD-42 I-6): a cancel that landed during the scan owns the terminal status,
+        // so a refusal met with one pending answers `Cancelled` rather than fail the step.
+        if let Err(err) =
+            Box::pin(self.check_env_files(run, step, &project, &cwd, &extra_dirs)).await
+        {
+            if matches!(err, EngineError::EnvFiles { .. }) && control.signal().is_cancel() {
+                return Err(EngineError::Cancelled { run: run.id });
+            }
+            return Err(err);
+        }
         // MOD-42 D9: the agent's own policy (a judge call's is the judge agent's: `candidate_of`
         // over the judge phase).
         let policy = (self.parts.policy)(candidate.agent_id);
@@ -6477,7 +6683,7 @@ where
         phase: &SnapshotPhase,
         candidate: &SnapshotCandidate,
         project: &Project,
-        cwd: &std::path::Path,
+        cwd: &Path,
         command_queue: bool,
     ) -> Result<crate::tools::ToolLease, EngineError> {
         // B-18: the candidate's transport from its agent row; no row advertises no prompt tool.
@@ -6907,6 +7113,12 @@ fn failure_text(phase: &str, err: &EngineError) -> String {
             cause: cause.clone(),
         }
         .to_string(),
+        // MOD-89 D6: the same bytes as the variant's own `Display`, typed for the record.
+        EngineError::EnvFiles { provider, files } => RunFailure::EnvFilesRefused {
+            provider: provider.clone(),
+            files: files.clone(),
+        }
+        .to_string(),
         other => other.to_string(),
     }
 }
@@ -7165,7 +7377,7 @@ struct VerifyStage<'a> {
     /// `shared_serialized` sibling is not charged for the per-repo lock wait.
     started_at: DateTime<Utc>,
     /// Stage 2's `cwd`, the `command_run.cwd` fallback when there is no primary tree (H-23).
-    session_cwd: &'a std::path::Path,
+    session_cwd: &'a Path,
     /// Stage 4's answer: a verify runs only on `Ok` (blueprint A-3).
     result: &'a Result<DoneEvent, DriverError>,
     /// MOD-37 M4 D1: the step deadline cut the session; the verify gets `Some(ZERO)` at once,
@@ -20758,6 +20970,759 @@ mod tests {
                         printed [REDACTED] and exited"),
                 "{notes:?}"
             );
+        }
+
+        /// MOD-89 T3 (D2-D7, blueprint F-1): a session's trees are scanned for env files before
+        /// its driver is built. A provider project refuses unless `allow_env_files` is on; any
+        /// other finding is one item note per run. The fake isolator answers one scripted scan
+        /// per session, FIFO, and an unscripted one finds nothing.
+        mod env_files {
+            use std::path::PathBuf;
+
+            use chrono::TimeDelta;
+            use htui_core::fixtures::ids;
+            use htui_core::model::{
+                Claim, NewRunStep, Note, RunId, RunMode, RunStatus, SnapshotCandidate, Status,
+                StepId, StepStatus,
+            };
+            use htui_core::prompt::settings::SettingKey;
+            use htui_core::secret::{INFISICAL, SecretError};
+            use htui_core::store::{ReadStore as _, WriteStore as _};
+
+            use super::super::{Harness, parked_group, snapshot_of};
+            use super::{
+                VALUE, failing, feat_3_with_prd_ungated, key, provider_project, start_feat_3,
+                started_run, step_at,
+            };
+            use crate::command::{CommandOutcome, EngineError};
+            use crate::engine::{SessionKey, failure_text};
+            use crate::isolate::{Clock as _, EnvFiles, env_files};
+            use crate::status::RunFailure;
+
+            fn found(paths: &[&str]) -> EnvFiles {
+                EnvFiles {
+                    paths: paths.iter().map(|path| (*path).to_owned()).collect(),
+                    truncated: None,
+                }
+            }
+
+            async fn notes(harness: &Harness) -> Vec<Note> {
+                harness
+                    .orch
+                    .store
+                    .notes(ids::HTUI_FEAT_3)
+                    .await
+                    .expect("MemStore never fails a read")
+            }
+
+            /// The notes whose body is D7's warning for `files`.
+            async fn warnings(harness: &Harness, files: &EnvFiles) -> Vec<Note> {
+                let body = env_files::warning(files);
+                notes(harness)
+                    .await
+                    .into_iter()
+                    .filter(|note| note.body == body)
+                    .collect()
+            }
+
+            /// `allow_env_files: true` merged into `FEAT-3`'s project settings.
+            async fn allow_env_files(harness: &Harness) {
+                let project = harness.orch.item(ids::HTUI_FEAT_3).await.project_id;
+                let mut settings = harness
+                    .orch
+                    .store
+                    .project_settings(project)
+                    .await
+                    .expect("MemStore never fails a read")
+                    .filter(serde_json::Value::is_object)
+                    .unwrap_or_else(|| serde_json::json!({}));
+                settings[SettingKey::AllowEnvFiles.key()] = serde_json::json!(true);
+                harness.orch.store.set_project_settings(project, settings);
+            }
+
+            fn candidate(index: i32) -> SessionKey<'static> {
+                SessionKey {
+                    phase: "prd",
+                    attempt: 1,
+                    fanout_index: index,
+                    call: 0,
+                }
+            }
+
+            /// The `prd` phase fanned out to two candidates.
+            async fn prd_fanned(harness: &Harness) {
+                harness
+                    .repoint(ids::HTUI_FEAT_3, |phase| {
+                        if phase.name == "prd" {
+                            phase.fan_out = 2;
+                        }
+                    })
+                    .await;
+            }
+
+            /// D3, D6, D7: the run fails with the sentence, the driver never starts, the item is
+            /// not blocked. Plan delta 6: the trees, the trim record and the prompt row exist by
+            /// then, so none of them is asserted absent.
+            #[tokio::test]
+            async fn env_files_refuse_a_provider_project_s_run_before_its_driver() {
+                let harness = Harness::new().await;
+                harness.free_feat_3().await;
+                provider_project(&harness, &[("API_KEY", VALUE)]);
+                let files = found(&[".env", "web/.env.local"]);
+                harness.orch.isolator.script_env_files(files.clone());
+
+                let walked = Box::pin(harness.dispatch(start_feat_3())).await;
+
+                assert!(
+                    matches!(
+                        &walked,
+                        Err(EngineError::EnvFiles { provider, files: refused })
+                            if provider == INFISICAL && *refused == files
+                    ),
+                    "the walk answers the refusal: {walked:?}"
+                );
+                let run = started_run(&harness.orch).await;
+                let row = harness.orch.run(run).await;
+                assert_eq!(
+                    (row.status, row.failure),
+                    (
+                        RunStatus::Failed,
+                        Some(env_files::refused(INFISICAL, &files))
+                    )
+                );
+                let prd = step_at(&harness.orch, run, 0).await;
+                assert_eq!(prd.status, StepStatus::Failed);
+                assert!(
+                    harness.orch.spec_for(&key("prd")).is_none(),
+                    "no driver.start"
+                );
+                assert_ne!(
+                    harness.orch.item(ids::HTUI_FEAT_3).await.status,
+                    Status::Blocked,
+                    "`fail_hard` never blocks the item"
+                );
+                assert!(
+                    warnings(&harness, &files).await.is_empty(),
+                    "a refusal is not also a warning"
+                );
+            }
+
+            /// Secrets first: a run refused twice reads `secrets_refused`, and the plain walk
+            /// never reaches a tree, so it never scans.
+            #[tokio::test]
+            async fn a_secrets_refusal_wins_over_env_files() {
+                let harness = Harness::new().await;
+                harness.free_feat_3().await;
+                let cause = failing(&harness, SecretError::BadCredentials);
+                harness.orch.isolator.script_env_files(found(&[".env"]));
+
+                let walked = Box::pin(harness.dispatch(start_feat_3())).await;
+
+                assert!(
+                    matches!(&walked, Err(EngineError::Secrets(refused)) if *refused == cause),
+                    "{walked:?}"
+                );
+                assert!(harness.orch.isolator.env_file_requests().is_empty());
+            }
+
+            /// D3, D6: a provider-less project warns: the session starts and the item gets one
+            /// note via the step.
+            #[tokio::test]
+            async fn a_provider_less_project_s_run_proceeds_with_one_warning_note() {
+                let harness = Harness::new().await;
+                harness.free_feat_3().await;
+                let files = found(&[".env"]);
+                harness.orch.isolator.script_env_files(files.clone());
+
+                Box::pin(harness.dispatch(start_feat_3()))
+                    .await
+                    .expect("the walk parks at prd's gate");
+
+                assert!(harness.orch.spec_for(&key("prd")).is_some(), "prd started");
+                let run = started_run(&harness.orch).await;
+                let prd = step_at(&harness.orch, run, 0).await;
+                let warned = warnings(&harness, &files).await;
+                assert_eq!(warned.len(), 1, "{warned:?}");
+                assert_eq!(
+                    warned[0].body,
+                    "env files in the session's trees: `.env`; the agent can read them"
+                );
+                assert_eq!(warned[0].via_step_id, Some(prd.id));
+            }
+
+            /// D6's dedupe: a second session of the same run with the same findings writes no
+            /// second note.
+            #[tokio::test]
+            async fn a_two_phase_run_with_the_same_findings_writes_one_note() {
+                let harness = Harness::new().await;
+                feat_3_with_prd_ungated(&harness).await;
+                let files = found(&[".env"]);
+                harness.orch.isolator.script_env_files(files.clone());
+                harness.orch.isolator.script_env_files(files.clone());
+
+                Box::pin(harness.dispatch(start_feat_3()))
+                    .await
+                    .expect("the walk parks at plan's gate");
+
+                assert!(harness.orch.spec_for(&key("prd")).is_some(), "prd ran");
+                assert!(harness.orch.spec_for(&key("plan")).is_some(), "plan ran");
+                assert_eq!(harness.orch.isolator.env_file_requests().len(), 2);
+                let run = started_run(&harness.orch).await;
+                let prd = step_at(&harness.orch, run, 0).await;
+                let warned = warnings(&harness, &files).await;
+                assert_eq!(warned.len(), 1, "{warned:?}");
+                assert_eq!(warned[0].via_step_id, Some(prd.id));
+            }
+
+            /// D4: `allow_env_files` downgrades a provider project's refusal to the warning; the
+            /// session still gets the resolved env.
+            #[tokio::test]
+            async fn allow_env_files_turns_the_refusal_into_the_warning() {
+                let harness = Harness::new().await;
+                harness.free_feat_3().await;
+                provider_project(&harness, &[("API_KEY", VALUE)]);
+                allow_env_files(&harness).await;
+                let files = found(&[".env"]);
+                harness.orch.isolator.script_env_files(files.clone());
+
+                Box::pin(harness.dispatch(start_feat_3()))
+                    .await
+                    .expect("the walk parks at prd's gate");
+
+                let spec = harness.orch.spec_for(&key("prd")).expect("prd started");
+                assert_eq!(
+                    spec.env,
+                    std::collections::BTreeMap::from([("API_KEY".to_owned(), VALUE.to_owned())])
+                );
+                assert_eq!(warnings(&harness, &files).await.len(), 1);
+            }
+
+            #[tokio::test]
+            async fn no_findings_no_note_no_failure() {
+                let harness = Harness::new().await;
+                harness.free_feat_3().await;
+                provider_project(&harness, &[("API_KEY", VALUE)]);
+
+                Box::pin(harness.dispatch(start_feat_3()))
+                    .await
+                    .expect("the walk parks at prd's gate");
+
+                assert!(harness.orch.spec_for(&key("prd")).is_some(), "prd started");
+                assert_eq!(harness.orch.isolator.env_file_requests().len(), 1);
+                let notes = notes(&harness).await;
+                assert!(
+                    notes
+                        .iter()
+                        .all(|note| !note.body.starts_with("env files in")
+                            && !note.body.contains("env_files_refused")),
+                    "{notes:?}"
+                );
+            }
+
+            /// D2: a scan that fails is logged and reads as "nothing found"; it never fails the
+            /// step, even on a provider project.
+            #[tokio::test]
+            async fn a_scan_fault_fails_open() {
+                let harness = Harness::new().await;
+                harness.free_feat_3().await;
+                provider_project(&harness, &[("API_KEY", VALUE)]);
+                harness.orch.isolator.fail_env_files("boom");
+
+                Box::pin(harness.dispatch(start_feat_3()))
+                    .await
+                    .expect("the walk parks at prd's gate");
+
+                assert!(harness.orch.spec_for(&key("prd")).is_some(), "prd started");
+                let run = started_run(&harness.orch).await;
+                assert_eq!(harness.orch.run(run).await.failure, None);
+                let notes = notes(&harness).await;
+                assert!(
+                    notes
+                        .iter()
+                        .all(|note| !note.body.starts_with("env files in")),
+                    "{notes:?}"
+                );
+            }
+
+            /// D2: the roots scanned are exactly what the agent can read: its `cwd` and its
+            /// `extra_dirs` (plan D28).
+            #[tokio::test]
+            async fn the_scan_reads_the_session_s_cwd_and_extra_dirs() {
+                let harness = Harness::new().await;
+                harness.free_feat_3().await;
+                harness
+                    .orch
+                    .isolator
+                    .script_extra_dirs(vec![PathBuf::from("/fake/elsewhere/docs")]);
+
+                Box::pin(harness.dispatch(start_feat_3()))
+                    .await
+                    .expect("the walk parks at prd's gate");
+
+                let run = started_run(&harness.orch).await;
+                let prd = step_at(&harness.orch, run, 0).await;
+                let spec = harness.orch.spec_for(&key("prd")).expect("prd started");
+                let requests = harness.orch.isolator.env_file_requests();
+                assert_eq!(
+                    requests.first(),
+                    Some(&(
+                        PathBuf::from(format!("/fake/trees/{run}/{}", prd.id)),
+                        vec![PathBuf::from("/fake/elsewhere/docs")],
+                    ))
+                );
+                assert_eq!(
+                    requests.first(),
+                    Some(&(spec.cwd, spec.extra_dirs)),
+                    "the session started in the trees that were scanned"
+                );
+            }
+
+            /// Blueprint F-1: a fan-out whose every candidate was refused fails the run with the
+            /// sentence, once: no retry, no selection, no judge, and the run is cleaned up.
+            #[tokio::test]
+            async fn a_fan_out_whose_candidates_are_all_refused_fails_the_run_with_the_sentence() {
+                let harness = Harness::new().await;
+                harness.free_feat_3().await;
+                prd_fanned(&harness).await;
+                provider_project(&harness, &[("API_KEY", VALUE)]);
+                let files = found(&[".env"]);
+                harness.orch.isolator.script_env_files(files.clone());
+                harness.orch.isolator.script_env_files(files.clone());
+
+                let outcome = Box::pin(harness.dispatch(start_feat_3()))
+                    .await
+                    .expect("a refused group is a failed run, not an engine error");
+
+                let CommandOutcome::Started { run, rest } = outcome else {
+                    panic!("`StartRun` answers `Started`, not {outcome:?}");
+                };
+                let failure = RunFailure::EnvFilesRefused {
+                    provider: INFISICAL.to_owned(),
+                    files: files.clone(),
+                };
+                assert_eq!(rest.run, RunStatus::Failed);
+                assert_eq!(rest.failure.as_ref(), Some(&failure));
+                let row = harness.orch.run(run).await;
+                assert_eq!(
+                    (row.status, row.failure),
+                    (RunStatus::Failed, Some(failure.to_string()))
+                );
+                let prd: Vec<_> = harness
+                    .orch
+                    .steps(run)
+                    .await
+                    .into_iter()
+                    .filter(|step| step.position == 0)
+                    .collect();
+                assert_eq!(prd.len(), 2, "both candidates, no judge: {prd:?}");
+                assert!(
+                    prd.iter()
+                        .all(|step| step.status == StepStatus::Failed && step.attempt == 1),
+                    "only attempt 1, both failed: {prd:?}"
+                );
+                let bodies: Vec<String> = notes(&harness)
+                    .await
+                    .into_iter()
+                    .map(|note| note.body)
+                    .collect();
+                for index in 0..2 {
+                    assert!(
+                        harness.orch.spec_for(&candidate(index)).is_none(),
+                        "candidate {index} never started"
+                    );
+                    let noted = format!(
+                        "fan-out candidate {index} of `prd` attempt 1: {}",
+                        env_files::refused(INFISICAL, &files)
+                    );
+                    assert!(bodies.contains(&noted), "{bodies:?}");
+                }
+                assert_eq!(harness.orch.isolator.cleanups(), 1);
+                assert_ne!(
+                    harness.orch.item(ids::HTUI_FEAT_3).await.status,
+                    Status::Blocked
+                );
+            }
+
+            /// Hazard (dedupe race, accepted): concurrent candidates may both read the notes
+            /// before either writes, so a fanned group leaves one note or up to one per
+            /// candidate, never one per phase.
+            #[tokio::test]
+            async fn a_provider_less_fan_out_proceeds_with_the_warning() {
+                let harness = Harness::new().await;
+                harness.free_feat_3().await;
+                prd_fanned(&harness).await;
+                let files = found(&[".env"]);
+                harness.orch.isolator.script_env_files(files.clone());
+                harness.orch.isolator.script_env_files(files.clone());
+
+                Box::pin(harness.dispatch(start_feat_3()))
+                    .await
+                    .expect("the group settles");
+
+                for index in 0..2 {
+                    assert!(
+                        harness.orch.spec_for(&candidate(index)).is_some(),
+                        "candidate {index} started"
+                    );
+                }
+                let warned = warnings(&harness, &files).await.len();
+                assert!((1..=2).contains(&warned), "{warned} warning notes");
+            }
+
+            /// MOD-89 review M4: a group only one of whose candidates was refused is a mixed
+            /// group: the refused one fails with its note, the other starts, and the run is not
+            /// failed with the sentence. The scan that meets the scripted answer is whichever
+            /// candidate asks first, so the case names neither index.
+            #[tokio::test]
+            async fn a_fan_out_with_one_refused_candidate_routes_as_a_mixed_group() {
+                let harness = Harness::new().await;
+                harness.free_feat_3().await;
+                prd_fanned(&harness).await;
+                provider_project(&harness, &[("API_KEY", VALUE)]);
+                let files = found(&[".env"]);
+                harness.orch.isolator.script_env_files(files.clone());
+
+                let outcome = Box::pin(harness.dispatch(start_feat_3()))
+                    .await
+                    .expect("a mixed group is no engine error");
+
+                let CommandOutcome::Started { run, rest } = outcome else {
+                    panic!("`StartRun` answers `Started`, not {outcome:?}");
+                };
+                assert_ne!(rest.run, RunStatus::Failed, "{rest:?}");
+                assert_eq!(rest.failure, None);
+                assert_eq!(harness.orch.run(run).await.failure, None);
+                let prd: Vec<_> = harness
+                    .orch
+                    .steps(run)
+                    .await
+                    .into_iter()
+                    .filter(|step| step.position == 0 && step.fanout_index >= 0)
+                    .collect();
+                let refused: Vec<_> = prd
+                    .iter()
+                    .filter(|step| step.status == StepStatus::Failed)
+                    .collect();
+                assert_eq!(refused.len(), 1, "{prd:?}");
+                let refused = refused[0];
+                let other = 1 - refused.fanout_index;
+                assert!(
+                    harness
+                        .orch
+                        .spec_for(&candidate(refused.fanout_index))
+                        .is_none(),
+                    "the refused candidate never started"
+                );
+                assert!(
+                    harness.orch.spec_for(&candidate(other)).is_some(),
+                    "the other candidate started"
+                );
+                let noted = format!(
+                    "fan-out candidate {} of `prd` attempt 1: {}",
+                    refused.fanout_index,
+                    env_files::refused(INFISICAL, &files)
+                );
+                let bodies: Vec<String> = notes(&harness)
+                    .await
+                    .into_iter()
+                    .map(|note| note.body)
+                    .collect();
+                assert!(bodies.contains(&noted), "{bodies:?}");
+            }
+
+            /// MOD-89 review M2: a resumed slot whose candidate 0 reached `done` before the crash
+            /// and whose candidate 1 the scan then refused is a mixed group too: the fold reads
+            /// the whole slot, not only the candidates this call drove, so the group routes on
+            /// to selection and the run is not failed with the sentence.
+            #[tokio::test]
+            async fn a_resumed_slot_with_a_done_candidate_is_not_failed_by_one_refusal() {
+                let harness = Harness::new().await;
+                harness.free_feat_3().await;
+                prd_fanned(&harness).await;
+                provider_project(&harness, &[("API_KEY", VALUE)]);
+                let files = found(&[".env"]);
+                harness.orch.isolator.script_env_files(files.clone());
+                harness_engine!(harness.orch, engine);
+                let run = engine
+                    .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None)
+                    .await
+                    .expect("the graph resolves");
+                let now = harness.orch.clock.now();
+                assert_eq!(
+                    harness
+                        .orch
+                        .store
+                        .claim_run(
+                            run,
+                            harness.orch.box_id(),
+                            harness.orch.owner(),
+                            now,
+                            TimeDelta::days(1)
+                        )
+                        .await
+                        .expect("MemStore claims"),
+                    Claim::Admitted
+                );
+                let snapshot = snapshot_of(&harness, run).await;
+                let phase = snapshot.phases[0].clone();
+                let chosen = phase.candidates[0].clone();
+                // Candidate 0 ran to `done` before the crash; candidate 1 was never created.
+                let done = harness
+                    .orch
+                    .store
+                    .create_step(NewRunStep {
+                        id: StepId::new(),
+                        run_id: run,
+                        position: phase.position,
+                        attempt: 1,
+                        fanout_index: 0,
+                        phase_name: phase.name.clone(),
+                        agent_id: Some(chosen.agent_id),
+                        model: Some(chosen.model),
+                    })
+                    .await
+                    .expect("MemStore creates the candidate")
+                    .id;
+                for (from, to) in [
+                    (StepStatus::Pending, StepStatus::Running),
+                    (StepStatus::Running, StepStatus::Done),
+                ] {
+                    assert!(
+                        harness
+                            .orch
+                            .store
+                            .transition_step(done, from, to, now)
+                            .await
+                            .expect("MemStore moves the candidate")
+                    );
+                }
+                let row = harness.orch.run(run).await;
+
+                let rest = Box::pin(engine.drive_group(&row, &snapshot, &phase, 1))
+                    .await
+                    .expect("a refused candidate is no engine error");
+
+                assert_eq!(rest, None, "the mixed group routes on to selection");
+                let after = harness.orch.run(run).await;
+                assert_eq!((after.status, after.failure), (RunStatus::Running, None));
+                let slot: Vec<_> = harness
+                    .orch
+                    .steps(run)
+                    .await
+                    .into_iter()
+                    .filter(|step| step.position == 0)
+                    .map(|step| (step.fanout_index, step.status))
+                    .collect();
+                assert_eq!(
+                    slot,
+                    [(0, StepStatus::Done), (1, StepStatus::Failed)],
+                    "only the re-run candidate failed"
+                );
+                assert!(harness.orch.spec_for(&candidate(1)).is_none());
+            }
+
+            /// MOD-89 review M3: `fail_candidate` answers whether it moved the row, so a refusal
+            /// is reported to the fold only when this call failed the candidate. A row another
+            /// process already moved (plan D17) is left alone, gets no note, and answers `false`.
+            #[tokio::test]
+            async fn fail_candidate_answers_whether_it_moved_the_row() {
+                let harness = Harness::new().await;
+                let (run, [settled, _]) = parked_group(&harness).await;
+                let row = harness.orch.run(run).await;
+                let snapshot = snapshot_of(&harness, run).await;
+                let phase = &snapshot.phases[0];
+                let step_of = |id: StepId| {
+                    let orch = &harness.orch;
+                    async move {
+                        orch.steps(run)
+                            .await
+                            .into_iter()
+                            .find(|step| step.id == id)
+                            .expect("the step exists")
+                    }
+                };
+                let before = notes(&harness).await.len();
+                harness_engine!(harness.orch, engine);
+
+                let lost = step_of(settled).await;
+                assert_ne!(lost.status, StepStatus::Running);
+                assert!(
+                    !engine
+                        .fail_candidate(&row, phase, &lost, "too late")
+                        .await
+                        .expect("a lost compare-and-set is no error"),
+                    "the row was not this call's to move"
+                );
+                assert_eq!(notes(&harness).await.len(), before, "and gets no note");
+
+                let live = harness
+                    .orch
+                    .store
+                    .create_step(NewRunStep {
+                        id: StepId::new(),
+                        run_id: run,
+                        position: lost.position,
+                        attempt: lost.attempt + 1,
+                        fanout_index: 0,
+                        phase_name: lost.phase_name.clone(),
+                        agent_id: lost.agent_id,
+                        model: lost.model.clone(),
+                    })
+                    .await
+                    .expect("MemStore creates the step")
+                    .id;
+                assert!(
+                    harness
+                        .orch
+                        .store
+                        .transition_step(
+                            live,
+                            StepStatus::Pending,
+                            StepStatus::Running,
+                            harness.orch.clock.now()
+                        )
+                        .await
+                        .expect("MemStore moves the step")
+                );
+                assert!(
+                    engine
+                        .fail_candidate(&row, phase, &step_of(live).await, "refused")
+                        .await
+                        .expect("the failure writes"),
+                    "a `running` row is this call's to fail"
+                );
+                assert_eq!(step_of(live).await.status, StepStatus::Failed);
+                assert_eq!(notes(&harness).await.len(), before + 1);
+            }
+
+            /// MOD-89 review L5 (MOD-42 I-6): a cancel that lands while the trees are scanned owns
+            /// the terminal status: the walk answers `Cancelled`, not the refusal it also met.
+            #[tokio::test]
+            async fn a_cancel_during_the_scan_wins_over_the_refusal() {
+                let harness = Harness::new().await;
+                harness.free_feat_3().await;
+                provider_project(&harness, &[("API_KEY", VALUE)]);
+                harness.orch.isolator.script_env_files(found(&[".env"]));
+                harness
+                    .orch
+                    .cancel_walks_during_env_files(std::time::Duration::from_secs(1));
+
+                let walked = Box::pin(harness.dispatch(start_feat_3())).await;
+
+                let run = started_run(&harness.orch).await;
+                assert!(
+                    matches!(&walked, Err(EngineError::Cancelled { run: stopped }) if *stopped == run),
+                    "the walk answers the cancel: {walked:?}"
+                );
+                assert_eq!(harness.orch.isolator.env_file_requests().len(), 1);
+                assert!(
+                    harness
+                        .orch
+                        .run(run)
+                        .await
+                        .failure
+                        .is_none_or(|failure| !failure.contains("env_files_refused")),
+                    "the refusal is not the run's failure"
+                );
+                assert!(
+                    harness.orch.spec_for(&key("prd")).is_none(),
+                    "no driver.start"
+                );
+            }
+
+            /// MOD-89 review L12 (D6): the dedupe is per run: a second run on the same item with
+            /// the same findings writes its own warning note, via its own step.
+            #[tokio::test]
+            async fn a_second_run_on_the_item_writes_its_own_warning_note() {
+                let harness = Harness::new().await;
+                harness.free_feat_3().await;
+                let files = found(&[".env"]);
+                harness.orch.isolator.script_env_files(files.clone());
+                harness.orch.isolator.script_env_files(files.clone());
+
+                Box::pin(harness.dispatch(start_feat_3()))
+                    .await
+                    .expect("the first walk parks at prd's gate");
+                let first = started_run(&harness.orch).await;
+                harness
+                    .orch
+                    .store
+                    .finish_run(first, RunStatus::Cancelled, None, harness.orch.clock.now())
+                    .await
+                    .expect("the parked run is cancellable");
+                Box::pin(harness.dispatch(start_feat_3()))
+                    .await
+                    .expect("the second walk parks at prd's gate");
+
+                let runs: Vec<RunId> = harness
+                    .orch
+                    .store
+                    .runs(ids::HTUI_FEAT_3)
+                    .await
+                    .expect("MemStore never fails a read")
+                    .into_iter()
+                    .map(|run| run.id)
+                    .filter(|run| *run != ids::RUN_2)
+                    .collect();
+                assert_eq!(runs.len(), 2, "{runs:?}");
+                let mut via = Vec::new();
+                for run in runs {
+                    via.push(step_at(&harness.orch, run, 0).await.id);
+                }
+                let mut warned: Vec<_> = warnings(&harness, &files)
+                    .await
+                    .into_iter()
+                    .filter_map(|note| note.via_step_id)
+                    .collect();
+                warned.sort();
+                via.sort();
+                assert_eq!(warned, via, "one note per run, each via its own prd step");
+            }
+
+            /// MOD-89 review L12: secrets first on a fan-out too: the group fails before a token
+            /// with `secrets_refused`, and no candidate's trees are ever scanned.
+            #[tokio::test]
+            async fn a_secrets_refusal_wins_over_env_files_on_a_fan_out() {
+                let harness = Harness::new().await;
+                harness.free_feat_3().await;
+                prd_fanned(&harness).await;
+                let cause = failing(&harness, SecretError::BadCredentials);
+                harness.orch.isolator.script_env_files(found(&[".env"]));
+                harness.orch.isolator.script_env_files(found(&[".env"]));
+
+                let outcome = Box::pin(harness.dispatch(start_feat_3()))
+                    .await
+                    .expect("a refused group is a failed run, not an engine error");
+
+                let CommandOutcome::Started { rest, .. } = outcome else {
+                    panic!("`StartRun` answers `Started`, not {outcome:?}");
+                };
+                assert_eq!(rest.run, RunStatus::Failed);
+                assert_eq!(rest.failure, Some(RunFailure::SecretsRefused { cause }));
+                assert!(harness.orch.isolator.env_file_requests().is_empty());
+            }
+
+            /// D6, D7: the refusal is typed, and its sentence names the setting that clears it
+            /// by the registry's own key, so the two cannot drift apart.
+            #[test]
+            fn failure_text_types_an_env_files_refusal() {
+                let files = found(&[".env"]);
+                let err = EngineError::EnvFiles {
+                    provider: INFISICAL.to_owned(),
+                    files: files.clone(),
+                };
+                let typed = RunFailure::EnvFilesRefused {
+                    provider: INFISICAL.to_owned(),
+                    files,
+                }
+                .to_string();
+                assert_eq!(failure_text("prd", &err), typed);
+                assert_eq!(err.to_string(), typed);
+                assert!(
+                    typed.contains(&format!("set {}.", SettingKey::AllowEnvFiles.key())),
+                    "{typed}"
+                );
+            }
         }
     }
 }

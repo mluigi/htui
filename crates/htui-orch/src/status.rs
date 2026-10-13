@@ -121,6 +121,14 @@ pub enum RunFailure {
         /// The provider's or the column check's error. Value-free by construction (M2 D4).
         cause: htui_core::secret::SecretError,
     },
+    /// MOD-89 D3, D6: a provider project's session trees hold env files and `allow_env_files` is
+    /// off, so the step failed before its driver was built. Names the files, never a value.
+    EnvFilesRefused {
+        /// `project.secret_provider`, as the column holds it.
+        provider: String,
+        /// What the scan found.
+        files: crate::isolate::EnvFiles,
+    },
 }
 
 impl RunFailure {
@@ -172,6 +180,9 @@ impl fmt::Display for RunFailure {
                 write!(f, "scrub refused at `{phase}`: unmasked {rule}")
             }
             Self::SecretsRefused { cause } => f.write_str(&cause.refusal()),
+            Self::EnvFilesRefused { provider, files } => {
+                f.write_str(&crate::isolate::env_files::refused(provider, files))
+            }
         }
     }
 }
@@ -603,6 +614,19 @@ mod tests {
             .to_string(),
             "secrets_refused: no Infisical machine identity is stored in the OS keyring",
             "MOD-10 D13: a refused resolution names the cause, never a value"
+        );
+        assert_eq!(
+            RunFailure::EnvFilesRefused {
+                provider: "infisical".into(),
+                files: crate::isolate::EnvFiles {
+                    paths: vec![".env".into()],
+                    truncated: None,
+                },
+            }
+            .to_string(),
+            "env_files_refused: `.env` in the session's trees; the project resolves its secrets \
+             from infisical. Remove them, or set allow_env_files.",
+            "MOD-89 D7: names the files and the provider, never a value"
         );
     }
 
