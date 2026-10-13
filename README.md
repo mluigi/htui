@@ -27,6 +27,7 @@ It runs on Windows 10+, Linux and macOS.
 - [Setting up agents](#setting-up-agents)
 - [Search](#search)
 - [Scripting htui](#scripting-htui)
+- [Use htui from Claude Code](#use-htui-from-claude-code)
 - [Where htui keeps its files](#where-htui-keeps-its-files)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
@@ -541,6 +542,25 @@ None of them writes anything: the database session is read-only, and nothing is 
 machine, with one exception: the first `--search-items` on a machine downloads the embedding model
 (about 134 MB) into your user cache directory. An empty standard output means the command failed before it could answer. The documents,
 every field and every error code are described in [`docs/htui-cli.md`](docs/htui-cli.md).
+
+## Use htui from Claude Code
+
+If you work in a plain `claude` session beside htui, `htui claude emit` writes a Claude Code plugin
+named `htui`: a skill that reads htui's state with the commands above and hands work to htui
+instead of doing it inline, and a mod that shows what waits on you above the prompt, opens a
+`/htui` pane, and answers `/htui status`, `/htui waiting` and `/htui search <query>`.
+
+```
+htui claude emit
+claude plugin marketplace add ~/.local/share/htui/claude-plugin
+claude plugin install htui@htui
+```
+
+`emit` writes under your local data directory (`~/.local/share/htui/claude-plugin` on Linux;
+`--dir PATH` picks another) and prints the two `claude plugin` commands with the directory it
+used. It never edits `~/.claude`. After upgrading htui, run `htui claude emit --force`, then
+`/reload-plugins` in Claude Code. Options, what the mod shows and the Claude Code version it needs
+are in [`docs/htui-claude-plugin.md`](docs/htui-claude-plugin.md).
 
 ## Where htui keeps its files
 

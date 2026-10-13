@@ -31,6 +31,9 @@ machine. See [No writes](#no-writes).
 - [Credentials and crash reports](#credentials-and-crash-reports)
 - [Text output](#text-output)
 
+See also: [the Claude Code plugin](htui-claude-plugin.md), which reads these commands from a
+Claude Code session.
+
 ## The commands and their flags
 
 | Command | Flags |
