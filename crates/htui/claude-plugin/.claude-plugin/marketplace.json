@@ -1,0 +1,14 @@
+{
+  "name": "htui",
+  "owner": {
+    "name": "htui"
+  },
+  "description": "htui's plugin, written by htui claude emit",
+  "plugins": [
+    {
+      "name": "htui",
+      "source": "./htui",
+      "description": "Read htui's state from Claude Code and hand work to htui"
+    }
+  ]
+}

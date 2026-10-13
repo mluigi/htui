@@ -14,6 +14,7 @@ pub mod agent_worker;
 pub mod app;
 pub mod box_settings;
 pub mod catalogue;
+pub mod claude_emit;
 pub mod cli;
 pub mod concepts;
 pub mod concepts_worker;
@@ -80,7 +81,8 @@ use crate::keymap::Keymap;
 /// (MOD-45) comes right after logging, before the keyring flags; it prints to the shell and exits.
 /// `htui status` and `htui waiting` (MOD-92) come right after it: they read only, print one answer
 /// and exit, and `--search-items` (read-only too since MOD-92) keeps its place after the keyring
-/// flags; all three run before the key file is read.
+/// flags; all three run before the key file is read. `htui claude emit` (MOD-93) comes right after
+/// the state verbs: it writes only its plugin directory, prints and exits.
 /// With `--dsn-stdin`, the session's DSN is read from stdin before the backend starts.
 ///
 /// The backend is always available immediately: `connect::start` opens the local mirror and hands
@@ -125,6 +127,13 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
         return state_cmd::run(state_cmd::Verb::Waiting, state)
             .await
             .map_err(anyhow::Error::from);
+    }
+    // MOD-93: after `init_tracing`, so `--log` works; it writes only its own directory.
+    if let Some(cli::Command::Claude(cli::ClaudeArgs {
+        command: cli::ClaudeCommand::Emit(emit),
+    })) = args.command.clone()
+    {
+        return claude_emit::run(emit).await.map_err(anyhow::Error::from);
     }
     if args.set_dsn {
         return set_dsn_from_stdin();
