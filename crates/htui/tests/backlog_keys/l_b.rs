@@ -445,3 +445,66 @@ async fn enter_replays_the_step_and_misses_without_one() {
     );
     assert_eq!(harness.app().status, None, "and no refusal was raised");
 }
+
+/// The Runs pane's row the step cursor (`▸`) is on.
+fn cursor_row(frame: &str) -> String {
+    frame
+        .lines()
+        .filter_map(|row| row.rsplit_once("││").map(|(_, pane)| pane))
+        .find(|pane| pane.contains('▸'))
+        .unwrap_or_else(|| panic!("the Runs pane has a step cursor:\n{frame}"))
+        .trim_end_matches('│')
+        .trim_end()
+        .to_owned()
+}
+
+/// The lane's rebinding test (MOD-67 M5 D12): `[backlog.runs] next_step = "n"` moves the step
+/// cursor to `n`. `n` moves it, `J` no longer does, and the browse row names `n`. `n` passes the
+/// unconverted Backlog tab (it intercepts no `n`) and the converted one (no `backlog`, `list` or
+/// `pane` act binds it).
+#[tokio::test]
+async fn a_rebound_next_step_moves_the_cursor_and_j_capital_is_inert() {
+    let keys = htui::keys::load_str("version = 1\n[backlog.runs]\nnext_step = \"n\"\n")
+        .expect("the keys load");
+    let mut harness = Harness::over(MemStore::demo())
+        .with_tab(Box::new(BacklogTab::new()))
+        .with_keys(keys);
+    harness.drive().await;
+    harness.app().update(Action::SetScope {
+        workspace: workspace("platform").await,
+    });
+    harness.drive().await;
+    for _ in 0..TO_FEAT_1 {
+        harness.key("j");
+        harness.drive().await;
+    }
+    harness.key("l");
+    harness.drive().await;
+    let frame = harness.render();
+    assert!(
+        cursor_row(&frame).contains("prd"),
+        "the cursor starts on FEAT-1's first step:\n{frame}"
+    );
+    assert_eq!(
+        pane_last_row(&frame),
+        "n/K step · Enter replay · v flow · ? keys",
+        "the browse row names the rebound key:\n{frame}"
+    );
+
+    harness.key("J");
+    harness.drive().await;
+    let frame = harness.render();
+    assert!(
+        cursor_row(&frame).contains("prd"),
+        "`J` no longer moves the cursor:\n{frame}"
+    );
+
+    harness.key("n");
+    harness.drive().await;
+    let frame = harness.render();
+    assert!(
+        cursor_row(&frame).contains("plan"),
+        "`n` moves it to the next step:\n{frame}"
+    );
+    assert!(frame.contains("┌ FEAT-1"), "on FEAT-1 still:\n{frame}");
+}
