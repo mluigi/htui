@@ -476,7 +476,8 @@ mod tests {
                           switcher, migration, waiting, skills, skills.library, \
                           skills.templates, skills.attach, skills.help, requirements, backlog, \
                           backlog.body, backlog.runs, backlog.graph, backlog.docs, backlog.notes, \
-                          backlog.prompt, backlog.reqs, backlog.filter_form, backlog.item, chat";
+                          backlog.prompt, backlog.reqs, backlog.filter_form, backlog.item, chat, \
+                          queue, picker";
 
     #[test]
     fn an_empty_file_is_the_defaults() {

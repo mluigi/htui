@@ -149,7 +149,22 @@ close = ["esc"]  # close"#;
                        end        = [\"esc\"]         # end chat (twice)\n\
                        thoughts   = [\"t\"]           # thoughts\n\
                        top        = [\"g\"]           # top\n\
-                       bottom     = [\"G\"]           # bottom\n"
+                       bottom     = [\"G\"]           # bottom\n\
+                       \n\
+                       [queue]\n\
+                       move_down = [\"J\"]      # move down\n\
+                       move_up   = [\"K\"]      # move up\n\
+                       pause     = [\"P\"]      # pause / resume\n\
+                       dequeue   = [\"Q\"]      # dequeue\n\
+                       open      = [\"enter\"]  # open\n\
+                       \n\
+                       [picker]\n\
+                       open       = [\"enter\", \"l\"]      # open directory\n\
+                       parent     = [\"h\", \"backspace\"]  # parent directory\n\
+                       choose     = [\"s\"]               # choose\n\
+                       choose_dir = [\"S\"]               # choose this directory\n\
+                       go_to      = [\"/\"]               # go to path\n\
+                       hidden     = [\".\"]               # show hidden\n"
             ),
             "{printed}"
         );
