@@ -47,13 +47,13 @@ const VERSION_TS: &str = "htui/hooks/version.ts";
 /// it on stderr. Neither arm reaches Sentry: its sentences carry home paths (MOD-93 D8).
 #[derive(Debug)]
 pub enum EmitExit {
-    /// Exit 2, nothing written: the target holds an earlier emit and `--force` is missing; holds
-    /// anything `emit` did not write (checked again right before an earlier emit is moved
-    /// aside); is a file; is a path with a `..`, not valid UTF-8, or naming no directory; or
-    /// there is no `--dir` and the default directory is missing (no local data directory) or
-    /// has a `..`.
+    /// Exit 2, nothing left written: the target holds an earlier emit and `--force` is
+    /// missing; holds anything `emit` did not write (checked again right before an earlier emit
+    /// is moved aside); is a file; is a path with a `..`, not valid UTF-8, or naming no
+    /// directory; or there is no `--dir` and the default directory is missing (no local data
+    /// directory) or has a `..`.
     Refused(String),
-    /// Exit 1: a write, a rename or stdout failed.
+    /// Exit 1: a read, a write, a removal, a rename or stdout failed.
     Failed(String),
 }
 
@@ -446,8 +446,8 @@ fn decide(dir: &Path, target: Target, force: bool) -> Result<Install, EmitExit> 
     }
 }
 
-/// Normalises `dir` and classifies it (D4), touching nothing: every refusal comes from here, so
-/// [`run`] gives it before it runs `claude --version`.
+/// Normalises `dir` and classifies it (D4), touching nothing: every refusal but [`install`]'s late
+/// `--force` recheck comes from here, so [`run`] gives it before it runs `claude --version`.
 ///
 /// # Errors
 ///
@@ -584,8 +584,9 @@ fn install(prepared: Prepared, variant: Variant, rename: Rename<'_>) -> Result<R
 /// [`EmitExit::Refused`] for a target `emit` may not write (even with `force`), a file, a path
 /// naming no directory, with a `..` or not UTF-8, or an earlier emit without `force`; nothing is
 /// touched then. The same for an earlier emit that is no longer one when it would be moved aside;
-/// the target is left as it is, and the staging directory removed. [`EmitExit::Failed`] when a directory cannot be read, made or renamed, or a file
-/// cannot be written; the staging directory is removed, and a moved-aside emit is put back.
+/// the target is left as it is, and the staging directory removed. [`EmitExit::Failed`] when a
+/// directory cannot be read, made, removed or renamed, or a file cannot be written; the staging
+/// directory is removed, and a moved-aside emit is put back.
 pub fn write_to(dir: &Path, options: &Options) -> Result<Report, EmitExit> {
     install(
         prepare(dir, options.force)?,
@@ -696,8 +697,8 @@ pub fn render(report: &Report, check: &ClaudeCheck) -> String {
 /// # Errors
 ///
 /// [`EmitExit::Refused`] when there is no `--dir` and no local data directory (or one with a
-/// `..`), or the target is refused (before `claude` runs); [`EmitExit::Failed`] when the write fails or stdout fails (a
-/// closed pipe excepted).
+/// `..`), or the target is refused (before `claude` runs, but for the late `--force` recheck);
+/// [`EmitExit::Failed`] when the write fails or stdout fails (a closed pipe excepted).
 pub async fn run(args: cli::EmitArgs) -> Result<(), EmitExit> {
     run_with(args, probe_claude, &mut std::io::stdout()).await
 }
@@ -712,7 +713,7 @@ where
     Probe: FnOnce() -> Checked,
     Checked: Future<Output = ClaudeCheck>,
 {
-    // Every refusal before `claude --version` runs.
+    // Every refusal but install's late `--force` recheck, before `claude --version` runs.
     let dir = chosen_dir(args.dir, default_dir())?;
     let prepared = prepare(&dir, args.force)?;
     let check = probe().await;
@@ -1349,8 +1350,8 @@ mod tests {
         (outcome, probed.get())
     }
 
-    /// F4: every refusal returns before `claude --version` runs; a write runs it once and prints
-    /// the report.
+    /// F4: every refusal from `prepare` returns before `claude --version` runs; a write runs it
+    /// once and prints the report.
     #[test]
     fn a_refusal_returns_before_claude_is_probed() {
         let root = tempfile::tempdir().expect("a temp dir");

@@ -320,7 +320,7 @@ skew line after it).
 | `htui` is not on `PATH`, or could not start | `htui: not found on PATH` |
 | `htui` ran past its bound | `htui: timed out` |
 | `htui` printed nothing | `htui printed nothing (exit <code>)` |
-| The answer is not a JSON object, a count in it (`working`, `waiting`) is not a whole number of 0 or more, or its `rows` is not a list | `htui: unreadable answer (exit <code>)` |
+| The answer is not a JSON object, a `status` count (`working`, `waiting`) is not a whole number of 0 or more, or a `waiting` answer's `rows` is not a list | `htui: unreadable answer (exit <code>)` |
 | The answer's schema version is newer | `htui: answer version <N> is newer than this plugin: run htui claude emit --force, then /reload-plugins` |
 | A failure document (the store offline, a refusal, a failed read) | `htui: <error.message>`, for example `htui: cannot reach Postgres: store unreachable: connection refused` |
 | Any other non-zero exit | `htui: exit <code>` |
