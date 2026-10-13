@@ -313,8 +313,8 @@ mod binary {
     }
 
     /// MOD-67 M5 R1 M1 end to end: a key the filter form's option rows keep for themselves
-    /// (`Space`, `l`, `Enter`, `Shift+Left`) cannot be given to one of its acts; each file is refused before
-    /// anything starts, on the entry's line, naming the form.
+    /// (`Space`, `l`, `Enter`, `Shift+Left`) cannot be given to one of its acts; each file is
+    /// refused before anything starts, on the entry's line, naming the form.
     #[test]
     fn a_rebind_onto_a_filter_form_fixed_key_exits_2() {
         let home = tempfile::tempdir().expect("a throwaway home");

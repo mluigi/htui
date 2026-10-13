@@ -1,7 +1,8 @@
 //! The key file's semantic checks over the merged keys (MOD-67 M2 D8 steps 5-6; ANA-26 §7.4
-//! step 7): collisions in every context and in every declared stack, and printable chords on
-//! actions offered while a field captures. Before them, [`give_way`] lets an entry of the file
-//! take its chord from an action the file leaves at its default (MOD-12 M3 R1 H1).
+//! step 7): collisions in every context and in every declared stack, printable chords on
+//! actions offered while a field captures, and (MOD-67 M5 R1) a user chord on a key a view keeps
+//! for itself ahead of the resolver ([`FIXED`]). Before them, [`give_way`] lets an entry of the
+//! file take its chord from an action the file leaves at its default (MOD-12 M3 R1 H1).
 //!
 //! MOD-67 M3: the per-context pass skips view contexts (PA-4: a view context holds rows of modes
 //! that never meet; the stack pass checks every declared stack), the stack pass allows a

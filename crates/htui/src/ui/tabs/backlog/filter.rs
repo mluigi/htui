@@ -234,8 +234,9 @@ impl FilterForm {
     ///
     /// On the Tags row every plain character is text (blueprint E7): the field takes the key
     /// first, and what it passes resolves as on any row, so the row moves on
-    /// `form.next_field`/`prev_field` (`Tab`/`Down`, `BackTab`/`Up`). On the other rows the form's own plain keys come first (`Enter` applies,
-    /// `Esc` cancels, `h`/`l`/arrows move the option, Space ticks it), then the acts:
+    /// `form.next_field`/`prev_field` (`Tab`/`Down`, `BackTab`/`Up`). On the other rows the
+    /// form's own plain keys come first (`Enter` applies, `Esc` cancels, `h`/`l`/arrows move the
+    /// option, Space ticks it), then the acts:
     /// `backlog.filter_form.next_row`/`prev_row` (`j`/`k`) and the field moves, and
     /// `backlog.filter_form.clear` (`x`). Anything else is [`FormOutcome::Pass`]: a chord is never
     /// a form key (MOD-13 review L4), so `Alt+x` clears nothing.
