@@ -1,0 +1,13 @@
+---
+source: crates/htui/src/state_cmd.rs
+expression: pretty(&read)
+---
+{
+  "version": 1,
+  "kind": "status",
+  "store": "error",
+  "error": {
+    "code": "read_failed",
+    "message": "reading the store failed: store backend error: XX000: planted"
+  }
+}

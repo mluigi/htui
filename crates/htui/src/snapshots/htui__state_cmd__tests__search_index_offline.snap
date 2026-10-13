@@ -1,0 +1,16 @@
+---
+source: crates/htui/src/state_cmd.rs
+expression: "pretty(&search(IndexAnswer::Offline(\"cannot reach Qdrant: qdrant: collection exists: transport error\".into())))"
+---
+{
+  "version": 1,
+  "kind": "search",
+  "store": "online",
+  "index": "offline",
+  "query": "closed items",
+  "decisions": false,
+  "error": {
+    "code": "qdrant_unreachable",
+    "message": "cannot reach Qdrant: qdrant: collection exists: transport error"
+  }
+}

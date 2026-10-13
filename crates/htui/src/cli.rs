@@ -98,6 +98,21 @@ pub struct Args {
         conflicts_with = "index_items"
     )]
     pub limit: Option<u64>,
+
+    /// With `--search-items`: print one versioned JSON document instead of lines
+    /// (`docs/htui-cli.md`).
+    #[arg(long, requires = "search_items", conflicts_with = "index_items")]
+    pub json: bool,
+
+    /// With `--search-items`: only the project whose repository, registered on this box, contains
+    /// PATH (the deepest one).
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "search_items",
+        conflicts_with_all = ["index_items", "project"]
+    )]
+    pub cwd: Option<PathBuf>,
 }
 
 /// `htui`'s subcommands (MOD-41 plan D14).
@@ -113,6 +128,14 @@ pub enum Command {
     /// new box's executor to `worker`. The DSN comes from the OS keyring or `--dsn-stdin`; never
     /// argv or the environment.
     Provision(ProvisionArgs),
+    /// Print the top bar's facts and exit: store state, workspace, box, working and waiting counts.
+    /// Reads only (MOD-92): the DSN comes from the OS keyring; nothing is written. `--json` prints one
+    /// versioned document (`docs/htui-cli.md`); exit 3 when the store does not answer, 2 on a refusal.
+    Status(StateArgs),
+    /// Print what waits on you (`R-TUI-11`): gates, failed judges, selections, Unblock rows, interrupted
+    /// runs and permission requests, in the overlay's order (project in scope order, then item key,
+    /// run, step and reason), with their age. Reads only, as `status`.
+    Waiting(StateArgs),
     /// Serve htui's MCP tools to one agent session over stdio. Started by the agent htui launched,
     /// never by hand: it reads HTUI_MCP_ADDR and HTUI_MCP_TOKEN, writes only MCP to stdout, and exits
     /// when the agent closes stdin.
@@ -145,9 +168,23 @@ pub struct WorkerArgs {
     pub dsn_stdin: bool,
 }
 
+/// `htui status` / `htui waiting`'s flags (MOD-92 D1). None reads the environment.
+#[derive(Debug, Clone, Default, PartialEq, Eq, clap::Args)]
+pub struct StateArgs {
+    /// Print one versioned JSON document instead of text.
+    #[arg(long)]
+    pub json: bool,
+    /// Scope to the project with this slug instead of the first workspace.
+    #[arg(long, value_name = "SLUG", conflicts_with = "cwd")]
+    pub project: Option<String>,
+    /// Scope to the project whose repository, registered on this box, contains PATH.
+    #[arg(long, value_name = "PATH")]
+    pub cwd: Option<PathBuf>,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Args, Command, ProvisionArgs, WorkerArgs};
+    use super::{Args, Command, ProvisionArgs, StateArgs, WorkerArgs};
     use clap::{CommandFactory as _, Parser as _};
 
     #[test]
@@ -189,6 +226,7 @@ mod tests {
             &["htui", "--decisions"],
             &["htui", "--index-items", "--decisions"],
             &["htui", "--index-items", "--limit", "3"],
+            &["htui", "--json"],
             &["htui", "--search-items", "q", "--limit", "0"],
             &[
                 "htui",
@@ -471,6 +509,110 @@ mod tests {
                 "`htui --{}` must not read the environment",
                 arg.get_id()
             );
+        }
+    }
+
+    /// MOD-92 D1: `status` and `waiting` take `--json`, `--project` and `--cwd`.
+    #[test]
+    fn status_and_waiting_parse_their_three_flags() {
+        let args = Args::try_parse_from(["htui", "status"]).expect("parse");
+        assert_eq!(args.command, Some(Command::Status(StateArgs::default())));
+        let args = Args::try_parse_from(["htui", "waiting", "--json", "--project", "htui"])
+            .expect("parse");
+        assert_eq!(
+            args.command,
+            Some(Command::Waiting(StateArgs {
+                json: true,
+                project: Some("htui".to_owned()),
+                cwd: None,
+            }))
+        );
+        let args = Args::try_parse_from(["htui", "status", "--cwd", "."]).expect("parse");
+        assert_eq!(
+            args.command,
+            Some(Command::Status(StateArgs {
+                json: false,
+                project: None,
+                cwd: Some(".".into()),
+            }))
+        );
+    }
+
+    /// MOD-92 D1: one scope at a time.
+    #[test]
+    fn state_project_and_cwd_exclude_each_other() {
+        for verb in ["status", "waiting"] {
+            assert!(
+                Args::try_parse_from(["htui", verb, "--project", "a", "--cwd", "."]).is_err(),
+                "`{verb} --project --cwd` must not parse"
+            );
+        }
+    }
+
+    /// MOD-92 D1: no TUI flag stands beside a state verb; the global `--log` does.
+    #[test]
+    fn state_verbs_refuse_tui_flags_beside_them() {
+        for bad in [
+            &["htui", "--demo", "status"][..],
+            &["htui", "--offline", "waiting"],
+            &["htui", "status", "--decisions"],
+        ] {
+            assert!(Args::try_parse_from(bad).is_err(), "{bad:?} must not parse");
+        }
+        let args = Args::try_parse_from(["htui", "status", "--log", "x"]).expect("parse");
+        assert_eq!(args.log.as_deref(), Some(std::path::Path::new("x")));
+    }
+
+    /// MOD-92 D1: at top level, `--json` and `--cwd` belong to `--search-items`.
+    #[test]
+    fn json_and_cwd_need_search_items_at_top_level() {
+        for bad in [
+            &["htui", "--json"][..],
+            &["htui", "--cwd", "."],
+            &["htui", "--index-items", "--json"],
+            &[
+                "htui",
+                "--search-items",
+                "q",
+                "--cwd",
+                ".",
+                "--project",
+                "p",
+            ],
+        ] {
+            assert!(Args::try_parse_from(bad).is_err(), "{bad:?} must not parse");
+        }
+        let args = Args::try_parse_from(["htui", "--search-items", "q", "--json", "--cwd", "."])
+            .expect("parse");
+        assert!(args.json);
+        assert_eq!(args.cwd.as_deref(), Some(std::path::Path::new(".")));
+    }
+
+    /// `R-STO-1`, MOD-92: no argument of `htui status` or `htui waiting` reads the environment,
+    /// except the propagated global `--log`.
+    #[test]
+    fn no_state_argument_reads_the_environment() {
+        let mut command = Args::command();
+        command.build();
+        for name in ["status", "waiting"] {
+            let verb = command
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("`{name}` is a subcommand"));
+            let mut saw_log = false;
+            for arg in verb.get_arguments() {
+                if arg.get_id() == "log" {
+                    saw_log = true;
+                    assert_eq!(arg.get_env(), Some(std::ffi::OsStr::new("HTUI_LOG")));
+                } else {
+                    assert_eq!(
+                        arg.get_env(),
+                        None,
+                        "`htui {name} --{}` must not read the environment",
+                        arg.get_id()
+                    );
+                }
+            }
+            assert!(saw_log, "`--log` is propagated to `{name}`");
         }
     }
 }

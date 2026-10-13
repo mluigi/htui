@@ -1,0 +1,16 @@
+---
+source: crates/htui/src/state_cmd.rs
+expression: "pretty(&search(IndexAnswer::Refused(format!(\"{EMBEDDER_MISMATCH}: collection `htui_concepts` holds vectors from hash/384\"))))"
+---
+{
+  "version": 1,
+  "kind": "search",
+  "store": "online",
+  "index": "refused",
+  "query": "closed items",
+  "decisions": false,
+  "error": {
+    "code": "embedder_mismatch",
+    "message": "qdrant: embedder mismatch: collection `htui_concepts` holds vectors from hash/384"
+  }
+}

@@ -1,0 +1,13 @@
+---
+source: crates/htui/src/state_cmd.rs
+expression: "pretty(&search(IndexAnswer::Empty))"
+---
+{
+  "version": 1,
+  "kind": "search",
+  "store": "online",
+  "index": "empty",
+  "query": "closed items",
+  "decisions": false,
+  "hits": []
+}

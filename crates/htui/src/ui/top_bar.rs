@@ -91,6 +91,7 @@ mod tests {
             step_label: String::new(),
             reason: WaitingReason::Unblock,
             text: "blocked".to_owned(),
+            since: chrono::DateTime::UNIX_EPOCH,
         }
     }
 

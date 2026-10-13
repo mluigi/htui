@@ -1,0 +1,15 @@
+---
+source: crates/htui/src/state_cmd.rs
+expression: pretty(&answer)
+---
+{
+  "version": 1,
+  "kind": "status",
+  "store": "online",
+  "workspace": null,
+  "projects": [],
+  "box": null,
+  "working": 0,
+  "waiting": 0,
+  "permissions_known": false
+}

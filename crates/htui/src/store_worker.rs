@@ -2017,8 +2017,9 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> StoreReply {
 
 /// MOD-69 review L4: the open permissions, or `None` (unknown, as offline) when their read fails
 /// for any reason but [`StoreError::Unreachable`], which propagates so `go_offline` still fires.
-/// A broken permission read then costs the list its permission rows, not the whole reply.
-fn permissions_or_unknown(
+/// A broken permission read then costs the list its permission rows, not the whole reply. This is
+/// also `htui waiting --json`'s rule (MOD-92).
+pub(crate) fn permissions_or_unknown(
     read: StoreResult<Vec<WaitingPermission>>,
 ) -> StoreResult<Option<Vec<WaitingPermission>>> {
     match read {
@@ -3779,9 +3780,15 @@ mod tests {
 
     /// MOD-69 plan D6, blueprint H-5: over the demo's Platform scope, `RUN_2` is the only active
     /// run and owns no row, `htui` FEAT-2 (blocked, no run) is the one Reopen row, and TOOL-1
-    /// (awaiting approval, no run) is a candidate with no row.
+    /// (awaiting approval, no run) is a candidate with no row. The Reopen row is since FEAT-2's
+    /// last change (MOD-92 D5).
     #[tokio::test]
     async fn serve_waiting_reads_the_demo_platform() {
+        let feat_2 = demo_data()
+            .items
+            .into_iter()
+            .find(|item| item.id == ids::HTUI_FEAT_2)
+            .expect("the demo holds FEAT-2");
         let backend = demo();
         let scope = platform_scope(&backend).await;
         assert_eq!(
@@ -3816,6 +3823,7 @@ mod tests {
                 step_label: String::new(),
                 reason: WaitingReason::Unblock,
                 text: "blocked, no active run: u reopens it".into(),
+                since: feat_2.updated_at,
             }]
         );
     }

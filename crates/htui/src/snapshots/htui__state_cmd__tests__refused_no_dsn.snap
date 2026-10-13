@@ -1,0 +1,13 @@
+---
+source: crates/htui/src/state_cmd.rs
+expression: pretty(&no_dsn)
+---
+{
+  "version": 1,
+  "kind": "waiting",
+  "store": "refused",
+  "error": {
+    "code": "no_dsn",
+    "message": "no Postgres DSN is stored; run `htui --set-dsn` first"
+  }
+}

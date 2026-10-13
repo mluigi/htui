@@ -8,8 +8,9 @@ use std::time::Duration;
 /// Parses the command line and runs the shell, or `htui worker`.
 ///
 /// Exit codes: 0 on success; 2 for `htui worker`'s startup refusals, `htui provision`'s
-/// refusals (MOD-45 D292), `htui mcp` without its environment, a key file htui refuses (MOD-67)
-/// and clap's usage errors; 3 for an `htui mcp` the host refused (MOD-11 D6); 1 for every other
+/// refusals (MOD-45 D292), `htui mcp` without its environment, a key file htui refuses (MOD-67),
+/// a state verb's refusal (MOD-92) and clap's usage errors; 3 for an `htui mcp` the host refused
+/// (MOD-11 D6) and for a state verb whose store or index did not answer (MOD-92); 1 for every other
 /// failure (MOD-41 plan D14). The error is printed after [`run`](htui::run) has restored the
 /// terminal, so a failure is readable instead of being drawn over the last frame.
 ///
@@ -98,7 +99,7 @@ async fn body(args: htui::cli::Args) -> ExitCode {
 /// The exit code `error` ends `body` with: a [`WorkerExit`](htui::worker_cmd::WorkerExit)'s, a
 /// [`ProvisionExit`](htui::provision::ProvisionExit)'s or an [`McpExit`](htui::mcp_cmd::McpExit)'s
 /// own code (MOD-11 B-13: 2, 3 or 1), a [`KeysError`](htui::keys::KeysError)'s (MOD-67 M2 D9:
-/// 2), else 1.
+/// 2), a [`StateExit`](htui::state_cmd::StateExit)'s (MOD-92: 3, 2 or 1), else 1.
 fn exit_code(error: &anyhow::Error) -> u8 {
     error
         .downcast_ref::<htui::worker_cmd::WorkerExit>()
@@ -118,6 +119,11 @@ fn exit_code(error: &anyhow::Error) -> u8 {
                 .downcast_ref::<htui::keys::KeysError>()
                 .map(htui::keys::KeysError::code)
         })
+        .or_else(|| {
+            error
+                .downcast_ref::<htui::state_cmd::StateExit>()
+                .map(htui::state_cmd::StateExit::code)
+        })
         .unwrap_or(1)
 }
 
@@ -128,7 +134,9 @@ fn exit_code(error: &anyhow::Error) -> u8 {
 /// its code: its sentences carry `user@host`, remote paths and the host's journal and log lines,
 /// and each describes that host's state. MOD-11 B-13: no `htui mcp` end is either; an agent's
 /// relay ending is the session's state, not a crash. MOD-67 M2 D9: no key-file refusal either,
-/// whatever its code: the report carries the user's home path.
+/// whatever its code: the report carries the user's home path. MOD-92: a state verb whose store
+/// or index did not answer (3) or that refused (2) is a state, not a crash, by its type; its failure
+/// (1) is still reported.
 fn reports_to_sentry(error: &anyhow::Error, code: u8) -> bool {
     code != 2
         && error
@@ -136,6 +144,10 @@ fn reports_to_sentry(error: &anyhow::Error, code: u8) -> bool {
             .is_none()
         && error.downcast_ref::<htui::mcp_cmd::McpExit>().is_none()
         && error.downcast_ref::<htui::keys::KeysError>().is_none()
+        && !matches!(
+            error.downcast_ref::<htui::state_cmd::StateExit>(),
+            Some(htui::state_cmd::StateExit::Offline(_) | htui::state_cmd::StateExit::Refused(_))
+        )
 }
 
 #[cfg(test)]
@@ -148,6 +160,7 @@ mod tests {
     use htui::keys::{KeyFileError, KeysError};
     use htui::mcp_cmd::McpExit;
     use htui::provision::ProvisionExit;
+    use htui::state_cmd::StateExit;
     use htui::worker_cmd::WorkerExit;
 
     /// MOD-45 review finding 1: no `htui provision` end reaches Sentry, whatever its code; a
@@ -242,6 +255,33 @@ mod tests {
         assert_eq!(grace(&["htui", "mcp"]), Duration::ZERO);
         assert_eq!(grace(&["htui"]), htui::SHUTDOWN);
         assert_eq!(grace(&["htui", "--clear-dsn"]), htui::SHUTDOWN);
+        assert_eq!(grace(&["htui", "status"]), htui::SHUTDOWN);
+    }
+
+    /// MOD-92 D3: a state verb exits 3 offline, 2 refused, 1 failed, wrapped or not; only the
+    /// failure reaches Sentry.
+    #[test]
+    fn state_exits_are_3_2_1_and_only_failures_reach_sentry() {
+        assert_eq!(StateExit::Offline(String::new()).code(), 3);
+        assert_eq!(StateExit::Refused(String::new()).code(), 2);
+        assert_eq!(StateExit::Failed(String::new()).code(), 1);
+        for (exit, reported) in [
+            (StateExit::Offline("cannot reach Postgres".into()), false),
+            (StateExit::Refused("no DSN".into()), false),
+            (StateExit::Failed("reading the store failed".into()), true),
+        ] {
+            let expected = exit.code();
+            let error = anyhow::Error::from(exit);
+            assert_eq!(super::exit_code(&error), expected, "{error}");
+            assert_eq!(reports_to_sentry(&error, expected), reported, "{error}");
+            let wrapped = error.context("while answering");
+            assert_eq!(super::exit_code(&wrapped), expected, "{wrapped:#}");
+            assert_eq!(
+                reports_to_sentry(&wrapped, expected),
+                reported,
+                "{wrapped:#}"
+            );
+        }
     }
 
     /// MOD-41 review RF-4: a body that panics while a blocking task never ends still leaves

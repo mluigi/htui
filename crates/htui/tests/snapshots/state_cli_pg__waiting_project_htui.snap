@@ -1,0 +1,47 @@
+---
+source: crates/htui/tests/state_cli_pg.rs
+expression: run.pretty()
+---
+{
+  "version": 1,
+  "kind": "waiting",
+  "store": "online",
+  "workspace": {
+    "id": "01a06490-bfb8-7000-8000-000000000300",
+    "slug": "platform",
+    "name": "Platform"
+  },
+  "projects": [
+    {
+      "id": "01a06490-c3a0-7000-8000-000000000400",
+      "slug": "htui",
+      "name": "htui"
+    }
+  ],
+  "working": 0,
+  "permissions_known": true,
+  "rows": [
+    {
+      "reason": "unblock",
+      "item_key": "FEAT-2",
+      "item_id": "01a06490-d343-7000-8000-000000000803",
+      "run_id": null,
+      "step_id": null,
+      "step": null,
+      "text": "blocked, no active run: u reopens it",
+      "since": "[timestamp]",
+      "age_seconds": "[age]"
+    },
+    {
+      "reason": "gate",
+      "item_key": "FEAT-3",
+      "item_id": "01a06490-d344-7000-8000-000000000804",
+      "run_id": "01a06490-e2e1-7000-8000-000000000c01",
+      "step_id": "01a06490-e6cc-7000-8000-000000000d04",
+      "step": "prd 0.1",
+      "text": "gate",
+      "since": "[timestamp]",
+      "age_seconds": "[age]"
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+---
+source: crates/htui/tests/state_cli_pg.rs
+expression: run.pretty()
+---
+{
+  "version": 1,
+  "kind": "status",
+  "store": "online",
+  "workspace": {
+    "id": "[uuid]",
+    "slug": "graphics",
+    "name": "Graphics"
+  },
+  "projects": [
+    {
+      "id": "[uuid]",
+      "slug": "vulkan-tutorials",
+      "name": "Vulkan Tutorials"
+    }
+  ],
+  "box": {
+    "id": "[uuid]",
+    "hostname": "HTUI-TEST",
+    "registered": false
+  },
+  "working": 0,
+  "waiting": 0,
+  "permissions_known": true
+}

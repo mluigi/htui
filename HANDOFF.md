@@ -14,21 +14,17 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-08):** **MOD-57 is done** (`docs/decisions/mod/mod-57.md`): with `HTUI_EDITOR_PANE=1`,
-`E`/`Ctrl+E` run `$VISUAL`/`$EDITOR` inside the asking pane; with focus in htui (`Ctrl+4`) every other tab works
-while the editor waits, and quit and abort ask first. Owed on the host: an nvim run in the pane and the PRD's
-10-edit trial. Before it, **ANA-29 was concluded** (`docs/ANA-29.md`,
-`docs/decisions/ana/ana-29.md`): Claude Code mods (in-process JS/TS handlers shipped in plugins) for
-developing htui and for using it elsewhere. htui-driven `claude -p` sessions load the user's mods and
-settings hooks today, so **MOD-91** isolates them first; dev side gets one committed `htui-dev` mod
-(**TOOL-8**) over a canonical gate script (**TOOL-9**), plus sandbox hardening (**TOOL-10**) and
-**CLEAN-12**; consumer side is a read-only `--json` CLI (**MOD-92**), then a thin emitted `htui` plugin
-(**MOD-93**), with **MOD-94** (permission answers outside the TUI) behind a maintainer decision. Before it,
-**MOD-12 is done** (`docs/decisions/mod/mod-12.md`): auto mode runs explicitly queued items unattended,
-holds each batch to its spend cap, and `ctrl-q` opens the queue overlay; a stalled batch closes. Owed on the
-host: the Postgres gate and the PRD's prototype batch. Before that, **CLEAN-9**
-(`docs/decisions/clean/clean-9.md`): the recorder's `cap_exceeded` row names the session allowance and what
-bound it. Filed **CLEAN-11** for the leftovers.
+**Current status (2026-10-13):** **MOD-92 is done** (`docs/decisions/mod/mod-92.md`): `htui status`,
+`htui waiting` and `htui --search-items … --json` print one versioned JSON document each (schema and exit codes in
+`docs/htui-cli.md`) over a read-only Postgres session; an unreachable store answers `"store":"offline"` and exit 3,
+never cached data. That unblocks MOD-93 (still behind MOD-91). Filed **MOD-95** for an `auto_queue` test that fails
+on `main` too. Owed on the host: the Postgres gate on the merged tree. Before it, **MOD-57 is done**
+(`docs/decisions/mod/mod-57.md`): with `HTUI_EDITOR_PANE=1`, `E`/`Ctrl+E` run `$VISUAL`/`$EDITOR` inside the
+asking pane while every other tab keeps working; owed on the host: an nvim run in the pane and the PRD's 10-edit
+trial. Before that, **ANA-29 was concluded** (`docs/ANA-29.md`, `docs/decisions/ana/ana-29.md`): Claude Code mods
+for developing htui and for using it elsewhere - **MOD-91** isolates htui-driven sessions first; dev side
+**TOOL-8**/**TOOL-9**/**TOOL-10** and **CLEAN-12**; consumer side MOD-92 (done), then **MOD-93**, with **MOD-94**
+behind a maintainer decision.
 Live coordinates after MOD-70 and MOD-12 M1: migrations run through `0017_follow_up` (`run_command.run_step_id`,
 `text`; `follow_up_window`; MOD-12's `0016_auto_queue`: `queue_entry`, `queue_batch`, `run.batch_id`), so **the next
 migration is `0018`** (cache: `0005`). MOD-37's `0014_run_step_opening` and MOD-11's queue migration both landed as
@@ -214,7 +210,7 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   `TerminateProcess` (no process-group kill); `ClosePseudoConsole` runs on its own thread; and a
   forwarded `Ctrl+C` must reach the editor without ending htui.
   **ANA-29 note (2026-10-08, `docs/ANA-29.md` §8):** once they land, run on Windows MOD-91's
-  isolation flags against a subscription login, MOD-92's `--json` verbs (keyring DSN, exit codes),
+  isolation flags against a subscription login, MOD-92's `--json` verbs (landed; keyring DSN, exit codes, `docs/htui-cli.md`),
   and MOD-93's `htui claude emit` with a `claude plugin marketplace add` of the emitted directory,
   with the mod reaching `htui.exe` through `$.process.run`. Mods themselves are documented with
   PowerShell setup and `;` path lists, but native Windows behaviour is unconfirmed. MOD-57 is done
@@ -461,18 +457,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   (`docs/htui-mcp.md:33-35`). Document the change in `docs/htui-mcp.md` and the README. Not
   blocked.
 
-- [ ] **MOD-92 - Read-only `--json` CLI for htui state** (from ANA-29, `docs/ANA-29.md` §5.3).
-  `R-TUI-11`, `R-ID-2`, `R-ID-6`, `R-STO-1`, `R-NF-2`. Nothing outside the TUI can read htui's
-  state: the CLI has no `status`, `waiting` or `--json`. Add read-only subcommands that print
-  one versioned JSON document and exit: `htui status --json` (store state, box, working and
-  waiting counts, as in the top bar), `htui waiting --json` (`R-TUI-11`'s rows through
-  `waiting_candidates`/`WaitingView`: reason, item key, run, step, age), and `--json` for
-  `--search-items`. Scope is the active workspace, or `--project <slug>`, or the project whose
-  registered repo contains `--cwd <path>`. The DSN comes from the keyring like every other verb.
-  An offline or unreachable store answers a typed `{"store":"offline"}` document and exit status
-  3, never stale data presented as live. No writes. The JSON schema is documented and pinned by
-  tests, because MOD-93 and other agents parse it. Not blocked.
-
 - [ ] **MOD-93 - `htui` Claude Code plugin: one skill, one mod, emitted from the binary** (from
   ANA-29, `docs/ANA-29.md` §6). `R-ID-4`, `R-ID-6`, `R-STO-1`, `R-TUI-11`, `R-NF-1`. For people
   working in plain `claude` beside htui. `htui claude emit [--dir PATH]` writes a directory
@@ -487,7 +471,8 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   `userConfig`: `panel` (`auto|command|off`), `poll_seconds`. Rules from `docs/ANA-29.md` §6.3:
   no `$.model`, no DSN, reach limited to processes, `claude plugin validate --strict` and `claude
   plugin test` in the gate. `emit` omits the mod and says so when `claude --version` is below
-  2.1.287. Blocked on MOD-91 and MOD-92.
+  2.1.287. Blocked on MOD-91. MOD-92 is done: its verbs and the JSON schema they print are in
+  `docs/htui-cli.md` (`docs/decisions/mod/mod-92.md`).
 
 - [ ] **MOD-94 - Answer a relayed permission request from outside the TUI** (from ANA-29,
   `docs/ANA-29.md` §5.1 C3). `R-TUI-4`, `R-TUI-6`, `R-HIS-1`, `R-ID-6`. MOD-42's executor waits for
@@ -497,10 +482,19 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   name the request they answer, refuse a request already answered or whose session is gone, and
   record the answerer as a person on this box (ANA-27 T2). MOD-93's pane then gains one button per
   option, pressed by a person; no mod or agent answers on its own. **Blocked on a maintainer
-  decision** (`docs/ANA-29.md` §12 Q2) and on MOD-92; the buttons land after MOD-93.
+  decision** (`docs/ANA-29.md` §12 Q2); MOD-92 is done (`docs/htui-cli.md`, its envelope and exit
+  codes are the model for `permission list --json`); the buttons land after MOD-93.
 
 ### Deferred backlog
 
+- [ ] **MOD-95 - auto_queue overshoot test: the batch closes as drained** (found at MOD-92's gate).
+  `R-ORCH-6`, `R-AGT-7`. `htui-worker` `tests/auto_queue.rs`
+  `a_batch_overshoots_its_cap_by_at_most_one_attempt_pg` fails at `:2210`: after the overshoot the
+  batch reads `closed_reason = 'drained'` where the test pins it open ("the batch is still open after
+  the overshoot"). It fails identically on `main` `19b708fa`, so it predates MOD-92. The open-batch
+  assertion came from CLEAN-9 (`d0be442f`), the drain close from MOD-12 (`b9604b57`), built in
+  separate sandboxes; decide which behaviour is right (the next sweep declining by cap, or the batch
+  closing as drained) and fix the code or the test. Not blocked.
 - [ ] **CLEAN-10 - `cargo doc` fails on private intra-doc links** (found at MOD-12 M2's gate).
   `cargo doc --workspace --no-deps --all-features` stops with 17 errors in `htui-core` and
   `htui-store`. They are public docs linking to private items (`close_batch` →
@@ -589,6 +583,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
-| MOD-N   | 24 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-89 `.env` in a worktree, MOD-91 session isolation from user mods, MOD-92 `--json` CLI, MOD-93 consumer Claude Code plugin, MOD-94 permission answers outside the TUI, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 23 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-89 `.env` in a worktree, MOD-91 session isolation from user mods, MOD-93 consumer Claude Code plugin, MOD-94 permission answers outside the TUI, MOD-95 auto_queue overshoot test, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 3 (CLEAN-10 `cargo doc` private links, CLEAN-11 CLEAN-9 deferred review residuals, CLEAN-12 `.claude/` hygiene) |
 | TOOL-N  | 3 (TOOL-8 `htui-dev` mod, TOOL-9 gate script and git hooks, TOOL-10 sandbox mod hardening) |

@@ -17,8 +17,8 @@ use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 use htui_store::embed::{DENSE_DIM, DenseEmbedder, EmbedderIdentity, HashEmbedder};
 use htui_store::qdrant_settings::QdrantSettings;
 use htui_store::vector::{
-    DENSE, EMBEDDER_KEY, Owner, PointType, QdrantStore, SPARSE, SearchQuery, VectorStore as _,
-    is_embedder_mismatch,
+    DENSE, EMBEDDER_KEY, ExistingCollection, Owner, PointType, QdrantStore, SPARSE, SearchQuery,
+    VectorStore as _, is_embedder_mismatch,
 };
 use htui_store::vector_sync::Indexer;
 use qdrant_client::Qdrant;
@@ -518,4 +518,168 @@ async fn another_dense_width_is_refused_and_not_stamped() {
     assert!(err.contains("8-wide"), "{err}");
     assert!(err.contains("384-wide"), "{err}");
     assert_eq!(stored, None, "a wrong-width collection is never stamped");
+}
+
+// MOD-92 G8: `open_existing`, the read-only open of `--search-items --json`.
+
+async fn open_existing<E: DenseEmbedder>(
+    url: &str,
+    embedder: E,
+    name: &str,
+) -> Result<Option<QdrantStore<E>>, StoreError> {
+    let settings = QdrantSettings::new(url.to_owned(), None).expect("valid URL");
+    QdrantStore::open_existing_to(&settings, embedder, name).await
+}
+
+#[tokio::test]
+async fn open_existing_on_a_missing_collection_is_none_and_creates_nothing() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let name = fresh_name();
+    let opened = open_existing(&url, HashEmbedder::new(DENSE_DIM), &name)
+        .await
+        .expect("Qdrant answers");
+    let exists = raw(&url)
+        .collection_exists(&name)
+        .await
+        .expect("collection exists");
+    if exists {
+        raw(&url).delete_collection(&name).await.expect("drop");
+    }
+    assert!(opened.is_none(), "a missing collection is reported");
+    assert!(!exists, "and not created");
+}
+
+#[tokio::test]
+async fn open_existing_searches_what_connect_built() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let name = fresh_name();
+    let built = connect(&url, HashEmbedder::new(DENSE_DIM), &name)
+        .await
+        .expect("Qdrant answers");
+    let read = MemStore::demo();
+    Indexer::sync(&read, &scope(), &built).await.expect("sync");
+    let item = read
+        .items(
+            &Scope {
+                workspace_id: ids::WORKSPACE_PLATFORM,
+                project_ids: vec![ids::PROJECT_HTUI],
+            },
+            &ItemFilter::default(),
+        )
+        .await
+        .expect("items")
+        .remove(0);
+
+    let opened = open_existing(&url, HashEmbedder::new(DENSE_DIM), &name).await;
+    let hits = match &opened {
+        Ok(Some(store)) => Some(store.search(&query(&item.key)).await),
+        _ => None,
+    };
+    built.drop_collection().await.expect("drop");
+    let opened = opened.expect("Qdrant answers");
+    assert!(opened.is_some(), "an existing collection opens");
+    let hits = hits.expect("opened").expect("search");
+    assert!(
+        hits.iter().any(|h| h.key == item.key),
+        "{} not among {hits:?}",
+        item.key
+    );
+}
+
+#[tokio::test]
+async fn open_existing_refuses_another_identity() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let name = fresh_name();
+    connect(&url, HashEmbedder::new(DENSE_DIM), &name)
+        .await
+        .expect("Qdrant answers");
+    let other = Renamed {
+        inner: HashEmbedder::new(DENSE_DIM),
+        identity: EmbedderIdentity {
+            model: "test/other".into(),
+            ..EmbedderIdentity::hash(DENSE_DIM)
+        },
+    };
+    let refused = open_existing(&url, other, &name).await;
+    raw(&url).delete_collection(&name).await.expect("drop");
+    let err = refused.expect_err("another embedder is refused");
+    assert!(is_embedder_mismatch(&err), "{err}");
+}
+
+#[tokio::test]
+async fn open_existing_refuses_another_width() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let name = fresh_name();
+    let client = raw(&url);
+    create_bare(&client, &name, DENSE_DIM as u64 + 1).await;
+    let refused = open_existing(&url, HashEmbedder::new(DENSE_DIM), &name).await;
+    client.delete_collection(&name).await.expect("drop");
+    let err = refused.expect_err("another width is refused");
+    assert!(is_embedder_mismatch(&err), "{err}");
+}
+
+/// Review R1 M3: whether the collection exists is answered before any embedder exists, so
+/// `--search-items` never loads the model for a missing index; the embedder check follows on
+/// `open`, as `open_existing` runs it.
+#[tokio::test]
+async fn an_existing_collection_is_found_before_the_embedder_and_checked_after() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let settings = QdrantSettings::new(url.clone(), None).expect("valid URL");
+    let missing = ExistingCollection::find_in(&settings, &fresh_name())
+        .await
+        .expect("Qdrant answers");
+    assert!(missing.is_none(), "a missing collection, and no embedder");
+
+    let name = fresh_name();
+    let client = raw(&url);
+    create_bare(&client, &name, DENSE_DIM as u64 + 1).await;
+    let found = ExistingCollection::find_in(&settings, &name).await;
+    let opened = match found {
+        Ok(Some(found)) => Some(found.open(HashEmbedder::new(DENSE_DIM)).await),
+        _ => None,
+    };
+    client.delete_collection(&name).await.expect("drop");
+    let err = opened
+        .expect("found")
+        .expect_err("another width is refused on open");
+    assert!(is_embedder_mismatch(&err), "{err}");
+}
+
+/// `connect` would stamp an unstamped collection and build its payload indexes; `open_existing`
+/// writes neither.
+#[tokio::test]
+async fn open_existing_leaves_an_unstamped_collection_unstamped() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let name = fresh_name();
+    let client = raw(&url);
+    create_unstamped(&client, &name, DENSE_DIM as u64, None).await;
+    let opened = open_existing(&url, HashEmbedder::new(DENSE_DIM), &name).await;
+    let stored = stored_identity(&client, &name).await;
+    let indexes = client
+        .collection_info(&name)
+        .await
+        .expect("collection info")
+        .result
+        .expect("a result")
+        .payload_schema
+        .len();
+    client.delete_collection(&name).await.expect("drop");
+    assert!(
+        opened.expect("an unstamped collection opens").is_some(),
+        "it exists"
+    );
+    assert_eq!(stored, None, "no stamp is written");
+    assert_eq!(indexes, 0, "no payload index is created");
 }
