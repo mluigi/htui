@@ -9,7 +9,8 @@ Sandbox run (`HR_SANDBOX=1`, branch `hr/MOD-67`, base `bb33692a`).
 **Selected milestone**: M5. M6 (close-out) is a later run.
 **Complexity**: Large (16 source files with key arms, ~100 non-test key-match sites, 15 `HINT_*`
 constants plus ~12 inline hint literals, 56 owned snapshots and 11 app-level ones)
-**Status**: confirmed 2026-10-08 (Q1: (a), the recommended option, taken on a plain "yes")
+**Status**: done (M5 landed 2026-10-13, `850d4bee`..`c65527db`); M6 is a later run. Confirmed 2026-10-08
+(Q1: (a), the recommended option, taken on a plain "yes")
 
 ## Summary
 
@@ -297,6 +298,41 @@ crates' checks only show there).
 - [ ] `?` lists every key of the focused Backlog pane and of Chat
 - [ ] Validation passes on the merged tree; snapshot diffs are hint/status text and the agreed rows
 - [ ] Patterns mirrored, not reinvented
+
+## Review gate (2026-10-13)
+
+`rust-reviewer` over `69e4e8b1..6a25f37e`: approve with changes; 0 CRITICAL/HIGH, 1 MEDIUM, 3 LOW,
+5 NIT. All fixed in R1 (`95c63f1b`..`c65527db`, one implement/verify workflow, maintainer chose
+"all in R1"), verified clean after one repair.
+
+- **Applied**: M1 a key a view keeps ahead of the resolver was invisible to the validator, so a key
+  file could bind an act to a dead chord the hint then advertised (`[common] back = ["i"]` left a
+  Chat replay unclosable; `[backlog.filter_form] clear = ["space"]` did nothing). The Chat replay
+  now resolves before its swallow (those files work), and a new `FIXED` table plus a fourth
+  validator pass refuse a rebind onto a fixed key of an M5 stack ("is fixed in the Backlog filter
+  form"); R1's verifier found the shifted form of a named fixed key (`shift-left`) still slipped
+  through — fixed in `91c90c1e`. L1 the README `PageUp`/`PageDown` row; L2 every M5 catalogue
+  citation re-pointed to the merged tree; L3 an open composer consumes every key (defensive).
+  NITs: one `keys::is_plain`, the filter Tags guards dropped, three docs.
+- **Carried (M6)**: `FIXED` for the M3/M4 forms (Requirements priority `m`/`l`/Space, the attach
+  form's Space); a user line that is both a collision and on a fixed key is reported twice; the key
+  prose of D11 plus `(t to unfold)`.
+- **Deviations recorded during implementation**: `[backlog.filter_form]` (T1); `list::render`
+  takes `Option<&str>`; `filter::CHORD` kept private behind `keys::is_plain` (now one helper);
+  45 snapshots moved in X6, the extra one the in-crate `htui__testkit__tests__shell_empty`;
+  SUPER/META/HYPER chords are swallowed by Backlog modal forms and no longer answer a parked
+  request (terminals rarely send them); the reject note types a digit (the blueprint said
+  swallowed); the folded-thought test semantics follow `fold_thoughts = true`; five `l_b`/`l_c`
+  helpers became `pub(super)` for the merged-tree tests.
+- **Process**: T1 in two workflows; four worktree lanes as concurrent workflows (all four
+  implementers were killed by a weekly usage limit before their first commit on 2026-10-09 and
+  relaunched 2026-10-13 from the uncommitted diffs); merged `--no-ff` with no conflict; T-close
+  and R1 workflows. Every lane's verify round 1 had 0 blocking findings; R1's caught the shifted
+  fixed keys. Merged-tree gate: htui 3067 tests serial, Postgres suites 62, insta clean,
+  workspace run green except `htui-worker` `auto_queue::a_batch_overshoots_its_cap_by_at_most_one_attempt_pg`,
+  which fails identically at `69e4e8b1` (pre-M5; last touched by MOD-12/CLEAN-9, `d0be442f`,
+  `1129d089`) and is not M5's. Pre-existing: full runs leave an empty `~/.config/htui/trees`
+  (removed after each run, as in M4).
 
 ## Verified claims (plan fact-check, 2026-10-08)
 
