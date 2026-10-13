@@ -1138,7 +1138,7 @@ mod tests {
 
     use super::*;
     use crate::app::{Emit, TopBarState};
-    use crate::keymap::Keymap;
+    use crate::keys::Keys;
     use crate::store_worker::Origin;
     use crate::testkit::DEFAULT_SIZE;
     use crate::ui::Theme;
@@ -1603,9 +1603,9 @@ mod tests {
             queue_writing: None,
         };
 
-        let (top_bar, keymap, theme, emit) = (
+        let (top_bar, keys, theme, emit) = (
             TopBarState::default(),
-            Keymap::new(),
+            Keys::compiled(),
             Theme::default(),
             Emit::default(),
         );
@@ -1613,7 +1613,7 @@ mod tests {
             &scope,
             &projects,
             &top_bar,
-            &keymap,
+            keys,
             &theme,
             Origin::Tab(BacklogTab::ID),
             &emit,
@@ -1670,9 +1670,9 @@ mod tests {
             .expect("the demo holds `platform`");
         let scope = Scope::from_workspace(&workspace);
         let projects = store.projects(&scope).await.expect("the projects");
-        let (top_bar, keymap, theme, emit) = (
+        let (top_bar, keys, theme, emit) = (
             TopBarState::default(),
-            Keymap::new(),
+            Keys::compiled(),
             Theme::default(),
             Emit::default(),
         );
@@ -1680,7 +1680,7 @@ mod tests {
             &scope,
             &projects,
             &top_bar,
-            &keymap,
+            keys,
             &theme,
             Origin::Tab(BacklogTab::ID),
             &emit,
@@ -1785,9 +1785,9 @@ mod tests {
             queue_intent: None,
             queue_writing: None,
         };
-        let (top_bar, keymap, theme, emit) = (
+        let (top_bar, keys, theme, emit) = (
             TopBarState::default(),
-            Keymap::new(),
+            Keys::compiled(),
             Theme::default(),
             Emit::default(),
         );
@@ -1795,7 +1795,7 @@ mod tests {
             &scope,
             &projects,
             &top_bar,
-            &keymap,
+            keys,
             &theme,
             Origin::Tab(BacklogTab::ID),
             &emit,
@@ -1837,9 +1837,9 @@ mod tests {
             queue_intent: None,
             queue_writing: None,
         };
-        let (top_bar, keymap, theme, emit) = (
+        let (top_bar, keys, theme, emit) = (
             TopBarState::default(),
-            Keymap::new(),
+            Keys::compiled(),
             Theme::default(),
             Emit::default(),
         );
@@ -1847,7 +1847,7 @@ mod tests {
             &scope,
             &projects,
             &top_bar,
-            &keymap,
+            keys,
             &theme,
             Origin::Tab(BacklogTab::ID),
             &emit,
@@ -1877,7 +1877,7 @@ mod tests {
         items: Vec<ItemSummary>,
         first: Selection,
         top_bar: TopBarState,
-        keymap: Keymap,
+        keys: Keys,
         theme: Theme,
         emit: Emit,
     }
@@ -1891,7 +1891,7 @@ mod tests {
                 items,
                 first,
                 top_bar: TopBarState::default(),
-                keymap: Keymap::new(),
+                keys: Keys::compiled().clone(),
                 theme: Theme::default(),
                 emit: Emit::default(),
             }
@@ -1902,7 +1902,7 @@ mod tests {
                 &self.scope,
                 &self.projects,
                 &self.top_bar,
-                &self.keymap,
+                &self.keys,
                 &self.theme,
                 Origin::Tab(BacklogTab::ID),
                 &self.emit,

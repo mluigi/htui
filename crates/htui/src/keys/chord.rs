@@ -1,7 +1,7 @@
 //! One normalised keystroke, and the strict parser a key file is read with (ANA-26 §7.1).
 //!
-//! `KeyChord` moved here from `keymap.rs` (MOD-67 M1, plan D2); `crate::keymap::KeyChord`
-//! re-exports it until M6. `parse` is the harness's lenient reader and is unchanged.
+//! `KeyChord` moved here from the deleted `keymap.rs` in MOD-67 M1 (plan D2). `parse` is the
+//! harness's lenient reader and is unchanged.
 //! `parse_strict` is the key file's reader (ANA-26 §7.1); on Unix it also refuses the chords a
 //! terminal in the legacy encoding never delivers as themselves (MOD-67 M2 D6).
 

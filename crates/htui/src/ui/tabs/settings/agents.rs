@@ -119,7 +119,7 @@ const FULL: f64 = 1.0;
 const NEARLY_FULL: f64 = 99.0;
 
 /// The keys line with nothing in flight (89 of the 98 columns, MOD-23 D245, MOD-66 D10). It stands
-/// in for a help entry: a Settings section has no [`KeyScope`](crate::keymap::KeyScope) of its own
+/// in for a help entry: a Settings section has no tab-level key rows of its own
 /// (MOD-20 D19), so the keys are written where they are pressed. `m` sits with the other write
 /// keys (MOD-66 B9).
 ///
@@ -681,7 +681,7 @@ impl AgentsSection {
     ///
     /// [`answer_consent`](Self::answer_consent)'s modality and its warning: **only this section's
     /// own keys** are consumed. `App::on_key` offers the active tab a key before the `Tab` and
-    /// `Global` keymaps, so a blanket `_ => Consumed` here would make `q`, `?`, `Tab` and the digit
+    /// `Global` key tables, so a blanket `_ => Consumed` here would make `q`, `?`, `Tab` and the digit
     /// tab-switches dead for as long as a human is reading a method list — which is why the choice
     /// is `Enter` and not a digit in the first place.
     fn answer_chooser(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {

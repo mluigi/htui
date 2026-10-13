@@ -1,7 +1,7 @@
 //! The action catalogue: every named action, its context, defaults and help (ANA-26 §7.2).
 //!
 //! MOD-67 M1 (plan D4, D12) fills the global, overlay and shared contexts. Global and overlay
-//! rows reproduce today's `Keymap::default_global` bindings, plus `f1` for help (ANA-26 §6.5).
+//! rows reproduce the M1 global bindings, plus `f1` for help (ANA-26 §6.5).
 //! Each shared-context row (`list`, `pane`, `confirm`, `form`, `common`) takes its defaults from
 //! today's match arms and cites the arm it mirrors. No view consumes a shared context until M3,
 //! so those rows change no behaviour yet. M3-M5 append each view's context in its own block.
@@ -737,7 +737,7 @@ const fn capture_row(
 /// Every action, grouped by context, in display order (the status line and the `?` box follow
 /// it). M3-M5 append their contexts' blocks at the end.
 pub static CATALOGUE: &[ActionSpec] = &[
-    // [global]: today's `keymap.rs` `default_global` rows and `app/mod.rs` `register_all`
+    // [global]: the pre-MOD-67 keymap's `default_global` rows and `app/mod.rs` `register_all`
     // labels, in status-line order. `ctrl-c` is fixed (`CTRL_C`) and never listed.
     row(Act::Quit, Global, "quit", &["q"], "quit"),
     row(Act::NextTab, Global, "next_tab", &["tab"], "next tab"),
@@ -820,8 +820,8 @@ pub static CATALOGUE: &[ActionSpec] = &[
     row(Act::Find, Global, "find", &["ctrl-f"], "find"),
     row(Act::Waiting, Global, "waiting", &["ctrl-w"], "waiting"),
     row(Act::Queue, Global, "queue", &["ctrl-q"], "queue"),
-    // [overlay]: `keymap.rs`'s wildcard overlay row. In capture because the concepts field
-    // returns `Pass` on `Esc` and this layer closes it (`concepts_search.rs:334-335`).
+    // [overlay]: the pre-MOD-67 keymap's wildcard overlay row. In capture because the concepts
+    // field returns `Pass` on `Esc` and this layer closes it (`concepts_search.rs:334-335`).
     capture_row(Act::OverlayClose, Overlay, "close", &["esc"], "close"),
     // [list]
     // backlog/mod.rs:789, requirements/mod.rs:443, connection.rs:811, kinds.rs:1492,

@@ -662,7 +662,7 @@ pub(super) mod bench {
     use ratatui::layout::Rect;
 
     use crate::app::{Action, Ctx, Emit, TopBarState};
-    use crate::keymap::Keymap;
+    use crate::keys::Keys;
     use crate::store_worker::Origin;
     use crate::ui::Theme;
     use crate::ui::tabs::BacklogTab;
@@ -673,14 +673,14 @@ pub(super) mod bench {
         scope: Scope,
         projects: Vec<ProjectRef>,
         top_bar: TopBarState,
-        keymap: Keymap,
+        keys: Keys,
         /// The palette, for the panes' `lines`.
         pub theme: Theme,
         emit: Emit,
     }
 
     impl Shell {
-        /// An empty scope with the default keymap and theme.
+        /// An empty scope with the compiled default keys and theme.
         pub fn new() -> Self {
             Self {
                 scope: Scope {
@@ -689,7 +689,7 @@ pub(super) mod bench {
                 },
                 projects: Vec::new(),
                 top_bar: TopBarState::default(),
-                keymap: Keymap::new(),
+                keys: Keys::compiled().clone(),
                 theme: Theme::default(),
                 emit: Emit::default(),
             }
@@ -701,7 +701,7 @@ pub(super) mod bench {
                 &self.scope,
                 &self.projects,
                 &self.top_bar,
-                &self.keymap,
+                &self.keys,
                 &self.theme,
                 Origin::Tab(BacklogTab::ID),
                 &self.emit,

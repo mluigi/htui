@@ -1944,7 +1944,7 @@ mod tests {
 
     use super::*;
     use crate::app::{Action, Emit, TopBarState};
-    use crate::keymap::Keymap;
+    use crate::keys::Keys;
     use crate::skills;
     use crate::store_worker::Origin;
     use crate::ui::Theme;
@@ -1978,9 +1978,9 @@ mod tests {
     /// too many and the prompt line runs past the pane.
     #[test]
     fn a_wide_skill_name_keeps_the_description_prompt_within_the_pane() {
-        let (top_bar, keymap, theme, emit) = (
+        let (top_bar, keys, theme, emit) = (
             TopBarState::default(),
-            Keymap::default_global(),
+            Keys::compiled(),
             Theme::default(),
             Emit::default(),
         );
@@ -1989,7 +1989,7 @@ mod tests {
             &scope,
             &[],
             &top_bar,
-            &keymap,
+            keys,
             &theme,
             Origin::Tab(SkillsTab::ID),
             &emit,
@@ -2097,9 +2097,9 @@ mod tests {
     async fn a_read_reply_does_not_close_the_editor_mid_save() {
         let backend = Backend::memory(MemStore::demo());
         let scope = vulkan();
-        let (top_bar, keymap, theme, emit) = (
+        let (top_bar, keys, theme, emit) = (
             TopBarState::default(),
-            Keymap::default_global(),
+            Keys::compiled(),
             Theme::default(),
             Emit::default(),
         );
@@ -2107,7 +2107,7 @@ mod tests {
             &scope,
             &[],
             &top_bar,
-            &keymap,
+            keys,
             &theme,
             Origin::Tab(SkillsTab::ID),
             &emit,
@@ -2161,9 +2161,9 @@ mod tests {
     async fn a_read_reply_does_not_close_the_attach_form_mid_save() {
         let backend = Backend::memory(MemStore::demo());
         let scope = vulkan();
-        let (top_bar, keymap, theme, emit) = (
+        let (top_bar, keys, theme, emit) = (
             TopBarState::default(),
-            Keymap::default_global(),
+            Keys::compiled(),
             Theme::default(),
             Emit::default(),
         );
@@ -2171,7 +2171,7 @@ mod tests {
             &scope,
             &[],
             &top_bar,
-            &keymap,
+            keys,
             &theme,
             Origin::Tab(SkillsTab::ID),
             &emit,
@@ -2245,9 +2245,9 @@ mod tests {
     async fn the_attach_form_keeps_edits_typed_during_its_save() {
         let backend = Backend::memory(MemStore::demo());
         let scope = vulkan();
-        let (top_bar, keymap, theme, emit) = (
+        let (top_bar, keys, theme, emit) = (
             TopBarState::default(),
-            Keymap::default_global(),
+            Keys::compiled(),
             Theme::default(),
             Emit::default(),
         );
@@ -2255,7 +2255,7 @@ mod tests {
             &scope,
             &[],
             &top_bar,
-            &keymap,
+            keys,
             &theme,
             Origin::Tab(SkillsTab::ID),
             &emit,
@@ -2351,8 +2351,8 @@ mod tests {
         scope: Scope,
         /// The top bar.
         top_bar: TopBarState,
-        /// The default keymap.
-        keymap: Keymap,
+        /// The compiled default keys.
+        keys: Keys,
         /// The default theme.
         theme: Theme,
         /// What the view emitted.
@@ -2366,7 +2366,7 @@ mod tests {
             Self {
                 scope: vulkan(),
                 top_bar: TopBarState::default(),
-                keymap: Keymap::default_global(),
+                keys: Keys::compiled().clone(),
                 theme: Theme::default(),
                 emit: Emit::default(),
                 projects: Vec::new(),
@@ -2392,7 +2392,7 @@ mod tests {
                 &self.scope,
                 &self.projects,
                 &self.top_bar,
-                &self.keymap,
+                &self.keys,
                 &self.theme,
                 Origin::Tab(SkillsTab::ID),
                 &self.emit,
@@ -3023,9 +3023,9 @@ mod tests {
     async fn a_skill_with_no_version_opens_an_empty_editor_on_token_0() {
         let backend = Backend::memory(MemStore::demo());
         let scope = vulkan();
-        let (top_bar, keymap, theme, emit) = (
+        let (top_bar, keys, theme, emit) = (
             TopBarState::default(),
-            Keymap::default_global(),
+            Keys::compiled(),
             Theme::default(),
             Emit::default(),
         );
@@ -3033,7 +3033,7 @@ mod tests {
             &scope,
             &[],
             &top_bar,
-            &keymap,
+            keys,
             &theme,
             Origin::Tab(SkillsTab::ID),
             &emit,
@@ -3126,9 +3126,9 @@ mod tests {
     async fn a_blank_body_dispatches_no_request() {
         let backend = Backend::memory(MemStore::demo());
         let scope = vulkan();
-        let (top_bar, keymap, theme, emit) = (
+        let (top_bar, keys, theme, emit) = (
             TopBarState::default(),
-            Keymap::default_global(),
+            Keys::compiled(),
             Theme::default(),
             Emit::default(),
         );
@@ -3136,7 +3136,7 @@ mod tests {
             &scope,
             &[],
             &top_bar,
-            &keymap,
+            keys,
             &theme,
             Origin::Tab(SkillsTab::ID),
             &emit,

@@ -655,7 +655,7 @@ mod tests {
 
     use super::*;
     use crate::app::{Emit, TopBarState};
-    use crate::keymap::Keymap;
+    use crate::keys::Keys;
     use crate::requirements;
     use crate::store_worker::Origin;
     use crate::ui::tabs::BacklogTab;
@@ -665,7 +665,7 @@ mod tests {
         scope: Scope,
         projects: Vec<ProjectRef>,
         top_bar: TopBarState,
-        keymap: Keymap,
+        keys: Keys,
         theme: Theme,
         emit: Emit,
     }
@@ -679,7 +679,7 @@ mod tests {
                 },
                 projects: Vec::new(),
                 top_bar: TopBarState::default(),
-                keymap: Keymap::new(),
+                keys: Keys::compiled().clone(),
                 theme: Theme::default(),
                 emit: Emit::default(),
             }
@@ -690,7 +690,7 @@ mod tests {
                 &self.scope,
                 &self.projects,
                 &self.top_bar,
-                &self.keymap,
+                &self.keys,
                 &self.theme,
                 Origin::Tab(BacklogTab::ID),
                 &self.emit,

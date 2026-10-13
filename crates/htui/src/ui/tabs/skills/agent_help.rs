@@ -804,7 +804,6 @@ mod tests {
     use super::fixtures::{accepted, chunk, ended, summary};
     use super::*;
     use crate::app::{Action, Emit, TopBarState};
-    use crate::keymap::Keymap;
     use crate::keys::{Context, Keys, load_str, views};
     use crate::store_worker::Origin;
     use crate::ui::tabs::SkillsTab;
@@ -815,8 +814,6 @@ mod tests {
         scope: Scope,
         /// The top bar.
         top_bar: TopBarState,
-        /// The default keymap.
-        keymap: Keymap,
         /// The default theme.
         theme: Theme,
         /// What the help emitted.
@@ -833,7 +830,6 @@ mod tests {
                     project_ids: vec![ids::PROJECT_VULKAN],
                 },
                 top_bar: TopBarState::default(),
-                keymap: Keymap::default_global(),
                 theme: Theme::default(),
                 emit: Emit::default(),
                 keys: None,
@@ -849,19 +845,15 @@ mod tests {
         }
 
         fn ctx(&self) -> Ctx<'_> {
-            let ctx = Ctx::new(
+            Ctx::new(
                 &self.scope,
                 &[],
                 &self.top_bar,
-                &self.keymap,
+                self.keys.as_ref().unwrap_or(Keys::compiled()),
                 &self.theme,
                 Origin::Tab(SkillsTab::ID),
                 &self.emit,
-            );
-            match &self.keys {
-                Some(keys) => ctx.with_keys(keys),
-                None => ctx,
-            }
+            )
         }
 
         /// The requests emitted since the last drain.

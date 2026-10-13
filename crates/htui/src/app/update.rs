@@ -35,7 +35,7 @@ impl App {
             Action::Replay { step_id } => self.replay(step_id),
             Action::Promote { run, step } => self.promote(run, step),
             Action::Reveal(target) => self.reveal(&target),
-            // The unstamped path (`Origin::App`, or a keymap binding): only a tab can open the
+            // The unstamped path (the shell itself, `Origin::App`): only a tab can open the
             // editor, because only a tab can be handed the outcome (MOD-9 D10).
             Action::EditExternally(_) => self.status = Some(EDITOR_NEEDS_A_TAB.to_owned()),
             Action::AbortEdit => self.abort_editor(),
@@ -167,7 +167,6 @@ impl App {
                 scope,
                 projects,
                 top_bar,
-                keymap,
                 keys,
                 theme,
                 emit,
@@ -177,16 +176,7 @@ impl App {
             let Some(view) = tabs.active_mut() else {
                 return;
             };
-            let mut ctx = Ctx::new(
-                scope,
-                projects,
-                top_bar,
-                keymap,
-                theme,
-                origin.clone(),
-                emit,
-            )
-            .with_keys(keys);
+            let mut ctx = Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit);
             view.on_refresh(&mut ctx);
         }
         self.drain(&origin);
@@ -204,7 +194,6 @@ impl App {
                 scope,
                 projects,
                 top_bar,
-                keymap,
                 keys,
                 theme,
                 emit,
@@ -214,16 +203,7 @@ impl App {
             let Some(top) = overlays.top_mut() else {
                 return;
             };
-            let mut ctx = Ctx::new(
-                scope,
-                projects,
-                top_bar,
-                keymap,
-                theme,
-                origin.clone(),
-                emit,
-            )
-            .with_keys(keys);
+            let mut ctx = Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit);
             top.refresh(&mut ctx);
         }
         self.drain(&origin);
@@ -314,7 +294,6 @@ impl App {
                 scope,
                 projects,
                 top_bar,
-                keymap,
                 keys,
                 theme,
                 emit,
@@ -324,16 +303,7 @@ impl App {
             let Some(view) = tabs.by_id_mut(tab) else {
                 return;
             };
-            let mut ctx = Ctx::new(
-                scope,
-                projects,
-                top_bar,
-                keymap,
-                theme,
-                origin.clone(),
-                emit,
-            )
-            .with_keys(keys);
+            let mut ctx = Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit);
             if !view.reveal(target, &mut ctx) {
                 tracing::debug!(%tab, "the tab does not reveal this target");
             }
@@ -363,7 +333,6 @@ impl App {
                         scope,
                         projects,
                         top_bar,
-                        keymap,
                         keys,
                         theme,
                         emit,
@@ -371,16 +340,8 @@ impl App {
                         ..
                     } = self;
                     if let Some(tab) = tabs.by_id_mut(id) {
-                        let mut ctx = Ctx::new(
-                            scope,
-                            projects,
-                            top_bar,
-                            keymap,
-                            theme,
-                            origin.clone(),
-                            emit,
-                        )
-                        .with_keys(keys);
+                        let mut ctx =
+                            Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit);
                         tab.on_reply(&reply, &mut ctx);
                     }
                 }
@@ -393,7 +354,6 @@ impl App {
                         scope,
                         projects,
                         top_bar,
-                        keymap,
                         keys,
                         theme,
                         emit,
@@ -402,16 +362,8 @@ impl App {
                     } = self;
                     // A reply to an overlay that has been popped is dropped silently.
                     if let Some(overlay) = overlays.by_id_mut(id) {
-                        let mut ctx = Ctx::new(
-                            scope,
-                            projects,
-                            top_bar,
-                            keymap,
-                            theme,
-                            origin.clone(),
-                            emit,
-                        )
-                        .with_keys(keys);
+                        let mut ctx =
+                            Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit);
                         overlay.on_reply(&reply, &mut ctx);
                     }
                 }
@@ -572,7 +524,6 @@ mod tests {
     use crate::app::state::EDITOR_NEEDS_A_TAB;
     use crate::app::{Handled, RevealKind};
     use crate::editor::{ExternalEdit, ExternalEditOutcome};
-    use crate::keymap::Keymap;
     use crate::store_worker::{RequestEnvelope, UNSOLICITED};
     use crate::ui::overlay::{MigrationPrompt, Overlay, OverlayId, WaitingList};
     use crate::ui::tabs::{Tab, TabId};
@@ -648,7 +599,7 @@ mod tests {
     /// A shell with one recorder tab, the channel the worker would read, and the recorder's log.
     fn shell() -> (App, UnboundedReceiver<RequestEnvelope>, Seen) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut app = App::new(tx, Keymap::default_global());
+        let mut app = App::new(tx);
         let seen: Seen = Seen::default();
         app.register_tab(Box::new(Recorder {
             seen: Rc::clone(&seen),
@@ -1258,7 +1209,7 @@ mod tests {
         assert_eq!(app.status.as_deref(), Some(EDITOR_NEEDS_A_TAB));
         assert_eq!(app.take_external_edit(), None);
 
-        // The unstamped path: a keymap binding or the shell itself (`Origin::App`).
+        // The unstamped path: the shell itself (`Origin::App`).
         app.status = None;
         app.update(Action::EditExternally(asked()));
         assert_eq!(app.status.as_deref(), Some(EDITOR_NEEDS_A_TAB));
@@ -1583,7 +1534,7 @@ mod tests {
         Lost,
     ) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut app = App::new(tx, Keymap::default_global());
+        let mut app = App::new(tx);
         let wants = Rc::new(Cell::new(wants));
         let seen = Pointed::default();
         let lost = Lost::default();
@@ -1611,7 +1562,7 @@ mod tests {
     #[test]
     fn no_tab_wants_the_mouse_at_start_up() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut app = App::new(tx, Keymap::default_global());
+        let mut app = App::new(tx);
         crate::app::register_all(&mut app);
         assert!(!app.tabs.is_empty());
         for i in 0..app.tabs.len() {

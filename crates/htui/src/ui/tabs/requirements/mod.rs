@@ -1295,7 +1295,6 @@ impl Tab for RequirementsTab {
 mod tests {
     use super::{HINT_WRITES, Mode, Notice, RequirementsTab, Row, SAVING};
     use crate::app::{Action, Ctx, Emit, Handled, TopBarState};
-    use crate::keymap::Keymap;
     use crate::keys::{Keys, views};
     use crate::requirements::{
         self, READ_NAME, RequirementWrite, RequirementsSnapshot, not_the_maintainer,
@@ -1343,7 +1342,7 @@ mod tests {
         scope: Scope,
         projects: Vec<ProjectRef>,
         top_bar: TopBarState,
-        keymap: Keymap,
+        keys: Keys,
         theme: Theme,
         emit: Emit,
     }
@@ -1354,7 +1353,7 @@ mod tests {
                 scope,
                 projects,
                 top_bar: TopBarState::default(),
-                keymap: Keymap::new(),
+                keys: Keys::compiled().clone(),
                 theme: Theme::default(),
                 emit: Emit::default(),
             }
@@ -1365,7 +1364,7 @@ mod tests {
                 &self.scope,
                 &self.projects,
                 &self.top_bar,
-                &self.keymap,
+                &self.keys,
                 &self.theme,
                 Origin::Tab(RequirementsTab::ID),
                 &self.emit,

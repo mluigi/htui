@@ -12,18 +12,9 @@ use crate::keys::Stack;
 use crate::store_worker::{StoreReply, StoreRequest};
 use crossterm::event::KeyEvent;
 
-/// Stable identity of an overlay, also the key of its [`KeyScope`](crate::keymap::KeyScope).
+/// Stable identity of an overlay, used for reply addressing and the overlay factories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OverlayId(pub &'static str);
-
-impl OverlayId {
-    /// Wildcard scope: a binding registered under it resolves for every overlay.
-    ///
-    /// The default `Esc` -> `OverlayAction::Close` binding has to exist before any concrete
-    /// overlay is registered, and [`KeyScope::Overlay`](crate::keymap::KeyScope::Overlay) carries
-    /// a concrete id, so the keymap looks the exact id up first and falls back to this one.
-    pub const ANY: Self = Self("*");
-}
 
 impl core::fmt::Display for OverlayId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

@@ -24,8 +24,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 use crate::agent_worker::{AgentRuntime, ChatTask, Served};
 use crate::app::{Action, App, Ctx, Emit, Handled, TopBarState};
 use crate::concepts_worker::{ConceptsRuntime, ConceptsServed};
-use crate::keymap::{KeyChord, Keymap};
-use crate::keys::Keys;
+use crate::keys::{KeyChord, Keys};
 use crate::run_worker::{RunRuntime, RunServed, TuiRuns as _};
 use crate::store_worker::{self, Origin, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest};
 use crate::ui::Theme;
@@ -126,7 +125,7 @@ impl Harness {
     #[must_use]
     pub fn over_backend(backend: Backend) -> Self {
         let (request_tx, rx) = mpsc::unbounded_channel();
-        let mut app = App::new(request_tx, Keymap::default_global());
+        let mut app = App::new(request_tx);
         app.top_bar.store = backend.label();
         app.start();
         let (width, height) = DEFAULT_SIZE;
@@ -664,8 +663,6 @@ pub struct SectionBench {
     projects: Vec<ProjectRef>,
     /// What the top bar would be showing.
     top_bar: TopBarState,
-    /// The key table, for the hint lines a section renders.
-    keymap: Keymap,
     /// The palette.
     theme: Theme,
     /// What the section emitted, drained by [`drained`](SectionBench::drained).
@@ -690,7 +687,6 @@ impl SectionBench {
             scope: Scope::from_workspace(workspaces.first().expect("the fixture has a workspace")),
             projects: Vec::new(),
             top_bar: TopBarState::default(),
-            keymap: Keymap::default_global(),
             theme: Theme::default(),
             emit: Emit::default(),
             keys: Keys::compiled().clone(),
@@ -712,12 +708,11 @@ impl SectionBench {
             &self.scope,
             &self.projects,
             &self.top_bar,
-            &self.keymap,
+            &self.keys,
             &self.theme,
             Origin::Tab(SettingsTab::ID),
             &self.emit,
         )
-        .with_keys(&self.keys)
     }
 
     /// Feeds one key to a section, written the way [`KeyChord::parse`] reads it.

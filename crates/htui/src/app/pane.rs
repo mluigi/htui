@@ -679,7 +679,6 @@ mod tests {
     use crate::editor::{
         EDITOR_ABORTED, EDITOR_BUSY, EditorCommand, ExternalEdit, ExternalEditOutcome, PANE_VAR,
     };
-    use crate::keymap::{Binding, KeyChord, KeyScope, Keymap};
     use crate::keys::{Act, Context, Keys, Stack, views};
     use crate::store_worker::{StoreReply, StoreRequest};
     use crate::ui::overlay::{AbortConfirm, Overlay, OverlayId, QuitConfirm};
@@ -954,7 +953,7 @@ mod tests {
     /// A shell with `specs` registered as [`Editing`] tabs, the first one active.
     fn shell_with(specs: &[Spec]) -> (App, Vec<Bench>) {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut app = App::new(tx, Keymap::new());
+        let mut app = App::new(tx);
         let benches = specs
             .iter()
             .map(|&(id, mouse, stack)| {
@@ -1714,7 +1713,7 @@ mod tests {
     }
 
     /// MOD-57 M2 E7 (PD-M2-2): the `?` box lists the editor keys that act where the user is:
-    /// `EDITOR_OPEN`'s on the asking tab (no legacy rows: the asking tab refuses them),
+    /// `EDITOR_OPEN`'s on the asking tab (none of the asking tab's own: it refuses them),
     /// `editor.focus` first on another tab (converted or not), none under a modal overlay.
     #[test]
     fn the_help_box_lists_the_keys_that_act_here() {
@@ -1722,12 +1721,6 @@ mod tests {
             (ASKER, false, None),
             (OTHER, false, Some(views::SETTINGS_TAB)),
         ]);
-        app.keymap.bind(Binding {
-            scope: KeyScope::Tab(ASKER),
-            key: KeyChord::new(KeyCode::Char('d'), KeyModifiers::NONE),
-            action: Action::Tab(TabAction::Focus(ASKER)),
-            help: "asker legacy",
-        });
         let log = Log::default();
         open(&mut app, ASKER, &log);
         app.on_key(ctrl('4'));
@@ -1740,7 +1733,6 @@ mod tests {
         );
         assert!(frame.contains("Global: q/Ctrl+c quit"), "{frame}");
         assert!(frame.contains("?/F1 closes this box"), "{frame}");
-        assert!(!frame.contains("asker legacy"), "{frame}");
         insta::assert_snapshot!("the_help_box_on_the_asking_tab", frame);
 
         // Another tab, a converted view: the way back first, then its own box.

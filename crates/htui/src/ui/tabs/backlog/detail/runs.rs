@@ -2143,7 +2143,7 @@ impl RunsTab {
 mod tests {
     use super::*;
     use crate::app::{Action, Emit, TopBarState};
-    use crate::keymap::Keymap;
+    use crate::keys::Keys;
     use crate::run_worker::{RunActions, RunFrame, StepActions};
     use crate::store_worker::Origin;
     use chrono::TimeDelta;
@@ -2163,7 +2163,7 @@ mod tests {
         scope: Scope,
         projects: Vec<ProjectRef>,
         top_bar: TopBarState,
-        keymap: Keymap,
+        keys: Keys,
         theme: Theme,
         emit: Emit,
     }
@@ -2177,7 +2177,7 @@ mod tests {
                 },
                 projects: Vec::new(),
                 top_bar: TopBarState::default(),
-                keymap: Keymap::new(),
+                keys: Keys::compiled().clone(),
                 theme: Theme::default(),
                 emit: Emit::default(),
             }
@@ -2188,7 +2188,7 @@ mod tests {
                 &self.scope,
                 &self.projects,
                 &self.top_bar,
-                &self.keymap,
+                &self.keys,
                 &self.theme,
                 Origin::Tab(crate::ui::tabs::BacklogTab::ID),
                 &self.emit,
@@ -2277,7 +2277,7 @@ mod tests {
     }
 
     /// A pane with nothing to replay consumes neither `Enter` nor a cursor it does not have, so
-    /// the Backlog tab's keymap row is what answers the key.
+    /// the Backlog tab's own keys are what answer it.
     #[tokio::test]
     async fn a_pane_with_no_step_passes_enter_on() {
         let shell = Shell::new();
@@ -4702,7 +4702,7 @@ mod tests {
     }
 
     /// MOD-28 review L4: with no request pending, the flow keeps neither `Tab` nor a digit, so
-    /// both reach the global keymap.
+    /// both reach the global keys.
     #[tokio::test]
     async fn tab_and_a_digit_pass_in_flow_with_no_pending_request() {
         let shell = Shell::new();

@@ -15,7 +15,6 @@ use tokio::sync::mpsc;
 use crate::app::action::{Action, Handled, OverlayAction, RevealKind, TabAction};
 use crate::app::pane::OpenEditor;
 use crate::editor::{EDITOR_BUSY, ExternalEdit, ExternalEditOutcome};
-use crate::keymap::{KeyScope, Keymap};
 use crate::keys::{Act, CTRL_C, Context, HelpLine, KeyChord, Keys, Stack};
 use crate::store_worker::{Origin, RequestEnvelope, Seq, StoreRequest};
 use crate::ui::overlay::{Overlay, OverlayRegistry, OverlayStack};
@@ -82,13 +81,9 @@ pub struct Ctx<'a> {
     pub projects: &'a [ProjectRef],
     /// What the top bar currently shows.
     pub top_bar: &'a TopBarState,
-    /// The legacy Backlog tab rows (MOD-67 D2). No view reads it; the named-action keys are
-    /// [`keys()`](Self::keys).
-    pub keymap: &'a Keymap,
     /// The palette.
     pub theme: &'a Theme,
-    /// The keys in force (MOD-67 D9): `App`'s own at the shell's sites, else the compiled
-    /// defaults. No view reads it in M1.
+    /// The keys in force (MOD-67 D9): `App`'s own at the shell's sites, a bench's in tests.
     keys: &'a Keys,
     /// Who the shell is talking to; replies to this view's requests come back addressed to it.
     origin: Origin,
@@ -105,7 +100,7 @@ impl<'a> Ctx<'a> {
         scope: &'a Scope,
         projects: &'a [ProjectRef],
         top_bar: &'a TopBarState,
-        keymap: &'a Keymap,
+        keys: &'a Keys,
         theme: &'a Theme,
         origin: Origin,
         emit: &'a Emit,
@@ -114,20 +109,12 @@ impl<'a> Ctx<'a> {
             scope,
             projects,
             top_bar,
-            keymap,
+            keys,
             theme,
-            keys: Keys::compiled(),
             origin,
             emit,
             editor_area: None,
         }
-    }
-
-    /// Hands the view these keys instead of the compiled defaults: how `App` passes its own.
-    #[must_use]
-    pub fn with_keys(mut self, keys: &'a Keys) -> Self {
-        self.keys = keys;
-        self
     }
 
     /// Lends this context the cell [`claim_editor_area`](Self::claim_editor_area) writes. Only
@@ -187,9 +174,6 @@ pub struct App {
     pub overlays: OverlayStack,
     /// How an [`OverlayId`](crate::ui::overlay::OverlayId) becomes an overlay.
     pub overlay_factories: OverlayRegistry,
-    /// The legacy tab rows: the six Backlog rows `register_all` binds (MOD-67 D2). Global and
-    /// overlay keys are `keys`' since MOD-67.
-    pub keymap: Keymap,
     /// The named-action keys in force (MOD-67 D10): the compiled defaults; M2 builds them from
     /// `keys.toml`.
     pub keys: Keys,
@@ -286,7 +270,7 @@ impl App {
     /// The caller registers views ([`register_all`](crate::app::register_all)), sets
     /// `top_bar.store` from `Backend::label()` and calls [`App::start`].
     #[must_use]
-    pub fn new(requests: mpsc::UnboundedSender<RequestEnvelope>, keymap: Keymap) -> Self {
+    pub fn new(requests: mpsc::UnboundedSender<RequestEnvelope>) -> Self {
         Self {
             scope: Scope {
                 workspace_id: WorkspaceId::default(),
@@ -297,7 +281,6 @@ impl App {
             tabs: TabRegistry::new(),
             overlays: OverlayStack::new(),
             overlay_factories: OverlayRegistry::new(),
-            keymap,
             keys: Keys::compiled().clone(),
             offered: Vec::new(),
             theme: Theme::default(),
@@ -551,7 +534,6 @@ impl App {
                 scope,
                 projects,
                 top_bar,
-                keymap,
                 keys,
                 theme,
                 emit,
@@ -562,16 +544,7 @@ impl App {
                 tracing::debug!(%tab, "the tab that asked for the editor is gone");
                 return;
             };
-            let mut ctx = Ctx::new(
-                scope,
-                projects,
-                top_bar,
-                keymap,
-                theme,
-                origin.clone(),
-                emit,
-            )
-            .with_keys(keys);
+            let mut ctx = Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit);
             view.on_external_edit(outcome, &mut ctx);
         }
         self.drain(&origin);
@@ -594,7 +567,7 @@ impl App {
     }
 
     /// A bracketed paste (MOD-22 review M-1): the propagation chain of [`on_key`](Self::on_key)
-    /// with **no keymap in it**. The top overlay, then — unless that overlay is modal — the active
+    /// with **no key table in it**. The top overlay, then — unless that overlay is modal — the active
     /// tab, each taking it only into a field it is capturing input with; whatever none of them
     /// takes is dropped and does nothing else. So a paste made before a field is open is never a
     /// key: its digits switch no tab, its `/` opens no filter, its `q` quits nothing.
@@ -619,7 +592,6 @@ impl App {
                     scope,
                     projects,
                     top_bar,
-                    keymap,
                     keys,
                     theme,
                     emit,
@@ -628,16 +600,8 @@ impl App {
                 } = self;
                 match overlays.top_mut() {
                     Some(top) => {
-                        let mut ctx = Ctx::new(
-                            scope,
-                            projects,
-                            top_bar,
-                            keymap,
-                            theme,
-                            origin.clone(),
-                            emit,
-                        )
-                        .with_keys(keys);
+                        let mut ctx =
+                            Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit);
                         top.on_paste(text, &mut ctx)
                     }
                     None => Handled::Pass,
@@ -656,7 +620,6 @@ impl App {
                     scope,
                     projects,
                     top_bar,
-                    keymap,
                     keys,
                     theme,
                     emit,
@@ -664,17 +627,9 @@ impl App {
                     ..
                 } = self;
                 if let Some(tab) = tabs.active_mut() {
-                    let mut ctx = Ctx::new(
-                        scope,
-                        projects,
-                        top_bar,
-                        keymap,
-                        theme,
-                        origin.clone(),
-                        emit,
-                    )
-                    .with_keys(keys);
-                    // `Pass` is the drop: there is no keymap for a paste to fall through to.
+                    let mut ctx =
+                        Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit);
+                    // `Pass` is the drop: there is no key table for a paste to fall through to.
                     let _ = tab.on_paste(text, &mut ctx);
                 }
             }
@@ -725,7 +680,7 @@ impl App {
         }
     }
 
-    /// A mouse event (MOD-71 D4): to the active tab only, with no keymap and no overlay in the
+    /// A mouse event (MOD-71 D4): to the active tab only, with no key table and no overlay in the
     /// chain (an open overlay turns capture off, D1).
     ///
     /// Gated first, so an event queued before capture went off does nothing. `Moved` (Windows still
@@ -754,7 +709,6 @@ impl App {
                 scope,
                 projects,
                 top_bar,
-                keymap,
                 keys,
                 theme,
                 emit,
@@ -763,16 +717,8 @@ impl App {
             } = self;
             match tabs.active_mut() {
                 Some(tab) => {
-                    let mut ctx = Ctx::new(
-                        scope,
-                        projects,
-                        top_bar,
-                        keymap,
-                        theme,
-                        origin.clone(),
-                        emit,
-                    )
-                    .with_keys(keys);
+                    let mut ctx =
+                        Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit);
                     tab.on_mouse(mouse, &mut ctx)
                 }
                 None => Handled::Pass,
@@ -788,7 +734,7 @@ impl App {
 
     /// The propagation chain (blueprint C.4, MOD-67 D6), stopping at the first consumer: the
     /// in-pane editor (MOD-57), `ctrl-c`, the top overlay, the overlay's stack (`Stack::OVERLAY`
-    /// while unconverted), the modal swallow, the active tab, its legacy rows, the tab's stack
+    /// while unconverted), the modal swallow, the active tab, the tab's stack
     /// (`Stack::BASE` while unconverted).
     ///
     /// `ctrl-c` is checked here only: a bracketed paste has no key table
@@ -822,7 +768,6 @@ impl App {
                     scope,
                     projects,
                     top_bar,
-                    keymap,
                     keys,
                     theme,
                     emit,
@@ -831,16 +776,8 @@ impl App {
                 } = self;
                 match overlays.top_mut() {
                     Some(top) => {
-                        let mut ctx = Ctx::new(
-                            scope,
-                            projects,
-                            top_bar,
-                            keymap,
-                            theme,
-                            origin.clone(),
-                            emit,
-                        )
-                        .with_keys(keys);
+                        let mut ctx =
+                            Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit);
                         top.on_key(key, &mut ctx)
                     }
                     None => Handled::Pass,
@@ -876,7 +813,6 @@ impl App {
                     scope,
                     projects,
                     top_bar,
-                    keymap,
                     keys,
                     theme,
                     emit,
@@ -885,16 +821,8 @@ impl App {
                 } = self;
                 match tabs.active_mut() {
                     Some(tab) => {
-                        let mut ctx = Ctx::new(
-                            scope,
-                            projects,
-                            top_bar,
-                            keymap,
-                            theme,
-                            origin.clone(),
-                            emit,
-                        )
-                        .with_keys(keys);
+                        let mut ctx =
+                            Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit);
                         tab.on_key(key, &mut ctx)
                     }
                     None => Handled::Pass,
@@ -902,10 +830,6 @@ impl App {
             };
             self.drain(&origin);
             if handled == Handled::Consumed {
-                return;
-            }
-            if let Some(action) = self.keymap.resolve(&KeyScope::Tab(id), chord).cloned() {
-                self.update(action);
                 return;
             }
         }
@@ -927,12 +851,11 @@ impl App {
             &self.scope,
             &self.projects,
             &self.top_bar,
-            &self.keymap,
+            &self.keys,
             &self.theme,
             origin,
             &self.emit,
         )
-        .with_keys(&self.keys)
     }
 
     /// Draws one frame: top bar, tab strip, the active tab, the in-pane editor over it (MOD-57
@@ -999,8 +922,8 @@ impl App {
 
     /// The `?` box (MOD-67 D8), rebuilt from the live state every frame. With a converted view
     /// holding the keyboard ([`App::active_stack`]): one line per layer of its stack, then the
-    /// closing line its global layer admits. Otherwise today's box: the overlay context (if one
-    /// is up), the active tab's legacy rows, the global context, then the closing line.
+    /// closing line its global layer admits. Otherwise: the overlay context (if one is
+    /// up), then the global context, then the closing line.
     ///
     /// MOD-57 M2 E7 (PD-M2-2): with an in-pane editor alive the box lists the editor keys that
     /// act where the user is. On the asking tab, [`Stack::EDITOR_OPEN`]'s box (the editor's keys,
@@ -1039,15 +962,6 @@ impl App {
                 if !self.overlays.is_empty() {
                     lines.extend(self.keys.help_line(Context::Overlay, offered));
                 }
-                if let Some(tab) = self.tabs.active() {
-                    let legacy = self.keymap.help_line(&KeyScope::Tab(tab.id()));
-                    if !legacy.is_empty() {
-                        lines.push(HelpLine::new(
-                            tab.title(),
-                            legacy.split(" · ").map(str::to_owned).collect(),
-                        ));
-                    }
-                }
                 lines.extend(self.keys.help_line(Context::Global, offered));
                 self.keys.help_closer(Stack::BASE)
             }
@@ -1079,7 +993,6 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::App;
-    use crate::keymap::Keymap;
     use crate::keys::{CATALOGUE, Context};
 
     /// MOD-67 review L1: `action_for`'s wildcard arm is only safe while every global act is
@@ -1088,7 +1001,7 @@ mod tests {
     #[test]
     fn every_global_act_is_fixed_mapped_or_offerable() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let app = App::new(tx, Keymap::new());
+        let app = App::new(tx);
         for row in CATALOGUE
             .iter()
             .filter(|row| row.context == Context::Global)
