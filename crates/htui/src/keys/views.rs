@@ -886,6 +886,77 @@ mod tests {
         ABORT_CONFIRM,
     ];
 
+    /// The views' sources (MOD-67 M3 T7): every file that names a stack of this module or
+    /// handles an act a view stack offers.
+    const VIEWS: &[&str] = &[
+        include_str!("../ui/tabs/settings/mod.rs"),
+        include_str!("../ui/tabs/settings/agents.rs"),
+        include_str!("../ui/tabs/settings/boxes.rs"),
+        include_str!("../ui/tabs/settings/connection.rs"),
+        include_str!("../ui/tabs/settings/hierarchy.rs"),
+        include_str!("../ui/tabs/settings/kinds.rs"),
+        include_str!("../ui/tabs/settings/personas.rs"),
+        include_str!("../ui/tabs/settings/prompt.rs"),
+        include_str!("../ui/tabs/settings/qdrant.rs"),
+        include_str!("../ui/tabs/settings/queue.rs"),
+        include_str!("../ui/tabs/settings/secrets.rs"),
+        include_str!("../ui/overlay/abort_confirm.rs"),
+        include_str!("../ui/overlay/concepts_search.rs"),
+        include_str!("../ui/overlay/migration_prompt.rs"),
+        include_str!("../ui/overlay/queue.rs"),
+        include_str!("../ui/overlay/quit_confirm.rs"),
+        include_str!("../ui/overlay/waiting_list.rs"),
+        include_str!("../ui/overlay/workspace_switcher.rs"),
+        include_str!("../ui/tabs/skills/mod.rs"),
+        include_str!("../ui/tabs/skills/library.rs"),
+        include_str!("../ui/tabs/skills/templates.rs"),
+        include_str!("../ui/tabs/skills/attach.rs"),
+        include_str!("../ui/tabs/skills/agent_help.rs"),
+        include_str!("../ui/tabs/requirements/mod.rs"),
+        include_str!("../ui/tabs/requirements/forms.rs"),
+        include_str!("../ui/tabs/backlog/mod.rs"),
+        include_str!("../ui/tabs/backlog/filter.rs"),
+        include_str!("../ui/tabs/backlog/item_form.rs"),
+        include_str!("../ui/tabs/backlog/divergence.rs"),
+        include_str!("../ui/tabs/backlog/detail/mod.rs"),
+        include_str!("../ui/tabs/backlog/detail/compose.rs"),
+        include_str!("../ui/tabs/backlog/detail/documents.rs"),
+        include_str!("../ui/tabs/backlog/detail/graph.rs"),
+        include_str!("../ui/tabs/backlog/detail/notes.rs"),
+        include_str!("../ui/tabs/backlog/detail/prompt.rs"),
+        include_str!("../ui/tabs/backlog/detail/requirements.rs"),
+        include_str!("../ui/tabs/backlog/detail/runs.rs"),
+        include_str!("../ui/tabs/chat/mod.rs"),
+    ];
+
+    /// Act sites beside [`VIEWS`] (MOD-67 M6 D7): files that handle a view stack's acts without
+    /// naming a stack (`ChatTop`/`ChatBottom` are named only in the transcript), and the
+    /// directory picker, whose host names its stack.
+    const ACT_SITES: &[&str] = &[
+        include_str!("../ui/tabs/chat/transcript.rs"),
+        include_str!("../ui/path_picker.rs"),
+    ];
+
+    /// `source`'s production code: up to its test module, its comment lines dropped, so a name
+    /// that occurs only in a test or a comment does not count.
+    fn production(source: &str) -> String {
+        let code = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        code.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Whether `wanted` occurs in one of `sources` not followed by an identifier character.
+    fn names(sources: &[String], wanted: &str) -> bool {
+        sources.iter().any(|source| {
+            source.match_indices(wanted).any(|(at, _)| {
+                !source[at + wanted.len()..]
+                    .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            })
+        })
+    }
+
     fn chord(spec: &str) -> KeyChord {
         KeyChord::parse_strict(spec).expect("a valid spec")
     }
@@ -1293,67 +1364,10 @@ mod tests {
     fn every_view_stack_is_named_by_a_view() {
         /// MOD-67 M6: the lanes name these; T-close empties the list (PA-4).
         const PENDING: &[&str] = &["QUEUE_OVERLAY", "HIERARCHY_PICKER"];
-        const VIEWS: &[&str] = &[
-            include_str!("../ui/tabs/settings/mod.rs"),
-            include_str!("../ui/tabs/settings/agents.rs"),
-            include_str!("../ui/tabs/settings/boxes.rs"),
-            include_str!("../ui/tabs/settings/connection.rs"),
-            include_str!("../ui/tabs/settings/hierarchy.rs"),
-            include_str!("../ui/tabs/settings/kinds.rs"),
-            include_str!("../ui/tabs/settings/personas.rs"),
-            include_str!("../ui/tabs/settings/prompt.rs"),
-            include_str!("../ui/tabs/settings/qdrant.rs"),
-            include_str!("../ui/tabs/settings/queue.rs"),
-            include_str!("../ui/tabs/settings/secrets.rs"),
-            include_str!("../ui/overlay/abort_confirm.rs"),
-            include_str!("../ui/overlay/concepts_search.rs"),
-            include_str!("../ui/overlay/migration_prompt.rs"),
-            include_str!("../ui/overlay/queue.rs"),
-            include_str!("../ui/overlay/quit_confirm.rs"),
-            include_str!("../ui/overlay/waiting_list.rs"),
-            include_str!("../ui/overlay/workspace_switcher.rs"),
-            include_str!("../ui/tabs/skills/mod.rs"),
-            include_str!("../ui/tabs/skills/library.rs"),
-            include_str!("../ui/tabs/skills/templates.rs"),
-            include_str!("../ui/tabs/skills/attach.rs"),
-            include_str!("../ui/tabs/skills/agent_help.rs"),
-            include_str!("../ui/tabs/requirements/mod.rs"),
-            include_str!("../ui/tabs/requirements/forms.rs"),
-            include_str!("../ui/tabs/backlog/mod.rs"),
-            include_str!("../ui/tabs/backlog/filter.rs"),
-            include_str!("../ui/tabs/backlog/item_form.rs"),
-            include_str!("../ui/tabs/backlog/divergence.rs"),
-            include_str!("../ui/tabs/backlog/detail/mod.rs"),
-            include_str!("../ui/tabs/backlog/detail/compose.rs"),
-            include_str!("../ui/tabs/backlog/detail/documents.rs"),
-            include_str!("../ui/tabs/backlog/detail/graph.rs"),
-            include_str!("../ui/tabs/backlog/detail/notes.rs"),
-            include_str!("../ui/tabs/backlog/detail/prompt.rs"),
-            include_str!("../ui/tabs/backlog/detail/requirements.rs"),
-            include_str!("../ui/tabs/backlog/detail/runs.rs"),
-            include_str!("../ui/tabs/chat/mod.rs"),
-        ];
-        // Production code only: each file up to its test module, its comment lines dropped, so a
-        // stack named only by a test or a doc comment still counts as unnamed.
-        let production: Vec<String> = VIEWS
-            .iter()
-            .map(|source| {
-                let code = source.split("\n#[cfg(test)]").next().unwrap_or(source);
-                code.lines()
-                    .filter(|line| !line.trim_start().starts_with("//"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .collect();
-        let named = |name: &str| {
-            let wanted = format!("views::{name}");
-            production.iter().any(|source| {
-                source.match_indices(&wanted).any(|(at, _)| {
-                    !source[at + wanted.len()..]
-                        .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
-                })
-            })
-        };
+        // Production code only, so a stack named only by a test or a doc comment still counts
+        // as unnamed.
+        let production: Vec<String> = VIEWS.iter().map(|source| production(source)).collect();
+        let named = |name: &str| names(&production, &format!("views::{name}"));
         let declared: Vec<&str> = include_str!("views.rs")
             .lines()
             .filter_map(|line| line.strip_prefix("pub const "))
@@ -1373,6 +1387,67 @@ mod tests {
                 continue;
             }
             assert!(named(name), "no view names views::{name}");
+        }
+    }
+    /// MOD-67 M6 D7 (ANA-26 §8, risk "a stack action no view handles"): every catalogue act is
+    /// offered by some declared stack in a layer of its own context, and every act a view stack
+    /// offers outside the global, overlay and editor contexts is named `Act::X` in some view's
+    /// production code (the include-and-strip technique of `every_view_stack_is_named_by_a_view`).
+    #[test]
+    fn every_act_is_offered_by_a_stack_and_handled_by_a_view() {
+        /// MOD-67 M6: the lanes name these; T-close empties the list (PA-4).
+        const PENDING_ACTS: &[Act] = &[
+            Act::QueueMoveDown,
+            Act::QueueMoveUp,
+            Act::QueuePause,
+            Act::QueueDequeue,
+            Act::QueueOpen,
+            Act::PickerOpen,
+            Act::PickerParent,
+            Act::PickerChoose,
+            Act::PickerChooseDir,
+            Act::PickerGoTo,
+            Act::PickerHidden,
+        ];
+        for spec in CATALOGUE {
+            assert!(
+                DECLARED
+                    .iter()
+                    .any(|(_, stack)| stack.view_admits(spec.context, spec.act)),
+                "no declared stack offers [{}] {}",
+                spec.context.table(),
+                spec.name
+            );
+        }
+        let production: Vec<String> = VIEWS
+            .iter()
+            .chain(ACT_SITES)
+            .map(|source| production(source))
+            .collect();
+        for &(phrase, stack) in DECLARED.iter().filter(|(_, stack)| !SHELL.contains(stack)) {
+            for (index, layer) in stack.layers().iter().enumerate() {
+                if matches!(
+                    layer.context(),
+                    Context::Global | Context::Overlay | Context::Editor
+                ) {
+                    continue;
+                }
+                for spec in CATALOGUE
+                    .iter()
+                    .filter(|spec| spec.context == layer.context() && stack.admits(index, spec.act))
+                {
+                    if PENDING_ACTS.contains(&spec.act) {
+                        continue;
+                    }
+                    let act = spec.act;
+                    assert!(
+                        names(&production, &format!("Act::{act:?}")),
+                        "{phrase}: no view handles Act::{act:?} ([{}] {})",
+                        spec.context.table(),
+                        spec.name
+                    );
+                }
+            }
         }
     }
 }
