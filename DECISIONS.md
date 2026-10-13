@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-91](docs/decisions/mod/mod-91.md)** - Keep the user's mods, settings hooks and skills out of htui-driven sessions (done, 2026-10-13)
 - **[MOD-92](docs/decisions/mod/mod-92.md)** - Read-only `--json` CLI for htui state (done, 2026-10-13)
 - **[ANA-29](docs/decisions/ana/ana-29.md)** - Claude Code mods: developing htui, and using htui in other projects (concluded, 2026-10-08)
 - **[MOD-57](docs/decisions/mod/mod-57.md)** - Run the external editor inside the TUI pane (done, 2026-10-08)

@@ -296,6 +296,13 @@ pub struct AgentSettings {
     pub quota: QuotaSettings,
     /// What the `usage` payload's numbers mean on the CLI path.
     pub usage: UsageSettings,
+    /// Whether this row lets the user's own Claude Code extensions — plugins and their mods,
+    /// settings hooks, skills and slash commands — into the sessions `htui` drives (MOD-91 D3).
+    /// `false`, the default and every pre-MOD-91 row's value, isolates: the CLI gets
+    /// `cli::ISOLATION_ARGS`, an ACP session gets `acp::isolation_meta()`. Top-level rather than
+    /// under `cli` because it applies to both transports. An unreadable settings document falls
+    /// back to `default()`, the isolated side.
+    pub user_extensions: bool,
 }
 
 /// `agent.settings.acp` (§5.2).
@@ -593,6 +600,17 @@ pub(crate) async fn launch_from(
 async fn resolve_now(launch: &AgentLaunch, cwd: &Path) -> Result<ResolvedLaunch> {
     let tools = crate::tools::resolve(launch.discovery.as_ref(), cwd).await?;
     resolve(launch, &tools)
+}
+
+/// The variable every agent session `htui` starts carries, set to `1` (MOD-91 D4): how a mod the
+/// user let back in (`user_extensions`) tells it is running under `htui` and can stand down.
+pub const SESSION_VAR: &str = "HTUI_SESSION";
+
+/// Inserts [`SESSION_VAR`]` = 1` into a session's resolved environment (MOD-91 D4). Called by both
+/// drivers' `launch_for`, **after** `spec.env`, so a row's `launch.env` cannot unset it. Never by
+/// [`spawn`] (which the probes use too) and never into `launch.env` (user data, `R-SEC-2`).
+pub(crate) fn mark_session(env: &mut BTreeMap<String, String>) {
+    env.insert(SESSION_VAR.to_owned(), "1".to_owned());
 }
 
 /// Replaces every `${name}` in one string.

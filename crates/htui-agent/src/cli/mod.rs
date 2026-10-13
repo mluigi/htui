@@ -140,6 +140,12 @@ pub const UNPARSED: &str = "<unparsed>";
 ///    in place of the allow-list and `--strict-mcp-config`, while 3, 6¼ and 6⅓ emit nothing — no
 ///    permission mode, no server (the operator's own included), no prompt tool. [`refuse_widening`]
 ///    is what keeps 7 from undoing it;
+///
+///    6⅞. the isolation levers [`ISOLATION_ARGS`] unless the row opts back in
+///    (`settings.user_extensions`, MOD-91 D1–D3): after the narrowing, on **every** session —
+///    tool-less help turns and resumes included — and before 7, so the operator's `extra_args`
+///    still win. That is also why a later `--settings` that drops `disableAllHooks` is refused
+///    before the spawn ([`refuse_settings_override`], D8) rather than allowed to win silently;
 /// 7. `settings.cli.extra_args` **last**, so an operator's repeated flag is the one the CLI keeps.
 ///
 /// **The budget flag is omitted at zero, and that is a measurement, not a nicety** (plan F-10):
@@ -152,6 +158,7 @@ pub fn argv(
     spec: &SessionSpec,
     session_id: &str,
     mcp_config: Option<&Path>,
+    user_extensions: bool,
 ) -> Vec<String> {
     let mut args: Vec<String> = row_args.to_vec();
     // `--verbose` is what makes `stream-json` emit every envelope rather than the terminal
@@ -230,9 +237,30 @@ pub fn argv(
         args.push(format!("--disallowedTools={}", denied.join(",")));
     }
 
+    // MOD-91 D1, D2: after the narrowing and before `extra_args`, on every session.
+    if !user_extensions {
+        args.extend(ISOLATION_ARGS.map(ToOwned::to_owned));
+    }
+
     args.extend(cli.extra_args.iter().cloned());
     args
 }
+
+/// The isolation levers (MOD-91 D1, probed in T1 case 1): `disableAllHooks` stops settings hooks
+/// and every plugin's mods (user-scope and skills-directory), `--disable-slash-commands` drops
+/// skills and slash commands. Auth, `htui`'s `--mcp-config` server and `--permission-prompt-tool`
+/// keep working under both. `--settings` takes one value, so the pair is spaced, as probed.
+/// Plugin agents and plugin MCP servers survive (T1 case 5, D7). Changing this changes
+/// `isolation_args_are_the_probed_levers` and, if `disableAllHooks` goes, [`HOOKS_OFF`]'s check.
+pub const ISOLATION_ARGS: [&str; 3] = [
+    "--settings",
+    r#"{"disableAllHooks":true}"#,
+    "--disable-slash-commands",
+];
+
+/// The settings key D8 requires an operator's own `--settings` to set (`true`): a later
+/// `--settings` **replaces** ours rather than merging (T1 case 1a).
+const HOOKS_OFF: &str = "disableAllHooks";
 
 /// The `extra_args` flags that would widen a tool-less session back: they come last on [`argv`],
 /// so the CLI keeps them over `--tools=` and `--strict-mcp-config` (MOD-55 review M1).
@@ -279,6 +307,47 @@ pub fn refuse_widening(cli: &CliSettings, tools: &ToolExposure) -> Result<()> {
             return Err(DriverError::Transport(format!(
                 "a session with no tools refuses this row's `{arg}` extra argument: it would \
                  widen the session back"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses an isolated session (`user_extensions` false) on a row whose `extra_args` carry a
+/// `--settings` that would undo [`ISOLATION_ARGS`] (MOD-91 D8): they come last on [`argv`] and the
+/// CLI keeps the last `--settings` whole (T1 case 1a). Spaced or `=`-joined. Allowed only when the
+/// value is inline JSON whose object sets `"disableAllHooks": true`; a path is refused, because
+/// `htui` does not read the operator's file. A row that opts back in is never checked.
+/// Refused rather than rewritten, for [`refuse_widening`]'s reason.
+///
+/// # Errors
+/// [`DriverError::Transport`] naming the flag and both fixes, never the value (`R-SEC-2`: a
+/// settings value can carry an `env` block). Never [`DriverError::Spawn`]: nothing was spawned.
+pub fn refuse_settings_override(cli: &CliSettings, user_extensions: bool) -> Result<()> {
+    if user_extensions {
+        return Ok(());
+    }
+    // MOD-91 D8: refusing a bad `--settings` that a later good one follows, and reading another
+    // flag's spaced value as the flag, are intentionally conservative: both refuse more, never less.
+    let mut args = cli.extra_args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        let (flag, joined) = arg
+            .split_once('=')
+            .map_or((arg, None), |(flag, value)| (flag, Some(value)));
+        // Exactly the flag: `--setting-sources` shares the prefix and is not this check's.
+        if flag != "--settings" {
+            continue;
+        }
+        let keeps_hooks_off = joined
+            .or_else(|| args.next())
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .and_then(|value| value.get(HOOKS_OFF).and_then(Value::as_bool))
+            == Some(true);
+        if !keeps_hooks_off {
+            return Err(DriverError::Transport(format!(
+                "an isolated session refuses this row's `--settings` extra argument: a later \
+                 `--settings` replaces htui's own, so it must set `\"{HOOKS_OFF}\": true` itself, \
+                 or set `mods (y/n)` to `y` in Settings > Agents"
             )));
         }
     }
@@ -486,6 +555,10 @@ impl CliDriver {
     /// spec's holds what the secret provider produced for this run. The argv is **not** assembled
     /// here — [`argv`] needs the minted session id, which is `start`'s to make.
     ///
+    /// `HTUI_SESSION=1` ([`crate::launch::SESSION_VAR`], MOD-91 D4) goes in after `spec.env`, on
+    /// every session whatever `user_extensions` says. Only `io_in` calls this in production, so it
+    /// marks exactly the sessions; a probe, which spawns through `launch::spawn`, never gets it.
+    ///
     /// # Errors
     /// `crate::launch::launch_from`'s, unchanged; [`DriverError::Transport`] for a prepared
     /// transport, which spawns nothing and so has no launch to describe.
@@ -501,6 +574,7 @@ impl CliDriver {
         };
         let mut resolved = crate::launch::launch_from(launch, recorded.as_ref(), &spec.cwd).await?;
         resolved.env.extend(spec.env.clone());
+        crate::launch::mark_session(&mut resolved.env);
         Ok(resolved)
     }
 
@@ -575,6 +649,7 @@ impl CliDriver {
                     spec,
                     session_id,
                     config.as_ref().map(McpConfigFile::path),
+                    self.settings.user_extensions,
                 );
                 let spawned = crate::launch::spawn(&resolved, &spec.cwd).await?;
                 Ok((ChildIo::from_spawned(spawned)?, config))
@@ -624,6 +699,8 @@ impl AgentDriver for CliDriver {
             );
             // MOD-55 review M1: before the spawn, so a refused row starts nothing.
             refuse_widening(&self.cli_settings(), &spec.tools)?;
+            // MOD-91 D8: before the spawn, so a refused row starts nothing.
+            refuse_settings_override(&self.cli_settings(), self.settings.user_extensions)?;
             let (io, mcp_config) = self.io(&spec, &session_id).await?;
             let options = SessionOptions {
                 agent_name: self.name.clone(),

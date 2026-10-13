@@ -18,6 +18,7 @@ project or a box.
 - [`command_run` and the command queue](#command_run-and-the-command-queue)
 - [Heavy commands outside the queue (R-MCP-4)](#heavy-commands-outside-the-queue-r-mcp-4)
 - [Permission prompts for `claude-cli`](#permission-prompts-for-claude-cli)
+- [Isolation from your Claude Code setup](#isolation-from-your-claude-code-setup)
 - [Personas can hide htui's tools](#personas-can-hide-htuis-tools)
 - [The socket](#the-socket)
 - [`htui mcp`: the relay](#htui-mcp-the-relay)
@@ -31,9 +32,11 @@ project or a box.
    with two environment variables, `HTUI_MCP_ADDR` (where the host listens) and `HTUI_MCP_TOKEN`
    (the session's token).
    - An ACP agent gets it in its `session/new` request, as a stdio entry of `mcpServers`.
-   - `claude-cli` gets it as one argument, `--mcp-config=<json>`. htui does not pass
-     `--strict-mcp-config`, so the MCP servers you configured for Claude Code yourself stay
-     available.
+   - `claude-cli` gets it as one argument, `--mcp-config=<path>`. The path names a private file
+     (mode `0600`, in an `htui-cli-*` directory of mode `0700`) that holds the server's JSON, so
+     the token never appears on the command line. The file is removed when the session ends.
+     htui does not pass `--strict-mcp-config`, so the MCP servers you configured for Claude Code
+     yourself stay available.
    - The binary is htui's own: on Linux `/proc/<pid>/exe` of the host process, which stays valid
      for the host's life even if the file on disk is replaced; elsewhere the path htui was started
      from.
@@ -379,6 +382,73 @@ inline_approval`). An engine with a tool host now admits it, because the prompt 
 If such a session nevertheless starts without the prompt tool, the step fails at once with
 `agent spawn failed: missing_capability: inline_approval — a gated CLI step needs htui's
 permission_prompt tool` (unlike the selection-time skip above, it carries the spawn prefix).
+
+## Isolation from your Claude Code setup
+
+By default, a Claude Code session that htui starts does not load your own Claude Code extensions,
+so that no mod or settings hook answers a tool call before htui is asked. One that did would settle
+the call before htui's [permission prompt](#permission-prompts-for-claude-cli) or the ACP
+permission request, and the call would then never reach htui's policy or its record.
+
+**Off by default:**
+
+- your mods, from user-scope plugins and from plugins in a project's `.claude/skills/` directory;
+- hooks from your `settings.json` files (user, project and local);
+- skills and slash commands, yours and the project's. htui puts a step's bound skills into the
+  prompt itself, so a session never needs them.
+
+**Still on:**
+
+- agents and MCP servers that come with your installed plugins;
+- the MCP servers you configured for Claude Code yourself, and the prompts they offer as
+  commands;
+- the repository's `CLAUDE.md`;
+- permission rules (`permissions.allow`/`deny`) in your and the repository's settings files, and
+  the agent's permission mode: a call they settle never reaches htui either. MOD-96 in
+  `HANDOFF.md` tracks this;
+- Claude Code's built-in mods, which it loads whatever the settings say;
+- htui's own `htui` server and its `permission_prompt` tool.
+
+**How it is done:**
+
+| Agent | What htui sends |
+|---|---|
+| `claude-cli` | `--settings '{"disableAllHooks":true}' --disable-slash-commands`, after the tool narrowing and before the row's `extra_args` |
+| `claude` (ACP) | `_meta.claudeCode.options` on `session/new`, `session/resume` and `session/load`: `settings: {disableAllHooks: true}` and `extraArgs: {"disable-slash-commands": ""}` |
+
+The `claude` adapter's own hooks keep working: `disableAllHooks` stops hooks from settings files
+and plugins, not the ones the adapter registers in code. Over ACP, `--disable-slash-commands` also
+empties the list of built-in commands the adapter reports. htui sends no slash command, so nothing
+is lost. Every ACP agent receives the same `_meta`; an agent that does not know the `claudeCode`
+key ignores it, as ACP requires. On an isolated ACP session, the `_meta` `settings` block replaces
+the settings the adapter would derive from a `CLAUDE_MODEL_CONFIG` set in the row's launch `env`.
+
+**Letting your extensions back in.** In **Settings › Agents**, edit the agent (`e`) and set
+`mods (y/n)` to `y`. That row's sessions then start as they did before: no `--settings` or
+`--disable-slash-commands`, and no `_meta.claudeCode`. It applies to sessions started after the
+save. The field is stored as `settings.user_extensions`; `n`, or no value, means isolated.
+
+**`HTUI_SESSION=1`.** Every agent session htui starts has `HTUI_SESSION=1` in its environment,
+whichever way the field is set, on both transports (the ACP adapter passes it on to the Claude
+Code it runs). A mod or hook you let back in can check it and stand down under htui. htui's
+agent checks and logins do not set it.
+
+**Your own `--settings` on `claude-cli`.** Claude Code keeps only the last `--settings` it is
+given, and does not merge them. A row's `settings.cli.extra_args` come after htui's flags, so a
+`--settings` there would replace htui's and undo the isolation. An isolated session therefore
+refuses to start when `extra_args` carry `--settings` (as two arguments or as `--settings=…`),
+unless the value is inline JSON that itself sets `"disableAllHooks": true`. A file path is
+refused, because htui does not read your file. The error names the flag but never its value:
+
+```
+an isolated session refuses this row's `--settings` extra argument: a later `--settings`
+replaces htui's own, so it must set `"disableAllHooks": true` itself, or set `mods (y/n)` to `y`
+in Settings > Agents
+```
+
+Nothing is started. Fix it by adding `"disableAllHooks":true` to that JSON, or by setting
+`mods (y/n)` to `y`. A row that has opted back in is not checked. A `--settings` in the row's
+launch `args` comes before htui's flags, so htui's replaces it.
 
 ## Personas can hide htui's tools
 

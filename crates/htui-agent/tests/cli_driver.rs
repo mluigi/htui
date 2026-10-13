@@ -22,12 +22,12 @@ use std::time::Duration;
 #[cfg(unix)]
 use chrono::Utc;
 #[cfg(unix)]
-use htui_agent::cli::ClaudeStreamAdapter;
+use htui_agent::cli::{ClaudeStreamAdapter, CliDriver};
+use htui_agent::cli::{ISOLATION_ARGS, argv, refuse_settings_override, refuse_widening, usd};
 #[cfg(unix)]
 use htui_agent::cli::{McpConfigFile, SessionOptions, open_session};
-use htui_agent::cli::{argv, refuse_widening, usd};
 #[cfg(unix)]
-use htui_agent::driver::{AgentSession, PermissionAnswer, PermissionRequestId};
+use htui_agent::driver::{AgentSession, DriverCaps, PermissionAnswer, PermissionRequestId};
 use htui_agent::driver::{
     AgentSessionRef, McpServerSpec, PermissionPolicy, SessionSpec, ToolExposure,
 };
@@ -41,7 +41,7 @@ use htui_agent::event::{
 };
 use htui_agent::launch::CliSettings;
 #[cfg(unix)]
-use htui_agent::launch::{AgentSettings, ChildIo};
+use htui_agent::launch::{AgentSettings, ChildIo, SESSION_VAR};
 use htui_agent::prompt_bridge::{PROMPT_TOOL, bridge};
 #[cfg(unix)]
 use htui_agent::prompt_bridge::{PromptAsk, PromptCall, PromptClosed, PromptVerdict};
@@ -101,33 +101,38 @@ fn argv_is_the_ana4_line_in_order() {
         &spec,
         "minted-id",
         None,
+        false,
     );
 
     assert_eq!(
         args,
-        vec![
-            "--row-arg",
-            "-p",
-            "--output-format",
-            "stream-json",
-            "--input-format",
-            "stream-json",
-            "--verbose",
-            "--include-partial-messages",
-            "--permission-mode",
-            "acceptEdits",
-            "--session-id",
-            "minted-id",
-            "--model",
-            "sonnet",
-            "--add-dir",
-            "/a",
-            "--add-dir",
-            "/b",
-            "--max-budget-usd",
-            "0.000300",
-            "--x",
-        ],
+        [
+            &[
+                "--row-arg",
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--input-format",
+                "stream-json",
+                "--verbose",
+                "--include-partial-messages",
+                "--permission-mode",
+                "acceptEdits",
+                "--session-id",
+                "minted-id",
+                "--model",
+                "sonnet",
+                "--add-dir",
+                "/a",
+                "--add-dir",
+                "/b",
+                "--max-budget-usd",
+                "0.000300",
+            ][..],
+            &ISOLATION_ARGS[..],
+            &["--x"][..],
+        ]
+        .concat(),
     );
     assert!(
         !args.contains(&"--bare".to_owned()),
@@ -149,6 +154,7 @@ fn the_prompt_has_no_place_on_the_command_line() {
         &spec(PathBuf::from("/scratch")),
         "minted-id",
         None,
+        false,
     );
     let after_p = args
         .iter()
@@ -168,7 +174,7 @@ fn a_resuming_session_names_the_old_id_and_mints_nothing() {
     let mut spec = spec(PathBuf::from("/scratch"));
     spec.resume = Some(AgentSessionRef::new("older-session"));
 
-    let args = argv(&[], &cli_settings("", &[]), &spec, "minted-id", None);
+    let args = argv(&[], &cli_settings("", &[]), &spec, "minted-id", None, false);
 
     assert!(
         args.windows(2)
@@ -191,6 +197,7 @@ fn an_empty_permission_mode_passes_no_flag() {
         &spec(PathBuf::from("/scratch")),
         "minted-id",
         None,
+        false,
     );
     assert!(!args.contains(&"--permission-mode".to_owned()), "{args:?}");
 }
@@ -205,7 +212,7 @@ fn a_budget_that_is_absent_or_zero_or_negative_passes_no_flag() {
     for budget in [None, Some(0), Some(-1)] {
         let mut spec = spec(PathBuf::from("/scratch"));
         spec.budget_micros = budget;
-        let args = argv(&[], &cli_settings("", &[]), &spec, "minted-id", None);
+        let args = argv(&[], &cli_settings("", &[]), &spec, "minted-id", None, false);
         assert!(
             !args.contains(&"--max-budget-usd".to_owned()),
             "budget {budget:?} must not reach the command line: {args:?}"
@@ -244,11 +251,28 @@ fn exposure(allow: &[&str], deny: &[&str], deny_kinds: &[ToolKind]) -> ToolExpos
     }
 }
 
+/// `args` up to the isolation levers, asserting that they end it: the cases whose subject is the
+/// flag an isolated session's levers follow (MOD-91 D2), over a row with no `extra_args`.
+fn without_levers(args: &[String]) -> &[String] {
+    assert!(
+        args.ends_with(&ISOLATION_ARGS.map(ToOwned::to_owned)),
+        "the levers end a row with no extra_args: {args:?}"
+    );
+    &args[..args.len() - ISOLATION_ARGS.len()]
+}
+
 /// [`argv`] over a bare spec carrying `tools`, with `extra_args`.
 fn narrowed_argv(tools: ToolExposure, extra_args: &[&str]) -> Vec<String> {
     let mut spec = spec(PathBuf::from("/scratch"));
     spec.tools = tools;
-    argv(&[], &cli_settings("", extra_args), &spec, "minted-id", None)
+    argv(
+        &[],
+        &cli_settings("", extra_args),
+        &spec,
+        "minted-id",
+        None,
+        false,
+    )
 }
 
 /// D11's position: both flags come right after the last pair and before the operator's
@@ -262,20 +286,24 @@ fn persona_flags_follow_the_pairs_and_precede_extra_args() {
     );
     assert_eq!(
         args,
-        vec![
-            "-p",
-            "--output-format",
-            "stream-json",
-            "--input-format",
-            "stream-json",
-            "--verbose",
-            "--include-partial-messages",
-            "--session-id",
-            "minted-id",
-            "--tools=Read,Grep",
-            "--disallowedTools=mcp__x__y,Bash,BashOutput,KillShell",
-            "--foo",
-        ],
+        [
+            &[
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--input-format",
+                "stream-json",
+                "--verbose",
+                "--include-partial-messages",
+                "--session-id",
+                "minted-id",
+                "--tools=Read,Grep",
+                "--disallowedTools=mcp__x__y,Bash,BashOutput,KillShell",
+            ][..],
+            &ISOLATION_ARGS[..],
+            &["--foo"][..],
+        ]
+        .concat(),
     );
     assert!(
         args.windows(2)
@@ -322,7 +350,7 @@ fn tools_is_absent_when_allow_is_empty() {
 fn deny_kinds_edit_yields_the_four_claude_names() {
     let args = narrowed_argv(exposure(&[], &[], &[ToolKind::Edit]), &[]);
     assert_eq!(
-        args.last().map(String::as_str),
+        without_levers(&args).last().map(String::as_str),
         Some("--disallowedTools=Edit,Write,MultiEdit,NotebookEdit"),
         "{args:?}"
     );
@@ -348,7 +376,7 @@ fn command_run_exposure_denies_the_heavy_bash_prefixes() {
         "`make` was already denied: kept once"
     );
     assert_eq!(
-        args.last().cloned(),
+        without_levers(&args).last().cloned(),
         Some(format!("--disallowedTools={}", expected.join(","))),
         "{args:?}"
     );
@@ -364,7 +392,7 @@ fn command_run_exposure_denies_the_heavy_bash_prefixes() {
 fn no_exposure_no_bash_denials() {
     let args = narrowed_argv(exposure(&[], &["mcp__x__y"], &[]), &[]);
     assert_eq!(
-        args.last().map(String::as_str),
+        without_levers(&args).last().map(String::as_str),
         Some("--disallowedTools=mcp__x__y"),
         "{args:?}"
     );
@@ -383,7 +411,7 @@ fn a_default_exposure_adds_no_flag() {
         "{args:?}"
     );
     assert_eq!(
-        args.last().map(String::as_str),
+        without_levers(&args).last().map(String::as_str),
         Some("minted-id"),
         "{args:?}"
     );
@@ -429,7 +457,8 @@ fn mcp_configs(args: &[String]) -> Vec<&String> {
         .collect()
 }
 
-/// I-7: a spec with no server gets exactly the pre-MOD-11 command line, flag for flag.
+/// I-7: a spec with no server gets exactly the pre-MOD-11 command line, flag for flag, plus the
+/// isolation levers every session has carried since MOD-91.
 #[test]
 fn argv_without_mcp_is_unchanged() {
     let args = argv(
@@ -438,32 +467,37 @@ fn argv_without_mcp_is_unchanged() {
         &full_spec(),
         "minted-id",
         None,
+        false,
     );
     assert_eq!(
         args,
-        vec![
-            "--row-arg",
-            "-p",
-            "--output-format",
-            "stream-json",
-            "--input-format",
-            "stream-json",
-            "--verbose",
-            "--include-partial-messages",
-            "--permission-mode",
-            "acceptEdits",
-            "--session-id",
-            "minted-id",
-            "--model",
-            "sonnet",
-            "--add-dir",
-            "/a",
-            "--max-budget-usd",
-            "0.000300",
-            "--tools=Read,Grep",
-            "--disallowedTools=mcp__x__y",
-            "--x",
-        ],
+        [
+            &[
+                "--row-arg",
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--input-format",
+                "stream-json",
+                "--verbose",
+                "--include-partial-messages",
+                "--permission-mode",
+                "acceptEdits",
+                "--session-id",
+                "minted-id",
+                "--model",
+                "sonnet",
+                "--add-dir",
+                "/a",
+                "--max-budget-usd",
+                "0.000300",
+                "--tools=Read,Grep",
+                "--disallowedTools=mcp__x__y",
+            ][..],
+            &ISOLATION_ARGS[..],
+            &["--x"][..],
+        ]
+        .concat(),
     );
     assert!(mcp_configs(&args).is_empty(), "{args:?}");
     assert_eq!(htui_agent::cli::mcp_config(&[]), None);
@@ -481,8 +515,16 @@ fn argv_with_mcp_has_one_joined_config_before_tools() {
         &with,
         "minted-id",
         Some(Path::new(CONFIG_PATH)),
+        false,
     );
-    let without = argv(&[], &cli_settings("", &[]), &full_spec(), "minted-id", None);
+    let without = argv(
+        &[],
+        &cli_settings("", &[]),
+        &full_spec(),
+        "minted-id",
+        None,
+        false,
+    );
 
     let configs = mcp_configs(&args);
     assert_eq!(configs.len(), 1, "{args:?}");
@@ -564,6 +606,7 @@ fn the_mcp_config_is_the_clis_stdio_shape() {
         &spec,
         "minted-id",
         Some(Path::new(CONFIG_PATH)),
+        false,
     );
     assert_eq!(
         mcp_configs(&args),
@@ -589,6 +632,7 @@ fn extra_args_stay_last_with_mcp() {
         &spec,
         "minted-id",
         Some(Path::new(CONFIG_PATH)),
+        false,
     );
     assert_eq!(
         args[args.len() - 2..],
@@ -616,6 +660,7 @@ fn argv_names_the_prompt_tool_only_with_a_port() {
         &with,
         "minted-id",
         Some(Path::new(CONFIG_PATH)),
+        false,
     );
     assert!(
         !without.contains(&"--permission-prompt-tool".to_owned()),
@@ -630,6 +675,7 @@ fn argv_names_the_prompt_tool_only_with_a_port() {
         &with,
         "minted-id",
         Some(Path::new(CONFIG_PATH)),
+        false,
     );
     let config_at = args
         .iter()
@@ -688,6 +734,7 @@ fn no_tools_disables_every_tool_and_every_mcp_server() {
         &spec,
         "minted-id",
         Some(Path::new(CONFIG_PATH)),
+        false,
     );
 
     assert_eq!(
@@ -733,6 +780,7 @@ fn no_tools_off_adds_neither_flag() {
             &spec,
             "minted-id",
             Some(Path::new(CONFIG_PATH)),
+            false,
         );
         assert!(
             !args.contains(&"--strict-mcp-config".to_owned()),
@@ -795,6 +843,250 @@ fn no_tools_passes_extra_args_that_do_not_widen() {
         &ToolExposure::default(),
     )
     .expect("a session with tools is not this check's business");
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-91: the user's own Claude Code extensions stay out of the session
+// ---------------------------------------------------------------------------------------------
+
+/// The one literal pin of the levers (blueprint B1): what T1 case 1 probed against `claude`
+/// 2.1.294. Every other case composes its argv from [`ISOLATION_ARGS`].
+#[test]
+fn isolation_args_are_the_probed_levers() {
+    assert_eq!(
+        ISOLATION_ARGS,
+        [
+            "--settings",
+            r#"{"disableAllHooks":true}"#,
+            "--disable-slash-commands",
+        ],
+    );
+}
+
+/// Where [`ISOLATION_ARGS`] start in `args`, asserting that they appear once, as one contiguous
+/// window, and that neither lever appears anywhere else.
+fn levers_at(args: &[String]) -> usize {
+    let at: Vec<usize> = args
+        .windows(ISOLATION_ARGS.len())
+        .enumerate()
+        .filter(|(_, window)| *window == ISOLATION_ARGS)
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(at.len(), 1, "one window of levers: {args:?}");
+    for lever in ISOLATION_ARGS {
+        assert_eq!(
+            args.iter().filter(|arg| *arg == lever).count(),
+            1,
+            "{lever} once: {args:?}"
+        );
+    }
+    at[0]
+}
+
+/// The sessions D2 names, each with the MCP config path `io_in` would pass: a fresh one, a
+/// resume, a tool-less help turn, and one with every field set, a server and a prompt port.
+fn lever_grid() -> Vec<(&'static str, SessionSpec, Option<&'static Path>)> {
+    let fresh = spec(PathBuf::from("/scratch"));
+    let mut resuming = spec(PathBuf::from("/scratch"));
+    resuming.resume = Some(AgentSessionRef::new("older-session"));
+    let mut tool_less_spec = full_spec();
+    tool_less_spec.tools = tool_less();
+    let mut full = full_spec();
+    full.mcp = vec![htui_server()];
+    let (port, _ask) = bridge();
+    full.prompt = Some(port);
+    vec![
+        ("fresh", fresh, None),
+        ("resuming", resuming, None),
+        ("tool-less", tool_less_spec, None),
+        ("full", full, Some(Path::new(CONFIG_PATH))),
+    ]
+}
+
+/// MOD-91 D1, D2: a row that has not opted back in carries the levers on every session, tool-less
+/// help turns and resumes included.
+#[test]
+fn argv_isolates_by_default() {
+    for (name, spec, config) in lever_grid() {
+        let args = argv(
+            &[],
+            &cli_settings("acceptEdits", &[]),
+            &spec,
+            "minted-id",
+            config,
+            false,
+        );
+        assert_eq!(
+            levers_at(&args) + ISOLATION_ARGS.len(),
+            args.len(),
+            "{name}: with no extra_args, the levers end the argv"
+        );
+    }
+}
+
+/// MOD-91 D3: a row that opts back in (`settings.user_extensions`) gets the same argv minus the
+/// levers, and nothing else changes.
+#[test]
+fn argv_opt_in_drops_the_levers() {
+    for (name, spec, config) in lever_grid() {
+        let cli = cli_settings("acceptEdits", &["--x"]);
+        let opted = argv(&[], &cli, &spec, "minted-id", config, true);
+        let isolated = argv(&[], &cli, &spec, "minted-id", config, false);
+
+        for lever in ["--settings", "--disable-slash-commands"] {
+            assert!(!opted.iter().any(|arg| arg == lever), "{name}: {opted:?}");
+        }
+        let at = levers_at(&isolated);
+        assert_eq!(
+            [&isolated[..at], &isolated[at + ISOLATION_ARGS.len()..]].concat(),
+            opted,
+            "{name}: the levers are the only difference"
+        );
+    }
+}
+
+/// MOD-91 D2: the levers come after the narrowing and before the operator's `extra_args`, so a
+/// repeated flag there is still the operator's (7).
+#[test]
+fn the_levers_precede_extra_args() {
+    let mut spec = full_spec();
+    spec.mcp = vec![htui_server()];
+    let (port, _ask) = bridge();
+    spec.prompt = Some(port);
+    let args = argv(
+        &[],
+        &cli_settings("acceptEdits", &["--y"]),
+        &spec,
+        "minted-id",
+        Some(Path::new(CONFIG_PATH)),
+        false,
+    );
+
+    let at = levers_at(&args);
+    assert!(
+        args[at - 1].starts_with("--disallowedTools="),
+        "right after the narrowing: {args:?}"
+    );
+    assert_eq!(
+        args[at + ISOLATION_ARGS.len()..],
+        ["--y"],
+        "right before extra_args, which stay last: {args:?}"
+    );
+}
+
+/// MOD-91 D2: a tool-less help turn is isolated too: the levers follow `--strict-mcp-config` and
+/// the deny list, and precede `extra_args`.
+#[test]
+fn a_tool_less_session_is_isolated_too() {
+    let mut spec = full_spec();
+    spec.tools = tool_less();
+    let args = argv(
+        &[],
+        &cli_settings("acceptEdits", &["--x"]),
+        &spec,
+        "minted-id",
+        None,
+        false,
+    );
+
+    let at = levers_at(&args);
+    assert_eq!(args[at - 2], "--strict-mcp-config", "{args:?}");
+    assert!(args[at - 1].starts_with("--disallowedTools="), "{args:?}");
+    assert_eq!(args[at + ISOLATION_ARGS.len()..], ["--x"], "{args:?}");
+}
+
+/// MOD-91 D8: a later `--settings` replaces `htui`'s own whole (T1 case 1a), so an isolated row
+/// refuses one in `extra_args` unless its value is inline JSON setting `"disableAllHooks": true`.
+/// Spaced or joined, a path (`htui` does not read the operator's file), `false`, the string
+/// `"true"`, a key nested one level down, a non-object or JSON scalar, an empty value, a dangling
+/// flag, one behind an unrelated flag, and a bad value whatever follows it are all refused. The
+/// refusal names the flag and both fixes, and never the value: a settings value can carry an `env`
+/// block (`R-SEC-2`).
+#[test]
+fn an_isolated_row_refuses_a_settings_that_drops_the_hooks_lever() {
+    for extra in [
+        &["--settings", r#"{"env":{"TOKEN":"s3cret"}}"#][..],
+        &[r#"--settings={"env":{"TOKEN":"s3cret"}}"#],
+        &["--settings", "/op/settings.json"],
+        &["--settings=/op/settings.json"],
+        &["--settings", r#"{"disableAllHooks":false}"#],
+        &["--settings", "[1]"],
+        &["--settings", r#"{"x":{"disableAllHooks":true}}"#],
+        &["--settings", r#"{"disableAllHooks":"true"}"#],
+        &["--settings="],
+        &["--settings", "true"],
+        &["--settings", "null"],
+        &["--settings"],
+        &["--x", "--settings", "/op/settings.json"],
+        &[
+            "--settings",
+            r#"{"disableAllHooks":true}"#,
+            "--settings",
+            "/op/settings.json",
+        ],
+        &[
+            "--settings",
+            "/op/settings.json",
+            "--settings",
+            r#"{"disableAllHooks":true}"#,
+        ],
+    ] {
+        let refused = refuse_settings_override(&cli_settings("acceptEdits", extra), false)
+            .expect_err(&format!("{extra:?} must be refused"));
+        let message = refused.to_string();
+        assert!(
+            message.starts_with("agent transport error: "),
+            "a transport refusal, never a spawn failure: {refused:?}"
+        );
+        for named in [
+            "--settings",
+            "disableAllHooks",
+            "set `mods (y/n)` to `y` in Settings > Agents",
+        ] {
+            assert!(
+                message.contains(named),
+                "{extra:?}: names {named}: {message}"
+            );
+        }
+        for secret in ["s3cret", "/op/settings.json", "TOKEN"] {
+            assert!(
+                !message.contains(secret),
+                "{extra:?}: never quotes the value: {message}"
+            );
+        }
+    }
+}
+
+/// MOD-91 D8: a `--settings` that keeps the hooks lever passes, spaced, joined or whitespace-laden,
+/// whatever else it sets; so does a row with no `--settings`, and `--setting-sources`, which is a
+/// different flag.
+#[test]
+fn a_settings_that_keeps_the_hooks_lever_passes() {
+    for extra in [
+        &["--settings", r#"{"disableAllHooks":true}"#][..],
+        &[r#"--settings={"disableAllHooks":true,"env":{"A":"b"}}"#],
+        &[
+            "--settings",
+            r#"{ "disableAllHooks" : true, "env": { "A": "b" } }"#,
+        ],
+        &[],
+        &["--x"],
+        &["--setting-sources", "user"],
+        &["--setting-sources=user,project"],
+    ] {
+        refuse_settings_override(&cli_settings("acceptEdits", extra), false)
+            .unwrap_or_else(|err| panic!("{extra:?} keeps the session isolated: {err}"));
+    }
+}
+
+/// MOD-91 D8: a row that opts back in has nothing to keep, so its `extra_args` are not read.
+#[test]
+fn an_opted_in_row_is_never_checked_for_settings() {
+    refuse_settings_override(
+        &cli_settings("acceptEdits", &["--settings", "/op/settings.json"]),
+        true,
+    )
+    .expect("an opted-in row is not this check's business");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2147,6 +2439,106 @@ async fn a_tool_less_start_with_widening_extra_args_is_refused_before_the_spawn(
             if message.contains("--dangerously-skip-permissions")),
         "{refused:?}"
     );
+}
+
+/// MOD-91 D8: the refusal comes before the spawn, as the widening one does. The row names a
+/// command that does not exist, so a driver that spawned first would answer `Spawn` instead.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_isolated_start_with_an_overriding_settings_is_refused_before_the_spawn() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut row = scripted_row(&dir.path().join("absent"), serde_json::Map::new());
+    row.settings["cli"]["extra_args"] = json!(["--settings", "/op/settings.json"]);
+
+    let Err(refused) = driver(&row)
+        .start(spec(dir.path().to_path_buf()), "hello".to_owned())
+        .await
+    else {
+        panic!("an isolated session refuses the row");
+    };
+
+    assert!(
+        matches!(&refused, DriverError::Transport(message)
+            if message.contains("--settings") && !message.contains("/op/settings.json")),
+        "{refused:?}"
+    );
+}
+
+/// MOD-91 D4: what a session would spawn carries `HTUI_SESSION=1` whether or not the row opts back
+/// in, and neither the row's `launch.env` nor the spec's `env` can set it to anything else: it is
+/// inserted after both.
+#[cfg(unix)]
+#[tokio::test]
+async fn launch_for_marks_the_session_whatever_the_setting() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    for user_extensions in [false, true] {
+        for (row_env, spec_env) in [(None, None), (Some("0"), None), (None, Some("0"))] {
+            let env = row_env
+                .map(|value| serde_json::Map::from_iter([(SESSION_VAR.to_owned(), json!(value))]))
+                .unwrap_or_default();
+            let mut row = scripted_row(&dir.path().join("absent"), env);
+            row.settings["user_extensions"] = json!(user_extensions);
+            let driver = CliDriver::from_row(&row, DriverCaps::default()).expect("the row builds");
+            let mut with = spec(dir.path().to_path_buf());
+            if let Some(value) = spec_env {
+                with.env.insert(SESSION_VAR.to_owned(), value.to_owned());
+            }
+
+            let resolved = driver.launch_for(&with).await.expect("the row resolves");
+
+            assert_eq!(
+                resolved.env.get(SESSION_VAR).map(String::as_str),
+                Some("1"),
+                "user_extensions {user_extensions}, row {row_env:?}, spec {spec_env:?}"
+            );
+        }
+    }
+    assert_eq!(SESSION_VAR, "HTUI_SESSION");
+}
+
+/// [`TURN_SCRIPT`], after copying its own `HTUI_SESSION` (or `unset`) to `$HTUI_GO_FILE.session`.
+#[cfg(unix)]
+const SESSION_SCRIPT: &str = r#"#!/bin/sh
+<RECORD>
+printf '%s' "${HTUI_SESSION-unset}" > "$HTUI_GO_FILE.session"
+printf '%s\n' '<INIT>'
+while IFS= read -r line; do
+  printf '%s\n' '<REPLY>'
+  printf '%s\n' '<RESULT>'
+done
+exit 0
+"#;
+
+/// MOD-91 D1–D4 through a real child: an isolated row's process is started with the levers, an
+/// opted-in row's without them, and both see `HTUI_SESSION=1`.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_started_session_spawns_the_levers_and_marks_its_environment() {
+    for user_extensions in [false, true] {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let mut scripted = scripted(tmp.path(), SESSION_SCRIPT);
+        scripted.row.settings["user_extensions"] = json!(user_extensions);
+        let mut session = start(&scripted.row, tmp.path()).await;
+        // The script records before it prints `init`, so both files exist by now.
+        let _ = next(&mut session, "the banner").await;
+
+        let text = std::fs::read_to_string(&scripted.argv).expect("the script recorded its argv");
+        let args: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            args.windows(ISOLATION_ARGS.len())
+                .any(|window| window == ISOLATION_ARGS),
+            !user_extensions,
+            "user_extensions {user_extensions}: {args:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("go.session"))
+                .expect("the script recorded its HTUI_SESSION"),
+            "1",
+            "user_extensions {user_extensions}"
+        );
+
+        session.cancel(Duration::ZERO).await.expect("cancel");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

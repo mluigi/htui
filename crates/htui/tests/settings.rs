@@ -4,7 +4,7 @@
 //! snapshot suite is pinned to.
 #![cfg(feature = "testkit")]
 
-use htui::agent_settings::{AgentDraft, AgentWrite};
+use htui::agent_settings::{self, AgentDraft, AgentWrite};
 use htui::app::{Action, Ctx, Handled};
 use htui::qdrant_settings_info::{QdrantSnapshot, QdrantState};
 use htui::secrets_settings::{DEMO_SESSION, Redacted};
@@ -3605,7 +3605,8 @@ async fn the_paste_field_renders_under_the_link() {
 // MOD-23 T3: the registry editor (plan D230-D232, D244, D245; blueprint §5)
 // -------------------------------------------------------------------------------------------
 
-/// The label column of the form: `default model` and `enabled (y/n)` are both 13 wide (D231).
+/// The label column of the form: `default model` and `enabled (y/n)` are both 13 wide (D231);
+/// MOD-91's `mods (y/n)` (10) fits inside it.
 const LABEL_WIDTH: usize = 13;
 
 /// The idle keys line (D245), written out rather than read from the section: this is the pin.
@@ -3628,8 +3629,8 @@ const DELETED_ELSEWHERE: &str = "deleted elsewhere \u{2014} the editor was close
 const CHANGED_ON_BOTH_SIDES: &str = "changed elsewhere \u{2014} reloaded; Enter retries \u{b7} also changed elsewhere: command, models";
 
 /// A valid create form, in `FIELD_LABELS` order: name, transport, command, args, models, default
-/// model, billing, enabled.
-const VALID_CREATE: [&str; 8] = [
+/// model, billing, enabled, mods.
+const VALID_CREATE: [&str; 9] = [
     "gamma",
     "acp",
     "/opt/demo/bin/agent",
@@ -3638,6 +3639,7 @@ const VALID_CREATE: [&str; 8] = [
     "m2",
     "subscription",
     "y",
+    "n",
 ];
 
 /// Types `text` into a section one character at a time, as a terminal delivers it.
@@ -3749,6 +3751,11 @@ async fn n_opens_the_create_form_and_captures_input() {
         Some("subscription")
     );
     assert_eq!(field_of(&rendered, "enabled (y/n)").as_deref(), Some("y"));
+    assert_eq!(
+        field_of(&rendered, "mods (y/n)").as_deref(),
+        Some("n"),
+        "a new row is isolated by default (MOD-91 D6)"
+    );
     assert!(
         rendered.contains("new agent \u{b7} settings from alpha"),
         "the header names the highlighted row the settings come from (OQ-5): {rendered}"
@@ -3828,6 +3835,7 @@ async fn enter_on_the_create_form_sends_create_agent_with_the_parsed_draft_and_t
                     default_model: Some("m2".to_owned()),
                     billing: Billing::Subscription,
                     enabled: true,
+                    user_extensions: false,
                 }
             );
             assert_eq!(*settings_from, Some(beta_id), "the highlighted row");
@@ -3862,6 +3870,7 @@ async fn a_bad_field_is_refused_locally_by_name_and_sends_nothing() {
         (5, "m9", "default model"),
         (6, "free", "billing"),
         (7, "maybe", "enabled (y/n)"),
+        (8, "maybe", "mods (y/n)"),
     ] {
         let mut section = section_over(&bench, vec![registry_row("alpha", false)]);
         bench.key(&mut section, "n");
@@ -3920,6 +3929,7 @@ async fn e_prefills_the_highlighted_row_without_a_name_field_and_sends_its_token
         ("default model", "m1"),
         ("billing", "subscription"),
         ("enabled (y/n)", "y"),
+        ("mods (y/n)", "n"),
     ] {
         assert_eq!(
             field_of(&rendered, label).as_deref(),
@@ -3951,6 +3961,72 @@ async fn e_prefills_the_highlighted_row_without_a_name_field_and_sends_its_token
         }
         other => panic!("expected EditAgent, got {other:?}"),
     }
+}
+
+/// MOD-91 D6: `e` prefills `mods (y/n)` from `settings.user_extensions`, and changing it alone
+/// sends an `EditAgent` with that change and nothing a probe checked, so no re-probe is announced.
+#[tokio::test]
+async fn e_prefills_user_extensions_from_settings_and_sends_that_change() {
+    let bench = SectionBench::new().await;
+    let mut row = editable_row("alpha");
+    row.agent.settings = json!({ "acp": { "protocol_version": 1 }, "user_extensions": true });
+    let agent_id = row.agent.id;
+    let mut section = section_over(&bench, vec![row.clone()]);
+    let _ = bench.drained();
+
+    bench.key(&mut section, "e");
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        field_of(&rendered, "mods (y/n)").as_deref(),
+        Some("y"),
+        "{rendered}"
+    );
+
+    // The edit form's fields are `FIELD_LABELS[1..]`: `mods (y/n)` is the eighth, seven tabs on.
+    pressed(&bench, &mut section, "tab", 7);
+    assert!(focused_on(&section, &bench, "mods (y/n)"));
+    pressed(&bench, &mut section, "backspace", 4);
+    typed(&bench, &mut section, "n");
+    bench.key(&mut section, "enter");
+    let requests = requests_of(&bench);
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    match &requests[0] {
+        StoreRequest::EditAgent {
+            agent_id: asked,
+            draft,
+            ..
+        } => {
+            assert_eq!(*asked, agent_id);
+            assert!(!draft.user_extensions, "`n` sends false");
+            assert_eq!(
+                *draft,
+                AgentDraft {
+                    user_extensions: false,
+                    ..agent_settings::draft_of(&row.agent)
+                },
+                "nothing else changed"
+            );
+        }
+        other => panic!("expected EditAgent, got {other:?}"),
+    }
+
+    let _ = bench.drained();
+    bench.reply(
+        &mut section,
+        &written(
+            vec![row],
+            AgentWrite::Edited {
+                id: agent_id,
+                name: "alpha".to_owned(),
+            },
+        ),
+    );
+    let note = note_line(&render_section(&section, &bench.ctx()));
+    assert!(note.contains("saved `alpha`"), "{note}");
+    assert!(
+        !note.contains("r probes now"),
+        "the opt-in is not something a probe checked: {note}"
+    );
 }
 
 /// Review L-4: `e` over a row whose stored model name holds a comma opens nothing and says why:

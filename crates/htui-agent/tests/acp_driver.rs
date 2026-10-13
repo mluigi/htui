@@ -45,6 +45,7 @@ use std::time::Duration;
 use chrono::Utc;
 use htui_agent::acp::AcpDriver;
 use htui_agent::acp::Handshake;
+use htui_agent::acp::isolation_meta;
 #[cfg(unix)]
 use htui_agent::acp::{
     AcpIo, SESSION_STARTED, SessionOptions, Stamp, TOOL_KIND_DENIED, open_session,
@@ -63,6 +64,7 @@ use htui_agent::event::{
 };
 use htui_agent::launch::AcpSettings;
 use htui_agent::launch::ResolvedLaunch;
+use htui_agent::launch::SESSION_VAR;
 #[cfg(unix)]
 use htui_agent::launch::{AgentSettings, SessionSettings, spawn};
 use htui_agent::probe::{
@@ -848,7 +850,8 @@ fn executable(path: &Path, contents: &str) {
 }
 
 /// D58 at the seam that decides it: a usable snapshot is what the session would spawn, arguments
-/// included, and `spec.env` is still applied last and still wins (`R-SEC-2`).
+/// included, and `spec.env` is still applied last and still wins (`R-SEC-2`). `HTUI_SESSION=1`
+/// (MOD-91 D4) is inserted after the spec's env, so it is in the map too.
 ///
 /// `ready` and `unauthenticated` are both asserted here rather than left to the pure case, because
 /// blueprint H-4 is a *driver* claim — an unauthenticated box spawns the recorded launch and lets
@@ -894,6 +897,7 @@ async fn a_usable_snapshot_is_what_the_driver_would_spawn_marker_included() {
         assert_eq!(
             launch.env,
             BTreeMap::from([
+                ("HTUI_SESSION".to_owned(), "1".to_owned()),
                 ("ROW_VAR".to_owned(), "row".to_owned()),
                 ("SECRET".to_owned(), "s".to_owned()),
                 ("SHARED".to_owned(), "spec".to_owned()),
@@ -902,6 +906,64 @@ async fn a_usable_snapshot_is_what_the_driver_would_spawn_marker_included() {
              on a key both hold (`R-SEC-2`); status {status:?}"
         );
     }
+}
+
+/// MOD-91 D4: what an ACP session would spawn carries `HTUI_SESSION=1` whether or not the row
+/// opts back in, and neither the recorded launch's env nor the spec's can set it to anything
+/// else: it is inserted after both. The adapter passes its `process.env` to the CLI it spawns
+/// (`acp-agent.js:5915-5925`), so this is what reaches Claude Code. A login's launch
+/// ([`AcpDriver::launch_in`]) is not a session and stays unmarked (blueprint B3).
+#[tokio::test]
+async fn launch_for_marks_the_session_whatever_the_setting() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let command = plain_file(&tmp.path().join("bin/htui-fake-adapter"));
+    for user_extensions in [false, true] {
+        for (row_env, spec_env) in [(None, None), (Some("0"), None), (None, Some("0"))] {
+            let mut agent = unresolvable_row();
+            agent.settings["user_extensions"] = json!(user_extensions);
+            let recorded = ResolvedLaunch {
+                command: command.clone(),
+                args: vec![MARKER.to_owned()],
+                env: row_env
+                    .map(|value| BTreeMap::from([(SESSION_VAR.to_owned(), value.to_owned())]))
+                    .unwrap_or_default(),
+            };
+            let row_on_box = on_box(
+                &agent,
+                &snapshot(ProbeSource::Probe, ProbeStatus::Ready, recorded),
+            );
+            let driver =
+                AcpDriver::from_row_with_probe(&agent, Some(&row_on_box), caps_for(&agent))
+                    .expect("the row's launch parses");
+            let mut with = spec(tmp.path().to_path_buf());
+            if let Some(value) = spec_env {
+                with.env.insert(SESSION_VAR.to_owned(), value.to_owned());
+            }
+
+            let resolved = driver
+                .launch_for(&with)
+                .await
+                .expect("a ready snapshot is usable");
+            assert_eq!(
+                resolved.env.get(SESSION_VAR).map(String::as_str),
+                Some("1"),
+                "user_extensions {user_extensions}, row {row_env:?}, spec {spec_env:?}"
+            );
+
+            if row_env.is_none() {
+                let login = driver
+                    .launch_in(tmp.path())
+                    .await
+                    .expect("a ready snapshot is usable");
+                assert_eq!(
+                    login.env.get(SESSION_VAR),
+                    None,
+                    "a login is not a session (user_extensions {user_extensions})"
+                );
+            }
+        }
+    }
+    assert_eq!(SESSION_VAR, "HTUI_SESSION");
 }
 
 /// [`AgentDriver::start`], retrying the `ETXTBSY` window a fixture executable opens.
@@ -1445,18 +1507,38 @@ fn methods(seen: &[(String, Value)]) -> Vec<&str> {
 
 /// Opens a session resuming [`PRIOR_SESSION`] in `cwd` against [`restoring_agent`], with
 /// `session` as `settings.acp.session` and, when `with_child`, a `sleep 1000` child whose pid the
-/// case can assert on.
+/// case can assert on. Every other setting is the default, so the session is isolated (MOD-91 D3).
 #[cfg(unix)]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "test fakes run under no TUI panic hook"
-)]
 async fn open_restoring(
     cwd: &Path,
     caps: Value,
     resume: Answer,
     load: Answer,
     session: SessionSettings,
+    with_child: bool,
+) -> Restore {
+    let settings = AgentSettings {
+        acp: AcpSettings {
+            session,
+            ..AcpSettings::default()
+        },
+        ..AgentSettings::default()
+    };
+    open_restoring_with(cwd, caps, resume, load, settings, with_child).await
+}
+
+/// [`open_restoring`] under the whole row settings `settings`: what MOD-91's `_meta` cases vary.
+#[cfg(unix)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test fakes run under no TUI panic hook"
+)]
+async fn open_restoring_with(
+    cwd: &Path,
+    caps: Value,
+    resume: Answer,
+    load: Answer,
+    settings: AgentSettings,
     with_child: bool,
 ) -> Restore {
     let child = if with_child {
@@ -1496,7 +1578,7 @@ async fn open_restoring(
         child,
     };
     let mut options = options(PATIENT_HANDSHAKE);
-    options.settings.acp.session = session;
+    options.settings = settings;
 
     let opened = open_session(
         io,
@@ -1965,13 +2047,20 @@ async fn mcp_agent(stream: tokio::io::DuplexStream, seen: oneshot::Sender<Value>
 }
 
 /// Opens a session over [`mcp_agent`] with `mcp` on the spec and answers the `session/new`
-/// params the agent received.
+/// params the agent received. The row's settings are the default, so the session is isolated
+/// (MOD-91 D3).
+#[cfg(unix)]
+async fn session_new_params(mcp: Vec<McpServerSpec>) -> Value {
+    session_new_params_with(mcp, AgentSettings::default()).await
+}
+
+/// [`session_new_params`] under the row settings `settings`: what MOD-91's `_meta` cases vary.
 #[cfg(unix)]
 #[expect(
     clippy::disallowed_methods,
     reason = "test fakes run under no TUI panic hook"
 )]
-async fn session_new_params(mcp: Vec<McpServerSpec>) -> Value {
+async fn session_new_params_with(mcp: Vec<McpServerSpec>, settings: AgentSettings) -> Value {
     let tmp = tempfile::tempdir().expect("temp cwd");
     let (client_end, agent_end) = tokio::io::duplex(DUPLEX_BYTES);
     let (reader, writer) = tokio::io::split(client_end);
@@ -1985,7 +2074,10 @@ async fn session_new_params(mcp: Vec<McpServerSpec>) -> Value {
     let mut spec = spec(tmp.path().to_path_buf());
     spec.mcp = mcp;
 
-    let session = open_session(io, spec, "hi".to_owned(), options(PATIENT_HANDSHAKE))
+    let mut options = options(PATIENT_HANDSHAKE);
+    options.settings = settings;
+
+    let session = open_session(io, spec, "hi".to_owned(), options)
         .await
         .expect("the agent opens a session");
     let params = tokio::time::timeout(EVENT_WINDOW, params)
@@ -2045,4 +2137,122 @@ async fn session_new_carries_the_mcp_server_as_stdio() {
 async fn session_new_without_mcp_sends_an_empty_list() {
     let params = session_new_params(Vec::new()).await;
     assert_eq!(params["mcpServers"], json!([]), "{params}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-91 D5: an isolated session's `_meta.claudeCode.options`
+// ---------------------------------------------------------------------------------------------
+
+/// MOD-91 B1: the one literal pin of the ACP lever, as T2 probed it (plan, "T2 — ACP", case (a)).
+/// Every other case compares against [`isolation_meta`] itself, so a change of lever touches the
+/// function and this case, and nothing else.
+#[test]
+fn isolation_meta_is_the_probed_options() {
+    assert_eq!(
+        Value::Object(isolation_meta()),
+        json!({
+            "claudeCode": {
+                "options": {
+                    "settings": { "disableAllHooks": true },
+                    "extraArgs": { "disable-slash-commands": "" },
+                },
+            },
+        }),
+    );
+}
+
+/// MOD-91 D3/D5: a row that never mentions `user_extensions` is isolated, and its `session/new`
+/// carries the lever as the whole `_meta`.
+#[cfg(unix)]
+#[tokio::test]
+async fn session_new_carries_the_isolation_meta_by_default() {
+    let params = session_new_params(Vec::new()).await;
+    assert_eq!(params["_meta"], Value::Object(isolation_meta()), "{params}");
+}
+
+/// MOD-91 D3: a row that opts back in sends no `claudeCode` key at all, so the adapter loads the
+/// user's extensions exactly as it did before MOD-91. Robust to `_meta` being absent or `null`.
+#[cfg(unix)]
+#[tokio::test]
+async fn session_new_sends_no_claude_code_meta_when_opted_in() {
+    let settings = AgentSettings {
+        user_extensions: true,
+        ..AgentSettings::default()
+    };
+    let params = session_new_params_with(Vec::new(), settings).await;
+    assert!(
+        params
+            .get("_meta")
+            .and_then(|meta| meta.get("claudeCode"))
+            .is_none(),
+        "an opted-in session/new carries no `claudeCode`: {params}"
+    );
+}
+
+/// MOD-91 D5: a restored session carries the same `_meta` as `session/new`, because the adapter's
+/// `getOrCreateSession` forwards `params._meta` on both routes (`acp-agent.js:5699-5720`, T2). A
+/// restore that dropped it would reopen an isolated step with the user's extensions loaded. The
+/// grid is both routes (`resume` advertised, then `loadSession` only) by both settings.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_resume_and_a_load_carry_the_same_meta() {
+    let routes = [
+        (
+            "session/resume",
+            json!({ "sessionCapabilities": { "resume": {} } }),
+        ),
+        ("session/load", json!({ "loadSession": true })),
+    ];
+    for (method, caps) in routes {
+        for user_extensions in [false, true] {
+            let tmp = tempfile::tempdir().expect("temp cwd");
+            let settings = AgentSettings {
+                user_extensions,
+                ..AgentSettings::default()
+            };
+            let mut restore = open_restoring_with(
+                tmp.path(),
+                caps.clone(),
+                Answer::Ok,
+                Answer::Ok,
+                settings,
+                false,
+            )
+            .await;
+            let opened = std::mem::replace(&mut restore.opened, Err(DriverError::Closed));
+            let session = opened.unwrap_or_else(|err| {
+                panic!("{method} restores (user_extensions {user_extensions}): {err:?}")
+            });
+            let seen = restore.seen();
+
+            let restored: Vec<_> = seen.iter().filter(|(sent, _)| sent == method).collect();
+            assert_eq!(
+                restored.len(),
+                1,
+                "one `{method}` (user_extensions {user_extensions}): {:?}",
+                methods(&seen)
+            );
+            let params = &restored[0].1;
+            assert_restore_params(params, tmp.path());
+            if user_extensions {
+                assert!(
+                    params
+                        .get("_meta")
+                        .and_then(|meta| meta.get("claudeCode"))
+                        .is_none(),
+                    "an opted-in `{method}` carries no `claudeCode`: {params}"
+                );
+            } else {
+                assert_eq!(
+                    params["_meta"],
+                    Value::Object(isolation_meta()),
+                    "an isolated `{method}` carries the lever: {params}"
+                );
+            }
+
+            drop(session);
+            restore.agent.abort();
+            let _ = restore.agent.await;
+        }
+    }
 }

@@ -25,8 +25,8 @@ use crate::ui::tabs::settings::yes_or_no;
 
 /// The form's labels, in tab order (plan D231). `name` is the create form's only; the edit form
 /// starts at index 1. The section's fields take their labels from here, so a refusal's field name
-/// and the label on screen cannot drift.
-pub const FIELD_LABELS: [&str; 8] = [
+/// and the label on screen cannot drift. `mods (y/n)` is MOD-91 D6's `settings.user_extensions`.
+pub const FIELD_LABELS: [&str; 9] = [
     "name",
     "transport",
     "command",
@@ -35,6 +35,7 @@ pub const FIELD_LABELS: [&str; 8] = [
     "default model",
     "billing",
     "enabled (y/n)",
+    "mods (y/n)",
 ];
 
 /// The field name of a refusal about the stored `launch` document rather than about a typed field.
@@ -48,12 +49,14 @@ const MODELS: &str = FIELD_LABELS[4];
 const DEFAULT_MODEL: &str = FIELD_LABELS[5];
 const BILLING: &str = FIELD_LABELS[6];
 const ENABLED: &str = FIELD_LABELS[7];
+const USER_EXTENSIONS: &str = FIELD_LABELS[8];
 
 /// The longest registry name (plan D234).
 const NAME_MAX: usize = 64;
 
-/// What the form edits of an `agent` row (plan D231): everything but `name`, `settings` and the
-/// keys of `launch` other than `command` and `args`.
+/// What the form edits of an `agent` row (plan D231): everything but `name`, the keys of
+/// `settings` other than `user_extensions` (MOD-91 D6) and the keys of `launch` other than
+/// `command` and `args`.
 ///
 /// `env` is not here and is never shown (plan D235, `R-SEC-2`). `args` is not a secret channel:
 /// secrets travel through `env` or a `${tool}` placeholder, and `AgentLaunch`'s own `Debug` prints
@@ -74,6 +77,8 @@ pub struct AgentDraft {
     pub billing: Billing,
     /// `agent.enabled`: the row everywhere, not the per-box switch.
     pub enabled: bool,
+    /// `agent.settings.user_extensions` (MOD-91 D6): the one key of `settings` the form edits.
+    pub user_extensions: bool,
 }
 
 /// One refused field (plan D247, blueprint D255): which field and why, printed as
@@ -123,6 +128,8 @@ pub struct DraftFields<'a> {
     pub billing: &'a str,
     /// `enabled (y/n)`.
     pub enabled: &'a str,
+    /// `mods (y/n)`.
+    pub user_extensions: &'a str,
 }
 
 /// Whether `name` is a registry name (plan D234): 1 to 64 characters from `[a-z0-9._-]`, the first
@@ -263,6 +270,16 @@ pub fn parse_enabled(text: &str) -> Result<bool, Refusal> {
     yes_or_no(text).ok_or_else(|| Refusal::new(ENABLED, "is y or n"))
 }
 
+/// `mods (y/n)` (MOD-91 D6): `settings.user_extensions`, by the same convention as
+/// [`parse_enabled`].
+///
+/// # Errors
+///
+/// A [`Refusal`] on `mods (y/n)` for anything but `y`, `yes`, `n` or `no`.
+pub fn parse_user_extensions(text: &str) -> Result<bool, Refusal> {
+    yes_or_no(text).ok_or_else(|| Refusal::new(USER_EXTENSIONS, "is y or n"))
+}
+
 /// The whole form (plan D247): each parser in [`FIELD_LABELS`] order.
 ///
 /// # Errors
@@ -276,6 +293,7 @@ pub fn draft_from_fields(fields: &DraftFields<'_>) -> Result<AgentDraft, Refusal
     let default_model = parse_default(fields.default_model, &models)?;
     let billing = parse_billing(fields.billing)?;
     let enabled = parse_enabled(fields.enabled)?;
+    let user_extensions = parse_user_extensions(fields.user_extensions)?;
     Ok(AgentDraft {
         transport,
         command,
@@ -284,6 +302,7 @@ pub fn draft_from_fields(fields: &DraftFields<'_>) -> Result<AgentDraft, Refusal
         default_model,
         billing,
         enabled,
+        user_extensions,
     })
 }
 
@@ -306,6 +325,7 @@ pub fn check_draft(draft: &AgentDraft) -> Result<AgentDraft, Refusal> {
         default_model: draft.default_model.as_deref().unwrap_or(""),
         billing: draft.billing.as_str(),
         enabled: if draft.enabled { "y" } else { "n" },
+        user_extensions: if draft.user_extensions { "y" } else { "n" },
     })
 }
 
@@ -334,22 +354,62 @@ pub fn merge_launch(stored: &Value, command: &str, args: &[String]) -> Result<Va
     checked_launch(merged)
 }
 
-/// An edit (plan D235, D239): `stored` with the draft applied.
+/// `settings.user_extensions` as the form reads it: a stored `true` or `false`, and anything else,
+/// an absent key included, `false` (`AgentSettings`' default, MOD-91 D3). The driver can differ in
+/// the safe direction only: when any settings key is malformed it falls back to
+/// `AgentSettings::default()`, which is isolated, so the form can show `y` while the driver
+/// isolates.
+fn stored_user_extensions(settings: &Value) -> bool {
+    settings
+        .get("user_extensions")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Merges the form's `mods (y/n)` into a stored `agent.settings` (MOD-91 D6, blueprint B5, B6).
 ///
-/// The draft is checked again ([`check_draft`]), `launch` is [`merge_launch`]d, and `transport`,
-/// `models`, `default_model`, `billing` and `enabled` are replaced. `id`, `name`, `settings`,
-/// `created_at` and `updated_at` are kept: the store stamps `updated_at`, and the compare-and-set
-/// token is the caller's.
+/// When `user_extensions` is what `stored` already means, `stored` comes back untouched, byte for
+/// byte, whatever its shape, so an edit that leaves the field alone never rewrites the document.
+/// Otherwise `user_extensions` is set on a copy of the object, and every other key is carried
+/// unchanged.
 ///
 /// # Errors
 ///
-/// The [`Refusal`] of [`check_draft`] or [`merge_launch`].
+/// A [`Refusal`] on `mods (y/n)` when the value changes and `stored` is not a JSON object. The
+/// sentence never quotes the document.
+pub fn merge_settings(stored: &Value, user_extensions: bool) -> Result<Value, Refusal> {
+    if stored_user_extensions(stored) == user_extensions {
+        return Ok(stored.clone());
+    }
+    let Some(object) = stored.as_object() else {
+        return Err(Refusal::new(
+            USER_EXTENSIONS,
+            "the stored settings document is not a JSON object; edit it with SQL",
+        ));
+    };
+    let mut merged = object.clone();
+    merged.insert("user_extensions".to_owned(), Value::Bool(user_extensions));
+    Ok(Value::Object(merged))
+}
+
+/// An edit (plan D235, D239): `stored` with the draft applied.
+///
+/// The draft is checked again ([`check_draft`]), `launch` is [`merge_launch`]d, and `transport`,
+/// `models`, `default_model`, `billing` and `enabled` are replaced. `settings` is kept but for
+/// `user_extensions` ([`merge_settings`], MOD-91 D6). `id`, `name`, `created_at` and `updated_at`
+/// are kept: the store stamps `updated_at`, and the compare-and-set token is the caller's.
+///
+/// # Errors
+///
+/// The [`Refusal`] of [`check_draft`], [`merge_launch`] or [`merge_settings`].
 pub fn apply_draft(stored: &Agent, draft: &AgentDraft) -> Result<Agent, Refusal> {
     let draft = check_draft(draft)?;
     let launch = merge_launch(&stored.launch, &draft.command, &draft.args)?;
+    let settings = merge_settings(&stored.settings, draft.user_extensions)?;
     Ok(Agent {
         transport: draft.transport,
         launch,
+        settings,
         models: draft.models,
         default_model: draft.default_model,
         billing: draft.billing,
@@ -359,12 +419,14 @@ pub fn apply_draft(stored: &Agent, draft: &AgentDraft) -> Result<Agent, Refusal>
 }
 
 /// A new row (plan D239): `launch` is `{command, args, env: {}}`, with no `discovery`, checked as
-/// [`AgentLaunch`]; `settings` is the caller's (OQ-5); `created_at = updated_at = now`. The name
-/// and the draft are checked again ([`parse_name`], [`check_draft`]).
+/// [`AgentLaunch`]; `settings` is the caller's (OQ-5), with `user_extensions` from the draft
+/// ([`merge_settings`], MOD-91 D6); `created_at = updated_at = now`. The name and the draft are
+/// checked again ([`parse_name`], [`check_draft`]).
 ///
 /// # Errors
 ///
-/// The [`Refusal`] of [`parse_name`], [`check_draft`] or the `AgentLaunch` check.
+/// The [`Refusal`] of [`parse_name`], [`check_draft`], [`merge_settings`] or the `AgentLaunch`
+/// check.
 pub fn new_agent(
     id: AgentId,
     name: String,
@@ -374,6 +436,7 @@ pub fn new_agent(
 ) -> Result<Agent, Refusal> {
     let name = parse_name(&name)?;
     let draft = check_draft(draft)?;
+    let settings = merge_settings(&settings, draft.user_extensions)?;
     let launch = checked_launch(serde_json::json!({
         "command": draft.command,
         "args": draft.args,
@@ -396,7 +459,8 @@ pub fn new_agent(
 
 /// The draft a stored row prefills the edit form with (blueprint F-16): `launch.command` if it is a
 /// string, else empty; the string elements of `launch.args`, in order. Reads nothing else of
-/// `launch`.
+/// `launch`. `user_extensions` is `settings.user_extensions` as `stored_user_extensions` reads
+/// it (MOD-91 D6), which can show `y` on a row the driver isolates, never the reverse.
 #[must_use]
 pub fn draft_of(agent: &Agent) -> AgentDraft {
     let command = agent
@@ -424,6 +488,7 @@ pub fn draft_of(agent: &Agent) -> AgentDraft {
         default_model: agent.default_model.clone(),
         billing: agent.billing,
         enabled: agent.enabled,
+        user_extensions: stored_user_extensions(&agent.settings),
     }
 }
 
@@ -744,6 +809,7 @@ mod tests {
             default_model: "b",
             billing: "subscription",
             enabled: "y",
+            user_extensions: "n",
         }
     }
 
@@ -941,6 +1007,18 @@ mod tests {
     }
 
     #[test]
+    fn user_extensions_is_y_or_n() {
+        assert_eq!(parse_user_extensions(" Y "), Ok(true));
+        assert_eq!(parse_user_extensions("yes"), Ok(true));
+        assert_eq!(parse_user_extensions("n"), Ok(false));
+        assert_eq!(parse_user_extensions("No"), Ok(false));
+        assert_eq!(
+            parse_user_extensions("?").map_err(|refusal| refusal.to_string()),
+            Err("`mods (y/n)`: is y or n".to_owned())
+        );
+    }
+
+    #[test]
     fn every_refusal_names_a_form_label() {
         let refusals = [
             parse_name("").expect_err("empty"),
@@ -951,6 +1029,7 @@ mod tests {
             parse_default("x", &strings(&["a"])).expect_err("unlisted"),
             parse_billing("").expect_err("empty"),
             parse_enabled("").expect_err("empty"),
+            parse_user_extensions("").expect_err("empty"),
         ];
         let named: Vec<&str> = refusals.iter().map(|refusal| refusal.field).collect();
         assert_eq!(named, FIELD_LABELS, "one refusal per label, in tab order");
@@ -968,6 +1047,7 @@ mod tests {
                 default_model: Some("b".to_owned()),
                 billing: Billing::Subscription,
                 enabled: true,
+                user_extensions: false,
             }
         );
     }
@@ -1001,6 +1081,23 @@ mod tests {
         assert_eq!(
             draft_from_fields(&bad).map_err(|refusal| refusal.field),
             Err("default model")
+        );
+        let bad = DraftFields {
+            enabled: "?",
+            user_extensions: "?",
+            ..fields()
+        };
+        assert_eq!(
+            draft_from_fields(&bad).map_err(|refusal| refusal.field),
+            Err("enabled (y/n)")
+        );
+        let bad = DraftFields {
+            user_extensions: "?",
+            ..fields()
+        };
+        assert_eq!(
+            draft_from_fields(&bad).map_err(|refusal| refusal.field),
+            Err("mods (y/n)")
         );
     }
 
@@ -1222,6 +1319,7 @@ mod tests {
                 default_model: Some("m1".to_owned()),
                 billing: Billing::Subscription,
                 enabled: true,
+                user_extensions: false,
             }
         );
         for seed in seed_rows(epoch()) {
@@ -1236,6 +1334,7 @@ mod tests {
                 default_model: prefill.default_model.as_deref().unwrap_or(""),
                 billing: prefill.billing.as_str(),
                 enabled: if prefill.enabled { "y" } else { "n" },
+                user_extensions: if prefill.user_extensions { "y" } else { "n" },
             });
             assert_eq!(
                 retyped,
@@ -1275,6 +1374,14 @@ mod tests {
             ..same.clone()
         };
         assert!(!launch_changed(&stored, &models_only));
+        let mods_only = AgentDraft {
+            user_extensions: !same.user_extensions,
+            ..same.clone()
+        };
+        assert!(
+            !launch_changed(&stored, &mods_only),
+            "the opt-in is not something a probe checked (MOD-91 D6)"
+        );
         let args = AgentDraft {
             args: strings(&["--new"]),
             ..same.clone()
@@ -1290,6 +1397,175 @@ mod tests {
             ..same
         };
         assert!(launch_changed(&stored, &transport));
+    }
+
+    // MOD-91 D6: `mods (y/n)`, the one key of `settings` the form edits (blueprint B5-B7).
+
+    /// `stored` without `user_extensions`, for "every other key is kept".
+    fn without_user_extensions(stored: &Value) -> Value {
+        let mut rest = stored.clone();
+        rest.as_object_mut()
+            .expect("an object")
+            .remove("user_extensions");
+        rest
+    }
+
+    #[test]
+    fn merge_settings_writes_only_user_extensions() {
+        let stored = json!({
+            "acp": { "protocol_version": 1 },
+            "cli": { "stream": "claude_stream_json", "extra_args": [] },
+            "permission": { "default": "ask", "rules": [] },
+            "quota": { "source": "cli_rate_limit_event" },
+            "usage": { "scope": "model_usage" },
+            "x_future": [1],
+        });
+        let merged = merge_settings(&stored, true).expect("an object merges");
+        assert_eq!(merged["user_extensions"], json!(true));
+        assert_eq!(
+            without_user_extensions(&merged),
+            stored,
+            "every other key is carried unchanged"
+        );
+        let back = merge_settings(&merged, false).expect("an object merges");
+        assert_eq!(back["user_extensions"], json!(false), "`n` stores false");
+        assert_eq!(without_user_extensions(&back), stored);
+    }
+
+    #[test]
+    fn merge_settings_leaves_the_document_untouched_when_the_value_is_unchanged() {
+        for (stored, user_extensions) in [
+            (json!({}), false),
+            (json!({ "user_extensions": true }), true),
+            (json!({ "user_extensions": false }), false),
+            (json!({ "user_extensions": "yes" }), false),
+            (json!([]), false),
+            (json!(null), false),
+        ] {
+            assert_eq!(
+                merge_settings(&stored, user_extensions),
+                Ok(stored.clone()),
+                "{stored} with {user_extensions} is returned as stored (blueprint B5)"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_settings_refuses_a_non_object_it_would_have_to_change() {
+        for stored in [json!([]), json!(null), json!("x")] {
+            let refusal = merge_settings(&stored, true).expect_err("not an object");
+            assert_eq!(refusal.field, "mods (y/n)", "the form label (blueprint B6)");
+            assert_eq!(
+                refusal.to_string(),
+                "`mods (y/n)`: the stored settings document is not a JSON object; edit it with SQL"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_draft_sets_user_extensions_and_keeps_every_other_settings_key() {
+        let stored = stored_agent();
+        let on = AgentDraft {
+            user_extensions: true,
+            ..draft()
+        };
+        let merged = apply_draft(&stored, &on).expect("a valid edit");
+        assert_eq!(merged.settings["user_extensions"], json!(true));
+        assert_eq!(without_user_extensions(&merged.settings), stored.settings);
+        let off = apply_draft(&merged, &draft()).expect("a valid edit");
+        assert_eq!(off.settings["user_extensions"], json!(false));
+        assert_eq!(without_user_extensions(&off.settings), stored.settings);
+        let broken = Agent {
+            settings: json!([]),
+            ..stored_agent()
+        };
+        assert_eq!(
+            apply_draft(&broken, &on).map_err(|refusal| refusal.field),
+            Err("mods (y/n)")
+        );
+        assert_eq!(
+            apply_draft(&broken, &draft()).map(|row| row.settings),
+            Ok(json!([])),
+            "an edit that leaves the field alone does not touch the document"
+        );
+    }
+
+    #[test]
+    fn new_agent_writes_user_extensions_into_the_given_settings() {
+        let settings = json!({ "cli": { "stream": "claude_stream_json" } });
+        let on = AgentDraft {
+            user_extensions: true,
+            ..draft()
+        };
+        let row = new_agent(
+            AgentId::new(),
+            "agent-x".to_owned(),
+            &on,
+            settings.clone(),
+            epoch(),
+        )
+        .expect("a valid row");
+        assert_eq!(row.settings["user_extensions"], json!(true));
+        assert_eq!(without_user_extensions(&row.settings), settings);
+        let opted_in =
+            json!({ "cli": { "stream": "claude_stream_json" }, "user_extensions": true });
+        let row = new_agent(
+            AgentId::new(),
+            "agent-y".to_owned(),
+            &draft(),
+            opted_in,
+            epoch(),
+        )
+        .expect("a valid row");
+        assert_eq!(
+            row.settings["user_extensions"],
+            json!(false),
+            "a source row's opt-in is not copied over an `n` (blueprint B7)"
+        );
+        assert_eq!(without_user_extensions(&row.settings), settings);
+    }
+
+    #[test]
+    fn draft_of_reads_user_extensions_from_settings() {
+        let on = Agent {
+            settings: json!({ "acp": {}, "user_extensions": true }),
+            ..stored_agent()
+        };
+        assert!(draft_of(&on).user_extensions);
+        for settings in [
+            json!({}),
+            json!({ "user_extensions": "yes" }),
+            json!({ "user_extensions": 1 }),
+            json!([true]),
+            json!(null),
+        ] {
+            let row = Agent {
+                settings: settings.clone(),
+                ..stored_agent()
+            };
+            assert!(
+                !draft_of(&row).user_extensions,
+                "{settings} reads as the driver's default, false"
+            );
+        }
+    }
+
+    /// Pins the key name against T3's `htui_agent::launch::AgentSettings.user_extensions`.
+    #[test]
+    fn the_merged_settings_read_back_as_the_drivers_setting() {
+        let seed = seed_rows(epoch())
+            .into_iter()
+            .find(|row| row.settings.get("cli").is_some())
+            .expect("a seed row with a cli block");
+        let before: htui_agent::launch::AgentSettings =
+            serde_json::from_value(seed.settings.clone()).expect("the seed settings parse");
+        assert!(!before.user_extensions);
+        let merged = merge_settings(&seed.settings, true).expect("an object merges");
+        let after: htui_agent::launch::AgentSettings =
+            serde_json::from_value(merged).expect("the merged settings parse");
+        assert!(after.user_extensions, "the driver reads the form's key");
+        assert_eq!(after.cli, before.cli);
+        assert!(after.cli.is_some());
     }
 
     /// Review L-4: `models` is comma-separated, so a stored name holding a comma cannot survive
