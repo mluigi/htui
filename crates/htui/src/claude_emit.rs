@@ -7,9 +7,10 @@
 //!
 //! The target is written only when it is absent or empty, or, with `--force`, when it holds an
 //! earlier emit: every file one `emit` writes (or the engine's `htui/.claude-plugin/types/`, A-10),
-//! no link, a marketplace named `htui`, and a stamped version, not the source tree's (D4).
-//! Anything else is refused, `--force` or not, and so is a path with a `..` or one that is not
-//! UTF-8. Nothing outside the target and its two siblings
+//! no link, a marketplace named `htui`, and not the source tree's placeholder version (D4).
+//! Anything else is refused, `--force` or not, and so is a path with a `..` (the default
+//! directory's included) or one that is not UTF-8. An earlier emit is checked again right before
+//! it is moved aside. Nothing outside the target and its two siblings
 //! `<dir>.emit-<pid>` (staging) and `<dir>.old-<pid>` (the earlier emit, moved aside) is written,
 //! but the target's missing parents. Exits are 2 (refused) and 1 (failed), and none reaches Sentry:
 //! the sentences carry home paths.
@@ -46,8 +47,11 @@ const VERSION_TS: &str = "htui/hooks/version.ts";
 /// it on stderr. Neither arm reaches Sentry: its sentences carry home paths (MOD-93 D8).
 #[derive(Debug)]
 pub enum EmitExit {
-    /// Exit 2: the target is not one `emit` may write (foreign, a file, ours without `--force`),
-    /// or this box has no default directory.
+    /// Exit 2, nothing written: the target holds an earlier emit and `--force` is missing; holds
+    /// anything `emit` did not write (checked again right before an earlier emit is moved
+    /// aside); is a file; is a path with a `..`, not valid UTF-8, or naming no directory; or
+    /// there is no `--dir` and the default directory is missing (no local data directory) or
+    /// has a `..`.
     Refused(String),
     /// Exit 1: a write, a rename or stdout failed.
     Failed(String),
@@ -415,6 +419,33 @@ struct Prepared {
     install: Install,
 }
 
+/// How `target` at `dir` is written (D4), or the refusal.
+///
+/// # Errors
+///
+/// [`EmitExit::Refused`] for a target `emit` did not write (even with `force`), a file, or an
+/// earlier emit without `force`.
+fn decide(dir: &Path, target: Target, force: bool) -> Result<Install, EmitExit> {
+    match target {
+        Target::Absent => Ok(Install::Create),
+        Target::Empty => Ok(Install::FillEmpty),
+        Target::Ours if force => Ok(Install::Replace),
+        Target::Ours => Err(EmitExit::Refused(format!(
+            "{} already holds the htui plugin; pass --force to replace it",
+            dir.display()
+        ))),
+        Target::Foreign(why) => Err(EmitExit::Refused(format!(
+            "{} holds files htui claude emit did not write ({why}); it is left as it is. Choose \
+             another --dir.",
+            dir.display()
+        ))),
+        Target::NotADirectory => Err(EmitExit::Refused(format!(
+            "{} is a file, not a directory",
+            dir.display()
+        ))),
+    }
+}
+
 /// Normalises `dir` and classifies it (D4), touching nothing: every refusal comes from here, so
 /// [`run`] gives it before it runs `claude --version`.
 ///
@@ -432,30 +463,7 @@ fn prepare(dir: &Path, force: bool) -> Result<Prepared, EmitExit> {
         )));
     };
     let (name, parent) = (name.to_os_string(), parent.to_path_buf());
-    let install = match classify(&dir)? {
-        Target::Absent => Install::Create,
-        Target::Empty => Install::FillEmpty,
-        Target::Ours if force => Install::Replace,
-        Target::Ours => {
-            return Err(EmitExit::Refused(format!(
-                "{} already holds the htui plugin; pass --force to replace it",
-                dir.display()
-            )));
-        }
-        Target::Foreign(why) => {
-            return Err(EmitExit::Refused(format!(
-                "{} holds files htui claude emit did not write ({why}); it is left as it is. \
-                 Choose another --dir.",
-                dir.display()
-            )));
-        }
-        Target::NotADirectory => {
-            return Err(EmitExit::Refused(format!(
-                "{} is a file, not a directory",
-                dir.display()
-            )));
-        }
-    };
+    let install = decide(&dir, classify(&dir)?, force)?;
     Ok(Prepared {
         dir,
         name,
@@ -470,9 +478,11 @@ fn prepare(dir: &Path, force: bool) -> Result<Prepared, EmitExit> {
 ///
 /// # Errors
 ///
-/// [`EmitExit::Failed`] when a directory cannot be made or renamed, or a file cannot be written.
-/// The staging directory is removed, a moved-aside emit is put back (or the sentence names where
-/// it is), and an emptied target is made again.
+/// [`EmitExit::Refused`] when an earlier emit to replace is no longer one right before it is
+/// moved aside (TOCTOU), with [`prepare`]'s sentence; it is left as it is.
+/// [`EmitExit::Failed`] when a directory cannot be read, made, removed or renamed, or a file
+/// cannot be written. The staging directory is removed, a moved-aside emit is put back (or the
+/// sentence names where it is), and an emptied target is made again.
 fn install(prepared: Prepared, variant: Variant, rename: Rename<'_>) -> Result<Report, EmitExit> {
     let Prepared {
         dir,
@@ -502,13 +512,29 @@ fn install(prepared: Prepared, variant: Variant, rename: Rename<'_>) -> Result<R
         ))
     };
 
+    // `prepare`'s check was made before the staging was written: an earlier emit is classified
+    // again right before it is moved, and refused as `prepare` refuses it once it is no longer
+    // ours. One that is gone or emptied meanwhile is written as such.
+    let install = match install {
+        Install::Replace => classify(&dir)
+            .and_then(|target| decide(&dir, target, true))
+            .map_err(discard)?,
+        other => other,
+    };
     let mut leftover = None;
     match install {
         Install::Create => rename(&staging, &dir)
             .map_err(into_place)
             .map_err(discard)?,
         Install::FillEmpty => {
-            fs::remove_dir(&dir).map_err(into_place).map_err(discard)?;
+            fs::remove_dir(&dir)
+                .map_err(|error| {
+                    EmitExit::Failed(format!(
+                        "cannot remove the empty directory {}: {error}",
+                        dir.display()
+                    ))
+                })
+                .map_err(discard)?;
             if let Err(error) = rename(&staging, &dir) {
                 // Best effort: the empty directory the person made is there again.
                 let _ = fs::create_dir(&dir);
@@ -557,7 +583,8 @@ fn install(prepared: Prepared, variant: Variant, rename: Rename<'_>) -> Result<R
 ///
 /// [`EmitExit::Refused`] for a target `emit` may not write (even with `force`), a file, a path
 /// naming no directory, with a `..` or not UTF-8, or an earlier emit without `force`; nothing is
-/// touched then. [`EmitExit::Failed`] when a directory cannot be read, made or renamed, or a file
+/// touched then. The same for an earlier emit that is no longer one when it would be moved aside;
+/// the target is left as it is, and the staging directory removed. [`EmitExit::Failed`] when a directory cannot be read, made or renamed, or a file
 /// cannot be written; the staging directory is removed, and a moved-aside emit is put back.
 pub fn write_to(dir: &Path, options: &Options) -> Result<Report, EmitExit> {
     install(
@@ -572,6 +599,34 @@ pub fn write_to(dir: &Path, options: &Options) -> Result<Report, EmitExit> {
 #[must_use]
 pub fn default_dir() -> Option<PathBuf> {
     dirs::data_local_dir().map(|dir| dir.join("htui").join("claude-plugin"))
+}
+
+/// The directory `emit` writes: `given` (`--dir`), else `default`.
+///
+/// # Errors
+///
+/// [`EmitExit::Refused`] when there is neither, or `default` has a `..` (from `HOME` or
+/// `XDG_DATA_HOME`): its own sentence, since no `--dir` was given to drop it from. A given
+/// `--dir` with a `..` is refused by [`target_path`].
+fn chosen_dir(given: Option<PathBuf>, default: Option<PathBuf>) -> Result<PathBuf, EmitExit> {
+    if let Some(given) = given {
+        return Ok(given);
+    }
+    let Some(default) = default else {
+        return Err(EmitExit::Refused(
+            "this machine has no local data directory; pass --dir PATH".to_owned(),
+        ));
+    };
+    if default
+        .components()
+        .any(|part| part == Component::ParentDir)
+    {
+        return Err(EmitExit::Refused(format!(
+            "{} (the default directory) contains ..; pass --dir PATH without ..",
+            default.display()
+        )));
+    }
+    Ok(default)
 }
 
 /// Runs `claude --version` through the bounded, killable probe child (cwd: the temp dir), and
@@ -640,8 +695,8 @@ pub fn render(report: &Report, check: &ClaudeCheck) -> String {
 ///
 /// # Errors
 ///
-/// [`EmitExit::Refused`] when there is no `--dir` and no local data directory, or the target is
-/// refused (before `claude` runs); [`EmitExit::Failed`] when the write fails or stdout fails (a
+/// [`EmitExit::Refused`] when there is no `--dir` and no local data directory (or one with a
+/// `..`), or the target is refused (before `claude` runs); [`EmitExit::Failed`] when the write fails or stdout fails (a
 /// closed pipe excepted).
 pub async fn run(args: cli::EmitArgs) -> Result<(), EmitExit> {
     run_with(args, probe_claude, &mut std::io::stdout()).await
@@ -657,12 +712,8 @@ where
     Probe: FnOnce() -> Checked,
     Checked: Future<Output = ClaudeCheck>,
 {
-    let Some(dir) = args.dir.or_else(default_dir) else {
-        return Err(EmitExit::Refused(
-            "this machine has no local data directory; pass --dir PATH".to_owned(),
-        ));
-    };
     // Every refusal before `claude --version` runs.
+    let dir = chosen_dir(args.dir, default_dir())?;
     let prepared = prepare(&dir, args.force)?;
     let check = probe().await;
     let report = install(prepared, check.variant(), &|from, to| fs::rename(from, to))?;
@@ -707,8 +758,8 @@ mod tests {
 
     use super::{
         CLAUDE_FLOOR, CLAUDE_VERSION_PATTERN, ClaudeCheck, EmitExit, FILES, Options, PLUGIN_JSON,
-        Report, SOURCE_VERSION, VERSION, VERSION_TS, VERSION_TS_LITERAL, Variant, default_dir,
-        files_for, install, prepare, render, run_with, write_to,
+        Report, SOURCE_VERSION, VERSION, VERSION_TS, VERSION_TS_LITERAL, Variant, chosen_dir,
+        default_dir, files_for, install, prepare, render, run_with, write_to,
     };
     use crate::cli::EmitArgs;
 
@@ -1632,5 +1683,79 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    /// R1c (TOCTOU): an earlier emit that turns foreign between the check and the swap is
+    /// refused with the foreign sentence, and the file dropped into it is left as it is.
+    #[test]
+    fn a_target_turned_foreign_after_the_check_is_refused_and_left_untouched() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let dir = root.path().join("plugin");
+        emit(&dir, false, Variant::WithMod).expect("the first emit");
+        let prepared = prepare(&dir, true).expect("an earlier emit with --force");
+        std::fs::write(dir.join("notes.txt"), "mine\n").expect("the foreign file");
+        let before = tree(&dir);
+        assert_eq!(
+            refusal(install(prepared, Variant::SkillOnly, &|from, to| {
+                std::fs::rename(from, to)
+            })),
+            foreign(&dir, "notes.txt")
+        );
+        assert_eq!(tree(&dir), before);
+        assert_eq!(names_in(root.path()), ["plugin"]);
+    }
+
+    /// R1c: an empty target that is no longer empty when `emit` removes it gets its own
+    /// sentence, and what was dropped into it stays.
+    #[test]
+    fn a_failed_removal_of_the_empty_target_names_it() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let dir = root.path().join("plugin");
+        std::fs::create_dir(&dir).expect("the empty target");
+        let prepared = prepare(&dir, false).expect("an empty target");
+        std::fs::write(dir.join("notes.txt"), "mine\n").expect("the late file");
+        let sentence = failure(install(prepared, Variant::WithMod, &|from, to| {
+            std::fs::rename(from, to)
+        }));
+        assert!(
+            sentence.starts_with(&format!(
+                "cannot remove the empty directory {}: ",
+                dir.display()
+            )),
+            "{sentence}"
+        );
+        assert_eq!(names_in(&dir), ["notes.txt"]);
+        assert_eq!(names_in(root.path()), ["plugin"]);
+    }
+
+    /// R1c: a default directory with a `..` (from `HOME` or `XDG_DATA_HOME`) is refused with its
+    /// own sentence; a given `--dir` is passed on as it is, and no directory at all is refused.
+    #[test]
+    fn the_default_directory_with_dot_dot_gets_its_own_refusal() {
+        let default = std::path::PathBuf::from("/home/u/../x/htui/claude-plugin");
+        match chosen_dir(None, Some(default)) {
+            Err(EmitExit::Refused(sentence)) => assert_eq!(
+                sentence,
+                "/home/u/../x/htui/claude-plugin (the default directory) contains ..; pass --dir \
+                 PATH without .."
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let given = std::path::PathBuf::from("/p/../q");
+        assert_eq!(
+            chosen_dir(Some(given.clone()), Some("/d".into())).expect("the given dir"),
+            given
+        );
+        assert_eq!(
+            chosen_dir(None, Some("/d/x".into())).expect("the default dir"),
+            Path::new("/d/x")
+        );
+        match chosen_dir(None, None) {
+            Err(EmitExit::Refused(sentence)) => assert_eq!(
+                sentence,
+                "this machine has no local data directory; pass --dir PATH"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 }
