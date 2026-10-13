@@ -7,7 +7,7 @@
 
 use htui_core::model::{ItemId, ItemSummary, ProjectId, ProjectRef};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
@@ -124,32 +124,14 @@ pub fn title(count: usize, filter: Option<&str>) -> String {
     }
 }
 
-/// Draws the list pane. With a `hint` and room for a row besides it, the pane's last inner row
-/// is the hint: the Backlog's own keys (MOD-67 M5, Q1 a), clipped to the pane, and the rows take
-/// the height above it.
-pub fn render(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    view: &ListView<'_>,
-    hint: Option<&str>,
-    theme: &Theme,
-) {
+/// Draws the list pane. The Backlog's own keys (MOD-67 M5, Q1 a) are the shell's hint row since
+/// M6 T2, so the rows take the whole pane.
+pub fn render(frame: &mut Frame<'_>, area: Rect, view: &ListView<'_>, theme: &Theme) {
     let block = Block::new()
         .borders(Borders::ALL)
         .title(title(view.items.len(), view.filter));
-    let mut inner = block.inner(area);
+    let inner = block.inner(area);
     frame.render_widget(block, area);
-    if let Some(hint) = hint
-        && inner.height >= 2
-    {
-        let [rows, row] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
-        frame.render_widget(
-            Line::styled(cells::clip(hint, usize::from(row.width)), theme.dim),
-            row,
-        );
-        inner = rows;
-    }
 
     // MOD-13 blueprint E3, review M2: every scope project has a header row even with no item
     // under it, so an empty filtered result is told by `visible`, the rule the tab navigates by.

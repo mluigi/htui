@@ -564,9 +564,22 @@ pub fn could_not_check(why: &str, reread: &str, save: Option<&str>) -> String {
     }
 }
 
+impl Compose {
+    /// The keys of the focused part for the shell's hint row (MOD-67 M5, M6 T2), through
+    /// [`stack`](Self::stack): the one-line rows' or the body's.
+    #[must_use]
+    pub fn key_hint(&self, keys: &Keys) -> String {
+        let spec = match self.focus {
+            Part::Kind | Part::Title => HINT_TEXT,
+            Part::Body => HINT_AREA,
+        };
+        keys.hint(self.stack(), spec)
+    }
+}
+
 /// Draws the area over the sub-tab's whole content rect (D6): a top rule titled `title`, the
-/// one-line rows, the body, the notice and the hint (through [`Compose::stack`], MOD-67 M5).
-/// `kinds` is the Docs pane's hint text, drawn under a typed kind only.
+/// one-line rows, the body and the notice. Its keys are [`Compose::key_hint`], the shell's hint
+/// row since MOD-67 M6 T2. `kinds` is the Docs pane's hint text, drawn under a typed kind only.
 ///
 /// Returns the body's rect, which the pane claims for an in-pane editor (MOD-57 P2).
 pub fn render(
@@ -575,7 +588,6 @@ pub fn render(
     compose: &Compose,
     title: &str,
     kinds: Option<&str>,
-    keys: &Keys,
     theme: &Theme,
 ) -> Rect {
     let block = Block::new()
@@ -611,9 +623,7 @@ pub fn render(
         .as_deref()
         .map(|sentence| wrapped(sentence, all))
         .unwrap_or_default();
-    let fixed = u16::try_from(rows.len())
-        .unwrap_or(u16::MAX)
-        .saturating_add(1);
+    let fixed = u16::try_from(rows.len()).unwrap_or(u16::MAX);
     let room = inner.height.saturating_sub(fixed);
     let wanted = u16::try_from(notice_lines.len()).unwrap_or(u16::MAX);
     let notice_height = wanted.min(room);
@@ -622,17 +632,13 @@ pub fn render(
         notice_lines.drain(..usize::from(wanted - notice_height));
     }
     let mut constraints: Vec<Constraint> = rows.iter().map(|_| Constraint::Length(1)).collect();
-    constraints.extend([
-        Constraint::Min(body_min),
-        Constraint::Length(notice_height),
-        Constraint::Length(1),
-    ]);
+    constraints.extend([Constraint::Min(body_min), Constraint::Length(notice_height)]);
     let areas = Layout::vertical(constraints).split(inner);
     let count = rows.len();
     for (line, at) in rows.into_iter().zip(areas.iter()) {
         frame.render_widget(Paragraph::new(line), *at);
     }
-    let [body, notice, hint] = [areas[count], areas[count + 1], areas[count + 2]];
+    let [body, notice] = [areas[count], areas[count + 1]];
     frame.render_widget(
         Paragraph::new(compose.body.lines(
             body.width,
@@ -650,15 +656,6 @@ pub fn render(
                 .collect::<Vec<_>>(),
         ),
         notice,
-    );
-    let spec = match compose.focus {
-        Part::Kind | Part::Title => HINT_TEXT,
-        Part::Body => HINT_AREA,
-    };
-    let text = keys.hint(compose.stack(), spec);
-    frame.render_widget(
-        Paragraph::new(Line::styled(cells::clip(&text, all), theme.dim)),
-        hint,
     );
     body
 }
@@ -1164,21 +1161,17 @@ mod tests {
     }
 
     #[test]
-    fn the_area_draws_its_hint_inside_the_pane() {
+    fn the_area_s_keys_follow_its_focus_outside_the_pane() {
         let compose = note();
         let text = drawn(43, 23, |frame, area| {
-            render(
-                frame,
-                area,
-                &compose,
-                " New note ",
-                None,
-                Keys::compiled(),
-                &Theme::default(),
-            );
+            render(frame, area, &compose, " New note ", None, &Theme::default());
         });
         assert!(text.contains(" New note "), "{text}");
-        assert!(text.contains(&rendered(&compose, HINT_AREA)), "{text}");
+        assert!(!text.contains(&rendered(&compose, HINT_AREA)), "{text}");
+        assert_eq!(
+            compose.key_hint(Keys::compiled()),
+            rendered(&compose, HINT_AREA)
+        );
 
         let compose = typed("FEAT-1");
         let text = drawn(43, 23, |frame, area| {
@@ -1188,11 +1181,13 @@ mod tests {
                 &compose,
                 " New document ",
                 Some("plan, prd, summary"),
-                Keys::compiled(),
                 &Theme::default(),
             );
         });
-        assert!(text.contains(&rendered(&compose, HINT_TEXT)), "{text}");
+        assert_eq!(
+            compose.key_hint(Keys::compiled()),
+            rendered(&compose, HINT_TEXT)
+        );
         assert!(text.contains("kinds: plan"), "{text}");
         assert!(text.contains("> kind"), "{text}");
         assert!(text.contains("  title"), "{text}");
@@ -1207,7 +1202,6 @@ mod tests {
                 &fixed,
                 " New version of plan (from v2) ",
                 Some("plan, prd, summary"),
-                Keys::compiled(),
                 &Theme::default(),
             );
         });
@@ -1222,7 +1216,8 @@ mod tests {
 
     /// MOD-57 P2 (PD-3): `render` returns the rect its body is drawn in, which the pane claims
     /// for an in-pane editor: under the top rule for a note, under the kind, kinds, title and
-    /// body-label rows for a typed document, and above the hint either way.
+    /// body-label rows for a typed document, down to the pane's last row either way (the keys
+    /// are the shell's hint row since MOD-67 M6 T2).
     #[test]
     fn render_returns_the_body_rect() {
         let mut compose = note();
@@ -1235,12 +1230,11 @@ mod tests {
                 &compose,
                 " New note ",
                 None,
-                Keys::compiled(),
                 &Theme::default(),
             ));
         });
         let body = body.expect("the frame drew");
-        assert_eq!(body, Rect::new(0, 1, 43, 21));
+        assert_eq!(body, Rect::new(0, 1, 43, 22));
         assert!(
             bench::row_from(&text, body).starts_with("First line."),
             "{body:?} in\n{text}"
@@ -1259,12 +1253,11 @@ mod tests {
                 &compose,
                 " New document ",
                 Some("plan, prd, summary"),
-                Keys::compiled(),
                 &Theme::default(),
             ));
         });
         let body = body.expect("the frame drew");
-        assert_eq!(body, Rect::new(0, 5, 43, 17));
+        assert_eq!(body, Rect::new(0, 5, 43, 18));
         assert!(
             bench::row_from(&text, body).starts_with("First line."),
             "{body:?} in\n{text}"
@@ -1279,27 +1272,18 @@ mod tests {
         );
     }
 
-    /// A long notice keeps its end (the hedge) and the hint.
+    /// A long notice keeps its end (the hedge); the keys are the shell's hint row (MOD-67 M6 T2).
     #[test]
-    fn a_long_notice_keeps_its_last_rows_and_the_hint() {
+    fn a_long_notice_keeps_its_last_rows() {
         let mut compose = note();
         compose.settle(Some(may_have_landed(
             &"store backend error: connection reset ".repeat(8),
             "thread",
         )));
         let text = drawn(43, 8, |frame, area| {
-            render(
-                frame,
-                area,
-                &compose,
-                " New note ",
-                None,
-                Keys::compiled(),
-                &Theme::default(),
-            );
+            render(frame, area, &compose, " New note ", None, &Theme::default());
         });
         assert!(text.contains("re-read to check"), "{text}");
-        assert!(text.contains(&rendered(&compose, HINT_AREA)), "{text}");
     }
 
     /// The maintainer's answer to blueprint §6 Q1: `v` with nothing changed is `unchanged`, in

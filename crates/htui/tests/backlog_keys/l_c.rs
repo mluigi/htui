@@ -138,8 +138,10 @@ async fn enter_re_roots_the_graph_and_never_says_the_miss() {
     sub_tab(&mut harness, TO_GRAPH);
     let frame = harness.render();
     assert!(
-        frame.contains("┌ FEAT-1") && frame.contains("depth 2/3 · +/- depth · Enter re-root"),
-        "the Graph on FEAT-1, its footer label-built:\n{frame}"
+        frame.contains("┌ FEAT-1")
+            && frame.contains("depth 2/3")
+            && frame.contains("+/- depth · Enter re-root"),
+        "the Graph on FEAT-1, its keys label-built in the hint row:\n{frame}"
     );
 
     // One `J` from FEAT-1's root row is htui ANA-1 (tests/backlog.rs).

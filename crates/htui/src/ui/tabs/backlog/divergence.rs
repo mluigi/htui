@@ -467,8 +467,9 @@ fn count(n: usize, noun: &str) -> String {
     }
 }
 
-/// D4: the view over the whole tab `area`.
-pub fn render(frame: &mut Frame<'_>, area: Rect, view: &Divergence, keys: &Keys, theme: &Theme) {
+/// D4: the view over the whole tab `area`. Its keys are [`Divergence::hint`], the shell's hint row
+/// since MOD-67 M6 T2.
+pub fn render(frame: &mut Frame<'_>, area: Rect, view: &Divergence, theme: &Theme) {
     let title = header(&view.key, view.ancestor_version, view.head_version);
     let block = Block::new()
         .borders(Borders::ALL)
@@ -493,9 +494,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, view: &Divergence, keys: &Keys,
         .flat_map(|row| row_lines(row, vw, theme))
         .collect();
     let all = u16::try_from(table.len()).unwrap_or(u16::MAX);
-    // The headings and the hint take a row each; with a pane, the section row and the diffs'
-    // `DIFF_MIN` come off the table's share.
-    let rest = inner.height.saturating_sub(2);
+    // The headings take a row; with a pane, the section row and the diffs' `DIFF_MIN` come off
+    // the table's share.
+    let rest = inner.height.saturating_sub(1);
     let (table_h, section_h) = match view.pane {
         Some(_) => (all.min(rest.saturating_sub(1 + DIFF_MIN)), 1),
         None => (all.min(rest), 0),
@@ -506,12 +507,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, view: &Divergence, keys: &Keys,
             *last = Line::styled("\u{2026}", theme.dim);
         }
     }
-    let [headings_at, table_at, section_at, diffs_at, hint_at] = Layout::vertical([
+    let [headings_at, table_at, section_at, diffs_at] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(table_h),
         Constraint::Length(section_h),
         Constraint::Min(0),
-        Constraint::Length(1),
     ])
     .areas(inner);
     frame.render_widget(
@@ -565,14 +565,6 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, view: &Divergence, keys: &Keys,
             .collect();
         frame.render_widget(Paragraph::new(bar), gap);
     }
-
-    frame.render_widget(
-        Paragraph::new(Line::styled(
-            cells::clip(&view.hint(keys), width),
-            theme.dim,
-        )),
-        hint_at,
-    );
 }
 
 /// A unified diff as the rows it draws in a `width`-wide column, each beside the diff line it
@@ -730,7 +722,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = chrome(frame.area()).body;
-                render(frame, area, view, Keys::compiled(), &Theme::default());
+                render(frame, area, view, &Theme::default());
             })
             .expect("the frame draws");
         let buffer = terminal.backend().buffer();
@@ -1262,13 +1254,7 @@ mod tests {
             ] {
                 terminal
                     .draw(|frame| {
-                        render(
-                            frame,
-                            area(frame),
-                            &view,
-                            Keys::compiled(),
-                            &Theme::default(),
-                        );
+                        render(frame, area(frame), &view, &Theme::default());
                     })
                     .unwrap_or_else(|err| panic!("{width}x{height}: {err}"));
                 for code in [KeyCode::PageDown, KeyCode::Char('j'), KeyCode::Tab] {

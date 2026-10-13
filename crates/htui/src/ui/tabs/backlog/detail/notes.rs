@@ -416,17 +416,20 @@ impl DetailTab for NotesTab {
         }
     }
 
+    /// The compose area's keys while it is open, else [`HINT`] (MOD-67 M6 T2); nothing with no
+    /// item selected.
+    fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
+        let hint = match &self.compose {
+            Some(compose) => compose.key_hint(keys),
+            None if self.item.is_none() => return None,
+            None => keys.hint(views::BACKLOG_NOTES, HINT),
+        };
+        (!hint.is_empty()).then(|| Line::styled(hint, theme.dim))
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         if let Some(compose) = &self.compose {
-            let body = compose::render(
-                frame,
-                area,
-                compose,
-                " New note ",
-                None,
-                ctx.keys(),
-                ctx.theme,
-            );
+            let body = compose::render(frame, area, compose, " New note ", None, ctx.theme);
             ctx.claim_editor_area(body);
             return;
         }
@@ -434,15 +437,12 @@ impl DetailTab for NotesTab {
             message(frame, area, "No item selected.", ctx.theme);
             return;
         }
-        // Review M1's sentence under the thread; D11: the browse hint takes the last row.
+        // Review M1's sentence under the thread; D11's browse hint is the shell's hint row since
+        // MOD-67 M6 T2 (`key_hint`).
         let notice = self.notice_rows(area.width);
         let height = u16::try_from(notice.len()).unwrap_or(u16::MAX);
-        let [list, below, hint] = Layout::vertical([
-            Constraint::Min(0),
-            Constraint::Length(height),
-            Constraint::Length(1),
-        ])
-        .areas(area);
+        let [list, below] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(height)]).areas(area);
         frame.render_widget(
             Paragraph::new(
                 notice
@@ -451,16 +451,6 @@ impl DetailTab for NotesTab {
                     .collect::<Vec<_>>(),
             ),
             below,
-        );
-        frame.render_widget(
-            Line::styled(
-                cells::clip(
-                    &ctx.keys().hint(views::BACKLOG_NOTES, HINT),
-                    usize::from(hint.width),
-                ),
-                ctx.theme.dim,
-            ),
-            hint,
         );
         if self.notes.is_empty() {
             message(frame, list, "No notes for this item.", ctx.theme);
@@ -597,7 +587,7 @@ mod tests {
             open.render(frame, area, &shell.ctx().with_editor_area(&cell));
         });
         let claimed = cell.get().expect("the area claims its body");
-        assert_eq!(claimed, Rect::new(0, 1, 43, 21));
+        assert_eq!(claimed, Rect::new(0, 1, 43, 22));
         assert!(
             row_from(&text, claimed).starts_with("First line."),
             "{claimed:?} in\n{text}"
@@ -741,7 +731,6 @@ mod tests {
         let text = drawn(43, 23, |frame, area| pane.render(frame, area, &shell.ctx()));
         assert!(text.contains("the note was written;"), "{text}");
         assert!(text.contains("Hi."), "{text}");
-        assert_eq!(text.lines().last().map(str::trim_end), Some(HINT), "{text}");
         assert!(shell.actions().is_empty(), "the re-read was the check");
         // The sentence stays until the next key.
         let _ = pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
@@ -1019,7 +1008,6 @@ mod tests {
         }
         let text = drawn(20, 8, |frame, area| pane.render(frame, area, &shell.ctx()));
         assert!(text.contains("THE END"), "{text}");
-        assert_eq!(text.lines().last().map(str::trim_end), Some(HINT), "{text}");
     }
 
     /// Review L1: after the user's own note lands, the re-read thread opens at its bottom, where
@@ -1067,7 +1055,6 @@ mod tests {
         let text = drawn(20, 8, |frame, area| pane.render(frame, area, &shell.ctx()));
         assert!(text.contains("MINE"), "{text}");
         assert!(text.contains("the note was"), "{text}");
-        assert_eq!(text.lines().last().map(str::trim_end), Some(HINT), "{text}");
     }
 
     /// Review L2: a `\t` in a saved note draws as spaces to the next tab stop, as the compose
@@ -1153,16 +1140,20 @@ mod tests {
         assert_eq!(keys.hint(stack, super::HINT), "A add note");
     }
 
-    /// D11: with an item and no area, the last row is the hint, over a thread or an empty one;
-    /// with no item there is none.
+    /// D11, MOD-67 M6 T2: with an item and no area the keys are [`HINT`], the shell's hint row,
+    /// over a thread or an empty one, and the pane draws none of it; with no item there are none,
+    /// and an open area has its own.
     #[tokio::test]
-    async fn the_hint_is_drawn_under_the_thread() {
+    async fn the_keys_are_the_hint_row_s() {
         let shell = Shell::new();
+        let keys = |pane: &NotesTab| {
+            pane.key_hint(Keys::compiled(), &Theme::default())
+                .map(|line| line.to_string())
+        };
         let pane = pane(&shell).await;
         let text = drawn(43, 23, |frame, area| pane.render(frame, area, &shell.ctx()));
-        let rows: Vec<&str> = text.lines().collect();
-        assert_eq!(rows[22].trim_end(), HINT, "{text}");
-        assert_eq!(text.matches(HINT).count(), 1, "{text}");
+        assert_eq!(keys(&pane).as_deref(), Some(HINT));
+        assert!(!text.contains(HINT), "{text}");
 
         let mut empty = NotesTab::new();
         empty.on_item_change(Some(ITEM));
@@ -1171,17 +1162,17 @@ mod tests {
             empty.render(frame, area, &shell.ctx())
         });
         assert!(text.contains("No notes for this item."), "{text}");
-        assert_eq!(text.lines().last().map(str::trim_end), Some(HINT), "{text}");
+        assert_eq!(keys(&empty).as_deref(), Some(HINT));
 
         let mut none = NotesTab::new();
         none.on_item_change(None);
-        let text = drawn(43, 23, |frame, area| none.render(frame, area, &shell.ctx()));
-        assert!(!text.contains(HINT), "{text}");
+        assert_eq!(keys(&none), None);
 
         let composing = composing(&shell).await;
-        let text = drawn(43, 23, |frame, area| {
-            composing.render(frame, area, &shell.ctx());
-        });
-        assert!(!text.contains(HINT), "{text}");
+        assert_eq!(
+            keys(&composing),
+            Some(compose(&composing).key_hint(Keys::compiled())),
+            "the area's own keys"
+        );
     }
 }

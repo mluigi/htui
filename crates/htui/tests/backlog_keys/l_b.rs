@@ -344,22 +344,18 @@ async fn f1_opens_help_from_the_reject_note_and_the_note_stays() {
     assert_eq!(harness.queued(), 0, "and nothing was sent");
 }
 
-/// The Runs pane's last row: the one above the detail pane's bottom border.
-fn pane_last_row(frame: &str) -> String {
+/// The shell's hint row (MOD-67 M6 T2): the frame's second-to-last row, trailing blanks dropped.
+fn hint_row(frame: &str) -> String {
     let rows: Vec<&str> = frame.lines().collect();
-    let bottom = rows
-        .iter()
-        .rposition(|row| row.starts_with('└'))
-        .unwrap_or_else(|| panic!("the panes have a bottom border:\n{frame}"));
-    let row = rows[bottom - 1];
-    let (_, pane) = row
-        .rsplit_once("││")
-        .unwrap_or_else(|| panic!("the row crosses into the pane: {row:?}"));
-    pane.trim_end_matches('│').trim_end().to_owned()
+    rows[rows.len() - 2].trim_end().to_owned()
 }
 
-/// ANA-26 §8: browsing the Runs pane draws a hint row built from the keys in force, one per
-/// view: the run list, the flow, and an item with no run.
+/// The list's own keys, after a pane's in the shell's hint row when both fit (MOD-67 M6 T2).
+const LIST_KEYS: &str = "j/k move · h/l sub-tab · f filter · N new · e edit";
+
+/// ANA-26 §8: browsing the Runs pane, the shell's hint row (MOD-67 M6 T2) leads with the pane's
+/// keys, built from the keys in force, one per view: the run list, the flow, and an item with no
+/// run; the list's own follow at 100 columns.
 #[tokio::test]
 async fn the_runs_browse_hint_row() {
     let adapter = FakeAdapter::new();
@@ -369,8 +365,8 @@ async fn the_runs_browse_hint_row() {
     let frame = harness.render();
     assert!(frame.contains("▸"), "ANA-1's runs are listed:\n{frame}");
     assert_eq!(
-        pane_last_row(&frame),
-        "J/K step · Enter replay · v flow · ? keys",
+        hint_row(&frame),
+        format!("J/K step · Enter replay · v flow · ? keys · {LIST_KEYS}"),
         "the list's row:\n{frame}"
     );
 
@@ -378,8 +374,8 @@ async fn the_runs_browse_hint_row() {
     harness.drive().await;
     let frame = harness.render();
     assert_eq!(
-        pane_last_row(&frame),
-        "J/K step · +/- zoom · v list · ? keys",
+        hint_row(&frame),
+        format!("J/K step · +/- zoom · v list · ? keys · {LIST_KEYS}"),
         "the flow's row:\n{frame}"
     );
     harness.key("v");
@@ -394,8 +390,8 @@ async fn the_runs_browse_hint_row() {
         "ANA-2 has no run:\n{frame}"
     );
     assert_eq!(
-        pane_last_row(&frame),
-        "R start run · ? keys",
+        hint_row(&frame),
+        format!("R start run · ? keys · {LIST_KEYS}"),
         "an item with no run:\n{frame}"
     );
 }
@@ -485,9 +481,8 @@ async fn a_rebound_next_step_moves_the_cursor_and_j_capital_is_inert() {
         cursor_row(&frame).contains("prd"),
         "the cursor starts on FEAT-1's first step:\n{frame}"
     );
-    assert_eq!(
-        pane_last_row(&frame),
-        "n/K step · Enter replay · v flow · ? keys",
+    assert!(
+        hint_row(&frame).starts_with("n/K step · Enter replay · v flow · ? keys"),
         "the browse row names the rebound key:\n{frame}"
     );
 

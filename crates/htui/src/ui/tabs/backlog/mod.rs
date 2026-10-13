@@ -38,13 +38,14 @@ pub mod list;
 use htui_core::model::{ItemId, ItemKindId, ItemSummary, ProjectId, RunId, Scope, Status, StepId};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 
 use crate::app::{Action, Ctx, Handled, RevealTarget};
 use crate::editor::ExternalEditOutcome;
 use crate::item_writes::{self, ItemDivergence, ItemFormContext, ItemWrite};
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{QUEUE_REQUEST_NAMES, QueueView, QueueWrite, StoreReply, StoreRequest};
+use crate::ui::cells::cell_width;
 use crate::ui::tabs::backlog::detail::{
     BodyTab, DetailRegistry, DocumentsTab, GraphTab, NotesTab, PromptTab, ReqsTab, RunsTab,
 };
@@ -88,6 +89,22 @@ const LIST_HINT: HintSpec = &[
     Hint::One(Act::BacklogNewItem, "new"),
     Hint::One(Act::Edit, "edit"),
 ];
+
+/// What joins the focused pane's keys and [`LIST_HINT`] in the shell's hint row (MOD-67 M6 T2).
+const LIST_SEP: &str = " \u{b7} ";
+
+/// `line`'s spans, each with the line's own style under its own, so two lines join into one row
+/// without either losing its look (MOD-67 M6 T2).
+fn styled_spans(line: Line<'static>) -> Vec<Span<'static>> {
+    let base = line.style;
+    line.spans
+        .into_iter()
+        .map(|span| {
+            let style = base.patch(span.style);
+            span.style(style)
+        })
+        .collect()
+}
 
 /// MOD-12 D9: what `Q` says with the cursor on a project header.
 const NO_ITEM_TO_QUEUE: &str = "select an item to queue";
@@ -184,9 +201,10 @@ impl BacklogTab {
     /// Identity of the Backlog tab.
     pub const ID: TabId = TabId("backlog");
 
-    /// The list hint row's text (MOD-67 M5 Q1 a), read through the active pane's stack; `None`
-    /// while the filter form, the item form or a sub-tab captures, since a hint for keys a field
-    /// is typing would lie, and when no key of [`LIST_HINT`] is bound.
+    /// The list's own keys (MOD-67 M5 Q1 a, the shell's hint row since M6 T2), read through the
+    /// active pane's stack; `None` while the filter form, the item form or a sub-tab captures,
+    /// since a hint for keys a field is typing would lie, and when no key of [`LIST_HINT`] is
+    /// bound.
     fn list_hint(&self, keys: &Keys) -> Option<String> {
         if self.form.is_some() || self.item_form.is_some() || self.detail.captures_input() {
             return None;
@@ -851,9 +869,36 @@ impl Tab for BacklogTab {
         Some(self.detail.key_stack())
     }
 
-    fn key_hint(&self, _width: u16, ctx: &Ctx<'_>) -> Option<Line<'static>> {
-        self.list_hint(ctx.keys())
-            .map(|hint| Line::styled(hint, ctx.theme.dim))
+    /// The keys of what holds the Backlog's keyboard (MOD-67 M6 T2): the divergence view's, the
+    /// item form's or the filter form's while one is open; a capturing pane's alone; browsing,
+    /// the focused pane's [`DetailTab::key_hint`](detail::DetailTab::key_hint), then ` · ` and
+    /// [`LIST_HINT`] when the joined row fits `width`, the pane's alone when not, [`LIST_HINT`]
+    /// alone when the pane has none (Body, Prompt).
+    fn key_hint(&self, width: u16, ctx: &Ctx<'_>) -> Option<Line<'static>> {
+        let (keys, theme) = (ctx.keys(), ctx.theme);
+        let dim = |text: String| (!text.is_empty()).then(|| Line::styled(text, theme.dim));
+        if let Some(form) = &self.item_form {
+            return dim(match form.resolving() {
+                Some(view) => view.hint(keys),
+                None => form.key_hint(keys),
+            });
+        }
+        if let Some(form) = &self.form {
+            return dim(form.key_hint(keys));
+        }
+        let pane = self.detail.key_hint(keys, theme);
+        let list = self.list_hint(keys).and_then(dim);
+        match (pane, list) {
+            (Some(pane), Some(list))
+                if pane.width() + cell_width(LIST_SEP) + list.width() <= usize::from(width) =>
+            {
+                let mut spans = styled_spans(pane);
+                spans.push(Span::styled(LIST_SEP, theme.dim));
+                spans.extend(styled_spans(list));
+                Some(Line::from(spans))
+            }
+            (pane, list) => pane.or(list),
+        }
     }
 
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
@@ -972,7 +1017,7 @@ impl Tab for BacklogTab {
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         // MOD-13 milestone 3 D4: the divergence view takes the whole tab area, list pane included.
         if let Some(view) = self.item_form.as_ref().and_then(ItemForm::resolving) {
-            divergence::render(frame, area, view, ctx.keys(), ctx.theme);
+            divergence::render(frame, area, view, ctx.theme);
             return;
         }
         let [left, right] = panes(area);
@@ -996,16 +1041,13 @@ impl Tab for BacklogTab {
             selected: self.selected,
             filter: summary.as_deref(),
         };
-        let hint = self.list_hint(ctx.keys());
-        list::render(frame, list_area, &view, hint.as_deref(), ctx.theme);
+        list::render(frame, list_area, &view, ctx.theme);
         if let (Some(form), Some(at)) = (&self.form, form_area) {
-            filter::render(frame, at, form, ctx.keys(), ctx.theme);
+            filter::render(frame, at, form, ctx.theme);
         }
         // MOD-13 milestone 2 D8: the open item form takes the detail pane's place.
         match &self.item_form {
-            Some(form) => {
-                ctx.claim_editor_area(item_form::render(frame, right, form, ctx.keys(), ctx.theme))
-            }
+            Some(form) => ctx.claim_editor_area(item_form::render(frame, right, form, ctx.theme)),
             None => detail::render(
                 frame,
                 right,
@@ -2821,7 +2863,6 @@ mod tests {
                     frame,
                     right,
                     tab.item_form.as_ref().expect("open"),
-                    Keys::compiled(),
                     &Theme::default(),
                 ));
             })
@@ -4344,37 +4385,83 @@ mod tests {
     const DEFAULT_LIST_HINT: &str =
         "j/k move \u{b7} h/l sub-tab \u{b7} f filter \u{b7} N new \u{b7} e edit";
 
-    /// The list pane's last inner row in `frame`: the row above its bottom border, borders and
-    /// trailing blanks off.
-    fn list_last_row(frame: &str) -> String {
-        let rows: Vec<&str> = frame.lines().collect();
-        let bottom = rows
-            .iter()
-            .rposition(|row| row.starts_with('\u{2514}'))
-            .unwrap_or_else(|| panic!("the list pane has a bottom border:\n{frame}"));
-        let (list, _) = rows[bottom - 1]
-            .split_once("\u{2502}\u{2502}")
-            .unwrap_or_else(|| panic!("the row crosses into the detail pane:\n{frame}"));
-        list.trim_start_matches('\u{2502}').trim_end().to_owned()
+    /// The Backlog's row of the shell's hint row at `width` cells, as text (MOD-67 M6 T2).
+    fn row_at(tab: &BacklogTab, bench: &Bench, width: u16) -> Option<String> {
+        tab.key_hint(width, &bench.ctx())
+            .map(|line| line.to_string())
     }
 
-    /// Q1 (a), PA-5: the hint names the Backlog's own keys in the list pane's 53 inner cells at
-    /// 100 columns, and is drawn on the pane's last inner row.
+    /// Q1 (a), PA-5, MOD-67 M6 T2: the list keys are the shell's hint row: on the Body pane, which
+    /// has none of its own, the row is the list's alone, and the list pane draws none of it.
     #[tokio::test]
-    async fn the_list_hint_fits_the_list_pane_at_100_columns() {
+    async fn the_list_hint_is_the_hint_row_on_the_body_pane() {
         let bench = Bench::new().await;
         let tab = bench.tab();
         let hint = tab.list_hint(Keys::compiled()).expect("nothing captures");
         assert_eq!(hint, DEFAULT_LIST_HINT);
-        let [list, _] = panes(Rect::new(0, 0, 100, 30));
-        let inner = usize::from(list.width) - 2;
-        assert_eq!(inner, 53, "the list pane's inner width at 100 columns");
-        assert!(
-            crate::ui::cells::cell_width(&hint) <= inner,
-            "{hint:?} fits {inner} cells"
+        assert_eq!(
+            row_at(&tab, &bench, 100).as_deref(),
+            Some(DEFAULT_LIST_HINT)
         );
         let frame = drawn(&tab, &bench);
-        assert_eq!(list_last_row(&frame), hint, "drawn last:\n{frame}");
+        assert!(!frame.contains(DEFAULT_LIST_HINT), "{frame}");
+    }
+
+    /// MOD-67 M6 T2: browsing a pane with keys of its own, the pane's lead and the list's follow
+    /// after ` · ` when both fit the row; when they do not, the pane's stand alone.
+    #[tokio::test]
+    async fn the_pane_hint_leads_and_the_list_keys_follow_when_they_fit() {
+        let bench = Bench::new().await;
+        let Selection::Item(item) = bench.first else {
+            panic!("the first row is an item")
+        };
+        let mut tab = bench.tab();
+        tab.detail.on_item_change(Some(item));
+        assert!(tab.detail.select_id(RunsTab::ID));
+        let pane = tab
+            .detail
+            .key_hint(Keys::compiled(), &Theme::default())
+            .expect("the Runs pane has keys")
+            .to_string();
+        let joined = format!("{pane} \u{b7} {DEFAULT_LIST_HINT}");
+        let fits = u16::try_from(cell_width(&joined)).expect("a narrow row");
+        assert!(fits <= 100, "{joined:?} fits 100 columns");
+        assert_eq!(row_at(&tab, &bench, 100).as_deref(), Some(joined.as_str()));
+        assert_eq!(row_at(&tab, &bench, fits).as_deref(), Some(joined.as_str()));
+        assert_eq!(
+            row_at(&tab, &bench, fits - 1).as_deref(),
+            Some(pane.as_str())
+        );
+        assert_eq!(row_at(&tab, &bench, 30).as_deref(), Some(pane.as_str()));
+    }
+
+    /// MOD-67 M6 T2: a capturing pane's own keys stand alone (the list's do not apply while it
+    /// takes every key), and an open form's are the row.
+    #[tokio::test]
+    async fn a_capturing_pane_shows_only_its_own_keys() {
+        let bench = Bench::new().await;
+        let Selection::Item(item) = bench.first else {
+            panic!("the first row is an item")
+        };
+        let mut tab = bench.tab();
+        tab.detail.on_item_change(Some(item));
+        assert!(tab.detail.select_id(NotesTab::ID));
+        press(&mut tab, &bench, KeyCode::Char('a'));
+        tab.on_reply(&StoreReply::NoteForm { item }, &mut bench.ctx());
+        assert!(tab.detail.captures_input(), "the note area is open");
+        let pane = tab
+            .detail
+            .key_hint(Keys::compiled(), &Theme::default())
+            .expect("the area has keys")
+            .to_string();
+        assert_eq!(row_at(&tab, &bench, 100), Some(pane.clone()));
+        assert!(!pane.contains(DEFAULT_LIST_HINT), "{pane}");
+
+        let mut tab = bench.tab();
+        let form = FilterForm::open(&tab.filter, &bench.projects);
+        let keys = form.key_hint(Keys::compiled());
+        tab.form = Some(form);
+        assert_eq!(row_at(&tab, &bench, 100), Some(keys), "the filter form's");
     }
 
     /// Q1 (a): a hint for keys a field is typing would lie, so the row is not drawn while the

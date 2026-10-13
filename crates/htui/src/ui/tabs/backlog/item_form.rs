@@ -1026,18 +1026,26 @@ pub(super) const fn marker(focused: bool) -> &'static str {
     if focused { "> " } else { "  " }
 }
 
+impl ItemForm {
+    /// The focused field's keys for the shell's hint row (MOD-67 M5 D9, M6 T2), through
+    /// [`views::ITEM_FORM`]: the pickers', the one-line fields' or the text areas'.
+    #[must_use]
+    pub fn key_hint(&self, keys: &Keys) -> String {
+        let spec = match self.focus {
+            Field::Project | Field::Kind | Field::Graph => HINT_PICK,
+            Field::Title | Field::Priority | Field::Tags => HINT_TEXT,
+            Field::Paths | Field::Body => HINT_AREA,
+        };
+        keys.hint(views::ITEM_FORM, spec)
+    }
+}
+
 /// Draws the form into the detail pane's `area` (D8).
 ///
 /// Returns the rect the pane claims for an in-pane editor (MOD-57 P2): the field handed to
 /// `$EDITOR`, else the focused one when it is Paths, else the body. The paths rect is
 /// `PATHS_HEIGHT` rows, under `MIN_PANE`, so a Paths edit gets the whole tab body (R0 F1).
-pub fn render(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    form: &ItemForm,
-    keys: &Keys,
-    theme: &Theme,
-) -> Rect {
+pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme) -> Rect {
     let title = match &form.context.item {
         Some(item) => format!(" Edit {} (v{}) ", item.key, item.version),
         None => format!(" New item \u{b7} {} ", form.slug(form.context.project)),
@@ -1061,11 +1069,11 @@ pub fn render(
         .as_deref()
         .map(|sentence| wrapped(sentence, usize::from(inner.width)))
         .unwrap_or_default();
-    // Every row but the body and the notice: the one-line rows, the paths and their label, the
-    // body label and the hint.
+    // Every row but the body and the notice: the one-line rows, the paths and their label, and
+    // the body label (the keys are the shell's hint row since MOD-67 M6 T2).
     let fixed = u16::try_from(rows.len())
         .unwrap_or(u16::MAX)
-        .saturating_add(PATHS_HEIGHT + 3);
+        .saturating_add(PATHS_HEIGHT + 2);
     // The notice grows into the body's rows when it has to (a small terminal), and a notice
     // longer than all of them loses its first rows: the D11 hedge ends the sentence, and it is
     // what stops a second Ctrl+S from minting a duplicate.
@@ -1083,7 +1091,6 @@ pub fn render(
         Constraint::Length(1),
         Constraint::Min(body_min),
         Constraint::Length(notice_height),
-        Constraint::Length(1),
     ]);
     let areas = Layout::vertical(constraints).split(inner);
     let width = inner.width;
@@ -1091,8 +1098,8 @@ pub fn render(
         frame.render_widget(Paragraph::new(form.row_line(*field, width, theme)), *at);
     }
     let rest = &areas[rows.len()..];
-    let [paths_label, paths, body_label, body, notice, hint] =
-        [rest[0], rest[1], rest[2], rest[3], rest[4], rest[5]];
+    let [paths_label, paths, body_label, body, notice] =
+        [rest[0], rest[1], rest[2], rest[3], rest[4]];
     let label = |field: Field, text: &str| {
         let focused = form.focus == field;
         let style = if focused { theme.title } else { theme.dim };
@@ -1130,19 +1137,6 @@ pub fn render(
                 .collect::<Vec<_>>(),
         ),
         notice,
-    );
-    let spec = match form.focus {
-        Field::Project | Field::Kind | Field::Graph => HINT_PICK,
-        Field::Title | Field::Priority | Field::Tags => HINT_TEXT,
-        Field::Paths | Field::Body => HINT_AREA,
-    };
-    let text = keys.hint(views::ITEM_FORM, spec);
-    frame.render_widget(
-        Paragraph::new(Line::styled(
-            cells::clip(&text, usize::from(width)),
-            theme.dim,
-        )),
-        hint,
     );
     match form.external.unwrap_or(form.focus) {
         Field::Paths => paths,
@@ -1536,10 +1530,10 @@ mod tests {
             assert_eq!(form.busy(), Some(Busy::Minting), "{field:?}");
         }
         let form = new_form().await;
-        let text = drawn_with(&form, &keys).join("\n");
+        let hint = form.key_hint(&keys);
         assert!(
-            text.contains("Tab field \u{b7} F2 save \u{b7} Esc cancel"),
-            "{text}"
+            hint.contains("Tab field \u{b7} F2 save \u{b7} Esc cancel"),
+            "{hint}"
         );
     }
 
@@ -1715,18 +1709,8 @@ mod tests {
         drawn_at(form, DEFAULT_SIZE)
     }
 
-    /// [`drawn`] under `keys`.
-    fn drawn_with(form: &ItemForm, keys: &Keys) -> Vec<String> {
-        drawn_under(form, DEFAULT_SIZE, keys)
-    }
-
     /// The form drawn into the detail pane of a `(width, height)` terminal, one string per row.
-    fn drawn_at(form: &ItemForm, size: (u16, u16)) -> Vec<String> {
-        drawn_under(form, size, Keys::compiled())
-    }
-
-    /// [`drawn_at`] under `keys`.
-    fn drawn_under(form: &ItemForm, (width, height): (u16, u16), keys: &Keys) -> Vec<String> {
+    fn drawn_at(form: &ItemForm, (width, height): (u16, u16)) -> Vec<String> {
         let [_, right] = panes(chrome(Rect::new(0, 0, width, height)).body);
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
             right.width,
@@ -1735,7 +1719,7 @@ mod tests {
         .expect("a test terminal");
         terminal
             .draw(|frame| {
-                render(frame, frame.area(), form, keys, &Theme::default());
+                render(frame, frame.area(), form, &Theme::default());
             })
             .expect("the frame draws");
         let buffer = terminal.backend().buffer();
@@ -1765,13 +1749,7 @@ mod tests {
         let mut body = None;
         terminal
             .draw(|frame| {
-                body = Some(render(
-                    frame,
-                    frame.area(),
-                    &form,
-                    Keys::compiled(),
-                    &Theme::default(),
-                ));
+                body = Some(render(frame, frame.area(), &form, &Theme::default()));
             })
             .expect("the frame draws");
         let body = body.expect("the frame drew");
@@ -1788,8 +1766,9 @@ mod tests {
             "{:?}",
             row(body.y - 1)
         );
-        // The notice's two rows, the hint and the frame's bottom border are below it.
-        assert_eq!(body.bottom() + NOTICE_HEIGHT + 2, right.height, "{body:?}");
+        // The notice's two rows and the frame's bottom border are below it (the keys are the
+        // shell's hint row since MOD-67 M6 T2).
+        assert_eq!(body.bottom() + NOTICE_HEIGHT + 1, right.height, "{body:?}");
     }
 
     /// MOD-57 R0 F1: with Paths focused or handed to `$EDITOR`, `render` returns the paths rect,
@@ -1810,13 +1789,7 @@ mod tests {
             let mut rect = None;
             terminal
                 .draw(|frame| {
-                    rect = Some(render(
-                        frame,
-                        frame.area(),
-                        form,
-                        Keys::compiled(),
-                        &Theme::default(),
-                    ));
+                    rect = Some(render(frame, frame.area(), form, &Theme::default()));
                 })
                 .expect("the frame draws");
             let rect = rect.expect("the frame drew");
@@ -1843,7 +1816,7 @@ mod tests {
 
     /// Every state shows as characters, because the snapshots are text (blueprint §4 render).
     #[tokio::test]
-    async fn the_new_form_draws_its_rows_and_the_hint() {
+    async fn the_new_form_draws_its_rows_and_names_its_keys() {
         let mut form = new_form().await;
         type_text(&mut form, "Fresh item");
         let text = drawn(&form).join("\n");
@@ -1854,10 +1827,12 @@ mod tests {
             "\u{2039}ANA ",
             "\u{2039}kind default\u{203a}",
             "paths (one per line)",
-            &rendered(HINT_TEXT),
         ] {
             assert!(text.contains(wanted), "{wanted:?} in\n{text}");
         }
+        // MOD-67 M6 T2: the keys are the shell's hint row, not the form's.
+        assert!(!text.contains(&rendered(HINT_TEXT)), "{text}");
+        assert_eq!(form.key_hint(Keys::compiled()), rendered(HINT_TEXT));
     }
 
     /// D11: a Postgres `Unreachable` message runs past two rows, and the hedge after it still
@@ -1877,7 +1852,6 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(flowed.contains(&hedge), "{hedge:?} in\n{}", rows.join("\n"));
-        assert!(flowed.contains(&rendered(HINT_TEXT)), "{}", rows.join("\n"));
     }
 
     /// MOD-67 M6 D4: the mint hedge names the save key in force, and says to look first unbound.
@@ -2702,13 +2676,12 @@ mod tests {
         let mut form = new_form().await;
         for field in [Field::Body, Field::Paths] {
             focus_on(&mut form, field);
-            let text = drawn(&form).join("\n");
-            assert!(text.contains(&rendered(HINT_AREA)), "{field:?} in\n{text}");
-            assert!(!text.contains("Tab field"), "{field:?} in\n{text}");
+            let hint = form.key_hint(Keys::compiled());
+            assert_eq!(hint, rendered(HINT_AREA), "{field:?}");
+            assert!(!hint.contains("Tab field"), "{field:?}: {hint}");
         }
         focus_on(&mut form, Field::Title);
-        let text = drawn(&form).join("\n");
-        assert!(text.contains(&rendered(HINT_TEXT)), "{text}");
+        assert_eq!(form.key_hint(Keys::compiled()), rendered(HINT_TEXT));
     }
 
     #[tokio::test]

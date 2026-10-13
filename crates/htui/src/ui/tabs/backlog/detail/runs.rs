@@ -977,19 +977,18 @@ fn artifact_rows(doc: &Document, width: u16) -> Vec<(bool, String)> {
 }
 
 /// Draws the artifact view (D173): the document read-only over the pane, `Esc` to leave. Its
-/// hint renders through [`views::RUNS_ARTIFACT`] (MOD-67 M5).
+/// keys ([`ARTIFACT_HINT`] through [`views::RUNS_ARTIFACT`], MOD-67 M5) are the shell's hint row
+/// since M6 T2, so the document has the whole pane.
 ///
 /// Records the width it wrapped at in `width`, which is what the next scroll key clamps against.
 fn render_artifact(
     frame: &mut Frame<'_>,
-    area: Rect,
+    body: Rect,
     doc: Option<&Document>,
     scroll: Scroll,
     width: &Cell<u16>,
-    keys: &Keys,
     theme: &Theme,
 ) {
-    let [body, hint] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
     let Some(doc) = doc else {
         message(frame, body, "Opening the document\u{2026}", theme);
         return;
@@ -1005,13 +1004,6 @@ fn render_artifact(
     frame.render_widget(
         Paragraph::new(lines).scroll((scroll.offset().min(last), 0)),
         body,
-    );
-    frame.render_widget(
-        Paragraph::new(Line::styled(
-            keys.hint(views::RUNS_ARTIFACT, ARTIFACT_HINT),
-            theme.dim,
-        )),
-        hint,
     );
 }
 
@@ -1929,6 +1921,14 @@ impl DetailTab for RunsTab {
         }
     }
 
+    /// The mode's keys (MOD-67 M6 T2): [`hint_spec`](Self::hint_spec) through the mode's stack;
+    /// nothing with no item selected.
+    fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
+        self.item?;
+        let hint = keys.hint(self.stack(), self.hint_spec());
+        (!hint.is_empty()).then(|| Line::styled(hint, theme.dim))
+    }
+
     /// The footer a modal asks in is drawn whatever the list holds, so the close-out of an item
     /// with no run is on screen too: `C` needs no run (`close_out_enabled`).
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
@@ -1942,19 +1942,11 @@ impl DetailTab for RunsTab {
             doc, scroll, width, ..
         } = &self.mode
         {
-            render_artifact(
-                frame,
-                area,
-                doc.as_deref(),
-                *scroll,
-                width,
-                ctx.keys(),
-                ctx.theme,
-            );
+            render_artifact(frame, area, doc.as_deref(), *scroll, width, ctx.theme);
             return;
         }
 
-        let footer = self.footer(area.width, ctx.keys(), ctx.theme);
+        let footer = self.footer(area.width, ctx.theme);
         let height = footer
             .iter()
             .map(|line| line.width().max(1).div_ceil(usize::from(area.width.max(1))))
@@ -2084,57 +2076,59 @@ impl RunsTab {
         (lines, cursor_end)
     }
 
-    /// What a capturing mode asks, drawn under the run list, and while browsing the browse row
-    /// (ANA-26 §8: the list's, the flow's, or an item with no run's). Every hint renders its spec
-    /// through the mode's stack (MOD-67 M5), so a rebound key shows its own chord. The document
-    /// view draws its own hint (`render_artifact`).
-    fn footer(&self, width: u16, keys: &Keys, theme: &Theme) -> Vec<Line<'static>> {
-        let spec = |spec: HintSpec| Line::styled(keys.hint(self.stack(), spec), theme.dim);
+    /// What a capturing mode asks, drawn under the run list: its question and its field. The
+    /// keys that ended it, and the browse row (ANA-26 §8), are the shell's hint row since MOD-67
+    /// M6 T2 ([`hint_spec`](Self::hint_spec)).
+    fn footer(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
         match &self.mode {
-            Mode::Browse if self.runs.is_empty() => vec![spec(RUNS_EMPTY_HINT)],
-            Mode::Browse => match self.view {
-                View::List => vec![spec(RUNS_LIST_HINT)],
-                View::Flow => vec![spec(RUNS_FLOW_HINT)],
-            },
-            Mode::Artifact { .. } => Vec::new(),
+            Mode::Browse
+            | Mode::Artifact { .. }
+            | Mode::CloseOut(CloseOutStage::Counting | CloseOutStage::InFlight) => Vec::new(),
             Mode::RejectNote { field, .. } => vec![
                 Line::styled("reject with a note:", theme.title),
                 field.line(width, true, theme),
-                spec(REJECT_HINT),
             ],
             Mode::FollowUp { field, .. } => vec![
                 Line::styled("follow-up for the running step:", theme.title),
                 field.line(width, true, theme),
-                spec(FOLLOW_UP_HINT),
             ],
-            Mode::ConfirmCancel { .. } => vec![
-                Line::styled("cancel this run?", theme.title),
-                spec(CONFIRM_CANCEL_HINT),
-            ],
-            Mode::CloseOut(CloseOutStage::Counting) => vec![spec(COUNTING_HINT)],
-            Mode::CloseOut(CloseOutStage::Warn(preview)) => vec![
-                Line::styled(
-                    format!(
-                        "close {} as {} · {} runs · {} commit rows · summary v{}",
-                        preview.key,
-                        preview.resolution,
-                        preview.runs,
-                        preview.rows,
-                        preview.version
-                    ),
-                    theme.title,
+            Mode::ConfirmCancel { .. } => vec![Line::styled("cancel this run?", theme.title)],
+            Mode::CloseOut(CloseOutStage::Warn(preview)) => vec![Line::styled(
+                format!(
+                    "close {} as {} · {} runs · {} commit rows · summary v{}",
+                    preview.key, preview.resolution, preview.runs, preview.rows, preview.version
                 ),
-                spec(WARN_HINT),
-            ],
+                theme.title,
+            )],
             Mode::CloseOut(CloseOutStage::Typed { preview, field }) => {
                 let prompt = format!("type {} to close it: ", preview.key);
                 let room =
                     width.saturating_sub(u16::try_from(cell_width(&prompt)).unwrap_or(u16::MAX));
                 let mut line = Line::from(Span::styled(prompt, theme.title));
                 line.spans.extend(field.line(room, true, theme).spans);
-                vec![line, spec(TYPED_HINT)]
+                vec![line]
             }
-            Mode::CloseOut(CloseOutStage::InFlight) => vec![spec(IN_FLIGHT_HINT)],
+        }
+    }
+
+    /// The current mode's keys (ANA-26 §8, MOD-67 M5): browsing, the list's, the flow's, or an
+    /// item with no run's; a question's or a field's; the document view's. Rendered through
+    /// [`stack`](Self::stack), so a rebound key shows its own chord.
+    fn hint_spec(&self) -> HintSpec {
+        match &self.mode {
+            Mode::Browse if self.runs.is_empty() => RUNS_EMPTY_HINT,
+            Mode::Browse => match self.view {
+                View::List => RUNS_LIST_HINT,
+                View::Flow => RUNS_FLOW_HINT,
+            },
+            Mode::Artifact { .. } => ARTIFACT_HINT,
+            Mode::RejectNote { .. } => REJECT_HINT,
+            Mode::FollowUp { .. } => FOLLOW_UP_HINT,
+            Mode::ConfirmCancel { .. } => CONFIRM_CANCEL_HINT,
+            Mode::CloseOut(CloseOutStage::Counting) => COUNTING_HINT,
+            Mode::CloseOut(CloseOutStage::Warn(_)) => WARN_HINT,
+            Mode::CloseOut(CloseOutStage::Typed { .. }) => TYPED_HINT,
+            Mode::CloseOut(CloseOutStage::InFlight) => IN_FLIGHT_HINT,
         }
     }
 }
@@ -2522,8 +2516,9 @@ mod tests {
         );
         assert_eq!(
             lines.iter().filter(|line| !line.is_empty()).count(),
-            2 + 2 + 4 * 2 + 1,
-            "the header, the run, four two-line steps and the browse row (ANA-26 §8)"
+            2 + 2 + 4 * 2,
+            "the header, the run and four two-line steps (ANA-26 §8's browse row is the shell's \
+             hint row since MOD-67 M6 T2)"
         );
     }
 
@@ -2556,8 +2551,8 @@ mod tests {
         );
         assert_eq!(
             lines.iter().filter(|line| !line.is_empty()).count(),
-            2 + 2 + 4 * 2 + 1 + 1,
-            "only the parked step with a note grew (the last `+ 1` is the browse row)"
+            2 + 2 + 4 * 2 + 1,
+            "only the parked step with a note grew"
         );
     }
 
@@ -2685,9 +2680,8 @@ mod tests {
         assert_eq!(lines[at + 4], "        handoff prompt only");
         assert_eq!(
             lines.iter().filter(|line| !line.is_empty()).count(),
-            2 + 2 + 4 * 2 + 1 + 2 + 1,
-            "only the parked step grew: its reason and its two opening lines; `resumed` adds none \
-             (the last `+ 1` is the browse row)"
+            2 + 2 + 4 * 2 + 1 + 2,
+            "only the parked step grew: its reason and its two opening lines; `resumed` adds none"
         );
 
         // A step that is done still says how its chat opened. Seventeen lines are more than the
@@ -3613,10 +3607,13 @@ mod tests {
         }
     }
 
-    /// The footer the pane draws under its list, as text.
+    /// The footer the pane draws under its list, then its keys (the shell's hint row since
+    /// MOD-67 M6 T2), as text: what the pane's last rows read before M6.
     fn footer(pane: &RunsTab) -> Vec<String> {
-        pane.footer(43, Keys::compiled(), &Theme::default())
+        let theme = Theme::default();
+        pane.footer(43, &theme)
             .iter()
+            .chain(pane.key_hint(Keys::compiled(), &theme).as_ref())
             .map(|line| text(line).trim_end().to_owned())
             .collect()
     }
@@ -5360,11 +5357,12 @@ mod tests {
         assert!(pane.captures_input(), "the close-out is open");
         let drawn = lines(&pane, &shell);
         assert_eq!(drawn[0], "No runs for this item.", "{drawn:#?}");
-        assert!(
-            drawn
-                .iter()
-                .any(|line| line == "counting what the close-out writes\u{2026}"),
-            "the counting stage is on screen: {drawn:#?}"
+        assert_eq!(
+            pane.key_hint(Keys::compiled(), &Theme::default())
+                .map(|line| line.to_string())
+                .as_deref(),
+            Some("counting what the close-out writes\u{2026}"),
+            "the counting stage is on the shell's hint row: {drawn:#?}"
         );
 
         pane.on_reply(
@@ -5832,8 +5830,8 @@ mod tests {
         );
         assert_eq!(
             drawn.iter().filter(|line| !line.is_empty()).count(),
-            2 + 2 + 4 * 2 + 2 + 1,
-            "the header, the run, four two-line steps, the request's two and the browse row"
+            2 + 2 + 4 * 2 + 2,
+            "the header, the run, four two-line steps and the request's two"
         );
     }
 
@@ -6296,8 +6294,8 @@ mod tests {
         );
         assert_eq!(
             drawn.iter().filter(|line| !line.is_empty()).count(),
-            2 + 2 + 4 * 2 + 1 + 1,
-            "only the step with the follow-up grew (the last `+ 1` is the browse row): {drawn:#?}"
+            2 + 2 + 4 * 2 + 1,
+            "only the step with the follow-up grew: {drawn:#?}"
         );
 
         pane.on_reply(
