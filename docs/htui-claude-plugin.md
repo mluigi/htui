@@ -231,8 +231,11 @@ answers `htui: the pane waits: <reason>`.
 
 ### The commands
 
-The commands are turnless: each answers at once, as the command's output in the transcript, and
-sends nothing to the model.
+The commands are turnless: each costs no model turn. Typed while Claude is idle, a command answers
+at once; typed during a turn, it runs when that turn ends. The answer is the command's output row
+in the transcript, and like any command's output the model reads that row on its next turn, so the
+item keys, reasons, permission text and search snippets a command prints reach the model then.
+`/htui` prints no row when it opens the pane.
 
 | Command | Prints |
 |---|---|
@@ -324,8 +327,9 @@ decides what to write:
 - **No model calls.** The mod makes none, and nothing it shows is decided by a model.
 - **Reach limited to running `htui`.** The mod runs processes (`$.process.run`, only `htui`),
   keeps a timer, reads one environment variable (`HTUI_SESSION`), registers `/htui`, keeps its own
-  state and draws its band and pane. It makes no network call, writes no file, and sends nothing
-  into the session. `claude plugin validate --strict <dir>/htui` lists what it calls:
+  state and draws its band and pane. It makes no network call, writes no file, and never
+  submits a prompt or starts a turn; its only transcript rows are the `/htui` answers above.
+  `claude plugin validate --strict <dir>/htui` lists what it calls:
 
   ```
   ./register.tsx calls: $.clock.every, $.clock.now, $.command.register, $.env.get, $.process.run, $.state.get, $.state.set, $.ui.open, $.ui.panes, $.ui.resolve
