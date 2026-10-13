@@ -72,8 +72,8 @@ Constraints that hold across both milestones (from ANA-29 §6.3 and §6.4):
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Emit + skill | `htui claude emit [--dir PATH] [--force]` writes a directory marketplace holding plugin `htui` (the binary's version) with skill `htui`, and prints the `marketplace add` / `install` commands. A `claude` session with it installed knows how to read htui state with MOD-92's commands and when to hand work to htui | in-progress | `.claude/plans/mod-93-htui-claude-plugin.plan.md` |
-| 2 | Mod | The plugin also carries the `htui` mod: an `AbovePrompt` band with the waiting-on-you count from `htui waiting --json` on a `$.clock.every` timer, a `/htui` pane listing the rows, turnless `/htui status` / `waiting` / `search <q>`, a version-skew line, and stand-down on `HTUI_SESSION`. `userConfig`: `panel` (`auto\|command\|off`), `poll_seconds` (default 30). `emit` leaves out the mod, and says so, when `claude --version` is below 2.1.287. The gate runs `validate --strict` and `plugin test` | in-progress | `.claude/plans/mod-93-htui-claude-plugin.plan.md` |
+| 1 | Emit + skill | `htui claude emit [--dir PATH] [--force]` writes a directory marketplace holding plugin `htui` (the binary's version) with skill `htui`, and prints the `marketplace add` / `install` commands. A `claude` session with it installed knows how to read htui state with MOD-92's commands and when to hand work to htui | complete | `.claude/plans/mod-93-htui-claude-plugin.plan.md` |
+| 2 | Mod | The plugin also carries the `htui` mod: an `AbovePrompt` band with the waiting-on-you count from `htui waiting --json` on a `$.clock.every` timer, a `/htui` pane listing the rows, turnless `/htui status` / `waiting` / `search <q>`, a version-skew line, and stand-down on `HTUI_SESSION`. `userConfig`: `panel` (`auto\|command\|off`), `poll_seconds` (default 30). `emit` leaves out the mod, and says so, when `claude --version` is below 2.1.287. The gate runs `validate --strict` and `plugin test` | complete | `.claude/plans/mod-93-htui-claude-plugin.plan.md` |
 
 ## Decisions taken at framing (maintainer, 2026-10-13)
 - **Surface**: the `AbovePrompt` band, not a status line. `panel` controls the band and pane
@@ -108,4 +108,4 @@ Constraints that hold across both milestones (from ANA-29 §6.3 and §6.4):
 | `emit --force` deletes user content under a custom `--dir` | Low | Medium | Open question above; the plan decides the safe shape |
 
 ---
-*Status: DRAFT — requirements only. Implementation planning pending via /plan.*
+*Status: COMPLETE — both milestones shipped (`docs/decisions/mod/mod-93.md`).*
