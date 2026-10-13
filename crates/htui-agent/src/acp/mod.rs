@@ -33,8 +33,8 @@ use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, EnvVariable, InitializeRequest, LoadSessionRequest,
     McpServer, McpServerStdio, Meta, NewSessionRequest, ReadTextFileResponse,
     RequestPermissionOutcome, RequestPermissionResponse, ResumeSessionRequest,
-    SelectedPermissionOutcome, SessionConfigOptionValue, SetSessionConfigOptionRequest,
-    WriteTextFileResponse,
+    SelectedPermissionOutcome, SessionConfigOptionValue, SessionModeId, SessionModeState,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, Dispatch, RestoredSession, SessionMessage,
@@ -1920,6 +1920,18 @@ async fn restore_session(
     }
 }
 
+/// MOD-96 D4: what pinning `wanted` takes. Red-phase stub.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "MOD-96 T3 red phase: the stub is wired in by the green commit")
+)]
+fn mode_to_set(
+    _modes: Option<&SessionModeState>,
+    _wanted: &str,
+) -> std::result::Result<Option<SessionModeId>, String> {
+    Ok(None)
+}
+
 /// Discards every update already queued on `session`, without waiting: the history a
 /// `session/load` replays ahead of its response, or whatever an agent sent ahead of its
 /// `session/resume` answer (SDK `concepts/sessions.rs:86-88`; the handler
@@ -2021,10 +2033,12 @@ fn model_values(
 
 #[cfg(test)]
 mod tests {
-    use agent_client_protocol::schema::v1::AgentCapabilities;
+    use agent_client_protocol::schema::v1::{
+        AgentCapabilities, SessionMode, SessionModeId, SessionModeState,
+    };
     use serde_json::json;
 
-    use super::{Restore, restore_route};
+    use super::{Restore, mode_to_set, restore_route};
     use crate::launch::SessionSettings;
 
     fn caps(document: serde_json::Value) -> AgentCapabilities {
@@ -2050,6 +2064,47 @@ mod tests {
         assert!(
             why.contains("sessionCapabilities.resume") && why.contains("loadSession"),
             "{why}"
+        );
+    }
+
+    /// MOD-96 D4: a mode already current sends nothing, an offered one is set, and an agent that
+    /// reports no modes, or none with the pinned id, is refused, naming what it does offer.
+    #[test]
+    fn mode_to_set_skips_sends_and_refuses() {
+        let offered = || {
+            vec![
+                SessionMode::new("default", "Default"),
+                SessionMode::new("acceptEdits", "Accept Edits"),
+            ]
+        };
+        let current = SessionModeState::new("default", offered());
+        let elsewhere = SessionModeState::new("acceptEdits", offered());
+        let without = SessionModeState::new(
+            "acceptEdits",
+            vec![
+                SessionMode::new("acceptEdits", "Accept Edits"),
+                SessionMode::new("plan", "Plan"),
+            ],
+        );
+
+        assert_eq!(mode_to_set(Some(&current), "default"), Ok(None));
+        assert_eq!(
+            mode_to_set(Some(&elsewhere), "default"),
+            Ok(Some(SessionModeId::new("default")))
+        );
+
+        let none = mode_to_set(None, "default").expect_err("no modes is refused");
+        assert!(
+            none.contains("`default`") && none.contains("no session modes"),
+            "{none}"
+        );
+
+        let missing = mode_to_set(Some(&without), "default").expect_err("an absent mode is refused");
+        assert!(
+            missing.contains("`default`")
+                && missing.contains("acceptEdits")
+                && missing.contains("plan"),
+            "{missing}"
         );
     }
 }

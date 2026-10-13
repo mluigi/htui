@@ -215,6 +215,9 @@ async fn scripted_agent(stream: tokio::io::DuplexStream, script: Script, session
                 )
                 .await;
             }
+            // MOD-96 D4: the session reports its modes, `default` current, so a row that pins
+            // `settings.acp.permission_mode: "default"` (the seeded `claude` row) opens with no
+            // `session/set_mode`, and one that pins nothing is unaffected.
             "session/new" => {
                 send(
                     &mut writer,
@@ -224,6 +227,10 @@ async fn scripted_agent(stream: tokio::io::DuplexStream, script: Script, session
                         "result": {
                             "sessionId": session_id,
                             "configOptions": [ model_option() ],
+                            "modes": {
+                                "currentModeId": "default",
+                                "availableModes": [ { "id": "default", "name": "Default" } ],
+                            },
                         },
                     }),
                 )

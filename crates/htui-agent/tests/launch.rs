@@ -392,6 +392,31 @@ fn user_extensions_is_read_from_the_settings_document() {
     assert!(reparsed.user_extensions, "the round trip keeps the opt-in");
 }
 
+/// MOD-96 D4: `acp.permission_mode` is the session mode an ACP row pins. Absent is `None`, and a
+/// `None` is not written back (so a pre-MOD-96 row re-serialises unchanged); a value is read as
+/// written and kept by a serialise → parse round trip.
+#[test]
+fn acp_permission_mode_is_read_and_round_trips() {
+    let absent: AgentSettings = serde_json::from_str("{}").expect("`{}` is a valid settings row");
+    assert_eq!(absent.acp.permission_mode, None);
+    let written = serde_json::to_value(&absent.acp).expect("acp settings serialise");
+    assert!(
+        written.get("permission_mode").is_none(),
+        "a `None` mode is not written: {written}"
+    );
+
+    let settings: AgentSettings =
+        serde_json::from_str(r#"{ "acp": { "permission_mode": "default" } }"#)
+            .expect("a pinned row parses");
+    assert_eq!(settings.acp.permission_mode.as_deref(), Some("default"));
+
+    let reparsed: AgentSettings =
+        serde_json::from_str(&serde_json::to_string(&settings).expect("settings serialise"))
+            .expect("serialised settings parse");
+    assert_eq!(reparsed, settings);
+    assert_eq!(reparsed.acp.permission_mode.as_deref(), Some("default"));
+}
+
 #[test]
 fn resolve_substitutes_command_args_and_env() {
     let launch: AgentLaunch = serde_json::from_str(CLAUDE_LAUNCH).expect("claude launch parses");
