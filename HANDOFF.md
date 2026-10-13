@@ -14,7 +14,9 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-13):** **MOD-91 is done** (`docs/decisions/mod/mod-91.md`): every Claude Code
+**Current status (2026-10-13):** **TOOL-11 is done** (`docs/decisions/tool/tool-11.md`): `scripts/hr up --headroom`
+makes a sandbox run's Claude go through the run's own headroom proxy (started by `attach`, readiness-checked, falls
+back to a direct session; default off). Owed on the host: a real `up --headroom` run. Before it, **MOD-91 is done** (`docs/decisions/mod/mod-91.md`): every Claude Code
 session htui drives (`claude-cli` argv, ACP `_meta` on new/resume/load) runs with
 `disableAllHooks` and `--disable-slash-commands`, so the user's and the repo's mods, settings hooks and skills
 stay out; a per-row `mods (y/n)` in Settings > Agents opts back in, `HTUI_SESSION=1` marks the session, and an
@@ -23,10 +25,7 @@ permission mode still pre-approve). Beside it, **MOD-92 is done** (`docs/decisio
 `htui waiting` and `htui --search-items … --json` print one versioned JSON document each (schema and exit codes in
 `docs/htui-cli.md`) over a read-only Postgres session; an unreachable store answers `"store":"offline"` and exit 3,
 never cached data. With both done, MOD-93 is unblocked. Filed **MOD-95** for an `auto_queue` test that fails
-on `main` too. Owed on the host: the Postgres gate on the merged tree. Before them, **MOD-57 is done**
-(`docs/decisions/mod/mod-57.md`): with `HTUI_EDITOR_PANE=1`, `E`/`Ctrl+E` run `$VISUAL`/`$EDITOR` inside the
-asking pane while every other tab keeps working; owed on the host: an nvim run in the pane and the PRD's 10-edit
-trial. Before that, **ANA-29 was concluded** (`docs/ANA-29.md`, `docs/decisions/ana/ana-29.md`): Claude Code mods
+on `main` too. Owed on the host: the Postgres gate on the merged tree. Before them, **ANA-29 was concluded** (`docs/ANA-29.md`, `docs/decisions/ana/ana-29.md`): Claude Code mods
 for developing htui and for using it elsewhere - MOD-91 (done) isolates htui-driven sessions first; dev side
 **TOOL-8**/**TOOL-9**/**TOOL-10** and **CLEAN-12**; consumer side MOD-92 (done), then **MOD-93**, with **MOD-94**
 behind a maintainer decision.
@@ -575,17 +574,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   `~/.claude/plugins` (except `plugins/data` and `plugins/store`) and `~/.claude/skills`
   read-only, or masked, in runs; check that plugin auto-update and `$.store` degrade quietly; and
   extend the `docs/hr-sandbox.md` table. Not blocked.
-- [ ] **TOOL-11 - hr sandbox: optional host headroom.** `scripts/hr up` gains an opt-in/opt-out
-  switch (a flag such as `--headroom` / `--no-headroom`, default off) that points a run's Claude at
-  the host's headroom ([headroomlabs-ai/headroom](https://github.com/headroomlabs-ai/headroom),
-  installed on the host through `uv`). A sandbox already mounts `~/.headroom`,
-  `~/.local/share/uv/tools` and `~/.local/bin` (`docs/hr-sandbox.md`, mounts table), so the plan
-  must decide first whether a run (a) uses the host's running headroom proxy over the network (a
-  compose env or `extra_hosts` entry so the container reaches the host port, with
-  `ANTHROPIC_BASE_URL` set in the run), or (b) starts its own headroom in the container from the
-  mounted tool. It must also record what a run does when the host proxy is down (degrade quietly,
-  no hang) and that headroom sees every prompt and credential in the run. Extend
-  `docs/hr-sandbox.md` (the flag, the `~/.headroom` row and the risk table). Not blocked.
 
 ## Summary
 
@@ -594,4 +582,4 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 | ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
 | MOD-N   | 23 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-89 `.env` in a worktree, MOD-93 consumer Claude Code plugin, MOD-94 permission answers outside the TUI, MOD-95 auto_queue overshoot test, MOD-96 settings-file permission rules in driven sessions, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 3 (CLEAN-10 `cargo doc` private links, CLEAN-11 CLEAN-9 deferred review residuals, CLEAN-12 `.claude/` hygiene) |
-| TOOL-N  | 4 (TOOL-8 `htui-dev` mod, TOOL-9 gate script and git hooks, TOOL-10 sandbox mod hardening, TOOL-11 sandbox headroom) |
+| TOOL-N  | 3 (TOOL-8 `htui-dev` mod, TOOL-9 gate script and git hooks, TOOL-10 sandbox mod hardening) |
