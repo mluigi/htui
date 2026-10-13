@@ -24,7 +24,7 @@ Always pass `--json`. Without it the output is text for people, and the exit cod
 |---|---|
 | `htui status --json` | The top bar's facts: the workspace, its projects, this box, how many runs are working (`working`) and how many rows wait on the person (`waiting`). |
 | `htui waiting --json` | The waiting-on-you list: the same rows as the TUI's overlay, each with how long it has waited (`rows`). |
-| `htui --search-items "<query>" --json` | The concepts index's best hits for the query (`hits`). |
+| `htui --search-items='<query>' --json` | The concepts index's best hits for the query (`hits`). Keep the query in one argument after `=`: a query starting with `-` would otherwise be read as a flag. |
 
 Scope:
 
@@ -52,7 +52,7 @@ When `store` is `"online"`, the command's own fields follow. Otherwise one `erro
 and nothing else.
 
 A search document also has `index`, the Qdrant concepts index's state: `online` (it answered;
-`hits` may be empty), `empty` (no index yet; `hits` is `[]`; `htui --index-items` builds one),
+`hits` may be empty), `empty` (no index yet; `hits` is `[]`; building it is the person's step: `htui --index-items`, which writes the index, so never run it yourself),
 `offline`, `refused` or `error` (no `hits`, and an `error` object instead).
 
 **Ignore fields you do not know, and treat a value you do not know as "something else", not as an
@@ -125,11 +125,11 @@ be listed, so permission rows are missing.
   `resolution` is `null`. A hit with a `resolution` is a closed item: say how it closed. A
   `requirement` hit's `key` is a requirement's key, not an item's.
 - Never work such a request inline in this session.
-- Never try to write htui's store. There is no write command.
+- Never try to write htui's store. None of these three commands writes, and you run no other htui command.
 
 ## What this skill never does
 
-No write command exists: the three commands only read. Never connect to htui's Postgres or Qdrant
+The three commands only read, and this skill runs no other htui command. Never connect to htui's Postgres or Qdrant
 directly; read htui's state through these commands only.
 
 ## Reference
