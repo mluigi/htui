@@ -2244,3 +2244,44 @@ async fn a_rebound_end_key_arms_and_ends_the_chat() {
         "the second `ctrl-e` ended the chat: {frame}"
     );
 }
+
+/// MOD-67 M5 (D12), L-D's rebinding test: `[chat] thoughts = "T"` folds and unfolds a thought on
+/// `T`, leaves `t` inert, and the live hint names the new key. A thought starts folded, so `t`
+/// leaves it folded and `T` unfolds it; the folded row's `(t to unfold)` is key prose, M6's.
+#[tokio::test]
+async fn a_rebound_thoughts_key_folds_and_t_is_inert() {
+    let keys = htui::keys::load_str("version = 1\n[chat]\nthoughts = \"T\"\n")
+        .expect("the key file loads");
+    let script = Script::one_turn(vec![
+        ScriptEvent::Emit(DriverEvent::ThoughtChunk(TextChunk {
+            text: "first\nsecond".to_owned(),
+            message_id: Some("t1".to_owned()),
+        })),
+        chunk("hello"),
+        done(),
+    ]);
+    let (mut harness, _) =
+        harness_over(script, Transport::Acp, |harness| harness.with_keys(keys)).await;
+    compose(&mut harness, "hi");
+    harness.drive().await;
+    let frame = harness.render();
+    assert_eq!(
+        hint_row(&frame),
+        "i compose · Esc Esc end · T thoughts · j/k scroll",
+        "{frame}"
+    );
+    let folded =
+        |frame: &str| frame.contains("thought  first") && !frame.contains("thought  second");
+    assert!(folded(&frame), "a thought starts folded: {frame}");
+
+    harness.key("t");
+    let frame = harness.render();
+    assert!(folded(&frame), "`t` is inert: {frame}");
+
+    harness.key("T");
+    let frame = harness.render();
+    assert!(frame.contains("thought  second"), "`T` unfolds: {frame}");
+    harness.key("T");
+    let frame = harness.render();
+    assert!(folded(&frame), "and folds again: {frame}");
+}
