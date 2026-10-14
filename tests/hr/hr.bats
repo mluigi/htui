@@ -1464,7 +1464,22 @@ EOF
     # ~/.claude/security itself stays shared (the security plugin's agent-sdk-venv); only its
     # cross-project log.txt is masked, and the per-session plugin state is not (threat model).
     [[ "$(jq --arg c "$c/" '[.[] | select(.target | startswith($c))] | length' <<<"$vols")" \
-        -eq $((${#HR_CLAUDE_MASK_DIRS[@]} + ${#HR_CLAUDE_MASK_FILES[@]} + 1)) ]]
+        -eq $((${#HR_CLAUDE_MASK_DIRS[@]} + ${#HR_CLAUDE_MASK_FILES[@]} + ${#HR_CLAUDE_RO_DIRS[@]} + ${#HR_CLAUDE_RW_UNDER_RO[@]} + 1)) ]]
+    # TOOL-10: a plugin or a skills-directory plugin written by a run would run in process in the
+    # host's next session. Both trees are read-only; only the plugins' state dirs come back rw, after
+    # the read-only bind that covers them.
+    for d in "${HR_CLAUDE_RO_DIRS[@]}"; do
+        jq -e --arg t "$c/$d" 'any(.[]; . == {type: "bind", source: $t, target: $t, ro: true})' <<<"$vols" >/dev/null \
+            || { echo "$d is not a read-only bind" >&2; return 1; }
+    done
+    for d in "${HR_CLAUDE_RW_UNDER_RO[@]}"; do
+        jq -e --arg t "$c/$d" 'any(.[]; . == {type: "bind", source: $t, target: $t, ro: false})' <<<"$vols" >/dev/null \
+            || { echo "$d is not a read-write bind" >&2; return 1; }
+        [[ "$(jq --arg t "$c/plugins" --arg u "$c/$d" 'map(.target) | (index($t) < index($u))' <<<"$vols")" == true ]] \
+            || { echo "$d is mounted before plugins" >&2; return 1; }
+    done
+    # Login and settings are not mounted on their own: they stay in the shared read-write bind.
+    ! jq -e 'any(.[]; .target | test("/\\.claude/(settings\\.json|\\.credentials\\.json)$"))' <<<"$vols" >/dev/null || false
     jq -e --arg t "$c/security/log.txt" 'any(.[]; .target == $t)' <<<"$vols" >/dev/null
     ! jq -e --arg t "$c/security" 'any(.[]; .target == $t)' <<<"$vols" >/dev/null || false
 }
@@ -1482,7 +1497,9 @@ EOF
     grep -qxF "HR_CLAUDE_MASK=$HR_ROOT/MOD-5/claude-mask" "$env"
     # Mount points exist, as directories owned by the user (Docker would make them root-owned).
     [[ -d "$HOME/.claude/projects/$name" && -O "$HOME/.claude/projects/$name" ]]
-    for d in "${HR_CLAUDE_MASK_DIRS[@]}"; do [[ -d "$HOME/.claude/$d" && -O "$HOME/.claude/$d" ]]; done
+    for d in "${HR_CLAUDE_MASK_DIRS[@]}" "${HR_CLAUDE_RO_DIRS[@]}" "${HR_CLAUDE_RW_UNDER_RO[@]}"; do
+        [[ -d "$HOME/.claude/$d" && -O "$HOME/.claude/$d" ]]
+    done
     for f in "${HR_CLAUDE_MASK_FILES[@]}"; do
         [[ -f "$HOME/.claude/$f" && -O "$HOME/.claude/$f" ]]
         [[ -f "$HR_ROOT/MOD-5/claude-mask/$f" && ! -s "$HR_ROOT/MOD-5/claude-mask/$f" ]]
@@ -1751,6 +1768,13 @@ EOF
     dexec TOOL-9001 test -s "$HOME/.claude/settings.json"
     dexec TOOL-9001 test -d "$HOME/.claude/plugins"
     dexec TOOL-9001 test -d "$HOME/.claude/skills"
+    # TOOL-10: plugins and skills are read-only, their state dirs are not.
+    for d in "${HR_CLAUDE_RO_DIRS[@]}"; do
+        ! dexec TOOL-9001 touch "$HOME/.claude/$d/.hr-probe" 2>/dev/null || { echo "$d is writable" >&2; return 1; }
+    done
+    for d in "${HR_CLAUDE_RW_UNDER_RO[@]}"; do
+        dexec TOOL-9001 bash -c "touch ~/.claude/$d/.hr-probe && rm ~/.claude/$d/.hr-probe" || { echo "$d is not writable" >&2; return 1; }
+    done
     # Of ~/.claude/security only log.txt is masked (in the loop above); the plugin's venv is shared.
     if [[ -d "$HOME/.claude/security/agent-sdk-venv" ]]; then
         dexec TOOL-9001 test -d "$HOME/.claude/security/agent-sdk-venv"

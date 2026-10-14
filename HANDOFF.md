@@ -14,7 +14,10 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-14):** **ANA-30 is concluded** (`docs/ANA-30.md`, `docs/decisions/ana/ana-30.md`): no
+**Current status (2026-10-14):** **TOOL-10 is done** (`docs/decisions/tool/tool-10.md`): in an `hr` run
+`~/.claude/plugins` and `skills` are read-only (`plugins/data` and `plugins/store` stay writable) and `dev-mods` is a
+tmpfs, so a run cannot plant a mod that runs in the host's next session; `settings.json` is still writable, filed as
+**TOOL-12**. Owed on the host: a real `scripts/hr up`, the Docker bats case. Before it, **ANA-30 is concluded** (`docs/ANA-30.md`, `docs/decisions/ana/ana-30.md`): no
 `utility_model` setting now (every compliant cheap-model use is single-digit dollars a month and has no surface yet);
 the $100 API credit is spent through a `per_token` registry row (data, no code), built into the first MOD that adds a
 second drafting surface. Spawned **MOD-97** (an inherited `ANTHROPIC_API_KEY` reroutes subscription rows to API
@@ -33,7 +36,7 @@ levels are pinned by a capture test, the project-settings decode warn fires once
 `project.settings` is refused by `ProjectCaps::from_settings` as the writers refuse it. Owed on the host: the Postgres
 gate on the merged tree. Earlier completions (**MOD-67**, **MOD-96**, **CLEAN-10**, **MOD-93**, **MOD-89**, **MOD-95**, **TOOL-11**,
 **MOD-91**, **MOD-92**) are in `DECISIONS.md`; their host Postgres gates on the merged tree, the Windows runs
-and MOD-93's live install and `tsc` on the mod stay owed. Open from ANA-29: **TOOL-8**/**TOOL-10** and
+and MOD-93's live install and `tsc` on the mod stay owed. Open from ANA-29: **TOOL-8** and
 **MOD-94** behind a maintainer decision.
 Live coordinates after MOD-96: migrations run through `0018_seed_permission_mode` (MOD-96: data only, pins
 `acp.permission_mode` on the seeded `claude` row), before it `0017_follow_up` (`run_command.run_step_id`,
@@ -441,18 +444,15 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   `agent.spawn` fires for Workflow agents. G1 models dev-dependency features (only htui's `testkit`
   goes vacuous in a workspace run). `MultiEdit` no longer exists; Gortex and Serena write tools are
   guarded instead. Known gaps in `docs/htui-dev.md`. M2 unblocked (TOOL-9 done).
-- [ ] **TOOL-10 - hr sandbox: stop a run from planting a mod that runs on the host** (from
-  ANA-29, `docs/ANA-29.md` §3.3). `~/.claude` is shared read-write with every run
-  (`docker/hr/compose.hr.yaml:99-114`), and `docs/hr-sandbox.md` already lists "add hooks or
-  settings that execute in your next host Claude session". Mods widen that: a plugin installed,
-  or a `~/.claude/skills/<x>/.claude-plugin` folder written (it loads as `@skills-dir`), inside a
-  sandbox runs **in process** in every later host session, unsandboxed. `~/.claude/dev-mods/` is
-  a lesser risk: a mod there loads only in the session whose ID names its folder, after a
-  hot-reload approval and in a trusted workspace (`mods/create`), so it reaches the host only if
-  that host session is resumed; verify this before deciding whether to mount it read-only. Mount
-  `~/.claude/plugins` (except `plugins/data` and `plugins/store`) and `~/.claude/skills`
-  read-only, or masked, in runs; check that plugin auto-update and `$.store` degrade quietly; and
-  extend the `docs/hr-sandbox.md` table. Not blocked.
+- [ ] **TOOL-12 - hr sandbox: settings.json, agents, commands and hooks in ~/.claude stay writable from a run**
+  (from TOOL-10, `docs/decisions/tool/tool-10.md`). TOOL-10 made `~/.claude/plugins` and `skills`
+  read-only, so a run cannot install a plugin or write a mod. It can still write `settings.json` (hooks,
+  `enabledPlugins`, `extraKnownMarketplaces` with a directory source on another shared path such as
+  `~/.headroom`, `~/.serena`, `~/.cache/uv` or the run's project dir) and `agents/`, `commands/`, `hooks/`.
+  Decide: a per-run copy of `settings.json` seeded at `up` (login and `/model` then stop flowing back), or a
+  read-only bind plus a writable overlay for the few keys a run needs; and whether `agents/` and `commands/`
+  go read-only too. Check what breaks in a run first (`/login` writes `.credentials.json`, which is a
+  separate file). Not blocked.
 
 ## Summary
 
@@ -461,4 +461,4 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 | ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
 | MOD-N   | 20 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
-| TOOL-N  | 2 (TOOL-8 `htui-dev` mod, TOOL-10 sandbox mod hardening) |
+| TOOL-N  | 2 (TOOL-8 `htui-dev` mod, TOOL-12 sandbox settings hardening) |
