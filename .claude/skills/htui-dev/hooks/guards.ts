@@ -504,10 +504,6 @@ const GIT_WRITES = new Set([
   'cherry-pick',
   'revert',
   'am',
-  'apply',
-  'add',
-  'rm',
-  'mv',
   'pull',
   'push',
   'checkout-index',
@@ -692,6 +688,29 @@ function cleanDryRun(args: Words): boolean {
   return false
 }
 
+/** The `git apply` options that turn applying off: they only read the patch. */
+const APPLY_READS = ['--check', '--stat', '--numstat', '--summary']
+
+/** Whether a `git apply` only reads: at least one of `APPLY_READS`, and no other option. */
+function applyReadsOnly(args: Words): boolean {
+  let reads = false
+  for (const w of args) {
+    if (w === '--') break
+    if (APPLY_READS.includes(w)) reads = true
+    else if (w.startsWith('-') && w !== '-') return false
+  }
+  return reads
+}
+
+/** Whether a `git add`, `mv` or `rm` is a dry run: `-n` (none of their short options takes a value) or a prefix of `--dry-run`, before `--`. */
+function dryRun(args: Words): boolean {
+  for (const w of args) {
+    if (w === '--') return false
+    if (w.startsWith('--') ? w.length >= 3 && '--dry-run'.startsWith(w) : /^-[A-Za-z]*n/.test(w)) return true
+  }
+  return false
+}
+
 /**
  * Whether a `git branch` or `git tag` command only lists: no write option (`writeLong`, or a short
  * cluster with a letter of `writeShort`), and a name given only to a list form (`--list`, `-l`, ...),
@@ -750,6 +769,12 @@ export function gitWrite(words: Words): string | null {
       return switchWrite(args)
     case 'clean':
       return cleanDryRun(args) ? null : 'git clean'
+    case 'apply':
+      return applyReadsOnly(args) ? null : 'git apply'
+    case 'add':
+    case 'mv':
+    case 'rm':
+      return dryRun(args) ? null : `git ${git.sub}`
     case 'branch':
       return listsOnly(
         args,

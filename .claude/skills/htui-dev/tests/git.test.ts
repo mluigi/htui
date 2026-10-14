@@ -260,6 +260,35 @@ test('git clean is a dry run only with -n or a prefix of --dry-run, before -- an
   for (const [line, label] of table) expect(gitWrite(simpleCommands(line)![0]!), line).toBe(label)
 })
 
+test('dry runs of apply, add, mv and rm are allowed', () => {
+  const table: [string, string | null][] = [
+    ['git apply --check p', null],
+    ['git apply --stat p', null],
+    ['git apply --numstat --summary p', null],
+    ['git apply --check', null],
+    ['git add -n .', null],
+    ['git add --dry-run .', null],
+    ['git add -nA', null],
+    ['git add --dry .', null],
+    ['git mv -n a b', null],
+    ['git mv a b -n', null],
+    ['git rm -n a', null],
+    ['git rm -rn a', null],
+    ['git rm --dry-run a', null],
+    ['git apply p', 'git apply'],
+    ['git apply --check --apply p', 'git apply'],
+    ['git apply --stat --index p', 'git apply'],
+    ['git apply -3 p', 'git apply'],
+    ['git add .', 'git add'],
+    ['git add -- -n', 'git add'],
+    ['git add -A', 'git add'],
+    ['git mv a b', 'git mv'],
+    ['git rm -r a', 'git rm'],
+    ['git rm -- -n', 'git rm'],
+  ]
+  for (const [line, label] of table) expect(gitWrite(simpleCommands(line)![0]!), line).toBe(label)
+})
+
 test('gitWrite names the writes to the remote, refs, worktrees, submodules and history beyond the porcelain', () => {
   const table: [string, string | null][] = [
     ['git push', 'git push'],
