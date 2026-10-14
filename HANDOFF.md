@@ -402,8 +402,8 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   `install-workflow-hooks.sh:22-23` to what this repo has once TOOL-9 lands (the commit hook via
   `core.hooksPath`, the `--no-verify` block from TOOL-8). No behaviour change. The lock file and
   the generated-skills decision are not blocked; the lifecycle text and
-  `install-workflow-hooks.sh` corrections are blocked on TOOL-9, and the `--no-verify` wording on
-  TOOL-8 M1.
+  `install-workflow-hooks.sh` corrections are blocked on TOOL-9; the `--no-verify` wording is
+  unblocked (TOOL-8 M1 landed: G6 in `docs/htui-dev.md`).
 - [ ] **MOD-3 - Diff tab + code explorer.** `R-LATER-1`. Later tier; needs its own ANA first.
 - [ ] **MOD-5 - Issue tracker mirror.** `R-LATER-2`. `IssueSync` trait, OneDev first, downstream
   only. Later tier; needs its own ANA first.
@@ -435,6 +435,12 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   Tests with `claude plugin test`; `claude plugin validate --strict` in TOOL-9's gate. Open in the
   plan: whether `agent.spawn` fires for Workflow-tool agents (D3), and whether a skills-directory
   mod prompts beyond workspace trust. M1 unblocked (MOD-91 done: a skills-directory `htui-dev` mod no longer loads in htui's own sessions unless the row sets `mods (y/n)`); M2 after TOOL-9.
+  **Phase M1 landed (`1d3963c3`..`40446f29`, 2026-10-14):** `.claude/skills/htui-dev/` guards G1-G6
+  (`docs/htui-dev.md`, plan `.claude/plans/tool-8-m1-guards.plan.md`), 88 kit tests, validate
+  `--strict` green, two review rounds. Both open questions closed live: no prompt beyond trust, and
+  `agent.spawn` fires for Workflow agents. G1 models dev-dependency features (only htui's `testkit`
+  goes vacuous in a workspace run). `MultiEdit` no longer exists; Gortex and Serena write tools are
+  guarded instead. Known gaps in `docs/htui-dev.md`. M2 still after TOOL-9.
 - [ ] **TOOL-9 - Canonical gate script, committed git hooks, DECISIONS merge rule** (from ANA-29,
   `docs/ANA-29.md` §4.1, §4.2 D5, D7, D8). `scripts/gate.sh` and `scripts/gate.ps1` run the gate the
   memory notes describe: `cargo fmt --check`, `cargo clippy --workspace --all-features --
