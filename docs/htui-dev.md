@@ -374,7 +374,7 @@ Two rules for anything under `.claude/skills/htui-dev/`:
   `xargs`, a command piped into a shell (`cat <<EOF | sh`, `… | bash`), or backticks inside double
   quotes, and it treats every `$VAR` as text. A `case … esac` inside a `$( … )` is misread: a
   pattern's `)` ends the substitution early, so the rest of that arm goes unchecked (nothing is
-  refused by mistake). A guard can be walked around on purpose. It is there
+  refused by mistake). A `$( … )` inside arithmetic, `$(( $(…) ))`, is not followed either. A guard can be walked around on purpose. It is there
   to catch mistakes.
 - **G4 refuses only the git commands it lists.** Any other git command passes from a read-only
   agent, for example `notes merge`, `remote add`, `config`, `symbolic-ref`, `prune`, `repack`,
