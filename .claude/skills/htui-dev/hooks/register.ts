@@ -12,7 +12,7 @@
 // network; its one value is the read-only agents' ids in `$.state`, which a reload keeps.
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
-import type { HtuiDevReadOnly } from '../types'
+import type { HtuiDevReadOnly, HtuiDevReadOnlyCalls } from '../types'
 import {
   cargoTest,
   coarseGitWrite,
@@ -29,6 +29,7 @@ import {
 import { simpleCommands, type Words } from './shell'
 
 const readOnly = atom({ plugin: 'htui-dev', key: 'readOnly' } as const, [] as HtuiDevReadOnly)
+const readOnlyCalls = atom({ plugin: 'htui-dev', key: 'readOnlyCalls' } as const, [] as HtuiDevReadOnlyCalls)
 
 /** Puts `text` on the plugin's status line; never throws (a `$` call in a re-entry rejects). */
 function warn($: EngineInterface, text: string): void {
@@ -50,18 +51,41 @@ function judge($: EngineInterface, guard: string, what: 'call' | 'spawn', decide
 }
 
 /**
- * Whether `agentId` was tagged read-only. The main loop (no `agentId`) never reads the state. A
- * read that fails, or a value that is no list, warns with `failed` and answers false.
+ * Whether the list `load` reads holds `id`; an undefined or empty `id` reads nothing. A read that
+ * fails, or a value that is no list, warns with `failed` and answers false.
  */
-async function isTagged($: EngineInterface, agentId: string | undefined, failed: string): Promise<boolean> {
-  if (agentId === undefined) return false
+async function holds($: EngineInterface, load: () => Promise<unknown>, id: string | undefined, failed: string): Promise<boolean> {
+  if (id === undefined || id === '') return false
   try {
-    const ids: unknown = await read($, readOnly)
-    if (!Array.isArray(ids)) throw new TypeError('readOnly holds no list')
-    return ids.includes(agentId)
+    const ids = await load()
+    if (!Array.isArray(ids)) throw new TypeError('the state holds no list')
+    return ids.includes(id)
   } catch {
     warn($, failed)
     return false
+  }
+}
+
+/** Whether `agentId` was tagged read-only. The main loop (no `agentId`) never reads the state. */
+const isTagged = ($: EngineInterface, agentId: string | undefined, failed: string): Promise<boolean> =>
+  holds($, () => read($, readOnly), agentId, failed)
+
+/** Whether a read-only agent made the Workflow or Agent call `toolUseId`. */
+const isReadOnlyCall = ($: EngineInterface, toolUseId: string | undefined, failed: string): Promise<boolean> =>
+  holds($, () => read($, readOnlyCalls), toolUseId, failed)
+
+/** The list with `id` added, once. */
+const adding =
+  (id: string) =>
+  (ids: readonly string[] | undefined): readonly string[] =>
+    (ids ?? []).includes(id) ? ids! : [...(ids ?? []), id]
+
+/** Runs a state write; one that fails warns with `failed`. */
+async function store($: EngineInterface, write: () => Promise<unknown>, failed: string): Promise<void> {
+  try {
+    await write()
+  } catch {
+    warn($, failed)
   }
 }
 
@@ -154,6 +178,21 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // G4 for workflows: a workflow agent's spawn names no parent, only the Workflow call that
+  // started its run (its `tool_use_id`). A read-only agent's Workflow and Agent calls are noted
+  // before they run, so the spawns they cause can be tagged. Never refuses.
+  on('tool.call', { tool: ['Workflow', 'Agent'] }, async ($, e, next) => {
+    if (await isTagged($, e.agentId, 'htui-dev: read-only guard failed, call allowed')) {
+      const id = e.tool_use_id
+      await store($, () => update($, readOnlyCalls, adding(id)), `htui-dev: read-only tag failed, call ${id} unrecorded`)
+    }
+    return next(e)
+  }).catch(($, e, next) => {
+    if (next.called) return next(e)
+    warn($, 'htui-dev: tool.call guard failed, call allowed')
+    return next(e)
+  })
+
   on('agent.spawn', async ($, e, next) => {
     // Every refusal comes before `next`: a deny after it fails the hook (AgentSpawnResult).
     const fable = judge($, 'Fable', 'spawn', () => fableModel(e.model))
@@ -165,15 +204,15 @@ export const register: Register = on => {
       warn($, 'htui-dev: read-only guard failed, spawn allowed untagged')
     }
     if (!tag) tag = await isTagged($, e.parentAgentId, 'htui-dev: read-only guard failed, spawn allowed untagged')
+    // A main-loop spawn that is no workflow agent reads no state.
+    if (!tag && (e.workflow !== undefined || e.parentAgentId !== undefined)) {
+      tag = await isReadOnlyCall($, e.tool_use_id, 'htui-dev: read-only guard failed, spawn allowed untagged')
+    }
     const got = await next(e)
     if (got.deny !== undefined) return got
     if (tag && got.agentId !== undefined) {
       const id = got.agentId
-      try {
-        await update($, readOnly, ids => ((ids ?? []).includes(id) ? ids : [...(ids ?? []), id]))
-      } catch {
-        warn($, `htui-dev: read-only tag failed, agent ${id} untagged`)
-      }
+      await store($, () => update($, readOnly, adding(id)), `htui-dev: read-only tag failed, agent ${id} untagged`)
     }
     // G5's gap: a model left unset resolves from the agent definition or the parent, after the
     // hook could refuse. Too late to deny (it fails the hook); say so instead.

@@ -51,6 +51,39 @@ test('an agent spawned by a read-only agent is read-only too', async ($, on) => 
   expect(writes).toEqual([['agent-1'], ['agent-1', 'agent-2']])
 })
 
+// A workflow agent's spawn carries no parentAgentId (live probe, claim 19), only the tool_use_id
+// of the Workflow call that started its run. A read-only agent's Workflow and Agent calls are
+// recorded, and a workflow spawn under a recorded call is tagged.
+test('a workflow started by a read-only agent starts read-only agents', async ($, on) => {
+  const writes: unknown[] = []
+  const seen: { tool_use_id?: string; workflow?: unknown }[] = []
+  const callIds: string[] = []
+  const lines: (string | undefined)[] = []
+  const clock = mock.clock(on)
+  statuses(on, lines)
+  tagWrites(on, writes)
+  on('agent.spawn', async ($, e) => {
+    seen.push({ tool_use_id: e.tool_use_id, workflow: e.workflow })
+    return { model: 'claude-opus-5-5', agentId: `agent-${seen.length}` } as never
+  })
+  on('tool.call', async ($, e) => {
+    callIds.push(e.tool_use_id)
+    return { result: 'ok' } as never
+  })
+  await spawn($, { prompt: 'READ-ONLY' })
+  await call($, 'Workflow', { script: 'agent("fix it")' }, 'agent-1')
+  await call($, 'Workflow', { script: 'agent("fix it")' })
+  const workflow = (id: string) => ({ prompt: 'fix it', subagentType: 'workflow-subagent', tool_use_id: id, workflow: { runId: 'wf_1', agentIndex: 1 } })
+  await $.agent.spawn(workflow(callIds[0]!) as never)
+  await $.agent.spawn(workflow(callIds[1]!) as never)
+  // The kit carries both fields through, and the two calls had ids of their own.
+  expect(seen[1]).toEqual({ tool_use_id: callIds[0], workflow: { runId: 'wf_1', agentIndex: 1 } })
+  expect(callIds[0]).not.toBe(callIds[1])
+  await clock.settle()
+  expect(lines).toEqual([])
+  expect(writes).toEqual([['agent-1'], ['agent-1', 'agent-2']])
+})
+
 test('a lowercase read-only in the prompt tags nothing', async ($, on) => {
   const writes: unknown[] = []
   const reached: Reached[] = []
@@ -310,9 +343,10 @@ test('the main loop never reads the tag store', async ($, on) => {
   seedTags(on, 42)
   await call($, 'Edit', { file_path: 'src/a.rs', old_string: 'a', new_string: 'b' })
   await bash($, 'git commit -m x')
+  await call($, 'Workflow', { script: 'agent("x")' })
   await spawn($, { prompt: 'implement it' })
   await clock.settle()
-  expect(reached.map(r => r.tool)).toEqual(['Edit', 'Bash'])
+  expect(reached.map(r => r.tool)).toEqual(['Edit', 'Bash', 'Workflow'])
   expect(lines).toEqual([])
 })
 
