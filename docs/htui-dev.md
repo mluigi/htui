@@ -31,7 +31,7 @@ Every refusal starts with `htui-dev:`, names the problem, and ends with the fix 
 | G1 | `cargo test` that builds feature-gated integration tests with their feature still off | The gated files compile to nothing, so the run reports `ok` with 0 tests (ANA-29 D1) | Your command with `--features testkit` (or `test-support`) added; for several crates or the whole workspace, `--all-features` works too |
 | G2 | `cargo test -p <crate>` naming the other crate's test feature | `htui` calls it `testkit`, the other crates `test-support`. cargo refuses the wrong one anyway; the refusal just gives you the right spelling | Your command with the name swapped |
 | G3 | An edit that writes the forbidden literal into `crates/**/*.{rs,json}` | `crates/htui-agent/tests/extensibility.rs` fails the workspace gate on it, but per-crate gates stay green, so it is caught lanes later (ANA-29 D2) | Use another name. Only `extensibility.rs` may spell it |
-| G4 | File writes, and git commands that change the working tree, the index, refs or history, from an agent started read-only | A read-only verifier once fixed and committed the defect it was asked to report (ANA-29 D3). On a shared tree, `git checkout .` or `git clean` would also destroy the parent's uncommitted work | Report the change in the answer instead |
+| G4 | File writes, and the git commands [listed under G4](#g4-read-only-agents) that change the working tree, the index, refs, history or the remote, from an agent started read-only | A read-only verifier once fixed and committed the defect it was asked to report (ANA-29 D3). On a shared tree, `git checkout .` or `git clean` would also destroy the parent's uncommitted work | Report the change in the answer instead |
 | G5 | A subagent spawned with a Fable model | Every agent here inherits the session's model and none runs on Fable (ANA-29 D4) | Leave `model` unset |
 | G6 | `git commit --no-verify` or `git commit -n` | It skips the repo's commit hooks (ANA-29 D8) | The same commit without the flag |
 
@@ -48,7 +48,8 @@ The Bash guards look at each simple command in the line, not at the raw text:
 - A `$( … )` inside double quotes is read as the shell reads it: a fresh quoting context, up to its
   balanced `)`, stepping over nested quotes, parentheses and heredoc bodies. So the usual
   `git commit -m "$(cat <<'EOF' … EOF)"` is one word, even when the message has `"` or `&&` in it,
-  and the commands inside the substitution are checked too. `$(( … ))` is arithmetic, not a command.
+  and the commands inside the substitution are checked too. `$(( … ))` is arithmetic, not a command,
+  quoted or not, and a here-string (`<<<`) is no heredoc.
 - Leading `VAR=value` assignments, `if`/`then`/`do`/`{` and similar words, and the wrappers `env`,
   `command`, `time`, `nice`, `timeout <duration>`, `nohup` and `exec` are stripped, with their
   options. `env -S "…"` (`--split-string`) is split into the command it runs.
@@ -59,8 +60,8 @@ The Bash guards look at each simple command in the line, not at the raw text:
 So `echo cargo test -p htui` and `git commit -m "cargo test -p htui"` are left alone, while
 `RUST_LOG=x timeout 900 cargo test -p htui 2>&1 | tail` is checked.
 
-A line the reader cannot follow (an unbalanced quote, a heredoc with no end) is let through
-without comment. The one exception is a read-only agent's line: it still meets a coarse pattern for
+A line the reader cannot follow (an unbalanced quote, a heredoc with no end, nesting so deep that
+reading it would overflow the stack) is let through without comment. The one exception is a read-only agent's line: it still meets a coarse pattern for
 the git commands that always write (see G4).
 
 ### G1 and G2: `cargo test`
@@ -121,6 +122,14 @@ path is a bare `<member>/Cargo.toml`; any other manifest is the workspace root, 
 called (`.claude/worktrees/tool-8/Cargo.toml`). `--exclude` (globs too) takes a crate out of a
 workspace run.
 
+**The working directory.** A `cd` (or `pushd`) earlier in the same Bash line into a member's folder,
+`crates/<member>` or any folder below it, makes a later `cargo test` with no `-p`, `--workspace` or
+`--manifest-path` select that member, as cargo would. So `cd crates/htui-store && cargo test` is
+allowed, and `cd crates/htui-agent && cargo test` is refused with `--features test-support` as the
+fix. Relative paths are joined onto the earlier `cd`s, with `.` and `..` resolved. A `cd` anywhere
+else, `cd` alone, `cd -`, `~`, a `$VAR`, `pushd +N` and `popd` select no member again. Where the
+line starts is not known; see [Known gaps](#known-gaps).
+
 Features are read in every spelling cargo takes: `--features a,b`, `--features "a b"`,
 `--features=…`, `-F …`, `-F…`, inside a short cluster (`-qF testkit`), repeated.
 
@@ -146,8 +155,10 @@ G3 reads the edit tools:
   `refactor`;
 - Serena's `create_text_file`, `replace_content`, `replace_in_files`, `replace_symbol_body`,
   `insert_after_symbol`, `insert_before_symbol`, `rename_symbol`, `safe_delete_symbol`,
-  `replace_lines`, `insert_at_line` and `delete_lines`. Serena is configured machine-wide, so its
-  tools reach sessions here.
+  `replace_lines`, `insert_at_line` and `delete_lines`, and its optional JetBrains tools
+  `jet_brains_rename`, `jet_brains_move`, `jet_brains_safe_delete` and `jet_brains_inline_symbol`
+  (also matched as `jetbrains_…`). Serena is configured machine-wide, so its tools reach sessions
+  here.
 
 Either server's tools also count under a plugin's prefix (`mcp__plugin_<name>_gortex__…`).
 
@@ -167,9 +178,15 @@ Serena's `replace_in_files` reaches many files. It counts when its `relative_pat
 (the whole project), a folder in `crates/` outside `target/`, or a scanned file. A dry run
 (`dry_run: true`) writes nothing and passes G3 and G4.
 
-The Serena field names come from this session's Serena tool list. `create_text_file`,
-`replace_lines`, `insert_at_line` and `delete_lines` were not in that list; their fields
-(`relative_path`, `content`) are Serena's documented ones.
+The Serena tool names and fields were checked against Serena 2.0.0's source. Its JetBrains tools
+are named `jet_brains_*` there (class `JetBrainsRenameTool` becomes `jet_brains_rename`);
+`jet_brains_rename` writes its `new_name`, and the other three write no new text, so they meet G4
+only. Two Serena tools are not matched:
+
+- `execute_shell_command` runs a shell command. Serena's `claude-code` context excludes it, so it
+  is not offered here; see [Known gaps](#known-gaps).
+- The memory tools (`write_memory`, `edit_memory`, …) write only Serena's memory folder, never the
+  tree.
 
 ### G4: read-only agents
 
@@ -185,25 +202,46 @@ The tag is the agent's `agentId`. It is kept in the mod's `$.state`, which outli
 mod, for the rest of the session. Explore and Plan agents need no tag: they have no write tools.
 
 A tagged agent's file writes are refused: `Edit`, `Write`, `NotebookEdit`, and every Gortex and
-Serena write tool G3 reads. So are its Bash git commands that change the working tree, the index,
-refs or history:
+Serena write tool G3 reads. So are exactly these Bash git commands, which change the working tree,
+the index, refs, history or the remote:
 
-- `commit`, `reset`, `restore`, `switch`, `merge`, `rebase`, `cherry-pick`, `revert`, `am`,
-  `apply`, `add`, `rm`, `mv` and `pull`, in any form;
+- `commit`, `reset`, `restore`, `merge`, `rebase`, `cherry-pick`, `revert`, `am`, `pull`, `push`,
+  `checkout-index`, `read-tree`, `update-ref`, `update-index`, `gc` and `filter-branch`, in any
+  form (`push --dry-run` included);
+- `apply`, except with only `--check`, `--stat`, `--numstat` or `--summary`;
+- `add`, `mv` and `rm`, except with `-n`/`--dry-run`;
 - `stash`, except `stash list` and `stash show`;
 - `checkout` with a pathspec (`.`, anything after `--`, a second positional,
-  `--pathspec-from-file`), or with `--force`/`-f` or `--patch`/`-p`;
-- `clean`, except with `-n`/`--dry-run`;
+  `--pathspec-from-file`, `--ours`/`--theirs`, `-2`/`-3`), or with `--force`/`-f` or
+  `--patch`/`-p`;
+- `switch` with `--force`/`-f`, `--discard-changes`, `--force-create`/`-C` or `--orphan`;
+- `clean`, except with `-n`/`--dry-run` (before `--`, and not as the pattern of `-e`);
 - `branch` and `tag` in any but their list forms (`branch -d/-D/-m`, `branch <name>`,
   `tag -a`, `tag <name>` are writes; `branch -a`, `--list`, `--contains`, `tag -l`, `tag -n` are
-  not).
+  not);
+- `bisect`, except `bisect log`, `bisect view` and `bisect visualize`;
+- `worktree add`, `remove`, `move` and `prune`;
+- `submodule update`, `deinit`, `add` and `sync`;
+- `sparse-checkout`, except `sparse-checkout list`;
+- `reflog expire` and `reflog delete`;
+- `notes add`, `remove`, `edit`, `append`, `copy` and `prune` (also after `--ref <ref>`);
+- `replace`, except its list forms (`git replace`, `-l`, `--list`).
+
+Long options of `checkout`, `switch` and `clean` are read by their unique prefix, as git reads
+them: `--forc` is `--force`, `--disc` is `--discard-changes`, `--dry` is `--dry-run`. An ambiguous
+prefix (`checkout --pat`) is refused by git itself. Any other git command passes; see
+[Known gaps](#known-gaps).
 
 It can still read, search, build, check and run tests, and run `git status`, `diff`, `log`, `show`,
-`blame`, `fetch` and `checkout <branch>`.
+`blame`, `fetch`, `checkout <branch>`, `checkout -b <new>`, `switch <branch>` and
+`switch -c <new>`.
 
 A tagged agent's Bash line that the reader cannot follow still meets a coarse pattern: a `git`
-word followed by one of the always-writing subcommands above is refused. Anyone else's unreadable
-line stays allowed.
+word followed by `commit`, `reset`, `restore`, `merge`, `rebase`, `cherry-pick`, `revert`, `am`,
+`apply`, `add`, `rm`, `mv`, `pull`, `push`, `clean`, one of the plumbing writes above, `stash` (but
+`list`/`show`), or a writing action of `bisect`, `worktree`, `submodule`, `sparse-checkout`,
+`reflog` or `notes`, is refused. Being coarse, it also refuses the dry runs of `apply`, `add`, `mv`,
+`rm` and `clean` on such a line. Anyone else's unreadable line stays allowed.
 
 **Workflow agents.** A workflow script's `agent()` raises the same spawn event, and its tool calls
 carry the same `agentId` (verified live, see below). Its spawn names no parent agent, though, only
@@ -323,15 +361,29 @@ Two rules for anything under `.claude/skills/htui-dev/`:
   refusal after the agent starts would fail the hook. So a Fable model pinned in an agent definition,
   or inherited from a Fable session, starts anyway, and the mod only shows a status line:
   `htui-dev: subagent <id> resolved to Fable (<model>) — inherited or pinned in its agent definition`.
-- **G1 does not know the working directory.** A `cargo test` with no package is read as a workspace
-  run. `cd crates/htui && cargo test --features testkit` is therefore allowed (it is right either
-  way), but `cd crates/htui-agent && cargo test` is refused with `htui`'s fix, although cargo would
-  test only `htui-agent` there. Use `-p` from the root. A `cargo test` in another project from a
-  session opened here is read the same way.
+- **G1 follows the working directory only within one Bash line.** A `cd crates/<member>` earlier in
+  the line is read (see [G1](#g1-and-g2-cargo-test)), but the folder the line starts in is not
+  known: the session's own, or one an earlier Bash call moved to. It is read as the workspace
+  root. So a bare `cargo test` run from `crates/htui-store` that way is refused with `htui`'s fix,
+  although cargo would test only `htui-store` there; use `-p` from the root, or `cd` in the same
+  line. `cd -`, `cd ~`, a `$VAR` and `popd` are read as the root too. A `cd` inside `( … )` or a
+  `bash -c` string is read as if it outlasted them, so in `(cd crates/htui-store && cargo test);
+  cargo test` the second run is let through. A relative `--manifest-path` is read from the root. A
+  `cargo test` in another project from a session opened here is read the same way.
 - **The reader is not a shell.** It does not follow `eval`, scripts, aliases, functions, `sudo`,
   `xargs`, a command piped into a shell (`cat <<EOF | sh`, `… | bash`), or backticks inside double
-  quotes, and it treats every `$VAR` as text. A guard can be walked around on purpose. It is there
+  quotes, and it treats every `$VAR` as text. A `case … esac` inside a `$( … )` is misread: a
+  pattern's `)` ends the substitution early, so the rest of that arm goes unchecked (nothing is
+  refused by mistake). A guard can be walked around on purpose. It is there
   to catch mistakes.
+- **G4 refuses only the git commands it lists.** Any other git command passes from a read-only
+  agent, for example `notes merge`, `remote add`, `config`, `symbolic-ref`, `prune`, `repack`,
+  `pack-refs`, `fast-import`, `lfs`, `maintenance`, `worktree lock`, and `submodule foreach`, which
+  runs a command of its own. `checkout -m` and `switch -m` carry local changes into the new branch
+  and are allowed.
+- **Serena's `execute_shell_command` is not matched.** Serena's `claude-code` context excludes it.
+  A Serena started with another context would offer it, and the commands it runs never meet the
+  Bash guards.
 - **G4 does not refuse `git checkout <one path>`.** `git checkout src/a.rs` restores a file, but
   with one positional the reader cannot tell a path from a branch name, so it is allowed. `.`, a
   second positional and anything after `--` are refused.

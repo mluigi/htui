@@ -3,7 +3,7 @@
 //   G1  cargo test that builds feature-gated integration tests without their feature (0 tests, green)
 //   G2  cargo test with the other crate's test feature name (testkit vs test-support)
 //   G3  the literal extensibility.rs forbids, written into crates/**/*.{rs,json} by an edit tool
-//   G4  file writes, and git commands that change the tree, index or history, from an agent started read-only
+//   G4  file writes, and the git writes docs/htui-dev.md lists, from an agent started read-only
 //   G5  a subagent asked to run on Fable
 //   G6  git commit --no-verify (or -n), which skips the repo's commit hooks
 // Every guard is a `{ deny }`, never a rewrite, and judges before `next`. A guard that throws
