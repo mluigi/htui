@@ -211,4 +211,10 @@ Not gated by cargo until TOOL-9 wires `validate`/`test` for `.claude/skills/htui
 | 13. Verifier prompts mark read-only as `READ-ONLY` / "STRICTLY no edits, no commits" | Verified | memory `ultracode-scoped-to-implementers` (MOD-12 M3) |
 | 14. `git commit -n` = `--no-verify`; `--verify` is its opposite | Verified | `git commit -h` |
 | 15. Live probe auth available in this sandbox | Verified | `~/.claude/.credentials.json` `expiresAt` ≈ 7.5 h ahead |
+| 17. Task 0 (a): a skills-directory plugin loads with no prompt beyond workspace trust | Verified live (2.1.296, `-p`, scratch config) | debug log: "hooks module probe@skills-dir loaded (worker, environment 1, tier user)", "plugin.register: probe … judged by core alone: admitted" |
+| 18. Task 0 (b): a plain subagent's `agentId` is answered by `next` before its first `tool.call` | Verified live | spawn settled 08:58:36.478 with `agentId` af39…; that agent's Bash `tool.call` at 08:58:46 carried it. The parent's `Agent` tool call itself raises `tool.call` on main |
+| 19. Task 0 (b): Workflow-tool agents raise `agent.spawn`, and their tool calls carry the answered `agentId` | **Verified live** (D3 closed) | `subagentType` `workflow-subagent`, `workflow: {runId: "wf_…", agentIndex: 1}`, `parentAgentId` absent; the agent's Bash `tool.call` carried the same id |
+| 20. Task 0 (c): the Workflow tool is available under `-p`; a workflow agent's prompt and `model` option reach the hook | Verified live | prompt seen verbatim (`"READ-ONLY verifier. …"`), `model=sonnet` → answered `claude-sonnet-5-5` |
+| 21. Live smoke (post-implementation): G6, G1, G3 refuse in a real `-p` session with their corrective texts | Verified live | scratch checkout, haiku: `--no-verify` commit refused (no commit made), `cargo test -p htui` refused, Write of the literal under `crates/` refused (file unchanged) |
+| 22. Live smoke: a `READ-ONLY` subagent's Write is refused, its `git status` runs | Verified live | "agent a6e0… was started read-only and may not change files (Write)"; `notes.txt` absent |
 | 16. Tasks independent | No: all share `register.ts`/`guards.ts` | serial, one implementer |
