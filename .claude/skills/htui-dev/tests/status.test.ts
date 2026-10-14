@@ -263,7 +263,7 @@ test('malformed dev-health output reads as nothing', () => {
 const fakeRun = (answers: Record<string, Ran>, calls: string[][]) => async (argv: readonly string[]) => {
   calls.push([...argv])
   const key = Object.keys(answers).find(k => argv.join(' ').includes(k))
-  return key === undefined ? ({ failed: 'not found' } as Ran) : answers[key]
+  return key === undefined ? ({ failed: 'not found' } as Ran) : answers[key]!
 }
 const okRan = (stdout: string, exitCode = 0): Ran => ({ exitCode, stdout, stderr: '' })
 const HOST = { root: '/repo', windows: false }

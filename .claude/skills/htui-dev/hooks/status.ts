@@ -36,7 +36,7 @@ export function itemOf(hrItem: string | undefined, branch: string | null): { lab
   if (hrItem !== undefined && hrItem !== '') return { label: hrItem, key: hrItem }
   const m = branch === null ? null : /([A-Za-z]+-\d+)/.exec(branch)
   if (m !== null) {
-    const key = m[1].toUpperCase()
+    const key = m[1]!.toUpperCase()
     return { label: key, key }
   }
   return { label: branch ?? 'detached', key: null }
@@ -64,9 +64,9 @@ export function phaseOf(handoff: string, key: string): Phase {
   const start = lines.findIndex(l => open.test(l))
   if (start === -1) return 'not open'
   let end = start + 1
-  while (end < lines.length && !ITEM_LINE.test(lines[end]) && !HEADING.test(lines[end])) end++
+  while (end < lines.length && !ITEM_LINE.test(lines[end]!) && !HEADING.test(lines[end]!)) end++
   let phase: string | null = null
-  for (const m of lines.slice(start, end).join('\n').matchAll(/\*\*Phase\s+(\S+?)\s+landed\b/g)) phase = m[1]
+  for (const m of lines.slice(start, end).join('\n').matchAll(/\*\*Phase\s+(\S+?)\s+landed\b/g)) phase = m[1]!
   return phase === null ? 'open' : `${phase} landed`
 }
 
@@ -83,8 +83,8 @@ export function parsePorcelainV2(stdout: string): Porcelain {
   const p: Porcelain = { oid: null, head: null, ahead: null, dirty: 0 }
   for (const line of stdout.split(/\r?\n/)) {
     let m: RegExpExecArray | null
-    if ((m = /^# branch\.oid (\S+)/.exec(line)) !== null) p.oid = m[1] === '(initial)' ? null : m[1]
-    else if ((m = /^# branch\.head (.+)$/.exec(line)) !== null) p.head = m[1] === '(detached)' ? null : m[1]
+    if ((m = /^# branch\.oid (\S+)/.exec(line)) !== null) p.oid = m[1] === '(initial)' ? null : m[1]!
+    else if ((m = /^# branch\.head (.+)$/.exec(line)) !== null) p.head = m[1] === '(detached)' ? null : m[1]!
     else if ((m = /^# branch\.ab \+(\d+) -\d+/.exec(line)) !== null) p.ahead = Number(m[1])
     else if (/^[12u?] /.test(line)) p.dirty++
   }

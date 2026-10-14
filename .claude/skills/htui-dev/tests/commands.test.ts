@@ -131,8 +131,8 @@ test('/next answers the script stdout and its exit code', async () => {
   const calls: Call[] = []
   const got = await scriptCommand('next', POSIX, runner(calls, { exitCode: 0, stdout: 'next-item pre-filter\n  1. TOOL-8\n', stderr: 'noise' }))
   expect(got).toEqual({ text: 'next-item pre-filter\n  1. TOOL-8', exitCode: 0 })
-  expect(calls[0].cwd).toBe('/repo')
-  expect(calls[0].timeoutMs).toBe(60000)
+  expect(calls[0]!.cwd).toBe('/repo')
+  expect(calls[0]!.timeoutMs).toBe(60000)
 })
 
 test('a failing script appends its stderr and passes its code', async () => {

@@ -1,9 +1,17 @@
 {
   "name": "htui-dev",
   "version": "0.0.0-source",
-  "description": "Guards for developing htui: refuses the calls that have cost this repo real losses, each with the fix",
+  "description": "Developing htui: guards that refuse the calls that have cost this repo real losses, a status line (item, phase, branch, disk, Postgres, gate), and /gate, /next, /validate",
   "author": {
     "name": "htui"
   },
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "status_line": {
+      "type": "boolean",
+      "title": "Status line",
+      "description": "Show the item, HANDOFF phase, branch, disk, Postgres and gate line, refreshed every 60 s in interactive sessions; off stops the timer and the git and dev-health runs it makes",
+      "default": true
+    }
+  }
 }
