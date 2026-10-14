@@ -149,6 +149,9 @@ test('a read-only agent may not change the tree, the index or history through gi
     ['git branch -D topic', 'git branch'],
     ['cd crates && git commit -am x', 'git commit'],
     ['git -C /r commit --no-verify -m x', 'git commit'],
+    ['git push --force', 'git push'],
+    ['git worktree remove x', 'git worktree remove'],
+    ['git update-ref -d refs/heads/main', 'git update-ref'],
   ]
   for (const [command, verb] of commands) {
     const r = (await bash($, command, 'agent-1')) as { deny?: string }
@@ -166,6 +169,7 @@ test('a line the parser cannot follow is still checked for git writes from a rea
   for (const command of [
     'echo $((1<<2)); git commit -am x',
     `echo 'unbalanced; git -C /r reset --hard`,
+    `echo 'unbalanced; git push --force`,
     'echo $((1<<2)); git status; git stash list',
   ]) {
     got.push(((await bash($, command, 'agent-1')) as { deny?: string }).deny)
@@ -173,6 +177,7 @@ test('a line the parser cannot follow is still checked for git writes from a rea
   expect(got).toEqual([
     'htui-dev: agent agent-1 was started read-only and may not run git commit — report what to change instead',
     'htui-dev: agent agent-1 was started read-only and may not run git reset — report what to change instead',
+    'htui-dev: agent agent-1 was started read-only and may not run git push — report what to change instead',
     undefined,
   ])
   // An untagged agent's unreadable line stays allowed.

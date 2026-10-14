@@ -494,7 +494,7 @@ export function noVerify(words: Words): string | null {
   return `htui-dev: git commit --no-verify skips the repo's commit hooks — commit without it: ${quoteWords(fixed)}`
 }
 
-/** git subcommands that always change the working tree, the index, refs or history (G4). */
+/** git subcommands that change the working tree, the index, refs, history or the remote in every form (G4). */
 const GIT_WRITES = new Set([
   'commit',
   'reset',
@@ -510,7 +510,38 @@ const GIT_WRITES = new Set([
   'rm',
   'mv',
   'pull',
+  'push',
+  'checkout-index',
+  'read-tree',
+  'update-ref',
+  'update-index',
+  'gc',
+  'filter-branch',
 ])
+
+/**
+ * git subcommands that write only through some of their own subcommands: the action is the first
+ * word that is no option (past the value of an option `skip` names), and `writes` says whether
+ * that action (or none, `undefined`) writes. The label names the action when there is one to name.
+ */
+const GIT_ACTIONS: Readonly<Record<string, { skip: readonly string[]; writes: (action: string | undefined) => boolean; named: boolean }>> = {
+  bisect: { skip: [], writes: a => !['log', 'view', 'visualize'].includes(a ?? ''), named: false },
+  worktree: { skip: [], writes: a => ['add', 'remove', 'move', 'prune'].includes(a ?? ''), named: true },
+  submodule: { skip: [], writes: a => ['update', 'deinit', 'add', 'sync'].includes(a ?? ''), named: true },
+  'sparse-checkout': { skip: [], writes: a => a !== 'list', named: false },
+  reflog: { skip: [], writes: a => a === 'expire' || a === 'delete', named: true },
+  notes: { skip: ['--ref'], writes: a => ['add', 'remove', 'edit', 'append', 'copy', 'prune'].includes(a ?? ''), named: true },
+}
+
+/** The first word of `args` that is no option, past the value of an option in `skip`. */
+function actionOf(args: Words, skip: readonly string[]): string | undefined {
+  for (let i = 0; i < args.length; i++) {
+    const w = args[i]!
+    if (skip.includes(w)) i++
+    else if (!w.startsWith('-')) return w
+  }
+  return undefined
+}
 
 /** `git checkout` options whose value is the next word. */
 const CHECKOUT_VALUE = new Set(['-b', '-B', '--orphan'])
@@ -565,16 +596,27 @@ function listsOnly(args: Words, writeLong: readonly string[], writeShort: string
 }
 
 /**
- * G4's Bash half: the git command that changes the working tree, the index, refs or history, as a
- * label for the refusal, or null. Reading stays allowed: status, diff, log, show, blame, fetch,
- * `stash list|show`, `checkout <branch>`, `clean -n`, and the list forms of `branch` and `tag`.
+ * G4's Bash half: the git command, of those listed in docs/htui-dev.md, that changes the working
+ * tree, the index, refs, history or the remote, as a label for the refusal, or null. Reading stays
+ * allowed: status, diff, log, show, blame, fetch, `stash list|show`, `checkout <branch>`, `clean -n`,
+ * the list forms of `branch`, `tag`, `replace`, `reflog`, `notes`, `worktree`, `submodule`,
+ * `sparse-checkout`, and `bisect log|view|visualize`. A git command not listed passes (Known gaps).
  */
 export function gitWrite(words: Words): string | null {
   const git = gitSubcommand(words)
   if (git === null) return null
   const args = words.slice(git.at)
   if (GIT_WRITES.has(git.sub)) return `git ${git.sub}`
+  const actions = GIT_ACTIONS[git.sub]
+  if (actions !== undefined) {
+    const action = actionOf(args, actions.skip)
+    if (!actions.writes(action)) return null
+    return actions.named ? `git ${git.sub} ${action}` : `git ${git.sub}`
+  }
   switch (git.sub) {
+    case 'replace':
+      // `git replace` alone, or with `-l`/`--list`, lists the replacements.
+      return args.length === 0 || args[0] === '-l' || args[0] === '--list' || args[0]!.startsWith('--format') ? null : 'git replace'
     case 'stash':
       return args[0] === 'list' || args[0] === 'show' ? null : 'git stash'
     case 'checkout':
@@ -605,11 +647,12 @@ export function gitWrite(words: Words): string | null {
 }
 
 /**
- * A `git` word followed, past its global options, by a subcommand that always writes (`stash` but
- * its list and show). Only for a line the parser cannot follow; coarse on purpose.
+ * A `git` word followed, past its global options, by a subcommand that writes in (nearly) every
+ * form, or by a writing action of one that does not. Only for a line the parser cannot follow;
+ * coarse on purpose.
  */
 const COARSE_GIT_WRITE =
-  /(?:^|[\s;&|()`'"])git(?:\s+(?:-C|-c|--git-dir|--work-tree|--namespace)\s+\S+|\s+-\S+)*\s+(commit|reset|restore|switch|merge|rebase|cherry-pick|revert|am|apply|add|rm|mv|pull|clean|stash(?!\s+(?:list|show)\b))(?![\w-])/
+  /(?:^|[\s;&|()`'"])git(?:\s+(?:-C|-c|--git-dir|--work-tree|--namespace)\s+\S+|\s+-\S+)*\s+(commit|reset|restore|switch|merge|rebase|cherry-pick|revert|am|apply|add|rm|mv|pull|clean|push|checkout-index|read-tree|update-ref|update-index|gc|filter-branch|stash(?!\s+(?:list|show)\b)|bisect(?!\s+(?:log|view|visualize)\b)|worktree\s+(?:add|remove|move|prune)|submodule\s+(?:update|deinit|add|sync)|sparse-checkout(?!\s+list\b)|reflog\s+(?:expire|delete)|notes\s+(?:add|remove|edit|append|copy|prune))(?![\w-])/
 
 /**
  * G4's Bash half for a line the parser cannot follow (an unbalanced quote, `$((1<<2))` read as a
@@ -618,7 +661,7 @@ const COARSE_GIT_WRITE =
  */
 export function coarseGitWrite(command: string): string | null {
   const m = COARSE_GIT_WRITE.exec(command)
-  return m === null ? null : `git ${m[1]}`
+  return m === null ? null : `git ${m[1]!.replace(/\s+/g, ' ')}`
 }
 
 // --- G3: the forbidden literal --------------------------------------------------------------
