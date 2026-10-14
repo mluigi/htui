@@ -499,6 +499,12 @@ to the current model of each line, so the map is re-checked when an alias moves)
 | `haiku` (Haiku 4.5) | 25 | 25 | Epoch ECI 142.42, roughly 14 points below the 156-157 frontier band. Absent from AA and from both Arena top thirties |
 | `*` (including `default` **and `sonnet`**) | 65 | 65 | The conservative catch-all. `sonnet` is **deliberately not a key** (§7.4): it has no independent analysis-kind figure, so it resolves here rather than carrying a number no source can check |
 
+**Amendment (ANA-30, 2026-10-14):** the `haiku` alias moved to Haiku 5.5 on 2026-10-07, so the
+`haiku` row's basis (Haiku 4.5) no longer describes what the alias runs. Settled by the maintainer:
+the row is re-keyed on `claude-haiku-5-5` and left unscored, so it resolves through `*` (65) until a
+source scores Haiku 5.5, as `sonnet` does (§7.4); the 25 above is withdrawn with its basis. MOD-36
+seeds the amended map (`docs/ANA-30.md` §3.1, §8 call 8).
+
 `agy`:
 
 | Model string | `"*"` | `implement`, `fix`, `reproduce` | Basis, re-read 2026-09-28 |
