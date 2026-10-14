@@ -733,3 +733,4 @@ arguments. See [`docs/hr-sandbox.md`](docs/hr-sandbox.md).
 - [`docs/htui-cli.md`](docs/htui-cli.md): `htui status`, `htui waiting` and `--search-items --json` for scripts: every JSON document, the exit codes and the versioning rule.
 - [`docs/htui-secrets.md`](docs/htui-secrets.md): the Infisical secret provider — machine identity, base URL, errors.
 - [`docs/htui-editor.md`](docs/htui-editor.md): `E`/`Ctrl+E`, `$VISUAL`/`$EDITOR`, and the in-pane editor (`HTUI_EDITOR_PANE`): working in other tabs while it waits, the quit and abort questions, and the `[editor]` key table.
+- [`docs/htui-dev.md`](docs/htui-dev.md): the `htui-dev` Claude Code mod that guards work on this repository: what it refuses and why, the fix each refusal names, and how to turn it off.

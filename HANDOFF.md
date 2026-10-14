@@ -393,7 +393,7 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   lists it in `TOOL_EXCLUDES` as untracked. Correct `.claude/skills/handoff-run/references/lifecycle.md:98-99` and
   `install-workflow-hooks.sh:22-23` to what this repo has now that TOOL-9 landed (the commit hook via
   `core.hooksPath`, the `--no-verify` block from TOOL-8). No behaviour change. Nothing here is
-  blocked except the `--no-verify` wording, which waits on TOOL-8 M1. TOOL-9 already added the
+  blocked: TOOL-8 M1 landed (G6 in `docs/htui-dev.md`). TOOL-9 already added the
   `core.hooksPath` paragraph to `.claude/skills/handoff-run/references/lifecycle.md` and the installer header, so check those first.
 - [ ] **MOD-3 - Diff tab + code explorer.** `R-LATER-1`. Later tier; needs its own ANA first.
 - [ ] **MOD-5 - Issue tracker mirror.** `R-LATER-2`. `IssueSync` trait, OneDev first, downstream
@@ -426,6 +426,12 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   Tests with `claude plugin test`; `claude plugin validate --strict` in TOOL-9's gate. Open in the
   plan: whether `agent.spawn` fires for Workflow-tool agents (D3), and whether a skills-directory
   mod prompts beyond workspace trust. M1 unblocked (MOD-91 done: a skills-directory `htui-dev` mod no longer loads in htui's own sessions unless the row sets `mods (y/n)`); M2 unblocked (TOOL-9 done: `scripts/gate.sh`/`.ps1`, `--detach`, `--status`, `target/gate/last.json`, `docs/decisions/tool/tool-9.md`).
+  **Phase M1 landed (`1d3963c3`..`40446f29`, 2026-10-14):** `.claude/skills/htui-dev/` guards G1-G6
+  (`docs/htui-dev.md`, plan `.claude/plans/tool-8-m1-guards.plan.md`), 88 kit tests, validate
+  `--strict` green, two review rounds. Both open questions closed live: no prompt beyond trust, and
+  `agent.spawn` fires for Workflow agents. G1 models dev-dependency features (only htui's `testkit`
+  goes vacuous in a workspace run). `MultiEdit` no longer exists; Gortex and Serena write tools are
+  guarded instead. Known gaps in `docs/htui-dev.md`. M2 unblocked (TOOL-9 done).
 - [ ] **TOOL-10 - hr sandbox: stop a run from planting a mod that runs on the host** (from
   ANA-29, `docs/ANA-29.md` §3.3). `~/.claude` is shared read-write with every run
   (`docker/hr/compose.hr.yaml:99-114`), and `docs/hr-sandbox.md` already lists "add hooks or
