@@ -162,8 +162,12 @@ const since = (isoTime: string | null, now: number): string => {
 
 const failedSteps = (doc: GateDoc): string[] => doc.steps.filter(s => s.status === 'failed').map(s => s.name)
 
-/** The outcome alone: `gate passed`, `gate failed: test, abort-grep`, or `gate running`. */
+/**
+ * The outcome alone: `gate passed`, `gate failed: test, abort-grep`, or `gate running`. A
+ * finished pass of one step (`--only`) names it: `gate plugin passed` is not the gate passing.
+ */
 const outcome = (doc: GateDoc): string => {
+  if (doc.state === 'passed' && doc.steps.length === 1) return `gate ${doc.steps[0]!.name} passed`
   if (doc.state !== 'failed') return `gate ${doc.state}`
   const failed = failedSteps(doc)
   return failed.length === 0 ? 'gate failed' : `gate failed: ${failed.join(', ')}`

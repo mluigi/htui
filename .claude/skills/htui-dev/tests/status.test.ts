@@ -173,6 +173,15 @@ test('a failed gate lists its failed steps in order', () => {
   expect(gateSummary(doc, HEAD, T0)).toBe('gate failed: test, abort-grep 40m')
 })
 
+test('a one-step run (--only) names its step, so it never reads as the whole gate', () => {
+  const only = parseGate(gateDoc({ state: 'passed', startedAgo: 200, finishedAgo: 120, steps: [['plugin', 'passed', 30]] }))
+  expect(gateSummary(only, HEAD, T0)).toBe('gate plugin passed 2m')
+  if (only === null || only === 'unreadable') throw new Error('unparsed')
+  expect(gateToast(only)).toBe('gate plugin passed')
+  const failed = parseGate(gateDoc({ state: 'failed', startedAgo: 200, finishedAgo: 120, steps: [['fmt', 'failed', 3]] }))
+  expect(gateSummary(failed, HEAD, T0)).toBe('gate failed: fmt 2m')
+})
+
 test('a result for another HEAD says so', () => {
   const doc = parseGate(gateDoc({ state: 'passed', startedAgo: 200, finishedAgo: 100, head: 'b'.repeat(40) }))
   expect(gateSummary(doc, HEAD, T0)).toBe('gate passed 1m (older HEAD)')
