@@ -425,20 +425,111 @@ export function noVerify(words: Words): string | null {
   return `htui-dev: git commit --no-verify skips the repo's commit hooks — commit without it: ${quoteWords(fixed)}`
 }
 
-/** G4's Bash half: the git command that changes the tree or history (`git commit`, `git stash` but its list and show, `git reset`, `git checkout --`), or null. */
+/** git subcommands that always change the working tree, the index, refs or history (G4). */
+const GIT_WRITES = new Set([
+  'commit',
+  'reset',
+  'restore',
+  'switch',
+  'merge',
+  'rebase',
+  'cherry-pick',
+  'revert',
+  'am',
+  'apply',
+  'add',
+  'rm',
+  'mv',
+  'pull',
+])
+
+/** `git checkout` options whose value is the next word. */
+const CHECKOUT_VALUE = new Set(['-b', '-B', '--orphan'])
+
+/** What `git checkout` writes, or null when it only switches branches: paths, `--force` or `--patch`. */
+function checkoutWrite(args: Words): string | null {
+  let positionals = 0
+  for (let i = 0; i < args.length; i++) {
+    const w = args[i]!
+    if (w === '--') return 'git checkout <paths>'
+    if (w === '--force') return 'git checkout --force'
+    if (w === '--patch') return 'git checkout --patch'
+    if (w.startsWith('--pathspec-from-file')) return 'git checkout <paths>'
+    if (CHECKOUT_VALUE.has(w)) i++
+    else if (/^-[A-Za-z]+$/.test(w)) {
+      if (w.includes('f')) return 'git checkout --force'
+      if (w.includes('p')) return 'git checkout --patch'
+      if (/[bB]$/.test(w)) i++
+    } else if (!w.startsWith('-')) {
+      if (w === '.' || ++positionals >= 2) return 'git checkout <paths>'
+    }
+  }
+  return null
+}
+
+/**
+ * Whether a `git branch` or `git tag` command only lists: no write option (`writeLong`, or a short
+ * cluster with a letter of `writeShort`), and a name given only to a list form (`--list`, `-l`, ...),
+ * as a pattern, or as the value of a filter (`--contains <commit>`).
+ */
+function listsOnly(args: Words, writeLong: readonly string[], writeShort: string, listing: readonly string[]): boolean {
+  const filters = ['--contains', '--no-contains', '--merged', '--no-merged', '--points-at', '--sort', '--format']
+  let list = false
+  let names = false
+  for (let i = 0; i < args.length; i++) {
+    const w = args[i]!
+    const name = w.split('=')[0]!
+    if (w === '--') {
+      names ||= i + 1 < args.length
+      break
+    }
+    if (writeLong.includes(name)) return false
+    if (listing.includes(name)) list = true
+    else if (filters.includes(w) && i + 1 < args.length && !args[i + 1]!.startsWith('-')) i++
+    else if (/^-[A-Za-z]/.test(w) && !w.startsWith('--')) {
+      const letters = w.slice(1).replace(/\d+$/, '')
+      if ([...letters].some(l => writeShort.includes(l))) return false
+      if ([...letters].some(l => listing.includes(`-${l}`))) list = true
+    } else if (!w.startsWith('-')) names = true
+  }
+  return list || !names
+}
+
+/**
+ * G4's Bash half: the git command that changes the working tree, the index, refs or history, as a
+ * label for the refusal, or null. Reading stays allowed: status, diff, log, show, blame, fetch,
+ * `stash list|show`, `checkout <branch>`, `clean -n`, and the list forms of `branch` and `tag`.
+ */
 export function gitWrite(words: Words): string | null {
   const git = gitSubcommand(words)
   if (git === null) return null
   const args = words.slice(git.at)
+  if (GIT_WRITES.has(git.sub)) return `git ${git.sub}`
   switch (git.sub) {
-    case 'commit':
-      return 'git commit'
     case 'stash':
       return args[0] === 'list' || args[0] === 'show' ? null : 'git stash'
-    case 'reset':
-      return 'git reset'
     case 'checkout':
-      return args.includes('--') ? 'git checkout --' : null
+      return checkoutWrite(args)
+    case 'clean':
+      return args.some(w => w === '--dry-run' || /^-[A-Za-z]*n/.test(w)) ? null : 'git clean'
+    case 'branch':
+      return listsOnly(
+        args,
+        ['--delete', '--move', '--copy', '--force', '--set-upstream-to', '--unset-upstream', '--edit-description', '--track', '--no-track', '--create-reflog'],
+        'dDmMcCfut',
+        ['--list', '-l', '-a', '--all', '-r', '--remotes', '--show-current'],
+      )
+        ? null
+        : 'git branch'
+    case 'tag':
+      return listsOnly(
+        args,
+        ['--annotate', '--sign', '--no-sign', '--local-user', '--force', '--delete', '--message', '--file', '--edit', '--create-reflog', '--trailer'],
+        'asudmFfe',
+        ['--list', '-l', '-n', '--verify', '-v'],
+      )
+        ? null
+        : 'git tag'
     default:
       return null
   }

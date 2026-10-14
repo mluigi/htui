@@ -92,7 +92,7 @@ test('a read-only agent may not write files', async ($, on) => {
   expect(reached).toEqual([])
 })
 
-test('a read-only agent may not commit, stash, reset or check out files', async ($, on) => {
+test('a read-only agent may not change the tree, the index or history through git', async ($, on) => {
   const reached: Reached[] = []
   tools(on, reached)
   agents(on, [])
@@ -101,7 +101,12 @@ test('a read-only agent may not commit, stash, reset or check out files', async 
     ['git commit -m x', 'git commit'],
     ['git stash', 'git stash'],
     ['git reset --hard', 'git reset'],
-    ['git checkout -- src/a.rs', 'git checkout --'],
+    ['git checkout -- src/a.rs', 'git checkout <paths>'],
+    ['git checkout .', 'git checkout <paths>'],
+    ['git restore .', 'git restore'],
+    ['git clean -fdx', 'git clean'],
+    ['git add -A', 'git add'],
+    ['git branch -D topic', 'git branch'],
     ['cd crates && git commit -am x', 'git commit'],
     ['git -C /r commit --no-verify -m x', 'git commit'],
   ]
@@ -120,8 +125,9 @@ test('a read-only agent may read, check and inspect', async ($, on) => {
   await call($, 'Read', { file_path: 'src/a.rs' }, 'agent-1')
   await bash($, 'cargo check -p htui', 'agent-1')
   await bash($, 'git status && git diff && git stash list', 'agent-1')
+  await bash($, 'git log -n 3 && git show HEAD && git branch -a && git fetch && git checkout main', 'agent-1')
   await call($, 'mcp__gortex__search', { query: 'x' }, 'agent-1')
-  expect(reached.map(r => r.tool)).toEqual(['Read', 'Bash', 'Bash', 'mcp__gortex__search'])
+  expect(reached.map(r => r.tool)).toEqual(['Read', 'Bash', 'Bash', 'Bash', 'mcp__gortex__search'])
 })
 
 test('a read-only agent still meets the other guards', async ($, on) => {
