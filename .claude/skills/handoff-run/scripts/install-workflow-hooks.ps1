@@ -13,6 +13,11 @@
 #   post-commit (workspace only, prepended before foreign blocks): commit touching
 #               surface source -> run sync-workflow-surface.ps1 + refresh hooks.
 #
+# core.hooksPath (TOOL-9): for the workspace, also points core.hooksPath at scripts/githooks
+#   (when that directory ships a pre-commit) and drops its own pre-commit block, since the
+#   committed hook runs the validator and then chains to whatever .git/hooks holds. The
+#   post-commit sync block stays in .git/hooks and is reached through that chain.
+#
 # Escape hatch (printed on block): WORKFLOW_SKIP_HOOK=1. Deliberately NOT --no-verify: a
 # separate PreToolUse hook hard-blocks that flag for agent sessions, so advertising it
 # would be dead advice - and after the -ScopePaths change an unrelated commit needs
@@ -124,6 +129,53 @@ function Set-MarkerBlock {
         $HookPath,
         (($new -join "`n") + "`n"),
         (New-Object System.Text.UTF8Encoding($false)))
+}
+
+$HooksPathValue = 'scripts/githooks'
+
+function Remove-MarkerBlock {
+    # Drops our '# workflow-hook-start/end' block (markers included); every other line,
+    # foreign blocks included, stays. No block or no file: nothing done.
+    param([string]$HookPath)
+    if (-not (Test-Path -LiteralPath $HookPath)) { return }
+    $lines = @(ConvertTo-LfLines ([System.IO.File]::ReadAllText($HookPath)))
+    $start = Find-MarkerIndex -Lines $lines -Marker $StartMarker
+    if ($start -lt 0) { return }
+    $end = Find-MarkerIndex -Lines $lines -Marker $EndMarker -From ($start + 1)
+    if ($end -lt 0) {
+        throw "corrupted workflow-hook block in ${HookPath}: start marker without matching end - fix by hand"
+    }
+    $pre = if ($start -gt 0) { $lines[0..($start - 1)] } else { @() }
+    $post = if ($end -lt $lines.Count - 1) { $lines[($end + 1)..($lines.Count - 1)] } else { @() }
+    $new = @($pre) + @($post)
+    [System.IO.File]::WriteAllText(
+        $HookPath,
+        (($new -join "`n") + "`n"),
+        (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Get-HooksPath {
+    param([string]$Root)
+    $v = & git -C $Root config --local --get core.hooksPath 2>$null
+    if ($LASTEXITCODE -ne 0) { return '' }
+    return "$v".Trim()
+}
+
+function Set-HooksPath {
+    # Points core.hooksPath at the committed hooks (TOOL-9). Relative, so it resolves in the
+    # main checkout and in every linked worktree. A repo without the committed hooks is left
+    # alone: a hooksPath to nowhere would switch off every hook it has.
+    param([string]$Root)
+    if (-not (Test-Path -LiteralPath (Join-Path $Root $HooksPathValue 'pre-commit'))) { return }
+    if ((Get-HooksPath -Root $Root) -ne $HooksPathValue) {
+        & git -C $Root config --local core.hooksPath $HooksPathValue
+    }
+}
+
+function Test-CommittedHooksActive {
+    param([string]$Root)
+    return ((Test-Path -LiteralPath (Join-Path $Root $HooksPathValue 'pre-commit')) -and
+        ((Get-HooksPath -Root $Root) -eq $HooksPathValue))
 }
 
 function ConvertTo-ShSingleQuoted {
@@ -268,8 +320,14 @@ function Install-WorkflowHooks {
         }
         # -InsertAfterShebang for both hooks: a foreign block with an early exit 0 must
         # never sit above ours and swallow it.
-        Set-MarkerBlock -HookPath (Join-Path $hooksDir 'pre-commit') `
-            -BlockLines $preCommitLines -InsertAfterShebang
+        if ($t.IsWorkspace -and (Test-CommittedHooksActive -Root $t.Root)) {
+            # scripts/githooks/pre-commit does this job and chains to the rest; two copies
+            # would run the validator twice.
+            Remove-MarkerBlock -HookPath (Join-Path $hooksDir 'pre-commit')
+        } else {
+            Set-MarkerBlock -HookPath (Join-Path $hooksDir 'pre-commit') `
+                -BlockLines $preCommitLines -InsertAfterShebang
+        }
         if ($t.IsWorkspace) {
             Set-MarkerBlock -HookPath (Join-Path $hooksDir 'post-commit') `
                 -BlockLines (New-PostCommitBlock) -InsertAfterShebang
@@ -486,12 +544,33 @@ function Invoke-SelfTest {
         if ($LASTEXITCODE -ne 2) {
             $failures += "case13: required missing target exited $LASTEXITCODE, expected 2"
         }
+
+        # Case 14-15: committed hooks (TOOL-9). core.hooksPath is set once, and the installer's
+        # own pre-commit block goes while a foreign block stays. (The .sh twin's case 16, which
+        # runs the committed sh hook itself, has no equivalent here: that hook is sh.)
+        $ws14 = Join-Path $tmp 'case14\workspace'
+        New-Item -ItemType Directory -Force (Join-Path $ws14 'scripts\githooks') | Out-Null
+        & git init -q $ws14
+        Set-Content -LiteralPath (Join-Path $ws14 'scripts\githooks\pre-commit') -Value '#!/bin/sh'
+        $own14 = Join-Path $ws14 '.git\hooks\pre-commit'
+        [System.IO.File]::WriteAllText($own14, ((@('#!/bin/sh') + $foreignBlock) -join "`n") + "`n")
+        Set-MarkerBlock -HookPath $own14 -BlockLines (New-PreCommitBlock) -InsertAfterShebang
+        Set-HooksPath -Root $ws14
+        if ((Get-HooksPath -Root $ws14) -ne 'scripts/githooks') { $failures += 'case14: core.hooksPath not set' }
+        Install-WorkflowHooks -TargetList @(Get-HookTargets -Root $ws14 -Names @()) -Quiet
+        $raw14 = [System.IO.File]::ReadAllText($own14)
+        if ($raw14 -match [regex]::Escape($StartMarker)) { $failures += 'case15: own pre-commit block survived next to the committed hook' }
+        if ($raw14 -notmatch [regex]::Escape('# graphify-hook-start')) { $failures += 'case15: foreign pre-commit block lost' }
+        $h14a = (Get-FileHash $own14 -Algorithm SHA256).Hash
+        Set-HooksPath -Root $ws14
+        Install-WorkflowHooks -TargetList @(Get-HookTargets -Root $ws14 -Names @()) -Quiet
+        if ((Get-FileHash $own14 -Algorithm SHA256).Hash -ne $h14a) { $failures += 'case14: second install changed the hook' }
     } finally {
         if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
     }
 
     if ($failures.Count -eq 0) {
-        Write-Host 'Self-test: 13/13 cases PASS.'
+        Write-Host 'Self-test: 15/15 cases PASS.'
         return 0
     }
     Write-Host "Self-test FAIL ($($failures.Count)):"
@@ -515,6 +594,10 @@ if (-not (Test-Path -LiteralPath $WorkspaceRoot)) {
 # as WF_WORKSPACE_ROOT, and a relative one there would be read against the committing
 # repo's cwd — the exact breakage the baked literals exist to remove.
 $WorkspaceRoot = [System.IO.Path]::GetFullPath($WorkspaceRoot).TrimEnd('\', '/')
+
+# Before target resolution: a missing required target exits 2, and the workspace's own
+# hooksPath must not depend on a sub-repo this checkout does not have.
+Set-HooksPath -Root $WorkspaceRoot
 
 Install-WorkflowHooks -TargetList (Get-HookTargets -Root $WorkspaceRoot -Names $Targets)
 exit 0

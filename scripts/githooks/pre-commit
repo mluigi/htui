@@ -1,0 +1,41 @@
+#!/bin/sh
+# pre-commit (TOOL-9): block a commit on workflow-doc findings in the files it stages, then
+# hand over to whatever the clone keeps in its own hooks directory. Active once
+# `core.hooksPath` is scripts/githooks (install-workflow-hooks.sh / .ps1 sets it).
+#
+# Escape hatch: WORKFLOW_SKIP_HOOK=1 git commit ...  Only findings in staged files block;
+# a pre-existing finding elsewhere prints as [WARNING] and does not.
+#
+# Windows runs the pwsh body: a bash subprocess there stalls or dies on fork, which reads as
+# a hang rather than an error (measured 2026-08-21, see install-workflow-hooks.sh).
+
+HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+case "$(uname -s 2>/dev/null || echo unknown)" in
+    MINGW*|MSYS*|CYGWIN*|Windows_NT)
+        pwsh -NoProfile -File "$HOOK_DIR/pre-commit.ps1" || exit 1
+        ;;
+    *)
+        WF_STAGED=$(git diff --cached --name-only)
+        WF_DOCS_PATTERN='^HANDOFF\.md$|^DECISIONS\.md$|^docs/decisions/.+\.md$|^docs/ANA-[^/]+\.md$'
+
+        # Fast path: the validator only spawns when a watched path is staged.
+        if [ -n "$WF_STAGED" ] && [ "${WORKFLOW_SKIP_HOOK:-0}" != "1" ] \
+           && echo "$WF_STAGED" | grep -E -q "$WF_DOCS_PATTERN"; then
+            bash ".claude/skills/handoff-run/scripts/validate-workflow-docs.sh" --scope-paths "$WF_STAGED"
+            wf_status=$?
+            if [ "$wf_status" -ne 0 ]; then
+                echo "[workflow-hook] validate-workflow-docs.sh exited $wf_status - findings above, in files this commit stages." >&2
+                echo "[workflow-hook] escape hatch: WORKFLOW_SKIP_HOOK=1 git commit ..." >&2
+                exit 1
+            fi
+        fi
+        ;;
+esac
+
+# Chain: core.hooksPath replaces .git/hooks, so run the clone's own hook (a foreign block such
+# as graphify's lives there). No 'exit 0' above this line, or the chain would be skipped.
+WF_OWN="$(git rev-parse --git-common-dir)/hooks/pre-commit"
+if [ -x "$WF_OWN" ]; then
+    "$WF_OWN" "$@" || exit 1
+fi
