@@ -3,7 +3,7 @@
 **Source**: `HANDOFF.md` TOOL-8 (from ANA-29, `docs/ANA-29.md` §4.2 D1-D4/D8, §6.1-6.3)
 **Routed**: plan path (C3 only fired); maintainer scoped the run to **M1**. M2 (status line, `/gate`,
 `/next`, `/validate`) stays open, blocked on TOOL-9.
-**Status**: M1 done 2026-10-14 (`1d3963c3`..`40446f29`; review R1 block → fixed, R2 approve with changes → fixed). M2 open, blocked on TOOL-9.
+**Status**: M1 done 2026-10-14 (`1d3963c3`..`40446f29`; review R1 block → fixed, R2 approve with changes → fixed). M2 done 2026-10-14 (`.claude/plans/tool-8-m2-status-commands.plan.md`).
 **Complexity**: Medium (one new plugin directory, ~10 files, no Rust change)
 
 ## Summary

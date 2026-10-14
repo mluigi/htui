@@ -14,7 +14,12 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-14):** **TOOL-10 is done** (`docs/decisions/tool/tool-10.md`): in an `hr` run
+**Current status (2026-10-14):** **TOOL-8 is done** (`docs/decisions/tool/tool-8.md`): the `htui-dev` mod
+(`.claude/skills/htui-dev/`, `docs/htui-dev.md`) refuses six kinds of costly call (M1), and keeps a status line in
+interactive sessions (item and HANDOFF phase, merge/ahead/dirty, disk above 90%, Postgres not up, last gate) with a
+toast when a gate finishes, plus turnless `/gate`, `/next` and `/validate` (M2); `scripts/dev-health.sh`/`.ps1` are
+new. Owed on the host: a Windows run (`claude -p "/gate fmt"` returns at once, the `.ps1` commands), `dev-health`'s
+docker path against the real `htui-postgres`, and the Postgres gate. Before it, **TOOL-10 is done** (`docs/decisions/tool/tool-10.md`): in an `hr` run
 `~/.claude/plugins` and `skills` are read-only (`plugins/data` and `plugins/store` stay writable) and `dev-mods` is a
 tmpfs, so a run cannot plant a mod that runs in the host's next session; `settings.json` is still writable, filed as
 **TOOL-12**. Owed on the host: a real `scripts/hr up`, the Docker bats case. Before it, **ANA-30 is concluded** (`docs/ANA-30.md`, `docs/decisions/ana/ana-30.md`): no
@@ -36,8 +41,7 @@ levels are pinned by a capture test, the project-settings decode warn fires once
 `project.settings` is refused by `ProjectCaps::from_settings` as the writers refuse it. Owed on the host: the Postgres
 gate on the merged tree. Earlier completions (**MOD-67**, **MOD-96**, **CLEAN-10**, **MOD-93**, **MOD-89**, **MOD-95**, **TOOL-11**,
 **MOD-91**, **MOD-92**) are in `DECISIONS.md`; their host Postgres gates on the merged tree, the Windows runs
-and MOD-93's live install and `tsc` on the mod stay owed. Open from ANA-29: **TOOL-8** and
-**MOD-94** behind a maintainer decision.
+and MOD-93's live install and `tsc` on the mod stay owed. Open from ANA-29: **MOD-94** behind a maintainer decision.
 Live coordinates after MOD-96: migrations run through `0018_seed_permission_mode` (MOD-96: data only, pins
 `acp.permission_mode` on the seeded `claude` row), before it `0017_follow_up` (`run_command.run_step_id`,
 `text`; `follow_up_window`; MOD-12's `0016_auto_queue`: `queue_entry`, `queue_batch`, `run.batch_id`), so **the next
@@ -420,30 +424,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 
 ### Tooling findings
 
-- [ ] **TOOL-8 - `htui-dev` mod: guards, status line and turnless commands** (from ANA-29,
-  `docs/ANA-29.md` §4.2, §6). A skills-directory plugin at `.claude/skills/htui-dev/`
-  (`.claude-plugin/plugin.json`, `hooks/hooks.json` → `register.ts`, `*.test.ts`), loaded in
-  place by every trusted checkout and sandbox clone; develop it with `--plugin-dir`. **M1 guards**,
-  each a `{deny}` with a corrective reason, never a rewrite: `cargo test` of `-p htui` or
-  `--workspace` without `--features testkit`/`--all-features`, and `--features testkit` on crates
-  that call it `test-support`; the substring `zeta` in Edit/Write/MultiEdit content written to
-  `crates/**/*.rs` or `crates/**/*.json`, except `crates/htui-agent/tests/extensibility.rs` (the
-  test's own scope: `tree_files()` and `text.contains("zeta")`); Edit/Write and
-  `git commit|stash|reset|checkout --` from an agent whose spawn prompt declared it read-only (`agent.spawn` records the `agentId`);
-  an `agent.spawn` naming a Fable model (deny, not warn: maintainer, 2026-10-08); `git commit --no-verify`. Guards fail open with a
-  status warning. **M2 status and commands**: a status line from a 60 s timer (item and HANDOFF
-  phase from `HR_ITEM` or the branch, `MERGE_HEAD`, ahead/dirty counts, disk above 90%, Postgres
-  down, last gate result); turnless `/gate` (starts TOOL-9's script detached, polls its status
-  file, toasts the result), `/next`, `/validate` (the existing `.sh`/`.ps1` scripts by platform).
-  Tests with `claude plugin test`; `claude plugin validate --strict` in TOOL-9's gate. Open in the
-  plan: whether `agent.spawn` fires for Workflow-tool agents (D3), and whether a skills-directory
-  mod prompts beyond workspace trust. M1 unblocked (MOD-91 done: a skills-directory `htui-dev` mod no longer loads in htui's own sessions unless the row sets `mods (y/n)`); M2 unblocked (TOOL-9 done: `scripts/gate.sh`/`.ps1`, `--detach`, `--status`, `target/gate/last.json`, `docs/decisions/tool/tool-9.md`).
-  **Phase M1 landed (`1d3963c3`..`40446f29`, 2026-10-14):** `.claude/skills/htui-dev/` guards G1-G6
-  (`docs/htui-dev.md`, plan `.claude/plans/tool-8-m1-guards.plan.md`), 88 kit tests, validate
-  `--strict` green, two review rounds. Both open questions closed live: no prompt beyond trust, and
-  `agent.spawn` fires for Workflow agents. G1 models dev-dependency features (only htui's `testkit`
-  goes vacuous in a workspace run). `MultiEdit` no longer exists; Gortex and Serena write tools are
-  guarded instead. Known gaps in `docs/htui-dev.md`. M2 unblocked (TOOL-9 done).
 - [ ] **TOOL-12 - hr sandbox: settings.json, agents, commands and hooks in ~/.claude stay writable from a run**
   (from TOOL-10, `docs/decisions/tool/tool-10.md`). TOOL-10 made `~/.claude/plugins` and `skills`
   read-only, so a run cannot install a plugin or write a mod. It can still write `settings.json` (hooks,
@@ -461,4 +441,4 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 | ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
 | MOD-N   | 20 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
-| TOOL-N  | 2 (TOOL-8 `htui-dev` mod, TOOL-12 sandbox settings hardening) |
+| TOOL-N  | 1 (TOOL-12 sandbox settings hardening) |

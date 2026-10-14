@@ -251,6 +251,13 @@ run_self_test() {
     write_last running
     [[ "$(jq -r '.finished' "$LAST_JSON")" == "null" ]] || failures+=('last.json: running state has a finished time')
 
+    # The htui-dev mod's /gate checks a step name against its own copy of STEPS (TOOL-8 M2).
+    local mod="$REPO_ROOT/.claude/skills/htui-dev/hooks/commands.ts" listed
+    if [[ -f "$mod" ]]; then
+        listed="$(grep -o "GATE_STEPS = \[[^]]*\]" "$mod" | grep -o "'[a-z-]*'" | tr -d "'" | tr '\n' ' ')"
+        [[ "$listed" == "${STEPS[*]} " ]] || failures+=("htui-dev GATE_STEPS ($listed) differ from STEPS (${STEPS[*]})")
+    fi
+
     rm -rf "$tmp"
     rc=0
     if [[ ${#failures[@]} -eq 0 ]]; then

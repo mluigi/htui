@@ -1,21 +1,31 @@
-# Guards for developing htui (`.claude/skills/htui-dev`)
+# Developing htui with Claude Code: the `htui-dev` mod (`.claude/skills/htui-dev`)
 
 `htui-dev` is a Claude Code mod that lives in this repository and loads in every Claude Code session
-you open here. It refuses five kinds of tool call that have cost this repo real work: test runs that
-pass without testing anything, a name the extensibility test forbids written into `crates/`, writes
-and commits from agents that were started read-only, Fable subagents, and `git commit --no-verify`.
-Each refusal says what to run instead.
+you open here. It does three things:
 
-It is a safety net, not a sandbox. It never rewrites a call, it lets through anything it cannot
-read, and you can turn it off for a session.
+- **Guards.** It refuses five kinds of tool call that have cost this repo real work: test runs that
+  pass without testing anything, a name the extensibility test forbids written into `crates/`,
+  writes and commits from agents that were started read-only, Fable subagents, and
+  `git commit --no-verify`. Each refusal says what to run instead.
+- **A status line.** In an interactive session, one line under the prompt shows the item you are on
+  and its HANDOFF phase, a merge in progress, unpushed and uncommitted work, a nearly full disk, a
+  dev Postgres that is down, and the last gate result. A toast says when a gate finishes.
+- **Three commands that cost no model turn:** `/gate` starts the gate in the background, `/next`
+  ranks the open HANDOFF items, `/validate` checks `HANDOFF.md` and `DECISIONS.md`.
+
+The guards are a safety net, not a sandbox. They never rewrite a call, they let through anything
+they cannot read, and you can turn the mod off for a session.
 
 The design is in [`.claude/plans/tool-8-m1-guards.plan.md`](../.claude/plans/tool-8-m1-guards.plan.md)
-(TOOL-8 M1). The reasons behind each guard are in [`docs/ANA-29.md`](ANA-29.md), §4.2 (D1-D4, D8).
-This is milestone 1. Milestone 2 (a status line and the `/gate`, `/next` and `/validate` commands)
-is still to come, after TOOL-9.
+(TOOL-8 M1, the guards) and
+[`.claude/plans/tool-8-m2-status-commands.plan.md`](../.claude/plans/tool-8-m2-status-commands.plan.md)
+(TOOL-8 M2, the status line and the commands). The reasons are in [`docs/ANA-29.md`](ANA-29.md),
+§4.2 (D1-D6, D8-D10).
 
 - [What it refuses](#what-it-refuses)
 - [How each guard decides](#how-each-guard-decides)
+- [The status line](#the-status-line)
+- [The commands](#the-commands)
 - [What it never does](#what-it-never-does)
 - [Turning it off](#turning-it-off)
 - [Working on the mod](#working-on-the-mod)
@@ -268,6 +278,76 @@ before `commit` (`-C dir`, `-c k=v`, `--git-dir`, …) are skipped. Other comman
 (`git log -n 3`, `git push --no-verify`) are not checked. The refusal shows the commit with the
 flag taken out (`-an -m x` becomes `-a -m x`).
 
+## The status line
+
+In an interactive session the mod keeps one status line, refreshed every 60 seconds:
+
+```
+TOOL-8 M1 landed · merging · 2 ahead · 1 dirty · disk 93% · pg down · gate failed: test 40m
+```
+
+Each part shows only when it has something to say:
+
+| Part | Shows | Read from |
+|---|---|---|
+| Item | `HR_ITEM` when set (an hr sandbox), else the first `PREFIX-N` in the branch name, upper-cased, else the branch | the environment, `git status` |
+| Phase | `<X> landed` from the item's last `**Phase <X> landed` note, `open` with no note, `not open` when the item has no open line. Only the item's own line and the lines under it count, up to the next item or heading | `HANDOFF.md` |
+| `merging` | a merge is in progress | `git rev-parse -q --verify MERGE_HEAD` |
+| `N ahead` | commits not on the upstream; with no upstream, commits not on `main` (nothing on `main` itself) | `git status --porcelain=v2 --branch`, `git rev-list --count main..HEAD` |
+| `N dirty` | changed, staged, unmerged and untracked files | the same `git status` |
+| `disk N%` | the repo's disk above 90% (the disk the repo is on, not `/`, which in an hr sandbox is the container's) | `scripts/dev-health.sh` / `.ps1` |
+| `pg recovering` / `pg down` | the dev Postgres is not up | the same script |
+| Gate | `gate running 4m`, `gate passed 2h`, `gate passed (1 skipped) 2h`, `gate failed: test, abort-grep 40m`; a one-step run names its step (`gate plugin passed`); `(older HEAD)` when it ran on another commit; `gate: last.json unreadable` | `target/gate/last.json` |
+
+`git status` runs with `--no-optional-locks`, so a refresh never takes `index.lock` beside a commit.
+
+`scripts/dev-health.sh` (and its twin `dev-health.ps1`) prints one JSON line:
+`{"disk":{"path":…,"used_pct":80},"postgres":{"state":"up","via":"pg_isready","target":"localhost:5439"}}`.
+Postgres is the host and port of `HTUI_TEST_DATABASE_URL`, else `localhost:5439`. The first probe
+that exists answers: `pg_isready` (0 up, 1 recovering, 2 down); then, for a local target only, the
+`htui-postgres` container (the host has no psql client), down when it is stopped and
+`docker exec htui-postgres pg_isready` when it runs; then a 3-second TCP connect, which can only
+tell up from down. `bash scripts/dev-health.sh --self-test` checks the DSN parsing and
+the JSON.
+
+**Toasts.** When `last.json` shows a gate that finished after the session started, the next refresh
+toasts `gate passed` or `gate failed: <steps>`, once. A gate that finished before the session started
+never toasts.
+
+**Guard warnings** share the line. A guard that fails puts its warning in front,
+`⚠ htui-dev: read-only guard failed, call allowed · TOOL-8 M1 landed`, and it drops off at the first
+refresh 10 minutes after the refresh that first showed it. With no timer running (a `-p` run, or the
+status line off) the warning shows alone, as before M2.
+
+**When it runs.** The timer starts only in an interactive session that htui does not drive
+(`HTUI_SESSION` unset) and with the `status_line` option on. A reload of the mod (saving a file in
+its folder) raises `session.start` again, which restarts the timer (seen live). Should a reload ever
+not, the first tool call of the main loop after it is meant to; that path is tested through the kit
+only. A refresh that is still running when the next one is due is not overlapped.
+
+## The commands
+
+The three commands are registered in every session, `claude -p "/validate"` included, and answer
+with the script's own output. Under `claude -p`, the process exits with the script's exit code. Each
+runs the `.sh` through `bash`, or on Windows (`OS=Windows_NT`) the `.ps1` through
+`pwsh -NoProfile -File`, from the checkout the mod sits in (`git rev-parse --show-toplevel` from the
+mod's folder, so a worktree's copy serves that worktree).
+
+| Command | Runs | Answers |
+|---|---|---|
+| `/gate` | `scripts/gate.sh --detach` (all steps) | the launcher's line (`gate started, pid …`). Refused while `last.json` says a gate started under 4 hours ago is running |
+| `/gate <step>` | `scripts/gate.sh --detach --only <step>` | the same; steps: `fmt`, `clippy-all`, `clippy-bare`, `test`, `abort-grep`, `migrations`, `workflow-docs`, `plugin` |
+| `/gate force` | the whole gate, even while one runs | the launcher's line |
+| `/gate status` | nothing | the last result and each step's status and time; `no gate result yet` or `gate: last.json unreadable` (exit 1) |
+| `/next` | `.claude/skills/handoff-run/scripts/next-item.sh --repo-root <root>` | the ranked candidates |
+| `/validate` | `.claude/skills/handoff-run/scripts/validate-workflow-docs.sh --repo-root <root>` | the findings; exit 1 on errors |
+
+An unknown `/gate` word answers the step list (exit 2); the list is the mod's copy of gate.sh's
+steps, and both gate self-tests check it has not drifted. An exit code outside 0-255 (a Windows
+crash code) reads as 1. A script that cannot start answers
+`htui-dev: <script> could not run: not found` (or `timed out`). The gate itself runs detached and
+writes `target/gate/last.json`; the status line and its toast pick the result up.
+
 ## What it never does
 
 - **It never rewrites a call.** Every guard answers with a refusal or lets the call through
@@ -277,11 +357,15 @@ flag taken out (`-an -m x` becomes `-a -m x`).
   `htui-dev: read-only guard failed, call allowed`. A tag store that holds no list counts as
   unreadable. If the spawn hook fails after the agent started, the status line says the read-only
   tag may be missing. A command the parser cannot read is let through silently (but see G4).
-- **It reaches nothing outside the event.** No process, file, network or model call. The only
-  things it calls are `$.state` for the read-only tags (`readOnly`, the tagged agents' ids, and
-  `readOnlyCalls`, the `tool_use_id`s of their `Workflow` and `Agent` calls) and `$.ui.status` for
-  those warnings. The main loop's tool calls never read the state. `claude plugin validate` lists
-  exactly `$.state.get, $.state.set, $.ui.status`.
+- **It writes no file and reaches no network or model.** The guards call nothing but `$.state`
+  (the read-only tags) and `$.ui.status`; the main loop's tool calls never read the tags. The status
+  line and the commands run `git` read-only and the repo's own scripts (`scripts/dev-health`,
+  `scripts/gate`, `next-item`, `validate-workflow-docs`), and read `HANDOFF.md` and
+  `target/gate/last.json`. Its `$.state` values are the read-only tags (`readOnly`,
+  `readOnlyCalls`), the last gate result it toasted (`gateSeen`) and whether the session runs the
+  timer (`ambient`). `claude plugin validate` lists exactly `$.clock.every, $.clock.now,
+  $.command.register, $.env.get, $.fs.read, $.process.run, $.state.get, $.state.set, $.ui.status,
+  $.ui.toast`.
 
 ## Turning it off
 
@@ -289,6 +373,11 @@ flag taken out (`-an -m x` becomes `-a -m x`).
   customization off, this mod included.
 - `"disableAllHooks": true` in any settings file stops every mod and settings hook, this one
   included. The plugin's other parts would stay loaded, but this one has none.
+
+The status line has a switch of its own, the `status_line` option (default on). Set it in the
+config menu, or in `~/.claude/settings.json`:
+`"pluginConfigs": {"htui-dev@skills-dir": {"options": {"status_line": false}}}`. Off, no timer runs
+and nothing is run for the line; the guards and the commands stay.
 
 There is no switch for a single guard. If a guard refuses a legitimate command, the refusal's fix is
 usually what you meant. If it is not, use `--safe-mode` for that session and report the case.
@@ -303,11 +392,14 @@ usually what you meant. If it is not, use `--safe-mode` for that session and rep
 .claude/skills/htui-dev/
   .claude-plugin/plugin.json   name, version, author (validate --strict needs it), types
   hooks/hooks.json             {"modules": ["./register.ts"]}
-  hooks/register.ts            the four hooks, the fail-open helpers, the readOnly/readOnlyCalls state
+  hooks/register.ts            the hooks, the fail-open helpers, the status timer and the commands' wiring
   hooks/guards.ts              the pure decisions, the G1 feature tables, the refusal texts
   hooks/shell.ts               the Bash command reader
-  types/index.d.ts             the $.state contract (htui-dev.readOnly, htui-dev.readOnlyCalls)
+  hooks/status.ts              the status line's facts: item, phase, git, dev-health, last.json, the line
+  hooks/commands.ts            /gate, /next, /validate and each script's argv per platform
+  types/index.d.ts             the $.state contract (readOnly, readOnlyCalls, gateSeen, ambient)
   tests/*.test.ts              the kit tests; tests/fixtures.ts holds their helpers
+scripts/dev-health.sh, .ps1    the disk and Postgres facts, as one JSON line
 ```
 
 The mod is a skills-directory plugin: a session opened in this repo loads it once you trust the
@@ -329,7 +421,9 @@ rm -rf "$C"
 ```
 
 `validate` exits 0 even when it fails: look for `✔ Validation passed`. Its `calls:` line must stay
-`$.state.get, $.state.set, $.ui.status`.
+the list under [What it never does](#what-it-never-does): no `$.fs.write`, no `$.http`. The three
+commands must read `answers its own command:`, which needs each registered by a literal name (a loop
+over the names makes them read as gates). `bash scripts/gate.sh --only plugin` runs both.
 
 The tests use `claude-code/testing`: hooks a test registers sit beneath the mod and stand in for the
 engine. The kit passes a call's `agentId` and a spawn's `parentAgentId`, `workflow` and
@@ -340,7 +434,9 @@ from below is only checked for the plain `{ deny }` shape.
 
 For type-checking, use the `tsconfig.json` from the header of the `claude-code.d.ts` that
 Claude Code writes, kept **outside** the mod folder (`.claude-plugin/types/` is regenerated on every
-load).
+load), with its `include` naming that `.d.ts` and the mod's `hooks`, `types` and `tests` by
+absolute path. TypeScript 5.9 checks the whole mod clean under `strict` and
+`noUncheckedIndexedAccess`.
 
 Two rules for anything under `.claude/skills/htui-dev/`:
 
@@ -398,6 +494,23 @@ Two rules for anything under `.claude/skills/htui-dev/`:
   built this exposed only the older names (`edit_file`, `write_file`, `edit_symbol`,
   `rename_symbol`, `batch_edit`), whose fields were checked. The compact tools are matched by name
   and read with the same fields, plus `target.file` and `target.symbol`.
+- **The status line is not drawn by `claude -p`.** It needs an interactive session; `-p` runs get
+  the commands only.
+- **A reload drops a guard warning early.** The warning is held in the module, not in `$.state`,
+  because it is set where every other `$` call fails; a reload clears it at the next refresh.
+- **A toast needs the timer.** With the status line off, or in a `-p` run, a finished gate is seen
+  only through `/gate status`.
+- **`/gate`'s 4-hour bound is a guess.** A gate killed mid-run leaves `running` in `last.json`;
+  `/gate force` starts another. A `running` result whose start does not parse never blocks.
+- **A refused status line is not resent until it changes.** `$.ui.status` answers nothing, so a
+  hook beneath that drops a line cannot be seen. Only a call that throws (a re-entry) is retried.
+- **A failed read of `last.json` at start seeds no result.** A gate that ended before the session
+  may then toast once.
+- **Windows is untested.** The `.ps1` commands, `dev-health.ps1` and the `OS=Windows_NT` check have
+  run only under PowerShell 7.5 on Linux. `gate.ps1 -Detach` now starts the gate with no
+  redirection on Windows (ShellExecute, so the gate inherits none of the launcher's pipes, and the
+  gate writes `run.log` itself). Without that, `/gate` would wait on the gate's copy of its pipe.
+  The Windows check owed is that `claude -p "/gate fmt"` returns at once there.
 - **A rename is checked at the symbol's own file.** Gortex's and Serena's `rename_symbol` write the
   new name into every file that refers to the symbol, but G3 judges only the file the call names.
 
@@ -415,3 +528,16 @@ scratch configuration:
   covers a workflow agent tagged by its own prompt or type.
 - The Workflow tool is available under `-p`. A workflow agent's prompt and `model` option reach the
   hook as given (`"READ-ONLY verifier. …"`, `model=sonnet`).
+
+M2 (2026-10-14, Claude Code 2.1.296, a scratch configuration in an hr sandbox):
+
+- `claude -p /validate` and `claude -p /next` answer the scripts' text, with the plugin's name in
+  front (`htui-dev: workflow-docs validation: 0 error(s) …`). On a worktree with a broken HANDOFF,
+  `/validate` printed both errors and `claude -p` exited 1.
+- In an interactive session (a pty, 160 columns) the mod registered the three commands, ran
+  `git rev-parse --show-toplevel` from its folder, and set
+  `TOOL-8 M1 landed · 6 ahead · gate passed 2m (older HEAD)` 0.1 s after `session.start`.
+  That run's gate was `gate.sh --only plugin`, which led to naming one-step runs.
+- Saving a file of the mod reloaded it 9 ms later and raised `session.start` again
+  (`session.start: raised for htui-dev (loaded later)`). The line was set again at once and every
+  60 s after.
