@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[TOOL-10](docs/decisions/tool/tool-10.md)** - hr sandbox: plugins and skills read-only, `dev-mods` masked in a run (done, 2026-10-14)
 - **[CLEAN-11](docs/decisions/clean/clean-11.md)** - CLEAN-9 deferred review residuals: log-level pin, deduped decode warn, `null` cap settings refused (done, 2026-10-14)
 - **[TOOL-9](docs/decisions/tool/tool-9.md)** - Canonical gate script, committed git hooks, DECISIONS merge rule (done, 2026-10-14)
 - **[MOD-67](docs/decisions/mod/mod-67.md)** - Configurable hotkeys: named actions, `keys.toml`, generated hints (done, 2026-10-14)
