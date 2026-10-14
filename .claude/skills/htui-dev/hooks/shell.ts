@@ -472,12 +472,12 @@ function commandsOf(line: string, depth: number): Words[] {
   return out
 }
 
-/** The simple commands of a Bash line, recursing into `bash|sh|zsh|dash|ksh -c` (also `-lc`, `-ec`) and `$( … )` inside double quotes; null when the parser cannot follow it (unbalanced quote, trailing backslash, unterminated heredoc). */
+/** The simple commands of a Bash line, recursing into `bash|sh|zsh|dash|ksh -c` (also `-lc`, `-ec`) and `$( … )` inside double quotes; null when the parser cannot follow it (unbalanced quote, trailing backslash, unterminated heredoc, nesting deep enough to overflow the stack). */
 export function simpleCommands(command: string): Words[] | null {
   try {
     return commandsOf(command, 0)
   } catch (err) {
-    if (err instanceof Unfollowable) return null
+    if (err instanceof Unfollowable || err instanceof RangeError) return null
     throw err
   }
 }

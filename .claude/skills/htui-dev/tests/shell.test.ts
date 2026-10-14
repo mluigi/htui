@@ -185,6 +185,9 @@ test('a line the parser cannot follow answers null', () => {
   expect(simpleCommands('echo abc\\')).toBeNull()
   expect(simpleCommands('cat <<EOF\ngit commit -n')).toBeNull()
   expect(simpleCommands('cat <<')).toBeNull()
+  // Nesting deep enough to overflow the stack is no throw either.
+  expect(simpleCommands('"$('.repeat(20000))).toBeNull()
+  expect(simpleCommands('echo ' + '"$(echo '.repeat(20000) + 'x' + ')"'.repeat(20000))).toBeNull()
 })
 
 test('quoteWords survives a round trip through simpleCommands', () => {
