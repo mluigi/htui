@@ -1,0 +1,279 @@
+// Reads a Bash line as the simple commands it runs, enough for the guards to see
+// `cargo test …` and `git commit …` wherever they stand. It is no shell: what it
+// cannot follow (an unbalanced quote, a heredoc with no end) answers null, and the
+// guards let that call through (ANA-29 §6.3, "fail open").
+
+/** One simple command's words: quotes removed, leading VAR=value and the wrappers env/command/time/nice/timeout/nohup stripped, redirections dropped. */
+export type Words = readonly string[]
+
+/** What the tokenizer hands on: a word, a command separator, or a redirection that does or does not take the next word. */
+type Token = { kind: 'word'; text: string } | { kind: 'sep' } | { kind: 'redir'; takesWord: boolean }
+
+/** A heredoc whose body starts at the next newline: its delimiter, and whether `<<-` lets the end line lead with tabs. */
+type Heredoc = { delimiter: string; stripTabs: boolean }
+
+/** Thrown inside the parser for a line it cannot follow; `simpleCommands` turns it into null. */
+class Unfollowable extends Error {}
+
+/** Characters that end an unquoted word. */
+const BREAK = new Set([' ', '\t', '\n', ';', '&', '|', '(', ')', '<', '>', '`'])
+
+/** Words that open or close a compound command; at the head of a command they are not the program. */
+const KEYWORDS = new Set(['!', '{', '}', 'if', 'then', 'elif', 'else', 'fi', 'do', 'done', 'while', 'until'])
+
+/** `NAME=value`, a shell assignment. */
+const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/
+
+/** Splits `line` into tokens, skipping comments and heredoc bodies. Throws Unfollowable. */
+function tokenize(line: string): Token[] {
+  const tokens: Token[] = []
+  const heredocs: Heredoc[] = []
+  /** Set once a redirection `<<` has read its operator: the next word is a heredoc delimiter. */
+  let wantsDelimiter: Heredoc | null = null
+  let word = ''
+  let inWord = false
+  let quoted = false
+  let i = 0
+
+  const endWord = () => {
+    if (!inWord) return
+    if (wantsDelimiter !== null) {
+      heredocs.push({ ...wantsDelimiter, delimiter: word })
+      wantsDelimiter = null
+    } else {
+      tokens.push({ kind: 'word', text: word })
+    }
+    word = ''
+    inWord = false
+    quoted = false
+  }
+
+  /** At a newline: skips the body of every heredoc opened on the line just ended. */
+  const skipBodies = () => {
+    for (const doc of heredocs.splice(0)) {
+      for (;;) {
+        if (i >= line.length) throw new Unfollowable('heredoc without an end')
+        const eol = line.indexOf('\n', i)
+        const end = eol === -1 ? line.length : eol
+        const text = line.slice(i, end)
+        i = end + 1
+        if ((doc.stripTabs ? text.replace(/^\t+/, '') : text) === doc.delimiter) break
+      }
+    }
+  }
+
+  while (i < line.length) {
+    const c = line[i]!
+    if (c === '\\') {
+      if (i + 1 >= line.length) throw new Unfollowable('trailing backslash')
+      if (line[i + 1] === '\n') {
+        i += 2
+        continue
+      }
+      word += line[i + 1]
+      inWord = true
+      i += 2
+      continue
+    }
+    if (c === "'") {
+      const close = line.indexOf("'", i + 1)
+      if (close === -1) throw new Unfollowable('unbalanced single quote')
+      word += line.slice(i + 1, close)
+      inWord = quoted = true
+      i = close + 1
+      continue
+    }
+    if (c === '"') {
+      i++
+      for (;;) {
+        if (i >= line.length) throw new Unfollowable('unbalanced double quote')
+        const d = line[i]!
+        if (d === '"') break
+        if (d === '\\' && i + 1 < line.length && '$`"\\\n'.includes(line[i + 1]!)) {
+          if (line[i + 1] !== '\n') word += line[i + 1]
+          i += 2
+          continue
+        }
+        word += d
+        i++
+      }
+      inWord = quoted = true
+      i++
+      continue
+    }
+    if (c === '#' && !inWord) {
+      const eol = line.indexOf('\n', i)
+      i = eol === -1 ? line.length : eol
+      continue
+    }
+    if (c === '$' && line[i + 1] === '(') {
+      // `$(`: the substitution is a command of its own, opened by the `(` below.
+      endWord()
+      i++
+      continue
+    }
+    if (!BREAK.has(c)) {
+      word += c
+      inWord = true
+      i++
+      continue
+    }
+    if (c === '<' || c === '>') {
+      // A run of digits right before the operator names a file descriptor, not a word.
+      if (inWord && !quoted && /^\d+$/.test(word)) {
+        word = ''
+        inWord = false
+      }
+      endWord()
+      if (line.startsWith('<<<', i)) {
+        tokens.push({ kind: 'redir', takesWord: true })
+        i += 3
+      } else if (line.startsWith('<<', i)) {
+        const stripTabs = line[i + 2] === '-'
+        i += stripTabs ? 3 : 2
+        wantsDelimiter = { delimiter: '', stripTabs }
+      } else {
+        const two = line.slice(i, i + 2)
+        const op = two === '>>' || two === '>&' || two === '<&' || two === '>|' || two === '<>' ? two : c
+        i += op.length
+        // `2>&1`, `>&-`: the operator names its target itself.
+        const fd = op.endsWith('&') ? /^(\d+|-)/.exec(line.slice(i)) : null
+        if (fd !== null) i += fd[0].length
+        tokens.push({ kind: 'redir', takesWord: fd === null })
+      }
+      continue
+    }
+    if (c === '&' && line[i + 1] === '>') {
+      endWord()
+      i += line[i + 2] === '>' ? 3 : 2
+      tokens.push({ kind: 'redir', takesWord: true })
+      continue
+    }
+    endWord()
+    if (wantsDelimiter !== null && c !== ' ' && c !== '\t') throw new Unfollowable('heredoc without a delimiter')
+    if (c === ' ' || c === '\t') {
+      i++
+      continue
+    }
+    tokens.push({ kind: 'sep' })
+    i += (c === '&' && line[i + 1] === '&') || (c === '|' && (line[i + 1] === '|' || line[i + 1] === '&')) ? 2 : 1
+    if (c === '\n') skipBodies()
+  }
+  endWord()
+  if (wantsDelimiter !== null) throw new Unfollowable('heredoc without a delimiter')
+  if (heredocs.length > 0) skipBodies()
+  return tokens
+}
+
+/**
+ * The index past a wrapper's options from `at`: `withValue` and `longWithValue` name the options
+ * whose value is the next word (`-n 10`); `-n10` and `--long=v` are one word, as is any other option.
+ */
+function skipOptions(words: string[], at: number, withValue: readonly string[], longWithValue: readonly string[]): number {
+  while (at < words.length) {
+    const w = words[at]!
+    if (w === '--') return at + 1
+    if (!w.startsWith('-') || w === '-') return at
+    if (withValue.includes(w) || longWithValue.includes(w)) at += 2
+    else at += 1
+  }
+  return at
+}
+
+/** The words with leading assignments, keywords and wrappers stripped, the program first. */
+function unwrap(words: string[]): string[] {
+  let at = 0
+  for (;;) {
+    const start = at
+    while (at < words.length && (ASSIGNMENT.test(words[at]!) || KEYWORDS.has(words[at]!))) at++
+    const w = words[at]
+    if (w === 'env') {
+      at = skipOptions(words, at + 1, ['-u', '-C', '-S'], ['--unset', '--chdir', '--split-string'])
+    } else if (w === 'command' || w === 'nohup') {
+      at = skipOptions(words, at + 1, [], [])
+    } else if (w === 'time') {
+      at = skipOptions(words, at + 1, ['-f', '-o'], ['--format', '--output'])
+    } else if (w === 'nice') {
+      at = skipOptions(words, at + 1, ['-n'], ['--adjustment'])
+    } else if (w === 'timeout') {
+      at = skipOptions(words, at + 1, ['-s', '-k'], ['--signal', '--kill-after'])
+      if (at < words.length) at++ // the duration
+    }
+    if (at === start) return words.slice(at)
+  }
+}
+
+/** The string a `bash|sh -c` command runs, or null when the words are no such command. */
+function dashC(words: readonly string[]): string | null {
+  const shell = (words[0] ?? '').split('/').pop()
+  if (shell !== 'bash' && shell !== 'sh') return null
+  let hasC = false
+  let at = 1
+  while (at < words.length) {
+    const w = words[at]!
+    if (w === '-o' || w === '+o' || w === '-O' || w === '+O') {
+      at += 2
+      continue
+    }
+    if (w === '--') {
+      at++
+      break
+    }
+    if (w.startsWith('--')) {
+      at++
+      continue
+    }
+    if (/^[-+][A-Za-z]+$/.test(w)) {
+      if (w.startsWith('-') && w.includes('c')) hasC = true
+      at++
+      continue
+    }
+    break
+  }
+  return hasC && at < words.length ? words[at]! : null
+}
+
+/** The simple commands of `line`, `bash -c` strings followed. Throws Unfollowable. */
+function commandsOf(line: string, depth: number): Words[] {
+  if (depth > 8) throw new Unfollowable('bash -c nested too deep')
+  const out: Words[] = []
+  let words: string[] = []
+  let dropNext = false
+  const flush = () => {
+    const unwrapped = unwrap(words)
+    words = []
+    if (unwrapped.length === 0) return
+    const inner = dashC(unwrapped)
+    if (inner === null) out.push(unwrapped)
+    else out.push(...commandsOf(inner, depth + 1))
+  }
+  for (const t of tokenize(line)) {
+    if (t.kind === 'sep') {
+      dropNext = false
+      flush()
+    } else if (t.kind === 'redir') {
+      dropNext = t.takesWord
+    } else if (dropNext) {
+      dropNext = false
+    } else {
+      words.push(t.text)
+    }
+  }
+  flush()
+  return out
+}
+
+/** The simple commands of a Bash line, recursing into `bash|sh -c` (also `-lc`, `-ec`); null when the parser cannot follow it (unbalanced quote, trailing backslash, unterminated heredoc). */
+export function simpleCommands(command: string): Words[] | null {
+  try {
+    return commandsOf(command, 0)
+  } catch (err) {
+    if (err instanceof Unfollowable) return null
+    throw err
+  }
+}
+
+/** Words back to one shell line, single-quoting a word that needs it (for the corrected command in a deny). */
+export function quoteWords(words: Words): string {
+  return words.map(w => (/^[A-Za-z0-9_\-./=:,+@%^]+$/.test(w) ? w : `'${w.replace(/'/g, `'\\''`)}'`)).join(' ')
+}
