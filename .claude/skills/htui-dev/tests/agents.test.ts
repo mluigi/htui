@@ -1,5 +1,5 @@
 import { test, expect, mock } from 'claude-code/testing'
-import { agents, bash, call, seedTags, spawn, statuses, tagWrites, tools, type Reached, type Spawned } from './fixtures'
+import { agents, bash, call, LIT, seedTags, spawn, statuses, tagWrites, tools, type Reached, type Spawned } from './fixtures'
 
 // A probe of the kit itself: G4's tests below hand the mod an agentId and a parentAgentId.
 // Should the kit drop either, those cases are tested through the pure functions instead.
@@ -192,4 +192,78 @@ test('a subagent that resolves to Fable on its own is let through with a status'
   expect(lines).toEqual([
     'htui-dev: subagent agent-1 resolved to Fable (claude-fable-5) — inherited or pinned in its agent definition',
   ])
+})
+
+// Fail open (ANA-29 §6.3): a guard that cannot judge lets the call through and says so.
+
+test('an unreadable tag store lets a write through, with a status', async ($, on) => {
+  const clock = mock.clock(on)
+  const lines: (string | undefined)[] = []
+  const reached: Reached[] = []
+  statuses(on, lines)
+  tools(on, reached)
+  seedTags(on, 42)
+  await call($, 'Edit', { file_path: 'src/a.rs', old_string: 'a', new_string: 'b' }, 'agent-1')
+  await bash($, 'git commit -m x', 'agent-1')
+  await clock.settle()
+  expect(reached.map(r => r.tool)).toEqual(['Edit', 'Bash'])
+  expect(lines).toEqual([
+    'htui-dev: read-only guard failed, call allowed',
+    'htui-dev: read-only guard failed, call allowed',
+  ])
+})
+
+test('an unreadable tag store lets a nested spawn start untagged, with a status', async ($, on) => {
+  const clock = mock.clock(on)
+  const lines: (string | undefined)[] = []
+  const spawned: Spawned[] = []
+  statuses(on, lines)
+  agents(on, spawned)
+  seedTags(on, 42)
+  expect(await spawn($, { parentAgentId: 'agent-9' })).toEqual({ model: 'claude-opus-5-5', agentId: 'agent-1' })
+  await clock.settle()
+  expect(spawned).toHaveLength(1)
+  expect(lines).toEqual(['htui-dev: read-only guard failed, spawn allowed untagged'])
+})
+
+test('a tag that cannot be written leaves the agent started, with a status', async ($, on) => {
+  const clock = mock.clock(on)
+  const lines: (string | undefined)[] = []
+  statuses(on, lines)
+  agents(on, [])
+  on('state.set', { plugin: 'htui-dev', key: 'readOnly' }, async () => ({ deny: 'store refused' }) as never)
+  expect(await spawn($, { prompt: 'READ-ONLY' })).toEqual({ model: 'claude-opus-5-5', agentId: 'agent-1' })
+  await clock.settle()
+  expect(lines).toEqual(['htui-dev: read-only tag failed, agent agent-1 untagged'])
+})
+
+test('a Bash call the parser throws on goes through, with a status', async ($, on) => {
+  const clock = mock.clock(on)
+  const lines: (string | undefined)[] = []
+  const reached: Reached[] = []
+  statuses(on, lines)
+  tools(on, reached)
+  await $.tool.call({ tool: 'Bash', command: undefined } as never)
+  await clock.settle()
+  expect(reached.map(r => r.tool)).toEqual(['Bash'])
+  expect(lines).toEqual(['htui-dev: shell parser failed, call allowed'])
+})
+
+test('refusing and allowing set no status line', async ($, on) => {
+  const clock = mock.clock(on)
+  const lines: (string | undefined)[] = []
+  statuses(on, lines)
+  tools(on, [])
+  agents(on, [])
+  await spawn($, { prompt: 'READ-ONLY' })
+  await spawn($, { model: 'fable' })
+  await spawn($, {})
+  await call($, 'Edit', { file_path: 'src/a.rs', old_string: 'a', new_string: 'b' }, 'agent-1')
+  await call($, 'Edit', { file_path: 'src/a.rs', old_string: 'a', new_string: 'b' }, 'agent-2')
+  await call($, 'Write', { file_path: 'crates/htui/src/a.rs', content: LIT })
+  await bash($, 'git commit -n -m x && cargo test -p htui')
+  await bash($, 'git commit -m x', 'agent-1')
+  await bash($, 'cargo test -p htui --features testkit', 'agent-2')
+  await clock.settle()
+  expect(lines).toEqual([])
 })
