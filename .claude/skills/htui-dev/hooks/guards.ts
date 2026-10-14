@@ -499,7 +499,6 @@ const GIT_WRITES = new Set([
   'commit',
   'reset',
   'restore',
-  'switch',
   'merge',
   'rebase',
   'cherry-pick',
@@ -543,29 +542,127 @@ function actionOf(args: Words, skip: readonly string[]): string | undefined {
   return undefined
 }
 
-/** `git checkout` options whose value is the next word. */
-const CHECKOUT_VALUE = new Set(['-b', '-B', '--orphan'])
+/**
+ * The long option `w` (its name before `=`) stands for among `options`: itself, or the one option
+ * it is a prefix of, as git reads an abbreviation. Null for a `--no-` form, an unknown option, or an
+ * ambiguous prefix (git refuses that one itself).
+ */
+function longOption(w: string, options: readonly string[]): string | null {
+  const name = w.split('=')[0]!
+  if (name.startsWith('--no-')) return null
+  if (options.includes(name)) return name
+  const hits = options.filter(o => o.startsWith(name))
+  return hits.length === 1 ? hits[0]! : null
+}
 
-/** What `git checkout` writes, or null when it only switches branches: paths, `--force` or `--patch`. */
-function checkoutWrite(args: Words): string | null {
+/** `git checkout`'s long options (2.43), for reading an abbreviation. */
+const CHECKOUT_LONG = [
+  '--guess',
+  '--overlay',
+  '--quiet',
+  '--recurse-submodules',
+  '--progress',
+  '--merge',
+  '--conflict',
+  '--detach',
+  '--track',
+  '--force',
+  '--orphan',
+  '--overwrite-ignore',
+  '--ignore-other-worktrees',
+  '--ours',
+  '--theirs',
+  '--patch',
+  '--ignore-skip-worktree-bits',
+  '--pathspec-from-file',
+  '--pathspec-file-nul',
+]
+
+/** `git switch`'s long options (2.43), for reading an abbreviation. */
+const SWITCH_LONG = [
+  '--create',
+  '--force-create',
+  '--guess',
+  '--discard-changes',
+  '--quiet',
+  '--recurse-submodules',
+  '--progress',
+  '--merge',
+  '--conflict',
+  '--detach',
+  '--track',
+  '--force',
+  '--orphan',
+  '--overwrite-ignore',
+  '--ignore-other-worktrees',
+]
+
+/** Long options of `checkout` and `switch` whose value is the next word when not given with `=`. */
+const BRANCH_LONG_VALUE = ['--create', '--force-create', '--orphan', '--conflict', '--pathspec-from-file']
+
+/**
+ * What a `git checkout` or `git switch` writes, or null when it only switches (or creates) a branch.
+ * `long` maps the long options that write to their label, `short` the short letters that do;
+ * `shortValue` are the letters whose value is the rest of the cluster or the next word. For
+ * checkout, a second positional or `.` is a pathspec.
+ */
+function branchWrite(
+  sub: 'checkout' | 'switch',
+  args: Words,
+  options: readonly string[],
+  long: Readonly<Record<string, string>>,
+  short: Readonly<Record<string, string>>,
+  shortValue: string,
+): string | null {
   let positionals = 0
   for (let i = 0; i < args.length; i++) {
     const w = args[i]!
-    if (w === '--') return 'git checkout <paths>'
-    if (w === '--force') return 'git checkout --force'
-    if (w === '--patch') return 'git checkout --patch'
-    if (w.startsWith('--pathspec-from-file')) return 'git checkout <paths>'
-    if (CHECKOUT_VALUE.has(w)) i++
-    else if (/^-[A-Za-z]+$/.test(w)) {
-      if (w.includes('f')) return 'git checkout --force'
-      if (w.includes('p')) return 'git checkout --patch'
-      if (/[bB]$/.test(w)) i++
-    } else if (!w.startsWith('-')) {
-      if (w === '.' || ++positionals >= 2) return 'git checkout <paths>'
+    if (w === '--') return sub === 'checkout' ? 'git checkout <paths>' : null
+    if (w.startsWith('--')) {
+      const o = longOption(w, options)
+      if (o === null) continue
+      if (long[o] !== undefined) return `git ${sub} ${long[o]}`
+      if (BRANCH_LONG_VALUE.includes(o) && !w.includes('=')) i++
+      continue
     }
+    if (/^-[A-Za-z0-9]/.test(w)) {
+      // A short cluster: flags until one takes a value, which is the rest or the next word.
+      for (let j = 1; j < w.length; j++) {
+        const letter = w[j]!
+        if (short[letter] !== undefined) return `git ${sub} ${short[letter]}`
+        if (shortValue.includes(letter)) {
+          if (j === w.length - 1) i++
+          break
+        }
+      }
+      continue
+    }
+    if (sub === 'checkout' && (w === '.' || ++positionals >= 2)) return 'git checkout <paths>'
   }
   return null
 }
+
+/** What `git checkout` writes, or null when it only switches branches: paths (also `--ours`/`--theirs`, `-2`/`-3`), `--force` or `--patch`. */
+const checkoutWrite = (args: Words): string | null =>
+  branchWrite(
+    'checkout',
+    args,
+    CHECKOUT_LONG,
+    { '--force': '--force', '--patch': '--patch', '--ours': '<paths>', '--theirs': '<paths>', '--pathspec-from-file': '<paths>' },
+    { f: '--force', p: '--patch', '2': '<paths>', '3': '<paths>' },
+    'bB',
+  )
+
+/** What `git switch` writes, or null when it only switches or creates a branch: `--force`/`--discard-changes`, `-C`, `--orphan`. */
+const switchWrite = (args: Words): string | null =>
+  branchWrite(
+    'switch',
+    args,
+    SWITCH_LONG,
+    { '--force': '--force', '--discard-changes': '--discard-changes', '--force-create': '--force-create', '--orphan': '--orphan' },
+    { f: '--force', C: '--force-create' },
+    'c',
+  )
 
 /**
  * Whether a `git branch` or `git tag` command only lists: no write option (`writeLong`, or a short
@@ -621,6 +718,8 @@ export function gitWrite(words: Words): string | null {
       return args[0] === 'list' || args[0] === 'show' ? null : 'git stash'
     case 'checkout':
       return checkoutWrite(args)
+    case 'switch':
+      return switchWrite(args)
     case 'clean':
       return args.some(w => w === '--dry-run' || /^-[A-Za-z]*n/.test(w)) ? null : 'git clean'
     case 'branch':
@@ -652,7 +751,7 @@ export function gitWrite(words: Words): string | null {
  * coarse on purpose.
  */
 const COARSE_GIT_WRITE =
-  /(?:^|[\s;&|()`'"])git(?:\s+(?:-C|-c|--git-dir|--work-tree|--namespace)\s+\S+|\s+-\S+)*\s+(commit|reset|restore|switch|merge|rebase|cherry-pick|revert|am|apply|add|rm|mv|pull|clean|push|checkout-index|read-tree|update-ref|update-index|gc|filter-branch|stash(?!\s+(?:list|show)\b)|bisect(?!\s+(?:log|view|visualize)\b)|worktree\s+(?:add|remove|move|prune)|submodule\s+(?:update|deinit|add|sync)|sparse-checkout(?!\s+list\b)|reflog\s+(?:expire|delete)|notes\s+(?:add|remove|edit|append|copy|prune))(?![\w-])/
+  /(?:^|[\s;&|()`'"])git(?:\s+(?:-C|-c|--git-dir|--work-tree|--namespace)\s+\S+|\s+-\S+)*\s+(commit|reset|restore|merge|rebase|cherry-pick|revert|am|apply|add|rm|mv|pull|clean|push|checkout-index|read-tree|update-ref|update-index|gc|filter-branch|stash(?!\s+(?:list|show)\b)|bisect(?!\s+(?:log|view|visualize)\b)|worktree\s+(?:add|remove|move|prune)|submodule\s+(?:update|deinit|add|sync)|sparse-checkout(?!\s+list\b)|reflog\s+(?:expire|delete)|notes\s+(?:add|remove|edit|append|copy|prune))(?![\w-])/
 
 /**
  * G4's Bash half for a line the parser cannot follow (an unbalanced quote, `$((1<<2))` read as a

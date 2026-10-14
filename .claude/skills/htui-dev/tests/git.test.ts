@@ -131,8 +131,6 @@ test('gitWrite names the git commands that change the tree, the index or history
     ['git restore .', 'git restore'],
     ['git restore --staged src/a.rs', 'git restore'],
     ['git clean -fdx', 'git clean'],
-    ['git switch main', 'git switch'],
-    ['git switch -c topic', 'git switch'],
     ['git merge main', 'git merge'],
     ['git merge --abort', 'git merge'],
     ['git rebase main', 'git rebase'],
@@ -183,6 +181,62 @@ test('gitWrite names the git commands that change the tree, the index or history
     ['git tag -v v1', null],
     ['echo git commit', null],
     ['cargo test', null],
+  ]
+  for (const [line, label] of table) expect(gitWrite(simpleCommands(line)![0]!), line).toBe(label)
+})
+
+test('git switch mirrors git checkout: only a force, a force-create or an orphan writes', () => {
+  const table: [string, string | null][] = [
+    ['git switch -f main', 'git switch --force'],
+    ['git switch --force main', 'git switch --force'],
+    ['git switch -qf main', 'git switch --force'],
+    ['git switch --discard-changes main', 'git switch --discard-changes'],
+    ['git switch --disc main', 'git switch --discard-changes'],
+    ['git switch -C topic', 'git switch --force-create'],
+    ['git switch --force-create topic', 'git switch --force-create'],
+    ['git switch --force-c topic', 'git switch --force-create'],
+    ['git switch --orphan x', 'git switch --orphan'],
+    ['git switch --orph x', 'git switch --orphan'],
+    ['git switch main', null],
+    ['git switch -', null],
+    ['git switch -c topic', null],
+    ['git switch -c topic origin/main', null],
+    ['git switch -cf', null],
+    ['git switch -c f', null],
+    ['git switch --create topic', null],
+    ['git switch --detach HEAD~1', null],
+    ['git switch --det HEAD~1', null],
+    ['git switch -t origin/x', null],
+    ['git switch --no-force main', null],
+    // Ambiguous: git refuses `--fo` (force or force-create) and `--d` (discard-changes or detach).
+    ['git switch --fo main', null],
+    ['git switch --d main', null],
+  ]
+  for (const [line, label] of table) expect(gitWrite(simpleCommands(line)![0]!), line).toBe(label)
+})
+
+test('git checkout reads --ours/--theirs as paths and long options by their unique prefix', () => {
+  const table: [string, string | null][] = [
+    ['git checkout --ours a.rs', 'git checkout <paths>'],
+    ['git checkout --theirs a.rs', 'git checkout <paths>'],
+    ['git checkout --ou a.rs', 'git checkout <paths>'],
+    ['git checkout -2 a.rs', 'git checkout <paths>'],
+    ['git checkout -3 a.rs', 'git checkout <paths>'],
+    ['git checkout --forc main', 'git checkout --force'],
+    ['git checkout --patc', 'git checkout --patch'],
+    ['git checkout -qf main', 'git checkout --force'],
+    ['git checkout --pathspec-fr=f', 'git checkout <paths>'],
+    ['git checkout -b f', null],
+    ['git checkout -bf', null],
+    ['git checkout -B f origin/f', null],
+    ['git checkout --orphan f', null],
+    ['git checkout --det HEAD', null],
+    ['git checkout -q --detach main', null],
+    ['git checkout -t origin/x', null],
+    ['git checkout --no-force main', null],
+    ['git checkout -', null],
+    // Ambiguous: git refuses `--pat` (pathspec-from-file or pathspec-file-nul).
+    ['git checkout --pat', null],
   ]
   for (const [line, label] of table) expect(gitWrite(simpleCommands(line)![0]!), line).toBe(label)
 })
