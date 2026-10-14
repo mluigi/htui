@@ -383,6 +383,47 @@ const COMMIT_LONG_VALUE = new Set([
   '--pathspec-from-file',
 ])
 
+/** `git commit`'s long options that take no value (2.43): an abbreviation of one is no value-taking option. */
+const COMMIT_LONG_FLAG = [
+  '--all',
+  '--patch',
+  '--interactive',
+  '--amend',
+  '--allow-empty',
+  '--allow-empty-message',
+  '--branch',
+  '--dry-run',
+  '--edit',
+  '--include',
+  '--long',
+  '--no-edit',
+  '--no-post-rewrite',
+  '--no-verify',
+  '--null',
+  '--only',
+  '--porcelain',
+  '--quiet',
+  '--reset-author',
+  '--short',
+  '--signoff',
+  '--no-signoff',
+  '--status',
+  '--no-status',
+  '--verbose',
+  '--verify',
+  '--gpg-sign',
+  '--no-gpg-sign',
+  '--untracked-files',
+  '--pathspec-file-nul',
+  '--ahead-behind',
+  '--no-ahead-behind',
+]
+
+/** Whether long option `w` (no `=`) takes the next word: a value-taking option, or an abbreviation git reads as one alone. */
+const takesValue = (w: string): boolean =>
+  COMMIT_LONG_VALUE.has(w) ||
+  (w.length > 3 && [...COMMIT_LONG_VALUE].some(o => o.startsWith(w)) && !COMMIT_LONG_FLAG.some(o => o.startsWith(w)))
+
 /** The subcommand of a `git` command and where its arguments start, or null when `words` run no git. */
 function gitSubcommand(words: Words): { sub: string; at: number } | null {
   if ((words[0] ?? '').split('/').pop() !== 'git') return null
@@ -422,7 +463,7 @@ export function noVerify(words: Words): string | null {
       }
       if (abbreviates(name, '--verify', '--veri'.length) && !w.includes('=')) skips = false
       fixed.push(w)
-      if (COMMIT_LONG_VALUE.has(w) && i + 1 < words.length) fixed.push(words[++i]!)
+      if (!w.includes('=') && takesValue(w) && i + 1 < words.length) fixed.push(words[++i]!)
       continue
     }
     if (!w.startsWith('-') || w === '-') {

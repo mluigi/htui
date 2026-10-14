@@ -25,7 +25,8 @@ test('git commit with --no-verify or -n is refused', async ($, on) => {
     'git commit -n -m x',
     'git commit -an -m x',
     'git commit -nm x',
-    'git commit --no-ver -m x',
+    // git 2.43 takes --no-veri; --no-ver is ambiguous with --no-verbose.
+    'git commit --no-veri -m x',
     'git -C crates commit -n -m x',
     'git -c core.hooksPath=x commit -n -m x',
     'git --git-dir=.git --work-tree . commit -n -m x',
@@ -58,6 +59,10 @@ test('a commit that runs its hooks is allowed', async ($, on) => {
     // The value of -C (reuse a commit's message) and of --author, not the flag.
     'git commit -Cn',
     'git commit --author -n -m x',
+    // An abbreviated value-taking option takes the next word as git does.
+    'git commit --mess -n',
+    'git commit --auth -n -m x',
+    'git commit --templ -n',
   ]
   const got = await verdicts($, on, commands)
   got.forEach((r, i) => expect(r, commands[i]).toBeUndefined())
