@@ -132,16 +132,18 @@ type CargoTest = {
 }
 
 /**
- * The package a `--manifest-path` names: its folder's name, or null for the workspace root. A
- * member's folder counts only under `crates/` (or `../`), so `/r/htui/Cargo.toml` is the root.
+ * The package a `--manifest-path` names: its folder's name when that folder sits in `crates/` (or
+ * `../`), or is a bare `<member>/Cargo.toml`; otherwise null, the workspace root, whatever its
+ * folder is called (`/r/.claude/worktrees/tool-8/Cargo.toml`, `/home/me/htui/Cargo.toml`).
  */
 function manifestPackage(path: string): string | null {
   const parts = path.replace(/\\/g, '/').split('/').filter(p => p !== '' && p !== '.')
   const name = parts[parts.length - 2]
   if (name === undefined) return null
   const above = parts[parts.length - 3]
-  if (!(MEMBERS as readonly string[]).includes(name)) return name
-  return above === undefined || above === 'crates' || above === '..' ? name : null
+  if (above === 'crates' || above === '..') return name
+  const bare = above === undefined && !path.startsWith('/') && (MEMBERS as readonly string[]).includes(name)
+  return bare ? name : null
 }
 
 /** Reads `words` as a `cargo test` (or `cargo t`) command, or null when it is none. */

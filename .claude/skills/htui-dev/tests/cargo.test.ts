@@ -86,6 +86,27 @@ test("a selected crate's dependencies turn the gate on", async ($, on) => {
   ])
 })
 
+test('a manifest outside a crates folder is the workspace root, whatever its folder is called', async ($, on) => {
+  const got = await verdicts($, on, [
+    'cargo test --manifest-path /r/.claude/worktrees/tool-8/Cargo.toml',
+    'cargo test --manifest-path=/home/me/htui-wt/Cargo.toml',
+    'cargo test --manifest-path /home/me/htui/Cargo.toml',
+    'cargo test --manifest-path /r/.claude/worktrees/tool-8/Cargo.toml --features testkit',
+    'cargo test --manifest-path ../htui/Cargo.toml',
+    'cargo test --manifest-path htui-agent/Cargo.toml',
+    'cargo test --manifest-path /r/.claude/worktrees/tool-8/crates/htui-store/Cargo.toml',
+  ])
+  expect(got.map(r => r?.match(/builds (\S+)'s integration tests/)?.[1] ?? r)).toEqual([
+    'htui',
+    'htui',
+    'htui',
+    undefined,
+    'htui',
+    'htui-agent',
+    undefined,
+  ])
+})
+
 test('integration tests in scope count, whatever selects them', async ($, on) => {
   await denies($, on, [
     'cargo test -p htui --test app',
