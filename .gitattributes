@@ -1,0 +1,3 @@
+# The DECISIONS.md index is one line per item, so two branches that each add a line merge by keeping
+# both. Union does not order them: the validator still requires newest-first, so check the result.
+DECISIONS.md merge=union
