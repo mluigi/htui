@@ -5,4 +5,5 @@
 /*.log
 graphify-out/cache
 /crates/htui/claude-plugin/htui/.claude-plugin/types/
+/.claude/skills/htui-dev/.claude-plugin/types/
 .env

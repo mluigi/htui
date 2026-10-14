@@ -1,0 +1,9 @@
+{
+  "name": "htui-dev",
+  "version": "0.0.0-source",
+  "description": "Guards for developing htui: refuses the calls that have cost this repo real losses, each with the fix",
+  "author": {
+    "name": "htui"
+  },
+  "types": "./types/index.d.ts"
+}
