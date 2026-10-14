@@ -365,3 +365,83 @@ export function gitWrite(words: Words): string | null {
       return null
   }
 }
+
+// --- G3: the forbidden literal --------------------------------------------------------------
+
+/**
+ * The name `crates/htui-agent/tests/extensibility.rs` forbids anywhere in `crates/**\/*.{rs,json}`
+ * (case-sensitive), built so that this file never spells it.
+ */
+export const LITERAL = 'ze' + 'ta'
+
+/**
+ * The Gortex MCP tools that write a file (Q3). `edit_file`, `write_file`, `edit_symbol`,
+ * `rename_symbol` and `batch_edit` are this session's schemas; `edit` and `refactor` are the
+ * newer compact names, whose inputs are read the same way.
+ */
+export const GORTEX_WRITE = /^mcp__gortex__(edit|edit_file|edit_symbol|batch_edit|rename_symbol|refactor|write_file)$/
+
+/** The fields that carry the text a write puts into a file; the old text is never read (removing the literal is the fix). */
+const NEW_TEXT = ['new_string', 'new_source', 'content', 'new_name'] as const
+
+/** A path from a Gortex symbol id: what stands before `::` (`htui/crates/x.rs::Sym`). */
+const idPath = (v: unknown): string | null => (typeof v === 'string' && v.includes('::') ? v.slice(0, v.indexOf('::')) : null)
+
+/** The file a node of a tool's input names: `file_path`, `path`, `notebook_path`, `target.file`, or a symbol id's file. */
+function pathOf(node: Readonly<Record<string, unknown>>): string | null {
+  for (const key of ['file_path', 'path', 'notebook_path']) {
+    if (typeof node[key] === 'string') return node[key] as string
+  }
+  const target = node.target
+  if (target !== null && typeof target === 'object' && !Array.isArray(target)) {
+    const t = target as Record<string, unknown>
+    if (typeof t.file === 'string') return t.file
+    const p = idPath(t.symbol) ?? idPath(t.id)
+    if (p !== null) return p
+  }
+  return idPath(node.id)
+}
+
+/** Whether the literal scan reads `path`: a `.rs` or `.json` under a `crates/` folder, outside any `target/`, not the scan's own file. */
+function scanned(path: string): boolean {
+  const p = path.replace(/\\/g, '/')
+  const at = p.lastIndexOf('crates/')
+  if (at === -1 || (at > 0 && p[at - 1] !== '/')) return false
+  const inCrates = p.slice(at)
+  if (!/\.(rs|json)$/.test(inCrates)) return false
+  if (inCrates.split('/').includes('target')) return false
+  return inCrates !== 'crates/htui-agent/tests/extensibility.rs'
+}
+
+/** The first path, walking `node` with the nearest path passed down, whose new text holds the literal. */
+function offender(node: unknown, inherited: string | null, depth: number): string | null {
+  if (depth > 16 || node === null || typeof node !== 'object') return null
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const hit = offender(item, inherited, depth + 1)
+      if (hit !== null) return hit
+    }
+    return null
+  }
+  const record = node as Readonly<Record<string, unknown>>
+  const path = pathOf(record) ?? inherited
+  if (path !== null && scanned(path)) {
+    for (const key of NEW_TEXT) {
+      const v = record[key]
+      if (typeof v === 'string' && v.includes(LITERAL)) return path
+    }
+  }
+  for (const [key, v] of Object.entries(record)) {
+    if (key === 'target') continue
+    const hit = offender(v, path, depth + 1)
+    if (hit !== null) return hit
+  }
+  return null
+}
+
+/** G3: an edit by `tool` that would write the literal into a file the scan reads; every matched tool's input is read the same way. */
+export function forbiddenLiteral(_tool: string, input: Readonly<Record<string, unknown>>): string | null {
+  const path = offender(input, null, 0)
+  if (path === null) return null
+  return `htui-dev: ${path} would contain "${LITERAL}", which crates/htui-agent/tests/extensibility.rs forbids in crates/**/*.{rs,json} — use another name; only extensibility.rs may spell it`
+}

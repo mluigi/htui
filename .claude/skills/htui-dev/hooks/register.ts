@@ -2,12 +2,13 @@
 // call that has cost this repo real work (docs/htui-dev.md):
 //   G1  cargo test that builds feature-gated integration tests without their feature (0 tests, green)
 //   G2  cargo test with the other crate's test feature name (testkit vs test-support)
+//   G3  the literal extensibility.rs forbids, written into crates/**/*.{rs,json} by an edit tool
 //   G6  git commit --no-verify (or -n), which skips the repo's commit hooks
 // Every guard is a `{ deny }`, never a rewrite. A guard that throws lets the call through and
 // says so on the status line (ANA-29 §6.3, "fail open"): the guards are a safety net, not a
 // sandbox. The mod reads nothing outside the event; it runs no process and touches no file.
 import type { EngineInterface, Register } from 'claude-code'
-import { cargoTest, noVerify } from './guards'
+import { cargoTest, forbiddenLiteral, GORTEX_WRITE, noVerify } from './guards'
 import { simpleCommands, type Words } from './shell'
 
 /** Puts `text` on the plugin's status line; never throws (a `$` call in a re-entry rejects). */
@@ -45,6 +46,17 @@ export const register: Register = on => {
       if (reason !== null) return { deny: reason }
     }
     return next(e)
+  }).catch(($, e, next) => {
+    if (next.called) return next(e)
+    warn($, 'htui-dev: tool.call guard failed, call allowed')
+    return next(e)
+  })
+
+  on('tool.call', { tool: ['Edit', 'Write', 'NotebookEdit', GORTEX_WRITE] }, async ($, e, next) => {
+    const reason = judge($, 'forbidden literal', 'call', () =>
+      forbiddenLiteral(e.tool, e as unknown as Readonly<Record<string, unknown>>),
+    )
+    return reason !== null ? { deny: reason } : next(e)
   }).catch(($, e, next) => {
     if (next.called) return next(e)
     warn($, 'htui-dev: tool.call guard failed, call allowed')
