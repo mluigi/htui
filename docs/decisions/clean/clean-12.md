@@ -11,7 +11,7 @@
   re-index; `scripts/hr` (`TOOL_EXCLUDES`, now `scripts/hr:697`, not `:692`) already treated the directory like
   `.serena/`, `.kiro/` and `graphify-out/`; nothing loads the files from git. `scripts/hr`, `docs/hr-sandbox.md`
   and `tests/hr/hr.bats` needed no change. `.claude/skills/graphify` stays committed.
-- **Hook docs (`d72e81f2`).** Most of the item was already done by TOOL-9: `lifecycle.md` step 8 and the
+- **Hook docs (`d72e81f2`).** Most of the item was already done by TOOL-9: the lifecycle reference's step 8 and the
   installer headers already describe `scripts/githooks/` and `core.hooksPath`, so the handoff-run lifecycle reference was not edited.
   The one stale spot was the installer's "a separate PreToolUse hook hard-blocks that flag", which now names its
   source (G6 of the `htui-dev` mod, `docs/htui-dev.md`). **D2:** comment-only, `.sh` and `.ps1` in lockstep, and
