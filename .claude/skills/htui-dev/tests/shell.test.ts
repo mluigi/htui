@@ -60,10 +60,27 @@ test('each wrapper is stripped with its options, nested ones too', () => {
     ['timeout -s KILL -k 5 900s cargo test', ['cargo', 'test']],
     ['timeout --signal=TERM --preserve-status 15m cargo test', ['cargo', 'test']],
     ['nohup cargo test', ['cargo', 'test']],
+    ['exec cargo test', ['cargo', 'test']],
+    ['exec -a name -cl cargo test', ['cargo', 'test']],
     ['RUST_LOG=x timeout 900 nice -n 5 env A=1 nohup time cargo test', ['cargo', 'test']],
   ]
   for (const [line, words] of cases) expect(simpleCommands(line), line).toEqual([words])
   expect(simpleCommands('time')).toEqual([])
+})
+
+test('env -S splits its string into the command', () => {
+  expect(simpleCommands('env -S "cargo test -p htui"')).toEqual([['cargo', 'test', '-p', 'htui']])
+  expect(simpleCommands(`env -S'cargo test' -p htui`)).toEqual([['cargo', 'test', '-p', 'htui']])
+  expect(simpleCommands('env --split-string="cargo test" -p htui')).toEqual([['cargo', 'test', '-p', 'htui']])
+  expect(simpleCommands('env -i -S "A=1 git commit -n"')).toEqual([['git', 'commit', '-n']])
+  expect(simpleCommands('env -uSHELL cargo test')).toEqual([['cargo', 'test']])
+})
+
+test('an array assignment is no command', () => {
+  expect(simpleCommands('arr=(cargo test -p htui)')).toEqual([])
+  expect(simpleCommands('arr=(a "b c" $(x)) && cargo test')).toEqual([['cargo', 'test']])
+  expect(simpleCommands('arr+=(git commit -n); ls')).toEqual([['ls']])
+  expect(simpleCommands('declare -a xs=(git commit -n)')).toEqual([['declare', '-a', 'xs=(git commit -n)']])
 })
 
 test('leading shell keywords and braces are not the command', () => {
@@ -93,6 +110,11 @@ test('a bash -c string is followed', () => {
   expect(simpleCommands(`bash -e -o pipefail -c 'cargo test'`)).toEqual([['cargo', 'test']])
   expect(simpleCommands(`/bin/bash -ec "bash -c 'git commit -n'"`)).toEqual([['git', 'commit', '-n']])
   expect(simpleCommands(`env bash -c 'cargo test'`)).toEqual([['cargo', 'test']])
+  expect(simpleCommands(`bash --rcfile f -c 'cargo test'`)).toEqual([['cargo', 'test']])
+  expect(simpleCommands(`bash --init-file f --norc -c 'cargo test'`)).toEqual([['cargo', 'test']])
+  for (const shell of ['zsh', 'dash', 'ksh', '/usr/bin/zsh']) {
+    expect(simpleCommands(`${shell} -c 'git commit -n'`), shell).toEqual([['git', 'commit', '-n']])
+  }
   // Not a -c: the script runs, the parser cannot see into it.
   expect(simpleCommands('bash scripts/gate.sh -c')).toEqual([['bash', 'scripts/gate.sh', '-c']])
   expect(simpleCommands(`bash -c 'echo "unbalanced'`)).toBeNull()

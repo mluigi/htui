@@ -164,6 +164,10 @@ test('every way of reaching cargo test is seen', async ($, on) => {
     'cargo check && cargo test -p htui',
     'echo "$(cargo test -p htui 2>&1 | tail -3)"',
     '/usr/bin/cargo test -p htui',
+    'exec cargo test -p htui',
+    'env -S "cargo test -p htui"',
+    `zsh -c 'cargo test -p htui'`,
+    `bash --rcfile ~/.bashrc -c 'cargo test -p htui'`,
   ])
 })
 
@@ -242,6 +246,7 @@ test('other cargo commands and mere mentions are allowed', async ($, on) => {
     'git commit -m "cargo test -p htui"',
     `git commit -m "$(cat <<'EOF'\nfix: "a && cargo test -p htui" ran 0 tests\nEOF\n)"`,
     `grep -n 'cargo test' docs/htui-cli.md`,
+    'cmd=(cargo test -p htui)',
     'cat <<EOF\ncargo test -p htui\nEOF',
   ])
 })

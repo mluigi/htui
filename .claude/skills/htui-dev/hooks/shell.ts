@@ -3,7 +3,7 @@
 // cannot follow (an unbalanced quote, a heredoc with no end) answers null, and the
 // guards let that call through (ANA-29 §6.3, "fail open").
 
-/** One simple command's words: quotes removed, leading VAR=value and the wrappers env/command/time/nice/timeout/nohup stripped, redirections dropped. */
+/** One simple command's words: quotes removed, leading VAR=value and the wrappers env (and its -S string)/command/time/nice/timeout/nohup/exec stripped, redirections dropped. */
 export type Words = readonly string[]
 
 /**
@@ -28,8 +28,11 @@ const BREAK = new Set([' ', '\t', '\n', ';', '&', '|', '(', ')', '<', '>', '`'])
 /** Words that open or close a compound command; at the head of a command they are not the program. */
 const KEYWORDS = new Set(['!', '{', '}', 'if', 'then', 'elif', 'else', 'fi', 'do', 'done', 'while', 'until'])
 
-/** `NAME=value`, a shell assignment. */
-const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/
+/** `NAME=value` or `NAME+=value`, a shell assignment. */
+const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*\+?=/
+
+/** The shells whose `-c` string is followed. */
+const SHELLS = new Set(['bash', 'sh', 'zsh', 'dash', 'ksh'])
 
 /** The index of the `)` closing the `(` at `open`, counting parentheses only (for `$(( … ))`). Throws Unfollowable. */
 function parenEnd(line: string, open: number): number {
@@ -250,6 +253,13 @@ function tokenize(line: string): Token[] {
       i++
       continue
     }
+    if (c === '(' && inWord && !quoted && /^[A-Za-z_][A-Za-z0-9_]*\+?=$/.test(word)) {
+      // `arr=( … )`: an array assignment, one word, no subshell.
+      const end = substitutionEnd(line, i + 1)
+      word += line.slice(i, end + 1)
+      i = end + 1
+      continue
+    }
     if (c === '<' || c === '>') {
       // A run of digits right before the operator names a file descriptor, not a word.
       if (inWord && !quoted && /^\d+$/.test(word)) {
@@ -312,15 +322,63 @@ function skipOptions(words: string[], at: number, withValue: readonly string[], 
   return at
 }
 
+/**
+ * Where `env`'s options starting at `at` end, and the string of its `-S` (`--split-string`), whose
+ * words stand in for the option and run as the command, or null without one.
+ */
+function envOptions(words: readonly string[], at: number): { at: number; split: string | null } {
+  while (at < words.length) {
+    const o = words[at]!
+    if (o === '--') return { at: at + 1, split: null }
+    if (!o.startsWith('-') || o === '-') return { at, split: null }
+    if (o === '--split-string') return { at: at + 2, split: words[at + 1] ?? '' }
+    if (o.startsWith('--split-string=')) return { at: at + 1, split: o.slice('--split-string='.length) }
+    if (o === '--unset' || o === '--chdir') {
+      at += 2
+      continue
+    }
+    if (o.startsWith('--')) {
+      at++
+      continue
+    }
+    // A short cluster: `-u NAME` and `-C DIR` take a value, `-S STRING` the split string.
+    let used = 1
+    for (let j = 1; j < o.length; j++) {
+      const letter = o[j]!
+      if (letter !== 'u' && letter !== 'C' && letter !== 'S') continue
+      const rest = o.slice(j + 1)
+      if (letter === 'S') return rest !== '' ? { at: at + 1, split: rest } : { at: at + 2, split: words[at + 1] ?? '' }
+      if (rest === '') used = 2
+      break
+    }
+    at += used
+  }
+  return { at, split: null }
+}
+
+/** The words of `text` as the shell splits them: quotes removed, nothing run. Throws Unfollowable. */
+const wordsOf = (text: string): string[] =>
+  tokenize(text).flatMap(t => (t.kind === 'word' ? [t.text] : []))
+
 /** The words with leading assignments, keywords and wrappers stripped, the program first. */
-function unwrap(words: string[]): string[] {
+function unwrap(given: string[]): string[] {
+  let words = given
   let at = 0
   for (;;) {
     const start = at
     while (at < words.length && (ASSIGNMENT.test(words[at]!) || KEYWORDS.has(words[at]!))) at++
     const w = words[at]
     if (w === 'env') {
-      at = skipOptions(words, at + 1, ['-u', '-C', '-S'], ['--unset', '--chdir', '--split-string'])
+      const env = envOptions(words, at + 1)
+      if (env.split !== null) {
+        // `env -S "cargo test"`: its string, split, is the command, followed by the words after it.
+        words = [...wordsOf(env.split), ...words.slice(env.at)]
+        at = 0
+        continue
+      }
+      at = env.at
+    } else if (w === 'exec') {
+      at = skipOptions(words, at + 1, ['-a'], [])
     } else if (w === 'command' || w === 'nohup') {
       at = skipOptions(words, at + 1, [], [])
     } else if (w === 'time') {
@@ -335,15 +393,14 @@ function unwrap(words: string[]): string[] {
   }
 }
 
-/** The string a `bash|sh -c` command runs, or null when the words are no such command. */
+/** The string a `bash|sh|zsh|dash|ksh -c` command runs, or null when the words are no such command. */
 function dashC(words: readonly string[]): string | null {
-  const shell = (words[0] ?? '').split('/').pop()
-  if (shell !== 'bash' && shell !== 'sh') return null
+  if (!SHELLS.has((words[0] ?? '').split('/').pop()!)) return null
   let hasC = false
   let at = 1
   while (at < words.length) {
     const w = words[at]!
-    if (w === '-o' || w === '+o' || w === '-O' || w === '+O') {
+    if (w === '-o' || w === '+o' || w === '-O' || w === '+O' || w === '--rcfile' || w === '--init-file') {
       at += 2
       continue
     }
@@ -401,7 +458,7 @@ function commandsOf(line: string, depth: number): Words[] {
   return out
 }
 
-/** The simple commands of a Bash line, recursing into `bash|sh -c` (also `-lc`, `-ec`); null when the parser cannot follow it (unbalanced quote, trailing backslash, unterminated heredoc). */
+/** The simple commands of a Bash line, recursing into `bash|sh|zsh|dash|ksh -c` (also `-lc`, `-ec`) and `$( … )` inside double quotes; null when the parser cannot follow it (unbalanced quote, trailing backslash, unterminated heredoc). */
 export function simpleCommands(command: string): Words[] | null {
   try {
     return commandsOf(command, 0)
