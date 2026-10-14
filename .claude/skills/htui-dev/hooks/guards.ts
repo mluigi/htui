@@ -5,24 +5,75 @@ import { quoteWords, type Words } from './shell'
 
 // --- G1 and G2: cargo test -------------------------------------------------------------------
 
+// The three tables below are copied from the manifests; a drift is TOOL-9's gate to catch
+// (`cargo tree -e features` shows what cargo really turns on). Every feature is `<crate>/<name>`.
+
 /**
- * The feature each member's integration tests are gated on (`#![cfg(feature = …)]` over
- * `crates/*\/tests`), from the `[features]` of `crates/*\/Cargo.toml`. A drift from the manifests
- * is TOOL-9's gate to catch.
+ * The features each member declares, and what each forwards to: the `[features]` tables of
+ * `crates/*\/Cargo.toml`. Only the forwards that reach a test feature are listed (`dep:` ones are not).
  */
-const GATED: Readonly<Record<string, string>> = {
-  htui: 'testkit',
-  'htui-agent': 'test-support',
-  'htui-core': 'test-support',
-  'htui-store': 'test-support',
+const FEATURES: Readonly<Record<string, Readonly<Record<string, readonly string[]>>>> = {
+  htui: { testkit: ['htui-store/test-support'] },
+  'htui-agent': { 'test-support': ['htui-core/test-support'] },
+  'htui-core': { demo: [], 'test-support': ['htui-core/demo'], sqlx: [] },
+  'htui-mcp': {},
+  'htui-orch': { 'test-support': ['htui-core/test-support', 'htui-agent/test-support'] },
+  'htui-secrets': {},
+  'htui-store': { demo: ['htui-core/demo'], 'test-support': ['htui-store/demo'], 'local-embed': [] },
+  'htui-worker': { 'test-support': [] },
 }
 
-/** Every member that has one of the two test features, gated tests or not: G2 checks the spelling. */
-const TEST_FEATURE: Readonly<Record<string, string>> = {
-  ...GATED,
-  'htui-orch': 'test-support',
-  'htui-worker': 'test-support',
+/**
+ * What selecting a member for `cargo test` turns on by itself: the `features = [...]` of its
+ * `[dependencies]` and, since a test build uses them, its `[dev-dependencies]` (only `demo` and
+ * `test-support` listed). Cargo unifies them over every selected crate, so `-p htui-agent
+ * -p htui-orch` builds the agent's own tests with `test-support`, and `-p htui-store` its own.
+ */
+const SELECTING: Readonly<Record<string, readonly string[]>> = {
+  htui: [
+    'htui-core/demo',
+    'htui-store/demo',
+    'htui-agent/test-support',
+    'htui-orch/test-support',
+    'htui-worker/test-support',
+    'htui-store/test-support',
+  ],
+  'htui-orch': ['htui-core/test-support', 'htui-agent/test-support'],
+  'htui-worker': [
+    'htui-core/test-support',
+    'htui-orch/test-support',
+    'htui-agent/test-support',
+    'htui-store/demo',
+    'htui-store/test-support',
+  ],
+  'htui-mcp': [
+    'htui-core/test-support',
+    'htui-agent/test-support',
+    'htui-orch/test-support',
+    'htui-store/demo',
+    'htui-store/test-support',
+  ],
+  'htui-store': ['htui-core/test-support', 'htui-store/test-support'],
 }
+
+/**
+ * The features a member's integration tests are gated on (`#![cfg(feature = …)]` over
+ * `crates/*\/tests`: htui 43 files on `testkit`; agent 4 and core 8 on `test-support`; store 3 on
+ * `test-support` and 5 on `demo`). The first is the one a refusal suggests.
+ */
+const GATES: Readonly<Record<string, readonly string[]>> = {
+  htui: ['testkit'],
+  'htui-agent': ['test-support'],
+  'htui-core': ['test-support'],
+  'htui-store': ['test-support', 'demo'],
+}
+
+/** Every member's test feature, `testkit` or `test-support`, gated tests or not: G2 checks the spelling. */
+const TEST_FEATURE: Readonly<Record<string, string>> = Object.fromEntries(
+  Object.entries(FEATURES).flatMap(([crate, own]) =>
+    ['testkit', 'test-support'].filter(f => own[f] !== undefined).map(f => [crate, f]),
+  ),
+)
 
 /** The virtual root's members (`Cargo.toml` `[workspace]`): a run with no package selection tests them all. */
 const MEMBERS = [
@@ -186,9 +237,34 @@ function parseCargoTest(words: Words): CargoTest | null {
   return got
 }
 
-/** Whether `crate`'s gating feature `feature` is on: by `--all-features`, by name, or as `<crate>/<feature>`. */
-const enables = (t: CargoTest, crate: string, feature: string): boolean =>
-  t.allFeatures || t.features.includes(feature) || t.features.includes(`${crate}/${feature}`)
+/**
+ * The features (`<crate>/<name>`) a run of `t` over the crates `selected` turns on: the command
+ * line's (`--all-features`; a plain name on each selected crate that has it; `<crate>/<name>`), what
+ * selecting each crate turns on, and everything those forward to.
+ */
+function enabledFeatures(t: CargoTest, selected: readonly string[]): Set<string> {
+  const queue: string[] = []
+  for (const crate of selected) {
+    const own = FEATURES[crate] ?? {}
+    if (t.allFeatures) queue.push(...Object.keys(own).map(f => `${crate}/${f}`))
+    for (const term of t.features) if (!term.includes('/') && own[term] !== undefined) queue.push(`${crate}/${term}`)
+    queue.push(...(SELECTING[crate] ?? []))
+  }
+  queue.push(...t.features.filter(term => term.includes('/')))
+  const on = new Set<string>()
+  while (queue.length > 0) {
+    const feature = queue.pop()!
+    if (on.has(feature)) continue
+    on.add(feature)
+    const [crate, name] = feature.split('/') as [string, string]
+    queue.push(...(FEATURES[crate]?.[name] ?? []))
+  }
+  return on
+}
+
+/** `a`, `a and b`, `a, b and c`. */
+const listed = (items: readonly string[]): string =>
+  items.length < 2 ? items.join('') : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`
 
 /** `t`'s words with `add` put before `--`, or at the end. */
 const withWords = (t: CargoTest, add: readonly string[]): Words => [
@@ -231,16 +307,16 @@ function wrongFeature(t: CargoTest): string | null {
 /** G1: integration tests built without the feature they are gated on, so they run 0 tests and pass. */
 function vacuousRun(t: CargoTest): string | null {
   if (!t.inScope) return null
-  const selected = (t.packages ?? [...MEMBERS]).filter(c => !t.excluded.includes(c))
-  const missing = [...new Set(selected)].filter(c => GATED[c] !== undefined && !enables(t, c, GATED[c]!))
+  const selected = [...new Set(t.packages ?? MEMBERS.filter(c => !t.excluded.includes(c)))]
+  const on = enabledFeatures(t, selected)
+  const missing = selected.filter(c => (GATES[c] ?? []).some(f => !on.has(`${c}/${f}`)))
   if (missing.length === 0) return null
-  const cmd = quoteWords(t.words)
-  if (t.packages !== null && new Set(t.packages).size === 1) {
-    const crate = missing[0]!
-    const feature = GATED[crate]!
-    return `htui-dev: \`${cmd}\` builds ${crate}'s integration tests without \`${feature}\`, so they run 0 tests and pass — run: ${quoteWords(withWords(t, ['--features', feature]))}`
-  }
-  return `htui-dev: \`${cmd}\` runs the feature-gated integration tests of ${missing.join(', ')} as 0 tests — run: ${quoteWords(withWords(t, ['--all-features']))}`
+  // A plain name turns the feature on in every selected crate that has it, so one word fixes all.
+  const features = [...new Set(missing.map(c => GATES[c]![0]!))]
+  const tests = missing.length === 1 ? `${missing[0]}'s integration tests` : `the integration tests of ${listed(missing)}`
+  const fix = quoteWords(withWords(t, ['--features', features.join(',')]))
+  const single = t.packages !== null && selected.length === 1
+  return `htui-dev: \`${quoteWords(t.words)}\` builds ${tests} without ${listed(features.map(f => `\`${f}\``))}, so they run 0 tests and pass — run: ${fix}${single ? '' : ' (or --all-features)'}`
 }
 
 /** G1 and G2 over one simple command: G2 first (its text is the more precise), then G1. */

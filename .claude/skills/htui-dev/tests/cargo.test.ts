@@ -42,24 +42,46 @@ test('each spelling of the htui selection without testkit is refused', async ($,
   ])
 })
 
-test('agent, core and store without test-support are refused', async ($, on) => {
+test('agent and core alone without test-support are refused', async ($, on) => {
   await denies($, on, [
     'cargo test -p htui-agent',
     'cargo test -p htui-core --features demo',
-    'cargo test -p htui-store --test pg_store',
-    'cargo test --manifest-path crates/htui-store/Cargo.toml',
+    'cargo test --manifest-path crates/htui-agent/Cargo.toml',
+    'cargo test -p htui-agent -p htui-core',
+    'cargo test -p htui-agent -p htui-secrets',
   ])
 })
 
-test('the whole workspace without every gating feature is refused', async ($, on) => {
+test('the whole workspace without testkit is refused', async ($, on) => {
   await denies($, on, [
     'cargo test',
     'cargo test --workspace',
     'cargo test --all',
-    'cargo test --workspace --features testkit',
     'cargo test --workspace --features test-support',
+    'cargo test --workspace --features htui-agent/test-support',
     'cargo test --manifest-path Cargo.toml',
-    'cargo test --manifest-path /r/htui/Cargo.toml --features testkit',
+    'cargo test --manifest-path /r/htui/Cargo.toml',
+  ])
+})
+
+// Cargo turns features on beyond the command line: a selected crate's [dependencies] and
+// [dev-dependencies] (htui, orch, worker and mcp ask for agent/core/store `test-support`; store asks
+// for its own), and each feature's forwards (`testkit` -> store, agent -> core, orch -> core and agent).
+test("a selected crate's dependencies turn the gate on", async ($, on) => {
+  await allows($, on, [
+    'cargo test -p htui-store',
+    'cargo test -p htui-store --test pg_store',
+    'cargo test --manifest-path crates/htui-store/Cargo.toml',
+    'cargo test -p htui-agent -p htui-orch',
+    'cargo test -p htui-core -p htui-worker',
+    'cargo test -p htui-agent -p htui-core -p htui-mcp',
+    'cargo test -p htui-core -p htui-store',
+    'cargo test --workspace --features testkit',
+    'cargo test --features testkit',
+    'cargo test -p htui -p htui-agent --features testkit',
+    'cargo test -p htui-agent -p htui-core --features htui-agent/test-support',
+    'cargo test -p htui-agent -p htui-core --features test-support',
+    'cargo test --workspace --exclude htui',
     'cd crates/htui && cargo test --features testkit',
   ])
 })
@@ -92,8 +114,11 @@ test('every way of reaching cargo test is seen', async ($, on) => {
 
 test('one crate of several missing its feature is refused', async ($, on) => {
   await denies($, on, [
-    'cargo test -p htui -p htui-agent --features testkit',
-    'cargo test -p htui-agent -p htui-core --features htui-agent/test-support',
+    'cargo test -p htui-agent -p htui-core --features htui-core/test-support',
+    'cargo test -p htui -p htui-core --features htui-core/test-support',
+    'cargo test -p htui -p htui-orch --features test-support',
+    // store's dev-dependencies cover core, not agent.
+    'cargo test -p htui-agent -p htui-core -p htui-store',
   ])
 })
 
@@ -191,14 +216,16 @@ test('a refusal names the command and the fix', async ($, on) => {
   const got = await verdicts($, on, [
     'RUST_LOG=x cargo test -p htui --test app 2>&1 | tail',
     'cargo test -p htui-core -- --test-threads=1',
-    'cargo test --workspace --features testkit',
-    'cargo test -p htui -p htui-agent --features testkit',
+    'cargo test',
+    'cargo test --workspace -- --nocapture',
+    'cargo test -p htui-agent -p htui-core',
   ])
   expect(got).toEqual([
     "htui-dev: `cargo test -p htui --test app` builds htui's integration tests without `testkit`, so they run 0 tests and pass — run: cargo test -p htui --test app --features testkit",
     "htui-dev: `cargo test -p htui-core -- --test-threads=1` builds htui-core's integration tests without `test-support`, so they run 0 tests and pass — run: cargo test -p htui-core --features test-support -- --test-threads=1",
-    'htui-dev: `cargo test --workspace --features testkit` runs the feature-gated integration tests of htui-agent, htui-core, htui-store as 0 tests — run: cargo test --workspace --features testkit --all-features',
-    'htui-dev: `cargo test -p htui -p htui-agent --features testkit` runs the feature-gated integration tests of htui-agent as 0 tests — run: cargo test -p htui -p htui-agent --features testkit --all-features',
+    "htui-dev: `cargo test` builds htui's integration tests without `testkit`, so they run 0 tests and pass — run: cargo test --features testkit (or --all-features)",
+    "htui-dev: `cargo test --workspace -- --nocapture` builds htui's integration tests without `testkit`, so they run 0 tests and pass — run: cargo test --workspace --features testkit -- --nocapture (or --all-features)",
+    'htui-dev: `cargo test -p htui-agent -p htui-core` builds the integration tests of htui-agent and htui-core without `test-support`, so they run 0 tests and pass — run: cargo test -p htui-agent -p htui-core --features test-support (or --all-features)',
   ])
 })
 
