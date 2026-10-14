@@ -164,6 +164,15 @@ test('a substitution inside double quotes is followed as commands', () => {
   expect(simpleCommands(`echo "$(git commit -n"`)).toBeNull()
 })
 
+test('arithmetic and a here-string are no heredoc, quoted or not', () => {
+  expect(simpleCommands(`echo "$(cat <<<"x"\n)"`)).toEqual([['cat'], ['echo', '$(cat <<<"x"\n)']])
+  expect(simpleCommands(`echo "$(echo $((1<<2)))"`)).toEqual([['echo', '$((1<<2))'], ['echo', '$(echo $((1<<2)))']])
+  expect(simpleCommands('echo $((1<<2)); git commit -n')).toEqual([['echo', '$((1<<2))'], ['git', 'commit', '-n']])
+  expect(simpleCommands('echo a$(( (1+2) * 3 ))b')).toEqual([['echo', 'a$(( (1+2) * 3 ))b']])
+  expect(simpleCommands('x=$((a+1)) cargo test')).toEqual([['cargo', 'test']])
+  expect(simpleCommands('echo $((1')).toBeNull()
+})
+
 test('a comment is skipped', () => {
   expect(simpleCommands('cargo check # then git commit -n\nls')).toEqual([['cargo', 'check'], ['ls']])
   expect(simpleCommands('# git commit -n')).toEqual([])

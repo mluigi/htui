@@ -99,7 +99,13 @@ function substitutionEnd(line: string, from: number): number {
       i = eol === -1 ? line.length : eol
       continue
     }
-    if (c === '<' && line[i + 1] === '<' && line[i + 2] !== '<') {
+    if (line.startsWith('<<<', i)) {
+      // A here-string: its word follows, no heredoc body.
+      i += 3
+      wordStart = true
+      continue
+    }
+    if (c === '<' && line[i + 1] === '<') {
       i += 2
       const stripTabs = line[i] === '-'
       if (stripTabs) i++
@@ -239,6 +245,14 @@ function tokenize(line: string): Token[] {
     if (c === '#' && !inWord) {
       const eol = line.indexOf('\n', i)
       i = eol === -1 ? line.length : eol
+      continue
+    }
+    if (c === '$' && line[i + 1] === '(' && line[i + 2] === '(') {
+      // `$(( … ))`: arithmetic, part of the word, no command (and its `<<` no heredoc).
+      const end = parenEnd(line, i + 1)
+      word += line.slice(i, end + 1)
+      inWord = true
+      i = end + 1
       continue
     }
     if (c === '$' && line[i + 1] === '(') {

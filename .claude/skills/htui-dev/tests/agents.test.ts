@@ -172,11 +172,11 @@ test('a line the parser cannot follow is still checked for git writes from a rea
   await spawn($, { prompt: 'READ-ONLY' })
   const got: (string | undefined)[] = []
   for (const command of [
-    'echo $((1<<2)); git commit -am x',
+    'cat <<EOF; git commit -am x',
     `echo 'unbalanced; git -C /r reset --hard`,
     `echo 'unbalanced; git push --force`,
     `echo 'unbalanced; git switch main`,
-    'echo $((1<<2)); git status; git stash list',
+    'cat <<EOF; git status; git stash list',
   ]) {
     got.push(((await bash($, command, 'agent-1')) as { deny?: string }).deny)
   }
@@ -188,7 +188,7 @@ test('a line the parser cannot follow is still checked for git writes from a rea
     undefined,
   ])
   // An untagged agent's unreadable line stays allowed.
-  await bash($, 'echo $((1<<2)); git commit -am x', 'agent-2')
+  await bash($, 'cat <<EOF; git commit -am x', 'agent-2')
   expect(reached.map(r => r.agentId)).toEqual(['agent-1', 'agent-1', 'agent-2'])
 })
 

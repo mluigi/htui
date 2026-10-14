@@ -807,8 +807,8 @@ const COARSE_GIT_WRITE =
   /(?:^|[\s;&|()`'"])git(?:\s+(?:-C|-c|--git-dir|--work-tree|--namespace)\s+\S+|\s+-\S+)*\s+(commit|reset|restore|merge|rebase|cherry-pick|revert|am|apply|add|rm|mv|pull|clean|push|checkout-index|read-tree|update-ref|update-index|gc|filter-branch|stash(?!\s+(?:list|show)\b)|bisect(?!\s+(?:log|view|visualize)\b)|worktree\s+(?:add|remove|move|prune)|submodule\s+(?:update|deinit|add|sync)|sparse-checkout(?!\s+list\b)|reflog\s+(?:expire|delete)|notes\s+(?:add|remove|edit|append|copy|prune))(?![\w-])/
 
 /**
- * G4's Bash half for a line the parser cannot follow (an unbalanced quote, `$((1<<2))` read as a
- * heredoc): the git write it seems to run, by a coarse pattern, or null. For a read-only agent only;
+ * G4's Bash half for a line the parser cannot follow (an unbalanced quote, a heredoc with no
+ * end): the git write it seems to run, by a coarse pattern, or null. For a read-only agent only;
  * any other caller's unreadable line stays allowed.
  */
 export function coarseGitWrite(command: string): string | null {
