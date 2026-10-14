@@ -19,7 +19,8 @@
 #   post-commit sync block stays in .git/hooks and is reached through that chain.
 #
 # Escape hatch (printed on block): WORKFLOW_SKIP_HOOK=1. Deliberately NOT --no-verify: a
-# separate PreToolUse hook hard-blocks that flag for agent sessions, so advertising it
+# separate PreToolUse hook hard-blocks that flag for agent sessions (htui: guard G6 of the
+# htui-dev mod, docs/htui-dev.md), so advertising it
 # would be dead advice - and after the -ScopePaths change an unrelated commit needs
 # neither hatch.
 #
