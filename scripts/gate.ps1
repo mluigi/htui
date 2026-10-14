@@ -222,13 +222,23 @@ function Invoke-GateSelfTest {
         $script:Results.Add([pscustomobject]@{ name = 'fmt'; status = 'passed'; seconds = 1 })
         $script:Results.Add([pscustomobject]@{ name = 'test'; status = 'failed'; seconds = 2 })
         Write-Last 'failed' '2026-01-01T00:00:03Z'
-        $j = Get-Content -Raw $script:LastJson | ConvertFrom-Json
-        if ($j.state -ne 'failed' -or @($j.steps).Count -ne 2 -or $j.steps[1].status -ne 'failed' -or $j.finished -ne '2026-01-01T00:00:03Z') {
+        $raw = Get-Content -Raw $script:LastJson
+        $j = $raw | ConvertFrom-Json
+        # `finished` from the text: ConvertFrom-Json reads an ISO time as a DateTime.
+        if ($j.state -ne 'failed' -or @($j.steps).Count -ne 2 -or $j.steps[1].status -ne 'failed' -or $raw -notmatch '"finished":"2026-01-01T00:00:03Z"') {
             $failures += 'last.json: shape'
         }
         if (Test-Path "$($script:LastJson).tmp") { $failures += 'last.json: temp file left behind' }
         Write-Last 'running'
         if ($null -ne (Get-Content -Raw $script:LastJson | ConvertFrom-Json).finished) { $failures += 'last.json: running state has a finished time' }
+
+        # The htui-dev mod's /gate checks a step name against its own copy of the steps (TOOL-8 M2).
+        $mod = Join-Path $RepoRoot '.claude/skills/htui-dev/hooks/commands.ts'
+        if (Test-Path -LiteralPath $mod) {
+            $m = [regex]::Match((Get-Content -Raw -LiteralPath $mod), 'GATE_STEPS = \[([^\]]*)\]')
+            $listed = @([regex]::Matches($m.Groups[1].Value, "'([a-z-]+)'") | ForEach-Object { $_.Groups[1].Value })
+            if (($listed -join ' ') -ne ($Steps -join ' ')) { $failures += "htui-dev GATE_STEPS ($($listed -join ' ')) differ from the steps ($($Steps -join ' '))" }
+        }
     } finally {
         if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
     }
@@ -250,11 +260,23 @@ if ($Status) {
 
 if ($Detach) {
     New-Item -ItemType Directory -Force $script:GateDir | Out-Null
-    $argList = @('-NoProfile', '-File', $PSCommandPath)
-    if ($Only) { $argList += @('-Only', $Only) }
-    $p = Start-Process pwsh -ArgumentList $argList -WindowStyle Hidden -PassThru `
-        -RedirectStandardOutput (Join-Path $script:GateDir 'run.log') `
-        -RedirectStandardError (Join-Path $script:GateDir 'run.err.log')
+    $runLog = Join-Path $script:GateDir 'run.log'
+    if ($IsWindows) {
+        # No redirection on Start-Process: with it, .NET starts the child with handle inheritance
+        # on, and a caller reading this launcher through a pipe (the htui-dev mod's /gate) would
+        # wait on the gate's copy of that pipe until the gate ends. Without it the child starts
+        # through ShellExecute, inherits nothing, and writes its own log.
+        $q = { param([string]$s) "'" + $s.Replace("'", "''") + "'" }
+        $cmd = "& $(& $q $PSCommandPath)$(if ($Only) { " -Only $Only" }) *> $(& $q $runLog)"
+        $p = Start-Process pwsh -ArgumentList @('-NoProfile', '-Command', $cmd) -WindowStyle Hidden -PassThru
+    } else {
+        # Elsewhere .NET hands the child only its three redirected streams.
+        $argList = @('-NoProfile', '-File', $PSCommandPath)
+        if ($Only) { $argList += @('-Only', $Only) }
+        $p = Start-Process pwsh -ArgumentList $argList -PassThru `
+            -RedirectStandardOutput $runLog `
+            -RedirectStandardError (Join-Path $script:GateDir 'run.err.log')
+    }
     Write-Host "gate started, pid $($p.Id) - log $(Join-Path $script:GateDir 'run.log'), result: pwsh scripts/gate.ps1 -Status"
     exit 0
 }

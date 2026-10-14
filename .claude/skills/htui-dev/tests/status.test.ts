@@ -182,6 +182,15 @@ test('a one-step run (--only) names its step, so it never reads as the whole gat
   expect(gateSummary(failed, HEAD, T0)).toBe('gate failed: fmt 2m')
 })
 
+test('skipped steps are named, so a green cannot hide a missing check', () => {
+  const doc = parseGate(
+    gateDoc({ state: 'passed', startedAgo: 200, finishedAgo: 120, steps: [['fmt', 'passed', 1], ['plugin', 'skipped', 0]] }),
+  )
+  expect(gateSummary(doc, HEAD, T0)).toBe('gate passed (1 skipped) 2m')
+  const one = parseGate(gateDoc({ state: 'passed', startedAgo: 200, finishedAgo: 120, steps: [['plugin', 'skipped', 0]] }))
+  expect(gateSummary(one, HEAD, T0)).toBe('gate plugin skipped 2m')
+})
+
 test('a result for another HEAD says so', () => {
   const doc = parseGate(gateDoc({ state: 'passed', startedAgo: 200, finishedAgo: 100, head: 'b'.repeat(40) }))
   expect(gateSummary(doc, HEAD, T0)).toBe('gate passed 1m (older HEAD)')
@@ -221,6 +230,9 @@ test('a run is fresh while running and started under 4 h ago', () => {
   expect(isFreshRun(parseGate(gateDoc({ state: 'running', startedAgo: 4 * 3600 + 1 })), T0)).toBe(false)
   expect(isFreshRun(parseGate(gateDoc({ state: 'passed', startedAgo: 9, finishedAgo: 1 })), T0)).toBe(false)
   expect(isFreshRun('unreadable', T0)).toBe(false)
+  // A damaged start never blocks /gate.
+  const damaged = JSON.stringify({ head: HEAD, started: 'x', finished: null, state: 'running', steps: [] })
+  expect(isFreshRun(parseGate(damaged), T0)).toBe(false)
   expect(isFreshRun(null, T0)).toBe(false)
 })
 

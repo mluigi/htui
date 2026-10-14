@@ -8,13 +8,14 @@
 #
 # Prints one JSON line and exits 0, whatever Postgres answered:
 #   {"disk":{"path":"<repo root>","used_pct":80},
-#    "postgres":{"state":"up|recovering|down|unknown","via":"pg_isready|docker|tcp|none","target":"host:port"}}
+#    "postgres":{"state":"up|recovering|down|unknown","via":"pg_isready|docker|tcp","target":"host:port"}}
 # used_pct is null when df cannot say. Exit 2 is usage only.
 #
 # Postgres is the host and port of HTUI_TEST_DATABASE_URL, else localhost:5439 (compose.yaml).
-# The first probe that exists answers: pg_isready (0 up, 1 recovering, 2 down, else unknown), then
-# `docker exec htui-postgres pg_isready` (the host has no psql client), then a 3 s TCP connect,
-# which can only tell up from down. The disk is the repo root's filesystem, never `/`: in an hr
+# The first probe that exists answers: pg_isready (0 up, 1 recovering, 2 down, else unknown), then,
+# for a local target only, the htui-postgres container (the host has no psql client): stopped is
+# down, running is `docker exec htui-postgres pg_isready`. Last, a 3 s TCP connect, which can only
+# tell up from down. The disk is the repo root's filesystem, never `/`: in an hr
 # sandbox `/` is the container overlay and the repo lives on another disk.
 
 set -u
@@ -95,6 +96,11 @@ tcp_up() {
     fi
 }
 
+is_local() {
+    # Whether $1 names this machine.
+    case "$1" in localhost|127.0.0.1|::1) return 0 ;; *) return 1 ;; esac
+}
+
 pg_probe() {
     # -> PG_STATE, PG_VIA for PG_HOST:PG_PORT.
     local rc
@@ -103,16 +109,15 @@ pg_probe() {
         PG_STATE="$(map_isready "$rc")"; PG_VIA=pg_isready
         return
     fi
-    # Inspect first: on a box without the container, `docker exec` exits 1, which would read as
-    # recovering.
-    if command -v docker >/dev/null 2>&1 && docker container inspect "$CONTAINER" >/dev/null 2>&1; then
+    # The container answers only for a local target. Its state first: `docker exec` on a missing or
+    # stopped container exits 1, which would read as recovering.
+    local running
+    if is_local "$PG_HOST" && command -v docker >/dev/null 2>&1 \
+        && running="$(docker container inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)"; then
+        PG_VIA=docker
+        if [[ "$running" != true ]]; then PG_STATE=down; return; fi
         docker exec "$CONTAINER" pg_isready -t 3 >/dev/null 2>&1; rc=$?
-        PG_STATE="$(map_isready "$rc")"; PG_VIA=docker
-        return
-    fi
-    if [[ "$PG_HOST" == /* ]]; then
-        # A socket directory, and nothing that can read it.
-        PG_STATE=unknown; PG_VIA=none
+        PG_STATE="$(map_isready "$rc")"
         return
     fi
     if tcp_up "$PG_HOST" "$PG_PORT"; then PG_STATE=up; else PG_STATE=down; fi
@@ -148,6 +153,7 @@ run_self_test() {
     dsn_case 'postgres://[::1]:5440/d' '::1:5440'
     dsn_case 'postgres://h1:1,h2:2/d' 'h1:1'
     dsn_case 'postgres:///db?host=/run/pg' 'localhost:5432'
+    dsn_case 'POSTGRES://h:1/d' 'localhost:5439'
 
     parse_dsn 'postgres://[::1]:5440/d'
     [[ "$(target_of)" == '[::1]:5440' ]] || failures+=("target_of: IPv6 not bracketed: $(target_of)")
@@ -169,6 +175,8 @@ run_self_test() {
     [[ "$pct" =~ ^[0-9]+$ ]] && ((pct <= 100)) || failures+=("disk_pct: not a percentage: '$pct'")
 
     tcp_up 127.0.0.1 1 && failures+=('tcp_up: 127.0.0.1:1 answered')
+
+    is_local localhost && is_local ::1 && ! is_local db.example || failures+=('is_local: wrong answer')
 
     if [[ ${#failures[@]} -eq 0 ]]; then
         echo 'Self-test: all cases PASS.'

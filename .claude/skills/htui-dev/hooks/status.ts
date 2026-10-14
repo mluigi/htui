@@ -163,11 +163,17 @@ const since = (isoTime: string | null, now: number): string => {
 const failedSteps = (doc: GateDoc): string[] => doc.steps.filter(s => s.status === 'failed').map(s => s.name)
 
 /**
- * The outcome alone: `gate passed`, `gate failed: test, abort-grep`, or `gate running`. A
- * finished pass of one step (`--only`) names it: `gate plugin passed` is not the gate passing.
+ * The outcome alone: `gate passed`, `gate passed (2 skipped)`, `gate failed: test, abort-grep`, or
+ * `gate running`. A finished pass of one step (`--only`) names it: `gate plugin passed` (or
+ * `skipped`) is not the gate passing. Skips are named as gate.sh names them, so a green cannot
+ * hide a missing check.
  */
 const outcome = (doc: GateDoc): string => {
-  if (doc.state === 'passed' && doc.steps.length === 1) return `gate ${doc.steps[0]!.name} passed`
+  if (doc.state === 'passed' && doc.steps.length === 1) return `gate ${doc.steps[0]!.name} ${doc.steps[0]!.status}`
+  if (doc.state === 'passed') {
+    const skipped = doc.steps.filter(s => s.status === 'skipped').length
+    return skipped === 0 ? 'gate passed' : `gate passed (${skipped} skipped)`
+  }
   if (doc.state !== 'failed') return `gate ${doc.state}`
   const failed = failedSteps(doc)
   return failed.length === 0 ? 'gate failed' : `gate failed: ${failed.join(', ')}`
@@ -194,8 +200,9 @@ export const FRESH_MS = 4 * 3600_000
 /** Whether a gate is running and started under FRESH_MS ago. */
 export function isFreshRun(doc: GateRead, now: number): boolean {
   if (doc === null || doc === 'unreadable' || doc.state !== 'running') return false
+  // A start that does not parse cannot be aged: a damaged file never blocks /gate.
   const t = Date.parse(doc.started)
-  return Number.isNaN(t) || now - t < FRESH_MS
+  return !Number.isNaN(t) && now - t < FRESH_MS
 }
 
 /** `/gate status`: the summary, then one line per step. */

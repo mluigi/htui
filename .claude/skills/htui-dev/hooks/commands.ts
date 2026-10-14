@@ -41,8 +41,11 @@ export function answerOf(ran: Ran, what: string): Answer {
   let text = ran.stdout.trimEnd()
   if (ran.exitCode !== 0 && ran.stderr.trim() !== '') text = text === '' ? ran.stderr.trimEnd() : `${text}\n${ran.stderr.trimEnd()}`
   if (text === '') text = `(${what}: no output, exit ${ran.exitCode})`
-  return { text, exitCode: ran.exitCode }
+  return { text, exitCode: exitCodeOf(ran.exitCode) }
 }
+
+/** An exit code `command.run` takes (a whole number 0-255; any other fails the hook): else 1. */
+const exitCodeOf = (c: number): number => (Number.isInteger(c) && c >= 0 && c <= 255 ? c : 1)
 
 /** gate.sh --detach returns at once; the bound only covers a launcher that hangs. */
 const GATE_LAUNCH_MS = 30_000
@@ -57,7 +60,7 @@ const SCRIPT_MS = 60_000
 export async function gateCommand(args: string, h: Host, run: Runner, read: Reader, now: number, head: string | null): Promise<Answer> {
   const verb = args.trim().split(/\s+/)[0] ?? ''
   const doc = parseGate(await read(join(h.root, 'target', 'gate', 'last.json')))
-  if (verb === 'status') return { text: gateStatusText(doc, head, now), exitCode: doc === null ? 1 : 0 }
+  if (verb === 'status') return { text: gateStatusText(doc, head, now), exitCode: doc === null || doc === 'unreadable' ? 1 : 0 }
   const step = verb === '' || verb === 'force' ? null : verb
   if (step !== null && !(GATE_STEPS as readonly string[]).includes(step)) {
     return { text: `unknown step "${step}" - /gate [step|status|force]; steps: ${GATE_STEPS.join(', ')}`, exitCode: 2 }

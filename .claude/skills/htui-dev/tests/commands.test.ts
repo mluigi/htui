@@ -115,6 +115,10 @@ test('/gate status prints the summary and each step', async () => {
     text: 'no gate result yet',
     exitCode: 1,
   })
+  expect(await gateCommand('status', POSIX, runner(calls), files({ [LAST]: '{' }), T0, HEAD)).toEqual({
+    text: 'gate: last.json unreadable',
+    exitCode: 1,
+  })
   expect(calls).toEqual([])
 })
 
@@ -144,6 +148,13 @@ test('/validate answers the validator output and exit 1 on findings', async () =
   const out = '[ERROR] HANDOFF.md:3 bad line\nworkflow-docs validation: 1 error(s), 0 warning(s)\n'
   const got = await scriptCommand('validate', POSIX, runner([], { exitCode: 1, stdout: out, stderr: '' }))
   expect(got).toEqual({ text: out.trimEnd(), exitCode: 1 })
+})
+
+test('an exit code command.run cannot take reads as 1', async () => {
+  for (const exitCode of [256, -1, 3221225477]) {
+    expect((await scriptCommand('next', POSIX, runner([], { exitCode, stdout: 'x', stderr: '' }))).exitCode, String(exitCode)).toBe(1)
+  }
+  expect((await scriptCommand('next', POSIX, runner([], { exitCode: 255, stdout: 'x', stderr: '' }))).exitCode).toBe(255)
 })
 
 test('a script with no output says so', async () => {

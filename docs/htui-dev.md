@@ -297,16 +297,17 @@ Each part shows only when it has something to say:
 | `N dirty` | changed, staged, unmerged and untracked files | the same `git status` |
 | `disk N%` | the repo's disk above 90% (the disk the repo is on, not `/`, which in an hr sandbox is the container's) | `scripts/dev-health.sh` / `.ps1` |
 | `pg recovering` / `pg down` | the dev Postgres is not up | the same script |
-| Gate | `gate running 4m`, `gate passed 2h`, `gate failed: test, abort-grep 40m`; a one-step run names its step (`gate plugin passed`); `(older HEAD)` when it ran on another commit; `gate: last.json unreadable` | `target/gate/last.json` |
+| Gate | `gate running 4m`, `gate passed 2h`, `gate passed (1 skipped) 2h`, `gate failed: test, abort-grep 40m`; a one-step run names its step (`gate plugin passed`); `(older HEAD)` when it ran on another commit; `gate: last.json unreadable` | `target/gate/last.json` |
 
 `git status` runs with `--no-optional-locks`, so a refresh never takes `index.lock` beside a commit.
 
 `scripts/dev-health.sh` (and its twin `dev-health.ps1`) prints one JSON line:
 `{"disk":{"path":…,"used_pct":80},"postgres":{"state":"up","via":"pg_isready","target":"localhost:5439"}}`.
 Postgres is the host and port of `HTUI_TEST_DATABASE_URL`, else `localhost:5439`. The first probe
-that exists answers: `pg_isready` (0 up, 1 recovering, 2 down), then
-`docker exec htui-postgres pg_isready` (the host has no psql client), then a 3-second TCP connect,
-which can only tell up from down. `bash scripts/dev-health.sh --self-test` checks the DSN parsing and
+that exists answers: `pg_isready` (0 up, 1 recovering, 2 down); then, for a local target only, the
+`htui-postgres` container (the host has no psql client), down when it is stopped and
+`docker exec htui-postgres pg_isready` when it runs; then a 3-second TCP connect, which can only
+tell up from down. `bash scripts/dev-health.sh --self-test` checks the DSN parsing and
 the JSON.
 
 **Toasts.** When `last.json` shows a gate that finished after the session started, the next refresh
@@ -320,9 +321,9 @@ status line off) the warning shows alone, as before M2.
 
 **When it runs.** The timer starts only in an interactive session that htui does not drive
 (`HTUI_SESSION` unset) and with the `status_line` option on. A reload of the mod (saving a file in
-its folder) raises `session.start` again, which restarts the timer; should a reload ever not, the
-first tool call after it does. A refresh that is still running when the next one is due is not
-overlapped.
+its folder) raises `session.start` again, which restarts the timer (seen live). Should a reload ever
+not, the first tool call of the main loop after it is meant to; that path is tested through the kit
+only. A refresh that is still running when the next one is due is not overlapped.
 
 ## The commands
 
@@ -337,11 +338,13 @@ mod's folder, so a worktree's copy serves that worktree).
 | `/gate` | `scripts/gate.sh --detach` (all steps) | the launcher's line (`gate started, pid …`). Refused while `last.json` says a gate started under 4 hours ago is running |
 | `/gate <step>` | `scripts/gate.sh --detach --only <step>` | the same; steps: `fmt`, `clippy-all`, `clippy-bare`, `test`, `abort-grep`, `migrations`, `workflow-docs`, `plugin` |
 | `/gate force` | the whole gate, even while one runs | the launcher's line |
-| `/gate status` | nothing | the last result and each step's status and time; `no gate result yet` (exit 1) |
+| `/gate status` | nothing | the last result and each step's status and time; `no gate result yet` or `gate: last.json unreadable` (exit 1) |
 | `/next` | `.claude/skills/handoff-run/scripts/next-item.sh --repo-root <root>` | the ranked candidates |
 | `/validate` | `.claude/skills/handoff-run/scripts/validate-workflow-docs.sh --repo-root <root>` | the findings; exit 1 on errors |
 
-An unknown `/gate` word answers the step list (exit 2). A script that cannot start answers
+An unknown `/gate` word answers the step list (exit 2); the list is the mod's copy of gate.sh's
+steps, and both gate self-tests check it has not drifted. An exit code outside 0-255 (a Windows
+crash code) reads as 1. A script that cannot start answers
 `htui-dev: <script> could not run: not found` (or `timed out`). The gate itself runs detached and
 writes `target/gate/last.json`; the status line and its toast pick the result up.
 
@@ -498,9 +501,16 @@ Two rules for anything under `.claude/skills/htui-dev/`:
 - **A toast needs the timer.** With the status line off, or in a `-p` run, a finished gate is seen
   only through `/gate status`.
 - **`/gate`'s 4-hour bound is a guess.** A gate killed mid-run leaves `running` in `last.json`;
-  `/gate force` starts another.
+  `/gate force` starts another. A `running` result whose start does not parse never blocks.
+- **A refused status line is not resent until it changes.** `$.ui.status` answers nothing, so a
+  hook beneath that drops a line cannot be seen. Only a call that throws (a re-entry) is retried.
+- **A failed read of `last.json` at start seeds no result.** A gate that ended before the session
+  may then toast once.
 - **Windows is untested.** The `.ps1` commands, `dev-health.ps1` and the `OS=Windows_NT` check have
-  run only under PowerShell 7.5 on Linux.
+  run only under PowerShell 7.5 on Linux. `gate.ps1 -Detach` now starts the gate with no
+  redirection on Windows (ShellExecute, so the gate inherits none of the launcher's pipes, and the
+  gate writes `run.log` itself). Without that, `/gate` would wait on the gate's copy of its pipe.
+  The Windows check owed is that `claude -p "/gate fmt"` returns at once there.
 - **A rename is checked at the symbol's own file.** Gortex's and Serena's `rename_symbol` write the
   new name into every file that refers to the symbol, but G3 judges only the file the call names.
 

@@ -81,9 +81,11 @@ function show($: EngineInterface, force = false): void {
   if (!force && line === shown) return
   shown = line
   try {
-    void Promise.resolve($.ui.status(line)).catch(() => {})
+    // Fire and forget: the call answers nothing, so only a throw (a re-entry) is seen.
+    $.ui.status(line)
   } catch {
-    // Nothing is left to tell (a `$` call in a re-entry rejects).
+    // The next tick sends the line again.
+    shown = undefined
   }
 }
 
@@ -221,14 +223,16 @@ async function toastGate($: EngineInterface, doc: GateRead): Promise<void> {
   if (seen !== null && seen.finished === doc.finished) return
   const finished = doc.finished
   const text = gateToast(doc)
-  if (seen !== null && text !== null) void Promise.resolve($.ui.toast(text)).catch(() => {})
+  if (seen !== null && text !== null) $.ui.toast(text)
   await update($, gateSeen, () => ({ finished }))
 }
 
 /** Seeds `gateSeen` from the gate result there is now, so a gate that ended before the session never toasts. */
 async function seedGate($: EngineInterface): Promise<void> {
   const host = await hostOf($)
-  const doc = host === null ? null : parseGate(await readerOf($)(join(host.root, 'target', 'gate', 'last.json')))
+  // No root, no seed: the first finished gate a tick sees then seeds instead of toasting.
+  if (host === null) return
+  const doc = parseGate(await readerOf($)(join(host.root, 'target', 'gate', 'last.json')))
   const finished = doc !== null && doc !== 'unreadable' && doc.state !== 'running' ? doc.finished : null
   await update($, gateSeen, prev => prev ?? { finished })
 }
@@ -251,7 +255,11 @@ async function tick($: EngineInterface): Promise<void> {
       }
       const snap = await gather(host, hrItem, runnerOf($), readerOf($), scriptArgv(host, 'health'))
       ambientLine = composeAmbient(snap, now)
-      await toastGate($, snap.gate)
+      try {
+        await toastGate($, snap.gate)
+      } catch {
+        // The state store failed: no toast this time; the line still updates.
+      }
     }
     if (warning !== null) {
       warning.at ??= now
@@ -280,12 +288,14 @@ function arm($: EngineInterface): void {
 }
 
 /**
- * A reload drops the timer and need not raise `session.start` again: the first tool call after
- * one asks `ambient` whether this session ran the timer, and re-arms it (or, with `status_line`
- * now off, clears the line). Never awaited: it adds nothing to a guard's path.
+ * A reload drops the timer. Live (2.1.296) a reload raises `session.start` again, which re-arms
+ * it; should one not, the first main-loop tool call after it asks `ambient` whether this session
+ * ran the timer and re-arms it (or, with `status_line` now off, takes the ambient part off the
+ * line). Never awaited: it adds nothing to a guard's path.
  */
-function kick($: EngineInterface): void {
-  if (rearmChecked || timer !== null) return
+function kick($: EngineInterface, agentId: string | undefined): void {
+  // Only the main loop's calls: a subagent's `$` is not known to outlive its dispatch.
+  if (agentId !== undefined || rearmChecked || timer !== null) return
   rearmChecked = true
   void (async () => {
     let fit: boolean
@@ -299,8 +309,8 @@ function kick($: EngineInterface): void {
     if (statusLine) {
       arm($)
     } else {
-      shown = undefined
-      void Promise.resolve($.ui.status(undefined)).catch(() => {})
+      ambientLine = null
+      show($, true)
     }
   })().catch(() => {})
 }
@@ -366,7 +376,7 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'validate' }, async $ => answer($, 'validate', h => scriptCommand('validate', h, runnerOf($))))
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
-    kick($)
+    kick($, e.agentId)
     let cmds: Words[] | null = null
     try {
       cmds = simpleCommands(e.command)
@@ -432,7 +442,7 @@ export const register: Register = (on, options) => {
       ],
     },
     async ($, e, next) => {
-      kick($)
+      kick($, e.agentId)
       const input = e as unknown as Readonly<Record<string, unknown>>
       if (writesNothing(e.tool, input)) return next(e)
       // G4 first: a read-only agent writes nothing, whatever the text.
@@ -454,7 +464,7 @@ export const register: Register = (on, options) => {
   // started its run (its `tool_use_id`). A read-only agent's Workflow and Agent calls are noted
   // before they run, so the spawns they cause can be tagged. Never refuses.
   on('tool.call', { tool: ['Workflow', 'Agent'] }, async ($, e, next) => {
-    kick($)
+    kick($, e.agentId)
     if (await isTagged($, e.agentId, 'htui-dev: read-only guard failed, call allowed')) {
       const id = e.tool_use_id
       await store($, () => update($, readOnlyCalls, adding(id)), `htui-dev: read-only tag failed, call ${id} unrecorded`)

@@ -7,12 +7,13 @@
 #
 # Prints one JSON line and exits 0, whatever Postgres answered:
 #   {"disk":{"path":"<repo root>","used_pct":80},
-#    "postgres":{"state":"up|recovering|down|unknown","via":"pg_isready|docker|tcp|none","target":"host:port"}}
+#    "postgres":{"state":"up|recovering|down|unknown","via":"pg_isready|docker|tcp","target":"host:port"}}
 # used_pct is null when the drive cannot be read.
 #
 # Postgres is the host and port of HTUI_TEST_DATABASE_URL, else localhost:5439 (compose.yaml).
-# The first probe that exists answers: pg_isready (0 up, 1 recovering, 2 down, else unknown), then
-# `docker exec htui-postgres pg_isready`, then a 3 s TCP connect, which can only tell up from down.
+# The first probe that exists answers: pg_isready (0 up, 1 recovering, 2 down, else unknown), then,
+# for a local target only, the htui-postgres container: stopped is down, running is
+# `docker exec htui-postgres pg_isready`. Last, a 3 s TCP connect, which can only tell up from down.
 
 [CmdletBinding()]
 param(
@@ -30,8 +31,9 @@ function ConvertFrom-Dsn {
     # A DSN with no port gets libpq's 5432. user:password@ is dropped up to the last @, a query or
     # fragment is cut, a multi-host list keeps its first host, and an IPv6 host loses its brackets.
     param([string]$Dsn)
-    if (-not $Dsn -or $Dsn -notmatch '^postgres(ql)?://') { return @{ Host = 'localhost'; Port = '5439' } }
-    $rest = $Dsn -replace '^postgres(ql)?://', ''
+    # -c: case-sensitive, as bash's =~ is.
+    if (-not $Dsn -or $Dsn -cnotmatch '^postgres(ql)?://') { return @{ Host = 'localhost'; Port = '5439' } }
+    $rest = $Dsn -creplace '^postgres(ql)?://', ''
     $rest = ($rest -split '[?#]', 2)[0]
     $rest = ($rest -split '/', 2)[0]
     $at = $rest.LastIndexOf('@')
@@ -54,7 +56,8 @@ function Get-Target {
 }
 
 function Get-DiskPct {
-    # The use of $Path's drive as an integer, rounded up as df does, or $null. The drive is the
+    # The use of $Path's drive as an integer, or $null: used / (used + available), rounded up, as df
+    # computes it (blocks reserved for root count as neither). The drive is the
     # mount whose root is the longest prefix of the path: GetPathRoot alone answers `/` on Linux,
     # which in an hr sandbox is the overlay, not the repo's disk.
     param([string]$Path)
@@ -69,7 +72,10 @@ function Get-DiskPct {
             Sort-Object { $_.RootDirectory.FullName.Length } -Descending |
             Select-Object -First 1
         if ($null -eq $drive -or $drive.TotalSize -le 0) { return $null }
-        return [int][math]::Ceiling(100.0 * ($drive.TotalSize - $drive.AvailableFreeSpace) / $drive.TotalSize)
+        $used = $drive.TotalSize - $drive.TotalFreeSpace
+        $avail = $drive.AvailableFreeSpace
+        if ($used + $avail -le 0) { return $null }
+        return [int][math]::Ceiling(100.0 * $used / ($used + $avail))
     } catch {
         return $null
     }
@@ -94,6 +100,12 @@ function Test-TcpUp {
     }
 }
 
+function Test-Local {
+    # Whether $HostName names this machine.
+    param([string]$HostName)
+    return @('localhost', '127.0.0.1', '::1') -ccontains $HostName
+}
+
 function Test-Pg {
     # -> @{ State; Via } for $Pg.
     param([hashtable]$Pg)
@@ -101,16 +113,16 @@ function Test-Pg {
         & pg_isready -h $Pg.Host -p $Pg.Port -t 3 *> $null
         return @{ State = (ConvertTo-PgState $LASTEXITCODE); Via = 'pg_isready' }
     }
-    # Inspect first: on a box without the container, `docker exec` exits 1, which would read as
-    # recovering.
-    if (Get-Command docker -ErrorAction SilentlyContinue) {
-        & docker container inspect $Container *> $null
+    # The container answers only for a local target. Its state first: `docker exec` on a missing or
+    # stopped container exits 1, which would read as recovering.
+    if ((Test-Local $Pg.Host) -and (Get-Command docker -ErrorAction SilentlyContinue)) {
+        $running = "$(& docker container inspect -f '{{.State.Running}}' $Container 2>$null)".Trim()
         if ($LASTEXITCODE -eq 0) {
+            if ($running -ne 'true') { return @{ State = 'down'; Via = 'docker' } }
             & docker exec $Container pg_isready -t 3 *> $null
             return @{ State = (ConvertTo-PgState $LASTEXITCODE); Via = 'docker' }
         }
     }
-    if ($Pg.Host.StartsWith('/')) { return @{ State = 'unknown'; Via = 'none' } }
     return @{ State = $(if (Test-TcpUp $Pg.Host ([int]$Pg.Port)) { 'up' } else { 'down' }); Via = 'tcp' }
 }
 
@@ -135,7 +147,8 @@ function Invoke-DevHealthSelfTest {
         @('postgres://u:p@x@h:1/d', 'h:1'),
         @('postgres://[::1]:5440/d', '::1:5440'),
         @('postgres://h1:1,h2:2/d', 'h1:1'),
-        @('postgres:///db?host=/run/pg', 'localhost:5432')
+        @('postgres:///db?host=/run/pg', 'localhost:5432'),
+        @('POSTGRES://h:1/d', 'localhost:5439')
     )
     foreach ($c in $cases) {
         $pg = ConvertFrom-Dsn $c[0]
@@ -161,6 +174,8 @@ function Invoke-DevHealthSelfTest {
     if ($null -eq $pct -or $pct -lt 0 -or $pct -gt 100) { $failures += "Get-DiskPct: not a percentage: '$pct'" }
 
     if (Test-TcpUp '127.0.0.1' 1) { $failures += 'Test-TcpUp: 127.0.0.1:1 answered' }
+
+    if (-not (Test-Local 'localhost') -or -not (Test-Local '::1') -or (Test-Local 'db.example')) { $failures += 'Test-Local: wrong answer' }
 
     if ($failures.Count -eq 0) { Write-Host 'Self-test: all cases PASS.'; return 0 }
     Write-Host "Self-test FAIL ($($failures.Count)):"

@@ -76,6 +76,7 @@ test('the line refreshes every 60 s, and is re-sent only when it changed', async
   expect(countRuns(runs, 'status')).toBe(1)
   await clock.advance(1)
   expect(countRuns(runs, 'status')).toBe(2)
+  expect(countRuns(runs, 'health')).toBe(2)
   expect(lines).toEqual([LINE])
   w.status = ok(porcelain({ ab: [3, 0] }))
   await clock.advance(60_000)
@@ -218,6 +219,40 @@ test('after a reload, a tool call re-arms the timer once', async ($, on) => {
   expect(countRuns(runs, 'status')).toBe(2)
 })
 
+test("a subagent's tool call never re-arms the timer", async ($, on) => {
+  const clock = mock.clock(on)
+  const runs: Run[] = []
+  const reads = { n: 0 }
+  world(on, { ...DEFAULT_WORLD }, runs, clock)
+  seedAmbient(on, true, reads)
+  tools(on, [])
+  await bash($, 'ls', 'agent-1')
+  await clock.advance(120_000)
+  expect(reads.n).toBe(0)
+  expect(runs).toEqual([])
+})
+
+test('a state store that fails stops neither the line nor its refresh', async ($, on) => {
+  on('state.set', { plugin: 'htui-dev', key: 'gateSeen' }, async () => ({ deny: 'store down' }) as never)
+  const { clock, lines, w } = await setup($, on, {
+    files: { [LAST]: gateJson('passed', '2026-10-14T10:00:00Z', '2026-10-14T11:00:00Z') },
+  })
+  expect(lines).toEqual([`${LINE} · gate passed 1h`])
+  w.status = ok(porcelain({ ab: [3, 0] }))
+  await clock.advance(60_000)
+  expect(lines.at(-1)).toBe('TOOL-8 M1 landed · 3 ahead · gate passed 1h')
+})
+
+test('a gate that ended before a session whose root was not found at first never toasts', async ($, on) => {
+  const { clock, shown, w } = await setup($, on, {
+    w: { root: 'deny' },
+    files: { [LAST]: gateJson('passed', '2026-10-14T10:00:00Z', '2026-10-14T11:00:00Z') },
+  })
+  w.root = ok(`${ROOT}\n`)
+  await clock.advance(120_000)
+  expect(shown).toEqual([])
+})
+
 test('a tool call re-arms nothing when no session armed a timer', async ($, on) => {
   const clock = mock.clock(on)
   const runs: Run[] = []
@@ -301,6 +336,8 @@ test('with no repo root each command says so and runs no script', async ($, on) 
       exitCode: 1,
     })
   }
+  // Each command asks again (a failure is not kept), and runs nothing else.
+  expect(runs.length).toBe(3)
   expect(runs.every(r => keyOf(r.argv) === 'root')).toBe(true)
 })
 
