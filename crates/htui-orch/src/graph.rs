@@ -11,7 +11,7 @@
 //! reads its own `graph_snapshot` and nothing else (invariant 2, `docs/ANA-2.md:109-113`), which
 //! is what makes an edit to a phase mid-run a no-op for that run.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use htui_core::model::{
@@ -683,14 +683,16 @@ fn project_settings(project: &Project) -> ProjectSettings {
         Ok(settings) => settings,
         Err(err) => {
             let empty = match &project.settings {
+                // `resolve` refuses a `null` before it gets here (`ProjectCaps::from_settings`);
+                // kept so this function stays quiet on its own, without that read.
                 Value::Null => true,
                 Value::Object(map) => map.is_empty(),
                 _ => false,
             };
             if !empty {
-                static WARNED: OnceLock<Mutex<HashSet<(ProjectId, i64)>>> = OnceLock::new();
-                let key = (project.id, project.updated_at.timestamp_micros());
-                if first_decode_failure(WARNED.get_or_init(Mutex::default), key) {
+                static WARNED: OnceLock<Mutex<HashMap<ProjectId, i64>>> = OnceLock::new();
+                let edit = project.updated_at.timestamp_micros();
+                if first_decode_failure(WARNED.get_or_init(Mutex::default), project.id, edit) {
                     tracing::warn!(
                         project = %project.id,
                         %err,
@@ -709,11 +711,18 @@ fn project_settings(project: &Project) -> ProjectSettings {
     }
 }
 
-/// True when `key` was not in `seen` and is now. The set is a parameter so a test can use its own.
-fn first_decode_failure(seen: &Mutex<HashSet<(ProjectId, i64)>>, key: (ProjectId, i64)) -> bool {
+/// True when `project`'s document at `edit` (`updated_at` in micros) is not the one last noted.
+/// Only the last edit of each project is remembered, so the map holds one entry per project, as
+/// `first_of` holds one batch. The map is a parameter so a test can use its own.
+fn first_decode_failure(
+    seen: &Mutex<HashMap<ProjectId, i64>>,
+    project: ProjectId,
+    edit: i64,
+) -> bool {
     seen.lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .insert(key)
+        .insert(project, edit)
+        != Some(edit)
 }
 
 /// One `app_setting` value as a positive `i64`.
@@ -1003,14 +1012,16 @@ mod tests {
     /// edit that is still malformed is news. Over a local set, so no other test is in it.
     #[test]
     fn a_decode_failure_is_first_once_per_project_and_edit() {
-        let seen = std::sync::Mutex::new(std::collections::HashSet::new());
+        let seen = std::sync::Mutex::default();
         let project = ProjectId::new();
-        assert!(first_decode_failure(&seen, (project, 1)), "a new document");
-        assert!(!first_decode_failure(&seen, (project, 1)), "the same one");
-        assert!(first_decode_failure(&seen, (project, 2)), "an edit");
-        assert!(
-            first_decode_failure(&seen, (ProjectId::new(), 1)),
-            "another"
+        assert!(first_decode_failure(&seen, project, 1), "a new document");
+        assert!(!first_decode_failure(&seen, project, 1), "the same one");
+        assert!(first_decode_failure(&seen, project, 2), "an edit");
+        assert!(first_decode_failure(&seen, ProjectId::new(), 1), "another");
+        assert_eq!(
+            seen.lock().expect("unpoisoned").len(),
+            2,
+            "one entry per project"
         );
     }
 
@@ -1073,7 +1084,7 @@ mod tests {
             project_settings(&project);
         }
 
-        let warned = logs.lines_with("; its non-cap keys read as defaults");
+        let warned = logs.lines_with("its non-cap keys read as defaults");
         assert_eq!(warned.len(), 2, "once per edit: {warned:?}");
         assert!(
             warned.iter().all(|line| line.contains(" WARN ")),
