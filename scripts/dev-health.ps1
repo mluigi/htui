@@ -54,11 +54,21 @@ function Get-Target {
 }
 
 function Get-DiskPct {
-    # The use of $Path's drive as an integer, rounded up as df does, or $null.
+    # The use of $Path's drive as an integer, rounded up as df does, or $null. The drive is the
+    # mount whose root is the longest prefix of the path: GetPathRoot alone answers `/` on Linux,
+    # which in an hr sandbox is the overlay, not the repo's disk.
     param([string]$Path)
     try {
-        $drive = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot((Resolve-Path -LiteralPath $Path).Path))
-        if ($drive.TotalSize -le 0) { return $null }
+        $full = (Resolve-Path -LiteralPath $Path).Path
+        $sep = [System.IO.Path]::DirectorySeparatorChar
+        $drive = [System.IO.DriveInfo]::GetDrives() |
+            Where-Object {
+                $r = $_.RootDirectory.FullName
+                $full -eq $r.TrimEnd($sep) -or $full.StartsWith($r.TrimEnd($sep) + $sep, [System.StringComparison]::OrdinalIgnoreCase) -or $r -eq "$sep"
+            } |
+            Sort-Object { $_.RootDirectory.FullName.Length } -Descending |
+            Select-Object -First 1
+        if ($null -eq $drive -or $drive.TotalSize -le 0) { return $null }
         return [int][math]::Ceiling(100.0 * ($drive.TotalSize - $drive.AvailableFreeSpace) / $drive.TotalSize)
     } catch {
         return $null
