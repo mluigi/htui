@@ -354,11 +354,11 @@ impl core::fmt::Display for CapError {
 impl ProjectCaps {
     /// Reads both cap keys out of a `project.settings` document.
     ///
-    /// An absent or `null` document is unbounded; any other non-object (array, string, number,
-    /// bool) is a [`CapError::document`] error, since it cannot hold a cap the operator wrote.
-    /// The `null` read is deliberately looser than the writers: `PgStore` and `MemStore` refuse to
-    /// clear a key out of a `null` document (`jsonb_typeof = 'object'`), yet a reader treats it as
-    /// "no caps". Intentional; do not align one side without the other.
+    /// Any non-object (`null`, array, string, number, bool) is a [`CapError::document`] error,
+    /// since it cannot hold a cap the operator wrote. `null` is refused like the rest, as the
+    /// writers do: `PgStore` and `MemStore` refuse to set or clear a key in a `null` document
+    /// (`jsonb_typeof = 'object'`), so reader and writers agree (CLEAN-11; before it a `null` read
+    /// as "no caps"). A project row is created with `{}`, so only a hand-written `null` is refused.
     ///
     /// Within an object, absent or `null` is `None` — unbounded. An integer `>= 0` is the cap.
     /// Anything else (negative, float, string, bool, object) is an **error**, because a cap the
@@ -369,7 +369,7 @@ impl ProjectCaps {
     ///
     /// [`CapError`] naming the first offending key, in declaration order.
     pub fn from_settings(settings: &Value) -> Result<Self, CapError> {
-        if !settings.is_object() && !settings.is_null() {
+        if !settings.is_object() {
             return Err(CapError::document(settings.to_string()));
         }
         Ok(Self {
@@ -948,12 +948,9 @@ mod tests {
         assert_eq!(error.key, PER_TOKEN_CAP_BATCH);
 
         // A document that is not an object cannot hold a cap, so it is refused rather than read
-        // as "no caps"; `null` stays the unbounded absence.
-        assert_eq!(
-            ProjectCaps::from_settings(&Value::Null).expect("a null document is unbounded"),
-            ProjectCaps::default()
-        );
-        for bad in [json!([]), json!("x"), json!(3)] {
+        // as "no caps"; `null` is not an object either, which is what the writers say too
+        // (CLEAN-11).
+        for bad in [Value::Null, json!([]), json!("x"), json!(3)] {
             let error = ProjectCaps::from_settings(&bad)
                 .expect_err("a non-object settings document is refused");
             assert!(error.is_document());
