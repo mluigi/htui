@@ -41,8 +41,8 @@ what changed.
 - The compose file parses; the new mounts' flags and order, and the count of 22 mounts under `~/.claude`,
   match test 42 (checked by running its `jq` assertions on the parsed YAML, since the sandbox has no `docker`).
 - `bats --filter-tags '!docker' tests/hr`: 12 cases fail, the same 12 on a clean `HEAD` (they need `docker` or
-  the host: 3g, 3h, 3l, 3r, 21, 25, 26, 32, 40, 40b, 42, 44). Test 43 passes. Test 42 needs `docker`
-  with `docker` and could not run here.
+  the host: 3g, 3h, 3l, 3r, 21, 25, 26, 32, 40, 40b, 42, 44). Test 43 passes. Test 42 needs `docker compose config`
+  and could not run here.
 
 ## Owed on the host
 
