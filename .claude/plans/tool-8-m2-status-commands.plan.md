@@ -3,7 +3,7 @@
 **Source**: `HANDOFF.md` TOOL-8 (from ANA-29, `docs/ANA-29.md` §4.2 D5/D6/D9/D10, §6.1-6.3)
 **Routed**: plan path (`/handoff-run`, 0 criteria fired, maintainer accepted, 2026-10-14). M1 (guards
 G1-G6) landed `1d3963c3`..`40446f29`, plan `.claude/plans/tool-8-m1-guards.plan.md`.
-**Status**: CONFIRMED 2026-10-14 (D1-D3 as recommended); in progress.
+**Status**: done 2026-10-14 (`28bb7c23`..`c38eb1b7`; review R1 approve with changes → fixed). TOOL-8 closed: `docs/decisions/tool/tool-8.md`.
 **Complexity**: Medium (mod-only TypeScript plus one small script pair, no Rust change)
 
 ## Summary

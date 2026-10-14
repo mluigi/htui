@@ -14,29 +14,19 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-14):** **TOOL-9 is done** (`docs/decisions/tool/tool-9.md`): `scripts/gate.sh` and
-`gate.ps1` run the one gate (fmt, both clippy runs, the suite single-threaded without fail-fast, an abort scan,
-migration numbering, the workflow validator, the `htui-dev` mod when present), detached on request, result in
-`target/gate/last.json`; the workspace pre-commit is committed in `scripts/githooks/` and the installers set
-`core.hooksPath`; `DECISIONS.md` merges by union. Owed on the host: a Windows run of the `.ps1` files (`pwsh` was
-not available in the sandbox) and the Postgres gate. Before it, **CLEAN-11 is done** (`docs/decisions/clean/clean-11.md`): the once-per-batch log
-levels are pinned by a capture test, the project-settings decode warn fires once per project edit, and a `null`
-`project.settings` is refused by `ProjectCaps::from_settings` as the writers refuse it. Owed on the host: the Postgres
-gate on the merged tree. Before it, **MOD-67 is done** (`docs/decisions/mod/mod-67.md`): every key outside text
-entry is a named action in one catalogue, dispatched through declared context stacks, rebindable in
-`<config_root>/keys.toml` (`--keys`, `--default-keys`, `--print-keys`; defaults in `docs/htui-keys.md`); every
-hint, the `?` box and every message that names a key are generated, and one hint row above the status line shows
-the keys of what you are in. Owed on the host: the Postgres gate on the merged tree, a Windows run. Before it, **MOD-96 is done** (`docs/decisions/mod/mod-96.md`): an isolated
-Claude Code session reads no settings file (`--setting-sources ""` / ACP `settingSources: []`), so their permission
-rules and `defaultMode` no longer settle a call before htui; an isolated `claude-cli` row with no mode gets
-`--permission-mode default`, and ACP rows pin `acp.permission_mode` (seeded `default` on `claude`) with
-`session/set_mode`. `claude-cli` keeps `acceptEdits` (review R1). Owed on the host: the Postgres gate on the merged
-tree. Before it, **CLEAN-10 is done** (`docs/decisions/clean/clean-10.md`): `cargo doc --workspace
---no-deps` passes with and without `--all-features` (docs-only; 33 private or unresolved intra-doc links fixed).
-**MOD-93** (`docs/decisions/mod/mod-93.md`; owed on the host: the Postgres gate, a live install against the host
-store, `tsc` on the mod, Windows), **MOD-89**, **MOD-95**, **TOOL-11**, **MOD-91** and **MOD-92** are done (see
-`DECISIONS.md`). Open from ANA-29: **TOOL-8**/**TOOL-10**, **CLEAN-12**,
-and **MOD-94** behind a maintainer decision.
+**Current status (2026-10-14):** **TOOL-8 is done** (`docs/decisions/tool/tool-8.md`): the `htui-dev` mod
+(`.claude/skills/htui-dev/`, `docs/htui-dev.md`) refuses six kinds of costly call (M1), and keeps a status line in
+interactive sessions (item and HANDOFF phase, merge/ahead/dirty, disk above 90%, Postgres not up, last gate) with a
+toast when a gate finishes, plus turnless `/gate`, `/next` and `/validate` (M2); `scripts/dev-health.sh`/`.ps1` are
+new. Owed on the host: a Windows run (`claude -p "/gate fmt"` returns at once, the `.ps1` commands), `dev-health`'s
+docker path against the real `htui-postgres`, and the Postgres gate. Before it, **TOOL-9 is done**
+(`docs/decisions/tool/tool-9.md`): `scripts/gate.sh` and `gate.ps1` run the one gate, detached on request, result in
+`target/gate/last.json`; the workspace pre-commit is committed in `scripts/githooks/` (`core.hooksPath`);
+`DECISIONS.md` merges by union. Owed on the host: a Windows run and the Postgres gate (both `.ps1` self-tests now
+pass under PowerShell 7.5 on Linux, TOOL-8). Before it, **CLEAN-11 is done** (`docs/decisions/clean/clean-11.md`).
+Still owed on the host from earlier items (see their write-ups): the Postgres gate on the merged tree for CLEAN-11,
+MOD-67, MOD-96, CLEAN-10 and MOD-93, Windows runs for MOD-67 and MOD-93, MOD-93's live install and `tsc`. Open
+from ANA-29: **TOOL-10**, **CLEAN-12**, and **MOD-94** behind a maintainer decision.
 Live coordinates after MOD-96: migrations run through `0018_seed_permission_mode` (MOD-96: data only, pins
 `acp.permission_mode` on the seeded `claude` row), before it `0017_follow_up` (`run_command.run_step_id`,
 `text`; `follow_up_window`; MOD-12's `0016_auto_queue`: `queue_entry`, `queue_batch`, `run.batch_id`), so **the next
@@ -393,7 +383,7 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   lists it in `TOOL_EXCLUDES` as untracked. Correct `.claude/skills/handoff-run/references/lifecycle.md:98-99` and
   `install-workflow-hooks.sh:22-23` to what this repo has now that TOOL-9 landed (the commit hook via
   `core.hooksPath`, the `--no-verify` block from TOOL-8). No behaviour change. Nothing here is
-  blocked: TOOL-8 M1 landed (G6 in `docs/htui-dev.md`). TOOL-9 already added the
+  blocked: TOOL-8 is done (G6 in `docs/htui-dev.md`, `docs/decisions/tool/tool-8.md`). TOOL-9 already added the
   `core.hooksPath` paragraph to `.claude/skills/handoff-run/references/lifecycle.md` and the installer header, so check those first.
 - [ ] **MOD-3 - Diff tab + code explorer.** `R-LATER-1`. Later tier; needs its own ANA first.
 - [ ] **MOD-5 - Issue tracker mirror.** `R-LATER-2`. `IssueSync` trait, OneDev first, downstream
@@ -408,30 +398,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 
 ### Tooling findings
 
-- [ ] **TOOL-8 - `htui-dev` mod: guards, status line and turnless commands** (from ANA-29,
-  `docs/ANA-29.md` §4.2, §6). A skills-directory plugin at `.claude/skills/htui-dev/`
-  (`.claude-plugin/plugin.json`, `hooks/hooks.json` → `register.ts`, `*.test.ts`), loaded in
-  place by every trusted checkout and sandbox clone; develop it with `--plugin-dir`. **M1 guards**,
-  each a `{deny}` with a corrective reason, never a rewrite: `cargo test` of `-p htui` or
-  `--workspace` without `--features testkit`/`--all-features`, and `--features testkit` on crates
-  that call it `test-support`; the substring `zeta` in Edit/Write/MultiEdit content written to
-  `crates/**/*.rs` or `crates/**/*.json`, except `crates/htui-agent/tests/extensibility.rs` (the
-  test's own scope: `tree_files()` and `text.contains("zeta")`); Edit/Write and
-  `git commit|stash|reset|checkout --` from an agent whose spawn prompt declared it read-only (`agent.spawn` records the `agentId`);
-  an `agent.spawn` naming a Fable model (deny, not warn: maintainer, 2026-10-08); `git commit --no-verify`. Guards fail open with a
-  status warning. **M2 status and commands**: a status line from a 60 s timer (item and HANDOFF
-  phase from `HR_ITEM` or the branch, `MERGE_HEAD`, ahead/dirty counts, disk above 90%, Postgres
-  down, last gate result); turnless `/gate` (starts TOOL-9's script detached, polls its status
-  file, toasts the result), `/next`, `/validate` (the existing `.sh`/`.ps1` scripts by platform).
-  Tests with `claude plugin test`; `claude plugin validate --strict` in TOOL-9's gate. Open in the
-  plan: whether `agent.spawn` fires for Workflow-tool agents (D3), and whether a skills-directory
-  mod prompts beyond workspace trust. M1 unblocked (MOD-91 done: a skills-directory `htui-dev` mod no longer loads in htui's own sessions unless the row sets `mods (y/n)`); M2 unblocked (TOOL-9 done: `scripts/gate.sh`/`.ps1`, `--detach`, `--status`, `target/gate/last.json`, `docs/decisions/tool/tool-9.md`).
-  **Phase M1 landed (`1d3963c3`..`40446f29`, 2026-10-14):** `.claude/skills/htui-dev/` guards G1-G6
-  (`docs/htui-dev.md`, plan `.claude/plans/tool-8-m1-guards.plan.md`), 88 kit tests, validate
-  `--strict` green, two review rounds. Both open questions closed live: no prompt beyond trust, and
-  `agent.spawn` fires for Workflow agents. G1 models dev-dependency features (only htui's `testkit`
-  goes vacuous in a workspace run). `MultiEdit` no longer exists; Gortex and Serena write tools are
-  guarded instead. Known gaps in `docs/htui-dev.md`. M2 unblocked (TOOL-9 done).
 - [ ] **TOOL-10 - hr sandbox: stop a run from planting a mod that runs on the host** (from
   ANA-29, `docs/ANA-29.md` §3.3). `~/.claude` is shared read-write with every run
   (`docker/hr/compose.hr.yaml:99-114`), and `docs/hr-sandbox.md` already lists "add hooks or
@@ -452,4 +418,4 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 | ANA-N   | 3 (ANA-25 learned weights, ANA-28 heavy_build routing, ANA-30 utility models) |
 | MOD-N   | 18 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-12 `.claude/` hygiene) |
-| TOOL-N  | 2 (TOOL-8 `htui-dev` mod, TOOL-10 sandbox mod hardening) |
+| TOOL-N  | 1 (TOOL-10 sandbox mod hardening) |
