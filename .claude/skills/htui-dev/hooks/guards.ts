@@ -657,15 +657,28 @@ function pathOf(node: Readonly<Record<string, unknown>>): string | null {
   return idPath(node.id)
 }
 
-/** Whether the literal scan reads `path`: a `.rs` or `.json` under a `crates/` folder, outside any `target/`, not the scan's own file. */
+/** A path's folders and file, `\\` read as `/`, with `.` dropped and `..` taken back. */
+function segmentsOf(path: string): string[] {
+  const out: string[] = []
+  for (const part of path.replace(/\\/g, '/').split('/')) {
+    if (part === '' || part === '.') continue
+    if (part === '..' && out.length > 0 && out[out.length - 1] !== '..') out.pop()
+    else out.push(part)
+  }
+  return out
+}
+
+/**
+ * Whether the literal scan reads `path`: a `.rs` or `.json` below the first `crates` folder, with
+ * no `target` folder below it, and not the scan's own file `crates/htui-agent/tests/extensibility.rs`.
+ */
 function scanned(path: string): boolean {
-  const p = path.replace(/\\/g, '/')
-  const at = p.lastIndexOf('crates/')
-  if (at === -1 || (at > 0 && p[at - 1] !== '/')) return false
-  const inCrates = p.slice(at)
-  if (!/\.(rs|json)$/.test(inCrates)) return false
-  if (inCrates.split('/').includes('target')) return false
-  return inCrates !== 'crates/htui-agent/tests/extensibility.rs'
+  const parts = segmentsOf(path)
+  const at = parts.indexOf('crates')
+  if (at === -1 || at >= parts.length - 1) return false
+  if (!/\.(rs|json)$/.test(parts[parts.length - 1]!)) return false
+  if (parts.slice(at).includes('target')) return false
+  return parts.slice(-4).join('/') !== 'crates/htui-agent/tests/extensibility.rs'
 }
 
 /** The first path, walking `node` with the nearest path passed down, whose new text holds the literal. */
@@ -696,7 +709,7 @@ function offender(node: unknown, inherited: string | null, depth: number): strin
 
 /** Whether a `replace_in_files` over `path` (a file, a folder, or empty for the whole project) can reach a file the scan reads. */
 function reachesScanned(path: string): boolean {
-  const parts = path.replace(/\\/g, '/').split('/').filter(p => p !== '' && p !== '.')
+  const parts = segmentsOf(path)
   if (parts.length === 0) return true
   if (/\.[A-Za-z0-9]+$/.test(parts[parts.length - 1]!)) return scanned(path)
   const at = parts.indexOf('crates')

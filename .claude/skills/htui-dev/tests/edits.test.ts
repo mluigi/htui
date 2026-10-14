@@ -144,6 +144,19 @@ test('writes the scan does not read are allowed', async ($, on) => {
   calls.forEach((c, i) => expect(got[i], JSON.stringify(c)).toBeUndefined())
 })
 
+test('a path is read by its segments, with . and .. resolved', async ($, on) => {
+  const write = (file_path: string): Call => ['Write', { file_path, content: NAMED }]
+  const got = await verdicts($, on, [
+    write('/r/crates/htui/tests/mycrates/a.rs'),
+    write('/r/crates/htui/target/../src/a.rs'),
+    write('crates/htui/./src/a.rs'),
+    write('/r/crates/htui/src/../target/a.rs'),
+    write('crates/htui-agent/tests/../tests/extensibility.rs'),
+    write('/r/mycrates/a.rs'),
+  ])
+  expect(got.map(r => r !== undefined)).toEqual([true, true, true, false, false, false])
+})
+
 test('removing the literal is allowed: only the new text is read', async ($, on) => {
   const got = await verdicts($, on, [
     ['Edit', { file_path: 'crates/htui/src/a.rs', old_string: NAMED, new_string: 'fn row() {}' }],
