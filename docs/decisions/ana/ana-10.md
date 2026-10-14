@@ -1,4 +1,4 @@
-# ANA-10 - Local-only mode: SQLite as a primary writable store (done, 2026-09-08)
+# ANA-10 - Local-only mode: SQLite as a primary writable store (done; verdict withdrawn by MOD-25, 2026-09-08)
 
 > **Verdict withdrawn** by MOD-25 (2026-09-16, `docs/decisions/mod/mod-25.md`): `htui` is
 > online-only. This write-up stays as the analysis that was done and not taken.

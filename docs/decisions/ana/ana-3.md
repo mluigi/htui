@@ -15,5 +15,7 @@ Design is documented in `docs/ANA-3.md`.
 
 ## Downstream items
 
-- **MOD-2**: Integrates the providers into `htui-agent`.
+- **MOD-2**: Integrates the providers into `htui-agent`. *(2026-10-14 audit note: MOD-2 shipped the
+  `ExcerptProvider` seam with a fail-open test fake only, `crates/htui-core/src/prompt/excerpt.rs`; no
+  Headroom, Serena, Graphify or diff provider exists, and no open item builds one, `R-LATER-7`.)*
 - **MOD-11**: The MCP server (`command_run` tool) may enforce command rejection for manual search tools.

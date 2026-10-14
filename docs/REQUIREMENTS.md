@@ -24,7 +24,7 @@ amended 2026-09-29 by maintainer decision on MOD-50 (`docs/decisions/mod/mod-50.
 amended in place (requirement rows indexed; the decisions filter keyed on resolution);
 amended 2026-09-30 by maintainer decision on ANA-26 (`docs/ANA-26.md` §9,
 `docs/decisions/ana/ana-26.md`) — R-TUI-10 added (configurable keys); R-TUI-1 and R-STO-1
-amended in place.
+amended in place;
 and by maintainer decision on MOD-22 (`docs/decisions/mod/mod-22.md`, plan OQ-1) —
 R-AGT-9 amended in place (the loopback paste-back relays one authorization code once).
 amended 2026-09-29 by maintainer decision on MOD-41 (`.claude/prds/mod-41-headless-worker.prd.md`
@@ -38,6 +38,16 @@ on whichever path it lands: the run fails, the fan-out candidate fails, or the j
 amended 2026-10-03 by maintainer decision on MOD-69 (`.claude/prds/mod-69-waiting-on-you.prd.md`,
 `docs/ANA-27.md` §7) — R-TUI-11 added (waiting-on-you list); R-TUI-1 amended in place (working and
 waiting-on-you counts replace the active run count).
+Recorded late (2026-10-14 requirements audit), each made at the time by maintainer decision:
+2026-09-25 on MOD-34 (`docs/decisions/mod/mod-34.md`) — R-STO-8 added (semantic search);
+2026-09-28 on ANA-21 (`docs/decisions/ana/ana-21.md`) — R-AGT-8 amended in place (remaining fan-out
+slots apportioned by per-model weight);
+2026-10-14 on ANA-30 (`docs/decisions/ana/ana-30.md`) — R-ID-6 amended in place (display-only labels
+and person-accepted drafts are outside it).
+amended 2026-10-14 by maintainer decision on the requirements audit (MOD-99) — R-NF-2 amended in
+place (Qdrant and a user-configured error-reporting endpoint are optional and fail open); R-ORCH-6
+amended in place (the schedule window is R-ORCH-13, `later`); R-ORCH-12's delivery note corrected
+(MOD-43 is open); R-LATER-6 names `claude-cli`.
 **Governed by:** `.claude/rules/workflow-docs.md`
 
 This file is the product requirements for `htui`. It sits above every `ANA-N` analysis and every
@@ -260,7 +270,8 @@ conflict. Their verdicts survive only where restated here.
 - **R-ORCH-6 (must).** Auto mode is a queue runner: picks ready items by dependency order and
   priority, filters by current box capabilities, runs unattended with gates treated as `never`
   unless the user marked a gate as hard, escalates failures, and honors caps per item and per
-  batch. Supports a schedule window and a target box (R-ORCH-12).
+  batch. Supports a target box (R-ORCH-12). A schedule window is R-ORCH-13 (`later`): version one
+  may store it but need not enforce it. Amended by maintainer decision, 2026-10-14.
 - **R-ORCH-7 (must).** Fan-out: a phase with N candidate sessions runs them in parallel on the same
   prompt, each producing its own artifact and, for code phases, its own tree. Selection is a human
   choice when gated, otherwise a judge step using a configured agent. Only the selected result
@@ -278,7 +289,7 @@ conflict. Their verdicts survive only where restated here.
   step: agent, model, gate outcome, status, exit code, prompt digest, commit hashes, usage, timing.
 - **R-ORCH-12 (must).** Remote dispatch: queue an item from one box to run on another. Requires a
   headless `htui` worker per box polling Postgres (R-ID-2). Promoted from later by maintainer
-  decision on MOD-41, 2026-09-29; delivered by MOD-41 (worker) and MOD-43 (targeting).
+  decision on MOD-41, 2026-09-29; delivered by MOD-41 (worker, done) and MOD-43 (targeting, open).
 - **R-ORCH-13 (later).** Scheduling: run the queue inside a time window on a chosen box.
 
 ## 7. Run history (R-HIS)
@@ -396,14 +407,18 @@ Designed for, not built in version one. Each needs its own `ANA-N` before implem
 - **R-LATER-4.** Scheduling (R-ORCH-13). Remote dispatch (R-ORCH-12) was promoted to must on
   MOD-41, 2026-09-29.
 - **R-LATER-5.** Team support (R-USR-3).
-- **R-LATER-6.** Additional agents beyond `claude` and `agy` via the registry (R-AGT-5).
+- **R-LATER-6.** Additional agents beyond `claude`, `claude-cli` and `agy` via the registry (R-AGT-5).
 - **R-LATER-7.** External context tools (Headroom, Serena, Graphify) as excerpt providers for
   R-PRM-1, fail-open when absent.
 
 ## 13. Non-functional (R-NF)
 
 - **R-NF-1 (must).** Windows 10+, Linux, macOS.
-- **R-NF-2 (must).** No dependency on any external daemon other than Postgres and the agents.
+- **R-NF-2 (must).** No required dependency on any external daemon other than Postgres and the
+  agents. Two services are optional, and each fails open with nothing else affected when absent:
+  Qdrant with its embedding model for semantic search (R-STO-8), and an error-reporting endpoint
+  the user configures in Settings, which is off unless set and receives only scrubbed events
+  (R-ID-7, MOD-99). Amended by maintainer decision, 2026-10-14.
 - **R-NF-3 (must).** All long operations (probe, cache refresh, sessions) run off the UI thread;
   the TUI never blocks on network or subprocess I/O.
 - **R-NF-4 (must).** Every `ANA-N` and `MOD-N` item cites, as `addresses` citations, the

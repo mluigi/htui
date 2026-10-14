@@ -8,8 +8,8 @@
 # Usage:
 #   bash scripts/gate.sh [--only <step>] [--detach] [--status] [--self-test]
 #
-#   --only <step>  run one step (fmt, clippy-all, clippy-bare, test, abort-grep, migrations,
-#                  workflow-docs, plugin)
+#   --only <step>  run one step (fmt, clippy-all, clippy-bare, postgres, test, abort-grep,
+#                  migrations, workflow-docs, plugin)
 #   --detach       relaunch under setsid, log to target/gate/run.log, print the PID and return
 #   --status       print target/gate/last.json and exit
 #
@@ -41,7 +41,7 @@ TEST_LOG="${GATE_TEST_LOG:-$GATE_DIR/test.log}"
 MIGRATIONS_DIR="${GATE_MIGRATIONS_DIR:-$REPO_ROOT/crates/htui-store/migrations}"
 PLUGIN_DIR="$REPO_ROOT/.claude/skills/htui-dev"
 MIN_CLAUDE="2.1.287"
-STEPS=(fmt clippy-all clippy-bare test abort-grep migrations workflow-docs plugin)
+STEPS=(fmt clippy-all clippy-bare postgres test abort-grep migrations workflow-docs plugin)
 
 STEP_NAMES=(); STEP_STATUS=(); STEP_SECONDS=()
 STARTED=""
@@ -82,6 +82,27 @@ version_ge() {
 step_fmt()         { cargo fmt --check; }
 step_clippy_all()  { cargo clippy --workspace --all-features -- -D warnings; }
 step_clippy_bare() { cargo clippy --workspace -- -D warnings; }
+
+step_postgres() {
+    # TOOL-14: without HTUI_TEST_DATABASE_URL every Postgres suite returns early and passes, so
+    # the test step's green says nothing about Postgres. Say so as a skipped step. Never print
+    # the DSN: it may carry a password.
+    local dsn="${HTUI_TEST_DATABASE_URL:-}" host port
+    if [[ -z "$dsn" ]]; then
+        echo "postgres: HTUI_TEST_DATABASE_URL unset - the Postgres suites return early and prove nothing"
+        return 3
+    fi
+    if [[ ! "$dsn" =~ ^postgres(ql)?://([^@/]*@)?([^:/?]+)(:([0-9]+))? ]]; then
+        echo "postgres: DSN set, host not parsed (not probed)"
+        return 0
+    fi
+    host="${BASH_REMATCH[3]}"; port="${BASH_REMATCH[5]:-5432}"
+    if ! timeout 3 bash -c ">/dev/tcp/$host/$port" 2>/dev/null; then
+        echo "postgres: $host:$port unreachable - the Postgres suites would fail"
+        return 1
+    fi
+    echo "postgres: $host:$port reachable; the Postgres suites run live"
+}
 
 step_test() {
     mkdir -p "$GATE_DIR"
@@ -235,6 +256,15 @@ run_self_test() {
     step_abort_grep >/dev/null && failures+=('abort-grep: SIGABRT passed')
     TEST_LOG="$tmp/missing.log"
     step_abort_grep >/dev/null && failures+=('abort-grep: a missing log passed')
+
+    ( unset HTUI_TEST_DATABASE_URL; step_postgres >/dev/null; [[ $? -eq 3 ]] ) \
+        || failures+=('postgres: an unset DSN was not skipped')
+    ( HTUI_TEST_DATABASE_URL='postgres://u@127.0.0.1:1/db' step_postgres >/dev/null; [[ $? -eq 1 ]] ) \
+        || failures+=('postgres: an unreachable host passed')
+    ( HTUI_TEST_DATABASE_URL='host=/run/postgresql dbname=x' step_postgres >/dev/null ) \
+        || failures+=('postgres: an unparsed DSN failed')
+    out="$(HTUI_TEST_DATABASE_URL='postgres://u:s3cret@127.0.0.1:1/db' step_postgres 2>&1)"
+    [[ "$out" != *s3cret* ]] || failures+=('postgres: the DSN password was printed')
 
     version_ge 2.1.296 2.1.287 || failures+=('version_ge: 2.1.296 < 2.1.287')
     version_ge 2.1.287 2.1.287 || failures+=('version_ge: equal versions refused')

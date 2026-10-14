@@ -24,7 +24,9 @@ and built together.
 - the list covers only the active workspace;
 - a judge failure gets its own row;
 - the top bar shows working and waiting runs separately;
-- `R-TUI-11` added and `R-TUI-1` amended as proposed (`docs/REQUIREMENTS.md`);
+- `R-TUI-11` added and `R-TUI-1` amended as proposed (`docs/REQUIREMENTS.md`); *(2026-10-14 audit
+  note: `R-TUI-11`'s "agent's open question" reason is not delivered here, `WaitingReason` has no such
+  variant; it is MOD-75's)*;
 - offline, open permission requests are left out and the overlay says so;
 - M-1: `Ctrl+w waiting` stays clipped from the 100-column help line; the `?` box shows it;
 - M-2: a promoted step is listed as a gate row (`promoted to chat`);

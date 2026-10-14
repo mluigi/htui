@@ -336,7 +336,7 @@ mod's folder, so a worktree's copy serves that worktree).
 | Command | Runs | Answers |
 |---|---|---|
 | `/gate` | `scripts/gate.sh --detach` (all steps) | the launcher's line (`gate started, pid …`). Refused while `last.json` says a gate started under 4 hours ago is running |
-| `/gate <step>` | `scripts/gate.sh --detach --only <step>` | the same; steps: `fmt`, `clippy-all`, `clippy-bare`, `test`, `abort-grep`, `migrations`, `workflow-docs`, `plugin` |
+| `/gate <step>` | `scripts/gate.sh --detach --only <step>` | the same; steps: `fmt`, `clippy-all`, `clippy-bare`, `postgres`, `test`, `abort-grep`, `migrations`, `workflow-docs`, `plugin` |
 | `/gate force` | the whole gate, even while one runs | the launcher's line |
 | `/gate status` | nothing | the last result and each step's status and time; `no gate result yet` or `gate: last.json unreadable` (exit 1) |
 | `/next` | `.claude/skills/handoff-run/scripts/next-item.sh --repo-root <root>` | the ranked candidates |

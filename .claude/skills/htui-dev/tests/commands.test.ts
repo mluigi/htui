@@ -54,7 +54,7 @@ test('Windows runs each .ps1 through pwsh, joining paths with /', () => {
 })
 
 test("the step list is gate.sh's", () => {
-  expect([...GATE_STEPS]).toEqual(['fmt', 'clippy-all', 'clippy-bare', 'test', 'abort-grep', 'migrations', 'workflow-docs', 'plugin'])
+  expect([...GATE_STEPS]).toEqual(['fmt', 'clippy-all', 'clippy-bare', 'postgres', 'test', 'abort-grep', 'migrations', 'workflow-docs', 'plugin'])
 })
 
 test("a bare /gate starts the detached gate in the repo root and answers the launcher's line", async () => {
@@ -125,7 +125,7 @@ test('/gate status prints the summary and each step', async () => {
 test('/gate with an unknown word lists the steps and runs nothing', async () => {
   const calls: Call[] = []
   expect(await gateCommand('bogus', POSIX, runner(calls), files({}), T0, HEAD)).toEqual({
-    text: 'unknown step "bogus" - /gate [step|status|force]; steps: fmt, clippy-all, clippy-bare, test, abort-grep, migrations, workflow-docs, plugin',
+    text: 'unknown step "bogus" - /gate [step|status|force]; steps: fmt, clippy-all, clippy-bare, postgres, test, abort-grep, migrations, workflow-docs, plugin',
     exitCode: 2,
   })
   expect(calls).toEqual([])
