@@ -55,11 +55,27 @@ function judge($: EngineInterface, guard: string, what: 'call' | 'spawn', decide
 async function isTagged($: EngineInterface, agentId: string | undefined, failed: string): Promise<boolean> {
   if (agentId === undefined) return false
   try {
-    return (await read($, readOnly)).includes(agentId)
+    const ids: unknown = await read($, readOnly)
+    if (!Array.isArray(ids)) throw new TypeError('readOnly holds no list')
+    return ids.includes(agentId)
   } catch {
     warn($, failed)
     return false
   }
+}
+
+/**
+ * `agent.spawn`'s backstop (a throw, an overrun budget, a wrong answer shape): a spawn is never
+ * refused here. A settled `next` is replayed, with a warning that the agent may have started before
+ * its read-only tag was written; otherwise the spawn goes ahead, with a warning.
+ */
+export function spawnBackstop<E, R>($: EngineInterface, e: E, next: ((e: E) => R) & { readonly called: boolean }): R {
+  if (next.called) {
+    warn($, 'htui-dev: agent.spawn guard failed after the spawn, read-only tag may be missing')
+    return next(e)
+  }
+  warn($, 'htui-dev: agent.spawn guard failed, spawn allowed')
+  return next(e)
 }
 
 export const register: Register = on => {
@@ -155,10 +171,5 @@ export const register: Register = on => {
       warn($, `htui-dev: subagent ${got.agentId ?? '(no id)'} resolved to Fable (${got.model}) — inherited or pinned in its agent definition`)
     }
     return got
-  }).catch(($, e, next) => {
-    // The same backstop: a spawn is never refused here, and a settled `next` is replayed.
-    if (next.called) return next(e)
-    warn($, 'htui-dev: agent.spawn guard failed, spawn allowed')
-    return next(e)
-  })
+  }).catch(spawnBackstop)
 }

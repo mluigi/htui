@@ -1,4 +1,5 @@
 import { test, expect, mock } from 'claude-code/testing'
+import { spawnBackstop } from '../hooks/register'
 import { agents, bash, call, LIT, seedTags, spawn, statuses, tagWrites, tools, type Reached, type Spawned } from './fixtures'
 
 // A probe of the kit itself: G4's tests below hand the mod an agentId and a parentAgentId.
@@ -260,6 +261,50 @@ test('a Bash call the parser throws on goes through, with a status', async ($, o
   await clock.settle()
   expect(reached.map(r => r.tool)).toEqual(['Bash'])
   expect(lines).toEqual(['htui-dev: shell parser failed, call allowed'])
+})
+
+test('a tag store that holds no list lets a write through, with a status', async ($, on) => {
+  const clock = mock.clock(on)
+  const lines: (string | undefined)[] = []
+  const reached: Reached[] = []
+  statuses(on, lines)
+  tools(on, reached)
+  // A string would match agent-1 as a substring of agent-12.
+  seedTags(on, 'agent-12')
+  await call($, 'Edit', { file_path: 'src/a.rs', old_string: 'a', new_string: 'b' }, 'agent-1')
+  await clock.settle()
+  expect(reached.map(r => r.tool)).toEqual(['Edit'])
+  expect(lines).toEqual(['htui-dev: read-only guard failed, call allowed'])
+})
+
+test('the main loop never reads the tag store', async ($, on) => {
+  const clock = mock.clock(on)
+  const lines: (string | undefined)[] = []
+  const reached: Reached[] = []
+  statuses(on, lines)
+  tools(on, reached)
+  agents(on, [])
+  seedTags(on, 42)
+  await call($, 'Edit', { file_path: 'src/a.rs', old_string: 'a', new_string: 'b' })
+  await bash($, 'git commit -m x')
+  await spawn($, { prompt: 'implement it' })
+  await clock.settle()
+  expect(reached.map(r => r.tool)).toEqual(['Edit', 'Bash'])
+  expect(lines).toEqual([])
+})
+
+// The kit fails a test whose own hook answers a malformed spawn, so the backstop is driven directly.
+test('a spawn hook that fails after the agent started says the tag may be missing', () => {
+  const lines: string[] = []
+  const $ = { ui: { status: (text: string) => void lines.push(text) } } as never
+  const started = Object.assign((e: string) => `ran ${e}`, { called: true })
+  const fresh = Object.assign((e: string) => `ran ${e}`, { called: false })
+  expect(spawnBackstop($, 'spawn', started)).toBe('ran spawn')
+  expect(spawnBackstop($, 'spawn', fresh)).toBe('ran spawn')
+  expect(lines).toEqual([
+    'htui-dev: agent.spawn guard failed after the spawn, read-only tag may be missing',
+    'htui-dev: agent.spawn guard failed, spawn allowed',
+  ])
 })
 
 test('refusing and allowing set no status line', async ($, on) => {
