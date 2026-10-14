@@ -84,6 +84,12 @@ test('a read-only agent may not write files', async ($, on) => {
     ['mcp__gortex__edit_file', { path: 'src/a.rs', old_string: 'a', new_string: 'b' }],
     ['mcp__gortex__write_file', { path: 'src/a.rs', content: 'b' }],
     ['mcp__gortex__batch_edit', { edits: [] }],
+    ['mcp__plugin_gortex_gortex__edit_symbol', { id: 'htui/src/a.rs::f', old_source: 'a', new_source: 'b' }],
+    ['mcp__serena__replace_symbol_body', { name_path: 'f', relative_path: 'src/a.rs', body: 'b' }],
+    ['mcp__serena__replace_in_files', { needle: 'a', repl: 'b', mode: 'literal' }],
+    ['mcp__serena__safe_delete_symbol', { name_path_pattern: 'f', relative_path: 'src/a.rs' }],
+    ['mcp__serena__delete_lines', { relative_path: 'src/a.rs', start_line: 1, end_line: 2 }],
+    ['mcp__plugin_serena_serena__rename_symbol', { name_path: 'f', relative_path: 'src/a.rs', new_name: 'g' }],
   ]
   for (const [tool, input] of writes) {
     const r = (await call($, tool, input, 'agent-1')) as { deny?: string }
@@ -127,7 +133,8 @@ test('a read-only agent may read, check and inspect', async ($, on) => {
   await bash($, 'git status && git diff && git stash list', 'agent-1')
   await bash($, 'git log -n 3 && git show HEAD && git branch -a && git fetch && git checkout main', 'agent-1')
   await call($, 'mcp__gortex__search', { query: 'x' }, 'agent-1')
-  expect(reached.map(r => r.tool)).toEqual(['Read', 'Bash', 'Bash', 'Bash', 'mcp__gortex__search'])
+  await call($, 'mcp__serena__replace_in_files', { needle: 'a', repl: 'b', mode: 'literal', dry_run: true }, 'agent-1')
+  expect(reached.map(r => r.tool)).toEqual(['Read', 'Bash', 'Bash', 'Bash', 'mcp__gortex__search', 'mcp__serena__replace_in_files'])
 })
 
 test('a read-only agent still meets the other guards', async ($, on) => {

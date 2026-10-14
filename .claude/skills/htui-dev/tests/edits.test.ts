@@ -59,6 +59,57 @@ test('each Gortex write tool is checked', async ($, on) => {
   calls.forEach((c, i) => expect(got[i], c[0]).toMatch(/^htui-dev: /))
 })
 
+// Serena's write tools, with the input fields of this session's Serena tool list (create_text_file,
+// replace_lines and insert_at_line were not listed; their fields are Serena's documented ones).
+test('each Serena write tool is checked, also under a plugin prefix', async ($, on) => {
+  const calls: Call[] = [
+    ['mcp__serena__create_text_file', { relative_path: 'crates/htui/src/a.rs', content: NAMED }],
+    ['mcp__serena__replace_content', { relative_path: 'crates/htui/src/a.rs', needle: 'x', repl: NAMED, mode: 'literal' }],
+    ['mcp__serena__replace_symbol_body', { name_path: 'row', relative_path: 'crates/htui-core/src/a.rs', body: NAMED }],
+    ['mcp__serena__insert_after_symbol', { name_path: 'row', relative_path: 'crates/htui-core/src/a.rs', body: NAMED }],
+    ['mcp__serena__insert_before_symbol', { name_path: 'row', relative_path: 'crates/htui-core/src/a.rs', body: NAMED }],
+    ['mcp__serena__rename_symbol', { name_path: 'row', relative_path: 'crates/htui-core/src/a.rs', new_name: `${LIT}_row` }],
+    ['mcp__serena__replace_lines', { relative_path: 'crates/htui/seeds/a.json', start_line: 1, end_line: 2, content: NAMED }],
+    ['mcp__serena__insert_at_line', { relative_path: 'crates/htui/src/a.rs', line: 3, content: NAMED }],
+    ['mcp__plugin_serena_serena__replace_content', { relative_path: 'crates/htui/src/a.rs', needle: 'x', repl: NAMED, mode: 'regex' }],
+    ['mcp__plugin_gortex_gortex__edit_file', { path: 'crates/htui/src/a.rs', old_string: 'x', new_string: NAMED }],
+  ]
+  const got = await verdicts($, on, calls)
+  calls.forEach((c, i) => expect(got[i], c[0]).toMatch(/^htui-dev: crates\/\S+ would contain/))
+})
+
+test("Serena's replace_in_files is checked over the folder it reaches", async ($, on) => {
+  const many = (input: object): Call => ['mcp__serena__replace_in_files', { needle: 'x', repl: NAMED, mode: 'literal', ...input }]
+  const got = await verdicts($, on, [
+    many({}),
+    many({ relative_path: '' }),
+    many({ relative_path: '.' }),
+    many({ relative_path: 'crates' }),
+    many({ relative_path: 'crates/htui/src' }),
+    many({ relative_path: 'crates/htui/src/a.rs' }),
+    many({ relative_path: 'docs' }),
+    many({ relative_path: 'crates/htui/README.md' }),
+    many({ relative_path: 'crates/htui/target' }),
+    many({ dry_run: true }),
+    ['mcp__serena__replace_in_files', { needle: 'x', repl: 'y', mode: 'literal' }],
+  ])
+  expect(got.map(r => r !== undefined)).toEqual([true, true, true, true, true, true, false, false, false, false, false])
+  expect(got[0]).toBe(
+    `htui-dev: replacing across the whole project would write "${LIT}" into crates/**/*.{rs,json}, which crates/htui-agent/tests/extensibility.rs forbids — use another name, or narrow relative_path to files the scan does not read`,
+  )
+})
+
+test('Serena writes the scan does not read, and its read tools, are allowed', async ($, on) => {
+  const got = await verdicts($, on, [
+    ['mcp__serena__replace_content', { relative_path: 'docs/a.md', needle: 'x', repl: NAMED, mode: 'literal' }],
+    ['mcp__serena__create_text_file', { relative_path: 'crates/htui/README.md', content: NAMED }],
+    ['mcp__serena__delete_lines', { relative_path: 'crates/htui/src/a.rs', start_line: 1, end_line: 2 }],
+    ['mcp__serena__safe_delete_symbol', { name_path_pattern: 'row', relative_path: 'crates/htui/src/a.rs' }],
+    ['mcp__serena__find_symbol', { name_path_pattern: LIT, relative_path: 'crates/htui/src/a.rs', body: NAMED }],
+  ])
+  expect(got).toEqual([undefined, undefined, undefined, undefined, undefined])
+})
+
 test('a batch refusal names the edit that offends', async ($, on) => {
   const [got] = await verdicts($, on, [
     [

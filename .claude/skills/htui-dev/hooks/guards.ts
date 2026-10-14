@@ -543,15 +543,22 @@ export function gitWrite(words: Words): string | null {
  */
 export const LITERAL = 'ze' + 'ta'
 
-/** The fields that carry the text a write puts into a file; the old text is never read (removing the literal is the fix). */
-const NEW_TEXT = ['new_string', 'new_source', 'content', 'new_name'] as const
+/**
+ * The fields that carry the text a write puts into a file (Gortex: `new_string`, `new_source`,
+ * `content`, `new_name`; Serena: `body`, `repl`, `content`, `new_name`); the old text is never read
+ * (removing the literal is the fix).
+ */
+const NEW_TEXT = ['new_string', 'new_source', 'content', 'new_name', 'body', 'repl'] as const
+
+/** Serena's one write tool that reaches many files: `relative_path` is a file, a folder, or empty for the whole project. */
+const SERENA_MANY = /^mcp__(plugin_[a-z0-9_-]+_)?serena__replace_in_files$/
 
 /** A path from a Gortex symbol id: what stands before `::` (`htui/crates/x.rs::Sym`). */
 const idPath = (v: unknown): string | null => (typeof v === 'string' && v.includes('::') ? v.slice(0, v.indexOf('::')) : null)
 
-/** The file a node of a tool's input names: `file_path`, `path`, `notebook_path`, `target.file`, or a symbol id's file. */
+/** The file a node of a tool's input names: `file_path`, `path`, `notebook_path`, `relative_path` (Serena), `target.file`, or a symbol id's file. */
 function pathOf(node: Readonly<Record<string, unknown>>): string | null {
-  for (const key of ['file_path', 'path', 'notebook_path']) {
+  for (const key of ['file_path', 'path', 'notebook_path', 'relative_path']) {
     if (typeof node[key] === 'string') return node[key] as string
   }
   const target = node.target
@@ -601,8 +608,28 @@ function offender(node: unknown, inherited: string | null, depth: number): strin
   return null
 }
 
+/** Whether a `replace_in_files` over `path` (a file, a folder, or empty for the whole project) can reach a file the scan reads. */
+function reachesScanned(path: string): boolean {
+  const parts = path.replace(/\\/g, '/').split('/').filter(p => p !== '' && p !== '.')
+  if (parts.length === 0) return true
+  if (/\.[A-Za-z0-9]+$/.test(parts[parts.length - 1]!)) return scanned(path)
+  const at = parts.indexOf('crates')
+  return at !== -1 && !parts.slice(at).includes('target')
+}
+
+/** A call that writes nothing although its tool can: Serena's `replace_in_files` as a dry run. */
+export const writesNothing = (tool: string, input: Readonly<Record<string, unknown>>): boolean =>
+  SERENA_MANY.test(tool) && input.dry_run === true
+
 /** G3: an edit by `tool` that would write the literal into a file the scan reads; every matched tool's input is read the same way. */
-export function forbiddenLiteral(_tool: string, input: Readonly<Record<string, unknown>>): string | null {
+export function forbiddenLiteral(tool: string, input: Readonly<Record<string, unknown>>): string | null {
+  if (writesNothing(tool, input)) return null
+  if (SERENA_MANY.test(tool)) {
+    const where = typeof input.relative_path === 'string' ? input.relative_path : ''
+    if (typeof input.repl !== 'string' || !input.repl.includes(LITERAL) || !reachesScanned(where)) return null
+    const across = where.replace(/^\.?\/?$/, '') === '' ? 'the whole project' : where
+    return `htui-dev: replacing across ${across} would write "${LITERAL}" into crates/**/*.{rs,json}, which crates/htui-agent/tests/extensibility.rs forbids — use another name, or narrow relative_path to files the scan does not read`
+  }
   const path = offender(input, null, 0)
   if (path === null) return null
   return `htui-dev: ${path} would contain "${LITERAL}", which crates/htui-agent/tests/extensibility.rs forbids in crates/**/*.{rs,json} — use another name; only extensibility.rs may spell it`

@@ -23,6 +23,7 @@ import {
   noVerify,
   readOnlyEdit,
   readOnlyGit,
+  writesNothing,
 } from './guards'
 import { simpleCommands, type Words } from './shell'
 
@@ -95,8 +96,9 @@ export const register: Register = on => {
 
   // The tools that write a file. Of Gortex's MCP tools (Q3): `edit_file`, `write_file`,
   // `edit_symbol`, `rename_symbol` and `batch_edit` by their schemas; `edit` and `refactor`, the
-  // compact names, read the same way. The pattern is written in the matcher, so that
-  // `claude plugin validate` lists it.
+  // compact names, read the same way. Serena's write tools are configured machine-wide, so they
+  // reach this repo too. Either server may also come from a plugin (`mcp__plugin_<name>_<server>__`).
+  // The patterns are written in the matcher, so that `claude plugin validate` lists them.
   on(
     'tool.call',
     {
@@ -104,17 +106,18 @@ export const register: Register = on => {
         'Edit',
         'Write',
         'NotebookEdit',
-        /^mcp__gortex__(edit|edit_file|edit_symbol|batch_edit|rename_symbol|refactor|write_file)$/,
+        /^mcp__(plugin_[a-z0-9_-]+_)?gortex__(edit|edit_file|edit_symbol|batch_edit|rename_symbol|refactor|write_file)$/,
+        /^mcp__(plugin_[a-z0-9_-]+_)?serena__(create_text_file|replace_content|replace_in_files|replace_symbol_body|insert_after_symbol|insert_before_symbol|rename_symbol|safe_delete_symbol|replace_lines|insert_at_line|delete_lines)$/,
       ],
     },
     async ($, e, next) => {
+      const input = e as unknown as Readonly<Record<string, unknown>>
+      if (writesNothing(e.tool, input)) return next(e)
       // G4 first: a read-only agent writes nothing, whatever the text.
       if (await isTagged($, e.agentId, 'htui-dev: read-only guard failed, call allowed')) {
         return { deny: readOnlyEdit(e.tool, e.agentId!) }
       }
-      const reason = judge($, 'forbidden literal', 'call', () =>
-        forbiddenLiteral(e.tool, e as unknown as Readonly<Record<string, unknown>>),
-      )
+      const reason = judge($, 'forbidden literal', 'call', () => forbiddenLiteral(e.tool, input))
       return reason !== null ? { deny: reason } : next(e)
     },
   ).catch(($, e, next) => {
