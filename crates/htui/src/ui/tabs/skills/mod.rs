@@ -23,6 +23,7 @@ use crate::editor::ExternalEditOutcome;
 use crate::keys::{Act, KeyChord, Stack};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::registry::{Tab, TabId};
+use crate::ui::tabs::settings::key_line;
 use crossterm::event::KeyEvent;
 
 use library::LibraryView;
@@ -153,6 +154,15 @@ impl Tab for SkillsTab {
     fn on_external_edit(&mut self, outcome: ExternalEditOutcome, ctx: &mut Ctx<'_>) {
         self.templates.on_external_edit(outcome.clone(), ctx);
         self.library.on_external_edit(outcome, ctx);
+    }
+
+    /// The shown view's keys (MOD-67 M6 T2): its mode's hint through its stack.
+    fn key_hint(&self, _width: u16, ctx: &Ctx<'_>) -> Option<Line<'static>> {
+        let hint = match self.view {
+            View::Skills => self.library.key_hint(ctx.keys()),
+            View::Templates => self.templates.key_hint(ctx.keys()),
+        };
+        key_line(hint, ctx.theme)
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {

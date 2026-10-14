@@ -29,6 +29,6 @@ Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
 │                                                     ││                                           │
 │                                                     ││  R-ENT-1 must Every item has a stable key…│
 │                                                     ││▸ R-ENT-2 later An item may carry a free-f…│
-│                                                     ││j/k move · Enter pick · Esc back           │
 └─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
+j/k move · Enter pick · Esc back
 Ctrl+c quit · F1 help

@@ -11,6 +11,7 @@
 //! - `app` (`testkit`): a shell whose `app.keys` came from `valid.toml` quits on the rebound chord
 //!   and no longer on `q`, closes an overlay on `F2`, and shows both on the status line and the
 //!   `?` box; one from `quit_ctrl_q.toml` quits on `ctrl-q` and never opens the queue.
+//! - `reference_page` (MOD-67 M6 D8): `docs/htui-keys.md`'s toml block is the default print.
 //!
 //! No case may read the developer's own `keys.toml` (blueprint F-9, H-10): every child runs with
 //! a cleared environment, `HOME` and `XDG_CONFIG_HOME` both set to a temporary directory, and
@@ -120,7 +121,8 @@ mod binary {
                      concepts, switcher, migration, waiting, skills, skills.library, \
                      skills.templates, skills.attach, skills.help, requirements, backlog, \
                      backlog.body, backlog.runs, backlog.graph, backlog.docs, backlog.notes, \
-                     backlog.prompt, backlog.reqs, backlog.filter_form, backlog.item, chat"
+                     backlog.prompt, backlog.reqs, backlog.filter_form, backlog.item, chat, \
+                     queue, picker"
                         .to_owned(),
                     "12: [global] quitt: no such action; [global] has quit, next_tab, prev_tab, \
                      select_tab_1, select_tab_2, select_tab_3, select_tab_4, select_tab_5, \
@@ -586,5 +588,29 @@ mod app {
             "`Ctrl+q` no longer opens the queue"
         );
         assert!(harness.app().should_quit, "`Ctrl+q` quits");
+    }
+}
+
+/// `docs/htui-keys.md`, the generated key reference (MOD-67 M6 D8). No binary and no `testkit`:
+/// the page is checked against the library's print.
+mod reference_page {
+    /// MOD-67 M6 D8: `docs/htui-keys.md`'s toml block is the default print, byte for byte.
+    #[test]
+    fn the_key_reference_page_is_the_default_print() {
+        let page = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/htui-keys.md"
+        ))
+        .expect("docs/htui-keys.md exists");
+        let block = page
+            .split_once("```toml\n")
+            .and_then(|(_, rest)| rest.split_once("```\n"))
+            .map(|(block, _)| block)
+            .expect("one ```toml block");
+        assert!(
+            block == htui::keys::print(&htui::keys::Keys::defaults()),
+            "docs/htui-keys.md is stale: regenerate its toml block with \
+             `cargo run -q -p htui -- --default-keys --print-keys`"
+        );
     }
 }

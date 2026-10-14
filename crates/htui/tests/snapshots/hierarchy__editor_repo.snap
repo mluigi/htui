@@ -24,11 +24,11 @@ Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-│                                                                                                  │
 │name          : l                                                                                 │
 │remote_url    :                                                                                   │
 │default_branch: main                                                                              │
 │primary (y/n) : y                                                                                 │
-│Tab/Shift+Tab field · Enter save · Esc cancel                                                     │
+│                                                                                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
+Tab/Shift+Tab field · Enter save · Esc cancel
 Ctrl+c quit · F1 help

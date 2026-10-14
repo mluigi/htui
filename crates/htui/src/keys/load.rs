@@ -476,7 +476,8 @@ mod tests {
                           switcher, migration, waiting, skills, skills.library, \
                           skills.templates, skills.attach, skills.help, requirements, backlog, \
                           backlog.body, backlog.runs, backlog.graph, backlog.docs, backlog.notes, \
-                          backlog.prompt, backlog.reqs, backlog.filter_form, backlog.item, chat";
+                          backlog.prompt, backlog.reqs, backlog.filter_form, backlog.item, chat, \
+                          queue, picker";
 
     #[test]
     fn an_empty_file_is_the_defaults() {
@@ -1068,6 +1069,31 @@ quit = ["x", "shift-a"]
                 2,
                 "[chat] filter: no such action; [chat] has compose, next_agent, end, thoughts, \
                  top, bottom, and may override down, up, back"
+            )
+        );
+    }
+
+    /// MOD-67 M6 §4.1: `[queue]` and `[picker]` rebind their views' own verbs, and `[picker]`
+    /// lists what it has and may override (the plan's `cancel` is `common.back`, PA-10).
+    #[test]
+    fn a_queue_or_picker_table_rebinds_its_view() {
+        let keys = load_str("[queue]\nmove_down = \"D\"\n").expect("loads");
+        assert_eq!(
+            keys.actions(views::QUEUE_OVERLAY, chord("D")),
+            [Act::QueueMoveDown]
+        );
+        assert_eq!(keys.actions(views::QUEUE_OVERLAY, chord("J")), []);
+        let keys = load_str("[picker]\nopen = \"o\"\n").expect("loads");
+        assert_eq!(
+            keys.actions(views::HIERARCHY_PICKER, chord("o")),
+            [Act::PickerOpen]
+        );
+        assert_eq!(
+            errors("[picker]\ncancel = \"c\"\n"),
+            one(
+                2,
+                "[picker] cancel: no such action; [picker] has open, parent, choose, choose_dir, \
+                 go_to, hidden, and may override down, up, back"
             )
         );
     }

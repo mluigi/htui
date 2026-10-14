@@ -2057,14 +2057,37 @@ fn status(frame: &str) -> &str {
     frame.lines().last().unwrap_or_default().trim_end()
 }
 
-/// The Chat's last row inside its border: the hint, or the composer's line while it is open.
+/// The shell's hint row (MOD-67 M6 T2): the frame's line above the status line.
 fn hint_row(frame: &str) -> &str {
     let lines: Vec<&str> = frame.lines().collect();
-    lines[lines.len() - 3]
+    lines[lines.len() - 2].trim_end()
+}
+
+/// The Chat's last row inside its border: the composer's line while it is open, blank otherwise.
+fn composer_row(frame: &str) -> &str {
+    let lines: Vec<&str> = frame.lines().collect();
+    lines[lines.len() - 4]
         .trim_end()
         .trim_start_matches('│')
         .trim_end_matches('│')
         .trim_end()
+}
+
+/// MOD-67 M6 T2 (blueprint §1 note 6): the composer's own keys are on screen while it is open,
+/// in the shell's hint row, and its row holds the input.
+#[tokio::test]
+async fn the_composer_hint_shows_while_composing() {
+    let (mut harness, _) = harness(Script::default()).await;
+    let frame = harness.render();
+    assert_eq!(
+        composer_row(&frame),
+        "",
+        "closed, the row is blank: {frame}"
+    );
+    harness.key("i");
+    let frame = harness.render();
+    assert_eq!(hint_row(&frame), "Enter send · Esc leave", "{frame}");
+    assert_eq!(composer_row(&frame), "> _", "{frame}");
 }
 
 /// MOD-67 M5 (D12, PA-4): an open composer is `CAPTURE`. The status line drops `q quit`, `?` is
@@ -2080,7 +2103,7 @@ async fn the_composer_status_line_and_box() {
     harness.key("?");
     assert!(!harness.app().help_visible, "`?` is text in the composer");
     let frame = harness.render();
-    assert_eq!(hint_row(&frame), "> ?_", "{frame}");
+    assert_eq!(composer_row(&frame), "> ?_", "{frame}");
 
     harness.key("f1");
     assert!(harness.app().help_visible, "`F1` opens the box");
@@ -2096,7 +2119,7 @@ async fn the_composer_status_line_and_box() {
     harness.key("f1");
     assert!(!harness.app().help_visible, "`F1` closes it");
     let frame = harness.render();
-    assert_eq!(hint_row(&frame), "> ?_", "the text is intact: {frame}");
+    assert_eq!(composer_row(&frame), "> ?_", "the text is intact: {frame}");
 
     // With every view registered, the offered chords join the capture's status line.
     let mut full = Harness::demo().with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
@@ -2229,7 +2252,7 @@ async fn a_chord_does_not_disarm_esc_esc() {
 
 /// MOD-67 M5 (D7, D9): `[chat] end = "ctrl-e"` arms on the chord the old guard passed and ends
 /// the chat on the second press, the hint doubles the new label, and `Esc` neither arms nor ends.
-/// The armed sentence stays prose until M6 (D11).
+/// The armed sentence names the new label too (MOD-67 M6 D4).
 #[tokio::test]
 async fn a_rebound_end_key_arms_and_ends_the_chat() {
     let keys = htui::keys::load_str("version = 1\n[chat]\nend = \"ctrl-e\"\n")
@@ -2259,7 +2282,7 @@ async fn a_rebound_end_key_arms_and_ends_the_chat() {
     let frame = harness.render();
     assert_eq!(
         hint_row(&frame),
-        "Esc again ends this chat",
+        "Ctrl+e again ends this chat",
         "`ctrl-e` arms: {frame}"
     );
     harness.key("ctrl-e");
@@ -2274,7 +2297,7 @@ async fn a_rebound_end_key_arms_and_ends_the_chat() {
 
 /// MOD-67 M5 (D12), L-D's rebinding test: `[chat] thoughts = "T"` folds and unfolds a thought on
 /// `T`, leaves `t` inert, and the live hint names the new key. A thought starts folded, so `t`
-/// leaves it folded and `T` unfolds it; the folded row's `(t to unfold)` is key prose, M6's.
+/// leaves it folded and `T` unfolds it; the folded row says `(T to unfold)` (MOD-67 M6 D4).
 #[tokio::test]
 async fn a_rebound_thoughts_key_folds_and_t_is_inert() {
     let keys = htui::keys::load_str("version = 1\n[chat]\nthoughts = \"T\"\n")
@@ -2372,4 +2395,37 @@ async fn a_thoughts_key_rebound_onto_i_folds_in_the_replay() {
         frame.contains("read-only"),
         "the replay stays open: {frame}"
     );
+}
+
+/// MOD-67 M6 D4: the armed sentence doubles the end key in force, and a folded thought names the
+/// thoughts key in force, live and in a replay of the same step.
+#[tokio::test]
+async fn a_rebound_end_and_thoughts_key_are_named() {
+    let keys = htui::keys::load_str("version = 1\n[chat]\nend = \"x\"\nthoughts = \"T\"\n")
+        .expect("the key file loads");
+    let script = Script::one_turn(vec![
+        ScriptEvent::Emit(DriverEvent::ThoughtChunk(TextChunk {
+            text: "first\nsecond".to_owned(),
+            message_id: Some("t1".to_owned()),
+        })),
+        chunk("hello"),
+        done(),
+    ]);
+    let (mut harness, _) =
+        harness_over(script, Transport::Acp, |harness| harness.with_keys(keys)).await;
+    compose(&mut harness, "hi");
+    harness.drive().await;
+    let frame = harness.render();
+    assert!(frame.contains("thought  first (T to unfold)"), "{frame}");
+
+    harness.key("x");
+    let frame = harness.render();
+    assert_eq!(hint_row(&frame), "x again ends this chat", "{frame}");
+    harness.key("j");
+
+    let step = harness.chat_steps()[0];
+    replay(&mut harness, step).await;
+    let frame = harness.render();
+    assert!(frame.contains("read-only"), "the replay is open: {frame}");
+    assert!(frame.contains("thought  first (T to unfold)"), "{frame}");
 }

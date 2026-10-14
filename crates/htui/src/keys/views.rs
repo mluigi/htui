@@ -20,6 +20,8 @@
 //! it offers, `MODAL`. Layer order: view, `pane`, `backlog`, `confirm`, `form`, `common`, `list`,
 //! global. Each browse stack's tail is written out (a `const` slice cannot be concatenated);
 //! `every_backlog_browse_stack_offers_the_tab_and_the_list` pins that all seven share it.
+//!
+//! M6 adds the queue overlay's and the directory picker's stacks.
 
 use super::{Act, Context, Layer, Stack};
 
@@ -135,11 +137,11 @@ const FORM: Layer = Layer::all(Context::Form);
 /// (L-A Q11). `SettingsTab` resolves `settings.next_section`/`prev_section` through it.
 pub const SETTINGS_TAB: Stack<'static> = Stack::new(&[SETTINGS, GLOBAL]);
 
-/// A mode that is a text field or an opaque widget and nothing else (PA-7): the agents paste
-/// field, the Qdrant URL and key editors, the connection, prompt and queue editors, the boxes
-/// tags editor, hierarchy's typed delete, its in-flight delete and its path picker, the personas
-/// import path and the secrets URL; the Requirements filter (MOD-67 M4); the Runs note,
-/// follow-up and typed key, a close-out in flight and the chat composer (MOD-67 M5).
+/// A mode that is a text field or an opaque widget and nothing else (PA-7): the agents paste field,
+/// the Qdrant URL and key editors, the connection, prompt and queue editors, the boxes tags editor,
+/// hierarchy's typed delete, its in-flight delete and its path picker's go-to field, the personas
+/// import path and the secrets URL; the Requirements filter (MOD-67 M4); the Runs note, follow-up
+/// and typed key, a close-out in flight and the chat composer (MOD-67 M5).
 pub const CAPTURE: Stack<'static> = Stack::new(&[MODAL]);
 
 /// Settings > Agents, browsing the agent list.
@@ -819,6 +821,43 @@ pub const CHAT_REPLAY: Stack<'static> = Stack::new(&[
     GLOBAL,
 ]);
 
+/// The queue overlay (MOD-12 M3 D8; MOD-67 M6 D2): its own verbs, the list moves, then the
+/// overlay layers the other list overlays compose (`overlay.close`, `global.help`).
+pub const QUEUE_OVERLAY: Stack<'static> = Stack::new(&[
+    Layer::view(
+        Context::Queue,
+        &[
+            Act::QueueMoveDown,
+            Act::QueueMoveUp,
+            Act::QueuePause,
+            Act::QueueDequeue,
+            Act::QueueOpen,
+        ],
+    ),
+    LIST,
+    OVERLAY,
+    HELP,
+]);
+
+/// Settings > Hierarchy, the directory picker while its go-to field is closed (MOD-49; MOD-67 M6
+/// D3). With the field open the section is on [`CAPTURE`]: the field types every printable key.
+pub const HIERARCHY_PICKER: Stack<'static> = Stack::new(&[
+    Layer::view(
+        Context::Picker,
+        &[
+            Act::PickerOpen,
+            Act::PickerParent,
+            Act::PickerChoose,
+            Act::PickerChooseDir,
+            Act::PickerGoTo,
+            Act::PickerHidden,
+        ],
+    ),
+    BACK,
+    LIST,
+    MODAL,
+]);
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -845,6 +884,226 @@ mod tests {
         QUIT_CONFIRM,
         ABORT_CONFIRM,
     ];
+
+    /// A source file under `src/`, with its path (MOD-67 M6 R1: the per-stack act check names
+    /// the files it reads).
+    macro_rules! source {
+        ($path:literal) => {
+            ($path, include_str!(concat!("../", $path)))
+        };
+    }
+
+    /// The views' sources (MOD-67 M3 T7): every file that names a stack of this module or
+    /// handles an act a view stack offers.
+    const VIEWS: &[(&str, &str)] = &[
+        source!("ui/tabs/settings/mod.rs"),
+        source!("ui/tabs/settings/agents.rs"),
+        source!("ui/tabs/settings/boxes.rs"),
+        source!("ui/tabs/settings/connection.rs"),
+        source!("ui/tabs/settings/hierarchy.rs"),
+        source!("ui/tabs/settings/kinds.rs"),
+        source!("ui/tabs/settings/personas.rs"),
+        source!("ui/tabs/settings/prompt.rs"),
+        source!("ui/tabs/settings/qdrant.rs"),
+        source!("ui/tabs/settings/queue.rs"),
+        source!("ui/tabs/settings/secrets.rs"),
+        source!("ui/overlay/abort_confirm.rs"),
+        source!("ui/overlay/concepts_search.rs"),
+        source!("ui/overlay/migration_prompt.rs"),
+        source!("ui/overlay/queue.rs"),
+        source!("ui/overlay/quit_confirm.rs"),
+        source!("ui/overlay/waiting_list.rs"),
+        source!("ui/overlay/workspace_switcher.rs"),
+        source!("ui/tabs/skills/mod.rs"),
+        source!("ui/tabs/skills/library.rs"),
+        source!("ui/tabs/skills/templates.rs"),
+        source!("ui/tabs/skills/attach.rs"),
+        source!("ui/tabs/skills/agent_help.rs"),
+        source!("ui/tabs/requirements/mod.rs"),
+        source!("ui/tabs/requirements/forms.rs"),
+        source!("ui/tabs/backlog/mod.rs"),
+        source!("ui/tabs/backlog/filter.rs"),
+        source!("ui/tabs/backlog/item_form.rs"),
+        source!("ui/tabs/backlog/divergence.rs"),
+        source!("ui/tabs/backlog/detail/mod.rs"),
+        source!("ui/tabs/backlog/detail/compose.rs"),
+        source!("ui/tabs/backlog/detail/documents.rs"),
+        source!("ui/tabs/backlog/detail/graph.rs"),
+        source!("ui/tabs/backlog/detail/notes.rs"),
+        source!("ui/tabs/backlog/detail/prompt.rs"),
+        source!("ui/tabs/backlog/detail/requirements.rs"),
+        source!("ui/tabs/backlog/detail/runs.rs"),
+        source!("ui/tabs/chat/mod.rs"),
+    ];
+
+    /// Act sites beside [`VIEWS`] (MOD-67 M6 D7): files that handle a view stack's acts without
+    /// naming a stack (`ChatTop`/`ChatBottom` are named only in the transcript), and the
+    /// directory picker, whose host names its stack.
+    const ACT_SITES: &[(&str, &str)] = &[
+        source!("ui/tabs/chat/transcript.rs"),
+        source!("ui/path_picker.rs"),
+    ];
+
+    /// The Settings tab: it switches sections for every section's browse stack.
+    const SETTINGS_TAB_RS: &str = "ui/tabs/settings/mod.rs";
+    /// The Skills tab: it switches views for the Library's and the Attachments' browse stacks.
+    const SKILLS_TAB_RS: &str = "ui/tabs/skills/mod.rs";
+    /// The Backlog tab: it handles the `pane`, `backlog`, `common` and `list` acts of every
+    /// browsing pane's stack.
+    const BACKLOG_TAB_RS: &str = "ui/tabs/backlog/mod.rs";
+    /// The chat transcript: it jumps (`chat.top`, `chat.bottom`) for both Chat stacks.
+    const TRANSCRIPT_RS: &str = "ui/tabs/chat/transcript.rs";
+    /// The directory picker: it handles the picker acts of the Hierarchy stack that hosts it.
+    const PATH_PICKER_RS: &str = "ui/path_picker.rs";
+
+    /// Pairs every stack this module declares with its name (MOD-67 M6 R1 LOW-4).
+    macro_rules! by_name {
+        ($($stack:ident),* $(,)?) => {
+            &[$((stringify!($stack), $stack)),*]
+        };
+    }
+
+    /// Every stack this module declares, by name, in declaration order.
+    const VIEW_STACKS: &[(&str, Stack<'static>)] = by_name![
+        SETTINGS_TAB,
+        CAPTURE,
+        AGENTS_BROWSE,
+        AGENTS_CONSENT,
+        AGENTS_CHOOSER,
+        AGENTS_FORM,
+        HIERARCHY_BROWSE,
+        HIERARCHY_EDITOR,
+        HIERARCHY_DELETE_COUNTING,
+        HIERARCHY_DELETE_WARN,
+        KINDS_BROWSE,
+        KINDS_EDITOR,
+        KINDS_CONFIRM,
+        PROMPT_BROWSE,
+        CONNECTION_BROWSE,
+        CONNECTION_CONFIRM,
+        QDRANT_BROWSE,
+        QDRANT_CONFIRM,
+        BOXES_BROWSE,
+        BOXES_EDITOR,
+        BOXES_EXECUTOR,
+        PERSONAS_BROWSE,
+        PERSONAS_FORM,
+        PERSONAS_EDITOR,
+        PERSONAS_DELETE,
+        PERSONAS_REPORT,
+        SECRETS_BROWSE,
+        SECRETS_FORM,
+        SECRETS_CONFIRM,
+        QUEUE_BROWSE,
+        CONCEPTS_QUERY,
+        SWITCHER,
+        MIGRATION,
+        QUIT_CONFIRM,
+        ABORT_CONFIRM,
+        WAITING_LIST,
+        LIBRARY_BROWSE,
+        LIBRARY_PROMPT,
+        LIBRARY_INFO,
+        LIBRARY_EDITOR,
+        LIBRARY_REPORT,
+        ATTACH_BROWSE,
+        ATTACH_FORM,
+        ATTACH_PICKER,
+        ATTACH_CONFIRM,
+        TEMPLATES_BROWSE,
+        TEMPLATES_PROMPT,
+        TEMPLATES_EDITOR,
+        HELP_ASKING,
+        HELP_WAITING,
+        HELP_PROPOSAL,
+        REQUIREMENTS_BROWSE,
+        REQUIREMENTS_FORM,
+        REQUIREMENTS_WITHDRAW,
+        BACKLOG_BODY,
+        RUNS_BROWSE,
+        RUNS_CONFIRM,
+        RUNS_COUNTING,
+        RUNS_ARTIFACT,
+        BACKLOG_GRAPH,
+        BACKLOG_DOCS,
+        DOCS_COMPOSE,
+        BACKLOG_NOTES,
+        NOTES_COMPOSE,
+        BACKLOG_PROMPT,
+        BACKLOG_REQS,
+        REQS_PICK,
+        REQS_KIND,
+        REQS_CONFIRM,
+        BACKLOG_FILTER,
+        ITEM_FORM,
+        ITEM_DIVERGENCE,
+        CHAT_LIVE,
+        CHAT_REPLAY,
+        QUEUE_OVERLAY,
+        HIERARCHY_PICKER,
+    ];
+
+    /// The files a stack's acts are handled in beside the files that name it (MOD-67 M6 R1
+    /// LOW-4): a view hands the keys it does not handle to its host or to a widget it owns.
+    /// Every entry must carry an act its stack's naming files do not name.
+    const DELEGATES: &[(&str, &[&str])] = &[
+        ("AGENTS_BROWSE", &[SETTINGS_TAB_RS]),
+        ("AGENTS_CONSENT", &[SETTINGS_TAB_RS]),
+        ("AGENTS_CHOOSER", &[SETTINGS_TAB_RS]),
+        ("HIERARCHY_BROWSE", &[SETTINGS_TAB_RS]),
+        ("KINDS_BROWSE", &[SETTINGS_TAB_RS]),
+        ("PROMPT_BROWSE", &[SETTINGS_TAB_RS]),
+        ("CONNECTION_BROWSE", &[SETTINGS_TAB_RS]),
+        ("QDRANT_BROWSE", &[SETTINGS_TAB_RS]),
+        ("BOXES_BROWSE", &[SETTINGS_TAB_RS]),
+        ("PERSONAS_BROWSE", &[SETTINGS_TAB_RS]),
+        ("SECRETS_BROWSE", &[SETTINGS_TAB_RS]),
+        ("QUEUE_BROWSE", &[SETTINGS_TAB_RS]),
+        ("LIBRARY_BROWSE", &[SKILLS_TAB_RS]),
+        ("LIBRARY_REPORT", &[SKILLS_TAB_RS]),
+        ("ATTACH_BROWSE", &[SKILLS_TAB_RS]),
+        ("BACKLOG_BODY", &[BACKLOG_TAB_RS]),
+        ("BACKLOG_GRAPH", &[BACKLOG_TAB_RS]),
+        ("BACKLOG_DOCS", &[BACKLOG_TAB_RS]),
+        ("BACKLOG_NOTES", &[BACKLOG_TAB_RS]),
+        ("BACKLOG_PROMPT", &[BACKLOG_TAB_RS]),
+        ("BACKLOG_REQS", &[BACKLOG_TAB_RS]),
+        ("CHAT_LIVE", &[TRANSCRIPT_RS]),
+        ("CHAT_REPLAY", &[TRANSCRIPT_RS]),
+        ("HIERARCHY_PICKER", &[PATH_PICKER_RS]),
+    ];
+
+    /// `source`'s production code: up to its test module, its comment lines dropped, so a name
+    /// that occurs only in a test or a comment does not count.
+    fn production(source: &str) -> String {
+        let code = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        code.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Whether `wanted` occurs in one of `sources` not followed by an identifier character.
+    fn names(sources: &[String], wanted: &str) -> bool {
+        sources.iter().any(|source| names_in(source, wanted))
+    }
+
+    /// Whether `wanted` occurs in `source` not followed by an identifier character.
+    fn names_in(source: &str, wanted: &str) -> bool {
+        source.match_indices(wanted).any(|(at, _)| {
+            !source[at + wanted.len()..]
+                .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+        })
+    }
+
+    /// The stacks `views.rs` declares, by name, read from its source.
+    fn declared_names() -> Vec<&'static str> {
+        include_str!("views.rs")
+            .lines()
+            .filter_map(|line| line.strip_prefix("pub const "))
+            .filter_map(|rest| rest.split_once(": Stack<'static>").map(|(name, _)| name))
+            .collect()
+    }
 
     fn chord(spec: &str) -> KeyChord {
         KeyChord::parse_strict(spec).expect("a valid spec")
@@ -1042,6 +1301,50 @@ mod tests {
         assert_eq!(resolve(CHAT_REPLAY, "t"), [Act::ChatThoughts]);
     }
 
+    /// MOD-67 M6 §4.3: the queue overlay's and the directory picker's stacks.
+    #[test]
+    fn the_queue_overlay_and_picker_stacks_resolve_as_designed() {
+        assert_eq!(resolve(QUEUE_OVERLAY, "J"), [Act::QueueMoveDown]);
+        assert_eq!(resolve(QUEUE_OVERLAY, "K"), [Act::QueueMoveUp]);
+        assert_eq!(resolve(QUEUE_OVERLAY, "P"), [Act::QueuePause]);
+        assert_eq!(resolve(QUEUE_OVERLAY, "Q"), [Act::QueueDequeue]);
+        assert_eq!(resolve(QUEUE_OVERLAY, "enter"), [Act::QueueOpen]);
+        assert_eq!(resolve(QUEUE_OVERLAY, "j"), [Act::ListDown]);
+        assert_eq!(resolve(QUEUE_OVERLAY, "down"), [Act::ListDown]);
+        assert_eq!(resolve(QUEUE_OVERLAY, "esc"), [Act::OverlayClose]);
+        assert_eq!(resolve(QUEUE_OVERLAY, "?"), [Act::Help]);
+        assert_eq!(resolve(QUEUE_OVERLAY, "f1"), [Act::Help]);
+        for spec in ["ctrl-j", "alt-J", "q", "1"] {
+            assert_eq!(resolve(QUEUE_OVERLAY, spec), [], "{spec}");
+        }
+        // The global layer is the unfiltered `HELP`; the overlay is modal at the shell.
+        assert!(QUEUE_OVERLAY.passes(chord("q")));
+
+        for spec in ["enter", "l"] {
+            assert_eq!(resolve(HIERARCHY_PICKER, spec), [Act::PickerOpen], "{spec}");
+        }
+        for spec in ["h", "backspace"] {
+            assert_eq!(
+                resolve(HIERARCHY_PICKER, spec),
+                [Act::PickerParent],
+                "{spec}"
+            );
+        }
+        assert_eq!(resolve(HIERARCHY_PICKER, "s"), [Act::PickerChoose]);
+        assert_eq!(resolve(HIERARCHY_PICKER, "S"), [Act::PickerChooseDir]);
+        assert_eq!(resolve(HIERARCHY_PICKER, "/"), [Act::PickerGoTo]);
+        assert_eq!(resolve(HIERARCHY_PICKER, "."), [Act::PickerHidden]);
+        assert_eq!(resolve(HIERARCHY_PICKER, "esc"), [Act::Back]);
+        assert_eq!(resolve(HIERARCHY_PICKER, "j"), [Act::ListDown]);
+        for spec in ["q", "?", "1"] {
+            assert_eq!(resolve(HIERARCHY_PICKER, spec), [], "{spec}");
+        }
+        assert_eq!(resolve(HIERARCHY_PICKER, "f1"), [Act::Help]);
+        assert_eq!(resolve(HIERARCHY_PICKER, "ctrl-f"), [Act::Find]);
+        assert!(!HIERARCHY_PICKER.passes(chord("q")));
+        assert!(HIERARCHY_PICKER.passes(chord("ctrl-j")));
+    }
+
     /// MOD-67 M5 §4 (D5): every Backlog browse stack ends in the same tail, so the Backlog
     /// tab's own verbs and the list's resolve on every sub-tab.
     #[test]
@@ -1103,7 +1406,7 @@ mod tests {
             .iter()
             .filter(|(_, stack)| !NOT_VIEW_LED.contains(stack))
             .collect();
-        assert_eq!(views.len(), 70);
+        assert_eq!(views.len(), 72);
         for &&(phrase, stack) in &views {
             let first = stack.layers()[0];
             assert!(first.inherits(), "{phrase}: layer 0 is not a view layer");
@@ -1207,71 +1510,11 @@ mod tests {
     /// validated (and refuse key files) for a mode no view is ever in.
     #[test]
     fn every_view_stack_is_named_by_a_view() {
-        const VIEWS: &[&str] = &[
-            include_str!("../ui/tabs/settings/mod.rs"),
-            include_str!("../ui/tabs/settings/agents.rs"),
-            include_str!("../ui/tabs/settings/boxes.rs"),
-            include_str!("../ui/tabs/settings/connection.rs"),
-            include_str!("../ui/tabs/settings/hierarchy.rs"),
-            include_str!("../ui/tabs/settings/kinds.rs"),
-            include_str!("../ui/tabs/settings/personas.rs"),
-            include_str!("../ui/tabs/settings/prompt.rs"),
-            include_str!("../ui/tabs/settings/qdrant.rs"),
-            include_str!("../ui/tabs/settings/queue.rs"),
-            include_str!("../ui/tabs/settings/secrets.rs"),
-            include_str!("../ui/overlay/abort_confirm.rs"),
-            include_str!("../ui/overlay/concepts_search.rs"),
-            include_str!("../ui/overlay/migration_prompt.rs"),
-            include_str!("../ui/overlay/quit_confirm.rs"),
-            include_str!("../ui/overlay/waiting_list.rs"),
-            include_str!("../ui/overlay/workspace_switcher.rs"),
-            include_str!("../ui/tabs/skills/mod.rs"),
-            include_str!("../ui/tabs/skills/library.rs"),
-            include_str!("../ui/tabs/skills/templates.rs"),
-            include_str!("../ui/tabs/skills/attach.rs"),
-            include_str!("../ui/tabs/skills/agent_help.rs"),
-            include_str!("../ui/tabs/requirements/mod.rs"),
-            include_str!("../ui/tabs/requirements/forms.rs"),
-            include_str!("../ui/tabs/backlog/mod.rs"),
-            include_str!("../ui/tabs/backlog/filter.rs"),
-            include_str!("../ui/tabs/backlog/item_form.rs"),
-            include_str!("../ui/tabs/backlog/divergence.rs"),
-            include_str!("../ui/tabs/backlog/detail/mod.rs"),
-            include_str!("../ui/tabs/backlog/detail/compose.rs"),
-            include_str!("../ui/tabs/backlog/detail/documents.rs"),
-            include_str!("../ui/tabs/backlog/detail/graph.rs"),
-            include_str!("../ui/tabs/backlog/detail/notes.rs"),
-            include_str!("../ui/tabs/backlog/detail/prompt.rs"),
-            include_str!("../ui/tabs/backlog/detail/requirements.rs"),
-            include_str!("../ui/tabs/backlog/detail/runs.rs"),
-            include_str!("../ui/tabs/chat/mod.rs"),
-        ];
-        // Production code only: each file up to its test module, its comment lines dropped, so a
-        // stack named only by a test or a doc comment still counts as unnamed.
-        let production: Vec<String> = VIEWS
-            .iter()
-            .map(|source| {
-                let code = source.split("\n#[cfg(test)]").next().unwrap_or(source);
-                code.lines()
-                    .filter(|line| !line.trim_start().starts_with("//"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .collect();
-        let named = |name: &str| {
-            let wanted = format!("views::{name}");
-            production.iter().any(|source| {
-                source.match_indices(&wanted).any(|(at, _)| {
-                    !source[at + wanted.len()..]
-                        .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
-                })
-            })
-        };
-        let declared: Vec<&str> = include_str!("views.rs")
-            .lines()
-            .filter_map(|line| line.strip_prefix("pub const "))
-            .filter_map(|rest| rest.split_once(": Stack<'static>").map(|(name, _)| name))
-            .collect();
+        // Production code only, so a stack named only by a test or a doc comment still counts
+        // as unnamed.
+        let production: Vec<String> = VIEWS.iter().map(|(_, source)| production(source)).collect();
+        let named = |name: &str| names(&production, &format!("views::{name}"));
+        let declared = declared_names();
         // `BASE`, `OVERLAY` and the editor stacks live in `stack.rs`.
         assert_eq!(
             declared.len(),
@@ -1283,6 +1526,101 @@ mod tests {
         );
         for name in declared {
             assert!(named(name), "no view names views::{name}");
+        }
+    }
+
+    /// MOD-67 M6 D7 (ANA-26 §8, risk "a stack action no view handles"): every catalogue act is
+    /// offered by some declared stack in a layer of its own context, and every act a view stack
+    /// offers outside the global, overlay and editor contexts (the shell's) is named `Act::X` in
+    /// that stack's own files: the production code of the files that name `views::<STACK>`, plus
+    /// its [`DELEGATES`] (MOD-67 M6 R1 LOW-4, so an act shared by many stacks is checked for each
+    /// stack rather than passing on any view that names it).
+    #[test]
+    fn every_act_is_offered_by_a_stack_and_handled_by_a_view() {
+        for spec in CATALOGUE {
+            assert!(
+                DECLARED
+                    .iter()
+                    .any(|(_, stack)| stack.view_admits(spec.context, spec.act)),
+                "no declared stack offers [{}] {}",
+                spec.context.table(),
+                spec.name
+            );
+        }
+        let mut listed: Vec<&str> = VIEW_STACKS.iter().map(|&(name, _)| name).collect();
+        let mut declared = declared_names();
+        listed.sort_unstable();
+        declared.sort_unstable();
+        assert_eq!(
+            listed, declared,
+            "VIEW_STACKS vs the stacks views.rs declares"
+        );
+        let sources: Vec<(&str, String)> = VIEWS
+            .iter()
+            .chain(ACT_SITES)
+            .map(|&(path, source)| (path, production(source)))
+            .collect();
+        let source = |path: &str| {
+            sources
+                .iter()
+                .find(|&&(at, _)| at == path)
+                .map(|(_, code)| code.as_str())
+                .unwrap_or_else(|| panic!("{path} is in neither VIEWS nor ACT_SITES"))
+        };
+        let mut unhandled = Vec::new();
+        for &(name, stack) in VIEW_STACKS {
+            let stack_name = format!("views::{name}");
+            let own: Vec<&str> = sources
+                .iter()
+                .filter(|(_, code)| names_in(code, &stack_name))
+                .map(|(_, code)| code.as_str())
+                .collect();
+            let delegates = DELEGATES
+                .iter()
+                .find(|&&(stack, _)| stack == name)
+                .map_or(&[][..], |&(_, paths)| paths);
+            let mut used = vec![false; delegates.len()];
+            for (index, layer) in stack.layers().iter().enumerate() {
+                if matches!(
+                    layer.context(),
+                    Context::Global | Context::Overlay | Context::Editor
+                ) {
+                    continue;
+                }
+                for spec in CATALOGUE
+                    .iter()
+                    .filter(|spec| spec.context == layer.context() && stack.admits(index, spec.act))
+                {
+                    let act = format!("Act::{:?}", spec.act);
+                    if own.iter().any(|code| names_in(code, &act)) {
+                        continue;
+                    }
+                    let mut handled = false;
+                    for (path, used) in delegates.iter().zip(&mut used) {
+                        if names_in(source(path), &act) {
+                            (*used, handled) = (true, true);
+                        }
+                    }
+                    if !handled {
+                        unhandled.push(format!(
+                            "{name}: {act} ([{}] {})",
+                            spec.context.table(),
+                            spec.name
+                        ));
+                    }
+                }
+            }
+            for (path, used) in delegates.iter().zip(used) {
+                assert!(used, "{name}: {path} handles no act its own files do not");
+            }
+        }
+        assert!(
+            unhandled.is_empty(),
+            "acts no file of their stack handles:\n{}",
+            unhandled.join("\n")
+        );
+        for &(name, _) in DELEGATES {
+            assert!(declared.contains(&name), "DELEGATES names no stack {name}");
         }
     }
 }

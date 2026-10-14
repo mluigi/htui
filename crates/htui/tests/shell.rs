@@ -431,3 +431,62 @@ async fn the_status_line_and_help_box_over_the_switcher() {
     }
     assert!(!frame.contains("Backlog: "), "no legacy tab line: {frame}");
 }
+
+/// Row 28 of a 100x30 frame: the shell's hint row (MOD-67 M6 T2), trailing blanks trimmed.
+fn hint_row(frame: &str) -> &str {
+    frame.lines().nth(28).unwrap_or_default().trim_end()
+}
+
+/// The demo shell, every tab registered, settled on the Backlog.
+async fn demo_shell(keys: Option<htui::keys::Keys>) -> Harness {
+    let mut harness = Harness::demo().with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
+    if let Some(keys) = keys {
+        harness = harness.with_keys(keys);
+    }
+    register_all(harness.app());
+    harness.drive_to_end().await;
+    harness
+}
+
+/// MOD-67 M6 T2: the row above the status line holds the active tab's keys; on the Backlog's
+/// Body pane, the list's own (the pane has none).
+#[tokio::test]
+async fn the_hint_row_shows_the_active_tabs_keys() {
+    let mut harness = demo_shell(None).await;
+    let frame = harness.render();
+    assert_eq!(
+        hint_row(&frame),
+        "j/k move · h/l sub-tab · f filter · N new · e edit",
+        "{frame}"
+    );
+    assert_eq!(
+        status_line(&frame),
+        frame.lines().nth(29).unwrap_or_default().trim_end()
+    );
+}
+
+/// MOD-67 M6 T2 (plan Q1 (a)): an overlay's box carries its own hint, so the row goes blank.
+#[tokio::test]
+async fn the_hint_row_is_blank_under_an_overlay() {
+    let mut harness = demo_shell(None).await;
+    harness.key("w");
+    harness.drive_to_end().await;
+    assert_eq!(
+        harness.app().overlays.iter().count(),
+        1,
+        "`w` opened the switcher"
+    );
+    let frame = harness.render();
+    assert_eq!(hint_row(&frame), "", "{frame}");
+}
+
+/// MOD-67 M6 T2: the row is rendered through the tab's stack, so a rebound key shows its chord.
+#[tokio::test]
+async fn the_hint_row_follows_a_rebound_key() {
+    let keys =
+        htui::keys::load_str("version = 1\n[backlog]\nfilter = \"/\"\n").expect("the keys load");
+    let mut harness = demo_shell(Some(keys)).await;
+    let frame = harness.render();
+    assert!(hint_row(&frame).contains("/ filter"), "{frame}");
+    assert!(!hint_row(&frame).contains("f filter"), "{frame}");
+}

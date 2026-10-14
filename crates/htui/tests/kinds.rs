@@ -1011,9 +1011,8 @@ async fn an_unreferenced_graph_is_listed_after_the_kinds() {
     let frame = bench.render_section(&section, 100);
     let last = frame
         .lines()
-        .filter(|line| !line.trim().is_empty())
-        .nth_back(1)
-        .expect("the tree has rows above the hint");
+        .rfind(|line| !line.trim().is_empty())
+        .expect("the tree has rows");
     assert_eq!(
         last.trim(),
         "orphan · graph, no kind",
@@ -1481,7 +1480,9 @@ async fn a_prefix_change_asks_before_it_writes() {
     assert!(section.captures_input(), "and it is modal while it is up");
     let frame = bench.render_section(&section, 100);
     assert!(
-        frame.contains("y write \u{b7} n/Esc back to the editor"),
+        bench
+            .key_hint(&section)
+            .contains("y write \u{b7} n/Esc back to the editor"),
         "the hint names both answers: {frame}"
     );
     assert!(
@@ -1512,7 +1513,7 @@ async fn n_on_the_prefix_warning_returns_to_the_editor_with_its_text() {
 
     let frame = bench.render_section(&section, 100);
     assert!(
-        frame.contains("Tab/Shift+Tab field"),
+        bench.key_hint(&section).contains("Tab/Shift+Tab field"),
         "the editor is back: {frame}"
     );
     assert!(frame.contains("prefix     : AN"), "with its text: {frame}");
@@ -2538,10 +2539,10 @@ async fn a_rebound_graph_acts_on_its_new_chord_and_the_hint_follows() {
 
     assert!(
         bench
-            .render_section(&section, 100)
+            .key_hint(&section)
             .contains("e edit \u{b7} G graph \u{b7} d delete kind"),
         "{}",
-        bench.render_section(&section, 100)
+        bench.key_hint(&section)
     );
     assert_eq!(bench.key(&mut section, "g"), Handled::Pass);
     assert!(!section.captures_input(), "`g` is unbound now");

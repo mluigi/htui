@@ -24,6 +24,8 @@ use htui_core::model::{
     UserId,
 };
 use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
+use ratatui::buffer::Buffer;
+use ratatui::style::Style;
 
 /// The detail pane's `%m-%d %H:%M` stamps: a revision written by a case carries today's.
 const STAMP_FILTER: (&str, &str) = (r"\d{2}-\d{2} \d{2}:\d{2}", "MM-DD hh:mm");
@@ -98,15 +100,16 @@ fn status(frame: &str) -> String {
     frame.lines().last().unwrap_or_default().to_owned()
 }
 
-/// The notice: the rows between the content's bottom border and the hint, joined (it wraps).
+/// The notice: the rows between the content's bottom border and the tab's filter row, joined (it
+/// wraps).
 fn notice(frame: &str) -> String {
     let lines: Vec<&str> = frame.lines().collect();
-    let hint = lines.len() - 2;
-    let bottom = lines[..hint]
+    let filter = lines.len() - 3;
+    let bottom = lines[..filter]
         .iter()
         .rposition(|line| line.starts_with('\u{2514}'))
-        .unwrap_or_else(|| panic!("no bottom border above the hint:\n{frame}"));
-    lines[bottom + 1..hint]
+        .unwrap_or_else(|| panic!("no bottom border above the filter row:\n{frame}"));
+    lines[bottom + 1..filter]
         .iter()
         .map(|line| line.trim())
         .collect::<Vec<_>>()
@@ -401,10 +404,16 @@ async fn a_stale_amend_keeps_the_form() {
     assert!(head.body.ends_with("Mine."), "{}", head.body);
 }
 
-/// The hint row: the frame's line above the status line.
+/// The shell's hint row (MOD-67 M6 T2): the frame's line above the status line.
 fn hint(frame: &str) -> String {
     let lines: Vec<&str> = frame.lines().collect();
     lines[lines.len() - 2].to_owned()
+}
+
+/// The tab's own last row, above the shell's hint row: the filter's input while it is open.
+fn filter_row(frame: &str) -> String {
+    let lines: Vec<&str> = frame.lines().collect();
+    lines[lines.len() - 3].to_owned()
 }
 
 /// The demo on the Requirements tab with `file` as the keys file (MOD-67 M4).
@@ -423,7 +432,7 @@ async fn a_rebound_save_saves_a_requirements_draft() {
     let frame = harness.render();
     assert_eq!(
         hint(&frame),
-        " Tab field \u{b7} F2 save \u{b7} Esc cancel",
+        "Tab field \u{b7} F2 save \u{b7} Esc cancel",
         "{frame}"
     );
     harness.key("ctrl-s");
@@ -618,7 +627,7 @@ async fn the_requirements_tree_status_line_and_help_box() {
     );
     assert_eq!(
         hint(&frame),
-        " j/k move \u{b7} Enter fold \u{b7} / filter \u{b7} a area \u{b7} n new \u{b7} e amend \
+        "j/k move \u{b7} Enter fold \u{b7} / filter \u{b7} a area \u{b7} n new \u{b7} e amend \
          \u{b7} W withdraw \u{b7} r reload",
         "{frame}"
     );
@@ -651,12 +660,9 @@ async fn ctrl_s_on_the_filter_saves_nothing_and_types_nothing() {
     harness.key("ctrl-s");
     assert_eq!(harness.queued(), 0, "nothing was sent");
     let frame = harness.render();
-    assert!(hint(&frame).starts_with(" /ST"), "{frame}");
-    assert!(!hint(&frame).starts_with(" /STs"), "{frame}");
-    assert!(
-        hint(&frame).ends_with("  Enter apply \u{b7} Esc clear"),
-        "{frame}"
-    );
+    assert!(filter_row(&frame).starts_with(" /ST"), "{frame}");
+    assert!(!filter_row(&frame).starts_with(" /STs"), "{frame}");
+    assert_eq!(hint(&frame), "Enter apply \u{b7} Esc clear", "{frame}");
 }
 
 /// MOD-67 M4 (lane rebinding test): `[requirements] amend = "E"` moves the amend to `E`; `e`
@@ -676,4 +682,35 @@ async fn a_rebound_amend_amends_and_e_is_inert() {
     harness.key("E");
     let frame = harness.render();
     assert!(frame.contains(" Amend R-ENT-1 (v2) "), "{frame}");
+}
+
+/// The style of the cell where `text` starts on row `y` of `buffer`.
+fn style_at(buffer: &Buffer, y: u16, text: &str) -> Style {
+    let row: Vec<&str> = (0..buffer.area.width)
+        .map(|x| buffer[(x, y)].symbol())
+        .collect();
+    let at = (0..row.len())
+        .find(|&x| row[x..].concat().starts_with(text))
+        .unwrap_or_else(|| panic!("`{text}` is not on row {y}: {}", row.concat()));
+    buffer[(u16::try_from(at).expect("a narrow row"), y)].style()
+}
+
+/// MOD-67 M6 T2 (PRD D1 "mirrored in the view as greyed keys"): in the shell's hint row the write
+/// keys are drawn dim, as the status line is, where a write would be refused, and in the move
+/// keys' style where one would be sent.
+#[tokio::test]
+async fn the_hint_row_greys_the_write_keys_where_a_write_is_refused() {
+    let mut harness = open_platform_over(stranger_first()).await;
+    let buffer = harness.render_buffer();
+    let dim = style_at(&buffer, 29, "q quit");
+    assert_eq!(style_at(&buffer, 28, "a area"), dim, "not the maintainer");
+    assert_ne!(style_at(&buffer, 28, "j/k move"), dim);
+
+    let mut harness = open().await;
+    let buffer = harness.render_buffer();
+    assert_eq!(
+        style_at(&buffer, 28, "a area"),
+        style_at(&buffer, 28, "j/k move"),
+        "the maintainer"
+    );
 }

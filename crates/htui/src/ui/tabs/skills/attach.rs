@@ -35,7 +35,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::library::{Notice, Sent};
 use crate::app::{Ctx, Handled};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::skills::{ProjectSkills, SkillsSnapshot};
 use crate::store_worker::StoreRequest;
 use crate::ui::cells;
@@ -467,7 +467,8 @@ impl AttachPane {
         };
         let target = target(*row, snapshot, ctx);
         let name = skill_name(snapshot, self.skill);
-        let question = format!("detach `{name}` from {target}? y detaches, any other key keeps it");
+        let yes = ctx.keys().label(views::ATTACH_CONFIRM, Act::ConfirmYes);
+        let question = detach_question(&name, &target, yes.as_deref());
         self.mode = AttachMode::ConfirmDetach {
             key,
             token: stored.updated_at,
@@ -744,14 +745,15 @@ impl AttachPane {
 
     // --- frames --------------------------------------------------------------------------------
 
-    /// Draws the pane into `area` and returns its hint row, through the mode's stack.
+    /// Draws the pane into `area`. Its keys are [`hint`](Self::hint), the shell's hint row since
+    /// MOD-67 M6 T2.
     pub(super) fn render(
         &self,
         frame: &mut Frame<'_>,
         area: Rect,
         snapshot: &SkillsSnapshot,
         ctx: &Ctx<'_>,
-    ) -> String {
+    ) {
         let (rows_area, panel) = match &self.mode {
             AttachMode::Form(_) | AttachMode::Picker { .. } => {
                 let [rows_area, panel] =
@@ -762,19 +764,27 @@ impl AttachPane {
             AttachMode::Browse | AttachMode::ConfirmDetach { .. } => (area, None),
         };
         self.render_rows(frame, rows_area, snapshot, ctx);
-        let spec = match (&self.mode, panel) {
+        match (&self.mode, panel) {
             (AttachMode::Form(form), Some(panel)) => {
                 render_form(frame, panel, form, snapshot, self.skill, ctx);
-                FORM_HINT
             }
             (AttachMode::Picker { form, cursor }, Some(panel)) => {
                 render_picker(frame, panel, form, *cursor, snapshot, ctx);
-                PICKER_HINT
             }
-            (AttachMode::ConfirmDetach { .. }, _) => CONFIRM_HINT,
-            _ => BROWSE_HINT,
+            _ => {}
+        }
+    }
+
+    /// The pane's keys in its mode, through [`key_stack`](Self::key_stack): the Skills tab's part
+    /// of the shell's hint row (MOD-67 M6 T2).
+    pub(super) fn hint(&self, keys: &Keys) -> String {
+        let spec = match &self.mode {
+            AttachMode::Form(_) => FORM_HINT,
+            AttachMode::Picker { .. } => PICKER_HINT,
+            AttachMode::ConfirmDetach { .. } => CONFIRM_HINT,
+            AttachMode::Browse => BROWSE_HINT,
         };
-        ctx.keys().hint(self.key_stack(), spec)
+        keys.hint(self.key_stack(), spec)
     }
 
     /// The rows, the cursor's highlighted and kept in view.
@@ -1184,10 +1194,38 @@ fn render_picker(
     );
 }
 
+/// The detach question over `name` and `target`, its answer `yes` (`ConfirmYes`'s label through
+/// `ATTACH_CONFIRM`, MOD-67 M6 D4); with none bound the question stands alone.
+fn detach_question(name: &str, target: &str, yes: Option<&str>) -> String {
+    match yes {
+        Some(yes) => {
+            format!("detach `{name}` from {target}? {yes} detaches, any other key keeps it")
+        }
+        None => format!("detach `{name}` from {target}?"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ui::cells::cell_width;
+
+    /// MOD-67 M6 D4: the detach question names the answer in force through `ATTACH_CONFIRM`, and
+    /// asks alone when none is bound.
+    #[test]
+    fn a_rebound_detach_answer_is_named() {
+        let keys =
+            crate::keys::load_str("version = 1\n[skills.attach]\nyes = \"Y\"\n").expect("loads");
+        let yes = keys.label(views::ATTACH_CONFIRM, Act::ConfirmYes);
+        assert_eq!(
+            detach_question("tests", "global", yes.as_deref()),
+            "detach `tests` from global? Y detaches, any other key keeps it"
+        );
+        assert_eq!(
+            detach_question("tests", "global", None),
+            "detach `tests` from global?"
+        );
+    }
 
     /// A ZWJ family: one cluster of five code points, 2 cells.
     const FAMILY: &str = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";

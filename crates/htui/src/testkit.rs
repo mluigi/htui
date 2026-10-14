@@ -24,8 +24,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 use crate::agent_worker::{AgentRuntime, ChatTask, Served};
 use crate::app::{Action, App, Ctx, Emit, Handled, TopBarState};
 use crate::concepts_worker::{ConceptsRuntime, ConceptsServed};
-use crate::keymap::{KeyChord, Keymap};
-use crate::keys::Keys;
+use crate::keys::{KeyChord, Keys};
 use crate::run_worker::{RunRuntime, RunServed, TuiRuns as _};
 use crate::store_worker::{self, Origin, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest};
 use crate::ui::Theme;
@@ -126,7 +125,7 @@ impl Harness {
     #[must_use]
     pub fn over_backend(backend: Backend) -> Self {
         let (request_tx, rx) = mpsc::unbounded_channel();
-        let mut app = App::new(request_tx, Keymap::default_global());
+        let mut app = App::new(request_tx);
         app.top_bar.store = backend.label();
         app.start();
         let (width, height) = DEFAULT_SIZE;
@@ -612,6 +611,20 @@ impl Harness {
         buffer_text(term.backend().buffer())
     }
 
+    /// Draws a frame and returns its buffer, for a check on a cell's style rather than its text
+    /// (MOD-67 M6 T2: the hint row's greyed write keys).
+    ///
+    /// # Panics
+    ///
+    /// If the `TestBackend` fails to draw, which it only does when a widget panics.
+    pub fn render_buffer(&mut self) -> Buffer {
+        let Self { term, app, .. } = self;
+        if let Err(error) = term.draw(|frame| app.render(frame)) {
+            panic!("the test backend failed to draw: {error}");
+        }
+        term.backend().buffer().clone()
+    }
+
     /// How many requests are queued and not yet served: what the next [`Harness::settle`] or
     /// [`Harness::drive`] answers. A case that queues requests with `key` or `Action::Tick` and
     /// serves them later can pin that they were in flight (MOD-13 milestone 4 review L1).
@@ -664,8 +677,6 @@ pub struct SectionBench {
     projects: Vec<ProjectRef>,
     /// What the top bar would be showing.
     top_bar: TopBarState,
-    /// The key table, for the hint lines a section renders.
-    keymap: Keymap,
     /// The palette.
     theme: Theme,
     /// What the section emitted, drained by [`drained`](SectionBench::drained).
@@ -690,7 +701,6 @@ impl SectionBench {
             scope: Scope::from_workspace(workspaces.first().expect("the fixture has a workspace")),
             projects: Vec::new(),
             top_bar: TopBarState::default(),
-            keymap: Keymap::default_global(),
             theme: Theme::default(),
             emit: Emit::default(),
             keys: Keys::compiled().clone(),
@@ -712,12 +722,11 @@ impl SectionBench {
             &self.scope,
             &self.projects,
             &self.top_bar,
-            &self.keymap,
+            &self.keys,
             &self.theme,
             Origin::Tab(SettingsTab::ID),
             &self.emit,
         )
-        .with_keys(&self.keys)
     }
 
     /// Feeds one key to a section, written the way [`KeyChord::parse`] reads it.
@@ -760,6 +769,16 @@ impl SectionBench {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The section's keys as the shell's hint row would show them (MOD-67 M6 T2): its
+    /// [`SettingsSection::key_hint`] through the bench's keys, as plain text; empty for `None`.
+    #[must_use]
+    pub fn key_hint(&self, section: &dyn SettingsSection) -> String {
+        section
+            .key_hint(&self.keys, &self.theme)
+            .map(|line| line.to_string())
+            .unwrap_or_default()
     }
 
     /// Draws one section into a `width`x30 buffer and returns it as snapshot text.

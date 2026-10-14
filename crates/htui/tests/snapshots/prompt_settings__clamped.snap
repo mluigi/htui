@@ -31,4 +31,3 @@ project Vulkan Tutorials
 Lines quoted from the top of a file; the reader clamps it to excerpt_file_line_cap.
 range 1..=4294967295 lines · rungs app
 clamped to excerpt_file_line_cap = 10
-j/k · e edit · r reload

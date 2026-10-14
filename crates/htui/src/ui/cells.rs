@@ -24,8 +24,9 @@
 //!
 //! Every clip with a cut mark, pad, fit and word wrap in `ui/` goes through the operations below
 //! (MOD-60 D1), so a row is never measured one way and drawn another: [`clip`], [`pad`],
-//! [`pad_left`], [`fit`], [`wrap`], [`wrap_spans`] and [`clip_spans`], all drawing a control
-//! character as one blank cell (D3); the clips ([`clip`], [`fit`] and [`clip_spans`]) cut at
+//! [`pad_left`], [`fit`], [`wrap`], [`wrap_spans`], [`clip_spans`] and [`clip_line`], all drawing
+//! a control character as one blank cell (D3); the clips ([`clip`], [`fit`], [`clip_spans`] and
+//! [`clip_line`]) cut at
 //! [`ELLIPSIS`]. [`expand_tabs`] draws a `\t` as `TextArea` does (MOD-84 D6). A few walks are
 //! other operations and keep their own loop over the two measures above: the text widgets' cursor
 //! windows, `path_picker`'s cut from the left and its word wrap (which keeps controls raw; out of
@@ -36,7 +37,7 @@ use std::borrow::Cow;
 use std::iter;
 
 use ratatui::style::Style;
-use ratatui::text::Span;
+use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation as _;
 use unicode_width::UnicodeWidthStr;
 
@@ -359,6 +360,18 @@ pub(crate) fn clip_spans(spans: &[Span<'_>], width: usize) -> Vec<Span<'static>>
     out
 }
 
+/// `line` cut to at most `width` cells by [`clip_spans`]: span by span, styles kept, the last kept
+/// span ending in [`ELLIPSIS`] when anything was cut (MOD-67 M6 T2, the shell's hint row). The
+/// line's own style and alignment are kept.
+#[must_use]
+pub(crate) fn clip_line(line: Line<'_>, width: u16) -> Line<'static> {
+    let spans = clip_spans(&line.spans, usize::from(width));
+    let mut clipped = Line::from(spans);
+    clipped.style = line.style;
+    clipped.alignment = line.alignment;
+    clipped
+}
+
 /// Columns between tab stops: `TextArea`'s, so a `\t` reads in the Notes thread and in an item
 /// body's code as it did in the compose area (MOD-13 review L2, MOD-84 D6).
 pub(crate) const TAB_STOP: usize = 4;
@@ -391,6 +404,34 @@ mod tests {
     use super::*;
     use ratatui::style::{Color, Modifier};
     use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+    /// MOD-67 M6 T2: the hint row's cut keeps each span's style and ends in the mark.
+    #[test]
+    fn clip_line_cuts_span_by_span_and_keeps_the_styles() {
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let dim = Style::default().fg(Color::DarkGray);
+        let line = Line::from(vec![
+            Span::styled("j/k move", bold),
+            Span::styled(" · e edit", dim),
+        ]);
+        let whole = clip_line(line.clone(), 40);
+        assert_eq!(
+            whole.spans,
+            vec![
+                Span::styled("j/k move", bold),
+                Span::styled(" · e edit", dim)
+            ]
+        );
+        let cut = clip_line(line.clone(), 12);
+        assert_eq!(
+            cut.spans,
+            vec![Span::styled("j/k move", bold), Span::styled(" · …", dim)]
+        );
+        assert_eq!(cut.width(), 12);
+        let mid = clip_line(line, 5);
+        assert_eq!(mid.spans, vec![Span::styled("j/k …", bold)]);
+        assert!(clip_line(Line::from("abc"), 0).spans.is_empty());
+    }
 
     #[test]
     fn ascii_and_the_widgets_own_glyphs_are_one_cell() {

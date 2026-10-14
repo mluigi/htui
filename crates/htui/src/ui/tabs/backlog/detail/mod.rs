@@ -28,7 +28,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{Ctx, Handled};
 use crate::editor::ExternalEditOutcome;
-use crate::keys::{Act, Stack, views};
+use crate::keys::{Act, Keys, Stack, views};
 use crate::store_worker::StoreReply;
 use crate::ui::Theme;
 use crossterm::event::{KeyEvent, MouseEvent};
@@ -139,6 +139,12 @@ pub trait DetailTab {
     fn key_stack(&self) -> Stack<'static> {
         views::BACKLOG_BODY
     }
+    /// The keys of this pane's current mode for the Backlog's part of the shell's hint row
+    /// (MOD-67 M6 T2), through [`key_stack`](DetailTab::key_stack). Defaulted to `None` (Body and
+    /// Prompt, which have no key line of their own).
+    fn key_hint(&self, _keys: &Keys, _theme: &Theme) -> Option<Line<'static>> {
+        None
+    }
 }
 
 /// The sub-tabs of the detail pane, in registration order, plus which one is active.
@@ -203,6 +209,12 @@ impl DetailRegistry {
     pub fn key_stack(&self) -> Stack<'static> {
         self.active()
             .map_or(views::BACKLOG_BODY, DetailTab::key_stack)
+    }
+
+    /// The active sub-tab's [`DetailTab::key_hint`], `None` while the registry is empty.
+    #[must_use]
+    pub fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
+        self.active().and_then(|tab| tab.key_hint(keys, theme))
     }
 
     /// Activates the sub-tab at `idx`. `false` (and no change) when the index is out of range.

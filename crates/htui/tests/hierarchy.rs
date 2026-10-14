@@ -2539,14 +2539,9 @@ async fn the_report_notice_names_what_was_not_inferred() {
             },
         );
         let frame = bench.render_section(&section, 250);
-        let hint = frame
-            .lines()
-            .find(|row| row.contains("j/k"))
-            .unwrap_or_else(|| panic!("the hint row is drawn: {frame}"));
-        assert!(
-            hint.trim_end().ends_with(&format!("\u{b7} {expected}")),
-            "{report:?} reads `{expected}`: {hint}"
-        );
+        // The section's last row: the notice alone, the keys being the shell's (MOD-67 M6 T2).
+        let notice = frame.lines().nth(29).unwrap_or_default().trim_end();
+        assert_eq!(notice, expected, "{report:?} reads `{expected}`: {frame}");
     }
 }
 
@@ -3239,5 +3234,141 @@ async fn a_rebound_yes_is_the_one_key_the_warning_names() {
     assert!(
         frame.contains("Enter confirm"),
         "`Y` continued to the typed stage: {frame}"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// MOD-67 M6 (lane L-B): the directory picker dispatches through `views::HIERARCHY_PICKER`, and
+// the section's key-naming sentences name the keys in force.
+// -------------------------------------------------------------------------------------------
+
+/// Keys loaded from a key file holding `body` after its version line.
+fn keys_from(body: &str) -> htui::keys::Keys {
+    htui::keys::load_str(&format!("version = 1\n{body}")).expect("the key file loads")
+}
+
+/// MOD-67 M6 D3: `[picker] open = "o"` and `parent = "u"` move the picker on their new chords,
+/// `Enter` lists nothing any more, and the popup's hint names the new keys.
+#[tokio::test]
+async fn a_rebound_picker_key_opens_a_directory() {
+    let bench = SectionBench::new()
+        .await
+        .with_keys(keys_from("[picker]\nopen = \"o\"\nparent = \"u\"\n"));
+    let backend = demo();
+    let tree = with_root(tree_with_two_repos(&backend).await, "/work");
+    let mut section = picker_section(&bench, tree, Some("/home/u"));
+
+    // Workspace, project, `alpha`.
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "b");
+    assert_eq!(listings(&bench.drained()), [("/work".to_owned(), false)]);
+    bench.reply(&mut section, &dirs("/work", &[("core", false)], 0));
+
+    bench.key(&mut section, "o");
+    assert_eq!(
+        listings(&bench.drained()),
+        [("/work/core".to_owned(), false)]
+    );
+    bench.reply(&mut section, &dirs("/work/core", &[("src", false)], 0));
+    bench.key(&mut section, "u");
+    assert_eq!(listings(&bench.drained()), [("/work".to_owned(), false)]);
+    bench.reply(&mut section, &dirs("/work", &[("core", false)], 0));
+
+    assert_eq!(bench.key(&mut section, "enter"), Handled::Consumed);
+    assert!(bench.drained().is_empty(), "`Enter` opens nothing now");
+    assert!(section.captures_input(), "the picker is still open");
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("o open \u{b7} u up"), "{frame}");
+}
+
+/// MOD-67 M6 D4: `[settings.hierarchy] new_workspace = "W"`: with no workspace the rows pane and
+/// the refusal both name `W`, `W` opens the editor and `N` is inert.
+#[tokio::test]
+async fn a_rebound_new_workspace_key_is_the_one_the_empty_tree_names() {
+    let bench = SectionBench::new()
+        .await
+        .with_keys(keys_from("[settings.hierarchy]\nnew_workspace = \"W\"\n"));
+    let mut section = HierarchySection::new();
+    bench.reply(&mut section, &StoreReply::Hierarchy(None));
+    let _ = bench.drained();
+
+    bench.key(&mut section, "e");
+    let frame = bench.render_section(&section, 100);
+    let sentence = "no workspace \u{2014} `W` creates one";
+    assert_eq!(
+        frame.matches(sentence).count(),
+        2,
+        "the rows pane and the refusal name `W`: {frame}"
+    );
+    assert!(!frame.contains("`N`"), "{frame}");
+
+    assert_eq!(bench.key(&mut section, "N"), Handled::Pass);
+    assert!(!section.captures_input(), "`N` opens nothing now");
+    bench.key(&mut section, "W");
+    assert!(section.captures_input(), "`W` opens the workspace editor");
+}
+
+/// MOD-67 M6 D4: `[settings.hierarchy] primary = "P"`: a `HierarchyStale` answering `P` says to
+/// press `P` again.
+#[tokio::test]
+async fn a_rebound_primary_key_is_named_after_a_stale_write() {
+    let bench = SectionBench::new()
+        .await
+        .with_keys(keys_from("[settings.hierarchy]\nprimary = \"P\"\n"));
+    let backend = demo();
+    let tree = tree_with_two_repos(&backend).await;
+    let mut section = picker_section(&bench, tree.clone(), None);
+
+    // Workspace, project, `alpha`, `beta`.
+    for _ in 0..3 {
+        bench.key(&mut section, "j");
+    }
+    bench.key(&mut section, "P");
+    let emitted = bench.drained();
+    assert!(
+        matches!(
+            emitted.as_slice(),
+            [Action::Store(StoreRequest::UpdateRepo { .. })]
+        ),
+        "`P` moves the primary: {emitted:?}"
+    );
+    bench.reply(&mut section, &StoreReply::HierarchyStale(Box::new(tree)));
+
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("reloaded; press P again"), "{frame}");
+    assert!(!frame.contains("press p again"), "{frame}");
+}
+
+/// MOD-49 D15 through the picker's stack (MOD-67 M6 D3): `q` is no picker key and is swallowed,
+/// so the app keeps running with the picker open; `F1` passes to the shell, whose help box lists
+/// the picker's keys.
+#[tokio::test]
+async fn f1_over_the_picker_opens_help_and_q_does_not_quit() {
+    let mut harness = hierarchy_over(MemStore::demo()).await;
+    harness.key("b");
+    harness.settle().await;
+    assert!(harness.render().contains("j/k move"), "the picker is open");
+
+    harness.key("q");
+    harness.settle().await;
+    assert!(!harness.app().should_quit, "`q` can't quit mid-pick");
+    let frame = harness.render();
+    assert!(
+        frame.contains("j/k move"),
+        "the picker is still open: {frame}"
+    );
+
+    harness.key("f1");
+    let frame = harness.render();
+    assert!(frame.contains("F1 closes this box"), "{frame}");
+    assert!(frame.contains("Picker: Enter/l open directory"), "{frame}");
+
+    harness.key("f1");
+    let frame = harness.render();
+    assert!(!frame.contains("F1 closes this box"), "{frame}");
+    assert!(
+        frame.contains("j/k move"),
+        "the picker is still open: {frame}"
     );
 }

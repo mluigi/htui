@@ -29,6 +29,6 @@ Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-│i compose the first prompt · a next agent                                                         │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
+i compose the first prompt · a next agent
 chat_start: no agent runtime in this harness

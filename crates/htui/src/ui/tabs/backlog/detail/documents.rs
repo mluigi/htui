@@ -52,14 +52,14 @@ use ratatui::widgets::{Cell, Paragraph, Row, Table};
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::ExternalEditOutcome;
 use crate::hand_written::{DOCUMENT_FORM_NAME, HandText, WRITE_DOCUMENT_NAME, write_refused};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
-use crate::ui::cells;
+use crate::ui::Theme;
 use crate::ui::tabs::backlog::detail::compose::{
     self, Compose, ComposeOutcome, could_not_check, may_have_landed, not_written,
 };
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Scroll, message};
-use crate::ui::tabs::settings::wrapped;
+use crate::ui::tabs::settings::{key_line, wrapped};
 use crossterm::event::KeyEvent;
 
 /// Written by a run step.
@@ -267,7 +267,9 @@ impl DocumentsTab {
     }
 
     /// Review M1, round 2: the kind's checked version after a hedge settles it ([`Settled`]).
-    fn settle_hedge(&mut self, latest: Option<&Document>) {
+    ///
+    /// The sentence names the save key `keys` binds in the area's stack (MOD-67 M6 D4).
+    fn settle_hedge(&mut self, latest: Option<&Document>, keys: &Keys) {
         let Some(hedged) = self.hedged.take() else {
             return;
         };
@@ -284,10 +286,11 @@ impl DocumentsTab {
             }
             outcome => {
                 if let Some(compose) = self.compose.as_mut() {
+                    let save = keys.label(compose.stack(), Act::FormSave);
                     compose.settle(Some(if outcome == Settled::CannotTell {
-                        cannot_tell(&hedged.why)
+                        cannot_tell(&hedged.why, save.as_deref())
                     } else {
-                        not_written(&hedged.why)
+                        not_written(&hedged.why, save.as_deref())
                     }));
                 }
             }
@@ -396,13 +399,18 @@ fn settled(hedged: &Hedged, latest: Option<&Document>) -> Settled {
 }
 
 /// Review round 2: the hedge's sentence when the checked version is another user's, past the
-/// expected one, and this write may lie below it.
+/// expected one, and this write may lie below it. `save` is `FormSave`'s label through
+/// `DOCS_COMPOSE` (MOD-67 M6 D4); with none bound the clause goes.
 #[must_use]
-fn cannot_tell(why: &str) -> String {
-    format!(
+fn cannot_tell(why: &str, save: Option<&str>) -> String {
+    let hidden = format!(
         "{why} \u{2014} it may have been written; a newer version by someone else hides it from \
-         the check, so Ctrl+S may write it twice"
-    )
+         the check"
+    );
+    match save {
+        Some(save) => format!("{hidden}, so {save} may write it twice"),
+        None => hidden,
+    }
 }
 
 /// D5: what a landed `WriteDocument` says under the table. `landed` past `expected` means
@@ -501,9 +509,9 @@ impl DetailTab for DocumentsTab {
         self.compose.is_some()
     }
 
-    fn on_external_edit(&mut self, outcome: ExternalEditOutcome, _ctx: &mut Ctx<'_>) {
+    fn on_external_edit(&mut self, outcome: ExternalEditOutcome, ctx: &mut Ctx<'_>) {
         match self.compose.as_mut() {
-            Some(compose) => compose.on_external_edit(outcome),
+            Some(compose) => compose.on_external_edit(outcome, ctx.keys()),
             None => tracing::debug!("no document compose area to take the $EDITOR outcome"),
         }
     }
@@ -532,7 +540,7 @@ impl DetailTab for DocumentsTab {
                             .is_none_or(|base| base.kind == hedged.kind)
                     }) =>
             {
-                self.settle_hedge(context.base.as_ref());
+                self.settle_hedge(context.base.as_ref(), ctx.keys());
             }
             StoreReply::DocumentForm(context)
                 if matches!(&self.opening, Some((item, _)) if *item == context.item)
@@ -582,7 +590,8 @@ impl DetailTab for DocumentsTab {
             StoreReply::Failed { request, .. } if *request == DOCUMENT_FORM_NAME => {
                 self.opening = None;
                 if let (Some(hedged), Some(compose)) = (self.hedged.take(), self.compose.as_mut()) {
-                    compose.settle(Some(could_not_check(&hedged.why, "list")));
+                    let save = ctx.keys().label(compose.stack(), Act::FormSave);
+                    compose.settle(Some(could_not_check(&hedged.why, "list", save.as_deref())));
                 }
             }
             StoreReply::Failed { request, message } if *request == WRITE_DOCUMENT_NAME => {
@@ -592,19 +601,22 @@ impl DetailTab for DocumentsTab {
         }
     }
 
+    /// The compose area's keys while it is open, else `HINT` (MOD-67 M6 T2); nothing with no
+    /// item selected.
+    fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
+        let hint = match &self.compose {
+            Some(compose) => compose.key_hint(keys),
+            None if self.item.is_none() => return None,
+            None => keys.hint(views::BACKLOG_DOCS, HINT),
+        };
+        key_line(hint, theme)
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         if let Some(compose) = &self.compose {
             let title = self.compose_title(compose);
             let kinds = self.kinds();
-            let body = compose::render(
-                frame,
-                area,
-                compose,
-                &title,
-                Some(&kinds),
-                ctx.keys(),
-                ctx.theme,
-            );
+            let body = compose::render(frame, area, compose, &title, Some(&kinds), ctx.theme);
             ctx.claim_editor_area(body);
             return;
         }
@@ -612,30 +624,16 @@ impl DetailTab for DocumentsTab {
             message(frame, area, "No item selected.", ctx.theme);
             return;
         }
-        // D5's sentence under the table; with none the table keeps the rect above the hint (E5).
+        // D5's sentence under the table; with none the table keeps the whole rect (E5).
         let notice = self
             .notice
             .as_deref()
             .map(|sentence| wrapped(sentence, usize::from(area.width)))
             .unwrap_or_default();
         let height = u16::try_from(notice.len()).unwrap_or(u16::MAX);
-        // D11: the browse hint takes the last row, under the table and the notice.
-        let [table, below, hint] = Layout::vertical([
-            Constraint::Min(0),
-            Constraint::Length(height),
-            Constraint::Length(1),
-        ])
-        .areas(area);
-        frame.render_widget(
-            Line::styled(
-                cells::clip(
-                    &ctx.keys().hint(views::BACKLOG_DOCS, HINT),
-                    usize::from(hint.width),
-                ),
-                ctx.theme.dim,
-            ),
-            hint,
-        );
+        // D11's browse hint is the shell's hint row since MOD-67 M6 T2 (`key_hint`).
+        let [table, below] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(height)]).areas(area);
         if self.documents.is_empty() {
             message(frame, table, "No documents for this item.", ctx.theme);
         } else {
@@ -678,12 +676,32 @@ mod tests {
     /// The browse hint as the default keys draw it (MOD-67 M5: `super::HINT` is a spec).
     const HINT: &str = "J/K move \u{b7} a new \u{b7} v new version";
 
+    /// MOD-67 M6 D4: the compose hedges name the save key in force through `DOCS_COMPOSE`, and
+    /// drop it unbound.
+    #[test]
+    fn a_rebound_save_key_is_named_by_the_compose_hedges() {
+        let keys = crate::keys::load_str("version = 1\n[form]\nsave = \"f2\"\n").expect("loads");
+        let save = keys.label(views::DOCS_COMPOSE, Act::FormSave);
+        assert_eq!(save.as_deref(), Some("F2"));
+        assert!(not_written("boom", save.as_deref()).ends_with("F2 tries again"));
+        assert!(cannot_tell("boom", save.as_deref()).ends_with("so F2 may write it twice"));
+        assert!(
+            could_not_check("boom", "list", save.as_deref()).ends_with("F2 may write it twice")
+        );
+        assert_eq!(
+            not_written("boom", None),
+            "boom \u{2014} the re-read shows it was not written"
+        );
+        assert!(cannot_tell("boom", None).ends_with("hides it from the check"));
+        assert!(could_not_check("boom", "list", None).ends_with("could not be re-read to check"));
+    }
+
     /// MOD-67 M5: the spec renders today's text under the default keys, and a rebound
     /// `new_version`.
     #[test]
     fn the_hint_renders_through_the_docs_stack() {
         let stack = views::BACKLOG_DOCS;
-        assert_eq!(crate::keys::Keys::compiled().hint(stack, super::HINT), HINT);
+        assert_eq!(Keys::compiled().hint(stack, super::HINT), HINT);
         let keys = crate::keys::load_str("version = 1\n[backlog.docs]\nnew_version = \"V\"\n")
             .expect("loads");
         assert_eq!(
@@ -896,7 +914,10 @@ mod tests {
         let text = drawn(43, 23, |frame, rect| {
             pane.render(frame, rect, &shell.ctx().with_editor_area(&cell));
         });
-        assert!(text.contains(HINT), "the table is drawn:\n{text}");
+        assert!(
+            text.contains("kind     ver by"),
+            "the table is drawn:\n{text}"
+        );
         assert_eq!(cell.get(), None, "the table claims nothing");
 
         open(&shell, &backend, &mut pane, 'v').await;
@@ -911,7 +932,7 @@ mod tests {
             pane.render(frame, rect, &shell.ctx().with_editor_area(&cell));
         });
         let claimed = cell.get().expect("the form claims its body");
-        assert_eq!(claimed, Rect::new(0, 4, 43, 18));
+        assert_eq!(claimed, Rect::new(0, 4, 43, 19));
         assert!(
             row_from(&text, claimed).starts_with(&first),
             "{first:?} at {claimed:?} in\n{text}"
@@ -1301,7 +1322,7 @@ mod tests {
         checked(&shell, &store, &backend, &mut pane).await;
         assert_eq!(
             compose(&pane).notice(),
-            Some(not_written(&message).as_str())
+            Some(not_written(&message, Some("Ctrl+s")).as_str())
         );
         assert_eq!(compose(&pane).busy(), None);
         assert!(compose(&pane).body().starts_with("Edited by hand.\n"));
@@ -1327,7 +1348,7 @@ mod tests {
         assert!(pane.notice.is_none(), "{:?}", pane.notice);
         assert_eq!(
             compose(&pane).notice(),
-            Some(not_written(&message).as_str())
+            Some(not_written(&message, Some("Ctrl+s")).as_str())
         );
         assert_eq!(compose(&pane).busy(), None);
         assert!(compose(&pane).body().starts_with("Edited by hand.\n"));
@@ -1365,7 +1386,7 @@ mod tests {
         assert!(pane.notice.is_none());
         assert_eq!(
             compose(&pane).notice(),
-            Some(cannot_tell(&message).as_str())
+            Some(cannot_tell(&message, Some("Ctrl+s")).as_str())
         );
         assert_eq!(compose(&pane).busy(), None);
         assert!(compose(&pane).body().starts_with("Edited by hand.\n"));
@@ -1438,7 +1459,7 @@ mod tests {
         assert_eq!(compose(&pane).busy(), None);
         assert_eq!(
             compose(&pane).notice(),
-            Some(could_not_check(&message, "list").as_str())
+            Some(could_not_check(&message, "list", Some("Ctrl+s")).as_str())
         );
         assert!(compose(&pane).body().starts_with("Edited by hand.\n"));
 
@@ -1479,7 +1500,7 @@ mod tests {
         assert_eq!(compose(&pane).busy(), None);
         assert_eq!(
             compose(&pane).notice(),
-            Some(could_not_check(&message, "list").as_str())
+            Some(could_not_check(&message, "list", Some("Ctrl+s")).as_str())
         );
     }
 
@@ -1631,30 +1652,34 @@ mod tests {
 
     #[test]
     fn the_hint_fits_the_detail_pane() {
-        assert!(cells::cell_width(HINT) <= 43, "{HINT}");
+        assert!(crate::ui::cells::cell_width(HINT) <= 43, "{HINT}");
     }
 
-    /// D11: with an item and no form, the last row is the hint, under the table and under D5's
-    /// notice, or under an empty list; with no item there is none.
+    /// D11, MOD-67 M6 T2: with an item and no form the keys are [`HINT`], the shell's hint row,
+    /// over the table, D5's notice or an empty list, and the pane draws none of it (the notice is
+    /// its last row); with no item there are none, and an open form has its own.
     #[tokio::test]
-    async fn the_hint_is_drawn_under_the_table() {
+    async fn the_keys_are_the_hint_row_s_and_the_notice_is_last() {
         let shell = Shell::new();
         let (store, backend) = demo();
         let mut pane = pane(&shell, &store).await;
+        let keys = |pane: &DocumentsTab| {
+            pane.key_hint(Keys::compiled(), &Theme::default())
+                .map(|line| line.to_string())
+        };
         let text = drawn(43, 23, |frame, rect| pane.render(frame, rect, &shell.ctx()));
-        let rows: Vec<&str> = text.lines().collect();
-        assert_eq!(rows[22].trim_end(), HINT, "{text}");
-        assert_eq!(text.matches(HINT).count(), 1, "{text}");
+        assert_eq!(keys(&pane).as_deref(), Some(HINT));
+        assert!(!text.contains(HINT), "{text}");
 
-        // With D5's notice the hint is still last, and the notice sits right above it.
+        // D5's notice takes the pane's last row.
         let request = saving_v(&shell, &backend, &mut pane).await;
         let reply = served(&backend, &request).await;
         pane.on_reply(&reply, &mut shell.ctx());
         assert!(!pane.captures_input(), "the form closed");
         let text = drawn(43, 23, |frame, rect| pane.render(frame, rect, &shell.ctx()));
         let rows: Vec<&str> = text.lines().collect();
-        assert_eq!(rows[22].trim_end(), HINT, "{text}");
-        assert_eq!(rows[21].trim_end(), "saved as plan v3", "{text}");
+        assert_eq!(rows[22].trim_end(), "saved as plan v3", "{text}");
+        assert_eq!(keys(&pane).as_deref(), Some(HINT));
 
         let mut empty = DocumentsTab::new();
         empty.on_item_change(Some(ITEM));
@@ -1663,17 +1688,19 @@ mod tests {
             empty.render(frame, rect, &shell.ctx())
         });
         assert!(text.contains("No documents for this item."), "{text}");
-        assert_eq!(text.lines().last().map(str::trim_end), Some(HINT), "{text}");
+        assert_eq!(keys(&empty).as_deref(), Some(HINT));
 
         let mut none = DocumentsTab::new();
         none.on_item_change(None);
-        let text = drawn(43, 23, |frame, rect| none.render(frame, rect, &shell.ctx()));
-        assert!(!text.contains(HINT), "{text}");
+        assert_eq!(keys(&none), None);
 
         // The landed write re-read the list.
         let _ = taken(&shell);
         open(&shell, &backend, &mut pane, 'a').await;
-        let text = drawn(43, 23, |frame, rect| pane.render(frame, rect, &shell.ctx()));
-        assert!(!text.contains(HINT), "{text}");
+        assert_eq!(
+            keys(&pane),
+            Some(compose(&pane).key_hint(Keys::compiled())),
+            "the form's own keys"
+        );
     }
 }

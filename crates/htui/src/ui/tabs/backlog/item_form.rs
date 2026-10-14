@@ -40,7 +40,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::divergence::{Divergence, ViewOutcome, rebased_on, still_behind};
 use crate::editor::{
-    EDITED, ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, strip_added_newline,
+    ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, edited, strip_added_newline,
     without_controls,
 };
 use crate::item_writes::{ItemDivergence, ItemFormContext};
@@ -53,24 +53,24 @@ use crate::ui::{FieldOutcome, TextArea, TextField, Theme};
 /// Lines `PageUp`/`PageDown` move in the paths and body areas.
 pub const PAGE: u16 = 5;
 
-/// The hint under a text field, through the form's stack (`Tab field · Ctrl+s save · Esc
-/// cancel` under the defaults). It fits the detail pane's inner width at 100x30 (43 columns).
+/// The shell's hint row on a text field, through the form's stack (`Tab field · Ctrl+s save · Esc
+/// cancel` under the defaults).
 pub const HINT_TEXT: HintSpec = &[
     Hint::One(Act::FormNextField, "field"),
     Hint::One(Act::FormSave, "save"),
     Hint::Text("Esc cancel"),
 ];
 
-/// The hint under a picker: its value keys are the picker's own (MOD-67 M5, fixed). It fits the
-/// detail pane's inner width at 100x30 (43 columns).
+/// The shell's hint row on a picker: its value keys are the picker's own (MOD-67 M5, fixed).
 pub const HINT_PICK: HintSpec = &[
     Hint::Text("\u{2190}/\u{2192} choose"),
     Hint::One(Act::FormNextField, "field"),
     Hint::Text("Esc cancel"),
 ];
 
-/// The hint under the paths and body areas (milestone 4 D7): 41 columns against the detail
-/// pane's 43 under the defaults, so `Tab field` gives way to Ctrl+E (Tab still cycles).
+/// The shell's hint row on the paths and body areas (milestone 4 D7): Ctrl+E in place of `Tab
+/// field`, which still cycles. Milestone 4 cut it to fit the detail pane; the row it now takes is
+/// the terminal's width (MOD-67 M6 T2), but the compose hints share it and their snapshots pin it.
 pub const HINT_AREA: HintSpec = &[
     Hint::One(Act::FormExternalEditor, "$EDITOR"),
     Hint::One(Act::FormSave, "save"),
@@ -186,7 +186,7 @@ pub struct ItemForm {
     focus: Field,
     /// A read or write in flight.
     busy: Option<Busy>,
-    /// The last refusal or reply, above the hint.
+    /// The last refusal or reply, on the form's last rows.
     notice: Option<String>,
     /// The revision reason a save sends: `Edited`, or `DivergenceResolution` once rebased
     /// (milestone 3 D6).
@@ -345,10 +345,15 @@ impl ItemForm {
     /// D5: the form rebased on the head after `m`/`t`. `opened` holds the head's texts, so A4's
     /// "unchanged keeps the stored value" now means "unchanged from the head"; the widgets hold
     /// `resolved`'s texts; kind and graph are `resolved`'s; the token is `head.version`; the reason
-    /// `DivergenceResolution`; focus Title; the notice `rebased_on(head.version)`. `None` when
-    /// `context.item` is `None` (`open_edit`'s rule).
+    /// `DivergenceResolution`; focus Title; the notice `rebased_on(head.version, save)`, `save` the
+    /// form's save key as `keys` binds it (MOD-67 M6 D4). `None` when `context.item` is `None`
+    /// (`open_edit`'s rule).
     #[must_use]
-    pub fn open_resolution(context: ItemFormContext, resolved: &ItemSpec) -> Option<Self> {
+    pub fn open_resolution(
+        context: ItemFormContext,
+        resolved: &ItemSpec,
+        keys: &Keys,
+    ) -> Option<Self> {
         let head = context.item.as_ref()?;
         let (opened, version) = (Texts::of(&ItemSpec::of(head)), head.version);
         let mut form = Self::build(
@@ -360,7 +365,10 @@ impl ItemForm {
             &Texts::of(resolved),
         );
         form.reason = EditReason::DivergenceResolution;
-        form.notice = Some(rebased_on(version));
+        form.notice = Some(rebased_on(
+            version,
+            keys.label(views::ITEM_FORM, Act::FormSave).as_deref(),
+        ));
         Some(form)
     }
 
@@ -504,11 +512,11 @@ impl ItemForm {
 
     /// D4: the `$EDITOR` handoff came back. No field out (`external` is `None`): ignored.
     /// `Edited` replaces only the handed-out field's text (control characters dropped, then D5),
-    /// puts the cursor at its end, focuses it and says `EDITED`;
+    /// puts the cursor at its end, focuses it and says `edited`, naming `keys`' save key (MOD-67 M6);
     /// the token, reason, `opened` and every other field are untouched, so A4's "unchanged" still
     /// compares against what the form opened with. `Unchanged` says `NO_CHANGES` (+ `WAIT_FLAG`
     /// when quick); `Failed` says its sentence; neither touches the text.
-    pub fn on_external_edit(&mut self, outcome: ExternalEditOutcome) {
+    pub fn on_external_edit(&mut self, outcome: ExternalEditOutcome, keys: &Keys) {
         let Some(field) = self.external.take() else {
             return;
         };
@@ -532,7 +540,9 @@ impl ItemForm {
                     // Review L4: at the end, so a long body's edited tail is what the area shows.
                     area.set_cursor(usize::MAX);
                     self.focus = field;
-                    self.notice = Some(EDITED.to_owned());
+                    self.notice = Some(edited(
+                        keys.label(views::ITEM_FORM, Act::FormSave).as_deref(),
+                    ));
                 }
             }
             ExternalEditOutcome::Unchanged { quick } => {
@@ -702,14 +712,17 @@ impl ItemForm {
             ViewOutcome::Stay => ItemFormOutcome::Stay,
             ViewOutcome::Pass => ItemFormOutcome::Pass,
             ViewOutcome::Back => {
-                self.notice = Some(still_behind(view.head_version()));
+                self.notice = Some(still_behind(
+                    view.head_version(),
+                    keys.label(views::ITEM_FORM, Act::FormSave).as_deref(),
+                ));
                 self.resolving = None;
                 ItemFormOutcome::Stay
             }
             ViewOutcome::Resolve(side) => {
                 if let Some(view) = self.resolving.take() {
                     let (context, resolved) = view.resolve(side);
-                    if let Some(form) = Self::open_resolution(context, &resolved) {
+                    if let Some(form) = Self::open_resolution(context, &resolved, keys) {
                         *self = form;
                     }
                 }
@@ -1013,18 +1026,26 @@ pub(super) const fn marker(focused: bool) -> &'static str {
     if focused { "> " } else { "  " }
 }
 
+impl ItemForm {
+    /// The focused field's keys for the shell's hint row (MOD-67 M5 D9, M6 T2), through
+    /// [`views::ITEM_FORM`]: the pickers', the one-line fields' or the text areas'.
+    #[must_use]
+    pub fn key_hint(&self, keys: &Keys) -> String {
+        let spec = match self.focus {
+            Field::Project | Field::Kind | Field::Graph => HINT_PICK,
+            Field::Title | Field::Priority | Field::Tags => HINT_TEXT,
+            Field::Paths | Field::Body => HINT_AREA,
+        };
+        keys.hint(views::ITEM_FORM, spec)
+    }
+}
+
 /// Draws the form into the detail pane's `area` (D8).
 ///
 /// Returns the rect the pane claims for an in-pane editor (MOD-57 P2): the field handed to
 /// `$EDITOR`, else the focused one when it is Paths, else the body. The paths rect is
 /// `PATHS_HEIGHT` rows, under `MIN_PANE`, so a Paths edit gets the whole tab body (R0 F1).
-pub fn render(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    form: &ItemForm,
-    keys: &Keys,
-    theme: &Theme,
-) -> Rect {
+pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme) -> Rect {
     let title = match &form.context.item {
         Some(item) => format!(" Edit {} (v{}) ", item.key, item.version),
         None => format!(" New item \u{b7} {} ", form.slug(form.context.project)),
@@ -1048,11 +1069,11 @@ pub fn render(
         .as_deref()
         .map(|sentence| wrapped(sentence, usize::from(inner.width)))
         .unwrap_or_default();
-    // Every row but the body and the notice: the one-line rows, the paths and their label, the
-    // body label and the hint.
+    // Every row but the body and the notice: the one-line rows, the paths and their label, and
+    // the body label (the keys are the shell's hint row since MOD-67 M6 T2).
     let fixed = u16::try_from(rows.len())
         .unwrap_or(u16::MAX)
-        .saturating_add(PATHS_HEIGHT + 3);
+        .saturating_add(PATHS_HEIGHT + 2);
     // The notice grows into the body's rows when it has to (a small terminal), and a notice
     // longer than all of them loses its first rows: the D11 hedge ends the sentence, and it is
     // what stops a second Ctrl+S from minting a duplicate.
@@ -1070,7 +1091,6 @@ pub fn render(
         Constraint::Length(1),
         Constraint::Min(body_min),
         Constraint::Length(notice_height),
-        Constraint::Length(1),
     ]);
     let areas = Layout::vertical(constraints).split(inner);
     let width = inner.width;
@@ -1078,8 +1098,8 @@ pub fn render(
         frame.render_widget(Paragraph::new(form.row_line(*field, width, theme)), *at);
     }
     let rest = &areas[rows.len()..];
-    let [paths_label, paths, body_label, body, notice, hint] =
-        [rest[0], rest[1], rest[2], rest[3], rest[4], rest[5]];
+    let [paths_label, paths, body_label, body, notice] =
+        [rest[0], rest[1], rest[2], rest[3], rest[4]];
     let label = |field: Field, text: &str| {
         let focused = form.focus == field;
         let style = if focused { theme.title } else { theme.dim };
@@ -1118,32 +1138,22 @@ pub fn render(
         ),
         notice,
     );
-    let spec = match form.focus {
-        Field::Project | Field::Kind | Field::Graph => HINT_PICK,
-        Field::Title | Field::Priority | Field::Tags => HINT_TEXT,
-        Field::Paths | Field::Body => HINT_AREA,
-    };
-    let text = keys.hint(views::ITEM_FORM, spec);
-    frame.render_widget(
-        Paragraph::new(Line::styled(
-            cells::clip(&text, usize::from(width)),
-            theme.dim,
-        )),
-        hint,
-    );
     match form.external.unwrap_or(form.focus) {
         Field::Paths => paths,
         _ => body,
     }
 }
 
-/// D11: a mint's `Failed` that may have followed a COMMIT whose answer was lost.
+/// D11: a mint's `Failed` that may have followed a COMMIT whose answer was lost. `save` is
+/// `FormSave`'s label through `ITEM_FORM`, the form that stays open (MOD-67 M6 D4); with none
+/// bound the sentence says to look first.
 #[must_use]
-pub fn mint_may_have_landed(why: &str) -> String {
-    format!(
-        "{why} \u{2014} it may have been written; the list is being re-read, look for it before \
-         Ctrl+S"
-    )
+pub fn mint_may_have_landed(why: &str, save: Option<&str>) -> String {
+    let hedge = format!("{why} \u{2014} it may have been written; the list is being re-read");
+    match save {
+        Some(save) => format!("{hedge}, look for it before {save}"),
+        None => format!("{hedge}, look for it first"),
+    }
 }
 
 /// Review L4: the same hedge for a mint whose form a scope change closed. Nothing is re-read and
@@ -1520,10 +1530,10 @@ mod tests {
             assert_eq!(form.busy(), Some(Busy::Minting), "{field:?}");
         }
         let form = new_form().await;
-        let text = drawn_with(&form, &keys).join("\n");
+        let hint = form.key_hint(&keys);
         assert!(
-            text.contains("Tab field \u{b7} F2 save \u{b7} Esc cancel"),
-            "{text}"
+            hint.contains("Tab field \u{b7} F2 save \u{b7} Esc cancel"),
+            "{hint}"
         );
     }
 
@@ -1699,18 +1709,8 @@ mod tests {
         drawn_at(form, DEFAULT_SIZE)
     }
 
-    /// [`drawn`] under `keys`.
-    fn drawn_with(form: &ItemForm, keys: &Keys) -> Vec<String> {
-        drawn_under(form, DEFAULT_SIZE, keys)
-    }
-
     /// The form drawn into the detail pane of a `(width, height)` terminal, one string per row.
-    fn drawn_at(form: &ItemForm, size: (u16, u16)) -> Vec<String> {
-        drawn_under(form, size, Keys::compiled())
-    }
-
-    /// [`drawn_at`] under `keys`.
-    fn drawn_under(form: &ItemForm, (width, height): (u16, u16), keys: &Keys) -> Vec<String> {
+    fn drawn_at(form: &ItemForm, (width, height): (u16, u16)) -> Vec<String> {
         let [_, right] = panes(chrome(Rect::new(0, 0, width, height)).body);
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
             right.width,
@@ -1719,7 +1719,7 @@ mod tests {
         .expect("a test terminal");
         terminal
             .draw(|frame| {
-                render(frame, frame.area(), form, keys, &Theme::default());
+                render(frame, frame.area(), form, &Theme::default());
             })
             .expect("the frame draws");
         let buffer = terminal.backend().buffer();
@@ -1749,13 +1749,7 @@ mod tests {
         let mut body = None;
         terminal
             .draw(|frame| {
-                body = Some(render(
-                    frame,
-                    frame.area(),
-                    &form,
-                    Keys::compiled(),
-                    &Theme::default(),
-                ));
+                body = Some(render(frame, frame.area(), &form, &Theme::default()));
             })
             .expect("the frame draws");
         let body = body.expect("the frame drew");
@@ -1772,8 +1766,9 @@ mod tests {
             "{:?}",
             row(body.y - 1)
         );
-        // The notice's two rows, the hint and the frame's bottom border are below it.
-        assert_eq!(body.bottom() + NOTICE_HEIGHT + 2, right.height, "{body:?}");
+        // The notice's two rows and the frame's bottom border are below it (the keys are the
+        // shell's hint row since MOD-67 M6 T2).
+        assert_eq!(body.bottom() + NOTICE_HEIGHT + 1, right.height, "{body:?}");
     }
 
     /// MOD-57 R0 F1: with Paths focused or handed to `$EDITOR`, `render` returns the paths rect,
@@ -1794,13 +1789,7 @@ mod tests {
             let mut rect = None;
             terminal
                 .draw(|frame| {
-                    rect = Some(render(
-                        frame,
-                        frame.area(),
-                        form,
-                        Keys::compiled(),
-                        &Theme::default(),
-                    ));
+                    rect = Some(render(frame, frame.area(), form, &Theme::default()));
                 })
                 .expect("the frame draws");
             let rect = rect.expect("the frame drew");
@@ -1827,7 +1816,7 @@ mod tests {
 
     /// Every state shows as characters, because the snapshots are text (blueprint §4 render).
     #[tokio::test]
-    async fn the_new_form_draws_its_rows_and_the_hint() {
+    async fn the_new_form_draws_its_rows_and_names_its_keys() {
         let mut form = new_form().await;
         type_text(&mut form, "Fresh item");
         let text = drawn(&form).join("\n");
@@ -1838,10 +1827,12 @@ mod tests {
             "\u{2039}ANA ",
             "\u{2039}kind default\u{203a}",
             "paths (one per line)",
-            &rendered(HINT_TEXT),
         ] {
             assert!(text.contains(wanted), "{wanted:?} in\n{text}");
         }
+        // MOD-67 M6 T2: the keys are the shell's hint row, not the form's.
+        assert!(!text.contains(&rendered(HINT_TEXT)), "{text}");
+        assert_eq!(form.key_hint(Keys::compiled()), rendered(HINT_TEXT));
     }
 
     /// D11: a Postgres `Unreachable` message runs past two rows, and the hedge after it still
@@ -1852,7 +1843,7 @@ mod tests {
         type_text(&mut form, "Fresh item");
         let why = "store unreachable: error communicating with database: Connection reset by \
                    peer (os error 104)";
-        let hedge = mint_may_have_landed(why);
+        let hedge = mint_may_have_landed(why, Some("Ctrl+s"));
         form.settle(Some(hedge.clone()));
         let rows = drawn(&form);
         let flowed = rows
@@ -1861,7 +1852,16 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(flowed.contains(&hedge), "{hedge:?} in\n{}", rows.join("\n"));
-        assert!(flowed.contains(&rendered(HINT_TEXT)), "{}", rows.join("\n"));
+    }
+
+    /// MOD-67 M6 D4: the mint hedge names the save key in force, and says to look first unbound.
+    #[test]
+    fn the_mint_hedge_names_the_save_key_or_none() {
+        assert!(mint_may_have_landed("boom", Some("F2")).ends_with("look for it before F2"));
+        assert_eq!(
+            mint_may_have_landed("boom", None),
+            "boom \u{2014} it may have been written; the list is being re-read, look for it first"
+        );
     }
 
     /// The notice's rows drawn at `size`, joined back into one sentence.
@@ -1883,7 +1883,7 @@ mod tests {
         type_text(&mut form, "Fresh item");
         let why = "store unreachable: error communicating with database: Connection reset by \
                    peer (os error 104)";
-        let hedge = mint_may_have_landed(why);
+        let hedge = mint_may_have_landed(why, Some("Ctrl+s"));
         form.settle(Some(hedge.clone()));
         let (flowed, rows) = flowed_at(&form, (80, 24));
         assert!(flowed.contains(&hedge), "{hedge:?} in\n{rows}");
@@ -1898,8 +1898,8 @@ mod tests {
             "store unreachable: {}",
             "connection reset by peer ".repeat(12)
         );
-        form.settle(Some(mint_may_have_landed(why.trim_end())));
-        let tail = mint_may_have_landed("");
+        form.settle(Some(mint_may_have_landed(why.trim_end(), Some("Ctrl+s"))));
+        let tail = mint_may_have_landed("", Some("Ctrl+s"));
         let (flowed, rows) = flowed_at(&form, (80, 24));
         assert!(flowed.contains(tail.trim_start()), "{tail:?} in\n{rows}");
     }
@@ -2035,18 +2035,26 @@ mod tests {
             title: "Resolved".to_owned(),
             ..ItemSpec::of(&head)
         };
-        let rebased = ItemForm::open_resolution(divergence.context.clone(), &resolved)
-            .expect("a context with an item");
+        let rebased =
+            ItemForm::open_resolution(divergence.context.clone(), &resolved, Keys::compiled())
+                .expect("a context with an item");
         assert_eq!(rebased.token(), Some(head.version));
         assert_eq!(rebased.reason(), EditReason::DivergenceResolution);
-        assert_eq!(rebased.notice(), Some(rebased_on(head.version).as_str()));
+        assert_eq!(
+            rebased.notice(),
+            Some(rebased_on(head.version, Some("Ctrl+s")).as_str())
+        );
         assert_eq!(rebased.opened.title, head.title, "unchanged means the head");
         assert_eq!(rebased.title.text(), Some("Resolved"));
         assert_eq!(rebased.focus(), Field::Title);
         assert!(rebased.resolving().is_none());
 
-        let mut same = ItemForm::open_resolution(divergence.context.clone(), &ItemSpec::of(&head))
-            .expect("a context with an item");
+        let mut same = ItemForm::open_resolution(
+            divergence.context.clone(),
+            &ItemSpec::of(&head),
+            Keys::compiled(),
+        )
+        .expect("a context with an item");
         assert!(matches!(
             same.on_key(ctrl('s'), Keys::compiled()),
             ItemFormOutcome::Stay
@@ -2055,7 +2063,7 @@ mod tests {
 
         let mut new = divergence.context;
         new.item = None;
-        assert!(ItemForm::open_resolution(new, &resolved).is_none());
+        assert!(ItemForm::open_resolution(new, &resolved, Keys::compiled()).is_none());
     }
 
     /// D2, D5: my title wins its conflict, their priority is kept, and the save is a resolution
@@ -2199,7 +2207,10 @@ mod tests {
             "{:?}",
             form.title.text()
         );
-        assert_eq!(form.notice(), Some(still_behind(2).as_str()));
+        assert_eq!(
+            form.notice(),
+            Some(still_behind(2, Some("Ctrl+s")).as_str())
+        );
 
         let (version, changes, reason) = edit_sent(&mut form);
         assert_eq!((version, reason), (1, EditReason::Edited));
@@ -2464,7 +2475,10 @@ mod tests {
             form.title.text().map(str::to_owned),
             form.paths.text().to_owned(),
         );
-        form.on_external_edit(ExternalEditOutcome::Edited("New body.\n".to_owned()));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited("New body.\n".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(
             form.body.text(),
             "New body.",
@@ -2476,7 +2490,7 @@ mod tests {
             "review L4: the cursor ends the text"
         );
         assert_eq!(form.focus(), Field::Body);
-        assert_eq!(form.notice(), Some(EDITED));
+        assert_eq!(form.notice(), Some(edited(Some("Ctrl+s")).as_str()));
         assert_eq!(form.title.text().map(str::to_owned), title);
         assert_eq!(form.paths.text(), paths);
         assert_eq!(form.token(), Some(1));
@@ -2502,7 +2516,10 @@ mod tests {
         let body = form.body.text().to_owned();
         focus_on(&mut form, Field::Paths);
         handed(&mut form);
-        form.on_external_edit(ExternalEditOutcome::Edited("src/**\nlib/**\n".to_owned()));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited("src/**\nlib/**\n".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(form.paths.text(), "src/**\nlib/**");
         assert_eq!(
             form.paths.cursor_line_col(),
@@ -2511,7 +2528,7 @@ mod tests {
         );
         assert_eq!(form.body.text(), body);
         assert_eq!(form.focus(), Field::Paths);
-        assert_eq!(form.notice(), Some(EDITED));
+        assert_eq!(form.notice(), Some(edited(Some("Ctrl+s")).as_str()));
     }
 
     /// A4: "unchanged" compares against what the form opened with, not what was handed out.
@@ -2522,8 +2539,11 @@ mod tests {
         focus_on(&mut form, Field::Body);
         type_text(&mut form, "x");
         handed(&mut form);
-        form.on_external_edit(ExternalEditOutcome::Edited(form.opened.body.clone()));
-        assert_eq!(form.notice(), Some(EDITED));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited(form.opened.body.clone()),
+            Keys::compiled(),
+        );
+        assert_eq!(form.notice(), Some(edited(Some("Ctrl+s")).as_str()));
         assert!(matches!(
             form.on_key(ctrl('s'), Keys::compiled()),
             ItemFormOutcome::Stay
@@ -2552,7 +2572,7 @@ mod tests {
             ),
         ] {
             handed(&mut form);
-            form.on_external_edit(outcome);
+            form.on_external_edit(outcome, Keys::compiled());
             assert_eq!(form.notice(), Some(notice.as_str()));
             assert_eq!(form.body.text(), body);
             assert_eq!(form.external, None);
@@ -2567,19 +2587,28 @@ mod tests {
         form.body = TextArea::with_text("abc");
         focus_on(&mut form, Field::Body);
         handed(&mut form);
-        form.on_external_edit(ExternalEditOutcome::Edited("abc\n".to_owned()));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited("abc\n".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(form.notice(), Some(NO_CHANGES));
         assert_eq!(form.body.text(), "abc");
 
         handed(&mut form);
-        form.on_external_edit(ExternalEditOutcome::Edited("abd\n".to_owned()));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited("abd\n".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(form.body.text(), "abd");
 
         form.body = TextArea::with_text("abc\n");
         handed(&mut form);
-        form.on_external_edit(ExternalEditOutcome::Edited("abc\n\n".to_owned()));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited("abc\n\n".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(form.body.text(), "abc\n\n");
-        assert_eq!(form.notice(), Some(EDITED));
+        assert_eq!(form.notice(), Some(edited(Some("Ctrl+s")).as_str()));
     }
 
     /// Review L2: a control character from the editor is dropped, as a paste drops one; a `\t`
@@ -2591,11 +2620,12 @@ mod tests {
         form.body = TextArea::with_text("abc");
         focus_on(&mut form, Field::Body);
         handed(&mut form);
-        form.on_external_edit(ExternalEditOutcome::Edited(
-            "a\u{1b}[31mb\u{7}c\u{0}\n\tindented\u{7f}\n".to_owned(),
-        ));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited("a\u{1b}[31mb\u{7}c\u{0}\n\tindented\u{7f}\n".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(form.body.text(), "a[31mbc\n\tindented");
-        assert_eq!(form.notice(), Some(EDITED));
+        assert_eq!(form.notice(), Some(edited(Some("Ctrl+s")).as_str()));
     }
 
     /// Review L2: the filter runs before D5's compare, so a return that differs only by control
@@ -2607,7 +2637,10 @@ mod tests {
         form.body = TextArea::with_text("abc");
         focus_on(&mut form, Field::Body);
         handed(&mut form);
-        form.on_external_edit(ExternalEditOutcome::Edited("a\u{1b}bc\u{0}\n".to_owned()));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited("a\u{1b}bc\u{0}\n".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(form.notice(), Some(NO_CHANGES));
         assert_eq!(form.body.text(), "abc");
     }
@@ -2617,14 +2650,23 @@ mod tests {
         let store = MemStore::demo();
         let mut form = edit_form(&store, ids::HTUI_ANA_1).await;
         let body = form.body.text().to_owned();
-        form.on_external_edit(ExternalEditOutcome::Edited("x".to_owned()));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited("x".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(form.body.text(), body);
         assert_eq!(form.notice(), None);
 
         focus_on(&mut form, Field::Body);
         handed(&mut form);
-        form.on_external_edit(ExternalEditOutcome::Failed("one".to_owned()));
-        form.on_external_edit(ExternalEditOutcome::Failed("two".to_owned()));
+        form.on_external_edit(
+            ExternalEditOutcome::Failed("one".to_owned()),
+            Keys::compiled(),
+        );
+        form.on_external_edit(
+            ExternalEditOutcome::Failed("two".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(form.notice(), Some("one"), "the second had no field out");
     }
 
@@ -2634,13 +2676,12 @@ mod tests {
         let mut form = new_form().await;
         for field in [Field::Body, Field::Paths] {
             focus_on(&mut form, field);
-            let text = drawn(&form).join("\n");
-            assert!(text.contains(&rendered(HINT_AREA)), "{field:?} in\n{text}");
-            assert!(!text.contains("Tab field"), "{field:?} in\n{text}");
+            let hint = form.key_hint(Keys::compiled());
+            assert_eq!(hint, rendered(HINT_AREA), "{field:?}");
+            assert!(!hint.contains("Tab field"), "{field:?}: {hint}");
         }
         focus_on(&mut form, Field::Title);
-        let text = drawn(&form).join("\n");
-        assert!(text.contains(&rendered(HINT_TEXT)), "{text}");
+        assert_eq!(form.key_hint(Keys::compiled()), rendered(HINT_TEXT));
     }
 
     #[tokio::test]

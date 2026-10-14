@@ -6,6 +6,8 @@
 //! write, and on the shell's refresh tick (M3 D9) while no read is in flight: every
 //! `REFRESHES_PER_READ`th tick after a good read (M3 review R1 M2), every
 //! `REFRESHES_PER_RETRY`th after a failed one.
+//!
+//! Its keys resolve through `views::QUEUE_OVERLAY` (MOD-67 M6).
 
 use htui_core::model::{
     BatchClose, EntryState, ItemId, QueueMove, QueueOverview, QueueRow, Scope, format_usd,
@@ -16,13 +18,14 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::app::{Action, Ctx, Handled, OverlayAction, RevealTarget};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
 use crate::store_worker::{QUEUE_REQUEST_NAMES, QueueWrite, StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width};
 use crate::ui::layout::centered;
 use crate::ui::overlay::registry::{Overlay, OverlayId};
 use crate::ui::tabs::backlog::queue_sentence;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 
 /// Marker in front of the row the cursor is on (the waiting list's): a snapshot records symbols
 /// and not styles.
@@ -40,8 +43,17 @@ const CHROME: u16 = 3;
 /// The widest the title column grows, in cells; a longer title is cut with an ellipsis.
 const TITLE_MAX: usize = 32;
 
-/// The line under the list. `Esc` is the wildcard overlay binding; the rest are handled here.
-const HINT: &str = "j/k move · J/K reorder · P pause/resume · Q dequeue · Enter open · Esc close";
+/// The line under the list (MOD-67 M6 D2), through [`views::QUEUE_OVERLAY`]: `list.*`, the
+/// `queue` verbs and `overlay.close` (the shell's). `j/k move · J/K reorder · P pause/resume ·
+/// Q dequeue · Enter open · Esc close` under the defaults.
+const HINT: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, "move"),
+    Hint::Pair(Act::QueueMoveDown, Act::QueueMoveUp, "reorder"),
+    Hint::One(Act::QueuePause, "pause/resume"),
+    Hint::One(Act::QueueDequeue, "dequeue"),
+    Hint::One(Act::QueueOpen, "open"),
+    Hint::One(Act::OverlayClose, "close"),
+];
 
 /// What the list says before the first `QueueOverview` reply.
 const READING: &str = "reading the queue";
@@ -217,7 +229,7 @@ impl QueueOverlay {
     }
 
     /// The box's contents: the header and the visible rows (or the reading, empty or unavailable
-    /// line), a blank line, then the hint.
+    /// line), a blank line, then `hint` (the rendered [`HINT`]).
     ///
     /// `room` is the box's inner width and `text_width` the room the sentence column gets;
     /// `None` is the natural size, nothing clipped. The header, the unavailable line and the hint
@@ -229,6 +241,7 @@ impl QueueOverlay {
         room: Option<usize>,
         text_width: Option<usize>,
         visible: usize,
+        hint: &str,
         theme: &Theme,
     ) -> Vec<Line<'static>> {
         let clipped = |text: &str| {
@@ -285,7 +298,7 @@ impl QueueOverlay {
             }
         };
         lines.push(Line::raw(""));
-        lines.push(Line::styled(clipped(HINT), theme.dim));
+        lines.push(Line::styled(clipped(hint), theme.dim));
         lines
     }
 
@@ -429,54 +442,64 @@ impl Overlay for QueueOverlay {
         true
     }
 
+    fn key_stack(&self) -> Option<Stack<'static>> {
+        Some(views::QUEUE_OVERLAY)
+    }
+
     fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
         // The queue is this box's, not the scope's: one read on open.
         vec![StoreRequest::QueueOverview]
     }
 
+    /// Each candidate of the chord through `views::QUEUE_OVERLAY` (MOD-67 M6 D2), the first this
+    /// overlay takes winning; chord equality includes the modifiers, so `ctrl-j` is not `j`.
+    /// `overlay.close` and `global.help` are the shell's (`Pass`); the rest is swallowed by
+    /// `is_modal`, so nothing quits or reaches the tab below.
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let len = self.rows().len();
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                if let Some(last) = len.checked_sub(1) {
-                    self.put((self.cursor + 1).min(last));
+        let chord = KeyChord::from_event(key);
+        for act in ctx.keys().actions(views::QUEUE_OVERLAY, chord) {
+            match act {
+                Act::ListDown => {
+                    if let Some(last) = len.checked_sub(1) {
+                        self.put((self.cursor + 1).min(last));
+                    }
                 }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if let Some(last) = len.checked_sub(1) {
-                    self.put(self.cursor.min(last).saturating_sub(1));
+                Act::ListUp => {
+                    if let Some(last) = len.checked_sub(1) {
+                        self.put(self.cursor.min(last).saturating_sub(1));
+                    }
                 }
-            }
-            KeyCode::Char('J') => self.request_move(QueueMove::Down, ctx),
-            KeyCode::Char('K') => self.request_move(QueueMove::Up, ctx),
-            // M3 review R1 M1: the write names the state the box shows, so a queue that changed
-            // since the last read (a stalled batch the runner closed, L4) refuses it rather than
-            // flipping the other way.
-            KeyCode::Char('P') => {
-                if let Some(overview) = &self.overview {
-                    ctx.request(match &overview.batch {
-                        Some(batch) => StoreRequest::PauseQueue {
-                            expect: Some(batch.id),
-                        },
-                        None => StoreRequest::ResumeQueue {
-                            expect_paused: true,
-                        },
-                    });
+                Act::QueueMoveDown => self.request_move(QueueMove::Down, ctx),
+                Act::QueueMoveUp => self.request_move(QueueMove::Up, ctx),
+                // M3 review R1 M1: the write names the state the box shows, so a queue that
+                // changed since the last read (a stalled batch the runner closed, L4) refuses it
+                // rather than flipping the other way.
+                Act::QueuePause => {
+                    if let Some(overview) = &self.overview {
+                        ctx.request(match &overview.batch {
+                            Some(batch) => StoreRequest::PauseQueue {
+                                expect: Some(batch.id),
+                            },
+                            None => StoreRequest::ResumeQueue {
+                                expect_paused: true,
+                            },
+                        });
+                    }
                 }
-            }
-            KeyCode::Char('Q') => {
-                if let Some((row, _)) = self.selected() {
-                    ctx.request(StoreRequest::DequeueItem {
-                        item: row.entry.item_id,
-                    });
+                Act::QueueDequeue => {
+                    if let Some((row, _)) = self.selected() {
+                        ctx.request(StoreRequest::DequeueItem {
+                            item: row.entry.item_id,
+                        });
+                    }
                 }
+                Act::QueueOpen => self.enter(ctx),
+                _ => continue, // `overlay.close`, `global.help`: the shell's
             }
-            KeyCode::Enter => self.enter(ctx),
-            // `Esc` falls through to the wildcard overlay binding; the rest (a lower-case `q`
-            // included) is swallowed by `is_modal`, so nothing quits or reaches the tab below.
-            _ => return Handled::Pass,
+            return Handled::Consumed;
         }
-        Handled::Consumed
+        Handled::Pass
     }
 
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
@@ -503,7 +526,13 @@ impl Overlay for QueueOverlay {
                     | QueueWrite::Moved { .. }
                     | QueueWrite::Stale { .. } => String::new(),
                 };
-                ctx.emit(Action::Error(queue_sentence(write, &key, view)));
+                let pause = ctx.keys().label(views::QUEUE_OVERLAY, Act::QueuePause);
+                ctx.emit(Action::Error(queue_sentence(
+                    write,
+                    &key,
+                    view,
+                    pause.as_deref(),
+                )));
                 self.reread(ctx);
             }
             StoreReply::Failed { request, message } if *request == OVERVIEW => {
@@ -537,7 +566,8 @@ impl Overlay for QueueOverlay {
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         // The natural size: every row, every sentence whole.
-        let natural = self.lines(None, None, usize::MAX, ctx.theme);
+        let hint = ctx.keys().hint(views::QUEUE_OVERLAY, HINT);
+        let natural = self.lines(None, None, usize::MAX, &hint, ctx.theme);
         let width = u16::try_from(widest(&natural))
             .unwrap_or(u16::MAX)
             .saturating_add(CHROME)
@@ -550,7 +580,7 @@ impl Overlay for QueueOverlay {
         let room = usize::from(width.saturating_sub(CHROME));
         let text_width = room.saturating_sub(self.columns.prefix());
         let visible = usize::from(height.saturating_sub(2)).saturating_sub(self.fixed());
-        let lines = self.lines(Some(room), Some(text_width), visible, ctx.theme);
+        let lines = self.lines(Some(room), Some(text_width), visible, &hint, ctx.theme);
 
         let box_area = centered(area, width, height);
         frame.render_widget(Clear, box_area);
@@ -569,9 +599,10 @@ impl Overlay for QueueOverlay {
 mod tests {
     use super::*;
     use crate::app::{Emit, TopBarState};
-    use crate::keymap::Keymap;
+    use crate::keys::{Keys, load_str, views};
     use crate::store_worker::{Origin, QueueView};
     use chrono::{DateTime, TimeZone, Utc};
+    use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
     use htui_core::model::{
         BatchFigures, BatchId, BatchStop, CapError, Escalation, Hold, PER_TOKEN_CAP_BATCH,
@@ -588,7 +619,7 @@ mod tests {
         scope: Scope,
         projects: Vec<ProjectRef>,
         top_bar: TopBarState,
-        keymap: Keymap,
+        keys: Keys,
         theme: Theme,
         emit: Emit,
     }
@@ -602,10 +633,17 @@ mod tests {
                 },
                 projects: Vec::new(),
                 top_bar: TopBarState::default(),
-                keymap: Keymap::new(),
+                keys: Keys::compiled().clone(),
                 theme: Theme::default(),
                 emit: Emit::default(),
             }
+        }
+
+        /// The bench with these keys instead of the compiled defaults (MOD-67 M6): how a test
+        /// rebinds.
+        fn with_keys(mut self, keys: Keys) -> Self {
+            self.keys = keys;
+            self
         }
 
         fn ctx(&self) -> Ctx<'_> {
@@ -613,7 +651,7 @@ mod tests {
                 &self.scope,
                 &self.projects,
                 &self.top_bar,
-                &self.keymap,
+                &self.keys,
                 &self.theme,
                 Origin::Overlay(QueueOverlay::ID),
                 &self.emit,
@@ -662,6 +700,11 @@ mod tests {
         fn render(&self, overlay: &QueueOverlay) -> String {
             self.render_at(overlay, 100, 30)
         }
+    }
+
+    /// The hint rendered with the compiled keys.
+    fn hint() -> String {
+        Keys::compiled().hint(views::QUEUE_OVERLAY, HINT)
     }
 
     fn at(hour: u32, minute: u32) -> DateTime<Utc> {
@@ -827,7 +870,7 @@ mod tests {
         let bench = Bench::new();
         let mut overlay = QueueOverlay::new();
         bench.feed(&mut overlay, overview(every_state()));
-        let lines = overlay.lines(None, None, usize::MAX, &Theme::default());
+        let lines = overlay.lines(None, None, usize::MAX, &hint(), &Theme::default());
         let texts = texts(&lines);
         for (row, state) in every_state() {
             let sentence = state.to_string();
@@ -1013,7 +1056,7 @@ mod tests {
             },
         );
         assert!(bench.drained().is_empty(), "a failed read is not re-read");
-        let natural = overlay.lines(None, None, usize::MAX, &Theme::default());
+        let natural = overlay.lines(None, None, usize::MAX, &hint(), &Theme::default());
         assert_eq!(
             texts(&natural)[0],
             format!("{NO_CURSOR}{UNAVAILABLE}{message}")
@@ -1125,7 +1168,7 @@ mod tests {
             &mut overlay,
             overview(vec![(row("FIX-1", title), EntryState::Next)]),
         );
-        let lines = overlay.lines(None, None, usize::MAX, &Theme::default());
+        let lines = overlay.lines(None, None, usize::MAX, &hint(), &Theme::default());
         let row_text = &texts(&lines)[2];
         assert_eq!(
             row_text,
@@ -1696,6 +1739,71 @@ mod tests {
         assert_eq!(bench.code(&mut overlay, KeyCode::Char('q')), Handled::Pass);
         assert!(bench.drained().is_empty());
         assert!(overlay.is_modal(), "a passed key is swallowed, never quits");
+    }
+
+    /// MOD-67 M6 (D2): the shell resolves the overlay's keys, its status line and its `?` box
+    /// through the queue's own stack.
+    #[test]
+    fn the_overlay_reports_the_queue_stack() {
+        assert_eq!(QueueOverlay::new().key_stack(), Some(views::QUEUE_OVERLAY));
+    }
+
+    /// MOD-67 M6 (D2): chord equality includes the modifiers, so a held `Ctrl` or `Alt` makes
+    /// none of the queue's keys: each passes (the modal overlay swallows it) and steers nothing.
+    #[test]
+    fn a_chord_is_no_queue_key() {
+        let bench = Bench::new();
+        let mut overlay = QueueOverlay::new();
+        bench.feed(&mut overlay, overview(abc()));
+        for (code, mods) in [
+            (KeyCode::Char('j'), KeyModifiers::CONTROL),
+            (KeyCode::Char('j'), KeyModifiers::ALT),
+            (KeyCode::Char('J'), KeyModifiers::CONTROL),
+            (KeyCode::Char('P'), KeyModifiers::ALT),
+            (KeyCode::Char('q'), KeyModifiers::CONTROL),
+            (KeyCode::Enter, KeyModifiers::ALT),
+        ] {
+            let handled = overlay.on_key(KeyEvent::new(code, mods), &mut bench.ctx());
+            assert_eq!(handled, Handled::Pass, "{code:?} {mods:?}");
+        }
+        assert!(bench.drained().is_empty(), "nothing steered the queue");
+        assert_eq!(overlay.cursor, 0, "the cursor did not move");
+    }
+
+    /// MOD-67 M6: the lane's rebinding test. `[queue] move_down = "D"` moves the reorder down to
+    /// `D`: `D` asks for the move, `J` is inert, and the hint names `D`.
+    #[test]
+    fn a_rebound_key_moves_the_entry_and_the_old_one_is_inert() {
+        let keys = load_str("[queue]\nmove_down = \"D\"\n").expect("the keys load");
+        let bench = Bench::new().with_keys(keys);
+        let mut overlay = QueueOverlay::new();
+        let rows = abc();
+        let a = rows[0].0.entry.item_id;
+        bench.feed(&mut overlay, overview(rows));
+
+        assert_eq!(
+            bench.code(&mut overlay, KeyCode::Char('D')),
+            Handled::Consumed
+        );
+        assert_one_request(
+            &bench.drained(),
+            |request| matches!(request, StoreRequest::MoveQueueEntry { item, to: QueueMove::Down } if *item == a),
+        );
+        assert_eq!(bench.code(&mut overlay, KeyCode::Char('J')), Handled::Pass);
+        assert!(bench.drained().is_empty(), "`J` asks for nothing");
+
+        let rendered = bench.render(&overlay);
+        assert!(rendered.contains("D/K reorder"), "{rendered}");
+    }
+
+    /// MOD-67 M6 (D2): with the compiled keys the rendered hint is the literal it replaced, byte
+    /// for byte, so no frame moves.
+    #[test]
+    fn the_hint_is_the_rendered_spec() {
+        assert_eq!(
+            hint(),
+            "j/k move · J/K reorder · P pause/resume · Q dequeue · Enter open · Esc close"
+        );
     }
 
     #[test]

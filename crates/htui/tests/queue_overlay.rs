@@ -11,6 +11,7 @@
 use chrono::Utc;
 use htui::agent_worker::AgentRuntime;
 use htui::app::{Action, register_all};
+use htui::keys::{Keys, load_str};
 use htui::testkit::Harness;
 use htui::ui::overlay::QueueOverlay;
 use htui_agent::registry::DriverFactory;
@@ -20,8 +21,12 @@ use htui_core::store::MemStore;
 
 /// The demo shell over `store`, settled.
 async fn shell(store: &MemStore) -> Harness {
-    let mut harness =
-        Harness::over(store.clone()).with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
+    settled(Harness::over(store.clone())).await
+}
+
+/// `harness` with the agent runtime and every view, settled.
+async fn settled(harness: Harness) -> Harness {
+    let mut harness = harness.with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
     register_all(harness.app());
     harness.drive_to_end().await;
     harness
@@ -41,7 +46,16 @@ async fn queued(items: &[ItemId]) -> MemStore {
 
 /// The shell over `store` with the queue overlay open and read.
 async fn opened(store: &MemStore) -> Harness {
-    let mut harness = shell(store).await;
+    open(shell(store).await).await
+}
+
+/// The shell over `store`, run with `keys`, with the queue overlay open and read.
+async fn opened_with(store: &MemStore, keys: Keys) -> Harness {
+    open(settled(Harness::over(store.clone()).with_keys(keys)).await).await
+}
+
+/// `harness` with the queue overlay opened by `Ctrl+Q` and read.
+async fn open(mut harness: Harness) -> Harness {
     harness.key("ctrl-q");
     harness.drive_to_end().await;
     assert_eq!(
@@ -84,6 +98,16 @@ fn row_order(harness: &mut Harness, keys: &[&str]) -> Vec<String> {
                 .map(|key| (*key).to_owned())
         })
         .collect()
+}
+
+/// The key of the row the cursor is on, among `keys`.
+fn cursor_row(harness: &mut Harness, keys: &[&str]) -> Option<String> {
+    queue_box(&harness.render()).iter().find_map(|line| {
+        let cells = line.trim_start_matches('│').strip_prefix("> ")?;
+        keys.iter()
+            .find(|key| cells.starts_with(&format!("{key} ")))
+            .map(|key| (*key).to_owned())
+    })
 }
 
 /// The queue's items in store order.
@@ -288,4 +312,112 @@ async fn p_over_a_batch_the_runner_closed_is_refused_and_opens_nothing() {
         "the box re-read the queue, and says why it is paused (L4): {}",
         harness.render()
     );
+}
+
+/// MOD-67 M6 X-S (PA-5): `[queue] pause = "X"`; the runner closes the batch the box showed, and
+/// the refused pause names `X`, the key that pauses in this box, not the default `P`.
+#[tokio::test]
+async fn a_rebound_pause_key_is_named_after_a_stale_pause() {
+    let store = queued(&[ids::HTUI_ANA_2]).await;
+    let seen = store
+        .open_batch(ids::BOX, ids::USER, Utc::now())
+        .await
+        .expect("the batch opens")
+        .id;
+    let keys = load_str("[queue]\npause = \"X\"\n").expect("the keys load");
+    let mut harness = opened_with(&store, keys).await;
+
+    // The runner's stall close (L4), behind the overlay's back.
+    store
+        .close_drained_batch(seen, &[ids::HTUI_ANA_2], Utc::now())
+        .await
+        .expect("the store answers")
+        .expect("the stalled batch closed");
+
+    harness.key("X");
+    harness.drive_to_end().await;
+    assert_eq!(
+        store.open_batch_of(ids::BOX).await.expect("reads"),
+        None,
+        "no batch opened"
+    );
+    assert_eq!(
+        harness.app().status.as_deref(),
+        Some("queue already paused: its batch closed before X reached it")
+    );
+}
+
+/// MOD-67 M6: the lane's rebinding test, through the store. `[queue] move_down = "D"` and
+/// `move_up = "U"`: `J` is inert, `D` moves the cursor row down in the store, and the hint names
+/// the new chords.
+#[tokio::test]
+async fn a_rebound_reorder_key_round_trips_through_the_store() {
+    let store = queued(&[ids::HTUI_ANA_2, ids::HTUI_FEAT_2]).await;
+    let before = store_order(&store).await;
+    let keys = load_str("[queue]\nmove_down = \"D\"\nmove_up = \"U\"\n").expect("the keys load");
+    let mut harness = opened_with(&store, keys).await;
+
+    harness.key("J");
+    harness.drive_to_end().await;
+    assert_eq!(store_order(&store).await, before, "`J` moved nothing");
+
+    harness.key("D");
+    harness.drive_to_end().await;
+    assert_eq!(
+        store_order(&store).await,
+        [before[1], before[0]],
+        "`D` moved the first entry down"
+    );
+    let frame = harness.render();
+    let inside = queue_box(&frame).join("\n");
+    assert!(inside.contains("D/U reorder"), "{frame}");
+    assert!(!inside.contains("J/K reorder"), "{frame}");
+}
+
+/// MOD-67 M6 (D2, D8): over the queue the `?` box renders the queue's stack, one line per layer.
+#[tokio::test]
+async fn the_help_box_lists_the_queue_keys() {
+    let store = queued(&[ids::HTUI_ANA_2]).await;
+    let mut harness = opened(&store).await;
+    harness.key("?");
+    assert!(harness.app().help_visible, "`?` opens the box");
+    let frame = harness.render();
+    assert!(
+        frame
+            .lines()
+            .any(|line| line.contains("Queue: J move down")),
+        "{frame}"
+    );
+    for line in [
+        "List: j/Down down · k/Up up",
+        "Overlay: Esc close",
+        "Global: Ctrl+c quit · ?/F1 help",
+    ] {
+        assert!(frame.contains(line), "`{line}` is in the box: {frame}");
+    }
+    harness.key("?");
+    assert!(!harness.app().help_visible, "`?` again closes it");
+}
+
+/// MOD-67 M6 (D2): chord equality includes the modifiers, so `Ctrl+J` moves no cursor and
+/// `Ctrl+P` or `Alt+P` pauses nothing.
+#[tokio::test]
+async fn a_ctrl_chord_does_not_steer_the_queue() {
+    let store = queued(&[ids::HTUI_ANA_2, ids::HTUI_FEAT_2]).await;
+    let mut harness = opened(&store).await;
+    let keys = ["ANA-2", "FEAT-2"];
+    let first = cursor_row(&mut harness, &keys);
+    assert!(first.is_some(), "{}", harness.render());
+
+    for chord in ["ctrl-j", "ctrl-P", "alt-P"] {
+        harness.key(chord);
+        harness.drive_to_end().await;
+    }
+    assert_eq!(cursor_row(&mut harness, &keys), first, "the cursor stayed");
+    assert_eq!(
+        store.open_batch_of(ids::BOX).await.expect("reads"),
+        None,
+        "the queue is still paused"
+    );
+    assert!(!harness.app().overlays.is_empty(), "the overlay is open");
 }

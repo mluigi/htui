@@ -19,8 +19,16 @@ pub mod pane;
 pub const QUICK_EXIT: Duration = Duration::from_secs(1);
 
 /// The notice after an `$EDITOR` return with text in it: the view holds the text, unsaved (MOD-9;
-/// shared by the Skills views and the Backlog item form, MOD-13 milestone 4 D8).
-pub const EDITED: &str = "edited in $EDITOR \u{2014} Ctrl+S saves";
+/// shared by the Skills views and the Backlog item form, MOD-13 milestone 4 D8). `save` is the
+/// save key of the editor the text returned to, as `Keys::label` writes it (MOD-67 M6 D4); with
+/// none bound the clause goes.
+#[must_use]
+pub fn edited(save: Option<&str>) -> String {
+    match save {
+        Some(save) => format!("edited in $EDITOR \u{2014} {save} saves"),
+        None => "edited in $EDITOR".to_owned(),
+    }
+}
 
 /// The notice after an `$EDITOR` return that changed nothing (MOD-13 milestone 4 D8). The
 /// Library also gives it for a rename that changes nothing.
@@ -635,6 +643,13 @@ mod tests {
                 .find(|(name, _)| *name == key)
                 .map(|(_, value)| (*value).to_owned())
         }
+    }
+
+    /// MOD-67 M6 D4: the notice names the save key in force, and says nothing of one unbound.
+    #[test]
+    fn edited_names_the_save_key_in_force() {
+        assert_eq!(edited(Some("F2")), "edited in $EDITOR \u{2014} F2 saves");
+        assert_eq!(edited(None), "edited in $EDITOR");
     }
 
     #[test]

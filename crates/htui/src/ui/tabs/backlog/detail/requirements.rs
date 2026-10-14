@@ -61,7 +61,7 @@ use crate::requirements::{
 };
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
-use crate::ui::cells::{self, cell_width};
+use crate::ui::cells;
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Scroll, message};
 use crate::ui::tabs::settings::modal_rest;
 use crossterm::event::KeyEvent;
@@ -430,41 +430,18 @@ impl ReqsTab {
         (lines, (self.cursor + 1) * 2)
     }
 
-    /// The footer of the current mode, every line cut to `width`; the picker shows at most
-    /// `room` candidates, a window that keeps its cursor in view. The key words are the mode's
-    /// stack's labels in `keys` (MOD-67 M5), identical to the old literals with the defaults.
-    fn footer(&self, width: usize, room: usize, keys: &Keys, theme: &Theme) -> Vec<Line<'static>> {
-        let stack = self.stack();
-        let hint =
-            |spec: HintSpec| Line::styled(cells::clip(&keys.hint(stack, spec), width), theme.dim);
+    /// The footer of the current mode, every line cut to `width`: the picker's candidates (at
+    /// most `room`, a window that keeps its cursor in view) or the question's title. The key
+    /// lines that ended it are the shell's hint row since MOD-67 M6 T2 ([`DetailTab::key_hint`]);
+    /// Browse has no footer.
+    fn footer(&self, width: usize, room: usize, theme: &Theme) -> Vec<Line<'static>> {
         let title = |text: String| Line::styled(cells::clip(&text, width), theme.title);
         match self.mode {
-            Mode::Browse => {
-                let (moves, writes) = (keys.hint(stack, MOVES), keys.hint(stack, WRITES));
-                // The separator rides on the moves' span, as the old `J/K move · ` did, so the
-                // row clips exactly as it always has.
-                let moves = if moves.is_empty() || writes.is_empty() {
-                    moves
-                } else {
-                    format!("{moves}{SEP}")
-                };
-                let moves = cells::clip(&moves, width);
-                let rest = width.saturating_sub(cell_width(&moves));
-                let style = if self.writable() {
-                    theme.base
-                } else {
-                    theme.dim
-                };
-                vec![Line::from(vec![
-                    Span::styled(moves, theme.base),
-                    Span::styled(cells::clip(&writes, rest), style),
-                ])]
-            }
+            Mode::Browse => Vec::new(),
             Mode::Pick { cursor } => {
                 let room = room.max(1);
                 let skip = (cursor + 1).saturating_sub(room);
-                let mut lines: Vec<Line<'static>> = self
-                    .candidates()
+                self.candidates()
                     .iter()
                     .enumerate()
                     .skip(skip)
@@ -479,19 +456,48 @@ impl ReqsTab {
                         );
                         Line::styled(cells::clip(&text, width), theme.base)
                     })
-                    .collect();
-                lines.push(hint(PICK_HINT));
-                lines
+                    .collect()
             }
-            Mode::Kind { requirement } => vec![
-                title(format!("cite {} as:", self.key_of(requirement))),
-                hint(KIND_HINT),
-            ],
-            Mode::ConfirmUncite { requirement, kind } => vec![
-                title(format!("uncite {} ({kind})?", self.key_of(requirement))),
-                hint(CONFIRM_HINT),
-            ],
+            Mode::Kind { requirement } => {
+                vec![title(format!("cite {} as:", self.key_of(requirement)))]
+            }
+            Mode::ConfirmUncite { requirement, kind } => vec![title(format!(
+                "uncite {} ({kind})?",
+                self.key_of(requirement)
+            ))],
         }
+    }
+
+    /// The keys of the current mode (MOD-67 M5, M6 T2), the mode's stack's labels in `keys`:
+    /// Browse's moves then its writes, the writes greyed where a write would be refused; a
+    /// question's or the picker's spec otherwise.
+    fn keys_line(&self, keys: &Keys, theme: &Theme) -> Line<'static> {
+        let stack = self.stack();
+        let spec = match self.mode {
+            Mode::Browse => {
+                let (moves, writes) = (keys.hint(stack, MOVES), keys.hint(stack, WRITES));
+                let style = if self.writable() {
+                    theme.base
+                } else {
+                    theme.dim
+                };
+                let mut spans = Vec::new();
+                if !moves.is_empty() {
+                    spans.push(Span::styled(moves, theme.base));
+                }
+                if !writes.is_empty() {
+                    if !spans.is_empty() {
+                        spans.push(Span::styled(SEP, theme.base));
+                    }
+                    spans.push(Span::styled(writes, style));
+                }
+                return Line::from(spans);
+            }
+            Mode::Pick { .. } => PICK_HINT,
+            Mode::Kind { .. } => KIND_HINT,
+            Mode::ConfirmUncite { .. } => CONFIRM_HINT,
+        };
+        Line::styled(keys.hint(stack, spec), theme.dim)
     }
 
     /// A requirement's key, from the candidates or the citations; its id when neither has it.
@@ -599,13 +605,19 @@ impl DetailTab for ReqsTab {
         }
     }
 
+    /// The mode's keys (MOD-67 M6 T2); nothing with no item selected.
+    fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
+        self.item?;
+        Some(self.keys_line(keys, theme)).filter(|line| line.width() > 0)
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         if self.item.is_none() {
             message(frame, area, "No item selected.", ctx.theme);
             return;
         }
         let width = usize::from(area.width);
-        let footer = self.footer(width, usize::from(area.height / 2), ctx.keys(), ctx.theme);
+        let footer = self.footer(width, usize::from(area.height / 2), ctx.theme);
         let [list, prompt] = Layout::vertical([
             Constraint::Min(0),
             Constraint::Length(u16::try_from(footer.len()).unwrap_or(u16::MAX)),
@@ -655,7 +667,7 @@ mod tests {
 
     use super::*;
     use crate::app::{Emit, TopBarState};
-    use crate::keymap::Keymap;
+    use crate::keys::Keys;
     use crate::requirements;
     use crate::store_worker::Origin;
     use crate::ui::tabs::BacklogTab;
@@ -665,7 +677,7 @@ mod tests {
         scope: Scope,
         projects: Vec<ProjectRef>,
         top_bar: TopBarState,
-        keymap: Keymap,
+        keys: Keys,
         theme: Theme,
         emit: Emit,
     }
@@ -679,7 +691,7 @@ mod tests {
                 },
                 projects: Vec::new(),
                 top_bar: TopBarState::default(),
-                keymap: Keymap::new(),
+                keys: Keys::compiled().clone(),
                 theme: Theme::default(),
                 emit: Emit::default(),
             }
@@ -690,7 +702,7 @@ mod tests {
                 &self.scope,
                 &self.projects,
                 &self.top_bar,
-                &self.keymap,
+                &self.keys,
                 &self.theme,
                 Origin::Tab(BacklogTab::ID),
                 &self.emit,
@@ -758,7 +770,7 @@ mod tests {
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect();
-            assert!(cell_width(&text) <= 30, "{text:?} against 30");
+            assert!(cells::cell_width(&text) <= 30, "{text:?} against 30");
             assert!(text.ends_with('\u{2026}'), "{text:?}");
         }
     }
@@ -1050,8 +1062,8 @@ mod tests {
             .collect()
     }
 
-    /// Blueprint §5.4: a refused read is drawn in the pane, above the hint, and a later answer
-    /// replaces it.
+    /// Blueprint §5.4: a refused read is drawn in the pane (its keys are the shell's hint row since
+    /// MOD-67 M6 T2), and a later answer replaces it.
     #[tokio::test]
     async fn a_refused_read_is_drawn_in_the_pane() {
         let shell = Shell::new();
@@ -1066,7 +1078,12 @@ mod tests {
         );
         let rows = drawn(&pane, &shell);
         assert_eq!(rows[0], "the read was refused", "{rows:#?}");
-        assert_eq!(rows.last().map(String::as_str), Some(BROWSE_HINT_TEXT));
+        assert_eq!(
+            pane.key_hint(Keys::compiled(), &Theme::default())
+                .map(|line| line.to_string())
+                .as_deref(),
+            Some(BROWSE_HINT_TEXT)
+        );
 
         pane.on_reply(
             &StoreReply::ItemCitations(Box::new(citations(ids::HTUI_ANA_1).await)),
@@ -1076,7 +1093,7 @@ mod tests {
         assert!(rows[0].contains("R-ENT-1 addresses v1"), "{rows:#?}");
     }
 
-    /// The hint row in full: [`MOVES`], the separator, then [`WRITES`].
+    /// The keys in full: [`MOVES`], the separator, then [`WRITES`].
     const BROWSE_HINT_TEXT: &str = "J/K move · r reconfirm · c cite · u uncite";
 
     /// PRD Constraints, plan P10: offline the write words of the hint are dim; online they are
@@ -1086,10 +1103,12 @@ mod tests {
         let shell = Shell::new();
         let theme = Theme::default();
         let writes_style = |pane: &ReqsTab| {
-            let footer = pane.footer(usize::from(PANE_WIDTH), 8, Keys::compiled(), &theme);
-            assert_eq!(text(&footer[0]), BROWSE_HINT_TEXT);
+            let line = pane
+                .key_hint(Keys::compiled(), &theme)
+                .expect("an item is selected");
+            assert_eq!(text(&line), BROWSE_HINT_TEXT);
             let writes = Keys::compiled().hint(views::BACKLOG_REQS, WRITES);
-            let writes = footer[0]
+            let writes = line
                 .spans
                 .iter()
                 .find(|span| span.content == writes)
@@ -1104,17 +1123,16 @@ mod tests {
         assert_eq!(writes_style(&offline), theme.dim);
     }
 
-    /// MOD-67 M5: every mode's footer is built from its stack's labels, and reads as the old
-    /// literal did with the defaults.
+    /// MOD-67 M5: every mode's keys are built from its stack's labels, and read as the old
+    /// literal did with the defaults (the shell's hint row since M6 T2).
     #[tokio::test]
     async fn the_mode_footers_read_as_before_with_the_defaults() {
         let shell = Shell::new();
         let theme = Theme::default();
         let mut pane = pane(&shell, ids::HTUI_FEAT_1, citations(ids::HTUI_FEAT_1).await);
         let last = |pane: &ReqsTab| {
-            pane.footer(usize::from(PANE_WIDTH), 8, Keys::compiled(), &theme)
-                .last()
-                .map(|line| text(line))
+            pane.key_hint(Keys::compiled(), &theme)
+                .map(|line| text(&line))
                 .unwrap_or_default()
         };
         assert_eq!(last(&pane), BROWSE_HINT_TEXT);
@@ -1168,15 +1186,15 @@ mod tests {
         assert_eq!(candidate_keys(&pane), ["R-ENT-1", "R-ENT-2", "R-STO-1"]);
         pane.on_key(key(KeyCode::Char('c')), &mut shell.ctx());
         let window = |pane: &ReqsTab| {
-            pane.footer(usize::from(PANE_WIDTH), 2, Keys::compiled(), &theme)
+            pane.footer(usize::from(PANE_WIDTH), 2, &theme)
                 .iter()
                 .map(|line| text(line).chars().take(10).collect::<String>())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(window(&pane), ["▸ R-ENT-1 ", "  R-ENT-2 ", "j/k move ·"]);
+        assert_eq!(window(&pane), ["▸ R-ENT-1 ", "  R-ENT-2 "]);
         pane.on_key(key(KeyCode::Char('j')), &mut shell.ctx());
         pane.on_key(key(KeyCode::Char('j')), &mut shell.ctx());
-        assert_eq!(window(&pane), ["  R-ENT-2 ", "▸ R-STO-1 ", "j/k move ·"]);
+        assert_eq!(window(&pane), ["  R-ENT-2 ", "▸ R-STO-1 "]);
         pane.on_key(key(KeyCode::Char('j')), &mut shell.ctx());
         assert_eq!(pane.mode, Mode::Pick { cursor: 2 }, "the last stays last");
     }

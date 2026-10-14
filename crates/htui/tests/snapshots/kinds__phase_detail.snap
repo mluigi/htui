@@ -25,10 +25,3 @@ vulkan-tutorials  Vulkan Tutorials
     0. plan · template plan · gate soft · in none · budget inherit
     1. implement · template implement · gate soft · in plan,review · budget inherit
     2. review · template review · gate soft · in implement · budget inherit
-
-
-
-
-
-
-j/k · n kind/phase · N graph · e edit · g graph · d delete kind · r reload

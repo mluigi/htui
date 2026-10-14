@@ -39,7 +39,7 @@ use crate::connection::{AttemptOutcome, ConnectionSnapshot, DsnState, READ_NAME,
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
-use crate::ui::tabs::settings::{SectionId, SettingsSection, modal_rest, wrapped};
+use crate::ui::tabs::settings::{SectionId, SettingsSection, answers, asked, modal_rest, wrapped};
 use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::KeyEvent;
 
@@ -127,8 +127,14 @@ const UNREADABLE_GUIDE: &str = "the keyring could not be read; Enter tries to st
 
 /// B-7: one `--set-dsn` may have written a string this build's parser refuses. It is still the
 /// DSN the next launch will dial with, so it is reported as stored — without a summary that would
-/// have to be guessed at.
-const STORED_UNREADABLE: &str = "stored \u{2014} not readable by this build; e replaces it";
+/// have to be guessed at. `edit` is `Edit`'s label through `CONNECTION_BROWSE`, the key that
+/// replaces it (MOD-67 M6 D4); with none bound the clause goes.
+fn stored_unreadable(edit: Option<&str>) -> String {
+    match edit {
+        Some(edit) => format!("stored \u{2014} not readable by this build; {edit} replaces it"),
+        None => "stored \u{2014} not readable by this build".to_owned(),
+    }
+}
 
 /// The Status row before the session's first dial.
 const NO_ATTEMPT: &str = "no dial yet this session";
@@ -136,12 +142,25 @@ const NO_ATTEMPT: &str = "no dial yet this session";
 /// The Mirror row's `last full refresh` before the first cursor-at-zero pass.
 const NEVER: &str = "never";
 
-/// The Rebuild row's value: a row that is an action says which keys run it.
-const REBUILD_KEYS: &str = "press Enter or R";
+/// The Rebuild row's value: a row that is an action says which keys run it, as `keys` binds them
+/// in `CONNECTION_BROWSE` (MOD-67 M6 D4): `press Enter or R` with the defaults, one key when one
+/// is bound, a dash when neither is.
+fn rebuild_keys(keys: &Keys) -> String {
+    let stack = views::CONNECTION_BROWSE;
+    match (
+        keys.label(stack, Act::ConnectionActivate),
+        keys.label(stack, Act::ConnectionRebuild),
+    ) {
+        (Some(activate), Some(rebuild)) => format!("press {activate} or {rebuild}"),
+        (Some(one), None) | (None, Some(one)) => format!("press {one}"),
+        (None, None) => "\u{2014}".to_owned(),
+    }
+}
 
 /// D13's question. Names what the session keeps, because losing a working connection is what a
-/// user would reasonably fear from a key called "clear".
-const CONFIRM_CLEAR: &str = "Remove the DSN from the keyring? This session keeps its current connection; the next launch starts offline. y / n";
+/// user would reasonably fear from a key called "clear". The answers are appended as `keys` binds
+/// them ([`answers`], MOD-67 M6 PA-6).
+const CONFIRM_CLEAR: &str = "Remove the DSN from the keyring? This session keeps its current connection; the next launch starts offline.";
 
 /// D14's question, written from `CacheStore::rebuild`'s own body; the table count is
 /// [`MIRRORED_TABLES`]'s, so a table joining the mirror cannot leave the copy behind.
@@ -149,10 +168,16 @@ const CONFIRM_CLEAR: &str = "Remove the DSN from the keyring? This session keeps
 /// Both lists, always. The action is never extended to clear anything else — if it were, one of
 /// these two halves would quietly stop being true, and a confirmation that is wrong about what it
 /// destroys is worse than no confirmation at all.
-fn confirm_rebuild() -> String {
-    format!(
-        "Rebuild the mirror? Survives: the file, schema_version, db_fingerprint, built_at. Goes: the {} mirrored tables, cache_cursor, last_full_refresh_at. The next refresh pass refills it. y / n",
-        MIRRORED_TABLES.len()
+///
+/// Ends in `answers`, the keys that answer it ([`answers`], MOD-67 M6
+/// PA-6).
+fn confirm_rebuild(answers: &str) -> String {
+    asked(
+        &format!(
+            "Rebuild the mirror? Survives: the file, schema_version, db_fingerprint, built_at. Goes: the {} mirrored tables, cache_cursor, last_full_refresh_at. The next refresh pass refills it.",
+            MIRRORED_TABLES.len()
+        ),
+        answers,
     )
 }
 
@@ -303,7 +328,7 @@ pub struct ConnectionSection {
     selected: usize,
     /// Browsing, typing, or being asked a question.
     mode: Mode,
-    /// The last outcome, one line on the hint row or under the field.
+    /// The last outcome, on the notice row under the pane in Browse, under the field otherwise.
     notice: Option<Notice>,
     /// The write in flight, by [`StoreRequest::name`]. A second one is refused until the reply:
     /// the staleness index keeps only the newest request of a kind, so two writes of one kind
@@ -382,13 +407,14 @@ impl ConnectionSection {
 
     /// What `c` says when there is nothing to clear: the DSN row's own words, so the refusal and
     /// the row cannot disagree about why.
-    fn dsn_row_refusal(&self) -> String {
+    fn dsn_row_refusal(&self, keys: &Keys) -> String {
         self.dsn_state().map_or_else(
             || NOT_READ.to_owned(),
             |state| {
                 dsn_row(
                     state,
                     self.snapshot.as_ref().and_then(|s| s.dsn_summary.as_ref()),
+                    keys,
                 )
             },
         )
@@ -533,14 +559,14 @@ impl ConnectionSection {
     }
 
     /// The value column of one row (D16), before wrapping.
-    fn row_text(&self, row: Row) -> String {
+    fn row_text(&self, row: Row, keys: &Keys) -> String {
         let Some(snapshot) = &self.snapshot else {
             return NOT_READ.to_owned();
         };
         match row {
             // D15: the label is the backend's own string, rendered and never parsed.
             Row::Status => format!("{} \u{b7} {}", snapshot.label, attempt_text(snapshot)),
-            Row::Dsn => dsn_row(&snapshot.dsn_state, snapshot.dsn_summary.as_ref()),
+            Row::Dsn => dsn_row(&snapshot.dsn_state, snapshot.dsn_summary.as_ref(), keys),
             Row::Mirror => match &snapshot.mirror {
                 None => DEMO_ROW.to_owned(),
                 Some(mirror) => {
@@ -559,13 +585,13 @@ impl ConnectionSection {
                     )
                 }
             },
-            Row::Rebuild => REBUILD_KEYS.to_owned(),
+            Row::Rebuild => rebuild_keys(keys),
         }
     }
 
     /// One or more lines per row, in [`Row::ALL`] order; a value too long for the frame wraps
     /// under its own column rather than being clipped.
-    fn lines(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    fn lines(&self, width: u16, theme: &Theme, keys: &Keys) -> Vec<Line<'static>> {
         let label_width = label_width();
         let gutter = label_width + 4;
         let room = usize::from(width).saturating_sub(gutter).max(1);
@@ -576,7 +602,7 @@ impl ConnectionSection {
             } else {
                 theme.base
             };
-            let value = self.row_text(row);
+            let value = self.row_text(row, keys);
             for (n, chunk) in wrapped(&value, room).into_iter().enumerate() {
                 let label = if n == 0 { row.label() } else { "" };
                 lines.push(Line::styled(
@@ -589,7 +615,7 @@ impl ConnectionSection {
     }
 
     /// The pane under the rows: the field, or the question, or nothing.
-    fn pane(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    fn pane(&self, width: u16, theme: &Theme, keys: &Keys) -> Vec<Line<'static>> {
         let room = usize::from(width).max(1);
         match &self.mode {
             Mode::Browse => Vec::new(),
@@ -604,7 +630,7 @@ impl ConnectionSection {
                         .spans,
                 );
                 let mut lines = vec![Line::from(spans)];
-                // Under the field rather than on the hint line: a refusal is about what was just
+                // Under the field rather than on the notice row: a refusal is about what was just
                 // typed, and it belongs where the typing is.
                 let guide = match self.dsn_state() {
                     Some(DsnState::Stored) => REPLACES,
@@ -623,9 +649,14 @@ impl ConnectionSection {
                 );
                 lines
             }
-            Mode::ConfirmClear => question(CONFIRM_CLEAR, room, theme),
+            Mode::ConfirmClear => question(
+                &asked(CONFIRM_CLEAR, &answers(keys, views::CONNECTION_CONFIRM)),
+                room,
+                theme,
+            ),
             Mode::ConfirmRebuild { stage } => {
-                let mut lines = question(&confirm_rebuild(), room, theme);
+                let answers = answers(keys, views::CONNECTION_CONFIRM);
+                let mut lines = question(&confirm_rebuild(&answers), room, theme);
                 if matches!(stage, ConfirmStage::InFlight) {
                     lines.push(Line::styled(REBUILDING.to_owned(), theme.dim));
                 }
@@ -634,35 +665,27 @@ impl ConnectionSection {
         }
     }
 
-    /// The one line under the pane: the keys this mode binds, then the last outcome.
-    ///
-    /// The outcome only appears here in Browse; every other mode already draws it in the pane,
-    /// where it is next to what it is about.
-    fn hint(&self, bound: &Keys, width: u16, theme: &Theme) -> Line<'static> {
-        let keys = self.hint_text(bound);
+    /// The one line under the pane: the last outcome, in `theme.error` when it is one to act on
+    /// rather than read (a compare-and-set miss). The keys this mode binds moved to the shell's
+    /// hint row (MOD-67 M6 T2, [`SettingsSection::key_hint`]), so the outcome has the line to
+    /// itself; blank without one.
+    /// Browse only: every other mode draws it in the pane, next to what it is about.
+    fn notice_line(&self, theme: &Theme) -> Line<'static> {
         let (Some(notice), Mode::Browse) = (&self.notice, &self.mode) else {
-            return Line::styled(keys, theme.dim);
+            return Line::default();
         };
-        let style = if notice.is_error() {
-            theme.error
-        } else {
-            theme.dim
-        };
-        let text = notice.text().to_owned();
-        // The outcome wins the line when both do not fit: the keys are on screen every other
-        // frame, and this is the only place the outcome appears.
-        let room = usize::from(width);
-        if cell_width(&keys) + cell_width(&text) + 3 > room {
-            return Line::styled(text, style);
-        }
-        Line::from(vec![
-            Span::styled(format!("{keys} \u{b7} "), theme.dim),
-            Span::styled(text, style),
-        ])
+        Line::styled(
+            notice.text().to_owned(),
+            if notice.is_error() {
+                theme.error
+            } else {
+                theme.dim
+            },
+        )
     }
 
-    /// The keys half of the hint line, through the mode's stack (MOD-67 D9), plus what a write in
-    /// flight adds to it.
+    /// The mode's keys for the shell's hint row, through the mode's stack (MOD-67 D9), plus what a
+    /// write in flight adds to them.
     fn hint_text(&self, bound: &Keys) -> String {
         let spec = match self.mode {
             Mode::Editing(_) => HINT_EDITING,
@@ -835,7 +858,7 @@ impl SettingsSection for ConnectionSection {
                             // keyring at all in a demo session, and over an unreadable one there
                             // is nothing *known* to clear — a delete there would be a guess at a
                             // store that has not answered.
-                            self.refuse(self.dsn_row_refusal());
+                            self.refuse(self.dsn_row_refusal(ctx.keys()));
                         }
                     }
                     return Handled::Consumed;
@@ -906,8 +929,12 @@ impl SettingsSection for ConnectionSection {
         }
     }
 
+    fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
+        super::key_line(self.hint_text(keys), theme)
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let pane = self.pane(area.width, ctx.theme);
+        let pane = self.pane(area.width, ctx.theme, ctx.keys());
         let [rows, pane_area, hint] = Layout::vertical([
             Constraint::Min(3),
             Constraint::Length(u16::try_from(pane.len()).unwrap_or(u16::MAX)),
@@ -926,15 +953,15 @@ impl SettingsSection for ConnectionSection {
                 .wrap(Wrap { trim: true }),
                 rows,
             ),
-            None => frame.render_widget(Paragraph::new(self.lines(rows.width, ctx.theme)), rows),
+            None => frame.render_widget(
+                Paragraph::new(self.lines(rows.width, ctx.theme, ctx.keys())),
+                rows,
+            ),
         }
         if !pane.is_empty() {
             frame.render_widget(Paragraph::new(pane), pane_area);
         }
-        frame.render_widget(
-            Paragraph::new(self.hint(ctx.keys(), area.width, ctx.theme)),
-            hint,
-        );
+        frame.render_widget(Paragraph::new(self.notice_line(ctx.theme)), hint);
     }
 }
 
@@ -953,13 +980,15 @@ fn label_width() -> usize {
 /// The DSN row's value column, and the sentence `c` refuses with when there is nothing to clear.
 ///
 /// One function for both so the row and the refusal cannot disagree about why a key did nothing.
-fn dsn_row(state: &DsnState, summary: Option<&String>) -> String {
+fn dsn_row(state: &DsnState, summary: Option<&String>, keys: &Keys) -> String {
     match (state, summary) {
         (DsnState::NotApplicable, _) => DEMO_ROW.to_owned(),
         (DsnState::NotStored, _) => NOT_STORED.to_owned(),
         (DsnState::Unreadable(why), _) => format!("{UNREADABLE}: {why}"),
         (DsnState::Stored, Some(summary)) => format!("{STORED} \u{2014} {summary}"),
-        (DsnState::Stored, None) => STORED_UNREADABLE.to_owned(),
+        (DsnState::Stored, None) => {
+            stored_unreadable(keys.label(views::CONNECTION_BROWSE, Act::Edit).as_deref())
+        }
     }
 }
 
@@ -997,6 +1026,30 @@ fn in_flight(busy: &str) -> String {
 mod tests {
     use super::*;
     use crossterm::event::KeyCode;
+
+    /// MOD-67 M6 D4, PA-6: the key-naming rows and questions with their keys unbound.
+    #[test]
+    fn the_connection_sentences_without_their_keys() {
+        assert_eq!(
+            stored_unreadable(Some("e")),
+            "stored \u{2014} not readable by this build; e replaces it"
+        );
+        assert_eq!(
+            stored_unreadable(None),
+            "stored \u{2014} not readable by this build"
+        );
+        assert_eq!(rebuild_keys(&Keys::defaults()), "press Enter or R");
+        let rebuild_only =
+            crate::keys::load_str("version = 1\n[settings.connection]\nactivate = []\n")
+                .expect("loads");
+        assert_eq!(rebuild_keys(&rebuild_only), "press R");
+        let neither = crate::keys::load_str(
+            "version = 1\n[settings.connection]\nactivate = []\nrebuild = []\n",
+        )
+        .expect("loads");
+        assert_eq!(rebuild_keys(&neither), "\u{2014}");
+        assert!(confirm_rebuild("").ends_with("The next refresh pass refills it."));
+    }
 
     /// The hard rule reaches the *mode* as well as the editor: [`ConnectionSection`] derives
     /// `Debug` through [`Mode`], so a variant that printed its own field's text would put a DSN
@@ -1066,35 +1119,31 @@ mod tests {
             "cache_cursor",
             "last_full_refresh_at",
         ] {
-            assert!(confirm_rebuild().contains(named), "`{named}`");
+            assert!(confirm_rebuild("y / n").contains(named), "`{named}`");
         }
         assert!(
-            !confirm_rebuild().contains("pending/"),
+            !confirm_rebuild("y / n").contains("pending/"),
             "D1: `CacheStore::rebuild` has no pending/ buffer to spare"
         );
     }
 
-    /// MOD-60: the hint line measures the notice in cells, so a CJK notice that fits by `char`
-    /// count but not on screen takes the line alone rather than overrunning it. The same rule
-    /// stands in all five sections' hint checks.
+    /// MOD-67 M6 T2: the row under the pane carries the notice alone, and the keys are the
+    /// section's [`SettingsSection::key_hint`], the shell's row.
     #[test]
-    fn a_wide_notice_takes_the_hint_line_alone() {
-        let k = 10;
-        let notice = "\u{6f22}".repeat(k);
+    fn the_notice_row_carries_the_notice_alone() {
+        let notice = "\u{6f22}".repeat(10);
         let section = ConnectionSection {
             notice: Some(Notice::Error(notice.clone())),
             ..ConnectionSection::new()
         };
-        let keys = section.hint_text(Keys::compiled());
-        let width = cell_width(&keys) + k + 3;
-
-        let line = section.hint(
-            Keys::compiled(),
-            u16::try_from(width).expect("a hint this narrow fits u16"),
-            &Theme::default(),
-        );
-
-        assert_eq!(line.spans.len(), 1, "{line:?} against {width}");
+        let theme = Theme::default();
+        let line = section.notice_line(&theme);
+        assert_eq!(line.spans.len(), 1, "{line:?}");
         assert_eq!(line.spans[0].content, notice);
+        assert_eq!(line.style, theme.error);
+        let keys = section
+            .key_hint(Keys::compiled(), &theme)
+            .expect("the defaults bind the keys");
+        assert_eq!(keys.to_string(), section.hint_text(Keys::compiled()));
     }
 }

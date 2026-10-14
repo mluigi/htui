@@ -32,7 +32,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{Ctx, Handled};
-use crate::keys::{Act, KeyChord, Stack, views};
+use crate::keys::{Act, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells;
@@ -91,6 +91,34 @@ pub(crate) fn modal_rest(stack: Stack<'_>, chord: KeyChord) -> Handled {
     } else {
         Handled::Consumed
     }
+}
+
+/// A question's answers as its sentence ends them (MOD-67 M6, PA-6): the first chords of
+/// `confirm.yes` and `confirm.no` through `stack`, `y / n` under the defaults; an unbound side
+/// drops, both unbound is empty.
+pub(crate) fn answers(keys: &Keys, stack: Stack<'_>) -> String {
+    [Act::ConfirmYes, Act::ConfirmNo]
+        .into_iter()
+        .filter_map(|act| keys.label(stack, act))
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+/// `question` ended by `answers` ([`answers`]'s text) after one space, or alone when there are
+/// none (MOD-67 M6, PA-6).
+pub(crate) fn asked(question: &str, answers: &str) -> String {
+    if answers.is_empty() {
+        question.to_owned()
+    } else {
+        format!("{question} {answers}")
+    }
+}
+
+/// A view's keys as the shell's hint row draws them (MOD-67 M6 T2, every tab's
+/// [`Tab::key_hint`](crate::ui::tabs::Tab::key_hint)): `theme.dim`, `None` when no key of the
+/// spec is bound.
+pub(crate) fn key_line(text: String, theme: &Theme) -> Option<Line<'static>> {
+    (!text.is_empty()).then(|| Line::styled(text, theme.dim))
 }
 
 /// `text` in rows of at most `width` cells, its whitespace collapsed: words joined by one space,
@@ -190,6 +218,11 @@ pub trait SettingsSection {
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>);
     /// Draws below the section strip.
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>);
+    /// This section's keys (its mode's spec through its stack, plus what a write in flight adds),
+    /// for the shell's hint row (MOD-67 M6 T2). Defaulted to `None`.
+    fn key_hint(&self, _keys: &Keys, _theme: &Theme) -> Option<Line<'static>> {
+        None
+    }
 }
 
 /// The registered sections, in strip order, plus which one is active.
@@ -415,6 +448,13 @@ impl Tab for SettingsTab {
         self.sections.focus(section)
     }
 
+    /// The active section's keys (MOD-67 M6 T2).
+    fn key_hint(&self, _width: u16, ctx: &Ctx<'_>) -> Option<Line<'static>> {
+        self.sections
+            .active()
+            .and_then(|section| section.key_hint(ctx.keys(), ctx.theme))
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let block = Block::new().borders(Borders::ALL).title(" Settings ");
         let inner = block.inner(area);
@@ -488,6 +528,20 @@ mod tests {
         let other = &buffer[(second, 0)];
         assert_eq!(other.symbol(), "Q");
         assert!(!other.modifier.intersects(marked), "{other:?}");
+    }
+
+    /// MOD-67 M6 PA-6: a question ends in the answers in force, and in none when none is bound.
+    #[test]
+    fn answers_are_the_confirm_keys_in_force() {
+        let keys = Keys::defaults();
+        assert_eq!(answers(&keys, views::CONNECTION_CONFIRM), "y / n");
+        assert_eq!(asked("clear it?", "y / n"), "clear it? y / n");
+        let no_unbound = crate::keys::load_str("version = 1\n[confirm]\nno = []\n").expect("loads");
+        assert_eq!(answers(&no_unbound, views::CONNECTION_CONFIRM), "y");
+        let both_unbound =
+            crate::keys::load_str("version = 1\n[confirm]\nyes = []\nno = []\n").expect("loads");
+        assert_eq!(answers(&both_unbound, views::SECRETS_CONFIRM), "");
+        assert_eq!(asked("clear it?", ""), "clear it?");
     }
 
     /// A ZWJ family: one cluster of five code points, 2 cells.

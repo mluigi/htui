@@ -29,6 +29,6 @@ Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
 │                                                     ││                                           │
 │                                                     ││close ANA-1 as done · 1 runs · 0 commit    │
 │                                                     ││rows · summary v2                          │
-│                                                     ││←/→ resolution · y continue · n cancel     │
 └─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
+←/→ resolution · y continue · n cancel
 Ctrl+c quit · F1 help

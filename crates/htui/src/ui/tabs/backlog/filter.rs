@@ -26,8 +26,9 @@ use crate::store_worker::StoreRequest;
 use crate::ui::cells::{self, cell_width};
 use crate::ui::{FieldOutcome, TextField, Theme};
 
-/// Rows the form takes at the bottom of the list pane: two borders, four rows and the hint.
-pub const FORM_HEIGHT: u16 = 7;
+/// Rows the form takes at the bottom of the list pane: two borders and four rows (its keys are
+/// the shell's hint row since MOD-67 M6 T2).
+pub const FORM_HEIGHT: u16 = 6;
 
 /// The hint under every row but Tags, through [`views::BACKLOG_FILTER`].
 pub const HINT_CHOICES: HintSpec = &[
@@ -430,25 +431,32 @@ fn any(chosen: &[&str]) -> String {
     }
 }
 
-/// Draws the form in `area`, the bottom [`FORM_HEIGHT`] rows of the list pane, its hint through
-/// [`views::BACKLOG_FILTER`].
-pub fn render(frame: &mut Frame<'_>, area: Rect, form: &FilterForm, keys: &Keys, theme: &Theme) {
+/// Draws the form in `area`, the bottom [`FORM_HEIGHT`] rows of the list pane. Its keys are
+/// [`FilterForm::key_hint`], the shell's hint row since MOD-67 M6 T2.
+pub fn render(frame: &mut Frame<'_>, area: Rect, form: &FilterForm, theme: &Theme) {
     let block = Block::new().borders(Borders::ALL).title(" Filter ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let width = usize::from(inner.width);
-    let mut lines: Vec<Line<'static>> = ROWS
+    let lines: Vec<Line<'static>> = ROWS
         .iter()
         .map(|row| form.line(*row, width, theme))
         .collect();
-    let hint = if form.row == FilterRow::Tags {
-        HINT_TAGS
-    } else {
-        HINT_CHOICES
-    };
-    let hint = keys.hint(views::BACKLOG_FILTER, hint);
-    lines.push(Line::styled(cells::clip(&hint, width), theme.dim));
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+impl FilterForm {
+    /// The focused row's keys for the shell's hint row (MOD-67 M6 T2): [`HINT_TAGS`] on Tags,
+    /// [`HINT_CHOICES`] elsewhere, through [`views::BACKLOG_FILTER`].
+    #[must_use]
+    pub fn key_hint(&self, keys: &Keys) -> String {
+        let spec = if self.row == FilterRow::Tags {
+            HINT_TAGS
+        } else {
+            HINT_CHOICES
+        };
+        keys.hint(views::BACKLOG_FILTER, spec)
+    }
 }
 
 #[cfg(test)]

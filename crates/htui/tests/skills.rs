@@ -1616,7 +1616,7 @@ async fn a_proposal_accepted_saves_as_the_next_version() {
     harness.key("enter");
     let frame = harness.render();
     assert!(
-        notice(&frame).contains("proposal accepted \u{2014} Ctrl+S saves it"),
+        notice(&frame).contains("proposal accepted \u{2014} Ctrl+s saves it"),
         "{frame}"
     );
     assert!(
@@ -1917,5 +1917,66 @@ async fn a_rebound_library_import_opens_the_form_and_i_is_inert() {
     assert!(
         frame.contains(" import skills "),
         "`M` opens the form: {frame}"
+    );
+}
+
+/// MOD-67 M6 D4: a rebound save key is the one the Library's notices name, after an `$EDITOR`
+/// return and after a stale save alike.
+#[tokio::test]
+async fn a_rebound_save_key_is_named_by_the_skills_notices() {
+    let store = MemStore::demo();
+    let mut harness = open_with_keys(store.clone(), "[form]\nsave = \"f2\"\n").await;
+    select(&mut harness, "rust-style");
+    harness.key("E");
+    let Some((tab, _)) = harness.app().take_external_edit() else {
+        panic!("`E` asked for the editor");
+    };
+    harness.app().finish_external_edit(
+        tab,
+        ExternalEditOutcome::Edited("Prefer `expect`.\n".to_owned()),
+    );
+    let frame = harness.render();
+    assert!(
+        notice(&frame).contains("edited in $EDITOR \u{2014} F2 saves"),
+        "{frame}"
+    );
+
+    let elsewhere = store
+        .add_skill_version(
+            ids::SKILL_RUST_STYLE,
+            2,
+            NewSkillVersion {
+                body: "Saved elsewhere.".to_owned(),
+                source: serde_json::json!({}),
+                created_by: ids::USER,
+            },
+        )
+        .await
+        .expect("the direct write");
+    assert!(matches!(elsewhere, CasOutcome::Applied(ref row) if row.version == 3));
+    harness.key("f2");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        notice(&frame).contains("your draft is kept and F2 saves it as v4"),
+        "{frame}"
+    );
+}
+
+/// MOD-67 M6 D4: a rebound edit key is the one a refused name sends the user to.
+#[tokio::test]
+async fn a_rebound_reload_and_edit_key_are_named() {
+    let mut harness = open_with_keys(
+        MemStore::demo(),
+        "[skills.library]\nreload = \"f5\"\nedit = \"o\"\n",
+    )
+    .await;
+    harness.key("n");
+    type_text(&mut harness, "tests");
+    harness.key("enter");
+    let frame = harness.render();
+    assert!(
+        notice(&frame).contains("`tests` exists \u{2014} select it and press o"),
+        "{frame}"
     );
 }

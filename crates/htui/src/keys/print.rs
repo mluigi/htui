@@ -149,7 +149,22 @@ close = ["esc"]  # close"#;
                        end        = [\"esc\"]         # end chat (twice)\n\
                        thoughts   = [\"t\"]           # thoughts\n\
                        top        = [\"g\"]           # top\n\
-                       bottom     = [\"G\"]           # bottom\n"
+                       bottom     = [\"G\"]           # bottom\n\
+                       \n\
+                       [queue]\n\
+                       move_down = [\"J\"]      # move down\n\
+                       move_up   = [\"K\"]      # move up\n\
+                       pause     = [\"P\"]      # pause / resume\n\
+                       dequeue   = [\"Q\"]      # dequeue\n\
+                       open      = [\"enter\"]  # open\n\
+                       \n\
+                       [picker]\n\
+                       open       = [\"enter\", \"l\"]      # open directory\n\
+                       parent     = [\"h\", \"backspace\"]  # parent directory\n\
+                       choose     = [\"s\"]               # choose\n\
+                       choose_dir = [\"S\"]               # choose this directory\n\
+                       go_to      = [\"/\"]               # go to path\n\
+                       hidden     = [\".\"]               # show hidden\n"
             ),
             "{printed}"
         );
@@ -287,6 +302,36 @@ close = ["esc"]  # close"#;
         assert_eq!(quote("ctrl-f"), "\"ctrl-f\"");
         let keys = load_str("[global]\nquit = [\"\\\\\"]\n").expect("a backslash chord loads");
         assert_eq!(load_str(&print(&keys)), Ok(keys));
+    }
+
+    /// MOD-67 M6 D9 low 1 (PA-2): a view row the file pins to its compiled derivation while the
+    /// file moves its shared row is the user's change, so it prints `(changed)`, and the print
+    /// reads back to the same keys and re-prints byte for byte.
+    #[test]
+    fn a_view_row_pinned_to_its_default_while_its_shared_row_moves_is_marked() {
+        let keys = load_str(
+            "version = 1\n[form]\nnext_field = [\"ctrl-n\"]\n[settings.agents]\n\
+             next_field = [\"tab\", \"down\"]\n",
+        )
+        .expect("the file loads");
+        let printed = print(&keys);
+        let agents = printed
+            .split("\n\n")
+            .find(|table| table.starts_with("[settings.agents]\n"))
+            .expect("an agents table");
+        let next_field = agents
+            .lines()
+            .find(|line| line.starts_with("next_field "))
+            .unwrap_or_else(|| panic!("no next_field row in {agents}"));
+        assert!(next_field.contains(r#"= ["tab", "down"]"#), "{next_field}");
+        assert!(
+            next_field.ends_with("# next field (changed)"),
+            "{next_field}"
+        );
+        assert_eq!(printed.matches("(changed)").count(), 2, "{printed}");
+        let reloaded = load_str(&printed).expect("the print loads");
+        assert_eq!(reloaded, keys);
+        assert_eq!(print(&reloaded), printed);
     }
 
     #[test]

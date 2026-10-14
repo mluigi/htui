@@ -216,7 +216,7 @@ async fn the_registry_lists_one_line_per_persona() {
         "the detail line sits under the cursor row: {frame}"
     );
     assert!(lines[2].starts_with("reviewer \u{b7} Reviews"), "{frame}");
-    assert!(frame.contains(BROWSE_KEYS), "{frame}");
+    assert!(bench.key_hint(&section).contains(BROWSE_KEYS), "{frame}");
     insta::assert_snapshot!("browse", frame);
 }
 
@@ -439,7 +439,7 @@ async fn e_opens_the_prefilled_form() {
             "{line}: {frame}"
         );
     }
-    assert!(frame.contains(FORM_EDIT_KEYS), "{frame}");
+    assert!(bench.key_hint(&section).contains(FORM_EDIT_KEYS), "{frame}");
     insta::assert_snapshot!("form", frame);
 }
 
@@ -473,7 +473,7 @@ async fn an_unchanged_form_sends_nothing() {
     assert!(!section.captures_input(), "the form closed");
     let frame = frame(&bench, &section);
     assert!(frame.contains(UNCHANGED), "{frame}");
-    assert!(frame.contains(BROWSE_KEYS), "{frame}");
+    assert!(bench.key_hint(&section).contains(BROWSE_KEYS), "{frame}");
 }
 
 fn one_rule() -> PersonaRule {
@@ -571,7 +571,7 @@ async fn b_opens_the_body_and_ctrl_s_sends_the_body_only() {
 
     let opened = frame(&bench, &section);
     assert!(opened.contains("body of `architect`"), "{opened}");
-    assert!(opened.contains(EDITOR_KEYS), "{opened}");
+    assert!(bench.key_hint(&section).contains(EDITOR_KEYS), "{opened}");
     insta::assert_snapshot!("body", opened);
 
     type_text(&bench, &mut section, "Extra.");
@@ -1027,7 +1027,7 @@ async fn d_asks_and_y_sends_delete_persona() {
         asked.contains("delete persona `reviewer`? a persona bound to a phase is refused."),
         "{asked}"
     );
-    assert!(asked.contains(DELETING_KEYS), "{asked}");
+    assert!(bench.key_hint(&section).contains(DELETING_KEYS), "{asked}");
     insta::assert_snapshot!("delete_ask", asked);
 
     bench.key(&mut section, "y");
@@ -1047,7 +1047,7 @@ async fn n_or_esc_at_the_question_sends_nothing() {
     for stop in ["n", "esc"] {
         keys(&bench, &mut section, &["d", stop]);
         assert!(!section.captures_input(), "{stop}: back to Browse");
-        assert!(frame(&bench, &section).contains(BROWSE_KEYS), "{stop}");
+        assert!(bench.key_hint(&section).contains(BROWSE_KEYS), "{stop}");
     }
     assert!(bench.drained().is_empty(), "nothing at all was emitted");
 }
@@ -1217,7 +1217,7 @@ async fn an_import_with_a_refusal_or_a_drop_opens_the_report() {
         report.starts_with("imported 1 \u{b7} refused 2 \u{b7} skipped 1"),
         "{report}"
     );
-    assert!(report.contains(REPORT_KEYS), "{report}");
+    assert!(bench.key_hint(&section).contains(REPORT_KEYS), "{report}");
     insta::assert_snapshot!("import_report", report);
 
     bench.key(&mut section, "j");
@@ -1230,7 +1230,7 @@ async fn an_import_with_a_refusal_or_a_drop_opens_the_report() {
 
     bench.key(&mut section, "esc");
     assert!(!section.captures_input(), "back to Browse");
-    assert!(frame(&bench, &section).contains(BROWSE_KEYS));
+    assert!(bench.key_hint(&section).contains(BROWSE_KEYS));
 }
 
 #[tokio::test]
@@ -1273,11 +1273,11 @@ async fn an_import_landing_over_an_editor_says_the_counts() {
         "{report}"
     );
     assert!(report.contains("gortex-search.md"), "{report}");
-    assert!(report.contains(REPORT_KEYS), "{report}");
+    assert!(bench.key_hint(&section).contains(REPORT_KEYS), "{report}");
 
     bench.key(&mut section, "esc");
     assert!(!section.captures_input(), "back to Browse");
-    assert!(frame(&bench, &section).contains(BROWSE_KEYS));
+    assert!(bench.key_hint(&section).contains(BROWSE_KEYS));
 }
 
 /// R1 M-1 (OQ-7, R-13: every drop is named): an import whose only issue is dropped `mcp__`
@@ -1312,7 +1312,7 @@ async fn an_import_with_only_drops_landing_over_an_editor_keeps_its_report() {
     bench.key(&mut section, "esc");
     let report = frame(&bench, &section);
     assert!(section.captures_input(), "the report opened: {report}");
-    assert!(report.contains(REPORT_KEYS), "{report}");
+    assert!(bench.key_hint(&section).contains(REPORT_KEYS), "{report}");
     assert!(
         shows(&report, "dropped from `tools`: `mcp__gortex__search`"),
         "the drop is named: {report}"
@@ -1496,7 +1496,7 @@ async fn alt_y_at_the_delete_question_deletes_nothing() {
         assert!(section.captures_input(), "{chord}: still asking");
     }
     assert!(requests(&bench).is_empty(), "no chord sent the delete");
-    assert!(frame(&bench, &section).contains(DELETING_KEYS));
+    assert!(bench.key_hint(&section).contains(DELETING_KEYS));
 
     bench.key(&mut section, "y");
     assert!(
@@ -1591,7 +1591,9 @@ async fn a_rebound_save_saves_the_body() {
     bench.key(&mut section, "b");
     let opened = frame(&bench, &section);
     assert!(
-        opened.contains("F2 save \u{b7} Esc cancel \u{b7} Enter breaks the line"),
+        bench
+            .key_hint(&section)
+            .contains("F2 save \u{b7} Esc cancel \u{b7} Enter breaks the line"),
         "{opened}"
     );
 

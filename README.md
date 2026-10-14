@@ -244,7 +244,9 @@ error in either direction (such as `esc` for `[global] help`, or `f1` for `[over
 A table named after a Settings section, a Skills view, `[requirements]`, a Backlog sub-tab
 (`[backlog.runs]`, `[backlog.docs]`, …), `[chat]` or a pop-up changes a shared action there alone:
 `[settings.boxes] reload = ["f5"]` reloads Boxes on `F5`, and every other section keeps `r`.
-`[backlog]` holds the Backlog's own keys (filter, new item, queue, …);
+`[backlog]` holds the Backlog's own keys (filter, new item, queue, …), `[queue]` the queue
+overlay's (`Ctrl+q`: move, reorder, pause, dequeue, open) and `[picker]` the directory picker's
+(**Settings › Hierarchy**, `b`);
 `[backlog.runs] filter = ["/"]` moves the filter key in the Runs sub-tab alone.
 `htui --print-keys` prints every table that has keys. To see what a table may change, write a name
 htui does not know in it: the error lists every action that table has and every shared action it
@@ -263,10 +265,16 @@ they keep `Down`; write `[settings.agents] next_field = [...]` to replace it in 
 While a text field takes typing, the keys the field uses itself (letters, arrows, `Enter`, `Esc`)
 stay the field's. In the same way, keys a screen keeps for itself (a choice's value keys, such as
 `Space` and `h` / `l` on the Backlog filter's rows, or the digits that answer a permission
-request) cannot be given to an action there: `[backlog.filter_form] clear = ["space"]` is refused.
+request, the Requirements priority's `m` / `l` / `Space` / `←` / `→`, or the attachment form's
+activation `Space`) cannot be given to an action there: `[backlog.filter_form] clear = ["space"]`
+is refused.
 `Tab` still leaves a Skills editor with the draft kept. In the Backlog's item
 form and the Notes and Docs editors, `[form] save` and `[form] external_editor` replace `Ctrl+s`
 and `Ctrl+e`.
+
+The row above the status line names the keys of what you are in, and follows your `keys.toml`;
+`?` lists all of them. Every action with its default keys is in
+[`docs/htui-keys.md`](docs/htui-keys.md), the output of `htui --default-keys --print-keys`.
 
 ### Backlog
 
@@ -286,8 +294,9 @@ the item cites).
 | `Q` / `P` | Queue or dequeue the item / pause or resume this box's queue |
 | `?` | Every key of the pane you are in |
 
-The list's last row names the Backlog's own keys, and the Runs sub-tab's last row the keys of the
-view it shows; both follow your `keys.toml`.
+The row above the status line names the keys of the focused sub-tab, then the list's when they
+fit. `Ctrl+q` opens this box's queue: `j` / `k` move, `J` / `K` reorder, `P` pauses or resumes,
+`Q` dequeues and `Enter` opens the item.
 
 **Runs.** The Runs sub-tab lists an item's runs and their steps. Move between steps with `J` / `K`.
 If an action isn't allowed right now, the status line says why and nothing happens.
@@ -368,13 +377,13 @@ history. Withdrawn requirements stay in the list, dimmed and marked `✕`.
 | `W` | Withdraw the requirement (asks you to type its key to confirm) |
 | `r` | Read the requirements again |
 
-In the forms, `Tab` moves between fields and `Ctrl+S` saves. An amend or a withdraw names the
+In the forms, `Tab` moves between fields and `Ctrl+s` saves. An amend or a withdraw names the
 item that decided it, and that item then cites the requirement.
 
 A project's requirements belong to whoever first added an area or a requirement to it. Anyone
 can read them, but only the owner can add, amend or withdraw; for everyone else, and while offline,
 the write keys are greyed out and the status line says why. If someone else changed a requirement
-while you were amending it, your text is kept and `Ctrl+S` saves over the new version.
+while you were amending it, your text is kept and `Ctrl+s` saves over the new version.
 
 ### Chat
 

@@ -38,12 +38,14 @@ pub mod list;
 use htui_core::model::{ItemId, ItemKindId, ItemSummary, ProjectId, RunId, Scope, Status, StepId};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::text::{Line, Span};
 
 use crate::app::{Action, Ctx, Handled, RevealTarget};
 use crate::editor::ExternalEditOutcome;
 use crate::item_writes::{self, ItemDivergence, ItemFormContext, ItemWrite};
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{QUEUE_REQUEST_NAMES, QueueView, QueueWrite, StoreReply, StoreRequest};
+use crate::ui::cells::cell_width;
 use crate::ui::tabs::backlog::detail::{
     BodyTab, DetailRegistry, DocumentsTab, GraphTab, NotesTab, PromptTab, ReqsTab, RunsTab,
 };
@@ -53,7 +55,7 @@ use crate::ui::tabs::backlog::item_form::{
 };
 use crate::ui::tabs::backlog::list::{ListView, Selection};
 use crate::ui::tabs::registry::{CLOSE_THE_FIELD_FIRST, Tab, TabId};
-use crate::ui::tabs::settings::modal_rest;
+use crate::ui::tabs::settings::{key_line, modal_rest};
 use crossterm::event::{KeyEvent, MouseEvent};
 
 /// Width of the list pane, as a percentage of the body region.
@@ -87,6 +89,22 @@ const LIST_HINT: HintSpec = &[
     Hint::One(Act::BacklogNewItem, "new"),
     Hint::One(Act::Edit, "edit"),
 ];
+
+/// What joins the focused pane's keys and [`LIST_HINT`] in the shell's hint row (MOD-67 M6 T2).
+const LIST_SEP: &str = " \u{b7} ";
+
+/// `line`'s spans, each with the line's own style under its own, so two lines join into one row
+/// without either losing its look (MOD-67 M6 T2).
+fn styled_spans(line: Line<'static>) -> Vec<Span<'static>> {
+    let base = line.style;
+    line.spans
+        .into_iter()
+        .map(|span| {
+            let style = base.patch(span.style);
+            span.style(style)
+        })
+        .collect()
+}
 
 /// MOD-12 D9: what `Q` says with the cursor on a project header.
 const NO_ITEM_TO_QUEUE: &str = "select an item to queue";
@@ -183,9 +201,10 @@ impl BacklogTab {
     /// Identity of the Backlog tab.
     pub const ID: TabId = TabId("backlog");
 
-    /// The list hint row's text (MOD-67 M5 Q1 a), read through the active pane's stack; `None`
-    /// while the filter form, the item form or a sub-tab captures, since a hint for keys a field
-    /// is typing would lie, and when no key of [`LIST_HINT`] is bound.
+    /// The list's own keys (MOD-67 M5 Q1 a, the shell's hint row since M6 T2), read through the
+    /// active pane's stack; `None` while the filter form, the item form or a sub-tab captures,
+    /// since a hint for keys a field is typing would lie, and when no key of [`LIST_HINT`] is
+    /// bound.
     fn list_hint(&self, keys: &Keys) -> Option<String> {
         if self.form.is_some() || self.item_form.is_some() || self.detail.captures_input() {
             return None;
@@ -523,7 +542,15 @@ impl BacklogTab {
             | QueueWrite::Moved { .. }
             | QueueWrite::Stale { .. } => String::new(),
         };
-        ctx.emit(Action::Error(queue_sentence(write, &key, view)));
+        let pause = ctx
+            .keys()
+            .label(self.detail.key_stack(), Act::BacklogPauseQueue);
+        ctx.emit(Action::Error(queue_sentence(
+            write,
+            &key,
+            view,
+            pause.as_deref(),
+        )));
     }
 
     /// A key while the item form is open (D8, A7).
@@ -660,7 +687,10 @@ impl BacklogTab {
                     form.settle(Some(if refused {
                         message.to_owned()
                     } else {
-                        mint_may_have_landed(message)
+                        mint_may_have_landed(
+                            message,
+                            ctx.keys().label(views::ITEM_FORM, Act::FormSave).as_deref(),
+                        )
                     }));
                 }
                 if !refused {
@@ -839,6 +869,38 @@ impl Tab for BacklogTab {
         Some(self.detail.key_stack())
     }
 
+    /// The keys of what holds the Backlog's keyboard (MOD-67 M6 T2): the divergence view's, the
+    /// item form's or the filter form's while one is open; a capturing pane's alone; browsing,
+    /// the focused pane's [`DetailTab::key_hint`](detail::DetailTab::key_hint), then ` · ` and
+    /// `LIST_HINT` when the joined row fits `width`, the pane's alone when not, `LIST_HINT`
+    /// alone when the pane has none (Body, Prompt).
+    fn key_hint(&self, width: u16, ctx: &Ctx<'_>) -> Option<Line<'static>> {
+        let (keys, theme) = (ctx.keys(), ctx.theme);
+        let dim = |text| key_line(text, theme);
+        if let Some(form) = &self.item_form {
+            return dim(match form.resolving() {
+                Some(view) => view.hint(keys),
+                None => form.key_hint(keys),
+            });
+        }
+        if let Some(form) = &self.form {
+            return dim(form.key_hint(keys));
+        }
+        let pane = self.detail.key_hint(keys, theme);
+        let list = self.list_hint(keys).and_then(dim);
+        match (pane, list) {
+            (Some(pane), Some(list))
+                if pane.width() + cell_width(LIST_SEP) + list.width() <= usize::from(width) =>
+            {
+                let mut spans = styled_spans(pane);
+                spans.push(Span::styled(LIST_SEP, theme.dim));
+                spans.extend(styled_spans(list));
+                Some(Line::from(spans))
+            }
+            (pane, list) => pane.or(list),
+        }
+    }
+
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         // MOD-12 D9: the queue read and writes, ahead of the list's.
         match reply {
@@ -929,7 +991,7 @@ impl Tab for BacklogTab {
     /// key owner is the asker, and the item form owns keys first.
     fn on_external_edit(&mut self, outcome: ExternalEditOutcome, ctx: &mut Ctx<'_>) {
         match self.item_form.as_mut() {
-            Some(form) => form.on_external_edit(outcome),
+            Some(form) => form.on_external_edit(outcome, ctx.keys()),
             None => self.detail.on_external_edit(outcome, ctx),
         }
     }
@@ -955,7 +1017,7 @@ impl Tab for BacklogTab {
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         // MOD-13 milestone 3 D4: the divergence view takes the whole tab area, list pane included.
         if let Some(view) = self.item_form.as_ref().and_then(ItemForm::resolving) {
-            divergence::render(frame, area, view, ctx.keys(), ctx.theme);
+            divergence::render(frame, area, view, ctx.theme);
             return;
         }
         let [left, right] = panes(area);
@@ -979,16 +1041,13 @@ impl Tab for BacklogTab {
             selected: self.selected,
             filter: summary.as_deref(),
         };
-        let hint = self.list_hint(ctx.keys());
-        list::render(frame, list_area, &view, hint.as_deref(), ctx.theme);
+        list::render(frame, list_area, &view, ctx.theme);
         if let (Some(form), Some(at)) = (&self.form, form_area) {
-            filter::render(frame, at, form, ctx.keys(), ctx.theme);
+            filter::render(frame, at, form, ctx.theme);
         }
         // MOD-13 milestone 2 D8: the open item form takes the detail pane's place.
         match &self.item_form {
-            Some(form) => {
-                ctx.claim_editor_area(item_form::render(frame, right, form, ctx.keys(), ctx.theme))
-            }
+            Some(form) => ctx.claim_editor_area(item_form::render(frame, right, form, ctx.theme)),
             None => detail::render(
                 frame,
                 right,
@@ -1051,8 +1110,15 @@ const DEMO_NOTHING_ADMITTED: &str = "demo: nothing is admitted";
 
 /// MOD-12 D9: the status line after a queue write. `n` is the queue's length after it. In
 /// `htui --demo` (`view.demo`) a running queue says nothing is admitted (review L3). The queue
-/// overlay says its writes with it too (M3 review R1 N2).
-pub(crate) fn queue_sentence(write: &QueueWrite, key: &str, view: &QueueView) -> String {
+/// overlay says its writes with it too (M3 review R1 N2). `pause` is the label of the key that
+/// pauses on the caller's stack (MOD-67 M6 X-S): a refused pause names it, and drops the clause
+/// that would when none is bound.
+pub(crate) fn queue_sentence(
+    write: &QueueWrite,
+    key: &str,
+    view: &QueueView,
+    pause: Option<&str>,
+) -> String {
     let n = view.entries.len();
     match *write {
         QueueWrite::Queued { .. } => match (view.open_batch.is_some(), view.demo) {
@@ -1090,12 +1156,20 @@ pub(crate) fn queue_sentence(write: &QueueWrite, key: &str, view: &QueueView) ->
         QueueWrite::Moved { moved: false } => "already at that end of the queue".to_owned(),
         // M3 review R1 M1: `P` sent over a queue that changed since it was read; `view` is the
         // queue now.
-        QueueWrite::Stale { pause: true } if view.open_batch.is_none() => {
-            "queue already paused: its batch closed before P reached it".to_owned()
-        }
-        QueueWrite::Stale { pause: true } => {
-            "queue not paused: it was resumed since it was read; P again pauses it".to_owned()
-        }
+        QueueWrite::Stale { pause: true } if view.open_batch.is_none() => match pause {
+            Some(pause) => {
+                format!("queue already paused: its batch closed before {pause} reached it")
+            }
+            None => "queue already paused: its batch closed first".to_owned(),
+        },
+        QueueWrite::Stale { pause: true } => match pause {
+            Some(pause) => {
+                format!(
+                    "queue not paused: it was resumed since it was read; {pause} again pauses it"
+                )
+            }
+            None => "queue not paused: it was resumed since it was read".to_owned(),
+        },
         QueueWrite::Stale { pause: false } if view.open_batch.is_some() => {
             "queue already running: it was resumed since it was read".to_owned()
         }
@@ -1138,7 +1212,7 @@ mod tests {
 
     use super::*;
     use crate::app::{Emit, TopBarState};
-    use crate::keymap::Keymap;
+    use crate::keys::Keys;
     use crate::store_worker::Origin;
     use crate::testkit::DEFAULT_SIZE;
     use crate::ui::Theme;
@@ -1296,7 +1370,56 @@ mod tests {
             ),
         ];
         for (write, view, sentence) in cases {
-            assert_eq!(queue_sentence(&write, "K-1", &view), sentence, "{write:?}");
+            assert_eq!(
+                queue_sentence(&write, "K-1", &view, Some("P")),
+                sentence,
+                "{write:?}"
+            );
+        }
+    }
+
+    /// MOD-67 M6 X-S (PA-5): a refused pause names the key that pauses, the one the caller's
+    /// stack binds; with no key bound the sentence drops the clause that would name one.
+    #[test]
+    fn a_rebound_pause_key_is_the_one_the_stale_sentence_names() {
+        let paused = QueueView {
+            entries: vec![ItemId::new()],
+            open_batch: None,
+            demo: false,
+        };
+        let running = QueueView {
+            open_batch: Some(htui_core::model::BatchId::new()),
+            ..paused.clone()
+        };
+        let stale = QueueWrite::Stale { pause: true };
+        let cases = [
+            (
+                &paused,
+                Some("X"),
+                "queue already paused: its batch closed before X reached it",
+            ),
+            (
+                &running,
+                Some("X"),
+                "queue not paused: it was resumed since it was read; X again pauses it",
+            ),
+            (
+                &paused,
+                None,
+                "queue already paused: its batch closed first",
+            ),
+            (
+                &running,
+                None,
+                "queue not paused: it was resumed since it was read",
+            ),
+        ];
+        for (view, pause, sentence) in cases {
+            assert_eq!(
+                queue_sentence(&stale, "", view, pause),
+                sentence,
+                "{pause:?}"
+            );
         }
     }
 
@@ -1603,9 +1726,9 @@ mod tests {
             queue_writing: None,
         };
 
-        let (top_bar, keymap, theme, emit) = (
+        let (top_bar, keys, theme, emit) = (
             TopBarState::default(),
-            Keymap::new(),
+            Keys::compiled(),
             Theme::default(),
             Emit::default(),
         );
@@ -1613,7 +1736,7 @@ mod tests {
             &scope,
             &projects,
             &top_bar,
-            &keymap,
+            keys,
             &theme,
             Origin::Tab(BacklogTab::ID),
             &emit,
@@ -1670,9 +1793,9 @@ mod tests {
             .expect("the demo holds `platform`");
         let scope = Scope::from_workspace(&workspace);
         let projects = store.projects(&scope).await.expect("the projects");
-        let (top_bar, keymap, theme, emit) = (
+        let (top_bar, keys, theme, emit) = (
             TopBarState::default(),
-            Keymap::new(),
+            Keys::compiled(),
             Theme::default(),
             Emit::default(),
         );
@@ -1680,7 +1803,7 @@ mod tests {
             &scope,
             &projects,
             &top_bar,
-            &keymap,
+            keys,
             &theme,
             Origin::Tab(BacklogTab::ID),
             &emit,
@@ -1785,9 +1908,9 @@ mod tests {
             queue_intent: None,
             queue_writing: None,
         };
-        let (top_bar, keymap, theme, emit) = (
+        let (top_bar, keys, theme, emit) = (
             TopBarState::default(),
-            Keymap::new(),
+            Keys::compiled(),
             Theme::default(),
             Emit::default(),
         );
@@ -1795,7 +1918,7 @@ mod tests {
             &scope,
             &projects,
             &top_bar,
-            &keymap,
+            keys,
             &theme,
             Origin::Tab(BacklogTab::ID),
             &emit,
@@ -1837,9 +1960,9 @@ mod tests {
             queue_intent: None,
             queue_writing: None,
         };
-        let (top_bar, keymap, theme, emit) = (
+        let (top_bar, keys, theme, emit) = (
             TopBarState::default(),
-            Keymap::new(),
+            Keys::compiled(),
             Theme::default(),
             Emit::default(),
         );
@@ -1847,7 +1970,7 @@ mod tests {
             &scope,
             &projects,
             &top_bar,
-            &keymap,
+            keys,
             &theme,
             Origin::Tab(BacklogTab::ID),
             &emit,
@@ -1877,7 +2000,7 @@ mod tests {
         items: Vec<ItemSummary>,
         first: Selection,
         top_bar: TopBarState,
-        keymap: Keymap,
+        keys: Keys,
         theme: Theme,
         emit: Emit,
     }
@@ -1891,7 +2014,7 @@ mod tests {
                 items,
                 first,
                 top_bar: TopBarState::default(),
-                keymap: Keymap::new(),
+                keys: Keys::compiled().clone(),
                 theme: Theme::default(),
                 emit: Emit::default(),
             }
@@ -1902,7 +2025,7 @@ mod tests {
                 &self.scope,
                 &self.projects,
                 &self.top_bar,
-                &self.keymap,
+                &self.keys,
                 &self.theme,
                 Origin::Tab(BacklogTab::ID),
                 &self.emit,
@@ -2740,7 +2863,6 @@ mod tests {
                     frame,
                     right,
                     tab.item_form.as_ref().expect("open"),
-                    Keys::compiled(),
                     &Theme::default(),
                 ));
             })
@@ -3471,7 +3593,10 @@ mod tests {
         assert_eq!(press(&mut tab, &bench, KeyCode::Esc), Handled::Consumed);
         assert!(view(&tab).is_none(), "the view closed");
         assert!(tab.item_form.is_some(), "the form stays");
-        assert_eq!(notice(&tab), Some(divergence::still_behind(2)));
+        assert_eq!(
+            notice(&tab),
+            Some(divergence::still_behind(2, Some("Ctrl+s")))
+        );
 
         let again = saved(&mut tab, &bench);
         assert!(
@@ -3544,7 +3669,10 @@ mod tests {
             Handled::Consumed
         );
         assert!(view(&tab).is_none());
-        assert_eq!(notice(&tab), Some(divergence::rebased_on(2)));
+        assert_eq!(
+            notice(&tab),
+            Some(divergence::rebased_on(2, Some("Ctrl+s")))
+        );
         let request = saved(&mut tab, &bench);
         assert!(
             matches!(
@@ -3697,7 +3825,10 @@ mod tests {
         );
         let form = tab.item_form.as_ref().expect("the form stays");
         assert_eq!(form.busy(), None);
-        assert_eq!(notice(&tab), Some(mint_may_have_landed(&why)));
+        assert_eq!(
+            notice(&tab),
+            Some(mint_may_have_landed(&why, Some("Ctrl+s")))
+        );
         assert!(tab.filter.is_empty(), "the filter is cleared");
         let actions = bench.actions();
         assert_eq!(items_reads(&actions), [(ItemFilter::default(), false)]);
@@ -3769,7 +3900,7 @@ mod tests {
         assert!(sentence.contains("may have been written"), "{sentence:?}");
         // Round 2: nothing is re-read and no form is open, so neither is promised.
         assert!(!sentence.contains("re-read"), "{sentence:?}");
-        assert!(!sentence.contains("Ctrl+S"), "{sentence:?}");
+        assert!(!sentence.contains("Ctrl+s"), "{sentence:?}");
         assert_eq!(*sentence, mint_may_have_landed_in_the_old_scope(&why));
         assert!(tab.item_form.is_none());
     }
@@ -4042,7 +4173,10 @@ mod tests {
             ExternalEditOutcome::Edited("New body.".to_owned()),
             &mut bench.ctx(),
         );
-        assert_eq!(notice(&tab).as_deref(), Some(crate::editor::EDITED));
+        assert_eq!(
+            notice(&tab).as_deref(),
+            Some(crate::editor::edited(Some("Ctrl+s")).as_str())
+        );
         let request = saved(&mut tab, &bench);
         assert!(
             matches!(
@@ -4176,7 +4310,10 @@ mod tests {
             ExternalEditOutcome::Edited("New body.".to_owned()),
             &mut bench.ctx(),
         );
-        assert_eq!(notice(&tab).as_deref(), Some(crate::editor::EDITED));
+        assert_eq!(
+            notice(&tab).as_deref(),
+            Some(crate::editor::edited(Some("Ctrl+s")).as_str())
+        );
         assert!(seen.borrow().is_empty());
     }
 
@@ -4248,37 +4385,83 @@ mod tests {
     const DEFAULT_LIST_HINT: &str =
         "j/k move \u{b7} h/l sub-tab \u{b7} f filter \u{b7} N new \u{b7} e edit";
 
-    /// The list pane's last inner row in `frame`: the row above its bottom border, borders and
-    /// trailing blanks off.
-    fn list_last_row(frame: &str) -> String {
-        let rows: Vec<&str> = frame.lines().collect();
-        let bottom = rows
-            .iter()
-            .rposition(|row| row.starts_with('\u{2514}'))
-            .unwrap_or_else(|| panic!("the list pane has a bottom border:\n{frame}"));
-        let (list, _) = rows[bottom - 1]
-            .split_once("\u{2502}\u{2502}")
-            .unwrap_or_else(|| panic!("the row crosses into the detail pane:\n{frame}"));
-        list.trim_start_matches('\u{2502}').trim_end().to_owned()
+    /// The Backlog's row of the shell's hint row at `width` cells, as text (MOD-67 M6 T2).
+    fn row_at(tab: &BacklogTab, bench: &Bench, width: u16) -> Option<String> {
+        tab.key_hint(width, &bench.ctx())
+            .map(|line| line.to_string())
     }
 
-    /// Q1 (a), PA-5: the hint names the Backlog's own keys in the list pane's 53 inner cells at
-    /// 100 columns, and is drawn on the pane's last inner row.
+    /// Q1 (a), PA-5, MOD-67 M6 T2: the list keys are the shell's hint row: on the Body pane, which
+    /// has none of its own, the row is the list's alone, and the list pane draws none of it.
     #[tokio::test]
-    async fn the_list_hint_fits_the_list_pane_at_100_columns() {
+    async fn the_list_hint_is_the_hint_row_on_the_body_pane() {
         let bench = Bench::new().await;
         let tab = bench.tab();
         let hint = tab.list_hint(Keys::compiled()).expect("nothing captures");
         assert_eq!(hint, DEFAULT_LIST_HINT);
-        let [list, _] = panes(Rect::new(0, 0, 100, 30));
-        let inner = usize::from(list.width) - 2;
-        assert_eq!(inner, 53, "the list pane's inner width at 100 columns");
-        assert!(
-            crate::ui::cells::cell_width(&hint) <= inner,
-            "{hint:?} fits {inner} cells"
+        assert_eq!(
+            row_at(&tab, &bench, 100).as_deref(),
+            Some(DEFAULT_LIST_HINT)
         );
         let frame = drawn(&tab, &bench);
-        assert_eq!(list_last_row(&frame), hint, "drawn last:\n{frame}");
+        assert!(!frame.contains(DEFAULT_LIST_HINT), "{frame}");
+    }
+
+    /// MOD-67 M6 T2: browsing a pane with keys of its own, the pane's lead and the list's follow
+    /// after ` · ` when both fit the row; when they do not, the pane's stand alone.
+    #[tokio::test]
+    async fn the_pane_hint_leads_and_the_list_keys_follow_when_they_fit() {
+        let bench = Bench::new().await;
+        let Selection::Item(item) = bench.first else {
+            panic!("the first row is an item")
+        };
+        let mut tab = bench.tab();
+        tab.detail.on_item_change(Some(item));
+        assert!(tab.detail.select_id(RunsTab::ID));
+        let pane = tab
+            .detail
+            .key_hint(Keys::compiled(), &Theme::default())
+            .expect("the Runs pane has keys")
+            .to_string();
+        let joined = format!("{pane} \u{b7} {DEFAULT_LIST_HINT}");
+        let fits = u16::try_from(cell_width(&joined)).expect("a narrow row");
+        assert!(fits <= 100, "{joined:?} fits 100 columns");
+        assert_eq!(row_at(&tab, &bench, 100).as_deref(), Some(joined.as_str()));
+        assert_eq!(row_at(&tab, &bench, fits).as_deref(), Some(joined.as_str()));
+        assert_eq!(
+            row_at(&tab, &bench, fits - 1).as_deref(),
+            Some(pane.as_str())
+        );
+        assert_eq!(row_at(&tab, &bench, 30).as_deref(), Some(pane.as_str()));
+    }
+
+    /// MOD-67 M6 T2: a capturing pane's own keys stand alone (the list's do not apply while it
+    /// takes every key), and an open form's are the row.
+    #[tokio::test]
+    async fn a_capturing_pane_shows_only_its_own_keys() {
+        let bench = Bench::new().await;
+        let Selection::Item(item) = bench.first else {
+            panic!("the first row is an item")
+        };
+        let mut tab = bench.tab();
+        tab.detail.on_item_change(Some(item));
+        assert!(tab.detail.select_id(NotesTab::ID));
+        press(&mut tab, &bench, KeyCode::Char('a'));
+        tab.on_reply(&StoreReply::NoteForm { item }, &mut bench.ctx());
+        assert!(tab.detail.captures_input(), "the note area is open");
+        let pane = tab
+            .detail
+            .key_hint(Keys::compiled(), &Theme::default())
+            .expect("the area has keys")
+            .to_string();
+        assert_eq!(row_at(&tab, &bench, 100), Some(pane.clone()));
+        assert!(!pane.contains(DEFAULT_LIST_HINT), "{pane}");
+
+        let mut tab = bench.tab();
+        let form = FilterForm::open(&tab.filter, &bench.projects);
+        let keys = form.key_hint(Keys::compiled());
+        tab.form = Some(form);
+        assert_eq!(row_at(&tab, &bench, 100), Some(keys), "the filter form's");
     }
 
     /// Q1 (a): a hint for keys a field is typing would lie, so the row is not drawn while the

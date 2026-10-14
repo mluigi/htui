@@ -352,7 +352,6 @@ impl Overlay for WaitingList {
 mod tests {
     use super::*;
     use crate::app::{Action, Emit, OverlayAction, RevealTarget, TopBarState};
-    use crate::keymap::Keymap;
     use crate::keys::Keys;
     use crate::store_worker::Origin;
     use crate::ui::cells::cell_width;
@@ -369,7 +368,7 @@ mod tests {
         scope: Scope,
         projects: Vec<ProjectRef>,
         top_bar: TopBarState,
-        keymap: Keymap,
+        keys: Keys,
         theme: Theme,
         emit: Emit,
     }
@@ -386,7 +385,7 @@ mod tests {
                     waiting,
                     ..TopBarState::default()
                 },
-                keymap: Keymap::new(),
+                keys: Keys::compiled().clone(),
                 theme: Theme::default(),
                 emit: Emit::default(),
             }
@@ -397,7 +396,7 @@ mod tests {
                 &self.scope,
                 &self.projects,
                 &self.top_bar,
-                &self.keymap,
+                &self.keys,
                 &self.theme,
                 Origin::Overlay(WaitingList::ID),
                 &self.emit,

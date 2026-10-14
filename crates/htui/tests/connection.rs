@@ -1140,8 +1140,9 @@ fn frame_of(bench: &SectionBench, section: &ConnectionSection) -> String {
     bench.render_section(section, 100)
 }
 
-/// The hint line: the last row of the section's own layout.
-fn hint_of(frame: &str) -> String {
+/// The notice line: the last row of the section's own layout. The keys that shared it moved to
+/// the shell's hint row (MOD-67 M6 T2), [`SectionBench::key_hint`].
+fn notice_of(frame: &str) -> String {
     frame
         .lines()
         .nth(29)
@@ -1377,10 +1378,10 @@ async fn a_valid_dsn_emits_set_dsn_and_marks_busy() {
     );
 
     assert!(!section.captures_input(), "the field closed behind it");
-    let frame = frame_of(&bench, &section);
+    let hint = bench.key_hint(&section);
     assert!(
-        hint_of(&frame).ends_with("set_dsn in flight"),
-        "the hint says what is out: {frame}"
+        hint.ends_with("set_dsn in flight"),
+        "the hint says what is out: {hint}"
     );
 
     // A second write is refused until the first answers (the one-write-in-flight guard, D5).
@@ -1483,8 +1484,8 @@ async fn an_unreadable_keyring_shows_the_reason_and_never_opens_the_editor() {
         "the other rows still answer: {frame}"
     );
     assert!(
-        frame.contains("e edit DSN"),
-        "and the keys are the ordinary ones: {frame}"
+        bench.key_hint(&section).contains("e edit DSN"),
+        "and the keys are the ordinary ones"
     );
     insta::assert_snapshot!("unreadable", frame_of(&bench, &section));
 }
@@ -1568,8 +1569,8 @@ async fn e_opens_a_replacement_field_over_a_stored_dsn() {
     let frame = frame_of(&bench, &section);
     assert!(frame.contains("(19)"), "{frame}");
     assert!(
-        frame.contains("Enter store"),
-        "and the hint is the editor's: {frame}"
+        bench.key_hint(&section).contains("Enter store"),
+        "and the hint is the editor's"
     );
     assert!(
         frame.contains("Enter replaces the stored DSN"),
@@ -1725,7 +1726,7 @@ async fn a_rebound_rebuild_answers_its_new_chord_and_the_hint_names_it() {
     feed(&bench, &mut section, &stored_snapshot());
 
     assert_eq!(
-        hint_of(&frame_of(&bench, &section)),
+        bench.key_hint(&section),
         "e edit DSN \u{b7} c clear DSN \u{b7} X rebuild cache \u{b7} r reload \u{b7} j/k rows"
     );
     assert_eq!(
@@ -1825,15 +1826,15 @@ async fn the_offline_notice_after_set_dsn() {
         answer.offline = offline;
         feed(&bench, &mut section, &answer);
 
-        let hint = hint_of(&frame_of(&bench, &section));
+        let notice = notice_of(&frame_of(&bench, &section));
         if offline {
             assert_eq!(
-                hint,
+                notice,
                 "stored; this session was started with --offline, so it takes effect on the next launch",
-                "the sentence wins the line when the keys do not fit beside it"
+                "the sentence has the line to itself"
             );
         } else {
-            assert!(hint.ends_with("\u{b7} stored"), "{hint}");
+            assert_eq!(notice, "stored");
         }
     }
 }
@@ -1938,7 +1939,7 @@ async fn a_failed_write_shows_the_seams_sentence() {
     let frame = frame_of(&bench, &section);
     assert!(flattened(&frame).contains(DEMO_SESSION), "{frame}");
     assert!(
-        !hint_of(&frame).contains("in flight"),
+        !bench.key_hint(&section).contains("in flight"),
         "and nothing is still out: {frame}"
     );
     assert!(
@@ -2154,4 +2155,29 @@ async fn the_product_registers_connection_after_prompt() {
         harness.render().contains("Rebuild cache"),
         "the fifth `l` would wrap; four reach the last section"
     );
+}
+
+/// MOD-67 M6 D4, PA-6: the Rebuild row names the rebuild key in force, and the clear question
+/// ends in the answers in force; the old `y` answers nothing there.
+#[tokio::test]
+async fn a_rebound_answer_ends_the_question() {
+    let keys =
+        htui::keys::load_str("version = 1\n[settings.connection]\nyes = \"Y\"\nrebuild = \"B\"\n")
+            .expect("the key file loads");
+    let bench = SectionBench::new().await.with_keys(keys);
+    let mut section = ConnectionSection::new();
+    feed(&bench, &mut section, &stored_snapshot());
+
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(frame.contains("press Enter or B"), "{frame}");
+
+    assert_eq!(bench.key(&mut section, "c"), Handled::Consumed);
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(
+        frame.contains("the next launch starts offline. Y / n"),
+        "{frame}"
+    );
+    bench.key(&mut section, "y");
+    assert!(section.captures_input(), "`y` is not an answer any more");
+    assert!(bench.drained().is_empty(), "`y` sends nothing");
 }

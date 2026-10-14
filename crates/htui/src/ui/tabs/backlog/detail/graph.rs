@@ -18,12 +18,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::{Action, Ctx, Handled, RevealTarget};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::StoreReply;
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width, graphemes};
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, PAGE, message};
 use crate::ui::tabs::backlog::list;
+use crate::ui::tabs::settings::key_line;
 use crossterm::event::KeyEvent;
 
 /// The footer's key half (MOD-67 M5): `+/- depth · Enter re-root` with the defaults, read
@@ -774,13 +775,19 @@ impl DetailTab for GraphTab {
             Paragraph::new(lines.split_off(offset.min(lines.len()))),
             tree,
         );
-        let mut text = format!("depth {}/{}", self.depth, Self::MAX_HOPS);
-        let hint = ctx.keys().hint(views::BACKLOG_GRAPH, GRAPH_HINT);
-        if !hint.is_empty() {
-            text.push_str(" \u{b7} ");
-            text.push_str(&hint);
-        }
+        // The keys are the shell's hint row (MOD-67 M6 T2, `key_hint`); the depth stays here.
+        let text = format!("depth {}/{}", self.depth, Self::MAX_HOPS);
         frame.render_widget(Paragraph::new(Line::styled(text, ctx.theme.dim)), footer);
+    }
+
+    /// `GRAPH_HINT` while the tree is drawn (MOD-67 M6 T2): the footer under it keeps only
+    /// `depth d/3`. Nothing while there is no tree to move in.
+    fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
+        if self.item.is_none() || self.graph.is_none() || self.visible().len() <= 1 {
+            return None;
+        }
+        let hint = keys.hint(views::BACKLOG_GRAPH, GRAPH_HINT);
+        key_line(hint, theme)
     }
 }
 
@@ -794,7 +801,6 @@ mod tests {
 
     use super::*;
     use crate::app::{Emit, TopBarState};
-    use crate::keymap::Keymap;
     use crate::store_worker::Origin;
     use crate::ui::cells::cell_width;
     use crate::ui::tabs::BacklogTab;
@@ -809,7 +815,7 @@ mod tests {
         scope: Scope,
         projects: Vec<ProjectRef>,
         top_bar: TopBarState,
-        keymap: Keymap,
+        keys: Keys,
         theme: Theme,
         emit: Emit,
     }
@@ -831,7 +837,7 @@ mod tests {
                 scope,
                 projects,
                 top_bar: TopBarState::default(),
-                keymap: Keymap::new(),
+                keys: Keys::compiled().clone(),
                 theme: Theme::default(),
                 emit: Emit::default(),
             }
@@ -842,7 +848,7 @@ mod tests {
                 &self.scope,
                 &self.projects,
                 &self.top_bar,
-                &self.keymap,
+                &self.keys,
                 &self.theme,
                 Origin::Tab(BacklogTab::ID),
                 &self.emit,
@@ -1763,7 +1769,7 @@ mod tests {
     }
 
     /// L7: a pane shorter than the tree scrolls it so the cursor row stays on screen, the footer
-    /// kept below it.
+    /// kept below it (its keys the shell's hint row since MOD-67 M6 T2).
     #[tokio::test]
     async fn a_short_pane_scrolls_to_keep_the_cursor_visible() {
         let shell = Shell::platform().await;
@@ -1779,7 +1785,7 @@ mod tests {
                 "    ← origin     FEAT-3 queued (*)",
                 "▸   ← blocked_by TOOL-1 awaiting_approval",
                 "  ← blocked_by FEAT-2 blocked Agent driver…",
-                "depth 2/3 · +/- depth · Enter re-root",
+                "depth 2/3",
             ]
         );
         for _ in 0..3 {
@@ -1791,7 +1797,7 @@ mod tests {
                 "  ← blocked_by FEAT-2 blocked Agent driver…",
                 "    ← relates    agy:FEAT-1 open ACP trans…",
                 "▸ ← relates    FEAT-3 queued Postgres stor…",
-                "depth 2/3 · +/- depth · Enter re-root",
+                "depth 2/3",
             ],
             "the last row is the window's last"
         );

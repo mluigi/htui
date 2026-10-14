@@ -212,7 +212,8 @@ pub(super) const WHILE_EDITING: &str = "while an edit is open";
 /// ([`views`]). M4 appends the Skills and Requirements stacks and the two editor
 /// stacks (MOD-57 §6.4, D8.2), the editor stacks right after the overlay's, so an `[editor]`
 /// chord is checked against `global.quit` and `global.help`. M5 appends the Backlog and Chat
-/// stacks (in strip order), after M4's.
+/// stacks (in strip order), after M4's. M6 appends the queue overlay's and the directory
+/// picker's.
 pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("on every screen", Stack::BASE),
     ("over an overlay", Stack::OVERLAY),
@@ -311,6 +312,10 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("in the item divergence view", views::ITEM_DIVERGENCE),
     ("in Chat", views::CHAT_LIVE),
     ("in a Chat replay", views::CHAT_REPLAY),
+    // MOD-67 M6: the last two views that matched raw keys (blueprint §4.4), appended so every
+    // existing first-reported phrase is unchanged.
+    ("in the queue overlay", views::QUEUE_OVERLAY),
+    ("in the Hierarchy directory picker", views::HIERARCHY_PICKER),
 ];
 
 /// Keys a view matches ahead of the resolver in one declared stack (ANA-26 §6.1, MOD-67 M5 D5):
@@ -349,9 +354,26 @@ const TAB_SELECT: &[Act] = &[
 const DIGITS: &[&str] = &["1", "2", "3", "4", "5", "6", "7", "8", "9"];
 
 /// Every declared stack with keys its view keeps fixed (MOD-67 M5 R1 M1), in [`DECLARED`] order,
-/// each citing the arm that matches them. M5's views only: a Settings, Skills or Requirements
-/// form's choice keys are still unlisted (M6).
+/// each citing the arm that matches them. M5's views and the M3/M4 forms' choice keys (MOD-67
+/// M6 D5): the Attachments activation, the Requirements priority.
 pub static FIXED: &[Fixed] = &[
+    // attach.rs `activation_key`: the activation field's plain `Space` cycles it, `Enter`
+    // submits and `Esc` cancels (a choice field's value keys, ANA-26 §6.1); library.rs
+    // `on_attach_key` also refuses `Esc` while the form's save is in flight.
+    Fixed {
+        stack: views::ATTACH_FORM,
+        chords: &["space", "enter", "esc"],
+        only_global: false,
+        shadowed: &[],
+    },
+    // requirements/forms.rs `RequirementForm::on_key`: the priority's `m`/`l` choose,
+    // `Space`/`Left`/`Right` toggle, `Esc` cancels (MOD-67 M4 D10).
+    Fixed {
+        stack: views::REQUIREMENTS_FORM,
+        chords: &["m", "l", "space", "left", "right", "esc"],
+        only_global: false,
+        shadowed: &[],
+    },
     // runs.rs `RunsTab::on_key`: while the step under the cursor has a pending request, every
     // plain digit answers it (MOD-42 D14).
     Fixed {
@@ -484,7 +506,7 @@ mod tests {
             DECLARED[2],
             ("in the focused in-pane editor", Stack::EDITOR_FOCUSED)
         );
-        assert_eq!(DECLARED.len(), 78);
+        assert_eq!(DECLARED.len(), 80);
         assert!(DECLARED.contains(&(WHILE_EDITING, Stack::EDITOR_OPEN)));
         let phrases: HashSet<&str> = DECLARED.iter().map(|(phrase, _)| *phrase).collect();
         assert_eq!(phrases.len(), DECLARED.len(), "a phrase is used twice");
@@ -509,6 +531,25 @@ mod tests {
                 assert!(KeyChord::parse_strict(written).is_ok(), "{written:?}");
             }
             assert!(!entry.only_global || entry.stack.global().is_some());
+        }
+    }
+
+    /// MOD-67 M6 D5: `FIXED` keeps `DECLARED` order, so a row and chord two entries fix is
+    /// reported naming the first declared stack.
+    #[test]
+    fn fixed_follows_declared_order() {
+        let at = |stack: Stack<'static>| {
+            DECLARED
+                .iter()
+                .position(|(_, declared)| *declared == stack)
+                .expect("a declared stack")
+        };
+        for pair in FIXED.windows(2) {
+            assert!(
+                at(pair[0].stack) < at(pair[1].stack),
+                "FIXED is out of DECLARED order at {:?}",
+                DECLARED[at(pair[1].stack)].0
+            );
         }
     }
 

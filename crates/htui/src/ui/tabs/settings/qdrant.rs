@@ -9,7 +9,7 @@ use crate::qdrant_settings_info::{QdrantSnapshot, QdrantState};
 use crate::secrets_settings::{DEMO_SESSION, Redacted};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
-use crate::ui::tabs::settings::{SectionId, SettingsSection, modal_rest, wrapped};
+use crate::ui::tabs::settings::{SectionId, SettingsSection, answers, asked, modal_rest, wrapped};
 use crate::ui::{FieldOutcome, TextField};
 use crossterm::event::KeyEvent;
 
@@ -25,7 +25,8 @@ const DEMO_ROW: &str = "n/a in a demo session";
 const UNREADABLE: &str = "the keyring could not be read";
 const UNREADABLE_GUIDE: &str =
     "the keyring could not be read; Enter tries to store a Qdrant URL in it";
-const CONFIRM_CLEAR: &str = "Remove the Qdrant settings from the keyring? y / n";
+/// The clear question; the answers are appended as the keys bind them (MOD-67 M6 PA-6).
+const CONFIRM_CLEAR: &str = "Remove the Qdrant settings from the keyring?";
 
 // The hint rows (MOD-67 M3 D9): rendered through the mode's stack, so a rebound key shows its
 // new chord. `Enter`/`Esc` in the editors are the text field's own keys (D13), written as text.
@@ -335,29 +336,20 @@ impl QdrantSection {
         ctx.request(request);
     }
 
-    /// The one line under the pane: the keys this mode binds, then the last outcome.
-    ///
-    /// The outcome only appears here in Browse. When both do not fit in `room` cells the outcome
-    /// wins the line: the keys are on screen every other frame, and this is the only place the
-    /// outcome appears.
-    fn hint(&self, keys: &Keys, room: usize, theme: &crate::ui::Theme) -> Line<'static> {
-        let keys = self.hint_text(keys);
+    /// The line under the pane in Browse: the last outcome, in `theme.error` when it is one to
+    /// act on. The keys this mode binds moved to the shell's hint row (MOD-67 M6 T2,
+    /// [`SettingsSection::key_hint`]); without an outcome there is no line. The editors and the
+    /// question draw theirs in the pane.
+    fn notice_line(&self, theme: &crate::ui::Theme) -> Option<Line<'static>> {
         let (Some(notice), Mode::Browse) = (&self.notice, &self.mode) else {
-            return Line::styled(keys, theme.dim);
+            return None;
         };
-        let text = notice.text().to_owned();
-        let sty = if notice.is_error() {
+        let style = if notice.is_error() {
             theme.error
         } else {
             theme.dim
         };
-        if cell_width(&keys) + cell_width(&text) + 3 > room {
-            return Line::styled(text, sty);
-        }
-        Line::from(vec![
-            Span::styled(format!("{keys} \u{b7} "), theme.dim),
-            Span::styled(text, sty),
-        ])
+        Some(Line::styled(notice.text().to_owned(), style))
     }
 
     fn hint_text(&self, keys: &Keys) -> String {
@@ -503,6 +495,10 @@ impl SettingsSection for QdrantSection {
         }
     }
 
+    fn key_hint(&self, keys: &Keys, theme: &crate::ui::Theme) -> Option<Line<'static>> {
+        super::key_line(self.hint_text(keys), theme)
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let room = usize::from(area.width).max(1);
         let mut lines = Vec::new();
@@ -604,11 +600,12 @@ impl SettingsSection for QdrantSection {
                 );
             }
             Mode::ConfirmClear => {
-                lines.extend(question(CONFIRM_CLEAR, room, ctx.theme));
+                let answers = answers(ctx.keys(), views::QDRANT_CONFIRM);
+                lines.extend(question(&asked(CONFIRM_CLEAR, &answers), room, ctx.theme));
             }
         }
 
-        lines.push(self.hint(ctx.keys(), room, ctx.theme));
+        lines.extend(self.notice_line(ctx.theme));
 
         let p = ratatui::widgets::Paragraph::new(lines);
         frame.render_widget(p, area);
@@ -620,22 +617,24 @@ mod tests {
     use super::*;
     use crate::ui::Theme;
 
-    /// MOD-60: the hint line measures the notice in cells, so a CJK notice that fits by `char`
-    /// count but not on screen takes the line alone rather than overrunning it.
+    /// MOD-67 M6 T2: in Browse the line under the pane carries the notice alone, and the keys are
+    /// the section's [`SettingsSection::key_hint`], the shell's row.
     #[test]
-    fn a_wide_notice_takes_the_hint_line_alone() {
-        let k = 10;
-        let notice = "\u{6f22}".repeat(k);
+    fn the_notice_line_carries_the_notice_alone() {
+        let notice = "\u{6f22}".repeat(10);
         let section = QdrantSection {
             notice: Some(Notice::Error(notice.clone())),
             ..QdrantSection::new()
         };
-        let keys = section.hint_text(Keys::compiled());
-        let width = cell_width(&keys) + k + 3;
-
-        let line = section.hint(Keys::compiled(), width, &Theme::default());
-
-        assert_eq!(line.spans.len(), 1, "{line:?} against {width}");
+        let theme = Theme::default();
+        let line = section.notice_line(&theme).expect("a notice in Browse");
+        assert_eq!(line.spans.len(), 1, "{line:?}");
         assert_eq!(line.spans[0].content, notice);
+        assert_eq!(line.style, theme.error);
+        assert_eq!(QdrantSection::new().notice_line(&theme), None);
+        let keys = section
+            .key_hint(Keys::compiled(), &theme)
+            .expect("the defaults bind the keys");
+        assert_eq!(keys.to_string(), section.hint_text(Keys::compiled()));
     }
 }

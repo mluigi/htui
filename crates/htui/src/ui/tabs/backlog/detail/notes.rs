@@ -43,7 +43,7 @@ use crate::editor::ExternalEditOutcome;
 use crate::hand_written::{
     ADD_NOTE_NAME, HandText, NOTE_FORM_NAME, answered_from_the_mirror, write_refused,
 };
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells;
@@ -51,7 +51,7 @@ use crate::ui::tabs::backlog::detail::compose::{
     self, Compose, ComposeOutcome, could_not_check, may_have_landed, not_written,
 };
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, message};
-use crate::ui::tabs::settings::wrapped;
+use crate::ui::tabs::settings::{key_line, wrapped};
 use crossterm::event::KeyEvent;
 
 /// The browse hint on the pane's last row (D11), through [`views::BACKLOG_NOTES`].
@@ -240,7 +240,9 @@ impl NotesTab {
     /// found closes the area and says so (and the thread opens at its bottom, where it is); none
     /// keeps the text and says it was not written, or, read from the mirror, that it could not be
     /// checked (round 1).
-    fn settle_hedge(&mut self, notes: &[Note]) {
+    ///
+    /// The sentence names the save key `keys` binds in the area's stack (MOD-67 M6 D4).
+    fn settle_hedge(&mut self, notes: &[Note], keys: &Keys) {
         let Some(item) = self.item else {
             return;
         };
@@ -260,10 +262,11 @@ impl NotesTab {
             self.notice = Some(NOTE_WRITTEN.to_owned());
             self.follow = true;
         } else if let Some(compose) = self.compose.as_mut() {
+            let save = keys.label(compose.stack(), Act::FormSave);
             compose.settle(Some(if hedged.mirror {
-                could_not_check(&hedged.why, "thread")
+                could_not_check(&hedged.why, "thread", save.as_deref())
             } else {
-                not_written(&hedged.why)
+                not_written(&hedged.why, save.as_deref())
             }));
         }
     }
@@ -345,9 +348,9 @@ impl DetailTab for NotesTab {
         self.compose.is_some()
     }
 
-    fn on_external_edit(&mut self, outcome: ExternalEditOutcome, _ctx: &mut Ctx<'_>) {
+    fn on_external_edit(&mut self, outcome: ExternalEditOutcome, ctx: &mut Ctx<'_>) {
         match self.compose.as_mut() {
-            Some(compose) => compose.on_external_edit(outcome),
+            Some(compose) => compose.on_external_edit(outcome, ctx.keys()),
             None => tracing::debug!("no note compose area to take the $EDITOR outcome"),
         }
     }
@@ -356,7 +359,7 @@ impl DetailTab for NotesTab {
         match reply {
             StoreReply::Notes(notes) => {
                 self.notes.clone_from(notes);
-                self.settle_hedge(notes);
+                self.settle_hedge(notes, ctx.keys());
                 // Review L1: the user's own note is the newest, so the thread opens at its
                 // bottom; before a first render there is no height to fit, and it opens at the top.
                 // Round 1: the rows the sentence takes are not the thread's.
@@ -401,24 +404,32 @@ impl DetailTab for NotesTab {
             // Review M1: the check failed too; say so rather than leave the area busy.
             StoreReply::Failed { request, .. } if *request == NOTES_READ => {
                 if let (Some(hedged), Some(compose)) = (self.hedged.take(), self.compose.as_mut()) {
-                    compose.settle(Some(could_not_check(&hedged.why, "thread")));
+                    let save = ctx.keys().label(compose.stack(), Act::FormSave);
+                    compose.settle(Some(could_not_check(
+                        &hedged.why,
+                        "thread",
+                        save.as_deref(),
+                    )));
                 }
             }
             _ => {}
         }
     }
 
+    /// The compose area's keys while it is open, else `HINT` (MOD-67 M6 T2); nothing with no
+    /// item selected.
+    fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
+        let hint = match &self.compose {
+            Some(compose) => compose.key_hint(keys),
+            None if self.item.is_none() => return None,
+            None => keys.hint(views::BACKLOG_NOTES, HINT),
+        };
+        key_line(hint, theme)
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         if let Some(compose) = &self.compose {
-            let body = compose::render(
-                frame,
-                area,
-                compose,
-                " New note ",
-                None,
-                ctx.keys(),
-                ctx.theme,
-            );
+            let body = compose::render(frame, area, compose, " New note ", None, ctx.theme);
             ctx.claim_editor_area(body);
             return;
         }
@@ -426,15 +437,12 @@ impl DetailTab for NotesTab {
             message(frame, area, "No item selected.", ctx.theme);
             return;
         }
-        // Review M1's sentence under the thread; D11: the browse hint takes the last row.
+        // Review M1's sentence under the thread; D11's browse hint is the shell's hint row since
+        // MOD-67 M6 T2 (`key_hint`).
         let notice = self.notice_rows(area.width);
         let height = u16::try_from(notice.len()).unwrap_or(u16::MAX);
-        let [list, below, hint] = Layout::vertical([
-            Constraint::Min(0),
-            Constraint::Length(height),
-            Constraint::Length(1),
-        ])
-        .areas(area);
+        let [list, below] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(height)]).areas(area);
         frame.render_widget(
             Paragraph::new(
                 notice
@@ -443,16 +451,6 @@ impl DetailTab for NotesTab {
                     .collect::<Vec<_>>(),
             ),
             below,
-        );
-        frame.render_widget(
-            Line::styled(
-                cells::clip(
-                    &ctx.keys().hint(views::BACKLOG_NOTES, HINT),
-                    usize::from(hint.width),
-                ),
-                ctx.theme.dim,
-            ),
-            hint,
         );
         if self.notes.is_empty() {
             message(frame, list, "No notes for this item.", ctx.theme);
@@ -479,7 +477,7 @@ mod tests {
 
     use super::*;
     use crate::app::Action;
-    use crate::editor::{EDITED, ExternalEdit, ExternalEditOutcome};
+    use crate::editor::{ExternalEdit, ExternalEditOutcome, edited};
     use crate::hand_written::{ADD_NOTE_NAME, NOTE_FORM_NAME};
     use crate::store_worker::StoreRequest;
     use crate::ui::tabs::backlog::detail::compose::bench::{Shell, ctrl, drawn, key, row_from};
@@ -589,7 +587,7 @@ mod tests {
             open.render(frame, area, &shell.ctx().with_editor_area(&cell));
         });
         let claimed = cell.get().expect("the area claims its body");
-        assert_eq!(claimed, Rect::new(0, 1, 43, 21));
+        assert_eq!(claimed, Rect::new(0, 1, 43, 22));
         assert!(
             row_from(&text, claimed).starts_with("First line."),
             "{claimed:?} in\n{text}"
@@ -733,7 +731,6 @@ mod tests {
         let text = drawn(43, 23, |frame, area| pane.render(frame, area, &shell.ctx()));
         assert!(text.contains("the note was written;"), "{text}");
         assert!(text.contains("Hi."), "{text}");
-        assert_eq!(text.lines().last().map(str::trim_end), Some(HINT), "{text}");
         assert!(shell.actions().is_empty(), "the re-read was the check");
         // The sentence stays until the next key.
         let _ = pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
@@ -754,7 +751,7 @@ mod tests {
         pane.on_reply(&StoreReply::Notes(thread), &mut shell.ctx());
         assert_eq!(
             compose(&pane).notice(),
-            Some(not_written(&message).as_str())
+            Some(not_written(&message, Some("Ctrl+s")).as_str())
         );
         assert_eq!(compose(&pane).body(), "Hi.");
         assert_eq!(compose(&pane).busy(), None);
@@ -780,7 +777,7 @@ mod tests {
         pane.on_reply(&StoreReply::Notes(Vec::new()), &mut shell.ctx());
         assert_eq!(
             compose(&pane).notice(),
-            Some(not_written(&message).as_str())
+            Some(not_written(&message, Some("Ctrl+s")).as_str())
         );
     }
 
@@ -800,7 +797,7 @@ mod tests {
         assert_eq!(compose(&pane).busy(), None);
         assert_eq!(
             compose(&pane).notice(),
-            Some(could_not_check(&message, "thread").as_str())
+            Some(could_not_check(&message, "thread", Some("Ctrl+s")).as_str())
         );
         assert_eq!(compose(&pane).body(), "Hi.");
     }
@@ -838,7 +835,7 @@ mod tests {
         assert_eq!(compose(&pane).busy(), None);
         assert_eq!(
             compose(&pane).notice(),
-            Some(could_not_check(&message, "thread").as_str())
+            Some(could_not_check(&message, "thread", Some("Ctrl+s")).as_str())
         );
         assert_eq!(compose(&pane).body(), "Hi.");
 
@@ -922,7 +919,10 @@ mod tests {
             &mut shell.ctx(),
         );
         assert_eq!(compose(&open).body(), "From the editor.");
-        assert_eq!(compose(&open).notice(), Some(EDITED));
+        assert_eq!(
+            compose(&open).notice(),
+            Some(edited(Some("Ctrl+s")).as_str())
+        );
         // With no area open the outcome is dropped.
         let mut closed = pane(&shell).await;
         closed.on_external_edit(
@@ -1008,7 +1008,6 @@ mod tests {
         }
         let text = drawn(20, 8, |frame, area| pane.render(frame, area, &shell.ctx()));
         assert!(text.contains("THE END"), "{text}");
-        assert_eq!(text.lines().last().map(str::trim_end), Some(HINT), "{text}");
     }
 
     /// Review L1: after the user's own note lands, the re-read thread opens at its bottom, where
@@ -1056,7 +1055,6 @@ mod tests {
         let text = drawn(20, 8, |frame, area| pane.render(frame, area, &shell.ctx()));
         assert!(text.contains("MINE"), "{text}");
         assert!(text.contains("the note was"), "{text}");
-        assert_eq!(text.lines().last().map(str::trim_end), Some(HINT), "{text}");
     }
 
     /// Review L2: a `\t` in a saved note draws as spaces to the next tab stop, as the compose
@@ -1136,22 +1134,26 @@ mod tests {
     #[test]
     fn the_hint_renders_through_the_notes_stack() {
         let stack = views::BACKLOG_NOTES;
-        assert_eq!(crate::keys::Keys::compiled().hint(stack, super::HINT), HINT);
+        assert_eq!(Keys::compiled().hint(stack, super::HINT), HINT);
         let keys =
             crate::keys::load_str("version = 1\n[backlog.notes]\nadd = \"A\"\n").expect("loads");
         assert_eq!(keys.hint(stack, super::HINT), "A add note");
     }
 
-    /// D11: with an item and no area, the last row is the hint, over a thread or an empty one;
-    /// with no item there is none.
+    /// D11, MOD-67 M6 T2: with an item and no area the keys are [`HINT`], the shell's hint row,
+    /// over a thread or an empty one, and the pane draws none of it; with no item there are none,
+    /// and an open area has its own.
     #[tokio::test]
-    async fn the_hint_is_drawn_under_the_thread() {
+    async fn the_keys_are_the_hint_row_s() {
         let shell = Shell::new();
+        let keys = |pane: &NotesTab| {
+            pane.key_hint(Keys::compiled(), &Theme::default())
+                .map(|line| line.to_string())
+        };
         let pane = pane(&shell).await;
         let text = drawn(43, 23, |frame, area| pane.render(frame, area, &shell.ctx()));
-        let rows: Vec<&str> = text.lines().collect();
-        assert_eq!(rows[22].trim_end(), HINT, "{text}");
-        assert_eq!(text.matches(HINT).count(), 1, "{text}");
+        assert_eq!(keys(&pane).as_deref(), Some(HINT));
+        assert!(!text.contains(HINT), "{text}");
 
         let mut empty = NotesTab::new();
         empty.on_item_change(Some(ITEM));
@@ -1160,17 +1162,17 @@ mod tests {
             empty.render(frame, area, &shell.ctx())
         });
         assert!(text.contains("No notes for this item."), "{text}");
-        assert_eq!(text.lines().last().map(str::trim_end), Some(HINT), "{text}");
+        assert_eq!(keys(&empty).as_deref(), Some(HINT));
 
         let mut none = NotesTab::new();
         none.on_item_change(None);
-        let text = drawn(43, 23, |frame, area| none.render(frame, area, &shell.ctx()));
-        assert!(!text.contains(HINT), "{text}");
+        assert_eq!(keys(&none), None);
 
         let composing = composing(&shell).await;
-        let text = drawn(43, 23, |frame, area| {
-            composing.render(frame, area, &shell.ctx());
-        });
-        assert!(!text.contains(HINT), "{text}");
+        assert_eq!(
+            keys(&composing),
+            Some(compose(&composing).key_hint(Keys::compiled())),
+            "the area's own keys"
+        );
     }
 }

@@ -87,13 +87,13 @@ fn abort_gives_way(entry: &Row, default: &Row) -> bool {
 ///
 /// Four passes, in this order: two actions sharing a chord in one shared or global context; two
 /// candidates for one chord in a [`DECLARED`] stack; a chord shared with `editor.focus` in any
-/// context (MOD-57 M2 E9 (d)); a printable chord on an `in_capture` action; an act of a stack
-/// bound to a key its view keeps fixed ([`FIXED`], MOD-67 M5 R1 M1). `give_way` ran first, so
-/// a default that gave its chord away (the abort's to a global entry, M2 R1 M-1) is no
-/// collision; a focus chord shared with anything, and an `[editor] abort` entry on a global
-/// default, still are. A pair and chord seen by two passes is reported once. A
-/// [`STATE_GUARDED`] pair may share a chord only when it is a catalogue default of both
-/// actions (PA-2), and so may a
+/// context (MOD-57 M2 E9 (d)); a printable chord on an `in_capture` action; an act of a stack bound
+/// to a key its view keeps fixed ([`FIXED`], MOD-67 M5 R1 M1). `give_way` ran first, so a default
+/// that gave its chord away (the abort's to a global entry, M2 R1 M-1) is no collision; a focus
+/// chord shared with anything, and an `[editor] abort` entry on a global default, still are. A pair
+/// and chord seen by two passes is reported once, and a line's chord the fixed pass would repeat
+/// after a collision or capture error is not reported again (MOD-67 M6 D6). A [`STATE_GUARDED`]
+/// pair may share a chord only when it is a catalogue default of both actions (PA-2), and so may a
 /// [`SHADOWING`] pair whose first act's layer is the narrower (MOD-67 D11).
 #[must_use]
 pub fn validate(keys: &Keys) -> Vec<KeyFileError> {
@@ -111,6 +111,7 @@ fn check(
         keys,
         guarded,
         reported: Vec::new(),
+        said: Vec::new(),
         errors: Vec::new(),
     };
     for (i, first) in keys.rows.iter().enumerate() {
@@ -179,10 +180,12 @@ fn check(
         {
             continue; // a derived row's chords are its shared row's, reported there
         }
-        for chord in row.chords.iter().filter(|chord| chord.is_printable()) {
+        for &chord in row.chords.iter().filter(|chord| chord.is_printable()) {
             let shown = quote(&chord.spec());
+            let line = line_of(row);
+            check.said.push((line, chord));
             check.errors.push(KeyFileError {
-                line: row.line.unwrap_or(0),
+                line,
                 message: format!(
                     "{} = {shown}: {shown} is typed text while a field captures: bind a ctrl or \
                      alt chord or a named key",
@@ -203,6 +206,13 @@ fn resolve_at<'k>(keys: &'k Keys, stack: Stack<'_>, act: Act) -> Option<(usize, 
         .enumerate()
         .filter(|&(index, _)| stack.admits(index, act))
         .find_map(|(index, layer)| keys.row(layer.context(), act).map(|row| (index, row)))
+}
+
+/// The line an error about `row` reports on, and the line of D6's `(line, chord)` key (MOD-67 M6
+/// R1 LOW-5: one rule for every pass): the entry that set its chords, else the file's entry that
+/// repeats its default, else 0 for a row the file leaves alone.
+fn line_of(row: &Row) -> usize {
+    row.line.or(row.entry).unwrap_or(0)
 }
 
 /// A row's identity: its context and act.
@@ -227,6 +237,9 @@ struct Check<'k> {
     guarded: &'k [(Act, Act)],
     /// `((context, act), (context, act), chord)` of every reported collision, by source row.
     reported: Vec<(Slot, Slot, KeyChord)>,
+    /// `(line, chord)` of every collision and capture error, so the fixed pass, which runs last,
+    /// does not report a line's chord again (MOD-67 M6 D6, PA-13).
+    said: Vec<(usize, KeyChord)>,
     errors: Vec<KeyFileError>,
 }
 
@@ -234,7 +247,8 @@ impl Check<'_> {
     /// The fixed-key pass (MOD-67 M5 R1 M1): every act a [`Fixed`] entry's stack resolves on one
     /// of its keys or on a named key's SHIFT form, in the layers the keys shadow, unless the
     /// entry shadows that act by design.
-    /// A row and chord are reported once, naming the first stack, on the row's [`source`].
+    /// A row and chord are reported once, naming the first stack, on the row's [`source`]; a
+    /// line's chord an earlier pass reported is skipped (MOD-67 M6 D6: the first pass wins).
     fn fixed(&mut self, table: &[Fixed]) {
         let mut seen: Vec<(Slot, KeyChord)> = Vec::new();
         for entry in table {
@@ -266,13 +280,17 @@ impl Check<'_> {
                     };
                     let row = source(self.keys, row);
                     let slot = (row.context, row.act);
-                    if index < first || seen.contains(&(slot, chord)) {
+                    let line = line_of(row);
+                    if index < first
+                        || seen.contains(&(slot, chord))
+                        || self.said.contains(&(line, chord))
+                    {
                         continue;
                     }
                     seen.push((slot, chord));
                     let shown = quote(&chord.spec());
                     self.errors.push(KeyFileError {
-                        line: row.line.or(row.entry).unwrap_or(0),
+                        line,
                         message: format!("{} = {shown}: {shown} is fixed {phrase}", subject(row)),
                     });
                 }
@@ -312,8 +330,10 @@ impl Check<'_> {
             .map_or_else(|| "default".to_owned(), |line| format!("line {line}"));
         let shown = quote(&chord.spec());
         let other_name = other.act.spec().map_or("", |spec| spec.name);
+        let line = line_of(reported_source);
+        self.said.push((line, chord));
         self.errors.push(KeyFileError {
-            line: reported_source.line.or(reported_source.entry).unwrap_or(0),
+            line,
             message: format!(
                 "{} = {shown}: {shown} is already {}.{other_name} ({origin}) {place}",
                 subject(reported_source),
@@ -351,7 +371,7 @@ fn subject(row: &Row) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{check, validate};
+    use super::{check, line_of, validate};
     use crate::keys::{
         Act, Context, FIXED, Fixed, KeyChord, Keys, SHADOWING, STATE_GUARDED, load_str,
     };
@@ -378,6 +398,18 @@ mod tests {
     #[test]
     fn the_compiled_defaults_validate() {
         assert_eq!(validate(Keys::compiled()), []);
+    }
+
+    /// MOD-67 M6 R1 LOW-5: every pass reports a row on one line, so D6's `(line, chord)` keys
+    /// agree: the entry that set its chords, else the file's entry that repeats its default (the
+    /// row is the user's, MOD-12 M3 R1 H1), else 0 for a row the file leaves alone.
+    #[test]
+    fn every_pass_reports_a_row_on_one_line() {
+        let keys = load_str("[global]\nqueue = [\"ctrl-q\"]\nquit = [\"z\"]\n").expect("it loads");
+        let line = |act| line_of(keys.row(Context::Global, act).expect("a global row"));
+        assert_eq!(line(Act::Queue), 2, "an entry repeating the default");
+        assert_eq!(line(Act::Quit), 3, "an entry setting the chords");
+        assert_eq!(line(Act::Help), 0, "a row the file leaves alone");
     }
 
     // MOD-57 M2 E9: the editor's keys.
@@ -688,13 +720,22 @@ mod tests {
     }
 
     /// PA-2: the allow-list is per chord. `esc` is a default of both `back` and `dismiss`, so
-    /// adding `backspace` to `back` keeps that share allowed, and `dismiss` keeps `esc`; a chord
-    /// the user gives both is not.
+    /// adding `f2` to `back` keeps that share allowed, and `dismiss` keeps `esc`; a chord the user
+    /// gives both is not.
     #[test]
     fn a_state_guarded_pair_is_allowed_only_on_a_chord_both_have_by_default() {
-        assert_eq!(errors("[common]\nback = [\"esc\", \"backspace\"]\n"), []);
-        let keys = load_str("[common]\nback = [\"esc\", \"backspace\"]\n").expect("loads");
+        assert_eq!(errors("[common]\nback = [\"esc\", \"f2\"]\n"), []);
+        let keys = load_str("[common]\nback = [\"esc\", \"f2\"]\n").expect("loads");
         assert_eq!(keys.chords(Context::Common, Act::Dismiss), [chord("esc")]);
+        // MOD-67 M6: `backspace` (this test's chord before M6) is the directory picker's
+        // `picker.parent`, which offers `common.back` too.
+        assert_eq!(
+            errors("[common]\nback = [\"esc\", \"backspace\"]\n"),
+            one(
+                2,
+                r#"[common] back = "backspace": "backspace" is already picker.parent (default) in the Hierarchy directory picker"#
+            )
+        );
         assert_eq!(
             errors("[common]\ndismiss = [\"z\"]\nback = [\"z\"]\n"),
             one(
@@ -872,11 +913,12 @@ mod tests {
             fixed("prev_row", "left")
         );
         // A shared act the form offers is refused there too, once, naming the first stack.
+        // MOD-67 M6: the first declared stack that keeps the key fixed.
         assert_eq!(
             errors("[form]\nnext_field = [\"tab\", \"right\"]\n"),
             one(
                 2,
-                r#"[form] next_field = "right": "right" is fixed in the Backlog filter form"#
+                r#"[form] next_field = "right": "right" is fixed in a Requirements form"#
             )
         );
     }
@@ -885,9 +927,13 @@ mod tests {
     /// Runs close-out warning keeps its resolution keys.
     #[test]
     fn a_rebind_onto_an_item_form_or_runs_question_fixed_key_is_refused() {
+        // MOD-67 M6: the first declared stack that keeps the key fixed.
         assert_eq!(
             errors("[form]\nsave = [\"ctrl-s\", \"esc\"]\n"),
-            one(2, r#"[form] save = "esc": "esc" is fixed in the item form"#)
+            one(
+                2,
+                r#"[form] save = "esc": "esc" is fixed in the Attachments form"#
+            )
         );
         assert_eq!(
             errors("[backlog.runs]\nyes = [\"y\", \"right\"]\n"),
@@ -916,11 +962,12 @@ mod tests {
                 r#"[backlog.filter_form] next_row = "shift-right": "shift-right" is fixed in the Backlog filter form"#
             )
         );
+        // MOD-67 M6: the first declared stack that keeps the key fixed.
         assert_eq!(
             errors("[form]\nsave = [\"ctrl-s\", \"shift-left\"]\n"),
             one(
                 2,
-                r#"[form] save = "shift-left": "shift-left" is fixed in the item form"#
+                r#"[form] save = "shift-left": "shift-left" is fixed in a Requirements form"#
             )
         );
         assert_eq!(
@@ -934,6 +981,33 @@ mod tests {
         assert_eq!(
             errors("[backlog.filter_form]\nclear = [\"x\", \"shift-up\"]\n"),
             []
+        );
+    }
+
+    /// MOD-67 M6 D5: the Requirements forms' priority keys and the Attachments form's activation
+    /// keys are matched ahead of the resolver, so no act of their stacks may take one.
+    #[test]
+    fn a_rebind_onto_a_requirements_priority_or_attachment_key_is_refused() {
+        assert_eq!(
+            errors("[requirements]\nnext_field = [\"tab\", \"right\"]\n"),
+            one(
+                2,
+                r#"[requirements] next_field = "right": "right" is fixed in a Requirements form"#
+            )
+        );
+        assert_eq!(
+            errors("[form]\nnext_field = [\"tab\", \"enter\"]\n"),
+            one(
+                2,
+                r#"[form] next_field = "enter": "enter" is fixed in the Attachments form"#
+            )
+        );
+        assert_eq!(
+            errors("[form]\nsave = [\"ctrl-s\", \"left\"]\n"),
+            one(
+                2,
+                r#"[form] save = "left": "left" is fixed in a Requirements form"#
+            )
         );
     }
 
@@ -956,6 +1030,36 @@ mod tests {
         assert_eq!(
             errors("[global]\nselect_tab_1 = [\"2\"]\nselect_tab_2 = [\"1\"]\n"),
             []
+        );
+    }
+
+    /// MOD-67 M6 D6 (PA-13): a line's chord that collides and is also fixed in the same stack
+    /// is reported once, by the collision; the fixed pass does not repeat it.
+    #[test]
+    fn a_line_both_colliding_and_fixed_is_reported_once() {
+        assert_eq!(
+            errors("version = 1\n[backlog.runs]\napprove = [\"a\", \"1\"]\n"),
+            one(
+                3,
+                r#"[backlog.runs] approve = "1": "1" is already global.select_tab_1 (default) in Backlog > Runs"#
+            )
+        );
+    }
+
+    /// MOD-67 M6 D9 low 2 (PA-2): a view row the file pins to its compiled derivation while its
+    /// shared row moves is the user's line, so a collision with it names that line, not the
+    /// shared row's.
+    #[test]
+    fn a_collision_names_a_pinned_view_rows_own_line() {
+        assert_eq!(
+            errors(
+                "version = 1\n[form]\nnext_field = [\"ctrl-n\"]\n[settings.agents]\n\
+                 next_field = [\"tab\", \"down\"]\nprev_field = [\"down\"]\n"
+            ),
+            one(
+                6,
+                r#"[settings.agents] prev_field = "down": "down" is already settings.agents.next_field (line 5) in the Agents form"#
+            )
         );
     }
 

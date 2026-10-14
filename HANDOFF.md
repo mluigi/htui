@@ -14,7 +14,11 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-13):** **MOD-96 is done** (`docs/decisions/mod/mod-96.md`): an isolated
+**Current status (2026-10-14):** **MOD-67 is done** (`docs/decisions/mod/mod-67.md`): every key outside text
+entry is a named action in one catalogue, dispatched through declared context stacks, rebindable in
+`<config_root>/keys.toml` (`--keys`, `--default-keys`, `--print-keys`; defaults in `docs/htui-keys.md`); every
+hint, the `?` box and every message that names a key are generated, and one hint row above the status line shows
+the keys of what you are in. Owed on the host: the Postgres gate on the merged tree, a Windows run. Before it, **MOD-96 is done** (`docs/decisions/mod/mod-96.md`): an isolated
 Claude Code session reads no settings file (`--setting-sources ""` / ACP `settingSources: []`), so their permission
 rules and `defaultMode` no longer settle a call before htui; an isolated `claude-cli` row with no mode gets
 `--permission-mode default`, and ACP rows pin `acp.permission_mode` (seeded `default` on `claude`) with
@@ -295,93 +299,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   the executing box resolves a project's secrets with the machine identity in its own keyring; a headless worker
   without one refuses, and delivering it is this item's.
 
-- [ ] **MOD-67 - Configurable hotkeys: named actions, `keys.toml`, generated hints** (from ANA-26,
-  `docs/ANA-26.md`, `docs/decisions/ana/ana-26.md`). `R-TUI-10`, `R-TUI-1`, `R-STO-1`, `R-NF-1`.
-  Every key outside text entry becomes a named action in one compiled-in catalogue (about 100
-  actions, named once per meaning: shared `list`/`pane`/`confirm`/`form`/`common` contexts, a
-  narrower context overriding one for a single view), dispatched through composed context stacks
-  whose resolver returns ordered candidates so a view can decline and fall through. A user
-  overrides only what they change in `<config_root>/keys.toml` (per OS user and machine, never the
-  store); an invalid file refuses to start with every error as `path:line`, exit status 2, kept out
-  of error capture; `--keys`, `--default-keys`, `--print-keys`. `ctrl-c` is checked first and
-  always quits (MOD-57's pane excepted). Every hint, key-naming message and the `?` box is
-  generated; `?`/`f1` open help from every screen. Fixes two routing defects found by ANA-26:
-  `ctrl-c` opens the clear confirm in Settings > Connection and Qdrant browse, and the Qdrant editor
-  passes `Tab` to the tab bar. Six milestones (ANA-26 §8): M1 catalogue and resolver, M2 the file,
-  M3 Settings and overlays, M4 Skills and Requirements, M5 Backlog and Chat, M6 close-out; M3-M5
-  are independent but share snapshots. Not blocked.
-  **TUI design review (2026-10-04, https://claude.ai/artifact/TxAriNUvRpTifJy8Wq6HeH findings 1,
-  3):** `?` lists only the global keys and the tab's action bindings, missing j/k, h/l, J/K and every
-  detail-pane key, so the generated sheet must list every key of the focused tab and pane. Hints sit
-  in four places and spell one action four ways (`j/k move`/`select`/`rows`, `J/K move`, `Up/Dn
-  move`), and Backlog has no hint row; generated hints go in one fixed row for every tab. MOD-81
-  and MOD-82 come after this item.
-  **Phase M1 landed (`c3b3f7bd`..`add7fb39`, 2026-10-06):** the `keys/` module: `KeyChord` with a
-  strict parser, the 41-action catalogue (`global`, `overlay`, shared contexts), the `Keys`
-  resolver over context stacks, and generated status line and `?` box. `ctrl-c` quits first from
-  every screen (fixes Connection/Qdrant browse), and `?`/`f1` open help over overlays. No snapshot
-  changed. Deferred: the overlay-aware and capture-filtered status line to M3, and the Unix
-  ctrl-collision rejects to M2 (`.claude/plans/mod-67-m1-catalogue-resolver.plan.md`, "Review gate").
-  **Phase M2 landed (`d4be4861`..`97cad2aa`, 2026-10-07):** `<config_root>/keys.toml` (or
-  `--keys PATH`) is loaded with line spans, checked per context and per declared stack, and either
-  installed or refused with every error as `keys.toml:LINE:`, exit status 2, outside Sentry;
-  `--default-keys`, `--print-keys` (round-trips). The Unix legacy ctrl rejects landed (some
-  `cfg(unix)` only). Global and overlay keys are configurable end to end; a key a view or overlay
-  still matches itself wins until M3-M5 (README "Changing keys"). The narrower-context override of a
-  shared verb and the shadowing allow-list kind land with M3's first view context
-  (`.claude/plans/mod-67-m2-keys-file.plan.md`, "Review gate").
-  **Phase M3 landed (`55064b73`..`4ae61bf9`, 2026-10-08):** all ten Settings sections, the
-  Settings tab and the four overlays dispatch through declared context stacks (`keys/views.rs`, 36
-  declared), their 65 hint constants are generated, and the status line and `?` box follow the
-  active stack. Fixed and pinned: modifier-blind arms (`ctrl-d` deletes in hierarchy/kinds,
-  `ctrl-l` cycles sections, `ctrl-t` checks secrets, `alt-y`/`ctrl-y` answer questions and apply
-  migrations) and the Qdrant editor passing `Tab`. A view table may override a shared verb
-  (`[settings.boxes] reload`), and a global rebind onto a Settings or overlay key is refused.
-  Carried: `TextArea`'s own `ctrl-s` to M4; hard-coded key prose to M6 (`Ctrl+S retries`,
-  `NO_MATCHES` `Ctrl+R`, `RELOADED` "press p again", `NOT_A_VALUE_ROW` "`e` edits"); a `picker`
-  context for the hierarchy directory picker (L-C Q3)
-  (`.claude/plans/mod-67-m3-settings-overlays.plan.md`, "Review gate").
-  **MOD-57 (done, `docs/decisions/mod/mod-57.md`)** added `Context::Editor` (`editor.focus` `ctrl-4`,
-  `editor.abort` `ctrl-x`), `Stack::EDITOR_FOCUSED`/`EDITOR_OPEN` and `views::QUIT_CONFIRM`/`ABORT_CONFIRM`
-  (`DECLARED` 39). Its M2 landed the loader follow-ups: `editor.focus` must keep a chord and never gives
-  way, its chord is refused in every other table, `[editor]` is checked against every global "while an
-  edit is open", and a `[global]` entry may take `editor.abort`'s default chord (give-way across tables,
-  that one case only).
-  **MOD-12 M3 changed one M2 rule (2026-10-08, `docs/decisions/mod/mod-12.md`, review R1 H1):** within one
-  table a user's entry takes a chord from an action left at its default (that action loses it, with a stderr
-  notice and a `--print-keys` mark); two user entries on one chord stay an error. It also added the global
-  `queue` action on `ctrl-q` (ANA-26 §7.4 amended).
-  **Phase M4 landed (`ba082c94`..`4802a157`, 2026-10-08):** the Skills tab (view switch, Library,
-  Templates, the attachments pane, the editors' agent help) and the Requirements tab dispatch
-  through declared stacks (`keys/views.rs`, 18 more; 6 contexts and 22 actions), and their 24 hint
-  constants are generated. Fixed and pinned: the Skills `h`/`l` modifier blindness (`ctrl-l`
-  switched views) and `alt-y` detaching an attachment. `TextArea` no longer claims `ctrl-s`: every
-  editor outside Backlog saves on `form.save` only (M3's carry closed). Skills editors still pass
-  `Tab` with the draft kept. The MOD-57 `[editor]` follow-up is closed: `editor.focus` must keep a
-  chord, and the editor stacks join `DECLARED`, so an `[editor]` chord on `global.quit`/`help` is
-  refused either way (`[global] quit = ["ctrl-x"]` now is). Hint changes accepted at the gate:
-  trimmed Library and Templates browse rows, `Tab/Down field`, agent help `n/Esc discard`. Carried:
-  key prose to M6 (`Ctrl+S saves it`, `Esc again discards`, `y detaches, any other key keeps it`),
-  and the hierarchy `picker` context (M3 L-C Q3). Pre-existing, seen here: full test runs leave an
-  empty `~/.config/htui/trees` (the worker's default scratch root)
-  (`.claude/plans/mod-67-m4-skills-requirements.plan.md`, "Review gate").
-  **Phase M5 landed (`850d4bee`..`c65527db`, 2026-10-13):** the Backlog tab (list, filter form,
-  item form and divergence view, all seven sub-tabs, the Notes/Docs compose areas) and the Chat tab
-  dispatch through declared stacks (`keys/views.rs`, 20 more; 11 contexts, 58 actions); every hint
-  is generated, Runs gains a browse hint row and the list pane `j/k move · h/l sub-tab · f filter ·
-  N new · e edit`, and `?` lists every layer of the focused pane. The Backlog `Enter` miss is
-  `backlog.replay` and the eight legacy `Keymap` rows are gone. Fixed and pinned: `alt-y` answering
-  a run cancel or an uncite, modifier-blind Body/Prompt keys (`ctrl-n` cycled the template), `F1`
-  swallowed by Backlog and Chat input modes. `form.save` is the only save chord in every editor.
-  Changed for users: a global key on a Backlog or Chat key is refused (`[global] quit = ["f"]`), so
-  is a shared rebind that collides in a new stack, and (review R1) a rebind onto a key a view keeps
-  for itself (`[backlog.filter_form] clear = ["space"]`); the filter form's table is
-  `[backlog.filter_form]`. Carried to M6: key prose (`Ctrl+S tries again`, `Ctrl+S compares again`,
-  `Esc again ends this chat`, `(t to unfold)`, `no conflicts — m or t continues`), `FIXED` for the
-  M3/M4 forms (Requirements priority keys, the attach form), one report per line and chord across
-  the validator's passes, `Keymap`/`Binding`/`KeyScope` with App's legacy tab paths,
-  `Ctx::new(&Keymap)`, the uniform hint row for every tab, the every-stack reachability test
-  (`.claude/plans/mod-67-m5-backlog-chat.plan.md`, "Review gate"). **Remaining: M6** close-out.
 - [ ] **MOD-85 - Remaining accent (cyan) uses that do not mean focus or selection** (from MOD-80,
   `docs/decisions/mod/mod-80.md` "Carried"; blueprint B-6, review M1/L5). `R-TUI-1`. MOD-80 made
   `accent` mean focus and selection, gave keys, running, warnings and diff-added their own theme roles,
@@ -392,8 +309,9 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   each one (`key`, `dim`, `warning` or `base`), and pin the decisions with buffer-style tests. Also:
   the Skills attach activation field marks focus with `selected` rather than `accent`, and the
   concepts-search, workspace-switcher and path-picker overlays mark their cursor row with `accent`
-  alone, which is bold-only under `NO_COLOR`. Style only. Not blocked; touches views that MOD-67,
-  MOD-81 and MOD-82 also rewrite, so run it after them or beside them with care.
+  alone, which is bold-only under `NO_COLOR`. Style only. Not blocked; touches views that MOD-81
+  and MOD-82 also rewrite, so run it after them or beside them with care (MOD-67 is done,
+  `docs/decisions/mod/mod-67.md`).
 - [ ] **MOD-81 - Narrow and wide terminal widths** (from the TUI design review of 2026-10-04,
   https://claude.ai/artifact/TxAriNUvRpTifJy8Wq6HeH findings 4, 14). `R-TUI-1`, `R-TUI-2`,
   `R-TUI-8`. Below 100 columns the Settings > Agents table drops its name column, the only
@@ -404,7 +322,7 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   the mostly empty list 86 columns and the reading pane 70. Give identifying columns a minimum
   width, shorten statuses below about 90 columns, mark a clipped strip with `›`, wrap or scroll the
   Prompt pane, and cap the list width so the detail pane takes the rest. Rows fit through
-  `ui::cells` (MOD-60). After MOD-67, which rewrites the same views' hint rows and snapshots.
+  `ui::cells` (MOD-60). MOD-67 is done (`docs/decisions/mod/mod-67.md`): hints now sit in one row above the status line.
 - [ ] **MOD-82 - Shared pane chrome: sub-tabs, detail header, overlays, Settings layouts** (from
   the TUI design review of 2026-10-04, https://claude.ai/artifact/TxAriNUvRpTifJy8Wq6HeH findings 9,
   13, 15, 16). `R-TUI-1`, `R-TUI-3`, `R-TUI-7`, `R-TUI-8`. Secondary navigation comes in three
@@ -417,7 +335,8 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   dim the backdrop. The eight Settings sections use five layouts (table, tree, key-value,
   master-detail, one-line records) with different indents, and Connection says `press Enter or R`
   where its hint row says `R rebuild cache`; settle on table and key-value with shared label widths.
-  After MOD-67.
+  MOD-67 is done (`docs/decisions/mod/mod-67.md`); carried here from it: the Prompt pane header's `n / p · N
+  templates` and the Skills/Templates pane titles' ` J/K scroll ` still name keys as literal pane chrome.
 - [ ] **MOD-83 - Display labels and actionable errors** (from the TUI design review of 2026-10-04,
   https://claude.ai/artifact/TxAriNUvRpTifJy8Wq6HeH findings 10, 12). `R-TUI-1`, `R-TUI-4`,
   `R-TUI-8`. Internal values reach the screen: snake_case statuses (`awaiting_approval`), source tags
@@ -449,7 +368,7 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   tree reads it. It reuses MOD-28's `ExecutionGraph` plumbing (pan, zoom, mouse, fit through `ui::cells`), with a
   key toggle like the Runs pane's `v`. Open in the plan: node content and size, layout of cycles and items with
   several parents, re-rooting from a node (the tree's `Enter` emits `Action::Reveal`), and how the hop depth
-  (`+`/`-`) sits beside the flow's zoom. Not blocked. After MOD-67, which owns the key catalogue.
+  (`+`/`-`) sits beside the flow's zoom. Not blocked; its toggle is a catalogue action (MOD-67, `docs/decisions/mod/mod-67.md`).
 
 - [ ] **MOD-94 - Answer a relayed permission request from outside the TUI** (from ANA-29,
   `docs/ANA-29.md` §5.1 C3). `R-TUI-4`, `R-TUI-6`, `R-HIS-1`, `R-ID-6`. MOD-42's executor waits for
@@ -545,6 +464,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-25 learned weights, ANA-28 heavy_build routing, ANA-30 utility models) |
-| MOD-N   | 19 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 18 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-11 CLEAN-9 deferred review residuals, CLEAN-12 `.claude/` hygiene) |
 | TOOL-N  | 3 (TOOL-8 `htui-dev` mod, TOOL-9 gate script and git hooks, TOOL-10 sandbox mod hardening) |

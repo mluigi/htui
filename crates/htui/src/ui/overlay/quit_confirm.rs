@@ -136,7 +136,6 @@ impl Overlay for QuitConfirm {
 mod tests {
     use super::*;
     use crate::app::{Emit, TopBarState};
-    use crate::keymap::Keymap;
     use crate::keys::{Keys, load_str};
     use crate::store_worker::Origin;
     use crate::ui::cells::cell_width;
@@ -149,7 +148,6 @@ mod tests {
         scope: Scope,
         projects: Vec<ProjectRef>,
         top_bar: TopBarState,
-        keymap: Keymap,
         theme: Theme,
         keys: Option<Keys>,
         emit: Emit,
@@ -164,7 +162,6 @@ mod tests {
                 },
                 projects: Vec::new(),
                 top_bar: TopBarState::default(),
-                keymap: Keymap::new(),
                 theme: Theme::default(),
                 keys: None,
                 emit: Emit::default(),
@@ -178,19 +175,15 @@ mod tests {
         }
 
         fn ctx(&self) -> Ctx<'_> {
-            let ctx = Ctx::new(
+            Ctx::new(
                 &self.scope,
                 &self.projects,
                 &self.top_bar,
-                &self.keymap,
+                self.keys.as_ref().unwrap_or(Keys::compiled()),
                 &self.theme,
                 Origin::Overlay(QuitConfirm::ID),
                 &self.emit,
-            );
-            match &self.keys {
-                Some(keys) => ctx.with_keys(keys),
-                None => ctx,
-            }
+            )
         }
 
         /// Sends one chord (a strict key-file spec) to the confirm.

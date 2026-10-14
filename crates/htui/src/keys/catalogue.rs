@@ -1,7 +1,7 @@
 //! The action catalogue: every named action, its context, defaults and help (ANA-26 §7.2).
 //!
 //! MOD-67 M1 (plan D4, D12) fills the global, overlay and shared contexts. Global and overlay
-//! rows reproduce today's `Keymap::default_global` bindings, plus `f1` for help (ANA-26 §6.5).
+//! rows reproduce the M1 global bindings, plus `f1` for help (ANA-26 §6.5).
 //! Each shared-context row (`list`, `pane`, `confirm`, `form`, `common`) takes its defaults from
 //! today's match arms and cites the arm it mirrors. No view consumes a shared context until M3,
 //! so those rows change no behaviour yet. M3-M5 append each view's context in its own block.
@@ -31,11 +31,14 @@
 //! context holding the Backlog tab's own verbs (filter, new item, queue, the replay miss, ...),
 //! then one view context per Backlog sub-tab in strip order, the filter and item forms, and
 //! `chat`. Every chord is today's: no default changes.
+//!
+//! MOD-67 M6 appends `queue` (the queue overlay) and `picker` (the directory picker), the last
+//! two views that matched raw keys.
 
 use Context::{
     Backlog, BacklogDocs, BacklogFilter, BacklogGraph, BacklogItem, BacklogNotes, BacklogPrompt,
     BacklogReqs, BacklogRuns, Chat, Common, Concepts, Confirm, Editor, Form, Global, List, Overlay,
-    Pane, Requirements, Settings, SettingsAgents, SettingsBoxes, SettingsConnection,
+    Pane, Picker, Queue, Requirements, Settings, SettingsAgents, SettingsBoxes, SettingsConnection,
     SettingsHierarchy, SettingsKinds, SettingsPersonas, SettingsSecrets, Skills, SkillsAttach,
     SkillsHelp, SkillsLibrary, SkillsTemplates, Switcher, Waiting,
 };
@@ -44,7 +47,8 @@ use Context::{
 /// M1 has the global, overlay and shared contexts; M3 appends the Settings and overlay view
 /// contexts; M4 the Skills and Requirements ones. M5 appends the Backlog and Chat contexts:
 /// `backlog` (shared), one view context per Backlog sub-tab, the filter and item forms, and
-/// `chat`.
+/// `chat`. MOD-67 M6 appends `queue` (the queue overlay) and `picker` (the directory picker),
+/// the last two views that matched raw keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Context {
     /// `[global]`: reachable from every screen, checked last.
@@ -132,6 +136,11 @@ pub enum Context {
     BacklogItem,
     /// `[chat]`: the Chat tab (live, parked, ended, replay).
     Chat,
+    /// `[queue]`: the queue overlay (MOD-67 M6 D2).
+    Queue,
+    /// `[picker]`: the directory picker a Settings section opens (MOD-67 M6 D3; today
+    /// Hierarchy's).
+    Picker,
 }
 
 impl Context {
@@ -178,6 +187,8 @@ impl Context {
         Self::BacklogFilter,
         Self::BacklogItem,
         Self::Chat,
+        Self::Queue,
+        Self::Picker,
     ];
 
     /// The TOML table name: `global`, `overlay`, `list`, ..., `settings.agents`, `concepts`.
@@ -224,6 +235,8 @@ impl Context {
             Self::BacklogFilter => "backlog.filter_form",
             Self::BacklogItem => "backlog.item",
             Self::Chat => "chat",
+            Self::Queue => "queue",
+            Self::Picker => "picker",
         }
     }
 
@@ -272,11 +285,14 @@ impl Context {
             Self::BacklogFilter => "Filter",
             Self::BacklogItem => "Item",
             Self::Chat => "Chat",
+            Self::Queue => "Queue",
+            Self::Picker => "Picker",
         }
     }
 
     /// A view's own context (a Settings section, an overlay, a Skills view or pane, the
-    /// Requirements tab, a Backlog sub-tab or form, the Chat tab): hosts view verbs, D10
+    /// Requirements tab, a Backlog sub-tab or form, the Chat tab, the queue overlay, the
+    /// directory picker): hosts view verbs, D10
     /// overrides and [`VIEW_DEFAULTS`]; skipped by the validator's per-context pass (MOD-67 M3
     /// PA-4).
     #[must_use]
@@ -312,6 +328,8 @@ impl Context {
                 | Self::BacklogFilter
                 | Self::BacklogItem
                 | Self::Chat
+                | Self::Queue
+                | Self::Picker
         )
     }
 
@@ -656,6 +674,28 @@ pub enum Act {
     ChatTop,
     /// `chat.bottom`: the transcript's bottom.
     ChatBottom,
+    /// `queue.move_down`: move the selected entry down the queue.
+    QueueMoveDown,
+    /// `queue.move_up`: move the selected entry up the queue.
+    QueueMoveUp,
+    /// `queue.pause`: pause or resume the selected entry.
+    QueuePause,
+    /// `queue.dequeue`: take the selected entry off the queue.
+    QueueDequeue,
+    /// `queue.open`: open the selected entry's item.
+    QueueOpen,
+    /// `picker.open`: open the selected directory.
+    PickerOpen,
+    /// `picker.parent`: go to the parent directory.
+    PickerParent,
+    /// `picker.choose`: choose the selected entry.
+    PickerChoose,
+    /// `picker.choose_dir`: choose the directory being listed.
+    PickerChooseDir,
+    /// `picker.go_to`: type a path to go to.
+    PickerGoTo,
+    /// `picker.hidden`: show or hide hidden entries.
+    PickerHidden,
 }
 
 impl Act {
@@ -737,7 +777,7 @@ const fn capture_row(
 /// Every action, grouped by context, in display order (the status line and the `?` box follow
 /// it). M3-M5 append their contexts' blocks at the end.
 pub static CATALOGUE: &[ActionSpec] = &[
-    // [global]: today's `keymap.rs` `default_global` rows and `app/mod.rs` `register_all`
+    // [global]: the pre-MOD-67 keymap's `default_global` rows and `app/mod.rs` `register_all`
     // labels, in status-line order. `ctrl-c` is fixed (`CTRL_C`) and never listed.
     row(Act::Quit, Global, "quit", &["q"], "quit"),
     row(Act::NextTab, Global, "next_tab", &["tab"], "next tab"),
@@ -820,16 +860,17 @@ pub static CATALOGUE: &[ActionSpec] = &[
     row(Act::Find, Global, "find", &["ctrl-f"], "find"),
     row(Act::Waiting, Global, "waiting", &["ctrl-w"], "waiting"),
     row(Act::Queue, Global, "queue", &["ctrl-q"], "queue"),
-    // [overlay]: `keymap.rs`'s wildcard overlay row. In capture because the concepts field
-    // returns `Pass` on `Esc` and this layer closes it (`concepts_search.rs:334-335`).
+    // [overlay]: the pre-MOD-67 keymap's wildcard overlay row. In capture because the concepts
+    // field returns `Pass` on `Esc` and this layer closes it (`concepts_search.rs:334-335`).
     capture_row(Act::OverlayClose, Overlay, "close", &["esc"], "close"),
     // [list]
     // backlog/mod.rs:789, requirements/mod.rs:443, connection.rs:811, kinds.rs:1492,
-    // qdrant.rs:404, workspace_switcher.rs:163, waiting_list.rs:274. agents.rs:2420 and
-    // hierarchy.rs:1212 take `j` only (ANA §6.6 adds `down`, M3).
+    // qdrant.rs:404, workspace_switcher.rs:163, waiting_list.rs:274, queue.rs:440,
+    // path_picker.rs:142. agents.rs:2420 and hierarchy.rs:1212 take `j` only (ANA §6.6 adds
+    // `down`, M3).
     row(Act::ListDown, List, "down", &["j", "down"], "down"),
     // backlog/mod.rs:790, requirements/mod.rs:444, connection.rs:815, kinds.rs:1496,
-    // boxes.rs:699, library.rs:689.
+    // boxes.rs:699, library.rs:689, queue.rs:445, path_picker.rs:147.
     row(Act::ListUp, List, "up", &["k", "up"], "up"),
     // backlog/mod.rs:791, requirements/mod.rs:445. kinds.rs:1476 binds `g` to open graph (M3).
     row(Act::ListTop, List, "top", &["g", "home"], "top"),
@@ -933,8 +974,8 @@ pub static CATALOGUE: &[ActionSpec] = &[
     // boxes.rs:733, requirements/mod.rs:471, library.rs:690, templates.rs:523, attach.rs:398.
     // agents.rs:2495 `r` probes (a view verb).
     row(Act::Reload, Common, "reload", &["r"], "reload"),
-    // divergence.rs:248, library.rs:895, chat/mod.rs:280. personas.rs:841 also takes `Enter`:
-    // a `VIEW_DEFAULTS` row.
+    // divergence.rs:248, library.rs:895, chat/mod.rs:280, path_picker.rs:182 (the directory
+    // picker, MOD-67 M6). personas.rs:841 also takes `Enter`: a `VIEW_DEFAULTS` row.
     row(Act::Back, Common, "back", &["esc"], "back"),
     // connection.rs:828, boxes.rs:739, hierarchy.rs:1295, kinds.rs:1511, prompt.rs:875.
     // Shares `Esc` with `back`: `STATE_GUARDED`.
@@ -1722,6 +1763,50 @@ pub static CATALOGUE: &[ActionSpec] = &[
     row(Act::ChatTop, Chat, "top", &["g"], "top"),
     // transcript.rs:488.
     row(Act::ChatBottom, Chat, "bottom", &["G"], "bottom"),
+    // [queue]: the queue overlay (MOD-67 M6 D2). `j`/`k` are `list.down`/`up`, `Esc` is
+    // `overlay.close`, `?` is `global.help`.
+    // queue.rs:450.
+    row(Act::QueueMoveDown, Queue, "move_down", &["J"], "move down"),
+    // queue.rs:451.
+    row(Act::QueueMoveUp, Queue, "move_up", &["K"], "move up"),
+    // queue.rs:455-466.
+    row(Act::QueuePause, Queue, "pause", &["P"], "pause / resume"),
+    // queue.rs:467-473.
+    row(Act::QueueDequeue, Queue, "dequeue", &["Q"], "dequeue"),
+    // queue.rs:474.
+    row(Act::QueueOpen, Queue, "open", &["enter"], "open"),
+    // [picker]: the directory picker (MOD-67 M6 D3). `j`/`k` are `list.down`/`up`, `Esc` is
+    // `common.back` (PA-10).
+    // path_picker.rs:151-154.
+    row(
+        Act::PickerOpen,
+        Picker,
+        "open",
+        &["enter", "l"],
+        "open directory",
+    ),
+    // path_picker.rs:155-167. Not `up`: that would hide the inherited `list.up` (PA-10).
+    row(
+        Act::PickerParent,
+        Picker,
+        "parent",
+        &["h", "backspace"],
+        "parent directory",
+    ),
+    // path_picker.rs:168-170.
+    row(Act::PickerChoose, Picker, "choose", &["s"], "choose"),
+    // path_picker.rs:171-173.
+    row(
+        Act::PickerChooseDir,
+        Picker,
+        "choose_dir",
+        &["S"],
+        "choose this directory",
+    ),
+    // path_picker.rs:174-177.
+    row(Act::PickerGoTo, Picker, "go_to", &["/"], "go to path"),
+    // path_picker.rs:178-181.
+    row(Act::PickerHidden, Picker, "hidden", &["."], "show hidden"),
 ];
 
 /// Extra default chords a view adds to a shared act, on top of whatever the shared row resolves
@@ -1857,12 +1942,14 @@ mod tests {
             Context::BacklogFilter => 37,
             Context::BacklogItem => 38,
             Context::Chat => 39,
+            Context::Queue => 40,
+            Context::Picker => 41,
         }
     }
 
     #[test]
     fn every_context_is_listed_once_in_all() {
-        assert_eq!(Context::ALL.len(), 40);
+        assert_eq!(Context::ALL.len(), 42);
         for (index, context) in Context::ALL.iter().enumerate() {
             assert_eq!(
                 context_position(*context),
@@ -2061,6 +2148,17 @@ mod tests {
         Act::ChatThoughts,
         Act::ChatTop,
         Act::ChatBottom,
+        Act::QueueMoveDown,
+        Act::QueueMoveUp,
+        Act::QueuePause,
+        Act::QueueDequeue,
+        Act::QueueOpen,
+        Act::PickerOpen,
+        Act::PickerParent,
+        Act::PickerChoose,
+        Act::PickerChooseDir,
+        Act::PickerGoTo,
+        Act::PickerHidden,
     ];
 
     /// `act`'s index in [`ALL`]. No wildcard arm: a new variant fails to compile here until it is
@@ -2226,6 +2324,17 @@ mod tests {
             Act::ChatThoughts => 156,
             Act::ChatTop => 157,
             Act::ChatBottom => 158,
+            Act::QueueMoveDown => 159,
+            Act::QueueMoveUp => 160,
+            Act::QueuePause => 161,
+            Act::QueueDequeue => 162,
+            Act::QueueOpen => 163,
+            Act::PickerOpen => 164,
+            Act::PickerParent => 165,
+            Act::PickerChoose => 166,
+            Act::PickerChooseDir => 167,
+            Act::PickerGoTo => 168,
+            Act::PickerHidden => 169,
         }
     }
 
@@ -2250,7 +2359,7 @@ mod tests {
 
     #[test]
     fn every_act_has_exactly_one_row() {
-        assert_eq!(CATALOGUE.len(), 159);
+        assert_eq!(CATALOGUE.len(), 170);
         let acts: HashSet<Act> = CATALOGUE.iter().map(|row| row.act).collect();
         assert_eq!(acts.len(), CATALOGUE.len(), "an act has two rows");
         for row in CATALOGUE {
@@ -2415,6 +2524,8 @@ mod tests {
             (Context::BacklogFilter, "backlog.filter_form", "Filter"),
             (Context::BacklogItem, "backlog.item", "Item"),
             (Context::Chat, "chat", "Chat"),
+            (Context::Queue, "queue", "Queue"),
+            (Context::Picker, "picker", "Picker"),
         ];
         assert_eq!(table.len(), Context::ALL.len());
         for (context, name, heading) in table {
@@ -2452,6 +2563,10 @@ mod tests {
             Context::BacklogItem,
             Context::Chat,
         ] {
+            assert!(context.is_view() && !context.is_shared(), "{context:?}");
+        }
+        // MOD-67 M6 §4.1: the queue overlay and the directory picker are views.
+        for context in [Context::Queue, Context::Picker] {
             assert!(context.is_view() && !context.is_shared(), "{context:?}");
         }
     }

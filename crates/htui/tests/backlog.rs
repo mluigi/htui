@@ -3400,3 +3400,45 @@ async fn q_and_p_are_on_the_backlog_help_line() {
     assert!(help.contains("Q queue / dequeue"), "{help}");
     assert!(help.contains("P pause / resume queue"), "{help}");
 }
+
+/// MOD-67 M6 D4: a rebound save key is the one the item form's notices name: the `$EDITOR`
+/// return's, and the one `Esc` from the divergence view leaves.
+#[tokio::test]
+async fn a_rebound_save_key_is_named_by_the_item_form() {
+    let store = MemStore::demo();
+    let file =
+        htui::keys::load_str("version = 1\n[form]\nsave = \"f2\"\n").expect("the key file loads");
+    let mut harness = Harness::over(store.clone())
+        .with_keys(file)
+        .with_tab(Box::new(BacklogTab::new()))
+        .with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
+    harness.drive_to_end().await;
+    harness.app().update(Action::SetScope {
+        workspace: workspace("platform").await,
+    });
+    harness.drive_to_end().await;
+
+    keys(&mut harness, &["e"]).await;
+    keys(&mut harness, &TITLE_TO_BODY).await;
+    keys(&mut harness, &["ctrl-e"]).await;
+    assert!(harness.app().take_external_edit().is_some(), "asked");
+    harness.app().finish_external_edit(
+        BacklogTab::ID,
+        ExternalEditOutcome::Edited("New body.\n".to_owned()),
+    );
+    let frame = harness.render();
+    assert!(
+        frame.contains("edited in $EDITOR \u{2014} F2 saves"),
+        "the notice:\n{frame}"
+    );
+
+    their_write(&store, retitled("Theirs")).await;
+    keys(&mut harness, &["f2"]).await;
+    assert!(harness.render().contains("theirs v2"), "the view opened");
+    keys(&mut harness, &["esc"]).await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("still behind v2; F2 compares again"),
+        "the notice:\n{frame}"
+    );
+}

@@ -46,14 +46,14 @@ pub type HintSpec = &'static [Hint];
 /// One logical line of the `?` box: a heading and its entries (D8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelpLine {
-    /// `Global`, `Overlay`, or a tab's title for its legacy rows.
+    /// `Global`, `Overlay`, or a context's heading.
     pub heading: String,
     /// `"{chords} {help}"` entries, e.g. `q/Ctrl+c quit`.
     pub entries: Vec<String>,
 }
 
 impl HelpLine {
-    /// A line from its parts (the shell builds the legacy tab line with it).
+    /// A line from its parts.
     #[must_use]
     pub fn new(heading: impl Into<String>, entries: Vec<String>) -> Self {
         Self {

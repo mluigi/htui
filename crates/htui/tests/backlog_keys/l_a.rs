@@ -409,14 +409,21 @@ async fn a_rebound_external_editor_hands_the_body_out() {
     assert_eq!(edit.text, "A note by hand.");
 }
 
-/// The filter form's four rows and its hint, as drawn in the list pane: borders and padding off.
+/// The shell's hint row (MOD-67 M6 T2): the frame's second-to-last row, trailing blanks dropped.
+fn hint_row(frame: &str) -> String {
+    let rows: Vec<&str> = frame.lines().collect();
+    rows[rows.len() - 2].trim_end().to_owned()
+}
+
+/// The filter form's four rows, as drawn in the list pane: borders and padding off (its keys are
+/// the shell's hint row since MOD-67 M6 T2).
 fn filter_rows(frame: &str) -> Vec<String> {
     let lines: Vec<&str> = frame.lines().collect();
     let title = lines
         .iter()
         .position(|line| line.contains("┌ Filter "))
         .unwrap_or_else(|| panic!("the filter form is open:\n{frame}"));
-    lines[title + 1..=title + 5]
+    lines[title + 1..=title + 4]
         .iter()
         .map(|line| {
             let left = line.split("││").next().unwrap_or_default();
@@ -482,9 +489,13 @@ async fn the_filter_form_keeps_its_value_keys_and_x_clears() {
 
     press(&mut harness, "j").await;
     press(&mut harness, "x").await;
-    let rows = filter_rows(&harness.render());
+    let frame = harness.render();
+    let rows = filter_rows(&frame);
     assert_eq!(rows[2], "> tags    jx", "typed, not moved or cleared");
-    assert_eq!(rows[4], "comma list · Tab row · Enter apply · Esc cancel");
+    assert_eq!(
+        hint_row(&frame),
+        "comma list · Tab row · Enter apply · Esc cancel"
+    );
     press(&mut harness, "down").await;
     assert_eq!(focused(&mut harness), "ready", "`Down` moves on");
     press(&mut harness, "backtab").await;

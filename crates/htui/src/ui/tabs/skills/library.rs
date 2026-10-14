@@ -35,11 +35,11 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use super::agent_help::{ACCEPTED, AgentHelp, HelpOutcome, Report};
+use super::agent_help::{AgentHelp, HelpOutcome, Report, accepted};
 use super::attach::{AttachOutcome, AttachPane};
 use crate::app::{Action, Ctx, Handled};
-use crate::editor::{EDITED, ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
+use crate::editor::{ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, edited};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::skill_import::ImportOutcome;
 use crate::skills::{READ_NAME, REQUEST_NAMES, SkillWrite, SkillsSnapshot, StaleWhat};
 use crate::store_worker::{StoreReply, StoreRequest};
@@ -85,13 +85,25 @@ const SAVING: &str = "saving\u{2026}";
 /// A `SkillsStale` for a skill the library no longer holds.
 const SKILL_GONE: &str = "the skill is gone";
 
-/// A rename over a row that changed since the form opened.
-const SKILL_CHANGED_ELSEWHERE: &str = "changed elsewhere since you opened it \u{2014} your text is \
-                                       kept; Ctrl+S saves it over the new row";
+/// A rename over a row that changed since the form opened. `save` is `FormSave`'s label through
+/// `LIBRARY_INFO` (MOD-67 M6 D4); with none bound the clause goes.
+fn skill_changed_elsewhere(save: Option<&str>) -> String {
+    let kept = "changed elsewhere since you opened it \u{2014} your text is kept";
+    match save {
+        Some(save) => format!("{kept}; {save} saves it over the new row"),
+        None => kept.to_owned(),
+    }
+}
 
-/// An attachment save over a row that changed since the form opened.
-const BINDING_CHANGED_ELSEWHERE: &str = "this attachment changed elsewhere \u{2014} your form is \
-                                         kept; Ctrl+S saves over it";
+/// An attachment save over a row that changed since the form opened. `save` is `FormSave`'s
+/// label through `ATTACH_FORM` (MOD-67 M6 D4); with none bound the clause goes.
+fn binding_changed_elsewhere(save: Option<&str>) -> String {
+    let kept = "this attachment changed elsewhere \u{2014} your form is kept";
+    match save {
+        Some(save) => format!("{kept}; {save} saves over it"),
+        None => kept.to_owned(),
+    }
+}
 
 /// A detach over a row that changed or went since the question was asked: nothing was detached,
 /// and the pane shows the row as it is now.
@@ -165,13 +177,21 @@ const ENTER_A_PATH: &str = "type a path to a SKILL.md file or a directory";
 /// An import that found nothing to import.
 const NOTHING_IMPORTED: &str = "nothing to import at that path";
 
-/// `SkillsStale` over an open editor: the Templates view's sentence (`templates.rs`).
-fn version_changed_elsewhere(head: i32) -> String {
-    format!(
-        "saved elsewhere since you opened it \u{2014} v{head} is now the latest; your draft is \
-         kept and Ctrl+S saves it as v{}",
-        head + 1
-    )
+/// `SkillsStale` over an open editor: the Templates view's sentence (`templates.rs`). `save` is
+/// `FormSave`'s label through `LIBRARY_EDITOR` (MOD-67 M6 D4); with none bound the sentence says
+/// what saving writes.
+fn version_changed_elsewhere(head: i32, save: Option<&str>) -> String {
+    let next = head + 1;
+    match save {
+        Some(save) => format!(
+            "saved elsewhere since you opened it \u{2014} v{head} is now the latest; your draft is \
+             kept and {save} saves it as v{next}"
+        ),
+        None => format!(
+            "saved elsewhere since you opened it \u{2014} v{head} is now the latest; your draft is \
+             kept and saving writes it as v{next}"
+        ),
+    }
 }
 
 /// A key while a write is in flight: one at a time (`settings/prompt.rs`' rule).
@@ -180,9 +200,13 @@ fn in_flight(busy: &str) -> String {
 }
 
 /// MOD-59 D5: a write that applied although its re-read failed. It landed; the view still draws
-/// what it held, and `r` reads again.
-fn landed_unread(landed: &str, why: &str) -> String {
-    format!("{landed} \u{2014} the re-read failed, r reloads: {why}")
+/// what it held, and `reload` (`Reload`'s label through `LIBRARY_BROWSE`, MOD-67 M6 D4) reads
+/// again; with none bound the clause goes.
+fn landed_unread(landed: &str, why: &str, reload: Option<&str>) -> String {
+    match reload {
+        Some(reload) => format!("{landed} \u{2014} the re-read failed, {reload} reloads: {why}"),
+        None => format!("{landed} \u{2014} the re-read failed: {why}"),
+    }
 }
 
 /// D99 (F-I): the estimate of one skill's block as `render::skills` writes it, `version` and
@@ -234,7 +258,7 @@ pub(super) struct LibraryView {
     busy: Option<&'static str>,
     /// What the write in flight carries, for the landing (D98).
     sent: Option<Sent>,
-    /// The last outcome, one line above the hint.
+    /// The last outcome, on the view's last rows.
     notice: Option<Notice>,
     /// What `E`/`Ctrl+E` asked `$EDITOR` for, until `on_external_edit`.
     external: Option<Pending>,
@@ -600,7 +624,7 @@ impl LibraryView {
         {
             let outcome = help.on_reply(reply, ctx);
             if outcome != HelpOutcome::Consumed {
-                self.apply_help(outcome);
+                self.apply_help(outcome, ctx.keys());
             }
         }
         match reply {
@@ -620,7 +644,7 @@ impl LibraryView {
                     }
                     self.snapshot = Some((**snapshot).clone());
                     self.unavailable = None;
-                    self.land(outcome, None);
+                    self.land(outcome, None, ctx.keys());
                     self.clamp();
                 }
                 // No snapshot to check the scope by: only the write in flight owns this reply, and
@@ -629,7 +653,7 @@ impl LibraryView {
                     if self.snapshot.is_none() {
                         self.unavailable = Some(why.clone());
                     }
-                    self.land(outcome, Some(why));
+                    self.land(outcome, Some(why), ctx.keys());
                 }
                 Err(_) => {}
             },
@@ -647,7 +671,7 @@ impl LibraryView {
                             ..
                         })
                     );
-                    self.stale(*what, detach);
+                    self.stale(*what, detach, ctx.keys());
                 }
                 self.clamp();
             }
@@ -680,7 +704,7 @@ impl LibraryView {
 
     /// The `$EDITOR` handoff came back. No handoff pending (the scope changed meanwhile, or the
     /// Templates view asked for it): ignored (D100).
-    pub(super) fn on_external_edit(&mut self, outcome: ExternalEditOutcome, _ctx: &mut Ctx<'_>) {
+    pub(super) fn on_external_edit(&mut self, outcome: ExternalEditOutcome, ctx: &mut Ctx<'_>) {
         let Some(Pending { mut editor, resume }) = self.external.take() else {
             return;
         };
@@ -690,7 +714,11 @@ impl LibraryView {
                 editor.esc_armed = false;
                 self.notice = Some(match skill_body_refusal(editor.area.text()) {
                     Some(sentence) => Notice::Error(sentence),
-                    None => Notice::Info(EDITED.to_owned()),
+                    None => Notice::Info(edited(
+                        ctx.keys()
+                            .label(views::LIBRARY_EDITOR, Act::FormSave)
+                            .as_deref(),
+                    )),
                 });
                 self.mode = Mode::Editing(editor);
             }
@@ -710,7 +738,8 @@ impl LibraryView {
         }
     }
 
-    /// Draws the view below the switch line: the content, the notice row and the hint row.
+    /// Draws the view below the switch line: the content and the notice row. Its keys are
+    /// [`key_hint`](Self::key_hint), the shell's hint row since MOD-67 M6 T2.
     pub(super) fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         // The notice wraps rather than clips (at most `NOTICE_LINES`): the stale sentence ends on
         // the version the next `Ctrl+S` writes.
@@ -722,48 +751,18 @@ impl LibraryView {
         let mut notice = wrapped(notice, usize::from(area.width.saturating_sub(1)).max(1));
         notice.truncate(NOTICE_LINES);
         let notice_height = u16::try_from(notice.len().max(1)).unwrap_or(1);
-        let [content, notice_row, hint_row] = Layout::vertical([
-            Constraint::Min(1),
-            Constraint::Length(notice_height),
-            Constraint::Length(1),
-        ])
-        .areas(area);
-        let hint = match (&self.attach, &self.snapshot, &self.mode, self.handed_off()) {
+        let [content, notice_row] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(notice_height)]).areas(area);
+        match (&self.attach, &self.snapshot, &self.mode, self.handed_off()) {
             (Some(pane), Some(snapshot), _, _) => pane.render(frame, content, snapshot, ctx),
-            (_, _, Mode::Editing(editor), _) => {
+            (_, _, Mode::Editing(editor), _) | (_, _, Mode::Browse, Some(editor)) => {
                 self.render_editor(frame, content, editor, ctx);
-                match &editor.help {
-                    Some(help) => help.hint(ctx.keys()),
-                    None => {
-                        let (line, col) = editor.area.cursor_line_col();
-                        format!(
-                            "{} \u{b7} L{}:C{}",
-                            ctx.keys().hint(self.key_stack(), EDIT_HINT),
-                            line + 1,
-                            col + 1
-                        )
-                    }
-                }
-            }
-            (_, _, Mode::Browse, Some(editor)) => {
-                self.render_editor(frame, content, editor, ctx);
-                ctx.keys().hint(self.key_stack(), HANDED_OFF_HINT)
             }
             (_, _, Mode::Report { outcomes, cursor }, _) => {
                 self.render_report(frame, content, outcomes, *cursor, ctx);
-                ctx.keys().hint(self.key_stack(), REPORT_HINT)
             }
-            (_, _, mode, _) => {
-                self.render_browse(frame, content, ctx);
-                let spec = match mode {
-                    Mode::Naming { .. } | Mode::Describing { .. } => NAMING_HINT,
-                    Mode::Info(_) => INFO_HINT,
-                    Mode::ImportPath { .. } => IMPORT_HINT,
-                    Mode::Browse | Mode::Editing(_) | Mode::Report { .. } => BROWSE_HINT,
-                };
-                ctx.keys().hint(self.key_stack(), spec)
-            }
-        };
+            _ => self.render_browse(frame, content, ctx),
+        }
         frame.render_widget(
             Paragraph::new(
                 notice
@@ -773,10 +772,38 @@ impl LibraryView {
             ),
             notice_row,
         );
-        frame.render_widget(
-            Paragraph::new(Line::styled(format!(" {hint}"), ctx.theme.dim)),
-            hint_row,
-        );
+    }
+
+    /// The keys of the shown mode for the shell's hint row (MOD-67 M6 T2), through
+    /// [`key_stack`](Self::key_stack): the attachments pane's while it is open, an open agent
+    /// help's, the editor's with the cursor's `L:C`, else the mode's.
+    pub(super) fn key_hint(&self, keys: &Keys) -> String {
+        match (&self.attach, &self.snapshot, &self.mode, self.handed_off()) {
+            (Some(pane), Some(_), _, _) => pane.hint(keys),
+            (_, _, Mode::Editing(editor), _) => match &editor.help {
+                Some(help) => help.hint(keys),
+                None => {
+                    let (line, col) = editor.area.cursor_line_col();
+                    format!(
+                        "{} \u{b7} L{}:C{}",
+                        keys.hint(self.key_stack(), EDIT_HINT),
+                        line + 1,
+                        col + 1
+                    )
+                }
+            },
+            (_, _, Mode::Browse, Some(_)) => keys.hint(self.key_stack(), HANDED_OFF_HINT),
+            (_, _, Mode::Report { .. }, _) => keys.hint(self.key_stack(), REPORT_HINT),
+            (_, _, mode, _) => {
+                let spec = match mode {
+                    Mode::Naming { .. } | Mode::Describing { .. } => NAMING_HINT,
+                    Mode::Info(_) => INFO_HINT,
+                    Mode::ImportPath { .. } => IMPORT_HINT,
+                    Mode::Browse | Mode::Editing(_) | Mode::Report { .. } => BROWSE_HINT,
+                };
+                keys.hint(self.key_stack(), spec)
+            }
+        }
     }
 
     // --- keys ----------------------------------------------------------------------------------
@@ -945,7 +972,7 @@ impl LibraryView {
             }
             FieldOutcome::Submit => {
                 match core::mem::take(&mut self.mode) {
-                    Mode::Naming { field } => self.named(field),
+                    Mode::Naming { field } => self.named(field, ctx.keys()),
                     Mode::Describing { name, field } => {
                         let description = field.text().unwrap_or_default().to_owned();
                         self.notice = None;
@@ -1027,13 +1054,18 @@ impl LibraryView {
 
     /// `Enter` on a new name (D71): an invalid or taken name is refused and the prompt stays;
     /// otherwise the description prompt opens.
-    fn named(&mut self, field: TextField) {
+    ///
+    /// A taken name sends the user to the browse edit key `keys` binds (MOD-67 M6 D4).
+    fn named(&mut self, field: TextField, keys: &Keys) {
         let name = field.text().unwrap_or_default().to_owned();
         let refusal = if validate_name(&name) {
             self.snapshot
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.by_name(&name).is_some())
-                .then(|| format!("`{name}` exists \u{2014} select it and press e"))
+                .then(|| match keys.label(views::LIBRARY_BROWSE, Act::Edit) {
+                    Some(edit) => format!("`{name}` exists \u{2014} select it and press {edit}"),
+                    None => format!("`{name}` exists"),
+                })
         } else {
             Some(invalid_skill_name(&name))
         };
@@ -1147,7 +1179,7 @@ impl LibraryView {
             && let Some(help) = editor.help.as_mut()
         {
             let outcome = help.on_key(key, ctx);
-            return self.apply_help(outcome);
+            return self.apply_help(outcome, ctx.keys());
         }
         let busy = self.busy;
         let page = self.page.get();
@@ -1276,7 +1308,7 @@ impl LibraryView {
     /// `$EDITOR` return does (`on_external_edit`'s `Edited` arm): skills have no `parse`, so the
     /// only check is `skill_body_refusal`'s, shown and not enforced; `Ctrl+S` stays the gate.
     /// `original` is left alone, so `Esc` still asks first.
-    fn apply_help(&mut self, outcome: HelpOutcome) -> Handled {
+    fn apply_help(&mut self, outcome: HelpOutcome, keys: &Keys) -> Handled {
         let Mode::Editing(editor) = &mut self.mode else {
             return Handled::Pass;
         };
@@ -1295,7 +1327,9 @@ impl LibraryView {
                 editor.esc_armed = false;
                 self.notice = Some(match skill_body_refusal(editor.area.text()) {
                     Some(sentence) => Notice::Error(sentence),
-                    None => Notice::Info(ACCEPTED.to_owned()),
+                    None => Notice::Info(accepted(
+                        keys.label(views::LIBRARY_EDITOR, Act::FormSave).as_deref(),
+                    )),
                 });
             }
         }
@@ -1377,17 +1411,17 @@ impl LibraryView {
     /// searches the snapshot for what was sent; a reply for any other write, and every plain
     /// `Skills` read, leaves the draft, the token and `busy` alone. `unread` is the re-read's
     /// failure (D5): the write landed, and the notice says the library drawn is the one held.
-    fn land(&mut self, outcome: &SkillWrite, unread: Option<&str>) {
+    fn land(&mut self, outcome: &SkillWrite, unread: Option<&str>, keys: &Keys) {
         if self.busy != Some(outcome.request_name()) {
             return;
         }
         let landed = match (outcome, self.sent.take()) {
             (SkillWrite::Created { skill, name }, Some(Sent::Create { body })) => {
-                self.landed_version(*skill, name, 1, &body)
+                self.landed_version(*skill, name, 1, &body, keys)
             }
             (SkillWrite::Versioned { skill, version }, Some(Sent::Version { body })) => {
                 let name = snapshot_name(self.snapshot.as_ref(), *skill);
-                self.landed_version(*skill, &name, *version, &body)
+                self.landed_version(*skill, &name, *version, &body, keys)
             }
             (SkillWrite::Edited { skill, name }, Some(Sent::Rename)) => {
                 self.select(*skill);
@@ -1400,7 +1434,12 @@ impl LibraryView {
                     .as_mut()
                     .is_some_and(|pane| pane.on_landed(*key, &change, Some(*updated_at)));
                 if kept {
-                    format!("attached to {target} \u{2014} later edits kept, Ctrl+S saves them")
+                    match keys.label(views::ATTACH_FORM, Act::FormSave) {
+                        Some(save) => format!(
+                            "attached to {target} \u{2014} later edits kept, {save} saves them"
+                        ),
+                        None => format!("attached to {target} \u{2014} later edits kept"),
+                    }
                 } else {
                     format!("attached to {target}")
                 }
@@ -1419,17 +1458,24 @@ impl LibraryView {
                 self.busy = None;
                 self.mode = Mode::Browse;
                 self.attach = None;
-                self.notice = Some(Notice::Error(format!(
-                    "`{}` landed \u{2014} r reloads",
-                    outcome.request_name()
-                )));
+                let name = outcome.request_name();
+                self.notice = Some(Notice::Error(
+                    match keys.label(views::LIBRARY_BROWSE, Act::Reload) {
+                        Some(reload) => format!("`{name}` landed \u{2014} {reload} reloads"),
+                        None => format!("`{name}` landed"),
+                    },
+                ));
                 return;
             }
         };
         self.busy = None;
         self.notice = Some(match unread {
             None => Notice::Info(landed),
-            Some(why) => Notice::Error(landed_unread(&landed, why)),
+            Some(why) => Notice::Error(landed_unread(
+                &landed,
+                why,
+                keys.label(views::LIBRARY_BROWSE, Act::Reload).as_deref(),
+            )),
         });
     }
 
@@ -1481,7 +1527,14 @@ impl LibraryView {
     /// lands (MOD-59 D5; `select` leaves the cursor on an unknown id). Keys typed while the save
     /// was in flight still edited the draft; when they did, the editor stays open on them with the
     /// token at the saved version, so the next `Ctrl+S` appends them (the Templates view's rule).
-    fn landed_version(&mut self, skill: SkillId, name: &str, version: i32, body: &str) -> String {
+    fn landed_version(
+        &mut self,
+        skill: SkillId,
+        name: &str,
+        version: i32,
+        body: &str,
+        keys: &Keys,
+    ) -> String {
         let tokens = estimate(name, version, body);
         self.select(skill);
         let verb = if version == 1 {
@@ -1504,17 +1557,20 @@ impl LibraryView {
             editor.from = Some(version);
             body.clone_into(&mut editor.original);
             editor.esc_armed = false;
-            format!(
-                "{verb} \u{b7} ~{tokens} tokens \u{2014} later edits kept, Ctrl+S saves them as \
-                 v{}",
-                version + 1
-            )
+            match keys.label(views::LIBRARY_EDITOR, Act::FormSave) {
+                Some(save) => format!(
+                    "{verb} \u{b7} ~{tokens} tokens \u{2014} later edits kept, {save} saves them \
+                     as v{}",
+                    version + 1
+                ),
+                None => format!("{verb} \u{b7} ~{tokens} tokens \u{2014} later edits kept"),
+            }
         }
     }
 
     /// A write missed its token, or its row is gone (§6.4's second table): the draft keeps its
     /// text and takes the token as it is now, so the next `Ctrl+S` is a deliberate overwrite.
-    fn stale(&mut self, what: StaleWhat, detach: bool) {
+    fn stale(&mut self, what: StaleWhat, detach: bool, keys: &Keys) {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -1522,7 +1578,10 @@ impl LibraryView {
             StaleWhat::Version(skill) => match (snapshot.head(skill), &mut self.mode) {
                 (Some(head), Mode::Editing(editor)) => {
                     editor.token = head.version;
-                    self.notice = Some(Notice::Error(version_changed_elsewhere(head.version)));
+                    self.notice = Some(Notice::Error(version_changed_elsewhere(
+                        head.version,
+                        keys.label(views::LIBRARY_EDITOR, Act::FormSave).as_deref(),
+                    )));
                 }
                 (Some(_), _) => {}
                 (None, _) => self.gone(),
@@ -1530,7 +1589,9 @@ impl LibraryView {
             StaleWhat::Skill(skill) => match (snapshot.entry(skill), &mut self.mode) {
                 (Some(entry), Mode::Info(form)) => {
                     form.token = entry.skill.updated_at;
-                    self.notice = Some(Notice::Error(SKILL_CHANGED_ELSEWHERE.to_owned()));
+                    self.notice = Some(Notice::Error(skill_changed_elsewhere(
+                        keys.label(views::LIBRARY_INFO, Act::FormSave).as_deref(),
+                    )));
                 }
                 (Some(_), _) => {}
                 (None, _) => self.gone(),
@@ -1540,11 +1601,13 @@ impl LibraryView {
                     pane.on_stale(snapshot);
                 }
                 let sentence = if detach {
-                    DETACH_CHANGED_ELSEWHERE
+                    DETACH_CHANGED_ELSEWHERE.to_owned()
                 } else {
-                    BINDING_CHANGED_ELSEWHERE
+                    binding_changed_elsewhere(
+                        keys.label(views::ATTACH_FORM, Act::FormSave).as_deref(),
+                    )
                 };
-                self.notice = Some(Notice::Error(sentence.to_owned()));
+                self.notice = Some(Notice::Error(sentence));
             }
         }
     }
@@ -1944,7 +2007,7 @@ mod tests {
 
     use super::*;
     use crate::app::{Action, Emit, TopBarState};
-    use crate::keymap::Keymap;
+    use crate::keys::Keys;
     use crate::skills;
     use crate::store_worker::Origin;
     use crate::ui::Theme;
@@ -1978,9 +2041,9 @@ mod tests {
     /// too many and the prompt line runs past the pane.
     #[test]
     fn a_wide_skill_name_keeps_the_description_prompt_within_the_pane() {
-        let (top_bar, keymap, theme, emit) = (
+        let (top_bar, keys, theme, emit) = (
             TopBarState::default(),
-            Keymap::default_global(),
+            Keys::compiled(),
             Theme::default(),
             Emit::default(),
         );
@@ -1989,7 +2052,7 @@ mod tests {
             &scope,
             &[],
             &top_bar,
-            &keymap,
+            keys,
             &theme,
             Origin::Tab(SkillsTab::ID),
             &emit,
@@ -2097,9 +2160,9 @@ mod tests {
     async fn a_read_reply_does_not_close_the_editor_mid_save() {
         let backend = Backend::memory(MemStore::demo());
         let scope = vulkan();
-        let (top_bar, keymap, theme, emit) = (
+        let (top_bar, keys, theme, emit) = (
             TopBarState::default(),
-            Keymap::default_global(),
+            Keys::compiled(),
             Theme::default(),
             Emit::default(),
         );
@@ -2107,7 +2170,7 @@ mod tests {
             &scope,
             &[],
             &top_bar,
-            &keymap,
+            keys,
             &theme,
             Origin::Tab(SkillsTab::ID),
             &emit,
@@ -2161,9 +2224,9 @@ mod tests {
     async fn a_read_reply_does_not_close_the_attach_form_mid_save() {
         let backend = Backend::memory(MemStore::demo());
         let scope = vulkan();
-        let (top_bar, keymap, theme, emit) = (
+        let (top_bar, keys, theme, emit) = (
             TopBarState::default(),
-            Keymap::default_global(),
+            Keys::compiled(),
             Theme::default(),
             Emit::default(),
         );
@@ -2171,7 +2234,7 @@ mod tests {
             &scope,
             &[],
             &top_bar,
-            &keymap,
+            keys,
             &theme,
             Origin::Tab(SkillsTab::ID),
             &emit,
@@ -2245,9 +2308,9 @@ mod tests {
     async fn the_attach_form_keeps_edits_typed_during_its_save() {
         let backend = Backend::memory(MemStore::demo());
         let scope = vulkan();
-        let (top_bar, keymap, theme, emit) = (
+        let (top_bar, keys, theme, emit) = (
             TopBarState::default(),
-            Keymap::default_global(),
+            Keys::compiled(),
             Theme::default(),
             Emit::default(),
         );
@@ -2255,7 +2318,7 @@ mod tests {
             &scope,
             &[],
             &top_bar,
-            &keymap,
+            keys,
             &theme,
             Origin::Tab(SkillsTab::ID),
             &emit,
@@ -2351,8 +2414,8 @@ mod tests {
         scope: Scope,
         /// The top bar.
         top_bar: TopBarState,
-        /// The default keymap.
-        keymap: Keymap,
+        /// The compiled default keys.
+        keys: Keys,
         /// The default theme.
         theme: Theme,
         /// What the view emitted.
@@ -2366,7 +2429,7 @@ mod tests {
             Self {
                 scope: vulkan(),
                 top_bar: TopBarState::default(),
-                keymap: Keymap::default_global(),
+                keys: Keys::compiled().clone(),
                 theme: Theme::default(),
                 emit: Emit::default(),
                 projects: Vec::new(),
@@ -2392,7 +2455,7 @@ mod tests {
                 &self.scope,
                 &self.projects,
                 &self.top_bar,
-                &self.keymap,
+                &self.keys,
                 &self.theme,
                 Origin::Tab(SkillsTab::ID),
                 &self.emit,
@@ -2441,8 +2504,9 @@ mod tests {
         };
         let (buffer, claim) = drawn(&view);
         let claim = claim.expect("the draft claims its text");
-        // The content above the notice and hint rows, inside the draft's border.
-        assert_eq!(claim, Rect::new(1, 1, 98, 24));
+        // The content above the notice row, inside the draft's border (the keys are the shell's
+        // hint row since MOD-67 M6 T2).
+        assert_eq!(claim, Rect::new(1, 1, 98, 25));
         let row = |y: u16| {
             (claim.x..claim.right())
                 .map(|x| buffer[(x, y)].symbol())
@@ -2487,7 +2551,7 @@ mod tests {
             title.contains("docs-style \u{b7} new, saves v1"),
             "{title:?}"
         );
-        let hint = line(area.bottom() - 1, 0, area.width);
+        let hint = view.key_hint(ctx.keys());
         assert!(hint.contains("the draft is in $EDITOR"), "{hint:?}");
 
         // Browse's `E` (F-12) has no draft to draw: the pane takes the tab body.
@@ -2812,6 +2876,62 @@ mod tests {
         );
     }
 
+    /// MOD-67 M6 D4: the Library's key-naming notices with their key unbound.
+    #[test]
+    fn the_library_notices_without_their_keys() {
+        assert_eq!(
+            skill_changed_elsewhere(None),
+            "changed elsewhere since you opened it \u{2014} your text is kept"
+        );
+        assert_eq!(
+            binding_changed_elsewhere(None),
+            "this attachment changed elsewhere \u{2014} your form is kept"
+        );
+        assert!(version_changed_elsewhere(3, None).ends_with("saving writes it as v4"));
+        assert!(version_changed_elsewhere(3, Some("F2")).ends_with("F2 saves it as v4"));
+        assert_eq!(
+            landed_unread("saved v3", "gone", None),
+            "saved v3 \u{2014} the re-read failed: gone"
+        );
+    }
+
+    /// MOD-67 M6 D4: a landed-unread write names the reload key in force through
+    /// `LIBRARY_BROWSE`.
+    #[tokio::test]
+    async fn a_rebound_reload_key_is_named_by_a_landed_unread_write() {
+        let backend = Backend::memory(MemStore::demo());
+        let bench = Bench {
+            keys: crate::keys::load_str("version = 1\n[skills.library]\nreload = \"f5\"\n")
+                .expect("loads"),
+            ..Bench::new()
+        };
+        let mut ctx = bench.ctx();
+        let mut view = LibraryView::default();
+        let read = serve(&backend, &StoreRequest::Skills(bench.scope.clone())).await;
+        view.on_reply(&read, &mut ctx);
+
+        view.on_key(key(KeyCode::Char('e')), &mut ctx);
+        view.on_key(key(KeyCode::Char('x')), &mut ctx);
+        view.on_key(ctrl('s'), &mut ctx);
+        let _save = bench.one();
+        view.on_reply(
+            &unread(SkillWrite::Versioned {
+                skill: ids::SKILL_RUST_STYLE,
+                version: 3,
+            }),
+            &mut ctx,
+        );
+        assert!(
+            matches!(
+                &view.notice,
+                Some(Notice::Error(text))
+                    if text.contains("the re-read failed, F5 reloads: store unreachable: gone")
+            ),
+            "{:?}",
+            view.notice
+        );
+    }
+
     /// MOD-59 D5: a save that applied although its re-read failed closes the editor, says what
     /// landed and that the re-read failed, and keeps drawing the library the view held.
     #[tokio::test]
@@ -3023,9 +3143,9 @@ mod tests {
     async fn a_skill_with_no_version_opens_an_empty_editor_on_token_0() {
         let backend = Backend::memory(MemStore::demo());
         let scope = vulkan();
-        let (top_bar, keymap, theme, emit) = (
+        let (top_bar, keys, theme, emit) = (
             TopBarState::default(),
-            Keymap::default_global(),
+            Keys::compiled(),
             Theme::default(),
             Emit::default(),
         );
@@ -3033,7 +3153,7 @@ mod tests {
             &scope,
             &[],
             &top_bar,
-            &keymap,
+            keys,
             &theme,
             Origin::Tab(SkillsTab::ID),
             &emit,
@@ -3126,9 +3246,9 @@ mod tests {
     async fn a_blank_body_dispatches_no_request() {
         let backend = Backend::memory(MemStore::demo());
         let scope = vulkan();
-        let (top_bar, keymap, theme, emit) = (
+        let (top_bar, keys, theme, emit) = (
             TopBarState::default(),
-            Keymap::default_global(),
+            Keys::compiled(),
             Theme::default(),
             Emit::default(),
         );
@@ -3136,7 +3256,7 @@ mod tests {
             &scope,
             &[],
             &top_bar,
-            &keymap,
+            keys,
             &theme,
             Origin::Tab(SkillsTab::ID),
             &emit,
@@ -3402,7 +3522,7 @@ mod tests {
             "the sent body's ending kept"
         );
         assert_eq!(open.original, original, "Esc still asks first");
-        assert_eq!(view.notice, Some(Notice::Info(ACCEPTED.to_owned())));
+        assert_eq!(view.notice, Some(Notice::Info(accepted(Some("Ctrl+s")))));
         assert!(bench.emit.take().is_empty(), "accepting sends nothing");
 
         view.on_key(ctrl('s'), &mut ctx);
@@ -3432,7 +3552,7 @@ mod tests {
             "```\nPrefer `expect` with a reason. One error enum per crate.\n```\n",
         );
         view.on_key(key(KeyCode::Char('y')), &mut ctx);
-        assert_eq!(view.notice, Some(Notice::Info(ACCEPTED.to_owned())));
+        assert_eq!(view.notice, Some(Notice::Info(accepted(Some("Ctrl+s")))));
         view.on_key(ctrl('s'), &mut ctx);
         assert_eq!(
             view.notice,

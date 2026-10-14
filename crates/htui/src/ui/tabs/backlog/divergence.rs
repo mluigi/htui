@@ -43,8 +43,21 @@ pub const HINT_SIDES: HintSpec = &[
     Hint::One(Act::ItemMine, "mine wins"),
 ];
 
-/// The hint's pick part with no conflict (D5): `m` and `t` give the same spec.
-pub const HINT_NO_CONFLICT: &str = "no conflicts \u{2014} m or t continues";
+/// The hint's pick part with no conflict (D5): `m` and `t` give the same spec. The keys are
+/// `ItemMine`'s and `ItemTheirs`'s labels through [`views::ITEM_DIVERGENCE`] (MOD-67 M6 D4): both,
+/// the one bound, or none.
+#[must_use]
+pub fn no_conflict(keys: &Keys) -> String {
+    let stack = views::ITEM_DIVERGENCE;
+    match (
+        keys.label(stack, Act::ItemMine),
+        keys.label(stack, Act::ItemTheirs),
+    ) {
+        (Some(mine), Some(theirs)) => format!("no conflicts \u{2014} {mine} or {theirs} continues"),
+        (Some(one), None) | (None, Some(one)) => format!("no conflicts \u{2014} {one} continues"),
+        (None, None) => "no conflicts".to_owned(),
+    }
+}
 
 /// Shown when both body and paths differ.
 pub const HINT_TAB: HintSpec = &[Hint::One(Act::ItemSwitchDiff, "body/paths")];
@@ -70,16 +83,25 @@ pub fn header(key: &str, ancestor: i32, head: i32) -> String {
     format!("{key}  v{ancestor} \u{2192} theirs v{head}")
 }
 
-/// D5: the form's notice after `Esc` in the view; its token and text are unchanged.
+/// D5: the form's notice after `Esc` in the view; its token and text are unchanged. `save` is
+/// `FormSave`'s label through `ITEM_FORM`, the form the view returns to (MOD-67 M6 D4); with none
+/// bound the clause goes.
 #[must_use]
-pub fn still_behind(head: i32) -> String {
-    format!("still behind v{head}; Ctrl+S compares again")
+pub fn still_behind(head: i32, save: Option<&str>) -> String {
+    match save {
+        Some(save) => format!("still behind v{head}; {save} compares again"),
+        None => format!("still behind v{head}"),
+    }
 }
 
-/// D5: the rebased form's notice; the token is now `head`.
+/// D5: the rebased form's notice; the token is now `head`. `save` is `FormSave`'s label through
+/// `ITEM_FORM` (MOD-67 M6 D4); with none bound the clause goes.
 #[must_use]
-pub fn rebased_on(head: i32) -> String {
-    format!("rebased on v{head}; Ctrl+S saves the resolution")
+pub fn rebased_on(head: i32, save: Option<&str>) -> String {
+    match save {
+        Some(save) => format!("rebased on v{head}; {save} saves the resolution"),
+        None => format!("rebased on v{head}"),
+    }
 }
 
 /// Which text the two diffs show (D4).
@@ -312,7 +334,7 @@ impl Divergence {
         &self.merge
     }
 
-    /// D4/D5: [`HINT_SIDES`] or [`HINT_NO_CONFLICT`], then [`HINT_TAB`] when both body and paths
+    /// D4/D5: [`HINT_SIDES`] or [`no_conflict`], then [`HINT_TAB`] when both body and paths
     /// differ, then [`HINT_BACK`], each through [`views::ITEM_DIVERGENCE`], empty parts dropped,
     /// joined by ` · ` (MOD-67 M5 D9). With a conflict and both texts that is
     /// `t theirs wins · m mine wins · Tab body/paths · Esc back` under the defaults.
@@ -322,7 +344,7 @@ impl Divergence {
         let mut parts = vec![if self.merge.has_conflict() {
             keys.hint(stack, HINT_SIDES)
         } else {
-            HINT_NO_CONFLICT.to_owned()
+            no_conflict(keys)
         }];
         if self.both_texts() {
             parts.push(keys.hint(stack, HINT_TAB));
@@ -445,8 +467,9 @@ fn count(n: usize, noun: &str) -> String {
     }
 }
 
-/// D4: the view over the whole tab `area`.
-pub fn render(frame: &mut Frame<'_>, area: Rect, view: &Divergence, keys: &Keys, theme: &Theme) {
+/// D4: the view over the whole tab `area`. Its keys are [`Divergence::hint`], the shell's hint row
+/// since MOD-67 M6 T2.
+pub fn render(frame: &mut Frame<'_>, area: Rect, view: &Divergence, theme: &Theme) {
     let title = header(&view.key, view.ancestor_version, view.head_version);
     let block = Block::new()
         .borders(Borders::ALL)
@@ -471,9 +494,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, view: &Divergence, keys: &Keys,
         .flat_map(|row| row_lines(row, vw, theme))
         .collect();
     let all = u16::try_from(table.len()).unwrap_or(u16::MAX);
-    // The headings and the hint take a row each; with a pane, the section row and the diffs'
-    // `DIFF_MIN` come off the table's share.
-    let rest = inner.height.saturating_sub(2);
+    // The headings take a row; with a pane, the section row and the diffs' `DIFF_MIN` come off
+    // the table's share.
+    let rest = inner.height.saturating_sub(1);
     let (table_h, section_h) = match view.pane {
         Some(_) => (all.min(rest.saturating_sub(1 + DIFF_MIN)), 1),
         None => (all.min(rest), 0),
@@ -484,12 +507,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, view: &Divergence, keys: &Keys,
             *last = Line::styled("\u{2026}", theme.dim);
         }
     }
-    let [headings_at, table_at, section_at, diffs_at, hint_at] = Layout::vertical([
+    let [headings_at, table_at, section_at, diffs_at] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(table_h),
         Constraint::Length(section_h),
         Constraint::Min(0),
-        Constraint::Length(1),
     ])
     .areas(inner);
     frame.render_widget(
@@ -543,14 +565,6 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, view: &Divergence, keys: &Keys,
             .collect();
         frame.render_widget(Paragraph::new(bar), gap);
     }
-
-    frame.render_widget(
-        Paragraph::new(Line::styled(
-            cells::clip(&view.hint(keys), width),
-            theme.dim,
-        )),
-        hint_at,
-    );
 }
 
 /// A unified diff as the rows it draws in a `width`-wide column, each beside the diff line it
@@ -708,7 +722,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = chrome(frame.area()).body;
-                render(frame, area, view, Keys::compiled(), &Theme::default());
+                render(frame, area, view, &Theme::default());
             })
             .expect("the frame draws");
         let buffer = terminal.backend().buffer();
@@ -1126,9 +1140,39 @@ mod tests {
         )
         .await;
         let hint = clean.hint(Keys::compiled());
-        assert!(hint.starts_with(HINT_NO_CONFLICT), "{hint}");
+        assert!(hint.starts_with(&no_conflict(Keys::compiled())), "{hint}");
         assert!(hint.ends_with("Esc back"), "{hint}");
         assert!(!hint.contains("Tab body/paths"), "{hint}");
+    }
+
+    /// MOD-67 M6 D4: the no-conflict sentence names the side keys in force through
+    /// `ITEM_DIVERGENCE`: both, one, or none.
+    #[test]
+    fn a_rebound_side_key_is_named_with_no_conflict() {
+        let keys =
+            crate::keys::load_str("version = 1\n[backlog.item]\nmine = \"b\"\ntheirs = \"w\"\n")
+                .expect("loads");
+        assert_eq!(no_conflict(&keys), "no conflicts \u{2014} b or w continues");
+        assert_eq!(
+            no_conflict(Keys::compiled()),
+            "no conflicts \u{2014} m or t continues"
+        );
+        let one =
+            crate::keys::load_str("version = 1\n[backlog.item]\ntheirs = []\n").expect("loads");
+        assert_eq!(no_conflict(&one), "no conflicts \u{2014} m continues");
+        let none = crate::keys::load_str("version = 1\n[backlog.item]\nmine = []\ntheirs = []\n")
+            .expect("loads");
+        assert_eq!(no_conflict(&none), "no conflicts");
+        assert_eq!(
+            still_behind(2, Some("F2")),
+            "still behind v2; F2 compares again"
+        );
+        assert_eq!(still_behind(2, None), "still behind v2");
+        assert_eq!(
+            rebased_on(2, Some("F2")),
+            "rebased on v2; F2 saves the resolution"
+        );
+        assert_eq!(rebased_on(2, None), "rebased on v2");
     }
 
     #[test]
@@ -1143,12 +1187,7 @@ mod tests {
                 rendered(HINT_BACK),
             ]
             .join(" \u{b7} "),
-            [
-                HINT_NO_CONFLICT.to_owned(),
-                rendered(HINT_TAB),
-                rendered(HINT_BACK),
-            ]
-            .join(" \u{b7} "),
+            [no_conflict(keys), rendered(HINT_TAB), rendered(HINT_BACK)].join(" \u{b7} "),
         ] {
             assert!(cell_width(&hint) <= room, "{hint:?} against {room}");
         }
@@ -1215,13 +1254,7 @@ mod tests {
             ] {
                 terminal
                     .draw(|frame| {
-                        render(
-                            frame,
-                            area(frame),
-                            &view,
-                            Keys::compiled(),
-                            &Theme::default(),
-                        );
+                        render(frame, area(frame), &view, &Theme::default());
                     })
                     .unwrap_or_else(|err| panic!("{width}x{height}: {err}"));
                 for code in [KeyCode::PageDown, KeyCode::Char('j'), KeyCode::Tab] {

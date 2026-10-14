@@ -24,7 +24,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use crate::app::{Action, Ctx, Handled, OverlayAction, RevealTarget};
 use crate::concepts;
 use crate::concepts_worker::ConceptsReply;
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::{cell_width, graphemes};
 use crate::ui::layout::centered;
@@ -76,8 +76,17 @@ pub const NO_PROJECTS: &str = "this workspace has no projects";
 /// `Enter` on an empty query.
 pub const EMPTY_QUERY: &str = "type a query first";
 
-/// A search that found nothing.
-pub const NO_MATCHES: &str = "no matches — Ctrl+R indexes this scope if the index is empty";
+/// A search that found nothing. `reindex` is `ConceptsReindex`'s label through `CONCEPTS_QUERY`
+/// (MOD-67 M6 D4); with none bound the hint goes.
+#[must_use]
+pub fn no_matches(reindex: Option<&str>) -> String {
+    match reindex {
+        Some(reindex) => {
+            format!("no matches \u{2014} {reindex} indexes this scope if the index is empty")
+        }
+        None => "no matches".to_owned(),
+    }
+}
 
 /// After the list, when the query or a toggle moved since it was searched.
 pub const CHANGED: &str = "changed — Enter searches again";
@@ -241,7 +250,7 @@ impl ConceptsSearch {
     }
 
     /// The search's status row, first match wins (§5.5).
-    fn status(&self, scope: &Scope, theme: &Theme) -> (String, Style) {
+    fn status(&self, scope: &Scope, theme: &Theme, keys: &Keys) -> (String, Style) {
         if let Some(notice) = self.notice {
             return (notice.to_owned(), theme.dim);
         }
@@ -256,7 +265,10 @@ impl ConceptsSearch {
             return (IDLE.to_owned(), theme.dim);
         }
         let mut text = if self.hits.is_empty() {
-            NO_MATCHES.to_owned()
+            no_matches(
+                keys.label(views::CONCEPTS_QUERY, Act::ConceptsReindex)
+                    .as_deref(),
+            )
         } else {
             format!("{} hit(s)", self.hits.len())
         };
@@ -427,7 +439,7 @@ impl Overlay for ConceptsSearch {
                 )
             })
             .collect();
-        let (mut status_text, status_style) = self.status(ctx.scope, theme);
+        let (mut status_text, status_style) = self.status(ctx.scope, theme, ctx.keys());
         let (mut index_text, index_style) = self.index_line(theme);
         if self.hits.is_empty() {
             // Review 8: an error too wide for its row is drawn whole in the empty hit rows, search
@@ -516,7 +528,6 @@ mod tests {
     use crate::app::{Action, Emit, OverlayAction, RevealTarget, TopBarState};
     use crate::concepts::{self, DECISION_RESOLUTIONS};
     use crate::concepts_worker::ConceptsReply;
-    use crate::keymap::Keymap;
     use crate::store_worker::Origin;
     use crate::ui::Theme;
     use crate::ui::cells::cell_width;
@@ -532,7 +543,7 @@ mod tests {
         scope: Scope,
         projects: Vec<ProjectRef>,
         top_bar: TopBarState,
-        keymap: Keymap,
+        keys: Keys,
         theme: Theme,
         emit: Emit,
     }
@@ -560,7 +571,7 @@ mod tests {
                 },
                 projects,
                 top_bar: TopBarState::default(),
-                keymap: Keymap::new(),
+                keys: Keys::compiled().clone(),
                 theme: Theme::default(),
                 emit: Emit::default(),
             }
@@ -571,7 +582,7 @@ mod tests {
                 &self.scope,
                 &self.projects,
                 &self.top_bar,
-                &self.keymap,
+                &self.keys,
                 &self.theme,
                 Origin::Overlay(ConceptsSearch::ID),
                 &self.emit,
@@ -933,7 +944,8 @@ mod tests {
                 outcome: Ok(Vec::new()),
             },
         );
-        assert!(bench.render(&search).contains(NO_MATCHES));
+        assert!(bench.render(&search).contains(&no_matches(Some("Ctrl+r"))));
+        assert_eq!(no_matches(None), "no matches");
 
         bench.typed(&mut search, " scaffold");
         bench.code(&mut search, KeyCode::Enter);

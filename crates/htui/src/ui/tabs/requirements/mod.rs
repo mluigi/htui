@@ -107,10 +107,10 @@ const HINT_WRITES: HintSpec = &[
 /// The hint row's words after the write keys.
 const HINT_RELOAD: HintSpec = &[Hint::One(Act::Reload, "reload")];
 
-/// The hint row on the filter, after the field: the field's own keys.
+/// The hint row while the filter is open: the field's own keys.
 const FILTER_HINT: HintSpec = &[Hint::Text("Enter apply"), Hint::Text("Esc clear")];
 
-/// The filter field's width on the hint row.
+/// The filter field's width on the filter row.
 const FILTER_WIDTH: u16 = 30;
 
 /// The hint row on the area and requirement forms (MOD-67 M4 D9).
@@ -132,30 +132,42 @@ fn in_flight(busy: &str) -> String {
 }
 
 /// MOD-59 D5: a write that applied although its re-read failed. It landed; the tab still draws
-/// what it held, and `r` reads again.
-fn landed_unread(landed: &str, why: &str) -> String {
-    format!("{landed} \u{2014} the re-read failed, r reloads: {why}")
+/// what it held, and `reload` (`Reload`'s label through `REQUIREMENTS_BROWSE`, MOD-67 M6 D4) reads
+/// again; with none bound the clause goes.
+fn landed_unread(landed: &str, why: &str, reload: Option<&str>) -> String {
+    match reload {
+        Some(reload) => format!("{landed} \u{2014} the re-read failed, {reload} reloads: {why}"),
+        None => format!("{landed} \u{2014} the re-read failed: {why}"),
+    }
 }
 
 /// MOD-59 review M1: a mint's `Failed`. A mint whose COMMIT landed but whose answer was lost comes
 /// back as the same `Failed`, and its retry would mint a second requirement, so the notice does not
 /// call it a refusal. The form keeps its text, and the tab re-reads the tree, which is drawn beside
-/// the form: the check needs no `Esc`, which would drop the draft (re-review L1).
-fn mint_failed(why: &str) -> String {
-    format!(
-        "{why} \u{2014} it may have been written; the tree is being re-read, look for it there \
-         before Ctrl+S"
-    )
+/// the form: the check needs no `Esc`, which would drop the draft (re-review L1). `save` is
+/// `FormSave`'s label through `REQUIREMENTS_FORM` (MOD-67 M6 D4); with none bound the sentence
+/// says to look first.
+fn mint_failed(why: &str, save: Option<&str>) -> String {
+    let hedge = format!(
+        "{why} \u{2014} it may have been written; the tree is being re-read, look for it there"
+    );
+    match save {
+        Some(save) => format!("{hedge} before {save}"),
+        None => format!("{hedge} first"),
+    }
 }
 
 /// A `RequirementsStale` over an open form: the text is kept and the token moved to the head.
 /// The tab's own sentence rather than Settings' `CHANGED_ELSEWHERE`, whose retry is `Enter`
-/// (blueprint F-1).
-fn requirement_changed_elsewhere(head: i32) -> String {
-    format!(
-        "changed elsewhere since you opened it \u{2014} now v{head}; your text is kept and Ctrl+S \
-         saves over it"
-    )
+/// (blueprint F-1). `save` is `FormSave`'s label through the open form's stack (MOD-67 M6 D4);
+/// with none bound the clause goes.
+fn requirement_changed_elsewhere(head: i32, save: Option<&str>) -> String {
+    let kept =
+        format!("changed elsewhere since you opened it \u{2014} now v{head}; your text is kept");
+    match save {
+        Some(save) => format!("{kept} and {save} saves over it"),
+        None => kept,
+    }
 }
 
 /// The Requirements tab's sentence for a reveal of a requirement this workspace does not hold
@@ -193,7 +205,7 @@ pub struct RequirementsTab {
     /// The tab write in flight, by `StoreRequest::name`: one at a time, and the only write a
     /// `RequirementWritten` lands (MOD-59 D4).
     busy: Option<&'static str>,
-    /// The last outcome, one line above the hint.
+    /// The last outcome, on the notice rows above the filter row.
     notice: Option<Notice>,
     /// A reveal waiting for the next `Requirements` reply (MOD-64 D235).
     pending_reveal: Option<(RequirementId, String)>,
@@ -218,7 +230,7 @@ enum Mode {
     Withdraw(WithdrawForm),
 }
 
-/// One line of report above the hint.
+/// The report on the notice rows, above the filter row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Notice {
     /// Dim.
@@ -730,7 +742,13 @@ impl RequirementsTab {
         self.mode = Mode::Browse;
         self.notice = Some(match unread {
             None => Notice::Info(landed),
-            Some(why) => Notice::Error(landed_unread(&landed, why)),
+            Some(why) => Notice::Error(landed_unread(
+                &landed,
+                why,
+                ctx.keys()
+                    .label(views::REQUIREMENTS_BROWSE, Act::Reload)
+                    .as_deref(),
+            )),
         });
         let held = self.snapshot.as_ref().is_some_and(|snapshot| match row {
             Row::Area(id) => snapshot.area(id).is_some(),
@@ -844,8 +862,9 @@ impl RequirementsTab {
 
     /// A `RequirementsStale` over the write in flight: the form stays with its text, its token
     /// moves to the head, and the notice says so. A head withdrawn elsewhere takes no retry, and
-    /// the notice says that instead.
-    fn stale(&mut self) {
+    /// the notice says that instead. The retry is the save key `keys` binds in the open form's
+    /// stack (MOD-67 M6 D4).
+    fn stale(&mut self, keys: &Keys) {
         if self.busy.take().is_none() {
             return;
         }
@@ -874,18 +893,28 @@ impl RequirementsTab {
             self.notice = Some(Notice::Error(requirement_withdrawn(&key)));
             return;
         }
-        match &mut self.mode {
+        let stack = match &mut self.mode {
             Mode::Requirement(RequirementForm {
                 target:
                     FormTarget::Amend {
                         expected_version, ..
                     },
                 ..
-            }) => *expected_version = head,
-            Mode::Withdraw(form) => form.set_expected_version(head),
-            _ => {}
-        }
-        self.notice = Some(Notice::Error(requirement_changed_elsewhere(head)));
+            }) => {
+                *expected_version = head;
+                views::REQUIREMENTS_FORM
+            }
+            Mode::Withdraw(form) => {
+                form.set_expected_version(head);
+                views::REQUIREMENTS_WITHDRAW
+            }
+            _ => views::REQUIREMENTS_FORM,
+        };
+        let save = keys.label(stack, Act::FormSave);
+        self.notice = Some(Notice::Error(requirement_changed_elsewhere(
+            head,
+            save.as_deref(),
+        )));
     }
 
     // --- render --------------------------------------------------------------------------------
@@ -1023,9 +1052,11 @@ impl RequirementsTab {
         );
     }
 
-    /// The hint row for the current mode, through its stack and `keys` (MOD-67 M4 D9).
-    fn hint(&self, keys: &Keys, theme: &Theme) -> Line<'static> {
-        match &self.mode {
+    /// The keys of the current mode for the shell's hint row, through its stack and `keys`
+    /// (MOD-67 M4 D9, M6 T2): Browse's three groups, the writes greyed where a write would be
+    /// refused; a form's spec. `None` when no key of it is bound.
+    fn keys_line(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
+        let line = match &self.mode {
             Mode::Browse => {
                 let writes = if self.writes_allowed() {
                     theme.base
@@ -1035,7 +1066,7 @@ impl RequirementsTab {
                 // Three groups, the writes in their own style; an unbound group drops out with
                 // its separator.
                 let stack = self.stack();
-                let mut spans = vec![Span::styled(" ", theme.base)];
+                let mut spans = Vec::new();
                 for (spec, style) in [
                     (HINT_MOVE, theme.base),
                     (HINT_WRITES, writes),
@@ -1045,39 +1076,38 @@ impl RequirementsTab {
                     if text.is_empty() {
                         continue;
                     }
-                    if spans.len() > 1 {
+                    if !spans.is_empty() {
                         spans.push(Span::styled(" \u{b7} ", theme.base));
                     }
                     spans.push(Span::styled(text, style));
                 }
                 Line::from(spans)
             }
-            Mode::Filter { field } => {
-                let mut spans = vec![Span::styled(" /", theme.accent)];
-                spans.extend(field.line(FILTER_WIDTH, true, theme).spans);
-                spans.push(Span::styled(
-                    format!("  {}", keys.hint(self.stack(), FILTER_HINT)),
-                    theme.dim,
-                ));
-                Line::from(spans)
-            }
-            Mode::NewArea(_) => Line::styled(
-                format!(" {}", keys.hint(self.stack(), FORM_HINT)),
-                theme.dim,
-            ),
+            Mode::Filter { .. } => Line::styled(keys.hint(self.stack(), FILTER_HINT), theme.dim),
+            Mode::NewArea(_) => Line::styled(keys.hint(self.stack(), FORM_HINT), theme.dim),
             Mode::Requirement(form) => {
                 let mut text = keys.hint(self.stack(), FORM_HINT);
                 if form.focus == FormFocus::Priority {
                     text.push_str(" \u{b7} ");
                     text.push_str(&keys.hint(self.stack(), PRIORITY_HINT));
                 }
-                Line::styled(format!(" {text}"), theme.dim)
+                Line::styled(text, theme.dim)
             }
-            Mode::Withdraw(_) => Line::styled(
-                format!(" {}", keys.hint(self.stack(), WITHDRAW_HINT)),
-                theme.dim,
-            ),
-        }
+            Mode::Withdraw(_) => Line::styled(keys.hint(self.stack(), WITHDRAW_HINT), theme.dim),
+        };
+        (line.width() > 0).then_some(line)
+    }
+
+    /// The row under the notice: the filter's input (` /` and the field) while it is open, blank
+    /// otherwise. Kept in every mode so the tree's height does not move; the keys that shared it
+    /// are the shell's hint row (MOD-67 M6 T2, [`Tab::key_hint`]).
+    fn filter_row(&self, theme: &Theme) -> Line<'static> {
+        let Mode::Filter { field } = &self.mode else {
+            return Line::default();
+        };
+        let mut spans = vec![Span::styled(" /", theme.accent)];
+        spans.extend(field.line(FILTER_WIDTH, true, theme).spans);
+        Line::from(spans)
     }
 }
 
@@ -1178,7 +1208,7 @@ impl Tab for RequirementsTab {
                 }
                 self.snapshot = Some((**snapshot).clone());
                 self.recovered();
-                self.stale();
+                self.stale(ctx.keys());
                 let before = self.selected;
                 self.reselect(ctx);
                 // The head moved elsewhere, so a detail still on screen for the same row is the
@@ -1221,7 +1251,8 @@ impl Tab for RequirementsTab {
                 // mint the worker refused before its insert is a refusal like the others (L2).
                 self.busy = None;
                 if *request == MINT_NAME && !self.mint_refused(message, ctx) {
-                    self.notice = Some(Notice::Error(mint_failed(message)));
+                    let save = ctx.keys().label(views::REQUIREMENTS_FORM, Act::FormSave);
+                    self.notice = Some(Notice::Error(mint_failed(message, save.as_deref())));
                     ctx.request(StoreRequest::Requirements(ctx.scope.clone()));
                 } else {
                     self.notice = Some(Notice::Error(message.clone()));
@@ -1229,6 +1260,10 @@ impl Tab for RequirementsTab {
             }
             _ => {}
         }
+    }
+
+    fn key_hint(&self, _width: u16, ctx: &Ctx<'_>) -> Option<Line<'static>> {
+        self.keys_line(ctx.keys(), ctx.theme)
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
@@ -1262,7 +1297,7 @@ impl Tab for RequirementsTab {
             ),
             notice_row,
         );
-        frame.render_widget(Paragraph::new(self.hint(ctx.keys(), ctx.theme)), hint_row);
+        frame.render_widget(Paragraph::new(self.filter_row(ctx.theme)), hint_row);
     }
 
     fn reveal(&mut self, target: &RevealTarget, ctx: &mut Ctx<'_>) -> bool {
@@ -1295,7 +1330,6 @@ impl Tab for RequirementsTab {
 mod tests {
     use super::{HINT_WRITES, Mode, Notice, RequirementsTab, Row, SAVING};
     use crate::app::{Action, Ctx, Emit, Handled, TopBarState};
-    use crate::keymap::Keymap;
     use crate::keys::{Keys, views};
     use crate::requirements::{
         self, READ_NAME, RequirementWrite, RequirementsSnapshot, not_the_maintainer,
@@ -1343,7 +1377,7 @@ mod tests {
         scope: Scope,
         projects: Vec<ProjectRef>,
         top_bar: TopBarState,
-        keymap: Keymap,
+        keys: Keys,
         theme: Theme,
         emit: Emit,
     }
@@ -1354,7 +1388,7 @@ mod tests {
                 scope,
                 projects,
                 top_bar: TopBarState::default(),
-                keymap: Keymap::new(),
+                keys: Keys::compiled().clone(),
                 theme: Theme::default(),
                 emit: Emit::default(),
             }
@@ -1365,7 +1399,7 @@ mod tests {
                 &self.scope,
                 &self.projects,
                 &self.top_bar,
-                &self.keymap,
+                &self.keys,
                 &self.theme,
                 Origin::Tab(RequirementsTab::ID),
                 &self.emit,
@@ -1521,7 +1555,8 @@ mod tests {
     /// The style the Browse hint draws the four write words in.
     fn write_words_style(tab: &RequirementsTab, theme: &Theme) -> Style {
         let writes = Keys::compiled().hint(views::REQUIREMENTS_BROWSE, HINT_WRITES);
-        tab.hint(Keys::compiled(), theme)
+        tab.keys_line(Keys::compiled(), theme)
+            .expect("the defaults bind the keys")
             .spans
             .iter()
             .find(|span| span.content == writes)
@@ -2071,7 +2106,7 @@ mod tests {
         assert!(
             matches!(&hedge, Some(Notice::Error(text))
                 if text.starts_with("store unreachable: reset \u{2014} it may have been written")
-                    && text.contains("Ctrl+S")
+                    && text.contains("Ctrl+s")
                     && !text.contains("Esc")),
             "{hedge:?}"
         );
@@ -2163,6 +2198,33 @@ mod tests {
         assert_eq!(
             tab.notice,
             Some(Notice::Error(requirement_withdrawn("R-ENT-1")))
+        );
+    }
+
+    /// MOD-67 M6 D4: the Requirements hedges name the save key in force through
+    /// `REQUIREMENTS_FORM`, and the reload key through `REQUIREMENTS_BROWSE`; unbound, neither.
+    #[test]
+    fn a_rebound_save_key_is_named_by_a_requirements_hedge() {
+        use super::{landed_unread, mint_failed, requirement_changed_elsewhere};
+        use crate::keys::{Act, load_str};
+        let keys = load_str("version = 1\n[form]\nsave = \"f2\"\n").expect("loads");
+        let save = keys.label(views::REQUIREMENTS_FORM, Act::FormSave);
+        assert_eq!(save.as_deref(), Some("F2"));
+        assert!(
+            mint_failed("boom", save.as_deref()).ends_with("look for it there before F2"),
+            "{}",
+            mint_failed("boom", save.as_deref())
+        );
+        assert!(requirement_changed_elsewhere(4, save.as_deref()).ends_with("F2 saves over it"));
+        assert!(mint_failed("boom", None).ends_with("look for it there first"));
+        assert!(requirement_changed_elsewhere(4, None).ends_with("your text is kept"));
+        assert_eq!(
+            landed_unread("saved", "gone", Some("r")),
+            "saved \u{2014} the re-read failed, r reloads: gone"
+        );
+        assert_eq!(
+            landed_unread("saved", "gone", None),
+            "saved \u{2014} the re-read failed: gone"
         );
     }
 }

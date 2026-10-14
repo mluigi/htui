@@ -19,7 +19,7 @@ use crate::ui::Theme;
 use crate::ui::tabs::settings::SectionId;
 use crossterm::event::{KeyEvent, MouseEvent};
 
-/// Stable identity of a tab. The string is also the key of its [`KeyScope`](crate::keymap::KeyScope).
+/// Stable identity of a tab, used for reply addressing and the reveal targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TabId(pub &'static str);
 
@@ -53,7 +53,7 @@ pub trait Tab {
     /// A bracketed paste reached this tab, whole (MOD-22 review M-1).
     ///
     /// Only a view that is capturing input takes one, into its focused field; everything else
-    /// answers `Pass` and the shell drops it — no keymap ever sees a paste, so text pasted before
+    /// answers `Pass` and the shell drops it — no key table ever sees a paste, so text pasted before
     /// a field is open never runs as commands. Defaulted to `Pass` so a tab with no field changes
     /// nothing.
     fn on_paste(&mut self, _text: &str, _ctx: &mut Ctx<'_>) -> Handled {
@@ -73,10 +73,16 @@ pub trait Tab {
     fn focus_section(&mut self, _section: SectionId) -> bool {
         false
     }
-    /// This tab's key stack in its current mode (MOD-67 D4), or `None` while the tab is not
-    /// converted (Backlog, Skills, Requirements, Chat until M4/M5): the shell then keeps today's
-    /// status line, `?` box and `Stack::BASE` dispatch. Defaulted, so no other tab changes.
+    /// This tab's key stack in its current mode (MOD-67 D4). Every production tab returns one; the
+    /// default `None` is the test doubles', which the shell treats as `Stack::BASE`.
     fn key_stack(&self) -> Option<Stack<'static>> {
+        None
+    }
+    /// The keys of this tab's focused mode for the shell's hint row (MOD-67 M6 D10, design review
+    /// finding 3): the mode's hint spec rendered through its own stack, so a rebound key shows its
+    /// new chord. `width` is the row's; a tab that composes two hints keeps the second only when
+    /// both fit. `None`: no row (the test doubles; a tab with nothing to say). Defaulted.
+    fn key_hint(&self, _width: u16, _ctx: &Ctx<'_>) -> Option<Line<'static>> {
         None
     }
     /// The `$EDITOR` handoff this tab asked for came back (MOD-9 D10). Defaulted, the trait's
@@ -108,7 +114,7 @@ pub trait Tab {
         false
     }
     /// A mouse event reached this tab (MOD-71 D4), only while [`wants_mouse`](Tab::wants_mouse)
-    /// says so. `Consumed` asks for a redraw; `Pass` is the drop and costs nothing — no keymap
+    /// says so. `Consumed` asks for a redraw; `Pass` is the drop and costs nothing — no key table
     /// reads a mouse event. Defaulted to `Pass`, so no other tab changes.
     fn on_mouse(&mut self, _mouse: MouseEvent, _ctx: &mut Ctx<'_>) -> Handled {
         Handled::Pass

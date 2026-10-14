@@ -999,7 +999,7 @@ async fn a_stale_reply_over_the_quirks_editor_names_ctrl_s() {
         frame.contains("changed elsewhere since you opened it"),
         "{frame}"
     );
-    assert!(frame.contains("ctrl-s retries"), "{frame}");
+    assert!(frame.contains("Ctrl+s retries"), "{frame}");
     assert!(!frame.contains("Enter retries"), "{frame}");
 
     bench.key(&mut section, "ctrl-s");
@@ -1055,8 +1055,8 @@ async fn p_on_this_box_sends_probe_box() {
     assert_eq!(bench.key(&mut section, "p"), Handled::Consumed);
 
     assert_eq!(names(&requests(&bench)), ["probe_box"]);
-    let frame = bench.render_section(&section, 100);
-    assert!(frame.contains("probing\u{2026}"), "{frame}");
+    let hint = bench.key_hint(&section);
+    assert!(hint.contains("probing\u{2026}"), "{hint}");
 }
 
 /// One `ProbeBox` in flight: a second `p` sends nothing, because a second request would
@@ -1071,7 +1071,8 @@ async fn p_while_probing_sends_nothing() {
 
     assert!(requests(&bench).is_empty());
     let frame = bench.render_section(&section, 100);
-    assert!(frame.contains("probing\u{2026}"), "{frame}");
+    let hint = bench.key_hint(&section);
+    assert!(hint.contains("probing\u{2026}"), "{hint}");
     assert!(
         frame.contains("a box probe is running on this box"),
         "{frame}"
@@ -1223,10 +1224,10 @@ async fn a_rebound_save_saves_the_quirks_editor_and_ctrl_s_no_longer_does() {
     feed(&bench, &mut section, &snap_of(MemStore::demo()).await);
 
     bench.key(&mut section, "e");
-    let frame = bench.render_section(&section, 100);
+    let hint = bench.key_hint(&section);
     assert!(
-        frame.contains("Ctrl+x saves \u{b7} Esc cancels \u{b7} Enter breaks the line"),
-        "{frame}"
+        hint.contains("Ctrl+x saves \u{b7} Esc cancels \u{b7} Enter breaks the line"),
+        "{hint}"
     );
     type_at(&bench, &mut section, "x");
     let typed = bench.render_section(&section, 100);
@@ -1337,7 +1338,8 @@ async fn w_flips_the_executor_after_confirmation() {
         words(&frame).contains("executor of `DESKTOP-HTUI`: `tui` \u{2192} `worker`?"),
         "{frame}"
     );
-    assert!(frame.contains("y write \u{b7} n/Esc cancel"), "{frame}");
+    let hint = bench.key_hint(&section);
+    assert!(hint.contains("y write \u{b7} n/Esc cancel"), "{hint}");
 
     assert_eq!(bench.key(&mut section, "y"), Handled::Consumed);
     let (box_id, expected, edit) = only_edit(&requests(&bench));
@@ -1590,7 +1592,7 @@ async fn s_opens_the_spec_editor_over_the_pretty_printed_overlay() {
         assert!(frame.contains(expected), "`{expected}` in {frame}");
     }
     assert_eq!(
-        last_line(&frame).trim_end_matches(' '),
+        bench.key_hint(&section),
         "Ctrl+s saves \u{b7} Esc cancels \u{b7} Enter breaks the line \u{b7} blank clears",
         "{frame}"
     );
@@ -1607,10 +1609,7 @@ async fn s_with_no_box_listed_still_opens_the_spec_editor() {
         frame.contains("no box is registered for this user yet"),
         "{frame}"
     );
-    assert_eq!(
-        last_line(&frame).trim_end_matches(' '),
-        "s spec \u{b7} r reload"
-    );
+    assert_eq!(bench.key_hint(&section), "s spec \u{b7} r reload");
 
     bench.key(&mut section, "s");
     assert!(
@@ -1682,12 +1681,7 @@ async fn s_does_nothing_before_the_first_read_or_over_a_refused_read() {
     let mut section = BoxesSection::new();
     assert_eq!(bench.key(&mut section, "s"), Handled::Consumed);
     assert!(!section.captures_input(), "not read yet");
-    let frame = bench.render_section(&section, 100);
-    assert_eq!(
-        last_line(&frame).trim_end_matches(' '),
-        "r reload",
-        "{frame}"
-    );
+    assert_eq!(bench.key_hint(&section), "r reload");
 
     let (bench, mut section) = bench_with(&snap_of(MemStore::demo()).await).await;
     bench.reply(
@@ -1699,12 +1693,7 @@ async fn s_does_nothing_before_the_first_read_or_over_a_refused_read() {
     );
     assert_eq!(bench.key(&mut section, "s"), Handled::Consumed);
     assert!(!section.captures_input(), "a refused read");
-    let frame = bench.render_section(&section, 100);
-    assert_eq!(
-        last_line(&frame).trim_end_matches(' '),
-        "r reload",
-        "{frame}"
-    );
+    assert_eq!(bench.key_hint(&section), "r reload");
     assert!(requests(&bench).is_empty());
 }
 
@@ -1724,8 +1713,8 @@ async fn ctrl_s_sends_set_probe_spec_with_the_parsed_overlay_and_the_token() {
         (Some(terraform_spec()), Some(token))
     );
     assert!(section.captures_input(), "open until the reply");
-    let frame = bench.render_section(&section, 100);
-    assert!(frame.contains("saving\u{2026}"), "{frame}");
+    let hint = bench.key_hint(&section);
+    assert!(hint.contains("saving\u{2026}"), "{hint}");
 }
 
 /// MOD-51 D6: text that is not JSON is refused on the render side; the editor stays open over it
@@ -1832,7 +1821,7 @@ async fn boxes_stale_over_the_spec_editor_keeps_the_text_and_takes_the_new_token
         frame.contains("changed elsewhere since you opened it"),
         "{frame}"
     );
-    assert!(frame.contains("ctrl-s retries"), "{frame}");
+    assert!(frame.contains("Ctrl+s retries"), "{frame}");
 
     bench.key(&mut section, "ctrl-s");
     assert_eq!(
@@ -2164,7 +2153,7 @@ async fn the_quirks_editor_renders() {
     let frame = bench.render_section(&section, 100);
     assert!(frame.contains("no admin rights"), "{frame}");
     assert!(frame.contains("use the D: drive"), "{frame}");
-    assert!(frame.contains("Ctrl+s saves"), "{frame}");
+    assert!(bench.key_hint(&section).contains("Ctrl+s saves"));
 
     insta::with_settings!({ filters => vec![DIGEST_FILTER] }, {
         insta::assert_snapshot!("quirks_editor", frame);
@@ -2207,7 +2196,11 @@ async fn the_executor_confirmation_renders() {
         ),
         "{frame}"
     );
-    assert!(frame.contains("y write \u{b7} n/Esc cancel"), "{frame}");
+    assert!(
+        bench
+            .key_hint(&section)
+            .contains("y write \u{b7} n/Esc cancel")
+    );
 
     insta::with_settings!({ filters => vec![DIGEST_FILTER] }, {
         insta::assert_snapshot!("executor_confirm", frame);
@@ -2246,4 +2239,30 @@ async fn the_empty_list_renders() {
     insta::with_settings!({ filters => vec![DIGEST_FILTER] }, {
         insta::assert_snapshot!("no_boxes", frame);
     });
+}
+
+/// MOD-67 M6 D4: a stale quirks save names the save key in force as its retry.
+#[tokio::test]
+async fn a_rebound_save_key_is_named_after_a_stale_quirks_save() {
+    let keys =
+        htui::keys::load_str("version = 1\n[form]\nsave = \"f2\"\n").expect("the key file loads");
+    let bench = SectionBench::new().await.with_keys(keys);
+    let mut section = BoxesSection::new();
+    feed(&bench, &mut section, &snap_of(MemStore::demo()).await);
+
+    bench.key(&mut section, "e");
+    type_at(&bench, &mut section, "no admin rights");
+    bench.key(&mut section, "f2");
+    only_edit(&requests(&bench));
+    bench.reply(
+        &mut section,
+        &StoreReply::BoxesStale(Box::new(demo_at_version(5).await)),
+    );
+
+    let frame = bench.render_section(&section, 100);
+    let words = frame.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        words.contains("reloaded; F2 retries against the current row"),
+        "{frame}"
+    );
 }

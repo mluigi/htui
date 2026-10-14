@@ -41,8 +41,8 @@ const CHAT_CANCEL: &str = "chat_cancel";
 /// (MOD-55 review L3).
 const AGENTS: &str = "agents";
 
-/// The editor's own chords while the help is open.
-const HELP_OPEN: &str = "agent help is open \u{2014} Esc leaves it first";
+/// The editor's own chords while the help is open, without the way out ([`AgentHelp::help_open`]).
+const HELP_OPEN: &str = "agent help is open";
 
 /// `Enter` on an empty request.
 const ASK_SOMETHING: &str = "type what you want changed";
@@ -62,12 +62,25 @@ const CANCELLED: &str = "agent help cancelled";
 /// `Esc`/`n` on a proposal.
 const DISCARDED: &str = "proposal discarded";
 
-/// The first accept of a proposal that holds a new mask marker (P9).
-const MASKED: &str = "the proposal holds [REDACTED] where a masked value was \u{2014} Enter again \
-                      replaces the body anyway";
+/// The first accept of a proposal that holds a new mask marker (P9). `accept` is
+/// `SkillsHelpAccept`'s label through `HELP_PROPOSAL` (MOD-67 M6 D4); with none bound the sentence
+/// says an accept.
+fn masked_note(accept: Option<&str>) -> String {
+    let held = "the proposal holds [REDACTED] where a masked value was";
+    match accept {
+        Some(accept) => format!("{held} \u{2014} {accept} again replaces the body anyway"),
+        None => format!("{held} \u{2014} accept again to replace the body anyway"),
+    }
+}
 
-/// What a view says once an accepted proposal replaced its buffer.
-pub(super) const ACCEPTED: &str = "proposal accepted \u{2014} Ctrl+S saves it";
+/// What a view says once an accepted proposal replaced its buffer. `save` is `FormSave`'s label
+/// through the caller's editor stack (MOD-67 M6 D4); with none bound the clause goes.
+pub(super) fn accepted(save: Option<&str>) -> String {
+    match save {
+        Some(save) => format!("proposal accepted \u{2014} {save} saves it"),
+        None => "proposal accepted".to_owned(),
+    }
+}
 
 /// The hint while the request is typed (MOD-67 M4 D9): `Enter` and `Esc` are the field's.
 const ASKING_HINT: HintSpec = &[
@@ -307,6 +320,27 @@ impl AgentHelp {
         }
     }
 
+    /// What the editor's own chords say while the help is open (MOD-67 M6 PA-12): the key that
+    /// leaves the help in its state. Asking, the request field's own `Esc` (a widget key); waiting,
+    /// `skills.help.cancel` through `HELP_WAITING`; a proposal or an answer, `confirm.no` through
+    /// `HELP_PROPOSAL` as its hint row spells it (`n/Esc`). With none bound, `close it first`.
+    pub(super) fn help_open(&self, keys: &Keys) -> String {
+        let way = match self.state {
+            State::Asking => Some("Esc".to_owned()),
+            State::Starting { .. } | State::Streaming { .. } | State::Cancelling => {
+                keys.label(views::HELP_WAITING, Act::SkillsHelpCancel)
+            }
+            State::Proposal { .. } | State::Answered { .. } => {
+                Some(keys.hint(views::HELP_PROPOSAL, &[Hint::All(Act::ConfirmNo, "")]))
+                    .filter(|way| !way.is_empty())
+            }
+        };
+        match way {
+            Some(way) => format!("{HELP_OPEN} \u{2014} {way} leaves it first"),
+            None => format!("{HELP_OPEN} \u{2014} close it first"),
+        }
+    }
+
     /// The stack of the editor under the help, whose verbs (`form.save`,
     /// `form.external_editor`, `skills.ask_agent`) are refused while the help is open.
     const fn editor_stack(&self) -> Stack<'static> {
@@ -348,7 +382,7 @@ impl AgentHelp {
                 )
             });
         if refused {
-            return HelpOutcome::Note(Report::Info(HELP_OPEN.to_owned()));
+            return HelpOutcome::Note(Report::Info(self.help_open(ctx.keys())));
         }
         if matches!(act, Some(Act::NextTab | Act::PrevTab)) {
             return HelpOutcome::Pass;
@@ -391,7 +425,11 @@ impl AgentHelp {
             ) => {
                 if *masked && !*armed {
                     *armed = true;
-                    HelpOutcome::Note(Report::Error(MASKED.to_owned()))
+                    HelpOutcome::Note(Report::Error(masked_note(
+                        ctx.keys()
+                            .label(views::HELP_PROPOSAL, Act::SkillsHelpAccept)
+                            .as_deref(),
+                    )))
                 } else {
                     HelpOutcome::Accept(core::mem::take(proposed))
                 }
@@ -804,7 +842,6 @@ mod tests {
     use super::fixtures::{accepted, chunk, ended, summary};
     use super::*;
     use crate::app::{Action, Emit, TopBarState};
-    use crate::keymap::Keymap;
     use crate::keys::{Context, Keys, load_str, views};
     use crate::store_worker::Origin;
     use crate::ui::tabs::SkillsTab;
@@ -815,8 +852,6 @@ mod tests {
         scope: Scope,
         /// The top bar.
         top_bar: TopBarState,
-        /// The default keymap.
-        keymap: Keymap,
         /// The default theme.
         theme: Theme,
         /// What the help emitted.
@@ -833,7 +868,6 @@ mod tests {
                     project_ids: vec![ids::PROJECT_VULKAN],
                 },
                 top_bar: TopBarState::default(),
-                keymap: Keymap::default_global(),
                 theme: Theme::default(),
                 emit: Emit::default(),
                 keys: None,
@@ -849,19 +883,15 @@ mod tests {
         }
 
         fn ctx(&self) -> Ctx<'_> {
-            let ctx = Ctx::new(
+            Ctx::new(
                 &self.scope,
                 &[],
                 &self.top_bar,
-                &self.keymap,
+                self.keys.as_ref().unwrap_or(Keys::compiled()),
                 &self.theme,
                 Origin::Tab(SkillsTab::ID),
                 &self.emit,
-            );
-            match &self.keys {
-                Some(keys) => ctx.with_keys(keys),
-                None => ctx,
-            }
+            )
         }
 
         /// The requests emitted since the last drain.
@@ -1154,7 +1184,7 @@ mod tests {
         ));
         assert_eq!(
             help.on_key(plain(KeyCode::Enter), &bench.ctx()),
-            HelpOutcome::Note(Report::Error(MASKED.to_owned()))
+            HelpOutcome::Note(Report::Error(masked_note(Some("Enter"))))
         );
         assert_eq!(
             help.on_key(plain(KeyCode::Enter), &bench.ctx()),
@@ -1360,7 +1390,8 @@ mod tests {
     #[test]
     fn ctrl_s_ctrl_e_ctrl_g_are_refused_while_open() {
         let bench = Bench::new();
-        let open = HelpOutcome::Note(Report::Info(HELP_OPEN.to_owned()));
+        let open =
+            |help: &AgentHelp| HelpOutcome::Note(Report::Info(help.help_open(Keys::compiled())));
         let mut helps = vec![
             asking(&bench, "old\n"),
             streaming(&bench, "old\n", StepId::new()),
@@ -1376,6 +1407,7 @@ mod tests {
         helps.push(answered(&bench, "old\n", "no block"));
         for mut help in helps {
             for c in ['s', 'S', 'e', 'E', 'g', 'G'] {
+                let open = open(&help);
                 assert_eq!(help.on_key(ctrl(c), &bench.ctx()), open, "{c}: {help:?}");
             }
         }
@@ -1552,13 +1584,15 @@ mod tests {
     #[test]
     fn a_rebound_ask_agent_is_refused_while_open() {
         let bench = Bench::with_keys("[skills]\nask_agent = \"f3\"\n");
-        let open = HelpOutcome::Note(Report::Info(HELP_OPEN.to_owned()));
+        let open =
+            |help: &AgentHelp| HelpOutcome::Note(Report::Info(help.help_open(bench.ctx().keys())));
         let mut helps = vec![
             asking(&bench, "old\n"),
             streaming(&bench, "old\n", StepId::new()),
         ];
         helps.push(answered(&bench, "old\n", "```\nnew\n```"));
         for mut help in helps {
+            let open = open(&help);
             assert_eq!(
                 help.on_key(plain(KeyCode::F(3)), &bench.ctx()),
                 open,
@@ -1604,6 +1638,49 @@ mod tests {
             );
         }
         assert!(bench.sent().is_empty());
+    }
+
+    /// MOD-67 M6 PA-12: the open-help note names the key that leaves the help in its state: the
+    /// request field's own `Esc` while asking, `skills.help.cancel` while waiting, `confirm.no`
+    /// (as the proposal's hint row spells it) on a proposal or an answer.
+    #[test]
+    fn help_open_names_the_way_out_of_each_state() {
+        let bench = Bench::new();
+        let keys = Keys::compiled();
+        let note = |way: &str| format!("agent help is open \u{2014} {way} leaves it first");
+        assert_eq!(asking(&bench, "old\n").help_open(keys), note("Esc"));
+        assert_eq!(
+            streaming(&bench, "old\n", StepId::new()).help_open(keys),
+            note("Esc")
+        );
+        assert_eq!(
+            answered(&bench, "old\n", "```\nnew\n```").help_open(keys),
+            note("n/Esc")
+        );
+        assert_eq!(
+            answered(&bench, "old\n", "no block").help_open(keys),
+            note("n/Esc")
+        );
+
+        let rebound = Bench::with_keys("version = 1\n[skills.help]\ncancel = \"x\"\n");
+        let keys = rebound.ctx().keys();
+        assert_eq!(asking(&rebound, "old\n").help_open(keys), note("Esc"));
+        assert_eq!(
+            streaming(&rebound, "old\n", StepId::new()).help_open(keys),
+            note("x")
+        );
+
+        let unbound = load_str("version = 1\n[skills.help]\ncancel = []\n").expect("loads");
+        assert_eq!(
+            streaming(&bench, "old\n", StepId::new()).help_open(&unbound),
+            "agent help is open \u{2014} close it first"
+        );
+        assert_eq!(
+            masked_note(None),
+            "the proposal holds [REDACTED] where a masked value was \u{2014} accept again to \
+             replace the body anyway"
+        );
+        assert_eq!(super::accepted(None), "proposal accepted");
     }
 
     /// MOD-67 M4 D4, D7: the stack is the state's.

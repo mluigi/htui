@@ -1829,8 +1829,9 @@ async fn e_is_refused_while_the_read_is_unavailable() {
     );
     let frame = bench.render_section(&section, 100);
     assert!(frame.contains("settings unavailable"), "{frame}");
-    assert!(
-        frame.contains("r reload"),
+    assert_eq!(
+        bench.key_hint(&section),
+        "r reload",
         "the hint is the only offer: {frame}"
     );
 }

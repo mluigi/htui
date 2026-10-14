@@ -16054,7 +16054,7 @@ done
 
         for (seq, agent_id) in [(1, no_discovery), (2, no_tools)] {
             let message = refused(set_paths(&mut runtime, &backend, &tx, seq, agent_id, &[]).await);
-            assert_eq!(message, "this row's launch is literal; e edits its command");
+            assert_eq!(message, "this row's launch is literal; edit its command");
             assert_eq!(runtime.background_len(), 0, "nothing was spawned");
             assert!(summary_of(&store, agent_id).await.on_box.is_none());
         }

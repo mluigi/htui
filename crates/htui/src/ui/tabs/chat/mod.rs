@@ -42,6 +42,7 @@ use crate::run_worker::{OrchReply, Via};
 use crate::store_worker::{ChatFrame, StoreReply, StoreRequest};
 use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::registry::{Tab, TabId};
+use crate::ui::tabs::settings::key_line;
 use composer::{Composer, ComposerOutcome};
 use crossterm::event::{KeyCode, KeyEvent};
 use permission::PermissionStrip;
@@ -475,12 +476,12 @@ impl ChatTab {
         (!missing.is_empty()).then(|| format!("this agent cannot: {}", missing.join(", ")))
     }
 
-    /// The hint under the transcript, each key labelled through the current mode's stack (MOD-67
-    /// M5 D9), so a rebound key shows its new chord.
+    /// The Chat's keys for the shell's hint row (MOD-67 M6 T2), each labelled through the current
+    /// mode's stack (MOD-67 M5 D9), so a rebound key shows its new chord.
     ///
     /// A refusal takes this line while there is a live conversation to keep on screen, and is
     /// cleared by the next key or the next frame.
-    fn hint(&self, keys: &Keys) -> String {
+    fn hint_text(&self, keys: &Keys) -> String {
         let stack = self.stack();
         // A replay offers three keys and no refusal can apply to it: nothing it can do fails.
         if self.replay.is_some() {
@@ -495,8 +496,12 @@ impl ChatTab {
             return keys.hint(stack, COMPOSE_HINT);
         }
         if self.cancel_armed {
-            // Key prose, M6's (MOD-67 D11).
-            return "Esc again ends this chat".to_owned();
+            // MOD-67 M6 D4: the end key in force, as the live hint doubles it. Only `ChatEnd`
+            // arms, so it is bound whenever this shows; unbound, the line is empty.
+            return keys
+                .label(stack, Act::ChatEnd)
+                .map(|end| format!("{end} again ends this chat"))
+                .unwrap_or_default();
         }
         if self.transcript.parked().is_some() {
             return keys.hint(stack, PARKED_HINT);
@@ -546,6 +551,12 @@ impl Tab for ChatTab {
     /// set, the agent cycle declined once a session exists, the digits fixed ahead of it).
     fn key_stack(&self) -> Option<Stack<'static>> {
         Some(self.stack())
+    }
+
+    /// The current mode's keys (MOD-67 M6 T2): `hint_text`, in `theme.dim`.
+    fn key_hint(&self, _width: u16, ctx: &Ctx<'_>) -> Option<Line<'static>> {
+        let hint = self.hint_text(ctx.keys());
+        key_line(hint, ctx.theme)
     }
 
     /// Each mode resolves through its stack (MOD-67 M5 D4, D5): the open composer and the parked
@@ -816,7 +827,11 @@ impl Tab for ChatTab {
                     frame.render_widget(Paragraph::new(Line::styled(text, ctx.theme.dim)), body)
                 }
                 None => {
-                    let lines = replay.transcript.lines(body.height as usize, ctx.theme);
+                    let unfold = ctx.keys().label(views::CHAT_REPLAY, Act::ChatThoughts);
+                    let lines =
+                        replay
+                            .transcript
+                            .lines(body.height as usize, ctx.theme, unfold.as_deref());
                     frame.render_widget(Paragraph::new(lines), body);
                 }
             }
@@ -829,7 +844,10 @@ impl Tab for ChatTab {
         {
             // MOD-37 review L-6: a resume whose handoff failed too has a `resume_failed` line, and
             // it goes above the refusal: it is why the header says `handoff`.
-            let mut lines = self.transcript.resume_failed_lines(ctx.theme);
+            let unfold = ctx.keys().label(views::CHAT_LIVE, Act::ChatThoughts);
+            let mut lines = self
+                .transcript
+                .resume_failed_lines(ctx.theme, unfold.as_deref());
             lines.push(Line::styled(refusal.clone(), ctx.theme.error));
             frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), body);
         } else if self.session.is_none() && !self.pending_start {
@@ -840,27 +858,21 @@ impl Tab for ChatTab {
             };
             frame.render_widget(Paragraph::new(Line::styled(text, ctx.theme.dim)), body);
         } else {
-            let lines = self.transcript.lines(body.height as usize, ctx.theme);
+            let unfold = ctx.keys().label(views::CHAT_LIVE, Act::ChatThoughts);
+            let lines = self
+                .transcript
+                .lines(body.height as usize, ctx.theme, unfold.as_deref());
             frame.render_widget(Paragraph::new(lines), body);
         }
 
         if let Some(row) = parked {
             PermissionStrip::render(frame, strip, row, ctx.theme);
         }
-        match replay {
-            // Not `Composer::render`: the composer belongs to the live view, and a replay must
-            // not show an input line for a step that can take no input.
-            Some(_) => frame.render_widget(
-                Paragraph::new(Line::styled(self.hint(ctx.keys()), ctx.theme.dim)),
-                composer,
-            ),
-            None => Composer::render(
-                frame,
-                composer,
-                &self.composer,
-                &self.hint(ctx.keys()),
-                ctx.theme,
-            ),
+        // Not under a replay: the composer belongs to the live view, and a replay must not show
+        // an input line for a step that can take no input. The keys are the shell's hint row
+        // (MOD-67 M6 T2, `key_hint`).
+        if replay.is_none() {
+            Composer::render(frame, composer, &self.composer, ctx.theme);
         }
     }
 }
@@ -869,7 +881,7 @@ impl Tab for ChatTab {
 mod tests {
     use super::*;
     use crate::app::{Action, Emit, TopBarState};
-    use crate::keymap::Keymap;
+    use crate::keys::Keys;
     use crate::store_worker::Origin;
     use crate::ui::Theme;
     use chrono::{TimeZone as _, Utc};
@@ -887,7 +899,7 @@ mod tests {
         scope: Scope,
         projects: Vec<ProjectRef>,
         top_bar: TopBarState,
-        keymap: Keymap,
+        keys: Keys,
         theme: Theme,
         emit: Emit,
     }
@@ -901,7 +913,7 @@ mod tests {
                 },
                 projects: Vec::new(),
                 top_bar: TopBarState::default(),
-                keymap: Keymap::new(),
+                keys: Keys::compiled().clone(),
                 theme: Theme::default(),
                 emit: Emit::default(),
             }
@@ -912,7 +924,7 @@ mod tests {
                 &self.scope,
                 &self.projects,
                 &self.top_bar,
-                &self.keymap,
+                &self.keys,
                 &self.theme,
                 Origin::Tab(ChatTab::ID),
                 &self.emit,
@@ -1709,7 +1721,7 @@ mod tests {
             &mut shell.ctx(),
         );
 
-        assert_eq!(tab.hint(Keys::compiled()), sentence);
+        assert_eq!(tab.hint_text(Keys::compiled()), sentence);
         assert!(
             tab.session().is_some_and(|session| session.ended.is_none()),
             "the session is still live"

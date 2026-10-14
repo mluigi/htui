@@ -63,8 +63,15 @@ pub const NOT_READ: &str = "queue settings not read yet";
 /// What the rows pane says when the read itself was refused, before the refusal's sentence.
 pub const UNAVAILABLE: &str = "queue settings unavailable";
 
-/// What `e` says on a group header.
-pub const NOT_A_VALUE_ROW: &str = "`e` edits a value row";
+/// What `e` says on a group header. `edit` is `Edit`'s first label through `QUEUE_BROWSE`
+/// (MOD-67 M6 D4); with none bound the sentence names no key.
+#[must_use]
+pub fn not_a_value_row(edit: Option<&str>) -> String {
+    match edit {
+        Some(edit) => format!("`{edit}` edits a value row"),
+        None => "only a value row is edited".to_owned(),
+    }
+}
 
 /// What an empty field over a key that holds nothing says: there is nothing to clear.
 pub const NOTHING_SET: &str = "nothing is set here";
@@ -228,7 +235,7 @@ pub struct QueueSection {
     /// The write in flight, by [`StoreRequest::name`]; a second is refused until the reply, and
     /// only a write's reply closes the editor (`PromptSection`'s H-3, H-4).
     busy: Option<&'static str>,
-    /// The last outcome, one line on the hint row.
+    /// The last outcome, on the notice row under the pane.
     notice: Option<Notice>,
 }
 
@@ -337,9 +344,11 @@ impl QueueSection {
     }
 
     /// `e`: the row under the cursor, prefilled with its value as typed.
-    fn open_edit(&mut self, row: Row) {
+    fn open_edit(&mut self, row: Row, keys: &Keys) {
         let Some((target, stored, expected)) = self.opening(row) else {
-            self.say(NOT_A_VALUE_ROW);
+            self.say(&not_a_value_row(
+                keys.label(views::QUEUE_BROWSE, Act::Edit).as_deref(),
+            ));
             return;
         };
         let text = stored.map_or_else(String::new, |value| typed(target.key(), value));
@@ -534,24 +543,22 @@ impl QueueSection {
         vec![Line::from(spans)]
     }
 
-    /// The keys this mode binds, then the last outcome; the outcome wins when both do not fit.
-    fn hint(&self, bound: &Keys, width: u16, theme: &Theme) -> Line<'static> {
-        let keys = self.hint_text(bound);
+    /// The one line under the pane: the last outcome, in `theme.error` when it is one to act on
+    /// rather than read (a compare-and-set miss). The keys this mode binds moved to the shell's
+    /// hint row (MOD-67 M6 T2, [`SettingsSection::key_hint`]), so the outcome has the line to
+    /// itself; blank without one.
+    /// Any mode: an editor's outcome is drawn here too.
+    fn notice_line(&self, theme: &Theme) -> Line<'static> {
         let Some(notice) = &self.notice else {
-            return Line::styled(keys, theme.dim);
+            return Line::default();
         };
-        let style = match notice {
-            Notice::Error(_) => theme.error,
-            Notice::Info(_) => theme.dim,
-        };
-        let text = notice.text().to_owned();
-        if cell_width(&keys) + cell_width(&text) + 3 > usize::from(width) {
-            return Line::styled(text, style);
-        }
-        Line::from(vec![
-            Span::styled(format!("{keys} \u{b7} "), theme.dim),
-            Span::styled(text, style),
-        ])
+        Line::styled(
+            notice.text().to_owned(),
+            match notice {
+                Notice::Error(_) => theme.error,
+                Notice::Info(_) => theme.dim,
+            },
+        )
     }
 
     /// The stack of the current mode (MOD-67 D3, D4): the one place a mode maps to its keys, read
@@ -563,8 +570,8 @@ impl QueueSection {
         }
     }
 
-    /// The keys half of the hint line, through the mode's stack (MOD-67 D9), plus a write in
-    /// flight.
+    /// The mode's keys for the shell's hint row, through the mode's stack (MOD-67 D9), plus a
+    /// write in flight.
     fn hint_text(&self, bound: &Keys) -> String {
         let spec = match self.mode {
             Mode::Editing(_) => HINT_EDITING,
@@ -645,7 +652,7 @@ impl SettingsSection for QueueSection {
                     if !self.blocked()
                         && let Some(row) = self.selected()
                     {
-                        self.open_edit(row);
+                        self.open_edit(row, ctx.keys());
                     }
                 }
                 Act::ListDown => self.move_cursor(true),
@@ -681,6 +688,10 @@ impl SettingsSection for QueueSection {
             }
             _ => {}
         }
+    }
+
+    fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
+        super::key_line(self.hint_text(keys), theme)
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
@@ -729,10 +740,7 @@ impl SettingsSection for QueueSection {
         if !pane.is_empty() {
             frame.render_widget(Paragraph::new(pane), pane_area);
         }
-        frame.render_widget(
-            Paragraph::new(self.hint(ctx.keys(), area.width, ctx.theme)),
-            hint,
-        );
+        frame.render_widget(Paragraph::new(self.notice_line(ctx.theme)), hint);
     }
 }
 
@@ -850,6 +858,13 @@ fn reload(snapshot: &QueueSettingsSnapshot, target: Target) -> Reload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MOD-67 M6 D4: the header refusal names the edit key, and none unbound.
+    #[test]
+    fn not_a_value_row_names_the_edit_key_or_none() {
+        assert_eq!(not_a_value_row(Some("e")), "`e` edits a value row");
+        assert_eq!(not_a_value_row(None), "only a value row is edited");
+    }
 
     /// The editor's `Debug` names the target and the token, never the buffer.
     #[test]

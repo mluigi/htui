@@ -1218,7 +1218,7 @@ async fn x_cancels_a_pre_flight_that_has_not_answered() {
         "and it asks the runtime to drop the pre-flight: {asked:?}"
     );
     assert!(
-        render_section(&section, &bench.ctx()).contains("x cancel install"),
+        bench.key_hint(&section).contains("x cancel install"),
         "the hint offers the key it binds"
     );
 }
@@ -1543,7 +1543,9 @@ async fn the_consent_pane_renders_every_line_and_both_digest_wordings() {
         "{rendered}"
     );
     assert!(
-        rendered.contains("y install \u{b7} n cancel"),
+        bench
+            .key_hint(&section)
+            .contains("y install \u{b7} n cancel"),
         "the hint line stands in for a help entry: {rendered}"
     );
 
@@ -1616,7 +1618,7 @@ async fn the_progress_cell_renders_each_phase_and_never_a_misleading_zero() {
             "{phase} {done}/{total:?}:\n{rendered}"
         );
         assert!(
-            rendered.contains("x cancel install"),
+            bench.key_hint(&section).contains("x cancel install"),
             "the hint line offers the way out: {rendered}"
         );
     }
@@ -1692,7 +1694,7 @@ async fn a_failed_install_with_manual_steps_renders_them_under_the_table() {
     for line in steps.lines() {
         assert!(rendered.contains(line.trim_end()), "`{line}`:\n{rendered}");
     }
-    assert!(rendered.contains("Esc close"), "{rendered}");
+    assert!(bench.key_hint(&section).contains("Esc close"), "{rendered}");
     assert_eq!(
         on_box_cell(&rendered, "declared"),
         "not probed",
@@ -1741,7 +1743,7 @@ async fn a_failure_without_manual_steps_is_a_notice() {
         "{rendered}"
     );
     assert!(
-        rendered.contains("i install"),
+        bench.key_hint(&section).contains("i install"),
         "and the section is idle again: {rendered}"
     );
 }
@@ -1834,7 +1836,7 @@ async fn an_agents_reply_does_not_clear_an_install_in_flight() {
         "the download is still running and still says so: {rendered}"
     );
     assert!(
-        rendered.contains("x cancel install"),
+        bench.key_hint(&section).contains("x cancel install"),
         "and can still be stopped: {rendered}"
     );
 }
@@ -2165,7 +2167,9 @@ async fn a_on_an_unauthenticated_row_sends_auth_start_and_the_cell_reads_startin
     let rendered = render_section(&section, &bench.ctx());
     assert_eq!(on_box_cell(&rendered, "loginable"), "starting\u{2026}");
     assert!(
-        rendered.contains("o open link \u{b7} p paste redirect \u{b7} x cancel"),
+        bench
+            .key_hint(&section)
+            .contains("o open link \u{b7} p paste redirect \u{b7} x cancel"),
         "and the hint offers the keys a live flow binds: {rendered}"
     );
 }
@@ -2226,7 +2230,9 @@ async fn a_methods_frame_renders_the_chooser_with_names_descriptions_logout_and_
         "the cell says what the pane is waiting for"
     );
     assert!(
-        rendered.contains("j/k choose \u{b7} Enter select \u{b7} n/Esc cancel"),
+        bench
+            .key_hint(&section)
+            .contains("j/k choose \u{b7} Enter select \u{b7} n/Esc cancel"),
         "and the hint says which keys answer it: {rendered}"
     );
 
@@ -2589,7 +2595,7 @@ async fn a_second_choice_refused_by_a_live_flow_keeps_the_pane_and_the_others_cl
         "the flow the runtime refused a second choice for is still running: {rendered}"
     );
     assert!(
-        rendered.contains("x cancel"),
+        bench.key_hint(&section).contains("x cancel"),
         "and the key that stops it is still on screen: {rendered}"
     );
 
@@ -2636,7 +2642,7 @@ async fn done_clears_the_state_notes_the_status_and_re_reads_the_registry() {
     let rendered = render_section(&section, &bench.ctx());
     assert!(rendered.contains("logged in: ready"), "{rendered}");
     assert!(
-        rendered.contains("a authenticate"),
+        bench.key_hint(&section).contains("a authenticate"),
         "and the section is idle again: {rendered}"
     );
 
@@ -2723,7 +2729,9 @@ async fn an_agents_reply_during_a_login_does_not_clear_the_state() {
         "its link is still on screen: {rendered}"
     );
     assert!(
-        rendered.contains("o open link \u{b7} p paste redirect \u{b7} x cancel"),
+        bench
+            .key_hint(&section)
+            .contains("o open link \u{b7} p paste redirect \u{b7} x cancel"),
         "and it can still be stopped: {rendered}"
     );
 }
@@ -2781,7 +2789,10 @@ async fn a_failed_or_idle_flow_leaves_a_notice_and_an_idle_section() {
     );
     let rendered = render_section(&section, &bench.ctx());
     assert!(rendered.contains("No such file or directory"), "{rendered}");
-    assert!(rendered.contains("a authenticate"), "{rendered}");
+    assert!(
+        bench.key_hint(&section).contains("a authenticate"),
+        "{rendered}"
+    );
 
     let mut section = chooser_over(&bench, false, 0);
     bench.key(&mut section, "Enter");
@@ -2797,7 +2808,10 @@ async fn a_failed_or_idle_flow_leaves_a_notice_and_an_idle_section() {
         rendered.contains("no activity for 600s; login cancelled"),
         "the notice says what happened rather than implying the user did it: {rendered}"
     );
-    assert!(rendered.contains("a authenticate"), "{rendered}");
+    assert!(
+        bench.key_hint(&section).contains("a authenticate"),
+        "{rendered}"
+    );
 }
 
 // -------------------------------------------------------------------------------------------
@@ -3574,12 +3588,21 @@ async fn the_running_hint_offers_p_and_the_pasting_hint_offers_enter_and_esc() {
     let bench = SectionBench::new().await;
     let mut section = running_over(&bench, LOOPBACK_LINK);
     let rendered = render_section(&section, &bench.ctx());
-    assert!(rendered.contains(HINT_AUTH_RUNNING), "{rendered}");
+    assert!(
+        bench.key_hint(&section).contains(HINT_AUTH_RUNNING),
+        "{rendered}"
+    );
 
     bench.key(&mut section, "p");
     let rendered = render_section(&section, &bench.ctx());
-    assert!(rendered.contains(HINT_PASTING), "{rendered}");
-    assert!(!rendered.contains(HINT_AUTH_RUNNING), "{rendered}");
+    assert!(
+        bench.key_hint(&section).contains(HINT_PASTING),
+        "{rendered}"
+    );
+    assert!(
+        !bench.key_hint(&section).contains(HINT_AUTH_RUNNING),
+        "{rendered}"
+    );
 }
 
 /// The login pane with the paste field open, half a paste in: the link, the prompt naming the
@@ -4865,15 +4888,17 @@ async fn a_bare_row_reads_not_probed() {
     );
 }
 
-/// D245: the keys and the note are two lines, the note last (which is what
-/// [`the_idle_hint_says_r_cannot_refresh_quota`] reads).
+/// D245, MOD-67 M6 T2: the idle keys are the shell's hint row, not the section's, and the quota
+/// note is the section's last line (which is what [`the_idle_hint_says_r_cannot_refresh_quota`]
+/// reads).
 #[tokio::test]
-async fn the_idle_keys_and_the_quota_note_are_two_lines() {
+async fn the_idle_keys_are_the_shell_row_and_the_note_is_last() {
     let bench = SectionBench::new().await;
     let section = section_over(&bench, vec![registry_row("declared", true)]);
     let rendered = render_section(&section, &bench.ctx());
     let lines: Vec<&str> = rendered.lines().collect();
-    assert_eq!(lines[lines.len() - 2], IDLE_KEYS, "{rendered}");
+    assert_eq!(bench.key_hint(&section), IDLE_KEYS, "{rendered}");
+    assert!(!rendered.contains(IDLE_KEYS), "{rendered}");
     assert_eq!(lines[lines.len() - 1], IDLE_NOTE, "{rendered}");
 }
 
@@ -5112,11 +5137,10 @@ async fn m_opens_the_tool_paths_form_with_one_field_per_declared_tool() {
         paths_focused_on(&section, &bench, "alpha_tool"),
         "the first field holds the focus"
     );
-    // The last drawn line: the note line under it is empty while a form is open, and `lines`
-    // does not yield a trailing empty line.
+    // The form's keys: the shell's hint row (MOD-67 M6 T2).
     assert_eq!(
-        rendered.lines().last(),
-        Some("Tab next field \u{b7} Enter saves \u{b7} Esc cancels"),
+        bench.key_hint(&section),
+        "Tab next field \u{b7} Enter saves \u{b7} Esc cancels",
         "the form's keys line: {rendered}"
     );
 
@@ -5654,8 +5678,8 @@ async fn qdrant_r_re_reads_and_recovers_the_unavailable_state() {
     );
     let _ = bench.drained();
     let rendered = render_section(&section, &bench.ctx());
-    assert!(rendered.contains("r reload"), "{rendered}");
-    assert!(!rendered.contains("e edit"), "{rendered}");
+    assert!(bench.key_hint(&section).contains("r reload"), "{rendered}");
+    assert!(!bench.key_hint(&section).contains("e edit"), "{rendered}");
 
     assert_eq!(bench.key(&mut section, "r"), Handled::Consumed);
     assert!(
@@ -5665,7 +5689,7 @@ async fn qdrant_r_re_reads_and_recovers_the_unavailable_state() {
     bench.reply(&mut section, &StoreReply::Qdrant(qdrant_stored()));
     let rendered = render_section(&section, &bench.ctx());
     assert!(
-        rendered.contains("e edit"),
+        bench.key_hint(&section).contains("e edit"),
         "the fresh snapshot ends the outage: {rendered}"
     );
 }
@@ -5690,7 +5714,9 @@ async fn a_qdrant_write_says_what_it_did_or_why_it_failed() {
     );
     let rendered = render_section(&section, &bench.ctx());
     assert!(
-        rendered.contains("clear_qdrant_settings in flight"),
+        bench
+            .key_hint(&section)
+            .contains("clear_qdrant_settings in flight"),
         "{rendered}"
     );
     bench.reply(
@@ -5724,7 +5750,10 @@ async fn a_qdrant_write_says_what_it_did_or_why_it_failed() {
         rendered.contains("the keyring refused the delete"),
         "{rendered}"
     );
-    assert!(!rendered.contains("in flight"), "{rendered}");
+    assert!(
+        !bench.key_hint(&section).contains("in flight"),
+        "{rendered}"
+    );
 }
 
 /// One write at a time: while one is out, `e` and `c` are refused by name, and `r` is not refused
@@ -5812,7 +5841,9 @@ async fn a_qdrant_reload_just_before_a_write_is_not_taken_as_its_answer() {
         "the read is not the clear's answer: {rendered}"
     );
     assert!(
-        rendered.contains("clear_qdrant_settings in flight"),
+        bench
+            .key_hint(&section)
+            .contains("clear_qdrant_settings in flight"),
         "the clear is still out: {rendered}"
     );
 
@@ -6087,7 +6118,9 @@ async fn the_qdrant_clear_question_answers_y_and_n_and_passes_ctrl() {
     assert_eq!(bench.key(&mut section, "c"), Handled::Consumed);
     let rendered = render_section(&section, &bench.ctx());
     assert!(
-        rendered.contains("y confirm \u{b7} n/Esc cancel"),
+        bench
+            .key_hint(&section)
+            .contains("y confirm \u{b7} n/Esc cancel"),
         "{rendered}"
     );
     for chord in ["j", "q", "tab", "?"] {
@@ -6241,5 +6274,40 @@ async fn f1_from_the_agents_form_opens_help_and_keeps_the_form() {
     assert!(
         frame.contains("Tab next field"),
         "the form stayed open: {frame}"
+    );
+}
+
+/// MOD-67 M6 D4: a rebound probe key is the one the Agents notes name, the idle note and the
+/// switched-on notice alike.
+#[tokio::test]
+async fn a_rebound_settings_key_is_the_one_the_sentence_names() {
+    let keys = htui::keys::load_str("version = 1\n[settings.agents]\nprobe = \"P\"\n")
+        .expect("the key file loads");
+    let bench = SectionBench::new().await.with_keys(keys);
+    let row = registry_row("declared", true);
+    let mut section = section_over(&bench, vec![row.clone()]);
+    let rendered = render_section(&section, &bench.ctx());
+    let lines: Vec<&str> = rendered.lines().collect();
+    assert_eq!(
+        lines[lines.len() - 1],
+        "quota latches per chat, P cannot refresh it",
+        "{rendered}"
+    );
+
+    let _ = bench.drained();
+    bench.reply(
+        &mut section,
+        &written(
+            vec![row.clone()],
+            AgentWrite::Switched {
+                id: row.agent.id,
+                name: "declared".to_owned(),
+                enabled: true,
+            },
+        ),
+    );
+    assert_eq!(
+        note_line(&render_section(&section, &bench.ctx())),
+        "`declared` switched on; not probed yet \u{b7} P probes"
     );
 }

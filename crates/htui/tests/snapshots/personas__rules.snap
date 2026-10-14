@@ -8,27 +8,3 @@ holding a space, ", #, = or \ · kind: read edit delete move search execute thin
 other
 reject_once kind=execute command="rm -rf" # never wipe
 reject_always path=/etc
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Ctrl+s save · Esc cancel · Enter breaks the line

@@ -24,7 +24,6 @@ pub mod event_loop;
 pub mod hand_written;
 pub mod hierarchy;
 pub mod item_writes;
-pub mod keymap;
 pub mod keys;
 pub mod mcp_cmd;
 pub mod mcp_search;
@@ -69,7 +68,6 @@ use tokio::sync::mpsc;
 
 use crate::agent_worker::AgentRuntime;
 use crate::app::App;
-use crate::keymap::Keymap;
 
 /// Runs the whole application, terminal included.
 ///
@@ -229,7 +227,7 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
         secret_source(args.demo),
     );
 
-    let mut app = App::new(request_tx, Keymap::default_global());
+    let mut app = App::new(request_tx);
     app.top_bar.store = label;
     // MOD-80 D4: a NO_COLOR terminal gets the modifier-only theme.
     app.theme = ui::Theme::from_no_color(std::env::var_os("NO_COLOR").as_deref());
