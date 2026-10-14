@@ -664,6 +664,34 @@ const switchWrite = (args: Words): string | null =>
     'c',
   )
 
+/** `git clean`'s long options (2.43), for reading an abbreviation. */
+const CLEAN_LONG = ['--quiet', '--dry-run', '--force', '--interactive', '--exclude']
+
+/**
+ * Whether a `git clean` is a dry run: `-n` (also in a short cluster, before an `-e` whose value is
+ * the rest of it) or `--dry-run` (or a prefix git takes), before `--` and not as an exclude pattern.
+ */
+function cleanDryRun(args: Words): boolean {
+  for (let i = 0; i < args.length; i++) {
+    const w = args[i]!
+    if (w === '--') return false
+    if (w.startsWith('--')) {
+      const o = longOption(w, CLEAN_LONG)
+      if (o === '--dry-run') return true
+      if (o === '--exclude' && !w.includes('=')) i++
+    } else if (/^-[A-Za-z]/.test(w)) {
+      for (let j = 1; j < w.length; j++) {
+        if (w[j] === 'n') return true
+        if (w[j] === 'e') {
+          if (j === w.length - 1) i++
+          break
+        }
+      }
+    }
+  }
+  return false
+}
+
 /**
  * Whether a `git branch` or `git tag` command only lists: no write option (`writeLong`, or a short
  * cluster with a letter of `writeShort`), and a name given only to a list form (`--list`, `-l`, ...),
@@ -721,7 +749,7 @@ export function gitWrite(words: Words): string | null {
     case 'switch':
       return switchWrite(args)
     case 'clean':
-      return args.some(w => w === '--dry-run' || /^-[A-Za-z]*n/.test(w)) ? null : 'git clean'
+      return cleanDryRun(args) ? null : 'git clean'
     case 'branch':
       return listsOnly(
         args,

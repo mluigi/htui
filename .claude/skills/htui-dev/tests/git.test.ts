@@ -241,6 +241,25 @@ test('git checkout reads --ours/--theirs as paths and long options by their uniq
   for (const [line, label] of table) expect(gitWrite(simpleCommands(line)![0]!), line).toBe(label)
 })
 
+test('git clean is a dry run only with -n or a prefix of --dry-run, before -- and outside a value', () => {
+  const table: [string, string | null][] = [
+    ['git clean -fden', 'git clean'],
+    ['git clean -fdx -- -n', 'git clean'],
+    ['git clean -fd -e n', 'git clean'],
+    ['git clean -e -n -fd', 'git clean'],
+    ['git clean --exclude -n -fd', 'git clean'],
+    ['git clean --exclude=-n -f', 'git clean'],
+    ['git clean -f', 'git clean'],
+    ['git clean --dry -fd', null],
+    ['git clean --dr', null],
+    ['git clean -fdn', null],
+    ['git clean -nfd', null],
+    ['git clean -n -e x', null],
+    ['git clean -fd -n -- a', null],
+  ]
+  for (const [line, label] of table) expect(gitWrite(simpleCommands(line)![0]!), line).toBe(label)
+})
+
 test('gitWrite names the writes to the remote, refs, worktrees, submodules and history beyond the porcelain', () => {
   const table: [string, string | null][] = [
     ['git push', 'git push'],
