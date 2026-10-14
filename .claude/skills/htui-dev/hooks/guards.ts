@@ -249,3 +249,119 @@ export function cargoTest(words: Words): string | null {
   if (t === null) return null
   return wrongFeature(t) ?? vacuousRun(t)
 }
+
+// --- G6 and G4's Bash half: git ---------------------------------------------------------------
+
+/** git's own options before the subcommand that take a value as the next word (`-C dir`, `--git-dir x`). */
+const GIT_GLOBAL_VALUE = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--config-env'])
+
+/** `git commit`'s short options whose value is the rest of the cluster or the next word. */
+const COMMIT_SHORT_VALUE = new Set(['m', 'F', 'C', 'c', 't'])
+
+/** `git commit`'s short options whose value, if any, is only the rest of the cluster (`-S<keyid>`, `-u<mode>`). */
+const COMMIT_SHORT_OPTIONAL = new Set(['S', 'u'])
+
+/** `git commit`'s long options that take the next word as their value when not given with `=`. */
+const COMMIT_LONG_VALUE = new Set([
+  '--message',
+  '--file',
+  '--reuse-message',
+  '--reedit-message',
+  '--template',
+  '--author',
+  '--date',
+  '--fixup',
+  '--squash',
+  '--cleanup',
+  '--trailer',
+  '--pathspec-from-file',
+])
+
+/** The subcommand of a `git` command and where its arguments start, or null when `words` run no git. */
+function gitSubcommand(words: Words): { sub: string; at: number } | null {
+  if ((words[0] ?? '').split('/').pop() !== 'git') return null
+  let at = 1
+  while (at < words.length) {
+    const w = words[at]!
+    if (GIT_GLOBAL_VALUE.has(w)) at += 2
+    else if (w.startsWith('-')) at++
+    else return { sub: w, at: at + 1 }
+  }
+  return null
+}
+
+/** Whether a long option `w` is `full` or a prefix of it git would take (at least `min` characters). */
+const abbreviates = (w: string, full: string, min: number): boolean => w.length >= min && full.startsWith(w)
+
+/**
+ * G6: `git commit` with `--no-verify` (or a prefix git takes) or `-n`, also inside a short-flag
+ * cluster, unless a later `--verify` cancels it. The deny shows the commit without the flag.
+ */
+export function noVerify(words: Words): string | null {
+  const git = gitSubcommand(words)
+  if (git === null || git.sub !== 'commit') return null
+  let skips = false
+  const fixed: string[] = [...words.slice(0, git.at)]
+  for (let i = git.at; i < words.length; i++) {
+    const w = words[i]!
+    if (w === '--') {
+      fixed.push(...words.slice(i))
+      break
+    }
+    if (w.startsWith('--')) {
+      const name = w.split('=')[0]!
+      if (abbreviates(name, '--no-verify', '--no-ve'.length) && !w.includes('=')) {
+        skips = true
+        continue
+      }
+      if (abbreviates(name, '--verify', '--veri'.length) && !w.includes('=')) skips = false
+      fixed.push(w)
+      if (COMMIT_LONG_VALUE.has(w) && i + 1 < words.length) fixed.push(words[++i]!)
+      continue
+    }
+    if (!w.startsWith('-') || w === '-') {
+      fixed.push(w)
+      continue
+    }
+    // A short cluster: letters until one takes a value, which is the rest or the next word.
+    let kept = '-'
+    let takesNext = false
+    for (let j = 1; j < w.length; j++) {
+      const letter = w[j]!
+      if (COMMIT_SHORT_VALUE.has(letter)) {
+        kept += w.slice(j)
+        takesNext = j === w.length - 1
+        break
+      }
+      if (COMMIT_SHORT_OPTIONAL.has(letter)) {
+        kept += w.slice(j)
+        break
+      }
+      if (letter === 'n') skips = true
+      else kept += letter
+    }
+    if (kept !== '-') fixed.push(kept)
+    if (takesNext && i + 1 < words.length) fixed.push(words[++i]!)
+  }
+  if (!skips) return null
+  return `htui-dev: git commit --no-verify skips the repo's commit hooks — commit without it: ${quoteWords(fixed)}`
+}
+
+/** G4's Bash half: the git command that changes the tree or history (`git commit`, `git stash` but its list and show, `git reset`, `git checkout --`), or null. */
+export function gitWrite(words: Words): string | null {
+  const git = gitSubcommand(words)
+  if (git === null) return null
+  const args = words.slice(git.at)
+  switch (git.sub) {
+    case 'commit':
+      return 'git commit'
+    case 'stash':
+      return args[0] === 'list' || args[0] === 'show' ? null : 'git stash'
+    case 'reset':
+      return 'git reset'
+    case 'checkout':
+      return args.includes('--') ? 'git checkout --' : null
+    default:
+      return null
+  }
+}

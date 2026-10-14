@@ -2,11 +2,12 @@
 // call that has cost this repo real work (docs/htui-dev.md):
 //   G1  cargo test that builds feature-gated integration tests without their feature (0 tests, green)
 //   G2  cargo test with the other crate's test feature name (testkit vs test-support)
+//   G6  git commit --no-verify (or -n), which skips the repo's commit hooks
 // Every guard is a `{ deny }`, never a rewrite. A guard that throws lets the call through and
 // says so on the status line (ANA-29 §6.3, "fail open"): the guards are a safety net, not a
 // sandbox. The mod reads nothing outside the event; it runs no process and touches no file.
 import type { EngineInterface, Register } from 'claude-code'
-import { cargoTest } from './guards'
+import { cargoTest, noVerify } from './guards'
 import { simpleCommands, type Words } from './shell'
 
 /** Puts `text` on the plugin's status line; never throws (a `$` call in a re-entry rejects). */
@@ -39,7 +40,8 @@ export const register: Register = on => {
     // A line the parser cannot follow is allowed, with no status: it is no failure of the guard.
     if (cmds === null) return next(e)
     for (const words of cmds) {
-      const reason = judge($, 'cargo test', 'call', () => cargoTest(words))
+      const reason =
+        judge($, 'no-verify', 'call', () => noVerify(words)) ?? judge($, 'cargo test', 'call', () => cargoTest(words))
       if (reason !== null) return { deny: reason }
     }
     return next(e)
