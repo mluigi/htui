@@ -374,13 +374,6 @@ export function gitWrite(words: Words): string | null {
  */
 export const LITERAL = 'ze' + 'ta'
 
-/**
- * The Gortex MCP tools that write a file (Q3). `edit_file`, `write_file`, `edit_symbol`,
- * `rename_symbol` and `batch_edit` are this session's schemas; `edit` and `refactor` are the
- * newer compact names, whose inputs are read the same way.
- */
-export const GORTEX_WRITE = /^mcp__gortex__(edit|edit_file|edit_symbol|batch_edit|rename_symbol|refactor|write_file)$/
-
 /** The fields that carry the text a write puts into a file; the old text is never read (removing the literal is the fix). */
 const NEW_TEXT = ['new_string', 'new_source', 'content', 'new_name'] as const
 
@@ -444,4 +437,42 @@ export function forbiddenLiteral(_tool: string, input: Readonly<Record<string, u
   const path = offender(input, null, 0)
   if (path === null) return null
   return `htui-dev: ${path} would contain "${LITERAL}", which crates/htui-agent/tests/extensibility.rs forbids in crates/**/*.{rs,json} — use another name; only extensibility.rs may spell it`
+}
+
+// --- G4 and G5: subagents ---------------------------------------------------------------------
+
+/** Agent types that review or design and never change the tree (Q2). A plugin's `<plugin>:<name>` counts by its name. */
+const READ_ONLY_TYPES = new Set(['rust-reviewer', 'code-architect'])
+
+/**
+ * G4's marker (Q2): a prompt holding `READ-ONLY` (case-sensitive: a lowercase "read-only host tree"
+ * is ordinary text) or "strictly no edits" (any case), or a read-only agent type. A tagged parent
+ * is register.ts's to check: it lives in `$.state`.
+ */
+export function declaresReadOnly(spawn: { prompt: string; subagentType: string }): boolean {
+  return (
+    spawn.prompt.includes('READ-ONLY') ||
+    /strictly no edits/i.test(spawn.prompt) ||
+    READ_ONLY_TYPES.has(spawn.subagentType.split(':').pop()!)
+  )
+}
+
+/** G4's deny for a file-writing tool called by the read-only agent `agentId`. */
+export const readOnlyEdit = (tool: string, agentId: string): string =>
+  `htui-dev: agent ${agentId} was started read-only and may not change files (${tool}) — report the change in your answer instead`
+
+/** G4's deny for a git write (`gitWrite`'s label) run by the read-only agent `agentId`. */
+export const readOnlyGit = (verb: string, agentId: string): string =>
+  `htui-dev: agent ${agentId} was started read-only and may not run ${verb} — report what to change instead`
+
+/** Whether a model name, alias or id, is a Fable model. */
+export const isFable = (model: string): boolean => /fable/i.test(model)
+
+/**
+ * G5: a subagent asked to run on Fable. It reads the Agent tool's `model` parameter only: a model
+ * left unset is resolved after the hook, from the agent definition or the parent (see register.ts).
+ */
+export function fableModel(model: string | undefined): string | null {
+  if (model === undefined || !isFable(model)) return null
+  return `htui-dev: subagents never run on Fable in this repo (model "${model}") — leave model unset so the agent inherits the session's model`
 }
