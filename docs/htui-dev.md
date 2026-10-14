@@ -1,7 +1,7 @@
 # Guards for developing htui (`.claude/skills/htui-dev`)
 
 `htui-dev` is a Claude Code mod that lives in this repository and loads in every Claude Code session
-you open here. It refuses six kinds of tool call that have cost this repo real work: test runs that
+you open here. It refuses five kinds of tool call that have cost this repo real work: test runs that
 pass without testing anything, a name the extensibility test forbids written into `crates/`, writes
 and commits from agents that were started read-only, Fable subagents, and `git commit --no-verify`.
 Each refusal says what to run instead.
@@ -28,10 +28,10 @@ Every refusal starts with `htui-dev:`, names the problem, and ends with the fix 
 
 | Guard | Refuses | Why | The refusal's fix |
 |---|---|---|---|
-| G1 | `cargo test` that builds feature-gated integration tests without their feature | The gated files compile to nothing, so the run reports `ok` with 0 tests (ANA-29 D1) | Your command with `--features testkit` (or `test-support`) added, or `--all-features` for several crates or the whole workspace |
+| G1 | `cargo test` that builds feature-gated integration tests with their feature still off | The gated files compile to nothing, so the run reports `ok` with 0 tests (ANA-29 D1) | Your command with `--features testkit` (or `test-support`) added; for several crates or the whole workspace, `--all-features` works too |
 | G2 | `cargo test -p <crate>` naming the other crate's test feature | `htui` calls it `testkit`, the other crates `test-support`. cargo refuses the wrong one anyway; the refusal just gives you the right spelling | Your command with the name swapped |
 | G3 | An edit that writes the forbidden literal into `crates/**/*.{rs,json}` | `crates/htui-agent/tests/extensibility.rs` fails the workspace gate on it, but per-crate gates stay green, so it is caught lanes later (ANA-29 D2) | Use another name. Only `extensibility.rs` may spell it |
-| G4 | File writes, and `git commit`, `git stash`, `git reset` or `git checkout --`, from an agent started read-only | A read-only verifier once fixed and committed the defect it was asked to report (ANA-29 D3) | Report the change in the answer instead |
+| G4 | File writes, and git commands that change the working tree, the index, refs or history, from an agent started read-only | A read-only verifier once fixed and committed the defect it was asked to report (ANA-29 D3). On a shared tree, `git checkout .` or `git clean` would also destroy the parent's uncommitted work | Report the change in the answer instead |
 | G5 | A subagent spawned with a Fable model | Every agent here inherits the session's model and none runs on Fable (ANA-29 D4) | Leave `model` unset |
 | G6 | `git commit --no-verify` or `git commit -n` | It skips the repo's commit hooks (ANA-29 D8) | The same commit without the flag |
 
@@ -44,32 +44,85 @@ The Bash guards look at each simple command in the line, not at the raw text:
 - The line is split on unquoted `;`, `&&`, `||`, `|`, `|&`, `&`, newlines, `(`, `)`, `$(` and
   backticks. Redirections such as `2>&1` and `&>log` are dropped, not split on.
 - Quotes and backslashes are read as the shell reads them. A heredoc body and a `#` comment are
-  skipped, so `git commit -F - <<'EOF'` with a message about `--no-verify` is fine, and so is
-  `git commit -m "$(cat <<'EOF' … EOF)"`.
+  skipped, so `git commit -F - <<'EOF'` with a message about `--no-verify` is fine.
+- A `$( … )` inside double quotes is read as the shell reads it: a fresh quoting context, up to its
+  balanced `)`, stepping over nested quotes, parentheses and heredoc bodies. So the usual
+  `git commit -m "$(cat <<'EOF' … EOF)"` is one word, even when the message has `"` or `&&` in it,
+  and the commands inside the substitution are checked too. `$(( … ))` is arithmetic, not a command.
 - Leading `VAR=value` assignments, `if`/`then`/`do`/`{` and similar words, and the wrappers `env`,
-  `command`, `time`, `nice`, `timeout <duration>` and `nohup` are stripped, with their options.
-- `bash -c '…'` and `sh -c '…'` (also `-lc`, `-ec`) are followed into their string.
+  `command`, `time`, `nice`, `timeout <duration>`, `nohup` and `exec` are stripped, with their
+  options. `env -S "…"` (`--split-string`) is split into the command it runs.
+- `bash -c '…'`, `sh -c '…'`, `zsh -c`, `dash -c` and `ksh -c` (also `-lc`, `-ec`) are followed into
+  their string. `--rcfile f`, `--init-file f`, `-o opt` and `-O opt` take their value.
+- An array assignment, `arr=( … )` or `arr+=( … )`, is one word, not a subshell.
 
 So `echo cargo test -p htui` and `git commit -m "cargo test -p htui"` are left alone, while
 `RUST_LOG=x timeout 900 cargo test -p htui 2>&1 | tail` is checked.
 
 A line the reader cannot follow (an unbalanced quote, a heredoc with no end) is let through
-without comment.
+without comment. The one exception is a read-only agent's line: it still meets a coarse pattern for
+the git commands that always write (see G4).
 
 ### G1 and G2: `cargo test`
 
-Each member's integration tests are gated on one feature, read from the `Cargo.toml` files and the
-`#![cfg(feature = …)]` lines under `crates/*/tests`:
+**Which tests are gated.** The `#![cfg(feature = …)]` lines under `crates/*/tests`:
 
-| Selection | Needs one of |
+| Crate | Gated integration-test files |
 |---|---|
-| `-p htui` (also `--package`, `--package=`, `-phtui`, `--manifest-path crates/htui/Cargo.toml`) | `--all-features`, `testkit`, `htui/testkit` |
-| `-p htui-agent`, `htui-core`, `htui-store` | `--all-features`, `test-support`, `<crate>/test-support` |
-| `--workspace`, `--all`, or no package at all (the root is a virtual manifest, so that means every member) | `--all-features`, or every crate's own feature (`testkit,test-support`). `--workspace --features testkit` still runs the `test-support` crates' gated files as 0 tests |
-| `-p htui-mcp`, `htui-secrets`, `htui-orch`, `htui-worker` | nothing: they have no gated integration tests |
+| `htui` | 43 on `testkit` |
+| `htui-agent` | 4 on `test-support` |
+| `htui-core` | 8 on `test-support` |
+| `htui-store` | 3 on `test-support`, 5 on `demo` |
+
+The other crates have no gated integration tests.
+
+**What turns a feature on.** cargo turns test features on in three ways, and G1 models all three:
+
+1. **The command line:** `--all-features`, a plain name (applied to every selected crate that has
+   that feature), or `<crate>/<feature>`.
+2. **The selected crates' own dependencies.** A test build uses each selected crate's
+   `[dependencies]` and `[dev-dependencies]`, and cargo unifies their features over every selected
+   crate:
+
+   | Selecting | Turns on `test-support` in |
+   |---|---|
+   | `htui` | agent, orch, worker, store (core through forwarding) |
+   | `htui-orch` | core, agent |
+   | `htui-worker` | core, agent, orch, store |
+   | `htui-mcp` | core, agent, orch, store |
+   | `htui-store` | core, and store itself (it lists itself as a dev-dependency) |
+   | `htui-agent`, `htui-core`, `htui-secrets` | nothing |
+
+3. **Forwarding** in the `[features]` tables:
+   - `htui/testkit` → `htui-store/test-support`
+   - `htui-agent/test-support` → `htui-core/test-support`
+   - `htui-orch/test-support` → `htui-core/test-support` and `htui-agent/test-support`
+   - `htui-core/test-support` → `htui-core/demo`
+   - `htui-store/test-support` → `htui-store/demo`
+
+A run is refused only when a selected crate with gated tests would still have its gate off. In
+practice:
+
+| Selection | Refused unless |
+|---|---|
+| includes `htui` (also `--workspace`, `--all`, or no package at all: the root is a virtual manifest, so that means every member) | `htui` gets `testkit`: `--features testkit`, `htui/testkit` or `--all-features`. Nothing else is needed; `htui`'s dev-dependencies cover the rest |
+| `-p htui-agent` or `-p htui-core`, with none of htui, orch, worker or mcp beside it (store covers core, not agent) | that crate gets `test-support` |
+| `-p htui-store` | never: its own dev-dependency turns `test-support` (and so `demo`) on |
+| `-p htui-mcp`, `htui-secrets`, `htui-orch`, `htui-worker` | never: they have no gated integration tests |
+
+So `cargo test -p htui-agent -p htui-orch` and `cargo test --workspace --features testkit` are allowed,
+`cargo test -p htui-agent` alone is refused, and a bare `cargo test` is refused for `htui` alone,
+with `--features testkit` (or `--all-features`) as the fix.
+
+**How the selection is read.** `-p`, `--package`, `--package=`, `-phtui` and short clusters such as
+`-qp htui`; a package's `@version` is dropped and a glob (`-p 'htui-*'`) is matched against the
+members. `--manifest-path` names a member only when its folder sits in `crates/` (or `../`) or the
+path is a bare `<member>/Cargo.toml`; any other manifest is the workspace root, whatever its folder is
+called (`.claude/worktrees/tool-8/Cargo.toml`). `--exclude` (globs too) takes a crate out of a
+workspace run.
 
 Features are read in every spelling cargo takes: `--features a,b`, `--features "a b"`,
-`--features=…`, `-F …`, `-F…`, repeated. `--exclude` takes a crate out of a workspace run.
+`--features=…`, `-F …`, `-F…`, inside a short cluster (`-qF testkit`), repeated.
 
 The integration tests count as in scope unless the only target selectors are `--lib`, `--bin(s)`,
 `--doc`, `--example(s)` or `--bench(es)`. `--tests`, `--test <name>`, `--all-targets`, or no
@@ -86,17 +139,37 @@ G2 fires when a selected crate is given the other test feature name, plain or qu
 
 ### G3: the forbidden literal
 
-G3 reads the edit tools: `Edit`, `Write`, `NotebookEdit`, and Gortex's `edit_file`, `write_file`,
-`edit_symbol`, `rename_symbol`, `batch_edit`, `edit` and `refactor`. It reads only the text the call
-would write (`new_string`, `new_source`, `content`, `new_name`), never the old text, so removing the
-literal is always allowed. The check is case-sensitive, like the test.
+G3 reads the edit tools:
 
-The target path comes from `file_path`, `path`, `notebook_path`, `target.file`, or a symbol id's
-file part (`htui/crates/x.rs::Sym`). In a `batch_edit`, each edit is checked under its own path. The
-guard refuses when the path, from its last `crates/` folder on, ends in `.rs` or `.json`, has no
-`target/` folder, and is not `crates/htui-agent/tests/extensibility.rs`. That is the same set of
-files the test scans. Absolute paths, Windows `\` paths and worktree copies
+- `Edit`, `Write` and `NotebookEdit`;
+- Gortex's `edit_file`, `write_file`, `edit_symbol`, `rename_symbol`, `batch_edit`, `edit` and
+  `refactor`;
+- Serena's `create_text_file`, `replace_content`, `replace_in_files`, `replace_symbol_body`,
+  `insert_after_symbol`, `insert_before_symbol`, `rename_symbol`, `safe_delete_symbol`,
+  `replace_lines`, `insert_at_line` and `delete_lines`. Serena is configured machine-wide, so its
+  tools reach sessions here.
+
+Either server's tools also count under a plugin's prefix (`mcp__plugin_<name>_gortex__…`).
+
+It reads only the text the call would write (`new_string`, `new_source`, `content`, `new_name`,
+and Serena's `body` and `repl`), never the old text, so removing the literal is always allowed. The
+check is case-sensitive, like the test.
+
+The target path comes from `file_path`, `path`, `notebook_path`, Serena's `relative_path`,
+`target.file`, or a symbol id's file part (`htui/crates/x.rs::Sym`). In a `batch_edit`, each edit is
+checked under its own path. The path is read by its segments, with `.` dropped and `..` resolved.
+The guard refuses when, from the first `crates` folder on, the path ends in `.rs` or `.json`, has no
+`target` folder, and is not `crates/htui-agent/tests/extensibility.rs`. That is the same set of files
+the test scans. Absolute paths, Windows `\` paths and worktree copies
 (`.claude/worktrees/x/crates/…`) are all matched.
+
+Serena's `replace_in_files` reaches many files. It counts when its `relative_path` is empty or `.`
+(the whole project), a folder in `crates/` outside `target/`, or a scanned file. A dry run
+(`dry_run: true`) writes nothing and passes G3 and G4.
+
+The Serena field names come from this session's Serena tool list. `create_text_file`,
+`replace_lines`, `insert_at_line` and `delete_lines` were not in that list; their fields
+(`relative_path`, `content`) are Serena's documented ones.
 
 ### G4: read-only agents
 
@@ -104,17 +177,40 @@ When a subagent starts, it is tagged read-only if:
 
 - its prompt contains `READ-ONLY` (case-sensitive: "the read-only host tree" is ordinary text);
 - its prompt contains "strictly no edits", in any case;
-- its type is `rust-reviewer` or `code-architect`; or
-- the agent that spawned it is tagged.
+- its type is `rust-reviewer` or `code-architect`;
+- the agent that spawned it is tagged; or
+- it is a workflow agent whose run was started by a tagged agent's `Workflow` call (see below).
 
 The tag is the agent's `agentId`. It is kept in the mod's `$.state`, which outlives a reload of the
-mod, for the rest of the session. A tagged agent's `Edit`, `Write`, `NotebookEdit` and Gortex write
-calls are refused, and so are its Bash `git commit`, `git stash` (but not `stash list` or
-`stash show`), `git reset` and `git checkout --`. It can still read, search, build, check and run
-tests. Explore and Plan agents need no tag: they have no write tools.
+mod, for the rest of the session. Explore and Plan agents need no tag: they have no write tools.
 
-Workflow agents are covered too: a workflow script's `agent()` raises the same spawn event, and its
-tool calls carry the same `agentId` (verified live, see below).
+A tagged agent's file writes are refused: `Edit`, `Write`, `NotebookEdit`, and every Gortex and
+Serena write tool G3 reads. So are its Bash git commands that change the working tree, the index,
+refs or history:
+
+- `commit`, `reset`, `restore`, `switch`, `merge`, `rebase`, `cherry-pick`, `revert`, `am`,
+  `apply`, `add`, `rm`, `mv` and `pull`, in any form;
+- `stash`, except `stash list` and `stash show`;
+- `checkout` with a pathspec (`.`, anything after `--`, a second positional,
+  `--pathspec-from-file`), or with `--force`/`-f` or `--patch`/`-p`;
+- `clean`, except with `-n`/`--dry-run`;
+- `branch` and `tag` in any but their list forms (`branch -d/-D/-m`, `branch <name>`,
+  `tag -a`, `tag <name>` are writes; `branch -a`, `--list`, `--contains`, `tag -l`, `tag -n` are
+  not).
+
+It can still read, search, build, check and run tests, and run `git status`, `diff`, `log`, `show`,
+`blame`, `fetch` and `checkout <branch>`.
+
+A tagged agent's Bash line that the reader cannot follow still meets a coarse pattern: a `git`
+word followed by one of the always-writing subcommands above is refused. Anyone else's unreadable
+line stays allowed.
+
+**Workflow agents.** A workflow script's `agent()` raises the same spawn event, and its tool calls
+carry the same `agentId` (verified live, see below). Its spawn names no parent agent, though, only
+the `tool_use_id` of the `Workflow` call that started its run. So the mod notes the `tool_use_id` of
+each `Workflow` and `Agent` call a tagged agent makes, before the call runs, and tags a workflow (or
+nested) spawn under a noted call. This path is tested through the test kit only; see
+[Known gaps](#known-gaps).
 
 ### G5: Fable subagents
 
@@ -124,12 +220,15 @@ is known by then. See [Known gaps](#known-gaps) for what that misses.
 
 ### G6: `--no-verify`
 
-G6 refuses `git commit` with `--no-verify`, an abbreviation git accepts (`--no-ver`), or `-n`, also
-inside a cluster of short flags (`-an`, `-nm msg`). A later `--verify` cancels it. A value is not a
-flag: `-m -n` and `-mn` are messages, `-Cn` names a commit. Git's own options before `commit`
-(`-C dir`, `-c k=v`, `--git-dir`, …) are skipped. Other commands (`git log -n 3`,
-`git push --no-verify`) are not checked. The refusal shows the commit with the flag taken out
-(`-an -m x` becomes `-a -m x`).
+G6 refuses `git commit` with `--no-verify`, an abbreviation of it (git 2.43 takes `--no-veri`;
+`--no-ver` is ambiguous with `--no-verbose`), or `-n`, also inside a cluster of short flags (`-an`,
+`-nm msg`). A later `--verify` cancels it.
+
+A value is not a flag: `-m -n` and `-mn` are messages, `-Cn` names a commit, and an abbreviated
+value-taking option takes the next word as git does (`--mess -n` is a message). Git's own options
+before `commit` (`-C dir`, `-c k=v`, `--git-dir`, …) are skipped. Other commands
+(`git log -n 3`, `git push --no-verify`) are not checked. The refusal shows the commit with the
+flag taken out (`-an -m x` becomes `-a -m x`).
 
 ## What it never does
 
@@ -137,11 +236,14 @@ flag: `-m -n` and `-mn` are messages, `-Cn` names a commit. Git's own options be
   unchanged. (In auto mode a rewritten call is denied outright, ANA-29 §2.3.)
 - **It fails open.** If a guard throws, or the tag store cannot be read or written, the call goes
   through and the status line says which guard failed, for example
-  `htui-dev: read-only guard failed, call allowed`. A command the parser cannot read is let through
-  silently.
+  `htui-dev: read-only guard failed, call allowed`. A tag store that holds no list counts as
+  unreadable. If the spawn hook fails after the agent started, the status line says the read-only
+  tag may be missing. A command the parser cannot read is let through silently (but see G4).
 - **It reaches nothing outside the event.** No process, file, network or model call. The only
-  things it calls are `$.state` for the read-only tags and `$.ui.status` for those warnings.
-  `claude plugin validate` lists exactly `$.state.get, $.state.set, $.ui.status`.
+  things it calls are `$.state` for the read-only tags (`readOnly`, the tagged agents' ids, and
+  `readOnlyCalls`, the `tool_use_id`s of their `Workflow` and `Agent` calls) and `$.ui.status` for
+  those warnings. The main loop's tool calls never read the state. `claude plugin validate` lists
+  exactly `$.state.get, $.state.set, $.ui.status`.
 
 ## Turning it off
 
@@ -163,10 +265,10 @@ usually what you meant. If it is not, use `--safe-mode` for that session and rep
 .claude/skills/htui-dev/
   .claude-plugin/plugin.json   name, version, author (validate --strict needs it), types
   hooks/hooks.json             {"modules": ["./register.ts"]}
-  hooks/register.ts            the three hooks, the fail-open helpers, the readOnly state
-  hooks/guards.ts              the pure decisions, the G1 crate table, the refusal texts
+  hooks/register.ts            the four hooks, the fail-open helpers, the readOnly/readOnlyCalls state
+  hooks/guards.ts              the pure decisions, the G1 feature tables, the refusal texts
   hooks/shell.ts               the Bash command reader
-  types/index.d.ts             the $.state contract (htui-dev.readOnly)
+  types/index.d.ts             the $.state contract (htui-dev.readOnly, htui-dev.readOnlyCalls)
   tests/*.test.ts              the kit tests; tests/fixtures.ts holds their helpers
 ```
 
@@ -192,8 +294,11 @@ rm -rf "$C"
 `$.state.get, $.state.set, $.ui.status`.
 
 The tests use `claude-code/testing`: hooks a test registers sit beneath the mod and stand in for the
-engine. The kit passes a call's `agentId` and a spawn's `parentAgentId` through to the mod, so the
-read-only tests run through the real hooks. The parser and the git table are also tested directly.
+engine. The kit passes a call's `agentId` and a spawn's `parentAgentId`, `workflow` and
+`tool_use_id` through to the mod, so the read-only tests run through the real hooks. The parser, the
+git table and the spawn hook's backstop are also tested directly. The kit refuses a spawn answer of
+the wrong shape (a `deny` with other fields beside it), so the spawn hook's pass-through of a refusal
+from below is only checked for the plain `{ deny }` shape.
 
 For type-checking, use the `tsconfig.json` from the header of the `claude-code.d.ts` that
 Claude Code writes, kept **outside** the mod folder (`.claude-plugin/types/` is regenerated on every
@@ -204,9 +309,12 @@ Two rules for anything under `.claude/skills/htui-dev/`:
 - Never spell the forbidden literal. Build it as `'ze' + 'ta'`, as `guards.ts` and the test fixtures
   do. Nothing here is under `crates/`, so the scan never reads it, but a copied line could end up
   there.
-- Keep the G1 crate table (`GATED` in `guards.ts`) in step with the `[features]` of
-  `crates/*/Cargo.toml` and the gated test files. Nothing checks this until TOOL-9 adds the mod's
-  tests and validator to `scripts/gate.sh`.
+- Keep the G1 tables in `guards.ts` in step with the manifests: `FEATURES` (each crate's
+  `[features]` and their forwards), `SELECTING` (the features each crate's `[dependencies]` and
+  `[dev-dependencies]` ask for) and `GATES` (the gated test files). `cargo tree -p <crate> -e
+  features,normal,dev` shows what cargo really turns on. Nothing checks this until TOOL-9 adds the
+  mod's tests and validator to `scripts/gate.sh`; its drift check should compare against
+  `cargo tree -e features`.
 
 ## Known gaps
 
@@ -215,19 +323,31 @@ Two rules for anything under `.claude/skills/htui-dev/`:
   refusal after the agent starts would fail the hook. So a Fable model pinned in an agent definition,
   or inherited from a Fable session, starts anyway, and the mod only shows a status line:
   `htui-dev: subagent <id> resolved to Fable (<model>) — inherited or pinned in its agent definition`.
-- **G1 does not know the working directory.** `cd crates/htui && cargo test --features testkit` is
-  read as a workspace run and refused (cargo would test only `htui` there). Use `-p htui` from the
-  root. A `cargo test` in another project from a session opened here is read the same way.
-- **The reader is not a shell.** It does not follow `eval`, scripts, aliases, functions, or a
-  `$( … )` inside double quotes, and it treats every `$VAR` as text. A guard can be walked around
-  on purpose. It is there to catch mistakes.
+- **G1 does not know the working directory.** A `cargo test` with no package is read as a workspace
+  run. `cd crates/htui && cargo test --features testkit` is therefore allowed (it is right either
+  way), but `cd crates/htui-agent && cargo test` is refused with `htui`'s fix, although cargo would
+  test only `htui-agent` there. Use `-p` from the root. A `cargo test` in another project from a
+  session opened here is read the same way.
+- **The reader is not a shell.** It does not follow `eval`, scripts, aliases, functions, `sudo`,
+  `xargs`, a command piped into a shell (`cat <<EOF | sh`, `… | bash`), or backticks inside double
+  quotes, and it treats every `$VAR` as text. A guard can be walked around on purpose. It is there
+  to catch mistakes.
+- **G4 does not refuse `git checkout <one path>`.** `git checkout src/a.rs` restores a file, but
+  with one positional the reader cannot tell a path from a branch name, so it is allowed. `.`, a
+  second positional and anything after `--` are refused.
+- **Workflow agents started by a read-only agent are tagged through the test kit only.** The live
+  probe saw a main-loop workflow spawn carry no `parentAgentId`. The types say a workflow agent's
+  `tool_use_id` is that of the Workflow call that started its run, and the mod tags by it, but no
+  live run has yet shown a read-only agent's workflow being tagged.
 - **G4's tag lands as the spawn returns.** The tag is written as soon as the engine answers the
   spawn with the agent's id, before that agent's first model turn returns. The live probe saw a
   10-second gap before the first tool call.
-- **The field names of Gortex's compact `edit` and `refactor` tools were not confirmed.** The
-  session that built this exposed only the older names (`edit_file`, `write_file`, `edit_symbol`,
+- **The field names of Gortex's compact `edit` and `refactor` tools are assumed.** The session that
+  built this exposed only the older names (`edit_file`, `write_file`, `edit_symbol`,
   `rename_symbol`, `batch_edit`), whose fields were checked. The compact tools are matched by name
   and read with the same fields, plus `target.file` and `target.symbol`.
+- **A rename is checked at the symbol's own file.** Gortex's and Serena's `rename_symbol` write the
+  new name into every file that refers to the symbol, but G3 judges only the file the call names.
 
 ## What the live probe showed
 
@@ -240,6 +360,6 @@ scratch configuration:
   call carries the same id.
 - Workflow-tool agents raise the spawn event (`subagentType` `workflow-subagent`, a `workflow`
   field, no `parentAgentId`), and their tool calls carry the `agentId` the spawn answered. So G4
-  covers them.
+  covers a workflow agent tagged by its own prompt or type.
 - The Workflow tool is available under `-p`. A workflow agent's prompt and `model` option reach the
   hook as given (`"READ-ONLY verifier. …"`, `model=sonnet`).

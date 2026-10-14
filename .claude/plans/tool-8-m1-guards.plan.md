@@ -18,20 +18,21 @@ so there are no `scripts/` twins in M1.
 
 | # | Guard | Event | Denies when |
 |---|---|---|---|
-| G1 | vacuous cargo test | `tool.call` Bash | a simple command `cargo test …` selects a package whose integration tests are feature-gated, integration tests are in scope, and the gating feature is not enabled (table below) |
+| G1 | vacuous cargo test | `tool.call` Bash | a simple command `cargo test …` selects a package whose integration tests are feature-gated, integration tests are in scope, and the gating feature stays off once every way cargo turns features on is counted: the command line, the selected crates' `[dependencies]`/`[dev-dependencies]` features, and `[features]` forwarding (table below; R1, claim 23) |
 | G2 | wrong feature name | `tool.call` Bash | `cargo test -p <crate> --features testkit` where `<crate>` calls it `test-support`, or the reverse (spelling fix only: cargo already errors, probe 10) |
-| G3 | forbidden literal | `tool.call` Edit, Write, Gortex write tools | the *new* text (`new_string`, `content`, `new_source`, …) contains the literal and the target path is `crates/**/*.rs` or `crates/**/*.json` (any `target/` dir excluded), except `crates/htui-agent/tests/extensibility.rs`. Old text is never checked: removing the literal is the fix |
-| G4 | read-only agents | `agent.spawn` (tag) + `tool.call` (deny) | the call's `agentId` was tagged read-only, and the call is Edit, Write, NotebookEdit, a Gortex write tool, or Bash running `git commit\|stash\|reset\|checkout --` |
+| G3 | forbidden literal | `tool.call` Edit, Write, Gortex and (R1) Serena write tools, either under an optional `plugin_<name>_` prefix | the *new* text (`new_string`, `content`, `new_source`, Serena's `body`/`repl`, …) contains the literal and the target path is `crates/**/*.rs` or `crates/**/*.json` (any `target/` dir excluded), except `crates/htui-agent/tests/extensibility.rs`. Old text is never checked: removing the literal is the fix |
+| G4 | read-only agents | `agent.spawn` (tag) + `tool.call` (deny) | the call's `agentId` was tagged read-only, and the call is Edit, Write, NotebookEdit, a Gortex or Serena write tool, or (R1, widened) Bash running a git write: `commit`, `reset`, `restore`, `switch`, `merge`, `rebase`, `cherry-pick`, `revert`, `am`, `apply`, `add`, `rm`, `mv`, `pull`; `stash` but `list`/`show`; `checkout` with a pathspec (`.`, after `--`, a second positional) or `--force`/`--patch`; `clean` but `-n`; `branch`/`tag` but their list forms. `status`, `diff`, `log`, `show`, `blame`, `fetch`, `checkout <branch>` stay allowed |
 | G5 | Fable spawn | `agent.spawn` | `e.model` names a Fable model (`/fable/i`) |
 | G6 | `--no-verify` | `tool.call` Bash | `git … commit` with `--no-verify` or `-n` (also inside a short-flag cluster such as `-an`), unless a later `--verify` cancels it |
 
-**G1 table** (from the Cargo manifests and gated test files, verified claims 8-9, 11-12):
+**G1 table** (from the Cargo manifests and gated test files, verified claims 8-9, 12, 23; R1
+replaced the original table, which claim 11 had made wrong):
 
-| Selection | Needs one of |
+| Selection | Refused unless |
 |---|---|
-| `-p htui` / `--package htui` / `--manifest-path crates/htui/Cargo.toml` | `--all-features`, `testkit`, `htui/testkit` |
-| `-p htui-agent` / `htui-core` / `htui-store` (Q1) | `--all-features`, `test-support`, `<crate>/test-support` |
-| `--workspace` / `--all` / no package selection (virtual root = every member) | `--all-features`, or both `htui/testkit` and `test-support` (the probe showed `--workspace --features testkit` silently skips every `test-support`-gated file) |
+| includes `htui` (`-p htui`, `--manifest-path crates/htui/Cargo.toml`, `--workspace` / `--all` / no package selection: virtual root = every member) | `htui` gets `testkit` (`--all-features`, `testkit`, `htui/testkit`); its dev-dependencies turn on agent/core/store `test-support` |
+| `-p htui-agent` / `htui-core` (Q1) with none of htui, orch, worker, mcp selected (store's dev-dependencies cover core only) | that crate gets `test-support` (`--all-features`, `test-support`, `<crate>/test-support`, or a forward such as `htui-agent/test-support` → core) |
+| `-p htui-store` (Q1) | never: store's own dev-dependency on itself turns `test-support` (and `demo`) on |
 
 Integration tests are out of scope, and G1 allows the run, when the only target selectors are `--lib`,
 `--bin(s)`, `--doc` or `--example(s)`. `--tests`, `--test <name>`, `--all-targets`, or no selector at
@@ -204,9 +205,9 @@ Not gated by cargo until TOOL-9 wires `validate`/`test` for `.claude/skills/htui
 | 6. The test kit raises `tool.call`/`agent.spawn` and returns a hook's deny | Verified (scratch probe) | `claude plugin test` 1 pass with a `{ result }` bottom for Bash |
 | 7. The literal scan covers `crates/**/*.{rs,json}` minus `target/` and its own file, case-sensitive | Verified | `crates/htui-agent/tests/extensibility.rs` `tree_files`, `the_codebase_has_never_heard_of_zeta` (the doc comment says src/tests/seeds; the code recurses all of `crates/`) |
 | 8. Only `htui` calls it `testkit`; agent/core/orch/store/worker `test-support`; mcp/secrets neither | Verified | `crates/*/Cargo.toml` `[features]` |
-| 9. Feature-gated test files: htui 41 `testkit`; agent 6, core 8, store 3 `test-support` | Verified | `#![cfg(feature = …)]` grep over `crates/*/tests` |
+| 9. Feature-gated test files: htui 41 `testkit`; agent 6, core 8, store 3 `test-support` | **Corrected in R1**: htui 43 `testkit`; agent 4, core 8 `test-support`; store 3 `test-support` + 5 `demo` | `#![cfg(…)]` lines over `crates/*/tests/*.rs` and `*/main.rs` (htui: 39 plain, 2 beside a separate `#![cfg(unix)]`, 2 as `all(…)`) |
 | 10. `-p <test-support crate> --features testkit` is vacuous | **Falsified**: cargo errors "does not contain this feature" | scratch workspace probe (cargo, resolver 3) |
-| 11. `--workspace --features testkit` covers the workspace | **Falsified**: test-support-gated files run 0 tests, exit 0 | scratch workspace probe |
+| 11. `--workspace --features testkit` covers the workspace | **Falsified in this repo: dev-dependency enables** (R1). The original "falsified" came from a scratch workspace without them; here the run is real | `cargo tree --workspace -e features,normal,dev` shows agent/core/store `test-support` on with no flags; see claim 23 |
 | 12. Root manifest is virtual; bare `cargo test` = every member | Verified | `Cargo.toml` has `[workspace]` only |
 | 13. Verifier prompts mark read-only as `READ-ONLY` / "STRICTLY no edits, no commits" | Verified | memory `ultracode-scoped-to-implementers` (MOD-12 M3) |
 | 14. `git commit -n` = `--no-verify`; `--verify` is its opposite | Verified | `git commit -h` |
@@ -218,3 +219,4 @@ Not gated by cargo until TOOL-9 wires `validate`/`test` for `.claude/skills/htui
 | 21. Live smoke (post-implementation): G6, G1, G3 refuse in a real `-p` session with their corrective texts | Verified live | scratch checkout, haiku: `--no-verify` commit refused (no commit made), `cargo test -p htui` refused, Write of the literal under `crates/` refused (file unchanged) |
 | 22. Live smoke: a `READ-ONLY` subagent's Write is refused, its `git status` runs | Verified live | "agent a6e0… was started read-only and may not change files (Write)"; `notes.txt` absent |
 | 16. Tasks independent | No: all share `register.ts`/`guards.ts` | serial, one implementer |
+| 23. (R1) cargo turns test features on through the selected crates' dependencies and forwarding, unified over the selection | Verified | `[dev-dependencies]`: htui → agent, orch, worker, store `test-support`; orch → core, agent; worker and mcp → core, agent, orch, store; store → core and itself. `[features]`: `htui/testkit` → store; agent → core; orch → core, agent; core → `demo`; store → `demo`. `cargo tree -p <sel> -e features,normal,dev`: `-p htui-store` has store `test-support`; `-p htui-agent` has none; `-p htui-agent -p htui-orch` has agent `test-support` |
