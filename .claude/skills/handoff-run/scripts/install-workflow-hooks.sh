@@ -19,6 +19,11 @@
 #   post-commit (workspace only, prepended before foreign blocks): commit touching
 #               surface source -> run sync-workflow-surface.sh + refresh hooks.
 #
+# core.hooksPath (TOOL-9): for the workspace, also points core.hooksPath at scripts/githooks
+#   (when that directory ships a pre-commit) and drops its own pre-commit block, since the
+#   committed hook runs the validator and then chains to whatever .git/hooks holds. The
+#   post-commit sync block stays in .git/hooks and is reached through that chain.
+#
 # Escape hatch (printed on block): WORKFLOW_SKIP_HOOK=1. Deliberately NOT --no-verify: a
 # separate PreToolUse hook hard-blocks that flag for agent sessions, so advertising it
 # would be dead advice - and after the --scope-paths change an unrelated commit needs
@@ -317,13 +322,81 @@ install_workflow_hooks() {
         else
             new_pre_commit_block "$is_subrepo"
         fi
-        set_marker_block "$hooks_dir/pre-commit" 1
+        if [[ "${TARGET_IS_WORKSPACE[i]}" -eq 1 ]] && committed_hooks_active "${TARGET_ROOTS[i]}"; then
+            # scripts/githooks/pre-commit does this job and chains to the rest; two copies
+            # would run the validator twice.
+            remove_marker_block "$hooks_dir/pre-commit"
+        else
+            set_marker_block "$hooks_dir/pre-commit" 1
+        fi
         if [[ "${TARGET_IS_WORKSPACE[i]}" -eq 1 ]]; then
             new_post_commit_block
             set_marker_block "$hooks_dir/post-commit" 1
         fi
         [[ "$quiet" -eq 1 ]] || echo "Installed workflow hooks -> ${TARGET_NAMES[i]}"
     done
+}
+
+HOOKS_PATH_VALUE='scripts/githooks'
+
+remove_marker_block() {
+    # $1=hook_path. Drops our '# workflow-hook-start/end' block (markers included) and leaves
+    # every other line, foreign blocks included, as it was. No block or no file: nothing done.
+    local hook_path="$1" i start=-1 end=-1
+    [[ -s "$hook_path" ]] || return 0
+    convert_to_lf_lines "$hook_path"
+    local -a lines=("${LF_LINES[@]}")
+    for ((i = 0; i < ${#lines[@]}; i++)); do
+        if [[ "$(trim "${lines[i]}")" == "$START_MARKER" ]]; then start=$i; break; fi
+    done
+    [[ $start -ge 0 ]] || return 0
+    for ((i = start + 1; i < ${#lines[@]}; i++)); do
+        if [[ "$(trim "${lines[i]}")" == "$END_MARKER" ]]; then end=$i; break; fi
+    done
+    if [[ $end -lt 0 ]]; then
+        echo "corrupted workflow-hook block in ${hook_path}: start marker without matching end - fix by hand" >&2
+        exit 1
+    fi
+    local -a pre=() post=()
+    [[ $start -gt 0 ]] && pre=("${lines[@]:0:start}")
+    [[ $((end + 1)) -lt ${#lines[@]} ]] && post=("${lines[@]:$((end + 1))}")
+    printf '%s\n' "${pre[@]}" "${post[@]}" > "$hook_path"
+    chmod +x "$hook_path"
+}
+
+set_hooks_path() {
+    # $1=root. Points core.hooksPath at the committed hooks (TOOL-9). Relative, so it resolves
+    # in the main checkout and in every linked worktree. A repo without the committed hooks is
+    # left alone: a hooksPath to nowhere would switch off every hook it has.
+    local root="$1"
+    [[ -x "$root/$HOOKS_PATH_VALUE/pre-commit" ]] || return 0
+    [[ "$(git -C "$root" config --local --get core.hooksPath 2>/dev/null)" == "$HOOKS_PATH_VALUE" ]] \
+        || {
+            git -C "$root" config --local core.hooksPath "$HOOKS_PATH_VALUE"
+            warn_unchained_hooks "$root"
+        }
+}
+
+warn_unchained_hooks() {
+    # core.hooksPath replaces .git/hooks, and the committed hooks chain only pre-commit and
+    # post-commit. Any other hook the clone keeps there would silently stop running.
+    local dir="$1/.git/hooks" f n others=()
+    [[ -d "$dir" ]] || return 0
+    for f in "$dir"/*; do
+        [[ -f "$f" ]] || continue
+        n="$(basename "$f")"
+        case "$n" in *.sample|pre-commit|post-commit) continue ;; esac
+        others+=("$n")
+    done
+    if [[ ${#others[@]} -gt 0 ]]; then
+        echo "warning: core.hooksPath now bypasses .git/hooks/{${others[*]}} - only pre-commit and post-commit are chained"
+    fi
+}
+
+committed_hooks_active() {
+    # $1=root. True when the committed pre-commit hook is the one git runs here.
+    [[ -x "$1/$HOOKS_PATH_VALUE/pre-commit" \
+        && "$(git -C "$1" config --local --get core.hooksPath 2>/dev/null)" == "$HOOKS_PATH_VALUE" ]]
 }
 
 # ---- self-test ----
@@ -580,10 +653,65 @@ run_self_test() {
     local rc13=$?
     [[ $rc13 -eq 2 ]] || failures+=("case13: required missing target exited $rc13, expected 2")
 
+    # Case 14-16: committed hooks (TOOL-9). Fixture: a repo carrying real copies of
+    # scripts/githooks, one foreign pre-commit block in .git/hooks, and our old block.
+    local src14 ws14 own14 foreign14
+    src14="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)/scripts/githooks"
+    ws14="$tmp/case14/workspace"
+    mkdir -p "$ws14/scripts" "$ws14/.claude/skills/handoff-run/scripts"
+    git init -q "$ws14"
+    cp -r "$src14" "$ws14/scripts/githooks"
+    own14="$ws14/.git/hooks/pre-commit"
+    { printf '%s\n' '#!/bin/sh'; printf '%s\n' "${foreign_block[@]}"; } > "$own14"
+    new_pre_commit_block 0
+    set_marker_block "$own14" 1
+    set_hooks_path "$ws14"
+    [[ "$(git -C "$ws14" config --local --get core.hooksPath)" == 'scripts/githooks' ]] \
+        || failures+=('case14: core.hooksPath not set')
+    get_hook_targets "$ws14" ""
+    install_workflow_hooks 1
+    foreign14="$(cat "$own14")"
+    case "$foreign14" in *"$START_MARKER"*) failures+=('case15: own pre-commit block survived next to the committed hook') ;; esac
+    case "$foreign14" in *"$foreign_joined"*) ;; *) failures+=('case15: foreign pre-commit block lost') ;; esac
+    local h14a
+    h14a="$(sha256_of "$own14")"
+    set_hooks_path "$ws14"
+    get_hook_targets "$ws14" ""
+    install_workflow_hooks 1
+    [[ "$(sha256_of "$own14")" == "$h14a" ]] || failures+=('case14: second install changed the hook')
+
+    # Case 16: the committed hook blocks a staged workflow doc that fails the validator, lets an
+    # unrelated commit through, and still reaches the clone's own hook (the foreign block here
+    # touches a marker file).
+    local ws16="$tmp/case16/workspace" marker16
+    mkdir -p "$ws16"
+    git init -q "$ws16"
+    git -C "$ws16" config user.email t@t && git -C "$ws16" config user.name t
+    mkdir -p "$ws16/scripts" "$ws16/.claude/skills/handoff-run/scripts"
+    cp -r "$src14" "$ws16/scripts/githooks"
+    cp "$(dirname "${BASH_SOURCE[0]}")"/*.sh "$ws16/.claude/skills/handoff-run/scripts/"
+    marker16="$ws16/foreign-ran"
+    printf '%s\n' '#!/bin/sh' "touch '$marker16'" > "$ws16/.git/hooks/pre-commit"
+    chmod +x "$ws16/.git/hooks/pre-commit"
+    git -C "$ws16" config core.hooksPath scripts/githooks
+    echo x > "$ws16/unrelated.txt"
+    git -C "$ws16" add unrelated.txt
+    git -C "$ws16" commit -q -m unrelated >/dev/null 2>&1 \
+        || failures+=('case16: an unrelated commit was blocked')
+    [[ -e "$marker16" ]] || failures+=('case16: the hook in .git/hooks was not chained')
+    # A HANDOFF.md must exist or the validator reports that instead (outside the staged files).
+    printf '# H\n\n## Open\n\n## Summary\n\n| Area | Open |\n|---|---|\n' > "$ws16/HANDOFF.md"
+    printf '# D\n- **[MOD-1](docs/decisions/mod/mod-1.md)** - missing write-up (done, 2026-01-01)\n' > "$ws16/DECISIONS.md"
+    git -C "$ws16" add DECISIONS.md HANDOFF.md
+    git -C "$ws16" commit -q -m docs >/dev/null 2>&1 \
+        && failures+=('case16: a staged DECISIONS.md with a dangling index line was committed')
+    WORKFLOW_SKIP_HOOK=1 git -C "$ws16" commit -q -m docs >/dev/null 2>&1 \
+        || failures+=('case16: WORKFLOW_SKIP_HOOK=1 did not let the commit through')
+
     rm -rf "$tmp"
 
     if [[ ${#failures[@]} -eq 0 ]]; then
-        echo 'Self-test: 13/13 cases PASS.'
+        echo 'Self-test: 16/16 cases PASS.'
         return 0
     fi
     echo "Self-test FAIL (${#failures[@]}):"
@@ -625,6 +753,10 @@ if [[ -z "$WORKSPACE_ROOT" || ! -d "$WORKSPACE_ROOT" ]]; then
     echo "WorkspaceRoot not found: $WORKSPACE_ROOT"
     exit 2
 fi
+
+# Before target resolution: a missing required target exits 2, and the workspace's own
+# hooksPath must not depend on a sub-repo this checkout does not have.
+set_hooks_path "$WORKSPACE_ROOT"
 
 # engine-template lives OUTSIDE the workspace tree (MOD-43) and is optional.
 TARGETS="engine ../engine-template?"

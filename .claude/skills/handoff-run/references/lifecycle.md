@@ -102,7 +102,10 @@ Ordered; do not interleave:
    commit hang instead of fail**) — but the hook blocks only on findings in the
    files that commit stages, so this manual whole-repo run is the one that must be green
    before the done-report. Pre-existing findings elsewhere show up in the hook output as
-   `[WARNING] ... (pre-existing ...)`. Human escape hatch: `WORKFLOW_SKIP_HOOK=1`.
+   `[WARNING] ... (pre-existing ...)`. Human escape hatch: `WORKFLOW_SKIP_HOOK=1`. In htui the
+   workspace hook is committed (`scripts/githooks/`, TOOL-9): the installer only sets
+   `core.hooksPath` to it, and it dispatches to `pre-commit.ps1` on Windows by itself. The full
+   gate is `scripts/gate.sh` / `scripts/gate.ps1`.
 
 ## P3 — Cross-repo pointers (rule 5 recap)
 
