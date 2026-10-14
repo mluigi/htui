@@ -124,6 +124,11 @@ test('a read-only agent may not write files', async ($, on) => {
     ['mcp__serena__safe_delete_symbol', { name_path_pattern: 'f', relative_path: 'src/a.rs' }],
     ['mcp__serena__delete_lines', { relative_path: 'src/a.rs', start_line: 1, end_line: 2 }],
     ['mcp__plugin_serena_serena__rename_symbol', { name_path: 'f', relative_path: 'src/a.rs', new_name: 'g' }],
+    ['mcp__serena__jet_brains_rename', { relative_path: 'src/a.rs', name_path: 'f', new_name: 'g' }],
+    ['mcp__serena__jet_brains_move', { relative_path: 'src/a.rs', name_path: 'f', target_relative_path: 'src/b.rs' }],
+    ['mcp__serena__jet_brains_safe_delete', { relative_path: 'src/a.rs', name_path: 'f' }],
+    ['mcp__serena__jet_brains_inline_symbol', { name_path: 'f', relative_path: 'src/a.rs' }],
+    ['mcp__serena__jetbrains_move', { relative_path: 'src/a.rs', target_relative_path: 'src/b' }],
   ]
   for (const [tool, input] of writes) {
     const r = (await call($, tool, input, 'agent-1')) as { deny?: string }

@@ -147,7 +147,9 @@ export const register: Register = on => {
   // The tools that write a file. Of Gortex's MCP tools (Q3): `edit_file`, `write_file`,
   // `edit_symbol`, `rename_symbol` and `batch_edit` by their schemas; `edit` and `refactor`, the
   // compact names, read the same way. Serena's write tools are configured machine-wide, so they
-  // reach this repo too. Either server may also come from a plugin (`mcp__plugin_<name>_<server>__`).
+  // reach this repo too; its optional JetBrains ones are `jet_brains_*` in Serena 2.0.0 (the
+  // shorter `jetbrains_*` is matched as well). `execute_shell_command` is left out: Serena's
+  // claude-code context excludes it, and it is no file write. Either server may also come from a plugin (`mcp__plugin_<name>_<server>__`).
   // The patterns are written in the matcher, so that `claude plugin validate` lists them.
   on(
     'tool.call',
@@ -157,7 +159,7 @@ export const register: Register = on => {
         'Write',
         'NotebookEdit',
         /^mcp__(plugin_[a-z0-9_-]+_)?gortex__(edit|edit_file|edit_symbol|batch_edit|rename_symbol|refactor|write_file)$/,
-        /^mcp__(plugin_[a-z0-9_-]+_)?serena__(create_text_file|replace_content|replace_in_files|replace_symbol_body|insert_after_symbol|insert_before_symbol|rename_symbol|safe_delete_symbol|replace_lines|insert_at_line|delete_lines)$/,
+        /^mcp__(plugin_[a-z0-9_-]+_)?serena__(create_text_file|replace_content|replace_in_files|replace_symbol_body|insert_after_symbol|insert_before_symbol|rename_symbol|safe_delete_symbol|replace_lines|insert_at_line|delete_lines|jet_?brains_(?:rename|move|safe_delete|inline_symbol))$/,
       ],
     },
     async ($, e, next) => {

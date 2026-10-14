@@ -72,6 +72,9 @@ test('each Serena write tool is checked, also under a plugin prefix', async ($, 
     ['mcp__serena__replace_lines', { relative_path: 'crates/htui/seeds/a.json', start_line: 1, end_line: 2, content: NAMED }],
     ['mcp__serena__insert_at_line', { relative_path: 'crates/htui/src/a.rs', line: 3, content: NAMED }],
     ['mcp__plugin_serena_serena__replace_content', { relative_path: 'crates/htui/src/a.rs', needle: 'x', repl: NAMED, mode: 'regex' }],
+    // Serena 2.0.0 names its JetBrains tools jet_brains_*; the shorter spelling is matched too.
+    ['mcp__serena__jet_brains_rename', { relative_path: 'crates/htui-core/src/a.rs', name_path: 'row', new_name: `${LIT}_row` }],
+    ['mcp__serena__jetbrains_rename', { relative_path: 'crates/htui-core/src/a.rs', name_path: 'row', new_name: `${LIT}_row` }],
     ['mcp__plugin_gortex_gortex__edit_file', { path: 'crates/htui/src/a.rs', old_string: 'x', new_string: NAMED }],
   ]
   const got = await verdicts($, on, calls)
