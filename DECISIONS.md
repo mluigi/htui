@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[TOOL-9](docs/decisions/tool/tool-9.md)** - Canonical gate script, committed git hooks, DECISIONS merge rule (done, 2026-10-14)
 - **[MOD-67](docs/decisions/mod/mod-67.md)** - Configurable hotkeys: named actions, `keys.toml`, generated hints (done, 2026-10-14)
 - **[MOD-96](docs/decisions/mod/mod-96.md)** - Settings-file permission rules and the permission mode in htui-driven sessions (done, 2026-10-13)
 - **[CLEAN-10](docs/decisions/clean/clean-10.md)** - `cargo doc` fails on private intra-doc links (done, 2026-10-13)
