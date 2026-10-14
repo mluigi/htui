@@ -148,7 +148,7 @@ retrying.
 ## Working in a run
 
 ```
-scripts/hr attach [ITEM] [--shell]
+scripts/hr attach [ITEM] [--shell] [--api-key]
 ```
 
 Starts the run's containers if `dev` is not running (after `down`, or a reboot), re-creating the
@@ -157,6 +157,14 @@ then opens
 `claude --dangerously-skip-permissions` in the clone, or a login shell with `--shell`. Detaching is
 just quitting `claude`; the containers keep running, and you can attach again, or from several
 terminals at once.
+
+`--api-key` bills the session to the Anthropic API instead of the shared `~/.claude` OAuth login:
+the host's `ANTHROPIC_API_KEY` is forwarded into the container by name (the value never lands on a
+command line), and `attach` exits `2` when it is not set. The key reaches everything the session
+starts, `--shell` included, and htui does not clear it from an agent's environment, so a `claude`
+or `claude-cli` agent row run inside such a session bills the API too, whatever its `billing`
+says (`docs/ANA-30.md` §2.3). Which credit it draws on — a plan's monthly API credit or a purchased
+one — is the Console's (`docs/ANA-30.md` §3.2).
 Inside, start the lifecycle as usual:
 
 ```

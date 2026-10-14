@@ -14,7 +14,13 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-14):** **CLEAN-12 is done** (`docs/decisions/clean/clean-12.md`): the committed
+**Current status (2026-10-14):** **ANA-30 is concluded** (`docs/ANA-30.md`, `docs/decisions/ana/ana-30.md`): no
+`utility_model` setting now (every compliant cheap-model use is single-digit dollars a month and has no surface yet);
+the $100 API credit is spent through a `per_token` registry row (data, no code), built into the first MOD that adds a
+second drafting surface. Spawned **MOD-97** (an inherited `ANTHROPIC_API_KEY` reroutes subscription rows to API
+billing) and **MOD-98** (opt-in `summary` phase); `R-ID-6` gained a one-line clarification and ANA-21 §5.7 a `haiku`
+amendment. Owed on the host: checking which credit the $100 is (Console), and one dev-database query for stored ACP
+`session_info_update` titles (`docs/ANA-30.md` §8 calls 2, 6). Before it, **CLEAN-12 is done** (`docs/decisions/clean/clean-12.md`): the committed
 `.claude/.headroom_wrap_settings.lock` and the 20 `.claude/skills/generated/` Gortex files are untracked and
 ignored (tool-owned, as `scripts/hr` already treated them); the installer headers name G6 as the `--no-verify`
 block. Before it, **TOOL-9 is done** (`docs/decisions/tool/tool-9.md`): `scripts/gate.sh` and
@@ -68,14 +74,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   single-agent step, a phase's `command_queue = always`, is settable only in Postgres (Settings ›
   Kinds shows it read-only). Options to weigh: a non-routing item label, exempting `heavy_build`
   from the box-tag match, or a phase/queue setting in the TUI.
-- [ ] **ANA-30 - Utility models: auxiliary cheap-model calls (session titles etc.)**. Survey every
-  place htui could use a small, cheap model for background work: session and item titles,
-  summaries, history digests, commit messages, judge or triage calls, and similar. Motivation: a
-  $100 Claude API credit is available and needs uses. Per use, record the call site, the model tier
-  (`docs/ANA-21.md`), the API route (direct Claude API vs the `claude` CLI that htui wraps), an
-  estimated token cost, and the trigger. Then budget the uses against the credit and decide
-  whether a `utility_model` setting is worth building. A MOD is spawned only if the verdict says
-  yes. Not blocked.
 
 ### Next features
 - [ ] **MOD-36 - Weighted agent assignment across fan-out candidates** (from MOD-4 milestone 4,
@@ -104,6 +102,9 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   implement axis, `epoch-eci` is narrowed to `eci_scores.csv`, `tbench-4-0` stays blocked. Each
   dynamic source needs a parser under the fetch conditions of §6 (Arena from Hugging Face only, with
   a per-fetch licence check; Epoch keyed on `benchmark_metadata.csv`, never `*_external.csv`).
+  **ANA-30 note (2026-10-14, `docs/decisions/ana/ana-30.md`):** the `haiku` alias now runs Haiku 5.5;
+  seed the `claude`/`claude-cli` map with `claude-haiku-5-5` unscored (resolving through `*`) and no
+  `haiku` key at 25 (`docs/ANA-21.md` §5.7 amendment).
 - [ ] **MOD-27 - Swarm RunKind & task MCP Tool (from ANA-13).** Add `RunKind::Swarm` to `htui-orch`, implement `spawn_subagent` MCP tool with JSON schema validation and isolated worktrees. `htui-orch`, its `Isolator` seam and `run_worker.rs` exist since MOD-4 (done, `docs/decisions/mod/mod-4.md`); the MCP half needs MOD-11.
   The named personas a `handoff` targets exist since MOD-26 (done, `docs/decisions/mod/mod-26.md`):
   `persona` registry rows, bound per phase, frozen into the run snapshot by name.
@@ -376,6 +377,30 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   option, pressed by a person; no mod or agent answers on its own. **Blocked on a maintainer
   decision** (`docs/ANA-29.md` §12 Q2); MOD-92 is done (`docs/htui-cli.md`, its envelope and exit
   codes are the model for `permission list --json`); MOD-93 is done (`docs/decisions/mod/mod-93.md`), so the pane the buttons go in exists.
+- [ ] **MOD-97 - Strip inherited vendor API keys from subscription-billed agent spawns** (from
+  ANA-30, `docs/ANA-30.md` §2.3, §8 call 7). `R-AGT-7`, `R-AGT-9`, `R-SEC-2`. `spawn_supervised`
+  builds every agent child with `.envs(&launch.env)` and no `env_clear`
+  (`crates/htui-agent/src/launch.rs:1184-1199`), and Claude Code always uses `ANTHROPIC_API_KEY` in
+  `-p` mode when present. So an `htui` started where the key is exported (`hr attach --api-key` or
+  `--shell`, `docs/hr-sandbox.md`), or a project secret of that name (`SessionSpec.env`,
+  `driver.rs:283-284`), moves every `claude`/`claude-cli` run onto API billing while the row still
+  says `subscription`: the quota latch watches the wrong thing and no per-token cap applies. Remove
+  vendor auth variables (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`; which ones is the row's data,
+  not a vendor name in code, `R-AGT-5`) from a `billing = subscription` row's spawn, or refuse the
+  spawn naming the variable; settle which in the plan. Also in scope: Claude Code says `--bare` will
+  become the `-p` default, which would stop the seeded `claude-cli` row (D92, no `--bare`) using the
+  subscription login (`docs/ANA-30.md` §2.3); pin the behaviour with a test or an explicit flag. Not
+  blocked.
+- [ ] **MOD-98 - Opt-in `summary` phase on a cheap row to fill upstream summaries** (from ANA-30,
+  `docs/ANA-30.md` §4 U5, §8 call 5). `R-PRM-1`, `R-ORCH-1`, `R-ID-6`. Upstream prompts read the
+  latest `document.kind = 'summary'` (`pg/read.rs:588`), whose only writer is close-out's
+  deterministic commit table (`htui-orch/src/closeout.rs:66-121`), so readers get no prose. Add an
+  opt-in `summary` phase to the default step graphs (which ones, and whether "opt-in" is a seeded
+  disabled phase or a documented recipe, is the plan's to settle): ordinary item work on a registry
+  row, recorded as a `run_step`, writing the `summary` document. Sonnet 5.5 by default for quality
+  (~$0.12 per item), Haiku 5.5 where cost matters. A model never goes inside close-out (ANA-2
+  invariant 3) or prompt assembly (ANA-5 invariant 7). No `utility_model` setting (ANA-30 §7).
+  Not blocked.
 
 ### Deferred backlog
 
@@ -433,7 +458,7 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 3 (ANA-25 learned weights, ANA-28 heavy_build routing, ANA-30 utility models) |
-| MOD-N   | 18 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
+| MOD-N   | 20 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 2 (TOOL-8 `htui-dev` mod, TOOL-10 sandbox mod hardening) |

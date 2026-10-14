@@ -76,7 +76,9 @@ conflict. Their verdicts survive only where restated here.
   every skill text and inlines them into the initial prompt, so behavior is identical on every box
   and agents never spend turns reading instruction files.
 - **R-ID-6 (must).** No LLM agent is ever in a sync, cache, import or bookkeeping path. Those are
-  deterministic code.
+  deterministic code. Outside it (ANA-30, 2026-10-14): a display-only label a model derives, and a
+  draft a person accepts or edits before it is saved, as long as no status transition, link,
+  import, cache refresh or prompt ever reads the unaccepted model text.
 - **R-ID-7 (must).** Any transcript or tool output is scrubbed of secrets on the host box before it
   is persisted or transmitted. Scrubbing fails closed.
 
