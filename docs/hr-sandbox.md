@@ -441,9 +441,11 @@ runs rather than letting them pile up.
 | this repo | `/host/htui` | read-only, the clone's `origin` |
 | `~/.local/bin`, `~/.local/share/mise/installs`, `~/.local/share/uv/python`, `~/.local/share/uv/tools` (claude, gortex, graphify, headroom, uv) | same paths | read-only; nothing else of `~/.local` |
 | `/etc/localtime` | same path | read-only; the run shows the host's local time (the image has no `tzdata`, so `TZ` alone would mean UTC). A run already up picks it up after `down` + `up` |
-| `~/.claude` (login, settings, plugins, skills, agents, commands) | same path | read-write, shared by all runs, except what the next rows mask |
+| `~/.claude` (login, settings, agents, commands) | same path | read-write, shared by all runs, except what the next rows mask |
+| `~/.claude/plugins`, `~/.claude/skills` | same paths | **read-only**: a plugin, or a `skills/<x>/.claude-plugin` mod, that a run wrote would run in process in your next host session. Install and update plugins on the host |
+| `~/.claude/plugins/data`, `~/.claude/plugins/store` | same paths | read-write, shared: plugin state (`${CLAUDE_PLUGIN_DATA}`, `$.store` files) |
 | `~/.claude/projects/-home-mluigi-projects-htui` (this project's auto-memory and sessions) | same path | read-write, shared |
-| the rest of `~/.claude/projects`, and `file-history`, `paste-cache`, `shell-snapshots`, `session-env`, `session-data`, `sessions`, `daemon`, `jobs`, `backups`, `metrics`, `.remember` in `~/.claude` | an empty `tmpfs` each (256 MB for `projects`, 128 MB `file-history`, 64 MB `paste-cache`, 16 MB the rest) | per container, gone when it stops |
+| the rest of `~/.claude/projects`, and `file-history`, `paste-cache`, `shell-snapshots`, `session-env`, `session-data`, `sessions`, `daemon`, `jobs`, `backups`, `metrics`, `.remember`, `dev-mods` in `~/.claude` | an empty `tmpfs` each (256 MB for `projects`, 128 MB `file-history`, 64 MB `paste-cache`, 16 MB the rest) | per container, gone when it stops |
 | `~/.claude/history.jsonl`, `bash-commands.log`, `cost-tracker.log`, `security/log.txt` | an empty file each, from `claude-mask/` in the run directory | per run |
 | `~/.claude.json` | a private copy | changes inside do not flow back |
 | `~/.gortex` config, instructions, models | same path | read-only |
@@ -534,7 +536,7 @@ read-write:
 
 | Shared read-write | What a hostile run can do with it |
 |---|---|
-| `~/.claude` — by design, so runs have your login, settings, plugins, skills, agents and commands | add hooks or settings that execute in your next host Claude session; read or use the login (`.credentials.json`) |
+| `~/.claude` — by design, so runs have your login, settings, agents and commands (`plugins` and `skills` are read-only, `dev-mods` is masked) | add hooks or settings that execute in your next host Claude session, including `enabledPlugins` and a directory marketplace in `settings.json` that points at another shared path; read or use the login (`.credentials.json`) |
 | `~/.claude/projects/-home-mluigi-projects-htui` | read this project's host session transcripts; change its auto-memory, which your next host session loads |
 | `~/.cache/uv` | plant packages that `uvx` runs on the host |
 | `~/.headroom`, `~/.serena` | change the state and configuration your host headroom and serena read. A `--headroom` run's own proxy does not write to `~/.headroom` (its state is in the container), but the host's hooks and CLI still read it |
@@ -555,6 +557,7 @@ What stays protected:
 - the run registry: host-only (`HR_RUNS`) and validated on every read, so a run cannot change what
   `attach` mounts or what `down -v` removes; an old registry in `$HR_STATE/runs` is imported once,
   and never again;
+- your plugins and skills: read-only in a run, so a run cannot install a plugin or write a mod that the host would load in process. `dev-mods` (mods Claude writes in a session, which a host `--resume` of the run's session would load) is an empty `tmpfs`;
 - the rest of `~/.claude`: other projects' transcripts and memory, `file-history`, `paste-cache`,
   `shell-snapshots`, `session-env`, `session-data`, the host's live `sessions`, the Claude
   `daemon`'s control key, `jobs`, `backups` of `~/.claude.json`, `metrics`, `.remember`, your
@@ -574,6 +577,14 @@ What to do about it:
 
 Known residuals:
 
+- `settings.json`, `agents/`, `commands/` and `hooks/` in `~/.claude` stay read-write: a run can still add a
+  settings hook, enable a plugin or a directory marketplace, or plant an agent or command. Read-only
+  `plugins` and `skills` close the direct routes for a mod only (TOOL-10).
+- `plugins/data` stays read-write. It is empty for the plugins installed today; a plugin that puts code
+  there (a venv) would make it a route too.
+- With read-only `plugins/` Claude cannot write its `.orphaned_at` markers into the plugin cache; it logs
+  that at debug level and starts as usual (probed on a scratch config). A plugin install or update fails in
+  a run: do it on the host.
 - Per-session plugin state in `~/.claude` stays shared, by choice:
   `security_warnings_state_<session id>.json` (and its `.lock`, at the top and in `security/`) and
   the `.caveman-*` files

@@ -177,8 +177,12 @@ claude_project_of() { local LC_ALL=C p="$1"; printf '%s' "${p//[^a-zA-Z0-9]/-}";
 
 # The ~/.claude entries every run masks (re-review M-C): tmpfs dirs, per-run empty files.
 HR_CLAUDE_MASK_DIRS=(projects file-history paste-cache shell-snapshots session-env session-data sessions
-    jobs daemon backups metrics .remember)
+    jobs daemon backups metrics .remember dev-mods)
 HR_CLAUDE_MASK_FILES=(history.jsonl bash-commands.log cost-tracker.log security/log.txt)
+# TOOL-10: what a run may not write (read-only binds), and the state dirs bound back read-write
+# beneath the first of them (plugins/data = CLAUDE_PLUGIN_DATA, plugins/store = $.store).
+HR_CLAUDE_RO_DIRS=(plugins skills)
+HR_CLAUDE_RW_UNDER_RO=(plugins/data plugins/store)
 # The size compose.hr.yaml gives each of those tmpfs mounts, in bytes (none may default to half the RAM).
 declare -gA HR_CLAUDE_TMPFS_SIZE=([projects]=268435456 [file-history]=134217728 [paste-cache]=67108864)
 for _d in "${HR_CLAUDE_MASK_DIRS[@]}"; do : "${HR_CLAUDE_TMPFS_SIZE[$_d]:=16777216}"; done

@@ -482,8 +482,12 @@ LOCAL_MOUNTS=("$HOME/.local/bin" "$HOME/.local/share/mise/installs" "$HOME/.loca
 # paths relative to ~/.claude (security/log.txt: the security plugin's log of every project; its
 # agent-sdk-venv beside it stays shared).
 CLAUDE_MASK_DIRS=(projects file-history paste-cache shell-snapshots session-env session-data sessions
-    jobs daemon backups metrics .remember)
+    jobs daemon backups metrics .remember dev-mods)
 CLAUDE_MASK_FILES=(history.jsonl bash-commands.log cost-tracker.log security/log.txt)
+# Read-only in a run (TOOL-10: a plugin written there would run in the host's next session), and the
+# state dirs bound back read-write beneath the first. Mount points only: nothing here is masked.
+CLAUDE_RO_DIRS=(plugins skills)
+CLAUDE_RW_UNDER_RO=(plugins/data plugins/store)
 
 # claude_project NAME_VAR — Claude Code's ~/.claude/projects/<name> for HOST (every character
 # outside [A-Za-z0-9] becomes '-'; longer names than 200 get a hash suffix, not reproduced here).
@@ -499,7 +503,9 @@ claude_project() {
 prepare_claude_mounts() {
     local rd="$1" c="$HOME/.claude" d f
     mkdir -p "$c/projects/$HR_CLAUDE_PROJECT" || return 1
-    for d in "${CLAUDE_MASK_DIRS[@]}"; do mkdir -p "$c/$d" || return 1; done
+    for d in "${CLAUDE_MASK_DIRS[@]}" "${CLAUDE_RO_DIRS[@]}" "${CLAUDE_RW_UNDER_RO[@]}"; do
+        mkdir -p "$c/$d" || return 1
+    done
     for f in "${CLAUDE_MASK_FILES[@]}"; do
         [[ -e "$c/$f" || -L "$c/$f" ]] || { mkdir -p "$(dirname -- "$c/$f")" && (umask 077 && : >"$c/$f"); } \
             || return 1
