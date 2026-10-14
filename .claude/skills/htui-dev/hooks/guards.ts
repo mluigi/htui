@@ -129,6 +129,8 @@ type CargoTest = {
   inScope: boolean
   /** Where the test binary's own arguments start (`--`), or the words' length. */
   dashDash: number
+  /** Whether `--workspace`/`--all` or `--manifest-path` says where to test, whatever the working directory. */
+  located: boolean
 }
 
 /**
@@ -179,6 +181,7 @@ function parseCargoTest(words: Words): CargoTest | null {
     allFeatures: false,
     inScope: true,
     dashDash: words.length,
+    located: false,
   }
   let workspace = false
   let selectors = 0
@@ -230,9 +233,11 @@ function parseCargoTest(words: Words): CargoTest | null {
       const [v, n] = valueOf(i, '--manifest-path')
       const pkg = v === undefined ? null : manifestPackage(v)
       if (pkg !== null) packages.push(pkg)
+      got.located = true
       i += n
     } else if (w === '--workspace' || w === '--all') {
       workspace = true
+      got.located = true
       i++
     } else if (isOpt(w, '--exclude')) {
       const [v, n] = valueOf(i, '--exclude')
@@ -349,11 +354,54 @@ function vacuousRun(t: CargoTest): string | null {
   return `htui-dev: \`${quoteWords(t.words)}\` builds ${tests} without ${listed(features.map(f => `\`${f}\``))}, so they run 0 tests and pass — run: ${fix}${single ? '' : ' (or --all-features)'}`
 }
 
-/** G1 and G2 over one simple command: G2 first (its text is the more precise), then G1. */
-export function cargoTest(words: Words): string | null {
+/**
+ * G1 and G2 over one simple command run in `cwd` (see `movedTo`): G2 first (its text is the more
+ * precise), then G1. In a member's folder a `cargo test` that names no package, workspace or
+ * manifest tests that member, as cargo finds its manifest first.
+ */
+export function cargoTest(words: Words, cwd: Cwd = []): string | null {
   const t = parseCargoTest(words)
   if (t === null) return null
+  const member = memberAt(cwd)
+  if (member !== null && t.packages === null && !t.located) t.packages = [member]
   return wrongFeature(t) ?? vacuousRun(t)
+}
+
+// --- The working directory a line moves to (G1) ------------------------------------------------
+
+/**
+ * The working directory, as far as the Bash line has told: its folders, relative to where the line
+ * started (or from `/` after an absolute `cd`); [] for where it started, and for a place the line does
+ * not tell. The session's own directory is not known, and read as no member's.
+ */
+export type Cwd = readonly string[]
+
+/** The member whose folder `cwd` is in: the folder after a `crates` folder, when it names a member (cargo looks for the manifest from any folder below it). */
+function memberAt(cwd: Cwd): string | null {
+  for (let i = cwd.length - 2; i >= 0; i--) {
+    if (cwd[i] === 'crates' && (MEMBERS as readonly string[]).includes(cwd[i + 1]!)) return cwd[i + 1]!
+  }
+  return null
+}
+
+/**
+ * The working directory after the simple command `words`, run in `cwd`: a `cd` or `pushd` to a path
+ * joins it onto `cwd` (an absolute one replaces it), `.` and `..` resolved. `cd` alone, `cd -`, `~`,
+ * a `$VAR`, `pushd` with no folder or with `+N`/`-N`, and `popd` go where the line does not tell: [].
+ * `pushd -n` and any other command leave `cwd` as it is.
+ */
+export function movedTo(words: Words, cwd: Cwd): Cwd {
+  const program = words[0]
+  if (program === 'popd') return []
+  if (program !== 'cd' && program !== 'pushd') return cwd
+  let at = 1
+  for (; at < words.length && /^-[LPe@n]+$/.test(words[at]!); at++) {
+    if (program === 'pushd' && words[at]!.includes('n')) return cwd
+  }
+  if (words[at] === '--') at++
+  const dir = words[at]
+  if (dir === undefined || /^[-+~]/.test(dir) || /[$`]/.test(dir)) return []
+  return segmentsOf(dir.startsWith('/') ? dir : [...cwd, dir].join('/'))
 }
 
 // --- G6 and G4's Bash half: git ---------------------------------------------------------------

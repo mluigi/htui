@@ -16,11 +16,13 @@ import type { HtuiDevReadOnly, HtuiDevReadOnlyCalls } from '../types'
 import {
   cargoTest,
   coarseGitWrite,
+  type Cwd,
   declaresReadOnly,
   fableModel,
   forbiddenLiteral,
   gitWrite,
   isFable,
+  movedTo,
   noVerify,
   readOnlyEdit,
   readOnlyGit,
@@ -123,6 +125,8 @@ export const register: Register = on => {
         : null
       return reason !== null ? { deny: reason } : next(e)
     }
+    // A `cd crates/<member>` earlier in the line makes a bare `cargo test` select that member.
+    let cwd: Cwd = []
     for (const words of cmds) {
       const reason =
         (tagged
@@ -132,8 +136,13 @@ export const register: Register = on => {
             })
           : null) ??
         judge($, 'no-verify', 'call', () => noVerify(words)) ??
-        judge($, 'cargo test', 'call', () => cargoTest(words))
+        judge($, 'cargo test', 'call', () => cargoTest(words, cwd))
       if (reason !== null) return { deny: reason }
+      try {
+        cwd = movedTo(words, cwd)
+      } catch {
+        cwd = []
+      }
     }
     return next(e)
   }).catch(($, e, next) => {

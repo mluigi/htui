@@ -86,6 +86,53 @@ test("a selected crate's dependencies turn the gate on", async ($, on) => {
   ])
 })
 
+test('a cd into a member earlier in the line makes a bare cargo test select it', async ($, on) => {
+  const refused = [
+    'cd crates/htui && cargo test',
+    'cd crates/htui-agent && cargo test',
+    'cd /r/crates/htui-core/src && cargo test',
+    'pushd crates/htui-agent && cargo test',
+    'cd crates/htui/ ; cargo test --test app',
+    'cd crates && cd htui-core && cargo test',
+    'cd crates/htui-store && cd ../htui-agent && cargo test',
+    'cd crates/htui-agent && cargo test --features testkit',
+  ]
+  const allowed = [
+    'cd crates/htui-store && cargo test',
+    'cd crates/htui-agent && cargo test --features test-support',
+    'cd crates/htui-orch && cargo test',
+    'cd crates/htui-mcp/tests && cargo test',
+    'cd /home/me/htui/crates/htui-store/ && cargo test',
+    'cd crates/htui-agent && cargo test -p htui-store',
+    'cd -P crates/htui-secrets && cargo test',
+    'cd crates/htui-store\ncargo test',
+  ]
+  const got = await verdicts($, on, [...refused, ...allowed])
+  refused.forEach((c, i) => expect(got[i], c).toMatch(/^htui-dev: /))
+  allowed.forEach((c, i) => expect(got[refused.length + i], c).toBeUndefined())
+})
+
+test('a cd anywhere else, or one the line does not tell, selects no member', async ($, on) => {
+  await denies($, on, [
+    'cd crates/htui-store && cd ../.. && cargo test',
+    'cd crates/htui-store && cd - && cargo test',
+    'cd crates/htui-store && cd /tmp && cargo test',
+    'cd crates/htui-store && cd && cargo test',
+    'cd crates/htui-store && cd ~ && cargo test',
+    'cd crates/htui-store && cd $ROOT && cargo test',
+    'pushd crates/htui-store && popd && cargo test',
+    'cd crates/htui-store && cargo test --workspace',
+    'cargo test; cd crates/htui-store',
+  ])
+})
+
+test('the refusal after a cd names the member and its feature', async ($, on) => {
+  const got = await verdicts($, on, ['cd crates/htui-agent && cargo test'])
+  expect(got).toEqual([
+    "htui-dev: `cargo test` builds htui-agent's integration tests without `test-support`, so they run 0 tests and pass — run: cargo test --features test-support",
+  ])
+})
+
 test('a manifest outside a crates folder is the workspace root, whatever its folder is called', async ($, on) => {
   const got = await verdicts($, on, [
     'cargo test --manifest-path /r/.claude/worktrees/tool-8/Cargo.toml',
