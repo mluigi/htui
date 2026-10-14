@@ -15,6 +15,7 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { HtuiDevReadOnly } from '../types'
 import {
   cargoTest,
+  coarseGitWrite,
   declaresReadOnly,
   fableModel,
   forbiddenLiteral,
@@ -86,9 +87,18 @@ export const register: Register = on => {
     } catch {
       warn($, 'htui-dev: shell parser failed, call allowed')
     }
-    // A line the parser cannot follow is allowed, with no status: it is no failure of the guard.
-    if (cmds === null) return next(e)
     const tagged = await isTagged($, e.agentId, 'htui-dev: read-only guard failed, call allowed')
+    if (cmds === null) {
+      // A line the parser cannot follow is allowed, with no status: it is no failure of the guard.
+      // A read-only agent's still meets a coarse check for git writes.
+      const reason = tagged
+        ? judge($, 'read-only', 'call', () => {
+            const verb = coarseGitWrite(e.command)
+            return verb === null ? null : readOnlyGit(verb, e.agentId!)
+          })
+        : null
+      return reason !== null ? { deny: reason } : next(e)
+    }
     for (const words of cmds) {
       const reason =
         (tagged

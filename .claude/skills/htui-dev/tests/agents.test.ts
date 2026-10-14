@@ -124,6 +124,29 @@ test('a read-only agent may not change the tree, the index or history through gi
   expect(reached).toEqual([])
 })
 
+test('a line the parser cannot follow is still checked for git writes from a read-only agent', async ($, on) => {
+  const reached: Reached[] = []
+  tools(on, reached)
+  agents(on, [])
+  await spawn($, { prompt: 'READ-ONLY' })
+  const got: (string | undefined)[] = []
+  for (const command of [
+    'echo $((1<<2)); git commit -am x',
+    `echo 'unbalanced; git -C /r reset --hard`,
+    'echo $((1<<2)); git status; git stash list',
+  ]) {
+    got.push(((await bash($, command, 'agent-1')) as { deny?: string }).deny)
+  }
+  expect(got).toEqual([
+    'htui-dev: agent agent-1 was started read-only and may not run git commit — report what to change instead',
+    'htui-dev: agent agent-1 was started read-only and may not run git reset — report what to change instead',
+    undefined,
+  ])
+  // An untagged agent's unreadable line stays allowed.
+  await bash($, 'echo $((1<<2)); git commit -am x', 'agent-2')
+  expect(reached.map(r => r.agentId)).toEqual(['agent-1', 'agent-2'])
+})
+
 test('a read-only agent may read, check and inspect', async ($, on) => {
   const reached: Reached[] = []
   tools(on, reached)
