@@ -61,6 +61,8 @@ tokio      = { workspace = true, features = ["macros", "rt", "rt-multi-thread", 
 # Every repository the isolator's tests build is real and throwaway (plan D40); `tempfile = "3"`
 # is how the other four crates declare it (`crates/htui-core/Cargo.toml:31`).
 tempfile   = "3"
+# CLEAN-11: a capture layer, to pin how often and at what level `graph::project_settings` warns.
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true
