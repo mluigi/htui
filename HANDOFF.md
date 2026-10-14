@@ -14,7 +14,13 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-14):** **TOOL-8 is done** (`docs/decisions/tool/tool-8.md`): the `htui-dev` mod
+**Current status (2026-10-14):** a **requirements audit** found 69 of 90 `must` requirements fully met; the
+untracked gaps are filed as **MOD-99..106**, **ANA-31**, **ANA-32** and **TOOL-13**, and `R-NF-2`, `R-ORCH-6`,
+`R-ORCH-12` and `R-LATER-6` were amended (`docs/REQUIREMENTS.md` header). **MOD-99** (hard-coded Sentry DSN in a
+public repo) also owes key rotation and a history rewrite, after the live `hr` branches merge. **TOOL-14 is done**
+(`docs/decisions/tool/tool-14.md`): the gate's new `postgres` step reads `skipped` when `HTUI_TEST_DATABASE_URL` is
+unset, so a green no longer hides unexercised Postgres suites. Owed on the host: `gate.ps1 -SelfTest` on Windows.
+Before it, **TOOL-8 is done** (`docs/decisions/tool/tool-8.md`): the `htui-dev` mod
 (`.claude/skills/htui-dev/`, `docs/htui-dev.md`) refuses six kinds of costly call (M1), and keeps a status line in
 interactive sessions (item and HANDOFF phase, merge/ahead/dirty, disk above 90%, Postgres not up, last gate) with a
 toast when a gate finishes, plus turnless `/gate`, `/next` and `/validate` (M2); `scripts/dev-health.sh`/`.ps1` are
@@ -36,19 +42,16 @@ block. Before it, **TOOL-9 is done** (`docs/decisions/tool/tool-9.md`): `scripts
 migration numbering, the workflow validator, the `htui-dev` mod when present), detached on request, result in
 `target/gate/last.json`; the workspace pre-commit is committed in `scripts/githooks/` and the installers set
 `core.hooksPath`; `DECISIONS.md` merges by union. Owed on the host: a Windows run of the `.ps1` files (`pwsh` was
-not available in the sandbox) and the Postgres gate. Before it, **CLEAN-11 is done** (`docs/decisions/clean/clean-11.md`): the once-per-batch log
-levels are pinned by a capture test, the project-settings decode warn fires once per project edit, and a `null`
-`project.settings` is refused by `ProjectCaps::from_settings` as the writers refuse it. Owed on the host: the Postgres
-gate on the merged tree. Earlier completions (**MOD-67**, **MOD-96**, **CLEAN-10**, **MOD-93**, **MOD-89**, **MOD-95**, **TOOL-11**,
+not available in the sandbox) and the Postgres gate. Earlier completions (**CLEAN-11**, **MOD-67**, **MOD-96**, **CLEAN-10**, **MOD-93**, **MOD-89**, **MOD-95**, **TOOL-11**,
 **MOD-91**, **MOD-92**) are in `DECISIONS.md`; their host Postgres gates on the merged tree, the Windows runs
 and MOD-93's live install and `tsc` on the mod stay owed. Open from ANA-29: **MOD-94** behind a maintainer decision.
 Live coordinates after MOD-96: migrations run through `0018_seed_permission_mode` (MOD-96: data only, pins
 `acp.permission_mode` on the seeded `claude` row), before it `0017_follow_up` (`run_command.run_step_id`,
 `text`; `follow_up_window`; MOD-12's `0016_auto_queue`: `queue_entry`, `queue_batch`, `run.batch_id`), so **the next
-migration is `0019`** (cache: `0005`). MOD-37's `0014_run_step_opening` and MOD-11's queue migration both landed as
+migration is `0019`** (cache: through `0005_run_step_opening`, next `0006`). MOD-37's `0014_run_step_opening` and MOD-11's queue migration both landed as
 `0014`; MOD-11's was renumbered at the merge, and MOD-70's `0016` became `0017` at the merge with MOD-12. Pins: store
-conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15,
-`htui-orch` `CASES` re-pin from the merged tree; Postgres tables 45.
+conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
+`htui-orch` `CASES` 109 (`htui-orch/tests/fake_conformance.rs`); Postgres tables 45.
 ---
 
 ## Open items
@@ -81,6 +84,21 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   single-agent step, a phase's `command_queue = always`, is settable only in Postgres (Settings ›
   Kinds shows it read-only). Options to weigh: a non-routing item label, exempting `heavy_build`
   from the box-tag match, or a phase/queue setting in the TUI.
+- [ ] **ANA-31 - Can `agy` run with its own skills and context disabled** (from the 2026-10-14
+  requirements audit). `R-ID-5`, `R-AGT-5`. Isolation is wired only for Claude: the ACP `claudeCode`
+  meta (`crates/htui-agent/src/acp/mod.rs:1116`) and the `claude-cli` flags (`cli/mod.rs:258-272`,
+  MOD-91, MOD-96). `agy` ignores the meta (doc at `acp/mod.rs:1110`), so its own skills and context
+  files are never disabled, and a registry row's `settings.user_extensions` turns isolation off for
+  any agent. Establish what `agy` (and an ACP agent in general) offers to disable its own instruction
+  files, whether it can be expressed as row data (`R-AGT-5`), and whether `user_extensions` needs a
+  guard or an `R-ID-5` amendment.
+- [ ] **ANA-32 - Measure warm start against the one-second budget** (from the 2026-10-14
+  requirements audit). `R-STO-6`, `R-NF-3`. `R-STO-6` sets "under one second with a warm cache and a
+  reachable Postgres on the reference workstation"; MOD-6 (`docs/decisions/mod/mod-6.md:127`) said to
+  measure it and ANA-10 §12 criterion 13 keeps it as a recorded figure, but no figure, benchmark or
+  item exists. Define the measurement (process start to first interactive frame, cache refresh
+  excluded), record it on the reference workstation, and say whether a regression check belongs in
+  the gate.
 
 ### Next features
 - [ ] **MOD-36 - Weighted agent assignment across fan-out candidates** (from MOD-4 milestone 4,
@@ -408,6 +426,73 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   (~$0.12 per item), Haiku 5.5 where cost matters. A model never goes inside close-out (ANA-2
   invariant 3) or prompt assembly (ANA-5 invariant 7). No `utility_model` setting (ANA-30 §7).
   Not blocked.
+- [ ] **MOD-99 - Error-reporting endpoint from Settings; remove the hard-coded Sentry DSN** (from the
+  2026-10-14 requirements audit). `R-NF-2`, `R-ID-7`, `R-ID-2`, `R-TUI-8`, `R-STO-1`. `body` in
+  `crates/htui/src/main.rs:66-68` hard-codes a GlitchTip DSN and calls `sentry::init` on every start,
+  with no opt-out, and `lib.rs`'s `sentry_tracing::layer()` forwards error events and breadcrumbs that
+  never pass the `Scrubber` (`htui-core/src/scrub.rs`). The repository is public on GitHub. Make the
+  endpoint a Settings value (Settings tab, entered and cleared like the Postgres DSN, `R-TUI-8`): unset
+  means no client is built and nothing is sent; set means events and breadcrumbs pass the scrubber
+  first, failing closed (`R-ID-7`). Where it is stored is the plan's to settle: Sentry starts before the
+  store connects, so a store row needs a local copy or a late init, and a DSN with a key is a
+  credential for `R-STO-1`. Also remove the host from `docs/htui-worker.md:493`. **Retroactive
+  removal:** both DSNs ever committed (GlitchTip, and an older Bugsink one) are in commits `be47ad47`,
+  `bf42e75f` and `53826fcb`; rotate both keys first (the public mirror is the leak, a rewrite cannot
+  recall it), then rewrite history with `git filter-repo --replace-text` on every branch and force-push
+  `origin` and `github`, **after** the live `hr` sandbox branches (TOOL-8, ANA-30, TOOL-10 at the
+  audit) are merged or dropped. Maintainer decision 2026-10-14: file now, rewrite later. Not blocked.
+- [ ] **MOD-100 - Run-history retention sweep per project** (from the 2026-10-14 requirements
+  audit). `R-HIS-3`. `ProjectSettings.retention_days` (`htui-core/src/model/kind.rs:375`) is never
+  read: MOD-2's PRD and MOD-6 (`docs/decisions/mod/mod-6.md:89`, plan D14) deferred the sweep and no
+  item carried it. Add the setting to the Settings catalogue (`htui-core/src/prompt/settings.rs`) and
+  a deterministic sweep (`R-ID-6`) that deletes run-step event rows older than the window, keeping
+  run and step summaries and every document; `None` keeps everything (the default). Settle in the plan
+  which process runs it (TUI on connect, the worker, or both under one lock), and what the cache
+  (`R-STO-3`) does with rows it still holds. Not blocked.
+- [ ] **MOD-101 - Record the agent exit code on `run_step`** (from the 2026-10-14 requirements
+  audit). `R-ORCH-11`. Every engine `finish_step` passes `exit_code: None`
+  (`crates/htui-orch/src/engine.rs:1636`, `:2743`, `:3777`, `:4570`, `:5038`) and Postgres overwrites
+  the column (`htui-store/src/pg/write.rs:5341`), so `run_step.exit_code` is always NULL, though ANA-2
+  (`docs/ANA-2.md:551`) defines it as the agent process's exit code and MOD-4 claims `R-ORCH-11`.
+  Carry the child's exit status from the driver's `Done`/supervisor to `finish_step`; a recovered or
+  promoted step with no process keeps NULL. Not blocked.
+- [ ] **MOD-102 - Prompt upstream scope follows the active workspace** (from the 2026-10-14
+  requirements audit). `R-PRM-1`, `R-PRM-2`. The engine builds every phase prompt with
+  `PromptScope::project_only` (`crates/htui-orch/src/engine.rs:5967`, "the engine holds no
+  workspace"), so upstream items in other projects of the active workspace render as one-line stubs,
+  while the Backlog preview (`crates/htui/src/preview.rs:240`) uses the workspace: preview and real
+  prompt disagree. No decision records the departure. Record the workspace on the run when it is
+  queued (a run started with no workspace keeps project scope, `R-ENT-2`) and pass it to the engine;
+  pin preview/engine equality with a test. Not blocked.
+- [ ] **MOD-103 - Chat tab per session, and a project choice for a free-standing chat** (from the
+  2026-10-14 requirements audit). `R-TUI-1`, `R-TUI-6`. `register_all` registers one `ChatTab`
+  (`crates/htui/src/app/mod.rs:84`) holding one `session: Option<ChatSessionState>`
+  (`crates/htui/src/ui/tabs/chat/mod.rs:182`); a new prompt replaces an ended chat, so `R-TUI-1`'s
+  "Chat (one per session)" does not hold. A free-standing chat always starts against
+  `ctx.projects.first()` (`chat/mod.rs:355`), so in a multi-project workspace no other project can be
+  chosen. Also settle whether tool results show their content or only flip the call's status
+  (`chat/transcript.rs:250-264`). Not blocked.
+- [ ] **MOD-104 - Secret provider machine-identity bootstrap** (from the 2026-10-14 requirements
+  audit). `R-SEC-1`. The `SecretProvider` trait (`crates/htui-core/src/secret.rs:28-37`) has kind,
+  health, list_keys and resolve, but no "bootstrap a machine identity": the Infisical identity is
+  pasted into Settings › Secrets by hand. Add the method and the Infisical implementation (create or
+  register a machine identity for this box, store it in the keyring), or amend `R-SEC-1` if the
+  provider cannot do it from a client. A keyring-less headless worker stays MOD-48's. Not blocked.
+- [ ] **MOD-105 - In-app login and adapter install for `claude`** (from the 2026-10-14 requirements
+  audit). `R-AGT-9`, `R-AGT-10`, `R-AGT-5`. `claude-agent-acp` advertises only a `terminal` auth
+  method (`docs/ANA-4.md:599`), which MOD-21 refuses (`docs/decisions/mod/mod-21.md:151-153`), and
+  `claude-cli` falls to the refusing default (`crates/htui-agent/src/driver.rs:427`), so neither claude
+  row can be logged in from the app. In-app install handles only binary registry sources
+  (`install/fetch.rs`), and only `agent_agy.json` declares `discovery.install`; the claude rows declare
+  none, so a box without the npm adapter cannot install it. Run the terminal method in the embedded
+  terminal pane (MOD-57) and add an npm-package install source, both as row data (`R-AGT-5`). Not
+  blocked.
+- [ ] **MOD-106 - Enforce one primary repo per project** (from the 2026-10-14 requirements audit).
+  `R-ENT-3`. The schema stops two primaries (`uq_repo_primary`) but not zero: a project with repos
+  and no primary is reachable (`crates/htui/src/ui/tabs/settings/hierarchy.rs:684`), and
+  `item_spec.rs:367` copes by refusing bare paths. Enforce "at least one repo, exactly one primary"
+  at the store write (promote another repo when the primary is removed, refuse removing the last),
+  or amend `R-ENT-3` to allow a repo-less project. Not blocked.
 
 ### Deferred backlog
 
@@ -433,12 +518,21 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   read-only bind plus a writable overlay for the few keys a run needs; and whether `agents/` and `commands/`
   go read-only too. Check what breaks in a run first (`/login` writes `.credentials.json`, which is a
   separate file). Not blocked.
+- [ ] **TOOL-13 - Requirement-citation check in the workflow validator; backfill six write-ups** (from
+  the 2026-10-14 requirements audit). `R-NF-4`. `validate-workflow-docs.sh`/`.ps1` reports 0/0 while
+  `docs/decisions/ana/ana-13.md`, `docs/decisions/ana/ana-15.md`, `docs/decisions/ana/ana-19.md`,
+  `docs/decisions/ana/ana-20.md`, `docs/decisions/mod/mod-29.md` and `docs/decisions/mod/mod-35.md`
+  (and `docs/ANA-15.md`) cite no `R-` ID. Add a check: every open ANA/MOD line and every
+  ANA/MOD write-up (ANA-1 and ANA-8 exempt, they predate REQUIREMENTS) cites at least one defined,
+  non-withdrawn ID, and ranges such as `R-SEC-1..4` are written out so MOD-8's import scan can read
+  them. Backfill the six write-ups and normalise the MOD-29, MOD-35 and TOOL-5 write-up headings
+  to `# PREFIX-N - Title (status, date)`, which the validator also misses. Not blocked.
 
 ## Summary
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
-| MOD-N   | 20 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| ANA-N   | 4 (ANA-25 learned weights, ANA-28 heavy_build routing, ANA-31 agy isolation, ANA-32 warm-start measurement) |
+| MOD-N   | 28 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
-| TOOL-N  | 1 (TOOL-12 sandbox settings hardening) |
+| TOOL-N  | 2 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check) |

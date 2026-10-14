@@ -5,7 +5,7 @@
 import { age, gateStatusText, isFreshRun, join, parseGate, type Host, type Ran, type Reader, type Runner } from './status'
 
 /** gate.sh's STEPS (and gate.ps1's ValidateSet), in lockstep. */
-export const GATE_STEPS = ['fmt', 'clippy-all', 'clippy-bare', 'test', 'abort-grep', 'migrations', 'workflow-docs', 'plugin'] as const
+export const GATE_STEPS = ['fmt', 'clippy-all', 'clippy-bare', 'postgres', 'test', 'abort-grep', 'migrations', 'workflow-docs', 'plugin'] as const
 
 /** What a command answers: its transcript text, and the exit code a `claude -p "/cmd"` run takes. */
 export type Answer = { text: string; exitCode: number }

@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[TOOL-14](docs/decisions/tool/tool-14.md)** - Gate reports skipped Postgres suites (done, 2026-10-14)
 - **[CLEAN-12](docs/decisions/clean/clean-12.md)** - `.claude/` hygiene: lock file and generated Gortex skills untracked, installer headers name G6 (done, 2026-10-14)
 - **[ANA-30](docs/decisions/ana/ana-30.md)** - Utility models: auxiliary cheap-model calls (session titles etc.) (concluded, 2026-10-14)
 - **[TOOL-10](docs/decisions/tool/tool-10.md)** - hr sandbox: plugins and skills read-only, `dev-mods` masked in a run (done, 2026-10-14)
@@ -118,7 +119,7 @@
 - **[ANA-13](docs/decisions/ana/ana-13.md)** - Deep analysis on how oh-my-pi manages different agents and roles (concluded, 2026-09-13)
 - **[MOD-21](docs/decisions/mod/mod-21.md)** - In-app agent authentication (done, 2026-09-10)
 - **[MOD-20](docs/decisions/mod/mod-20.md)** - Registry-driven adapter install (done, 2026-09-09)
-- **[ANA-10](docs/decisions/ana/ana-10.md)** - Local-only mode: SQLite as a primary writable store (done, 2026-09-08)
+- **[ANA-10](docs/decisions/ana/ana-10.md)** - Local-only mode: SQLite as a primary writable store (done; verdict withdrawn by MOD-25, 2026-09-08)
 - **[ANA-5](docs/decisions/ana/ana-5.md)** - Prompt assembly: template contract, section model, upstream walk, trim order, file excerpts (done, 2026-09-06)
 - **[ANA-2](docs/decisions/ana/ana-2.md)** - Orchestration design: step graphs, phase contract, status machines, fan-out, isolation, resume (done, 2026-09-06)
 - **[ANA-4](docs/decisions/ana/ana-4.md)** - Agent protocol: ACP client and CLI fallback (done, 2026-09-05)

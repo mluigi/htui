@@ -146,7 +146,8 @@ The final tree `84cfb161` passed in the sandbox:
 - **The Postgres gate on the merged tree.**
 - **The PRD's prototype batch:** at least 3 queued `FIX`/`CLEAN`/`TOOL` items, for the "unattended
   outcome quality" metric. It is still an open question in the PRD.
-- **CLEAN-9** (M2 residuals) stays open.
+- **CLEAN-9** (M2 residuals) stays open. *(2026-10-14 audit note: CLEAN-9 has since closed,
+  `docs/decisions/clean/clean-9.md`.)*
 
 **Relates to MOD-43:** target-box selection in auto mode. MOD-12 only reports a run that is live on
 another box.

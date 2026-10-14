@@ -4,8 +4,8 @@
 # Usage:
 #   pwsh -NoProfile -File scripts/gate.ps1 [-Only <step>] [-Detach] [-Status] [-SelfTest]
 #
-#   -Only <step>  run one step (fmt, clippy-all, clippy-bare, test, abort-grep, migrations,
-#                 workflow-docs, plugin)
+#   -Only <step>  run one step (fmt, clippy-all, clippy-bare, postgres, test, abort-grep,
+#                 migrations, workflow-docs, plugin)
 #   -Detach       relaunch in a hidden process, log to target/gate/run.log, print the PID
 #   -Status       print target/gate/last.json and exit
 #
@@ -15,7 +15,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('fmt', 'clippy-all', 'clippy-bare', 'test', 'abort-grep', 'migrations', 'workflow-docs', 'plugin')]
+    [ValidateSet('fmt', 'clippy-all', 'clippy-bare', 'postgres', 'test', 'abort-grep', 'migrations', 'workflow-docs', 'plugin')]
     [string]$Only,
     [switch]$Detach,
     [switch]$Status,
@@ -32,7 +32,7 @@ $script:TestLog = if ($env:GATE_TEST_LOG) { $env:GATE_TEST_LOG } else { Join-Pat
 $script:MigrationsDir = if ($env:GATE_MIGRATIONS_DIR) { $env:GATE_MIGRATIONS_DIR } else { Join-Path $RepoRoot 'crates/htui-store/migrations' }
 $PluginDir = Join-Path $RepoRoot '.claude/skills/htui-dev'
 $MinClaude = [version]'2.1.287'
-$Steps = @('fmt', 'clippy-all', 'clippy-bare', 'test', 'abort-grep', 'migrations', 'workflow-docs', 'plugin')
+$Steps = @('fmt', 'clippy-all', 'clippy-bare', 'postgres', 'test', 'abort-grep', 'migrations', 'workflow-docs', 'plugin')
 
 $script:Results = New-Object System.Collections.Generic.List[object]
 $script:Started = ''
@@ -68,6 +68,35 @@ function Invoke-Native {
 function Step-Fmt { Invoke-Native cargo @('fmt', '--check') }
 function Step-ClippyAll { Invoke-Native cargo @('clippy', '--workspace', '--all-features', '--', '-D', 'warnings') }
 function Step-ClippyBare { Invoke-Native cargo @('clippy', '--workspace', '--', '-D', 'warnings') }
+
+function Step-Postgres {
+    # TOOL-14: without HTUI_TEST_DATABASE_URL every Postgres suite returns early and passes, so
+    # the test step's green says nothing about Postgres. Say so as a skipped step. Never print
+    # the DSN: it may carry a password.
+    $dsn = $env:HTUI_TEST_DATABASE_URL
+    if (-not $dsn) {
+        Write-Host 'postgres: HTUI_TEST_DATABASE_URL unset - the Postgres suites return early and prove nothing'
+        return $Skip
+    }
+    $m = [regex]::Match($dsn, '^postgres(ql)?://([^@/]*@)?([^:/?]+)(:([0-9]+))?')
+    if (-not $m.Success) {
+        Write-Host 'postgres: DSN set, host not parsed (not probed)'
+        return $Pass
+    }
+    $hostName = $m.Groups[3].Value
+    $port = if ($m.Groups[5].Success) { [int]$m.Groups[5].Value } else { 5432 }
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $reached = $false
+        try { $reached = $client.ConnectAsync($hostName, $port).Wait(3000) } catch { $reached = $false }
+        if (-not $reached) {
+            Write-Host "postgres: ${hostName}:$port unreachable - the Postgres suites would fail"
+            return $Fail
+        }
+    } finally { $client.Dispose() }
+    Write-Host "postgres: ${hostName}:$port reachable; the Postgres suites run live"
+    return $Pass
+}
 
 function Step-Test {
     New-Item -ItemType Directory -Force $script:GateDir | Out-Null
@@ -214,6 +243,18 @@ function Invoke-GateSelfTest {
         if ((Step-AbortGrep | Select-Object -Last 1) -eq $Pass) { $failures += 'abort-grep: SIGABRT passed' }
         $script:TestLog = Join-Path $tmp 'missing.log'
         if ((Step-AbortGrep | Select-Object -Last 1) -eq $Pass) { $failures += 'abort-grep: a missing log passed' }
+
+        $savedDsn = $env:HTUI_TEST_DATABASE_URL
+        try {
+            $env:HTUI_TEST_DATABASE_URL = $null
+            if ((Step-Postgres | Select-Object -Last 1) -ne $Skip) { $failures += 'postgres: an unset DSN was not skipped' }
+            $env:HTUI_TEST_DATABASE_URL = 'postgres://u@127.0.0.1:1/db'
+            if ((Step-Postgres | Select-Object -Last 1) -ne $Fail) { $failures += 'postgres: an unreachable host passed' }
+            $env:HTUI_TEST_DATABASE_URL = 'host=/run/postgresql dbname=x'
+            if ((Step-Postgres | Select-Object -Last 1) -ne $Pass) { $failures += 'postgres: an unparsed DSN failed' }
+            $env:HTUI_TEST_DATABASE_URL = 'postgres://u:s3cret@127.0.0.1:1/db'
+            if ("$(Step-Postgres 6>&1)" -match 's3cret') { $failures += 'postgres: the DSN password was printed' }
+        } finally { $env:HTUI_TEST_DATABASE_URL = $savedDsn }
 
         # last.json: the documented shape, and no .tmp left behind.
         $script:GateDir = Join-Path $tmp 'gate'; $script:LastJson = Join-Path $script:GateDir 'last.json'

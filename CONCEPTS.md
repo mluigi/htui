@@ -1,7 +1,7 @@
 # CONCEPTS - htui
 
 **Owner:** Luigi Marrandino
-**Reviewed:** 2026-09-30
+**Reviewed:** 2026-10-14
 
 Standing architectural intent for `htui`. Governed by `.claude/rules/concept-docs.md`. Distilled
 from `docs/REQUIREMENTS.md`, which is the authority; requirement IDs in brackets.
@@ -52,7 +52,7 @@ dependencies need nothing extra [R-ENT-9].
 
 - **One driver trait, ACP first.** Agents speak Agent Client Protocol; a CLI stream adapter covers
   the rest. Adding an agent is a registry row plus at most a parser [R-AGT-1..5]. Version one:
-  `claude`, `agy`.
+  `claude`, `claude-cli`, `agy`.
 - **Step graphs, not scripts.** A run is an ordered list of phases with candidate agents, gates,
   retries, fan-out and isolation mode; review failure loops back to implement [R-ORCH-1..3, 7, 8].
 - **Manual and auto.** Manual runs one item with gates as configured; auto is a queue runner that
