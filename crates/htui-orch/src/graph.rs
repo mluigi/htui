@@ -1008,7 +1008,10 @@ mod tests {
         assert!(first_decode_failure(&seen, (project, 1)), "a new document");
         assert!(!first_decode_failure(&seen, (project, 1)), "the same one");
         assert!(first_decode_failure(&seen, (project, 2)), "an edit");
-        assert!(first_decode_failure(&seen, (ProjectId::new(), 1)), "another");
+        assert!(
+            first_decode_failure(&seen, (ProjectId::new(), 1)),
+            "another"
+        );
     }
 
     /// A `tracing` writer into a shared buffer, for a case that asserts a line was logged.
@@ -1032,7 +1035,10 @@ mod tests {
     impl LogBuffer {
         /// The captured lines that mention `needle`.
         fn lines_with(&self, needle: &str) -> Vec<String> {
-            let bytes = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let bytes = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             String::from_utf8_lossy(&bytes)
                 .lines()
                 .filter(|line| line.contains(needle))
@@ -1069,7 +1075,10 @@ mod tests {
 
         let warned = logs.lines_with("; its non-cap keys read as defaults");
         assert_eq!(warned.len(), 2, "once per edit: {warned:?}");
-        assert!(warned.iter().all(|line| line.contains(" WARN ")), "{warned:?}");
+        assert!(
+            warned.iter().all(|line| line.contains(" WARN ")),
+            "{warned:?}"
+        );
         let again = logs.lines_with("still does not fully decode");
         assert_eq!(again.len(), 1, "the repeat: {again:?}");
         assert!(again[0].contains(" DEBUG "), "{again:?}");
