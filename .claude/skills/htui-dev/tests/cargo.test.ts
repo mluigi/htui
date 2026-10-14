@@ -107,6 +107,39 @@ test('a manifest outside a crates folder is the workspace root, whatever its fol
   ])
 })
 
+test('a package in a short-flag cluster, as a glob or with a version is read as cargo reads it', async ($, on) => {
+  const got = await verdicts($, on, [
+    'cargo test -qp htui',
+    'cargo test -vvp htui-agent',
+    'cargo test -qphtui',
+    'cargo test -p htui@0.1.0',
+    'cargo test --package=htui-core@0.1.0',
+    `cargo test -p 'htui-[ac]*'`,
+    `cargo test -p 'ht*'`,
+    'cargo test -qp htui --features testkit',
+    'cargo test -qp htui -qF testkit',
+    'cargo test -p htui@0.1.0 --features testkit',
+    `cargo test -p 'htui-*'`,
+    `cargo test --workspace --exclude 'htui-*' --features testkit`,
+    `cargo test --workspace --exclude 'h?ui'`,
+  ])
+  expect(got.map(r => r !== undefined)).toEqual([
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+  ])
+})
+
 test('integration tests in scope count, whatever selects them', async ($, on) => {
   await denies($, on, [
     'cargo test -p htui --test app',

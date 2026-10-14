@@ -146,6 +146,17 @@ function manifestPackage(path: string): string | null {
   return bare ? name : null
 }
 
+/** `cargo test`'s short options that take a value, attached (`-phtui`) or as the next word. */
+const SHORT_VALUE = new Set(['p', 'F', 'j', 'Z'])
+
+/** The members a package spec names: `@version` dropped, a glob (`htui-*`) matched against the members, anything else as written. */
+function packagesOf(spec: string): string[] {
+  const name = spec.replace(/@.*$/, '')
+  if (!/[*?[]/.test(name)) return [name]
+  const pattern = name.replace(/[.+^${}()|\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')
+  return MEMBERS.filter(m => new RegExp(`^${pattern}$`).test(m))
+}
+
 /** Reads `words` as a `cargo test` (or `cargo t`) command, or null when it is none. */
 function parseCargoTest(words: Words): CargoTest | null {
   if ((words[0] ?? '').split('/').pop() !== 'cargo') return null
@@ -193,9 +204,27 @@ function parseCargoTest(words: Words): CargoTest | null {
       got.dashDash = i
       break
     }
-    if (isOpt(w, '-p') || isOpt(w, '--package')) {
-      const [v, n] = valueOf(i, w.startsWith('--') ? '--package' : '-p')
-      if (v !== undefined) packages.push(v)
+    if (/^-[A-Za-z]/.test(w)) {
+      // A short cluster (`-qp htui`, `-vvF testkit`): flags until one takes a value, which is the
+      // rest of the cluster or the next word.
+      let used = 1
+      for (let j = 1; j < w.length; j++) {
+        const letter = w[j]!
+        if (!SHORT_VALUE.has(letter)) continue
+        const attached = w.slice(j + 1)
+        const value = attached !== '' ? attached : words[i + 1]
+        if (attached === '') used = 2
+        if (letter === 'p' && value !== undefined) packages.push(...packagesOf(value))
+        if (letter === 'F' && value !== undefined) {
+          if (attached !== '') addFeatures(i, w.slice(0, j + 1))
+          else addFeatures(i + 1, '')
+        }
+        break
+      }
+      i += used
+    } else if (isOpt(w, '--package')) {
+      const [v, n] = valueOf(i, '--package')
+      if (v !== undefined) packages.push(...packagesOf(v))
       i += n
     } else if (isOpt(w, '--manifest-path')) {
       const [v, n] = valueOf(i, '--manifest-path')
@@ -207,18 +236,17 @@ function parseCargoTest(words: Words): CargoTest | null {
       i++
     } else if (isOpt(w, '--exclude')) {
       const [v, n] = valueOf(i, '--exclude')
-      if (v !== undefined) got.excluded.push(v)
+      if (v !== undefined) got.excluded.push(...packagesOf(v))
       i += n
     } else if (w === '--all-features') {
       got.allFeatures = true
       i++
-    } else if (isOpt(w, '--features') || isOpt(w, '-F')) {
-      const name = w.startsWith('--') ? '--features' : '-F'
-      if (w === name) {
+    } else if (isOpt(w, '--features')) {
+      if (w === '--features') {
         if (i + 1 < words.length) addFeatures(i + 1, '')
         i += 2
       } else {
-        addFeatures(i, w.startsWith('--') ? '--features=' : '-F')
+        addFeatures(i, '--features=')
         i++
       }
     } else if (OUT_OF_SCOPE.has(w.split('=')[0]!) || IN_SCOPE.has(w.split('=')[0]!)) {
