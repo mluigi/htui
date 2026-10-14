@@ -112,8 +112,34 @@ test('a heredoc body is not read as commands', () => {
 test('a quoted heredoc inside a substitution stays in its word', () => {
   const line = `git commit -m "$(cat <<'EOF'\nfix: do not use --no-verify\n\nCo-Authored-By: x\nEOF\n)"`
   expect(simpleCommands(line)).toEqual([
+    ['cat'],
     ['git', 'commit', '-m', `$(cat <<'EOF'\nfix: do not use --no-verify\n\nCo-Authored-By: x\nEOF\n)`],
   ])
+})
+
+test('a substitution inside double quotes opens quotes of its own', () => {
+  // The standard commit form, with double quotes in the message.
+  const message = `$(cat <<'EOF'\nfix: handle "git log -n 3" in the parser\nEOF\n)`
+  expect(simpleCommands(`git commit -m "${message}"`)).toEqual([['cat'], ['git', 'commit', '-m', message]])
+  const separators = `$(cat <<'EOF'\nrun "a && cargo test -p htui"; then (b)\nEOF\n)`
+  expect(simpleCommands(`git commit -m "${separators}"`)).toEqual([['cat'], ['git', 'commit', '-m', separators]])
+  // An odd number of inner quotes is no unbalanced line.
+  const odd = `$(cat <<'EOF'\nsay "hi\nEOF\n)`
+  expect(simpleCommands(`git commit -m "${odd}"`)).toEqual([['cat'], ['git', 'commit', '-m', odd]])
+  expect(simpleCommands(`echo "a $(echo ")") b"`)).toEqual([['echo', ')'], ['echo', 'a $(echo ")") b']])
+})
+
+test('a substitution inside double quotes is followed as commands', () => {
+  expect(simpleCommands(`echo "$(git commit -n)"`)).toEqual([['git', 'commit', '-n'], ['echo', '$(git commit -n)']])
+  expect(simpleCommands(`x="$(cd a && cargo test -p htui)"`)).toEqual([['cd', 'a'], ['cargo', 'test', '-p', 'htui']])
+  expect(simpleCommands(`echo "$(echo "$(git commit -n)")"`)).toEqual([
+    ['git', 'commit', '-n'],
+    ['echo', '$(git commit -n)'],
+    ['echo', '$(echo "$(git commit -n)")'],
+  ])
+  // Arithmetic is no command, and an escaped dollar is text.
+  expect(simpleCommands(`echo "$((1<<2))" "\\$(git commit -n)"`)).toEqual([['echo', '$((1<<2))', '$(git commit -n)']])
+  expect(simpleCommands(`echo "$(git commit -n"`)).toBeNull()
 })
 
 test('a comment is skipped', () => {

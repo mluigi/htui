@@ -33,6 +33,7 @@ test('git commit with --no-verify or -n is refused', async ($, on) => {
     'git add . && git commit --no-verify -m x',
     `bash -c 'git commit --no-verify -m x'`,
     'echo $(git commit -n -m x)',
+    'echo "$(git commit -n -m x)"',
     'git commit --verify --no-verify -m x',
     'git commit -m x --no-verify -- src/a.rs',
   ]
@@ -49,6 +50,8 @@ test('a commit that runs its hooks is allowed', async ($, on) => {
     'git commit -m "do not use --no-verify"',
     `git commit -F - <<'EOF'\nfix --no-verify handling\n-n\nEOF`,
     `git commit -m "$(cat <<'EOF'\nnever --no-verify\nEOF\n)"`,
+    `git commit -m "$(cat <<'EOF'\nfix: handle "git log -n 3" in the parser\nEOF\n)"`,
+    `git commit -m "$(cat <<'EOF'\nfix: never "git commit -n" again\nEOF\n)"`,
     'git commit --no-verify --verify -m x',
     'git commit -n --verify -m x',
     'git commit -m x -- -n',
@@ -92,6 +95,13 @@ test('the refusal shows the commit without the flag', async ($, on) => {
     "htui-dev: git commit --no-verify skips the repo's commit hooks — commit without it: git -C d commit -m x",
     "htui-dev: git commit --no-verify skips the repo's commit hooks — commit without it: git commit -aS -m x",
   ])
+})
+
+test('the refusal of a heredoc commit gives back a command that parses', async ($, on) => {
+  const message = `$(cat <<'EOF'\nfix: "quoted" words\nEOF\n)`
+  const [got] = await verdicts($, on, [`git commit -n -m "${message}"`])
+  const fixed = got!.split('commit without it: ')[1]!
+  expect(simpleCommands(fixed)).toEqual([['git', 'commit', '-m', message]])
 })
 
 test('gitWrite names the git commands that change the tree or history', () => {

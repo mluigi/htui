@@ -6,8 +6,15 @@
 /** One simple command's words: quotes removed, leading VAR=value and the wrappers env/command/time/nice/timeout/nohup stripped, redirections dropped. */
 export type Words = readonly string[]
 
-/** What the tokenizer hands on: a word, a command separator, or a redirection that does or does not take the next word. */
-type Token = { kind: 'word'; text: string } | { kind: 'sep' } | { kind: 'redir'; takesWord: boolean }
+/**
+ * What the tokenizer hands on: a word, a command separator, a redirection that does or does not
+ * take the next word, or the text of a `$( … )` inside double quotes, whose commands run first.
+ */
+type Token =
+  | { kind: 'word'; text: string }
+  | { kind: 'sep' }
+  | { kind: 'redir'; takesWord: boolean }
+  | { kind: 'sub'; text: string }
 
 /** A heredoc whose body starts at the next newline: its delimiter, and whether `<<-` lets the end line lead with tabs. */
 type Heredoc = { delimiter: string; stripTabs: boolean }
@@ -23,6 +30,123 @@ const KEYWORDS = new Set(['!', '{', '}', 'if', 'then', 'elif', 'else', 'fi', 'do
 
 /** `NAME=value`, a shell assignment. */
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/
+
+/** The index of the `)` closing the `(` at `open`, counting parentheses only (for `$(( … ))`). Throws Unfollowable. */
+function parenEnd(line: string, open: number): number {
+  let depth = 0
+  for (let i = open; i < line.length; i++) {
+    if (line[i] === '(') depth++
+    else if (line[i] === ')' && --depth === 0) return i
+  }
+  throw new Unfollowable('unbalanced $((')
+}
+
+/** Where a `$(` (or `$((`) at `dollar` ends: the index of its last `)`. Throws Unfollowable. */
+const dollarParenEnd = (line: string, dollar: number): number =>
+  line[dollar + 2] === '(' ? parenEnd(line, dollar + 1) : substitutionEnd(line, dollar + 2)
+
+/** The index of the `"` closing a double-quoted string whose text starts at `from`. Throws Unfollowable. */
+function doubleQuoteEnd(line: string, from: number): number {
+  for (let i = from; i < line.length; ) {
+    const d = line[i]!
+    if (d === '"') return i
+    if (d === '\\') i += 2
+    else if (d === '$' && line[i + 1] === '(') i = dollarParenEnd(line, i) + 1
+    else i++
+  }
+  throw new Unfollowable('unbalanced double quote')
+}
+
+/**
+ * The index of the `)` closing a `$(` whose text starts at `from`. Inside, the shell starts afresh:
+ * quotes, nested parentheses, comments and heredoc bodies are stepped over, so a `)` or `"` in them
+ * closes nothing. Throws Unfollowable.
+ */
+function substitutionEnd(line: string, from: number): number {
+  let depth = 0
+  let wordStart = true
+  const pending: Heredoc[] = []
+  let i = from
+  while (i < line.length) {
+    const c = line[i]!
+    if (c === '\\') {
+      i += 2
+      wordStart = false
+      continue
+    }
+    if (c === "'") {
+      const close = line.indexOf("'", i + 1)
+      if (close === -1) throw new Unfollowable('unbalanced single quote')
+      i = close + 1
+      wordStart = false
+      continue
+    }
+    if (c === '"') {
+      i = doubleQuoteEnd(line, i + 1) + 1
+      wordStart = false
+      continue
+    }
+    if (c === '$' && line[i + 1] === '(') {
+      i = dollarParenEnd(line, i) + 1
+      wordStart = false
+      continue
+    }
+    if (c === '#' && wordStart) {
+      const eol = line.indexOf('\n', i)
+      i = eol === -1 ? line.length : eol
+      continue
+    }
+    if (c === '<' && line[i + 1] === '<' && line[i + 2] !== '<') {
+      i += 2
+      const stripTabs = line[i] === '-'
+      if (stripTabs) i++
+      while (line[i] === ' ' || line[i] === '\t') i++
+      let delimiter = ''
+      while (i < line.length && !' \t\n;&|<>()'.includes(line[i]!)) {
+        const q = line[i]!
+        if (q === "'" || q === '"') {
+          const close = line.indexOf(q, i + 1)
+          if (close === -1) throw new Unfollowable('unbalanced quote in a heredoc delimiter')
+          delimiter += line.slice(i + 1, close)
+          i = close + 1
+        } else if (q === '\\') {
+          delimiter += line[i + 1] ?? ''
+          i += 2
+        } else {
+          delimiter += q
+          i++
+        }
+      }
+      if (delimiter === '') throw new Unfollowable('heredoc without a delimiter')
+      pending.push({ delimiter, stripTabs })
+      wordStart = false
+      continue
+    }
+    if (c === '\n') {
+      i++
+      for (const doc of pending.splice(0)) {
+        for (;;) {
+          if (i >= line.length) throw new Unfollowable('heredoc without an end')
+          const eol = line.indexOf('\n', i)
+          const end = eol === -1 ? line.length : eol
+          const text = line.slice(i, end)
+          i = end + 1
+          if ((doc.stripTabs ? text.replace(/^\t+/, '') : text) === doc.delimiter) break
+        }
+      }
+      wordStart = true
+      continue
+    }
+    if (c === '(') depth++
+    else if (c === ')') {
+      if (depth === 0) return i
+      depth--
+    }
+    wordStart = ' \t;&|()<>'.includes(c)
+    i++
+  }
+  throw new Unfollowable('unbalanced $(')
+}
 
 /** Splits `line` into tokens, skipping comments and heredoc bodies. Throws Unfollowable. */
 function tokenize(line: string): Token[] {
@@ -92,6 +216,14 @@ function tokenize(line: string): Token[] {
         if (d === '\\' && i + 1 < line.length && '$`"\\\n'.includes(line[i + 1]!)) {
           if (line[i + 1] !== '\n') word += line[i + 1]
           i += 2
+          continue
+        }
+        if (d === '$' && line[i + 1] === '(') {
+          // A substitution: its text stays in the word, and its commands are handed on to run first.
+          const end = dollarParenEnd(line, i)
+          if (line[i + 2] !== '(') tokens.push({ kind: 'sub', text: line.slice(i + 2, end) })
+          word += line.slice(i, end + 1)
+          i = end + 1
           continue
         }
         word += d
@@ -238,8 +370,12 @@ function commandsOf(line: string, depth: number): Words[] {
   if (depth > 8) throw new Unfollowable('bash -c nested too deep')
   const out: Words[] = []
   let words: string[] = []
+  /** The commands of the substitutions in the command being read: they run before it. */
+  let subs: Words[] = []
   let dropNext = false
   const flush = () => {
+    out.push(...subs)
+    subs = []
     const unwrapped = unwrap(words)
     words = []
     if (unwrapped.length === 0) return
@@ -248,7 +384,9 @@ function commandsOf(line: string, depth: number): Words[] {
     else out.push(...commandsOf(inner, depth + 1))
   }
   for (const t of tokenize(line)) {
-    if (t.kind === 'sep') {
+    if (t.kind === 'sub') {
+      subs.push(...commandsOf(t.text, depth + 1))
+    } else if (t.kind === 'sep') {
       dropNext = false
       flush()
     } else if (t.kind === 'redir') {

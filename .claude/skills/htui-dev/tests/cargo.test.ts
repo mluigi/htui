@@ -108,6 +108,7 @@ test('every way of reaching cargo test is seen', async ($, on) => {
     'RUST_LOG=x timeout 900 cargo test -p htui',
     `bash -c 'cd /r && cargo test -p htui 2>&1 | tail -5'`,
     'cargo check && cargo test -p htui',
+    'echo "$(cargo test -p htui 2>&1 | tail -3)"',
     '/usr/bin/cargo test -p htui',
   ])
 })
@@ -185,6 +186,7 @@ test('other cargo commands and mere mentions are allowed', async ($, on) => {
     'cargo nextest run -p htui',
     'echo cargo test -p htui',
     'git commit -m "cargo test -p htui"',
+    `git commit -m "$(cat <<'EOF'\nfix: "a && cargo test -p htui" ran 0 tests\nEOF\n)"`,
     `grep -n 'cargo test' docs/htui-cli.md`,
     'cat <<EOF\ncargo test -p htui\nEOF',
   ])
