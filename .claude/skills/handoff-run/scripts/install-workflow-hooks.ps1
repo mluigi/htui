@@ -169,6 +169,20 @@ function Set-HooksPath {
     if (-not (Test-Path -LiteralPath (Join-Path $Root $HooksPathValue 'pre-commit'))) { return }
     if ((Get-HooksPath -Root $Root) -ne $HooksPathValue) {
         & git -C $Root config --local core.hooksPath $HooksPathValue
+        Write-UnchainedHookWarning -Root $Root
+    }
+}
+
+function Write-UnchainedHookWarning {
+    # core.hooksPath replaces .git/hooks, and the committed hooks chain only pre-commit and
+    # post-commit. Any other hook the clone keeps there would silently stop running.
+    param([string]$Root)
+    $dir = Join-Path $Root '.git' 'hooks'
+    if (-not (Test-Path -LiteralPath $dir)) { return }
+    $others = @(Get-ChildItem -LiteralPath $dir -File | Where-Object {
+            $_.Name -notlike '*.sample' -and $_.Name -notin @('pre-commit', 'post-commit') } | ForEach-Object { $_.Name })
+    if ($others.Count -gt 0) {
+        Write-Host "warning: core.hooksPath now bypasses .git/hooks/$($others -join ', .git/hooks/') - only pre-commit and post-commit are chained"
     }
 }
 
@@ -545,9 +559,9 @@ function Invoke-SelfTest {
             $failures += "case13: required missing target exited $LASTEXITCODE, expected 2"
         }
 
-        # Case 14-15: committed hooks (TOOL-9). core.hooksPath is set once, and the installer's
-        # own pre-commit block goes while a foreign block stays. (The .sh twin's case 16, which
-        # runs the committed sh hook itself, has no equivalent here: that hook is sh.)
+        # Case 14: committed hooks (TOOL-9). core.hooksPath is set once, and the installer's own
+        # pre-commit block goes while a foreign block stays. (The .sh twin's cases 15-16, which
+        # run the committed sh hook itself, have no equivalent here: that hook is sh.)
         $ws14 = Join-Path $tmp 'case14\workspace'
         New-Item -ItemType Directory -Force (Join-Path $ws14 'scripts\githooks') | Out-Null
         & git init -q $ws14
@@ -559,8 +573,8 @@ function Invoke-SelfTest {
         if ((Get-HooksPath -Root $ws14) -ne 'scripts/githooks') { $failures += 'case14: core.hooksPath not set' }
         Install-WorkflowHooks -TargetList @(Get-HookTargets -Root $ws14 -Names @()) -Quiet
         $raw14 = [System.IO.File]::ReadAllText($own14)
-        if ($raw14 -match [regex]::Escape($StartMarker)) { $failures += 'case15: own pre-commit block survived next to the committed hook' }
-        if ($raw14 -notmatch [regex]::Escape('# graphify-hook-start')) { $failures += 'case15: foreign pre-commit block lost' }
+        if ($raw14 -match [regex]::Escape($StartMarker)) { $failures += 'case14: own pre-commit block survived next to the committed hook' }
+        if ($raw14 -notmatch [regex]::Escape('# graphify-hook-start')) { $failures += 'case14: foreign pre-commit block lost' }
         $h14a = (Get-FileHash $own14 -Algorithm SHA256).Hash
         Set-HooksPath -Root $ws14
         Install-WorkflowHooks -TargetList @(Get-HookTargets -Root $ws14 -Names @()) -Quiet
@@ -570,7 +584,7 @@ function Invoke-SelfTest {
     }
 
     if ($failures.Count -eq 0) {
-        Write-Host 'Self-test: 15/15 cases PASS.'
+        Write-Host 'Self-test: 14/14 cases PASS.'
         return 0
     }
     Write-Host "Self-test FAIL ($($failures.Count)):"

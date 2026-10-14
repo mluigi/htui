@@ -371,7 +371,26 @@ set_hooks_path() {
     local root="$1"
     [[ -x "$root/$HOOKS_PATH_VALUE/pre-commit" ]] || return 0
     [[ "$(git -C "$root" config --local --get core.hooksPath 2>/dev/null)" == "$HOOKS_PATH_VALUE" ]] \
-        || git -C "$root" config --local core.hooksPath "$HOOKS_PATH_VALUE"
+        || {
+            git -C "$root" config --local core.hooksPath "$HOOKS_PATH_VALUE"
+            warn_unchained_hooks "$root"
+        }
+}
+
+warn_unchained_hooks() {
+    # core.hooksPath replaces .git/hooks, and the committed hooks chain only pre-commit and
+    # post-commit. Any other hook the clone keeps there would silently stop running.
+    local dir="$1/.git/hooks" f n others=()
+    [[ -d "$dir" ]] || return 0
+    for f in "$dir"/*; do
+        [[ -f "$f" ]] || continue
+        n="$(basename "$f")"
+        case "$n" in *.sample|pre-commit|post-commit) continue ;; esac
+        others+=("$n")
+    done
+    if [[ ${#others[@]} -gt 0 ]]; then
+        echo "warning: core.hooksPath now bypasses .git/hooks/{${others[*]}} - only pre-commit and post-commit are chained"
+    fi
 }
 
 committed_hooks_active() {

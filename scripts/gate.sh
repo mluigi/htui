@@ -181,7 +181,20 @@ run_gate() {
         run_step "$name" || failed=1
     done
     if [[ $failed -eq 0 ]]; then write_last passed "$(now_iso)"; else write_last failed "$(now_iso)"; fi
-    if [[ $failed -eq 0 ]]; then echo "== gate: PASSED"; else echo "== gate: FAILED"; fi
+    if [[ $failed -eq 0 ]]; then
+        # A skipped step is not a verified one: name them so a green cannot hide a missing check.
+        local skipped=() i
+        for ((i = 0; i < ${#STEP_NAMES[@]}; i++)); do
+            [[ "${STEP_STATUS[i]}" == skipped ]] && skipped+=("${STEP_NAMES[i]}")
+        done
+        if [[ ${#skipped[@]} -gt 0 ]]; then
+            echo "== gate: PASSED (${#skipped[@]} skipped: ${skipped[*]})"
+        else
+            echo "== gate: PASSED"
+        fi
+    else
+        echo "== gate: FAILED"
+    fi
     return "$failed"
 }
 

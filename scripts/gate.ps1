@@ -142,7 +142,11 @@ function Step-Plugin {
         Write-Host "plugin: claude $(if ($ver) { $ver } else { 'unknown' }) is older than $MinClaude"
         return $Skip
     }
-    if ((Invoke-Native claude @('plugin', 'validate', '--strict', $PluginDir)) -ne $Pass) { return $Fail }
+    # Invoke-Native's pipeline is the command's output followed by its verdict: show the first,
+    # compare only the last (an array on the left of -ne filters instead of comparing).
+    $r = @(Invoke-Native claude @('plugin', 'validate', '--strict', $PluginDir))
+    if ($r.Count -gt 1) { $r[0..($r.Count - 2)] | ForEach-Object { Write-Host $_ } }
+    if ($r[-1] -ne $Pass) { return $Fail }
     Invoke-Native claude @('plugin', 'test', $PluginDir)
 }
 
@@ -175,7 +179,8 @@ function Invoke-Gate {
     $finished = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     if ($failed) { Write-Last 'failed' $finished; Write-Host '== gate: FAILED'; return 1 }
     Write-Last 'passed' $finished
-    Write-Host '== gate: PASSED'
+    $skipped = @($script:Results | Where-Object { $_.status -eq 'skipped' } | ForEach-Object { $_.name })
+    Write-Host $(if ($skipped.Count -gt 0) { "== gate: PASSED ($($skipped.Count) skipped: $($skipped -join ', '))" } else { '== gate: PASSED' })
     return 0
 }
 
