@@ -14,7 +14,10 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-14):** **MOD-67 is done** (`docs/decisions/mod/mod-67.md`): every key outside text
+**Current status (2026-10-14):** **CLEAN-11 is done** (`docs/decisions/clean/clean-11.md`): the once-per-batch log
+levels are pinned by a capture test, the project-settings decode warn fires once per project edit, and a `null`
+`project.settings` is refused by `ProjectCaps::from_settings` as the writers refuse it. Owed on the host: the Postgres
+gate on the merged tree. Before it, **MOD-67 is done** (`docs/decisions/mod/mod-67.md`): every key outside text
 entry is a named action in one catalogue, dispatched through declared context stacks, rebindable in
 `<config_root>/keys.toml` (`--keys`, `--default-keys`, `--print-keys`; defaults in `docs/htui-keys.md`); every
 hint, the `?` box and every message that names a key are generated, and one hint row above the status line shows
@@ -24,14 +27,10 @@ rules and `defaultMode` no longer settle a call before htui; an isolated `claude
 `--permission-mode default`, and ACP rows pin `acp.permission_mode` (seeded `default` on `claude`) with
 `session/set_mode`. `claude-cli` keeps `acceptEdits` (review R1). Owed on the host: the Postgres gate on the merged
 tree. Before it, **CLEAN-10 is done** (`docs/decisions/clean/clean-10.md`): `cargo doc --workspace
---no-deps` passes with and without `--all-features` (docs-only; 33 private or unresolved intra-doc links fixed). Before
-it, **MOD-93 is done** (`docs/decisions/mod/mod-93.md`): `htui claude emit [--dir]
-[--force]` writes a local Claude Code marketplace from files built into the binary, holding plugin `htui` at the
-binary's version: a skill that reads htui through MOD-92's `--json` verbs and hands work to htui, and a mod with a
-waiting-on-you band, a `/htui` pane and turnless `/htui status|waiting|search` (skill-only below Claude Code 2.1.287;
-stands down under `HTUI_SESSION`). User guide `docs/htui-claude-plugin.md`. Owed on the host: the Postgres gate, a
-live install against the host store, `tsc` on the mod, Windows. **MOD-89**, **MOD-95**, **TOOL-11**, **MOD-91**
-and **MOD-92** are done (see `DECISIONS.md`). Open from ANA-29: **TOOL-8**/**TOOL-9**/**TOOL-10**, **CLEAN-12**,
+--no-deps` passes with and without `--all-features` (docs-only; 33 private or unresolved intra-doc links fixed).
+**MOD-93** (`docs/decisions/mod/mod-93.md`; owed on the host: the Postgres gate, a live install against the host
+store, `tsc` on the mod, Windows), **MOD-89**, **MOD-95**, **TOOL-11**, **MOD-91** and **MOD-92** are done (see
+`DECISIONS.md`). Open from ANA-29: **TOOL-8**/**TOOL-9**/**TOOL-10**, **CLEAN-12**,
 and **MOD-94** behind a maintainer decision.
 Live coordinates after MOD-96: migrations run through `0018_seed_permission_mode` (MOD-96: data only, pins
 `acp.permission_mode` on the seeded `claude` row), before it `0017_follow_up` (`run_command.run_step_id`,
@@ -383,18 +382,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 
 ### Deferred backlog
 
-- [ ] **CLEAN-11 - CLEAN-9 deferred review residuals** (from CLEAN-9, `docs/decisions/clean/clean-9.md`).
-  `R-AGT-7`.
-  - **Pin the once-per-batch log levels.** `note_batch_stop` logs `info` for a batch's first stop and
-    `debug` after (`htui-worker/src/runtime.rs`). Only the returned `bool` is pinned, because `htui-worker`
-    has no tracing capture. Needs a capture layer as a dev-dependency (`tracing-subscriber` is already a
-    workspace dependency used by `htui`).
-  - **Dedupe the project-settings decode warn.** `graph.rs` `project_settings` warns on every resolve for a
-    non-cap key that does not decode; the file has no process-wide once-set pattern to reuse.
-  - **`null` project settings read and clear disagree.** A `null` blob reads as "no caps"; `clear_setting`
-    refuses it in Pg and Mem (`jsonb_typeof = 'object'`). Intentional and documented on
-    `ProjectCaps::from_settings`; decide whether `null` should be a refusal everywhere.
-  Not blocked.
 - [ ] **CLEAN-12 - `.claude/` hygiene found by ANA-29** (from ANA-29, `docs/ANA-29.md` §4.1).
   Remove the committed `.claude/.headroom_wrap_settings.lock` and ignore it. Decide whether
   `.claude/skills/generated/` is committed or tool-owned: it is committed, yet `scripts/hr:692`
@@ -465,5 +452,5 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-25 learned weights, ANA-28 heavy_build routing, ANA-30 utility models) |
 | MOD-N   | 18 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
-| CLEAN-N | 2 (CLEAN-11 CLEAN-9 deferred review residuals, CLEAN-12 `.claude/` hygiene) |
+| CLEAN-N | 1 (CLEAN-12 `.claude/` hygiene) |
 | TOOL-N  | 3 (TOOL-8 `htui-dev` mod, TOOL-9 gate script and git hooks, TOOL-10 sandbox mod hardening) |

@@ -3690,6 +3690,77 @@ mod tests {
         assert!(shared.note_bad_cap(b, ids::PROJECT_HTUI, &err));
     }
 
+    /// A `tracing` writer into a shared buffer, for a case that asserts a line was logged.
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<StdMutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogBuffer {
+        /// The captured lines that mention `needle`.
+        fn lines_with(&self, needle: &str) -> Vec<String> {
+            let bytes = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .filter(|line| line.contains(needle))
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    /// CLEAN-11 (CLEAN-9 review): the bool says "first"; this pins the level it was said at. A
+    /// batch's first stop is `info`, its first malformed cap `warn`, and every later one `debug`.
+    #[test]
+    fn a_batch_says_its_first_stop_at_info_its_first_bad_cap_at_warn_and_the_rest_at_debug() {
+        let runtime = runtime();
+        let shared = &runtime.shared;
+        let batch = BatchId::new();
+        let stop = BatchStop::CapReached {
+            spent: 600,
+            cap: 500,
+        };
+        let err = CapError::at_key(PER_TOKEN_CAP_BATCH, "\"lots\"".to_owned());
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let logs = logs.clone();
+                move || logs.clone()
+            })
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            shared.note_batch_stop(batch, ids::HTUI_ANA_2, &stop);
+            shared.note_batch_stop(batch, ids::HTUI_FEAT_1, &stop);
+            shared.note_bad_cap(batch, ids::PROJECT_HTUI, &err);
+            shared.note_bad_cap(batch, ids::PROJECT_HTUI, &err);
+        }
+
+        for (needle, level) in [
+            ("admits no more under its spend cap", " INFO "),
+            ("admits no further entry", " DEBUG "),
+            ("queue cap is malformed", " WARN "),
+            ("queue cap is still malformed", " DEBUG "),
+        ] {
+            let lines = logs.lines_with(needle);
+            assert_eq!(lines.len(), 1, "{needle}: said once: {lines:?}");
+            assert!(lines[0].contains(level), "{needle} at{level}: {lines:?}");
+        }
+    }
+
     /// Plan D172, MOD-41 plan D7: a frame reaches every subscriber of its item, each at its own
     /// subscription's address, and no subscriber of another item.
     #[tokio::test]

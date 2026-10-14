@@ -11,7 +11,8 @@
 //! reads its own `graph_snapshot` and nothing else (invariant 2, `docs/ANA-2.md:109-113`), which
 //! is what makes an edit to a phase mid-run a no-op for that run.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use htui_core::model::{
     Agent, AgentBox, AgentId, Attachment, BindingChange, BoundSkill, BoxId, CapError, Gate,
@@ -674,28 +675,54 @@ fn check_fan_out_caps(
 /// `'{}'` decodes).
 ///
 /// A decode failure is warned about, because it silently defaults every non-cap key; the caps are
-/// read separately and strictly (`ProjectCaps::from_settings`), so they are not among them.
+/// read separately and strictly (`ProjectCaps::from_settings`), so they are not among them. The
+/// warning is said once per `(project, updated_at)` and at `debug` after (CLEAN-11), so a resolve
+/// per run does not repeat it but an edit that is still malformed is heard.
 fn project_settings(project: &Project) -> ProjectSettings {
     match serde_json::from_value(project.settings.clone()) {
         Ok(settings) => settings,
         Err(err) => {
             let empty = match &project.settings {
+                // `resolve` refuses a `null` before it gets here (`ProjectCaps::from_settings`);
+                // kept so this function stays quiet on its own, without that read.
                 Value::Null => true,
                 Value::Object(map) => map.is_empty(),
                 _ => false,
             };
             if !empty {
-                // Not deduped: the file keeps no process-wide state, and a once-set would need a
-                // global lock for a line that only fires on an already-malformed document.
-                tracing::warn!(
-                    project = %project.id,
-                    %err,
-                    "project.settings does not fully decode; its non-cap keys read as defaults"
-                );
+                static WARNED: OnceLock<Mutex<HashMap<ProjectId, i64>>> = OnceLock::new();
+                let edit = project.updated_at.timestamp_micros();
+                if first_decode_failure(WARNED.get_or_init(Mutex::default), project.id, edit) {
+                    tracing::warn!(
+                        project = %project.id,
+                        %err,
+                        "project.settings does not fully decode; its non-cap keys read as defaults"
+                    );
+                } else {
+                    tracing::debug!(
+                        project = %project.id,
+                        %err,
+                        "project.settings still does not fully decode"
+                    );
+                }
             }
             ProjectSettings::default()
         }
     }
+}
+
+/// True when `project`'s document at `edit` (`updated_at` in micros) is not the one last noted.
+/// Only the last edit of each project is remembered, so the map holds one entry per project, as
+/// `first_of` holds one batch. The map is a parameter so a test can use its own.
+fn first_decode_failure(
+    seen: &Mutex<HashMap<ProjectId, i64>>,
+    project: ProjectId,
+    edit: i64,
+) -> bool {
+    seen.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(project, edit)
+        != Some(edit)
 }
 
 /// One `app_setting` value as a positive `i64`.
@@ -977,8 +1004,96 @@ mod tests {
         Agent, AgentBox, AgentId, BTreeMap, BoundSkill, BoxId, GraphSource, Isolation, Item,
         ItemId, PhaseAgent, PhaseId, ProjectId, PromptTemplate, ResolveError, Resolved,
         ResolvedGraph, Result, RunMode, SnapshotTemplate, StepGraphId, StepGraphPhase, Value,
-        WriteStore, effective_gate, override_graph, resolve,
+        WriteStore, effective_gate, first_decode_failure, override_graph, project_settings,
+        resolve,
     };
+
+    /// CLEAN-11: a malformed document is first for its `(project, updated_at)` and not again; an
+    /// edit that is still malformed is news. Over a local set, so no other test is in it.
+    #[test]
+    fn a_decode_failure_is_first_once_per_project_and_edit() {
+        let seen = std::sync::Mutex::default();
+        let project = ProjectId::new();
+        assert!(first_decode_failure(&seen, project, 1), "a new document");
+        assert!(!first_decode_failure(&seen, project, 1), "the same one");
+        assert!(first_decode_failure(&seen, project, 2), "an edit");
+        assert!(first_decode_failure(&seen, ProjectId::new(), 1), "another");
+        assert_eq!(
+            seen.lock().expect("unpoisoned").len(),
+            2,
+            "one entry per project"
+        );
+    }
+
+    /// A `tracing` writer into a shared buffer, for a case that asserts a line was logged.
+    #[derive(Clone, Default)]
+    struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogBuffer {
+        /// The captured lines that mention `needle`.
+        fn lines_with(&self, needle: &str) -> Vec<String> {
+            let bytes = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .filter(|line| line.contains(needle))
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    /// CLEAN-11 (CLEAN-9 review): every resolve of a project whose settings do not decode used to
+    /// warn. It warns once per `(project, updated_at)`, then at `debug`.
+    #[test]
+    fn a_malformed_project_settings_blob_warns_once_per_edit() {
+        // Its own project id: the once-set is process-wide, and a shared id would make the
+        // outcome depend on test order.
+        let mut project = demo_data().projects.remove(0);
+        project.id = ProjectId::new();
+        project.settings = json!([1]);
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let logs = logs.clone();
+                move || logs.clone()
+            })
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            project_settings(&project);
+            project_settings(&project);
+            project.updated_at += chrono::Duration::seconds(1);
+            project_settings(&project);
+        }
+
+        let warned = logs.lines_with("its non-cap keys read as defaults");
+        assert_eq!(warned.len(), 2, "once per edit: {warned:?}");
+        assert!(
+            warned.iter().all(|line| line.contains(" WARN ")),
+            "{warned:?}"
+        );
+        let again = logs.lines_with("still does not fully decode");
+        assert_eq!(again.len(), 1, "the repeat: {again:?}");
+        assert!(again[0].contains(" DEBUG "), "{again:?}");
+    }
 
     /// The digest of the seeded `feature` graph, resolved against the demo fixture with one
     /// `claude`/`sonnet` candidate per phase. Computed once and pasted, which is the only way a
