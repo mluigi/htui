@@ -1,0 +1,771 @@
+//! Mock data. Nothing here is real; it only has to look like htui's.
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Status {
+    Open,
+    Queued,
+    InProgress,
+    AwaitingApproval,
+    Blocked,
+    Failed,
+    Done,
+    Closed,
+}
+
+impl Status {
+    pub fn label(self) -> &'static str {
+        match self {
+            Status::Open => "open",
+            Status::Queued => "queued",
+            Status::InProgress => "running",
+            Status::AwaitingApproval => "needs you",
+            Status::Blocked => "blocked",
+            Status::Failed => "failed",
+            Status::Done => "done",
+            Status::Closed => "closed",
+        }
+    }
+}
+
+pub struct Item {
+    pub key: &'static str,
+    pub title: &'static str,
+    pub project: &'static str,
+    pub status: Status,
+    pub priority: &'static str,
+    pub deps: &'static [&'static str],
+    /// Other relationships: (kind, item key). Kinds: "relates to", "follows up", "duplicates".
+    pub rels: &'static [(&'static str, &'static str)],
+    pub body: &'static str,
+}
+
+pub struct Run {
+    pub step: &'static str,
+    pub status: Status,
+    pub agent: &'static str,
+    pub took: &'static str,
+    pub cost: &'static str,
+}
+
+pub struct Requirement {
+    /// The requirement this one refines (nesting).
+    pub parent: Option<&'static str>,
+    pub ws: usize,
+    /// None: a workspace-level requirement.
+    pub project: Option<&'static str>,
+    pub id: &'static str,
+    pub area: &'static str,
+    pub title: &'static str,
+    pub text: &'static str,
+    pub status: Status,
+    pub items: &'static [&'static str],
+}
+
+pub struct Skill {
+    pub name: &'static str,
+    pub group: &'static str,
+    pub desc: &'static str,
+    pub attach: &'static str,
+    pub body: &'static str,
+}
+
+pub enum Msg {
+    You(String),
+    Agent(String),
+    Tool { name: &'static str, arg: &'static str, ok: bool, took: &'static str },
+    Permission { what: &'static str, answer: Option<&'static str> },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SessionKind {
+    /// htui's own agent, in every workspace: settings, skills, agents, the catalogue.
+    Global,
+    /// The workspace's coordinator: always open for messages.
+    Workspace,
+    /// One project's coordinator: always open for messages.
+    Project,
+    /// An agent working on an item: view only, unless it asks you something.
+    Item(&'static str),
+    /// A finished step's transcript: read only.
+    Archived(&'static str, &'static str),
+}
+
+/// The workspace index of sessions shown in every workspace.
+pub const EVERY_WORKSPACE: usize = usize::MAX;
+
+pub struct Session {
+    pub ws: usize,
+    pub kind: SessionKind,
+    pub name: &'static str,
+    pub agent: &'static str,
+    pub model: &'static str,
+    pub project: &'static str,
+    pub state: Status,
+    pub msgs: Vec<Msg>,
+}
+
+#[derive(Clone, Copy)]
+pub enum FieldKind {
+    /// Enter runs it; the value is what it says.
+    Action(&'static str),
+    Text,
+    Secret,
+    Toggle,
+    Choice(&'static [&'static str]),
+    ReadOnly,
+}
+
+pub struct Field {
+    pub label: &'static str,
+    pub value: String,
+    pub kind: FieldKind,
+    pub help: &'static str,
+}
+
+pub struct Section {
+    pub name: &'static str,
+    pub group: &'static str,
+    pub about: &'static str,
+    pub fields: Vec<Field>,
+}
+
+pub struct AgentRow {
+    pub name: &'static str,
+    pub transport: &'static str,
+    pub billing: &'static str,
+    pub models: &'static str,
+    pub state: Status,
+    pub version: &'static str,
+}
+
+/// One activity event. `target` is the item key or chat name Enter jumps to.
+pub struct LogLine {
+    pub at: String,
+    pub ws: usize,
+    pub status: Status,
+    pub text: String,
+    pub target: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Level {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl Level {
+    pub const ALL: [Level; 5] = [Level::Trace, Level::Debug, Level::Info, Level::Warn, Level::Error];
+    pub fn name(self) -> &'static str {
+        match self {
+            Level::Trace => "TRACE",
+            Level::Debug => "DEBUG",
+            Level::Info => "INFO",
+            Level::Warn => "WARN",
+            Level::Error => "ERROR",
+        }
+    }
+}
+
+/// One line of htui's own log (the Logs tab).
+pub struct LogRec {
+    pub at: String,
+    pub level: Level,
+    pub target: &'static str,
+    pub msg: String,
+}
+
+pub const LOG_TARGETS: [(&str, &str); 7] = [
+    ("htui::ui", "ui"),
+    ("htui_store", "store"),
+    ("htui_orch", "orchestrator"),
+    ("htui_agent", "agents"),
+    ("htui_mcp", "mcp"),
+    ("htui_worker", "worker"),
+    ("htui_secrets", "secrets"),
+];
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WsState {
+    Open,
+    /// Not on screen; its runs keep going.
+    Background,
+    /// Waiting for its runs to finish; a second stop forces it.
+    Stopping,
+    Stopped,
+}
+
+pub struct Workspace {
+    pub name: &'static str,
+    pub projects: Vec<&'static str>,
+    pub opened: &'static str,
+    pub path: &'static str,
+    pub description: &'static str,
+    pub goals: &'static [&'static str],
+    pub state: WsState,
+}
+
+pub struct Project {
+    pub name: &'static str,
+    pub repo: &'static str,
+    pub description: &'static str,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Usage {
+    /// Uses the workspace's instance.
+    Shared,
+    /// Runs its own instance on this port.
+    Own(u16),
+    Unused,
+}
+
+impl Usage {
+    pub fn label(self) -> String {
+        match self {
+            Usage::Shared => "workspace's".into(),
+            Usage::Own(port) => format!("own · :{port}"),
+            Usage::Unused => "not used".into(),
+        }
+    }
+}
+
+/// A service in the workspace's docker compose: a database, a cache, anything with an image.
+pub struct Component {
+    pub ws: usize,
+    pub name: String,
+    pub ctype: &'static str,
+    pub kind: &'static str,
+    pub image: String,
+    pub port: u16,
+    pub status: Status,
+    /// For cloud emulators: the services it emulates.
+    pub services: Vec<&'static str>,
+    /// How each project of the workspace uses it.
+    pub usage: Vec<(&'static str, Usage)>,
+}
+
+/// One kind of component the catalogue knows: its image, default port, versions, and (for cloud
+/// emulators) the services it can emulate.
+pub struct CatKind {
+    pub name: &'static str,
+    pub image: &'static str,
+    pub port: u16,
+    pub versions: Vec<&'static str>,
+    pub services: Vec<&'static str>,
+}
+
+pub struct CatType {
+    pub name: &'static str,
+    pub kinds: Vec<CatKind>,
+}
+
+/// What can be added as a component. In htui this lives in the database, seeded on first start,
+/// and is refreshed on request; here it is mock data.
+pub struct Catalogue {
+    pub types: Vec<CatType>,
+    pub updated: String,
+}
+
+fn kind(name: &'static str, image: &'static str, port: u16, versions: &[&'static str], services: &[&'static str]) -> CatKind {
+    CatKind { name, image, port, versions: versions.to_vec(), services: services.to_vec() }
+}
+
+pub fn catalogue() -> Catalogue {
+    let t = |name, kinds| CatType { name, kinds };
+    Catalogue {
+        updated: "3 days ago".into(),
+        types: vec![
+            t("database", vec![
+                kind("postgres", "postgres", 5432, &["17", "16", "15", "14"], &[]),
+                kind("mysql", "mysql", 3306, &["8.4", "8.0"], &[]),
+                kind("mariadb", "mariadb", 3306, &["11.4", "10.11"], &[]),
+                kind("mongodb", "mongo", 27017, &["8.0", "7.0"], &[]),
+            ]),
+            t("cache", vec![
+                kind("redis", "redis", 6379, &["7.4", "7.2"], &[]),
+                kind("valkey", "valkey/valkey", 6379, &["8.1", "8.0"], &[]),
+                kind("memcached", "memcached", 11211, &["1.6"], &[]),
+            ]),
+            t("queue", vec![
+                kind("rabbitmq", "rabbitmq", 5672, &["4.1-management", "3.13-management"], &[]),
+                kind("nats", "nats", 4222, &["2.11", "2.10"], &[]),
+                kind("kafka", "apache/kafka", 9092, &["4.0.0", "3.9.0"], &[]),
+            ]),
+            t("cloud emulator", vec![
+                kind("floci", "floci/floci", 4566, &["latest"], &["s3", "sqs", "sns", "dynamodb", "lambda", "secretsmanager"]),
+                kind("localstack", "localstack/localstack", 4566, &["4.5", "4.4", "latest"], &["s3", "sqs", "sns", "dynamodb", "lambda", "kinesis", "secretsmanager"]),
+                kind("elasticmq", "softwaremill/elasticmq-native", 9324, &["1.6"], &["sqs"]),
+                kind("azurite", "mcr.microsoft.com/azure-storage/azurite", 10000, &["latest"], &["blob", "queue", "table"]),
+                kind("gcp emulators", "gcr.io/google.com/cloudsdktool/google-cloud-cli", 8085, &["emulators"], &["pubsub", "firestore", "bigtable"]),
+            ]),
+            t("object storage", vec![kind("minio", "minio/minio", 9000, &["latest"], &[])]),
+            t("search", vec![
+                kind("qdrant", "qdrant/qdrant", 6333, &["v1.15", "v1.14"], &[]),
+                kind("meilisearch", "getmeili/meilisearch", 7700, &["v1.15"], &[]),
+                kind("elasticsearch", "elasticsearch", 9200, &["8.19.0"], &[]),
+            ]),
+            t("custom", vec![kind("any image", "ghcr.io/you/service", 8080, &["latest"], &[])]),
+        ],
+    }
+}
+
+pub struct Data {
+    pub catalogue: Catalogue,
+    pub workspaces: Vec<Workspace>,
+    pub projects: Vec<Project>,
+    pub components: Vec<Component>,
+    pub htui_log: Vec<LogRec>,
+    pub items: Vec<Item>,
+    pub reqs: Vec<Requirement>,
+    pub skills: Vec<Skill>,
+    pub sessions: Vec<Session>,
+    pub sections: Vec<Section>,
+    pub agents: Vec<AgentRow>,
+    pub log: Vec<LogLine>,
+}
+
+const BODY_DEFAULT: &str = "# Goal
+Make the thing described in the title work end to end, with tests.
+
+# Acceptance
+- the happy path is covered by an integration test
+- errors surface in the UI with a next step, not a code
+- `cargo test --workspace` stays green
+
+# Notes
+Mock body. In htui this is the item's markdown, rendered in place.";
+
+const BODY_KEYMAP: &str = "# Goal
+Every key htui reacts to comes from one keymap the user can rebind in `keys.toml`.
+
+# Acceptance
+- the queue and picker keys are rebindable
+- a conflicting binding is rejected with the two actions named
+- the old `keymap.rs` is gone
+
+# Milestones
+- M5 rebindable keys — done
+- M6 queue/picker keys, remove the old keymap — in review
+
+# Notes
+The hint line reads from the same catalogue, so a rebound key shows its new name.";
+
+pub fn mock() -> Data {
+    let items = vec![
+        Item { key: "ANA-28", title: "Retention policy for run transcripts", project: "htui", status: Status::Done, priority: "medium", deps: &[], rels: &[], body: BODY_DEFAULT },
+        Item { key: "ANA-33", title: "UI audit: btop-style shell and layouts", project: "htui", status: Status::InProgress, priority: "high", deps: &["MOD-80"], rels: &[("follows up", "MOD-67")], body: BODY_DEFAULT },
+        Item { key: "MOD-67", title: "Rebindable keymap", project: "htui", status: Status::AwaitingApproval, priority: "high", deps: &["MOD-80", "ANA-21"], rels: &[("relates to", "TOOL-8")], body: BODY_KEYMAP },
+        Item { key: "MOD-80", title: "Theme roles and NO_COLOR", project: "htui", status: Status::Done, priority: "medium", deps: &["ANA-21"], rels: &[], body: BODY_DEFAULT },
+        Item { key: "ANA-21", title: "Keymap survey across TUIs", project: "htui", status: Status::Done, priority: "low", deps: &[], rels: &[], body: BODY_DEFAULT },
+        Item { key: "MOD-107", title: "spawn_subagent MCP tool", project: "htui", status: Status::Queued, priority: "high", deps: &["MOD-67"], rels: &[], body: BODY_DEFAULT },
+        Item { key: "MOD-108", title: "Honour retention_days in the sweeper", project: "htui", status: Status::Open, priority: "medium", deps: &["ANA-28"], rels: &[], body: BODY_DEFAULT },
+        Item { key: "MOD-109", title: "Multiple Chat tabs", project: "htui", status: Status::Blocked, priority: "medium", deps: &["MOD-107"], rels: &[("relates to", "MOD-67")], body: BODY_DEFAULT },
+        Item { key: "CLEAN-11", title: "Drop the legacy markdown importer", project: "htui", status: Status::Failed, priority: "low", deps: &[], rels: &[], body: BODY_DEFAULT },
+        Item { key: "CLEAN-12", title: "Split backlog/mod.rs", project: "htui", status: Status::Open, priority: "medium", deps: &[], rels: &[("follows up", "ANA-33")], body: BODY_DEFAULT },
+        Item { key: "TOOL-8", title: "Guards, /gate, /next, /validate", project: "htui", status: Status::InProgress, priority: "high", deps: &[], rels: &[], body: BODY_DEFAULT },
+        Item { key: "TOOL-9", title: "Gate hooks", project: "htui", status: Status::Closed, priority: "low", deps: &["TOOL-8"], rels: &[], body: BODY_DEFAULT },
+        Item { key: "FEAT-1", title: "ACP transport upgrade", project: "agy", status: Status::Open, priority: "high", deps: &[], rels: &[], body: BODY_DEFAULT },
+        Item { key: "FIX-1", title: "Session leak on cancel", project: "agy", status: Status::InProgress, priority: "high", deps: &["FEAT-1"], rels: &[], body: BODY_DEFAULT },
+        Item { key: "ANA-1", title: "Prompt assembly survey", project: "agy", status: Status::Done, priority: "low", deps: &[], rels: &[], body: BODY_DEFAULT },
+        Item { key: "VAL-2", title: "Validate the Windows build", project: "agy", status: Status::Queued, priority: "medium", deps: &["FIX-1"], rels: &[], body: BODY_DEFAULT },
+        Item { key: "FEAT-3", title: "Postgres failover", project: "infra", status: Status::InProgress, priority: "high", deps: &["ANA-4"], rels: &[], body: BODY_DEFAULT },
+        Item { key: "FIX-2", title: "TLS certificate rotation", project: "infra", status: Status::Failed, priority: "high", deps: &[], rels: &[], body: BODY_DEFAULT },
+        Item { key: "ANA-4", title: "Latency budget per endpoint", project: "api", status: Status::Done, priority: "medium", deps: &[], rels: &[], body: BODY_DEFAULT },
+        Item { key: "MOD-12", title: "Rate limiting", project: "api", status: Status::Open, priority: "medium", deps: &["ANA-4"], rels: &[], body: BODY_DEFAULT },
+    ];
+
+    let workspaces = vec![
+        Workspace {
+            name: "Graphics",
+            projects: vec!["htui", "agy"],
+            opened: "now",
+            path: "~/projects/graphics",
+            description: "The agent tooling: htui and the runtime it drives.",
+            goals: &["ship the keymap and the new shell by November", "every run reproducible on any box"],
+            state: WsState::Open,
+        },
+        Workspace {
+            name: "Platform",
+            projects: vec!["infra", "api"],
+            opened: "yesterday",
+            path: "~/work/platform",
+            description: "Production services and the infrastructure under them.",
+            goals: &["zero-downtime deploys", "p99 under 200 ms"],
+            state: WsState::Background,
+        },
+        Workspace {
+            name: "Personal",
+            projects: vec![],
+            opened: "3 weeks ago",
+            path: "~/personal",
+            description: "Side projects.",
+            goals: &[],
+            state: WsState::Stopped,
+        },
+    ];
+
+    let reqs = vec![
+        Requirement { parent: None, ws: 0, project: Some("htui"), id: "R-1", area: "Backlog", title: "Items form a dependency graph", text: "Every item may depend on others; the queue never starts an item whose dependencies are not done.", status: Status::Done, items: &["ANA-2", "MOD-4"] },
+        Requirement { parent: None, ws: 0, project: Some("htui"), id: "R-2", area: "Backlog", title: "Status is visible at a glance", text: "Every list that shows items shows their status with a glyph and a colour, never only a word.", status: Status::InProgress, items: &["MOD-80", "ANA-33"] },
+        Requirement { parent: Some("R-2"), ws: 0, project: Some("htui"), id: "R-2.1", area: "Backlog", title: "A glyph per status", text: "Each status has its own glyph, so it reads without colour.", status: Status::Done, items: &["MOD-80"] },
+        Requirement { parent: Some("R-2"), ws: 0, project: Some("htui"), id: "R-2.2", area: "Backlog", title: "Graphs colour nodes by status", text: "The Graph and Runs views colour each node by its status.", status: Status::InProgress, items: &["ANA-33", "MOD-67"] },
+        Requirement { parent: Some("R-20"), ws: 0, project: Some("htui"), id: "R-20.1", area: "UI", title: "Conflicts are named", text: "A conflicting binding is rejected with both actions named.", status: Status::AwaitingApproval, items: &["MOD-67"] },
+        Requirement { parent: None, ws: 0, project: Some("htui"), id: "R-7", area: "Agents", title: "Spawn subagents over MCP", text: "An agent can start a subagent through the htui MCP server and see its result.", status: Status::Open, items: &["MOD-107"] },
+        Requirement { parent: None, ws: 0, project: Some("htui"), id: "R-9", area: "Agents", title: "Quota is shown per agent", text: "The Agents section shows the quota each agent reported, and when it was last refreshed.", status: Status::InProgress, items: &["MOD-41"] },
+        Requirement { parent: None, ws: 0, project: Some("htui"), id: "R-12", area: "Chat", title: "Several chats at once", text: "The user can keep more than one chat open and switch between them without losing either.", status: Status::Open, items: &["MOD-109"] },
+        Requirement { parent: None, ws: 0, project: Some("htui"), id: "R-13", area: "Chat", title: "Permission requests are answered inline", text: "A permission request appears in the transcript where it happened, with its options as keys.", status: Status::Done, items: &["MOD-2"] },
+        Requirement { parent: None, ws: 0, project: Some("htui"), id: "R-20", area: "UI", title: "Every key is rebindable", text: "Every key htui reacts to can be rebound in keys.toml.", status: Status::InProgress, items: &["MOD-67"] },
+        Requirement { parent: None, ws: 0, project: Some("htui"), id: "R-21", area: "UI", title: "Each tab explains itself", text: "A toggleable panel says what the tab is for and the common actions.", status: Status::Open, items: &["ANA-33"] },
+        Requirement { parent: None, ws: 0, project: None, id: "W-1", area: "Workspace", title: "Every project builds offline", text: "No project in Graphics needs the network to build once its dependencies are cached.", status: Status::InProgress, items: &["VAL-2"] },
+        Requirement { parent: None, ws: 0, project: Some("agy"), id: "R-3", area: "Agents", title: "Cancelling a session frees it", text: "A cancelled agent session releases its process and its lease within a second.", status: Status::InProgress, items: &["FIX-1"] },
+        Requirement { parent: None, ws: 1, project: None, id: "W-1", area: "Workspace", title: "Zero-downtime deploys", text: "Every service in Platform deploys without dropping requests.", status: Status::Open, items: &["FEAT-3"] },
+        Requirement { parent: None, ws: 1, project: Some("api"), id: "R-1", area: "API", title: "p99 under 200 ms", text: "Every public endpoint answers within 200 ms at p99 under nominal load.", status: Status::InProgress, items: &["ANA-4", "MOD-12"] },
+        Requirement { parent: None, ws: 0, project: Some("htui"), id: "R-30", area: "Storage", title: "Transcripts expire", text: "Run transcripts older than retention_days are deleted by the sweeper.", status: Status::Open, items: &["MOD-108"] },
+    ];
+
+    let skills = vec![
+        Skill { name: "handoff-run", group: "Library", desc: "Run a HANDOFF item through its full lifecycle.", attach: "**/HANDOFF.md", body: "1. select the item\n2. route: PRD / plan / ANA\n3. confirm with the maintainer\n4. run the chain\n5. bookkeeping + validate" },
+        Skill { name: "handoff-add", group: "Library", desc: "Create a HANDOFF item from one line.", attach: "**/HANDOFF.md", body: "Mint the ID, write the checklist line, recount, validate." },
+        Skill { name: "plan", group: "Library", desc: "Restate requirements and write a step plan.", attach: "—", body: "Wait for CONFIRM before touching code." },
+        Skill { name: "rust-review", group: "Library", desc: "Ownership, lifetimes, error handling.", attach: "**/*.rs", body: "Check unwraps, clones in hot paths, error context." },
+        Skill { name: "mod-item", group: "Templates", desc: "Template for a MOD item body.", attach: "—", body: "# Goal\n# Acceptance\n# Milestones\n# Notes" },
+        Skill { name: "ana-item", group: "Templates", desc: "Template for an ANA item body.", attach: "—", body: "# Question\n# Method\n# Findings\n# Verdict" },
+        Skill { name: "claude", group: "Agent help", desc: "How htui drives Claude Code over ACP.", attach: "—", body: "Transport: acp. Billing: subscription.\nPermissions are forwarded to the Chat tab." },
+        Skill { name: "codex", group: "Agent help", desc: "How htui drives Codex.", attach: "—", body: "Transport: acp. Billing: api key." },
+    ];
+
+    let sessions = vec![
+        Session {
+            ws: EVERY_WORKSPACE,
+            kind: SessionKind::Global,
+            name: "htui agent",
+            agent: "claude",
+            model: "opus",
+            project: "htui",
+            state: Status::Open,
+            msgs: vec![
+                Msg::You("add a skill for reviewing SQL migrations and attach it to migrations".into()),
+                Msg::Tool { name: "skills", arg: "create sql-migration-review", ok: true, took: "0.2s" },
+                Msg::Tool { name: "skills", arg: "attach sql-migration-review **/migrations/*.sql", ok: true, took: "0.1s" },
+                Msg::Agent("Done: sql-migration-review exists and is attached to **/migrations/*.sql.\nI can also change settings (queue limits, agents), add skills or templates, and refresh the component catalogue.".into()),
+            ],
+        },
+        Session {
+            ws: 0,
+            kind: SessionKind::Workspace,
+            name: "Graphics coordinator",
+            agent: "claude",
+            model: "opus",
+            project: "Graphics",
+            state: Status::Open,
+            msgs: vec![
+                Msg::You("what should I look at first today?".into()),
+                Msg::Tool { name: "query", arg: "items needing a person", ok: true, took: "0.1s" },
+                Msg::Agent("Two things need you: MOD-67's review asks which conflict message wording you prefer, and CLEAN-11's gate wants permission to delete build/. TOOL-8 and FIX-1 are running fine.".into()),
+            ],
+        },
+        Session {
+            ws: 0,
+            kind: SessionKind::Project,
+            name: "htui coordinator",
+            agent: "claude",
+            model: "opus",
+            project: "htui",
+            state: Status::InProgress,
+            msgs: vec![
+                Msg::You("queue MOD-107 after MOD-67 lands".into()),
+                Msg::Agent("Queued. MOD-107 starts when MOD-67's gate passes; I'll tell you here.".into()),
+            ],
+        },
+        Session {
+            ws: 0,
+            kind: SessionKind::Project,
+            name: "agy coordinator",
+            agent: "codex",
+            model: "gpt-5",
+            project: "agy",
+            state: Status::Open,
+            msgs: vec![Msg::Agent("FIX-1 is implementing. VAL-2 waits for it.".into())],
+        },
+        Session {
+            ws: 0,
+            kind: SessionKind::Item("MOD-67"),
+            name: "MOD-67 · review",
+            agent: "claude",
+            model: "opus",
+            project: "htui",
+            state: Status::AwaitingApproval,
+            msgs: vec![
+                Msg::Tool { name: "read", arg: "docs/decisions/MOD-67.md", ok: true, took: "0.1s" },
+                Msg::Tool { name: "read", arg: "crates/htui/src/keys/validate.rs", ok: true, took: "0.1s" },
+                Msg::Agent("Two review comments disagree on the conflict message. Which do you want?\n  1) \"x is already bound to quit\"\n  2) \"x: conflicts with quit (keys.toml:12)\"".into()),
+            ],
+        },
+        Session {
+            ws: 0,
+            kind: SessionKind::Item("CLEAN-11"),
+            name: "CLEAN-11 · gate",
+            agent: "claude",
+            model: "sonnet",
+            project: "htui",
+            state: Status::AwaitingApproval,
+            msgs: vec![
+                Msg::Agent("The gate failed on stale build output. I'll remove it and re-run.".into()),
+                Msg::Tool { name: "read", arg: "CMakeLists.txt", ok: true, took: "0.1s" },
+                Msg::Permission { what: "execute  rm -rf build", answer: None },
+            ],
+        },
+        Session {
+            ws: 0,
+            kind: SessionKind::Item("TOOL-8"),
+            name: "TOOL-8 · implement",
+            agent: "claude",
+            model: "sonnet",
+            project: "htui",
+            state: Status::InProgress,
+            msgs: vec![
+                Msg::Agent("Step 3/5: wiring /gate into the status line.".into()),
+                Msg::Tool { name: "edit", arg: "crates/htui/src/state_cmd.rs", ok: true, took: "0.3s" },
+                Msg::Tool { name: "execute", arg: "cargo test -p htui state_cmd", ok: true, took: "38s" },
+                Msg::Agent("Tests pass. Moving on to /next.".into()),
+            ],
+        },
+        Session {
+            ws: 0,
+            kind: SessionKind::Item("FIX-1"),
+            name: "FIX-1 · implement",
+            agent: "codex",
+            model: "gpt-5",
+            project: "agy",
+            state: Status::InProgress,
+            msgs: vec![
+                Msg::Tool { name: "search", arg: "\"cancel\" in src/session/", ok: true, took: "0.2s" },
+                Msg::Agent("The leak is a missing drop of the lease guard on the cancel path. Writing a test first.".into()),
+            ],
+        },
+        Session {
+            ws: 1,
+            kind: SessionKind::Workspace,
+            name: "Platform coordinator",
+            agent: "claude",
+            model: "opus",
+            project: "Platform",
+            state: Status::Open,
+            msgs: vec![Msg::Agent("FEAT-3 is running in the background. FIX-2's gate failed overnight.".into())],
+        },
+        Session { ws: 1, kind: SessionKind::Project, name: "infra coordinator", agent: "claude", model: "sonnet", project: "infra", state: Status::Open, msgs: vec![] },
+        Session { ws: 1, kind: SessionKind::Project, name: "api coordinator", agent: "claude", model: "sonnet", project: "api", state: Status::Open, msgs: vec![] },
+        Session {
+            ws: 1,
+            kind: SessionKind::Item("FEAT-3"),
+            name: "FEAT-3 · implement",
+            agent: "claude",
+            model: "sonnet",
+            project: "infra",
+            state: Status::InProgress,
+            msgs: vec![Msg::Agent("Writing the failover script; replica promotion works in the test cluster.".into())],
+        },
+        Session { ws: 2, kind: SessionKind::Workspace, name: "Personal coordinator", agent: "claude", model: "sonnet", project: "Personal", state: Status::Open, msgs: vec![] },
+    ];
+
+    let sections = vec![
+        Section { name: "Agents", group: "Agents", about: "The coding agents htui can drive, and whether each is ready on this box.", fields: vec![] },
+        Section {
+            name: "Personas",
+            group: "Agents",
+            about: "Named prompt + model presets an agent can run as.",
+            fields: vec![
+                Field { label: "default persona", value: "implementer".into(), kind: FieldKind::Choice(&["implementer", "reviewer", "architect"]), help: "used when an item names none" },
+                Field { label: "import from", value: "~/.claude/agents".into(), kind: FieldKind::Text, help: "a directory of persona files" },
+            ],
+        },
+        Section {
+            name: "Prompt",
+            group: "Agents",
+            about: "What every agent prompt starts with.",
+            fields: vec![
+                Field { label: "preamble", value: "You are working in htui's sandbox.".into(), kind: FieldKind::Text, help: "prepended to every prompt" },
+                Field { label: "include concepts", value: "on".into(), kind: FieldKind::Toggle, help: "attach CONCEPTS.md excerpts" },
+            ],
+        },
+        Section {
+            name: "Queue",
+            group: "Running",
+            about: "How much may run at once, and what it may cost.",
+            fields: vec![
+                Field { label: "run cap", value: "unbounded".into(), kind: FieldKind::Text, help: "USD per run; empty = unbounded" },
+                Field { label: "batch cap", value: "1.50".into(), kind: FieldKind::Text, help: "USD per batch" },
+                Field { label: "max concurrent", value: "2".into(), kind: FieldKind::Choice(&["1", "2", "4", "8"]), help: "runs at once on this box" },
+                Field { label: "auto queue", value: "off".into(), kind: FieldKind::Toggle, help: "start ready items without asking" },
+                Field { label: "window", value: "not set".into(), kind: FieldKind::Text, help: "e.g. 22:00-07:00" },
+            ],
+        },
+        Section {
+            name: "Boxes",
+            group: "Running",
+            about: "The machines htui has seen, and this one's limits.",
+            fields: vec![
+                Field { label: "this box", value: "DESKTOP-HTUI".into(), kind: FieldKind::ReadOnly, help: "fingerprinted from the machine id" },
+                Field { label: "cpu", value: "16 cores".into(), kind: FieldKind::ReadOnly, help: "" },
+                Field { label: "accept runs", value: "on".into(), kind: FieldKind::Toggle, help: "let the queue start runs here" },
+            ],
+        },
+        Section {
+            name: "Connection",
+            group: "Storage",
+            about: "The Postgres database every box shares.",
+            fields: vec![
+                Field { label: "status", value: "● connected · 3 ms".into(), kind: FieldKind::ReadOnly, help: "" },
+                Field { label: "DSN", value: "postgres://htui@db.local/htui".into(), kind: FieldKind::Secret, help: "stored in the OS keyring" },
+                Field { label: "offline buffer", value: "off".into(), kind: FieldKind::Toggle, help: "queue writes while unreachable" },
+            ],
+        },
+        Section {
+            name: "Catalogue",
+            group: "Storage",
+            about: "What can be added as a component: images, versions, emulated services. Stored in the database.",
+            fields: vec![
+                Field { label: "source", value: "built-in list, copied to the database on first start".into(), kind: FieldKind::ReadOnly, help: "" },
+                Field { label: "last updated", value: "3 days ago".into(), kind: FieldKind::ReadOnly, help: "" },
+                Field { label: "update now", value: "fetch new kinds and versions".into(), kind: FieldKind::Action("catalogue updated: 3 new versions (postgres 18, kafka 4.1.0, valkey 8.2)"), help: "Enter runs it; the htui agent can do it too" },
+            ],
+        },
+        Section {
+            name: "Qdrant",
+            group: "Storage",
+            about: "The vector index behind concept search.",
+            fields: vec![
+                Field { label: "url", value: "http://localhost:6334".into(), kind: FieldKind::Text, help: "" },
+                Field { label: "collection", value: "htui-concepts".into(), kind: FieldKind::Text, help: "" },
+            ],
+        },
+        Section {
+            name: "Secrets",
+            group: "Storage",
+            about: "Where project secrets come from.",
+            fields: vec![
+                Field { label: "provider", value: "infisical".into(), kind: FieldKind::Choice(&["none", "infisical", "env file"]), help: "" },
+                Field { label: "URL", value: "https://infisical.example.com".into(), kind: FieldKind::Text, help: "" },
+                Field { label: "client secret", value: "s3cr3t-value-123".into(), kind: FieldKind::Secret, help: "never shown; storing replaces it" },
+            ],
+        },
+        Section {
+            name: "Hierarchy",
+            group: "Backlog",
+            about: "How projects nest inside the open workspace. Switching workspace is w, from anywhere.",
+            fields: vec![
+                Field { label: "group items by", value: "project".into(), kind: FieldKind::Choice(&["project", "kind", "status"]), help: "how the Backlog list is grouped" },
+                Field { label: "show closed", value: "off".into(), kind: FieldKind::Toggle, help: "list closed and done items" },
+            ],
+        },
+        Section {
+            name: "Kinds",
+            group: "Backlog",
+            about: "Item prefixes (ANA, MOD, …) and what each one means.",
+            fields: vec![
+                Field { label: "ANA", value: "analysis".into(), kind: FieldKind::Text, help: "" },
+                Field { label: "MOD", value: "module / feature".into(), kind: FieldKind::Text, help: "" },
+                Field { label: "CLEAN", value: "cleanup".into(), kind: FieldKind::Text, help: "" },
+                Field { label: "TOOL", value: "tooling".into(), kind: FieldKind::Text, help: "" },
+            ],
+        },
+    ];
+
+    let agents = vec![
+        AgentRow { name: "claude", transport: "acp", billing: "subscription", models: "opus, sonnet", state: Status::Done, version: "2.1.290" },
+        AgentRow { name: "codex", transport: "acp", billing: "api key", models: "gpt-5", state: Status::Done, version: "0.48.0" },
+        AgentRow { name: "gemini", transport: "acp", billing: "subscription", models: "—", state: Status::AwaitingApproval, version: "1.4.0" },
+        AgentRow { name: "aider", transport: "cli", billing: "api key", models: "—", state: Status::Failed, version: "—" },
+    ];
+
+    let ev = |at: &str, ws: usize, status: Status, text: &str, target: Option<&'static str>| LogLine {
+        at: at.to_string(),
+        ws,
+        status,
+        text: text.to_string(),
+        target,
+    };
+    let log = vec![
+        ev("20:39:50", 1, Status::Failed, "Platform · run FIX-2 · gate failed: cert fixture expired", Some("FIX-2")),
+        ev("20:41:03", 0, Status::InProgress, "run MOD-67 · review started (claude · opus)", Some("MOD-67")),
+        ev("20:41:40", 0, Status::Done, "run MOD-80 · gate passed (412 tests)", Some("MOD-80")),
+        ev("20:42:12", 0, Status::AwaitingApproval, "CLEAN-11 · gate asks: rm -rf build", Some("CLEAN-11 · gate")),
+        ev("20:43:05", 0, Status::AwaitingApproval, "MOD-67 · review asks which wording you prefer", Some("MOD-67 · review")),
+        ev("20:44:31", 0, Status::InProgress, "run TOOL-8 · implement step 3/5", Some("TOOL-8")),
+        ev("20:44:58", 1, Status::InProgress, "Platform · run FEAT-3 · implement step 2/5", Some("FEAT-3")),
+        ev("20:45:02", 0, Status::Queued, "MOD-107 queued behind MOD-67", Some("MOD-107")),
+        ev("20:46:18", 0, Status::Done, "concepts re-indexed (1 204 chunks)", None),
+    ];
+
+    let projects = vec![
+        Project { name: "htui", repo: "~/projects/htui", description: "The terminal UI that runs coding agents over a shared backlog." },
+        Project { name: "agy", repo: "~/projects/agy", description: "The agent runtime htui drives over ACP." },
+        Project { name: "infra", repo: "~/work/platform/infra", description: "Terraform, the database cluster and its failover." },
+        Project { name: "api", repo: "~/work/platform/api", description: "The public HTTP API." },
+    ];
+
+    let components = vec![
+        Component { ws: 0, name: "db".into(), ctype: "database", kind: "postgres", image: "postgres:16".into(), port: 5432, status: Status::InProgress, services: vec![], usage: vec![("htui", Usage::Shared), ("agy", Usage::Own(5433))] },
+        Component { ws: 0, name: "vectors".into(), ctype: "search", kind: "qdrant", image: "qdrant/qdrant:v1.15".into(), port: 6333, status: Status::InProgress, services: vec![], usage: vec![("htui", Usage::Shared), ("agy", Usage::Unused)] },
+        Component { ws: 1, name: "db".into(), ctype: "database", kind: "postgres", image: "postgres:16".into(), port: 5432, status: Status::InProgress, services: vec![], usage: vec![("infra", Usage::Shared), ("api", Usage::Shared)] },
+        Component { ws: 1, name: "cache".into(), ctype: "cache", kind: "redis", image: "redis:7.4".into(), port: 6379, status: Status::Queued, services: vec![], usage: vec![("infra", Usage::Unused), ("api", Usage::Shared)] },
+    ];
+
+    let htui_log = (0..60).map(mock_log).collect();
+
+    Data { catalogue: catalogue(), workspaces, projects, components, htui_log, items, reqs, skills, sessions, sections, agents, log }
+}
+
+/// A run history derived from the item's status, so every item has something to show.
+pub fn runs(item: &Item) -> Vec<Run> {
+    const STEPS: [&str; 5] = ["plan", "architect", "implement", "review", "gate"];
+    let (done, current) = match item.status {
+        Status::Open | Status::Queued => return Vec::new(),
+        Status::InProgress => (2, Some(Status::InProgress)),
+        Status::AwaitingApproval => (3, Some(Status::AwaitingApproval)),
+        Status::Blocked => (1, Some(Status::Blocked)),
+        Status::Failed => (4, Some(Status::Failed)),
+        Status::Done | Status::Closed => (5, None),
+    };
+    let mut runs: Vec<Run> = STEPS[..done]
+        .iter()
+        .map(|step| Run { step, status: Status::Done, agent: "claude · opus", took: "4m 12s", cost: "$0.38" })
+        .collect();
+    if let Some(status) = current {
+        runs.push(Run { step: STEPS[done.min(4)], status, agent: "claude · opus", took: "1m 03s", cost: "$0.11" });
+    }
+    runs
+}
+
+/// The n-th line of htui's own log: deterministic, so every run looks the same.
+pub fn mock_log(n: usize) -> LogRec {
+    const MSGS: [(Level, usize, &str); 16] = [
+        (Level::Info, 1, "connected to postgres://htui@db.local/htui in 3 ms"),
+        (Level::Debug, 0, "frame drawn in 1.2 ms (34 widgets)"),
+        (Level::Info, 2, "run MOD-67: step review started on claude/opus"),
+        (Level::Debug, 3, "acp: session/update tool_call read docs/decisions/MOD-67.md"),
+        (Level::Trace, 0, "key Down → backlog.list.move"),
+        (Level::Info, 5, "worker DESKTOP-HTUI heartbeat, 2 runs, 0 queued"),
+        (Level::Warn, 3, "gemini: not authenticated, skipping probe"),
+        (Level::Debug, 1, "LISTEN run_events: 3 notifications"),
+        (Level::Info, 4, "mcp: spawn_subagent called by TOOL-8"),
+        (Level::Error, 2, "run CLEAN-11: gate failed (exit 101): 2 tests"),
+        (Level::Debug, 6, "infisical: token refreshed, expires in 3600 s"),
+        (Level::Info, 2, "queue: MOD-107 waits for MOD-67"),
+        (Level::Warn, 1, "slow query 412 ms: SELECT … FROM run_step WHERE …"),
+        (Level::Trace, 3, "acp: <- session/update agent_message_chunk (182 bytes)"),
+        (Level::Info, 0, "workspace Platform moved to the background (1 run continues)"),
+        (Level::Debug, 5, "lease renewed for run TOOL-8 (ttl 30 s)"),
+    ];
+    let (level, target, msg) = MSGS[n % MSGS.len()];
+    let secs = 20 * 3600 + 30 * 60 + n * 7;
+    LogRec {
+        at: format!("{:02}:{:02}:{:02}.{:03}", secs / 3600, secs / 60 % 60, secs % 60, (n * 137) % 1000),
+        level,
+        target: LOG_TARGETS[target].0,
+        msg: msg.to_string(),
+    }
+}
