@@ -183,8 +183,12 @@ fn finish(nodes: Vec<Node<StatusNode>>, edges: Vec<Edge<StepEdge>>, select: &str
         }
     }
     let links: Vec<(String, String)> = edges.iter().map(|e| (e.source.clone(), e.target.clone())).collect();
-    let nodes = nodes.into_iter().map(|n| n.with_draggable(false).with_connectable(false).with_deletable(false)).collect();
-    let mut flow = Graph::with_graph(nodes, edges).expect("mock graph is valid").with_theme(flow_theme(pal));
+    // Nodes can be dragged to tidy the picture; links can never be made, moved or deleted here.
+    let nodes = nodes.into_iter().map(|n| n.with_draggable(true).with_connectable(false).with_deletable(false)).collect();
+    let mut flow = Graph::with_graph(nodes, edges)
+        .expect("mock graph is valid")
+        .with_theme(flow_theme(pal))
+        .with_edges_reconnectable(false);
     let layout = if opts.horizontal { Sugiyama::horizontal() } else { Sugiyama::vertical() };
     let spacing = if opts.labels.labels() { 4.0 } else { 2.0 };
     flow.apply_layout(layout.with_node_spacing(2.0).with_rank_spacing(spacing).with_margin(1.0));

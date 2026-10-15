@@ -17,11 +17,11 @@ pub fn about(tab: usize) -> (&'static str, Vec<(&'static str, &'static str)>) {
     match tab {
         WORKSPACES => (
             "Every saved workspace, its projects, components (databases, caches…) and requirements. Open one; the others keep running.",
-            vec![("o", "open"), ("s", "stop (twice: force)"), ("N", "add component"), ("[ ]", "sections")],
+            vec![("o", "open"), ("s", "stop (twice: force)"), ("r", "resume"), ("N", "new…"), ("S-←→", "sections")],
         ),
         BACKLOG => (
-            "The open workspace's items, grouped by project. Pick one; its body, runs and dependency graph open on the right.",
-            vec![("N", "new item"), ("/", "filter"), ("Tab", "next pane"), ("[ ]", "sections"), ("p", "layout")],
+            "The open workspace's items. Pick one; its body, runs and dependency graph open on the right.",
+            vec![("N", "new item"), ("/", "filter"), ("h", "done items"), ("g", "grouping"), ("Tab", "next pane"), ("S-←→", "sections")],
         ),
         CHAT => (
             "The workspace and project coordinators, and every agent working on an item. Item chats are read-only until they ask you.",
@@ -53,16 +53,23 @@ pub fn draw_list(f: &mut Frame, app: &App, area: Rect, pal: Palette) {
     let entries = rows.iter().filter(|r| matches!(r, RowRef::Entry(_))).count();
     let pos = rows[..(t.tree.cursor + 1).min(rows.len())].iter().filter(|r| matches!(r, RowRef::Entry(_))).count();
 
-    let all: &[(&str, &str)] =
-        if app.tab == WORKSPACES { &[("o", "open"), ("s", "stop"), ("←→", "fold")] } else { &[("/", "filter"), ("←→", "fold"), ("Enter", "open")] };
+    let all: &[(&str, &str)] = match app.tab {
+        WORKSPACES => &[("o", "open"), ("s", "stop"), ("←→", "fold")],
+        BACKLOG => &[("h", "done"), ("g", "group"), ("/", "filter"), ("←→", "fold")],
+        _ => &[("/", "filter"), ("←→", "fold"), ("Enter", "open")],
+    };
     // As many hints as fit in the border; a narrow list keeps the first ones.
     let mut n = all.len();
     while n > 0 && crate::ui::hint_line(&all[..n], pal).width() as u16 + 4 > area.width {
         n -= 1;
     }
     let hints = &all[..n];
+    let mut title = vec![Span::styled(list_title(app.tab), theme::bold())];
+    if app.tab == BACKLOG {
+        title.push(Span::styled(format!(" by {}", app.group_by.name()), theme::dim()));
+    }
     let mut block = panel(
-        vec![Span::styled(list_title(app.tab), theme::bold())],
+        title,
         Some(Line::from(Span::styled(format!(" {pos}/{entries} "), theme::dim()))),
         hints,
         focused,
@@ -108,6 +115,14 @@ pub fn draw_list(f: &mut Frame, app: &App, area: Rect, pal: Palette) {
             line = line.style(Style::new().bg(SEL_BG));
         }
         f.render_widget(line, rect);
+    }
+    // Under the last row: what `h` hides, and how to see it.
+    let shown = rows.len().saturating_sub(t.tree.offset);
+    let done = app::finished_count(&app.data, app.workspace);
+    if app.tab == BACKLOG && done > 0 && (shown as u16) + 1 < inner.height {
+        let text = if app.show_done { format!(" {done} done shown · h hides") } else { format!(" {done} done hidden · h shows") };
+        let y = inner.y + shown as u16 + 1;
+        f.render_widget(crate::ui::fit(Line::from(Span::styled(text, theme::dim())), inner.width), Rect::new(inner.x, y, inner.width, 1));
     }
 }
 
@@ -302,6 +317,12 @@ pub fn draw_graph(f: &mut Frame, app: &App, canvas: Rect, pal: Palette) -> Optio
     let key = flow_key(app)?;
     let mut flows = app.flows.borrow_mut();
     let (graph, kinds) = flows.entry(key.clone()).or_insert_with(|| build_graph(app, &key, pal));
+    // A faint dot grid that moves with the view, so panning and dragging read as moving a canvas.
+    let dots = rataflow::Background::new(graph)
+        .variant(rataflow::BackgroundVariant::Dots)
+        .gap(6, 3)
+        .style(rataflow::BackgroundStyle::default().with_pattern_color(theme::FAINT).with_bg_color(None));
+    f.render_widget(dots, canvas);
     f.render_widget(&mut *graph, canvas);
     if app.graph.minimap && canvas.width > 40 && canvas.height > 10 {
         f.render_widget(rataflow::MiniMap::new(graph).position(rataflow::MiniMapPosition::TopRight).size(24, 8), canvas);
@@ -326,7 +347,14 @@ pub fn draw_graph(f: &mut Frame, app: &App, canvas: Rect, pal: Palette) -> Optio
 
 /// Hints for a pane showing a graph.
 pub const GRAPH_HINTS: &[(&str, &str)] =
-    &[("←→↑↓", "node"), ("Enter", "open"), ("+ -", "zoom"), ("L", "links"), ("m", "map"), ("d", "flip"), ("S-←→", "section")];
+    &[("←→↑↓", "node"), ("Enter", "open"), ("M / drag", "move"), ("+ -", "zoom"), ("L", "links"), ("r", "re-layout"), ("S-←→", "section")];
+
+pub fn graph_hints(app: &App) -> &'static [(&'static str, &'static str)] {
+    if app.moving { MOVE_HINTS } else { GRAPH_HINTS }
+}
+
+/// Hints while a node is being moved.
+pub const MOVE_HINTS: &[(&str, &str)] = &[("←→↑↓", "move the node"), ("Enter / Esc", "done"), ("r", "re-layout after")];
 
 /// Sub-tabs as chips, for a pane's top border.
 pub fn subtab_line(names: &[&str], active: usize, pal: Palette) -> Line<'static> {
@@ -342,9 +370,9 @@ pub fn subtab_line(names: &[&str], active: usize, pal: Palette) -> Line<'static>
 fn backlog_detail(f: &mut Frame, app: &App, item: &Item, area: Rect, focused: bool, pal: Palette) -> DetailOut {
     let t = app.cur();
     let hints: &[(&str, &str)] = match t.subtab {
-        1 if !t.runs_table => GRAPH_HINTS,
+        1 if !t.runs_table => graph_hints(app),
         1 => &[("v", "graph"), ("S-←→", "section")],
-        2 => GRAPH_HINTS,
+        2 => graph_hints(app),
         _ => &[("S-←→", "section"), ("↑↓", "scroll"), ("e", "edit"), ("z", "zoom")],
     };
     let block = panel(

@@ -12,7 +12,10 @@ pub const SEL_BG: Color = Color::Rgb(0x2a, 0x30, 0x3b);
 pub const NEUTRAL: Color = Color::Rgb(0x8a, 0xb4, 0xf8);
 pub const INK: Color = Color::Rgb(0x16, 0x18, 0x1d);
 
+/// The maintainer picked `Both` (tab accents + kind colours); the other two stay only so the
+/// palette code keeps its shape, and `c` no longer cycles them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)]
 pub enum Scheme {
     /// Each tab has its accent, and item keys are coloured by kind.
     Both,
@@ -23,33 +26,11 @@ pub enum Scheme {
 }
 
 impl Scheme {
-    pub fn next(self) -> Self {
-        match self {
-            Scheme::Both => Scheme::PerTab,
-            Scheme::PerTab => Scheme::PerKind,
-            Scheme::PerKind => Scheme::Both,
-        }
-    }
-    pub fn name(self) -> &'static str {
-        match self {
-            Scheme::Both => "tab + kind colours",
-            Scheme::PerTab => "tab colours only",
-            Scheme::PerKind => "kind colours only",
-        }
-    }
     pub fn id(self) -> &'static str {
         match self {
             Scheme::Both => "both",
             Scheme::PerTab => "tab",
             Scheme::PerKind => "kind",
-        }
-    }
-    pub fn from_id(id: &str) -> Option<Self> {
-        match id {
-            "both" => Some(Scheme::Both),
-            "tab" => Some(Scheme::PerTab),
-            "kind" => Some(Scheme::PerKind),
-            _ => None,
         }
     }
 }

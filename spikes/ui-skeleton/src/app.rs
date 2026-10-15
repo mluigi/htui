@@ -351,8 +351,17 @@ pub struct App {
     pub highlight_req: Option<&'static str>,
     /// Printed after the terminal is restored.
     pub goodbye: Option<String>,
-    /// Jumps taken without moving since: (where from, where to). Backspace walks it back.
-    pub back: Vec<(Loc, Loc)>,
+    /// Places reached by jumps, browser-style: Backspace / Alt ← go back, Alt → forward.
+    pub history: Vec<Loc>,
+    /// Where in `history` the user is.
+    pub hist_pos: usize,
+    /// Backlog: how the list is grouped, and whether done and closed items show.
+    pub group_by: GroupBy,
+    pub show_done: bool,
+    /// A graph node being moved with the keyboard (`M`).
+    pub moving: bool,
+    /// What the state file holds, so it is only written when something changed.
+    saved: String,
     /// The new-item modal's size, kept between uses.
     pub new_item_size: (u16, u16),
     /// The Workspaces list: (workspace, project) per entry; project None is the overview.
@@ -377,7 +386,7 @@ impl App {
         );
         let trees = [
             ws_tree,
-            backlog_tree(&data, 0),
+            backlog_tree(&data, 0, GroupBy::Project, false),
             chat_tree(&data, 0),
             Tree::new(data.skills.iter().enumerate().map(|(i, s)| (i, s.group, s.name.to_string()))),
             logs_tree,
@@ -418,7 +427,12 @@ impl App {
             graph: GraphOpts { labels: LinkLabels::Legend, minimap: false, horizontal: false },
             highlight_req: None,
             goodbye: None,
-            back: Vec::new(),
+            history: Vec::new(),
+            hist_pos: 0,
+            group_by: GroupBy::Project,
+            show_done: false,
+            moving: false,
+            saved: String::new(),
             new_item_size: (96, 28),
             ws_nodes,
             stopping: HashMap::new(),
@@ -429,6 +443,8 @@ impl App {
             logs: LogsView { min_level: Level::Debug, follow: true, top: 0, next: 60, last: Instant::now() },
         };
         app.load();
+        app.rebuild_for_workspace(None);
+        app.saved = app.state_text();
         app
     }
 
@@ -454,7 +470,8 @@ impl App {
         if w.state == WsState::Stopped {
             return 0;
         }
-        self.data.items.iter().filter(|i| w.projects.contains(&i.project) && i.status == Status::InProgress).count()
+        let parked = |key: &str| w.parked.iter().any(|p| p.key == key);
+        self.data.items.iter().filter(|i| w.projects.contains(&i.project) && i.status == Status::InProgress && !parked(i.key)).count()
     }
 
     pub fn needs_you(&self, ws: usize) -> usize {
@@ -481,7 +498,7 @@ impl App {
 
     /// Rebuilds the Backlog and Chat lists for the open workspace.
     pub fn rebuild_for_workspace(&mut self, select_item: Option<usize>) {
-        let mut tree = backlog_tree(&self.data, self.workspace);
+        let mut tree = backlog_tree(&self.data, self.workspace, self.group_by, self.show_done);
         if let Some(idx) = select_item {
             tree.select(idx);
         }
@@ -516,24 +533,48 @@ impl App {
         Loc { tab: self.tab, cursor: t.tree.cursor, subtab: t.subtab, detail_cursor: t.detail_cursor, focus: t.focus, label: format!("{entry}{sub}") }
     }
 
-    /// Forgets the way back once the user has moved away from where the last jump landed.
-    pub fn check_back(&mut self) {
-        if let Some((_, dest)) = self.back.last()
-            && !self.here().same(dest)
-        {
-            self.back.clear();
+    /// A jump from `from` to `to`: like a browser, anything forward of here is dropped.
+    pub fn record_jump(&mut self, from: Loc, to: Loc) {
+        if self.history.is_empty() {
+            self.history.push(from);
+        } else {
+            // Where the user is now may not be where they landed last time: keep the real place.
+            self.history[self.hist_pos] = from;
+            self.history.truncate(self.hist_pos + 1);
         }
+        self.history.push(to);
+        if self.history.len() > 50 {
+            self.history.remove(0);
+        }
+        self.hist_pos = self.history.len() - 1;
     }
 
-    pub fn go_back(&mut self) {
-        let Some((from, _)) = self.back.pop() else { return };
-        self.tab = from.tab;
-        let t = &mut self.tabs[from.tab];
-        t.tree.cursor = from.cursor;
-        t.subtab = from.subtab;
-        t.detail_cursor = from.detail_cursor;
-        t.focus = from.focus;
-        self.flash(format!("↩ {}", from.label));
+    pub fn back_label(&self) -> Option<&str> {
+        (self.hist_pos > 0).then(|| self.history[self.hist_pos - 1].label.as_str())
+    }
+
+    pub fn can_forward(&self) -> bool {
+        self.hist_pos + 1 < self.history.len()
+    }
+
+    /// Back (-1) or forward (+1) through the history.
+    pub fn go_history(&mut self, by: isize) {
+        let next = self.hist_pos as isize + by;
+        if next < 0 || next as usize >= self.history.len() {
+            return;
+        }
+        self.history[self.hist_pos] = self.here();
+        self.hist_pos = next as usize;
+        let to = self.history[self.hist_pos].clone();
+        self.tab = to.tab;
+        let t = &mut self.tabs[to.tab];
+        t.tree.cursor = to.cursor;
+        t.subtab = to.subtab;
+        t.detail_cursor = to.detail_cursor;
+        t.focus = to.focus;
+        self.moving = false;
+        self.fix_focus();
+        self.flash(format!("{} {}", if by < 0 { "↩" } else { "↪" }, to.label));
     }
 
     pub fn cur(&self) -> &TabState {
@@ -589,8 +630,11 @@ impl App {
     fn load(&mut self) {
         let Ok(text) = std::fs::read_to_string(Self::state_path()) else { return };
         let kv: HashMap<&str, &str> = text.lines().filter_map(|l| l.split_once('=')).collect();
-        if let Some(s) = kv.get("scheme").and_then(|v| Scheme::from_id(v)) {
-            self.scheme = s;
+        if let Some(g) = kv.get("backlog.group").and_then(|v| GroupBy::ALL.iter().find(|g| g.name() == *v)) {
+            self.group_by = *g;
+        }
+        if let Some(v) = kv.get("backlog.show_done") {
+            self.show_done = *v == "1";
         }
         if let Some(v) = kv.get("about") {
             self.about = *v == "1";
@@ -623,14 +667,15 @@ impl App {
         self.fix_focus();
     }
 
-    pub fn save(&self) {
+    fn state_text(&self) -> String {
         let mut out = format!(
-            "scheme={}\nabout={}\ntab={}\nnew_item_size={}x{}\n",
-            self.scheme.id(),
+            "about={}\ntab={}\nnew_item_size={}x{}\nbacklog.group={}\nbacklog.show_done={}\n",
             u8::from(self.about),
             self.tab,
             self.new_item_size.0,
-            self.new_item_size.1
+            self.new_item_size.1,
+            self.group_by.name(),
+            u8::from(self.show_done)
         );
         for (i, name) in TABS.iter().enumerate() {
             let l = &self.tabs[i].layout;
@@ -643,19 +688,87 @@ impl App {
                 u8::from(l.act_on)
             );
         }
-        let _ = std::fs::write(Self::state_path(), out);
+        out
+    }
+
+    /// Writes the state file as soon as anything in it changed, so closing the terminal (or
+    /// killing the tmux pane) loses nothing.
+    pub fn save(&mut self) {
+        let text = self.state_text();
+        if text != self.saved && std::fs::write(Self::state_path(), &text).is_ok() {
+            self.saved = text;
+        }
     }
 }
 
-fn backlog_tree(data: &Data, workspace: usize) -> Tree {
+/// How the Backlog list is grouped (`g` cycles).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GroupBy {
+    Project,
+    Kind,
+    Status,
+}
+
+impl GroupBy {
+    pub const ALL: [GroupBy; 3] = [GroupBy::Project, GroupBy::Kind, GroupBy::Status];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            GroupBy::Project => "project",
+            GroupBy::Kind => "kind",
+            GroupBy::Status => "status",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        let pos = Self::ALL.iter().position(|g| *g == self).unwrap_or(0);
+        Self::ALL[(pos + 1) % Self::ALL.len()]
+    }
+}
+
+pub fn is_finished(status: Status) -> bool {
+    matches!(status, Status::Done | Status::Closed)
+}
+
+/// Done and closed items in the open workspace, which `h` shows or hides.
+pub fn finished_count(data: &Data, workspace: usize) -> usize {
     let projects = &data.workspaces[workspace].projects;
-    Tree::new(
-        data.items
-            .iter()
-            .enumerate()
-            .filter(|(_, i)| projects.contains(&i.project))
-            .map(|(idx, i)| (idx, i.project, format!("{} {}", i.key, i.title))),
-    )
+    data.items.iter().filter(|i| projects.contains(&i.project) && is_finished(i.status)).count()
+}
+
+fn backlog_tree(data: &Data, workspace: usize, group_by: GroupBy, show_done: bool) -> Tree {
+    // What needs attention first.
+    const STATUS_ORDER: [Status; 8] = [
+        Status::AwaitingApproval,
+        Status::Failed,
+        Status::InProgress,
+        Status::Blocked,
+        Status::Queued,
+        Status::Open,
+        Status::Done,
+        Status::Closed,
+    ];
+    let projects = &data.workspaces[workspace].projects;
+    let mut entries: Vec<(usize, &str, String)> = data
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| projects.contains(&i.project) && (show_done || !is_finished(i.status)))
+        .map(|(idx, i)| {
+            let group = match group_by {
+                GroupBy::Project => i.project,
+                GroupBy::Kind => i.key.split('-').next().unwrap_or(i.key),
+                GroupBy::Status => i.status.label(),
+            };
+            (idx, group, format!("{} {}", i.key, i.title))
+        })
+        .collect();
+    match group_by {
+        GroupBy::Project => {}
+        GroupBy::Kind => entries.sort_by(|a, b| a.1.cmp(b.1)),
+        GroupBy::Status => entries.sort_by_key(|(idx, ..)| STATUS_ORDER.iter().position(|s| *s == data.items[*idx].status)),
+    }
+    Tree::new(entries.into_iter())
 }
 
 /// htui's own agent first, then the workspace's coordinator, the projects' coordinators, every

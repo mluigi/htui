@@ -169,15 +169,20 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect, pal: Palette) -> (Vec<(u16,
 /// The right side of the header, dropping the least useful parts until it fits.
 fn header_right(app: &App, pal: Palette, room: usize) -> Vec<Span<'static>> {
     let line_style = Style::new().fg(FAINT);
-    // After a jump: where Backspace goes.
-    let back: Vec<Span<'static>> = match app.back.last() {
-        Some((from, _)) => vec![
+    // After a jump: where Backspace / Alt ← goes, and whether Alt → has somewhere to go.
+    let mut back: Vec<Span<'static>> = match app.back_label() {
+        Some(label) => vec![
             Span::styled(" ⌫ ", Style::new().fg(INK).bg(pal.accent).add_modifier(Modifier::BOLD)),
-            Span::styled(format!(" back to {} ", from.label), pal.accent()),
+            Span::styled(format!(" back to {label} "), pal.accent()),
             Span::styled("─", line_style),
         ],
         None => vec![],
     };
+    if app.can_forward() {
+        back.push(Span::styled(" Alt→ ", pal.accent().add_modifier(Modifier::BOLD)));
+        back.push(Span::styled("forward ", theme::dim()));
+        back.push(Span::styled("─", line_style));
+    }
     if let Some((text, _)) = &app.flash {
         let back_w: usize = back.iter().map(|s| s.width()).sum();
         let room = room.saturating_sub(1 + back_w) as u16;
@@ -339,10 +344,11 @@ fn draw_help(f: &mut Frame, pal: Palette) {
             ("← →", "fold group · node in a graph"),
             ("Shift ← →  [ ]", "previous / next sub-tab"),
             ("Enter / Esc", "open / back to the list"),
-            ("⌫ / Alt ←", "back after a jump (until you move)"),
+            ("⌫ / Alt ←", "back through jumps"),
+            ("Alt →", "forward again"),
             ("/", "filter the list"),
         ]),
-        ("look", &[("c", "colour scheme"), ("F1", "about this tab")]),
+        ("look", &[("F1", "about this tab")]),
         ("app", &[("q / Ctrl-C", "leave: work keeps running")]),
     ];
     let right: [(&str, &[(&str, &str)]); 5] = [
@@ -353,10 +359,11 @@ fn draw_help(f: &mut Frame, pal: Palette) {
             ("F2 / F3", "show or hide list / activity"),
             ("z", "zoom the focused pane"),
         ]),
-        ("backlog", &[("N", "new item (AI rewrite, or talk it through)"), ("v", "runs: graph / table")]),
+        ("backlog", &[("N", "new item (AI rewrite, or talk it through)"), ("h · g", "done items · grouping"), ("v", "runs: graph / table")]),
         ("graphs", &[
             ("Enter", "open item · its chat · requirement"),
-            ("+ - 0 · f", "zoom · reset · fit"),
+            ("M / drag a node", "move it (links stay as they are)"),
+            ("+ - 0 · f · r", "zoom · reset · fit · re-layout"),
             ("L · m · d", "link labels · minimap · direction"),
         ]),
         ("chat", &[("i", "write (when the chat lets you)"), ("a A r", "allow · always · reject")]),

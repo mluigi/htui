@@ -10,7 +10,14 @@ use crate::app::{self, App};
 use crate::data::{self, Level, Status, Usage, WsState};
 use crate::theme::{self, Palette, SEL_BG};
 use crate::ui::panel;
-use crate::views::{DetailOut, GRAPH_HINTS, body, draw_graph, subtab_hits, subtab_line, ws_state_span};
+use crate::views::{DetailOut, body, graph_hints, draw_graph, subtab_hits, subtab_line, ws_state_span};
+
+/// Infisical's URL when Secrets uses it: then each workspace's `.env` lives there, not on disk.
+pub fn infisical(app: &App) -> Option<String> {
+    let s = app.data.sections.iter().find(|s| s.name == "Secrets")?;
+    let get = |label: &str| s.fields.iter().find(|f| f.label == label).map(|f| f.value.clone());
+    (get("provider")? == "infisical").then(|| get("URL").unwrap_or_default())
+}
 
 fn heading(text: &str, pal: Palette) -> Line<'static> {
     Line::from(Span::styled(format!(" {text}"), pal.accent().add_modifier(Modifier::BOLD)))
@@ -24,11 +31,13 @@ pub fn ws_detail(f: &mut Frame, app: &App, idx: usize, area: Rect, focused: bool
     let hints: &[(&str, &str)] = match (t.subtab, project, w.state) {
         (0, None, WsState::Background) => &[("o", "open"), ("s", "stop"), ("N", "new…"), ("S-←→", "section")],
         (0, None, WsState::Stopping) => &[("s", "force stop"), ("S-←→", "section")],
+        (0, None, WsState::Stopped) if !w.parked.is_empty() => &[("r", "resume"), ("o", "open"), ("N", "new…"), ("S-←→", "section")],
         (0, None, WsState::Stopped) => &[("o", "open"), ("N", "new…"), ("S-←→", "section")],
+        (0, None, WsState::Open) if !w.parked.is_empty() => &[("r", "resume parked runs"), ("N", "new…"), ("S-←→", "section")],
         (0, ..) => &[("N", "new…"), ("S-←→", "section")],
         (1, None, _) => &[("↑↓", "select"), ("N", "add component"), ("d", "remove")],
         (1, Some(_), _) => &[("↑↓", "select"), ("Enter", "shared / own / none"), ("N", "add own")],
-        _ if t.req_graph => GRAPH_HINTS,
+        _ if t.req_graph => graph_hints(app),
         _ => &[("↑↓", "select"), ("Enter", "go to item"), ("v", "graph"), ("N", "new…"), ("S-←→", "section")],
     };
     let mut title = vec![Span::styled(project.unwrap_or(w.name), theme::bold())];
@@ -100,6 +109,7 @@ fn workspace_overview(app: &App, ws: usize, pal: Palette) -> Vec<Line<'static>> 
         ]),
         Line::raw(""),
     ];
+    lines.extend(stop_lines(app, ws, pal));
     lines.push(heading("description", pal));
     lines.push(Line::from(Span::styled(format!(" {}", w.description), theme::text())));
     lines.push(Line::raw(""));
@@ -143,6 +153,45 @@ fn workspace_overview(app: &App, ws: usize, pal: Palette) -> Vec<Line<'static>> 
             Span::styled(format!(" {:<10}", c.name), theme::bold()),
             Span::styled(format!("{} {}  :{}", c.ctype, c.kind, c.port), theme::text()),
         ]));
+    }
+    lines
+}
+
+/// While stopping: the runs it waits for. Once stopped: the runs it parked, and how they resume.
+fn stop_lines(app: &App, ws: usize, pal: Palette) -> Vec<Line<'static>> {
+    let w = &app.data.workspaces[ws];
+    let mut lines = Vec::new();
+    if w.state == WsState::Stopping {
+        let running: Vec<_> = app
+            .data
+            .items
+            .iter()
+            .filter(|i| w.projects.contains(&i.project) && matches!(i.status, Status::InProgress | Status::AwaitingApproval))
+            .collect();
+        lines.push(heading(&format!("stopping · waiting for {} run(s) to reach a stoppable step", running.len()), pal));
+        for i in running {
+            let step = crate::flow::run_steps(i).into_iter().find(|s| s.status != Status::Done).map_or("—", |s| s.name);
+            lines.push(Line::from(vec![
+                Span::raw("   "),
+                theme::glyph(i.status),
+                Span::styled(format!(" {:<9}", i.key), pal.key(i.key)),
+                Span::styled(format!("finishing {step}, then parks"), theme::text()),
+            ]));
+        }
+        lines.push(Line::from(vec![Span::raw("   "), theme::chip("s", pal.accent), Span::styled(" again stops them now; they redo that step when resumed", theme::dim())]));
+        lines.push(Line::raw(""));
+    } else if !w.parked.is_empty() {
+        lines.push(heading(&format!("{} parked run(s)", w.parked.len()), pal));
+        for p in &w.parked {
+            let how = if p.interrupted { format!("cut short in {}: redoes it on resume", p.step) } else { format!("parked after {}: goes on from the next step", p.step) };
+            lines.push(Line::from(vec![
+                Span::styled("   ⏸ ", Style::new().fg(theme::status_color(Status::AwaitingApproval))),
+                Span::styled(format!("{:<9}", p.key), pal.key(p.key)),
+                Span::styled(how, theme::text()),
+            ]));
+        }
+        lines.push(Line::from(vec![Span::raw("   "), theme::chip("r", pal.accent), Span::styled(" resumes them all, in the background", theme::dim())]));
+        lines.push(Line::raw(""));
     }
     lines
 }
@@ -249,6 +298,19 @@ fn components(
                 Span::styled(format!("  generated in {}/.htui/ · ports on localhost", app.data.workspaces[ws].path), theme::dim()),
             ]));
             lines.extend(compose_lines(&services(app, ws, None), pal));
+            lines.push(Line::raw(""));
+            let env = match infisical(app) {
+                Some(url) => vec![
+                    Span::styled(" .env", pal.accent().add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("  in Infisical ({url}), folder /{}", app.data.workspaces[ws].name.to_lowercase()), theme::dim()),
+                ],
+                None => vec![
+                    Span::styled(" .env", pal.accent().add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("  {}/.htui/.env · Secrets has no Infisical", app.data.workspaces[ws].path), theme::dim()),
+                ],
+            };
+            lines.push(Line::from(env));
+            lines.push(Line::from(Span::styled("   ports and URLs per project; passwords come from Secrets either way", theme::dim())));
         }
         Some(p) => {
             lines.push(Line::from(Span::styled(format!(" How {p} uses the workspace's components. Enter cycles: the workspace's · its own · none."), theme::dim())));
@@ -397,6 +459,9 @@ pub fn compose_lines(services: &[Service], pal: Palette) -> Vec<Line<'static>> {
 pub enum ReqSel {
     Req(&'static str),
     Item(&'static str),
+    /// A requirement in another scope: a workspace one's project requirements, or a project one's
+    /// workspace parent. Enter goes there.
+    Link(&'static str),
 }
 
 /// The requirements list, and its selectable rows as (line, what). `cursor` marks one row.
@@ -469,8 +534,51 @@ fn req_lines(
     let child_prefix = if root { String::new() } else { format!("{prefix}{}", if last { "   " } else { "│  " }) };
     let pad = format!("   {child_prefix}{}           ", if scope.iter().any(|c| c.parent == Some(r.id)) { "│" } else { " " });
     lines.push(Line::from(Span::styled(format!("{pad}{}", r.text), theme::dim())));
+    let req_style = Style::new().fg(theme::status_color(Status::AwaitingApproval));
+    // A project requirement that comes from a workspace one says so, and leads back to it.
+    if let Some(parent) = r.parent.and_then(|p| app.data.reqs.iter().find(|x| x.id == p && x.ws == r.ws))
+        && parent.project.is_none()
+        && r.project.is_some()
+    {
+        let on = selected(sel);
+        sel.push((lines.len(), ReqSel::Link(parent.id)));
+        let mut line = Line::from(vec![
+            Span::styled(format!("{pad}↑ from "), theme::dim()),
+            Span::styled(format!("{:<6}", parent.id), req_style.add_modifier(Modifier::BOLD)),
+            Span::styled(parent.title, theme::text()),
+            Span::styled("   workspace-wide", theme::dim()),
+        ]);
+        if on {
+            line = line.style(Style::new().bg(SEL_BG));
+        }
+        lines.push(line);
+    }
+    // A workspace requirement lists the project requirements it was split into.
+    if r.project.is_none() {
+        let splits: Vec<_> = app.data.reqs.iter().filter(|x| x.ws == r.ws && x.parent == Some(r.id) && x.project.is_some()).collect();
+        if !splits.is_empty() {
+            lines.push(Line::from(Span::styled(format!("{pad}split into"), theme::dim())));
+        }
+        for s in splits {
+            let on = selected(sel);
+            sel.push((lines.len(), ReqSel::Link(s.id)));
+            let mut line = Line::from(vec![
+                Span::styled(format!("{pad}⇢ "), theme::dim()),
+                theme::glyph(s.status),
+                Span::styled(format!(" {:<7}", s.id), req_style.add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{:<6}", s.project.unwrap_or("")), theme::bold()),
+                Span::styled(s.title, theme::text()),
+            ]);
+            if on {
+                line = line.style(Style::new().bg(SEL_BG));
+            }
+            lines.push(line);
+        }
+    }
     // Each covering item on its own row, so it can be picked and opened.
-    if r.items.is_empty() {
+    // A split workspace requirement is covered through its project requirements.
+    let split = r.project.is_none() && app.data.reqs.iter().any(|x| x.ws == r.ws && x.parent == Some(r.id) && x.project.is_some());
+    if r.items.is_empty() && !split {
         lines.push(Line::from(Span::styled(format!("{pad}nobody covers it yet"), theme::dim())));
     }
     for key in r.items {

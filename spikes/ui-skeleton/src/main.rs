@@ -68,7 +68,6 @@ fn dump(args: &[String]) -> std::io::Result<()> {
                 c => KeyCode::Char(c),
             };
             on_key(&mut app, KeyEvent::new(code, KeyModifiers::NONE));
-            app.check_back();
         }
     } else {
         app.cur_mut().focus = Pane::Detail;
@@ -104,11 +103,11 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
                 Event::Mouse(mouse) => on_mouse(app, mouse),
                 _ => {}
             }
-            app.check_back();
             if app.quit || !event::poll(Duration::ZERO)? {
                 break;
             }
         }
+        app.save();
     }
     Ok(())
 }
@@ -151,9 +150,10 @@ fn tick(app: &mut App) {
     let done: Vec<usize> = app.stopping.iter().filter(|(_, at)| at.elapsed() > Duration::from_secs(3)).map(|(w, _)| *w).collect();
     for w in done {
         app.stopping.remove(&w);
-        app.data.workspaces[w].state = WsState::Stopped;
+        park_runs(app, w, false);
         let name = app.data.workspaces[w].name;
-        app.flash(format!("{name} stopped gracefully"));
+        let n = app.data.workspaces[w].parked.len();
+        app.flash(format!("{name} stopped: {n} run(s) parked after their step · r resumes"));
     }
     if app.logs.last.elapsed() > Duration::from_millis(1500) {
         app.logs.last = Instant::now();
@@ -219,6 +219,13 @@ fn on_key(app: &mut App, key: KeyEvent) {
         }
         return;
     }
+    // Moving a graph node takes every key until it is placed.
+    if app.moving {
+        match views::flow_key(app) {
+            Some(k) if app.cur().focus == Pane::Detail => return move_key(app, key, &k),
+            _ => app.moving = false,
+        }
+    }
 
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
@@ -229,8 +236,9 @@ fn on_key(app: &mut App, key: KeyEvent) {
         KeyCode::Left if shift => step_subtab(app, -1),
         KeyCode::Right if shift => step_subtab(app, 1),
         KeyCode::Char('q') => app.modal = Some(Modal::Quit),
-        KeyCode::Backspace if !app.back.is_empty() => app.go_back(),
-        KeyCode::Left if alt && !app.back.is_empty() => app.go_back(),
+        KeyCode::Backspace if app.back_label().is_some() => app.go_history(-1),
+        KeyCode::Left if alt => app.go_history(-1),
+        KeyCode::Right if alt => app.go_history(1),
         KeyCode::Char('?') => app.help = true,
         KeyCode::F(1) => {
             app.about = !app.about;
@@ -258,10 +266,6 @@ fn on_key(app: &mut App, key: KeyEvent) {
             let msg = if t.zoom { "zoomed · z to restore" } else { "layout restored" };
             app.flash(msg);
         }
-        KeyCode::Char('c') => {
-            app.scheme = app.scheme.next();
-            app.flash(format!("colours: {}", app.scheme.name()));
-        }
         KeyCode::Char('/') => {
             app.cur_mut().layout.list_on = true;
             app.cur_mut().focus = Pane::List;
@@ -276,6 +280,21 @@ fn on_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('s') if app.tab == WORKSPACES => stop_workspace(app),
+        KeyCode::Char('r') if app.tab == WORKSPACES && app.cur().subtab == 0 => resume_workspace(app),
+        // Backlog list options (a focused graph keeps h for panning).
+        KeyCode::Char('h') if app.tab == BACKLOG && !graph_focused(app) => {
+            app.show_done = !app.show_done;
+            let keep = app.cur().tree.selected();
+            app.rebuild_for_workspace(keep);
+            let n = app::finished_count(&app.data, app.workspace);
+            app.flash(if app.show_done { format!("showing {n} done / closed") } else { format!("{n} done / closed hidden · h shows them") });
+        }
+        KeyCode::Char('g') if app.tab == BACKLOG && !graph_focused(app) => {
+            app.group_by = app.group_by.next();
+            let keep = app.cur().tree.selected();
+            app.rebuild_for_workspace(keep);
+            app.flash(format!("grouped by {} · g changes", app.group_by.name()));
+        }
         _ => pane_key(app, key),
     }
 }
@@ -388,6 +407,7 @@ fn detail_key(app: &mut App, key: KeyEvent, up: bool, down: bool, left: bool, ri
             } else if key.code == KeyCode::Enter {
                 match sel.get(t.detail_cursor).map(|(_, s)| *s) {
                     Some(ReqSel::Item(key)) => jump(app, |app| go_to_item(app, key)),
+                    Some(ReqSel::Link(id)) => jump(app, |app| go_to_requirement(app, id)),
                     Some(ReqSel::Req(id)) => app.flash(format!("{id}: e edits it · L links an item (mock)")),
                     None => {}
                 }
@@ -430,7 +450,26 @@ fn detail_key(app: &mut App, key: KeyEvent, up: bool, down: bool, left: bool, ri
 /// A graph takes the arrows (pick a node), h j k l (pan), + - 0 (zoom), f (fit), Enter (open),
 /// and the view options: L (how links are labelled), m (minimap), d (direction).
 fn graph_key(app: &mut App, key: KeyEvent, flow_key: &str) {
+    if app.moving {
+        return move_key(app, key, flow_key);
+    }
     match key.code {
+        KeyCode::Char('M') => {
+            let node = app.flows.borrow().get(flow_key).and_then(|(g, _)| g.first_selected_node_id());
+            match node {
+                Some(id) => {
+                    app.moving = true;
+                    app.flash(format!("moving {} · arrows move it · Enter / Esc done", id.trim_start_matches("req:")));
+                }
+                None => app.flash("pick a node first (arrows), then M"),
+            }
+            return;
+        }
+        KeyCode::Char('r') => {
+            app.flows.borrow_mut().remove(flow_key);
+            app.flash("graph laid out again");
+            return;
+        }
         KeyCode::Char('L') => {
             app.graph.labels = app.graph.labels.next();
             app.flash(format!("links: {}", app.graph.labels.name()));
@@ -463,22 +502,45 @@ fn graph_key(app: &mut App, key: KeyEvent, flow_key: &str) {
     }
 }
 
-/// Enter on a graph node: another item opens that item, the item itself or a run step opens its
-/// chat, a requirement opens it in Workspaces.
-/// Runs a navigation and remembers where it came from, so Backspace can return.
+/// `M` on a graph: the arrows (or h j k l) move the selected node; its links follow, and nothing
+/// about what it links to changes.
+fn move_key(app: &mut App, key: KeyEvent, flow_key: &str) {
+    let (dx, dy) = match key.code {
+        KeyCode::Left | KeyCode::Char('h') => (-2.0, 0.0),
+        KeyCode::Right | KeyCode::Char('l') => (2.0, 0.0),
+        KeyCode::Up | KeyCode::Char('k') => (0.0, -1.0),
+        KeyCode::Down | KeyCode::Char('j') => (0.0, 1.0),
+        KeyCode::Enter | KeyCode::Esc | KeyCode::Char('M') => {
+            app.moving = false;
+            app.flash("placed · r lays the graph out again");
+            return;
+        }
+        _ => return,
+    };
+    let mut flows = app.flows.borrow_mut();
+    if let Some((graph, _)) = flows.get_mut(flow_key)
+        && let Some(id) = graph.first_selected_node_id()
+    {
+        graph.move_node(&id, (dx, dy));
+    }
+}
+
+fn graph_focused(app: &App) -> bool {
+    app.cur().focus == Pane::Detail && views::flow_key(app).is_some()
+}
+
+/// Runs a navigation and records it in the history, so Backspace / Alt ← can return.
 fn jump(app: &mut App, go: impl FnOnce(&mut App)) {
     let from = app.here();
     go(app);
     let to = app.here();
-    if from.same(&to) {
-        return;
+    if !from.same(&to) {
+        app.record_jump(from, to);
     }
-    if app.back.last().is_some_and(|(_, dest)| !dest.same(&from)) {
-        app.back.clear();
-    }
-    app.back.push((from, to));
 }
 
+/// Enter on a graph node: another item opens that item, the item itself or a run step opens its
+/// chat, a requirement opens it in Workspaces.
 fn graph_enter(app: &mut App, flow_key: &str) {
     let node = app.flows.borrow().get(flow_key).and_then(|(g, _)| g.first_selected_node_id());
     let Some(node) = node else { return };
@@ -569,7 +631,7 @@ fn go_to_item(app: &mut App, key: &str) {
         return;
     }
     switch_tab(app, BACKLOG);
-    app.tabs[BACKLOG].tree.select(idx);
+    select_item(app, idx);
     app.tabs[BACKLOG].focus = Pane::Detail;
     app.flash(format!("{key} · {}", app.data.items[idx].title));
 }
@@ -668,7 +730,7 @@ fn jump_to(app: &mut App, event: usize) {
             return;
         }
         switch_tab(app, BACKLOG);
-        app.tabs[BACKLOG].tree.select(idx);
+        select_item(app, idx);
         app.tabs[BACKLOG].focus = Pane::Detail;
     } else if let Some(idx) = app.data.sessions.iter().position(|s| s.name == target) {
         if app.data.sessions[idx].ws != app.workspace {
@@ -708,14 +770,63 @@ fn stop_workspace(app: &mut App) {
         WsState::Background => {
             app.data.workspaces[ws].state = WsState::Stopping;
             app.stopping.insert(ws, Instant::now());
-            app.flash(format!("stopping {name}: {running} run(s) finish their step · s again forces"));
+            app.flash(format!("stopping {name}: {running} run(s) finish their step, then park · s again forces"));
         }
         WsState::Stopping => {
             app.stopping.remove(&ws);
-            app.data.workspaces[ws].state = WsState::Stopped;
-            app.flash(format!("forced: {name} stopped, {running} run(s) killed"));
+            park_runs(app, ws, true);
+            app.flash(format!("forced: {name} stopped, {running} run(s) cut mid-step · r resumes them"));
         }
-        WsState::Stopped => app.flash(format!("{name} is already stopped · o opens it")),
+        WsState::Stopped => app.flash(format!("{name} is already stopped · r resumes its runs · o opens it")),
+    }
+}
+
+/// Stops workspace `ws`, setting its running items aside. Graceful: each finished its current step
+/// and resumes at the next one. Forced: each was cut short and redoes that step on resume.
+fn park_runs(app: &mut App, ws: usize, interrupted: bool) {
+    let projects = app.data.workspaces[ws].projects.clone();
+    let parked: Vec<data::Parked> = app
+        .data
+        .items
+        .iter()
+        .filter(|i| projects.contains(&i.project) && matches!(i.status, Status::InProgress | Status::AwaitingApproval))
+        .filter_map(|i| {
+            let step = flow::run_steps(i).into_iter().find(|s| s.status != Status::Done)?;
+            Some(data::Parked { key: i.key, step: step.name, interrupted })
+        })
+        .collect();
+    let w = &mut app.data.workspaces[ws];
+    w.state = WsState::Stopped;
+    w.parked.extend(parked);
+}
+
+/// `r`: a stopped workspace's parked runs start again, in the background (or on screen if it is the
+/// open one).
+fn resume_workspace(app: &mut App) {
+    let Some(ws) = selected_ws(app) else { return };
+    let w = &mut app.data.workspaces[ws];
+    let name = w.name;
+    if w.state == WsState::Stopping {
+        return app.flash(format!("{name} is still stopping · s forces it"));
+    }
+    if w.state != WsState::Stopped && w.parked.is_empty() {
+        return app.flash(format!("{name} is running; nothing to resume"));
+    }
+    let parked = std::mem::take(&mut w.parked);
+    let redo = parked.iter().filter(|p| p.interrupted).count();
+    if w.state == WsState::Stopped {
+        w.state = if ws == app.workspace { WsState::Open } else { WsState::Background };
+    }
+    let how = if redo > 0 { format!(", {redo} redo the step they were cut in") } else { String::new() };
+    app.flash(format!("{name} resumed: {} run(s) pick up where they parked{how}", parked.len()));
+}
+
+/// Selects item `idx` in the Backlog, showing done items first if it is one of them.
+fn select_item(app: &mut App, idx: usize) {
+    if !app.tabs[BACKLOG].tree.select(idx) && app::is_finished(app.data.items[idx].status) && !app.show_done {
+        app.show_done = true;
+        app.rebuild_for_workspace(Some(idx));
+        app.flash("showing done items (h hides them)");
     }
 }
 
@@ -764,7 +875,7 @@ fn new_thing(app: &mut App) {
             let (ws, project) = app.selected_entry().map_or((app.workspace, None), |i| app.ws_nodes[i]);
             app.modal = Some(match app.cur().subtab {
                 1 => Modal::AddComponent(modal::Wizard::new(ws, project)),
-                2 => requirement_form(app, ws, project),
+                2 => Modal::NewItem(modal::NewItem::requirement(ws, project, &app.data)),
                 _ => Modal::Chooser(forms::Chooser {
                     options: vec![
                         ("workspace", "a new workspace, in its own folder"),
@@ -778,11 +889,6 @@ fn new_thing(app: &mut App) {
         }
         _ => app.flash("mock: in htui this opens a modal like Backlog's N"),
     }
-}
-
-fn requirement_form(app: &App, ws: usize, project: Option<&'static str>) -> Modal {
-    let parents = app.data.reqs.iter().filter(|r| r.ws == ws && (project.is_none() || r.project == project)).map(|r| r.id.to_string()).collect();
-    Modal::Form(forms::Form::requirement(ws, project, parents))
 }
 
 fn on_outcome(app: &mut App, outcome: Outcome) {
@@ -802,7 +908,7 @@ fn on_outcome(app: &mut App, outcome: Outcome) {
                 "workspace" => Modal::Form(forms::Form::workspace()),
                 "project" => Modal::Form(forms::Form::project(ws)),
                 "component" => Modal::AddComponent(modal::Wizard::new(ws, project)),
-                _ => requirement_form(app, ws, project),
+                _ => Modal::NewItem(modal::NewItem::requirement(ws, project, &app.data)),
             });
         }
         Outcome::SubmitForm => {
@@ -829,6 +935,10 @@ fn on_outcome(app: &mut App, outcome: Outcome) {
             let idx = app.data.items.len() - 1;
             app.rebuild_for_workspace(Some(idx));
             app.flash(format!("created {key} in {project}"));
+        }
+        Outcome::CreateReq { ws, project, draft } => {
+            app.modal = None;
+            create_requirement(app, ws, project, draft);
         }
         Outcome::AddComponent(c) => {
             app.modal = None;
@@ -859,6 +969,7 @@ fn submit_form(app: &mut App, form: forms::Form) {
                 description: leak(form.value("description")),
                 goals: &[],
                 state: WsState::Stopped,
+                parked: vec![],
             });
             let ws = app.data.workspaces.len() - 1;
             app.data.sessions.push(data::Session {
@@ -899,31 +1010,56 @@ fn submit_form(app: &mut App, form: forms::Form) {
             }
             app.flash(format!("added {name} to {} · its coordinator is in Chat", app.data.workspaces[ws].name));
         }
-        forms::FormKind::Requirement => {
-            let parent = form.value("refines");
-            let parent = (!parent.starts_with("none")).then(|| leak(parent));
-            let siblings = app.data.reqs.iter().filter(|r| r.ws == form.ws && r.parent == parent).count();
-            let top = app.data.reqs.iter().filter(|r| r.ws == form.ws).count();
-            let id = leak(&match parent {
-                Some(p) => format!("{p}.{}", siblings + 1),
-                None => format!("R-{}", top + 40),
-            });
-            app.data.reqs.push(data::Requirement {
-                parent,
-                ws: form.ws,
-                project: form.project,
-                id,
-                area: form.project.unwrap_or("Workspace"),
-                title: leak(form.value("title")),
-                text: leak(form.value("text")),
-                status: Status::Open,
-                items: &[],
-            });
-            app.highlight_req = Some(id);
-            app.flows.borrow_mut().retain(|k, _| !k.starts_with("reqs:"));
-            app.flash(format!("added {id}"));
-        }
     }
+}
+
+/// Adds a requirement from the new-requirement modal, and for a workspace-wide one the project
+/// requirements it was split into (each refines it). The cursor lands on it.
+fn create_requirement(app: &mut App, ws: usize, project: Option<&'static str>, draft: modal::Draft) {
+    let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+    // The body's first paragraph is the requirement's text.
+    let text = draft.body.lines().skip(1).take_while(|l| !l.is_empty()).collect::<Vec<_>>().join(" ");
+    let id = leak(draft.key);
+    app.data.reqs.push(data::Requirement {
+        parent: draft.refines,
+        ws,
+        project,
+        id,
+        area: project.unwrap_or("Workspace"),
+        title: leak(draft.title),
+        text: leak(text),
+        status: Status::Open,
+        items: &[],
+    });
+    let mut made = Vec::new();
+    for s in draft.splits.into_iter().filter(|s| s.on) {
+        let sid = leak(s.id);
+        made.push(sid);
+        app.data.reqs.push(data::Requirement {
+            parent: Some(id),
+            ws,
+            project: Some(s.project),
+            id: sid,
+            area: s.project,
+            title: leak(s.title),
+            text: leak(s.text),
+            status: Status::Open,
+            items: &[],
+        });
+    }
+    app.flows.borrow_mut().retain(|k, _| !k.starts_with("reqs:"));
+    // Show it where it lives, with the cursor on it.
+    if let Some(i) = app.ws_nodes.iter().position(|n| *n == (ws, project)) {
+        app.tabs[WORKSPACES].tree.select(i);
+    }
+    let (_, sel) = wsview::requirements(app, ws, project, None, theme::Palette::new(app.scheme, WORKSPACES));
+    let t = &mut app.tabs[WORKSPACES];
+    t.subtab = 2;
+    t.req_graph = false;
+    t.detail_cursor = sel.iter().position(|(_, s)| *s == ReqSel::Req(id)).unwrap_or(0);
+    t.focus = Pane::Detail;
+    app.highlight_req = Some(id);
+    app.flash(if made.is_empty() { format!("added {id}") } else { format!("added {id} and {}", made.join(", ")) });
 }
 
 fn start_edit(app: &mut App, idx: usize) {

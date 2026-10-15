@@ -1,4 +1,5 @@
-//! Small modals: leaving htui, "new what?", and the forms for a workspace, project or requirement.
+//! Small modals: leaving htui, "new what?", and the forms for a workspace or project.
+//! Requirements use the new-item modal (describe → AI rewrite → review).
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -15,7 +16,6 @@ use crate::theme::{self, INK, Palette, SEL_BG};
 pub enum FormKind {
     Workspace,
     Project,
-    Requirement,
 }
 
 pub struct Field {
@@ -29,7 +29,6 @@ pub struct Field {
 pub struct Form {
     pub kind: FormKind,
     pub ws: usize,
-    pub project: Option<&'static str>,
     pub fields: Vec<Field>,
     pub cursor: usize,
 }
@@ -53,7 +52,6 @@ impl Form {
         Form {
             kind: FormKind::Workspace,
             ws: 0,
-            project: None,
             cursor: 0,
             fields: vec![
                 Field { label: "name", value: String::new(), choices: None, help: "what you call it, e.g. Mobile" },
@@ -67,7 +65,6 @@ impl Form {
         Form {
             kind: FormKind::Project,
             ws,
-            project: None,
             cursor: 0,
             fields: vec![
                 Field { label: "name", value: String::new(), choices: None, help: "short, used in keys and env names" },
@@ -78,22 +75,6 @@ impl Form {
                     help: "← → to change",
                 },
                 Field { label: "location", value: "~/projects/".into(), choices: None, help: "the folder, or the URL to clone" },
-            ],
-        }
-    }
-
-    pub fn requirement(ws: usize, project: Option<&'static str>, parents: Vec<String>) -> Self {
-        let mut choices = vec!["none (top level)".to_string()];
-        choices.extend(parents);
-        Form {
-            kind: FormKind::Requirement,
-            ws,
-            project,
-            cursor: 0,
-            fields: vec![
-                Field { label: "title", value: String::new(), choices: None, help: "what must be true, in one line" },
-                Field { label: "refines", value: choices[0].clone(), choices: Some(choices), help: "← → picks a parent; a child gets the parent's id plus .n" },
-                Field { label: "text", value: String::new(), choices: None, help: "how you would check it" },
             ],
         }
     }
@@ -253,7 +234,6 @@ pub fn draw_form(f: &mut Frame, form: &Form, app: &App, pal: Palette) {
     let title = match form.kind {
         FormKind::Workspace => "new workspace".to_string(),
         FormKind::Project => format!("new project · {}", app.data.workspaces[form.ws].name),
-        FormKind::Requirement => format!("new requirement · {}", form.project.unwrap_or(app.data.workspaces[form.ws].name)),
     };
     let rect = centered(f.area(), 86, 24);
     f.render_widget(Clear, rect);
@@ -291,7 +271,10 @@ pub fn draw_form(f: &mut Frame, form: &Form, app: &App, pal: Palette) {
                 tree(&format!("{folder}/"), ""),
                 tree("  .htui/workspace.toml", "name, description, goals, projects"),
                 tree("  .htui/docker-compose.yml", "the components, generated"),
-                tree("  .htui/.env", "ports and URLs per project (no secrets)"),
+                match crate::wsview::infisical(app) {
+                    Some(url) => tree("  (.env)", &format!("ports and URLs per project: kept in Infisical ({url})")),
+                    None => tree("  .htui/.env", "ports and URLs per project (Secrets has no Infisical)"),
+                },
                 tree("  projects/", "projects cloned from a URL go here"),
                 Line::raw(""),
                 Line::from(Span::styled("Existing repos stay where they are; the workspace only points at them.", theme::dim())),
@@ -310,19 +293,6 @@ pub fn draw_form(f: &mut Frame, form: &Form, app: &App, pal: Palette) {
                 Line::from(Span::styled(format!("  {where_}"), theme::text())),
                 Line::from(Span::styled(format!("  a \"{name} coordinator\" chat appears in the Chat tab"), theme::text())),
                 Line::from(Span::styled("  it uses the workspace's components until you say otherwise", theme::text())),
-            ]
-        }
-        FormKind::Requirement => {
-            let parent = form.value("refines");
-            let id = if parent.starts_with("none") { "R-n".to_string() } else { format!("{parent}.n") };
-            vec![
-                heading("it becomes"),
-                Line::from(vec![
-                    Span::styled("  ◇ ", theme::text()),
-                    Span::styled(id, Style::new().fg(theme::status_color(Status::AwaitingApproval)).add_modifier(Modifier::BOLD)),
-                    Span::styled(format!("  {}", form.value("title")), theme::bold()),
-                ]),
-                Line::from(Span::styled("  nobody covers it yet: link items from their Graph, or from the Backlog form", theme::dim())),
             ]
         }
     };

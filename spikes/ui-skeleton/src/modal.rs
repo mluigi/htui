@@ -29,6 +29,29 @@ pub struct Draft {
     pub key: String,
     pub title: String,
     pub body: String,
+    /// Requirements: the one it refines, if any.
+    pub refines: Option<&'static str>,
+    /// Workspace requirements: the project requirements the agent split it into.
+    pub splits: Vec<Split>,
+}
+
+/// One project's share of a workspace requirement.
+#[derive(Clone)]
+pub struct Split {
+    pub project: &'static str,
+    pub id: String,
+    pub title: String,
+    pub text: String,
+    /// Unticked splits are not created.
+    pub on: bool,
+}
+
+/// What the modal creates.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum What {
+    Item,
+    /// A requirement in workspace `ws`; the scope picker's first entry is the workspace itself.
+    Requirement { ws: usize },
 }
 
 #[derive(PartialEq, Eq)]
@@ -44,9 +67,15 @@ pub enum Stage {
 }
 
 pub struct NewItem {
+    pub what: What,
     pub stage: Stage,
     pub projects: Vec<&'static str>,
+    /// Items: an index into `projects`. Requirements: 0 is workspace-wide, n is `projects[n - 1]`.
     pub project: usize,
+    /// Requirements it may refine (cycled with `p` in review).
+    pub parents: Vec<&'static str>,
+    /// Review: the split under the cursor.
+    pub split_cursor: usize,
     pub input: String,
     pub draft: Option<Draft>,
     pub variant: usize,
@@ -91,6 +120,8 @@ pub enum Outcome {
     Stay,
     Close,
     Create { project: &'static str, draft: Draft },
+    /// A requirement: workspace-wide (project None) with its project splits, or a project's.
+    CreateReq { ws: usize, project: Option<&'static str>, draft: Draft },
     AddComponent(Component),
     /// Close the window; the work goes on (or is stopped first).
     Leave { stop_all: bool },
@@ -103,9 +134,12 @@ pub enum Outcome {
 impl NewItem {
     pub fn new(projects: Vec<&'static str>) -> Self {
         NewItem {
+            what: What::Item,
             stage: Stage::Describe,
             projects,
             project: 0,
+            parents: Vec::new(),
+            split_cursor: 0,
             input: String::new(),
             draft: None,
             variant: 0,
@@ -113,6 +147,38 @@ impl NewItem {
             chat_input: String::new(),
             turn: 0,
             busy: None,
+        }
+    }
+
+    /// A requirement for workspace `ws`, scoped to `project` (None: workspace-wide).
+    pub fn requirement(ws: usize, project: Option<&'static str>, data: &Data) -> Self {
+        let projects = data.workspaces[ws].projects.clone();
+        let mut n = NewItem::new(projects.clone());
+        n.what = What::Requirement { ws };
+        n.project = project.and_then(|p| projects.iter().position(|x| *x == p)).map_or(0, |i| i + 1);
+        n
+    }
+
+    pub fn is_req(&self) -> bool {
+        matches!(self.what, What::Requirement { .. })
+    }
+
+    /// The scope picked: None is the workspace, or the item's / requirement's project.
+    pub fn scope(&self) -> Option<&'static str> {
+        match self.what {
+            What::Item => self.projects.get(self.project).copied(),
+            What::Requirement { .. } => self.project.checked_sub(1).and_then(|i| self.projects.get(i)).copied(),
+        }
+    }
+
+    fn scope_len(&self) -> usize {
+        self.projects.len() + usize::from(self.is_req())
+    }
+
+    fn redraft(&self, input: &str, variant: usize, data: &Data) -> Draft {
+        match self.what {
+            What::Item => rewrite(input, variant, data),
+            What::Requirement { ws } => rewrite_req(input, variant, data, ws, self.scope()),
         }
     }
 
@@ -125,7 +191,12 @@ impl NewItem {
         self.busy = None;
         match self.stage {
             Stage::Refining => {
-                self.draft = Some(rewrite(&self.input, self.variant, data));
+                self.draft = Some(self.redraft(&self.input, self.variant, data));
+                self.split_cursor = 0;
+                self.parents = match self.what {
+                    What::Item => Vec::new(),
+                    What::Requirement { ws } => data.reqs.iter().filter(|r| r.ws == ws && may_refine(r, self.scope())).map(|r| r.id).collect(),
+                };
                 self.stage = Stage::Review;
             }
             Stage::Chat => {
@@ -141,14 +212,19 @@ impl NewItem {
     fn agent_reply(&mut self, said: &str, data: &Data) -> String {
         if self.draft.is_none() {
             let seed = if self.input.trim().is_empty() { said.to_string() } else { self.input.clone() };
-            self.draft = Some(rewrite(&seed, 0, data));
+            self.draft = Some(self.redraft(&seed, 0, data));
         }
+        let req = self.is_req();
+        let workspace_wide = req && self.scope().is_none();
         let draft = self.draft.as_mut().expect("set above");
+        let checks = if req { "# How to check\n" } else { "# Acceptance\n" };
         match self.turn {
+            0 if workspace_wide => "Got it. Does it touch every project, or only some? I split it into one requirement per project; tell me which to leave out. And how would you check it is true?".into(),
+            0 if req => "Got it. How would you check it is true? One observable thing is enough.".into(),
             0 => "Got it. Who is it for: just you, or the whole team? And what is the one thing it must do on day one?".into(),
             1 => {
-                draft.body = draft.body.replace("# Acceptance\n", &format!("# Acceptance\n- {}\n", said.trim()));
-                "Added that as the first acceptance criterion. Anything explicitly out of scope?".into()
+                draft.body = draft.body.replace(checks, &format!("{checks}- {}\n", said.trim()));
+                if req { "Added that as the first check. Anything it must not do?".into() } else { "Added that as the first acceptance criterion. Anything explicitly out of scope?".into() }
             }
             2 => {
                 draft.body.push_str(&format!("\n\n# Out of scope\n- {}", said.trim()));
@@ -295,6 +371,88 @@ fn rewrite(input: &str, variant: usize, data: &Data) -> Draft {
         body: format!(
             "# Goal\n{goal}\n\n# Acceptance\n- the main path is covered by an integration test\n- failures show a next step, not an error code\n\n# Open questions\n- does this need a setting, or is one behaviour enough?"
         ),
+        refines: None,
+        splits: Vec::new(),
+    }
+}
+
+/// What a new requirement in `scope` may refine: a workspace one only another workspace one; a
+/// project one its own project's, or a workspace one (as a share of it).
+fn may_refine(r: &crate::data::Requirement, scope: Option<&str>) -> bool {
+    r.project.is_none() || (scope.is_some() && r.project == scope)
+}
+
+/// A title from the first sentence: capitalised, cut at a word boundary.
+fn title_of(first: &str) -> String {
+    let mut title = String::new();
+    for word in first.split_whitespace() {
+        if title.chars().count() + word.chars().count() + 1 > 72 {
+            break;
+        }
+        if !title.is_empty() {
+            title.push(' ');
+        }
+        title.push_str(word);
+    }
+    if let Some(c) = title.get(..1) {
+        title = c.to_uppercase() + &title[1..];
+    }
+    if title.is_empty() { "Untitled".into() } else { title }
+}
+
+/// The mock "LLM rewrite" of a requirement: one line that must be true, how to check it, and, for a
+/// workspace-wide one, one requirement per project it touches.
+fn rewrite_req(input: &str, variant: usize, data: &Data, ws: usize, project: Option<&'static str>) -> Draft {
+    let text = input.trim();
+    let first = text.split(['.', '\n']).next().unwrap_or(text).trim();
+    let title = title_of(first);
+    // Workspace requirements are W-n; project ones share the workspace's R-n.
+    let next = |prefix: &str, skip: usize| {
+        data.reqs
+            .iter()
+            .filter(|r| r.ws == ws)
+            .filter_map(|r| r.id.strip_prefix(prefix).and_then(|n| n.split('.').next()).and_then(|n| n.parse::<u32>().ok()))
+            .max()
+            .unwrap_or(0)
+            + 1
+            + skip as u32
+    };
+    let key = match project {
+        None => format!("W-{}", next("W-", 0)),
+        Some(_) => format!("R-{}", next("R-", 0)),
+    };
+    let must = if variant.is_multiple_of(2) { format!("{title}.") } else { format!("It must always be true that: {}.", first.to_lowercase()) };
+    // The words that matter, to guess what it refines.
+    const COMMON: [&str; 6] = ["every", "project", "projects", "should", "always", "there"];
+    let words: Vec<String> =
+        text.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() > 4 && !COMMON.contains(w)).map(String::from).collect();
+    let refines = data
+        .reqs
+        .iter()
+        .filter(|r| r.ws == ws && may_refine(r, project) && r.parent.is_none())
+        .find(|r| words.iter().any(|w| r.title.to_lowercase().contains(w.as_str())))
+        .map(|r| r.id);
+    let splits = match project {
+        Some(_) => Vec::new(),
+        None => data.workspaces[ws]
+            .projects
+            .iter()
+            .enumerate()
+            .map(|(i, p)| Split {
+                project: p,
+                id: format!("R-{}", next("R-", i)),
+                title: format!("{p}: {}", title.to_lowercase()),
+                text: format!("What {key} means for {p}, checked in {p}'s own tests."),
+                on: true,
+            })
+            .collect(),
+    };
+    Draft {
+        key,
+        title,
+        body: format!("# Must\n{must}\n\n# How to check\n- a test or a check htui can run says yes or no\n\n# Open questions\n- is it for every case, or only the common one?"),
+        refines,
+        splits,
     }
 }
 
@@ -321,8 +479,8 @@ fn new_item_key(n: &mut NewItem, key: KeyEvent, ctrl: bool) -> Outcome {
     match n.stage {
         Stage::Describe => match key.code {
             KeyCode::Esc => return Outcome::Close,
-            KeyCode::Up => n.project = (n.project + n.projects.len().max(1) - 1) % n.projects.len().max(1),
-            KeyCode::Down => n.project = (n.project + 1) % n.projects.len().max(1),
+            KeyCode::Up => n.project = (n.project + n.scope_len().max(1) - 1) % n.scope_len().max(1),
+            KeyCode::Down => n.project = (n.project + 1) % n.scope_len().max(1),
             KeyCode::Tab => {
                 n.stage = Stage::Chat;
                 if !n.input.trim().is_empty() && n.chat.is_empty() {
@@ -348,9 +506,29 @@ fn new_item_key(n: &mut NewItem, key: KeyEvent, ctrl: bool) -> Outcome {
         }
         Stage::Review => match key.code {
             KeyCode::Esc => return Outcome::Close,
-            KeyCode::Enter => {
-                if let (Some(d), Some(p)) = (&n.draft, n.projects.get(n.project)) {
-                    return Outcome::Create { project: p, draft: d.clone() };
+            KeyCode::Enter => match (n.what, &n.draft) {
+                (What::Requirement { ws }, Some(d)) => return Outcome::CreateReq { ws, project: n.scope(), draft: d.clone() },
+                (What::Item, Some(d)) => {
+                    if let Some(p) = n.scope() {
+                        return Outcome::Create { project: p, draft: d.clone() };
+                    }
+                }
+                _ => {}
+            },
+            KeyCode::Up => n.split_cursor = n.split_cursor.saturating_sub(1),
+            KeyCode::Down => {
+                let len = n.draft.as_ref().map_or(0, |d| d.splits.len());
+                n.split_cursor = (n.split_cursor + 1).min(len.saturating_sub(1));
+            }
+            KeyCode::Char(' ') => {
+                if let Some(s) = n.draft.as_mut().and_then(|d| d.splits.get_mut(n.split_cursor)) {
+                    s.on = !s.on;
+                }
+            }
+            KeyCode::Char('p') if n.is_req() => {
+                if let Some(d) = n.draft.as_mut() {
+                    let pos = d.refines.and_then(|r| n.parents.iter().position(|p| *p == r)).map_or(0, |i| i + 1);
+                    d.refines = n.parents.get(pos).copied();
                 }
             }
             KeyCode::Char('e') => n.stage = Stage::Describe,
@@ -479,7 +657,7 @@ fn crumbs(steps: &[&str], at: usize, pal: Palette) -> Vec<Span<'static>> {
 
 pub fn draw(f: &mut Frame, app: &App, pal: Palette) {
     match &app.modal {
-        Some(Modal::NewItem(n)) => draw_new_item(f, n, app.new_item_size, pal),
+        Some(Modal::NewItem(n)) => draw_new_item(f, n, &app.data, app.new_item_size, pal),
         Some(Modal::AddComponent(w)) => draw_wizard(f, w, app, pal),
         Some(Modal::Quit) => crate::forms::draw_quit(f, app, pal),
         Some(Modal::Chooser(c)) => crate::forms::draw_chooser(f, c, pal),
@@ -493,16 +671,24 @@ pub fn new_item_rect(area: Rect, size: (u16, u16)) -> Rect {
     centered(area, size.0, size.1)
 }
 
-fn draw_new_item(f: &mut Frame, n: &NewItem, size: (u16, u16), pal: Palette) {
+fn draw_new_item(f: &mut Frame, n: &NewItem, data: &Data, size: (u16, u16), pal: Palette) {
     let rect = new_item_rect(f.area(), size);
     f.render_widget(Clear, rect);
+    let splits = n.draft.as_ref().is_some_and(|d| !d.splits.is_empty());
     let hints: &[(&str, &str)] = match n.stage {
+        Stage::Describe if n.is_req() => &[("Enter", "rewrite with AI"), ("Tab", "talk it through"), ("↑↓", "scope"), ("Ctrl ←→↑↓", "resize"), ("Esc", "cancel")],
         Stage::Describe => &[("Enter", "rewrite with AI"), ("Tab", "talk it through"), ("↑↓", "project"), ("Ctrl ←→↑↓", "resize"), ("Esc", "cancel")],
         Stage::Refining => &[("Esc", "stop")],
+        Stage::Review if splits => &[("Enter", "create all"), ("↑↓ Space", "keep / drop a split"), ("p", "refines"), ("e", "edit"), ("r", "rewrite"), ("t", "talk"), ("Esc", "cancel")],
+        Stage::Review if n.is_req() => &[("Enter", "create"), ("p", "refines"), ("e", "edit"), ("r", "rewrite again"), ("t", "talk it through"), ("Esc", "cancel")],
         Stage::Review => &[("Enter", "create"), ("e", "edit"), ("r", "rewrite again"), ("t", "talk it through"), ("Esc", "cancel")],
         Stage::Chat => &[("Enter", "send"), ("Ctrl-D", "review draft"), ("Esc", "back")],
     };
-    let block = frame("new item", crate::ui::hint_line(hints, pal), pal);
+    let title = match n.what {
+        What::Item => "new item".to_string(),
+        What::Requirement { ws } => format!("new requirement · {}", data.workspaces[ws].name),
+    };
+    let block = frame(&title, crate::ui::hint_line(hints, pal), pal);
     let inner = block.inner(rect);
     f.render_widget(block, rect);
     let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
@@ -517,24 +703,41 @@ fn draw_new_item(f: &mut Frame, n: &NewItem, size: (u16, u16), pal: Palette) {
     } else {
         crumbs(&["describe", "rewrite", "review"], at, pal)
     };
-    let project = n.projects.get(n.project).copied().unwrap_or("no project");
-    head_spans.push(Span::styled("      project ", theme::dim()));
+    let project = match (n.is_req(), n.scope()) {
+        (_, Some(p)) => p.to_string(),
+        (true, None) => "workspace-wide".to_string(),
+        (false, None) => "no project".to_string(),
+    };
+    head_spans.push(Span::styled(if n.is_req() { "      for " } else { "      project " }, theme::dim()));
     head_spans.push(Span::styled(format!("‹ {project} ›"), theme::bold()));
     let [head, _, rest] = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
     f.render_widget(Line::from(head_spans), head);
 
     match n.stage {
         Stage::Describe => {
-            let lines = vec![
-                Line::from(Span::styled("What do you want to build or fix?", theme::bold())),
-                Line::from(Span::styled("Write it however it comes; an agent turns it into a proper item for you to check.", theme::dim())),
-                Line::raw(""),
-            ];
+            let lines = match (n.is_req(), n.scope()) {
+                (false, _) => vec![
+                    Line::from(Span::styled("What do you want to build or fix?", theme::bold())),
+                    Line::from(Span::styled("Write it however it comes; an agent turns it into a proper item for you to check.", theme::dim())),
+                    Line::raw(""),
+                ],
+                (true, None) => vec![
+                    Line::from(Span::styled("What must be true across the workspace?", theme::bold())),
+                    Line::from(Span::styled("An agent words it as a requirement and splits it into one per project it touches, for you to check.", theme::dim())),
+                    Line::raw(""),
+                ],
+                (true, Some(_)) => vec![
+                    Line::from(Span::styled("What must this project do?", theme::bold())),
+                    Line::from(Span::styled("Write it however it comes; an agent words it as a requirement you can check.", theme::dim())),
+                    Line::raw(""),
+                ],
+            };
             let [top, field] = Layout::vertical([Constraint::Length(3), Constraint::Fill(1)]).areas(rest);
             f.render_widget(Paragraph::new(lines), top);
             let field_block = Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(theme::FAINT));
+            let example = if n.is_req() { "e.g. every project reports its errors to the same tracker" } else { "e.g. the backlog list should remember which groups I folded" };
             let text = if n.input.is_empty() {
-                Line::from(vec![Span::styled("▏", pal.accent()), Span::styled("e.g. the backlog list should remember which groups I folded", theme::dim())])
+                Line::from(vec![Span::styled("▏", pal.accent()), Span::styled(example, theme::dim())])
             } else {
                 Line::from(vec![Span::styled(n.input.clone(), theme::text()), Span::styled("▏", pal.accent())])
             };
@@ -551,14 +754,24 @@ fn draw_new_item(f: &mut Frame, n: &NewItem, size: (u16, u16), pal: Palette) {
         }
         Stage::Review => {
             if let Some(d) = &n.draft {
-                f.render_widget(Paragraph::new(draft_lines(d, pal, "(mock rewrite — no model was called)")).wrap(Wrap { trim: false }), rest);
+                let mut lines = draft_lines(d, n.scope(), pal, "(mock rewrite — no model was called)");
+                if n.is_req() {
+                    lines.extend(req_extra_lines(d, data, n.split_cursor, pal));
+                }
+                f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), rest);
             }
         }
         Stage::Chat => {
             let [left, right] = Layout::horizontal([Constraint::Percentage(45), Constraint::Fill(1)]).areas(rest);
             let draft_block = Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(theme::FAINT)).title(Span::styled(" draft ", theme::bold()));
             let lines = match &n.draft {
-                Some(d) => draft_lines(d, pal, "updates as you talk"),
+                Some(d) => {
+                    let mut lines = draft_lines(d, n.scope(), pal, "updates as you talk");
+                    if n.is_req() {
+                        lines.extend(req_extra_lines(d, data, usize::MAX, pal));
+                    }
+                    lines
+                }
                 None => vec![Line::from(Span::styled("The draft appears once the agent has something to go on.", theme::dim()))],
             };
             f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(draft_block), left);
@@ -591,14 +804,20 @@ fn draw_new_item(f: &mut Frame, n: &NewItem, size: (u16, u16), pal: Palette) {
     }
 }
 
-fn draft_lines(d: &Draft, pal: Palette, note: &str) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        Line::from(vec![
-            theme::glyph(Status::Open),
-            Span::raw(" "),
-            Span::styled(d.key.clone(), pal.key(&d.key)),
+fn draft_lines(d: &Draft, scope: Option<&str>, pal: Palette, note: &str) -> Vec<Line<'static>> {
+    let req = d.key.starts_with("W-") || d.key.starts_with("R-");
+    let head = if req {
+        vec![
+            Span::styled("◇ ", Style::new().fg(theme::status_color(Status::AwaitingApproval))),
+            Span::styled(d.key.clone(), Style::new().fg(theme::status_color(Status::AwaitingApproval)).add_modifier(Modifier::BOLD)),
             Span::styled(format!("  {}", d.title), theme::bold()),
-        ]),
+            Span::styled(format!("   {}", scope.unwrap_or("workspace-wide")), theme::dim()),
+        ]
+    } else {
+        vec![theme::glyph(Status::Open), Span::raw(" "), Span::styled(d.key.clone(), pal.key(&d.key)), Span::styled(format!("  {}", d.title), theme::bold())]
+    };
+    let mut lines = vec![
+        Line::from(head),
         Line::from(Span::styled(note.to_string(), theme::dim())),
         Line::raw(""),
     ];
@@ -610,6 +829,40 @@ fn draft_lines(d: &Draft, pal: Palette, note: &str) -> Vec<Line<'static>> {
                 None => Line::from(Span::styled(l.to_string(), theme::text())),
             },
         });
+    }
+    lines
+}
+
+/// What only a requirement draft has: what it refines, and the project requirements it splits into.
+fn req_extra_lines(d: &Draft, data: &Data, cursor: usize, pal: Palette) -> Vec<Line<'static>> {
+    let req_style = Style::new().fg(theme::status_color(Status::AwaitingApproval)).add_modifier(Modifier::BOLD);
+    let mut lines = vec![Line::raw(""), Line::from(Span::styled("Refines", pal.accent().add_modifier(Modifier::BOLD)))];
+    lines.push(match d.refines.and_then(|id| data.reqs.iter().find(|r| r.id == id)) {
+        Some(r) => Line::from(vec![Span::styled("  ↑ ", theme::dim()), Span::styled(r.id, req_style), Span::styled(format!("  {}", r.title), theme::text()), Span::styled("   p changes", theme::dim())]),
+        None => Line::from(Span::styled("  nothing: a top-level requirement · p picks a parent", theme::dim())),
+    });
+    if d.splits.is_empty() {
+        return lines;
+    }
+    let kept = d.splits.iter().filter(|s| s.on).count();
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("Splits into project requirements", pal.accent().add_modifier(Modifier::BOLD)),
+        Span::styled(format!("   {kept} of {} kept · each refines {}", d.splits.len(), d.key), theme::dim()),
+    ]));
+    for (i, s) in d.splits.iter().enumerate() {
+        let mut line = Line::from(vec![
+            Span::styled(if i == cursor { "▌ " } else { "  " }, pal.accent()),
+            Span::styled(if s.on { "[x] " } else { "[ ] " }, if s.on { Style::new().fg(theme::status_color(Status::Done)) } else { theme::dim() }),
+            Span::styled("◇ ", if s.on { req_style } else { theme::dim() }),
+            Span::styled(format!("{:<7}", s.id), if s.on { req_style } else { theme::dim() }),
+            Span::styled(format!("{:<6}", s.project), theme::bold()),
+            Span::styled(s.title.clone(), if s.on { theme::text() } else { theme::dim() }),
+        ]);
+        if i == cursor {
+            line = line.style(Style::new().bg(SEL_BG));
+        }
+        lines.push(line);
     }
     lines
 }

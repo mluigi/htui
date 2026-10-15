@@ -205,6 +205,18 @@ pub struct Workspace {
     pub description: &'static str,
     pub goals: &'static [&'static str],
     pub state: WsState,
+    /// Runs a stop parked; resuming the workspace picks them up again.
+    pub parked: Vec<Parked>,
+}
+
+/// A run a stop put aside.
+#[derive(Clone, Debug)]
+pub struct Parked {
+    pub key: &'static str,
+    /// The step it stopped in (forced) or after (graceful).
+    pub step: &'static str,
+    /// Forced: the step was cut short and runs again on resume. Graceful: it finished first.
+    pub interrupted: bool,
 }
 
 pub struct Project {
@@ -386,6 +398,7 @@ pub fn mock() -> Data {
             description: "The agent tooling: htui and the runtime it drives.",
             goals: &["ship the keymap and the new shell by November", "every run reproducible on any box"],
             state: WsState::Open,
+            parked: vec![],
         },
         Workspace {
             name: "Platform",
@@ -395,6 +408,7 @@ pub fn mock() -> Data {
             description: "Production services and the infrastructure under them.",
             goals: &["zero-downtime deploys", "p99 under 200 ms"],
             state: WsState::Background,
+            parked: vec![],
         },
         Workspace {
             name: "Personal",
@@ -404,6 +418,7 @@ pub fn mock() -> Data {
             description: "Side projects.",
             goals: &[],
             state: WsState::Stopped,
+            parked: vec![],
         },
     ];
 
@@ -420,6 +435,9 @@ pub fn mock() -> Data {
         Requirement { parent: None, ws: 0, project: Some("htui"), id: "R-20", area: "UI", title: "Every key is rebindable", text: "Every key htui reacts to can be rebound in keys.toml.", status: Status::InProgress, items: &["MOD-67"] },
         Requirement { parent: None, ws: 0, project: Some("htui"), id: "R-21", area: "UI", title: "Each tab explains itself", text: "A toggleable panel says what the tab is for and the common actions.", status: Status::Open, items: &["ANA-33"] },
         Requirement { parent: None, ws: 0, project: None, id: "W-1", area: "Workspace", title: "Every project builds offline", text: "No project in Graphics needs the network to build once its dependencies are cached.", status: Status::InProgress, items: &["VAL-2"] },
+        Requirement { parent: None, ws: 0, project: None, id: "W-2", area: "Workspace", title: "Errors reach one tracker", text: "Every project in Graphics reports its errors to the same tracker, tagged with the project.", status: Status::Open, items: &[] },
+        Requirement { parent: Some("W-2"), ws: 0, project: Some("htui"), id: "R-40", area: "htui", title: "htui reports panics and failed runs", text: "A panic or a failed run in htui reaches the tracker, tagged htui.", status: Status::Open, items: &[] },
+        Requirement { parent: Some("W-2"), ws: 0, project: Some("agy"), id: "R-41", area: "agy", title: "agy reports session crashes", text: "A crashed agent session in agy reaches the tracker, tagged agy.", status: Status::Open, items: &[] },
         Requirement { parent: None, ws: 0, project: Some("agy"), id: "R-3", area: "Agents", title: "Cancelling a session frees it", text: "A cancelled agent session releases its process and its lease within a second.", status: Status::InProgress, items: &["FIX-1"] },
         Requirement { parent: None, ws: 1, project: None, id: "W-1", area: "Workspace", title: "Zero-downtime deploys", text: "Every service in Platform deploys without dropping requests.", status: Status::Open, items: &["FEAT-3"] },
         Requirement { parent: None, ws: 1, project: Some("api"), id: "R-1", area: "API", title: "p99 under 200 ms", text: "Every public endpoint answers within 200 ms at p99 under nominal load.", status: Status::InProgress, items: &["ANA-4", "MOD-12"] },
@@ -614,7 +632,7 @@ pub fn mock() -> Data {
             ],
         },
         Section {
-            name: "Connection",
+            name: "Postgres",
             group: "Storage",
             about: "The Postgres database every box shares.",
             fields: vec![
@@ -650,15 +668,6 @@ pub fn mock() -> Data {
                 Field { label: "provider", value: "infisical".into(), kind: FieldKind::Choice(&["none", "infisical", "env file"]), help: "" },
                 Field { label: "URL", value: "https://infisical.example.com".into(), kind: FieldKind::Text, help: "" },
                 Field { label: "client secret", value: "s3cr3t-value-123".into(), kind: FieldKind::Secret, help: "never shown; storing replaces it" },
-            ],
-        },
-        Section {
-            name: "Hierarchy",
-            group: "Backlog",
-            about: "How projects nest inside the open workspace. Switching workspace is w, from anywhere.",
-            fields: vec![
-                Field { label: "group items by", value: "project".into(), kind: FieldKind::Choice(&["project", "kind", "status"]), help: "how the Backlog list is grouped" },
-                Field { label: "show closed", value: "off".into(), kind: FieldKind::Toggle, help: "list closed and done items" },
             ],
         },
         Section {
