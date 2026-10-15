@@ -1,27 +1,28 @@
 # CONCEPTS - htui
 
 **Owner:** Luigi Marrandino
-**Reviewed:** 2026-10-14
+**Reviewed:** 2026-10-15
 
 Standing architectural intent for `htui`. Governed by `.claude/rules/concept-docs.md`. Distilled
 from `docs/REQUIREMENTS.md`, which is the authority; requirement IDs in brackets.
 
 ## What htui is
 
-A cross-platform Rust TUI (`ratatui`, `crossterm`, `tokio`) that wraps AI coding agents to run a
-backlog of work items through configurable step graphs across projects, repositories and machines
-[R-ID-1]. Single developer today, teams later without redesign [R-USR-1..3].
+A cross-platform Rust TUI (`ratatui`, `crossterm`, `tokio`) that wraps AI agents to run a backlog
+of work items through configurable step graphs across projects, repositories and machines. Projects
+of any kind, coding the main one [R-ID-1]. Single developer today, teams later without redesign
+[R-USR-1..3].
 
-It is **not** an IDE, not a code editor, not a terminal multiplexer, and not a cloud service. It is
-a local-first, developer-guided harness. A headless `htui worker` per box, started by you and
+A local-first, developer-guided harness. It ships no editor of its own; it hosts your `$EDITOR`. A web
+front end and multiplexer panes are later tier. A headless `htui worker` per box, started by you and
 talking only to your Postgres, is part of `htui` [R-ID-2].
 
 ## Single source of truth
 
 - **Postgres holds everything**: items, documents, runs, full transcripts, skills, templates, box
-  profiles, agent registry, settings [R-ID-3]. Credentials live in the OS keyring; a headless
-  worker without one reads its DSN from a systemd credential or its stdin, never argv, the
-  environment or a plain file [R-STO-1].
+  profiles, agent registry, key bindings, settings [R-ID-3]. Credentials live in the OS keyring; a
+  headless worker without one reads its DSN from a systemd credential or stdin, dev and CI from an
+  env var stripped from agents; never argv or a plain file [R-STO-1].
 - **Repos stay clean.** `htui` writes no files into managed repositories; only agents doing an
   item's work touch a working tree [R-ID-4]. Rejected: per-repo `items.json` snapshots, they were a
   second source of truth with merge exposure.
@@ -38,23 +39,24 @@ talking only to your Postgres, is part of `htui` [R-ID-2].
 
 ## Hierarchy
 
-`workspace` groups projects for cross-repo work; `project` owns item keys, kinds, step graphs and
-secrets; skills attach globally or to a project or one of its phases [R-SKL-2]; `repo` is a git
-checkout in exactly one project [R-ENT-1..4]. Workspaces
-are explicit; a single project runs with none [R-ENT-2]. Logical identity never depends on a
-filesystem path: every box maps repos and workspace roots to its own paths [R-BOX-4].
+`workspace` groups related projects and owns cross-project items [R-ENT-16]; `project` owns item
+keys, kinds, step graphs and secrets; skills attach from global down to phase, most specific wins
+[R-SKL-2]; a `repo` is a git checkout or plain folder in one project, zero or more per project
+[R-ENT-1..4]. Workspaces are explicit, with no root path; a single project runs with none [R-ENT-2].
+Logical identity never depends on a filesystem path: every box maps repos to its own paths [R-BOX-4].
 
-Item kinds are configurable per project with a key prefix and a default step graph; seeded set
-`ANA`, `FEAT`, `FIX`, `CLEAN`, `TOOL` [R-ENT-6]. Item links are UUID edges, so cross-project
-dependencies need nothing extra [R-ENT-9].
+Item kinds are configurable per project, seeded by its type [R-ENT-6]. Item status is open, blocked
+or closed; progress lives on runs [R-ENT-8]. Links are UUID edges, so cross-project dependencies need
+nothing extra [R-ENT-9].
 
 ## Agents and orchestration
 
 - **One driver trait, ACP first.** Agents speak Agent Client Protocol; a CLI stream adapter covers
   the rest. Adding an agent is a registry row plus at most a parser [R-AGT-1..5]. Version one:
   `claude`, `claude-cli`, `agy`.
-- **Step graphs, not scripts.** A run is an ordered list of phases with candidate agents, gates,
-  retries, fan-out and isolation mode; review failure loops back to implement [R-ORCH-1..3, 7, 8].
+- **Step graphs, not scripts.** Phases with candidate agents, gates, retries, loop-backs and
+  isolation; fan-out divides work into parallel parts that an integrate step merges [R-ORCH-1..3, 7,
+  8]. A coordinator per project and workspace only manages [R-ORCH-14].
 - **Manual and auto.** Manual runs one item with gates as configured; auto is a queue runner that
   downgrades non-hard gates and honors caps [R-ORCH-4, 6]. Any step can be promoted to interactive
   chat and resumed [R-ORCH-5].
@@ -68,8 +70,8 @@ dependencies need nothing extra [R-ENT-9].
 - **Inlined skills.** Agents run with system skills disabled; `htui` owns skill and template text
   in Postgres and inlines it into one self-contained initial prompt [R-ID-5, R-PRM-1, R-SKL-1, 2].
 - **Bounded context.** Prior work reaches a prompt only as documents and upstream summaries within
-  one to two hops inside the active workspace, never as raw transcripts; oversize inputs are trimmed
-  in a fixed priority order [R-PRM-1..3].
+  one to two hops inside the active workspace, never as raw transcripts; template and skills are
+  never trimmed, the rest in a fixed order [R-PRM-1..3].
 - **htui MCP server.** Agents propose links, write artifacts and, when exposed, queue heavy
   commands behind per-box limits through `htui`'s own MCP tools, scoped to their run step
   [R-MCP-1..4].
@@ -77,8 +79,8 @@ dependencies need nothing extra [R-ENT-9].
 ## Secrets
 
 Project secrets come from a `SecretProvider` (Infisical first) into the agent environment only;
-agents never get a tool that reads them [R-SEC-1, 2]. Every transcript is scrubbed on the host box
-before it persists, and scrubbing fails closed [R-ID-7, R-SEC-3].
+agents never get a tool that reads them [R-SEC-1, 2]. Everything persisted or sent off the box is
+scrubbed on the host box first, and scrubbing fails closed [R-ID-7, R-SEC-3].
 
 ## Which file answers which question
 

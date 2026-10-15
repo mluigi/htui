@@ -14,7 +14,13 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-14):** a **requirements audit** found 69 of 90 `must` requirements fully met; the
+**Current status (2026-10-15):** a **requirements review** with the maintainer
+(`docs/requirements-review-2026-10-15.md`) went through every requirement and amended most of
+`docs/REQUIREMENTS.md`. The main changes: `htui` serves any kind of project; fan-out now divides work
+(best-of-N is later, `R-LATER-13`); a coordinator per project and per workspace (`R-ORCH-14`); key
+bindings move to Postgres; `R-LATER-3` and `R-LATER-7` are promoted to must; macOS is best effort. Filed
+**ANA-33..39** for the open designs and **MOD-107..114** for the settled work. **ANA-28 is concluded**
+(`heavy_build` becomes a label, MOD-107). Before it, a **requirements audit** (2026-10-14) found 69 of 90 `must` requirements fully met; the
 untracked gaps are filed as **MOD-99..106**, **ANA-31**, **ANA-32** and **TOOL-13**, and `R-NF-2`, `R-ORCH-6`,
 `R-ORCH-12` and `R-LATER-6` were amended (`docs/REQUIREMENTS.md` header). **MOD-99** (hard-coded Sentry DSN in a
 public repo) also owes key rotation and a history rewrite, after the live `hr` branches merge. **TOOL-14 is done**
@@ -74,16 +80,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   automatically. The fit is deterministic arithmetic over rows, so it is allowed under `R-ID-6`.
   Judge choice itself is out of scope: ANA-21 §2.2 established the judge is never asked of the
   selector, and MOD-36 owns the judge-identity hardening.
-- [ ] **ANA-28 - `heavy_build`: queue switch vs required box capability** (from MOD-11,
-  `docs/decisions/mod/mod-11.md`). `R-MCP-3`, `R-ORCH-10`. R-MCP-3 says an item carrying the
-  `heavy_build` tag forces `command_run` on. MOD-11 reads that tag from `item.required_tags`, the only
-  item tag field, and that field is also the item's required box capabilities (R-ORCH-10). So
-  tagging an item `heavy_build` both exposes `command_run` and lets the item run only on a box that
-  declares `heavy_build`; elsewhere the run is refused with `missing tags: heavy_build`
-  (`docs/htui-mcp.md`, "When `command_run` is offered"). The other way to get the queue on a
-  single-agent step, a phase's `command_queue = always`, is settable only in Postgres (Settings ›
-  Kinds shows it read-only). Options to weigh: a non-routing item label, exempting `heavy_build`
-  from the box-tag match, or a phase/queue setting in the TUI.
+  **Requirements review note (2026-10-15):** best-of-N fan-out is now the later-tier compete mode
+  (`R-LATER-13`; `R-ORCH-7` means divided work), so this analysis and MOD-36 are later tier too.
 - [ ] **ANA-31 - Can `agy` run with its own skills and context disabled** (from the 2026-10-14
   requirements audit). `R-ID-5`, `R-AGT-5`. Isolation is wired only for Claude: the ACP `claudeCode`
   meta (`crates/htui-agent/src/acp/mod.rs:1116`) and the `claude-cli` flags (`cli/mod.rs:258-272`,
@@ -91,45 +89,93 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   files are never disabled, and a registry row's `settings.user_extensions` turns isolation off for
   any agent. Establish what `agy` (and an ACP agent in general) offers to disable its own instruction
   files, whether it can be expressed as row data (`R-AGT-5`), and whether `user_extensions` needs a
-  guard or an `R-ID-5` amendment.
+  guard or an `R-ID-5` amendment. **Requirements review note (2026-10-15):** `R-ID-5` now allows a
+  row to opt out of isolation, provided Settings shows it (MOD-109 builds that part). What is left
+  here is how `agy` is isolated.
 - [ ] **ANA-32 - Measure warm start against the one-second budget** (from the 2026-10-14
   requirements audit). `R-STO-6`, `R-NF-3`. `R-STO-6` sets "under one second with a warm cache and a
   reachable Postgres on the reference workstation"; MOD-6 (`docs/decisions/mod/mod-6.md:127`) said to
   measure it and ANA-10 §12 criterion 13 keeps it as a recorded figure, but no figure, benchmark or
   item exists. Define the measurement (process start to first interactive frame, cache refresh
   excluded), record it on the reference workstation, and say whether a regression check belongs in
-  the gate.
+  the gate. **Requirements review note (2026-10-15):** `R-STO-6` now reads "first interactive frame
+  from a warm cache under one second, with the Postgres connect allowed to finish later", and
+  `R-NF-3` gains a key-press-to-screen bound (on the order of 50 ms under load) that this
+  measurement sets.
+- [ ] **ANA-33 - Step graphs v2 and divided fan-out** (from the 2026-10-15 requirements review,
+  `docs/requirements-review-2026-10-15.md`). `R-ORCH-1`, `R-ORCH-3`, `R-ORCH-7`, `R-ORCH-8`,
+  `R-MCP-2`, `R-ID-6`, `R-TUI-4`, `R-TUI-8`. Step graphs today are an ordered phase list per
+  project, and fan-out runs N candidates on one prompt and keeps one result. The review changes both:
+  graphs branch, run phases in parallel and loop, can be owned by a workspace, can run several items
+  as subgraphs, and can be **planned at run time** by the agent that starts them, which then runs its
+  plan directly within the project's bounds (phases, agents, caps, hard gates). Fan-out becomes
+  **division of work**: a planner agent splits a step into parts, parallel sub-steps of the same run,
+  each in its own tree, and an integrate step merges them before review (like Claude Code's
+  ultracode). Loop-back on failure becomes a per-phase target. Settle: the graph model and its
+  storage, and the snapshot a run freezes (`R-ORCH-11`); the planner's MCP tools; how a part maps
+  onto `run_step` (`UNIQUE (run_id, position, attempt, fanout_index)`) and onto crash recovery
+  (ANA-2 §4.9); how the integrate step relates to ANA-2 §4.6's reconciliation, where the orchestrator
+  never resolves a conflict; the Settings graph editor; and what becomes of MOD-27 (swarm,
+  `spawn_subagent`), MOD-36 and ANA-25 (now later tier, `R-LATER-13`). Its verdict ships in version
+  one. Not blocked.
+- [ ] **ANA-34 - Coordinator at project and workspace level** (from the 2026-10-15 requirements
+  review). `R-ORCH-14`, `R-TUI-9`, `R-ENT-8`, `R-ID-6`, `R-ORCH-7`, `R-ENT-15`. The maintainer asked
+  where merge and pull requests happen. Today the orchestrator merges a step's branch into the local
+  primary checkout (ANA-2 §4.6), close-out only records hashes and writes the summary
+  (`htui-orch/src/closeout.rs`), and nothing pushes or opens a PR. The review adds a **coordinator**,
+  one per project and one per workspace. It only manages: it listens to what happens below it, talks
+  with children and parent, integrates a child's work when the child's run completes (merge, push or
+  PR, as the project configures), and runs close-out with a checklist (follow-up items, re-confirming
+  suspect citations, choosing the resolution). Settle: whether a coordinator is an agent session, a
+  deterministic process or both, and where `R-ID-6` draws the line; its lifetime and the box it runs
+  on (the worker, `R-ORCH-12`); how it relates to ANA-33's planner and integrate step; the
+  push/PR configuration and its credentials (`R-BOX-4`, `R-SEC-2`); and the final text of `R-TUI-9`.
+  Not blocked; best read beside ANA-33.
+- [ ] **ANA-35 - Entity model for any kind of project** (from the 2026-10-15 requirements review).
+  `R-ID-1`, `R-ENT-1`, `R-ENT-2`, `R-ENT-3`, `R-ENT-4`, `R-ENT-5`, `R-ENT-6`, `R-ENT-8`, `R-ENT-9`,
+  `R-ENT-12`, `R-ENT-14`, `R-ENT-16`, `R-BOX-4`, `R-STO-8`, `R-TUI-2`. `htui` now serves any kind of
+  project, not only code. Settle the schema and migration for: a project **type** that seeds kinds and
+  graphs (software, research, docs, ops; the non-software seeds); **repo-less** projects and repos
+  that are **plain folders** (what refuses without git); workspaces with **no root path** that
+  **own items, documents and requirements** (their key space and kinds, and `R-ENT-7`'s single
+  counter); documents owned by a project or workspace; **attachments** in Postgres under a size cap;
+  link kinds `parent`, `duplicates`, `implements` and links to documents or attachments; and the item
+  status reduced to **open / blocked / closed**, with `queued`/`in_progress`/`awaiting_approval`/
+  `failed` moving to the run. That last one touches the store, orchestrator, cache, Backlog filters,
+  waiting-on-you and search's decisions filter. Also take over MOD-106's question of the primary repo.
+  Not blocked.
+- [ ] **ANA-36 - Further MCP tools for agents** (from the 2026-10-15 requirements review).
+  `R-MCP-2`, `R-MCP-1`, `R-ID-6`. The review adds read tools, search, `item_create` drafts, the
+  question tool (MOD-75) and the planner's tools (ANA-33), and asks for a survey of what else agents
+  should get: what comparable harnesses expose to their agents, which tools would replace work an
+  agent does badly today (from stored transcripts), and the scope and `R-ID-6` line for each. Not
+  blocked.
+- [ ] **ANA-37 - Is Qdrant worth requiring** (from the 2026-10-15 requirements review). `R-NF-2`,
+  `R-STO-8`, `R-ENT-13`. The maintainer wants Qdrant required "if it is very beneficial". Today it is
+  optional and fails open (MOD-34, MOD-50, MOD-68). Measure what semantic search adds once agents can
+  search (MOD-112), triage and duplicate detection use it, and memory (ANA-38) sits on it. Weigh that
+  against the cost of a second required daemon on every box (install, Windows, a headless worker) and
+  against Postgres-only alternatives (`pgvector`, full-text search). Verdict: required or optional,
+  and the `R-NF-2` text. Not blocked.
+- [ ] **ANA-38 - Project and workspace memory** (from the 2026-10-15 requirements review; reopens
+  `R-ENT-13`). `R-ENT-13`, `R-ID-6`, `R-STO-8`, `R-ORCH-14`. ANA-1's atomic facts with importance
+  scores were dropped on 2026-09-03 as over-engineered ("summaries cover the need"). The maintainer
+  reopened the question for the coordinator (ANA-34) and agents: memory of facts, decisions and
+  gotchas that outlives one item. Settle who writes an entry (an agent, a person, close-out), how it
+  stays fresh against the code it describes (commit pinning, expiry, confirmation), the `R-ID-6` line
+  (a person accepts it, or not), how it reaches a prompt (`R-PRM-1`, `R-PRM-3`), and its
+  **integration with Qdrant** (indexed, searched, deduplicated). Not blocked.
+- [ ] **ANA-39 - Mandatory context tools for coding sessions** (from the 2026-10-15 requirements
+  review; `R-LATER-7` promoted to must). `R-LATER-7`, `R-NF-2`, `R-AGT-10`, `R-ID-5`, `R-MCP-4`,
+  `R-PRM-1`. Code-context tools (Gortex, Serena, Graphify, Headroom) become mandatory in coding
+  sessions and replace the agents' plain search and read tools there. When one is missing, `htui`
+  installs it or tells the user how. Settle: which tools, and which is the default; how each agent
+  is denied grep/read in favour of them (permission rules, the agent's tool list, per row as data,
+  `R-AGT-5`); what a coding session is (the project type, phase or kind); install and detection
+  through R-AGT-10's tool managers; per-box indexing cost and freshness; and the excerpt-provider half
+  of `R-PRM-1` (ANA-3 shipped none). Not blocked.
 
 ### Next features
-- [ ] **MOD-36 - Weighted agent assignment across fan-out candidates** (from MOD-4 milestone 4,
-  OQ-7; ANA-21 is done, `docs/decisions/ana/ana-21.md`). `R-AGT-8`,
-  `R-ORCH-7`. Milestone 4 runs every candidate of a group on the
-  one agent the walk selects (rival sampling). This item spreads candidates across the eligible
-  agents by weight: a weighted `AgentSelector` (the seam milestone 4 leaves per-candidate) picks each
-  `fanout_index`'s agent from the walk's eligible list using ANA-21's weights, so the judge compares
-  different models on the same task. Slot 0 stays `eligible[0]` and only the rival slots are
-  apportioned, so the priority order stands (`docs/ANA-21.md` §5.5, §7.2). Open points to settle in
-  the plan: the prompt is assembled once
-  per group, but token budgeting uses one agent's estimator (`TokenEstimator::for_agent`), so mixed
-  families need either the tightest budget or per-candidate trimming, which breaks "identical prompt
-  across siblings" (ANA-5 `:1870`); each candidate draws on its own agent's quota; the judge must not
-  learn which model wrote which candidate (position-bias control extends to model-identity bias).
-  **ANA-17 note (2026-09-25, `docs/decisions/ana/ana-17.md`):** the section framing is one frame for
-  every model, so the estimator is the only thing a mixed-family group can diverge on. The function is
-  `TokenEstimator::for_model` (keyed on a model id), not `for_agent`, and every production
-  `PromptSpec` passes `TokenEstimator::DEFAULT` today (`htui-orch/src/engine.rs:4652`, `:5374`,
-  `htui/src/preview.rs:306`), so choosing it per group or per candidate is new wiring.
-  **MOD-23 note (2026-09-30, `docs/decisions/mod/mod-23.md`):** ANA-21 item 8's "MOD-23's editor
-  surfaces `settings.weights`" moved here: the Settings > Agents edit form carries `settings`
-  untouched, and a weights field is one more entry in its field list (plan D231).
-  **ANA-24 note (2026-10-01, `docs/decisions/ana/ana-24.md`):** the seed `weights.sources` registry
-  takes `docs/ANA-24.md` §5: `epoch-mirrorcode` (primary) and `arena-webdev`/`arena-agent` join the
-  implement axis, `epoch-eci` is narrowed to `eci_scores.csv`, `tbench-4-0` stays blocked. Each
-  dynamic source needs a parser under the fetch conditions of §6 (Arena from Hugging Face only, with
-  a per-fetch licence check; Epoch keyed on `benchmark_metadata.csv`, never `*_external.csv`).
-  **ANA-30 note (2026-10-14, `docs/decisions/ana/ana-30.md`):** the `haiku` alias now runs Haiku 5.5;
-  seed the `claude`/`claude-cli` map with `claude-haiku-5-5` unscored (resolving through `*`) and no
-  `haiku` key at 25 (`docs/ANA-21.md` §5.7 amendment).
 - [ ] **MOD-27 - Swarm RunKind & task MCP Tool (from ANA-13).** Add `RunKind::Swarm` to `htui-orch`, implement `spawn_subagent` MCP tool with JSON schema validation and isolated worktrees. `htui-orch`, its `Isolator` seam and `run_worker.rs` exist since MOD-4 (done, `docs/decisions/mod/mod-4.md`); the MCP half needs MOD-11.
   The named personas a `handoff` targets exist since MOD-26 (done, `docs/decisions/mod/mod-26.md`):
   `persona` registry rows, bound per phase, frozen into the run snapshot by name.
@@ -148,7 +194,9 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   depth and breadth limits against `max_agents_per_run`; how a child fits `UNIQUE (run_id, position,
   attempt, fanout_index)`; crash recovery of a child under ANA-2 §4.9; and whether graph steps deny
   the harness's own subagent tool, whose sessions htui never sees. Cites `R-MCP-2`, which already
-  lists the tool.
+  lists the tool. **Requirements review note (2026-10-15):** `R-ORCH-7` now means divided work
+  (a planner, parallel parts, an integrate step), which overlaps the swarm. ANA-33 settles whether
+  this item is subsumed, narrowed or kept; do not start before its verdict.
 - [ ] **MOD-16 - Windows runtime verification of the agent driver** (from MOD-2). `R-AGT-1`,
   `R-NF-3`, `R-HIS-1`. **This is now the only Windows check** (TOOL-3 decided 2026-09-28,
   `docs/decisions/tool/tool-3.md`): the maintainer accepted that
@@ -377,7 +425,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   follow-up turn. MOD-69's waiting-on-you list shows each open question as its own row. Whether a
   parked question holds its session and compute slot (like a permission request) or releases them
   and resumes later is this item's design call. Not blocked: MOD-11 is done (`docs/decisions/mod/mod-11.md`), so the MCP
-  server exists.
+  server exists. `R-MCP-2` lists the tool since the 2026-10-15 requirements review, and MOD-114
+  rings and notifies when a question parks a step.
   **From MOD-55 (`docs/decisions/mod/mod-55.md`):** milestone 4 (Skills) also takes the editors' `Ctrl+G` (ask an
   agent, `ui/tabs/skills/agent_help.rs`) and the `AgentHelp` panel's keys (`Enter`/`y` accept, `Esc`/`n` discard),
   hard-coded today like `Ctrl+S`/`Ctrl+E`.
@@ -441,6 +490,9 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   recall it), then rewrite history with `git filter-repo --replace-text` on every branch and force-push
   `origin` and `github`, **after** the live `hr` sandbox branches (TOOL-8, ANA-30, TOOL-10 at the
   audit) are merged or dropped. Maintainer decision 2026-10-14: file now, rewrite later. Not blocked.
+  **Requirements review note (2026-10-15):** `R-ID-7` now names logs, telemetry and error reports
+  explicitly. Check that `tracing` output written to a file passes the scrubber too, not only what
+  reaches the endpoint.
 - [ ] **MOD-100 - Run-history retention sweep per project** (from the 2026-10-14 requirements
   audit). `R-HIS-3`. `ProjectSettings.retention_days` (`htui-core/src/model/kind.rs:375`) is never
   read: MOD-2's PRD and MOD-6 (`docs/decisions/mod/mod-6.md:89`, plan D14) deferred the sweep and no
@@ -471,7 +523,10 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   "Chat (one per session)" does not hold. A free-standing chat always starts against
   `ctx.projects.first()` (`chat/mod.rs:355`), so in a multi-project workspace no other project can be
   chosen. Also settle whether tool results show their content or only flip the call's status
-  (`chat/transcript.rs:250-264`). Not blocked.
+  (`chat/transcript.rs:250-264`). Not blocked. **Requirements review (2026-10-15), `R-TUI-6`
+  amended:** a free-standing chat runs against the **active workspace**, or the project when there is
+  no workspace, whatever folder `htui` started in; there is no project picker. Tool results **show
+  their content** (collapsible). The agent and model are chosen when the chat starts.
 - [ ] **MOD-104 - Secret provider machine-identity bootstrap** (from the 2026-10-14 requirements
   audit). `R-SEC-1`. The `SecretProvider` trait (`crates/htui-core/src/secret.rs:28-37`) has kind,
   health, list_keys and resolve, but no "bootstrap a machine identity": the Infisical identity is
@@ -486,26 +541,148 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   (`install/fetch.rs`), and only `agent_agy.json` declares `discovery.install`; the claude rows declare
   none, so a box without the npm adapter cannot install it. Run the terminal method in the embedded
   terminal pane (MOD-57) and add an npm-package install source, both as row data (`R-AGT-5`). Not
-  blocked.
+  blocked. **Requirements review (2026-10-15), `R-AGT-9` and `R-AGT-10` amended:** login is now
+  **best effort**: where the agent offers no usable in-app method, showing the exact command to run
+  is enough, so the embedded-terminal login is optional. Install grows: besides the npm source, install,
+  detect and **update** agents through the box's tool managers (`mise`, `npm`/`volta`, `brew`,
+  `winget`, `scoop`), preferring the one the box already uses (on the maintainer's box, `claude` and
+  `agy` come from `mise`, the latter via `aqua:google-antigravity/antigravity-cli`), and show the
+  installed version beside the latest. Autodiscovery must see mise and volta shims.
 - [ ] **MOD-106 - Enforce one primary repo per project** (from the 2026-10-14 requirements audit).
   `R-ENT-3`. The schema stops two primaries (`uq_repo_primary`) but not zero: a project with repos
   and no primary is reachable (`crates/htui/src/ui/tabs/settings/hierarchy.rs:684`), and
   `item_spec.rs:367` copes by refusing bare paths. Enforce "at least one repo, exactly one primary"
   at the store write (promote another repo when the primary is removed, refuse removing the last),
-  or amend `R-ENT-3` to allow a repo-less project. Not blocked.
-
-### Deferred backlog
-
-- [ ] **MOD-3 - Diff tab + code explorer.** `R-LATER-1`. Later tier; needs its own ANA first.
-- [ ] **MOD-5 - Issue tracker mirror.** `R-LATER-2`. `IssueSync` trait, OneDev first, downstream
-  only. Later tier; needs its own ANA first.
-
+  or amend `R-ENT-3` to allow a repo-less project. Not blocked. **Requirements review (2026-10-15):**
+  `R-ENT-3` is amended, so a project may have **zero repos**, and when it has any, exactly one is
+  primary. What remains: promote another repo when the primary is removed, and make "repos but no
+  primary" unreachable. Removing the last repo is allowed. ANA-35 owns the wider repo-less model, so
+  land this after it or with it.
+- [ ] **MOD-107 - Item priority and labels; `heavy_build` as a label** (from ANA-28, concluded,
+  `docs/decisions/ana/ana-28.md`, and the 2026-10-15 requirements review). `R-ENT-5`, `R-BOX-3`,
+  `R-MCP-3`, `R-ORCH-6`, `R-ORCH-10`, `R-TUI-2`. Add an explicit item **priority** (auto mode already
+  picks "by priority", `R-ORCH-6`) and free **labels**, kept apart from `required_tags`, which stay the
+  routing capability set. `heavy_build` becomes a label: MOD-11's exposure check reads labels, and an
+  item labelled `heavy_build` runs on any box. Migrate existing `required_tags` entries of
+  `heavy_build` to the label, and drop `heavy_build` from the seeded box vocabulary. The Backlog filters
+  and sorts by labels and priority; the item form edits them; the cache and search follow. Assignee and
+  due date are later (`R-LATER-11`). Not blocked.
+- [ ] **MOD-108 - Boxes and repos: wider probe, clone onto a box, git credentials** (from the
+  2026-10-15 requirements review). `R-BOX-2`, `R-BOX-4`, `R-STO-1`, `R-SEC-2`, `R-AGT-6`. (1) The box
+  probe also records language runtimes (`node`, `python`, `go`, `java`), tool and package managers
+  (`mise`, `npm`, `volta`, `brew`, `winget`, `scoop`), free disk space and network reachability, as
+  `box_probe_spec` data where possible. (2) A repo missing on a box can be **cloned** from its remote
+  URL, and the per-box path recorded. (3) When the clone fails on authentication, name the remote and
+  what it needs (SSH key, token, `gh auth`), mark the repo unavailable on that box, and offer an
+  in-app setup: generate an SSH key and show its public half, or store an HTTPS token in the OS
+  keyring for git to use (a credential helper), never in a file. ANA-34's push/PR credentials will
+  reuse this. Not blocked.
+- [ ] **MOD-109 - Settings and configuration surfaces** (from the 2026-10-15 requirements review).
+  `R-TUI-10`, `R-TUI-8`, `R-STO-1`, `R-STO-3`, `R-STO-5`, `R-SEC-2`, `R-AGT-5`, `R-ID-5`, `R-MCP-3`.
+  Five settled changes, landable as separate milestones:
+  - **Key bindings in Postgres.** Edited in Settings and stored per user, shared by every `htui` on
+    the store, cached for offline. `keys.toml` goes away. This reverses MOD-67's file (ANA-26), and
+    MOD-67's catalogue, validation and `--default-keys` stay.
+  - **Agent rows from Settings.** A user adds a registry row, beyond MOD-23's edit form. A row's
+    isolation opt-out (`settings.user_extensions`, `R-ID-5`) is shown and editable.
+  - **`command_run` controls.** A phase's exposure and the per-box command-class limits become
+    editable; Settings › Kinds shows them read-only today.
+  - **DSN from an environment variable**, for dev and CI. Read once, and stripped from every agent
+    spawn (beside MOD-97's vendor-key strip).
+  - **`htui migrate`.** An explicit, non-interactive CLI verb that applies pending migrations; the
+    worker still never migrates.
+  Not blocked.
+- [ ] **MOD-110 - Agents and quota: event kinds, cost view, quota-aware auto mode** (from the
+  2026-10-15 requirements review). `R-AGT-1`, `R-AGT-7`, `R-AGT-8`, `R-ORCH-6`, `R-HIS-1`,
+  `R-TUI-6`. (1) The driver's event kinds gain plan/todo updates, subagent start and end, file read,
+  mode change and questions to the user, mapped from ACP and the CLI stream as row data where the
+  agent reports them. Check which already arrive as untyped events. (2) A cost and usage view over
+  time, per agent, project and item, from the recorded usage events. (3) Auto mode **waits** for a
+  subscription quota reset and resumes, rather than failing the item, with the wait visible in the
+  queue overlay. Not blocked.
+- [ ] **MOD-111 - Run control: advisory judge, step control, routing, budget raise** (from the
+  2026-10-15 requirements review). `R-ORCH-2`, `R-ORCH-4`, `R-ORCH-10`, `R-ORCH-12`, `R-HIS-2`,
+  `R-PRM-3`, `R-TUI-4`. (1) A gate can ask a configured judge agent for an **advisory** verdict,
+  shown on the gate, and the person still decides. (2) Manual mode can **run one chosen step, skip a
+  step, or restart from any step**. (3) **Fork from history**: start a new chat or run from a past
+  step's context. (4) A run refused for missing capability tags **offers dispatch to a box that has
+  them**; this part needs MOD-43. (5) In manual mode, a step about to start trimmed says so and lets the
+  user **raise the budget** first (`R-PRM-3`'s trim stays as ANA-5 §4.4 built it). Not blocked except
+  part (4).
+- [ ] **MOD-112 - Agent context over MCP: read tools, item drafts, wider search** (from the
+  2026-10-15 requirements review). `R-MCP-1`, `R-MCP-2`, `R-PRM-1`, `R-STO-8`, `R-ID-6`. (1) Read
+  tools for items, documents and requirements, with **read scope wider than the run** (the active
+  workspace) and writes still run-scoped. (2) A **search** tool over R-STO-8's index. (3)
+  **`item_create`**: an agent proposes an item, held as a draft until a person accepts it. (4) The index
+  also covers **notes** and **scrubbed run transcripts**, and searches can be scoped to a workspace
+  (workspace-owned items once ANA-35 lands). The question tool is MOD-75's; the planner's tools are
+  ANA-33's. Not blocked.
+- [ ] **MOD-113 - Prompt library: templates and skills** (from the 2026-10-15 requirements review).
+  `R-PRM-4`, `R-SKL-1`, `R-SKL-2`, `R-SKL-4`, `R-TUI-1`, `R-TUI-7`. (1) A **template library**
+  shared across projects and workspaces, with per-project overrides, in its own **Templates tab**,
+  where today Templates is a sub-tab of Skills. (2) Skill attachments gain **workspace** and
+  **item-kind** levels (phase > kind > project > workspace > global), extending MOD-9's resolution
+  (ANA-22). (3) Skills carry **resources** (scripts, references, files), and the prompt and session
+  learn to deliver them. (4) **Import** whole skill folders and Claude Code plugins, resources
+  included. Not blocked.
+- [ ] **MOD-114 - TUI: notifications, requirement coverage, attachments, open in editor** (from the
+  2026-10-15 requirements review). `R-TUI-11`, `R-ENT-15`, `R-TUI-3`, `R-TUI-5`, `R-ENT-12`,
+  `R-ID-2`, `R-TUI-4`. (1) When something starts waiting on the user: a **terminal bell** and an
+  **OS notification** (notify-send, macOS, Windows toast), switchable in Settings. (2) The citation
+  kind **`verifies`**, plus a coverage view per requirement; the item's Reqs sub-tab flags suspect
+  citations; the Graph shows cited requirements and linked documents as nodes (MOD-88's flow mode
+  too). (3) **Attachments** on items and documents in Postgres under a size cap, with an Attachments
+  sub-tab; who may own one waits on ANA-35. (4) **Open in `$EDITOR` at the line**: an artifact, or a
+  file named by a tool call, edit proposal or diff, through MOD-9/MOD-57's editor handoff. Not
+  blocked except part (3).
 - [ ] **MOD-8 - Legacy markdown import.** `R-LATER-3`. Map old prefixes to kinds per project,
-  preserve keys, build links. Later tier; MOD-6 landed (`docs/decisions/mod/mod-6.md`, importer
+  preserve keys, build links. **Promoted to must by the 2026-10-15 requirements review:** this
+  repository is its first user. ANA-9 §7.1 and ANA-11 §6 already cover its design, but it should
+  follow ANA-35, whose status, link and ownership model it imports into. MOD-6 landed (`docs/decisions/mod/mod-6.md`, importer
   mint variant per ANA-9 §7.1 still to write). Widened by ANA-11 (`docs/ANA-11.md` §6 phase 3): also import
   `docs/REQUIREMENTS.md` into the requirement tables MOD-38 added (`docs/decisions/mod/mod-38.md`), map each `DECISIONS.md` status to
   `item.resolution` (`shipped` → `done`), write-ups to `summary` documents and each analysis doc to
   the `verdict` document, and scan body `R-` IDs once into `addresses` citations.
+
+### Deferred backlog
+
+- [ ] **MOD-36 - Weighted agent assignment across fan-out candidates** (from MOD-4 milestone 4,
+  OQ-7; ANA-21 is done, `docs/decisions/ana/ana-21.md`). `R-AGT-8`,
+  `R-LATER-13`. **Deferred by the 2026-10-15 requirements review:** best-of-N fan-out is now the
+  later-tier compete mode (`R-LATER-13`), and `R-ORCH-7` means divided work (ANA-33).
+  Milestone 4 runs every candidate of a group on the
+  one agent the walk selects (rival sampling). This item spreads candidates across the eligible
+  agents by weight: a weighted `AgentSelector` (the seam milestone 4 leaves per-candidate) picks each
+  `fanout_index`'s agent from the walk's eligible list using ANA-21's weights, so the judge compares
+  different models on the same task. Slot 0 stays `eligible[0]` and only the rival slots are
+  apportioned, so the priority order stands (`docs/ANA-21.md` §5.5, §7.2). Open points to settle in
+  the plan: the prompt is assembled once
+  per group, but token budgeting uses one agent's estimator (`TokenEstimator::for_agent`), so mixed
+  families need either the tightest budget or per-candidate trimming, which breaks "identical prompt
+  across siblings" (ANA-5 `:1870`); each candidate draws on its own agent's quota; the judge must not
+  learn which model wrote which candidate (position-bias control extends to model-identity bias).
+  **ANA-17 note (2026-09-25, `docs/decisions/ana/ana-17.md`):** the section framing is one frame for
+  every model, so the estimator is the only thing a mixed-family group can diverge on. The function is
+  `TokenEstimator::for_model` (keyed on a model id), not `for_agent`, and every production
+  `PromptSpec` passes `TokenEstimator::DEFAULT` today (`htui-orch/src/engine.rs:4652`, `:5374`,
+  `htui/src/preview.rs:306`), so choosing it per group or per candidate is new wiring.
+  **MOD-23 note (2026-09-30, `docs/decisions/mod/mod-23.md`):** ANA-21 item 8's "MOD-23's editor
+  surfaces `settings.weights`" moved here: the Settings > Agents edit form carries `settings`
+  untouched, and a weights field is one more entry in its field list (plan D231).
+  **ANA-24 note (2026-10-01, `docs/decisions/ana/ana-24.md`):** the seed `weights.sources` registry
+  takes `docs/ANA-24.md` §5: `epoch-mirrorcode` (primary) and `arena-webdev`/`arena-agent` join the
+  implement axis, `epoch-eci` is narrowed to `eci_scores.csv`, `tbench-4-0` stays blocked. Each
+  dynamic source needs a parser under the fetch conditions of §6 (Arena from Hugging Face only, with
+  a per-fetch licence check; Epoch keyed on `benchmark_metadata.csv`, never `*_external.csv`).
+  **ANA-30 note (2026-10-14, `docs/decisions/ana/ana-30.md`):** the `haiku` alias now runs Haiku 5.5;
+  seed the `claude`/`claude-cli` map with `claude-haiku-5-5` unscored (resolving through `*`) and no
+  `haiku` key at 25 (`docs/ANA-21.md` §5.7 amendment).
+
+- [ ] **MOD-3 - Diff tab + code explorer.** `R-LATER-1`. Later tier; needs its own ANA first.
+- [ ] **MOD-5 - Issue tracker sync.** `R-LATER-2`. `IssueSync` trait, OneDev first. Since the
+  2026-10-15 requirements review it is **two-way by field ownership** (each field has an owning side),
+  no longer a downstream mirror. Later tier; needs its own ANA first.
+
 
 ### Tooling findings
 
@@ -527,12 +704,16 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   non-withdrawn ID, and ranges such as `R-SEC-1..4` are written out so MOD-8's import scan can read
   them. Backfill the six write-ups and normalise the MOD-29, MOD-35 and TOOL-5 write-up headings
   to `# PREFIX-N - Title (status, date)`, which the validator also misses. Not blocked.
+  **Requirements review (2026-10-15), `R-NF-4` amended:** the check covers **every prefix** (TOOL,
+  CLEAN, NEXT, VAL as well as ANA and MOD), for open lines and write-ups alike. Backfill the write-ups
+  that newly fall under it, or exempt items archived before 2026-10-15 if that list is long, and
+  record which choice was made.
 
 ## Summary
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 4 (ANA-25 learned weights, ANA-28 heavy_build routing, ANA-31 agy isolation, ANA-32 warm-start measurement) |
-| MOD-N   | 28 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| ANA-N   | 10 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-33 step graphs v2 and divided fan-out, ANA-34 coordinator, ANA-35 entity model for any project, ANA-36 further MCP tools, ANA-37 Qdrant required?, ANA-38 project memory, ANA-39 mandatory context tools) |
+| MOD-N   | 36 (MOD-16 Windows verification, MOD-27 swarm, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
 | CLEAN-N | 0 |
 | TOOL-N  | 2 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check) |

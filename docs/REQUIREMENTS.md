@@ -48,6 +48,16 @@ amended 2026-10-14 by maintainer decision on the requirements audit (MOD-99) —
 place (Qdrant and a user-configured error-reporting endpoint are optional and fail open); R-ORCH-6
 amended in place (the schedule window is R-ORCH-13, `later`); R-ORCH-12's delivery note corrected
 (MOD-43 is open); R-LATER-6 names `claude-cli`.
+amended 2026-10-15 by maintainer decision on the requirements review
+(`docs/requirements-review-2026-10-15.md`) — R-ENT-16 and R-ORCH-14 added; R-LATER-3 and R-LATER-7
+promoted to must; R-LATER-8..13 added; R-ENT-13 reopened pending ANA-38; amended in place: R-ID-1,
+R-ID-2, R-ID-3, R-ID-5, R-ID-6, R-ID-7, R-BOX-2, R-BOX-3, R-BOX-4, R-ENT-2, R-ENT-3, R-ENT-4, R-ENT-5,
+R-ENT-6, R-ENT-8, R-ENT-9, R-ENT-11, R-ENT-12, R-ENT-14, R-ENT-15, R-STO-1, R-STO-5, R-STO-6, R-STO-8,
+R-AGT-1, R-AGT-5, R-AGT-7, R-AGT-8 (compete mode named), R-AGT-9, R-AGT-10, R-ORCH-1, R-ORCH-2, R-ORCH-3, R-ORCH-4, R-ORCH-6,
+R-ORCH-7, R-ORCH-10, R-HIS-2, R-PRM-1, R-PRM-3, R-PRM-4, R-SKL-1, R-SKL-2, R-SKL-4, R-MCP-1, R-MCP-2, R-MCP-3,
+R-TUI-1, R-TUI-2, R-TUI-3, R-TUI-4, R-TUI-5, R-TUI-6, R-TUI-7, R-TUI-8, R-TUI-9, R-TUI-10, R-TUI-11,
+R-LATER-2, R-NF-1, R-NF-2, R-NF-3, R-NF-4 and §14 (the web front end leaves it for R-LATER-8). Where the design is open, the text names the
+deciding analysis (ANA-33..39).
 **Governed by:** `.claude/rules/workflow-docs.md`
 
 This file is the product requirements for `htui`. It sits above every `ANA-N` analysis and every
@@ -70,27 +80,41 @@ conflict. Their verdicts survive only where restated here.
 ## 1. Identity (R-ID)
 
 - **R-ID-1 (must).** `htui` is a cross-platform Rust terminal application (`ratatui`, `crossterm`,
-  `tokio`) that wraps AI coding agents to run a backlog of work items through configurable step
-  graphs across projects, repositories and machines.
-- **R-ID-2 (must).** `htui` is not an IDE, not a code editor, not a terminal multiplexer, and not a
-  cloud-hosted service. It is a local-first, developer-guided harness. A headless `htui worker`
-  process per box, started by the user and talking only to that user's Postgres, is part of `htui`;
-  it is not a hosted service (R-ORCH-12). Amended by maintainer decision on MOD-41, 2026-09-29.
+  `tokio`) that wraps AI agents to run a backlog of work items through configurable step graphs
+  across projects, repositories and machines. A project may be of any kind — software, research,
+  documentation, operations, or any task an agent can do; coding is the main case, not the only one.
+  Amended by maintainer decision, 2026-10-15.
+- **R-ID-2 (must).** `htui` ships no code editor of its own. It is a local-first, developer-guided
+  harness. A headless `htui worker` process per box, started by the user and talking only to that
+  user's Postgres, is part of `htui`; it is not a hosted service (R-ORCH-12). It hosts the user's own
+  `$EDITOR` and opens it on a file an agent touched, at the line (from a tool call, an edit proposal,
+  a diff or an artifact). Multiplexer-like terminal panes, a web front end and code viewing are
+  allowed and designed for, but are later tier (R-LATER-9, R-LATER-8, R-LATER-1). Amended by
+  maintainer decision on MOD-41, 2026-09-29, and on the requirements review, 2026-10-15.
 - **R-ID-3 (must).** Postgres is the single source of truth.
   Everything `htui` knows lives there: items, documents, runs, transcripts, skills, templates, box
-  profiles, agent registry, settings.
+  profiles, agent registry, key bindings, settings. Not stores, and holding no domain data of their
+  own: the per-box identity file, the read-only cache (R-STO-3), and the semantic-search index
+  (R-STO-8), which is derived from Postgres and rebuildable from it. Amended 2026-10-15.
 - **R-ID-4 (must).** `htui` writes no files into managed repositories. The only changes to a
   working tree are made by agents doing the item's work. Rationale: keeps repos clean and avoids
   merge conflicts on generated state.
 - **R-ID-5 (must).** Agents run with their own system skills disabled. `htui` owns every prompt and
   every skill text and inlines them into the initial prompt, so behavior is identical on every box
-  and agents never spend turns reading instruction files.
+  and agents never spend turns reading instruction files. Isolation is the default; a registry row
+  may opt out, and an opted-out agent is shown as such in Settings (ANA-31 settles `agy`). Amended
+  2026-10-15.
 - **R-ID-6 (must).** No LLM agent is ever in a sync, cache, import or bookkeeping path. Those are
   deterministic code. Outside it (ANA-30, 2026-10-14): a display-only label a model derives, and a
   draft a person accepts or edits before it is saved, as long as no status transition, link,
-  import, cache refresh or prompt ever reads the unaccepted model text.
-- **R-ID-7 (must).** Any transcript or tool output is scrubbed of secrets on the host box before it
-  is persisted or transmitted. Scrubbing fails closed.
+  import, cache refresh or prompt ever reads the unaccepted model text. Such drafts may also help
+  import and triage — a mapping of legacy items, a suggested link, a proposed item — and are written
+  only once a person accepts them (amended 2026-10-15). An agent choosing *which work to do next*
+  (R-ORCH-1's planned graphs, R-ORCH-14's coordinator) is item work, not bookkeeping; the status
+  transitions it causes stay deterministic.
+- **R-ID-7 (must).** Anything persisted or sent off the box — transcripts, tool output, logs,
+  telemetry, error reports, the cache — is scrubbed of secrets on the host box first. Scrubbing fails
+  closed. Amended 2026-10-15 (was: transcripts and tool output).
 
 ## 2. Users and boxes (R-USR, R-BOX)
 
@@ -104,30 +128,49 @@ conflict. Their verdicts survive only where restated here.
   hostname, OS family and version, architecture, CPU, RAM, GPU presence and vendor.
 - **R-BOX-2 (must).** The box probe records installed toolchains and tools with versions:
   compilers (`rustc`, `cargo`, `gcc`, `clang`, `cl`), build tools (`cmake`, `ninja`, `vcpkg`),
-  shells, container runtime, and installed agents. Re-probe on demand and when `htui` version
-  changes. `last_seen` updated per session.
+  language runtimes (`node`, `python`, `go`, `java`), package and tool managers (`mise`, `npm`,
+  `volta`, `brew`, `winget`, `scoop`), shells, container runtime, installed agents, free disk space
+  and network reachability. Re-probe on demand and when `htui` version changes. `last_seen` updated
+  per session. Amended 2026-10-15.
 - **R-BOX-3 (must).** Box carries capability tags, both probed and hand-declared, plus a free-form
   quirks note editable in the TUI. Seeded vocabulary: `gpu`, `vulkan`, `msvc`, `mingw`, `clang`,
-  `cmake`, `vcpkg`, `docker`, `rust`, `heavy_build`. Vocabulary is open.
-- **R-BOX-4 (must).** Each box holds per-box paths for every repo and workspace root it has checked
-  out. Logical identity (UUID, slug) never depends on a filesystem path.
+  `cmake`, `vcpkg`, `docker`, `rust`. Vocabulary is open. `heavy_build` is an item label (R-ENT-5,
+  R-MCP-3), not a box capability (amended 2026-10-15, answering ANA-28).
+- **R-BOX-4 (must).** Each box holds per-box paths for every repo and folder it has checked out.
+  Logical identity (UUID, slug) never depends on a filesystem path. `htui` can clone a repo onto a box
+  that lacks it, from the repo's remote URL, and records the path. When the box has no credentials
+  for that remote, `htui` says which remote needs which credential and how to provide it, marks the
+  repo unavailable on that box, and can guide the setup itself: generate an SSH key and show its
+  public half, or store an HTTPS token in the OS keyring for git to use, never in a file (R-STO-1).
+  Amended 2026-10-15.
 
 ## 3. Entity model (R-ENT)
 
 - **R-ENT-1 (must).** Three-tier hierarchy: `workspace` groups projects, `project` owns work,
-  `repo` is a git checkout.
-- **R-ENT-2 (must).** `workspace`: named, explicit group of one or more projects for cross-repo
-  work, with a per-box root path. There are no implicit workspace rows: opening a single project
-  runs with no workspace, and every workspace-scoped feature falls back to "the current project".
+  `repo` is a git checkout or a plain folder (R-ENT-4).
+- **R-ENT-2 (must).** `workspace`: named, explicit group of one or more related projects, which may
+  live anywhere on a box; a workspace is not a directory and has no root path. It owns its own items,
+  documents and requirements (R-ENT-16). There are no implicit workspace rows: opening a single
+  project runs with no workspace, and every workspace-scoped feature falls back to "the current
+  project". Amended 2026-10-15 (the per-box root path is dropped).
 - **R-ENT-3 (must).** `project`: owns the item key space, the item kinds, step graphs, skill
-  bindings, secret provider binding and phase defaults. Has one or more repos, one marked primary.
-- **R-ENT-4 (must).** `repo`: a git repository belonging to exactly one project, with remote URL,
-  default branch and per-box local path.
+  bindings, secret provider binding and phase defaults. It has a type (software, research, docs, ops,
+  and more) that seeds its kinds and graphs (R-ENT-6). It has zero or more repos; when it has any,
+  exactly one is primary. A phase that needs a repo refuses to run in a project without one. Amended
+  2026-10-15 (repos optional, project type; design in ANA-35).
+- **R-ENT-4 (must).** `repo`: a git repository or a plain folder belonging to exactly one project,
+  with per-box local path and, for a git repository, remote URL and default branch. What needs git —
+  `worktree` isolation, commit hashes, merging — needs a git repository; `copy` and `local` isolation
+  work on a folder. Amended 2026-10-15.
 - **R-ENT-5 (must).** `item`: key (`<PREFIX>-<N>`, unique per project), kind, title, body, status,
-  required capability tags, `created_by`, `version` for optimistic locking, timestamps. Body is
-  markdown edited in the TUI or an external editor.
+  priority, labels, required capability tags, `created_by`, `version` for optimistic locking,
+  timestamps. Body is markdown edited in the TUI or an external editor. Labels are free and route
+  nothing; required capability tags route (R-ORCH-10). Assignee and due date come with team use
+  (R-LATER-11). Amended 2026-10-15.
 - **R-ENT-6 (must).** Item kinds are configurable per project. Each kind has a key prefix, a
-  description and a default step graph. Seeded set on project creation:
+  description and a default step graph. The seeded set depends on the project type (R-ENT-3); a
+  research, docs or ops project gets its own kinds (for example research → verdict, outline → draft →
+  review, plan → execute → verify), settled by ANA-35. Seeded set for a software project:
 
   | Prefix  | Kind      | Default graph                        |
   |---------|-----------|--------------------------------------|
@@ -140,30 +183,44 @@ conflict. Their verdicts survive only where restated here.
 - **R-ENT-7 (must).** Item keys are minted from a per-project, per-prefix sequence held by Postgres.
   Never reused: a project has exactly one counter and exactly one writer of it. Creating an item
   in a project mirrored from a server, while that server is unreachable, is not supported (see R-STO-4).
-- **R-ENT-8 (must).** Item status is one of `open`, `queued`, `in_progress`, `awaiting_approval`,
-  `blocked`, `done`, `failed`, `closed`. Transitions are driven by the orchestrator and by close-out,
-  not edited by hand. A closed item carries a resolution: `done`, `concluded`, `rejected`,
-  `withdrawn`, `superseded` or `duplicate`. Resolution is not a status.
+- **R-ENT-8 (must).** Item status is one of `open`, `blocked` or `closed`. The progress of work —
+  `queued`, `in_progress`, `awaiting_approval`, `failed` — belongs to the item's runs, not to the
+  item. Transitions are driven by the orchestrator, the coordinator (R-ORCH-14) and close-out, not
+  edited by hand. A closed item carries a resolution: `done`, `concluded`, `rejected`, `withdrawn`,
+  `superseded` or `duplicate`. Resolution is not a status. Amended 2026-10-15 (was eight statuses;
+  migration designed in ANA-35).
 - **R-ENT-9 (must).** Item links are directed edges by UUID with kind `blocked_by`, `origin`,
-  `relates`, `supersedes`. Because edges use UUIDs, cross-project links need nothing extra. Links
-  are proposed by agents through the `htui` MCP server (R-MCP-2) and by the importer (R-LATER-3);
-  there is no manual link action.
+  `relates`, `supersedes`, `parent` (decomposition: a parent and its children, unlike `origin`, which
+  is provenance), `duplicates` and `implements`; a link may also target a document or an attachment.
+  Because edges use UUIDs, cross-project links need nothing extra. Links are proposed by agents
+  through the `htui` MCP server (R-MCP-2) and by the importer (R-LATER-3); there is no manual link
+  action. Requirements are linked by citation (R-ENT-15). Amended 2026-10-15.
 - **R-ENT-10 (must).** Item body and title changes are recorded as revisions with author, box and
   reason. Concurrent edits on the same `version` are rejected and shown as a divergence with the
   common ancestor; no timestamp-based last-writer-wins anywhere.
-- **R-ENT-11 (must).** Item notes: a thread of human comments per item, plain markdown, no editing
-  history needed.
-- **R-ENT-12 (must).** `document`: versioned per item and kind. Kinds follow the phases of the
-  graph (`prd`, `plan`, `review`, `summary`, `verdict`, and any phase-defined kind). Produced by
-  steps or written by hand.
-- **R-ENT-13 (withdrawn).** Atomic facts table with importance scores (ANA-1 `artifact`,
-  `artifact_link`). Dropped as over-engineered; summaries cover the need. Re-open only on evidence.
-- **R-ENT-14 (must).** `requirement`: key `R-<AREA>-<N>` minted per project and area, never
-  reused. It has body, rationale, priority `must`/`later`, state `active`/`withdrawn`, and a
-  `version` with revisions naming the deciding item. Text changes only by human action.
-- **R-ENT-15 (must).** Items cite requirements with kind `addresses`, `amends`, `withdraws` or
-  `reserves`. Each citation records the requirement version it was made against, and a newer
-  version marks it suspect until re-confirmed.
+- **R-ENT-11 (must).** Item notes: a thread of comments per item, from people and from agents
+  (`note_add`, R-MCP-2), plain markdown, no editing history needed. Amended 2026-10-15.
+- **R-ENT-12 (must).** `document`: versioned per owner and kind; the owner is an item, a project or
+  a workspace. Item kinds follow the phases of the graph (`prd`, `plan`, `review`, `summary`,
+  `verdict`, and any phase-defined kind). Produced by steps or written by hand. Items and documents
+  may carry attachments (images, logs, other files), held in Postgres under a size cap in version one
+  (an object store is R-LATER-10). Amended 2026-10-15.
+- **R-ENT-13 (reopened, pending ANA-38).** Project and workspace memory: facts, decisions and
+  gotchas that outlive one item, for the coordinator (R-ORCH-14) and for agents. ANA-1's atomic facts
+  table with importance scores (`artifact`, `artifact_link`) was withdrawn as over-engineered on
+  2026-09-03; reopened 2026-10-15 by maintainer decision. ANA-38 settles who writes it, how it stays
+  fresh, how it meets R-ID-6, and its integration with semantic search (R-STO-8).
+- **R-ENT-14 (must).** `requirement`: key `R-<AREA>-<N>` minted per owner and area, never reused;
+  the owner is a project or a workspace. It has body, rationale, priority `must`/`later`, state
+  `active`/`withdrawn`, and a `version` with revisions naming the deciding item. Text changes only by
+  human action. Amended 2026-10-15 (workspace requirements).
+- **R-ENT-15 (must).** Items cite requirements with kind `addresses`, `amends`, `withdraws`,
+  `reserves` or `verifies` (a test or review item that verifies the requirement). Each citation
+  records the requirement version it was made against, and a newer version marks it suspect until
+  re-confirmed. Amended 2026-10-15 (`verifies`).
+- **R-ENT-16 (must).** Workspace-owned items: a workspace has its own key space and kinds, and owns
+  items, documents and requirements that span its member projects, linked to their items by UUID.
+  Added by maintainer decision, 2026-10-15; design in ANA-35.
 
 ## 4. Storage, cache and offline (R-STO)
 
@@ -171,13 +228,15 @@ conflict. Their verdicts survive only where restated here.
   string and provider identities live in the OS keyring (Windows Credential Manager, macOS Keychain,
   Linux secret service), never in a file — including when the connection string is typed into the
   TUI rather than passed to `htui --set-dsn`. Local files under the user's config directory that
-  hold no secret and no domain data (the box identity, the read-only cache, the key bindings of
-  R-TUI-10) are not a store. One exception, for a headless worker (R-ORCH-12) on
+  hold no secret and no domain data (the box identity, the read-only cache) are not a store. One
+  exception, for a headless worker (R-ORCH-12) on
   a Linux host with no secret service: the DSN may be a systemd credential encrypted at rest and
   bound to the host (`systemd-creds encrypt`, read from `$CREDENTIALS_DIRECTORY`), or be read once
-  from the worker's or a TUI session's stdin (`--dsn-stdin`) and held only in memory. Never in
-  `argv`, the environment, or a plaintext file. Amended by maintainer decision on MOD-41,
-  2026-09-29, and on MOD-45, 2026-10-01 (a TUI session's stdin).
+  from the worker's or a TUI session's stdin (`--dsn-stdin`) and held only in memory. For
+  development and CI, the DSN may also come from an environment variable, which `htui` removes from
+  every agent subprocess environment (R-SEC-2). Never in `argv` or a plaintext file. Amended by
+  maintainer decision on MOD-41, 2026-09-29, on MOD-45, 2026-10-01 (a TUI session's stdin), and on
+  the requirements review, 2026-10-15 (environment variable; key bindings moved to Postgres).
 - **R-STO-2 (must).** TLS to Postgres is supported and optional.
 - **R-STO-3 (must).** Each box keeps a read-only cache of the projects it has opened under the
   user's config directory, refreshed on every successful connection. Contents: items, links,
@@ -189,29 +248,36 @@ conflict. Their verdicts survive only where restated here.
 - **R-STO-5 (must).** Schema migrations are versioned, forward-only in version one, applied by
   `htui` on connect after confirmation. A headless process (one with no one to confirm, such as a
   worker) never migrates: when the schema is behind or ahead of the one it was built for, it refuses
-  to start and reports why. The per-box SQLite schemas for the read-only cache (R-STO-3)
-  are versioned and forward-only, but answer a version mismatch by rebuilding.
-- **R-STO-6 (must).** Startup with a warm cache and reachable Postgres is under one second on the
-  reference workstation. Cache refresh runs in the background and never blocks input. The budget is
-  conditioned on a reachable server and binds no offline start (R-STO-4); that scope was decided,
-  not overlooked (maintainer, 2026-09-08).
+  to start and reports why; an explicit, non-interactive `htui migrate` verb applies them from a
+  shell. The per-box SQLite schemas for the read-only cache (R-STO-3)
+  are versioned and forward-only, but answer a version mismatch by rebuilding. Amended 2026-10-15
+  (`htui migrate`).
+- **R-STO-6 (must).** With a warm cache, the first interactive frame appears in under one second on
+  the reference workstation; connecting to Postgres and refreshing the cache may finish later in the
+  background and never block input. ANA-32 measures it. Amended 2026-10-15 (was: under one second
+  with a reachable Postgres).
 - **R-STO-7 (withdrawn).** Local-only mode. Withdrawn by maintainer decision MOD-25, 2026-09-11.
 - **R-STO-8 (must).** Semantic search over items and requirements. `htui` indexes each item's key,
-  title and body, its latest documents, and each requirement's key, body and rationale (withdrawn
-  ones included), into a Qdrant collection (local dense embeddings plus BM25 sparse vectors, ranked
-  together) and answers searches scoped to projects. A search can be narrowed to decisions: items
+  title and body, its latest documents, its notes, the scrubbed transcripts of its runs, and each
+  requirement's key, body and rationale (withdrawn ones included), into a Qdrant collection (local
+  dense embeddings plus BM25 sparse vectors, ranked together) and answers searches scoped to
+  projects or a workspace, workspace-owned items, documents and requirements included (R-ENT-16).
+  Agents search through an MCP tool (R-MCP-2). A search can be narrowed to decisions: items
   closed as `done`, `concluded` or `rejected` (R-ENT-8), and their documents. The index is derived
   from Postgres and rebuildable from it (R-STO-1); when Qdrant or the embedding model is
-  unavailable, search fails with a clear error and nothing else is affected. Added by maintainer
-  decision on MOD-34, 2026-09-25 (`docs/ANA-19.md`, `docs/ANA-20.md`); amended by maintainer
-  decision on MOD-50, 2026-09-29 (requirements indexed, decisions by resolution).
+  unavailable, search fails with a clear error and nothing else is affected, unless ANA-37 makes
+  Qdrant required (R-NF-2). Added by maintainer decision on MOD-34, 2026-09-25 (`docs/ANA-19.md`,
+  `docs/ANA-20.md`); amended by maintainer decision on MOD-50, 2026-09-29 (requirements indexed,
+  decisions by resolution), and on the requirements review, 2026-10-15 (notes, transcripts,
+  workspace scope, agent tool).
 
 ## 5. Agent driver (R-AGT)
 
 - **R-AGT-1 (must).** One `AgentDriver` trait: start a session (prompt, working directory,
   environment, tool exposure), stream typed events, send a follow-up, answer a permission request,
   cancel. Event kinds: assistant text, thought, tool call, tool result, edit proposal, permission
-  request, usage, error, done.
+  request, plan or todo update, subagent start and end, file read, mode change, question to the
+  user, usage, error, done. Amended 2026-10-15 (five kinds added).
 - **R-AGT-2 (must).** Primary implementation: ACP (Agent Client Protocol) client over JSON-RPC.
   `htui` is the ACP client; the agent, or its ACP adapter, is the server. `htui` handles tool
   permissions, presents edit proposals, and receives usage.
@@ -222,18 +288,21 @@ conflict. Their verdicts survive only where restated here.
   enabled per box. Version one entries: `claude`, `claude-cli`, and `agy`. Amended 2026-09-09:
   `agy` over ACP is **settled and proven**.
 - **R-AGT-5 (must).** Adding an agent requires a registry row and, at most, one stream adapter. No
-  orchestrator or prompt code changes.
+  orchestrator or prompt code changes. A user adds a row from the Settings tab, with no `htui`
+  release. Amended 2026-10-15.
 - **R-AGT-6 (must).** Autodiscovery: on box registration and on demand, probe `PATH` for known
   agent binaries and ACP adapters, record version, mark enabled on that box. Manual entries allowed.
 - **R-AGT-7 (must).** Quota tracking per agent: for `subscription` agents, remaining allowance or
   reset window as reported by the agent or its CLI, refreshed per run; for `per_token` agents, a
-  configurable cap per run and per batch, enforced by cancelling the session when exceeded.
+  configurable cap per run and per batch, enforced by cancelling the session when exceeded. The TUI
+  shows cost and usage over time per agent, project and item. Amended 2026-10-15.
 - **R-AGT-8 (must).** When a phase lists several candidate agents, the orchestrator picks the first
   in priority order whose quota is not exhausted and whose billing cap is not reached. When the
-  phase fans out, the remaining candidate slots are apportioned across the other eligible
-  candidates by their per-model weight (ANA-21).
+  phase fans out in compete mode (R-LATER-13), the remaining candidate slots are apportioned across
+  the other eligible candidates by their per-model weight (ANA-21).
 - **R-AGT-9 (must).** An agent that reports itself installed but unauthenticated is authenticated
-  **from the app**, through the agent's own protocol, without leaving `htui` for a vendor CLI. The
+  **from the app** wherever the agent's own protocol allows it, without leaving `htui` for a vendor
+  CLI; where it does not, `htui` shows the exact command to run (amended 2026-10-15: best effort). The
   method is chosen from the ones that agent advertises; logging out is offered where the agent
   advertises it. `htui` triggers the flow and observes its outcome: it does not read, hold, transmit
   or store the credential, which stays wherever the agent keeps it (R-ID-7, R-SEC-2). Authentication
@@ -248,34 +317,50 @@ conflict. Their verdicts survive only where restated here.
   the installer's claim (R-AGT-6). Where the source publishes an integrity digest it is verified;
   where it does not, the user is told that before the download, not after. Where the adapter is
   proprietary, its licence and account-type consequences are surfaced before `htui` fetches it on
-  the user's behalf. Added by maintainer decision, 2026-09-09, reversing `docs/ANA-4.md` §4.6's
-  deferral of registry-driven installation; implemented as MOD-20.
+  the user's behalf. Besides a row's direct source, `htui` installs, detects and updates agents
+  through the tool managers a box has — `mise`, `npm`/`volta`, `brew`, `winget`, `scoop` — preferring
+  the one the box already uses, then the row's direct source; it shows the installed version beside
+  the latest. Added by maintainer decision, 2026-09-09, reversing `docs/ANA-4.md` §4.6's
+  deferral of registry-driven installation; implemented as MOD-20; amended 2026-10-15 (tool
+  managers, updates).
 
 ## 6. Orchestration (R-ORCH)
 
-- **R-ORCH-1 (must).** A step graph is a named, ordered list of phases owned by a project. Each
+- **R-ORCH-1 (must).** A step graph is a named set of phases owned by a project or a workspace. Each
   phase has: candidate agents with model in priority order, fan-out count, gate, retry limit, input
   document kinds, output document kind, fan-out isolation mode, command queue mode, optional
-  verification command. An item inherits its kind's default graph and may override it.
+  verification command. An item inherits its kind's default graph and may override it. Graphs may
+  branch on conditions, run phases in parallel and loop; one graph may run several items, each as a
+  subgraph; and a graph may be planned at run time by the agent that starts it, which then runs its
+  plan directly within the bounds the project allows (phases, agents, caps), hard gates still
+  enforced. Amended 2026-10-15 (was: an ordered list owned by a project); design in ANA-33.
 - **R-ORCH-2 (must).** Gate is `always`, `on_failure` or `never`, plus a `hard` flag. A gated step
   ends in `awaiting_approval`; the user approves, rejects with a note, edits the artifact, or
-  retries. Auto mode (R-ORCH-6) downgrades every gate to `never` except those flagged `hard`.
-- **R-ORCH-3 (must).** A failed `review` loops back to the preceding `implement` with the review
-  attached, up to the retry limit, then escalates to the user.
+  retries. A gate may ask a configured judge agent for an advisory verdict, shown on the gate; the
+  person still decides. Auto mode (R-ORCH-6) downgrades every gate to `never` except those flagged
+  `hard`. Amended 2026-10-15 (advisory judge).
+- **R-ORCH-3 (must).** A failed phase loops back to the phase it declares as its loop-back target
+  (a failed `review` to the preceding `implement` by default) with the failing artifact attached, up
+  to the retry limit, then escalates to the user. Amended 2026-10-15 (any phase).
 - **R-ORCH-4 (must).** Manual mode runs one selected item through its graph with gates as
-  configured.
+  configured, and can run a single chosen step, skip a step, or restart from any step. Amended
+  2026-10-15 (step control).
 - **R-ORCH-5 (must).** Any step can be promoted to an interactive chat, on failure or by user
   request, preserving the session context. When the chat yields the step's artifact, the pipeline
   resumes from the next step.
 - **R-ORCH-6 (must).** Auto mode is a queue runner: picks ready items by dependency order and
   priority, filters by current box capabilities, runs unattended with gates treated as `never`
   unless the user marked a gate as hard, escalates failures, and honors caps per item and per
-  batch. Supports a target box (R-ORCH-12). A schedule window is R-ORCH-13 (`later`): version one
-  may store it but need not enforce it. Amended by maintainer decision, 2026-10-14.
-- **R-ORCH-7 (must).** Fan-out: a phase with N candidate sessions runs them in parallel on the same
-  prompt, each producing its own artifact and, for code phases, its own tree. Selection is a human
-  choice when gated, otherwise a judge step using a configured agent. Only the selected result
-  continues; the rest are kept as history.
+  batch. When a subscription agent's quota is exhausted, it waits for the reset and resumes rather
+  than failing the item. Supports a target box (R-ORCH-12). A schedule window is R-ORCH-13 (`later`):
+  version one may store it but need not enforce it. Amended by maintainer decision, 2026-10-14, and
+  2026-10-15 (quota wait).
+- **R-ORCH-7 (must).** Fan-out divides work: a planner agent splits a step's work into parts, which
+  run as parallel sub-steps of the same run on several agents, each in its own isolated tree
+  (R-ORCH-8) and producing its own artifact; an integrate step then merges the parts' branches and
+  artifacts, resolving conflicts, before review. Running N candidates on the same prompt and keeping
+  one (best-of-N) is R-LATER-13. Amended by maintainer decision, 2026-10-15 (was: best-of-N); design
+  in ANA-33.
 - **R-ORCH-8 (must).** Fan-out isolation mode per project or phase: `worktree` (default, one git
   worktree per session), `copy` (directory copy for trees where worktrees break build caches),
   `shared_serialized` (one tree, sessions run one after another), `local` (run directly in the
@@ -284,20 +369,28 @@ conflict. Their verdicts survive only where restated here.
   overlap. Overlap: same repo unless both use isolated trees, or declared touched-path sets
   intersect. Overlapping items are serialized; others run in parallel up to a per-box limit.
 - **R-ORCH-10 (must).** Capability matching: a run is refused when the item's required tags are not
-  a subset of the box's tags, listing the missing tags. Auto mode filters the queue the same way.
+  a subset of the box's tags, listing the missing tags, and `htui` offers to dispatch it to a box
+  that has them (R-ORCH-12). Auto mode filters the queue the same way. Amended 2026-10-15.
 - **R-ORCH-11 (must).** Every run records: item, target box, executing box, graph snapshot, and per
   step: agent, model, gate outcome, status, exit code, prompt digest, commit hashes, usage, timing.
 - **R-ORCH-12 (must).** Remote dispatch: queue an item from one box to run on another. Requires a
   headless `htui` worker per box polling Postgres (R-ID-2). Promoted from later by maintainer
   decision on MOD-41, 2026-09-29; delivered by MOD-41 (worker, done) and MOD-43 (targeting, open).
 - **R-ORCH-13 (later).** Scheduling: run the queue inside a time window on a chosen box.
+- **R-ORCH-14 (must).** Coordinators: one per project and one per workspace, above item runs. A
+  coordinator only manages: it follows what happens below it, talks with its children and its
+  parent, and integrates a child's work when the child's run completes — merging, pushing or
+  opening a pull request as the project configures — and runs close-out (R-TUI-9). It does no item
+  work itself. Added by maintainer decision, 2026-10-15; design in ANA-34, which also settles what it
+  changes in R-ID-6, R-ORCH-7, R-ENT-8 and R-TUI-9.
 
 ## 7. Run history (R-HIS)
 
 - **R-HIS-1 (must).** Every session event from R-AGT-1, plus the assembled prompt, every follow-up
   and every permission answer, is stored as an ordered row per run step, after scrubbing. Nothing
   about a run exists only on one box.
-- **R-HIS-2 (must).** The chat view can reopen any past step read-only and replay it.
+- **R-HIS-2 (must).** The chat view can reopen any past step read-only and replay it, and start a
+  new chat or run from that step's context (fork). Amended 2026-10-15 (fork).
 - **R-HIS-3 (must).** Retention is configurable per project; default keeps everything.
 
 ## 8. Prompt assembly and skills (R-PRM, R-SKL)
@@ -306,19 +399,27 @@ conflict. Their verdicts survive only where restated here.
   phase template, item body, input documents from prior steps, summaries of upstream items reached
   by `blocked_by` and `origin` edges within one to two hops and inside the active workspace (or
   current project when no workspace), box profile, bound skill text, and any `htui`-selected file
-  excerpts. Never raw transcripts of other items.
+  excerpts. Never raw transcripts of other items. Beyond this prompt, an agent can pull more context
+  itself through `htui`'s MCP read tools (R-MCP-2). Amended 2026-10-15.
 - **R-PRM-2 (must).** Upstream items outside the active workspace appear as one-line status stubs.
-- **R-PRM-3 (must).** Per-step token budget; oversize inputs are trimmed by a fixed priority order
-  (template and skills first, then item body, then prior documents, then upstream summaries, then
-  excerpts) and the trim is recorded on the step.
+- **R-PRM-3 (must).** Per-step token budget. When the inputs exceed it, they are kept in a fixed
+  priority order: the template and skills are never cut (a step whose template and skills alone
+  exceed the budget is refused), then the item body, prior documents, upstream summaries and
+  excerpts, the last cut first. The trim is recorded on the step. In manual mode, before a step
+  starts trimmed, `htui` says so and lets the user raise the budget. Amended 2026-10-15 (reworded as
+  a keep order, as ANA-5 §4.4 implements it; budget raise added).
 - **R-PRM-4 (must).** Prompt templates per phase are versioned rows in Postgres,
-  with a documented placeholder contract, editable in the TUI.
-- **R-SKL-1 (must).** Skill library in Postgres: name, description, versioned markdown body.
-- **R-SKL-2 (must).** Skills attach at global, project or phase level; the most specific attachment
-  of a skill wins (phase over project over global). An attachment pins a version or follows latest,
-  and carries the activation (`always`, `glob`, `off`).
+  with a documented placeholder contract, editable in the TUI. Templates form a library shared
+  across projects and workspaces, with per-project overrides. Amended 2026-10-15.
+- **R-SKL-1 (must).** Skill library in Postgres: name, description, versioned markdown body, and
+  optional resources (scripts, references, other files). Amended 2026-10-15 (resources).
+- **R-SKL-2 (must).** Skills attach at global, workspace, project, item-kind or phase level; the
+  most specific attachment of a skill wins (phase over kind over project over workspace over
+  global). An attachment pins a version or follows latest, and carries the activation (`always`,
+  `glob`, `off`). Amended 2026-10-15 (workspace and kind levels).
 - **R-SKL-3 (must).** TUI supports create, edit, view version diff, bind and unbind.
-- **R-SKL-4 (must).** Import from existing `SKILL.md` files as a convenience.
+- **R-SKL-4 (must).** Import from existing `SKILL.md` files and from whole skill folders and Claude
+  Code plugins, resources included. Amended 2026-10-15.
 
 ## 9. Secrets and scrubbing (R-SEC)
 
@@ -337,14 +438,19 @@ conflict. Their verdicts survive only where restated here.
 ## 10. htui MCP server (R-MCP)
 
 - **R-MCP-1 (must).** `htui` exposes an MCP server to every session it launches. Every tool call is
-  scoped to the run step owning the session; an agent cannot touch items outside its run.
+  scoped to the run step owning the session: an agent writes only within its run, and may read
+  beyond it — workspace items, documents and requirements. Amended 2026-10-15 (wider read scope).
 - **R-MCP-2 (must).** Tools: `item_link` (propose an edge, kind), `item_status` request,
   `document_write` (the step's output artifact), `note_add`, `box_profile` read, `command_run`,
-  `spawn_subagent`.
+  `spawn_subagent`; read tools for items, documents and requirements, and semantic search
+  (R-STO-8); `item_create`, which proposes an item as a draft a person accepts (R-ID-6); a question
+  to the user that parks the step (R-TUI-11, MOD-75); and the planner's tools for declaring parts and
+  next steps (R-ORCH-1, R-ORCH-7, ANA-33). ANA-36 surveys further tools. Amended 2026-10-15.
 - **R-MCP-3 (must).** `command_run` enqueues build, test and run commands behind per-box
   concurrency limits by command class (for example one C++ build, four test runs) and returns
   output. Exposure per phase is `off`, `fan_out_only` (default) or `always`, and can be forced on
-  by the item carrying the `heavy_build` tag. When off, the tool is not advertised to the session.
+  by the item carrying the `heavy_build` label (R-ENT-5). When off, the tool is not advertised to the
+  session. The exposure and the per-box limits are editable in Settings. Amended 2026-10-15.
 - **R-MCP-4 (must).** Skill text instructs agents to use `command_run` for heavy commands when it is
   exposed; ACP permission handling denies matching direct shell commands in that case.
 
@@ -352,83 +458,116 @@ conflict. Their verdicts survive only where restated here.
 
 - **R-TUI-1 (must).** Keyboard driven, mouse optional; keys are configurable (R-TUI-10). Top bar: workspace or project, box, store
   state — distinguishing online, connecting, and offline since T
-  — working run count and waiting-on-you count (R-TUI-11). Tabs: Backlog, Chat (one per session), Skills, Requirements, Settings. Workspace switcher
-  overlay. Queue overlay for auto mode with reorder and pause.
-- **R-TUI-2 (must).** Backlog left pane: items grouped by project, filters by status, project,
-  capability and readiness. Actions: new, edit, run, queue, close, open graph.
+  — working run count and waiting-on-you count (R-TUI-11). Tabs: Backlog, Chat (one per session), Skills, Templates, Requirements, Settings. Workspace switcher
+  overlay. Queue overlay for auto mode with reorder and pause. Amended 2026-10-15 (Templates tab).
+- **R-TUI-2 (must).** Backlog left pane: items grouped by project, with workspace-owned items
+  (R-ENT-16) as their own group; filters by status, project, capability, readiness, labels and
+  priority, and sorting by priority. Actions: new, edit, run, queue, close, open graph. Amended
+  2026-10-15.
 - **R-TUI-3 (must).** Backlog right pane is tabbed per selected item: **Body**, **Runs**, **Graph**,
-  **Documents**, **Notes**.
+  **Documents**, **Notes**, **Requirements** (the item's citations, suspect ones flagged) and
+  **Attachments**. Amended 2026-10-15.
 - **R-TUI-4 (must).** Runs tab: active and past runs for the item, step list with agent, model,
-  gate state, usage, duration. Actions: approve, reject with note, retry, promote to chat, cancel,
-  open artifact, select fan-out result.
+  gate state, usage, duration; a divided step shows its parts as a tree (planner, parts, integrate)
+  with each part's state. Actions: approve, reject with note, retry, promote to chat, cancel,
+  open artifact, run, skip or restart from a step (R-ORCH-4), fork from a step (R-HIS-2), and open
+  an artifact, or a file from a tool call or diff, in `$EDITOR` at the line (R-ID-2). Amended
+  2026-10-15 (was: select fan-out result, which moves to R-LATER-13).
 - **R-TUI-5 (must).** Graph tab: the item and everything connected, one to N hops, across projects,
-  with status and link kind, navigable.
+  with status and link kind, navigable, including cited requirements and linked documents and
+  attachments as nodes. Amended 2026-10-15.
 - **R-TUI-6 (must).** Chat tab: streamed session with assistant text, collapsed thoughts, tool calls
-  and results, edit proposals, permission prompts answered inline, follow-up input. Bound to a run
-  step or free-standing against a project.
-- **R-TUI-7 (must).** Skills tab: library, editor, version diff, bindings matrix by project and
-  phase.
-- **R-TUI-8 (must).** Settings tab: agent registry with quota, box profile with capability edits,
-  item kinds and step graphs per project, secret provider, caps, scheduler window, and the Postgres
-  connection: whether a DSN is stored, a masked field to enter or replace it, an action to clear it,
-  and the state of the last attempt. What is typed goes to the OS keyring and nowhere else
-  (R-STO-1); it is not echoed, not logged, and not written to any file.
+  and their results' content (collapsible), edit proposals, permission prompts answered inline,
+  follow-up input. Bound to a run step, or free-standing: then it runs against the active workspace,
+  or the project when there is no workspace, whatever folder `htui` was started in, with the agent
+  and model chosen when it starts. Amended 2026-10-15.
+- **R-TUI-7 (must).** Skills tab: library, editor, version diff, a skill's resources, and a bindings
+  matrix by workspace, project, item kind and phase. The Templates tab holds the template library
+  (R-PRM-4) the same way. Amended 2026-10-15.
+- **R-TUI-8 (must).** Settings tab: agent registry with quota, adding a row (R-AGT-5), and each
+  row's isolation (R-ID-5); box profile with capability edits; project types, workspaces, item kinds,
+  and step graphs with a graph editor; `command_run` exposure and per-box limits (R-MCP-3); key
+  bindings (R-TUI-10); secret provider, caps, scheduler window, repo credentials (R-BOX-4), and the
+  Postgres connection: whether a DSN is stored, a masked field to enter or replace it, an action to
+  clear it, and the state of the last attempt. What is typed goes to the OS keyring and nowhere else
+  (R-STO-1); it is not echoed, not logged, and not written to any file. Amended 2026-10-15.
 - **R-TUI-9 (must).** Close-out writes the final summary document, sets status, records commit
-  hashes from the run. No markdown files are produced.
+  hashes from the run. No markdown files are produced. The coordinator (R-ORCH-14) runs close-out
+  and its checklist — follow-up items, re-confirming suspect citations, choosing the resolution —
+  and the merge, push or pull request; ANA-34 settles the split. Amended 2026-10-15.
 - **R-TUI-10 (must).** Every key outside text entry is bound to a named action. The default
-  bindings ship in `htui`. A user overrides them in a local file, `keys.toml` under the user's
-  config directory, per OS user and per machine; the file lists only the actions it changes, may
-  unbind one, and is never read from or written to the store, so the keys in force are the same
-  offline. Printable characters, editing keys inside a text field, a field's Enter and Esc,
-  numbered choices, and a choice field's value keys are fixed. `htui` refuses to start on an
-  invalid file and names its path and line for every error, including a chord bound twice on one
-  screen and a printable chord bound where a text field is typing; `htui --default-keys` starts
-  with the defaults instead. `ctrl-c` always quits, from every htui screen and field, and cannot
+  bindings ship in `htui`. A user overrides them in the Settings tab; the overrides are stored in
+  Postgres per user and shared by every `htui` that connects to it, and the read-only cache keeps the
+  last known set, so the keys in force offline are the last ones seen online. Overrides list only
+  the actions they change and may unbind one. Printable characters, editing keys inside a text
+  field, a field's Enter and Esc, numbered choices, and a choice field's value keys are fixed.
+  `htui` refuses an invalid set and names every error, including a chord bound twice on one screen
+  and a printable chord bound where a text field is typing; `htui --default-keys` starts with the
+  defaults instead. `ctrl-c` always quits, from every htui screen and field, and cannot
   be unbound or bound to anything else; a pane that runs another program in a terminal forwards
   it to that program and always keeps a key that leaves the pane. Every hint line and the `?`
-  help show the keys in force, and the help opens from every screen.
+  help show the keys in force, and the help opens from every screen. Amended by maintainer decision,
+  2026-10-15, reversing ANA-26's local `keys.toml` (MOD-67).
 - **R-TUI-11 (must).** One overlay, opened from every screen, lists every run in the active
   workspace that waits on a person — a gate, a fan-out selection, a judge failure, a blocked run,
   an open permission request, and an agent's open question — with the reason and the step, and
   opens the item's Runs tab on that step. The top bar shows the count. The list is computed from
-  the store at read time.
+  the store at read time. When something starts waiting, `htui` rings the terminal bell and raises
+  an OS notification; notifications to a remote endpoint are R-LATER-12. Amended 2026-10-15.
 
 ## 12. Later tier (R-LATER)
 
-Designed for, not built in version one. Each needs its own `ANA-N` before implementation.
+Designed for, not built in version one. Each needs its own `ANA-N` before implementation. R-LATER-3
+and R-LATER-7 were promoted to must on 2026-10-15 and keep their IDs.
 
 - **R-LATER-1.** Diff tab (working-tree diff per repo, structural diff optional) and read-only code
   explorer with multi-root tree.
-- **R-LATER-2.** Issue tracker sync behind an `IssueSync` trait (OneDev, GitHub, others) as a
-  downstream mirror only; Postgres stays canonical.
-- **R-LATER-3.** Legacy import of markdown workflow repos (`HANDOFF.md`, `DECISIONS.md`,
-  `docs/decisions/**`, `docs/ANA-*.md`) into projects, items, documents and links, mapping old
-  prefixes to kinds per project, preserving keys.
+- **R-LATER-2.** Issue tracker sync behind an `IssueSync` trait (OneDev, GitHub, others), both
+  ways, by field ownership: each field has an owning side (for example title and body from `htui`,
+  comments both ways, labels from the tracker). Amended 2026-10-15 (was: a downstream mirror only).
+- **R-LATER-3 (must, promoted 2026-10-15).** Legacy import of markdown workflow repos (`HANDOFF.md`,
+  `DECISIONS.md`, `docs/decisions/**`, `docs/ANA-*.md`) into projects, items, documents and links,
+  mapping old prefixes to kinds per project, preserving keys. This repository is its first user.
 - **R-LATER-4.** Scheduling (R-ORCH-13). Remote dispatch (R-ORCH-12) was promoted to must on
   MOD-41, 2026-09-29.
 - **R-LATER-5.** Team support (R-USR-3).
 - **R-LATER-6.** Additional agents beyond `claude`, `claude-cli` and `agy` via the registry (R-AGT-5).
-- **R-LATER-7.** External context tools (Headroom, Serena, Graphify) as excerpt providers for
-  R-PRM-1, fail-open when absent.
+- **R-LATER-7 (must, promoted 2026-10-15).** Code-context tools (Gortex, Serena, Graphify, Headroom)
+  are mandatory in coding sessions and replace the agent's plain search and read tools there; they
+  also serve as excerpt providers for R-PRM-1. When one is missing on a box, `htui` installs it
+  (R-AGT-10's routes) or tells the user how. Design in ANA-39.
+- **R-LATER-8.** A web front end over the same Postgres (R-ID-2).
+- **R-LATER-9.** Multiplexer-like terminal panes: several agents, shells and editors side by side in
+  `htui` (R-ID-2).
+- **R-LATER-10.** Attachments in an object store, Postgres holding the reference (R-ENT-12).
+- **R-LATER-11.** Item assignee and due date, with team use (R-USR-3, R-ENT-5).
+- **R-LATER-12.** Waiting-on-you notifications to a remote endpoint (ntfy, chat), optional and
+  failing open (R-TUI-11, R-NF-2).
+- **R-LATER-13.** Compete fan-out: N candidates run the same prompt and a person or a judge agent
+  keeps one result, the rest kept as history (the version-one R-ORCH-7 until 2026-10-15; ANA-21,
+  MOD-36).
 
 ## 13. Non-functional (R-NF)
 
-- **R-NF-1 (must).** Windows 10+, Linux, macOS.
-- **R-NF-2 (must).** No required dependency on any external daemon other than Postgres and the
-  agents. Two services are optional, and each fails open with nothing else affected when absent:
-  Qdrant with its embedding model for semantic search (R-STO-8), and an error-reporting endpoint
-  the user configures in Settings, which is off unless set and receives only scrubbed events
-  (R-ID-7, MOD-99). Amended by maintainer decision, 2026-10-14.
+- **R-NF-1 (must).** Linux and Windows 10+. macOS is best effort: it builds and nothing may block
+  it, but it gates no release. Amended 2026-10-15.
+- **R-NF-2 (must).** No required dependency on any external daemon other than Postgres, the agents,
+  and in coding sessions the code-context tools (R-LATER-7). Two services are optional, and each
+  fails open with nothing else affected when absent: Qdrant with its embedding model for semantic
+  search (R-STO-8), unless ANA-37 finds it worth requiring, and an error-reporting endpoint the user
+  configures in Settings, which is off unless set and receives only scrubbed events (R-ID-7,
+  MOD-99). Amended by maintainer decision, 2026-10-14, and 2026-10-15 (context tools; Qdrant to
+  ANA-37).
 - **R-NF-3 (must).** All long operations (probe, cache refresh, sessions) run off the UI thread;
-  the TUI never blocks on network or subprocess I/O.
-- **R-NF-4 (must).** Every `ANA-N` and `MOD-N` item cites, as `addresses` citations, the
-  requirement IDs it addresses.
+  the TUI never blocks on network or subprocess I/O, and reflects a key press on screen within a
+  bound set by ANA-32's measurement (order of 50 ms) under load. Amended 2026-10-15.
+- **R-NF-4 (must).** Every item, whatever its prefix, cites as `addresses` citations the requirement
+  IDs it addresses. Amended 2026-10-15 (was: `ANA-N` and `MOD-N` only).
 
 ## 14. Out of scope
 
 - Hosting or managing the Postgres server itself.
-- Any web or GUI front end.
-- Editing code inside `htui`.
+- Editing code inside `htui` (it hosts the user's `$EDITOR`, R-ID-2).
 - Exporting `HANDOFF.md` or other markdown views from the database.
 
 ## 15. Superseded material
