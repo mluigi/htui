@@ -344,7 +344,7 @@ fn draw_help(f: &mut Frame, pal: Palette) {
             ("← →", "fold group · node in a graph"),
             ("Shift ← →  [ ]", "previous / next sub-tab"),
             ("Enter / Esc", "open / back to the list"),
-            ("⌫ / Alt ←", "back through jumps"),
+            ("⌫ / Alt ←", "back: jumps, tabs, panes, sections"),
             ("Alt →", "forward again"),
             ("/", "filter the list"),
         ]),
@@ -359,7 +359,7 @@ fn draw_help(f: &mut Frame, pal: Palette) {
             ("F2 / F3", "show or hide list / activity"),
             ("z", "zoom the focused pane"),
         ]),
-        ("backlog", &[("N", "new item (AI rewrite, or talk it through)"), ("h · g", "done items · grouping"), ("v", "runs: graph / table")]),
+        ("backlog", &[("N", "new item (AI rewrite, or talk it through)"), ("t", "where it runs · workflow"), ("h · g", "done items · grouping"), ("v", "runs: graph / table")]),
         ("graphs", &[
             ("Enter", "open item · its chat · requirement"),
             ("M / drag a node", "move it (links stay as they are)"),

@@ -67,7 +67,9 @@ fn dump(args: &[String]) -> std::io::Result<()> {
                 '~' => KeyCode::Tab,
                 c => KeyCode::Char(c),
             };
+            let before = app.here();
             on_key(&mut app, KeyEvent::new(code, KeyModifiers::NONE));
+            app.track(before);
         }
     } else {
         app.cur_mut().focus = Pane::Detail;
@@ -98,11 +100,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
         }
         // Drain everything queued, so a mouse drag does not lag behind (rataflow's advice).
         loop {
+            let before = app.here();
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => on_key(app, key),
                 Event::Mouse(mouse) => on_mouse(app, mouse),
                 _ => {}
             }
+            app.track(before);
             if app.quit || !event::poll(Duration::ZERO)? {
                 break;
             }
@@ -289,6 +293,14 @@ fn on_key(app: &mut App, key: KeyEvent) {
             let n = app::finished_count(&app.data, app.workspace);
             app.flash(if app.show_done { format!("showing {n} done / closed") } else { format!("{n} done / closed hidden · h shows them") });
         }
+        KeyCode::Char('t') if app.tab == BACKLOG => {
+            if let Some(idx) = app.cur().tree.selected() {
+                let item = &app.data.items[idx];
+                let target = app.target_of(item.key);
+                let workflow = app.item_workflow.get(item.key).map_or(0, |w| w + 1);
+                app.modal = Some(Modal::RunSetup(modal::RunSetup { item: idx, section: 0, target, workflow }));
+            }
+        }
         KeyCode::Char('g') if app.tab == BACKLOG && !graph_focused(app) => {
             app.group_by = app.group_by.next();
             let keep = app.cur().tree.selected();
@@ -425,6 +437,12 @@ fn detail_key(app: &mut App, key: KeyEvent, up: bool, down: bool, left: bool, ri
                 step_subtab(app, if left { -1 } else { 1 });
             } else if let (KeyCode::Enter, Some(p), Some(ci)) = (key.code, project, comps.get(t.detail_cursor)) {
                 cycle_usage(app, *ci, p);
+            } else if let (KeyCode::Char(' '), None, Some(ci)) = (key.code, project, comps.get(t.detail_cursor)) {
+                let c = &mut app.data.components[*ci];
+                let on = c.status != Status::InProgress;
+                c.status = if on { Status::InProgress } else { Status::Queued };
+                let text = if on { format!("{} started · localhost:{}", c.name, c.port) } else { format!("{} stopped · its data stays in its volume", c.name) };
+                app.flash(text);
             } else if let (KeyCode::Char('d'), None, Some(ci)) = (key.code, project, comps.get(t.detail_cursor)) {
                 let c = app.data.components.remove(*ci);
                 app.cur_mut().detail_cursor = 0;
@@ -548,13 +566,28 @@ fn graph_enter(app: &mut App, flow_key: &str) {
     if flow_key.starts_with("runs:") {
         let Some(idx) = app.cur().tree.selected() else { return };
         let item = &app.data.items[idx];
-        let Some(step) = flow::run_steps(item).into_iter().find(|s| s.id == node) else { return };
+        let Some(step) = app.steps_of(item).into_iter().find(|s| s.id == node) else { return };
         let key = item.key;
-        match step.status {
+        match (step.id, step.status) {
+            // htui's own stages have no chat: say what they did.
+            ("prepare", Status::Queued) => app.flash(format!("{} has not started yet", step.name)),
+            ("prepare", _) => {
+                let t = &app.data.targets[app.target_of(key)];
+                app.flash(format!("{}: {}", step.name, t.how.first().copied().unwrap_or("").replace("<item>", &key.to_lowercase())));
+            }
+            ("pick", Status::Queued) => app.flash("the fast pick runs when the run starts"),
+            ("pick", _) => {
+                let (wf, why) = app.workflow_of(item);
+                let name = app.data.workflows[wf].name;
+                app.flash(match why {
+                    Some(why) => format!("fast pick chose {name}: {why} · t changes it"),
+                    None => format!("{name}, pinned by you · t changes it"),
+                });
+            }
             // Not started: nothing to show yet.
-            Status::Queued => app.flash(format!("{} has not started yet", step.name)),
-            Status::Done | Status::Closed => jump(app, |app| open_archived(app, key, step.id, step.name, step.agent)),
-            _ => jump(app, |app| open_item_chat(app, key, Some(step.name))),
+            (_, Status::Queued) => app.flash(format!("{} has not started yet", step.name)),
+            (_, Status::Done | Status::Closed) => jump(app, |app| open_archived(app, key, step.id, &step.name, step.agent)),
+            _ => jump(app, |app| open_item_chat(app, key, Some(&step.name))),
         }
     } else if let Some(id) = node.strip_prefix("req:") {
         let id = id.to_string();
@@ -567,7 +600,7 @@ fn graph_enter(app: &mut App, flow_key: &str) {
 }
 
 /// A finished step's transcript, read only, in the Chat tab's "archived" group.
-fn open_archived(app: &mut App, key: &'static str, step: &'static str, name: &'static str, agent: &'static str) {
+fn open_archived(app: &mut App, key: &'static str, step: &'static str, name: &str, agent: &'static str) {
     let existing = app.data.sessions.iter().position(|s| s.kind == SessionKind::Archived(key, step));
     let idx = match existing {
         Some(i) => i,
@@ -764,18 +797,27 @@ fn go_to_workspaces(app: &mut App) {
 fn stop_workspace(app: &mut App) {
     let Some(ws) = selected_ws(app) else { return };
     let name = app.data.workspaces[ws].name;
-    let running = app.running(ws);
     match app.data.workspaces[ws].state {
         WsState::Open => app.flash(format!("{name} is open: open another one first, or stop single runs in the Backlog")),
         WsState::Background => {
-            app.data.workspaces[ws].state = WsState::Stopping;
-            app.stopping.insert(ws, Instant::now());
-            app.flash(format!("stopping {name}: {running} run(s) finish their step, then park · s again forces"));
+            let runs = running_items(app, ws);
+            let mut lines = if runs.is_empty() {
+                vec!["Nothing is running there; it closes right away.".to_string()]
+            } else {
+                vec![format!("{} run(s) finish the step they are in, then park:", runs.len())]
+            };
+            lines.extend(runs.iter().map(|(k, s)| format!("   {k:<9} {s}")));
+            lines.push(String::new());
+            lines.push("Nothing new starts. r resumes the parked runs later; s again forces.".into());
+            app.modal = Some(Modal::Confirm(modal::Confirm { title: format!("stop {name}?"), lines, yes: "stop", action: modal::Action::Stop(ws) }));
         }
         WsState::Stopping => {
-            app.stopping.remove(&ws);
-            park_runs(app, ws, true);
-            app.flash(format!("forced: {name} stopped, {running} run(s) cut mid-step · r resumes them"));
+            let runs = running_items(app, ws);
+            let mut lines = vec![format!("{} run(s) are cut short now, mid-step:", runs.len())];
+            lines.extend(runs.iter().map(|(k, s)| format!("   {k:<9} {s}: its work so far is kept, the step runs again")));
+            lines.push(String::new());
+            lines.push("r resumes them; each redoes the step it was cut in.".into());
+            app.modal = Some(Modal::Confirm(modal::Confirm { title: format!("force-stop {name}?"), lines, yes: "force stop", action: modal::Action::ForceStop(ws) }));
         }
         WsState::Stopped => app.flash(format!("{name} is already stopped · r resumes its runs · o opens it")),
     }
@@ -784,20 +826,22 @@ fn stop_workspace(app: &mut App) {
 /// Stops workspace `ws`, setting its running items aside. Graceful: each finished its current step
 /// and resumes at the next one. Forced: each was cut short and redoes that step on resume.
 fn park_runs(app: &mut App, ws: usize, interrupted: bool) {
-    let projects = app.data.workspaces[ws].projects.clone();
-    let parked: Vec<data::Parked> = app
-        .data
-        .items
-        .iter()
-        .filter(|i| projects.contains(&i.project) && matches!(i.status, Status::InProgress | Status::AwaitingApproval))
-        .filter_map(|i| {
-            let step = flow::run_steps(i).into_iter().find(|s| s.status != Status::Done)?;
-            Some(data::Parked { key: i.key, step: step.name, interrupted })
-        })
-        .collect();
+    let parked: Vec<data::Parked> = running_items(app, ws).into_iter().map(|(key, step)| data::Parked { key, step, interrupted }).collect();
     let w = &mut app.data.workspaces[ws];
     w.state = WsState::Stopped;
     w.parked.extend(parked);
+}
+
+/// The runs going on in workspace `ws`: (item, the step it is in).
+fn running_items(app: &App, ws: usize) -> Vec<(&'static str, String)> {
+    let projects = &app.data.workspaces[ws].projects;
+    app.data
+        .items
+        .iter()
+        .filter(|i| projects.contains(&i.project) && matches!(i.status, Status::InProgress | Status::AwaitingApproval))
+        .filter(|i| !app.data.workspaces[ws].parked.iter().any(|p| p.key == i.key))
+        .map(|i| (i.key, app.current_step(i)))
+        .collect()
 }
 
 /// `r`: a stopped workspace's parked runs start again, in the background (or on screen if it is the
@@ -918,6 +962,37 @@ fn on_outcome(app: &mut App, outcome: Outcome) {
         }
         Outcome::Stay => {}
         Outcome::Close => app.modal = None,
+        Outcome::Confirmed(action) => {
+            app.modal = None;
+            match action {
+                modal::Action::Stop(ws) => {
+                    let name = app.data.workspaces[ws].name;
+                    let n = running_items(app, ws).len();
+                    app.data.workspaces[ws].state = WsState::Stopping;
+                    app.stopping.insert(ws, Instant::now());
+                    app.flash(format!("stopping {name}: {n} run(s) finish their step, then park · s again forces"));
+                }
+                modal::Action::ForceStop(ws) => {
+                    let name = app.data.workspaces[ws].name;
+                    let n = running_items(app, ws).len();
+                    app.stopping.remove(&ws);
+                    park_runs(app, ws, true);
+                    app.flash(format!("forced: {name} stopped, {n} run(s) cut mid-step · r resumes them"));
+                }
+            }
+        }
+        Outcome::SetRun { item, target, workflow } => {
+            app.modal = None;
+            let key = app.data.items[item].key;
+            app.item_target.insert(key, target);
+            match workflow {
+                Some(wf) => app.item_workflow.insert(key, wf),
+                None => app.item_workflow.remove(key),
+            };
+            let (wf, why) = app.workflow_of(&app.data.items[item]);
+            let how = if why.is_some() { "fast pick" } else { "pinned" };
+            app.flash(format!("{key} runs on {} · workflow {} ({how})", app.data.targets[target].name, app.data.workflows[wf].name));
+        }
         Outcome::Create { project, draft } => {
             app.modal = None;
             let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };

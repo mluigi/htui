@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, BorderType, Widget};
 
 use rataflow::{Edge, EdgeStyle, FitViewOptions, Flow, Node, NodeContent, NodeRenderContext, StepEdge, Sugiyama, Theme};
 
-use crate::data::{Item, Requirement, Status};
+use crate::data::{Item, Requirement, Status, Workflow};
 use crate::theme::{self, Palette};
 
 pub type Graph = Flow<StatusNode, StepEdge>;
@@ -299,42 +299,34 @@ pub fn item_graph(items: &[Item], reqs: &[Requirement], root: &Item, pal: Palett
 /// One step of a run as the graph and Enter see it.
 pub struct Step {
     pub id: &'static str,
-    pub name: &'static str,
+    pub name: String,
     pub agent: &'static str,
     pub status: Status,
 }
 
-/// A run: plan; a fan-out of agents, each researching one part; a merge; then code and review in a
-/// loop until review approves; then the gate.
-pub fn run_steps(item: &Item) -> Vec<Step> {
+/// A run: htui prepares the target, a fast model picks the workflow, then the workflow's steps.
+pub fn run_steps(item: &Item, wf: &Workflow, target: &str) -> Vec<Step> {
+    // Every run starts with the same two stages, then the workflow's own.
+    let mut all: Vec<(&'static str, String, &'static str, usize)> = vec![
+        ("prepare", format!("prepare · {target}"), "htui", 0),
+        ("pick", "pick workflow".to_string(), "fast model", 1),
+    ];
+    all.extend(wf.steps.iter().map(|(id, name, agent, stage)| (*id, name.to_string(), *agent, stage + 2)));
+    let stages = all.iter().map(|s| s.3).max().unwrap_or(0) + 1;
     // How many stages are finished; the next one is the current stage (none when not started).
     let (done, current) = match item.status {
         Status::Open | Status::Queued => (0, None),
-        Status::Blocked => (1, Some(Status::Blocked)),
-        Status::InProgress => (5, Some(Status::InProgress)),
-        Status::AwaitingApproval => (6, Some(Status::AwaitingApproval)),
-        Status::Failed => (7, Some(Status::Failed)),
-        Status::Done | Status::Closed => (8, None),
+        Status::Blocked => (2, Some(Status::Blocked)),
+        Status::InProgress => ((stages * 5 / 8).max(2), Some(Status::InProgress)),
+        Status::AwaitingApproval => ((stages * 6 / 8).max(2), Some(Status::AwaitingApproval)),
+        Status::Failed => (stages - 1, Some(Status::Failed)),
+        Status::Done | Status::Closed => (stages, None),
     };
-    // (id, name, agent, stage)
-    const STEPS: [(&str, &str, &str, usize); 10] = [
-        ("plan", "plan", "claude · opus", 0),
-        ("r-api", "research · API", "claude · sonnet", 1),
-        ("r-prior", "research · prior art", "codex · gpt-5", 1),
-        ("r-perf", "research · perf", "gemini · pro", 1),
-        ("merge", "merge findings", "claude · opus", 2),
-        ("code-1", "code · round 1", "claude · sonnet", 3),
-        ("review-1", "review · round 1", "rust-reviewer", 4),
-        ("code-2", "code · round 2", "claude · sonnet", 5),
-        ("review-2", "review · round 2", "rust-reviewer", 6),
-        ("gate", "gate", "cargo test", 7),
-    ];
-    STEPS
-        .iter()
+    all.into_iter()
         .map(|(id, name, agent, stage)| {
             let status = match current {
-                _ if *stage < done => Status::Done,
-                Some(cur) if *stage == done => cur,
+                _ if stage < done => Status::Done,
+                Some(cur) if stage == done => cur,
                 _ => Status::Queued,
             };
             Step { id, name, agent, status }
@@ -342,8 +334,8 @@ pub fn run_steps(item: &Item) -> Vec<Step> {
         .collect()
 }
 
-pub fn run_graph(item: &Item, pal: Palette, opts: GraphOpts) -> Graph {
-    let steps = run_steps(item);
+pub fn run_graph(item: &Item, wf: &Workflow, target: &str, pal: Palette, opts: GraphOpts) -> Graph {
+    let steps = run_steps(item, wf, target);
     let status = |id: &str| steps.iter().find(|s| s.id == id).map_or(Status::Queued, |s| s.status);
     let nodes = steps
         .iter()
@@ -353,35 +345,33 @@ pub fn run_graph(item: &Item, pal: Palette, opts: GraphOpts) -> Graph {
                 Status::Queued => "not started".to_string(),
                 st => format!("{} · {}", s.agent, st.label()),
             };
-            let content = StatusNode { head: s.name.to_string(), head_color: theme::TEXT, sub, status: s.status, accent: pal.accent, root: false, shape: Shape::Step };
+            let content = StatusNode { head: s.name.clone(), head_color: theme::TEXT, sub, status: s.status, accent: pal.accent, root: false, shape: Shape::Step };
             Node::new(s.id, (0.0, 0.0), (NODE_W - 4.0, NODE_H), content)
         })
         .collect();
-    let pairs = [
-        ("plan", "r-api", "fans out"),
-        ("plan", "r-prior", "fans out"),
-        ("plan", "r-perf", "fans out"),
-        ("r-api", "merge", "merges"),
-        ("r-prior", "merge", "merges"),
-        ("r-perf", "merge", "merges"),
-        ("merge", "code-1", "next"),
-        ("code-1", "review-1", "next"),
-        ("review-1", "code-2", "changes requested"),
-        ("code-2", "review-2", "next"),
-        ("review-2", "gate", "approved"),
-    ];
+    let first = wf.steps.first().map_or("gate", |s| s.0);
+    let mut pairs = vec![("prepare", "pick", "next"), ("pick", first, "next")];
+    pairs.extend(wf.links.iter().copied());
     // The links into a step that is running now move.
     let edges = pairs
         .iter()
         .enumerate()
         .map(|(i, (s, t, k))| edge(i, s, t, k, opts, status(t) == Status::InProgress && status(s) == Status::Done))
         .collect();
-    let select = steps.iter().find(|s| s.status != Status::Done).map_or("gate", |s| s.id);
+    let select = steps.iter().find(|s| s.status != Status::Done).or(steps.last()).map_or("prepare", |s| s.id);
     finish(nodes, edges, select, pal, opts)
 }
 
-/// The link kinds the run graph uses, for its legend.
-pub const RUN_KINDS: [&str; 4] = ["fans out", "merges", "changes requested", "approved"];
+/// The link kinds a workflow's run graph uses, for its legend.
+pub fn run_kinds(wf: &Workflow) -> Vec<&'static str> {
+    let mut kinds = Vec::new();
+    for (_, _, k) in wf.links {
+        if *k != "next" && !kinds.contains(k) {
+            kinds.push(*k);
+        }
+    }
+    kinds
+}
 
 /// Requirements in scope, parent above child, and the items covering each.
 pub fn req_graph(items: &[Item], reqs: &[&Requirement], pal: Palette, opts: GraphOpts) -> (Graph, Vec<&'static str>) {

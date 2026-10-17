@@ -21,15 +21,15 @@ pub fn about(tab: usize) -> (&'static str, Vec<(&'static str, &'static str)>) {
         ),
         BACKLOG => (
             "The open workspace's items. Pick one; its body, runs and dependency graph open on the right.",
-            vec![("N", "new item"), ("/", "filter"), ("h", "done items"), ("g", "grouping"), ("Tab", "next pane"), ("S-←→", "sections")],
+            vec![("N", "new item"), ("t", "where / how it runs"), ("/", "filter"), ("h", "done items"), ("g", "grouping"), ("S-←→", "sections")],
         ),
         CHAT => (
             "The workspace and project coordinators, and every agent working on an item. Item chats are read-only until they ask you.",
             vec![("i", "write"), ("a", "allow"), ("r", "reject"), ("Tab", "next pane"), ("z", "zoom")],
         ),
         SKILLS => (
-            "Skills and templates agents can load, and per-agent help. Attach a skill to files with a glob.",
-            vec![("Enter", "open"), ("e", "edit"), ("t", "attach"), ("i", "import")],
+            "Everything a run can use: workflows (how an item runs), skills, personas, templates, mods and MCP servers.",
+            vec![("Enter", "open"), ("e", "edit"), ("t", "attach"), ("i", "import"), ("N", "new")],
         ),
         LOGS => (
             "htui's own log, newest at the bottom. Pick a source on the left; new lines stream in while following.",
@@ -43,7 +43,7 @@ pub fn about(tab: usize) -> (&'static str, Vec<(&'static str, &'static str)>) {
 }
 
 fn list_title(tab: usize) -> &'static str {
-    ["workspaces", "items", "chats", "skills", "sources", "sections"][tab]
+    ["workspaces", "items", "chats", "toolbox", "sources", "sections"][tab]
 }
 
 pub fn draw_list(f: &mut Frame, app: &App, area: Rect, pal: Palette) {
@@ -186,7 +186,11 @@ fn entry_spans(app: &App, idx: usize, pal: Palette) -> Vec<Span<'static>> {
             }
             spans
         }
-        SKILLS => vec![Span::raw("  "), Span::styled(d.skills[idx].name, theme::text())],
+        SKILLS => {
+            let n = d.workflows.len();
+            let name = if idx < n { d.workflows[idx].name } else { d.skills[idx - n].name };
+            vec![Span::raw("  "), Span::styled(name, theme::text())]
+        }
         LOGS => {
             let name = if idx == 0 { "all" } else { data::LOG_TARGETS[idx - 1].1 };
             let count = d.htui_log.iter().filter(|r| idx == 0 || r.target == data::LOG_TARGETS[idx - 1].0).count();
@@ -279,8 +283,10 @@ pub fn flow_key(app: &App) -> Option<String> {
     match app.tab {
         BACKLOG => {
             let item = &app.data.items[t.tree.selected()?];
+            let (wf, _) = app.workflow_of(item);
+            let target = app.target_of(item.key);
             match t.subtab {
-                1 if !t.runs_table => Some(format!("runs:{}:{scheme}:{opts}", item.key)),
+                1 if !t.runs_table => Some(format!("runs:{}:{wf}:{target}:{scheme}:{opts}", item.key)),
                 2 => Some(format!("graph:{}:{scheme}:{opts}", item.key)),
                 _ => None,
             }
@@ -299,7 +305,9 @@ fn build_graph(app: &App, key: &str, pal: Palette) -> (Graph, Vec<&'static str>)
         Some("runs") | Some("graph") => {
             let item = app.cur().tree.selected().map_or(&d.items[0], |i| &d.items[i]);
             if key.starts_with("runs") {
-                (flow::run_graph(item, pal, app.graph), flow::RUN_KINDS.to_vec())
+                let wf = &d.workflows[app.workflow_of(item).0];
+                let target = d.targets[app.target_of(item.key)].name;
+                (flow::run_graph(item, wf, target, pal, app.graph), flow::run_kinds(wf))
             } else {
                 flow::item_graph(&d.items, &d.reqs, item, pal, app.graph)
             }
@@ -393,6 +401,19 @@ fn backlog_detail(f: &mut Frame, app: &App, item: &Item, area: Rect, focused: bo
         Span::styled("   depends on ", theme::dim()),
         Span::styled(if item.deps.is_empty() { "nothing".to_string() } else { item.deps.join(", ") }, theme::text()),
     ])];
+    let (wf, why) = app.workflow_of(item);
+    let target = &app.data.targets[app.target_of(item.key)];
+    lines.push(Line::from(vec![
+        Span::styled(" runs on ", theme::dim()),
+        Span::styled(target.name, theme::bold()),
+        Span::styled(format!(" ({})", target.kind), theme::dim()),
+        Span::styled("   workflow ", theme::dim()),
+        Span::styled(app.data.workflows[wf].name, theme::bold()),
+        Span::styled(if why.is_some() { " (fast pick)" } else { " (pinned)" }, theme::dim()),
+        Span::styled("   ", theme::dim()),
+        Span::styled("t", pal.accent().add_modifier(Modifier::BOLD)),
+        Span::styled(" changes", theme::dim()),
+    ]));
     lines.push(Line::raw(""));
 
     let subtabs = subtab_hits(area, &app::BACKLOG_SUBTABS);
@@ -400,7 +421,7 @@ fn backlog_detail(f: &mut Frame, app: &App, item: &Item, area: Rect, focused: bo
     if (t.subtab == 1 && !t.runs_table) || t.subtab == 2 {
         let inner = block.inner(area);
         f.render_widget(block, area);
-        let [head, canvas] = Layout::vertical([Constraint::Length(2), Constraint::Fill(1)]).areas(inner);
+        let [head, canvas] = Layout::vertical([Constraint::Length(3), Constraint::Fill(1)]).areas(inner);
         f.render_widget(Paragraph::new(lines), Rect { x: head.x + 1, width: head.width.saturating_sub(1), ..head });
         let flow = draw_graph(f, app, canvas, pal);
         return DetailOut { flow, subtabs, ..DetailOut::default() };
@@ -658,7 +679,11 @@ pub fn draw_composer(f: &mut Frame, app: &App, area: Rect, pal: Palette) {
 }
 
 fn skill_detail(f: &mut Frame, app: &App, idx: usize, area: Rect, focused: bool, pal: Palette) -> DetailOut {
-    let s = &app.data.skills[idx];
+    let n = app.data.workflows.len();
+    if idx < n {
+        return workflow_detail(f, app, idx, area, focused, pal);
+    }
+    let s = &app.data.skills[idx - n];
     let block = panel(
         vec![Span::styled(s.name, theme::bold())],
         Some(Line::from(Span::styled(format!(" {} ", s.group), theme::dim()))),
@@ -669,12 +694,73 @@ fn skill_detail(f: &mut Frame, app: &App, idx: usize, area: Rect, focused: bool,
     let mut lines = vec![
         Line::from(Span::styled(format!(" {}", s.desc), theme::text())),
         Line::raw(""),
-        Line::from(vec![Span::styled(" attached to  ", theme::dim()), Span::styled(s.attach, theme::bold())]),
+        Line::from(vec![
+            Span::styled(if s.group == "mods" { " works with   " } else { " attached to  " }, theme::dim()),
+            Span::styled(s.attach, theme::bold()),
+        ]),
         Line::raw(""),
     ];
     for l in s.body.lines() {
         lines.push(Line::from(vec![Span::styled(" │ ", pal.accent()), Span::styled(l, theme::text())]));
     }
+    DetailOut { max_scroll: body(f, block, area, lines, app.cur().detail_scroll), ..DetailOut::default() }
+}
+
+/// A workflow: what it is for, when the fast pick chooses it, its steps, and who uses it.
+fn workflow_detail(f: &mut Frame, app: &App, idx: usize, area: Rect, focused: bool, pal: Palette) -> DetailOut {
+    let wf = &app.data.workflows[idx];
+    let block = panel(
+        vec![Span::styled(wf.name, theme::bold())],
+        Some(Line::from(Span::styled(" workflow ", theme::dim()))),
+        &[("e", "edit steps"), ("d", "duplicate"), ("N", "new")],
+        focused,
+        pal,
+    );
+    let heading = |t: &str| Line::from(Span::styled(format!(" {t}"), pal.accent().add_modifier(Modifier::BOLD)));
+    let mut lines = vec![Line::from(Span::styled(format!(" {}", wf.desc), theme::text())), Line::raw("")];
+    lines.push(heading("the fast pick chooses it for"));
+    lines.push(Line::from(Span::styled(format!(" {}", wf.when), theme::text())));
+    lines.push(Line::raw(""));
+    lines.push(heading("steps"));
+    lines.push(Line::from(Span::styled(" prepare (htui, on the item's target) → pick workflow (fast model) →", theme::dim())));
+    let stages = wf.steps.iter().map(|s| s.3).max().unwrap_or(0) + 1;
+    for st in 0..stages {
+        let here: Vec<_> = wf.steps.iter().filter(|s| s.3 == st).collect();
+        for (i, s) in here.iter().enumerate() {
+            let branch = match (here.len(), i) {
+                (1, _) => "   ",
+                (_, 0) => " ┬ ",
+                (n, i) if i + 1 == n => " └ ",
+                _ => " ├ ",
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {}{branch}", st + 1), theme::dim()),
+                Span::styled(format!("{:<22}", s.1), theme::bold()),
+                Span::styled(s.2, theme::dim()),
+            ]));
+        }
+    }
+    let name = |id: &str| wf.steps.iter().find(|s| s.0 == id).map_or(id.to_string(), |s| s.1.to_string());
+    let loops: Vec<String> = wf.links.iter().filter(|l| l.2 == "changes requested").map(|(a, b, k)| format!("{} → {}: {k}", name(a), name(b))).collect();
+    if !loops.is_empty() {
+        lines.push(Line::from(Span::styled(format!("   links: {}", loops.join(" · ")), theme::dim())));
+    }
+    lines.push(Line::raw(""));
+    lines.push(heading("at run time"));
+    lines.push(Line::from(Span::styled(
+        " The run's agent may add, skip or repeat steps (a second research part, another review round), within the project's bounds: phases, agents, caps, hard gates. Each change shows in the run graph.",
+        theme::text(),
+    )));
+    lines.push(Line::raw(""));
+    lines.push(heading("used by"));
+    let users: Vec<String> = app
+        .data
+        .items
+        .iter()
+        .filter(|i| app.workspace_projects().contains(&i.project) && app.workflow_of(i).0 == idx)
+        .map(|i| format!("{}{}", i.key, if app.workflow_of(i).1.is_some() { "" } else { " (pinned)" }))
+        .collect();
+    lines.push(Line::from(Span::styled(if users.is_empty() { " no item in this workspace".to_string() } else { format!(" {}", users.join(", ")) }, theme::text())));
     DetailOut { max_scroll: body(f, block, area, lines, app.cur().detail_scroll), ..DetailOut::default() }
 }
 

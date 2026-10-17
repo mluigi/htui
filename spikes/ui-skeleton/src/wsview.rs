@@ -35,7 +35,7 @@ pub fn ws_detail(f: &mut Frame, app: &App, idx: usize, area: Rect, focused: bool
         (0, None, WsState::Stopped) => &[("o", "open"), ("N", "new…"), ("S-←→", "section")],
         (0, None, WsState::Open) if !w.parked.is_empty() => &[("r", "resume parked runs"), ("N", "new…"), ("S-←→", "section")],
         (0, ..) => &[("N", "new…"), ("S-←→", "section")],
-        (1, None, _) => &[("↑↓", "select"), ("N", "add component"), ("d", "remove")],
+        (1, None, _) => &[("↑↓", "select"), ("Space", "start / stop"), ("N", "add component"), ("d", "remove")],
         (1, Some(_), _) => &[("↑↓", "select"), ("Enter", "shared / own / none"), ("N", "add own")],
         _ if t.req_graph => graph_hints(app),
         _ => &[("↑↓", "select"), ("Enter", "go to item"), ("v", "graph"), ("N", "new…"), ("S-←→", "section")],
@@ -170,7 +170,7 @@ fn stop_lines(app: &App, ws: usize, pal: Palette) -> Vec<Line<'static>> {
             .collect();
         lines.push(heading(&format!("stopping · waiting for {} run(s) to reach a stoppable step", running.len()), pal));
         for i in running {
-            let step = crate::flow::run_steps(i).into_iter().find(|s| s.status != Status::Done).map_or("—", |s| s.name);
+            let step = app.current_step(i);
             lines.push(Line::from(vec![
                 Span::raw("   "),
                 theme::glyph(i.status),
@@ -422,7 +422,9 @@ pub fn compose_lines(services: &[Service], pal: Palette) -> Vec<Line<'static>> {
             "mongodb" => Some("MONGO_INITDB_ROOT_PASSWORD"),
             _ => None,
         };
-        if !s.services.is_empty() {
+        if s.kind == "floci" {
+            push(vec![Span::styled("    # emulates every service it has: s3, sqs, sns, dynamodb, lambda, …", theme::dim())]);
+        } else if !s.services.is_empty() {
             push(vec![Span::styled("    environment:", key)]);
             push(vec![Span::styled("      SERVICES: ", key), Span::styled(s.services.join(","), theme::text())]);
         }

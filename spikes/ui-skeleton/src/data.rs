@@ -69,6 +69,169 @@ pub struct Skill {
     pub body: &'static str,
 }
 
+/// A way an item's run can be executed. Wherever it runs, htui prepares it there: the code, the
+/// item's components (docker compose), env and secrets, and the agents.
+pub struct Target {
+    pub name: &'static str,
+    pub kind: &'static str,
+    pub address: &'static str,
+    /// What htui does there to run an item, in order.
+    pub how: &'static [&'static str],
+    pub status: Status,
+    /// Only in the plans: shown, not selectable.
+    pub planned: Option<&'static str>,
+}
+
+/// A template for how an item is executed: its steps and links. A fast model picks one when a run
+/// starts; the agent may change it at run time within the project's bounds.
+pub struct Workflow {
+    pub name: &'static str,
+    pub desc: &'static str,
+    /// What the fast pick looks for.
+    pub when: &'static str,
+    /// (id, name, agent, stage): steps sharing a stage run in parallel.
+    pub steps: &'static [(&'static str, &'static str, &'static str, usize)],
+    pub links: &'static [(&'static str, &'static str, &'static str)],
+}
+
+pub fn workflows() -> Vec<Workflow> {
+    vec![
+        Workflow {
+            name: "standard",
+            desc: "Plan, code, review until approved, gate.",
+            when: "most items: one area, a clear goal",
+            steps: &[
+                ("plan", "plan", "claude · opus", 0),
+                ("code-1", "code · round 1", "claude · sonnet", 1),
+                ("review-1", "review · round 1", "rust-reviewer", 2),
+                ("code-2", "code · round 2", "claude · sonnet", 3),
+                ("review-2", "review · round 2", "rust-reviewer", 4),
+                ("gate", "gate", "cargo test", 5),
+            ],
+            links: &[
+                ("plan", "code-1", "next"),
+                ("code-1", "review-1", "next"),
+                ("review-1", "code-2", "changes requested"),
+                ("code-2", "review-2", "next"),
+                ("review-2", "gate", "approved"),
+            ],
+        },
+        Workflow {
+            name: "research fan-out",
+            desc: "Plan; agents research one part each in parallel; merge; then code and review.",
+            when: "items touching several areas, or needing prior art first",
+            steps: &[
+                ("plan", "plan", "claude · opus", 0),
+                ("r-api", "research · API", "claude · sonnet", 1),
+                ("r-prior", "research · prior art", "codex · gpt-5", 1),
+                ("r-perf", "research · perf", "gemini · pro", 1),
+                ("merge", "merge findings", "claude · opus", 2),
+                ("code-1", "code · round 1", "claude · sonnet", 3),
+                ("review-1", "review · round 1", "rust-reviewer", 4),
+                ("code-2", "code · round 2", "claude · sonnet", 5),
+                ("review-2", "review · round 2", "rust-reviewer", 6),
+                ("gate", "gate", "cargo test", 7),
+            ],
+            links: &[
+                ("plan", "r-api", "fans out"),
+                ("plan", "r-prior", "fans out"),
+                ("plan", "r-perf", "fans out"),
+                ("r-api", "merge", "merges"),
+                ("r-prior", "merge", "merges"),
+                ("r-perf", "merge", "merges"),
+                ("merge", "code-1", "next"),
+                ("code-1", "review-1", "next"),
+                ("review-1", "code-2", "changes requested"),
+                ("code-2", "review-2", "next"),
+                ("review-2", "gate", "approved"),
+            ],
+        },
+        Workflow {
+            name: "quick fix",
+            desc: "Code the fix with a regression test, one review, gate.",
+            when: "bugs with a known cause, small changes",
+            steps: &[("code-1", "code · fix + test", "claude · sonnet", 0), ("review-1", "review", "rust-reviewer", 1), ("gate", "gate", "cargo test", 2)],
+            links: &[("code-1", "review-1", "next"), ("review-1", "gate", "approved")],
+        },
+        Workflow {
+            name: "analysis",
+            desc: "Research the question from two sides, write it up, review the write-up. No code.",
+            when: "questions: why, compare, should we",
+            steps: &[
+                ("plan", "frame the question", "claude · opus", 0),
+                ("r-a", "research · options", "claude · sonnet", 1),
+                ("r-b", "research · prior art", "codex · gpt-5", 1),
+                ("write", "write-up", "claude · opus", 2),
+                ("review-1", "review", "claude · opus", 3),
+            ],
+            links: &[("plan", "r-a", "fans out"), ("plan", "r-b", "fans out"), ("r-a", "write", "merges"), ("r-b", "write", "merges"), ("write", "review-1", "next")],
+        },
+    ]
+}
+
+pub fn targets() -> Vec<Target> {
+    vec![
+        Target {
+            name: "this box",
+            kind: "local",
+            address: "DESKTOP-HTUI",
+            how: &[
+                "a git worktree of the project on this machine, branch <item>",
+                "the item's components started here with docker compose (ports from the workspace .env)",
+                "the agent runs as you, with your installed agents",
+            ],
+            status: Status::Done,
+            planned: None,
+        },
+        Target {
+            name: "docker · this box",
+            kind: "docker",
+            address: "local docker daemon",
+            how: &[
+                "a fresh clone on branch <item> inside a container, like scripts/hr",
+                "its own compose project: a private Postgres, cache… on free ports",
+                "the toolchain image; agent logins on a named volume",
+                "nothing leaves the container until you collect the branch",
+            ],
+            status: Status::Done,
+            planned: None,
+        },
+        Target {
+            name: "ssh · build-01",
+            kind: "remote ssh",
+            address: "luigi@build-01.lan",
+            how: &[
+                "clones the project into ~/htui-runs/<item> on build-01",
+                "starts the item's components there with docker compose",
+                "env from Infisical, secrets resolved on build-01",
+                "agents must be installed and logged in on build-01 (probed first)",
+            ],
+            status: Status::Done,
+            planned: None,
+        },
+        Target {
+            name: "docker · build-01",
+            kind: "remote docker",
+            address: "docker context build-01 (over ssh)",
+            how: &[
+                "the docker sandbox, on build-01's docker daemon",
+                "fresh clone, private compose project, toolchain image, as on this box",
+                "the branch comes back over ssh when you collect it",
+            ],
+            status: Status::AwaitingApproval,
+            planned: None,
+        },
+        Target {
+            name: "box · LAPTOP-2",
+            kind: "htui server",
+            address: "enrolled with the htui server",
+            how: &["a box enrolled with a central htui server claims the run and prepares it like this box"],
+            status: Status::Queued,
+            planned: Some("planned: the htui server is MOD-47, phase 2"),
+        },
+    ]
+}
+
 pub enum Msg {
     You(String),
     Agent(String),
@@ -214,7 +377,7 @@ pub struct Workspace {
 pub struct Parked {
     pub key: &'static str,
     /// The step it stopped in (forced) or after (graceful).
-    pub step: &'static str,
+    pub step: String,
     /// Forced: the step was cut short and runs again on resume. Graceful: it finished first.
     pub interrupted: bool,
 }
@@ -333,6 +496,8 @@ pub struct Data {
     pub items: Vec<Item>,
     pub reqs: Vec<Requirement>,
     pub skills: Vec<Skill>,
+    pub workflows: Vec<Workflow>,
+    pub targets: Vec<Target>,
     pub sessions: Vec<Session>,
     pub sections: Vec<Section>,
     pub agents: Vec<AgentRow>,
@@ -445,14 +610,20 @@ pub fn mock() -> Data {
     ];
 
     let skills = vec![
-        Skill { name: "handoff-run", group: "Library", desc: "Run a HANDOFF item through its full lifecycle.", attach: "**/HANDOFF.md", body: "1. select the item\n2. route: PRD / plan / ANA\n3. confirm with the maintainer\n4. run the chain\n5. bookkeeping + validate" },
-        Skill { name: "handoff-add", group: "Library", desc: "Create a HANDOFF item from one line.", attach: "**/HANDOFF.md", body: "Mint the ID, write the checklist line, recount, validate." },
-        Skill { name: "plan", group: "Library", desc: "Restate requirements and write a step plan.", attach: "—", body: "Wait for CONFIRM before touching code." },
-        Skill { name: "rust-review", group: "Library", desc: "Ownership, lifetimes, error handling.", attach: "**/*.rs", body: "Check unwraps, clones in hot paths, error context." },
-        Skill { name: "mod-item", group: "Templates", desc: "Template for a MOD item body.", attach: "—", body: "# Goal\n# Acceptance\n# Milestones\n# Notes" },
-        Skill { name: "ana-item", group: "Templates", desc: "Template for an ANA item body.", attach: "—", body: "# Question\n# Method\n# Findings\n# Verdict" },
-        Skill { name: "claude", group: "Agent help", desc: "How htui drives Claude Code over ACP.", attach: "—", body: "Transport: acp. Billing: subscription.\nPermissions are forwarded to the Chat tab." },
-        Skill { name: "codex", group: "Agent help", desc: "How htui drives Codex.", attach: "—", body: "Transport: acp. Billing: api key." },
+        Skill { name: "handoff-run", group: "skills", desc: "Run a HANDOFF item through its full lifecycle.", attach: "**/HANDOFF.md", body: "1. select the item\n2. route: PRD / plan / ANA\n3. confirm with the maintainer\n4. run the chain\n5. bookkeeping + validate" },
+        Skill { name: "handoff-add", group: "skills", desc: "Create a HANDOFF item from one line.", attach: "**/HANDOFF.md", body: "Mint the ID, write the checklist line, recount, validate." },
+        Skill { name: "plan", group: "skills", desc: "Restate requirements and write a step plan.", attach: "—", body: "Wait for CONFIRM before touching code." },
+        Skill { name: "rust-review", group: "skills", desc: "Ownership, lifetimes, error handling.", attach: "**/*.rs", body: "Check unwraps, clones in hot paths, error context." },
+        Skill { name: "architect", group: "personas", desc: "Designs before anyone codes: files, interfaces, build order.", attach: "plan steps", body: "You are a software architect. Read the code before proposing.\nAnswer with a blueprint: files, interfaces, data flow, build order." },
+        Skill { name: "reviewer", group: "personas", desc: "Reviews a diff for correctness first, style last.", attach: "review steps", body: "You review changes. Report findings ranked by severity,\neach with a failing scenario. No praise, no nits unless asked." },
+        Skill { name: "mod-item", group: "templates", desc: "Template for a MOD item body.", attach: "MOD items", body: "# Goal\n# Acceptance\n# Milestones\n# Notes" },
+        Skill { name: "ana-item", group: "templates", desc: "Template for an ANA item body.", attach: "ANA items", body: "# Question\n# Method\n# Findings\n# Verdict" },
+        Skill { name: "htui-status", group: "mods", desc: "Claude Code mod: a live panel with the run's step and gate.", attach: "claude only", body: "Plugin mod (Claude Code ≥ 2.1.287): in-process handler.\nPanel: step, gate result, permission count. Other agents ignore it." },
+        Skill { name: "permission-toast", group: "mods", desc: "Claude Code mod: a toast when a permission waits.", attach: "claude only", body: "Hook on permission requests; shows a toast in the agent's UI." },
+        Skill { name: "htui", group: "MCP servers", desc: "htui's own MCP server: item, run and question tools.", attach: "every run", body: "stdio relay `htui mcp` (HTUI_MCP_ADDR, HTUI_MCP_TOKEN).\nTools: item_get, run_status, ask_user, spawn_subagent (MOD-107)." },
+        Skill { name: "gortex", group: "MCP servers", desc: "Code graph queries for agents.", attach: "code steps", body: "search, read, relations, trace, change." },
+        Skill { name: "claude", group: "agent help", desc: "How htui drives Claude Code over ACP.", attach: "—", body: "Transport: acp. Billing: subscription.\nPermissions are forwarded to the Chat tab." },
+        Skill { name: "codex", group: "agent help", desc: "How htui drives Codex.", attach: "—", body: "Transport: acp. Billing: api key." },
     ];
 
     let sessions = vec![
@@ -622,6 +793,20 @@ pub fn mock() -> Data {
             ],
         },
         Section {
+            name: "Targets",
+            group: "Running",
+            about: "Where an item can be executed. Each item picks one (t in the Backlog); htui prepares it there.",
+            fields: vec![
+                Field { label: "this box", value: "local · DESKTOP-HTUI · ● ready".into(), kind: FieldKind::ReadOnly, help: "a worktree here; compose on this machine" },
+                Field { label: "docker · this box", value: "docker · local daemon · ● ready".into(), kind: FieldKind::ReadOnly, help: "fresh clone in a container, private compose (like scripts/hr)" },
+                Field { label: "ssh · build-01", value: "remote ssh · luigi@build-01.lan · ● ready".into(), kind: FieldKind::ReadOnly, help: "clone and compose on build-01" },
+                Field { label: "docker · build-01", value: "remote docker · context build-01 · ⚠ daemon unreachable".into(), kind: FieldKind::ReadOnly, help: "the docker sandbox on build-01's daemon" },
+                Field { label: "box · LAPTOP-2", value: "htui server · planned (MOD-47)".into(), kind: FieldKind::ReadOnly, help: "boxes enrolled with a central htui server; phase 2" },
+                Field { label: "add a target", value: "ssh host, docker context…".into(), kind: FieldKind::Action("mock: a form asks for the kind, the address, and probes it"), help: "Enter adds one" },
+                Field { label: "default", value: "this box".into(), kind: FieldKind::Choice(&["this box", "docker · this box", "ssh · build-01", "docker · build-01"]), help: "for new items; each item can change it" },
+            ],
+        },
+        Section {
             name: "Boxes",
             group: "Running",
             about: "The machines htui has seen, and this one's limits.",
@@ -725,7 +910,7 @@ pub fn mock() -> Data {
 
     let htui_log = (0..60).map(mock_log).collect();
 
-    Data { catalogue: catalogue(), workspaces, projects, components, htui_log, items, reqs, skills, sessions, sections, agents, log }
+    Data { catalogue: catalogue(), workspaces, projects, components, htui_log, items, reqs, skills, workflows: workflows(), targets: targets(), sessions, sections, agents, log }
 }
 
 /// A run history derived from the item's status, so every item has something to show.

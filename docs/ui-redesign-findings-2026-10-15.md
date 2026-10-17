@@ -128,15 +128,18 @@ Status never relies on colour alone: glyph + word everywhere (`● done ◐ runn
   graph; `Shift ←→` was added for that.
 - **Enter** opens / focuses the detail; **Esc** returns to the list.
 - **History, like a browser** (round 7; it replaced "back until you move"): every jump (Enter in a
-  graph, the activity panel, a requirement's item or linked requirement) is recorded. `⌫ Backspace`
-  or `Alt ←` goes back, `Alt →` forward; jumping somewhere new drops what was forward. Moving around
-  no longer forgets anything; going back from a place you moved on from remembers where you were, so
-  forward returns there. 50 entries. The header shows `⌫ back to MOD-67 · graph` and `Alt→ forward`
-  when there is somewhere to go. Switching tabs with `1`–`6` is **not** recorded (§8).
+  graph, the activity panel, a requirement's item or linked requirement) is recorded, and since
+  round 8 also **every change of tab, sub-tab or pane** (keys or clicks), like an IDE's back /
+  forward. Moving a cursor inside a pane is not recorded, but going back from there remembers the
+  cursor, so forward returns to it. `⌫ Backspace` or `Alt ←` goes back, `Alt →` forward; going
+  somewhere new drops what was forward. 50 entries. The header shows `⌫ back to MOD-67 · body ·
+  list` (the pane is named when it is not the detail) and `Alt→ forward` when there is somewhere to
+  go.
 - **Leaving:** `q` / `Ctrl-C` never just quit. A "leave htui" modal lists every live workspace with
   running / waiting counts: `Enter` leaves the window and **the work keeps running in the
   background**, `S` stops everything gracefully and leaves, `Esc` stays; a second `Ctrl-C` leaves.
   After leaving, the terminal prints e.g. "htui keeps running in the background: 4 run(s)".
+- **Confirmations** (round 8): both workspace stops ask first (§4.1). Leaving already asks.
 - `?` opens a two-column key reference; `/` filters the focused list.
 - Single letters are global unless a pane claims them: graph letters (`L m d f r M + - 0`, `h j k l`
   pan) only act when a graph has focus; Backlog's `h` / `g` act everywhere in the Backlog except a
@@ -144,8 +147,8 @@ Status never relies on colour alone: glyph + word everywhere (`● done ◐ runn
 
 ## 4. Tabs
 
-Tab set changed during the review: **workspaces · backlog · chat · skills · logs · settings**. The
-Requirements tab is gone (absorbed by Workspaces); Logs is new.
+Tab set changed during the review: **workspaces · backlog · chat · toolbox · logs · settings**. The
+Requirements tab is gone (absorbed by Workspaces); Logs is new; Skills became Toolbox (round 8).
 
 ### 4.1 Workspaces (new tab; replaces the `w` switcher overlay and Settings' workspace field)
 
@@ -162,6 +165,11 @@ Requirements tab is gone (absorbed by Workspaces); Logs is new.
   runs ("⏸ FEAT-3 parked after code · round 2: goes on from the next step" / "cut short in code ·
   round 2: redoes it on resume"), and `r` resumes them all in the background (or on screen, if it is
   the open workspace). Opening a stopped workspace with `o` leaves its runs parked until `r`.
+- **Both stops ask first** (round 8): `s` opens "stop Platform?" listing each run and the step it
+  will finish ("FEAT-3 code · round 2"), "Nothing new starts. r resumes the parked runs later";
+  `s` on a stopping workspace opens "force-stop Platform?" saying which step each run is cut in and
+  that it runs again on resume. `Enter` confirms, `Esc` cancels (a cancelled force stop leaves the
+  graceful stop going).
 - The open workspace still cannot be stopped from here ("open another first, or stop single runs in
   the Backlog"); not answered yet (§8).
 - The panel's key hints follow the state (`o open · s stop`, `s force stop`, …). The earlier
@@ -194,6 +202,10 @@ Requirements tab is gone (absorbed by Workspaces); Logs is new.
   **generated `docker-compose.yml`** shown underneath: ports exposed on localhost, passwords as
   `${NAME_PASSWORD}` "from Secrets", named volumes for databases, `SERVICES: s3,sqs` for emulators,
   one extra service per project that runs its own instance. `d` removes a component.
+- **Start / stop one component** (round 8): `Space` on a row starts or stops it ("db stopped · its
+  data stays in its volume"). htui does **not** start or stop the stack with the workspace
+  (decided round 8). These are the workspace's local instances; a run starts its own compose
+  wherever it executes (§4.2a).
 - **Where the files live** (round 7 decision): the compose file goes in the **workspace folder**
   (`<workspace>/.htui/docker-compose.yml`). The `.env` (ports and URLs per project) goes to
   **Infisical when it is available** (Settings → Secrets provider = infisical; the skeleton shows
@@ -205,6 +217,9 @@ Requirements tab is gone (absorbed by Workspaces); Logs is new.
   (e.g. `DB_URL=postgres://localhost:5433/agy`). `N` adds a component only this project uses.
 - **Add-component wizard:** type → kind → **version** → **services** (only for emulators; `Space`
   toggles) → name & port (picked free, editable) → compose preview with `+` on the new lines.
+- **floci emulates every service, no choice** (round 8): the services step is skipped for it; the
+  kind list says "emulates all of s3, sqs, …" and its compose entry has no `SERVICES` line. Other
+  emulators (LocalStack, Azurite, GCP) still let you pick.
 - **Types:** database, cache, queue, **cloud emulator** (floci, LocalStack, ElasticMQ, Azurite, GCP
   emulators — explicit request: "something like floci to emulate s3, sqs and others"), object
   storage, search, custom image.
@@ -259,6 +274,33 @@ Requirements tab is gone (absorbed by Workspaces); Logs is new.
   failed, running, blocked, queued, open, done, closed). The list title says "items by kind". Both
   persist. A jump to a hidden done item turns `h` on rather than failing.
 - Empty workspace: "Nothing here yet. Press N to create the first one."
+- A second status line: **"runs on docker · this box (docker)   workflow research fan-out (fast
+  pick)   t changes"** (§4.2a).
+
+### 4.2a Where an item runs, and how (round 8)
+
+The maintainer: the user chooses, **per item**, where it is executed: locally, in docker (as the
+`scripts/hr` sandboxes do), over ssh on another machine, in docker on another machine, or on another
+box connected through a central htui server (only in the plans). **Wherever it runs, htui starts the
+docker compose there and configures everything the item needs.**
+
+- **Targets** (Settings → Running → Targets lists them; "add a target"; a default for new items):
+  | target | kind | what htui does there |
+  |---|---|---|
+  | this box | local | a git worktree on branch `<item>`; the item's components via compose here; agents run as you |
+  | docker · this box | docker | a fresh clone in a container, a private compose project (own Postgres, cache… on free ports), the toolchain image, agent logins on a named volume; nothing leaves until collected (like `scripts/hr`) |
+  | ssh · build-01 | remote ssh | clone into `~/htui-runs/<item>`, compose there, env from Infisical, agents probed on build-01 first |
+  | docker · build-01 | remote docker | the docker sandbox on build-01's daemon (docker context over ssh); the branch comes back when collected |
+  | box · LAPTOP-2 | htui server | **planned** (MOD-47, phase 2): a box enrolled with the server claims the run; shown, not selectable |
+- **`t` in the Backlog** opens "how MOD-67 runs": *where* on the left (each target with its state and
+  what htui prepares there, including "components started there: db, vectors"), *workflow* on the
+  right (§4.6). `Tab` switches side, `Enter` saves.
+- **The run graph starts with htui's own two stages**: `prepare · docker · this box` (Enter says what
+  it did there) and `pick workflow` (Enter says what the fast pick chose and why), then the
+  workflow's steps (§5.2).
+- Existing items it touches: MOD-43 (remote dispatch: a target box for a run), MOD-44 (container
+  execution environment), MOD-47 (`htui server`, phase 2), TOOL-7 (`scripts/hr`). Remote ssh and
+  remote docker as targets, and "compose wherever it runs", are not covered by any of them (§10).
 
 ### 4.3 Chat
 
@@ -293,10 +335,29 @@ Requirements tab is gone (absorbed by Workspaces); Logs is new.
   audit item 3). Toggles `● on` / `○ off`, choices `‹ value ›`, secrets `•••••••• stored`.
 - New **Catalogue** section (source, last updated, "update now" action).
 
-### 4.6 Skills
+### 4.6 Toolbox (was Skills; round 8)
 
-Unchanged from the first skeleton (list + detail with description, attach glob, body). Not reviewed
-yet.
+The maintainer: the tab must hold **every kind of tool a prompt item's execution can use**: skills,
+personas, mods, **workflows**, and other things (to be settled by an analysis).
+
+- **List groups:** workflows · skills · personas · templates · mods (Claude Code mods: work with
+  claude only) · MCP servers · agent help. "Other kinds" is open (§8).
+- **Workflows** are templates for **how an item is executed**: steps (parallel ones share a stage),
+  links (fan-out, merge, changes requested, approved), and when to use them. Mock set: *standard*
+  (plan → code → review loop → gate), *research fan-out*, *quick fix* (code + test → review →
+  gate), *analysis* (frame → research ×2 → write-up → review, no code). The detail shows the steps as
+  a tree, "the fast pick chooses it for …", "at run time …", and which items use it (pinned or
+  picked).
+- **Every run starts with a fast pick**: a quick, cheap prompt reads the item and picks the workflow
+  (about a second); the run graph shows it as the `pick workflow` step. The user can **pin** one per
+  item instead (`t` → workflow; "auto" is the default).
+- **The model may change the workflow at run time** (add, skip or repeat steps: another research
+  part, another review round) within the project's bounds; the change shows in the run graph.
+- Existing items it touches: **MOD-113** (template library with its own Templates tab, skill levels,
+  resources, import of skill folders and plugins), **ANA-33** (step graphs v2: graphs planned at run
+  time, division of work), **ANA-30** (rejected a separate `utility_model` setting, which the fast
+  pick needs in some form), **ANA-31** (agy with its own skills off). **No item covers a toolbox of
+  all kinds, the per-item workflow pick, or mods as a run resource**: an ANA is needed (§10).
 
 ### 4.7 Activity panel (in the IDE + activity / three-column presets)
 
@@ -325,7 +386,7 @@ graphs. Shared behaviour:
   (`Enter` / `Esc` places it). Links follow the node; nothing can create, reconnect or delete a link
   (nodes `connectable(false)`, `deletable(false)`, flow `with_edges_reconnectable(false)`; no keys are
   forwarded to rataflow's own bindings). Positions live as long as the graph is cached: `r`, or
-  changing `L` / `d`, lays it out again (whether to save them is in §8).
+  changing `L` / `d`, lays it out again; not saving them is fine (decided round 8).
 - **Mouse:** drag pans (empty canvas) or moves (a node), wheel zooms. The maintainer reported in
   round 7 that **the wheel does nothing**, while drags work. Cause, found in their tmux config: the
   **tmux-mighty-scroll** plugin binds `WheelUpPane`/`WheelDownPane` and only passes the wheel to the
@@ -371,6 +432,10 @@ plan → ┬ research · API        (claude)  ┐
        └ research · perf       (gemini)  ┘        ─(changes requested)→ code · round 2 → review · round 2
                                                    ─(approved)→ gate
 ```
+
+Since round 8 the graph follows the item's **workflow** (§4.6): the drawing above is *research
+fan-out*; *standard*, *quick fix* and *analysis* draw their own steps. Every run graph starts with
+`prepare · <target>` → `pick workflow`, and the legend shows only the link kinds that workflow uses.
 
 Links: `fans out`, `merges`, `changes requested` (red), `approved` (green), plain `next`; links into
 the running step are animated. **Enter:** running / waiting step → its live chat; finished step → its
@@ -442,6 +507,14 @@ item graph.
    graph; pick a requirement's items and jump; item graph top-down; emulator components, versions,
    catalogue in the DB; new-item modal defaults to the item's project and is resizable; separate
    workspace/project coordinators plus a global htui agent.
+8. Answers: both stops need a confirmation; history records tab, pane and sub-tab changes too;
+   moved graph nodes may reset; no starting/stopping the stack with the workspace, but each
+   component can be started or stopped; Q3 (stopping) and Q5 (wheel) need explaining; the mouse is
+   all fine. New: choose per item where it runs (local, docker like `scripts/hr`, remote ssh, remote
+   docker, a box through a central htui server, planned), with compose and everything set up there;
+   Skills becomes a tab for every tool a run can use (skills, personas, mods, workflows — templates
+   for how an item runs, changeable by the model at run time, picked at the start by a fast prompt —
+   and more, probably an ANA); floci always includes every service.
 7. Answers: tab + kind colours; default presets fine but sizes must survive a restart; digits for
    tabs fine; real back/forward history; stop once = wait for the next stoppable step then close,
    twice = stop outright, both resumable; compose in the workspace folder, `.env` in Infisical if
@@ -454,17 +527,24 @@ item graph.
 
 Answered in round 7 (see the sections): colour scheme (§3.5), default presets and remembered sizes
 (§3.4), digits stay tab switches (permissions moved to `a A r`), browser-style history (§3.6), what
-stop does and resuming (§4.1), where compose and `.env` live (§4.1 Components). Still open:
+stop does and resuming (§4.1), where compose and `.env` live (§4.1 Components). Answered in round 8:
+history records tabs, sub-tabs and panes too (§3.6); moved graph nodes reset on re-layout, and that
+is fine (§5); the stack is not started or stopped with the workspace, components are one by one
+(§4.1). Still open:
 
-1. History: should switching tabs (`1`–`6`, clicks) be recorded too, like an IDE's back/forward, or
-   only jumps (now)?
-2. Moved graph nodes: keep their positions only for the session (now), or save them per graph?
-3. Workspaces: can the open workspace be stopped from its own tab? And what counts as a "stoppable
-   step": only step boundaries (now), or also checkpoints inside a long step?
-4. Components: whether htui starts/stops the compose stack with the workspace; the Infisical folder
-   layout for a workspace's `.env` (the skeleton shows `/<workspace>`).
-5. Mouse wheel: document the tmux-mighty-scroll fix (§5), or should htui offer a non-wheel zoom only?
-6. Requirements: does a workspace requirement's status come from its project requirements (all done
+1. (explained in round 8, awaiting an answer) Stopping the workspace that is on screen, and whether
+   a graceful stop may also pause inside a long step.
+2. (explained in round 8, awaiting an answer) Mouse wheel under tmux: docs only, or a hint from htui.
+3. Targets: does a project (or workspace) set a default target that its items inherit, besides the
+   Settings default? How does work come back from a remote target: a branch collected like
+   `scripts/hr collect`, or pushed? Who installs and logs in the agents on a remote box?
+4. Workflows: which model makes the fast pick (ANA-30 rejected `utility_model`)? May the agent change
+   the workflow at run time without asking, or only propose? Are workflows per project, per
+   workspace, global, or all three (like MOD-113's templates)?
+5. Toolbox: which other kinds belong there (hooks, commands, sub-agents, prompts, env presets?);
+   does Templates stay a group here or get its own tab, as MOD-113 says?
+6. The Infisical folder layout for a workspace's `.env` (the skeleton shows `/<workspace>`).
+7. Requirements: does a workspace requirement's status come from its project requirements (all done
    → done)? Can an agent propose splits for an existing workspace requirement later?
 7. Catalogue: source of updates (a URL htui publishes? registry tags?), and whether users can add
    their own kinds.
@@ -474,9 +554,7 @@ stop does and resuming (§4.1), where compose and `.env` live (§4.1 Components)
 10. New-item flow: which model does the rewrite (`utility_model` was rejected by ANA-30), and does the
     talk-it-through agent become an item chat once the item exists?
 11. The htui agent's permissions: which settings it may change without asking.
-12. Skills tab: not reviewed.
-13. Mouse: tried in round 7, drags work; the wheel is item 5. Dragging graph nodes (new in round 7)
-    is untested by hand.
+12. Mouse: all fine (round 8), including dragging graph nodes.
 
 ## 9. What the real implementation needs (not decided, notes only)
 
@@ -498,17 +576,30 @@ Drafted for discussion only; wording and ids to be settled with the maintainer.
   border; toggleable per-tab "about" panel; per-tab layout presets with resizable splits, show/hide
   panes and zoom, persisted the moment they change; tab accents plus kind colours.
 - **Navigation:** arrows never leave a pane; pane switching by `Tab` / `Ctrl ←→` / click; sub-tabs by
-  `Shift ←→` / click; browser-style history of jumps (`⌫` / `Alt ←` back, `Alt →` forward).
+  `Shift ←→` / click; browser-style history of jumps and of tab, sub-tab and pane changes (`⌫` /
+  `Alt ←` back, `Alt →` forward).
 - **Leaving** never stops work by default; graceful stop-all is an explicit choice.
 - **Workspaces tab:** saved workspaces with lifecycle states; opening one backgrounds the other
   without interrupting runs; graceful stop (runs reach their next stoppable step, then park) and
-  forced stop (cut mid-step), both resumable; a folder per workspace (`.htui/`); projects from a
-  folder, a git URL or a new repo; descriptions and goals.
+  forced stop (cut mid-step), both resumable and both confirmed first; a folder per workspace
+  (`.htui/`); projects from a folder, a git URL or a new repo; descriptions and goals.
 - **Components:** typed components (database, cache, queue, cloud emulator, object storage, search,
   custom) from a **catalogue stored in the database and updatable**, with versions and emulated
   services; a generated compose file in the workspace folder with free ports and secrets from the
   Secrets provider; the `.env` in Infisical when available, else in the workspace folder; per
-  project: shared instance, own instance, or unused.
+  project: shared instance, own instance, or unused; each component started or stopped on its own;
+  floci always emulates every service.
+- **Execution targets:** each item chooses where it runs: this box, docker on this box (a sandbox
+  like `scripts/hr`), a remote machine over ssh, docker on a remote machine, or (phase 2, MOD-47) a
+  box enrolled with an htui server; wherever it runs, htui prepares the code, starts the item's
+  compose, and configures env, secrets and agents there. The run graph shows this as its first step.
+- **Workflows:** templates for how an item runs (steps, parallel parts, review loops); a fast prompt
+  picks one when a run starts, the user can pin one per item, and the agent may change it at run
+  time within the project's bounds.
+- **Toolbox tab** (replaces Skills): workflows, skills, personas, templates, mods, MCP servers, and
+  whatever else a run can use. **Needs an ANA first** (no existing item covers it): which kinds
+  exist, how each is attached to a run, the fast pick's model (against ANA-30), and how it relates
+  to MOD-113 and ANA-33.
 - **Requirements** live in Workspaces, per workspace and per project, **nest**, show their covering
   items as navigable rows, and have a graph view; they are added through the same describe → rewrite
   → review modal as items; a workspace requirement is split into project requirements, and each side

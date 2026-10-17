@@ -18,6 +18,10 @@ const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 
 pub enum Modal {
     NewItem(NewItem),
+    /// Asks before something hard to undo; Enter does it.
+    Confirm(Confirm),
+    /// Where an item runs, and with which workflow.
+    RunSetup(RunSetup),
     AddComponent(Wizard),
     Quit,
     Chooser(crate::forms::Chooser),
@@ -115,8 +119,34 @@ pub struct Wizard {
     pub updating: Option<Instant>,
 }
 
+pub struct Confirm {
+    pub title: String,
+    pub lines: Vec<String>,
+    /// The Enter key's label, e.g. "stop".
+    pub yes: &'static str,
+    pub action: Action,
+}
+
+#[derive(Clone, Copy)]
+pub enum Action {
+    Stop(usize),
+    ForceStop(usize),
+}
+
+pub struct RunSetup {
+    pub item: usize,
+    /// 0: where it runs, 1: the workflow.
+    pub section: usize,
+    pub target: usize,
+    /// 0 is "let the fast pick choose"; n is `workflows[n - 1]`.
+    pub workflow: usize,
+}
+
 /// What a modal asks the app to do.
 pub enum Outcome {
+    Confirmed(Action),
+    /// Run setup chosen: target, and workflow (None: the fast pick).
+    SetRun { item: usize, target: usize, workflow: Option<usize> },
     Stay,
     Close,
     Create { project: &'static str, draft: Draft },
@@ -263,7 +293,8 @@ impl Wizard {
 
     fn steps(&self, data: &Data) -> Vec<WStep> {
         let mut steps = vec![WStep::Type, WStep::Kind, WStep::Version];
-        if !self.kind(data).services.is_empty() {
+        let k = self.kind(data);
+        if !k.services.is_empty() && !all_services(k) {
             steps.push(WStep::Services);
         }
         steps.extend([WStep::Name, WStep::Compose]);
@@ -462,6 +493,14 @@ pub fn on_key(modal: &mut Modal, key: KeyEvent, data: &Data) -> Outcome {
     let small = match modal {
         Modal::NewItem(n) => return new_item_key(n, key, ctrl),
         Modal::AddComponent(w) => return wizard_key(w, key, ctrl, data),
+        Modal::Confirm(c) => {
+            return match key.code {
+                KeyCode::Enter | KeyCode::Char('y') => Outcome::Confirmed(c.action),
+                KeyCode::Esc | KeyCode::Char('n') => Outcome::Close,
+                _ => Outcome::Stay,
+            };
+        }
+        Modal::RunSetup(s) => return run_setup_key(s, key, data),
         Modal::Quit => forms::quit_key(key),
         Modal::Chooser(c) => forms::chooser_key(c, key),
         Modal::Form(f) => forms::form_key(f, key),
@@ -562,6 +601,25 @@ fn new_item_key(n: &mut NewItem, key: KeyEvent, ctrl: bool) -> Outcome {
     Outcome::Stay
 }
 
+fn run_setup_key(s: &mut RunSetup, key: KeyEvent, data: &Data) -> Outcome {
+    match key.code {
+        KeyCode::Esc => return Outcome::Close,
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => s.section = 1 - s.section,
+        KeyCode::Up if s.section == 0 => s.target = s.target.saturating_sub(1),
+        KeyCode::Down if s.section == 0 => s.target = (s.target + 1).min(data.targets.len() - 1),
+        KeyCode::Up => s.workflow = s.workflow.saturating_sub(1),
+        KeyCode::Down => s.workflow = (s.workflow + 1).min(data.workflows.len()),
+        KeyCode::Enter => {
+            if data.targets[s.target].planned.is_some() {
+                return Outcome::Stay;
+            }
+            return Outcome::SetRun { item: s.item, target: s.target, workflow: s.workflow.checked_sub(1) };
+        }
+        _ => {}
+    }
+    Outcome::Stay
+}
+
 fn wizard_key(w: &mut Wizard, key: KeyEvent, ctrl: bool, data: &Data) -> Outcome {
     if key.code == KeyCode::Char('U') && w.step != WStep::Name {
         w.updating = Some(Instant::now());
@@ -608,8 +666,9 @@ fn wizard_key(w: &mut Wizard, key: KeyEvent, ctrl: bool, data: &Data) -> Outcome
             }
             if step == WStep::Kind {
                 w.version_idx = 0;
-                // Emulators start with their first two services on.
-                w.services = w.kind(data).services.iter().take(2).copied().collect();
+                // floci always emulates everything; other emulators start with two services on.
+                let k = w.kind(data);
+                w.services = if all_services(k) { k.services.clone() } else { k.services.iter().take(2).copied().collect() };
                 w.service_cursor = 0;
             }
             w.step_by(data, 1);
@@ -621,6 +680,11 @@ fn wizard_key(w: &mut Wizard, key: KeyEvent, ctrl: bool, data: &Data) -> Outcome
         _ => {}
     }
     Outcome::Stay
+}
+
+/// Emulators that always run every service they emulate: no choice to make.
+pub fn all_services(k: &CatKind) -> bool {
+    k.name == "floci"
 }
 
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
@@ -659,11 +723,113 @@ pub fn draw(f: &mut Frame, app: &App, pal: Palette) {
     match &app.modal {
         Some(Modal::NewItem(n)) => draw_new_item(f, n, &app.data, app.new_item_size, pal),
         Some(Modal::AddComponent(w)) => draw_wizard(f, w, app, pal),
+        Some(Modal::Confirm(c)) => draw_confirm(f, c, pal),
+        Some(Modal::RunSetup(s)) => draw_run_setup(f, s, app, pal),
         Some(Modal::Quit) => crate::forms::draw_quit(f, app, pal),
         Some(Modal::Chooser(c)) => crate::forms::draw_chooser(f, c, pal),
         Some(Modal::Form(form)) => crate::forms::draw_form(f, form, app, pal),
         None => {}
     }
+}
+
+fn draw_confirm(f: &mut Frame, c: &Confirm, pal: Palette) {
+    let w = c.lines.iter().map(|l| l.chars().count()).max().unwrap_or(0).max(c.title.len() + 8) as u16 + 6;
+    let rect = centered(f.area(), w.max(56), c.lines.len() as u16 + 4);
+    f.render_widget(Clear, rect);
+    let block = frame(&c.title, crate::ui::hint_line(&[("Enter", c.yes), ("Esc", "cancel")], pal), pal);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let mut lines = vec![Line::raw("")];
+    lines.extend(c.lines.iter().map(|l| Line::from(Span::styled(format!(" {l}"), theme::text()))));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Where an item runs (left) and its workflow (right), each with what it means underneath.
+fn draw_run_setup(f: &mut Frame, s: &RunSetup, app: &App, pal: Palette) {
+    let data = &app.data;
+    let item = &data.items[s.item];
+    let rect = centered(f.area(), 124, 30);
+    f.render_widget(Clear, rect);
+    let hints: &[(&str, &str)] = &[("↑↓", "choose"), ("Tab", "where / workflow"), ("Enter", "save"), ("Esc", "cancel")];
+    let block = frame(&format!("how {} runs", item.key), crate::ui::hint_line(hints, pal), pal);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
+    let [left, _, right] = Layout::horizontal([Constraint::Percentage(50), Constraint::Length(2), Constraint::Fill(1)]).areas(inner);
+    let head = |text: &str, on: bool| {
+        Line::from(Span::styled(text.to_string(), if on { pal.accent().add_modifier(Modifier::BOLD) } else { theme::dim().add_modifier(Modifier::BOLD) }))
+    };
+    let row = |label: String, note: String, selected: bool, focused: bool, disabled: bool| {
+        let mut line = Line::from(vec![
+            Span::styled(if selected { "▌ " } else { "  " }, if focused { pal.accent() } else { theme::dim() }),
+            Span::styled(format!("{label:<20}"), if disabled { theme::dim() } else if selected { theme::bold() } else { theme::text() }),
+            Span::styled(note, theme::dim()),
+        ]);
+        if selected {
+            line = line.style(Style::new().bg(SEL_BG));
+        }
+        line
+    };
+
+    let mut l = vec![head("Where it runs", s.section == 0), Line::raw("")];
+    for (i, t) in data.targets.iter().enumerate() {
+        let note = if t.planned.is_some() { "planned".to_string() } else { format!("{} {}", theme::status_glyph(t.status), t.kind) };
+        l.push(crate::ui::fit(row(t.name.to_string(), note, i == s.target, s.section == 0, t.planned.is_some()), left.width));
+    }
+    let t = &data.targets[s.target];
+    l.push(Line::raw(""));
+    l.push(Line::from(vec![Span::styled(t.address.to_string(), theme::dim())]));
+    l.push(Line::from(Span::styled("htui prepares it there:", theme::bold())));
+    let branch = item.key.to_lowercase();
+    for step in t.how {
+        l.push(Line::from(vec![Span::styled("  • ", pal.accent()), Span::styled(step.replace("<item>", &branch), theme::text())]));
+    }
+    if let Some(why) = t.planned {
+        l.push(Line::from(Span::styled(format!("  {why}"), Style::new().fg(theme::status_color(Status::AwaitingApproval)))));
+    }
+    let comps: Vec<&str> = data.components.iter().filter(|c| c.usage.iter().any(|(p, u)| *p == item.project && *u != Usage::Unused)).map(|c| c.name.as_str()).collect();
+    if !comps.is_empty() {
+        l.push(Line::from(Span::styled(format!("  components started there: {}", comps.join(", ")), theme::dim())));
+    }
+    f.render_widget(Paragraph::new(l).wrap(Wrap { trim: false }), left);
+
+    let (auto, why) = crate::app::auto_pick(item);
+    let mut r = vec![head("Workflow", s.section == 1), Line::raw("")];
+    let width = right.width;
+    r.push(crate::ui::fit(row("auto".into(), format!("fast pick → {}", data.workflows[auto].name), s.workflow == 0, s.section == 1, false), width));
+    for (i, w) in data.workflows.iter().enumerate() {
+        r.push(crate::ui::fit(row(w.name.to_string(), w.when.to_string(), s.workflow == i + 1, s.section == 1, false), width));
+    }
+    let wf = &data.workflows[s.workflow.checked_sub(1).unwrap_or(auto)];
+    r.push(Line::raw(""));
+    if s.workflow == 0 {
+        r.push(Line::from(Span::styled(format!("Would pick {} now: {why}.", wf.name), theme::bold())));
+    }
+    r.push(Line::from(Span::styled(wf.desc.to_string(), theme::text())));
+    r.push(Line::from(Span::styled(workflow_chain(wf), theme::dim())));
+    r.push(Line::raw(""));
+    r.push(Line::from(Span::styled(
+        if s.workflow == 0 {
+            "When the run starts, a fast model reads the item and picks the workflow (about a second)."
+        } else {
+            "Pinned: the fast pick is skipped."
+        },
+        theme::dim(),
+    )));
+    r.push(Line::from(Span::styled("Either way the agent may add, skip or repeat steps at run time, within the project's bounds.", theme::dim())));
+    f.render_widget(Paragraph::new(r).wrap(Wrap { trim: false }), right);
+}
+
+/// "plan → research ×3 → merge → …": a workflow's stages in one line.
+pub fn workflow_chain(wf: &crate::data::Workflow) -> String {
+    let stages = wf.steps.iter().map(|s| s.3).max().unwrap_or(0) + 1;
+    (0..stages)
+        .map(|st| {
+            let names: Vec<&str> = wf.steps.iter().filter(|s| s.3 == st).map(|s| s.1).collect();
+            if names.len() > 1 { format!("{} ×{}", names[0].split(" · ").next().unwrap_or(names[0]), names.len()) } else { names.concat() }
+        })
+        .collect::<Vec<_>>()
+        .join(" → ")
 }
 
 /// Where the new-item modal sits for a given size.
@@ -932,7 +1098,11 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, app: &App, pal: Palette) {
         WStep::Kind => {
             let mut lines = vec![Line::from(Span::styled(format!("Which {}?", ty.name), theme::bold())), Line::raw("")];
             for (i, k) in ty.kinds.iter().enumerate() {
-                let extra = if k.services.is_empty() { String::new() } else { format!(" · emulates {}", k.services.join(", ")) };
+                let extra = match (k.services.is_empty(), all_services(k)) {
+                    (true, _) => String::new(),
+                    (false, true) => format!(" · emulates all of {}", k.services.join(", ")),
+                    (false, false) => format!(" · emulates {}", k.services.join(", ")),
+                };
                 lines.push(choice(k.name.to_string(), format!("{} · port {}{extra}", k.image, k.port), i == w.kind_idx));
             }
             f.render_widget(Paragraph::new(lines), rest);

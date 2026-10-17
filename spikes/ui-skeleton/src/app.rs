@@ -18,7 +18,7 @@ pub const CHAT: usize = 2;
 pub const SKILLS: usize = 3;
 pub const LOGS: usize = 4;
 pub const SETTINGS: usize = 5;
-pub const TABS: [&str; 6] = ["workspaces", "backlog", "chat", "skills", "logs", "settings"];
+pub const TABS: [&str; 6] = ["workspaces", "backlog", "chat", "toolbox", "logs", "settings"];
 
 pub const BACKLOG_SUBTABS: [&str; 5] = ["body", "runs", "graph", "docs", "notes"];
 pub const WS_SUBTABS: [&str; 3] = ["overview", "components", "requirements"];
@@ -362,6 +362,12 @@ pub struct App {
     pub moving: bool,
     /// What the state file holds, so it is only written when something changed.
     saved: String,
+    /// Set when the last event already moved through the history (a jump, back, forward).
+    nav_done: bool,
+    /// Where each item runs (an index into `data.targets`); missing: the default, this box.
+    pub item_target: HashMap<&'static str, usize>,
+    /// The workflow chosen for an item; missing: the fast pick decides.
+    pub item_workflow: HashMap<&'static str, usize>,
     /// The new-item modal's size, kept between uses.
     pub new_item_size: (u16, u16),
     /// The Workspaces list: (workspace, project) per entry; project None is the overview.
@@ -388,7 +394,7 @@ impl App {
             ws_tree,
             backlog_tree(&data, 0, GroupBy::Project, false),
             chat_tree(&data, 0),
-            Tree::new(data.skills.iter().enumerate().map(|(i, s)| (i, s.group, s.name.to_string()))),
+            toolbox_tree(&data),
             logs_tree,
             Tree::new(data.sections.iter().enumerate().map(|(i, s)| (i, s.group, s.name.to_string()))),
         ];
@@ -433,6 +439,10 @@ impl App {
             show_done: false,
             moving: false,
             saved: String::new(),
+            nav_done: false,
+            // A few items already set up elsewhere, so the picture is not all "this box".
+            item_target: HashMap::from([("MOD-67", 1), ("TOOL-8", 2), ("FEAT-3", 3)]),
+            item_workflow: HashMap::new(),
             new_item_size: (96, 28),
             ws_nodes,
             stopping: HashMap::new(),
@@ -530,11 +540,30 @@ impl App {
             _ => TABS[self.tab].to_string(),
         };
         let sub = subtabs(self.tab).get(t.subtab).map_or(String::new(), |s| format!(" · {s}"));
-        Loc { tab: self.tab, cursor: t.tree.cursor, subtab: t.subtab, detail_cursor: t.detail_cursor, focus: t.focus, label: format!("{entry}{sub}") }
+        let pane = match t.focus {
+            Pane::List => " · list",
+            Pane::Activity => " · activity",
+            Pane::Composer => " · composer",
+            Pane::Detail => "",
+        };
+        Loc { tab: self.tab, cursor: t.tree.cursor, subtab: t.subtab, detail_cursor: t.detail_cursor, focus: t.focus, label: format!("{entry}{sub}{pane}") }
+    }
+
+    /// After an event: a change of tab, sub-tab or pane goes into the history too (jumps record
+    /// themselves). Moving inside a pane does not.
+    pub fn track(&mut self, before: Loc) {
+        if std::mem::take(&mut self.nav_done) || self.modal.is_some() {
+            return;
+        }
+        let now = self.here();
+        if (before.tab, before.subtab, before.focus) != (now.tab, now.subtab, now.focus) {
+            self.record_jump(before, now);
+        }
     }
 
     /// A jump from `from` to `to`: like a browser, anything forward of here is dropped.
     pub fn record_jump(&mut self, from: Loc, to: Loc) {
+        self.nav_done = true;
         if self.history.is_empty() {
             self.history.push(from);
         } else {
@@ -563,6 +592,7 @@ impl App {
         if next < 0 || next as usize >= self.history.len() {
             return;
         }
+        self.nav_done = true;
         self.history[self.hist_pos] = self.here();
         self.hist_pos = next as usize;
         let to = self.history[self.hist_pos].clone();
@@ -575,6 +605,33 @@ impl App {
         self.moving = false;
         self.fix_focus();
         self.flash(format!("{} {}", if by < 0 { "↩" } else { "↪" }, to.label));
+    }
+
+    /// The steps of item `item`'s run, from its workflow and target.
+    pub fn steps_of(&self, item: &data::Item) -> Vec<crate::flow::Step> {
+        let (wf, _) = self.workflow_of(item);
+        crate::flow::run_steps(item, &self.data.workflows[wf], self.data.targets[self.target_of(item.key)].name)
+    }
+
+    /// The step a run is in now (the first not finished).
+    pub fn current_step(&self, item: &data::Item) -> String {
+        self.steps_of(item).into_iter().find(|s| s.status != Status::Done).map_or_else(|| "—".to_string(), |s| s.name)
+    }
+
+    /// Where item `key` runs.
+    pub fn target_of(&self, key: &str) -> usize {
+        self.item_target.get(key).copied().unwrap_or(0)
+    }
+
+    /// The item's workflow, and whether the fast pick chose it (with its reason).
+    pub fn workflow_of(&self, item: &data::Item) -> (usize, Option<&'static str>) {
+        match self.item_workflow.get(item.key) {
+            Some(wf) => (*wf, None),
+            None => {
+                let (wf, why) = auto_pick(item);
+                (wf, Some(why))
+            }
+        }
     }
 
     pub fn cur(&self) -> &TabState {
@@ -701,6 +758,17 @@ impl App {
     }
 }
 
+/// The mock fast pick: what a small model would answer from the item's kind and shape, in a second.
+pub fn auto_pick(item: &data::Item) -> (usize, &'static str) {
+    match item.key.split('-').next().unwrap_or("") {
+        "ANA" => (3, "a question to answer, no code"),
+        "FIX" => (2, "a bug with a known cause"),
+        "CLEAN" => (2, "a small, contained change"),
+        _ if item.deps.len() > 1 || item.title.to_lowercase().contains("keymap") => (1, "touches several areas; needs prior art"),
+        _ => (0, "one area, a clear goal"),
+    }
+}
+
 /// How the Backlog list is grouped (`g` cycles).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GroupBy {
@@ -797,6 +865,19 @@ pub fn chat_tree(data: &Data, workspace: usize) -> Tree {
         g.open = false;
     }
     tree
+}
+
+/// The Toolbox list: workflows first (entries 0..n), then skills, personas, templates, mods and MCP
+/// servers (entry n + i is `skills[i]`).
+fn toolbox_tree(data: &Data) -> Tree {
+    let n = data.workflows.len();
+    Tree::new(
+        data.workflows
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (i, "workflows", w.name.to_string()))
+            .chain(data.skills.iter().enumerate().map(move |(i, s)| (n + i, s.group, s.name.to_string()))),
+    )
 }
 
 fn ws_nodes(data: &Data) -> Vec<(usize, Option<&'static str>)> {
