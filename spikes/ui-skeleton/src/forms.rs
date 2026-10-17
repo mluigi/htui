@@ -83,13 +83,13 @@ impl Form {
     }
 
     pub fn step(wf: usize, edit: Option<usize>, after: usize, name: &str, persona: &str, agent: &str, parts: &str) -> Self {
-        const AGENTS: [&str; 9] = ["persona's default", "claude · opus", "claude · sonnet", "claude · haiku", "codex · gpt-5", "gemini · pro", "rust-reviewer", "cargo test", "you"];
+        const AGENTS: [&str; 9] = ["any agent", "claude · opus", "claude · sonnet", "claude · haiku", "codex · gpt-5", "gemini · pro", "rust-reviewer", "cargo test", "you"];
         let mut choices: Vec<String> = AGENTS.iter().map(|a| a.to_string()).collect();
         if !choices.iter().any(|c| c == agent) {
             choices.insert(1, agent.to_string());
         }
         let mut personas: Vec<String> = vec!["none (a check)".into()];
-        personas.extend(crate::data::PERSONAS.iter().map(|(p, _)| p.to_string()));
+        personas.extend(crate::data::PERSONAS.iter().map(|p| p.to_string()));
         let persona = if persona.is_empty() { personas[0].clone() } else { persona.to_string() };
         Form {
             kind: FormKind::Step { wf, edit, after },
@@ -98,7 +98,7 @@ impl Form {
             fields: vec![
                 Field { label: "name", value: name.to_string(), choices: None, help: "what the step does, e.g. security review" },
                 Field { label: "persona", value: persona, choices: Some(personas), help: "← → the role the step needs (Toolbox → personas); a check has none" },
-                Field { label: "agent", value: agent.to_string(), choices: Some(choices), help: "← → who plays it: the persona's default, or a specific agent; \"you\" waits for you" },
+                Field { label: "agent", value: agent.to_string(), choices: Some(choices), help: "← → who plays it: any agent (the run picks), or a specific one; \"you\" waits for you" },
                 Field { label: "parts", value: parts.to_string(), choices: None, help: "comma-separated for a fan-out (one agent per part), empty for one agent" },
             ],
         }
@@ -299,7 +299,7 @@ pub fn draw_form(f: &mut Frame, form: &Form, app: &App, pal: Palette) {
                 tree("  .htui/workspace.toml", "name, description, goals, projects"),
                 tree("  .htui/docker-compose.yml", "the components, generated"),
                 match crate::wsview::infisical(app) {
-                    Some(url) => tree("  (.env)", &format!("ports and URLs per project: kept in Infisical ({url})")),
+                    Some(url) => tree("  (.env)", &format!("ports and URLs: in Infisical ({url}), a folder per project")),
                     None => tree("  .htui/.env", "ports and URLs per project (Secrets has no Infisical)"),
                 },
                 tree("  projects/", "projects cloned from a URL go here"),
@@ -311,9 +311,7 @@ pub fn draw_form(f: &mut Frame, form: &Form, app: &App, pal: Palette) {
             let w = &app.data.workflows[wf];
             let parts: Vec<&str> = form.value("parts").split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
             let who = match (form.value("persona"), form.value("agent")) {
-                (p, "persona's default") if !p.starts_with("none") => {
-                    format!("{p}, played by {}", crate::data::PERSONAS.iter().find(|(n, _)| *n == p).map_or("its default agent", |(_, a)| a))
-                }
+                (p, "any agent") if !p.starts_with("none") => format!("{p}, played by whichever agent the run picks"),
                 (p, a) if !p.starts_with("none") => format!("{p}, played by {a}"),
                 (_, a) => format!("a check run by {a}"),
             };

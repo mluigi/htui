@@ -324,7 +324,7 @@ fn components(
             let env = match infisical(app) {
                 Some(url) => vec![
                     Span::styled(" .env", pal.accent().add_modifier(Modifier::BOLD)),
-                    Span::styled(format!("  in Infisical ({url}), folder /{}", app.data.workspaces[ws].name.to_lowercase()), theme::dim()),
+                    Span::styled(format!("  in Infisical ({url}): a folder per project, /{}/<project>", app.data.workspaces[ws].name.to_lowercase()), theme::dim()),
                 ],
                 None => vec![
                     Span::styled(" .env", pal.accent().add_modifier(Modifier::BOLD)),
@@ -332,7 +332,7 @@ fn components(
                 ],
             };
             lines.push(Line::from(env));
-            lines.push(Line::from(Span::styled("   ports and URLs per project; passwords come from Secrets either way", theme::dim())));
+            lines.push(Line::from(Span::styled("   ports and URLs per project; a project and its runs read only their own folder; passwords come from Secrets either way", theme::dim())));
         }
         Some(p) => {
             lines.push(Line::from(Span::styled(format!(" How {p} uses the workspace's components. Enter cycles: the workspace's · its own · none."), theme::dim())));

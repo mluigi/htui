@@ -468,7 +468,7 @@ pub fn workflow_graph(wf: &Workflow, selected: Option<&str>, pal: Palette, opts:
             let (head, sub) = if s.parts.is_empty() {
                 let who = match (s.persona.as_str(), s.agent.as_str()) {
                     ("", a) => a.to_string(),
-                    (p, "persona's default") => p.to_string(),
+                    (p, "any agent") => format!("{p} · any agent"),
                     (p, a) => format!("{p} · {a}"),
                 };
                 (s.name.clone(), who)

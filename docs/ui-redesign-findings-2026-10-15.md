@@ -209,8 +209,9 @@ Requirements tab is gone (absorbed by Workspaces); Logs is new; Skills became To
   wherever it executes (§4.2a).
 - **Where the files live** (round 7 decision): the compose file goes in the **workspace folder**
   (`<workspace>/.htui/docker-compose.yml`). The `.env` (ports and URLs per project) goes to
-  **Infisical when it is available** (Settings → Secrets provider = infisical; the skeleton shows
-  "in Infisical (url), folder /graphics"), **otherwise next to the compose file**
+  **Infisical when it is available** (Settings → Secrets provider = infisical), **one folder per
+  project** under the workspace's (`/graphics/agy`, `/graphics/htui`; decided round 11, option b),
+  so a project and its runs read only their own values; **otherwise next to the compose file**
   (`<workspace>/.htui/.env`). Passwords come from Secrets either way. The new-workspace preview
   says the same.
 - **Project level:** for each workspace component, `Enter` cycles **the workspace's instance · its
@@ -391,8 +392,9 @@ personas, mods, **workflows**, and other things (to be settled by an analysis).
 - **Steps name a persona** (round 10): "aren't persona and role the same things?" Yes. htui already
   has personas (MOD-26: registry rows with a prompt body and permission rules, bound per phase and
   frozen into the run snapshot), so a step asks for a **persona** (planner, researcher, coder,
-  reviewer, writer, architect; none for a check) and an **agent**, "persona's default" unless set.
-  Nodes read "coder · claude · sonnet". Whether a persona carries a default agent is new (§8).
+  reviewer, writer, architect; none for a check) and an **agent**. **Personas carry no agent**
+  (round 11): any agent can play any persona, so the step's agent is either a specific one or
+  **any agent** (the run picks). Nodes read "coder · claude · sonnet" or "coder · any agent".
 - **A workflow can pin a target** (round 10): `T` in the editor cycles inherit and every target; the
   header says "items using it run on docker · this box (pinned here; an item can still choose)".
 - **Viewed and edited as a graph in the Toolbox** (round 9; the "used by" list is gone). The template
@@ -623,6 +625,7 @@ item graph.
     project workflows get an ANA; Templates stay in the Toolbox and MOD-113 is updated; a workflow
     may pin a target, and persona and role are the same thing; any step can stop gracefully; the
     Infisical layout needs explaining; floci should let you choose the clouds.
+11. Infisical: a folder per project (option b). Personas carry no agent; they are for every agent.
 7. Answers: tab + kind colours; default presets fine but sizes must survive a restart; digits for
    tabs fine; real back/forward history; stop once = wait for the next stoppable step then close,
    twice = stop outright, both resumable; compose in the workspace folder, `.env` in Infisical if
@@ -646,12 +649,11 @@ workflows (§4.6), the extra toolbox kinds (§4.6). Still open:
 
 Answered in round 10: Templates stay a Toolbox group (MOD-113 to be amended); a workflow may pin a
 target; persona = role (§4.6); any step can stop gracefully; floci lets you choose the clouds
-(§4.1). Still open:
+(§4.1). Answered in round 11: the Infisical layout (a folder per project, §4.1 Components);
+personas carry no agent (§4.6). Still open:
 
 1. Project workflows (a workflow that drives a whole project, coordinating its items): **an ANA**,
    to be filed (§10).
-2. The Infisical folder layout for a workspace's `.env` (explained in round 10, awaiting an answer).
-3. Does a persona carry a default agent (new to MOD-26's personas), or does every step name one?
 7. Requirements: does a workspace requirement's status come from its project requirements (all done
    → done)? Can an agent propose splits for an existing workspace requirement later?
 7. Catalogue: source of updates (a URL htui publishes? registry tags?), and whether users can add
@@ -694,7 +696,8 @@ Drafted for discussion only; wording and ids to be settled with the maintainer.
 - **Components:** typed components (database, cache, queue, cloud emulator, object storage, search,
   custom) from a **catalogue stored in the database and updatable**, with versions and emulated
   services; a generated compose file in the workspace folder with free ports and secrets from the
-  Secrets provider; the `.env` in Infisical when available, else in the workspace folder; per
+  Secrets provider; the `.env` in Infisical when available (a folder per project under the
+  workspace's), else in the workspace folder; per
   project: shared instance, own instance, or unused; each component started or stopped on its own;
   floci always emulates every service.
 - **Execution targets:** each item chooses where it runs: this box, docker on this box (a sandbox
@@ -713,7 +716,8 @@ Drafted for discussion only; wording and ids to be settled with the maintainer.
   that coordinate a whole project: later.
 - **Settings values change with the arrows** (choices and toggles), saved at once.
 - **Workflow editor:** mouse (drag a handle to link, click a link, right-click a step) and undo /
-  redo of every edit. A workflow may pin a target. Steps name a persona and an agent.
+  redo of every edit. A workflow may pin a target. Steps name a persona and an agent (a specific one
+  or any agent); personas carry no agent.
 - **ANA: project workflows** (round 10): a workflow that drives a whole project's implementation,
   coordinating its items automatically; how it relates to the coordinators, the queue and ANA-33.
 - **Amend MOD-113** (round 10): Templates stay a group of the Toolbox tab instead of getting their

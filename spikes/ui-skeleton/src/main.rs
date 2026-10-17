@@ -592,7 +592,7 @@ fn wf_key(app: &mut App, key: KeyEvent, flow_key: &str) -> bool {
     match key.code {
         KeyCode::Char('a') => {
             let after = pos.unwrap_or(steps.len().saturating_sub(1));
-            app.modal = Some(Modal::Form(forms::Form::step(wf, None, after, "", "coder", "persona's default", "")));
+            app.modal = Some(Modal::Form(forms::Form::step(wf, None, after, "", "coder", "any agent", "")));
         }
         KeyCode::Char('e') | KeyCode::Enter => {
             let Some(p) = pos else { return true };

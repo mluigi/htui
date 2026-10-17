@@ -89,7 +89,8 @@ pub struct WfStep {
     pub name: String,
     /// Who the step needs (a persona from the Toolbox: planner, coder, reviewer…). Empty: a check.
     pub persona: String,
-    /// The agent that plays it; "persona's default" leaves it to the persona.
+    /// The agent that plays it, or "any agent" (the run picks one). Personas carry no agent: any
+    /// agent can play any persona.
     pub agent: String,
     /// A fan-out: (part, agent) per parallel agent. Empty: one agent. At run time a planner may
     /// split it differently.
@@ -149,9 +150,8 @@ fn st(id: &str, name: &str, agent: &str, parts: &[(&str, &str)]) -> WfStep {
     WfStep { id: id.into(), name: name.into(), persona: persona.into(), agent: agent.into(), parts: parts.iter().map(|(p, a)| (p.to_string(), a.to_string())).collect() }
 }
 
-/// The personas a step can ask for (Toolbox → personas), and each one's default agent.
-pub const PERSONAS: [(&str, &str); 6] =
-    [("planner", "claude · opus"), ("researcher", "claude · sonnet"), ("coder", "claude · sonnet"), ("reviewer", "rust-reviewer"), ("writer", "claude · opus"), ("architect", "claude · opus")];
+/// The personas a step can ask for (Toolbox → personas). Any agent can play any of them.
+pub const PERSONAS: [&str; 6] = ["planner", "researcher", "coder", "reviewer", "writer", "architect"];
 
 fn ln(from: &str, to: &str, kind: &'static str) -> WfLink {
     WfLink { from: from.into(), to: to.into(), kind }
@@ -672,11 +672,11 @@ pub fn mock() -> Data {
         Skill { name: "handoff-add", group: "skills", desc: "Create a HANDOFF item from one line.", attach: "**/HANDOFF.md", body: "Mint the ID, write the checklist line, recount, validate." },
         Skill { name: "plan", group: "skills", desc: "Restate requirements and write a step plan.", attach: "—", body: "Wait for CONFIRM before touching code." },
         Skill { name: "rust-review", group: "skills", desc: "Ownership, lifetimes, error handling.", attach: "**/*.rs", body: "Check unwraps, clones in hot paths, error context." },
-        Skill { name: "planner", group: "personas", desc: "Turns an item into a plan of steps. Default agent: claude · opus.", attach: "plan, merge steps", body: "You plan. Restate the goal, list the steps, name the risks." },
-        Skill { name: "researcher", group: "personas", desc: "Looks one part up and reports findings. Default: claude · sonnet.", attach: "research steps", body: "You research one part of the item and report what you found, with sources." },
-        Skill { name: "coder", group: "personas", desc: "Writes the change and its tests. Default: claude · sonnet.", attach: "code steps", body: "You implement. Small commits, tests first where it helps." },
-        Skill { name: "reviewer", group: "personas", desc: "Reviews a diff for correctness first, style last. Default: rust-reviewer.", attach: "review steps", body: "You review changes. Report findings ranked by severity,\neach with a failing scenario. No praise, no nits unless asked." },
-        Skill { name: "writer", group: "personas", desc: "Writes analyses and docs. Default: claude · opus.", attach: "write-up steps", body: "You write for the maintainer: plain words, the verdict first." },
+        Skill { name: "planner", group: "personas", desc: "Turns an item into a plan of steps.", attach: "plan, merge steps", body: "You plan. Restate the goal, list the steps, name the risks." },
+        Skill { name: "researcher", group: "personas", desc: "Looks one part up and reports findings.", attach: "research steps", body: "You research one part of the item and report what you found, with sources." },
+        Skill { name: "coder", group: "personas", desc: "Writes the change and its tests.", attach: "code steps", body: "You implement. Small commits, tests first where it helps." },
+        Skill { name: "reviewer", group: "personas", desc: "Reviews a diff for correctness first, style last.", attach: "review steps", body: "You review changes. Report findings ranked by severity,\neach with a failing scenario. No praise, no nits unless asked." },
+        Skill { name: "writer", group: "personas", desc: "Writes analyses and docs.", attach: "write-up steps", body: "You write for the maintainer: plain words, the verdict first." },
         Skill { name: "architect", group: "personas", desc: "Designs before anyone codes: files, interfaces, build order.", attach: "plan steps", body: "You are a software architect. Read the code before proposing.\nAnswer with a blueprint: files, interfaces, data flow, build order." },
         Skill { name: "mod-item", group: "templates", desc: "Template for a MOD item body.", attach: "MOD items", body: "# Goal\n# Acceptance\n# Milestones\n# Notes" },
         Skill { name: "ana-item", group: "templates", desc: "Template for an ANA item body.", attach: "ANA items", body: "# Question\n# Method\n# Findings\n# Verdict" },
