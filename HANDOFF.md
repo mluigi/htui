@@ -216,6 +216,9 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   without the DSN leaving this box; how secrets reach it (`R-SEC-2`); collecting a branch from a
   container or a remote checkout; and `R-NF-2` (docker as an opt-in per-target dependency). Not
   blocked; read beside MOD-43, MOD-44 and MOD-47.
+  **Drafted (2026-10-17, `docs/ANA-42.md`):** verdict is a target record pointing at a box, the
+  executor staying on this box for the driven kinds, a forwarded relay socket, secrets injected, and
+  collection by bundle; spawns MOD-130, MOD-131, MOD-132. Stays open until the maintainer answers §8.
 
 ### Next features
 - [ ] **MOD-27 - Swarm RunKind & task MCP Tool (from ANA-13).** Add `RunKind::Swarm` to `htui-orch`, implement `spawn_subagent` MCP tool with JSON schema validation and isolated worktrees. `htui-orch`, its `Isolator` seam and `run_worker.rs` exist since MOD-4 (done, `docs/decisions/mod/mod-4.md`); the MCP half needs MOD-11.
@@ -410,6 +413,26 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   not the worker, resolves project secrets. Blocked on MOD-47. MOD-10 is done (`docs/decisions/mod/mod-10.md`):
   the executing box resolves a project's secrets with the machine identity in its own keyring; a headless worker
   without one refuses, and delivering it is this item's.
+- [ ] **MOD-130 - Execution targets: target record, child boxes, target cascade** (from ANA-42,
+  `docs/ANA-42.md` §7.1, §7.2, §7.8; **proposed, pending the maintainer's acceptance of §8**).
+  `R-ORCH-15`, `R-ORCH-12`, `R-BOX-1..4`, `R-NF-2`. Migration for a `target` record (`kind`, `locator`,
+  `box_id`, `status`) and `box.kind`/`parent_box_id` (relax the `os_family` CHECK for child boxes);
+  `target_id` at workspace, project, workflow and item with the Settings default and an inherited-from
+  resolver; the queue keys on `executing_box_id`, not `target_box_id == here`, so a driven target starts
+  on this box; the `R-NF-2` amendment (`dockerd` and `sshd` opt-in per target). Wires MOD-44's container
+  box to the record. Not blocked; read beside MOD-43 and MOD-44.
+- [ ] **MOD-131 - Driven targets: ssh and docker exec launch, MCP relay tunnel, remote bootstrap**
+  (from ANA-42, `docs/ANA-42.md` §7.2-§7.4, §7.6; **proposed, pending §8**). `R-ORCH-15`, `R-AGT-11`,
+  `R-AGT-5`, `R-SEC-2`, `R-BOX-4`. The `TargetTransport` launch decorator under `TransportBuilder` for
+  `ssh -T`, a docker context and `docker exec -i`; relay socket forwarding with the token as a stdin
+  preamble (spike stream-local forwarding and `sun_path` length first, §9); a per-target `htui` helper
+  path shipped from this box; remote probe, install and login through the channel; secrets injected into
+  the exec's environment. Blocked on MOD-130 and MOD-44.
+- [ ] **MOD-132 - Target preparation and branch collection by bundle** (from ANA-42,
+  `docs/ANA-42.md` §7.5, §7.6; **proposed, pending §8**). `R-ORCH-15`, `R-SEC-5`, `R-ENT-17`.
+  The `prepare · <target>` stage (clone with `pushurl` disabled, compose project on free ports) and the
+  `collect branch` step: `git bundle create` on the target, verify, fetch into a temp ref under fsck and
+  compare-and-swap, with `scripts/hr collect`'s refusals and config-path confirmation. Blocked on MOD-130.
 
 - [ ] **MOD-85 - Remaining accent (cyan) uses that do not mean focus or selection** (from MOD-80,
   `docs/decisions/mod/mod-80.md` "Carried"; blueprint B-6, review M1/L5). `R-TUI-1`. MOD-80 made
@@ -864,6 +887,6 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 13 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-33 step graphs v2 and divided fan-out, ANA-34 coordinator, ANA-35 entity model for any project, ANA-36 further MCP tools, ANA-37 Qdrant required?, ANA-38 project memory, ANA-39 mandatory context tools, ANA-40 Toolbox, ANA-41 project workflows, ANA-42 execution targets) |
-| MOD-N   | 47 (MOD-16 Windows verification, MOD-27 swarm, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-115 TUI shell, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
+| MOD-N   | 50 (MOD-16 Windows verification, MOD-27 swarm, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-115 TUI shell, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
 | CLEAN-N | 0 |
 | TOOL-N  | 2 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check) |
