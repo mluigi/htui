@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[ANA-40](docs/decisions/ana/ana-40.md)** - Toolbox: kinds of run tools and how to show them (concluded, 2026-10-17)
 - **[ANA-28](docs/decisions/ana/ana-28.md)** - `heavy_build`: queue switch vs required box capability (concluded, 2026-10-15)
 - **[TOOL-14](docs/decisions/tool/tool-14.md)** - Gate reports skipped Postgres suites (done, 2026-10-14)
 - **[CLEAN-12](docs/decisions/clean/clean-12.md)** - `.claude/` hygiene: lock file and generated Gortex skills untracked, installer headers name G6 (done, 2026-10-14)
