@@ -261,7 +261,7 @@ async fn the_open_list_follows_a_park_without_reopening() {
     let mut harness = platform(&store).await;
     harness.key("ctrl-w");
     let before = harness.render();
-    assert!(before.contains("> FEAT-2"), "{before}");
+    assert!(before.contains("\u{258c} FEAT-2"), "{before}");
     assert!(!before.contains("plan 1.1"), "{before}");
 
     park_ana_2(&store).await;
@@ -270,7 +270,7 @@ async fn the_open_list_follows_a_park_without_reopening() {
     let after = harness.render();
     assert!(after.contains("  ANA-2"), "{after}");
     assert!(after.contains("plan 1.1"), "{after}");
-    assert!(after.contains("> FEAT-2  \u{2014}"), "{after}");
+    assert!(after.contains("\u{258c} FEAT-2  \u{2014}"), "{after}");
 }
 
 /// Plan D8: `Enter` closes the list and lands on the row's step in the Runs pane.

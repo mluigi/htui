@@ -2,6 +2,10 @@
 //! `Waiting` reply, read straight from `ctx.top_bar.waiting`, so the list holds nothing but its
 //! cursor and refreshes on every tick with no request of its own. `Enter` reveals the row's step;
 //! the Runs pane stays the one place that answers (PRD scope).
+//!
+//! Drawn on the MOD-115 kit: [`Modal`] is the frame, `kit::list` the rows (the `▌` gutter and the
+//! selection band mark the cursor), `kit::empty` the empty state, and the key hint sits on the
+//! modal's bottom border.
 
 use std::cell::Cell;
 
@@ -9,33 +13,32 @@ use htui_core::model::{ItemId, RunId, Scope, StepId};
 use htui_worker::{WaitingReason, WaitingRow, WaitingView};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::text::Line;
+use ratatui::widgets::Paragraph;
 
 use crate::app::{Action, Ctx, Handled, OverlayAction, RevealTarget};
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
-use crate::ui::cells::{self, cell_width};
-use crate::ui::layout::centered;
+use crate::ui::cells::{self, cell_width, clip_line};
+use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::list::{self, Row, RowKind};
+use crate::ui::kit::modal::{Modal, ModalSize};
 use crate::ui::overlay::registry::{Overlay, OverlayId};
 use crossterm::event::KeyEvent;
 
-/// Marker in front of the row the cursor is on (the switcher's, `workspace_switcher.rs`): a
-/// snapshot records symbols and not styles.
-const CURSOR: &str = "> ";
+/// The margin in front of every row, after the list's gutter, so the columns stay put whether or
+/// not a row is selected.
+const LEAD: &str = " ";
 
-/// The marker's width, in front of every other line, so the columns stay put.
-const NO_CURSOR: &str = "  ";
+/// What a note leads with, to line up under the rows: the gutter's column, then [`LEAD`].
+const NOTE_LEAD: &str = "  ";
 
 /// Gap between two columns.
 const GAP: &str = "  ";
 
-/// Left border, right border and one column of right padding.
-const CHROME: u16 = 3;
-
-/// The line under the list (MOD-67 D9): `list.down`/`list.up` and `waiting.open` are handled
-/// here, `overlay.close` by the shell.
+/// The hint on the modal's bottom border (MOD-67 D9): `list.down`/`list.up` and `waiting.open`
+/// are handled here, `overlay.close` by the shell.
 const HINT: HintSpec = &[
     Hint::Pair(Act::ListDown, Act::ListUp, "move"),
     Hint::One(Act::WaitingOpen, "open"),
@@ -44,6 +47,9 @@ const HINT: HintSpec = &[
 
 /// What a reply with no row says.
 const EMPTY: &str = "nothing is waiting on you";
+
+/// The empty state's next step: where a waiting row comes from.
+const EMPTY_NEXT: &str = "a gate, a permission request or a blocked item will appear here";
 
 /// What the list says before the first `Waiting` reply (blueprint A-6).
 const READING: &str = "reading the store";
@@ -131,50 +137,48 @@ impl WaitingList {
         }));
     }
 
-    /// The box's contents: the visible rows (or the empty or reading line), the offline or
-    /// unreadable line when permissions are unknown, a blank line, then `hint` (the rendered
-    /// [`HINT`]).
-    ///
-    /// `text_width` is the room the text column gets; `None` is its widest text, unclipped.
-    /// `visible` is how many rows fit: the window always holds the cursor.
-    fn lines(
-        &self,
-        waiting: Option<&WaitingView>,
-        text_width: Option<usize>,
-        visible: usize,
-        hint: &str,
-        theme: &Theme,
-    ) -> Vec<Line<'static>> {
-        let mut lines = match waiting {
-            None => vec![Line::styled(format!("{NO_CURSOR}{READING}"), theme.dim)],
-            Some(view) if view.rows.is_empty() => {
-                vec![Line::styled(format!("{NO_CURSOR}{EMPTY}"), theme.dim)]
-            }
-            Some(view) => {
-                let columns = Columns::of(&view.rows);
-                let text_width = text_width.unwrap_or(columns.text);
-                let at = self.at(&view.rows).unwrap_or(0);
-                let first = if visible > 0 && at >= visible {
-                    at + 1 - visible
-                } else {
-                    0
-                };
-                view.rows
-                    .iter()
-                    .enumerate()
-                    .skip(first)
-                    .take(visible)
-                    .map(|(index, row)| row_line(row, index == at, &columns, text_width, theme))
-                    .collect()
-            }
+    /// The note lines under the list: the reading line before the first reply, and the offline
+    /// or unreadable line when permissions are unknown. They stay in view while the rows scroll.
+    fn notes(waiting: Option<&WaitingView>, theme: &Theme) -> Vec<Line<'static>> {
+        let Some(view) = waiting else {
+            return vec![Line::styled(format!("{NOTE_LEAD}{READING}"), theme.dim)];
         };
-        if let Some(view) = waiting.filter(|view| !view.permissions_known) {
-            let why = if view.offline { OFFLINE } else { UNREADABLE };
-            lines.push(Line::styled(format!("{NO_CURSOR}{why}"), theme.dim));
+        if view.permissions_known {
+            return Vec::new();
         }
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(format!("{NO_CURSOR}{hint}"), theme.dim));
-        lines
+        let why = if view.offline { OFFLINE } else { UNREADABLE };
+        vec![Line::styled(format!("{NOTE_LEAD}{why}"), theme.dim)]
+    }
+}
+
+/// What fills the box above its notes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Body {
+    /// No reply yet: only the reading note.
+    Nothing,
+    /// A reply with no row: the empty state (two lines).
+    Empty,
+    /// This many rows.
+    Rows(usize),
+}
+
+impl Body {
+    /// Which body `waiting` has.
+    fn of(waiting: Option<&WaitingView>) -> Self {
+        match waiting {
+            None => Self::Nothing,
+            Some(view) if view.rows.is_empty() => Self::Empty,
+            Some(view) => Self::Rows(view.rows.len()),
+        }
+    }
+
+    /// Its height in rows when nothing is cut.
+    const fn height(self) -> usize {
+        match self {
+            Self::Nothing => 0,
+            Self::Empty => 2,
+            Self::Rows(n) => n,
+        }
     }
 }
 
@@ -201,9 +205,10 @@ impl Columns {
         }
     }
 
-    /// Everything in front of the text: the marker, three padded columns and their gaps.
-    fn prefix(&self) -> usize {
-        cell_width(CURSOR) + self.key + self.step + self.label + 3 * cell_width(GAP)
+    /// A whole row, text unclipped: the gutter, the lead, three padded columns, their gaps and the
+    /// text.
+    fn row_width(&self) -> usize {
+        1 + cell_width(LEAD) + self.key + self.step + self.label + 3 * cell_width(GAP) + self.text
     }
 }
 
@@ -216,41 +221,22 @@ fn step_text(row: &WaitingRow) -> &str {
     }
 }
 
-/// One row: `{marker}{key}{GAP}{step}{GAP}{label}{GAP}{text}`, the first three padded to their
-/// column and the text clipped to `text_width`, never wrapped.
-fn row_line(
-    row: &WaitingRow,
-    selected: bool,
-    columns: &Columns,
-    text_width: usize,
-    theme: &Theme,
-) -> Line<'static> {
-    let marker = if selected { CURSOR } else { NO_CURSOR };
-    let style = if selected { theme.accent } else { theme.base };
-    Line::styled(
-        format!(
-            "{marker}{}{GAP}{}{GAP}{}{GAP}{}",
-            cells::fit(&row.item_key, columns.key),
-            cells::fit(step_text(row), columns.step),
-            cells::fit(row.reason.label(), columns.label),
-            cells::clip(&row.text, text_width),
+/// One row: `{LEAD}{key}{GAP}{step}{GAP}{label}{GAP}{text}`, the first three padded to their
+/// column. The text is whole: the list cuts it at the box's edge with an ellipsis.
+fn item_row(row: &WaitingRow, columns: &Columns, theme: &Theme) -> Row<'static> {
+    Row {
+        line: Line::styled(
+            format!(
+                "{LEAD}{}{GAP}{}{GAP}{}{GAP}{}",
+                cells::fit(&row.item_key, columns.key),
+                cells::fit(step_text(row), columns.step),
+                cells::fit(row.reason.label(), columns.label),
+                row.text,
+            ),
+            theme.base,
         ),
-        style,
-    )
-}
-
-/// The widest of `lines`, in cells (the switcher's MOD-60 B3 measure).
-fn widest(lines: &[Line<'_>]) -> usize {
-    lines
-        .iter()
-        .map(|line| {
-            line.spans
-                .iter()
-                .map(|span| cell_width(&span.content))
-                .sum::<usize>()
-        })
-        .max()
-        .unwrap_or(0)
+        kind: RowKind::Item,
+    }
 }
 
 impl Overlay for WaitingList {
@@ -315,36 +301,67 @@ impl Overlay for WaitingList {
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let waiting = ctx.top_bar.waiting.as_ref();
         let rows = waiting.map_or(&[][..], |view| view.rows.as_slice());
+        let theme = ctx.theme;
         let columns = Columns::of(rows);
-        let fixed = 2 + usize::from(waiting.is_some_and(|view| !view.permissions_known));
-
-        // The natural size: every row, every text whole.
+        let body = Body::of(waiting);
+        let notes = Self::notes(waiting, theme);
         let hint = ctx.keys().hint(views::WAITING_LIST, HINT);
-        let natural = self.lines(waiting, None, usize::MAX, &hint, ctx.theme);
-        let width = u16::try_from(widest(&natural))
-            .unwrap_or(u16::MAX)
-            .saturating_add(CHROME)
-            .min(area.width.saturating_sub(4));
-        let height = u16::try_from(natural.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(2)
-            .min(area.height.saturating_sub(2));
 
-        let room = usize::from(width.saturating_sub(CHROME));
-        let text_width = room.saturating_sub(columns.prefix());
-        let visible = usize::from(height.saturating_sub(2)).saturating_sub(fixed);
-        let lines = self.lines(waiting, Some(text_width), visible, &hint, ctx.theme);
+        // The natural size: every row, every text whole, the hint whole on the border.
+        let widest = [
+            columns.row_width(),
+            cell_width(EMPTY).max(cell_width(EMPTY_NEXT)),
+            cell_width(&hint) + 1,
+        ]
+        .into_iter()
+        .chain(notes.iter().map(Line::width))
+        .max()
+        .unwrap_or(0);
+        let content = Modal::new(self.title())
+            .size(ModalSize::Fit {
+                content_w: u16::try_from(widest).unwrap_or(u16::MAX),
+                content_h: u16::try_from(body.height() + notes.len()).unwrap_or(u16::MAX),
+            })
+            .hint(&hint)
+            .render(frame, area, theme);
 
-        let box_area = centered(area, width, height);
-        frame.render_widget(Clear, box_area);
-        frame.render_widget(
-            Paragraph::new(Text::from(lines)).block(
-                Block::new()
-                    .borders(Borders::ALL)
-                    .title(Span::styled(format!(" {} ", self.title()), ctx.theme.title)),
-            ),
-            box_area,
-        );
+        // The notes keep the bottom rows; the body takes what is left above them.
+        let note_rows = u16::try_from(notes.len()).unwrap_or(u16::MAX);
+        let body_area = Rect {
+            height: content.height.saturating_sub(note_rows),
+            ..content
+        };
+        match body {
+            Body::Nothing => {}
+            Body::Empty => empty::render(frame, body_area, EMPTY, NextStep(EMPTY_NEXT), theme),
+            Body::Rows(total) => {
+                let at = self.at(rows).unwrap_or(0);
+                let offset = list::scroll_into_view(at, 0, usize::from(body_area.height), total);
+                let item_rows: Vec<Row<'static>> = rows
+                    .iter()
+                    .map(|row| item_row(row, &columns, theme))
+                    .collect();
+                list::render(
+                    frame,
+                    body_area,
+                    &item_rows,
+                    Some(at),
+                    offset,
+                    theme.accent,
+                    theme,
+                );
+            }
+        }
+        let notes_area = Rect {
+            y: body_area.bottom().min(content.bottom()),
+            height: content.height - body_area.height,
+            ..content
+        };
+        let notes: Vec<Line<'static>> = notes
+            .into_iter()
+            .map(|line| clip_line(line, notes_area.width))
+            .collect();
+        frame.render_widget(Paragraph::new(notes), notes_area);
     }
 }
 
@@ -555,7 +572,7 @@ mod tests {
         bench.top_bar.waiting = Some(view(resorted.clone()));
         assert_eq!(list.at(&resorted), Some(2));
         let rendered = bench.render(&list);
-        assert!(rendered.contains("> FEAT-2 "), "{rendered}");
+        assert!(rendered.contains("\u{258c} FEAT-2 "), "{rendered}");
         bench.code(&mut list, KeyCode::Enter);
         assert_closes_then_reveals(&bench.emit.take(), &rows[1]);
 
@@ -573,11 +590,11 @@ mod tests {
         let mut bench = Bench::over(Some(view(rows.clone())));
         let mut list = WaitingList::new();
         let opened = bench.render(&list);
-        assert!(opened.contains("> FEAT-2 "), "{opened}");
+        assert!(opened.contains("\u{258c} FEAT-2 "), "{opened}");
 
         bench.top_bar.waiting = Some(view(vec![gate("ANA-2", ids::HTUI_ANA_2), rows[0].clone()]));
         let rendered = bench.render(&list);
-        assert!(rendered.contains("> FEAT-2 "), "{rendered}");
+        assert!(rendered.contains("\u{258c} FEAT-2 "), "{rendered}");
         bench.code(&mut list, KeyCode::Enter);
         assert_closes_then_reveals(&bench.emit.take(), &rows[0]);
     }
@@ -686,33 +703,90 @@ mod tests {
 
     #[test]
     fn a_row_reads_key_step_reason_and_text() {
-        let view = view(vec![
+        let rows = vec![
             gate("ANA-2", ids::HTUI_ANA_2),
             permission("ANA-2", ids::HTUI_ANA_2),
             reopen("FEAT-2", ids::HTUI_FEAT_2),
-        ]);
-        let list = WaitingList::new();
-        let lines = list.lines(Some(&view), None, usize::MAX, &hint(), &Theme::default());
+        ];
+        let columns = Columns::of(&rows);
+        let lines: Vec<Line<'static>> = rows
+            .iter()
+            .map(|row| item_row(row, &columns, &Theme::default()).line)
+            .collect();
         assert_eq!(
             texts(&lines),
             vec![
-                "> ANA-2   prd 0.1  gate        gate",
-                "  ANA-2   prd 0.1  permission  edit: src/lib.rs",
-                "  FEAT-2  \u{2014}        unblock     blocked, no active run: u reopens it",
-                "",
-                "  j/k move · Enter open · Esc close",
+                " ANA-2   prd 0.1  gate        gate",
+                " ANA-2   prd 0.1  permission  edit: src/lib.rs",
+                " FEAT-2  \u{2014}        unblock     blocked, no active run: u reopens it",
             ]
         );
     }
 
     #[test]
+    fn the_hint_sits_on_the_bottom_border() {
+        let bench = Bench::over(Some(view(vec![gate("ANA-2", ids::HTUI_ANA_2)])));
+        let rendered = bench.render(&WaitingList::new());
+        let border = rendered
+            .lines()
+            .find(|line| line.contains(&hint()))
+            .unwrap_or_else(|| panic!("the hint is drawn: {rendered}"));
+        assert!(
+            border.contains('\u{2570}'),
+            "on the bottom border: {border}"
+        );
+    }
+
+    #[test]
+    fn the_selected_row_is_marked_by_the_gutter_and_the_others_are_not() {
+        let bench = Bench::over(Some(view(vec![
+            gate("ANA-2", ids::HTUI_ANA_2),
+            reopen("FEAT-2", ids::HTUI_FEAT_2),
+        ])));
+        let rendered = bench.render(&WaitingList::new());
+        assert!(rendered.contains("\u{258c} ANA-2 "), "{rendered}");
+        assert!(rendered.contains("\u{2502}  FEAT-2 "), "{rendered}");
+        assert_eq!(rendered.matches('\u{258c}').count(), 1, "{rendered}");
+    }
+
+    #[test]
+    fn the_selected_row_is_still_marked_without_colour() {
+        let mut bench = Bench::over(Some(view(vec![gate("ANA-2", ids::HTUI_ANA_2)])));
+        bench.theme = Theme::monochrome();
+        let mut term = Terminal::new(TestBackend::new(100, 30)).expect("a test backend");
+        term.draw(|frame| WaitingList::new().render(frame, frame.area(), &bench.ctx()))
+            .expect("the overlay draws");
+        let buffer = term.backend().buffer();
+        let marked = buffer
+            .content()
+            .iter()
+            .filter(|cell| cell.symbol() == "\u{258c}")
+            .count();
+        assert_eq!(marked, 1, "the gutter is drawn in monochrome too");
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .all(|cell| cell.fg == ratatui::style::Color::Reset
+                    && cell.bg == ratatui::style::Color::Reset),
+            "no colour anywhere"
+        );
+    }
+
+    #[test]
+    fn the_empty_state_carries_a_next_step() {
+        let bench = Bench::over(Some(view(Vec::new())));
+        let rendered = bench.render(&WaitingList::new());
+        assert!(rendered.contains(EMPTY), "{rendered}");
+        assert!(rendered.contains(EMPTY_NEXT), "{rendered}");
+    }
+
+    #[test]
     fn before_the_first_reply_it_says_reading() {
-        let list = WaitingList::new();
-        let lines = list.lines(None, None, usize::MAX, &hint(), &Theme::default());
-        assert_eq!(texts(&lines)[0], format!("{NO_CURSOR}{READING}"));
-        let rendered = Bench::over(None).render(&list);
+        let rendered = Bench::over(None).render(&WaitingList::new());
         assert!(rendered.contains(READING), "{rendered}");
         assert!(!rendered.contains(OFFLINE), "{rendered}");
+        assert!(!rendered.contains(EMPTY), "{rendered}");
     }
 
     #[test]
@@ -726,9 +800,29 @@ mod tests {
             bench.code(&mut list, KeyCode::Char('j'));
         }
         let rendered = bench.render(&list);
-        assert!(rendered.contains("> FEAT-35 "), "{rendered}");
+        assert!(rendered.contains("\u{258c} FEAT-35 "), "{rendered}");
         assert!(!rendered.contains("FEAT-1 "), "{rendered}");
         assert!(rendered.contains(&hint()), "{rendered}");
+    }
+
+    #[test]
+    fn the_note_stays_in_view_while_a_long_list_scrolls() {
+        let rows: Vec<WaitingRow> = (1..=40)
+            .map(|n| reopen(&format!("FEAT-{n}"), ItemId::new()))
+            .collect();
+        let bench = Bench::over(Some(WaitingView {
+            working: 0,
+            rows,
+            permissions_known: false,
+            offline: true,
+        }));
+        let mut list = WaitingList::new();
+        for _ in 0..39 {
+            bench.code(&mut list, KeyCode::Char('j'));
+        }
+        let rendered = bench.render(&list);
+        assert!(rendered.contains("\u{258c} FEAT-40 "), "{rendered}");
+        assert!(rendered.contains(OFFLINE), "{rendered}");
     }
 
     #[test]
