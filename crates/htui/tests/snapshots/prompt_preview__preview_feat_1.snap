@@ -2,8 +2,7 @@
 source: crates/htui/tests/prompt_preview.rs
 expression: frame
 ---
-Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
- 1 Backlog
+Platform   ¹Backlog                                                                                                                 1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
 ┌ Backlog (11) ──────────────────────────────────────────────────────────────────────────────────────────────┐┌ FEAT-1 ────────────────────────────────────────────────────────────────────────────────┐
 │▾ htui (8)                                                                                                  ││ Body Runs Graph Docs Notes Prompt Reqs                                                 │
 │  ANA-1    done               Data model, box registry and sync topology                                    ││template  prd v1                                                                        │
@@ -59,6 +58,7 @@ Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
 │                                                                                                            ││- Editing anything. Filters, actions and the item editor are MOD-13.                    │
 │                                                                                                            ││- Driving an agent; the chat tab is MOD-2.                                              │
 │                                                                                                            ││- Any real database. MOD-1 runs against the in-memory store and its demo fixture.       │
-└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────────────────────┘
-j/k move · h/l sub-tab · f filter · N new · e edit
-q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help
+│                                                                                                            ││                                                                                        │
+│                                                                                                            ││Done when                                                                               │
+│                                                                                                            ││- `cargo run -- --demo` opens on the backlog of the Platform workspace.                 │
+└─j/k move · h/l sub-tab · f filter · N new · e edit─────────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────────────────────┘

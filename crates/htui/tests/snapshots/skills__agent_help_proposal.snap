@@ -2,8 +2,7 @@
 source: crates/htui/tests/skills.rs
 expression: frame
 ---
-Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
- 1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
+Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat         0 working · 0 waiting · memory
  Skills │ Templates
 ┌ proposal from scripted · sent → proposed ────────────────────────────────────────────────────────┐
 │--- sent                                                                                          │
@@ -28,7 +27,7 @@ Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
-
-Enter accept · n/Esc discard · J/K scroll · PgUp/PgDn page
-Ctrl+c quit · Tab next tab · Shift+Tab previous tab · F1 help · Ctrl+f find · Ctrl+w waiting · Ctrl+
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└─Enter accept · n/Esc discard · J/K scroll · PgUp/PgDn page───────────────────────────────────────┘

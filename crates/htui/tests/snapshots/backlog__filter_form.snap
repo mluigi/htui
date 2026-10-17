@@ -2,8 +2,7 @@
 source: crates/htui/tests/backlog.rs
 expression: frame
 ---
-Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
- 1 Backlog
+Platform   ¹Backlog             1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
 ┌ Backlog (11) ───────────────────────────────────────┐┌ ANA-1 ────────────────────────────────────┐
 │▾ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │
 │  ANA-1    done               Data model, box regist…││Data model, box registry and sync topology │
@@ -23,12 +22,13 @@ Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
 │                                                     ││                                           │
 │                                                     ││Item keys are minted from a per-project    │
 │                                                     ││counter table, which keeps numbers gapless │
-└─────────────────────────────────────────────────────┘│and lets the legacy importer align the     │
-┌ Filter ─────────────────────────────────────────────┐│counter above the numbers it brings in.    │
+│                                                     ││and lets the legacy importer align the     │
+│                                                     ││counter above the numbers it brings in.    │
+│                                                     ││                                           │
+└─────────────────────────────────────────────────────┘│                                           │
+┌ Filter ─────────────────────────────────────────────┐│                                           │
 │  status  ‹[x] done›  done                           ││                                           │
 │  project ‹[ ] htui›  any                            ││                                           │
 │> tags    rust                                       ││                                           │
 │  ready   [ ] only what this box can start           ││                                           │
-└─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
-comma list · Tab row · Enter apply · Esc cancel
-Ctrl+c quit · F1 help
+└─comma list · Tab row · Enter apply · Esc cancel─────┘└───────────────────────────────────────────┘

@@ -2,8 +2,7 @@
 source: crates/htui/tests/skills.rs
 expression: frame
 ---
-Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
- 1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
+Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat         0 working · 0 waiting · memory
  Skills │ Templates
 ┌ rust-style · editing from v2, saves v4 · ~42 tokens ─────────────────────────────────────────────┐
 │XPrefer `expect` with a reason. One error enum per crate.                                         │
@@ -27,8 +26,9 @@ Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└─Ctrl+s save · Ctrl+g ask agent · Ctrl+e $EDITOR · Esc cancel · L1:C2─────────────────────────────┘
  saved elsewhere since you opened it — v3 is now the latest; your draft is kept and Ctrl+s saves it
  as v4
-Ctrl+s save · Ctrl+g ask agent · Ctrl+e $EDITOR · Esc cancel · L1:C2
-Ctrl+c quit · Tab next tab · Shift+Tab previous tab · F1 help · Ctrl+f find · Ctrl+w waiting · Ctrl+

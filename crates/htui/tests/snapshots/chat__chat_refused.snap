@@ -2,8 +2,7 @@
 source: crates/htui/tests/chat.rs
 expression: harness.render()
 ---
-Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
- 1 Chat
+Graphics   ¹Chat                                        chat_start: no agent runtime in this harness
 ┌ Chat ────────────────────────────────────────────────────────────────────────────────────────────┐
 │agy · gemini-3.7-flash-high · Vulkan Tutorials · session —                                        │
 │no agent runtime in this harness                                                                  │
@@ -29,6 +28,7 @@ Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
-i compose the first prompt · a next agent
-chat_start: no agent runtime in this harness
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└─i compose the first prompt · a next agent────────────────────────────────────────────────────────┘

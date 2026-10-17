@@ -2,8 +2,7 @@
 source: crates/htui/src/app/pane.rs
 expression: text(buffer)
 ---
-no workspace · no box ·  · 0 working · 0 waiting
- 1 asker  2 other
+no workspace   ¹asker  ²other                                         editing in asker · Ctrl+4 back
 ┌ other ───────────────────────────────────────────────────────────────────────────────────────────┐
 │VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIE│
 │VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIE│
@@ -29,6 +28,7 @@ no workspace · no box ·  · 0 working · 0 waiting
 │VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIE│
 │VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIE│
 │VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIE│
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
-
-editing in asker · Ctrl+4 back · q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? h

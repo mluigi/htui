@@ -2,12 +2,14 @@
 source: crates/htui/tests/hierarchy.rs
 expression: harness.render()
 ---
-Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
- 1 Settings
+Graphics   ¹Settings            0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
 ┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
 │ Agents  Hierarchy                                                                                │
 │Graphics (graphics) — root on this box: unset                                                     │
 │  vulkan-tutorials  Vulkan Tutorials                                                              │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -29,6 +31,4 @@ Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
 │Nothing here can be undone.                                                                       │
 │Type `vulkan-tutorials` to confirm:                                                               │
 │                                                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
-Enter confirm · Esc stop
-Ctrl+c quit · F1 help
+└─Enter confirm · Esc stop─────────────────────────────────────────────────────────────────────────┘

@@ -2,19 +2,19 @@
 source: crates/htui/tests/concepts_search.rs
 expression: frame
 ---
-Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
- 1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
+Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat         1 working · 1 waiting · memory
 ┌ Backlog (11) ───────────────────────────────────────┐┌ ANA-1 ────────────────────────────────────┐
 │▾ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │
 │  ANA-1    done               Data model, box regist…││Data model, box registry and sync topology │
 │  ANA-2    open               Orchestrator step grap…││ANA-1  ANA  done                           │
+│  CLEAN-1  failed             Drop the legacy markdo…││no tags · priority 0 · version 1           │
 │ ┌ Search concepts ─────────────────────────────────────────────────────────────────────────────┐ │
 │ │scope all projects · decisions off                                                            │ │
 │ │query                                                                                         │ │
 │ │                                                                                              │ │
 │ │                                                                                              │ │
-│ │                                                                                              │ │
 │▾│                                                                                              │a│
+│ │                                                                                              │ │
 │ │                                                                                              │ │
 │ │                                                                                              │ │
 │ │                                                                                              │ │
@@ -29,6 +29,6 @@ Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
 └─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
-
-Ctrl+c quit · F1 help

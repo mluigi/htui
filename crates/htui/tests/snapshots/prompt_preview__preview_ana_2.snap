@@ -2,8 +2,7 @@
 source: crates/htui/tests/prompt_preview.rs
 expression: frame
 ---
-Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
- 1 Backlog
+Platform   ¹Backlog             1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
 ┌ Backlog (11) ───────────────────────────────────────┐┌ ANA-2 ────────────────────────────────────┐
 │▾ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │
 │  ANA-1    done               Data model, box regist…││template  prd v1                           │
@@ -29,6 +28,7 @@ Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
 │                                                     ││          preview: phase-level skills come │
 │                                                     ││          preview: output_kind defaults to │
 │                                                     ││          preview: command_queue exposure i│
-└─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
-j/k move · h/l sub-tab · f filter · N new · e edit
-q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help
+│                                                     ││          preview: attempt 1, so verify_fai│
+│                                                     ││          preview: no run exists, so no run│
+│                                                     ││          preview: no phase of this item's │
+└─j/k move · h/l sub-tab · f filter · N new · e edit──┘└───────────────────────────────────────────┘

@@ -2,8 +2,7 @@
 source: crates/htui/tests/skills.rs
 expression: frame
 ---
-Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
- 1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
+Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat         1 working · 1 waiting · memory
  Skills │ Templates
 ┌ attachments · tests ─────────────────────────────────────────────────────────────────────────────┐
 │  global                       —                                                                  │
@@ -19,6 +18,9 @@ Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
 │    feature › review           —                                                                  │
 │    refactor › plan            —                                                                  │
 │    refactor › implement       —                                                                  │
+│    refactor › review          —                                                                  │
+│    tooling › plan             —                                                                  │
+│    tooling › implement        —                                                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ edit tests · htui ───────────────────────────────────────────────────────────────────────────────┐
 │activation  glob  (Space cycles)                                                                  │
@@ -28,7 +30,4 @@ Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
 │globs       src/**                                                                                │
 │effective:  src/**, **/*.rs, **/Cargo.toml                                                        │
 │a bare glob matches in every repo of the project; <repo>:<glob> matches in that repo only         │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
-
-Tab/Down field · Space activation · Ctrl+r repo · Ctrl+s save · Esc cancel
-Ctrl+c quit · F1 help · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue
+└─Tab/Down field · Space activation · Ctrl+r repo · Ctrl+s save · Esc cancel───────────────────────┘

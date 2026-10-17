@@ -2,8 +2,7 @@
 source: crates/htui/tests/waiting.rs
 expression: frame
 ---
-Platform · DESKTOP-HTUI · memory · 1 working · 3 waiting
- 1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
+Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat         1 working · 3 waiting · memory
 ┌ Backlog (11) ───────────────────────────────────────┐┌ ANA-1 ────────────────────────────────────┐
 │▾ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │
 │  ANA-1    done               Data model, box regist…││Data model, box registry and sync topology │
@@ -14,13 +13,13 @@ Platform · DESKTOP-HTUI · memory · 1 working · 3 waiting
 │  FEAT-3   queued             Postgres store and cac…││other module reaches through, so it is     │
 │  FIX-1    closed             Terminal left raw afte…││settled first.                             │
 │  TOOL-1   awaiting_approval  CI matrix for the thre…││                                           │
-│▾ agy (3)     ┌ Waiting on you ─────────────────────────────────────────────────────┐y box keeps a│
-│  ANA-1    don│> ANA-2   plan 1.1  gate        gate                                 │n connect.   │
-│  FEAT-1   ope│  ANA-2   plan 1.1  permission  edit: src/lib.rs                     │a version    │
-│  FIX-1    ope│  FEAT-2  —         unblock     blocked, no active run: u reopens it │own against  │
-│              │                                                                     │n silently   │
-│              │  j/k move · Enter open · Esc close                                  │             │
-│              └─────────────────────────────────────────────────────────────────────┘             │
+│▾ agy (3)                                            ││Postgres holds the truth; every box keeps a│
+│  ANA-1    done               Prompt assembly survey ││read-only cache it refreshes on connect.   │
+│  FEAT-1   ope╭ Waiting on you ─────────────────────────────────────────────────────╮a version    │
+│  FIX-1    ope│▌ ANA-2   plan 1.1  gate        gate                                 │own against  │
+│              │  ANA-2   plan 1.1  permission  edit: src/lib.rs                     │n silently   │
+│              │  FEAT-2  —         unblock     blocked, no active run: u reopens it │             │
+│              ╰ j/k move · Enter open · Esc close ──────────────────────────────────╯             │
 │                                                     ││Item keys are minted from a per-project    │
 │                                                     ││counter table, which keeps numbers gapless │
 │                                                     ││and lets the legacy importer align the     │
@@ -29,6 +28,7 @@ Platform · DESKTOP-HTUI · memory · 1 working · 3 waiting
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
 └─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
-
-Ctrl+c quit · ? help
