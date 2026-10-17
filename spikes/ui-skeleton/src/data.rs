@@ -87,6 +87,9 @@ pub struct Target {
 pub struct WfStep {
     pub id: String,
     pub name: String,
+    /// Who the step needs (a persona from the Toolbox: planner, coder, reviewer…). Empty: a check.
+    pub persona: String,
+    /// The agent that plays it; "persona's default" leaves it to the persona.
     pub agent: String,
     /// A fan-out: (part, agent) per parallel agent. Empty: one agent. At run time a planner may
     /// split it differently.
@@ -129,11 +132,26 @@ pub struct Workflow {
     pub links: Vec<WfLink>,
     /// Bumped on every edit, so cached graphs are rebuilt.
     pub version: usize,
+    /// Where items using it run, if the workflow pins it (an index into `targets`). Item > workflow
+    /// > project > workspace > Settings.
+    pub target: Option<usize>,
 }
 
 fn st(id: &str, name: &str, agent: &str, parts: &[(&str, &str)]) -> WfStep {
-    WfStep { id: id.into(), name: name.into(), agent: agent.into(), parts: parts.iter().map(|(p, a)| (p.to_string(), a.to_string())).collect() }
+    let persona = match id {
+        "plan" | "merge" => "planner",
+        "research" => "researcher",
+        "code" => "coder",
+        "review" => "reviewer",
+        "write" => "writer",
+        _ => "",
+    };
+    WfStep { id: id.into(), name: name.into(), persona: persona.into(), agent: agent.into(), parts: parts.iter().map(|(p, a)| (p.to_string(), a.to_string())).collect() }
 }
+
+/// The personas a step can ask for (Toolbox → personas), and each one's default agent.
+pub const PERSONAS: [(&str, &str); 6] =
+    [("planner", "claude · opus"), ("researcher", "claude · sonnet"), ("coder", "claude · sonnet"), ("reviewer", "rust-reviewer"), ("writer", "claude · opus"), ("architect", "claude · opus")];
 
 fn ln(from: &str, to: &str, kind: &'static str) -> WfLink {
     WfLink { from: from.into(), to: to.into(), kind }
@@ -154,6 +172,7 @@ pub fn workflows() -> Vec<Workflow> {
                 ln("gate", "code", "fails"),
             ],
             version: 0,
+            target: None,
         },
         Workflow {
             name: "research fan-out",
@@ -177,6 +196,7 @@ pub fn workflows() -> Vec<Workflow> {
                 ln("gate", "code", "fails"),
             ],
             version: 0,
+            target: None,
         },
         Workflow {
             name: "quick fix",
@@ -185,6 +205,7 @@ pub fn workflows() -> Vec<Workflow> {
             steps: vec![st("code", "code · fix + test", "claude · sonnet", &[]), st("review", "review", "rust-reviewer", &[]), st("gate", "gate", "cargo test", &[])],
             links: vec![ln("code", "review", "next"), ln("review", "code", "changes requested"), ln("review", "gate", "approved"), ln("gate", "code", "retries")],
             version: 0,
+            target: None,
         },
         Workflow {
             name: "analysis",
@@ -198,6 +219,7 @@ pub fn workflows() -> Vec<Workflow> {
             ],
             links: vec![ln("plan", "research", "next"), ln("research", "write", "next"), ln("write", "review", "next"), ln("review", "write", "changes requested")],
             version: 0,
+            target: None,
         },
     ]
 }
@@ -506,7 +528,7 @@ pub fn catalogue() -> Catalogue {
             ]),
             t("cloud emulator", vec![
                 // floci is a family: one container per cloud, each serving every service it has.
-                kind("floci", "floci/floci", 4566, &["latest", "nightly"], &["aws", "azure", "gcp", "oci"]),
+                kind("floci", "floci/floci", 4566, &["latest", "nightly"], &["AWS", "Azure", "GCP", "Oracle", "console"]),
                 kind("localstack", "localstack/localstack", 4566, &["4.5", "4.4", "latest"], &["s3", "sqs", "sns", "dynamodb", "lambda", "kinesis", "secretsmanager"]),
                 kind("elasticmq", "softwaremill/elasticmq-native", 9324, &["1.6"], &["sqs"]),
                 kind("azurite", "mcr.microsoft.com/azure-storage/azurite", 10000, &["latest"], &["blob", "queue", "table"]),
@@ -650,8 +672,12 @@ pub fn mock() -> Data {
         Skill { name: "handoff-add", group: "skills", desc: "Create a HANDOFF item from one line.", attach: "**/HANDOFF.md", body: "Mint the ID, write the checklist line, recount, validate." },
         Skill { name: "plan", group: "skills", desc: "Restate requirements and write a step plan.", attach: "—", body: "Wait for CONFIRM before touching code." },
         Skill { name: "rust-review", group: "skills", desc: "Ownership, lifetimes, error handling.", attach: "**/*.rs", body: "Check unwraps, clones in hot paths, error context." },
+        Skill { name: "planner", group: "personas", desc: "Turns an item into a plan of steps. Default agent: claude · opus.", attach: "plan, merge steps", body: "You plan. Restate the goal, list the steps, name the risks." },
+        Skill { name: "researcher", group: "personas", desc: "Looks one part up and reports findings. Default: claude · sonnet.", attach: "research steps", body: "You research one part of the item and report what you found, with sources." },
+        Skill { name: "coder", group: "personas", desc: "Writes the change and its tests. Default: claude · sonnet.", attach: "code steps", body: "You implement. Small commits, tests first where it helps." },
+        Skill { name: "reviewer", group: "personas", desc: "Reviews a diff for correctness first, style last. Default: rust-reviewer.", attach: "review steps", body: "You review changes. Report findings ranked by severity,\neach with a failing scenario. No praise, no nits unless asked." },
+        Skill { name: "writer", group: "personas", desc: "Writes analyses and docs. Default: claude · opus.", attach: "write-up steps", body: "You write for the maintainer: plain words, the verdict first." },
         Skill { name: "architect", group: "personas", desc: "Designs before anyone codes: files, interfaces, build order.", attach: "plan steps", body: "You are a software architect. Read the code before proposing.\nAnswer with a blueprint: files, interfaces, data flow, build order." },
-        Skill { name: "reviewer", group: "personas", desc: "Reviews a diff for correctness first, style last.", attach: "review steps", body: "You review changes. Report findings ranked by severity,\neach with a failing scenario. No praise, no nits unless asked." },
         Skill { name: "mod-item", group: "templates", desc: "Template for a MOD item body.", attach: "MOD items", body: "# Goal\n# Acceptance\n# Milestones\n# Notes" },
         Skill { name: "ana-item", group: "templates", desc: "Template for an ANA item body.", attach: "ANA items", body: "# Question\n# Method\n# Findings\n# Verdict" },
         Skill { name: "htui-status", group: "mods", desc: "Claude Code mod: a live panel with the run's step and gate.", attach: "claude only", body: "Plugin mod (Claude Code ≥ 2.1.287): in-process handler.\nPanel: step, gate result, permission count. Other agents ignore it." },
@@ -861,7 +887,7 @@ pub fn mock() -> Data {
             about: "How items run: the fast pick that chooses a workflow, and what the agent may change on its own.",
             fields: vec![
                 Field { label: "fast pick model", value: "claude · haiku".into(), kind: FieldKind::Choice(&["claude · haiku", "claude · sonnet", "codex · gpt-5-mini", "gemini · flash"]), help: "a light model, from the models your agents offer; it picks the workflow when a run starts" },
-                Field { label: "changes at run time", value: "ask me".into(), kind: FieldKind::Choice(&["ask me", "automatic"]), help: "the agent may change a run's workflow; ask me shows it as a permission in the item's chat" },
+                Field { label: "run-time changes", value: "ask me".into(), kind: FieldKind::Choice(&["ask me", "automatic"]), help: "the agent may change a run's workflow; ask me shows it as a permission in the item's chat" },
                 Field { label: "default workflow", value: "auto (fast pick)".into(), kind: FieldKind::Choice(&["auto (fast pick)", "standard", "research fan-out", "quick fix", "analysis"]), help: "for items that do not pin one" },
             ],
         },

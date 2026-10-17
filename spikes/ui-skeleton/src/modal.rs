@@ -305,7 +305,7 @@ impl Wizard {
     fn steps(&self, data: &Data) -> Vec<WStep> {
         let mut steps = vec![WStep::Type, WStep::Kind, WStep::Version];
         let k = self.kind(data);
-        if !k.services.is_empty() && !all_services(k) {
+        if !k.services.is_empty() {
             steps.push(WStep::Services);
         }
         steps.extend([WStep::Name, WStep::Compose]);
@@ -680,9 +680,9 @@ fn wizard_key(w: &mut Wizard, key: KeyEvent, ctrl: bool, data: &Data) -> Outcome
             }
             if step == WStep::Kind {
                 w.version_idx = 0;
-                // floci always emulates everything; other emulators start with two services on.
+                // floci starts with AWS and its console; other emulators with their first two services.
                 let k = w.kind(data);
-                w.services = if all_services(k) { k.services.clone() } else { k.services.iter().take(2).copied().collect() };
+                w.services = if picks_clouds(k) { vec!["AWS", "console"] } else { k.services.iter().take(2).copied().collect() };
                 w.service_cursor = 0;
             }
             w.step_by(data, 1);
@@ -696,8 +696,8 @@ fn wizard_key(w: &mut Wizard, key: KeyEvent, ctrl: bool, data: &Data) -> Outcome
     Outcome::Stay
 }
 
-/// Emulators that always run every service they emulate: no choice to make.
-pub fn all_services(k: &CatKind) -> bool {
+/// floci: the choice is which clouds (each emulates every service of its cloud), not services.
+pub fn picks_clouds(k: &CatKind) -> bool {
     k.name == "floci"
 }
 
@@ -829,7 +829,7 @@ fn draw_run_setup(f: &mut Frame, s: &RunSetup, app: &App, pal: Palette) {
     };
 
     let mut l = vec![head("Where it runs", s.section == 0), Line::raw("")];
-    let (inherited, from) = app.inherited_target(app.workspace_of(item.project), Some(item.project));
+    let (inherited, from) = app.inherited_for_item(item.key);
     l.push(crate::ui::fit(row("inherit".into(), format!("{} (from {from})", data.targets[inherited].name), s.target == 0, s.section == 0, false), left.width));
     for (i, t) in data.targets.iter().enumerate() {
         let note = if t.planned.is_some() { "planned".to_string() } else { format!("{} {}", theme::status_glyph(t.status), t.kind) };
@@ -875,7 +875,7 @@ fn draw_run_setup(f: &mut Frame, s: &RunSetup, app: &App, pal: Palette) {
         },
         theme::dim(),
     )));
-    let changes = if app.setting("Workflows", "changes at run time") == "automatic" { "on its own" } else { "after asking you" };
+    let changes = if app.setting("Workflows", "run-time changes") == "automatic" { "on its own" } else { "after asking you" };
     r.push(Line::from(Span::styled(format!("Either way the agent may change it at run time, {changes} (Settings → Workflows)."), theme::dim())));
     f.render_widget(Paragraph::new(r).wrap(Wrap { trim: false }), right);
 }
@@ -1128,6 +1128,7 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, app: &App, pal: Palette) {
             WStep::Type => "type",
             WStep::Kind => "kind",
             WStep::Version => "version",
+            WStep::Services if picks_clouds(w.kind(data)) => "clouds",
             WStep::Services => "services",
             WStep::Name => "name & port",
             WStep::Compose => "compose",
@@ -1167,12 +1168,12 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, app: &App, pal: Palette) {
         WStep::Kind => {
             let mut lines = vec![Line::from(Span::styled(format!("Which {}?", ty.name), theme::bold())), Line::raw("")];
             for (i, k) in ty.kinds.iter().enumerate() {
-                let extra = match (k.services.is_empty(), all_services(k)) {
+                let extra = match (k.services.is_empty(), picks_clouds(k)) {
                     (true, _) => String::new(),
-                    (false, true) => " · AWS, Azure, GCP, Oracle: all services".to_string(),
+                    (false, true) => " · AWS, Azure, GCP, Oracle; every service of each".to_string(),
                     (false, false) => format!(" · emulates {}", k.services.join(", ")),
                 };
-                let ports = if all_services(k) { "ports 4566–4599".to_string() } else { format!("port {}", k.port) };
+                let ports = if picks_clouds(k) { "ports 4566–4599".to_string() } else { format!("port {}", k.port) };
                 lines.push(choice(k.name.to_string(), format!("{} · {ports}{extra}", k.image), i == w.kind_idx));
             }
             f.render_widget(Paragraph::new(lines), rest);
@@ -1188,13 +1189,21 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, app: &App, pal: Palette) {
             f.render_widget(Paragraph::new(lines), rest);
         }
         WStep::Services => {
-            let mut lines = vec![Line::from(Span::styled(format!("Which services should {} emulate?", k.name), theme::bold())), Line::raw("")];
+            let clouds = picks_clouds(k);
+            let ask = if clouds { "Which clouds should floci emulate? Each one runs every service of its cloud.".to_string() } else { format!("Which services should {} emulate?", k.name) };
+            let mut lines = vec![Line::from(Span::styled(ask, theme::bold())), Line::raw("")];
             for (i, s) in k.services.iter().enumerate() {
                 let on = w.services.contains(s);
+                let note = if clouds {
+                    crate::wsview::FLOCI.iter().find(|f| f.1 == *s).map_or(String::new(), |f| format!("{:<18}:{}  {}", f.2, f.3, f.4))
+                } else {
+                    String::new()
+                };
                 let mut line = Line::from(vec![
                     Span::styled(if i == w.service_cursor { "▌ " } else { "  " }, pal.accent()),
                     Span::styled(if on { "[x] " } else { "[ ] " }, if on { Style::new().fg(theme::status_color(Status::Done)) } else { theme::dim() }),
-                    Span::styled(s.to_string(), if on { theme::bold() } else { theme::text() }),
+                    Span::styled(format!("{s:<10}"), if on { theme::bold() } else { theme::text() }),
+                    Span::styled(note, theme::dim()),
                 ]);
                 if i == w.service_cursor {
                     line = line.style(Style::new().bg(SEL_BG));
@@ -1202,7 +1211,10 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, app: &App, pal: Palette) {
                 lines.push(line);
             }
             lines.push(Line::raw(""));
-            lines.push(Line::from(Span::styled("Projects get one endpoint for all of them, e.g. AWS_ENDPOINT_URL=http://localhost:4566", theme::dim())));
+            lines.push(Line::from(Span::styled(
+                if clouds { "Projects get one endpoint per cloud chosen, e.g. AWS_ENDPOINT_URL=http://localhost:4566" } else { "Projects get one endpoint for all of them, e.g. AWS_ENDPOINT_URL=http://localhost:4566" },
+                theme::dim(),
+            )));
             f.render_widget(Paragraph::new(lines), rest);
         }
         WStep::Name => {

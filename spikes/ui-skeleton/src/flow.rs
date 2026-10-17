@@ -466,7 +466,12 @@ pub fn workflow_graph(wf: &Workflow, selected: Option<&str>, pal: Palette, opts:
         .iter()
         .map(|s| {
             let (head, sub) = if s.parts.is_empty() {
-                (s.name.clone(), s.agent.clone())
+                let who = match (s.persona.as_str(), s.agent.as_str()) {
+                    ("", a) => a.to_string(),
+                    (p, "persona's default") => p.to_string(),
+                    (p, a) => format!("{p} · {a}"),
+                };
+                (s.name.clone(), who)
             } else {
                 (format!("{} ×{}", s.name, s.parts.len()), s.parts.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>().join(", "))
             };
@@ -509,6 +514,13 @@ pub fn workflow_graph(wf: &Workflow, selected: Option<&str>, pal: Palette, opts:
     for e in loops {
         let _ = flow.add_edge(e);
     }
+    // In the editor a link can be drawn by dragging from a step's ● to another step. Dropping
+    // anywhere on the step counts: rataflow snaps to the nearest handle within this radius (its
+    // default needs the drop right on a handle).
+    for s in &wf.steps {
+        flow.set_node_connectable(&s.id, true);
+    }
+    flow.connection_radius = NODE_W / 2.0 + 2.0;
 
     (flow, kinds)
 }

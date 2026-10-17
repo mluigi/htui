@@ -218,9 +218,12 @@ Requirements tab is gone (absorbed by Workspaces); Logs is new; Skills became To
   (e.g. `DB_URL=postgres://localhost:5433/agy`). `N` adds a component only this project uses.
 - **Add-component wizard:** type → kind → **version** → **services** (only for emulators; `Space`
   toggles) → name & port (picked free, editable) → compose preview with `+` on the new lines.
-- **floci is a family of emulators, all included, no choice** (rounds 8–9). Checked against the
+- **floci is a family of emulators; you choose the clouds** (rounds 8–10). Checked against the
   floci-io GitHub org: one container per cloud, one port each, every service of that cloud always
-  on, no auth tokens or feature gates, plus a web console. Adding floci writes five services:
+  on, no auth tokens or feature gates, plus a web console. The wizard's step is **clouds** (round 10:
+  "it should choose, much like the services we removed"): AWS, Azure, GCP, Oracle, console, each
+  with its image, port and services listed; AWS and the console start ticked. Only the ticked ones
+  are written. All five:
   | service | image | port | serves |
   |---|---|---|---|
   | `<name>-aws` | `floci/floci` | 4566 | EC2, ECS, EKS, Lambda, RDS, S3, DynamoDB, SQS, SNS, IAM, KMS, Step Functions, CloudFormation… |
@@ -230,8 +233,8 @@ Requirements tab is gone (absorbed by Workspaces); Logs is new; Skills became To
   | `<name>-ui` | `floci/floci-ui` | 4500 | web console for all four |
   Tags: `latest` (stable releases on the 15th and the last day of each month) or `nightly`. A project
   with its own instance shifts all five ports together. The project's env gets one endpoint per
-  cloud (`AWS_ENDPOINT_URL=http://localhost:4566`, …). The wizard skips the services step for floci;
-  LocalStack, Azurite and the GCP emulators still let you pick.
+  cloud chosen (`AWS_ENDPOINT_URL=http://localhost:4566`, …). LocalStack, Azurite and the GCP
+  emulators still pick services.
 - **Types:** database, cache, queue, **cloud emulator** (floci, LocalStack, ElasticMQ, Azurite, GCP
   emulators — explicit request: "something like floci to emulate s3, sqs and others"), object
   storage, search, custom image.
@@ -297,7 +300,8 @@ box connected through a central htui server (only in the plans). **Wherever it r
 docker compose there and configures everything the item needs.**
 
 - **Default target, by cascade** (round 9): Settings (default **this box**, i.e. local) → workspace →
-  project → item; each level inherits unless it sets one. Workspace and project overviews show
+  project → **workflow** (round 10: a workflow can pin a target, `T` in its editor) → item; each
+  level inherits unless it sets one. Workspace and project overviews show
   "items run on docker · this box (from workspace Graphics) · T changes" (`T` cycles inherit and
   every target). In `t`'s picker the first row is **"inherit · this box (from Settings)"**.
 - **Work comes back by collecting** (round 9), like `scripts/hr collect`: on every target except this
@@ -356,9 +360,12 @@ docker compose there and configures everything the item needs.**
 - Fields edit **inline on their row**; the help shows on the line under the selected field (fixes
   audit item 3). Toggles `● on` / `○ off`, choices `‹ value ›`, secrets `•••••••• stored`.
 - New **Catalogue** section (source, last updated, "update now" action).
+- **Arrows change values** (round 10): on a choice `←` / `→` moves to the previous / next value, on a
+  toggle either flips it; saved at once, with a flash ("fast pick model: claude · sonnet · saved").
+  Text and secret fields still open with `Enter`. The pane's hint reads `←→ change · Enter edit`.
 - New **Targets** section (round 8; default target, round 9) and **Workflows** section (round 9):
   *fast pick model* (default **claude · haiku**, chosen from the models the configured agents offer),
-  *changes at run time* (**ask me** / automatic: may the agent change a run's workflow on its own, or
+  *run-time changes* (**ask me** / automatic: may the agent change a run's workflow on its own, or
   must it ask through a permission in the item's chat), *default workflow* (auto, or one).
 
 ### 4.6 Toolbox (was Skills; round 8)
@@ -381,6 +388,13 @@ personas, mods, **workflows**, and other things (to be settled by an analysis).
   **`retries`** (loop: the same kind of step again, up to a cap), **`asks you`** (waits for your
   go-ahead, e.g. `merge → code` in research fan-out), **`if`** (taken only when a condition holds, e.g.
   docs only). A fan-out is a step property (its parts), not a link.
+- **Steps name a persona** (round 10): "aren't persona and role the same things?" Yes. htui already
+  has personas (MOD-26: registry rows with a prompt body and permission rules, bound per phase and
+  frozen into the run snapshot), so a step asks for a **persona** (planner, researcher, coder,
+  reviewer, writer, architect; none for a check) and an **agent**, "persona's default" unless set.
+  Nodes read "coder · claude · sonnet". Whether a persona carries a default agent is new (§8).
+- **A workflow can pin a target** (round 10): `T` in the editor cycles inherit and every target; the
+  header says "items using it run on docker · this box (pinned here; an item can still choose)".
 - **Viewed and edited as a graph in the Toolbox** (round 9; the "used by" list is gone). The template
   is drawn with rataflow: loops leave and enter by the **sides** (review loops on the right, failure
   loops on the left) so they never hide under the chain. Editing keys on the graph: `a` adds a step
@@ -389,6 +403,15 @@ personas, mods, **workflows**, and other things (to be settled by an analysis).
   what came after), `c` connects: arrows pick the target, `Enter` opens the relation picker (a loop
   can point back), `i` lists the step's links (`← →` changes a relation, `d` deletes one), `M` / drag
   moves a node. Runs already going keep the version they started with.
+- **Mouse** (round 10): drag from a step's `●` handle to another step creates a link, then the
+  relation picker opens (dropping anywhere on the target step counts); click a link to open its
+  step's links with that one selected; right-click a step to edit it; drag a step to move it.
+- **Undo / redo** (round 10): `u` / `U`, or `Ctrl-Z` / `Ctrl-Y`, over every edit (add, edit, delete a
+  step, add a link, change or delete a link, the target pin); 100 deep. The header shows "u undoes:
+  adding security review". `Ctrl-Z` no longer reaches the pane zoom (`z`).
+- **Graceful stop applies to every step** (round 10, "any"): agents stop before their next turn with
+  the conversation saved; checks and htui's own steps stop at once and rerun on resume, which loses
+  nothing.
 - **Every run starts with a fast pick**: a light model (Settings → Workflows, default claude · haiku)
   reads the item and picks the workflow; the run graph shows it as the `pick workflow` step. The user
   can **pin** one per item instead (`t` → workflow; "auto" is the default).
@@ -523,6 +546,14 @@ item graph.
   the fit centred on. Spacing 2 is safe.
 - Two fit requests before the first draw (e.g. `request_fit_view_with_options` twice) also left the
   edges undrawn in one test; make one request.
+- **Connecting by mouse** (round 10): rataflow emits `ConnectionStarted` on a press on a handle and
+  `ConnectionCompleted(Connection)` on release, and the app adds the edge
+  (`add_edge_from_connection`, or its own model). The drop must land within `connection_radius` of a
+  target handle; the default needs it right on the handle, and the drag ends in
+  `ConnectionCancelled`. The editor sets `flow.connection_radius = NODE_W / 2 + 2` so a drop anywhere
+  on the step snaps. The search includes **hidden** handles. `EdgeClicked { edge_id }` and
+  `NodeContextMenu { node_id }` (right button) come back from `handle_mouse_event` too; the skeleton
+  names edges `e<link index>` to map them back.
 - Dense neighbourhoods get crowded and labels on parallel links can collide; the legend mode reads
   better there. Not solved.
 - Graph state (pan / zoom / selection / moved nodes) is cached per graph so it survives redraws.
@@ -588,6 +619,10 @@ item graph.
    (haiku) and configurable from the agents' models; the agent may change workflows, with a setting
    for automatic or ask; workflows global, project workflows later; add hooks, commands, sub-agents,
    prompts, env presets, MCPs and tools like gortex and headroom, with an ANA on how to show them.
+10. Workflow links by mouse, and undo / redo; Settings values change with the arrows. Answers:
+    project workflows get an ANA; Templates stay in the Toolbox and MOD-113 is updated; a workflow
+    may pin a target, and persona and role are the same thing; any step can stop gracefully; the
+    Infisical layout needs explaining; floci should let you choose the clouds.
 7. Answers: tab + kind colours; default presets fine but sizes must survive a restart; digits for
    tabs fine; real back/forward history; stop once = wait for the next stoppable step then close,
    twice = stop outright, both resumable; compose in the workspace folder, `.env` in Infisical if
@@ -609,15 +644,14 @@ Answered in round 9: stopping (§4.1), the wheel (§5), default targets by casca
 htui agent's setup role (§4.2a), the fast pick model and run-time changes (§4.5, §4.6), global
 workflows (§4.6), the extra toolbox kinds (§4.6). Still open:
 
-1. Project workflows: a workflow that drives a whole project, coordinating its items (wanted later;
-   how it relates to the workspace and project coordinators and to the queue).
-2. Templates: stay a Toolbox group, or get their own tab as MOD-113 says? (The toolbox ANA decides.)
-3. Workflow editing: is a step's agent a fixed agent, a persona, or a role the run fills? Can a
-   workflow pin a target too, or is that only per item?
-4. Which steps count as "can pause between turns": only agents with resumable sessions (now), or
-   also checks that can be killed and rerun cheaply?
-5. The Infisical folder layout for a workspace's `.env` (the skeleton shows `/<workspace>`).
-6. floci: when a project uses only one cloud, should it still get all five containers?
+Answered in round 10: Templates stay a Toolbox group (MOD-113 to be amended); a workflow may pin a
+target; persona = role (§4.6); any step can stop gracefully; floci lets you choose the clouds
+(§4.1). Still open:
+
+1. Project workflows (a workflow that drives a whole project, coordinating its items): **an ANA**,
+   to be filed (§10).
+2. The Infisical folder layout for a workspace's `.env` (explained in round 10, awaiting an answer).
+3. Does a persona carry a default agent (new to MOD-26's personas), or does every step name one?
 7. Requirements: does a workspace requirement's status come from its project requirements (all done
    → done)? Can an agent propose splits for an existing workspace requirement later?
 7. Catalogue: source of updates (a URL htui publishes? registry tags?), and whether users can add
@@ -677,6 +711,13 @@ Drafted for discussion only; wording and ids to be settled with the maintainer.
   pick by a configurable light model chooses one when a run starts; the user can pin one per item;
   the agent may change it at run time, automatically or after asking (a setting). Project workflows
   that coordinate a whole project: later.
+- **Settings values change with the arrows** (choices and toggles), saved at once.
+- **Workflow editor:** mouse (drag a handle to link, click a link, right-click a step) and undo /
+  redo of every edit. A workflow may pin a target. Steps name a persona and an agent.
+- **ANA: project workflows** (round 10): a workflow that drives a whole project's implementation,
+  coordinating its items automatically; how it relates to the coordinators, the queue and ANA-33.
+- **Amend MOD-113** (round 10): Templates stay a group of the Toolbox tab instead of getting their
+  own Templates tab.
 - **Toolbox tab** (replaces Skills): workflows, skills, personas, templates, mods, MCP servers,
   hooks, commands, sub-agents, prompts, env presets, and tools like gortex and headroom. **Needs an
   ANA first** (no existing item covers it): which kinds exist, how each is shown and attached to a

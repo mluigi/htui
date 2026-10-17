@@ -82,19 +82,23 @@ impl Form {
         }
     }
 
-    pub fn step(wf: usize, edit: Option<usize>, after: usize, name: &str, agent: &str, parts: &str) -> Self {
-        const AGENTS: [&str; 8] = ["claude · opus", "claude · sonnet", "claude · haiku", "codex · gpt-5", "gemini · pro", "rust-reviewer", "cargo test", "you"];
+    pub fn step(wf: usize, edit: Option<usize>, after: usize, name: &str, persona: &str, agent: &str, parts: &str) -> Self {
+        const AGENTS: [&str; 9] = ["persona's default", "claude · opus", "claude · sonnet", "claude · haiku", "codex · gpt-5", "gemini · pro", "rust-reviewer", "cargo test", "you"];
         let mut choices: Vec<String> = AGENTS.iter().map(|a| a.to_string()).collect();
         if !choices.iter().any(|c| c == agent) {
-            choices.insert(0, agent.to_string());
+            choices.insert(1, agent.to_string());
         }
+        let mut personas: Vec<String> = vec!["none (a check)".into()];
+        personas.extend(crate::data::PERSONAS.iter().map(|(p, _)| p.to_string()));
+        let persona = if persona.is_empty() { personas[0].clone() } else { persona.to_string() };
         Form {
             kind: FormKind::Step { wf, edit, after },
             ws: 0,
             cursor: 0,
             fields: vec![
                 Field { label: "name", value: name.to_string(), choices: None, help: "what the step does, e.g. security review" },
-                Field { label: "agent", value: agent.to_string(), choices: Some(choices), help: "← → picks who runs it; \"you\" is a step that waits for you" },
+                Field { label: "persona", value: persona, choices: Some(personas), help: "← → the role the step needs (Toolbox → personas); a check has none" },
+                Field { label: "agent", value: agent.to_string(), choices: Some(choices), help: "← → who plays it: the persona's default, or a specific agent; \"you\" waits for you" },
                 Field { label: "parts", value: parts.to_string(), choices: None, help: "comma-separated for a fan-out (one agent per part), empty for one agent" },
             ],
         }
@@ -306,7 +310,14 @@ pub fn draw_form(f: &mut Frame, form: &Form, app: &App, pal: Palette) {
         FormKind::Step { wf, edit, after } => {
             let w = &app.data.workflows[wf];
             let parts: Vec<&str> = form.value("parts").split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
-            let shape = if parts.is_empty() { format!("one agent: {}", form.value("agent")) } else { format!("a fan-out: {} agents in parallel ({})", parts.len(), parts.join(", ")) };
+            let who = match (form.value("persona"), form.value("agent")) {
+                (p, "persona's default") if !p.starts_with("none") => {
+                    format!("{p}, played by {}", crate::data::PERSONAS.iter().find(|(n, _)| *n == p).map_or("its default agent", |(_, a)| a))
+                }
+                (p, a) if !p.starts_with("none") => format!("{p}, played by {a}"),
+                (_, a) => format!("a check run by {a}"),
+            };
+            let shape = if parts.is_empty() { who } else { format!("a fan-out: {} agents in parallel ({}), each a {}", parts.len(), parts.join(", "), form.value("persona")) };
             let place = match edit {
                 Some(_) => "its links stay as they are".to_string(),
                 None => format!("after {}, taking over its outgoing links", w.steps.get(after).map_or("the start", |s| s.name.as_str())),

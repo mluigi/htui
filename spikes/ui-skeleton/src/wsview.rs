@@ -399,7 +399,7 @@ pub const FLOCI: [(&str, &str, &str, u16, &str); 5] = [
     ("az", "Azure", "floci/floci-az", 4577, "Blob, Queue, Table, Cosmos DB, Functions, Key Vault, Event Hubs, Azure SQL, AKS…"),
     ("gcp", "GCP", "floci/floci-gcp", 4588, "Cloud Storage, Pub/Sub, Firestore, Datastore, Secret Manager, IAM, Managed Kafka"),
     ("oci", "Oracle", "floci/floci-oci", 4599, "Identity, Object Storage, Queue, Streaming, Vault + KMS, Secrets, Functions"),
-    ("ui", "console", "floci/floci-ui", 4500, "web console for all four"),
+    ("ui", "console", "floci/floci-ui", 4500, "web console for the clouds above"),
 ];
 
 /// The compose services one component becomes: one, or floci's five.
@@ -411,8 +411,11 @@ pub fn expand(name: &str, image: &str, host_port: u16, port: u16, kind: &str, se
     let tag = image.rsplit(':').next().unwrap_or("latest");
     // Own instances shift every port by the same amount.
     let shift = host_port as i32 - 4566;
+    // Only the clouds chosen in the wizard (none chosen: all, for old components).
+    let wanted = |cloud: &str| services.is_empty() || services.contains(&cloud);
     FLOCI
         .iter()
+        .filter(|(_, cloud, ..)| wanted(cloud))
         .enumerate()
         .map(|(i, (suffix, cloud, img, p, _))| Service {
             name: format!("{name}-{suffix}"),

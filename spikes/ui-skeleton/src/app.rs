@@ -328,6 +328,15 @@ impl Loc {
     }
 }
 
+/// A workflow as it was before an edit, for undo and redo.
+pub struct WfSnapshot {
+    pub wf: usize,
+    pub steps: Vec<data::WfStep>,
+    pub links: Vec<data::WfLink>,
+    pub target: Option<usize>,
+    pub what: String,
+}
+
 pub struct App {
     pub tab: usize,
     pub tabs: Vec<TabState>,
@@ -384,6 +393,9 @@ pub struct App {
     pub pending_link: Option<(usize, String, String)>,
     /// The step to select when an edited template is drawn again.
     pub wf_select: Option<String>,
+    /// Workflow edits that can be undone / redone: (workflow, what it was before, what the edit was).
+    pub wf_undo: Vec<WfSnapshot>,
+    pub wf_redo: Vec<WfSnapshot>,
     /// The new-item modal's size, kept between uses.
     pub new_item_size: (u16, u16),
     /// The Workspaces list: (workspace, project) per entry; project None is the overview.
@@ -467,6 +479,8 @@ impl App {
             project_target: HashMap::from([("agy", 1)]),
             pending_link: None,
             wf_select: None,
+            wf_undo: Vec::new(),
+            wf_redo: Vec::new(),
             new_item_size: (96, 28),
             ws_nodes,
             stopping: HashMap::new(),
@@ -649,6 +663,30 @@ impl App {
             .collect()
     }
 
+    /// Remembers workflow `wf` before an edit described by `what`; a new edit clears redo.
+    pub fn wf_checkpoint(&mut self, wf: usize, what: impl Into<String>) {
+        let w = &self.data.workflows[wf];
+        self.wf_undo.push(WfSnapshot { wf, steps: w.steps.clone(), links: w.links.clone(), target: w.target, what: what.into() });
+        if self.wf_undo.len() > 100 {
+            self.wf_undo.remove(0);
+        }
+        self.wf_redo.clear();
+    }
+
+    /// Undo (`redo` false) or redo the last workflow edit.
+    pub fn wf_step_history(&mut self, redo: bool) {
+        let (from, to) = if redo { (&mut self.wf_redo, &mut self.wf_undo) } else { (&mut self.wf_undo, &mut self.wf_redo) };
+        let Some(snap) = from.pop() else {
+            self.flash(if redo { "nothing to redo" } else { "nothing to undo" });
+            return;
+        };
+        let w = &mut self.data.workflows[snap.wf];
+        to.push(WfSnapshot { wf: snap.wf, steps: std::mem::replace(&mut w.steps, snap.steps), links: std::mem::replace(&mut w.links, snap.links), target: std::mem::replace(&mut w.target, snap.target), what: snap.what.clone() });
+        w.version += 1;
+        let name = w.name;
+        self.flash(format!("{} {} · {name}", if redo { "redid" } else { "undid" }, snap.what));
+    }
+
     /// A Settings field's value, e.g. ("Workflows", "fast pick model").
     pub fn setting(&self, section: &str, label: &str) -> String {
         self.data.sections.iter().find(|s| s.name == section).and_then(|s| s.fields.iter().find(|f| f.label == label)).map_or_else(String::new, |f| f.value.clone())
@@ -664,7 +702,19 @@ impl App {
         if let Some(t) = self.item_target.get(key) {
             return (*t, "this item".into());
         }
-        let project = self.data.items.iter().find(|i| i.key == key).map_or("", |i| i.project);
+        self.inherited_for_item(key)
+    }
+
+    /// What item `key` gets when it sets nothing: its workflow's pin, else project, workspace, Settings.
+    pub fn inherited_for_item(&self, key: &str) -> (usize, String) {
+        let item = self.data.items.iter().find(|i| i.key == key);
+        if let Some(item) = item {
+            let wf = &self.data.workflows[self.workflow_of(item).0];
+            if let Some(t) = wf.target {
+                return (t, format!("workflow {}", wf.name));
+            }
+        }
+        let project = item.map_or("", |i| i.project);
         self.inherited_target(self.workspace_of(project), Some(project))
     }
 
@@ -830,15 +880,17 @@ impl App {
     }
 }
 
-/// Whether an agent can stop between turns and later reopen its saved conversation (ACP session
-/// load). Checks and htui's own steps cannot: they stop at once and run again.
+/// Whether a step is an agent that keeps a conversation (claude, codex, gemini and personas played
+/// by them), as opposed to a check or one of htui's own steps.
 pub fn resumable(agent: &str) -> bool {
     ["claude", "codex", "gemini", "rust-reviewer"].iter().any(|a| agent.starts_with(a))
 }
 
-/// What happens to one run when a graceful stop reaches it.
+/// What happens to one run when a graceful stop reaches it. Every step can stop gracefully: an agent
+/// before its next turn (its conversation saved), a check or htui's own step at once (rerunning
+/// costs little).
 pub fn graceful_note(agent: &str) -> &'static str {
-    if resumable(agent) { "stops before its next turn; the conversation is saved and resumes" } else { "cannot pause between turns: stops now; the step runs again on resume" }
+    if resumable(agent) { "stops before its next turn; the conversation is saved and resumes" } else { "a check: stops now and runs again on resume; nothing is lost" }
 }
 
 /// The mock fast pick: what a small model would answer from the item's kind and shape, in a second.

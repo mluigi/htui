@@ -737,7 +737,7 @@ fn workflow_detail(f: &mut Frame, app: &App, idx: usize, area: Rect, focused: bo
     } else if app.moving {
         MOVE_HINTS
     } else {
-        &[("←→↑↓", "step"), ("a", "add after"), ("e", "edit"), ("x", "delete"), ("c", "connect"), ("i", "links"), ("M", "move"), ("+ -", "zoom")]
+        &[("←→↑↓", "step"), ("a", "add"), ("e", "edit"), ("x", "delete"), ("c", "connect"), ("i", "links"), ("u U", "undo redo"), ("T", "target")]
     };
     let block = panel(
         vec![Span::styled(wf.name, theme::bold()), Span::styled(" · workflow template", theme::dim())],
@@ -748,14 +748,21 @@ fn workflow_detail(f: &mut Frame, app: &App, idx: usize, area: Rect, focused: bo
     );
     let inner = block.inner(area);
     f.render_widget(block, area);
+    let pin = match wf.target {
+        Some(t) => format!("items using it run on {} (pinned here; an item can still choose)", app.data.targets[t].name),
+        None => "items using it run where their project says (T pins a target here)".to_string(),
+    };
+    let undo = match (app.wf_undo.last(), app.wf_redo.last()) {
+        (Some(u), _) => format!("   u undoes: {}", u.what),
+        (None, Some(r)) => format!("   U redoes: {}", r.what),
+        _ => String::new(),
+    };
     let head = vec![
         Line::from(vec![Span::styled(wf.desc, theme::text()), Span::styled(format!("   fast pick chooses it for: {}", wf.when), theme::dim())]),
-        Line::from(Span::styled(
-            "A run unrolls it: each loop taken becomes round 1, round 2…, each fan-out one node per part. The agent may change it at run time (Settings → Workflows).",
-            theme::dim(),
-        )),
+        Line::from(vec![Span::styled(pin, theme::dim()), Span::styled(undo, pal.accent())]),
+        Line::from(Span::styled("Mouse: drag from a step's ○ to another step to link them · click a link to edit it · right-click a step to edit it.", theme::dim())),
     ];
-    let [top, canvas] = Layout::vertical([Constraint::Length(3), Constraint::Fill(1)]).areas(inner);
+    let [top, canvas] = Layout::vertical([Constraint::Length(4), Constraint::Fill(1)]).areas(inner);
     f.render_widget(Paragraph::new(head).wrap(Wrap { trim: false }), Rect { x: top.x + 1, width: top.width.saturating_sub(2), ..top });
     let flow = draw_graph(f, app, canvas, pal);
     DetailOut { flow, ..DetailOut::default() }
@@ -770,7 +777,7 @@ fn settings_detail(f: &mut Frame, app: &App, idx: usize, area: Rect, focused: bo
     } else if section.name == "Agents" {
         &[("n", "add"), ("a", "authenticate"), ("r", "probe")]
     } else {
-        &[("Enter", "edit"), ("Esc", "sections")]
+        &[("←→", "change"), ("Enter", "edit"), ("Esc", "sections")]
     };
     let block = panel(vec![Span::styled(section.name, theme::bold())], None, hints, focused || editing, pal);
     let inner = block.inner(area);

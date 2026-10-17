@@ -268,7 +268,7 @@ fn on_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('}') => resize_activity(app, 3),
         KeyCode::Char('[') => step_subtab(app, -1),
         KeyCode::Char(']') => step_subtab(app, 1),
-        KeyCode::Char('z') => {
+        KeyCode::Char('z') if !ctrl => {
             let t = app.cur_mut();
             t.zoom = !t.zoom;
             let msg = if t.zoom { "zoomed · z to restore" } else { "layout restored" };
@@ -408,6 +408,8 @@ fn detail_key(app: &mut App, key: KeyEvent, up: bool, down: bool, left: bool, ri
                 t.detail_cursor = t.detail_cursor.saturating_sub(1);
             } else if key.code == KeyCode::Enter {
                 start_edit(app, idx);
+            } else if left || right {
+                step_setting(app, idx, if left { -1 } else { 1 });
             }
         }
         LOGS => logs_key(app, key, idx, up, down),
@@ -557,18 +559,44 @@ fn wf_key(app: &mut App, key: KeyEvent, flow_key: &str) -> bool {
         }
         return true;
     }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Char('u') | KeyCode::Char('z') if key.code == KeyCode::Char('u') || ctrl => {
+            app.wf_step_history(false);
+            return true;
+        }
+        KeyCode::Char('U') | KeyCode::Char('y') if key.code == KeyCode::Char('U') || ctrl => {
+            app.wf_step_history(true);
+            return true;
+        }
+        KeyCode::Char('T') => {
+            let choices: Vec<usize> = (0..app.data.targets.len()).filter(|t| app.data.targets[*t].planned.is_none()).collect();
+            let cur = app.data.workflows[wf].target;
+            let next = match cur.and_then(|c| choices.iter().position(|t| *t == c)) {
+                None => choices.first().copied(),
+                Some(k) => choices.get(k + 1).copied(),
+            };
+            app.wf_checkpoint(wf, "the target pin");
+            app.data.workflows[wf].target = next;
+            let text = match next {
+                Some(t) => format!("{} pins {}: items using it run there unless they choose", app.data.workflows[wf].name, app.data.targets[t].name),
+                None => format!("{} pins nothing: items run where their project says", app.data.workflows[wf].name),
+            };
+            app.flash(text);
+            return true;
+        }
+        _ => {}
+    }
     let steps = &app.data.workflows[wf].steps;
     let pos = sel.as_deref().and_then(|id| steps.iter().position(|s| s.id == id));
     match key.code {
         KeyCode::Char('a') => {
             let after = pos.unwrap_or(steps.len().saturating_sub(1));
-            app.modal = Some(Modal::Form(forms::Form::step(wf, None, after, "", "claude · sonnet", "")));
+            app.modal = Some(Modal::Form(forms::Form::step(wf, None, after, "", "coder", "persona's default", "")));
         }
         KeyCode::Char('e') | KeyCode::Enter => {
             let Some(p) = pos else { return true };
-            let s = &steps[p];
-            let parts: Vec<&str> = s.parts.iter().map(|(n, _)| n.as_str()).collect();
-            app.modal = Some(Modal::Form(forms::Form::step(wf, Some(p), p, &s.name, &s.agent, &parts.join(", "))));
+            open_step_form(app, wf, p);
         }
         KeyCode::Char('x') => {
             let Some(p) = pos else { return true };
@@ -594,8 +622,25 @@ fn wf_key(app: &mut App, key: KeyEvent, flow_key: &str) -> bool {
     true
 }
 
+fn open_step_form(app: &mut App, wf: usize, p: usize) {
+    let s = &app.data.workflows[wf].steps[p];
+    let parts: Vec<&str> = s.parts.iter().map(|(n, _)| n.as_str()).collect();
+    app.modal = Some(Modal::Form(forms::Form::step(wf, Some(p), p, &s.name, &s.persona, &s.agent, &parts.join(", "))));
+}
+
 /// The links modal: ↑↓ picks a link, ← → changes its kind, d deletes it.
 fn links_key(app: &mut App, key: KeyEvent) {
+    if let Some(Modal::Links(l)) = &app.modal
+        && matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Char('d') | KeyCode::Delete)
+        && !modal::step_links(&app.data.workflows[l.wf], &l.node).is_empty()
+    {
+        let what = if matches!(key.code, KeyCode::Left | KeyCode::Right) { "a link's relation" } else { "deleting a link" };
+        let wf = l.wf;
+        // Repeated ← → on one link is one edit.
+        if app.wf_undo.last().is_none_or(|u| u.wf != wf || u.what != what || what != "a link's relation") {
+            app.wf_checkpoint(wf, what);
+        }
+    }
     let Some(Modal::Links(l)) = &mut app.modal else { return };
     let wf = &mut app.data.workflows[l.wf];
     let ids = modal::step_links(wf, &l.node);
@@ -632,6 +677,9 @@ fn links_key(app: &mut App, key: KeyEvent) {
 /// Adds or edits a workflow step from the step form.
 fn save_step(app: &mut App, wf: usize, edit: Option<usize>, after: usize, form: &forms::Form) {
     let name = form.value("name").trim().to_string();
+    app.wf_checkpoint(wf, if edit.is_some() { format!("editing {name}") } else { format!("adding {name}") });
+    let persona = form.value("persona");
+    let persona = if persona.starts_with("none") { String::new() } else { persona.to_string() };
     let agent = form.value("agent").to_string();
     let parts: Vec<(String, String)> = form.value("parts").split(',').map(str::trim).filter(|p| !p.is_empty()).map(|p| (p.to_string(), agent.clone())).collect();
     let w = &mut app.data.workflows[wf];
@@ -639,6 +687,7 @@ fn save_step(app: &mut App, wf: usize, edit: Option<usize>, after: usize, form: 
         Some(p) => {
             let s = &mut w.steps[p];
             s.name = name.clone();
+            s.persona = persona;
             s.agent = agent;
             s.parts = parts;
             s.id.clone()
@@ -660,7 +709,7 @@ fn save_step(app: &mut App, wf: usize, edit: Option<usize>, after: usize, form: 
                 w.links.push(data::WfLink { from: prev.clone(), to: id.clone(), kind: "next" });
             }
             let at = if prev.is_some() { after + 1 } else { w.steps.len() };
-            w.steps.insert(at, data::WfStep { id: id.clone(), name: name.clone(), agent, parts });
+            w.steps.insert(at, data::WfStep { id: id.clone(), name: name.clone(), persona, agent, parts });
             id
         }
     };
@@ -671,6 +720,8 @@ fn save_step(app: &mut App, wf: usize, edit: Option<usize>, after: usize, form: 
 
 /// Deletes a workflow step; what led into it now leads to what came after it.
 fn delete_step(app: &mut App, wf: usize, p: usize) {
+    let name = app.data.workflows[wf].steps[p].name.clone();
+    app.wf_checkpoint(wf, format!("deleting {name}"));
     let w = &mut app.data.workflows[wf];
     let id = w.steps[p].id.clone();
     let preds: Vec<String> = w.links.iter().filter(|l| l.to == id && l.from != id && !data::is_loop(l.kind)).map(|l| l.from.clone()).collect();
@@ -1148,6 +1199,7 @@ fn on_outcome(app: &mut App, outcome: Outcome) {
         Outcome::Choose(kind) if app.pending_link.is_some() => {
             app.modal = None;
             let Some((wf, from, to)) = app.pending_link.take() else { return };
+            app.wf_checkpoint(wf, format!("adding a link ({kind})"));
             let w = &mut app.data.workflows[wf];
             let name = |id: &str| w.steps.iter().find(|s| s.id == id).map_or(id.to_string(), |s| s.name.clone());
             let text = format!("{} → {}: {kind}", name(&from), name(&to));
@@ -1176,7 +1228,10 @@ fn on_outcome(app: &mut App, outcome: Outcome) {
             }
         }
         Outcome::Stay => {}
-        Outcome::Close => app.modal = None,
+        Outcome::Close => {
+            app.modal = None;
+            app.pending_link = None;
+        }
         Outcome::Confirmed(action) => {
             app.modal = None;
             match action {
@@ -1388,6 +1443,25 @@ fn start_edit(app: &mut App, idx: usize) {
     }
 }
 
+/// ← → on a Settings field: a choice moves to the previous / next value, a toggle flips. Saved at
+/// once, like every Settings change.
+fn step_setting(app: &mut App, idx: usize, by: isize) {
+    let cursor = app.cur().detail_cursor;
+    let Some(field) = app.data.sections[idx].fields.get_mut(cursor) else { return };
+    let label = field.label;
+    match field.kind {
+        FieldKind::Toggle => field.value = if field.value == "on" { "off".into() } else { "on".into() },
+        FieldKind::Choice(options) => {
+            let pos = options.iter().position(|o| *o == field.value).unwrap_or(0) as isize;
+            field.value = options[(pos + by).rem_euclid(options.len() as isize) as usize].to_string();
+        }
+        FieldKind::Text | FieldKind::Secret => return app.flash(format!("{label}: Enter edits the text")),
+        _ => return,
+    }
+    let value = field.value.clone();
+    app.flash(format!("{label}: {value} · saved"));
+}
+
 fn edit_key(app: &mut App, key: KeyEvent) {
     let Mode::Edit(buf) = &mut app.mode else { return };
     match key.code {
@@ -1553,10 +1627,38 @@ fn contains(rect: Option<Rect>, x: u16, y: u16) -> bool {
 }
 
 fn forward_to_flow(app: &mut App, m: MouseEvent) {
-    if let Some(key) = views::flow_key(app)
-        && let Some((graph, _)) = app.flows.borrow_mut().get_mut(&key)
-    {
-        let _ = graph.handle_mouse_event(m);
+    let Some(key) = views::flow_key(app) else { return };
+    let events: Vec<rataflow::FlowEvent> = match app.flows.borrow_mut().get_mut(&key) {
+        Some((graph, _)) => graph.handle_mouse_event(m).into_events().collect(),
+        None => return,
+    };
+    if !key.starts_with("wf:") {
+        return;
+    }
+    // The workflow editor by mouse: drag ○ → step links, click a link edits it, right-click a step
+    // edits the step.
+    let Some(wf) = key.split(':').nth(1).and_then(|v| v.parse::<usize>().ok()) else { return };
+    for ev in events {
+        match ev {
+            rataflow::FlowEvent::ConnectionCompleted(c) if c.source != c.target => {
+                app.pending_link = Some((wf, c.source, c.target));
+                app.modal = Some(Modal::Chooser(forms::Chooser { title: "link kind", options: data::LINK_KINDS.to_vec(), cursor: 0 }));
+            }
+            rataflow::FlowEvent::EdgeClicked { edge_id } => {
+                let idx = edge_id.strip_prefix('e').and_then(|n| n.parse::<usize>().ok());
+                if let Some(link) = idx.and_then(|i| app.data.workflows[wf].links.get(i)) {
+                    let node = link.from.clone();
+                    let cursor = modal::step_links(&app.data.workflows[wf], &node).iter().position(|i| Some(*i) == idx).unwrap_or(0);
+                    app.modal = Some(Modal::Links(modal::LinksEdit { wf, node, cursor }));
+                }
+            }
+            rataflow::FlowEvent::NodeContextMenu { node_id } => {
+                if let Some(p) = app.data.workflows[wf].steps.iter().position(|s| s.id == node_id) {
+                    open_step_form(app, wf, p);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1633,6 +1735,10 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
                 Some(Drag::Flow) => forward_to_flow(app, m),
                 Some(Drag::Modal) | None => {}
             }
+        }
+        MouseEventKind::Down(MouseButton::Right) | MouseEventKind::Up(MouseButton::Right) if contains(app.rects.flow, x, y) => {
+            app.cur_mut().focus = Pane::Detail;
+            forward_to_flow(app, m);
         }
         MouseEventKind::Up(_) => {
             if app.drag == Some(Drag::Flow) {
