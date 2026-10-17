@@ -1,7 +1,7 @@
 # CONCEPTS - htui
 
 **Owner:** Luigi Marrandino
-**Reviewed:** 2026-10-15
+**Reviewed:** 2026-10-17
 
 Standing architectural intent for `htui`. Governed by `.claude/rules/concept-docs.md`. Distilled
 from `docs/REQUIREMENTS.md`, which is the authority; requirement IDs in brackets.
@@ -42,7 +42,9 @@ talking only to your Postgres, is part of `htui` [R-ID-2].
 `workspace` groups related projects and owns cross-project items [R-ENT-16]; `project` owns item
 keys, kinds, step graphs and secrets; skills attach from global down to phase, most specific wins
 [R-SKL-2]; a `repo` is a git checkout or plain folder in one project, zero or more per project
-[R-ENT-1..4]. Workspaces are explicit, with no root path; a single project runs with none [R-ENT-2].
+[R-ENT-1..4]. Workspaces are explicit and not a directory their projects must live under; each has a
+folder for what `htui` generates there (compose file, environment file); a single project runs with
+none [R-ENT-2, R-ENT-17, R-SEC-5].
 Logical identity never depends on a filesystem path: every box maps repos to its own paths [R-BOX-4].
 
 Item kinds are configurable per project, seeded by its type [R-ENT-6]. Item status is open, blocked
@@ -56,7 +58,14 @@ nothing extra [R-ENT-9].
   `claude`, `claude-cli`, `agy`.
 - **Step graphs, not scripts.** Phases with candidate agents, gates, retries, loop-backs and
   isolation; fan-out divides work into parallel parts that an integrate step merges [R-ORCH-1..3, 7,
-  8]. A coordinator per project and workspace only manages [R-ORCH-14].
+  8]. A coordinator per project and workspace only manages [R-ORCH-14]. Global workflow templates,
+  loops included, are picked per run by a light model or pinned per item, and runs unroll them
+  [R-ORCH-1].
+- **Runs go where you say.** Each item runs on a target — this box, docker, a remote machine over
+  SSH or its docker — chosen by a Settings → workspace → project → workflow → item cascade; `htui`
+  prepares it there and the work comes back by collecting the branch [R-ORCH-15]. Stopping a run
+  saves its conversation and can always be resumed [R-ORCH-16]; leaving the TUI never stops work
+  [R-TUI-18].
 - **Manual and auto.** Manual runs one item with gates as configured; auto is a queue runner that
   downgrades non-hard gates and honors caps [R-ORCH-4, 6]. Any step can be promoted to interactive
   chat and resumed [R-ORCH-5].

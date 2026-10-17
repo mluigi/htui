@@ -58,6 +58,12 @@ R-ORCH-7, R-ORCH-10, R-HIS-2, R-PRM-1, R-PRM-3, R-PRM-4, R-SKL-1, R-SKL-2, R-SKL
 R-TUI-1, R-TUI-2, R-TUI-3, R-TUI-4, R-TUI-5, R-TUI-6, R-TUI-7, R-TUI-8, R-TUI-9, R-TUI-10, R-TUI-11,
 R-LATER-2, R-NF-1, R-NF-2, R-NF-3, R-NF-4 and §14 (the web front end leaves it for R-LATER-8). Where the design is open, the text names the
 deciding analysis (ANA-33..39).
+amended 2026-10-17 by maintainer decision on the UI redesign review
+(`docs/ui-redesign-findings-2026-10-15.md`) — R-ENT-17, R-AGT-11, R-ORCH-15, R-ORCH-16, R-SEC-5 and
+R-TUI-12..18 added; amended in place: R-ID-6, R-ENT-2, R-ENT-14, R-ENT-15, R-ORCH-1, R-HIS-3,
+R-PRM-4, R-TUI-1, R-TUI-2, R-TUI-3, R-TUI-4, R-TUI-5, R-TUI-6, R-TUI-7, R-TUI-8 and R-TUI-10. The
+analyses it opens are ANA-40 (the Toolbox), ANA-41 (project workflows) and ANA-42 (execution
+targets).
 **Governed by:** `.claude/rules/workflow-docs.md`
 
 This file is the product requirements for `htui`. It sits above every `ANA-N` analysis and every
@@ -111,7 +117,10 @@ conflict. Their verdicts survive only where restated here.
   import and triage — a mapping of legacy items, a suggested link, a proposed item — and are written
   only once a person accepts them (amended 2026-10-15). An agent choosing *which work to do next*
   (R-ORCH-1's planned graphs, R-ORCH-14's coordinator) is item work, not bookkeeping; the status
-  transitions it causes stay deterministic.
+  transitions it causes stay deterministic. The light model (R-ORCH-1) that picks a run's workflow
+  and rewrites a new item's or requirement's draft (R-TUI-17) is outside it too: one is item work,
+  the other a draft a person accepts. One configurable light model serves both, which partly
+  reverses ANA-30's rejection of a single `utility_model` setting. Amended 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`).
 - **R-ID-7 (must).** Anything persisted or sent off the box — transcripts, tool output, logs,
   telemetry, error reports, the cache — is scrubbed of secrets on the host box first. Scrubbing fails
   closed. Amended 2026-10-15 (was: transcripts and tool output).
@@ -149,10 +158,14 @@ conflict. Their verdicts survive only where restated here.
 - **R-ENT-1 (must).** Three-tier hierarchy: `workspace` groups projects, `project` owns work,
   `repo` is a git checkout or a plain folder (R-ENT-4).
 - **R-ENT-2 (must).** `workspace`: named, explicit group of one or more related projects, which may
-  live anywhere on a box; a workspace is not a directory and has no root path. It owns its own items,
-  documents and requirements (R-ENT-16). There are no implicit workspace rows: opening a single
-  project runs with no workspace, and every workspace-scoped feature falls back to "the current
-  project". Amended 2026-10-15 (the per-box root path is dropped).
+  live anywhere on a box; a workspace is not a directory its projects must live under. It owns its
+  own items, documents and requirements (R-ENT-16). There are no implicit workspace rows: opening a
+  single project runs with no workspace, and every workspace-scoped feature falls back to "the
+  current project". A workspace has a folder (by default `~/workspaces/<name>`) where `htui` keeps
+  its description, goals, generated compose file (R-ENT-17) and, without Infisical, its environment
+  file (R-SEC-5); projects cloned from a URL go under it, existing repos stay where they are.
+  Amended 2026-10-15 (the per-box root path is dropped) and 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`) (a folder for
+  what `htui` generates).
 - **R-ENT-3 (must).** `project`: owns the item key space, the item kinds, step graphs, skill
   bindings, secret provider binding and phase defaults. It has a type (software, research, docs, ops,
   and more) that seeds its kinds and graphs (R-ENT-6). It has zero or more repos; when it has any,
@@ -213,14 +226,31 @@ conflict. Their verdicts survive only where restated here.
 - **R-ENT-14 (must).** `requirement`: key `R-<AREA>-<N>` minted per owner and area, never reused;
   the owner is a project or a workspace. It has body, rationale, priority `must`/`later`, state
   `active`/`withdrawn`, and a `version` with revisions naming the deciding item. Text changes only by
-  human action. Amended 2026-10-15 (workspace requirements).
+  human action: coordinators and agents propose changes as drafts a person accepts (R-ID-6). A
+  requirement may refine another; the child's key is its parent's plus `.n` (`R-TUI-2.1`).
+  Workspace requirements are keyed `W-…` (ANA-35 settles the exact form). Amended 2026-10-15
+  (workspace requirements) and 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`) (nesting, drafts).
 - **R-ENT-15 (must).** Items cite requirements with kind `addresses`, `amends`, `withdraws`,
   `reserves` or `verifies` (a test or review item that verifies the requirement). Each citation
   records the requirement version it was made against, and a newer version marks it suspect until
-  re-confirmed. Amended 2026-10-15 (`verifies`).
+  re-confirmed. A workspace requirement can be split into project requirements, each refining it,
+  and its coverage derives from theirs: covered when all are, in progress when any is, open
+  otherwise. An agent may propose further splits, as drafts a person accepts. Amended 2026-10-15
+  (`verifies`) and 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`) (splits).
 - **R-ENT-16 (must).** Workspace-owned items: a workspace has its own key space and kinds, and owns
   items, documents and requirements that span its member projects, linked to their items by UUID.
   Added by maintainer decision, 2026-10-15; design in ANA-35.
+- **R-ENT-17 (must).** Workspace components: a workspace declares the services its projects need —
+  databases, caches, queues, cloud emulators, object storage, search engines, any image — picked from
+  a catalogue held in Postgres, with a version and, for an emulator, the services or clouds it
+  emulates (floci: AWS, Azure, GCP and Oracle, one container each, and its console). The catalogue is
+  seeded at first start, updated on request from a catalogue file published in the `htui`
+  repository and from the image registry's tags, and extended by the user with kinds of their own.
+  `htui` generates a docker compose file in the workspace folder (R-ENT-2) with free ports,
+  passwords from the secret provider and named volumes for data; per project, each component is the
+  workspace's instance, the project's own instance, or unused. Each component starts and stops on its
+  own; the stack is not tied to the workspace's lifecycle. Wherever an item runs, its components are
+  started there (R-ORCH-15). Added by maintainer decision, 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`); MOD-117.
 
 ## 4. Storage, cache and offline (R-STO)
 
@@ -323,6 +353,12 @@ conflict. Their verdicts survive only where restated here.
   the latest. Added by maintainer decision, 2026-09-09, reversing `docs/ANA-4.md` §4.6's
   deferral of registry-driven installation; implemented as MOD-20; amended 2026-10-15 (tool
   managers, updates).
+- **R-AGT-11 (must).** A global htui agent, present in every workspace, manages `htui` itself:
+  settings, Toolbox entries (R-TUI-7), agent rows, execution targets (installing and logging in
+  agents on a remote box, setting up a docker context, R-ORCH-15) and the component catalogue
+  (R-ENT-17). It acts without asking only on reads, catalogue updates and Toolbox additions;
+  anything touching secrets, agent logins, installs on a remote box, a deletion or a target change
+  waits for the person's permission. Added by maintainer decision, 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`); MOD-121.
 
 ## 6. Orchestration (R-ORCH)
 
@@ -334,6 +370,16 @@ conflict. Their verdicts survive only where restated here.
   subgraph; and a graph may be planned at run time by the agent that starts it, which then runs its
   plan directly within the bounds the project allows (phases, agents, caps), hard gates still
   enforced. Amended 2026-10-15 (was: an ordered list owned by a project); design in ANA-33.
+  Beside kinds' graphs there is a global library of **workflows**, edited in the Toolbox (R-TUI-7):
+  templates with steps, fan-out parts and typed links — `next`, `approved`, `asks you` (waits for
+  the person), `if` (taken only when a condition holds), and the loops `changes requested`, `fails`
+  and `retries` back to an earlier step. A step names a persona and either a specific agent or any
+  agent; personas carry no agent. A workflow may pin an execution target (R-ORCH-15). When a run
+  starts, a light model configured in Settings picks the item's workflow unless the item pins one,
+  and the run carries it out: each loop taken becomes round 1, round 2, each fan-out one sub-step per
+  part. The run's agent may change the workflow at run time, on its own or after asking, as a setting
+  says. How workflows and kinds' step graphs fit together is settled by ANA-33 with ANA-40; workflows
+  that drive a whole project are ANA-41. Amended 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`).
 - **R-ORCH-2 (must).** Gate is `always`, `on_failure` or `never`, plus a `hard` flag. A gated step
   ends in `awaiting_approval`; the user approves, rejects with a note, edits the artifact, or
   retries. A gate may ask a configured judge agent for an advisory verdict, shown on the gate; the
@@ -383,6 +429,23 @@ conflict. Their verdicts survive only where restated here.
   opening a pull request as the project configures — and runs close-out (R-TUI-9). It does no item
   work itself. Added by maintainer decision, 2026-10-15; design in ANA-34, which also settles what it
   changes in R-ID-6, R-ORCH-7, R-ENT-8 and R-TUI-9.
+- **R-ORCH-15 (must).** Execution targets: each item runs on a target — this box (a worktree of the
+  project), docker on this box (a fresh clone in a container with its own compose project and the
+  toolchain image, as `scripts/hr` sandboxes run), a remote machine over SSH, docker on a remote
+  machine, or, with R-ORCH-12's phase 2 (MOD-47), a box enrolled with an `htui` server. The default
+  cascades Settings (this box) → workspace → project → workflow → item, each level inheriting unless
+  it sets one. Wherever it runs, `htui` prepares it there — the code, the item's components
+  (R-ENT-17), environment and secrets, and the agents, the htui agent (R-AGT-11) installing and
+  logging in what is missing — and the work comes back when the person collects the branch, as
+  `scripts/hr collect` does. Added by maintainer decision, 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`); design in ANA-42,
+  beside R-ORCH-12 (MOD-43) and the container environment (MOD-44).
+- **R-ORCH-16 (must).** Stopping runs: a person can stop every run in a workspace, the open one
+  included. A graceful stop halts each agent step before its next turn, and a check or one of
+  `htui`'s own steps at once; a second, forced stop halts every step mid-turn. Both ask for
+  confirmation, always save the conversation, and can be resumed: an agent step resumes its saved
+  session (after a forced stop it redoes the interrupted turn) and a check runs again. Nothing new
+  starts in the workspace until its runs are resumed. Added by maintainer decision, 2026-10-17
+  (UI review, `docs/ui-redesign-findings-2026-10-15.md`); MOD-125.
 
 ## 7. Run history (R-HIS)
 
@@ -391,7 +454,9 @@ conflict. Their verdicts survive only where restated here.
   about a run exists only on one box.
 - **R-HIS-2 (must).** The chat view can reopen any past step read-only and replay it, and start a
   new chat or run from that step's context (fork). Amended 2026-10-15 (fork).
-- **R-HIS-3 (must).** Retention is configurable per project; default keeps everything.
+- **R-HIS-3 (must).** Retention is configurable per project; default keeps everything. Archived
+  transcripts of finished steps follow the same window and sweeper (MOD-100); a transcript a person
+  pins is kept. Amended 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`).
 
 ## 8. Prompt assembly and skills (R-PRM, R-SKL)
 
@@ -410,7 +475,8 @@ conflict. Their verdicts survive only where restated here.
   a keep order, as ANA-5 §4.4 implements it; budget raise added).
 - **R-PRM-4 (must).** Prompt templates per phase are versioned rows in Postgres,
   with a documented placeholder contract, editable in the TUI. Templates form a library shared
-  across projects and workspaces, with per-project overrides. Amended 2026-10-15.
+  across projects and workspaces, with per-project overrides. Amended 2026-10-15. The library is a
+  group of the Toolbox tab (R-TUI-7), not a tab of its own. Amended 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`).
 - **R-SKL-1 (must).** Skill library in Postgres: name, description, versioned markdown body, and
   optional resources (scripts, references, other files). Amended 2026-10-15 (resources).
 - **R-SKL-2 (must).** Skills attach at global, workspace, project, item-kind or phase level; the
@@ -434,6 +500,11 @@ conflict. Their verdicts survive only where restated here.
   failing it, or failing the fan-out candidate, or parking the judge.
 - **R-SEC-4 (must).** When the provider is unreachable, runs needing its secrets are refused with a
   clear error; there is no plaintext fallback.
+- **R-SEC-5 (must).** The ports and URLs a workspace's components give each project (R-ENT-17) form
+  an environment file that holds no secrets. When the provider is Infisical it lives there, one
+  folder per project under the workspace's (`/<workspace>/<project>`), so a project and its runs read
+  only their own; otherwise it sits beside the compose file in the workspace folder (R-ENT-2).
+  Passwords come from the provider either way. Added by maintainer decision, 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`).
 
 ## 10. htui MCP server (R-MCP)
 
@@ -456,41 +527,77 @@ conflict. Their verdicts survive only where restated here.
 
 ## 11. TUI (R-TUI)
 
-- **R-TUI-1 (must).** Keyboard driven, mouse optional; keys are configurable (R-TUI-10). Top bar: workspace or project, box, store
-  state — distinguishing online, connecting, and offline since T
-  — working run count and waiting-on-you count (R-TUI-11). Tabs: Backlog, Chat (one per session), Skills, Templates, Requirements, Settings. Workspace switcher
-  overlay. Queue overlay for auto mode with reorder and pause. Amended 2026-10-15 (Templates tab).
+- **R-TUI-1 (must).** Keyboard driven, mouse optional; keys are configurable (R-TUI-10). A one-row
+  header: the open workspace or project (it opens the Workspaces tab), the tabs, then, dropping the
+  least useful parts when narrow, the history chip (R-TUI-13), the working run count and
+  waiting-on-you count (R-TUI-11), workspaces running in the background, the box, the store state —
+  distinguishing online, connecting, and offline since T — and the layout. Tabs: Workspaces, Backlog,
+  Chat, Toolbox, Logs, Settings. Each tab has an accent colour and item keys are coloured by kind;
+  status shows as a glyph and a human word (`needs you`, not `awaiting_approval`), never by colour
+  alone. Queue overlay for auto mode with reorder and pause. Leaving never stops work (R-TUI-18).
+  Amended 2026-10-15 (Templates tab) and 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`): the Skills, Templates and
+  Requirements tabs and the workspace switcher overlay give way to Toolbox (R-TUI-7) and Workspaces
+  (R-TUI-14); Chat lists every session (R-TUI-6); Logs is new (R-TUI-15).
 - **R-TUI-2 (must).** Backlog left pane: items grouped by project, with workspace-owned items
   (R-ENT-16) as their own group; filters by status, project, capability, readiness, labels and
-  priority, and sorting by priority. Actions: new, edit, run, queue, close, open graph. Amended
-  2026-10-15.
+  priority, and sorting by priority. Actions: new, edit, run, queue, close, open graph. The grouping
+  cycles project, kind and status (attention order), done and closed items stay hidden until shown,
+  and both persist. A new item opens the modal of R-TUI-17. The detail says where the item runs and
+  with which workflow, both changeable from the Backlog (R-ORCH-15, R-ORCH-1). Amended 2026-10-15 and
+  2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`).
 - **R-TUI-3 (must).** Backlog right pane is tabbed per selected item: **Body**, **Runs**, **Graph**,
   **Documents**, **Notes**, **Requirements** (the item's citations, suspect ones flagged) and
-  **Attachments**. Amended 2026-10-15.
+  **Attachments**, as chips in the pane's top border. Amended 2026-10-15 and 2026-10-17 (chips).
 - **R-TUI-4 (must).** Runs tab: active and past runs for the item, step list with agent, model,
   gate state, usage, duration; a divided step shows its parts as a tree (planner, parts, integrate)
   with each part's state. Actions: approve, reject with note, retry, promote to chat, cancel,
   open artifact, run, skip or restart from a step (R-ORCH-4), fork from a step (R-HIS-2), and open
-  an artifact, or a file from a tool call or diff, in `$EDITOR` at the line (R-ID-2). Amended
-  2026-10-15 (was: select fan-out result, which moves to R-LATER-13).
+  an artifact, or a file from a tool call or diff, in `$EDITOR` at the line (R-ID-2). The run shows
+  as a graph of its workflow as carried out (R-ORCH-1): `prepare` on its target, `pick workflow`,
+  each loop taken as round 1, round 2, each fan-out part as a node, typed links (those into a
+  running step animated), and `collect` when it ran off this box (R-ORCH-15); a step table is one
+  key away. Enter on a step opens its live chat while it runs or waits, its archived transcript
+  (read-only) once finished, and nothing before it starts. Amended 2026-10-15 (was: select fan-out
+  result, which moves to R-LATER-13) and 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`) (the run graph).
 - **R-TUI-5 (must).** Graph tab: the item and everything connected, one to N hops, across projects,
   with status and link kind, navigable, including cited requirements and linked documents and
-  attachments as nodes. Amended 2026-10-15.
+  attachments as nodes. It reads top to bottom from what comes first — parent requirements, the
+  requirements the item covers, its blockers, the item, what follows it — with link kinds as a
+  legend, as labels on the links, both or neither. Enter opens another item, the item's live chat, or
+  a requirement in Workspaces (R-TUI-14). Every graph (R-TUI-4, R-TUI-5, R-TUI-7, R-TUI-14) opens at
+  zoom 1 centred on what matters, pans and zooms by keyboard and mouse, has a dotted background, and
+  lets nodes be moved by drag or keyboard without changing a link; inside tmux it says once how to
+  let the mouse wheel through. Amended 2026-10-15 and 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`).
 - **R-TUI-6 (must).** Chat tab: streamed session with assistant text, collapsed thoughts, tool calls
   and their results' content (collapsible), edit proposals, permission prompts answered inline,
   follow-up input. Bound to a run step, or free-standing: then it runs against the active workspace,
   or the project when there is no workspace, whatever folder `htui` was started in, with the agent
-  and model chosen when it starts. Amended 2026-10-15.
-- **R-TUI-7 (must).** Skills tab: library, editor, version diff, a skill's resources, and a bindings
-  matrix by workspace, project, item kind and phase. The Templates tab holds the template library
-  (R-PRM-4) the same way. Amended 2026-10-15.
+  and model chosen when it starts. The tab lists every session in groups: the htui agent (R-AGT-11),
+  the workspace coordinator, one coordinator per project (R-ORCH-14), item runs, and archived step
+  transcripts (read-only). Coordinators always take messages; an item run's chat is view-only while
+  the agent works and writable only when it asks the person something. Permissions are answered with
+  `a` allow once, `A` always, `r` reject. Amended 2026-10-15 and 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`).
+- **R-TUI-7 (must).** Toolbox tab: everything a run can use, grouped by kind — workflows (R-ORCH-1),
+  skills (library, editor, version diff, a skill's resources, and a bindings matrix by workspace,
+  project, item kind and phase), personas, templates (R-PRM-4), mods, MCP servers, hooks, commands,
+  sub-agents, prompts, environment presets, and tools that bundle several of these (Gortex, Headroom,
+  R-LATER-7). A workflow is shown and edited as a graph: add, edit, delete and connect steps by
+  keyboard or mouse (dragging from a step's handle), change or delete a link, pin a target, with undo
+  and redo of every edit. ANA-40 settles the kinds and how each is shown. Amended 2026-10-15 and
+  2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`) (was: a Skills tab and a separate Templates tab).
 - **R-TUI-8 (must).** Settings tab: agent registry with quota, adding a row (R-AGT-5), and each
-  row's isolation (R-ID-5); box profile with capability edits; project types, workspaces, item kinds,
-  and step graphs with a graph editor; `command_run` exposure and per-box limits (R-MCP-3); key
+  row's isolation (R-ID-5); box profile with capability edits; project types, item kinds, and step
+  graphs with a graph editor; `command_run` exposure and per-box limits (R-MCP-3); key
   bindings (R-TUI-10); secret provider, caps, scheduler window, repo credentials (R-BOX-4), and the
   Postgres connection: whether a DSN is stored, a masked field to enter or replace it, an action to
   clear it, and the state of the last attempt. What is typed goes to the OS keyring and nowhere else
-  (R-STO-1); it is not echoed, not logged, and not written to any file. Amended 2026-10-15.
+  (R-STO-1); it is not echoed, not logged, and not written to any file. Sections also hold the
+  targets and the default target (R-ORCH-15), workflows (the light model, chosen from the models the
+  configured agents offer; whether the agent's run-time workflow changes apply on their own or ask
+  first; the default workflow) and the component catalogue (R-ENT-17); the connection section is
+  named Postgres. Workspaces live in their own tab (R-TUI-14) and the Backlog's grouping and done
+  items are Backlog keys (R-TUI-2). A field edits on its row with its help beneath; arrows change a
+  choice or a toggle, saved at once. Amended 2026-10-15 and 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`).
 - **R-TUI-9 (must).** Close-out writes the final summary document, sets status, records commit
   hashes from the run. No markdown files are produced. The coordinator (R-ORCH-14) runs close-out
   and its checklist — follow-up items, re-confirming suspect citations, choosing the resolution —
@@ -503,17 +610,63 @@ conflict. Their verdicts survive only where restated here.
   field, a field's Enter and Esc, numbered choices, and a choice field's value keys are fixed.
   `htui` refuses an invalid set and names every error, including a chord bound twice on one screen
   and a printable chord bound where a text field is typing; `htui --default-keys` starts with the
-  defaults instead. `ctrl-c` always quits, from every htui screen and field, and cannot
-  be unbound or bound to anything else; a pane that runs another program in a terminal forwards
+  defaults instead. `ctrl-c` always quits, from every htui screen and field (the first press asks,
+  the second leaves, R-TUI-18), and cannot be unbound or bound to anything else; a pane that runs another program in a terminal forwards
   it to that program and always keeps a key that leaves the pane. Every hint line and the `?`
-  help show the keys in force, and the help opens from every screen. Amended by maintainer decision,
-  2026-10-15, reversing ANA-26's local `keys.toml` (MOD-67).
+  help show the keys in force, and the help opens from every screen. No default needs AltGr on common
+  non-US layouts. Plain arrows never leave a pane; `Tab`/`Shift-Tab`, `Ctrl ←→` or a click move
+  between panes, `Shift ←→` changes sub-tab, and digits switch tabs. Amended by maintainer decision,
+  2026-10-15, reversing ANA-26's local `keys.toml` (MOD-67), and 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`) (navigation
+  defaults).
 - **R-TUI-11 (must).** One overlay, opened from every screen, lists every run in the active
   workspace that waits on a person — a gate, a fan-out selection, a judge failure, a blocked run,
   an open permission request, and an agent's open question — with the reason and the step, and
   opens the item's Runs tab on that step. The top bar shows the count. The list is computed from
   the store at read time. When something starts waiting, `htui` rings the terminal bell and raises
   an OS notification; notifications to a remote endpoint are R-LATER-12. Amended 2026-10-15.
+- **R-TUI-12 (must).** Shell: panes have rounded borders with the title and sub-tabs in the top
+  border and the focused pane's key hints in its bottom border; long rows end in `…`, long content
+  scrolls with a scrollbar and stops at its end. A toggleable panel under the header says what the
+  tab is for and its usual actions. Each tab has layout presets — list and detail, with an activity
+  panel underneath (R-TUI-16), three columns, the detail alone — with splits resized by key or drag,
+  panes shown or hidden, and a pane zoomed; the layout, the panel's state and modal sizes are saved
+  the moment they change. When the layout hides something, the pane says how to bring it back.
+  Added by maintainer decision, 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`); MOD-115.
+- **R-TUI-13 (must).** History: back and forward like a browser over every jump (Enter in a graph,
+  the activity panel, a requirement's covering item or linked requirement) and every change of tab,
+  sub-tab or pane — `⌫` or `Alt ←` back, `Alt →` forward; going somewhere new drops what was
+  forward. The header names where back goes. Added by maintainer decision, 2026-10-17
+  (UI review, `docs/ui-redesign-findings-2026-10-15.md`); MOD-115.
+- **R-TUI-14 (must).** Workspaces tab: every saved workspace with its state — open, in the background
+  with its runs going, stopping, stopped — and under it an overview and its projects. Opening one
+  sends the current one to the background without interrupting its runs; stopping and resuming
+  runs follow R-ORCH-16. Sub-tabs, per workspace and per project: overview (state, folder,
+  description, goals, projects, components, default target), components (R-ENT-17: a table, the
+  generated compose file, start and stop, each project's use) and requirements (R-ENT-14, R-ENT-15:
+  a tree with nesting, each covering item and linked requirement a selectable row that jumps there,
+  and a graph view). New workspaces (with their folder), projects (from a folder, a git URL or a new
+  repo), components (a wizard over the catalogue) and requirements (R-TUI-17) are created here.
+  Added by maintainer decision, 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`); MOD-116, MOD-117, MOD-118.
+- **R-TUI-15 (must).** Logs tab: `htui`'s own log, sources on the left with line and warning counts,
+  lines on the right with coloured levels, a minimum level, follow on and off, and scrolling that
+  pauses following. Added by maintainer decision, 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`); MOD-122.
+- **R-TUI-16 (must).** Activity panel, part of the layout presets (R-TUI-12): events newest first
+  across workspaces, what needs the person pinned on top; Enter jumps to the item or chat (R-TUI-13);
+  filters for all workspaces, needs you, failures and this workspace. Added by maintainer decision,
+  2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`); MOD-122.
+- **R-TUI-17 (must).** Creating an item or a requirement opens a centred, resizable modal: the person
+  describes it in their own words, with the project (for a requirement, the scope: workspace-wide or a
+  project) preset from where they are; the light model (R-ORCH-1) rewrites it into an item (kind, key,
+  title, goal, acceptance, open questions) or a requirement (what must hold, how to check it, what it
+  refines); the person reviews, edits, rewrites again, or talks it through with an agent that asks
+  questions and folds the answers into a live draft. A workspace requirement comes with proposed
+  project requirements to keep or drop (R-ENT-15). The talk-it-through chat becomes the item's first
+  chat. Nothing is saved before the person accepts it (R-ID-6). Added by maintainer decision,
+  2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`); MOD-118, MOD-119.
+- **R-TUI-18 (must).** Leaving never stops work: `q` or `ctrl-c` opens a dialog listing every live
+  workspace with its running and waiting counts; leaving closes the window and the runs keep going
+  in the background, or are stopped gracefully first (R-ORCH-16) when the person chooses so. A
+  second `ctrl-c` leaves. Added by maintainer decision, 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`); MOD-115.
 
 ## 12. Later tier (R-LATER)
 

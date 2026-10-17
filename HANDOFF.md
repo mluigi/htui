@@ -14,7 +14,13 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-15):** a **requirements review** with the maintainer
+**Current status (2026-10-17):** a **UI redesign review** with the maintainer, run on a throwaway
+ratatui skeleton (branch `spike/ui-skeleton`, `spikes/ui-skeleton/`), is concluded; every decision is
+in `docs/ui-redesign-findings-2026-10-15.md`. It added `R-ENT-17`, `R-AGT-11`, `R-ORCH-15`, `R-ORCH-16`, `R-SEC-5` and
+`R-TUI-12..18` and amended `R-TUI-1..8`, `R-TUI-10` and six more (`docs/REQUIREMENTS.md` header). Filed
+**ANA-40..42** (Toolbox, project workflows, execution targets) and **MOD-115..125** (the redesign's
+settled work); MOD-81, MOD-82, MOD-83, MOD-85 and MOD-88 are absorbed by MOD-115 and MOD-120, and
+MOD-113 is amended (Templates stay in the Toolbox). Before it (2026-10-15), a **requirements review** with the maintainer
 (`docs/requirements-review-2026-10-15.md`) went through every requirement and amended most of
 `docs/REQUIREMENTS.md`. The main changes: `htui` serves any kind of project; fan-out now divides work
 (best-of-N is later, `R-LATER-13`); a coordinator per project and per workspace (`R-ORCH-14`); key
@@ -174,6 +180,42 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   `R-AGT-5`); what a coding session is (the project type, phase or kind); install and detection
   through R-AGT-10's tool managers; per-box indexing cost and freshness; and the excerpt-provider half
   of `R-PRM-1` (ANA-3 shipped none). Not blocked.
+
+- [ ] **ANA-40 - Toolbox: kinds of run tools and how to show them** (from the UI redesign review,
+  `docs/ui-redesign-findings-2026-10-15.md` §4.6). `R-TUI-7`, `R-ORCH-1`, `R-PRM-4`, `R-SKL-1`, `R-SKL-2`, `R-SKL-4`,
+  `R-LATER-7`, `R-ID-6`. The Skills tab becomes a **Toolbox** of everything a run can use: workflows,
+  skills, personas, templates, Claude Code mods (claude only), MCP servers, hooks, commands,
+  sub-agents, prompts (the new-item rewrite, the fast workflow pick), environment presets, and tools
+  that bundle several of these (Gortex: MCP server + hooks + daemon; Headroom: MCP server + proxy;
+  Serena; Graphify). Settle: which kinds exist and which are data in Postgres versus discovered on a
+  box; how each kind is shown and edited (a bundle tool as one entry or its parts); how each attaches
+  to a run (R-SKL-2's levels, a persona on a step, a mod only for agents that support it); what
+  **workflows** are against kinds' step graphs (ANA-33): the review's workflows are global templates
+  with real loops (`changes requested`, `fails`, `retries`) and relations (`next`, `approved`,
+  `asks you`, `if`), steps naming a persona and an agent or "any agent" (personas carry no agent),
+  picked per run by a light model or pinned per item, unrolled by the run, changeable by the agent at
+  run time behind a setting; and the **light model** setting, which partly reverses ANA-30. The
+  skeleton's Toolbox and workflow editor are the reference. Not blocked; read beside ANA-33.
+- [ ] **ANA-41 - Project workflows** (from the UI redesign review, `docs/ui-redesign-findings-2026-10-15.md` §8). `R-ORCH-1`,
+  `R-ORCH-14`, `R-ORCH-6`, `R-ID-6`. A workflow that drives a **whole project's implementation**,
+  coordinating its items automatically (which to start, in what order, when to stop), above the
+  per-item workflows of ANA-40. Settle how it relates to the project and workspace coordinators
+  (ANA-34), auto mode's queue (`R-ORCH-6`), ANA-33's planned graphs, and `R-ID-6`'s line between item
+  work and bookkeeping. Wanted later, by maintainer decision; blocked on ANA-34 and ANA-40.
+- [ ] **ANA-42 - Execution targets: where an item runs** (from the UI redesign review,
+  `docs/ui-redesign-findings-2026-10-15.md` §4.2a). `R-ORCH-15`, `R-ORCH-12`, `R-ENT-17`, `R-SEC-5`, `R-AGT-11`, `R-BOX-4`,
+  `R-NF-2`. Each item runs on a target: this box, docker on this box (a sandbox like `scripts/hr`:
+  fresh clone, private compose project, toolchain image), a remote machine over SSH, docker on a
+  remote machine (a docker context over SSH), or a box enrolled with an `htui` server (MOD-47, phase
+  2). The default cascades Settings → workspace → project → workflow → item. Wherever it runs, `htui`
+  prepares the code, the item's components (compose), environment and secrets, and the agents, the
+  htui agent installing and logging in what is missing; the work comes back by collecting the branch
+  as `scripts/hr collect` does. Settle: what a target is in the store and how it relates to boxes
+  (`R-BOX-1..4`) and MOD-43's target box; where the agent process runs for each kind (MOD-44's container
+  environment is one answer); how sessions, permissions and the MCP relay reach a remote target
+  without the DSN leaving this box; how secrets reach it (`R-SEC-2`); collecting a branch from a
+  container or a remote checkout; and `R-NF-2` (docker as an opt-in per-target dependency). Not
+  blocked; read beside MOD-43, MOD-44 and MOD-47.
 
 ### Next features
 - [ ] **MOD-27 - Swarm RunKind & task MCP Tool (from ANA-13).** Add `RunKind::Swarm` to `htui-orch`, implement `spawn_subagent` MCP tool with JSON schema validation and isolated worktrees. `htui-orch`, its `Isolator` seam and `run_worker.rs` exist since MOD-4 (done, `docs/decisions/mod/mod-4.md`); the MCP half needs MOD-11.
@@ -381,7 +423,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   concepts-search, workspace-switcher and path-picker overlays mark their cursor row with `accent`
   alone, which is bold-only under `NO_COLOR`. Style only. Not blocked; touches views that MOD-81
   and MOD-82 also rewrite, so run it after them or beside them with care (MOD-67 is done,
-  `docs/decisions/mod/mod-67.md`).
+  `docs/decisions/mod/mod-67.md`). **Absorbed by MOD-115** (UI redesign review, 2026-10-17): the
+  redesign gives each tab an accent and keys a kind colour; closes when MOD-115 lands.
 - [ ] **MOD-81 - Narrow and wide terminal widths** (from the TUI design review of 2026-10-04,
   https://claude.ai/artifact/TxAriNUvRpTifJy8Wq6HeH findings 4, 14). `R-TUI-1`, `R-TUI-2`,
   `R-TUI-8`. Below 100 columns the Settings > Agents table drops its name column, the only
@@ -393,6 +436,7 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   width, shorten statuses below about 90 columns, mark a clipped strip with `›`, wrap or scroll the
   Prompt pane, and cap the list width so the detail pane takes the rest. Rows fit through
   `ui::cells` (MOD-60). MOD-67 is done (`docs/decisions/mod/mod-67.md`): hints now sit in one row above the status line.
+  **Absorbed by MOD-115** (UI redesign review, 2026-10-17): closes when MOD-115 lands.
 - [ ] **MOD-82 - Shared pane chrome: sub-tabs, detail header, overlays, Settings layouts** (from
   the TUI design review of 2026-10-04, https://claude.ai/artifact/TxAriNUvRpTifJy8Wq6HeH findings 9,
   13, 15, 16). `R-TUI-1`, `R-TUI-3`, `R-TUI-7`, `R-TUI-8`. Secondary navigation comes in three
@@ -407,6 +451,7 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   where its hint row says `R rebuild cache`; settle on table and key-value with shared label widths.
   MOD-67 is done (`docs/decisions/mod/mod-67.md`); carried here from it: the Prompt pane header's `n / p · N
   templates` and the Skills/Templates pane titles' ` J/K scroll ` still name keys as literal pane chrome.
+  **Absorbed by MOD-115** (UI redesign review, 2026-10-17): closes when MOD-115 lands.
 - [ ] **MOD-83 - Display labels and actionable errors** (from the TUI design review of 2026-10-04,
   https://claude.ai/artifact/TxAriNUvRpTifJy8Wq6HeH findings 10, 12). `R-TUI-1`, `R-TUI-4`,
   `R-TUI-8`. Internal values reach the screen: snake_case statuses (`awaiting_approval`), source tags
@@ -415,7 +460,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   Give each shown enum a display label and add one pluralising helper. Errors name no next step
   (`qdrant: query: connection refused`, `hierarchy needs Postgres`); each one says where to fix it
   (for example Settings > Connection or Settings > Qdrant). Not blocked; copy only, but it shares
-  snapshots with MOD-81 and MOD-82, so it lands beside or after them.
+  snapshots with MOD-81 and MOD-82, so it lands beside or after them. **Absorbed by MOD-115** (UI
+  redesign review, 2026-10-17): closes when MOD-115 lands.
 - [ ] **MOD-75 - Agent question tool: an MCP tool that parks the step for a person** (from MOD-69,
   `.claude/prds/mod-69-waiting-on-you.prd.md`). `R-MCP-1..4`, `R-TUI-11`. A step's agent that
   finds something it did not expect, or needs an opinion, has no way to ask: the question lands in
@@ -440,6 +486,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   key toggle like the Runs pane's `v`. Open in the plan: node content and size, layout of cycles and items with
   several parents, re-rooting from a node (the tree's `Enter` emits `Action::Reveal`), and how the hop depth
   (`+`/`-`) sits beside the flow's zoom. Not blocked; its toggle is a catalogue action (MOD-67, `docs/decisions/mod/mod-67.md`).
+  **Absorbed by MOD-120** (UI redesign review, 2026-10-17): the item graph becomes a rataflow graph
+  outright; closes when MOD-120 lands.
 
 - [ ] **MOD-94 - Answer a relayed permission request from outside the TUI** (from ANA-29,
   `docs/ANA-29.md` §5.1 C3). `R-TUI-4`, `R-TUI-6`, `R-HIS-1`, `R-ID-6`. MOD-42's executor waits for
@@ -500,7 +548,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   a deterministic sweep (`R-ID-6`) that deletes run-step event rows older than the window, keeping
   run and step summaries and every document; `None` keeps everything (the default). Settle in the plan
   which process runs it (TUI on connect, the worker, or both under one lock), and what the cache
-  (`R-STO-3`) does with rows it still holds. Not blocked.
+  (`R-STO-3`) does with rows it still holds. Not blocked. **UI redesign review (2026-10-17),
+  `R-HIS-3`:** archived step transcripts follow the same window; a transcript a person pins is kept.
 - [ ] **MOD-101 - Record the agent exit code on `run_step`** (from the 2026-10-14 requirements
   audit). `R-ORCH-11`. Every engine `finish_step` passes `exit_code: None`
   (`crates/htui-orch/src/engine.rs:1636`, `:2743`, `:3777`, `:4570`, `:5038`) and Postgres overwrites
@@ -523,7 +572,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   "Chat (one per session)" does not hold. A free-standing chat always starts against
   `ctx.projects.first()` (`chat/mod.rs:355`), so in a multi-project workspace no other project can be
   chosen. Also settle whether tool results show their content or only flip the call's status
-  (`chat/transcript.rs:250-264`). Not blocked. **Requirements review (2026-10-15), `R-TUI-6`
+  (`chat/transcript.rs:250-264`). Not blocked; the UI redesign's Chat groups are MOD-121, settle
+  together. **Requirements review (2026-10-15), `R-TUI-6`
   amended:** a free-standing chat runs against the **active workspace**, or the project when there is
   no workspace, whatever folder `htui` started in; there is no project picker. Tool results **show
   their content** (collapsible). The agent and model are chosen when the chat starts.
@@ -619,8 +669,9 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   ANA-33's. Not blocked.
 - [ ] **MOD-113 - Prompt library: templates and skills** (from the 2026-10-15 requirements review).
   `R-PRM-4`, `R-SKL-1`, `R-SKL-2`, `R-SKL-4`, `R-TUI-1`, `R-TUI-7`. (1) A **template library**
-  shared across projects and workspaces, with per-project overrides, in its own **Templates tab**,
-  where today Templates is a sub-tab of Skills. (2) Skill attachments gain **workspace** and
+  shared across projects and workspaces, with per-project overrides, as a **group of the Toolbox
+  tab** (amended by the UI redesign review, 2026-10-17: not a Templates tab of its own; the Toolbox
+  is MOD-124, after ANA-40). (2) Skill attachments gain **workspace** and
   **item-kind** levels (phase > kind > project > workspace > global), extending MOD-9's resolution
   (ANA-22). (3) Skills carry **resources** (scripts, references, files), and the prompt and session
   learn to deliver them. (4) **Import** whole skill folders and Claude Code plugins, resources
@@ -643,6 +694,105 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   `docs/REQUIREMENTS.md` into the requirement tables MOD-38 added (`docs/decisions/mod/mod-38.md`), map each `DECISIONS.md` status to
   `item.resolution` (`shipped` → `done`), write-ups to `summary` documents and each analysis doc to
   the `verdict` document, and scan body `R-` IDs once into `addresses` citations.
+
+- [ ] **MOD-115 - TUI shell: header, panes, layouts, history, widget kit** (from the UI redesign
+  review, `docs/ui-redesign-findings-2026-10-15.md` §3, §9). `R-TUI-1`, `R-TUI-10`, `R-TUI-12`, `R-TUI-13`, `R-TUI-18`. The
+  btop-style shell every tab sits in: the one-row header (workspace, tabs with accents, history chip,
+  counts, background workspaces), rounded panes with titles and sub-tab chips in the top border and
+  the focused pane's hints in the bottom one, the toggleable "about this tab" panel (`F1`), per-tab
+  layout presets (IDE, IDE + activity, three columns, focus) with resizable splits, show/hide, zoom,
+  all saved the moment they change; navigation defaults (arrows stay in a pane, `Tab`/`Ctrl ←→`
+  between panes, `Shift ←→` sub-tabs, digits tabs, no AltGr-only key); browser-style history over
+  jumps, tabs, sub-tabs and panes; the leave dialog (work keeps running). Build it as a **shared
+  widget kit** (pane, tree list with groups, filter and selection band, form rows with inline help,
+  key chips, empty state, modal frame, legend) so tabs stop drawing their own (`backlog/mod.rs` and
+  `settings/agents.rs` split along these lines); kind colours, glyph + human word for every status.
+  **Absorbs MOD-81, MOD-82, MOD-83 and MOD-85**, which close when it lands. The 199 insta snapshots
+  are rewritten tab by tab. Not blocked; the other redesign items build on it.
+- [ ] **MOD-116 - Workspaces tab and workspace lifecycle** (from the UI redesign review,
+  `docs/ui-redesign-findings-2026-10-15.md` §4.1). `R-TUI-14`, `R-ENT-2`, `R-ORCH-16`, `R-TUI-18`. A new tab listing every saved
+  workspace with its state (open, background with runs going, stopping, stopped), an overview and
+  its projects; opening one backgrounds the current one without interrupting its runs; stopping and
+  resuming runs from here (MOD-125), both stops confirmed; the overview (state, folder, description,
+  goals, projects, components, the default target with `T`, stopped runs); new-workspace form with
+  its folder (default `~/workspaces/<name>`) and a preview of what is created there; new-project form
+  (existing folder, git URL, new repo), each getting a coordinator chat. Replaces the workspace
+  switcher overlay and Settings' workspace field. The lifecycle lives in the store and the worker;
+  the TUI reflects it. Blocked on MOD-115; the folder needs `R-ENT-2`'s amendment in ANA-35's schema.
+- [ ] **MOD-117 - Workspace components: catalogue, compose, start and stop** (from the UI redesign
+  review, `docs/ui-redesign-findings-2026-10-15.md` §4.1 Components). `R-ENT-17`, `R-SEC-5`, `R-TUI-14`. The catalogue in
+  Postgres (types, kinds, images, versions, emulated services or clouds), seeded at first start and
+  updated from a catalogue file published in the repo plus registry tags, user kinds allowed; the
+  add-component wizard (type → kind → version → services, or clouds for floci → name and free port →
+  compose preview); the generated compose file in the workspace folder (passwords as variables from
+  Secrets, named volumes, floci's AWS 4566, Azure 4577 with the docker socket, GCP 4588, Oracle 4599
+  and console 4500, only the clouds chosen); per-project use (the workspace's, its own on a free
+  port, none) and the env each project gets; `Space` starts or stops one component; the `.env` in
+  Infisical at `/<workspace>/<project>` or beside the compose file. Blocked on MOD-116.
+- [ ] **MOD-118 - Requirements in Workspaces: nesting, splits, graph** (from the UI redesign review,
+  `docs/ui-redesign-findings-2026-10-15.md` §4.1 Requirements). `R-ENT-14`, `R-ENT-15`, `R-TUI-14`, `R-TUI-17`, `R-ID-6`.
+  Requirements move from their own tab into Workspaces, per workspace and per project: a tree with
+  nesting (`R-2` → `R-2.1`), each covering item and linked requirement a selectable row that jumps
+  there (history), a graph view (`v`); new requirements through the describe → rewrite → review
+  modal, scope picked, "refines" guessed; a workspace requirement split into project requirements
+  (keep or drop each), shown as "split into ⇢" and "↑ from" rows, its coverage derived from theirs;
+  agent proposals and edits as drafts a person accepts. Blocked on MOD-116, and on ANA-35 for
+  workspace-owned requirements and their keys.
+- [ ] **MOD-119 - Backlog redesign: list options, new-item modal, run setup** (from the UI redesign
+  review, `docs/ui-redesign-findings-2026-10-15.md` §4.2, §4.2a). `R-TUI-2`, `R-TUI-3`, `R-TUI-17`, `R-ORCH-15`, `R-ORCH-1`. IDE
+  proportions (list about 24%); `h` shows or hides done items, `g` cycles grouping (project, kind,
+  status in attention order), both persisted (they leave Settings' Hierarchy); the new-item modal
+  (describe with the project preset from the item on screen, light-model rewrite, review, talk it
+  through with a live draft, resizable and remembered; the chat becomes the item's first chat); a
+  second status line ("runs on … · workflow …") and `t` "how it runs": target (inherit or one) and
+  workflow (auto or pinned). Blocked on MOD-115; targets beyond this box need ANA-42, workflows need
+  ANA-40.
+- [ ] **MOD-120 - Graphs redesign: item, run and template graphs** (from the UI redesign review,
+  `docs/ui-redesign-findings-2026-10-15.md` §5). `R-TUI-4`, `R-TUI-5`, `R-TUI-7`, `R-TUI-14`. All graphs on rataflow: zoom 1
+  centred on what matters, keyboard and mouse pan and zoom, dotted background, nodes movable by drag
+  or `M` without touching links (edges not reconnectable), `L` legend/labels, minimap, direction,
+  `r` re-layout; the item graph top to bottom with requirements and typed links (refines, covered
+  by, blocks, follow-up, relates to), Enter navigating; the run graph as the workflow carried out
+  (prepare, pick, rounds, parts, collect; Enter by state: live chat, archived transcript, nothing);
+  the requirements graph; the tmux wheel hint and its docs section. §5.4 of the findings lists the
+  rataflow pitfalls (overlapping components, rank spacing 1, double fit requests, loop handles).
+  **Absorbs MOD-88**, which closes when it lands. Blocked on MOD-115.
+- [ ] **MOD-121 - Chat groups, coordinators and the htui agent** (from the UI redesign review,
+  `docs/ui-redesign-findings-2026-10-15.md` §4.3). `R-TUI-6`, `R-AGT-11`, `R-ORCH-14`, `R-HIS-2`, `R-HIS-3`. The Chat tab lists
+  every session in groups: the htui agent (in every workspace), the workspace coordinator, one per
+  project, item runs, archived step transcripts (read-only, pinnable); an item run's chat is
+  view-only while the agent works and writable when it asks; permissions answered with `a`/`A`/`r`.
+  The htui agent itself: settings, Toolbox entries, agent rows, targets and the catalogue, acting
+  without asking only on reads, catalogue updates and Toolbox additions. Overlaps MOD-103 (chat per
+  session): settle together. Blocked on MOD-115; coordinators need ANA-34.
+- [ ] **MOD-122 - Activity panel and Logs tab** (from the UI redesign review, `docs/ui-redesign-findings-2026-10-15.md` §4.4,
+  §4.7). `R-TUI-15`, `R-TUI-16`. The activity panel (newest first, needs-you pinned with a count,
+  Enter jumps to the source with history, filters: all workspaces, needs you, failures, this
+  workspace, live across background workspaces) and the Logs tab (`htui`'s own log by source with
+  counts, levels, minimum level, follow, scroll pausing it). Blocked on MOD-115.
+- [ ] **MOD-123 - Settings redesign** (from the UI redesign review, `docs/ui-redesign-findings-2026-10-15.md` §4.5). `R-TUI-8`,
+  `R-ORCH-15`, `R-ORCH-1`, `R-ENT-17`. Fields edit on their row with help beneath; `←`/`→` change a
+  choice or toggle, saved at once; Connection renamed **Postgres**; Backlog › Hierarchy removed (its
+  options are Backlog keys, MOD-119); new sections **Targets** (list, add through the htui agent,
+  default), **Workflows** (light model chosen from the configured agents' models, run-time changes
+  ask or automatic, default workflow) and **Catalogue** (source, last update, update now). Overlaps
+  MOD-109's surfaces: land beside it. Blocked on MOD-115.
+- [ ] **MOD-124 - Toolbox tab and workflow editor** (from the UI redesign review, `docs/ui-redesign-findings-2026-10-15.md` §4.6).
+  `R-TUI-7`, `R-ORCH-1`, `R-PRM-4`. The Toolbox tab with the kinds ANA-40 settles (templates stay a
+  group here, MOD-113), and the workflow template editor: a rataflow graph with loops drawn through
+  side handles; `a` add, `e` edit (name, persona, agent or any agent, fan-out parts), `x` delete
+  (confirmed, links rewired), `c` connect or drag from a step's handle (relation picker), `i` links
+  or click a link (change, delete), right-click edits, `T` pins a target, undo/redo of every edit
+  (`u`/`U`, `Ctrl-Z`/`Ctrl-Y`); runs keep the version they started with. Blocked on ANA-40 and
+  MOD-115.
+- [ ] **MOD-125 - Stopping and resuming runs** (from the UI redesign review, `docs/ui-redesign-findings-2026-10-15.md` §4.1).
+  `R-ORCH-16`, `R-TUI-14`, `R-TUI-18`, `R-AGT-1`. Stop every run in a workspace, the open one
+  included: graceful stops each agent step before its next turn (a check or `htui`'s own step at
+  once), forced stops mid-turn; both confirmed, the conversation always saved; resume reopens each
+  agent's saved session (redoing an interrupted turn) and reruns checks; nothing new starts until
+  resumed. Settle in the plan how "before the next turn" maps onto ACP (cancel at a turn boundary,
+  session load) and the CLI adapter, and what the worker does for runs it owns (MOD-41). Not
+  blocked; its TUI half lands with MOD-116.
 
 ### Deferred backlog
 
@@ -713,7 +863,7 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 10 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-33 step graphs v2 and divided fan-out, ANA-34 coordinator, ANA-35 entity model for any project, ANA-36 further MCP tools, ANA-37 Qdrant required?, ANA-38 project memory, ANA-39 mandatory context tools) |
-| MOD-N   | 36 (MOD-16 Windows verification, MOD-27 swarm, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
+| ANA-N   | 13 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-33 step graphs v2 and divided fan-out, ANA-34 coordinator, ANA-35 entity model for any project, ANA-36 further MCP tools, ANA-37 Qdrant required?, ANA-38 project memory, ANA-39 mandatory context tools, ANA-40 Toolbox, ANA-41 project workflows, ANA-42 execution targets) |
+| MOD-N   | 47 (MOD-16 Windows verification, MOD-27 swarm, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-115 TUI shell, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
 | CLEAN-N | 0 |
 | TOOL-N  | 2 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check) |
