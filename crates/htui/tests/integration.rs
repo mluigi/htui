@@ -50,18 +50,18 @@ async fn the_demo_shell_starts_inside_the_first_workspace_on_the_backlog_tab() {
         harness.app().overlays.is_empty(),
         "the startup workspace was entered from the first reply, so no switcher was ever opened"
     );
-    assert_eq!(
-        top_bar(&frame),
-        "Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting",
-        "the top bar reads the startup scope"
+    let header = top_bar(&frame);
+    assert!(
+        header.starts_with("Graphics") && header.contains("0 working · 0 waiting · memory"),
+        "the header reads the startup scope: {header}"
     );
     assert!(
-        frame.contains(" 1 Backlog  2 Skills  3 Requirements  4 Settings"),
-        "the tab strip is in registration order: {frame}"
+        frame.contains(" \u{b9}Backlog  \u{b2}Skills  \u{b3}Requirements  \u{2074}Settings"),
+        "the tab chips are in registration order: {frame}"
     );
     assert!(
-        frame.contains("w workspaces"),
-        "the status line advertises the global `w` binding: {frame}"
+        harness.app().keys_line().contains("w workspaces"),
+        "the global `w` binding is offered"
     );
     insta::assert_snapshot!("demo_shell", frame);
 }

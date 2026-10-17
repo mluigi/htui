@@ -29,6 +29,7 @@ select_tab_7 = ["7"]        # select tab
 select_tab_8 = ["8"]        # select tab
 select_tab_9 = ["9"]        # select tab
 help         = ["?", "f1"]  # help
+about        = ["f9"]       # about
 workspaces   = ["w"]        # workspaces
 find         = ["ctrl-f"]   # find
 waiting      = ["ctrl-w"]   # waiting

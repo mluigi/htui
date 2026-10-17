@@ -10,8 +10,7 @@
 //! few cells. [`render`] returns the rects it drew the workspace and each tab chip into
 //! ([`HeaderHits`]); M1 wires no mouse handler to them.
 //!
-//! Task 0 of M1 declared the surface; `top_bar` keeps drawing the frame until task 5, which also
-//! adds `Act::About` (`F9`) in front of [`HEADER_CHIPS`].
+//! The key chips read `F9 about ? keys`; both chords come from [`Keys`].
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -40,9 +39,8 @@ const SUPERSCRIPT: [&str; 9] = [
 ];
 
 /// The key chips at the right end of the header: `(action, word)`, each label resolved through
-/// [`Keys`] so a rebound action shows its new chord and an unbound one is skipped. Task 5 puts
-/// `Act::About` (`F9 about`) in front of `?`.
-const HEADER_CHIPS: &[(Act, &str)] = &[(Act::Help, "keys")];
+/// [`Keys`] so a rebound action shows its new chord and an unbound one is skipped: `F9 about ? keys`.
+const HEADER_CHIPS: &[(Act, &str)] = &[(Act::About, "about"), (Act::Help, "keys")];
 
 /// A message that replaces the header's right side for a moment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -410,6 +408,9 @@ mod tests {
             "0 waiting",
             "memory",
             "DESKTOP-HTUI",
+            "F9",
+            "about",
+            "?",
             "keys",
         ];
         let columns: Vec<u16> = order.iter().map(|part| column(&buffer, part)).collect();
@@ -421,7 +422,7 @@ mod tests {
     /// store; the waiting count outlives them all, and the left side is never cut for them.
     #[test]
     fn the_right_side_drops_its_lowest_priority_part_first_when_narrow() {
-        // Left is 8 + 2 + 10 + 9 = 29 cells; the right side needs 56, joined, and a gap of 2.
+        // Left is 8 + 2 + 10 + 9 = 29 cells; the right side needs 68, joined, and a gap of 2.
         let kept = |width: u16| -> Vec<&'static str> {
             let (buffer, _) = draw(width, &state());
             let text = line(&buffer);
@@ -435,10 +436,10 @@ mod tests {
                 .collect()
         };
         assert_eq!(
-            kept(87),
+            kept(99),
             ["DESKTOP-HTUI", "keys", "1 working", "memory", "0 waiting"]
         );
-        assert_eq!(kept(86), ["keys", "1 working", "memory", "0 waiting"]);
+        assert_eq!(kept(98), ["keys", "1 working", "memory", "0 waiting"]);
         assert_eq!(kept(70), ["1 working", "memory", "0 waiting"]);
         assert_eq!(kept(55), ["memory", "0 waiting"]);
         assert_eq!(kept(45), ["0 waiting"]);
@@ -552,20 +553,29 @@ mod tests {
         }
     }
 
-    /// The `?` chip's chord is whatever `Keys` says: rebound to `F9` it reads `F9`, unbound the
-    /// chip (and its word) is gone, never a bare word.
+    /// The chips' chords are whatever `Keys` says: `F9 about ? keys` by default, help rebound to
+    /// `F12` reads `F12`, unbound the chip (and its word) is gone, never a bare word.
     #[test]
     fn a_key_chip_is_labelled_through_keys() {
         let theme = Theme::default();
-        assert!(line(&draw(120, &state()).0).contains(" ?  keys"));
-        let f9 = Keys::defaults().with_chords(Context::Global, Act::Help, &["f9"]);
-        let (buffer, _) = draw_with(120, &state(), None, &f9, &theme);
-        assert!(line(&buffer).ends_with(" F9  keys"), "{}", line(&buffer));
+        assert!(line(&draw(120, &state()).0).ends_with(" F9  about   ?  keys"));
+        let f12 = Keys::defaults().with_chords(Context::Global, Act::Help, &["f12"]);
+        let (buffer, _) = draw_with(120, &state(), None, &f12, &theme);
+        assert!(line(&buffer).ends_with(" F12  keys"), "{}", line(&buffer));
         let unbound = Keys::defaults().with_chords(Context::Global, Act::Help, &[]);
         let (buffer, _) = draw_with(120, &state(), None, &unbound, &theme);
         let text = line(&buffer);
-        assert!(!text.contains("keys"), "{text}");
-        assert!(text.ends_with("DESKTOP-HTUI"), "{text}");
+        assert!(
+            !text.contains("keys") && text.ends_with(" F9  about"),
+            "{text}"
+        );
+        let no_about = Keys::defaults().with_chords(Context::Global, Act::About, &[]);
+        let (buffer, _) = draw_with(120, &state(), None, &no_about, &theme);
+        let text = line(&buffer);
+        assert!(
+            !text.contains("about") && text.ends_with(" ?  keys"),
+            "{text}"
+        );
     }
 
     /// MOD-69 plan T3.3, MOD-80 D6: `M waiting` is a warning exactly when a person is owed
@@ -687,7 +697,7 @@ mod tests {
         let text = line(&buffer);
         assert!(text.starts_with("no workspace"), "{text}");
         assert!(
-            text.ends_with("0 working \u{b7} 0 waiting \u{b7} no box \u{b7}  ?  keys"),
+            text.ends_with("0 working \u{b7} 0 waiting \u{b7} no box \u{b7}  F9  about   ?  keys"),
             "{text}"
         );
     }

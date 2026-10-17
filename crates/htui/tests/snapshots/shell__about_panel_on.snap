@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/shell.rs
+expression: shown
+---
+Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat         0 working · 0 waiting · memory
+╭─ About ──────────────────────────────────────────────────────────────────────────────────────────╮
+│ Your work items: open one for its body, runs and notes, and queue it for an agent.               │
+│  N  new item   f  filter   Q  queue   e  edit                                                    │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+┌ Backlog (2) ────────────────────────────────────────┐┌ FEAT-1 ───────────────────────────────────┐
+│▾ Vulkan Tutorials (2)                               ││ Body Runs Graph Docs Notes Prompt Reqs    │
+│  FEAT-1  in_progress  Chapter 12 parity             ││Chapter 12 parity                          │
+│  TOOL-1  open         Shader build script           ││FEAT-1  FEAT  in_progress                  │
+│                                                     ││gpu, vulkan · priority 0 · version 1       │
+│                                                     ││                                           │
+│                                                     ││No body for this item.                     │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+└─j/k move · h/l sub-tab · f filter · N new · e edit──┘└───────────────────────────────────────────┘

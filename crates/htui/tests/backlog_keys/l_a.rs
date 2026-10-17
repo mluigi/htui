@@ -163,17 +163,12 @@ async fn a_backlog_table_moves_the_filter_key() {
 }
 
 /// The status line of a capturing mode under `register_all` (D9).
-const FILTERED: &str = "Ctrl+c quit · F1 help · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue";
+const FILTERED: &str =
+    "Ctrl+c quit · F1 help · F9 about · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue";
 
-/// The status line: the frame's last row, trailing blanks dropped.
+/// The keys line the status row listed before MOD-115 (nothing draws it any more).
 fn status_line(harness: &mut Harness) -> String {
-    harness
-        .render()
-        .lines()
-        .last()
-        .unwrap_or_default()
-        .trim_end()
-        .to_owned()
+    harness.app().keys_line()
 }
 
 /// User-visible item 3: `F1` opens help from the item form (it swallowed function keys), the box
@@ -206,8 +201,8 @@ async fn f1_opens_help_from_the_item_form_and_the_form_stays() {
     );
 }
 
-/// D9: a capturing Backlog form reports its modal stack, so the status line is the filtered one:
-/// `Ctrl+c quit · F1 help`, then the chords `register_all` offers (`Ctrl+f`, `Ctrl+w`, `Ctrl+q`),
+/// D9: a capturing Backlog form reports its modal stack, so the keys line is the filtered one:
+/// `Ctrl+c quit · F1 help · F9 about`, then the chords `register_all` offers (`Ctrl+f`, `Ctrl+w`, `Ctrl+q`),
 /// and none of the browse keys (`q`, `Tab`, digits, `?`, `w`).
 #[tokio::test]
 async fn a_capturing_backlog_form_shows_the_filtered_status_line() {
@@ -409,10 +404,17 @@ async fn a_rebound_external_editor_hands_the_body_out() {
     assert_eq!(edit.text, "A note by hand.");
 }
 
-/// The shell's hint row (MOD-67 M6 T2): the frame's second-to-last row, trailing blanks dropped.
+/// The hints (MOD-67 M6 T2): MOD-115 draws them on the body's bottom border, the frame's last
+/// row, so this is that row with the rule and the corners trimmed off.
 fn hint_row(frame: &str) -> String {
-    let rows: Vec<&str> = frame.lines().collect();
-    rows[rows.len() - 2].trim_end().to_owned()
+    frame
+        .lines()
+        .last()
+        .unwrap_or_default()
+        .trim_matches([
+            '\u{2514}', '\u{2518}', '\u{2500}', '\u{2570}', '\u{256f}', ' ',
+        ])
+        .to_owned()
 }
 
 /// The filter form's four rows, as drawn in the list pane: borders and padding off (its keys are

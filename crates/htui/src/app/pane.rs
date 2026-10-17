@@ -1113,6 +1113,11 @@ mod tests {
         out
     }
 
+    /// The header row's flash (MOD-115): the status text now rides the right of row 0.
+    fn flash_row(buffer: &Buffer) -> String {
+        row_from(buffer, 0, 0).trim_end().to_owned()
+    }
+
     /// Row `y` of the buffer from column `x`.
     fn row_from(buffer: &Buffer, x: u16, y: u16) -> String {
         (x..buffer.area.right())
@@ -1684,30 +1689,27 @@ mod tests {
         let term = draw(&mut app, 100, 30);
         let buffer = term.backend().buffer();
         assert!(
-            row_from(buffer, 0, 29).starts_with(&format!("{NOTICE}q quit \u{b7} ")),
+            flash_row(buffer).ends_with(NOTICE.trim_end_matches(" \u{b7} ")),
             "{}",
-            row_from(buffer, 0, 29)
+            flash_row(buffer)
         );
         insta::assert_snapshot!("another_tab_while_editing", text(buffer));
 
         app.keys = Keys::defaults().with_chords(Context::Editor, Act::EditorFocus, &["f12"]);
         let term = draw(&mut app, 100, 30);
-        assert!(
-            row_from(term.backend().buffer(), 0, 29)
-                .starts_with("editing in asker \u{b7} F12 back \u{b7} q quit")
-        );
+        assert!(flash_row(term.backend().buffer()).ends_with("editing in asker \u{b7} F12 back"));
 
         app.status = Some("boom".to_owned());
         let term = draw(&mut app, 100, 30);
-        let row = row_from(term.backend().buffer(), 0, 29);
-        assert!(row.starts_with("boom") && !row.contains("editing"), "{row}");
+        let row = flash_row(term.backend().buffer());
+        assert!(row.ends_with("boom") && !row.contains("editing"), "{row}");
 
         app.status = None;
         app.push_overlay(Box::new(Shade));
         let term = draw(&mut app, 100, 30);
-        let row = row_from(term.backend().buffer(), 0, 29);
+        let row = flash_row(term.backend().buffer());
         assert!(
-            row.starts_with("editing in asker \u{b7} q quit") && !row.contains("back"),
+            row.ends_with("editing in asker") && !row.contains("back"),
             "{row}"
         );
     }
@@ -2145,12 +2147,11 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).expect("the file"), "body\n");
         assert_eq!(size, PaneSize::new(11, 60));
 
-        // Unclaimed: the body (100x26 under the top bar and the strip, above the hint row and
-        // the status line, MOD-67 M6 T2).
+        // Unclaimed: the body (100x29 under the one-row header, MOD-115).
         let (mut app, _benches) = shell(&[ASKER]);
         draw(&mut app, 100, 30);
         let spawned = open(&mut app, ASKER, &log);
-        assert_eq!(spawned.borrow()[0].1, PaneSize::new(25, 100));
+        assert_eq!(spawned.borrow()[0].1, PaneSize::new(28, 100));
 
         // Never drawn.
         let (mut app, _benches) = shell(&[ASKER]);
@@ -2206,7 +2207,7 @@ mod tests {
             open(&mut app, ASKER, &log);
             let term = draw(&mut app, 100, 30);
             assert!(
-                row_from(term.backend().buffer(), 0, 2).starts_with(FOCUSED_TITLE),
+                row_from(term.backend().buffer(), 0, 1).starts_with(FOCUSED_TITLE),
                 "{claim:?}: the rule is on the body's first row"
             );
         }
@@ -2235,8 +2236,8 @@ mod tests {
         // Still focused, but off screen: the other tab's own line, led by the open edit (MOD-57
         // M2 E6); not the way back, since the next key is swallowed (M2 R1 L-2).
         assert_eq!(app.editor_status(), None);
-        let status = row_from(term.backend().buffer(), 0, 29);
-        assert!(status.starts_with("editing in asker \u{b7} "), "{status}");
+        let status = flash_row(term.backend().buffer());
+        assert!(status.ends_with("editing in asker"), "{status}");
         assert!(!status.contains("back"), "{status}");
 
         app.on_key(plain('a'));
@@ -2385,8 +2386,8 @@ mod tests {
         app.push_overlay(Box::new(Prompt(Rc::clone(&heard))));
         let term = draw(&mut app, 100, 30);
         let buffer = term.backend().buffer();
-        assert!(row_from(buffer, 0, 2).starts_with(UNFOCUSED_TITLE));
-        assert!(row_from(buffer, 0, 29).starts_with(COVERED));
+        assert!(row_from(buffer, 0, 1).starts_with(UNFOCUSED_TITLE));
+        assert!(flash_row(buffer).ends_with(COVERED));
         assert!(!term.backend().cursor_visible());
 
         app.on_key(ctrl('4'));
@@ -2404,7 +2405,7 @@ mod tests {
         assert!(app.overlays.is_empty());
         assert_eq!(app.editor_status().as_deref(), Some(UNFOCUSED_STATUS));
         let term = draw(&mut app, 100, 30);
-        assert!(row_from(term.backend().buffer(), 0, 2).starts_with(UNFOCUSED_TITLE));
+        assert!(row_from(term.backend().buffer(), 0, 1).starts_with(UNFOCUSED_TITLE));
     }
 
     #[test]
@@ -2426,8 +2427,8 @@ mod tests {
         assert!(!app.help_visible, "the box closes");
         let term = draw(&mut app, 100, 30);
         let buffer = term.backend().buffer();
-        assert!(row_from(buffer, 0, 2).starts_with(FOCUSED_TITLE));
-        assert!(row_from(buffer, 0, 29).starts_with(FOCUSED_STATUS));
+        assert!(row_from(buffer, 0, 1).starts_with(FOCUSED_TITLE));
+        assert!(flash_row(buffer).ends_with(FOCUSED_STATUS));
         assert!(term.backend().cursor_visible());
 
         app.on_key(plain('a'));
@@ -2466,10 +2467,10 @@ mod tests {
         output(&mut app, b"ab\r\ncd");
         let mut term = draw(&mut app, 100, 30);
         assert!(term.backend().cursor_visible(), "focused: shown");
-        // Body at row 2, the rule on it, the screen below: row 1 of the screen is frame row 4.
+        // Body at row 1, the rule on it, the screen below: row 1 of the screen is frame row 3.
         assert_eq!(
             term.get_cursor_position().expect("a position"),
-            Position::new(2, 4)
+            Position::new(2, 3)
         );
 
         app.on_key(ctrl('4'));
@@ -2502,7 +2503,7 @@ mod tests {
         draw(&mut app, 120, 40);
         assert!(!app.dirty);
         app.resize_editor();
-        let size = PaneSize::new(35, 120);
+        let size = PaneSize::new(38, 120);
         assert_eq!(*log.borrow(), vec![Call::Resize(size)]);
         assert_eq!(
             app.editor.as_ref().map(|editor| editor.screen.size()),
@@ -2550,13 +2551,13 @@ mod tests {
     fn the_title_status_and_help_come_from_the_keys() {
         let (mut app, _benches, _log) = opened();
         let term = draw(&mut app, 100, 30);
-        assert!(row_from(term.backend().buffer(), 0, 2).starts_with(FOCUSED_TITLE));
-        assert!(row_from(term.backend().buffer(), 0, 29).starts_with(FOCUSED_STATUS));
+        assert!(row_from(term.backend().buffer(), 0, 1).starts_with(FOCUSED_TITLE));
+        assert!(flash_row(term.backend().buffer()).ends_with(FOCUSED_STATUS));
 
         app.on_key(ctrl('4'));
         let term = draw(&mut app, 100, 30);
-        assert!(row_from(term.backend().buffer(), 0, 2).starts_with(UNFOCUSED_TITLE));
-        assert!(row_from(term.backend().buffer(), 0, 29).starts_with(UNFOCUSED_STATUS));
+        assert!(row_from(term.backend().buffer(), 0, 1).starts_with(UNFOCUSED_TITLE));
+        assert!(flash_row(term.backend().buffer()).ends_with(UNFOCUSED_STATUS));
 
         app.on_key(plain('?'));
         let term = draw(&mut app, 100, 30);
@@ -2579,7 +2580,7 @@ mod tests {
         let (mut app, _benches, _log) = opened();
         app.keys = Keys::defaults().with_chords(Context::Editor, Act::EditorFocus, &["f12"]);
         let term = draw(&mut app, 100, 30);
-        assert!(row_from(term.backend().buffer(), 0, 2).starts_with(" nvim · F12 to htui "));
+        assert!(row_from(term.backend().buffer(), 0, 1).starts_with(" nvim · F12 to htui "));
         assert_eq!(
             app.editor_status().as_deref(),
             Some("the editor has the keys · F12 to htui")

@@ -255,11 +255,11 @@ mod tests {
 
     #[test]
     fn the_hint_follows_the_keys() {
-        let keys = load_str("[confirm]\nyes = [\"f9\"]\n").expect("the file loads");
+        let keys = load_str("[confirm]\nyes = [\"f8\"]\n").expect("the file loads");
         let bench = Bench::new().with_keys(keys);
 
         let frame = bench.render(&QuitConfirm::new());
-        assert!(frame.contains("F9 quit · n/Esc keep editing"), "{frame}");
+        assert!(frame.contains("F8 quit · n/Esc keep editing"), "{frame}");
     }
 
     #[test]

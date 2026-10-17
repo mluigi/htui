@@ -48,12 +48,14 @@ use ratatui::widgets::Paragraph;
 /// A DSN that parses and names a port nothing listens on (`tests/connection.rs`'s).
 const DEAD_DSN: &str = "postgres://htui:s3cret@127.0.0.1:1/htui?sslmode=disable";
 
-/// The status line of the bare shell: today's, which 72 snapshots pin.
-const BARE_STATUS: &str = "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help";
+/// The keys line of the bare shell, the one the status row listed before MOD-115.
+const BARE_STATUS: &str =
+    "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · F9 about";
 
-/// The status line with `register_all`, as a 100-column frame cuts it (34 snapshots pin it).
-const FULL_STATUS_CUT: &str = "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · \
-                               ? help · w workspaces · Ctrl+f find";
+/// The keys line with `register_all`.
+const FULL_STATUS: &str = "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · \
+                           ? help · F9 about · w workspaces · Ctrl+f find · Ctrl+w waiting · \
+                           Ctrl+q queue";
 
 /// The `?` box's closing line.
 const CLOSER: &str = "?/F1 closes this box";
@@ -77,14 +79,10 @@ fn top(harness: &mut Harness) -> Option<OverlayId> {
     harness.app().overlays.top().map(|overlay| overlay.id())
 }
 
-/// The last non-empty line of a frame: the status line.
-fn status_line(frame: &str) -> &str {
-    frame
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or_default()
-        .trim_end()
+/// The keys line the status row listed before MOD-115 (nothing draws it any more): the global
+/// keys the holder of the keyboard admits, from the same stack the `?` box reads.
+fn status_line(harness: &mut Harness) -> String {
+    harness.app().keys_line()
 }
 
 #[tokio::test]
@@ -325,10 +323,10 @@ async fn the_help_box_lists_ctrl_w_waiting_only_with_register_all() {
 #[tokio::test]
 async fn the_status_line_is_todays_in_both_harnesses() {
     let mut bare = shell(false).await;
-    assert_eq!(status_line(&bare.render()), BARE_STATUS);
+    assert_eq!(status_line(&mut bare), BARE_STATUS);
 
     let mut full = shell(true).await;
-    assert_eq!(status_line(&full.render()), FULL_STATUS_CUT);
+    assert_eq!(status_line(&mut full), FULL_STATUS);
 }
 
 /// A capturing Settings section on the agents form's stack: it types every printable chord and
@@ -514,7 +512,10 @@ async fn a_capturing_section_shows_the_filtered_status_line_and_box() {
             StackProbe,
         )])));
     harness.drive_to_end().await;
-    assert_eq!(status_line(&harness.render()), "Ctrl+c quit · F1 help");
+    assert_eq!(
+        status_line(&mut harness),
+        "Ctrl+c quit · F1 help · F9 about"
+    );
 
     harness.key("?");
     assert!(!harness.app().help_visible, "the probe typed `?`");
@@ -546,7 +547,7 @@ async fn an_overlay_with_a_stack_drives_the_status_line_and_box() {
     register_all(harness.app());
     harness.drive_to_end().await;
     assert_eq!(top(&mut harness), Some(OverlayId("overlay-probe")));
-    assert_eq!(status_line(&harness.render()), "Ctrl+c quit · F1 help");
+    assert_eq!(status_line(&mut harness), "Ctrl+c quit · F1 help");
 
     harness.key("?");
     assert!(
@@ -565,7 +566,7 @@ async fn an_overlay_with_a_stack_drives_the_status_line_and_box() {
 
     harness.key("esc");
     assert!(harness.app().overlays.is_empty(), "`Esc` closes the probe");
-    assert_eq!(status_line(&harness.render()), FULL_STATUS_CUT);
+    assert_eq!(status_line(&mut harness), FULL_STATUS);
 }
 
 #[tokio::test]
@@ -577,7 +578,7 @@ async fn with_keys_installs_the_keys() {
         .with_keys(keys);
     harness.drive_to_end().await;
     assert!(
-        status_line(&harness.render()).starts_with("F10 quit · Tab next tab"),
+        status_line(&mut harness).starts_with("F10 quit · Tab next tab"),
         "{}",
         harness.render()
     );

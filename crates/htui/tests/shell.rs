@@ -47,7 +47,8 @@ async fn open_over_demo() -> Harness {
     harness
 }
 
-/// The top bar, i.e. the first line of a rendered frame.
+/// The header, i.e. the first line of a rendered frame (MOD-115: it replaced the top bar and the
+/// tab strip).
 fn top_bar(frame: &str) -> String {
     frame.lines().next().unwrap_or_default().to_owned()
 }
@@ -109,10 +110,10 @@ async fn j_and_k_move_the_cursor_and_stop_at_the_ends() {
 #[tokio::test]
 async fn enter_switches_the_scope_and_the_top_bar_follows() {
     let mut harness = open_over_demo().await;
-    assert_eq!(
-        top_bar(&harness.render()),
-        "Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting",
-        "the fixture's only active run is in the other workspace"
+    let header = top_bar(&harness.render());
+    assert!(
+        header.starts_with("Graphics") && header.contains("0 working · 0 waiting · memory"),
+        "the fixture's only active run is in the other workspace: {header}"
     );
 
     harness.key("j");
@@ -141,10 +142,10 @@ async fn enter_switches_the_scope_and_the_top_bar_follows() {
     );
 
     let frame = harness.render();
-    assert_eq!(
-        top_bar(&frame),
-        "Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting",
-        "the top bar reads the new workspace and its active-run count"
+    let header = top_bar(&frame);
+    assert!(
+        header.starts_with("Platform") && header.contains("1 working · 1 waiting · memory"),
+        "the header reads the new workspace and its active-run count: {header}"
     );
     insta::assert_snapshot!("after_switch", frame);
 }
@@ -199,10 +200,10 @@ async fn the_top_bar_shows_the_offline_age() {
     let mut harness = shell_reporting("offline · 3m", None).await;
     let frame = harness.render();
 
-    assert_eq!(
-        top_bar(&frame),
-        "Graphics · DESKTOP-HTUI · offline · 3m · 0 working · 0 waiting",
-        "the store field is `Backend::label()` verbatim (plan D11)"
+    let header = top_bar(&frame);
+    assert!(
+        header.starts_with("Graphics") && header.contains("0 working · 0 waiting · offline · 3m"),
+        "the store field is `Backend::label()` verbatim (plan D11): {header}"
     );
     assert!(
         harness.app().overlays.is_empty(),
@@ -296,14 +297,9 @@ async fn ctrl_c_quits_from_the_modal_switcher() {
     assert!(harness.app().should_quit, "`ctrl-c` quits from it");
 }
 
-/// The last non-empty line of a frame: the status line.
-fn status_line(frame: &str) -> &str {
-    frame
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or_default()
-        .trim_end()
+/// The keys line the status row listed before MOD-115 (nothing draws it any more).
+fn status_line(harness: &mut Harness) -> String {
+    harness.app().keys_line()
 }
 
 /// MOD-67 M3 (D14): the prompt answers through `confirm.yes`/`confirm.no`, and chord equality
@@ -387,7 +383,7 @@ async fn a_migration_override_rebinds_yes() {
 #[tokio::test]
 async fn the_status_line_and_help_box_over_the_migration_prompt() {
     let mut harness = shell_reporting("online", Some(3)).await;
-    assert_eq!(status_line(&harness.render()), "Ctrl+c quit · ? help");
+    assert_eq!(status_line(&mut harness), "Ctrl+c quit · ? help");
     harness.key("?");
     assert!(harness.app().help_visible);
     let frame = harness.render();
@@ -416,7 +412,7 @@ async fn ctrl_j_does_not_move_the_switcher() {
 #[tokio::test]
 async fn the_status_line_and_help_box_over_the_switcher() {
     let mut harness = open_over_demo().await;
-    assert_eq!(status_line(&harness.render()), "Ctrl+c quit · ? help");
+    assert_eq!(status_line(&mut harness), "Ctrl+c quit · ? help");
     harness.key("?");
     assert!(harness.app().help_visible);
     let frame = harness.render();
@@ -432,9 +428,12 @@ async fn the_status_line_and_help_box_over_the_switcher() {
     assert!(!frame.contains("Backlog: "), "no legacy tab line: {frame}");
 }
 
-/// Row 28 of a 100x30 frame: the shell's hint row (MOD-67 M6 T2), trailing blanks trimmed.
+/// The hints of a 100x30 frame (MOD-67 M6 T2): MOD-115 draws them on the body's bottom border,
+/// the last row, so this is that row with the rule and the corners trimmed off.
 fn hint_row(frame: &str) -> &str {
-    frame.lines().nth(28).unwrap_or_default().trim_end()
+    frame.lines().last().unwrap_or_default().trim_matches([
+        '\u{2514}', '\u{2518}', '\u{2500}', '\u{2570}', '\u{256f}', ' ',
+    ])
 }
 
 /// The demo shell, every tab registered, settled on the Backlog.
@@ -458,10 +457,6 @@ async fn the_hint_row_shows_the_active_tabs_keys() {
         hint_row(&frame),
         "j/k move · h/l sub-tab · f filter · N new · e edit",
         "{frame}"
-    );
-    assert_eq!(
-        status_line(&frame),
-        frame.lines().nth(29).unwrap_or_default().trim_end()
     );
 }
 
@@ -489,4 +484,32 @@ async fn the_hint_row_follows_a_rebound_key() {
     let frame = harness.render();
     assert!(hint_row(&frame).contains("/ filter"), "{frame}");
     assert!(!hint_row(&frame).contains("f filter"), "{frame}");
+}
+
+/// MOD-115: the harness hides the about panel so the tabs keep the rows their tests were
+/// written against; `F9` brings it up under the header, and again takes it away.
+#[tokio::test]
+async fn f9_toggles_the_about_panel_under_the_header() {
+    let mut harness = shell_reporting("memory", None).await;
+    let hidden = harness.render();
+    assert!(!harness.app().about_visible, "the harness hides it");
+    assert!(!hidden.contains("About"), "{hidden}");
+
+    harness.key("f9");
+    let shown = harness.render();
+    assert!(harness.app().about_visible);
+    let rows: Vec<&str> = shown.lines().collect();
+    assert!(
+        rows[1].contains("About"),
+        "the panel opens right under the header: {shown}"
+    );
+    assert!(
+        rows[2].contains("Your work items"),
+        "the active tab's purpose leads: {shown}"
+    );
+    insta::assert_snapshot!("about_panel_on", shown);
+
+    harness.key("f9");
+    assert!(!harness.app().about_visible);
+    assert!(!harness.render().contains("About"));
 }

@@ -6262,8 +6262,11 @@ async fn f1_from_the_agents_form_opens_help_and_keeps_the_form() {
         "the form is open: {frame}"
     );
     assert!(
-        frame.contains("Ctrl+c quit \u{b7} F1 help"),
-        "the status line is the capturing one: {frame}"
+        harness
+            .app()
+            .keys_line()
+            .starts_with("Ctrl+c quit \u{b7} F1 help"),
+        "the keys line is the capturing one"
     );
 
     harness.key("f1");

@@ -95,20 +95,28 @@ fn select(harness: &mut Harness, key: &str) {
     panic!("`{key}` is not in the tree:\n{}", harness.render());
 }
 
-/// The status line: the frame's last line.
+/// The message on the right of the header (MOD-115: errors and the editor's line moved there from
+/// the status line).
 fn status(frame: &str) -> String {
-    frame.lines().last().unwrap_or_default().to_owned()
+    frame.lines().next().unwrap_or_default().to_owned()
 }
 
-/// The notice: the rows between the content's bottom border and the tab's filter row, joined (it
-/// wraps).
+/// The index of the content's bottom border: the lowest frame line that opens with a corner.
+/// MOD-115: the hints are drawn on it, no longer on a row of their own.
+fn bottom_border(frame: &str) -> usize {
+    let lines: Vec<&str> = frame.lines().collect();
+    lines
+        .iter()
+        .rposition(|line| line.starts_with(['\u{2514}', '\u{2570}']))
+        .unwrap_or_else(|| panic!("no bottom border:\n{frame}"))
+}
+
+/// The notice: the rows between the content's bottom border and the tab's filter row (the frame's
+/// last line), joined (it wraps).
 fn notice(frame: &str) -> String {
     let lines: Vec<&str> = frame.lines().collect();
-    let filter = lines.len() - 3;
-    let bottom = lines[..filter]
-        .iter()
-        .rposition(|line| line.starts_with('\u{2514}'))
-        .unwrap_or_else(|| panic!("no bottom border above the filter row:\n{frame}"));
+    let filter = lines.len() - 1;
+    let bottom = bottom_border(frame);
     lines[bottom + 1..filter]
         .iter()
         .map(|line| line.trim())
@@ -129,7 +137,9 @@ async fn the_tab_is_third_in_the_strip() {
     let mut harness = open().await;
     let frame = harness.render();
     assert!(
-        frame.contains(" 1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat"),
+        frame.contains(
+            " \u{b9}Backlog  \u{b2}Skills  \u{b3}Requirements  \u{2074}Settings  \u{2075}Chat"
+        ),
         "{frame}"
     );
 }
@@ -404,16 +414,19 @@ async fn a_stale_amend_keeps_the_form() {
     assert!(head.body.ends_with("Mine."), "{}", head.body);
 }
 
-/// The shell's hint row (MOD-67 M6 T2): the frame's line above the status line.
+/// The hints (MOD-67 M6 T2): MOD-115 draws them on the content's bottom border, so this is that
+/// line with the rule and the corners trimmed off.
 fn hint(frame: &str) -> String {
-    let lines: Vec<&str> = frame.lines().collect();
-    lines[lines.len() - 2].to_owned()
+    let line = frame.lines().nth(bottom_border(frame)).unwrap_or_default();
+    line.trim_matches([
+        '\u{2514}', '\u{2518}', '\u{2500}', '\u{2570}', '\u{256f}', ' ',
+    ])
+    .to_owned()
 }
 
-/// The tab's own last row, above the shell's hint row: the filter's input while it is open.
+/// The tab's own last row, the frame's last line: the filter's input while it is open.
 fn filter_row(frame: &str) -> String {
-    let lines: Vec<&str> = frame.lines().collect();
-    lines[lines.len() - 3].to_owned()
+    frame.lines().last().unwrap_or_default().to_owned()
 }
 
 /// The demo on the Requirements tab with `file` as the keys file (MOD-67 M4).
@@ -618,13 +631,12 @@ async fn a_write_in_flight_swallows_keys_but_save_says_so() {
 #[tokio::test]
 async fn the_requirements_tree_status_line_and_help_box() {
     let mut harness = open().await;
-    let frame = harness.render();
     assert_eq!(
-        status(&frame),
+        harness.app().keys_line(),
         "q quit \u{b7} Tab next tab \u{b7} Shift+Tab previous tab \u{b7} 1 select tab \u{b7} ? help \
-         \u{b7} w workspaces \u{b7} Ctrl+f find",
-        "{frame}"
+         \u{b7} F9 about \u{b7} w workspaces \u{b7} Ctrl+f find \u{b7} Ctrl+w waiting \u{b7} Ctrl+q queue"
     );
+    let frame = harness.render();
     assert_eq!(
         hint(&frame),
         "j/k move \u{b7} Enter fold \u{b7} / filter \u{b7} a area \u{b7} n new \u{b7} e amend \
@@ -695,22 +707,32 @@ fn style_at(buffer: &Buffer, y: u16, text: &str) -> Style {
     buffer[(u16::try_from(at).expect("a narrow row"), y)].style()
 }
 
-/// MOD-67 M6 T2 (PRD D1 "mirrored in the view as greyed keys"): in the shell's hint row the write
-/// keys are drawn dim, as the status line is, where a write would be refused, and in the move
-/// keys' style where one would be sent.
+/// The row of the content's bottom border in `buffer`, where MOD-115 draws the hints.
+fn border_y(buffer: &Buffer) -> u16 {
+    (0..buffer.area.height)
+        .rev()
+        .find(|y| buffer[(0, *y)].symbol() == "\u{2514}")
+        .expect("a bottom border")
+}
+
+/// MOD-67 M6 T2 (PRD D1 "mirrored in the view as greyed keys"): in the hints on the bottom border
+/// the write keys are drawn dim, as an idle tab chip in the header is, where a write would be
+/// refused, and in the move keys' style where one would be sent.
 #[tokio::test]
 async fn the_hint_row_greys_the_write_keys_where_a_write_is_refused() {
     let mut harness = open_platform_over(stranger_first()).await;
     let buffer = harness.render_buffer();
-    let dim = style_at(&buffer, 29, "q quit");
-    assert_eq!(style_at(&buffer, 28, "a area"), dim, "not the maintainer");
-    assert_ne!(style_at(&buffer, 28, "j/k move"), dim);
+    let dim = style_at(&buffer, 0, "\u{b2}Skills");
+    let y = border_y(&buffer);
+    assert_eq!(style_at(&buffer, y, "a area"), dim, "not the maintainer");
+    assert_ne!(style_at(&buffer, y, "j/k move"), dim);
 
     let mut harness = open().await;
     let buffer = harness.render_buffer();
+    let y = border_y(&buffer);
     assert_eq!(
-        style_at(&buffer, 28, "a area"),
-        style_at(&buffer, 28, "j/k move"),
+        style_at(&buffer, y, "a area"),
+        style_at(&buffer, y, "j/k move"),
         "the maintainer"
     );
 }

@@ -628,12 +628,12 @@ fn stable_step() -> insta::Settings {
 }
 
 /// The transcript area of a rendered frame: everything between the tab's header line and its
-/// hint line. Four lines of chrome above (top bar, tab strip, block border, header) and three
-/// below (hint, block border, status line), all fixed by the layout — which is exactly why the
-/// live and the replayed body can be compared line for line.
+/// bottom border. Three lines of chrome above (the header row, the block border, the tab's own
+/// header) and one below (the block border, which carries the hints), all fixed by the layout —
+/// which is exactly why the live and the replayed body can be compared line for line.
 fn body_lines(render: &str) -> Vec<&str> {
     let lines: Vec<&str> = render.lines().collect();
-    lines[4..lines.len() - 3].to_vec()
+    lines[3..lines.len() - 1].to_vec()
 }
 
 /// A shell over the demo fixture with a Chat tab and nothing running in it.
@@ -2052,21 +2052,23 @@ async fn a_harness_without_a_runtime_renders_the_refusal() {
 // ended), `CHAT_REPLAY` and, while the composer is open, `CAPTURE` (PA-4).
 // ---------------------------------------------------------------------------------------------
 
-/// The status line: the frame's last line.
-fn status(frame: &str) -> &str {
-    frame.lines().last().unwrap_or_default().trim_end()
+/// The keys line the status row listed before MOD-115 (nothing draws it any more).
+fn status(harness: &mut Harness) -> String {
+    harness.app().keys_line()
 }
 
-/// The shell's hint row (MOD-67 M6 T2): the frame's line above the status line.
+/// The hints (MOD-67 M6 T2): MOD-115 draws them on the Chat's bottom border, the frame's last
+/// line, so this is that line with the rule and the corners trimmed off.
 fn hint_row(frame: &str) -> &str {
-    let lines: Vec<&str> = frame.lines().collect();
-    lines[lines.len() - 2].trim_end()
+    frame.lines().last().unwrap_or_default().trim_matches([
+        '\u{2514}', '\u{2518}', '\u{2500}', '\u{2570}', '\u{256f}', ' ',
+    ])
 }
 
 /// The Chat's last row inside its border: the composer's line while it is open, blank otherwise.
 fn composer_row(frame: &str) -> &str {
     let lines: Vec<&str> = frame.lines().collect();
-    lines[lines.len() - 4]
+    lines[lines.len() - 2]
         .trim_end()
         .trim_start_matches('│')
         .trim_end_matches('│')
@@ -2097,8 +2099,7 @@ async fn the_composer_hint_shows_while_composing() {
 async fn the_composer_status_line_and_box() {
     let (mut harness, _) = harness(Script::default()).await;
     harness.key("i");
-    let frame = harness.render();
-    assert_eq!(status(&frame), "Ctrl+c quit · F1 help", "{frame}");
+    assert_eq!(status(&mut harness), "Ctrl+c quit · F1 help · F9 about");
 
     harness.key("?");
     assert!(!harness.app().help_visible, "`?` is text in the composer");
@@ -2109,7 +2110,10 @@ async fn the_composer_status_line_and_box() {
     assert!(harness.app().help_visible, "`F1` opens the box");
     let frame = harness.render();
     assert_eq!(frame.matches("Global: ").count(), 1, "{frame}");
-    assert!(frame.contains("Global: Ctrl+c quit · F1 help"), "{frame}");
+    assert!(
+        frame.contains("Global: Ctrl+c quit · F1 help · F9 about"),
+        "{frame}"
+    );
     assert!(
         !frame.contains("Chat: "),
         "no Chat line over a capture: {frame}"
@@ -2127,11 +2131,9 @@ async fn the_composer_status_line_and_box() {
     full.drive_to_end().await;
     full.key("5");
     full.key("i");
-    let frame = full.render();
     assert_eq!(
-        status(&frame),
-        "Ctrl+c quit · F1 help · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue",
-        "{frame}"
+        status(&mut full),
+        "Ctrl+c quit · F1 help · F9 about · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue"
     );
 }
 

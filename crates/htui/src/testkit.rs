@@ -127,6 +127,9 @@ impl Harness {
         let (request_tx, rx) = mpsc::unbounded_channel();
         let mut app = App::new(request_tx);
         app.top_bar.store = backend.label();
+        // MOD-115: the about panel is off, so a tab's frame keeps the rows it was written
+        // against; `tests/shell.rs` turns it on for the one frame that shows it.
+        app.about_visible = false;
         app.start();
         let (width, height) = DEFAULT_SIZE;
         let (reply_tx, reply_rx) = mpsc::unbounded_channel();
@@ -986,10 +989,14 @@ mod tests {
         assert_eq!(top_bar.box_name, "DESKTOP-HTUI");
         assert_eq!(top_bar.store, "memory");
         assert_eq!(harness.app().projects.len(), 1);
+        // `register_all` without a runtime leaves an error for the header's flash to show.
+        harness.app().status = None;
+        let frame = harness.render();
+        let header = frame.lines().next().unwrap_or_default();
+        assert!(header.starts_with("Graphics"), "{header}");
         assert!(
-            harness
-                .render()
-                .starts_with("Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting")
+            header.contains("0 working · 0 waiting · memory"),
+            "{header}"
         );
     }
 

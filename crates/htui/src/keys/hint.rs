@@ -360,9 +360,10 @@ mod tests {
     use super::{HelpLine, Hint};
     use crate::keys::{Act, Context, Keys, Layer, Stack, views};
 
-    const BARE: &str = "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help";
+    const BARE: &str =
+        "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · F9 about";
     const FULL: &str = "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help \
-                        · w workspaces · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue";
+                        · F9 about · w workspaces · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue";
 
     /// What the shell offers without `register_all`: every act but the four that name a view.
     fn bare(act: Act) -> bool {
@@ -430,12 +431,12 @@ mod tests {
         assert_eq!(
             global_line(keys, bare),
             "Global: q/Ctrl+c quit · Tab next tab · Shift+Tab previous tab · 1-9 select tab \
-             · ?/F1 help"
+             · ?/F1 help · F9 about"
         );
         assert_eq!(
             global_line(keys, all),
             "Global: q/Ctrl+c quit · Tab next tab · Shift+Tab previous tab · 1-9 select tab \
-             · ?/F1 help · w workspaces · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue"
+             · ?/F1 help · F9 about · w workspaces · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue"
         );
         assert_eq!(
             keys.help_line(Context::Overlay, all)
@@ -482,7 +483,7 @@ mod tests {
             global.rows(88),
             [
                 "Global: q/Ctrl+c quit · Tab next tab · Shift+Tab previous tab · 1-9 select tab",
-                "  ?/F1 help · w workspaces · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue",
+                "  ?/F1 help · F9 about · w workspaces · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue",
             ]
         );
     }
@@ -553,10 +554,14 @@ mod tests {
         let keys = Keys::compiled();
         assert_eq!(keys.status_line(views::AGENTS_BROWSE, bare), BARE);
         assert_eq!(keys.status_line(views::AGENTS_BROWSE, all), FULL);
-        let modal_all = "Ctrl+c quit · F1 help · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue";
+        let modal_all =
+            "Ctrl+c quit · F1 help · F9 about · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue";
         for stack in [views::AGENTS_FORM, views::CAPTURE, views::KINDS_CONFIRM] {
             assert_eq!(keys.status_line(stack, all), modal_all);
-            assert_eq!(keys.status_line(stack, bare), "Ctrl+c quit · F1 help");
+            assert_eq!(
+                keys.status_line(stack, bare),
+                "Ctrl+c quit · F1 help · F9 about"
+            );
         }
         for stack in [views::SWITCHER, views::WAITING_LIST, views::MIGRATION] {
             assert_eq!(keys.status_line(stack, all), "Ctrl+c quit · ? help");
@@ -583,7 +588,7 @@ mod tests {
                 "Common: r reload · Esc dismiss",
                 "List: j/Down down · k/Up up",
                 "Global: q/Ctrl+c quit · Tab next tab · Shift+Tab previous tab · 1-9 select tab \
-                 · ?/F1 help",
+                 · ?/F1 help · F9 about",
             ]
         );
         assert_eq!(
@@ -607,12 +612,14 @@ mod tests {
             texts(keys.help_lines(views::AGENTS_FORM, bare)),
             [
                 "Agents: Tab/Down next field · Shift+Tab/Up previous field",
-                "Global: Ctrl+c quit · F1 help",
+                "Global: Ctrl+c quit · F1 help · F9 about",
             ]
         );
         assert_eq!(
             texts(keys.help_lines(views::CAPTURE, all)),
-            ["Global: Ctrl+c quit · F1 help · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue"]
+            [
+                "Global: Ctrl+c quit · F1 help · F9 about · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue"
+            ]
         );
     }
 
@@ -622,7 +629,7 @@ mod tests {
     fn a_tabs_layer_shows_on_the_status_line_and_in_one_global_line() {
         use views::TEMPLATES_EDITOR;
         let keys = Keys::compiled();
-        let tabs = "Ctrl+c quit · Tab next tab · Shift+Tab previous tab · F1 help";
+        let tabs = "Ctrl+c quit · Tab next tab · Shift+Tab previous tab · F1 help · F9 about";
         assert_eq!(
             keys.status_line(TEMPLATES_EDITOR, all),
             format!("{tabs} · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue")

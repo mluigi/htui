@@ -1386,11 +1386,11 @@ async fn offline_the_section_says_unavailable_and_offers_no_keys() {
     assert!(shows(&frame, DATABASE_UNREACHABLE), "{frame}");
     assert!(!frame.contains(BROWSE_KEYS), "no keys are offered: {frame}");
 
-    // The last line is the shell's: the refused read's status gives way to the key help on the
-    // first key, so the section's rows are what must not move.
+    // The first line is the shell's header: the refused read's flash gives way on the first key,
+    // so the section's rows are what must not move.
     let pane = |frame: &str| -> Vec<String> {
         let lines: Vec<String> = frame.lines().map(str::to_owned).collect();
-        lines[..lines.len() - 1].to_vec()
+        lines[1..].to_vec()
     };
     for key in ["n", "e", "d", "I"] {
         harness.key(key);

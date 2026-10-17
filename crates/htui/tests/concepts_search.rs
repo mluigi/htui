@@ -419,14 +419,9 @@ async fn the_first_search_in_flight_says_it_loads_the_model() {
     insta::assert_snapshot!("searching", frame);
 }
 
-/// The last non-empty line of a frame: the status line.
-fn status_line(frame: &str) -> &str {
-    frame
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or_default()
-        .trim_end()
+/// The keys line the status row listed before MOD-115 (nothing draws it any more).
+fn status_line(harness: &mut Harness) -> String {
+    harness.app().keys_line()
 }
 
 /// MOD-67 M3 (D7, D8, L-E Q7): the search's field captures `?`, so the status line, the `?` box
@@ -435,7 +430,7 @@ fn status_line(frame: &str) -> &str {
 async fn the_status_line_and_help_box_over_the_search_name_f1() {
     let mut harness = open(Some(seeded().await)).await;
     harness.key("ctrl-f");
-    assert_eq!(status_line(&harness.render()), "Ctrl+c quit · F1 help");
+    assert_eq!(status_line(&mut harness), "Ctrl+c quit · F1 help");
     harness.key("f1");
     assert!(harness.app().help_visible, "`F1` opens the box");
     let frame = harness.render();

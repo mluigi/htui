@@ -18,9 +18,11 @@ use crate::editor::{EDITOR_BUSY, ExternalEdit, ExternalEditOutcome};
 use crate::keys::{Act, CTRL_C, Context, HelpLine, KeyChord, Keys, Stack};
 use crate::store_worker::{Origin, RequestEnvelope, Seq, StoreRequest};
 use crate::ui::cells::clip_line;
+use crate::ui::header::{self, Flash};
+use crate::ui::kit::pane::paint_bottom_hints;
 use crate::ui::overlay::{Overlay, OverlayRegistry, OverlayStack};
 use crate::ui::tabs::{Tab, TabId, TabRegistry};
-use crate::ui::{Theme, layout, top_bar};
+use crate::ui::{Theme, about, layout};
 use crossterm::event::{Event, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind};
 use zeroize::Zeroizing;
 
@@ -185,6 +187,9 @@ pub struct App {
     pub theme: Theme,
     /// Whether the help box is up.
     pub help_visible: bool,
+    /// Whether the about panel under the header is up (MOD-115). In memory only: it starts on
+    /// and M2 persists it.
+    pub about_visible: bool,
     /// Last error text, shown on the status line.
     pub status: Option<String>,
     /// Set by `Action::Quit`; the event loop stops after the current iteration.
@@ -286,6 +291,7 @@ impl App {
             offered: Vec::new(),
             theme: Theme::default(),
             help_visible: false,
+            about_visible: true,
             status: None,
             should_quit: false,
             dirty: true,
@@ -375,6 +381,7 @@ impl App {
             Act::NextTab => Some(Action::Tab(TabAction::Next)),
             Act::PrevTab => Some(Action::Tab(TabAction::Prev)),
             Act::Help => Some(Action::ToggleHelp),
+            Act::About => Some(Action::ToggleAbout),
             Act::OverlayClose => Some(Action::Overlay(OverlayAction::Close)),
             other => other
                 .tab_index()
@@ -859,14 +866,53 @@ impl App {
         )
     }
 
-    /// Draws one frame: top bar, tab strip, the active tab, the in-pane editor over it (MOD-57
-    /// P1), the hint row (MOD-67 M6), the status line, then the overlays bottom-up and the help
-    /// box on top.
+    /// The global keys the status line listed before MOD-115, as text: the global actions the
+    /// active view's stack admits and the shell offers, chords from [`Keys`]. Nothing draws it
+    /// any more (the header's chips and the `?` box carry the same keys); tests read it to pin how
+    /// a view's stack and a rebind shape what a user can press.
+    #[must_use]
+    pub fn keys_line(&self) -> String {
+        self.keys
+            .status_line(self.active_stack().unwrap_or(Stack::BASE), |act| {
+                self.action_for(act).is_some()
+            })
+    }
+
+    /// The header's flash (MOD-115): what used to be the status line's text, now on the right of
+    /// the header. The first of the last error ([`App::status`], error style), the in-pane
+    /// editor's line ([`App::editor_status`], dim) and another tab's `editing in <Tab> · ...`
+    /// notice ([`App::editor_notice`], dim, its trailing separator stripped); `None` when none of
+    /// them is up. The global help line is gone: `?` opens the box and the header carries the
+    /// `F9 about ? keys` chips.
+    #[must_use]
+    pub(super) fn flash(&self) -> Option<Flash> {
+        if let Some(message) = &self.status {
+            return Some(Flash {
+                text: message.clone(),
+                style: self.theme.error,
+            });
+        }
+        let text = self.editor_status().or_else(|| {
+            self.editor_notice().map(|notice| {
+                notice
+                    .strip_suffix(" \u{b7} ")
+                    .map_or(notice.clone(), str::to_owned)
+            })
+        })?;
+        Some(Flash {
+            text,
+            style: self.theme.dim,
+        })
+    }
+
+    /// Draws one frame: the one-row header, the about panel when it is up, the active tab, the
+    /// in-pane editor over it (MOD-57 P1), the active tab's key hints on the body's bottom border
+    /// (MOD-115 M1 adapter), then the overlays bottom-up and the help box on top.
     ///
-    /// The hint row holds the active tab's [`Tab::key_hint`]; it is blank under any overlay (the
+    /// The hints are the active tab's [`Tab::key_hint`]; they are left off under any overlay (the
     /// overlay's box has its own hint, plan Q1 (a)) and while the in-pane editor's tab is on
     /// screen (focused, the editor has the keys; unfocused, the tab refuses its own,
-    /// [`Stack::EDITOR_OPEN`]). The `?` box leaves it alone: the box is centred over the body.
+    /// [`Stack::EDITOR_OPEN`]). The `?` box leaves them alone: the box is centred over the body.
     ///
     /// Rendering is read-only by contract: a view that emits here is not applied until the next
     /// key or reply drains the queue.
@@ -874,10 +920,30 @@ impl App {
         self.dirty = false;
         self.editor_area.set(None);
         let area = frame.area();
-        let chrome = layout::chrome(area);
+        // A tab with no about text (a test double, a reserved tab) leaves no empty hole under the
+        // header: the panel's rows go to the body.
+        let about = self
+            .tabs
+            .active()
+            .filter(|_| self.about_visible)
+            .and_then(|tab| about::about_for(tab.id()).map(|text| (tab, text)));
+        let chrome = layout::chrome_with(area, about.is_some());
 
-        top_bar::render(frame, chrome.top_bar, &self.top_bar, &self.theme);
-        crate::ui::tabs::registry::render_strip(frame, chrome.tab_strip, &self.tabs, &self.theme);
+        let flash = self.flash();
+        // M1 wires no mouse handler to the header's hit rects.
+        let _hits = header::render(
+            frame,
+            chrome.header,
+            &self.top_bar,
+            &self.tabs,
+            flash.as_ref(),
+            &self.keys,
+            &self.theme,
+        );
+        if let (Some(panel), Some((tab, text))) = (chrome.about, about) {
+            let stack = tab.key_stack().unwrap_or(Stack::BASE);
+            about::render(frame, panel, text, &self.keys, stack, &self.theme);
+        }
 
         match self.tabs.active() {
             Some(tab) => {
@@ -897,38 +963,23 @@ impl App {
 
         self.draw_editor(frame, chrome.body);
 
-        let hint = match self.tabs.active() {
-            Some(tab) if self.overlays.is_empty() && !self.editor_visible() => {
-                tab.key_hint(chrome.hint.width, &self.ctx(Origin::Tab(tab.id())))
+        // The M1 hint adapter: tabs still frame their own bodies, so the hints are painted onto
+        // the last row's border glyphs once the tab is drawn. Deleted as tabs move to `Pane::hints`.
+        if let Some(tab) = self.tabs.active()
+            && self.overlays.is_empty()
+            && !self.editor_visible()
+            && chrome.body.height > 0
+        {
+            let width = chrome.body.width.saturating_sub(4);
+            let hint = tab.key_hint(width, &self.ctx(Origin::Tab(tab.id())));
+            if let Some(line) = hint
+                && let Some(row) = hint_row(frame.buffer_mut(), chrome.body)
+            {
+                let line = clip_line(line, width);
+                join_panes_under(frame.buffer_mut(), row, line.width());
+                paint_bottom_hints(frame.buffer_mut(), row, line, self.theme.base);
             }
-            _ => None,
-        };
-        if let Some(line) = hint {
-            frame.render_widget(
-                Paragraph::new(clip_line(line, chrome.hint.width)),
-                chrome.hint,
-            );
         }
-
-        let (status, style) = match &self.status {
-            Some(message) => (message.clone(), self.theme.error),
-            None => (
-                self.editor_status().unwrap_or_else(|| {
-                    let line = self
-                        .keys
-                        .status_line(self.active_stack().unwrap_or(Stack::BASE), |act| {
-                            self.action_for(act).is_some()
-                        });
-                    // MOD-57 M2 E6: another tab's line, led by the open edit.
-                    match self.editor_notice() {
-                        Some(notice) => format!("{notice}{line}"),
-                        None => line,
-                    }
-                }),
-                self.theme.dim,
-            ),
-        };
-        frame.render_widget(Paragraph::new(Line::styled(status, style)), chrome.status);
 
         for overlay in self.overlays.iter() {
             let ctx = self.ctx(Origin::Overlay(overlay.id()));
@@ -1008,12 +1059,83 @@ impl App {
     }
 }
 
+/// How many of the body's last rows [`hint_row`] looks through for the tab's bottom border.
+const HINT_SEARCH_ROWS: u16 = 4;
+
+/// The row of `body` the M1 hint adapter paints on: the lowest of its last [`HINT_SEARCH_ROWS`]
+/// rows that starts with a bottom-left corner, i.e. the bottom border of the tab's content. A tab
+/// that puts a notice or a filter row under its frame still gets the hints on the frame; one with
+/// no such border in its last rows loses them until it moves to `Pane::hints` (M3, M4).
+fn hint_row(buf: &ratatui::buffer::Buffer, body: Rect) -> Option<Rect> {
+    let body = body.intersection(buf.area);
+    (0..HINT_SEARCH_ROWS.min(body.height))
+        .map(|up| body.bottom() - 1 - up)
+        .find(|y| matches!(buf[(body.x, *y)].symbol(), "\u{2514}" | "\u{2570}"))
+        .map(|y| Rect::new(body.x, y, body.width, 1))
+}
+
+/// Turns the corners where two side-by-side panes meet on `row` into plain rule, across the
+/// `width` cells the hints will cover from two cells in, so a hint longer than the first pane
+/// reads on across the seam instead of being cut by `┘└`.
+fn join_panes_under(buf: &mut ratatui::buffer::Buffer, row: Rect, width: usize) {
+    let end = row
+        .x
+        .saturating_add(2)
+        .saturating_add(u16::try_from(width).unwrap_or(u16::MAX))
+        .min(row.right().saturating_sub(1));
+    for x in row.x.saturating_add(2)..end {
+        if matches!(
+            buf[(x, row.y)].symbol(),
+            "\u{2518}" | "\u{2514}" | "\u{256f}" | "\u{2570}"
+        ) {
+            buf[(x, row.y)].set_symbol("\u{2500}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tokio::sync::mpsc;
 
-    use super::App;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    use super::{App, hint_row, join_panes_under};
     use crate::keys::{CATALOGUE, Context};
+
+    /// MOD-115 M1 adapter: the hints go on the lowest bottom border among the body's last four
+    /// rows, so a tab with a notice under its frame still shows them; none there, none shown.
+    #[test]
+    fn the_hint_row_is_the_lowest_bottom_border_in_the_last_rows() {
+        let body = Rect::new(0, 1, 20, 10);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 11));
+        assert_eq!(hint_row(&buf, body), None);
+        buf[(0, 5)].set_symbol("\u{2514}");
+        assert_eq!(hint_row(&buf, body), None, "five rows up is too far");
+        buf[(0, 8)].set_symbol("\u{2514}");
+        assert_eq!(hint_row(&buf, body), Some(Rect::new(0, 8, 20, 1)));
+        buf[(0, 10)].set_symbol("\u{2570}");
+        assert_eq!(hint_row(&buf, body), Some(Rect::new(0, 10, 20, 1)));
+    }
+
+    /// A hint longer than the first pane reads on across the seam where two panes meet.
+    #[test]
+    fn a_long_hint_joins_the_panes_it_runs_across() {
+        let row = Rect::new(0, 0, 14, 1);
+        let mut buf = Buffer::empty(row);
+        buf.set_string(0, 0, "\u{2514}\u{2500}\u{2500}\u{2500}\u{2518}\u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}", ratatui::style::Style::default());
+        join_panes_under(&mut buf, row, 2);
+        assert_eq!(
+            buf[(4, 0)].symbol(),
+            "\u{2518}",
+            "the hint stops before the seam"
+        );
+        join_panes_under(&mut buf, row, 8);
+        assert_eq!(buf[(4, 0)].symbol(), "\u{2500}");
+        assert_eq!(buf[(5, 0)].symbol(), "\u{2500}");
+        assert_eq!(buf[(0, 0)].symbol(), "\u{2514}", "the outer corners stay");
+        assert_eq!(buf[(13, 0)].symbol(), "\u{2518}");
+    }
 
     /// MOD-67 review L1: `action_for`'s wildcard arm is only safe while every global act is
     /// either fixed-mapped by the shell or offerable (and so dispatched once `register_all`
