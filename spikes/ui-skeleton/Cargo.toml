@@ -1,0 +1,15 @@
+# THROWAWAY SPIKE — a UI skeleton for trying layouts and colours. Mock data only; nothing in the
+# htui workspace depends on it, and its code is not meant to be reused as-is.
+[package]
+name = "htui-ui-skeleton"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ratatui = "0.30.2"
+# The same graph widget htui's Runs pane uses (MOD-28).
+rataflow = "0.1"
+
+# Its own workspace, so the htui workspace never builds it.
+[workspace]
