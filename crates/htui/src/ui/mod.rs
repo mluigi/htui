@@ -1,9 +1,12 @@
 //! Everything that draws. No module below this one holds a store handle or a channel: views
 //! receive a [`crate::app::Ctx`] and answer with actions (`R-NF-3`, plan D4).
 
+pub mod about;
 pub(crate) mod cells;
 pub mod diff;
 pub mod editor_pane;
+pub mod header;
+pub mod kit;
 pub mod layout;
 mod markdown;
 pub mod overlay;
