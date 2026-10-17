@@ -22,6 +22,8 @@ pub enum Modal {
     Confirm(Confirm),
     /// Where an item runs, and with which workflow.
     RunSetup(RunSetup),
+    /// The links of one workflow step: change their kind or delete them.
+    Links(LinksEdit),
     AddComponent(Wizard),
     Quit,
     Chooser(crate::forms::Chooser),
@@ -131,12 +133,21 @@ pub struct Confirm {
 pub enum Action {
     Stop(usize),
     ForceStop(usize),
+    /// Delete step `.1` of workflow `.0`.
+    DeleteStep(usize, usize),
+}
+
+pub struct LinksEdit {
+    pub wf: usize,
+    pub node: String,
+    pub cursor: usize,
 }
 
 pub struct RunSetup {
     pub item: usize,
     /// 0: where it runs, 1: the workflow.
     pub section: usize,
+    /// 0 is "inherit"; n is `targets[n - 1]`.
     pub target: usize,
     /// 0 is "let the fast pick choose"; n is `workflows[n - 1]`.
     pub workflow: usize,
@@ -146,7 +157,7 @@ pub struct RunSetup {
 pub enum Outcome {
     Confirmed(Action),
     /// Run setup chosen: target, and workflow (None: the fast pick).
-    SetRun { item: usize, target: usize, workflow: Option<usize> },
+    SetRun { item: usize, target: Option<usize>, workflow: Option<usize> },
     Stay,
     Close,
     Create { project: &'static str, draft: Draft },
@@ -501,6 +512,8 @@ pub fn on_key(modal: &mut Modal, key: KeyEvent, data: &Data) -> Outcome {
             };
         }
         Modal::RunSetup(s) => return run_setup_key(s, key, data),
+        // Handled by the app, which owns the workflows.
+        Modal::Links(_) => return Outcome::Stay,
         Modal::Quit => forms::quit_key(key),
         Modal::Chooser(c) => forms::chooser_key(c, key),
         Modal::Form(f) => forms::form_key(f, key),
@@ -606,14 +619,15 @@ fn run_setup_key(s: &mut RunSetup, key: KeyEvent, data: &Data) -> Outcome {
         KeyCode::Esc => return Outcome::Close,
         KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => s.section = 1 - s.section,
         KeyCode::Up if s.section == 0 => s.target = s.target.saturating_sub(1),
-        KeyCode::Down if s.section == 0 => s.target = (s.target + 1).min(data.targets.len() - 1),
+        KeyCode::Down if s.section == 0 => s.target = (s.target + 1).min(data.targets.len()),
         KeyCode::Up => s.workflow = s.workflow.saturating_sub(1),
         KeyCode::Down => s.workflow = (s.workflow + 1).min(data.workflows.len()),
         KeyCode::Enter => {
-            if data.targets[s.target].planned.is_some() {
+            let target = s.target.checked_sub(1);
+            if target.is_some_and(|t| data.targets[t].planned.is_some()) {
                 return Outcome::Stay;
             }
-            return Outcome::SetRun { item: s.item, target: s.target, workflow: s.workflow.checked_sub(1) };
+            return Outcome::SetRun { item: s.item, target, workflow: s.workflow.checked_sub(1) };
         }
         _ => {}
     }
@@ -725,11 +739,54 @@ pub fn draw(f: &mut Frame, app: &App, pal: Palette) {
         Some(Modal::AddComponent(w)) => draw_wizard(f, w, app, pal),
         Some(Modal::Confirm(c)) => draw_confirm(f, c, pal),
         Some(Modal::RunSetup(s)) => draw_run_setup(f, s, app, pal),
+        Some(Modal::Links(l)) => draw_links(f, l, app, pal),
         Some(Modal::Quit) => crate::forms::draw_quit(f, app, pal),
         Some(Modal::Chooser(c)) => crate::forms::draw_chooser(f, c, pal),
         Some(Modal::Form(form)) => crate::forms::draw_form(f, form, app, pal),
         None => {}
     }
+}
+
+/// The links touching a workflow step, in the order the editor walks them.
+pub fn step_links(wf: &crate::data::Workflow, node: &str) -> Vec<usize> {
+    (0..wf.links.len()).filter(|i| wf.links[*i].from == node || wf.links[*i].to == node).collect()
+}
+
+fn draw_links(f: &mut Frame, l: &LinksEdit, app: &App, pal: Palette) {
+    let wf = &app.data.workflows[l.wf];
+    let ids = step_links(wf, &l.node);
+    let name = |id: &str| wf.steps.iter().find(|s| s.id == id).map_or(id.to_string(), |s| s.name.clone());
+    let rect = centered(f.area(), 84, ids.len() as u16 + 8);
+    f.render_widget(Clear, rect);
+    let hints: &[(&str, &str)] = &[("↑↓", "link"), ("← →", "kind"), ("d", "delete"), ("Esc", "done")];
+    let block = frame(&format!("links of {}", name(&l.node)), crate::ui::hint_line(hints, pal), pal);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let mut lines = vec![Line::raw("")];
+    if ids.is_empty() {
+        lines.push(Line::from(Span::styled(" No links. c on the graph connects this step to another.", theme::dim())));
+    }
+    for (row, i) in ids.iter().enumerate() {
+        let link = &wf.links[*i];
+        let (color, dotted, _) = crate::flow::rel_style(link.kind);
+        let meaning = crate::data::LINK_KINDS.iter().find(|(k, _)| *k == link.kind).map_or("", |(_, m)| m);
+        let mut line = Line::from(vec![
+            Span::styled(if row == l.cursor { " ▌ " } else { "   " }, pal.accent()),
+            Span::styled(format!("{:<16} {} ", name(&link.from), if dotted { "┄┄▶" } else { "──▶" }), theme::text()),
+            Span::styled(format!("{:<16}", name(&link.to)), theme::text()),
+            Span::styled("‹ ", pal.accent()),
+            Span::styled(format!("{:<17}", link.kind), Style::new().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(" › ", pal.accent()),
+            Span::styled(meaning, theme::dim()),
+        ]);
+        if row == l.cursor {
+            line = line.style(Style::new().bg(SEL_BG));
+        }
+        lines.push(crate::ui::fit(line, inner.width));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(" Loops (changes requested, fails, retries) point back to an earlier step; a run unrolls them.", theme::dim())));
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_confirm(f: &mut Frame, c: &Confirm, pal: Palette) {
@@ -772,11 +829,13 @@ fn draw_run_setup(f: &mut Frame, s: &RunSetup, app: &App, pal: Palette) {
     };
 
     let mut l = vec![head("Where it runs", s.section == 0), Line::raw("")];
+    let (inherited, from) = app.inherited_target(app.workspace_of(item.project), Some(item.project));
+    l.push(crate::ui::fit(row("inherit".into(), format!("{} (from {from})", data.targets[inherited].name), s.target == 0, s.section == 0, false), left.width));
     for (i, t) in data.targets.iter().enumerate() {
         let note = if t.planned.is_some() { "planned".to_string() } else { format!("{} {}", theme::status_glyph(t.status), t.kind) };
-        l.push(crate::ui::fit(row(t.name.to_string(), note, i == s.target, s.section == 0, t.planned.is_some()), left.width));
+        l.push(crate::ui::fit(row(t.name.to_string(), note, i + 1 == s.target, s.section == 0, t.planned.is_some()), left.width));
     }
-    let t = &data.targets[s.target];
+    let t = &data.targets[s.target.checked_sub(1).unwrap_or(inherited)];
     l.push(Line::raw(""));
     l.push(Line::from(vec![Span::styled(t.address.to_string(), theme::dim())]));
     l.push(Line::from(Span::styled("htui prepares it there:", theme::bold())));
@@ -810,26 +869,36 @@ fn draw_run_setup(f: &mut Frame, s: &RunSetup, app: &App, pal: Palette) {
     r.push(Line::raw(""));
     r.push(Line::from(Span::styled(
         if s.workflow == 0 {
-            "When the run starts, a fast model reads the item and picks the workflow (about a second)."
+            format!("When the run starts, {} reads the item and picks the workflow (Settings → Workflows).", app.setting("Workflows", "fast pick model"))
         } else {
-            "Pinned: the fast pick is skipped."
+            "Pinned: the fast pick is skipped.".to_string()
         },
         theme::dim(),
     )));
-    r.push(Line::from(Span::styled("Either way the agent may add, skip or repeat steps at run time, within the project's bounds.", theme::dim())));
+    let changes = if app.setting("Workflows", "changes at run time") == "automatic" { "on its own" } else { "after asking you" };
+    r.push(Line::from(Span::styled(format!("Either way the agent may change it at run time, {changes} (Settings → Workflows)."), theme::dim())));
     f.render_widget(Paragraph::new(r).wrap(Wrap { trim: false }), right);
 }
 
-/// "plan → research ×3 → merge → …": a workflow's stages in one line.
+/// "plan → research ×3 → merge → code ⇄ review → gate": a template in one line; ⇄ marks a loop
+/// between neighbours, ↺ a loop further back.
 pub fn workflow_chain(wf: &crate::data::Workflow) -> String {
-    let stages = wf.steps.iter().map(|s| s.3).max().unwrap_or(0) + 1;
-    (0..stages)
-        .map(|st| {
-            let names: Vec<&str> = wf.steps.iter().filter(|s| s.3 == st).map(|s| s.1).collect();
-            if names.len() > 1 { format!("{} ×{}", names[0].split(" · ").next().unwrap_or(names[0]), names.len()) } else { names.concat() }
-        })
-        .collect::<Vec<_>>()
-        .join(" → ")
+    let mut out = String::new();
+    for (i, s) in wf.steps.iter().enumerate() {
+        if i > 0 {
+            let back = wf.links.iter().any(|l| crate::data::is_loop(l.kind) && l.from == s.id && l.to == wf.steps[i - 1].id);
+            out.push_str(if back { " ⇄ " } else { " → " });
+        }
+        out.push_str(&s.name);
+        if !s.parts.is_empty() {
+            out.push_str(&format!(" ×{}", s.parts.len()));
+        }
+        let far = wf.links.iter().filter(|l| crate::data::is_loop(l.kind) && l.from == s.id).any(|l| i == 0 || l.to != wf.steps[i - 1].id);
+        if far {
+            out.push_str(" ↺");
+        }
+    }
+    out
 }
 
 /// Where the new-item modal sits for a given size.
@@ -1100,10 +1169,11 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, app: &App, pal: Palette) {
             for (i, k) in ty.kinds.iter().enumerate() {
                 let extra = match (k.services.is_empty(), all_services(k)) {
                     (true, _) => String::new(),
-                    (false, true) => format!(" · emulates all of {}", k.services.join(", ")),
+                    (false, true) => " · AWS, Azure, GCP, Oracle: all services".to_string(),
                     (false, false) => format!(" · emulates {}", k.services.join(", ")),
                 };
-                lines.push(choice(k.name.to_string(), format!("{} · port {}{extra}", k.image, k.port), i == w.kind_idx));
+                let ports = if all_services(k) { "ports 4566–4599".to_string() } else { format!("port {}", k.port) };
+                lines.push(choice(k.name.to_string(), format!("{} · {ports}{extra}", k.image), i == w.kind_idx));
             }
             f.render_widget(Paragraph::new(lines), rest);
         }
@@ -1157,26 +1227,18 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, app: &App, pal: Palette) {
         }
         WStep::Compose => {
             let c = w.component(data);
-            let new = crate::wsview::Service {
-                name: c.name.clone(),
-                image: c.image.clone(),
-                host_port: c.port,
-                port: k.port,
-                kind: c.kind.to_string(),
-                services: c.services.clone(),
-                comment: Some(match w.project {
-                    Some(p) => format!("only {p}"),
-                    None => "shared by every project".into(),
-                }),
-                new: true,
-            };
+            let comment = Some(match w.project {
+                Some(p) => format!("only {p}"),
+                None => "shared by every project".into(),
+            });
+            let new = crate::wsview::expand(&c.name, &c.image, c.port, k.port, c.kind, &c.services, comment, true);
             let mut lines = vec![Line::from(vec![
                 Span::styled("docker-compose.yml", pal.accent().add_modifier(Modifier::BOLD)),
                 Span::styled("  after adding · ", theme::dim()),
                 Span::styled("+", Style::new().fg(theme::status_color(Status::Done))),
                 Span::styled(" marks what is new", theme::dim()),
             ])];
-            lines.extend(crate::wsview::compose_lines(&crate::wsview::services(app, w.ws, Some(new)), pal));
+            lines.extend(crate::wsview::compose_lines(&crate::wsview::services(app, w.ws, new), pal));
             f.render_widget(Paragraph::new(lines), rest);
         }
     }

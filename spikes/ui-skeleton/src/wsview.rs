@@ -33,7 +33,8 @@ pub fn ws_detail(f: &mut Frame, app: &App, idx: usize, area: Rect, focused: bool
         (0, None, WsState::Stopping) => &[("s", "force stop"), ("S-←→", "section")],
         (0, None, WsState::Stopped) if !w.parked.is_empty() => &[("r", "resume"), ("o", "open"), ("N", "new…"), ("S-←→", "section")],
         (0, None, WsState::Stopped) => &[("o", "open"), ("N", "new…"), ("S-←→", "section")],
-        (0, None, WsState::Open) if !w.parked.is_empty() => &[("r", "resume parked runs"), ("N", "new…"), ("S-←→", "section")],
+        (0, None, WsState::Open) if !w.parked.is_empty() => &[("r", "resume runs"), ("N", "new…"), ("S-←→", "section")],
+        (0, None, WsState::Open) => &[("s", "stop runs"), ("N", "new…"), ("S-←→", "section")],
         (0, ..) => &[("N", "new…"), ("S-←→", "section")],
         (1, None, _) => &[("↑↓", "select"), ("Space", "start / stop"), ("N", "add component"), ("d", "remove")],
         (1, Some(_), _) => &[("↑↓", "select"), ("Enter", "shared / own / none"), ("N", "add own")],
@@ -110,6 +111,8 @@ fn workspace_overview(app: &App, ws: usize, pal: Palette) -> Vec<Line<'static>> 
         Line::raw(""),
     ];
     lines.extend(stop_lines(app, ws, pal));
+    lines.push(target_line(app, ws, None, pal));
+    lines.push(Line::raw(""));
     lines.push(heading("description", pal));
     lines.push(Line::from(Span::styled(format!(" {}", w.description), theme::text())));
     lines.push(Line::raw(""));
@@ -162,38 +165,55 @@ fn stop_lines(app: &App, ws: usize, pal: Palette) -> Vec<Line<'static>> {
     let w = &app.data.workspaces[ws];
     let mut lines = Vec::new();
     if w.state == WsState::Stopping {
-        let running: Vec<_> = app
-            .data
-            .items
-            .iter()
-            .filter(|i| w.projects.contains(&i.project) && matches!(i.status, Status::InProgress | Status::AwaitingApproval))
-            .collect();
-        lines.push(heading(&format!("stopping · waiting for {} run(s) to reach a stoppable step", running.len()), pal));
-        for i in running {
-            let step = app.current_step(i);
+        let running = app.running_items(ws);
+        lines.push(heading(&format!("stopping · {} run(s) end their current agent turn", running.len()), pal));
+        for (key, step, agent) in running {
             lines.push(Line::from(vec![
                 Span::raw("   "),
-                theme::glyph(i.status),
-                Span::styled(format!(" {:<9}", i.key), pal.key(i.key)),
-                Span::styled(format!("finishing {step}, then parks"), theme::text()),
+                theme::glyph(Status::InProgress),
+                Span::styled(format!(" {key:<9}"), pal.key(key)),
+                Span::styled(format!("{step} · {agent}: "), theme::text()),
+                Span::styled(crate::app::graceful_note(&agent), theme::dim()),
             ]));
         }
-        lines.push(Line::from(vec![Span::raw("   "), theme::chip("s", pal.accent), Span::styled(" again stops them now; they redo that step when resumed", theme::dim())]));
+        lines.push(Line::from(vec![Span::raw("   "), theme::chip("s", pal.accent), Span::styled(" again stops them now, mid-turn (conversations are still saved)", theme::dim())]));
         lines.push(Line::raw(""));
     } else if !w.parked.is_empty() {
-        lines.push(heading(&format!("{} parked run(s)", w.parked.len()), pal));
+        lines.push(heading(&format!("{} stopped run(s), conversations saved", w.parked.len()), pal));
         for p in &w.parked {
-            let how = if p.interrupted { format!("cut short in {}: redoes it on resume", p.step) } else { format!("parked after {}: goes on from the next step", p.step) };
+            let how = match (p.interrupted, p.resumable) {
+                (_, false) => format!("stopped in {}: the step runs again on resume", p.step),
+                (true, true) => format!("cut mid-turn in {}: resumes the conversation, redoing that turn", p.step),
+                (false, true) => format!("stopped between turns in {}: resumes the conversation", p.step),
+            };
             lines.push(Line::from(vec![
                 Span::styled("   ⏸ ", Style::new().fg(theme::status_color(Status::AwaitingApproval))),
                 Span::styled(format!("{:<9}", p.key), pal.key(p.key)),
                 Span::styled(how, theme::text()),
             ]));
         }
-        lines.push(Line::from(vec![Span::raw("   "), theme::chip("r", pal.accent), Span::styled(" resumes them all, in the background", theme::dim())]));
+        lines.push(Line::from(vec![Span::raw("   "), theme::chip("r", pal.accent), Span::styled(" resumes them all", theme::dim())]));
         lines.push(Line::raw(""));
     }
     lines
+}
+
+/// "items run on docker · this box (set here) · T changes": the default target and where it comes
+/// from (Settings → workspace → project → item).
+fn target_line(app: &App, ws: usize, project: Option<&str>, pal: Palette) -> Line<'static> {
+    let set_here = match project {
+        Some(p) => app.project_target.contains_key(p),
+        None => app.ws_target.contains_key(&ws),
+    };
+    let (t, from) = app.inherited_target(ws, project);
+    Line::from(vec![
+        Span::styled(" items run on ", theme::dim()),
+        Span::styled(app.data.targets[t].name, theme::bold()),
+        Span::styled(if set_here { "  (set here)".to_string() } else { format!("  (from {from})") }, theme::dim()),
+        Span::styled("   ", theme::dim()),
+        theme::chip("T", pal.accent),
+        Span::styled(" changes · an item can still choose its own (t in the Backlog)", theme::dim()),
+    ])
 }
 
 fn project_overview(app: &App, ws: usize, p: &str, pal: Palette) -> Vec<Line<'static>> {
@@ -206,6 +226,8 @@ fn project_overview(app: &App, ws: usize, p: &str, pal: Palette) -> Vec<Line<'st
             Span::styled(proj.map_or("", |x| x.repo).to_string(), theme::text()),
             Span::styled(format!("   in workspace {}", app.data.workspaces[ws].name), theme::dim()),
         ]),
+        Line::raw(""),
+        target_line(app, ws, Some(p), pal),
         Line::raw(""),
         heading("description", pal),
         Line::from(Span::styled(format!(" {}", proj.map_or("", |x| x.description)), theme::text())),
@@ -297,7 +319,7 @@ fn components(
                 Span::styled(" docker-compose.yml", pal.accent().add_modifier(Modifier::BOLD)),
                 Span::styled(format!("  generated in {}/.htui/ · ports on localhost", app.data.workspaces[ws].path), theme::dim()),
             ]));
-            lines.extend(compose_lines(&services(app, ws, None), pal));
+            lines.extend(compose_lines(&services(app, ws, vec![]), pal));
             lines.push(Line::raw(""));
             let env = match infisical(app) {
                 Some(url) => vec![
@@ -337,7 +359,14 @@ fn components(
                     line = line.style(Style::new().bg(SEL_BG));
                 }
                 lines.push(line);
-                if selected && usage != Usage::Unused {
+                if selected && usage != Usage::Unused && c.kind == "floci" {
+                    let shift = port as i32 - 4566;
+                    let at = |p: u16| (p as i32 + shift) as u16;
+                    lines.push(Line::from(Span::styled(
+                        format!("   ↳ {p} gets AWS_ENDPOINT_URL=http://localhost:{} · AZURE_ENDPOINT=…:{} · GCP endpoints …:{} · OCI …:{}", at(4566), at(4577), at(4588), at(4599)),
+                        theme::dim(),
+                    )));
+                } else if selected && usage != Usage::Unused {
                     let scheme = if c.kind == "postgres" { "postgres" } else { c.kind };
                     let var = format!("{}_URL", c.name.to_uppercase());
                     lines.push(Line::from(Span::styled(format!("   ↳ {p} gets {var}={scheme}://localhost:{port}/{p}"), theme::dim())));
@@ -363,33 +392,51 @@ pub struct Service {
     pub new: bool,
 }
 
+/// floci's emulators: (suffix, cloud, image, container port, what it serves). Each always serves
+/// every service of its cloud; the console shows all of them.
+pub const FLOCI: [(&str, &str, &str, u16, &str); 5] = [
+    ("aws", "AWS", "floci/floci", 4566, "EC2, ECS, EKS, Lambda, RDS, S3, DynamoDB, SQS, SNS, IAM, KMS, Step Functions, CloudFormation…"),
+    ("az", "Azure", "floci/floci-az", 4577, "Blob, Queue, Table, Cosmos DB, Functions, Key Vault, Event Hubs, Azure SQL, AKS…"),
+    ("gcp", "GCP", "floci/floci-gcp", 4588, "Cloud Storage, Pub/Sub, Firestore, Datastore, Secret Manager, IAM, Managed Kafka"),
+    ("oci", "Oracle", "floci/floci-oci", 4599, "Identity, Object Storage, Queue, Streaming, Vault + KMS, Secrets, Functions"),
+    ("ui", "console", "floci/floci-ui", 4500, "web console for all four"),
+];
+
+/// The compose services one component becomes: one, or floci's five.
+#[allow(clippy::too_many_arguments)]
+pub fn expand(name: &str, image: &str, host_port: u16, port: u16, kind: &str, services: &[&'static str], comment: Option<String>, new: bool) -> Vec<Service> {
+    if kind != "floci" {
+        return vec![Service { name: name.to_string(), image: image.to_string(), host_port, port, kind: kind.to_string(), services: services.to_vec(), comment, new }];
+    }
+    let tag = image.rsplit(':').next().unwrap_or("latest");
+    // Own instances shift every port by the same amount.
+    let shift = host_port as i32 - 4566;
+    FLOCI
+        .iter()
+        .enumerate()
+        .map(|(i, (suffix, cloud, img, p, _))| Service {
+            name: format!("{name}-{suffix}"),
+            image: format!("{img}:{tag}"),
+            host_port: (*p as i32 + shift) as u16,
+            port: *p,
+            kind: format!("floci-{suffix}"),
+            services: vec![],
+            comment: if i == 0 { comment.clone().map(|c| format!("{c} · {cloud}")) } else { Some(cloud.to_string()) },
+            new,
+        })
+        .collect()
+}
+
 /// The services the workspace's compose file runs: each component, plus one per project-own instance.
-pub fn services(app: &App, ws: usize, extra: Option<Service>) -> Vec<Service> {
+pub fn services(app: &App, ws: usize, extra: Vec<Service>) -> Vec<Service> {
     let mut out = Vec::new();
     for c in app.data.components.iter().filter(|c| c.ws == ws) {
         let shared_by: Vec<&str> = c.usage.iter().filter(|(_, u)| *u == Usage::Shared).map(|(p, _)| *p).collect();
-        out.push(Service {
-            name: c.name.clone(),
-            image: c.image.clone(),
-            host_port: c.port,
-            port: c.port,
-            kind: c.kind.to_string(),
-            services: c.services.clone(),
-            comment: (!shared_by.is_empty()).then(|| format!("shared by {}", shared_by.join(", "))),
-            new: false,
-        });
+        let comment = (!shared_by.is_empty()).then(|| format!("shared by {}", shared_by.join(", ")));
+        out.extend(expand(&c.name, &c.image, c.port, c.port, c.kind, &c.services, comment, false));
         for (p, u) in &c.usage {
             if let Usage::Own(port) = u {
-                out.push(Service {
-                    name: format!("{p}-{}", c.name),
-                    image: c.image.clone(),
-                    host_port: *port,
-                    port: c.port,
-                    kind: c.kind.to_string(),
-                    services: c.services.clone(),
-                    comment: Some(format!("{p}'s own instance")),
-                    new: false,
-                });
+                out.extend(expand(&format!("{p}-{}", c.name), &c.image, *port, c.port, c.kind, &c.services, Some(format!("{p}'s own instance")), false));
             }
         }
     }
@@ -422,8 +469,8 @@ pub fn compose_lines(services: &[Service], pal: Palette) -> Vec<Line<'static>> {
             "mongodb" => Some("MONGO_INITDB_ROOT_PASSWORD"),
             _ => None,
         };
-        if s.kind == "floci" {
-            push(vec![Span::styled("    # emulates every service it has: s3, sqs, sns, dynamodb, lambda, …", theme::dim())]);
+        if s.kind == "floci-az" {
+            push(vec![Span::styled("    volumes: ", key), Span::styled("[\"/var/run/docker.sock:/var/run/docker.sock\"]", theme::text()), Span::styled("   # Azure Functions run in containers", theme::dim())]);
         } else if !s.services.is_empty() {
             push(vec![Span::styled("    environment:", key)]);
             push(vec![Span::styled("      SERVICES: ", key), Span::styled(s.services.join(","), theme::text())]);

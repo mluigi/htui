@@ -82,16 +82,61 @@ pub struct Target {
     pub planned: Option<&'static str>,
 }
 
-/// A template for how an item is executed: its steps and links. A fast model picks one when a run
-/// starts; the agent may change it at run time within the project's bounds.
+/// One step of a workflow template.
+#[derive(Clone, Debug)]
+pub struct WfStep {
+    pub id: String,
+    pub name: String,
+    pub agent: String,
+    /// A fan-out: (part, agent) per parallel agent. Empty: one agent. At run time a planner may
+    /// split it differently.
+    pub parts: Vec<(String, String)>,
+}
+
+/// A link of a workflow template. Loop kinds point back to an earlier step.
+#[derive(Clone, Debug)]
+pub struct WfLink {
+    pub from: String,
+    pub to: String,
+    pub kind: &'static str,
+}
+
+/// The relations a template link can have, and what each means.
+pub const LINK_KINDS: [(&str, &str); 7] = [
+    ("next", "then the next step"),
+    ("approved", "a review passes it on"),
+    ("changes requested", "loop: a review sends it back"),
+    ("fails", "loop: a failed check sends it back"),
+    ("asks you", "waits for your go-ahead"),
+    ("if", "taken only when a condition holds (e.g. docs only)"),
+    ("retries", "loop: the same step again, up to a cap"),
+];
+
+/// Kinds that go back to an earlier step.
+pub fn is_loop(kind: &str) -> bool {
+    matches!(kind, "changes requested" | "fails" | "retries")
+}
+
+/// A template for how an item is executed: steps and the links between them, loops included. A
+/// fast model picks one when a run starts; the run unrolls it (round 1, round 2, the parts of a
+/// fan-out), and the agent may change it at run time.
 pub struct Workflow {
     pub name: &'static str,
     pub desc: &'static str,
     /// What the fast pick looks for.
     pub when: &'static str,
-    /// (id, name, agent, stage): steps sharing a stage run in parallel.
-    pub steps: &'static [(&'static str, &'static str, &'static str, usize)],
-    pub links: &'static [(&'static str, &'static str, &'static str)],
+    pub steps: Vec<WfStep>,
+    pub links: Vec<WfLink>,
+    /// Bumped on every edit, so cached graphs are rebuilt.
+    pub version: usize,
+}
+
+fn st(id: &str, name: &str, agent: &str, parts: &[(&str, &str)]) -> WfStep {
+    WfStep { id: id.into(), name: name.into(), agent: agent.into(), parts: parts.iter().map(|(p, a)| (p.to_string(), a.to_string())).collect() }
+}
+
+fn ln(from: &str, to: &str, kind: &'static str) -> WfLink {
+    WfLink { from: from.into(), to: to.into(), kind }
 }
 
 pub fn workflows() -> Vec<Workflow> {
@@ -100,71 +145,59 @@ pub fn workflows() -> Vec<Workflow> {
             name: "standard",
             desc: "Plan, code, review until approved, gate.",
             when: "most items: one area, a clear goal",
-            steps: &[
-                ("plan", "plan", "claude · opus", 0),
-                ("code-1", "code · round 1", "claude · sonnet", 1),
-                ("review-1", "review · round 1", "rust-reviewer", 2),
-                ("code-2", "code · round 2", "claude · sonnet", 3),
-                ("review-2", "review · round 2", "rust-reviewer", 4),
-                ("gate", "gate", "cargo test", 5),
+            steps: vec![st("plan", "plan", "claude · opus", &[]), st("code", "code", "claude · sonnet", &[]), st("review", "review", "rust-reviewer", &[]), st("gate", "gate", "cargo test", &[])],
+            links: vec![
+                ln("plan", "code", "next"),
+                ln("code", "review", "next"),
+                ln("review", "code", "changes requested"),
+                ln("review", "gate", "approved"),
+                ln("gate", "code", "fails"),
             ],
-            links: &[
-                ("plan", "code-1", "next"),
-                ("code-1", "review-1", "next"),
-                ("review-1", "code-2", "changes requested"),
-                ("code-2", "review-2", "next"),
-                ("review-2", "gate", "approved"),
-            ],
+            version: 0,
         },
         Workflow {
             name: "research fan-out",
-            desc: "Plan; agents research one part each in parallel; merge; then code and review.",
+            desc: "Plan; agents research one part each in parallel; merge; you confirm; then code and review.",
             when: "items touching several areas, or needing prior art first",
-            steps: &[
-                ("plan", "plan", "claude · opus", 0),
-                ("r-api", "research · API", "claude · sonnet", 1),
-                ("r-prior", "research · prior art", "codex · gpt-5", 1),
-                ("r-perf", "research · perf", "gemini · pro", 1),
-                ("merge", "merge findings", "claude · opus", 2),
-                ("code-1", "code · round 1", "claude · sonnet", 3),
-                ("review-1", "review · round 1", "rust-reviewer", 4),
-                ("code-2", "code · round 2", "claude · sonnet", 5),
-                ("review-2", "review · round 2", "rust-reviewer", 6),
-                ("gate", "gate", "cargo test", 7),
+            steps: vec![
+                st("plan", "plan", "claude · opus", &[]),
+                st("research", "research", "claude · sonnet", &[("API", "claude · sonnet"), ("prior art", "codex · gpt-5"), ("perf", "gemini · pro")]),
+                st("merge", "merge findings", "claude · opus", &[]),
+                st("code", "code", "claude · sonnet", &[]),
+                st("review", "review", "rust-reviewer", &[]),
+                st("gate", "gate", "cargo test", &[]),
             ],
-            links: &[
-                ("plan", "r-api", "fans out"),
-                ("plan", "r-prior", "fans out"),
-                ("plan", "r-perf", "fans out"),
-                ("r-api", "merge", "merges"),
-                ("r-prior", "merge", "merges"),
-                ("r-perf", "merge", "merges"),
-                ("merge", "code-1", "next"),
-                ("code-1", "review-1", "next"),
-                ("review-1", "code-2", "changes requested"),
-                ("code-2", "review-2", "next"),
-                ("review-2", "gate", "approved"),
+            links: vec![
+                ln("plan", "research", "next"),
+                ln("research", "merge", "next"),
+                ln("merge", "code", "asks you"),
+                ln("code", "review", "next"),
+                ln("review", "code", "changes requested"),
+                ln("review", "gate", "approved"),
+                ln("gate", "code", "fails"),
             ],
+            version: 0,
         },
         Workflow {
             name: "quick fix",
-            desc: "Code the fix with a regression test, one review, gate.",
+            desc: "Code the fix with a regression test, review, gate.",
             when: "bugs with a known cause, small changes",
-            steps: &[("code-1", "code · fix + test", "claude · sonnet", 0), ("review-1", "review", "rust-reviewer", 1), ("gate", "gate", "cargo test", 2)],
-            links: &[("code-1", "review-1", "next"), ("review-1", "gate", "approved")],
+            steps: vec![st("code", "code · fix + test", "claude · sonnet", &[]), st("review", "review", "rust-reviewer", &[]), st("gate", "gate", "cargo test", &[])],
+            links: vec![ln("code", "review", "next"), ln("review", "code", "changes requested"), ln("review", "gate", "approved"), ln("gate", "code", "retries")],
+            version: 0,
         },
         Workflow {
             name: "analysis",
             desc: "Research the question from two sides, write it up, review the write-up. No code.",
             when: "questions: why, compare, should we",
-            steps: &[
-                ("plan", "frame the question", "claude · opus", 0),
-                ("r-a", "research · options", "claude · sonnet", 1),
-                ("r-b", "research · prior art", "codex · gpt-5", 1),
-                ("write", "write-up", "claude · opus", 2),
-                ("review-1", "review", "claude · opus", 3),
+            steps: vec![
+                st("plan", "frame the question", "claude · opus", &[]),
+                st("research", "research", "claude · sonnet", &[("options", "claude · sonnet"), ("prior art", "codex · gpt-5")]),
+                st("write", "write-up", "claude · opus", &[]),
+                st("review", "review", "claude · opus", &[]),
             ],
-            links: &[("plan", "r-a", "fans out"), ("plan", "r-b", "fans out"), ("r-a", "write", "merges"), ("r-b", "write", "merges"), ("write", "review-1", "next")],
+            links: vec![ln("plan", "research", "next"), ln("research", "write", "next"), ln("write", "review", "next"), ln("review", "write", "changes requested")],
+            version: 0,
         },
     ]
 }
@@ -204,7 +237,7 @@ pub fn targets() -> Vec<Target> {
                 "clones the project into ~/htui-runs/<item> on build-01",
                 "starts the item's components there with docker compose",
                 "env from Infisical, secrets resolved on build-01",
-                "agents must be installed and logged in on build-01 (probed first)",
+                "the htui agent installs and logs in the agents on build-01 if they are missing (asks you for each login)",
             ],
             status: Status::Done,
             planned: None,
@@ -214,7 +247,7 @@ pub fn targets() -> Vec<Target> {
             kind: "remote docker",
             address: "docker context build-01 (over ssh)",
             how: &[
-                "the docker sandbox, on build-01's docker daemon",
+                "the docker sandbox, on build-01's docker daemon (the htui agent sets up the docker context)",
                 "fresh clone, private compose project, toolchain image, as on this box",
                 "the branch comes back over ssh when you collect it",
             ],
@@ -378,8 +411,10 @@ pub struct Parked {
     pub key: &'static str,
     /// The step it stopped in (forced) or after (graceful).
     pub step: String,
-    /// Forced: the step was cut short and runs again on resume. Graceful: it finished first.
+    /// Forced: cut mid-turn; that turn runs again on resume. Graceful: stopped between turns.
     pub interrupted: bool,
+    /// The agent can reopen its saved conversation. If not, the step runs again from its start.
+    pub resumable: bool,
 }
 
 pub struct Project {
@@ -470,7 +505,8 @@ pub fn catalogue() -> Catalogue {
                 kind("kafka", "apache/kafka", 9092, &["4.0.0", "3.9.0"], &[]),
             ]),
             t("cloud emulator", vec![
-                kind("floci", "floci/floci", 4566, &["latest"], &["s3", "sqs", "sns", "dynamodb", "lambda", "secretsmanager"]),
+                // floci is a family: one container per cloud, each serving every service it has.
+                kind("floci", "floci/floci", 4566, &["latest", "nightly"], &["aws", "azure", "gcp", "oci"]),
                 kind("localstack", "localstack/localstack", 4566, &["4.5", "4.4", "latest"], &["s3", "sqs", "sns", "dynamodb", "lambda", "kinesis", "secretsmanager"]),
                 kind("elasticmq", "softwaremill/elasticmq-native", 9324, &["1.6"], &["sqs"]),
                 kind("azurite", "mcr.microsoft.com/azure-storage/azurite", 10000, &["latest"], &["blob", "queue", "table"]),
@@ -624,6 +660,19 @@ pub fn mock() -> Data {
         Skill { name: "gortex", group: "MCP servers", desc: "Code graph queries for agents.", attach: "code steps", body: "search, read, relations, trace, change." },
         Skill { name: "claude", group: "agent help", desc: "How htui drives Claude Code over ACP.", attach: "—", body: "Transport: acp. Billing: subscription.\nPermissions are forwarded to the Chat tab." },
         Skill { name: "codex", group: "agent help", desc: "How htui drives Codex.", attach: "—", body: "Transport: acp. Billing: api key." },
+        Skill { name: "gate-on-stop", group: "hooks", desc: "Runs the project's gate when an agent stops.", attach: "code steps", body: "Hook: Stop → scripts/gate.sh; a red gate sends the step back." },
+        Skill { name: "no-secrets-in-diff", group: "hooks", desc: "Blocks a write that adds a secret-shaped value.", attach: "every run", body: "Hook: PreToolUse(Write|Edit) → scan the new text; deny on a match." },
+        Skill { name: "/gate", group: "commands", desc: "Slash command: run the gate and report.", attach: "claude", body: "Runs scripts/gate.sh, summarises failures." },
+        Skill { name: "/next", group: "commands", desc: "Slash command: what to do next on this item.", attach: "claude", body: "Reads the item, the run so far, and proposes the next step." },
+        Skill { name: "code-architect", group: "sub-agents", desc: "A sub-agent the main agent can call for a design.", attach: "plan steps", body: "Persona: architect. Tools: read-only code graph. Returns a blueprint." },
+        Skill { name: "rust-reviewer", group: "sub-agents", desc: "A sub-agent that reviews Rust diffs.", attach: "review steps", body: "Persona: reviewer. Reads the diff, ranks findings by severity." },
+        Skill { name: "rewrite-item", group: "prompts", desc: "The prompt behind the new-item rewrite.", attach: "new item modal", body: "Turn the user's words into an item: kind, title, Goal, Acceptance, Open questions." },
+        Skill { name: "fast-pick", group: "prompts", desc: "The prompt the fast pick uses to choose a workflow.", attach: "every run start", body: "Given the item and the workflows' \"when\" lines, answer one workflow and one reason." },
+        Skill { name: "rust-ci", group: "env presets", desc: "Environment for Rust runs: toolchain, caches, flags.", attach: "Rust projects", body: "RUSTFLAGS=-D warnings · CARGO_TARGET_DIR shared · sccache on." },
+        Skill { name: "gortex", group: "tools", desc: "Code graph: an MCP server, hooks that steer reads, and a daemon.", attach: "code steps", body: "MCP: search, read, relations, trace, change.\nHooks: PreToolUse redirects raw reads.\nDaemon: indexes the tracked repos." },
+        Skill { name: "headroom", group: "tools", desc: "Context compression: an MCP server and a proxy.", attach: "long runs", body: "MCP: compress / retrieve.\nProxy: shrinks tool results before the model sees them." },
+        Skill { name: "serena", group: "tools", desc: "Symbol-level editing through language servers (MCP).", attach: "code steps", body: "MCP: find_symbol, replace_symbol_body, rename_symbol…" },
+        Skill { name: "graphify", group: "tools", desc: "Turns code and docs into a knowledge graph.", attach: "analysis steps", body: "Skill + CLI: builds graphify-out/, then query / path / explain." },
     ];
 
     let sessions = vec![
@@ -802,8 +851,18 @@ pub fn mock() -> Data {
                 Field { label: "ssh · build-01", value: "remote ssh · luigi@build-01.lan · ● ready".into(), kind: FieldKind::ReadOnly, help: "clone and compose on build-01" },
                 Field { label: "docker · build-01", value: "remote docker · context build-01 · ⚠ daemon unreachable".into(), kind: FieldKind::ReadOnly, help: "the docker sandbox on build-01's daemon" },
                 Field { label: "box · LAPTOP-2", value: "htui server · planned (MOD-47)".into(), kind: FieldKind::ReadOnly, help: "boxes enrolled with a central htui server; phase 2" },
-                Field { label: "add a target", value: "ssh host, docker context…".into(), kind: FieldKind::Action("mock: a form asks for the kind, the address, and probes it"), help: "Enter adds one" },
+                Field { label: "add a target", value: "ssh host, docker context…".into(), kind: FieldKind::Action("mock: the htui agent asks for the address, probes it, and installs what is missing"), help: "Enter adds one, through the htui agent" },
                 Field { label: "default", value: "this box".into(), kind: FieldKind::Choice(&["this box", "docker · this box", "ssh · build-01", "docker · build-01"]), help: "for new items; each item can change it" },
+            ],
+        },
+        Section {
+            name: "Workflows",
+            group: "Running",
+            about: "How items run: the fast pick that chooses a workflow, and what the agent may change on its own.",
+            fields: vec![
+                Field { label: "fast pick model", value: "claude · haiku".into(), kind: FieldKind::Choice(&["claude · haiku", "claude · sonnet", "codex · gpt-5-mini", "gemini · flash"]), help: "a light model, from the models your agents offer; it picks the workflow when a run starts" },
+                Field { label: "changes at run time", value: "ask me".into(), kind: FieldKind::Choice(&["ask me", "automatic"]), help: "the agent may change a run's workflow; ask me shows it as a permission in the item's chat" },
+                Field { label: "default workflow", value: "auto (fast pick)".into(), kind: FieldKind::Choice(&["auto (fast pick)", "standard", "research fan-out", "quick fix", "analysis"]), help: "for items that do not pin one" },
             ],
         },
         Section {
@@ -869,7 +928,7 @@ pub fn mock() -> Data {
     ];
 
     let agents = vec![
-        AgentRow { name: "claude", transport: "acp", billing: "subscription", models: "opus, sonnet", state: Status::Done, version: "2.1.290" },
+        AgentRow { name: "claude", transport: "acp", billing: "subscription", models: "opus, sonnet, haiku", state: Status::Done, version: "2.1.290" },
         AgentRow { name: "codex", transport: "acp", billing: "api key", models: "gpt-5", state: Status::Done, version: "0.48.0" },
         AgentRow { name: "gemini", transport: "acp", billing: "subscription", models: "—", state: Status::AwaitingApproval, version: "1.4.0" },
         AgentRow { name: "aider", transport: "cli", billing: "api key", models: "—", state: Status::Failed, version: "—" },

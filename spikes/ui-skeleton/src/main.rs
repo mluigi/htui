@@ -151,13 +151,14 @@ fn tick(app: &mut App) {
         }
         app.flash("catalogue updated: postgres 18, kafka 4.1.0, valkey 8.2");
     }
-    let done: Vec<usize> = app.stopping.iter().filter(|(_, at)| at.elapsed() > Duration::from_secs(3)).map(|(w, _)| *w).collect();
+    // A graceful stop only waits for the current agent turns to end: seconds, not minutes.
+    let done: Vec<usize> = app.stopping.iter().filter(|(_, at)| at.elapsed() > Duration::from_millis(1800)).map(|(w, _)| *w).collect();
     for w in done {
         app.stopping.remove(&w);
         park_runs(app, w, false);
         let name = app.data.workspaces[w].name;
         let n = app.data.workspaces[w].parked.len();
-        app.flash(format!("{name} stopped: {n} run(s) parked after their step · r resumes"));
+        app.flash(format!("{name}: {n} run(s) stopped, conversations saved · r resumes"));
     }
     if app.logs.last.elapsed() > Duration::from_millis(1500) {
         app.logs.last = Instant::now();
@@ -206,6 +207,9 @@ fn on_key(app: &mut App, key: KeyEvent) {
             }
             _ => {}
         }
+    }
+    if matches!(app.modal, Some(Modal::Links(_))) {
+        return links_key(app, key);
     }
     if let Some(modal) = &mut app.modal {
         let outcome = modal::on_key(modal, key, &app.data);
@@ -285,6 +289,7 @@ fn on_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('s') if app.tab == WORKSPACES => stop_workspace(app),
         KeyCode::Char('r') if app.tab == WORKSPACES && app.cur().subtab == 0 => resume_workspace(app),
+        KeyCode::Char('T') if app.tab == WORKSPACES && app.cur().subtab == 0 => cycle_scope_target(app),
         // Backlog list options (a focused graph keeps h for panning).
         KeyCode::Char('h') if app.tab == BACKLOG && !graph_focused(app) => {
             app.show_done = !app.show_done;
@@ -296,7 +301,7 @@ fn on_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('t') if app.tab == BACKLOG => {
             if let Some(idx) = app.cur().tree.selected() {
                 let item = &app.data.items[idx];
-                let target = app.target_of(item.key);
+                let target = app.item_target.get(item.key).map_or(0, |t| t + 1);
                 let workflow = app.item_workflow.get(item.key).map_or(0, |w| w + 1);
                 app.modal = Some(Modal::RunSetup(modal::RunSetup { item: idx, section: 0, target, workflow }));
             }
@@ -471,6 +476,9 @@ fn graph_key(app: &mut App, key: KeyEvent, flow_key: &str) {
     if app.moving {
         return move_key(app, key, flow_key);
     }
+    if flow_key.starts_with("wf:") && wf_key(app, key, flow_key) {
+        return;
+    }
     match key.code {
         KeyCode::Char('M') => {
             let node = app.flows.borrow().get(flow_key).and_then(|(g, _)| g.first_selected_node_id());
@@ -510,14 +518,175 @@ fn graph_key(app: &mut App, key: KeyEvent, flow_key: &str) {
     let Some((graph, _)) = flows.get_mut(flow_key) else { return };
     match key.code {
         KeyCode::Char('f') => flow::fit_all(graph),
-        KeyCode::Char('+' | '=') => graph.zoom_in(),
-        KeyCode::Char('-') => graph.zoom_out(),
+        KeyCode::Char('+' | '=') => {
+            graph.zoom_in();
+            drop(flows);
+            app.wheel_hint_off = true;
+        }
+        KeyCode::Char('-') => {
+            graph.zoom_out();
+            drop(flows);
+            app.wheel_hint_off = true;
+        }
         KeyCode::Char('0') => graph.reset_zoom(),
         KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'j' | 'k' | 'l') => {
             let _ = graph.handle_key_event(key);
         }
         _ => {}
     }
+}
+
+/// The workflow editor's keys on a template graph. Returns false for keys the graph handles itself.
+fn wf_key(app: &mut App, key: KeyEvent, flow_key: &str) -> bool {
+    let Some(wf) = flow_key.split(':').nth(1).and_then(|v| v.parse::<usize>().ok()) else { return false };
+    let sel = app.flows.borrow().get(flow_key).and_then(|(g, _)| g.first_selected_node_id());
+    if let Some((w, from)) = app.connecting.clone() {
+        match key.code {
+            KeyCode::Enter => {
+                if let Some(to) = sel {
+                    app.connecting = None;
+                    app.pending_link = Some((w, from, to));
+                    app.modal = Some(Modal::Chooser(forms::Chooser { title: "link kind", options: data::LINK_KINDS.to_vec(), cursor: 0 }));
+                }
+            }
+            KeyCode::Esc => {
+                app.connecting = None;
+                app.flash("not connected");
+            }
+            _ => return false,
+        }
+        return true;
+    }
+    let steps = &app.data.workflows[wf].steps;
+    let pos = sel.as_deref().and_then(|id| steps.iter().position(|s| s.id == id));
+    match key.code {
+        KeyCode::Char('a') => {
+            let after = pos.unwrap_or(steps.len().saturating_sub(1));
+            app.modal = Some(Modal::Form(forms::Form::step(wf, None, after, "", "claude · sonnet", "")));
+        }
+        KeyCode::Char('e') | KeyCode::Enter => {
+            let Some(p) = pos else { return true };
+            let s = &steps[p];
+            let parts: Vec<&str> = s.parts.iter().map(|(n, _)| n.as_str()).collect();
+            app.modal = Some(Modal::Form(forms::Form::step(wf, Some(p), p, &s.name, &s.agent, &parts.join(", "))));
+        }
+        KeyCode::Char('x') => {
+            let Some(p) = pos else { return true };
+            let name = steps[p].name.clone();
+            let lines = vec![
+                format!("{name} goes, with its links; what led into it now leads to what came after."),
+                "Runs already going keep the version they started with.".to_string(),
+            ];
+            app.modal = Some(Modal::Confirm(modal::Confirm { title: format!("delete step {name}?"), lines, yes: "delete", action: modal::Action::DeleteStep(wf, p) }));
+        }
+        KeyCode::Char('c') => {
+            let Some(id) = sel else { return true };
+            let name = pos.map_or(id.clone(), |p| steps[p].name.clone());
+            app.connecting = Some((wf, id));
+            app.flash(format!("connect from {name}: arrows pick the target, Enter chooses the link (a loop can point back)"));
+        }
+        KeyCode::Char('i') => {
+            let Some(node) = sel else { return true };
+            app.modal = Some(Modal::Links(modal::LinksEdit { wf, node, cursor: 0 }));
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// The links modal: ↑↓ picks a link, ← → changes its kind, d deletes it.
+fn links_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::Links(l)) = &mut app.modal else { return };
+    let wf = &mut app.data.workflows[l.wf];
+    let ids = modal::step_links(wf, &l.node);
+    let mut close = false;
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter => close = true,
+        KeyCode::Up => l.cursor = l.cursor.saturating_sub(1),
+        KeyCode::Down => l.cursor = (l.cursor + 1).min(ids.len().saturating_sub(1)),
+        KeyCode::Left | KeyCode::Right => {
+            if let Some(i) = ids.get(l.cursor) {
+                let kinds = data::LINK_KINDS;
+                let at = kinds.iter().position(|(k, _)| *k == wf.links[*i].kind).unwrap_or(0) as isize;
+                let by = if key.code == KeyCode::Left { -1 } else { 1 };
+                wf.links[*i].kind = kinds[(at + by).rem_euclid(kinds.len() as isize) as usize].0;
+                wf.version += 1;
+            }
+        }
+        KeyCode::Char('d') | KeyCode::Delete => {
+            if let Some(i) = ids.get(l.cursor) {
+                wf.links.remove(*i);
+                wf.version += 1;
+                l.cursor = l.cursor.min(ids.len().saturating_sub(2));
+            }
+        }
+        _ => {}
+    }
+    let node = l.node.clone();
+    if close {
+        app.modal = None;
+    }
+    app.wf_select = Some(node);
+}
+
+/// Adds or edits a workflow step from the step form.
+fn save_step(app: &mut App, wf: usize, edit: Option<usize>, after: usize, form: &forms::Form) {
+    let name = form.value("name").trim().to_string();
+    let agent = form.value("agent").to_string();
+    let parts: Vec<(String, String)> = form.value("parts").split(',').map(str::trim).filter(|p| !p.is_empty()).map(|p| (p.to_string(), agent.clone())).collect();
+    let w = &mut app.data.workflows[wf];
+    let id = match edit {
+        Some(p) => {
+            let s = &mut w.steps[p];
+            s.name = name.clone();
+            s.agent = agent;
+            s.parts = parts;
+            s.id.clone()
+        }
+        None => {
+            let base: String = name.to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect();
+            let mut id = base.clone();
+            let mut n = 2;
+            while w.steps.iter().any(|s| s.id == id) {
+                id = format!("{base}-{n}");
+                n += 1;
+            }
+            let prev = w.steps.get(after).map(|s| s.id.clone());
+            // The new step takes over the previous one's forward links, and follows it.
+            if let Some(prev) = &prev {
+                for l in w.links.iter_mut().filter(|l| l.from == *prev && !data::is_loop(l.kind)) {
+                    l.from = id.clone();
+                }
+                w.links.push(data::WfLink { from: prev.clone(), to: id.clone(), kind: "next" });
+            }
+            let at = if prev.is_some() { after + 1 } else { w.steps.len() };
+            w.steps.insert(at, data::WfStep { id: id.clone(), name: name.clone(), agent, parts });
+            id
+        }
+    };
+    w.version += 1;
+    app.wf_select = Some(id);
+    app.flash(format!("{} {name} · the template is saved", if edit.is_some() { "edited" } else { "added" }));
+}
+
+/// Deletes a workflow step; what led into it now leads to what came after it.
+fn delete_step(app: &mut App, wf: usize, p: usize) {
+    let w = &mut app.data.workflows[wf];
+    let id = w.steps[p].id.clone();
+    let preds: Vec<String> = w.links.iter().filter(|l| l.to == id && l.from != id && !data::is_loop(l.kind)).map(|l| l.from.clone()).collect();
+    let succs: Vec<(String, &'static str)> = w.links.iter().filter(|l| l.from == id && l.to != id && !data::is_loop(l.kind)).map(|l| (l.to.clone(), l.kind)).collect();
+    w.links.retain(|l| l.from != id && l.to != id);
+    for a in &preds {
+        for (b, kind) in &succs {
+            if !w.links.iter().any(|l| l.from == *a && l.to == *b) {
+                w.links.push(data::WfLink { from: a.clone(), to: b.clone(), kind });
+            }
+        }
+    }
+    let name = w.steps.remove(p).name;
+    w.version += 1;
+    app.wf_select = w.steps.get(p.saturating_sub(1)).map(|s| s.id.clone());
+    app.flash(format!("deleted {name}"));
 }
 
 /// `M` on a graph: the arrows (or h j k l) move the selected node; its links follow, and nothing
@@ -568,7 +737,7 @@ fn graph_enter(app: &mut App, flow_key: &str) {
         let item = &app.data.items[idx];
         let Some(step) = app.steps_of(item).into_iter().find(|s| s.id == node) else { return };
         let key = item.key;
-        match (step.id, step.status) {
+        match (step.id.as_str(), step.status) {
             // htui's own stages have no chat: say what they did.
             ("prepare", Status::Queued) => app.flash(format!("{} has not started yet", step.name)),
             ("prepare", _) => {
@@ -576,6 +745,8 @@ fn graph_enter(app: &mut App, flow_key: &str) {
                 app.flash(format!("{}: {}", step.name, t.how.first().copied().unwrap_or("").replace("<item>", &key.to_lowercase())));
             }
             ("pick", Status::Queued) => app.flash("the fast pick runs when the run starts"),
+            ("collect", Status::Queued) => app.flash("when the run is done, collect brings the branch back here (like scripts/hr collect)"),
+            ("collect", _) => app.flash(format!("collect: fetch branch {} from the sandbox and merge it here", key.to_lowercase())),
             ("pick", _) => {
                 let (wf, why) = app.workflow_of(item);
                 let name = app.data.workflows[wf].name;
@@ -586,7 +757,11 @@ fn graph_enter(app: &mut App, flow_key: &str) {
             }
             // Not started: nothing to show yet.
             (_, Status::Queued) => app.flash(format!("{} has not started yet", step.name)),
-            (_, Status::Done | Status::Closed) => jump(app, |app| open_archived(app, key, step.id, &step.name, step.agent)),
+            (_, Status::Done | Status::Closed) => {
+                let id: &'static str = Box::leak(step.id.clone().into_boxed_str());
+                let agent: &'static str = Box::leak(step.agent.clone().into_boxed_str());
+                jump(app, |app| open_archived(app, key, id, &step.name, agent))
+            }
             _ => jump(app, |app| open_item_chat(app, key, Some(&step.name))),
         }
     } else if let Some(id) = node.strip_prefix("req:") {
@@ -798,25 +973,27 @@ fn stop_workspace(app: &mut App) {
     let Some(ws) = selected_ws(app) else { return };
     let name = app.data.workspaces[ws].name;
     match app.data.workspaces[ws].state {
-        WsState::Open => app.flash(format!("{name} is open: open another one first, or stop single runs in the Backlog")),
-        WsState::Background => {
-            let runs = running_items(app, ws);
+        WsState::Open | WsState::Background => {
+            let runs = app.running_items(ws);
+            if runs.is_empty() && ws == app.workspace {
+                return app.flash(format!("nothing is running in {name}"));
+            }
             let mut lines = if runs.is_empty() {
-                vec!["Nothing is running there; it closes right away.".to_string()]
+                vec!["Nothing is running there; it stops right away.".to_string()]
             } else {
-                vec![format!("{} run(s) finish the step they are in, then park:", runs.len())]
+                vec![format!("{} run(s) stop:", runs.len())]
             };
-            lines.extend(runs.iter().map(|(k, s)| format!("   {k:<9} {s}")));
+            lines.extend(runs.iter().map(|(k, s, a)| format!("   {k:<9} {s} · {a}: {}", app::graceful_note(a))));
             lines.push(String::new());
-            lines.push("Nothing new starts. r resumes the parked runs later; s again forces.".into());
-            app.modal = Some(Modal::Confirm(modal::Confirm { title: format!("stop {name}?"), lines, yes: "stop", action: modal::Action::Stop(ws) }));
+            lines.push("Nothing new starts. r resumes them; s again stops them at once.".into());
+            app.modal = Some(Modal::Confirm(modal::Confirm { title: format!("stop the runs in {name}?"), lines, yes: "stop", action: modal::Action::Stop(ws) }));
         }
         WsState::Stopping => {
-            let runs = running_items(app, ws);
-            let mut lines = vec![format!("{} run(s) are cut short now, mid-step:", runs.len())];
-            lines.extend(runs.iter().map(|(k, s)| format!("   {k:<9} {s}: its work so far is kept, the step runs again")));
+            let runs = app.running_items(ws);
+            let mut lines = vec![format!("{} run(s) stop now, mid-turn:", runs.len())];
+            lines.extend(runs.iter().map(|(k, s, a)| format!("   {k:<9} {s} · {a}")));
             lines.push(String::new());
-            lines.push("r resumes them; each redoes the step it was cut in.".into());
+            lines.push("Conversations are saved; on resume the interrupted turn runs again.".into());
             app.modal = Some(Modal::Confirm(modal::Confirm { title: format!("force-stop {name}?"), lines, yes: "force stop", action: modal::Action::ForceStop(ws) }));
         }
         WsState::Stopped => app.flash(format!("{name} is already stopped · r resumes its runs · o opens it")),
@@ -826,22 +1003,13 @@ fn stop_workspace(app: &mut App) {
 /// Stops workspace `ws`, setting its running items aside. Graceful: each finished its current step
 /// and resumes at the next one. Forced: each was cut short and redoes that step on resume.
 fn park_runs(app: &mut App, ws: usize, interrupted: bool) {
-    let parked: Vec<data::Parked> = running_items(app, ws).into_iter().map(|(key, step)| data::Parked { key, step, interrupted }).collect();
+    let parked: Vec<data::Parked> =
+        app.running_items(ws).into_iter().map(|(key, step, agent)| data::Parked { key, step, interrupted, resumable: app::resumable(&agent) }).collect();
+    let open = ws == app.workspace;
     let w = &mut app.data.workspaces[ws];
-    w.state = WsState::Stopped;
+    // The workspace on screen stays open; its runs are what stopped.
+    w.state = if open { WsState::Open } else { WsState::Stopped };
     w.parked.extend(parked);
-}
-
-/// The runs going on in workspace `ws`: (item, the step it is in).
-fn running_items(app: &App, ws: usize) -> Vec<(&'static str, String)> {
-    let projects = &app.data.workspaces[ws].projects;
-    app.data
-        .items
-        .iter()
-        .filter(|i| projects.contains(&i.project) && matches!(i.status, Status::InProgress | Status::AwaitingApproval))
-        .filter(|i| !app.data.workspaces[ws].parked.iter().any(|p| p.key == i.key))
-        .map(|i| (i.key, app.current_step(i)))
-        .collect()
 }
 
 /// `r`: a stopped workspace's parked runs start again, in the background (or on screen if it is the
@@ -863,6 +1031,36 @@ fn resume_workspace(app: &mut App) {
     }
     let how = if redo > 0 { format!(", {redo} redo the step they were cut in") } else { String::new() };
     app.flash(format!("{name} resumed: {} run(s) pick up where they parked{how}", parked.len()));
+}
+
+/// `T` on a workspace or project overview: where its items run, by default. Cycles "inherit" and
+/// every selectable target.
+fn cycle_scope_target(app: &mut App) {
+    let Some(i) = app.selected_entry() else { return };
+    let (ws, project) = app.ws_nodes[i];
+    let choices: Vec<usize> = (0..app.data.targets.len()).filter(|t| app.data.targets[*t].planned.is_none()).collect();
+    let current = match project {
+        Some(p) => app.project_target.get(p).copied(),
+        None => app.ws_target.get(&ws).copied(),
+    };
+    // None (inherit) → each target → None.
+    let next = match current.and_then(|c| choices.iter().position(|t| *t == c)) {
+        None => choices.first().copied(),
+        Some(k) => choices.get(k + 1).copied(),
+    };
+    match (project, next) {
+        (Some(p), Some(t)) => _ = app.project_target.insert(p, t),
+        (Some(p), None) => _ = app.project_target.remove(p),
+        (None, Some(t)) => _ = app.ws_target.insert(ws, t),
+        (None, None) => _ = app.ws_target.remove(&ws),
+    }
+    let (t, from) = match project {
+        Some(p) => app.inherited_target(ws, Some(p)),
+        None => app.inherited_target(ws, None),
+    };
+    let what = project.unwrap_or(app.data.workspaces[ws].name);
+    let how = if next.is_some() { "set here".to_string() } else { format!("inherited from {from}") };
+    app.flash(format!("{what}: items run on {} ({how}) unless an item says otherwise", app.data.targets[t].name));
 }
 
 /// Selects item `idx` in the Backlog, showing done items first if it is one of them.
@@ -921,6 +1119,7 @@ fn new_thing(app: &mut App) {
                 1 => Modal::AddComponent(modal::Wizard::new(ws, project)),
                 2 => Modal::NewItem(modal::NewItem::requirement(ws, project, &app.data)),
                 _ => Modal::Chooser(forms::Chooser {
+                    title: "new",
                     options: vec![
                         ("workspace", "a new workspace, in its own folder"),
                         ("project", "a repo in this workspace"),
@@ -946,6 +1145,18 @@ fn on_outcome(app: &mut App, outcome: Outcome) {
             });
             app.quit = true;
         }
+        Outcome::Choose(kind) if app.pending_link.is_some() => {
+            app.modal = None;
+            let Some((wf, from, to)) = app.pending_link.take() else { return };
+            let w = &mut app.data.workflows[wf];
+            let name = |id: &str| w.steps.iter().find(|s| s.id == id).map_or(id.to_string(), |s| s.name.clone());
+            let text = format!("{} → {}: {kind}", name(&from), name(&to));
+            w.links.retain(|l| !(l.from == from && l.to == to));
+            w.links.push(data::WfLink { from: from.clone(), to, kind });
+            w.version += 1;
+            app.wf_select = Some(from);
+            app.flash(text);
+        }
         Outcome::Choose(what) => {
             let (ws, project) = app.selected_entry().map_or((app.workspace, None), |i| app.ws_nodes[i]);
             app.modal = Some(match what {
@@ -957,7 +1168,11 @@ fn on_outcome(app: &mut App, outcome: Outcome) {
         }
         Outcome::SubmitForm => {
             if let Some(Modal::Form(form)) = app.modal.take() {
-                submit_form(app, form);
+                if let forms::FormKind::Step { wf, edit, after } = form.kind {
+                    save_step(app, wf, edit, after, &form);
+                } else {
+                    submit_form(app, form);
+                }
             }
         }
         Outcome::Stay => {}
@@ -967,31 +1182,36 @@ fn on_outcome(app: &mut App, outcome: Outcome) {
             match action {
                 modal::Action::Stop(ws) => {
                     let name = app.data.workspaces[ws].name;
-                    let n = running_items(app, ws).len();
+                    let n = app.running_items(ws).len();
                     app.data.workspaces[ws].state = WsState::Stopping;
                     app.stopping.insert(ws, Instant::now());
-                    app.flash(format!("stopping {name}: {n} run(s) finish their step, then park · s again forces"));
+                    app.flash(format!("stopping {name}: {n} run(s) stop before their next turn · s again: now"));
                 }
+                modal::Action::DeleteStep(wf, p) => delete_step(app, wf, p),
                 modal::Action::ForceStop(ws) => {
                     let name = app.data.workspaces[ws].name;
-                    let n = running_items(app, ws).len();
+                    let n = app.running_items(ws).len();
                     app.stopping.remove(&ws);
                     park_runs(app, ws, true);
-                    app.flash(format!("forced: {name} stopped, {n} run(s) cut mid-step · r resumes them"));
+                    app.flash(format!("{name}: {n} run(s) stopped mid-turn, conversations saved · r resumes"));
                 }
             }
         }
         Outcome::SetRun { item, target, workflow } => {
             app.modal = None;
             let key = app.data.items[item].key;
-            app.item_target.insert(key, target);
+            match target {
+                Some(t) => app.item_target.insert(key, t),
+                None => app.item_target.remove(key),
+            };
             match workflow {
                 Some(wf) => app.item_workflow.insert(key, wf),
                 None => app.item_workflow.remove(key),
             };
             let (wf, why) = app.workflow_of(&app.data.items[item]);
             let how = if why.is_some() { "fast pick" } else { "pinned" };
-            app.flash(format!("{key} runs on {} · workflow {} ({how})", app.data.targets[target].name, app.data.workflows[wf].name));
+            let (t, from) = app.target_source(key);
+            app.flash(format!("{key} runs on {} (from {from}) · workflow {} ({how})", app.data.targets[t].name, app.data.workflows[wf].name));
         }
         Outcome::Create { project, draft } => {
             app.modal = None;
@@ -1033,6 +1253,8 @@ fn on_outcome(app: &mut App, outcome: Outcome) {
 fn submit_form(app: &mut App, form: forms::Form) {
     let leak = |s: &str| -> &'static str { Box::leak(s.trim().to_string().into_boxed_str()) };
     match form.kind {
+        // Saved by `save_step` before this is reached.
+        forms::FormKind::Step { .. } => {}
         forms::FormKind::Workspace => {
             let name = leak(form.value("name"));
             let path = leak(form.value("folder"));
@@ -1419,6 +1641,7 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
             app.drag = None;
         }
         MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+            app.wheel_seen = true;
             let by = if m.kind == MouseEventKind::ScrollDown { 1 } else { -1 };
             if contains(app.rects.flow, x, y) {
                 forward_to_flow(app, m);

@@ -16,6 +16,8 @@ use crate::theme::{self, INK, Palette, SEL_BG};
 pub enum FormKind {
     Workspace,
     Project,
+    /// A workflow step: edit step `edit`, or add one after step `after`.
+    Step { wf: usize, edit: Option<usize>, after: usize },
 }
 
 pub struct Field {
@@ -33,8 +35,9 @@ pub struct Form {
     pub cursor: usize,
 }
 
-/// "New what?" in the Workspaces tab.
+/// "New what?" in the Workspaces tab; also the link-kind picker.
 pub struct Chooser {
+    pub title: &'static str,
     pub options: Vec<(&'static str, &'static str)>,
     pub cursor: usize,
 }
@@ -75,6 +78,24 @@ impl Form {
                     help: "← → to change",
                 },
                 Field { label: "location", value: "~/projects/".into(), choices: None, help: "the folder, or the URL to clone" },
+            ],
+        }
+    }
+
+    pub fn step(wf: usize, edit: Option<usize>, after: usize, name: &str, agent: &str, parts: &str) -> Self {
+        const AGENTS: [&str; 8] = ["claude · opus", "claude · sonnet", "claude · haiku", "codex · gpt-5", "gemini · pro", "rust-reviewer", "cargo test", "you"];
+        let mut choices: Vec<String> = AGENTS.iter().map(|a| a.to_string()).collect();
+        if !choices.iter().any(|c| c == agent) {
+            choices.insert(0, agent.to_string());
+        }
+        Form {
+            kind: FormKind::Step { wf, edit, after },
+            ws: 0,
+            cursor: 0,
+            fields: vec![
+                Field { label: "name", value: name.to_string(), choices: None, help: "what the step does, e.g. security review" },
+                Field { label: "agent", value: agent.to_string(), choices: Some(choices), help: "← → picks who runs it; \"you\" is a step that waits for you" },
+                Field { label: "parts", value: parts.to_string(), choices: None, help: "comma-separated for a fan-out (one agent per part), empty for one agent" },
             ],
         }
     }
@@ -204,9 +225,9 @@ pub fn draw_quit(f: &mut Frame, app: &App, pal: Palette) {
 }
 
 pub fn draw_chooser(f: &mut Frame, c: &Chooser, pal: Palette) {
-    let rect = centered(f.area(), 64, c.options.len() as u16 + 4);
+    let rect = centered(f.area(), 76, c.options.len() as u16 + 4);
     f.render_widget(Clear, rect);
-    let block = frame("new", &[("↑↓", "choose"), ("Enter", "next"), ("Esc", "cancel")], pal);
+    let block = frame(c.title, &[("↑↓", "choose"), ("Enter", "pick"), ("Esc", "cancel")], pal);
     let inner = block.inner(rect);
     f.render_widget(block, rect);
     let lines: Vec<Line> = c
@@ -218,7 +239,7 @@ pub fn draw_chooser(f: &mut Frame, c: &Chooser, pal: Palette) {
             let mut line = Line::from(vec![
                 Span::styled(if selected { "▌ " } else { "  " }, pal.accent()),
                 Span::styled(name.chars().next().unwrap_or(' ').to_string(), pal.accent().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
-                Span::styled(format!("{:<13}", &name[1..]), if selected { theme::bold() } else { theme::text() }),
+                Span::styled(format!("{:<18}", &name[1..]), if selected { theme::bold() } else { theme::text() }),
                 Span::styled(what.to_string(), theme::dim()),
             ]);
             if selected {
@@ -234,6 +255,8 @@ pub fn draw_form(f: &mut Frame, form: &Form, app: &App, pal: Palette) {
     let title = match form.kind {
         FormKind::Workspace => "new workspace".to_string(),
         FormKind::Project => format!("new project · {}", app.data.workspaces[form.ws].name),
+        FormKind::Step { wf, edit: Some(_), .. } => format!("edit step · {}", app.data.workflows[wf].name),
+        FormKind::Step { wf, .. } => format!("new step · {}", app.data.workflows[wf].name),
     };
     let rect = centered(f.area(), 86, 24);
     f.render_widget(Clear, rect);
@@ -278,6 +301,22 @@ pub fn draw_form(f: &mut Frame, form: &Form, app: &App, pal: Palette) {
                 tree("  projects/", "projects cloned from a URL go here"),
                 Line::raw(""),
                 Line::from(Span::styled("Existing repos stay where they are; the workspace only points at them.", theme::dim())),
+            ]
+        }
+        FormKind::Step { wf, edit, after } => {
+            let w = &app.data.workflows[wf];
+            let parts: Vec<&str> = form.value("parts").split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
+            let shape = if parts.is_empty() { format!("one agent: {}", form.value("agent")) } else { format!("a fan-out: {} agents in parallel ({})", parts.len(), parts.join(", ")) };
+            let place = match edit {
+                Some(_) => "its links stay as they are".to_string(),
+                None => format!("after {}, taking over its outgoing links", w.steps.get(after).map_or("the start", |s| s.name.as_str())),
+            };
+            vec![
+                heading("it becomes"),
+                Line::from(Span::styled(format!("  {}: {shape}", form.value("name")), theme::text())),
+                Line::from(Span::styled(format!("  {place}"), theme::dim())),
+                Line::raw(""),
+                Line::from(Span::styled("The template changes; runs already going keep the version they started with.", theme::dim())),
             ]
         }
         FormKind::Project => {

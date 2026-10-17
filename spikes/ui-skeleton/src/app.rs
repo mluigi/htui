@@ -362,12 +362,28 @@ pub struct App {
     pub moving: bool,
     /// What the state file holds, so it is only written when something changed.
     saved: String,
+    /// Running inside tmux, whose config may keep the mouse wheel from reaching htui.
+    pub tmux: bool,
+    /// A wheel event has reached htui once: the tmux hint is never needed again.
+    pub wheel_seen: bool,
+    /// The user zoomed with the keyboard: they know the way round it; stop hinting.
+    pub wheel_hint_off: bool,
     /// Set when the last event already moved through the history (a jump, back, forward).
     nav_done: bool,
     /// Where each item runs (an index into `data.targets`); missing: the default, this box.
     pub item_target: HashMap<&'static str, usize>,
     /// The workflow chosen for an item; missing: the fast pick decides.
     pub item_workflow: HashMap<&'static str, usize>,
+    /// Targets set on a workspace or a project; items inherit them (item > project > workspace >
+    /// Settings).
+    pub ws_target: HashMap<usize, usize>,
+    pub project_target: HashMap<&'static str, usize>,
+    /// Workflow editor: connecting from (workflow, step) until a target is picked.
+    pub connecting: Option<(usize, String)>,
+    /// A link waiting for its kind from the chooser: (workflow, from, to).
+    pub pending_link: Option<(usize, String, String)>,
+    /// The step to select when an edited template is drawn again.
+    pub wf_select: Option<String>,
     /// The new-item modal's size, kept between uses.
     pub new_item_size: (u16, u16),
     /// The Workspaces list: (workspace, project) per entry; project None is the overview.
@@ -439,10 +455,18 @@ impl App {
             show_done: false,
             moving: false,
             saved: String::new(),
+            tmux: std::env::var_os("TMUX").is_some(),
+            wheel_seen: false,
+            wheel_hint_off: false,
             nav_done: false,
             // A few items already set up elsewhere, so the picture is not all "this box".
             item_target: HashMap::from([("MOD-67", 1), ("TOOL-8", 2), ("FEAT-3", 3)]),
             item_workflow: HashMap::new(),
+            connecting: None,
+            ws_target: HashMap::new(),
+            project_target: HashMap::from([("agy", 1)]),
+            pending_link: None,
+            wf_select: None,
             new_item_size: (96, 28),
             ws_nodes,
             stopping: HashMap::new(),
@@ -610,17 +634,61 @@ impl App {
     /// The steps of item `item`'s run, from its workflow and target.
     pub fn steps_of(&self, item: &data::Item) -> Vec<crate::flow::Step> {
         let (wf, _) = self.workflow_of(item);
-        crate::flow::run_steps(item, &self.data.workflows[wf], self.data.targets[self.target_of(item.key)].name)
+        crate::flow::run_steps(item, &self.data.workflows[wf], &self.data.targets[self.target_of(item.key)])
     }
 
-    /// The step a run is in now (the first not finished).
-    pub fn current_step(&self, item: &data::Item) -> String {
-        self.steps_of(item).into_iter().find(|s| s.status != Status::Done).map_or_else(|| "—".to_string(), |s| s.name)
+    /// The runs going on in workspace `ws`: (item, the step it is in, the agent running it).
+    pub fn running_items(&self, ws: usize) -> Vec<(&'static str, String, String)> {
+        let w = &self.data.workspaces[ws];
+        self.data
+            .items
+            .iter()
+            .filter(|i| w.projects.contains(&i.project) && matches!(i.status, Status::InProgress | Status::AwaitingApproval))
+            .filter(|i| !w.parked.iter().any(|p| p.key == i.key))
+            .filter_map(|i| self.steps_of(i).into_iter().find(|s| s.status != Status::Done).map(|s| (i.key, s.name, s.agent)))
+            .collect()
     }
 
-    /// Where item `key` runs.
+    /// A Settings field's value, e.g. ("Workflows", "fast pick model").
+    pub fn setting(&self, section: &str, label: &str) -> String {
+        self.data.sections.iter().find(|s| s.name == section).and_then(|s| s.fields.iter().find(|f| f.label == label)).map_or_else(String::new, |f| f.value.clone())
+    }
+
+    /// Where item `key` runs: its own choice, else its project's, its workspace's, then Settings'.
     pub fn target_of(&self, key: &str) -> usize {
-        self.item_target.get(key).copied().unwrap_or(0)
+        self.target_source(key).0
+    }
+
+    /// The target for item `key` and where it comes from.
+    pub fn target_source(&self, key: &str) -> (usize, String) {
+        if let Some(t) = self.item_target.get(key) {
+            return (*t, "this item".into());
+        }
+        let project = self.data.items.iter().find(|i| i.key == key).map_or("", |i| i.project);
+        self.inherited_target(self.workspace_of(project), Some(project))
+    }
+
+    /// What a project (or, with None, a workspace) inherits when it sets nothing itself.
+    pub fn inherited_target(&self, ws: usize, project: Option<&str>) -> (usize, String) {
+        if let Some(p) = project
+            && let Some(t) = self.project_target.get(p)
+        {
+            return (*t, format!("project {p}"));
+        }
+        if let Some(t) = self.ws_target.get(&ws) {
+            return (*t, format!("workspace {}", self.data.workspaces[ws].name));
+        }
+        (self.settings_target(), "Settings".into())
+    }
+
+    /// Settings → Targets → default.
+    pub fn settings_target(&self) -> usize {
+        let value = self.data.sections.iter().find(|s| s.name == "Targets").and_then(|s| s.fields.iter().find(|f| f.label == "default")).map(|f| f.value.clone());
+        value.and_then(|v| self.data.targets.iter().position(|t| t.name == v)).unwrap_or(0)
+    }
+
+    pub fn workspace_of(&self, project: &str) -> usize {
+        self.data.workspaces.iter().position(|w| w.projects.contains(&project)).unwrap_or(self.workspace)
     }
 
     /// The item's workflow, and whether the fast pick chose it (with its reason).
@@ -690,6 +758,8 @@ impl App {
         if let Some(g) = kv.get("backlog.group").and_then(|v| GroupBy::ALL.iter().find(|g| g.name() == *v)) {
             self.group_by = *g;
         }
+        self.wheel_seen = kv.get("wheel_seen").is_some_and(|v| *v == "1");
+        self.wheel_hint_off = kv.get("wheel_hint_off").is_some_and(|v| *v == "1");
         if let Some(v) = kv.get("backlog.show_done") {
             self.show_done = *v == "1";
         }
@@ -726,13 +796,15 @@ impl App {
 
     fn state_text(&self) -> String {
         let mut out = format!(
-            "about={}\ntab={}\nnew_item_size={}x{}\nbacklog.group={}\nbacklog.show_done={}\n",
+            "about={}\ntab={}\nnew_item_size={}x{}\nbacklog.group={}\nbacklog.show_done={}\nwheel_seen={}\nwheel_hint_off={}\n",
             u8::from(self.about),
             self.tab,
             self.new_item_size.0,
             self.new_item_size.1,
             self.group_by.name(),
-            u8::from(self.show_done)
+            u8::from(self.show_done),
+            u8::from(self.wheel_seen),
+            u8::from(self.wheel_hint_off)
         );
         for (i, name) in TABS.iter().enumerate() {
             let l = &self.tabs[i].layout;
@@ -756,6 +828,17 @@ impl App {
             self.saved = text;
         }
     }
+}
+
+/// Whether an agent can stop between turns and later reopen its saved conversation (ACP session
+/// load). Checks and htui's own steps cannot: they stop at once and run again.
+pub fn resumable(agent: &str) -> bool {
+    ["claude", "codex", "gemini", "rust-reviewer"].iter().any(|a| agent.starts_with(a))
+}
+
+/// What happens to one run when a graceful stop reaches it.
+pub fn graceful_note(agent: &str) -> &'static str {
+    if resumable(agent) { "stops before its next turn; the conversation is saved and resumes" } else { "cannot pause between turns: stops now; the step runs again on resume" }
 }
 
 /// The mock fast pick: what a small model would answer from the item's kind and shape, in a second.

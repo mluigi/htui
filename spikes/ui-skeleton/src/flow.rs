@@ -6,9 +6,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Widget};
 
-use rataflow::{Edge, EdgeStyle, FitViewOptions, Flow, Node, NodeContent, NodeRenderContext, StepEdge, Sugiyama, Theme};
+use rataflow::{Edge, EdgeStyle, FitViewOptions, Flow, Handle, HandlePosition, Node, NodeContent, NodeRenderContext, StepEdge, Sugiyama, Theme};
 
-use crate::data::{Item, Requirement, Status, Workflow};
+use crate::data::{self, Item, Requirement, Status, Workflow};
 use crate::theme::{self, Palette};
 
 pub type Graph = Flow<StatusNode, StepEdge>;
@@ -128,8 +128,12 @@ pub fn rel_style(kind: &str) -> (Color, bool, &'static str) {
         "relates to" => (theme::kind_color("FEAT"), true, "related, no order"),
         "fans out" => (theme::kind_color("ANA"), false, "parallel agents, one part each"),
         "merges" => (theme::kind_color("ANA"), true, "their results combined"),
-        "changes requested" => (theme::status_color(Status::Failed), false, "review sends it back"),
+        "changes requested" => (theme::status_color(Status::Failed), false, "loop: review sends it back"),
         "approved" => (theme::status_color(Status::Done), false, "review passes it on"),
+        "fails" => (theme::status_color(Status::Failed), true, "loop: a failed check sends it back"),
+        "retries" => (theme::status_color(Status::Blocked), true, "loop: the same step again, up to a cap"),
+        "asks you" => (theme::status_color(Status::AwaitingApproval), false, "waits for your go-ahead"),
+        "if" => (theme::kind_color("FEAT"), true, "only when a condition holds"),
         _ => (theme::DIM, false, "next step"),
     }
 }
@@ -173,6 +177,9 @@ fn flow_theme(pal: Palette) -> Theme {
 }
 
 fn finish(nodes: Vec<Node<StatusNode>>, edges: Vec<Edge<StepEdge>>, select: &str, pal: Palette, opts: GraphOpts) -> Graph {
+    // Rank spacing 2, never 1: with a one-row gap the arrow vanishes whenever the view's pan lands
+    // on a whole row (rataflow 0.1 rounds the short edge away).
+    let spacing = if opts.labels.labels() { 4.0 } else { 2.0 };
     // What to centre on: the node that matters and its direct neighbours.
     let mut focus = vec![select.to_string()];
     for e in &edges {
@@ -190,7 +197,6 @@ fn finish(nodes: Vec<Node<StatusNode>>, edges: Vec<Edge<StepEdge>>, select: &str
         .with_theme(flow_theme(pal))
         .with_edges_reconnectable(false);
     let layout = if opts.horizontal { Sugiyama::horizontal() } else { Sugiyama::vertical() };
-    let spacing = if opts.labels.labels() { 4.0 } else { 2.0 };
     flow.apply_layout(layout.with_node_spacing(2.0).with_rank_spacing(spacing).with_margin(1.0));
     spread_components(&mut flow, &links, opts.horizontal);
     flow.select_node(select);
@@ -298,20 +304,90 @@ pub fn item_graph(items: &[Item], reqs: &[Requirement], root: &Item, pal: Palett
 
 /// One step of a run as the graph and Enter see it.
 pub struct Step {
-    pub id: &'static str,
+    pub id: String,
     pub name: String,
-    pub agent: &'static str,
+    pub agent: String,
     pub status: Status,
 }
 
-/// A run: htui prepares the target, a fast model picks the workflow, then the workflow's steps.
-pub fn run_steps(item: &Item, wf: &Workflow, target: &str) -> Vec<Step> {
-    // Every run starts with the same two stages, then the workflow's own.
-    let mut all: Vec<(&'static str, String, &'static str, usize)> = vec![
-        ("prepare", format!("prepare · {target}"), "htui", 0),
-        ("pick", "pick workflow".to_string(), "fast model", 1),
-    ];
-    all.extend(wf.steps.iter().map(|(id, name, agent, stage)| (*id, name.to_string(), *agent, stage + 2)));
+/// How a run carries a template out: the steps in order, a loop's body run twice (the review asked
+/// for changes once), a fan-out as one node per part. Returns (id, name, agent, stage) and links.
+pub fn actuate(wf: &Workflow) -> (Vec<(String, String, String, usize)>, Vec<(String, String, &'static str)>) {
+    let pos = |id: &str| wf.steps.iter().position(|s| s.id == id);
+    let fwd = |a: usize, b: usize| {
+        wf.links.iter().find(|l| !data::is_loop(l.kind) && l.from == wf.steps[a].id && l.to == wf.steps[b].id).map_or("next", |l| l.kind)
+    };
+    // The loop the mock run goes round once: the first "changes requested" back to an earlier step.
+    let main_loop = wf.links.iter().filter(|l| l.kind == "changes requested").find_map(|l| {
+        let (src, dst) = (pos(&l.from)?, pos(&l.to)?);
+        (dst <= src).then_some((src, dst))
+    });
+    let mut groups: Vec<(Vec<(String, String, String)>, &'static str)> = Vec::new();
+    let mut push = |j: usize, round: Option<usize>, kind: &'static str| {
+        let s = &wf.steps[j];
+        let (sid, sname) = match round {
+            Some(r) => (format!("{}-{r}", s.id), format!("{} · round {r}", s.name)),
+            None => (s.id.clone(), s.name.clone()),
+        };
+        let nodes = if s.parts.is_empty() {
+            vec![(sid, sname, s.agent.clone())]
+        } else {
+            s.parts.iter().enumerate().map(|(k, (part, agent))| (format!("{sid}-p{k}"), format!("{sname} · {part}"), agent.clone())).collect()
+        };
+        groups.push((nodes, kind));
+    };
+    let mut prev: Option<usize> = None;
+    let mut i = 0;
+    while i < wf.steps.len() {
+        if let Some((src, dst)) = main_loop.filter(|(_, dst)| *dst == i) {
+            for round in 1..=2 {
+                for j in dst..=src {
+                    let kind = if round == 2 && j == dst { "changes requested" } else { prev.map_or("next", |p| fwd(p, j)) };
+                    push(j, Some(round), kind);
+                    prev = Some(j);
+                }
+            }
+            i = src + 1;
+        } else {
+            push(i, None, prev.map_or("next", |p| fwd(p, i)));
+            prev = Some(i);
+            i += 1;
+        }
+    }
+    let mut nodes = Vec::new();
+    let mut links = Vec::new();
+    for (g, (group, kind)) in groups.iter().enumerate() {
+        nodes.extend(group.iter().map(|(id, name, agent)| (id.clone(), name.clone(), agent.clone(), g)));
+        if g == 0 {
+            continue;
+        }
+        let before = &groups[g - 1].0;
+        for (a, (from, ..)) in before.iter().enumerate() {
+            for (b, (to, ..)) in group.iter().enumerate() {
+                let kind = match (before.len(), group.len()) {
+                    (1, n) if n > 1 => "fans out",
+                    (n, 1) if n > 1 => "merges",
+                    (n, m) if n > 1 && m > 1 && a != b => continue,
+                    _ => *kind,
+                };
+                links.push((from.clone(), to.clone(), kind));
+            }
+        }
+    }
+    (nodes, links)
+}
+
+/// A run: htui prepares the target, a fast model picks the workflow, the workflow's steps, and on a
+/// sandboxed or remote target a last step that waits for you to collect the branch.
+pub fn run_steps(item: &Item, wf: &Workflow, target: &data::Target) -> Vec<Step> {
+    let (body, _) = actuate(wf);
+    let mut all: Vec<(String, String, String, usize)> =
+        vec![("prepare".into(), format!("prepare · {}", target.name), "htui".into(), 0), ("pick".into(), "pick workflow".into(), "fast model".into(), 1)];
+    all.extend(body.into_iter().map(|(id, name, agent, stage)| (id, name, agent, stage + 2)));
+    if target.kind != "local" {
+        let last = all.iter().map(|s| s.3).max().unwrap_or(0) + 1;
+        all.push(("collect".into(), "collect the branch".into(), "you".into(), last));
+    }
     let stages = all.iter().map(|s| s.3).max().unwrap_or(0) + 1;
     // How many stages are finished; the next one is the current stage (none when not started).
     let (done, current) = match item.status {
@@ -334,7 +410,7 @@ pub fn run_steps(item: &Item, wf: &Workflow, target: &str) -> Vec<Step> {
         .collect()
 }
 
-pub fn run_graph(item: &Item, wf: &Workflow, target: &str, pal: Palette, opts: GraphOpts) -> Graph {
+pub fn run_graph(item: &Item, wf: &Workflow, target: &data::Target, pal: Palette, opts: GraphOpts) -> Graph {
     let steps = run_steps(item, wf, target);
     let status = |id: &str| steps.iter().find(|s| s.id == id).map_or(Status::Queued, |s| s.status);
     let nodes = steps
@@ -346,31 +422,95 @@ pub fn run_graph(item: &Item, wf: &Workflow, target: &str, pal: Palette, opts: G
                 st => format!("{} · {}", s.agent, st.label()),
             };
             let content = StatusNode { head: s.name.clone(), head_color: theme::TEXT, sub, status: s.status, accent: pal.accent, root: false, shape: Shape::Step };
-            Node::new(s.id, (0.0, 0.0), (NODE_W - 4.0, NODE_H), content)
+            Node::new(s.id.as_str(), (0.0, 0.0), (NODE_W - 4.0, NODE_H), content)
         })
         .collect();
-    let first = wf.steps.first().map_or("gate", |s| s.0);
-    let mut pairs = vec![("prepare", "pick", "next"), ("pick", first, "next")];
-    pairs.extend(wf.links.iter().copied());
+    let (body, mut pairs) = actuate(wf);
+    let firsts: Vec<String> = body.iter().filter(|s| s.3 == 0).map(|s| s.0.clone()).collect();
+    pairs.insert(0, ("prepare".into(), "pick".into(), "next"));
+    for (k, f) in firsts.iter().enumerate() {
+        pairs.insert(1 + k, ("pick".into(), f.clone(), if firsts.len() > 1 { "fans out" } else { "next" }));
+    }
+    if let Some(collect) = steps.iter().find(|s| s.id == "collect") {
+        let last_stage = body.iter().map(|s| s.3).max().unwrap_or(0);
+        for s in body.iter().filter(|s| s.3 == last_stage) {
+            pairs.push((s.0.clone(), collect.id.clone(), "asks you"));
+        }
+    }
     // The links into a step that is running now move.
     let edges = pairs
         .iter()
         .enumerate()
         .map(|(i, (s, t, k))| edge(i, s, t, k, opts, status(t) == Status::InProgress && status(s) == Status::Done))
         .collect();
-    let select = steps.iter().find(|s| s.status != Status::Done).or(steps.last()).map_or("prepare", |s| s.id);
-    finish(nodes, edges, select, pal, opts)
+    let select = steps.iter().find(|s| s.status != Status::Done).or(steps.last()).map_or("prepare".to_string(), |s| s.id.clone());
+    finish(nodes, edges, &select, pal, opts)
 }
 
-/// The link kinds a workflow's run graph uses, for its legend.
+/// The link kinds a run of this workflow shows, for its legend.
 pub fn run_kinds(wf: &Workflow) -> Vec<&'static str> {
     let mut kinds = Vec::new();
-    for (_, _, k) in wf.links {
-        if *k != "next" && !kinds.contains(k) {
-            kinds.push(*k);
+    for (_, _, k) in actuate(wf).1 {
+        if k != "next" && !kinds.contains(&k) {
+            kinds.push(k);
         }
     }
     kinds
+}
+
+/// The template itself: one node per step (a fan-out shows its parts), every link, loops pointing
+/// back up. Laid out without the loops, which are added afterwards so they never bend the ranks.
+pub fn workflow_graph(wf: &Workflow, selected: Option<&str>, pal: Palette, opts: GraphOpts) -> (Graph, Vec<&'static str>) {
+    let nodes: Vec<Node<StatusNode>> = wf
+        .steps
+        .iter()
+        .map(|s| {
+            let (head, sub) = if s.parts.is_empty() {
+                (s.name.clone(), s.agent.clone())
+            } else {
+                (format!("{} ×{}", s.name, s.parts.len()), s.parts.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>().join(", "))
+            };
+            let content = StatusNode { head, head_color: theme::TEXT, sub, status: Status::Open, accent: pal.accent, root: false, shape: Shape::Step };
+            // Loops leave and enter by the sides, so they never hide under the forward chain:
+            // review loops on the right, failure loops on the left.
+            let side = |pos: HandlePosition, id: &str, source: bool, offset: f64| {
+                let h = if source { Handle::source(pos) } else { Handle::target(pos) };
+                h.with_id(id).with_offset(offset).with_hidden(true)
+            };
+            Node::new(s.id.as_str(), (0.0, 0.0), (NODE_W, NODE_H), content).with_handles(vec![
+                Handle::source(HandlePosition::Bottom).with_id("bottom"),
+                Handle::target(HandlePosition::Top).with_id("top"),
+                side(HandlePosition::Right, "r-out", true, 0.75),
+                side(HandlePosition::Right, "r-in", false, 0.25),
+                side(HandlePosition::Left, "l-out", true, 0.75),
+                side(HandlePosition::Left, "l-in", false, 0.25),
+            ])
+        })
+        .collect();
+    let mut forward = Vec::new();
+    let mut loops = Vec::new();
+    for (i, l) in wf.links.iter().enumerate() {
+        let e = edge(i, &l.from, &l.to, l.kind, opts, false);
+        if data::is_loop(l.kind) {
+            let (out, inn) = if l.kind == "changes requested" { ("r-out", "r-in") } else { ("l-out", "l-in") };
+            loops.push(e.with_source_handle(Some(out.into())).with_target_handle(Some(inn.into())));
+        } else {
+            forward.push(e.with_source_handle(Some("bottom".into())).with_target_handle(Some("top".into())));
+        }
+    }
+    let mut kinds: Vec<&'static str> = Vec::new();
+    for l in &wf.links {
+        if !kinds.contains(&l.kind) {
+            kinds.push(l.kind);
+        }
+    }
+    let first = selected.map(str::to_string).or_else(|| wf.steps.first().map(|s| s.id.clone())).unwrap_or_default();
+    let mut flow = finish(nodes, forward, &first, pal, opts);
+    for e in loops {
+        let _ = flow.add_edge(e);
+    }
+
+    (flow, kinds)
 }
 
 /// Requirements in scope, parent above child, and the items covering each.

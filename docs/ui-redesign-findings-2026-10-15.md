@@ -158,20 +158,21 @@ Requirements tab is gone (absorbed by Workspaces); Logs is new; Skills became To
   `◌ stopping…`, `○ stopped`.
 - **Opening another workspace** (`o`) sends the current one to the background; **its running items
   keep running.** The header shows `+N in background`.
-- **Stopping** (round 7 decision): `s` once is **graceful**: the overview lists each running item and
-  the step it is finishing ("◐ FEAT-3 finishing code · round 2, then parks"); when every run has
-  reached the next stoppable step, the workspace closes and the runs are **parked**. `s` twice
-  **forces** it: runs are cut mid-step. **Both are resumable**: a stopped workspace lists its parked
-  runs ("⏸ FEAT-3 parked after code · round 2: goes on from the next step" / "cut short in code ·
-  round 2: redoes it on resume"), and `r` resumes them all in the background (or on screen, if it is
-  the open workspace). Opening a stopped workspace with `o` leaves its runs parked until `r`.
-- **Both stops ask first** (round 8): `s` opens "stop Platform?" listing each run and the step it
-  will finish ("FEAT-3 code · round 2"), "Nothing new starts. r resumes the parked runs later";
-  `s` on a stopping workspace opens "force-stop Platform?" saying which step each run is cut in and
-  that it runs again on resume. `Enter` confirms, `Esc` cancels (a cancelled force stop leaves the
-  graceful stop going).
-- The open workspace still cannot be stopped from here ("open another first, or stop single runs in
-  the Backlog"); not answered yet (§8).
+- **Stopping means stopping the running items** (round 9 correction: it never removes anything, and
+  it works on the open workspace too, so a single workspace can be stopped). `s` once is
+  **graceful**: each run stops **before its agent's next turn** when the agent can resume a saved
+  session, otherwise **at once**; the overview says which ("TOOL-8 code · round 2 · claude: stops
+  before its next turn; the conversation is saved and resumes" / "cannot pause between turns: stops
+  now; the step runs again on resume"). It takes seconds, not a whole step. `s` twice stops every run
+  **now, mid-turn**. **The conversation is always saved**, and everything is resumable: the overview
+  lists the stopped runs ("⏸ TOOL-8 stopped between turns in code · round 2: resumes the
+  conversation" / "cut mid-turn …: resumes the conversation, redoing that turn" / "stopped in gate:
+  the step runs again"), and `r` resumes them all. A background workspace becomes `○ stopped`; the
+  open one stays open with its runs stopped.
+- **Both stops ask first** (round 8): `s` opens "stop the runs in Graphics?" listing each run, its
+  step and agent, and what will happen to it; `s` on a stopping workspace asks again before stopping
+  them mid-turn. `Enter` confirms, `Esc` cancels (a cancelled second stop leaves the graceful one
+  going). "Nothing is running in Graphics" when there is nothing to stop.
 - The panel's key hints follow the state (`o open · s stop`, `s force stop`, …). The earlier
   sentence "This is the open workspace. Opening another sends it to the background…" was removed at
   the maintainer's request.
@@ -217,18 +218,29 @@ Requirements tab is gone (absorbed by Workspaces); Logs is new; Skills became To
   (e.g. `DB_URL=postgres://localhost:5433/agy`). `N` adds a component only this project uses.
 - **Add-component wizard:** type → kind → **version** → **services** (only for emulators; `Space`
   toggles) → name & port (picked free, editable) → compose preview with `+` on the new lines.
-- **floci emulates every service, no choice** (round 8): the services step is skipped for it; the
-  kind list says "emulates all of s3, sqs, …" and its compose entry has no `SERVICES` line. Other
-  emulators (LocalStack, Azurite, GCP) still let you pick.
+- **floci is a family of emulators, all included, no choice** (rounds 8–9). Checked against the
+  floci-io GitHub org: one container per cloud, one port each, every service of that cloud always
+  on, no auth tokens or feature gates, plus a web console. Adding floci writes five services:
+  | service | image | port | serves |
+  |---|---|---|---|
+  | `<name>-aws` | `floci/floci` | 4566 | EC2, ECS, EKS, Lambda, RDS, S3, DynamoDB, SQS, SNS, IAM, KMS, Step Functions, CloudFormation… |
+  | `<name>-az` | `floci/floci-az` | 4577 | Blob, Queue, Table, Cosmos DB, Functions, Key Vault, Event Hubs, Azure SQL, AKS… (mounts the docker socket: Functions run in containers) |
+  | `<name>-gcp` | `floci/floci-gcp` | 4588 | Cloud Storage, Pub/Sub, Firestore, Datastore, Secret Manager, IAM, Managed Kafka |
+  | `<name>-oci` | `floci/floci-oci` | 4599 | Identity, Object Storage, Queue, Streaming, Vault + KMS, Secrets, Functions |
+  | `<name>-ui` | `floci/floci-ui` | 4500 | web console for all four |
+  Tags: `latest` (stable releases on the 15th and the last day of each month) or `nightly`. A project
+  with its own instance shifts all five ports together. The project's env gets one endpoint per
+  cloud (`AWS_ENDPOINT_URL=http://localhost:4566`, …). The wizard skips the services step for floci;
+  LocalStack, Azurite and the GCP emulators still let you pick.
 - **Types:** database, cache, queue, **cloud emulator** (floci, LocalStack, ElasticMQ, Azurite, GCP
   emulators — explicit request: "something like floci to emulate s3, sqs and others"), object
   storage, search, custom image.
 - **The catalogue is data, not code** (explicit request): seeded into the database at first start,
   updated on request (`U` in the wizard; Settings → Catalogue → "update now"; or ask the htui agent).
   The wizard shows "catalogue updated 3 days ago".
-- **Unverified mock values:** the floci entry (image `floci/floci`, port 4566, service list) is a
-  placeholder; the real image name and port were not checked. Other images are real public ones,
-  but their version lists are illustrative.
+- **Mock values:** floci's images and ports were checked (round 9, floci-io on GitHub); the
+  environment variable names per cloud other than `AWS_ENDPOINT_URL` are placeholders. Other images
+  are real public ones, but their version lists are illustrative.
 
 #### Requirements (moved here from their own tab)
 
@@ -284,12 +296,21 @@ The maintainer: the user chooses, **per item**, where it is executed: locally, i
 box connected through a central htui server (only in the plans). **Wherever it runs, htui starts the
 docker compose there and configures everything the item needs.**
 
+- **Default target, by cascade** (round 9): Settings (default **this box**, i.e. local) → workspace →
+  project → item; each level inherits unless it sets one. Workspace and project overviews show
+  "items run on docker · this box (from workspace Graphics) · T changes" (`T` cycles inherit and
+  every target). In `t`'s picker the first row is **"inherit · this box (from Settings)"**.
+- **Work comes back by collecting** (round 9), like `scripts/hr collect`: on every target except this
+  box the run graph ends with a `collect the branch` step that waits for you.
+- **The htui agent sets targets up** (round 9): adding a target, installing and logging in the agents
+  on a remote box, setting up a docker context; it asks for each login. Its Chat badge now reads
+  "settings · toolbox · agents · targets · catalogue".
 - **Targets** (Settings → Running → Targets lists them; "add a target"; a default for new items):
   | target | kind | what htui does there |
   |---|---|---|
   | this box | local | a git worktree on branch `<item>`; the item's components via compose here; agents run as you |
   | docker · this box | docker | a fresh clone in a container, a private compose project (own Postgres, cache… on free ports), the toolchain image, agent logins on a named volume; nothing leaves until collected (like `scripts/hr`) |
-  | ssh · build-01 | remote ssh | clone into `~/htui-runs/<item>`, compose there, env from Infisical, agents probed on build-01 first |
+  | ssh · build-01 | remote ssh | clone into `~/htui-runs/<item>`, compose there, env from Infisical; the htui agent installs and logs in missing agents |
   | docker · build-01 | remote docker | the docker sandbox on build-01's daemon (docker context over ssh); the branch comes back when collected |
   | box · LAPTOP-2 | htui server | **planned** (MOD-47, phase 2): a box enrolled with the server claims the run; shown, not selectable |
 - **`t` in the Backlog** opens "how MOD-67 runs": *where* on the left (each target with its state and
@@ -307,8 +328,9 @@ docker compose there and configures everything the item needs.**
 - **Groups, in order:** **htui agent** · **workspace** · **projects** · **item runs** · **archived**
   (folded). Explicit requests: separate workspace and project coordinators; always show the
   workspace coordinator and one coordinator per project; add a global agent.
-- **htui agent** (`✦`, shown in every workspace): changes htui's settings, adds skills and agents,
-  updates the component catalogue. Badge: "settings · skills · agents · catalogue".
+- **htui agent** (`✦`, shown in every workspace): changes htui's settings, adds toolbox entries and
+  agents, sets up targets (installs and logs in agents on remote boxes), updates the component
+  catalogue. Badge: "settings · toolbox · agents · targets · catalogue".
 - **Coordinators** (`◆` workspace, `◇` project) always take messages.
 - **Item runs** are **view only while the agent works** (`🔒 view only` composer: "claude is working
   on … on its own. This unlocks when it asks you something") and **editable only when they ask the
@@ -334,25 +356,46 @@ docker compose there and configures everything the item needs.**
 - Fields edit **inline on their row**; the help shows on the line under the selected field (fixes
   audit item 3). Toggles `● on` / `○ off`, choices `‹ value ›`, secrets `•••••••• stored`.
 - New **Catalogue** section (source, last updated, "update now" action).
+- New **Targets** section (round 8; default target, round 9) and **Workflows** section (round 9):
+  *fast pick model* (default **claude · haiku**, chosen from the models the configured agents offer),
+  *changes at run time* (**ask me** / automatic: may the agent change a run's workflow on its own, or
+  must it ask through a permission in the item's chat), *default workflow* (auto, or one).
 
 ### 4.6 Toolbox (was Skills; round 8)
 
 The maintainer: the tab must hold **every kind of tool a prompt item's execution can use**: skills,
 personas, mods, **workflows**, and other things (to be settled by an analysis).
 
-- **List groups:** workflows · skills · personas · templates · mods (Claude Code mods: work with
-  claude only) · MCP servers · agent help. "Other kinds" is open (§8).
-- **Workflows** are templates for **how an item is executed**: steps (parallel ones share a stage),
-  links (fan-out, merge, changes requested, approved), and when to use them. Mock set: *standard*
-  (plan → code → review loop → gate), *research fan-out*, *quick fix* (code + test → review →
-  gate), *analysis* (frame → research ×2 → write-up → review, no code). The detail shows the steps as
-  a tree, "the fast pick chooses it for …", "at run time …", and which items use it (pinned or
-  picked).
-- **Every run starts with a fast pick**: a quick, cheap prompt reads the item and picks the workflow
-  (about a second); the run graph shows it as the `pick workflow` step. The user can **pin** one per
-  item instead (`t` → workflow; "auto" is the default).
-- **The model may change the workflow at run time** (add, skip or repeat steps: another research
-  part, another review round) within the project's bounds; the change shows in the run graph.
+- **List groups** (round 9 added the last six): workflows · skills · personas · templates · mods
+  (Claude Code mods, claude only) · MCP servers · agent help · **hooks** · **commands** ·
+  **sub-agents** · **prompts** (the rewrite prompt, the fast-pick prompt) · **env presets** ·
+  **tools** (integrations that bundle an MCP server, hooks, a CLI or a daemon: gortex, headroom,
+  serena, graphify). **How to show all of these is an ANA** (round 9, §10).
+- **Workflows are templates; runs are their actuation** (round 9 correction). The template has **one
+  node per step and real loops**: `code → review`, and `review → code` "changes requested" back up,
+  `review → gate` "approved" onwards. A run **unrolls** it: each loop taken becomes `code · round 1 →
+  review · round 1 → code · round 2 …`, each fan-out one node per part (`research ×3` in the template,
+  three parallel nodes in the run).
+- **Template relations** (round 9; "possibly other relations?"): `next`, `approved`, **`changes
+  requested`** (loop), **`fails`** (loop: a failed check sends it back, e.g. `gate → code`),
+  **`retries`** (loop: the same kind of step again, up to a cap), **`asks you`** (waits for your
+  go-ahead, e.g. `merge → code` in research fan-out), **`if`** (taken only when a condition holds, e.g.
+  docs only). A fan-out is a step property (its parts), not a link.
+- **Viewed and edited as a graph in the Toolbox** (round 9; the "used by" list is gone). The template
+  is drawn with rataflow: loops leave and enter by the **sides** (review loops on the right, failure
+  loops on the left) so they never hide under the chain. Editing keys on the graph: `a` adds a step
+  after the selected one (form: name, agent, parts for a fan-out; it takes over the selected step's
+  outgoing links), `e` / `Enter` edits it, `x` deletes it (asks first; what led into it now leads to
+  what came after), `c` connects: arrows pick the target, `Enter` opens the relation picker (a loop
+  can point back), `i` lists the step's links (`← →` changes a relation, `d` deletes one), `M` / drag
+  moves a node. Runs already going keep the version they started with.
+- **Every run starts with a fast pick**: a light model (Settings → Workflows, default claude · haiku)
+  reads the item and picks the workflow; the run graph shows it as the `pick workflow` step. The user
+  can **pin** one per item instead (`t` → workflow; "auto" is the default).
+- **The model may change the workflow at run time**; Settings → Workflows says whether it does so on
+  its own or asks first (default: ask me).
+- Workflows are **global** for now. **Project workflows** (one that drives a whole project's
+  implementation, coordinating its items automatically) are wanted **later** (§8).
 - Existing items it touches: **MOD-113** (template library with its own Templates tab, skill levels,
   resources, import of skill folders and plugins), **ANA-33** (step graphs v2: graphs planned at run
   time, division of work), **ANA-30** (rejected a separate `utility_model` setting, which the fast
@@ -387,6 +430,11 @@ graphs. Shared behaviour:
   (nodes `connectable(false)`, `deletable(false)`, flow `with_edges_reconnectable(false)`; no keys are
   forwarded to rataflow's own bindings). Positions live as long as the graph is cached: `r`, or
   changing `L` / `d`, lays it out again; not saving them is fine (decided round 8).
+- **tmux and the wheel** (round 9: do both): (a) the docs explain how to let the wheel through tmux
+  (the mighty-scroll fix below, and tmux's own `mouse on`); (b) inside tmux (`$TMUX` set) a graph shows
+  a small box "wheel not zooming? tmux may be keeping it: see docs › tmux · + - zoom from the
+  keyboard" until a wheel event reaches htui once or the user zooms with `+` / `-`; both are
+  remembered, so it never comes back.
 - **Mouse:** drag pans (empty canvas) or moves (a node), wheel zooms. The maintainer reported in
   round 7 that **the wheel does nothing**, while drags work. Cause, found in their tmux config: the
   **tmux-mighty-scroll** plugin binds `WheelUpPane`/`WheelDownPane` and only passes the wheel to the
@@ -433,9 +481,12 @@ plan → ┬ research · API        (claude)  ┐
                                                    ─(approved)→ gate
 ```
 
-Since round 8 the graph follows the item's **workflow** (§4.6): the drawing above is *research
-fan-out*; *standard*, *quick fix* and *analysis* draw their own steps. Every run graph starts with
-`prepare · <target>` → `pick workflow`, and the legend shows only the link kinds that workflow uses.
+Since round 8 the graph follows the item's **workflow** (§4.6), and since round 9 it is computed by
+**unrolling the template**: the first `changes requested` loop is taken once (two rounds), fan-outs
+become one node per part, the template's relation kinds carry over (`asks you` before code in
+research fan-out, `approved` into the gate). Every run graph starts with `prepare · <target>` →
+`pick workflow` and, off this box, ends with `collect the branch`; the legend shows only the kinds
+the run uses.
 
 Links: `fans out`, `merges`, `changes requested` (red), `approved` (green), plain `next`; links into
 the running step are animated. **Enter:** running / waiting step → its live chat; finished step → its
@@ -461,6 +512,17 @@ item graph.
   multi-select, `Theme::Custom(Palette)` (set `canvas_bg` / `surface` to `Color::Reset` to blend in).
 - Default key bindings include `Delete`/`Backspace` = delete node: never forward those (htui's MOD-28
   already forwards no keys to rataflow's own bindings).
+- **Loops need side handles** (round 9): a back edge between the default bottom/top handles draws on
+  top of the forward chain and disappears. Give nodes extra handles (`Handle::source/target(Right |
+  Left).with_id(…).with_offset(…).with_hidden(true)`) and route loops through them with
+  `Edge::with_source_handle / with_target_handle`; once a node has more than one handle of a kind,
+  **every** handle needs an id (`AmbiguousHandles` otherwise, even for the default ones). Lay out
+  without the loops, then `add_edge` them, so they never bend the ranks.
+- **Never use rank spacing 1** (round 9): with a one-row gap between ranks, an edge's arrow vanishes
+  whenever the fitted view's pan lands on a whole row; which graphs it hit depended on how many nodes
+  the fit centred on. Spacing 2 is safe.
+- Two fit requests before the first draw (e.g. `request_fit_view_with_options` twice) also left the
+  edges undrawn in one test; make one request.
 - Dense neighbourhoods get crowded and labels on parallel links can collide; the legend mode reads
   better there. Not solved.
 - Graph state (pan / zoom / selection / moved nodes) is cached per graph so it survives redraws.
@@ -482,6 +544,7 @@ item graph.
 - Group rows in a tree that represent an entity (a workspace) should show that entity's detail, not
   "nothing selected".
 - History is browser-style (round 7); it no longer resets when the user moves.
+- `cargo clippy` does not rebuild the binary: a `--dump` after clippy shows the old build.
 - A list's "what is hidden" note goes in a row under the last entry, not in the border title: a
   narrow list cut "items by project · 5 done hidden" in half.
 - Mock id clash: a new mock requirement reused `R-30`; ids are per workspace, so anything that mints
@@ -515,6 +578,16 @@ item graph.
    Skills becomes a tab for every tool a run can use (skills, personas, mods, workflows — templates
    for how an item runs, changeable by the model at run time, picked at the start by a fast prompt —
    and more, probably an ANA); floci always includes every service.
+9. floci also emulates other clouds: include them (checked: AWS, Azure, GCP, Oracle + console). The
+   workflow pane: no "used by"; view and edit the template as a graph; the template needs real loops
+   (code → review → back to code on changes, else next) and maybe other relations, while runs show
+   the unrolled rounds. Stopping means stopping running items (fine with one workspace); graceful =
+   before the next agent turn if supported, else at once; conversations always saved. Wheel: do both
+   the docs and the hint. Answers: default target local, set in Settings, workspace, project, by
+   cascade; collect like `scripts/hr`; an htui agent does the remote setup; fast pick model light
+   (haiku) and configurable from the agents' models; the agent may change workflows, with a setting
+   for automatic or ask; workflows global, project workflows later; add hooks, commands, sub-agents,
+   prompts, env presets, MCPs and tools like gortex and headroom, with an ANA on how to show them.
 7. Answers: tab + kind colours; default presets fine but sizes must survive a restart; digits for
    tabs fine; real back/forward history; stop once = wait for the next stoppable step then close,
    twice = stop outright, both resumable; compose in the workspace folder, `.env` in Infisical if
@@ -532,18 +605,19 @@ history records tabs, sub-tabs and panes too (§3.6); moved graph nodes reset on
 is fine (§5); the stack is not started or stopped with the workspace, components are one by one
 (§4.1). Still open:
 
-1. (explained in round 8, awaiting an answer) Stopping the workspace that is on screen, and whether
-   a graceful stop may also pause inside a long step.
-2. (explained in round 8, awaiting an answer) Mouse wheel under tmux: docs only, or a hint from htui.
-3. Targets: does a project (or workspace) set a default target that its items inherit, besides the
-   Settings default? How does work come back from a remote target: a branch collected like
-   `scripts/hr collect`, or pushed? Who installs and logs in the agents on a remote box?
-4. Workflows: which model makes the fast pick (ANA-30 rejected `utility_model`)? May the agent change
-   the workflow at run time without asking, or only propose? Are workflows per project, per
-   workspace, global, or all three (like MOD-113's templates)?
-5. Toolbox: which other kinds belong there (hooks, commands, sub-agents, prompts, env presets?);
-   does Templates stay a group here or get its own tab, as MOD-113 says?
-6. The Infisical folder layout for a workspace's `.env` (the skeleton shows `/<workspace>`).
+Answered in round 9: stopping (§4.1), the wheel (§5), default targets by cascade, collecting, the
+htui agent's setup role (§4.2a), the fast pick model and run-time changes (§4.5, §4.6), global
+workflows (§4.6), the extra toolbox kinds (§4.6). Still open:
+
+1. Project workflows: a workflow that drives a whole project, coordinating its items (wanted later;
+   how it relates to the workspace and project coordinators and to the queue).
+2. Templates: stay a Toolbox group, or get their own tab as MOD-113 says? (The toolbox ANA decides.)
+3. Workflow editing: is a step's agent a fixed agent, a persona, or a role the run fills? Can a
+   workflow pin a target too, or is that only per item?
+4. Which steps count as "can pause between turns": only agents with resumable sessions (now), or
+   also checks that can be killed and rerun cheaply?
+5. The Infisical folder layout for a workspace's `.env` (the skeleton shows `/<workspace>`).
+6. floci: when a project uses only one cloud, should it still get all five containers?
 7. Requirements: does a workspace requirement's status come from its project requirements (all done
    → done)? Can an agent propose splits for an existing workspace requirement later?
 7. Catalogue: source of updates (a URL htui publishes? registry tags?), and whether users can add
@@ -591,15 +665,24 @@ Drafted for discussion only; wording and ids to be settled with the maintainer.
   floci always emulates every service.
 - **Execution targets:** each item chooses where it runs: this box, docker on this box (a sandbox
   like `scripts/hr`), a remote machine over ssh, docker on a remote machine, or (phase 2, MOD-47) a
-  box enrolled with an htui server; wherever it runs, htui prepares the code, starts the item's
-  compose, and configures env, secrets and agents there. The run graph shows this as its first step.
-- **Workflows:** templates for how an item runs (steps, parallel parts, review loops); a fast prompt
-  picks one when a run starts, the user can pin one per item, and the agent may change it at run
-  time within the project's bounds.
-- **Toolbox tab** (replaces Skills): workflows, skills, personas, templates, mods, MCP servers, and
-  whatever else a run can use. **Needs an ANA first** (no existing item covers it): which kinds
-  exist, how each is attached to a run, the fast pick's model (against ANA-30), and how it relates
-  to MOD-113 and ANA-33.
+  box enrolled with an htui server; the default cascades Settings (local) → workspace → project →
+  item; wherever it runs, htui prepares the code, starts the item's compose, and configures env,
+  secrets and agents there (the htui agent installs and logs in what is missing); work comes back by
+  collecting the branch. The run graph shows prepare first and collect last.
+- **Stopping runs:** graceful stop before the agent's next turn (at once for steps that cannot
+  resume), forced stop mid-turn; conversations always saved; everything resumable; works on the open
+  workspace.
+- **Workflows:** global templates with real loops and typed relations (next, approved, changes
+  requested, fails, retries, asks you, if), viewed and edited as a graph; runs unroll them; a fast
+  pick by a configurable light model chooses one when a run starts; the user can pin one per item;
+  the agent may change it at run time, automatically or after asking (a setting). Project workflows
+  that coordinate a whole project: later.
+- **Toolbox tab** (replaces Skills): workflows, skills, personas, templates, mods, MCP servers,
+  hooks, commands, sub-agents, prompts, env presets, and tools like gortex and headroom. **Needs an
+  ANA first** (no existing item covers it): which kinds exist, how each is shown and attached to a
+  run, how tools that bundle several kinds (MCP + hooks + daemon) appear, the fast pick's model
+  (against ANA-30), and how it relates to MOD-113 and ANA-33.
+- **Mouse wheel under tmux:** a docs section, and a one-time in-app hint inside tmux.
 - **Requirements** live in Workspaces, per workspace and per project, **nest**, show their covering
   items as navigable rows, and have a graph view; they are added through the same describe → rewrite
   → review modal as items; a workspace requirement is split into project requirements, and each side

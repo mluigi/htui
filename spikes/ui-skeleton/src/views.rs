@@ -28,7 +28,7 @@ pub fn about(tab: usize) -> (&'static str, Vec<(&'static str, &'static str)>) {
             vec![("i", "write"), ("a", "allow"), ("r", "reject"), ("Tab", "next pane"), ("z", "zoom")],
         ),
         SKILLS => (
-            "Everything a run can use: workflows (how an item runs), skills, personas, templates, mods and MCP servers.",
+            "Everything a run can use: workflows (how an item runs), skills, personas, templates, mods, MCP servers, hooks, commands, sub-agents, prompts, env presets and tools.",
             vec![("Enter", "open"), ("e", "edit"), ("t", "attach"), ("i", "import"), ("N", "new")],
         ),
         LOGS => (
@@ -291,6 +291,10 @@ pub fn flow_key(app: &App) -> Option<String> {
                 _ => None,
             }
         }
+        SKILLS if t.tree.selected()? < app.data.workflows.len() => {
+            let i = t.tree.selected()?;
+            Some(format!("wf:{i}:{}:{scheme}:{opts}", app.data.workflows[i].version))
+        }
         WORKSPACES if t.subtab == 2 && t.req_graph => {
             let (ws, project) = app.ws_nodes[app.selected_entry()?];
             Some(format!("reqs:{ws}:{}:{scheme}:{opts}", project.unwrap_or("-")))
@@ -302,11 +306,15 @@ pub fn flow_key(app: &App) -> Option<String> {
 fn build_graph(app: &App, key: &str, pal: Palette) -> (Graph, Vec<&'static str>) {
     let d = &app.data;
     match key.split(':').next() {
+        Some("wf") => {
+            let i = key.split(':').nth(1).and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+            flow::workflow_graph(&d.workflows[i], app.wf_select.as_deref(), pal, app.graph)
+        }
         Some("runs") | Some("graph") => {
             let item = app.cur().tree.selected().map_or(&d.items[0], |i| &d.items[i]);
             if key.starts_with("runs") {
                 let wf = &d.workflows[app.workflow_of(item).0];
-                let target = d.targets[app.target_of(item.key)].name;
+                let target = &d.targets[app.target_of(item.key)];
                 (flow::run_graph(item, wf, target, pal, app.graph), flow::run_kinds(wf))
             } else {
                 flow::item_graph(&d.items, &d.reqs, item, pal, app.graph)
@@ -332,6 +340,20 @@ pub fn draw_graph(f: &mut Frame, app: &App, canvas: Rect, pal: Palette) -> Optio
         .style(rataflow::BackgroundStyle::default().with_pattern_color(theme::FAINT).with_bg_color(None));
     f.render_widget(dots, canvas);
     f.render_widget(&mut *graph, canvas);
+    // Under tmux the wheel may never arrive (tmux-mighty-scroll and friends keep it). Say so once,
+    // until a wheel event proves otherwise or the user zooms from the keyboard.
+    if app.tmux && !app.wheel_seen && !app.wheel_hint_off && canvas.width > 50 && canvas.height > 8 {
+        let lines = vec![
+            Line::from(Span::styled(" wheel not zooming? ", theme::bold())),
+            Line::from(Span::styled(" tmux may be keeping it: see docs › tmux ", theme::dim())),
+            Line::from(vec![Span::styled(" + - ", pal.accent().add_modifier(Modifier::BOLD)), Span::styled("zoom from the keyboard ", theme::dim())]),
+        ];
+        let w = 44;
+        let rect = Rect::new(canvas.right().saturating_sub(w + 1), canvas.y, w, 5);
+        let block = Block::bordered().border_type(ratatui::widgets::BorderType::Rounded).border_style(Style::new().fg(theme::FAINT));
+        f.render_widget(ratatui::widgets::Clear, rect);
+        f.render_widget(Paragraph::new(lines).block(block), rect);
+    }
     if app.graph.minimap && canvas.width > 40 && canvas.height > 10 {
         f.render_widget(rataflow::MiniMap::new(graph).position(rataflow::MiniMapPosition::TopRight).size(24, 8), canvas);
     }
@@ -402,11 +424,12 @@ fn backlog_detail(f: &mut Frame, app: &App, item: &Item, area: Rect, focused: bo
         Span::styled(if item.deps.is_empty() { "nothing".to_string() } else { item.deps.join(", ") }, theme::text()),
     ])];
     let (wf, why) = app.workflow_of(item);
-    let target = &app.data.targets[app.target_of(item.key)];
+    let (ti, from) = app.target_source(item.key);
+    let target = &app.data.targets[ti];
     lines.push(Line::from(vec![
         Span::styled(" runs on ", theme::dim()),
         Span::styled(target.name, theme::bold()),
-        Span::styled(format!(" ({})", target.kind), theme::dim()),
+        Span::styled(if from == "this item" { " (set here)".to_string() } else { format!(" (from {from})") }, theme::dim()),
         Span::styled("   workflow ", theme::dim()),
         Span::styled(app.data.workflows[wf].name, theme::bold()),
         Span::styled(if why.is_some() { " (fast pick)" } else { " (pinned)" }, theme::dim()),
@@ -549,7 +572,7 @@ fn chat_detail(f: &mut Frame, app: &App, idx: usize, area: Rect, focused: bool, 
         &[("z", "zoom")]
     };
     let badge = match (s.kind, s.state) {
-        (SessionKind::Global, _) => Span::styled(" settings · skills · agents · catalogue ", Style::new().fg(INK).bg(pal.accent)),
+        (SessionKind::Global, _) => Span::styled(" settings · toolbox · agents · targets · catalogue ", Style::new().fg(INK).bg(pal.accent)),
         (SessionKind::Archived(..), _) => Span::styled(" archived · read only ", Style::new().fg(INK).bg(theme::DIM)),
         (SessionKind::Workspace, _) => Span::styled(" workspace coordinator ", Style::new().fg(INK).bg(pal.accent)),
         (SessionKind::Project, _) => Span::styled(" project coordinator ", Style::new().fg(INK).bg(pal.accent)),
@@ -706,62 +729,36 @@ fn skill_detail(f: &mut Frame, app: &App, idx: usize, area: Rect, focused: bool,
     DetailOut { max_scroll: body(f, block, area, lines, app.cur().detail_scroll), ..DetailOut::default() }
 }
 
-/// A workflow: what it is for, when the fast pick chooses it, its steps, and who uses it.
+/// A workflow template, drawn and edited as a graph: steps, fan-outs, and the loops back.
 fn workflow_detail(f: &mut Frame, app: &App, idx: usize, area: Rect, focused: bool, pal: Palette) -> DetailOut {
     let wf = &app.data.workflows[idx];
+    let hints: &[(&str, &str)] = if app.connecting.is_some() {
+        &[("←→↑↓", "pick the target"), ("Enter", "choose the link"), ("Esc", "cancel")]
+    } else if app.moving {
+        MOVE_HINTS
+    } else {
+        &[("←→↑↓", "step"), ("a", "add after"), ("e", "edit"), ("x", "delete"), ("c", "connect"), ("i", "links"), ("M", "move"), ("+ -", "zoom")]
+    };
     let block = panel(
-        vec![Span::styled(wf.name, theme::bold())],
-        Some(Line::from(Span::styled(" workflow ", theme::dim()))),
-        &[("e", "edit steps"), ("d", "duplicate"), ("N", "new")],
+        vec![Span::styled(wf.name, theme::bold()), Span::styled(" · workflow template", theme::dim())],
+        Some(Line::from(Span::styled(format!(" {} steps · {} links ", wf.steps.len(), wf.links.len()), theme::dim()))),
+        hints,
         focused,
         pal,
     );
-    let heading = |t: &str| Line::from(Span::styled(format!(" {t}"), pal.accent().add_modifier(Modifier::BOLD)));
-    let mut lines = vec![Line::from(Span::styled(format!(" {}", wf.desc), theme::text())), Line::raw("")];
-    lines.push(heading("the fast pick chooses it for"));
-    lines.push(Line::from(Span::styled(format!(" {}", wf.when), theme::text())));
-    lines.push(Line::raw(""));
-    lines.push(heading("steps"));
-    lines.push(Line::from(Span::styled(" prepare (htui, on the item's target) → pick workflow (fast model) →", theme::dim())));
-    let stages = wf.steps.iter().map(|s| s.3).max().unwrap_or(0) + 1;
-    for st in 0..stages {
-        let here: Vec<_> = wf.steps.iter().filter(|s| s.3 == st).collect();
-        for (i, s) in here.iter().enumerate() {
-            let branch = match (here.len(), i) {
-                (1, _) => "   ",
-                (_, 0) => " ┬ ",
-                (n, i) if i + 1 == n => " └ ",
-                _ => " ├ ",
-            };
-            lines.push(Line::from(vec![
-                Span::styled(format!(" {}{branch}", st + 1), theme::dim()),
-                Span::styled(format!("{:<22}", s.1), theme::bold()),
-                Span::styled(s.2, theme::dim()),
-            ]));
-        }
-    }
-    let name = |id: &str| wf.steps.iter().find(|s| s.0 == id).map_or(id.to_string(), |s| s.1.to_string());
-    let loops: Vec<String> = wf.links.iter().filter(|l| l.2 == "changes requested").map(|(a, b, k)| format!("{} → {}: {k}", name(a), name(b))).collect();
-    if !loops.is_empty() {
-        lines.push(Line::from(Span::styled(format!("   links: {}", loops.join(" · ")), theme::dim())));
-    }
-    lines.push(Line::raw(""));
-    lines.push(heading("at run time"));
-    lines.push(Line::from(Span::styled(
-        " The run's agent may add, skip or repeat steps (a second research part, another review round), within the project's bounds: phases, agents, caps, hard gates. Each change shows in the run graph.",
-        theme::text(),
-    )));
-    lines.push(Line::raw(""));
-    lines.push(heading("used by"));
-    let users: Vec<String> = app
-        .data
-        .items
-        .iter()
-        .filter(|i| app.workspace_projects().contains(&i.project) && app.workflow_of(i).0 == idx)
-        .map(|i| format!("{}{}", i.key, if app.workflow_of(i).1.is_some() { "" } else { " (pinned)" }))
-        .collect();
-    lines.push(Line::from(Span::styled(if users.is_empty() { " no item in this workspace".to_string() } else { format!(" {}", users.join(", ")) }, theme::text())));
-    DetailOut { max_scroll: body(f, block, area, lines, app.cur().detail_scroll), ..DetailOut::default() }
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let head = vec![
+        Line::from(vec![Span::styled(wf.desc, theme::text()), Span::styled(format!("   fast pick chooses it for: {}", wf.when), theme::dim())]),
+        Line::from(Span::styled(
+            "A run unrolls it: each loop taken becomes round 1, round 2…, each fan-out one node per part. The agent may change it at run time (Settings → Workflows).",
+            theme::dim(),
+        )),
+    ];
+    let [top, canvas] = Layout::vertical([Constraint::Length(3), Constraint::Fill(1)]).areas(inner);
+    f.render_widget(Paragraph::new(head).wrap(Wrap { trim: false }), Rect { x: top.x + 1, width: top.width.saturating_sub(2), ..top });
+    let flow = draw_graph(f, app, canvas, pal);
+    DetailOut { flow, ..DetailOut::default() }
 }
 
 fn settings_detail(f: &mut Frame, app: &App, idx: usize, area: Rect, focused: bool, pal: Palette) -> Vec<(u16, usize)> {
