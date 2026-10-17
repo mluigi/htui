@@ -1,6 +1,6 @@
 # UI redesign — findings so far (2026-10-15)
 
-**Status: review in progress. Nothing here is a requirement yet.** `docs/REQUIREMENTS.md` and
+**Status: review concluded on 2026-10-17 (round 12). Nothing here is a requirement yet: §10 is filed next, together with the maintainer.** `docs/REQUIREMENTS.md` and
 `HANDOFF.md` are untouched on purpose; §10 lists the requirements to file once the maintainer
 finishes reviewing the skeleton. This document exists so the findings survive a compacted or new
 session.
@@ -365,7 +365,7 @@ docker compose there and configures everything the item needs.**
   toggle either flips it; saved at once, with a flash ("fast pick model: claude · sonnet · saved").
   Text and secret fields still open with `Enter`. The pane's hint reads `←→ change · Enter edit`.
 - New **Targets** section (round 8; default target, round 9) and **Workflows** section (round 9):
-  *fast pick model* (default **claude · haiku**, chosen from the models the configured agents offer),
+  *light model* (round 12: was "fast pick model"; default **claude · haiku**, chosen from the models the configured agents offer; used by the fast pick and the new-item rewrite),
   *run-time changes* (**ask me** / automatic: may the agent change a run's workflow on its own, or
   must it ask through a permission in the item's chat), *default workflow* (auto, or one).
 
@@ -626,6 +626,8 @@ item graph.
     may pin a target, and persona and role are the same thing; any step can stop gracefully; the
     Infisical layout needs explaining; floci should let you choose the clouds.
 11. Infisical: a folder per project (option b). Personas carry no agent; they are for every agent.
+12. "Did we review everything?" Six older questions were still open; the maintainer took every
+    suggestion (§8) and concluded the review.
 7. Answers: tab + kind colours; default presets fine but sizes must survive a restart; digits for
    tabs fine; real back/forward history; stop once = wait for the next stoppable step then close,
    twice = stop outright, both resumable; compose in the workspace folder, `.env` in Infisical if
@@ -634,37 +636,38 @@ item graph.
    dotted background on every graph and nodes movable without editing links; new requirements go
    through the new-item flow, and a workspace requirement shows the project requirements it created.
 
-## 8. Open questions (not decided)
+## 8. Open questions — all answered (review concluded in round 12)
 
-Answered in round 7 (see the sections): colour scheme (§3.5), default presets and remembered sizes
-(§3.4), digits stay tab switches (permissions moved to `a A r`), browser-style history (§3.6), what
-stop does and resuming (§4.1), where compose and `.env` live (§4.1 Components). Answered in round 8:
-history records tabs, sub-tabs and panes too (§3.6); moved graph nodes reset on re-layout, and that
-is fine (§5); the stack is not started or stopped with the workspace, components are one by one
-(§4.1). Still open:
+Every question raised during the review has an answer, recorded in the section it belongs to:
+colour scheme (§3.5); presets and remembered sizes (§3.4); digits stay tab switches (§3.6);
+browser-style history over jumps, tabs, sub-tabs and panes (§3.6); stopping runs, graceful and
+forced, both confirmed and resumable (§4.1); compose, `.env` and the Infisical layout (§4.1
+Components); components started one by one, floci's clouds chosen (§4.1); targets and their cascade,
+collecting, the htui agent's setup role (§4.2a); workflows, the fast pick, run-time changes,
+personas (§4.6); the tmux wheel (§5); moved graph nodes may reset (§5).
 
-Answered in round 9: stopping (§4.1), the wheel (§5), default targets by cascade, collecting, the
-htui agent's setup role (§4.2a), the fast pick model and run-time changes (§4.5, §4.6), global
-workflows (§4.6), the extra toolbox kinds (§4.6). Still open:
+Answered in round 12 (the maintainer took every suggestion):
 
-Answered in round 10: Templates stay a Toolbox group (MOD-113 to be amended); a workflow may pin a
-target; persona = role (§4.6); any step can stop gracefully; floci lets you choose the clouds
-(§4.1). Answered in round 11: the Infisical layout (a folder per project, §4.1 Components);
-personas carry no agent (§4.6). Still open:
+1. **A workspace requirement's status** comes from its project requirements: done when all are done,
+   in progress when any is, open otherwise. Agents may later propose new project requirements for an
+   existing workspace one; each arrives as a draft the user accepts.
+2. **Component catalogue:** updates come from a catalogue file published in the htui repo plus a
+   check of the image registry for new versions; users can add their own kinds (a custom-image
+   component can be saved as a new kind).
+3. **Requirement ids and editing:** nested ids stay (`R-2.1` shows its parent; workspace ones are
+   `W-n`). Only the user edits requirements; coordinators propose changes as drafts the user accepts.
+4. **Archived transcripts** follow `retention_days` and the same sweeper as run transcripts
+   (MOD-108); a transcript the user pins is kept.
+5. **New-item flow:** the rewrite uses the same light model as the fast workflow pick; Settings →
+   Workflows' "fast pick model" becomes **"light model"**, used for both. This partly reverses
+   ANA-30's rejection of a single `utility_model` setting, so the requirement must say so. The
+   talk-it-through chat becomes the item's first chat once the item exists, and is archived with it.
+6. **The htui agent's permissions:** it acts without asking only on reads, catalogue updates and
+   Toolbox additions; it always asks before touching secrets, agent logins, installing on remote
+   boxes, deleting anything, or changing a target.
 
-1. Project workflows (a workflow that drives a whole project, coordinating its items): **an ANA**,
-   to be filed (§10).
-7. Requirements: does a workspace requirement's status come from its project requirements (all done
-   → done)? Can an agent propose splits for an existing workspace requirement later?
-7. Catalogue: source of updates (a URL htui publishes? registry tags?), and whether users can add
-   their own kinds.
-8. Requirements: id scheme for nested ones (`R-2.1`) vs. the current flat ids; who may edit them
-   (user only, or coordinators too).
-9. Archived transcripts: retention (ties to `retention_days`, MOD-108).
-10. New-item flow: which model does the rewrite (`utility_model` was rejected by ANA-30), and does the
-    talk-it-through agent become an item chat once the item exists?
-11. The htui agent's permissions: which settings it may change without asking.
-12. Mouse: all fine (round 8), including dragging graph nodes.
+Left for later, by decision: **project workflows** (a workflow that drives a whole project,
+coordinating its items) get an ANA (§10).
 
 ## 9. What the real implementation needs (not decided, notes only)
 
@@ -728,6 +731,13 @@ Drafted for discussion only; wording and ids to be settled with the maintainer.
   run, how tools that bundle several kinds (MCP + hooks + daemon) appear, the fast pick's model
   (against ANA-30), and how it relates to MOD-113 and ANA-33.
 - **Mouse wheel under tmux:** a docs section, and a one-time in-app hint inside tmux.
+- **Round 12 answers to fold into the requirements above:** workspace requirement status derived
+  from its project requirements, agent-proposed splits as drafts; catalogue updates from a published
+  file plus registry tags, user-defined kinds; nested requirement ids, user-only edits with
+  coordinator drafts; archived transcripts under `retention_days` (MOD-108) with pinning; one
+  configurable **light model** for the fast pick and the new-item rewrite (amends ANA-30's verdict);
+  the talk-it-through chat becomes the item's first chat; the htui agent asks before secrets, logins,
+  remote installs, deletes and target changes.
 - **Requirements** live in Workspaces, per workspace and per project, **nest**, show their covering
   items as navigable rows, and have a graph view; they are added through the same describe → rewrite
   → review modal as items; a workspace requirement is split into project requirements, and each side

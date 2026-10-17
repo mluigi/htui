@@ -886,7 +886,7 @@ pub fn mock() -> Data {
             group: "Running",
             about: "How items run: the fast pick that chooses a workflow, and what the agent may change on its own.",
             fields: vec![
-                Field { label: "fast pick model", value: "claude · haiku".into(), kind: FieldKind::Choice(&["claude · haiku", "claude · sonnet", "codex · gpt-5-mini", "gemini · flash"]), help: "a light model, from the models your agents offer; it picks the workflow when a run starts" },
+                Field { label: "light model", value: "claude · haiku".into(), kind: FieldKind::Choice(&["claude · haiku", "claude · sonnet", "codex · gpt-5-mini", "gemini · flash"]), help: "from the models your agents offer; picks the workflow when a run starts and rewrites new items" },
                 Field { label: "run-time changes", value: "ask me".into(), kind: FieldKind::Choice(&["ask me", "automatic"]), help: "the agent may change a run's workflow; ask me shows it as a permission in the item's chat" },
                 Field { label: "default workflow", value: "auto (fast pick)".into(), kind: FieldKind::Choice(&["auto (fast pick)", "standard", "research fan-out", "quick fix", "analysis"]), help: "for items that do not pin one" },
             ],

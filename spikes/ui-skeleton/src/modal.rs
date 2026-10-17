@@ -869,7 +869,7 @@ fn draw_run_setup(f: &mut Frame, s: &RunSetup, app: &App, pal: Palette) {
     r.push(Line::raw(""));
     r.push(Line::from(Span::styled(
         if s.workflow == 0 {
-            format!("When the run starts, {} reads the item and picks the workflow (Settings → Workflows).", app.setting("Workflows", "fast pick model"))
+            format!("When the run starts, {} reads the item and picks the workflow (Settings → Workflows).", app.setting("Workflows", "light model"))
         } else {
             "Pinned: the fast pick is skipped.".to_string()
         },
