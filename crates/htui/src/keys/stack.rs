@@ -172,6 +172,13 @@ impl<'a> Stack<'a> {
             .find(|(_, layer)| layer.context == Context::Global)
     }
 
+    /// Whether the stack captures text (MOD-115 M2 B3): it has a `[field]` layer. The shell
+    /// translates the `[field]` chords into the widgets' canonical events only then.
+    #[must_use]
+    pub fn captures_text(self) -> bool {
+        self.0.iter().any(|layer| layer.context == Context::Field)
+    }
+
     /// Whether this stack has a layer of `context` that admits `act` (the D10 legality test).
     pub(crate) fn view_admits(self, context: Context, act: Act) -> bool {
         self.0
@@ -185,10 +192,12 @@ impl Stack<'static> {
     /// `[global]`: D6 step 6, the status line and the `?` box's global line.
     pub const BASE: Self = Self(&[Layer::all(Context::Global)]);
 
-    /// `[overlay, global ∩ {help}]`: D6 step 2. `Esc` closes and `?`/`F1` toggle help over a
-    /// modal overlay, for keys the overlay passed.
+    /// `[overlay, global ∩ {quit} (filtered), global ∩ {help}]`: D6 step 2. `Esc` closes and
+    /// `?`/`F1` toggle help over a modal overlay, for keys the overlay passed; MOD-115 M2 B4 adds
+    /// the quit layer, so `ctrl-c` resolves to `global.quit` over every overlay.
     pub const OVERLAY: Self = Self(&[
         Layer::all(Context::Overlay),
+        Layer::only(Context::Global, &[Act::Quit]).with_modal_filter(),
         Layer::only(Context::Global, &[Act::Help]),
     ]);
 
@@ -316,6 +325,9 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     // existing first-reported phrase is unchanged.
     ("in the queue overlay", views::QUEUE_OVERLAY),
     ("in the Hierarchy directory picker", views::HIERARCHY_PICKER),
+    // MOD-115 M2 §1.5: the leave dialog, appended so every first-reported phrase is unchanged.
+    // Task 6 removes the quit question's entry with `quit_confirm.rs`.
+    ("in the leave dialog", views::LEAVE),
 ];
 
 /// Keys a view matches ahead of the resolver in one declared stack (ANA-26 §6.1, MOD-67 M5 D5):
@@ -350,6 +362,29 @@ const TAB_SELECT: &[Act] = &[
     Act::SelectTab9,
 ];
 
+/// MOD-115 M2 D7: the tab select and the answers. The digits a parked request takes are
+/// `answer.option_*` rows now, still fixed until Task 5 removes `FIXED`.
+const TAB_SELECT_AND_ANSWERS: &[Act] = &[
+    Act::SelectTab1,
+    Act::SelectTab2,
+    Act::SelectTab3,
+    Act::SelectTab4,
+    Act::SelectTab5,
+    Act::SelectTab6,
+    Act::SelectTab7,
+    Act::SelectTab8,
+    Act::SelectTab9,
+    Act::AnswerOption1,
+    Act::AnswerOption2,
+    Act::AnswerOption3,
+    Act::AnswerOption4,
+    Act::AnswerOption5,
+    Act::AnswerOption6,
+    Act::AnswerOption7,
+    Act::AnswerOption8,
+    Act::AnswerOption9,
+];
+
 /// The plain digits a permission request answers on.
 const DIGITS: &[&str] = &["1", "2", "3", "4", "5", "6", "7", "8", "9"];
 
@@ -364,7 +399,7 @@ pub static FIXED: &[Fixed] = &[
         stack: views::ATTACH_FORM,
         chords: &["space", "enter", "esc"],
         only_global: false,
-        shadowed: &[],
+        shadowed: &[Act::ChoiceToggle, Act::FieldSubmit, Act::FieldCancel],
     },
     // requirements/forms.rs `RequirementForm::on_key`: the priority's `m`/`l` choose,
     // `Space`/`Left`/`Right` toggle, `Esc` cancels (MOD-67 M4 D10).
@@ -372,7 +407,16 @@ pub static FIXED: &[Fixed] = &[
         stack: views::REQUIREMENTS_FORM,
         chords: &["m", "l", "space", "left", "right", "esc"],
         only_global: false,
-        shadowed: &[],
+        shadowed: &[
+            Act::RequirementsPriorityMust,
+            Act::RequirementsPriorityLater,
+            Act::ChoicePrev,
+            Act::ChoiceNext,
+            Act::ChoiceToggle,
+            Act::FieldLeft,
+            Act::FieldRight,
+            Act::FieldCancel,
+        ],
     },
     // runs.rs `RunsTab::on_key`: while the step under the cursor has a pending request, every
     // plain digit answers it (MOD-42 D14).
@@ -380,7 +424,7 @@ pub static FIXED: &[Fixed] = &[
         stack: views::RUNS_BROWSE,
         chords: DIGITS,
         only_global: false,
-        shadowed: TAB_SELECT,
+        shadowed: TAB_SELECT_AND_ANSWERS,
     },
     // runs.rs `close_out_key`: the close-out warning's arrows and `h`/`l` pick the resolution
     // (MOD-39 P13); the cancel question shares the stack.
@@ -388,7 +432,7 @@ pub static FIXED: &[Fixed] = &[
         stack: views::RUNS_CONFIRM,
         chords: &["left", "right", "h", "l"],
         only_global: false,
-        shadowed: &[],
+        shadowed: &[Act::ChoicePrev, Act::ChoiceNext],
     },
     // filter.rs `FilterForm::on_key`: an option row's `Enter` applies, `Esc` cancels, `h`/`l` and
     // the arrows move the option, `Space` ticks it.
@@ -396,7 +440,15 @@ pub static FIXED: &[Fixed] = &[
         stack: views::BACKLOG_FILTER,
         chords: &["enter", "esc", "h", "l", "left", "right", "space"],
         only_global: false,
-        shadowed: &[],
+        shadowed: &[
+            Act::FieldSubmit,
+            Act::FieldCancel,
+            Act::FieldLeft,
+            Act::FieldRight,
+            Act::ChoicePrev,
+            Act::ChoiceNext,
+            Act::ChoiceToggle,
+        ],
     },
     // item_form.rs `ItemForm::on_picker_key`: a picker's `h`/`l` and arrows choose, `Enter`
     // moves on, `Esc` cancels.
@@ -404,14 +456,21 @@ pub static FIXED: &[Fixed] = &[
         stack: views::ITEM_FORM,
         chords: &["left", "right", "h", "l", "enter", "esc"],
         only_global: false,
-        shadowed: &[],
+        shadowed: &[
+            Act::FieldLeft,
+            Act::FieldRight,
+            Act::FieldSubmit,
+            Act::FieldCancel,
+            Act::ChoicePrev,
+            Act::ChoiceNext,
+        ],
     },
     // chat/mod.rs `ChatTab::on_key`: a parked request takes every plain digit.
     Fixed {
         stack: views::CHAT_LIVE,
         chords: DIGITS,
         only_global: false,
-        shadowed: TAB_SELECT,
+        shadowed: TAB_SELECT_AND_ANSWERS,
     },
     // chat/mod.rs `ChatTab::on_key_replay`: what the replay's own acts left of the live tab's
     // keys is swallowed (D40, D41).
@@ -430,8 +489,9 @@ impl Keys {
     /// the first layer that has one binds `chord`, narrowest layer first, catalogue order within
     /// a layer. A row in a narrower layer **shadows** the same act in every wider layer, even
     /// when it is unbound or binds other chords. The caller handles the first candidate it
-    /// accepts. [`CTRL_C`](super::CTRL_C) is never a candidate: no catalogue default binds it and
-    /// M2's loader refuses it, and `App::on_key` checks it before any stack regardless.
+    /// accepts. MOD-115 M2: [`CTRL_C`](super::CTRL_C) is `global.quit`'s and `leave.confirm`'s
+    /// default, so it is their candidate like any chord; until Task 6, `App::on_key` still checks
+    /// it before any stack.
     ///
     /// A row is in a layer when [`Stack::admits`] says the layer offers its act (a view layer
     /// inherits the shared acts offered below it, PA-3). A modal layer's row is a candidate only
@@ -506,7 +566,8 @@ mod tests {
             DECLARED[2],
             ("in the focused in-pane editor", Stack::EDITOR_FOCUSED)
         );
-        assert_eq!(DECLARED.len(), 80);
+        assert_eq!(DECLARED.len(), 81);
+        assert_eq!(DECLARED[80], ("in the leave dialog", views::LEAVE));
         assert!(DECLARED.contains(&(WHILE_EDITING, Stack::EDITOR_OPEN)));
         let phrases: HashSet<&str> = DECLARED.iter().map(|(phrase, _)| *phrase).collect();
         assert_eq!(phrases.len(), DECLARED.len(), "a phrase is used twice");
@@ -638,13 +699,49 @@ mod tests {
         assert!(!Stack::new(&layers).passes(CTRL_C));
     }
 
+    /// MOD-115 M2 §1.4, B4: `ctrl-c` is `global.quit`'s on every screen, over every overlay and
+    /// in every field, but the focused in-pane editor still receives it.
     #[test]
-    fn ctrl_c_is_no_action_in_either_stack() {
+    fn ctrl_c_is_quit_on_every_screen_but_the_focused_editor() {
         let keys = Keys::compiled();
-        assert_eq!(keys.actions(Stack::BASE, CTRL_C), []);
-        assert_eq!(keys.actions(Stack::OVERLAY, CTRL_C), []);
+        assert_eq!(keys.actions(Stack::BASE, CTRL_C), [Act::Quit]);
+        assert_eq!(keys.actions(Stack::OVERLAY, CTRL_C), [Act::Quit]);
         assert_eq!(keys.actions(Stack::EDITOR_FOCUSED, CTRL_C), []);
-        assert_eq!(keys.actions(Stack::EDITOR_OPEN, CTRL_C), []);
+        assert_eq!(keys.actions(Stack::EDITOR_OPEN, CTRL_C), [Act::Quit]);
+        assert_eq!(keys.actions(views::LEAVE, CTRL_C), [Act::LeaveConfirm]);
+        // The quit question has no quit layer: Task 6 replaces it with the leave dialog.
+        for &(phrase, stack) in DECLARED {
+            if [Stack::EDITOR_FOCUSED, views::LEAVE, views::QUIT_CONFIRM].contains(&stack) {
+                continue;
+            }
+            assert_eq!(keys.actions(stack, CTRL_C), [Act::Quit], "{phrase}");
+        }
+    }
+
+    /// MOD-115 M2 B3: a stack captures text exactly when it has a `[field]` layer.
+    #[test]
+    fn a_stack_captures_text_when_it_has_a_field_layer() {
+        assert!(views::CAPTURE.captures_text());
+        assert!(views::ITEM_FORM.captures_text());
+        assert!(views::CONCEPTS_QUERY.captures_text());
+        assert!(!Stack::BASE.captures_text());
+        assert!(!Stack::OVERLAY.captures_text());
+        assert!(!views::BACKLOG_BODY.captures_text());
+        assert!(!views::RUNS_CONFIRM.captures_text());
+        let layers = [Layer::all(Context::Field)];
+        assert!(Stack::new(&layers).captures_text());
+    }
+
+    /// MOD-115 M2 B4: the overlay stack's quit layer is filtered and sits before the help
+    /// layer, so `Stack::global` is still the help layer and `q` is no candidate.
+    #[test]
+    fn the_overlay_stack_quits_on_ctrl_c_only() {
+        let keys = Keys::compiled();
+        assert_eq!(overlay(keys, "q"), []);
+        assert_eq!(overlay(keys, "ctrl-c"), [Act::Quit]);
+        let (index, layer) = Stack::OVERLAY.global().expect("a global layer");
+        assert_eq!(index, Stack::OVERLAY.layers().len() - 1);
+        assert!(layer.admits(Act::Help) && !layer.admits(Act::Quit));
     }
 
     #[test]

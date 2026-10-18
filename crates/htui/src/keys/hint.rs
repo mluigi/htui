@@ -21,6 +21,18 @@ const SEP: &str = " · ";
 /// Where a continuation row of a packed [`HelpLine`] starts.
 const INDENT: &str = "  ";
 
+/// MOD-115 M2 Task 0: the contexts whose rows no site resolves yet, kept out of the `?` box so
+/// the box lists only keys that act. The task that wires a context removes it here: `field`,
+/// `choice` and `answer` with Task 5 (the translation and the former `FIXED` sites), `layout`
+/// and `history` with Task 6 (the shell). The leave dialog is drawn from Task 6 on.
+const NOT_YET_WIRED: &[Context] = &[
+    Context::Field,
+    Context::Choice,
+    Context::Answer,
+    Context::Layout,
+    Context::History,
+];
+
 /// One element of a hint spec (ANA-26 §7.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hint {
@@ -218,6 +230,9 @@ impl Keys {
         let quit_help = Act::Quit.spec().map_or("quit", |spec| spec.help);
         let mut global_merged: Vec<(&str, Vec<KeyChord>)> = vec![(quit_help, Vec::new())];
         for (index, layer) in stack.layers().iter().enumerate() {
+            if NOT_YET_WIRED.contains(&layer.context()) {
+                continue; // MOD-115 M2 Task 0: no site resolves these rows yet
+            }
             let is_global = layer.context() == Context::Global;
             let mut here = Vec::new();
             let mut local: Vec<(&str, Vec<KeyChord>)> = Vec::new();
@@ -363,10 +378,12 @@ mod tests {
     use super::{HelpLine, Hint};
     use crate::keys::{Act, Context, Keys, Layer, Stack, views};
 
-    const BARE: &str =
-        "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · F9 about";
+    // MOD-115 M2: the pane keys close the line (the shell offers them from Task 6 on).
+    const BARE: &str = "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help \
+                        · F9 about · Ctrl+Right next pane · Ctrl+Left previous pane";
     const FULL: &str = "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help \
-                        · F9 about · w workspaces · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue";
+                        · F9 about · w workspaces · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue \
+                        · Ctrl+Right next pane · Ctrl+Left previous pane";
 
     /// What the shell offers without `register_all`: every act but the four that name a view.
     fn bare(act: Act) -> bool {
@@ -434,12 +451,13 @@ mod tests {
         assert_eq!(
             global_line(keys, bare),
             "Global: q/Ctrl+c quit · Tab next tab · Shift+Tab previous tab · 1-9 select tab \
-             · ?/F1 help · F9 about"
+             · ?/F1 help · F9 about · Ctrl+Right next pane · Ctrl+Left previous pane"
         );
         assert_eq!(
             global_line(keys, all),
             "Global: q/Ctrl+c quit · Tab next tab · Shift+Tab previous tab · 1-9 select tab \
-             · ?/F1 help · F9 about · w workspaces · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue"
+             · ?/F1 help · F9 about · w workspaces · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue \
+             · Ctrl+Right next pane · Ctrl+Left previous pane"
         );
         assert_eq!(
             keys.help_line(Context::Overlay, all)
@@ -487,6 +505,7 @@ mod tests {
             [
                 "Global: q/Ctrl+c quit · Tab next tab · Shift+Tab previous tab · 1-9 select tab",
                 "  ?/F1 help · F9 about · w workspaces · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue",
+                "  Ctrl+Right next pane · Ctrl+Left previous pane",
             ]
         );
     }
@@ -519,8 +538,9 @@ mod tests {
             "n/Esc cancel · Enter store"
         );
         let spec = &[Hint::All(Act::Help, "help"), Hint::All(Act::Quit, "quit")];
-        assert_eq!(keys.hint(views::CAPTURE, spec), "F1 help");
-        assert_eq!(keys.hint(Stack::BASE, spec), "?/F1 help · q quit");
+        // MOD-115 M2: `ctrl-c` is quit's own chord now, and it passes the modal filter.
+        assert_eq!(keys.hint(views::CAPTURE, spec), "F1 help · Ctrl+c quit");
+        assert_eq!(keys.hint(Stack::BASE, spec), "?/F1 help · q/Ctrl+c quit");
         assert_eq!(keys.labels(views::CAPTURE, Act::Help), ["F1".to_owned()]);
         assert_eq!(keys.label(views::CAPTURE, Act::Help).as_deref(), Some("F1"));
     }
@@ -591,7 +611,7 @@ mod tests {
                 "Common: r reload · Esc dismiss",
                 "List: j/Down down · k/Up up",
                 "Global: q/Ctrl+c quit · Tab next tab · Shift+Tab previous tab · 1-9 select tab \
-                 · ?/F1 help · F9 about",
+                 · ?/F1 help · F9 about · Ctrl+Right next pane · Ctrl+Left previous pane",
             ]
         );
         assert_eq!(
@@ -623,6 +643,34 @@ mod tests {
             [
                 "Global: Ctrl+c quit · F1 help · F9 about · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue"
             ]
+        );
+    }
+
+    /// MOD-115 M2 Task 0: the layers no site resolves yet stay out of the `?` box, so the box of
+    /// every M2 stack reads as it did before M2.
+    #[test]
+    fn the_box_leaves_out_the_layers_no_site_resolves_yet() {
+        let keys = Keys::compiled();
+        for stack in [
+            views::BACKLOG_BODY,
+            views::RUNS_BROWSE,
+            views::CHAT_LIVE,
+            views::ITEM_FORM,
+            views::CAPTURE,
+            views::REQUIREMENTS_FORM,
+        ] {
+            for line in keys.help_lines(stack, all) {
+                assert!(
+                    !["Layout", "History", "Text field", "Choice", "Answer"]
+                        .contains(&line.heading.as_str()),
+                    "{}",
+                    line.text()
+                );
+            }
+        }
+        assert_eq!(
+            texts(keys.help_lines(views::CAPTURE, bare)),
+            ["Global: Ctrl+c quit · F1 help · F9 about"]
         );
     }
 

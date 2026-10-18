@@ -17,27 +17,29 @@ keys_file` fails until it matches.
 # directory: ~/.config/htui on Linux, ~/Library/Application Support/htui on macOS, %APPDATA%\htui
 # on Windows. List only what you change: a list replaces that action's chords, [] unbinds it.
 # ctrl-c always quits and cannot be listed. `htui --default-keys` ignores the file for one run.
-version = 1
+version = 2
 
 [global]
-quit         = ["q"]        # quit
-next_tab     = ["tab"]      # next tab
-prev_tab     = ["backtab"]  # previous tab
-select_tab_1 = ["1"]        # select tab
-select_tab_2 = ["2"]        # select tab
-select_tab_3 = ["3"]        # select tab
-select_tab_4 = ["4"]        # select tab
-select_tab_5 = ["5"]        # select tab
-select_tab_6 = ["6"]        # select tab
-select_tab_7 = ["7"]        # select tab
-select_tab_8 = ["8"]        # select tab
-select_tab_9 = ["9"]        # select tab
-help         = ["?", "f1"]  # help
-about        = ["f9"]       # about
-workspaces   = ["w"]        # workspaces
-find         = ["ctrl-f"]   # find
-waiting      = ["ctrl-w"]   # waiting
-queue        = ["ctrl-q"]   # queue
+quit         = ["q"]           # quit
+next_tab     = ["tab"]         # next tab
+prev_tab     = ["backtab"]     # previous tab
+select_tab_1 = ["1"]           # select tab
+select_tab_2 = ["2"]           # select tab
+select_tab_3 = ["3"]           # select tab
+select_tab_4 = ["4"]           # select tab
+select_tab_5 = ["5"]           # select tab
+select_tab_6 = ["6"]           # select tab
+select_tab_7 = ["7"]           # select tab
+select_tab_8 = ["8"]           # select tab
+select_tab_9 = ["9"]           # select tab
+help         = ["?", "f1"]     # help
+about        = ["f9"]          # about
+workspaces   = ["w"]           # workspaces
+find         = ["ctrl-f"]      # find
+waiting      = ["ctrl-w"]      # waiting
+queue        = ["ctrl-q"]      # queue
+next_pane    = ["ctrl-right"]  # next pane
+prev_pane    = ["ctrl-left"]   # previous pane
 
 [overlay]
 close = ["esc"]  # close
@@ -188,12 +190,14 @@ accept     = ["enter", "y"]  # accept
 cancel     = ["esc"]         # cancel the turn
 
 [requirements]
-new_area   = ["a"]              # new area
-amend      = ["e"]              # amend
-withdraw   = ["W"]              # withdraw
-filter     = ["/"]              # filter
-next_field = ["tab", "down"]    # next field
-prev_field = ["backtab", "up"]  # previous field
+new_area       = ["a"]              # new area
+amend          = ["e"]              # amend
+withdraw       = ["W"]              # withdraw
+filter         = ["/"]              # filter
+priority_must  = ["m"]              # priority must
+priority_later = ["l"]              # priority later
+next_field     = ["tab", "down"]    # next field
+prev_field     = ["backtab", "up"]  # previous field
 
 [backlog]
 replay       = ["enter"]  # replay step
@@ -295,4 +299,53 @@ choose     = ["s"]               # choose
 choose_dir = ["S"]               # choose this directory
 go_to      = ["/"]               # go to path
 hidden     = ["."]               # show hidden
+
+[layout]
+next_preset     = ["p"]               # next layout
+prev_preset     = ["P"]               # previous layout
+grow_list       = [">"]               # wider list
+shrink_list     = ["<"]               # narrower list
+grow_activity   = ["}", "ctrl-down"]  # larger activity
+shrink_activity = ["{", "ctrl-up"]    # smaller activity
+toggle_list     = ["f2", "alt-1"]     # show/hide list
+toggle_activity = ["f3", "alt-2"]     # show/hide activity
+zoom            = ["z"]               # zoom
+
+[history]
+back    = ["backspace", "alt-left"]  # back
+forward = ["alt-right"]              # forward
+
+[leave]
+confirm = ["enter"]     # leave
+stay    = ["esc", "n"]  # stay
+
+[field]
+submit         = ["enter"]      # submit
+cancel         = ["esc"]        # cancel
+left           = ["left"]       # cursor left
+right          = ["right"]      # cursor right
+home           = ["home"]       # line start
+end            = ["end"]        # line end
+delete_back    = ["backspace"]  # delete back
+delete_forward = ["delete"]     # delete forward
+line_up        = ["up"]         # line up
+line_down      = ["down"]       # line down
+page_up        = ["pgup"]       # page up
+page_down      = ["pgdn"]       # page down
+
+[choice]
+prev   = ["left", "h"]   # previous option
+next   = ["right", "l"]  # next option
+toggle = ["space"]       # toggle
+
+[answer]
+option_1 = ["1"]  # answer
+option_2 = ["2"]  # answer
+option_3 = ["3"]  # answer
+option_4 = ["4"]  # answer
+option_5 = ["5"]  # answer
+option_6 = ["6"]  # answer
+option_7 = ["7"]  # answer
+option_8 = ["8"]  # answer
+option_9 = ["9"]  # answer
 ```

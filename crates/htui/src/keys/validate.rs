@@ -16,7 +16,7 @@
 use super::stack::WHILE_EDITING;
 use super::{
     Act, Context, DECLARED, FIXED, Fixed, KeyChord, KeyFileError, Keys, Lost, Row, SHADOWING,
-    STATE_GUARDED, Stack, quote,
+    STATE_GUARDED, Stack, V1_DEFAULTS, quote,
 };
 use crossterm::event::KeyModifiers;
 
@@ -38,6 +38,13 @@ use crossterm::event::KeyModifiers;
 /// against `overlay.close`, either way; any context against `editor.focus`; an `[editor] abort`
 /// entry against a global default). A context no declared stack composes with the entry's is
 /// not compared: `[global] quit = ["j"]` loads, and `list.down` keeps `j`.
+///
+/// MOD-115 M2 D8 (MD4): a file from before M2 (`version = 1`, or no version) keeps loading. A
+/// default M2 added or changed (`since: 2`) that the file leaves alone gives its chord to an entry
+/// of any context wherever a [`DECLARED`] stack makes both candidates for it, with the same
+/// notice; `[global] quit = ["z"]` loads and `layout.zoom` loses `z`. Only a chord the entry
+/// added gives way: one it repeats from its own default met the M2 default in the compiled keys
+/// already. A `version = 2` file gets the strict rules above.
 pub(super) fn give_way(keys: &mut Keys) {
     let mut taken: Vec<(usize, Lost)> = Vec::new();
     for entry in keys.rows.iter().filter(|row| row.entry.is_some()) {
@@ -63,11 +70,59 @@ pub(super) fn give_way(keys: &mut Keys) {
             }
         }
     }
+    if keys.version == 1 {
+        for entry in keys.rows.iter().filter(|row| row.entry.is_some()) {
+            for (index, default) in keys.rows.iter().enumerate() {
+                if default.entry.is_some()
+                    || default.context == entry.context
+                    || matches!(default.act, Act::OverlayClose | Act::EditorFocus)
+                {
+                    continue;
+                }
+                // Only a chord new in M2 and one the entry added: one it repeats from its own
+                // default met the M2 default in the compiled keys already, which validate.
+                for &chord in entry.chords.iter().filter(|c| {
+                    default.chords.contains(c) && new_in_m2(default.act, **c) && added(entry, **c)
+                }) {
+                    let meet = DECLARED.iter().any(|&(_, stack)| {
+                        let candidates = keys.actions(stack, chord);
+                        candidates.contains(&entry.act) && candidates.contains(&default.act)
+                    });
+                    let known = taken
+                        .iter()
+                        .any(|(at, lost)| *at == index && lost.chord == chord);
+                    if meet && !known {
+                        taken.push((
+                            index,
+                            Lost {
+                                chord,
+                                from: entry.context,
+                                to: entry.act,
+                                line: entry.entry.unwrap_or(0),
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+    }
     for (index, lost) in taken {
         let row = &mut keys.rows[index];
         row.chords.retain(|&chord| chord != lost.chord);
         row.lost.push(lost);
     }
+}
+
+/// Whether `chord` is a default M2 gave `act` (MOD-115 M2 D8): the row is `since: 2` and the
+/// chord is not among its [`V1_DEFAULTS`].
+fn new_in_m2(act: Act, chord: KeyChord) -> bool {
+    act.spec().is_some_and(|spec| spec.since == 2)
+        && !V1_DEFAULTS.iter().any(|&(known, defaults)| {
+            known == act
+                && defaults
+                    .iter()
+                    .any(|written| KeyChord::parse_strict(written) == Ok(chord))
+        })
 }
 
 /// Whether `default`, in another context than `entry`, still gives way to it (MOD-57 M2 R1 M-1):
@@ -373,7 +428,7 @@ fn subject(row: &Row) -> String {
 mod tests {
     use super::{check, line_of, validate};
     use crate::keys::{
-        Act, Context, FIXED, Fixed, KeyChord, Keys, SHADOWING, STATE_GUARDED, load_str,
+        Act, CTRL_C, Context, FIXED, Fixed, KeyChord, Keys, SHADOWING, STATE_GUARDED, load_str,
     };
 
     fn chord(spec: &str) -> KeyChord {
@@ -456,7 +511,11 @@ mod tests {
     fn a_global_entry_takes_ctrl_x_from_the_abort_with_a_notice() {
         let readme = "version = 1\n\n[global]\nquit = [\"ctrl-x\"]\n\n[overlay]\nclose = [\"esc\", \"f2\"]\n";
         let keys = load_str(readme).expect("the abort gives way");
-        assert_eq!(keys.chords(Context::Global, Act::Quit), [chord("ctrl-x")]);
+        // MOD-115 M2 (D-9): quit keeps its implicit `ctrl-c`.
+        assert_eq!(
+            keys.chords(Context::Global, Act::Quit),
+            [chord("ctrl-x"), CTRL_C]
+        );
         assert!(keys.chords(Context::Editor, Act::EditorAbort).is_empty());
         assert_eq!(keys.line(Context::Editor, Act::EditorAbort), None);
         let notices: Vec<(usize, String)> = keys
@@ -500,14 +559,15 @@ mod tests {
     }
 
     /// M2 R1 M-1: a global entry on the abort's chord that the file also sets is two entries on
-    /// one chord: still refused.
+    /// one chord: still refused. MOD-115 M2 B4: the abort question now offers quit (its
+    /// `ctrl-c`), and it is declared before the open edit, so it names the question.
     #[test]
     fn a_global_entry_on_an_abort_entrys_chord_is_still_refused() {
         assert_eq!(
             errors("[editor]\nabort = \"ctrl-x\"\n[global]\nquit = \"ctrl-x\"\n"),
             one(
                 4,
-                r#"[global] quit = "ctrl-x": "ctrl-x" is already editor.abort (line 2) while an edit is open"#
+                r#"[global] quit = "ctrl-x": "ctrl-x" is already editor.abort (line 2) in the abort question"#
             )
         );
     }
@@ -584,7 +644,11 @@ mod tests {
         assert_eq!(keys.line(Context::List, Act::ListDown), None);
 
         let keys = load_str("[global]\nquit = [\"ctrl-q\"]\n").expect("the queue gives way");
-        assert_eq!(keys.chords(Context::Global, Act::Quit), [chord("ctrl-q")]);
+        // MOD-115 M2 (D-9): quit keeps its implicit `ctrl-c`.
+        assert_eq!(
+            keys.chords(Context::Global, Act::Quit),
+            [chord("ctrl-q"), CTRL_C]
+        );
         assert!(keys.chords(Context::Global, Act::Queue).is_empty());
         assert_eq!(keys.line(Context::Global, Act::Queue), None);
     }

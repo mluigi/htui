@@ -1257,9 +1257,12 @@ mod tests {
     fn every_global_act_is_fixed_mapped_or_offerable() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let app = App::new(tx);
+        // MOD-115 M2 Task 0: the pane keys are catalogue rows before the shell keeps focus;
+        // Task 6 maps them and drops this exemption.
+        let wired_in_task_6 = [crate::keys::Act::NextPane, crate::keys::Act::PrevPane];
         for row in CATALOGUE
             .iter()
-            .filter(|row| row.context == Context::Global)
+            .filter(|row| row.context == Context::Global && !wired_in_task_6.contains(&row.act))
         {
             let fixed = app.action_for(row.act).is_some();
             assert!(

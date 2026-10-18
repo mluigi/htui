@@ -84,7 +84,7 @@ mod binary {
         assert_eq!(stderr, "");
         assert_eq!(stdout, print(&load_path(&valid).expect("valid.toml loads")));
         assert!(
-            stdout.contains("quit         = [\"ctrl-y\"]   # quit (changed)\n"),
+            stdout.contains("quit         = [\"ctrl-y\"]      # quit (changed)\n"),
             "{stdout}"
         );
         assert!(
@@ -110,7 +110,8 @@ mod binary {
             (
                 "errors",
                 vec![
-                    "2: version: write version = 1, the only version htui reads".to_owned(),
+                    "2: version: write version = 2 (version = 1 is a file from before MOD-115)"
+                        .to_owned(),
                     r#"5: [list] down: write a chord such as "q", or a list such as ["q", "x"]"#
                         .to_owned(),
                     r#"6: [list] up: write each chord as a string, such as "q""#.to_owned(),
@@ -122,12 +123,12 @@ mod binary {
                      skills.templates, skills.attach, skills.help, requirements, backlog, \
                      backlog.body, backlog.runs, backlog.graph, backlog.docs, backlog.notes, \
                      backlog.prompt, backlog.reqs, backlog.filter_form, backlog.item, chat, \
-                     queue, picker"
+                     queue, picker, layout, history, leave, field, choice, answer"
                         .to_owned(),
                     "12: [global] quitt: no such action; [global] has quit, next_tab, prev_tab, \
                      select_tab_1, select_tab_2, select_tab_3, select_tab_4, select_tab_5, \
                      select_tab_6, select_tab_7, select_tab_8, select_tab_9, help, about, workspaces, \
-                     find, waiting, queue"
+                     find, waiting, queue, next_pane, prev_pane"
                         .to_owned(),
                     r#"13: [global] quit = "shift-a": write a shifted letter as "A""#.to_owned(),
                     r#"13: [global] quit = "x": "x" is already settings.agents.cancel (default) in Settings > Agents"#

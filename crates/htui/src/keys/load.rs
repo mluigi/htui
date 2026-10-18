@@ -105,9 +105,12 @@ pub fn load_str(src: &str) -> Result<Keys, Vec<KeyFileError>> {
             }]);
         }
     };
+    let mut keys = Keys::defaults();
+    // MOD-115 M2 §1.7: a file that does not say otherwise is from before M2.
+    keys.version = 1;
     let mut loader = Loader {
         src,
-        keys: Keys::defaults(),
+        keys,
         errors: Vec::new(),
         set: Vec::new(),
     };
@@ -283,18 +286,29 @@ impl Loader<'_> {
     }
 
     /// A top-level entry: a table is a context (or a path to one); `version` is the only value
-    /// allowed beside them (D1, D2).
+    /// allowed beside them (D1, D2). MOD-115 M2 §1.7: `version = 1` (a file from before M2) or
+    /// `version = 2`; the keys remember which.
     fn top_level(&mut self, key: &Spanned<DeString<'_>>, value: &Spanned<DeValue<'_>>) {
         let name: &str = key.get_ref();
         let line = self.line(key.span().start);
+        let version = match value.get_ref() {
+            DeValue::Integer(integer) => {
+                match i64::from_str_radix(integer.as_str(), integer.radix()) {
+                    Ok(1) => Some(1),
+                    Ok(2) => Some(2),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
         match value.get_ref() {
             DeValue::Table(table) => self.walk_table(name, line, table),
-            DeValue::Integer(integer)
-                if name == "version"
-                    && i64::from_str_radix(integer.as_str(), integer.radix()) == Ok(1) => {}
+            _ if name == "version" && version.is_some() => {
+                self.keys.version = version.unwrap_or(1);
+            }
             _ if name == "version" => self.push(
                 line,
-                "version: write version = 1, the only version htui reads".to_owned(),
+                "version: write version = 2 (version = 1 is a file from before MOD-115)".to_owned(),
             ),
             _ if context_named(name).is_some() => self.push(
                 line,
@@ -415,6 +429,12 @@ impl Loader<'_> {
                 Ok(chord) => chords.push(chord),
             }
         }
+        // MOD-115 M2 (D-9): `ctrl-c` is a default of quit and of the leave dialog's confirm, but
+        // no file may list it until Task 5, so it stays implicit there, as it always was: an
+        // entry for such a row keeps it, and `--print-keys` leaves it out.
+        if spec.defaults.contains(&"ctrl-c") && !chords.contains(&CTRL_C) {
+            chords.push(CTRL_C);
+        }
         if items.is_empty()
             && let Some(reason) = must_keep(spec.act)
         {
@@ -444,7 +464,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{FILE_NAME, KeyFileError, KeysError, load_path, load_str, resolve};
-    use crate::keys::{Act, CATALOGUE, Context, KeyChord, Keys, views};
+    use crate::keys::{Act, CATALOGUE, CTRL_C, Context, KeyChord, Keys, views};
 
     /// The full error vector of `src`, as `(line, message)`.
     fn errors(src: &str) -> Vec<(usize, String)> {
@@ -477,7 +497,7 @@ mod tests {
                           skills.templates, skills.attach, skills.help, requirements, backlog, \
                           backlog.body, backlog.runs, backlog.graph, backlog.docs, backlog.notes, \
                           backlog.prompt, backlog.reqs, backlog.filter_form, backlog.item, chat, \
-                          queue, picker";
+                          queue, picker, layout, history, leave, field, choice, answer";
 
     #[test]
     fn an_empty_file_is_the_defaults() {
@@ -508,13 +528,19 @@ mod tests {
     #[test]
     fn a_list_replaces_the_defaults_and_a_string_is_a_list_of_one() {
         let keys = load_str("[global]\nquit = \"z\"\nhelp = [\"f1\"]\n").expect("loads");
-        assert_eq!(keys.chords(Context::Global, Act::Quit), [chord("z")]);
+        // MOD-115 M2 (D-9): quit keeps its implicit `ctrl-c`.
+        assert_eq!(
+            keys.chords(Context::Global, Act::Quit),
+            [chord("z"), CTRL_C]
+        );
         assert_eq!(keys.chords(Context::Global, Act::Help), [chord("f1")]);
         assert_eq!(keys.line(Context::Global, Act::Quit), Some(2));
         assert_eq!(keys.line(Context::Global, Act::Help), Some(3));
+        // MOD-115 M2 D8: the version-1 file's `z` takes `layout.zoom`'s M2 default.
+        assert_eq!(keys.chords(Context::Layout, Act::LayoutZoom), []);
         for spec in CATALOGUE
             .iter()
-            .filter(|spec| !matches!(spec.act, Act::Quit | Act::Help))
+            .filter(|spec| !matches!(spec.act, Act::Quit | Act::Help | Act::LayoutZoom))
         {
             assert_eq!(
                 keys.chords(spec.context, spec.act),
@@ -546,22 +572,85 @@ mod tests {
         );
     }
 
+    /// MOD-115 M2 §1.7: `version = 1` (a file from before M2) or `version = 2`, nothing else;
+    /// the keys remember which, and a file without one is version 1.
     #[test]
-    fn version_must_be_the_integer_1() {
-        for value in ["2", "\"1\"", "1.0", "true", "[1]"] {
+    fn version_must_be_the_integer_1_or_2() {
+        for value in ["3", "0", "\"1\"", "\"2\"", "1.0", "true", "[1]"] {
             assert_eq!(
                 errors(&format!("version = {value}\n")),
-                one(1, "version: write version = 1, the only version htui reads"),
+                one(
+                    1,
+                    "version: write version = 2 (version = 1 is a file from before MOD-115)"
+                ),
                 "{value}"
             );
         }
-        for value in ["0x1", "+1"] {
-            assert_eq!(
-                load_str(&format!("version = {value}\n")),
-                Ok(Keys::defaults()),
-                "{value}"
-            );
+        for (value, version) in [("1", 1), ("0x1", 1), ("+1", 1), ("2", 2), ("0x2", 2)] {
+            let keys = load_str(&format!("version = {value}\n")).expect("the version loads");
+            assert_eq!(keys, Keys::defaults(), "{value}");
+            assert_eq!(keys.version(), version, "{value}");
         }
+        assert_eq!(load_str("").expect("an empty file loads").version(), 1);
+        assert_eq!(Keys::compiled().version(), crate::keys::VERSION);
+        assert_eq!(crate::keys::VERSION, 2);
+    }
+
+    /// MOD-115 M2 (D-9): `ctrl-c` stays implicit on the rows whose default holds it, so a file
+    /// that rebinds quit keeps it and the default print reads back.
+    #[test]
+    fn a_rebound_quit_keeps_ctrl_c_and_no_other_row_gains_it() {
+        let keys = load_str("[global]\nquit = [\"z\"]\nhelp = [\"f1\"]\n").expect("it loads");
+        assert_eq!(
+            keys.chords(Context::Global, Act::Quit),
+            [chord("z"), CTRL_C]
+        );
+        assert_eq!(keys.chords(Context::Global, Act::Help), [chord("f1")]);
+        let unbound = load_str("[global]\nquit = []\n").expect("it loads");
+        assert_eq!(unbound.chords(Context::Global, Act::Quit), [CTRL_C]);
+        let same = load_str("[global]\nquit = [\"q\"]\n").expect("it loads");
+        assert_eq!(
+            same.line(Context::Global, Act::Quit),
+            None,
+            "the default, unmarked"
+        );
+        let leave = load_str("version = 2\n[leave]\nconfirm = [\"y\"]\n").expect("it loads");
+        assert_eq!(
+            leave.chords(Context::Leave, Act::LeaveConfirm),
+            [chord("y"), CTRL_C]
+        );
+    }
+
+    /// MOD-115 M2 D8: a version-1 file's entry takes a `since: 2` default's chord where a
+    /// declared stack makes both candidates, with a notice; a version-2 file is refused.
+    #[test]
+    fn a_version_1_entry_takes_a_new_defaults_chord_and_a_version_2_one_collides() {
+        let keys = load_str("[global]\nworkspaces = [\"z\"]\n").expect("version 1 loads");
+        assert_eq!(keys.chords(Context::Layout, Act::LayoutZoom), []);
+        assert_eq!(
+            keys.notices()
+                .into_iter()
+                .map(|notice| (notice.line, notice.message))
+                .collect::<Vec<_>>(),
+            [(
+                2,
+                r#"[global] workspaces = "z" takes "z" from layout.zoom, which is now unbound"#
+                    .to_owned()
+            )]
+        );
+        let strict = errors("version = 2\n[global]\nworkspaces = [\"z\"]\n");
+        assert!(
+            strict
+                .iter()
+                .any(|(line, message)| *line == 3 && message.contains("layout.zoom (default)")),
+            "{strict:?}"
+        );
+        // A default from before M2 still gives way only in its own context.
+        assert!(
+            errors("[global]\nworkspaces = [\"j\"]\n")
+                .iter()
+                .any(|(_, message)| message.contains("list.down (default)"))
+        );
     }
 
     #[test]
@@ -612,7 +701,10 @@ mod tests {
     fn an_inline_table_at_the_top_is_a_context() {
         // B-12: one rule for every table value.
         let inline = load_str("global = { quit = \"z\" }\n").expect("an inline context loads");
-        assert_eq!(inline.chords(Context::Global, Act::Quit), [chord("z")]);
+        assert_eq!(
+            inline.chords(Context::Global, Act::Quit),
+            [chord("z"), CTRL_C]
+        );
     }
 
     #[test]
@@ -729,7 +821,7 @@ mod tests {
 
     /// `tests/fixtures/keys/errors.toml` (blueprint §11.2; the fixture itself lands with Task 7).
     const ERRORS_TOML: &str = r#"# MOD-67 M2 fixture: one of each entry error, out of order on purpose.
-version = 2
+version = 3
 
 [list]
 down = 5
@@ -746,7 +838,10 @@ quit = ["x", "shift-a"]
     #[test]
     fn every_error_is_reported_and_sorted_by_line() {
         let expected: Vec<(usize, String)> = [
-            (2, "version: write version = 1, the only version htui reads"),
+            (
+                2,
+                "version: write version = 2 (version = 1 is a file from before MOD-115)",
+            ),
             (
                 5,
                 r#"[list] down: write a chord such as "q", or a list such as ["q", "x"]"#,
@@ -758,7 +853,7 @@ quit = ["x", "shift-a"]
                 "[global] quitt: no such action; [global] has quit, next_tab, prev_tab, \
                  select_tab_1, select_tab_2, select_tab_3, select_tab_4, select_tab_5, \
                  select_tab_6, select_tab_7, select_tab_8, select_tab_9, help, about, workspaces, find, \
-                 waiting, queue",
+                 waiting, queue, next_pane, prev_pane",
             ),
             (
                 13,
@@ -889,7 +984,11 @@ quit = ["x", "shift-a"]
         let resolved = resolve(Some(&named), false, None).expect("a good file loads");
         assert_eq!(resolved.path.as_deref(), Some(named.as_path()));
         let keys = resolved.keys;
-        assert_eq!(keys.chords(Context::Global, Act::Quit), [chord("z")]);
+        // MOD-115 M2 (D-9): quit keeps its implicit `ctrl-c`.
+        assert_eq!(
+            keys.chords(Context::Global, Act::Quit),
+            [chord("z"), CTRL_C]
+        );
         assert_eq!(
             load_path(&named).expect("a good file loads"),
             keys,
