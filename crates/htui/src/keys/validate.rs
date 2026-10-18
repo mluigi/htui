@@ -14,6 +14,7 @@
 //! gives way to a global entry too (M2 R1 M-1): a file that binds `ctrl-x` in `[global]` loads.
 
 use super::stack::WHILE_EDITING;
+use super::views::M2_LAYERS;
 use super::{
     Act, Context, DECLARED, FIXED, Fixed, KeyChord, KeyFileError, Keys, Lost, Row, SHADOWING,
     STATE_GUARDED, Stack, V1_DEFAULTS, quote,
@@ -208,7 +209,7 @@ fn check(
                     let shadowed = shadowing.contains(&(first.act, second.act))
                         && !added(first, chord)
                         && !added(second, chord);
-                    if !shadowed {
+                    if !shadowed && !met_in_m2(keys, stack, second.act) {
                         check.report(first, second, chord, phrase);
                     }
                 }
@@ -251,6 +252,21 @@ fn check(
     }
     check.fixed(fixed);
     check.errors
+}
+
+/// Whether, in a version-1 file, `act` (from before M2: `since: 1`, or a changed row in
+/// [`V1_DEFAULTS`] such as quit) meets `stack`'s narrower candidates only
+/// since MOD-115 M2 (D8, MD4): the stack offers it only through a layer M2 added
+/// ([`M2_LAYERS`], the overlays' `QUIT`). The stack pass then lets the narrower candidate keep
+/// the chord, which it does: the resolver handles the first candidate, so the stack acts as it
+/// did before M2. `[global] quit = ["ctrl-d"]` loads, and the concepts search keeps `ctrl-d`.
+fn met_in_m2(keys: &Keys, stack: Stack<'_>, act: Act) -> bool {
+    let before_m2 = act.spec().is_some_and(|spec| spec.since == 1)
+        || V1_DEFAULTS.iter().any(|&(known, _)| known == act);
+    keys.version == 1
+        && before_m2
+        && resolve_at(keys, stack, act)
+            .is_some_and(|(index, _)| M2_LAYERS.contains(&stack.layers()[index]))
 }
 
 /// The layer index and row of `act` as `stack` sees it: [`Keys::resolve_row`], with the index.
@@ -426,9 +442,10 @@ fn subject(row: &Row) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{check, line_of, validate};
+    use super::{check, line_of, resolve_at, validate};
     use crate::keys::{
-        Act, CTRL_C, Context, FIXED, Fixed, KeyChord, Keys, SHADOWING, STATE_GUARDED, load_str,
+        Act, CTRL_C, Context, DECLARED, FIXED, Fixed, KeyChord, Keys, SHADOWING, STATE_GUARDED,
+        load_str, views,
     };
 
     fn chord(spec: &str) -> KeyChord {
@@ -453,6 +470,86 @@ mod tests {
     #[test]
     fn the_compiled_defaults_validate() {
         assert_eq!(validate(Keys::compiled()), []);
+    }
+
+    /// MOD-115 M2 D8 (MD4): an overlay's `QUIT` layer is new in M2, so a version-1 file's quit
+    /// meets the concepts search's own keys only since M2. The narrower act keeps the chord
+    /// there, as before M2, and the file loads with no notice; a version-2 file is refused.
+    #[test]
+    fn a_version_1_quit_on_a_concepts_search_key_loads_and_the_search_keeps_it() {
+        for (spec, act) in [
+            ("ctrl-d", Act::ConceptsDecisions),
+            ("ctrl-p", Act::ConceptsProject),
+        ] {
+            let src = format!("[global]\nquit = [\"{spec}\"]\n");
+            let keys = load_str(&src).unwrap_or_else(|errors| panic!("{spec}: {errors:?}"));
+            assert_eq!(
+                keys.chords(Context::Global, Act::Quit),
+                [chord(spec), CTRL_C],
+                "{spec}"
+            );
+            assert_eq!(
+                keys.chords(Context::Concepts, act),
+                Keys::compiled().chords(Context::Concepts, act),
+                "{spec}"
+            );
+            assert_eq!(
+                keys.actions(views::CONCEPTS_QUERY, chord(spec)),
+                [act, Act::Quit],
+                "{spec}: the search's own act comes first"
+            );
+            assert!(keys.notices().is_empty(), "{spec}");
+            let strict = errors(&format!("version = 2\n{src}"));
+            assert!(
+                strict.iter().any(
+                    |(line, message)| *line == 3 && message.ends_with("in the concepts search")
+                ),
+                "{spec}: {strict:?}"
+            );
+        }
+    }
+
+    /// MOD-115 M2 D8 (MD4): in no stack where quit is offered only through a layer M2 added
+    /// ([`views::M2_LAYERS`]) does a version-1 `[global] quit` on a chord that stack binds for
+    /// another act collide there.
+    #[test]
+    fn a_version_1_quit_never_collides_through_a_layer_m2_added() {
+        let compiled = Keys::compiled();
+        let mut checked = 0;
+        for &(phrase, stack) in DECLARED {
+            let Some((at, _)) = resolve_at(compiled, stack, Act::Quit) else {
+                continue;
+            };
+            if !views::M2_LAYERS.contains(&stack.layers()[at]) {
+                continue;
+            }
+            let quit = compiled.chords(Context::Global, Act::Quit);
+            let mut chords: Vec<KeyChord> = Vec::new();
+            for (index, layer) in stack.layers().iter().enumerate() {
+                for row in compiled.rows.iter().filter(|row| {
+                    row.act != Act::Quit
+                        && row.context == layer.context()
+                        && stack.admits(index, row.act)
+                }) {
+                    chords.extend(row.chords.iter().filter(|c| !quit.contains(c)));
+                }
+            }
+            for chord in chords {
+                checked += 1;
+                let src = format!("[global]\nquit = [{:?}]\n", chord.spec());
+                let errors = errors(&src);
+                assert!(
+                    !errors
+                        .iter()
+                        .any(|(_, message)| message.ends_with(&format!(" {phrase}"))),
+                    "{src}: {errors:?}"
+                );
+            }
+        }
+        assert!(
+            checked > 0,
+            "some stack offers quit through the M2 quit layer"
+        );
     }
 
     /// MOD-67 M6 R1 LOW-5: every pass reports a row on one line, so D6's `(line, chord)` keys
@@ -560,14 +657,23 @@ mod tests {
 
     /// M2 R1 M-1: a global entry on the abort's chord that the file also sets is two entries on
     /// one chord: still refused. MOD-115 M2 B4: the abort question now offers quit (its
-    /// `ctrl-c`), and it is declared before the open edit, so it names the question.
+    /// `ctrl-c`) through the M2 `QUIT` layer, declared before the open edit; a version-1 file
+    /// meets it there only since M2 (D8), so it still names the open edit, and a version-2 file
+    /// names the question.
     #[test]
     fn a_global_entry_on_an_abort_entrys_chord_is_still_refused() {
         assert_eq!(
             errors("[editor]\nabort = \"ctrl-x\"\n[global]\nquit = \"ctrl-x\"\n"),
             one(
                 4,
-                r#"[global] quit = "ctrl-x": "ctrl-x" is already editor.abort (line 2) in the abort question"#
+                r#"[global] quit = "ctrl-x": "ctrl-x" is already editor.abort (line 2) while an edit is open"#
+            )
+        );
+        assert_eq!(
+            errors("version = 2\n[editor]\nabort = \"ctrl-x\"\n[global]\nquit = \"ctrl-x\"\n"),
+            one(
+                5,
+                r#"[global] quit = "ctrl-x": "ctrl-x" is already editor.abort (line 3) in the abort question"#
             )
         );
     }

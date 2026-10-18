@@ -188,6 +188,11 @@ const HISTORY: Layer = Layer::all(Context::History);
 /// right before its last [`HELP`] layer so `Stack::global` still finds the help layer.
 const QUIT: Layer = Layer::only(Context::Global, &[Act::Quit]).with_modal_filter();
 
+/// The layers MOD-115 M2 added to stacks from before it (D8, MD4): in a version-1 file, an act
+/// from before M2 that a stack offers only through one of them meets that stack's narrower acts
+/// only since M2, so the narrower act keeps a chord they share there (`validate`).
+pub(super) const M2_LAYERS: &[Layer] = &[QUIT, LAYOUT, HISTORY];
+
 /// The Settings tab while its section has no stack of its own: section cycling, then global
 /// (L-A Q11). `SettingsTab` resolves `settings.next_section`/`prev_section` through it.
 pub const SETTINGS_TAB: Stack<'static> = Stack::new(&[SETTINGS, HISTORY, GLOBAL]);
@@ -1639,6 +1644,64 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// MOD-115 M2 §1.5 (the implementer check, mechanised): every view source whose production
+    /// code builds a text widget (`TextField`, `TextArea`, the chat `Composer`) names a stack
+    /// that captures text, so a mode that feeds one cannot sit on a non-capturing stack alone.
+    #[test]
+    fn every_view_that_builds_a_text_widget_names_a_capturing_stack() {
+        let capturing: Vec<&str> = VIEW_STACKS
+            .iter()
+            .filter(|(_, stack)| stack.captures_text())
+            .map(|&(name, _)| name)
+            .collect();
+        // A widget's owner whose host names the stack: the Requirements forms (the tab picks
+        // `REQUIREMENTS_FORM`/`REQUIREMENTS_WITHDRAW`) and the directory picker's go-to field
+        // (Hierarchy puts it on `CAPTURE`).
+        const HOSTED: &[(&str, &str)] = &[
+            (
+                "ui/tabs/requirements/forms.rs",
+                "ui/tabs/requirements/mod.rs",
+            ),
+            (PATH_PICKER_RS, "ui/tabs/settings/hierarchy.rs"),
+        ];
+        let sources: Vec<(&str, String)> = VIEWS
+            .iter()
+            .chain(ACT_SITES)
+            .map(|&(path, source)| (path, production(source)))
+            .collect();
+        let code_of = |path: &str| {
+            sources
+                .iter()
+                .find(|(at, _)| *at == path)
+                .map(|(_, code)| code)
+                .unwrap_or_else(|| panic!("{path} is not a view source"))
+        };
+        let mut builders = 0;
+        let mut bare = Vec::new();
+        for (path, code) in &sources {
+            if !["TextField::", "TextArea::", "Composer::"]
+                .iter()
+                .any(|widget| code.contains(widget))
+            {
+                continue;
+            }
+            builders += 1;
+            let named = HOSTED
+                .iter()
+                .find(|(owner, _)| owner == path)
+                .map_or(code, |&(_, host)| code_of(host));
+            if !capturing.iter().any(|name| names_in(named, name)) {
+                bare.push(*path);
+            }
+        }
+        assert!(builders > 0, "some view builds a text widget");
+        assert_eq!(
+            bare,
+            Vec::<&str>::new(),
+            "build a text widget, name no capturing stack"
+        );
     }
 
     /// MOD-115 M2 §1.5, B1-B3: exactly the blueprint's stacks capture text (a `[field]` layer,
