@@ -75,6 +75,14 @@ pub trait Tab {
     fn key_stack(&self) -> Option<Stack<'static>> {
         None
     }
+    /// The stack of this tab's browse mode, the one the about panel labels its actions through
+    /// (MOD-115 review): the tab's main actions are its browse keys, and a form, a composer or a
+    /// filter being open must not blank them. Defaulted to the tab's current
+    /// [`key_stack`](Tab::key_stack), else `Stack::BASE`; a tab whose current stack can differ
+    /// from its browse stack overrides it.
+    fn browse_stack(&self) -> Stack<'static> {
+        self.key_stack().unwrap_or(Stack::BASE)
+    }
     /// The keys of this tab's focused mode for the shell's hint row (MOD-67 M6 D10, design review
     /// finding 3): the mode's hint spec rendered through its own stack, so a rebound key shows its
     /// new chord. `width` is the row's; a tab that composes two hints keeps the second only when

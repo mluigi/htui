@@ -7,7 +7,12 @@ pub const ABOUT_HEIGHT: u16 = 4;
 
 /// The fewest body rows a frame keeps while it still shows the about panel; a frame too short for
 /// the header, the panel and this many body rows hides the panel and keeps the body.
-const MIN_BODY_WITH_ABOUT: u16 = 1;
+///
+/// The blueprint says "about is `Some` only when header 1 + about 4 + body >= 6 rows fit". This
+/// reads the six as the *body's* rows (so the smallest frame with the panel is 1 + 4 + 6 = 11
+/// rows), not the frame's: a tab needs room for a list, its detail and the hint border, and a
+/// body of one to five rows is not one. A ten-row frame therefore shows the body alone.
+const MIN_BODY_WITH_ABOUT: u16 = 6;
 
 /// The regions of a frame. Tabs only ever draw inside [`Chrome::body`]; overlays get the whole
 /// frame and centre themselves with [`centered`].
@@ -29,7 +34,8 @@ pub fn chrome(area: Rect) -> Chrome {
 }
 
 /// Splits a frame into header, the about panel when `about` is asked for and the frame has room
-/// for it (the header, the four panel rows and [`MIN_BODY_WITH_ABOUT`] body row), and body.
+/// for it (the header, the four panel rows and [`MIN_BODY_WITH_ABOUT`] body rows: 11 in all), and
+/// body.
 #[must_use]
 pub fn chrome_with(area: Rect, about: bool) -> Chrome {
     let [header, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
@@ -90,13 +96,16 @@ mod tests {
 
     #[test]
     fn a_short_frame_drops_the_about_panel_and_keeps_the_body() {
-        // header 1 + panel 4 + body 1 is the smallest frame that shows the panel.
-        let fits = chrome_with(Rect::new(0, 0, 40, 6), true);
+        // header 1 + panel 4 + body 6 is the smallest frame that shows the panel.
+        let fits = chrome_with(Rect::new(0, 0, 40, 11), true);
         assert_eq!(fits.about, Some(Rect::new(0, 1, 40, 4)));
-        assert_eq!(fits.body, Rect::new(0, 5, 40, 1));
-        let short = chrome_with(Rect::new(0, 0, 40, 5), true);
+        assert_eq!(fits.body, Rect::new(0, 5, 40, 6));
+        let short = chrome_with(Rect::new(0, 0, 40, 10), true);
         assert_eq!(short.about, None);
-        assert_eq!(short.body, Rect::new(0, 1, 40, 4));
+        assert_eq!(short.body, Rect::new(0, 1, 40, 9));
+        let tiny_body = chrome_with(Rect::new(0, 0, 40, 6), true);
+        assert_eq!(tiny_body.about, None);
+        assert_eq!(tiny_body.body, Rect::new(0, 1, 40, 5));
         let tiny = chrome_with(Rect::new(0, 0, 40, 1), true);
         assert_eq!(tiny.header, Rect::new(0, 0, 40, 1));
         assert_eq!(tiny.body.height, 0);

@@ -944,7 +944,9 @@ impl App {
             &self.theme,
         );
         if let (Some(panel), Some((tab, text))) = (chrome.about, about) {
-            let stack = tab.key_stack().unwrap_or(Stack::BASE);
+            // The tab's browse stack, not the mode it is in: an open form or composer must not
+            // blank the actions.
+            let stack = tab.browse_stack();
             about::render(frame, panel, text, &self.keys, stack, &self.theme);
         }
 

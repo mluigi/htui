@@ -537,3 +537,59 @@ async fn the_header_chips_follow_the_overlay_stack() {
         "{header}"
     );
 }
+
+/// The about panel's actions row of a frame (header, top border, purpose, then this), without
+/// the border glyphs.
+fn about_actions(frame: &str) -> String {
+    frame
+        .lines()
+        .nth(3)
+        .unwrap_or_default()
+        .trim_matches(['\u{2502}', ' '])
+        .to_owned()
+}
+
+/// MOD-115 review: the about panel resolves its action labels against the tab's browse stack,
+/// not the stack of the mode the tab is in, so the actions row is not blank under the filter
+/// form (whose stack has no Backlog layer).
+#[tokio::test]
+async fn the_about_actions_survive_the_backlog_filter_form() {
+    let mut harness = demo_shell(None).await;
+    harness.key("f9");
+    let browse = harness.render();
+    assert!(
+        about_actions(&browse).contains("filter"),
+        "browsing: {browse}"
+    );
+
+    harness.key("f");
+    let frame = harness.render();
+    assert!(
+        frame.contains("Filter"),
+        "the filter form is open over the list: {frame}"
+    );
+    let actions = about_actions(&frame);
+    assert!(!actions.is_empty(), "{frame}");
+    assert!(
+        actions.contains("new item") && actions.contains("queue"),
+        "{frame}"
+    );
+}
+
+/// MOD-115 review: a frame of ten rows has no room for the panel plus a useful body (the
+/// header, four panel rows and at least six body rows), so the panel is left off; eleven rows
+/// show it.
+#[tokio::test]
+async fn a_ten_row_frame_drops_the_about_panel() {
+    for (height, shown) in [(10_u16, false), (11, true)] {
+        let mut harness = Harness::demo()
+            .size(100, height)
+            .with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
+        register_all(harness.app());
+        harness.drive_to_end().await;
+        harness.key("f9");
+        assert!(harness.app().about_visible);
+        let frame = harness.render();
+        assert_eq!(frame.contains("About"), shown, "{height} rows: {frame}");
+    }
+}

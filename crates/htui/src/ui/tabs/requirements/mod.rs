@@ -1135,6 +1135,12 @@ impl Tab for RequirementsTab {
         Some(self.stack())
     }
 
+    /// The tree's own stack, whatever form or filter is open (MOD-115 review): what the about
+    /// panel labels the tab's actions through.
+    fn browse_stack(&self) -> Stack<'static> {
+        views::REQUIREMENTS_BROWSE
+    }
+
     /// Each mode resolves through its stack (MOD-67 M4 D4, D6). A form or the filter captures
     /// every key but the chords its stack passes, so digits, `q` and `Tab` are text or field moves
     /// there; `form.save` (`Ctrl+S`) saves a form.

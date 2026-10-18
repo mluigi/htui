@@ -118,6 +118,15 @@ impl Tab for SkillsTab {
         Some(self.stack())
     }
 
+    /// The shown view's browse stack, whatever prompt or editor is open (MOD-115 review): what
+    /// the about panel labels the tab's actions through.
+    fn browse_stack(&self) -> Stack<'static> {
+        match self.view {
+            View::Skills => crate::keys::views::LIBRARY_BROWSE,
+            View::Templates => crate::keys::views::TEMPLATES_BROWSE,
+        }
+    }
+
     /// The view switch is `skills.switch_view` (MOD-67 M4 D5), resolved through the shown view's
     /// stack. Chord equality includes modifiers, so `ctrl-l`, `ctrl-h`, `alt-l` or `shift-right`
     /// no longer switch (ANA-26 §2.6 defect 1). Every other key goes to the shown view.

@@ -553,6 +553,12 @@ impl Tab for ChatTab {
         Some(self.stack())
     }
 
+    /// The live view's stack, whatever mode the chat is in (MOD-115 review): what the about panel
+    /// labels the tab's actions through, so an open composer does not blank them.
+    fn browse_stack(&self) -> Stack<'static> {
+        views::CHAT_LIVE
+    }
+
     /// The current mode's keys (MOD-67 M6 T2): `hint_text`, in `theme.dim`.
     fn key_hint(&self, _width: u16, ctx: &Ctx<'_>) -> Option<Line<'static>> {
         let hint = self.hint_text(ctx.keys());
