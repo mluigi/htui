@@ -21808,7 +21808,7 @@ mod tests {
 mod queued_cancel {
     use chrono::TimeDelta;
     use htui_core::fixtures::ids;
-    use htui_core::model::{RunMode, RunStatus, SnapshotCandidate, Status};
+    use htui_core::model::{Claim, RunMode, RunStatus, SnapshotCandidate, Status, StopMode};
     use htui_core::store::{ReadStore as _, WriteStore as _};
 
     use super::SessionKey;
@@ -21850,6 +21850,79 @@ mod queued_cancel {
                 "the run carries the workspace `StartRun` named"
             );
         }
+    }
+
+    /// MOD-125 D5: a run started from a stopped workspace is created `queued`, and its claim is
+    /// refused `WorkspaceStopped`: no lease, the item `queued`, no note, no step. After the resume
+    /// the same run's claim starts it.
+    #[tokio::test]
+    async fn a_claim_refused_for_a_stopped_workspace_leaves_the_run_queued_and_writes_nothing() {
+        let orch = harness().await;
+        orch.store
+            .stop_workspace(
+                ids::WORKSPACE_PLATFORM,
+                StopMode::Graceful,
+                ids::USER,
+                orch.clock.now(),
+            )
+            .await
+            .expect("the workspace exists");
+        let notes = orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .len();
+        let refused = orch
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+                workspace: Some(ids::WORKSPACE_PLATFORM),
+            })
+            .await;
+        let Err(EngineError::ClaimRefused {
+            run,
+            claim: Claim::WorkspaceStopped { workspace },
+        }) = refused
+        else {
+            panic!("a stopped workspace refuses the claim, not {refused:?}");
+        };
+        assert_eq!(workspace, ids::WORKSPACE_PLATFORM);
+        let row = orch.run(run).await;
+        assert_eq!(row.status, RunStatus::Queued);
+        assert_eq!(row.lease_expires_at, None, "never claimed: no lease");
+        let item = orch
+            .store
+            .item(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the item exists");
+        assert_eq!(item.status, Status::Queued);
+        assert_eq!(
+            orch.store
+                .notes(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .len(),
+            notes,
+            "no note"
+        );
+        assert!(orch.steps(run).await.is_empty(), "no step was created");
+        assert!(
+            orch.store
+                .resume_workspace(ids::WORKSPACE_PLATFORM)
+                .await
+                .expect("the write answers")
+        );
+        let outcome = orch
+            .claim(run)
+            .await
+            .expect("the resumed workspace admits the run");
+        assert!(
+            matches!(outcome, CommandOutcome::Started { run: started, .. } if started == run),
+            "{outcome:?}"
+        );
     }
 
     /// F-21: a claim lands between the cancel's read and its compare-and-set. `cancel_queued`
