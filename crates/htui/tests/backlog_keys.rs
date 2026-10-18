@@ -65,8 +65,9 @@ const BROWSE: &str =
 const CAPTURING: &str = "Ctrl+c quit · F1 help · F9 about";
 
 /// D12: on the Runs pane with a step under the cursor, the status line is the browse one and the
-/// `?` box lists every layer of `RUNS_BROWSE`, in order: the pane's own verbs, the pane scroll and
-/// sub-tab keys, the Backlog's verbs, `Common`, the list, the global keys, the closer.
+/// `?` box lists every layer of `RUNS_BROWSE`, in order: the pane's own verbs, the answers
+/// (MOD-115 M2 D7: `answer.option_*`, a parked request's digits), the pane scroll and sub-tab
+/// keys, the Backlog's verbs, `Common`, the list, the global keys, the closer.
 #[tokio::test]
 async fn the_runs_pane_status_line_and_box_list_every_layer() {
     let adapter = FakeAdapter::new();
@@ -93,6 +94,7 @@ async fn the_runs_pane_status_line_and_box_list_every_layer() {
              p promote to chat · s select winner · A accept output · o open output · \
              c cancel run · T retry cleanup · u unblock · R start run · C close out · \
              i follow up · v list / flow · + zoom in · - zoom out · = fit the run",
+            "Answer: 1-9 answer",
             "Pane: PgDn page down · PgUp page up · l/]/Right next sub-tab · \
              h/[/Left previous sub-tab",
             "Backlog: Enter replay step · m open graph · f filter · F clear filter · \

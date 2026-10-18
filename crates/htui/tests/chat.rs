@@ -2253,8 +2253,9 @@ async fn a_chord_does_not_disarm_esc_esc() {
 }
 
 /// MOD-67 M5 (D7, D9): `[chat] end = "ctrl-e"` arms on the chord the old guard passed and ends
-/// the chat on the second press, the hint doubles the new label, and `Esc` neither arms nor ends.
-/// The armed sentence names the new label too (MOD-67 M6 D4).
+/// the chat on the second press, and the hint doubles the new label. The armed sentence names the
+/// new label too (MOD-67 M6 D4). MOD-115 M2 MD7: `Esc` is never configurable, so it still arms
+/// (after the file's chord), and a plain key disarms it.
 #[tokio::test]
 async fn a_rebound_end_key_arms_and_ends_the_chat() {
     let keys = htui::keys::load_str("version = 1\n[chat]\nend = \"ctrl-e\"\n")
@@ -2271,14 +2272,14 @@ async fn a_rebound_end_key_arms_and_ends_the_chat() {
     assert_eq!(hint_row(&harness.render()), live);
 
     harness.key("esc");
-    harness.key("esc");
-    harness.drive().await;
     let frame = harness.render();
     assert_eq!(
         hint_row(&frame),
-        live,
-        "`Esc` neither arms nor ends: {frame}"
+        "Ctrl+e again ends this chat",
+        "`Esc` still arms: {frame}"
     );
+    harness.key("j");
+    assert_eq!(hint_row(&harness.render()), live, "`j` disarms");
 
     harness.key("ctrl-e");
     let frame = harness.render();

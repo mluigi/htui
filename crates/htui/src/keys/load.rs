@@ -265,14 +265,16 @@ fn chord_of(written: &str) -> Result<KeyChord, String> {
     KeyChord::parse_strict(written).map_err(|error| error.to_string())
 }
 
-/// Where the compiled row of `act` as `[context]` sees it holds `Esc`, or `None` (MOD-115 M2
-/// MD7): the row itself, else (a view's override of a shared verb) the shared row.
-fn esc_at(context: Context, act: Act) -> Option<usize> {
+/// Where the compiled row of `act` as `[context]` sees it holds `Esc`, counted from the end
+/// (`0`: last), or `None` (MOD-115 M2 MD7): the row itself, else (a view's override of a shared
+/// verb) the shared row. Counted from the end so the kept `Esc` follows the file's own chords
+/// (a hint names the key the user chose first) and a print reads back in the same order.
+fn esc_from_end(context: Context, act: Act) -> Option<usize> {
     let compiled = Keys::compiled();
     compiled
         .row(context, act)
         .or_else(|| act.spec().and_then(|spec| compiled.row(spec.context, act)))
-        .and_then(|row| row.chords.iter().position(|chord| *chord == ESC))
+        .and_then(|row| row.chords.iter().rev().position(|chord| *chord == ESC))
 }
 
 /// The shared acts `[context]` may override (MOD-67 M3 D10, PA-3): every shared catalogue row
@@ -431,7 +433,7 @@ impl Loader<'_> {
             }
         };
         // MOD-115 M2 MD7: a row whose compiled default holds `Esc` keeps it.
-        let esc = esc_at(context, spec.act);
+        let esc = esc_from_end(context, spec.act);
         let keeps_esc = esc.is_some();
         let mut chords: Vec<KeyChord> = Vec::new();
         for item in &items {
@@ -459,10 +461,10 @@ impl Loader<'_> {
                 Ok(chord) => chords.push(chord),
             }
         }
-        if let Some(at) = esc
+        if let Some(from_end) = esc
             && !chords.contains(&ESC)
         {
-            chords.insert(at.min(chords.len()), ESC);
+            chords.insert(chords.len().saturating_sub(from_end), ESC);
         }
         self.keys.set(context, spec.act, chords, key_line);
         self.set.push((context, spec.act));
@@ -742,7 +744,8 @@ mod tests {
             .expect("it loads");
         assert_eq!(
             keys.chords(Context::Overlay, Act::OverlayClose),
-            [chord("esc"), chord("f2")]
+            [chord("f2"), chord("esc")],
+            "the file's chords first, then the kept Esc"
         );
         assert_eq!(
             keys.chords(Context::Confirm, Act::ConfirmNo),
@@ -763,8 +766,35 @@ mod tests {
             load_str("version = 2\n[settings.boxes]\ndismiss = [\"x\"]\n").expect("it loads");
         assert_eq!(
             keys.chords(Context::SettingsBoxes, Act::Dismiss),
-            [chord("esc"), chord("x")]
+            [chord("x"), chord("esc")]
         );
+    }
+
+    /// MOD-115 M2 MD7: the kept `Esc` sits as far from the end as in the compiled row, so a
+    /// rebound row's hint leads with the file's chord, and every print (which never lists `Esc`)
+    /// reads back in the same order, a derived row's included.
+    #[test]
+    fn the_kept_esc_follows_the_files_chords_and_a_print_reads_back() {
+        let keys = load_str("version = 2\n[confirm]\nno = [\"x\"]\n[chat]\nend = \"ctrl-e\"\n")
+            .expect("it loads");
+        assert_eq!(
+            keys.chords(Context::Confirm, Act::ConfirmNo),
+            [chord("x"), chord("esc")]
+        );
+        assert_eq!(
+            keys.chords(Context::Migration, Act::ConfirmNo),
+            [chord("x"), chord("esc"), chord("N")]
+        );
+        assert_eq!(
+            keys.chords(Context::Chat, Act::ChatEnd),
+            [chord("ctrl-e"), chord("esc")]
+        );
+        for keys in [&keys, Keys::compiled()] {
+            let printed = crate::keys::print(keys);
+            let reloaded = load_str(&printed).expect("the print loads");
+            assert_eq!(&reloaded, keys);
+            assert_eq!(crate::keys::print(&reloaded), printed);
+        }
     }
 
     /// MOD-115 M2 MD7 with MD4: a version-1 file that lists `Esc` where the row holds it anyway
@@ -775,7 +805,8 @@ mod tests {
         let keys = load_str("[overlay]\nclose = [\"esc\", \"f2\"]\n").expect("it loads");
         assert_eq!(
             keys.chords(Context::Overlay, Act::OverlayClose),
-            [chord("esc"), chord("f2")]
+            [chord("f2"), chord("esc")],
+            "the kept Esc sits where the row keeps it, so a print reads back the same"
         );
         assert_eq!(
             errors("[list]\ntop = [\"g\", \"esc\"]\n"),

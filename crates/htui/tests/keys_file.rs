@@ -569,7 +569,8 @@ mod app {
         harness.drive_to_end().await;
         harness.key("?");
         let frame = harness.render();
-        assert!(frame.contains("Overlay: Esc/F2 close"), "{frame}");
+        // MOD-115 M2 MD7: the file lists `f2` only; `Esc` is kept after it.
+        assert!(frame.contains("Overlay: F2/Esc close"), "{frame}");
         harness.key("?");
         harness.key("esc");
         assert!(harness.app().overlays.is_empty(), "`Esc` still closes it");
