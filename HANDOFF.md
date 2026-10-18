@@ -14,12 +14,20 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-18):** **ANA-34 is concluded** (`docs/ANA-34.md`, `docs/decisions/ana/ana-34.md`): a
+**Current status (2026-10-18):** **ANA-36 is concluded** (`docs/ANA-36.md`, `docs/decisions/ana/ana-36.md`): of 36
+candidate MCP tools, 11 are refuted and 15 stay with the items that own them (MOD-112, MOD-75, MOD-27, MOD-135,
+MOD-136 and others, each given its §7.2 design input); the ten unowned survivors are filed as **MOD-151..157**
+(tool guidance, async commands with stored logs, test results and presets, `item_status` as a typed request,
+pending agent links and citations; `document_patch` and attachment tools wanted later). An agent proposal that a
+status move, the scheduler, coverage or a prompt would read waits for a person, so a scheduling-kind `item_link`
+becomes pending (reversing MOD-11 OQ-4). Its §9 requirement edits are applied (`R-MCP-1..4`, `R-ENT-9`,
+`R-ENT-15`, `R-ID-5`; ANA-34's `R-MCP-2` coordinator sentence folded in). Before it, **ANA-34 is concluded**
+(`docs/ANA-34.md`, `docs/decisions/ana/ana-34.md`): a
 coordinator is a role over store rows, not a process; deterministic code in the run's executor lands finished runs
 per repo (`local` stays the default, `push` fast-forward only, `pull_request` through a forge adapter, OneDev
 first) and never resolves a conflict; its agent turns only propose; close-out stays a person's confirmation over a
 checklist. Spawned **MOD-133..136**; requirement edits (`R-TUI-9` final text and others, §10) wait for the
-maintainer. Before it, **ANA-40 is concluded** (`docs/ANA-40.md`, `docs/decisions/ana/ana-40.md`): the
+maintainer, except §10.11, applied through ANA-36's `R-MCP-2`. Before it, **ANA-40 is concluded** (`docs/ANA-40.md`, `docs/decisions/ana/ana-40.md`): the
 Toolbox has eleven kinds plus bundles, Postgres holds them all and the box probe only reports observed state, every
 attachable kind shares one generalised binding, and the light model becomes one setting (a partial reversal of
 ANA-30). Spawned **MOD-126..129**; requirement edits (`R-TUI-7` and others) wait for the maintainer. Before it, a
@@ -38,16 +46,11 @@ bindings move to Postgres; `R-LATER-3` and `R-LATER-7` are promoted to must; mac
 (`heavy_build` becomes a label, MOD-107). Before it, a **requirements audit** (2026-10-14) found 69 of 90 `must` requirements fully met; the
 untracked gaps are filed as **MOD-99..106**, **ANA-31**, **ANA-32** and **TOOL-13**, and `R-NF-2`, `R-ORCH-6`,
 `R-ORCH-12` and `R-LATER-6` were amended (`docs/REQUIREMENTS.md` header). **MOD-99** (hard-coded Sentry DSN in a
-public repo) also owes key rotation and a history rewrite, after the live `hr` branches merge. **TOOL-14 is done**
-(`docs/decisions/tool/tool-14.md`): the gate's new `postgres` step reads `skipped` when `HTUI_TEST_DATABASE_URL` is
-unset, so a green no longer hides unexercised Postgres suites. Owed on the host: `gate.ps1 -SelfTest` on Windows.
-Before it, **TOOL-8 is done** (`docs/decisions/tool/tool-8.md`): the `htui-dev` mod
-(`.claude/skills/htui-dev/`, `docs/htui-dev.md`) refuses six kinds of costly call (M1), and keeps a status line in
-interactive sessions (item and HANDOFF phase, merge/ahead/dirty, disk above 90%, Postgres not up, last gate) with a
-toast when a gate finishes, plus turnless `/gate`, `/next` and `/validate` (M2); `scripts/dev-health.sh`/`.ps1` are
-new. Owed on the host: a Windows run (`claude -p "/gate fmt"` returns at once, the `.ps1` commands), `dev-health`'s
-docker path against the real `htui-postgres`, and the Postgres gate. Owed on the host from ANA-30: checking which credit the $100 is (Console), and one dev-database query for stored ACP
-`session_info_update` titles (`docs/ANA-30.md` §8 calls 2, 6). Earlier completions (**ANA-30**, **TOOL-10**, **CLEAN-12**, **TOOL-9**, **CLEAN-11**, **MOD-67**, **MOD-96**, **CLEAN-10**, **MOD-93**, **MOD-89**, **MOD-95**, **TOOL-11**,
+public repo) also owes key rotation and a history rewrite, after the live `hr` branches merge. Owed on the host from
+TOOL-14: `gate.ps1 -SelfTest` on Windows; from TOOL-8: a Windows run (`claude -p "/gate fmt"` returns at once, the
+`.ps1` commands), `dev-health`'s docker path against the real `htui-postgres`, and the Postgres gate; from ANA-30:
+checking which credit the $100 is (Console), and one dev-database query for stored ACP `session_info_update` titles
+(`docs/ANA-30.md` §8 calls 2, 6). Earlier completions (**TOOL-14**, **TOOL-8**, **ANA-30**, **TOOL-10**, **CLEAN-12**, **TOOL-9**, **CLEAN-11**, **MOD-67**, **MOD-96**, **CLEAN-10**, **MOD-93**, **MOD-89**, **MOD-95**, **TOOL-11**,
 **MOD-91**, **MOD-92**) are in `DECISIONS.md`; their host Postgres gates on the merged tree, the Windows runs
 and MOD-93's live install and `tsc` on the mod stay owed; TOOL-9's Windows run of the `.ps1` gate files and TOOL-10's real
 `scripts/hr up` and Docker bats case are owed on the host too. Open from ANA-29: **MOD-94** behind a maintainer decision.
@@ -133,12 +136,6 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   `failed` moving to the run. That last one touches the store, orchestrator, cache, Backlog filters,
   waiting-on-you and search's decisions filter. Also take over MOD-106's question of the primary repo.
   Not blocked.
-- [ ] **ANA-36 - Further MCP tools for agents** (from the 2026-10-15 requirements review).
-  `R-MCP-2`, `R-MCP-1`, `R-ID-6`. The review adds read tools, search, `item_create` drafts, the
-  question tool (MOD-75) and the planner's tools (ANA-33), and asks for a survey of what else agents
-  should get: what comparable harnesses expose to their agents, which tools would replace work an
-  agent does badly today (from stored transcripts), and the scope and `R-ID-6` line for each. Not
-  blocked.
 - [ ] **ANA-37 - Is Qdrant worth requiring** (from the 2026-10-15 requirements review). `R-NF-2`,
   `R-STO-8`, `R-ENT-13`. The maintainer wants Qdrant required "if it is very beneficial". Today it is
   optional and fails open (MOD-34, MOD-50, MOD-68). Measure what semantic search adds once agents can
@@ -155,6 +152,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   (a person accepts it, or not), how it reaches a prompt (`R-PRM-1`, `R-PRM-3`), and its
   **integration with Qdrant** (indexed, searched, deduplicated). Not blocked. ANA-34 is concluded: a
   coordinator turn is seeded from the store, and memory joins that seed when it lands (`docs/ANA-34.md` §7.2).
+  ANA-36 §7.2 adds design input: agent memory only as accepted suggestions, never a direct write into
+  future context.
 - [ ] **ANA-39 - Mandatory context tools for coding sessions** (from the 2026-10-15 requirements
   review; `R-LATER-7` promoted to must). `R-LATER-7`, `R-NF-2`, `R-AGT-10`, `R-ID-5`, `R-MCP-4`,
   `R-PRM-1`. Code-context tools (Gortex, Serena, Graphify, Headroom) become mandatory in coding
@@ -164,6 +163,7 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   `R-AGT-5`); what a coding session is (the project type, phase or kind); install and detection
   through R-AGT-10's tool managers; per-box indexing cost and freshness; and the excerpt-provider half
   of `R-PRM-1` (ANA-3 shipped none). Not blocked.
+  ANA-36 §10 adds design input: htui ships no code search or read tool of its own; these tools cover it.
 
 - [ ] **ANA-41 - Project workflows** (from the UI redesign review, `docs/ui-redesign-findings-2026-10-15.md` §8). `R-ORCH-1`,
   `R-ORCH-14`, `R-ORCH-6`, `R-ID-6`. A workflow that drives a **whole project's implementation**,
@@ -215,6 +215,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   lists the tool. **Requirements review note (2026-10-15):** `R-ORCH-7` now means divided work
   (a planner, parallel parts, an integrate step), which overlaps the swarm. ANA-33 settles whether
   this item is subsumed, narrowed or kept; do not start before its verdict.
+  ANA-36 §7.2 adds design input: consult as a blocking tool result, capped on depth, concurrency and
+  budget. Per its §8 Q8 the consult reuses the one tool-to-engine channel MOD-75 builds.
 - [ ] **MOD-16 - Windows runtime verification of the agent driver** (from MOD-2). `R-AGT-1`,
   `R-NF-3`, `R-HIS-1`. **This is now the only Windows check** (TOOL-3 decided 2026-09-28,
   `docs/decisions/tool/tool-3.md`): the maintainer accepted that
@@ -428,6 +430,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   `item_create`; one confirmation that closes, creates the accepted follow-ups and writes the accepted
   re-confirmations; `done` requires landed work; auto mode never closes an item. Blocked on MOD-133;
   coordinate with ANA-35's status migration.
+  ANA-36 §7.2 adds design input: MOD-154's typed status request is the checklist's proposed resolution;
+  follow-ups come from `item_create` drafts.
 - [ ] **MOD-136 - Coordinator turns and the workspace scope** (from ANA-34, `docs/ANA-34.md` §7.1,
   §7.2, §7.7). `R-ORCH-14`, `R-TUI-6`, `R-MCP-2`, `R-ID-6`, `R-ENT-14`. A run kind `coordinator` and
   workspace-owned runs; a `ToolScope` and a `WaitingRow` variant without an item; coordinator MCP tools
@@ -436,6 +440,58 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   in the TUI or by a checklist in the executor, resumed or reseeded from the store; the workspace
   coordinator follows and relays only. Supplies MOD-121's coordinator groups. Blocked on MOD-135 and
   MOD-115.
+  ANA-36 §7.2 adds design input: share the read code with MOD-112's `item_read`; link requests go through
+  MOD-155's pending state.
+- [ ] **MOD-151 - Tell agents about htui's MCP tools (server instructions, prompt section, typed
+  results)** (from ANA-36, `docs/ANA-36.md` §7.3, §7.4, §8 Q7). `R-MCP-2`, `R-MCP-4`, `R-PRM-1`,
+  `R-PRM-3`. `initialize.instructions` naming each advertised tool and when to use it; a prompt section
+  built from the same table (instead of a `session_info` tool); the prompt names the `R-PRM-3` trim
+  record; `COMMAND_QUEUE_TEXT` reworded so it no longer says "verification" (the tool refuses `verify`),
+  accepting the prompt-digest change; results gain `structuredContent` with an `outputSchema`, typed
+  stable refusals that are not `isError` (ANA-33's `plan_submit` style), and `readOnlyHint` on reads. Not
+  blocked (MOD-11 is done); describe MOD-112's tools the same way.
+- [ ] **MOD-152 - Async command queue and stored command logs** (from ANA-36, `docs/ANA-36.md` §7.3, §8
+  Q5). `R-MCP-3`, `R-MCP-4`, `R-ID-7`, `R-SEC-3`. `command_start` / `command_wait` (absolute deadline,
+  optional line pattern) / `command_cancel` over the existing `command_run` rows, with the same fence,
+  scrub and class limits, advertised with `command_run` and kept in `ASKING_TOOLS`; a scrubbed,
+  size-capped log artifact per command row (the plan picks the cap; scrubbing fails closed);
+  `command_output_read` (tail, line range, regex with context, byte cap) over the caller's run's rows; a
+  `repo` argument resolving the session's `extra_dirs` by name, with `ToolScope.extra_dirs` set by the
+  engine. `command_run` stays as the blocking form. Not blocked; MOD-109 puts the limits in Settings (not
+  blocking).
+- [ ] **MOD-153 - Structured test results and named command presets** (from ANA-36, `docs/ANA-36.md`
+  §7.3, §8 Q6). `R-MCP-3`, `R-MCP-4`. Pluggable result parsers keyed on recognised runners (nextest and
+  JUnit XML first): per-target counts, failing tests with a capped excerpt, crash signals and pending
+  snapshots, with MOD-152's log read as the fallback; `rerun_failed`; a read-only view of the
+  orchestrator's verify result for the run; a `preset` argument resolving to a project-configured
+  command, directory and timeout (above 1800 s where configured), instead of a `gate_run` tool. Blocked
+  on MOD-152; MOD-109 supplies the preset form.
+- [ ] **MOD-154 - `item_status` as a typed request** (from ANA-36, `docs/ANA-36.md` §7.3, §8 Q4).
+  `R-ENT-8`, `R-MCP-2`, `R-ID-6`, `R-TUI-11`. A typed status-request row (requested status from
+  `R-ENT-8`'s open/blocked/closed, resolution, reason, step) that a person accepts or rejects, shown as a
+  waiting-on-you row and as MOD-135's proposed resolution; it never moves the status (MOD-11 I-4); the
+  enum narrows when ANA-35's status migration lands. Absorbs the refuted close-out proposal tool. Blocked
+  on ANA-35 (the status enum) and MOD-135 (its checklist consumer).
+- [ ] **MOD-155 - Agent link and citation proposals wait for a person** (from ANA-36, `docs/ANA-36.md`
+  §7.3, §8 Q2, Q3). `R-ENT-9`, `R-ENT-15`, `R-ID-6`, `R-MCP-1`, `R-MCP-2`. An `item_link` of a kind
+  scheduling, status or a subgraph reads (`blocked_by`, `supersedes`, `duplicates`, `parent`) is pending
+  until a person accepts it, and `ready_items`, `queue_rows` and subgraph sources ignore it until then;
+  `relates`, `origin` and `implements` stay live as display (reversing MOD-11 OQ-4 for those kinds);
+  accept and reject on the item's links view and as a waiting row; `R-ENT-9`'s new kinds and workspace
+  targets once ANA-35 adds them. `requirement_cite`: a new fenced `WorkerStore` method proposing
+  `addresses`, `reserves` or `verifies`, pending until accepted, withdrawing only the run's own and never
+  overwriting a person's citation or proposer. MOD-136's coordinator link requests use the same pending
+  state. Blocked on ANA-35 (link kinds, `W-` keys).
+- [ ] **MOD-156 - `document_patch` tool (wanted later)** (from ANA-36, `docs/ANA-36.md` §7.3, §8 Q12).
+  `R-MCP-2`. Anchored edits (replace a section, upsert a table row, append under a heading) to the latest
+  version of the step's own output document in one call, one new version per call, a typed refusal on an
+  anchor miss; advertised with `document_write`. Wanted later, by maintainer decision. Not blocked.
+- [ ] **MOD-157 - Attachment tools for agents (wanted later)** (from ANA-36, `docs/ANA-36.md` §7.3, §8
+  Q12). `R-ENT-12`, `R-MCP-1`, `R-ID-7`. `attachment_read` (images as MCP image content, text capped and
+  scrubbed, others as metadata) at workspace read scope; `attachment_add` from the run's worktree or a
+  stored command log (MOD-152) to the run's item or output document, under the size cap, text and logs
+  only unless a person confirms (images cannot be text-scrubbed). Wanted later, by maintainer decision.
+  Blocked on MOD-114 part (3) and ANA-35 (who owns an attachment).
 
 - [ ] **MOD-85 - Remaining accent (cyan) uses that do not mean focus or selection** (from MOD-80,
   `docs/decisions/mod/mod-80.md` "Carried"; blueprint B-6, review M1/L5). `R-TUI-1`. MOD-80 made
@@ -502,6 +558,9 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   **From MOD-55 (`docs/decisions/mod/mod-55.md`):** milestone 4 (Skills) also takes the editors' `Ctrl+G` (ask an
   agent, `ui/tabs/skills/agent_help.rs`) and the `AgentHelp` panel's keys (`Enter`/`y` accept, `Esc`/`n` discard),
   hard-coded today like `Ctrl+S`/`Ctrl+E`.
+  ANA-36 §7.2 adds design input: the converged question shape (1-3 questions with options,
+  accept/decline/cancel, never auto-resolved). Per its §8 Q8 this item builds the one tool-to-engine
+  channel first, and MOD-27's consult reuses it.
 
 - [ ] **MOD-88 - Flow-graph mode for the Backlog item graph (rataflow)** (from MOD-14 and MOD-28,
   `docs/decisions/mod/mod-14.md`, `docs/decisions/mod/mod-28.md`). `R-TUI-1`. The Backlog detail's Graph
@@ -669,6 +728,7 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   - **`htui migrate`.** An explicit, non-interactive CLI verb that applies pending migrations; the
     worker still never migrates.
   Not blocked.
+  ANA-36 §7.3 adds consumers: MOD-152 (command limits) and MOD-153 (the preset form).
 - [ ] **MOD-110 - Agents and quota: event kinds, cost view, quota-aware auto mode** (from the
   2026-10-15 requirements review). `R-AGT-1`, `R-AGT-7`, `R-AGT-8`, `R-ORCH-6`, `R-HIS-1`,
   `R-TUI-6`. (1) The driver's event kinds gain plan/todo updates, subagent start and end, file read,
@@ -677,6 +737,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   time, per agent, project and item, from the recorded usage events. (3) Auto mode **waits** for a
   subscription quota reset and resumes, rather than failing the item, with the wait visible in the
   queue overlay. Not blocked.
+  ANA-36 §7.2 adds design input: map the harness's own todo and question events into rows, as display
+  only.
 - [ ] **MOD-111 - Run control: advisory judge, step control, routing, budget raise** (from the
   2026-10-15 requirements review). `R-ORCH-2`, `R-ORCH-4`, `R-ORCH-10`, `R-ORCH-12`, `R-HIS-2`,
   `R-PRM-3`, `R-TUI-4`. (1) A gate can ask a configured judge agent for an **advisory** verdict,
@@ -694,6 +756,9 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   also covers **notes** and **scrubbed run transcripts**, and searches can be scoped to a workspace
   (workspace-owned items once ANA-35 lands). The question tool is MOD-75's; the planner's tools are
   ANA-33's. Not blocked.
+  ANA-36 §7.2 adds design input: `item_read` with links both ways and authors marked, outline-first
+  `document_read`, out-of-workspace stubs and stable draft ids; part (1) also gains a scrubbed transcript
+  tail of a named step of the same item (its §8 Q11).
 - [ ] **MOD-113 - Prompt library: templates and skills** (from the 2026-10-15 requirements review).
   `R-PRM-4`, `R-SKL-1`, `R-SKL-2`, `R-SKL-4`, `R-TUI-1`, `R-TUI-7`. (1) A **template library**
   shared across projects and workspaces, with per-project overrides, as a **group of the Toolbox
@@ -703,6 +768,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   (ANA-22). (3) Skills carry **resources** (scripts, references, files), and the prompt and session
   learn to deliver them. (4) **Import** whole skill folders and Claude Code plugins, resources
   included. Not blocked.
+  ANA-36 §7.2 adds design input: part (3) delivers resources through a read tool over the bound skills
+  only, outline-first; scripts run through `command_run` (`R-ID-5` amended).
 - [ ] **MOD-114 - TUI: notifications, requirement coverage, attachments, open in editor** (from the
   2026-10-15 requirements review). `R-TUI-11`, `R-ENT-15`, `R-TUI-3`, `R-TUI-5`, `R-ENT-12`,
   `R-ID-2`, `R-TUI-4`. (1) When something starts waiting on the user: a **terminal bell** and an
@@ -713,6 +780,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   sub-tab; who may own one waits on ANA-35. (4) **Open in `$EDITOR` at the line**: an artifact, or a
   file named by a tool call, edit proposal or diff, through MOD-9/MOD-57's editor handoff. Not
   blocked except part (3).
+  ANA-36 §7.2 adds design input: ring on a `note_add` that carries a notify flag; MOD-157 waits on part
+  (3).
 - [ ] **MOD-8 - Legacy markdown import.** `R-LATER-3`. Map old prefixes to kinds per project,
   preserve keys, build links. **Promoted to must by the 2026-10-15 requirements review:** this
   repository is its first user. ANA-9 §7.1 and ANA-11 §6 already cover its design, but it should
@@ -771,6 +840,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   (keep or drop each), shown as "split into ⇢" and "↑ from" rows, its coverage derived from theirs;
   agent proposals and edits as drafts a person accepts. Blocked on MOD-116, and on ANA-35 for
   workspace-owned requirements and their keys.
+  ANA-36 §7.2 adds design input: `requirement_propose` (amends, withdraws) and `draft_update` as the
+  modal chats' tools, validated in the write tool with typed refusals.
 - [ ] **MOD-119 - Backlog redesign: list options, new-item modal, run setup** (from the UI redesign
   review, `docs/ui-redesign-findings-2026-10-15.md` §4.2, §4.2a). `R-TUI-2`, `R-TUI-3`, `R-TUI-17`, `R-ORCH-15`, `R-ORCH-1`. IDE
   proportions (list about 24%); `h` shows or hides done items, `g` cycles grouping (project, kind,
@@ -780,6 +851,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   second status line ("runs on … · workflow …") and `t` "how it runs": target (inherit or one) and
   workflow (auto or pinned). Blocked on MOD-115; targets beyond this box need ANA-42, workflows need
   MOD-124 and MOD-126.
+  ANA-36 §7.2 adds design input: `draft_update` as the new-item modal chat's tool, validated in the write
+  tool.
 - [ ] **MOD-120 - Graphs redesign: item, run and template graphs** (from the UI redesign review,
   `docs/ui-redesign-findings-2026-10-15.md` §5). `R-TUI-4`, `R-TUI-5`, `R-TUI-7`, `R-TUI-14`. All graphs on rataflow: zoom 1
   centred on what matters, keyboard and mouse pan and zoom, dotted background, nodes movable by drag
@@ -798,6 +871,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   The htui agent itself: settings, Toolbox entries, agent rows, targets and the catalogue, acting
   without asking only on reads, catalogue updates and Toolbox additions. Overlaps MOD-103 (chat per
   session): settle together. Blocked on MOD-115; the coordinator groups are blocked on MOD-136 (from ANA-34).
+  ANA-36 §7.2 adds design input: name the htui agent's tool surface; a secret is entered through a TUI
+  form, never passed as a tool argument.
 - [ ] **MOD-122 - Activity panel and Logs tab** (from the UI redesign review, `docs/ui-redesign-findings-2026-10-15.md` §4.4,
   §4.7). `R-TUI-15`, `R-TUI-16`. The activity panel (newest first, needs-you pinned with a count,
   Enter jumps to the source with history, filters: all workspaces, needs you, failures, this
@@ -922,7 +997,7 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 11 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-33 step graphs v2 and divided fan-out, ANA-35 entity model for any project, ANA-36 further MCP tools, ANA-37 Qdrant required?, ANA-38 project memory, ANA-39 mandatory context tools, ANA-41 project workflows, ANA-42 execution targets) |
-| MOD-N   | 58 (MOD-16 Windows verification, MOD-27 swarm, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-115 TUI shell, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
+| ANA-N   | 10 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-33 step graphs v2 and divided fan-out, ANA-35 entity model for any project, ANA-37 Qdrant required?, ANA-38 project memory, ANA-39 mandatory context tools, ANA-41 project workflows, ANA-42 execution targets) |
+| MOD-N   | 65 (MOD-16 Windows verification, MOD-27 swarm, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-151 tool guidance, MOD-152 async commands and logs, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-115 TUI shell, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
 | CLEAN-N | 0 |
 | TOOL-N  | 2 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check) |

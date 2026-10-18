@@ -17,16 +17,16 @@
 > `R-SKL-1` (skill resources), `R-TUI-11` (waiting on you), `R-TUI-17` (talk-it-through draft),
 > `R-AGT-11` (the htui agent).
 >
-> **Status (2026-10-18): draft, awaiting the maintainer's answers to §8.** No implementation code is
-> written here, and no ID is minted. Verdict (§7): of 36 candidate tools, **11 are refuted** by the
+> **Status (2026-10-18): concluded; the maintainer accepted all thirteen §8 answers as recommended.** No
+> implementation code is written here. Verdict (§7): of 36 candidate tools, **11 are refuted** by the
 > skeptic pass and go to §10; **15 are already owned** by an existing item (MOD-112, MOD-75, MOD-27,
 > MOD-135, MOD-136, MOD-118/119, MOD-121, MOD-113, ANA-38, and MOD-140 on the ANA-33 branch), and ANA-36
-> hands each owner its design input instead of re-proposing it; **the 10 unowned survivors** become
-> seven proposed MOD items, P1 to P7: tell agents about the tools, an async command queue with stored
-> logs, structured test results with named command presets, `item_status` as a typed request, link and
-> citation proposals that stay pending until a person accepts them, `document_patch`, and attachment
-> tools. The largest change of principle is in P5: an agent's `blocked_by` link is live today and feeds
-> auto mode's picks, which `R-ID-6` does not allow.
+> hands each owner its design input instead of re-proposing it; **the 10 unowned survivors** become seven
+> MOD items, **MOD-151** (P1) to **MOD-157** (P7): tell agents about the tools, an async command queue
+> with stored logs, structured test results with named command presets, `item_status` as a typed request,
+> link and citation proposals that stay pending until a person accepts them, `document_patch`, and
+> attachment tools. The largest change of principle is in **MOD-155** (P5): an agent's `blocked_by` link
+> is live today and feeds auto mode's picks, which `R-ID-6` does not allow.
 
 ---
 
@@ -47,7 +47,7 @@ An example of the kind of answer this item gives: today an implementer that runs
 `command_run` waits up to 30 minutes for one call, gets back the last 64 KiB of output, and has no way to
 read the rest except running the suite again. In the stored transcripts, agents re-ran a failed
 `cargo test` with no edit in between 978 times, mostly to read the output differently (§4). A
-`command_output_read` tool over a stored log (P2) and a structured result (P3) replace that work; both
+`command_output_read` tool over a stored log (**MOD-152** (P2)) and a structured result (**MOD-153** (P3)) replace that work; both
 are deterministic, so `R-ID-6` has nothing to say about them, and both only read the run's own rows, so
 `R-MCP-1` is met.
 
@@ -79,8 +79,8 @@ not hold.
   136/495 depending on what counts as a human prompt. Some sleeps and re-runs were deliberate (re-checks
   under load), so waste figures are upper bounds.
 - **Cargo wall-clock and token cost were not measured.** No reader computed tool-use to tool-result
-  durations for cargo runs, or cost per pattern. The value ranking of P2 (async commands, stored logs) and
-  P3 (structured results) therefore rests on **call counts only**.
+  durations for cargo runs, or cost per pattern. The value ranking of **MOD-152** (P2) (async commands, stored logs) and
+  **MOD-153** (P3) (structured results) therefore rests on **call counts only**.
 - **Question waits include the maintainer being away.** AskUserQuestion wait times are timestamp
   differences; one deliberate 37-question requirement interview (`93e329d7`) inflates the newer-half total.
 - **The harness survey has gaps.** Cline's source was not readable (names from docs); Amp's names come
@@ -233,9 +233,9 @@ Plain file IO, shell and web tools are left out; every harness has them.
 | New context from a written brief | Codex, Cline, Amp | none | rejected: each step is already a fresh session (§10) |
 | Memory written by the model | Gemini, goose, mem0 | none | only Devin's accepted-suggestion form; ANA-38 |
 | Search over past sessions | Amp, goose, Devin | none | MOD-112 (4), plus a same-item transcript tail (§8 Q11) |
-| CI-shaped log reads and structured failures | Buildkite, GitHub | a 64 KiB tail | P2, P3 |
+| CI-shaped log reads and structured failures | Buildkite, GitHub | a 64 KiB tail | **MOD-152** (P2), **MOD-153** (P3) |
 | Tool groups and read-only switches | GitHub, Sentry, Atlassian, Taskmaster | per-session predicates | kept: the advertised predicate per role (§7.4) |
-| Model choices marked as suggestions, content marked by author | GitHub intent flag, lockdown mode; Devin | none | author marks on every read (§7.4), pending links (P5) |
+| Model choices marked as suggestions, content marked by author | GitHub intent flag, lockdown mode; Devin | none | author marks on every read (§7.4), pending links (**MOD-155** (P5)) |
 
 ## 4. Transcript evidence
 
@@ -269,11 +269,11 @@ directory. Every row below was re-opened for this doc.
 
 | Session | Lines | What happened | What it argues for |
 |---|---|---|---|
-| `d901debf-e2b6-4a7b-9d0a-fd9c4711a041` | L96, L169-L520 | The parent waited on Workflow implementers with `sleep 240`…`sleep 595; git log --oneline -5`, 42 polls, about 6.6 h | a wait with a deadline (P2's `command_wait`; MOD-27's consult answer is a tool result) |
-| `15230992-43d0-4411-b199-abbae1d61fcd/subagents/workflows/wf_37948082-f02/agent-a5fd239f324e9f274.jsonl` | L310-L311, L359-L365 | `sleep 600; cat …output` hit the 10-minute Bash timeout (exit 143); a later `sleep 590` waited on a clippy gate whose output says it finished in 1m 18s | P2 |
-| `1cda6355-5bca-49bd-a158-047f3e0fdc85` | L209-L213 | `cargo test --workspace … ; grep -E '^test result\|FAILED\|panicked\|SIGABRT'` was blocked, and the whole suite was restarted without the grep | P2's stored log, P3 (the block itself is the dev hook) |
-| `d478a7a8-b1c1-48be-b214-5535e253f10d` | L1160-L1266 | `cargo test -p htui --test skills` re-run about 6 times to see one failure at a time | P2, P3 |
-| `4e526f51-a3be-4706-85df-dd1fd8c083e3` | L571-L821 | the workspace suite ran at least 4 times under `timeout 5400`, above `command_run`'s 1800 s cap, to read totals | P3's per-preset timeout |
+| `d901debf-e2b6-4a7b-9d0a-fd9c4711a041` | L96, L169-L520 | The parent waited on Workflow implementers with `sleep 240`…`sleep 595; git log --oneline -5`, 42 polls, about 6.6 h | a wait with a deadline (**MOD-152** (P2)'s `command_wait`; MOD-27's consult answer is a tool result) |
+| `15230992-43d0-4411-b199-abbae1d61fcd/subagents/workflows/wf_37948082-f02/agent-a5fd239f324e9f274.jsonl` | L310-L311, L359-L365 | `sleep 600; cat …output` hit the 10-minute Bash timeout (exit 143); a later `sleep 590` waited on a clippy gate whose output says it finished in 1m 18s | **MOD-152** (P2) |
+| `1cda6355-5bca-49bd-a158-047f3e0fdc85` | L209-L213 | `cargo test --workspace … ; grep -E '^test result\|FAILED\|panicked\|SIGABRT'` was blocked, and the whole suite was restarted without the grep | **MOD-152** (P2)'s stored log, **MOD-153** (P3) (the block itself is the dev hook) |
+| `d478a7a8-b1c1-48be-b214-5535e253f10d` | L1160-L1266 | `cargo test -p htui --test skills` re-run about 6 times to see one failure at a time | **MOD-152** (P2), **MOD-153** (P3) |
+| `4e526f51-a3be-4706-85df-dd1fd8c083e3` | L571-L821 | the workspace suite ran at least 4 times under `timeout 5400`, above `command_run`'s 1800 s cap, to read totals | **MOD-153** (P3)'s per-preset timeout |
 | `c6da34db-a6cc-452d-83f0-d6636d98965d` | L735-L736 | a close-out question asked at 20:12 was answered at 08:51 the next day (759 min), the session held open | MOD-75 (a park that can release the session) |
 | `7878cab7-9459-4f24-8104-5187bcc20bd0` | L458-L459 | "Which [review findings] do you want fixed in M1" waited from 17:19 to 00:13 | MOD-75 |
 | `167509c2-9ac6-4a5f-ad64-895049b68867`, `d48064b5-9310-4c64-874a-204546d30f91` | L751; L364-L400 | two sessions drove MOD-32 in one worktree; each "corrected" the other's record of the maintainer's CONFIRM time in prose | MOD-75's stored answer and timestamp |
@@ -282,7 +282,7 @@ directory. Every row below was re-opened for this doc.
 | `973a13d4-1784-411f-87e7-8fe073f3539f` | L221-L236 | placeholder item IDs remapped to minted IDs with a hand-written python script | `item_create` drafts (MOD-112 (3)); store-minted keys already exist (`R-ENT-7`) |
 | `a5db7a19-7fab-485b-81e5-19ca6a43f14f` | L497-L511 | an agent amended `R-AGT-8` in `REQUIREMENTS.md` with two direct Edits | `requirement_propose` as a draft (MOD-118, MOD-136) |
 | `64060544-c952-42c1-9cc3-10bebb4cd4fe` | L701-L704 | a parent scraped a Workflow `journal.jsonl` with ad-hoc python, the first attempt printing nothing | evidence about Claude's Workflow harness, not htui (skeptic) |
-| `7bc58ece-43ad-409d-927b-89f9ffa8b422` | L776-L1004 | the DSN for the Postgres gate hit the auto-mode classifier, then a docker-inspect script, a classifier outage, a placeholder host and a stray `.sqlx` | named presets (P3); the credential part is met by `R-SEC-2` (skeptic) |
+| `7bc58ece-43ad-409d-927b-89f9ffa8b422` | L776-L1004 | the DSN for the Postgres gate hit the auto-mode classifier, then a docker-inspect script, a classifier outage, a placeholder host and a stray `.sqlx` | named presets (**MOD-153** (P3)); the credential part is met by `R-SEC-2` (skeptic) |
 | `200cbe8d-01a4-4023-be7b-508f23c692fb` | L76 | `cat .claude/skills/handoff-run/references/routing.md`: a skill reference read on demand | `skill_resource_read` (MOD-113 (3)), gated on `R-ID-5` (§8 Q10) |
 
 ### 4.3 What the transcripts do not show
@@ -300,7 +300,7 @@ refutation), **holds, corrected** (corrections applied in the row), or **refuted
 
 | # | Name | What | Problem replaced (evidence) | Kind | `R-MCP-1` scope | `R-ID-6` line | Owner | Value / cost | Skeptic verdict |
 |---|---|---|---|---|---|---|---|---|---|
-| 1 | `item_read` / `item_query` | one item: fields, notes marked by author, links both ways with each target's status, documents by kind, runs and steps; a list variant by status, prefix, tag or link | search hits cannot be opened (`search.rs:85-107`); HANDOFF greps (496 calls in 103 older sessions); `0cdc82e8`, `dba80770` | read | active workspace; out-of-workspace upstream items as one-line stubs (`R-PRM-2`) | deterministic read; author marks; other runs' drafts never returned | MOD-112 (1) | high for chats and coordinators, medium for phase steps / small (lift `ReadStore::items`, `links`) | holds, corrected: phase prompts already carry the item (`R-PRM-1`); "proposed" links need P5 first |
+| 1 | `item_read` / `item_query` | one item: fields, notes marked by author, links both ways with each target's status, documents by kind, runs and steps; a list variant by status, prefix, tag or link | search hits cannot be opened (`search.rs:85-107`); HANDOFF greps (496 calls in 103 older sessions); `0cdc82e8`, `dba80770` | read | active workspace; out-of-workspace upstream items as one-line stubs (`R-PRM-2`) | deterministic read; author marks; other runs' drafts never returned | MOD-112 (1) | high for chats and coordinators, medium for phase steps / small (lift `ReadStore::items`, `links`) | holds, corrected: phase prompts already carry the item (`R-PRM-1`); "proposed" links need **MOD-155** (P5) first |
 | 2 | `document_read` | a document by item and kind or id; outline first, then one section by heading or anchor | `R-PRM-3` trims inputs with no way back; offset paging of design docs (`d901debf` subagent L21-L45) | read | active workspace | deterministic | MOD-112 (1) | high where inputs are trimmed / small | holds: the read exists (`worker.rs:145-158`); trim is the real driver |
 | 3 | `requirement_read` | requirements by id or prefix with text, state, version and citing items | per-id `git grep` loops (`d41b8799` subagent ~L46); no requirement read on `WorkerStore` | read | project requirements until ANA-35's `W-` keys | deterministic | MOD-112 (1) | high / small | holds, corrected: citation kinds are five (`requirement.rs:33-43`, `R-ENT-15`) |
 | 4 | `search_concepts` widening | workspace scope, notes and scrubbed transcripts; every hit openable | project-only search (`tools/search.rs:101-108`) | read | workspace index | deterministic; fails open (`R-NF-2`) | MOD-112 (2), (4); ANA-37 | medium / medium | holds, corrected: the worker offers search when its keyring holds the URL (`worker_cmd.rs:102-105`) |
@@ -311,30 +311,30 @@ refutation), **holds, corrected** (corrections applied in the row), or **refuted
 | 9 | coordinator tools | read runs and waiting rows below; drafts; resolution and re-confirm proposals; enqueue or link through a permission card | ANA-34 §7.1 | draft | item-less scope | agent drafts, code disposes | MOD-136 | high / large | holds |
 | 10 | close-out proposal | resolution, follow-ups, requirement changes in one proposal | close-out python surgery (`595a3f27` L254-L330) | draft | the run's item | draft | — | low | **refuted**: a composite of #13, #5 and #15 feeding MOD-135 |
 | 11 | memory / knowledge suggestion | propose a durable fact as a draft | 96 re-reads of memory files to relay gotchas (newer `mem.py`) | draft | run-owned draft, project or workspace entry | a draft a person accepts before any prompt reads it | ANA-38 | medium at most / medium | holds, corrected: phase-bound skills already deliver standing gotchas |
-| 12 | `item_link` as a draft | scheduling kinds pending until accepted; `R-ENT-9`'s kinds; workspace targets | a live `blocked_by` changes auto-mode picks (`pg/write.rs:7137-7146`, `pg/read.rs:2097-2100`) | draft | `from` the run's item; `to` in the workspace | pending for `blocked_by`, `supersedes`, `duplicates` (and `parent`, §8 Q2) | unowned → **P5**; kinds ANA-35 | high / medium | holds, corrected: reverses MOD-11 OQ-4 (`mod-11.md:156`), needs the maintainer |
-| 13 | `item_status` as a typed request | a typed request row (open/blocked/closed + resolution + reason) on waiting-on-you and the close-out checklist | requests surface only as the latest note (`pg/read.rs:2357-2362`); eight statuses vs `R-ENT-8`'s three | draft | the run's item | a request a person accepts; never moves status (I-4) | unowned → **P4** | medium / small | holds, corrected: "unseen" overstated; absorbs #10 |
-| 14 | `requirement_cite` | propose an `addresses`, `reserves` or `verifies` citation; withdraw only the run's own | deferred by MOD-11 OQ-7 (`mod-11.md:159`); no fenced path (`traits.rs:1775-1789`) | draft | from the run's item; target readable under `R-MCP-1` | pending until accepted, because coverage reads citations | unowned → **P5** | medium / small | holds, corrected: kinds; never overwrite a person's proposer (`cite` does on revive) |
+| 12 | `item_link` as a draft | scheduling kinds pending until accepted; `R-ENT-9`'s kinds; workspace targets | a live `blocked_by` changes auto-mode picks (`pg/write.rs:7137-7146`, `pg/read.rs:2097-2100`) | draft | `from` the run's item; `to` in the workspace | pending for `blocked_by`, `supersedes`, `duplicates` (and `parent`, §8 Q2) | unowned → **MOD-155** (P5); kinds ANA-35 | high / medium | holds, corrected: reverses MOD-11 OQ-4 (`mod-11.md:156`), needs the maintainer |
+| 13 | `item_status` as a typed request | a typed request row (open/blocked/closed + resolution + reason) on waiting-on-you and the close-out checklist | requests surface only as the latest note (`pg/read.rs:2357-2362`); eight statuses vs `R-ENT-8`'s three | draft | the run's item | a request a person accepts; never moves status (I-4) | unowned → **MOD-154** (P4) | medium / small | holds, corrected: "unseen" overstated; absorbs #10 |
+| 14 | `requirement_cite` | propose an `addresses`, `reserves` or `verifies` citation; withdraw only the run's own | deferred by MOD-11 OQ-7 (`mod-11.md:159`); no fenced path (`traits.rs:1775-1789`) | draft | from the run's item; target readable under `R-MCP-1` | pending until accepted, because coverage reads citations | unowned → **MOD-155** (P5) | medium / small | holds, corrected: kinds; never overwrite a person's proposer (`cite` does on revive) |
 | 15 | `requirement_propose` | a step agent drafts a requirement change or split | direct Edits of `R-AGT-8` (`a5db7a19` L497-L511) | draft | run-owned draft | a draft; `amend_requirement` stays forbidden | MOD-118 (step agents), MOD-136 (coordinator); store MOD-135 | medium / medium | holds, corrected: owned, name the tool there |
 | 16 | `draft_update` | the talk-it-through agent edits the live draft in the `R-TUI-17` modal | `R-TUI-17` names no tool | draft | the modal's unsaved draft | a draft a person accepts | MOD-119 (items), MOD-118 (requirements) | medium / small | holds, corrected: owned, not unowned |
 | 17 | htui agent tools | read and change settings, Toolbox, agent rows, targets, catalogue | `R-AGT-11` names no tool surface | action | the global htui agent chat | additions deterministic; secrets and targets person-gated | MOD-121 | medium / large | holds, corrected: secrets through an entry form, never as an argument (`R-SEC-2`) |
-| 18 | `command_start` / `command_wait` / `command_cancel` | an async split of `command_run` over the same queue rows | sleep polling (about 25 h newer half; `15230992` subagent L310-L365); 30-minute blocking calls and client timeouts (`docs/htui-mcp.md:323-327`) | action | the step's own queue rows | deterministic | unowned → **P2** | high where `command_run` is exposed (fan-out by default) / medium | holds, corrected: one call *in flight* per session, not one per session |
-| 19 | `command_output_read` | tail, range or regex with context over a stored scrubbed log of a run's command | 978 no-edit re-runs; `/tmp` log greps | read | command rows of the caller's run | deterministic; the stored log is scrubbed fail-closed | unowned → **P2** | medium / medium | holds: only the tail is stored today (`command.rs:355-377`), so a log artifact is new |
-| 20 | structured test results | per-target counts, failing tests with excerpts, crash signals, pending snapshots; `rerun_failed`; the run's verify result read-only | 8,766 test runs, 91% filtered by hand; suites re-run 4-6 times (`d478a7a8`, `4e526f51`) | action | the run's worktree and queue | deterministic parsing | unowned → **P3** | medium / medium | holds, corrected: pluggable parsers keyed on recognised runners (nextest, JUnit), fallback to #19 |
-| 21 | `gate_run` | named project gates with secrets injected into the child only | DSN classifier walls (`7bc58ece`) | action | the run's worktree | — | — | low as a tool | **refuted**: `R-SEC-2` already resolves secrets into the agent env; remainder folded into P3 as presets |
-| 22 | `command_run` in `extra_dirs` | a `repo` argument resolving to the session's extra repos | `directory()` joins only under `scope.cwd` (`command.rs:330-353`) | action | repos the engine passed to the session | deterministic | unowned → **P2** | medium / small | holds: `ToolScope` needs `extra_dirs` |
-| 23 | `session_info` | the session's own scope, offered tools and why, attempt, base commit | no `instructions`; the prompt names two tools | read | the calling session | deterministic | unowned → folded into **P1** | medium / small | holds, corrected: the cheap part is `initialize.instructions`; attempt and base commit belong in the prompt |
+| 18 | `command_start` / `command_wait` / `command_cancel` | an async split of `command_run` over the same queue rows | sleep polling (about 25 h newer half; `15230992` subagent L310-L365); 30-minute blocking calls and client timeouts (`docs/htui-mcp.md:323-327`) | action | the step's own queue rows | deterministic | unowned → **MOD-152** (P2) | high where `command_run` is exposed (fan-out by default) / medium | holds, corrected: one call *in flight* per session, not one per session |
+| 19 | `command_output_read` | tail, range or regex with context over a stored scrubbed log of a run's command | 978 no-edit re-runs; `/tmp` log greps | read | command rows of the caller's run | deterministic; the stored log is scrubbed fail-closed | unowned → **MOD-152** (P2) | medium / medium | holds: only the tail is stored today (`command.rs:355-377`), so a log artifact is new |
+| 20 | structured test results | per-target counts, failing tests with excerpts, crash signals, pending snapshots; `rerun_failed`; the run's verify result read-only | 8,766 test runs, 91% filtered by hand; suites re-run 4-6 times (`d478a7a8`, `4e526f51`) | action | the run's worktree and queue | deterministic parsing | unowned → **MOD-153** (P3) | medium / medium | holds, corrected: pluggable parsers keyed on recognised runners (nextest, JUnit), fallback to #19 |
+| 21 | `gate_run` | named project gates with secrets injected into the child only | DSN classifier walls (`7bc58ece`) | action | the run's worktree | — | — | low as a tool | **refuted**: `R-SEC-2` already resolves secrets into the agent env; remainder folded into **MOD-153** (P3) as presets |
+| 22 | `command_run` in `extra_dirs` | a `repo` argument resolving to the session's extra repos | `directory()` joins only under `scope.cwd` (`command.rs:330-353`) | action | repos the engine passed to the session | deterministic | unowned → **MOD-152** (P2) | medium / small | holds: `ToolScope` needs `extra_dirs` |
+| 23 | `session_info` | the session's own scope, offered tools and why, attempt, base commit | no `instructions`; the prompt names two tools | read | the calling session | deterministic | unowned → folded into **MOD-151** (P1) | medium / small | holds, corrected: the cheap part is `initialize.instructions`; attempt and base commit belong in the prompt |
 | 24 | `run_history_read` | an item's runs, steps, outcomes, commits; a scrubbed tail of a named step of the same item | MOD-4 state from git log (`dba80770`) | read | beyond the run; transcript tails only for the same item | deterministic; past model text marked as a step's output | MOD-112 (1) for the listing; the tail is unowned (§8 Q11) | medium / small | holds, corrected: fold the listing into #1 |
 | 25 | `run_steps_read` | the run's step graph and sibling results | journal scraping (`64060544`) | read | the caller's run | deterministic | — | low | **refuted**: prior steps reach later ones as inputs; planner and integrate views are MOD-140's `plan_status` |
 | 26 | `sibling_runs` | other live runs, files touched, leases | `ps aux \| grep rustc` contention checks (`96d6ff3d`) | read | beyond the run | deterministic | — | low | **refuted**: the queue's class limits do this; coordinator reads are MOD-136's |
 | 27 | `step_result` | a typed handback with an outcome claim and findings | StructuredOutput failures in Workflow subagents (`cf9ef78a`) | write | the caller's step | an outcome claim nothing may read | — | low | **refuted**: `document_write` is the work product; at most a per-phase schema on it |
-| 28 | `document_patch` | anchored section edits to the step's own output document, one version per call | 58 runs of 5+ Edits on one doc; output tokens on large bodies | write | the step's output document | item work product | unowned → **P6** | low to medium / small | holds, corrected: anchors can still miss; the saving is output tokens |
+| 28 | `document_patch` | anchored section edits to the step's own output document, one version per call | 58 runs of 5+ Edits on one doc; output tokens on large bodies | write | the step's output document | item work product | unowned → **MOD-156** (P6) | low to medium / small | holds, corrected: anchors can still miss; the saving is output tokens |
 | 29 | `notify_user` | a non-blocking message to the person | none in transcripts | write | the owning step | display-only | — | low | **refuted**: `note_add` with a notify flag MOD-114 rings on |
 | 30 | `resource_lease` | lease a named shared resource with a TTL | `flock /tmp/modNN-pg.lock` wrappers (`be428bb6`) | action | the run | deterministic | — | low | **refuted**: a project-defined command class with limit 1 (MOD-109) |
 | 31 | `box_profile` health | live disk, processes, Postgres reachability | 1,517 `df -h` calls | read | the session's box | deterministic | — | low or none | **refuted**: the shell has these; it would break the prompt-and-tool agreement |
 | 32 | `handoff_draft` | a continuation brief a person accepts | one session-limit event (`4ade4808` subagent) | draft | the run | draft | — | low | **refuted**: each step is a fresh session; continuation is MOD-140 `successors` or MOD-111 (3) |
 | 33 | `sibling_message` | a message to another live step of the run | none | action | live steps of the run | not an `R-ID-6` breach | — | low / large | **refuted**: breaks `R-PRM-1`'s self-contained prompt; needs a live channel; injection vector |
 | 34 | `skill_resource_read` | list and read a bound skill's resources, outline first | 362 tool-use lines reading `handoff-run/references` (`200cbe8d` L76; critic `skill.py`) | read | skills bound to this step only | deterministic, person-authored content | MOD-113 (3), gated on `R-ID-5` | low to medium / small | holds, corrected: the demand is this repo's workflow skill; conflicts with `R-ID-5` |
-| 35 | `attachment_read` / `attachment_add` | read an item's or document's attachment; attach a log or file from the run | `R-ENT-12` attachments; no transcript demand | read / write | read: workspace; add: the run's item or document | add is a work product; images cannot be text-scrubbed | unowned → **P7**; storage MOD-114 (3), schema ANA-35 | low / medium | holds: sequence after MOD-114 (3) |
+| 35 | `attachment_read` / `attachment_add` | read an item's or document's attachment; attach a log or file from the run | `R-ENT-12` attachments; no transcript demand | read / write | read: workspace; add: the run's item or document | add is a work product; images cannot be text-scrubbed | unowned → **MOD-157** (P7); storage MOD-114 (3), schema ANA-35 | low / medium | holds: sequence after MOD-114 (3) |
 | 36 | `definition_validate` | validate a draft persona, graph, template or skill without saving | none | read | workspace lookups | deterministic | — | low | **refuted**: validate inside the MOD-121 and `draft_update` write tools, as `plan_submit` does |
 
 ## 6. Options and trade-offs
@@ -358,7 +358,7 @@ optional pattern, so no call outlives the client's timeout and no agent sleeps b
 **6.3 Reading output.** A, raise the stored tail; B, store a scrubbed, capped log artifact per command
 row and read it by tail, range or regex; C, parse everything into structure. A still truncates. C alone
 fails on runners htui does not parse (htui serves any project type; R-MCP-4's prefixes include cmake,
-ctest, dotnet, npm, go). **B first (P2), C on top as pluggable parsers with B as the fallback (P3).**
+ctest, dotnet, npm, go). **B first (MOD-152 (P2)), C on top as pluggable parsers with B as the fallback (MOD-153 (P3)).**
 
 **6.4 Named gates.** A, a `gate_run` tool; B, a `preset` argument on `command_run` / `command_start` that
 resolves to a project-configured command line, working directory and timeout. The skeptic refuted A: the
@@ -405,9 +405,9 @@ These are not re-proposed. Each owner gets the input on the right when ANA-36 co
 | MOD-112 (`HANDOFF.md:689-696`) | #1, #2, #3, #4, #5, listing half of #24 | `item_read` returns links in both directions with each target's status, notes marked by author (`Note.via_step_id`), documents by kind, and the item's runs and steps with outcomes and commits; `item_query` wraps `ReadStore::items`; out-of-workspace upstream items return as one-line stubs (`R-PRM-2`); `document_read` is outline-first and section-addressed, never by line offset, byte-capped with a cursor; `requirement_read` returns all five citation kinds; `ToolScope` gains a workspace (coordinate with MOD-136's item-less scope); `item_create` drafts carry a stable draft id that documents reference, and htui resolves it on display instead of rewriting bodies. Same-item step transcript tail: §8 Q11. |
 | MOD-75 (`HANDOFF.md:491-501`) | #6 | the converged shape: 1-3 questions, each with an id, a short header, 2-3 options with the recommended one first, and free text; accept / decline / cancel outcomes; htui stores the answer and its time against the step, and later records cite that row, not model prose; no question tool in consult children; never auto-resolves on timeout; the part-versus-run park question from `origin/hr/ANA-33:HANDOFF.md:476-478`. Builds the tool-to-engine channel (§8 Q8). |
 | MOD-140 (`origin/hr/ANA-33:HANDOFF.md:875-883`) | #7 | none beyond cross-reference; ANA-33 §7.6 hands the wider survey to ANA-36 and MOD-112 (`origin/hr/ANA-33:docs/ANA-33.md:616-618`). Note from the critic: changes a part makes outside its owned paths are "shown to integrate and review" (`:604-606`), but `plan_status` is advertised to planner and integrate only (`:584`); the review role needs the facts in its prompt or `plan_status`. |
-| MOD-27 (`origin/hr/ANA-33:HANDOFF.md:213-218`) | #8 | the consult answer is a blocking tool result, so no wait / list / message tools; cancel is MCP request cancellation (`protocol.rs:336-347`); the residual issue is the client timeout on a long consult: if consult goes async, reuse P2's start/wait shape rather than a second lifecycle family; reuse MOD-75's tool-to-engine channel; Claude SDK-style caps on depth, concurrency and budget against `max_agents_per_run`. A second-opinion "oracle" is a consult, not its own tool. |
-| MOD-136 (`HANDOFF.md:431-438`) | #9 | share the read code with MOD-112's `item_read` and run listing; coordinator link requests go through P5's pending state, not a live write. |
-| MOD-135 (`HANDOFF.md:424-430`) | store for #5, #15; consumer of #13 | P4's typed status request is the checklist's "proposed resolution" input; follow-ups come from `item_create` drafts. |
+| MOD-27 (`origin/hr/ANA-33:HANDOFF.md:213-218`) | #8 | the consult answer is a blocking tool result, so no wait / list / message tools; cancel is MCP request cancellation (`protocol.rs:336-347`); the residual issue is the client timeout on a long consult: if consult goes async, reuse **MOD-152** (P2)'s start/wait shape rather than a second lifecycle family; reuse MOD-75's tool-to-engine channel; Claude SDK-style caps on depth, concurrency and budget against `max_agents_per_run`. A second-opinion "oracle" is a consult, not its own tool. |
+| MOD-136 (`HANDOFF.md:431-438`) | #9 | share the read code with MOD-112's `item_read` and run listing; coordinator link requests go through **MOD-155** (P5)'s pending state, not a live write. |
+| MOD-135 (`HANDOFF.md:424-430`) | store for #5, #15; consumer of #13 | **MOD-154** (P4)'s typed status request is the checklist's "proposed resolution" input; follow-ups come from `item_create` drafts. |
 | MOD-118, MOD-119 (`HANDOFF.md:765-782`) | #15, #16 | name `requirement_propose` (MOD-118, step agents; amends and withdraws travel here, not through `requirement_cite`) and `draft_update` (MOD-119 items, MOD-118 requirements) as the modal chats' tools; validate inside the write tool and answer typed refusals, as `plan_submit` does (absorbs #36). |
 | MOD-121 (`HANDOFF.md:793-800`) | #17 | name the htui agent's tool surface; a secret is entered through a TUI form the tool opens, never passed as an argument (`R-SEC-2`); validation inside the write tools (absorbs #36). |
 | ANA-38 (`HANDOFF.md:149-157`) | #11 | only the accepted-suggestion shape (Devin's), never a direct write into future context; part of the demand is met by phase-bound skills. |
@@ -416,23 +416,26 @@ These are not re-proposed. Each owner gets the input on the right when ANA-36 co
 
 ### 7.3 Proposed new items
 
-Seven items for the unowned survivors, ordered by dependency. Titles and scope only; **no ID is minted**.
+Seven items for the unowned survivors, ordered by dependency. Filed 2026-10-18 as P1 → MOD-151,
+P2 → MOD-152, P3 → MOD-153, P4 → MOD-154, P5 → MOD-155, P6 → MOD-156, P7 → MOD-157.
 
-| P | Title | Scope | Depends on | Requirements |
+| Item | Title | Scope | Depends on | Requirements |
 |---|---|---|---|---|
-| P1 | Tell agents about htui's tools | `initialize.instructions` naming each advertised tool and when to use it; a prompt section built from the same table (replaces `session_info`, #23); the prompt names the `R-PRM-3` trim record; reword `COMMAND_QUEUE_TEXT` so it no longer says "verification" (the tool refuses `verify`), accepting the digest change; results gain `structuredContent` with an `outputSchema`, typed stable refusals that are not `isError` (ANA-33's `plan_submit` style), and `readOnlyHint` annotations on reads. | none (MOD-11 done); coordinate with MOD-112 so its tools are described the same way | R-MCP-2, R-MCP-4, R-PRM-1, R-PRM-3 |
-| P2 | Async command queue and stored command logs | `command_start` / `command_wait` (absolute deadline, optional line pattern) / `command_cancel` over the existing `command_run` rows, same fence, scrub and class limits, advertised with `command_run` and kept in `ASKING_TOOLS`; a scrubbed, size-capped log artifact per row (cap chosen by the plan; R-ID-7 fail-closed); `command_output_read` (tail, line range, regex with context, byte cap) over the caller's run's rows; a `repo` argument resolving the session's `extra_dirs` by name (#22), with `ToolScope.extra_dirs` set by the engine. `command_run` stays as the blocking form. | none; MOD-109 for limits in Settings (not blocking) | R-MCP-3, R-MCP-4, R-ID-7, R-SEC-3 |
-| P3 | Structured test results and named command presets | Pluggable result parsers keyed on recognised runners (nextest and JUnit XML first), giving per-target counts, failing tests with a capped excerpt, crash signals and pending snapshots, with P2's log read as the fallback; `rerun_failed`; a read-only structured view of the orchestrator's verify result for the run; a `preset` argument resolving to a project-configured command, directory and timeout (above 1800 s where configured), replacing the refuted `gate_run` (#21). | P2; MOD-109 for the preset form | R-MCP-3, R-MCP-4 |
-| P4 | `item_status` as a typed request | A typed status-request row (requested status from `R-ENT-8`'s open/blocked/closed, resolution, reason, step) that a person accepts or rejects; shown as a waiting-on-you row and as MOD-135's proposed resolution; never moves the status (I-4); the enum narrows when ANA-35's migration lands. Absorbs the refuted close-out proposal (#10). | ANA-35 (status enum); MOD-135 (checklist consumer) | R-ENT-8, R-MCP-2, R-ID-6, R-TUI-11 |
-| P5 | Link and citation proposals that wait for a person | `item_link`: a pending state for the kinds §8 Q2 settles, which `ready_items`, `queue_rows` and subgraph sources ignore until accepted; accept and reject on the item's links view and as a waiting row; `R-ENT-9`'s `parent`, `duplicates`, `implements` and workspace targets once ANA-35 adds them. `requirement_cite`: a new fenced `WorkerStore` method proposing `addresses`, `reserves` or `verifies`, pending until accepted, withdrawing only the run's own, never overwriting a person's citation or proposer. | ANA-35 (kinds, `W-` keys); §8 Q2, Q3; the `R-MCP-2` amendment (§9) | R-ENT-9, R-ENT-15, R-ID-6, R-MCP-1, R-MCP-2 |
-| P6 | `document_patch` for the step's output document (wanted later) | Anchored edits (replace a section, upsert a table row, append under a heading) to the latest version of the step's own output document in one call, one new version per call, typed refusal on an anchor miss; advertised with `document_write`. | none | R-MCP-2 |
-| P7 | Attachment tools (wanted later) | `attachment_read` (images as MCP image content, text capped and scrubbed, others as metadata) at workspace read scope; `attachment_add` from the run's worktree or a stored command log to the run's item or output document, under the size cap, text and logs only unless a person confirms (images cannot be text-scrubbed, `R-ID-7`). | MOD-114 (3); ANA-35 (who owns an attachment) | R-ENT-12, R-MCP-1, R-ID-7 |
+| **MOD-151** (P1) | Tell agents about htui's tools | `initialize.instructions` naming each advertised tool and when to use it; a prompt section built from the same table (replaces `session_info`, #23); the prompt names the `R-PRM-3` trim record; reword `COMMAND_QUEUE_TEXT` so it no longer says "verification" (the tool refuses `verify`), accepting the digest change; results gain `structuredContent` with an `outputSchema`, typed stable refusals that are not `isError` (ANA-33's `plan_submit` style), and `readOnlyHint` annotations on reads. | none (MOD-11 done); coordinate with MOD-112 so its tools are described the same way | R-MCP-2, R-MCP-4, R-PRM-1, R-PRM-3 |
+| **MOD-152** (P2) | Async command queue and stored command logs | `command_start` / `command_wait` (absolute deadline, optional line pattern) / `command_cancel` over the existing `command_run` rows, same fence, scrub and class limits, advertised with `command_run` and kept in `ASKING_TOOLS`; a scrubbed, size-capped log artifact per row (cap chosen by the plan; R-ID-7 fail-closed); `command_output_read` (tail, line range, regex with context, byte cap) over the caller's run's rows; a `repo` argument resolving the session's `extra_dirs` by name (#22), with `ToolScope.extra_dirs` set by the engine. `command_run` stays as the blocking form. | none; MOD-109 for limits in Settings (not blocking) | R-MCP-3, R-MCP-4, R-ID-7, R-SEC-3 |
+| **MOD-153** (P3) | Structured test results and named command presets | Pluggable result parsers keyed on recognised runners (nextest and JUnit XML first), giving per-target counts, failing tests with a capped excerpt, crash signals and pending snapshots, with **MOD-152** (P2)'s log read as the fallback; `rerun_failed`; a read-only structured view of the orchestrator's verify result for the run; a `preset` argument resolving to a project-configured command, directory and timeout (above 1800 s where configured), replacing the refuted `gate_run` (#21). | **MOD-152** (P2); MOD-109 for the preset form | R-MCP-3, R-MCP-4 |
+| **MOD-154** (P4) | `item_status` as a typed request | A typed status-request row (requested status from `R-ENT-8`'s open/blocked/closed, resolution, reason, step) that a person accepts or rejects; shown as a waiting-on-you row and as MOD-135's proposed resolution; never moves the status (I-4); the enum narrows when ANA-35's migration lands. Absorbs the refuted close-out proposal (#10). | ANA-35 (status enum); MOD-135 (checklist consumer) | R-ENT-8, R-MCP-2, R-ID-6, R-TUI-11 |
+| **MOD-155** (P5) | Link and citation proposals that wait for a person | `item_link`: a pending state for the kinds §8 Q2 settles, which `ready_items`, `queue_rows` and subgraph sources ignore until accepted; accept and reject on the item's links view and as a waiting row; `R-ENT-9`'s `parent`, `duplicates`, `implements` and workspace targets once ANA-35 adds them. `requirement_cite`: a new fenced `WorkerStore` method proposing `addresses`, `reserves` or `verifies`, pending until accepted, withdrawing only the run's own, never overwriting a person's citation or proposer. | ANA-35 (kinds, `W-` keys); §8 Q2, Q3; the `R-MCP-2` amendment (§9) | R-ENT-9, R-ENT-15, R-ID-6, R-MCP-1, R-MCP-2 |
+| **MOD-156** (P6) | `document_patch` for the step's output document (wanted later) | Anchored edits (replace a section, upsert a table row, append under a heading) to the latest version of the step's own output document in one call, one new version per call, typed refusal on an anchor miss; advertised with `document_write`. | none | R-MCP-2 |
+| **MOD-157** (P7) | Attachment tools (wanted later) | `attachment_read` (images as MCP image content, text capped and scrubbed, others as metadata) at workspace read scope; `attachment_add` from the run's worktree or a stored command log to the run's item or output document, under the size cap, text and logs only unless a person confirms (images cannot be text-scrubbed, `R-ID-7`). | MOD-114 (3); ANA-35 (who owns an attachment) | R-ENT-12, R-MCP-1, R-ID-7 |
 
-**Phasing.** P1 and P2 are not blocked and carry the most value for their cost; P3 follows P2. P4 and P5
-wait on ANA-35 and on §8; P5 also waits on the `R-MCP-2` amendment. P6 and P7 are filed as wanted later.
-Effects on existing items, applied at acceptance: MOD-112, MOD-75, MOD-27 (on its ANA-33 text), MOD-118,
-MOD-119, MOD-121 and MOD-113 gain the design input of §7.2; MOD-109 gains P2 and P3 as consumers of the
-limit and preset forms; MOD-135 gains P4 as its resolution input.
+**Phasing.** **MOD-151** (P1) and **MOD-152** (P2) are not blocked and carry the most value for their
+cost; **MOD-153** (P3) follows **MOD-152** (P2). **MOD-154** (P4) and **MOD-155** (P5) wait on ANA-35 and
+on §8; **MOD-155** (P5) also waits on the `R-MCP-2` amendment. **MOD-156** (P6) and **MOD-157** (P7) are
+filed as wanted later. Effects on existing items, applied at acceptance: MOD-112, MOD-75, MOD-27 (on its
+ANA-33 text), MOD-118, MOD-119, MOD-121 and MOD-113 gain the design input of §7.2; MOD-109 gains
+**MOD-152** (P2) and **MOD-153** (P3) as consumers of the limit and preset forms; MOD-135 gains
+**MOD-154** (P4) as its resolution input.
 
 ### 7.4 Rules every tool follows
 
@@ -447,7 +450,7 @@ Condensed from the catalogue's 17 cross-cutting rules, with the skeptic's correc
    unaccepted drafts are visible only to that run.
 4. **Every write is fenced** through a `WorkerStore` method that takes a `StepFence` (I-3); new writes
    need new fenced methods.
-5. **Everything persisted or returned is scrubbed, failing closed** (I-5, `R-ID-7`), including P2's
+5. **Everything persisted or returned is scrubbed, failing closed** (I-5, `R-ID-7`), including **MOD-152** (P2)'s
    log artifacts. No tool reads a secret (`R-SEC-2`, `CONCEPTS.md:90-91`).
 6. **A tool not advertised does not exist** (I-7); exposure is per role and phase.
 7. **Typed results**: `structuredContent` with an `outputSchema`; refusals typed, stable and not
@@ -468,45 +471,59 @@ Condensed from the catalogue's 17 cross-cutting rules, with the skeptic's correc
 ## 8. Questions for the maintainer
 
 1. **The catalogue verdict (§5, §7.2):** 11 candidates refuted (§10), 15 left with their owners plus the
-   design input of §7.2, 10 unowned survivors grouped into P1 to P7. **Recommended: accept.**
-2. **Agent links (6.5, P5):** an agent's link of a kind a scheduler, status or subgraph reads
+   design input of §7.2, 10 unowned survivors grouped into **MOD-151** (P1) to **MOD-157** (P7). **Recommended: accept.**
+   **Answered 2026-10-18: accepted as recommended.**
+2. **Agent links (6.5, MOD-155 (P5)):** an agent's link of a kind a scheduler, status or subgraph reads
    (`blocked_by`, `supersedes`, `duplicates`, `parent`) is pending until a person accepts it; `relates`,
    `origin` and `implements` stay live as display. This reverses MOD-11 OQ-4 for those kinds and reads
    `R-ENT-9`'s "proposed by agents" together with `R-ID-6`. **Recommended: accept.**
-3. **`requirement_cite` (P5):** add it to `R-MCP-2` as a pending citation of kind `addresses`,
+   **Answered 2026-10-18: accepted as recommended.**
+3. **`requirement_cite` (MOD-155 (P5)):** add it to `R-MCP-2` as a pending citation of kind `addresses`,
    `reserves` or `verifies`; `amends` and `withdraws` mean a text change and travel through
    `requirement_propose` (MOD-118). **Recommended: accept.**
-4. **Status requests (6.6, P4):** `item_status` writes a typed request row a person accepts or rejects,
+   **Answered 2026-10-18: accepted as recommended.**
+4. **Status requests (6.6, MOD-154 (P4)):** `item_status` writes a typed request row a person accepts or rejects,
    shown on waiting-on-you and MOD-135's checklist, and still never moves a status.
    **Recommended: accept.**
-5. **Long commands (6.2, 6.3, P2):** keep `command_run` blocking and add `command_start` /
+   **Answered 2026-10-18: accepted as recommended.**
+5. **Long commands (6.2, 6.3, MOD-152 (P2)):** keep `command_run` blocking and add `command_start` /
    `command_wait` / `command_cancel`, a stored scrubbed log per command row, `command_output_read`, and a
    `repo` argument for `extra_dirs`. **Recommended: accept; the log cap is the plan's.**
-6. **Results and presets (6.4, P3):** pluggable parsers with the log read as fallback, a read-only view
+   **Answered 2026-10-18: accepted as recommended.**
+6. **Results and presets (6.4, MOD-153 (P3)):** pluggable parsers with the log read as fallback, a read-only view
    of the run's verify result, and named presets with their own timeout instead of a `gate_run` tool.
-   **Recommended: accept, after P2.**
-7. **Tool guidance (6.1, P1):** fill `initialize.instructions` and a prompt section naming every
+   **Recommended: accept, after MOD-152 (P2).**
+   **Answered 2026-10-18: accepted as recommended.**
+7. **Tool guidance (6.1, MOD-151 (P1)):** fill `initialize.instructions` and a prompt section naming every
    advertised tool, instead of a `session_info` tool; reword `COMMAND_QUEUE_TEXT` (this changes prompt
    digests). **Recommended: accept.**
+   **Answered 2026-10-18: accepted as recommended.**
 8. **One tool-to-engine channel:** MOD-75 builds it first (it is not blocked), and MOD-27's consult reuses
    it. **Recommended: accept.**
+   **Answered 2026-10-18: accepted as recommended.**
 9. **`R-ID-6` and cross-agent text in reads:** another agent's note returned by `item_read` is item work
    (a work product), not a draft; it comes back marked with its author, and unaccepted drafts are never
    returned to another run. **Recommended: accept, and add the sentence of §9.1 to `R-MCP-1`.**
+   **Answered 2026-10-18: accepted as recommended.**
 10. **Skill resources and `R-ID-5`:** skill text stays inlined; a bound skill's resources (references,
     scripts) may be read on demand through MOD-113's read tool, which needs `R-ID-5` amended (§9.6).
     **Recommended: accept the amendment, scoped to resources of the step's bound skills.**
+    **Answered 2026-10-18: accepted as recommended.**
 11. **Same-item transcript tail:** add "a scrubbed transcript tail of a named step of the same item" to
     MOD-112 part (1) beside the run listing; other items' transcripts stay out (`R-PRM-1`).
     **Recommended: accept.**
-12. **P6 and P7:** file both as wanted later; P7 also waits on MOD-114 (3) and ANA-35.
+    **Answered 2026-10-18: accepted as recommended.**
+12. **MOD-156 (P6) and MOD-157 (P7):** file both as wanted later; **MOD-157** (P7) also waits on MOD-114 (3) and ANA-35.
     **Recommended: accept.**
+    **Answered 2026-10-18: accepted as recommended.**
 13. **Requirement edits (§9).** **Recommended: accept as written, the wording open to the maintainer's
     edits.**
+    **Answered 2026-10-18: accepted as recommended.**
 
 ## 9. Requirement text changes proposed
 
-All maintainer-gated; `docs/REQUIREMENTS.md` is not edited by this item. ANA-34 §10.11's coordinator
+All maintainer-gated; accepted 2026-10-18 (§8 Q13) and applied to `docs/REQUIREMENTS.md` as written,
+in a commit of its own. ANA-34 §10.11's coordinator
 sentence is folded into 9.2 so `R-MCP-2` is amended once.
 
 **9.1 `R-MCP-1`**, add after "workspace items, documents and requirements": "Read results mark the author
@@ -551,11 +568,11 @@ person accepts; amending or withdrawing a requirement is a requirement draft (R-
 
 - **Close-out proposal (#10):** a composite of `item_status` (resolution), `item_create` (follow-ups),
   `requirement_propose` (wording) and MOD-136 (re-confirmations); MOD-135 already makes the checklist
-  deterministic; the evidence is markdown bookkeeping. Folded into P4 and MOD-135.
+  deterministic; the evidence is markdown bookkeeping. Folded into **MOD-154** (P4) and MOD-135.
 - **`gate_run` (#21):** `R-SEC-2` already resolves the test DSN into the agent's environment
   (`engine.rs:6574-6577`); the classifier denials are Claude Code's, which an htui step does not run
   under; injecting secrets "only into the child" does not keep them from agent-written test code. The
-  remainder (presets, directory, timeout) is a `command_run` argument, folded into P3.
+  remainder (presets, directory, timeout) is a `command_run` argument, folded into **MOD-153** (P3).
 - **`run_steps_read` (#25):** finished steps reach later steps as input documents (`R-PRM-1`,
   `resolve_inputs`); concurrent siblings have no results to read; planner and integrate views are
   MOD-140's `plan_status`. The two-sessions-in-one-worktree evidence is a TUI concurrency problem.
@@ -607,7 +624,7 @@ person accepts; amending or withdrawing a requirement is a requirement draft (R-
 - **Merge, push, PR and forge tools:** ANA-34 §7.1 (the agent never holds a forge credential, never
   merges); MOD-134 keeps those credentials out of agent environments.
 - **An agent-run `verify` class:** verify is the orchestrator's gate of record (`command.rs:48-49`);
-  agents read its result (P3).
+  agents read its result (**MOD-153** (P3)).
 - **A consumer MCP server or an out-of-session `command_run` client:** ANA-29; consumers use MOD-92's
   `--json` CLI.
 - **Plan approval that auto-approves on timeout (Jules):** a person must accept.
