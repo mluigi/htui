@@ -1,0 +1,22 @@
+---
+source: crates/htui/src/ui/overlay/leave.rs
+expression: "Bench::new().uncounted().render()"
+---
+
+
+
+
+
+
+
+
+
+
+
+
+                     ╭ Leave htui? ───────────────────────────────────────────╮
+                     │ Leaving closes htui. Work it is running stops with it: │
+                     │   ◐ – working · ⚠ – waiting   Graphics                 │
+                     │                                                        │
+                     │  Enter  leave   Esc  stay                              │
+                     ╰────────────────────────────────────────────────────────╯
