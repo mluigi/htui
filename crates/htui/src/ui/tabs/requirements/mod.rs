@@ -545,15 +545,13 @@ impl RequirementsTab {
                 _ => modal_rest(stack, chord),
             };
         }
-        let outcome = if is_plain(&key) {
-            match &mut self.mode {
-                Mode::NewArea(form) => form.on_key(key),
-                Mode::Requirement(form) => form.on_key(key),
-                Mode::Withdraw(form) => form.on_key(key),
-                Mode::Browse | Mode::Filter { .. } => return Handled::Pass,
-            }
-        } else {
-            FormOutcome::Pass
+        // MOD-115 M2 D7: the requirement form resolves its priority's keys itself, chords too.
+        let outcome = match &mut self.mode {
+            Mode::Requirement(form) => form.on_key(key, ctx.keys()),
+            Mode::NewArea(form) if is_plain(&key) => form.on_key(key),
+            Mode::Withdraw(form) if is_plain(&key) => form.on_key(key),
+            Mode::NewArea(_) | Mode::Withdraw(_) => FormOutcome::Pass,
+            Mode::Browse | Mode::Filter { .. } => return Handled::Pass,
         };
         match outcome {
             FormOutcome::Stay => {}

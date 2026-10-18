@@ -7,8 +7,9 @@
 //! (MOD-39 blueprint F-1). A form answers each key with a [`FormOutcome`]; the tab validates and
 //! sends, so what a form holds never reaches the store but through `StoreRequest`.
 //!
-//! MOD-67 M4: a form sees only plain keys, and only the keys its focused widget uses are the
-//! form's: the field moves and the save are acts the tab resolves on a [`FormOutcome::Pass`].
+//! MOD-67 M4: a form's text fields see only plain keys, and only the keys its focused widget uses
+//! are the form's: the field moves and the save are acts the tab resolves on a
+//! [`FormOutcome::Pass`]. MOD-115 M2 D7: the priority resolves its keys through the keymap.
 
 use htui_core::model::{Priority, ProjectId, RequirementAreaId, RequirementId};
 use ratatui::Frame;
@@ -17,9 +18,11 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
+use crate::keys::translate::FieldEvent;
+use crate::keys::{Act, KeyChord, Keys, is_plain, views};
 use crate::ui::cells;
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 
 /// How many rows `PageUp`/`PageDown` move the body or the rationale.
 const PAGE: u16 = 5;
@@ -300,11 +303,18 @@ impl RequirementForm {
         }
     }
 
-    /// A plain key to the focused field: on the priority `m` is must, `l` later and
-    /// `Space`/`←`/`→` toggle (the choice's value keys, MOD-67 M4 D10); `Enter` on the deciding
-    /// key submits; `Esc` anywhere cancels. A key the field does not use passes: the tab moves the
-    /// focus `Body → Rationale → Priority (→ Deciding)` or saves on it.
-    pub(super) fn on_key(&mut self, key: KeyEvent) -> FormOutcome {
+    /// A key to the focused field (MOD-115 M2 D7). On the priority the key resolves through
+    /// `views::REQUIREMENTS_FORM`, first matching candidate wins: `requirements.priority_must`
+    /// (`m`) is must, `priority_later` (`l`) later, and `choice.prev`/`next`/`toggle` (`h`/`←`,
+    /// `→`, `Space`) toggle; the canonical `Esc` (`field.cancel` after the shell's translation)
+    /// cancels. The text fields take plain keys only (a chord never reaches them, so the
+    /// `TextArea` never sees `ctrl-s`); `Enter` on the deciding key submits and `Esc` anywhere
+    /// cancels. A key the field does not use passes: the tab moves the focus `Body → Rationale →
+    /// Priority (→ Deciding)` or saves on it.
+    pub(super) fn on_key(&mut self, key: KeyEvent, keys: &Keys) -> FormOutcome {
+        if self.focus != FormFocus::Priority && !is_plain(&key) {
+            return FormOutcome::Pass;
+        }
         match self.focus {
             FormFocus::Body | FormFocus::Rationale => {
                 let area = if self.focus == FormFocus::Body {
@@ -321,17 +331,28 @@ impl RequirementForm {
                 }
             }
             FormFocus::Priority => {
-                match key.code {
-                    KeyCode::Char('m') => self.priority = Priority::Must,
-                    KeyCode::Char('l') => self.priority = Priority::Later,
-                    KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right => {
+                let chord = KeyChord::from_event(key);
+                let chosen = keys
+                    .actions(views::REQUIREMENTS_FORM, chord)
+                    .into_iter()
+                    .find_map(|act| match act {
+                        Act::RequirementsPriorityMust => Some(Some(Priority::Must)),
+                        Act::RequirementsPriorityLater => Some(Some(Priority::Later)),
+                        Act::ChoicePrev | Act::ChoiceNext | Act::ChoiceToggle => Some(None),
+                        _ => None,
+                    });
+                match chosen {
+                    Some(Some(priority)) => self.priority = priority,
+                    Some(None) => {
                         self.priority = match self.priority {
                             Priority::Must => Priority::Later,
                             Priority::Later => Priority::Must,
                         };
                     }
-                    KeyCode::Esc => return FormOutcome::Cancel,
-                    _ => return FormOutcome::Pass,
+                    None if FieldEvent::of(&key) == Some(FieldEvent::Cancel) => {
+                        return FormOutcome::Cancel;
+                    }
+                    None => return FormOutcome::Pass,
                 }
                 FormOutcome::Stay
             }
@@ -585,8 +606,117 @@ fn field_line(
 
 #[cfg(test)]
 mod tests {
-    use super::body_lines;
+    use htui_core::model::{Priority, ProjectId, RequirementAreaId};
+
+    use super::{FormFocus, FormOutcome, RequirementForm, body_lines};
+    use crate::keys::{Act, KeyChord, Keys, load_str, views};
     use crate::ui::Theme;
+
+    fn on_priority(priority: Priority) -> RequirementForm {
+        let mut form = RequirementForm::mint(
+            ProjectId::new(),
+            RequirementAreaId::new(),
+            "AREA".to_owned(),
+        );
+        form.priority = priority;
+        form.focus = FormFocus::Priority;
+        form
+    }
+
+    fn press(form: &mut RequirementForm, spec: &str, keys: &Keys) -> FormOutcome {
+        let key = KeyChord::parse_strict(spec)
+            .expect("a valid spec")
+            .to_event();
+        form.on_key(key, keys)
+    }
+
+    /// MOD-115 M2 D7 (T0 verify): every chord the `?` box lists for the priority's rows acts on
+    /// the priority, so the help line and the behaviour agree.
+    #[test]
+    fn every_listed_priority_chord_acts() {
+        let keys = Keys::compiled();
+        let labelled = |act| -> Vec<String> {
+            let mut specs = Vec::new();
+            for label in keys.labels(views::REQUIREMENTS_FORM, act) {
+                let chord = keys
+                    .chords(act.spec().expect("a row").context, act)
+                    .iter()
+                    .find(|chord| chord.label() == label)
+                    .expect("the label is a chord of the row");
+                specs.push(chord.spec());
+            }
+            specs
+        };
+        assert_eq!(labelled(Act::RequirementsPriorityMust), ["m"]);
+        assert_eq!(labelled(Act::RequirementsPriorityLater), ["l"]);
+        for spec in labelled(Act::RequirementsPriorityMust) {
+            let mut form = on_priority(Priority::Later);
+            assert_eq!(press(&mut form, &spec, keys), FormOutcome::Stay, "{spec}");
+            assert_eq!(form.priority, Priority::Must, "{spec}");
+        }
+        for spec in labelled(Act::RequirementsPriorityLater) {
+            let mut form = on_priority(Priority::Must);
+            assert_eq!(press(&mut form, &spec, keys), FormOutcome::Stay, "{spec}");
+            assert_eq!(form.priority, Priority::Later, "{spec}");
+        }
+        for act in [Act::ChoicePrev, Act::ChoiceNext, Act::ChoiceToggle] {
+            for spec in labelled(act) {
+                if keys
+                    .actions(
+                        views::REQUIREMENTS_FORM,
+                        KeyChord::parse_strict(&spec).expect("a valid spec"),
+                    )
+                    .first()
+                    == Some(&Act::RequirementsPriorityLater)
+                {
+                    continue; // `l` sets later, as the box says first
+                }
+                let mut form = on_priority(Priority::Must);
+                assert_eq!(press(&mut form, &spec, keys), FormOutcome::Stay, "{spec}");
+                assert_eq!(form.priority, Priority::Later, "{act:?} {spec}");
+            }
+        }
+        let mut form = on_priority(Priority::Must);
+        assert_eq!(press(&mut form, "esc", keys), FormOutcome::Cancel);
+        assert_eq!(press(&mut form, "x", keys), FormOutcome::Pass);
+        assert_eq!(press(&mut form, "ctrl-s", keys), FormOutcome::Pass);
+    }
+
+    /// MOD-115 M2 D7: a rebound priority key works, and the old letter no longer does.
+    #[test]
+    fn a_rebound_priority_key_works_and_the_old_one_does_not() {
+        let keys = load_str(
+            "version = 2\n[requirements]\npriority_must = \"M\"\npriority_later = \"alt-l\"\n\
+             [choice]\ntoggle = \"t\"\n",
+        )
+        .expect("the file loads");
+        let mut form = on_priority(Priority::Later);
+        assert_eq!(press(&mut form, "m", &keys), FormOutcome::Pass);
+        assert_eq!(form.priority, Priority::Later);
+        assert_eq!(press(&mut form, "M", &keys), FormOutcome::Stay);
+        assert_eq!(form.priority, Priority::Must);
+        assert_eq!(press(&mut form, "alt-l", &keys), FormOutcome::Stay);
+        assert_eq!(form.priority, Priority::Later);
+        assert_eq!(press(&mut form, "space", &keys), FormOutcome::Pass);
+        assert_eq!(press(&mut form, "t", &keys), FormOutcome::Stay);
+        assert_eq!(form.priority, Priority::Must);
+        // `l` is still `choice.next`, which toggles.
+        assert_eq!(press(&mut form, "l", &keys), FormOutcome::Stay);
+        assert_eq!(form.priority, Priority::Later);
+    }
+
+    /// A chord never reaches a text field: the body passes `ctrl-s` to the tab.
+    #[test]
+    fn a_chord_on_a_text_field_passes() {
+        let mut form = on_priority(Priority::Must);
+        form.focus = FormFocus::Body;
+        assert_eq!(
+            press(&mut form, "alt-m", Keys::compiled()),
+            FormOutcome::Pass
+        );
+        assert_eq!(press(&mut form, "m", Keys::compiled()), FormOutcome::Stay);
+        assert_eq!(form.body.text(), "m");
+    }
 
     /// A `TextArea` body keeps its line breaks on the withdraw form: `Line` would drop the `\n`
     /// and run the lines together.
