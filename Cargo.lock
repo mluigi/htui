@@ -3053,6 +3053,7 @@ dependencies = [
  "htui-worker",
  "insta",
  "portable-pty",
+ "proc-macro2",
  "rataflow",
  "ratatui",
  "rustix",

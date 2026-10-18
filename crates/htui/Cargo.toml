@@ -109,6 +109,9 @@ htui-worker = { workspace = true, features = ["test-support"] }
 htui-store = { workspace = true, features = ["demo", "test-support"] }
 # `filters` so a chat snapshot can substitute the session id the transport mints per run.
 insta    = { workspace = true, features = ["filters"] }
+# MOD-115 M2 §10: `tests/no_hardcoded_keys.rs` tokenises the sources (comments, strings and raw
+# strings handled), with line numbers for its report.
+proc-macro2 = { version = "1", features = ["span-locations"] }
 # T43 reads `run_step.usage` and the two `agent_box` quota columns with a raw `SELECT` over
 # `testkit::TestDb::pool`: no `ReadStore` method returns either (`pg_criteria.rs:93-105` says why),
 # and the point of that suite is what Postgres actually holds. Runtime-checked queries only, so
