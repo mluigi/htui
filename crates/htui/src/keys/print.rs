@@ -5,16 +5,18 @@ use std::fmt::Write as _;
 
 use super::{CTRL_C, Context, Keys, Row, quote};
 
-/// The header and `version = 2` (MOD-115 M2 §1.7; `super::VERSION`). Constant, so the output is
-/// the same on every machine (B-13).
+/// The header, before the `version` line. Constant, so the output is the same on every machine
+/// (B-13).
 const HEADER: &str = r"# htui key bindings, as `htui --print-keys` prints them. htui reads keys.toml in its config
 # directory: ~/.config/htui on Linux, ~/Library/Application Support/htui on macOS, %APPDATA%\htui
 # on Windows. List only what you change: a list replaces that action's chords, [] unbinds it.
 # ctrl-c always quits and cannot be listed. `htui --default-keys` ignores the file for one run.
-version = 2
 ";
 
-/// The keys in force as a complete `keys.toml`: a constant header, `version = 2`, then one table
+/// The keys in force as a complete `keys.toml`: a constant header, the `version` the keys were
+/// read under (MOD-115 M2 §1.7: `version = 2` for the compiled defaults, `super::VERSION`, and a
+/// version-2 file; `version = 1` for a file from before M2, so the print reads back under the
+/// rules it loaded under, D8), then one table
 /// per context in `Context::ALL` order (a context with no row prints nothing), one padded
 /// `name = ["chord", …]  # help` line per action. A view's table lists its own rows, then its
 /// derived `VIEW_DEFAULTS` rows, then its overrides of shared verbs (MOD-67 M3), each under the
@@ -26,6 +28,7 @@ version = 2
 #[must_use]
 pub fn print(keys: &Keys) -> String {
     let mut out = HEADER.to_owned();
+    let _ = writeln!(out, "version = {}", keys.version);
     for &context in Context::ALL {
         let rows: Vec<(&str, String, &str, String)> = keys
             .rows
@@ -224,6 +227,24 @@ close = ["esc"]  # close"#;
             assert!(printed.lines().any(|printed| printed == line), "{line}");
         }
         assert_eq!(printed.matches("(changed)").count(), 3);
+    }
+
+    /// MOD-115 M2 D8 (MD4): a version-1 file's print says `version = 1`, so it reads back under
+    /// the rules it loaded under: a version-1 quit on a concepts search key loads (the search
+    /// keeps it), and the same binding in a version-2 file is refused.
+    #[test]
+    fn a_version_1_file_prints_version_1_and_round_trips() {
+        for spec in ["ctrl-d", "ctrl-p"] {
+            let keys = load_str(&format!("[global]\nquit = [\"{spec}\"]\n")).expect("it loads");
+            let printed = print(&keys);
+            assert!(printed.contains("\nversion = 1\n"), "{printed}");
+            assert!(!printed.contains("version = 2"), "{printed}");
+            let reloaded = load_str(&printed).unwrap_or_else(|errors| panic!("{spec}: {errors:?}"));
+            assert_eq!(reloaded, keys, "{spec}");
+            assert_eq!(print(&reloaded), printed, "{spec}");
+        }
+        let strict = load_str("version = 2\n[global]\nquit = [\"ctrl-y\"]\n").expect("it loads");
+        assert!(print(&strict).contains("\nversion = 2\n"));
     }
 
     /// MOD-57 M2 E9: an `[editor]` change prints, reads back to the same keys and is marked.
