@@ -14,7 +14,7 @@
 > `R-ORCH-12`/`R-ORCH-15` (where it runs, collect), `R-TUI-6` (Chat groups), `R-MCP-2` (`item_create`),
 > `R-ENT-13` (memory, ANA-38), `R-ORCH-1`/`R-ORCH-6` (planned graphs, auto mode).
 >
-> **Status (2026-10-18): drafted, awaiting maintainer acceptance of §8.** No implementation code is
+> **Status (2026-10-18): concluded; the maintainer accepted all eleven §8 answers as recommended.** No implementation code is
 > written here. Verdict (§7): a coordinator is **a role with durable state in the store, not a
 > long-lived process or session**. Its **integration and close-out writes are deterministic code**: an
 > integrator that, when a child's run completes, lands the run's work as the project configures
@@ -28,7 +28,7 @@
 > a person's confirmation, now over a checklist the coordinator prepares; resolution `done` requires the
 > work to have landed. The workspace coordinator follows and relays in version one and integrates
 > nothing of its own. Push and forge credentials live in the executing box's OS keyring and never enter
-> an agent's environment. Proposed spawns: **P1**, **P2**, **P3**, **P4**.
+> an agent's environment. Filed: **MOD-133** (P1), **MOD-134** (P2), **MOD-135** (P3), **MOD-136** (P4).
 
 ---
 
@@ -661,7 +661,7 @@ the coordinator's checklist. The proposed final text is in §10.1.
 
 ## 9. Proposed spawns
 
-IDs are minted after acceptance; ordering is by dependency.
+Filed 2026-10-18 as P1 → MOD-133, P2 → MOD-134, P3 → MOD-135, P4 → MOD-136; ordering is by dependency.
 
 | P | Subject | Scope | Blocked on | Requirements |
 |---|---|---|---|---|

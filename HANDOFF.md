@@ -14,7 +14,12 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-17):** **ANA-40 is concluded** (`docs/ANA-40.md`, `docs/decisions/ana/ana-40.md`): the
+**Current status (2026-10-18):** **ANA-34 is concluded** (`docs/ANA-34.md`, `docs/decisions/ana/ana-34.md`): a
+coordinator is a role over store rows, not a process; deterministic code in the run's executor lands finished runs
+per repo (`local` stays the default, `push` fast-forward only, `pull_request` through a forge adapter, OneDev
+first) and never resolves a conflict; its agent turns only propose; close-out stays a person's confirmation over a
+checklist. Spawned **MOD-133..136**; requirement edits (`R-TUI-9` final text and others, §10) wait for the
+maintainer. Before it, **ANA-40 is concluded** (`docs/ANA-40.md`, `docs/decisions/ana/ana-40.md`): the
 Toolbox has eleven kinds plus bundles, Postgres holds them all and the box probe only reports observed state, every
 attachable kind shares one generalised binding, and the light model becomes one setting (a partial reversal of
 ANA-30). Spawned **MOD-126..129**; requirement edits (`R-TUI-7` and others) wait for the maintainer. Before it, a
@@ -41,13 +46,8 @@ Before it, **TOOL-8 is done** (`docs/decisions/tool/tool-8.md`): the `htui-dev` 
 interactive sessions (item and HANDOFF phase, merge/ahead/dirty, disk above 90%, Postgres not up, last gate) with a
 toast when a gate finishes, plus turnless `/gate`, `/next` and `/validate` (M2); `scripts/dev-health.sh`/`.ps1` are
 new. Owed on the host: a Windows run (`claude -p "/gate fmt"` returns at once, the `.ps1` commands), `dev-health`'s
-docker path against the real `htui-postgres`, and the Postgres gate. Before it, **ANA-30 is concluded** (`docs/ANA-30.md`, `docs/decisions/ana/ana-30.md`): no
-`utility_model` setting now (every compliant cheap-model use is single-digit dollars a month and has no surface yet);
-the $100 API credit is spent through a `per_token` registry row (data, no code), built into the first MOD that adds a
-second drafting surface. Spawned **MOD-97** (an inherited `ANTHROPIC_API_KEY` reroutes subscription rows to API
-billing) and **MOD-98** (opt-in `summary` phase); `R-ID-6` gained a one-line clarification and ANA-21 §5.7 a `haiku`
-amendment. Owed on the host: checking which credit the $100 is (Console), and one dev-database query for stored ACP
-`session_info_update` titles (`docs/ANA-30.md` §8 calls 2, 6). Earlier completions (**TOOL-10**, **CLEAN-12**, **TOOL-9**, **CLEAN-11**, **MOD-67**, **MOD-96**, **CLEAN-10**, **MOD-93**, **MOD-89**, **MOD-95**, **TOOL-11**,
+docker path against the real `htui-postgres`, and the Postgres gate. Owed on the host from ANA-30: checking which credit the $100 is (Console), and one dev-database query for stored ACP
+`session_info_update` titles (`docs/ANA-30.md` §8 calls 2, 6). Earlier completions (**ANA-30**, **TOOL-10**, **CLEAN-12**, **TOOL-9**, **CLEAN-11**, **MOD-67**, **MOD-96**, **CLEAN-10**, **MOD-93**, **MOD-89**, **MOD-95**, **TOOL-11**,
 **MOD-91**, **MOD-92**) are in `DECISIONS.md`; their host Postgres gates on the merged tree, the Windows runs
 and MOD-93's live install and `tsc` on the mod stay owed; TOOL-9's Windows run of the `.ps1` gate files and TOOL-10's real
 `scripts/hr up` and Docker bats case are owed on the host too. Open from ANA-29: **MOD-94** behind a maintainer decision.
@@ -117,20 +117,9 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   (ANA-2 §4.9); how the integrate step relates to ANA-2 §4.6's reconciliation, where the orchestrator
   never resolves a conflict; the Settings graph editor; and what becomes of MOD-27 (swarm,
   `spawn_subagent`), MOD-36 and ANA-25 (now later tier, `R-LATER-13`). Its verdict ships in version
-  one. Not blocked.
-- [ ] **ANA-34 - Coordinator at project and workspace level** (from the 2026-10-15 requirements
-  review). `R-ORCH-14`, `R-TUI-9`, `R-ENT-8`, `R-ID-6`, `R-ORCH-7`, `R-ENT-15`. The maintainer asked
-  where merge and pull requests happen. Today the orchestrator merges a step's branch into the local
-  primary checkout (ANA-2 §4.6), close-out only records hashes and writes the summary
-  (`htui-orch/src/closeout.rs`), and nothing pushes or opens a PR. The review adds a **coordinator**,
-  one per project and one per workspace. It only manages: it listens to what happens below it, talks
-  with children and parent, integrates a child's work when the child's run completes (merge, push or
-  PR, as the project configures), and runs close-out with a checklist (follow-up items, re-confirming
-  suspect citations, choosing the resolution). Settle: whether a coordinator is an agent session, a
-  deterministic process or both, and where `R-ID-6` draws the line; its lifetime and the box it runs
-  on (the worker, `R-ORCH-12`); how it relates to ANA-33's planner and integrate step; the
-  push/PR configuration and its credentials (`R-BOX-4`, `R-SEC-2`); and the final text of `R-TUI-9`.
-  Not blocked; best read beside ANA-33.
+  one. Not blocked. **Constraint from ANA-34 (concluded 2026-10-18, `docs/decisions/ana/ana-34.md`):**
+  integration has two levels: the integrate step combines one run's parts and may resolve conflicts
+  (item work); the coordinator lands finished runs and never resolves a conflict (`docs/ANA-34.md` §7.3).
 - [ ] **ANA-35 - Entity model for any kind of project** (from the 2026-10-15 requirements review).
   `R-ID-1`, `R-ENT-1`, `R-ENT-2`, `R-ENT-3`, `R-ENT-4`, `R-ENT-5`, `R-ENT-6`, `R-ENT-8`, `R-ENT-9`,
   `R-ENT-12`, `R-ENT-14`, `R-ENT-16`, `R-BOX-4`, `R-STO-8`, `R-TUI-2`. `htui` now serves any kind of
@@ -164,7 +153,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   gotchas that outlives one item. Settle who writes an entry (an agent, a person, close-out), how it
   stays fresh against the code it describes (commit pinning, expiry, confirmation), the `R-ID-6` line
   (a person accepts it, or not), how it reaches a prompt (`R-PRM-1`, `R-PRM-3`), and its
-  **integration with Qdrant** (indexed, searched, deduplicated). Not blocked.
+  **integration with Qdrant** (indexed, searched, deduplicated). Not blocked. ANA-34 is concluded: a
+  coordinator turn is seeded from the store, and memory joins that seed when it lands (`docs/ANA-34.md` §7.2).
 - [ ] **ANA-39 - Mandatory context tools for coding sessions** (from the 2026-10-15 requirements
   review; `R-LATER-7` promoted to must). `R-LATER-7`, `R-NF-2`, `R-AGT-10`, `R-ID-5`, `R-MCP-4`,
   `R-PRM-1`. Code-context tools (Gortex, Serena, Graphify, Headroom) become mandatory in coding
@@ -180,7 +170,9 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   coordinating its items automatically (which to start, in what order, when to stop), above the
   per-item workflows of ANA-40. Settle how it relates to the project and workspace coordinators
   (ANA-34), auto mode's queue (`R-ORCH-6`), ANA-33's planned graphs, and `R-ID-6`'s line between item
-  work and bookkeeping. Wanted later, by maintainer decision; blocked on ANA-34 (ANA-40 is concluded, `docs/decisions/ana/ana-40.md`).
+  work and bookkeeping. Wanted later, by maintainer decision. Not blocked: ANA-34 is concluded
+  (`docs/decisions/ana/ana-34.md`) and hands this item which work to start next and landing several
+  projects' work together (`docs/ANA-34.md` §7.1, §7.7); ANA-40 is concluded too (`docs/decisions/ana/ana-40.md`).
 - [ ] **ANA-42 - Execution targets: where an item runs** (from the UI redesign review,
   `docs/ui-redesign-findings-2026-10-15.md` §4.2a). `R-ORCH-15`, `R-ORCH-12`, `R-ENT-17`, `R-SEC-5`, `R-AGT-11`, `R-BOX-4`,
   `R-NF-2`. Each item runs on a target: this box, docker on this box (a sandbox like `scripts/hr`:
@@ -198,6 +190,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   **Drafted (2026-10-17, `docs/ANA-42.md`):** verdict is a target record pointing at a box, the
   executor staying on this box for the driven kinds, a forwarded relay socket, secrets injected, and
   collection by bundle; spawns MOD-130, MOD-131, MOD-132. Stays open until the maintainer answers §8.
+  ANA-34 (concluded 2026-10-18, its Q9) narrows §7.5's "merging stays the person's step" to `local`
+  mode: after collect, the coordinator integrates per the repo's mode (MOD-133); fold into §8.
 
 ### Next features
 - [ ] **MOD-27 - Swarm RunKind & task MCP Tool (from ANA-13).** Add `RunKind::Swarm` to `htui-orch`, implement `spawn_subagent` MCP tool with JSON schema validation and isolated worktrees. `htui-orch`, its `Isolator` seam and `run_worker.rs` exist since MOD-4 (done, `docs/decisions/mod/mod-4.md`); the MCP half needs MOD-11.
@@ -412,6 +406,36 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   The `prepare · <target>` stage (clone with `pushurl` disabled, compose project on free ports) and the
   `collect branch` step: `git bundle create` on the target, verify, fetch into a temp ref under fsck and
   compare-and-swap, with `scripts/hr collect`'s refusals and config-path confirmation. Blocked on MOD-130.
+- [ ] **MOD-133 - Integration records and modes (local, push, pull_request)** (from ANA-34,
+  `docs/ANA-34.md` §7.2-§7.4). `R-ORCH-14`, `R-ORCH-11`, `R-TUI-9`, `R-ENT-4`. Per-repo `integrate`
+  setting (`local`, the default and today's behaviour; `push`, fast-forward only, never forced;
+  `pull_request`) with a project default and a Settings form, snapshotted at run start; a run branch
+  `htui/item/<key>` for `pull_request` (`worktree` and `copy` isolation only); an `integration` record
+  per (run, repo) written by `finish_run(Done)`; an integrate arm of `sweep_once` on the executing box
+  with a lease, idempotence and park-with-refusal; an integration section in the close-out summary.
+  Not blocked (`pull_request` completes with MOD-134).
+- [ ] **MOD-134 - Forge adapter and push/forge credentials** (from ANA-34, `docs/ANA-34.md` §7.4,
+  §7.5). `R-ORCH-14`, `R-BOX-4`, `R-STO-1`, `R-SEC-2`, `R-SEC-3`, `R-SEC-4`. A forge adapter with four
+  verbs (push a branch, open or update a PR, set auto-merge, read PR state); OneDev REST first
+  (`git.mluigi.it` runs OneDev), GitHub REST second; an htui credential helper for git children,
+  reusing MOD-108's; forge tokens as keyring entries per base URL, scrubber masks, no fallback; the
+  systemd-credential exception for headless workers; PR state polling. Credentials never reach an agent
+  environment. Blocked on MOD-108 and MOD-133.
+- [ ] **MOD-135 - Close-out checklist** (from ANA-34, `docs/ANA-34.md` §7.6). `R-TUI-9`, `R-ENT-8`,
+  `R-ENT-15`, `R-ID-6`, `R-MCP-2`. A `CloseOut` waiting reason; a deterministic checklist (each run's
+  integration outcome, the proposed resolution, suspect citations through `reconfirm`, follow-up drafts);
+  a draft store for proposed items no reader consumes until accepted, shared with `R-MCP-2`'s
+  `item_create`; one confirmation that closes, creates the accepted follow-ups and writes the accepted
+  re-confirmations; `done` requires landed work; auto mode never closes an item. Blocked on MOD-133;
+  coordinate with ANA-35's status migration.
+- [ ] **MOD-136 - Coordinator turns and the workspace scope** (from ANA-34, `docs/ANA-34.md` §7.1,
+  §7.2, §7.7). `R-ORCH-14`, `R-TUI-6`, `R-MCP-2`, `R-ID-6`, `R-ENT-14`. A run kind `coordinator` and
+  workspace-owned runs; a `ToolScope` and a `WaitingRow` variant without an item; coordinator MCP tools
+  (read the runs and waiting rows below, write drafts into MOD-135's store, propose a resolution or a
+  re-confirmation, request an enqueue or a link through a permission card); turns opened by a message
+  in the TUI or by a checklist in the executor, resumed or reseeded from the store; the workspace
+  coordinator follows and relays only. Supplies MOD-121's coordinator groups. Blocked on MOD-135 and
+  MOD-115.
 
 - [ ] **MOD-85 - Remaining accent (cyan) uses that do not mean focus or selection** (from MOD-80,
   `docs/decisions/mod/mod-80.md` "Carried"; blueprint B-6, review M1/L5). `R-TUI-1`. MOD-80 made
@@ -628,8 +652,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   URL, and the per-box path recorded. (3) When the clone fails on authentication, name the remote and
   what it needs (SSH key, token, `gh auth`), mark the repo unavailable on that box, and offer an
   in-app setup: generate an SSH key and show its public half, or store an HTTPS token in the OS
-  keyring for git to use (a credential helper), never in a file. ANA-34's push/PR credentials will
-  reuse this. Not blocked.
+  keyring for git to use (a credential helper), never in a file. MOD-134 (from ANA-34) reuses the
+  helper for push and forge credentials. Not blocked.
 - [ ] **MOD-109 - Settings and configuration surfaces** (from the 2026-10-15 requirements review).
   `R-TUI-10`, `R-TUI-8`, `R-STO-1`, `R-STO-3`, `R-STO-5`, `R-SEC-2`, `R-AGT-5`, `R-ID-5`, `R-MCP-3`.
   Five settled changes, landable as separate milestones:
@@ -773,7 +797,7 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   view-only while the agent works and writable when it asks; permissions answered with `a`/`A`/`r`.
   The htui agent itself: settings, Toolbox entries, agent rows, targets and the catalogue, acting
   without asking only on reads, catalogue updates and Toolbox additions. Overlaps MOD-103 (chat per
-  session): settle together. Blocked on MOD-115; coordinators need ANA-34.
+  session): settle together. Blocked on MOD-115; the coordinator groups are blocked on MOD-136 (from ANA-34).
 - [ ] **MOD-122 - Activity panel and Logs tab** (from the UI redesign review, `docs/ui-redesign-findings-2026-10-15.md` §4.4,
   §4.7). `R-TUI-15`, `R-TUI-16`. The activity panel (newest first, needs-you pinned with a count,
   Enter jumps to the source with history, filters: all workspaces, needs you, failures, this
@@ -898,7 +922,7 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 12 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-33 step graphs v2 and divided fan-out, ANA-34 coordinator, ANA-35 entity model for any project, ANA-36 further MCP tools, ANA-37 Qdrant required?, ANA-38 project memory, ANA-39 mandatory context tools, ANA-41 project workflows, ANA-42 execution targets) |
-| MOD-N   | 54 (MOD-16 Windows verification, MOD-27 swarm, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-115 TUI shell, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
+| ANA-N   | 11 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-33 step graphs v2 and divided fan-out, ANA-35 entity model for any project, ANA-36 further MCP tools, ANA-37 Qdrant required?, ANA-38 project memory, ANA-39 mandatory context tools, ANA-41 project workflows, ANA-42 execution targets) |
+| MOD-N   | 58 (MOD-16 Windows verification, MOD-27 swarm, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-115 TUI shell, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
 | CLEAN-N | 0 |
 | TOOL-N  | 2 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check) |
