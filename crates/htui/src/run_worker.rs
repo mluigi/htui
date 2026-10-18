@@ -818,6 +818,7 @@ pub(crate) mod tests {
             item,
             mode: RunMode::Manual,
             repo_scope: None,
+            workspace: None,
         }))
     }
 
@@ -3049,6 +3050,7 @@ pub(crate) mod tests {
                 item: ids::HTUI_ANA_2,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             }),
             OrchRequest::Command(Command::AnswerGate {
                 run,

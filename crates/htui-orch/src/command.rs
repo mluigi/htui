@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use htui_agent::driver::AgentSessionRef;
 use htui_core::model::{
     AgentId, Claim, DocumentId, GraphSnapshot, Item, ItemId, RepoId, Resolution, Run, RunId,
-    RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId, StepStatus,
+    RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId, StepStatus, WorkspaceId,
 };
 use htui_core::prompt::AssembleError;
 use htui_core::store::StoreError;
@@ -62,6 +62,9 @@ pub enum Command {
         /// `None` resolves to the project's primary repo, or to nothing when it has none; an
         /// explicit empty scope on an item with a primary repo is refused (plan D14).
         repo_scope: Option<Vec<RepoId>>,
+        /// MOD-125 D3: the workspace the run is started from, recorded as `run.workspace_id`;
+        /// `None` (a test, an unscoped caller) is never gated by a workspace stop.
+        workspace: Option<WorkspaceId>,
     },
     /// §6.2's `approve` and `reject with note`: a human answers a parked gate.
     AnswerGate {

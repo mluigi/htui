@@ -649,6 +649,7 @@ impl Stack {
             item,
             mode: RunMode::Manual,
             repo_scope: None,
+            workspace: None,
         })
         .await;
         assert_eq!(self.take_status(), None, "the start was not refused");
@@ -1425,6 +1426,7 @@ async fn a_capability_refusal_blocks_and_unblock_reopens_on_postgres() {
             item,
             mode: RunMode::Manual,
             repo_scope: None,
+            workspace: None,
         })
         .await;
     assert_eq!(
@@ -1495,6 +1497,7 @@ async fn a_claim_time_refusal_is_not_requeued_on_postgres() {
             item,
             mode: RunMode::Manual,
             repo_scope: None,
+            workspace: None,
         })
         .await;
     let refused_status = stack.take_status().expect("the claim was refused");

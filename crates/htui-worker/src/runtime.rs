@@ -2281,6 +2281,11 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
         .iter()
         .map(|entry| (entry.item_id, entry.project_id))
         .collect();
+    // MOD-125 D3: the entry's workspace becomes the run's, so a workspace stop gates the claim.
+    let workspace_of: HashMap<ItemId, Option<WorkspaceId>> = entries
+        .iter()
+        .map(|entry| (entry.item_id, entry.workspace_id))
+        .collect();
     // `None`: the project read as absent.
     let mut caps: HashMap<ProjectId, Option<Result<ProjectCaps, CapError>>> = HashMap::new();
     let mut admissible = Vec::with_capacity(order.len());
@@ -2334,7 +2339,10 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
         if admitted >= free || ctx.shared.walks.closed() {
             break;
         }
-        match engine.enqueue_in_batch(item, batch.id).await {
+        match engine
+            .enqueue_in_batch(item, batch.id, workspace_of.get(&item).copied().flatten())
+            .await
+        {
             Ok(run) => {
                 admitted += 1;
                 ctx.shared.publisher.publish(&RunFrame {
@@ -2648,7 +2656,8 @@ async fn run_request<H: htui_core::store::WorkerHost, P: ReplySink>(
             item,
             mode,
             repo_scope,
-        }) => start_run(ctx, item, mode, repo_scope).await,
+            workspace,
+        }) => start_run(ctx, item, mode, repo_scope, workspace).await,
         OrchRequest::Command(Command::Unblock { item }) => unblock(ctx, item).await,
         OrchRequest::Command(command @ Command::CloseOut { item, .. }) => {
             let _ = ctx.tag.item.set(item);
@@ -2722,6 +2731,7 @@ async fn start_run<H: htui_core::store::WorkerHost, P: ReplySink>(
     item: ItemId,
     mode: htui_core::model::RunMode,
     repo_scope: Option<Vec<RepoId>>,
+    workspace: Option<WorkspaceId>,
 ) {
     let _ = ctx.tag.item.set(item);
     let kit = match Kit::read(&ctx.shared, &ctx.host, true).await {
@@ -2737,7 +2747,7 @@ async fn start_run<H: htui_core::store::WorkerHost, P: ReplySink>(
     if ctx.shared.walks.closed() {
         return ctx.refuse(PREEMPTED.to_owned());
     }
-    let run = match engine.enqueue(item, mode, repo_scope).await {
+    let run = match engine.enqueue(item, mode, repo_scope, workspace).await {
         Ok(run) => run,
         Err(err) => return ctx.refuse(err.to_string()),
     };
