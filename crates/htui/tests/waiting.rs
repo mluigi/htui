@@ -65,15 +65,15 @@ async fn refresh(harness: &mut Harness) {
 /// working count and the store.
 fn top_bar(harness: &mut Harness) -> String {
     harness.resize(160, 30);
-    harness
-        .render()
-        .lines()
-        .next()
+    let frame = harness.render();
+    let header = frame.lines().next().unwrap_or_default();
+    // The counts and the store sit between double spaces; the box name and the key chips follow.
+    header
+        .split("  ")
+        .find(|part| part.contains(" working \u{b7} "))
+        .and_then(|part| part.split(" \u{b7} DESKTOP-HTUI").next())
         .unwrap_or_default()
-        .trim_end()
-        .rsplit("  ")
-        .next()
-        .unwrap_or_default()
+        .trim()
         .to_owned()
 }
 
