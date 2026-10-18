@@ -4890,7 +4890,12 @@ impl State {
 
     /// Removes a workspace, its links and its box paths. Projects survive it
     /// (`0001_init.sql:162,174`).
-    fn delete_workspace(&mut self, id: WorkspaceId) -> Result<DeleteReach> {
+    ///
+    /// MOD-125 (blueprint F16) emulates `0019_stop_runs.sql`'s two foreign keys: the stop record
+    /// goes with the workspace (`ON DELETE CASCADE`), and its runs and queue entries outlive it
+    /// unscoped (`ON DELETE SET NULL`). A run's `updated_at` moves, as Postgres's trigger moves it
+    /// on the `SET NULL`; `queue_entry` has no `updated_at`.
+    fn delete_workspace(&mut self, id: WorkspaceId, now: DateTime<Utc>) -> Result<DeleteReach> {
         let reach = self
             .workspace_reach(id)
             .ok_or_else(|| StoreError::NotFound {
@@ -4900,6 +4905,22 @@ impl State {
         self.workspace_projects.retain(|row| row.workspace_id != id);
         self.workspace_box_paths
             .retain(|row| row.workspace_id != id);
+        self.workspace_stops.remove(&id);
+        for run in self
+            .runs
+            .values_mut()
+            .filter(|run| run.workspace_id == Some(id))
+        {
+            run.workspace_id = None;
+            run.updated_at = now;
+        }
+        for entry in self
+            .queue_entries
+            .values_mut()
+            .filter(|entry| entry.workspace_id == Some(id))
+        {
+            entry.workspace_id = None;
+        }
         self.workspaces.remove(&id);
         Ok(reach)
     }
@@ -8804,7 +8825,8 @@ impl WriteStore for MemStore {
     }
 
     async fn delete_workspace(&self, id: WorkspaceId) -> Result<DeleteReach> {
-        self.write(|state| state.delete_workspace(id))
+        let now = self.now();
+        self.write(|state| state.delete_workspace(id, now))
     }
 
     async fn delete_project(&self, id: ProjectId) -> Result<DeleteReach> {

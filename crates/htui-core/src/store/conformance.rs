@@ -233,6 +233,7 @@ pub const CASES: &[&str] = &[
     "claim_run_admits_after_resume",
     "a_run_without_a_workspace_is_never_gated",
     "adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped",
+    "a_deleted_workspace_unscopes_its_runs_and_drops_its_stop",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -631,6 +632,9 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         }
         "adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped" => {
             adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped(store).await;
+        }
+        "a_deleted_workspace_unscopes_its_runs_and_drops_its_stop" => {
+            a_deleted_workspace_unscopes_its_runs_and_drops_its_stop(store).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -7743,6 +7747,53 @@ async fn adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped<S: Wri
         run_row(CASE, store, a).await,
         settled,
         "{CASE}: and leaves the settled run as it was"
+    );
+}
+
+/// MOD-125 F16: deleting a workspace sets `run.workspace_id` to `NULL` on its runs (`ON DELETE SET
+/// NULL`) and takes its stop record (`ON DELETE CASCADE`), so a run the stopped workspace held
+/// back is claimable once the workspace is gone.
+async fn a_deleted_workspace_unscopes_its_runs_and_drops_its_stop<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_deleted_workspace_unscopes_its_runs_and_drops_its_stop";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let workspace = store
+        .create_workspace(new_workspace("doomed"))
+        .await
+        .expect(CASE)
+        .id;
+    let run = create_scoped_run(CASE, store, ids::HTUI_ANA_2, Some(workspace)).await;
+    store
+        .stop_workspace(workspace, StopMode::Forced, ids::USER, at)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::WorkspaceStopped { workspace },
+        "{CASE}: control: the stopped workspace holds its run back"
+    );
+
+    store.delete_workspace(workspace).await.expect(CASE);
+    assert_eq!(
+        run_row(CASE, store, run).await.workspace_id,
+        None,
+        "{CASE}: the run outlives its workspace, unscoped"
+    );
+    assert_eq!(
+        store.workspace_stop(workspace).await.expect(CASE),
+        None,
+        "{CASE}: the stop record went with the workspace"
+    );
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: and the unscoped run is admitted"
     );
 }
 
