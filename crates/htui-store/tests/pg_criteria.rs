@@ -8616,6 +8616,150 @@ async fn a_stalled_batch_closes_alike_on_both_stores() {
     db.drop_db().await;
 }
 
+/// MOD-125 D2 on both stores: a `stopped` run is live, so it keeps its scope and its batch, but it
+/// leaves the top bar. Each of Postgres' run-status lists below names `stopped` (or, for the top
+/// bar, leaves it out), and `MemStore`'s predicates agree: `active_runs` drops the run,
+/// `overlapping_runs` and `claim_run`'s overlap refusal still see it, and its auto batch is not
+/// drained until the run ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_run_is_live_everywhere_but_the_top_bar_on_both_stores() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let later = at + TimeDelta::seconds(1);
+    let owner = uuid::Uuid::now_v7();
+    let lease = TimeDelta::minutes(30);
+    let scope = htui_core::model::Scope {
+        workspace_id: ids::WORKSPACE_PLATFORM,
+        project_ids: vec![ids::PROJECT_HTUI, ids::PROJECT_AGY],
+    };
+    let repo = NewRepo {
+        id: RepoId::new(),
+        project_id: ids::PROJECT_HTUI,
+        name: "mod-125".to_owned(),
+        remote_url: None,
+        default_branch: "main".to_owned(),
+        is_primary: true,
+    };
+    pg.create_repo(repo.clone()).await.expect("pg repo");
+    mem.create_repo(repo.clone()).await.expect("mem repo");
+
+    let pg_batch = pg.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    let mem_batch = mem.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    let stopped = NewRun {
+        repo_scope: vec![repo.id],
+        ..batch_run(ids::HTUI_ANA_2, Some(pg_batch.id))
+    };
+    let run = stopped.id;
+    pg.create_run(stopped.clone()).await.expect("pg admits");
+    mem.create_run(NewRun {
+        batch_id: Some(mem_batch.id),
+        ..stopped
+    })
+    .await
+    .expect("mem admits");
+    assert_eq!(
+        pg.claim_run(run, ids::BOX, owner, at, lease)
+            .await
+            .expect("claim"),
+        Claim::Admitted
+    );
+    assert_eq!(
+        mem.claim_run(run, ids::BOX, owner, at, lease)
+            .await
+            .expect("claim"),
+        Claim::Admitted
+    );
+    assert_eq!(
+        (
+            pg.active_runs(&scope).await.expect("read"),
+            mem.active_runs(&scope).await.expect("read"),
+        ),
+        (2, 2),
+        "the fixture's queued RUN_2 and the running run are on the top bar"
+    );
+    for store_moved in [
+        pg.transition_run(run, RunStatus::Running, RunStatus::Stopped, at)
+            .await
+            .expect("stop"),
+        mem.transition_run(run, RunStatus::Running, RunStatus::Stopped, at)
+            .await
+            .expect("stop"),
+    ] {
+        assert!(store_moved, "running -> stopped (MOD-125 D1)");
+    }
+
+    assert_eq!(
+        (
+            pg.active_runs(&scope).await.expect("read"),
+            mem.active_runs(&scope).await.expect("read"),
+        ),
+        (1, 1),
+        "a stopped run leaves the top bar (D2 exclusion), on both stores"
+    );
+    let overlapping =
+        |runs: Vec<htui_core::model::Run>| runs.into_iter().map(|row| row.id).collect::<Vec<_>>();
+    assert_eq!(
+        (
+            overlapping(pg.overlapping_runs(&[repo.id]).await.expect("read")),
+            overlapping(mem.overlapping_runs(&[repo.id]).await.expect("read")),
+        ),
+        (vec![run], vec![run]),
+        "a stopped run still holds its scope"
+    );
+
+    let rival = NewRun {
+        repo_scope: vec![repo.id],
+        ..race_run(ids::HTUI_CLEAN_1)
+    };
+    pg.create_run(rival.clone()).await.expect("pg queues");
+    mem.create_run(rival.clone()).await.expect("mem queues");
+    let (pg_claim, mem_claim) = (
+        pg.claim_run(rival.id, ids::BOX, owner, at, lease)
+            .await
+            .expect("claim"),
+        mem.claim_run(rival.id, ids::BOX, owner, at, lease)
+            .await
+            .expect("claim"),
+    );
+    assert!(
+        matches!(&pg_claim, Claim::Overlaps { with, .. } if *with == run),
+        "a stopped run's scope refuses an overlapping claim, got {pg_claim:?}"
+    );
+    assert_eq!(pg_claim, mem_claim, "and MemStore refuses it alike");
+
+    assert_eq!(
+        (
+            pg.close_drained_batch(pg_batch.id, &[], later)
+                .await
+                .expect("close"),
+            mem.close_drained_batch(mem_batch.id, &[], later)
+                .await
+                .expect("close"),
+        ),
+        (None, None),
+        "a stopped run of its own keeps the batch open"
+    );
+    pg.fail_run(run, "abandoned", later).await.expect("fail");
+    mem.fail_run(run, "abandoned", later).await.expect("fail");
+    let (pg_closed, mem_closed) = (
+        pg.close_drained_batch(pg_batch.id, &[], later)
+            .await
+            .expect("close")
+            .expect("the run ended, so the batch drains"),
+        mem.close_drained_batch(mem_batch.id, &[], later)
+            .await
+            .expect("close")
+            .expect("the run ended, so the batch drains"),
+    );
+    assert_eq!(batch_shape(&pg_closed), batch_shape(&mem_closed));
+
+    db.drop_db().await;
+}
+
 /// Review H2 (Postgres only): a claim racing a pause either admits first, and the run stays
 /// `running`, or finds the run cancelled and answers `NotClaimable`; never a claimed run of a
 /// paused batch that the pause also cancelled, nor a queued one left behind. Both orders are

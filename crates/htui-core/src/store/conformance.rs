@@ -10694,6 +10694,24 @@ async fn step_create_and_transition_law<S: WriteStore>(store: &S) {
         matches!(live, Err(StoreError::Constraint(_))),
         "{CASE}: running does not reach superseded, got {live:?}"
     );
+    assert!(
+        store
+            .transition_step(
+                running_id,
+                StepStatus::Running,
+                StepStatus::Stopped,
+                finished
+            )
+            .await
+            .expect(CASE),
+        "{CASE}: running -> stopped matches (MOD-125 D1)"
+    );
+    store.supersede_step(running_id).await.expect(CASE);
+    assert_eq!(
+        step_row(CASE, store, ids::RUN_2, running_id).await.status,
+        StepStatus::Superseded,
+        "{CASE}: stopped -> superseded is M3's fresh-rerun fallback (MOD-125 D1)"
+    );
     let gone = store.supersede_step(StepId::new()).await;
     assert!(
         matches!(
@@ -11928,6 +11946,47 @@ async fn close_out_refuses_a_live_run<S: WriteStore>(store: &S) {
         item_row(CASE, store, ids::HTUI_FEAT_3).await.status,
         Status::Open,
         "{CASE}: and stays open"
+    );
+
+    // MOD-125 D2: a stopped run is live, it keeps its trees and branch, so it refuses too.
+    let at = seam_clock();
+    for (from, to) in [
+        (RunStatus::Queued, RunStatus::Running),
+        (RunStatus::Running, RunStatus::Stopped),
+    ] {
+        assert!(
+            store
+                .transition_run(ids::RUN_2, from, to, at)
+                .await
+                .expect(CASE),
+            "{CASE}: RUN_2 {from} -> {to}"
+        );
+    }
+    let stopped = store
+        .close_out(
+            ids::HTUI_FEAT_3,
+            Resolution::Withdrawn,
+            new_document(ids::HTUI_FEAT_3, "summary", None),
+            &[],
+        )
+        .await;
+    assert!(
+        matches!(&stopped, Err(StoreError::Constraint(sentence))
+            if sentence.contains(&ids::RUN_2.to_string())),
+        "{CASE}: a stopped run refuses the close-out like any live run, got {stopped:?}"
+    );
+    assert_eq!(
+        item_row(CASE, store, ids::HTUI_FEAT_3).await.status,
+        Status::Open,
+        "{CASE}: and the item stays open"
+    );
+    // `stopped -> failed` is the law's (MOD-125 D1), so `fail_run`'s compare-and-set takes it.
+    store.fail_run(ids::RUN_2, "boom", at).await.expect(CASE);
+    let failed = run_row(CASE, store, ids::RUN_2).await;
+    assert_eq!(
+        (failed.status, failed.finished_at),
+        (RunStatus::Failed, Some(at)),
+        "{CASE}: a stopped run fails, stamped from the caller's clock"
     );
 
     for (item, resolution, summary, why) in [
@@ -13595,6 +13654,13 @@ async fn finish_run_moves_run_and_item_together<S: WriteStore>(store: &S) {
         Status::InProgress,
         "{CASE}: the first claim took the item to in_progress"
     );
+    assert!(
+        store
+            .transition_run(right, RunStatus::Running, RunStatus::Stopped, at)
+            .await
+            .expect(CASE),
+        "{CASE}: the other run is stopped (MOD-125 D1)"
+    );
     store
         .finish_run(left, RunStatus::Done, None, at)
         .await
@@ -13602,7 +13668,14 @@ async fn finish_run_moves_run_and_item_together<S: WriteStore>(store: &S) {
     assert_eq!(
         item_row(CASE, store, held).await.status,
         Status::InProgress,
-        "{CASE}: the item is held while its other run is still live"
+        "{CASE}: the item is held while its other run is still live, stopped included (MOD-125 D2)"
+    );
+    assert!(
+        store
+            .transition_run(right, RunStatus::Stopped, RunStatus::Running, at)
+            .await
+            .expect(CASE),
+        "{CASE}: stopped -> running is the resume (MOD-125 D1)"
     );
     store
         .finish_run(right, RunStatus::Done, None, at)
@@ -15783,8 +15856,8 @@ async fn relay_view_lists_live_pending_requests_and_pending_cancels<S: WriteStor
 }
 
 /// MOD-69 plan D2: `waiting_candidates` lists every item of the scope that is `blocked` or
-/// `awaiting_approval`, or that owns a parked run, with its active runs (queued, running and
-/// parked) and their steps, in canonical order. A walking item, a finished run, another
+/// `awaiting_approval`, or that owns a parked run, with its active runs (queued, running, parked
+/// and, since MOD-125 D2, stopped) and their steps, in canonical order. A walking item, a finished run, another
 /// workspace's item and a chat run are absent; an empty scope answers nothing.
 async fn waiting_candidates_hold_every_park_and_nothing_else<S: WriteStore>(store: &S) {
     const CASE: &str = "waiting_candidates_hold_every_park_and_nothing_else";
@@ -15884,6 +15957,34 @@ async fn waiting_candidates_hold_every_park_and_nothing_else<S: WriteStore>(stor
             .await
             .expect(CASE),
         "{CASE}: awaiting_approval -> open is legal"
+    );
+
+    // A blocked item whose run a workspace stop interrupted: a stopped run is live (MOD-125 D2),
+    // so the candidate carries it and its stopped step. It stops before the walking runs claim,
+    // so it holds none of the box's two slots.
+    let stopped = minted(CASE, store, "blocked while stopped").await;
+    let stopped_run = claimed(CASE, store, stopped, owner, at).await;
+    let stopped_step = running_step(CASE, store, stopped_run, (0, 1, 0), at).await;
+    assert!(
+        store
+            .transition_run(stopped_run, RunStatus::Running, RunStatus::Stopped, at)
+            .await
+            .expect(CASE),
+        "{CASE}: running -> stopped is legal (MOD-125 D1)"
+    );
+    assert!(
+        store
+            .transition_step(stopped_step, StepStatus::Running, StepStatus::Stopped, at)
+            .await
+            .expect(CASE),
+        "{CASE}: the step stops with its run"
+    );
+    assert!(
+        store
+            .transition(stopped, Status::InProgress, Status::Blocked)
+            .await
+            .expect(CASE),
+        "{CASE}: in_progress -> blocked is legal"
     );
 
     // The negative: a walking run, claimed last (H-6).
@@ -15991,6 +16092,15 @@ async fn waiting_candidates_hold_every_park_and_nothing_else<S: WriteStore>(stor
                 reopened_run,
                 RunStatus::AwaitingApproval,
                 vec![(reopened_step, StepStatus::AwaitingApproval)],
+            )],
+        ),
+        (
+            stopped,
+            Status::Blocked,
+            vec![(
+                stopped_run,
+                RunStatus::Stopped,
+                vec![(stopped_step, StepStatus::Stopped)],
             )],
         ),
         (

@@ -5592,7 +5592,9 @@ impl WriteStore for PgStore {
         tx.commit().await.map_err(map_sqlx)
     }
 
-    /// §4.4's loop half: `pending | awaiting_approval | done -> superseded`, and nothing else.
+    /// §4.4's loop half: `pending | awaiting_approval | done -> superseded`, plus M3's
+    /// fresh-rerun fallback `stopped -> superseded` (MOD-125 D1), and nothing else: the list is
+    /// the law's `-> superseded` column.
     ///
     /// The refusal is the law's table and not a stale compare-and-set, so the follow-up read has
     /// to fetch the *status* rather than a bare `SELECT 1`: it is what
@@ -5605,7 +5607,7 @@ impl WriteStore for PgStore {
     async fn supersede_step(&self, step: StepId) -> Result<()> {
         let moved = sqlx::query!(
             "UPDATE run_step SET status = 'superseded' \
-              WHERE id = $1 AND status IN ('pending','awaiting_approval','done')",
+              WHERE id = $1 AND status IN ('pending','awaiting_approval','stopped','done')",
             step.as_uuid(),
         )
         .execute(&self.pool)
@@ -8153,10 +8155,11 @@ impl PgStore {
     }
 
     /// MOD-12 D3 (review M1), M3 D4 (L4): the runner's close of exactly `batch`, only while it is
-    /// open and no run of its own is `queued`, `running` or `awaiting_approval`. The entries the
-    /// runner read do not keep it open: it calls this when nothing is admissible (an empty queue,
-    /// or a stalled one). An entry it did not read does (review R1 L2): `seen` is the items of
-    /// the entries it read (empty when it read none), and an entry of the box for any other item
+    /// open and no run of its own is live (`queued`, `running`, `awaiting_approval` or, MOD-125
+    /// D2, `stopped`). The entries the runner read do not keep it open: it calls this when
+    /// nothing is admissible (an empty queue, or a stalled one). An entry it did not read does
+    /// (review R1 L2): `seen` is the items of the entries it read (empty when it read none),
+    /// and an entry of the box for any other item
     /// means an item may be ready that the runner never judged. The check is by item, not by
     /// `queued_at`: that is the queuing client's clock, not commit order, so a skewed clock or a
     /// queuer that stamped first and committed last could date an unread entry before every

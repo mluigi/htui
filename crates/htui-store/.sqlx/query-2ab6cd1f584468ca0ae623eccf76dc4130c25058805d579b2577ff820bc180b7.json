@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run_step SET status = 'superseded' WHERE id = $1 AND status IN ('pending','awaiting_approval','stopped','done')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2ab6cd1f584468ca0ae623eccf76dc4130c25058805d579b2577ff820bc180b7"
+}

@@ -1182,10 +1182,11 @@ impl MemStore {
     }
 
     /// MOD-12 D3 (review M1), M3 D4 (L4): the runner's close of exactly `batch`, only while it is
-    /// open and no run of its own is `queued`, `running` or `awaiting_approval`. The entries the
-    /// runner read do not keep it open: it calls this when nothing is admissible (an empty queue,
-    /// or a stalled one). An entry it did not read does (review R1 L2): `seen` is the items of
-    /// the entries it read (empty when it read none), and an entry of the box for any other item
+    /// open and no run of its own is live (`queued`, `running`, `awaiting_approval` or, MOD-125
+    /// D2, `stopped`). The entries the runner read do not keep it open: it calls this when
+    /// nothing is admissible (an empty queue, or a stalled one). An entry it did not read does
+    /// (review R1 L2): `seen` is the items of the entries it read (empty when it read none),
+    /// and an entry of the box for any other item
     /// means an item may be ready that the runner never judged. The check is by item, not by
     /// `queued_at`, which is the queuing client's clock and not commit order. The re-check is one
     /// closure, as `PgStore`'s is the UPDATE's own `WHERE`, so a resume

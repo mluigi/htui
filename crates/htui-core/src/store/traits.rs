@@ -1478,7 +1478,8 @@ pub trait WriteStore: ReadStore {
         reason: Option<String>,
     ) -> Result<()>;
 
-    /// §4.4's loop half: `pending | awaiting_approval | done -> superseded`, no other status.
+    /// §4.4's loop half: `pending | awaiting_approval | done -> superseded`, and M3's
+    /// fresh-rerun fallback `stopped -> superseded` (MOD-125 D1); no other status.
     ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`;

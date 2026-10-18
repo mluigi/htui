@@ -632,8 +632,8 @@ async fn the_mirror_counts_tool_calls_like_postgres() {
 
 /// MOD-69 plan D2: the mirror's `waiting_candidates` (three runtime reads over `item`, `run` and
 /// `run_step`) answers Postgres' rows whole after a pass: a gate park, a selection park on a
-/// minted item, FEAT-3 blocked behind its queued run, a blocked `agy` item, and the fixture's two
-/// candidates.
+/// minted item, a blocked minted item whose run is stopped (MOD-125 D2), FEAT-3 blocked behind its
+/// queued run, a blocked `agy` item, and the fixture's two candidates.
 #[tokio::test]
 async fn the_mirror_lists_waiting_candidates_like_postgres() {
     use htui_core::model::{
@@ -784,6 +784,53 @@ async fn the_mirror_lists_waiting_candidates_like_postgres() {
             .expect("transition")
     );
 
+    // A blocked item whose run a workspace stop interrupted: a stopped run is live (MOD-125 D2),
+    // so the mirror's run-status list names it as Postgres' does.
+    let stopped = store
+        .mint_item(NewItem {
+            id: ItemId::new(),
+            project_id: ids::PROJECT_HTUI,
+            kind_id: ids::KIND_HTUI_FEAT,
+            title: "stopped".to_owned(),
+            body: String::new(),
+            required_tags: Vec::new(),
+            touched_paths: Vec::new(),
+            priority: 0,
+            step_graph_id: None,
+            created_by: ids::USER,
+            box_id: Some(ids::BOX),
+        })
+        .await
+        .expect("mint_item")
+        .id;
+    let stopped_run = store
+        .create_run(new_run(stopped))
+        .await
+        .expect("create_run")
+        .id;
+    claim(stopped_run).await;
+    let stopped_step = running(stopped_run, 0).await;
+    assert!(
+        store
+            .transition_run(stopped_run, RunStatus::Running, RunStatus::Stopped, at)
+            .await
+            .expect("transition_run"),
+        "running -> stopped"
+    );
+    assert!(
+        store
+            .transition_step(stopped_step, StepStatus::Running, StepStatus::Stopped, at)
+            .await
+            .expect("transition_step"),
+        "running -> stopped"
+    );
+    assert!(
+        store
+            .transition(stopped, Status::InProgress, Status::Blocked)
+            .await
+            .expect("transition")
+    );
+
     // FEAT-3 blocked behind its queued `RUN_2`: a candidate carries its queued run, not only its
     // parked ones (T2's unblock reads the first active run, blueprint H-1).
     assert!(
@@ -826,10 +873,23 @@ async fn the_mirror_lists_waiting_candidates_like_postgres() {
             ids::HTUI_FEAT_2,
             ids::HTUI_FEAT_3,
             minted,
+            stopped,
             ids::HTUI_TOOL_1,
             ids::AGY_FIX_1
         ],
-        "ANA-2, FEAT-2, FEAT-3, the minted item and TOOL-1 of htui, then agy's FIX-1"
+        "ANA-2, FEAT-2, FEAT-3, the two minted items and TOOL-1 of htui, then agy's FIX-1"
+    );
+    assert_eq!(
+        mirrored
+            .iter()
+            .find(|row| row.item.id == stopped)
+            .expect("the stopped item is listed")
+            .runs
+            .iter()
+            .map(|(run, steps)| (run.id, run.status, steps.len()))
+            .collect::<Vec<_>>(),
+        vec![(stopped_run, RunStatus::Stopped, 1)],
+        "the stopped item carries its stopped run and the run's stopped step"
     );
     let feat_3 = mirrored
         .iter()
