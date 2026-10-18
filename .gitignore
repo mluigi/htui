@@ -9,4 +9,6 @@ graphify-out/cache
 .env
 .env.*
 /.claude/.headroom_wrap_settings.lock
+/.claude/.headroom_wrap_marker.json
+/.claude/.headroom_wrap_owners.json
 /.claude/skills/generated/
