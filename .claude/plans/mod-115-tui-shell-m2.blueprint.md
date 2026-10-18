@@ -568,6 +568,16 @@ with T5 serially.
     acts the fixed keys shadow), `keys/hint.rs`, `tests/keys_file.rs` and `tests/fixtures/keys/errors.toml`, and the
     `app/state.rs` test `every_global_act_is_fixed_mapped_or_offerable` (a `NextPane`/`PrevPane` exemption that Task 6
     drops when it wires them).
+  - *Version-1 files (T0 repair 2).* An `[editor] focus` entry in a version-1 file takes a `since: 2` default's
+    chord in any context (E9 (d) holds focus against every row), so `focus = ["f2"]` loads with a notice; and
+    `--print-keys` prints the version the keys were read under (`version = 1` for a file from before M2), so a
+    print reads back under the rules it loaded under.
+  - *The `QUIT` layer acts from T0 on (needs a maintainer call).* B4 puts `QUIT` in the overlay stacks in T0. The
+    hardcoded `ctrl-c` branch still answers first, and the modal filter drops a printable quit (`q`), so the default
+    keys act as before; but a quit the user rebound to a ctrl, alt or named chord (`[global] quit = ["ctrl-x"]`) now
+    quits over `Stack::OVERLAY`, the switcher, migration, waiting list, queue, concepts search and abort question,
+    as `ctrl-c` already does there, where before T0 the modal overlay swallowed it. No test or snapshot changed. The
+    alternative is moving `QUIT` (and `met_in_m2`'s tests) to Task 6 with the `ctrl-c` branch.
   - *§1.5's implementer check is a test:* `every_view_that_builds_a_text_widget_names_a_capturing_stack`
     (`views.rs`) fails a view source that builds a `TextField`/`TextArea`/`Composer` without naming a capturing
     stack (the Requirements forms and the directory picker are checked through their hosts).
