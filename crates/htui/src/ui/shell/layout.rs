@@ -1,5 +1,7 @@
 //! The layout engine (MOD-115 M2 D2, blueprint §6.1): pure geometry from a tab's body region and
-//! [`TabLayout`] to its [`PaneAreas`], the visible panes' focus order, mouse hits and seams.
+//! [`TabLayout`] to its [`PaneAreas`], the visible panes' focus order, mouse hits and seams; the
+//! steps the `[layout]` keys and the seam drags take on a [`TabLayout`]; and the note a hidden
+//! pane leaves ([`hidden_note`]).
 //!
 //! The presets: [`Preset::Ide`] puts the list beside the detail; [`Preset::IdeActivity`] puts
 //! that pair over the activity pane (`activity_pct` of the height); [`Preset::Columns`] lays the
@@ -281,6 +283,203 @@ pub fn seam(areas: &PaneAreas, x: u16, y: u16) -> Option<Seam> {
             }
     });
     (on_activity || on_neighbour).then_some(Seam::Activity)
+}
+
+/// The labels the hidden-pane note names, already resolved from the keymap (`Keys::label` of
+/// `layout.toggle_list`, `layout.toggle_activity`, `layout.next_preset`, `layout.zoom`); a
+/// `None` label (the act has no chord) drops its part of the note.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NoteLabels {
+    /// `layout.toggle_list`.
+    pub toggle_list: Option<String>,
+    /// `layout.toggle_activity`.
+    pub toggle_activity: Option<String>,
+    /// `layout.next_preset`.
+    pub next_preset: Option<String>,
+    /// `layout.zoom`.
+    pub zoom: Option<String>,
+}
+
+/// What a hidden pane says about bringing it back (`R-TUI-12`), for the detail's bottom border:
+/// `z unzoom` while another pane is zoomed, `F2 show list · p layouts` while the list is hidden
+/// by its toggle or the preset, `F3 show activity` while the activity pane is toggled off;
+/// joined with ` · `. `None` when nothing is hidden but by the preset's lack of an activity pane.
+#[must_use]
+pub fn hidden_note(areas: &PaneAreas, labels: &NoteLabels) -> Option<String> {
+    let part =
+        |label: &Option<String>, what: &str| label.as_ref().map(|key| format!("{key} {what}"));
+    let detail_zoomed_away =
+        areas.detail.is_empty() && (areas.list.is_some() || areas.activity.is_some());
+    let zoomed = detail_zoomed_away
+        || areas.list_hidden == Some(HiddenBy::Zoom)
+        || areas.activity_hidden == Some(HiddenBy::Zoom);
+    let list = matches!(areas.list_hidden, Some(HiddenBy::Toggle | HiddenBy::Preset));
+    let activity = areas.activity_hidden == Some(HiddenBy::Toggle);
+    let parts: Vec<String> = [
+        zoomed.then(|| part(&labels.zoom, "unzoom")),
+        list.then(|| part(&labels.toggle_list, "show list")),
+        list.then(|| part(&labels.next_preset, "layouts")),
+        activity.then(|| part(&labels.toggle_activity, "show activity")),
+    ]
+    .into_iter()
+    .flatten()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// The list's percentage step (`layout.grow_list` / `shrink_list`).
+const LIST_PERCENT_STEP: u16 = 5;
+/// The list's percentage bounds.
+const LIST_PERCENT_RANGE: (u16, u16) = (15, 85);
+/// The list's cell step; the cell width is clamped where it is drawn.
+const LIST_CELLS_STEP: u16 = 4;
+/// The activity pane's percentage step (`layout.grow_activity` / `shrink_activity`).
+const ACTIVITY_STEP: u16 = 5;
+/// The activity pane's percentage bounds.
+const ACTIVITY_RANGE: (u16, u16) = (15, 60);
+
+/// `value` in `range`, inclusive.
+fn within(value: u16, (low, high): (u16, u16)) -> u16 {
+    value.clamp(low, high)
+}
+
+/// `part` of `whole` in percent, rounded to the nearest.
+fn percent_of(part: u16, whole: u16) -> u16 {
+    if whole == 0 {
+        return 0;
+    }
+    let rounded = (u32::from(part) * 100 + u32::from(whole) / 2) / u32::from(whole);
+    u16::try_from(rounded).unwrap_or(u16::MAX)
+}
+
+impl TabLayout {
+    /// The next preset in [`Preset::ALL`], wrapping (`layout.next_preset`).
+    pub fn next_preset(&mut self) {
+        self.cycle_preset(1);
+    }
+
+    /// The previous preset, wrapping (`layout.prev_preset`).
+    pub fn prev_preset(&mut self) {
+        self.cycle_preset(Preset::ALL.len() - 1);
+    }
+
+    fn cycle_preset(&mut self, by: usize) {
+        let at = Preset::ALL
+            .iter()
+            .position(|preset| *preset == self.preset)
+            .unwrap_or(0);
+        self.preset = Preset::ALL[(at + by) % Preset::ALL.len()];
+    }
+
+    /// A wider list (`layout.grow_list`): 5 points of a percentage up to 85, or 4 cells.
+    pub fn grow_list(&mut self) {
+        self.list = match self.list {
+            ListSize::Percent(p) => ListSize::Percent(within(
+                p.saturating_add(LIST_PERCENT_STEP),
+                LIST_PERCENT_RANGE,
+            )),
+            ListSize::Cells(n) => ListSize::Cells(n.saturating_add(LIST_CELLS_STEP)),
+        };
+    }
+
+    /// A narrower list (`layout.shrink_list`): 5 points of a percentage down to 15, or 4 cells
+    /// down to one.
+    pub fn shrink_list(&mut self) {
+        self.list = match self.list {
+            ListSize::Percent(p) => ListSize::Percent(within(
+                p.saturating_sub(LIST_PERCENT_STEP),
+                LIST_PERCENT_RANGE,
+            )),
+            ListSize::Cells(n) => ListSize::Cells(n.saturating_sub(LIST_CELLS_STEP).max(1)),
+        };
+    }
+
+    /// A larger activity pane (`layout.grow_activity`): 5 points, up to 60.
+    pub fn grow_activity(&mut self) {
+        self.activity_pct = within(
+            self.activity_pct.saturating_add(ACTIVITY_STEP),
+            ACTIVITY_RANGE,
+        );
+    }
+
+    /// A smaller activity pane (`layout.shrink_activity`): 5 points, down to 15.
+    pub fn shrink_activity(&mut self) {
+        self.activity_pct = within(
+            self.activity_pct.saturating_sub(ACTIVITY_STEP),
+            ACTIVITY_RANGE,
+        );
+    }
+
+    /// Hides a shown list, shows a hidden one (`layout.toggle_list`); a list hidden by
+    /// [`Preset::Focus`] is shown by leaving it for [`Preset::Ide`].
+    pub fn toggle_list(&mut self) {
+        if self.preset == Preset::Focus {
+            self.preset = Preset::Ide;
+            self.list_on = true;
+        } else {
+            self.list_on = !self.list_on;
+        }
+    }
+
+    /// Hides a shown activity pane, shows a hidden one (`layout.toggle_activity`); a preset
+    /// without one moves to [`Preset::IdeActivity`].
+    pub fn toggle_activity(&mut self) {
+        let has_activity = matches!(self.preset, Preset::IdeActivity | Preset::Columns);
+        if !has_activity {
+            self.preset = Preset::IdeActivity;
+            self.activity_on = true;
+        } else {
+            self.activity_on = !self.activity_on;
+        }
+    }
+
+    /// Zooms the focused pane, or unzooms (`layout.zoom`).
+    pub fn toggle_zoom(&mut self) {
+        self.zoom = !self.zoom;
+    }
+
+    /// The list seam dragged to column `x` of `region` (the tab's body): the list's right border
+    /// moves there. The size keeps its kind: a percentage of the width the list shares with the
+    /// detail (15..=85), or cells (clamped to the minimums when the pair holds them). Nothing
+    /// changes while the list or the detail is hidden.
+    pub fn set_list_at(&mut self, region: Rect, x: u16) {
+        let drawn = areas(region, self, PaneId::List);
+        let (Some(list), Some(detail)) = (drawn.list, rect_of(&drawn, PaneId::Detail)) else {
+            return;
+        };
+        let shared = list.width + detail.width;
+        if shared < 2 {
+            return;
+        }
+        let width = (x.saturating_add(1))
+            .saturating_sub(list.x)
+            .clamp(1, shared - 1);
+        self.list = match self.list {
+            ListSize::Percent(_) => {
+                ListSize::Percent(within(percent_of(width, shared), LIST_PERCENT_RANGE))
+            }
+            ListSize::Cells(_) => {
+                ListSize::Cells(clamped(width, shared, MIN_LIST, MIN_DETAIL).unwrap_or(width))
+            }
+        };
+    }
+
+    /// The activity seam dragged to the cell `(x, y)` of `region` (the tab's body): the activity
+    /// pane's top border (stacked) or left border (columns) moves there, its share of the
+    /// region kept in 15..=60. Nothing changes while the activity pane is hidden.
+    pub fn set_activity_at(&mut self, region: Rect, x: u16, y: u16) {
+        let drawn = areas(region, self, PaneId::List);
+        if drawn.activity.is_none() {
+            return;
+        }
+        let share = match self.preset {
+            Preset::IdeActivity => percent_of(region.bottom().saturating_sub(y), region.height),
+            Preset::Columns => percent_of(region.right().saturating_sub(x), region.width),
+            Preset::Ide | Preset::Focus => return,
+        };
+        self.activity_pct = within(share, ACTIVITY_RANGE);
+    }
 }
 
 #[cfg(test)]
@@ -676,5 +875,329 @@ mod tests {
         for x in 0..100 {
             assert_eq!(seam(&zoomed, x, 5), None, "x = {x}");
         }
+    }
+
+    fn labels() -> NoteLabels {
+        NoteLabels {
+            toggle_list: Some("F2".to_owned()),
+            toggle_activity: Some("F3".to_owned()),
+            next_preset: Some("p".to_owned()),
+            zoom: Some("z".to_owned()),
+        }
+    }
+
+    fn note(layout: &TabLayout, focus: PaneId) -> Option<String> {
+        hidden_note(&areas(WIDE, layout, focus), &labels())
+    }
+
+    #[test]
+    fn nothing_hidden_but_the_presets_activity_pane_leaves_no_note() {
+        assert_eq!(note(&TabLayout::DEFAULT, PaneId::List), None);
+        assert_eq!(note(&layout(Preset::IdeActivity), PaneId::List), None);
+        assert_eq!(note(&layout(Preset::Columns), PaneId::List), None);
+    }
+
+    #[test]
+    fn a_hidden_list_says_how_to_show_it_and_where_the_layouts_are() {
+        let off = TabLayout {
+            list_on: false,
+            ..TabLayout::DEFAULT
+        };
+        assert_eq!(
+            note(&off, PaneId::Detail).as_deref(),
+            Some("F2 show list · p layouts")
+        );
+        assert_eq!(
+            note(&layout(Preset::Focus), PaneId::Detail).as_deref(),
+            Some("F2 show list · p layouts"),
+            "the preset hides it the same way"
+        );
+    }
+
+    #[test]
+    fn a_zoom_says_how_to_unzoom_whichever_pane_is_zoomed() {
+        let zoomed = TabLayout {
+            zoom: true,
+            ..TabLayout::DEFAULT
+        };
+        assert_eq!(note(&zoomed, PaneId::Detail).as_deref(), Some("z unzoom"));
+        assert_eq!(note(&zoomed, PaneId::List).as_deref(), Some("z unzoom"));
+        let activity = TabLayout {
+            preset: Preset::IdeActivity,
+            ..zoomed
+        };
+        assert_eq!(
+            note(&activity, PaneId::Activity).as_deref(),
+            Some("z unzoom")
+        );
+    }
+
+    #[test]
+    fn a_toggled_off_activity_pane_says_how_to_show_it() {
+        let off = TabLayout {
+            preset: Preset::Columns,
+            activity_on: false,
+            ..TabLayout::DEFAULT
+        };
+        assert_eq!(
+            note(&off, PaneId::List).as_deref(),
+            Some("F3 show activity")
+        );
+    }
+
+    #[test]
+    fn every_reason_joins_the_note_unzoom_first() {
+        let all = TabLayout {
+            preset: Preset::IdeActivity,
+            list_on: false,
+            activity_on: false,
+            zoom: true,
+            ..TabLayout::DEFAULT
+        };
+        assert_eq!(
+            note(&all, PaneId::Detail).as_deref(),
+            Some("F2 show list · p layouts · F3 show activity"),
+            "nothing left to zoom away: no unzoom part"
+        );
+        let mixed = TabLayout {
+            preset: Preset::IdeActivity,
+            list_on: false,
+            zoom: true,
+            ..TabLayout::DEFAULT
+        };
+        assert_eq!(
+            note(&mixed, PaneId::Detail).as_deref(),
+            Some("z unzoom · F2 show list · p layouts")
+        );
+    }
+
+    #[test]
+    fn a_missing_label_drops_its_part_of_the_note() {
+        let off = TabLayout {
+            list_on: false,
+            ..TabLayout::DEFAULT
+        };
+        let hidden = areas(WIDE, &off, PaneId::Detail);
+        let no_toggle = NoteLabels {
+            toggle_list: None,
+            ..labels()
+        };
+        assert_eq!(
+            hidden_note(&hidden, &no_toggle).as_deref(),
+            Some("p layouts")
+        );
+        assert_eq!(hidden_note(&hidden, &NoteLabels::default()), None);
+        let zoomed = areas(
+            WIDE,
+            &TabLayout {
+                zoom: true,
+                ..TabLayout::DEFAULT
+            },
+            PaneId::Detail,
+        );
+        assert_eq!(
+            hidden_note(
+                &zoomed,
+                &NoteLabels {
+                    zoom: None,
+                    ..labels()
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_presets_cycle_both_ways_and_wrap() {
+        let mut layout = TabLayout::DEFAULT;
+        let mut seen = Vec::new();
+        for _ in 0..Preset::ALL.len() {
+            layout.next_preset();
+            seen.push(layout.preset);
+        }
+        assert_eq!(
+            seen,
+            [
+                Preset::IdeActivity,
+                Preset::Columns,
+                Preset::Focus,
+                Preset::Ide
+            ]
+        );
+        layout.prev_preset();
+        assert_eq!(layout.preset, Preset::Focus);
+        layout.prev_preset();
+        assert_eq!(layout.preset, Preset::Columns);
+    }
+
+    #[test]
+    fn a_percent_list_steps_by_five_within_fifteen_and_eighty_five() {
+        let mut layout = TabLayout::DEFAULT;
+        layout.grow_list();
+        assert_eq!(layout.list, ListSize::Percent(55));
+        layout.shrink_list();
+        layout.shrink_list();
+        assert_eq!(layout.list, ListSize::Percent(45));
+        for _ in 0..20 {
+            layout.grow_list();
+        }
+        assert_eq!(layout.list, ListSize::Percent(85));
+        for _ in 0..20 {
+            layout.shrink_list();
+        }
+        assert_eq!(layout.list, ListSize::Percent(15));
+    }
+
+    #[test]
+    fn a_cells_list_steps_by_four_and_never_below_one_cell() {
+        let mut layout = with_list(ListSize::Cells(32));
+        layout.grow_list();
+        assert_eq!(layout.list, ListSize::Cells(36));
+        layout.shrink_list();
+        layout.shrink_list();
+        assert_eq!(layout.list, ListSize::Cells(28));
+        for _ in 0..20 {
+            layout.shrink_list();
+        }
+        assert_eq!(layout.list, ListSize::Cells(1));
+    }
+
+    #[test]
+    fn the_activity_pane_steps_by_five_within_fifteen_and_sixty() {
+        let mut layout = TabLayout::DEFAULT;
+        layout.grow_activity();
+        assert_eq!(layout.activity_pct, 35);
+        layout.shrink_activity();
+        layout.shrink_activity();
+        assert_eq!(layout.activity_pct, 25);
+        for _ in 0..20 {
+            layout.grow_activity();
+        }
+        assert_eq!(layout.activity_pct, 60);
+        for _ in 0..20 {
+            layout.shrink_activity();
+        }
+        assert_eq!(layout.activity_pct, 15);
+    }
+
+    #[test]
+    fn toggling_the_list_hides_and_shows_it_and_leaves_focus_for_ide() {
+        let mut layout = TabLayout::DEFAULT;
+        layout.toggle_list();
+        assert!(!layout.list_on);
+        layout.toggle_list();
+        assert!(layout.list_on);
+        let mut focus = TabLayout {
+            preset: Preset::Focus,
+            ..TabLayout::DEFAULT
+        };
+        focus.toggle_list();
+        assert_eq!((focus.preset, focus.list_on), (Preset::Ide, true));
+        let mut both = TabLayout {
+            preset: Preset::Focus,
+            list_on: false,
+            ..TabLayout::DEFAULT
+        };
+        both.toggle_list();
+        assert_eq!((both.preset, both.list_on), (Preset::Ide, true));
+    }
+
+    #[test]
+    fn toggling_the_activity_pane_on_moves_to_a_preset_that_has_one() {
+        let mut stacked = layout(Preset::IdeActivity);
+        stacked.toggle_activity();
+        assert!(!stacked.activity_on);
+        stacked.toggle_activity();
+        assert_eq!(
+            (stacked.preset, stacked.activity_on),
+            (Preset::IdeActivity, true)
+        );
+        let mut columns = layout(Preset::Columns);
+        columns.toggle_activity();
+        columns.toggle_activity();
+        assert_eq!(columns.preset, Preset::Columns, "it has one already");
+        for preset in [Preset::Ide, Preset::Focus] {
+            let mut without = layout(preset);
+            without.toggle_activity();
+            assert_eq!(
+                (without.preset, without.activity_on),
+                (Preset::IdeActivity, true),
+                "from {preset:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn zoom_toggles() {
+        let mut layout = TabLayout::DEFAULT;
+        layout.toggle_zoom();
+        assert!(layout.zoom);
+        layout.toggle_zoom();
+        assert!(!layout.zoom);
+    }
+
+    #[test]
+    fn dragging_the_list_seam_keeps_the_size_kind() {
+        let mut percent = TabLayout::DEFAULT;
+        percent.set_list_at(WIDE, 59);
+        assert_eq!(percent.list, ListSize::Percent(60));
+        assert_eq!(
+            areas(WIDE, &percent, PaneId::List).list.map(|r| r.right()),
+            Some(60)
+        );
+        percent.set_list_at(WIDE, 2);
+        assert_eq!(percent.list, ListSize::Percent(15));
+        percent.set_list_at(WIDE, 99);
+        assert_eq!(percent.list, ListSize::Percent(85));
+
+        let mut cells = with_list(ListSize::Cells(32));
+        cells.set_list_at(WIDE, 39);
+        assert_eq!(cells.list, ListSize::Cells(40));
+        cells.set_list_at(WIDE, 2);
+        assert_eq!(cells.list, ListSize::Cells(MIN_LIST));
+        cells.set_list_at(WIDE, 99);
+        assert_eq!(cells.list, ListSize::Cells(100 - MIN_DETAIL));
+    }
+
+    #[test]
+    fn dragging_the_list_seam_in_columns_measures_against_the_pair() {
+        let mut columns = layout(Preset::Columns);
+        columns.set_list_at(WIDE, 41);
+        // The pair is 70 cells wide: a 42-cell list is 60% of it.
+        assert_eq!(columns.list, ListSize::Percent(60));
+    }
+
+    #[test]
+    fn dragging_a_hidden_lists_seam_changes_nothing() {
+        let mut focus = layout(Preset::Focus);
+        focus.set_list_at(WIDE, 30);
+        assert_eq!(focus, layout(Preset::Focus));
+        let mut zoomed = TabLayout {
+            zoom: true,
+            ..TabLayout::DEFAULT
+        };
+        let before = zoomed;
+        zoomed.set_list_at(WIDE, 30);
+        assert_eq!(zoomed, before);
+    }
+
+    #[test]
+    fn dragging_the_activity_seam_sets_its_share_of_the_region() {
+        let mut stacked = layout(Preset::IdeActivity);
+        // The activity's top border on row 21: 10 of the 30 rows, 33%.
+        stacked.set_activity_at(WIDE, 5, 21);
+        assert_eq!(stacked.activity_pct, 33);
+        stacked.set_activity_at(WIDE, 5, 30);
+        assert_eq!(stacked.activity_pct, 15);
+        stacked.set_activity_at(WIDE, 5, 1);
+        assert_eq!(stacked.activity_pct, 60);
+
+        let mut columns = layout(Preset::Columns);
+        columns.set_activity_at(WIDE, 59, 5);
+        assert_eq!(columns.activity_pct, 41);
+
+        let mut ide = TabLayout::DEFAULT;
+        ide.set_activity_at(WIDE, 5, 21);
+        assert_eq!(ide, TabLayout::DEFAULT, "no activity pane to drag");
     }
 }
