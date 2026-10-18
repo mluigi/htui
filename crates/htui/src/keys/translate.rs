@@ -13,7 +13,9 @@
 //! 5. a plain canonical key its `[field]` row did not claim first: swallowed when nothing in the
 //!    stack binds it, else the key, untouched, for the view or the shell to resolve (D-13: a
 //!    focused widget still reads such a key literally, e.g. `left` kept by `choice.prev` after
-//!    `field.left` moved off it);
+//!    `field.left` moved off it). A shifted canonical key (`shift-left`, which the widgets read as
+//!    `left`) is no row's chord: it follows its row's plain key, delivered while the row holds
+//!    it and swallowed with it once the row moves off;
 //! 6. anything else: the key, untouched.
 //!
 //! MOD-115 M2 Task 5 writes it; Task 6 calls it from `App::on_key`. A site that needs submit or
@@ -147,10 +149,20 @@ pub fn translate(keys: &Keys, stack: Stack<'_>, key: KeyEvent) -> Option<KeyEven
             state: key.state,
         });
     }
-    if FieldEvent::of(&key).is_some() && candidates.is_empty() {
+    if candidates.is_empty()
+        && let Some(event) = FieldEvent::of(&key)
+        && (key.modifiers.is_empty() || !holds_its_canonical_key(keys, event))
+    {
         return None;
     }
     Some(key)
+}
+
+/// Whether `event`'s `[field]` row still holds the plain canonical key, so a shifted variant
+/// (no row's chord, read by the widgets as the plain key) still belongs to it.
+fn holds_its_canonical_key(keys: &Keys, event: FieldEvent) -> bool {
+    keys.chords(super::Context::Field, event.act())
+        .contains(&KeyChord::new(event.canonical(), KeyModifiers::NONE))
 }
 
 #[cfg(test)]
@@ -300,6 +312,37 @@ mod tests {
         assert_eq!(
             translate(&keys, views::ITEM_FORM, key("left")),
             Some(key("left"))
+        );
+    }
+
+    /// Rule 5 drops only what a `[field]` row gave up: a shifted editing key (`shift-left`,
+    /// `shift-home`, `shift-backspace`) is no row's chord, and the widgets read it as the plain
+    /// key, so it reaches them while its row still holds the plain key, and goes with it once the
+    /// row moves off.
+    #[test]
+    fn a_shifted_editing_key_follows_its_row() {
+        let shift = |code| KeyEvent::new(code, KeyModifiers::SHIFT);
+        for stack in [views::CAPTURE, views::REQUIREMENTS_FORM, views::ITEM_FORM] {
+            for event in FieldEvent::ALL {
+                if event == FieldEvent::Cancel {
+                    continue;
+                }
+                let key = shift(event.canonical());
+                assert_eq!(
+                    translate(Keys::compiled(), stack, key),
+                    Some(key),
+                    "{event:?}"
+                );
+            }
+        }
+        let moved = load_str("version = 2\n[field]\nleft = [\"ctrl-b\"]\n").expect("loads");
+        assert_eq!(
+            translate(&moved, views::CAPTURE, shift(KeyCode::Left)),
+            None
+        );
+        assert_eq!(
+            translate(&moved, views::CAPTURE, shift(KeyCode::Right)),
+            Some(shift(KeyCode::Right))
         );
     }
 
