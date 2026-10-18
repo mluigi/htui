@@ -869,7 +869,9 @@ impl App {
     /// The global keys the status line listed before MOD-115, as text: the global actions the
     /// active view's stack admits and the shell offers, chords from [`Keys`]. Nothing draws it
     /// any more (the header's chips and the `?` box carry the same keys); tests read it to pin how
-    /// a view's stack and a rebind shape what a user can press.
+    /// a view's stack and a rebind shape what a user can press. Compiled only for tests and the
+    /// `testkit` feature.
+    #[cfg(any(test, feature = "testkit"))]
     #[must_use]
     pub fn keys_line(&self) -> String {
         self.keys

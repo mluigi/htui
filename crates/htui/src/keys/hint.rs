@@ -149,7 +149,10 @@ impl Keys {
     /// order that is `offered` and has an admitted chord, each through the **first** global
     /// layer that offers it (`Stack::admits`), its first admitted chord, rows sharing a help
     /// label collapsed to the first (the digits), joined by ` · `. `Stack::BASE` gives the M1
-    /// line; a stack with one global layer renders exactly as before (MOD-67 M4 PA-2).
+    /// line; a stack with one global layer renders exactly as before (MOD-67 M4 PA-2). Nothing
+    /// draws it since MOD-115 (the header's chips and the `?` box carry the same keys), so it is
+    /// compiled only for tests and the `testkit` feature.
+    #[cfg(any(test, feature = "testkit"))]
     #[must_use]
     pub fn status_line(&self, stack: Stack<'_>, offered: impl Fn(Act) -> bool) -> String {
         // The first global layer that offers `act` (a `TABS` layer before `MODAL`, M4 PA-2).

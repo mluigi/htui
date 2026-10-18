@@ -4,6 +4,10 @@ Every key htui binds by default, exactly as `htui --default-keys --print-keys` p
 complete `keys.toml`. To change a key, copy its line into `keys.toml` in htui's configuration
 directory and edit it there; list only what you change (README, [Changing keys](../README.md#changing-keys)).
 
+`global.about` (the about panel) owns `f9` by default. A `keys.toml` that binds `f9` in another
+context now fails validation (htui exits with status 2 and names the clash) and must rebind it:
+move that action to a free chord, or rebind `global.about` first.
+
 This page is generated. After a change to the key catalogue, replace the block below with the
 output of `cargo run -q -p htui -- --default-keys --print-keys`; `cargo test -p htui --test
 keys_file` fails until it matches.
