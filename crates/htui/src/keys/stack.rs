@@ -293,6 +293,7 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("in the agent help proposal", views::HELP_PROPOSAL),
     ("in Requirements", views::REQUIREMENTS_BROWSE),
     ("in a Requirements form", views::REQUIREMENTS_FORM),
+    ("in a Requirements area form", views::AREA_FORM),
     (
         "in the Requirements withdraw form",
         views::REQUIREMENTS_WITHDRAW,
@@ -304,6 +305,7 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("in Backlog > Body", views::BACKLOG_BODY),
     ("in Backlog > Runs", views::RUNS_BROWSE),
     ("in a Runs question", views::RUNS_CONFIRM),
+    ("in a Runs cancel question", views::RUNS_CANCEL),
     ("while the Runs close-out counts", views::RUNS_COUNTING),
     ("in the Runs document view", views::RUNS_ARTIFACT),
     ("in Backlog > Graph", views::BACKLOG_GRAPH),
@@ -412,8 +414,8 @@ mod tests {
             DECLARED[2],
             ("in the focused in-pane editor", Stack::EDITOR_FOCUSED)
         );
-        assert_eq!(DECLARED.len(), 81);
-        assert_eq!(DECLARED[80], ("in the leave dialog", views::LEAVE));
+        assert_eq!(DECLARED.len(), 83);
+        assert_eq!(DECLARED[82], ("in the leave dialog", views::LEAVE));
         assert!(DECLARED.contains(&(WHILE_EDITING, Stack::EDITOR_OPEN)));
         let phrases: HashSet<&str> = DECLARED.iter().map(|(phrase, _)| *phrase).collect();
         assert_eq!(phrases.len(), DECLARED.len(), "a phrase is used twice");

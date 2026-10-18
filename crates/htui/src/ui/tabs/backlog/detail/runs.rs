@@ -698,9 +698,8 @@ impl RunsTab {
             | Mode::CloseOut(CloseOutStage::Typed { .. } | CloseOutStage::InFlight) => {
                 views::CAPTURE
             }
-            Mode::ConfirmCancel { .. } | Mode::CloseOut(CloseOutStage::Warn(_)) => {
-                views::RUNS_CONFIRM
-            }
+            Mode::ConfirmCancel { .. } => views::RUNS_CANCEL,
+            Mode::CloseOut(CloseOutStage::Warn(_)) => views::RUNS_CONFIRM,
             Mode::CloseOut(CloseOutStage::Counting) => views::RUNS_COUNTING,
             Mode::Artifact { .. } => views::RUNS_ARTIFACT,
         }
@@ -3678,6 +3677,14 @@ mod tests {
         assert_eq!(
             footer(&pane),
             ["cancel this run?", "y cancel it · n keep it"]
+        );
+        // T5 repair: the question answers only yes or no, so its `?` box lists no choice keys.
+        assert_eq!(pane.stack(), crate::keys::views::RUNS_CANCEL);
+        assert!(
+            crate::keys::Keys::compiled()
+                .help_lines(pane.stack(), |_| false)
+                .iter()
+                .all(|line| line.heading != "Choice")
         );
 
         for swallowed in ['q', 'j', 'x', '1'] {

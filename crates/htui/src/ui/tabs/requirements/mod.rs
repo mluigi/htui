@@ -263,7 +263,8 @@ impl RequirementsTab {
         match &self.mode {
             Mode::Browse => views::REQUIREMENTS_BROWSE,
             Mode::Filter { .. } => views::CAPTURE,
-            Mode::NewArea(_) | Mode::Requirement(_) => views::REQUIREMENTS_FORM,
+            Mode::NewArea(_) => views::AREA_FORM,
+            Mode::Requirement(_) => views::REQUIREMENTS_FORM,
             Mode::Withdraw(_) => views::REQUIREMENTS_WITHDRAW,
         }
     }
@@ -1771,6 +1772,40 @@ mod tests {
                 .any(|request| matches!(request, StoreRequest::RequirementDetail(id) if *id == ids::REQ_ENT_1)),
             "{sent:?}"
         );
+    }
+
+    /// MOD-115 M2 D7 (T5 repair): the area form has no priority and no choice field, so its
+    /// stack has neither layer: its `?` box lists only keys that act there, and `m`, `l` and
+    /// `Space` are text in its code field.
+    #[tokio::test]
+    async fn the_area_form_box_lists_only_keys_that_act() {
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let mut tab = tab_on(snapshot);
+        bench.key(&mut tab, KeyCode::Char('a'));
+        let stack = tab.key_stack().expect("the area form is open");
+        assert_eq!(stack, views::AREA_FORM);
+        let lines: Vec<String> = bench
+            .keys
+            .help_lines(stack, |_| false)
+            .iter()
+            .map(|line| line.text())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "Requirements: Tab/Down next field · Shift+Tab/Up previous field",
+                "Form: Ctrl+s save",
+                "Global: Ctrl+c quit",
+            ]
+        );
+        for code in [KeyCode::Char('m'), KeyCode::Char('l'), KeyCode::Char(' ')] {
+            assert_eq!(bench.key(&mut tab, code), Handled::Consumed, "{code:?}");
+        }
+        let Mode::NewArea(form) = &tab.mode else {
+            panic!("the area form is still open");
+        };
+        assert_eq!(form.code.text().unwrap_or_default(), "ml ");
     }
 
     /// MOD-39 review #3: a refusal of a write that is not the one in flight (one a scope change

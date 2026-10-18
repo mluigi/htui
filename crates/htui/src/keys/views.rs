@@ -168,9 +168,13 @@ const FORM: Layer = Layer::all(Context::Form);
 /// ([`Stack::captures_text`]). Always right after the view layer.
 const FIELD: Layer = Layer::all(Context::Field);
 
-/// Every `choice` act: a form with a choice field (the filter form, the item form's pickers,
-/// the Requirements priority, the close-out warning's resolution).
+/// Every `choice` act: a form with a choice field (the filter form, the Requirements priority,
+/// the close-out warning's resolution).
 const CHOICE: Layer = Layer::all(Context::Choice);
+
+/// `choice ∩ {prev, next}`: the item form's pickers, which only move (T5 repair: `toggle`
+/// would be listed in the `?` box and do nothing there).
+const PICK: Layer = Layer::only(Context::Choice, &[Act::ChoicePrev, Act::ChoiceNext]);
 
 /// `choice ∩ {toggle}`: the attachment form's activation field, which only cycles.
 const TOGGLE: Layer = Layer::only(Context::Choice, &[Act::ChoiceToggle]);
@@ -709,7 +713,7 @@ pub const REQUIREMENTS_BROWSE: Stack<'static> = Stack::new(&[
     GLOBAL,
 ]);
 
-/// Requirements, the area form and the requirement form (mint and amend).
+/// Requirements, the requirement form (mint and amend).
 pub const REQUIREMENTS_FORM: Stack<'static> = Stack::new(&[
     Layer::view(
         Context::Requirements,
@@ -720,6 +724,15 @@ pub const REQUIREMENTS_FORM: Stack<'static> = Stack::new(&[
     ),
     FIELD,
     CHOICE,
+    FORM_ALL,
+    MODAL,
+]);
+
+/// Requirements, the area form: a code and a title, so no priority and no choice (T5 repair:
+/// sharing [`REQUIREMENTS_FORM`] listed keys the form types as text).
+pub const AREA_FORM: Stack<'static> = Stack::new(&[
+    Layer::view(Context::Requirements, &[]),
+    FIELD,
     FORM_ALL,
     MODAL,
 ]);
@@ -782,13 +795,17 @@ pub const RUNS_BROWSE: Stack<'static> = Stack::new(&[
     GLOBAL,
 ]);
 
-/// Backlog > Runs, the cancel question and the close-out warning.
+/// Backlog > Runs, the close-out warning (its resolution is a choice).
 pub const RUNS_CONFIRM: Stack<'static> = Stack::new(&[
     Layer::view(Context::BacklogRuns, &[]),
     CHOICE,
     CONFIRM,
     MODAL,
 ]);
+
+/// Backlog > Runs, the cancel question: yes or no, no choice (T5 repair).
+pub const RUNS_CANCEL: Stack<'static> =
+    Stack::new(&[Layer::view(Context::BacklogRuns, &[]), CONFIRM, MODAL]);
 
 /// Backlog > Runs, while the close-out counts (it can only be left).
 pub const RUNS_COUNTING: Stack<'static> =
@@ -944,7 +961,7 @@ pub const BACKLOG_FILTER: Stack<'static> = Stack::new(&[
 pub const ITEM_FORM: Stack<'static> = Stack::new(&[
     Layer::view(Context::BacklogItem, &[]),
     FIELD,
-    CHOICE,
+    PICK,
     FORM,
     MODAL,
 ]);
@@ -1213,10 +1230,12 @@ mod tests {
         HELP_PROPOSAL,
         REQUIREMENTS_BROWSE,
         REQUIREMENTS_FORM,
+        AREA_FORM,
         REQUIREMENTS_WITHDRAW,
         BACKLOG_BODY,
         RUNS_BROWSE,
         RUNS_CONFIRM,
+        RUNS_CANCEL,
         RUNS_COUNTING,
         RUNS_ARTIFACT,
         BACKLOG_GRAPH,
@@ -1735,6 +1754,7 @@ mod tests {
                 "TEMPLATES_EDITOR",
                 "HELP_ASKING",
                 "REQUIREMENTS_FORM",
+                "AREA_FORM",
                 "REQUIREMENTS_WITHDRAW",
                 "DOCS_COMPOSE",
                 "NOTES_COMPOSE",
@@ -1816,7 +1836,7 @@ mod tests {
             .iter()
             .filter(|(_, stack)| !NOT_VIEW_LED.contains(stack))
             .collect();
-        assert_eq!(views.len(), 73);
+        assert_eq!(views.len(), 75);
         for &&(phrase, stack) in &views {
             let first = stack.layers()[0];
             assert!(first.inherits(), "{phrase}: layer 0 is not a view layer");

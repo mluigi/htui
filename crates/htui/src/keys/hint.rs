@@ -677,6 +677,32 @@ mod tests {
                 "Global: Ctrl+c quit · F1 help · F9 about",
             ]
         );
+        // T5 repair: the cancel question answers only yes or no, the area form has no priority
+        // and no choice, and the item form's pickers only move, so none lists what it ignores.
+        assert_eq!(
+            texts(keys.help_lines(views::RUNS_CANCEL, bare)),
+            [
+                "Confirm: y yes · n/Esc no",
+                "Global: Ctrl+c quit · F1 help · F9 about",
+            ]
+        );
+        assert_eq!(
+            texts(keys.help_lines(views::AREA_FORM, bare)),
+            [
+                "Requirements: Tab/Down next field · Shift+Tab/Up previous field",
+                "Form: Ctrl+s save",
+                "Global: Ctrl+c quit · F1 help · F9 about",
+            ]
+        );
+        assert_eq!(
+            texts(keys.help_lines(views::ITEM_FORM, bare)),
+            [
+                "Item: Tab/Down next field · Shift+Tab/Up previous field",
+                "Choice: Left/h previous option · Right/l next option",
+                "Form: Ctrl+s save · Ctrl+e $EDITOR",
+                "Global: Ctrl+c quit · F1 help · F9 about",
+            ]
+        );
         assert_eq!(
             texts(keys.help_lines(views::ATTACH_FORM, bare)),
             [
