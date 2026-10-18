@@ -39,6 +39,7 @@ use super::agent_help::{AgentHelp, HelpOutcome, Report, accepted};
 use super::attach::{AttachOutcome, AttachPane};
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::{ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, edited};
+use crate::keys::translate::FieldEvent;
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::skill_import::ImportOutcome;
 use crate::skills::{READ_NAME, REQUEST_NAMES, SkillWrite, SkillsSnapshot, StaleWhat};
@@ -48,7 +49,7 @@ use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::backlog::detail::Scroll;
 use crate::ui::tabs::settings::{modal_rest, wrapped};
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme, diff};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 
 /// How many rows the notice may wrap to before it is cut; one when it fits.
 const NOTICE_LINES: usize = 2;
@@ -1379,12 +1380,12 @@ impl LibraryView {
             self.attach = None;
             return Handled::Pass;
         };
-        // The form's save is in flight: its reply closes the form or keeps it, so `Esc` waits for
-        // it, as the editor's does. `Esc` is the form's own cancel key (widget-owned, MOD-67 M4
-        // D10), not a resolved act.
+        // The form's save is in flight: its reply closes the form or keeps it, so the cancel
+        // waits for it, as the editor's does. The canonical `Esc` is `field.cancel` after the
+        // shell's translation (MOD-115 M2 D7), so it is decoded, not resolved.
         if let Some(busy) = self.busy
             && pane.in_form()
-            && key.code == KeyCode::Esc
+            && FieldEvent::of(&key) == Some(FieldEvent::Cancel)
         {
             self.notice = Some(Notice::Error(in_flight(busy)));
             return Handled::Consumed;
@@ -2003,7 +2004,7 @@ mod tests {
     use std::sync::Arc;
 
     use chrono::TimeDelta;
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::clock::{TestClock, epoch};
     use htui_core::fixtures::ids;
     use htui_core::model::{Attachment, ProjectRef, Scope, SkillBindingKey, StepId};

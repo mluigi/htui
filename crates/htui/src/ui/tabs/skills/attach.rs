@@ -35,13 +35,14 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::library::{Notice, Sent};
 use crate::app::{Ctx, Handled};
+use crate::keys::translate::FieldEvent;
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::skills::{ProjectSkills, SkillsSnapshot};
 use crate::store_worker::StoreRequest;
 use crate::ui::cells;
 use crate::ui::tabs::settings::modal_rest;
 use crate::ui::{FieldOutcome, TextField, Theme};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 
 /// A row's label field, in cells: a label is fitted to it with `cells::fit`, so the summary stays
 /// on the row and in one column.
@@ -260,24 +261,26 @@ impl From<Handled> for AttachOutcome {
     }
 }
 
-/// A key on the form's activation, which is not typed (a widget's value key, MOD-67 M4 D10):
-/// `Space` (no modifier but `SHIFT`) cycles `always \u{2192} glob \u{2192} off`, `Enter` submits
-/// and `Esc` cancels as a text field's do; anything else passes to the form's stack.
-fn activation_key(form: &mut Form, key: KeyEvent) -> FieldOutcome {
-    if !(key.modifiers - KeyModifiers::SHIFT).is_empty() {
-        return FieldOutcome::Pass;
+/// A key on the form's activation, which is not typed (a choice field, MOD-67 M4 D10; MOD-115
+/// M2 D7): `choice.toggle` (`Space`) through `stack` cycles `always \u{2192} glob \u{2192} off`,
+/// and the canonical `Enter`/`Esc` (`field.submit`/`field.cancel` after the shell's translation,
+/// [`FieldEvent::of`]) submit and cancel as a text field's do; anything else passes to the form's
+/// stack.
+fn activation_key(form: &mut Form, key: KeyEvent, keys: &Keys, stack: Stack<'_>) -> FieldOutcome {
+    if keys
+        .actions(stack, KeyChord::from_event(key))
+        .contains(&Act::ChoiceToggle)
+    {
+        form.activation = match form.activation {
+            Activation::Always => Activation::Glob,
+            Activation::Glob => Activation::Off,
+            Activation::Off => Activation::Always,
+        };
+        return FieldOutcome::Consumed;
     }
-    match key.code {
-        KeyCode::Char(' ') => {
-            form.activation = match form.activation {
-                Activation::Always => Activation::Glob,
-                Activation::Glob => Activation::Off,
-                Activation::Off => Activation::Always,
-            };
-            FieldOutcome::Consumed
-        }
-        KeyCode::Enter => FieldOutcome::Submit,
-        KeyCode::Esc => FieldOutcome::Cancel,
+    match FieldEvent::of(&key) {
+        Some(FieldEvent::Submit) => FieldOutcome::Submit,
+        Some(FieldEvent::Cancel) => FieldOutcome::Cancel,
         _ => FieldOutcome::Pass,
     }
 }
@@ -553,7 +556,7 @@ impl AttachPane {
         ctx: &Ctx<'_>,
     ) -> AttachOutcome {
         let outcome = match form.focus {
-            FormField::Activation => activation_key(&mut form, key),
+            FormField::Activation => activation_key(&mut form, key, ctx.keys(), stack),
             FormField::Pin => form.pin.on_key(key),
             FormField::Position => form.position.on_key(key),
             FormField::Languages => form.languages.on_key(key),
@@ -604,10 +607,10 @@ impl AttachPane {
         AttachOutcome::Consumed
     }
 
-    /// The picker, through `views::ATTACH_PICKER`. `attach.choose` types `<repo>:` into the globs
-    /// field at its cursor, one char key at a time (D101: `TextField` has no insert API, and a key
-    /// is what inserts at the cursor), after `, ` when the text before the cursor ends in anything
-    /// but `,` or whitespace; `common.back` returns to the form. Any other key is `modal_rest`'s.
+    /// The picker, through `views::ATTACH_PICKER`. `attach.choose` inserts `<repo>:` into the
+    /// globs field at its cursor (`TextField::on_paste`, MOD-115 M2: no key event is forged),
+    /// after `, ` when the text before the cursor ends in anything but `,` or whitespace;
+    /// `common.back` returns to the form. Any other key is `modal_rest`'s.
     fn on_picker_key(
         &mut self,
         stack: Stack<'static>,
@@ -637,9 +640,8 @@ impl AttachPane {
                         .and_then(|before| before.chars().last())
                         .is_some_and(|last| last != ',' && !last.is_whitespace());
                     let inserted = format!("{}{repo}:", if separator { ", " } else { "" });
-                    for c in inserted.chars() {
-                        form.globs.on_key(KeyEvent::from(KeyCode::Char(c)));
-                    }
+                    // Unmasked, so the paste always fits (it grows the field).
+                    form.globs.on_paste(&inserted);
                     form.focus = FormField::Globs;
                 }
                 self.mode = AttachMode::Form(form);
@@ -1225,6 +1227,59 @@ mod tests {
             detach_question("tests", "global", None),
             "detach `tests` from global?"
         );
+    }
+
+    /// A form over the global row, focus on the activation.
+    fn activation_form(activation: Activation) -> Form {
+        Form {
+            key: SkillBindingKey {
+                skill: SkillId::new(),
+                project: None,
+                phase: None,
+            },
+            target: "global".to_owned(),
+            token: None,
+            activation,
+            pin: TextField::with_text("latest"),
+            position: TextField::with_text("0"),
+            languages: TextField::new(),
+            globs: TextField::new(),
+            focus: FormField::Activation,
+        }
+    }
+
+    fn event(spec: &str) -> KeyEvent {
+        KeyChord::parse_strict(spec)
+            .expect("a valid spec")
+            .to_event()
+    }
+
+    /// MOD-115 M2 D7: the activation cycles on `choice.toggle`, so a rebound toggle cycles it and
+    /// `Space` no longer does; `Enter` and `Esc` submit and cancel.
+    #[test]
+    fn the_activation_cycles_on_the_toggle_in_force() {
+        let compiled = Keys::compiled();
+        let mut form = activation_form(Activation::Always);
+        let outcome = activation_key(&mut form, event("space"), compiled, views::ATTACH_FORM);
+        assert_eq!(outcome, FieldOutcome::Consumed);
+        assert_eq!(form.activation, Activation::Glob);
+        let keys =
+            crate::keys::load_str("version = 2\n[choice]\ntoggle = \"ctrl-t\"\n").expect("loads");
+        let outcome = activation_key(&mut form, event("ctrl-t"), &keys, views::ATTACH_FORM);
+        assert_eq!(outcome, FieldOutcome::Consumed);
+        assert_eq!(form.activation, Activation::Off);
+        let outcome = activation_key(&mut form, event("space"), &keys, views::ATTACH_FORM);
+        assert_eq!(outcome, FieldOutcome::Pass, "Space is no toggle now");
+        assert_eq!(form.activation, Activation::Off);
+        for (spec, expected) in [
+            ("enter", FieldOutcome::Submit),
+            ("esc", FieldOutcome::Cancel),
+            ("ctrl-r", FieldOutcome::Pass),
+            ("x", FieldOutcome::Pass),
+        ] {
+            let outcome = activation_key(&mut form, event(spec), compiled, views::ATTACH_FORM);
+            assert_eq!(outcome, expected, "{spec}");
+        }
     }
 
     /// A ZWJ family: one cluster of five code points, 2 cells.

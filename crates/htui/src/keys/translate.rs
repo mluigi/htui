@@ -161,7 +161,9 @@ mod tests {
     use crate::keys::{Act, CTRL_C, Context, KeyChord, Keys, Stack, load_str, views};
 
     fn key(spec: &str) -> KeyEvent {
-        KeyChord::parse_strict(spec).expect("a valid spec").to_event()
+        KeyChord::parse_strict(spec)
+            .expect("a valid spec")
+            .to_event()
     }
 
     fn plain(code: KeyCode) -> KeyEvent {
@@ -217,7 +219,11 @@ mod tests {
         for stack in [Stack::BASE, views::BACKLOG_BODY, views::RUNS_CONFIRM] {
             assert!(!stack.captures_text());
             for spec in ["ctrl-t", "enter", "esc", "left", "x"] {
-                assert_eq!(translate(&keys, stack, key(spec)), Some(key(spec)), "{spec}");
+                assert_eq!(
+                    translate(&keys, stack, key(spec)),
+                    Some(key(spec)),
+                    "{spec}"
+                );
             }
         }
     }
