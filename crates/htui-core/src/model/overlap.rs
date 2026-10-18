@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::model::{RepoId, RunId};
+use crate::model::{RepoId, RunId, WorkspaceId};
 
 /// Plan D79: `GraphSnapshot.scope`, the scope a run was resolved to at `StartRun`. Keys equal
 /// `run.repo_scope`.
@@ -124,7 +124,8 @@ pub fn scope_of(snapshot: &Value, repo_scope: &[RepoId]) -> RunScope {
 }
 
 /// Plan D83: `WriteStore::claim_run`'s verdict. MOD-7 milestone 3 (D80) adds `MissingTags`, the
-/// one verdict that writes, and its `Vec` payload is why the type is no longer `Copy`.
+/// one verdict that writes, and its `Vec` payload is why the type is no longer `Copy`. MOD-125
+/// adds `WorkspaceStopped`, which writes nothing.
 #[must_use = "a refused claim must be acted on; only `MissingTags` wrote anything"]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Claim {
@@ -132,6 +133,14 @@ pub enum Claim {
     Admitted,
     /// Not `queued`, or `target_box_id != box`.
     NotClaimable,
+    /// MOD-125 D5: the run was started from a workspace that has a `workspace_stop` row. Writes
+    /// nothing. Decided right after `NotClaimable` and before `MissingTags`, so a stopped
+    /// workspace never fails a run for its tags. Transient: the run stays `queued`, and a claim
+    /// after the resume admits it.
+    WorkspaceStopped {
+        /// The run's `workspace_id`.
+        workspace: WorkspaceId,
+    },
     /// `R-ORCH-10` at claim (MOD-7 milestone 3, D80, D81): the run's item requires tags the box
     /// has neither probed nor declared. **The one refusal that writes**: inside the admission
     /// transaction the run moved `queued -> failed` with [`missing_tags_failure`] as its
@@ -170,6 +179,7 @@ impl fmt::Display for Claim {
         match self {
             Self::Admitted => f.write_str("admitted"),
             Self::NotClaimable => f.write_str("not claimable"),
+            Self::WorkspaceStopped { workspace } => write!(f, "workspace {workspace} is stopped"),
             Self::MissingTags { missing } => f.write_str(&missing_tags_failure(missing)),
             Self::SlotFull { running, limit } => {
                 write!(f, "box full ({running} of {limit} running)")
@@ -385,6 +395,14 @@ mod tests {
             .to_string(),
             format!("overlaps run {with} (not_isolated)")
         );
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(9));
+        let stopped = Claim::WorkspaceStopped { workspace };
+        assert_eq!(
+            stopped.to_string(),
+            format!("workspace {workspace} is stopped"),
+            "MOD-125 D5"
+        );
+        assert!(!stopped.is_admitted());
         assert!(Claim::Admitted.is_admitted());
         assert!(!Claim::NotClaimable.is_admitted());
         assert!(

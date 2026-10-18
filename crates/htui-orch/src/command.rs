@@ -401,8 +401,9 @@ pub enum EngineError {
         item: ItemId,
     },
     /// Plan D83: why `claim_run` refused — the box is at `max_concurrent_items`, or the run's
-    /// scope overlaps a live one under ANA-2 §4.7's rules L, I or P. The run stays `queued`, and
-    /// `Engine::claim` re-attempts it (plan D84).
+    /// scope overlaps a live one under ANA-2 §4.7's rules L, I or P, or the run's workspace is
+    /// stopped (MOD-125 D5). The run stays `queued`, and `Engine::claim` re-attempts it (plan
+    /// D84).
     #[error("claim refused: {claim}")]
     ClaimRefused {
         /// The run that stayed queued.
@@ -1743,6 +1744,20 @@ mod tests {
             }
             .to_string(),
             format!("claim refused: overlaps run {} (paths)", ids::RUN_1)
+        );
+        assert_eq!(
+            EngineError::ClaimRefused {
+                run: ids::RUN_2,
+                claim: Claim::WorkspaceStopped {
+                    workspace: ids::WORKSPACE_PLATFORM,
+                },
+            }
+            .to_string(),
+            format!(
+                "claim refused: workspace {} is stopped",
+                ids::WORKSPACE_PLATFORM
+            ),
+            "MOD-125 D5"
         );
         assert_eq!(
             EngineError::MissingTags {

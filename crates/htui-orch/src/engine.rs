@@ -780,7 +780,8 @@ where
     ///
     /// # Errors
     /// [`EngineError::ClaimRefused`] naming the rule when the box is full or the scope overlaps,
-    /// the run then left `queued` with nothing written; [`EngineError::MissingTags`] when the
+    /// or the run's workspace is stopped (MOD-125 D5), the run then left `queued` with nothing
+    /// written; [`EngineError::MissingTags`] when the
     /// run's item needs tags this box lacks, after `claim_run` failed the run and blocked its item
     /// in its transaction and this engine wrote the note afterwards in a separate call, outside
     /// that transaction (`R-ORCH-10`, MOD-7 milestone 3 D85, as rung 4 does). If the walk is
@@ -795,8 +796,9 @@ where
         let ttl = self.lease_times().ttl;
         // Anything but `Admitted` is a refusal. `MissingTags` is `R-ORCH-10`'s: `claim_run`
         // already failed the run and blocked its item, and the engine adds the note (D78). The
-        // three verdicts named in the last arm are ANA-2 §4.7's admission, not claimable, box full
-        // or overlap (plan D83), which wrote nothing and left the run as it was.
+        // four verdicts named in the last arm are ANA-2 §4.7's admission, not claimable, box full
+        // or overlap (plan D83), and MOD-125 D5's stopped workspace, which wrote nothing and left
+        // the run as it was.
         let claim = self
             .parts
             .store
@@ -818,7 +820,10 @@ where
             }
             // Named, not a catch-all: a new `Claim` verdict is a compile error here until it is
             // sorted into a refusal or not (blueprint R-43).
-            claim @ (Claim::NotClaimable | Claim::SlotFull { .. } | Claim::Overlaps { .. }) => {
+            claim @ (Claim::NotClaimable
+            | Claim::WorkspaceStopped { .. }
+            | Claim::SlotFull { .. }
+            | Claim::Overlaps { .. }) => {
                 return Err(EngineError::ClaimRefused { run, claim });
             }
         }

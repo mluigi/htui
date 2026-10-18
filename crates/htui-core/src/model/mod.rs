@@ -104,6 +104,7 @@ pub mod skill;
 pub mod skill_glob;
 pub mod skill_import;
 pub mod skill_language;
+pub mod stop;
 pub mod usage;
 pub mod user;
 pub mod waiting;
@@ -192,6 +193,7 @@ pub use skill::{
 };
 pub use skill_glob::{GlobError, SkillGlob, SkillGlobs};
 pub use skill_language::UnknownLanguage;
+pub use stop::{StopMode, WorkspaceStop};
 pub use usage::UsageTotals;
 pub use user::{AppUser, CapabilityTag};
 pub use waiting::{WaitingCandidate, WaitingPermission};
@@ -372,6 +374,12 @@ mod tests {
             &["worktree", "copy", "shared_serialized", "local"],
         );
         check_enum(CommandQueue::ALL, &["off", "fan_out_only", "always"]);
+    }
+
+    /// `0019_stop_runs.sql`'s `chk_workspace_stop_mode` (MOD-125 plan D4).
+    #[test]
+    fn stop_mode_matches_check_list() {
+        check_enum(StopMode::ALL, &["graceful", "forced"]);
     }
 
     /// `0011_permission_relay.sql`'s `chk_step_permission_status` (MOD-42 plan D1).
