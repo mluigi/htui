@@ -22,11 +22,11 @@ use sqlx::Row as _;
 /// The `connect_timeout` every headless connect here passes.
 const HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The 45 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
+/// The 46 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
 /// adds (`run_step_tree`, ANA-2 §9), then the six of `0006_requirements.sql` (ANA-11 §5), then
 /// the two of `0011_permission_relay.sql` (MOD-42 plan D1), then the one of `0012_persona.sql`
 /// (MOD-26 plan D1), then the two of `0016_auto_queue.sql` (MOD-12 plan D1, D2), then the one of
-/// `0017_follow_up.sql` (MOD-70 plan D1).
+/// `0017_follow_up.sql` (MOD-70 plan D1), then the one of `0019_stop_runs.sql` (MOD-125 plan D4).
 const TABLES: &[&str] = &[
     "app_user",
     "capability_tag",
@@ -79,6 +79,8 @@ const TABLES: &[&str] = &[
     "queue_entry",
     // 0017_follow_up.sql (MOD-70)
     "follow_up_window",
+    // 0019_stop_runs.sql (MOD-125)
+    "workspace_stop",
 ];
 
 #[tokio::test]
@@ -100,7 +102,7 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(
         applied,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
         ],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
@@ -109,8 +111,8 @@ async fn migrations_apply_on_a_clean_database() {
          MOD-23's 0009_agent_box_user_off.sql, MOD-33's 0010_prompt_digest_undigested.sql, \
          MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql, MOD-26 milestone 2's \
          0013_persona_phase_index.sql, MOD-37 milestone 5's 0014_run_step_opening.sql, \
-         MOD-11's 0015_command_queue.sql, MOD-12's 0016_auto_queue.sql, MOD-70's 0017_follow_up.sql \
-         and MOD-96's 0018_seed_permission_mode.sql, in ordinal order"
+         MOD-11's 0015_command_queue.sql, MOD-12's 0016_auto_queue.sql, MOD-70's 0017_follow_up.sql, \
+         MOD-96's 0018_seed_permission_mode.sql and MOD-125's 0019_stop_runs.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -128,19 +130,20 @@ async fn migrations_apply_on_a_clean_database() {
     }
     assert_eq!(
         TABLES.len(),
-        45,
+        46,
         "blueprint B.1 lists 32 tables (ANA-9 §3's prose count of 30 is wrong, H.1), \
          0003_orchestration.sql adds run_step_tree, 0006_requirements.sql adds ANA-11 §5's six, \
          MOD-42's 0011_permission_relay.sql adds step_permission and run_command, MOD-26's \
-         0012_persona.sql adds persona and MOD-12's 0016_auto_queue.sql adds queue_batch and queue_entry and MOD-70's 0017_follow_up.sql adds follow_up_window"
+         0012_persona.sql adds persona and MOD-12's 0016_auto_queue.sql adds queue_batch and queue_entry and MOD-70's 0017_follow_up.sql adds follow_up_window and \
+         MOD-125's 0019_stop_runs.sql adds workspace_stop"
     );
     // `_sqlx_migrations` is the only extra table sqlx adds.
     assert_eq!(
         present.len(),
         TABLES.len() + 1,
-        "the migrations create the 45 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
+        "the migrations create the 46 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
          MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql and MOD-12's 0016_auto_queue.sql (queue_batch, queue_entry) and MOD-70's \
-         0017_follow_up.sql and nothing else, \
+         0017_follow_up.sql and MOD-125's 0019_stop_runs.sql and nothing else, \
          got {present:?}"
     );
 
@@ -591,6 +594,59 @@ const MOD12_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// The seven `COMMENT ON COLUMN` texts of `0019_stop_runs.sql` (MOD-125 plan D1, D3, D4),
+/// verbatim and in migration order, for [`ANA_COLUMN_COMMENTS`]'s reason. `run.status` and
+/// `run_step.status` had no comment before.
+const MOD125_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
+    (
+        "run",
+        "status",
+        "MOD-125 D1: stopped = halted by a workspace stop and resumable; live (not terminal), holds \
+         no slot, still overlaps, no finished_at.",
+    ),
+    (
+        "run_step",
+        "status",
+        "MOD-125 D1: stopped = interrupted by a workspace stop; resumes to running, or is \
+         superseded by a fresh rerun.",
+    ),
+    (
+        "run",
+        "workspace_id",
+        "MOD-125 D3: the workspace a graph run was started from; a workspace stop stops only \
+         these. NULL for chat runs and for runs whose project was in no or several workspaces at \
+         0019.",
+    ),
+    (
+        "queue_entry",
+        "workspace_id",
+        "MOD-125 D3: the workspace the item was queued from; copied onto the run admit creates.",
+    ),
+    (
+        "workspace_stop",
+        "mode",
+        "MOD-125 D4: graceful (cancel the turn, keep the session) or forced (kill now); a forced \
+         stop is never downgraded by a later graceful one.",
+    ),
+    (
+        "workspace_stop",
+        "requested_by",
+        "MOD-125 D4: who asked for the stop (the escalating user, after an escalation).",
+    ),
+    (
+        "workspace_stop",
+        "requested_at",
+        "MOD-125 D4: the caller's clock at the request (the escalation's, after an escalation).",
+    ),
+];
+
+/// The one `COMMENT ON TABLE` of `0019_stop_runs.sql` (MOD-125 plan D4), verbatim.
+const MOD125_TABLE_COMMENT: (&str, &str) = (
+    "workspace_stop",
+    "MOD-125 D4: one row per stopped workspace; while it exists claim_run refuses and adopt_runs \
+     settles abandoned runs of the workspace as stopped. Resume deletes it. Not mirrored.",
+);
+
 /// MOD-11 plan D14 (OQ-3): `0015_command_queue.sql` gives `command_run` its two liveness columns,
 /// both nullable (every row written before the migration, and every verify row, has neither) and
 /// both commented.
@@ -649,7 +705,8 @@ async fn the_command_run_liveness_columns_exist() {
 /// behind each foreign key it adds (`run_command.run_step_id`, partial on `run_step_id IS NOT
 /// NULL`, which the cascade's strict `=` lookup implies; `follow_up_window.run_id`) and behind
 /// `run_command.run_id`, which `relay_view` reads per run. The step's status CHECK is untouched (PRD metric "No new step state"): its definition is the one
-/// `0015_command_queue.sql` left, byte for byte.
+/// `0015_command_queue.sql` left, byte for byte, plus the one state MOD-125's `0019_stop_runs.sql`
+/// adds (`stopped`, after `awaiting_approval`).
 #[tokio::test]
 async fn migration_0016_reshapes_run_command_and_adds_the_follow_up_window() {
     let Some(db) = common::fresh_db().await else {
@@ -760,9 +817,10 @@ async fn migration_0016_reshapes_run_command_and_adds_the_follow_up_window() {
     assert_eq!(
         status,
         "CHECK ((status = ANY (ARRAY['pending'::text, 'running'::text, \
-         'awaiting_approval'::text, 'done'::text, 'failed'::text, 'cancelled'::text, \
-         'superseded'::text])))",
-        "no new step state: run_step's status CHECK is 0015's, byte for byte"
+         'awaiting_approval'::text, 'stopped'::text, 'done'::text, 'failed'::text, \
+         'cancelled'::text, 'superseded'::text])))",
+        "no new step state from MOD-70: run_step's status CHECK is 0015's, byte for byte, plus \
+         MOD-125's `stopped` (0019)"
     );
 
     db.drop_db().await;
@@ -819,6 +877,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD26_COLUMN_COMMENTS)
         .chain(MOD11_COLUMN_COMMENTS)
         .chain(MOD12_COLUMN_COMMENTS)
+        .chain(MOD125_COLUMN_COMMENTS)
     {
         let actual: Option<String> = sqlx::query_scalar(
             "SELECT pg_catalog.col_description(c.oid, a.attnum) \
@@ -836,30 +895,31 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
             actual.as_deref(),
             Some(*expected),
             "{table}.{column}'s comment is the ANA (or MOD-7, MOD-9, MOD-23, MOD-33, MOD-26, \
-             MOD-11 or MOD-12) text byte for byte"
+             MOD-11, MOD-12 or MOD-125) text byte for byte"
         );
     }
 
-    // The one table comment, which `col_description` above cannot see: a table's own comment is
+    // The table comments, which `col_description` above cannot see: a table's own comment is
     // `objsubid = 0` on the class, not on any attribute.
-    let (table, expected) = ANA_TABLE_COMMENT;
-    let actual: Option<String> = sqlx::query_scalar(
-        "SELECT pg_catalog.obj_description(c.oid, 'pg_class') FROM pg_class c \
-         WHERE c.relnamespace = 'public'::regnamespace AND c.relkind = 'r' AND c.relname = $1",
-    )
-    .bind(table)
-    .fetch_one(&db.pool)
-    .await
-    .unwrap_or_else(|err| panic!("read obj_description for {table}: {err}"));
-    assert_eq!(
-        actual.as_deref(),
-        Some(expected),
-        "{table}'s table comment is the ANA-2 §9 text byte for byte"
-    );
+    for (table, expected) in [ANA_TABLE_COMMENT, MOD125_TABLE_COMMENT] {
+        let actual: Option<String> = sqlx::query_scalar(
+            "SELECT pg_catalog.obj_description(c.oid, 'pg_class') FROM pg_class c \
+             WHERE c.relnamespace = 'public'::regnamespace AND c.relkind = 'r' AND c.relname = $1",
+        )
+        .bind(table)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap_or_else(|err| panic!("read obj_description for {table}: {err}"));
+        assert_eq!(
+            actual.as_deref(),
+            Some(expected),
+            "{table}'s table comment is the ANA-2 §9 (or MOD-125) text byte for byte"
+        );
+    }
 
     // And nothing else in those tables carries one, so a reader of `\d+` sees exactly the
-    // sixty contracts the three ANAs, MOD-7, ANA-22, MOD-23, MOD-33, MOD-26, MOD-11 and MOD-12
-    // wrote and no half-finished sixty-first.
+    // contracts the three ANAs, MOD-7, ANA-22, MOD-23, MOD-33, MOD-26, MOD-11, MOD-12 and MOD-125
+    // wrote and no half-finished extra one.
     let commented: Vec<(String, String)> = sqlx::query_as(
         "SELECT c.relname::text, a.attname::text FROM pg_class c \
          JOIN pg_attribute a ON a.attrelid = c.oid \
@@ -878,6 +938,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
             .chain(MOD26_COLUMN_COMMENTS)
             .chain(MOD11_COLUMN_COMMENTS)
             .chain(MOD12_COLUMN_COMMENTS)
+            .chain(MOD125_COLUMN_COMMENTS)
             .map(|(table, _, _)| (*table).to_owned())
             .collect::<BTreeSet<String>>()
             .into_iter()
@@ -896,12 +957,13 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD26_COLUMN_COMMENTS)
         .chain(MOD11_COLUMN_COMMENTS)
         .chain(MOD12_COLUMN_COMMENTS)
+        .chain(MOD125_COLUMN_COMMENTS)
         .map(|(table, column, _)| ((*table).to_owned(), (*column).to_owned()))
         .collect();
     expected.sort();
     assert_eq!(
         commented, expected,
-        "exactly the sixty commented columns, and no others"
+        "exactly the listed commented columns, and no others"
     );
 
     db.drop_db().await;
@@ -1274,14 +1336,394 @@ async fn migration_0018_leaves_edited_and_other_rows_alone() {
     }
 }
 
+/// Inserts a `workspace` under `slug`, created by `user`, and answers its id.
+async fn insert_workspace(pool: &sqlx::PgPool, user: uuid::Uuid, slug: &str) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    sqlx::query("INSERT INTO workspace (id, slug, name, created_by) VALUES ($1, $2, $2, $3)")
+        .bind(id)
+        .bind(slug)
+        .bind(user)
+        .execute(pool)
+        .await
+        .expect("insert workspace");
+    id
+}
+
+/// Puts `project` in `workspace` (`workspace_project`).
+async fn link_project(pool: &sqlx::PgPool, workspace: uuid::Uuid, project: uuid::Uuid) {
+    sqlx::query("INSERT INTO workspace_project (workspace_id, project_id) VALUES ($1, $2)")
+        .bind(workspace)
+        .bind(project)
+        .execute(pool)
+        .await
+        .expect("insert workspace_project");
+}
+
+/// Registers a box for `user` and answers its id.
+async fn insert_box(pool: &sqlx::PgPool, user: uuid::Uuid) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version) \
+         VALUES ($1, $2, $3, 'linux', '', 'x86_64', '0.0.0')",
+    )
+    .bind(id)
+    .bind(user)
+    .bind(format!("HTUI-TEST-{}", id.simple()))
+    .execute(pool)
+    .await
+    .expect("register a box");
+    id
+}
+
+/// Inserts a manual `run` of `kind` (`graph` carries an empty snapshot, `ck_run_graph_snapshot`)
+/// in `status`, targeting `box_id`, and answers its id.
+async fn insert_run(
+    pool: &sqlx::PgPool,
+    project: uuid::Uuid,
+    kind: &str,
+    status: &str,
+    box_id: uuid::Uuid,
+    user: uuid::Uuid,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO run (id, project_id, kind, mode, status, target_box_id, graph_snapshot, \
+                          started_by) \
+         VALUES ($1, $2, $3, 'manual', $4, $5, \
+                 CASE WHEN $3 = 'graph' THEN '{}'::jsonb END, $6)",
+    )
+    .bind(id)
+    .bind(project)
+    .bind(kind)
+    .bind(status)
+    .bind(box_id)
+    .bind(user)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|err| panic!("insert a {status} {kind} run: {err}"));
+    id
+}
+
+/// Inserts an `open` item of `kind` in `project` and queues it on `box_id`; answers the item id.
+async fn queue_new_item(
+    pool: &sqlx::PgPool,
+    (project, kind): (uuid::Uuid, uuid::Uuid),
+    box_id: uuid::Uuid,
+    user: uuid::Uuid,
+) -> uuid::Uuid {
+    let item = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO item (id, project_id, kind_id, key_prefix, key_number, title, status, \
+         created_by) VALUES ($1, $2, $3, 'RES', 1, 'queued', 'open', $4)",
+    )
+    .bind(item)
+    .bind(project)
+    .bind(kind)
+    .bind(user)
+    .execute(pool)
+    .await
+    .expect("insert item");
+    sqlx::query(
+        "INSERT INTO queue_entry (item_id, box_id, queued_at, queued_by) \
+         VALUES ($1, $2, now(), $3)",
+    )
+    .bind(item)
+    .bind(box_id)
+    .bind(user)
+    .execute(pool)
+    .await
+    .expect("queue the item");
+    item
+}
+
+/// `run.workspace_id` of `run`.
+async fn run_workspace(pool: &sqlx::PgPool, run: uuid::Uuid) -> Option<uuid::Uuid> {
+    sqlx::query_scalar("SELECT workspace_id FROM run WHERE id = $1")
+        .bind(run)
+        .fetch_one(pool)
+        .await
+        .expect("read run.workspace_id")
+}
+
+/// `queue_entry.workspace_id` of the entry queuing `item`.
+async fn entry_workspace(pool: &sqlx::PgPool, item: uuid::Uuid) -> Option<uuid::Uuid> {
+    sqlx::query_scalar("SELECT workspace_id FROM queue_entry WHERE item_id = $1")
+        .bind(item)
+        .fetch_one(pool)
+        .await
+        .expect("read queue_entry.workspace_id")
+}
+
+/// MOD-125 plan D3 (PRD Q1) and DV-6: `0019_stop_runs.sql` backfills `run.workspace_id` only
+/// for a graph run whose project sits in exactly one workspace. A chat run, a run whose project
+/// is in two workspaces and a run whose project is in none stay `NULL`, so no workspace stop ever
+/// touches them. `queue_entry.workspace_id` follows the same one-workspace rule through its item.
+///
+/// Staged at v18 through [`MIGRATOR`] so the rows exist before 0019 runs, as on a real box (the
+/// `migration_0018_pins_the_old_claude_row_once` staging); the plain `run` then applies 0019.
+#[tokio::test]
+async fn migration_0019_scopes_only_one_workspace_graph_runs() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(18, &db.pool)
+        .await
+        .expect("apply 0001 through 0018");
+    let pool = &db.pool;
+    let user = uuid::Uuid::now_v7();
+    sqlx::query("INSERT INTO app_user (id, name) VALUES ($1, 'stop')")
+        .bind(user)
+        .execute(pool)
+        .await
+        .expect("insert app_user");
+    let box_id = insert_box(pool, user).await;
+
+    let only = insert_workspace(pool, user, "only").await;
+    let other = insert_workspace(pool, user, "other").await;
+    let one = plant_project_kind(pool, user, "in-one").await;
+    let two = plant_project_kind(pool, user, "in-two").await;
+    let none = plant_project_kind(pool, user, "in-none").await;
+    link_project(pool, only, one.0).await;
+    link_project(pool, only, two.0).await;
+    link_project(pool, other, two.0).await;
+
+    let one_graph = insert_run(pool, one.0, "graph", "running", box_id, user).await;
+    let one_chat = insert_run(pool, one.0, "chat", "running", box_id, user).await;
+    let two_graph = insert_run(pool, two.0, "graph", "queued", box_id, user).await;
+    let none_graph = insert_run(pool, none.0, "graph", "done", box_id, user).await;
+    let one_item = queue_new_item(pool, one, box_id, user).await;
+    let two_item = queue_new_item(pool, two, box_id, user).await;
+
+    MIGRATOR.run(pool).await.expect("apply 0019");
+
+    assert_eq!(
+        run_workspace(pool, one_graph).await,
+        Some(only),
+        "a graph run whose project is in exactly one workspace is scoped to it"
+    );
+    assert_eq!(
+        run_workspace(pool, one_chat).await,
+        None,
+        "a chat run stays unscoped: a chat is driven by the person typing in it"
+    );
+    assert_eq!(
+        run_workspace(pool, two_graph).await,
+        None,
+        "a graph run whose project is in two workspaces stays unscoped"
+    );
+    assert_eq!(
+        run_workspace(pool, none_graph).await,
+        None,
+        "a graph run whose project is in no workspace stays unscoped"
+    );
+    assert_eq!(
+        entry_workspace(pool, one_item).await,
+        Some(only),
+        "DV-6: an entry whose item's project is in exactly one workspace is scoped to it"
+    );
+    assert_eq!(
+        entry_workspace(pool, two_item).await,
+        None,
+        "DV-6: an entry whose item's project is in two workspaces stays unscoped"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-125 plan D1, D4: after 0019 a run and a step can be `stopped` (the two status CHECKs keep
+/// their Postgres-given names), an unknown status is still refused, and `workspace_stop.mode`
+/// admits only `graceful` and `forced` (`23514`, `chk_workspace_stop_mode`).
+#[tokio::test]
+async fn migration_0019_admits_stopped_and_refuses_an_unknown_stop_mode() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let pool = &db.pool;
+    let user = db.store.this_user().as_uuid();
+    let box_id = db.store.this_box().as_uuid();
+    let (project, _) = plant_project_kind(pool, user, "stop").await;
+    let workspace = insert_workspace(pool, user, "stop").await;
+    let run = insert_run(pool, project, "graph", "running", box_id, user).await;
+    sqlx::query(
+        "INSERT INTO run_step (run_id, position, phase_name, status) \
+         VALUES ($1, 0, 'build', 'running')",
+    )
+    .bind(run)
+    .execute(pool)
+    .await
+    .expect("insert a running step");
+
+    let stopped = sqlx::query("UPDATE run SET status = 'stopped' WHERE id = $1")
+        .bind(run)
+        .execute(pool)
+        .await
+        .expect("a run can be stopped");
+    assert_eq!(stopped.rows_affected(), 1);
+    let stopped = sqlx::query("UPDATE run_step SET status = 'stopped' WHERE run_id = $1")
+        .bind(run)
+        .execute(pool)
+        .await
+        .expect("a step can be stopped");
+    assert_eq!(stopped.rows_affected(), 1);
+
+    let err = sqlx::query("UPDATE run SET status = 'paused' WHERE id = $1")
+        .bind(run)
+        .execute(pool)
+        .await
+        .expect_err("a run status outside the list is refused");
+    assert_refused_by(err, "run_status_check", "run.status = 'paused'");
+    let err = sqlx::query("UPDATE run_step SET status = 'paused' WHERE run_id = $1")
+        .bind(run)
+        .execute(pool)
+        .await
+        .expect_err("a step status outside the list is refused");
+    assert_refused_by(err, "run_step_status_check", "run_step.status = 'paused'");
+    let status: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+          WHERE conrelid = 'run'::regclass AND conname = 'run_status_check'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read run's status CHECK");
+    assert_eq!(
+        status,
+        "CHECK ((status = ANY (ARRAY['queued'::text, 'running'::text, \
+         'awaiting_approval'::text, 'stopped'::text, 'done'::text, 'failed'::text, \
+         'cancelled'::text])))",
+        "run's status CHECK lists RunStatus::ALL in order, `stopped` after `awaiting_approval`"
+    );
+
+    let stop = |mode: &'static str| {
+        sqlx::query(
+            "INSERT INTO workspace_stop (workspace_id, mode, requested_by, requested_at) \
+             VALUES ($1, $2, $3, now()) \
+             ON CONFLICT (workspace_id) DO UPDATE SET mode = EXCLUDED.mode",
+        )
+        .bind(workspace)
+        .bind(mode)
+        .bind(user)
+        .execute(pool)
+    };
+    let err = stop("paused")
+        .await
+        .expect_err("a stop mode outside graceful and forced is refused");
+    assert_eq!(
+        err.as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("23514"),
+        "refused by a CHECK: {err}"
+    );
+    assert_refused_by(
+        err,
+        "chk_workspace_stop_mode",
+        "workspace_stop.mode = 'paused'",
+    );
+    for mode in ["graceful", "forced"] {
+        stop(mode)
+            .await
+            .unwrap_or_else(|err| panic!("a `{mode}` stop is admitted: {err}"));
+    }
+    assert_eq!(common::count(pool, "workspace_stop").await, 1);
+
+    db.drop_db().await;
+}
+
+/// MOD-125 plan D3, D4: deleting a workspace leaves its runs and queue entries unscoped
+/// (`ON DELETE SET NULL`) and takes its stop row with it (`ON DELETE CASCADE`); the run and the
+/// entry themselves survive.
+#[tokio::test]
+async fn migration_0019_a_deleted_workspace_unscopes_its_runs_and_drops_its_stop() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let pool = &db.pool;
+    let user = db.store.this_user().as_uuid();
+    let box_id = db.store.this_box().as_uuid();
+    let project = plant_project_kind(pool, user, "gone").await;
+    let workspace = insert_workspace(pool, user, "gone").await;
+    let run = insert_run(pool, project.0, "graph", "stopped", box_id, user).await;
+    let item = queue_new_item(pool, project, box_id, user).await;
+    sqlx::query("UPDATE run SET workspace_id = $2 WHERE id = $1")
+        .bind(run)
+        .bind(workspace)
+        .execute(pool)
+        .await
+        .expect("scope the run");
+    sqlx::query("UPDATE queue_entry SET workspace_id = $2 WHERE item_id = $1")
+        .bind(item)
+        .bind(workspace)
+        .execute(pool)
+        .await
+        .expect("scope the entry");
+    sqlx::query(
+        "INSERT INTO workspace_stop (workspace_id, mode, requested_by, requested_at) \
+         VALUES ($1, 'forced', $2, now())",
+    )
+    .bind(workspace)
+    .bind(user)
+    .execute(pool)
+    .await
+    .expect("stop the workspace");
+
+    let err = sqlx::query("UPDATE run SET workspace_id = $2 WHERE id = $1")
+        .bind(run)
+        .bind(uuid::Uuid::now_v7())
+        .execute(pool)
+        .await
+        .expect_err("an unknown workspace is refused");
+    assert_refused_by(err, "fk_run_workspace", "an unknown run.workspace_id");
+    let err = sqlx::query("UPDATE queue_entry SET workspace_id = $2 WHERE item_id = $1")
+        .bind(item)
+        .bind(uuid::Uuid::now_v7())
+        .execute(pool)
+        .await
+        .expect_err("an unknown workspace is refused");
+    assert_refused_by(
+        err,
+        "fk_queue_entry_workspace",
+        "an unknown queue_entry.workspace_id",
+    );
+
+    sqlx::query("DELETE FROM workspace WHERE id = $1")
+        .bind(workspace)
+        .execute(pool)
+        .await
+        .expect("a stopped workspace with scoped runs deletes");
+    assert_eq!(run_workspace(pool, run).await, None, "the run is unscoped");
+    assert_eq!(
+        entry_workspace(pool, item).await,
+        None,
+        "the entry is unscoped"
+    );
+    assert_eq!(
+        common::count(pool, "workspace_stop").await,
+        0,
+        "the stop row went with its workspace"
+    );
+
+    db.drop_db().await;
+}
+
 /// The smallest FK chain an `item` row needs (project -> step_graph -> item_kind), under the
 /// `created_by` the caller names. Returns `(project, kind)`; the kind's prefix is `RES`.
 async fn plant_item_kind(pool: &sqlx::PgPool, user: uuid::Uuid) -> (uuid::Uuid, uuid::Uuid) {
+    plant_project_kind(pool, user, "res").await
+}
+
+/// [`plant_item_kind`] under a project slug the caller names, so one database can hold several.
+async fn plant_project_kind(
+    pool: &sqlx::PgPool,
+    user: uuid::Uuid,
+    slug: &str,
+) -> (uuid::Uuid, uuid::Uuid) {
     let project = uuid::Uuid::now_v7();
     let graph = uuid::Uuid::now_v7();
     let kind = uuid::Uuid::now_v7();
-    sqlx::query("INSERT INTO project (id, slug, name, created_by) VALUES ($1, 'res', 'Res', $2)")
+    sqlx::query("INSERT INTO project (id, slug, name, created_by) VALUES ($1, $2, $2, $3)")
         .bind(project)
+        .bind(slug)
         .bind(user)
         .execute(pool)
         .await
@@ -1458,8 +1900,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(18),
-        "eighteen embedded migrations, none applied (through MOD-96's 0018_seed_permission_mode.sql)"
+        MigrationState::Pending(19),
+        "nineteen embedded migrations, none applied (through MOD-125's 0019_stop_runs.sql)"
     );
 
     db.drop_db().await;
@@ -1559,8 +2001,8 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(18),
-        "eighteen embedded migrations, through MOD-96's 0018_seed_permission_mode.sql"
+        MigrationState::Pending(19),
+        "nineteen embedded migrations, through MOD-125's 0019_stop_runs.sql"
     );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
@@ -1568,8 +2010,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("a pending schema is refused");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(18),
-        "every one of the eighteen, through MOD-96's 0018_seed_permission_mode.sql, is pending"
+        HeadlessError::MigrationsPending(19),
+        "every one of the nineteen, through MOD-125's 0019_stop_runs.sql, is pending"
     );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
@@ -1591,8 +2033,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("no migrations table is every migration pending");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(18),
-        "every one of the eighteen, through MOD-96's 0018_seed_permission_mode.sql, is pending"
+        HeadlessError::MigrationsPending(19),
+        "every one of the nineteen, through MOD-125's 0019_stop_runs.sql, is pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
@@ -1743,9 +2185,9 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        18,
-        "the later applies migrate nothing: the eighteen embedded migrations (through MOD-96's \
-         0018_seed_permission_mode.sql) are applied once"
+        19,
+        "the later applies migrate nothing: the nineteen embedded migrations (through MOD-125's \
+         0019_stop_runs.sql) are applied once"
     );
 
     db.drop_db().await;
@@ -2801,6 +3243,8 @@ async fn the_auto_queue_tables_and_column_exist() {
         ("queue_entry", "position", "integer", "YES"),
         ("queue_entry", "queued_at", "timestamp with time zone", "NO"),
         ("queue_entry", "queued_by", "uuid", "NO"),
+        // 0019_stop_runs.sql (MOD-125 plan D3) appends it, nullable.
+        ("queue_entry", "workspace_id", "uuid", "YES"),
         ("run", "batch_id", "uuid", "YES"),
     ]
     .into_iter()
@@ -2809,7 +3253,7 @@ async fn the_auto_queue_tables_and_column_exist() {
     assert_eq!(
         columns, expected,
         "0016 creates queue_batch and queue_entry as blueprint B.0 lists them and adds the \
-         nullable run.batch_id"
+         nullable run.batch_id; 0019 appends the nullable queue_entry.workspace_id"
     );
 
     let indexes: Vec<(String, String)> = sqlx::query_as(
