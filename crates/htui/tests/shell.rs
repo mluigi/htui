@@ -513,3 +513,27 @@ async fn f9_toggles_the_about_panel_under_the_header() {
     assert!(!harness.app().about_visible);
     assert!(!harness.render().contains("About"));
 }
+
+/// MOD-115 review: the header's key chips are labelled through the stack that holds the
+/// keyboard, so `F9 about` is gone under an overlay that does not take it (the switcher, the
+/// migration prompt), `? keys` stays, and `F9 about` returns once the overlay closes.
+#[tokio::test]
+async fn the_header_chips_follow_the_overlay_stack() {
+    let mut harness = open_over_demo().await;
+    let header = top_bar(&harness.render());
+    assert!(
+        !header.contains("about") && !header.contains("F9") && header.ends_with(" ?  keys"),
+        "{header}"
+    );
+    harness.key("esc");
+    harness.drive_to_end().await;
+    let header = top_bar(&harness.render());
+    assert!(header.ends_with(" F9  about   ?  keys"), "{header}");
+
+    let mut harness = shell_reporting("online", Some(3)).await;
+    let header = top_bar(&harness.render());
+    assert!(
+        !header.contains("about") && header.ends_with(" ?  keys"),
+        "{header}"
+    );
+}

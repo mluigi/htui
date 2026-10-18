@@ -938,6 +938,9 @@ impl App {
             &self.tabs,
             flash.as_ref(),
             &self.keys,
+            // The chips are labelled through the stack that holds the keyboard, so `F9 about`
+            // is not offered under an overlay that does not take it.
+            self.active_stack().unwrap_or(Stack::BASE),
             &self.theme,
         );
         if let (Some(panel), Some((tab, text))) = (chrome.about, about) {

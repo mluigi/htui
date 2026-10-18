@@ -98,6 +98,9 @@ pub struct Theme {
     /// The border of a pane that does not have focus (MOD-115): fainter than a focused pane's
     /// tab accent, so focus reads at a glance. `Indexed(240)`; DIM without colour.
     pub border_faint: Style,
+    /// The text drawn on a block filled with a tab's accent colour (the header's active tab
+    /// chip): black on the default theme, plain without colour, where no block is filled.
+    pub on_accent: Style,
     /// Per-tab accents; read them through [`Theme::tab_accent`].
     pub tab_accents: TabAccents,
     /// Per-kind key colours; read them through [`Theme::kind_style`].
@@ -122,6 +125,7 @@ impl Default for Theme {
             active_tab: accent.add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             cursor: Style::new().add_modifier(Modifier::REVERSED),
             border_faint: Style::new().fg(Color::Indexed(240)),
+            on_accent: Style::new().fg(Color::Black),
             tab_accents: TabAccents {
                 backlog: accent,
                 chat: Style::new().fg(Color::Green),
@@ -170,6 +174,7 @@ impl Theme {
             active_tab: plain.add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             cursor: reversed,
             border_faint: plain.add_modifier(Modifier::DIM),
+            on_accent: plain,
             tab_accents: TabAccents {
                 backlog: bold,
                 chat: bold,
@@ -298,6 +303,7 @@ mod tests {
             Style::new().fg(Color::Black).bg(Color::Cyan)
         );
         assert_eq!(theme.border_faint.fg, Some(Color::Indexed(240)));
+        assert_eq!(theme.on_accent, Style::new().fg(Color::Black));
         assert_eq!(theme.tab_accent("backlog").fg, Some(Color::Cyan));
         assert_eq!(theme.tab_accent("chat").fg, Some(Color::Green));
         assert_eq!(theme.tab_accent("skills").fg, Some(Color::Magenta));
@@ -408,6 +414,7 @@ mod tests {
             theme.active_tab,
             theme.cursor,
             theme.border_faint,
+            theme.on_accent,
         ];
         for role in roles {
             assert_eq!(role.fg, None, "{role:?}");
@@ -448,7 +455,13 @@ mod tests {
             Style::new().add_modifier(Modifier::BOLD),
             "a failure stands out without colour (D4 as amended in review)"
         );
-        for plain in [theme.base, theme.running, theme.warning, theme.added] {
+        for plain in [
+            theme.base,
+            theme.running,
+            theme.warning,
+            theme.added,
+            theme.on_accent,
+        ] {
             assert_eq!(plain, Style::new(), "{plain:?}");
         }
     }
