@@ -5542,6 +5542,10 @@ impl State {
     /// `owner`'s becomes `owner`'s (plan D88). Expiry is judged by this handle's clock (MOD-40
     /// plan D10). A chat run is never the sweep's: the engine cannot recover it, and leasing it
     /// fenced the chat's own unleased writes (MOD-24 D3b).
+    ///
+    /// MOD-125 D6: a candidate whose workspace is stopped is settled, not adopted: it moves
+    /// `running -> stopped` with its running steps, its lease is released as
+    /// [`State::release_lease`] releases it, and it is left out of the answer.
     fn adopt_runs(
         &mut self,
         box_id: BoxId,
@@ -5566,6 +5570,22 @@ impl State {
 
         let mut adopted = Vec::with_capacity(abandoned.len());
         for (_, id) in abandoned {
+            let settle = self
+                .runs
+                .get(&id)
+                .and_then(|row| row.workspace_id)
+                .is_some_and(|workspace| self.workspace_stops.contains_key(&workspace));
+            if settle {
+                // MOD-125 D6: a stopped workspace's abandoned run is settled, not adopted.
+                self.lease_owners.remove(&id);
+                if let Some(row) = self.runs.get_mut(&id) {
+                    row.status = RunStatus::Stopped;
+                    row.lease_expires_at = Some(now);
+                    row.updated_at = now;
+                }
+                self.stop_running_steps(id, now);
+                continue;
+            }
             self.lease_owners.insert(id, owner);
             if let Some(row) = self.runs.get_mut(&id) {
                 row.lease_box_id = Some(box_id);

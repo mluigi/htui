@@ -232,6 +232,7 @@ pub const CASES: &[&str] = &[
     "claim_run_checks_the_stop_before_tags",
     "claim_run_admits_after_resume",
     "a_run_without_a_workspace_is_never_gated",
+    "adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -627,6 +628,9 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         }
         "a_run_without_a_workspace_is_never_gated" => {
             a_run_without_a_workspace_is_never_gated(store).await;
+        }
+        "adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped" => {
+            adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped(store).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -7622,6 +7626,123 @@ async fn a_run_without_a_workspace_is_never_gated<S: WriteStore>(store: &S) {
         run_row(CASE, store, run).await.status,
         RunStatus::Running,
         "{CASE}: and it is still running"
+    );
+}
+
+/// MOD-125 D6: the sweep settles a stopped workspace's abandoned run instead of adopting it. In
+/// the sweep's own write the run moves `running -> stopped` with its `running` step, its lease is
+/// released as `release_lease` releases it, and it is left out of the answer; an unscoped run
+/// abandoned beside it is adopted as before. A second sweep finds nothing.
+async fn adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped<S: WriteStore>(
+    store: &S,
+) {
+    const CASE: &str = "adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped";
+    let (x, y) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let workspace = ids::WORKSPACE_PLATFORM;
+    let a = create_scoped_run(CASE, store, ids::HTUI_ANA_2, Some(workspace)).await;
+    let b = create_scoped_run(CASE, store, ids::HTUI_CLEAN_1, None).await;
+    for run in [a, b] {
+        assert_eq!(
+            store
+                .claim_run(run, ids::BOX, x, at, LEASE)
+                .await
+                .expect(CASE),
+            Claim::Admitted,
+            "{CASE}: X claims A and B"
+        );
+    }
+    let specs = [new_run_step(a, 0, 0, 0), new_run_step(a, 1, 0, 0)];
+    let [done, running] = specs.each_ref().map(|spec| spec.id);
+    for spec in specs {
+        store.create_step(spec).await.expect(CASE);
+    }
+    for (step, from, to) in [
+        (done, StepStatus::Pending, StepStatus::Running),
+        (done, StepStatus::Running, StepStatus::Done),
+        (running, StepStatus::Pending, StepStatus::Running),
+    ] {
+        assert!(
+            store.transition_step(step, from, to, at).await.expect(CASE),
+            "{CASE}: {from} -> {to} is a sanctioned move"
+        );
+    }
+    let done_before = step_row(CASE, store, a, done).await;
+
+    store
+        .stop_workspace(workspace, StopMode::Graceful, ids::USER, at)
+        .await
+        .expect(CASE);
+    for run in [a, b] {
+        assert!(
+            store.release_lease(run, x).await.expect(CASE),
+            "{CASE}: X abandons its lease"
+        );
+    }
+
+    let adopted = store.adopt_runs(ids::BOX, y, LEASE).await.expect(CASE);
+    assert_eq!(
+        adopted.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![b],
+        "{CASE}: only the unscoped run is adopted"
+    );
+    let settled = run_row(CASE, store, a).await;
+    assert_eq!(
+        settled.status,
+        RunStatus::Stopped,
+        "{CASE}: the stopped workspace's run is settled as stopped"
+    );
+    assert!(
+        settled.lease_expires_at.is_some(),
+        "{CASE}: the released lease keeps its expiry"
+    );
+    assert_eq!(
+        settled.finished_at, None,
+        "{CASE}: a stopped run is live: no finished_at"
+    );
+    assert_eq!(
+        (settled.executing_box_id, settled.lease_box_id),
+        (Some(ids::BOX), Some(ids::BOX)),
+        "{CASE}: the executing box and the lease's box are kept"
+    );
+    for owner in [y, x] {
+        assert!(
+            !store.refresh_lease(a, owner, LEASE).await.expect(CASE),
+            "{CASE}: nobody holds the settled run's lease"
+        );
+    }
+    assert_eq!(
+        step_row(CASE, store, a, running).await.status,
+        StepStatus::Stopped,
+        "{CASE}: its running step is stopped"
+    );
+    assert_eq!(
+        step_row(CASE, store, a, done).await,
+        done_before,
+        "{CASE}: its done step is untouched"
+    );
+    assert_eq!(
+        item_row(CASE, store, ids::HTUI_ANA_2).await.status,
+        Status::InProgress,
+        "{CASE}: the item stays in progress"
+    );
+    assert!(
+        store.refresh_lease(b, y, LEASE).await.expect(CASE),
+        "{CASE}: the adopted run is Y's"
+    );
+
+    assert!(
+        store
+            .adopt_runs(ids::BOX, Uuid::now_v7(), LEASE)
+            .await
+            .expect(CASE)
+            .is_empty(),
+        "{CASE}: a second sweep finds nothing: A is stopped and B is leased"
+    );
+    assert_eq!(
+        run_row(CASE, store, a).await,
+        settled,
+        "{CASE}: and leaves the settled run as it was"
     );
 }
 
