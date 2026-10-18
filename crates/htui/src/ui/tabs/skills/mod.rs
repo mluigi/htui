@@ -122,8 +122,8 @@ impl Tab for SkillsTab {
     /// the about panel labels the tab's actions through.
     fn browse_stack(&self) -> Stack<'static> {
         match self.view {
-            View::Skills => crate::keys::views::LIBRARY_BROWSE,
-            View::Templates => crate::keys::views::TEMPLATES_BROWSE,
+            View::Skills => LibraryView::browse_stack(),
+            View::Templates => TemplatesView::browse_stack(),
         }
     }
 

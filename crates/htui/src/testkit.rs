@@ -527,8 +527,15 @@ impl Harness {
     /// Changes the frame size. Snapshots are size-sensitive; the default is 100x30.
     #[must_use]
     pub fn size(mut self, width: u16, height: u16) -> Self {
-        self.term = terminal(width, height);
+        self.resize(width, height);
         self
+    }
+
+    /// Changes the frame size of a running harness, for a case that reads a wide header (100
+    /// columns hold the five tab chips and only the highest-priority right-side parts) and takes
+    /// its snapshot at the default size.
+    pub fn resize(&mut self, width: u16, height: u16) {
+        self.term = terminal(width, height);
     }
 
     /// Serves every queued request inline until nothing is left to answer.
@@ -991,6 +998,8 @@ mod tests {
         assert_eq!(harness.app().projects.len(), 1);
         // `register_all` without a runtime leaves an error for the header's flash to show.
         harness.app().status = None;
+        // 100 columns drop the working count and the store for the five tab chips and `? keys`.
+        harness.resize(160, 30);
         let frame = harness.render();
         let header = frame.lines().next().unwrap_or_default();
         assert!(header.starts_with("Graphics"), "{header}");

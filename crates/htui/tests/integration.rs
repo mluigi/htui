@@ -50,7 +50,11 @@ async fn the_demo_shell_starts_inside_the_first_workspace_on_the_backlog_tab() {
         harness.app().overlays.is_empty(),
         "the startup workspace was entered from the first reply, so no switcher was ever opened"
     );
-    let header = top_bar(&frame);
+    // At 100 columns the five tab chips and `? keys` leave no room for the working count and the
+    // store, so the header is read at 160 and the snapshot below keeps the 100-column frame.
+    harness.resize(160, 30);
+    let header = top_bar(&harness.render());
+    harness.resize(100, 30);
     assert!(
         header.starts_with("Graphics") && header.contains("0 working · 0 waiting · memory"),
         "the header reads the startup scope: {header}"

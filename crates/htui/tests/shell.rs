@@ -53,6 +53,15 @@ fn top_bar(frame: &str) -> String {
     frame.lines().next().unwrap_or_default().to_owned()
 }
 
+/// The header drawn 160 columns wide, then the harness back at the default 100x30. At 100 the
+/// five tab chips and `? keys` leave no room for the working count and the store label.
+fn wide_header(harness: &mut Harness) -> String {
+    harness.resize(160, 30);
+    let header = top_bar(&harness.render());
+    harness.resize(100, 30);
+    header
+}
+
 #[tokio::test]
 async fn the_switcher_lists_every_workspace_with_its_project_count() {
     let mut harness = open_over_demo().await;
@@ -110,7 +119,7 @@ async fn j_and_k_move_the_cursor_and_stop_at_the_ends() {
 #[tokio::test]
 async fn enter_switches_the_scope_and_the_top_bar_follows() {
     let mut harness = open_over_demo().await;
-    let header = top_bar(&harness.render());
+    let header = wide_header(&mut harness);
     assert!(
         header.starts_with("Graphics") && header.contains("0 working · 0 waiting · memory"),
         "the fixture's only active run is in the other workspace: {header}"
@@ -141,8 +150,8 @@ async fn enter_switches_the_scope_and_the_top_bar_follows() {
         "`workspace_project.position` decides the order"
     );
 
+    let header = wide_header(&mut harness);
     let frame = harness.render();
-    let header = top_bar(&frame);
     assert!(
         header.starts_with("Platform") && header.contains("1 working · 1 waiting · memory"),
         "the header reads the new workspace and its active-run count: {header}"
@@ -198,9 +207,8 @@ async fn an_empty_store_shows_no_workspaces() {
 async fn the_top_bar_shows_the_offline_age() {
     // What the worker reports once the first connect attempt has failed and three minutes passed.
     let mut harness = shell_reporting("offline · 3m", None).await;
+    let header = wide_header(&mut harness);
     let frame = harness.render();
-
-    let header = top_bar(&frame);
     assert!(
         header.starts_with("Graphics") && header.contains("0 working · 0 waiting · offline · 3m"),
         "the store field is `Backend::label()` verbatim (plan D11): {header}"

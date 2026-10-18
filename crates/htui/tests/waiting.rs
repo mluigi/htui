@@ -60,7 +60,11 @@ async fn refresh(harness: &mut Harness) {
 
 /// The right side of the frame's first line, the header (MOD-115): `N working · M waiting ·
 /// store`, the part after the workspace and the tab chips (which are separated by two spaces).
+///
+/// Read at 160 columns: at the default 100 the five tab chips and `? keys` leave no room for the
+/// working count and the store.
 fn top_bar(harness: &mut Harness) -> String {
+    harness.resize(160, 30);
     harness
         .render()
         .lines()
