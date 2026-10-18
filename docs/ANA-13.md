@@ -50,6 +50,10 @@ This document determines how `htui` can adopt these capabilities without violati
 | Add `spawn_subagent` as an MCP tool hosted by `htui` | **Adopted.** Expose `htui`'s orchestrator as an MCP tool (`htui-mcp`). When called, `htui` creates a new `RunStep` linked via a `parent_step_id` and executes it inside the orchestrator task, validating inputs against JSON schemas if provided. |
 | Support Isolated Worktrees | **Adopted.** Add `SessionSpec.isolated_worktree` flag. When true, `htui` copies the current repo state, runs the subagent, and surfaces the diff as an `EditProposal` to the parent. |
 
+*Superseded by ANA-33 §7.12, 2026-10-18 (`docs/decisions/ana/ana-33.md`):* a tree-writing
+`spawn_subagent` is a divided part (MOD-139). What stays is consult-mode `spawn_subagent`, a read-only
+child (`role = 'consult'` with `parent_step_id`) that the MCP host asks the engine to run (MOD-27).
+
 ### 3.3 Multi-Agent Communication (`hub` tool)
 **Need:** Break free from strict linear artifact-passing and allow agents to converse in a shared context.
 
@@ -57,6 +61,9 @@ This document determines how `htui` can adopt these capabilities without violati
 |---|---|
 | IRC Bus via Tool (`oh-my-pi` model) | Rejected. A pure event bus breaks `htui`'s linear step history replay (`R-HIS-2`). |
 | Introduce `RunKind::Swarm` | **Adopted.** Alongside `Graph` and `Chat`, create a `Swarm` mode. The orchestrator maintains a single shared context window. Agents yield via a specific tool call, passing the baton back to the orchestrator, which schedules the next active persona. |
+
+*Superseded by ANA-33 §7.12, 2026-10-18 (`docs/decisions/ana/ana-33.md`):* `RunKind::Swarm` is dropped.
+The swarm's typed exits and hop cap become a `successors` plan and `max_plan_revisions` (MOD-140).
 
 ---
 

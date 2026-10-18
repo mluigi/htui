@@ -393,6 +393,9 @@ summary yet". It is also the one use that needs nothing new: a phase in the grap
 work on a registry row, recorded as a `run_step`, which ANA-2 already sanctions. Haiku 5.5 makes it
 almost free; Sonnet 5.5 is the safer quality choice at about 20× the price. It lengthens every graph
 by one step, which is the maintainer's call (§8 call 5).
+*Amended by ANA-33, 2026-10-18 (`docs/ANA-33.md` §7.12, `docs/decisions/ana/ana-33.md`):* "lengthens every
+graph by one step" becomes "adds one node to the graphs that opt in; other graphs are unchanged". Opt-in is
+a seeded alternative graph per project and a library workflow, with no disabled node (MOD-98).
 
 **U6 (cheap judge).** Possible today with no code: name a cheap `per_token` row in
 `project.settings.judge_agent_id`, and the judge runs on its default model (`graph.rs:841-848`). A

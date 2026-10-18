@@ -14,7 +14,12 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-17):** **ANA-40 is concluded** (`docs/ANA-40.md`, `docs/decisions/ana/ana-40.md`): the
+**Current status (2026-10-18):** **ANA-33 is concluded** (`docs/ANA-33.md`, `docs/decisions/ana/ana-33.md`): step
+graphs become phase rows plus typed edges owned by a project, a workspace or the global workflow library, a run is
+pinned to a v2 snapshot, and fan-out divides work into a planner, planned parts and an integrate agent whose branch
+alone lands through ANA-2 §4.6. Spawned **MOD-137..143**; MOD-27 is narrowed to consult-mode `spawn_subagent`, and
+ANA-2, ANA-13, ANA-30, `R-MCP-3`, `R-TUI-8`, `R-ORCH-1` and `CONCEPTS.md` carry dated amendments. Before it,
+**ANA-40 is concluded** (`docs/ANA-40.md`, `docs/decisions/ana/ana-40.md`): the
 Toolbox has eleven kinds plus bundles, Postgres holds them all and the box probe only reports observed state, every
 attachable kind shares one generalised binding, and the light model becomes one setting (a partial reversal of
 ANA-30). Spawned **MOD-126..129**; requirement edits (`R-TUI-7` and others) wait for the maintainer. Before it, a
@@ -41,16 +46,11 @@ Before it, **TOOL-8 is done** (`docs/decisions/tool/tool-8.md`): the `htui-dev` 
 interactive sessions (item and HANDOFF phase, merge/ahead/dirty, disk above 90%, Postgres not up, last gate) with a
 toast when a gate finishes, plus turnless `/gate`, `/next` and `/validate` (M2); `scripts/dev-health.sh`/`.ps1` are
 new. Owed on the host: a Windows run (`claude -p "/gate fmt"` returns at once, the `.ps1` commands), `dev-health`'s
-docker path against the real `htui-postgres`, and the Postgres gate. Before it, **ANA-30 is concluded** (`docs/ANA-30.md`, `docs/decisions/ana/ana-30.md`): no
-`utility_model` setting now (every compliant cheap-model use is single-digit dollars a month and has no surface yet);
-the $100 API credit is spent through a `per_token` registry row (data, no code), built into the first MOD that adds a
-second drafting surface. Spawned **MOD-97** (an inherited `ANTHROPIC_API_KEY` reroutes subscription rows to API
-billing) and **MOD-98** (opt-in `summary` phase); `R-ID-6` gained a one-line clarification and ANA-21 §5.7 a `haiku`
-amendment. Owed on the host: checking which credit the $100 is (Console), and one dev-database query for stored ACP
-`session_info_update` titles (`docs/ANA-30.md` §8 calls 2, 6). Earlier completions (**TOOL-10**, **CLEAN-12**, **TOOL-9**, **CLEAN-11**, **MOD-67**, **MOD-96**, **CLEAN-10**, **MOD-93**, **MOD-89**, **MOD-95**, **TOOL-11**,
+docker path against the real `htui-postgres`, and the Postgres gate. Earlier completions (**ANA-30**, **TOOL-10**, **CLEAN-12**, **TOOL-9**, **CLEAN-11**, **MOD-67**, **MOD-96**, **CLEAN-10**, **MOD-93**, **MOD-89**, **MOD-95**, **TOOL-11**,
 **MOD-91**, **MOD-92**) are in `DECISIONS.md`; their host Postgres gates on the merged tree, the Windows runs
 and MOD-93's live install and `tsc` on the mod stay owed; TOOL-9's Windows run of the `.ps1` gate files and TOOL-10's real
-`scripts/hr up` and Docker bats case are owed on the host too. Open from ANA-29: **MOD-94** behind a maintainer decision.
+`scripts/hr up` and Docker bats case are owed on the host too, as are ANA-30's checks of which credit the $100 is and
+of stored ACP `session_info_update` titles (`docs/ANA-30.md` §8 calls 2, 6). Open from ANA-29: **MOD-94** behind a maintainer decision.
 Live coordinates after MOD-96: migrations run through `0018_seed_permission_mode` (MOD-96: data only, pins
 `acp.permission_mode` on the seeded `claude` row), before it `0017_follow_up` (`run_command.run_step_id`,
 `text`; `follow_up_window`; MOD-12's `0016_auto_queue`: `queue_entry`, `queue_batch`, `run.batch_id`), so **the next
@@ -102,22 +102,6 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   from a warm cache under one second, with the Postgres connect allowed to finish later", and
   `R-NF-3` gains a key-press-to-screen bound (on the order of 50 ms under load) that this
   measurement sets.
-- [ ] **ANA-33 - Step graphs v2 and divided fan-out** (from the 2026-10-15 requirements review,
-  `docs/requirements-review-2026-10-15.md`). `R-ORCH-1`, `R-ORCH-3`, `R-ORCH-7`, `R-ORCH-8`,
-  `R-MCP-2`, `R-ID-6`, `R-TUI-4`, `R-TUI-8`. Step graphs today are an ordered phase list per
-  project, and fan-out runs N candidates on one prompt and keeps one result. The review changes both:
-  graphs branch, run phases in parallel and loop, can be owned by a workspace, can run several items
-  as subgraphs, and can be **planned at run time** by the agent that starts them, which then runs its
-  plan directly within the project's bounds (phases, agents, caps, hard gates). Fan-out becomes
-  **division of work**: a planner agent splits a step into parts, parallel sub-steps of the same run,
-  each in its own tree, and an integrate step merges them before review (like Claude Code's
-  ultracode). Loop-back on failure becomes a per-phase target. Settle: the graph model and its
-  storage, and the snapshot a run freezes (`R-ORCH-11`); the planner's MCP tools; how a part maps
-  onto `run_step` (`UNIQUE (run_id, position, attempt, fanout_index)`) and onto crash recovery
-  (ANA-2 §4.9); how the integrate step relates to ANA-2 §4.6's reconciliation, where the orchestrator
-  never resolves a conflict; the Settings graph editor; and what becomes of MOD-27 (swarm,
-  `spawn_subagent`), MOD-36 and ANA-25 (now later tier, `R-LATER-13`). Its verdict ships in version
-  one. Not blocked.
 - [ ] **ANA-34 - Coordinator at project and workspace level** (from the 2026-10-15 requirements
   review). `R-ORCH-14`, `R-TUI-9`, `R-ENT-8`, `R-ID-6`, `R-ORCH-7`, `R-ENT-15`. The maintainer asked
   where merge and pull requests happen. Today the orchestrator merges a step's branch into the local
@@ -130,7 +114,11 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   deterministic process or both, and where `R-ID-6` draws the line; its lifetime and the box it runs
   on (the worker, `R-ORCH-12`); how it relates to ANA-33's planner and integrate step; the
   push/PR configuration and its credentials (`R-BOX-4`, `R-SEC-2`); and the final text of `R-TUI-9`.
-  Not blocked; best read beside ANA-33.
+  **Amended by ANA-33 (2026-10-18, `docs/decisions/ana/ana-33.md`):** ANA-33's side of the boundary is
+  settled (`docs/ANA-33.md` §7.13): ANA-33 owns the parts and the integrate step inside a run and keeps §4.6's
+  reconcile as the default landing hook; this item owns what the coordinator does with the integrated result
+  (landing, push, PR), which `R-ORCH-14` says it settles in `R-ORCH-7`, and integrating each child run of
+  MOD-143's subgraph nodes. Not blocked; read beside `docs/decisions/ana/ana-33.md`.
 - [ ] **ANA-35 - Entity model for any kind of project** (from the 2026-10-15 requirements review).
   `R-ID-1`, `R-ENT-1`, `R-ENT-2`, `R-ENT-3`, `R-ENT-4`, `R-ENT-5`, `R-ENT-6`, `R-ENT-8`, `R-ENT-9`,
   `R-ENT-12`, `R-ENT-14`, `R-ENT-16`, `R-BOX-4`, `R-STO-8`, `R-TUI-2`. `htui` now serves any kind of
@@ -146,7 +134,7 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   Not blocked.
 - [ ] **ANA-36 - Further MCP tools for agents** (from the 2026-10-15 requirements review).
   `R-MCP-2`, `R-MCP-1`, `R-ID-6`. The review adds read tools, search, `item_create` drafts, the
-  question tool (MOD-75) and the planner's tools (ANA-33), and asks for a survey of what else agents
+  question tool (MOD-75) and the planner's tools (MOD-140, from ANA-33, `docs/decisions/ana/ana-33.md`), and asks for a survey of what else agents
   should get: what comparable harnesses expose to their agents, which tools would replace work an
   agent does badly today (from stored transcripts), and the scope and `R-ID-6` line for each. Not
   blocked.
@@ -179,7 +167,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   `R-ORCH-14`, `R-ORCH-6`, `R-ID-6`. A workflow that drives a **whole project's implementation**,
   coordinating its items automatically (which to start, in what order, when to stop), above the
   per-item workflows of ANA-40. Settle how it relates to the project and workspace coordinators
-  (ANA-34), auto mode's queue (`R-ORCH-6`), ANA-33's planned graphs, and `R-ID-6`'s line between item
+  (ANA-34), auto mode's queue (`R-ORCH-6`), ANA-33's planned graphs (concluded, `docs/ANA-33.md` §7.6, §7.9,
+  `docs/decisions/ana/ana-33.md`), and `R-ID-6`'s line between item
   work and bookkeeping. Wanted later, by maintainer decision; blocked on ANA-34 (ANA-40 is concluded, `docs/decisions/ana/ana-40.md`).
 - [ ] **ANA-42 - Execution targets: where an item runs** (from the UI redesign review,
   `docs/ui-redesign-findings-2026-10-15.md` §4.2a). `R-ORCH-15`, `R-ORCH-12`, `R-ENT-17`, `R-SEC-5`, `R-AGT-11`, `R-BOX-4`,
@@ -221,6 +210,12 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   lists the tool. **Requirements review note (2026-10-15):** `R-ORCH-7` now means divided work
   (a planner, parallel parts, an integrate step), which overlaps the swarm. ANA-33 settles whether
   this item is subsumed, narrowed or kept; do not start before its verdict.
+  **Amended by ANA-33 (2026-10-18, `docs/ANA-33.md` §7.12, `docs/decisions/ana/ana-33.md`):** narrowed to
+  **consult-mode `spawn_subagent`**: a read-only child (`role = 'consult'` with `parent_step_id`) whose session
+  the MCP host asks the engine to run, which needs the first tool-to-engine channel (the item's real work), counted
+  in `max_agents_per_run`; once it lands, graph steps deny the harness's own subagent tool. `RunKind::Swarm` is
+  dropped and ANA-13 §3.3 superseded: the typed exits and hop cap above become a `successors` plan and
+  `max_plan_revisions` (MOD-140), and a tree-writing `spawn_subagent` is a part (MOD-139). Blocked on MOD-139.
 - [ ] **MOD-16 - Windows runtime verification of the agent driver** (from MOD-2). `R-AGT-1`,
   `R-NF-3`, `R-HIS-1`. **This is now the only Windows check** (TOOL-3 decided 2026-09-28,
   `docs/decisions/tool/tool-3.md`): the maintainer accepted that
@@ -411,7 +406,10 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   `docs/ANA-42.md` §7.5, §7.6; **proposed, pending §8**). `R-ORCH-15`, `R-SEC-5`, `R-ENT-17`.
   The `prepare · <target>` stage (clone with `pushurl` disabled, compose project on free ports) and the
   `collect branch` step: `git bundle create` on the target, verify, fetch into a temp ref under fsck and
-  compare-and-swap, with `scripts/hr collect`'s refusals and config-path confirmation. Blocked on MOD-130.
+  compare-and-swap, with `scripts/hr collect`'s refusals and config-path confirmation. **Amended by ANA-33
+  (2026-10-18, `docs/ANA-33.md` §7.11):** `prepare · <target>` and `collect branch` are `role = 'stage'` rows at
+  positions -2 and -1 (`node_key` `prepare`, `collect`), added by MOD-139. Blocked on MOD-130; the stage rows need
+  MOD-139.
 
 - [ ] **MOD-85 - Remaining accent (cyan) uses that do not mean focus or selection** (from MOD-80,
   `docs/decisions/mod/mod-80.md` "Carried"; blueprint B-6, review M1/L5). `R-TUI-1`. MOD-80 made
@@ -475,6 +473,9 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   and resumes later is this item's design call. Not blocked: MOD-11 is done (`docs/decisions/mod/mod-11.md`), so the MCP
   server exists. `R-MCP-2` lists the tool since the 2026-10-15 requirements review, and MOD-114
   rings and notifies when a question parks a step.
+  **Amended by ANA-33 (2026-10-18, `docs/decisions/ana/ana-33.md`):** scope unchanged, but the question park now
+  meets concurrent nodes and divided parts (MOD-138, MOD-139); whether a question parks only the asking part or
+  node, or the whole run, is left to this item's plan.
   **From MOD-55 (`docs/decisions/mod/mod-55.md`):** milestone 4 (Skills) also takes the editors' `Ctrl+G` (ask an
   agent, `ui/tabs/skills/agent_help.rs`) and the `AgentHelp` panel's keys (`Enter`/`y` accept, `Esc`/`n` discard),
   hard-coded today like `Ctrl+S`/`Ctrl+E`.
@@ -525,7 +526,10 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   (~$0.12 per item), Haiku 5.5 where cost matters. A model never goes inside close-out (ANA-2
   invariant 3) or prompt assembly (ANA-5 invariant 7). No `utility_model` setting (ANA-30 §7).
   **Amended by ANA-40:** the light-model setting (MOD-126) is the one configurable cheap model; this phase
-  keeps its registry row and does not read it. Not blocked.
+  keeps its registry row and does not read it. **Amended by ANA-33 (2026-10-18, `docs/ANA-33.md` §7.12):**
+  the open choice is settled: "opt-in" means a seeded alternative graph per project (`feature-summary`,
+  `bug-summary`) and a library workflow, each with a `summary` node after `review`, and no disabled-node flag (the
+  v2 model has none). It may land on today's linear model; MOD-137's edge backfill carries it. Not blocked.
 - [ ] **MOD-99 - Error-reporting endpoint from Settings; remove the hard-coded Sentry DSN** (from the
   2026-10-14 requirements audit). `R-NF-2`, `R-ID-7`, `R-ID-2`, `R-TUI-8`, `R-STO-1`. `body` in
   `crates/htui/src/main.rs:66-68` hard-codes a GlitchTip DSN and calls `sentry::init` on every start,
@@ -660,8 +664,9 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   step, or restart from any step**. (3) **Fork from history**: start a new chat or run from a past
   step's context. (4) A run refused for missing capability tags **offers dispatch to a box that has
   them**; this part needs MOD-43. (5) In manual mode, a step about to start trimmed says so and lets the
-  user **raise the budget** first (`R-PRM-3`'s trim stays as ANA-5 §4.4 built it). Not blocked except
-  part (4).
+  user **raise the budget** first (`R-PRM-3`'s trim stays as ANA-5 §4.4 built it). **Amended by ANA-33
+  (2026-10-18, `docs/decisions/ana/ana-33.md`):** step control addresses nodes by position and `node_key`
+  (MOD-138's v2 graph, divided parts and stage rows included). Not blocked except part (4).
 - [ ] **MOD-112 - Agent context over MCP: read tools, item drafts, wider search** (from the
   2026-10-15 requirements review). `R-MCP-1`, `R-MCP-2`, `R-PRM-1`, `R-STO-8`, `R-ID-6`. (1) Read
   tools for items, documents and requirements, with **read scope wider than the run** (the active
@@ -669,7 +674,7 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   **`item_create`**: an agent proposes an item, held as a draft until a person accepts it. (4) The index
   also covers **notes** and **scrubbed run transcripts**, and searches can be scoped to a workspace
   (workspace-owned items once ANA-35 lands). The question tool is MOD-75's; the planner's tools are
-  ANA-33's. Not blocked.
+  MOD-140's (from ANA-33, `docs/decisions/ana/ana-33.md`). Not blocked.
 - [ ] **MOD-113 - Prompt library: templates and skills** (from the 2026-10-15 requirements review).
   `R-PRM-4`, `R-SKL-1`, `R-SKL-2`, `R-SKL-4`, `R-TUI-1`, `R-TUI-7`. (1) A **template library**
   shared across projects and workspaces, with per-project overrides, as a **group of the Toolbox
@@ -765,7 +770,9 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   (prepare, pick, rounds, parts, collect; Enter by state: live chat, archived transcript, nothing);
   the requirements graph; the tmux wheel hint and its docs section. §5.4 of the findings lists the
   rataflow pitfalls (overlapping components, rank spacing 1, double fit requests, loop handles).
-  **Absorbs MOD-88**, which closes when it lands. Blocked on MOD-115.
+  **Amended by ANA-33 (2026-10-18, `docs/ANA-33.md` §7.10):** the run graph is built from the v2 snapshot's nodes
+  and edges, the run's `run_plan` rows and the step rows, stage rows included; MOD-142 carries that data and the
+  Runs step list. **Absorbs MOD-88**, which closes when it lands. Blocked on MOD-115.
 - [ ] **MOD-121 - Chat groups, coordinators and the htui agent** (from the UI redesign review,
   `docs/ui-redesign-findings-2026-10-15.md` §4.3). `R-TUI-6`, `R-AGT-11`, `R-ORCH-14`, `R-HIS-2`, `R-HIS-3`. The Chat tab lists
   every session in groups: the htui agent (in every workspace), the workspace coordinator, one per
@@ -784,7 +791,10 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   choice or toggle, saved at once; Connection renamed **Postgres**; Backlog › Hierarchy removed (its
   options are Backlog keys, MOD-119); new sections **Targets** (list, add through the htui agent,
   default), **Workflows** (light model chosen from the configured agents' models, run-time changes
-  ask or automatic, default workflow) and **Catalogue** (source, last update, update now). Overlaps
+  ask or automatic, default workflow) and **Catalogue** (source, last update, update now). **Amended by
+  ANA-33 (2026-10-18, `docs/ANA-33.md` §7.6):** the Workflows section's run-time changes field is the
+  `runtime_changes` default (`off`, `ask` default, `automatic`) that MOD-140 freezes into a run's bounds; a graph
+  may override it (MOD-141). Overlaps
   MOD-109's surfaces: land beside it. Blocked on MOD-115.
 - [ ] **MOD-124 - Toolbox tab and workflow editor** (from the UI redesign review, `docs/ui-redesign-findings-2026-10-15.md` §4.6).
   `R-TUI-7`, `R-ORCH-1`, `R-PRM-4`. The Toolbox tab with the kinds ANA-40 settled (`docs/decisions/ana/ana-40.md`; templates stay a
@@ -792,15 +802,19 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   side handles; `a` add, `e` edit (name, persona, agent or any agent, fan-out parts), `x` delete
   (confirmed, links rewired), `c` connect or drag from a step's handle (relation picker), `i` links
   or click a link (change, delete), right-click edits, `T` pins a target, undo/redo of every edit
-  (`u`/`U`, `Ctrl-Z`/`Ctrl-Y`); runs keep the version they started with. Blocked on MOD-115; the generic binding is MOD-127 and bundles are MOD-128.
+  (`u`/`U`, `Ctrl-Z`/`Ctrl-Y`); runs keep the version they started with. **Amended by ANA-33 (2026-10-18,
+  `docs/ANA-33.md` §7.10):** the workflow editor *is* MOD-141's shared step-graph component (one editor for every
+  `step_graph`, whatever its scope); this item keeps the Toolbox shell and opens MOD-141 on the library and the
+  workspace's graphs. Blocked on MOD-115; the generic binding is MOD-127, bundles are MOD-128, the editor MOD-141.
 - [ ] **MOD-125 - Stopping and resuming runs** (from the UI redesign review, `docs/ui-redesign-findings-2026-10-15.md` §4.1).
   `R-ORCH-16`, `R-TUI-14`, `R-TUI-18`, `R-AGT-1`. Stop every run in a workspace, the open one
   included: graceful stops each agent step before its next turn (a check or `htui`'s own step at
   once), forced stops mid-turn; both confirmed, the conversation always saved; resume reopens each
   agent's saved session (redoing an interrupted turn) and reruns checks; nothing new starts until
   resumed. Settle in the plan how "before the next turn" maps onto ACP (cancel at a turn boundary,
-  session load) and the CLI adapter, and what the worker does for runs it owns (MOD-41). Not
-  blocked; its TUI half lands with MOD-116.
+  session load) and the CLI adapter, and what the worker does for runs it owns (MOD-41). **Amended by
+  ANA-33 (2026-10-18, `docs/ANA-33.md` §9):** the test matrix includes a divided step (planner, parts, integrate)
+  and a subgraph node, the bug classes Argo and LangGraph hit. Not blocked; its TUI half lands with MOD-116.
 
 - [ ] **MOD-126 - Light model setting and run-start workflow pick** (from ANA-40, `docs/ANA-40.md` §5.4, §8 P1).
   `R-ORCH-1`, `R-ID-6`, `R-TUI-17`, `R-PRM-1`. One `app_setting` key `{agent_id, model}` (ANA-30 option B), a new
@@ -808,8 +822,11 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   prompts, and a `pick workflow` step recording the chosen workflow, a short reason and the model used. The pick
   is advisory and pinnable and needs no acceptance in auto mode; on model failure, no configured model or
   timeout it falls back to the Settings default workflow and then the kind's default graph, and the run never
-  blocks. Amend the ANA-30 decision record (partial reversal) and MOD-98's wording. Blocked on ANA-33 for the
-  pick's home in the run graph.
+  blocks. Amend the ANA-30 decision record (partial reversal) and MOD-98's wording. **Amended by ANA-33
+  (2026-10-18, `docs/ANA-33.md` §7.11, `docs/decisions/ana/ana-33.md`):** the pick's home is a `role = 'stage'`
+  row at position -3 (`node_key = 'pick'`), inserted in the `create_run` transaction with agent, model and usage,
+  its record a `workflow_pick` document; the pick runs before `create_run` and is re-run after a crash. Blocked on
+  MOD-139's stage rows.
 - [ ] **MOD-127 - Generic Toolbox binding; MCP server, command and env-preset kinds** (from ANA-40, §8 P2, P3).
   `R-SKL-2`, `R-TUI-7`, `R-ID-3`, `R-ID-5`, `R-AGT-11`. Generalise `skill_binding` to a typed binding (kind, ref,
   level, pin, activation) with one resolver shared by the Postgres and in-memory stores and a step-level reason
@@ -828,13 +845,71 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   starts with a spike on loading mods per run under isolation, which is unverified. Then extend `R-SKL-4` import so
   a Claude Code plugin yields one bundle with skill, command, sub-agent, hook, MCP and mod parts. Blocked on
   MOD-127 and MOD-128.
+- [ ] **MOD-137 - Step graph v2 storage: edges, owner scope, revision, atomic edits** (from ANA-33,
+  `docs/ANA-33.md` §7.1, §10). `R-ORCH-1`, `R-ORCH-3`, `R-TUI-8`. Migration `0019`: `step_graph_edge` (`next`, `if`,
+  `asks_you`, `changes_requested`, `fails`, with an `if` predicate and a loop `limit`); `step_graph.workspace_id` and
+  a nullable `project_id` under an at-most-one-owner CHECK (neither set is the global workflow library), with partial
+  unique indexes per scope; `step_graph.revision`, the whole-graph CAS token; the `split`, `palette` and `plan_scope`
+  columns and the divide planner and integrate persona and agent columns; `phase_part`; a deterministic backfill of
+  `next` edges from positions plus the review loop edge today's name rule implies. Code: `replace_graph` and deleters
+  for phases, edges and `phase_agent` on `WriteStore`, MemStore and PgStore; seeds write edges; `StoreRequest` verbs on
+  `catalogue::serve`; the re-override owed at `graph.rs:455-461`. Answers ANA-40 P7. Not blocked.
+- [ ] **MOD-138 - Snapshot v2 and the graph walker** (from ANA-33, `docs/ANA-33.md` §7.2, §7.3, §7.7, §10).
+  `R-ORCH-1`, `R-ORCH-2`, `R-ORCH-3`, `R-ORCH-4`, `R-ORCH-11`. `GraphSnapshot` v2 (nodes, edges, bounds; a divided
+  node expanded into `<name>:plan` and `<name>`) and its resolve; the v1 lift in `snapshot_of` (v1 runs keep today's
+  live-topology park); pinned resume for v2 (digests recompute, no live-graph compare). The walker: `ready()` replacing
+  `status::cursor`, concurrent driving under `max_parallel_sessions`, all-joins and derived skip propagation, the
+  closed `if` predicate set, `asks_you` parks, per-edge loop targets with region retirement, limits and the
+  no-progress test; graph-aware `required_inputs` and recovery frontier; a per-repo reconcile lock. A shared pure
+  validator used by save and resolve. Box every per-node future (stack depth, §9). Blocked on MOD-137.
+- [ ] **MOD-139 - Divided fan-out runtime: planner, parts, integrate** (from ANA-33, `docs/ANA-33.md` §7.4, §7.5,
+  §7.7, §7.8, §7.11, §10). `R-ORCH-7`, `R-ORCH-8`, `R-ORCH-11`, `R-MCP-3`. Migration: `run_step.role`,
+  `parent_step_id` and `node_key`; `run_plan` (append-only); cache mirror `0006` for both. Planner expansion and the
+  one-transaction admission (`base_refs`, part rows `pending`), default-parts revision 0; parts branch from
+  `base_refs` with their own `{{part}}` prompt and agent; part documents excluded from generic `input_kinds` (ANA-2
+  invariant 8 extended) and shown to integrate through `{{parts}}`; per-part retry, and the whole step fails on an
+  exhausted part. Integrate: `Isolator::premerge`, the copy-mode fetch, the ancestry post-check
+  (`integrate_incomplete`), only the integrate branch landing through §4.6. §4.9 recovery per role; caps at every
+  admission (`max_agents_per_run` counts planned sessions); `fan_out_only` meaning live siblings; the `role = 'stage'`
+  rows at -3..-1 that MOD-126 and MOD-132 need. Blocked on MOD-138.
+- [ ] **MOD-140 - The planner's MCP tools and run-time changes** (from ANA-33, `docs/ANA-33.md` §7.6, §10). `R-MCP-2`,
+  `R-MCP-1`, `R-ID-6`, `R-ORCH-1`. `plan_bounds`, `plan_submit` and `plan_status` in `htui-mcp`, with a fenced
+  `run_plan` proposal writer in the `write_step_document` style; the `ToolScope` role and plan scope set in
+  `open_tools` (and the chat constructors and test scopes); the shared plan validator, engine re-validation and
+  admission after the session, refusal texts, `missing_output` when no proposal is valid. Run-time changes: the
+  `runtime_changes` bound (`off`, `ask` by default, `automatic`) frozen from Settings > Workflows, `successors` plans
+  from any step, the plan-approval park, hard-gated and `asks_you` nodes never bypassed; the read-only planner
+  exposure through `deny_kinds` (verify adapter coverage, else a throwaway tree, §9). Coordinate with ANA-36 and
+  MOD-112. Blocked on MOD-139.
+- [ ] **MOD-141 - One step-graph editor for Settings and the Toolbox** (from ANA-33, `docs/ANA-33.md` §7.10, §10).
+  `R-TUI-8`, `R-TUI-7`, `R-TUI-10`, `R-ORCH-1`. A rataflow editor over `replace_graph`: the node form (every snapshot
+  field; split none, divide or compete, compete only behind the later-tier setting; candidates through a
+  `phase_agent` editor; palette; plan scope) and the edge form (relation, `if` predicate, loop `limit`); the
+  save-time validator; in-memory undo and redo over the revision CAS; catalogue key actions only, collisions resolved
+  per context. `Settings > Kinds` opens it on the project's graphs, the Toolbox on the library and the workspace's.
+  Amends MOD-124 (its workflow editor is this component) and MOD-123 (the `runtime_changes` default). Blocked on
+  MOD-137, MOD-138 (validator) and MOD-115.
+- [ ] **MOD-142 - Runs pane for divided and planned runs** (from ANA-33, `docs/ANA-33.md` §7.10, §10). `R-TUI-4`,
+  `R-ORCH-11`. `RunSummary` carries the decoded v2 graph and `run_plan` rows; the step list groups planner, parts and
+  integrate as a tree with each part's key, agent and state, offline from the mirrored `role`, `parent_step_id` and
+  `node_key`, and offers the plan-approval view at a planner gate; the judge layer, the `selected` mark and `s`
+  appear only on a compete node. Amends MOD-120, whose run graph reads the same graph, plans and stage rows. Blocked
+  on MOD-139; the list view does not need MOD-115.
+- [ ] **MOD-143 - Subgraph nodes: one graph runs several items** (from ANA-33, `docs/ANA-33.md` §7.9, §10). `R-ORCH-1`,
+  `R-ORCH-9`, `R-ORCH-14`. Migration: `run.parent_run_id`, `run.parent_step_id` and `UNIQUE (parent_step_id,
+  item_id)`. The `subgraph` node with a frozen child snapshot and an item source (planner-named existing items, or
+  ANA-35's `parent` children); one ordinary child run per item through the normal claim, capped by `max_child_runs`;
+  done when every child is done, a failed child fails the node; the parent releases its per-box slot while it waits;
+  idempotent recovery; depth 1. Blocked on MOD-138, ANA-35 (the run waiting state and the `parent` link) and ANA-34
+  (child integration).
 
 ### Deferred backlog
 
 - [ ] **MOD-36 - Weighted agent assignment across fan-out candidates** (from MOD-4 milestone 4,
   OQ-7; ANA-21 is done, `docs/decisions/ana/ana-21.md`). `R-AGT-8`,
   `R-LATER-13`. **Deferred by the 2026-10-15 requirements review:** best-of-N fan-out is now the
-  later-tier compete mode (`R-LATER-13`), and `R-ORCH-7` means divided work (ANA-33).
+  later-tier compete mode (`R-LATER-13`), and `R-ORCH-7` means divided work (ANA-33). ANA-33 left this
+  item unchanged (`docs/decisions/ana/ana-33.md`): compete code stays and is tested through the v1 lift.
   Milestone 4 runs every candidate of a group on the
   one agent the walk selects (rival sampling). This item spreads candidates across the eligible
   agents by weight: a weighted `AgentSelector` (the seam milestone 4 leaves per-candidate) picks each
@@ -898,7 +973,7 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 12 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-33 step graphs v2 and divided fan-out, ANA-34 coordinator, ANA-35 entity model for any project, ANA-36 further MCP tools, ANA-37 Qdrant required?, ANA-38 project memory, ANA-39 mandatory context tools, ANA-41 project workflows, ANA-42 execution targets) |
-| MOD-N   | 54 (MOD-16 Windows verification, MOD-27 swarm, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-115 TUI shell, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
+| ANA-N   | 11 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-34 coordinator, ANA-35 entity model for any project, ANA-36 further MCP tools, ANA-37 Qdrant required?, ANA-38 project memory, ANA-39 mandatory context tools, ANA-41 project workflows, ANA-42 execution targets) |
+| MOD-N   | 61 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-115 TUI shell, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-137 step graph v2 storage, MOD-138 snapshot v2 and walker, MOD-139 divided fan-out runtime, MOD-140 planner tools and run-time changes, MOD-141 step-graph editor, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
 | CLEAN-N | 0 |
 | TOOL-N  | 2 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check) |

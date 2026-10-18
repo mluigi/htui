@@ -64,6 +64,9 @@ R-TUI-12..18 added; amended in place: R-ID-6, R-ENT-2, R-ENT-14, R-ENT-15, R-ORC
 R-PRM-4, R-TUI-1, R-TUI-2, R-TUI-3, R-TUI-4, R-TUI-5, R-TUI-6, R-TUI-7, R-TUI-8 and R-TUI-10. The
 analyses it opens are ANA-40 (the Toolbox), ANA-41 (project workflows) and ANA-42 (execution
 targets).
+amended 2026-10-18 by maintainer decision on ANA-33 (`docs/ANA-33.md` §8, §10,
+`docs/decisions/ana/ana-33.md`) — R-ORCH-1, R-MCP-3 and R-TUI-8 amended in place (`retries` is a loop
+on the same step; the meaning of `fan_out_only`; the shared graph editor).
 **Governed by:** `.claude/rules/workflow-docs.md`
 
 This file is the product requirements for `htui`. It sits above every `ANA-N` analysis and every
@@ -372,9 +375,9 @@ conflict. Their verdicts survive only where restated here.
   enforced. Amended 2026-10-15 (was: an ordered list owned by a project); design in ANA-33.
   Beside kinds' graphs there is a global library of **workflows**, edited in the Toolbox (R-TUI-7):
   templates with steps, fan-out parts and typed links — `next`, `approved`, `asks you` (waits for
-  the person), `if` (taken only when a condition holds), and the loops `changes requested`, `fails`
-  and `retries` back to an earlier step. A step names a persona and either a specific agent or any
-  agent; personas carry no agent. A workflow may pin an execution target (R-ORCH-15). When a run
+  the person), `if` (taken only when a condition holds), the loops `changes requested` and `fails`
+  back to an earlier step, and `retries`, a loop on the same step (amended 2026-10-18, ANA-33). A
+  step names a persona and either a specific agent or any agent; personas carry no agent. A workflow may pin an execution target (R-ORCH-15). When a run
   starts, a light model configured in Settings picks the item's workflow unless the item pins one,
   and the run carries it out: each loop taken becomes round 1, round 2, each fan-out one sub-step per
   part. The run's agent may change the workflow at run time, on its own or after asking, as a setting
@@ -520,8 +523,10 @@ conflict. Their verdicts survive only where restated here.
 - **R-MCP-3 (must).** `command_run` enqueues build, test and run commands behind per-box
   concurrency limits by command class (for example one C++ build, four test runs) and returns
   output. Exposure per phase is `off`, `fan_out_only` (default) or `always`, and can be forced on
-  by the item carrying the `heavy_build` label (R-ENT-5). When off, the tool is not advertised to the
-  session. The exposure and the per-box limits are editable in Settings. Amended 2026-10-15.
+  by the item carrying the `heavy_build` label (R-ENT-5); `fan_out_only` exposes it when the session
+  has live siblings in the run (compete candidates, divided parts, parallel nodes). When off, the tool
+  is not advertised to the session. The exposure and the per-box limits are editable in Settings.
+  Amended 2026-10-15 and 2026-10-18 (ANA-33: the meaning of `fan_out_only`).
 - **R-MCP-4 (must).** Skill text instructs agents to use `command_run` for heavy commands when it is
   exposed; ACP permission handling denies matching direct shell commands in that case.
 
@@ -587,7 +592,8 @@ conflict. Their verdicts survive only where restated here.
   2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`) (was: a Skills tab and a separate Templates tab).
 - **R-TUI-8 (must).** Settings tab: agent registry with quota, adding a row (R-AGT-5), and each
   row's isolation (R-ID-5); box profile with capability edits; project types, item kinds, and step
-  graphs with a graph editor; `command_run` exposure and per-box limits (R-MCP-3); key
+  graphs with the shared graph editor (the one the Toolbox opens, R-TUI-7; amended 2026-10-18,
+  ANA-33); `command_run` exposure and per-box limits (R-MCP-3); key
   bindings (R-TUI-10); secret provider, caps, scheduler window, repo credentials (R-BOX-4), and the
   Postgres connection: whether a DSN is stored, a masked field to enter or replace it, an action to
   clear it, and the state of the last attempt. What is typed goes to the OS keyring and nowhere else

@@ -27,14 +27,14 @@
 > - `R-AGT-8` (candidate order), `R-TUI-7` (Toolbox editor) and `R-TUI-10` (configurable keys);
 > - `R-LATER-13` (compete fan-out) and `R-ENT-8` (status moves to the run, ANA-35).
 >
-> **Status (2026-10-18): drafted, awaiting maintainer acceptance of §8.** No implementation code is
-> written here. Verdict (§7): **one graph model, phase rows as nodes plus typed edge rows, owned by a
+> **Status (2026-10-18): concluded; the maintainer accepted all ten §8 decisions.** No implementation
+> code is written here. Write-up: `docs/decisions/ana/ana-33.md`. Verdict (§7): **one graph model, phase rows as nodes plus typed edge rows, owned by a
 > project, a workspace or the global workflow library; a run freezes a v2 snapshot and is pinned to it;
 > a divided step expands into a planner node, the parts it plans, and an integrate node; parts are
 > planned nodes at their own appended positions, recorded in an append-only `run_plan` before any of
 > them starts; the integrate agent merges the parts in its own tree after a deterministic pre-merge,
-> and only its branch reaches §4.6's unchanged reconciliation.** Proposed spawns: **MOD-NEW-a** to
-> **MOD-NEW-g**. These are placeholders; the session mints the real IDs.
+> and only its branch reaches §4.6's unchanged reconciliation.** Spawned: **MOD-137** to
+> **MOD-143** (minted 2026-10-18 through `scripts/hr-mint`).
 
 ---
 
@@ -416,8 +416,11 @@ Resume:
     and integrate persona and agent columns, plus optional default parts (`phase_part` rows).
   - `palette BOOLEAN`, for a node a planner may instantiate but the walk never reaches on its own.
   - `plan_scope` on a planner node.
-- **Validation.** Forward edges must be acyclic, and a back edge is only `changes_requested` or `fails`.
-  A palette node has no edges.
+- **Validation.** Forward edges must be acyclic, and a back edge is only `changes_requested`, `fails`
+  or `asks_you`. The findings' own `asks you` example is a back edge (`merge → code` in research
+  fan-out, `docs/ui-redesign-findings-2026-10-15.md:389-390`): a person picks whether the loop is
+  taken, and the edge carries a `limit` like the other loop links, which still bounds it (7.3). A
+  palette node has no edges.
 - **Backfill.** The migration derives `next` edges between consecutive positions. For each `review`
   phase it adds the `changes_requested` edge today's rule implies: to the greatest earlier `implement`,
   else to the previous phase, with `limit` taken from the target's `retry_limit`. That makes
@@ -480,7 +483,9 @@ GraphSnapshot v2 {
   `not`. Each source's `next` edges are always taken. A branch chosen by an agent goes through a
   planner, never through `if`.
 - **`asks_you`.** The run parks at `awaiting_approval` on the edge: its source is done and its target
-  is not yet created. Take creates the target, and decline skips it. It is never downgraded.
+  is not yet created. Take creates the target, and decline skips it. It is never downgraded. On an
+  `asks_you` back edge, take is a loop (below) within the edge's `limit`; once the limit is spent the
+  run escalates as for any loop instead of asking again.
 - **Loops.** `changes_requested` replaces `is_review`'s name rule: any node with such an edge has its
   verdict read the way `gate.rs` reads `review` today. On a loop from S to T, the walker retires every
   node on a forward path from T to S. That includes their parts and plans: plans become `abandoned`,
@@ -625,7 +630,7 @@ GraphSnapshot v2 {
     deterministic.
   - Finished: the plain test plus the ancestry post-check.
 - **Frontier.** `recover::frontier` becomes the set of done, landing nodes (plain or integrate) whose
-  reconcile is not yet recorded. MOD-NEW-b's plan settles whether a `reconciled_at` column makes that
+  reconcile is not yet recorded. MOD-138's plan settles whether a `reconciled_at` column makes that
   explicit.
 - **No twins.** The no-twin rule is the existing lease and fence (`StepFence::Lease`), unchanged.
 
@@ -732,6 +737,7 @@ GraphSnapshot v2 {
 | Creating and awaiting a subgraph's child runs | owns (deterministic) | integrates each child's work when it completes (`R-ORCH-14`) |
 | The planner's plan | owns; per run, item work | may read it, never edits it |
 | Which items run next across a project | none | coordinator, and ANA-41's project workflows |
+| What the coordinator changes in `R-ORCH-7` (`R-ORCH-14`: ANA-34 "also settles what it changes in R-ID-6, R-ORCH-7, R-ENT-8 and R-TUI-9", `docs/REQUIREMENTS.md:430-431`) | owns the parts and the integrate step inside a run | owns what the coordinator does with the integrated result (landing, push, PR) |
 
 ANA-35 owns workspace-owned items, item and run statuses (the `blocked` writes of §4.4 and §4.5, and
 the waiting state in 7.9), and the `parent` link kind. Workspace-*owned graphs* need only 7.1's owner
@@ -739,16 +745,18 @@ column and land before ANA-35.
 
 **7.14 Phasing.** Every phase ships in version one.
 
-1. **The graph model** (MOD-NEW-a, MOD-NEW-b). Edges, scope and revision, the v2 snapshot, the
+1. **The graph model** (MOD-137, MOD-138). Edges, scope and revision, the v2 snapshot, the
    readiness walk, and per-node loop targets. Linear graphs keep working through the backfill and the v1
    lift, and `R-ORCH-3` ships here.
-2. **Divided fan-out** (MOD-NEW-c, MOD-NEW-d, MOD-NEW-f). `R-ORCH-7` and `R-TUI-4`'s parts tree, plus the
+2. **Divided fan-out** (MOD-139, MOD-140, MOD-142). `R-ORCH-7` and `R-TUI-4`'s parts tree, plus the
    stage rows MOD-126 and MOD-132 need.
-3. **The editor** (MOD-NEW-e), with MOD-115, MOD-123 and MOD-124.
-4. **Subgraphs** (MOD-NEW-g), after ANA-35 and beside ANA-34.
-5. **Narrowed MOD-27** (consult-mode `spawn_subagent`), after MOD-NEW-c.
+3. **The editor** (MOD-141), with MOD-115, MOD-123 and MOD-124.
+4. **Subgraphs** (MOD-143), after ANA-35 and beside ANA-34.
+5. **Narrowed MOD-27** (consult-mode `spawn_subagent`), after MOD-139.
 
-## 8. Maintainer decisions requested
+## 8. Maintainer decisions requested (all accepted 2026-10-18)
+
+**Accepted (2026-10-18):** the maintainer accepted all ten decisions below as recommended.
 
 1. **One model: workflows are `step_graph` rows in the global scope, with no separate workflow table
    (7.1, answering ANA-40 P7).** Accept, or keep two models (6.1 D)?
@@ -780,7 +788,7 @@ column and land before ANA-35.
   future and gate the suite `--no-fail-fast` with a grep for SIGABRT.
 - **Concurrency is counted per run, not per session.** `max_concurrent_items` counts runs, so a run with
   four parts draws four sessions and four quotas at once. A box-level session cap may be needed (open,
-  MOD-NEW-c's plan). `R-ORCH-6`'s quota wait must apply per part.
+  MOD-139's plan). `R-ORCH-6`'s quota wait must apply per part.
 - **Ancestry proves inclusion of commits, not of their changes.** An integrate agent could, for example,
   merge with `-s ours` and pass. The mitigations are the per-part diffstat in the review prompt and
   review after integrate. A stronger check, such as a per-part diff against `owned_paths`, is an
@@ -793,7 +801,7 @@ column and land before ANA-35.
 - **`if` predicates.** The set may prove too small. Extension is additive: a new predicate kind
   serialised with `skip_serializing_if`, as the persona field did, without a `V` bump.
 - **`deny_kinds` coverage.** It is unverified that `deny_kinds` covers every adapter's edit tools for a
-  read-only planner. ACP reports some tools as `other`. Verify in MOD-NEW-d, and otherwise give the
+  read-only planner. ACP reports some tools as `other`. Verify in MOD-140, and otherwise give the
   planner a throwaway tree whose commits fail admission (`planner_wrote`).
 - **Migration cost.** Each migration rebuilds every box's mirror and needs `cargo sqlx prepare` against a
   migrated scratch database. The `tests/migrations.rs` table and comment lists, plus the MemStore and
@@ -805,7 +813,7 @@ column and land before ANA-35.
 
 ## 10. Spawned items
 
-- **MOD-NEW-a - Step graph v2 storage: edges, owner scope, revision, atomic edits.**
+- **MOD-137 - Step graph v2 storage: edges, owner scope, revision, atomic edits.**
   - **Migration `0019`:**
     - `step_graph_edge`;
     - `step_graph.workspace_id`, a nullable `project_id`, the scope CHECK and partial unique indexes;
@@ -823,7 +831,7 @@ column and land before ANA-35.
   - **Dependencies:** not blocked.
   - **Requirements:** `R-ORCH-1`, `R-ORCH-3`, `R-TUI-8` (storage half).
   - **Answers:** ANA-40 P7.
-- **MOD-NEW-b - Snapshot v2 and the graph walker.**
+- **MOD-138 - Snapshot v2 and the graph walker.**
   - **Snapshot:** `GraphSnapshot` v2 and its resolve, with divide expansion and bounds; the v1 lift in
     `snapshot_of`; pinned resume for v2.
   - **Walker:** `ready()` replacing `cursor`, with concurrent driving under `max_parallel_sessions`,
@@ -831,10 +839,10 @@ column and land before ANA-35.
     region retirement, limits and no-progress; graph-aware `required_inputs` and frontier; a per-repo
     reconcile lock.
   - **Validator:** a shared pure validator used by save and resolve.
-  - **Dependencies:** MOD-NEW-a.
+  - **Dependencies:** MOD-137.
   - **Requirements:** `R-ORCH-1`, `R-ORCH-2`, `R-ORCH-3`, `R-ORCH-11`, and the `R-ORCH-4` seam
     (MOD-111 addresses nodes by position).
-- **MOD-NEW-c - Divided fan-out runtime: planner, parts, integrate.**
+- **MOD-139 - Divided fan-out runtime: planner, parts, integrate.**
   - **Migration:** `run_step.role`, `parent_step_id` and `node_key`; `run_plan`; cache mirror `0006`
     for both.
   - **Admission:** planner expansion and the admission transaction; default-parts revision 0.
@@ -846,9 +854,9 @@ column and land before ANA-35.
   - **Recovery and caps:** §4.9 recovery per role; caps at every admission; the new meaning of
     `command_queue` `fan_out_only`.
   - **Stage rows:** the `role = 'stage'` rows at -3, -2 and -1 for MOD-126 and MOD-132.
-  - **Dependencies:** MOD-NEW-b.
+  - **Dependencies:** MOD-138.
   - **Requirements:** `R-ORCH-7`, `R-ORCH-8`, `R-ORCH-11`, `R-MCP-3`, and ANA-2 §4.6 and §4.9.
-- **MOD-NEW-d - The planner's MCP tools and run-time changes.**
+- **MOD-140 - The planner's MCP tools and run-time changes.**
   - **Tools:** `plan_bounds`, `plan_submit` and `plan_status` in `htui-mcp`, with a fenced `run_plan`
     proposal writer in the `write_step_document` style.
   - **Scope and validation:** the `ToolScope` role and plan scope set in `open_tools` (and in the chat
@@ -856,9 +864,9 @@ column and land before ANA-35.
     the session; refusal texts; `missing_output` for no proposal.
   - **Run-time changes:** the `runtime_changes` bound (`off`, `ask`, `automatic`) frozen from Settings >
     Workflows; the plan-approval park; the read-only planner exposure (`deny_kinds`).
-  - **Dependencies:** MOD-NEW-c; MOD-11 is done. Coordinate with ANA-36 and MOD-112.
+  - **Dependencies:** MOD-139; MOD-11 is done. Coordinate with ANA-36 and MOD-112.
   - **Requirements:** `R-MCP-2`, `R-MCP-1`, `R-ID-6`, `R-ORCH-1`.
-- **MOD-NEW-e - One step-graph editor for Settings and the Toolbox.**
+- **MOD-141 - One step-graph editor for Settings and the Toolbox.**
   - **Component:** a rataflow editor over `replace_graph`, with the node form (every field, including
     split, divide, candidates, palette and plan scope) and the edge form (relation, `if` predicate,
     limit).
@@ -866,32 +874,32 @@ column and land before ANA-35.
     actions with no hardcoded keys.
   - **Surfaces:** `Settings > Kinds` opens it on the project's graphs; the Toolbox opens it on the
     library and the workspace.
-  - **Dependencies:** MOD-NEW-a, MOD-NEW-b (validator), MOD-115.
+  - **Dependencies:** MOD-137, MOD-138 (validator), MOD-115.
   - **Amends:** MOD-124, whose workflow editor *is* this component (MOD-124 keeps the Toolbox shell), and
     MOD-123, whose Workflows section carries the `runtime_changes` default.
   - **Requirements:** `R-TUI-8`, `R-TUI-7`, `R-TUI-10`, `R-ORCH-1`.
-- **MOD-NEW-f - Runs pane for divided and planned runs.**
+- **MOD-142 - Runs pane for divided and planned runs.**
   - **Data:** `RunSummary` carries the decoded v2 graph and `run_plan` rows.
   - **Step list:** groups planner, parts and integrate as a tree with each part's state, works offline
     from the mirrored columns, and offers the plan-approval view at a planner gate.
   - **Compete affordances:** the judge layer, the `selected` mark and `s` appear only on a compete node.
-  - **Dependencies:** MOD-NEW-c.
+  - **Dependencies:** MOD-139.
   - **Amends:** MOD-120, whose run graph reads the same graph, plans and stage rows. It does not need
     MOD-115 for the list view.
   - **Requirements:** `R-TUI-4`, `R-ORCH-11`.
-- **MOD-NEW-g - Subgraph nodes: one graph runs several items.**
+- **MOD-143 - Subgraph nodes: one graph runs several items.**
   - **Migration:** `run.parent_run_id`, `parent_step_id` and `UNIQUE (parent_step_id, item_id)`.
   - **Node:** the `subgraph` node with a frozen child snapshot and an item source (planner-named items,
     or ANA-35's `parent` children); child-run creation through the normal claim; `max_child_runs`;
     completion and failure rules.
   - **Waiting and recovery:** slot release while waiting; idempotent recovery.
-  - **Dependencies:** MOD-NEW-b; ANA-35 (the run waiting state and the `parent` link); ANA-34 (child
+  - **Dependencies:** MOD-138; ANA-35 (the run waiting state and the `parent` link); ANA-34 (child
     integration).
   - **Requirements:** `R-ORCH-1`, `R-ORCH-9`, and the `R-ORCH-14` seam.
 
 **Existing items affected:**
 
-- **MOD-27:** narrowed to consult-mode `spawn_subagent`, and blocked on MOD-NEW-c.
+- **MOD-27:** narrowed to consult-mode `spawn_subagent`, and blocked on MOD-139.
 - **MOD-36 and ANA-25:** unchanged, later tier.
 - **MOD-98:** still not blocked; its open choice is settled, with opt-in meaning a seeded alternative
   graph.
@@ -899,7 +907,7 @@ column and land before ANA-35.
   parks only the asking part or node, or the whole run, is left open for MOD-75's plan.
 - **ANA-30:** the §4 U5 amendment in 7.12.
 - **MOD-120 and MOD-124:** amended as above.
-- **MOD-126:** unblocked once MOD-NEW-c's stage rows land; the pick home is 7.11.
+- **MOD-126:** unblocked once MOD-139's stage rows land; the pick home is 7.11.
 - **MOD-132 (ANA-42):** gains the `prepare` and `collect` stage rows.
 - **MOD-111:** step control addresses nodes by position and `node_key`.
 - **MOD-125:** its test matrix gains divided steps.
@@ -912,6 +920,8 @@ column and land before ANA-35.
 - **ANA-13:** §3.2 and §3.3 are superseded by 7.12.
 - **`R-MCP-3`:** the meaning of `fan_out_only`.
 - **`R-TUI-8`:** "with the shared graph editor".
+- **`R-ORCH-1`:** `retries` is a self-loop on the same node (its own `retry_limit`, 7.3), not a loop
+  back to an earlier step; 7.1 has no `retries` edge kind.
 - **`CONCEPTS.md:42-43`:** graphs are owned by a project, a workspace or the global library.
 
 ## 11. Sources
