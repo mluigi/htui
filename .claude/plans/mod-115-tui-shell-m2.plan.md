@@ -29,6 +29,8 @@ The D4 defaults (`ctrl-pgdn`/`ctrl-pgup` for tabs) and the D6 wording are accept
 | MD4 | Users' existing overrides are kept when defaults change (PRD Q2). | maintainer, this run |
 | MD5 | PRD Q1 (where layout/history live) is decided here: see D1. | maintainer, this run |
 | MD6 | The plan drafts the leave-dialog wording; it must not promise that work survives the exit (PRD Q3): see D6. | maintainer, this run |
+| MD7 | **`Esc` is the one exception to MD1.** It can never be configured: it cannot appear in `keys.toml` (refused like the old `ctrl-c` rule, naming the reason). Every action whose default holds `esc` keeps it whatever the file says: an override replaces only that row's other chords, and `[]` unbinds only those. So `Esc` always does what it does today (close, cancel, back, dismiss, no). This also settles blueprint D-13 for `Esc`. **Implemented in Task 5** (loader, validator, `[field]` translation never drops `Esc`); Task 0's rows are unaffected. | maintainer, 2026-10-18 after the blueprint |
+| MD8 | Mouse capture turns on for the list + detail tabs (Backlog, Requirements, Skills), so a click focuses a pane and a border drag resizes. Chat and Settings keep the terminal's plain text selection. This settles blueprint D-6. **Task 6.** | maintainer, 2026-10-18 after the blueprint |
 
 ## Design decisions (proposed; CONFIRM accepts or amends them)
 - **D1 — UI state lives in a per-machine file, history in memory.**
