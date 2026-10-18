@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[ANA-35](docs/decisions/ana/ana-35.md)** - Entity model for any kind of project (concluded, 2026-10-18)
 - **[ANA-34](docs/decisions/ana/ana-34.md)** - Coordinator at project and workspace level (concluded, 2026-10-18)
 - **[ANA-40](docs/decisions/ana/ana-40.md)** - Toolbox: kinds of run tools and how to show them (concluded, 2026-10-17)
 - **[ANA-28](docs/decisions/ana/ana-28.md)** - `heavy_build`: queue switch vs required box capability (concluded, 2026-10-15)

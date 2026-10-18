@@ -24,7 +24,8 @@
 > waiting-on-you), `R-MCP-1`/`R-MCP-2` (agent-visible enums, link addressing), `R-LATER-3` (the
 > importer), `R-LATER-10` (object store).
 >
-> **Status (2026-10-18): drafted, awaiting maintainer acceptance of §8.** No implementation code is
+> **Status (2026-10-18): concluded; the maintainer accepted all twenty §8 answers as recommended, and
+> the §10 requirement edits are applied.** No implementation code is
 > written here. Verdict (§7): the item keeps **three stored statuses** (`open`, `blocked`, `closed`);
 > everything a person sees as progress (`queued`, `running`, `needs you`, `failed`, `done`) is **derived
 > from the item's latest graph run**, and "one live run per item" moves from an item-status lock to a
@@ -45,8 +46,9 @@
 > version, live in a separate `bytea` table, 10 MiB by default and 64 MiB at most; text is scrubbed, a
 > binary is accepted only from a person. `parent` is single-valued and acyclic; closing as `duplicate`
 > or `superseded` records its link; links to documents and attachments live in their own table and pin a
-> document version. Proposed spawns: **P1** to **P7**; the workspace scope (P4) waits only on the
-> small project-type table (P3), not on folders or seeds.
+> document version. Filed: **MOD-144** (P1), **MOD-145** (P2), **MOD-146** (P3), **MOD-147** (P4),
+> **MOD-148** (P5), **MOD-149** (P6), **MOD-150** (P7); the workspace scope (MOD-147) waits only on the
+> small project-type table (MOD-146), not on folders or seeds.
 
 ---
 
@@ -1312,7 +1314,8 @@ them.
 
 ## 9. Proposed spawns
 
-Proposed, not minted; ordering is by dependency.
+Filed 2026-10-18 as P1 → MOD-144, P2 → MOD-145, P3 → MOD-146, P4 → MOD-147, P5 → MOD-148,
+P6 → MOD-149, P7 → MOD-150; ordering is by dependency.
 
 | P | Subject | Scope | Blocked on | Requirements |
 |---|---|---|---|---|
@@ -1356,7 +1359,8 @@ landed check at every site (Pg, MemStore, and the cache, which mirrors the integ
 
 ## 10. Requirement edits owed
 
-All maintainer-gated; `docs/REQUIREMENTS.md` is not edited by this item.
+Accepted by the maintainer on 2026-10-18 (§8 question 20) and, by that decision, applied as written to
+`docs/REQUIREMENTS.md` and `CONCEPTS.md` in the conclusion commit (`docs/decisions/ana/ana-35.md`).
 
 **10.1 `R-ENT-2`**, replace the clause "and every workspace-scoped feature falls back to … the current
 project" (`docs/REQUIREMENTS.md:162-163`) with "and the workspace-scoped views and searches cover just

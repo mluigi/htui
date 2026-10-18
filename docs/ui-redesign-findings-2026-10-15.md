@@ -262,7 +262,9 @@ Requirements tab is gone (absorbed by Workspaces); Logs is new; Skills became To
   refining `W-3`); `↑↓ Space` keeps or drops each before `Enter` creates them all. In the list a
   workspace requirement shows **"split into ⇢ R-42 htui …" rows** and is "covered" through them; each
   project requirement shows **"↑ from W-3"**. Both are selectable; `Enter` jumps (with history). Ids:
-  workspace ones `W-n`, project ones the workspace's shared `R-n` (§8 Q8 still open).
+  workspace ones `W-n`, project ones the workspace's shared `R-n` (§8 Q8 still open). *Settled by ANA-35
+  (`docs/ANA-35.md` §7.7, 2026-10-18): workspace requirements are `W-<AREA>-<N>`, project ones keep
+  their own `R-<AREA>-<N>`; there is no shared `R-n`.*
 - **Each covering item is its own selectable row** (`↳ ● MOD-80 Theme roles…`); `↑↓` select,
   `Enter` jumps to the item (with back). Arriving from a graph puts the cursor on that requirement.
 - **`v` toggles a graph view**: parent → child (`refines`) and requirement → covering items
@@ -656,6 +658,7 @@ Answered in round 12 (the maintainer took every suggestion):
    component can be saved as a new kind).
 3. **Requirement ids and editing:** nested ids stay (`R-2.1` shows its parent; workspace ones are
    `W-n`). Only the user edits requirements; coordinators propose changes as drafts the user accepts.
+   *Key form settled by ANA-35 (`docs/ANA-35.md` §7.7): `W-<AREA>-<N>`, `.n` nesting within one owner.*
 4. **Archived transcripts** follow `retention_days` and the same sweeper as run transcripts
    (MOD-100); a transcript the user pins is kept.
 5. **New-item flow:** the rewrite uses the same light model as the fast workflow pick; Settings →
