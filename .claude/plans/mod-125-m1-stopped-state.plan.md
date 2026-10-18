@@ -299,3 +299,7 @@ Two fact-check agents read the tree at `41bf5c90`, plus a scratch DB and a compi
 | ANA-2 tables at `:600-654` | FALSE | `:653-671` (run), `:683-710` (step); `run.rs:57,99` cite the stale lines, fixed in D8 |
 | Chat runs use a separate verb | TRUE | `start_chat_run` (`traits.rs:631`); `ChatRunSpec` at `run.rs:312` |
 | T4 ∥ T5 (old numbering: Pg vs engine) independent | FALSE | Compile coupling through new trait verbs and `Backend::queue_item`; tasks regrouped so T3 ∥ T4 are disjoint and each compiles on T2 |
+
+## Maintainer calls on the blueprint deviations
+
+DV-1..DV-6 (blueprint) accepted as recommended, 2026-10-18: DV-1 the top-bar count lists stay three statuses; DV-2 `pg/relay.rs:544` and its MemStore twin unchanged in M1; DV-3 the `queue_item` signature change moves into T2; DV-4 `stop_run` takes no `at`; DV-5 the queue runner may still create queued runs in a stopped workspace (claim refuses them), gated in M2; DV-6 `queue_entry.workspace_id` is backfilled by the one-workspace rule. The blueprint is the implementation authority where it and this plan differ.
