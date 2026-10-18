@@ -706,6 +706,45 @@ async fn a_resumed_box_admits_in_queue_order_up_to_the_cap() {
     );
 }
 
+/// MOD-125 D3: the queue runner copies the entry's workspace onto the run it admits, so a
+/// workspace stop gates an auto run's claim as it gates a manual one; an unscoped entry's run
+/// carries none.
+#[tokio::test]
+async fn admit_records_the_entrys_workspace_on_the_run() {
+    let h = Harness::open().await;
+    let scoped = mint_ana(&h.store, "scoped", 1).await;
+    let unscoped = mint_ana(&h.store, "unscoped", 0).await;
+    h.store
+        .queue_item(
+            scoped,
+            ids::BOX,
+            Some(ids::WORKSPACE_PLATFORM),
+            ids::USER,
+            Utc::now(),
+        )
+        .await
+        .expect("the item queues");
+    h.queue(unscoped).await;
+    h.resume().await;
+    let mut runtime = h.runtime();
+    h.sweep(&mut runtime).await;
+
+    for (item, workspace) in [(scoped, Some(ids::WORKSPACE_PLATFORM)), (unscoped, None)] {
+        let admitted = h.only_run(item).await;
+        assert_eq!(admitted.mode, RunMode::Auto, "the queue runner admitted it");
+        let run = h
+            .store
+            .run(admitted.id)
+            .await
+            .expect("the read answers")
+            .expect("the run exists");
+        assert_eq!(
+            run.workspace_id, workspace,
+            "the run carries its queue entry's workspace"
+        );
+    }
+}
+
 /// (c) D5: an entry `ready_items` does not hold waits, and is admitted once it is ready. M3 D4
 /// (L4): the wait stalls the batch, which closes, so the unblocked entry runs after a resume.
 #[tokio::test]

@@ -2281,6 +2281,11 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
         .iter()
         .map(|entry| (entry.item_id, entry.project_id))
         .collect();
+    // MOD-125 D3: the entry's workspace becomes the run's, so a workspace stop gates the claim.
+    let workspace_of: HashMap<ItemId, Option<WorkspaceId>> = entries
+        .iter()
+        .map(|entry| (entry.item_id, entry.workspace_id))
+        .collect();
     // `None`: the project read as absent.
     let mut caps: HashMap<ProjectId, Option<Result<ProjectCaps, CapError>>> = HashMap::new();
     let mut admissible = Vec::with_capacity(order.len());
@@ -2334,7 +2339,10 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
         if admitted >= free || ctx.shared.walks.closed() {
             break;
         }
-        match engine.enqueue_in_batch(item, batch.id, None).await {
+        match engine
+            .enqueue_in_batch(item, batch.id, workspace_of.get(&item).copied().flatten())
+            .await
+        {
             Ok(run) => {
                 admitted += 1;
                 ctx.shared.publisher.publish(&RunFrame {
