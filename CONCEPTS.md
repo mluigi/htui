@@ -40,8 +40,8 @@ talking only to your Postgres, is part of `htui` [R-ID-2].
 ## Hierarchy
 
 `workspace` groups related projects and owns cross-project items [R-ENT-16]; `project` owns item
-keys, kinds and secrets; a step graph is owned by a project, a workspace or the global workflow library
-[R-ORCH-1]; skills attach from global down to phase, most specific wins
+keys, kinds and secrets, and so does a workspace, for its own work [R-ENT-3]; a step graph is owned by a project,
+a workspace or the global workflow library [R-ORCH-1]; skills attach from global down to phase, most specific wins
 [R-SKL-2]; a `repo` is a git checkout or plain folder in one project, zero or more per project
 [R-ENT-1..4]. Workspaces are explicit and not a directory their projects must live under; each has a
 folder for what `htui` generates there (compose file, environment file); a single project runs with
@@ -49,7 +49,7 @@ none [R-ENT-2, R-ENT-17, R-SEC-5].
 Logical identity never depends on a filesystem path: every box maps repos to its own paths [R-BOX-4].
 
 Item kinds are configurable per project, seeded by its type [R-ENT-6]. Item status is open, blocked
-or closed; progress lives on runs [R-ENT-8]. Links are UUID edges, so cross-project dependencies need
+or closed; progress lives on runs, and what a person sees is derived from the latest run [R-ENT-8]. Links are UUID edges, so cross-project dependencies need
 nothing extra [R-ENT-9].
 
 ## Agents and orchestration

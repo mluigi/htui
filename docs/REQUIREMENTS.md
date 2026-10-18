@@ -67,6 +67,11 @@ targets).
 amended 2026-10-18 by maintainer decision on ANA-33 (`docs/ANA-33.md` §8, §10,
 `docs/decisions/ana/ana-33.md`) — R-ORCH-1, R-MCP-3 and R-TUI-8 amended in place (`retries` is a loop
 on the same step; the meaning of `fan_out_only`; the shared graph editor).
+amended 2026-10-18 by maintainer decision on ANA-35 (`docs/ANA-35.md` §10,
+`docs/decisions/ana/ana-35.md`) — amended in place: R-ID-7, R-ENT-2, R-ENT-3, R-ENT-4, R-ENT-5,
+R-ENT-6, R-ENT-7, R-ENT-8 (with ANA-34's transition sentence, `docs/ANA-34.md` §10.4), R-ENT-9,
+R-ENT-12, R-ENT-14, R-ENT-16, R-STO-3, R-ORCH-8, R-TUI-2 and R-TUI-11 (project types, folders,
+workspace ownership and keys, the three item statuses and their derived states, links, attachments).
 **Governed by:** `.claude/rules/workflow-docs.md`
 
 This file is the product requirements for `htui`. It sits above every `ANA-N` analysis and every
@@ -126,7 +131,9 @@ conflict. Their verdicts survive only where restated here.
   reverses ANA-30's rejection of a single `utility_model` setting. Amended 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`).
 - **R-ID-7 (must).** Anything persisted or sent off the box — transcripts, tool output, logs,
   telemetry, error reports, the cache — is scrubbed of secrets on the host box first. Scrubbing fails
-  closed. Amended 2026-10-15 (was: transcripts and tool output).
+  closed. A binary attachment a person adds is the one exception: it is stored as given, marked
+  unscrubbed, and never accepted from an agent (R-ENT-12). Amended 2026-10-15 (was: transcripts and
+  tool output) and 2026-10-18 (ANA-35, the binary attachment exception).
 
 ## 2. Users and boxes (R-USR, R-BOX)
 
@@ -163,30 +170,39 @@ conflict. Their verdicts survive only where restated here.
 - **R-ENT-2 (must).** `workspace`: named, explicit group of one or more related projects, which may
   live anywhere on a box; a workspace is not a directory its projects must live under. It owns its
   own items, documents and requirements (R-ENT-16). There are no implicit workspace rows: opening a
-  single project runs with no workspace, and every workspace-scoped feature falls back to "the
-  current project". A workspace has a folder (by default `~/workspaces/<name>`) where `htui` keeps
-  its description, goals, generated compose file (R-ENT-17) and, without Infisical, its environment
-  file (R-SEC-5); projects cloned from a URL go under it, existing repos stay where they are.
-  Amended 2026-10-15 (the per-box root path is dropped) and 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`) (a folder for
-  what `htui` generates).
+  single project runs with no workspace, and the workspace-scoped views and searches cover just that
+  project. A workspace has a folder on each box (by default `~/workspaces/<name>`) where `htui` writes
+  what it generates — the compose file (R-ENT-17) and, without Infisical, the environment file
+  (R-SEC-5) — and where projects cloned from a URL go; existing repos stay where they are. Its
+  description and goals live in Postgres, the goals as a workspace document (R-ENT-12). A single
+  project with no workspace has no folder, no components and no workspace-owned items.
+  Amended 2026-10-15 (the per-box root path is dropped), 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`) (a folder for
+  what `htui` generates) and 2026-10-18 (ANA-35, what the folder holds; no folder for a lone project).
 - **R-ENT-3 (must).** `project`: owns the item key space, the item kinds, step graphs, skill
-  bindings, secret provider binding and phase defaults. It has a type (software, research, docs, ops,
-  and more) that seeds its kinds and graphs (R-ENT-6). It has zero or more repos; when it has any,
-  exactly one is primary. A phase that needs a repo refuses to run in a project without one. Amended
-  2026-10-15 (repos optional, project type; design in ANA-35).
+  bindings, secret provider binding and phase defaults. It has a type, chosen from the project types
+  (software, research, docs, ops, general, and the user's own, R-TUI-8), whose kinds, graphs and
+  templates are copied into it once when it is created; changing a type never re-seeds an existing
+  project. It has zero or more repos; when it has any, exactly one is primary, which may be a folder;
+  removing a repo archives it, and the primary passes to another. A phase marked as needing a repo
+  refuses to start in a project without one. A workspace owns its own key space, kinds, graphs,
+  documents and requirements in the same way (R-ENT-16). Amended 2026-10-15 (repos optional, project
+  type) and 2026-10-18 (ANA-35, project types and the primary repo).
 - **R-ENT-4 (must).** `repo`: a git repository or a plain folder belonging to exactly one project,
   with per-box local path and, for a git repository, remote URL and default branch. What needs git —
   `worktree` isolation, commit hashes, merging — needs a git repository; `copy` and `local` isolation
-  work on a folder. Amended 2026-10-15.
-- **R-ENT-5 (must).** `item`: key (`<PREFIX>-<N>`, unique per project), kind, title, body, status,
-  priority, labels, required capability tags, `created_by`, `version` for optimistic locking,
-  timestamps. Body is markdown edited in the TUI or an external editor. Labels are free and route
-  nothing; required capability tags route (R-ORCH-10). Assignee and due date come with team use
-  (R-LATER-11). Amended 2026-10-15.
+  work on a folder. A plain folder cannot be cloned onto another box, pushed or run on a target other
+  than the box that holds it. `copy` on a folder brings back only files the folder has not changed
+  since the copy and parks on the rest; a `worktree` step copies a folder instead, and
+  `shared_serialized` refuses one (R-ORCH-8). Amended 2026-10-15 and 2026-10-18 (ANA-35, folders).
+- **R-ENT-5 (must).** `item`: key (`<PREFIX>-<N>`, unique per owner — a project, or a workspace
+  (R-ENT-16)), kind, title, body, status, priority, labels, required capability tags, `created_by`,
+  `version` for optimistic locking, timestamps. Body is markdown edited in the TUI or an external
+  editor. Labels are free and route nothing; required capability tags route (R-ORCH-10). Assignee and
+  due date come with team use (R-LATER-11). Amended 2026-10-15 and 2026-10-18 (ANA-35, unique per
+  owner).
 - **R-ENT-6 (must).** Item kinds are configurable per project. Each kind has a key prefix, a
-  description and a default step graph. The seeded set depends on the project type (R-ENT-3); a
-  research, docs or ops project gets its own kinds (for example research → verdict, outline → draft →
-  review, plan → execute → verify), settled by ANA-35. Seeded set for a software project:
+  description and a default step graph. The seeded set depends on the project type (R-ENT-3), the
+  prefixes editable per project like any kind. Seeded set for a software project:
 
   | Prefix  | Kind      | Default graph                        |
   |---------|-----------|--------------------------------------|
@@ -196,21 +212,49 @@ conflict. Their verdicts survive only where restated here.
   | `CLEAN` | refactor  | plan, implement, review              |
   | `TOOL`  | tooling   | plan, implement, review              |
 
-- **R-ENT-7 (must).** Item keys are minted from a per-project, per-prefix sequence held by Postgres.
-  Never reused: a project has exactly one counter and exactly one writer of it. Creating an item
-  in a project mirrored from a server, while that server is unreachable, is not supported (see R-STO-4).
+  Seeded sets for the other types (ANA-35 §7.4):
+
+  | Type      | Prefix | Kind               | Default graph                      |
+  |-----------|--------|--------------------|------------------------------------|
+  | research  | `RES`  | research           | research, verdict                  |
+  | research  | `Q`    | question           | question, answer                   |
+  | docs      | `DOC`  | document           | outline, draft, review             |
+  | ops       | `OPS`  | operation          | plan, execute, verify              |
+  | ops       | `INC`  | incident           | investigate, fix, postmortem       |
+  | general   | `TASK` | task               | execute, review                    |
+  | workspace | `WS`   | workspace item     | plan, review                       |
+
+  Amended 2026-10-18 (ANA-35, the seed table for every type).
+
+- **R-ENT-7 (must).** Item keys are minted from a per-owner, per-prefix sequence held by Postgres;
+  the owner is a project or a workspace. Never reused: each owner has exactly one counter per prefix,
+  and Postgres is its only writer. Keys of different owners may coincide and are qualified by the
+  owner's slug where ambiguous. Creating an item in a project mirrored from a server, while that
+  server is unreachable, is not supported (see R-STO-4). Amended 2026-10-18 (ANA-35, per-owner
+  counters).
 - **R-ENT-8 (must).** Item status is one of `open`, `blocked` or `closed`. The progress of work —
   `queued`, `in_progress`, `awaiting_approval`, `failed` — belongs to the item's runs, not to the
-  item. Transitions are driven by the orchestrator, the coordinator (R-ORCH-14) and close-out, not
+  item. Transitions are driven by deterministic code, the orchestrator, the coordinator's
+  integration (R-ORCH-14) and a person's close-out (R-TUI-9), never by unaccepted model text, not
   edited by hand. A closed item carries a resolution: `done`, `concluded`, `rejected`, `withdrawn`,
-  `superseded` or `duplicate`. Resolution is not a status. Amended 2026-10-15 (was eight statuses;
-  migration designed in ANA-35).
+  `superseded` or `duplicate`. Resolution is not a status. `blocked` means a person must clear
+  something and always carries a note; a dependency only makes an item not ready. What a person sees
+  — queued, running, needs you, failed, done (finished, close-out waiting), open, blocked, closed — is
+  derived from the status and the item's latest run, a cancelled run changing nothing. A `blocked_by`
+  link stops blocking when its target is closed or its latest run finished and its work landed.
+  Resolutions `done` and `concluded` require a finished run; the importer (R-LATER-3) records closed
+  items as it finds them. Reworking a finished item means starting a new run on it. Amended
+  2026-10-15 (was eight statuses; migration designed in ANA-35) and 2026-10-18 (ANA-34's transition
+  sentence; ANA-35's derived state, release rule and close-out law).
 - **R-ENT-9 (must).** Item links are directed edges by UUID with kind `blocked_by`, `origin`,
   `relates`, `supersedes`, `parent` (decomposition: a parent and its children, unlike `origin`, which
   is provenance), `duplicates` and `implements`; a link may also target a document or an attachment.
   Because edges use UUIDs, cross-project links need nothing extra. Links are proposed by agents
-  through the `htui` MCP server (R-MCP-2) and by the importer (R-LATER-3); there is no manual link
-  action. Requirements are linked by citation (R-ENT-15). Amended 2026-10-15.
+  through the `htui` MCP server (R-MCP-2) and by the importer (R-LATER-3). Requirements are linked by
+  citation (R-ENT-15). An item has at most one `parent` and parents
+  never form a cycle. A link to a document names the version it was made against. There is no manual
+  link action, except that a person's close-out as `duplicate` or `superseded` records the link to the
+  item they name. Amended 2026-10-15 and 2026-10-18 (ANA-35, parent and document-link rules).
 - **R-ENT-10 (must).** Item body and title changes are recorded as revisions with author, box and
   reason. Concurrent edits on the same `version` are rejected and shown as a divergence with the
   common ancestor; no timestamp-based last-writer-wins anywhere.
@@ -218,9 +262,11 @@ conflict. Their verdicts survive only where restated here.
   (`note_add`, R-MCP-2), plain markdown, no editing history needed. Amended 2026-10-15.
 - **R-ENT-12 (must).** `document`: versioned per owner and kind; the owner is an item, a project or
   a workspace. Item kinds follow the phases of the graph (`prd`, `plan`, `review`, `summary`,
-  `verdict`, and any phase-defined kind). Produced by steps or written by hand. Items and documents
-  may carry attachments (images, logs, other files), held in Postgres under a size cap in version one
-  (an object store is R-LATER-10). Amended 2026-10-15.
+  `verdict`, and any phase-defined kind). Produced by steps or written by hand. Items and document
+  versions may carry attachments (images, logs, other files), held in Postgres in version one under a
+  size cap, 10 MiB by default and never above 64 MiB (an object store is R-LATER-10). Text attachments
+  are scrubbed (R-ID-7); a binary attachment is accepted only from a person, who is told it is stored
+  as given. Amended 2026-10-15 and 2026-10-18 (ANA-35, attachment owners, cap and scrubbing).
 - **R-ENT-13 (reopened, pending ANA-38).** Project and workspace memory: facts, decisions and
   gotchas that outlive one item, for the coordinator (R-ORCH-14) and for agents. ANA-1's atomic facts
   table with importance scores (`artifact`, `artifact_link`) was withdrawn as over-engineered on
@@ -231,8 +277,10 @@ conflict. Their verdicts survive only where restated here.
   `active`/`withdrawn`, and a `version` with revisions naming the deciding item. Text changes only by
   human action: coordinators and agents propose changes as drafts a person accepts (R-ID-6). A
   requirement may refine another; the child's key is its parent's plus `.n` (`R-TUI-2.1`).
-  Workspace requirements are keyed `W-…` (ANA-35 settles the exact form). Amended 2026-10-15
-  (workspace requirements) and 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`) (nesting, drafts).
+  Workspace requirements are keyed `W-<AREA>-<N>`. Nesting with `.n` stays within one owner; a
+  project requirement that refines a workspace one keeps its own key. Amended 2026-10-15
+  (workspace requirements), 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`) (nesting, drafts) and
+  2026-10-18 (ANA-35, workspace keys).
 - **R-ENT-15 (must).** Items cite requirements with kind `addresses`, `amends`, `withdraws`,
   `reserves` or `verifies` (a test or review item that verifies the requirement). Each citation
   records the requirement version it was made against, and a newer version marks it suspect until
@@ -242,7 +290,9 @@ conflict. Their verdicts survive only where restated here.
   (`verifies`) and 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`) (splits).
 - **R-ENT-16 (must).** Workspace-owned items: a workspace has its own key space and kinds, and owns
   items, documents and requirements that span its member projects, linked to their items by UUID.
-  Added by maintainer decision, 2026-10-15; design in ANA-35.
+  A workspace item has no repos: it plans, decides and splits, and code work goes to child items in
+  member projects, linked by `parent` (R-ENT-9). Added by maintainer decision, 2026-10-15; amended by
+  ANA-35 (repo-less workspace items).
 - **R-ENT-17 (must).** Workspace components: a workspace declares the services its projects need —
   databases, caches, queues, cloud emulators, object storage, search engines, any image — picked from
   a catalogue held in Postgres, with a version and, for an emulator, the services or clouds it
@@ -271,10 +321,11 @@ conflict. Their verdicts survive only where restated here.
   maintainer decision on MOD-41, 2026-09-29, on MOD-45, 2026-10-01 (a TUI session's stdin), and on
   the requirements review, 2026-10-15 (environment variable; key bindings moved to Postgres).
 - **R-STO-2 (must).** TLS to Postgres is supported and optional.
-- **R-STO-3 (must).** Each box keeps a read-only cache of the projects it has opened under the
-  user's config directory, refreshed on every successful connection. Contents: items, links,
-  documents, notes, requirements and citations, run and step summaries, and transcripts of the
-  last N steps (N configurable).
+- **R-STO-3 (must).** Each box keeps a read-only cache of the projects and workspaces it has opened,
+  workspace-owned rows included (R-ENT-16), under the user's config directory, refreshed on every
+  successful connection. Contents: items, links, documents, attachment metadata (not their
+  contents), notes, requirements and citations, run and step summaries, and transcripts of the last
+  N steps (N configurable). Amended 2026-10-18 (ANA-35, workspaces and attachment metadata).
 - **R-STO-4 (must).** When Postgres is unreachable, the TUI opens in offline
   read-only mode from the cache: browse items, graph, documents and cached transcripts. No item
   creation, no runs.
@@ -410,10 +461,13 @@ conflict. Their verdicts survive only where restated here.
   artifacts, resolving conflicts, before review. Running N candidates on the same prompt and keeping
   one (best-of-N) is R-LATER-13. Amended by maintainer decision, 2026-10-15 (was: best-of-N); design
   in ANA-33.
-- **R-ORCH-8 (must).** Fan-out isolation mode per project or phase: `worktree` (default, one git
-  worktree per session), `copy` (directory copy for trees where worktrees break build caches),
+- **R-ORCH-8 (must).** Fan-out isolation mode per project or phase: `worktree` (one git worktree
+  per session), `copy` (directory copy for trees where worktrees break build caches),
   `shared_serialized` (one tree, sessions run one after another), `local` (run directly in the
-  working tree with no isolation and no serialization).
+  working tree with no isolation and no serialization). The default mode is set by the project type:
+  `worktree` for software projects, `local` for the others (R-ENT-3). On a plain folder a `worktree`
+  step copies the folder instead, and `shared_serialized` refuses it (R-ENT-4). Amended 2026-10-18
+  (ANA-35, default per type and folders).
 - **R-ORCH-9 (must).** Concurrent items: both modes may run several items at once when they do not
   overlap. Overlap: same repo unless both use isolated trees, or declared touched-path sets
   intersect. Overlapping items are serialized; others run in parallel up to a per-box limit.
@@ -544,12 +598,13 @@ conflict. Their verdicts survive only where restated here.
   Requirements tabs and the workspace switcher overlay give way to Toolbox (R-TUI-7) and Workspaces
   (R-TUI-14); Chat lists every session (R-TUI-6); Logs is new (R-TUI-15).
 - **R-TUI-2 (must).** Backlog left pane: items grouped by project, with workspace-owned items
-  (R-ENT-16) as their own group; filters by status, project, capability, readiness, labels and
-  priority, and sorting by priority. Actions: new, edit, run, queue, close, open graph. The grouping
-  cycles project, kind and status (attention order), done and closed items stay hidden until shown,
-  and both persist. A new item opens the modal of R-TUI-17. The detail says where the item runs and
-  with which workflow, both changeable from the Backlog (R-ORCH-15, R-ORCH-1). Amended 2026-10-15 and
-  2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`).
+  (R-ENT-16) as their own group; filters by state (R-ENT-8), project, capability, readiness, labels
+  and priority, and sorting by priority. Actions: new, edit, run, queue, close, open graph. The
+  grouping cycles project, kind and status (attention order), items done (finished, close-out
+  waiting) and closed stay hidden until shown, and both persist. A new item opens the modal of
+  R-TUI-17. The detail says where the item runs and with which workflow, both changeable from the
+  Backlog (R-ORCH-15, R-ORCH-1). Amended 2026-10-15, 2026-10-17 (UI review,
+  `docs/ui-redesign-findings-2026-10-15.md`) and 2026-10-18 (ANA-35, derived states).
 - **R-TUI-3 (must).** Backlog right pane is tabbed per selected item: **Body**, **Runs**, **Graph**,
   **Documents**, **Notes**, **Requirements** (the item's citations, suspect ones flagged) and
   **Attachments**, as chips in the pane's top border. Amended 2026-10-15 and 2026-10-17 (chips).
@@ -624,12 +679,13 @@ conflict. Their verdicts survive only where restated here.
   between panes, `Shift ←→` changes sub-tab, and digits switch tabs. Amended by maintainer decision,
   2026-10-15, reversing ANA-26's local `keys.toml` (MOD-67), and 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`) (navigation
   defaults).
-- **R-TUI-11 (must).** One overlay, opened from every screen, lists every run in the active
-  workspace that waits on a person — a gate, a fan-out selection, a judge failure, a blocked run,
-  an open permission request, and an agent's open question — with the reason and the step, and
+- **R-TUI-11 (must).** One overlay, opened from every screen, lists every run, or item, in the
+  active workspace that waits on a person — a gate, a fan-out selection, a judge failure, a blocked
+  item, an open permission request, and an agent's open question — with the reason and the step, and
   opens the item's Runs tab on that step. The top bar shows the count. The list is computed from
   the store at read time. When something starts waiting, `htui` rings the terminal bell and raises
-  an OS notification; notifications to a remote endpoint are R-LATER-12. Amended 2026-10-15.
+  an OS notification; notifications to a remote endpoint are R-LATER-12. Amended 2026-10-15 and
+  2026-10-18 (ANA-35, blocked items).
 - **R-TUI-12 (must).** Shell: panes have rounded borders with the title and sub-tabs in the top
   border and the focused pane's key hints in its bottom border; long rows end in `…`, long content
   scrolls with a scrollbar and stops at its end. A toggleable panel under the header says what the
