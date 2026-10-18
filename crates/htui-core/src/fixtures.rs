@@ -1436,6 +1436,7 @@ fn demo_graph_snapshot() -> Value {
 fn runs() -> Vec<Run> {
     vec![
         Run {
+            workspace_id: Some(ids::WORKSPACE_PLATFORM),
             id: ids::RUN_1,
             project_id: ids::PROJECT_HTUI,
             item_id: Some(ids::HTUI_FEAT_1),
@@ -1456,6 +1457,7 @@ fn runs() -> Vec<Run> {
             updated_at: demo_at(1, 12),
         },
         Run {
+            workspace_id: Some(ids::WORKSPACE_PLATFORM),
             id: ids::RUN_2,
             project_id: ids::PROJECT_HTUI,
             item_id: Some(ids::HTUI_FEAT_3),
@@ -1476,6 +1478,7 @@ fn runs() -> Vec<Run> {
             updated_at: demo_at(2, 8),
         },
         Run {
+            workspace_id: Some(ids::WORKSPACE_PLATFORM),
             id: ids::RUN_3,
             project_id: ids::PROJECT_HTUI,
             item_id: Some(ids::HTUI_ANA_1),

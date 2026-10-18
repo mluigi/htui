@@ -743,6 +743,7 @@ where
         self.parts
             .store
             .create_run(NewRun {
+                workspace_id: None,
                 id,
                 project_id: item.project_id,
                 item_id: item.id,
@@ -9666,6 +9667,7 @@ mod tests {
             .orch
             .store
             .create_run(htui_core::model::NewRun {
+                workspace_id: None,
                 id: run,
                 project_id: ids::PROJECT_HTUI,
                 item_id: ids::HTUI_ANA_2,
@@ -12939,6 +12941,7 @@ mod tests {
             .orch
             .store
             .create_run(htui_core::model::NewRun {
+                workspace_id: None,
                 id: run,
                 project_id: item.project_id,
                 item_id: item.id,
@@ -13044,6 +13047,7 @@ mod tests {
             .orch
             .store
             .create_run(htui_core::model::NewRun {
+                workspace_id: None,
                 id: run,
                 project_id: item.project_id,
                 item_id: item.id,

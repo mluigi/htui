@@ -97,6 +97,7 @@ pub const CASES: &[&str] = &[
     "settings_phase_rung_writes_token_budget_only",
     "project_create_seeds_the_catalogue",
     "run_create_moves_the_item",
+    "create_run_records_its_workspace",
     "claim_run_admits_one_and_refuses_the_second",
     "lease_refresh_is_a_cas_on_owner",
     "step_create_and_transition_law",
@@ -292,6 +293,7 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         }
         "project_create_seeds_the_catalogue" => project_create_seeds_the_catalogue(store).await,
         "run_create_moves_the_item" => run_create_moves_the_item(store).await,
+        "create_run_records_its_workspace" => create_run_records_its_workspace(store).await,
         "claim_run_admits_one_and_refuses_the_second" => {
             claim_run_admits_one_and_refuses_the_second(store).await;
         }
@@ -4879,6 +4881,7 @@ fn new_run(project: ProjectId, item: ItemId, scope: Vec<RepoId>) -> NewRun {
         repo_scope: scope,
         queued_at: seam_clock(),
         batch_id: None,
+        workspace_id: None,
     }
 }
 
@@ -4991,6 +4994,58 @@ async fn item_row<S: ReadStore>(case: &str, store: &S, item: ItemId) -> Item {
         .await
         .expect(case)
         .unwrap_or_else(|| panic!("{case}: item {item} exists"))
+}
+
+/// MOD-125 D3 (blueprint F14): `create_run` records `run.workspace_id`, the workspace a graph run
+/// was started from; `None` stays `None`; an unknown workspace is a foreign-key refusal that writes
+/// no row and leaves the item where it was.
+async fn create_run_records_its_workspace<S: WriteStore>(store: &S) {
+    const CASE: &str = "create_run_records_its_workspace";
+    assert_eq!(
+        item_row(CASE, store, ids::HTUI_ANA_2).await.status,
+        Status::Open,
+        "{CASE}: fixture precondition"
+    );
+
+    let mut unknown = new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new());
+    unknown.workspace_id = Some(WorkspaceId::new());
+    let refused = store.create_run(unknown.clone()).await;
+    assert!(
+        matches!(refused, Err(StoreError::Constraint(_))),
+        "{CASE}: an unknown workspace is a foreign-key refusal, got {refused:?}"
+    );
+    assert!(
+        store.run(unknown.id).await.expect(CASE).is_none(),
+        "{CASE}: the refusal wrote no run row"
+    );
+    assert_eq!(
+        item_row(CASE, store, ids::HTUI_ANA_2).await.status,
+        Status::Open,
+        "{CASE}: the refusal left the item open"
+    );
+
+    let mut scoped = new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new());
+    scoped.workspace_id = Some(ids::WORKSPACE_PLATFORM);
+    let created = store.create_run(scoped.clone()).await.expect(CASE);
+    assert_eq!(
+        created.workspace_id,
+        Some(ids::WORKSPACE_PLATFORM),
+        "{CASE}: the returned row carries the workspace"
+    );
+    assert_eq!(
+        run_row(CASE, store, scoped.id).await.workspace_id,
+        Some(ids::WORKSPACE_PLATFORM),
+        "{CASE}: `run` reads the workspace back"
+    );
+
+    let unscoped = new_run(ids::PROJECT_HTUI, ids::HTUI_CLEAN_1, Vec::new());
+    let created = store.create_run(unscoped.clone()).await.expect(CASE);
+    assert_eq!(created.workspace_id, None, "{CASE}: `None` stays `None`");
+    assert_eq!(
+        run_row(CASE, store, unscoped.id).await.workspace_id,
+        None,
+        "{CASE}: `run` reads `None` back"
+    );
 }
 
 /// Plan D6: the `run` row and the item's move to `queued` land together or not at all (ANA-2 §4.3,

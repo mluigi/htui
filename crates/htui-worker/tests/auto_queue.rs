@@ -547,7 +547,7 @@ impl Harness {
 
     async fn queue(&self, item: ItemId) {
         self.store
-            .queue_item(item, ids::BOX, ids::USER, Utc::now())
+            .queue_item(item, ids::BOX, None, ids::USER, Utc::now())
             .await
             .expect("the item queues");
     }
@@ -1900,7 +1900,7 @@ async fn two_runtimes_on_one_database_admit_each_item_once_pg() {
     );
     for item in [x, y] {
         db.store
-            .queue_item(item, ids::BOX, ids::USER, Utc::now())
+            .queue_item(item, ids::BOX, None, ids::USER, Utc::now())
             .await
             .expect("the item queues");
     }
@@ -1937,7 +1937,7 @@ async fn a_drained_batch_closes_drained_pg() {
     parts.open();
     let item = mint_ana(&db.store, "drains", 0).await;
     db.store
-        .queue_item(item, ids::BOX, ids::USER, Utc::now())
+        .queue_item(item, ids::BOX, None, ids::USER, Utc::now())
         .await
         .expect("the item queues");
     let batch = db
@@ -2020,7 +2020,7 @@ async fn manual_and_auto_overlap_serialise_on_postgres() {
 
     let auto = mint_ana(&db.store, "auto", 0).await;
     db.store
-        .queue_item(auto, ids::BOX, ids::USER, Utc::now())
+        .queue_item(auto, ids::BOX, None, ids::USER, Utc::now())
         .await
         .expect("the item queues");
     db.store
@@ -2123,7 +2123,7 @@ async fn a_batch_overshoots_its_cap_by_at_most_one_attempt_pg() {
     parts.open();
     let a1 = mint_ana(&db.store, "a1", 0).await;
     db.store
-        .queue_item(a1, ids::BOX, ids::USER, Utc::now())
+        .queue_item(a1, ids::BOX, None, ids::USER, Utc::now())
         .await
         .expect("the item queues");
     let batch = db
@@ -2225,7 +2225,7 @@ async fn a_batch_overshoots_its_cap_by_at_most_one_attempt_pg() {
 
     let a2 = mint_ana(&db.store, "a2", 1).await;
     db.store
-        .queue_item(a2, ids::BOX, ids::USER, Utc::now())
+        .queue_item(a2, ids::BOX, None, ids::USER, Utc::now())
         .await
         .expect("the item queues");
     runtime.sweep_with(&db.store, &TestSink::default());

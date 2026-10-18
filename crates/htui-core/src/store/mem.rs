@@ -943,15 +943,18 @@ impl MemStore {
     // dispatched by `Backend`; `PgStore` carries the same nine.
 
     /// MOD-12 D1: queue `item` on `box_id`. Idempotent: an item already queued (on any box)
-    /// answers its stored entry unchanged. `at` is microsecond-truncated.
+    /// answers its stored entry unchanged. `at` is microsecond-truncated. `workspace` (MOD-125 D3)
+    /// is recorded on a new entry. An entry already stored comes back unchanged, its workspace
+    /// included.
     ///
     /// # Errors
     /// [`StoreError::NotFound`] `{ entity: "item" }` for an unknown item;
-    /// [`StoreError::Constraint`] for an unknown box or user.
+    /// [`StoreError::Constraint`] for an unknown box, workspace or user.
     pub async fn queue_item(
         &self,
         item: ItemId,
         box_id: BoxId,
+        workspace: Option<WorkspaceId>,
         by: UserId,
         at: DateTime<Utc>,
     ) -> Result<QueueEntry> {
@@ -967,11 +970,21 @@ impl MemStore {
                     "box",
                 )));
             }
+            if let Some(workspace) = workspace
+                && !state.workspaces.contains_key(&workspace)
+            {
+                return Err(StoreError::Constraint(references_no_row(
+                    "queue_entry.workspace_id",
+                    workspace,
+                    "workspace",
+                )));
+            }
             state.require_user(by, "queue_entry.queued_by")?;
             let entry = QueueEntry {
                 item_id: item,
                 project_id,
                 box_id,
+                workspace_id: workspace,
                 position: None,
                 queued_at: at.trunc_subsecs(TIMESTAMPTZ_DIGITS),
                 queued_by: by,
@@ -2693,6 +2706,7 @@ impl State {
         }
 
         self.runs.entry(chat.run_id).or_insert_with(|| Run {
+            workspace_id: None,
             id: chat.run_id,
             project_id: chat.project_id,
             item_id: None,
@@ -5298,6 +5312,16 @@ impl State {
                 "box",
             )));
         }
+        // MOD-125 D3: `fk_run_workspace`.
+        if let Some(workspace) = new.workspace_id
+            && !self.workspaces.contains_key(&workspace)
+        {
+            return Err(StoreError::Constraint(references_no_row(
+                "run.workspace_id",
+                workspace,
+                "workspace",
+            )));
+        }
         self.require_user(new.started_by, "run.started_by")?;
         for repo in &new.repo_scope {
             if !self.repos.contains_key(repo) {
@@ -5328,6 +5352,7 @@ impl State {
         })?;
 
         let row = Run {
+            workspace_id: new.workspace_id,
             id: new.id,
             project_id: new.project_id,
             item_id: Some(new.item_id),
@@ -12265,6 +12290,7 @@ mod tests {
 
     fn graph_run(item: ItemId, project: ProjectId, scope: Vec<RepoId>) -> NewRun {
         NewRun {
+            workspace_id: None,
             id: RunId::new(),
             project_id: project,
             item_id: item,
@@ -14585,6 +14611,71 @@ mod tests {
         }
     }
 
+    /// MOD-125 D3: `queue_item` records the workspace the item was queued from; a repeat with
+    /// another workspace answers the stored entry unchanged; an unknown workspace is a
+    /// foreign-key refusal that stores nothing.
+    #[tokio::test]
+    async fn queue_item_records_its_workspace() {
+        let store = MemStore::demo();
+        let at = Utc::now();
+        let refused = store
+            .queue_item(
+                ids::HTUI_CLEAN_1,
+                ids::BOX,
+                Some(crate::model::WorkspaceId::new()),
+                ids::USER,
+                at,
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(StoreError::Constraint(_))),
+            "an unknown workspace is refused: {refused:?}"
+        );
+        assert!(
+            store
+                .queue_entries(ids::BOX)
+                .await
+                .expect("the read is total")
+                .is_empty(),
+            "the refusal stored nothing"
+        );
+
+        let entry = store
+            .queue_item(
+                ids::HTUI_ANA_2,
+                ids::BOX,
+                Some(ids::WORKSPACE_PLATFORM),
+                ids::USER,
+                at,
+            )
+            .await
+            .expect("an open item queues");
+        assert_eq!(entry.workspace_id, Some(ids::WORKSPACE_PLATFORM));
+        assert_eq!(
+            store
+                .queue_entries(ids::BOX)
+                .await
+                .expect("the read is total"),
+            vec![entry.clone()],
+            "the stored entry carries the workspace"
+        );
+
+        let again = store
+            .queue_item(
+                ids::HTUI_ANA_2,
+                ids::BOX,
+                None,
+                ids::USER,
+                at + TimeDelta::minutes(1),
+            )
+            .await
+            .expect("a repeat is answered");
+        assert_eq!(
+            again, entry,
+            "a repeat answers the stored entry, its workspace included"
+        );
+    }
+
     /// MOD-12 D1, D9: `queue_item` is idempotent (the stored entry answers a repeat unchanged),
     /// `dequeue_item` reports membership, and an unknown item is `NotFound`.
     #[tokio::test]
@@ -14592,7 +14683,7 @@ mod tests {
         let store = MemStore::demo();
         let at = Utc::now();
         let entry = store
-            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, None, ids::USER, at)
             .await
             .expect("an open item queues");
         assert_eq!(entry.item_id, ids::HTUI_ANA_2);
@@ -14610,6 +14701,7 @@ mod tests {
             .queue_item(
                 ids::HTUI_ANA_2,
                 ids::BOX,
+                None,
                 ids::USER,
                 at + TimeDelta::minutes(1),
             )
@@ -14639,19 +14731,19 @@ mod tests {
 
         assert!(matches!(
             store
-                .queue_item(ItemId::new(), ids::BOX, ids::USER, at)
+                .queue_item(ItemId::new(), ids::BOX, None, ids::USER, at)
                 .await,
             Err(StoreError::NotFound { entity: "item", .. })
         ));
         assert!(matches!(
             store
-                .queue_item(ids::HTUI_ANA_2, BoxId::new(), ids::USER, at)
+                .queue_item(ids::HTUI_ANA_2, BoxId::new(), None, ids::USER, at)
                 .await,
             Err(StoreError::Constraint(_))
         ));
         assert!(matches!(
             store
-                .queue_item(ids::HTUI_ANA_2, ids::BOX, UserId::new(), at)
+                .queue_item(ids::HTUI_ANA_2, ids::BOX, None, UserId::new(), at)
                 .await,
             Err(StoreError::Constraint(_))
         ));
@@ -14738,7 +14830,7 @@ mod tests {
             .await
             .expect("the batch opens");
         store
-            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, None, ids::USER, at)
             .await
             .expect("the item queues");
         let waiting = store
@@ -14874,7 +14966,7 @@ mod tests {
         );
 
         store
-            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, None, ids::USER, at)
             .await
             .expect("the item queues");
         let run = store
@@ -14933,7 +15025,7 @@ mod tests {
             .await
             .expect("the batch opens");
         store
-            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, None, ids::USER, at)
             .await
             .expect("the item queues");
         for seen in [&[][..], &[ids::HTUI_FEAT_2][..]] {
@@ -14969,7 +15061,7 @@ mod tests {
             .await
             .expect("the batch opens");
         store
-            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, None, ids::USER, at)
             .await
             .expect("the item queues");
         // Queued after the runner read only ANA_2, stamped by a clock behind the first queuer's.
@@ -14977,6 +15069,7 @@ mod tests {
             .queue_item(
                 ids::HTUI_FEAT_2,
                 ids::BOX,
+                None,
                 ids::USER,
                 at - TimeDelta::seconds(1),
             )
@@ -14999,7 +15092,7 @@ mod tests {
         let at = Utc::now();
         for item in [ids::HTUI_ANA_1, ids::HTUI_ANA_2] {
             store
-                .queue_item(item, ids::BOX, ids::USER, at)
+                .queue_item(item, ids::BOX, None, ids::USER, at)
                 .await
                 .expect("the item queues");
         }
@@ -15092,7 +15185,7 @@ mod tests {
             .await
             .expect("the batch opens");
         store
-            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, None, ids::USER, at)
             .await
             .expect("the item queues");
         store
@@ -15351,7 +15444,7 @@ mod tests {
     async fn queue_in_order(store: &MemStore, clock: &TestClock, items: &[ItemId]) {
         for item in items {
             store
-                .queue_item(*item, ids::BOX, ids::USER, clock.now())
+                .queue_item(*item, ids::BOX, None, ids::USER, clock.now())
                 .await
                 .expect("the item queues");
             clock.advance(TimeDelta::seconds(1));
@@ -15536,7 +15629,7 @@ mod tests {
         }
         for item in [ids::HTUI_ANA_2, ids::HTUI_CLEAN_1] {
             store
-                .queue_item(item, ids::BOX, ids::USER, at)
+                .queue_item(item, ids::BOX, None, ids::USER, at)
                 .await
                 .expect("queue");
         }
@@ -15623,7 +15716,7 @@ mod tests {
             }
         }
         store
-            .queue_item(ids::AGY_FIX_1, ids::BOX, ids::USER, at)
+            .queue_item(ids::AGY_FIX_1, ids::BOX, None, ids::USER, at)
             .await
             .expect("queue");
 
@@ -15683,12 +15776,12 @@ mod tests {
         let (a, b, c) = (ids::HTUI_ANA_2, ids::HTUI_FEAT_2, ids::HTUI_CLEAN_1);
         for item in [a, b, c] {
             store
-                .queue_item(item, ids::BOX, ids::USER, at)
+                .queue_item(item, ids::BOX, None, ids::USER, at)
                 .await
                 .expect("queue");
         }
         store
-            .queue_item(ids::AGY_FIX_1, laptop, ids::USER, at)
+            .queue_item(ids::AGY_FIX_1, laptop, None, ids::USER, at)
             .await
             .expect("queue on LAPTOP-B");
 

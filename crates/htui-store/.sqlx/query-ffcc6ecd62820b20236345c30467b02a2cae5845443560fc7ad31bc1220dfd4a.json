@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            WITH candidates AS (\n                SELECT id\n                  FROM run\n                 WHERE executing_box_id = $1\n                   AND status = 'running'\n                   AND kind = 'graph'\n                   AND (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp())\n                   AND lease_owner IS DISTINCT FROM $2\n                 ORDER BY queued_at, id\n                   FOR UPDATE SKIP LOCKED\n            ),\n            swept AS (\n                UPDATE run r\n                   SET lease_owner      = $2,\n                       lease_box_id     = $1,\n                       lease_expires_at = clock_timestamp() + $3::bigint * interval '1 microsecond'\n                  FROM candidates c\n                 WHERE r.id = c.id\n             RETURNING r.*\n            )\n            SELECT id               AS \"id: RunId\",\n                   project_id       AS \"project_id: ProjectId\",\n                   item_id          AS \"item_id: ItemId\",\n                   kind             AS \"kind: RunKind\",\n                   mode             AS \"mode: RunMode\",\n                   status           AS \"status: RunStatus\",\n                   target_box_id    AS \"target_box_id: BoxId\",\n                   executing_box_id AS \"executing_box_id: BoxId\",\n                   graph_snapshot,\n                   started_by       AS \"started_by: UserId\",\n                   queued_at,\n                   started_at,\n                   finished_at,\n                   failure,\n                   repo_scope       AS \"repo_scope: Vec<RepoId>\",\n                   lease_box_id     AS \"lease_box_id: BoxId\",\n                   lease_expires_at,\n                   updated_at\n              FROM swept\n             ORDER BY queued_at, id\n            ",
+  "query": "SELECT id, project_id, item_id, kind, mode, status, target_box_id, executing_box_id, graph_snapshot, started_by, queued_at, started_at, finished_at, failure, repo_scope, lease_box_id, lease_expires_at, updated_at, workspace_id FROM run WHERE project_id = $1 AND updated_at > $2 ORDER BY updated_at",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id: RunId",
+        "name": "id",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -16,7 +16,7 @@
       },
       {
         "ordinal": 1,
-        "name": "project_id: ProjectId",
+        "name": "project_id",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -27,7 +27,7 @@
       },
       {
         "ordinal": 2,
-        "name": "item_id: ItemId",
+        "name": "item_id",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -38,7 +38,7 @@
       },
       {
         "ordinal": 3,
-        "name": "kind: RunKind",
+        "name": "kind",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -49,7 +49,7 @@
       },
       {
         "ordinal": 4,
-        "name": "mode: RunMode",
+        "name": "mode",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -60,7 +60,7 @@
       },
       {
         "ordinal": 5,
-        "name": "status: RunStatus",
+        "name": "status",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -71,7 +71,7 @@
       },
       {
         "ordinal": 6,
-        "name": "target_box_id: BoxId",
+        "name": "target_box_id",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -82,7 +82,7 @@
       },
       {
         "ordinal": 7,
-        "name": "executing_box_id: BoxId",
+        "name": "executing_box_id",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -104,7 +104,7 @@
       },
       {
         "ordinal": 9,
-        "name": "started_by: UserId",
+        "name": "started_by",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -159,7 +159,7 @@
       },
       {
         "ordinal": 14,
-        "name": "repo_scope: Vec<RepoId>",
+        "name": "repo_scope",
         "type_info": "UuidArray",
         "origin": {
           "Table": {
@@ -170,7 +170,7 @@
       },
       {
         "ordinal": 15,
-        "name": "lease_box_id: BoxId",
+        "name": "lease_box_id",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -200,13 +200,23 @@
             "name": "updated_at"
           }
         }
+      },
+      {
+        "ordinal": 18,
+        "name": "workspace_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "workspace_id"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
         "Uuid",
-        "Uuid",
-        "Int8"
+        "Timestamptz"
       ]
     },
     "nullable": [
@@ -227,8 +237,9 @@
       false,
       true,
       true,
-      false
+      false,
+      true
     ]
   },
-  "hash": "5960b2f57457280ce219fd2dfbeacb53747566c1493340c4c82e93dd7a017b75"
+  "hash": "ffcc6ecd62820b20236345c30467b02a2cae5845443560fc7ad31bc1220dfd4a"
 }

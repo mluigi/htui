@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::model::ids::{
     AgentId, BatchId, BoxId, CommandRunId, ItemId, ProjectId, RepoId, RunId, StepGraphId, StepId,
-    UserId,
+    UserId, WorkspaceId,
 };
 use crate::model::kind::{CommandQueue, Gate, Isolation};
 
@@ -218,6 +218,11 @@ pub struct Run {
     pub project_id: ProjectId,
     /// `run.item_id`; `None` for a free-standing chat.
     pub item_id: Option<ItemId>,
+    /// `run.workspace_id` (MOD-125 D3): the workspace a graph run was started from; `None` for a
+    /// chat run, a run started without a scope, or one whose project was in no or several
+    /// workspaces at 0019.
+    #[serde(default)]
+    pub workspace_id: Option<WorkspaceId>,
     /// `run.kind`.
     pub kind: RunKind,
     /// `run.mode`.
@@ -435,6 +440,9 @@ pub struct NewRun {
     /// `batch_runs`.
     #[serde(default)]
     pub batch_id: Option<BatchId>,
+    /// `run.workspace_id` (MOD-125 D3); `None` is never gated by a workspace stop.
+    #[serde(default)]
+    pub workspace_id: Option<WorkspaceId>,
 }
 
 /// Arguments of [`crate::store::WriteStore::create_step`]: a `run_step` inserted at `pending`

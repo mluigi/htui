@@ -32,7 +32,7 @@ use htui_core::model::{
     RepoBoxPath, RepoId, Requirement, RequirementArea, RequirementFilter, RequirementId,
     RequirementRevision, RequirementSpec, ResolvedGraph, ResolvedInput, Run, RunId, RunStatus,
     RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, StepGraph, StepGraphId,
-    StepId, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WorkspaceSummary,
+    StepId, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WorkspaceId, WorkspaceSummary,
 };
 use htui_core::store::{MemStore, ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -609,7 +609,8 @@ impl Backend {
     }
 
     /// MOD-12 D1: queue `item` on `box_id`; idempotent, an item already queued answers its stored
-    /// entry unchanged.
+    /// entry unchanged, its workspace included. `workspace` (MOD-125 D3) is recorded on a new
+    /// entry.
     ///
     /// # Errors
     ///
@@ -619,12 +620,13 @@ impl Backend {
         &self,
         item: ItemId,
         box_id: BoxId,
+        workspace: Option<WorkspaceId>,
         by: UserId,
         at: DateTime<Utc>,
     ) -> Result<QueueEntry> {
         match self {
-            Self::Memory(store) => store.queue_item(item, box_id, by, at).await,
-            Self::Online { pg, .. } => pg.queue_item(item, box_id, by, at).await,
+            Self::Memory(store) => store.queue_item(item, box_id, workspace, by, at).await,
+            Self::Online { pg, .. } => pg.queue_item(item, box_id, workspace, by, at).await,
             Self::Offline { .. } => Err(orchestration_offline()),
         }
     }

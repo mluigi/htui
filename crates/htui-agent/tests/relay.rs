@@ -131,6 +131,7 @@ async fn leased_at(run: RunId, step: StepId) -> Leased {
     let owner = Uuid::new_v4();
     store
         .create_run(NewRun {
+            workspace_id: None,
             id: run,
             project_id: ids::PROJECT_HTUI,
             item_id: ids::HTUI_ANA_2,

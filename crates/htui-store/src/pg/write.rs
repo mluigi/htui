@@ -4602,11 +4602,12 @@ impl WriteStore for PgStore {
             r#"
             INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id,
                              executing_box_id, graph_snapshot, started_by, queued_at, repo_scope,
-                             batch_id)
-            VALUES ($1, $2, $3, 'graph', $4, 'queued', $5, NULL, $6, $7, $8, $9::uuid[], $10)
+                             batch_id, workspace_id)
+            VALUES ($1, $2, $3, 'graph', $4, 'queued', $5, NULL, $6, $7, $8, $9::uuid[], $10, $11)
             RETURNING id               AS "id: RunId",
                       project_id       AS "project_id: ProjectId",
                       item_id          AS "item_id: ItemId",
+                      workspace_id     AS "workspace_id: WorkspaceId",
                       kind             AS "kind: RunKind",
                       mode             AS "mode: RunMode",
                       status           AS "status: RunStatus",
@@ -4633,6 +4634,7 @@ impl WriteStore for PgStore {
             new.queued_at,
             &scope,
             new.batch_id.map(BatchId::as_uuid),
+            new.workspace_id.map(WorkspaceId::as_uuid),
         )
         .fetch_one(&mut *tx)
         .await
@@ -4997,6 +4999,7 @@ impl WriteStore for PgStore {
             SELECT id               AS "id: RunId",
                    project_id       AS "project_id: ProjectId",
                    item_id          AS "item_id: ItemId",
+                   workspace_id     AS "workspace_id: WorkspaceId",
                    kind             AS "kind: RunKind",
                    mode             AS "mode: RunMode",
                    status           AS "status: RunStatus",
@@ -7883,16 +7886,19 @@ impl PgStore {
 impl PgStore {
     /// MOD-12 D1: queue `item` on `box_id`. Idempotent: an item already queued (on any box)
     /// answers its stored entry unchanged (`ON CONFLICT (item_id) DO NOTHING`, then the read).
-    /// `at` is microsecond-truncated by the driver.
+    /// `at` is microsecond-truncated by the driver. `workspace` (MOD-125 D3) is recorded on a new
+    /// entry. An entry already stored comes back unchanged, its workspace included.
     ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] `{ entity: "item" }` for an unknown item;
-    /// [`StoreError::Constraint`] for an unknown box or user (23503, through [`map_sqlx`]).
+    /// [`StoreError::Constraint`] for an unknown box, workspace or user (23503, through
+    /// [`map_sqlx`]).
     pub async fn queue_item(
         &self,
         item: ItemId,
         box_id: BoxId,
+        workspace: Option<WorkspaceId>,
         by: UserId,
         at: DateTime<Utc>,
     ) -> Result<QueueEntry> {
@@ -7910,14 +7916,15 @@ impl PgStore {
         })?;
         sqlx::query!(
             r#"
-            INSERT INTO queue_entry (item_id, box_id, position, queued_at, queued_by)
-            VALUES ($1, $2, NULL, $3, $4)
+            INSERT INTO queue_entry (item_id, box_id, position, queued_at, queued_by, workspace_id)
+            VALUES ($1, $2, NULL, $3, $4, $5)
             ON CONFLICT (item_id) DO NOTHING
             "#,
             item.as_uuid(),
             box_id.as_uuid(),
             at,
             by.as_uuid(),
+            workspace.map(WorkspaceId::as_uuid),
         )
         .execute(&mut *tx)
         .await
@@ -7928,6 +7935,7 @@ impl PgStore {
             SELECT e.item_id    AS "item_id: ItemId",
                    i.project_id AS "project_id: ProjectId",
                    e.box_id     AS "box_id: BoxId",
+                   e.workspace_id AS "workspace_id: WorkspaceId",
                    e.position,
                    e.queued_at,
                    e.queued_by  AS "queued_by: UserId"
@@ -8003,6 +8011,7 @@ impl PgStore {
             SELECT e.item_id    AS "item_id: ItemId",
                    i.project_id AS "project_id: ProjectId",
                    e.box_id     AS "box_id: BoxId",
+                   e.workspace_id AS "workspace_id: WorkspaceId",
                    e.position,
                    e.queued_at,
                    e.queued_by  AS "queued_by: UserId"

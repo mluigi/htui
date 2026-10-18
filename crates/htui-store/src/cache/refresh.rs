@@ -1119,6 +1119,7 @@ const RUN_COLUMNS: &[&str] = &[
     "lease_box_id",
     "lease_expires_at",
     "updated_at",
+    "workspace_id",
 ];
 
 async fn refresh_run(
@@ -1133,7 +1134,7 @@ async fn refresh_run(
         // by definition not running while the mirror is read.
         "SELECT id, project_id, item_id, kind, mode, status, target_box_id, executing_box_id, \
                 graph_snapshot, started_by, queued_at, started_at, finished_at, failure, \
-                repo_scope, lease_box_id, lease_expires_at, updated_at \
+                repo_scope, lease_box_id, lease_expires_at, updated_at, workspace_id \
            FROM run WHERE project_id = $1 AND updated_at > $2 ORDER BY updated_at",
         project.as_uuid(),
         since,
@@ -1164,6 +1165,7 @@ async fn refresh_run(
             .bind(row.lease_box_id.map(|id| id.to_string()))
             .bind(row.lease_expires_at.map(ts_bind))
             .bind(ts_bind(row.updated_at))
+            .bind(row.workspace_id.map(|id| id.to_string()))
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx)?;

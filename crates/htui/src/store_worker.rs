@@ -2419,7 +2419,7 @@ async fn serve_queue(backend: &Backend, request: &StoreRequest) -> StoreResult<S
         }
         StoreRequest::QueueItem { item } => {
             let user = backend.this_user().await?;
-            let entry = backend.queue_item(*item, box_id, user, now()).await?;
+            let entry = backend.queue_item(*item, box_id, None, user, now()).await?;
             // D1: an item is queued on at most one box, and an existing entry is kept as it is.
             // One on another box is not this box's to report as queued (review L1); dequeueing
             // it from here is the M3 overlay's (D11).
@@ -5297,7 +5297,7 @@ mod tests {
         );
 
         store
-            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, Utc::now())
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, None, ids::USER, Utc::now())
             .await
             .expect("the item is queued");
         let StoreReply::Queue(view) = serve(&backend, &StoreRequest::QueueState).await else {
@@ -5475,7 +5475,7 @@ mod tests {
         data.boxes.push(elsewhere);
         let store = MemStore::from_demo(data);
         store
-            .queue_item(ids::HTUI_ANA_2, other, ids::USER, Utc::now())
+            .queue_item(ids::HTUI_ANA_2, other, None, ids::USER, Utc::now())
             .await
             .expect("the item is queued on the other box");
         let backend = Backend::memory(store);

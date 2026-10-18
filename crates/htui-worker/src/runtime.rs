@@ -4113,7 +4113,7 @@ mod queue_store_errors {
                 .take();
             if let Some((item, queued_at)) = late {
                 self.inner
-                    .queue_item(item, ids::BOX, ids::USER, queued_at)
+                    .queue_item(item, ids::BOX, None, ids::USER, queued_at)
                     .await?;
             }
             WorkerHost::close_drained_batch(&self.inner, batch, seen, at).await
@@ -4181,7 +4181,7 @@ mod queue_store_errors {
         // An open batch with an entry whose item is ready: admission reaches its every read.
         let store = MemStore::demo();
         store
-            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, Utc::now())
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, None, ids::USER, Utc::now())
             .await
             .expect("the item queues");
         store
@@ -4237,7 +4237,7 @@ mod queue_store_errors {
     async fn an_entry_whose_project_is_gone_is_not_admitted() {
         let store = MemStore::demo();
         store
-            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, Utc::now())
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, None, ids::USER, Utc::now())
             .await
             .expect("the item queues");
         store
@@ -4337,7 +4337,7 @@ mod queue_store_errors {
         let store = MemStore::demo();
         let at = Utc::now();
         store
-            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, None, ids::USER, at)
             .await
             .expect("the item queues");
         let batch = store
@@ -4383,7 +4383,7 @@ mod queue_store_errors {
         let store = MemStore::demo();
         let at = Utc::now();
         store
-            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, None, ids::USER, at)
             .await
             .expect("the item queues");
         let batch = store
@@ -4699,6 +4699,7 @@ mod role_gate {
         let run = RunId::new();
         store
             .create_run(NewRun {
+                workspace_id: None,
                 id: run,
                 project_id: row.project_id,
                 item_id: row.id,

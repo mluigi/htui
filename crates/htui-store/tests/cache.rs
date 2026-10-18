@@ -648,6 +648,7 @@ async fn the_mirror_lists_waiting_candidates_like_postgres() {
     let owner = uuid::Uuid::now_v7();
     let at = Utc::now().trunc_subsecs(6);
     let new_run = |item: ItemId| NewRun {
+        workspace_id: None,
         id: RunId::new(),
         project_id: ids::PROJECT_HTUI,
         item_id: item,

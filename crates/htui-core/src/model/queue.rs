@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::model::box_::{BoxSettings, DEFAULT_MAX_CONCURRENT_ITEMS};
-use crate::model::ids::{BatchId, BoxId, ItemId, ProjectId, RunId, StepId, UserId};
+use crate::model::ids::{BatchId, BoxId, ItemId, ProjectId, RunId, StepId, UserId, WorkspaceId};
 use crate::model::item::{ItemSummary, Status};
 use crate::model::quota::CapError;
 use crate::model::run::{RunMode, RunStatus};
@@ -35,6 +35,9 @@ pub struct QueueEntry {
     pub project_id: ProjectId,
     /// `queue_entry.box_id`.
     pub box_id: BoxId,
+    /// `queue_entry.workspace_id` (MOD-125 D3): the workspace the item was queued from, copied
+    /// onto the run `admit` creates.
+    pub workspace_id: Option<WorkspaceId>,
     /// `queue_entry.position`; `None` sorts last (D4). Milestone 1 writes only `None`.
     pub position: Option<i32>,
     /// `queue_entry.queued_at`.
@@ -607,6 +610,7 @@ mod tests {
 
     fn entry(item: ItemId, position: Option<i32>) -> QueueEntry {
         QueueEntry {
+            workspace_id: None,
             item_id: item,
             project_id: ProjectId::default(),
             box_id: BoxId::default(),

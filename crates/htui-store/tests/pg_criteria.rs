@@ -1081,6 +1081,7 @@ async fn count_running_on_box(pool: &PgPool, box_id: BoxId) -> i64 {
 /// never reads it back, so there is nothing to gain from the fixture's fuller one.
 fn race_run(item: ItemId) -> NewRun {
     NewRun {
+        workspace_id: None,
         id: RunId::new(),
         project_id: ids::PROJECT_HTUI,
         item_id: item,
@@ -7711,23 +7712,23 @@ async fn queue_surface_answers_alike_on_both_stores() {
         (ids::HTUI_FIX_1, later),
     ] {
         let on_pg = pg
-            .queue_item(item, ids::BOX, ids::USER, when)
+            .queue_item(item, ids::BOX, None, ids::USER, when)
             .await
             .expect("the Postgres queue_item lands");
         let on_mem = mem
-            .queue_item(item, ids::BOX, ids::USER, when)
+            .queue_item(item, ids::BOX, None, ids::USER, when)
             .await
             .expect("the MemStore queue_item lands");
         assert_eq!(on_pg, on_mem, "one entry, both stores");
         assert_eq!(on_pg.queued_at, when.trunc_subsecs(TIMESTAMPTZ_DIGITS));
     }
     let repeat = pg
-        .queue_item(ids::HTUI_ANA_2, BoxId::new(), ids::USER, later)
+        .queue_item(ids::HTUI_ANA_2, BoxId::new(), None, ids::USER, later)
         .await
         .expect("a repeat on Postgres answers the stored entry");
     assert_eq!(
         repeat,
-        mem.queue_item(ids::HTUI_ANA_2, BoxId::new(), ids::USER, later)
+        mem.queue_item(ids::HTUI_ANA_2, BoxId::new(), None, ids::USER, later)
             .await
             .expect("a repeat on MemStore answers the stored entry"),
     );
@@ -7749,20 +7750,22 @@ async fn queue_surface_answers_alike_on_both_stores() {
     );
 
     assert!(matches!(
-        pg.queue_item(ItemId::new(), ids::BOX, ids::USER, at).await,
+        pg.queue_item(ItemId::new(), ids::BOX, None, ids::USER, at)
+            .await,
         Err(htui_core::store::StoreError::NotFound { entity: "item", .. })
     ));
     assert!(matches!(
-        mem.queue_item(ItemId::new(), ids::BOX, ids::USER, at).await,
+        mem.queue_item(ItemId::new(), ids::BOX, None, ids::USER, at)
+            .await,
         Err(htui_core::store::StoreError::NotFound { entity: "item", .. })
     ));
     assert!(matches!(
-        pg.queue_item(ids::HTUI_CLEAN_1, BoxId::new(), ids::USER, at)
+        pg.queue_item(ids::HTUI_CLEAN_1, BoxId::new(), None, ids::USER, at)
             .await,
         Err(htui_core::store::StoreError::Constraint(_))
     ));
     assert!(matches!(
-        mem.queue_item(ids::HTUI_CLEAN_1, BoxId::new(), ids::USER, at)
+        mem.queue_item(ids::HTUI_CLEAN_1, BoxId::new(), None, ids::USER, at)
             .await,
         Err(htui_core::store::StoreError::Constraint(_))
     ));
@@ -8216,10 +8219,10 @@ async fn close_batch_cancels_its_queued_runs_and_the_drain_closes_only_its_batch
 
     let pg_batch = pg.open_batch(ids::BOX, ids::USER, at).await.expect("open");
     let mem_batch = mem.open_batch(ids::BOX, ids::USER, at).await.expect("open");
-    pg.queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+    pg.queue_item(ids::HTUI_ANA_2, ids::BOX, None, ids::USER, at)
         .await
         .expect("queue");
-    mem.queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+    mem.queue_item(ids::HTUI_ANA_2, ids::BOX, None, ids::USER, at)
         .await
         .expect("queue");
     let waiting = batch_run(ids::HTUI_ANA_2, Some(pg_batch.id));
@@ -8424,10 +8427,10 @@ async fn a_drain_skips_a_batch_with_an_entry_it_never_read_on_both_stores() {
 
     let pg_batch = pg.open_batch(ids::BOX, ids::USER, at).await.expect("open");
     let mem_batch = mem.open_batch(ids::BOX, ids::USER, at).await.expect("open");
-    pg.queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+    pg.queue_item(ids::HTUI_ANA_2, ids::BOX, None, ids::USER, at)
         .await
         .expect("queue");
-    mem.queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+    mem.queue_item(ids::HTUI_ANA_2, ids::BOX, None, ids::USER, at)
         .await
         .expect("queue");
     for (seen, why) in [
@@ -8493,10 +8496,10 @@ async fn a_drain_skips_a_batch_with_an_unread_entry_stamped_earlier_on_both_stor
     let mem_batch = mem.open_batch(ids::BOX, ids::USER, at).await.expect("open");
     // The runner reads ANA_2; FEAT_2 commits after its read, stamped by a clock behind.
     for (item, stamp) in [(ids::HTUI_ANA_2, at), (ids::HTUI_FEAT_2, earlier)] {
-        pg.queue_item(item, ids::BOX, ids::USER, stamp)
+        pg.queue_item(item, ids::BOX, None, ids::USER, stamp)
             .await
             .expect("queue");
-        mem.queue_item(item, ids::BOX, ids::USER, stamp)
+        mem.queue_item(item, ids::BOX, None, ids::USER, stamp)
             .await
             .expect("queue");
     }
@@ -8532,10 +8535,10 @@ async fn a_stalled_batch_closes_alike_on_both_stores() {
     let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
     let later = at + TimeDelta::seconds(1);
 
-    pg.queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+    pg.queue_item(ids::HTUI_ANA_2, ids::BOX, None, ids::USER, at)
         .await
         .expect("queue");
-    mem.queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+    mem.queue_item(ids::HTUI_ANA_2, ids::BOX, None, ids::USER, at)
         .await
         .expect("queue");
     let pg_batch = pg.open_batch(ids::BOX, ids::USER, at).await.expect("open");
@@ -9843,10 +9846,10 @@ async fn queue_entries_follow_one_order_on_both_stores() {
         .enumerate()
     {
         let when = at + TimeDelta::seconds(i64::try_from(seconds).expect("small"));
-        pg.queue_item(item, ids::BOX, ids::USER, when)
+        pg.queue_item(item, ids::BOX, None, ids::USER, when)
             .await
             .expect("queue on Postgres");
-        mem.queue_item(item, ids::BOX, ids::USER, when)
+        mem.queue_item(item, ids::BOX, None, ids::USER, when)
             .await
             .expect("queue on MemStore");
     }
@@ -9951,6 +9954,7 @@ fn queue_facts_mem(facts: &QueueFacts) -> htui_core::store::MemStore {
     }
     let chat_at = facts.at + TimeDelta::seconds(2);
     data.runs.push(htui_core::model::Run {
+        workspace_id: None,
         id: facts.chat,
         project_id: ids::PROJECT_HTUI,
         item_id: Some(ids::HTUI_ANA_2),
@@ -10127,10 +10131,10 @@ async fn queue_rows_answer_alike_on_both_stores() {
         ids::HTUI_FEAT_3,
         ids::HTUI_CLEAN_1,
     ] {
-        pg.queue_item(item, ids::BOX, ids::USER, facts.at)
+        pg.queue_item(item, ids::BOX, None, ids::USER, facts.at)
             .await
             .expect("queue on Postgres");
-        mem.queue_item(item, ids::BOX, ids::USER, facts.at)
+        mem.queue_item(item, ids::BOX, None, ids::USER, facts.at)
             .await
             .expect("queue on MemStore");
     }
@@ -10209,10 +10213,10 @@ async fn move_queue_entry_answers_alike_on_both_stores() {
     // Priority 0 each: created_at decides, ANA-2, FEAT-2, CLEAN-1.
     let (a, b, c) = (ids::HTUI_ANA_2, ids::HTUI_FEAT_2, ids::HTUI_CLEAN_1);
     for item in [c, b, a] {
-        pg.queue_item(item, ids::BOX, ids::USER, at)
+        pg.queue_item(item, ids::BOX, None, ids::USER, at)
             .await
             .expect("queue on Postgres");
-        mem.queue_item(item, ids::BOX, ids::USER, at)
+        mem.queue_item(item, ids::BOX, None, ids::USER, at)
             .await
             .expect("queue on MemStore");
     }
@@ -10248,10 +10252,10 @@ async fn move_queue_entry_answers_alike_on_both_stores() {
     let d = ItemId::new();
     queue_feat(pg, d, 9).await;
     queue_feat(&mem, d, 9).await;
-    pg.queue_item(d, ids::BOX, ids::USER, at)
+    pg.queue_item(d, ids::BOX, None, ids::USER, at)
         .await
         .expect("queue on Postgres");
-    mem.queue_item(d, ids::BOX, ids::USER, at)
+    mem.queue_item(d, ids::BOX, None, ids::USER, at)
         .await
         .expect("queue on MemStore");
     assert_eq!(
@@ -10284,7 +10288,7 @@ async fn queued_against_id_order(db: &common::TestDb) -> [ItemId; 3] {
     for &item in items.iter().rev() {
         queue_feat(&db.store, item, 0).await;
         db.store
-            .queue_item(item, ids::BOX, ids::USER, at)
+            .queue_item(item, ids::BOX, None, ids::USER, at)
             .await
             .expect("the item queues");
     }
@@ -10420,7 +10424,7 @@ async fn concurrent_moves_and_prunes_never_deadlock() {
             .expect("reopen the finished items");
         for &item in items.iter().rev() {
             db.store
-                .queue_item(item, ids::BOX, ids::USER, Utc::now())
+                .queue_item(item, ids::BOX, None, ids::USER, Utc::now())
                 .await
                 .expect("the item queues");
         }
@@ -10627,6 +10631,80 @@ async fn last_closed_batch_answers_alike_on_both_stores() {
         pg.last_closed_batch(BoxId::new()).await.expect("read"),
         None,
         "another box has none"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-125 D3: `queue_item` records the workspace the item was queued from on Postgres, as on
+/// `MemStore` (`mem.rs::queue_item_records_its_workspace`): stored and returned, read back by
+/// `queue_entries` and `queue_rows`; a repeat with another workspace answers the stored entry
+/// unchanged; an unknown workspace is `fk_queue_entry_workspace`'s refusal and stores nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_item_records_its_workspace() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let at = Utc::now();
+
+    let refused = pg
+        .queue_item(
+            ids::HTUI_CLEAN_1,
+            ids::BOX,
+            Some(WorkspaceId::new()),
+            ids::USER,
+            at,
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(htui_core::store::StoreError::Constraint(_))),
+        "an unknown workspace is refused: {refused:?}"
+    );
+    assert!(
+        pg.queue_entries(ids::BOX)
+            .await
+            .expect("the read answers")
+            .iter()
+            .all(|entry| entry.item_id != ids::HTUI_CLEAN_1),
+        "the refusal stored nothing"
+    );
+
+    let entry = pg
+        .queue_item(
+            ids::HTUI_ANA_2,
+            ids::BOX,
+            Some(ids::WORKSPACE_PLATFORM),
+            ids::USER,
+            at,
+        )
+        .await
+        .expect("an open item queues");
+    assert_eq!(entry.workspace_id, Some(ids::WORKSPACE_PLATFORM));
+    let stored = pg.queue_entries(ids::BOX).await.expect("the read answers");
+    assert!(stored.contains(&entry), "{stored:?}");
+    let rows = pg.queue_rows(ids::BOX).await.expect("the read answers");
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.entry.item_id == ids::HTUI_ANA_2)
+            .map(|row| row.entry.workspace_id),
+        Some(Some(ids::WORKSPACE_PLATFORM)),
+        "queue_rows carries the workspace too"
+    );
+
+    let again = pg
+        .queue_item(
+            ids::HTUI_ANA_2,
+            ids::BOX,
+            None,
+            ids::USER,
+            at + TimeDelta::minutes(1),
+        )
+        .await
+        .expect("a repeat is answered");
+    assert_eq!(
+        again, entry,
+        "a repeat answers the stored entry, its workspace included"
     );
 
     db.drop_db().await;

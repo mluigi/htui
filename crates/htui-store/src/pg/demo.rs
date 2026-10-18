@@ -441,8 +441,8 @@ impl PgStore {
             sqlx::query!(
                 "INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id, \
                  executing_box_id, graph_snapshot, started_by, queued_at, started_at, \
-                 finished_at, failure, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+                 finished_at, failure, updated_at, workspace_id) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
                 RunId::as_uuid(row.id),
                 ProjectId::as_uuid(row.project_id),
                 row.item_id.map(ItemId::as_uuid),
@@ -458,6 +458,7 @@ impl PgStore {
                 row.finished_at,
                 row.failure.as_deref(),
                 row.updated_at,
+                row.workspace_id.map(WorkspaceId::as_uuid),
             )
             .execute(&mut *tx)
             .await
