@@ -45,10 +45,11 @@ use crate::model::{
     RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
     SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId,
     SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase,
-    StepId, StepOpening, StepOutcome, StepPermission, StepStatus, TIMESTAMPTZ_DIGITS,
+    StepId, StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, TIMESTAMPTZ_DIGITS,
     ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
-    canonical_declared_tags, missing_tags_failure, moved_order, overlaps, prompt_summary, scope_of,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
+    WorkspaceSummary, canonical_declared_tags, missing_tags_failure, moved_order, overlaps,
+    prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -302,6 +303,8 @@ struct State {
     queue_entries: BTreeMap<ItemId, QueueEntry>,
     /// `queue_batch` (MOD-12 D2), by id.
     queue_batches: BTreeMap<BatchId, QueueBatch>,
+    /// `workspace_stop` (MOD-125 D4), by workspace.
+    workspace_stops: BTreeMap<WorkspaceId, WorkspaceStop>,
     /// `run.batch_id` (MOD-12 D7), beside `runs` as `lease_owners` is: not a `Run` field.
     run_batches: HashMap<RunId, BatchId>,
     /// `run_command`'s MOD-70 columns for `follow_up` rows, by id (B-2): `run_step_id` and the
@@ -416,6 +419,7 @@ impl MemStore {
             run_commands: BTreeMap::new(),
             queue_entries: BTreeMap::new(),
             queue_batches: BTreeMap::new(),
+            workspace_stops: BTreeMap::new(),
             run_batches: HashMap::new(),
             follow_up_payloads: BTreeMap::new(),
             follow_up_windows: BTreeMap::new(),
@@ -4886,7 +4890,12 @@ impl State {
 
     /// Removes a workspace, its links and its box paths. Projects survive it
     /// (`0001_init.sql:162,174`).
-    fn delete_workspace(&mut self, id: WorkspaceId) -> Result<DeleteReach> {
+    ///
+    /// MOD-125 (blueprint F16) emulates `0019_stop_runs.sql`'s two foreign keys: the stop record
+    /// goes with the workspace (`ON DELETE CASCADE`), and its runs and queue entries outlive it
+    /// unscoped (`ON DELETE SET NULL`). A run's `updated_at` moves, as Postgres's trigger moves it
+    /// on the `SET NULL`; `queue_entry` has no `updated_at`.
+    fn delete_workspace(&mut self, id: WorkspaceId, now: DateTime<Utc>) -> Result<DeleteReach> {
         let reach = self
             .workspace_reach(id)
             .ok_or_else(|| StoreError::NotFound {
@@ -4896,6 +4905,22 @@ impl State {
         self.workspace_projects.retain(|row| row.workspace_id != id);
         self.workspace_box_paths
             .retain(|row| row.workspace_id != id);
+        self.workspace_stops.remove(&id);
+        for run in self
+            .runs
+            .values_mut()
+            .filter(|run| run.workspace_id == Some(id))
+        {
+            run.workspace_id = None;
+            run.updated_at = now;
+        }
+        for entry in self
+            .queue_entries
+            .values_mut()
+            .filter(|entry| entry.workspace_id == Some(id))
+        {
+            entry.workspace_id = None;
+        }
         self.workspaces.remove(&id);
         Ok(reach)
     }
@@ -5385,7 +5410,7 @@ impl State {
 
     /// ANA-2 §4.7's admission and `R-ORCH-10`'s claim-time check (MOD-7 milestone 3, D80), decided
     /// before any write: a refusal writes nothing, except `MissingTags`, which fails the run and
-    /// blocks its item.
+    /// blocks its item. MOD-125 D5's workspace gate sits between claimability and the tags.
     fn claim_run(
         &mut self,
         run: RunId,
@@ -5404,6 +5429,12 @@ impl State {
         }
         if claimed.status != RunStatus::Queued || claimed.target_box_id != box_id {
             return Ok(Claim::NotClaimable);
+        }
+        // MOD-125 D5: after claimability, before the tags, so a stopped workspace never fails a run.
+        if let Some(workspace) = claimed.workspace_id
+            && self.workspace_stops.contains_key(&workspace)
+        {
+            return Ok(Claim::WorkspaceStopped { workspace });
         }
 
         // R-ORCH-10 at claim (MOD-7 milestone 3, D80, D81): after claimability, before the slot
@@ -5532,6 +5563,10 @@ impl State {
     /// `owner`'s becomes `owner`'s (plan D88). Expiry is judged by this handle's clock (MOD-40
     /// plan D10). A chat run is never the sweep's: the engine cannot recover it, and leasing it
     /// fenced the chat's own unleased writes (MOD-24 D3b).
+    ///
+    /// MOD-125 D6: a candidate whose workspace is stopped is settled, not adopted: it moves
+    /// `running -> stopped` with its running steps, its lease is released as
+    /// [`State::release_lease`] releases it, and it is left out of the answer.
     fn adopt_runs(
         &mut self,
         box_id: BoxId,
@@ -5556,6 +5591,22 @@ impl State {
 
         let mut adopted = Vec::with_capacity(abandoned.len());
         for (_, id) in abandoned {
+            let settle = self
+                .runs
+                .get(&id)
+                .and_then(|row| row.workspace_id)
+                .is_some_and(|workspace| self.workspace_stops.contains_key(&workspace));
+            if settle {
+                // MOD-125 D6: a stopped workspace's abandoned run is settled, not adopted.
+                self.lease_owners.remove(&id);
+                if let Some(row) = self.runs.get_mut(&id) {
+                    row.status = RunStatus::Stopped;
+                    row.lease_expires_at = Some(now);
+                    row.updated_at = now;
+                }
+                self.stop_running_steps(id, now);
+                continue;
+            }
             self.lease_owners.insert(id, owner);
             if let Some(row) = self.runs.get_mut(&id) {
                 row.lease_box_id = Some(box_id);
@@ -5609,6 +5660,81 @@ impl State {
             row.updated_at = now;
         }
         Ok(true)
+    }
+
+    /// MOD-125 D7: a compare-and-set `running -> stopped` on the owner's lease. The run's
+    /// `running` steps stop with it, and the lease is released as [`State::release_lease`]
+    /// releases it; `false` writes nothing.
+    fn stop_run(&mut self, run: RunId, owner: Uuid, now: DateTime<Utc>) -> Result<bool> {
+        let status = self.require_run(run)?.status;
+        if self.lease_owners.get(&run) != Some(&owner) || status != RunStatus::Running {
+            return Ok(false);
+        }
+        self.lease_owners.remove(&run);
+        if let Some(row) = self.runs.get_mut(&run) {
+            row.status = RunStatus::Stopped;
+            row.lease_expires_at = Some(now);
+            row.updated_at = now;
+        }
+        self.stop_running_steps(run, now);
+        Ok(true)
+    }
+
+    /// MOD-125 D6, D7: every `running` step of `run` moves to `stopped`.
+    fn stop_running_steps(&mut self, run: RunId, now: DateTime<Utc>) {
+        for step in self
+            .steps
+            .values_mut()
+            .filter(|step| step.run_id == run && step.status == StepStatus::Running)
+        {
+            step.status = StepStatus::Stopped;
+            step.updated_at = now;
+        }
+    }
+
+    /// MOD-125 D4: the upsert that only escalates `graceful -> forced`; every other repeat keeps
+    /// the stored row, its instant included.
+    fn stop_workspace(
+        &mut self,
+        workspace: WorkspaceId,
+        mode: StopMode,
+        by: UserId,
+        at: DateTime<Utc>,
+    ) -> Result<WorkspaceStop> {
+        if !self.workspaces.contains_key(&workspace) {
+            return Err(StoreError::NotFound {
+                entity: "workspace",
+                id: workspace.to_string(),
+            });
+        }
+        self.require_user(by, "workspace_stop.requested_by")?;
+        let requested = WorkspaceStop {
+            workspace_id: workspace,
+            mode,
+            requested_by: by,
+            requested_at: at.trunc_subsecs(TIMESTAMPTZ_DIGITS),
+        };
+        let stored = self
+            .workspace_stops
+            .entry(workspace)
+            .and_modify(|row| {
+                if row.mode == StopMode::Graceful && mode == StopMode::Forced {
+                    *row = requested.clone();
+                }
+            })
+            .or_insert_with(|| requested.clone());
+        Ok(stored.clone())
+    }
+
+    /// MOD-125 D4: deletes the stop record; `false` when the workspace was not stopped.
+    fn resume_workspace(&mut self, workspace: WorkspaceId) -> Result<bool> {
+        if !self.workspaces.contains_key(&workspace) {
+            return Err(StoreError::NotFound {
+                entity: "workspace",
+                id: workspace.to_string(),
+            });
+        }
+        Ok(self.workspace_stops.remove(&workspace).is_some())
     }
 
     /// MOD-78 D1: [`State::fence_holds`]'s predicate on a run. `lease_owners` holds a run only
@@ -8699,7 +8825,8 @@ impl WriteStore for MemStore {
     }
 
     async fn delete_workspace(&self, id: WorkspaceId) -> Result<DeleteReach> {
-        self.write(|state| state.delete_workspace(id))
+        let now = self.now();
+        self.write(|state| state.delete_workspace(id, now))
     }
 
     async fn delete_project(&self, id: ProjectId) -> Result<DeleteReach> {
@@ -8761,6 +8888,29 @@ impl WriteStore for MemStore {
         self.check_fault(MemFault::ReleaseLease)?;
         let now = self.now();
         self.write(|state| state.release_lease(run, owner, now))
+    }
+
+    async fn stop_workspace(
+        &self,
+        workspace: WorkspaceId,
+        mode: StopMode,
+        by: UserId,
+        at: DateTime<Utc>,
+    ) -> Result<WorkspaceStop> {
+        self.write(|state| state.stop_workspace(workspace, mode, by, at))
+    }
+
+    async fn workspace_stop(&self, workspace: WorkspaceId) -> Result<Option<WorkspaceStop>> {
+        Ok(self.read(|state| state.workspace_stops.get(&workspace).cloned()))
+    }
+
+    async fn resume_workspace(&self, workspace: WorkspaceId) -> Result<bool> {
+        self.write(|state| state.resume_workspace(workspace))
+    }
+
+    async fn stop_run(&self, run: RunId, owner: Uuid) -> Result<bool> {
+        let now = self.now();
+        self.write(|state| state.stop_run(run, owner, now))
     }
 
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {

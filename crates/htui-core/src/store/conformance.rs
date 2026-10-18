@@ -35,10 +35,10 @@ use crate::model::{
     RunKind, RunMode, RunScope, RunStatus, RunStep, RunStepCommit, RunStepTree, Scope,
     SessionEvent, SettleOutcome, Skill, SkillBindingKey, SkillId, SkillPatch, SkillVersion,
     SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
-    StepOpening, StepOutcome, StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount,
-    Transport, UpstreamEntry, UserId, VerifyOutcome, WaitingCandidate, WaitingPermission,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, canonical_declared_tags,
-    executor_scrub_refusal, missing_tags_failure,
+    StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, TIMESTAMPTZ_DIGITS,
+    ToolCallCount, Transport, UpstreamEntry, UserId, VerifyOutcome, WaitingCandidate,
+    WaitingPermission, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    WorkspaceStop, canonical_declared_tags, executor_scrub_refusal, missing_tags_failure,
 };
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
@@ -224,6 +224,16 @@ pub const CASES: &[&str] = &[
     "clear_queue_setting_removes_the_key_on_every_target",
     "queue_setting_on_a_box_merges_under_edit_version_and_keeps_executor",
     "queue_setting_refuses_a_foreign_key_and_a_bad_value_before_the_row",
+    "stop_workspace_upserts_and_escalates_never_downgrades",
+    "resume_workspace_deletes_and_reports",
+    "stop_run_is_a_fenced_cas_on_running",
+    "a_stopped_run_holds_no_slot_but_still_overlaps",
+    "claim_run_refuses_a_stopped_workspace_and_writes_nothing",
+    "claim_run_checks_the_stop_before_tags",
+    "claim_run_admits_after_resume",
+    "a_run_without_a_workspace_is_never_gated",
+    "adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped",
+    "a_deleted_workspace_unscopes_its_runs_and_drops_its_stop",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -595,6 +605,36 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         }
         "queue_setting_refuses_a_foreign_key_and_a_bad_value_before_the_row" => {
             queue_setting_refuses_a_foreign_key_and_a_bad_value_before_the_row(store).await
+        }
+        "stop_workspace_upserts_and_escalates_never_downgrades" => {
+            stop_workspace_upserts_and_escalates_never_downgrades(store).await;
+        }
+        "resume_workspace_deletes_and_reports" => {
+            resume_workspace_deletes_and_reports(store).await;
+        }
+        "stop_run_is_a_fenced_cas_on_running" => {
+            stop_run_is_a_fenced_cas_on_running(store).await;
+        }
+        "a_stopped_run_holds_no_slot_but_still_overlaps" => {
+            a_stopped_run_holds_no_slot_but_still_overlaps(store).await;
+        }
+        "claim_run_refuses_a_stopped_workspace_and_writes_nothing" => {
+            claim_run_refuses_a_stopped_workspace_and_writes_nothing(store).await;
+        }
+        "claim_run_checks_the_stop_before_tags" => {
+            claim_run_checks_the_stop_before_tags(store).await;
+        }
+        "claim_run_admits_after_resume" => {
+            claim_run_admits_after_resume(store).await;
+        }
+        "a_run_without_a_workspace_is_never_gated" => {
+            a_run_without_a_workspace_is_never_gated(store).await;
+        }
+        "adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped" => {
+            adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped(store).await;
+        }
+        "a_deleted_workspace_unscopes_its_runs_and_drops_its_stop" => {
+            a_deleted_workspace_unscopes_its_runs_and_drops_its_stop(store).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -6933,6 +6973,827 @@ async fn release_lease_frees_the_run_for_its_own_sweep<S: WriteStore>(store: &S)
     assert!(
         matches!(unknown, Err(StoreError::NotFound { entity: "run", .. })),
         "{CASE}: an unknown run is NotFound, got {unknown:?}"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// MOD-125 milestone 1 (plan D4, D5, D6, D7): workspace stops. `stop_workspace`,
+// `workspace_stop` and `resume_workspace` keep the gate's row; `stop_run` halts a run its owner
+// has quiesced; `claim_run` refuses a stopped workspace's run and `adopt_runs` settles one.
+// ------------------------------------------------------------------------------------------
+
+/// MOD-125 D4: `stop_workspace` is an upsert that only ever escalates `graceful -> forced`. A
+/// repeat of the same mode, and anything over `forced`, writes nothing and answers the stored row
+/// with the first request's instant; `workspace_stop` reads back exactly what each call answered.
+/// An unknown workspace is `NotFound`, decided before an unknown user, which is `Constraint`
+/// and writes no row.
+///
+/// The fixture has one user, so the escalation is asserted on the instant and the mode; the
+/// `requested_by` column is pinned by the unknown-user leg and by the stored row's value.
+async fn stop_workspace_upserts_and_escalates_never_downgrades<S: WriteStore>(store: &S) {
+    const CASE: &str = "stop_workspace_upserts_and_escalates_never_downgrades";
+    let workspace = ids::WORKSPACE_PLATFORM;
+    let base = Utc::now();
+    let at = |seconds: i64| base + TimeDelta::seconds(seconds);
+    let truncated = |seconds: i64| at(seconds).trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    assert_eq!(
+        store.workspace_stop(workspace).await.expect(CASE),
+        None,
+        "{CASE}: fixture precondition: the workspace is not stopped"
+    );
+
+    let first = store
+        .stop_workspace(workspace, StopMode::Graceful, ids::USER, at(1))
+        .await
+        .expect(CASE);
+    let graceful = WorkspaceStop {
+        workspace_id: workspace,
+        mode: StopMode::Graceful,
+        requested_by: ids::USER,
+        requested_at: truncated(1),
+    };
+    assert_eq!(
+        first, graceful,
+        "{CASE}: the first request inserts, its instant microsecond-truncated"
+    );
+    assert_eq!(
+        store.workspace_stop(workspace).await.expect(CASE),
+        Some(graceful.clone()),
+        "{CASE}: workspace_stop reads the inserted row"
+    );
+
+    let repeat = store
+        .stop_workspace(workspace, StopMode::Graceful, ids::USER, at(2))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        repeat, graceful,
+        "{CASE}: graceful over graceful writes nothing and keeps the first instant"
+    );
+    assert_eq!(
+        store.workspace_stop(workspace).await.expect(CASE),
+        Some(graceful),
+        "{CASE}: and the stored row is unchanged"
+    );
+
+    let escalated = store
+        .stop_workspace(workspace, StopMode::Forced, ids::USER, at(3))
+        .await
+        .expect(CASE);
+    let forced = WorkspaceStop {
+        workspace_id: workspace,
+        mode: StopMode::Forced,
+        requested_by: ids::USER,
+        requested_at: truncated(3),
+    };
+    assert_eq!(
+        escalated, forced,
+        "{CASE}: forced over graceful escalates, taking this request's values"
+    );
+    assert_eq!(
+        store.workspace_stop(workspace).await.expect(CASE),
+        Some(forced.clone()),
+        "{CASE}: workspace_stop reads the escalation"
+    );
+
+    for (mode, seconds) in [(StopMode::Graceful, 4), (StopMode::Forced, 5)] {
+        let answered = store
+            .stop_workspace(workspace, mode, ids::USER, at(seconds))
+            .await
+            .expect(CASE);
+        assert_eq!(
+            answered, forced,
+            "{CASE}: {mode} over forced writes nothing: a forced stop is never downgraded"
+        );
+        assert_eq!(
+            store.workspace_stop(workspace).await.expect(CASE),
+            Some(forced.clone()),
+            "{CASE}: {mode} over forced left the row as it was"
+        );
+    }
+
+    let unknown = store
+        .stop_workspace(WorkspaceId::new(), StopMode::Graceful, UserId::new(), at(6))
+        .await;
+    assert!(
+        matches!(
+            unknown,
+            Err(StoreError::NotFound {
+                entity: "workspace",
+                ..
+            })
+        ),
+        "{CASE}: an unknown workspace is NotFound, decided before the user, got {unknown:?}"
+    );
+
+    let other = ids::WORKSPACE_GRAPHICS;
+    let stranger = store
+        .stop_workspace(other, StopMode::Forced, UserId::new(), at(7))
+        .await;
+    assert!(
+        matches!(stranger, Err(StoreError::Constraint(_))),
+        "{CASE}: an unknown user is a foreign-key refusal, got {stranger:?}"
+    );
+    assert_eq!(
+        store.workspace_stop(other).await.expect(CASE),
+        None,
+        "{CASE}: the refusal wrote no row"
+    );
+    assert_eq!(
+        store.workspace_stop(WorkspaceId::new()).await.expect(CASE),
+        None,
+        "{CASE}: an unknown workspace has no stop record"
+    );
+}
+
+/// MOD-125 D4: `resume_workspace` deletes the stop record and reports whether there was one; a
+/// workspace that does not exist is `NotFound`, told apart from "not stopped".
+async fn resume_workspace_deletes_and_reports<S: WriteStore>(store: &S) {
+    const CASE: &str = "resume_workspace_deletes_and_reports";
+    let workspace = ids::WORKSPACE_PLATFORM;
+    store
+        .stop_workspace(workspace, StopMode::Graceful, ids::USER, seam_clock())
+        .await
+        .expect(CASE);
+
+    assert!(
+        store.resume_workspace(workspace).await.expect(CASE),
+        "{CASE}: a stopped workspace resumes"
+    );
+    assert_eq!(
+        store.workspace_stop(workspace).await.expect(CASE),
+        None,
+        "{CASE}: and its stop record is gone"
+    );
+    assert!(
+        !store.resume_workspace(workspace).await.expect(CASE),
+        "{CASE}: a second resume finds nothing to delete"
+    );
+    assert!(
+        !store
+            .resume_workspace(ids::WORKSPACE_GRAPHICS)
+            .await
+            .expect(CASE),
+        "{CASE}: a workspace that was never stopped answers false"
+    );
+    let unknown = store.resume_workspace(WorkspaceId::new()).await;
+    assert!(
+        matches!(
+            unknown,
+            Err(StoreError::NotFound {
+                entity: "workspace",
+                ..
+            })
+        ),
+        "{CASE}: an unknown workspace is NotFound, got {unknown:?}"
+    );
+}
+
+/// MOD-125 D7: `stop_run` is a compare-and-set `running -> stopped` fenced on the lease owner.
+/// It stops the run's `running` steps, leaves `pending` and `done` ones alone, releases the lease
+/// as `release_lease` does, and stamps no `finished_at` and no item move. A stranger, a second
+/// call and a parked run all answer `false` and write nothing.
+async fn stop_run_is_a_fenced_cas_on_running<S: WriteStore>(store: &S) {
+    const CASE: &str = "stop_run_is_a_fenced_cas_on_running";
+    let (owner, stranger) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let run = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: the owner claims the run"
+    );
+
+    let specs = [
+        new_run_step(run, 0, 0, 0),
+        new_run_step(run, 1, 0, 0),
+        new_run_step(run, 0, 0, 1),
+    ];
+    let [running, pending, done] = specs.each_ref().map(|spec| spec.id);
+    for spec in specs {
+        store.create_step(spec).await.expect(CASE);
+    }
+    for (step, moves) in [
+        (running, &[(StepStatus::Pending, StepStatus::Running)][..]),
+        (
+            done,
+            &[
+                (StepStatus::Pending, StepStatus::Running),
+                (StepStatus::Running, StepStatus::Done),
+            ][..],
+        ),
+    ] {
+        for (from, to) in moves {
+            assert!(
+                store
+                    .transition_step(step, *from, *to, at)
+                    .await
+                    .expect(CASE),
+                "{CASE}: {from} -> {to} is a sanctioned move"
+            );
+        }
+    }
+
+    let before = run_row(CASE, store, run).await;
+    let steps_before = store.run_steps(run).await.expect(CASE);
+    assert!(
+        !store.stop_run(run, stranger).await.expect(CASE),
+        "{CASE}: a stranger's stop is refused"
+    );
+    assert_eq!(
+        run_row(CASE, store, run).await,
+        before,
+        "{CASE}: the refusal wrote nothing to the run"
+    );
+    assert_eq!(
+        store.run_steps(run).await.expect(CASE),
+        steps_before,
+        "{CASE}: nor to its steps"
+    );
+
+    assert!(
+        store.stop_run(run, owner).await.expect(CASE),
+        "{CASE}: the owner stops its running run"
+    );
+    let stopped = run_row(CASE, store, run).await;
+    assert_eq!(
+        stopped.status,
+        RunStatus::Stopped,
+        "{CASE}: the run is stopped"
+    );
+    assert_eq!(
+        stopped.finished_at, None,
+        "{CASE}: a stopped run is live: no finished_at"
+    );
+    assert_eq!(
+        (stopped.executing_box_id, stopped.lease_box_id),
+        (Some(ids::BOX), Some(ids::BOX)),
+        "{CASE}: the executing box and the lease's box are kept"
+    );
+    assert_leased_for(
+        CASE,
+        &stopped,
+        TimeDelta::zero(),
+        "the lease is released at the store's now",
+    );
+    assert!(
+        !store.refresh_lease(run, owner, LEASE).await.expect(CASE),
+        "{CASE}: the owner is cleared, so its heartbeat matches no row"
+    );
+    assert_eq!(
+        step_row(CASE, store, run, running).await.status,
+        StepStatus::Stopped,
+        "{CASE}: the running step is stopped"
+    );
+    for (step, what) in [(pending, "pending"), (done, "done")] {
+        let row = step_row(CASE, store, run, step).await;
+        let old = steps_before
+            .iter()
+            .find(|old| old.id == step)
+            .unwrap_or_else(|| panic!("{CASE}: the {what} step was read before"));
+        assert_eq!(&row, old, "{CASE}: the {what} step is untouched");
+    }
+    assert_eq!(
+        item_row(CASE, store, ids::HTUI_ANA_2).await.status,
+        Status::InProgress,
+        "{CASE}: the item stays in progress"
+    );
+
+    assert!(
+        !store.stop_run(run, owner).await.expect(CASE),
+        "{CASE}: a second stop finds no running run of the owner's"
+    );
+    assert_eq!(
+        run_row(CASE, store, run).await,
+        stopped,
+        "{CASE}: and writes nothing"
+    );
+
+    let parked = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_CLEAN_1, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    assert_eq!(
+        store
+            .claim_run(parked, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: the owner claims a second run (the stopped one holds no slot)"
+    );
+    assert!(
+        store
+            .transition_run(parked, RunStatus::Running, RunStatus::AwaitingApproval, at)
+            .await
+            .expect(CASE),
+        "{CASE}: the second run parks at a gate"
+    );
+    let parked_before = run_row(CASE, store, parked).await;
+    assert!(
+        !store.stop_run(parked, owner).await.expect(CASE),
+        "{CASE}: a parked run is not running, so it is not stopped"
+    );
+    assert_eq!(
+        run_row(CASE, store, parked).await,
+        parked_before,
+        "{CASE}: and the refusal wrote nothing"
+    );
+
+    let unknown = store.stop_run(RunId::new(), owner).await;
+    assert!(
+        matches!(unknown, Err(StoreError::NotFound { entity: "run", .. })),
+        "{CASE}: an unknown run is NotFound, got {unknown:?}"
+    );
+}
+
+/// MOD-125 D2: a `stopped` run consumes no compute, so it holds no slot, but it keeps its trees
+/// and its branch, so it still refuses an overlapping scope (ANA-2 §4.7, invariant 6), as a
+/// parked run does in `claim_run_admits_one_and_refuses_the_second`.
+async fn a_stopped_run_holds_no_slot_but_still_overlaps<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_stopped_run_holds_no_slot_but_still_overlaps";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let repo = store
+        .create_repo(new_repo(ids::PROJECT_HTUI, "core", true))
+        .await
+        .expect(CASE)
+        .id;
+    let mut runs = Vec::new();
+    for (item, scope) in [
+        (ids::HTUI_ANA_2, vec![repo]),
+        (ids::HTUI_CLEAN_1, Vec::new()),
+        (mint_tagged(CASE, store, "Free", &[]).await, Vec::new()),
+        (
+            mint_tagged(CASE, store, "Overlapping", &[]).await,
+            vec![repo],
+        ),
+    ] {
+        runs.push(
+            store
+                .create_run(new_run(ids::PROJECT_HTUI, item, scope))
+                .await
+                .expect(CASE)
+                .id,
+        );
+    }
+    let [a, b, c, d] = runs[..] else {
+        panic!("{CASE}: four runs were queued")
+    };
+    for run in [a, b] {
+        assert_eq!(
+            store
+                .claim_run(run, ids::BOX, owner, at, LEASE)
+                .await
+                .expect(CASE),
+            Claim::Admitted,
+            "{CASE}: A and B take the box's two slots"
+        );
+    }
+    assert_eq!(
+        DEFAULT_MAX_CONCURRENT_ITEMS, 2,
+        "{CASE}: the legs below read as they do because the default is two"
+    );
+    assert_eq!(
+        store
+            .claim_run(c, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::SlotFull {
+            running: 2,
+            limit: 2
+        },
+        "{CASE}: control: the box is full while A runs"
+    );
+
+    assert!(
+        store.stop_run(a, owner).await.expect(CASE),
+        "{CASE}: A is stopped"
+    );
+    assert_eq!(
+        store
+            .claim_run(d, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::Overlaps {
+            with: a,
+            rule: OverlapRule::NotIsolated
+        },
+        "{CASE}: a stopped run still holds the trees of its repo_scope"
+    );
+    assert_eq!(
+        store
+            .claim_run(c, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: but it holds no slot, so the box that was full has one free"
+    );
+}
+
+/// A queued graph run of `item` started from `workspace`, as `new_run` builds it otherwise.
+async fn create_scoped_run<S: WriteStore>(
+    case: &str,
+    store: &S,
+    item: ItemId,
+    workspace: Option<WorkspaceId>,
+) -> RunId {
+    store
+        .create_run(NewRun {
+            workspace_id: workspace,
+            ..new_run(ids::PROJECT_HTUI, item, Vec::new())
+        })
+        .await
+        .expect(case)
+        .id
+}
+
+/// MOD-125 D5: `claim_run` refuses a run whose workspace is stopped with
+/// [`Claim::WorkspaceStopped`] and writes nothing: the run stays `queued` with no lease and no
+/// executing box, and its item stays `queued`. The gate sits right after `NotClaimable`, so a run
+/// of the stopped workspace that already runs is still `NotClaimable`, and the run and the box are
+/// still looked up first.
+async fn claim_run_refuses_a_stopped_workspace_and_writes_nothing<S: WriteStore>(store: &S) {
+    const CASE: &str = "claim_run_refuses_a_stopped_workspace_and_writes_nothing";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let workspace = ids::WORKSPACE_PLATFORM;
+    let running = create_scoped_run(CASE, store, ids::HTUI_CLEAN_1, Some(workspace)).await;
+    assert_eq!(
+        store
+            .claim_run(running, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: a run of the workspace starts before the stop"
+    );
+    let queued = create_scoped_run(CASE, store, ids::HTUI_ANA_2, Some(workspace)).await;
+    store
+        .stop_workspace(workspace, StopMode::Graceful, ids::USER, at)
+        .await
+        .expect(CASE);
+
+    let before = run_row(CASE, store, queued).await;
+    assert_eq!(
+        store
+            .claim_run(queued, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::WorkspaceStopped { workspace },
+        "{CASE}: a stopped workspace's queued run is refused by name"
+    );
+    let after = run_row(CASE, store, queued).await;
+    assert_eq!(
+        after, before,
+        "{CASE}: the refusal wrote nothing to the run"
+    );
+    assert_eq!(
+        (
+            after.status,
+            after.executing_box_id,
+            after.lease_box_id,
+            after.lease_expires_at
+        ),
+        (RunStatus::Queued, None, None, None),
+        "{CASE}: the run is still queued, unclaimed and unleased"
+    );
+    assert_eq!(
+        item_row(CASE, store, ids::HTUI_ANA_2).await.status,
+        Status::Queued,
+        "{CASE}: nor to its item"
+    );
+
+    assert_eq!(
+        store
+            .claim_run(running, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::NotClaimable,
+        "{CASE}: claimability is decided before the workspace stop"
+    );
+    let no_box = store
+        .claim_run(queued, BoxId::new(), owner, at, LEASE)
+        .await;
+    assert!(
+        matches!(no_box, Err(StoreError::NotFound { entity: "box", .. })),
+        "{CASE}: the box is looked up before the workspace stop, got {no_box:?}"
+    );
+}
+
+/// MOD-125 D5: the workspace gate is decided before `R-ORCH-10`'s tags, so a stopped workspace
+/// never fails a run for its tags: the run stays `queued` and its item `queued` (no `MissingTags`
+/// write). After the resume, the same claim meets the tags.
+async fn claim_run_checks_the_stop_before_tags<S: WriteStore>(store: &S) {
+    const CASE: &str = "claim_run_checks_the_stop_before_tags";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let workspace = ids::WORKSPACE_PLATFORM;
+    let item = mint_tagged(CASE, store, "Tagged", &["vulkan"]).await;
+    let run = create_scoped_run(CASE, store, item, Some(workspace)).await;
+    store
+        .stop_workspace(workspace, StopMode::Forced, ids::USER, at)
+        .await
+        .expect(CASE);
+
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::WorkspaceStopped { workspace },
+        "{CASE}: the stop is decided before the missing tag"
+    );
+    let row = run_row(CASE, store, run).await;
+    assert_eq!(
+        (row.status, row.failure, row.finished_at),
+        (RunStatus::Queued, None, None),
+        "{CASE}: the run is not failed for its tags"
+    );
+    assert_eq!(
+        item_row(CASE, store, item).await.status,
+        Status::Queued,
+        "{CASE}: and its item is not blocked"
+    );
+
+    assert!(
+        store.resume_workspace(workspace).await.expect(CASE),
+        "{CASE}: the workspace resumes"
+    );
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::MissingTags {
+            missing: tags(&["vulkan"])
+        },
+        "{CASE}: after the resume the claim meets the tags"
+    );
+}
+
+/// MOD-125 D5: the refusal is transient. Once the workspace resumes, the same queued run is
+/// admitted as `claim_run_admits_one_and_refuses_the_second` admits one: running on the box, the
+/// lease the store's clock plus the TTL, and the item in progress.
+async fn claim_run_admits_after_resume<S: WriteStore>(store: &S) {
+    const CASE: &str = "claim_run_admits_after_resume";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let workspace = ids::WORKSPACE_PLATFORM;
+    let run = create_scoped_run(CASE, store, ids::HTUI_ANA_2, Some(workspace)).await;
+    store
+        .stop_workspace(workspace, StopMode::Graceful, ids::USER, at)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::WorkspaceStopped { workspace },
+        "{CASE}: refused while the workspace is stopped"
+    );
+    assert!(
+        store.resume_workspace(workspace).await.expect(CASE),
+        "{CASE}: the workspace resumes"
+    );
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: the resumed workspace's run is admitted"
+    );
+    let claimed = run_row(CASE, store, run).await;
+    assert_eq!(
+        (claimed.status, claimed.executing_box_id, claimed.started_at),
+        (RunStatus::Running, Some(ids::BOX), Some(at)),
+        "{CASE}: the run started on the box at the caller's clock"
+    );
+    assert_eq!(
+        claimed.lease_box_id,
+        Some(ids::BOX),
+        "{CASE}: the lease names the box"
+    );
+    assert_leased_for(CASE, &claimed, LEASE, "the lease runs its TTL");
+    assert!(
+        store.refresh_lease(run, owner, LEASE).await.expect(CASE),
+        "{CASE}: the lease is the claimant's"
+    );
+    assert_eq!(
+        item_row(CASE, store, ids::HTUI_ANA_2).await.status,
+        Status::InProgress,
+        "{CASE}: the item moved queued -> in_progress with the claim"
+    );
+}
+
+/// MOD-125 D5, D6: a run with no workspace (a chat-free, unscoped graph run) is never gated:
+/// with every fixture workspace stopped it is admitted, and once its lease is released it is
+/// adopted, not settled.
+async fn a_run_without_a_workspace_is_never_gated<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_run_without_a_workspace_is_never_gated";
+    let (x, y) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    for workspace in [ids::WORKSPACE_PLATFORM, ids::WORKSPACE_GRAPHICS] {
+        store
+            .stop_workspace(workspace, StopMode::Forced, ids::USER, at)
+            .await
+            .expect(CASE);
+    }
+    let run = create_scoped_run(CASE, store, ids::HTUI_ANA_2, None).await;
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, x, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: a run with no workspace is admitted while every workspace is stopped"
+    );
+    assert!(
+        store.release_lease(run, x).await.expect(CASE),
+        "{CASE}: X gives the lease back"
+    );
+    let adopted = store.adopt_runs(ids::BOX, y, LEASE).await.expect(CASE);
+    assert_eq!(
+        adopted.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![run],
+        "{CASE}: the abandoned run is adopted, not settled"
+    );
+    assert_eq!(
+        run_row(CASE, store, run).await.status,
+        RunStatus::Running,
+        "{CASE}: and it is still running"
+    );
+}
+
+/// MOD-125 D6: the sweep settles a stopped workspace's abandoned run instead of adopting it. In
+/// the sweep's own write the run moves `running -> stopped` with its `running` step, its lease is
+/// released as `release_lease` releases it, and it is left out of the answer; an unscoped run
+/// abandoned beside it is adopted as before. A second sweep finds nothing.
+async fn adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped<S: WriteStore>(
+    store: &S,
+) {
+    const CASE: &str = "adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped";
+    let (x, y) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let workspace = ids::WORKSPACE_PLATFORM;
+    let a = create_scoped_run(CASE, store, ids::HTUI_ANA_2, Some(workspace)).await;
+    let b = create_scoped_run(CASE, store, ids::HTUI_CLEAN_1, None).await;
+    for run in [a, b] {
+        assert_eq!(
+            store
+                .claim_run(run, ids::BOX, x, at, LEASE)
+                .await
+                .expect(CASE),
+            Claim::Admitted,
+            "{CASE}: X claims A and B"
+        );
+    }
+    let specs = [new_run_step(a, 0, 0, 0), new_run_step(a, 1, 0, 0)];
+    let [done, running] = specs.each_ref().map(|spec| spec.id);
+    for spec in specs {
+        store.create_step(spec).await.expect(CASE);
+    }
+    for (step, from, to) in [
+        (done, StepStatus::Pending, StepStatus::Running),
+        (done, StepStatus::Running, StepStatus::Done),
+        (running, StepStatus::Pending, StepStatus::Running),
+    ] {
+        assert!(
+            store.transition_step(step, from, to, at).await.expect(CASE),
+            "{CASE}: {from} -> {to} is a sanctioned move"
+        );
+    }
+    let done_before = step_row(CASE, store, a, done).await;
+
+    store
+        .stop_workspace(workspace, StopMode::Graceful, ids::USER, at)
+        .await
+        .expect(CASE);
+    for run in [a, b] {
+        assert!(
+            store.release_lease(run, x).await.expect(CASE),
+            "{CASE}: X abandons its lease"
+        );
+    }
+
+    let adopted = store.adopt_runs(ids::BOX, y, LEASE).await.expect(CASE);
+    assert_eq!(
+        adopted.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![b],
+        "{CASE}: only the unscoped run is adopted"
+    );
+    let settled = run_row(CASE, store, a).await;
+    assert_eq!(
+        settled.status,
+        RunStatus::Stopped,
+        "{CASE}: the stopped workspace's run is settled as stopped"
+    );
+    assert!(
+        settled.lease_expires_at.is_some(),
+        "{CASE}: the released lease keeps its expiry"
+    );
+    assert_eq!(
+        settled.finished_at, None,
+        "{CASE}: a stopped run is live: no finished_at"
+    );
+    assert_eq!(
+        (settled.executing_box_id, settled.lease_box_id),
+        (Some(ids::BOX), Some(ids::BOX)),
+        "{CASE}: the executing box and the lease's box are kept"
+    );
+    for owner in [y, x] {
+        assert!(
+            !store.refresh_lease(a, owner, LEASE).await.expect(CASE),
+            "{CASE}: nobody holds the settled run's lease"
+        );
+    }
+    assert_eq!(
+        step_row(CASE, store, a, running).await.status,
+        StepStatus::Stopped,
+        "{CASE}: its running step is stopped"
+    );
+    assert_eq!(
+        step_row(CASE, store, a, done).await,
+        done_before,
+        "{CASE}: its done step is untouched"
+    );
+    assert_eq!(
+        item_row(CASE, store, ids::HTUI_ANA_2).await.status,
+        Status::InProgress,
+        "{CASE}: the item stays in progress"
+    );
+    assert!(
+        store.refresh_lease(b, y, LEASE).await.expect(CASE),
+        "{CASE}: the adopted run is Y's"
+    );
+
+    assert!(
+        store
+            .adopt_runs(ids::BOX, Uuid::now_v7(), LEASE)
+            .await
+            .expect(CASE)
+            .is_empty(),
+        "{CASE}: a second sweep finds nothing: A is stopped and B is leased"
+    );
+    assert_eq!(
+        run_row(CASE, store, a).await,
+        settled,
+        "{CASE}: and leaves the settled run as it was"
+    );
+}
+
+/// MOD-125 F16: deleting a workspace sets `run.workspace_id` to `NULL` on its runs (`ON DELETE SET
+/// NULL`) and takes its stop record (`ON DELETE CASCADE`), so a run the stopped workspace held
+/// back is claimable once the workspace is gone.
+async fn a_deleted_workspace_unscopes_its_runs_and_drops_its_stop<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_deleted_workspace_unscopes_its_runs_and_drops_its_stop";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let workspace = store
+        .create_workspace(new_workspace("doomed"))
+        .await
+        .expect(CASE)
+        .id;
+    let run = create_scoped_run(CASE, store, ids::HTUI_ANA_2, Some(workspace)).await;
+    store
+        .stop_workspace(workspace, StopMode::Forced, ids::USER, at)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::WorkspaceStopped { workspace },
+        "{CASE}: control: the stopped workspace holds its run back"
+    );
+
+    store.delete_workspace(workspace).await.expect(CASE);
+    assert_eq!(
+        run_row(CASE, store, run).await.workspace_id,
+        None,
+        "{CASE}: the run outlives its workspace, unscoped"
+    );
+    assert_eq!(
+        store.workspace_stop(workspace).await.expect(CASE),
+        None,
+        "{CASE}: the stop record went with the workspace"
+    );
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: and the unscoped run is admitted"
     );
 }
 

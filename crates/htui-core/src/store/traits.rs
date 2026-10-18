@@ -68,8 +68,8 @@ use crate::model::{
     RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding,
     SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId,
     StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus,
-    ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
 };
 use crate::prompt::settings::{Rungs, SettingKey};
 use crate::prompt::template::{TemplateRole, parse};
@@ -1255,8 +1255,10 @@ pub trait WriteStore: ReadStore {
     /// ANA-2 §4.7's admission, one transaction, answered as a [`Claim`] (plan D83).
     ///
     /// The decision order: `NotFound` for the run, then the box; [`Claim::NotClaimable`] when the
-    /// run is not `queued` or its `target_box_id` is not `box_id`; [`Claim::MissingTags`] when the
-    /// run's item requires a tag in neither the box's `probed_tags` nor its `declared_tags`
+    /// run is not `queued` or its `target_box_id` is not `box_id`; then
+    /// [`Claim::WorkspaceStopped`] when the run's `workspace_id` names a workspace with a
+    /// `workspace_stop` row (MOD-125 D5; nothing written, the run stays `queued`; a run with no
+    /// workspace is never gated); [`Claim::MissingTags`] when the run's item requires a tag in neither the box's `probed_tags` nor its `declared_tags`
     /// (`R-ORCH-10`, MOD-7 milestone 3 D80, D81: exact bytes, the missing tags in byte order and
     /// deduplicated; a run with no item has none); [`Claim::SlotFull`] when the box already runs
     /// its limit of **`running`** runs
@@ -1280,7 +1282,7 @@ pub trait WriteStore: ReadStore {
     /// with `failure` = [`missing_tags_failure`](crate::model::missing_tags_failure) of the list
     /// and `finished_at = at`, and its item `queued -> blocked`, in the same transaction;
     /// `executing_box_id`, `started_at` and the lease stay unset, so no slot is taken. Every other
-    /// answer writes nothing.
+    /// answer writes nothing, [`Claim::WorkspaceStopped`] included.
     ///
     /// `at` is the caller's clock, like every other stamp of the run's timeline; only the lease is
     /// the store's, because only the lease is compared by another process (MOD-40 blueprint B25).
@@ -1322,6 +1324,12 @@ pub trait WriteStore: ReadStore {
     ///
     /// **Never** a run whose `lease_owner` is `owner` (plan D88): a process whose heartbeat
     /// stalled past its TTL must not adopt its own live walk and run it twice under one owner.
+    ///
+    /// MOD-125 D6: a candidate whose `workspace_id` has a `workspace_stop` row is **settled, not
+    /// adopted**. In the same transaction it moves `running -> stopped` with every `running` step,
+    /// its lease is released as [`release_lease`](WriteStore::release_lease) releases it, and it
+    /// is left out of the answer. On Postgres a candidate whose running step another transaction
+    /// holds is deferred to a later sweep, neither settled nor adopted (step-then-run lock order).
     ///
     /// # Errors
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a `ttl` out of range;
@@ -1373,6 +1381,55 @@ pub trait WriteStore: ReadStore {
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }`, told
     /// apart from "not ours" by one follow-up read.
     async fn release_lease(&self, run: RunId, owner: Uuid) -> Result<bool>;
+
+    // ---- MOD-125 M1 (plan D4, D7): workspace stops ---------------------------------------------
+
+    /// MOD-125 D4: records that `workspace` is stopped and answers the record as stored. An upsert
+    /// on `workspace_stop`'s key, decided in this order: an unknown workspace is `NotFound`, an
+    /// unknown `by` is `Constraint`; no row inserts one (`mode`, `requested_by = by`,
+    /// `requested_at = at`); a `graceful` row asked `forced` **escalates**, all three columns
+    /// taking this request's values; every other repeat (`graceful` over `graceful`, anything over
+    /// `forced`) writes nothing and answers the stored row, so a forced stop is never downgraded
+    /// and the first request's instant is kept. Moves no run: the executors apply the stop (M2).
+    /// `at` is the caller's clock, microsecond-truncated.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "workspace" }`;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for an unknown user.
+    async fn stop_workspace(
+        &self,
+        workspace: WorkspaceId,
+        mode: StopMode,
+        by: UserId,
+        at: DateTime<Utc>,
+    ) -> Result<WorkspaceStop>;
+
+    /// MOD-125 D4: the workspace's stop record; `None` when it is not stopped, or does not exist.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn workspace_stop(&self, workspace: WorkspaceId) -> Result<Option<WorkspaceStop>>;
+
+    /// MOD-125 D4: deletes the workspace's stop record; `Ok(true)` when one existed, `Ok(false)`
+    /// when the workspace was not stopped. Moves no run: a queued run starts at its next claim,
+    /// and a stopped run is resumed by M3.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "workspace" }`, told
+    /// apart from "not stopped" by one follow-up read.
+    async fn resume_workspace(&self, workspace: WorkspaceId) -> Result<bool>;
+
+    /// MOD-125 D7: a compare-and-set `running -> stopped` on a run whose `lease_owner` is `owner`.
+    /// In one transaction every `running` step of the run moves to `stopped` and the lease is
+    /// released as [`release_lease`](WriteStore::release_lease) releases it (`lease_owner = NULL`,
+    /// `lease_expires_at = <store now>`, `lease_box_id` and `executing_box_id` kept). No
+    /// `finished_at`, no item write. `Ok(false)` when the run is not `running` or not `owner`'s;
+    /// nothing is written then. The caller has quiesced its walk (M2): a step it starts
+    /// concurrently is not this verb's to stop.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }`, read first.
+    async fn stop_run(&self, run: RunId, owner: Uuid) -> Result<bool>;
 
     /// Inserts a step at `pending`. `fanout_index = -1` is the judge and is accepted.
     ///

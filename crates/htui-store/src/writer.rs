@@ -39,8 +39,9 @@ use htui_core::model::{
     RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill,
     SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
     StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
-    StepStatus, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission,
-    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    StepStatus, StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
+    WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    WorkspaceStop,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{
@@ -987,6 +988,40 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.release_lease(run, owner).await,
             Self::Online(pg) => pg.release_lease(run, owner).await,
+        }
+    }
+
+    async fn stop_workspace(
+        &self,
+        workspace: WorkspaceId,
+        mode: StopMode,
+        by: UserId,
+        at: DateTime<Utc>,
+    ) -> Result<WorkspaceStop> {
+        match self {
+            Self::Memory(store) => store.stop_workspace(workspace, mode, by, at).await,
+            Self::Online(pg) => pg.stop_workspace(workspace, mode, by, at).await,
+        }
+    }
+
+    async fn workspace_stop(&self, workspace: WorkspaceId) -> Result<Option<WorkspaceStop>> {
+        match self {
+            Self::Memory(store) => store.workspace_stop(workspace).await,
+            Self::Online(pg) => pg.workspace_stop(workspace).await,
+        }
+    }
+
+    async fn resume_workspace(&self, workspace: WorkspaceId) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.resume_workspace(workspace).await,
+            Self::Online(pg) => pg.resume_workspace(workspace).await,
+        }
+    }
+
+    async fn stop_run(&self, run: RunId, owner: Uuid) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.stop_run(run, owner).await,
+            Self::Online(pg) => pg.stop_run(run, owner).await,
         }
     }
 

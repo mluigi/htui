@@ -7073,6 +7073,158 @@ async fn upsert_step_tree_takes_the_step_first() {
     db.drop_db().await;
 }
 
+/// MOD-125 D7 (blueprint F5): `stop_run` is the first writer that updates a run **and** its
+/// steps, so it takes MOD-77's step → run order: it waits on a held running step holding nothing
+/// on the run (a park holding the step then takes the run without `40P01`), then lands and stops
+/// both.
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_run_takes_the_steps_first() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (run, step, owner) = leased_running_step(&db).await;
+    let store = db.store.clone();
+    let answer =
+        assert_takes_the_step_first(
+            &db,
+            run,
+            step,
+            async move { store.stop_run(run, owner).await },
+        )
+        .await;
+    assert!(
+        answer.expect("the stop lands"),
+        "the owner's running run stops"
+    );
+    let (run_status, step_status): (String, String) = sqlx::query_as(
+        "SELECT r.status, s.status FROM run r JOIN run_step s ON s.run_id = r.id WHERE s.id = $1",
+    )
+    .bind(step.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("read the statuses");
+    assert_eq!(
+        (run_status.as_str(), step_status.as_str()),
+        ("stopped", "stopped"),
+        "the run and its running step are stopped together"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-125 D6 (blueprint F5, risk R3): the sweep locks a stopped workspace's running steps with
+/// `SKIP LOCKED` before its runs, so a run whose step another transaction holds is **deferred**:
+/// the sweep answers promptly, neither settling nor adopting it, and the next sweep after the
+/// holder commits settles it as `stopped`.
+#[tokio::test(flavor = "multi_thread")]
+async fn adopt_runs_defers_a_stopped_run_whose_step_is_held() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (x, y) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    let lease = TimeDelta::minutes(30);
+    let run = db
+        .store
+        .create_run(NewRun {
+            workspace_id: Some(ids::WORKSPACE_PLATFORM),
+            ..race_run(ids::HTUI_ANA_2)
+        })
+        .await
+        .expect("queue a scoped graph run")
+        .id;
+    assert_eq!(
+        db.store
+            .claim_run(run, ids::BOX, x, Utc::now(), lease)
+            .await
+            .expect("claim the run"),
+        Claim::Admitted,
+        "X leases the run"
+    );
+    let step = db
+        .store
+        .create_step(htui_core::model::NewRunStep {
+            id: StepId::new(),
+            run_id: run,
+            position: 0,
+            attempt: 1,
+            fanout_index: 0,
+            phase_name: "implement".to_owned(),
+            agent_id: Some(ids::AGENT_CLAUDE),
+            model: None,
+        })
+        .await
+        .expect("create the step")
+        .id;
+    assert!(
+        db.store
+            .transition_step(
+                step,
+                htui_core::model::StepStatus::Pending,
+                htui_core::model::StepStatus::Running,
+                Utc::now(),
+            )
+            .await
+            .expect("start the step"),
+        "the step starts"
+    );
+    db.store
+        .stop_workspace(
+            ids::WORKSPACE_PLATFORM,
+            htui_core::model::StopMode::Graceful,
+            ids::USER,
+            Utc::now(),
+        )
+        .await
+        .expect("stop the workspace");
+    assert!(
+        db.store.release_lease(run, x).await.expect("release"),
+        "X abandons the run"
+    );
+
+    let mut holder = db.pool.begin().await.expect("begin the holder");
+    sqlx::query("SELECT 1 FROM run_step WHERE id = $1 FOR UPDATE")
+        .bind(step.as_uuid())
+        .fetch_one(&mut *holder)
+        .await
+        .expect("the holder locks the step");
+    let swept = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        db.store.adopt_runs(ids::BOX, y, lease),
+    )
+    .await
+    .expect("the sweep never waits on the held step")
+    .expect("the sweep answers");
+    assert!(swept.is_empty(), "the deferred run is not adopted");
+    let status: String = sqlx::query_scalar("SELECT status FROM run WHERE id = $1")
+        .bind(run.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read the run");
+    assert_eq!(status, "running", "nor settled while its step is held");
+    holder.commit().await.expect("the holder commits");
+
+    let swept = db
+        .store
+        .adopt_runs(ids::BOX, y, lease)
+        .await
+        .expect("the next sweep answers");
+    assert!(swept.is_empty(), "the settled run is not adopted either");
+    let (run_status, step_status): (String, String) = sqlx::query_as(
+        "SELECT r.status, s.status FROM run r JOIN run_step s ON s.run_id = r.id WHERE s.id = $1",
+    )
+    .bind(step.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("read the statuses");
+    assert_eq!(
+        (run_status.as_str(), step_status.as_str()),
+        ("stopped", "stopped"),
+        "the next sweep settles the run and its step"
+    );
+
+    db.drop_db().await;
+}
+
 /// MOD-77 plan D1: `record_commits` waits on a held step holding nothing on its run, then lands.
 #[tokio::test(flavor = "multi_thread")]
 async fn record_commits_takes_the_step_first() {

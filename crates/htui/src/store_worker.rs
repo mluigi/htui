@@ -373,6 +373,8 @@ pub enum StoreRequest {
     QueueItem {
         /// The item.
         item: ItemId,
+        /// The scope's workspace, recorded on the entry (MOD-125 D3).
+        workspace: WorkspaceId,
     },
     /// MOD-12 D9: take `item` out of the queue; never cancels a run. [`StoreReply::QueueWritten`].
     DequeueItem {
@@ -2417,9 +2419,11 @@ async fn serve_queue(backend: &Backend, request: &StoreRequest) -> StoreResult<S
         StoreRequest::QueueState => {
             return Ok(StoreReply::Queue(queue_view(backend, box_id).await?));
         }
-        StoreRequest::QueueItem { item } => {
+        StoreRequest::QueueItem { item, workspace } => {
             let user = backend.this_user().await?;
-            let entry = backend.queue_item(*item, box_id, None, user, now()).await?;
+            let entry = backend
+                .queue_item(*item, box_id, Some(*workspace), user, now())
+                .await?;
             // D1: an item is queued on at most one box, and an existing entry is kept as it is.
             // One on another box is not this box's to report as queued (review L1); dequeueing
             // it from here is the M3 overlay's (D11).
@@ -5225,6 +5229,7 @@ mod tests {
                 StoreRequest::QueueState.name(),
                 StoreRequest::QueueItem {
                     item: ids::HTUI_ANA_2,
+                    workspace: ids::WORKSPACE_PLATFORM,
                 }
                 .name(),
                 StoreRequest::DequeueItem {
@@ -5462,6 +5467,38 @@ mod tests {
         assert!(view.open_batch.is_some_and(|batch| batch != open));
     }
 
+    /// MOD-125 D3: `QueueItem` records the scope's workspace on the entry it writes, so the run
+    /// `admit` creates from it is gated by that workspace's stop.
+    #[tokio::test]
+    async fn queue_item_records_the_scope_workspace() {
+        let store = MemStore::demo();
+        let backend = Backend::memory(store.clone());
+        let (write, view) = written(
+            &backend,
+            StoreRequest::QueueItem {
+                item: ids::HTUI_ANA_2,
+                workspace: ids::WORKSPACE_PLATFORM,
+            },
+        )
+        .await;
+        assert_eq!(
+            write,
+            QueueWrite::Queued {
+                item: ids::HTUI_ANA_2
+            }
+        );
+        assert!(view.entries.contains(&ids::HTUI_ANA_2), "{view:?}");
+        let entries = store.queue_entries(ids::BOX).await.expect("reads");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.item_id, entry.workspace_id))
+                .collect::<Vec<_>>(),
+            [(ids::HTUI_ANA_2, Some(ids::WORKSPACE_PLATFORM))],
+            "the entry carries the workspace the request named"
+        );
+    }
+
     /// MOD-12 D9 (review L1): an item queued on another box stays there (one box per item, D1),
     /// so `Q` from this box is refused with where to dequeue it rather than answered `Queued`
     /// with a count that leaves it out. This box's view still lacks it.
@@ -5484,6 +5521,7 @@ mod tests {
             &backend,
             &StoreRequest::QueueItem {
                 item: ids::HTUI_ANA_2,
+                workspace: ids::WORKSPACE_PLATFORM,
             },
         )
         .await

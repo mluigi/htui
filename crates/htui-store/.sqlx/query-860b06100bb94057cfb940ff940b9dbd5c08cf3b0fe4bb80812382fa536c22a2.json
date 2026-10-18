@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT workspace_id AS \"workspace_id: WorkspaceId\"\n                  FROM workspace_stop WHERE workspace_id = ANY($1::uuid[]) FOR SHARE\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "workspace_id: WorkspaceId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "workspace_stop",
+            "name": "workspace_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "860b06100bb94057cfb940ff940b9dbd5c08cf3b0fe4bb80812382fa536c22a2"
+}

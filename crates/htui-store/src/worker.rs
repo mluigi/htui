@@ -21,7 +21,7 @@ use htui_core::model::{
     ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus, RunStep,
     RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Status,
     StepGraphId, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, UpstreamEntry,
-    UserId, WorkspaceSummary,
+    UserId, WorkspaceId, WorkspaceStop, WorkspaceSummary,
 };
 use htui_core::store::{ParkOutcome, ReadStore, Result, StepFence, WriteStore};
 use serde_json::Value;
@@ -184,6 +184,9 @@ impl htui_core::store::WorkerStore for PgStore {
     async fn relay_view(&self, item: ItemId) -> Result<htui_core::model::RelayView> {
         WriteStore::relay_view(self, item).await
     }
+    async fn workspace_stop(&self, workspace: WorkspaceId) -> Result<Option<WorkspaceStop>> {
+        WriteStore::workspace_stop(self, workspace).await
+    }
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool> {
         WriteStore::transition(self, id, from, to).await
     }
@@ -226,6 +229,9 @@ impl htui_core::store::WorkerStore for PgStore {
     }
     async fn release_lease(&self, run: RunId, owner: Uuid) -> Result<bool> {
         WriteStore::release_lease(self, run, owner).await
+    }
+    async fn stop_run(&self, run: RunId, owner: Uuid) -> Result<bool> {
+        WriteStore::stop_run(self, run, owner).await
     }
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {
         WriteStore::create_step(self, new).await
@@ -565,6 +571,9 @@ impl htui_core::store::WorkerStore for Writer {
     async fn relay_view(&self, item: ItemId) -> Result<htui_core::model::RelayView> {
         WriteStore::relay_view(self, item).await
     }
+    async fn workspace_stop(&self, workspace: WorkspaceId) -> Result<Option<WorkspaceStop>> {
+        WriteStore::workspace_stop(self, workspace).await
+    }
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool> {
         WriteStore::transition(self, id, from, to).await
     }
@@ -607,6 +616,9 @@ impl htui_core::store::WorkerStore for Writer {
     }
     async fn release_lease(&self, run: RunId, owner: Uuid) -> Result<bool> {
         WriteStore::release_lease(self, run, owner).await
+    }
+    async fn stop_run(&self, run: RunId, owner: Uuid) -> Result<bool> {
+        WriteStore::stop_run(self, run, owner).await
     }
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {
         WriteStore::create_step(self, new).await

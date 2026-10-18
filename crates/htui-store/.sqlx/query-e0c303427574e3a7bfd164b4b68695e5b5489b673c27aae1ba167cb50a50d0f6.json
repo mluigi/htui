@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            WITH candidates AS (\n                SELECT id\n                  FROM run\n                 WHERE executing_box_id = $1\n                   AND status = 'running'\n                   AND kind = 'graph'\n                   AND (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp())\n                   AND lease_owner IS DISTINCT FROM $2\n                 ORDER BY queued_at, id\n                   FOR UPDATE SKIP LOCKED\n            ),\n            swept AS (\n                UPDATE run r\n                   SET lease_owner      = $2,\n                       lease_box_id     = $1,\n                       lease_expires_at = clock_timestamp() + $3::bigint * interval '1 microsecond'\n                  FROM candidates c\n                 WHERE r.id = c.id\n             RETURNING r.*\n            )\n            SELECT id               AS \"id: RunId\",\n                   project_id       AS \"project_id: ProjectId\",\n                   item_id          AS \"item_id: ItemId\",\n                   workspace_id     AS \"workspace_id: WorkspaceId\",\n                   kind             AS \"kind: RunKind\",\n                   mode             AS \"mode: RunMode\",\n                   status           AS \"status: RunStatus\",\n                   target_box_id    AS \"target_box_id: BoxId\",\n                   executing_box_id AS \"executing_box_id: BoxId\",\n                   graph_snapshot,\n                   started_by       AS \"started_by: UserId\",\n                   queued_at,\n                   started_at,\n                   finished_at,\n                   failure,\n                   repo_scope       AS \"repo_scope: Vec<RepoId>\",\n                   lease_box_id     AS \"lease_box_id: BoxId\",\n                   lease_expires_at,\n                   updated_at\n              FROM swept\n             ORDER BY queued_at, id\n            ",
+  "query": "\n                WITH swept AS (\n                    UPDATE run r\n                       SET lease_owner      = $2,\n                           lease_box_id     = $1,\n                           lease_expires_at = clock_timestamp() + $3::bigint * interval '1 microsecond'\n                     WHERE r.id = ANY($4::uuid[])\n                 RETURNING r.*\n                )\n                SELECT id               AS \"id: RunId\",\n                       project_id       AS \"project_id: ProjectId\",\n                       item_id          AS \"item_id: ItemId\",\n                       workspace_id     AS \"workspace_id: WorkspaceId\",\n                       kind             AS \"kind: RunKind\",\n                       mode             AS \"mode: RunMode\",\n                       status           AS \"status: RunStatus\",\n                       target_box_id    AS \"target_box_id: BoxId\",\n                       executing_box_id AS \"executing_box_id: BoxId\",\n                       graph_snapshot,\n                       started_by       AS \"started_by: UserId\",\n                       queued_at,\n                       started_at,\n                       finished_at,\n                       failure,\n                       repo_scope       AS \"repo_scope: Vec<RepoId>\",\n                       lease_box_id     AS \"lease_box_id: BoxId\",\n                       lease_expires_at,\n                       updated_at\n                  FROM swept\n                 ORDER BY queued_at, id\n                ",
   "describe": {
     "columns": [
       {
@@ -217,7 +217,8 @@
       "Left": [
         "Uuid",
         "Uuid",
-        "Int8"
+        "Int8",
+        "UuidArray"
       ]
     },
     "nullable": [
@@ -242,5 +243,5 @@
       false
     ]
   },
-  "hash": "8e0b51c307d1cd500fde0ff1ae408309fdc9b169d17a0ce7333fa5d7f6e51518"
+  "hash": "e0c303427574e3a7bfd164b4b68695e5b5489b673c27aae1ba167cb50a50d0f6"
 }
