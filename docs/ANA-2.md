@@ -111,11 +111,17 @@ enforcement point in this design.
    topology hash changed. Enforced by the snapshot being taken in the same transaction that inserts
    the `run` row, by `graph_snapshot` becoming `NOT NULL` for `kind = 'graph'` (§9), and by the
    orchestrator reading phases only from the snapshot.
+   *Amended by ANA-33, 2026-10-18 (`docs/ANA-33.md` §7.2, `docs/decisions/ana/ana-33.md`):* a v2 run is
+   pinned to its snapshot. Resume checks that the snapshot's `topology` and each admitted plan's `digest`
+   recompute from their own content and no longer compares against the live graph; the topology-hash
+   refusal above holds for v1 runs only.
 3. **No agent in a bookkeeping path.** Gate resolution, status moves, overlap admission, isolation
    setup, commit capture, selection bookkeeping and close-out are deterministic code (`R-ID-6`).
    The judge is the single exception `R-ORCH-7` grants, and it decides one thing only: which
    `fanout_index` wins. Enforced by the judge's output being an integer index plus a rationale
    document, never a status or a row.
+   *Amended by ANA-33, 2026-10-18 (`docs/ANA-33.md` §7.5):* the planner's plan and the integrate agent's
+   merge are item work, admitted and checked by code, not exceptions.
 4. **`htui` writes no files into a managed repository.** Worktrees and copies are created under a
    box-local scratch root outside every `repo_box_path` (`R-ID-4`). Enforced by `run_step_tree.path`
    being validated against every known `repo_box_path` prefix before creation, and by the
@@ -136,6 +142,9 @@ enforcement point in this design.
    `selected = false` and `status = 'superseded'`, their documents stay, and no later phase can read
    them (`R-ORCH-7`). Enforced by the single `input_kinds` resolution query of §4.2 joining
    `document.produced_by_step_id -> run_step.selected IS NOT FALSE`.
+   *Amended by ANA-33, 2026-10-18 (`docs/ANA-33.md` §7.4):* documents produced by divided parts
+   (`run_step.role = 'part'`) are likewise excluded from generic `input_kinds` resolution; only their
+   integrate node (through `{{parts}}`) and a re-planning planner read them.
 9. **Resume is decided from the store, never from memory.** Position, attempt, tree state and
    completion are re-derived from `run_step`, `run_step_tree`, `run_step_commit` and `document` on
    every start. Enforced by the orchestrator holding no cross-restart state and by §4.9's lease
@@ -258,6 +267,13 @@ fix, review`; `CLEAN`/refactor and `TOOL`/tooling to `plan, implement, review`.
 | Add a `phase_role` discriminator (`produce` / `verify` / `gate` / `integrate`) so an amend-the-previous-artifact phase like the in-house `fact-check` step is expressible | Rejected for v1, recorded as prior art | The maintainer's own `/handoff-run` surface runs `fact-check` (amends the plan in place) and `blueprint` (a kind `R-ENT-6` does not seed) as real phases (`.claude/skills/handoff-run/SKILL.md:110-124`). Both are expressible today without a new column: `fact-check` is a phase whose `output_kind` is a *new version* of `plan` (documents are append-only, `R-ENT-12`), and `blueprint` is an open `document.kind` (`0001_init.sql:391` has no CHECK). A discriminator would buy nothing the version chain does not already give. |
 | Add a per-task child table so N parallel sessions can run N *different* prompts | Rejected for v1, open for the maintainer | This is the maintainer's actual practice (MOD-1 wave C, MOD-6 wave B: disjoint file sets, all results merged, no losers), and it is *not* what `R-ORCH-7` describes ("runs them in parallel on the same prompt ... Only the selected result continues"). `docs/REQUIREMENTS.md` is the contract; a second fan-out kind is a requirement change, not an ANA verdict. Recorded as **Open for the maintainer 1** with the default "rival fan-out only in v1". |
 | Keep §5.4 and amend by migration for the semantics that genuinely need a column | **Adopted** | Five columns and one table, listed below. Everything else is a resolution rule, not storage. |
+
+*Amended by ANA-33, 2026-10-18 (`docs/ANA-33.md` §7.1, §7.4, `docs/decisions/ana/ana-33.md`):* the first
+four rows above (lines 256-259: a richer phase model, a DAG with explicit edges, a phase-role
+discriminator, a per-task fan-out) are superseded. `R-ORCH-1` and `R-ORCH-7` were amended on 2026-10-15,
+and ANA-33 adds typed edge rows (`step_graph_edge`) beside the phase rows, node roles (planner,
+integrate, subgraph) and divided fan-out whose parts are planned nodes at appended positions. "The graph
+is linear and positions are dense" below holds for v1 snapshots only.
 
 **Verdict.** The ANA-9 §5.4 DDL suffices for `R-ORCH-1`. Migration `0003_orchestration.sql` (§9)
 adds, on `step_graph_phase`: `judge_agent_id`, `judge_model` (§4.5), `deadline_seconds` (§4.2,
@@ -939,6 +955,13 @@ wave C, MOD-6 wave B, merge commit `73ac577`). The two are different mechanisms 
 describes only the first. `htui` v1 builds only the first, and the isolation and overlap machinery of
 §4.6 and §4.7 is the half that both would share. **Open for the maintainer 1** carries the question.
 
+*Amended by ANA-33, 2026-10-18 (`docs/ANA-33.md` §7.8):* as built (`check_fan_out_caps`,
+`graph.rs:641-671`), `max_agents_per_run` counts distinct planned sessions, not retry attempts or
+rounds: frozen nodes times `fan_out`, plus judges, plus admitted parts and planned nodes, plus consult
+children, checked at resolve and again at every admission. "every retry attempt planned so far" in
+*Bounds* above is corrected to that. Rival fan-out is now the later-tier compete mode (`R-LATER-13`), and
+`R-ORCH-7`'s divided work is ANA-33's.
+
 ### 4.6 Isolation modes and commit capture (`R-ORCH-8`, `R-ORCH-11`, `R-ID-4`)
 
 **The constraint.** `R-ORCH-8` (`docs/REQUIREMENTS.md:176-179`), verbatim:
@@ -1041,6 +1064,9 @@ the orchestrator, never by an agent:
    Town's Refinery does resolve them and states the price plainly ("The refinery prioritizes
    throughput over perfect accuracy, relying on subsequent review to catch errors",
    https://yegge.ai/gastown), which is a trade `R-ID-6` does not permit here.
+   *Amended by ANA-33, 2026-10-18 (`docs/ANA-33.md` §7.5):* an integrate step, an agent, may resolve
+   conflicts between parts inside its own tree, after a deterministic pre-merge and before an ancestry
+   post-check; only the integrate branch reaches this reconciliation, and a conflict here still parks.
 4. Record the merge commit as the *run's* reconciliation hash by updating the winner step's
    `after_hash` to the merge commit in the primary repo's `run_step_commit` row.
 
