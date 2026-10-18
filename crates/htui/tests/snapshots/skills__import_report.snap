@@ -2,7 +2,7 @@
 source: crates/htui/tests/skills.rs
 expression: frame
 ---
-Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat         0 working · 0 waiting · memory
+Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       0 waiting ·  F9  about   ?  keys
  Skills │ Templates
 ┌ import report ───────────────────────────────────────────────────────────────────────────────────┐
 │>! /nonexistent/htui-import-report — could not read `/nonexistent/htui-import-report` (No such    │

@@ -2,7 +2,7 @@
 source: crates/htui/tests/hierarchy.rs
 expression: harness.render()
 ---
-Graphics   ¹Settings            0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
+Graphics   ¹Settings           0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
 ┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
 │ Agents  Hierarchy                                                                                │
 │Graphics (graphics) — root on this box: unset                                                     │

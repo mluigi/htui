@@ -2,7 +2,7 @@
 source: crates/htui/tests/requirements.rs
 expression: frame
 ---
-Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat         1 working · 1 waiting · memory
+Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       1 waiting ·  F9  about   ?  keys
 ┌ Requirements (3) ─────────────────────────┐┌ R-ENT-2 ────────────────────────────────────────────┐
 │▾ htui (3)                                 ││An item may carry a free-form priority.              │
 │  ▾ ENT Entity model (2)                   ││                                                     │

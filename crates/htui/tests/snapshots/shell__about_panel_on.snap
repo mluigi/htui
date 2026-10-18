@@ -2,7 +2,7 @@
 source: crates/htui/tests/shell.rs
 expression: shown
 ---
-Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat         0 working · 0 waiting · memory
+Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       0 waiting ·  F9  about   ?  keys
 ╭─ About ──────────────────────────────────────────────────────────────────────────────────────────╮
 │ Your work items: open one for its body, runs and notes, and queue it for an agent.               │
 │  N  new item   f  filter   Q  queue   e  edit                                                    │

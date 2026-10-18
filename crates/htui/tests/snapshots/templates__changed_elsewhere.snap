@@ -2,7 +2,7 @@
 source: crates/htui/tests/templates.rs
 expression: frame
 ---
-Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat         0 working · 0 waiting · memory
+Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 waiting ·  F9  about   F1  keys
  Skills │ Templates
 ┌ implement · editing from v1, saves v3 ─────────────────────┐┌ phase placeholders ────────────────┐
 │DRAFT You are running the `implement` phase for {{item_key}}││{{item_key}} scalar                 │

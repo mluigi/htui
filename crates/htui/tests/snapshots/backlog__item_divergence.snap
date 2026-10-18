@@ -2,7 +2,7 @@
 source: crates/htui/tests/backlog.rs
 expression: frame
 ---
-Platform   ¹Backlog             1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
+Platform   ¹Backlog            1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
 ┌ ANA-1  v1 → theirs v2 ───────────────────────────────────────────────────────────────────────────┐
 │field     state     ancestor v1               theirs v2                 mine                      │
 │title     conflict  Data model, box registry  Theirs                    Data model, box registry  │
