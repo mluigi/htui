@@ -5389,7 +5389,7 @@ impl State {
 
     /// ANA-2 §4.7's admission and `R-ORCH-10`'s claim-time check (MOD-7 milestone 3, D80), decided
     /// before any write: a refusal writes nothing, except `MissingTags`, which fails the run and
-    /// blocks its item.
+    /// blocks its item. MOD-125 D5's workspace gate sits between claimability and the tags.
     fn claim_run(
         &mut self,
         run: RunId,
@@ -5408,6 +5408,12 @@ impl State {
         }
         if claimed.status != RunStatus::Queued || claimed.target_box_id != box_id {
             return Ok(Claim::NotClaimable);
+        }
+        // MOD-125 D5: after claimability, before the tags, so a stopped workspace never fails a run.
+        if let Some(workspace) = claimed.workspace_id
+            && self.workspace_stops.contains_key(&workspace)
+        {
+            return Ok(Claim::WorkspaceStopped { workspace });
         }
 
         // R-ORCH-10 at claim (MOD-7 milestone 3, D80, D81): after claimability, before the slot

@@ -32,17 +32,18 @@ use htui_store::testkit as common;
 /// and MOD-10 M4's secret-column case (plan D7) makes it 159,
 /// and MOD-12 M2's five queue-setting cases (plan D9) make it 164,
 /// and MOD-125 M1's `create_run_records_its_workspace` (plan D3) makes it 165,
-/// and MOD-125 M1's four stop-verb cases (plan D4, D7) make it 169.
-const EXPECTED_CASES: usize = 169;
+/// and MOD-125 M1's four stop-verb cases (plan D4, D7) make it 169,
+/// and MOD-125 M1's four claim-gate cases (plan D5) make it 173.
+const EXPECTED_CASES: usize = 173;
 
 #[test]
 fn case_list_matches_mem_store() {
     assert_eq!(
         htui_core::store::conformance::CASES.len(),
         EXPECTED_CASES,
-        "every conformance case must run against PgStore too (169 since MOD-78's `lease_holds` \
+        "every conformance case must run against PgStore too (173 since MOD-78's `lease_holds` \
          case, MOD-10 M4's secret-column case, MOD-12 M2's five queue-setting cases and \
-         MOD-125 M1's run-workspace and four stop-verb cases)"
+         MOD-125 M1's run-workspace and four stop-verb and four claim-gate cases)"
     );
 }
 

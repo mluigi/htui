@@ -228,6 +228,10 @@ pub const CASES: &[&str] = &[
     "resume_workspace_deletes_and_reports",
     "stop_run_is_a_fenced_cas_on_running",
     "a_stopped_run_holds_no_slot_but_still_overlaps",
+    "claim_run_refuses_a_stopped_workspace_and_writes_nothing",
+    "claim_run_checks_the_stop_before_tags",
+    "claim_run_admits_after_resume",
+    "a_run_without_a_workspace_is_never_gated",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -611,6 +615,18 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         }
         "a_stopped_run_holds_no_slot_but_still_overlaps" => {
             a_stopped_run_holds_no_slot_but_still_overlaps(store).await;
+        }
+        "claim_run_refuses_a_stopped_workspace_and_writes_nothing" => {
+            claim_run_refuses_a_stopped_workspace_and_writes_nothing(store).await;
+        }
+        "claim_run_checks_the_stop_before_tags" => {
+            claim_run_checks_the_stop_before_tags(store).await;
+        }
+        "claim_run_admits_after_resume" => {
+            claim_run_admits_after_resume(store).await;
+        }
+        "a_run_without_a_workspace_is_never_gated" => {
+            a_run_without_a_workspace_is_never_gated(store).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -7371,6 +7387,241 @@ async fn a_stopped_run_holds_no_slot_but_still_overlaps<S: WriteStore>(store: &S
             .expect(CASE),
         Claim::Admitted,
         "{CASE}: but it holds no slot, so the box that was full has one free"
+    );
+}
+
+/// A queued graph run of `item` started from `workspace`, as `new_run` builds it otherwise.
+async fn create_scoped_run<S: WriteStore>(
+    case: &str,
+    store: &S,
+    item: ItemId,
+    workspace: Option<WorkspaceId>,
+) -> RunId {
+    store
+        .create_run(NewRun {
+            workspace_id: workspace,
+            ..new_run(ids::PROJECT_HTUI, item, Vec::new())
+        })
+        .await
+        .expect(case)
+        .id
+}
+
+/// MOD-125 D5: `claim_run` refuses a run whose workspace is stopped with
+/// [`Claim::WorkspaceStopped`] and writes nothing: the run stays `queued` with no lease and no
+/// executing box, and its item stays `queued`. The gate sits right after `NotClaimable`, so a run
+/// of the stopped workspace that already runs is still `NotClaimable`, and the run and the box are
+/// still looked up first.
+async fn claim_run_refuses_a_stopped_workspace_and_writes_nothing<S: WriteStore>(store: &S) {
+    const CASE: &str = "claim_run_refuses_a_stopped_workspace_and_writes_nothing";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let workspace = ids::WORKSPACE_PLATFORM;
+    let running = create_scoped_run(CASE, store, ids::HTUI_CLEAN_1, Some(workspace)).await;
+    assert_eq!(
+        store
+            .claim_run(running, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: a run of the workspace starts before the stop"
+    );
+    let queued = create_scoped_run(CASE, store, ids::HTUI_ANA_2, Some(workspace)).await;
+    store
+        .stop_workspace(workspace, StopMode::Graceful, ids::USER, at)
+        .await
+        .expect(CASE);
+
+    let before = run_row(CASE, store, queued).await;
+    assert_eq!(
+        store
+            .claim_run(queued, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::WorkspaceStopped { workspace },
+        "{CASE}: a stopped workspace's queued run is refused by name"
+    );
+    let after = run_row(CASE, store, queued).await;
+    assert_eq!(
+        after, before,
+        "{CASE}: the refusal wrote nothing to the run"
+    );
+    assert_eq!(
+        (
+            after.status,
+            after.executing_box_id,
+            after.lease_box_id,
+            after.lease_expires_at
+        ),
+        (RunStatus::Queued, None, None, None),
+        "{CASE}: the run is still queued, unclaimed and unleased"
+    );
+    assert_eq!(
+        item_row(CASE, store, ids::HTUI_ANA_2).await.status,
+        Status::Queued,
+        "{CASE}: nor to its item"
+    );
+
+    assert_eq!(
+        store
+            .claim_run(running, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::NotClaimable,
+        "{CASE}: claimability is decided before the workspace stop"
+    );
+    let no_box = store
+        .claim_run(queued, BoxId::new(), owner, at, LEASE)
+        .await;
+    assert!(
+        matches!(no_box, Err(StoreError::NotFound { entity: "box", .. })),
+        "{CASE}: the box is looked up before the workspace stop, got {no_box:?}"
+    );
+}
+
+/// MOD-125 D5: the workspace gate is decided before `R-ORCH-10`'s tags, so a stopped workspace
+/// never fails a run for its tags: the run stays `queued` and its item `queued` (no `MissingTags`
+/// write). After the resume, the same claim meets the tags.
+async fn claim_run_checks_the_stop_before_tags<S: WriteStore>(store: &S) {
+    const CASE: &str = "claim_run_checks_the_stop_before_tags";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let workspace = ids::WORKSPACE_PLATFORM;
+    let item = mint_tagged(CASE, store, "Tagged", &["vulkan"]).await;
+    let run = create_scoped_run(CASE, store, item, Some(workspace)).await;
+    store
+        .stop_workspace(workspace, StopMode::Forced, ids::USER, at)
+        .await
+        .expect(CASE);
+
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::WorkspaceStopped { workspace },
+        "{CASE}: the stop is decided before the missing tag"
+    );
+    let row = run_row(CASE, store, run).await;
+    assert_eq!(
+        (row.status, row.failure, row.finished_at),
+        (RunStatus::Queued, None, None),
+        "{CASE}: the run is not failed for its tags"
+    );
+    assert_eq!(
+        item_row(CASE, store, item).await.status,
+        Status::Queued,
+        "{CASE}: and its item is not blocked"
+    );
+
+    assert!(
+        store.resume_workspace(workspace).await.expect(CASE),
+        "{CASE}: the workspace resumes"
+    );
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::MissingTags {
+            missing: tags(&["vulkan"])
+        },
+        "{CASE}: after the resume the claim meets the tags"
+    );
+}
+
+/// MOD-125 D5: the refusal is transient. Once the workspace resumes, the same queued run is
+/// admitted as `claim_run_admits_one_and_refuses_the_second` admits one: running on the box, the
+/// lease the store's clock plus the TTL, and the item in progress.
+async fn claim_run_admits_after_resume<S: WriteStore>(store: &S) {
+    const CASE: &str = "claim_run_admits_after_resume";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let workspace = ids::WORKSPACE_PLATFORM;
+    let run = create_scoped_run(CASE, store, ids::HTUI_ANA_2, Some(workspace)).await;
+    store
+        .stop_workspace(workspace, StopMode::Graceful, ids::USER, at)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::WorkspaceStopped { workspace },
+        "{CASE}: refused while the workspace is stopped"
+    );
+    assert!(
+        store.resume_workspace(workspace).await.expect(CASE),
+        "{CASE}: the workspace resumes"
+    );
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: the resumed workspace's run is admitted"
+    );
+    let claimed = run_row(CASE, store, run).await;
+    assert_eq!(
+        (claimed.status, claimed.executing_box_id, claimed.started_at),
+        (RunStatus::Running, Some(ids::BOX), Some(at)),
+        "{CASE}: the run started on the box at the caller's clock"
+    );
+    assert_eq!(
+        claimed.lease_box_id,
+        Some(ids::BOX),
+        "{CASE}: the lease names the box"
+    );
+    assert_leased_for(CASE, &claimed, LEASE, "the lease runs its TTL");
+    assert!(
+        store.refresh_lease(run, owner, LEASE).await.expect(CASE),
+        "{CASE}: the lease is the claimant's"
+    );
+    assert_eq!(
+        item_row(CASE, store, ids::HTUI_ANA_2).await.status,
+        Status::InProgress,
+        "{CASE}: the item moved queued -> in_progress with the claim"
+    );
+}
+
+/// MOD-125 D5, D6: a run with no workspace (a chat-free, unscoped graph run) is never gated:
+/// with every fixture workspace stopped it is admitted, and once its lease is released it is
+/// adopted, not settled.
+async fn a_run_without_a_workspace_is_never_gated<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_run_without_a_workspace_is_never_gated";
+    let (x, y) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    for workspace in [ids::WORKSPACE_PLATFORM, ids::WORKSPACE_GRAPHICS] {
+        store
+            .stop_workspace(workspace, StopMode::Forced, ids::USER, at)
+            .await
+            .expect(CASE);
+    }
+    let run = create_scoped_run(CASE, store, ids::HTUI_ANA_2, None).await;
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, x, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: a run with no workspace is admitted while every workspace is stopped"
+    );
+    assert!(
+        store.release_lease(run, x).await.expect(CASE),
+        "{CASE}: X gives the lease back"
+    );
+    let adopted = store.adopt_runs(ids::BOX, y, LEASE).await.expect(CASE);
+    assert_eq!(
+        adopted.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![run],
+        "{CASE}: the abandoned run is adopted, not settled"
+    );
+    assert_eq!(
+        run_row(CASE, store, run).await.status,
+        RunStatus::Running,
+        "{CASE}: and it is still running"
     );
 }
 

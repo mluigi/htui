@@ -4700,7 +4700,9 @@ impl WriteStore for PgStore {
     /// [`StoreError::Constraint`] for a TTL outside [`lease_ttl_micros`]'s range, before the
     /// transaction opens. [`StoreError::NotFound`] `{ entity: "run" }` or `{ entity: "box" }`, the
     /// run looked up first. Every refusal that is not an error is an `Ok` [`Claim`] other than
-    /// [`Claim::Admitted`], with nothing written, except [`Claim::MissingTags`]: the run is failed
+    /// [`Claim::Admitted`], with nothing written ([`Claim::WorkspaceStopped`], MOD-125 D5, decided
+    /// right after `NotClaimable` under a `FOR SHARE` on the `workspace_stop` row, included),
+    /// except [`Claim::MissingTags`]: the run is failed
     /// and its item blocked in this same transaction, which is then committed (MOD-7 milestone 3,
     /// D80). The run row and the box row are both locked `FOR UPDATE` before the tag read, so a
     /// concurrent `record_box_probe` or `edit_box` waits for the decision and the check cannot
@@ -4726,6 +4728,7 @@ impl WriteStore for PgStore {
             r#"
             SELECT status         AS "status: RunStatus",
                    target_box_id  AS "target_box_id: BoxId",
+                   workspace_id   AS "workspace_id: WorkspaceId",
                    repo_scope     AS "repo_scope: Vec<RepoId>",
                    graph_snapshot
               FROM run WHERE id = $1 FOR UPDATE
@@ -4754,6 +4757,24 @@ impl WriteStore for PgStore {
 
         if claimed.status != RunStatus::Queued || claimed.target_box_id != box_id {
             return Ok(Claim::NotClaimable);
+        }
+
+        // MOD-125 D5: run, then box, then the stop row. stop_workspace and resume_workspace lock
+        // only workspace_stop, so no cycle. FOR SHARE makes a racing resume (DELETE) or escalation
+        // wait for this decision; a stop inserted after this read is ordered after the claim, and
+        // M2's executor stops the run it admitted. The early return drops `tx`, which rolls back.
+        if let Some(workspace) = claimed.workspace_id {
+            let stopped = sqlx::query_scalar!(
+                r#"SELECT 1 AS "one!" FROM workspace_stop WHERE workspace_id = $1 FOR SHARE"#,
+                workspace.as_uuid(),
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .is_some();
+            if stopped {
+                return Ok(Claim::WorkspaceStopped { workspace });
+            }
         }
 
         // R-ORCH-10 at claim (MOD-7 milestone 3, D80, D81): inside the admission transaction,
