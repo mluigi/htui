@@ -77,7 +77,7 @@ use serde_json::Value;
 
 use self::execution_graph::{ExecutionGraph, by_step, drawable};
 use crate::app::{Action, Ctx, Handled};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, is_plain, views};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::run_worker::{Enabled, FrameKind, ItemActions, ORCH_NAMES, OrchReply, OrchRequest};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
@@ -86,7 +86,7 @@ use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, messa
 use crate::ui::tabs::chat::permission::PermissionStrip;
 use crate::ui::tabs::settings::{key_line, modal_rest};
 use crate::ui::text_field::{FieldOutcome, TextField};
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 
 /// What an action key says while the verdicts it reads have not arrived.
 pub const NOT_LOADED: &str = "the run actions have not loaded yet";
@@ -1104,8 +1104,8 @@ fn cycle(status: Status, current: Resolution, forward: bool) -> Resolution {
 /// leaves the pane in, and whether the key was used.
 ///
 /// Counting and warning leave on `confirm.no` (`n`/`Esc`), the warning goes on with
-/// `confirm.yes` (`y`); the warning's `←`/`→` (and `h`/`l`) pick the resolution (MOD-39 plan
-/// P13), fixed value keys matched on plain keys before the resolver (MOD-67 M5); the typed stage
+/// `confirm.yes` (`y`); the warning's `choice.prev`/`next` (`←`/`→`, `h`/`l`) pick the
+/// resolution (MOD-39 plan P13, MOD-115 M2 D7); the typed stage
 /// leaves on `Esc` only, because `n` is a letter there; in flight, every key waits for the
 /// answer. A key no stage used is `modal_rest`'s.
 fn close_out_key(
@@ -1121,30 +1121,22 @@ fn close_out_key(
             Some(Act::ConfirmNo) => return (Mode::Browse, Handled::Consumed),
             _ => (CloseOutStage::Counting, modal_rest(stack, chord)),
         },
-        CloseOutStage::Warn(mut preview) => {
-            let forward = match key.code {
-                KeyCode::Right | KeyCode::Char('l') => Some(true),
-                KeyCode::Left | KeyCode::Char('h') => Some(false),
-                _ => None,
-            };
-            match forward.filter(|_| is_plain(&key)) {
-                Some(forward) => {
-                    preview.resolution = cycle(preview.status, preview.resolution, forward);
-                    (CloseOutStage::Warn(preview), Handled::Consumed)
-                }
-                None => match ctx.keys().actions(stack, chord).first() {
-                    Some(Act::ConfirmYes) => (
-                        CloseOutStage::Typed {
-                            preview,
-                            field: TextField::new(),
-                        },
-                        Handled::Consumed,
-                    ),
-                    Some(Act::ConfirmNo) => return (Mode::Browse, Handled::Consumed),
-                    _ => (CloseOutStage::Warn(preview), modal_rest(stack, chord)),
-                },
+        CloseOutStage::Warn(mut preview) => match ctx.keys().actions(stack, chord).first() {
+            Some(&act @ (Act::ChoiceNext | Act::ChoicePrev)) => {
+                let forward = act == Act::ChoiceNext;
+                preview.resolution = cycle(preview.status, preview.resolution, forward);
+                (CloseOutStage::Warn(preview), Handled::Consumed)
             }
-        }
+            Some(Act::ConfirmYes) => (
+                CloseOutStage::Typed {
+                    preview,
+                    field: TextField::new(),
+                },
+                Handled::Consumed,
+            ),
+            Some(Act::ConfirmNo) => return (Mode::Browse, Handled::Consumed),
+            _ => (CloseOutStage::Warn(preview), modal_rest(stack, chord)),
+        },
         CloseOutStage::Typed { preview, mut field } => match field.on_key(key) {
             FieldOutcome::Submit if field.text() == Some(preview.key.as_str()) => {
                 ctx.request(command(Command::CloseOut {
@@ -1666,11 +1658,18 @@ impl DetailTab for RunsTab {
         if !matches!(self.mode, Mode::Browse) {
             return self.modal_key(key, ctx);
         }
-        // MOD-42 D14: while the step under the cursor has a pending request, every plain digit is
-        // this pane's, as the chat's parked strip takes them (`chat/mod.rs`); otherwise digits pass
-        // to the global tab select. A fixed key of MOD-67 D5, ahead of the resolver.
-        if is_plain(&key)
-            && let KeyCode::Char(digit @ '1'..='9') = key.code
+        let chord = KeyChord::from_event(key);
+        // MOD-42 D14: while the step under the cursor has a pending request, `answer.option_*`
+        // (the digits) is this pane's, as the chat's parked strip takes it (`chat/mod.rs`);
+        // otherwise the chord passes on, and a digit selects a tab (MOD-115 M2 D7: no fixed key).
+        if let Some(index) = ctx
+            .keys()
+            .actions(self.stack(), chord)
+            .first()
+            .and_then(|act| act.answer_index())
+            && let Some(digit) = u32::try_from(index + 1)
+                .ok()
+                .and_then(|n| char::from_digit(n, 10))
             && let Some(pending) = self.pending_under_cursor()
         {
             // One answer per request: a digit while it is in flight is swallowed.
@@ -1687,7 +1686,6 @@ impl DetailTab for RunsTab {
             }
             return Handled::Consumed;
         }
-        let chord = KeyChord::from_event(key);
         for act in ctx.keys().actions(self.stack(), chord) {
             match act {
                 Act::RunsNextStep => {
@@ -2141,7 +2139,7 @@ mod tests {
     use crate::run_worker::{RunActions, RunFrame, StepActions};
     use crate::store_worker::Origin;
     use chrono::TimeDelta;
-    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use htui_core::fixtures::{demo_at, ids};
     use htui_core::model::{
         FOLLOW_UP_EMPTY, FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_CANCELLED,
@@ -5587,6 +5585,52 @@ mod tests {
                 if *permission == pending.id && option_id == "reject"),
             "one answer, the second option's id: {sent:?}"
         );
+    }
+
+    /// MOD-115 M2 D7: the answers are `answer.option_*` rows: a rebound option answers, and its
+    /// old digit passes on (it selects a tab).
+    #[tokio::test]
+    async fn a_rebound_answer_answers_and_its_old_digit_passes() {
+        let mut shell = Shell::new();
+        shell.keys = crate::keys::load_str("version = 2\n[answer]\noption_2 = \"f8\"\n")
+            .expect("the keys load");
+        let (mut pane, pending) = asking(&shell).await;
+        assert_eq!(
+            pane.on_key(key(KeyCode::Char('2')), &mut shell.ctx()),
+            Handled::Pass
+        );
+        assert!(
+            requests(shell.emit.take()).is_empty(),
+            "`2` answers nothing"
+        );
+        assert_eq!(
+            pane.on_key(key(KeyCode::F(8)), &mut shell.ctx()),
+            Handled::Consumed
+        );
+        let sent = requests(shell.emit.take());
+        assert!(
+            matches!(sent.as_slice(), [StoreRequest::AnswerPermission { permission, option_id }]
+                if *permission == pending.id && option_id == "reject"),
+            "the second option's id: {sent:?}"
+        );
+    }
+
+    /// MOD-115 M2 D7: the close-out warning's resolution keys are the `[choice]` rows: a rebound
+    /// one cycles the resolution, the old letter no longer does.
+    #[tokio::test]
+    async fn a_rebound_resolution_key_cycles_and_the_old_letter_does_not() {
+        let mut shell = Shell::new();
+        shell.keys = crate::keys::load_str("version = 2\n[choice]\nnext = \"ctrl-n\"\n")
+            .expect("the keys load");
+        let mut pane = warned(&shell).await;
+        let before = footer(&pane);
+        pane.on_key(key(KeyCode::Char('l')), &mut shell.ctx());
+        assert_eq!(footer(&pane), before, "`l` is no resolution key now");
+        pane.on_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            &mut shell.ctx(),
+        );
+        assert_ne!(footer(&pane), before, "`ctrl-n` cycles the resolution");
     }
 
     /// D14: a second digit while the first answer is in flight sends nothing. Its

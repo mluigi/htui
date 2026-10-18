@@ -27,7 +27,7 @@
 //!
 //! Redaction (blueprint E10): the form's `Debug` prints lengths, never the body or the paths.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 use htui_core::model::item_spec::{self, NOTHING_TO_SAVE};
 use htui_core::model::{
     EditReason, ItemId, ItemKindId, ItemSpec, ProjectId, ProjectRef, SpecChanges, SpecError,
@@ -44,7 +44,8 @@ use crate::editor::{
     without_controls,
 };
 use crate::item_writes::{ItemDivergence, ItemFormContext};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, is_plain, views};
+use crate::keys::translate::FieldEvent;
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::StoreRequest;
 use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::settings::wrapped;
@@ -609,7 +610,7 @@ impl ItemForm {
     /// In order: an open divergence view takes every key (milestone 3 D5); while busy `form.save`
     /// and `form.external_editor` are swallowed, what the modal layer admits passes and everything
     /// else is swallowed, `Esc` included (D8); then the focused widget takes the key (a picker its
-    /// plain value keys, `Enter` and `Esc`); then what it left resolves: `form.save` saves (A6),
+    /// `[choice]` keys, `Enter` and `Esc`); then what it left resolves: `form.save` saves (A6),
     /// `form.external_editor` hands Body or Paths to `$EDITOR` (milestone 4 D1; swallowed on any
     /// other field), `form.next_field`/`prev_field` move the focus. Anything else is swallowed
     /// unless the modal layer passes it (`ctrl-c`, `F1`).
@@ -632,7 +633,7 @@ impl ItemForm {
         }
         match self.focus {
             Field::Project | Field::Kind | Field::Graph => {
-                if let Some(outcome) = self.on_picker_key(&key) {
+                if let Some(outcome) = self.on_picker_key(&key, &acts) {
                     return outcome;
                 }
             }
@@ -741,23 +742,24 @@ impl ItemForm {
         self.focus = fields[wrap(at, fields.len(), forward)];
     }
 
-    /// A picker's own keys, plain only (MOD-67 M5, fixed value keys): `Left`/`h` and `Right`/`l`
-    /// choose, with wrap; `Enter` moves on; `Esc` cancels. `None` for any other key, which the
-    /// form then resolves (`Down`/`Up` are `form.next_field`/`prev_field` by default), so an
-    /// `Alt+h` never picks.
-    fn on_picker_key(&mut self, key: &KeyEvent) -> Option<ItemFormOutcome> {
-        if !is_plain(key) {
-            return None;
-        }
-        Some(match key.code {
-            KeyCode::Left | KeyCode::Char('h') => self.pick(false),
-            KeyCode::Right | KeyCode::Char('l') => self.pick(true),
-            KeyCode::Enter => {
+    /// A picker's own keys (MOD-115 M2 D7): the first `choice.prev`/`next` among the chord's
+    /// candidates `acts` in [`views::ITEM_FORM`] (`Left`/`h`, `Right`/`l`) chooses, with wrap; the
+    /// canonical `Enter` (`field.submit` after the shell's translation) moves on and `Esc`
+    /// cancels. `None` for any other key, which the form then resolves (`Down`/`Up` are
+    /// `form.next_field`/`prev_field` by default), so an `Alt+h` never picks.
+    fn on_picker_key(&mut self, key: &KeyEvent, acts: &[Act]) -> Option<ItemFormOutcome> {
+        match FieldEvent::of(key) {
+            Some(FieldEvent::Submit) => {
                 self.move_focus(true);
-                ItemFormOutcome::Stay
+                return Some(ItemFormOutcome::Stay);
             }
-            KeyCode::Esc => ItemFormOutcome::Cancel,
-            _ => return None,
+            Some(FieldEvent::Cancel) => return Some(ItemFormOutcome::Cancel),
+            _ => {}
+        }
+        acts.iter().find_map(|act| match act {
+            Act::ChoicePrev => Some(self.pick(false)),
+            Act::ChoiceNext => Some(self.pick(true)),
+            _ => None,
         })
     }
 
@@ -1174,7 +1176,7 @@ mod tests {
     use crate::testkit::DEFAULT_SIZE;
     use crate::ui::layout::chrome;
     use crate::ui::tabs::backlog::panes;
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
     use htui_core::model::{ItemPatch, NewItemKind, NewStepGraph};
     use htui_core::store::{MemStore, WriteStore as _};
@@ -1461,6 +1463,48 @@ mod tests {
         let notice = form.notice().expect("a refusal");
         assert!(notice.contains("`nope`"), "{notice}");
         assert_eq!(form.busy(), None);
+    }
+
+    /// MOD-115 M2 D7: a picker's value keys are the `[choice]` rows: a rebound one picks, the
+    /// old letter does not, and `Enter`/`Esc` stay the canonical field events.
+    #[tokio::test]
+    async fn a_rebound_choice_key_picks_and_the_old_letter_does_not() {
+        let store = MemStore::demo();
+        let mut form = ItemForm::open_new(
+            context(&store, ids::PROJECT_HTUI, None).await,
+            &projects(),
+            None,
+        );
+        let keys = crate::keys::load_str("version = 2\n[choice]\nnext = \"ctrl-n\"\n")
+            .expect("the keys load");
+        focus_on(&mut form, Field::Project);
+        assert!(matches!(
+            form.on_key(key(KeyCode::Char('l')), &keys),
+            ItemFormOutcome::Stay
+        ));
+        assert_eq!(form.busy(), None, "`l` picks nothing now");
+        assert_eq!(form.picker_label(Field::Project), "htui");
+        let outcome = form.on_key(ctrl('n'), &keys);
+        assert!(
+            matches!(outcome, ItemFormOutcome::Reload(project) if project == ids::PROJECT_AGY),
+            "{outcome:?}"
+        );
+        let mut form = ItemForm::open_new(
+            context(&store, ids::PROJECT_HTUI, None).await,
+            &projects(),
+            None,
+        );
+        focus_on(&mut form, Field::Project);
+        assert!(matches!(
+            form.on_key(key(KeyCode::Enter), &keys),
+            ItemFormOutcome::Stay
+        ));
+        assert_ne!(form.focus, Field::Project, "Enter moves on");
+        focus_on(&mut form, Field::Kind);
+        assert!(matches!(
+            form.on_key(key(KeyCode::Esc), &keys),
+            ItemFormOutcome::Cancel
+        ));
     }
 
     #[tokio::test]

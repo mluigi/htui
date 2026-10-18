@@ -11,17 +11,18 @@
 //!
 //! MOD-67 M5: its keys resolve through [`views::BACKLOG_FILTER`]. The rows move with
 //! `backlog.filter_form.next_row`/`prev_row` and `form.next_field`/`prev_field`, `x` clears
-//! (`backlog.filter_form.clear`); an option row's value keys (`h`/`l`/arrows, Space) and its
-//! `Enter`/`Esc` are the form's own, plain keys only.
+//! (`backlog.filter_form.clear`); an option row's value keys are the `[choice]` rows (MOD-115 M2
+//! D7) and its `Enter`/`Esc` the canonical field events.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 use htui_core::model::{ItemFilter, ProjectId, ProjectRef, Scope, Status, declared_tags_from_text};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, is_plain, views};
+use crate::keys::translate::FieldEvent;
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, views};
 use crate::store_worker::StoreRequest;
 use crate::ui::cells::{self, cell_width};
 use crate::ui::{FieldOutcome, TextField, Theme};
@@ -236,11 +237,12 @@ impl FilterForm {
     /// On the Tags row every plain character is text (blueprint E7): the field takes the key
     /// first, and what it passes resolves as on any row, so the row moves on
     /// `form.next_field`/`prev_field` (`Tab`/`Down`, `BackTab`/`Up`). On the other rows the
-    /// form's own plain keys come first (`Enter` applies, `Esc` cancels, `h`/`l`/arrows move the
-    /// option, Space ticks it), then the acts:
-    /// `backlog.filter_form.next_row`/`prev_row` (`j`/`k`) and the field moves, and
-    /// `backlog.filter_form.clear` (`x`). Anything else is [`FormOutcome::Pass`]: a chord is never
-    /// a form key (MOD-13 review L4), so `Alt+x` clears nothing.
+    /// canonical `Enter` applies and `Esc` cancels (`field.submit`/`cancel` after the shell's
+    /// translation, MOD-115 M2 D7), then the acts: `choice.prev`/`next` (`h`/`l`/arrows) move the
+    /// option, `choice.toggle` (Space) ticks it, `backlog.filter_form.next_row`/`prev_row`
+    /// (`j`/`k`) and the field moves move the row, and `backlog.filter_form.clear` (`x`) clears.
+    /// Anything else is [`FormOutcome::Pass`]: a chord no row binds is never a form key (MOD-13
+    /// review L4), so `Alt+x` clears nothing.
     pub fn on_key(&mut self, key: KeyEvent, keys: &Keys) -> FormOutcome {
         if self.row == FilterRow::Tags {
             match self.tags.on_key(key) {
@@ -249,18 +251,19 @@ impl FilterForm {
                 FieldOutcome::Consumed => return FormOutcome::Stay,
                 FieldOutcome::Pass => {}
             }
-        } else if is_plain(&key) {
-            match key.code {
-                KeyCode::Enter => return self.apply(),
-                KeyCode::Esc => return FormOutcome::Cancel,
-                KeyCode::Char('h') | KeyCode::Left => return self.move_option(false),
-                KeyCode::Char('l') | KeyCode::Right => return self.move_option(true),
-                KeyCode::Char(' ') => return self.toggle(),
+        } else {
+            match FieldEvent::of(&key) {
+                Some(FieldEvent::Submit) => return self.apply(),
+                Some(FieldEvent::Cancel) => return FormOutcome::Cancel,
                 _ => {}
             }
         }
+        let options = self.row != FilterRow::Tags;
         for act in keys.actions(views::BACKLOG_FILTER, KeyChord::from_event(key)) {
             match act {
+                Act::ChoicePrev if options => return self.move_option(false),
+                Act::ChoiceNext if options => return self.move_option(true),
+                Act::ChoiceToggle if options => return self.toggle(),
                 Act::FormNextField => self.move_row(1),
                 Act::FormPrevField => self.move_row(-1),
                 // On the Tags row the field took every printable key above (`j`/`k`/`x` are
@@ -465,7 +468,7 @@ mod tests {
     use crate::testkit::DEFAULT_SIZE;
     use crate::ui::layout::chrome;
     use crate::ui::tabs::backlog::panes;
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
     use htui_core::model::WorkspaceId;
     use ratatui::layout::Rect;
@@ -529,6 +532,49 @@ mod tests {
         assert_eq!(
             form.on_key(key(KeyCode::Enter), &keys),
             FormOutcome::Apply(BacklogFilter::default())
+        );
+    }
+
+    /// MOD-115 M2 D7: an option row's value keys are the `[choice]` rows, so rebound ones move
+    /// and tick the option, and the old letters no longer do.
+    #[test]
+    fn rebound_choice_keys_move_and_tick_the_option() {
+        let keys = crate::keys::load_str(
+            "version = 2\n[choice]\nnext = \"ctrl-n\"\ntoggle = \"ctrl-t\"\n",
+        )
+        .expect("the keys load");
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let mut form = open();
+        assert_eq!(
+            form.on_key(key(KeyCode::Char('l')), &keys),
+            FormOutcome::Pass
+        );
+        assert_eq!(
+            form.on_key(key(KeyCode::Char(' ')), &keys),
+            FormOutcome::Pass
+        );
+        assert_eq!(form.on_key(ctrl('n'), &keys), FormOutcome::Stay);
+        assert_eq!(form.on_key(ctrl('t'), &keys), FormOutcome::Stay);
+        assert_eq!(
+            form.on_key(key(KeyCode::Enter), &keys),
+            FormOutcome::Apply(BacklogFilter {
+                statuses: vec![Status::ALL[1]],
+                ..BacklogFilter::default()
+            })
+        );
+        // The compiled keys: `l` moves and Space ticks, as before M2.
+        let mut form = open();
+        chars(&mut form, "l ");
+        assert_eq!(
+            form.on_key(key(KeyCode::Enter), Keys::compiled()),
+            FormOutcome::Apply(BacklogFilter {
+                statuses: vec![Status::ALL[1]],
+                ..BacklogFilter::default()
+            })
+        );
+        assert_eq!(
+            form.on_key(key(KeyCode::Esc), Keys::compiled()),
+            FormOutcome::Cancel
         );
     }
 
