@@ -975,12 +975,8 @@ impl App {
         {
             let width = chrome.body.width.saturating_sub(4);
             let hint = tab.key_hint(width, &self.ctx(Origin::Tab(tab.id())));
-            if let Some(line) = hint
-                && let Some(row) = hint_row(frame.buffer_mut(), chrome.body)
-            {
-                let line = clip_line(line, width);
-                join_panes_under(frame.buffer_mut(), row, line.width());
-                paint_bottom_hints(frame.buffer_mut(), row, line, self.theme.base);
+            if let Some(line) = hint {
+                paint_shell_hints(frame.buffer_mut(), chrome.body, line, self.theme.base);
             }
         }
 
@@ -1077,9 +1073,29 @@ fn hint_row(buf: &ratatui::buffer::Buffer, body: Rect) -> Option<Rect> {
         .map(|y| Rect::new(body.x, y, body.width, 1))
 }
 
+/// The M1 hint adapter's whole job: finds the bottom border of the tab's content in `body`
+/// ([`hint_row`]), joins the seams under the hint ([`join_panes_under`]) and paints the hint on
+/// the rule ([`paint_bottom_hints`]), which ends it in an ellipsis where the tab drew text of its
+/// own on that border. Deleted with the rest of the adapter as tabs move to `Pane::hints`
+/// (M3, M4).
+fn paint_shell_hints(
+    buf: &mut ratatui::buffer::Buffer,
+    body: Rect,
+    hint: Line<'static>,
+    style: ratatui::style::Style,
+) {
+    let Some(row) = hint_row(buf, body) else {
+        return;
+    };
+    let line = clip_line(hint, body.width.saturating_sub(4));
+    join_panes_under(buf, row, line.width());
+    paint_bottom_hints(buf, row, line, style);
+}
+
 /// Turns the corners where two side-by-side panes meet on `row` into plain rule, across the
 /// `width` cells the hints will cover from two cells in, so a hint longer than the first pane
-/// reads on across the seam instead of being cut by `┘└`.
+/// reads on across the seam instead of being cut by `┘└`. The join stops at the first cell that
+/// is text on the border (a title the tab drew there), where [`paint_bottom_hints`] ends the hint.
 fn join_panes_under(buf: &mut ratatui::buffer::Buffer, row: Rect, width: usize) {
     let end = row
         .x
@@ -1087,11 +1103,12 @@ fn join_panes_under(buf: &mut ratatui::buffer::Buffer, row: Rect, width: usize) 
         .saturating_add(u16::try_from(width).unwrap_or(u16::MAX))
         .min(row.right().saturating_sub(1));
     for x in row.x.saturating_add(2)..end {
-        if matches!(
-            buf[(x, row.y)].symbol(),
-            "\u{2518}" | "\u{2514}" | "\u{256f}" | "\u{2570}"
-        ) {
-            buf[(x, row.y)].set_symbol("\u{2500}");
+        match buf[(x, row.y)].symbol() {
+            "\u{2518}" | "\u{2514}" | "\u{256f}" | "\u{2570}" => {
+                buf[(x, row.y)].set_symbol("\u{2500}");
+            }
+            "\u{2500}" | "\u{2501}" => {}
+            _ => break,
         }
     }
 }
@@ -1138,6 +1155,95 @@ mod tests {
         assert_eq!(buf[(5, 0)].symbol(), "\u{2500}");
         assert_eq!(buf[(0, 0)].symbol(), "\u{2514}", "the outer corners stay");
         assert_eq!(buf[(13, 0)].symbol(), "\u{2518}");
+    }
+
+    /// Two rounded panes side by side over `width` x 8 cells, the right one carrying a scroll hint
+    /// on its bottom border as the Skills library and templates views do.
+    fn two_panes(width: u16) -> Buffer {
+        use ratatui::text::Line;
+        use ratatui::widgets::{Block, BorderType, Widget};
+
+        let area = Rect::new(0, 0, width, 8);
+        let mut buf = Buffer::empty(area);
+        let left = Rect::new(0, 0, width / 3, 8);
+        let right = Rect::new(left.right(), 0, width - left.width, 8);
+        Block::bordered()
+            .border_type(BorderType::Rounded)
+            .render(left, &mut buf);
+        Block::bordered()
+            .border_type(BorderType::Rounded)
+            .title_bottom(Line::from(" 12/40 ").right_aligned())
+            .render(right, &mut buf);
+        buf
+    }
+
+    fn bottom_row(buf: &Buffer) -> String {
+        let y = buf.area.bottom() - 1;
+        (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    /// MOD-115 review (hint adapter): where a tab drew its own text on the bottom border, the
+    /// shell hint ends with an ellipsis just before it instead of skipping cells one by one; the
+    /// seam between the panes is still joined under the part of the hint that is drawn.
+    #[test]
+    fn a_hint_running_into_a_title_on_the_bottom_border_ends_in_an_ellipsis_before_it() {
+        use ratatui::style::Style;
+        use ratatui::text::Line;
+
+        use super::paint_shell_hints;
+
+        let hint = "j/k move \u{b7} enter open \u{b7} f filter \u{b7} N new \u{b7} e edit \u{b7} / search \u{b7} ? keys \u{b7} q quit \u{b7} Tab next tab \u{b7} Ctrl+f find";
+        for width in [100_u16, 80] {
+            let mut buf = two_panes(width);
+            let body = Rect::new(0, 0, width, 8);
+            paint_shell_hints(&mut buf, body, Line::from(hint), Style::new());
+            let row = bottom_row(&buf);
+            let cells: Vec<char> = row.chars().collect();
+            assert_eq!(cells.len(), usize::from(width), "{width}: {row}");
+            assert!(
+                row.starts_with("\u{2570}\u{2500}j/k move"),
+                "{width}: {row}"
+            );
+            assert!(
+                row.ends_with("\u{2026} 12/40 \u{256f}"),
+                "{width}: the hint ends in an ellipsis right before the title: {row}"
+            );
+            let inner = &cells[1..cells.len() - 1];
+            assert!(
+                !inner
+                    .iter()
+                    .any(|c| "\u{2514}\u{2518}\u{2570}\u{256f}".contains(*c)),
+                "{width}: the seam is joined under the hint: {row}"
+            );
+        }
+        // A hint that fits before the title is drawn whole, with no ellipsis.
+        let mut buf = two_panes(100);
+        paint_shell_hints(
+            &mut buf,
+            Rect::new(0, 0, 100, 8),
+            Line::from("j/k move"),
+            Style::new(),
+        );
+        let row = bottom_row(&buf);
+        assert!(row.starts_with("\u{2570}\u{2500}j/k move"), "{row}");
+        assert!(!row.contains('\u{2026}'), "{row}");
+        assert!(row.ends_with(" 12/40 \u{256f}"), "{row}");
+    }
+
+    /// The seam is not joined past text on the border: a corner after the title stays.
+    #[test]
+    fn the_seam_join_stops_at_text_on_the_border() {
+        let row = Rect::new(0, 0, 14, 1);
+        let mut buf = Buffer::empty(row);
+        buf.set_string(
+            0,
+            0,
+            "\u{2570}\u{2500}\u{2500}ab\u{2500}\u{256f}\u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}",
+            ratatui::style::Style::default(),
+        );
+        join_panes_under(&mut buf, row, 12);
+        assert_eq!(buf[(6, 0)].symbol(), "\u{256f}", "text ends the join");
+        assert_eq!(buf[(7, 0)].symbol(), "\u{2570}");
     }
 
     /// MOD-67 review L1: `action_for`'s wildcard arm is only safe while every global act is

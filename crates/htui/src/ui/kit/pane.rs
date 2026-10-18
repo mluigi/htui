@@ -230,33 +230,36 @@ pub fn sub_tab_rects(area: Rect, titles: &[&str]) -> Vec<Rect> {
 
 /// Draws `hints` over the horizontal border glyphs of `row`, the last row of a body a tab has
 /// already framed (the M1 adapter until tabs hand their hints to [`Pane::hints`]). They start two
-/// cells in and are clipped to `row.width - 4`; a cell that is not a plain horizontal rule (a
-/// corner, text) is left alone, so a row that is not a border simply loses the hint. `style` is
-/// the hint line's base style.
+/// cells in and are clipped to `row.width - 4`. The hint is drawn only over the run of plain
+/// horizontal rule that starts there: where the tab drew text of its own on the border (a scroll
+/// hint as a bottom title) or a corner stands, the hint ends with an ellipsis in the last rule
+/// cell before it, or whole if it fits in the run. A row whose first cell there is not a rule
+/// gets nothing, so a row that is not a border simply loses the hint. `style` is the hint
+/// line's base style.
 pub fn paint_bottom_hints(buf: &mut Buffer, row: Rect, hints: Line<'_>, style: Style) {
     let width = row.width.saturating_sub(4);
     let row = row.intersection(buf.area);
     if width == 0 || row.is_empty() {
         return;
     }
-    let line = cells::clip_line(hints.patch_style(style), width);
-    let shown = u16::try_from(line.width()).unwrap_or(width).min(width);
-    let origin = Rect::new(row.x + 2, row.y, shown, 1).intersection(buf.area);
+    let start = row.x + 2;
+    let run = (start..start.saturating_add(width))
+        .take_while(|x| *x < row.right() && is_rule(buf[(*x, row.y)].symbol()))
+        .count();
+    let room = u16::try_from(run).unwrap_or(width).min(width);
+    if room == 0 {
+        return;
+    }
+    let line = cells::clip_line(hints.patch_style(style), room);
+    let shown = u16::try_from(line.width()).unwrap_or(room).min(room);
+    let origin = Rect::new(start, row.y, shown, 1).intersection(buf.area);
     if origin.is_empty() {
         return;
     }
     let mut scratch = Buffer::empty(origin);
     line.render(origin, &mut scratch);
-    let mut x = origin.x;
-    while x < origin.right() {
-        let cells_wide = cells::cell_width(scratch[(x, origin.y)].symbol()).max(1);
-        let end = (x + u16::try_from(cells_wide).unwrap_or(1)).min(origin.right());
-        if (x..end).all(|col| is_rule(buf[(col, origin.y)].symbol())) {
-            for col in x..end {
-                buf[(col, origin.y)] = scratch[(col, origin.y)].clone();
-            }
-        }
-        x = end;
+    for col in origin.x..origin.right() {
+        buf[(col, origin.y)] = scratch[(col, origin.y)].clone();
     }
 }
 
@@ -581,7 +584,21 @@ mod tests {
             Line::from("abcd"),
             Style::new(),
         );
-        assert_eq!(row(&mixed, 0), format!("╰─axcd{}╯", "─".repeat(11)));
+        // The hint runs up to the first cell that is not a rule and ends there with an
+        // ellipsis, instead of skipping that cell and going on past it.
+        assert_eq!(row(&mixed, 0), format!("╰─…x{}╯", "─".repeat(13)));
+        let mut room = bordered_row(&format!("╰──x{}╯", "─".repeat(13)));
+        paint_bottom_hints(
+            &mut room,
+            Rect::new(0, 0, 18, 1),
+            Line::from("a"),
+            Style::new(),
+        );
+        assert_eq!(
+            row(&room, 0),
+            format!("╰─ax{}╯", "─".repeat(13)),
+            "a hint that fits before the text is drawn whole, no ellipsis"
+        );
     }
 
     #[test]
