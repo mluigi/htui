@@ -549,3 +549,25 @@ with T5 serially.
   where nothing else in the stack binds that key; where another act does (e.g. `choice.prev` keeping `left`), the key
   is delivered and a focused widget still reads it literally (§3 rule 4). Closing that fully needs `&Keys` in the
   widgets, which the plan rejected (25-file signature change). Record it in the decision doc.
+- **D-14 (Task 0 as built; inertness and the compiled defaults validating).** Recorded after T0 so Tasks 5 and 6
+  refine what exists instead of writing it a second time.
+  - *Shift arrows move to Task 6* (with D-4). `pane.next_subtab`/`prev_subtab`, `settings.next_section`/
+    `prev_section` and `skills.switch_view` keep their version-1 defaults (`l`/`]`/`right`, `h`/`[`/`left`): a
+    shift arrow on them would show in the `?` box and change its snapshots. Task 6 adds `shift-right`/`shift-left`
+    (and `skills.switch_view`'s pair) and updates `the_m2_rows_have_their_task_0_defaults`, which pins their absence.
+  - *Task 5 work already in.* `validate::give_way`'s `version == 1` branch (`new_in_m2`, `V1_DEFAULTS`: a `since: 2`
+    default gives way to a version-1 entry wherever a declared stack meets them) and `validate::met_in_m2` (a
+    version-1 act from before M2 that a stack offers only through a layer M2 added, `views::M2_LAYERS` = `QUIT`,
+    `LAYOUT`, `HISTORY`, does not collide there: the narrower act keeps the chord, so `[global] quit = ["ctrl-d"]`
+    loads and the concepts search keeps `ctrl-d`). Task 5 refines these, it does not re-add them.
+  - *Interim implicit `ctrl-c`.* `load.rs` (`Loader::entry`) appends `ctrl-c` to every entry of a row whose default
+    holds it (quit, `leave.confirm`), in every version, not only §2's version-1 `[global] quit`. Task 5 replaces it
+    with §2's rule when it deletes `CTRL_C_REFUSED` and the `hint.rs` `CTRL_C` appends, and removes `hint.rs`'s
+    `NOT_YET_WIRED` filter once the contexts it hides are wired.
+  - *Also touched outside T0's §12 set:* `keys/stack.rs` `FIXED` `shadowed` lists (`TAB_SELECT_AND_ANSWERS`, the new
+    acts the fixed keys shadow), `keys/hint.rs`, `tests/keys_file.rs` and `tests/fixtures/keys/errors.toml`, and the
+    `app/state.rs` test `every_global_act_is_fixed_mapped_or_offerable` (a `NextPane`/`PrevPane` exemption that Task 6
+    drops when it wires them).
+  - *§1.5's implementer check is a test:* `every_view_that_builds_a_text_widget_names_a_capturing_stack`
+    (`views.rs`) fails a view source that builds a `TextField`/`TextArea`/`Composer` without naming a capturing
+    stack (the Requirements forms and the directory picker are checked through their hosts).
