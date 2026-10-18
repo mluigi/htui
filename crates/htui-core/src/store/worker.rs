@@ -12,10 +12,10 @@
 //! [`WriteStore`] method of the same name by path (UFCS): this module defines the new traits, so
 //! both families are in scope here and a method-call body would be ambiguous.
 //!
-//! `WorkerStore` is 60 methods: 14 [`ReadStore`] reads, 6 [`WriteStore`] reads, 25 writes,
+//! `WorkerStore` is 62 methods: 14 [`ReadStore`] reads, 7 [`WriteStore`] reads, 26 writes,
 //! `write_document`, MOD-42's three command methods, MOD-11's four agent writes and
 //! `item_by_key` (plan D13, B-4), its five command-queue methods (plan D14) and MOD-12 M2's
-//! `run_batch_spend`; [`RelayStore`] is nine (MOD-42 plan D2, MOD-70 plan D4).
+//! `run_batch_spend`; MOD-125 M1 adds `workspace_stop` and `stop_run`; [`RelayStore`] is nine (MOD-42 plan D2, MOD-70 plan D4).
 //! `WorkerHost` is `writer` plus 20 reads (blueprint F-5); MOD-41 T7 adds the 22nd,
 //! `queued_runs_on_box`; MOD-12 M1 adds seven (plan D3, D5, D6), the 29th `close_drained_batch`;
 //! MOD-12 M2 adds two (`batch_spend`, `project_settings`), 31.
@@ -38,7 +38,7 @@ use crate::model::{
     ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId,
     RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome,
     Status, StepGraphId, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus,
-    UpstreamEntry, UserId, WorkspaceSummary,
+    UpstreamEntry, UserId, WorkspaceId, WorkspaceStop, WorkspaceSummary,
 };
 use crate::store::error::Result;
 use crate::store::mem::MemStore;
@@ -187,7 +187,7 @@ pub trait WorkerStore: RecorderStore + RelayStore {
     /// [`ReadStore::notes`]: MOD-89 D6's dedupe reads the item's notes before it writes one.
     fn notes(&self, id: ItemId) -> impl Future<Output = Result<Vec<Note>>> + Send;
 
-    // -- 5 WriteStore reads
+    // -- 7 WriteStore reads
     /// [`WriteStore::repos`].
     fn repos(&self, project: ProjectId) -> impl Future<Output = Result<Vec<Repo>>> + Send;
     /// [`WriteStore::repo_box_paths`].
@@ -208,8 +208,13 @@ pub trait WorkerStore: RecorderStore + RelayStore {
         &self,
         item: ItemId,
     ) -> impl Future<Output = Result<crate::model::RelayView>> + Send;
+    /// [`WriteStore::workspace_stop`].
+    fn workspace_stop(
+        &self,
+        workspace: WorkspaceId,
+    ) -> impl Future<Output = Result<Option<WorkspaceStop>>> + Send;
 
-    // -- 25 writes
+    // -- 26 writes
     /// [`WriteStore::transition`].
     fn transition(
         &self,
@@ -260,6 +265,8 @@ pub trait WorkerStore: RecorderStore + RelayStore {
     ) -> impl Future<Output = Result<bool>> + Send;
     /// [`WriteStore::release_lease`].
     fn release_lease(&self, run: RunId, owner: Uuid) -> impl Future<Output = Result<bool>> + Send;
+    /// [`WriteStore::stop_run`].
+    fn stop_run(&self, run: RunId, owner: Uuid) -> impl Future<Output = Result<bool>> + Send;
     /// [`WriteStore::create_step`].
     fn create_step(&self, new: NewRunStep) -> impl Future<Output = Result<RunStep>> + Send;
     /// [`WriteStore::transition_run`].
@@ -750,6 +757,9 @@ impl WorkerStore for MemStore {
     async fn relay_view(&self, item: ItemId) -> Result<crate::model::RelayView> {
         WriteStore::relay_view(self, item).await
     }
+    async fn workspace_stop(&self, workspace: WorkspaceId) -> Result<Option<WorkspaceStop>> {
+        WriteStore::workspace_stop(self, workspace).await
+    }
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool> {
         WriteStore::transition(self, id, from, to).await
     }
@@ -792,6 +802,9 @@ impl WorkerStore for MemStore {
     }
     async fn release_lease(&self, run: RunId, owner: Uuid) -> Result<bool> {
         WriteStore::release_lease(self, run, owner).await
+    }
+    async fn stop_run(&self, run: RunId, owner: Uuid) -> Result<bool> {
+        WriteStore::stop_run(self, run, owner).await
     }
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {
         WriteStore::create_step(self, new).await

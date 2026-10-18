@@ -45,10 +45,11 @@ use crate::model::{
     RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
     SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId,
     SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase,
-    StepId, StepOpening, StepOutcome, StepPermission, StepStatus, TIMESTAMPTZ_DIGITS,
+    StepId, StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, TIMESTAMPTZ_DIGITS,
     ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
-    canonical_declared_tags, missing_tags_failure, moved_order, overlaps, prompt_summary, scope_of,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
+    WorkspaceSummary, canonical_declared_tags, missing_tags_failure, moved_order, overlaps,
+    prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -302,6 +303,8 @@ struct State {
     queue_entries: BTreeMap<ItemId, QueueEntry>,
     /// `queue_batch` (MOD-12 D2), by id.
     queue_batches: BTreeMap<BatchId, QueueBatch>,
+    /// `workspace_stop` (MOD-125 D4), by workspace.
+    workspace_stops: BTreeMap<WorkspaceId, WorkspaceStop>,
     /// `run.batch_id` (MOD-12 D7), beside `runs` as `lease_owners` is: not a `Run` field.
     run_batches: HashMap<RunId, BatchId>,
     /// `run_command`'s MOD-70 columns for `follow_up` rows, by id (B-2): `run_step_id` and the
@@ -416,6 +419,7 @@ impl MemStore {
             run_commands: BTreeMap::new(),
             queue_entries: BTreeMap::new(),
             queue_batches: BTreeMap::new(),
+            workspace_stops: BTreeMap::new(),
             run_batches: HashMap::new(),
             follow_up_payloads: BTreeMap::new(),
             follow_up_windows: BTreeMap::new(),
@@ -5611,6 +5615,81 @@ impl State {
         Ok(true)
     }
 
+    /// MOD-125 D7: a compare-and-set `running -> stopped` on the owner's lease. The run's
+    /// `running` steps stop with it, and the lease is released as [`State::release_lease`]
+    /// releases it; `false` writes nothing.
+    fn stop_run(&mut self, run: RunId, owner: Uuid, now: DateTime<Utc>) -> Result<bool> {
+        let status = self.require_run(run)?.status;
+        if self.lease_owners.get(&run) != Some(&owner) || status != RunStatus::Running {
+            return Ok(false);
+        }
+        self.lease_owners.remove(&run);
+        if let Some(row) = self.runs.get_mut(&run) {
+            row.status = RunStatus::Stopped;
+            row.lease_expires_at = Some(now);
+            row.updated_at = now;
+        }
+        self.stop_running_steps(run, now);
+        Ok(true)
+    }
+
+    /// MOD-125 D6, D7: every `running` step of `run` moves to `stopped`.
+    fn stop_running_steps(&mut self, run: RunId, now: DateTime<Utc>) {
+        for step in self
+            .steps
+            .values_mut()
+            .filter(|step| step.run_id == run && step.status == StepStatus::Running)
+        {
+            step.status = StepStatus::Stopped;
+            step.updated_at = now;
+        }
+    }
+
+    /// MOD-125 D4: the upsert that only escalates `graceful -> forced`; every other repeat keeps
+    /// the stored row, its instant included.
+    fn stop_workspace(
+        &mut self,
+        workspace: WorkspaceId,
+        mode: StopMode,
+        by: UserId,
+        at: DateTime<Utc>,
+    ) -> Result<WorkspaceStop> {
+        if !self.workspaces.contains_key(&workspace) {
+            return Err(StoreError::NotFound {
+                entity: "workspace",
+                id: workspace.to_string(),
+            });
+        }
+        self.require_user(by, "workspace_stop.requested_by")?;
+        let requested = WorkspaceStop {
+            workspace_id: workspace,
+            mode,
+            requested_by: by,
+            requested_at: at.trunc_subsecs(TIMESTAMPTZ_DIGITS),
+        };
+        let stored = self
+            .workspace_stops
+            .entry(workspace)
+            .and_modify(|row| {
+                if row.mode == StopMode::Graceful && mode == StopMode::Forced {
+                    *row = requested.clone();
+                }
+            })
+            .or_insert_with(|| requested.clone());
+        Ok(stored.clone())
+    }
+
+    /// MOD-125 D4: deletes the stop record; `false` when the workspace was not stopped.
+    fn resume_workspace(&mut self, workspace: WorkspaceId) -> Result<bool> {
+        if !self.workspaces.contains_key(&workspace) {
+            return Err(StoreError::NotFound {
+                entity: "workspace",
+                id: workspace.to_string(),
+            });
+        }
+        Ok(self.workspace_stops.remove(&workspace).is_some())
+    }
+
     /// MOD-78 D1: [`State::fence_holds`]'s predicate on a run. `lease_owners` holds a run only
     /// while its lease names an owner, so a missing entry is Postgres's `NULL`.
     fn lease_holds(&self, run: RunId, fence: StepFence) -> Result<bool> {
@@ -8761,6 +8840,29 @@ impl WriteStore for MemStore {
         self.check_fault(MemFault::ReleaseLease)?;
         let now = self.now();
         self.write(|state| state.release_lease(run, owner, now))
+    }
+
+    async fn stop_workspace(
+        &self,
+        workspace: WorkspaceId,
+        mode: StopMode,
+        by: UserId,
+        at: DateTime<Utc>,
+    ) -> Result<WorkspaceStop> {
+        self.write(|state| state.stop_workspace(workspace, mode, by, at))
+    }
+
+    async fn workspace_stop(&self, workspace: WorkspaceId) -> Result<Option<WorkspaceStop>> {
+        Ok(self.read(|state| state.workspace_stops.get(&workspace).cloned()))
+    }
+
+    async fn resume_workspace(&self, workspace: WorkspaceId) -> Result<bool> {
+        self.write(|state| state.resume_workspace(workspace))
+    }
+
+    async fn stop_run(&self, run: RunId, owner: Uuid) -> Result<bool> {
+        let now = self.now();
+        self.write(|state| state.stop_run(run, owner, now))
     }
 
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {

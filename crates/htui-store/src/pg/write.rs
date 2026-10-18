@@ -41,9 +41,9 @@ use htui_core::model::{
     RunStepCommit, RunStepTree, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding,
     SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
     StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
-    StepStatus, UserId, VerifyOutcome, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject, canonical_declared_tags, missing_tags_failure, moved_order,
-    overlaps, scope_of,
+    StepStatus, StopMode, UserId, VerifyOutcome, WaitingPermission, Workspace, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop, canonical_declared_tags,
+    missing_tags_failure, moved_order, overlaps, scope_of,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
@@ -5128,6 +5128,228 @@ impl WriteStore for PgStore {
                 id: run.to_string(),
             })
         }
+    }
+
+    /// MOD-125 D4: the upsert on `workspace_stop`'s key that only escalates `graceful -> forced`,
+    /// in one transaction.
+    ///
+    /// The workspace and the user are read first, explicitly: the no-op conflict path writes no
+    /// row and so takes no foreign-key check, and without the user read an unknown `by` over a
+    /// stored row would be answered `Ok` here and `Constraint` by `MemStore`. `ON CONFLICT DO
+    /// UPDATE ... WHERE` returns no row when its `WHERE` is false, so the stored row is then read
+    /// back; the conflict locked it, so the read sees what the upsert decided on.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "workspace" }`; [`StoreError::Constraint`] for an
+    /// unknown user.
+    async fn stop_workspace(
+        &self,
+        workspace: WorkspaceId,
+        mode: StopMode,
+        by: UserId,
+        at: DateTime<Utc>,
+    ) -> Result<WorkspaceStop> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let known = sqlx::query_scalar!(
+            r#"SELECT 1 AS "one!" FROM workspace WHERE id = $1"#,
+            workspace.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .is_some();
+        if !known {
+            return Err(StoreError::NotFound {
+                entity: "workspace",
+                id: workspace.to_string(),
+            });
+        }
+        let user = sqlx::query_scalar!(
+            r#"SELECT 1 AS "one!" FROM app_user WHERE id = $1"#,
+            by.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .is_some();
+        if !user {
+            return Err(StoreError::Constraint(references_no_row(
+                "workspace_stop.requested_by",
+                by,
+                "app_user",
+            )));
+        }
+
+        let written = sqlx::query_as!(
+            WorkspaceStop,
+            r#"
+            INSERT INTO workspace_stop AS ws (workspace_id, mode, requested_by, requested_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (workspace_id) DO UPDATE
+               SET mode         = 'forced',
+                   requested_by = EXCLUDED.requested_by,
+                   requested_at = EXCLUDED.requested_at
+             WHERE ws.mode = 'graceful' AND EXCLUDED.mode = 'forced'
+            RETURNING workspace_id AS "workspace_id: WorkspaceId",
+                      mode         AS "mode: StopMode",
+                      requested_by AS "requested_by: UserId",
+                      requested_at
+            "#,
+            workspace.as_uuid(),
+            mode.as_str(),
+            by.as_uuid(),
+            at,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        let stored = match written {
+            Some(row) => row,
+            None => sqlx::query_as!(
+                WorkspaceStop,
+                r#"
+                    SELECT workspace_id AS "workspace_id: WorkspaceId",
+                           mode         AS "mode: StopMode",
+                           requested_by AS "requested_by: UserId",
+                           requested_at
+                      FROM workspace_stop WHERE workspace_id = $1
+                    "#,
+                workspace.as_uuid(),
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_sqlx)?,
+        };
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(stored)
+    }
+
+    /// MOD-125 D4: the workspace's stop record, read on the pool.
+    ///
+    /// # Errors
+    ///
+    /// The backend's own failures only.
+    async fn workspace_stop(&self, workspace: WorkspaceId) -> Result<Option<WorkspaceStop>> {
+        sqlx::query_as!(
+            WorkspaceStop,
+            r#"
+            SELECT workspace_id AS "workspace_id: WorkspaceId",
+                   mode         AS "mode: StopMode",
+                   requested_by AS "requested_by: UserId",
+                   requested_at
+              FROM workspace_stop WHERE workspace_id = $1
+            "#,
+            workspace.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// MOD-125 D4: one `DELETE`; zero rows are told apart from an unknown workspace by one
+    /// follow-up read, as [`WriteStore::refresh_lease`] tells its zero rows apart.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "workspace" }`.
+    async fn resume_workspace(&self, workspace: WorkspaceId) -> Result<bool> {
+        let deleted = sqlx::query!(
+            "DELETE FROM workspace_stop WHERE workspace_id = $1",
+            workspace.as_uuid(),
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+        if deleted == 1 {
+            return Ok(true);
+        }
+        let exists = sqlx::query_scalar!(
+            r#"SELECT 1 AS "one!" FROM workspace WHERE id = $1"#,
+            workspace.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .is_some();
+        if exists {
+            Ok(false)
+        } else {
+            Err(StoreError::NotFound {
+                entity: "workspace",
+                id: workspace.to_string(),
+            })
+        }
+    }
+
+    /// MOD-125 D7: the compare-and-set `running -> stopped`, in one transaction that locks the
+    /// run's `running` steps **before** the run (MOD-77 D1's step → run order, which `park_step`
+    /// and `upsert_step_tree` take; the reverse could deadlock against them,
+    /// `pg_criteria.rs::stop_run_takes_the_steps_first`).
+    ///
+    /// The first read is unlocked and only decides the early exit (unknown run, not running, not
+    /// ours), which takes no lock. The steps are then locked `FOR NO KEY UPDATE`, which waits,
+    /// since the run is ours; the run is re-checked under its own lock, and a run that is no
+    /// longer running or ours rolls back as `false`. The lease is released as
+    /// [`WriteStore::release_lease`] releases it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "run" }`, read first.
+    async fn stop_run(&self, run: RunId, owner: Uuid) -> Result<bool> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let seen = sqlx::query!(
+            r#"SELECT status AS "status: RunStatus", lease_owner AS "lease_owner?" FROM run WHERE id = $1"#,
+            run.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "run",
+            id: run.to_string(),
+        })?;
+        if seen.status != RunStatus::Running || seen.lease_owner != Some(owner) {
+            return Ok(false);
+        }
+
+        let steps = sqlx::query_scalar!(
+            r#"SELECT id AS "id: StepId" FROM run_step WHERE run_id = $1 AND status = 'running' ORDER BY id FOR NO KEY UPDATE"#,
+            run.as_uuid(),
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        let locked = sqlx::query!(
+            r#"SELECT status AS "status: RunStatus", lease_owner AS "lease_owner?" FROM run WHERE id = $1 FOR NO KEY UPDATE"#,
+            run.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if locked.status != RunStatus::Running || locked.lease_owner != Some(owner) {
+            return Ok(false);
+        }
+
+        let steps: Vec<Uuid> = steps.into_iter().map(|id| id.as_uuid()).collect();
+        sqlx::query!(
+            "UPDATE run_step SET status = 'stopped' WHERE id = ANY($1::uuid[]) AND status = 'running'",
+            &steps,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        sqlx::query!(
+            "UPDATE run SET status = 'stopped', lease_owner = NULL, lease_expires_at = clock_timestamp() WHERE id = $1",
+            run.as_uuid(),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(true)
     }
 
     /// A `run_step` at `pending` with every settle column `NULL`; `fanout_index = -1` is the judge

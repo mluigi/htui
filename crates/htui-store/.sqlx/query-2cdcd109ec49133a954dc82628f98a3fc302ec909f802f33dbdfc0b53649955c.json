@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run SET status = 'stopped', lease_owner = NULL, lease_expires_at = clock_timestamp() WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2cdcd109ec49133a954dc82628f98a3fc302ec909f802f33dbdfc0b53649955c"
+}

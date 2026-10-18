@@ -7073,6 +7073,45 @@ async fn upsert_step_tree_takes_the_step_first() {
     db.drop_db().await;
 }
 
+/// MOD-125 D7 (blueprint F5): `stop_run` is the first writer that updates a run **and** its
+/// steps, so it takes MOD-77's step → run order: it waits on a held running step holding nothing
+/// on the run (a park holding the step then takes the run without `40P01`), then lands and stops
+/// both.
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_run_takes_the_steps_first() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (run, step, owner) = leased_running_step(&db).await;
+    let store = db.store.clone();
+    let answer =
+        assert_takes_the_step_first(
+            &db,
+            run,
+            step,
+            async move { store.stop_run(run, owner).await },
+        )
+        .await;
+    assert!(
+        answer.expect("the stop lands"),
+        "the owner's running run stops"
+    );
+    let (run_status, step_status): (String, String) = sqlx::query_as(
+        "SELECT r.status, s.status FROM run r JOIN run_step s ON s.run_id = r.id WHERE s.id = $1",
+    )
+    .bind(step.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("read the statuses");
+    assert_eq!(
+        (run_status.as_str(), step_status.as_str()),
+        ("stopped", "stopped"),
+        "the run and its running step are stopped together"
+    );
+
+    db.drop_db().await;
+}
+
 /// MOD-77 plan D1: `record_commits` waits on a held step holding nothing on its run, then lands.
 #[tokio::test(flavor = "multi_thread")]
 async fn record_commits_takes_the_step_first() {
