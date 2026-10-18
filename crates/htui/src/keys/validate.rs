@@ -43,7 +43,9 @@ use crossterm::event::KeyModifiers;
 /// MOD-115 M2 D8 (MD4): a file from before M2 (`version = 1`, or no version) keeps loading. A
 /// default M2 added or changed (`since: 2`) that the file leaves alone gives its chord to an entry
 /// of any context wherever a [`DECLARED`] stack makes both candidates for it, with the same
-/// notice; `[global] quit = ["z"]` loads and `layout.zoom` loses `z`. Only a chord the entry
+/// notice; `[global] quit = ["z"]` loads and `layout.zoom` loses `z`. An `[editor] focus` entry
+/// takes it in any context, since E9 (d) holds focus against every row: `[editor] focus =
+/// ["f2"]` loads and `layout.toggle_list` loses `f2`. Only a chord the entry
 /// added gives way: one it repeats from its own default met the M2 default in the compiled keys
 /// already. A `version = 2` file gets the strict rules above.
 pub(super) fn give_way(keys: &mut Keys) {
@@ -85,10 +87,12 @@ pub(super) fn give_way(keys: &mut Keys) {
                 for &chord in entry.chords.iter().filter(|c| {
                     default.chords.contains(c) && new_in_m2(default.act, **c) && added(entry, **c)
                 }) {
-                    let meet = DECLARED.iter().any(|&(_, stack)| {
-                        let candidates = keys.actions(stack, chord);
-                        candidates.contains(&entry.act) && candidates.contains(&default.act)
-                    });
+                    // E9 (d) holds `editor.focus` against every row in any context.
+                    let meet = entry.act == Act::EditorFocus
+                        || DECLARED.iter().any(|&(_, stack)| {
+                            let candidates = keys.actions(stack, chord);
+                            candidates.contains(&entry.act) && candidates.contains(&default.act)
+                        });
                     let known = taken
                         .iter()
                         .any(|(at, lost)| *at == index && lost.chord == chord);
@@ -442,7 +446,7 @@ fn subject(row: &Row) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{check, line_of, resolve_at, validate};
+    use super::{check, line_of, new_in_m2, resolve_at, validate};
     use crate::keys::{
         Act, CTRL_C, Context, DECLARED, FIXED, Fixed, KeyChord, Keys, SHADOWING, STATE_GUARDED,
         load_str, views,
@@ -507,6 +511,62 @@ mod tests {
                 "{spec}: {strict:?}"
             );
         }
+    }
+
+    /// MOD-115 M2 D8 (MD4): a version-1 `[editor] focus` on a chord only a default M2 added
+    /// holds loaded before M2, so it still loads: E9 (d) holds focus against every row in any
+    /// context, so the M2 default gives way to it wherever it sits, with the usual notice, and
+    /// focus keeps the chord. A version-2 file is refused (`f2`, `layout.toggle_list`).
+    #[test]
+    fn a_version_1_focus_takes_any_chord_only_an_m2_default_holds() {
+        let compiled = Keys::compiled();
+        let mut checked = 0;
+        for row in &compiled.rows {
+            for &key in row.chords.iter().filter(|&&c| new_in_m2(row.act, c)) {
+                // Only a chord nothing from before M2 holds: any other loaded no better before.
+                if key == CTRL_C
+                    || key.is_printable()
+                    || compiled
+                        .rows
+                        .iter()
+                        .any(|other| other.chords.contains(&key) && !new_in_m2(other.act, key))
+                {
+                    continue;
+                }
+                checked += 1;
+                let src = format!("version = 1\n[editor]\nfocus = [{:?}]\n", key.spec());
+                let keys = load_str(&src).unwrap_or_else(|errors| panic!("{src}: {errors:?}"));
+                assert_eq!(
+                    keys.chords(Context::Editor, Act::EditorFocus),
+                    [key],
+                    "{src}"
+                );
+                assert!(
+                    keys.rows
+                        .iter()
+                        .all(|row| row.act == Act::EditorFocus || !row.chords.contains(&key)),
+                    "{src}: another row kept it"
+                );
+                assert!(
+                    keys.notices().iter().any(|notice| notice.line == 3
+                        && notice.message.starts_with(&format!(
+                            "[editor] focus = {:?} takes {:?} from ",
+                            key.spec(),
+                            key.spec()
+                        ))),
+                    "{src}: {:?}",
+                    keys.notices()
+                );
+            }
+        }
+        assert!(checked >= 9, "{checked} chords checked");
+        assert_eq!(
+            errors("version = 2\n[editor]\nfocus = [\"f2\"]\n"),
+            one(
+                3,
+                r#"[editor] focus = "f2": "f2" is already layout.toggle_list (default) while an edit is open"#
+            )
+        );
     }
 
     /// MOD-115 M2 D8 (MD4): in no stack where quit is offered only through a layer M2 added
