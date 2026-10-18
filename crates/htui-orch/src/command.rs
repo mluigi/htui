@@ -961,10 +961,11 @@ fn unselected(
 
 /// §6.2's "Enabled when" for `cancel run` (plan D45): the run has not finished.
 ///
-/// `queued`, `running` and `awaiting_approval` are exactly the three `RunStatus::can_move_to`
-/// admits `cancelled` from (`crates/htui-core/src/model/run.rs`), and exactly
-/// [`RunStatus::is_active`]'s three — so the guard is stated against the table rather than against
-/// a list, and a status added to §4.3 cannot be silently left out of it.
+/// The three live statuses but `stopped`: `queued`, `running` and `awaiting_approval`.
+/// `RunStatus::can_move_to` admits `cancelled` from all four of [`RunStatus::is_active`]'s
+/// statuses (`crates/htui-core/src/model/run.rs`), so the guard is stated against the table
+/// rather than against a list, less `stopped` (MOD-125 D2: the law allows it; wired in M3, which
+/// applies a stopped run's cancel).
 ///
 /// A `queued` run has no steps and was never claimed; cancelling it is still legal and still ends
 /// with a cleanup, because the run may have been claimed and crashed between the two reads.
@@ -978,9 +979,9 @@ fn unselected(
 /// step of the run (plan D212).
 ///
 /// # Errors
-/// [`EngineError::RunStatus`] for a `done`, `failed` or `cancelled` run.
+/// [`EngineError::RunStatus`] for a `stopped`, `done`, `failed` or `cancelled` run.
 pub fn cancel_enabled(run: &Run) -> Result<(), EngineError> {
-    if run.status.is_active() {
+    if run.status.is_active() && run.status != RunStatus::Stopped {
         return Ok(());
     }
     Err(EngineError::RunStatus {
@@ -1266,7 +1267,8 @@ pub fn close_out_enabled(item: &Item, runs: &[Run]) -> Result<Resolution, Engine
 /// MOD-4 plan D177 (R-25): a manual cleanup retry is for a run that has finished.
 ///
 /// # Errors
-/// [`EngineError::NotTerminal`] for a `queued`, `running` or `awaiting_approval` run.
+/// [`EngineError::NotTerminal`] for a `queued`, `running`, `awaiting_approval` or `stopped` run
+/// (a stopped run keeps its trees, MOD-125 D2).
 pub fn cleanup_enabled(run: &Run) -> Result<(), EngineError> {
     if run.status.is_terminal() {
         return Ok(());
@@ -1644,8 +1646,8 @@ mod tests {
         );
     }
 
-    /// Plan D45 against §4.3's own table: the three statuses `cancelled` is reachable from are
-    /// the three the guard admits, and no other.
+    /// Plan D45 against §4.3's own table: the statuses `cancelled` is reachable from are the
+    /// ones the guard admits, less `stopped`, and no other.
     #[test]
     fn cancel_is_enabled_exactly_where_the_run_table_allows_it() {
         let mut run = demo_data()
@@ -1669,6 +1671,25 @@ mod tests {
                 "`{status}` is cancellable"
             );
         }
+
+        // MOD-125 D2: the law allows it; wired in M3.
+        run.status = RunStatus::Stopped;
+        assert!(
+            RunStatus::Stopped.can_move_to(RunStatus::Cancelled),
+            "`stopped` reaches `cancelled` in §4.3's amended table"
+        );
+        let refused = super::cancel_enabled(&run).expect_err("M1 shows no cancel of a stopped run");
+        assert!(
+            matches!(
+                &refused,
+                EngineError::RunStatus {
+                    status: RunStatus::Stopped,
+                    expected: "queued | running | awaiting_approval",
+                    ..
+                }
+            ),
+            "{refused}"
+        );
 
         for status in [RunStatus::Done, RunStatus::Failed, RunStatus::Cancelled] {
             run.status = status;
@@ -2316,6 +2337,8 @@ mod tests {
             RunStatus::Queued,
             RunStatus::Running,
             RunStatus::AwaitingApproval,
+            // MOD-125 D2: a stopped run keeps its trees.
+            RunStatus::Stopped,
         ] {
             run.status = status;
             assert!(

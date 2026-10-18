@@ -1339,7 +1339,7 @@ impl ReadStore for CacheStore {
         }
         let sql = format!(
             "SELECT {RUN_SELECT} FROM run WHERE item_id IN ({}) \
-               AND status IN ('queued','running','awaiting_approval')",
+               AND status IN ('queued','running','awaiting_approval','stopped')",
             placeholders(items.len()),
         );
         let mut query = sqlx::query(AssertSqlSafe(sql));
@@ -1466,7 +1466,8 @@ impl CacheStore {
         }))
     }
 
-    /// How many runs of the scope are active (`RunStatus::is_active`).
+    /// How many runs of the scope are on the top bar's count (`RunStatus::on_top_bar`, MOD-125
+    /// D2: the live runs less `stopped`).
     ///
     /// # Errors
     ///

@@ -2817,7 +2817,9 @@ fn lost_to_a_claim(err: &EngineError) -> bool {
     match err {
         EngineError::LeaseHeld { .. } => true,
         EngineError::RunStatus { status, .. } => {
-            *status != RunStatus::Queued && !status.is_terminal()
+            // MOD-125 D2: a `stopped` run's cancel is refused by `cancel_enabled` (wired in M3),
+            // which is an answer, not a lost race.
+            !matches!(*status, RunStatus::Queued | RunStatus::Stopped) && !status.is_terminal()
         }
         _ => false,
     }
@@ -3016,8 +3018,13 @@ async fn cancel_run<H: htui_core::store::WorkerHost, P: ReplySink>(
     // Review L-4: a claim by another process that lands between this snapshot and the queued CAS
     // leaves a run that is no longer queued, so D12 step 2's "otherwise" holds: the run is read
     // again (its `executing_box_id` decides step 4) and the cancel goes durable. A run that reads
-    // queued or terminal again keeps today's rowless refusal.
-    let row = if existing.is_none() && (row.status == RunStatus::Queued || row.status.is_terminal())
+    // queued or terminal again keeps today's rowless refusal. MOD-125 D2: so does a `stopped`
+    // run, whose cancel `cancel_enabled` refuses until M3 wires it: a durable row nobody applies
+    // would be a cancel M1 shows but cannot do.
+    let row = if existing.is_none()
+        && (row.status == RunStatus::Queued
+            || row.status == RunStatus::Stopped
+            || row.status.is_terminal())
     {
         let queued = Box::pin(on_run_unless_claimed(
             &ctx,
@@ -3031,7 +3038,13 @@ async fn cancel_run<H: htui_core::store::WorkerHost, P: ReplySink>(
             return;
         };
         match ctx.tag(run).await {
-            Some(row) if row.status != RunStatus::Queued && !row.status.is_terminal() => row,
+            Some(row)
+                if row.status != RunStatus::Queued
+                    && row.status != RunStatus::Stopped
+                    && !row.status.is_terminal() =>
+            {
+                row
+            }
             _ => return refuse(&ctx, lost.to_string()),
         }
     } else {
@@ -4817,6 +4830,86 @@ mod role_gate {
         runtime.sweep_with(&backend, &sink);
         rests_at(&store, later, RunStatus::AwaitingApproval).await;
         assert!(runtime.settle(PATIENCE).await.is_empty());
+    }
+
+    /// Every `Failed` answer's sentence, in arrival order.
+    #[derive(Debug, Clone, Default)]
+    struct Refusals(Arc<StdMutex<Vec<String>>>);
+
+    impl ReplySink for Refusals {
+        type Addr = u64;
+        type Subscriber = u64;
+
+        fn subscriber(addr: &u64) -> u64 {
+            *addr
+        }
+
+        fn send(&self, _to: &u64, reply: RunReply) {
+            if let RunReply::Failed { message, .. } = reply {
+                self.0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(message);
+            }
+        }
+    }
+
+    /// MOD-125 D2 (blueprint F4): `cancel_enabled` refuses a `stopped` run until M3 wires its
+    /// cancel, so `c` on one is answered with that refusal and leaves no durable `run_command`
+    /// row that no executor would ever apply.
+    #[tokio::test]
+    async fn a_cancel_of_a_stopped_run_is_refused_and_writes_no_row() {
+        let store = seeded(MemStore::demo()).await;
+        let run = stranded(&store, ids::HTUI_ANA_2).await;
+        assert!(
+            store
+                .transition_run(run, RunStatus::Running, RunStatus::Stopped, Utc::now())
+                .await
+                .expect("the move answers"),
+            "`running -> stopped` is sanctioned (MOD-125 D1)"
+        );
+        let mut runtime: RunRuntime<Backend, Refusals> = RunRuntime::with_parts(
+            Arc::new(FakeIsolator::new()) as Arc<dyn Isolator>,
+            Arc::new(FakeVerifier::new()),
+            DriverFactory::new(),
+        );
+        let backend = Backend::memory(store.clone());
+        let sink = Refusals::default();
+
+        runtime
+            .serve_request(
+                &backend,
+                &sink,
+                1,
+                RunRequest::Orch(crate::OrchRequest::Command(htui_orch::Command::CancelRun {
+                    run,
+                })),
+                &LiveChats::default(),
+            )
+            .await;
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+
+        let refusals = sink
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert_eq!(refusals.len(), 1, "one answer: {refusals:?}");
+        assert!(
+            refusals[0].contains("stopped"),
+            "the refusal names the status: {}",
+            refusals[0]
+        );
+        assert_eq!(status_of(&store, run).await, RunStatus::Stopped);
+        let relay = store
+            .relay_view(ids::HTUI_ANA_2)
+            .await
+            .expect("the read answers");
+        assert!(
+            relay.cancels.is_empty(),
+            "no pending cancel row: {:?}",
+            relay.cancels
+        );
     }
 
     /// MOD-12 D8 (blueprint H-8): a sweep asked for while one runs is not dropped. The first

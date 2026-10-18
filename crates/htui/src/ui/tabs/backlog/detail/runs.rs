@@ -1193,7 +1193,8 @@ fn run_style(theme: &Theme, status: RunStatus) -> Style {
         RunStatus::Queued => theme.base,
         RunStatus::Running => theme.running,
         RunStatus::AwaitingApproval => theme.warning,
-        RunStatus::Done => theme.dim,
+        // MOD-125: a stopped run waits for a deliberate resume, not an answer, so it is dim.
+        RunStatus::Done | RunStatus::Stopped => theme.dim,
         RunStatus::Failed | RunStatus::Cancelled => theme.error,
     }
 }
@@ -1204,7 +1205,7 @@ fn step_style(theme: &Theme, status: StepStatus) -> Style {
         StepStatus::Pending | StepStatus::Superseded => theme.dim,
         StepStatus::Running => theme.running,
         StepStatus::AwaitingApproval => theme.warning,
-        StepStatus::Done => theme.dim,
+        StepStatus::Done | StepStatus::Stopped => theme.dim,
         StepStatus::Failed | StepStatus::Cancelled => theme.error,
     }
 }

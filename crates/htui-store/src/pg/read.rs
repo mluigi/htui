@@ -40,14 +40,22 @@ use crate::pg::PgStore;
 use crate::pg::rows::{LinkNodeRow, PersonaRow, RunRow, SkillBindingRow, StepRow, UpstreamRow};
 use crate::{MAX_UPSTREAM_HOPS, order_documents};
 
-/// The `status IN (...)` list `active_runs` spells out, because `query!` needs a literal and
-/// cannot read a Rust constant.
+/// The `status IN (...)` list `waiting_candidates` spells out (the live runs, MOD-125 D2), because
+/// `query!` needs a literal and cannot read a Rust constant.
 ///
 /// Test-only: the query text is the real definition, and
-/// `active_runs_literal_matches_run_status` is what keeps it honest against
+/// `live_runs_literal_matches_run_status` is what keeps it honest against
 /// [`RunStatus::is_active`](htui_core::model::RunStatus::is_active).
 #[cfg(test)]
-const ACTIVE_RUN_STATUSES: [&str; 3] = ["queued", "running", "awaiting_approval"];
+const LIVE_RUN_STATUSES: [&str; 4] = ["queued", "running", "awaiting_approval", "stopped"];
+
+/// The `status IN (...)` list `active_runs` spells out: the top bar's count, the live runs less
+/// `stopped` (MOD-125 D2).
+///
+/// Test-only, like [`LIVE_RUN_STATUSES`]: `top_bar_runs_literal_matches_run_status` keeps it
+/// honest against [`RunStatus::on_top_bar`](htui_core::model::RunStatus::on_top_bar).
+#[cfg(test)]
+const TOP_BAR_RUN_STATUSES: [&str; 3] = ["queued", "running", "awaiting_approval"];
 
 /// The `Uuid`s of a scope's projects, in scope order (blueprint H.17).
 fn project_uuids(scope: &Scope) -> Vec<Uuid> {
@@ -1175,7 +1183,7 @@ impl ReadStore for PgStore {
 
     /// MOD-69 plan D1, D2: three reads — the candidate items, their active runs, those runs' steps —
     /// grouped and ordered by `WaitingCandidate::assemble`. A display read: the statements need not
-    /// share a snapshot (blueprint H-7). The run read's `status IN (...)` is `ACTIVE_RUN_STATUSES`'
+    /// share a snapshot (blueprint H-7). The run read's `status IN (...)` is `LIVE_RUN_STATUSES`'
     /// literal (blueprint H-24).
     async fn waiting_candidates(&self, scope: &Scope) -> Result<Vec<WaitingCandidate>> {
         if scope.is_empty() {
@@ -1243,7 +1251,7 @@ impl ReadStore for PgStore {
                    updated_at
               FROM run
              WHERE item_id = ANY($1)
-               AND status IN ('queued','running','awaiting_approval')
+               AND status IN ('queued','running','awaiting_approval','stopped')
             "#,
             &item_ids[..],
         )
@@ -1396,11 +1404,11 @@ impl PgStore {
         .map_err(map_sqlx)
     }
 
-    /// How many runs of the scope are active
-    /// ([`RunStatus::is_active`](htui_core::model::RunStatus::is_active)).
+    /// How many runs of the scope are on the top bar's count
+    /// ([`RunStatus::on_top_bar`](htui_core::model::RunStatus::on_top_bar), MOD-125 D2).
     ///
     /// The status list is written out because `query!` needs a literal; the unit test below
-    /// asserts it against `RunStatus::ALL`.
+    /// asserts it (`TOP_BAR_RUN_STATUSES`) against `RunStatus::ALL`.
     ///
     /// # Errors
     ///
@@ -2623,7 +2631,7 @@ impl PgStore {
                    lease_expires_at,
                    updated_at
               FROM run
-             WHERE status IN ('queued','running','awaiting_approval')
+             WHERE status IN ('queued','running','awaiting_approval','stopped')
                AND repo_scope && $1::uuid[]
              ORDER BY queued_at, id
             "#,
@@ -3283,10 +3291,10 @@ impl PgStore {
 mod tests {
     use htui_core::model::RunStatus;
 
-    use super::ACTIVE_RUN_STATUSES;
+    use super::{LIVE_RUN_STATUSES, TOP_BAR_RUN_STATUSES};
 
     #[test]
-    fn active_runs_literal_matches_run_status() {
+    fn live_runs_literal_matches_run_status() {
         let from_model: Vec<&str> = RunStatus::ALL
             .iter()
             .filter(|status| status.is_active())
@@ -3294,8 +3302,23 @@ mod tests {
             .collect();
         assert_eq!(
             from_model,
-            ACTIVE_RUN_STATUSES.to_vec(),
-            "the `status IN (...)` literal of `active_runs` and `RunStatus::is_active` must agree"
+            LIVE_RUN_STATUSES.to_vec(),
+            "the `status IN (...)` literal of `waiting_candidates` and `RunStatus::is_active` must \
+             agree"
+        );
+    }
+
+    #[test]
+    fn top_bar_runs_literal_matches_run_status() {
+        let from_model: Vec<&str> = RunStatus::ALL
+            .iter()
+            .filter(|status| status.on_top_bar())
+            .map(|status| status.as_str())
+            .collect();
+        assert_eq!(
+            from_model,
+            TOP_BAR_RUN_STATUSES.to_vec(),
+            "the `status IN (...)` literal of `active_runs` and `RunStatus::on_top_bar` must agree"
         );
     }
 }

@@ -2155,7 +2155,10 @@ pub fn chat_step_status(status: RunStatus) -> Option<StepStatus> {
         RunStatus::Done => Some(StepStatus::Done),
         RunStatus::Failed => Some(StepStatus::Failed),
         RunStatus::Cancelled => Some(StepStatus::Cancelled),
-        RunStatus::Queued | RunStatus::Running | RunStatus::AwaitingApproval => None,
+        RunStatus::Queued
+        | RunStatus::Running
+        | RunStatus::AwaitingApproval
+        | RunStatus::Stopped => None,
     }
 }
 

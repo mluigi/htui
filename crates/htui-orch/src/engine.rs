@@ -3010,7 +3010,10 @@ where
                         expected: "running",
                     });
                 }
+                // MOD-125 D2: a `stopped` run is at rest like a parked one; `resting` writes
+                // nothing and answers `Rest { run: Stopped, .. }`, which no caller cleans up.
                 RunStatus::AwaitingApproval
+                | RunStatus::Stopped
                 | RunStatus::Done
                 | RunStatus::Failed
                 | RunStatus::Cancelled => {
@@ -4676,6 +4679,7 @@ where
                         .await;
                 }
                 StepStatus::Running
+                | StepStatus::Stopped
                 | StepStatus::Done
                 | StepStatus::Superseded
                 | StepStatus::Cancelled => {}

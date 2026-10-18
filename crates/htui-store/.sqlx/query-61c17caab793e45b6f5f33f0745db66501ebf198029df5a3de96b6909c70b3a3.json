@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT count(*) FROM run WHERE item_id = $1 AND id <> $2 AND status IN ('queued','running','awaiting_approval')",
+  "query": "SELECT count(*) FROM run WHERE item_id = $1 AND id <> $2 AND status IN ('queued','running','awaiting_approval','stopped')",
   "describe": {
     "columns": [
       {
@@ -20,5 +20,5 @@
       null
     ]
   },
-  "hash": "2cb946d1c42989fd842986a1421e9de344af572e352b691a9d9a81df707c69db"
+  "hash": "61c17caab793e45b6f5f33f0745db66501ebf198029df5a3de96b6909c70b3a3"
 }

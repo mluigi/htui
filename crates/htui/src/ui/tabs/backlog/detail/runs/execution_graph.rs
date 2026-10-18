@@ -234,7 +234,7 @@ impl StepNode {
             StepStatus::Failed => self.theme.error,
             StepStatus::Running => self.theme.running,
             StepStatus::AwaitingApproval => self.theme.warning,
-            StepStatus::Superseded | StepStatus::Cancelled => self.theme.dim,
+            StepStatus::Superseded | StepStatus::Cancelled | StepStatus::Stopped => self.theme.dim,
             StepStatus::Pending | StepStatus::Done => self.theme.base,
         }
     }
@@ -243,7 +243,7 @@ impl StepNode {
     /// otherwise.
     fn text(&self) -> Style {
         match self.status {
-            StepStatus::Superseded | StepStatus::Cancelled => self.theme.dim,
+            StepStatus::Superseded | StepStatus::Cancelled | StepStatus::Stopped => self.theme.dim,
             StepStatus::Pending
             | StepStatus::Running
             | StepStatus::AwaitingApproval

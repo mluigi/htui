@@ -302,6 +302,7 @@ mod tests {
                 "queued",
                 "running",
                 "awaiting_approval",
+                "stopped",
                 "done",
                 "failed",
                 "cancelled",
@@ -313,6 +314,7 @@ mod tests {
                 "pending",
                 "running",
                 "awaiting_approval",
+                "stopped",
                 "done",
                 "failed",
                 "cancelled",
@@ -427,16 +429,29 @@ mod tests {
         }
     }
 
+    /// MOD-125 D2: `is_active` is the live set, `on_top_bar` the top bar's count (the live set
+    /// less `stopped`).
     #[test]
-    fn run_status_activity_matches_top_bar_rule() {
+    fn run_status_liveness_and_the_top_bar_rule() {
         for status in RunStatus::ALL {
             assert_eq!(
                 status.is_active(),
                 matches!(
                     status,
+                    RunStatus::Queued
+                        | RunStatus::Running
+                        | RunStatus::AwaitingApproval
+                        | RunStatus::Stopped
+                ),
+                "{status} liveness"
+            );
+            assert_eq!(
+                status.on_top_bar(),
+                matches!(
+                    status,
                     RunStatus::Queued | RunStatus::Running | RunStatus::AwaitingApproval
                 ),
-                "{status} activity"
+                "{status} on the top bar"
             );
         }
     }

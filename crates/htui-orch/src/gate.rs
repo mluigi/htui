@@ -1032,7 +1032,9 @@ pub(crate) async fn retire_slot<S: htui_core::store::WorkerStore, C: Clock + ?Si
             // which creates `(3,2)` after `(2,2)` is approved — would be unreachable. D5's reason
             // for the exclusion was that `superseded` is illegal from `failed`, and it is; the
             // conclusion it drew from that is the part this corrects.
-            StepStatus::Running | StepStatus::Failed => {
+            // MOD-125 D1: a `stopped` step retires the same way; `superseded` is reserved for M3's
+            // fresh rerun.
+            StepStatus::Running | StepStatus::Stopped | StepStatus::Failed => {
                 move_step(ctx, step.id, step.status, StepStatus::Cancelled, now).await?;
             }
             StepStatus::Superseded | StepStatus::Cancelled => {}

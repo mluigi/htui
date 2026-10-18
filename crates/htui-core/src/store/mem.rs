@@ -478,13 +478,13 @@ impl MemStore {
         }))
     }
 
-    /// How many runs of the scope are active (`RunStatus::is_active`).
+    /// How many runs of the scope are on the top bar (`RunStatus::on_top_bar`, MOD-125 D2).
     pub async fn active_runs(&self, scope: &Scope) -> Result<usize> {
         Ok(self.read(|state| {
             state
                 .runs
                 .values()
-                .filter(|run| run.status.is_active() && scope.contains(run.project_id))
+                .filter(|run| run.status.on_top_bar() && scope.contains(run.project_id))
                 .count()
         }))
     }
@@ -5415,12 +5415,16 @@ impl State {
         // `awaiting_approval` ones, because a parked run still owns its trees and its unmerged
         // branch" (invariant 6). A `queued` run is in neither: it has no `executing_box_id` and no
         // tree.
+        // A `stopped` run is in the overlap set and not the slot (MOD-125 D2).
         let mut live: Vec<&Run> = self
             .runs
             .values()
             .filter(|row| {
                 row.executing_box_id == Some(box_id)
-                    && matches!(row.status, RunStatus::Running | RunStatus::AwaitingApproval)
+                    && matches!(
+                        row.status,
+                        RunStatus::Running | RunStatus::AwaitingApproval | RunStatus::Stopped
+                    )
             })
             .collect();
         let running = rows(

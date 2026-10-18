@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id               AS \"id: RunId\",\n                   project_id       AS \"project_id: ProjectId\",\n                   item_id          AS \"item_id: ItemId\",\n                   kind             AS \"kind: RunKind\",\n                   mode             AS \"mode: RunMode\",\n                   status           AS \"status: RunStatus\",\n                   target_box_id    AS \"target_box_id: BoxId\",\n                   executing_box_id AS \"executing_box_id: BoxId\",\n                   graph_snapshot,\n                   started_by       AS \"started_by: UserId\",\n                   queued_at,\n                   started_at,\n                   finished_at,\n                   failure,\n                   repo_scope       AS \"repo_scope: Vec<RepoId>\",\n                   lease_box_id     AS \"lease_box_id: BoxId\",\n                   lease_expires_at,\n                   updated_at\n              FROM run\n             WHERE item_id = ANY($1)\n               AND status IN ('queued','running','awaiting_approval')\n            ",
+  "query": "\n            SELECT id               AS \"id: RunId\",\n                   project_id       AS \"project_id: ProjectId\",\n                   item_id          AS \"item_id: ItemId\",\n                   kind             AS \"kind: RunKind\",\n                   mode             AS \"mode: RunMode\",\n                   status           AS \"status: RunStatus\",\n                   target_box_id    AS \"target_box_id: BoxId\",\n                   executing_box_id AS \"executing_box_id: BoxId\",\n                   graph_snapshot,\n                   started_by       AS \"started_by: UserId\",\n                   queued_at,\n                   started_at,\n                   finished_at,\n                   failure,\n                   repo_scope       AS \"repo_scope: Vec<RepoId>\",\n                   lease_box_id     AS \"lease_box_id: BoxId\",\n                   lease_expires_at,\n                   updated_at\n              FROM run\n             WHERE item_id = ANY($1)\n               AND status IN ('queued','running','awaiting_approval','stopped')\n            ",
   "describe": {
     "columns": [
       {
@@ -228,5 +228,5 @@
       false
     ]
   },
-  "hash": "616fc347c025289f3e486199858c5f6bd5eee3b50f30359a181d0338ae77da30"
+  "hash": "f42b7b346500bf32c089bd44c73b490da331157ecc09f71846f3b678fa1f6a1a"
 }

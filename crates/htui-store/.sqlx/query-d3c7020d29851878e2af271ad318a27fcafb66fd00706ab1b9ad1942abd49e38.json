@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id               AS \"id: RunId\",\n                   project_id       AS \"project_id: ProjectId\",\n                   item_id          AS \"item_id: ItemId\",\n                   kind             AS \"kind: RunKind\",\n                   mode             AS \"mode: RunMode\",\n                   status           AS \"status: RunStatus\",\n                   target_box_id    AS \"target_box_id: BoxId\",\n                   executing_box_id AS \"executing_box_id: BoxId\",\n                   graph_snapshot,\n                   started_by       AS \"started_by: UserId\",\n                   queued_at,\n                   started_at,\n                   finished_at,\n                   failure,\n                   repo_scope       AS \"repo_scope: Vec<RepoId>\",\n                   lease_box_id     AS \"lease_box_id: BoxId\",\n                   lease_expires_at,\n                   updated_at\n              FROM run\n             WHERE status IN ('queued','running','awaiting_approval')\n               AND repo_scope && $1::uuid[]\n             ORDER BY queued_at, id\n            ",
+  "query": "\n            SELECT id               AS \"id: RunId\",\n                   project_id       AS \"project_id: ProjectId\",\n                   item_id          AS \"item_id: ItemId\",\n                   kind             AS \"kind: RunKind\",\n                   mode             AS \"mode: RunMode\",\n                   status           AS \"status: RunStatus\",\n                   target_box_id    AS \"target_box_id: BoxId\",\n                   executing_box_id AS \"executing_box_id: BoxId\",\n                   graph_snapshot,\n                   started_by       AS \"started_by: UserId\",\n                   queued_at,\n                   started_at,\n                   finished_at,\n                   failure,\n                   repo_scope       AS \"repo_scope: Vec<RepoId>\",\n                   lease_box_id     AS \"lease_box_id: BoxId\",\n                   lease_expires_at,\n                   updated_at\n              FROM run\n             WHERE status IN ('queued','running','awaiting_approval','stopped')\n               AND repo_scope && $1::uuid[]\n             ORDER BY queued_at, id\n            ",
   "describe": {
     "columns": [
       {
@@ -228,5 +228,5 @@
       false
     ]
   },
-  "hash": "e5d119fafd452da568e2db9cd767cb05a65c9e229955267d43d142bdf2c5b85f"
+  "hash": "d3c7020d29851878e2af271ad318a27fcafb66fd00706ab1b9ad1942abd49e38"
 }

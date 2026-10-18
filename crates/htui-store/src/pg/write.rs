@@ -979,7 +979,7 @@ async fn finish_run_on(
         let live = sqlx::query_scalar!(
             "SELECT count(*) FROM run \
               WHERE item_id = $1 AND id <> $2 \
-                AND status IN ('queued','running','awaiting_approval')",
+                AND status IN ('queued','running','awaiting_approval','stopped')",
             item.as_uuid(),
             run.as_uuid(),
         )
@@ -4844,7 +4844,7 @@ impl WriteStore for PgStore {
             r#"
             SELECT id AS "id: RunId", graph_snapshot, repo_scope AS "repo_scope: Vec<RepoId>"
               FROM run
-             WHERE executing_box_id = $1 AND status IN ('running','awaiting_approval')
+             WHERE executing_box_id = $1 AND status IN ('running','awaiting_approval','stopped')
                AND repo_scope && $2::uuid[]
              ORDER BY queued_at, id
             "#,
@@ -6155,14 +6155,14 @@ impl WriteStore for PgStore {
         Ok(ParkOutcome::Parked)
     }
 
-    /// §4.3's failure row: `queued | running | awaiting_approval -> failed`, with the reason and
+    /// §4.3's failure row: `queued | running | awaiting_approval | stopped -> failed`, with the reason and
     /// the caller's instant.
     ///
     /// `finished_at` is `COALESCE`d rather than assigned, so a run that already stamped a finish
     /// (a `cancelled` racing a `failed` is not possible under the law, but a re-`finish` is) keeps
     /// the first instant. `failure` is assigned: the newest reason is the one the pane shows.
     ///
-    /// The three statuses in the `WHERE` are exactly [`RunStatus::can_move_to`]'s `-> Failed`
+    /// The four statuses in the `WHERE` are exactly [`RunStatus::can_move_to`]'s `-> Failed`
     /// column, so the compare-and-set *is* the law, and like
     /// [`supersede_step`](WriteStore::supersede_step) the follow-up read fetches the **status**
     /// rather than a bare `SELECT 1`: it is what [`illegal_move`] names in the sentence.
@@ -6175,7 +6175,7 @@ impl WriteStore for PgStore {
         let moved = sqlx::query!(
             "UPDATE run SET status = 'failed', failure = $2, \
                             finished_at = COALESCE(finished_at, $3) \
-              WHERE id = $1 AND status IN ('queued','running','awaiting_approval')",
+              WHERE id = $1 AND status IN ('queued','running','awaiting_approval','stopped')",
             run.as_uuid(),
             failure,
             at,
@@ -6276,7 +6276,7 @@ impl WriteStore for PgStore {
     ///
     /// [`StoreError::NotFound`] `{ entity: "item" }`, or `{ entity: "run_step" }` for a commit row
     /// naming a step that does not exist; [`StoreError::Constraint`] when a run of the item is
-    /// `queued | running | awaiting_approval`, when `summary.kind` is not `summary`, when
+    /// live (`queued | running | awaiting_approval | stopped`), when `summary.kind` is not `summary`, when
     /// `summary.item_id` is not `item`, when `resolution` does not close the item's status under
     /// ANA-11 §4.2 ([`resolution_not_closable`]), when a commit row names an unknown repo, or when
     /// the summary duplicates a document id or names an unknown `created_by` /
@@ -6309,7 +6309,7 @@ impl WriteStore for PgStore {
             SELECT id     AS "id: RunId",
                    status AS "status: RunStatus"
               FROM run
-             WHERE item_id = $1 AND status IN ('queued','running','awaiting_approval')
+             WHERE item_id = $1 AND status IN ('queued','running','awaiting_approval','stopped')
              ORDER BY queued_at, id
              LIMIT 1
             "#,
@@ -8193,7 +8193,7 @@ impl PgStore {
                AND NOT EXISTS (
                        SELECT 1 FROM run r
                         WHERE r.batch_id = b.id
-                          AND r.status IN ('queued', 'running', 'awaiting_approval'))
+                          AND r.status IN ('queued', 'running', 'awaiting_approval', 'stopped'))
                AND NOT EXISTS (
                        SELECT 1 FROM queue_entry e
                         WHERE e.box_id = b.box_id
