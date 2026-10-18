@@ -17,17 +17,13 @@ mod l_c;
 // `l_c::a_rebound_cite_key_opens_the_picker_and_c_is_inert`) and L-A's
 // `l_a::the_replay_miss_names_a_rebound_step_key` hold here through the converted tab.
 
+use htui::testkit::Harness;
 use htui_agent::fake::FakeAdapter;
 use htui_core::store::MemStore;
 
-/// The status line: the frame's last row, trailing blanks dropped.
-fn status_line(frame: &str) -> String {
-    frame
-        .lines()
-        .last()
-        .unwrap_or_default()
-        .trim_end()
-        .to_owned()
+/// The keys line the status row listed before MOD-115 (nothing draws it any more).
+fn status_line(harness: &mut Harness) -> String {
+    harness.app().keys_line()
 }
 
 /// The `?` box's lines, one per layer: the rows between its borders, each continuation row
@@ -62,10 +58,11 @@ fn help_box(frame: &str) -> Vec<String> {
 }
 
 /// The browse status line of a lone Backlog tab: `Stack::BASE`'s.
-const BROWSE: &str = "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help";
+const BROWSE: &str =
+    "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · F9 about";
 
 /// The status line of a capturing mode in a lone Backlog tab (D9).
-const CAPTURING: &str = "Ctrl+c quit · F1 help";
+const CAPTURING: &str = "Ctrl+c quit · F1 help · F9 about";
 
 /// D12: on the Runs pane with a step under the cursor, the status line is the browse one and the
 /// `?` box lists every layer of `RUNS_BROWSE`, in order: the pane's own verbs, the pane scroll and
@@ -85,7 +82,7 @@ async fn the_runs_pane_status_line_and_box_list_every_layer() {
         frame.contains("┌ FEAT-1") && frame.contains("▸ 0.1"),
         "FEAT-1's Runs pane, a step under the cursor:\n{frame}"
     );
-    assert_eq!(status_line(&frame), BROWSE, "the browse status line");
+    assert_eq!(status_line(&mut harness), BROWSE, "the browse status line");
 
     harness.key("?");
     let frame = harness.render();
@@ -103,12 +100,16 @@ async fn the_runs_pane_status_line_and_box_list_every_layer() {
             "Common: e edit",
             "List: j/Down down · k/Up up · g/Home top · G/End bottom · Enter fold",
             "Global: q/Ctrl+c quit · Tab next tab · Shift+Tab previous tab · 1-9 select tab · \
-             ?/F1 help",
+             ?/F1 help · F9 about",
             "?/F1 closes this box",
         ],
         "the box:\n{frame}"
     );
-    assert_eq!(status_line(&frame), BROWSE, "the box keeps the status line");
+    assert_eq!(
+        status_line(&mut harness),
+        BROWSE,
+        "the box keeps the status line"
+    );
 }
 
 /// D9, D12: a capturing pane reports its modal stack. The Runs rejection note shows the capturing
@@ -120,12 +121,15 @@ async fn a_capturing_pane_drives_the_status_line_and_box() {
     harness.key("x");
     let frame = harness.render();
     assert!(frame.contains("reject with a note:"), "the note:\n{frame}");
-    assert_eq!(status_line(&frame), CAPTURING, "the note captures");
+    assert_eq!(status_line(&mut harness), CAPTURING, "the note captures");
     harness.key("f1");
     let frame = harness.render();
     assert_eq!(
         help_box(&frame),
-        ["Global: Ctrl+c quit · F1 help", "F1 closes this box"],
+        [
+            "Global: Ctrl+c quit · F1 help · F9 about",
+            "F1 closes this box"
+        ],
         "the note's box:\n{frame}"
     );
 
@@ -135,7 +139,7 @@ async fn a_capturing_pane_drives_the_status_line_and_box() {
     harness.drive_to_end().await;
     let frame = harness.render();
     assert!(frame.contains("Enter pick"), "the picker:\n{frame}");
-    assert_eq!(status_line(&frame), CAPTURING, "the picker captures");
+    assert_eq!(status_line(&mut harness), CAPTURING, "the picker captures");
     harness.key("f1");
     let frame = harness.render();
     assert_eq!(
@@ -144,7 +148,7 @@ async fn a_capturing_pane_drives_the_status_line_and_box() {
             "Reqs: J next row · K previous row · Enter pick",
             "Common: Esc back",
             "List: j/Down down · k/Up up",
-            "Global: Ctrl+c quit · F1 help",
+            "Global: Ctrl+c quit · F1 help · F9 about",
             "F1 closes this box",
         ],
         "the picker's box:\n{frame}"

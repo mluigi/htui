@@ -2,8 +2,7 @@
 source: crates/htui/tests/chat.rs
 expression: replayed
 ---
-Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
- 1 Chat
+Graphics   ¹Chat                0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
 ┌ Chat ────────────────────────────────────────────────────────────────────────────────────────────┐
 │replay · step …<step> · 6 rows · read-only · Esc leave                                          │
 │you  what is in main.rs                                                                           │
@@ -29,6 +28,7 @@ Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
-Esc leave replay · t thoughts · j/k scroll
-q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└─Esc leave replay · t thoughts · j/k scroll───────────────────────────────────────────────────────┘

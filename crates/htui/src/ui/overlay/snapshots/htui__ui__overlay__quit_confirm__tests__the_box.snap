@@ -15,8 +15,8 @@ expression: "bench.render(&QuitConfirm::new())"
 
 
 
-                      ┌ Quit ─────────────────────────────────────────────────┐
-                      │An edit is still open in the editor. Quit and lose it? │
-                      │                                                       │
-                      │y quit · n/Esc keep editing                            │
-                      └───────────────────────────────────────────────────────┘
+                     ╭ Quit ──────────────────────────────────────────────────╮
+                     │ An edit is still open in the editor. Quit and lose it? │
+                     │                                                        │
+                     │  y  quit   n/Esc  keep editing                         │
+                     ╰────────────────────────────────────────────────────────╯

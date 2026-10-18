@@ -126,7 +126,7 @@ mod binary {
                         .to_owned(),
                     "12: [global] quitt: no such action; [global] has quit, next_tab, prev_tab, \
                      select_tab_1, select_tab_2, select_tab_3, select_tab_4, select_tab_5, \
-                     select_tab_6, select_tab_7, select_tab_8, select_tab_9, help, workspaces, \
+                     select_tab_6, select_tab_7, select_tab_8, select_tab_9, help, about, workspaces, \
                      find, waiting, queue"
                         .to_owned(),
                     r#"13: [global] quit = "shift-a": write a shifted letter as "A""#.to_owned(),
@@ -500,14 +500,9 @@ mod app {
     use htui::ui::overlay::WorkspaceSwitcher;
     use htui_agent::registry::DriverFactory;
 
-    /// The last non-empty line of a frame: the status line (`tests/keys.rs`'s).
-    fn status_line(frame: &str) -> &str {
-        frame
-            .lines()
-            .rev()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or_default()
-            .trim()
+    /// The keys line the status row listed before MOD-115 (`tests/keys.rs`'s).
+    fn status_line(harness: &mut Harness) -> String {
+        harness.app().keys_line()
     }
 
     #[tokio::test]
@@ -521,11 +516,8 @@ mod app {
 
         harness.key("q");
         assert!(!harness.app().should_quit, "`q` no longer quits");
-        let frame = harness.render();
-        assert!(
-            status_line(&frame).starts_with("Ctrl+y quit · Tab next tab"),
-            "{frame}"
-        );
+        let line = status_line(&mut harness);
+        assert!(line.starts_with("Ctrl+y quit · Tab next tab"), "{line}");
 
         harness.key("?");
         assert!(harness.app().help_visible, "`?` opens the box");
@@ -570,11 +562,8 @@ mod app {
         register_all(harness.app());
         harness.drive_to_end().await;
 
-        let frame = harness.render();
-        assert!(
-            status_line(&frame).starts_with("Ctrl+q quit · Tab next tab"),
-            "{frame}"
-        );
+        let line = status_line(&mut harness);
+        assert!(line.starts_with("Ctrl+q quit · Tab next tab"), "{line}");
         harness.key("?");
         let frame = harness.render();
         assert!(frame.contains("Ctrl+q/Ctrl+c quit"), "{frame}");

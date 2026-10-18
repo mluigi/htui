@@ -2,12 +2,14 @@
 source: crates/htui/tests/hierarchy.rs
 expression: frame
 ---
-Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
- 1 Settings
+Graphics   ¹Settings           0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
 ┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
 │ Agents  Hierarchy                                                                                │
 │Graphics (graphics) — root on this box: unset                                                     │
 │  vulkan-tutorials  Vulkan Tutorials                                                              │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -29,6 +31,4 @@ Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
 │default_branch: main                                                                              │
 │primary (y/n) : y                                                                                 │
 │                                                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
-Tab/Shift+Tab field · Enter save · Esc cancel
-Ctrl+c quit · F1 help
+└─Tab/Shift+Tab field · Enter save · Esc cancel────────────────────────────────────────────────────┘

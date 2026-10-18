@@ -68,16 +68,15 @@ fn titled(key: &str) -> String {
     format!("\u{250c} {key} ")
 }
 
-/// The Requirements tab's notice: the rows between the content's bottom border and the hint,
-/// joined (the `tests/requirements.rs` reading).
+/// The Requirements tab's notice: the rows under the content's bottom border, joined (the
+/// `tests/requirements.rs` reading; MOD-115 drew the hints onto that border).
 fn notice(frame: &str) -> String {
     let lines: Vec<&str> = frame.lines().collect();
-    let hint = lines.len() - 2;
-    let bottom = lines[..hint]
+    let bottom = lines
         .iter()
-        .rposition(|line| line.starts_with('\u{2514}'))
-        .unwrap_or_else(|| panic!("no bottom border above the hint:\n{frame}"));
-    lines[bottom + 1..hint]
+        .rposition(|line| line.starts_with(['\u{2514}', '\u{2570}']))
+        .unwrap_or_else(|| panic!("no bottom border:\n{frame}"));
+    lines[bottom + 1..]
         .iter()
         .map(|line| line.trim())
         .collect::<Vec<_>>()
@@ -142,7 +141,7 @@ async fn revealing_before_the_backlog_has_loaded_selects_on_arrival() {
 async fn revealing_an_unknown_item_says_so_and_keeps_the_cursor() {
     let mut harness = platform().await;
     let before = harness.render();
-    let title_row = |frame: &str| frame.lines().nth(2).unwrap_or_default().to_owned();
+    let title_row = |frame: &str| frame.lines().nth(1).unwrap_or_default().to_owned();
     assert!(title_row(&before).contains(&titled("ANA-1")), "{before}");
 
     reveal(

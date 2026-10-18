@@ -2,8 +2,7 @@
 source: crates/htui/tests/templates.rs
 expression: frame
 ---
-Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
- 1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
+Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 waiting ·  F9  about   F1  keys
  Skills │ Templates
 ┌ triage · new, saves v1 ────────────────────────────────────┐┌ phase placeholders ────────────────┐
 │Triage {{item_key}}                                         ││{{item_key}} scalar                 │
@@ -28,7 +27,8 @@ Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
 │                                                            ││                                    │
 │                                                            ││                                    │
 │                                                            ││                                    │
-└────────────────────────────────────────────────────────────┘└────────────────────────────────────┘
+│                                                            ││                                    │
+│                                                            ││                                    │
+│                                                            ││                                    │
+└─Ctrl+s save · Ctrl+g ask agent · Ctrl+e $EDITOR · Esc cancel · L1:C20────────────────────────────┘
  this phase template never places {{item}} — Ctrl+s again saves anyway
-Ctrl+s save · Ctrl+g ask agent · Ctrl+e $EDITOR · Esc cancel · L1:C20
-Ctrl+c quit · Tab next tab · Shift+Tab previous tab · F1 help · Ctrl+f find · Ctrl+w waiting · Ctrl+

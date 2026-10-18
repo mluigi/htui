@@ -869,6 +869,12 @@ impl Tab for BacklogTab {
         Some(self.detail.key_stack())
     }
 
+    /// The active pane's stack, whatever form is open (MOD-115 review): what the about panel
+    /// labels the tab's actions through.
+    fn browse_stack(&self) -> Stack<'static> {
+        self.detail.key_stack()
+    }
+
     /// The keys of what holds the Backlog's keyboard (MOD-67 M6 T2): the divergence view's, the
     /// item form's or the filter form's while one is open; a capturing pane's alone; browsing,
     /// the focused pane's [`DetailTab::key_hint`](detail::DetailTab::key_hint), then ` · ` and

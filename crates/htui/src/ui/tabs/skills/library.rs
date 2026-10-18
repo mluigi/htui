@@ -524,6 +524,11 @@ fn prompt_rest(key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
 }
 
 impl LibraryView {
+    /// The browse mode's stack, whatever mode the view is in (MOD-115 review).
+    pub(super) const fn browse_stack() -> Stack<'static> {
+        views::LIBRARY_BROWSE
+    }
+
     /// The current mode's stack (MOD-67 M4 D4), always one: the attachments pane's while it is
     /// open, else an open agent help's, else the mode's. `SkillsTab::key_stack`, `on_key` and
     /// the hint read it.

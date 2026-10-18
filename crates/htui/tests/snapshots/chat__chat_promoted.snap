@@ -2,8 +2,7 @@
 source: crates/htui/tests/chat.rs
 expression: rendered
 ---
-Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
- 1 Chat
+Graphics   ¹Chat                0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
 ┌ Chat ────────────────────────────────────────────────────────────────────────────────────────────┐
 │promoted · research · handoff · scripted · sonnet · fake-<session>     │
 │you  You are continuing work already under way on htui:ANA-2, phase research, attempt 1.A previous│
@@ -29,6 +28,7 @@ Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
-i compose · Esc Esc end · t thoughts · j/k scroll
-q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└─i compose · Esc Esc end · t thoughts · j/k scroll────────────────────────────────────────────────┘

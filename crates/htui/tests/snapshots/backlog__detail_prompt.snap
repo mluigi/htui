@@ -2,8 +2,7 @@
 source: crates/htui/tests/backlog.rs
 expression: harness.render()
 ---
-Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
- 1 Backlog
+Platform   ¹Backlog             1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
 ┌ Backlog (11) ───────────────────────────────────────┐┌ FEAT-1 ───────────────────────────────────┐
 │▾ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │
 │  ANA-1    done               Data model, box regist…││template  prd v1                           │
@@ -29,6 +28,7 @@ Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
 │                                                     ││notes     preview: the template is chosen b│
 │                                                     ││          preview: documents are latest-per│
 │                                                     ││          preview: the `summary` kind is ex│
-└─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
-j/k move · h/l sub-tab · f filter · N new · e edit
-q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help
+│                                                     ││          preview: phase-level skills come │
+│                                                     ││          preview: output_kind defaults to │
+│                                                     ││          preview: command_queue exposure i│
+└─j/k move · h/l sub-tab · f filter · N new · e edit──┘└───────────────────────────────────────────┘

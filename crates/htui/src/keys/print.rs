@@ -129,6 +129,7 @@ select_tab_7 = ["7"]        # select tab
 select_tab_8 = ["8"]        # select tab
 select_tab_9 = ["9"]        # select tab
 help         = ["?", "f1"]  # help
+about        = ["f9"]       # about
 workspaces   = ["w"]        # workspaces
 find         = ["ctrl-f"]   # find
 waiting      = ["ctrl-w"]   # waiting
@@ -140,7 +141,7 @@ close = ["esc"]  # close"#;
     #[test]
     fn the_default_print_starts_with_the_header_global_and_overlay() {
         let printed = print(Keys::compiled());
-        let head: Vec<&str> = printed.lines().take(27).collect();
+        let head: Vec<&str> = printed.lines().take(28).collect();
         assert_eq!(head, DEFAULT_HEAD.lines().collect::<Vec<_>>());
         assert!(
             printed.ends_with(

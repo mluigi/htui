@@ -757,7 +757,7 @@ quit = ["x", "shift-a"]
                 12,
                 "[global] quitt: no such action; [global] has quit, next_tab, prev_tab, \
                  select_tab_1, select_tab_2, select_tab_3, select_tab_4, select_tab_5, \
-                 select_tab_6, select_tab_7, select_tab_8, select_tab_9, help, workspaces, find, \
+                 select_tab_6, select_tab_7, select_tab_8, select_tab_9, help, about, workspaces, find, \
                  waiting, queue",
             ),
             (

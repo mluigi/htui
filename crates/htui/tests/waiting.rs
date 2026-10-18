@@ -25,7 +25,7 @@ use htui_core::store::{MemStore, ParkOutcome, ReadStore as _, StepFence, WriteSt
 use uuid::Uuid;
 
 /// The top bar over Graphics, which owes nothing.
-const GRAPHICS: &str = "Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting";
+const GRAPHICS: &str = "0 working · 0 waiting · memory";
 
 /// The demo shell over `store`, settled in its startup workspace (Graphics).
 async fn graphics(store: &MemStore) -> Harness {
@@ -58,14 +58,22 @@ async fn refresh(harness: &mut Harness) {
     harness.drive_to_end().await;
 }
 
-/// The frame's first line: the top bar.
+/// The right side of the frame's first line, the header (MOD-115): `N working · M waiting ·
+/// store`, the part after the workspace and the tab chips (which are separated by two spaces).
+///
+/// Read at 160 columns: at the default 100 the five tab chips and `? keys` leave no room for the
+/// working count and the store.
 fn top_bar(harness: &mut Harness) -> String {
-    harness
-        .render()
-        .lines()
-        .next()
+    harness.resize(160, 30);
+    let frame = harness.render();
+    let header = frame.lines().next().unwrap_or_default();
+    // The counts and the store sit between double spaces; the box name and the key chips follow.
+    header
+        .split("  ")
+        .find(|part| part.contains(" working \u{b7} "))
+        .and_then(|part| part.split(" \u{b7} DESKTOP-HTUI").next())
         .unwrap_or_default()
-        .trim_end()
+        .trim()
         .to_owned()
 }
 
@@ -220,10 +228,7 @@ async fn the_top_bar_counts_working_and_waiting() {
     assert_eq!(top_bar(&mut harness), GRAPHICS);
 
     let mut harness = platform(&store).await;
-    assert_eq!(
-        top_bar(&mut harness),
-        "Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting"
-    );
+    assert_eq!(top_bar(&mut harness), "1 working · 1 waiting · memory");
 }
 
 /// Plan D5: the parked run moves from working to waiting, and the list grows by its gate row.
@@ -233,10 +238,7 @@ async fn a_park_shows_on_the_next_refresh_tick() {
     let mut harness = platform(&store).await;
     park_ana_2(&store).await;
     refresh(&mut harness).await;
-    assert_eq!(
-        top_bar(&mut harness),
-        "Platform · DESKTOP-HTUI · memory · 1 working · 2 waiting"
-    );
+    assert_eq!(top_bar(&mut harness), "1 working · 2 waiting · memory");
     assert_eq!(harness.app().status, None);
 }
 
@@ -263,7 +265,7 @@ async fn the_open_list_follows_a_park_without_reopening() {
     let mut harness = platform(&store).await;
     harness.key("ctrl-w");
     let before = harness.render();
-    assert!(before.contains("> FEAT-2"), "{before}");
+    assert!(before.contains("\u{258c} FEAT-2"), "{before}");
     assert!(!before.contains("plan 1.1"), "{before}");
 
     park_ana_2(&store).await;
@@ -272,7 +274,7 @@ async fn the_open_list_follows_a_park_without_reopening() {
     let after = harness.render();
     assert!(after.contains("  ANA-2"), "{after}");
     assert!(after.contains("plan 1.1"), "{after}");
-    assert!(after.contains("> FEAT-2  \u{2014}"), "{after}");
+    assert!(after.contains("\u{258c} FEAT-2  \u{2014}"), "{after}");
 }
 
 /// Plan D8: `Enter` closes the list and lands on the row's step in the Runs pane.

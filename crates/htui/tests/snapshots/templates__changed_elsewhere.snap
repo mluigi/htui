@@ -2,8 +2,7 @@
 source: crates/htui/tests/templates.rs
 expression: frame
 ---
-Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
- 1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
+Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 waiting ·  F9  about   F1  keys
  Skills │ Templates
 ┌ implement · editing from v1, saves v3 ─────────────────────┐┌ phase placeholders ────────────────┐
 │DRAFT You are running the `implement` phase for {{item_key}}││{{item_key}} scalar                 │
@@ -27,8 +26,9 @@ Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
 │                                                            ││                                    │
 │                                                            ││                                    │
 │                                                            ││                                    │
-└────────────────────────────────────────────────────────────┘└────────────────────────────────────┘
+│                                                            ││                                    │
+│                                                            ││                                    │
+│                                                            ││                                    │
+└─Ctrl+s save · Ctrl+g ask agent · Ctrl+e $EDITOR · Esc cancel · L1:C7─────────────────────────────┘
  saved elsewhere since you opened it — v2 is now the latest; your draft is kept and Ctrl+s saves it
  as v3
-Ctrl+s save · Ctrl+g ask agent · Ctrl+e $EDITOR · Esc cancel · L1:C7
-Ctrl+c quit · Tab next tab · Shift+Tab previous tab · F1 help · Ctrl+f find · Ctrl+w waiting · Ctrl+

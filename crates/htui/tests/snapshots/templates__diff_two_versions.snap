@@ -2,8 +2,7 @@
 source: crates/htui/tests/templates.rs
 expression: frame
 ---
-Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
- 1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
+Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       0 waiting ·  F9  about   ?  keys
  Skills │ Templates
 ┌ Templates ───────────────────┐┌ diff v1 → v2 ────────────────────────────────────────────────────┐
 │vulkan-tutorials              ││--- implement v1                                                  │
@@ -28,7 +27,7 @@ Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
 │                              ││                                                                  │
 │                              ││                                                                  │
 │                              ││                                                                  │
-└──────────────────────────────┘└──────────────────────────────────────────────────────────────────┘
-
-j/k · ,/. version · b base · d diff · D default · e edit · E $EDITOR · n new · r reload · h/l view
-q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces · Ctrl+f find
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+└─j/k · ,/. version · b base · d diff · D default · e edit · E $EDITOR · n new · r reload · h/l v…─┘

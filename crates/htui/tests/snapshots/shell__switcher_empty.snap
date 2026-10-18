@@ -2,11 +2,11 @@
 source: crates/htui/tests/shell.rs
 expression: frame
 ---
-no workspace · no box · memory · 0 working · 0 waiting
- 1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
+no workspace   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 waiting · memory ·  ?  keys
 ┌ Backlog (0) ────────────────────────────────────────┐┌ Detail ───────────────────────────────────┐
 │No items in this workspace.                          ││ Body Runs Graph Docs Notes Prompt Reqs    │
 │                                                     ││No item selected.                          │
+│                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
@@ -29,6 +29,6 @@ no workspace · no box · memory · 0 working · 0 waiting
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
 └─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
-
-Ctrl+c quit · ? help

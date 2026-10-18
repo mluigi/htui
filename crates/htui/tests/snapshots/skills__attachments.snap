@@ -2,8 +2,7 @@
 source: crates/htui/tests/skills.rs
 expression: frame
 ---
-Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
- 1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
+Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       1 waiting ·  F9  about   ?  keys
  Skills │ Templates
 ┌ attachments · rust-style ────────────────────────────────────────────────────────────────────────┐
 │  global                       —                                                                  │
@@ -28,7 +27,7 @@ Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
 │    analysis › verdict         —                                                                  │
 │    bug › reproduce            —                                                                  │
 │    bug › fix                  —                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
-
-j/k move · Enter edit · x detach · r reload · Esc back
-q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces · Ctrl+f find
+│    bug › review               —                                                                  │
+│    feature › prd              —                                                                  │
+│    feature › plan             —                                                                  │
+└─j/k move · Enter edit · x detach · r reload · Esc back───────────────────────────────────────────┘

@@ -386,6 +386,11 @@ impl TemplatesView {
         true
     }
 
+    /// The browse mode's stack, whatever mode the view is in (MOD-115 review).
+    pub(super) const fn browse_stack() -> Stack<'static> {
+        views::TEMPLATES_BROWSE
+    }
+
     /// The one place a mode maps to its stack (MOD-67 M4 D4, blueprint §6.5), always one: an
     /// open agent help's, else the mode's (a handed-off draft stays on the browse stack).
     /// `SkillsTab::key_stack`, `on_key` and the hint read it.

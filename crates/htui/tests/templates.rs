@@ -52,16 +52,6 @@ async fn open() -> Harness {
     open_over(MemStore::demo()).await
 }
 
-/// The shell's status line: the frame's last row.
-fn status(frame: &str) -> String {
-    frame
-        .lines()
-        .last()
-        .unwrap_or_default()
-        .trim_end()
-        .to_owned()
-}
-
 /// The demo world over `store` on the Templates view, with the keys file `toml` (MOD-67 M4: a
 /// rebinding test). `toml` follows `version = 1`.
 async fn open_with_keys(store: MemStore, toml: &str) -> Harness {
@@ -111,21 +101,29 @@ async fn head(store: &MemStore, name: &str) -> Option<PromptTemplate> {
         .unwrap_or_else(|err| panic!("the read failed: {err}"))
 }
 
-/// The hint row: the last line of the tab's body, just above the shell's status line.
-fn hint(frame: &str) -> String {
+/// The index of the content's bottom border: the lowest frame line that opens with a corner.
+/// MOD-115: the hints are drawn on it, no longer on a row of their own.
+fn bottom_border(frame: &str) -> usize {
     let lines: Vec<&str> = frame.lines().collect();
-    lines[lines.len() - 2].to_owned()
+    lines
+        .iter()
+        .rposition(|line| line.starts_with(['\u{2514}', '\u{2570}']))
+        .unwrap_or_else(|| panic!("no bottom border:\n{frame}"))
 }
 
-/// The notice: the rows between the content's bottom border and the hint, joined (it wraps).
+/// The hints: the text on the content's bottom border, the rule and corners trimmed off.
+fn hint(frame: &str) -> String {
+    let line = frame.lines().nth(bottom_border(frame)).unwrap_or_default();
+    line.trim_matches([
+        '\u{2514}', '\u{2570}', '\u{2518}', '\u{256f}', '\u{2500}', ' ',
+    ])
+    .to_owned()
+}
+
+/// The notice: the rows under the content's bottom border, joined (it wraps).
 fn notice(frame: &str) -> String {
     let lines: Vec<&str> = frame.lines().collect();
-    let hint = lines.len() - 2;
-    let bottom = lines[..hint]
-        .iter()
-        .rposition(|line| line.starts_with('\u{2514}'))
-        .unwrap_or_else(|| panic!("no bottom border above the hint:\n{frame}"));
-    lines[bottom + 1..hint]
+    lines[bottom_border(frame) + 1..]
         .iter()
         .map(|line| line.trim())
         .collect::<Vec<_>>()
@@ -1077,12 +1075,11 @@ async fn the_templates_editor_status_line_and_help_box() {
     let mut harness = open().await;
     select(&mut harness, "implement");
     harness.key("e");
-    let frame = harness.render();
     assert!(
-        status(&frame).starts_with(
-            "Ctrl+c quit · Tab next tab · Shift+Tab previous tab · F1 help · Ctrl+f find"
+        harness.app().keys_line().starts_with(
+            "Ctrl+c quit · Tab next tab · Shift+Tab previous tab · F1 help · F9 about · Ctrl+f find"
         ),
-        "{frame}"
+        "the keys line is the filtered one"
     );
     harness.key("?");
     assert!(!harness.app().help_visible, "`?` is text");
@@ -1197,7 +1194,9 @@ async fn the_strip_text_is_unchanged() {
     let mut harness = open().await;
     let frame = harness.render();
     assert!(
-        frame.contains(" 1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat"),
+        frame.contains(
+            " \u{b9}Backlog  \u{b2}Skills  \u{b3}Requirements  \u{2074}Settings  \u{2075}Chat"
+        ),
         "{frame}"
     );
 }

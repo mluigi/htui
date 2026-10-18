@@ -712,6 +712,12 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   `settings/agents.rs` split along these lines); kind colours, glyph + human word for every status.
   **Absorbs MOD-81, MOD-82, MOD-83 and MOD-85**, which close when it lands. The 199 insta snapshots
   are rewritten tab by tab. Not blocked; the other redesign items build on it.
+  **Phase 1 landed (hr/MOD-115, 2026-10-18):** widget kit (`ui/kit`: pane, list, status, chips, empty
+  state, modal), one-row header, `F9` about panel (in memory; Help keeps `?`/`F1`; a `keys.toml`
+  binding `f9` elsewhere now fails validation), pilot overlays on the kit, 174 snapshots re-accepted
+  (chrome rows only). Next, per `.claude/prds/mod-115-tui-shell.prd.md`: M2 layouts, pane keys,
+  history, leave dialog, UI-state file; M3/M4 port the tabs and delete the hint adapter
+  (`join_panes_under`, `paint_bottom_hints` use).
 - [ ] **MOD-116 - Workspaces tab and workspace lifecycle** (from the UI redesign review,
   `docs/ui-redesign-findings-2026-10-15.md` §4.1). `R-TUI-14`, `R-ENT-2`, `R-ORCH-16`, `R-TUI-18`. A new tab listing every saved
   workspace with its state (open, background with runs going, stopping, stopped), an overview and

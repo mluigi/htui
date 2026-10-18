@@ -58,21 +58,29 @@ fn select(harness: &mut Harness, name: &str) {
     panic!("`{name}` is not in the tree:\n{}", harness.render());
 }
 
-/// The hint row: the last line of the tab's body, just above the shell's status line.
-fn hint(frame: &str) -> String {
+/// The index of the content's bottom border: the lowest frame line that opens with a corner.
+/// MOD-115: the hints are drawn on it, no longer on a row of their own.
+fn bottom_border(frame: &str) -> usize {
     let lines: Vec<&str> = frame.lines().collect();
-    lines[lines.len() - 2].to_owned()
+    lines
+        .iter()
+        .rposition(|line| line.starts_with(['\u{2514}', '\u{2570}']))
+        .unwrap_or_else(|| panic!("no bottom border:\n{frame}"))
 }
 
-/// The notice: the rows between the content's bottom border and the hint, joined (it wraps).
+/// The hints: the text on the content's bottom border, the rule and corners trimmed off.
+fn hint(frame: &str) -> String {
+    let line = frame.lines().nth(bottom_border(frame)).unwrap_or_default();
+    line.trim_matches([
+        '\u{2514}', '\u{2570}', '\u{2518}', '\u{256f}', '\u{2500}', ' ',
+    ])
+    .to_owned()
+}
+
+/// The notice: the rows under the content's bottom border, joined (it wraps).
 fn notice(frame: &str) -> String {
     let lines: Vec<&str> = frame.lines().collect();
-    let hint = lines.len() - 2;
-    let bottom = lines[..hint]
-        .iter()
-        .rposition(|line| line.starts_with('\u{2514}'))
-        .unwrap_or_else(|| panic!("no bottom border above the hint:\n{frame}"));
-    lines[bottom + 1..hint]
+    lines[bottom_border(frame) + 1..]
         .iter()
         .map(|line| line.trim())
         .collect::<Vec<_>>()
@@ -272,7 +280,7 @@ async fn ctrl_e_on_a_draft_edits_over_its_claimed_rect() {
         .unwrap_or_else(|| panic!("the draft's title stays drawn beside the pane:\n{frame}"));
     let rule = lines
         .iter()
-        .position(|line| line.contains("Ctrl+4 to htui"))
+        .position(|line| line.starts_with('\u{2502}') && line.contains("Ctrl+4 to htui"))
         .expect("the pane's rule");
     assert_eq!(
         rule,
@@ -503,10 +511,15 @@ async fn the_editor_waits_while_another_tab_works_and_reads_back_on_return() {
     assert!(harness.app().editor_open(), "the editor waits");
     let frame = harness.render();
     assert!(!frame.contains(READY), "and is not drawn: {frame}");
-    let last = frame.lines().last().unwrap_or_default().to_owned();
+    let header = frame
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim_end()
+        .to_owned();
     assert!(
-        last.starts_with("editing in Skills \u{b7} Ctrl+4 back"),
-        "the status line names the edit: {frame}"
+        header.ends_with("editing in Skills \u{b7} Ctrl+4 back"),
+        "the header names the edit: {frame}"
     );
     assert!(
         frame.contains("\u{250c} FEAT-1 "),

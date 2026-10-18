@@ -2,8 +2,7 @@
 source: crates/htui/tests/templates.rs
 expression: frame
 ---
-Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
- 1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
+Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 waiting ·  F9  about   F1  keys
  Skills │ Templates
 ┌ proposal from scripted · sent → proposed ──────────────────┐┌ phase placeholders ────────────────┐
 │--- sent                                                    ││{{item_key}} scalar                 │
@@ -28,7 +27,7 @@ Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
 │verification output first and fix the                       ││                                    │
 │-cause rather than the symptom. Write a `{{output_kind}}`   ││                                    │
 │document describing what changed and how                    ││                                    │
-└────────────────────────────────────────────────────────────┘└────────────────────────────────────┘
-
-Enter accept · n/Esc discard · J/K scroll · PgUp/PgDn page
-Ctrl+c quit · Tab next tab · Shift+Tab previous tab · F1 help · Ctrl+f find · Ctrl+w waiting · Ctrl+
+│-you verified it, one section per file group.               ││                                    │
+│+Do the item.                                               ││                                    │
+│                                                            ││                                    │
+└─Enter accept · n/Esc discard · J/K scroll · PgUp/PgDn page─┘└────────────────────────────────────┘

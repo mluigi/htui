@@ -40,6 +40,7 @@ impl App {
             Action::EditExternally(_) => self.status = Some(EDITOR_NEEDS_A_TAB.to_owned()),
             Action::AbortEdit => self.abort_editor(),
             Action::ToggleHelp => self.help_visible = !self.help_visible,
+            Action::ToggleAbout => self.about_visible = !self.about_visible,
             Action::Error(message) => self.status = Some(message),
             Action::Tick => {
                 self.on_tick();

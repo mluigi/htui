@@ -15,28 +15,27 @@ use crossterm::event::KeyEvent;
 use htui_core::model::Scope;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
 
 use crate::app::{Action, Ctx, Handled, OverlayAction};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
+use crate::keys::{Act, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
-use crate::ui::layout::centered;
+use crate::ui::kit::chips::chip_line;
+use crate::ui::kit::modal::{Modal, ModalSize};
 use crate::ui::overlay::registry::{Overlay, OverlayId};
 
 /// What the box asks (PD-M2-1: fixed; the factory takes no argument).
 const QUESTION: &str = "An edit is still open in the editor. Quit and lose it?";
 
-/// The line under the question: `confirm.yes` and `confirm.no` here, `overlay.close` (the same
-/// effect as `no`) by the shell.
-const HINT: HintSpec = &[
-    Hint::One(Act::ConfirmYes, "quit"),
-    Hint::Pair(Act::ConfirmNo, Act::OverlayClose, "keep editing"),
-];
+/// The margin in front of each line of the box.
+const LEAD: &str = " ";
 
-/// Left border, right border and one column of right padding.
-const CHROME: u16 = 3;
+/// The words after the two chips: `confirm.yes` is handled here, `confirm.no` here too and
+/// `overlay.close` (the same effect as `no`) by the shell.
+const QUIT_WORD: &str = "quit";
+const KEEP_WORD: &str = "keep editing";
 
 /// Asks before `global.quit` drops an open edit.
 #[derive(Debug, Default)]
@@ -53,12 +52,31 @@ impl QuitConfirm {
         Self
     }
 
-    /// The box's contents: the question, a blank line, then `hint` (the rendered [`HINT`]).
-    fn lines(hint: String, theme: &Theme) -> Vec<Line<'static>> {
+    /// The box's contents: the question, a blank line, then the two answers as key chips. The
+    /// labels come from `keys`, so a rebound answer shows its new chord; `n/Esc` is
+    /// `confirm.no`'s first chord and `overlay.close`'s, as the hint row spelled it.
+    fn lines(keys: &Keys, theme: &Theme) -> Vec<Line<'static>> {
+        let stack = views::QUIT_CONFIRM;
+        let keep: Vec<String> = [Act::ConfirmNo, Act::OverlayClose]
+            .into_iter()
+            .filter_map(|act| keys.label(stack, act))
+            .collect();
+        let answers = chip_line(
+            &[
+                (
+                    keys.label(stack, Act::ConfirmYes).unwrap_or_default(),
+                    QUIT_WORD,
+                ),
+                (keep.join("/"), KEEP_WORD),
+            ],
+            theme,
+        );
+        let mut chips = vec![Span::raw(LEAD)];
+        chips.extend(answers.spans);
         vec![
-            Line::styled(QUESTION, theme.base),
+            Line::styled(format!("{LEAD}{QUESTION}"), theme.base),
             Line::raw(""),
-            Line::styled(hint, theme.dim),
+            Line::from(chips),
         ]
     }
 }
@@ -110,25 +128,15 @@ impl Overlay for QuitConfirm {
     fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let lines = Self::lines(ctx.keys().hint(views::QUIT_CONFIRM, HINT), ctx.theme);
+        let lines = Self::lines(ctx.keys(), ctx.theme);
         let widest = lines.iter().map(Line::width).max().unwrap_or(0);
-        let width = u16::try_from(widest)
-            .unwrap_or(u16::MAX)
-            .saturating_add(CHROME);
-        let height = u16::try_from(lines.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(2);
-        let box_area = centered(area, width, height);
-
-        frame.render_widget(Clear, box_area);
-        frame.render_widget(
-            Paragraph::new(Text::from(lines)).block(
-                Block::new()
-                    .borders(Borders::ALL)
-                    .title(Span::styled(format!(" {} ", self.title()), ctx.theme.title)),
-            ),
-            box_area,
-        );
+        let content = Modal::new(self.title())
+            .size(ModalSize::Fit {
+                content_w: u16::try_from(widest).unwrap_or(u16::MAX),
+                content_h: u16::try_from(lines.len()).unwrap_or(u16::MAX),
+            })
+            .render(frame, area, ctx.theme);
+        frame.render_widget(Paragraph::new(lines), content);
     }
 }
 
@@ -255,11 +263,13 @@ mod tests {
 
     #[test]
     fn the_hint_follows_the_keys() {
-        let keys = load_str("[confirm]\nyes = [\"f9\"]\n").expect("the file loads");
+        let keys = load_str("[confirm]\nyes = [\"f8\"]\n").expect("the file loads");
         let bench = Bench::new().with_keys(keys);
 
         let frame = bench.render(&QuitConfirm::new());
-        assert!(frame.contains("F9 quit · n/Esc keep editing"), "{frame}");
+        assert!(frame.contains(" F8  quit"), "{frame}");
+        assert!(frame.contains(" n/Esc  keep editing"), "{frame}");
+        assert!(!frame.contains(" y  quit"), "{frame}");
     }
 
     #[test]

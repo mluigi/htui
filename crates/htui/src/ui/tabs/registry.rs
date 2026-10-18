@@ -7,15 +7,12 @@
 use htui_core::model::Scope;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
-use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::text::Line;
 
 use crate::app::{Ctx, Handled, RevealTarget};
 use crate::editor::ExternalEditOutcome;
 use crate::keys::Stack;
 use crate::store_worker::{StoreReply, StoreRequest};
-use crate::ui::Theme;
 use crate::ui::tabs::settings::SectionId;
 use crossterm::event::{KeyEvent, MouseEvent};
 
@@ -77,6 +74,14 @@ pub trait Tab {
     /// default `None` is the test doubles', which the shell treats as `Stack::BASE`.
     fn key_stack(&self) -> Option<Stack<'static>> {
         None
+    }
+    /// The stack of this tab's browse mode, the one the about panel labels its actions through
+    /// (MOD-115 review): the tab's main actions are its browse keys, and a form, a composer or a
+    /// filter being open must not blank them. Defaulted to the tab's current
+    /// [`key_stack`](Tab::key_stack), else `Stack::BASE`; a tab whose current stack can differ
+    /// from its browse stack overrides it.
+    fn browse_stack(&self) -> Stack<'static> {
+        self.key_stack().unwrap_or(Stack::BASE)
     }
     /// The keys of this tab's focused mode for the shell's hint row (MOD-67 M6 D10, design review
     /// finding 3): the mode's hint spec rendered through its own stack, so a rebound key shows its
@@ -242,59 +247,9 @@ impl TabRegistry {
         self.tabs.iter().find(|t| t.id() == id).map(|t| t.title())
     }
 
-    /// The tab strip's input: every tab's id and title in registration order.
+    /// The header's tab chips' input: every tab's id and title in registration order.
     #[must_use]
     pub fn titles(&self) -> Vec<(TabId, &str)> {
         self.tabs.iter().map(|t| (t.id(), t.title())).collect()
-    }
-}
-
-/// Draws the tab strip: `1 Backlog  2 Skills  3 Settings`, the active one in `active_tab` (bold,
-/// underlined).
-pub fn render_strip(frame: &mut Frame<'_>, area: Rect, registry: &TabRegistry, theme: &Theme) {
-    let active = registry.active_id();
-    let mut spans: Vec<Span<'_>> = Vec::new();
-    for (idx, (id, title)) in registry.titles().into_iter().enumerate() {
-        let style: Style = if Some(id) == active {
-            theme.active_tab
-        } else {
-            theme.dim
-        };
-        spans.push(Span::styled(format!(" {} {title} ", idx + 1), style));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-#[cfg(test)]
-mod tests {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-    use ratatui::style::{Color, Modifier};
-
-    use super::*;
-    use crate::ui::tabs::{BacklogTab, SkillsTab};
-
-    /// MOD-80 D5: under the monochrome theme only modifiers can mark the active tab, so it is
-    /// bold and underlined and the others are neither.
-    #[test]
-    fn active_main_tab_is_bold_and_underlined_without_colour() {
-        let mut registry = TabRegistry::new();
-        registry.register(Box::new(BacklogTab::new()));
-        registry.register(Box::new(SkillsTab::new()));
-        let mut terminal = Terminal::new(TestBackend::new(40, 1)).expect("terminal");
-        terminal
-            .draw(|frame| render_strip(frame, frame.area(), &registry, &Theme::monochrome()))
-            .expect("the strip draws");
-        let buffer = terminal.backend().buffer();
-        let marked = Modifier::BOLD | Modifier::UNDERLINED;
-        let active = &buffer[(1, 0)];
-        assert_eq!(active.symbol(), "1");
-        assert!(active.modifier.contains(marked), "{active:?}");
-        let other = &buffer[(12, 0)];
-        assert_eq!(other.symbol(), "2");
-        assert!(!other.modifier.intersects(marked), "{other:?}");
-        for x in 0..40 {
-            assert_eq!(buffer[(x, 0)].fg, Color::Reset, "no colour at x = {x}");
-        }
     }
 }

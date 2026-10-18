@@ -344,10 +344,17 @@ async fn f1_opens_help_from_the_reject_note_and_the_note_stays() {
     assert_eq!(harness.queued(), 0, "and nothing was sent");
 }
 
-/// The shell's hint row (MOD-67 M6 T2): the frame's second-to-last row, trailing blanks dropped.
+/// The hints (MOD-67 M6 T2): MOD-115 draws them on the body's bottom border, the frame's last
+/// row, so this is that row with the rule and the corners trimmed off.
 fn hint_row(frame: &str) -> String {
-    let rows: Vec<&str> = frame.lines().collect();
-    rows[rows.len() - 2].trim_end().to_owned()
+    frame
+        .lines()
+        .last()
+        .unwrap_or_default()
+        .trim_matches([
+            '\u{2514}', '\u{2518}', '\u{2500}', '\u{2570}', '\u{256f}', ' ',
+        ])
+        .to_owned()
 }
 
 /// The list's own keys, after a pane's in the shell's hint row when both fit (MOD-67 M6 T2).

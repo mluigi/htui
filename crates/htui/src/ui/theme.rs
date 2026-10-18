@@ -16,6 +16,49 @@ use htui_core::model::Status;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 
+/// The accent each main tab draws its focused pane border and header chip with (MOD-115).
+/// Reserved workspaces and logs tabs have theirs here too, so the ids are fixed before those
+/// tabs exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabAccents {
+    /// The backlog tab.
+    pub backlog: Style,
+    /// The chat tab.
+    pub chat: Style,
+    /// The skills tab.
+    pub skills: Style,
+    /// The settings tab.
+    pub settings: Style,
+    /// The requirements tab.
+    pub requirements: Style,
+    /// The reserved workspaces tab.
+    pub workspaces: Style,
+    /// The reserved logs tab.
+    pub logs: Style,
+}
+
+/// The colour of an item key's prefix (`ANA-3`, `R-NF-3`), so a list tells kinds apart at a
+/// glance (MOD-115).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KindColours {
+    /// `ANA-` analysis items.
+    pub ana: Style,
+    /// `MOD-` modification items.
+    pub mod_: Style,
+    /// `CLEAN-` clean-up items.
+    pub clean: Style,
+    /// `TOOL-` tooling items.
+    pub tool: Style,
+    /// `FIX-` fixes.
+    pub fix: Style,
+    /// `FEAT-` features.
+    pub feat: Style,
+    /// `VAL-` validation items.
+    pub val: Style,
+    /// `R-` requirements.
+    pub req: Style,
+}
+
 /// Styles shared by every view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
@@ -52,6 +95,16 @@ pub struct Theme {
     /// The one-cell text cursor in `TextField` / `TextArea`, and the flow view's cursor node
     /// border (D1).
     pub cursor: Style,
+    /// The border of a pane that does not have focus (MOD-115): fainter than a focused pane's
+    /// tab accent, so focus reads at a glance. `Indexed(240)`; DIM without colour.
+    pub border_faint: Style,
+    /// The text drawn on a block filled with a tab's accent colour (the header's active tab
+    /// chip): black on the default theme, plain without colour, where no block is filled.
+    pub on_accent: Style,
+    /// Per-tab accents; read them through [`Theme::tab_accent`].
+    pub tab_accents: TabAccents,
+    /// Per-kind key colours; read them through [`Theme::kind_style`].
+    pub kind_colours: KindColours,
 }
 
 impl Default for Theme {
@@ -71,6 +124,27 @@ impl Default for Theme {
             added: Style::new().fg(Color::Green),
             active_tab: accent.add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             cursor: Style::new().add_modifier(Modifier::REVERSED),
+            border_faint: Style::new().fg(Color::Indexed(240)),
+            on_accent: Style::new().fg(Color::Black),
+            tab_accents: TabAccents {
+                backlog: accent,
+                chat: Style::new().fg(Color::Green),
+                skills: Style::new().fg(Color::Magenta),
+                settings: Style::new().fg(Color::Blue),
+                requirements: Style::new().fg(Color::Yellow),
+                workspaces: Style::new().fg(Color::Yellow),
+                logs: Style::new().fg(Color::Indexed(208)),
+            },
+            kind_colours: KindColours {
+                ana: Style::new().fg(Color::Cyan),
+                mod_: Style::new().fg(Color::Blue),
+                clean: Style::new().fg(Color::Green),
+                tool: Style::new().fg(Color::Magenta),
+                fix: Style::new().fg(Color::Red),
+                feat: Style::new().fg(Color::Yellow),
+                val: Style::new().fg(Color::Indexed(208)),
+                req: Style::new().fg(Color::Indexed(244)),
+            },
         }
     }
 }
@@ -99,6 +173,27 @@ impl Theme {
             added: plain,
             active_tab: plain.add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             cursor: reversed,
+            border_faint: plain.add_modifier(Modifier::DIM),
+            on_accent: plain,
+            tab_accents: TabAccents {
+                backlog: bold,
+                chat: bold,
+                skills: bold,
+                settings: bold,
+                requirements: bold,
+                workspaces: bold,
+                logs: bold,
+            },
+            kind_colours: KindColours {
+                ana: bold,
+                mod_: bold,
+                clean: bold,
+                tool: bold,
+                fix: bold,
+                feat: bold,
+                val: bold,
+                req: bold,
+            },
         }
     }
 
@@ -125,6 +220,42 @@ impl Theme {
             span.style = span.style.patch(self.selected);
         }
         line
+    }
+
+    /// The accent of the tab with this id (`TabId.0`): its focused pane border and header chip.
+    /// Keyed by the string so the theme does not import `TabId`; an id with no accent of its own
+    /// gets the focus [`accent`](Self::accent).
+    #[must_use]
+    pub fn tab_accent(&self, tab: &str) -> Style {
+        let accents = &self.tab_accents;
+        match tab {
+            "backlog" => accents.backlog,
+            "chat" => accents.chat,
+            "skills" => accents.skills,
+            "settings" => accents.settings,
+            "requirements" => accents.requirements,
+            "workspaces" => accents.workspaces,
+            "logs" => accents.logs,
+            _ => self.accent,
+        }
+    }
+
+    /// The style of an item key's kind prefix (`ANA`, `MOD`, `CLEAN`, `TOOL`, `FIX`, `FEAT`,
+    /// `VAL`, `R-`). An unknown prefix keeps the plain [`key`](Self::key) style.
+    #[must_use]
+    pub fn kind_style(&self, prefix: &str) -> Style {
+        let kinds = &self.kind_colours;
+        match prefix {
+            "ANA" => kinds.ana,
+            "MOD" => kinds.mod_,
+            "CLEAN" => kinds.clean,
+            "TOOL" => kinds.tool,
+            "FIX" => kinds.fix,
+            "FEAT" => kinds.feat,
+            "VAL" => kinds.val,
+            "R-" => kinds.req,
+            _ => self.key,
+        }
     }
 
     /// The style an [`Status`] renders with, so every list agrees on what "blocked" looks like.
@@ -170,6 +301,31 @@ mod tests {
         assert_eq!(
             theme.selected,
             Style::new().fg(Color::Black).bg(Color::Cyan)
+        );
+        assert_eq!(theme.border_faint.fg, Some(Color::Indexed(240)));
+        assert_eq!(theme.on_accent, Style::new().fg(Color::Black));
+        assert_eq!(theme.tab_accent("backlog").fg, Some(Color::Cyan));
+        assert_eq!(theme.tab_accent("chat").fg, Some(Color::Green));
+        assert_eq!(theme.tab_accent("skills").fg, Some(Color::Magenta));
+        assert_eq!(theme.tab_accent("settings").fg, Some(Color::Blue));
+        assert_eq!(theme.tab_accent("requirements").fg, Some(Color::Yellow));
+        assert_eq!(theme.tab_accent("workspaces").fg, Some(Color::Yellow));
+        assert_eq!(theme.tab_accent("logs").fg, Some(Color::Indexed(208)));
+        assert_eq!(
+            theme.tab_accent("no-such-tab"),
+            theme.accent,
+            "an unknown tab falls back to the focus accent"
+        );
+        for prefix in ["ANA", "MOD", "CLEAN", "TOOL", "FIX", "FEAT", "VAL", "R-"] {
+            assert!(
+                theme.kind_style(prefix).fg.is_some(),
+                "{prefix} has its own colour"
+            );
+        }
+        assert_eq!(
+            theme.kind_style("NOPE"),
+            theme.key,
+            "an unknown prefix keeps the key style"
         );
     }
 
@@ -257,10 +413,33 @@ mod tests {
             theme.added,
             theme.active_tab,
             theme.cursor,
+            theme.border_faint,
+            theme.on_accent,
         ];
         for role in roles {
             assert_eq!(role.fg, None, "{role:?}");
             assert_eq!(role.bg, None, "{role:?}");
+        }
+        assert!(theme.border_faint.add_modifier.contains(Modifier::DIM));
+        for name in [
+            "backlog",
+            "chat",
+            "skills",
+            "settings",
+            "requirements",
+            "workspaces",
+            "logs",
+            "no-such-tab",
+        ] {
+            let accent = theme.tab_accent(name);
+            assert_eq!(accent.fg, None, "{name}");
+            assert_eq!(accent.bg, None, "{name}");
+            assert!(accent.add_modifier.contains(Modifier::BOLD), "{name}");
+        }
+        for prefix in ["ANA", "MOD", "CLEAN", "TOOL", "FIX", "FEAT", "VAL", "R-"] {
+            let kind = theme.kind_style(prefix);
+            assert_eq!(kind.fg, None, "{prefix}");
+            assert_eq!(kind.bg, None, "{prefix}");
         }
         assert!(theme.selected.add_modifier.contains(Modifier::REVERSED));
         assert!(theme.cursor.add_modifier.contains(Modifier::REVERSED));
@@ -276,7 +455,13 @@ mod tests {
             Style::new().add_modifier(Modifier::BOLD),
             "a failure stands out without colour (D4 as amended in review)"
         );
-        for plain in [theme.base, theme.running, theme.warning, theme.added] {
+        for plain in [
+            theme.base,
+            theme.running,
+            theme.warning,
+            theme.added,
+            theme.on_accent,
+        ] {
             assert_eq!(plain, Style::new(), "{plain:?}");
         }
     }

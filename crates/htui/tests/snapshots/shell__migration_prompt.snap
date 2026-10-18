@@ -2,8 +2,7 @@
 source: crates/htui/tests/shell.rs
 expression: frame
 ---
-Graphics · DESKTOP-HTUI · online · 0 working · 0 waiting
- 1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
+Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat          0 waiting · online ·  ?  keys
 ┌ Backlog (2) ────────────────────────────────────────┐┌ FEAT-1 ───────────────────────────────────┐
 │▾ Vulkan Tutorials (2)                               ││ Body Runs Graph Docs Notes Prompt Reqs    │
 │  FEAT-1  in_progress  Chapter 12 parity             ││Chapter 12 parity                          │
@@ -11,6 +10,7 @@ Graphics · DESKTOP-HTUI · online · 0 working · 0 waiting
 │                                                     ││gpu, vulkan · priority 0 · version 1       │
 │                                                     ││                                           │
 │                                                     ││No body for this item.                     │
+│                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
@@ -29,6 +29,6 @@ Graphics · DESKTOP-HTUI · online · 0 working · 0 waiting
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
 └─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
-
-Ctrl+c quit · ? help

@@ -2,8 +2,7 @@
 source: crates/htui/tests/backlog.rs
 expression: frame
 ---
-Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
- 1 Backlog
+Platform   ¹Backlog            1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
 ┌ Backlog (11) ───────────────────────────────────────┐┌ ANA-2 ────────────────────────────────────┐
 │▾ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │
 │  ANA-1    done               Data model, box regist…││graph  awaiting  DESKTOP-HTUI 09-24 09:00  │
@@ -27,8 +26,9 @@ Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
 │                                                     ││reject with a note:                        │
 │                                                     ││needs work                                 │
-└─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
-Enter reject · Esc cancel
-Ctrl+c quit · F1 help
+└─Enter reject · Esc cancel───────────────────────────┘└───────────────────────────────────────────┘

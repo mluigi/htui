@@ -2,8 +2,7 @@
 source: crates/htui/tests/backlog.rs
 expression: frame
 ---
-Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
- 1 Backlog
+Platform   ¹Backlog                                vulkan-tutorials:FEAT-1 is outside this workspace
 ┌ Backlog (11) ───────────────────────────────────────┐┌ FIX-1 ────────────────────────────────────┐
 │▾ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │
 │  ANA-1    done               Data model, box regist…││  FIX-1 open Session leak on cancel        │
@@ -28,7 +27,8 @@ Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
 │                                                     ││depth 2/3                                  │
-└─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
-+/- depth · Enter re-root · j/k move · h/l sub-tab · f filter · N new · e edit
-vulkan-tutorials:FEAT-1 is outside this workspace
+└─+/- depth · Enter re-root · j/k move · h/l sub-tab · f filter · N new · e edit───────────────────┘

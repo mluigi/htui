@@ -63,6 +63,8 @@ pub enum Action {
     AbortEdit,
     /// Show or hide the key help.
     ToggleHelp,
+    /// Show or hide the about panel under the header (`global.about`, MOD-115).
+    ToggleAbout,
     /// Put a message on the status line: what a `StoreReply::Failed` becomes.
     Error(String),
     /// The 250 ms timer fired.
