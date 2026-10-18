@@ -11,6 +11,8 @@ pub mod layout;
 mod markdown;
 pub mod overlay;
 pub mod path_picker;
+pub mod shell;
+pub mod state_file;
 pub mod tabs;
 pub mod text_area;
 pub mod text_field;

@@ -21,6 +21,7 @@ use crate::ui::cells::clip_line;
 use crate::ui::header::{self, Flash};
 use crate::ui::kit::pane::paint_bottom_hints;
 use crate::ui::overlay::{Overlay, OverlayRegistry, OverlayStack};
+use crate::ui::shell::PaneId;
 use crate::ui::tabs::{Tab, TabId, TabRegistry};
 use crate::ui::{Theme, about, layout};
 use crossterm::event::{Event, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind};
@@ -94,6 +95,12 @@ pub struct Ctx<'a> {
     emit: &'a Emit,
     /// MOD-57 P2: where the active tab names its editing rect; `None` at every other site.
     editor_area: Option<&'a Cell<Option<Rect>>>,
+    /// MOD-115 M2 D3: the tab's focused pane, as the shell keeps it; `None` until the shell sets
+    /// one (B7: then the list).
+    focus: Option<PaneId>,
+    /// MOD-115 M2 D6: the open in-pane edit's label, for the leave dialog; `None` when no edit
+    /// is open.
+    open_edit: Option<&'a str>,
 }
 
 impl<'a> Ctx<'a> {
@@ -117,7 +124,36 @@ impl<'a> Ctx<'a> {
             origin,
             emit,
             editor_area: None,
+            focus: None,
+            open_edit: None,
         }
+    }
+
+    /// This context with the tab's focused pane (MOD-115 M2 D3). Only the shell calls it.
+    #[must_use]
+    pub const fn with_focus(mut self, focus: PaneId) -> Self {
+        self.focus = Some(focus);
+        self
+    }
+
+    /// This context with the open in-pane edit's label, or none (MOD-115 M2 D6).
+    #[must_use]
+    pub const fn with_open_edit(mut self, open_edit: Option<&'a str>) -> Self {
+        self.open_edit = open_edit;
+        self
+    }
+
+    /// The tab's focused pane (MOD-115 M2 D3): the list unless the shell set another (B7), so
+    /// every bench behaves as before the shell kept focus.
+    #[must_use]
+    pub fn focus(&self) -> PaneId {
+        self.focus.unwrap_or(PaneId::List)
+    }
+
+    /// The open in-pane edit's label, if an edit is open (MOD-115 M2 D6).
+    #[must_use]
+    pub const fn open_edit(&self) -> Option<&'a str> {
+        self.open_edit
     }
 
     /// Lends this context the cell [`claim_editor_area`](Self::claim_editor_area) writes. Only
@@ -1126,6 +1162,45 @@ mod tests {
 
     use super::{App, hint_row, join_panes_under};
     use crate::keys::{CATALOGUE, Context};
+
+    /// MOD-115 M2 B7: a view sees the list focused and no open edit unless the shell says so;
+    /// the builders set both.
+    #[test]
+    fn a_ctx_defaults_to_the_list_focused_and_no_open_edit() {
+        use htui_core::model::{Scope, WorkspaceId};
+
+        use super::{Ctx, Emit, TopBarState};
+        use crate::keys::Keys;
+        use crate::store_worker::Origin;
+        use crate::ui::Theme;
+        use crate::ui::overlay::AbortConfirm;
+        use crate::ui::shell::PaneId;
+
+        let scope = Scope {
+            workspace_id: WorkspaceId::default(),
+            project_ids: Vec::new(),
+        };
+        let (top_bar, theme, emit) = (TopBarState::default(), Theme::default(), Emit::default());
+        let ctx = || {
+            Ctx::new(
+                &scope,
+                &[],
+                &top_bar,
+                Keys::compiled(),
+                &theme,
+                Origin::Overlay(AbortConfirm::ID),
+                &emit,
+            )
+        };
+        assert_eq!(ctx().focus(), PaneId::List);
+        assert_eq!(ctx().open_edit(), None);
+        let set = ctx()
+            .with_focus(PaneId::Detail)
+            .with_open_edit(Some("MOD-115 body"));
+        assert_eq!(set.focus(), PaneId::Detail);
+        assert_eq!(set.open_edit(), Some("MOD-115 body"));
+        assert_eq!(ctx().with_open_edit(None).open_edit(), None);
+    }
 
     /// MOD-115 M1 adapter: the hints go on the lowest bottom border among the body's last four
     /// rows, so a tab with a notice under its frame still shows them; none there, none shown.
