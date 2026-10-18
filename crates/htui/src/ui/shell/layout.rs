@@ -14,9 +14,11 @@
 //! split is clamped to the pane minimums only when the region holds them all; a smaller region
 //! keeps the unclamped split, and nothing is ever hidden for lack of room.
 //!
-//! A zoomed pane takes the whole region. The detail has no hidden reason in [`PaneAreas`]: when
-//! the list or the activity pane is zoomed, the detail is a zero-sized rect at the region's
-//! origin, which [`visible`], [`step`] and [`hit`] skip.
+//! A zoomed pane takes the whole region, and every other pane is hidden by [`HiddenBy::Zoom`]
+//! (whatever else hid it). The detail has no hidden reason in [`PaneAreas`]: when the list or
+//! the activity pane is zoomed, the detail is a zero-sized rect at the region's origin. Any
+//! zero-sized pane is skipped by [`visible`], [`step`], [`hit`] and [`seam`]; the note goes on
+//! the [`note_area`].
 
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 
@@ -71,8 +73,10 @@ pub fn areas(region: Rect, layout: &TabLayout, focus: PaneId) -> PaneAreas {
             PaneId::Activity if activity_hidden.is_none() => PaneId::Activity,
             _ => PaneId::Detail,
         };
+        // Every pane but the zoomed one is hidden by the zoom, whatever else hid it: the zoom
+        // is what it must undo first, and the reason `hidden_note` reads the zoom from.
         let away = |pane: PaneId, hidden: &mut Option<HiddenBy>| {
-            if pane != zoomed && hidden.is_none() {
+            if pane != zoomed {
                 *hidden = Some(HiddenBy::Zoom);
             }
         };
@@ -211,13 +215,16 @@ fn cut_columns(area: Rect, width: u16) -> (Rect, Rect) {
     (left, right)
 }
 
-/// The rect `pane` is drawn in, if it is shown.
+/// The rect `pane` is drawn in, if it is shown with at least one cell: a pane the split left
+/// zero-sized (the zoomed-away detail, or any pane of a region too small to hold it) is not
+/// visible, focusable, hit or seamed.
 fn rect_of(areas: &PaneAreas, pane: PaneId) -> Option<Rect> {
     match pane {
         PaneId::List => areas.list,
-        PaneId::Detail => Some(areas.detail).filter(|detail| !detail.is_empty()),
+        PaneId::Detail => Some(areas.detail),
         PaneId::Activity => areas.activity,
     }
+    .filter(|rect| !rect.is_empty())
 }
 
 /// The panes `areas` shows, in focus-cycle order: list, detail, activity.
@@ -260,13 +267,14 @@ pub fn hit(areas: &PaneAreas, x: u16, y: u16) -> Option<PaneId> {
 pub fn seam(areas: &PaneAreas, x: u16, y: u16) -> Option<Seam> {
     let at = Position::new(x, y);
     let detail = rect_of(areas, PaneId::Detail);
-    if let (Some(list), Some(detail)) = (areas.list, detail)
+    if let (Some(list), Some(detail)) = (rect_of(areas, PaneId::List), detail)
         && (list.contains(at) && x + 1 == list.right() || detail.contains(at) && x == detail.x)
     {
         return Some(Seam::List);
     }
-    let activity = areas.activity?;
-    let neighbour = detail.or(areas.list)?;
+    let list = rect_of(areas, PaneId::List);
+    let activity = rect_of(areas, PaneId::Activity)?;
+    let neighbour = detail.or(list)?;
     let beside = activity.y == neighbour.y;
     let on_activity = activity.contains(at)
         && if beside {
@@ -274,7 +282,7 @@ pub fn seam(areas: &PaneAreas, x: u16, y: u16) -> Option<Seam> {
         } else {
             y == activity.y
         };
-    let on_neighbour = [areas.list, detail].into_iter().flatten().any(|pane| {
+    let on_neighbour = [list, detail].into_iter().flatten().any(|pane| {
         pane.contains(at)
             && if beside {
                 x + 1 == pane.right() && pane.right() == activity.x
@@ -300,19 +308,19 @@ pub struct NoteLabels {
     pub zoom: Option<String>,
 }
 
-/// What a hidden pane says about bringing it back (`R-TUI-12`), for the detail's bottom border:
-/// `z unzoom` while another pane is zoomed, `F2 show list · p layouts` while the list is hidden
-/// by its toggle or the preset, `F3 show activity` while the activity pane is toggled off;
+/// What a hidden pane says about bringing it back (`R-TUI-12`), for the [`note_area`]'s bottom
+/// border: `z unzoom` while the zoom is on (every pane but the zoomed one is then hidden by it,
+/// so the zoom is the only part); otherwise `F2 show list · p layouts` while the list is hidden
+/// by its toggle or the preset and `F3 show activity` while the activity pane is toggled off,
 /// joined with ` · `. `None` when nothing is hidden but by the preset's lack of an activity pane.
+/// The zoom is read from the [`HiddenBy::Zoom`] reasons [`areas`] gives, never from the geometry:
+/// a region too narrow for the detail is not a zoom.
 #[must_use]
 pub fn hidden_note(areas: &PaneAreas, labels: &NoteLabels) -> Option<String> {
     let part =
         |label: &Option<String>, what: &str| label.as_ref().map(|key| format!("{key} {what}"));
-    let detail_zoomed_away =
-        areas.detail.is_empty() && (areas.list.is_some() || areas.activity.is_some());
-    let zoomed = detail_zoomed_away
-        || areas.list_hidden == Some(HiddenBy::Zoom)
-        || areas.activity_hidden == Some(HiddenBy::Zoom);
+    let zoomed =
+        areas.list_hidden == Some(HiddenBy::Zoom) || areas.activity_hidden == Some(HiddenBy::Zoom);
     let list = matches!(areas.list_hidden, Some(HiddenBy::Toggle | HiddenBy::Preset));
     let activity = areas.activity_hidden == Some(HiddenBy::Toggle);
     let parts: Vec<String> = [
@@ -326,6 +334,18 @@ pub fn hidden_note(areas: &PaneAreas, labels: &NoteLabels) -> Option<String> {
     .flatten()
     .collect();
     (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// The rect whose bottom border carries the [`hidden_note`]: the detail's, or, while the list or
+/// the activity pane is zoomed (the detail then zero-sized), the zoomed pane's. `None` when no
+/// pane has a cell to paint on.
+#[must_use]
+pub fn note_area(areas: &PaneAreas) -> Option<Rect> {
+    rect_of(areas, PaneId::Detail).or_else(|| {
+        visible(areas)
+            .first()
+            .and_then(|pane| rect_of(areas, *pane))
+    })
 }
 
 /// The list's percentage step (`layout.grow_list` / `shrink_list`).
@@ -638,7 +658,11 @@ mod tests {
         let list = areas(WIDE, &zoomed(Preset::Ide), PaneId::List);
         assert_eq!(list.list, Some(WIDE));
         assert!(list.detail.is_empty(), "the zoomed-away detail has no area");
-        assert_eq!(list.activity_hidden, Some(HiddenBy::Preset), "kept");
+        assert_eq!(
+            list.activity_hidden,
+            Some(HiddenBy::Zoom),
+            "every pane but the zoomed one is hidden by the zoom"
+        );
         assert_eq!(visible(&list), [PaneId::List]);
 
         let activity = areas(WIDE, &zoomed(Preset::IdeActivity), PaneId::Activity);
@@ -648,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn zoom_on_a_hidden_focus_zooms_the_detail_and_keeps_the_first_reason() {
+    fn zoom_on_a_hidden_focus_zooms_the_detail_and_hides_the_rest_by_zoom() {
         let layout = TabLayout {
             list_on: false,
             zoom: true,
@@ -656,7 +680,25 @@ mod tests {
         };
         let got = areas(WIDE, &layout, PaneId::List);
         assert_eq!(got.detail, WIDE);
-        assert_eq!(got.list_hidden, Some(HiddenBy::Toggle));
+        assert_eq!(
+            got.list_hidden,
+            Some(HiddenBy::Zoom),
+            "the zoom is what the list must undo first"
+        );
+        let focus = areas(
+            WIDE,
+            &TabLayout {
+                preset: Preset::Focus,
+                zoom: true,
+                ..TabLayout::DEFAULT
+            },
+            PaneId::Detail,
+        );
+        assert_eq!(focus.detail, WIDE);
+        assert_eq!(
+            (focus.list_hidden, focus.activity_hidden),
+            (Some(HiddenBy::Zoom), Some(HiddenBy::Zoom))
+        );
         let ide = areas(
             WIDE,
             &TabLayout {
@@ -946,7 +988,7 @@ mod tests {
     }
 
     #[test]
-    fn every_reason_joins_the_note_unzoom_first() {
+    fn a_zoom_leaves_only_the_unzoom_part_whatever_else_is_hidden() {
         let all = TabLayout {
             preset: Preset::IdeActivity,
             list_on: false,
@@ -956,8 +998,15 @@ mod tests {
         };
         assert_eq!(
             note(&all, PaneId::Detail).as_deref(),
+            Some("z unzoom"),
+            "while zoomed only the unzoom brings anything back"
+        );
+        let mut unzoomed = all;
+        unzoomed.toggle_zoom();
+        assert_eq!(
+            note(&unzoomed, PaneId::Detail).as_deref(),
             Some("F2 show list · p layouts · F3 show activity"),
-            "nothing left to zoom away: no unzoom part"
+            "every reason joins the note once the zoom is gone"
         );
         let mixed = TabLayout {
             preset: Preset::IdeActivity,
@@ -965,10 +1014,111 @@ mod tests {
             zoom: true,
             ..TabLayout::DEFAULT
         };
+        assert_eq!(note(&mixed, PaneId::Detail).as_deref(), Some("z unzoom"));
+    }
+
+    #[test]
+    fn a_zoom_with_nothing_else_shown_still_says_how_to_unzoom() {
+        // A list toggled off (or a preset without one) leaves the detail alone; the zoom is
+        // still on, and the list-showing keys would bring back nothing while it is.
+        let mut ide = TabLayout {
+            list_on: false,
+            zoom: true,
+            ..TabLayout::DEFAULT
+        };
+        assert_eq!(note(&ide, PaneId::Detail).as_deref(), Some("z unzoom"));
+        ide.toggle_list();
+        assert_eq!(note(&ide, PaneId::Detail).as_deref(), Some("z unzoom"));
         assert_eq!(
-            note(&mixed, PaneId::Detail).as_deref(),
-            Some("z unzoom · F2 show list · p layouts")
+            visible(&areas(WIDE, &ide, PaneId::Detail)),
+            [PaneId::Detail]
         );
+
+        let mut focus = TabLayout {
+            zoom: true,
+            ..layout(Preset::Focus)
+        };
+        assert_eq!(note(&focus, PaneId::Detail).as_deref(), Some("z unzoom"));
+        focus.toggle_zoom();
+        assert_eq!(
+            note(&focus, PaneId::Detail).as_deref(),
+            Some("F2 show list · p layouts")
+        );
+    }
+
+    #[test]
+    fn a_narrow_region_never_says_unzoom_without_a_zoom() {
+        for list in [ListSize::Percent(85), ListSize::Percent(100)] {
+            for width in 1..=39 {
+                let region = Rect::new(0, 1, width, 10);
+                let got = areas(region, &with_list(list), PaneId::List);
+                assert_eq!(
+                    hidden_note(&got, &labels()),
+                    None,
+                    "{list:?} in {width} cells"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_zero_sized_pane_is_neither_visible_nor_a_seam() {
+        let flat = areas(
+            Rect::new(0, 0, 80, 1),
+            &layout(Preset::IdeActivity),
+            PaneId::List,
+        );
+        assert!(flat.activity.is_some_and(|a| a.is_empty()), "{flat:?}");
+        assert_eq!(visible(&flat), [PaneId::List, PaneId::Detail]);
+        assert_eq!(seam(&flat, 0, 0), None);
+        assert_eq!(step(&flat, PaneId::Detail, true), PaneId::List);
+        for &preset in Preset::ALL {
+            for (width, height) in [(1, 1), (2, 1), (1, 3), (80, 1), (3, 40)] {
+                let got = areas(
+                    Rect::new(0, 0, width, height),
+                    &layout(preset),
+                    PaneId::List,
+                );
+                for pane in visible(&got) {
+                    let rect = match pane {
+                        PaneId::List => got.list,
+                        PaneId::Detail => Some(got.detail),
+                        PaneId::Activity => got.activity,
+                    };
+                    assert!(
+                        rect.is_some_and(|r| !r.is_empty()),
+                        "{preset:?} {width}x{height}: {pane:?} visible but empty"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_note_goes_on_the_detail_or_on_the_zoomed_pane() {
+        let ide = areas(WIDE, &TabLayout::DEFAULT, PaneId::List);
+        assert_eq!(note_area(&ide), Some(ide.detail));
+        let zoom = |preset, focus| {
+            areas(
+                WIDE,
+                &TabLayout {
+                    zoom: true,
+                    ..layout(preset)
+                },
+                focus,
+            )
+        };
+        assert_eq!(note_area(&zoom(Preset::Ide, PaneId::List)), Some(WIDE));
+        assert_eq!(
+            note_area(&zoom(Preset::IdeActivity, PaneId::Activity)),
+            Some(WIDE)
+        );
+        assert_eq!(
+            note_area(&zoom(Preset::Columns, PaneId::Detail)),
+            Some(WIDE)
+        );
+        let gone = areas(Rect::new(0, 0, 0, 0), &TabLayout::DEFAULT, PaneId::List);
+        assert_eq!(note_area(&gone), None, "nothing drawn, nowhere to paint");
     }
 
     #[test]
