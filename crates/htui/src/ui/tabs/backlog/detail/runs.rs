@@ -836,6 +836,7 @@ impl RunsTab {
                         item,
                         mode: RunMode::Manual,
                         repo_scope: None,
+                        workspace: Some(ctx.scope.workspace_id),
                     }));
                 }
             }
@@ -2147,7 +2148,7 @@ mod tests {
     use htui_core::model::{
         FOLLOW_UP_EMPTY, FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_CANCELLED,
         FOLLOW_UP_SESSION_ENDED, GateOutcome, PermissionStatus, ProjectRef, RelaySessionId,
-        RunCommandId, Scope, WorkspaceId, executor_scrub_refusal,
+        RunCommandId, Scope, executor_scrub_refusal,
     };
     use htui_core::store::{MemStore, ReadStore};
     use htui_orch::Rest;
@@ -2167,7 +2168,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 scope: Scope {
-                    workspace_id: WorkspaceId::default(),
+                    workspace_id: ids::WORKSPACE_PLATFORM,
                     project_ids: Vec::new(),
                 },
                 projects: Vec::new(),
@@ -3387,6 +3388,8 @@ mod tests {
                 item: ids::HTUI_FEAT_1,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                // MOD-125 D3: the run is recorded under the scope it was started from.
+                workspace: Some(ids::WORKSPACE_PLATFORM),
             })
         );
         assert_refused(shift('R'), "run").await;

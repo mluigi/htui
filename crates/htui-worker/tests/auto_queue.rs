@@ -605,6 +605,7 @@ fn start_run(item: ItemId) -> RunRequest {
         item,
         mode: RunMode::Manual,
         repo_scope: None,
+        workspace: None,
     }))
 }
 

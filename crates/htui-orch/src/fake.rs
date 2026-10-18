@@ -2428,8 +2428,9 @@ impl FakeOrchestrator {
         &self,
         item: ItemId,
         batch: BatchId,
+        workspace: Option<htui_core::model::WorkspaceId>,
     ) -> std::result::Result<RunId, EngineError> {
-        crate::engine::enqueue_in_batch_fake(self, item, batch).await
+        crate::engine::enqueue_in_batch_fake(self, item, batch, workspace).await
     }
 
     /// `Engine::sweep` over the same parts (plan D98): adopt every expired lease on this box,

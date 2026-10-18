@@ -619,6 +619,7 @@ impl Stack {
                 item,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
         {

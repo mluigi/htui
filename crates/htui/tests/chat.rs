@@ -1114,6 +1114,7 @@ fn start_run() -> StoreRequest {
         item: ids::HTUI_ANA_2,
         mode: RunMode::Manual,
         repo_scope: None,
+        workspace: None,
     }))
 }
 

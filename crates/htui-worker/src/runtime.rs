@@ -2334,7 +2334,7 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
         if admitted >= free || ctx.shared.walks.closed() {
             break;
         }
-        match engine.enqueue_in_batch(item, batch.id).await {
+        match engine.enqueue_in_batch(item, batch.id, None).await {
             Ok(run) => {
                 admitted += 1;
                 ctx.shared.publisher.publish(&RunFrame {
@@ -2648,7 +2648,8 @@ async fn run_request<H: htui_core::store::WorkerHost, P: ReplySink>(
             item,
             mode,
             repo_scope,
-        }) => start_run(ctx, item, mode, repo_scope).await,
+            workspace,
+        }) => start_run(ctx, item, mode, repo_scope, workspace).await,
         OrchRequest::Command(Command::Unblock { item }) => unblock(ctx, item).await,
         OrchRequest::Command(command @ Command::CloseOut { item, .. }) => {
             let _ = ctx.tag.item.set(item);
@@ -2722,6 +2723,7 @@ async fn start_run<H: htui_core::store::WorkerHost, P: ReplySink>(
     item: ItemId,
     mode: htui_core::model::RunMode,
     repo_scope: Option<Vec<RepoId>>,
+    workspace: Option<WorkspaceId>,
 ) {
     let _ = ctx.tag.item.set(item);
     let kit = match Kit::read(&ctx.shared, &ctx.host, true).await {
@@ -2737,7 +2739,7 @@ async fn start_run<H: htui_core::store::WorkerHost, P: ReplySink>(
     if ctx.shared.walks.closed() {
         return ctx.refuse(PREEMPTED.to_owned());
     }
-    let run = match engine.enqueue(item, mode, repo_scope).await {
+    let run = match engine.enqueue(item, mode, repo_scope, workspace).await {
         Ok(run) => run,
         Err(err) => return ctx.refuse(err.to_string()),
     };

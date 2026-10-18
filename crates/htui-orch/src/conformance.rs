@@ -148,7 +148,12 @@ pub trait Orchestrate {
     ///
     /// # Errors
     /// Whatever the engine refuses with.
-    async fn enqueue_in_batch(&self, item: ItemId, batch: BatchId) -> Result<RunId, EngineError>;
+    async fn enqueue_in_batch(
+        &self,
+        item: ItemId,
+        batch: BatchId,
+        workspace: Option<WorkspaceId>,
+    ) -> Result<RunId, EngineError>;
 
     /// A second orchestrator over the same store, as a process started after this one died
     /// (plan D118): a new `owner`, fresh isolator and verifier, a clock past every lease.
@@ -280,8 +285,13 @@ impl Orchestrate for FakeOrchestrator {
         Self::claim(self, run).await
     }
 
-    async fn enqueue_in_batch(&self, item: ItemId, batch: BatchId) -> Result<RunId, EngineError> {
-        Self::enqueue_in_batch(self, item, batch).await
+    async fn enqueue_in_batch(
+        &self,
+        item: ItemId,
+        batch: BatchId,
+        workspace: Option<WorkspaceId>,
+    ) -> Result<RunId, EngineError> {
+        Self::enqueue_in_batch(self, item, batch, workspace).await
     }
 
     fn restarted(&self) -> Self {
@@ -1387,6 +1397,7 @@ async fn start_in<O: Orchestrate>(orch: &O, item: ItemId, mode: RunMode) -> (Run
             item,
             mode,
             repo_scope: None,
+            workspace: None,
         })
         .await
         .expect("the graph resolves and the box has a slot");
@@ -3167,6 +3178,7 @@ async fn no_candidate_agent_blocks_the_item<H: CaseHarness>(harness: &H) {
             item: ids::HTUI_FEAT_3,
             mode: RunMode::Manual,
             repo_scope: None,
+            workspace: None,
         })
         .await
         .expect_err("rung 4 refuses before a run row exists");
@@ -3225,6 +3237,7 @@ async fn a_capability_refusal_writes_no_run_and_unblock_reopens<H: CaseHarness>(
             item: ids::HTUI_FEAT_3,
             mode: RunMode::Manual,
             repo_scope: None,
+            workspace: None,
         })
         .await
         .expect_err("the demo box has neither `docker` nor `vulkan`");
@@ -4109,6 +4122,7 @@ async fn fan_out_above_max_fan_out_is_refused_at_start<H: CaseHarness>(harness: 
             item: ids::HTUI_ANA_2,
             mode: RunMode::Manual,
             repo_scope: None,
+            workspace: None,
         })
         .await
         .expect_err("fan_out 5 exceeds max_fan_out 4");
@@ -4142,6 +4156,7 @@ async fn a_malformed_cap_is_refused_at_start<H: CaseHarness>(harness: &H) {
             item: ids::HTUI_ANA_2,
             mode: RunMode::Manual,
             repo_scope: None,
+            workspace: None,
         })
         .await
         .expect_err("a string cap is refused");
@@ -4185,6 +4200,7 @@ async fn max_agents_per_run_is_refused_at_start<H: CaseHarness>(harness: &H) {
             item: ids::HTUI_FEAT_3,
             mode: RunMode::Manual,
             repo_scope: None,
+            workspace: None,
         })
         .await
         .expect_err("seven agents exceed six");
@@ -4374,6 +4390,7 @@ async fn start_refused<O: Orchestrate>(orch: &O, item: ItemId) -> (RunId, Claim)
             item,
             mode: RunMode::Manual,
             repo_scope: None,
+            workspace: None,
         })
         .await
         .expect_err("the claim is refused");
@@ -4650,6 +4667,7 @@ async fn a_suspended_walk_cannot_write_after_adoption<H: CaseHarness>(harness: &
         item: ids::HTUI_FEAT_3,
         mode: RunMode::Manual,
         repo_scope: None,
+        workspace: None,
     }));
     if let Either::Left(_) =
         futures::future::select(walk.as_mut(), Box::pin(stalled.notified())).await
@@ -4754,6 +4772,7 @@ async fn a_walk_woken_after_done_records_no_commits<H: CaseHarness>(harness: &H)
         item: ids::HTUI_FEAT_3,
         mode: RunMode::Manual,
         repo_scope: None,
+        workspace: None,
     }));
     if let Either::Left(_) =
         futures::future::select(walk.as_mut(), Box::pin(stalled.notified())).await
@@ -4837,6 +4856,7 @@ async fn crash<O: Orchestrate>(orch: &O, item: ItemId, stalled: &Notify) -> RunI
             item,
             mode: RunMode::Manual,
             repo_scope: None,
+            workspace: None,
         }),
         stalled,
     )
@@ -6314,6 +6334,7 @@ async fn unblock_opens_a_blocked_item_with_no_run<H: CaseHarness>(harness: &H) {
         item: ids::HTUI_FEAT_3,
         mode: RunMode::Manual,
         repo_scope: None,
+        workspace: None,
     })
     .await
     .expect_err("rung 4 refuses before a run row exists");
@@ -8010,7 +8031,7 @@ async fn open_batch<O: Orchestrate>(orch: &O) -> BatchId {
 /// When either is refused, which every caller of this helper expects not to be.
 async fn run_in_batch<O: Orchestrate>(orch: &O, item: ItemId, batch: BatchId) -> (RunId, Rest) {
     let run = orch
-        .enqueue_in_batch(item, batch)
+        .enqueue_in_batch(item, batch, None)
         .await
         .expect("the batch is open and the item startable");
     let outcome = orch.claim(run).await.expect("the box admits the run");
@@ -9230,6 +9251,7 @@ mod fanout_paths {
                 item: ids::HTUI_ANA_2,
                 mode: htui_core::model::RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect_err("the refused selection is raised");
@@ -9444,6 +9466,7 @@ mod fanout_paths {
                 item: ids::HTUI_ANA_2,
                 mode: htui_core::model::RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })),
             async {
                 stalled.notified().await;
