@@ -37,14 +37,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{Ctx, Handled};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, is_plain, views};
+use crate::keys::{Act, Context, Hint, HintSpec, KeyChord, Keys, Stack, is_plain, views};
 use crate::run_worker::{OrchReply, Via};
 use crate::store_worker::{ChatFrame, StoreReply, StoreRequest};
 use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::registry::{Tab, TabId};
 use crate::ui::tabs::settings::key_line;
 use composer::{Composer, ComposerOutcome};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 use permission::PermissionStrip;
 use transcript::{Transcript, TranscriptRow};
 
@@ -73,7 +73,7 @@ const REPLAY_HINT: HintSpec = &[
 /// The open composer's keys (`CAPTURE`): its own, fixed (ANA-26 §6.1).
 const COMPOSE_HINT: HintSpec = &[Hint::Text("Enter send"), Hint::Text("Esc leave")];
 
-/// A parked permission request (`CHAT_LIVE`): the digits are fixed ahead of the resolver (D5).
+/// A parked permission request (`CHAT_LIVE`): the digits are `answer.option_*` (MOD-115 M2 D7).
 const PARKED_HINT: HintSpec = &[
     Hint::Text("1-9 answer"),
     Hint::One(Act::ChatCompose, "compose"),
@@ -263,15 +263,17 @@ impl ChatTab {
     /// [`views::CHAT_REPLAY`] first: `common.back` (`Esc`) leaves, and the transcript's acts
     /// scroll and fold exactly as they do live. A key none of them took that the live tab would
     /// act on (`i`, `Enter`, a digit, `a`) is consumed and does nothing, because a finished step
-    /// takes no prompt and answers no permission request (D41): fixed, on plain keys only (MOD-67
-    /// M5 D5), so `alt-2` still reaches the shell. Anything else is the shell's (`q`, `Tab`, `?`).
+    /// takes no prompt and answers no permission request (D41): the chords `CHAT_LIVE` binds to a
+    /// `[chat]` or `[answer]` row, so `alt-2` still reaches the shell. Anything else is the shell's
+    /// (`q`, `Tab`, `?`).
     /// Resolving first lets a key file give the replay's own acts one of those keys
     /// (`[common] back = ["i"]`, M5 R1 M1); under the defaults none of them has one.
     ///
     /// The digits are *consumed* rather than passed on for the same reason the live tab consumes
     /// them: a `2` typed at a permission row must not fall through to the global tab-select
-    /// binding and move the user off the conversation they are reading. The validator refuses a
-    /// global act on the swallowed keys but the tab select (`keys::FIXED`).
+    /// binding and move the user off the conversation they are reading. The swallowed keys are
+    /// what `CHAT_LIVE` binds to a `[chat]` or `[answer]` row (MOD-115 M2 D7), so they follow a
+    /// rebind.
     fn on_key_replay(&mut self, key: KeyEvent, keys: &Keys) -> Handled {
         let handled = match keys
             .actions(views::CHAT_REPLAY, KeyChord::from_event(key))
@@ -294,12 +296,17 @@ impl ChatTab {
                 .map_or(Handled::Pass, |replay| replay.transcript.on_act(act)),
             None => Handled::Pass,
         };
+        // MOD-115 M2 D7: what the live tab would do with the chord (a `[chat]` or `[answer]` row
+        // through `CHAT_LIVE`: the digits, `i`, `a`, `Enter` by default) is swallowed, derived
+        // from the keys in force rather than listed.
         if handled == Handled::Pass
-            && is_plain(&key)
-            && matches!(
-                key.code,
-                KeyCode::Char('1'..='9' | 'i' | 'a') | KeyCode::Enter
-            )
+            && keys
+                .actions(views::CHAT_LIVE, KeyChord::from_event(key))
+                .iter()
+                .any(|act| {
+                    act.spec()
+                        .is_some_and(|spec| matches!(spec.context, Context::Chat | Context::Answer))
+                })
         {
             return Handled::Consumed;
         }
@@ -548,7 +555,7 @@ impl Tab for ChatTab {
 
     /// The stack of the Chat's current mode (MOD-67 M5 D4, PA-4): the replay's while one is open,
     /// `CAPTURE` while the composer is, else the live view's (idle, live, parked or ended: one key
-    /// set, the agent cycle declined once a session exists, the digits fixed ahead of it).
+    /// set, the agent cycle declined once a session exists, the answers ahead of it).
     fn key_stack(&self) -> Option<Stack<'static>> {
         Some(self.stack())
     }
@@ -565,11 +572,10 @@ impl Tab for ChatTab {
         key_line(hint, ctx.theme)
     }
 
-    /// Each mode resolves through its stack (MOD-67 M5 D4, D5): the open composer and the parked
-    /// request's digits stay fixed ahead of the resolver (ANA-26 §6.1), and the replay's swallow
-    /// takes what the replay's own acts left (M5 R1 M1), each on plain keys only
-    /// (`keys::is_plain`): a chord with any modifier but `SHIFT` passes them by, CONTROL and ALT
-    /// as under the old guard, and SUPER, HYPER and META too.
+    /// Each mode resolves through its stack (MOD-67 M5 D4, D5): the open composer reads its
+    /// canonical events (the shell's `[field]` translation, MOD-115 M2 D7), a parked request
+    /// answers on `answer.option_*` through `CHAT_LIVE`, and the replay's swallow takes what the
+    /// replay's own acts left (M5 R1 M1) of the live tab's `[chat]` and `[answer]` chords.
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         // A refusal is transient: it says what the last key could not do, and the next one clears
         // it whatever it was.
@@ -601,8 +607,15 @@ impl Tab for ChatTab {
         // A digit answers the parked request, and **every** digit is consumed while one is
         // waiting: a `4` with three options on screen must not fall through to the global
         // tab-select binding and move the user off the conversation the agent is blocked on.
-        if is_plain(&key)
-            && let KeyCode::Char(digit @ '1'..='9') = key.code
+        // MOD-115 M2 D7: the answers are `answer.option_*` rows (the digits by default).
+        if let Some(index) = ctx
+            .keys()
+            .actions(views::CHAT_LIVE, chord)
+            .first()
+            .and_then(|act| act.answer_index())
+            && let Some(digit) = u32::try_from(index + 1)
+                .ok()
+                .and_then(|n| char::from_digit(n, 10))
             && self.transcript.parked().is_some()
         {
             self.answer(digit, ctx);
@@ -891,7 +904,7 @@ mod tests {
     use crate::store_worker::Origin;
     use crate::ui::Theme;
     use chrono::{TimeZone as _, Utc};
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use htui_agent::event::{DriverEnvelope, DriverEvent, TextChunk};
     use htui_core::fixtures::ids;
     use htui_core::model::{
@@ -1092,6 +1105,82 @@ mod tests {
             );
         }
         assert!(shell.emit.is_empty(), "reading sends nothing either");
+    }
+
+    /// MOD-115 M2 D7: the replay swallows what the live tab binds in force (its `[chat]` and
+    /// `[answer]` chords), not a fixed list: a rebound answer or compose key is swallowed, and the
+    /// old letter or digit is the shell's again.
+    #[test]
+    fn the_replay_swallows_what_the_live_tab_binds_in_force() {
+        let mut shell = Shell::new();
+        shell.keys = crate::keys::load_str(
+            "version = 2\n[answer]\noption_1 = \"f8\"\n[chat]\ncompose = \"I\"\n",
+        )
+        .expect("the keys load");
+        let mut tab = live(&shell);
+        replay(&mut tab, &shell, two_rows());
+        for (pressed, handled) in [
+            (key(KeyCode::F(8)), Handled::Consumed),
+            (key(KeyCode::Char('I')), Handled::Consumed),
+            (key(KeyCode::Char('2')), Handled::Consumed),
+            (key(KeyCode::Char('i')), Handled::Pass),
+            (key(KeyCode::Char('1')), Handled::Pass),
+        ] {
+            assert_eq!(
+                tab.on_key(pressed, &mut shell.ctx()),
+                handled,
+                "{pressed:?}"
+            );
+        }
+        assert!(shell.emit.is_empty(), "a replay sends nothing");
+        assert!(tab.replay().is_some(), "and is still open");
+    }
+
+    /// MOD-115 M2 D7: a parked request answers on `answer.option_*`: a rebound option answers,
+    /// and the old digit no longer does (it is the tab select's again).
+    #[test]
+    fn a_rebound_answer_answers_the_parked_request() {
+        use htui_agent::driver::PermissionRequestId;
+        use htui_agent::event::{PermissionOption, PermissionOptionKind, PermissionRequestEvent};
+        let mut shell = Shell::new();
+        shell.keys = crate::keys::load_str("version = 2\n[answer]\noption_1 = \"f8\"\n")
+            .expect("the keys load");
+        let mut tab = live(&shell);
+        tab.on_reply(
+            &StoreReply::Chat(ChatFrame::Event(Box::new(DriverEnvelope {
+                event: DriverEvent::PermissionRequest(PermissionRequestEvent {
+                    request_id: PermissionRequestId::new("req-1"),
+                    tool_call_id: Some("call-1".to_owned()),
+                    options: vec![PermissionOption {
+                        id: "allow".to_owned(),
+                        label: "Allow".to_owned(),
+                        kind: PermissionOptionKind::AllowOnce,
+                    }],
+                }),
+                raw: None,
+                at: Utc.timestamp_opt(0, 0).single().expect("epoch is a time"),
+            }))),
+            &mut shell.ctx(),
+        );
+        assert!(tab.transcript.parked().is_some(), "the agent asks");
+        drop(shell.emit.take());
+        assert_eq!(
+            tab.on_key(key(KeyCode::Char('1')), &mut shell.ctx()),
+            Handled::Pass,
+            "`1` selects a tab now"
+        );
+        assert!(shell.emit.is_empty(), "`1` answers nothing");
+        assert_eq!(
+            tab.on_key(key(KeyCode::F(8)), &mut shell.ctx()),
+            Handled::Consumed
+        );
+        assert!(
+            matches!(
+                shell.emit.take().as_slice(),
+                [Action::Store(StoreRequest::ChatAnswer { .. })]
+            ),
+            "`F8` answers"
+        );
     }
 
     /// A parked-looking row is history, not a question (D41): the digit that would have answered
