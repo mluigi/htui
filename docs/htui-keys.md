@@ -16,33 +16,34 @@ keys_file` fails until it matches.
 # htui key bindings, as `htui --print-keys` prints them. htui reads keys.toml in its config
 # directory: ~/.config/htui on Linux, ~/Library/Application Support/htui on macOS, %APPDATA%\htui
 # on Windows. List only what you change: a list replaces that action's chords, [] unbinds it.
-# ctrl-c always quits and cannot be listed. `htui --default-keys` ignores the file for one run.
+# Esc is never listed: a row marked "Esc always" keeps it whatever its list says. ctrl-c binds
+# like any key. `htui --default-keys` ignores the file for one run.
 version = 2
 
 [global]
-quit         = ["q"]           # quit
-next_tab     = ["tab"]         # next tab
-prev_tab     = ["backtab"]     # previous tab
-select_tab_1 = ["1"]           # select tab
-select_tab_2 = ["2"]           # select tab
-select_tab_3 = ["3"]           # select tab
-select_tab_4 = ["4"]           # select tab
-select_tab_5 = ["5"]           # select tab
-select_tab_6 = ["6"]           # select tab
-select_tab_7 = ["7"]           # select tab
-select_tab_8 = ["8"]           # select tab
-select_tab_9 = ["9"]           # select tab
-help         = ["?", "f1"]     # help
-about        = ["f9"]          # about
-workspaces   = ["w"]           # workspaces
-find         = ["ctrl-f"]      # find
-waiting      = ["ctrl-w"]      # waiting
-queue        = ["ctrl-q"]      # queue
-next_pane    = ["ctrl-right"]  # next pane
-prev_pane    = ["ctrl-left"]   # previous pane
+quit         = ["q", "ctrl-c"]  # quit
+next_tab     = ["tab"]          # next tab
+prev_tab     = ["backtab"]      # previous tab
+select_tab_1 = ["1"]            # select tab
+select_tab_2 = ["2"]            # select tab
+select_tab_3 = ["3"]            # select tab
+select_tab_4 = ["4"]            # select tab
+select_tab_5 = ["5"]            # select tab
+select_tab_6 = ["6"]            # select tab
+select_tab_7 = ["7"]            # select tab
+select_tab_8 = ["8"]            # select tab
+select_tab_9 = ["9"]            # select tab
+help         = ["?", "f1"]      # help
+about        = ["f9"]           # about
+workspaces   = ["w"]            # workspaces
+find         = ["ctrl-f"]       # find
+waiting      = ["ctrl-w"]       # waiting
+queue        = ["ctrl-q"]       # queue
+next_pane    = ["ctrl-right"]   # next pane
+prev_pane    = ["ctrl-left"]    # previous pane
 
 [overlay]
-close = ["esc"]  # close
+close = []  # close; Esc always
 
 [list]
 down   = ["j", "down"]  # down
@@ -60,8 +61,8 @@ next_subtab = ["l", "]", "right"]  # next sub-tab
 prev_subtab = ["h", "[", "left"]   # previous sub-tab
 
 [confirm]
-yes = ["y"]         # yes
-no  = ["n", "esc"]  # no
+yes = ["y"]  # yes
+no  = ["n"]  # no; Esc always
 
 [form]
 next_field      = ["tab"]      # next field
@@ -70,13 +71,13 @@ save            = ["ctrl-s"]   # save
 external_editor = ["ctrl-e"]   # $EDITOR
 
 [common]
-edit    = ["e"]    # edit
-new     = ["n"]    # new
-delete  = ["d"]    # delete
-clear   = ["c"]    # clear
-reload  = ["r"]    # reload
-back    = ["esc"]  # back
-dismiss = ["esc"]  # dismiss
+edit    = ["e"]  # edit
+new     = ["n"]  # new
+delete  = ["d"]  # delete
+clear   = ["c"]  # clear
+reload  = ["r"]  # reload
+back    = []     # back; Esc always
+dismiss = []     # dismiss; Esc always
 
 [editor]
 focus = ["ctrl-4"]  # editor focus
@@ -130,7 +131,7 @@ rules      = ["r"]              # edit rules
 import     = ["I"]              # import
 next_field = ["tab", "down"]    # next field
 prev_field = ["backtab", "up"]  # previous field
-back       = ["esc", "enter"]   # back
+back       = ["enter"]          # back; Esc always
 
 [settings.secrets]
 check      = ["t"]              # check
@@ -151,8 +152,8 @@ down      = ["down"]    # next hit
 switch = ["enter"]  # switch workspace
 
 [migration]
-yes = ["y", "Y"]         # yes
-no  = ["n", "esc", "N"]  # no
+yes = ["y", "Y"]  # yes
+no  = ["n", "N"]  # no; Esc always
 
 [waiting]
 open = ["enter"]  # open step
@@ -187,7 +188,7 @@ prev_field = ["backtab", "up"]  # previous field
 prev_agent = ["up"]          # previous agent
 next_agent = ["down"]        # next agent
 accept     = ["enter", "y"]  # accept
-cancel     = ["esc"]         # cancel the turn
+cancel     = []              # cancel the turn; Esc always
 
 [requirements]
 new_area       = ["a"]              # new area
@@ -280,7 +281,7 @@ prev_field  = ["backtab", "up"]   # previous field
 [chat]
 compose    = ["i", "enter"]  # compose
 next_agent = ["a"]           # next agent
-end        = ["esc"]         # end chat (twice)
+end        = []              # end chat (twice); Esc always
 thoughts   = ["t"]           # thoughts
 top        = ["g"]           # top
 bottom     = ["G"]           # bottom
@@ -316,12 +317,12 @@ back    = ["backspace", "alt-left"]  # back
 forward = ["alt-right"]              # forward
 
 [leave]
-confirm = ["enter"]     # leave
-stay    = ["esc", "n"]  # stay
+confirm = ["enter", "ctrl-c"]  # leave
+stay    = ["n"]                # stay; Esc always
 
 [field]
 submit         = ["enter"]      # submit
-cancel         = ["esc"]        # cancel
+cancel         = []             # cancel; Esc always
 left           = ["left"]       # cursor left
 right          = ["right"]      # cursor right
 home           = ["home"]       # line start

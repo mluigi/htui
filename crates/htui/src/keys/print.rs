@@ -3,15 +3,16 @@
 
 use std::fmt::Write as _;
 
-use super::{CTRL_C, Context, Keys, Row, quote};
+use super::{Context, ESC, Keys, Row, quote};
 
 /// The header, before the `version` line. Constant, so the output is the same on every machine
 /// (B-13).
-const HEADER: &str = r"# htui key bindings, as `htui --print-keys` prints them. htui reads keys.toml in its config
+const HEADER: &str = r#"# htui key bindings, as `htui --print-keys` prints them. htui reads keys.toml in its config
 # directory: ~/.config/htui on Linux, ~/Library/Application Support/htui on macOS, %APPDATA%\htui
 # on Windows. List only what you change: a list replaces that action's chords, [] unbinds it.
-# ctrl-c always quits and cannot be listed. `htui --default-keys` ignores the file for one run.
-";
+# Esc is never listed: a row marked "Esc always" keeps it whatever its list says. ctrl-c binds
+# like any key. `htui --default-keys` ignores the file for one run.
+"#;
 
 /// The keys in force as a complete `keys.toml`: a constant header, the `version` the keys were
 /// read under (MOD-115 M2 §1.7: `version = 2` for the compiled defaults, `super::VERSION`, and a
@@ -23,8 +24,9 @@ const HEADER: &str = r"# htui key bindings, as `htui --print-keys` prints them. 
 /// shared verb's name. A line the file changed ends `(changed)`; a derived row the file did not
 /// set never does; an unbound action is `name = []`. A line left at its default that gave chords
 /// to the file's entries (MOD-12 M3 R1 H1) ends `(unbound by quit)` when it has none left, else
-/// `(lost "j" to top)`. `ctrl-c` is never printed (MOD-115 M2 D-9): the loader keeps it on the rows
-/// whose default holds it, so the print reads back to the same keys.
+/// `(lost "j" to top)`. `Esc` is never printed (MOD-115 M2 MD7: a file cannot list it): a row that
+/// holds it says `Esc always` after its help, and the loader gives it back, so the print reads
+/// back to the same keys. `ctrl-c` prints like any chord (MD2).
 #[must_use]
 pub fn print(keys: &Keys) -> String {
     let mut out = HEADER.to_owned();
@@ -38,12 +40,22 @@ pub fn print(keys: &Keys) -> String {
                 let value = row
                     .chords
                     .iter()
-                    .filter(|chord| **chord != CTRL_C)
+                    .filter(|chord| **chord != ESC)
                     .map(|chord| quote(&chord.spec()))
                     .collect::<Vec<_>>()
                     .join(", ");
                 let name = row.act.spec().map_or("", |spec| spec.name);
-                (name, format!("[{value}]"), row.help, mark(row))
+                let esc = if row.chords.contains(&ESC) {
+                    "; Esc always"
+                } else {
+                    ""
+                };
+                (
+                    name,
+                    format!("[{value}]"),
+                    row.help,
+                    format!("{esc}{}", mark(row)),
+                )
             })
             .collect();
         if rows.is_empty() {
@@ -114,50 +126,51 @@ mod tests {
     use super::print;
     use crate::keys::{Keys, load_str, quote};
 
-    /// Blueprint §4's lines 1-26 of the default print, the queue row (MOD-12 M3 D8) and the pane
-    /// rows (MOD-115 M2): 30.
+    /// Blueprint §4's lines 1-26 of the default print, the queue row (MOD-12 M3 D8), the pane
+    /// rows (MOD-115 M2) and the header's Esc and ctrl-c line (MD7, MD2): 31.
     const DEFAULT_HEAD: &str = r#"# htui key bindings, as `htui --print-keys` prints them. htui reads keys.toml in its config
 # directory: ~/.config/htui on Linux, ~/Library/Application Support/htui on macOS, %APPDATA%\htui
 # on Windows. List only what you change: a list replaces that action's chords, [] unbinds it.
-# ctrl-c always quits and cannot be listed. `htui --default-keys` ignores the file for one run.
+# Esc is never listed: a row marked "Esc always" keeps it whatever its list says. ctrl-c binds
+# like any key. `htui --default-keys` ignores the file for one run.
 version = 2
 
 [global]
-quit         = ["q"]           # quit
-next_tab     = ["tab"]         # next tab
-prev_tab     = ["backtab"]     # previous tab
-select_tab_1 = ["1"]           # select tab
-select_tab_2 = ["2"]           # select tab
-select_tab_3 = ["3"]           # select tab
-select_tab_4 = ["4"]           # select tab
-select_tab_5 = ["5"]           # select tab
-select_tab_6 = ["6"]           # select tab
-select_tab_7 = ["7"]           # select tab
-select_tab_8 = ["8"]           # select tab
-select_tab_9 = ["9"]           # select tab
-help         = ["?", "f1"]     # help
-about        = ["f9"]          # about
-workspaces   = ["w"]           # workspaces
-find         = ["ctrl-f"]      # find
-waiting      = ["ctrl-w"]      # waiting
-queue        = ["ctrl-q"]      # queue
-next_pane    = ["ctrl-right"]  # next pane
-prev_pane    = ["ctrl-left"]   # previous pane
+quit         = ["q", "ctrl-c"]  # quit
+next_tab     = ["tab"]          # next tab
+prev_tab     = ["backtab"]      # previous tab
+select_tab_1 = ["1"]            # select tab
+select_tab_2 = ["2"]            # select tab
+select_tab_3 = ["3"]            # select tab
+select_tab_4 = ["4"]            # select tab
+select_tab_5 = ["5"]            # select tab
+select_tab_6 = ["6"]            # select tab
+select_tab_7 = ["7"]            # select tab
+select_tab_8 = ["8"]            # select tab
+select_tab_9 = ["9"]            # select tab
+help         = ["?", "f1"]      # help
+about        = ["f9"]           # about
+workspaces   = ["w"]            # workspaces
+find         = ["ctrl-f"]       # find
+waiting      = ["ctrl-w"]       # waiting
+queue        = ["ctrl-q"]       # queue
+next_pane    = ["ctrl-right"]   # next pane
+prev_pane    = ["ctrl-left"]    # previous pane
 
 [overlay]
-close = ["esc"]  # close"#;
+close = []  # close; Esc always"#;
 
     #[test]
     fn the_default_print_starts_with_the_header_global_and_overlay() {
         let printed = print(Keys::compiled());
-        let head: Vec<&str> = printed.lines().take(30).collect();
+        let head: Vec<&str> = printed.lines().take(31).collect();
         assert_eq!(head, DEFAULT_HEAD.lines().collect::<Vec<_>>());
         // MOD-115 M2: the M2 tables follow the picker's, the answers last.
         assert!(
             printed.contains(
                 "[chat]\ncompose    = [\"i\", \"enter\"]  # compose\n\
                        next_agent = [\"a\"]           # next agent\n\
-                       end        = [\"esc\"]         # end chat (twice)\n\
+                       end        = []              # end chat (twice); Esc always\n\
                        thoughts   = [\"t\"]           # thoughts\n\
                        top        = [\"g\"]           # top\n\
                        bottom     = [\"G\"]           # bottom\n\
@@ -220,9 +233,10 @@ close = ["esc"]  # close"#;
         assert_eq!(reloaded, keys);
         assert_eq!(print(&reloaded), printed);
         for line in [
-            "quit         = [\"ctrl-y\"]      # quit (changed)",
-            "workspaces   = []              # workspaces (changed)",
-            "close = [\"esc\", \"f2\"]  # close (changed)",
+            // MOD-115 M2: a version-1 quit keeps `ctrl-c` (D-9), and `Esc` is never printed (MD7).
+            "quit         = [\"ctrl-y\", \"ctrl-c\"]  # quit (changed)",
+            "workspaces   = []                    # workspaces (changed)",
+            "close = [\"f2\"]  # close; Esc always (changed)",
         ] {
             assert!(printed.lines().any(|printed| printed == line), "{line}");
         }

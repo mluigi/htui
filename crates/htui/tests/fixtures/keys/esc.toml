@@ -1,0 +1,4 @@
+# MOD-115 M2 (MD7) fixture: Esc is never configurable, however it is spelled.
+[global]
+quit = ["q", "esc"]
+find = "Escape"

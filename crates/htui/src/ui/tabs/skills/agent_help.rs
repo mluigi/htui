@@ -1662,17 +1662,27 @@ mod tests {
             note("n/Esc")
         );
 
+        // MOD-115 M2 MD7: the cancel keeps `Esc` whatever the file says, so it still leads.
         let rebound = Bench::with_keys("version = 1\n[skills.help]\ncancel = \"x\"\n");
         let keys = rebound.ctx().keys();
         assert_eq!(asking(&rebound, "old\n").help_open(keys), note("Esc"));
         assert_eq!(
             streaming(&rebound, "old\n", StepId::new()).help_open(keys),
-            note("x")
+            note("Esc")
+        );
+        assert_eq!(
+            keys.labels(crate::keys::views::HELP_WAITING, Act::SkillsHelpCancel),
+            ["Esc", "x"]
         );
 
         let unbound = load_str("version = 1\n[skills.help]\ncancel = []\n").expect("loads");
         assert_eq!(
             streaming(&bench, "old\n", StepId::new()).help_open(&unbound),
+            note("Esc")
+        );
+        let none = Keys::defaults().with_chords(Context::SkillsHelp, Act::SkillsHelpCancel, &[]);
+        assert_eq!(
+            streaming(&bench, "old\n", StepId::new()).help_open(&none),
             "agent help is open \u{2014} close it first"
         );
         assert_eq!(

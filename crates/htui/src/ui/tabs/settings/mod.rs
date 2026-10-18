@@ -536,11 +536,16 @@ mod tests {
         let keys = Keys::defaults();
         assert_eq!(answers(&keys, views::CONNECTION_CONFIRM), "y / n");
         assert_eq!(asked("clear it?", "y / n"), "clear it? y / n");
+        // MOD-115 M2 MD7: `[]` unbinds only `no`'s other chords; `Esc` is never configurable.
         let no_unbound = crate::keys::load_str("version = 1\n[confirm]\nno = []\n").expect("loads");
-        assert_eq!(answers(&no_unbound, views::CONNECTION_CONFIRM), "y");
+        assert_eq!(answers(&no_unbound, views::CONNECTION_CONFIRM), "y / Esc");
         let both_unbound =
             crate::keys::load_str("version = 1\n[confirm]\nyes = []\nno = []\n").expect("loads");
-        assert_eq!(answers(&both_unbound, views::SECRETS_CONFIRM), "");
+        assert_eq!(answers(&both_unbound, views::SECRETS_CONFIRM), "Esc");
+        let all_unbound = Keys::defaults()
+            .with_chords(crate::keys::Context::Confirm, Act::ConfirmYes, &[])
+            .with_chords(crate::keys::Context::Confirm, Act::ConfirmNo, &[]);
+        assert_eq!(answers(&all_unbound, views::SECRETS_CONFIRM), "");
         assert_eq!(asked("clear it?", ""), "clear it?");
     }
 

@@ -330,168 +330,14 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("in the leave dialog", views::LEAVE),
 ];
 
-/// Keys a view matches ahead of the resolver in one declared stack (ANA-26 §6.1, MOD-67 M5 D5):
-/// a choice's value keys, a form's own `Enter`/`Esc`, the permission digits. They are not
-/// actions, and no key file moves them, so an act bound to one never hears it there; the
-/// validator refuses such a binding (M5 R1 M1), on the user's line, naming the stack.
-#[derive(Debug, Clone, Copy)]
-pub struct Fixed {
-    /// The stack, one of [`DECLARED`]'s; its phrase names it in the error.
-    pub stack: Stack<'static>,
-    /// The keys, spelled as in a key file, matched on plain keys only (SHIFT aside), so the
-    /// validator also refuses a named key's SHIFT form (`shift-left`); a character has none.
-    pub chords: &'static [&'static str],
-    /// The keys shadow only the stack's global layer: the Chat replay resolves its own acts
-    /// first and swallows what they left (M5 R1 M1 (a)).
-    pub only_global: bool,
-    /// Acts the keys shadow by design, on any of them: the tab select, whose digit must not move
-    /// the user off a parked request or a replay (MOD-42 D14, D40).
-    pub shadowed: &'static [Act],
-}
-
-/// The tab select's acts: the digits a parked request or a replay takes are theirs by default.
-const TAB_SELECT: &[Act] = &[
-    Act::SelectTab1,
-    Act::SelectTab2,
-    Act::SelectTab3,
-    Act::SelectTab4,
-    Act::SelectTab5,
-    Act::SelectTab6,
-    Act::SelectTab7,
-    Act::SelectTab8,
-    Act::SelectTab9,
-];
-
-/// MOD-115 M2 D7: the tab select and the answers. The digits a parked request takes are
-/// `answer.option_*` rows now, still fixed until Task 5 removes `FIXED`.
-const TAB_SELECT_AND_ANSWERS: &[Act] = &[
-    Act::SelectTab1,
-    Act::SelectTab2,
-    Act::SelectTab3,
-    Act::SelectTab4,
-    Act::SelectTab5,
-    Act::SelectTab6,
-    Act::SelectTab7,
-    Act::SelectTab8,
-    Act::SelectTab9,
-    Act::AnswerOption1,
-    Act::AnswerOption2,
-    Act::AnswerOption3,
-    Act::AnswerOption4,
-    Act::AnswerOption5,
-    Act::AnswerOption6,
-    Act::AnswerOption7,
-    Act::AnswerOption8,
-    Act::AnswerOption9,
-];
-
-/// The plain digits a permission request answers on.
-const DIGITS: &[&str] = &["1", "2", "3", "4", "5", "6", "7", "8", "9"];
-
-/// Every declared stack with keys its view keeps fixed (MOD-67 M5 R1 M1), in [`DECLARED`] order,
-/// each citing the arm that matches them. M5's views and the M3/M4 forms' choice keys (MOD-67
-/// M6 D5): the Attachments activation, the Requirements priority.
-pub static FIXED: &[Fixed] = &[
-    // attach.rs `activation_key`: the activation field's plain `Space` cycles it, `Enter`
-    // submits and `Esc` cancels (a choice field's value keys, ANA-26 §6.1); library.rs
-    // `on_attach_key` also refuses `Esc` while the form's save is in flight.
-    Fixed {
-        stack: views::ATTACH_FORM,
-        chords: &["space", "enter", "esc"],
-        only_global: false,
-        shadowed: &[Act::ChoiceToggle, Act::FieldSubmit, Act::FieldCancel],
-    },
-    // requirements/forms.rs `RequirementForm::on_key`: the priority's `m`/`l` choose,
-    // `Space`/`Left`/`Right` toggle, `Esc` cancels (MOD-67 M4 D10).
-    Fixed {
-        stack: views::REQUIREMENTS_FORM,
-        chords: &["m", "l", "space", "left", "right", "esc"],
-        only_global: false,
-        shadowed: &[
-            Act::RequirementsPriorityMust,
-            Act::RequirementsPriorityLater,
-            Act::ChoicePrev,
-            Act::ChoiceNext,
-            Act::ChoiceToggle,
-            Act::FieldLeft,
-            Act::FieldRight,
-            Act::FieldCancel,
-        ],
-    },
-    // runs.rs `RunsTab::on_key`: while the step under the cursor has a pending request, every
-    // plain digit answers it (MOD-42 D14).
-    Fixed {
-        stack: views::RUNS_BROWSE,
-        chords: DIGITS,
-        only_global: false,
-        shadowed: TAB_SELECT_AND_ANSWERS,
-    },
-    // runs.rs `close_out_key`: the close-out warning's arrows and `h`/`l` pick the resolution
-    // (MOD-39 P13); the cancel question shares the stack.
-    Fixed {
-        stack: views::RUNS_CONFIRM,
-        chords: &["left", "right", "h", "l"],
-        only_global: false,
-        shadowed: &[Act::ChoicePrev, Act::ChoiceNext],
-    },
-    // filter.rs `FilterForm::on_key`: an option row's `Enter` applies, `Esc` cancels, `h`/`l` and
-    // the arrows move the option, `Space` ticks it.
-    Fixed {
-        stack: views::BACKLOG_FILTER,
-        chords: &["enter", "esc", "h", "l", "left", "right", "space"],
-        only_global: false,
-        shadowed: &[
-            Act::FieldSubmit,
-            Act::FieldCancel,
-            Act::FieldLeft,
-            Act::FieldRight,
-            Act::ChoicePrev,
-            Act::ChoiceNext,
-            Act::ChoiceToggle,
-        ],
-    },
-    // item_form.rs `ItemForm::on_picker_key`: a picker's `h`/`l` and arrows choose, `Enter`
-    // moves on, `Esc` cancels.
-    Fixed {
-        stack: views::ITEM_FORM,
-        chords: &["left", "right", "h", "l", "enter", "esc"],
-        only_global: false,
-        shadowed: &[
-            Act::FieldLeft,
-            Act::FieldRight,
-            Act::FieldSubmit,
-            Act::FieldCancel,
-            Act::ChoicePrev,
-            Act::ChoiceNext,
-        ],
-    },
-    // chat/mod.rs `ChatTab::on_key`: a parked request takes every plain digit.
-    Fixed {
-        stack: views::CHAT_LIVE,
-        chords: DIGITS,
-        only_global: false,
-        shadowed: TAB_SELECT_AND_ANSWERS,
-    },
-    // chat/mod.rs `ChatTab::on_key_replay`: what the replay's own acts left of the live tab's
-    // keys is swallowed (D40, D41).
-    Fixed {
-        stack: views::CHAT_REPLAY,
-        chords: &[
-            "1", "2", "3", "4", "5", "6", "7", "8", "9", "i", "a", "enter",
-        ],
-        only_global: true,
-        shadowed: TAB_SELECT,
-    },
-];
-
 impl Keys {
     /// The **ordered candidates** for `chord` in `stack` (ANA-26 §7.3): every action whose row in
     /// the first layer that has one binds `chord`, narrowest layer first, catalogue order within
     /// a layer. A row in a narrower layer **shadows** the same act in every wider layer, even
     /// when it is unbound or binds other chords. The caller handles the first candidate it
     /// accepts. MOD-115 M2: [`CTRL_C`](super::CTRL_C) is `global.quit`'s and `leave.confirm`'s
-    /// default, so it is their candidate like any chord; until Task 6, `App::on_key` still checks
-    /// it before any stack.
+    /// default, so it is their candidate like any chord. No key is matched ahead of this
+    /// (MOD-115 M2 D7: the former `FIXED` keys are rows).
     ///
     /// A row is in a layer when [`Stack::admits`] says the layer offers its act (a view layer
     /// inherits the shared acts offered below it, PA-3). A modal layer's row is a candidate only
@@ -525,7 +371,7 @@ impl Keys {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{DECLARED, FIXED, Layer, Stack, WHILE_EDITING};
+    use super::{DECLARED, Layer, Stack, WHILE_EDITING};
     use crate::keys::{Act, CTRL_C, Context, KeyChord, Keys, load_str, views};
 
     fn chord(spec: &str) -> KeyChord {
@@ -571,47 +417,6 @@ mod tests {
         assert!(DECLARED.contains(&(WHILE_EDITING, Stack::EDITOR_OPEN)));
         let phrases: HashSet<&str> = DECLARED.iter().map(|(phrase, _)| *phrase).collect();
         assert_eq!(phrases.len(), DECLARED.len(), "a phrase is used twice");
-    }
-
-    /// MOD-67 M5 R1 M1: every `FIXED` entry names a declared stack (its phrase is the error's),
-    /// once, and its keys parse.
-    #[test]
-    fn every_fixed_entry_is_a_declared_stack_once() {
-        for (index, entry) in FIXED.iter().enumerate() {
-            assert!(
-                DECLARED.iter().any(|(_, stack)| *stack == entry.stack),
-                "FIXED[{index}] is not declared"
-            );
-            assert!(
-                FIXED[index + 1..]
-                    .iter()
-                    .all(|other| other.stack != entry.stack),
-                "FIXED[{index}] is listed twice"
-            );
-            for written in entry.chords {
-                assert!(KeyChord::parse_strict(written).is_ok(), "{written:?}");
-            }
-            assert!(!entry.only_global || entry.stack.global().is_some());
-        }
-    }
-
-    /// MOD-67 M6 D5: `FIXED` keeps `DECLARED` order, so a row and chord two entries fix is
-    /// reported naming the first declared stack.
-    #[test]
-    fn fixed_follows_declared_order() {
-        let at = |stack: Stack<'static>| {
-            DECLARED
-                .iter()
-                .position(|(_, declared)| *declared == stack)
-                .expect("a declared stack")
-        };
-        for pair in FIXED.windows(2) {
-            assert!(
-                at(pair[0].stack) < at(pair[1].stack),
-                "FIXED is out of DECLARED order at {:?}",
-                DECLARED[at(pair[1].stack)].0
-            );
-        }
     }
 
     /// MOD-67 M4 R1 L1: `skills.switch_view` is offered only by the Library and Templates

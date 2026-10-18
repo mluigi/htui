@@ -1105,7 +1105,8 @@ fn cycle(status: Status, current: Resolution, forward: bool) -> Resolution {
 ///
 /// Counting and warning leave on `confirm.no` (`n`/`Esc`), the warning goes on with
 /// `confirm.yes` (`y`); the warning's `choice.prev`/`next` (`←`/`→`, `h`/`l`) pick the
-/// resolution (MOD-39 plan P13, MOD-115 M2 D7); the typed stage
+/// resolution, and `choice.toggle` (Space) steps forward (MOD-39 plan P13, MOD-115 M2 D7); the
+/// typed stage
 /// leaves on `Esc` only, because `n` is a letter there; in flight, every key waits for the
 /// answer. A key no stage used is `modal_rest`'s.
 fn close_out_key(
@@ -1122,8 +1123,9 @@ fn close_out_key(
             _ => (CloseOutStage::Counting, modal_rest(stack, chord)),
         },
         CloseOutStage::Warn(mut preview) => match ctx.keys().actions(stack, chord).first() {
-            Some(&act @ (Act::ChoiceNext | Act::ChoicePrev)) => {
-                let forward = act == Act::ChoiceNext;
+            // `choice.toggle` (Space) steps forward, as the `?` box's `Space toggle` says.
+            Some(&act @ (Act::ChoiceNext | Act::ChoicePrev | Act::ChoiceToggle)) => {
+                let forward = act != Act::ChoicePrev;
                 preview.resolution = cycle(preview.status, preview.resolution, forward);
                 (CloseOutStage::Warn(preview), Handled::Consumed)
             }
@@ -5630,7 +5632,11 @@ mod tests {
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
             &mut shell.ctx(),
         );
-        assert_ne!(footer(&pane), before, "`ctrl-n` cycles the resolution");
+        let after = footer(&pane);
+        assert_ne!(after, before, "`ctrl-n` cycles the resolution");
+        // `choice.toggle` steps forward too, as the `?` box lists it.
+        pane.on_key(key(KeyCode::Char(' ')), &mut shell.ctx());
+        assert_ne!(footer(&pane), after, "Space cycles the resolution");
     }
 
     /// D14: a second digit while the first answer is in flight sends nothing. Its

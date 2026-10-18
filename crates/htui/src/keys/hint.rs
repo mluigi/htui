@@ -3,16 +3,16 @@
 //! Every label comes from the keys in force, so a rebound action shows its new chord (MOD-67 D7,
 //! D8). A hint row and the status line take the first chord of each action; a `?` box line lists
 //! all of them. Rows sharing a help label (the nine `select_tab_*`) collapse into one entry, and
-//! an unbound action drops out, except `global.quit`, which always ends with the fixed `Ctrl+c`.
+//! an unbound action drops out. MOD-115 M2: `ctrl-c` is `global.quit`'s own default chord, listed
+//! like any other, so nothing is appended to it.
 //!
 //! MOD-67 M3: every label goes through the layer that resolves it, so a modal layer's filtered
 //! chords never show (D5). The status line, the `?` box and its closer render a stack (D7, D8):
 //! `Stack::BASE` gives today's text, a view's stack its own.
 
-use crossterm::event::KeyCode;
 use unicode_width::UnicodeWidthStr;
 
-use super::{Act, CTRL_C, Context, KeyChord, Keys, Stack};
+use super::{Act, Context, KeyChord, Keys, Stack};
 
 /// The separator between entries: U+00B7 with a space on each side, as the status line has
 /// always written it.
@@ -22,16 +22,11 @@ const SEP: &str = " · ";
 const INDENT: &str = "  ";
 
 /// MOD-115 M2 Task 0: the contexts whose rows no site resolves yet, kept out of the `?` box so
-/// the box lists only keys that act. The task that wires a context removes it here: `field`,
-/// `choice` and `answer` with Task 5 (the translation and the former `FIXED` sites), `layout`
-/// and `history` with Task 6 (the shell). The leave dialog is drawn from Task 6 on.
-const NOT_YET_WIRED: &[Context] = &[
-    Context::Field,
-    Context::Choice,
-    Context::Answer,
-    Context::Layout,
-    Context::History,
-];
+/// the box lists only keys that act. The task that wires a context removes it here: Task 5 wired
+/// `choice` and `answer` (the former `FIXED` sites); `field` goes with Task 6, which calls the
+/// translation (`keys::translate`) from the shell, and `layout` and `history` with Task 6's
+/// dispatch. The leave dialog is drawn from Task 6 on.
+const NOT_YET_WIRED: &[Context] = &[Context::Field, Context::Layout, Context::History];
 
 /// One element of a hint spec (ANA-26 §7.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,8 +151,8 @@ impl Keys {
             .join(SEP)
     }
 
-    /// The status line (D7, MOD-67 M3 PA-9) from `stack`'s global layers: quit first, always,
-    /// as its first admitted chord, else `Ctrl+c`; then every other `Global` row in catalogue
+    /// The status line (D7, MOD-67 M3 PA-9) from `stack`'s global layers: quit first, as its
+    /// first admitted chord (omitted when the stack admits none); then every other `Global` row in catalogue
     /// order that is `offered` and has an admitted chord, each through the **first** global
     /// layer that offers it (`Stack::admits`), its first admitted chord, rows sharing a help
     /// label collapsed to the first (the digits), joined by ` · `. `Stack::BASE` gives the M1
@@ -194,11 +189,13 @@ impl Keys {
             .iter()
             .filter(admitted)
             .find(|row| row.act == Act::Quit)
-            .and_then(first_chord)
-            .unwrap_or(CTRL_C);
+            .and_then(first_chord);
         let quit_help = Act::Quit.spec().map_or("quit", |spec| spec.help);
         let mut shown: Vec<&str> = vec![quit_help];
-        let mut entries = vec![format!("{} {quit_help}", quit.label())];
+        let mut entries: Vec<String> = quit
+            .map(|quit| format!("{} {quit_help}", quit.label()))
+            .into_iter()
+            .collect();
         for row in self.rows.iter().filter(admitted) {
             if row.act == Act::Quit || !offered(row.act) || shown.contains(&row.help) {
                 continue;
@@ -218,7 +215,7 @@ impl Keys {
     /// rows sharing a help label merge, and a row with no admitted chord drops. `offered` is
     /// consulted for `Global` rows only. Every global layer of the stack renders as **one**
     /// `Global:` line at the last global layer's place (MOD-67 M4 PA-2): quit first (its admitted
-    /// chords, none when no global layer admits `Quit`, then the fixed `Ctrl+c`), then the rows
+    /// chords, none when no global layer admits `Quit`), then the rows
     /// in layer order, an act listed under the first global layer that offers it. A layer that
     /// lists nothing has no line.
     #[must_use]
@@ -268,12 +265,6 @@ impl Keys {
             if is_global && last_global != Some(index) {
                 continue; // the one `Global:` line sits at the last global layer
             }
-            if is_global
-                && let Some((_, quit)) = merged.first_mut()
-                && !quit.contains(&CTRL_C)
-            {
-                quit.push(CTRL_C);
-            }
             let entries: Vec<String> = merged
                 .iter()
                 .filter(|(_, chords)| !chords.is_empty())
@@ -287,8 +278,8 @@ impl Keys {
     }
 
     /// One `?` box line for `context` (D8): every offered and bound action, all its chords
-    /// joined by `/`, rows sharing a help label merged into one entry. `Quit` always appears and
-    /// ends with the fixed `Ctrl+c`. `None` if the context offers nothing.
+    /// joined by `/`, rows sharing a help label merged into one entry. `Quit` always appears while
+    /// it is bound. `None` if the context offers nothing.
     #[must_use]
     pub fn help_line(&self, context: Context, offered: impl Fn(Act) -> bool) -> Option<HelpLine> {
         let mut merged: Vec<(&str, Vec<KeyChord>)> = Vec::new();
@@ -297,10 +288,7 @@ impl Keys {
             if !quit && !offered(row.act) {
                 continue;
             }
-            let mut chords = row.chords.clone();
-            if quit && !chords.contains(&CTRL_C) {
-                chords.push(CTRL_C);
-            }
+            let chords = row.chords.clone();
             if chords.is_empty() {
                 continue;
             }
@@ -350,13 +338,7 @@ fn with_text(labels: &str, text: &str) -> String {
 /// One merged entry's chords: `1-9` for a run of three or more consecutive plain characters,
 /// else every label joined by `/` (`q/Ctrl+c`, `1/2/x/4`).
 fn chord_list(chords: &[KeyChord]) -> String {
-    let plain: Option<Vec<char>> = chords
-        .iter()
-        .map(|chord| match chord.code {
-            KeyCode::Char(c) if chord.mods.is_empty() => Some(c),
-            _ => None,
-        })
-        .collect();
+    let plain: Option<Vec<char>> = chords.iter().map(KeyChord::plain_char).collect();
     if let Some(plain) = plain
         && let [first, .., last] = plain[..]
         && plain.len() >= 3
@@ -413,10 +395,11 @@ mod tests {
     #[test]
     fn an_unbound_action_drops_out_of_the_status_line_and_a_hint() {
         let keys = Keys::defaults().with_chords(Context::Global, Act::Quit, &[]);
-        // PA-9: quit always leads the status line, as `Ctrl+c` once its own chords are gone.
+        // MOD-115 M2: `ctrl-c` is quit's own chord, so an unbound quit drops out like any act
+        // (a key file cannot unbind it: the safety net refuses that).
         assert!(
             keys.status_line(Stack::BASE, all)
-                .starts_with("Ctrl+c quit · Tab next tab")
+                .starts_with("Tab next tab · ")
         );
         let spec = &[Hint::One(Act::Quit, "quit"), Hint::One(Act::Help, "help")];
         assert_eq!(keys.hint(Stack::BASE, spec), "? help");
@@ -471,10 +454,16 @@ mod tests {
         );
     }
 
+    /// MOD-115 M2 (MD2): quit lists the chords in force and nothing appended: `ctrl-c` only
+    /// while it is bound.
     #[test]
-    fn quit_lists_ctrl_c_even_when_q_is_unbound() {
-        let keys = Keys::defaults().with_chords(Context::Global, Act::Quit, &[]);
+    fn quit_lists_only_its_own_chords() {
+        let keys = Keys::defaults().with_chords(Context::Global, Act::Quit, &["ctrl-c"]);
         assert!(global_line(&keys, all).starts_with("Global: Ctrl+c quit · "));
+        let keys = Keys::defaults().with_chords(Context::Global, Act::Quit, &["ctrl-x"]);
+        assert!(global_line(&keys, all).starts_with("Global: Ctrl+x quit · "));
+        let keys = Keys::defaults().with_chords(Context::Global, Act::Quit, &[]);
+        assert!(global_line(&keys, all).starts_with("Global: Tab next tab · "));
     }
 
     #[test]
@@ -646,10 +635,12 @@ mod tests {
         );
     }
 
-    /// MOD-115 M2 Task 0: the layers no site resolves yet stay out of the `?` box, so the box of
-    /// every M2 stack reads as it did before M2.
+    /// MOD-115 M2: the layers no site resolves yet (`field`, `layout`, `history`) stay out of the
+    /// `?` box; the ones Task 5 wired (`choice`, `answer`) are listed. The whole box of each
+    /// stack is pinned, so a line no site acts on cannot slip in (T0 verify: the headings alone
+    /// let the Requirements form's priority keys show before they were wired).
     #[test]
-    fn the_box_leaves_out_the_layers_no_site_resolves_yet() {
+    fn the_box_lists_the_wired_layers_and_leaves_out_the_rest() {
         let keys = Keys::compiled();
         for stack in [
             views::BACKLOG_BODY,
@@ -661,13 +652,51 @@ mod tests {
         ] {
             for line in keys.help_lines(stack, all) {
                 assert!(
-                    !["Layout", "History", "Text field", "Choice", "Answer"]
-                        .contains(&line.heading.as_str()),
+                    !["Layout", "History", "Text field"].contains(&line.heading.as_str()),
                     "{}",
                     line.text()
                 );
             }
         }
+        assert_eq!(
+            texts(keys.help_lines(views::REQUIREMENTS_FORM, bare)),
+            [
+                "Requirements: m priority must · l priority later · Tab/Down next field \
+                 · Shift+Tab/Up previous field",
+                "Choice: Left/h previous option · Right/l next option · Space toggle",
+                "Form: Ctrl+s save",
+                "Global: Ctrl+c quit · F1 help · F9 about",
+            ]
+        );
+        assert_eq!(
+            texts(keys.help_lines(views::RUNS_CONFIRM, bare)),
+            [
+                "Choice: Left/h previous option · Right/l next option · Space toggle",
+                "Confirm: y yes · n/Esc no",
+                "Global: Ctrl+c quit · F1 help · F9 about",
+            ]
+        );
+        assert_eq!(
+            texts(keys.help_lines(views::ATTACH_FORM, bare)),
+            [
+                "Attachments: Ctrl+r repo picker · Tab/Down next field · Shift+Tab/Up previous \
+                 field",
+                "Choice: Space toggle",
+                "Form: Ctrl+s save",
+                "Global: Ctrl+c quit · F1 help · F9 about",
+            ]
+        );
+        assert_eq!(
+            texts(keys.help_lines(views::CHAT_LIVE, bare)),
+            [
+                "Chat: i/Enter compose · a next agent · Esc end chat (twice) · t thoughts · g top \
+                 · G bottom",
+                "Answer: 1-9 answer",
+                "List: j/Down down · k/Up up",
+                "Global: q/Ctrl+c quit · Tab next tab · Shift+Tab previous tab · 1-9 select tab \
+                 · ?/F1 help · F9 about · Ctrl+Right next pane · Ctrl+Left previous pane",
+            ]
+        );
         assert_eq!(
             texts(keys.help_lines(views::CAPTURE, bare)),
             ["Global: Ctrl+c quit · F1 help · F9 about"]

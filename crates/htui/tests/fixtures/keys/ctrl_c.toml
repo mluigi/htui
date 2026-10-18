@@ -1,4 +1,7 @@
-# MOD-67 M2 fixture: ctrl-c, however it is spelled.
+# MOD-115 M2 (MD2) fixture: ctrl-c binds like any chord. In a version-2 file quit keeps only what
+# it lists, so find may take ctrl-c; the leave dialog keeps its own.
+version = 2
+
 [global]
-quit = ["q", "ctrl-c"]
-find = "ctrl-C"
+quit = ["q"]
+find = "ctrl-c"

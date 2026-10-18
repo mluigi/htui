@@ -1,3 +1,4 @@
-# MOD-67 M2 fixture: the overlay close unbound.
+# MOD-67 M2 fixture: the overlay close unbound. MOD-115 M2 (MD7): [] unbinds only its other
+# chords, and Esc still closes.
 [overlay]
 close = []

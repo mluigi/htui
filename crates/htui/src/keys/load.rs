@@ -10,8 +10,8 @@ use toml::Spanned;
 use toml::de::{DeString, DeTable, DeValue};
 
 use super::{
-    Act, ActionSpec, CATALOGUE, CTRL_C, ChordError, Context, DECLARED, KeyChord, Keys, quote,
-    validate, validate::give_way,
+    Act, ActionSpec, CATALOGUE, CTRL_C, Context, DECLARED, ESC, KeyChord, Keys, quote, validate,
+    validate::give_way,
 };
 
 /// The key file's name under the config root.
@@ -25,7 +25,7 @@ pub struct KeyFileError {
     /// tests rule out.
     pub line: usize,
     /// Everything after `keys.toml:LINE: `, e.g.
-    /// `[global] quit = "ctrl-c": ctrl-c always quits and cannot be bound`.
+    /// `[global] quit = "esc": esc always closes, cancels or goes back and cannot be bound`.
     pub message: String,
 }
 
@@ -60,8 +60,9 @@ impl KeysError {
 /// The report's last line, after every error (ANA-26 §7.5).
 const HINT: &str = "Fix the file, or run `htui --default-keys` to start with the default keys.";
 
-/// The refusal of `ctrl-c`, however it is spelled (D8 step 4).
-const CTRL_C_REFUSED: &str = "ctrl-c always quits and cannot be bound";
+/// The refusal of `Esc`, with any modifier (MOD-115 M2 MD7): it is never configurable. Every row
+/// whose compiled default holds it keeps it, so a list replaces only that row's other chords.
+const ESC_REFUSED: &str = "esc always closes, cancels or goes back and cannot be bound";
 
 /// ANA-26 §7.5's report: no trailing newline, since `main` prints it with `eprintln!`.
 impl std::fmt::Display for KeysError {
@@ -114,7 +115,15 @@ pub fn load_str(src: &str) -> Result<Keys, Vec<KeyFileError>> {
         errors: Vec::new(),
         set: Vec::new(),
     };
-    for (key, value) in root.get_ref() {
+    // MOD-115 M2: the version decides how an entry reads (MD7's version-1 `Esc`), and a table
+    // may come before it in the parsed order, so it is read first.
+    let version_first = |(key, _): &(&Spanned<DeString<'_>>, &Spanned<DeValue<'_>>)| {
+        let name: &str = key.get_ref();
+        name != "version"
+    };
+    let mut entries: Vec<_> = root.get_ref().iter().collect();
+    entries.sort_by_key(version_first);
+    for (key, value) in entries {
         loader.top_level(key, value);
     }
     let Loader {
@@ -123,6 +132,17 @@ pub fn load_str(src: &str) -> Result<Keys, Vec<KeyFileError>> {
         set,
         ..
     } = loader;
+    // MOD-115 M2 (D-9): `ctrl-c` always quit before M2 and no file could list it, so a version-1
+    // file's quit keeps it. A version-2 file binds it like any chord.
+    if keys.version == 1
+        && let Some(quit) = keys.row(Context::Global, Act::Quit)
+        && let Some(line) = quit.entry
+        && !quit.chords.contains(&CTRL_C)
+    {
+        let mut chords = quit.chords.clone();
+        chords.push(CTRL_C);
+        keys.set(Context::Global, Act::Quit, chords, line);
+    }
     // MOD-67 M3 PA-1: the view defaults follow the shared rows the file just set.
     keys.derive(&set);
     give_way(&mut keys);
@@ -238,20 +258,21 @@ fn context_named(path: &str) -> Option<Context> {
         .find(|context| context.table() == path)
 }
 
-/// `written` as a chord the file may bind (D8 steps 3-4), or the reason it may not. A
-/// `CtrlCapital` whose suggestion is `ctrl-c` reports the ctrl-c refusal: never suggest a
-/// spelling the next check refuses (B-5).
+/// `written` as a chord: [`KeyChord::parse_strict`], with its reason when it fails (D8 step 3).
+/// `ctrl-c` binds like any chord since MOD-115 M2 (MD2); `Esc` is the entry's to refuse
+/// ([`Loader::entry`]).
 fn chord_of(written: &str) -> Result<KeyChord, String> {
-    match KeyChord::parse_strict(written) {
-        Ok(chord) if chord == CTRL_C => Err(CTRL_C_REFUSED.to_owned()),
-        Err(ChordError::CtrlCapital { suggestion })
-            if KeyChord::parse_strict(&suggestion) == Ok(CTRL_C) =>
-        {
-            Err(CTRL_C_REFUSED.to_owned())
-        }
-        Ok(chord) => Ok(chord),
-        Err(error) => Err(error.to_string()),
-    }
+    KeyChord::parse_strict(written).map_err(|error| error.to_string())
+}
+
+/// Where the compiled row of `act` as `[context]` sees it holds `Esc`, or `None` (MOD-115 M2
+/// MD7): the row itself, else (a view's override of a shared verb) the shared row.
+fn esc_at(context: Context, act: Act) -> Option<usize> {
+    let compiled = Keys::compiled();
+    compiled
+        .row(context, act)
+        .or_else(|| act.spec().and_then(|spec| compiled.row(spec.context, act)))
+        .and_then(|row| row.chords.iter().position(|chord| *chord == ESC))
 }
 
 /// The shared acts `[context]` may override (MOD-67 M3 D10, PA-3): every shared catalogue row
@@ -409,6 +430,9 @@ impl Loader<'_> {
                 return;
             }
         };
+        // MOD-115 M2 MD7: a row whose compiled default holds `Esc` keeps it.
+        let esc = esc_at(context, spec.act);
+        let keeps_esc = esc.is_some();
         let mut chords: Vec<KeyChord> = Vec::new();
         for item in &items {
             let line = self.line(item.span().start);
@@ -422,6 +446,12 @@ impl Loader<'_> {
             let shown = quote(written);
             match chord_of(written) {
                 Err(reason) => self.push(line, format!("[{table}] {name} = {shown}: {reason}")),
+                // MD7, MD4: a version-1 file listed `Esc` where the row has it anyway (the
+                // README's `close = ["esc", "f2"]`); it changes nothing, so it still loads.
+                Ok(chord) if chord == ESC && self.keys.version == 1 && keeps_esc => {}
+                Ok(chord) if chord.is_esc() => {
+                    self.push(line, format!("[{table}] {name} = {shown}: {ESC_REFUSED}"));
+                }
                 Ok(chord) if chords.contains(&chord) => self.push(
                     line,
                     format!("[{table}] {name} = {shown}: already listed for this action"),
@@ -429,31 +459,30 @@ impl Loader<'_> {
                 Ok(chord) => chords.push(chord),
             }
         }
-        // MOD-115 M2 (D-9): `ctrl-c` is a default of quit and of the leave dialog's confirm, but
-        // no file may list it until Task 5, so it stays implicit there, as it always was: an
-        // entry for such a row keeps it, and `--print-keys` leaves it out.
-        if spec.defaults.contains(&"ctrl-c") && !chords.contains(&CTRL_C) {
-            chords.push(CTRL_C);
-        }
-        if items.is_empty()
-            && let Some(reason) = must_keep(spec.act)
+        if let Some(at) = esc
+            && !chords.contains(&ESC)
         {
-            self.push(
-                key_line,
-                format!("[{table}] {name}: must keep at least one chord: {reason}"),
-            );
+            chords.insert(at.min(chords.len()), ESC);
         }
         self.keys.set(context, spec.act, chords, key_line);
         self.set.push((context, spec.act));
     }
 }
 
-/// Why `act` must keep at least one chord (ANA-26 §7.4 step 6), or `None`.
-const fn must_keep(act: Act) -> Option<&'static str> {
+/// Why `act` must keep at least one chord (ANA-26 §7.4 step 6; MOD-115 M2 D7, D-10), or `None`:
+/// the validator's safety nets refuse a file that leaves one with none. The rows that hold `Esc`
+/// (`overlay.close`, `field.cancel`, `leave.stay`) keep it by construction (MD7).
+pub(super) const fn must_keep(act: Act) -> Option<&'static str> {
     match act {
         Act::OverlayClose => Some("overlays swallow every other key"),
         // MOD-57 M2 E9 (a): the one way back from a focused in-pane editor.
         Act::EditorFocus => Some("the editor takes every other key"),
+        Act::Quit | Act::LeaveConfirm => Some(
+            "global.quit opens the leave dialog and leave.confirm leaves; without both htui \
+             cannot be left",
+        ),
+        Act::FieldCancel => Some("it is the way out of a text field"),
+        Act::LeaveStay => Some("it is the way back from the leave dialog"),
         _ => None,
     }
 }
@@ -463,7 +492,7 @@ mod tests {
     use std::error::Error as _;
     use std::path::{Path, PathBuf};
 
-    use super::{FILE_NAME, KeyFileError, KeysError, load_path, load_str, resolve};
+    use super::{ESC_REFUSED, FILE_NAME, KeyFileError, KeysError, load_path, load_str, resolve};
     use crate::keys::{Act, CATALOGUE, CTRL_C, Context, KeyChord, Keys, views};
 
     /// The full error vector of `src`, as `(line, message)`.
@@ -596,10 +625,11 @@ mod tests {
         assert_eq!(crate::keys::VERSION, 2);
     }
 
-    /// MOD-115 M2 (D-9): `ctrl-c` stays implicit on the rows whose default holds it, so a file
-    /// that rebinds quit keeps it and the default print reads back.
+    /// MOD-115 M2 (D-9): `ctrl-c` always quit before M2 and no file could list it, so a
+    /// version-1 file's quit keeps it; a version-2 file binds it like any chord, and no other
+    /// row gains it.
     #[test]
-    fn a_rebound_quit_keeps_ctrl_c_and_no_other_row_gains_it() {
+    fn a_version_1_quit_keeps_ctrl_c_and_a_version_2_one_binds_it_like_any_chord() {
         let keys = load_str("[global]\nquit = [\"z\"]\nhelp = [\"f1\"]\n").expect("it loads");
         assert_eq!(
             keys.chords(Context::Global, Act::Quit),
@@ -614,10 +644,142 @@ mod tests {
             None,
             "the default, unmarked"
         );
+        let leave = load_str("[leave]\nconfirm = [\"y\"]\n").expect("it loads");
+        assert_eq!(
+            leave.chords(Context::Leave, Act::LeaveConfirm),
+            [chord("y")],
+            "only a version-1 quit had ctrl-c implicit"
+        );
+
+        let strict = load_str("version = 2\n[global]\nquit = [\"ctrl-y\"]\n").expect("it loads");
+        assert_eq!(strict.chords(Context::Global, Act::Quit), [chord("ctrl-y")]);
+        let listed =
+            load_str("version = 2\n[global]\nquit = [\"ctrl-y\", \"ctrl-c\"]\n").expect("it loads");
+        assert_eq!(
+            listed.chords(Context::Global, Act::Quit),
+            [chord("ctrl-y"), CTRL_C]
+        );
         let leave = load_str("version = 2\n[leave]\nconfirm = [\"y\"]\n").expect("it loads");
         assert_eq!(
             leave.chords(Context::Leave, Act::LeaveConfirm),
-            [chord("y"), CTRL_C]
+            [chord("y")]
+        );
+    }
+
+    /// MOD-115 M2 (MD2): `ctrl-c` binds like any chord: an entry in quit's table takes it from
+    /// quit, which keeps `q` (D-10), with the usual notice.
+    #[test]
+    fn ctrl_c_binds_like_any_chord() {
+        let keys = load_str("version = 2\n[global]\nfind = \"ctrl-c\"\n").expect("it loads");
+        assert_eq!(keys.chords(Context::Global, Act::Find), [CTRL_C]);
+        assert_eq!(keys.chords(Context::Global, Act::Quit), [chord("q")]);
+        assert_eq!(
+            keys.notices()
+                .into_iter()
+                .map(|notice| notice.message)
+                .collect::<Vec<_>>(),
+            [r#"[global] find = "ctrl-c" takes "ctrl-c" from global.quit, which keeps "q""#]
+        );
+        assert_eq!(
+            keys.actions(views::LEAVE, CTRL_C),
+            [Act::LeaveConfirm],
+            "the leave dialog keeps its own ctrl-c"
+        );
+    }
+
+    /// MOD-115 M2 D7, D-10: quit and the leave dialog's two answers must keep a chord. An entry
+    /// that empties one is refused on its line, naming why; quit gives a chord away only while it
+    /// keeps another, so `[global] help = ["q"]` loads and quit keeps `ctrl-c`.
+    #[test]
+    fn quit_and_the_leave_dialog_must_keep_a_chord() {
+        let way_out = "must keep at least one chord: global.quit opens the leave dialog and \
+                       leave.confirm leaves; without both htui cannot be left";
+        assert_eq!(
+            errors("version = 2\n[global]\nquit = []\n"),
+            one(3, &format!("[global] quit: {way_out}"))
+        );
+        assert_eq!(
+            errors("version = 2\n[leave]\nconfirm = []\n"),
+            one(3, &format!("[leave] confirm: {way_out}"))
+        );
+        let keys = load_str("version = 2\n[global]\nhelp = [\"q\"]\n").expect("it loads");
+        assert_eq!(keys.chords(Context::Global, Act::Quit), [CTRL_C]);
+        assert_eq!(keys.chords(Context::Global, Act::Help), [chord("q")]);
+        let keys = load_str("version = 2\n[leave]\nconfirm = [\"n\"]\n").expect("it loads");
+        assert_eq!(
+            keys.chords(Context::Leave, Act::LeaveStay),
+            [chord("esc")],
+            "stay gives `n` away and keeps Esc"
+        );
+        // Taking quit's last chord is a collision, not an unbound quit.
+        assert!(
+            errors("version = 2\n[global]\nhelp = [\"q\", \"ctrl-c\"]\n")
+                .iter()
+                .any(|(line, message)| *line == 3
+                    && message.contains(r#""ctrl-c" is already global.quit (default)"#)),
+            "{:?}",
+            errors("version = 2\n[global]\nhelp = [\"q\", \"ctrl-c\"]\n")
+        );
+    }
+
+    /// MOD-115 M2 MD7: a key file cannot list `Esc`, however it is spelled, and a row whose
+    /// default holds it keeps it: a list replaces only the row's other chords, `[]` unbinds only
+    /// those.
+    #[test]
+    fn esc_is_never_configurable() {
+        for (spec, line) in [("esc", 3), ("Esc", 3), ("escape", 3), ("alt-esc", 3)] {
+            assert_eq!(
+                errors(&format!("version = 2\n[list]\ntop = [{spec:?}]\n")),
+                one(line, &format!("[list] top = {spec:?}: {ESC_REFUSED}")),
+                "{spec}"
+            );
+        }
+        assert_eq!(
+            errors("version = 2\n[overlay]\nclose = [\"esc\", \"f2\"]\n"),
+            one(3, &format!(r#"[overlay] close = "esc": {ESC_REFUSED}"#))
+        );
+        let keys = load_str("version = 2\n[overlay]\nclose = [\"f2\"]\n[confirm]\nno = []\n")
+            .expect("it loads");
+        assert_eq!(
+            keys.chords(Context::Overlay, Act::OverlayClose),
+            [chord("esc"), chord("f2")]
+        );
+        assert_eq!(
+            keys.chords(Context::Confirm, Act::ConfirmNo),
+            [chord("esc")]
+        );
+        let unbound = load_str("version = 2\n[overlay]\nclose = []\n").expect("it loads");
+        assert_eq!(
+            unbound.chords(Context::Overlay, Act::OverlayClose),
+            [chord("esc")]
+        );
+        assert_eq!(
+            unbound.line(Context::Overlay, Act::OverlayClose),
+            None,
+            "Esc alone is the default"
+        );
+        // A view's override of a shared verb keeps the shared row's Esc too.
+        let keys =
+            load_str("version = 2\n[settings.boxes]\ndismiss = [\"x\"]\n").expect("it loads");
+        assert_eq!(
+            keys.chords(Context::SettingsBoxes, Act::Dismiss),
+            [chord("esc"), chord("x")]
+        );
+    }
+
+    /// MOD-115 M2 MD7 with MD4: a version-1 file that lists `Esc` where the row holds it anyway
+    /// (the README's `close = ["esc", "f2"]`) changes nothing, so it still loads; one that lists
+    /// it on any other row is refused, as in version 2.
+    #[test]
+    fn a_version_1_esc_on_a_row_that_holds_it_still_loads() {
+        let keys = load_str("[overlay]\nclose = [\"esc\", \"f2\"]\n").expect("it loads");
+        assert_eq!(
+            keys.chords(Context::Overlay, Act::OverlayClose),
+            [chord("esc"), chord("f2")]
+        );
+        assert_eq!(
+            errors("[list]\ntop = [\"g\", \"esc\"]\n"),
+            one(2, &format!(r#"[list] top = "esc": {ESC_REFUSED}"#))
         );
     }
 
@@ -730,20 +892,17 @@ mod tests {
         );
     }
 
+    /// MOD-115 M2 (MD2): `ctrl-c` is a chord like any other; a capital is still refused with the
+    /// spelling to write.
     #[test]
-    fn ctrl_c_is_refused_however_it_is_spelled() {
-        let src = "[global]\nquit = [\"q\", \"ctrl-c\"]\nfind = \"ctrl-C\"\nwaiting = \" ctrl + shift + c \"\n";
-        let refused = "ctrl-c always quits and cannot be bound";
+    fn ctrl_c_is_read_like_any_chord() {
+        let src = "version = 2\n[global]\nquit = [\"q\", \"ctrl-c\"]\nfind = \"ctrl-C\"\n";
         assert_eq!(
             errors(src),
-            vec![
-                (2, format!(r#"[global] quit = "ctrl-c": {refused}"#)),
-                (3, format!(r#"[global] find = "ctrl-C": {refused}"#)),
-                (
-                    4,
-                    format!(r#"[global] waiting = " ctrl + shift + c ": {refused}"#)
-                ),
-            ]
+            one(
+                4,
+                r#"[global] find = "ctrl-C": write "ctrl-c": a terminal sends ctrl with the lower-case letter"#
+            )
         );
         assert_eq!(
             errors("[global]\nfind = \"ctrl-alt-C\"\n"),
@@ -777,26 +936,30 @@ mod tests {
         );
     }
 
+    /// MOD-115 M2 MD7: `overlay.close` keeps `Esc` by construction, so `[]` leaves it `Esc`
+    /// alone and the overlay can always be closed.
     #[test]
-    fn overlay_close_must_keep_a_chord() {
+    fn overlay_close_keeps_esc_by_construction() {
+        let keys = load_str("[overlay]\nclose = []\n").expect("it loads");
         assert_eq!(
-            errors("[overlay]\nclose = []\n"),
-            one(
-                2,
-                "[overlay] close: must keep at least one chord: overlays swallow every other key"
-            )
+            keys.chords(Context::Overlay, Act::OverlayClose),
+            [chord("esc")]
         );
-        assert_eq!(
-            errors("[overlay]\nclose = [\"ctrl-c\"]\n"),
-            one(
-                2,
-                r#"[overlay] close = "ctrl-c": ctrl-c always quits and cannot be bound"#
-            )
-        );
+        for (context, act) in [
+            (Context::Field, Act::FieldCancel),
+            (Context::Leave, Act::LeaveStay),
+            (Context::Overlay, Act::OverlayClose),
+        ] {
+            let table = context.table();
+            let name = act.spec().expect("a row").name;
+            let keys =
+                load_str(&format!("version = 2\n[{table}]\n{name} = []\n")).expect("it loads");
+            assert!(keys.chords(context, act).contains(&chord("esc")), "{name}");
+        }
     }
 
-    /// MOD-67 M4 D8.1, D8.3: `editor.focus` must keep a chord, and `ctrl-c` is refused in
-    /// `[editor]` as everywhere.
+    /// MOD-67 M4 D8.1: `editor.focus` must keep a chord; MOD-115 M2: `ctrl-c` is quit's in a
+    /// version-2 file, so focus cannot share it there.
     #[test]
     fn editor_focus_must_keep_a_chord() {
         assert_eq!(
@@ -806,12 +969,11 @@ mod tests {
                 "[editor] focus: must keep at least one chord: the editor takes every other key"
             )
         );
-        assert_eq!(
-            errors("[editor]\nfocus = \"ctrl-c\"\n"),
-            one(
-                2,
-                r#"[editor] focus = "ctrl-c": ctrl-c always quits and cannot be bound"#
-            )
+        assert!(
+            errors("version = 2\n[editor]\nfocus = \"ctrl-c\"\n")
+                .iter()
+                .all(|(line, message)| *line == 3
+                    && message.starts_with(r#"[editor] focus = "ctrl-c": "ctrl-c" is already "#)),
         );
         assert!(
             load_str("[editor]\nabort = []\n").is_ok(),
@@ -1015,7 +1177,7 @@ quit = ["x", "shift-a"]
     #[test]
     fn a_broken_root_file_is_invalid_with_its_path() {
         let root = tempfile::tempdir().expect("a temp dir");
-        let file = write(root.path(), FILE_NAME, "[global]\nquit = \"ctrl-c\"\n");
+        let file = write(root.path(), FILE_NAME, "[global]\nquit = \"esc\"\n");
         match resolve(None, false, Some(root.path())) {
             Err(KeysError::Invalid { path, errors }) => {
                 assert_eq!(path, file);
@@ -1023,9 +1185,7 @@ quit = ["x", "shift-a"]
                     errors,
                     [KeyFileError {
                         line: 2,
-                        message:
-                            r#"[global] quit = "ctrl-c": ctrl-c always quits and cannot be bound"#
-                                .to_owned()
+                        message: format!(r#"[global] quit = "esc": {ESC_REFUSED}"#)
                     }]
                 );
             }
@@ -1265,10 +1425,11 @@ quit = ["x", "shift-a"]
             keys.chords(Context::SettingsAgents, Act::FormNextField),
             [chord("tab"), chord("down")]
         );
+        // MOD-115 M2 MD7: `no` keeps its Esc, and the migration prompt's row follows it.
         let keys = load_str("[confirm]\nno = [\"x\"]\n").expect("loads");
         assert_eq!(
             keys.chords(Context::Migration, Act::ConfirmNo),
-            [chord("x"), chord("N")]
+            [chord("x"), chord("esc"), chord("N")]
         );
     }
 }

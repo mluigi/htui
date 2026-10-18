@@ -21,11 +21,11 @@ pub mod views;
 pub use catalogue::{
     Act, ActionSpec, CATALOGUE, Context, SHADOWING, STATE_GUARDED, V1_DEFAULTS, VIEW_DEFAULTS,
 };
-pub use chord::{CTRL_C, ChordError, KeyChord};
+pub use chord::{CTRL_C, ChordError, ESC, KeyChord};
 pub use hint::{HelpLine, Hint, HintSpec};
 pub use load::{FILE_NAME, KeyFileError, KeysError, Resolved, load_path, load_str, resolve};
 pub use print::print;
-pub use stack::{DECLARED, FIXED, Fixed, Layer, Stack};
+pub use stack::{DECLARED, Layer, Stack};
 pub use validate::validate;
 
 /// The keys in force: every catalogue action's chords per context (MOD-67 D9, D10). Built once
@@ -336,10 +336,9 @@ impl Keys {
     }
 }
 
-/// Whether `key` carries no modifier but `SHIFT`, which is how a terminal reports a capital. The
-/// keys a view keeps fixed ahead of the resolver (ANA-26 §6.1, MOD-67 M5 D5: a choice's value
-/// keys, the permission digits, the Chat replay's swallow) match only such a key, so a chord with
-/// CONTROL, ALT, SUPER, HYPER or META passes on to the resolver.
+/// Whether `key` carries no modifier but `SHIFT`, which is how a terminal reports a capital: what
+/// a text widget takes (MOD-67 M4: a form's text fields see plain keys only), and the keys that
+/// disarm the chat's double `Esc`. A chord with CONTROL, ALT, SUPER, HYPER or META is not plain.
 pub(crate) fn is_plain(key: &crossterm::event::KeyEvent) -> bool {
     (key.modifiers - crossterm::event::KeyModifiers::SHIFT).is_empty()
 }
