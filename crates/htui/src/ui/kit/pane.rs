@@ -84,7 +84,8 @@ impl<'a> Pane<'a> {
     }
 
     /// A note on the bottom border, right-aligned and drawn focused or not: what a hidden pane
-    /// says about bringing it back (`R-TUI-12`). It takes only the rule the hints left.
+    /// says about bringing it back (`R-TUI-12`). It takes only the rule the hints left, less
+    /// the one rule cell that parts it from them.
     #[must_use]
     pub fn note(mut self, note: Line<'a>) -> Self {
         self.note = Some(note);
@@ -325,8 +326,8 @@ pub fn paint_focus(buf: &mut Buffer, area: Rect, focus: Focus, accent: Style, th
 /// Draws `note` over the horizontal border glyphs of `row`, right-aligned: the twin of
 /// [`paint_bottom_hints`], ending two cells before the right corner. It is clipped to
 /// `row.width - 4` and drawn only over the run of plain rule that ends there, so it stops (with
-/// an ellipsis) at the first cell that is not one, a hint or a corner. `style` is the note's
-/// base style.
+/// an ellipsis) one rule cell short of the first cell that is not one, a hint or the tab's own
+/// text, so a rule cell always parts the two. `style` is the note's base style.
 pub fn paint_bottom_note(buf: &mut Buffer, row: Rect, note: Line<'_>, style: Style) {
     let width = row.width.saturating_sub(4);
     let row = row.intersection(buf.area);
@@ -338,7 +339,15 @@ pub fn paint_bottom_note(buf: &mut Buffer, row: Rect, note: Line<'_>, style: Sty
     let run = (1..=width)
         .take_while(|k| end >= row.x + k && is_rule(buf[(end - k, row.y)].symbol()))
         .count();
-    let room = u16::try_from(run).unwrap_or(width).min(width);
+    let run = u16::try_from(run).unwrap_or(width).min(width);
+    // A run cut short by a hint or the tab's own text keeps one rule cell beside it, so the
+    // note never reads as one word with what stopped it; a run of the whole width already
+    // leaves the rule cell after the left corner.
+    let room = if run < width {
+        run.saturating_sub(1)
+    } else {
+        run
+    };
     if room == 0 {
         return;
     }
@@ -902,7 +911,19 @@ mod tests {
             Line::from("123456789"),
             Style::new(),
         );
-        assert_eq!(row(&clipped, 0), "╰─abcdef1234…─╯");
+        assert_eq!(
+            row(&clipped, 0),
+            "╰─abcdef─123…─╯",
+            "one rule cell stays between the note and what stopped it"
+        );
+        let mut exact = bordered_row(&text);
+        paint_bottom_note(
+            &mut exact,
+            Rect::new(0, 0, 15, 1),
+            Line::from("1234"),
+            Style::new(),
+        );
+        assert_eq!(row(&exact, 0), "╰─abcdef─1234─╯");
         let mut fits = bordered_row(&text);
         paint_bottom_note(
             &mut fits,
@@ -963,6 +984,20 @@ mod tests {
         assert_eq!(
             row(&focused, 3),
             format!("╰─enter open{}z unzoom─╯", "─".repeat(8))
+        );
+        let (tight, _) = draw(
+            22,
+            4,
+            &theme,
+            Pane::new("T")
+                .hints(Line::from("enter open"))
+                .note(Line::from("z unzoom"))
+                .focus(Focus::Focused),
+        );
+        assert_eq!(
+            row(&tight, 3),
+            "╰─enter open─z unzo…─╯",
+            "the note never runs into the hints"
         );
     }
 }
