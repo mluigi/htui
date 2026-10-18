@@ -68,7 +68,7 @@ footer outside the kit, all 199 snapshots are rewritten, and the maintainer sign
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
 | 1 | Widget kit + shell frame | Header, rounded panes, bottom-border hints, `F9` about panel (F1 stays Help); kit parts exist and two pilot overlays use them | complete | `.claude/plans/mod-115-tui-shell-m1.plan.md` |
-| 2 | Layouts and navigation | Per-tab presets, resize, show/hide, zoom, saved at once; pane keys, sub-tab keys; history; leave dialog | pending | — |
+| 2 | Layouts and navigation | Per-tab presets, resize, show/hide, zoom, saved at once; pane keys, sub-tab keys; history; leave dialog; every key configurable (maintainer, 2026-10-18) | in-progress | `.claude/plans/mod-115-tui-shell-m2.plan.md` |
 | 3 | Tabs ported, group A | First group of existing tabs on the kit, snapshots rewritten | pending | — |
 | 4 | Tabs ported, group B | Remaining tabs, `backlog/mod.rs` and `settings/agents.rs` split; MOD-81/82/83/85 closed | pending | — |
 
