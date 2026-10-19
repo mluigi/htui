@@ -21,7 +21,7 @@ use crate::ui::cells::clip_line;
 use crate::ui::header::{self, Flash};
 use crate::ui::kit::pane::paint_bottom_hints;
 use crate::ui::overlay::{Overlay, OverlayRegistry, OverlayStack};
-use crate::ui::shell::PaneId;
+use crate::ui::shell::{PaneAreas, PaneId, TabLayout};
 use crate::ui::tabs::{Tab, TabId, TabRegistry};
 use crate::ui::{Theme, about, layout};
 use crossterm::event::{Event, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind};
@@ -101,7 +101,17 @@ pub struct Ctx<'a> {
     /// MOD-115 M2 D6: the open in-pane edit's label, for the leave dialog; `None` when no edit
     /// is open.
     open_edit: Option<&'a str>,
+    /// MOD-115 M2 D2: the tab's layout as the shell keeps it; `None` until the shell sets one
+    /// (B7: then the tab's own default, [`Ctx::split`]).
+    layout: Option<TabLayout>,
+    /// MOD-115 M2 B5: where [`Ctx::split`] records the panes the tab claimed this frame, and the
+    /// region it split; `None` at every site but the active tab's render.
+    claim: Option<&'a Cell<Option<PaneClaim>>>,
 }
+
+/// What a list + detail tab claimed in one frame (MOD-115 M2 B5): the region it split and the
+/// panes the shell's layout gave it.
+pub type PaneClaim = (Rect, PaneAreas);
 
 impl<'a> Ctx<'a> {
     /// Builds the context of one view. The shell is the only caller.
@@ -126,7 +136,40 @@ impl<'a> Ctx<'a> {
             editor_area: None,
             focus: None,
             open_edit: None,
+            layout: None,
+            claim: None,
         }
+    }
+
+    /// This context with the tab's layout as the shell keeps it (MOD-115 M2 D2). Only the shell
+    /// calls it, for a list + detail tab.
+    #[must_use]
+    pub const fn with_layout(mut self, layout: TabLayout) -> Self {
+        self.layout = Some(layout);
+        self
+    }
+
+    /// Lends this context the cell [`split`](Self::split) records its claim in (MOD-115 M2 B5).
+    /// Only `App::render` calls it, for the active tab's render.
+    #[must_use]
+    pub const fn with_pane_claim(mut self, cell: &'a Cell<Option<PaneClaim>>) -> Self {
+        self.claim = Some(cell);
+        self
+    }
+
+    /// MOD-115 M2 B5: `region` split into the tab's panes, by the layout the shell keeps for the
+    /// tab, else `default` (the tab's own, so a bench draws as before the shell kept layouts).
+    /// Called where the tab split its body itself; during the active tab's render the shell
+    /// records the claim for focus borders, the hidden-pane note, the activity placeholder, the
+    /// hints and the mouse. The last claim of a frame wins.
+    #[must_use]
+    pub fn split(&self, region: Rect, default: TabLayout) -> PaneAreas {
+        let areas =
+            crate::ui::shell::layout::areas(region, &self.layout.unwrap_or(default), self.focus());
+        if let Some(cell) = self.claim {
+            cell.set(Some((region, areas)));
+        }
+        areas
     }
 
     /// This context with the tab's focused pane (MOD-115 M2 D3). Only the shell calls it.
@@ -1200,6 +1243,114 @@ mod tests {
         assert_eq!(set.focus(), PaneId::Detail);
         assert_eq!(set.open_edit(), Some("MOD-115 body"));
         assert_eq!(ctx().with_open_edit(None).open_edit(), None);
+    }
+
+    /// MOD-115 M2 B5, B7: `split` uses the tab's own default until the shell hands it a layout,
+    /// and records the region and the areas only where the shell lent the claim cell.
+    #[test]
+    fn a_split_follows_the_default_until_the_shell_sets_a_layout_and_records_its_claim() {
+        use std::cell::Cell;
+
+        use htui_core::model::{Scope, WorkspaceId};
+
+        use super::{Ctx, Emit, PaneClaim, TopBarState};
+        use crate::keys::Keys;
+        use crate::store_worker::Origin;
+        use crate::ui::Theme;
+        use crate::ui::shell::{ListSize, PaneId, Preset, TabLayout, layout};
+        use crate::ui::tabs::TabId;
+
+        let scope = Scope {
+            workspace_id: WorkspaceId::default(),
+            project_ids: Vec::new(),
+        };
+        let (top_bar, theme, emit) = (TopBarState::default(), Theme::default(), Emit::default());
+        let ctx = || {
+            Ctx::new(
+                &scope,
+                &[],
+                &top_bar,
+                Keys::compiled(),
+                &theme,
+                Origin::Tab(TabId("bench")),
+                &emit,
+            )
+        };
+        let region = Rect::new(0, 1, 100, 28);
+        let default = TabLayout {
+            list: ListSize::Percent(55),
+            ..TabLayout::DEFAULT
+        };
+        let focus = TabLayout {
+            preset: Preset::Focus,
+            ..default
+        };
+        assert_eq!(
+            ctx().split(region, default),
+            layout::areas(region, &default, PaneId::List),
+            "a bench splits by the tab's default"
+        );
+        let cell: Cell<Option<PaneClaim>> = Cell::new(None);
+        let areas = ctx()
+            .with_layout(focus)
+            .with_focus(PaneId::Detail)
+            .with_pane_claim(&cell)
+            .split(region, default);
+        assert_eq!(areas, layout::areas(region, &focus, PaneId::Detail));
+        assert_eq!(areas.list, None, "the shell's layout wins over the default");
+        assert_eq!(cell.get(), Some((region, areas)), "the claim is recorded");
+        let _ = ctx().split(region, default);
+        assert_eq!(
+            cell.get(),
+            Some((region, areas)),
+            "a context without the cell records nothing"
+        );
+    }
+
+    /// MOD-115 M2 §6.3: a tab that declares nothing has one pane, no location and restores
+    /// nothing.
+    #[test]
+    fn a_tab_has_one_pane_no_location_and_restores_nothing_by_default() {
+        use crate::ui::shell::{Panes, TabLoc};
+        use crate::ui::tabs::Tab;
+
+        struct Bare;
+        impl Tab for Bare {
+            fn id(&self) -> crate::ui::tabs::TabId {
+                crate::ui::tabs::TabId("bare")
+            }
+            fn title(&self) -> &str {
+                "Bare"
+            }
+            fn wants_requests(
+                &self,
+                _scope: &htui_core::model::Scope,
+            ) -> Vec<crate::store_worker::StoreRequest> {
+                Vec::new()
+            }
+            fn on_scope_change(&mut self, _scope: &htui_core::model::Scope) {}
+            fn on_key(
+                &mut self,
+                _key: crossterm::event::KeyEvent,
+                _ctx: &mut super::Ctx<'_>,
+            ) -> crate::app::Handled {
+                crate::app::Handled::Pass
+            }
+            fn on_reply(
+                &mut self,
+                _reply: &crate::store_worker::StoreReply,
+                _ctx: &mut super::Ctx<'_>,
+            ) {
+            }
+            fn render(&self, _frame: &mut ratatui::Frame<'_>, _area: Rect, _ctx: &super::Ctx<'_>) {}
+        }
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let app = App::new(tx);
+        let mut ctx = app.ctx(crate::store_worker::Origin::App);
+        let mut bare = Bare;
+        assert_eq!(bare.panes(), Panes::Single);
+        assert_eq!(bare.location(), TabLoc::default());
+        assert!(!bare.restore(&TabLoc::default(), &mut ctx));
     }
 
     /// MOD-115 M1 adapter: the hints go on the lowest bottom border among the body's last four

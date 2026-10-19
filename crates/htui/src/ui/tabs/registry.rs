@@ -13,6 +13,7 @@ use crate::app::{Ctx, Handled, RevealTarget};
 use crate::editor::ExternalEditOutcome;
 use crate::keys::Stack;
 use crate::store_worker::{StoreReply, StoreRequest};
+use crate::ui::shell::{Panes, TabLoc};
 use crate::ui::tabs::settings::SectionId;
 use crossterm::event::{KeyEvent, MouseEvent};
 
@@ -134,6 +135,27 @@ pub trait Tab {
     /// capturing views (e.g. by tracking the capture holder), or the review-L3 stale anchor
     /// returns.
     fn on_mouse_lost(&mut self) {}
+
+    /// The panes this tab has (MOD-115 M2 D2): one (the default: Chat, Settings, the test
+    /// doubles) or a list and a detail with the tab's default layout. A list + detail tab splits
+    /// its body with [`Ctx::split`](crate::app::Ctx::split), where the shell's layout for it
+    /// applies; on a single-pane tab the pane and layout keys do nothing.
+    fn panes(&self) -> Panes {
+        Panes::Single
+    }
+
+    /// Where this tab is (MOD-115 M2 D5): its sub-tab and its opaque cursor, for the history.
+    /// Defaulted to nowhere in particular, so only the tab itself is recorded.
+    fn location(&self) -> TabLoc {
+        TabLoc::default()
+    }
+
+    /// Goes back to `loc`, a [`location`](Tab::location) this tab gave (MOD-115 M2 D5): selects
+    /// the sub-tab and moves the cursor. `false` when nothing could be restored, which is what
+    /// the default says.
+    fn restore(&mut self, _loc: &TabLoc, _ctx: &mut Ctx<'_>) -> bool {
+        false
+    }
 }
 
 /// Every registered tab, in registration order, plus which one is active.
