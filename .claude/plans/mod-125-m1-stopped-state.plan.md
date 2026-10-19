@@ -303,3 +303,15 @@ Two fact-check agents read the tree at `41bf5c90`, plus a scratch DB and a compi
 ## Maintainer calls on the blueprint deviations
 
 DV-1..DV-6 (blueprint) accepted as recommended, 2026-10-18: DV-1 the top-bar count lists stay three statuses; DV-2 `pg/relay.rs:544` and its MemStore twin unchanged in M1; DV-3 the `queue_item` signature change moves into T2; DV-4 `stop_run` takes no `at`; DV-5 the queue runner may still create queued runs in a stopped workspace (claim refuses them), gated in M2; DV-6 `queue_entry.workspace_id` is backfilled by the one-workspace rule. The blueprint is the implementation authority where it and this plan differ.
+
+## Deferred review findings (R1, 2026-10-19)
+
+The M1 review (rust-reviewer, Approve-with-fixes, each finding adversarially verified) was split by the maintainer: M-1, M-2, L-1, L-2, L-4 and L-8 are fixed in round R1; these are recorded, with no M1 code.
+
+| Finding | Goes to | What |
+|---|---|---|
+| M-3 | M2 | `delete_workspace` refuses with `Constraint` while the workspace has `stopped` runs. Pg: lock the `workspace_stop` row `FOR UPDATE`, then `EXISTS` a stopped run of the workspace; the MemStore twin; one conformance case; the Settings hierarchy shows the refusal. |
+| L-3 | M2 | A readable refusal, "this workspace no longer exists: switch workspace", for `fk_run_workspace` and `fk_queue_entry_workspace`. No fallback to `None`. |
+| L-7 | M3, M2 | M3: `select_fanout`'s loser `CASE` and judge list gain `stopped` (Pg `pg/write.rs` ~5968/5984 and the Mem twins), with a conformance case. M2: decide whether a stopped workspace's queued runs count against `admit`'s `free_slots`. |
+| L-5 | M2 | Raise the minimum binary/schema version before shipping any `stop_workspace` caller. |
+| L-6 | note | `queue_entry.workspace_id` is unindexed; the table is small, so no index now. |

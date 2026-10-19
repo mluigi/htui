@@ -29,6 +29,15 @@
 | F15 | ANA-2 `:673-676` says "`RunStatus::is_active()` stays `Queued \| Running \| AwaitingApproval` as shipped, and it is what `R-TUI-1`'s active-run count reads". That sentence becomes false under D2. | `docs/ANA-2.md:673-676` | **adopted**: T5 amends it too. |
 | F16 | Mem must emulate the two new foreign keys, `ON DELETE SET NULL` on `run`/`queue_entry.workspace_id` and `CASCADE` on `workspace_stop`. Today `State::delete_workspace` (`mem.rs:4874`) clears only links and box paths. | — | **adopted**: T3 extends it, plus one conformance case. |
 
+> **Deviation note on F5 (review round R1, 2026-10-19, finding M-1).** The settlement no longer
+> locks steps before runs. `adopt_runs` locks its candidates `FOR UPDATE SKIP LOCKED`, reads the
+> stop rows `FOR SHARE`, and only then, for the stopped candidates alone, reads their running steps
+> plainly and locks them `FOR NO KEY UPDATE SKIP LOCKED`; a step the first read saw and the second
+> skipped defers its run. Every run/step lock is `SKIP LOCKED` and every `UPDATE` touches only rows
+> already held, so the sweep never waits on a run or step lock and MOD-77's step → run order is
+> irrelevant to it; the only waiting lock (`FOR SHARE` on `workspace_stop`) is now taken holding no
+> step lock. `stop_run` keeps steps first. Amended algorithm: §T3.3, `adopt_runs`.
+
 ---
 
 ## 1. Shared decisions for every task
@@ -632,7 +641,18 @@ the way `release_lease` does.
   `# Errors` / decision paragraph to match T3.1. The overlap list at `:4847` gains `'stopped'`, as
   §4 row 15 (T2).
 
-- **`adopt_runs`** becomes an explicit transaction on READ COMMITTED (`self.pool.begin()`), seven
+- **`adopt_runs`** — **amended by review round R1 (2026-10-19, M-1; see the F5 deviation note):**
+  step 1 below is deleted. The order is step 2 (candidates, `FOR UPDATE SKIP LOCKED`), step 3
+  (stops, `FOR SHARE`), then, only when some candidate's workspace is stopped, (a) step 4's plain
+  read and (b) the lock
+  `SELECT id FROM run_step WHERE run_id = ANY($1::uuid[]) AND status = 'running' ORDER BY run_id, id FOR NO KEY UPDATE SKIP LOCKED`
+  into the held set; a stopped candidate is deferred when (a) has a step (b) lacks, settled
+  otherwise. (a) and (b) are not collapsed into one `SKIP LOCKED` read: that read cannot tell a
+  held step from no step, and would settle a run whose step another transaction holds
+  (`pg_criteria.rs::adopt_runs_defers_a_stopped_run_whose_step_is_held`). Steps 5–7 are unchanged.
+  The original text follows.
+
+  `adopt_runs` becomes an explicit transaction on READ COMMITTED (`self.pool.begin()`), seven
   statements. Each id list is empty-checked in Rust, so the common path with no stopped workspace
   runs only steps 2, 6 and 7.
   1. **Steps first** (F5; MOD-77's step → run order). The running steps of stopped-workspace
