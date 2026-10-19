@@ -64,7 +64,7 @@ impl RunStatus {
         )
     }
 
-    /// R-TUI-18's active-run count (MOD-125 D2): the live runs less `stopped`, so the top bar keeps
+    /// R-TUI-1's active-run count (MOD-125 D2): the live runs less `stopped`, so the top bar keeps
     /// counting "running and waiting". `active_runs` in every store filters by it.
     #[must_use]
     pub const fn on_top_bar(self) -> bool {

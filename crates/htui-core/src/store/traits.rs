@@ -1444,6 +1444,12 @@ pub trait WriteStore: ReadStore {
     /// as [`transition`](WriteStore::transition): `Ok(false)` on a stale `from`, `Constraint` on
     /// an illegal pair without an update, `NotFound` first (plan D14).
     ///
+    /// A production stop goes through [`stop_run`](WriteStore::stop_run) (fenced on
+    /// `lease_owner`, moves the running steps, releases the lease) or the
+    /// [`adopt_runs`](WriteStore::adopt_runs) settlement (MOD-125 D6, D7); a bare
+    /// `running -> stopped` here is a test or seeding move that leaves the lease and the steps
+    /// alone.
+    ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }`;
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a pair outside
@@ -1457,6 +1463,11 @@ pub trait WriteStore: ReadStore {
     ) -> Result<bool>;
 
     /// The `run_step` twin of [`transition_run`](WriteStore::transition_run).
+    ///
+    /// A production stop moves a step through [`stop_run`](WriteStore::stop_run) or the
+    /// [`adopt_runs`](WriteStore::adopt_runs) settlement (MOD-125 D6, D7); a bare
+    /// `running -> stopped` here is a test or seeding move that leaves its run and the run's lease
+    /// alone.
     ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`;
