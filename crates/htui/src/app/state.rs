@@ -26,7 +26,7 @@ use crate::ui::kit::empty::{NextStep, placeholder};
 use crate::ui::kit::pane::{Focus, paint_bottom_hints, paint_bottom_note, paint_focus};
 use crate::ui::overlay::{Overlay, OverlayRegistry, OverlayStack};
 use crate::ui::shell::history::{History, Loc};
-use crate::ui::shell::layout::{self as pane_layout, NoteLabels};
+use crate::ui::shell::layout::{self as pane_layout, NoteLabels, Seam};
 use crate::ui::shell::{PaneAreas, PaneId, Panes, TabLayout};
 use crate::ui::state_file::{UiState, UiStore};
 use crate::ui::tabs::{Tab, TabId, TabRegistry};
@@ -376,6 +376,24 @@ pub struct App {
     pub(super) recording: bool,
     /// MOD-115 M2 §8: set by `history.back`/`forward`, so the move itself is not recorded.
     pub(super) history_move: bool,
+    /// MOD-115 M2 §7: the seam being dragged, from its `Down` to its `Up`.
+    pub(super) drag: Option<SeamDrag>,
+    /// MOD-74 D1, MOD-115 M2 MD8: the tab whose own gesture holds the mouse (its
+    /// [`Tab::wants_mouse`] said yes while capture was on), so a capture that stays on across a
+    /// switch between two list + detail tabs still tells the one that held it.
+    pub(super) mouse_view: Option<TabId>,
+}
+
+/// A seam drag in progress (MOD-115 M2 §7): the tab, the seam and the offset from the cell
+/// grabbed to the line the layout's setter reads (the list's right border, the activity pane's
+/// top or left border), so grabbing either of the seam's two lines never jumps it a cell (T2
+/// carried finding 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SeamDrag {
+    tab: TabId,
+    seam: Seam,
+    dx: i32,
+    dy: i32,
 }
 
 impl App {
@@ -430,6 +448,8 @@ impl App {
             history: History::default(),
             recording: false,
             history_move: false,
+            drag: None,
+            mouse_view: None,
         }
     }
 
@@ -827,6 +847,8 @@ impl App {
         if edit.is_some() && self.mouse {
             self.lose_mouse();
             self.mouse = false;
+            self.mouse_view = None;
+            self.drag = None;
         }
         edit
     }
@@ -952,12 +974,18 @@ impl App {
     ///
     /// MOD-57 M2 E8: off while the in-pane editor is on screen (the pane draws over the view, and
     /// the terminal keeps its own selection over it); on another tab the view decides.
+    ///
+    /// MOD-115 M2 MD8: a tab with a list and a detail wants it too, so a click focuses a pane and
+    /// a seam drag resizes it; a single-pane tab (Chat, Settings) keeps the terminal's selection.
     #[must_use]
     pub fn wants_mouse(&self) -> bool {
         !self.editor_visible()
             && self.overlays.is_empty()
             && !self.help_visible
-            && self.tabs.active().is_some_and(Tab::wants_mouse)
+            && self
+                .tabs
+                .active()
+                .is_some_and(|tab| tab.wants_mouse() || matches!(tab.panes(), Panes::ListDetail(_)))
     }
 
     /// MOD-74 D1: what the event loop hands `TerminalGuard::set_mouse_capture` after every step:
@@ -965,18 +993,28 @@ impl App {
     /// told ([`Tab::on_mouse_lost`]): after a tab switch the tab holding the gesture is no longer
     /// the active one.
     ///
-    /// A "loss" is the on-to-off capture edge. That equals "the gesture holder lost the pointer"
-    /// only because `RunsTab` is the sole view that wants the mouse: a switch between two
-    /// capturing views keeps capture on and fires nothing. A second `wants_mouse` implementor
-    /// must also handle that switch (e.g. by tracking the capture holder), or the review-L3 stale
-    /// anchor returns.
+    /// A "loss" is the on-to-off capture edge, or (below) a change of the gesture holder.
+    ///
+    /// MOD-115 M2 MD8: list + detail tabs want the mouse too, so capture can stay on across a
+    /// tab switch; the gesture holder ([`Tab::wants_mouse`] while capture is on) is tracked, and
+    /// every tab is told when it changes or goes, as on the off edge. A seam drag ends with
+    /// capture.
     #[must_use = "the loop must hand this to TerminalGuard::set_mouse_capture"]
     pub fn mouse_capture(&mut self) -> bool {
         let wants = self.wants_mouse();
-        if self.mouse && !wants {
+        let holder = self
+            .tabs
+            .active()
+            .filter(|tab| wants && tab.wants_mouse())
+            .map(Tab::id);
+        if (self.mouse && !wants) || (self.mouse_view.is_some() && self.mouse_view != holder) {
             self.lose_mouse();
         }
+        if !wants {
+            self.drag = None;
+        }
         self.mouse = wants;
+        self.mouse_view = holder;
         wants
     }
 
@@ -1014,6 +1052,16 @@ impl App {
         let Some(id) = self.tabs.active_id() else {
             return;
         };
+        // MOD-115 M2 §7: the shell's own gestures first: a seam drag, a click that focuses a
+        // pane (still handed on, the Runs flow takes clicks).
+        if self.shell_mouse(id, mouse) {
+            self.dirty = true;
+            return;
+        }
+        // Only a tab whose own gesture wants the mouse is handed it (MOD-71 D4).
+        if !self.tabs.active().is_some_and(Tab::wants_mouse) {
+            return;
+        }
         let origin = Origin::Tab(id);
         let status = self.status.take();
         let handled = {
@@ -1041,6 +1089,64 @@ impl App {
             self.dirty = true;
         } else if self.status.is_none() {
             self.status = status;
+        }
+    }
+
+    /// The shell's mouse (MOD-115 M2 §7), over the panes the active tab `id` claimed last frame:
+    /// a left press on a seam starts a drag (consumed), one in a pane focuses it (passed on); a
+    /// drag moves the seam; the release ends it and saves the layout. `true` when consumed.
+    fn shell_mouse(&mut self, id: TabId, mouse: MouseEvent) -> bool {
+        use crossterm::event::MouseButton;
+
+        let (x, y) = (mouse.column, mouse.row);
+        let claim = self.last_claim.filter(|(claimed, _, _)| *claimed == id);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some((_, _, areas)) = claim else {
+                    return false;
+                };
+                if let Some(seam) = pane_layout::seam(&areas, x, y) {
+                    let (dx, dy) = seam_offset(&areas, seam, x, y);
+                    self.drag = Some(SeamDrag {
+                        tab: id,
+                        seam,
+                        dx,
+                        dy,
+                    });
+                    return true;
+                }
+                if let Some(pane) = pane_layout::hit(&areas, x, y) {
+                    self.focus.insert(id, pane);
+                    self.dirty = true;
+                }
+                false
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(drag) = self.drag.filter(|drag| drag.tab == id) else {
+                    return false;
+                };
+                let (Some((_, region, _)), Some(tab)) = (claim, self.tabs.active()) else {
+                    return true;
+                };
+                let Some(mut layout) = self.layout_of(tab) else {
+                    return true;
+                };
+                let (x, y) = (shifted(x, drag.dx), shifted(y, drag.dy));
+                match drag.seam {
+                    Seam::List => layout.set_list_at(region, x),
+                    Seam::Activity => layout.set_activity_at(region, x, y),
+                }
+                self.ui.layouts.insert(id.0.to_owned(), layout);
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.drag.take().is_some() {
+                    self.save_ui_state();
+                    return true;
+                }
+                false
+            }
+            _ => false,
         }
     }
 
@@ -1467,6 +1573,30 @@ const ACTIVITY_TITLE: &str = "Activity";
 const ACTIVITY_WHAT: &str = "Activity appears here once the activity panel lands";
 const ACTIVITY_NEXT: &str = "hides this pane";
 const ACTIVITY_NEXT_UNBOUND: &str = "a layout without it hides this pane";
+
+/// The offset from the grabbed cell `(x, y)` on `seam` to the line the layout's setter reads:
+/// the list's right border, the activity pane's left border (columns) or top border (stacked).
+/// Grabbing the other line of the seam is one cell off it (T2 carried finding 1).
+fn seam_offset(areas: &PaneAreas, seam: Seam, x: u16, y: u16) -> (i32, i32) {
+    let delta = |anchor: u16, at: u16| i32::from(anchor) - i32::from(at);
+    match seam {
+        Seam::List => areas
+            .list
+            .map_or((0, 0), |list| (delta(list.right().saturating_sub(1), x), 0)),
+        Seam::Activity => match areas.activity {
+            Some(activity) if activity.y == areas.detail.y || areas.detail.is_empty() => {
+                (delta(activity.x, x), 0)
+            }
+            Some(activity) => (0, delta(activity.y, y)),
+            None => (0, 0),
+        },
+    }
+}
+
+/// `at` moved by `by` cells, clamped to the terminal's range.
+fn shifted(at: u16, by: i32) -> u16 {
+    u16::try_from((i32::from(at) + by).max(0)).unwrap_or(u16::MAX)
+}
 
 /// The rect `pane` is drawn in, if it has a cell (a zoomed-away detail is 0x0).
 fn focused_rect(areas: &PaneAreas, pane: PaneId) -> Option<Rect> {
@@ -2425,6 +2555,187 @@ pub(crate) mod shell_tests {
         app.keys = crate::keys::load_str("version = 2\n[history]\nforward = []\n")
             .expect("the file loads");
         assert!(!header(&mut app).contains("forward"));
+    }
+
+    fn mouse(app: &mut App, kind: crossterm::event::MouseEventKind, column: u16, row: u16) {
+        app.on_mouse(crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    fn down(app: &mut App, x: u16, y: u16) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        mouse(app, MouseEventKind::Down(MouseButton::Left), x, y);
+    }
+
+    fn drag_to(app: &mut App, x: u16, y: u16) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        mouse(app, MouseEventKind::Drag(MouseButton::Left), x, y);
+    }
+
+    fn up(app: &mut App, x: u16, y: u16) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        mouse(app, MouseEventKind::Up(MouseButton::Left), x, y);
+    }
+
+    /// MD8: a list + detail tab turns mouse capture on; a single-pane one (Chat) keeps the
+    /// terminal's own selection.
+    #[test]
+    fn capture_is_on_for_a_list_and_detail_tab_only() {
+        let mut app = split_app();
+        assert!(app.wants_mouse());
+        assert!(app.mouse_capture());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut chat = App::new(tx);
+        chat.register_tab(Box::new(crate::ui::tabs::ChatTab::new()));
+        assert!(!chat.wants_mouse());
+        assert!(!chat.mouse_capture());
+    }
+
+    /// §7: a click in a pane focuses it.
+    #[test]
+    fn a_click_focuses_the_pane_under_it() {
+        let mut app = split_app();
+        let _ = draw(&mut app, 100, 30);
+        let (_, areas) = claim(&app);
+        down(&mut app, areas.detail.x + 5, areas.detail.y + 3);
+        assert_eq!(focused(&app), PaneId::Detail);
+        up(&mut app, areas.detail.x + 5, areas.detail.y + 3);
+        let list = areas.list.expect("shown");
+        down(&mut app, list.x + 3, list.y + 3);
+        assert_eq!(focused(&app), PaneId::List);
+    }
+
+    /// §7, T2 carried finding 1: dragging the list seam moves it with the pointer, from either of
+    /// its two lines, without a one-cell jump at the grab; the release saves the layout.
+    #[test]
+    fn a_seam_drag_follows_the_pointer_from_either_line_and_saves_on_release() {
+        use crate::ui::state_file::UiStore;
+
+        for far_line in [false, true] {
+            let store = UiStore::memory();
+            let mut app = split_app();
+            app.ui_store = store.clone();
+            let _ = draw(&mut app, 100, 30);
+            let (region, areas) = claim(&app);
+            let list = areas.list.expect("shown");
+            let grab = if far_line {
+                areas.detail.x
+            } else {
+                list.right() - 1
+            };
+            let y = list.y + 4;
+            down(&mut app, grab, y);
+            drag_to(&mut app, grab, y);
+            let _ = draw(&mut app, 100, 30);
+            let (_, still) = claim(&app);
+            assert_eq!(still.list, areas.list, "{far_line}: the grab moves nothing");
+            drag_to(&mut app, grab + 10, y);
+            let _ = draw(&mut app, 100, 30);
+            let (_, moved) = claim(&app);
+            assert_eq!(
+                moved.list.map(|list| list.width),
+                Some(list.width + 10),
+                "{far_line}: the seam follows the pointer"
+            );
+            assert_eq!(
+                store.load().state.layouts.get(SPLIT.0),
+                None,
+                "not saved yet"
+            );
+            up(&mut app, grab + 10, y);
+            let saved = store.load().state.layouts.get(SPLIT.0).copied();
+            assert_eq!(saved, Some(layout(&app)), "{far_line}: saved on release");
+            assert_eq!(focused(&app), PaneId::List, "a seam grab focuses nothing");
+            assert_eq!(region.width, 100);
+        }
+    }
+
+    /// §7, T2 carried finding 1: the activity seam, stacked, grabbed on the line above it.
+    #[test]
+    fn an_activity_seam_grabbed_on_either_line_does_not_jump() {
+        let mut app = split_app();
+        app.ui.layouts.insert(
+            SPLIT.0.to_owned(),
+            TabLayout {
+                preset: Preset::IdeActivity,
+                ..SPLIT_LAYOUT
+            },
+        );
+        let _ = draw(&mut app, 100, 30);
+        let (_, areas) = claim(&app);
+        let activity = areas.activity.expect("shown");
+        for grab in [activity.y, activity.y - 1] {
+            down(&mut app, activity.x + 30, grab);
+            drag_to(&mut app, activity.x + 30, grab);
+            let _ = draw(&mut app, 100, 30);
+            let (_, after) = claim(&app);
+            assert_eq!(
+                after.activity,
+                Some(activity),
+                "{grab}: the grab moves nothing"
+            );
+            up(&mut app, activity.x + 30, grab);
+        }
+        down(&mut app, activity.x + 30, activity.y);
+        drag_to(&mut app, activity.x + 30, activity.y - 3);
+        up(&mut app, activity.x + 30, activity.y - 3);
+        assert!(layout(&app).activity_pct > 30, "{:?}", layout(&app));
+    }
+
+    /// A list + detail tab whose own gesture wants the mouse (as the Runs flow does), counting
+    /// the losses it is told of.
+    struct Gesture(std::rc::Rc<std::cell::Cell<usize>>);
+
+    impl Tab for Gesture {
+        fn id(&self) -> TabId {
+            TabId("gesture")
+        }
+        fn title(&self) -> &str {
+            "Gesture"
+        }
+        fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+            Vec::new()
+        }
+        fn on_scope_change(&mut self, _scope: &Scope) {}
+        fn on_key(&mut self, _key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            Handled::Pass
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+        fn panes(&self) -> Panes {
+            Panes::ListDetail(SPLIT_LAYOUT)
+        }
+        fn wants_mouse(&self) -> bool {
+            true
+        }
+        fn on_mouse_lost(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    /// MOD-74 L1 with MD8: capture stays on between two list + detail tabs, so the shell tracks
+    /// the gesture holder and tells the tabs when it leaves, as on the off edge.
+    #[test]
+    fn a_switch_between_two_capturing_tabs_tells_the_gesture_holder() {
+        let lost = std::rc::Rc::new(std::cell::Cell::new(0));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.register_tab(Box::new(Gesture(lost.clone())));
+        app.register_tab(Box::new(SplitTab::new(SPLIT, "Backlog")));
+        assert!(app.mouse_capture());
+        assert_eq!(lost.get(), 0);
+        press(&mut app, KeyCode::PageDown, KeyModifiers::CONTROL);
+        assert!(
+            app.mouse_capture(),
+            "capture stays on: the list + detail tab wants it"
+        );
+        assert_eq!(lost.get(), 1, "the holder was told");
+        assert!(app.mouse_capture());
+        assert_eq!(lost.get(), 1, "once");
     }
 
     /// A single-pane tab claims nothing: no claim is kept, and the frame is the M1 one.
