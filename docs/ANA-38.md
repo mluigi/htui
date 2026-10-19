@@ -8,32 +8,48 @@
 > `.claude/rules/workflow-docs.md`, `CONCEPTS.md`, `docs/REQUIREMENTS.md` and
 > `docs/requirements-review-2026-10-15.md` (the item's origin). Best read beside ANA-34 (the coordinator
 > that reads memory), ANA-35 (owner documents, a candidate home) and ANA-37 (is Qdrant required), which is
-> not on this branch. This is a draft: nothing here is a decision until the maintainer answers section 8.
+> not on this branch. This is draft v2: the maintainer answered section 8 on 2026-10-19 and changed the
+> direction (fully automatic memory, a `lesson` kind, a global scope). The answers are recorded in
+> section 8, with the residual questions at its end; nothing else here is a decision until they are answered.
 >
 > **Requirements addressed:** `R-ENT-13` (reopened, pending ANA-38), `R-ID-6`, `R-STO-8`, `R-PRM-1`,
 > `R-PRM-3`. Touched at their seams: `R-ORCH-14` (coordinator seed), `R-ENT-12` (owner documents),
 > `R-ENT-15` (version-stamped citations, the freshness precedent), `R-MCP-1`/`R-MCP-2` (agent writes),
 > `R-TUI-9` (close-out), `R-ID-3`/`R-ID-4`/`R-ID-5` (Postgres is the store, no files in repos, htui
 > inlines prompts), `R-ID-7` (scrub before persist), `R-STO-3` (offline cache mirror), `R-NF-2` (Qdrant
-> fails open).
+> fails open), `R-ORCH-1` (the configurable light model that would write entries).
 >
-> **Status (2026-10-19): draft, awaiting the maintainer's answers to section 8.** No implementation code
-> is written here and no requirement text is edited. Recommended verdict (section 7), in short: bring
-> memory back as **a small, person-accepted store of verbatim entries, not as ANA-1's atomic facts**. An
-> entry has a subject, prose, an owner scope (project, later workspace), a state (`draft`, `accepted`,
-> `suspect`, `superseded`) and a freshness stamp. **Writers are a person, or an agent that only proposes
-> a draft a person accepts**; nothing, no prompt, no index, no coordinator seed, reads an unaccepted
-> entry, and no model ever extracts entries inside close-out. **Freshness is computed by code, never a
-> model**: a version stamp on whatever the entry cites (the `makes_suspect` / `reconfirm` pattern that
-> exists today), plus, for git projects only, an optional commit-and-path pin checked by a sweep that
-> stores a suspect flag. **Prompt reach is Postgres-only**: a new internal prompt section filled in
-> `phase_spec`, accepted and non-suspect entries only, a hard token cap, a snapshot at run start, trimmed
-> early. **Qdrant is an add-on**: agent-pull search and display-only "possible duplicate" hints, one more
-> point type delivered with ANA-35's planned collection rebuild; it never decides what enters a prompt or
-> whether an entry is fresh. The design is built to work with Qdrant absent, so ANA-38 gives ANA-37
+> **Status (2026-10-19: draft v2, maintainer answered section 8; residual questions in section 8).** No
+> implementation code is written here and no requirement text is edited. The maintainer answered the ten
+> questions of section 8 "all as recommended" and then amended them with three further decisions that
+> override parts of questions 1, 2 and 9 and adjust 4, 6 and 8. Recommended verdict (section 7), in short:
+> bring memory back as **a small, fully automatic store of verbatim entries, written by a model through a
+> validated deterministic pipeline, with no person-acceptance gate**, not as ANA-1's atomic facts. An entry
+> has a subject, prose, a kind (`fact`, `decision`, `gotcha`, and the new `lesson`: recurring errors,
+> optimizations already done, things that improve usage over time), an owner scope (project, workspace, and
+> a new **global** scope for lessons and gotchas that apply in any project), a state (`active`, `suspect`,
+> `superseded`, `retired`; there is no draft state) and a freshness stamp. **The writer is a model** (the
+> configurable light model of `R-ORCH-1`, which spends the user's plan) at run end, fed also by a
+> deterministic lesson detector; **entries become active without approval**. This amends `R-ID-6`, a
+> "must": memory writes become an explicit exception to "no LLM in bookkeeping", listed as an owed,
+> maintainer-gated edit. The earlier recommendation, "a model only drafts, a person accepts, MOD-135 draft
+> store", is superseded and kept in section 4 as Option E, the predecessor of Option E-prime.
+> **Safeguards replace the gate and are automatic, not approval gates**: a deterministic write path around
+> the model (schema validation, per-run write cap, scrub before persist, platform-stamped provenance,
+> evidence that cites something observed in the run), dedup and supersede at write time, computed freshness
+> with an automatic re-validation turn and auto-retire, deterministic usage counters, a gated automatic
+> promotion to global scope, and human visibility (list, edit, retire, pin-as-trusted, "why is this here",
+> per-level off switches) without gating. **Freshness is computed by code, never a model**: a version stamp
+> on whatever the entry cites (the `makes_suspect` / `reconfirm` pattern that exists today), plus, for git
+> projects only, an optional commit-and-path pin checked by a sweep that stores a suspect flag. **Prompt
+> reach is Postgres-only**: a new internal prompt section filled in `phase_spec`, active non-suspect
+> entries only, a hard token cap, a snapshot at run start, trimmed early. **Qdrant is an add-on** that
+> improves dedup recall and agent-pull search; memory works with Qdrant absent, so ANA-38 gives ANA-37
 > something to measure without depending on its answer. **Not** brought back: importance scores 1-10, the
-> fact-to-fact link graph, recursive-CTE injection. Phasing P1..Pn is in section 7; the P's are proposed
-> and not yet filed.
+> fact-to-fact link graph, recursive-CTE injection. The costs that remain are named plainly in section 6:
+> unreviewed standing instructions, memory poisoning with no human gate, a model call on every run, global
+> leakage, runaway growth and self-reinforcing wrong lessons. Phasing P1..P7 is in section 7; the P's are
+> proposed and not yet filed, and no IDs are minted.
 
 ---
 
@@ -97,6 +113,12 @@ ANA-36, ANA-37, ANA-19/20, ANA-3 and the MOD-34/50/68 write-ups were skimmed or 
 (no Qdrant live test, no build, no measurement on htui data); several benefit numbers are vendor-reported
 or abstract-only.
 
+**Revision (v2, 2026-10-19).** The maintainer answered section 8 and moved the design from "a model drafts,
+a person accepts" to complete automation. The evidence in sections 2 and 3 and the options of section 4 are
+kept as written for draft v1; the person-accepts hybrid stays as Option E and the recommendation is the new
+Option E-prime. Where a passage still describes the person gate, the answers in section 8 and the text of
+sections 4.6, 6 and 7 govern. New statements about the repo made in this revision are labelled unverified.
+
 ## 2. Surface as read
 
 Line numbers marked `~` in the sweep were approximate and are given here by section or file only.
@@ -112,7 +134,8 @@ Line numbers marked `~` in the sweep were approximate and are given here by sect
   link, import, cache refresh or prompt ever reads the unaccepted model text"; drafts "are written only
   once a person accepts them". Choosing which work to do next is item work, not bookkeeping
   (`docs/REQUIREMENTS.md:121-131`; `docs/requirements-review-2026-10-15.md:31-33`). A prompt is on the
-  forbidden-reader list.
+  forbidden-reader list. The maintainer's decision of 2026-10-19 makes memory writes an explicit exception
+  to the first sentence; the amendment is owed and maintainer-gated (section 7.3).
 - `R-PRM-1` lists the prompt's inputs (phase template, item body, input documents, upstream summaries
   within one to two hops and inside the active workspace or project, box profile, bound skills, selected
   file excerpts) and says "Never raw transcripts of other items"; more context is pulled through MCP
@@ -199,7 +222,8 @@ Line numbers marked `~` in the sweep were approximate and are given here by sect
   `docs/ANA-35.md:684-695, 731-739, 957-961`; `docs/decisions/ana/ana-35.md`, Q12-Q14, Q16). Not built:
   MOD-146/147, open. A project may sit in several workspaces today (`workspace_project` PK is
   `(workspace_id, project_id)`), so workspace memory reaching a project step has no single owner until that
-  scope row exists.
+  scope row exists. A global scope (v2) would be a third row of the same pattern; ANA-35 does not design
+  one (checked only against the cited section).
 
 ### 2.4 The Qdrant seam
 
@@ -250,11 +274,15 @@ Line numbers marked `~` in the sweep were approximate and are given here by sect
   that write into it (`docs/ANA-34.md:528-541, 662-670`; `HANDOFF.md:418-436`). No `draft` string appears in
   any migration. The only agent-proposes-person-accepts code today is in-memory editor-panel drafts
   (`crates/htui/src/agent_settings.rs:317, 405`). Requirement writes are the person-gated precedent
-  (`proposed_by_step_id` NULL marks a human).
+  (`proposed_by_step_id` NULL marks a human). Under the 2026-10-19 decision memory has no draft state and no
+  longer needs this mechanism; MOD-135 stays relevant to `item_create` and coordinator proposals only.
 - Agent step outputs (documents) already flow into later prompts without acceptance, as item work under
   `R-ID-6`. Close-out is a pure formatter and "a model never goes inside close-out" (MOD-98, ANA-2
   invariant 3; `HANDOFF.md:593-604`). The close-out checklist (ANA-34 section 7.6, MOD-135) is the natural
   accept touchpoint for a "memory candidates" row; it does not exist yet (`docs/ANA-34.md:604-616`).
+  Under v2 memory does not use that touchpoint: an extraction turn at run end writes entries, and the rule
+  "a model never goes inside close-out" is kept by running it as a step before close-out, not inside the
+  formatter (unverified how the engine would schedule such a step).
 
 ### 2.6 Where memory-like content lives in this repo's workflow today
 
@@ -332,7 +360,11 @@ it, Windsurf limits it to the legacy agent, Devin Knowledge is deprecated), whic
 over-engineering risk ANA-1 was dropped for; (c) injection comes in three styles, an eager small index
 (Claude, Copilot), lazy retrieval by trigger (Windsurf, Devin), and names-only plus deliberate read
 (Serena); the cautionary cases are Cline's read-everything and Claude's silent truncation past 200 lines;
-(d) local memory does not travel across machines or sandboxes, while htui's Postgres store does.
+(d) local memory does not travel across machines or sandboxes, while htui's Postgres store does;
+(e) maintainer decision, 2026-10-19: htui takes the unreviewed-but-guarded route that Windsurf, Codex
+memories and Claude auto memory took, not the person-gated one. The accumulation of low-quality entries
+seen in (a) is therefore the failure to design against (section 6), and the automatic safeguards of Option
+E-prime stand where the vendors' gate stood.
 
 ### 3.2 Memory systems and frameworks
 
@@ -405,7 +437,9 @@ over-engineering risk ANA-1 was dropped for; (c) injection comes in three styles
   (https://arxiv.org/pdf/2607.29167). Recurring mitigations: write-time admission (including human
   approval), platform-kept provenance outside the model, retrieval-time filtering, TTL by source
   (secondary sources: https://www.emergentmind.com/topics/persistent-memory-poisoning). No source
-  documents a human-accept flow end to end, so the accept gate here is a design choice, not a precedent.
+  documents a human-accept flow end to end, and none documents a fully automatic design with the safeguards
+  chosen here, so both the v1 accept gate and the v2 automatic safeguards are design choices, not
+  precedents.
 - **Qdrant and pgvector.** One collection with a keyword payload field and `is_tenant:true`, never a
   collection per scope (https://qdrant.tech/documentation/guides/multiple-partitions/); payload filters
   can carry status, commit SHA, validity windows (https://qdrant.tech/documentation/concepts/filtering/);
@@ -422,8 +456,12 @@ compared against ANA-37 (does it need Qdrant required) and cost.
 
 One classification decides S1 and S3 before any option can be judged: **is a memory entry item work or
 bookkeeping?** Step documents flow into later prompts unaccepted because they belong to one item; a memory
-entry outlives it and fires in every later run. The recommendation (question 1) is to treat entry creation
-as bookkeeping, so a model-authored entry reaches a prompt only after a person accepts it.
+entry outlives it and fires in every later run. Draft v1 recommended
+treating entry creation as bookkeeping, so a model-authored entry reaches a prompt only after a person
+accepts it. The maintainer's answer (2026-10-19) overrides that: entry creation stays outside the
+deterministic bookkeeping rule as an explicit, owed exception to `R-ID-6`, and a model writes entries that
+become active without approval. Option E keeps the v1 recommendation as the alternative; Option E-prime is
+the v2 recommendation.
 
 ### 4.1 Option A - Summaries only, no new entity (status quo of the withdrawal)
 
@@ -480,10 +518,11 @@ extracting facts.
   Qdrant's apparent value only by adding a dedup workload nobody measured. Listed for completeness; not
   recommended.
 
-### 4.5 Option E - Hybrid (recommended)
+### 4.5 Option E - Hybrid with a person gate (the v1 recommendation, now the alternative)
 
 Verbatim entries in three lanes, deterministic freshness, Postgres-only prompt selection, Qdrant as an
-add-on.
+add-on. Superseded as the recommendation by Option E-prime (4.6) but kept whole, because it is the
+fallback if P7 shows that the automatic path does harm.
 
 - **Entry:** subject, prose body, owner scope (project; workspace after the scope row exists), state
   (`draft`, `accepted`, `suspect`, `superseded`, `withdrawn`), optional citations, optional pin, provenance
@@ -523,20 +562,111 @@ add-on.
 - Cost: moderate and phased. P1 needs no draft store, no workspace row and no git read. ANA-37: works
   Postgres-only and hands ANA-37 a measurable (paraphrase recall and duplicate-hint quality on real
   entries) without presuming its answer.
+- **Trade-off against E-prime:** the safest poisoning posture (no unaccepted text is ever read) and a
+  clean `R-ID-6`, bought with a person's review time. Its weaknesses are the ones the maintainer rejected:
+  approval fatigue and accumulation of unreviewed drafts (Cursor, Augment before Memory Review), a rubber
+  stamp gate whose value depends on a review volume nobody estimated, and a hard dependency on MOD-135,
+  a filed item with no schema. It also never captures a lesson nobody thinks to propose, which is the
+  case the new `lesson` kind exists for.
 
-### 4.6 Comparison against the settle-points, R-ID-6, ANA-37 and cost
+### 4.6 Option E-prime - Automated hybrid (recommended, v2)
 
-| | A summaries only | B person-written | C agent-proposed, accepted | D atomic facts + importance | E hybrid |
-|---|---|---|---|---|---|
-| S1 who writes | close-out table; opt-in model phase (MOD-98) | a person | agent proposes, person accepts | agents (implicit) | person, promoted note, accepted agent draft |
-| S2 freshness | none | person confirm; version pin | needs a field | `commit_hash` flag only | version stamp + optional commit/path pin by sweep; person re-confirm |
-| S3 R-ID-6 | clean | clean | clean once draft store exists | violated unless gated | clean; one-sentence ruling needed (Q1) |
-| S4 Qdrant / R-STO-8 | document points already | via owner-document points | accepted-only point type | dedup hardest to justify | add-on point type; hints; Postgres baseline |
-| S5 model and prompt | edge-driven, 2 hops | skill or new section | new section + draft store | 2 tables + CTE | owner doc or small table + internal section |
-| Meets the need | no (unlinked gotchas lost) | partly (depends on discipline) | yes | yes, over-built | yes, smallest slice first |
-| Needs Qdrant required (ANA-37) | no | no | no | pushes toward it | no; Qdrant optional |
-| Cost | nil | lowest | moderate, blocked on MOD-135 | highest | moderate, phased |
-| Withdrawal risk | none | low | low | repeats ANA-1 | low if scores and links stay dropped |
+Option E's entry model, freshness and prompt reach, with the person gate replaced by a model writer and a
+deterministic pipeline of automatic safeguards. Decided by the maintainer on 2026-10-19; the safeguards are
+not approval gates and nothing waits for a person.
+
+- **Entry:** subject, prose body, **kind** (`fact`, `decision`, `gotcha`, `lesson`), owner scope (project,
+  workspace, **global**), state (`active`, `suspect`, `superseded`, `retired`; no draft state), evidence
+  (citations of what was observed: path, error text, step), optional pin, a pinned-as-trusted flag set by a
+  person, deterministic usage counters, and provenance stamped by code (run, agent, item, commit; for a
+  global entry also the agent, tool or CLI version it was learned on). No importance score and no
+  fact-link graph. One deterministic `supersedes` pointer keyed on (scope, subject), now set
+  automatically at write time.
+- **The `lesson` kind:** recurring errors, optimizations already done, things that improve usage over time.
+  A lesson is not tied to a workflow or an item and is owned by a project or a workspace (or, after
+  promotion, global); the run it came from is provenance only, never an owner.
+- **Global scope:** a third owner above workspace, holding lessons "that can be generalized, and gotchas
+  that can happen in any other project/workspace": tooling and general practice, not project facts. It is
+  a third hidden scope row, the same pattern as the workspace scope row of ANA-35 (`docs/ANA-35.md:937-947`),
+  and depends on the MOD-147 work. Whether the row pattern carries over unchanged to a row with no
+  workspace, project or repo is not verified.
+- **Home:** start as an ANA-35 owner document with a conventional kind (question 3, accepted as
+  recommended), and move to a dedicated table only if forced. Honest risk, larger than in Option E: state,
+  pin, trusted flag, usage counters, kind and a three-level scope do not obviously fit document columns, so
+  P1 should settle table or document before anything is built (inference, not checked against the
+  ANA-35 document shape).
+- **Capture points (writer = a model):** (1) **run end**: an extraction turn by the configurable light
+  model (`R-ORCH-1`; it spends the user's plan) over the run's own evidence, meaning errors seen, retries,
+  fixes and measured wins; (2) a **deterministic detector** over run records for repeated error
+  signatures, retries, timeouts and outlier cost, which triggers or feeds that extraction. The first task
+  of the detector's phase is to verify what error and retry detail run records store today; that is **not
+  yet verified**. A person may also write an entry directly (manual write), and a note can be promoted.
+- **Write path (deterministic code around the model):** schema-validated output; a per-run write cap;
+  scrub (`R-ID-7`) before persist, failing closed; provenance stamped by the platform, which the model
+  cannot set; the evidence must cite something observed in the run (a path, an error text, a step), and an
+  entry without it is rejected. Each control answers a recorded risk: the provenance-laundering and
+  standing-instruction findings (section 3.3) argue for platform-kept provenance and write-time admission,
+  and the self-built-memory results (eleven of twelve pairings failing to beat memory-off) argue for
+  admitting less rather than more.
+- **Dedup and supersede at write time, automatic:** the same (scope, subject) key, or high similarity,
+  replaces (supersedes) the older entry instead of appending. The Postgres-only fallback is the subject
+  key plus full-text. Qdrant, when present, improves recall through a **raw-cosine** query (the existing
+  RRF score cannot be thresholded; the 0.98 and 0.82 reference thresholds in the literature are for other
+  embedders and do not transfer). This makes ANA-37's measurement more valuable, and memory still works
+  with Qdrant absent. The literature points the same way: replacing beats appending, and a deterministic
+  newest-wins recipe beat LLM contradiction decisions (section 3.2).
+- **Freshness (S2), computed by code:** version stamp on cited rows, optional commit-and-path pin for git
+  projects, checked by a sweep that stores a suspect flag. A suspect entry is **held back from prompts**,
+  and an automatic **re-validation turn** (triggered by the sweep, reading the cited paths) either
+  re-confirms (new stamp), amends (a new superseding version) or retires it. Unresolved suspect entries
+  auto-retire after a configurable period. A global lesson is stamped with the agent, tool or CLI version
+  it was learned on and goes suspect when that version changes, since no repo pin applies. The model never
+  decides that an entry is stale; code does, and the model only re-reads what code flagged.
+- **Prompt reach (S5), unchanged in shape:** a new internal section filled by a Postgres query in
+  `phase_spec`; active non-suspect entries by owner scope, deterministic order and tiebreak, a hard token
+  cap, one run-start snapshot, ranked after Excerpts and before Upstream, ids and versions recorded in
+  `trim_record`, entries rendered as quoted data labelled with source and trust. New: deterministic usage
+  counters (injected into N steps; of those, how many ended done versus failed) used to rank demotion and
+  retirement, with no model. The global section has its own small cap and ranks below project and
+  workspace.
+- **Global promotion, automatic through a deterministic gate:** a generalization check (a model decides
+  "applies beyond this project") followed by a deterministic validator that rejects any text containing
+  project or workspace-specific tokens (repo, project and workspace names and keys, absolute paths,
+  hostnames, secret patterns, URLs of private forges) and re-runs scrub. Failing either keeps the entry at
+  its original scope. An agent may not target global directly; promotion is a separate pipeline step.
+  `R-PRM-1`'s "reads stay inside the active workspace" needs one clause for global tooling lessons.
+- **Human visibility without gating:** a TUI list of recent automatic entries with edit, retire,
+  pin-as-trusted and a "why is this here" view (provenance, evidence, injected-in runs); a settings switch
+  that turns automatic capture and global promotion off per cascade level (Settings, workspace, project),
+  default on, per the maintainer.
+- **Qdrant (S4):** one more point type for entries in the single collection, built like the requirement
+  path and delivered with ANA-35's planned collection rebuild; `search_concepts` types extended; raw-cosine
+  dedup as above. Qdrant never decides what enters a prompt or whether an entry is fresh.
+- **Coordinator:** a coordinator turn's seed reads active entries from rows without the `R-PRM-3` ladder;
+  MOD-136 is needed only for that seed, not for memory itself.
+- **Accepted risks, stated plainly:** cross-project leakage of anything the validator misses; a larger
+  poisoning blast radius (one bad global entry reaches every project); unreviewed standing instructions;
+  a model call on every run. Section 6 lists each with its mitigation.
+- Cost: moderate-to-high and phased. P1 and P2 are the committed slice. New recurring cost is model tokens
+  on every run plus re-validation and generalization turns; per-run size is not measured (section 9.2). It
+  needs no draft store (MOD-135 no longer blocks memory), but needs MOD-147 for workspace and global scope.
+  ANA-37: works Postgres-only and hands ANA-37 a measurable (raw-cosine dedup recall against the
+  subject-key plus full-text fallback) without presuming its answer.
+
+### 4.7 Comparison against the settle-points, R-ID-6, ANA-37 and cost
+
+| | A summaries only | B person-written | C agent-proposed, accepted | D atomic facts + importance | E hybrid, person gate (v1) | E-prime automated hybrid (v2, recommended) |
+|---|---|---|---|---|---|---|
+| S1 who writes | close-out table; opt-in model phase (MOD-98) | a person | agent proposes, person accepts | agents (implicit) | person, promoted note, accepted agent draft | a model (light model) through a validated pipeline; a person may also write |
+| S2 freshness | none | person confirm; version pin | needs a field | `commit_hash` flag only | version stamp + optional pin by sweep; person re-confirm | same computed freshness; automatic re-validation turn; auto-retire; global lessons tied to tool version |
+| S3 R-ID-6 | clean | clean | clean once draft store exists | violated unless gated | clean; one-sentence ruling needed | explicit amended exception (owed edit) |
+| S4 Qdrant / R-STO-8 | document points already | via owner-document points | accepted-only point type | dedup hardest to justify | add-on point type; hints; Postgres baseline | add-on point type; raw-cosine dedup; Postgres fallback (subject key + full-text) |
+| S5 model and prompt | edge-driven, 2 hops | skill or new section | new section + draft store | 2 tables + CTE | owner doc or small table + internal section | owner doc or table + internal section; usage counters; global section with own cap |
+| Meets the need | no (unlinked gotchas lost) | partly (depends on discipline) | yes | yes, over-built | yes, smallest slice first | yes; also captures lessons nobody proposes |
+| Poisoning exposure | none | none | gated by a person | high | gated by a person | no human gate; contained by write-path safeguards, global gate, visibility |
+| Needs Qdrant required (ANA-37) | no | no | no | pushes toward it | no; Qdrant optional | no; Qdrant improves recall only |
+| Cost | nil | lowest | moderate, blocked on MOD-135 | highest | moderate, phased | moderate-to-high: model tokens on every run; MOD-147 for workspace and global |
+| Withdrawal risk | none | low | low | repeats ANA-1 | low if scores and links stay dropped | medium: more machinery than E; scores and links stay dropped |
 
 ## 5. Evaluation
 
@@ -555,19 +685,29 @@ Reading the table with the critic's caveats:
 - **D is dominated.** The evidence (verbatim beats extracted facts; replacing beats appending; LLM
   contradiction decisions perform worst) and the project's own precedent (ANA-11 invariant 5) point away
   from it.
-- **E is B then C then freshness automation**, in the order the dependencies allow. The reason it is
-  recommended is that each phase is independently testable and phase 1 depends on nothing unbuilt.
+- **E was B then C then freshness automation**, in the order the dependencies allowed. It is no longer
+  the recommendation, but it is the fallback if the automatic path proves harmful.
+- **E-prime is E with the gate replaced by safeguards**, and the evidence cuts both ways. For it: C's
+  approval burden and the silent failure of person-only lanes (ANA-29), and the vendors that shipped
+  unreviewed memory (Windsurf, Codex, Claude). Against it: the self-built-memory results (most pairings
+  fail to beat memory-off; stale or wrong memory reported worse than none) and the poisoning literature,
+  which treats a saved entry as a standing instruction. So E-prime is the recommendation because the
+  maintainer chose it, with its weakest points named: nothing outside the safeguards stops a wrong entry,
+  and the safeguards are untested on htui data. Each phase stays independently testable, P1 and P2 depend
+  on nothing unbuilt except the table-or-document choice, and P7 exists to catch harm.
 - **Benefit evidence is thin and mixed.** Vendor-reported Copilot gains; independent coding-agent
   benchmarks show verified experience helping by a few points while self-built memory mostly does not;
   stale memory is reported worse than none. This argues for verified-only injection and a small design,
-  and for measuring on htui's own data before making anything "must" beyond phase 1. No evaluation plan
-  exists yet (question 8 proposes one).
+  and for measuring on htui's own data before making anything "must" beyond P1 and P2. The evaluation plan
+  is P7 (question 8, as adjusted). Automatic capture raises the stakes of that plan: harm from wrong
+  entries is the measure that decides whether the gate-free design stays.
 
 ## 6. Risks
 
 **Staleness.** The dominant risk and the reason freshness is a settle-point.
 - A suspect entry that still reaches a prompt is worse than no entry. Mitigation: suspect entries are held
-  back or marked, never silently injected; the stamp check is code.
+  back from prompts, never silently injected; the stamp check is code, and an automatic re-validation
+  turn re-confirms, amends or retires them.
 - The commit pin is **not available everywhere**: folder projects have no hashes; no branch name is stored
   per run or item; rebased or squashed pins become unreachable; htui writes nothing into a managed repo, so
   the check reads the repo read-only on the executing box; remote targets (ANA-42) have no repo state at
@@ -581,103 +721,191 @@ Reading the table with the critic's caveats:
 - A path-intersection check is conservative: a busy file flags many entries (false positives), never
   misses a touch. A content or symbol hash would cut false positives but is a later refinement.
 - Selecting by time (expiry, "last confirmed") must be resolved by the caller and recorded, never inside
-  `assemble`.
+  `assemble`. The auto-retire period for unresolved suspect entries is applied by the sweep, not at
+  selection time.
+- The re-validation turn is a model reading code the sweep flagged; it can wrongly re-confirm. Mitigation:
+  it must cite what it re-read, the new stamp is code-written, and a re-confirmed entry that later ends
+  runs in failure loses rank through the usage counters.
 
-**Memory poisoning.** A saved entry is a standing instruction that fires in every later run, so the attack
-is temporally decoupled (ASI06, MINJA). Mitigations: the accept gate (no prompt or index reads an
-unaccepted entry); provenance and trust stamped by code, outside the model; entries rendered as quoted
-data with a source label, not as directives; agent proposals only from inside a run (run-scoped MCP
-writes, `R-MCP-1`); scrub on write (`R-ID-7`); a cap on drafts per close-out; supersede rather than edit
-an accepted entry, keeping the old one for audit. Residual risk: a rubber-stamp gate. The gate's value
-depends on review volume, which nobody has estimated.
+**Memory poisoning, with no human gate.** A saved entry is a standing instruction that fires in every
+later run, so the attack is temporally decoupled (ASI06, MINJA), and under v2 nothing a person does sits
+between a model's text and a later prompt. The gate of v1 is gone, so each mitigation below is a control in
+code. Mitigations: provenance and trust stamped by the platform, outside the model (the model cannot set
+it, which answers provenance laundering); evidence that must cite something observed in the run, so
+a claim with no trace is rejected; schema validation, a per-run write cap and scrub on write (`R-ID-7`);
+entries rendered as quoted data with a source and trust label, not as directives; writes only through
+the pipeline, for a run the platform knows (run-scoped provenance, `R-MCP-1`), never a free tool call into
+the store; supersede
+rather than edit, keeping the old entry for audit; usage counters that demote entries whose runs fail;
+the suspect state and re-validation; and human visibility (list, "why is this here", retire, per-level off
+switch) so a person can find and kill a bad entry after the fact. Residual risk: an entry that passes every
+control and is wrong or hostile stays active until freshness, counters or a person remove it. The
+text a run observes (tool output, repository text) is untrusted input to the extraction turn, and whether
+the evidence rule is enough against an injected string in an error message is not verified.
+
+**Unreviewed standing instructions.** Even a correct entry is an instruction no person read. Mitigation:
+the quoted-data rendering, the trust label, the small caps, and the visible "why is this here" view. The
+prompt tells the agent an entry is a note from earlier runs, not a rule; whether agents honour that is
+unmeasured (P7).
+
+**Model cost on every run.** The light model spends the user's plan: an extraction turn at run end, a
+generalization check per promotion candidate, and a re-validation turn per suspect entry. Per-run token
+cost is not measured. Mitigations: the per-run write cap, extraction fed by the detector's evidence rather
+than whole transcripts, a skip for runs with nothing observed (a proposal, to confirm), and the per-level
+off switch. The cost is paid whether or not memory helps, which is one more reason P7 gates the "must".
+
+**Global leakage.** A global entry is read by every project, so anything the validator misses leaks across
+projects and workspaces, and one bad global entry reaches all of them (a blast radius larger than any
+project's). Mitigations: an agent cannot target global; promotion is its own step through a model
+generalization check and then a deterministic validator that rejects project and workspace-specific tokens
+(names and keys, absolute paths, hostnames, secret patterns, private-forge URLs) and re-runs scrub; a
+failure keeps the entry at its scope; a small global cap, ranked below project and workspace; stamping
+with the tool version and suspecting on change; a switch to turn global promotion off per level. Residual:
+the validator's recall for project-specific tokens is not measured (section 9.2), and `R-PRM-1`'s "reads
+stay inside the active workspace" needs one clause so global tooling lessons are not a breach.
+
+**Runaway growth.** Automatic writes with no review can pile up entries nobody reads. Mitigations: dedup
+and supersede at write time, the per-run write cap, auto-retire of unresolved suspect entries, usage
+counters that rank unused or failing entries for retirement, and the prompt caps (the store may grow, the
+prompt may not). Residual: the store itself is unbounded without a retention rule (a residual question).
+
+**Self-reinforcing wrong lessons.** A wrong lesson injected into later runs can cause the very errors that
+the detector then reads as new evidence, so the store reinforces itself. Mitigations: evidence must cite an
+observation in the run, not a prior entry; entries injected into a run are marked in the run record so the
+extraction turn can discount evidence from runs the entry shaped (a proposal, unverified); usage counters
+demote an entry whose injected steps end failed; a person can retire it. Residual: counters are
+correlation, not cause.
 
 **Qdrant dependence.** Retrieval quality is the weak spot in the literature (embedding retrieval unstable,
 most self-built memory pairings not beating memory-off), and Qdrant is optional and fails open until
 ANA-37 decides (`R-NF-2`, MOD-34/50/68). Therefore: prompt selection and freshness never read Qdrant; the
 Postgres row is canonical and the index rebuildable (`R-ID-3`, `R-STO-8`); Qdrant adds agent-pull search
-and duplicate hints only. A just-accepted entry is not searchable until the next sync (15 minutes on a
-worker) or an on-demand index request. A worker with no keyring never serves search, so agent-pull from a
+and better dedup recall only. With Qdrant absent, dedup falls back to the subject key plus full-text and
+paraphrased duplicates get through more often, which is one more input to ANA-37. A just-written entry is
+not searchable, and not visible to the raw-cosine dedup, until the next sync (15 minutes on a worker) or
+an on-demand index request, so two near-identical entries written in one window can both land. A worker with no keyring never serves search, so agent-pull from a
 provisioned worker is unavailable even today. If ANA-37 makes Qdrant required, the fail-open plumbing (a
 worker without a keyring never indexes) must change first; ANA-38 then only makes the index step
 mandatory, with no design change.
 
 **Other risks.**
 - Over-engineering, the withdrawal's own objection: mitigated by dropping scores, links and the CTE, and by
-  making phase 1 a use test. Real remaining exposure: a new entity or document kind, plus store-trait
+  making P1 and P2 a use test. Real remaining exposure is larger than in v1: a new entity or document kind,
+  a model writer, a detector, a sweep, a re-validation turn and a promotion pipeline, plus store-trait
   methods across about eight backends and a SQLite mirror migration, if a dedicated table is chosen.
 - Workspace reach: `R-PRM-1` says reads stay inside the active workspace, but the engine is headless, holds
   no workspace and walks project-bounded; a project may sit in several workspaces. Workspace memory in a
-  project step cannot be built until the scope row (MOD-147) exists, so workspace scope is phase 2 or later.
+  project step cannot be built until the scope row (MOD-147) exists, and the global scope row depends on
+  the same work, so workspace scope is not in P1 and global scope is P6.
 - Fan-out consistency: needs a run-start snapshot and a `trim_record` version bump; the digest would
   otherwise lie for `R-ID-5`.
-- Approval fatigue and UI surface: no list, edit, accept, supersede and retire surface is designed.
-- Authorization: who counts as "a person" and how concurrent edits behave (`R-ENT-10` compare-and-set
-  applies by default).
+- Approval fatigue is gone with the gate, but the visibility surface is not designed: the list, edit,
+  retire, pin-as-trusted and "why is this here" views, and the per-level switches.
+- Authorization: who may edit, retire or pin-as-trusted, and how concurrent edits behave (`R-ENT-10`
+  compare-and-set applies by default). A pinned-as-trusted entry's exemptions are a residual question.
+- Offline mirror: whether entries must be browsable offline (`R-STO-3`) is still uncovered and decides a
+  SQLite migration.
 - Documentation hygiene: ANA-34 still cites stale line numbers for this item.
 
 ## 7. Verdict and phasing
 
 ### 7.1 Recommended answer per settle-point
 
-**S1 Who writes.** A person, directly or by promoting a note; or an agent that **proposes** into a draft
-store, a person accepting at the close-out checklist (later also coordinator turns). Close-out code never
-uses a model to extract an entry. A deterministic close-out has no accepted prose to extract from today in
-any case (the only `summary` writer is the commit table), which leaves a person or an accepted draft as the
-only real writers.
+Revised on 2026-10-19 after the maintainer's answers.
 
-**S2 Freshness.** Code decides, a person confirms: version stamp on cited rows (existing pattern), optional
-commit-and-path pin for git projects checked by a sweep that stores a flag, "last confirmed" as a display
-aid, suspect entries held back or marked, supersede rather than edit. No model adjudicates truth or
-contradiction; a model may only draft "still true" or "amend" for a person to accept.
+**S1 Who writes.** A model: the configurable light model of `R-ORCH-1`, through a validated deterministic
+pipeline. Capture points are the end of a run (an extraction turn over the run's own evidence: errors seen,
+retries, fixes, measured wins) and a deterministic detector over run records that triggers or feeds that
+turn. A person may also write, edit and retire entries in the TUI. The code that writes the close-out
+summary still never uses a model; the extraction turn is a separate step. The v1 answer ("an agent only
+proposes into a draft store, a person accepts") is superseded and kept as Option E.
 
-**S3 R-ID-6.** Entry creation is bookkeeping. The model drafts, a person accepts, and no prompt, index,
-coordinator seed, link, status transition or cache refresh reads an unaccepted entry. Add one sentence to
-`R-ID-6` or `R-ENT-13` saying so, and settle where a pre-acceptance draft is stored (the requirement's own
-wording says drafts are written only once accepted, while ANA-34 and MOD-135 describe a draft store no
-reader consumes).
+**S2 Freshness.** Code decides, and nothing waits for a person: version stamp on cited rows (existing
+pattern), optional commit-and-path pin for git projects checked by a sweep that stores a suspect flag,
+suspect entries held back from prompts, supersede rather than edit. An automatic re-validation turn
+(sweep-triggered, reading the cited paths) re-confirms with a new stamp, amends with a new superseding
+version, or retires; unresolved suspect entries auto-retire after a configurable period. Global lessons
+carry the agent, tool or CLI version they were learned on and go suspect when it changes. No model decides
+that an entry is stale; a model re-reads only what code flagged.
 
-**S4 Qdrant / R-STO-8.** Memory works with Postgres alone. Qdrant adds a point type for accepted entries,
-agent-pull search through the existing `search_concepts`, and display-only duplicate hints; delivered with
-ANA-35's collection rebuild. Nothing about prompt content or freshness reads the index. Ask ANA-37 to
-measure paraphrase recall and duplicate-hint quality on real entries.
+**S3 R-ID-6.** An explicit, amended exception: memory writes are not bookkeeping a person gates and are
+not forbidden; they are a named exception to "no LLM in bookkeeping". Everything else in `R-ID-6` stays: no
+status transition, link, import or cache refresh reads model text, and state changes, dedup keys, freshness
+and prompt selection are deterministic code. The amendment text is proposed in 7.3 and is maintainer-gated.
+No draft state exists, so the "where does a pre-acceptance draft live" ruling falls away.
 
-**S5 Model and prompt reach.** Entries are verbatim prose with a subject, scope, state and stamp; home is an
-ANA-35 owner document kind to start, a dedicated table only if forced. Prompt reach is a new internal
-section filled in `phase_spec`, capped, snapshotted at run start, trimmed after Excerpts and before
-Upstream, recorded in `trim_record`; the rest by agent pull. Not brought back: importance scores, the link
-graph, recursive-CTE injection, model-ranked or model-extracted selection.
+**S4 Qdrant / R-STO-8.** Memory works with Postgres alone (subject key plus full-text for dedup). Qdrant adds
+a point type for entries, agent-pull search through the existing `search_concepts`, and a raw-cosine query
+that improves dedup recall at write time; delivered with ANA-35's collection rebuild. Nothing about prompt
+content or freshness reads the index. Ask ANA-37 to measure paraphrase recall and dedup quality on real
+entries.
+
+**S5 Model and prompt reach.** Entries are verbatim prose with a subject, kind, scope, state and stamp; home
+is an ANA-35 owner document kind to start (a table if forced, decided in P1), with a third, global owner
+scope added. Prompt reach is a new internal section filled in `phase_spec`, active non-suspect entries
+only, capped, snapshotted at run start, trimmed after Excerpts and before Upstream, recorded in
+`trim_record`; a global section with its own small cap ranks below project and workspace; deterministic
+usage counters drive demotion; the rest by agent pull. Not brought back: importance scores, the link graph,
+recursive-CTE injection, model-ranked selection.
 
 On ANA-1's atomic facts specifically: neither as they were nor summaries alone. Keep summaries; add
-accepted entries beside them.
+automatically written entries beside them.
 
 ### 7.2 Proposed phases (not filed; IDs are minted only after the maintainer accepts)
 
 | P | Subject | Scope | Blocked on |
 |---|---|---|---|
-| P1 | Person-written project memory and prompt section | A project-owned entry (document kind or small table, decided in question 3), person-written or promoted from a note; state and version; version-stamp freshness through the citation pattern; Postgres-only selection in `phase_spec` into a new internal section with a cap and a run-start snapshot; trim rank and `trim_record` bump; TUI list, edit, retire; `R-PRM-1`/`R-PRM-3`/CONCEPTS amendments | project scope: none beyond ANA-35's owner-document work if a document kind is used (MOD-146/147 are workspace/owner pieces); confirm which owner-document pieces project scope needs |
-| P2 | Agent proposals and the accept path | MCP propose-memory tool writing into the draft store; accepted entries only readable; close-out checklist "memory candidates" row; provenance stamped by code; workspace-owned entries; coordinator seed reads accepted entries | MOD-135 (draft store, checklist), MOD-147 (workspace scope row), MOD-136 for coordinator turns |
-| P3 | Code-pinned freshness sweep | Optional pin (repo, commit, paths or symbols) from the writing step's `after_hash`; sweep arm computing "cited paths changed since pin" and storing a suspect flag; checklist row for re-confirm, amend or retire; git-projects only | P1; P2 for the checklist row |
-| P4 | Qdrant point type and duplicate hints | Memory point type, accepted-only, rebuilt on version change; `search_concepts` type extension; raw-cosine query for display-only duplicate hints at accept time; rides the planned collection rebuild | P1; ANA-35's collection v4 work; MOD-112 for read tools; informed by ANA-37 |
-| P5 | Evaluation on htui data | Before/after measurement on real steps and recall of known gotchas, FTS vs Qdrant hybrid on real entries; feeds ANA-37 and the must/later call on `R-ENT-13` | P1, ideally P4 |
+| P1 | Entry store and prompt section | Entry store (an owner document kind or a table, decided in question 3 at the start of the phase) with kinds including `lesson`, states `active`, `suspect`, `superseded`, `retired`, TUI list, edit and retire, and manual write; a prompt section filled by Postgres-only selection in `phase_spec` with a cap, a run-start snapshot, a trim rank and a `trim_record` bump; `R-PRM-1`/`R-PRM-3`/CONCEPTS amendments | project scope: none beyond ANA-35's owner-document work if a document kind is used (confirm which owner-document pieces project scope needs); not MOD-135; not MOD-147 |
+| P2 | Automatic capture at run end | Extraction turn by the light model over the run's evidence; write-path safeguards (schema validation, per-run write cap, scrub before persist, platform-stamped provenance, evidence must cite the run); dedup and supersede at write time (subject key plus full-text); deterministic usage counters; per-level capture switch | P1; the `R-ID-6` amendment (maintainer-gated) before it is built; MOD-147 only for workspace-owned entries; MOD-136 only for the coordinator seed reading entries |
+| P3 | Lesson detector over run records | Deterministic detector for repeated error signatures, retries, timeouts and outlier cost that triggers or feeds extraction. First task: verify what error and retry detail run records store today (not yet verified) | P2; the result of that verification |
+| P4 | Freshness sweep, pins and re-validation | Version-stamp suspect flag; optional pin (repo, commit, paths or symbols) from the writing step's `after_hash`, git projects only; automatic re-validation turn; auto-retire of unresolved suspect entries; pin-as-trusted; the "why is this here" view | P1; P2 for the re-validation turn |
+| P5 | Qdrant point type and raw-cosine dedup | Memory point type, active entries only, rebuilt on version change; `search_concepts` type extension; a raw-cosine `VectorStore` query for write-time dedup; rides ANA-35's planned collection rebuild; informed by ANA-37 | P1, P2; ANA-35's collection v4 work; MOD-112 for read tools |
+| P6 | Global scope and automatic promotion | A third hidden scope row (global), same pattern as ANA-35's workspace scope row; the promotion pipeline (generalization check, then the deterministic validator and scrub); tool-version stamping and suspect-on-change; a small global prompt section; the `R-PRM-1` clause; the per-level promotion switch | MOD-147 work (scope row pattern); P2; P4 for suspect-on-change |
+| P7 | Measurement on real htui steps | Before/after on real steps, recall of known gotchas, harm from wrong entries, FTS versus Qdrant; decides whether `R-ENT-13` stays "must" beyond P1 and P2; feeds ANA-37 | P1, P2; ideally P3, P5, P6 |
 
-`R-ENT-13` priority: "must" for P1 only; "later" for P2..P4 until P5 reports. P1..P5 are a proposal; the
-number may change at filing, as ANA-34's P1..P4 did before they became MOD-133..136.
+`R-ENT-13` priority: "must" for P1 and P2; "later" for P3..P6 until P7 reports. P1..P7 are a proposal and no
+IDs are minted; the number may change at filing, as ANA-34's P1..P4 did before they became MOD-133..136.
+MOD-135 (the draft store) no longer blocks memory; MOD-147 blocks workspace and global scope; MOD-136 is
+needed only for the coordinator seed.
 
 ### 7.3 Requirement edits owed (all maintainer-gated; this item edits none)
 
-- `R-ENT-13`: replace "reopened, pending ANA-38" with the settled text; state the priority split;
-  state that product memory is separate from the development workflow's own memory.
-- `R-ID-6`: one sentence that a memory entry is bookkeeping and reaches a prompt, the index and the seed
-  only once a person has accepted it.
-- `R-PRM-1`/`R-PRM-3`: add accepted project (later workspace) memory to the input list and a rank in the
-  keep order; CONCEPTS "Bounded context" likewise; ANA-5 section 4.4 trim order and the section vocabulary.
-- `R-STO-8`: add the memory point type once P4 lands, and a note that no dedup is automatic.
-- ANA-34 section 7.2: the "added to the seed" sentence becomes a concrete reader of accepted entries; fix
-  the stale line references to this item.
+- `R-ENT-13`: replace "reopened, pending ANA-38" with the settled text: kinds (`fact`, `decision`,
+  `gotcha`, `lesson`), scopes (project, workspace, global), writers (the light model through a validated
+  pipeline; a person may also write), states, the priority split, and that product memory is separate from
+  the development workflow's own memory.
+- `R-ID-6`, proposed amendment text: "Exception (ANA-38, 2026-10-19): a memory entry (R-ENT-13) may be
+  written by the light model (R-ORCH-1) without a person's acceptance, through a deterministic write path
+  (schema-validated, capped per run, scrubbed per R-ID-7, provenance stamped by the platform, evidence
+  drawn from the run). An active entry may reach a prompt, the index and the coordinator seed. Nothing else
+  changes: no status transition, link, import or cache refresh reads model text, and an entry's state,
+  dedup key, freshness and selection are decided by code." Also state that the same configurable light
+  model serves this use, a third beside workflow choice and draft rewrite.
+- `R-PRM-1`/`R-PRM-3`: add active project and workspace memory, and a small global section, to the input
+  list and a rank in the keep order. `R-PRM-1`/`R-PRM-3` global clause: global tooling lessons are the one
+  prompt input not bounded by the active workspace. CONCEPTS "Bounded context" likewise; ANA-5 section 4.4
+  trim order and the section vocabulary.
+- `R-STO-8`: add the memory point type once P5 lands, and replace the draft note that no dedup is
+  automatic with the raw-cosine write-time dedup and its Postgres fallback.
+- `R-ENT-12` and the owner scopes: a note in ANA-35 (and a one-line owner extension in `R-ENT-12`) that a
+  document may be owned at a global scope row, if documents are the home; the scope-row pattern is ANA-35's.
+- CONCEPTS lines: Memory (kinds, scopes, states), Lesson, Global scope, and the "Bounded context"
+  amendment above.
+- A `R-TUI` surface line for the visibility views (list, edit, retire, pin-as-trusted, "why is this here")
+  and a Settings cascade line for the capture and promotion switches; the requirement ids to amend were not
+  looked up.
+- ANA-2 invariant 3 / MOD-98 ("a model never goes inside close-out"): note that the extraction turn is a
+  run-end step before close-out and that the formatter itself stays model-free (an inference to confirm).
+- ANA-34 section 7.2: the "added to the seed" sentence becomes a concrete reader of active entries; fix the
+  stale line references to this item.
 
 ## 8. Questions for the maintainer
 
-Plain terms first for each, then the recommendation.
+Plain terms first for each, then the recommendation. Questions 1..10 keep their v1 text; under each is the
+maintainer's answer of 2026-10-19. The maintainer answered "all as recommended" and then amended three
+points: (a) a new `lesson` kind, (b) a new global scope, (c) memory is completely automated, with no person
+acceptance gate. Where an answer says "overridden", the recommendation above it is the superseded v1
+position. Question 11 and the residual questions are new in v2.
 
 **1. Is writing a memory entry "doing the work" or "bookkeeping" under R-ID-6?**
 In plain terms: step output documents already reach later prompts without anyone approving them, because
@@ -689,6 +917,11 @@ poisoning research and the Augment and Cursor experience say untrusted text must
 gate. Example: an agent proposes "the sqlx offline cache must be regenerated after any query change"; it
 sits in the draft list, the next step's prompt does not include it, and after you accept it at close-out
 every later step in the project sees it.
+
+Answer (2026-10-19): accepted, then overridden by complete automation (decision 1c). No person gates
+memory: a model writes entries and they become active without approval, so no unaccepted state exists.
+The classification is resolved as an explicit exception to `R-ID-6` (amendment text in 7.3, maintainer-gated)
+rather than as bookkeeping a person approves. The recommended sentence about unaccepted entries is moot.
 
 **2. Who writes entries, through which channel, and where does a draft live before acceptance?**
 In plain terms: you, an agent suggesting something that you approve, or the close-out screen offering you
@@ -702,6 +935,12 @@ once accepted. Example: during a step the agent calls a propose-memory tool with
 stack in tests", the text and the cited path; at close-out the checklist shows three drafts and you accept
 two and edit one.
 
+Answer (2026-10-19): accepted, then overridden by complete automation (decision 1c). The writer is the
+configurable light model through the validated deterministic pipeline, at run end and fed by the lesson
+detector. The MOD-135 draft store is not required for memory and there is no draft state, so the "where
+does a draft live" ruling falls away. A person still may write, edit and retire directly. Close-out code
+still never uses a model; the extraction turn is a separate step before it.
+
 **3. Is memory its own table, or a kind of owner-level document from ANA-35?**
 In plain terms: either a new kind of row, or a normal document that happens to belong to a project instead
 of an item and carries a "memory" label. Recommended: start with an ANA-35 owner document of a conventional
@@ -712,6 +951,9 @@ Postgres migration, a SQLite mirror migration and new methods in about eight bac
 withdrawn. Risk: a document has no pin or state columns, so the cost may move there. Example: the entry
 "tests under htui-orch need the boxed dispatch arms" is a project-owned document of kind `memory` with a
 stored pin; it needs no new table and appears in the same project document list.
+
+Answer (2026-10-19): accepted as recommended. Note for P1: states, pin, usage counters, kind and a three-level
+scope make a dedicated table more likely than v1 assumed (inference); P1 settles table or document first.
 
 **4. How does an entry stay fresh against the code?**
 In plain terms: how htui notices that a remembered fact is no longer true, without asking a model.
@@ -726,6 +968,12 @@ pure prompt assembler. Example: an entry cites `crates/htui-orch/src/engine.rs`,
 weeks later the sweep sees that file changed and flags it "suspect since <commit>"; the next close-out
 asks you: still true, amend, or retire.
 
+Answer (2026-10-19): accepted, then adjusted (decision 2). The person step "re-confirm, amend or retire" is
+replaced by an automatic re-validation turn, triggered by the sweep and reading the cited paths, which
+re-confirms with a new stamp, amends with a new superseding version, or retires; unresolved suspect
+entries auto-retire after a configurable period. Freshness is still computed by code and a suspect entry
+is still held back from prompts.
+
 **5. How does memory get into a prompt?**
 In plain terms: whether a prompt gets a short fixed list of accepted entries, or whatever a search finds.
 Recommended: a new internal prompt section filled from Postgres in the engine, accepted non-suspect entries
@@ -738,6 +986,10 @@ bytes when Qdrant is down or re-embedded; Copilot and Claude likewise load a cap
 Example: a project has 14 accepted entries and the cap holds 6; the prompt lists 6 with short bodies and
 says 8 more are available through search; both fan-out siblings print the same 6.
 
+Answer (2026-10-19): accepted as recommended. The safeguards add deterministic usage counters (injected
+into N steps, how many ended done versus failed) for demotion and retirement ranking, and a global section
+with its own small cap, ranked below project and workspace; the shape is unchanged.
+
 **6. What is Qdrant's role for memory, and does ANA-38 wait for ANA-37?**
 In plain terms: whether memory needs the search index to work at all. Recommended: no. The design works
 with Postgres alone; Qdrant is an add-on for agent search and "possible duplicate" hints; memory becomes one
@@ -748,6 +1000,11 @@ before this is finalised. Why: memory is small and scoped, so full-text probably
 from Qdrant is paraphrase recall and duplicate hints, which ANA-37 can measure. Example: you propose
 "tests need --test-threads=1"; the hint says "looks like the existing entry about the process-wide keyring
 fake" and you pick merge or keep both; with Qdrant down no hint appears and nothing else changes.
+
+Answer (2026-10-19): accepted, then adjusted (decision 2). Qdrant stays optional and never decides prompt
+content or freshness, but its role grows from display-only duplicate hints to improving recall for
+write-time dedup through a raw-cosine query; the Postgres-only fallback is the subject key plus full-text.
+This makes ANA-37's measurement more valuable, and memory still works with Qdrant absent.
 
 **7. Do ANA-1's atomic facts come back, or do summaries suffice?**
 In plain terms: the old design stored many small scored facts linked to each other; the question is whether
@@ -761,6 +1018,9 @@ about what "over-engineered" meant; confirm it. Example: a build-step gotcha fro
 current one surfaces through the project memory section; the older entry on the same subject is marked
 superseded, not scored against the new one.
 
+Answer (2026-10-19): accepted as recommended. The `supersedes` pointer is now set by code at write time on
+the same (scope, subject) key or high similarity, rather than confirmed by a person.
+
 **8. What is in the first release, and how do we know it pays off?**
 In plain terms: how much to build before finding out whether memory helps at all. Recommended: phase P1
 only (project entries a person writes or promotes, version-stamp freshness, Postgres-only prompt section, a
@@ -770,6 +1030,10 @@ and recall of known gotchas, decides whether `R-ENT-13` stays "must" beyond P1. 
 tests the value; the benefit evidence is vendor-reported or abstract-only, so measure on your own data.
 Example: in P1 you add "regenerate .sqlx after any query change" to project htui by hand and see it in
 every step prompt; agent proposals and the stale flag arrive later.
+
+Answer (2026-10-19): accepted, then adjusted (decision 3). Re-phased to P1..P7 (7.2): "must" for P1 and P2,
+"later" for the rest until P7, the measurement phase, reports; MOD-135 no longer blocks memory, MOD-147
+blocks workspace and global scope, and MOD-136 is needed only for the coordinator seed.
 
 **9. Where does accepting happen, and how much review is acceptable?**
 In plain terms: how many suggestions you are willing to look at, and where. Recommended: reuse the existing
@@ -781,6 +1045,11 @@ the gate from becoming a rubber stamp, and platform-kept provenance is the main 
 provenance laundering. Example: the checklist shows "Memory candidates (3)" with accept, edit and skip;
 skipping all three does not block close-out.
 
+Answer (2026-10-19): accepted, then overridden by complete automation (decision 1c). There is no accept
+surface and no review volume to cap, and the close-out "Memory candidates" row is dropped. It is replaced
+by human visibility without gating: a TUI list of recent automatic entries with edit, retire,
+pin-as-trusted and a "why is this here" view, and per-level switches for capture and global promotion.
+
 **10. What happens to the current development-workflow memory (auto-memory files, Gortex remember,
 `.remember`, HANDOFF notes)?**
 In plain terms: whether the notes your agents keep today are moved into the new store. Recommended: a
@@ -790,6 +1059,50 @@ from the development workflow's memory. Why: vendor memories are per-user, per-b
 `R-ID-4` bars writing into repos; several current notes are already stale, so a bulk import would copy
 staleness into the new store. Example: the note "code-architect carries `model: opus`" is no longer true;
 when you re-add the real gotchas by hand, that one is dropped and each kept entry gets a pin.
+
+Answer (2026-10-19): accepted as recommended.
+
+**11. Lesson kind and global scope (new in v2).**
+In plain terms: a gotcha belongs to a project or workspace, but some knowledge is about doing the work
+better in general: an error that keeps coming back, a speed-up already found, a habit that makes the tools
+behave. Decided by the maintainer: (a) a new kind, `lesson`, for recurring errors, optimizations already
+done and things that improve usage over time, not tied to a workflow or an item, owned by a project or a
+workspace, with the run as provenance only; (b) a new global scope above workspace, for lessons that can be
+generalized and gotchas that can happen in any other project or workspace (tooling and general practice,
+not project facts), a third hidden scope row on the pattern of ANA-35's workspace scope row and dependent on
+the MOD-147 work; (c) all of it automatic, with the safeguards of Option E-prime in place of an approval
+gate. Why: a person does not think to propose the lesson that three runs hit the same timeout, and a gotcha
+learned in one project is useful in the next. The price is in section 6: leakage across projects, a bigger
+poisoning blast radius, unreviewed standing instructions and a model call on every run. Example: three
+runs on different items time out on the same sqlx offline step and then succeed after a cache rebuild; the
+detector flags the repeated signature, the extraction turn writes a `lesson` for the project with the error
+text and step as evidence, and later the generalization check and validator promote a version stripped of
+project names to global, where it appears in every project's prompt under its own small cap.
+
+Answer (2026-10-19): decided as stated above (decisions 1a, 1b, 1c); the design is Option E-prime in 4.6
+and the phases are P1..P7 in 7.2. The `R-ID-6` amendment, `R-ENT-13`, `R-PRM-1`/`R-PRM-3`, `R-STO-8` and
+CONCEPTS edits are owed (7.3).
+
+**Residual questions (genuinely still open; each with a recommended answer).**
+
+1. **Default sizes.** What are the per-run write cap and the prompt caps per scope? Recommended: configurable
+   settings with starting defaults of 5 writes per run, about 1,500 tokens for the project section, 500 for
+   workspace and 300 for global (proposals, unmeasured), tuned at P7. The v1 inference of a 1.8k to 7k total
+   budget was also unmeasured.
+2. **Auto-retire period.** How long may a suspect entry stay unresolved before it auto-retires? Recommended:
+   14 days, configurable, applied by the sweep; a retired entry is kept for audit and listed in the TUI.
+3. **Global before or after P7 reports.** Phase order puts the global scope (P6) before the measurement
+   (P7), while the maintainer wants capture and promotion on by default. Recommended: build P6 after P7's
+   first read on P1..P5, so the harm rate of project-level entries is known before one bad entry can reach
+   every project; global promotion stays behind its switch either way.
+4. **Cost bound for the model.** Is there a ceiling on the light model's token spend for memory? Recommended:
+   a setting for a per-run extraction budget, extraction skipped for runs with no observed error, retry or
+   measured win, and the per-level off switch; measure the real per-run cost first (section 9.2).
+5. **Pin-as-trusted and who may act.** What does a pinned entry escape, and who may edit, retire or pin in
+   a shared workspace? Recommended: a pinned entry is exempt from auto-retire and from usage-counter
+   demotion but is still held back when suspect; any member allowed to write to the project or workspace may
+   edit, retire or pin, with `R-ENT-10` compare-and-set; global entries need the same permission as
+   workspace settings.
 
 ## 9. Sources and Not verified
 
@@ -808,7 +1121,9 @@ withdrawal text). Code: `crates/htui-core/src/prompt/{mod,trim,template,excerpt,
 `crates/htui-store/src/pg/read.rs`, `crates/htui-store/migrations/{0001,0003,0006}*.sql`,
 `crates/htui-core/src/model/requirement.rs`, `crates/htui-core/src/store/{traits,mem}.rs`,
 `crates/htui/src/{concepts,concepts_worker,worker_cmd,agent_settings}.rs`, `crates/htui-mcp/src/{search.rs,tools/search.rs}`.
-Web sources are given inline in section 3.
+Web sources are given inline in section 3. Added in v2: `docs/ANA-35.md:937-947` (the workspace scope row
+pattern the global row would copy); the maintainer's answers of 2026-10-19, which are decisions and not
+repo evidence.
 
 ### 9.2 Not verified
 
@@ -831,7 +1146,24 @@ Web sources are given inline in section 3.
   `client()`, qdrant-client defaults unchecked); whether any seeded phase or default template produces a
   `summary`-kind document or places `{{excerpts}}`; the bodies of `PgStore::reconfirm` and the
   `ReqsTab` flow; the full implementor list for a new store-trait method; how a person-gated draft is
-  stored (MOD-135 is a filed item with no schema and no `draft` string in any migration).
+  stored (MOD-135 is a filed item with no schema and no `draft` string in any migration; no longer needed
+  for memory under v2).
+- **Run-record error and retry detail (new in v2).** Whether run records store what the lesson detector
+  needs: error text or a signature, retry counts, timeouts, per-run cost. Not verified, and the first task
+  of P3. Likewise not traced: how the engine would schedule a run-end extraction turn as a step before
+  close-out, and whether the light model setting of `R-ORCH-1` can be called from there.
+- **Light-model cost per run (new in v2).** The tokens spent by an extraction turn, a generalization check
+  and a re-validation turn are unmeasured, as is the share of runs that would skip extraction; the cost
+  lands on the user's plan.
+- **Validator recall for project-specific tokens (new in v2).** No measurement exists of how much
+  project or workspace-specific text a deterministic validator (names and keys, absolute paths, hostnames,
+  secret patterns, private-forge URLs) misses in a real lesson; the global scope's leakage risk rests on it.
+  Nor is it verified that an injected string in an error message cannot pass the "evidence must cite the
+  run" rule.
+- **Vendor CLI memory in htui sessions (new in v2).** Whether a vendor CLI's own memory (Claude auto-memory,
+  Codex memories) loads inside sessions htui starts. It matters now because a global lesson injected by
+  htui could duplicate or contradict what the CLI already remembers. Also not verified: that the
+  ANA-35 workspace scope row pattern carries unchanged to a global row with no workspace, project or repo.
 - **Nothing was run.** No Qdrant live test, no build, no embedding of a sample entry, no measurement of
   recall or dedup quality on htui data.
 - **Harness prior art** came partly from search summaries and secondary sources: Cursor's memory history,
@@ -850,7 +1182,8 @@ Web sources are given inline in section 3.
 
 **Contradictions between the sweeps, and how this draft resolves them**
 - Item work or bookkeeping: history says a prompt is a forbidden reader; substrate says step documents
-  already reach prompts unaccepted as item work. The classification was never made; it is question 1.
+  already reach prompts unaccepted as item work. The classification was never made; the maintainer resolved it in
+  question 1 (2026-10-19) as an explicit exception to `R-ID-6`, not as bookkeeping.
 - Freshness check timing: the freshness slice says status is checked at injection time; the substrate says
   `assemble` is pure and siblings must be byte-identical. Resolved here by a sweep storing a flag.
 - Commit-pin feasibility: the freshness and seed slices treat pinning as cheap and deterministic; the
@@ -867,7 +1200,8 @@ Web sources are given inline in section 3.
   query exists.
 - Collection naming (v3 versus v4) is inconsistent across slices; the one-rebuild advice depends on it.
 - Close-out extraction: history lists "deterministic extraction from accepted material" as a compliant
-  writer, but close-out has no accepted prose to extract. Dropped as a real writer.
+  writer, but close-out has no accepted prose to extract. Dropped as a real writer in v1. Superseded in v2: a model extraction turn at run end is now the
+  writer, run as a step before close-out so the formatter stays model-free.
 - The brief's pointer to ANA-13/ANA-18 for citation re-confirmation was wrong: ANA-13 is the oh-my-pi
   roles study and ANA-18 the Jev model study; the staleness machinery is ANA-11 / MOD-38 / MOD-39.
 
@@ -877,25 +1211,30 @@ Web sources are given inline in section 3.
   reopening itself gave no evidence.
 - Benefit numbers (see above) support "small and verified", not a specific mechanism.
 - Corpus size, token budget (1.8k to 7k) and the claim that Postgres full-text is enough are inferences.
-- Person-acceptance burden is assumed tolerable; no volume estimate exists.
+- (v1, moot under v2) Person-acceptance burden is assumed tolerable; no volume estimate exists. Its
+  replacement: that the automatic safeguards are enough is assumed, not measured; P7 is the test.
 - Skills as zero-new-code memory is asserted from requirement text; cost against `max_skill_tokens` and
   scoping granularity were not checked.
-- That MOD-135's draft store can carry a memory proposal: it is a filed item only.
+- That MOD-135's draft store can carry a memory proposal: it is a filed item only (moot for memory in v2).
 - Parts of Qdrant shipped behaviour (above) and the ANA-37 outcome.
 
 **Uncovered (not decided here, owed before or during filing)**
 - Whether memory must be browsable offline (decides a SQLite mirror migration and a `CacheStore` method).
-- The TUI surface: list, edit, accept, supersede and retire; reuse of the inbox or a new pane.
-- Who counts as "a person" for acceptance; multi-user concurrent edits beyond `R-ENT-10`.
-- Entry fields, states, deletion, retention and audit trail beyond the fragments in section 4.5.
-- Precedence between owner levels (item, project, workspace) and between memory and skills or CLAUDE.md
-  rules; whether an entry can be promoted from item to project level.
+- The TUI surface: list, edit, retire, pin-as-trusted and "why is this here"; reuse of the inbox or a new
+  pane.
+- Who may edit, retire or pin an entry; multi-user concurrent edits beyond `R-ENT-10`.
+- Entry fields, deletion, retention of retired and superseded entries, and the audit trail beyond the
+  fragments in section 4.6.
+- Precedence between owner levels (project, workspace, global) and between memory and skills or CLAUDE.md
+  rules; whether an entry can be promoted from item to project level (global promotion is automatic,
+  section 4.6).
 - Migration of the maintainer's existing notes (question 10 proposes a hand-reviewed seed).
 - Readers beyond a step prompt: chat sessions with no item (only `box_profile` and `search_concepts`),
   judge and handoff roles, a coordinator with no agent.
 - A labelling rule for how an entry is phrased in a prompt (data, not directive) and which trust label it
   carries.
-- An evaluation plan on htui data (P5 is a placeholder).
+- A detailed evaluation plan on htui data (P7 is the placeholder: before/after, recall of known gotchas,
+  harm from wrong entries, FTS versus Qdrant).
 - Folder projects and remote targets (ANA-42): pins and the repo check do not exist there; only relayed MCP
   and the prompt reach a remote agent.
 - Whether ANA-38's product memory is meant to replace the maintainer's own agent-memory workflow or only to
