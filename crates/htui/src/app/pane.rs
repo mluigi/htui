@@ -1246,6 +1246,31 @@ mod tests {
         assert_eq!(log.borrow().last(), Some(&Call::Dropped));
     }
 
+    /// MOD-115 M2 D6: with an in-pane editor alive the leave dialog names the open edit, from
+    /// the asking tab and from another; without one it does not.
+    #[test]
+    fn the_leave_dialog_names_the_open_edit() {
+        for from_other in [false, true] {
+            let (mut app, _benches, _log) = unfocused_two();
+            confirmable(&mut app);
+            if from_other {
+                app.on_key(next_tab());
+            }
+            app.on_key(plain('q'));
+            let frame = text(draw(&mut app, 100, 30).backend().buffer());
+            assert!(
+                frame.contains("\u{270e} an open edit (unsaved changes are lost)"),
+                "{from_other}: {frame}"
+            );
+        }
+        let (mut app, _benches) = shell(&[ASKER, OTHER]);
+        confirmable(&mut app);
+        app.on_key(plain('q'));
+        let frame = text(draw(&mut app, 100, 30).backend().buffer());
+        assert!(frame.contains("Leave htui?"), "{frame}");
+        assert!(!frame.contains("an open edit"), "{frame}");
+    }
+
     /// MOD-115 M2 D6, from the asking tab and from another: `n` and `Esc` keep the edit as it
     /// was (unfocused, where the user was), `Enter` leaves and the editor goes with `App`.
     #[test]
