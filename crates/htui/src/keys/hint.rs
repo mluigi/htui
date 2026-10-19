@@ -12,7 +12,7 @@
 
 use unicode_width::UnicodeWidthStr;
 
-use super::{Act, Context, KeyChord, Keys, Stack};
+use super::{Act, Context, KeyChord, Keys, SHADOWING, Stack};
 
 /// The separator between entries: U+00B7 with a space on each side, as the status line has
 /// always written it.
@@ -230,7 +230,8 @@ impl Keys {
 
     /// The `?` box (D8, MOD-67 M3): one line per layer of `stack`, narrowest first, under the
     /// layer's `Context::heading`. A row is listed under the first layer that admits it and has
-    /// a row for it (the `actions` shadowing rule, L-B Q6), with every chord that layer admits;
+    /// a row for it (the `actions` shadowing rule, L-B Q6), with every chord that layer admits
+    /// but those a listed narrower act always takes ([`SHADOWING`], MOD-115 M2 T5R);
     /// rows sharing a help label merge, and a row with no admitted chord drops. `offered` is
     /// consulted for `Global` rows only. Every global layer of the stack renders as **one**
     /// `Global:` line at the last global layer's place (MOD-67 M4 PA-2): quit first (its admitted
@@ -273,7 +274,9 @@ impl Keys {
                     .chords
                     .iter()
                     .copied()
-                    .filter(|chord| layer.admits_chord(*chord))
+                    .filter(|chord| {
+                        layer.admits_chord(*chord) && !self.shadowed(stack, *chord, row.act)
+                    })
                     .collect();
                 match merged.iter_mut().find(|(help, _)| *help == row.help) {
                     Some((_, known)) => known.extend(chords),
@@ -294,6 +297,23 @@ impl Keys {
             }
         }
         lines
+    }
+
+    /// Whether `chord` never reaches `act` in `stack` and the box lists the act that takes it
+    /// (MOD-115 M2 T5R): a narrower candidate ahead of `act` forms a [`SHADOWING`] pair with it
+    /// (the narrower act always wins), and its layer is wired. Over the Requirements form `l`
+    /// always sets the priority later, so the box lists it under that row only, not as the
+    /// choice's next option.
+    fn shadowed(&self, stack: Stack<'_>, chord: KeyChord, act: Act) -> bool {
+        self.actions(stack, chord)
+            .into_iter()
+            .take_while(|&candidate| candidate != act)
+            .any(|narrower| {
+                SHADOWING.contains(&(narrower, act))
+                    && self
+                        .resolve_row(stack, narrower)
+                        .is_some_and(|(layer, _)| !NOT_YET_WIRED.contains(&layer.context()))
+            })
     }
 
     /// One `?` box line for `context` (D8): every offered and bound action, all its chords
@@ -654,8 +674,8 @@ mod tests {
         assert_eq!(
             texts(keys.help_lines(views::MIGRATION, all)),
             [
+                // T5R: `Esc` is always `confirm.no` here (SHADOWING), listed there only.
                 "Schema: y/Y yes · n/Esc/N no",
-                "Overlay: Esc close",
                 "Global: Ctrl+c quit · ?/F1 help",
             ]
         );
@@ -702,7 +722,9 @@ mod tests {
             [
                 "Requirements: m priority must · l priority later · Tab/Down next field \
                  · Shift+Tab/Up previous field",
-                "Choice: Left/h previous option · Right/l next option · Space toggle",
+                // T5R: on the priority `l` always sets later (SHADOWING), so it is not listed as
+                // the next option.
+                "Choice: Left/h previous option · Right next option · Space toggle",
                 "Form: Ctrl+s save",
                 "Global: Ctrl+c quit · F1 help · F9 about",
             ]

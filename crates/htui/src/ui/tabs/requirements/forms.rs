@@ -630,50 +630,62 @@ mod tests {
         form.on_key(key, keys)
     }
 
-    /// MOD-115 M2 D7 (T0 verify): every chord the `?` box lists for the priority's rows acts on
-    /// the priority, so the help line and the behaviour agree.
+    /// MOD-115 M2 D7 (T0 verify, T5R): every chord the `?` box lists over the form for the
+    /// priority's rows acts on the priority as its entry says, so the help line and the
+    /// behaviour agree: `l` is listed as later only, since on the priority it always sets later.
     #[test]
     fn every_listed_priority_chord_acts() {
         let keys = Keys::compiled();
-        let labelled = |act| -> Vec<String> {
-            let mut specs = Vec::new();
-            for label in keys.labels(views::REQUIREMENTS_FORM, act) {
-                let chord = keys
-                    .chords(act.spec().expect("a row").context, act)
-                    .iter()
-                    .find(|chord| chord.label() == label)
-                    .expect("the label is a chord of the row");
-                specs.push(chord.spec());
-            }
-            specs
+        let lines = keys.help_lines(views::REQUIREMENTS_FORM, |_| true);
+        // The chords the box lists for `act`: its entry's labels, read back as the row's chords.
+        let listed = |act: Act| -> Vec<String> {
+            let spec = act.spec().expect("a row");
+            let suffix = format!(" {}", spec.help);
+            let entry = lines
+                .iter()
+                .flat_map(|line| &line.entries)
+                .find(|entry| entry.ends_with(&suffix))
+                .unwrap_or_else(|| panic!("{act:?} is listed: {lines:?}"));
+            let labels = entry.strip_suffix(&suffix).expect("the suffix");
+            labels
+                .split('/')
+                .map(|label| {
+                    keys.chords(spec.context, act)
+                        .iter()
+                        .find(|chord| chord.label() == label)
+                        .unwrap_or_else(|| panic!("{label} is a chord of {act:?}"))
+                        .spec()
+                })
+                .collect()
         };
-        assert_eq!(labelled(Act::RequirementsPriorityMust), ["m"]);
-        assert_eq!(labelled(Act::RequirementsPriorityLater), ["l"]);
-        for spec in labelled(Act::RequirementsPriorityMust) {
+        assert_eq!(listed(Act::RequirementsPriorityMust), ["m"]);
+        assert_eq!(listed(Act::RequirementsPriorityLater), ["l"]);
+        assert!(
+            !listed(Act::ChoiceNext).contains(&"l".to_owned()),
+            "`l` sets later on the priority, so the box does not call it the next option"
+        );
+        for spec in listed(Act::RequirementsPriorityMust) {
             let mut form = on_priority(Priority::Later);
             assert_eq!(press(&mut form, &spec, keys), FormOutcome::Stay, "{spec}");
             assert_eq!(form.priority, Priority::Must, "{spec}");
         }
-        for spec in labelled(Act::RequirementsPriorityLater) {
-            let mut form = on_priority(Priority::Must);
-            assert_eq!(press(&mut form, &spec, keys), FormOutcome::Stay, "{spec}");
-            assert_eq!(form.priority, Priority::Later, "{spec}");
+        for spec in listed(Act::RequirementsPriorityLater) {
+            for from in [Priority::Must, Priority::Later] {
+                let mut form = on_priority(from);
+                assert_eq!(press(&mut form, &spec, keys), FormOutcome::Stay, "{spec}");
+                assert_eq!(form.priority, Priority::Later, "{spec}");
+            }
         }
         for act in [Act::ChoicePrev, Act::ChoiceNext, Act::ChoiceToggle] {
-            for spec in labelled(act) {
-                if keys
-                    .actions(
-                        views::REQUIREMENTS_FORM,
-                        KeyChord::parse_strict(&spec).expect("a valid spec"),
-                    )
-                    .first()
-                    == Some(&Act::RequirementsPriorityLater)
-                {
-                    continue; // `l` sets later, as the box says first
+            for spec in listed(act) {
+                for (from, to) in [
+                    (Priority::Must, Priority::Later),
+                    (Priority::Later, Priority::Must),
+                ] {
+                    let mut form = on_priority(from);
+                    assert_eq!(press(&mut form, &spec, keys), FormOutcome::Stay, "{spec}");
+                    assert_eq!(form.priority, to, "{act:?} {spec} toggles");
                 }
-                let mut form = on_priority(Priority::Must);
-                assert_eq!(press(&mut form, &spec, keys), FormOutcome::Stay, "{spec}");
-                assert_eq!(form.priority, Priority::Later, "{act:?} {spec}");
             }
         }
         let mut form = on_priority(Priority::Must);
