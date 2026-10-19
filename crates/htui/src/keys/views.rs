@@ -1321,6 +1321,20 @@ mod tests {
         Keys::compiled().actions(stack, chord(spec))
     }
 
+    /// MOD-115 M2 T6 (blueprint D-15): `MODAL` admits neither the pane keys (B2) nor the tab
+    /// keys, so a form never switches tabs, on the default `ctrl-pgdn` or on a `next_tab` rebound
+    /// to a chord the modal filter passes; the capturing Skills modes keep them through `TABS`.
+    #[test]
+    fn a_capturing_mode_never_switches_tabs() {
+        assert_eq!(resolve(ITEM_FORM, "ctrl-pgdn"), []);
+        assert_eq!(resolve(ITEM_FORM, "ctrl-pgup"), []);
+        let rebound = crate::keys::load_str("version = 2\n[global]\nnext_tab = [\"f7\"]\n")
+            .expect("the file loads");
+        assert_eq!(rebound.actions(ITEM_FORM, chord("f7")), []);
+        assert_eq!(rebound.actions(BACKLOG_BODY, chord("f7")), [Act::NextTab]);
+        assert_eq!(resolve(LIBRARY_EDITOR, "ctrl-pgdn"), [Act::NextTab]);
+    }
+
     #[test]
     fn the_view_stacks_resolve_as_designed() {
         assert_eq!(resolve(HIERARCHY_BROWSE, "ctrl-d"), []);
