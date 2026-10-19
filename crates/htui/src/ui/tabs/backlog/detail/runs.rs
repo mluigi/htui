@@ -1753,6 +1753,14 @@ impl DetailTab for RunsTab {
         !matches!(self.mode, Mode::Browse)
     }
 
+    /// MOD-115 M2 §7: the list's motion moves the step cursor while the detail is focused, as
+    /// its own `J`/`K` (`Act::RunsNextStep`/`RunsPrevStep`) do; the flow follows it.
+    fn step(&mut self, step: super::Step, ctx: &Ctx<'_>) -> Handled {
+        self.move_cursor(step.delta());
+        self.sync_graph(ctx.theme);
+        Handled::Consumed
+    }
+
     fn key_stack(&self) -> Stack<'static> {
         self.stack()
     }
@@ -2261,6 +2269,31 @@ mod tests {
             Some(ids::STEP_PRD),
             "and stops on the first going back"
         );
+    }
+
+    /// MOD-115 M2 §7: with the detail focused the list's motion moves the step cursor, a row as
+    /// `J` and `K` do, or to either end; nothing is asked of the store.
+    #[tokio::test]
+    async fn a_step_moves_the_step_cursor_as_j_and_k_do() {
+        use crate::ui::tabs::backlog::detail::Step;
+
+        let shell = Shell::new();
+        let mut pane = pane(&shell).await;
+        assert_eq!(pane.step(Step::Down, &shell.ctx()), Handled::Consumed);
+        assert_eq!(pane.selected_step(), Some(ids::STEP_PLAN), "a row, as `J`");
+        assert_eq!(pane.step(Step::Bottom, &shell.ctx()), Handled::Consumed);
+        assert_eq!(
+            pane.selected_step(),
+            Some(ids::STEP_REVIEW),
+            "the last step"
+        );
+        assert_eq!(pane.step(Step::Down, &shell.ctx()), Handled::Consumed);
+        assert_eq!(pane.selected_step(), Some(ids::STEP_REVIEW), "clamped");
+        assert_eq!(pane.step(Step::Top, &shell.ctx()), Handled::Consumed);
+        assert_eq!(pane.selected_step(), Some(ids::STEP_PRD), "the first step");
+        assert_eq!(pane.step(Step::Up, &shell.ctx()), Handled::Consumed);
+        assert_eq!(pane.selected_step(), Some(ids::STEP_PRD), "clamped");
+        assert!(shell.emit.take().is_empty(), "a cursor move reads nothing");
     }
 
     #[tokio::test]

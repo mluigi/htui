@@ -1613,16 +1613,22 @@ mod tests {
         })
     }
 
-    /// MOD-71 D1: every view the shell starts with keeps the terminal's own text selection.
+    /// MOD-71 D1: every single-pane view the shell starts with keeps the terminal's own text
+    /// selection; MOD-115 M2 MD8 (T7): a tab with a list and a detail takes the mouse for pane
+    /// focus and seams.
     #[test]
-    fn no_tab_wants_the_mouse_at_start_up() {
+    fn only_a_list_and_detail_tab_wants_the_mouse_at_start_up() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
         crate::app::register_all(&mut app);
         assert!(!app.tabs.is_empty());
         for i in 0..app.tabs.len() {
             assert!(app.tabs.select(i));
-            assert!(!app.wants_mouse(), "{:?}", app.tabs.active_id());
+            let split = app
+                .tabs
+                .active()
+                .is_some_and(|tab| matches!(tab.panes(), crate::ui::shell::Panes::ListDetail(_)));
+            assert_eq!(app.wants_mouse(), split, "{:?}", app.tabs.active_id());
         }
     }
 

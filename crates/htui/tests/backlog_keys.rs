@@ -57,9 +57,10 @@ fn help_box(frame: &str) -> Vec<String> {
     lines
 }
 
-/// The browse status line of a lone Backlog tab: `Stack::BASE`'s.
-const BROWSE: &str =
-    "q quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · 1 select tab · ? help · F9 about";
+/// The browse status line of a lone Backlog tab: `Stack::BASE`'s, and the pane keys of a list +
+/// detail tab (MOD-115 M2 T7).
+const BROWSE: &str = "q quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · 1 select tab · \
+                      ? help · F9 about · Tab next pane · Shift+Tab previous pane";
 
 /// The status line of a capturing mode in a lone Backlog tab (D9).
 const CAPTURING: &str = "Ctrl+c quit · F1 help · F9 about";
@@ -101,11 +102,15 @@ async fn the_runs_pane_status_line_and_box_list_every_layer() {
              N new item · Q queue / dequeue · P pause / resume queue",
             "Common: e edit",
             "List: j/Down down · k/Up up · g/Home top · G/End bottom · Enter fold",
-            // MOD-115 M2 T6: the history keys act on every tab; the layout and pane keys only on
-            // a tab that claims a list and a detail (the Backlog does from Task 7).
+            // MOD-115 M2 T7: the Backlog claims a list and a detail, so the layout and pane keys
+            // act here; Runs keeps `p` (promote) and `P` (pause queue), so no preset key is
+            // offered (blueprint D-1). The history keys act on every tab.
+            "Layout: > wider list · < narrower list · }/Ctrl+Down larger activity · \
+             {/Ctrl+Up smaller activity · F2/Alt+1 show/hide list · F3/Alt+2 show/hide activity · \
+             z zoom",
             "History: Backspace/Alt+Left back · Alt+Right forward",
             "Global: q/Ctrl+c quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · 1-9 select tab · \
-             ?/F1 help · F9 about",
+             ?/F1 help · F9 about · Tab/Ctrl+Right next pane · Shift+Tab/Ctrl+Left previous pane",
             "?/F1 closes this box",
         ],
         "the box:\n{frame}"

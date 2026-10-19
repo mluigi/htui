@@ -46,8 +46,10 @@ use crate::item_writes::{self, ItemDivergence, ItemFormContext, ItemWrite};
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{QUEUE_REQUEST_NAMES, QueueView, QueueWrite, StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
+use crate::ui::shell::{ListSize, PaneId, Panes, TabLayout, TabLoc};
 use crate::ui::tabs::backlog::detail::{
-    BodyTab, DetailRegistry, DocumentsTab, GraphTab, NotesTab, PromptTab, ReqsTab, RunsTab,
+    BodyTab, DetailId, DetailRegistry, DocumentsTab, GraphTab, NotesTab, PromptTab, ReqsTab,
+    RunsTab, Step,
 };
 use crate::ui::tabs::backlog::filter::{BacklogFilter, FilterForm, FormOutcome};
 use crate::ui::tabs::backlog::item_form::{
@@ -58,14 +60,22 @@ use crate::ui::tabs::registry::{CLOSE_THE_FIELD_FIRST, Tab, TabId};
 use crate::ui::tabs::settings::{key_line, modal_rest};
 use crossterm::event::{KeyEvent, MouseEvent};
 
-/// Width of the list pane, as a percentage of the body region.
+/// The Backlog's default layout (MOD-115 M2 D2): the list beside the detail, 55% of the body.
 ///
 /// The list gets the larger half: it carries the longest strings (`KEY  status  title`, with
-/// `awaiting_approval` in it) and it is the pane a reader navigates from.
-const LIST_PERCENT: u16 = 55;
+/// `awaiting_approval` in it) and it is the pane a reader navigates from. The shell's layout
+/// engine splits it as `Layout::horizontal([Percentage(55), Percentage(45)])` did, cell for cell.
+pub const BACKLOG_LAYOUT: TabLayout = TabLayout {
+    list: ListSize::Percent(55),
+    ..TabLayout::DEFAULT
+};
 
-/// Width of the detail pane, as a percentage of the body region.
-const DETAIL_PERCENT: u16 = 45;
+/// How a [`Selection`] is written into a [`TabLoc`] cursor: `item:{id}:{key}` (the key names a
+/// miss, as a reveal's does) or `project:{id}` (MOD-115 M2 §8).
+const ITEM_CURSOR: &str = "item";
+
+/// The project-header half of the cursor format beside [`ITEM_CURSOR`].
+const PROJECT_CURSOR: &str = "project";
 
 /// How far the link traversal behind the Graph sub-tab reaches: its deepest view (MOD-14 D2).
 /// Fetched once per selection and filtered by `+`/`-` locally, so a depth change costs no read and
@@ -804,9 +814,16 @@ impl Tab for BacklogTab {
         // is no list or sub-tab act, so `ctrl-l` cycles nothing (D12).
         let stack = self.detail.key_stack();
         let acts = ctx.keys().actions(stack, KeyChord::from_event(key));
+        // MOD-115 M2 §7: only motion follows the focus. The list's motion and its fold are the
+        // list's while it is focused; the detail steps its own pane; the activity pane takes
+        // them and nothing moves. Every other act, the view verbs, acts whatever is focused.
+        let focus = ctx.focus();
         // D6, PA-2: a project header folds before any pane sees `Enter` (the fold's own guard
         // declines on an item row).
-        if acts.contains(&Act::ListFold) && self.fold(ctx) == Handled::Consumed {
+        if focus == PaneId::List
+            && acts.contains(&Act::ListFold)
+            && self.fold(ctx) == Handled::Consumed
+        {
             return Handled::Consumed;
         }
         // D5: the pane first; it takes its own acts and declines the rest. The Runs pane replays
@@ -815,6 +832,12 @@ impl Tab for BacklogTab {
             return Handled::Consumed;
         }
         for act in acts {
+            if let (Some(step), false) = (Step::of(act), focus == PaneId::List) {
+                if focus == PaneId::Detail {
+                    let _ = self.detail.step(step, ctx);
+                }
+                return Handled::Consumed;
+            }
             match act {
                 Act::ListDown => self.step(1, ctx),
                 Act::ListUp => self.step(-1, ctx),
@@ -1026,16 +1049,27 @@ impl Tab for BacklogTab {
             divergence::render(frame, area, view, ctx.theme);
             return;
         }
-        let [left, right] = panes(area);
-        // MOD-13 D1: the open form takes the bottom of the list pane.
-        let (list_area, form_area) = match self.form {
-            Some(_) => {
-                let [list, form] =
-                    Layout::vertical([Constraint::Min(0), Constraint::Length(filter::FORM_HEIGHT)])
-                        .areas(left);
-                (list, Some(form))
+        // MOD-115 M2 B5: the panes the shell's layout gives the tab, claimed for the focus
+        // borders, the hints and the mouse; today's 55/45 split by default.
+        let areas = ctx.split(area, BACKLOG_LAYOUT);
+        let below = |host: Rect| {
+            let [rest, form] =
+                Layout::vertical([Constraint::Min(0), Constraint::Length(filter::FORM_HEIGHT)])
+                    .areas(host);
+            (rest, form)
+        };
+        // MOD-13 D1: the open form takes the bottom of the list pane; with the list hidden, the
+        // bottom of the detail's, so a form that captures every key is never off screen.
+        let (list_area, detail_area, form_area) = match (self.form.is_some(), areas.list) {
+            (true, Some(list)) => {
+                let (list, form) = below(list);
+                (Some(list), areas.detail, Some(form))
             }
-            None => (left, None),
+            (true, None) => {
+                let (detail, form) = below(areas.detail);
+                (None, detail, Some(form))
+            }
+            (false, list) => (list, areas.detail, None),
         };
 
         // MOD-13 review M1: the filter the rows were read under, not the one still in flight.
@@ -1047,21 +1081,82 @@ impl Tab for BacklogTab {
             selected: self.selected,
             filter: summary.as_deref(),
         };
-        list::render(frame, list_area, &view, ctx.theme);
+        if let Some(list_area) = list_area {
+            list::render(frame, list_area, &view, ctx.theme);
+        }
         if let (Some(form), Some(at)) = (&self.form, form_area) {
             filter::render(frame, at, form, ctx.theme);
         }
-        // MOD-13 milestone 2 D8: the open item form takes the detail pane's place.
+        // MOD-13 milestone 2 D8: the open item form takes the detail pane's place, or the whole
+        // area while another pane is zoomed, so a form that captures every key is on screen.
         match &self.item_form {
-            Some(form) => ctx.claim_editor_area(item_form::render(frame, right, form, ctx.theme)),
+            Some(form) => {
+                let at = if detail_area.is_empty() {
+                    area
+                } else {
+                    detail_area
+                };
+                ctx.claim_editor_area(item_form::render(frame, at, form, ctx.theme));
+            }
+            None if detail_area.is_empty() => {}
             None => detail::render(
                 frame,
-                right,
+                detail_area,
                 &self.detail,
                 self.item().map(|item| item.key.as_str()),
                 ctx,
             ),
         }
+    }
+
+    /// MOD-115 M2 D2: a list and a detail, today's 55/45 by default.
+    fn panes(&self) -> Panes {
+        Panes::ListDetail(BACKLOG_LAYOUT)
+    }
+
+    /// MOD-115 M2 §8: the active sub-tab, by id and title, and the row under the cursor.
+    fn location(&self) -> TabLoc {
+        let cursor = match self.selected {
+            Some(Selection::Item(id)) => {
+                let key = self
+                    .items
+                    .iter()
+                    .find(|item| item.id == id)
+                    .map_or("", |item| item.key.as_str());
+                Some(format!("{ITEM_CURSOR}:{id}:{key}"))
+            }
+            Some(Selection::Project(id)) => Some(format!("{PROJECT_CURSOR}:{id}")),
+            None => None,
+        };
+        TabLoc {
+            subtab: self.detail.active_id().map(|id| id.0),
+            subtab_title: self.detail.active().map(|tab| tab.title().to_owned()),
+            cursor,
+        }
+    }
+
+    /// MOD-115 M2 §8: back to a [`location`](Tab::location): its sub-tab, then its item through
+    /// the reveal path (unfolded, read, or read again when the list no longer holds it), or its
+    /// project header while the list shows it. Nothing while a form or a capturing sub-tab holds
+    /// the keys: a move would drop what it is typing.
+    fn restore(&mut self, loc: &TabLoc, ctx: &mut Ctx<'_>) -> bool {
+        if self.form.is_some() || self.item_form.is_some() || self.detail.captures_input() {
+            return false;
+        }
+        let subtab = loc
+            .subtab
+            .is_some_and(|id| self.detail.select_id(DetailId(id)));
+        let row = match loc.cursor.as_deref().and_then(parse_cursor) {
+            Some((Selection::Item(id), key)) => self.reveal(&RevealTarget::Item { id, key }, ctx),
+            Some((Selection::Project(id), _))
+                if self.rows(ctx).contains(&Selection::Project(id)) =>
+            {
+                self.go(Some(Selection::Project(id)), ctx);
+                true
+            }
+            Some((Selection::Project(_), _)) | None => false,
+        };
+        subtab || row
     }
 
     fn reveal(&mut self, target: &RevealTarget, ctx: &mut Ctx<'_>) -> bool {
@@ -1196,13 +1291,26 @@ fn replay_miss(keys: &Keys) -> String {
     }
 }
 
-/// Splits the body region into the list pane and the detail pane.
+/// The [`Selection`] a [`TabLoc`] cursor written by [`BacklogTab`]'s `location` names, with an
+/// item's key (empty for a project header); `None` for any other string (MOD-115 M2 §8).
+fn parse_cursor(cursor: &str) -> Option<(Selection, String)> {
+    let mut parts = cursor.splitn(3, ':');
+    match (parts.next()?, parts.next()?) {
+        (ITEM_CURSOR, id) => Some((
+            Selection::Item(id.parse().ok()?),
+            parts.next().unwrap_or_default().to_owned(),
+        )),
+        (PROJECT_CURSOR, id) => Some((Selection::Project(id.parse().ok()?), String::new())),
+        _ => None,
+    }
+}
+
+/// The body region split into the list pane and the detail pane by the default layout: what
+/// the tests that size a pane measure against.
+#[cfg(test)]
 fn panes(area: Rect) -> [Rect; 2] {
-    Layout::horizontal([
-        Constraint::Percentage(LIST_PERCENT),
-        Constraint::Percentage(DETAIL_PERCENT),
-    ])
-    .areas(area)
+    let areas = crate::ui::shell::layout::areas(area, &BACKLOG_LAYOUT, PaneId::List);
+    [areas.list.unwrap_or_default(), areas.detail]
 }
 
 /// The Backlog's sentence for a reveal of an item this workspace does not hold (MOD-64 D235, F5).
@@ -1223,7 +1331,8 @@ mod tests {
     use crate::testkit::DEFAULT_SIZE;
     use crate::ui::Theme;
     use crate::ui::layout::chrome;
-    use crate::ui::tabs::backlog::detail::{DetailId, DetailTab};
+    use crate::ui::shell::{ListSize, PaneId, Preset};
+    use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Step};
     use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
     use htui_core::model::ItemFilter;
     use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
@@ -4532,5 +4641,341 @@ mod tests {
             bench.tab().list_hint(&keys).as_deref(),
             Some("j/k move \u{b7} h/l sub-tab \u{b7} / filter \u{b7} N new \u{b7} e edit")
         );
+    }
+
+    // ---- MOD-115 M2 T7: the panes, motion by focus, the location ---------------------------
+
+    /// A sub-tab that records the steps it takes and the keys it is offered, passing every key.
+    #[derive(Debug)]
+    struct StepProbe {
+        steps: Rc<RefCell<Vec<Step>>>,
+        keys: Rc<RefCell<Vec<KeyCode>>>,
+    }
+
+    impl DetailTab for StepProbe {
+        fn id(&self) -> DetailId {
+            DetailId("probe")
+        }
+        fn title(&self) -> &str {
+            "Probe"
+        }
+        fn on_item_change(&mut self, _item: Option<ItemId>) {}
+        fn on_key(&mut self, key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            self.keys.borrow_mut().push(key.code);
+            Handled::Pass
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+        fn step(&mut self, step: Step, _ctx: &Ctx<'_>) -> Handled {
+            self.steps.borrow_mut().push(step);
+            Handled::Consumed
+        }
+    }
+
+    /// What a [`StepProbe`] took.
+    type Steps = Rc<RefCell<Vec<Step>>>;
+
+    /// What a [`StepProbe`] was offered.
+    type Offered = Rc<RefCell<Vec<KeyCode>>>;
+
+    /// The settled tab with a [`StepProbe`] as its only sub-tab, and the probe's two logs.
+    fn stepping(bench: &Bench) -> (BacklogTab, Steps, Offered) {
+        let (steps, keys): (Steps, Offered) = (Rc::default(), Rc::default());
+        let mut detail = DetailRegistry::new();
+        detail.register(Box::new(StepProbe {
+            steps: Rc::clone(&steps),
+            keys: Rc::clone(&keys),
+        }));
+        let tab = BacklogTab {
+            detail,
+            ..bench.tab()
+        };
+        (tab, steps, keys)
+    }
+
+    /// The tab drawn at the harness's size through `ctx`, as snapshot text.
+    fn drawn_through(tab: &BacklogTab, ctx: &Ctx<'_>) -> String {
+        let (width, height) = DEFAULT_SIZE;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("a test terminal");
+        terminal
+            .draw(|frame| tab.render(frame, frame.area(), ctx))
+            .expect("the frame draws");
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The first project's id: the project `bench.first` sits under.
+    fn first_project(bench: &Bench) -> ProjectId {
+        bench
+            .items
+            .iter()
+            .find(|item| Selection::Item(item.id) == bench.first)
+            .map(|item| item.project_id)
+            .expect("the first row is an item")
+    }
+
+    /// MOD-115 M2 D2: the Backlog is a list + detail tab, its default today's 55/45 split, and
+    /// its render claims exactly the rects the tab drew before the shell kept layouts.
+    #[tokio::test]
+    async fn the_backlog_claims_a_list_and_a_detail_at_today_s_split() {
+        assert_eq!(BacklogTab::new().panes(), Panes::ListDetail(BACKLOG_LAYOUT));
+        assert_eq!(BACKLOG_LAYOUT.list, ListSize::Percent(55));
+        assert_eq!(BACKLOG_LAYOUT.preset, Preset::Ide);
+
+        let bench = Bench::new().await;
+        let claim = Cell::new(None);
+        let ctx = bench.ctx().with_pane_claim(&claim);
+        let _ = drawn_through(&bench.tab(), &ctx);
+        let (region, areas) = claim.get().expect("the render claims its panes");
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .areas(region);
+        assert_eq!(region, Rect::new(0, 0, DEFAULT_SIZE.0, DEFAULT_SIZE.1));
+        assert_eq!((areas.list, areas.detail), (Some(left), right));
+        assert_eq!(areas.activity, None);
+    }
+
+    /// MOD-115 M2 D2: a layout that hides the list gives the detail the whole body; the
+    /// divergence view still takes the whole area and claims nothing.
+    #[tokio::test]
+    async fn a_hidden_list_gives_the_detail_the_whole_body() {
+        let bench = Bench::new().await;
+        let key = bench
+            .items
+            .iter()
+            .find(|item| Selection::Item(item.id) == bench.first)
+            .map(|item| item.key.clone())
+            .expect("the first row is an item");
+        let focus = TabLayout {
+            preset: Preset::Focus,
+            ..BACKLOG_LAYOUT
+        };
+        let frame = drawn_through(&bench.tab(), &bench.ctx().with_layout(focus));
+        let top = frame.lines().next().expect("a first row");
+        assert!(
+            top.starts_with(&format!("\u{250c} {key} ")),
+            "the detail starts at the left edge:\n{frame}"
+        );
+        let both = drawn_through(&bench.tab(), &bench.ctx());
+        assert!(
+            !both
+                .lines()
+                .next()
+                .unwrap_or("")
+                .starts_with(&format!("\u{250c} {key} ")),
+            "the list is on the left by default:\n{both}"
+        );
+    }
+
+    /// MOD-115 M2 §7: with the list focused, motion moves the list as before; the pane is
+    /// offered the key first and takes no step.
+    #[tokio::test]
+    async fn with_the_list_focused_motion_moves_the_list() {
+        let bench = Bench::new().await;
+        let (mut tab, steps, keys) = stepping(&bench);
+        let mut ctx = bench.ctx().with_focus(PaneId::List);
+        assert_eq!(
+            tab.on_key(KeyEvent::from(KeyCode::Char('j')), &mut ctx),
+            Handled::Consumed
+        );
+        assert_ne!(tab.selected, Some(bench.first), "the cursor moved");
+        assert!(steps.borrow().is_empty(), "the pane took no step");
+        assert_eq!(*keys.borrow(), [KeyCode::Char('j')], "offered first");
+    }
+
+    /// MOD-115 M2 §7: with the detail focused, `list.down`/`up`/`top`/`bottom` step the detail
+    /// pane and the list cursor stays, so no detail read goes out.
+    #[tokio::test]
+    async fn with_the_detail_focused_motion_steps_the_detail_pane() {
+        let bench = Bench::new().await;
+        let (mut tab, steps, _) = stepping(&bench);
+        let mut ctx = bench.ctx().with_focus(PaneId::Detail);
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Up,
+            KeyCode::Char('g'),
+            KeyCode::End,
+        ] {
+            assert_eq!(
+                tab.on_key(KeyEvent::from(code), &mut ctx),
+                Handled::Consumed,
+                "{code:?}"
+            );
+        }
+        assert_eq!(
+            *steps.borrow(),
+            [Step::Down, Step::Up, Step::Top, Step::Bottom]
+        );
+        assert_eq!(tab.selected, Some(bench.first), "the list cursor stayed");
+        assert!(bench.actions().is_empty(), "so nothing was read");
+    }
+
+    /// MOD-115 M2 §7: a sub-tab that takes no step (the trait's default) still keeps the list
+    /// cursor where it is while the detail is focused.
+    #[tokio::test]
+    async fn a_pane_that_takes_no_step_still_keeps_the_list_cursor() {
+        let bench = Bench::new().await;
+        let mut detail = DetailRegistry::new();
+        detail.register(Box::new(CapturingProbe {
+            capturing: Rc::new(Cell::new(false)),
+            seen: Rc::default(),
+        }));
+        let mut tab = BacklogTab {
+            detail,
+            ..bench.tab()
+        };
+        let mut ctx = bench.ctx().with_focus(PaneId::Detail);
+        assert_eq!(
+            tab.on_key(KeyEvent::from(KeyCode::Char('j')), &mut ctx),
+            Handled::Consumed
+        );
+        assert_eq!(tab.selected, Some(bench.first));
+    }
+
+    /// MOD-115 M2 §7: with the activity pane focused, motion is consumed and nothing moves.
+    #[tokio::test]
+    async fn with_the_activity_focused_motion_moves_nothing() {
+        let bench = Bench::new().await;
+        let (mut tab, steps, _) = stepping(&bench);
+        let mut ctx = bench.ctx().with_focus(PaneId::Activity);
+        for code in [KeyCode::Char('j'), KeyCode::Char('k'), KeyCode::Char('G')] {
+            assert_eq!(
+                tab.on_key(KeyEvent::from(code), &mut ctx),
+                Handled::Consumed,
+                "{code:?}"
+            );
+        }
+        assert!(steps.borrow().is_empty(), "the detail took no step");
+        assert_eq!(tab.selected, Some(bench.first), "the list cursor stayed");
+        assert!(bench.actions().is_empty());
+    }
+
+    /// MOD-115 M2 §7: `Enter` on a project header folds it with the list focused; with the
+    /// detail focused it skips the fold and reaches the pane (the Runs pane replays there).
+    #[tokio::test]
+    async fn enter_with_the_detail_focused_reaches_the_pane_not_the_fold() {
+        let bench = Bench::new().await;
+        let project = first_project(&bench);
+        let (mut tab, _, keys) = stepping(&bench);
+        tab.selected = Some(Selection::Project(project));
+        let mut ctx = bench.ctx().with_focus(PaneId::Detail);
+        let _ = tab.on_key(KeyEvent::from(KeyCode::Enter), &mut ctx);
+        assert!(tab.folded.is_empty(), "no fold with the detail focused");
+        assert_eq!(*keys.borrow(), [KeyCode::Enter], "the pane was offered it");
+
+        let mut ctx = bench.ctx().with_focus(PaneId::List);
+        assert_eq!(
+            tab.on_key(KeyEvent::from(KeyCode::Enter), &mut ctx),
+            Handled::Consumed
+        );
+        assert_eq!(tab.folded, [project], "the list's fold");
+    }
+
+    /// MOD-115 M2 §7: a view verb acts whatever pane is focused: `f` opens the filter with the
+    /// detail focused, and `l` cycles the sub-tab with the activity pane focused.
+    #[tokio::test]
+    async fn a_view_verb_acts_whatever_pane_is_focused() {
+        let bench = Bench::new().await;
+        let mut tab = bench.tab();
+        let before = tab.detail.active_id();
+        let mut ctx = bench.ctx().with_focus(PaneId::Activity);
+        let _ = tab.on_key(KeyEvent::from(KeyCode::Char('l')), &mut ctx);
+        assert_ne!(tab.detail.active_id(), before, "the sub-tab cycled");
+        let mut ctx = bench.ctx().with_focus(PaneId::Detail);
+        let _ = tab.on_key(KeyEvent::from(KeyCode::Char('f')), &mut ctx);
+        assert!(tab.form.is_some(), "the filter opened");
+    }
+
+    /// MOD-115 M2 D5, §8: the location names the active sub-tab (id and title) and the item
+    /// under the cursor; restoring it on a tab moved since selects the sub-tab, unfolds the
+    /// item's project and selects the item, reading its detail.
+    #[tokio::test]
+    async fn the_location_names_the_sub_tab_and_the_item_and_restore_returns_to_them() {
+        let bench = Bench::new().await;
+        let mut tab = bench.tab();
+        assert!(tab.detail.select_id(RunsTab::ID));
+        let here = tab.location();
+        assert_eq!(here.subtab, Some("runs"));
+        assert_eq!(here.subtab_title.as_deref(), Some("Runs"));
+        assert!(here.cursor.is_some(), "the item under the cursor");
+
+        let mut moved = bench.tab();
+        let _ = moved.on_key(KeyEvent::from(KeyCode::Char('j')), &mut bench.ctx());
+        assert_ne!(moved.selected, Some(bench.first));
+        let project = first_project(&bench);
+        moved.folded.push(project);
+        let _ = bench.actions();
+
+        assert!(moved.restore(&here, &mut bench.ctx()));
+        assert_eq!(moved.selected, Some(bench.first), "back on the item");
+        assert_eq!(moved.detail.active_id(), Some(RunsTab::ID), "on Runs");
+        assert!(!moved.folded.contains(&project), "its project unfolded");
+        let Selection::Item(id) = bench.first else {
+            unreachable!("the first row is an item")
+        };
+        assert!(
+            bench.actions().iter().any(
+                |action| matches!(action, Action::Store(StoreRequest::Item(read)) if *read == id)
+            ),
+            "its detail is read"
+        );
+        assert_eq!(moved.location(), here, "and the location reads the same");
+    }
+
+    /// MOD-115 M2 §8: a project header is a location too.
+    #[tokio::test]
+    async fn a_project_header_is_a_location_too() {
+        let bench = Bench::new().await;
+        let project = first_project(&bench);
+        let mut tab = bench.tab();
+        tab.selected = Some(Selection::Project(project));
+        let here = tab.location();
+        let mut moved = bench.tab();
+        assert!(moved.restore(&here, &mut bench.ctx()));
+        assert_eq!(moved.selected, Some(Selection::Project(project)));
+    }
+
+    /// MOD-115 M2 §8: an item the list no longer holds is read again, as a reveal reads it
+    /// (the filter goes, the reveal is armed).
+    #[tokio::test]
+    async fn restoring_an_item_the_list_does_not_hold_reads_it_again() {
+        let bench = Bench::new().await;
+        let here = bench.tab().location();
+        let mut empty = BacklogTab::new();
+        assert!(empty.restore(&here, &mut bench.ctx()));
+        assert!(empty.pending_reveal.is_some(), "the reveal is armed");
+        assert_eq!(items_reads(&bench.actions()).len(), 1, "one list read");
+    }
+
+    /// MOD-115 M2 §8: an open form keeps the tab where it is, and a location that names no
+    /// sub-tab or item restores nothing.
+    #[tokio::test]
+    async fn restore_moves_nothing_while_a_form_is_open_or_with_nothing_named() {
+        let bench = Bench::new().await;
+        let here = {
+            let mut tab = bench.tab();
+            tab.detail.select_id(RunsTab::ID);
+            tab.location()
+        };
+        let mut tab = bench.tab();
+        let _ = tab.on_key(KeyEvent::from(KeyCode::Char('j')), &mut bench.ctx());
+        let at = tab.selected;
+        tab.form = Some(FilterForm::open(&tab.filter, &bench.projects));
+        assert!(!tab.restore(&here, &mut bench.ctx()));
+        assert_eq!(tab.selected, at);
+        assert_ne!(tab.detail.active_id(), Some(RunsTab::ID));
+
+        let mut tab = bench.tab();
+        assert!(!tab.restore(&TabLoc::default(), &mut bench.ctx()));
+        assert_eq!(tab.selected, Some(bench.first));
     }
 }

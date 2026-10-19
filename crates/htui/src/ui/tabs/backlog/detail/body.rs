@@ -23,7 +23,7 @@ use crate::app::{Ctx, Handled};
 use crate::keys::{Act, KeyChord};
 use crate::store_worker::StoreReply;
 use crate::ui::markdown;
-use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Scroll, message};
+use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Scroll, Step, message};
 use crossterm::event::KeyEvent;
 
 /// How many lines the head block takes: title, key line, meta line, blank.
@@ -89,6 +89,11 @@ impl DetailTab for BodyTab {
             }
         }
         Handled::Pass
+    }
+
+    /// MOD-115 M2 §7: the list's motion scrolls the body while the detail is focused.
+    fn step(&mut self, step: Step, _ctx: &Ctx<'_>) -> Handled {
+        self.scroll.follow(step, self.len())
     }
 
     fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
@@ -261,6 +266,29 @@ mod tests {
         }
         let rows = rows(&pane, &shell, 43, 30);
         assert_eq!(rows[4], "  loop.", "{rows:#?}");
+    }
+
+    /// MOD-115 M2 §7: with the detail focused the list's motion scrolls the body, a row as `J`
+    /// and `K` do, or to either end, clamped against the rows of the last render.
+    #[tokio::test]
+    async fn a_step_scrolls_the_body_as_its_scroll_keys_do() {
+        let shell = Shell::new();
+        let mut stepped = pane(&shell).await;
+        let mut keyed = pane(&shell).await;
+        let _ = rows(&stepped, &shell, 20, 12);
+        let _ = rows(&keyed, &shell, 20, 12);
+        assert_eq!(stepped.step(Step::Down, &shell.ctx()), Handled::Consumed);
+        let _ = keyed.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+        assert_eq!(stepped.scroll, keyed.scroll, "a row, as `J`");
+        assert_eq!(stepped.scroll.offset(), 1);
+
+        let last = stepped.len() - 1;
+        assert_eq!(stepped.step(Step::Bottom, &shell.ctx()), Handled::Consumed);
+        assert_eq!(stepped.scroll.skip(), last, "the body's last row");
+        assert_eq!(stepped.step(Step::Up, &shell.ctx()), Handled::Consumed);
+        assert_eq!(stepped.scroll.skip(), last - 1, "a row up, as `K`");
+        assert_eq!(stepped.step(Step::Top, &shell.ctx()), Handled::Consumed);
+        assert_eq!(stepped.scroll.offset(), 0, "the top");
     }
 
     /// Before the first render the scroll counts the body unwrapped, the old lower bound.

@@ -565,6 +565,13 @@ impl DetailTab for ReqsTab {
         !matches!(self.mode, Mode::Browse)
     }
 
+    /// MOD-115 M2 §7: the list's motion moves the citation cursor while the detail is focused,
+    /// as its own `J`/`K` (`Act::ReqsNextRow`/`ReqsPrevRow`) do.
+    fn step(&mut self, step: super::Step, _ctx: &Ctx<'_>) -> Handled {
+        self.move_cursor(step.delta());
+        Handled::Consumed
+    }
+
     /// Blueprint §5.4: a fresh [`ItemCitations`] for this item lands whichever request it
     /// answers, the cursor following its citation; a refused read is drawn in the pane; a refused
     /// write only frees the pane, the status line already has its sentence. Only the write in
@@ -1197,6 +1204,32 @@ mod tests {
         assert_eq!(window(&pane), ["  R-ENT-2 ", "▸ R-STO-1 "]);
         pane.on_key(key(KeyCode::Char('j')), &mut shell.ctx());
         assert_eq!(pane.mode, Mode::Pick { cursor: 2 }, "the last stays last");
+    }
+
+    /// MOD-115 M2 §7: with the detail focused the list's motion moves the citation cursor, a row
+    /// as `J` and `K` do, or to either end; nothing is asked of the store.
+    #[tokio::test]
+    async fn a_step_moves_the_citation_cursor_as_j_and_k_do() {
+        use crate::ui::tabs::backlog::detail::Step;
+
+        let shell = Shell::new();
+        // FEAT-1 cites one requirement; three rows give the cursor somewhere to go.
+        let mut three = citations(ids::HTUI_FEAT_1).await;
+        let cited = three.citations[0].clone();
+        three.citations.extend([cited.clone(), cited]);
+        let mut pane = pane(&shell, ids::HTUI_FEAT_1, three);
+        let last = pane.rows().len() - 1;
+        assert_eq!(last, 2);
+        assert_eq!(pane.step(Step::Down, &shell.ctx()), Handled::Consumed);
+        assert_eq!(pane.cursor, 1, "a row, as `J`");
+        assert_eq!(pane.step(Step::Bottom, &shell.ctx()), Handled::Consumed);
+        assert_eq!(pane.cursor, last, "the last citation");
+        assert_eq!(pane.step(Step::Top, &shell.ctx()), Handled::Consumed);
+        assert_eq!(pane.cursor, 0, "the first");
+        assert_eq!(pane.step(Step::Up, &shell.ctx()), Handled::Consumed);
+        assert_eq!(pane.cursor, 0, "clamped");
+        let (requests, _) = shell.drained();
+        assert!(requests.is_empty(), "a cursor move reads nothing");
     }
 
     /// Review of T4: across a reply the cursor stays on its citation, lands on the one a cite

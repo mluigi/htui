@@ -48,14 +48,15 @@ use ratatui::widgets::Paragraph;
 /// A DSN that parses and names a port nothing listens on (`tests/connection.rs`'s).
 const DEAD_DSN: &str = "postgres://htui:s3cret@127.0.0.1:1/htui?sslmode=disable";
 
-/// The keys line of the bare shell, the one the status row listed before MOD-115.
-const BARE_STATUS: &str =
-    "q quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · 1 select tab · ? help · F9 about";
+/// The keys line of the bare shell, the one the status row listed before MOD-115, and the pane
+/// keys the Backlog offers as a list + detail tab (MOD-115 M2 T7).
+const BARE_STATUS: &str = "q quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · 1 select tab · \
+                           ? help · F9 about · Tab next pane · Shift+Tab previous pane";
 
-/// The keys line with `register_all`.
+/// The keys line with `register_all`, on the Backlog.
 const FULL_STATUS: &str = "q quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · 1 select tab · \
                            ? help · F9 about · w workspaces · Ctrl+f find · Ctrl+w waiting · \
-                           Ctrl+q queue";
+                           Ctrl+q queue · Tab next pane · Shift+Tab previous pane";
 
 /// The `?` box's closing line.
 const CLOSER: &str = "?/F1 closes this box";

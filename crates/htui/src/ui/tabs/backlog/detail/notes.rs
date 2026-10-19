@@ -327,6 +327,13 @@ impl DetailTab for NotesTab {
         Handled::Pass
     }
 
+    /// MOD-115 M2 §7: the list's motion scrolls the thread while the detail is focused, over
+    /// the rows as wrapped at the last render (review L1, as `J`/`K`).
+    fn step(&mut self, step: super::Step, _ctx: &Ctx<'_>) -> Handled {
+        let (width, _) = self.drawn.get();
+        self.scroll.follow(step, self.row_count(width))
+    }
+
     /// `NOTES_COMPOSE` while the area is open, else `BACKLOG_NOTES` (MOD-67 M5 D4).
     fn key_stack(&self) -> Stack<'static> {
         self.compose
@@ -480,6 +487,7 @@ mod tests {
     use crate::editor::{ExternalEdit, ExternalEditOutcome, edited};
     use crate::hand_written::{ADD_NOTE_NAME, NOTE_FORM_NAME};
     use crate::store_worker::StoreRequest;
+    use crate::ui::tabs::backlog::detail::Step;
     use crate::ui::tabs::backlog::detail::compose::bench::{Shell, ctrl, drawn, key, row_from};
     use crate::ui::tabs::backlog::detail::compose::{
         could_not_check, may_have_landed, not_written,
@@ -535,6 +543,31 @@ mod tests {
 
     fn compose(pane: &NotesTab) -> &Compose {
         pane.compose.as_ref().expect("the area is open")
+    }
+
+    /// MOD-115 M2 §7: with the detail focused the list's motion scrolls the thread, a row as `J`
+    /// and `K` do, or to either end, clamped against the rows wrapped at the last render.
+    #[tokio::test]
+    async fn a_step_scrolls_the_thread_as_its_scroll_keys_do() {
+        let shell = Shell::new();
+        let mut stepped = pane(&shell).await;
+        let mut keyed = pane(&shell).await;
+        for pane in [&stepped, &keyed] {
+            let _ = drawn(24, 8, |frame, area| pane.render(frame, area, &shell.ctx()));
+        }
+        assert_eq!(stepped.step(Step::Down, &shell.ctx()), Handled::Consumed);
+        let _ = keyed.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+        assert_eq!(stepped.scroll, keyed.scroll, "a row, as `J`");
+        assert_eq!(stepped.scroll.offset(), 1);
+
+        let last = stepped.row_count(stepped.drawn.get().0) - 1;
+        assert!(last > 1, "the thread wraps past a row at 24 cells");
+        assert_eq!(stepped.step(Step::Bottom, &shell.ctx()), Handled::Consumed);
+        assert_eq!(stepped.scroll.skip(), last, "the thread's last row");
+        assert_eq!(stepped.step(Step::Up, &shell.ctx()), Handled::Consumed);
+        assert_eq!(stepped.scroll.skip(), last - 1, "a row up, as `K`");
+        assert_eq!(stepped.step(Step::Top, &shell.ctx()), Handled::Consumed);
+        assert_eq!(stepped.scroll.offset(), 0, "the top");
     }
 
     #[tokio::test]
