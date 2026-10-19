@@ -112,13 +112,23 @@ impl Keys {
     /// when no chord reaches it.
     #[must_use]
     pub fn reachable_label(&self, stack: Stack<'_>, act: Act) -> Option<String> {
+        self.reachable_chord(stack, act)
+            .map(|chord| chord.short_label())
+    }
+
+    /// The chord [`reachable_label`](Self::reachable_label) names: the first chord of `act`
+    /// through `stack` that its layer admits and whose first candidate is `act`. What the
+    /// hidden-pane note and the activity placeholder label (`KeyChord::label`), so a key a
+    /// narrower act takes (`p` in Backlog > Runs, blueprint D-1) is never offered; and the key
+    /// the wheel stands for (MD8). `None` when no chord reaches it.
+    #[must_use]
+    pub fn reachable_chord(&self, stack: Stack<'_>, act: Act) -> Option<KeyChord> {
         let (layer, row) = self.resolve_row(stack, act)?;
         row.chords
             .iter()
             .copied()
             .filter(|chord| layer.admits_chord(*chord))
             .find(|chord| self.actions(stack, *chord).first() == Some(&act))
-            .map(|chord| chord.short_label())
     }
 
     /// Every chord of `act` through `stack` that its layer admits, as labels (MOD-67 D9).

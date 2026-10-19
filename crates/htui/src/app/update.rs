@@ -16,11 +16,11 @@ use crate::connection::DsnState;
 use crate::run_worker::OrchRequest;
 use crate::store_worker::{Origin, ReplyEnvelope, StoreReply, StoreRequest};
 use crate::ui::overlay::{Overlay, OverlayId};
-use crate::ui::shell::PaneId;
 use crate::ui::shell::history::Loc;
 use crate::ui::shell::layout as pane_layout;
-use crate::ui::tabs::SettingsTab;
+use crate::ui::shell::{PaneId, TabLayout};
 use crate::ui::tabs::settings::ConnectionSection;
+use crate::ui::tabs::{SettingsTab, TabId};
 
 /// The top bar's counts are re-read once a second, i.e. every fourth 250 ms tick.
 const TICKS_PER_REFRESH: u64 = 4;
@@ -144,17 +144,21 @@ impl App {
             LayoutAction::Zoom => layout.toggle_zoom(),
         }
         self.ui.layouts.insert(id.0.to_owned(), layout);
-        // The region the tab split last, else one that holds every pane: only which panes are
-        // shown matters here.
+        if self.hides(id, &layout, focus) {
+            self.focus.insert(id, PaneId::Detail);
+        }
+        self.save_ui_state();
+    }
+
+    /// Whether `layout` hides `pane` of tab `id` (MOD-115 M2 D3), drawn over the region the tab
+    /// split last, else one that holds every pane: only which panes are shown matters here.
+    fn hides(&self, id: TabId, layout: &TabLayout, pane: PaneId) -> bool {
         let region = self
             .last_claim
             .filter(|(claimed, _, _)| *claimed == id)
             .map_or(Rect::new(0, 0, 200, 60), |(_, region, _)| region);
-        let areas = pane_layout::areas(region, &layout, focus);
-        if !pane_layout::visible(&areas).contains(&focus) {
-            self.focus.insert(id, PaneId::Detail);
-        }
-        self.save_ui_state();
+        let areas = pane_layout::areas(region, layout, pane);
+        !pane_layout::visible(&areas).contains(&pane)
     }
 
     /// `history.back`/`forward` (MOD-115 M2 D5): to the place on the history, the place left
@@ -203,7 +207,16 @@ impl App {
             }
             self.drain(&origin);
         }
-        self.focus.insert(loc.tab, loc.pane);
+        // D3: a pane the layout has hidden since the place was left gives the focus to the
+        // detail, as a layout key that hides it does.
+        let hidden = self
+            .tabs
+            .active()
+            .filter(|tab| tab.id() == loc.tab)
+            .and_then(|tab| self.layout_of(tab))
+            .is_some_and(|layout| self.hides(loc.tab, &layout, loc.pane));
+        let pane = if hidden { PaneId::Detail } else { loc.pane };
+        self.focus.insert(loc.tab, pane);
     }
 
     /// Opening and closing overlays. An unregistered id is ignored: the shell must not die

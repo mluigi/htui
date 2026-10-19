@@ -552,7 +552,8 @@ impl App {
         if let Some(activity) = areas.activity.filter(|rect| !rect.is_empty()) {
             let next = self
                 .keys
-                .label(stack, Act::LayoutToggleActivity)
+                .reachable_chord(stack, Act::LayoutToggleActivity)
+                .map(|chord| chord.label())
                 .map_or_else(
                     || ACTIVITY_NEXT_UNBOUND.to_owned(),
                     |key| format!("{key} {ACTIVITY_NEXT}"),
@@ -583,12 +584,18 @@ impl App {
     /// R-TUI-12: what a hidden pane says about bringing it back, right-aligned on the bottom
     /// border of the detail, or of the zoomed pane while the detail is zoomed away (T2 carried
     /// finding 3). Painted after the hints, so it keeps one rule cell before them (finding 2).
+    /// Only keys that reach their act are named: a part whose key a narrower act takes (`p` in
+    /// Backlog > Runs, blueprint D-1) is left out.
     fn paint_hidden_note(&self, frame: &mut Frame<'_>, areas: &PaneAreas) {
         let Some(tab) = self.tabs.active() else {
             return;
         };
         let stack = tab.key_stack().unwrap_or(Stack::BASE);
-        let label = |act| self.keys.label(stack, act);
+        let label = |act| {
+            self.keys
+                .reachable_chord(stack, act)
+                .map(|chord| chord.label())
+        };
         let labels = NoteLabels {
             toggle_list: label(Act::LayoutToggleList),
             toggle_activity: label(Act::LayoutToggleActivity),
@@ -848,7 +855,7 @@ impl App {
             self.lose_mouse();
             self.mouse = false;
             self.mouse_view = None;
-            self.drag = None;
+            self.end_drag();
         }
         edit
     }
@@ -1011,11 +1018,23 @@ impl App {
             self.lose_mouse();
         }
         if !wants {
-            self.drag = None;
+            self.end_drag();
         }
         self.mouse = wants;
         self.mouse_view = holder;
         wants
+    }
+
+    /// Ends a seam drag (MOD-115 M2 §7) and saves the layout it left on screen (D1): on its
+    /// `Up`, and where its `Up` will never reach the shell: capture going off (an overlay, the
+    /// help box, the editor), the loop suspending for an external edit, or a new press after a
+    /// release the terminal lost. `true` when a drag was in progress.
+    fn end_drag(&mut self) -> bool {
+        let ended = self.drag.take().is_some();
+        if ended {
+            self.save_ui_state();
+        }
+        ended
     }
 
     /// MOD-74 D1, D2: tells every tab capture went off.
@@ -1058,8 +1077,12 @@ impl App {
             self.dirty = true;
             return;
         }
-        // Only a tab whose own gesture wants the mouse is handed it (MOD-71 D4).
+        // Only a tab whose own gesture wants the mouse is handed it (MOD-71 D4). For the others
+        // the wheel over a pane is the keymap's list motion there (MD8).
         if !self.tabs.active().is_some_and(Tab::wants_mouse) {
+            if let Some(key) = self.wheel_key(id, mouse) {
+                self.dispatch_key(key);
+            }
             return;
         }
         let origin = Origin::Tab(id);
@@ -1092,6 +1115,25 @@ impl App {
         }
     }
 
+    /// MOD-115 M2 MD8: capture is on for every list + detail tab, so the terminal no longer turns
+    /// the wheel into arrow keys (alternate scroll). For a tab with no gesture of its own, the
+    /// wheel over a pane it claimed focuses that pane and stands for the first chord that
+    /// reaches `list.down`/`list.up` through the tab's stack, so a rebound motion key is what
+    /// the wheel presses. `None` off every pane, for any other event, or with no such chord.
+    fn wheel_key(&mut self, id: TabId, mouse: MouseEvent) -> Option<KeyEvent> {
+        let act = match mouse.kind {
+            MouseEventKind::ScrollDown => Act::ListDown,
+            MouseEventKind::ScrollUp => Act::ListUp,
+            _ => return None,
+        };
+        let (_, _, areas) = self.last_claim.filter(|(claimed, _, _)| *claimed == id)?;
+        let pane = pane_layout::hit(&areas, mouse.column, mouse.row)?;
+        let stack = self.tabs.active()?.key_stack().unwrap_or(Stack::BASE);
+        let chord = self.keys.reachable_chord(stack, act)?;
+        self.focus.insert(id, pane);
+        Some(chord.to_event())
+    }
+
     /// The shell's mouse (MOD-115 M2 §7), over the panes the active tab `id` claimed last frame:
     /// a left press on a seam starts a drag (consumed), one in a pane focuses it (passed on); a
     /// drag moves the seam; the release ends it and saves the layout. `true` when consumed.
@@ -1102,6 +1144,8 @@ impl App {
         let claim = self.last_claim.filter(|(claimed, _, _)| *claimed == id);
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                // A drag whose `Up` never came ends here, saved.
+                self.end_drag();
                 let Some((_, _, areas)) = claim else {
                     return false;
                 };
@@ -1139,13 +1183,7 @@ impl App {
                 self.ui.layouts.insert(id.0.to_owned(), layout);
                 true
             }
-            MouseEventKind::Up(MouseButton::Left) => {
-                if self.drag.take().is_some() {
-                    self.save_ui_state();
-                    return true;
-                }
-                false
-            }
+            MouseEventKind::Up(MouseButton::Left) => self.end_drag(),
             _ => false,
         }
     }
@@ -2004,6 +2042,8 @@ pub(crate) mod shell_tests {
         pub(crate) subtab: Option<&'static str>,
         pub(crate) cursor: usize,
         pub(crate) restored: Vec<TabLoc>,
+        /// The stack it resolves through: Backlog's body sub-tab unless a test names another.
+        pub(crate) stack: Stack<'static>,
     }
 
     impl SplitTab {
@@ -2014,6 +2054,7 @@ pub(crate) mod shell_tests {
                 subtab: None,
                 cursor: 0,
                 restored: Vec::new(),
+                stack: views::BACKLOG_BODY,
             }
         }
     }
@@ -2030,9 +2071,16 @@ pub(crate) mod shell_tests {
         }
         fn on_scope_change(&mut self, _scope: &Scope) {}
         fn on_key(&mut self, key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            if !key.modifiers.is_empty() {
+                return Handled::Pass;
+            }
             match key.code {
-                KeyCode::Char('j') => {
+                KeyCode::Char('j') | KeyCode::Down => {
                     self.cursor += 1;
+                    Handled::Consumed
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.cursor = self.cursor.saturating_sub(1);
                     Handled::Consumed
                 }
                 KeyCode::Char('l') => {
@@ -2057,7 +2105,7 @@ pub(crate) mod shell_tests {
             }
         }
         fn key_stack(&self) -> Option<Stack<'static>> {
-            Some(views::BACKLOG_BODY)
+            Some(self.stack)
         }
         fn key_hint(&self, _width: u16, _ctx: &Ctx<'_>) -> Option<Line<'static>> {
             Some(Line::from("j/k move"))
@@ -2198,14 +2246,56 @@ pub(crate) mod shell_tests {
             text.ends_with("F2 show list \u{b7} p layouts\u{2500}\u{256f}"),
             "{text}"
         );
-        // At a width where the two meet, a rule cell parts them.
-        let buf = draw(&mut app, 40, 12);
+        // Where the note's run is cut short by the hints, it is clipped with an ellipsis and
+        // exactly one rule cell parts the last hint glyph from it: the hints are painted first,
+        // whole, and the note after them.
+        let buf = draw(&mut app, 30, 12);
+        let (_, areas) = claim(&app);
+        let bottom = areas.detail.bottom() - 1;
+        let text = row(&buf, bottom);
+        let at = usize::from(areas.detail.x);
+        let cells: Vec<&str> = (0..buf.area.width)
+            .map(|x| buf[(x, bottom)].symbol())
+            .collect();
+        assert_eq!(cells[at + 2..at + 10].concat(), "j/k move", "{text}");
+        assert_eq!(cells[at + 10], "\u{2500}", "one rule cell: {text}");
+        assert_eq!(cells[at + 11], "F", "the note starts after it: {text}");
+        let right = at + usize::from(areas.detail.width);
+        assert_eq!(
+            cells[right - 3..right].concat(),
+            "\u{2026}\u{2500}\u{256f}",
+            "the note is clipped: {text}"
+        );
+    }
+
+    /// R-TUI-12 with D-1: the note names only keys that reach their act. In Backlog > Runs `p`
+    /// is `runs.promote`, so the note does not offer it for the layouts.
+    #[test]
+    fn a_hidden_note_leaves_out_a_key_a_narrower_act_takes() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.about_visible = false;
+        let mut runs = SplitTab::new(SPLIT, "Backlog");
+        runs.stack = views::RUNS_BROWSE;
+        app.register_tab(Box::new(runs));
+        let p = crate::keys::KeyChord::new(KeyCode::Char('p'), KeyModifiers::NONE);
+        assert_eq!(
+            app.keys.actions(views::RUNS_BROWSE, p).first(),
+            Some(&crate::keys::Act::RunsPromote)
+        );
+        app.ui.layouts.insert(
+            SPLIT.0.to_owned(),
+            TabLayout {
+                list_on: false,
+                ..SPLIT_LAYOUT
+            },
+        );
+        app.focus.insert(SPLIT, PaneId::Detail);
+        let buf = draw(&mut app, 100, 30);
         let (_, areas) = claim(&app);
         let text = row(&buf, areas.detail.bottom() - 1);
-        assert!(
-            !text.contains("movep") && !text.contains("move\u{2026}F"),
-            "{text}"
-        );
+        assert!(text.ends_with("F2 show list\u{2500}\u{256f}"), "{text}");
+        assert!(!text.contains("layouts"), "{text}");
     }
 
     /// Carried finding 3: a zoomed list leaves the detail 0x0; the note goes on the zoomed pane.
@@ -2278,6 +2368,54 @@ pub(crate) mod shell_tests {
         press(&mut chat, KeyCode::Right, KeyModifiers::CONTROL);
         assert!(chat.focus.is_empty(), "{:?}", chat.focus);
         assert_eq!(focused(&chat), PaneId::Detail);
+    }
+
+    /// D4, the headline flip: `Tab`/`BackTab` move the pane focus on a list + detail tab, and
+    /// on Settings (a single-pane tab) they do nothing: no focus, and no tab change either.
+    #[test]
+    fn tab_moves_the_panes_and_does_nothing_on_settings() {
+        let mut app = split_app();
+        let _ = draw(&mut app, 100, 30);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(focused(&app), PaneId::Detail);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(focused(&app), PaneId::List, "it wraps");
+        press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(focused(&app), PaneId::Detail);
+        assert_eq!(app.tabs.active_id(), Some(SPLIT), "no tab change");
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut settings = App::new(tx);
+        settings.register_tab(Box::new(crate::ui::tabs::SettingsTab::with_sections(vec![
+            Box::new(crate::ui::tabs::settings::QdrantSection::new()),
+        ])));
+        settings.register_tab(Box::new(SplitTab::new(SPLIT, "Backlog")));
+        let _ = draw(&mut settings, 100, 30);
+        let before = settings.tabs.active_id();
+        press(&mut settings, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut settings, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(settings.tabs.active_id(), before, "Tab moves no tab");
+        assert!(settings.focus.is_empty(), "{:?}", settings.focus);
+    }
+
+    /// D5 with D3: back to a place whose pane the layout has since hidden focuses the detail,
+    /// not the hidden pane.
+    #[test]
+    fn back_never_focuses_a_pane_the_layout_hides() {
+        let mut app = split_app();
+        let _ = draw(&mut app, 100, 30);
+        assert_eq!(focused(&app), PaneId::List);
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        assert_eq!(focused(&app), PaneId::Detail);
+        assert!(
+            app.history.peek_back().is_some(),
+            "the focus move is a place"
+        );
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        let _ = draw(&mut app, 100, 30);
+        let (_, areas) = claim(&app);
+        assert_eq!(areas.list, None, "the list stays hidden");
+        assert_eq!(focused(&app), PaneId::Detail);
     }
 
     /// D2, D1: the layout keys change the active tab's layout and save it the moment it changes;
@@ -2507,6 +2645,29 @@ pub(crate) mod shell_tests {
         assert!(app.should_quit, "Enter leaves");
     }
 
+    /// D6, D7: from the open chat composer `ctrl-c` opens the leave dialog (the composer passes
+    /// it, it is no text), and a second one leaves.
+    #[test]
+    fn ctrl_c_from_the_chat_composer_asks_then_leaves() {
+        use crate::ui::overlay::{LeaveDialog, Overlay};
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.register_tab(Box::new(crate::ui::tabs::ChatTab::new()));
+        leavable(&mut app);
+        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+        let stack = app.tabs.active().and_then(|tab| tab.key_stack());
+        assert!(
+            stack.is_some_and(Stack::captures_text),
+            "the composer is open"
+        );
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!app.should_quit, "asked first");
+        assert_eq!(app.overlays.top().map(Overlay::id), Some(LeaveDialog::ID));
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.should_quit, "the second leaves");
+    }
+
     /// D6: the dialog names the open in-pane edit; without one it reads as nothing live once the
     /// counts are known.
     #[test]
@@ -2685,6 +2846,74 @@ pub(crate) mod shell_tests {
         drag_to(&mut app, activity.x + 30, activity.y - 3);
         up(&mut app, activity.x + 30, activity.y - 3);
         assert!(layout(&app).activity_pct > 30, "{:?}", layout(&app));
+    }
+
+    /// D1, §7: a drag that capture going off cuts short (an overlay opens, so its `Up` never
+    /// reaches the shell) still saves the layout it left on screen.
+    #[test]
+    fn a_drag_cut_short_by_an_overlay_is_saved() {
+        use crate::ui::state_file::UiStore;
+
+        let store = UiStore::memory();
+        let mut app = split_app();
+        leavable(&mut app);
+        app.ui_store = store.clone();
+        assert!(app.mouse_capture());
+        let _ = draw(&mut app, 100, 30);
+        let (_, areas) = claim(&app);
+        let list = areas.list.expect("shown");
+        let (grab, y) = (list.right() - 1, list.y + 4);
+        down(&mut app, grab, y);
+        drag_to(&mut app, grab + 10, y);
+        assert_eq!(store.load().state.layouts.get(SPLIT.0), None);
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(!app.mouse_capture(), "the dialog turns capture off");
+        up(&mut app, grab + 10, y);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            store.load().state.layouts.get(SPLIT.0).copied(),
+            Some(layout(&app)),
+            "the dragged layout is saved"
+        );
+        assert_ne!(layout(&app).list, SPLIT_LAYOUT.list);
+    }
+
+    /// MD8: with capture on, the wheel over a pane focuses it and moves it as the keymap's
+    /// `list.down`/`list.up` would (what the terminal's alternate scroll sent before capture).
+    #[test]
+    fn the_wheel_moves_the_pane_under_the_pointer() {
+        use crossterm::event::MouseEventKind;
+
+        let mut app = split_app();
+        assert!(app.mouse_capture());
+        let _ = draw(&mut app, 100, 30);
+        let (_, areas) = claim(&app);
+        let list = areas.list.expect("shown");
+        mouse(&mut app, MouseEventKind::ScrollDown, list.x + 3, list.y + 3);
+        mouse(&mut app, MouseEventKind::ScrollDown, list.x + 3, list.y + 3);
+        mouse(&mut app, MouseEventKind::ScrollUp, list.x + 3, list.y + 3);
+        assert_eq!(
+            app.here().and_then(|loc| loc.at.cursor).as_deref(),
+            Some("1")
+        );
+        assert_eq!(focused(&app), PaneId::List);
+        mouse(
+            &mut app,
+            MouseEventKind::ScrollDown,
+            areas.detail.x + 3,
+            areas.detail.y + 3,
+        );
+        assert_eq!(focused(&app), PaneId::Detail);
+        assert_eq!(
+            app.here().and_then(|loc| loc.at.cursor).as_deref(),
+            Some("2")
+        );
+        // Outside every pane (the header), the wheel does nothing.
+        mouse(&mut app, MouseEventKind::ScrollDown, 1, 0);
+        assert_eq!(
+            app.here().and_then(|loc| loc.at.cursor).as_deref(),
+            Some("2")
+        );
     }
 
     /// A list + detail tab whose own gesture wants the mouse (as the Runs flow does), counting
