@@ -581,3 +581,24 @@ with T5 serially.
   - *§1.5's implementer check is a test:* `every_view_that_builds_a_text_widget_names_a_capturing_stack`
     (`views.rs`) fails a view source that builds a `TextField`/`TextArea`/`Composer` without naming a capturing
     stack (the Requirements forms and the directory picker are checked through their hosts).
+- **D-15 (Task 6 as built; recorded at T6 repair 1).**
+  - *`MODAL` leaves out the tab keys too (B2 widened, needs a maintainer call).* B2 drops only
+    `NextPane`/`PrevPane` from `MODAL_GLOBALS`; T6 also drops `NextTab`/`PrevTab`. Their version-1 default
+    (`tab`/`backtab`) never passed the modal filter, so no form switched tabs; the new `ctrl-pgdn`/`ctrl-pgup`
+    would, and a form would start switching tabs mid-edit. Consequence: a `next_tab`/`prev_tab` the user rebound
+    to an F-key, ctrl or alt chord no longer switches tabs from a capturing or confirming mode (it did before T6),
+    except in the Skills modes that hand the tab keys to the shell through `TABS`. Pinned by
+    `views::tests::a_capturing_mode_never_switches_tabs`. The alternative is keeping the tab acts in `MODAL_GLOBALS`
+    (B2 as written), which lets `ctrl-pgdn` leave a form.
+  - *Shift arrows are listed last (needs a maintainer call).* Plan D4 and §1.4 put `shift-right`/`shift-left` first
+    on `pane.next_subtab`/`prev_subtab`, `settings.next_section`/`prev_section` and `skills.switch_view`. T6 appends
+    them (`l`, `]`, `shift-right` / `h`, `[`, `shift-left`), so every hint row's and `?` box's first label stays
+    `h`/`l` and no hint widens. Chord order sets the first label in hints and the box and the order in
+    `--print-keys`/docs/htui-keys.md; the keys that act are the same. Pinned by
+    `the_m2_rows_have_their_task_6_defaults`.
+  - *The wheel under MD8.* Capture on for every list + detail tab ends the terminal's alternate scroll (the wheel
+    as Up/Down keys). For a tab with no gesture of its own (`Tab::wants_mouse` false) the shell maps the wheel over
+    a claimed pane to the first chord that reaches `list.down`/`list.up` through the tab's stack, focusing that pane
+    (`App::wheel_key`); the Runs flow keeps its own wheel.
+  - *Hidden-pane note and activity placeholder name reachable keys only* (`Keys::reachable_chord`), so D-1's `p`
+    in Backlog > Runs and Backlog > Prompt is never offered for the layouts there.
