@@ -19,9 +19,12 @@ use crate::keys::{Act, CTRL_C, Context, HelpLine, KeyChord, Keys, Stack};
 use crate::store_worker::{Origin, RequestEnvelope, Seq, StoreRequest};
 use crate::ui::cells::clip_line;
 use crate::ui::header::{self, Flash};
-use crate::ui::kit::pane::paint_bottom_hints;
+use crate::ui::kit::empty::{NextStep, placeholder};
+use crate::ui::kit::pane::{Focus, paint_bottom_hints, paint_bottom_note, paint_focus};
 use crate::ui::overlay::{Overlay, OverlayRegistry, OverlayStack};
-use crate::ui::shell::{PaneAreas, PaneId, TabLayout};
+use crate::ui::shell::layout::{self as pane_layout, NoteLabels};
+use crate::ui::shell::{PaneAreas, PaneId, Panes, TabLayout};
+use crate::ui::state_file::UiState;
 use crate::ui::tabs::{Tab, TabId, TabRegistry};
 use crate::ui::{Theme, about, layout};
 use crossterm::event::{Event, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind};
@@ -347,6 +350,17 @@ pub struct App {
     /// MOD-57 P2: where the active tab's pane goes, as the last frame computed it; read by
     /// `open_editor` (the spawn size) and `resize_editor`.
     pub(super) editor_rect: Option<(TabId, Rect)>,
+    /// MOD-115 M2 D1: the UI state the shell keeps and saves: the about panel's and each tab's
+    /// layout (keyed by `TabId.0`), and the modal sizes read back and written again.
+    pub(crate) ui: UiState,
+    /// MOD-115 M2 D3: the focused pane per tab; a tab with none focuses its list (a list + detail
+    /// tab) or its detail (a single-pane one).
+    pub(crate) focus: HashMap<TabId, PaneId>,
+    /// MOD-115 M2 B5: the active tab's claim this frame. `None` at the top of every `render`.
+    pub(super) pane_claim: Cell<Option<PaneClaim>>,
+    /// MOD-115 M2 B5: the panes the active tab claimed in the last frame, and the region it
+    /// split, for the pane keys, the layout keys and the mouse (like `editor_rect`).
+    pub(crate) last_claim: Option<(TabId, Rect, PaneAreas)>,
 }
 
 impl App {
@@ -393,7 +407,101 @@ impl App {
             editor: None,
             editor_area: Cell::new(None),
             editor_rect: None,
+            ui: UiState::default(),
+            focus: HashMap::new(),
+            pane_claim: Cell::new(None),
+            last_claim: None,
         }
+    }
+
+    /// The layout the shell keeps for `tab` (MOD-115 M2 D2): the stored one, else the tab's own
+    /// default; `None` for a single-pane tab.
+    pub(crate) fn layout_of(&self, tab: &dyn Tab) -> Option<TabLayout> {
+        match tab.panes() {
+            Panes::ListDetail(default) => {
+                Some(self.ui.layouts.get(tab.id().0).copied().unwrap_or(default))
+            }
+            Panes::Single => None,
+        }
+    }
+
+    /// The focused pane of `tab` (MOD-115 M2 D3): the one the shell keeps, else the list of a
+    /// list + detail tab and the detail of a single-pane one.
+    pub(crate) fn focus_of(&self, tab: &dyn Tab) -> PaneId {
+        self.focus
+            .get(&tab.id())
+            .copied()
+            .unwrap_or(match tab.panes() {
+                Panes::ListDetail(_) => PaneId::List,
+                Panes::Single => PaneId::Detail,
+            })
+    }
+
+    /// The shell's paint over the panes the active tab claimed (MOD-115 M2 §6.4): the activity
+    /// placeholder, then each visible pane's border restyled for focus (the tab accent on the
+    /// focused one, the faint border on the others).
+    fn paint_panes(&self, frame: &mut Frame<'_>, areas: &PaneAreas) {
+        let Some(tab) = self.tabs.active() else {
+            return;
+        };
+        let stack = tab.key_stack().unwrap_or(Stack::BASE);
+        if let Some(activity) = areas.activity.filter(|rect| !rect.is_empty()) {
+            let next = self
+                .keys
+                .label(stack, Act::LayoutToggleActivity)
+                .map_or_else(
+                    || ACTIVITY_NEXT_UNBOUND.to_owned(),
+                    |key| format!("{key} {ACTIVITY_NEXT}"),
+                );
+            placeholder(
+                frame,
+                activity,
+                ACTIVITY_TITLE,
+                ACTIVITY_WHAT,
+                NextStep(&next),
+                &self.theme,
+            );
+        }
+        let focus = self.focus_of(tab);
+        let accent = self.theme.tab_accent(tab.id().0);
+        for pane in pane_layout::visible(areas) {
+            if let Some(rect) = focused_rect(areas, pane) {
+                let state = if pane == focus {
+                    Focus::Focused
+                } else {
+                    Focus::Unfocused
+                };
+                paint_focus(frame.buffer_mut(), rect, state, accent, &self.theme);
+            }
+        }
+    }
+
+    /// R-TUI-12: what a hidden pane says about bringing it back, right-aligned on the bottom
+    /// border of the detail, or of the zoomed pane while the detail is zoomed away (T2 carried
+    /// finding 3). Painted after the hints, so it keeps one rule cell before them (finding 2).
+    fn paint_hidden_note(&self, frame: &mut Frame<'_>, areas: &PaneAreas) {
+        let Some(tab) = self.tabs.active() else {
+            return;
+        };
+        let stack = tab.key_stack().unwrap_or(Stack::BASE);
+        let label = |act| self.keys.label(stack, act);
+        let labels = NoteLabels {
+            toggle_list: label(Act::LayoutToggleList),
+            toggle_activity: label(Act::LayoutToggleActivity),
+            next_preset: label(Act::LayoutNextPreset),
+            zoom: label(Act::LayoutZoom),
+        };
+        let (Some(note), Some(area)) = (
+            pane_layout::hidden_note(areas, &labels),
+            pane_layout::note_area(areas),
+        ) else {
+            return;
+        };
+        if area.height < 2 {
+            return;
+        }
+        let row = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+        paint_bottom_note(frame.buffer_mut(), row, Line::from(note), self.theme.dim);
     }
 
     /// Issues the reads the shell itself needs: the workspace list, this box's row, the store
@@ -1000,6 +1108,7 @@ impl App {
     pub fn render(&mut self, frame: &mut Frame<'_>) {
         self.dirty = false;
         self.editor_area.set(None);
+        self.pane_claim.set(None);
         let area = frame.area();
         // A tab with no about text (a test double, a reserved tab) leaves no empty hole under the
         // header: the panel's rows go to the body.
@@ -1033,9 +1142,14 @@ impl App {
 
         match self.tabs.active() {
             Some(tab) => {
-                let ctx = self
+                let mut ctx = self
                     .ctx(Origin::Tab(tab.id()))
-                    .with_editor_area(&self.editor_area);
+                    .with_editor_area(&self.editor_area)
+                    .with_focus(self.focus_of(tab))
+                    .with_pane_claim(&self.pane_claim);
+                if let Some(layout) = self.layout_of(tab) {
+                    ctx = ctx.with_layout(layout);
+                }
                 tab.render(frame, chrome.body, &ctx);
             }
             None => {
@@ -1046,21 +1160,50 @@ impl App {
                 );
             }
         }
+        // MOD-115 M2 B5: what the active tab claimed, for the keys and the mouse until the next
+        // frame; a single-pane tab claims nothing.
+        let claim = self.pane_claim.get();
+        self.last_claim = self
+            .tabs
+            .active_id()
+            .zip(claim)
+            .map(|(id, (region, areas))| (id, region, areas));
+        if let Some((_, areas)) = claim {
+            self.paint_panes(frame, &areas);
+        }
 
         self.draw_editor(frame, chrome.body);
 
         // The M1 hint adapter: tabs still frame their own bodies, so the hints are painted onto
         // the last row's border glyphs once the tab is drawn. Deleted as tabs move to `Pane::hints`.
+        // MOD-115 M2 §6.4: on a tab that claimed panes they go on the focused pane's border,
+        // from its left edge to the body's right one (with the list focused, the M1 rect).
         if let Some(tab) = self.tabs.active()
             && self.overlays.is_empty()
             && !self.editor_visible()
             && chrome.body.height > 0
         {
-            let width = chrome.body.width.saturating_sub(4);
+            let target = claim.map_or(chrome.body, |(_, areas)| {
+                let pane = focused_rect(&areas, self.focus_of(tab)).unwrap_or(chrome.body);
+                Rect {
+                    x: pane.x,
+                    width: chrome.body.right().saturating_sub(pane.x),
+                    height: pane.bottom().saturating_sub(chrome.body.y),
+                    ..chrome.body
+                }
+            });
+            let width = target.width.saturating_sub(4);
             let hint = tab.key_hint(width, &self.ctx(Origin::Tab(tab.id())));
             if let Some(line) = hint {
-                paint_shell_hints(frame.buffer_mut(), chrome.body, line, self.theme.base);
+                paint_shell_hints(frame.buffer_mut(), target, line, self.theme.base);
             }
+        }
+        // R-TUI-12: the hidden pane's note, after the hints (it keeps one rule cell before them),
+        // on the detail's bottom border, or the zoomed pane's.
+        if let Some((_, areas)) = claim
+            && !self.editor_visible()
+        {
+            self.paint_hidden_note(frame, &areas);
         }
 
         for overlay in self.overlays.iter() {
@@ -1139,6 +1282,23 @@ impl App {
             box_area,
         );
     }
+}
+
+/// The activity placeholder's title, what it says and its next step (MOD-115 M2 D2): the pane
+/// MOD-122 fills.
+const ACTIVITY_TITLE: &str = "Activity";
+const ACTIVITY_WHAT: &str = "Activity appears here once the activity panel lands";
+const ACTIVITY_NEXT: &str = "hides this pane";
+const ACTIVITY_NEXT_UNBOUND: &str = "a layout without it hides this pane";
+
+/// The rect `pane` is drawn in, if it has a cell (a zoomed-away detail is 0x0).
+fn focused_rect(areas: &PaneAreas, pane: PaneId) -> Option<Rect> {
+    match pane {
+        PaneId::List => areas.list,
+        PaneId::Detail => Some(areas.detail),
+        PaneId::Activity => areas.activity,
+    }
+    .filter(|rect| !rect.is_empty())
 }
 
 /// How many of the body's last rows [`hint_row`] looks through for the tab's bottom border.
@@ -1498,5 +1658,299 @@ mod tests {
                 App::is_offerable(row.act)
             );
         }
+    }
+}
+
+/// MOD-115 M2 T6: the shell's panes (render), focus, layout, history and mouse, over a list +
+/// detail test double.
+#[cfg(test)]
+pub(crate) mod shell_tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use htui_core::model::Scope;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::text::Line;
+    use ratatui::widgets::{Block, BorderType};
+    use ratatui::{Frame, Terminal};
+    use tokio::sync::mpsc;
+
+    use super::{App, Ctx};
+    use crate::app::Handled;
+    use crate::keys::{Stack, views};
+    use crate::store_worker::{StoreReply, StoreRequest};
+    use crate::ui::Theme;
+    use crate::ui::shell::{ListSize, PaneId, Panes, Preset, TabLayout, TabLoc};
+    use crate::ui::tabs::{Tab, TabId};
+
+    /// The double's id: one the theme gives an accent of its own.
+    pub(crate) const SPLIT: TabId = TabId("backlog");
+
+    /// The double's default layout: Backlog's 55/45.
+    pub(crate) const SPLIT_LAYOUT: TabLayout = TabLayout {
+        list: ListSize::Percent(55),
+        ..TabLayout::DEFAULT
+    };
+
+    /// A list + detail tab that splits its body with `ctx.split` and frames each pane, as the
+    /// list + detail tabs do once they adopt the layout (Task 7).
+    pub(crate) struct SplitTab {
+        pub(crate) id: TabId,
+        pub(crate) title: &'static str,
+        pub(crate) subtab: Option<&'static str>,
+        pub(crate) cursor: usize,
+        pub(crate) restored: Vec<TabLoc>,
+    }
+
+    impl SplitTab {
+        pub(crate) fn new(id: TabId, title: &'static str) -> Self {
+            Self {
+                id,
+                title,
+                subtab: None,
+                cursor: 0,
+                restored: Vec::new(),
+            }
+        }
+    }
+
+    impl Tab for SplitTab {
+        fn id(&self) -> TabId {
+            self.id
+        }
+        fn title(&self) -> &str {
+            self.title
+        }
+        fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+            Vec::new()
+        }
+        fn on_scope_change(&mut self, _scope: &Scope) {}
+        fn on_key(&mut self, key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            match key.code {
+                KeyCode::Char('j') => {
+                    self.cursor += 1;
+                    Handled::Consumed
+                }
+                KeyCode::Char('l') => {
+                    self.subtab = Some(match self.subtab {
+                        Some("runs") => "body",
+                        _ => "runs",
+                    });
+                    Handled::Consumed
+                }
+                _ => Handled::Pass,
+            }
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
+            let areas = ctx.split(area, SPLIT_LAYOUT);
+            let block = || Block::bordered().border_type(BorderType::Rounded);
+            if let Some(list) = areas.list {
+                frame.render_widget(block(), list);
+            }
+            if !areas.detail.is_empty() {
+                frame.render_widget(block(), areas.detail);
+            }
+        }
+        fn key_stack(&self) -> Option<Stack<'static>> {
+            Some(views::BACKLOG_BODY)
+        }
+        fn key_hint(&self, _width: u16, _ctx: &Ctx<'_>) -> Option<Line<'static>> {
+            Some(Line::from("j/k move"))
+        }
+        fn panes(&self) -> Panes {
+            Panes::ListDetail(SPLIT_LAYOUT)
+        }
+        fn location(&self) -> TabLoc {
+            TabLoc {
+                subtab: self.subtab,
+                subtab_title: self.subtab.map(|id| {
+                    if id == "runs" {
+                        "Runs".to_owned()
+                    } else {
+                        "Body".to_owned()
+                    }
+                }),
+                cursor: Some(self.cursor.to_string()),
+            }
+        }
+        fn restore(&mut self, loc: &TabLoc, _ctx: &mut Ctx<'_>) -> bool {
+            self.restored.push(loc.clone());
+            self.subtab = loc.subtab;
+            self.cursor = loc
+                .cursor
+                .as_deref()
+                .and_then(|c| c.parse().ok())
+                .unwrap_or(0);
+            true
+        }
+    }
+
+    /// A shell with the double registered, about off.
+    pub(crate) fn split_app() -> App {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.about_visible = false;
+        app.register_tab(Box::new(SplitTab::new(SPLIT, "Backlog")));
+        app
+    }
+
+    pub(crate) fn draw(app: &mut App, width: u16, height: u16) -> Buffer {
+        let mut term = Terminal::new(TestBackend::new(width, height)).expect("a test terminal");
+        term.draw(|frame| app.render(frame)).expect("draws");
+        term.backend().buffer().clone()
+    }
+
+    pub(crate) fn row(buf: &Buffer, y: u16) -> String {
+        (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    pub(crate) fn press(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+        app.on_key(KeyEvent::new(code, mods));
+    }
+
+    fn claim(app: &App) -> (Rect, crate::ui::shell::PaneAreas) {
+        let (tab, region, areas) = app.last_claim.expect("the double claimed its panes");
+        assert_eq!(tab, SPLIT);
+        (region, areas)
+    }
+
+    /// D3: the focused pane's border takes the tab accent, the other the faint border role;
+    /// with no focus set the list is focused (B7).
+    #[test]
+    fn the_focused_pane_has_the_tab_accent_and_the_other_the_faint_border() {
+        for theme in [Theme::default(), Theme::monochrome()] {
+            let mut app = split_app();
+            app.theme = theme.clone();
+            let buf = draw(&mut app, 100, 30);
+            let (_, areas) = claim(&app);
+            let list = areas.list.expect("the list is shown");
+            let accent = theme.tab_accent(SPLIT.0);
+            assert_eq!(buf[(list.x, list.y)].fg, accent.fg.unwrap_or_default());
+            assert_eq!(buf[(list.x, list.y)].modifier, accent.add_modifier);
+            let detail = areas.detail;
+            assert_eq!(
+                buf[(detail.x, detail.y)].fg,
+                theme.border_faint.fg.unwrap_or_default()
+            );
+            assert_eq!(
+                buf[(detail.x, detail.y)].modifier,
+                theme.border_faint.add_modifier
+            );
+            app.focus.insert(SPLIT, PaneId::Detail);
+            let buf = draw(&mut app, 100, 30);
+            assert_eq!(buf[(detail.x, detail.y)].fg, accent.fg.unwrap_or_default());
+            assert_eq!(buf[(detail.x, detail.y)].modifier, accent.add_modifier);
+            assert_eq!(
+                buf[(list.x, list.y)].modifier,
+                theme.border_faint.add_modifier
+            );
+        }
+    }
+
+    /// §6.4: the hints go on the focused pane's bottom border; with the list focused that is
+    /// the body's row from its left edge, as the M1 adapter drew them.
+    #[test]
+    fn the_hints_follow_the_focused_pane() {
+        let mut app = split_app();
+        let buf = draw(&mut app, 100, 30);
+        let (_, areas) = claim(&app);
+        let bottom = areas.detail.bottom() - 1;
+        assert!(
+            row(&buf, bottom).starts_with("\u{2570}\u{2500}j/k move"),
+            "{}",
+            row(&buf, bottom)
+        );
+        app.focus.insert(SPLIT, PaneId::Detail);
+        let buf = draw(&mut app, 100, 30);
+        let text = row(&buf, bottom);
+        let at = usize::from(areas.detail.x);
+        let cells: Vec<&str> = (0..buf.area.width)
+            .map(|x| buf[(x, bottom)].symbol())
+            .collect();
+        assert_eq!(cells[at + 2..at + 10].concat(), "j/k move", "{text}");
+        assert!(!cells[..at].concat().contains("j/k"), "{text}");
+    }
+
+    /// R-TUI-12, carried finding 2: a hidden list leaves its note on the detail's bottom border,
+    /// right-aligned, painted after the hints with a rule cell between them.
+    #[test]
+    fn a_hidden_list_says_how_to_bring_it_back_beside_the_hints() {
+        let mut app = split_app();
+        app.ui.layouts.insert(
+            SPLIT.0.to_owned(),
+            TabLayout {
+                list_on: false,
+                ..SPLIT_LAYOUT
+            },
+        );
+        app.focus.insert(SPLIT, PaneId::Detail);
+        let buf = draw(&mut app, 100, 30);
+        let (_, areas) = claim(&app);
+        assert_eq!(areas.list, None);
+        let text = row(&buf, areas.detail.bottom() - 1);
+        assert!(text.starts_with("\u{2570}\u{2500}j/k move"), "{text}");
+        assert!(
+            text.ends_with("F2 show list \u{b7} p layouts\u{2500}\u{256f}"),
+            "{text}"
+        );
+        // At a width where the two meet, a rule cell parts them.
+        let buf = draw(&mut app, 40, 12);
+        let (_, areas) = claim(&app);
+        let text = row(&buf, areas.detail.bottom() - 1);
+        assert!(
+            !text.contains("movep") && !text.contains("move\u{2026}F"),
+            "{text}"
+        );
+    }
+
+    /// Carried finding 3: a zoomed list leaves the detail 0x0; the note goes on the zoomed pane.
+    #[test]
+    fn a_zoomed_list_carries_the_unzoom_note() {
+        let mut app = split_app();
+        app.ui.layouts.insert(
+            SPLIT.0.to_owned(),
+            TabLayout {
+                zoom: true,
+                ..SPLIT_LAYOUT
+            },
+        );
+        let buf = draw(&mut app, 100, 30);
+        let (region, areas) = claim(&app);
+        assert_eq!(areas.list, Some(region));
+        assert!(areas.detail.is_empty());
+        let text = row(&buf, region.bottom() - 1);
+        assert!(text.ends_with("z unzoom\u{2500}\u{256f}"), "{text}");
+    }
+
+    /// D2: until MOD-122 the activity pane is a placeholder that says what will be there.
+    #[test]
+    fn the_activity_pane_is_a_placeholder() {
+        let mut app = split_app();
+        app.ui.layouts.insert(
+            SPLIT.0.to_owned(),
+            TabLayout {
+                preset: Preset::IdeActivity,
+                ..SPLIT_LAYOUT
+            },
+        );
+        let buf = draw(&mut app, 100, 30);
+        let (_, areas) = claim(&app);
+        let activity = areas.activity.expect("the preset shows the activity pane");
+        assert!(row(&buf, activity.y).contains(" Activity "));
+        let inside: String = (activity.y..activity.bottom())
+            .map(|y| row(&buf, y))
+            .collect();
+        assert!(inside.contains("Activity appears here"), "{inside}");
+    }
+
+    /// A single-pane tab claims nothing: no claim is kept, and the frame is the M1 one.
+    #[test]
+    fn a_single_pane_tab_claims_nothing() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.register_tab(Box::new(crate::ui::tabs::ChatTab::new()));
+        let _ = draw(&mut app, 100, 30);
+        assert_eq!(app.last_claim, None);
     }
 }
