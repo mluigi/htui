@@ -1363,19 +1363,25 @@ mod tests {
         }
     }
 
-    /// H-14: `Tab` and `Shift+Tab` pass to the shell; every other key is the help's while it
-    /// waits, so the draft under it is locked.
+    /// H-14: the tab keys pass to the shell (`ctrl-pgdn`/`ctrl-pgup` since MOD-115 M2 D4, so
+    /// `Tab` is the help's now); every other key is the help's while it waits, so the draft under
+    /// it is locked.
     #[test]
     fn tab_passes_and_the_buffer_is_locked() {
         let bench = Bench::new();
         let mut help = streaming(&bench, "old\n", StepId::new());
+        let pressed = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
         assert_eq!(
-            help.on_key(plain(KeyCode::Tab), &bench.ctx()),
+            help.on_key(pressed(KeyCode::PageDown), &bench.ctx()),
             HelpOutcome::Pass
         );
         assert_eq!(
-            help.on_key(plain(KeyCode::BackTab), &bench.ctx()),
+            help.on_key(pressed(KeyCode::PageUp), &bench.ctx()),
             HelpOutcome::Pass
+        );
+        assert_eq!(
+            help.on_key(plain(KeyCode::Tab), &bench.ctx()),
+            HelpOutcome::Consumed
         );
         assert_eq!(help.on_key(ch('x'), &bench.ctx()), HelpOutcome::Consumed);
         assert_eq!(

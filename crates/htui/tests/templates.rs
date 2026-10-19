@@ -543,7 +543,7 @@ async fn another_session_s_version_is_not_taken_for_the_save() {
     harness.key("e");
     type_text(&mut harness, "MINE ");
     // `Tab` away and `2` back queues a `Templates` read ahead of the save.
-    harness.key("tab");
+    harness.key("ctrl-pgdn");
     harness.key("2");
     harness.key("ctrl-s");
     // Another session appends v2 before either request is served.
@@ -923,11 +923,11 @@ async fn tab_and_digits_while_editing() {
         harness.render().contains("2You are running"),
         "`2` is text in the editor"
     );
-    harness.key("tab");
+    harness.key("ctrl-pgdn");
     assert_eq!(
         harness.app().tabs.active_id().map(|id| id.0),
         Some("requirements"),
-        "`Tab` passes to the shell, and Requirements follows Skills"
+        "`Ctrl+PgDn` passes to the shell, and Requirements follows Skills"
     );
     harness.key("2");
     harness.settle().await;
@@ -1077,7 +1077,7 @@ async fn the_templates_editor_status_line_and_help_box() {
     harness.key("e");
     assert!(
         harness.app().keys_line().starts_with(
-            "Ctrl+c quit · Tab next tab · Shift+Tab previous tab · F1 help · F9 about · Ctrl+f find"
+            "Ctrl+c quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · F1 help · F9 about · Ctrl+f find"
         ),
         "the keys line is the filtered one"
     );
@@ -1100,7 +1100,7 @@ async fn the_templates_editor_status_line_and_help_box() {
         .filter(|line| line.contains("Global:"))
         .collect();
     assert_eq!(globals.len(), 1, "one `Global:` line: {frame}");
-    assert!(globals[0].contains("Tab next tab"), "{frame}");
+    assert!(globals[0].contains("Ctrl+PgDn next tab"), "{frame}");
     assert!(frame.contains("F1 closes this box"), "{frame}");
     assert!(!frame.contains("?/F1 closes this box"), "{frame}");
     harness.key("f1");
@@ -1150,11 +1150,11 @@ async fn tab_leaves_the_name_prompt_and_the_agent_help_with_the_draft() {
 
     harness.key("n");
     type_text(&mut harness, "tri");
-    harness.key("tab");
+    harness.key("ctrl-pgdn");
     assert_eq!(
         requirements(&mut harness),
         Some("requirements"),
-        "the prompt passes `Tab`"
+        "the prompt passes `Ctrl+PgDn`"
     );
     harness.key("2");
     harness.drive().await;
@@ -1172,11 +1172,11 @@ async fn tab_leaves_the_name_prompt_and_the_agent_help_with_the_draft() {
     harness.key("ctrl-g");
     harness.drive().await;
     type_text(&mut harness, "short");
-    harness.key("tab");
+    harness.key("ctrl-pgdn");
     assert_eq!(
         requirements(&mut harness),
         Some("requirements"),
-        "the help passes `Tab`"
+        "the help passes `Ctrl+PgDn`"
     );
     harness.key("2");
     harness.drive().await;

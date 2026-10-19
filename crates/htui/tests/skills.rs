@@ -1003,11 +1003,11 @@ async fn tab_and_digits_still_switch_tabs_with_a_draft_open() {
         harness.render().contains("2Prefer"),
         "`2` is text in the editor"
     );
-    harness.key("tab");
+    harness.key("ctrl-pgdn");
     assert_eq!(
         harness.app().tabs.active_id().map(|id| id.0),
         Some("requirements"),
-        "`Tab` passes to the shell, and Requirements follows Skills"
+        "`Ctrl+PgDn` passes to the shell, and Requirements follows Skills"
     );
     harness.key("2");
     harness.settle().await;
@@ -1784,7 +1784,7 @@ async fn the_library_editor_status_line_keeps_tab() {
     let stack = harness.app().active_stack().expect("a converted view");
     let line = harness.app().keys.status_line(stack, |_| true);
     assert!(
-        line.starts_with("Ctrl+c quit · Tab next tab · Shift+Tab previous tab · F1 help"),
+        line.starts_with("Ctrl+c quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · F1 help"),
         "{line}"
     );
 }

@@ -208,7 +208,10 @@ async fn f1_opens_help_from_the_item_form_and_the_form_stays() {
 async fn a_capturing_backlog_form_shows_the_filtered_status_line() {
     let mut harness = shell(None).await;
     let browsing = status_line(&mut harness);
-    assert!(browsing.starts_with("q quit · Tab next tab"), "{browsing}");
+    assert!(
+        browsing.starts_with("q quit · Ctrl+PgDn next tab"),
+        "{browsing}"
+    );
     press(&mut harness, "N").await;
     assert!(harness.render().contains(" New item "));
     assert_eq!(status_line(&mut harness), FILTERED, "item form");

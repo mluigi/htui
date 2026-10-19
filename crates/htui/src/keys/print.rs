@@ -136,26 +136,26 @@ mod tests {
 version = 2
 
 [global]
-quit         = ["q", "ctrl-c"]  # quit
-next_tab     = ["tab"]          # next tab
-prev_tab     = ["backtab"]      # previous tab
-select_tab_1 = ["1"]            # select tab
-select_tab_2 = ["2"]            # select tab
-select_tab_3 = ["3"]            # select tab
-select_tab_4 = ["4"]            # select tab
-select_tab_5 = ["5"]            # select tab
-select_tab_6 = ["6"]            # select tab
-select_tab_7 = ["7"]            # select tab
-select_tab_8 = ["8"]            # select tab
-select_tab_9 = ["9"]            # select tab
-help         = ["?", "f1"]      # help
-about        = ["f9"]           # about
-workspaces   = ["w"]            # workspaces
-find         = ["ctrl-f"]       # find
-waiting      = ["ctrl-w"]       # waiting
-queue        = ["ctrl-q"]       # queue
-next_pane    = ["ctrl-right"]   # next pane
-prev_pane    = ["ctrl-left"]    # previous pane
+quit         = ["q", "ctrl-c"]           # quit
+next_tab     = ["ctrl-pgdn"]             # next tab
+prev_tab     = ["ctrl-pgup"]             # previous tab
+select_tab_1 = ["1"]                     # select tab
+select_tab_2 = ["2"]                     # select tab
+select_tab_3 = ["3"]                     # select tab
+select_tab_4 = ["4"]                     # select tab
+select_tab_5 = ["5"]                     # select tab
+select_tab_6 = ["6"]                     # select tab
+select_tab_7 = ["7"]                     # select tab
+select_tab_8 = ["8"]                     # select tab
+select_tab_9 = ["9"]                     # select tab
+help         = ["?", "f1"]               # help
+about        = ["f9"]                    # about
+workspaces   = ["w"]                     # workspaces
+find         = ["ctrl-f"]                # find
+waiting      = ["ctrl-w"]                # waiting
+queue        = ["ctrl-q"]                # queue
+next_pane    = ["tab", "ctrl-right"]     # next pane
+prev_pane    = ["backtab", "ctrl-left"]  # previous pane
 
 [overlay]
 close = []  # close; Esc always"#;
@@ -234,8 +234,8 @@ close = []  # close; Esc always"#;
         assert_eq!(print(&reloaded), printed);
         for line in [
             // MOD-115 M2: a version-1 quit keeps `ctrl-c` (D-9), and `Esc` is never printed (MD7).
-            "quit         = [\"ctrl-y\", \"ctrl-c\"]  # quit (changed)",
-            "workspaces   = []                    # workspaces (changed)",
+            "quit         = [\"ctrl-y\", \"ctrl-c\"]      # quit (changed)",
+            "workspaces   = []                        # workspaces (changed)",
             "close = [\"f2\"]  # close; Esc always (changed)",
         ] {
             assert!(printed.lines().any(|printed| printed == line), "{line}");

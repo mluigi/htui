@@ -642,7 +642,7 @@ async fn the_requirements_tree_status_line_and_help_box() {
     let mut harness = open().await;
     assert_eq!(
         harness.app().keys_line(),
-        "q quit \u{b7} Tab next tab \u{b7} Shift+Tab previous tab \u{b7} 1 select tab \u{b7} ? help \
+        "q quit \u{b7} Ctrl+PgDn next tab \u{b7} Ctrl+PgUp previous tab \u{b7} 1 select tab \u{b7} ? help \
          \u{b7} F9 about \u{b7} w workspaces \u{b7} Ctrl+f find \u{b7} Ctrl+w waiting \u{b7} Ctrl+q queue"
     );
     let frame = harness.render();

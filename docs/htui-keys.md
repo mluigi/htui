@@ -21,26 +21,26 @@ keys_file` fails until it matches.
 version = 2
 
 [global]
-quit         = ["q", "ctrl-c"]  # quit
-next_tab     = ["tab"]          # next tab
-prev_tab     = ["backtab"]      # previous tab
-select_tab_1 = ["1"]            # select tab
-select_tab_2 = ["2"]            # select tab
-select_tab_3 = ["3"]            # select tab
-select_tab_4 = ["4"]            # select tab
-select_tab_5 = ["5"]            # select tab
-select_tab_6 = ["6"]            # select tab
-select_tab_7 = ["7"]            # select tab
-select_tab_8 = ["8"]            # select tab
-select_tab_9 = ["9"]            # select tab
-help         = ["?", "f1"]      # help
-about        = ["f9"]           # about
-workspaces   = ["w"]            # workspaces
-find         = ["ctrl-f"]       # find
-waiting      = ["ctrl-w"]       # waiting
-queue        = ["ctrl-q"]       # queue
-next_pane    = ["ctrl-right"]   # next pane
-prev_pane    = ["ctrl-left"]    # previous pane
+quit         = ["q", "ctrl-c"]           # quit
+next_tab     = ["ctrl-pgdn"]             # next tab
+prev_tab     = ["ctrl-pgup"]             # previous tab
+select_tab_1 = ["1"]                     # select tab
+select_tab_2 = ["2"]                     # select tab
+select_tab_3 = ["3"]                     # select tab
+select_tab_4 = ["4"]                     # select tab
+select_tab_5 = ["5"]                     # select tab
+select_tab_6 = ["6"]                     # select tab
+select_tab_7 = ["7"]                     # select tab
+select_tab_8 = ["8"]                     # select tab
+select_tab_9 = ["9"]                     # select tab
+help         = ["?", "f1"]               # help
+about        = ["f9"]                    # about
+workspaces   = ["w"]                     # workspaces
+find         = ["ctrl-f"]                # find
+waiting      = ["ctrl-w"]                # waiting
+queue        = ["ctrl-q"]                # queue
+next_pane    = ["tab", "ctrl-right"]     # next pane
+prev_pane    = ["backtab", "ctrl-left"]  # previous pane
 
 [overlay]
 close = []  # close; Esc always
@@ -53,12 +53,12 @@ bottom = ["G", "end"]   # bottom
 fold   = ["enter"]      # fold
 
 [pane]
-scroll_down = ["J"]                # scroll down
-scroll_up   = ["K"]                # scroll up
-page_down   = ["pgdn"]             # page down
-page_up     = ["pgup"]             # page up
-next_subtab = ["l", "]", "right"]  # next sub-tab
-prev_subtab = ["h", "[", "left"]   # previous sub-tab
+scroll_down = ["J"]                      # scroll down
+scroll_up   = ["K"]                      # scroll up
+page_down   = ["pgdn"]                   # page down
+page_up     = ["pgup"]                   # page up
+next_subtab = ["l", "]", "shift-right"]  # next sub-tab
+prev_subtab = ["h", "[", "shift-left"]   # previous sub-tab
 
 [confirm]
 yes = ["y"]  # yes
@@ -84,8 +84,8 @@ focus = ["ctrl-4"]  # editor focus
 abort = ["ctrl-x"]  # abort edit
 
 [settings]
-next_section = ["l", "]", "right"]  # next section
-prev_section = ["h", "[", "left"]   # previous section
+next_section = ["l", "]", "shift-right"]  # next section
+prev_section = ["h", "[", "shift-left"]   # previous section
 
 [settings.agents]
 probe          = ["r"]              # probe
@@ -159,13 +159,13 @@ no  = ["n", "N"]  # no; Esc always
 open = ["enter"]  # open step
 
 [skills]
-switch_view     = ["h", "l", "[", "]", "left", "right"]  # switch view
-prev_version    = [","]                                  # older version
-next_version    = ["."]                                  # newer version
-base            = ["b"]                                  # diff base
-diff            = ["d"]                                  # diff
-edit_externally = ["E"]                                  # edit in $EDITOR
-ask_agent       = ["ctrl-g"]                             # ask agent
+switch_view     = ["h", "l", "[", "]", "shift-left", "shift-right"]  # switch view
+prev_version    = [","]                                              # older version
+next_version    = ["."]                                              # newer version
+base            = ["b"]                                              # diff base
+diff            = ["d"]                                              # diff
+edit_externally = ["E"]                                              # edit in $EDITOR
+ask_agent       = ["ctrl-g"]                                         # ask agent
 
 [skills.library]
 import     = ["I"]              # import

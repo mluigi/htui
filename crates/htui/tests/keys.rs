@@ -50,10 +50,10 @@ const DEAD_DSN: &str = "postgres://htui:s3cret@127.0.0.1:1/htui?sslmode=disable"
 
 /// The keys line of the bare shell, the one the status row listed before MOD-115.
 const BARE_STATUS: &str =
-    "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · F9 about";
+    "q quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · 1 select tab · ? help · F9 about";
 
 /// The keys line with `register_all`.
-const FULL_STATUS: &str = "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · \
+const FULL_STATUS: &str = "q quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · 1 select tab · \
                            ? help · F9 about · w workspaces · Ctrl+f find · Ctrl+w waiting · \
                            Ctrl+q queue";
 
@@ -422,21 +422,27 @@ async fn ctrl_l_and_ctrl_h_do_not_cycle_sections() {
     let frame = harness.render();
     assert!(on_connection(&frame), "Connection is active: {frame}");
 
-    for key in ["ctrl-l", "ctrl-h", "shift-right", "alt-["] {
+    // MOD-115 M2 D4: plain arrows stay in the section; the shift arrows are section keys now.
+    for key in ["ctrl-l", "ctrl-h", "right", "alt-["] {
         harness.key(key);
         harness.drive_to_end().await;
         let frame = harness.render();
         assert!(on_connection(&frame), "`{key}` did not cycle: {frame}");
     }
 
-    harness.key("l");
-    harness.drive_to_end().await;
-    let frame = harness.render();
-    assert!(!on_connection(&frame), "`l` moved to Qdrant: {frame}");
-    harness.key("h");
-    harness.drive_to_end().await;
-    let frame = harness.render();
-    assert!(on_connection(&frame), "`h` moved back: {frame}");
+    for (forward, back) in [("l", "h"), ("shift-right", "shift-left")] {
+        harness.key(forward);
+        harness.drive_to_end().await;
+        let frame = harness.render();
+        assert!(
+            !on_connection(&frame),
+            "`{forward}` moved to Qdrant: {frame}"
+        );
+        harness.key(back);
+        harness.drive_to_end().await;
+        let frame = harness.render();
+        assert!(on_connection(&frame), "`{back}` moved back: {frame}");
+    }
 }
 
 /// MOD-67 M4 D5 pin (ANA-26 §2.6 defect 1): the Skills view switch is `skills.switch_view`
@@ -450,26 +456,30 @@ async fn ctrl_l_and_ctrl_h_do_not_switch_skills_views() {
     let frame = harness.render();
     assert!(on_library(&frame), "the tab opens on the Library: {frame}");
 
-    for key in ["ctrl-l", "ctrl-h", "alt-l", "shift-right"] {
+    // MOD-115 M2 D4: plain arrows stay in the pane; the shift arrows switch the view now.
+    for key in ["ctrl-l", "ctrl-h", "alt-l", "right"] {
         harness.key(key);
         harness.drive_to_end().await;
         let frame = harness.render();
         assert!(on_library(&frame), "`{key}` did not switch: {frame}");
     }
 
-    harness.key("l");
-    harness.drive_to_end().await;
-    let frame = harness.render();
-    assert!(!on_library(&frame), "`l` showed Templates: {frame}");
-    assert!(frame.contains("default"), "the Templates hint: {frame}");
-    harness.key("h");
-    harness.drive_to_end().await;
-    let frame = harness.render();
-    assert!(on_library(&frame), "`h` went back: {frame}");
+    for (forward, back) in [("l", "h"), ("shift-right", "shift-left")] {
+        harness.key(forward);
+        harness.drive_to_end().await;
+        let frame = harness.render();
+        assert!(!on_library(&frame), "`{forward}` showed Templates: {frame}");
+        assert!(frame.contains("default"), "the Templates hint: {frame}");
+        harness.key(back);
+        harness.drive_to_end().await;
+        let frame = harness.render();
+        assert!(on_library(&frame), "`{back}` went back: {frame}");
+    }
 }
 
 /// MOD-67 M4 PA-2 pin at the shell: a capturing Skills mode offers no view switch (`l` is typed)
-/// and still hands `Tab` to the shell, the draft kept; the agent help over it too.
+/// and still hands the tab key (`ctrl-pgdn` since MOD-115 M2 D4) to the shell, the draft kept;
+/// the agent help over it too.
 #[tokio::test]
 async fn a_capturing_skills_view_keeps_tab_and_offers_no_switch() {
     let mut harness = shell(true).await;
@@ -490,11 +500,11 @@ async fn a_capturing_skills_view_keeps_tab_and_offers_no_switch() {
     let frame = harness.render();
     assert!(frame.contains("lYou are running"), "`l` is typed: {frame}");
     let skills_then_requirements = |harness: &mut Harness| {
-        harness.key("tab");
+        harness.key("ctrl-pgdn");
         assert_eq!(
             harness.app().tabs.active_id().map(|id| id.0),
             Some("requirements"),
-            "`Tab` passes to the shell"
+            "`Ctrl+PgDn` passes to the shell"
         );
         harness.key("2");
         assert_eq!(harness.app().tabs.active_id(), Some(SkillsTab::ID));
@@ -595,7 +605,7 @@ async fn with_keys_installs_the_keys() {
         .with_keys(keys);
     harness.drive_to_end().await;
     assert!(
-        status_line(&mut harness).starts_with("F10 quit · Tab next tab"),
+        status_line(&mut harness).starts_with("F10 quit · Ctrl+PgDn next tab"),
         "{}",
         harness.render()
     );

@@ -33,11 +33,12 @@
 use super::{Act, Context, Layer, Stack};
 
 /// Every global act but the pane keys (MOD-115 M2 B2): `ctrl-right` is word-right in a field,
-/// so a capturing or confirming mode never moves the pane focus.
+/// so a capturing or confirming mode never moves the pane focus. Nor the tab keys (T6): their
+/// `tab`/`backtab` never passed a capturing or confirming mode, and their `ctrl-pgdn`/`ctrl-pgup`
+/// would, so a form would start switching tabs; a capturing Skills mode still hands them to the
+/// shell through its own `TABS` layer (MOD-67 M4 PA-2).
 const MODAL_GLOBALS: &[Act] = &[
     Act::Quit,
-    Act::NextTab,
-    Act::PrevTab,
     Act::SelectTab1,
     Act::SelectTab2,
     Act::SelectTab3,
@@ -56,7 +57,7 @@ const MODAL_GLOBALS: &[Act] = &[
 ];
 
 /// The global layer of a capturing or confirming mode: CONTROL, ALT and function keys only, and
-/// no pane key (MOD-115 M2 B2).
+/// no pane or tab key (MOD-115 M2 B2).
 const MODAL: Layer = Layer::only(Context::Global, MODAL_GLOBALS).with_modal_filter();
 
 /// The unfiltered global layer of a browse mode.
@@ -1326,7 +1327,9 @@ mod tests {
         assert_eq!(resolve(KINDS_BROWSE, "ctrl-d"), []);
         assert_eq!(resolve(HIERARCHY_BROWSE, "d"), [Act::Delete]);
         assert_eq!(resolve(HIERARCHY_BROWSE, "down"), [Act::ListDown]);
-        assert_eq!(resolve(HIERARCHY_BROWSE, "tab"), [Act::NextTab]);
+        // MOD-115 M2 D4: `Tab` moves the pane focus (nothing on a single-pane tab).
+        assert_eq!(resolve(HIERARCHY_BROWSE, "tab"), [Act::NextPane]);
+        assert_eq!(resolve(HIERARCHY_BROWSE, "ctrl-pgdn"), [Act::NextTab]);
         assert_eq!(resolve(AGENTS_FORM, "tab"), [Act::FormNextField]);
         // MOD-115 M2: a text area takes `Down` too; the form's own move comes first.
         assert_eq!(
@@ -1400,7 +1403,10 @@ mod tests {
         assert_eq!(resolve(LIBRARY_BROWSE, "ctrl-e"), []);
         assert_eq!(resolve(LIBRARY_BROWSE, "J"), [Act::PaneScrollDown]);
         assert_eq!(resolve(LIBRARY_BROWSE, "q"), [Act::Quit]);
-        assert_eq!(resolve(LIBRARY_EDITOR, "tab"), [Act::NextTab]);
+        // MOD-115 M2 D4: the tab keys are `ctrl-pgdn`/`ctrl-pgup` (the `TABS` layer still hands
+        // them to the shell); `Tab` reaches neither the panes (B2) nor the tabs.
+        assert_eq!(resolve(LIBRARY_EDITOR, "tab"), []);
+        assert_eq!(resolve(LIBRARY_EDITOR, "ctrl-pgdn"), [Act::NextTab]);
         assert_eq!(resolve(LIBRARY_EDITOR, "ctrl-g"), [Act::SkillsAskAgent]);
         assert_eq!(resolve(LIBRARY_EDITOR, "ctrl-s"), [Act::FormSave]);
         assert_eq!(resolve(LIBRARY_EDITOR, "ctrl-e"), [Act::FormExternalEditor]);
@@ -1428,7 +1434,8 @@ mod tests {
             resolve(HELP_ASKING, "down"),
             [Act::SkillsHelpNextAgent, Act::FieldLineDown]
         );
-        assert_eq!(resolve(HELP_ASKING, "tab"), [Act::NextTab]);
+        assert_eq!(resolve(HELP_ASKING, "tab"), []);
+        assert_eq!(resolve(HELP_ASKING, "ctrl-pgup"), [Act::PrevTab]);
         assert_eq!(resolve(HELP_PROPOSAL, "y"), [Act::SkillsHelpAccept]);
         assert_eq!(resolve(HELP_PROPOSAL, "esc"), [Act::ConfirmNo]);
         assert_eq!(resolve(HELP_WAITING, "esc"), [Act::SkillsHelpCancel]);

@@ -391,8 +391,11 @@ mod tests {
     fn the_base_stack_resolves_quit_tabs_digits_help_and_the_offered_globals() {
         let keys = Keys::compiled();
         assert_eq!(base(keys, "q"), [Act::Quit]);
-        assert_eq!(base(keys, "tab"), [Act::NextTab]);
-        assert_eq!(base(keys, "shift-tab"), [Act::PrevTab]);
+        // MOD-115 M2 D4: `Tab` moves the pane focus, `ctrl-pgdn` the tab.
+        assert_eq!(base(keys, "tab"), [Act::NextPane]);
+        assert_eq!(base(keys, "ctrl-pgdn"), [Act::NextTab]);
+        assert_eq!(base(keys, "shift-tab"), [Act::PrevPane]);
+        assert_eq!(base(keys, "ctrl-pgup"), [Act::PrevTab]);
         assert_eq!(base(keys, "3"), [Act::SelectTab3]);
         assert_eq!(base(keys, "?"), [Act::Help]);
         assert_eq!(base(keys, "f1"), [Act::Help]);
@@ -610,8 +613,10 @@ mod tests {
         assert_eq!(open(keys, "q"), [Act::Quit]);
         assert_eq!(open(keys, "?"), [Act::Help]);
         assert_eq!(open(keys, "f1"), [Act::Help]);
-        assert_eq!(open(keys, "tab"), [Act::NextTab]);
-        assert_eq!(open(keys, "shift-tab"), [Act::PrevTab]);
+        assert_eq!(open(keys, "tab"), [Act::NextPane]);
+        assert_eq!(open(keys, "ctrl-pgdn"), [Act::NextTab]);
+        assert_eq!(open(keys, "shift-tab"), [Act::PrevPane]);
+        assert_eq!(open(keys, "ctrl-pgup"), [Act::PrevTab]);
         assert_eq!(open(keys, "1"), [Act::SelectTab1]);
         assert_eq!(open(keys, "w"), [Act::Workspaces]);
         assert_eq!(open(keys, "ctrl-f"), [Act::Find]);

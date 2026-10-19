@@ -85,7 +85,7 @@ mod binary {
         assert_eq!(stdout, print(&load_path(&valid).expect("valid.toml loads")));
         // MOD-115 M2: a version-1 quit keeps `ctrl-c` (D-9); `Esc` is never printed (MD7).
         assert!(
-            stdout.contains("quit         = [\"ctrl-y\", \"ctrl-c\"]  # quit (changed)\n"),
+            stdout.contains("quit         = [\"ctrl-y\", \"ctrl-c\"]      # quit (changed)\n"),
             "{stdout}"
         );
         assert!(
@@ -102,7 +102,7 @@ mod binary {
         for (name, line) in [
             (
                 "ctrl_c",
-                "find         = [\"ctrl-c\"]      # find (changed)\n",
+                "find         = [\"ctrl-c\"]                # find (changed)\n",
             ),
             ("overlay_close", "close = []  # close; Esc always\n"),
         ] {
@@ -544,7 +544,10 @@ mod app {
         harness.key("q");
         assert!(!harness.app().should_quit, "`q` no longer quits");
         let line = status_line(&mut harness);
-        assert!(line.starts_with("Ctrl+y quit · Tab next tab"), "{line}");
+        assert!(
+            line.starts_with("Ctrl+y quit · Ctrl+PgDn next tab"),
+            "{line}"
+        );
 
         harness.key("?");
         assert!(harness.app().help_visible, "`?` opens the box");
@@ -598,7 +601,10 @@ mod app {
         harness.drive_to_end().await;
 
         let line = status_line(&mut harness);
-        assert!(line.starts_with("Ctrl+q quit · Tab next tab"), "{line}");
+        assert!(
+            line.starts_with("Ctrl+q quit · Ctrl+PgDn next tab"),
+            "{line}"
+        );
         harness.key("?");
         let frame = harness.render();
         assert!(frame.contains("Ctrl+q/Ctrl+c quit"), "{frame}");

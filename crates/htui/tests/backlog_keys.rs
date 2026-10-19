@@ -59,7 +59,7 @@ fn help_box(frame: &str) -> Vec<String> {
 
 /// The browse status line of a lone Backlog tab: `Stack::BASE`'s.
 const BROWSE: &str =
-    "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · F9 about";
+    "q quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · 1 select tab · ? help · F9 about";
 
 /// The status line of a capturing mode in a lone Backlog tab (D9).
 const CAPTURING: &str = "Ctrl+c quit · F1 help · F9 about";
@@ -95,8 +95,8 @@ async fn the_runs_pane_status_line_and_box_list_every_layer() {
              c cancel run · T retry cleanup · u unblock · R start run · C close out · \
              i follow up · v list / flow · + zoom in · - zoom out · = fit the run",
             "Answer: 1-9 answer",
-            "Pane: PgDn page down · PgUp page up · l/]/Right next sub-tab · \
-             h/[/Left previous sub-tab",
+            "Pane: PgDn page down · PgUp page up · l/]/Shift+Right next sub-tab · \
+             h/[/Shift+Left previous sub-tab",
             "Backlog: Enter replay step · m open graph · f filter · F clear filter · \
              N new item · Q queue / dequeue · P pause / resume queue",
             "Common: e edit",
@@ -104,7 +104,7 @@ async fn the_runs_pane_status_line_and_box_list_every_layer() {
             // MOD-115 M2 T6: the history keys act on every tab; the layout and pane keys only on
             // a tab that claims a list and a detail (the Backlog does from Task 7).
             "History: Backspace/Alt+Left back · Alt+Right forward",
-            "Global: q/Ctrl+c quit · Tab next tab · Shift+Tab previous tab · 1-9 select tab · \
+            "Global: q/Ctrl+c quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · 1-9 select tab · \
              ?/F1 help · F9 about",
             "?/F1 closes this box",
         ],

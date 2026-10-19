@@ -1002,6 +1002,16 @@ mod tests {
         press(KeyCode::Enter, KeyModifiers::NONE)
     }
 
+    /// `global.next_tab` (MOD-115 M2 D4: `ctrl-pgdn`; `Tab` moves the pane focus).
+    fn next_tab() -> KeyEvent {
+        press(KeyCode::PageDown, KeyModifiers::CONTROL)
+    }
+
+    /// `global.prev_tab` (`ctrl-pgup`).
+    fn prev_tab() -> KeyEvent {
+        press(KeyCode::PageUp, KeyModifiers::CONTROL)
+    }
+
     /// The id of the overlay on top.
     fn top(app: &App) -> Option<OverlayId> {
         app.overlays.top().map(Overlay::id)
@@ -1130,7 +1140,7 @@ mod tests {
     const UNFOCUSED_TITLE: &str = " nvim · htui has the keys ";
     const FOCUSED_STATUS: &str = "the editor has the keys · Ctrl+4 to htui";
     const UNFOCUSED_STATUS: &str =
-        "Ctrl+4 to the editor · Ctrl+x abort · Tab/Shift+Tab switch tabs · q quit · ? help";
+        "Ctrl+4 to the editor · Ctrl+x abort · Ctrl+PgDn/Ctrl+PgUp switch tabs · q quit · ? help";
     const REFUSAL: &str = "the editor is open: Ctrl+4 to the editor · Ctrl+x abort";
     /// R0 F3, M2 R1 L-1: under any modal overlay, a prompt or a view (find, the queue, the quit
     /// question), on the asking tab.
@@ -1244,7 +1254,7 @@ mod tests {
             let (mut app, benches, log) = unfocused_two();
             confirmable(&mut app);
             if from_other {
-                app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+                app.on_key(next_tab());
             }
             let here = app.tabs.active_id();
 
@@ -1298,7 +1308,7 @@ mod tests {
             let (mut app, _benches, log) = unfocused_two();
             confirmable(&mut app);
             if other {
-                app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+                app.on_key(next_tab());
             }
             if asked {
                 app.on_key(plain('q'));
@@ -1335,7 +1345,7 @@ mod tests {
             let (mut app, benches, log) = unfocused_two();
             confirmable(&mut app);
             if from_other {
-                app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+                app.on_key(next_tab());
             }
             app.on_key(plain('q'));
             app.on_key(ctrl('4'));
@@ -1382,7 +1392,7 @@ mod tests {
     #[test]
     fn on_the_asking_tab_every_global_acts_and_tabs_switch() {
         let (mut app, benches, log) = unfocused_two();
-        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(next_tab());
         assert_eq!(app.tabs.active_id(), Some(OTHER), "`Tab` switches");
         assert!(app.editor_open(), "the editor keeps running");
         let term = draw(&mut app, 100, 30);
@@ -1402,7 +1412,7 @@ mod tests {
 
         app.on_key(plain('2'));
         assert_eq!(app.tabs.active_id(), Some(OTHER), "`2` from the asking tab");
-        app.on_key(press(KeyCode::BackTab, KeyModifiers::SHIFT));
+        app.on_key(prev_tab());
         assert_eq!(app.tabs.active_id(), Some(ASKER));
         assert_eq!(app.editor_status().as_deref(), Some(UNFOCUSED_STATUS));
         assert!(
@@ -1496,7 +1506,7 @@ mod tests {
     #[test]
     fn on_another_tab_keys_reach_that_tab() {
         let (mut app, benches, log) = unfocused_two();
-        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(next_tab());
         for key in [
             plain('j'),
             plain('x'),
@@ -1519,7 +1529,7 @@ mod tests {
     #[test]
     fn the_focus_key_from_another_tab_brings_the_editor_back_focused() {
         let (mut app, benches, log) = unfocused_two();
-        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(next_tab());
         app.on_key(plain('?'));
         assert!(app.help_visible);
 
@@ -1537,7 +1547,7 @@ mod tests {
     #[test]
     fn abort_acts_only_on_the_asking_tab() {
         let (mut app, benches, _log) = unfocused_two();
-        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(next_tab());
         app.on_key(ctrl('x'));
         assert!(app.editor_open(), "not on another tab");
         assert_eq!(
@@ -1563,7 +1573,7 @@ mod tests {
     fn a_tab_emitting_abort_edit_kills_nothing() {
         let (mut app, benches, log) = unfocused_two();
         abortable(&mut app);
-        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(next_tab());
         app.on_key(plain('!'));
         assert_eq!(
             codes(&benches[1]),
@@ -1580,7 +1590,7 @@ mod tests {
     #[test]
     fn a_second_edit_from_another_tab_is_answered_editor_busy() {
         let (mut app, benches, _log) = unfocused_two();
-        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(next_tab());
         app.on_key(plain('e'));
         assert!(app.take_external_edit().is_none());
         assert_eq!(
@@ -1602,7 +1612,7 @@ mod tests {
             "the asker: dropped"
         );
 
-        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(next_tab());
         app.on_paste(&Zeroizing::new("x".to_owned()));
         assert_eq!(benches[1].seen.borrow().pastes, vec!["x".to_owned()]);
         assert!(writes(&log).is_empty());
@@ -1633,7 +1643,7 @@ mod tests {
         let name = app.top_bar.workspace.clone();
         for other in [false, true] {
             if other {
-                app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+                app.on_key(next_tab());
             }
             app.update(Action::SetScope {
                 workspace: workspace("Platform"),
@@ -1660,7 +1670,7 @@ mod tests {
     fn a_reveal_into_the_asking_tab_is_refused_and_one_elsewhere_passes() {
         let (mut app, _benches, _log) = unfocused_two();
         app.reveal_tabs = vec![(RevealKind::Item, ASKER), (RevealKind::Requirement, OTHER)];
-        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(next_tab());
 
         app.update(Action::Reveal(RevealTarget::Item {
             id: ItemId::new(),
@@ -1697,7 +1707,7 @@ mod tests {
     #[test]
     fn the_status_line_on_another_tab_carries_the_edit_and_the_way_back() {
         let (mut app, _benches, _log) = unfocused_two();
-        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(next_tab());
         let term = draw(&mut app, 100, 30);
         let buffer = term.backend().buffer();
         assert!(
@@ -1751,7 +1761,7 @@ mod tests {
 
         // Another tab, a converted view: the way back first, then its own box.
         app.on_key(plain('?'));
-        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(next_tab());
         app.on_key(plain('?'));
         assert!(app.help_visible);
         let term = draw(&mut app, 100, 30);
@@ -2105,7 +2115,7 @@ mod tests {
     #[test]
     fn off_screen_output_feeds_the_screen_without_a_frame() {
         let (mut app, _benches, log) = unfocused_two();
-        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(next_tab());
         app.dirty = false;
         output(&mut app, b"hidden-text\x1b[6n");
         assert!(!app.dirty, "nothing on screen changed");
@@ -2554,7 +2564,7 @@ mod tests {
         open(&mut app, ASKER, &log);
         assert!(!app.mouse_capture(), "on the asking tab: off");
         app.on_key(ctrl('4'));
-        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(next_tab());
         assert!(app.mouse_capture(), "on the other tab: the view's");
         assert_eq!(benches[1].lost.get(), 0);
 
@@ -2564,7 +2574,7 @@ mod tests {
         assert_eq!(benches[1].lost.get(), 1, "the other tab is told (MOD-74)");
 
         app.on_key(ctrl('4'));
-        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(next_tab());
         assert!(app.mouse_capture());
         exited(&mut app, 0, Duration::from_secs(2));
         assert!(app.mouse_capture(), "still on after the exit");
@@ -2611,7 +2621,9 @@ mod tests {
         app.on_key(press(KeyCode::F(12), KeyModifiers::NONE));
         assert_eq!(
             app.editor_status().as_deref(),
-            Some("F12 to the editor · Ctrl+x abort · Tab/Shift+Tab switch tabs · q quit · ? help")
+            Some(
+                "F12 to the editor · Ctrl+x abort · Ctrl+PgDn/Ctrl+PgUp switch tabs · q quit · ? help"
+            )
         );
         app.on_key(plain('j'));
         assert_eq!(

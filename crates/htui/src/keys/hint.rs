@@ -411,11 +411,11 @@ mod tests {
     use crate::keys::{Act, Context, Keys, Layer, Stack, views};
 
     // MOD-115 M2: the pane keys close the line (the shell offers them from Task 6 on).
-    const BARE: &str = "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help \
-                        · F9 about · Ctrl+Right next pane · Ctrl+Left previous pane";
-    const FULL: &str = "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help \
+    const BARE: &str = "q quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · 1 select tab · ? help \
+                        · F9 about · Tab next pane · Shift+Tab previous pane";
+    const FULL: &str = "q quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · 1 select tab · ? help \
                         · F9 about · w workspaces · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue \
-                        · Ctrl+Right next pane · Ctrl+Left previous pane";
+                        · Tab next pane · Shift+Tab previous pane";
 
     /// What the shell offers without `register_all`: every act but the four that name a view.
     fn bare(act: Act) -> bool {
@@ -478,7 +478,7 @@ mod tests {
         // (a key file cannot unbind it: the safety net refuses that).
         assert!(
             keys.status_line(Stack::BASE, all)
-                .starts_with("Tab next tab · ")
+                .starts_with("Ctrl+PgDn next tab · ")
         );
         let spec = &[Hint::One(Act::Quit, "quit"), Hint::One(Act::Help, "help")];
         assert_eq!(keys.hint(Stack::BASE, spec), "? help");
@@ -512,14 +512,14 @@ mod tests {
         let keys = Keys::compiled();
         assert_eq!(
             global_line(keys, bare),
-            "Global: q/Ctrl+c quit · Tab next tab · Shift+Tab previous tab · 1-9 select tab \
-             · ?/F1 help · F9 about · Ctrl+Right next pane · Ctrl+Left previous pane"
+            "Global: q/Ctrl+c quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · 1-9 select tab \
+             · ?/F1 help · F9 about · Tab/Ctrl+Right next pane · Shift+Tab/Ctrl+Left previous pane"
         );
         assert_eq!(
             global_line(keys, all),
-            "Global: q/Ctrl+c quit · Tab next tab · Shift+Tab previous tab · 1-9 select tab \
+            "Global: q/Ctrl+c quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · 1-9 select tab \
              · ?/F1 help · F9 about · w workspaces · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue \
-             · Ctrl+Right next pane · Ctrl+Left previous pane"
+             · Tab/Ctrl+Right next pane · Shift+Tab/Ctrl+Left previous pane"
         );
         assert_eq!(
             keys.help_line(Context::Overlay, all)
@@ -542,7 +542,7 @@ mod tests {
         let keys = Keys::defaults().with_chords(Context::Global, Act::Quit, &["ctrl-x"]);
         assert!(global_line(&keys, all).starts_with("Global: Ctrl+x quit · "));
         let keys = Keys::defaults().with_chords(Context::Global, Act::Quit, &[]);
-        assert!(global_line(&keys, all).starts_with("Global: Tab next tab · "));
+        assert!(global_line(&keys, all).starts_with("Global: Ctrl+PgDn next tab · "));
     }
 
     #[test]
@@ -571,9 +571,9 @@ mod tests {
         assert_eq!(
             global.rows(88),
             [
-                "Global: q/Ctrl+c quit · Tab next tab · Shift+Tab previous tab · 1-9 select tab",
+                "Global: q/Ctrl+c quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · 1-9 select tab",
                 "  ?/F1 help · F9 about · w workspaces · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue",
-                "  Ctrl+Right next pane · Ctrl+Left previous pane",
+                "  Tab/Ctrl+Right next pane · Shift+Tab/Ctrl+Left previous pane",
             ]
         );
     }
@@ -675,12 +675,12 @@ mod tests {
             texts(keys.help_lines(views::QUEUE_BROWSE, bare)),
             [
                 "Queue: e/Enter edit",
-                "Settings: l/]/Right next section · h/[/Left previous section",
+                "Settings: l/]/Shift+Right next section · h/[/Shift+Left previous section",
                 "Common: r reload · Esc dismiss",
                 "List: j/Down down · k/Up up",
                 HISTORY_LINE,
-                "Global: q/Ctrl+c quit · Tab next tab · Shift+Tab previous tab · 1-9 select tab \
-                 · ?/F1 help · F9 about · Ctrl+Right next pane · Ctrl+Left previous pane",
+                "Global: q/Ctrl+c quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · 1-9 select tab \
+                 · ?/F1 help · F9 about · Tab/Ctrl+Right next pane · Shift+Tab/Ctrl+Left previous pane",
             ]
         );
         assert_eq!(
@@ -839,8 +839,8 @@ mod tests {
                 "Answer: 1-9 answer",
                 "List: j/Down down · k/Up up",
                 HISTORY_LINE,
-                "Global: q/Ctrl+c quit · Tab next tab · Shift+Tab previous tab · 1-9 select tab \
-                 · ?/F1 help · F9 about · Ctrl+Right next pane · Ctrl+Left previous pane",
+                "Global: q/Ctrl+c quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · 1-9 select tab \
+                 · ?/F1 help · F9 about · Tab/Ctrl+Right next pane · Shift+Tab/Ctrl+Left previous pane",
             ]
         );
         assert_eq!(
@@ -855,7 +855,7 @@ mod tests {
     fn a_tabs_layer_shows_on_the_status_line_and_in_one_global_line() {
         use views::TEMPLATES_EDITOR;
         let keys = Keys::compiled();
-        let tabs = "Ctrl+c quit · Tab next tab · Shift+Tab previous tab · F1 help · F9 about";
+        let tabs = "Ctrl+c quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · F1 help · F9 about";
         assert_eq!(
             keys.status_line(TEMPLATES_EDITOR, all),
             format!("{tabs} · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue")

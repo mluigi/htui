@@ -937,16 +937,17 @@ const fn capture_row(
 /// it). M3-M5 append their contexts' blocks at the end.
 pub static CATALOGUE: &[ActionSpec] = &[
     // [global]: the pre-MOD-67 keymap's `default_global` rows and `app/mod.rs` `register_all`
-    // labels, in status-line order. MOD-115 M2 (MD2): `ctrl-c` is a default of quit, no longer
-    // a fixed key; `app/state.rs` still answers it ahead of every stack until Task 6. `next_tab`
-    // and `prev_tab` move to `ctrl-pgdn`/`ctrl-pgup` in Task 6 (B6), so they are `since: 2`.
+    // labels, in status-line order. MOD-115 M2 (MD2): `ctrl-c` is a default of quit (the leave
+    // dialog), no longer a fixed key. Plan D4: `next_tab` and `prev_tab` moved to
+    // `ctrl-pgdn`/`ctrl-pgup` (T6, B6), `tab`/`backtab` to the pane rows, so they are `since: 2`;
+    // digits and clicks remain the main way between tabs.
     row(Act::Quit, Global, "quit", &["q", "ctrl-c"], "quit").since(2),
-    row(Act::NextTab, Global, "next_tab", &["tab"], "next tab").since(2),
+    row(Act::NextTab, Global, "next_tab", &["ctrl-pgdn"], "next tab").since(2),
     row(
         Act::PrevTab,
         Global,
         "prev_tab",
-        &["backtab"],
+        &["ctrl-pgup"],
         "previous tab",
     )
     .since(2),
@@ -1024,13 +1025,13 @@ pub static CATALOGUE: &[ActionSpec] = &[
     row(Act::Find, Global, "find", &["ctrl-f"], "find"),
     row(Act::Waiting, Global, "waiting", &["ctrl-w"], "waiting"),
     row(Act::Queue, Global, "queue", &["ctrl-q"], "queue"),
-    // MOD-115 M2 D3: pane focus. After `queue`, so every keys line keeps its prefix. Task 6 adds
-    // `tab`/`backtab` once `next_tab` gives them up (B6); a modal stack never offers them (B2).
+    // MOD-115 M2 D3: pane focus. After `queue`, so every keys line keeps its prefix. `tab` and
+    // `backtab` since `next_tab` gave them up (T6, B6); the modal stack never offers them (B2).
     row(
         Act::NextPane,
         Global,
         "next_pane",
-        &["ctrl-right"],
+        &["tab", "ctrl-right"],
         "next pane",
     )
     .since(2),
@@ -1038,7 +1039,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         Act::PrevPane,
         Global,
         "prev_pane",
-        &["ctrl-left"],
+        &["backtab", "ctrl-left"],
         "previous pane",
     )
     .since(2),
@@ -1080,13 +1081,13 @@ pub static CATALOGUE: &[ActionSpec] = &[
     // backlog/detail/mod.rs:469.
     row(Act::PanePageUp, Pane, "page_up", &["pgup"], "page up"),
     // backlog/mod.rs:793. Settings cycles sections through `settings.next_section` (M3).
-    // MOD-115 M2 Task 6 (B6): the shift arrows replace the plain ones (arrows stay in the pane);
-    // until then a shift arrow would show in the `?` box, so no default changes in Task 0.
+    // MOD-115 M2 T6 (B6, plan D4): the shift arrows replace the plain ones (arrows stay in the
+    // focused pane). Appended, so the hint rows' first chords (`h/l sub-tab`) stay.
     row(
         Act::PaneNextSubtab,
         Pane,
         "next_subtab",
-        &["l", "]", "right"],
+        &["l", "]", "shift-right"],
         "next sub-tab",
     )
     .since(2),
@@ -1095,7 +1096,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         Act::PanePrevSubtab,
         Pane,
         "prev_subtab",
-        &["h", "[", "left"],
+        &["h", "[", "shift-left"],
         "previous sub-tab",
     )
     .since(2),
@@ -1184,12 +1185,12 @@ pub static CATALOGUE: &[ActionSpec] = &[
     row(Act::EditorAbort, Editor, "abort", &["ctrl-x"], "abort edit"),
     // [settings]: the Settings tab's own section cycling (MOD-67 M3 D1). Every non-capturing
     // section stack carries this layer, so a section's view layer may override both.
-    // settings/mod.rs:347. MOD-115 M2 Task 6: the shift arrows, as on `pane.next_subtab`.
+    // settings/mod.rs:347. MOD-115 M2 T6: the shift arrows, as on `pane.next_subtab`.
     row(
         Act::NextSection,
         Settings,
         "next_section",
-        &["l", "]", "right"],
+        &["l", "]", "shift-right"],
         "next section",
     )
     .since(2),
@@ -1198,7 +1199,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         Act::PrevSection,
         Settings,
         "prev_section",
-        &["h", "[", "left"],
+        &["h", "[", "shift-left"],
         "previous section",
     )
     .since(2),
@@ -1443,12 +1444,12 @@ pub static CATALOGUE: &[ActionSpec] = &[
     // [skills]: the verbs Library and Templates share (MOD-67 M4 D2), one row each, so
     // `[skills.library]` and `[skills.templates]` may override them per view.
     // skills/mod.rs:111-118: one toggle between two views (D2), so no next/prev pair.
-    // MOD-115 M2 Task 6: the shift arrows, as on `pane.next_subtab`.
+    // MOD-115 M2 T6: the shift arrows, as on `pane.next_subtab`.
     row(
         Act::SkillsSwitchView,
         Skills,
         "switch_view",
-        &["h", "l", "[", "]", "left", "right"],
+        &["h", "l", "[", "]", "shift-left", "shift-right"],
         "switch view",
     )
     .since(2),
@@ -3007,24 +3008,25 @@ mod tests {
         }
     }
 
-    /// MOD-115 M2 §1.4 (B6, D-4): the defaults Task 0 adds are the ones that collide with
-    /// nothing and show nowhere yet; the meaning flips (`tab` to the panes, the shift arrows for
-    /// the plain ones on the sub-tabs) wait for Task 6.
+    /// MOD-115 M2 §1.4 (B6, D-4, plan D4): Task 6 flips the meanings with their wiring: `tab`
+    /// and `backtab` move the pane focus, the tabs move to `ctrl-pgdn`/`ctrl-pgup`, and the
+    /// sub-tab, section and view switches take the shift arrows instead of the plain ones
+    /// (arrows stay in the pane), appended so every hint's first chord stays.
     #[test]
-    fn the_m2_rows_have_their_task_0_defaults() {
+    fn the_m2_rows_have_their_task_6_defaults() {
         let defaults = |act: Act| act.spec().expect("a row").defaults;
         assert_eq!(defaults(Act::Quit), ["q", "ctrl-c"]);
-        assert_eq!(defaults(Act::NextTab), ["tab"]);
-        assert_eq!(defaults(Act::PrevTab), ["backtab"]);
-        assert_eq!(defaults(Act::NextPane), ["ctrl-right"]);
-        assert_eq!(defaults(Act::PrevPane), ["ctrl-left"]);
-        assert_eq!(defaults(Act::PaneNextSubtab), ["l", "]", "right"]);
-        assert_eq!(defaults(Act::PanePrevSubtab), ["h", "[", "left"]);
-        assert_eq!(defaults(Act::NextSection), ["l", "]", "right"]);
-        assert_eq!(defaults(Act::PrevSection), ["h", "[", "left"]);
+        assert_eq!(defaults(Act::NextTab), ["ctrl-pgdn"]);
+        assert_eq!(defaults(Act::PrevTab), ["ctrl-pgup"]);
+        assert_eq!(defaults(Act::NextPane), ["tab", "ctrl-right"]);
+        assert_eq!(defaults(Act::PrevPane), ["backtab", "ctrl-left"]);
+        assert_eq!(defaults(Act::PaneNextSubtab), ["l", "]", "shift-right"]);
+        assert_eq!(defaults(Act::PanePrevSubtab), ["h", "[", "shift-left"]);
+        assert_eq!(defaults(Act::NextSection), ["l", "]", "shift-right"]);
+        assert_eq!(defaults(Act::PrevSection), ["h", "[", "shift-left"]);
         assert_eq!(
             defaults(Act::SkillsSwitchView),
-            ["h", "l", "[", "]", "left", "right"]
+            ["h", "l", "[", "]", "shift-left", "shift-right"]
         );
         assert_eq!(defaults(Act::LayoutNextPreset), ["p"]);
         assert_eq!(defaults(Act::LayoutPrevPreset), ["P"]);

@@ -991,7 +991,8 @@ mod tests {
         // An empty store leaves the registration's switcher up and a modal overlay swallows what
         // it does not handle, so the tab bindings only apply once it is closed.
         harness.key("esc");
-        harness.key("tab");
+        // MOD-115 M2 D4: `ctrl-pgdn` is the next tab (`Tab` moves the pane focus).
+        harness.key("ctrl-pgdn");
         harness.settle().await;
         assert!(harness.render().contains("Skills"));
         assert_eq!(
