@@ -36,6 +36,7 @@ use crate::keys::{Act, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells;
+use crate::ui::shell::TabLoc;
 use crate::ui::tabs::registry::{Tab, TabId};
 use crossterm::event::KeyEvent;
 
@@ -395,8 +396,9 @@ impl Tab for SettingsTab {
 
     /// Section cycling through `settings.next_section`/`prev_section` (MOD-67 M3, L-B Q10):
     /// resolved through the active section's stack, else `views::SETTINGS_TAB`. Chord equality
-    /// includes modifiers, so `ctrl-l`, `ctrl-h` or `shift-right` no longer cycle (ANA-26 §2.6
-    /// defect 1). Every other key goes to the active section.
+    /// includes modifiers, so `ctrl-l` or `ctrl-h` no longer cycle (ANA-26 §2.6 defect 1), and
+    /// plain `right` no longer does either (MOD-115 M2 D4). Every other key goes to the active
+    /// section.
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         // A section that is taking typed text answers first: `l` is a letter there, not a cycle.
         if self
@@ -446,6 +448,33 @@ impl Tab for SettingsTab {
     /// already been handed whatever the tab was handed.
     fn focus_section(&mut self, section: SectionId) -> bool {
         self.sections.focus(section)
+    }
+
+    /// MOD-115 M2 §8: the active section, by id and title; Settings has no cursor of its own.
+    fn location(&self) -> TabLoc {
+        TabLoc {
+            subtab: self.sections.active_id().map(|id| id.0),
+            subtab_title: self
+                .sections
+                .active()
+                .map(|section| section.title().to_owned()),
+            cursor: None,
+        }
+    }
+
+    /// MOD-115 M2 §8: back to a [`location`](Tab::location)'s section, as
+    /// [`focus_section`](Tab::focus_section) moves to one. Nothing while the active section is
+    /// taking typed text: a move would leave its field behind.
+    fn restore(&mut self, loc: &TabLoc, _ctx: &mut Ctx<'_>) -> bool {
+        if self
+            .sections
+            .active()
+            .is_some_and(SettingsSection::captures_input)
+        {
+            return false;
+        }
+        loc.subtab
+            .is_some_and(|id| self.sections.focus(SectionId(id)))
     }
 
     /// The active section's keys (MOD-67 M6 T2).
@@ -528,6 +557,53 @@ mod tests {
         let other = &buffer[(second, 0)];
         assert_eq!(other.symbol(), "Q");
         assert!(!other.modifier.intersects(marked), "{other:?}");
+    }
+
+    /// MOD-115 M2 §8: the location names the active section; restoring it activates that
+    /// section, and a location naming no registered section restores nothing.
+    #[test]
+    fn the_location_is_the_section_and_restore_returns_to_it() {
+        use crate::app::{Emit, TopBarState};
+        use crate::store_worker::Origin;
+        use htui_core::model::WorkspaceId;
+
+        let mut tab = SettingsTab::with_sections(vec![
+            Box::new(ConnectionSection::new()),
+            Box::new(QdrantSection::new()),
+        ]);
+        let first = tab.location();
+        assert_eq!(first.subtab, tab.sections.active_id().map(|id| id.0));
+        assert_eq!(first.subtab_title.as_deref(), Some("Connection"));
+        assert_eq!(first.cursor, None);
+        tab.sections.cycle_next();
+        let second = tab.location();
+        assert_ne!(second, first);
+
+        let scope = Scope {
+            workspace_id: WorkspaceId::default(),
+            project_ids: Vec::new(),
+        };
+        let (top_bar, theme, emit) = (TopBarState::default(), Theme::default(), Emit::default());
+        let mut ctx = Ctx::new(
+            &scope,
+            &[],
+            &top_bar,
+            Keys::compiled(),
+            &theme,
+            Origin::Tab(SettingsTab::ID),
+            &emit,
+        );
+        assert!(tab.restore(&first, &mut ctx));
+        assert_eq!(tab.location(), first);
+        assert!(tab.restore(&second, &mut ctx));
+        assert_eq!(tab.location(), second);
+        let gone = TabLoc {
+            subtab: Some("no-such-section"),
+            ..TabLoc::default()
+        };
+        assert!(!tab.restore(&gone, &mut ctx));
+        assert!(!tab.restore(&TabLoc::default(), &mut ctx));
+        assert_eq!(tab.location(), second, "nothing moved");
     }
 
     /// MOD-67 M6 PA-6: a question ends in the answers in force, and in none when none is bound.
