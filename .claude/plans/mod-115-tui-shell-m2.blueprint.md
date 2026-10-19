@@ -619,3 +619,11 @@ with T5 serially.
     `skills.switch_view`, so the doc comments at `ui/tabs/settings/mod.rs` ("`ctrl-l`, `ctrl-h` or `shift-right` no
     longer cycle") and `ui/tabs/skills/mod.rs` ("... or `shift-right` no longer switch") are wrong; drop
     `shift-right` from both lists (plain `right` is the chord that no longer acts).
+- **D-16 (Task 8 as built; recorded at T8 repair 1).** The plan's `docs/decisions/mod/mod-115.md` is written as
+  `docs/decisions/mod/mod-115-decisions.md`. `validate-workflow-docs.sh` takes a `<prefix>-N.md` under `docs/decisions/`
+  for an item write-up and fails it as `decision-orphan` without a `DECISIONS.md` index line, and an index line for
+  MOD-115 while it is open in `HANDOFF.md` would break lifecycle step 3 (`.claude/rules/workflow-docs.md`). The
+  `-decisions` name is supplementary prose to the validator. `docs/REQUIREMENTS.md` (header and R-TUI-10) links
+  it. At close-out the item's write-up is `mod-115.md` with its index line, and it folds this file in.
+  T8 repair 2 touched `docs/htui-editor.md` outside the set: its `ctrl-c cannot be bound` bullet
+  contradicted README's Changing keys, which links it; it now names the `global.quit`/`leave.confirm` clash.
