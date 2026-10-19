@@ -22,6 +22,7 @@ use crate::app::{Ctx, Handled};
 use crate::editor::ExternalEditOutcome;
 use crate::keys::{Act, KeyChord, Stack};
 use crate::store_worker::{StoreReply, StoreRequest};
+use crate::ui::shell::{Panes, TabLoc};
 use crate::ui::tabs::registry::{Tab, TabId};
 use crate::ui::tabs::settings::key_line;
 use crossterm::event::KeyEvent;
@@ -50,6 +51,27 @@ enum View {
     Templates,
 }
 
+impl View {
+    /// Both views, in switch-line order.
+    const ALL: [Self; 2] = [Self::Skills, Self::Templates];
+
+    /// The view's id in a history location (MOD-115 M2 §8).
+    const fn id(self) -> &'static str {
+        match self {
+            Self::Skills => "library",
+            Self::Templates => "templates",
+        }
+    }
+
+    /// The view's name on the switch line, for the header's `back to` chip.
+    const fn title(self) -> &'static str {
+        match self {
+            Self::Skills => "Skills",
+            Self::Templates => "Templates",
+        }
+    }
+}
+
 impl SkillsTab {
     /// Identity of the Skills tab.
     pub const ID: TabId = TabId("skills");
@@ -66,6 +88,14 @@ impl SkillsTab {
             View::Skills => self.library.key_stack(),
             View::Templates => self.templates.key_stack(),
         }
+    }
+
+    /// Whether the shown view, or `view`, is taking every key: a prompt or an editor is open.
+    fn captures(&self, view: View) -> bool {
+        [self.view, view].into_iter().any(|view| match view {
+            View::Skills => self.library.captures_input(),
+            View::Templates => self.templates.captures_input(),
+        })
     }
 
     /// The other view.
@@ -128,8 +158,9 @@ impl Tab for SkillsTab {
     }
 
     /// The view switch is `skills.switch_view` (MOD-67 M4 D5), resolved through the shown view's
-    /// stack. Chord equality includes modifiers, so `ctrl-l`, `ctrl-h`, `alt-l` or `shift-right`
-    /// no longer switch (ANA-26 §2.6 defect 1). Every other key goes to the shown view.
+    /// stack. Chord equality includes modifiers, so `ctrl-l`, `ctrl-h` or `alt-l` no longer
+    /// switch (ANA-26 §2.6 defect 1), and plain `right` no longer does either (MOD-115 M2 D4:
+    /// arrows stay in the pane). Every other key goes to the shown view.
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         // A capturing mode answers first: `l` is a letter there (its stack has no `skills`
         // switch either, D5).
@@ -172,6 +203,48 @@ impl Tab for SkillsTab {
             View::Templates => self.templates.key_hint(ctx.keys()),
         };
         key_line(hint, ctx.theme)
+    }
+
+    /// MOD-115 M2 D2: the list and the pane, the 32-cell list both views drew by default.
+    fn panes(&self) -> Panes {
+        Panes::ListDetail(library::LAYOUT)
+    }
+
+    /// MOD-115 M2 §8: the shown view (`library` or `templates`, with its title) and its row.
+    fn location(&self) -> TabLoc {
+        let cursor = match self.view {
+            View::Skills => self.library.cursor(),
+            View::Templates => self.templates.cursor(),
+        };
+        TabLoc {
+            subtab: Some(self.view.id()),
+            subtab_title: Some(self.view.title().to_owned()),
+            cursor: Some(cursor.to_string()),
+        }
+    }
+
+    /// MOD-115 M2 §8: back to a [`location`](Tab::location): its view shown and its row under
+    /// the cursor. Nothing while either view is taking keys: a move would leave a prompt or an
+    /// editor behind.
+    fn restore(&mut self, loc: &TabLoc, _ctx: &mut Ctx<'_>) -> bool {
+        let target = View::ALL
+            .into_iter()
+            .find(|view| loc.subtab == Some(view.id()));
+        if self.captures(target.unwrap_or(self.view)) {
+            return false;
+        }
+        if let Some(view) = target {
+            self.view = view;
+        }
+        let row = loc
+            .cursor
+            .as_deref()
+            .and_then(|cursor| cursor.parse().ok())
+            .is_some_and(|index| match self.view {
+                View::Skills => self.library.restore_cursor(index),
+                View::Templates => self.templates.restore_cursor(index),
+            });
+        target.is_some() || row
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {

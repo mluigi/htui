@@ -1435,3 +1435,37 @@ async fn a_rebound_save_key_is_named_by_the_template_warning() {
     );
     assert_eq!(head(&store, "triage").await, None, "nothing was sent");
 }
+
+/// MOD-115 M2 §7, §8 (T7): `Tab` focuses the pane, where `j` leaves the tree's cursor where it
+/// is; a view switch is a place in the history, and Back returns to the Templates view and the
+/// template it was on.
+#[tokio::test]
+async fn the_pane_takes_motion_and_back_returns_to_the_template_left() {
+    let mut harness = open().await;
+    select(&mut harness, "implement");
+    harness.key("tab");
+    harness.key("j");
+    harness.key("G");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} implement v"),
+        "the cursor stayed:\n{frame}"
+    );
+
+    harness.key("tab");
+    harness.key("h");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("\u{250c} implement v"),
+        "on the Skills view:\n{frame}"
+    );
+    harness.key("backspace");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} implement v"),
+        "back on `implement`:\n{frame}"
+    );
+}

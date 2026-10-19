@@ -1987,3 +1987,37 @@ async fn a_rebound_reload_and_edit_key_are_named() {
         "{frame}"
     );
 }
+
+/// MOD-115 M2 §7, §8 (T7): `Tab` focuses the pane, where `k` leaves the library's cursor where
+/// it is; a view switch is a place in the history, and Back returns to the library and the skill
+/// it was on.
+#[tokio::test]
+async fn the_pane_takes_motion_and_back_returns_to_the_skill_left() {
+    let mut harness = open().await;
+    select(&mut harness, "tests");
+    harness.key("tab");
+    harness.key("k");
+    harness.key("g");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} tests v"),
+        "the cursor stayed:\n{frame}"
+    );
+
+    harness.key("tab");
+    harness.key("l");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("\u{250c} tests v"),
+        "on the Templates view:\n{frame}"
+    );
+    harness.key("backspace");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} tests v"),
+        "back on `tests`:\n{frame}"
+    );
+}
