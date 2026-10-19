@@ -14,7 +14,8 @@
 > items owned by a project or a workspace), `R-ID-6` (drafts a person accepts), `R-NF-1` (Windows),
 > `R-PRM-1`/`R-PRM-3` (how context reaches a prompt), `R-LATER-7` (code stays with the code-context tools).
 >
-> **Status (2026-10-18): draft; §8 awaits the maintainer.** No implementation code is written here. Verdict
+> **Status (2026-10-19): concluded; the maintainer accepted all eleven §8 answers as recommended** (D1-D5
+> decided 2026-10-18). Decision write-up: `docs/decisions/ana/ana-37.md`. No implementation code is written here. Verdict
 > (§7): **knowledge search is a required workspace service: one shared Qdrant per workspace, required to be
 > configured, failing open on outage.** The first draft kept Qdrant optional on every box. The maintainer then
 > reframed the item (§1, D1-D5) as one search over everything a workspace knows, across its projects: items,
@@ -30,7 +31,8 @@
 > trial covered one project's backlog, small enough to read whole; how the gain behaves at workspace scale is
 > **unmeasured** (§5.10). The "very beneficial" bar is met by the maintainer's decision on the
 > workspace-knowledge framing, supported by the duplicate result; it is not proven for agents at today's size.
-> Proposed spawns P1..P5 (§9), not filed.
+> Filed: **MOD-158** (P1), **MOD-159** (P2), **MOD-160** (P3), **MOD-161** (P4), **MOD-162** (P5); the §10
+> requirement edits are applied to `docs/REQUIREMENTS.md`.
 
 ---
 
@@ -779,11 +781,11 @@ indexed; tool calls, tool results and edit proposals, which carry code, are not 
 | Phase | Content | Depends on |
 |---|---|---|
 | 0 | Requirement edits (§10), the `R-NF-2` text merged with MOD-130's pending amendment; MOD-112, ANA-35 and ANA-38 take their constraints | maintainer acceptance |
-| 1 | P1 workspace Qdrant setting and API key; P3 cheap fail-open and wording | none |
-| 2 | P2 single indexer, freshness, one collection per workspace; MOD-112 (4) notes, transcripts and agents' workspace scope on top of it | P1 |
-| 3 | P2's coverage of documents owned by a project or the workspace, workspace requirements and memory; MOD-112 (4)'s workspace-owned items | ANA-35, ANA-38 |
-| 4 | P4 related items at draft time | P2; MOD-112 (3), MOD-135 and MOD-8 for the later parts |
-| any | P5 benchmark in the repo; rerun at workspace scale once notes and transcripts are indexed | none; the rerun needs MOD-112 (4) and MOD-8 |
+| 1 | P1 (MOD-158) workspace Qdrant setting and API key; P3 (MOD-160) cheap fail-open and wording | none |
+| 2 | P2 (MOD-159) single indexer, freshness, one collection per workspace; MOD-112 (4) notes, transcripts and agents' workspace scope on top of it | P1 |
+| 3 | P2's (MOD-159) coverage of documents owned by a project or the workspace, workspace requirements and memory; MOD-112 (4)'s workspace-owned items | ANA-35, ANA-38 |
+| 4 | P4 (MOD-161) related items at draft time | P2; MOD-112 (3), MOD-135 and MOD-8 for the later parts |
+| any | P5 (MOD-162) benchmark in the repo; rerun at workspace scale once notes and transcripts are indexed | none; the rerun needs MOD-112 (4) and MOD-8 |
 
 ## 8. Questions for the maintainer
 
@@ -872,15 +874,16 @@ D1-D5 (§1) are decided and not asked again. What stays open:
 
 ## 9. Proposed spawns
 
-Not filed; no IDs are minted. Ordering is by dependency.
+Filed 2026-10-19 as P1 → MOD-158, P2 → MOD-159, P3 → MOD-160, P4 → MOD-161, P5 → MOD-162; ordering is by
+dependency.
 
-| P | Subject | Scope | Blocked on | Requirements |
-|---|---|---|---|---|
-| P1 | Workspace Qdrant: URL setting and API key | The Qdrant URL as a workspace setting in Postgres (migration, coordinated with ANA-35's workspace schema and MOD-130's `target_id` on the workspace; set from the existing Settings > Qdrant section, whose URL row moves to it, and from the CLI), a URL with credentials refused; the API key in the keyring per workspace, from a systemd credential or stdin, one key per workspace slug, for a headless worker (R-ORCH-12), and for development and CI from an environment variable htui removes from every agent subprocess (R-SEC-2); a development and CI override for the URL; the per-box keyring URL offered once as the workspace setting, then retired; a setting changed after start picked up without a restart. | none | R-STO-1, R-STO-8, R-SEC-2, R-TUI-8, R-NF-2 |
-| P2 | One indexer per workspace; freshness; coverage | The workspace indexer lease in Postgres (holder, box, expiry, renewal, one lease per workspace a process serves; renewed before each delete batch, orphans confirmed absent in the same pass); one collection per workspace; the run records the workspace it was queued from; the short incremental cycle (timestamps with the cache refresh's overlap; transcripts by step and `seq`) plus the full reconcile; the worker's index job runs under the lease, and the TUI's `Ctrl+R` and `--index-items` take it only when free, otherwise request a pass from the holder and show which box holds it; `--search-items` over several workspaces queries each one's Qdrant and names those unavailable. Coverage of the parts of D3 that MOD-112 (4) does not own: documents owned by a project or the workspace and workspace requirements once ANA-35 lands, and memory as ANA-38 designs it. **MOD-112 (4) keeps** notes, scrubbed transcripts (prompt, follow-up, assistant-text and plan events only), workspace-owned items once ANA-35 lands, and agents' workspace scope; P2 provides the indexer they plug into and does not duplicate them. | P1; ANA-35 and ANA-38 for those parts | R-STO-8, R-ENT-12, R-ENT-13, R-ENT-16 |
-| P3 | Fail open cheaply, and say so | The TUI search checks Qdrant and the collection before loading the model and never creates a collection, as the CLI already does; every search surface answers "knowledge search unavailable" with its cause; `search_concepts` advertised when the workspace has a URL configured, answering with the same words during an outage (today it is always advertised, §2.4); Settings, first run and worker start warn when the workspace has no Qdrant, when it is unreachable, and when this box lacks the key; CI runs `qdrant_live` and `qdrant_worker` against a Qdrant instead of skipping. May be folded into P1. | none | R-NF-2, R-NF-3, R-STO-8, R-MCP-2, R-TUI-8 |
-| P4 | Related items at draft time | The top 5 nearest items across the workspace (open and closed, decisions included) beside item creation in the TUI, `item_create` drafts, the coordinator's follow-up drafts and the MOD-8 importer, for a person to judge; display-only, nothing written from a score; "knowledge search unavailable" during an outage, filing unaffected. | P2; MOD-112 (3), MOD-135 and MOD-8 for those parts | R-STO-8, R-ID-6, R-ENT-9, R-MCP-2 |
-| P5 | Retrieval benchmark in the repo; rerun at workspace scale | Move the ANA-37 harness (corpus builder, frozen queries with their hash, metrics, McNemar) from `/tmp` into the repo as a dev tool against a scratch Qdrant; build a workspace corpus from Postgres (several projects, notes, transcripts) once MOD-112 (4) and MOD-8 land; add cross-project duplicate and question queries; report dense-only beside the hybrid; rerun the agent trial on a corpus that does not fit one read. Could be filed as TOOL instead. | none; the workspace rerun needs MOD-112 (4) and MOD-8 | R-STO-8 |
+| P | Filed | Subject | Scope | Blocked on | Requirements |
+|---|---|---|---|---|---|
+| P1 | MOD-158 | Workspace Qdrant: URL setting and API key | The Qdrant URL as a workspace setting in Postgres (migration, coordinated with ANA-35's workspace schema and MOD-130's `target_id` on the workspace; set from the existing Settings > Qdrant section, whose URL row moves to it, and from the CLI), a URL with credentials refused; the API key in the keyring per workspace, from a systemd credential or stdin, one key per workspace slug, for a headless worker (R-ORCH-12), and for development and CI from an environment variable htui removes from every agent subprocess (R-SEC-2); a development and CI override for the URL; the per-box keyring URL offered once as the workspace setting, then retired; a setting changed after start picked up without a restart. | none | R-STO-1, R-STO-8, R-SEC-2, R-TUI-8, R-NF-2 |
+| P2 | MOD-159 | One indexer per workspace; freshness; coverage | The workspace indexer lease in Postgres (holder, box, expiry, renewal, one lease per workspace a process serves; renewed before each delete batch, orphans confirmed absent in the same pass); one collection per workspace; the run records the workspace it was queued from; the short incremental cycle (timestamps with the cache refresh's overlap; transcripts by step and `seq`) plus the full reconcile; the worker's index job runs under the lease, and the TUI's `Ctrl+R` and `--index-items` take it only when free, otherwise request a pass from the holder and show which box holds it; `--search-items` over several workspaces queries each one's Qdrant and names those unavailable. Coverage of the parts of D3 that MOD-112 (4) does not own: documents owned by a project or the workspace and workspace requirements once ANA-35 lands, and memory as ANA-38 designs it. **MOD-112 (4) keeps** notes, scrubbed transcripts (prompt, follow-up, assistant-text and plan events only), workspace-owned items once ANA-35 lands, and agents' workspace scope; P2 provides the indexer they plug into and does not duplicate them. | P1; ANA-35 and ANA-38 for those parts | R-STO-8, R-ENT-12, R-ENT-13, R-ENT-16 |
+| P3 | MOD-160 | Fail open cheaply, and say so | The TUI search checks Qdrant and the collection before loading the model and never creates a collection, as the CLI already does; every search surface answers "knowledge search unavailable" with its cause; `search_concepts` advertised when the workspace has a URL configured, answering with the same words during an outage (today it is always advertised, §2.4); Settings, first run and worker start warn when the workspace has no Qdrant, when it is unreachable, and when this box lacks the key; CI runs `qdrant_live` and `qdrant_worker` against a Qdrant instead of skipping. May be folded into P1. | none | R-NF-2, R-NF-3, R-STO-8, R-MCP-2, R-TUI-8 |
+| P4 | MOD-161 | Related items at draft time | The top 5 nearest items across the workspace (open and closed, decisions included) beside item creation in the TUI, `item_create` drafts, the coordinator's follow-up drafts and the MOD-8 importer, for a person to judge; display-only, nothing written from a score; "knowledge search unavailable" during an outage, filing unaffected. | P2; MOD-112 (3), MOD-135 and MOD-8 for those parts | R-STO-8, R-ID-6, R-ENT-9, R-MCP-2 |
+| P5 | MOD-162 | Retrieval benchmark in the repo; rerun at workspace scale | Move the ANA-37 harness (corpus builder, frozen queries with their hash, metrics, McNemar) from `/tmp` into the repo as a dev tool against a scratch Qdrant; build a workspace corpus from Postgres (several projects, notes, transcripts) once MOD-112 (4) and MOD-8 land; add cross-project duplicate and question queries; report dense-only beside the hybrid; rerun the agent trial on a corpus that does not fit one read. Could be filed as TOOL instead. | none; the workspace rerun needs MOD-112 (4) and MOD-8 | R-STO-8 |
 
 Effects on existing items, applied at acceptance: **MOD-112** part (2) is recorded as existing
 (`search_concepts`); part (4) keeps notes, transcripts (without tool calls, tool results or edit
@@ -896,6 +899,7 @@ shared Qdrant and reaches a prompt without it" as a constraint; how memory is in
 ## 10. Requirement edits owed
 
 All maintainer-gated; `docs/REQUIREMENTS.md` is not edited by this item. `<date>` is the acceptance date.
+Accepted 2026-10-19 and applied to `docs/REQUIREMENTS.md` in the conclusion commit (`docs/decisions/ana/ana-37.md`).
 A bracketed condition marks a sentence that depends on a §8 question other than Q9; it is removed on
 acceptance, and the sentence is dropped if its question is rejected.
 

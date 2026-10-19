@@ -64,6 +64,13 @@ R-TUI-12..18 added; amended in place: R-ID-6, R-ENT-2, R-ENT-14, R-ENT-15, R-ORC
 R-PRM-4, R-TUI-1, R-TUI-2, R-TUI-3, R-TUI-4, R-TUI-5, R-TUI-6, R-TUI-7, R-TUI-8 and R-TUI-10. The
 analyses it opens are ANA-40 (the Toolbox), ANA-41 (project workflows) and ANA-42 (execution
 targets).
+amended 2026-10-19 by maintainer decision on ANA-37 (`docs/decisions/ana/ana-37.md`, `docs/ANA-37.md` §10) —
+R-NF-2 and R-STO-8 replaced (one shared Qdrant per workspace, required and failing open; knowledge
+search for the workspace, one indexer under a lease, a collection per workspace, related items at
+draft time); amended in place: R-STO-1 (the Qdrant API key in the keyring, the URL a workspace
+setting), R-MCP-1 (notes and transcripts through search), R-MCP-2 (a text filter on the read tools,
+knowledge search at workspace scope), R-ENT-13 (memory indexed, and reaching a prompt without it) and
+R-TUI-8 (the workspace's Qdrant in Settings).
 **Governed by:** `.claude/rules/workflow-docs.md`
 
 This file is the product requirements for `htui`. It sits above every `ANA-N` analysis and every
@@ -218,11 +225,13 @@ conflict. Their verdicts survive only where restated here.
   `verdict`, and any phase-defined kind). Produced by steps or written by hand. Items and documents
   may carry attachments (images, logs, other files), held in Postgres under a size cap in version one
   (an object store is R-LATER-10). Amended 2026-10-15.
-- **R-ENT-13 (reopened, pending ANA-38).** Project and workspace memory: facts, decisions and
-  gotchas that outlive one item, for the coordinator (R-ORCH-14) and for agents. ANA-1's atomic facts
-  table with importance scores (`artifact`, `artifact_link`) was withdrawn as over-engineered on
-  2026-09-03; reopened 2026-10-15 by maintainer decision. ANA-38 settles who writes it, how it stays
-  fresh, how it meets R-ID-6, and its integration with semantic search (R-STO-8).
+- **R-ENT-13 (reopened, pending ANA-38).** Project and workspace memory: facts, decisions and gotchas
+  that outlive one item, for the coordinator (R-ORCH-14) and for agents. ANA-1's atomic facts table with
+  importance scores (`artifact`, `artifact_link`) was withdrawn as over-engineered on 2026-09-03;
+  reopened 2026-10-15 by maintainer decision. ANA-38 settles who writes it, how it stays fresh, how it
+  meets R-ID-6, and its integration with semantic search (R-STO-8). Memory entries are indexed in the
+  workspace's knowledge search (R-STO-8), and memory reaches a prompt without it, so an outage of the
+  workspace's Qdrant never empties a prompt (R-NF-2, ANA-37).
 - **R-ENT-14 (must).** `requirement`: key `R-<AREA>-<N>` minted per owner and area, never reused;
   the owner is a project or a workspace. It has body, rationale, priority `must`/`later`, state
   `active`/`withdrawn`, and a `version` with revisions naming the deciding item. Text changes only by
@@ -254,19 +263,22 @@ conflict. Their verdicts survive only where restated here.
 
 ## 4. Storage, cache and offline (R-STO)
 
-- **R-STO-1 (must).** Postgres is the only writable store. Connection
-  string and provider identities live in the OS keyring (Windows Credential Manager, macOS Keychain,
-  Linux secret service), never in a file — including when the connection string is typed into the
-  TUI rather than passed to `htui --set-dsn`. Local files under the user's config directory that
+- **R-STO-1 (must).** Postgres is the only writable store. Connection string, provider identities and
+  the API key of each workspace's Qdrant live in the OS keyring (Windows Credential Manager, macOS
+  Keychain, Linux secret service), never in a file — including when the connection string is typed into
+  the TUI rather than passed to `htui --set-dsn`. Local files under the user's config directory that
   hold no secret and no domain data (the box identity, the read-only cache) are not a store. One
-  exception, for a headless worker (R-ORCH-12) on
-  a Linux host with no secret service: the DSN may be a systemd credential encrypted at rest and
-  bound to the host (`systemd-creds encrypt`, read from `$CREDENTIALS_DIRECTORY`), or be read once
-  from the worker's or a TUI session's stdin (`--dsn-stdin`) and held only in memory. For
-  development and CI, the DSN may also come from an environment variable, which `htui` removes from
-  every agent subprocess environment (R-SEC-2). Never in `argv` or a plaintext file. Amended by
-  maintainer decision on MOD-41, 2026-09-29, on MOD-45, 2026-10-01 (a TUI session's stdin), and on
-  the requirements review, 2026-10-15 (environment variable; key bindings moved to Postgres).
+  exception, for a headless worker (R-ORCH-12) on a Linux host with no secret service: the DSN may be a
+  systemd credential encrypted at rest and bound to the host (`systemd-creds encrypt`, read from
+  `$CREDENTIALS_DIRECTORY`), or be read once from the worker's or a TUI session's stdin (`--dsn-stdin`)
+  and held only in memory. For development and CI, the DSN may also come from an environment variable,
+  which `htui` removes from every agent subprocess environment (R-SEC-2). Never in `argv` or a plaintext
+  file. The same exception, and the development and CI environment variable, apply to a workspace's
+  Qdrant API key (R-STO-8). The Qdrant URL is not a secret: it is a workspace setting in Postgres,
+  carries no credentials, and may be overridden per process by a development or CI environment variable.
+  Amended by maintainer decision on MOD-41, 2026-09-29, on MOD-45, 2026-10-01 (a TUI session's stdin),
+  and on the requirements review, 2026-10-15 (environment variable; key bindings moved to Postgres), and
+  on ANA-37, 2026-10-19 (Qdrant API key and URL).
 - **R-STO-2 (must).** TLS to Postgres is supported and optional.
 - **R-STO-3 (must).** Each box keeps a read-only cache of the projects it has opened under the
   user's config directory, refreshed on every successful connection. Contents: items, links,
@@ -287,19 +299,28 @@ conflict. Their verdicts survive only where restated here.
   background and never block input. ANA-32 measures it. Amended 2026-10-15 (was: under one second
   with a reachable Postgres).
 - **R-STO-7 (withdrawn).** Local-only mode. Withdrawn by maintainer decision MOD-25, 2026-09-11.
-- **R-STO-8 (must).** Semantic search over items and requirements. `htui` indexes each item's key,
-  title and body, its latest documents, its notes, the scrubbed transcripts of its runs, and each
-  requirement's key, body and rationale (withdrawn ones included), into a Qdrant collection (local
-  dense embeddings plus BM25 sparse vectors, ranked together) and answers searches scoped to
-  projects or a workspace, workspace-owned items, documents and requirements included (R-ENT-16).
-  Agents search through an MCP tool (R-MCP-2). A search can be narrowed to decisions: items
-  closed as `done`, `concluded` or `rejected` (R-ENT-8), and their documents. The index is derived
-  from Postgres and rebuildable from it (R-STO-1); when Qdrant or the embedding model is
-  unavailable, search fails with a clear error and nothing else is affected, unless ANA-37 makes
-  Qdrant required (R-NF-2). Added by maintainer decision on MOD-34, 2026-09-25 (`docs/ANA-19.md`,
+- **R-STO-8 (must).** Knowledge search for the workspace. `htui` indexes what a workspace knows, across
+  its projects: each item's key, title and body, its latest documents, its notes and the scrubbed
+  transcripts of its runs (prompts, agent text and plans, not tool calls, tool output or edits);
+  documents owned by a project or the workspace (R-ENT-12); workspace-owned items (R-ENT-16); each
+  requirement's key, body and rationale (withdrawn ones included); and memory (R-ENT-13). Code and
+  markdown files in a repo checkout are not indexed: they belong to the code-context tools (R-LATER-7)
+  unless imported into Postgres (R-LATER-3). The index lives in the workspace's shared Qdrant (R-NF-2),
+  with local dense embeddings and BM25 sparse vectors ranked together. Each workspace has its own
+  collection, holding every member project. Searches cover the workspace by default and can be narrowed
+  to projects; agents search through an MCP tool at workspace scope, within their read scope (R-MCP-1,
+  R-MCP-2). A search can be narrowed to decisions: items closed as `done`, `concluded` or `rejected`
+  (R-ENT-8), and their documents. The index is derived from Postgres and rebuildable from it (R-STO-1).
+  One `htui` process per workspace indexes it and keeps it current. It is the holder of a workspace
+  lease in Postgres, worker or TUI. Rows written are indexed within a short cycle, and a full reconcile
+  catches deletions. When the workspace's Qdrant or the embedding model is unavailable, search answers
+  "knowledge search unavailable" and nothing else is affected (R-NF-2). Drafting an item shows the
+  nearest existing items across the workspace for a person to judge; nothing is written from a search
+  score (R-ID-6). Added by maintainer decision on MOD-34, 2026-09-25 (`docs/ANA-19.md`,
   `docs/ANA-20.md`); amended by maintainer decision on MOD-50, 2026-09-29 (requirements indexed,
-  decisions by resolution), and on the requirements review, 2026-10-15 (notes, transcripts,
-  workspace scope, agent tool).
+  decisions by resolution), on the requirements review, 2026-10-15 (notes, transcripts, workspace scope,
+  agent tool), and on ANA-37, 2026-10-19 (workspace knowledge search, shared Qdrant, one indexer, a
+  collection per workspace, the lease, freshness and related items).
 
 ## 5. Agent driver (R-AGT)
 
@@ -509,14 +530,18 @@ conflict. Their verdicts survive only where restated here.
 ## 10. htui MCP server (R-MCP)
 
 - **R-MCP-1 (must).** `htui` exposes an MCP server to every session it launches. Every tool call is
-  scoped to the run step owning the session: an agent writes only within its run, and may read
-  beyond it — workspace items, documents and requirements. Amended 2026-10-15 (wider read scope).
+  scoped to the run step owning the session: an agent writes only within its run, and may read beyond it
+  — workspace items with their notes, documents and requirements, and, through knowledge search
+  (R-STO-8), snippets of the scrubbed transcripts of the workspace's runs. Amended 2026-10-15 (wider
+  read scope) and 2026-10-19 (ANA-37, notes and transcripts through search).
 - **R-MCP-2 (must).** Tools: `item_link` (propose an edge, kind), `item_status` request,
   `document_write` (the step's output artifact), `note_add`, `box_profile` read, `command_run`,
-  `spawn_subagent`; read tools for items, documents and requirements, and semantic search
-  (R-STO-8); `item_create`, which proposes an item as a draft a person accepts (R-ID-6); a question
-  to the user that parks the step (R-TUI-11, MOD-75); and the planner's tools for declaring parts and
-  next steps (R-ORCH-1, R-ORCH-7, ANA-33). ANA-36 surveys further tools. Amended 2026-10-15.
+  `spawn_subagent`; read tools for items, documents and requirements, with a text filter over their
+  keys, titles and bodies that works without Qdrant, and knowledge search at workspace scope (R-STO-8),
+  which says it is unavailable when the workspace's Qdrant is not available; `item_create`, which
+  proposes an item as a draft a person accepts (R-ID-6); a question to the user that parks the step
+  (R-TUI-11, MOD-75); and the planner's tools for declaring parts and next steps (R-ORCH-1, R-ORCH-7,
+  ANA-33). ANA-36 surveys further tools. Amended 2026-10-15 and 2026-10-19 (ANA-37).
 - **R-MCP-3 (must).** `command_run` enqueues build, test and run commands behind per-box
   concurrency limits by command class (for example one C++ build, four test runs) and returns
   output. Exposure per phase is `off`, `fan_out_only` (default) or `always`, and can be forced on
@@ -585,19 +610,21 @@ conflict. Their verdicts survive only where restated here.
   keyboard or mouse (dragging from a step's handle), change or delete a link, pin a target, with undo
   and redo of every edit. ANA-40 settles the kinds and how each is shown. Amended 2026-10-15 and
   2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`) (was: a Skills tab and a separate Templates tab).
-- **R-TUI-8 (must).** Settings tab: agent registry with quota, adding a row (R-AGT-5), and each
-  row's isolation (R-ID-5); box profile with capability edits; project types, item kinds, and step
-  graphs with a graph editor; `command_run` exposure and per-box limits (R-MCP-3); key
-  bindings (R-TUI-10); secret provider, caps, scheduler window, repo credentials (R-BOX-4), and the
-  Postgres connection: whether a DSN is stored, a masked field to enter or replace it, an action to
-  clear it, and the state of the last attempt. What is typed goes to the OS keyring and nowhere else
-  (R-STO-1); it is not echoed, not logged, and not written to any file. Sections also hold the
-  targets and the default target (R-ORCH-15), workflows (the light model, chosen from the models the
-  configured agents offer; whether the agent's run-time workflow changes apply on their own or ask
-  first; the default workflow) and the component catalogue (R-ENT-17); the connection section is
-  named Postgres. Workspaces live in their own tab (R-TUI-14) and the Backlog's grouping and done
-  items are Backlog keys (R-TUI-2). A field edits on its row with its help beneath; arrows change a
-  choice or a toggle, saved at once. Amended 2026-10-15 and 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`).
+- **R-TUI-8 (must).** Settings tab: agent registry with quota, adding a row (R-AGT-5), and each row's
+  isolation (R-ID-5); box profile with capability edits; project types, item kinds, and step graphs with
+  a graph editor; `command_run` exposure and per-box limits (R-MCP-3); key bindings (R-TUI-10); secret
+  provider, caps, scheduler window, repo credentials (R-BOX-4), and the Postgres connection: whether a
+  DSN is stored, a masked field to enter or replace it, an action to clear it, and the state of the last
+  attempt. What is typed goes to the OS keyring and nowhere else (R-STO-1); it is not echoed, not
+  logged, and not written to any file. Sections also hold the targets and the default target
+  (R-ORCH-15), workflows (the light model, chosen from the models the configured agents offer; whether
+  the agent's run-time workflow changes apply on their own or ask first; the default workflow), the
+  component catalogue (R-ENT-17), and the workspace's Qdrant (its URL, stored in Postgres; a masked
+  field for this box's API key, stored in the keyring; the state of the last attempt; a warning when the
+  workspace has none; R-STO-8, R-NF-2); the connection section is named Postgres. Workspaces live in
+  their own tab (R-TUI-14) and the Backlog's grouping and done items are Backlog keys (R-TUI-2). A field
+  edits on its row with its help beneath; arrows change a choice or a toggle, saved at once. Amended
+  2026-10-15, 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`) and 2026-10-19 (ANA-37).
 - **R-TUI-9 (must).** Close-out writes the final summary document, sets status, records commit
   hashes from the run. No markdown files are produced. The coordinator (R-ORCH-14) runs close-out
   and its checklist — follow-up items, re-confirming suspect citations, choosing the resolution —
@@ -704,13 +731,18 @@ and R-LATER-7 were promoted to must on 2026-10-15 and keep their IDs.
 
 - **R-NF-1 (must).** Linux and Windows 10+. macOS is best effort: it builds and nothing may block
   it, but it gates no release. Amended 2026-10-15.
-- **R-NF-2 (must).** No required dependency on any external daemon other than Postgres, the agents,
-  and in coding sessions the code-context tools (R-LATER-7). Two services are optional, and each
-  fails open with nothing else affected when absent: Qdrant with its embedding model for semantic
-  search (R-STO-8), unless ANA-37 finds it worth requiring, and an error-reporting endpoint the user
-  configures in Settings, which is off unless set and receives only scrubbed events (R-ID-7,
-  MOD-99). Amended by maintainer decision, 2026-10-14, and 2026-10-15 (context tools; Qdrant to
-  ANA-37).
+- **R-NF-2 (must).** Required services: Postgres, and one shared Qdrant per workspace with its embedding
+  model, which runs in each process that searches or indexes (R-STO-8). Qdrant fails open: when a
+  workspace's Qdrant is not configured or not reachable, `htui` starts and works, knowledge search says
+  "knowledge search unavailable", and nothing else is affected; no run, prompt or close-out waits on it.
+  While a workspace names no Qdrant, agents are not offered the search tool (R-MCP-2). Every box and
+  process of a workspace uses that workspace's one Qdrant; none runs or names a Qdrant of its own,
+  except a development or CI override (R-STO-1). Beyond Postgres, Qdrant and the agents, no required
+  dependency on any external daemon, except the code-context tools in coding sessions (R-LATER-7). An
+  error-reporting endpoint the user configures in Settings stays optional: it is off unless set,
+  receives only scrubbed events (R-ID-7, MOD-99), and fails open with nothing else affected. Amended by
+  maintainer decision, 2026-10-14, 2026-10-15 (context tools; Qdrant to ANA-37), and on ANA-37,
+  2026-10-19 (one shared Qdrant per workspace, required, failing open).
 - **R-NF-3 (must).** All long operations (probe, cache refresh, sessions) run off the UI thread;
   the TUI never blocks on network or subprocess I/O, and reflects a key press on screen within a
   bound set by ANA-32's measurement (order of 50 ms) under load. Amended 2026-10-15.
