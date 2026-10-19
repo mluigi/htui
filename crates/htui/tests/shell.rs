@@ -613,6 +613,98 @@ async fn a_ten_row_frame_drops_the_about_panel() {
     }
 }
 
+/// The demo shell with `keys` installed (the defaults when `None`), moved to the Platform
+/// workspace and on the Requirements tab, as `tests/requirements.rs` opens it.
+async fn requirements_shell(keys: Option<&str>) -> Harness {
+    use htui::ui::tabs::RequirementsTab;
+
+    let mut harness = Harness::over(htui_core::store::MemStore::demo());
+    if let Some(file) = keys {
+        harness = harness.with_keys(htui::keys::load_str(file).expect("the keys load"));
+    }
+    register_all(harness.app());
+    harness.settle().await;
+    harness.key("w");
+    harness.settle().await;
+    harness.key("j");
+    harness.key("enter");
+    harness.settle().await;
+    harness.key("3");
+    harness.settle().await;
+    assert_eq!(harness.app().tabs.active_id(), Some(RequirementsTab::ID));
+    harness
+}
+
+/// Presses each key of `keys` in turn, settling after each.
+async fn press_all(harness: &mut Harness, keys: &[&str]) {
+    for key in keys {
+        harness.key(key);
+        harness.settle().await;
+    }
+}
+
+/// Whether the view holding the keyboard captures text (a `[field]` layer in its stack).
+fn captures(harness: &mut Harness) -> bool {
+    harness
+        .app()
+        .active_stack()
+        .is_some_and(htui::keys::Stack::captures_text)
+}
+
+/// MOD-115 M2 D7 (blueprint §3), T6R finding 3: the shell's `[field]` translation, end to end on
+/// a real capturing screen (the Requirements filter). With `field.submit` and
+/// `field.delete_back` rebound, the rebound chords edit and submit the filter exactly as the
+/// canonical `Backspace` and `Enter` do with the defaults; `Esc` still cancels with
+/// `field.cancel` moved to another chord (MD7), and so does that chord.
+#[tokio::test]
+async fn a_rebound_field_key_edits_and_submits_a_real_field_as_its_canonical_key_did() {
+    const REBOUND: &str = "version = 2\n[field]\nsubmit = [\"ctrl-t\"]\ndelete_back = [\"f7\"]\ncancel = [\"ctrl-o\"]\n";
+
+    let mut canonical = requirements_shell(None).await;
+    let mut rebound = requirements_shell(Some(REBOUND)).await;
+    press_all(&mut canonical, &["/"]).await;
+    press_all(&mut rebound, &["/"]).await;
+    assert!(
+        captures(&mut canonical) && captures(&mut rebound),
+        "the filter is open"
+    );
+
+    press_all(&mut canonical, &["S", "T", "O", "X", "backspace"]).await;
+    press_all(&mut rebound, &["S", "T", "O", "X", "f7"]).await;
+    assert_eq!(
+        rebound.render(),
+        canonical.render(),
+        "`F7` deleted back as `Backspace` did"
+    );
+    press_all(&mut canonical, &["enter"]).await;
+    press_all(&mut rebound, &["ctrl-t"]).await;
+    let frame = rebound.render();
+    assert_eq!(
+        frame,
+        canonical.render(),
+        "`ctrl-t` submitted as `Enter` did"
+    );
+    assert!(!captures(&mut rebound), "the filter is submitted: {frame}");
+    assert!(
+        frame.contains("R-STO-1") && !frame.contains("R-ENT-2"),
+        "the list is filtered on `STO`: {frame}"
+    );
+
+    // MD7: `Esc` is never configurable; the moved `field.cancel` chord cancels too.
+    for cancel in ["esc", "ctrl-o"] {
+        let mut canonical = requirements_shell(None).await;
+        let mut rebound = requirements_shell(Some(REBOUND)).await;
+        press_all(&mut canonical, &["/", "E", "N", "T", "esc"]).await;
+        press_all(&mut rebound, &["/", "E", "N", "T", cancel]).await;
+        assert!(!captures(&mut rebound), "`{cancel}` closed the filter");
+        assert_eq!(
+            rebound.render(),
+            canonical.render(),
+            "`{cancel}` cancelled as `Esc` does"
+        );
+    }
+}
+
 /// A list + detail tab that records the panes the shell gives it, for the layout cases (MOD-115
 /// M2 T6): the production tabs adopt the layout in Task 7.
 mod split {
