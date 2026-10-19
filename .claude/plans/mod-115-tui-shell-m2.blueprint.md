@@ -602,3 +602,20 @@ with T5 serially.
     (`App::wheel_key`); the Runs flow keeps its own wheel.
   - *Hidden-pane note and activity placeholder name reachable keys only* (`Keys::reachable_chord`), so D-1's `p`
     in Backlog > Runs and Backlog > Prompt is never offered for the layouts there.
+  - *Also touched outside T6's §12 set (recorded at T6 repair 2):*
+    - `ui/overlay/abort_confirm.rs`, a behaviour change: the abort question passes `global.quit` to the shell
+      (`Handled::Pass` when the chord's first act is `Act::Quit`) instead of consuming it. B4 needs it: the question
+      swallowed every other key, so with the hardcoded `ctrl-c` branch gone `ctrl-c` could not reach the `QUIT`
+      layer and open the leave dialog over it. `Esc` in the dialog comes back to the question. Its module doc now
+      names `LeaveDialog` instead of the deleted `QuitConfirm`.
+    - `ui/overlay/leave.rs`, doc only (it names `register_all` instead of "Task 6 registers it").
+    - `keys/print.rs`, test only (the expected `--print-keys` text after the flips, wider comment column).
+    - `ui/tabs/requirements/mod.rs` and `ui/tabs/skills/agent_help.rs`, tests only: the Requirements `?` box now
+      lists the text field's wired keys; the Skills agent help passes `ctrl-pgdn`/`ctrl-pgup` (not `Tab`) to the
+      shell.
+    - `docs/htui-keys.md` (Task 8's file), regenerated for the default flips so it matches `--print-keys`.
+    - `app/state.rs` `hint_row` (in the set, but a pre-M2 adapter bug): a 0-wide frame no longer panics.
+  - *Carried to Task 7 (its files):* after the flips `shift-right` is a default of `settings.next_section` and
+    `skills.switch_view`, so the doc comments at `ui/tabs/settings/mod.rs` ("`ctrl-l`, `ctrl-h` or `shift-right` no
+    longer cycle") and `ui/tabs/skills/mod.rs` ("... or `shift-right` no longer switch") are wrong; drop
+    `shift-right` from both lists (plain `right` is the chord that no longer acts).
