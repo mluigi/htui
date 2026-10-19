@@ -1655,6 +1655,10 @@ const HINT_SEARCH_ROWS: u16 = 4;
 /// no such border in its last rows loses them until it moves to `Pane::hints` (M3, M4).
 fn hint_row(buf: &ratatui::buffer::Buffer, body: Rect) -> Option<Rect> {
     let body = body.intersection(buf.area);
+    if body.is_empty() {
+        // A body with no columns (a 0-wide frame) has no cell to look at.
+        return None;
+    }
     (0..HINT_SEARCH_ROWS.min(body.height))
         .map(|up| body.bottom() - 1 - up)
         .find(|y| matches!(buf[(body.x, *y)].symbol(), "\u{2514}" | "\u{2570}"))
@@ -1871,6 +1875,16 @@ mod tests {
         assert_eq!(hint_row(&buf, body), Some(Rect::new(0, 8, 20, 1)));
         buf[(0, 10)].set_symbol("\u{2570}");
         assert_eq!(hint_row(&buf, body), Some(Rect::new(0, 10, 20, 1)));
+    }
+
+    /// A frame with no columns has no border to paint the hints on: the adapter finds no row
+    /// instead of reading a cell the buffer does not have (T6 repair 2, finding 5).
+    #[test]
+    fn a_body_with_no_columns_has_no_hint_row() {
+        let buf = Buffer::empty(Rect::new(0, 0, 0, 6));
+        for height in 0..=6 {
+            assert_eq!(hint_row(&buf, Rect::new(0, 0, 0, height)), None, "{height}");
+        }
     }
 
     /// A hint longer than the first pane reads on across the seam where two panes meet.
