@@ -6,12 +6,19 @@
 use htui_core::model::{RunId, Scope, StepId, WorkspaceId, WorkspaceSummary};
 use htui_orch::Command;
 
-use crate::app::action::{Action, OverlayAction, RevealTarget, TabAction};
+use ratatui::layout::Rect;
+
+use crate::app::action::{
+    Action, HistoryAction, LayoutAction, OverlayAction, PaneAction, RevealTarget, TabAction,
+};
 use crate::app::state::{App, Ctx, EDITOR_NEEDS_A_TAB};
 use crate::connection::DsnState;
 use crate::run_worker::OrchRequest;
 use crate::store_worker::{Origin, ReplyEnvelope, StoreReply, StoreRequest};
 use crate::ui::overlay::{Overlay, OverlayId};
+use crate::ui::shell::PaneId;
+use crate::ui::shell::history::Loc;
+use crate::ui::shell::layout as pane_layout;
 use crate::ui::tabs::SettingsTab;
 use crate::ui::tabs::settings::ConnectionSection;
 
@@ -19,8 +26,14 @@ use crate::ui::tabs::settings::ConnectionSection;
 const TICKS_PER_REFRESH: u64 = 4;
 
 impl App {
-    /// Applies one action.
+    /// Applies one action, recording the move it made in the history (MOD-115 M2 §8: a reply
+    /// that reveals or redirects is a new place too).
     pub fn update(&mut self, action: Action) {
+        self.recorded(|app| app.apply(action));
+    }
+
+    /// [`update`](Self::update)'s body.
+    fn apply(&mut self, action: Action) {
         match action {
             Action::Quit => self.should_quit = true,
             Action::Tab(tab) => self.update_tab(tab),
@@ -40,7 +53,13 @@ impl App {
             Action::EditExternally(_) => self.status = Some(EDITOR_NEEDS_A_TAB.to_owned()),
             Action::AbortEdit => self.abort_editor(),
             Action::ToggleHelp => self.help_visible = !self.help_visible,
-            Action::ToggleAbout => self.about_visible = !self.about_visible,
+            Action::ToggleAbout => {
+                self.about_visible = !self.about_visible;
+                self.save_ui_state();
+            }
+            Action::Pane(pane) => self.step_pane(pane),
+            Action::Layout(step) => self.change_layout(step),
+            Action::History(step) => self.go_history(step),
             Action::Error(message) => self.status = Some(message),
             Action::Tick => {
                 self.on_tick();
@@ -83,6 +102,108 @@ impl App {
             }
             self.activate_tab();
         }
+    }
+
+    /// `global.next_pane`/`prev_pane` (MOD-115 M2 D3): the next visible pane of the panes the
+    /// active tab claimed in the last frame. Nothing on a tab that claimed none (a single-pane
+    /// tab).
+    fn step_pane(&mut self, step: PaneAction) {
+        let Some(tab) = self.tabs.active() else {
+            return;
+        };
+        let id = tab.id();
+        let from = self.focus_of(tab);
+        let Some((_, _, areas)) = self.last_claim.filter(|(claimed, _, _)| *claimed == id) else {
+            return;
+        };
+        let to = pane_layout::step(&areas, from, step == PaneAction::Next);
+        self.focus.insert(id, to);
+    }
+
+    /// One `[layout]` key on the active tab (MOD-115 M2 D2): the stored layout steps, a focused
+    /// pane it hides gives the focus to the detail, and the UI state is saved. Nothing on a
+    /// single-pane tab.
+    fn change_layout(&mut self, step: LayoutAction) {
+        let Some(tab) = self.tabs.active() else {
+            return;
+        };
+        let id = tab.id();
+        let focus = self.focus_of(tab);
+        let Some(mut layout) = self.layout_of(tab) else {
+            return;
+        };
+        match step {
+            LayoutAction::NextPreset => layout.next_preset(),
+            LayoutAction::PrevPreset => layout.prev_preset(),
+            LayoutAction::GrowList => layout.grow_list(),
+            LayoutAction::ShrinkList => layout.shrink_list(),
+            LayoutAction::GrowActivity => layout.grow_activity(),
+            LayoutAction::ShrinkActivity => layout.shrink_activity(),
+            LayoutAction::ToggleList => layout.toggle_list(),
+            LayoutAction::ToggleActivity => layout.toggle_activity(),
+            LayoutAction::Zoom => layout.toggle_zoom(),
+        }
+        self.ui.layouts.insert(id.0.to_owned(), layout);
+        // The region the tab split last, else one that holds every pane: only which panes are
+        // shown matters here.
+        let region = self
+            .last_claim
+            .filter(|(claimed, _, _)| *claimed == id)
+            .map_or(Rect::new(0, 0, 200, 60), |(_, region, _)| region);
+        let areas = pane_layout::areas(region, &layout, focus);
+        if !pane_layout::visible(&areas).contains(&focus) {
+            self.focus.insert(id, PaneId::Detail);
+        }
+        self.save_ui_state();
+    }
+
+    /// `history.back`/`forward` (MOD-115 M2 D5): to the place on the history, the place left
+    /// kept for the way back; the move itself is not recorded.
+    fn go_history(&mut self, step: HistoryAction) {
+        let Some(here) = self.here() else {
+            return;
+        };
+        let to = match step {
+            HistoryAction::Back => self.history.back(here),
+            HistoryAction::Forward => self.history.forward(here),
+        };
+        let Some(to) = to else {
+            return;
+        };
+        self.history_move = true;
+        self.go(&to);
+    }
+
+    /// Goes to `loc`: its tab, the tab's own location (`Tab::restore`, and what it emitted
+    /// drained) and the focused pane. A tab that is no longer registered is a no-op; the tab an
+    /// in-pane editor is open for is focused but not restored (MOD-57 M2 E5: nothing steers it).
+    fn go(&mut self, loc: &Loc) {
+        if self.tabs.title(loc.tab).is_none() {
+            return;
+        }
+        self.update_tab(TabAction::Focus(loc.tab));
+        if self.editor_tab() != Some(loc.tab) {
+            let origin = Origin::Tab(loc.tab);
+            {
+                let Self {
+                    scope,
+                    projects,
+                    top_bar,
+                    keys,
+                    theme,
+                    emit,
+                    tabs,
+                    ..
+                } = self;
+                if let Some(view) = tabs.by_id_mut(loc.tab) {
+                    let mut ctx =
+                        Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit);
+                    let _ = view.restore(&loc.at, &mut ctx);
+                }
+            }
+            self.drain(&origin);
+        }
+        self.focus.insert(loc.tab, loc.pane);
     }
 
     /// Opening and closing overlays. An unregistered id is ignored: the shell must not die

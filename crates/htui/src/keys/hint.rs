@@ -21,13 +21,6 @@ const SEP: &str = " · ";
 /// Where a continuation row of a packed [`HelpLine`] starts.
 const INDENT: &str = "  ";
 
-/// MOD-115 M2 Task 0: the contexts whose rows no site resolves yet, kept out of the `?` box so
-/// the box lists only keys that act. The task that wires a context removes it here: Task 5 wired
-/// `choice` and `answer` (the former `FIXED` sites); `field` goes with Task 6, which calls the
-/// translation (`keys::translate`) from the shell, and `layout` and `history` with Task 6's
-/// dispatch. The leave dialog is drawn from Task 6 on.
-const NOT_YET_WIRED: &[Context] = &[Context::Field, Context::Layout, Context::History];
-
 /// One element of a hint spec (ANA-26 §7.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hint {
@@ -233,7 +226,8 @@ impl Keys {
     /// a row for it (the `actions` shadowing rule, L-B Q6), with every chord that layer admits
     /// but those a listed narrower act always takes ([`SHADOWING`], MOD-115 M2 T5R);
     /// rows sharing a help label merge, and a row with no admitted chord drops. `offered` is
-    /// consulted for `Global` rows only. Every global layer of the stack renders as **one**
+    /// consulted for `Global` and `Layout` rows only (the shell's: a layout key acts only on a
+    /// tab with a list and a detail, MOD-115 M2 D2). Every global layer of the stack renders as **one**
     /// `Global:` line at the last global layer's place (MOD-67 M4 PA-2): quit first (its admitted
     /// chords, none when no global layer admits `Quit`), then the rows
     /// in layer order, an act listed under the first global layer that offers it. A layer that
@@ -247,9 +241,6 @@ impl Keys {
         let quit_help = Act::Quit.spec().map_or("quit", |spec| spec.help);
         let mut global_merged: Vec<(&str, Vec<KeyChord>)> = vec![(quit_help, Vec::new())];
         for (index, layer) in stack.layers().iter().enumerate() {
-            if NOT_YET_WIRED.contains(&layer.context()) {
-                continue; // MOD-115 M2 Task 0: no site resolves these rows yet
-            }
             let is_global = layer.context() == Context::Global;
             let mut here = Vec::new();
             let mut local: Vec<(&str, Vec<KeyChord>)> = Vec::new();
@@ -267,7 +258,10 @@ impl Keys {
                     continue; // shadowed by a narrower layer
                 }
                 here.push(row.act);
-                if row.context == Context::Global && row.act != Act::Quit && !offered(row.act) {
+                if matches!(row.context, Context::Global | Context::Layout)
+                    && row.act != Act::Quit
+                    && !offered(row.act)
+                {
                     continue;
                 }
                 let chords: Vec<KeyChord> = row
@@ -301,18 +295,20 @@ impl Keys {
 
     /// Whether `chord` never reaches `act` in `stack` and the box lists the act that takes it
     /// (MOD-115 M2 T5R): a narrower candidate ahead of `act` forms a [`SHADOWING`] pair with it
-    /// (the narrower act always wins), and its layer is wired. Over the Requirements form `l`
-    /// always sets the priority later, so the box lists it under that row only, not as the
-    /// choice's next option.
+    /// (the narrower act always wins). Over the Requirements form `l` always sets the priority
+    /// later, so the box lists it under that row only, not as the choice's next option. A text
+    /// field's act never hides a wider one (MOD-115 M2 T6): the widget passes what it does not
+    /// use, so the concepts search's `Esc` is the field's cancel and still `overlay.close`, and
+    /// the box lists it under both.
     fn shadowed(&self, stack: Stack<'_>, chord: KeyChord, act: Act) -> bool {
         self.actions(stack, chord)
             .into_iter()
             .take_while(|&candidate| candidate != act)
             .any(|narrower| {
                 SHADOWING.contains(&(narrower, act))
-                    && self
-                        .resolve_row(stack, narrower)
-                        .is_some_and(|(layer, _)| !NOT_YET_WIRED.contains(&layer.context()))
+                    && narrower
+                        .spec()
+                        .is_none_or(|spec| spec.context != Context::Field)
             })
     }
 
@@ -414,6 +410,15 @@ mod tests {
     fn all(_: Act) -> bool {
         true
     }
+
+    /// MOD-115 M2 T6: a text field's editing keys, the `?` box line of every capturing stack.
+    const FIELD_LINE: &str = "Text field: Enter submit · Esc cancel · Left cursor left · Right cursor \
+                              right · Home line start · End line end · Backspace delete back · Del \
+                              delete forward · Up line up · Down line down · PgUp page up · PgDn \
+                              page down";
+
+    /// MOD-115 M2 T6: the history keys, the `?` box line of every tab browse stack.
+    const HISTORY_LINE: &str = "History: Backspace/Alt+Left back · Alt+Right forward";
 
     fn global_line(keys: &Keys, offered: fn(Act) -> bool) -> String {
         keys.help_line(Context::Global, offered)
@@ -658,6 +663,7 @@ mod tests {
                 "Settings: l/]/Right next section · h/[/Left previous section",
                 "Common: r reload · Esc dismiss",
                 "List: j/Down down · k/Up up",
+                HISTORY_LINE,
                 "Global: q/Ctrl+c quit · Tab next tab · Shift+Tab previous tab · 1-9 select tab \
                  · ?/F1 help · F9 about · Ctrl+Right next pane · Ctrl+Left previous pane",
             ]
@@ -683,45 +689,79 @@ mod tests {
             texts(keys.help_lines(views::AGENTS_FORM, bare)),
             [
                 "Agents: Tab/Down next field · Shift+Tab/Up previous field",
+                FIELD_LINE,
                 "Global: Ctrl+c quit · F1 help · F9 about",
             ]
         );
         assert_eq!(
             texts(keys.help_lines(views::CAPTURE, all)),
             [
+                FIELD_LINE,
                 "Global: Ctrl+c quit · F1 help · F9 about · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue"
+            ]
+        );
+        // T6: the field's `Esc` is the concepts search's close too (the field passes cancel), so
+        // the box lists it under both; the hit cursor's `up`/`down` hide the field's (SHADOWING).
+        assert_eq!(
+            texts(keys.help_lines(views::CONCEPTS_QUERY, all)),
+            [
+                "Search concepts: Ctrl+d decisions only · Ctrl+p cycle project scope · Ctrl+r \
+                 re-index scope · Up previous hit · Down next hit",
+                "Text field: Enter submit · Esc cancel · Left cursor left · Right cursor right · \
+                 Home line start · End line end · Backspace delete back · Del delete forward · \
+                 PgUp page up · PgDn page down",
+                "Overlay: Esc close",
+                "Global: Ctrl+c quit · F1 help",
             ]
         );
     }
 
-    /// MOD-115 M2: the layers no site resolves yet (`field`, `layout`, `history`) stay out of the
-    /// `?` box; the ones Task 5 wired (`choice`, `answer`) are listed. The whole box of each
-    /// stack is pinned, so a line no site acts on cannot slip in (T0 verify: the headings alone
-    /// let the Requirements form's priority keys show before they were wired).
+    /// MOD-115 M2: every layer is wired from Task 6 on, so the box lists `field`, `history` and
+    /// (where the shell offers them: a tab with a list and a detail) `layout` too. The whole box
+    /// of each stack is pinned, so a line no site acts on cannot slip in (T0 verify: the headings
+    /// alone let the Requirements form's priority keys show before they were wired).
     #[test]
-    fn the_box_lists_the_wired_layers_and_leaves_out_the_rest() {
+    fn the_box_lists_every_layer_and_the_layout_rows_only_where_offered() {
         let keys = Keys::compiled();
-        for stack in [
-            views::BACKLOG_BODY,
-            views::RUNS_BROWSE,
-            views::CHAT_LIVE,
-            views::ITEM_FORM,
-            views::CAPTURE,
-            views::REQUIREMENTS_FORM,
-        ] {
-            for line in keys.help_lines(stack, all) {
-                assert!(
-                    !["Layout", "History", "Text field"].contains(&line.heading.as_str()),
-                    "{}",
-                    line.text()
-                );
-            }
+        let headings = |stack, offered: fn(Act) -> bool| -> Vec<String> {
+            keys.help_lines(stack, offered)
+                .into_iter()
+                .map(|line| line.heading)
+                .collect()
+        };
+        fn no_layout(act: Act) -> bool {
+            act.spec()
+                .is_none_or(|spec| spec.context != Context::Layout)
         }
+        for stack in [views::BACKLOG_BODY, views::RUNS_BROWSE] {
+            assert!(headings(stack, all).contains(&"Layout".to_owned()));
+            assert!(!headings(stack, no_layout).contains(&"Layout".to_owned()));
+            assert!(headings(stack, no_layout).contains(&"History".to_owned()));
+        }
+        assert!(headings(views::CHAT_LIVE, all).contains(&"History".to_owned()));
+        assert!(!headings(views::CHAT_LIVE, all).contains(&"Layout".to_owned()));
+        for stack in [views::ITEM_FORM, views::CAPTURE, views::REQUIREMENTS_FORM] {
+            let heads = headings(stack, all);
+            assert!(heads.contains(&"Text field".to_owned()), "{heads:?}");
+            assert!(!heads.contains(&"History".to_owned()), "{heads:?}");
+        }
+        assert_eq!(
+            texts(keys.help_lines(views::BACKLOG_BODY, all))
+                .into_iter()
+                .find(|line| line.starts_with("Layout")),
+            Some(
+                "Layout: p next layout · > wider list · < narrower list · }/Ctrl+Down larger \
+                 activity · {/Ctrl+Up smaller activity · F2/Alt+1 show/hide list · F3/Alt+2 \
+                 show/hide activity · z zoom"
+                    .to_owned()
+            )
+        );
         assert_eq!(
             texts(keys.help_lines(views::REQUIREMENTS_FORM, bare)),
             [
                 "Requirements: m priority must · l priority later · Tab/Down next field \
                  · Shift+Tab/Up previous field",
+                FIELD_LINE,
                 // T5R: on the priority `l` always sets later (SHADOWING), so it is not listed as
                 // the next option.
                 "Choice: Left/h previous option · Right next option · Space toggle",
@@ -750,6 +790,7 @@ mod tests {
             texts(keys.help_lines(views::AREA_FORM, bare)),
             [
                 "Requirements: Tab/Down next field · Shift+Tab/Up previous field",
+                FIELD_LINE,
                 "Form: Ctrl+s save",
                 "Global: Ctrl+c quit · F1 help · F9 about",
             ]
@@ -758,6 +799,7 @@ mod tests {
             texts(keys.help_lines(views::ITEM_FORM, bare)),
             [
                 "Item: Tab/Down next field · Shift+Tab/Up previous field",
+                FIELD_LINE,
                 "Choice: Left/h previous option · Right/l next option",
                 "Form: Ctrl+s save · Ctrl+e $EDITOR",
                 "Global: Ctrl+c quit · F1 help · F9 about",
@@ -768,6 +810,7 @@ mod tests {
             [
                 "Attachments: Ctrl+r repo picker · Tab/Down next field · Shift+Tab/Up previous \
                  field",
+                FIELD_LINE,
                 "Choice: Space toggle",
                 "Form: Ctrl+s save",
                 "Global: Ctrl+c quit · F1 help · F9 about",
@@ -780,13 +823,14 @@ mod tests {
                  · G bottom",
                 "Answer: 1-9 answer",
                 "List: j/Down down · k/Up up",
+                HISTORY_LINE,
                 "Global: q/Ctrl+c quit · Tab next tab · Shift+Tab previous tab · 1-9 select tab \
                  · ?/F1 help · F9 about · Ctrl+Right next pane · Ctrl+Left previous pane",
             ]
         );
         assert_eq!(
             texts(keys.help_lines(views::CAPTURE, bare)),
-            ["Global: Ctrl+c quit · F1 help · F9 about"]
+            [FIELD_LINE, "Global: Ctrl+c quit · F1 help · F9 about"]
         );
     }
 
@@ -805,6 +849,7 @@ mod tests {
         assert_eq!(
             texts(keys.help_lines(TEMPLATES_EDITOR, all)),
             [
+                FIELD_LINE.to_owned(),
                 "Skills: Ctrl+g ask agent".to_owned(),
                 "Form: Ctrl+s save · Ctrl+e $EDITOR".to_owned(),
                 format!("Global: {tabs} · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue"),

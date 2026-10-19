@@ -1795,6 +1795,10 @@ mod tests {
             lines,
             [
                 "Requirements: Tab/Down next field · Shift+Tab/Up previous field",
+                // MOD-115 M2 T6: the field's editing keys are wired, so the box lists them.
+                "Text field: Enter submit · Esc cancel · Left cursor left · Right cursor right \
+                 · Home line start · End line end · Backspace delete back · Del delete forward \
+                 · Up line up · Down line down · PgUp page up · PgDn page down",
                 "Form: Ctrl+s save",
                 "Global: Ctrl+c quit",
             ]

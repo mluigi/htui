@@ -68,6 +68,7 @@ use tokio::sync::mpsc;
 
 use crate::agent_worker::AgentRuntime;
 use crate::app::App;
+use crate::ui::state_file::UiStore;
 
 /// Runs the whole application, terminal included.
 ///
@@ -233,6 +234,18 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
     app.theme = ui::Theme::from_no_color(std::env::var_os("NO_COLOR").as_deref());
     // MOD-67 M2 D5: before `register_all`, so every `Ctx` the shell builds carries the file's keys.
     app.keys = keys;
+    // MOD-115 M2 D1: the UI state from `ui-state.toml` in the config root, before the tabs are
+    // registered; a file that cannot be used starts from the defaults and says why in the header.
+    // No config directory: every launch is the first and nothing is saved.
+    let ui_store = identity::config_root_path()
+        .ok()
+        .map_or(UiStore::Nowhere, |root| {
+            UiStore::File(root.join(ui::state_file::FILE_NAME))
+        });
+    let loaded = ui_store.load();
+    app.apply_ui_state(loaded.state);
+    app.ui_store = ui_store;
+    app.status = loaded.notice;
     app::register_all(&mut app);
     app.start();
 

@@ -101,6 +101,9 @@ async fn the_runs_pane_status_line_and_box_list_every_layer() {
              N new item · Q queue / dequeue · P pause / resume queue",
             "Common: e edit",
             "List: j/Down down · k/Up up · g/Home top · G/End bottom · Enter fold",
+            // MOD-115 M2 T6: the history keys act on every tab; the layout and pane keys only on
+            // a tab that claims a list and a detail (the Backlog does from Task 7).
+            "History: Backspace/Alt+Left back · Alt+Right forward",
             "Global: q/Ctrl+c quit · Tab next tab · Shift+Tab previous tab · 1-9 select tab · \
              ?/F1 help · F9 about",
             "?/F1 closes this box",
@@ -129,6 +132,10 @@ async fn a_capturing_pane_drives_the_status_line_and_box() {
     assert_eq!(
         help_box(&frame),
         [
+            // MOD-115 M2 T6: the note's field lists its editing keys.
+            "Text field: Enter submit · Esc cancel · Left cursor left · Right cursor right · \
+             Home line start · End line end · Backspace delete back · Del delete forward · \
+             Up line up · Down line down · PgUp page up · PgDn page down",
             "Global: Ctrl+c quit · F1 help · F9 about",
             "F1 closes this box"
         ],

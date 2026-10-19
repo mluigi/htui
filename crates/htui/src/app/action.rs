@@ -61,6 +61,13 @@ pub enum Action {
     /// and answer its tab `Failed(EDITOR_ABORTED)`; nothing without one. `App::drain` takes it
     /// only from the abort question (`App::abort_overlay`); any other emitter is dropped (R2 LOW-2).
     AbortEdit,
+    /// Move the focus between the active tab's panes (MOD-115 M2 D3): `global.next_pane` /
+    /// `prev_pane`. Nothing on a single-pane tab.
+    Pane(PaneAction),
+    /// Change the active tab's layout (MOD-115 M2 D2): the `[layout]` keys. Saved at once.
+    Layout(LayoutAction),
+    /// Go back or forward through the places visited (MOD-115 M2 D5): the `[history]` keys.
+    History(HistoryAction),
     /// Show or hide the key help.
     ToggleHelp,
     /// Show or hide the about panel under the header (`global.about`, MOD-115).
@@ -88,6 +95,47 @@ pub enum TabAction {
     /// Either id being unregistered is a no-op, as [`Focus`](TabAction::Focus)'s is — a build
     /// that dropped a view must not kill the shell, and must not silently land somewhere else.
     FocusSection(TabId, SectionId),
+}
+
+/// Moving the pane focus (MOD-115 M2 D3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneAction {
+    /// The next visible pane, wrapping.
+    Next,
+    /// The previous visible pane, wrapping.
+    Prev,
+}
+
+/// One step on the active tab's layout (MOD-115 M2 D2), one per `[layout]` row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutAction {
+    /// `layout.next_preset`.
+    NextPreset,
+    /// `layout.prev_preset`.
+    PrevPreset,
+    /// `layout.grow_list`.
+    GrowList,
+    /// `layout.shrink_list`.
+    ShrinkList,
+    /// `layout.grow_activity`.
+    GrowActivity,
+    /// `layout.shrink_activity`.
+    ShrinkActivity,
+    /// `layout.toggle_list`.
+    ToggleList,
+    /// `layout.toggle_activity`.
+    ToggleActivity,
+    /// `layout.zoom`.
+    Zoom,
+}
+
+/// Moving through the history (MOD-115 M2 D5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryAction {
+    /// `history.back`: the place left last.
+    Back,
+    /// `history.forward`: where back was pressed.
+    Forward,
 }
 
 /// Opening and closing overlays.

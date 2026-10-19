@@ -601,3 +601,112 @@ async fn a_ten_row_frame_drops_the_about_panel() {
         assert_eq!(frame.contains("About"), shown, "{height} rows: {frame}");
     }
 }
+
+/// A list + detail tab that records the panes the shell gives it, for the layout cases (MOD-115
+/// M2 T6): the production tabs adopt the layout in Task 7.
+mod split {
+    use std::sync::{Arc, Mutex};
+
+    use crossterm::event::KeyEvent;
+    use htui::app::{Ctx, Handled};
+    use htui::keys::{Stack, views};
+    use htui::store_worker::{StoreReply, StoreRequest};
+    use htui::ui::shell::{PaneAreas, Panes, TabLayout};
+    use htui::ui::tabs::{Tab, TabId};
+    use htui_core::model::Scope;
+    use ratatui::Frame;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::{Block, BorderType};
+
+    /// The panes of every frame drawn, last last.
+    pub type Drawn = Arc<Mutex<Vec<PaneAreas>>>;
+
+    pub struct Split(pub Drawn);
+
+    impl Tab for Split {
+        fn id(&self) -> TabId {
+            TabId("split")
+        }
+        fn title(&self) -> &str {
+            "Split"
+        }
+        fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+            Vec::new()
+        }
+        fn on_scope_change(&mut self, _scope: &Scope) {}
+        fn on_key(&mut self, _key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            Handled::Pass
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
+            let areas = ctx.split(area, TabLayout::DEFAULT);
+            self.0.lock().expect("not poisoned").push(areas);
+            for pane in [areas.list, Some(areas.detail), areas.activity]
+                .into_iter()
+                .flatten()
+                .filter(|rect| !rect.is_empty())
+            {
+                frame.render_widget(Block::bordered().border_type(BorderType::Rounded), pane);
+            }
+        }
+        fn key_stack(&self) -> Option<Stack<'static>> {
+            Some(views::BACKLOG_BODY)
+        }
+        fn panes(&self) -> Panes {
+            Panes::ListDetail(TabLayout::DEFAULT)
+        }
+    }
+}
+
+/// MOD-115 M2 D1, the plan's acceptance: the layout and the about panel survive a restart.
+/// Change both, drop the shell, build another over the same UI-state store, and the new shell
+/// draws the layout and shows the about panel as they were left.
+#[tokio::test]
+async fn the_layout_and_the_about_panel_survive_a_restart() {
+    use htui::ui::shell::ListSize;
+    use htui::ui::state_file::UiStore;
+
+    let store = UiStore::memory();
+    let drawn = split::Drawn::default();
+    let mut first = Harness::demo()
+        .with_ui_store(store.clone())
+        .with_tab(Box::new(split::Split(drawn.clone())));
+    first.settle().await;
+    let _ = first.render();
+    let before = *drawn.lock().expect("not poisoned").last().expect("drawn");
+    first.key(">");
+    first.key("f2");
+    assert!(!first.app().about_visible);
+    first.key("f9");
+    assert!(first.app().about_visible);
+    let _ = first.render();
+    let left = *drawn.lock().expect("not poisoned").last().expect("drawn");
+    assert_eq!(left.list, None, "f2 hid the list");
+    drop(first);
+
+    let redrawn = split::Drawn::default();
+    let mut again = Harness::demo()
+        .with_ui_store(store.clone())
+        .with_tab(Box::new(split::Split(redrawn.clone())));
+    again.settle().await;
+    assert!(again.app().about_visible, "the about panel stays on");
+    let _ = again.render();
+    let restored = *redrawn.lock().expect("not poisoned").last().expect("drawn");
+    assert_eq!(restored, left, "the layout is drawn as it was left");
+    assert_ne!(restored, before);
+    again.key("f2");
+    let _ = again.render();
+    let shown = *redrawn.lock().expect("not poisoned").last().expect("drawn");
+    let list = shown.list.expect("f2 shows the list again");
+    let body = list.width + shown.detail.width;
+    assert_eq!(
+        list.width,
+        body * 55 / 100,
+        "the grown list (55%, from `>`) came back with it"
+    );
+    let state = store.load().state;
+    assert_eq!(
+        state.layouts.get("split").map(|layout| layout.list),
+        Some(ListSize::Percent(55))
+    );
+}
