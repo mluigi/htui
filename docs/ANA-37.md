@@ -3,27 +3,34 @@
 > **Scope note:** Decide whether Qdrant-backed semantic search (`R-STO-8`) gives htui enough real benefit,
 > to agents, triage, duplicate detection and memory, to make the Qdrant daemon and its embedding model a
 > required dependency (`R-NF-2`). Narrowed by the maintainer on 2026-10-18 (§1): a measurement of benefit,
-> not a survey of alternative backends. Governed by `.claude/rules/workflow-docs.md`, `docs/REQUIREMENTS.md`
-> and `docs/requirements-review-2026-10-15.md` (the item's origin).
+> not a survey of alternative backends. Reframed by the maintainer the same day, after the first draft
+> (§1, D1-D5): the subject is a knowledge search for the workspace on one shared Qdrant. Governed by
+> `.claude/rules/workflow-docs.md`, `docs/REQUIREMENTS.md` and `docs/requirements-review-2026-10-15.md`
+> (the item's origin).
 >
-> **Requirements addressed:** `R-NF-2`, `R-STO-8`, `R-ENT-13`. Touched at their seams: `R-MCP-2` (agent
-> read and search tools), `R-STO-1` (where a headless worker finds its Qdrant URL), `R-ID-6` (drafts a
-> person accepts), `R-NF-1` (Windows), `R-PRM-1`/`R-PRM-3` (how context reaches a prompt).
+> **Requirements addressed:** `R-NF-2`, `R-STO-8`, `R-ENT-13`. Touched at their seams: `R-STO-1` (where the
+> Qdrant URL and API key live), `R-MCP-1`/`R-MCP-2` (agent read scope, read and search tools), `R-SEC-2`
+> (htui's own credentials kept from sessions), `R-TUI-8` (Settings), `R-ENT-12`/`R-ENT-16` (documents and
+> items owned by a project or a workspace), `R-ID-6` (drafts a person accepts), `R-NF-1` (Windows),
+> `R-PRM-1`/`R-PRM-3` (how context reaches a prompt), `R-LATER-7` (code stays with the code-context tools).
 >
-> **Status (2026-10-18): draft; §8 awaits the maintainer.** No implementation code is written here.
-> Verdict (§7): **Qdrant stays optional, the daemon and the embedding model alike, on every box.** On
-> htui's own corpus the shipped hybrid search puts a reworded duplicate in the top 5 for 22 of 24 queries.
-> Without Qdrant, the best baseline (Postgres full-text, length-normalised) gets 9 of 24 (paired
-> p = 0.0002). htui's own BM25 leg, which is lexical but runs in Qdrant, gets 16 of 24; the dense leg adds
-> the remaining 6 (p = 0.031). The gain does not show for natural-language questions (10 of 20 against 7
-> of 20, p = 0.58) or for identifiers (13-15 of 16 for every backend), and in an agent A/B trial an agent
-> with grep and read matched an agent with semantic search on all 12 tasks (n = 12, one run per arm, both
-> at the ceiling). The one consumer that clearly gains, a duplicate check at draft time, is unbuilt and
-> display-only; without Qdrant it would be absent and filing unaffected. In htui's own history at least
-> about 1% of items (2 of ~200) had a noticed overlap that needed recall across different wording;
-> overlaps nobody noticed are not counted. Requiring Qdrant would make a reachable Qdrant (one can be
-> shared) and a 133 MB model per searching box a hard dependency; headless workers would first need a
-> non-keyring URL source (P1). Proposed spawns P1..P4 (§9), not filed.
+> **Status (2026-10-18): draft; §8 awaits the maintainer.** No implementation code is written here. Verdict
+> (§7): **knowledge search is a required workspace service: one shared Qdrant per workspace, required to be
+> configured, failing open on outage.** The first draft kept Qdrant optional on every box. The maintainer then
+> reframed the item (§1, D1-D5) as one search over everything a workspace knows, across its projects: items,
+> requirements, decisions, documents, notes, scrubbed transcripts and, once it exists, memory. Code is out: it
+> is per worker checkout and stays with the code-context tools. A workspace is expected to have its Qdrant
+> configured. When it is missing or down, htui starts and works, knowledge search says "knowledge search
+> unavailable", and nothing else is affected. One htui process per workspace runs the indexer, proposed here
+> as the holder of a workspace lease in Postgres; each searching process embeds its own queries. The
+> measurements stand. On htui's own corpus the shipped hybrid search puts a reworded duplicate in the top 5
+> for 22 of 24 queries, against 9 of 24 for the best baseline without Qdrant (paired p = 0.0002) and 16 for
+> htui's BM25 leg alone (p = 0.031). Natural-language questions show no significant gain (10 of 20 against 7,
+> p = 0.58), and an agent with grep and read matched an agent with semantic search on all 12 trial tasks. That
+> trial covered one project's backlog, small enough to read whole; how the gain behaves at workspace scale is
+> **unmeasured** (§5.10). The "very beneficial" bar is met by the maintainer's decision on the
+> workspace-knowledge framing, supported by the duplicate result; it is not proven for agents at today's size.
+> Proposed spawns P1..P5 (§9), not filed.
 
 ---
 
@@ -49,6 +56,32 @@ cost side is kept only as far as needed to judge whether the benefit is worth re
 item text's "against Postgres-only alternatives (`pgvector`, full-text search)" (`HANDOFF.md:146-147`) is
 therefore dropped. Lexical search appears below only as the baseline that semantic search must beat.
 
+**Maintainer direction, 2026-10-18 (after the first draft).** The first draft's verdict was "Qdrant stays
+optional, the daemon and the embedding model alike, on every box". Having read it, the maintainer
+reframed the item as a knowledge search for the workspace on one shared Qdrant. These are decisions, not
+proposals, and they override the first draft where they differ:
+
+- **D1. A knowledge search for the workspace.** One search across everything the workspace knows, across
+  its projects. Example: an agent in project B asks "have we decided anything about retry limits?" and
+  gets the decision taken in project A.
+- **D2. One shared Qdrant per workspace,** like the shared Postgres. Never a Qdrant per worker or per box.
+- **D3. What counts as knowledge:** items, requirements, decisions, documents (item documents and
+  documents owned by a project or the workspace), notes, scrubbed run transcripts, and ANA-38's memory
+  once it exists. "Docs for now": htui's documents stored in Postgres. **Not code:** code is per worker
+  checkout and stays with Gortex and the other code-context tools (`R-LATER-7`). Markdown files inside a
+  repo checkout count as code (per worker) unless imported into Postgres (MOD-8).
+- **D4. Required, failing open on outage.** A workspace is expected to have its shared Qdrant configured.
+  When it is unconfigured or unreachable, htui starts and keeps working; knowledge search says "knowledge
+  search unavailable" and nothing else is affected. No run, prompt or close-out waits on it. htui does not
+  refuse to start.
+- **D5. Indexing runs in one place per workspace.** Query embedding stays in each process that searches,
+  so each searching box keeps the 133 MB model. A central search endpoint is not adopted. How the one
+  indexer is chosen is this doc's proposal (§7.3): whichever htui process holds a workspace-wide lease in
+  Postgres.
+
+The measurements of §5 stand and are not re-run. §5.10 reads them under D1; §6 to §11 are rewritten for
+the new verdict.
+
 Method: three readers in parallel (the code surface and its cost; decision history and the consumers;
 published evidence), then two measurements. A retrieval benchmark links htui's own search code against
 htui's own corpus (§5.1-5.5). An agent A/B trial gives the same tasks to an agent with grep and read and to
@@ -66,12 +99,12 @@ host database.
   a migration (`vector.rs:34-39`).
 - **Three kinds of point** (`crates/htui-store/src/vector_sync.rs`): an item as `"{key} {title}\n\n{body}"`
   (`item_point`, `:192`); its latest documents, split at `#`/`##` headings and at 2000 characters
-  (`MAX_CHUNK_CHARS`, `:27`; `document_points`, `:237`); and each requirement as `"{key} {body}\n\n{rationale}"`,
-  withdrawn ones included (`requirement_point`, `:215`). Payload carries type, key, project, status,
-  resolution and a snippet of at most 280 characters.
-- **Not indexed, although `R-STO-8` requires it:** notes, scrubbed run transcripts, workspace scope and
-  workspace-owned items. These are MOD-112 part (4) (`HANDOFF.md:689-696`). Comments, links, tags and labels
-  are not indexed either.
+  (`MAX_CHUNK_CHARS`, `:27`; `document_points`, `:237`); and each requirement as `"{key}
+  {body}\n\n{rationale}"`, withdrawn ones included (`requirement_point`, `:215`). Payload carries type, key,
+  project, status, resolution and a snippet of at most 280 characters.
+- **Not indexed, although `R-STO-8` requires it:** notes, scrubbed run transcripts, workspace-owned
+  items and, for agents, workspace scope. These are MOD-112 part (4) (`HANDOFF.md:689-696`). Comments,
+  links, tags and labels are not indexed either.
 - **No write path triggers indexing.** The callers of `Indexer::sync` are: `htui worker`, at start and every
   `concepts_sync_minutes` (default 15), **only if the keyring held a Qdrant URL at worker start**
   (`crates/htui/src/concepts.rs:224-227, 300, 332, 361`); the CLI `htui --index-items` (`concepts.rs:215`);
@@ -87,6 +120,26 @@ host database.
 - **Embedder identity is enforced** (MOD-68 D8). A collection stamped with another model or width is
   refused with `qdrant: embedder mismatch …` (`check_existing`, `vector.rs:456`). The remedy is manual:
   `curl -X DELETE` the collection, then `--index-items` (`README.md:549-552`).
+
+- **Indexed today, against D3's list.** Search already spans a workspace, but only as a list of its
+  projects: the TUI overlay's workspace scope passes each member project's ID to one filter
+  (`search_filter`, `vector.rs:642`). The CLI passes `--cwd`'s project, `--project`'s, or by default every
+  workspace's projects (`search_projects`, `crates/htui/src/concepts.rs:589-612`). Nothing is owned by a
+  workspace yet.
+
+| D3 knowledge | In Postgres today | Indexed today | Who closes the gap |
+|---|---|---|---|
+| Items (key, title, body) | yes | yes | — |
+| Decisions (items closed `done`, `concluded`, `rejected`) | yes, as items | yes, with a decisions filter | — |
+| Requirements | project-owned only (`requirement.project_id NOT NULL`, `migrations/0006_requirements.sql:70-72`) | yes | workspace requirements: ANA-35 (`R-ENT-14`, `R-ENT-16`) |
+| Item documents | yes (`document.item_id NOT NULL`, `migrations/0001_init.sql:389-391`) | latest version, chunked | — |
+| Documents owned by a project or the workspace | no; `document` has only an item owner | no | ANA-35 (`R-ENT-12`), then indexing |
+| Notes | yes (`item_note`, `0001_init.sql:374`) | no | MOD-112 (4) |
+| Scrubbed run transcripts | yes (`session_event`, `0001_init.sql:513`; scrubbed before a row persists, `R-SEC-3`) | no | MOD-112 (4) |
+| Workspace-owned items | no | no | ANA-35, then MOD-112 (4) |
+| Memory | no | no | ANA-38 |
+| htui's own markdown backlog and decisions | no; files in the checkout | no; MOD-34 dropped them | MOD-8 imports them; until then they count as code (D3) |
+| Code | — | no, and stays out (D3) | the code-context tools (`R-LATER-7`) |
 
 ### 2.2 What runs in htui and what needs the daemon
 
@@ -121,14 +174,22 @@ cannot be queried, because query vectors are built in htui. Requiring one means 
 A hit gives an agent a key, a point type, a score and a snippet of at most 280 characters
 (`tools/search.rs:1-8`). **The MCP server has no tool to open a hit.** Its eight tools are `box_profile`,
 `document_write`, `note_add`, `item_status`, `item_link`, `search_concepts`, `command_run` and
-`permission_prompt` (`ALL`, `crates/htui-mcp/src/tools/mod.rs:45-54`); read tools are MOD-112 (1). No prompt tells
-an agent the tool exists; the only signal is its description, "Searches this project's items, documents
+`permission_prompt` (`ALL`, `crates/htui-mcp/src/tools/mod.rs:45-54`); read tools are MOD-112 (1). No prompt
+tells an agent the tool exists; the only signal is its description, "Searches this project's items, documents
 and requirements by meaning."
 
 Without Qdrant, the lexical baseline htui has today is narrow: items match by case-insensitive substring
 on **key and title only** (`crates/htui-store/src/pg/read.rs:105-110`), requirements on key and body
 (`pg/read.rs:948`), documents, notes and transcripts not at all. There is no Postgres full-text search in
 the code.
+
+**Cross-project search today.** People can already search across projects: the overlay's workspace
+scope passes the member projects' IDs to one filter, and the CLI's default passes every workspace's
+projects (§2.1). Agents cannot: `search_concepts` is fixed to the session's project (`McpSearch::search`,
+`projects: vec![query.project]`, `crates/htui/src/mcp_search.rs:44`),
+although `R-MCP-1` lets an agent read workspace items, documents and requirements. So D1's example, an
+agent in project B finding project A's decision, fails today on scope alone, before any question of
+meaning.
 
 ### 2.4 Fail-open paths
 
@@ -160,13 +221,14 @@ the code.
   (`qdrant_settings.rs:25-33`) and the collection is multi-tenant. Each box then needs network access,
   the URL in its keyring, and its own 133 MB model cache. Every worker with a URL re-syncs every project
   every 15 minutes: redundant, idempotent, with the race of §2.1.
-- **The URL lives only in the OS keyring** (`secret.rs:43-45, 304-314`). There is no env, stdin, file or
-  systemd-credential source. The DSN also has `--dsn-stdin`, a systemd credential and, for development
-  and CI, an environment variable (`docs/REQUIREMENTS.md:257-269`; `docs/htui-worker.md:380-399`); it
-  never has a file source. So a
+- **The URL lives only in the OS keyring** (`secret.rs:43-45, 304-314`). Settings already has a Qdrant section
+  that edits this box's URL and a masked API key in the keyring (`crates/htui/src/ui/tabs/settings/qdrant.rs`;
+  "set one in Settings > Qdrant", `concepts.rs:97`). There is no env, stdin, file or systemd-credential
+  source. The DSN also has `--dsn-stdin`, a systemd credential and, for development and CI, an environment
+  variable (`docs/REQUIREMENTS.md:257-269`; `docs/htui-worker.md:380-399`); it never has a file source. So a
   systemd or provisioned worker **never** indexes and never offers `search_concepts`
-  (`docs/htui-worker.md:240-241, 415-417`), and an hr sandbox, which has no keyring, searches only in
-  tests. Requiring Qdrant on a headless worker first needs code that does not exist.
+  (`docs/htui-worker.md:240-241, 415-417`), and an hr sandbox, which has no keyring, searches only in tests.
+  Requiring Qdrant on a headless worker first needs code that does not exist.
 - **Dev and test.** `compose.yaml:53-62` runs `qdrant/qdrant:v1.19.1` pinned to the client, and
   `README.md:129` calls it "only needed for Search". `scripts/hr` gives each run its own Qdrant
   (`docker/hr/compose.hr.yaml:35-60`). `qdrant_live` and `qdrant_worker` print a skip line and pass when
@@ -175,6 +237,12 @@ the code.
   (https://api.github.com/repos/qdrant/qdrant/releases/tags/v1.19.1). htui documents only
   `docker compose up -d` (`README.md:120-129`), which on Windows means Docker Desktop. `rten` was measured
   on Linux x86-64 only (ANA-23 §9); MOD-16 is open. The headless worker is Linux-only.
+- **No place in Postgres names a workspace's Qdrant.** The URL is per box, in each keyring. The
+  `workspace` table has no settings column (`migrations/0001_init.sql:129-137`); `project.settings` is per
+  project (`:150`) and `app_setting` covers the whole database (`:557-561`). One Postgres holds several
+  workspaces, and a project can belong to more than one (`workspace_project`, primary key
+  `(workspace_id, project_id)`, `:161-166`). The Infisical base URL is kept the same per-box way
+  (`INFISICAL_URL_USER`, `secret.rs:47`).
 
 ## 3. Constraints from sibling items
 
@@ -206,6 +274,14 @@ the code.
    (`docs/REQUIREMENTS.md:257-269`). The Qdrant URL and API key are not in its list.
 9. **`R-NF-1`** requires Windows 10+ (`docs/REQUIREMENTS.md:705-706`); MOD-16 (Windows verification) is
    open.
+10. **ANA-35** (`HANDOFF.md:123-135`) settles workspaces that own items, documents and requirements, and
+    documents owned by a project or a workspace. D3's workspace-owned knowledge cannot be indexed before it
+    exists.
+11. **`R-MCP-1`** lets an agent read beyond its run, workspace items, documents and requirements included
+    (`docs/REQUIREMENTS.md:511-513`). Search at workspace scope stays inside it for those; notes and other
+    runs' transcripts fall outside it (Q11). **`R-SEC-2`**
+    keeps `htui`'s own credentials from every session (`:494-496`): a Qdrant API key, like the DSN, must
+    never reach an agent's environment.
 
 ## 4. Prior art and evidence
 
@@ -508,10 +584,10 @@ Trial:
   search should grow with corpus size; the trial does not test that.
 - **Arm A's grep is not an htui agent's grep.** Arm A grepped markdown files. An agent in htui works over
   Postgres rows through MCP and has no grep there; today it has no read tool either (§2.3). The trial shows
-  what a lexical, read-capable tool gives, not what htui's agents have now. Q2 assumes MOD-112's text
-  filter performs about as well as arm A's grep and whole-file read. An MCP filter over rows, with no
-  bulk read, is likely weaker, and arm B also had grep and read, which htui's agents lack; so the
-  trial's tie may overstate how little semantic search adds for an htui agent.
+  what a lexical, read-capable tool gives, not what htui's agents have now. §7.4's outage fallback
+  assumes MOD-112's text filter performs about as well as arm A's grep and whole-file read. An MCP filter
+  over rows, with no bulk read, is likely weaker, and arm B also had grep and read, which htui's agents
+  lack; so the trial's tie may overstate how little semantic search adds for an htui agent.
 - **The task author knew the targets;** paraphrases may leave grep-findable residue ("terminal",
   "keyring", ".env.local", "/proc").
 - **Learning across tasks** and **self-reported call counts,** with shared reads attributed
@@ -519,165 +595,280 @@ Trial:
 - **The none class is vocabulary-checkable:** "screen reader", "advisory" and "favourite" have small
   synonym sets, so it does not stress what semantic search adds.
 
+### 5.10 Reading the results under D1
+
+The measurements answer a smaller question than D1 asks.
+
+- **The trial measured one project's backlog, which fits one read.** Arm A read `HANDOFF.md` once and
+  reused it (§5.7). A workspace knowledge base, several projects plus notes, transcripts and later memory,
+  does not fit one read. Transcripts are not greppable for an agent: they are Postgres rows, the MCP
+  server has no read tool (§2.3), and no read tool will page through every run's events.
+- **So the single-search numbers are the relevant ones at workspace scale.** When nobody can read
+  everything, what one search returns is what an agent or a person sees. On duplicates that is 22 of 24 in
+  the top 5 with htui's hybrid search, against 9 of 24 for the best baseline without Qdrant (§5.2). On
+  questions the gain is not significant (10 against 7 of 20, p = 0.58). D1's own example, "have we
+  decided anything about retry limits?", is a question: the class with no significant gain, where the
+  dense leg alone did best (12 of 20).
+- **The extrapolation is unmeasured.** No corpus spanning several projects, notes or transcripts was
+  built, and no trial ran on one. Whether the duplicate gain holds, grows or shrinks there, and whether
+  questions start to separate, is not known. P5 measures it.
+
 ## 6. Analysis
 
-### 6.1 Benefit per consumer
+### 6.1 Benefit per consumer at workspace scale
 
-The benchmark and the trial answer different questions, and both are needed. The benchmark measures one
-query, one ranked list: what a single search returns. The trial measures an agent that may search, read
-and retry. On duplicates the single search gains a lot (22 of 24, against 9 without Qdrant and 16 for
-htui's BM25 leg alone). The agent with grep and read
-gains nothing from it at this size, because it reads the whole backlog. So the benefit is largest exactly
-where nobody reads everything: a person at the item form, an importer, a large backlog.
+The benchmark measures one query, one ranked list: what a single search returns. The trial measures an
+agent that may search, read and retry. At one project's size the agent reads everything, and search adds
+nothing the trial could see (§5.7). Under D1 the corpus is a workspace: several projects, their notes and
+transcripts, later memory. Nobody reads that whole, so the benefit moves to what one search returns, which
+is where the measured gain is (§5.10).
 
-| Consumer | Today | Without Qdrant | Broken or degraded | How often | How large |
-|---|---|---|---|---|---|
-| Agents finding related work | `search_concepts`, own project only, no read tool, no prompt mentions it | no discovery tool at all | **broken for discovery** today, run unaffected; **degraded** once MOD-112 gives read tools with a text filter | unmeasured | trial: none (12/12 both); benchmark questions +3 of 20, not significant |
-| Duplicate check at draft time | no code | the person or agent reads the backlog; key/title substring | neither today (unbuilt). Under P3 it is absent without Qdrant and filing is unaffected | at least about 1% of items (2 of ~200) had a noticed overlap; unnoticed ones are not counted | benchmark: 22 of 24 in the top 5, against 9 without Qdrant (p = 0.0002) and 16 for htui's BM25 leg alone (p = 0.031); no score works as an automatic flag |
-| Triage | no code; automatic triage ruled out (ANA-30 X5) | nothing | neither; no consumer | — | same retrieval as duplicates; not measured separately |
-| Memory (ANA-38) | not built | injection by scope, kind or recency under `R-PRM-3`'s budget | **degraded only past the budget** | — | published evidence favours injection below ~100-200k tokens |
-| Coordinator (ANA-34) | no search | unaffected | neither | — | none |
-| People: `Ctrl+F`, CLI | built | key/title substring | degraded | unmeasured | as the benchmark |
+| Consumer | Today | Under D1, Qdrant up | Qdrant down or unconfigured (D4) | Evidence |
+|---|---|---|---|---|
+| Agents finding knowledge | `search_concepts`, own project only, no read tool, no prompt mentions it | `search_concepts` at workspace scope over D3's corpus | unconfigured: the tool is not offered; down: "knowledge search unavailable"; either way MOD-112's read tools with a text filter (Q10) | duplicates 22 vs 9 of 24 (single search); questions not significant; trial: none at one project's size; workspace scale unmeasured |
+| Duplicate check at draft time | no code | display-only related items, across the workspace's projects | the list says knowledge search is unavailable; filing unaffected | 22 of 24 in the top 5; no score works as an automatic flag (§5.4) |
+| People: `Ctrl+F`, CLI | workspace or one project; items, documents, requirements | the same over D3's corpus | "knowledge search unavailable" | as the benchmark |
+| Memory (ANA-38) | not built | indexed and searched with the rest | still reaches a prompt, by injection under `R-PRM-3`'s budget | published evidence favours injection below ~100-200k tokens (§4.2) |
+| Triage | no code; automatic triage ruled out (ANA-30 X5) | same retrieval as duplicates | nothing | not measured separately |
+| Coordinator, prompt assembly | no search | unchanged; no search step (`R-PRM-1`) | unaffected | — |
 
-- **Agents.** The only hard break today is that an agent without Qdrant has no discovery tool. That break
-  is not about meaning: it exists because the MCP server has no read or list tool at all. MOD-112's read
-  tools fix it if they carry a text filter over bodies, which the trial's arm A stands in for (an
-  assumption, §5.9: a row filter with no bulk read is likely weaker than grep and read). Once they
-  do, what semantic search adds for an agent at htui's size is not measurable in the trial and not
-  significant in the benchmark's question class. The dense leg alone beat the shipped fusion on
-  questions (0.60 against 0.50, 3 to 1, p ≈ 0.63), so the fusion may lose some question hits; the data
-  cannot tell.
-- **Duplicates.** This is the one clear, measured gain, and it splits in two. Against the best no-Qdrant
-  baseline the hybrid gains 13 queries (22 against 9 of 24, p = 0.0002). But htui's BM25 leg alone,
-  which is lexical and carries the IDF the Postgres and grep baselines lack, already reaches 16 of 24,
-  and it finds 9 of the 13 rescues. What meaning adds is the step from 16 to 22: the hybrid beats the
-  sparse leg 6 to 0 (p = 0.031). In a03, a11 and a18 the dense leg ranks the target second, the sparse leg
-  misses the top 10 and no other lexical variant reaches the top 5, and the hybrid ranks it 3rd, 4th and
-  3rd. Both legs, as built, need the daemon. A second caution: the consumer is a suggestion list a person
-  judges (`R-ID-6`, ANA-30 X4), and no score supports an automatic flag (§5.4). Without Qdrant the list is
-  absent; the item is still filed, the duplicate is still caught later or not, and history says a noticed
-  miss costs a fold.
-- **Memory.** Nothing exists to measure. At the scale of the one analogue on record (12k words) memory
-  fits in a prompt, and the published results favour injection there. Semantic retrieval matters for
-  memory only once a scope's memory outgrows `R-PRM-3`'s budget. Dedup of entries on write is the
-  duplicate case again and is display-only by `R-ID-6`.
+- **Agents.** D1's case is the cross-project one: an agent in project B looking for project A's
+  decision. Today it fails on scope before meaning (§2.3). At workspace scope, with notes and transcripts
+  added, an agent can no longer read everything, so it depends on what a search returns. The duplicate
+  gain applies there. The question class, which D1's example belongs to, showed no significant gain, and
+  the dense leg alone beat the shipped fusion on it (12 against 10 of 20, 3 to 1, p ≈ 0.63). The fusion
+  may lose question hits; the data cannot tell.
+- **Duplicates.** Still the one clear, measured gain: 13 more of 24 in the top 5 than the best baseline
+  without Qdrant, and 6 more than htui's BM25 leg alone (§5.2). Across projects, two people may file the
+  same work without ever reading each other's backlog, which is where reading everything stops working.
+  That is reasoning: htui has one project, and no cross-project duplicate was counted.
+- **Memory.** Indexing memory in the shared Qdrant makes it searchable with the rest of the workspace.
+  Reaching a prompt is a separate path. At the sizes in view, injection works and beats retrieval on
+  accuracy (§4.2), so memory must not depend on Qdrant to reach a prompt.
 
-### 6.2 Benefit against the cost of a required daemon
+### 6.2 Cost of a required shared Qdrant
 
-Requiring Qdrant means requiring two things on every box that searches or indexes: a reachable daemon and
-the in-process embedder with its model.
+D2 and D4 change the cost the first draft weighed. The daemon is one per workspace, not one per box, and
+"required" means "expected to be configured", not "refuse to start".
 
-- **The daemon** can be one shared instance, like Postgres (§2.5), so "a second daemon on every box"
-  overstates the install. It still adds a service to install, secure and upgrade: Qdrant binds 0.0.0.0
-  without authentication by default, guarantees upgrades only between consecutive minor versions, never
-  downgrades, has no memory cap, and ships no Windows ARM64 binary
+- **One install and upgrade path per workspace, like Postgres.** Someone runs one Qdrant, secures it and
+  upgrades it. Qdrant binds 0.0.0.0 without authentication by default, guarantees upgrades only between
+  consecutive minor versions, never downgrades and has no memory cap
   (https://qdrant.tech/documentation/faq/qdrant-fundamentals/ ;
-  https://qdrant.tech/articles/memory-consumption/ ;
-  https://github.com/qdrant/qdrant/issues/7686 ; https://computingforgeeks.com/install-qdrant-ubuntu/).
-  Its memory is small at htui's size: 67 MB empty, 83.7 MB with the 1,081-point benchmark collection.
-- **The embedder** costs every searching box a 133 MB download on first use, 150-180 MB of RSS while it
-  embeds, and, on Windows, an `rten` path no one has measured.
-- **Headless workers** cannot be given a Qdrant URL at all today (§2.5). Requiring Qdrant there needs new
-  code first, and until then a provisioned worker would refuse to start or violate the requirement. This
-  is a one-off cost: P1 closes the gap whichever way the verdict goes.
-- **Failing open would become failing closed,** if "required" means refusing to start without it. Every
-  path in §2.4 that now shows an error in a box would turn into a refusal to start, and the tests that
-  skip without Qdrant would have to stop skipping. A weaker reading, "required where a feature is
-  enabled", is option B of §6.3.
+  https://qdrant.tech/articles/memory-consumption/ ; https://computingforgeeks.com/install-qdrant-ubuntu/).
+  Its memory at htui's size is small: 67 MB empty, 83.7 MB with the benchmark collection (§5.5). The dev
+  image is pinned to the client's version (`compose.yaml:53-62`), so a server upgrade moves with htui's.
+- **Per searching box: the model.** Each box that searches downloads the 133 MB model on first use and
+  holds about 150-180 MB of RSS while it embeds (§5.5). That is every TUI that searches and every worker
+  that hosts sessions offered `search_concepts`. D5 keeps it there: no central search endpoint.
+- **The indexer's box** carries the embedding load of the whole workspace: 120.7 ms per point at 4
+  threads, so the 1,081-point benchmark corpus took 130.5 s to embed (§5.5). Transcripts will multiply
+  the point count; by how much is not measured.
+- **Windows, assumed a client.** Assumed, not decided: the shared Qdrant runs on Linux or under Docker,
+  so a Windows box only searches. D2 does not say where the Qdrant runs. A Windows-only workspace
+  (`R-NF-1`) would use Docker Desktop or Qdrant's native Windows zip (§2.5); running that zip as a service
+  is **UNVERIFIED** (§11). A Windows TUI that searches still embeds on `rten`, which is unmeasured there
+  (MOD-16); if it fails, search fails open on that box.
+- **Headless workers need a URL and a key source.** Today the URL is only in the keyring, which a
+  headless worker lacks (§2.5). With the URL in Postgres (§7.5) a worker reads it from the database it
+  already reaches; the API key still needs a non-keyring source, as the DSN has.
+- **Failing open is cheap only if it is built cheap.** Today a TUI search against a dead Qdrant can
+  download 133 MB first, a TUI search creates the collection, and the TUI advertises `search_concepts` on
+  boxes where every call errors (§2.4). D4 needs these fixed.
 - **Operational record.** The live tests time out under load (`docs/decisions/mod/mod-90.md:78-79`); a
   fresh install could not search for six days (§4.1); an embedder or collection change means a manual
-  delete and reindex.
-
-On the other side of the scale: one measured, significant gain, for one consumer that is unbuilt and
-display-only, absent without Qdrant while filing is unaffected. Of that gain, the share only meaning
-delivers is 6 of 24 duplicate queries (16 to 22, p = 0.031); the rest is htui's BM25 leg, lexical but
-run in Qdrant. Add no measured gain for agents; no consumer at all in triage, the coordinator or prompts;
-and memory that would not need retrieval at the sizes in view. That does not meet "very beneficial". The
-benefit is real enough to keep and improve the optional path, not to make every box depend on it.
+  delete and reindex. With one indexer per workspace, a reindex is one process's job, not every box's.
 
 ### 6.3 Options considered
 
-| Option | What it means | Against it |
+| Option | What it means | Status |
 |---|---|---|
-| A. Required on every box | every TUI, worker and CLI needs a reachable Qdrant and the model, and refuses to start without them | pays the whole of §6.2 for a gain the trial could not see at htui's size and one unbuilt, display-only consumer; headless workers cannot be given a URL until P1 |
-| B. Required where a feature is enabled | a box that turns on a Qdrant-backed feature (say P3's related items) must have Qdrant; other boxes need not | no such feature exists yet, so today it requires nothing; it is the expected shape if a §7.4 trigger fires |
-| C. Optional, plus fixes to the optional path | Qdrant stays fail-open everywhere; P1 makes it configurable on headless workers and keeps the index fresh, P2 makes failure cheap and honest, P3 builds the one consumer that gains | the duplicate gain reaches only boxes where someone configures Qdrant |
+| A. Required on every box, refusing to start | every TUI, worker and CLI needs a reachable Qdrant and the model, or does not start | **rejected by D4**: an outage of a derived index would stop work that does not need it |
+| B. Required shared service, failing open | each workspace is expected to configure one shared Qdrant; Settings warns when it has none; when it is missing or down, only knowledge search is affected, and it says "knowledge search unavailable" | **chosen** (D2, D4) |
+| C. Optional everywhere | Qdrant stays an optional extra per box, with fixes to the optional path | the first draft's verdict; **superseded** by the maintainer's direction |
 
-C wins. It delivers the measured benefit wherever Qdrant is set up, which one shared instance makes cheap
-(§2.5), and costs nothing elsewhere. It fixes the gaps that today keep the benefit from showing even where
-Qdrant is configured (§7.3). And it leaves B open for when a consumer exists whose absence hurts (§7.4).
-A's cost is certain; its benefit is one display-only list.
+B keeps what C had right, that nothing but search depends on Qdrant, and adds what D1 needs: each
+workspace has one place where its knowledge is indexed, by one process, reachable from every box. The
+"very beneficial" bar is met by the maintainer's decision on the workspace-knowledge framing, and the
+duplicate result supports it. It is not proven for agents at today's size: the trial tied, and the gain at
+workspace scale is unmeasured (§5.10).
 
 ## 7. Verdict
 
-**7.1 Qdrant stays optional: the daemon and the embedding model alike, on every box.** No box, process or
-deployment kind (TUI, worker, headless, Windows) requires Qdrant or the model. `R-NF-2` keeps it in its
-fail-open list and drops the "unless ANA-37" caveat (§10.1). The embedder is useless without the daemon and
-the daemon cannot be queried without the embedder (§2.2), so they are optional together; there is no
-"embedder required, daemon optional" split worth making.
+**7.1 Knowledge search is a required workspace service: one shared Qdrant per workspace, required to be
+configured, failing open on outage (D2, D4).** Each workspace is expected to name one Qdrant, as it has one
+Postgres. Every box and process of a workspace uses that workspace's one Qdrant; none runs or names a Qdrant
+of its own, except a development or CI override (Q1, `R-STO-1`). When the workspace has none configured, or
+its Qdrant is unreachable, htui starts and works: knowledge search in the TUI and the CLI says "knowledge
+search unavailable"; for agents `search_concepts` is not offered while the workspace has no Qdrant URL, and
+answers "knowledge search unavailable" during an outage (Q6). No run, prompt or close-out waits on it. The
+embedding model is needed wherever a process searches or indexes, and its failure fails open the same way.
+Postgres stays the source of truth; the index is derived and rebuildable.
 
-**7.2 Every consumer has a path that does not need Qdrant, or is hidden without it.**
+**7.2 Scope of knowledge (D3).** Indexed: items; requirements, withdrawn ones included; decisions (items
+closed `done`, `concluded` or `rejected`, with their documents); documents owned by an item, a project or
+the workspace; notes; scrubbed run transcripts; workspace-owned items; and ANA-38's memory once it exists.
+Not indexed: code, and markdown files in a repo checkout, which belong to the code-context tools
+(`R-LATER-7`) until MOD-8 imports them into Postgres. Of these, items, requirements, decisions and item
+documents are indexed today; notes, transcripts and, once ANA-35 lands, workspace-owned items are MOD-112
+(4); documents owned by a project or the workspace and workspace requirements wait on ANA-35 and are P2's;
+memory waits on ANA-38 (§2.1). From transcripts, the prompt, follow-up, assistant-text and plan events are
+indexed; tool calls, tool results and edit proposals, which carry code, are not (D3;
+`chk_event_kind`, `0001_init.sql:524-527`). MOD-112 (4) takes this as a constraint.
 
-- **Agents:** MOD-112's read tools carry a text filter over keys, titles, bodies, documents and
-  requirements that works without Qdrant (§10.3). `search_concepts` stays, additive. Today the TUI always
-  advertises it and on a box without Qdrant every call errors (§2.4); under P2 it is advertised only where
-  a Qdrant URL is configured. Agent discovery then degrades without Qdrant and never breaks.
-- **Duplicate check and triage:** a display-only "related items" list at draft time, top 5, open and
-  closed items, decisions included; shown when Qdrant is configured and hidden when it is not. No link,
-  resolution or flag is ever written from a score (`R-ID-6`, §5.4). This is P3.
-- **Memory (ANA-38):** memory reaches a prompt without Qdrant, by injection under `R-PRM-3`'s budget.
-  Indexing memory entries in Qdrant and suggesting near-duplicate entries on write are allowed as
-  optional extras. ANA-38 takes this as a constraint (§10.4).
-- **Coordinator and prompt assembly:** unchanged; no search step.
+**7.3 One indexer per workspace, kept fresh, with workspace scope.**
 
-**7.3 Make the optional path work where it is configured.** The benefit measured in §5 is only real where
-the index exists and is fresh. Today it is often neither: a headless worker cannot be given the URL, and a
-box whose TUI is the executor never syncs (§2.1, §2.5). So: the Qdrant URL and API key get the DSN's
-non-keyring sources for a headless worker, and whichever process executes runs on a box keeps the index
-fresh (P1). A search against a dead Qdrant fails before the 133 MB model loads, a search never creates a
-collection, and agents are offered `search_concepts` only where a Qdrant URL is configured (P2). The
-recommended deployment is one shared Qdrant per team, as with Postgres.
+- **One indexer (D5).** Whichever htui process holds the workspace's indexer lease in Postgres runs the
+  index cycle; no other process indexes. The lease is a row with holder, box and expiry, taken only when
+  free or expired and renewed on each beat, on the pattern of the run lease (`lease_box_id`,
+  `lease_owner`, `lease_expires_at`, `migrations/0003_orchestration.sql:41-43`). Worker or TUI may hold it,
+  one lease per workspace it serves (Q5). This removes the two-indexer race of §2.1, provided a holder
+  renews its lease immediately before each delete batch and confirms each orphan's absence in Postgres in
+  the same pass (Q4).
+- **One collection per workspace (Q3).** Each workspace's collection holds every member project. A
+  project in two workspaces (§2.5) is indexed in each; the index is derived, so this costs space, not
+  consistency. A run records no workspace today: `run` has no `workspace_id`, and only
+  `workspace_project` and `workspace_box_path` carry one (`migrations/0001_init.sql:162, 174`). So "the
+  session's workspace" needs a rule (Q3).
+- **Freshness (Q4).** The holder indexes rows written since its last pass on a short cycle, and runs
+  today's full reconcile on a longer one to catch deletions. The TUI's `Ctrl+R` and `--index-items` take
+  the lease only if it is free; otherwise they ask the holder for a pass and show which box holds the
+  lease (Q5).
+- **Workspace scope for people and agents.** People already search a workspace as a list of its projects
+  (§2.3). Agents get the same: `search_concepts` searches the session's workspace (Q3) by default, with
+  its project as a narrower option. `R-MCP-1`'s read scope beyond the run covers workspace items,
+  documents and requirements only (`docs/REQUIREMENTS.md:511-513`); snippets of other runs' transcripts,
+  and arguably notes, fall outside it, so the scope is widened by Q11 or agent searches exclude those point
+  types. The agent tool (`search_concepts`, MOD-11) is project-only today; widening it is MOD-112 (4).
 
-**7.4 What would reopen the question.** Any one of these, measured with the same harness (P4):
+**7.4 Per-consumer paths.**
 
-1. The real corpus is in Postgres (MOD-8, MOD-112 (4)) and a rerun shows a significant gain for the
-   question class, or an agent trial on it shows an accuracy gap between the arms.
-2. ANA-38's memory for one scope outgrows `R-PRM-3`'s budget, so retrieval is needed to reach a prompt.
-3. P3's related-items list is in use and its absence on boxes without Qdrant is reported as a problem.
-4. A project's open backlog no longer fits one agent read, or its open items pass a size set with P4
-   (today's 71 open items fit one read), and an agent trial on it separates the arms.
+- **Agents:** `search_concepts` at workspace scope over D3's corpus, advertised when the workspace has a
+  Qdrant configured (Q6). During an outage a call answers "knowledge search unavailable", and the agent
+  falls back to MOD-112 (1)'s read tools with a text filter over keys, titles and bodies, which works
+  without Qdrant (Q10).
+- **Duplicate check and triage:** a display-only "related items" list at draft time, the top 5 across
+  the workspace, open and closed items, decisions included (Q7). During an outage the list says knowledge
+  search is unavailable; filing is never blocked. No link, resolution or flag is written from a score
+  (`R-ID-6`, §5.4).
+- **Memory (ANA-38):** entries are indexed in the shared Qdrant and searched with the rest. Memory still
+  reaches a prompt without Qdrant, by injection under `R-PRM-3`'s budget, so an outage never empties a
+  prompt (Q8). Suggesting near-duplicate entries on write is a display-only use of the same search.
+- **People:** `Ctrl+F` over D3's corpus, the current workspace by default as today. `--search-items`
+  keeps its scopes, `--cwd`'s project, `--project`'s, or by default every workspace's (§2.1). A search
+  over several workspaces queries each workspace's collection in that workspace's Qdrant and names the
+  workspaces whose search is unavailable (P2).
+- **Coordinator and prompt assembly:** unchanged; no search step (`R-PRM-1`).
 
-Even then the expected answer is "required where that feature is enabled", not "required on every box".
+**7.5 Configuration.**
 
-**7.5 Phasing.**
+- **The Qdrant URL is a workspace setting stored in Postgres (Q1).** Every box of the workspace reads it
+  from the database it already uses, so a headless worker needs no extra URL source. It holds no secret: a
+  URL that carries credentials is refused. While Postgres is unreachable (`R-STO-4`) the URL cannot be
+  read, and knowledge search says it is unavailable.
+- **The API key is a secret delivered like the DSN (Q2):** the OS keyring; for a headless worker a
+  systemd credential or stdin; for development and CI an environment variable that htui removes from every
+  agent subprocess environment (`R-SEC-2`). Never Postgres, `argv` or a plaintext file.
+- **Settings shows the state (Q6).** The existing Settings > Qdrant section (§2.5) keeps its masked
+  API-key row in this box's keyring; P1 moves its URL row to the workspace setting. Settings and first run
+  show when the workspace has no Qdrant configured, when it is unreachable, and when this box lacks its
+  key: a warning, not a block. A worker logs the same warning once at start.
+
+**7.6 Phasing.**
 
 | Phase | Content | Depends on |
 |---|---|---|
-| 0 | Requirement edits (§10); MOD-112 and ANA-38 take their constraints | maintainer acceptance |
-| 1 | P1 headless configuration and index freshness; P2 cheap fail-open | none |
-| 2 | P3 related items at draft time: the TUI's item creation first, then `item_create` drafts, coordinator follow-ups and the importer | MOD-112 (3), MOD-135, MOD-8 for the later parts |
-| any | P4 benchmark in tree, rerun when MOD-8 lands | none |
+| 0 | Requirement edits (§10), the `R-NF-2` text merged with MOD-130's pending amendment; MOD-112, ANA-35 and ANA-38 take their constraints | maintainer acceptance |
+| 1 | P1 workspace Qdrant setting and API key; P3 cheap fail-open and wording | none |
+| 2 | P2 single indexer, freshness, one collection per workspace; MOD-112 (4) notes, transcripts and agents' workspace scope on top of it | P1 |
+| 3 | P2's coverage of documents owned by a project or the workspace, workspace requirements and memory; MOD-112 (4)'s workspace-owned items | ANA-35, ANA-38 |
+| 4 | P4 related items at draft time | P2; MOD-112 (3), MOD-135 and MOD-8 for the later parts |
+| any | P5 benchmark in the repo; rerun at workspace scale once notes and transcripts are indexed | none; the rerun needs MOD-112 (4) and MOD-8 |
 
 ## 8. Questions for the maintainer
 
-1. **Qdrant optional, daemon and model together, on every box (7.1).** **Recommended: accept.**
-2. **Agent discovery without Qdrant (7.2):** MOD-112's read tools gain a text filter over bodies,
-   documents and requirements that works without Qdrant; `search_concepts` stays additive. Without this an
-   agent on a box without Qdrant has no way to find by words. **Recommended: accept.**
-3. **Related items at draft time, display-only (7.2, P3):** top 5 nearest items when Qdrant is
-   configured, hidden otherwise; no automatic duplicate flag, because no score separated duplicates from
-   no-target queries (§5.4). **Recommended: accept.**
-4. **Memory must reach a prompt without Qdrant (7.2):** ANA-38 takes this as a constraint; Qdrant indexing
-   and dedup of memory entries stay optional. **Recommended: accept.**
-5. **Make the optional path work (7.3, P1, P2):** a non-keyring Qdrant URL source for a headless worker,
-   on the DSN's pattern; index freshness owned by the executing process; a search fails before the model
-   loads and never creates a collection; agents are offered `search_concepts` only where a Qdrant URL is
-   configured. **Recommended: accept, including the `R-STO-1` edit in §10.5.**
-6. **Reopen triggers (7.4)** and keeping the benchmark harness in the repo to measure them (P4).
+D1-D5 (§1) are decided and not asked again. What stays open:
+
+1. **Where the URL lives (7.5).** The Qdrant URL becomes a workspace setting in Postgres, read by every
+   box of the workspace. `workspace` has no settings column today (§2.5), so this needs a migration. A URL
+   that carries credentials is refused. The per-box keyring entry `qdrant-url` (`secret.rs:43`) is
+   retired: a box that finds it set while the workspace has none offers it once as the workspace setting,
+   and the existing Settings > Qdrant section (§2.5) moves its URL row to the workspace setting. For
+   development and CI an environment variable may override the URL per process, so an hr sandbox can
+   point at its own Qdrant. The migration coordinates with ANA-35, which owns the workspace schema, and
+   with MOD-130's `target_id` on the workspace. **Recommended: accept.**
+2. **How the API key is delivered (7.5).** As a secret like the DSN, under `R-STO-1`: in the OS keyring, one
+   entry per workspace; for a headless worker (`R-ORCH-12`) a systemd credential, or stdin read beside
+   `--dsn-stdin` and held only in memory; for development and CI an environment variable removed from every
+   agent subprocess (`R-SEC-2`). A worker may serve several workspaces, so stdin or the credential carries one
+   key per workspace, keyed by workspace slug (`workspace.slug`, `0001_init.sql:131`). Not in Postgres:
+   although Qdrant holds only data derived from Postgres, a key there would let any database reader rewrite or
+   delete the index, and it would be the only htui credential kept in the database. A workspace whose Qdrant
+   needs no key is allowed, and Settings warns about it. **Recommended: accept, with the `R-STO-1` edit of
+   §10.5.**
+3. **One collection per workspace (7.3).** Each workspace gets its own collection in its Qdrant, holding
+   every member project; a project in two workspaces is indexed in each; two workspaces that name the
+   same Qdrant still keep separate collections and leases. Today's single `htui_concepts_v2` for every
+   project (§2.1) is replaced, which is a new collection, not a migration (`vector.rs:34-39`). A session
+   searches the workspace its run was queued from, which P2 records on the run (`run` has no
+   `workspace_id` today, §7.3); a run with none recorded searches every workspace of its project.
    **Recommended: accept.**
-7. **Requirement edits (§10).** Each edit stands or falls with its question: the bracketed sentences of
-   §10.2 with Q3 and Q5, §10.3 with Q2, §10.4 with Q4, §10.5 with Q5. **Recommended: accept as written,
-   the wording open to the maintainer's edits.**
+4. **Lease mechanism and freshness trigger (7.3).** The lease: a row per workspace (holder, box, expiry),
+   taken when free or expired and renewed each beat, on the run lease's pattern, reusing `lease_ttl_seconds`
+   (120) and `lease_refresh_seconds` (60) (`migrations/0003_orchestration.sql:135-136`). The holder renews the
+   lease immediately before each delete batch, and a renewal that touches zero rows means abandon, as with the
+   run lease (`0003_orchestration.sql:56-58`); in the same pass it confirms each orphan's absence in Postgres.
+   So a lapsed holder cannot delete what the next one indexed. Not a session advisory lock: that binds the
+   lease to one connection, which `PgStore`'s pool does not hold still (`pg/mod.rs:103`); htui's only advisory
+   lock is transaction-scoped (`pg/write.rs:7361`). The trigger: a short cycle, 60 s recommended. Items,
+   requirements, notes and documents are read by `updated_at` or `created_at` (`item_note` and `document` are
+   append-only and have only `created_at`, `migrations/0001_init.sql:564-571`), pulled back by the cache
+   refresh's overlap window (`cache_overlap_seconds`, 300 s, `cache/refresh.rs:220, 338`): a timestamp is
+   taken before its transaction commits, so a cursor set at the last pass would miss a late commit. Reading a
+   row twice is harmless; the sync is idempotent (§2.1). Transcripts are read by `(run_step_id, seq)` past the
+   last indexed `seq` per step, as the cache refresh reads them (`refresh_transcripts`,
+   `cache/refresh.rs:1687`), never by `session_event.at`, which is the executing box's clock
+   (`0001_init.sql:522`). Today's full reconcile runs every `concepts_sync_minutes` for deletions. Not NOTIFY
+   or an outbox for now: htui has neither in its code (MOD-46 proposes `NOTIFY` for live transcripts; revisit
+   with it), a missed notification would still need the cycle, and a minute's lag is acceptable for a search.
+   **Recommended: short cycle; revisit NOTIFY with MOD-46 or if the lag is reported.**
+5. **Who may hold the lease (7.3).** Any htui process of the workspace, worker or TUI, that can reach
+   its Qdrant and load the model; first come, released on a clean exit, expired otherwise. A process may
+   hold one lease per workspace it serves. A worker-only rule would leave a workspace whose TUI is the
+   executor, the default (§2.1), with no indexer. The TUI's `Ctrl+R` and `--index-items` take the lease
+   only if it is free; otherwise they record a request for a pass on the lease row, which the holder
+   serves on its next beat, and show which box holds the lease. **Recommended: worker or TUI, no
+   preference rule for now.**
+6. **What "configured" warns about, and where (7.4, 7.5).** Three states: the workspace has no Qdrant
+   URL; it has one that is unreachable or refuses the collection (embedder mismatch); this box has no API
+   key for a Qdrant that needs one. Shown as a warning in the existing Settings > Qdrant section (§2.5),
+   beside Postgres (`R-TUI-8`), at first run when a workspace is created or opened, and as one log line at
+   worker start; never a modal, never a block. The section keeps this box's masked API key in the
+   keyring, and its URL row now edits the workspace setting in Postgres. That row could instead sit in the
+   Workspaces tab's overview (`R-TUI-14`), since the URL belongs to the workspace; Settings is
+   recommended, beside the key. Search surfaces say "knowledge search unavailable" with the cause one
+   key away. `search_concepts` is advertised to a session when the workspace has a URL configured,
+   checked as the session starts; during an outage a call answers "knowledge search unavailable" as a
+   tool error. **Recommended: accept.**
+7. **Related items at draft time, display-only (7.4, P4):** the top 5 nearest items across the
+   workspace, open and closed; no automatic duplicate flag, because no score separated duplicates from
+   no-target queries (§5.4). **Recommended: accept.**
+8. **Memory and Qdrant (7.4):** ANA-38 indexes memory in the shared Qdrant and gets memory into a prompt
+   without it. **Recommended: accept, as a constraint on ANA-38.**
+9. **Requirement edits (§10).** Each edit stands or falls with its question: the bracketed sentences of
+   §10.2 with Q3, Q4, Q5 and Q7, §10.3's text-filter clause with Q10, §10.4 with Q8, §10.5 with Q1 and
+   Q2, §10.6 with Q6, §10.7 with Q11. **Recommended: accept as written, the wording open to the
+   maintainer's edits.**
+10. **Agents' outage fallback (7.4).** MOD-112 (1)'s read tools gain a text filter over keys, titles and
+    bodies that works without Qdrant, so an agent can still find by words while knowledge search is
+    unavailable or unconfigured. MOD-112 names no lexical tool today (§3, item 1). It is likely weaker than
+    the trial's grep and whole-file read (§5.9). **Recommended: accept.**
+11. **Agents' read scope for search results (7.3).** `R-MCP-1` lets an agent read workspace items,
+    documents and requirements beyond its run. Knowledge search at workspace scope also returns snippets
+    of notes and of other runs' scrubbed transcripts. Either `R-MCP-1` widens to cover them (§10.7), or
+    agent searches exclude notes and transcripts and only people search them. Transcripts are scrubbed
+    before a row persists (`R-SEC-3`), and a hit carries at most 280 characters (§2.3). **Recommended:
+    widen, with the edit of §10.7.**
 
 ## 9. Proposed spawns
 
@@ -685,71 +876,110 @@ Not filed; no IDs are minted. Ordering is by dependency.
 
 | P | Subject | Scope | Blocked on | Requirements |
 |---|---|---|---|---|
-| P1 | Qdrant for headless workers; index freshness | For a headless worker (R-ORCH-12), the Qdrant URL and API key read from stdin and from a systemd credential beside the keyring, as the DSN is; for development and CI, from an environment variable that htui removes from every agent subprocess environment (R-SEC-2), as `R-STO-1` allows for the DSN, so an hr sandbox, which has no keyring, can search outside tests; a URL stored after start is picked up without a restart; the process that executes runs on a box (worker or TUI) runs the index cycle; the two-indexer transient deletion of §2.1 fixed or shown harmless; README: one shared Qdrant per team. | none | R-STO-8, R-STO-1, R-SEC-2, R-NF-2 |
-| P2 | Search fails open cheaply | The TUI search checks Qdrant and the collection before loading the model, and opens the existing collection instead of creating it, as the CLI does; a dead Qdrant never triggers a 133 MB download. The TUI advertises `search_concepts` to a session only when a Qdrant URL is configured, checked as the session starts, so a URL stored mid-session reaches new sessions (today it is always advertised, §2.4). `Ctrl+F` stays offered and keeps saying how to configure Qdrant. May be folded into P1. | none | R-NF-2, R-STO-8, R-NF-3, R-MCP-2 |
-| P3 | Related items at draft time | When Qdrant is configured: the top 5 nearest existing items (open and closed, decisions included) beside item creation in the TUI, `item_create` drafts, the coordinator's follow-up drafts and the MOD-8 importer, for a person to judge; display-only, nothing written from a score; hidden without Qdrant. | MOD-112 (3), MOD-135 and MOD-8 for those parts; the TUI part is not blocked | R-STO-8, R-ID-6, R-ENT-9, R-MCP-2 |
-| P4 | Retrieval benchmark in the repo | Move the ANA-37 harness (corpus builder, frozen queries with their hash, metrics, McNemar) from `/tmp` into the repo as a dev tool against a scratch Qdrant; add a corpus read from Postgres once MOD-8 lands; report dense-only beside the hybrid. Could be filed as TOOL instead. | none | R-STO-8 |
+| P1 | Workspace Qdrant: URL setting and API key | The Qdrant URL as a workspace setting in Postgres (migration, coordinated with ANA-35's workspace schema and MOD-130's `target_id` on the workspace; set from the existing Settings > Qdrant section, whose URL row moves to it, and from the CLI), a URL with credentials refused; the API key in the keyring per workspace, from a systemd credential or stdin, one key per workspace slug, for a headless worker (R-ORCH-12), and for development and CI from an environment variable htui removes from every agent subprocess (R-SEC-2); a development and CI override for the URL; the per-box keyring URL offered once as the workspace setting, then retired; a setting changed after start picked up without a restart. | none | R-STO-1, R-STO-8, R-SEC-2, R-TUI-8, R-NF-2 |
+| P2 | One indexer per workspace; freshness; coverage | The workspace indexer lease in Postgres (holder, box, expiry, renewal, one lease per workspace a process serves; renewed before each delete batch, orphans confirmed absent in the same pass); one collection per workspace; the run records the workspace it was queued from; the short incremental cycle (timestamps with the cache refresh's overlap; transcripts by step and `seq`) plus the full reconcile; the worker's index job runs under the lease, and the TUI's `Ctrl+R` and `--index-items` take it only when free, otherwise request a pass from the holder and show which box holds it; `--search-items` over several workspaces queries each one's Qdrant and names those unavailable. Coverage of the parts of D3 that MOD-112 (4) does not own: documents owned by a project or the workspace and workspace requirements once ANA-35 lands, and memory as ANA-38 designs it. **MOD-112 (4) keeps** notes, scrubbed transcripts (prompt, follow-up, assistant-text and plan events only), workspace-owned items once ANA-35 lands, and agents' workspace scope; P2 provides the indexer they plug into and does not duplicate them. | P1; ANA-35 and ANA-38 for those parts | R-STO-8, R-ENT-12, R-ENT-13, R-ENT-16 |
+| P3 | Fail open cheaply, and say so | The TUI search checks Qdrant and the collection before loading the model and never creates a collection, as the CLI already does; every search surface answers "knowledge search unavailable" with its cause; `search_concepts` advertised when the workspace has a URL configured, answering with the same words during an outage (today it is always advertised, §2.4); Settings, first run and worker start warn when the workspace has no Qdrant, when it is unreachable, and when this box lacks the key; CI runs `qdrant_live` and `qdrant_worker` against a Qdrant instead of skipping. May be folded into P1. | none | R-NF-2, R-NF-3, R-STO-8, R-MCP-2, R-TUI-8 |
+| P4 | Related items at draft time | The top 5 nearest items across the workspace (open and closed, decisions included) beside item creation in the TUI, `item_create` drafts, the coordinator's follow-up drafts and the MOD-8 importer, for a person to judge; display-only, nothing written from a score; "knowledge search unavailable" during an outage, filing unaffected. | P2; MOD-112 (3), MOD-135 and MOD-8 for those parts | R-STO-8, R-ID-6, R-ENT-9, R-MCP-2 |
+| P5 | Retrieval benchmark in the repo; rerun at workspace scale | Move the ANA-37 harness (corpus builder, frozen queries with their hash, metrics, McNemar) from `/tmp` into the repo as a dev tool against a scratch Qdrant; build a workspace corpus from Postgres (several projects, notes, transcripts) once MOD-112 (4) and MOD-8 land; add cross-project duplicate and question queries; report dense-only beside the hybrid; rerun the agent trial on a corpus that does not fit one read. Could be filed as TOOL instead. | none; the workspace rerun needs MOD-112 (4) and MOD-8 | R-STO-8 |
 
 Effects on existing items, applied at acceptance: **MOD-112** part (2) is recorded as existing
-(`search_concepts`); what remains is workspace scope, and part (1) gains the text filter of Q2. **ANA-38**
-gains "memory reaches a prompt without Qdrant" as a constraint. **MOD-135** gains P3 as a later consumer of
-its follow-up drafts.
+(`search_concepts`); part (4) keeps notes, transcripts (without tool calls, tool results or edit
+proposals), workspace-owned items and agents' workspace scope, plugs into P2's indexer and becomes blocked
+on P2; part (1)'s read tools carry the text filter that is agents' fallback during an outage (Q10).
+**ANA-35** gains a note that documents owned by a project or the workspace and workspace requirements are
+knowledge P2 indexes once they exist, and that P1's `workspace` migration coordinates with its workspace
+schema. **MOD-130** gains a note that P1's migration and its `target_id` on the workspace touch the same
+table, and that its `R-NF-2` amendment merges with §10.1. **ANA-38** gains "memory is indexed in the
+shared Qdrant and reaches a prompt without it" as a constraint; how memory is indexed is ANA-38's design.
+**MOD-135** gains P4 as a later consumer of its follow-up drafts.
 
 ## 10. Requirement edits owed
 
 All maintainer-gated; `docs/REQUIREMENTS.md` is not edited by this item. `<date>` is the acceptance date.
-A bracketed condition marks a sentence that depends on a §8 question other than Q7; it is removed on
+A bracketed condition marks a sentence that depends on a §8 question other than Q9; it is removed on
 acceptance, and the sentence is dropped if its question is rejected.
 
 **10.1 `R-NF-2`, proposed text:**
 
-> **R-NF-2 (must).** No required dependency on any external daemon other than Postgres, the agents, and in
-> coding sessions the code-context tools (R-LATER-7). Two services are optional, and each fails open with
-> nothing else affected when absent: Qdrant with its embedding model for semantic search (R-STO-8), and an
-> error-reporting endpoint the user configures in Settings, which is off unless set and receives only
-> scrubbed events (R-ID-7, MOD-99). When semantic search is absent, a feature that uses it either has a
-> path that works without it, or is not offered, or says plainly that search is unavailable; no run,
-> prompt or close-out needs it. ANA-37 measured what semantic search adds and kept Qdrant optional; its
-> §7.4 names what reopens the question. Amended by maintainer decision, 2026-10-14, 2026-10-15 (context
-> tools; Qdrant to ANA-37), and `<date>` (ANA-37).
+> **R-NF-2 (must).** Required services: Postgres, and one shared Qdrant per workspace with its embedding
+> model, which runs in each process that searches or indexes (R-STO-8). Qdrant fails open: when a workspace's
+> Qdrant is not configured or not reachable, `htui` starts and works, knowledge search says "knowledge search
+> unavailable", and nothing else is affected; no run, prompt or close-out waits on it. While a workspace names
+> no Qdrant, agents are not offered the search tool (R-MCP-2). Every box and process of a workspace uses that
+> workspace's one Qdrant; none runs or names a Qdrant of its own, except a development or CI override
+> (R-STO-1). Beyond Postgres, Qdrant and the agents, no required dependency on any external daemon, except the
+> code-context tools in coding sessions (R-LATER-7). An error-reporting endpoint the user configures in
+> Settings stays optional: it is off unless set, receives only scrubbed events (R-ID-7, MOD-99), and fails
+> open with nothing else affected. Amended by maintainer decision, 2026-10-14, 2026-10-15 (context tools;
+> Qdrant to ANA-37), and on ANA-37, `<date>` (one shared Qdrant per workspace, required, failing open).
+
+Composes with MOD-130's pending amendment (`dockerd` and `sshd` opt-in per target, `HANDOFF.md:395`)
+and with MOD-44's open `dockerd` question (`HANDOFF.md:347`); whichever lands second merges the other's
+sentence instead of replacing the whole text.
 
 **10.2 `R-STO-8`, proposed text:**
 
-> **R-STO-8 (must).** Semantic search over items and requirements. `htui` indexes each item's key, title
-> and body, its latest documents, its notes, the scrubbed transcripts of its runs, and each requirement's
-> key, body and rationale (withdrawn ones included), into a Qdrant collection (local dense embeddings plus
-> BM25 sparse vectors, ranked together) and answers searches scoped to projects or a workspace,
-> workspace-owned items, documents and requirements included (R-ENT-16). Agents search through an MCP tool
-> (R-MCP-2). A search can be narrowed to decisions: items closed as `done`, `concluded` or `rejected`
-> (R-ENT-8), and their documents. The index is derived from Postgres and rebuildable from it (R-STO-1).
-> [Only if Q5 is accepted:] The process that executes runs on a box keeps it current. Qdrant and the
-> embedding model are optional (R-NF-2): where they are not configured or are unavailable, a search or
-> tool that needs them is either not offered or answers with a clear error, and nothing else is
-> affected. [Only if Q5 is accepted:] A headless worker (R-ORCH-12) takes the Qdrant URL and API key from
-> the same sources as its DSN (R-STO-1). [Only if Q3 is accepted:] Where Qdrant is configured, drafting an
-> item shows the nearest existing items for a person to judge; nothing is written from a search score
-> (R-ID-6). Added by maintainer decision on MOD-34, 2026-09-25
-> (`docs/ANA-19.md`, `docs/ANA-20.md`); amended by maintainer decision on MOD-50, 2026-09-29
-> (requirements indexed, decisions by resolution), on the requirements review, 2026-10-15 (notes,
-> transcripts, workspace scope, agent tool), and on ANA-37, `<date>` (optional; and, with Q3 and Q5,
-> freshness, headless configuration, related items).
+> **R-STO-8 (must).** Knowledge search for the workspace. `htui` indexes what a workspace knows, across its
+> projects: each item's key, title and body, its latest documents, its notes and the scrubbed transcripts of
+> its runs (prompts, agent text and plans, not tool calls, tool output or edits); documents owned by a project
+> or the workspace (R-ENT-12); workspace-owned items (R-ENT-16); each requirement's key, body and rationale
+> (withdrawn ones included); and memory (R-ENT-13). Code and markdown files in a repo checkout are not
+> indexed: they belong to the code-context tools (R-LATER-7) unless imported into Postgres (R-LATER-3). The
+> index lives in the workspace's shared Qdrant (R-NF-2), with local dense embeddings and BM25 sparse vectors
+> ranked together. [Only if Q3 is accepted:] Each workspace has its own collection, holding every member
+> project. Searches cover the workspace by default and can be narrowed to projects; agents search through an
+> MCP tool at workspace scope, within their read scope (R-MCP-1, R-MCP-2). A search can be narrowed to
+> decisions: items closed as `done`, `concluded` or `rejected` (R-ENT-8), and their documents. The index is
+> derived from Postgres and rebuildable from it (R-STO-1). One `htui` process per workspace indexes it and
+> keeps it current. [Only if Q4 and Q5 are accepted:] It is the holder of a workspace lease in Postgres,
+> worker or TUI. [Only if Q4 is accepted:] Rows written are indexed within a short cycle, and a full reconcile
+> catches deletions. When the workspace's Qdrant or the embedding model is unavailable, search answers
+> "knowledge search unavailable" and nothing else is affected (R-NF-2). [Only if Q7 is accepted:] Drafting an
+> item shows the nearest existing items across the workspace for a person to judge; nothing is written from a
+> search score (R-ID-6). Added by maintainer decision on MOD-34, 2026-09-25 (`docs/ANA-19.md`,
+> `docs/ANA-20.md`); amended by maintainer decision on MOD-50, 2026-09-29 (requirements indexed, decisions by
+> resolution), on the requirements review, 2026-10-15 (notes, transcripts, workspace scope, agent tool), and
+> on ANA-37, `<date>` (workspace knowledge search, shared Qdrant, one indexer; and, with Q3, Q4, Q5 and Q7, a
+> collection per workspace, the lease, freshness and related items).
 
-**10.3 `R-MCP-2`**, replace "read tools for items, documents and requirements, and semantic search
-(R-STO-8)" with "read tools for items, documents and requirements, with a text filter over their keys,
-titles and bodies that works without Qdrant, and semantic search (R-STO-8) where Qdrant is configured".
+**10.3 `R-MCP-2`** (the text-filter clause with Q10; if Q10 is rejected, the clause is dropped), replace "read
+tools for items, documents and requirements, and semantic search (R-STO-8)" with "read tools for items,
+documents and requirements, with a text filter over their keys, titles and bodies that works without Qdrant,
+and knowledge search at workspace scope (R-STO-8), which says it is unavailable when the workspace's Qdrant is
+not available", and replace the final "Amended 2026-10-15." with "Amended 2026-10-15 and `<date>` (ANA-37)."
 
-**10.4 `R-ENT-13`**, append: "Memory reaches a prompt without semantic search, which is optional (R-NF-2);
-indexing entries in Qdrant and suggesting near-duplicate entries are optional extras (ANA-37)."
+**10.4 `R-ENT-13`** (with Q8), append: "Memory entries are indexed in the workspace's knowledge search
+(R-STO-8), and memory reaches a prompt without it, so an outage of the workspace's Qdrant never empties a
+prompt (R-NF-2, ANA-37)."
 
-**10.5 `R-STO-1`** (with Q5), three exact edits to `docs/REQUIREMENTS.md:257-269`:
+**10.5 `R-STO-1`** (with Q1 and Q2), three exact edits to `docs/REQUIREMENTS.md:257-269`:
 
 1. Replace "Connection string and provider identities live in the OS keyring" with "Connection string,
-   provider identities and the Qdrant URL and API key live in the OS keyring".
+   provider identities and the API key of each workspace's Qdrant live in the OS keyring".
 2. After "Never in `argv` or a plaintext file.", insert: "The same exception, and the development and CI
-   environment variable, apply to the Qdrant URL and API key (R-STO-8)."
-3. Append to the amendment trail, before its final full stop: ", and on ANA-37, `<date>` (Qdrant URL and
-   API key)". The trail then ends "…(environment variable; key bindings moved to Postgres), and on
-   ANA-37, `<date>` (Qdrant URL and API key)."
+   environment variable, apply to a workspace's Qdrant API key (R-STO-8). The Qdrant URL is not a secret:
+   it is a workspace setting in Postgres, carries no credentials, and may be overridden per process by a
+   development or CI environment variable."
+3. Append to the amendment trail, before its final full stop: ", and on ANA-37, `<date>` (Qdrant API key
+   and URL)". The trail then ends "…(environment variable; key bindings moved to Postgres), and on ANA-37,
+   `<date>` (Qdrant API key and URL)."
+
+**10.6 `R-TUI-8`** (with Q6), two exact edits to `docs/REQUIREMENTS.md:588-600`:
+
+1. Replace "the default workflow) and the component catalogue (R-ENT-17);" with "the default workflow),
+   the component catalogue (R-ENT-17), and the workspace's Qdrant (its URL, stored in Postgres; a masked
+   field for this box's API key, stored in the keyring; the state of the last attempt; a warning when the
+   workspace has none; R-STO-8, R-NF-2);". The earlier "What is typed goes to the OS keyring and nowhere
+   else" stays with the Postgres connection it follows; the Qdrant URL is not a secret (§10.5).
+2. Replace the trail "Amended 2026-10-15 and 2026-10-17 (UI review,
+   `docs/ui-redesign-findings-2026-10-15.md`)." with "Amended 2026-10-15, 2026-10-17 (UI review,
+   `docs/ui-redesign-findings-2026-10-15.md`) and `<date>` (ANA-37)."
+
+**10.7 `R-MCP-1`** (with Q11), replace "and may read beyond it — workspace items, documents and
+requirements." with "and may read beyond it — workspace items with their notes, documents and
+requirements, and, through knowledge search (R-STO-8), snippets of the scrubbed transcripts of the
+workspace's runs.", and replace the final "Amended 2026-10-15 (wider read scope)." with "Amended
+2026-10-15 (wider read scope) and `<date>` (ANA-37, notes and transcripts through search)."
 
 ## 11. Not verified
 
@@ -757,6 +987,10 @@ indexing entries in Qdrant and suggesting near-duplicate entries are optional ex
   pgvector, embedded indexes (Qdrant Edge included, noted only as existing in beta) and other vector
   databases. Whether a lexical index outside Qdrant could carry the share of the duplicate gain that
   htui's BM25 leg delivers (9 of 13 rescues) was therefore not examined.
+- **The workspace-scale extrapolation is UNMEASURED.** §5.10 and §6.1 argue that the single-search
+  numbers matter more once a workspace's knowledge does not fit one read. No corpus spanning several
+  projects, notes or transcripts was built, no cross-project duplicate was counted (htui has one
+  project), and no trial ran on such a corpus. P5 is owed for that.
 - **Real agent use of `search_concepts`:** how often agents call it is **UNVERIFIED**; transcripts are in
   the host database, which the sandbox cannot reach.
 - **htui's own no-Qdrant baseline** (substring on key and title) was not run in the benchmark; L and G are
@@ -766,19 +1000,24 @@ indexing entries in Qdrant and suggesting near-duplicate entries are optional ex
   found in `mcp_search.rs`, `concepts.rs`, `concepts_worker.rs` or `tools/search.rs`. Recomputed from the
   uncollapsed points (`S_points`, top 5 points): duplicates 22/24, questions 9/20, identifiers 15/16. The
   headline holds; questions lose one hit.
-- **MOD-112's text filter against arm A.** Q2 and §6.1 assume a text filter over Postgres rows performs
-  about as well as arm A's grep and whole-file read. That was not measured; an MCP filter with no bulk
-  read is likely weaker (§5.9).
+- **The outage fallback against arm A.** §7.4 relies on MOD-112's text filter over Postgres rows during
+  an outage. Whether it performs about as well as arm A's grep and whole-file read was not measured; an
+  MCP filter with no bulk read is likely weaker (§5.9).
 - **The real corpus shape:** items and decisions are not yet Postgres rows (MOD-8); notes, transcripts and
   `docs/ANA-*.md` were not in the corpus. Results may change on the real index.
+- **The lease and freshness design** (§7.3, Q4, Q5) is a proposal checked against the schema only; no
+  code for it was written or tested.
 - **Trial limits:** one run per arm, call counts self-reported and not cross-checked against transcripts,
   the model and its version not recorded in this doc.
-- **Resource figures:** Qdrant memory and CPU with a populated index under real query load, and sync
-  duration on a real backlog, were not measured beyond the 83.7 MB figure. The embedder figures are
-  ANA-23's spike, not the real binary. Qdrant's official idle RSS is **UNVERIFIED**.
-- **Windows:** running Qdrant as a Windows service is **UNVERIFIED**; `rten` on Windows is unmeasured
-  (MOD-16 open).
-- **The two-indexer transient deletion** (§2.1) is inferred from code order and not tested.
+- **Resource figures:** Qdrant memory and CPU with a populated index under real query load, sync duration
+  on a real backlog, and the point count transcripts add were not measured beyond the 83.7 MB figure. The
+  embedder figures are ANA-23's spike, not the real binary. Qdrant's official idle RSS is **UNVERIFIED**.
+- **Windows:** `rten` on Windows is unmeasured (MOD-16 open). That the shared Qdrant runs on Linux or
+  under Docker, leaving Windows boxes as clients, is an assumption, not a decision (§6.2). For a
+  Windows-only workspace, running the native `qdrant-x86_64-pc-windows-msvc.zip` as a Windows service is
+  **UNVERIFIED**.
+- **The two-indexer transient deletion** (§2.1) is inferred from code order and not tested; the lease of
+  §7.3 removes it once built.
 - **Web evidence marked UNVERIFIED by its reader:** the headline numbers of the "When Lexical Beats Neural"
   preprint (PDF returned 403); the 2026 Stack Overflow Recall@20 figures (search snippet only); the "vibes"
   quote attributed to the Latent Space podcast; whether embeddings supply Linear Triage Intelligence's
@@ -786,7 +1025,8 @@ indexing entries in Qdrant and suggesting near-duplicate entries are optional ex
 - **Whether the UI redesign keeps `Ctrl+F`:** `docs/ui-redesign-findings-2026-10-15.md` does not mention
   it; **UNVERIFIED**.
 - **The maintainer's bar** exists in two wordings, "proves very beneficial" and "is very beneficial";
-  neither is a verbatim transcript.
+  neither is a verbatim transcript. Under D1-D5 it is met by the maintainer's decision, not by a
+  measurement (§6.3).
 - **Artefacts:** the benchmark (`/tmp/ana37-benchmark/`), the trial (`/tmp/ana37-trial/`), the Qdrant
   collection `ana37_concepts` and the Postgres database `ana37` are outside the repo. An hr sandbox
-  restart wipes `/tmp` and `~/.cache`; P4 exists so the numbers can be reproduced.
+  restart wipes `/tmp` and `~/.cache`; P5 exists so the numbers can be reproduced.
