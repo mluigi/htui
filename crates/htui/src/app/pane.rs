@@ -60,7 +60,7 @@ use crate::editor::{
     EDITOR_ABORTED, EDITOR_BUSY, EditorCommand, EditorExit, ExternalEdit, ExternalEditOutcome,
     PANE_VAR, TempEdit,
 };
-use crate::keys::{Act, CTRL_C, Hint, HintSpec, KeyChord, Stack};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack};
 use crate::ui::overlay::Overlay;
 use crate::ui::tabs::TabId;
 
@@ -77,7 +77,7 @@ const EDITOR_LOCKED: &str = "the editor is open";
 /// MOD-57 M2 E5: what the asking tab waits for before anything may steer it.
 const FINISH_FIRST: &str = "finish or abort it first";
 
-/// M2 R1 nit: what `editor.focus` under the quit question says.
+/// M2 R1 nit: what `editor.focus` under the leave dialog says.
 const ANSWER_FIRST: &str = "answer the question first";
 
 /// The refusal's tail and the status line while a modal overlay is over the editor (R0 F3): its
@@ -284,7 +284,7 @@ impl App {
     }
 
     /// The asking tab's title (as the tab strip shows it), else its id; empty without an editor.
-    fn editor_title(&self) -> &str {
+    pub(super) fn editor_title(&self) -> &str {
         let Some(tab) = self.editor_tab() else {
             return "";
         };
@@ -361,17 +361,17 @@ impl App {
     /// 1. The first key that finds a focused editor without the keys is swallowed and unfocuses
     ///    it ([`editor_lost_keys`](Self::editor_lost_keys)).
     /// 2. With the keys, the editor's, unless it is the focus toggle.
-    /// 3. `ctrl-c`: `false`, so `on_key`'s one ANA-26 C3 site quits.
-    /// 4. Under a modal overlay (a reply's prompt, the quit question): `false`, the overlay's
-    ///    keys; `editor.focus` does not act there, and under the quit question says so
+    /// 3. Under a modal overlay (a reply's prompt, the leave dialog): `false`, the overlay's
+    ///    keys (`ctrl-c` there is the overlay's quit layer, or the dialog's `leave.confirm`);
+    ///    `editor.focus` does not act there, and under the leave dialog says so
     ///    ([`focus_under_the_question`](Self::focus_under_the_question)).
-    /// 5. On another tab: `editor.focus` ([`Stack::EDITOR_FOCUSED`]) refocuses and brings the
+    /// 4. On another tab: `editor.focus` ([`Stack::EDITOR_FOCUSED`]) refocuses and brings the
     ///    asking tab back (B16, [`focus_from_another_tab`](Self::focus_from_another_tab));
     ///    anything else is `false`, as if no editor were alive.
-    /// 6. On the asking tab ([`asking_tab_key`](Self::asking_tab_key)): the first candidate of
+    /// 5. On the asking tab ([`asking_tab_key`](Self::asking_tab_key)): the first candidate of
     ///    [`Stack::EDITOR_OPEN`] that maps (`editor.focus`, `editor.abort`, then every global the
-    ///    shell maps); a key nothing maps is refused on the status line. Nothing reaches the
-    ///    asking view.
+    ///    shell maps, `ctrl-c`'s `global.quit` included: the leave dialog); a key nothing maps is
+    ///    refused on the status line. Nothing reaches the asking view.
     pub(super) fn editor_key(&mut self, key: KeyEvent, chord: KeyChord) -> bool {
         if self.editor_lost_keys() {
             return true;
@@ -394,11 +394,6 @@ impl App {
             }
             return true;
         }
-        // ANA-26 C3 holds while htui has the keys, at `on_key`'s own site (B-M2-7); under a modal
-        // overlay its keys take the path below (C3, the overlay, `Esc`/help, the modal swallow).
-        if chord == CTRL_C {
-            return false;
-        }
         if self.editor_covered() {
             return focus && self.focus_under_the_question();
         }
@@ -409,19 +404,19 @@ impl App {
         self.asking_tab_key(chord)
     }
 
-    /// `editor.focus` under a modal overlay (`editor_key` step 4): the quit question has no use
+    /// `editor.focus` under a modal overlay (`editor_key` step 3): the leave dialog has no use
     /// for it, so the status line says to answer the question first rather than swallow it
     /// silently (M2 R1 nit), and `true`. Under any other overlay `false`: the overlay's key.
     fn focus_under_the_question(&mut self) -> bool {
-        let question = self.quit_overlay.is_some()
-            && self.overlays.top().map(Overlay::id) == self.quit_overlay;
+        let question = self.leave_overlay.is_some()
+            && self.overlays.top().map(Overlay::id) == self.leave_overlay;
         if question {
             self.status = Some(format!("{EDITOR_LOCKED}: {ANSWER_FIRST}"));
         }
         question
     }
 
-    /// `editor.focus` on another tab (`editor_key` step 5, E1): refocuses, closes the `?` box and
+    /// `editor.focus` on another tab (`editor_key` step 4, E1): refocuses, closes the `?` box and
     /// brings the asking tab back (B16). Always `true`.
     fn focus_from_another_tab(&mut self) -> bool {
         let Some(editor) = self.editor.as_mut() else {
@@ -434,7 +429,7 @@ impl App {
         true
     }
 
-    /// A key on the asking tab, unfocused, under no modal overlay (`editor_key` step 6, E3): the
+    /// A key on the asking tab, unfocused, under no modal overlay (`editor_key` step 5, E3): the
     /// first candidate of [`Stack::EDITOR_OPEN`] that maps; a key nothing maps is refused on the
     /// status line. Always `true`: nothing reaches the asking view.
     fn asking_tab_key(&mut self, chord: KeyChord) -> bool {
@@ -547,15 +542,14 @@ impl App {
         })
     }
 
-    /// MOD-57 M2 E4 (PRD D5): what `global.quit` resolves to. With an editor alive and
-    /// `quit_overlay` set, opening the quit question; else [`Action::Quit`]. `ctrl-c` never comes
-    /// here (ANA-26 C3 quits at once), and the question's `y` emits `Action::Quit` itself.
+    /// MOD-115 M2 D6 (`R-TUI-18`, replacing MOD-57 M2 E4's editor-only question): what
+    /// `global.quit` (`q`, `ctrl-c`) resolves to: the leave dialog, always; [`Action::Quit`] only
+    /// on a bare shell with no `leave_overlay`. The dialog's `leave.confirm` (`Enter`, a second
+    /// `ctrl-c`) emits `Action::Quit` itself.
     #[must_use]
     pub(super) fn request_quit(&self) -> Action {
-        match (self.editor.is_some(), self.quit_overlay) {
-            (true, Some(id)) => Action::Overlay(OverlayAction::Open(id)),
-            _ => Action::Quit,
-        }
+        self.leave_overlay
+            .map_or(Action::Quit, |id| Action::Overlay(OverlayAction::Open(id)))
     }
 
     /// MOD-57 M2 R1 M-2: what `editor.abort` on the asking tab resolves to. With `abort_overlay`
@@ -681,7 +675,7 @@ mod tests {
     };
     use crate::keys::{Act, Context, Keys, Stack, views};
     use crate::store_worker::{StoreReply, StoreRequest};
-    use crate::ui::overlay::{AbortConfirm, Overlay, OverlayId, QuitConfirm};
+    use crate::ui::overlay::{AbortConfirm, LeaveDialog, Overlay, OverlayId};
     use crate::ui::tabs::{Tab, TabId};
 
     /// What the fake child was asked to do.
@@ -829,7 +823,8 @@ mod tests {
     }
 
     /// A modal overlay that records the keys it is given and passes `Esc` (so the overlay
-    /// stack closes it).
+    /// stack closes it) and `ctrl-c` (the overlay stack's quit layer, MOD-115 M2 B4), as the
+    /// real prompts pass a chord they do not use.
     struct Prompt(Rc<RefCell<Vec<KeyEvent>>>);
 
     impl Overlay for Prompt {
@@ -846,7 +841,9 @@ mod tests {
             Vec::new()
         }
         fn on_key(&mut self, key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
-            if key.code == KeyCode::Esc {
+            if key.code == KeyCode::Esc
+                || crate::keys::KeyChord::from_event(key) == crate::keys::CTRL_C
+            {
                 return Handled::Pass;
             }
             self.0.borrow_mut().push(key);
@@ -994,11 +991,15 @@ mod tests {
         app.abort_overlay = Some(AbortConfirm::ID);
     }
 
-    /// Registers the quit question and names it as the quit overlay, as `register_all` does.
+    /// Registers the leave dialog and names it as the leave overlay, as `register_all` does.
     fn confirmable(app: &mut App) {
         app.overlay_factories
-            .register(QuitConfirm::ID, || Box::new(QuitConfirm::new()));
-        app.quit_overlay = Some(QuitConfirm::ID);
+            .register(LeaveDialog::ID, || Box::new(LeaveDialog::new()));
+        app.leave_overlay = Some(LeaveDialog::ID);
+    }
+
+    fn enter() -> KeyEvent {
+        press(KeyCode::Enter, KeyModifiers::NONE)
     }
 
     /// The id of the overlay on top.
@@ -1197,15 +1198,19 @@ mod tests {
         assert_eq!(writes(&log), vec![b"a".to_vec()]);
     }
 
-    /// MOD-57 M2 E4 (rewrites M1's `unfocused_ctrl_c_and_q_quit_at_once`): `ctrl-c` quits at
-    /// once; `q` asks first. A bare shell (no quit overlay) quits at once, as M1 did.
+    /// MOD-115 M2 D6, `R-TUI-18` (rewrites MOD-57 M2 E4's): `ctrl-c` and `q` both open the
+    /// leave dialog, and a second `ctrl-c` leaves. A bare shell (no leave overlay) quits at once,
+    /// as M1 did.
     #[test]
-    fn unfocused_ctrl_c_quits_at_once_and_q_asks_first() {
+    fn unfocused_ctrl_c_and_q_open_the_leave_dialog_and_a_second_ctrl_c_leaves() {
         let (mut app, _benches, log) = opened();
         confirmable(&mut app);
         app.on_key(ctrl('4'));
         app.on_key(ctrl('c'));
-        assert!(app.should_quit, "ctrl-c quits at once");
+        assert!(!app.should_quit, "ctrl-c asks first");
+        assert_eq!(top(&app), Some(LeaveDialog::ID));
+        app.on_key(ctrl('c'));
+        assert!(app.should_quit, "the second ctrl-c leaves");
         assert!(writes(&log).is_empty());
         drop(app);
         assert_eq!(
@@ -1219,7 +1224,7 @@ mod tests {
         app.on_key(ctrl('4'));
         app.on_key(plain('q'));
         assert!(!app.should_quit, "`q` asks first");
-        assert_eq!(top(&app), Some(QuitConfirm::ID));
+        assert_eq!(top(&app), Some(LeaveDialog::ID));
         assert!(app.editor_open());
         assert!(writes(&log).is_empty());
 
@@ -1231,10 +1236,10 @@ mod tests {
         assert_eq!(log.borrow().last(), Some(&Call::Dropped));
     }
 
-    /// MOD-57 M2 E4, from the asking tab and from another: `n` and `Esc` keep the edit as it was
-    /// (unfocused, where the user was), `y` quits and the editor goes with `App`.
+    /// MOD-115 M2 D6, from the asking tab and from another: `n` and `Esc` keep the edit as it
+    /// was (unfocused, where the user was), `Enter` leaves and the editor goes with `App`.
     #[test]
-    fn q_asks_first_y_quits_and_n_keeps_the_editor() {
+    fn q_asks_first_enter_leaves_and_n_keeps_the_editor() {
         for from_other in [false, true] {
             let (mut app, benches, log) = unfocused_two();
             confirmable(&mut app);
@@ -1245,7 +1250,7 @@ mod tests {
 
             for close in [plain('n'), press(KeyCode::Esc, KeyModifiers::NONE)] {
                 app.on_key(plain('q'));
-                assert_eq!(top(&app), Some(QuitConfirm::ID), "{from_other}: asked");
+                assert_eq!(top(&app), Some(LeaveDialog::ID), "{from_other}: asked");
                 assert!(!app.should_quit);
                 app.on_key(close);
                 assert!(app.overlays.is_empty(), "{from_other} {close:?}: closed");
@@ -1260,7 +1265,9 @@ mod tests {
 
             app.on_key(plain('q'));
             app.on_key(plain('y'));
-            assert!(app.should_quit, "{from_other}: `y` quits");
+            assert!(!app.should_quit, "{from_other}: `y` is no answer here");
+            app.on_key(enter());
+            assert!(app.should_quit, "{from_other}: `Enter` leaves");
             assert!(writes(&log).is_empty());
             assert!(benches[0].seen.borrow().keys.is_empty());
             drop(app);
@@ -1268,14 +1275,14 @@ mod tests {
         }
     }
 
-    /// M2 R1 L-1: the covered sentence fits every modal overlay on the asking tab, the quit
-    /// question and an offered view included, and a refused key says it too.
+    /// M2 R1 L-1: the covered sentence fits every modal overlay on the asking tab, the leave
+    /// dialog and an offered view included, and a refused key says it too.
     #[test]
     fn under_any_modal_overlay_the_asking_tab_says_close_this_first() {
         let (mut app, _benches, _log) = unfocused_two();
         confirmable(&mut app);
         app.on_key(plain('q'));
-        assert_eq!(top(&app), Some(QuitConfirm::ID));
+        assert_eq!(top(&app), Some(LeaveDialog::ID));
         assert_eq!(app.editor_status().as_deref(), Some(COVERED));
         app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
 
@@ -1283,10 +1290,10 @@ mod tests {
         assert_eq!(app.editor_status().as_deref(), Some(COVERED));
     }
 
-    /// ANA-26 C3 with an editor alive: `ctrl-c` quits at once on the asking tab, on another, and
-    /// under the quit question.
+    /// MOD-115 M2 D6 with an editor alive: `ctrl-c` opens the leave dialog on the asking tab and
+    /// on another, and leaves under it (`R-TUI-18`'s second `ctrl-c`).
     #[test]
-    fn ctrl_c_quits_at_once_on_any_tab_and_under_the_question() {
+    fn ctrl_c_opens_the_dialog_on_any_tab_and_leaves_under_it() {
         for (other, asked) in [(false, false), (true, false), (false, true), (true, true)] {
             let (mut app, _benches, log) = unfocused_two();
             confirmable(&mut app);
@@ -1295,7 +1302,11 @@ mod tests {
             }
             if asked {
                 app.on_key(plain('q'));
-                assert_eq!(top(&app), Some(QuitConfirm::ID));
+                assert_eq!(top(&app), Some(LeaveDialog::ID));
+            } else {
+                app.on_key(ctrl('c'));
+                assert!(!app.should_quit, "other {other}: asked first");
+                assert_eq!(top(&app), Some(LeaveDialog::ID), "other {other}");
             }
             app.on_key(ctrl('c'));
             assert!(app.should_quit, "other {other}, asked {asked}");
@@ -1316,7 +1327,7 @@ mod tests {
         assert!(benches[0].seen.borrow().keys.is_empty());
     }
 
-    /// M2 R1 nit: `editor.focus` under the quit question, from the asking tab or another, is not
+    /// M2 R1 nit: `editor.focus` under the leave dialog, from the asking tab or another, is not
     /// swallowed silently: the status line says to answer it first. The question stays up.
     #[test]
     fn the_focus_key_under_the_question_says_answer_it_first() {
@@ -1333,7 +1344,7 @@ mod tests {
                 Some("the editor is open: answer the question first"),
                 "{from_other}"
             );
-            assert_eq!(top(&app), Some(QuitConfirm::ID), "{from_other}");
+            assert_eq!(top(&app), Some(LeaveDialog::ID), "{from_other}");
             assert!(!focused(&app), "{from_other}");
             assert!(writes(&log).is_empty());
             assert!(benches[0].seen.borrow().keys.is_empty());
@@ -1344,10 +1355,11 @@ mod tests {
         }
     }
 
-    /// B-M2-5: an editor that exits under the question leaves it up; `y` still quits, `n` closes.
+    /// B-M2-5: an editor that exits under the leave dialog leaves it up; `Enter` still leaves,
+    /// `n` closes.
     #[test]
-    fn an_editor_that_exits_under_the_question_leaves_it_up_and_y_still_quits() {
-        for (answer, quits) in [(plain('y'), true), (plain('n'), false)] {
+    fn an_editor_that_exits_under_the_dialog_leaves_it_up_and_enter_still_leaves() {
+        for (answer, quits) in [(enter(), true), (plain('n'), false)] {
             let (mut app, benches, _log) = unfocused_two();
             confirmable(&mut app);
             app.on_key(plain('q'));
@@ -1358,7 +1370,7 @@ mod tests {
                 1,
                 "the asker heard it"
             );
-            assert_eq!(top(&app), Some(QuitConfirm::ID), "the question stays up");
+            assert_eq!(top(&app), Some(LeaveDialog::ID), "the dialog stays up");
             app.on_key(answer);
             assert_eq!(app.should_quit, quits, "{answer:?}");
             assert_eq!(app.overlays.is_empty(), !quits, "{answer:?}");
@@ -1832,7 +1844,7 @@ mod tests {
     }
 
     /// M2 R1 M-2: every other key closes the question and keeps the edit, unfocused, and is
-    /// consumed: `Esc`, `?` (no box opens), `q` (no quit question), `ctrl-4` (no refocus).
+    /// consumed: `Esc`, `?` (no box opens), `q` (no leave dialog), `ctrl-4` (no refocus).
     #[test]
     fn every_other_key_under_the_abort_question_keeps_the_edit() {
         for key in [
@@ -1884,14 +1896,24 @@ mod tests {
         assert!(benches.iter().all(|b| b.seen.borrow().heard.is_empty()));
     }
 
-    /// M2 R1 M-2: `ctrl-c` under the abort question quits at once (ANA-26 C3).
+    /// M2 R1 M-2, MOD-115 M2 B4: `ctrl-c` under the abort question opens the leave dialog over
+    /// it (the abort question's quit layer), and a second one leaves.
     #[test]
-    fn ctrl_c_under_the_abort_question_quits() {
+    fn ctrl_c_under_the_abort_question_opens_the_dialog_and_a_second_leaves() {
         let (mut app, _benches, _log) = unfocused_two();
         abortable(&mut app);
+        confirmable(&mut app);
         app.on_key(ctrl('x'));
+        assert_eq!(top(&app), Some(AbortConfirm::ID));
+        app.on_key(ctrl('c'));
+        assert!(!app.should_quit);
+        assert_eq!(top(&app), Some(LeaveDialog::ID));
         app.on_key(ctrl('c'));
         assert!(app.should_quit);
+        assert!(
+            app.editor_open(),
+            "leaving does not abort: App drops the editor"
+        );
     }
 
     /// M2 R1 M-2: an editor that exits under the abort question takes it along (the edit it
@@ -2324,7 +2346,8 @@ mod tests {
         );
         assert!(app.editor_open());
 
-        // ctrl-c still quits at once (ANA-26 C3).
+        // ctrl-c is the overlay stack's quit (MOD-115 M2 B4): a bare shell, with no leave dialog,
+        // quits at once.
         let mut quit = app;
         quit.on_key(ctrl('c'));
         assert!(quit.should_quit);

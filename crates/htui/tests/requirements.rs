@@ -515,10 +515,13 @@ async fn an_alt_chord_from_a_form_reaches_the_shell() {
         harness.key("q");
         assert!(!harness.app().should_quit, "`q` stays the form's");
         harness.key("alt-q");
-        assert!(
-            harness.app().should_quit,
-            "`alt-q` passed to the shell from field {field_tabs}"
+        assert_eq!(
+            harness.app().overlays.top().map(|overlay| overlay.id()),
+            Some(htui::ui::overlay::LeaveDialog::ID),
+            "`alt-q` passed to the shell from field {field_tabs}: the leave dialog (MOD-115 M2 D6)"
         );
+        harness.key("enter");
+        assert!(harness.app().should_quit, "and `Enter` leaves");
     }
 }
 
@@ -607,7 +610,7 @@ async fn f1_opens_help_from_a_form_and_the_form_stays() {
 }
 
 /// MOD-67 M4: while a write is in flight a form swallows plain keys, `form.save` says the write is
-/// in flight, and `ctrl-c` still quits.
+/// in flight, and `ctrl-c` still quits (through the leave dialog, MOD-115 M2 D6).
 #[tokio::test]
 async fn a_write_in_flight_swallows_keys_but_save_says_so() {
     let mut harness = open().await;
@@ -622,6 +625,12 @@ async fn a_write_in_flight_swallows_keys_but_save_says_so() {
     let frame = harness.render();
     assert!(notice(&frame).contains("is still in flight"), "{frame}");
     assert_eq!(harness.queued(), 1, "nothing more was sent");
+    harness.key("ctrl-c");
+    assert_eq!(
+        harness.app().overlays.top().map(|overlay| overlay.id()),
+        Some(htui::ui::overlay::LeaveDialog::ID),
+        "`ctrl-c` opens the leave dialog"
+    );
     harness.key("ctrl-c");
     assert!(harness.app().should_quit, "`ctrl-c` still quits");
 }

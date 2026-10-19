@@ -292,7 +292,7 @@ async fn esc_answers_the_prompt_like_n() {
 }
 
 /// MOD-52: the switcher is modal and swallows `q`, but `ctrl-c` quits through the overlay
-/// wildcard binding.
+/// stack's quit layer: it opens the leave dialog (MOD-115 M2 D6), and a second one leaves.
 #[tokio::test]
 async fn ctrl_c_quits_from_the_modal_switcher() {
     let mut harness = open_over_demo().await;
@@ -300,6 +300,17 @@ async fn ctrl_c_quits_from_the_modal_switcher() {
     assert!(
         !harness.app().should_quit,
         "the modal overlay still swallows `q`"
+    );
+    assert_eq!(
+        harness.app().overlays.iter().count(),
+        1,
+        "and opens nothing"
+    );
+    harness.key("ctrl-c");
+    assert_eq!(
+        harness.app().overlays.top().map(|overlay| overlay.id()),
+        Some(htui::ui::overlay::LeaveDialog::ID),
+        "`ctrl-c` asks first"
     );
     harness.key("ctrl-c");
     assert!(harness.app().should_quit, "`ctrl-c` quits from it");

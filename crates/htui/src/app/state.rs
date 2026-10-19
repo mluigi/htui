@@ -18,7 +18,7 @@ use crate::app::action::{
 use crate::app::pane::OpenEditor;
 use crate::editor::{EDITOR_BUSY, ExternalEdit, ExternalEditOutcome};
 use crate::keys::translate::translate;
-use crate::keys::{Act, CTRL_C, Context, HelpLine, KeyChord, Keys, Stack};
+use crate::keys::{Act, Context, HelpLine, KeyChord, Keys, Stack};
 use crate::store_worker::{Origin, RequestEnvelope, Seq, StoreRequest};
 use crate::ui::cells::clip_line;
 use crate::ui::header::{self, Flash};
@@ -302,10 +302,11 @@ pub struct App {
     /// Set by [`register_all`](crate::app::register_all), and an id for the same reason
     /// `startup_overlay` is one: the shell must not name a concrete view (MOD-1 blueprint D).
     pub migration_overlay: Option<crate::ui::overlay::OverlayId>,
-    /// The quit question (MOD-57 M2 E4): opened by `global.quit` while an in-pane editor is
-    /// alive. Set by [`register_all`](crate::app::register_all), an id for `migration_overlay`'s
-    /// reason; `None` (a bare shell) quits at once, as M1 did.
-    pub quit_overlay: Option<crate::ui::overlay::OverlayId>,
+    /// The leave dialog (MOD-115 M2 D6, `R-TUI-18`; it replaced MOD-57 M2 E4's quit question):
+    /// opened by `global.quit` (`q`, `ctrl-c`) on every screen. Set by
+    /// [`register_all`](crate::app::register_all), an id for `migration_overlay`'s reason; `None`
+    /// (a bare shell) quits at once, as M1 did.
+    pub leave_overlay: Option<crate::ui::overlay::OverlayId>,
     /// The abort question (MOD-57 M2 R1 M-2): opened by `editor.abort` on the asking tab. Set by
     /// [`register_all`](crate::app::register_all), an id for `migration_overlay`'s reason; `None`
     /// (a bare shell) aborts at once, as M1 did.
@@ -409,7 +410,7 @@ impl App {
             ticks: 0,
             startup_overlay: None,
             migration_overlay: None,
-            quit_overlay: None,
+            leave_overlay: None,
             abort_overlay: None,
             replay_tab: None,
             reveal_tabs: Vec::new(),
@@ -646,7 +647,7 @@ impl App {
     /// offered.
     pub(super) fn action_for(&self, act: Act) -> Option<Action> {
         match act {
-            // MOD-57 M2 E4: asks first while an in-pane editor is alive.
+            // MOD-115 M2 D6: the leave dialog, always.
             Act::Quit => Some(self.request_quit()),
             Act::NextTab => Some(Action::Tab(TabAction::Next)),
             Act::PrevTab => Some(Action::Tab(TabAction::Prev)),
@@ -1044,12 +1045,15 @@ impl App {
     }
 
     /// The propagation chain (blueprint C.4, MOD-67 D6), stopping at the first consumer: the
-    /// in-pane editor (MOD-57), `ctrl-c`, the top overlay, the overlay's stack (`Stack::OVERLAY`
-    /// while unconverted), the modal swallow, the active tab, the tab's stack
-    /// (`Stack::BASE` while unconverted).
+    /// in-pane editor (MOD-57), the `[field]` translation (MOD-115 M2 D7), the top overlay, the
+    /// overlay's stack (`Stack::OVERLAY` while unconverted), the modal swallow, the active tab,
+    /// the tab's stack (`Stack::BASE` while unconverted). Each dispatch is recorded in the
+    /// history (MOD-115 M2 D5).
     ///
-    /// `ctrl-c` is checked here only: a bracketed paste has no key table
-    /// ([`on_paste`](Self::on_paste)), so a pasted `U+0003` never quits.
+    /// MOD-115 M2 D7: `ctrl-c` is `global.quit`'s default chord like any other, resolved through
+    /// the stacks: every overlay's stack has a quit layer (B4), so it opens the leave dialog from
+    /// every screen, and the dialog's `leave.confirm` takes the second. A bracketed paste has no
+    /// key table ([`on_paste`](Self::on_paste)), so a pasted `U+0003` never quits.
     pub fn on_key(&mut self, key: KeyEvent) {
         self.recorded(|app| app.dispatch_key(key));
     }
@@ -1063,9 +1067,9 @@ impl App {
         let chord = KeyChord::from_event(key);
 
         // MOD-57 P5, P6, M2 E1-E3: a live in-pane editor answers first. Focused, it takes every
-        // key, `ctrl-c` included (ANA-26 §6.4's one exception); on the asking tab, the editor's and
-        // the global keys only; on another tab, only `editor.focus`. `ctrl-c` and a modal
-        // overlay's keys take the path below.
+        // key, `ctrl-c` included (`R-TUI-10`'s terminal-pane clause; `editor.focus` is the way
+        // out); on the asking tab, the editor's and the global keys only; on another tab, only
+        // `editor.focus`. A modal overlay's keys take the path below.
         if self.editor.is_some() && self.editor_key(key, chord) {
             return;
         }
@@ -1081,13 +1085,6 @@ impl App {
             return;
         };
         let chord = KeyChord::from_event(key);
-
-        // `ctrl-c` quits before any overlay or view sees it (ANA-26 §6.4, MOD-67 D6). MOD-57's
-        // exception is the step above.
-        if chord == CTRL_C {
-            self.update(Action::Quit);
-            return;
-        }
 
         if let Some(id) = self.overlays.top().map(Overlay::id) {
             let origin = Origin::Overlay(id);
@@ -1339,8 +1336,12 @@ impl App {
             self.paint_hidden_note(frame, &areas);
         }
 
+        // MOD-115 M2 D6: the leave dialog names an open in-pane edit.
+        let open_edit = self.editor.is_some().then(|| self.editor_title());
         for overlay in self.overlays.iter() {
-            let ctx = self.ctx(Origin::Overlay(overlay.id()));
+            let ctx = self
+                .ctx(Origin::Overlay(overlay.id()))
+                .with_open_edit(open_edit);
             overlay.render(frame, area, &ctx);
         }
 
@@ -2240,6 +2241,112 @@ pub(crate) mod shell_tests {
         assert_eq!(
             app.history.peek_back().map(|loc| loc.label.as_str()),
             Some("Requirements \u{b7} list")
+        );
+    }
+
+    /// Registers the leave dialog, as `register_all` does.
+    pub(crate) fn leavable(app: &mut App) {
+        use crate::ui::overlay::LeaveDialog;
+        app.overlay_factories
+            .register(LeaveDialog::ID, || Box::new(LeaveDialog::new()));
+        app.leave_overlay = Some(LeaveDialog::ID);
+    }
+
+    /// A tab whose mode captures text and passes every key, as a form whose field passes a
+    /// chord does.
+    struct Capturing;
+
+    impl Tab for Capturing {
+        fn id(&self) -> TabId {
+            TabId("capturing")
+        }
+        fn title(&self) -> &str {
+            "Capturing"
+        }
+        fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+            Vec::new()
+        }
+        fn on_scope_change(&mut self, _scope: &Scope) {}
+        fn on_key(&mut self, _key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            Handled::Pass
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+        fn key_stack(&self) -> Option<Stack<'static>> {
+            Some(views::CAPTURE)
+        }
+    }
+
+    /// MOD-115 M2 D6, D7, `R-TUI-18`: `ctrl-c` is `global.quit` on every screen: from a tab, from
+    /// a text field and over every modal overlay it opens the leave dialog, and a second one
+    /// leaves. `q` opens it too; under it a second `q` opens no second dialog.
+    #[test]
+    fn ctrl_c_opens_the_leave_dialog_from_every_screen_and_a_second_leaves() {
+        use crate::ui::overlay::{
+            AbortConfirm, ConceptsSearch, LeaveDialog, MigrationPrompt, Overlay, QueueOverlay,
+            WaitingList, WorkspaceSwitcher,
+        };
+
+        let overlays: Vec<Option<fn() -> Box<dyn Overlay>>> = vec![
+            None,
+            Some(|| Box::new(WorkspaceSwitcher::new())),
+            Some(|| Box::new(ConceptsSearch::new())),
+            Some(|| Box::new(WaitingList::new())),
+            Some(|| Box::new(QueueOverlay::new())),
+            Some(|| Box::new(MigrationPrompt::new())),
+            Some(|| Box::new(AbortConfirm::new())),
+        ];
+        for capturing in [false, true] {
+            for overlay in &overlays {
+                let mut app = split_app();
+                if capturing {
+                    let (tx, _rx) = mpsc::unbounded_channel();
+                    app = App::new(tx);
+                    app.register_tab(Box::new(Capturing));
+                }
+                leavable(&mut app);
+                if let Some(make) = overlay {
+                    app.push_overlay(make());
+                }
+                let at = app.overlays.top().map(Overlay::id);
+                press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+                assert!(!app.should_quit, "{capturing} {at:?}: asked first");
+                assert_eq!(
+                    app.overlays.top().map(Overlay::id),
+                    Some(LeaveDialog::ID),
+                    "{capturing} {at:?}"
+                );
+                press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+                assert!(app.should_quit, "{capturing} {at:?}: the second leaves");
+            }
+        }
+        let mut app = split_app();
+        leavable(&mut app);
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+        assert_eq!(app.overlays.top().map(Overlay::id), Some(LeaveDialog::ID));
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+        assert_eq!(app.overlays.iter().count(), 1, "no second dialog");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.overlays.is_empty() && !app.should_quit, "Esc stays");
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.should_quit, "Enter leaves");
+    }
+
+    /// D6: the dialog names the open in-pane edit; without one it reads as nothing live once the
+    /// counts are known.
+    #[test]
+    fn the_leave_dialog_says_nothing_is_running_when_nothing_is() {
+        let mut app = split_app();
+        leavable(&mut app);
+        app.top_bar.waiting = Some(htui_worker::WaitingView::default());
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+        let buf = draw(&mut app, 100, 30);
+        let text: String = (0..30).map(|y| row(&buf, y)).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Nothing is running. Leave htui?"), "{text}");
+        assert!(
+            text.contains("Enter  leave") && text.contains("Esc  stay"),
+            "{text}"
         );
     }
 

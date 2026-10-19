@@ -12,8 +12,8 @@
 //! says work may be running and shows `–` for both counts.
 //!
 //! Every answer resolves through [`Keys`] on [`views::LEAVE`], and the chips name the chords in
-//! force. Shaped like the quit question it replaces: a centred, modal box sized to its text.
-//! Task 6 registers it and deletes `quit_confirm.rs`.
+//! force. Shaped like the quit question it replaced: a centred, modal box sized to its text.
+//! `register_all` registers it as `App::leave_overlay`.
 
 use crossterm::event::KeyEvent;
 use htui_core::model::{Scope, Status};

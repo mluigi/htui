@@ -298,7 +298,6 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
         "in the Requirements withdraw form",
         views::REQUIREMENTS_WITHDRAW,
     ),
-    ("in the quit question", views::QUIT_CONFIRM),
     ("in the abort question", views::ABORT_CONFIRM),
     (WHILE_EDITING, Stack::EDITOR_OPEN),
     // MOD-67 M5: the Backlog and Chat stacks, in strip order, after M4's (blueprint §4.3).
@@ -328,7 +327,7 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("in the queue overlay", views::QUEUE_OVERLAY),
     ("in the Hierarchy directory picker", views::HIERARCHY_PICKER),
     // MOD-115 M2 §1.5: the leave dialog, appended so every first-reported phrase is unchanged.
-    // Task 6 removes the quit question's entry with `quit_confirm.rs`.
+    // It replaced the quit question (T6), whose entry went with `quit_confirm.rs`.
     ("in the leave dialog", views::LEAVE),
 ];
 
@@ -414,8 +413,9 @@ mod tests {
             DECLARED[2],
             ("in the focused in-pane editor", Stack::EDITOR_FOCUSED)
         );
-        assert_eq!(DECLARED.len(), 83);
-        assert_eq!(DECLARED[82], ("in the leave dialog", views::LEAVE));
+        // MOD-115 M2 T6: the quit question's entry went with it.
+        assert_eq!(DECLARED.len(), 82);
+        assert_eq!(DECLARED[81], ("in the leave dialog", views::LEAVE));
         assert!(DECLARED.contains(&(WHILE_EDITING, Stack::EDITOR_OPEN)));
         let phrases: HashSet<&str> = DECLARED.iter().map(|(phrase, _)| *phrase).collect();
         assert_eq!(phrases.len(), DECLARED.len(), "a phrase is used twice");
@@ -516,9 +516,8 @@ mod tests {
         assert_eq!(keys.actions(Stack::EDITOR_FOCUSED, CTRL_C), []);
         assert_eq!(keys.actions(Stack::EDITOR_OPEN, CTRL_C), [Act::Quit]);
         assert_eq!(keys.actions(views::LEAVE, CTRL_C), [Act::LeaveConfirm]);
-        // The quit question has no quit layer: Task 6 replaces it with the leave dialog.
         for &(phrase, stack) in DECLARED {
-            if [Stack::EDITOR_FOCUSED, views::LEAVE, views::QUIT_CONFIRM].contains(&stack) {
+            if [Stack::EDITOR_FOCUSED, views::LEAVE].contains(&stack) {
                 continue;
             }
             assert_eq!(keys.actions(stack, CTRL_C), [Act::Quit], "{phrase}");

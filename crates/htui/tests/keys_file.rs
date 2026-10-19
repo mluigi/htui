@@ -575,8 +575,15 @@ mod app {
         harness.key("esc");
         assert!(harness.app().overlays.is_empty(), "`Esc` still closes it");
 
+        // MOD-115 M2 D6: the rebound quit opens the leave dialog, whose `Enter` leaves.
         harness.key("ctrl-y");
-        assert!(harness.app().should_quit, "`Ctrl+y` quits");
+        assert_eq!(
+            harness.app().overlays.top().map(|overlay| overlay.id()),
+            Some(htui::ui::overlay::LeaveDialog::ID),
+            "`Ctrl+y` asks first"
+        );
+        harness.key("enter");
+        assert!(harness.app().should_quit, "`Ctrl+y` leaves");
     }
 
     /// MOD-12 M3 R1 H1: the shell over a file that gives `ctrl-q` to quit starts, shows quit on
@@ -600,11 +607,13 @@ mod app {
         assert!(!harness.app().help_visible, "`?` closes the box");
 
         harness.key("ctrl-q");
-        assert!(
-            harness.app().overlays.is_empty(),
-            "`Ctrl+q` no longer opens the queue"
+        assert_eq!(
+            harness.app().overlays.top().map(|overlay| overlay.id()),
+            Some(htui::ui::overlay::LeaveDialog::ID),
+            "`Ctrl+q` no longer opens the queue: it opens the leave dialog (MOD-115 M2 D6)"
         );
-        assert!(harness.app().should_quit, "`Ctrl+q` quits");
+        harness.key("enter");
+        assert!(harness.app().should_quit, "`Ctrl+q` leaves");
     }
 }
 

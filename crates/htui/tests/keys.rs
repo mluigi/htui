@@ -143,11 +143,16 @@ async fn ctrl_c_quits_from_qdrant_browse() {
         "Qdrant is in browse mode, no field open: {frame}"
     );
 
+    // MOD-115 M2 D6: `ctrl-c` opens the leave dialog before the section sees it; a second
+    // one leaves.
     harness.key("ctrl-c");
-    assert!(
-        harness.app().should_quit,
-        "`ctrl-c` quits before the section sees it"
+    assert_eq!(
+        top(&mut harness),
+        Some(htui::ui::overlay::LeaveDialog::ID),
+        "`ctrl-c` asks first"
     );
+    harness.key("ctrl-c");
+    assert!(harness.app().should_quit, "the second `ctrl-c` leaves");
 }
 
 #[tokio::test]
@@ -167,9 +172,15 @@ async fn ctrl_c_quits_over_every_modal_overlay() {
         }
         assert_eq!(top(&mut harness), Some(expected), "`{opener}` opened it");
         harness.key("ctrl-c");
+        assert_eq!(
+            top(&mut harness),
+            Some(htui::ui::overlay::LeaveDialog::ID),
+            "`ctrl-c` opens the leave dialog over {expected:?}"
+        );
+        harness.key("ctrl-c");
         assert!(
             harness.app().should_quit,
-            "`ctrl-c` quits over {expected:?}"
+            "a second `ctrl-c` leaves over {expected:?}"
         );
     }
 
@@ -178,9 +189,15 @@ async fn ctrl_c_quits_over_every_modal_overlay() {
     harness.drive_to_end().await;
     assert_eq!(top(&mut harness), Some(MigrationPrompt::ID));
     harness.key("ctrl-c");
+    assert_eq!(
+        top(&mut harness),
+        Some(htui::ui::overlay::LeaveDialog::ID),
+        "`ctrl-c` opens the leave dialog over the migration prompt"
+    );
+    harness.key("ctrl-c");
     assert!(
         harness.app().should_quit,
-        "`ctrl-c` quits over the migration prompt"
+        "a second `ctrl-c` leaves over the migration prompt"
     );
 }
 

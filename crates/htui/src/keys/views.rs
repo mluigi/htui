@@ -2,7 +2,7 @@
 //!
 //! Each stack opens with the view's own layer ([`Layer::view`]: the mode's own acts plus the
 //! shared acts a wider layer offers, PA-3), except [`SETTINGS_TAB`], [`CAPTURE`],
-//! [`QUIT_CONFIRM`] and [`ABORT_CONFIRM`] (only `editor.abort`), which have none, and ends
+//! and [`ABORT_CONFIRM`] (only `editor.abort`), which have none, and ends
 //! with the global layer: unfiltered in a
 //! browse mode, [`Layer::modal`] in a capturing or confirming one (D5). Layer order is fixed:
 //! view, `settings`, `confirm`, `form`, `common`, `list`, `overlay`, `global` (only the layers
@@ -517,11 +517,6 @@ pub const MIGRATION: Stack<'static> = Stack::new(&[
     QUIT,
     HELP,
 ]);
-
-/// The quit question (MOD-57 M2 E4): `confirm.yes` quits, `confirm.no` and `overlay.close` keep
-/// the edit, `global.help` toggles the box. No view layer: the question has no keys of its own,
-/// so `[confirm]`, `[overlay]` and `[global] help` rebind it, and no `[quit]` table exists.
-pub const QUIT_CONFIRM: Stack<'static> = Stack::new(&[CONFIRM, OVERLAY, HELP]);
 
 /// The abort question (MOD-57 M2 R1 M-2): `editor.abort` again aborts; every other key keeps the
 /// edit, so no other layer: not even `overlay.close` or `global.help` act there. MOD-115 M2 B4:
@@ -1070,7 +1065,6 @@ mod tests {
         Stack::EDITOR_OPEN,
         SETTINGS_TAB,
         CAPTURE,
-        QUIT_CONFIRM,
         ABORT_CONFIRM,
     ];
 
@@ -1100,7 +1094,6 @@ mod tests {
         source!("ui/overlay/concepts_search.rs"),
         source!("ui/overlay/migration_prompt.rs"),
         source!("ui/overlay/queue.rs"),
-        source!("ui/overlay/quit_confirm.rs"),
         source!("ui/overlay/leave.rs"),
         source!("ui/overlay/waiting_list.rs"),
         source!("ui/overlay/workspace_switcher.rs"),
@@ -1210,7 +1203,6 @@ mod tests {
         CONCEPTS_QUERY,
         SWITCHER,
         MIGRATION,
-        QUIT_CONFIRM,
         ABORT_CONFIRM,
         WAITING_LIST,
         LIBRARY_BROWSE,
@@ -1382,16 +1374,15 @@ mod tests {
         );
         assert_eq!(resolve(SWITCHER, "enter"), [Act::SwitcherSwitch]);
         assert_eq!(resolve(SWITCHER, "2"), []);
-        assert_eq!(resolve(QUIT_CONFIRM, "y"), [Act::ConfirmYes]);
-        assert_eq!(resolve(QUIT_CONFIRM, "n"), [Act::ConfirmNo]);
-        assert_eq!(
-            resolve(QUIT_CONFIRM, "esc"),
-            [Act::ConfirmNo, Act::OverlayClose]
-        );
-        assert_eq!(resolve(QUIT_CONFIRM, "?"), [Act::Help]);
-        assert_eq!(resolve(QUIT_CONFIRM, "f1"), [Act::Help]);
-        for spec in ["q", "Y", "enter"] {
-            assert_eq!(resolve(QUIT_CONFIRM, spec), [], "{spec}");
+        // MOD-115 M2 D6: the leave dialog (it replaced the quit question).
+        assert_eq!(resolve(LEAVE, "enter"), [Act::LeaveConfirm]);
+        assert_eq!(resolve(LEAVE, "ctrl-c"), [Act::LeaveConfirm]);
+        assert_eq!(resolve(LEAVE, "esc"), [Act::LeaveStay]);
+        assert_eq!(resolve(LEAVE, "n"), [Act::LeaveStay]);
+        assert_eq!(resolve(LEAVE, "?"), [Act::Help]);
+        assert_eq!(resolve(LEAVE, "f1"), [Act::Help]);
+        for spec in ["q", "y", "Y"] {
+            assert_eq!(resolve(LEAVE, spec), [], "{spec}");
         }
     }
 

@@ -2243,8 +2243,7 @@ pub static VIEW_DEFAULTS: &[(Context, Act, &[&str])] = &[
 /// (`every_allow_list_entry_is_demanded`).
 pub static SHADOWING: &[(Act, Act)] = &[
     // migration_prompt.rs:97 + VIEW_DEFAULTS: `[migration] no` derives ["n", "esc", "N"], and
-    // `Esc` is also overlay.close below it. Both close the prompt, nothing applied. And the quit
-    // question (`views::QUIT_CONFIRM`): `Esc` is `confirm.no` there too.
+    // `Esc` is also overlay.close below it. Both close the prompt, nothing applied.
     (Act::ConfirmNo, Act::OverlayClose),
     // graph.rs:712: the Graph pane answers `Enter` itself (re-root), always; the Backlog's
     // replay miss never fires there (MOD-67 M5 PA-2).

@@ -5,13 +5,14 @@
 //! this box instead (`App::request_abort`), and only `editor.abort` **again** aborts
 //! ([`Action::AbortEdit`]), on a press: a held abort key's repeats are consumed and leave the
 //! question up. A `y` cannot confirm it: every other key closes the box, keeps the
-//! edit as it was and goes nowhere else, so nano's `ctrl-x`, `y` keeps the edit. `ctrl-c` never
-//! reaches it: the shell's hard quit (C3) runs before any overlay sees a key. A paste under it
+//! edit as it was and goes nowhere else, so nano's `ctrl-x`, `y` keeps the edit. `global.quit`
+//! (`ctrl-c`) is passed to the shell, whose quit layer opens the leave dialog over the question
+//! (MOD-115 M2 B4); `Esc` there comes back to it. A paste under it
 //! is dropped (it reaches neither the editor nor a tab) and the question stays. An editor that
 //! exits under it takes it along (`App::on_pane_event`), and so does a tab move off the asking
 //! tab (`App::update_tab`).
 //!
-//! Fixed text, shaped like [`QuitConfirm`](super::QuitConfirm): the factory takes no argument.
+//! Fixed text, shaped like [`LeaveDialog`](super::LeaveDialog): the factory takes no argument.
 
 use crossterm::event::{KeyEvent, KeyEventKind};
 use htui_core::model::Scope;
@@ -87,11 +88,12 @@ impl Overlay for AbortConfirm {
 
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let chord = KeyChord::from_event(key);
-        if ctx
-            .keys()
-            .actions(views::ABORT_CONFIRM, chord)
-            .contains(&Act::EditorAbort)
-        {
+        let acts = ctx.keys().actions(views::ABORT_CONFIRM, chord);
+        if acts.first() == Some(&Act::Quit) {
+            // MOD-115 M2 B4: the shell's quit layer opens the leave dialog.
+            return Handled::Pass;
+        }
+        if acts.contains(&Act::EditorAbort) {
             // M2 R2 LOW-1: a held abort key repeats the press that opened this box; only a fresh
             // press confirms, and a repeat leaves the question up.
             if key.kind == KeyEventKind::Press {

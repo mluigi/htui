@@ -764,7 +764,7 @@ mod tests {
     }
 
     /// An overlay's stack labels the chips: `F9 about` is gone under the waiting list, the
-    /// switcher, the migration prompt and the quit question, `? keys` stays; under a tab's
+    /// switcher, the migration prompt and the leave dialog, `? keys` stays; under a tab's
     /// modal form `F9 about` stays and help is `F1`.
     #[test]
     fn the_chips_follow_the_active_key_stack() {
@@ -777,7 +777,7 @@ mod tests {
             views::WAITING_LIST,
             views::SWITCHER,
             views::MIGRATION,
-            views::QUIT_CONFIRM,
+            views::LEAVE,
         ] {
             let text = at(stack);
             assert!(!text.contains("about") && !text.contains("F9"), "{text}");

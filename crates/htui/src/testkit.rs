@@ -1091,8 +1091,15 @@ mod tests {
         harness.key("esc");
         assert!(harness.app().overlays.is_empty());
 
-        // With no overlay left, the global table sees the key again.
+        // With no overlay left, the global table sees the key again: `q` opens the leave dialog
+        // (MOD-115 M2 D6), whose `Enter` leaves.
         harness.key("q");
+        assert!(!harness.app().should_quit);
+        assert_eq!(
+            harness.app().overlays.top().map(Overlay::id),
+            Some(crate::ui::overlay::LeaveDialog::ID)
+        );
+        harness.key("enter");
         assert!(harness.app().should_quit);
     }
 }
