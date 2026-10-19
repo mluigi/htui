@@ -633,7 +633,9 @@ async fn the_mirror_counts_tool_calls_like_postgres() {
 /// MOD-69 plan D2: the mirror's `waiting_candidates` (three runtime reads over `item`, `run` and
 /// `run_step`) answers Postgres' rows whole after a pass: a gate park, a selection park on a
 /// minted item, a blocked minted item whose run is stopped (MOD-125 D2), FEAT-3 blocked behind its
-/// queued run, a blocked `agy` item, and the fixture's two candidates.
+/// queued run, a blocked `agy` item, and the fixture's two candidates. With that stopped run in
+/// the scope, the mirror's `active_runs` answers Postgres' count, which is the scope's runs on the
+/// top bar ([`RunStatus::on_top_bar`]): live, less `stopped`.
 #[tokio::test]
 async fn the_mirror_lists_waiting_candidates_like_postgres() {
     use htui_core::model::{
@@ -890,6 +892,33 @@ async fn the_mirror_lists_waiting_candidates_like_postgres() {
             .collect::<Vec<_>>(),
         vec![(stopped_run, RunStatus::Stopped, 1)],
         "the stopped item carries its stopped run and the run's stopped step"
+    );
+    let statuses: Vec<RunStatus> =
+        sqlx::query_scalar("SELECT status FROM run WHERE project_id = ANY($1)")
+            .bind(
+                scope
+                    .project_ids
+                    .iter()
+                    .map(|id| id.as_uuid())
+                    .collect::<Vec<_>>(),
+            )
+            .fetch_all(&db.pool)
+            .await
+            .expect("read the scope's run statuses");
+    assert!(
+        statuses.contains(&RunStatus::Stopped),
+        "control: the scope holds a stopped run"
+    );
+    let active = cache.active_runs(&scope).await.expect("mirror active_runs");
+    assert_eq!(
+        active,
+        store.active_runs(&scope).await.expect("pg active_runs"),
+        "the mirror and Postgres count the top bar's runs alike"
+    );
+    assert_eq!(
+        active,
+        statuses.iter().filter(|status| status.on_top_bar()).count(),
+        "the count is the scope's runs on the top bar: the stopped run is not one"
     );
     let feat_3 = mirrored
         .iter()
