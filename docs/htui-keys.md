@@ -4,14 +4,18 @@ Every key htui binds by default, exactly as `htui --default-keys --print-keys` p
 complete `keys.toml`. To change a key, copy its line into `keys.toml` in htui's configuration
 directory and edit it there; list only what you change (README, [Changing keys](../README.md#changing-keys)).
 
-A `[global]` chord is reserved on every screen that offers it: binding it to an action in a
-narrower table fails validation (htui exits with status 2 and names the clash and the screen). For
-example `global.about` (the about panel) owns `f9`, so `[list] down = ["f9"]` is refused: move that
-action to a free chord, or rebind the global action first.
+In a `version = 2` file a `[global]` chord is reserved on every screen that offers it: binding it
+to an action in a narrower table fails validation (htui exits with status 2 and names the clash and
+the screen). For example `global.about` (the about panel) owns `f9`, so `[list] down = ["f9"]` is
+refused: move that action to a free chord, or rebind the global action first. A file without
+`version`, or with `version = 1`, gets the same error for a chord that was already global before
+version 2, such as `f9`; a global chord version 2 added, such as `ctrl-pgdn` or `tab`, gives way to
+it with a notice instead.
 
-`Esc` is never configurable: a key file cannot list it, and every row marked `Esc always` keeps it
-whatever its list says (`[]` unbinds only the row's other chords). A `version = 1` file that lists
-`Esc` on such a row still loads. `ctrl-c` binds like any key: by default the first press opens the
+`Esc` is never configurable: a `version = 2` file cannot list it, and every row marked `Esc always`
+keeps it whatever its list says (`[]` unbinds only the row's other chords). A `version = 1` file
+that lists `Esc` on such a row still loads; `Esc` on any other row is refused in either version.
+`ctrl-c` binds like any key: by default the first press opens the
 leave dialog (`global.quit`) and a second one leaves (`leave.confirm`). htui refuses a file that
 leaves `global.quit` or `leave.confirm` with no chord, and likewise `leave.stay`, `field.cancel`,
 `overlay.close` and `editor.focus`.

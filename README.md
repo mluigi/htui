@@ -226,11 +226,13 @@ close = ["f2"]
 
 Every key is an action you can rebind, the keys of a text field and of a choice included; only a
 character typed into a text field is text. `Esc` is the exception: it is never configurable, a
-file cannot list it, and every action marked `Esc always` in `--print-keys` keeps it (`close =
-["f2"]` above closes on `F2` and `Esc`). `ctrl-c` binds like any key: by default it opens the leave
-dialog and a second press leaves, and htui refuses a file that leaves no way to leave it. A file
-without `version`, or with `version = 1`, was written before these rules and keeps loading: where a
-newer default takes one of its keys, the default gives way with a notice.
+`version = 2` file cannot list it, and every action marked `Esc always` in `--print-keys` keeps it
+(`close = ["f2"]` above closes on `F2` and `Esc`). `ctrl-c` binds like any key: by default it opens
+the leave dialog and a second press leaves, and htui refuses a file that leaves no way to leave it.
+A file without `version`, or with `version = 1`, was written before these rules and two of them do
+not apply to it: it may list `Esc` on a row marked `Esc always` (`Esc` on any other row is refused in
+either version), and where a newer default takes one of its keys, the default gives way with a
+notice.
 
 Within one table, your keys win over the defaults you leave alone: if a key you list is the
 default of another action in the same table, that action gives it up, and is unbound if it had
@@ -239,7 +241,7 @@ no other key. htui starts anyway and says so on stderr, with the file's path and
 `htui --print-keys` marks that action's line `(unbound by quit)`. List the action with another
 key to keep it.
 
-htui refuses to start on an invalid file and names every bad line, as in
+htui refuses to start on an invalid file and names every bad line, as in (a `version = 2` file)
 `keys.toml:3: [overlay] close = "esc": esc always closes, cancels or goes back and cannot be bound`;
 `htui --default-keys` starts with the default keys anyway. Two actions you list with the same key
 are an error. In a `version = 2` file a default gives way to a key from another table in one case
@@ -268,8 +270,8 @@ A global key must not be a key that Settings, Skills, Requirements, the Backlog,
 already uses: `[global] quit = ["x"]` is refused, because `x` cancels in **Settings › Agents** and
 rejects a step in the Backlog's **Runs**; so is `[global] quit = ["f"]`, because `f` opens the
 Backlog filter. A shared table is checked the same way on every screen that uses it:
-`[list] down = ["G"]` is refused, because `G` jumps to the bottom in Chat, and so is
-`[pane] next_subtab = ["tab"]`, because `Tab` moves to the next pane. Some Settings
+`[list] down = ["G"]` is refused, because `G` jumps to the bottom in Chat, and in a `version = 2`
+file so is `[pane] next_subtab = ["tab"]`, because `Tab` moves to the next pane. Some Settings
 forms also move between fields with `Down` / `Up`. A `[form] next_field` line changes them too, and
 they keep `Down`; write `[settings.agents] next_field = [...]` to replace it in that form alone.
 While a text field takes typing, a printable key is text; the field's other keys are the `[field]`

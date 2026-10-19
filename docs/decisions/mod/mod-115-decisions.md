@@ -7,7 +7,7 @@
 `.claude/plans/mod-115-tui-shell-m1.plan.md` and `.claude/plans/mod-115-tui-shell-m1.blueprint.md`;
 M2 `.claude/plans/mod-115-tui-shell-m2.plan.md` and
 `.claude/plans/mod-115-tui-shell-m2.blueprint.md` (the blueprint's B1-B7 and PLAN DEVIATIONS
-D-1..D-15 are the record of what was built where it differs from the plan).
+D-1..D-16 are the record of what was built where it differs from the plan).
 **User guide:** README "Changing keys"; `docs/htui-keys.md` (every action and its default,
 generated).
 
@@ -15,7 +15,8 @@ MOD-115 is still open in `HANDOFF.md`, so this is not its close-out write-up: th
 under `docs/decisions/mod/` with the item's own name when the item closes
 (`.claude/rules/workflow-docs.md`, lifecycle step 3), and it folds this file in. A write-up with
 the item's name needs an index line in `DECISIONS.md`, and an index line for an open item is a
-reused ID, so the decisions so far live here. `R-TUI-10` was amended from this record (`docs/REQUIREMENTS.md`, 2026-10-18).
+reused ID, so the decisions so far live here (blueprint D-16). `R-TUI-10` was amended from this
+record (`docs/REQUIREMENTS.md`, 2026-10-18).
 
 ## Milestone 1 (by reference)
 
@@ -51,7 +52,9 @@ hidden. The `HANDOFF.md` phase 1 note summarises the milestone.
   receives `ctrl-c`; `editor.focus` is the way out.
 - **MD3 - the clash rule stays.** A `[global]` chord cannot be bound to an action in a narrower
   table wherever a screen offers both; the error names the screen (`[list] down = ["f9"]`: `"f9"
-  is already global.about (default) in Settings > Agents`). M1's `F9` note is this rule.
+  is already global.about (default) in Settings > Agents`). M1's `F9` note is this rule. Under
+  MD4 a version-1 file is held to it only for chords that were global before M2: a global chord
+  M2 added (`ctrl-pgdn` on `global.next_tab`, `tab` on `global.next_pane`) gives way with a notice.
 - **MD4 - existing overrides keep loading.** `keys.toml` is `version = 2`; a file without
   `version` is version 1. In a version-1 file a default M2 added or changed (`since: 2`) gives
   way to the file's entry wherever a declared stack meets them, with the existing notice; a
