@@ -101,7 +101,8 @@ async fn ctrl_c_quits_from_connection_browse_with_a_stored_dsn() {
     .with_tab(Box::new(BacklogTab::new()))
     .with_tab(Box::new(SettingsTab::with_sections(vec![Box::new(
         ConnectionSection::new(),
-    )])));
+    )])))
+    .with_leave_dialog();
     harness.settle().await;
     harness.app().update(Action::Tab(TabAction::FocusSection(
         SettingsTab::ID,
@@ -114,16 +115,21 @@ async fn ctrl_c_quits_from_connection_browse_with_a_stored_dsn() {
         "the section is in browse mode, no field open: {frame}"
     );
 
+    // MOD-115 M2 D6: `ctrl-c` opens the leave dialog before the section sees it; a second one
+    // leaves.
     harness.key("ctrl-c");
-    assert!(
-        harness.app().should_quit,
-        "`ctrl-c` quits before the section sees it"
+    assert_eq!(
+        top(&mut harness),
+        Some(htui::ui::overlay::LeaveDialog::ID),
+        "`ctrl-c` asks before the section sees it"
     );
     let frame = harness.render();
     assert!(
         !frame.contains("Remove the DSN from the keyring?"),
         "the modifier-blind `c` arm never ran: {frame}"
     );
+    harness.key("ctrl-c");
+    assert!(harness.app().should_quit, "the second `ctrl-c` leaves");
 
     cache.close().await;
     drop(root);
@@ -534,10 +540,11 @@ async fn a_capturing_skills_view_keeps_tab_and_offers_no_switch() {
 
 #[tokio::test]
 async fn a_capturing_section_shows_the_filtered_status_line_and_box() {
-    let mut harness =
-        Harness::demo().with_tab(Box::new(SettingsTab::with_sections(vec![Box::new(
+    let mut harness = Harness::demo()
+        .with_tab(Box::new(SettingsTab::with_sections(vec![Box::new(
             StackProbe,
-        )])));
+        )])))
+        .with_leave_dialog();
     harness.drive_to_end().await;
     assert_eq!(
         status_line(&mut harness),
@@ -562,8 +569,15 @@ async fn a_capturing_section_shows_the_filtered_status_line_and_box() {
     harness.key("f1");
     assert!(!harness.app().help_visible, "`F1` closes it");
 
+    // MOD-115 M2 D6: `ctrl-c` still reaches `global.quit`: the leave dialog, then leaving.
     harness.key("ctrl-c");
-    assert!(harness.app().should_quit, "`ctrl-c` still quits");
+    assert_eq!(
+        top(&mut harness),
+        Some(htui::ui::overlay::LeaveDialog::ID),
+        "`ctrl-c` asks first"
+    );
+    harness.key("ctrl-c");
+    assert!(harness.app().should_quit, "the second `ctrl-c` leaves");
 }
 
 #[tokio::test]

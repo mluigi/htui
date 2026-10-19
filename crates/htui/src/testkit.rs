@@ -524,6 +524,19 @@ impl Harness {
         self
     }
 
+    /// Registers the leave dialog (MOD-115 M2 D6), as [`register_all`](crate::app::register_all)
+    /// does: `global.quit` then opens it rather than leaving at once, and its `leave.confirm` (a
+    /// second `ctrl-c`, `Enter`) leaves. A harness without it leaves on the first quit.
+    #[must_use]
+    pub fn with_leave_dialog(mut self) -> Self {
+        use crate::ui::overlay::LeaveDialog;
+        self.app
+            .overlay_factories
+            .register(LeaveDialog::ID, || Box::new(LeaveDialog::new()));
+        self.app.leave_overlay = Some(LeaveDialog::ID);
+        self
+    }
+
     /// Names the tab an `Action::Replay` focuses and addresses its rows to, as
     /// [`register_all`](crate::app::register_all) names it.
     ///
