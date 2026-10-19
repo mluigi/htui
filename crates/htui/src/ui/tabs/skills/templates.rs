@@ -1434,6 +1434,12 @@ mod tests {
 
     use super::*;
 
+    /// The tree's width, borders included: two spaces, the name fitted to [`NAME_WIDTH`] cells,
+    /// ` v`, a head of up to three digits, a space and the role make at most 28 cells. The view
+    /// draws the Skills tab's shared layout (`library::LAYOUT`, MOD-115 M2 D2), which
+    /// `the_browse_frame_claims_the_32_cell_list` pins to this width.
+    const LIST_WIDTH: u16 = 32;
+
     /// MOD-67 M6 D4: the Templates notices name the key in force, and drop it unbound.
     #[test]
     fn the_templates_notices_name_their_key_or_none() {
@@ -2412,11 +2418,3 @@ mod tests {
         );
     }
 }
-
-/// The tree's width, borders included: two spaces, the name fitted to [`NAME_WIDTH`] cells, ` v`,
-/// a head of up to three digits, a space and the role make at most 28 cells. The view draws the
-/// Skills tab's shared layout (`library::LAYOUT`, MOD-115 M2 D2); a test pins it to this width.
-/// After the tests module, so the source guards that read the file up to its first
-/// `#[cfg(test)]` (`keys/views.rs`) still read all of it.
-#[cfg(test)]
-const LIST_WIDTH: u16 = 32;
