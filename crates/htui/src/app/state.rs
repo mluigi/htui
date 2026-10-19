@@ -21,7 +21,7 @@ use crate::keys::translate::translate;
 use crate::keys::{Act, Context, HelpLine, KeyChord, Keys, Stack};
 use crate::store_worker::{Origin, RequestEnvelope, Seq, StoreRequest};
 use crate::ui::cells::clip_line;
-use crate::ui::header::{self, Flash};
+use crate::ui::header::{self, Flash, ShellChips};
 use crate::ui::kit::empty::{NextStep, placeholder};
 use crate::ui::kit::pane::{Focus, paint_bottom_hints, paint_bottom_note, paint_focus};
 use crate::ui::overlay::{Overlay, OverlayRegistry, OverlayStack};
@@ -1197,6 +1197,47 @@ impl App {
             })
     }
 
+    /// The header's shell chips (MOD-115 M2 §8, `R-TUI-1`): `⌫ back to <place>` while there is
+    /// somewhere back, `Alt→ forward` while there is somewhere forward, each labelled with the
+    /// first chord that reaches its act through the stack holding the keyboard (no chip where
+    /// none does), and the active list + detail tab's layout (`· zoom` while zoomed).
+    #[must_use]
+    pub(super) fn shell_chips(&self) -> ShellChips {
+        let stack = self.active_stack().unwrap_or(Stack::BASE);
+        let back = self
+            .history
+            .peek_back()
+            .zip(self.keys.reachable_label(stack, Act::HistoryBack))
+            .map(|(loc, key)| {
+                (
+                    format!("{key} back to {}", loc.label),
+                    format!("{key} back"),
+                )
+            });
+        let forward = self
+            .history
+            .can_forward()
+            .then(|| self.keys.reachable_label(stack, Act::HistoryForward))
+            .flatten()
+            .map(|key| format!("{key} forward"));
+        let layout = self
+            .tabs
+            .active()
+            .and_then(|tab| self.layout_of(tab))
+            .map(|layout| {
+                if layout.zoom {
+                    format!("{} \u{b7} zoom", layout.preset.label())
+                } else {
+                    layout.preset.label().to_owned()
+                }
+            });
+        ShellChips {
+            back,
+            forward,
+            layout,
+        }
+    }
+
     /// The header's flash (MOD-115): what used to be the status line's text, now on the right of
     /// the header. The first of the last error ([`App::status`], error style), the in-pane
     /// editor's line ([`App::editor_status`], dim) and another tab's `editing in <Tab> · ...`
@@ -1250,6 +1291,7 @@ impl App {
         let chrome = layout::chrome_with(area, about.is_some());
 
         let flash = self.flash();
+        let chips = self.shell_chips();
         // M1 wires no mouse handler to the header's hit rects.
         let _hits = header::render(
             frame,
@@ -1261,6 +1303,7 @@ impl App {
             // The chips are labelled through the stack that holds the keyboard, so `F9 about`
             // is not offered under an overlay that does not take it.
             self.active_stack().unwrap_or(Stack::BASE),
+            &chips,
             &self.theme,
         );
         if let (Some(panel), Some((tab, text))) = (chrome.about, about) {
@@ -2348,6 +2391,40 @@ pub(crate) mod shell_tests {
             text.contains("Enter  leave") && text.contains("Esc  stay"),
             "{text}"
         );
+    }
+
+    /// §8: the header names the place back, the way forward and the layout, with the keys in
+    /// force.
+    #[test]
+    fn the_header_names_the_way_back_the_way_forward_and_the_layout() {
+        let mut app = split_app();
+        app.register_tab(Box::new(SplitTab::new(
+            TabId("requirements"),
+            "Requirements",
+        )));
+        let header = |app: &mut App| row(&draw(app, 220, 30), 0);
+        let text = header(&mut app);
+        assert!(text.contains("list+detail"), "{text}");
+        assert!(!text.contains("back"), "{text}");
+        press(&mut app, KeyCode::Char('z'), KeyModifiers::NONE);
+        assert!(header(&mut app).contains("list+detail \u{b7} zoom"));
+        press(&mut app, KeyCode::Char('2'), KeyModifiers::NONE);
+        let text = header(&mut app);
+        assert!(
+            text.contains("\u{232b} back to Backlog \u{b7} list"),
+            "{text}"
+        );
+        assert!(!text.contains("forward"), "{text}");
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        let text = header(&mut app);
+        assert!(text.contains("Alt\u{2192} forward"), "{text}");
+        // A rebound key labels the chip; an unbound one drops it.
+        app.keys = crate::keys::load_str("version = 2\n[history]\nforward = [\"f7\"]\n")
+            .expect("the file loads");
+        assert!(header(&mut app).contains("F7 forward"));
+        app.keys = crate::keys::load_str("version = 2\n[history]\nforward = []\n")
+            .expect("the file loads");
+        assert!(!header(&mut app).contains("forward"));
     }
 
     /// A single-pane tab claims nothing: no claim is kept, and the frame is the M1 one.

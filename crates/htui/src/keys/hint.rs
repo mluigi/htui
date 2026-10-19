@@ -106,6 +106,21 @@ impl Keys {
         self.labels(stack, act).into_iter().next()
     }
 
+    /// MOD-115 M2 §8: the first chord of `act` through `stack` that its layer admits and that
+    /// reaches it (`act` is the chord's first candidate, so no narrower act takes it), as
+    /// [`KeyChord::short_label`] writes it: the header's `⌫ back` / `Alt→ forward` chips. `None`
+    /// when no chord reaches it.
+    #[must_use]
+    pub fn reachable_label(&self, stack: Stack<'_>, act: Act) -> Option<String> {
+        let (layer, row) = self.resolve_row(stack, act)?;
+        row.chords
+            .iter()
+            .copied()
+            .filter(|chord| layer.admits_chord(*chord))
+            .find(|chord| self.actions(stack, *chord).first() == Some(&act))
+            .map(|chord| chord.short_label())
+    }
+
     /// Every chord of `act` through `stack` that its layer admits, as labels (MOD-67 D9).
     #[must_use]
     pub fn labels(&self, stack: Stack<'_>, act: Act) -> Vec<String> {

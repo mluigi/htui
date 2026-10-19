@@ -132,6 +132,33 @@ impl KeyChord {
         }
         out
     }
+
+    /// The chord as the header's chips write it (MOD-115 M2 D-12): `Backspace` is `⌫`, an arrow
+    /// is `←→↑↓` after its modifiers with no `+` (`Alt←`, `Ctrl→`); everything else is
+    /// [`label`](Self::label).
+    #[must_use]
+    pub fn short_label(&self) -> String {
+        let glyph = match self.code {
+            KeyCode::Backspace => "\u{232b}",
+            KeyCode::Left => "\u{2190}",
+            KeyCode::Right => "\u{2192}",
+            KeyCode::Up => "\u{2191}",
+            KeyCode::Down => "\u{2193}",
+            _ => return self.label(),
+        };
+        let mut out = String::new();
+        for (modifier, name) in [
+            (KeyModifiers::CONTROL, "Ctrl"),
+            (KeyModifiers::ALT, "Alt"),
+            (KeyModifiers::SHIFT, "Shift"),
+        ] {
+            if self.mods.contains(modifier) {
+                out.push_str(name);
+            }
+        }
+        out.push_str(glyph);
+        out
+    }
 }
 
 /// `ctrl-c`: the default `global.quit`/`leave.confirm` chord (MOD-115 M2 MD2), bound and
@@ -1041,5 +1068,24 @@ mod tests {
         assert_eq!(parse("esc"), ESC);
         assert!(parse("alt-esc").is_esc());
         assert!(!parse("enter").is_esc());
+    }
+
+    /// MOD-115 M2 D-12: the header's chips write `⌫`, `Alt←` and `Alt→`; a key without a short
+    /// form keeps its label.
+    #[test]
+    fn the_short_label_draws_backspace_and_the_arrows() {
+        let short = |spec: &str| {
+            KeyChord::parse_strict(spec)
+                .unwrap_or_else(|error| panic!("{spec}: {error:?}"))
+                .short_label()
+        };
+        assert_eq!(short("backspace"), "\u{232b}");
+        assert_eq!(short("alt-left"), "Alt\u{2190}");
+        assert_eq!(short("alt-right"), "Alt\u{2192}");
+        assert_eq!(short("ctrl-up"), "Ctrl\u{2191}");
+        assert_eq!(short("down"), "\u{2193}");
+        assert_eq!(short("ctrl-pgdn"), "Ctrl+PgDn");
+        assert_eq!(short("f2"), "F2");
+        assert_eq!(short("q"), "q");
     }
 }
