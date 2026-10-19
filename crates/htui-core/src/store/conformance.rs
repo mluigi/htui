@@ -7637,6 +7637,9 @@ async fn a_run_without_a_workspace_is_never_gated<S: WriteStore>(store: &S) {
 /// the sweep's own write the run moves `running -> stopped` with its `running` step, its lease is
 /// released as `release_lease` releases it, and it is left out of the answer; an unscoped run
 /// abandoned beside it is adopted as before. A second sweep finds nothing.
+///
+/// X claims both runs for a zero TTL and never releases them, so X still owns the lapsed lease
+/// when the sweep runs: only the settlement's own release can make X's heartbeat on A fail.
 async fn adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped<S: WriteStore>(
     store: &S,
 ) {
@@ -7649,13 +7652,17 @@ async fn adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped<S: Wri
     for run in [a, b] {
         assert_eq!(
             store
-                .claim_run(run, ids::BOX, x, at, LEASE)
+                .claim_run(run, ids::BOX, x, at, TimeDelta::zero())
                 .await
                 .expect(CASE),
             Claim::Admitted,
-            "{CASE}: X claims A and B"
+            "{CASE}: X claims A and B, for no time at all"
         );
     }
+    let claimed_expiry = run_row(CASE, store, a)
+        .await
+        .lease_expires_at
+        .expect("the claim stamps an expiry");
     let specs = [new_run_step(a, 0, 0, 0), new_run_step(a, 1, 0, 0)];
     let [done, running] = specs.each_ref().map(|spec| spec.id);
     for spec in specs {
@@ -7677,12 +7684,6 @@ async fn adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped<S: Wri
         .stop_workspace(workspace, StopMode::Graceful, ids::USER, at)
         .await
         .expect(CASE);
-    for run in [a, b] {
-        assert!(
-            store.release_lease(run, x).await.expect(CASE),
-            "{CASE}: X abandons its lease"
-        );
-    }
 
     let adopted = store.adopt_runs(ids::BOX, y, LEASE).await.expect(CASE);
     assert_eq!(
@@ -7697,8 +7698,10 @@ async fn adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped<S: Wri
         "{CASE}: the stopped workspace's run is settled as stopped"
     );
     assert!(
-        settled.lease_expires_at.is_some(),
-        "{CASE}: the released lease keeps its expiry"
+        settled
+            .lease_expires_at
+            .is_some_and(|until| until >= claimed_expiry),
+        "{CASE}: the released lease's expiry is the settlement's clock, never before the claim's"
     );
     assert_eq!(
         settled.finished_at, None,
@@ -7709,12 +7712,14 @@ async fn adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped<S: Wri
         (Some(ids::BOX), Some(ids::BOX)),
         "{CASE}: the executing box and the lease's box are kept"
     );
-    for owner in [y, x] {
-        assert!(
-            !store.refresh_lease(a, owner, LEASE).await.expect(CASE),
-            "{CASE}: nobody holds the settled run's lease"
-        );
-    }
+    assert!(
+        !store.refresh_lease(a, y, LEASE).await.expect(CASE),
+        "{CASE}: the sweeper does not hold the settled run's lease"
+    );
+    assert!(
+        !store.refresh_lease(a, x, LEASE).await.expect(CASE),
+        "{CASE}: the dead owner no longer holds the settled run's lease"
+    );
     assert_eq!(
         step_row(CASE, store, a, running).await.status,
         StepStatus::Stopped,
