@@ -113,10 +113,10 @@ pub trait Tab {
     /// clicks and seam drags) and nothing is drawn over it. Defaulted to `false`, so no other tab
     /// changes: only the Backlog answers, for its Runs pane's flow view.
     ///
-    /// MOD-74 review L1: a loss used to be only the shell's on-to-off capture edge. Since list
-    /// + detail tabs keep capture on across a tab switch, the shell tracks the tab whose own
-    /// gesture holds the mouse and tells every tab when it changes too (`App::mouse_capture`), so
-    /// the review-L3 stale anchor stays gone.
+    /// MOD-74 review L1: a loss used to be only the shell's on-to-off capture edge. Since the
+    /// tabs with a list and a detail keep capture on across a tab switch, the shell tracks the
+    /// tab whose own gesture holds the mouse and tells every tab when it changes too
+    /// (`App::mouse_capture`), so the review-L3 stale anchor stays gone.
     fn wants_mouse(&self) -> bool {
         false
     }

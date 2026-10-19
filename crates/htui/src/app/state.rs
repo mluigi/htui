@@ -2460,7 +2460,8 @@ pub(crate) mod shell_tests {
             WaitingList, WorkspaceSwitcher,
         };
 
-        let overlays: Vec<Option<fn() -> Box<dyn Overlay>>> = vec![
+        type MakeOverlay = fn() -> Box<dyn Overlay>;
+        let overlays: Vec<Option<MakeOverlay>> = vec![
             None,
             Some(|| Box::new(WorkspaceSwitcher::new())),
             Some(|| Box::new(ConceptsSearch::new())),
