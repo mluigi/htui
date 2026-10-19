@@ -671,8 +671,19 @@ async fn a_rebound_field_key_edits_and_submits_a_real_field_as_its_canonical_key
 
     press_all(&mut canonical, &["S", "T", "O", "X", "backspace"]).await;
     press_all(&mut rebound, &["S", "T", "O", "X", "f7"]).await;
+    // MOD-115 M2 T7: the filter's hint names `field.submit` through the keys (MD1), so the
+    // rebound frame reads `Ctrl+t apply` where the canonical one reads `Enter apply`, one rule
+    // cell shorter; the rest is the same frame.
+    let open = rebound.render();
+    assert!(
+        open.contains("Ctrl+t apply"),
+        "the hint names the rebound key: {open}"
+    );
     assert_eq!(
-        rebound.render(),
+        open.replace(
+            "Ctrl+t apply \u{b7} Esc clear",
+            "Enter apply \u{b7} Esc clear\u{2500}"
+        ),
         canonical.render(),
         "`F7` deleted back as `Backspace` did"
     );

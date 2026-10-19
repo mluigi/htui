@@ -46,7 +46,8 @@ use crate::requirements::{
     mint_refused, not_the_maintainer,
 };
 use crate::store_worker::{StoreReply, StoreRequest};
-use crate::ui::tabs::backlog::detail::Scroll;
+use crate::ui::shell::{ListSize, PaneId, Panes, TabLayout, TabLoc};
+use crate::ui::tabs::backlog::detail::{Scroll, Step};
 use crate::ui::tabs::backlog::list::window;
 use crate::ui::tabs::registry::{CLOSE_THE_FIELD_FIRST, Tab, TabId};
 use crate::ui::tabs::settings::{modal_rest, wrapped};
@@ -56,11 +57,23 @@ use crossterm::event::KeyEvent;
 use forms::{AreaForm, FormFocus, FormOutcome, FormTarget, RequirementForm, WithdrawForm};
 use tree::{Fold, Row, TreeView};
 
-/// The tree's share of the body, as a percentage.
-const TREE_PERCENT: u16 = 45;
+/// The Requirements tab's default layout (MOD-115 M2 D2): the tree beside the detail, 45% of
+/// the rows above the notice and the filter row, as `Layout::horizontal([Percentage(45),
+/// Percentage(55)])` split them before the shell kept layouts.
+pub const REQUIREMENTS_LAYOUT: TabLayout = TabLayout {
+    list: ListSize::Percent(45),
+    ..TabLayout::DEFAULT
+};
 
-/// The detail pane's share of the body, as a percentage.
-const DETAIL_PERCENT: u16 = 55;
+/// How a [`Row`] is written into a [`TabLoc`] cursor (MOD-115 M2 §8): `requirement:{id}:{key}`
+/// (the key names a miss, as a reveal's does), `area:{id}` or `project:{id}`.
+const REQUIREMENT_CURSOR: &str = "requirement";
+
+/// An area header's cursor, beside [`REQUIREMENT_CURSOR`].
+const AREA_CURSOR: &str = "area";
+
+/// A project header's cursor, beside [`REQUIREMENT_CURSOR`].
+const PROJECT_CURSOR: &str = "project";
 
 /// How many rows the notice may wrap to before it is cut; one when it fits.
 const NOTICE_LINES: usize = 2;
@@ -107,8 +120,12 @@ const HINT_WRITES: HintSpec = &[
 /// The hint row's words after the write keys.
 const HINT_RELOAD: HintSpec = &[Hint::One(Act::Reload, "reload")];
 
-/// The hint row while the filter is open: the field's own keys.
-const FILTER_HINT: HintSpec = &[Hint::Text("Enter apply"), Hint::Text("Esc clear")];
+/// The hint row while the filter is open: the field's own keys, `field.submit` through the keys
+/// (MOD-115 M2 MD1) and `Esc` as written (MD7).
+const FILTER_HINT: HintSpec = &[
+    Hint::One(Act::FieldSubmit, "apply"),
+    Hint::Text("Esc clear"),
+];
 
 /// The filter field's width on the filter row.
 const FILTER_WIDTH: u16 = 30;
@@ -168,6 +185,20 @@ fn requirement_changed_elsewhere(head: i32, save: Option<&str>) -> String {
         Some(save) => format!("{kept} and {save} saves over it"),
         None => kept,
     }
+}
+
+/// The [`Row`] a [`TabLoc`] cursor written by [`RequirementsTab`]'s `location` names, with a
+/// requirement's key (empty for a header); `None` for any other string (MOD-115 M2 §8).
+fn parse_cursor(cursor: &str) -> Option<(Row, String)> {
+    let mut parts = cursor.splitn(3, ':');
+    let (kind, id) = (parts.next()?, parts.next()?);
+    let row = match kind {
+        REQUIREMENT_CURSOR => Row::Requirement(id.parse().ok()?),
+        AREA_CURSOR => Row::Area(id.parse().ok()?),
+        PROJECT_CURSOR => Row::Project(id.parse().ok()?),
+        _ => return None,
+    };
+    Some((row, parts.next().unwrap_or_default().to_owned()))
 }
 
 /// The Requirements tab's sentence for a reveal of a requirement this workspace does not hold
@@ -449,17 +480,29 @@ impl RequirementsTab {
     /// Browse (blueprint §4.4; MOD-67 M4 D6): the first candidate of the browse stack this state
     /// accepts. A global act, or one this state declines (`list.fold` on a requirement row,
     /// `common.back` with no filter), is the shell's, through the same stack.
+    ///
+    /// MOD-115 M2 §7: only motion follows the focus. The tree's motion and its fold are the
+    /// tree's while it is focused; with the detail focused the motion scrolls the detail (the
+    /// `pane.scroll_*` arm's scroll); with the activity pane focused it is taken and nothing
+    /// moves. Every other act acts whatever pane is focused.
     fn on_browse_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
         let chord = KeyChord::from_event(key);
+        let focus = ctx.focus();
         for act in ctx.keys().actions(views::REQUIREMENTS_BROWSE, chord) {
+            if let (Some(step), false) = (Step::of(act), focus == PaneId::List) {
+                if focus == PaneId::Detail {
+                    return self.scroll.follow(step, self.pane_rows.get());
+                }
+                return Handled::Consumed;
+            }
             match act {
                 Act::ListDown => self.step(1, ctx),
                 Act::ListUp => self.step(-1, ctx),
                 Act::ListTop => self.jump(false, ctx),
                 Act::ListBottom => self.jump(true, ctx),
-                // A requirement row has nothing to fold.
+                // A requirement row has nothing to fold, and the fold is the tree's.
                 Act::ListFold => {
-                    if self.fold() == Handled::Pass {
+                    if focus != PaneId::List || self.fold() == Handled::Pass {
                         continue;
                     }
                 }
@@ -1286,13 +1329,15 @@ impl Tab for RequirementsTab {
             Constraint::Length(1),
         ])
         .areas(area);
-        let [left, right] = Layout::horizontal([
-            Constraint::Percentage(TREE_PERCENT),
-            Constraint::Percentage(DETAIL_PERCENT),
-        ])
-        .areas(content);
-        self.render_tree(frame, left, ctx);
-        self.render_detail(frame, right, ctx);
+        // MOD-115 M2 B5: the panes the shell's layout gives the rows above the notice, claimed
+        // for the focus borders, the hints and the mouse; today's 45/55 by default.
+        let areas = ctx.split(content, REQUIREMENTS_LAYOUT);
+        if let Some(tree) = areas.list {
+            self.render_tree(frame, tree, ctx);
+        }
+        if !areas.detail.is_empty() {
+            self.render_detail(frame, areas.detail, ctx);
+        }
         frame.render_widget(
             Paragraph::new(
                 notice
@@ -1303,6 +1348,60 @@ impl Tab for RequirementsTab {
             notice_row,
         );
         frame.render_widget(Paragraph::new(self.filter_row(ctx.theme)), hint_row);
+    }
+
+    /// MOD-115 M2 D2: the tree and the detail, today's 45/55 by default.
+    fn panes(&self) -> Panes {
+        Panes::ListDetail(REQUIREMENTS_LAYOUT)
+    }
+
+    /// MOD-115 M2 §8: the row under the cursor; the tab has no sub-tabs.
+    fn location(&self) -> TabLoc {
+        let cursor = self.selected.map(|row| match row {
+            Row::Requirement(id) => {
+                let key = self
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.requirement(id))
+                    .map_or("", |row| row.key.as_str());
+                format!("{REQUIREMENT_CURSOR}:{id}:{key}")
+            }
+            Row::Area(id) => format!("{AREA_CURSOR}:{id}"),
+            Row::Project(id) => format!("{PROJECT_CURSOR}:{id}"),
+        });
+        TabLoc {
+            cursor,
+            ..TabLoc::default()
+        }
+    }
+
+    /// MOD-115 M2 §8: back to a [`location`](Tab::location)'s row: a requirement through the
+    /// reveal path (unhidden and its detail read, or read again when the tree no longer holds
+    /// it), a header the tree holds made visible. The row already under the cursor reads
+    /// nothing; an open form keeps its text, so nothing moves under it.
+    fn restore(&mut self, loc: &TabLoc, ctx: &mut Ctx<'_>) -> bool {
+        if !matches!(self.mode, Mode::Browse | Mode::Filter { .. }) {
+            return false;
+        }
+        let Some((row, key)) = loc.cursor.as_deref().and_then(parse_cursor) else {
+            return false;
+        };
+        if self.selected == Some(row) && self.rows(ctx).contains(&row) {
+            return true;
+        }
+        match row {
+            Row::Requirement(id) => self.reveal(&RevealTarget::Requirement { id, key }, ctx),
+            Row::Area(_) | Row::Project(_) => {
+                let held = self.snapshot.as_ref().is_some_and(|snapshot| {
+                    tree::rows(snapshot, ctx.projects, &[], "").contains(&row)
+                });
+                if held {
+                    self.mode = Mode::Browse;
+                    self.put_cursor(row, ctx);
+                }
+                held
+            }
+        }
     }
 
     fn reveal(&mut self, target: &RevealTarget, ctx: &mut Ctx<'_>) -> bool {
@@ -1333,20 +1432,24 @@ impl Tab for RequirementsTab {
 
 #[cfg(test)]
 mod tests {
-    use super::{HINT_WRITES, Mode, Notice, RequirementsTab, Row, SAVING};
+    use super::{HINT_WRITES, Mode, Notice, REQUIREMENTS_LAYOUT, RequirementsTab, Row, SAVING};
     use crate::app::{Action, Ctx, Emit, Handled, TopBarState};
     use crate::keys::{Keys, views};
     use crate::requirements::{
         self, READ_NAME, RequirementWrite, RequirementsSnapshot, not_the_maintainer,
     };
     use crate::store_worker::{Origin, StoreReply, StoreRequest};
+    use crate::ui::TextField;
     use crate::ui::Theme;
+    use crate::ui::shell::{ListSize, PaneId, Panes, TabLoc};
     use crate::ui::tabs::registry::Tab as _;
+    use core::cell::Cell;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use htui_core::fixtures::ids;
     use htui_core::model::{ProjectRef, RequirementId, RequirementState, Scope};
     use htui_core::store::{MemStore, StoreError, requirement_withdrawn};
     use htui_store::{Backend, DATABASE_UNREACHABLE};
+    use ratatui::layout::{Constraint, Layout, Rect};
     use ratatui::style::Style;
 
     /// The demo's Platform snapshot, its projects (`htui`, `agy`) and its scope.
@@ -2269,5 +2372,193 @@ mod tests {
             landed_unread("saved", "gone", None),
             "saved \u{2014} the re-read failed: gone"
         );
+    }
+
+    // ---- MOD-115 M2 T7: the panes, motion by focus, the location ---------------------------
+
+    /// `code` with the tab's pane `focus` focused.
+    fn key_at(bench: &Bench, tab: &mut RequirementsTab, focus: PaneId, code: KeyCode) -> Handled {
+        tab.on_key(KeyEvent::from(code), &mut bench.ctx().with_focus(focus))
+    }
+
+    /// The tab drawn at 100x30 through `ctx`.
+    fn draw(tab: &RequirementsTab, ctx: &Ctx<'_>) {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).expect("terminal");
+        terminal
+            .draw(|frame| tab.render(frame, frame.area(), ctx))
+            .expect("the frame draws");
+    }
+
+    /// MOD-115 M2 D2: the Requirements tab is a list + detail tab, its default today's 45/55
+    /// split of the rows above the notice and the filter row, claimed cell for cell.
+    #[tokio::test]
+    async fn the_tree_and_the_detail_are_claimed_at_today_s_split() {
+        assert_eq!(
+            RequirementsTab::new().panes(),
+            Panes::ListDetail(REQUIREMENTS_LAYOUT)
+        );
+        assert_eq!(REQUIREMENTS_LAYOUT.list, ListSize::Percent(45));
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let claim = Cell::new(None);
+        draw(&tab_on(snapshot), &bench.ctx().with_pane_claim(&claim));
+        let (region, areas) = claim.get().expect("the render claims its panes");
+        assert_eq!(
+            region,
+            Rect::new(0, 0, 100, 28),
+            "above the notice and filter rows"
+        );
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
+                .areas(region);
+        assert_eq!((areas.list, areas.detail), (Some(left), right));
+    }
+
+    /// MOD-115 M2 §7: with the tree focused, motion moves the cursor as before; with the
+    /// detail focused it scrolls the detail and the cursor stays; with the activity pane
+    /// focused nothing moves.
+    #[tokio::test]
+    async fn motion_follows_the_focused_pane() {
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let mut tab = tab_on(snapshot);
+        tab.pane_rows.set(10);
+
+        for (code, offset) in [
+            (KeyCode::Char('j'), 1),
+            (KeyCode::Down, 2),
+            (KeyCode::Char('k'), 1),
+            (KeyCode::Char('G'), 9),
+            (KeyCode::Home, 0),
+        ] {
+            assert_eq!(
+                key_at(&bench, &mut tab, PaneId::Detail, code),
+                Handled::Consumed
+            );
+            assert_eq!(tab.scroll.offset(), offset, "{code:?}");
+        }
+        assert_eq!(tab.selected, Some(Row::Requirement(ids::REQ_ENT_1)));
+        assert!(bench.emit.take().is_empty(), "no detail read");
+
+        for code in [KeyCode::Char('j'), KeyCode::Char('G')] {
+            assert_eq!(
+                key_at(&bench, &mut tab, PaneId::Activity, code),
+                Handled::Consumed
+            );
+        }
+        assert_eq!(tab.selected, Some(Row::Requirement(ids::REQ_ENT_1)));
+        assert_eq!(tab.scroll.offset(), 0);
+
+        key_at(&bench, &mut tab, PaneId::List, KeyCode::Char('j'));
+        assert_ne!(
+            tab.selected,
+            Some(Row::Requirement(ids::REQ_ENT_1)),
+            "the tree's"
+        );
+    }
+
+    /// MOD-115 M2 §7: the fold is the tree's: `Enter` on a header folds it with the tree
+    /// focused, and passes with the detail focused. A view verb acts whatever is focused.
+    #[tokio::test]
+    async fn the_fold_is_the_tree_s_and_a_view_verb_acts_anywhere() {
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let mut tab = tab_on(snapshot);
+        tab.selected = Some(Row::Project(ids::PROJECT_HTUI));
+        assert_eq!(
+            key_at(&bench, &mut tab, PaneId::Detail, KeyCode::Enter),
+            Handled::Pass
+        );
+        assert!(tab.folded.is_empty(), "no fold from the detail");
+        assert_eq!(
+            key_at(&bench, &mut tab, PaneId::List, KeyCode::Enter),
+            Handled::Consumed
+        );
+        assert_eq!(tab.folded.len(), 1, "the tree's fold");
+
+        assert_eq!(
+            key_at(&bench, &mut tab, PaneId::Detail, KeyCode::Char('/')),
+            Handled::Consumed
+        );
+        assert!(matches!(tab.mode, Mode::Filter { .. }), "the filter opened");
+    }
+
+    /// MOD-115 M2 §8: the location is the row under the cursor; restoring it on a tab moved
+    /// since puts the cursor back, unfolds what hides it and reads the requirement's detail.
+    #[tokio::test]
+    async fn the_location_is_the_row_and_restore_returns_to_it() {
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let here = tab_on(snapshot.clone()).location();
+        assert_eq!(here.subtab, None);
+        assert!(here.cursor.is_some());
+
+        let mut moved = tab_on(snapshot.clone());
+        bench.key(&mut moved, KeyCode::Char('j'));
+        assert_ne!(moved.selected, Some(Row::Requirement(ids::REQ_ENT_1)));
+        let _ = bench.emit.take();
+        assert!(moved.restore(&here, &mut bench.ctx()));
+        assert_eq!(moved.selected, Some(Row::Requirement(ids::REQ_ENT_1)));
+        assert!(
+            requests(&bench.emit.take())
+                .iter()
+                .any(|request| matches!(request, StoreRequest::RequirementDetail(id) if *id == ids::REQ_ENT_1)),
+            "its detail is read"
+        );
+        assert_eq!(moved.location(), here);
+
+        // A header is a location too, and restoring onto the row already selected reads nothing.
+        let mut header = tab_on(snapshot.clone());
+        header.selected = Some(Row::Project(ids::PROJECT_HTUI));
+        let at = header.location();
+        assert!(header.restore(&at, &mut bench.ctx()));
+        assert!(bench.emit.take().is_empty(), "already there");
+        let mut other = tab_on(snapshot);
+        assert!(other.restore(&at, &mut bench.ctx()));
+        assert_eq!(other.selected, Some(Row::Project(ids::PROJECT_HTUI)));
+    }
+
+    /// MOD-115 M2 §8: an open form keeps its text, so nothing is restored over it; a location
+    /// that names no row restores nothing.
+    #[tokio::test]
+    async fn restore_moves_nothing_over_a_form_or_without_a_row() {
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let here = tab_on(snapshot.clone()).location();
+        let mut tab = tab_on(snapshot.clone());
+        bench.key(&mut tab, KeyCode::Char('j'));
+        let at = tab.selected;
+        bench.key(&mut tab, KeyCode::Char('a'));
+        assert!(
+            matches!(tab.mode, Mode::NewArea(_)),
+            "the area form is open"
+        );
+        assert!(!tab.restore(&here, &mut bench.ctx()));
+        assert_eq!(tab.selected, at);
+
+        let mut tab = tab_on(snapshot);
+        assert!(!tab.restore(&TabLoc::default(), &mut bench.ctx()));
+    }
+
+    /// MOD-115 M2 MD1 (T6R finding): the filter's hint names `field.submit` through the keys,
+    /// as every other hint does; `Esc` stays `Esc` (MD7).
+    #[tokio::test]
+    async fn the_filter_hint_names_a_rebound_submit_key() {
+        use crate::keys::load_str;
+        let (snapshot, _, _) = platform().await;
+        let mut tab = tab_on(snapshot);
+        tab.mode = Mode::Filter {
+            field: TextField::new(),
+        };
+        let theme = Theme::default();
+        let text = |keys: &Keys| {
+            tab.keys_line(keys, &theme)
+                .map(|line| line.to_string())
+                .unwrap_or_default()
+        };
+        assert_eq!(text(Keys::compiled()), "Enter apply \u{b7} Esc clear");
+        let keys = load_str("version = 2\n[field]\nsubmit = \"ctrl-t\"\n").expect("loads");
+        assert_eq!(text(&keys), "Ctrl+t apply \u{b7} Esc clear");
     }
 }

@@ -636,14 +636,16 @@ async fn a_write_in_flight_swallows_keys_but_save_says_so() {
 }
 
 /// MOD-67 M4 (D11): browsing the tree, the status line is today's and the `?` box renders
-/// `REQUIREMENTS_BROWSE`, one line per layer.
+/// `REQUIREMENTS_BROWSE`, one line per layer. MOD-115 M2 T7: the tab claims a tree and a detail,
+/// so the pane keys are offered on the line and the layout keys in the box.
 #[tokio::test]
 async fn the_requirements_tree_status_line_and_help_box() {
     let mut harness = open().await;
     assert_eq!(
         harness.app().keys_line(),
         "q quit \u{b7} Ctrl+PgDn next tab \u{b7} Ctrl+PgUp previous tab \u{b7} 1 select tab \u{b7} ? help \
-         \u{b7} F9 about \u{b7} w workspaces \u{b7} Ctrl+f find \u{b7} Ctrl+w waiting \u{b7} Ctrl+q queue"
+         \u{b7} F9 about \u{b7} w workspaces \u{b7} Ctrl+f find \u{b7} Ctrl+w waiting \u{b7} Ctrl+q queue \
+         \u{b7} Tab next pane \u{b7} Shift+Tab previous pane"
     );
     let frame = harness.render();
     assert_eq!(
@@ -660,6 +662,7 @@ async fn the_requirements_tree_status_line_and_help_box() {
         "Common: n new \u{b7} r reload \u{b7} Esc back",
         "List: j/Down down \u{b7} k/Up up \u{b7} g/Home top \u{b7} G/End bottom \u{b7} Enter fold",
         "Pane: J scroll down \u{b7} K scroll up \u{b7} PgDn page down \u{b7} PgUp page up",
+        "Layout: p next layout \u{b7} P previous layout",
         "Global: ",
         "?/F1 closes this box",
     ] {
@@ -743,5 +746,34 @@ async fn the_hint_row_greys_the_write_keys_where_a_write_is_refused() {
         style_at(&buffer, y, "a area"),
         style_at(&buffer, y, "j/k move"),
         "the maintainer"
+    );
+}
+
+/// MOD-115 M2 §7, §8 (T7): `Tab` focuses the detail, where `j` leaves the tree's cursor where it
+/// is; a pane change is a place in the history, and Back returns to it with the row it was on.
+#[tokio::test]
+async fn the_detail_takes_motion_and_back_returns_to_the_row_left() {
+    let mut harness = open().await;
+    select(&mut harness, "R-ENT-2");
+    harness.settle().await;
+    harness.key("tab");
+    harness.key("j");
+    harness.key("G");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} R-ENT-2 "),
+        "the cursor stayed:\n{frame}"
+    );
+
+    harness.key("tab");
+    select(&mut harness, "R-STO-1");
+    harness.settle().await;
+    harness.key("backspace");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} R-ENT-2 "),
+        "back on R-ENT-2:\n{frame}"
     );
 }
