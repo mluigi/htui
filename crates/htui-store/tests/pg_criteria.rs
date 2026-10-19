@@ -7112,10 +7112,12 @@ async fn stop_run_takes_the_steps_first() {
     db.drop_db().await;
 }
 
-/// MOD-125 D6 (blueprint F5, risk R3): the sweep locks a stopped workspace's running steps with
-/// `SKIP LOCKED` before its runs, so a run whose step another transaction holds is **deferred**:
-/// the sweep answers promptly, neither settling nor adopting it, and the next sweep after the
-/// holder commits settles it as `stopped`.
+/// MOD-125 D6 (blueprint F5 and T3.3, as amended by review round R1): under its run locks the
+/// sweep reads a stopped workspace's running steps plainly, then locks them `SKIP LOCKED`, so a run
+/// whose step another transaction holds is **deferred**: the sweep answers promptly, neither
+/// settling nor adopting it, and the next sweep after the holder commits settles it as `stopped`,
+/// its lease released. X's claim takes a zero TTL, so its lease lapses at once while X still owns
+/// it: the run is abandoned without a `release_lease`.
 #[tokio::test(flavor = "multi_thread")]
 async fn adopt_runs_defers_a_stopped_run_whose_step_is_held() {
     let Some(db) = common::demo_db().await else {
@@ -7134,11 +7136,11 @@ async fn adopt_runs_defers_a_stopped_run_whose_step_is_held() {
         .id;
     assert_eq!(
         db.store
-            .claim_run(run, ids::BOX, x, Utc::now(), lease)
+            .claim_run(run, ids::BOX, x, Utc::now(), TimeDelta::zero())
             .await
             .expect("claim the run"),
         Claim::Admitted,
-        "X leases the run"
+        "X leases the run, for no time at all"
     );
     let step = db
         .store
@@ -7176,10 +7178,6 @@ async fn adopt_runs_defers_a_stopped_run_whose_step_is_held() {
         )
         .await
         .expect("stop the workspace");
-    assert!(
-        db.store.release_lease(run, x).await.expect("release"),
-        "X abandons the run"
-    );
 
     let mut holder = db.pool.begin().await.expect("begin the holder");
     sqlx::query("SELECT 1 FROM run_step WHERE id = $1 FOR UPDATE")
@@ -7221,6 +7219,13 @@ async fn adopt_runs_defers_a_stopped_run_whose_step_is_held() {
         ("stopped", "stopped"),
         "the next sweep settles the run and its step"
     );
+    let lease_owner: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT lease_owner FROM run WHERE id = $1")
+            .bind(run.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("read the lease owner");
+    assert_eq!(lease_owner, None, "and releases X's lapsed lease");
 
     db.drop_db().await;
 }

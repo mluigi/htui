@@ -4759,9 +4759,11 @@ impl WriteStore for PgStore {
             return Ok(Claim::NotClaimable);
         }
 
-        // MOD-125 D5: run, then box, then the stop row. stop_workspace and resume_workspace lock
-        // only workspace_stop, so no cycle. FOR SHARE makes a racing resume (DELETE) or escalation
-        // wait for this decision; a stop inserted after this read is ordered after the claim, and
+        // MOD-125 D5: run, then box, then the stop row. resume_workspace locks only workspace_stop;
+        // stop_workspace also takes FOR KEY SHARE on workspace and app_user through its foreign
+        // keys, neither of which a claim locks; delete_workspace locks run rows before the stop
+        // row, the claim's own order. So no cycle. FOR SHARE makes a racing resume (DELETE) or
+        // escalation wait for this decision; a stop inserted after this read is ordered after the claim, and
         // M2's executor stops the run it admitted. The early return drops `tx`, which rolls back.
         if let Some(workspace) = claimed.workspace_id {
             let stopped = sqlx::query_scalar!(
@@ -4982,25 +4984,31 @@ impl WriteStore for PgStore {
     ///
     /// MOD-125 D6: a candidate whose workspace has a `workspace_stop` row is **settled, not
     /// adopted**: `running -> stopped` with its running steps, the lease released as
-    /// [`WriteStore::release_lease`] releases it, and left out of the answer. That is the first
-    /// sweep write on a run's steps, so it keeps MOD-77's step → run lock order (blueprint F5):
+    /// [`WriteStore::release_lease`] releases it, and left out of the answer (blueprint F5, as
+    /// amended by review round R1):
     ///
-    /// 1. the running steps of the stopped-workspace candidates are locked first,
-    ///    `FOR NO KEY UPDATE OF s SKIP LOCKED`;
-    /// 2. the candidates are locked in `(queued_at, id)` order, `FOR UPDATE SKIP LOCKED`;
-    /// 3. the stop rows of their workspaces are read `FOR SHARE` (the decision `claim_run` makes);
-    /// 4. the stopped candidates' running steps are re-read under the run locks. A candidate
-    ///    whose every running step was locked in 1 is settled; one with a running step another
-    ///    transaction holds is **deferred** to a later sweep, neither settled nor adopted
+    /// 1. the candidates are locked in `(queued_at, id)` order, `FOR UPDATE SKIP LOCKED`;
+    /// 2. the stop rows of their workspaces are read `FOR SHARE` (the decision `claim_run` makes);
+    /// 3. only when a candidate's workspace is stopped, its running steps are read twice: once
+    ///    plainly, then locked `FOR NO KEY UPDATE SKIP LOCKED`. A stopped candidate whose every
+    ///    running step the second read locked is settled; one with a running step the first read
+    ///    saw and the second skipped (another transaction holds it) is **deferred** to a later
+    ///    sweep, neither settled nor adopted
     ///    (`pg_criteria.rs::adopt_runs_defers_a_stopped_run_whose_step_is_held`); every other
-    ///    candidate is adopted;
-    /// 5. the settlement writes the steps, then the runs;
-    /// 6. the adoption is today's update, over the adopted ids.
+    ///    candidate is adopted. One `SKIP LOCKED` read alone cannot tell a held step from no step,
+    ///    and would settle a run whose step another transaction is writing;
+    /// 4. the settlement writes the steps, then the runs;
+    /// 5. the adoption is today's update, over the adopted ids.
     ///
-    /// `SKIP LOCKED` is on every lock this sweep takes on `run` and `run_step` (blueprint A-5): two
-    /// concurrent sweeps never wait on each other's row locks and cannot deadlock, a row one sweep
-    /// holds is simply not the other's, and no sweep waits on a stalled former owner. The only
-    /// waiting lock is `FOR SHARE` on `workspace_stop`, whose writers hold it for one statement.
+    /// Every lock this sweep takes on `run` and `run_step` is `SKIP LOCKED` (blueprint A-5), and
+    /// every `UPDATE` touches only rows it already holds, so the sweep never waits on a run or step
+    /// lock: two concurrent sweeps cannot deadlock, a row one sweep holds is simply not the
+    /// other's, no sweep waits on a stalled former owner, and MOD-77's step → run order is
+    /// irrelevant here. The only waiting lock is `FOR SHARE` on `workspace_stop`, taken while the
+    /// sweep holds run locks but no step lock. Its writers hold the row lock briefly and wait on
+    /// nothing else while holding it: `resume_workspace` is one autocommit `DELETE`;
+    /// `stop_workspace` holds it from its upsert through at most one read-back `SELECT` and the
+    /// `COMMIT`; `delete_workspace`'s cascade reaches it last, right before its `COMMIT`.
     ///
     /// `RETURNING` cannot carry an `ORDER BY`, so the adoption is a CTE and the ordering is the
     /// `SELECT` over it — `queued_at`, as the contract says. A box that does not exist matches
@@ -5014,33 +5022,7 @@ impl WriteStore for PgStore {
         let ttl = lease_ttl_micros(ttl)?;
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
 
-        // 1. Steps first (MOD-77's step → run order).
-        let held: BTreeSet<Uuid> = sqlx::query_scalar!(
-            r#"
-            SELECT s.id AS "step: StepId"
-              FROM run_step s
-              JOIN run r ON r.id = s.run_id
-              JOIN workspace_stop ws ON ws.workspace_id = r.workspace_id
-             WHERE r.executing_box_id = $1
-               AND r.status = 'running'
-               AND r.kind = 'graph'
-               AND (r.lease_expires_at IS NULL OR r.lease_expires_at <= clock_timestamp())
-               AND r.lease_owner IS DISTINCT FROM $2
-               AND s.status = 'running'
-             ORDER BY s.run_id, s.id
-               FOR NO KEY UPDATE OF s SKIP LOCKED
-            "#,
-            box_id.as_uuid(),
-            owner,
-        )
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(map_sqlx)?
-        .into_iter()
-        .map(|step| step.as_uuid())
-        .collect();
-
-        // 2. The candidates: today's predicate and order.
+        // 1. The candidates: today's predicate and order.
         let candidates = sqlx::query!(
             r#"
             SELECT id           AS "id: RunId",
@@ -5061,7 +5043,7 @@ impl WriteStore for PgStore {
         .await
         .map_err(map_sqlx)?;
 
-        // 3. The stops held, for the candidates' workspaces.
+        // 2. The stops held, for the candidates' workspaces.
         let workspaces: Vec<Uuid> = candidates
             .iter()
             .filter_map(|row| row.workspace_id.map(|id| id.as_uuid()))
@@ -5100,7 +5082,9 @@ impl WriteStore for PgStore {
         }
 
         if !stopping.is_empty() {
-            // 4. The stopped candidates' running steps, read under the run locks.
+            // 3. The stopped candidates' running steps, read under the run locks: (a) every one
+            // plainly, then (b) the ones no other transaction holds, locked. A step (a) saw and
+            // (b) skipped is held elsewhere, and defers its run.
             let running = sqlx::query!(
                 r#"
                 SELECT id     AS "id: StepId",
@@ -5112,6 +5096,21 @@ impl WriteStore for PgStore {
             .fetch_all(&mut *tx)
             .await
             .map_err(map_sqlx)?;
+            let held: BTreeSet<Uuid> = sqlx::query_scalar!(
+                r#"
+                SELECT id AS "id: StepId"
+                  FROM run_step WHERE run_id = ANY($1::uuid[]) AND status = 'running'
+                 ORDER BY run_id, id
+                   FOR NO KEY UPDATE SKIP LOCKED
+                "#,
+                &stopping,
+            )
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .into_iter()
+            .map(|step| step.as_uuid())
+            .collect();
             let deferred: BTreeSet<Uuid> = running
                 .iter()
                 .filter(|step| !held.contains(&step.id.as_uuid()))
@@ -5133,7 +5132,7 @@ impl WriteStore for PgStore {
                 .map(|step| step.id.as_uuid())
                 .collect();
 
-            // 5. Settle: the steps, then the runs.
+            // 4. Settle: the steps, then the runs.
             if !steps.is_empty() {
                 sqlx::query!(
                     "UPDATE run_step SET status = 'stopped' WHERE id = ANY($1::uuid[]) AND status = 'running'",
@@ -5155,7 +5154,7 @@ impl WriteStore for PgStore {
             }
         }
 
-        // 6. Adopt.
+        // 5. Adopt.
         let adopted = if adopt.is_empty() {
             Vec::new()
         } else {
@@ -5202,7 +5201,7 @@ impl WriteStore for PgStore {
             .map_err(map_sqlx)?
         };
 
-        // 7. Commit.
+        // 6. Commit.
         tx.commit().await.map_err(map_sqlx)?;
         Ok(adopted)
     }

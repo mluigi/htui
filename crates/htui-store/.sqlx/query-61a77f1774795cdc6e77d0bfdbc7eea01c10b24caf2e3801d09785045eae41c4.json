@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT id AS \"id: StepId\"\n                  FROM run_step WHERE run_id = ANY($1::uuid[]) AND status = 'running'\n                 ORDER BY run_id, id\n                   FOR NO KEY UPDATE SKIP LOCKED\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: StepId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "61a77f1774795cdc6e77d0bfdbc7eea01c10b24caf2e3801d09785045eae41c4"
+}
