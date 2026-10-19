@@ -1,8 +1,8 @@
 //! `keys.toml` to [`Keys`] (MOD-67 M2; ANA-26 §7.1, §7.4 steps 1-6, §7.5): find the file, parse
 //! it with spans, check names and chords strictly, merge it over the catalogue, and report every
 //! error with its line. The merge lets an entry take its chord from an action the file leaves at
-//! its default (MOD-12 M3 R1 H1, [`Resolved::notices`]); [`validate()`] adds the checks over the
-//! merged keys.
+//! its default (MOD-12 M3 R1 H1, [`Resolved::notices`]); [`validate()`](super::validate) adds
+//! the checks over the merged keys.
 
 use std::path::{Path, PathBuf};
 
@@ -10,8 +10,8 @@ use toml::Spanned;
 use toml::de::{DeString, DeTable, DeValue};
 
 use super::{
-    Act, ActionSpec, CATALOGUE, CTRL_C, Context, DECLARED, ESC, KeyChord, Keys, quote, validate,
-    validate::give_way,
+    Act, ActionSpec, CATALOGUE, CTRL_C, Context, DECLARED, ESC, KeyChord, Keys, quote,
+    validate::{give_way, validate_loaded},
 };
 
 /// The key file's name under the config root.
@@ -114,6 +114,7 @@ pub fn load_str(src: &str) -> Result<Keys, Vec<KeyFileError>> {
         keys,
         errors: Vec::new(),
         set: Vec::new(),
+        dropped: Vec::new(),
     };
     // MOD-115 M2: the version decides how an entry reads (MD7's version-1 `Esc`), and a table
     // may come before it in the parsed order, so it is read first.
@@ -130,6 +131,7 @@ pub fn load_str(src: &str) -> Result<Keys, Vec<KeyFileError>> {
         mut keys,
         mut errors,
         set,
+        dropped,
         ..
     } = loader;
     // MOD-115 M2 (D-9): `ctrl-c` always quit before M2 and no file could list it, so a version-1
@@ -152,7 +154,7 @@ pub fn load_str(src: &str) -> Result<Keys, Vec<KeyFileError>> {
     // MOD-67 M3 PA-1: the view defaults follow the shared rows the file just set.
     keys.derive(&set);
     give_way(&mut keys);
-    errors.extend(validate(&keys));
+    errors.extend(validate_loaded(&keys, &dropped));
     errors.sort_by_key(|error| error.line);
     if errors.is_empty() {
         Ok(keys)
@@ -303,6 +305,9 @@ struct Loader<'s> {
     errors: Vec<KeyFileError>,
     /// Every `(context, act)` an entry resolved to: `Keys::derive` keeps these rows as written.
     set: Vec<(Context, Act)>,
+    /// Every `(context, act)` whose entry listed chords and lost them all to errors reported on
+    /// their lines: the safety net does not report the row again (MOD-67 M6 D6).
+    dropped: Vec<(Context, Act)>,
 }
 
 impl Loader<'_> {
@@ -471,6 +476,9 @@ impl Loader<'_> {
             && !chords.contains(&ESC)
         {
             chords.insert(chords.len().saturating_sub(from_end), ESC);
+        }
+        if chords.is_empty() && !items.is_empty() {
+            self.dropped.push((context, spec.act));
         }
         self.keys.set(context, spec.act, chords, key_line);
         self.set.push((context, spec.act));
@@ -983,6 +991,37 @@ mod tests {
                 "[editor] focus: must keep at least one chord: the editor takes every other key"
             )
         );
+    }
+
+    /// MOD-115 M2 D-10 (T5 repair, MOD-67 M6 D6): a must-keep row the file lists only bad
+    /// chords for is reported once, for the bad chord. The user did list a chord; the row is
+    /// empty only because the loader dropped it, so the safety net says nothing more.
+    #[test]
+    fn a_must_keep_row_with_only_bad_chords_is_reported_once() {
+        for (src, start) in [
+            (
+                "version = 2\n[editor]\nfocus = [\"ctrl-E\"]\n",
+                r#"[editor] focus = "ctrl-E": "#,
+            ),
+            (
+                "version = 2\n[global]\nquit = [\"ctrl-C\"]\n",
+                r#"[global] quit = "ctrl-C": "#,
+            ),
+            (
+                "version = 2\n[global]\nquit = [\"esc\"]\n",
+                r#"[global] quit = "esc": "#,
+            ),
+            (
+                "version = 2\n[leave]\nconfirm = [7]\n",
+                "[leave] confirm: write each chord as a string",
+            ),
+        ] {
+            let found = errors(src);
+            assert!(
+                found.len() == 1 && found[0].0 == 3 && found[0].1.starts_with(start),
+                "{src:?}: {found:?}"
+            );
+        }
     }
 
     /// MOD-115 M2 MD7: `overlay.close` keeps `Esc` by construction, so `[]` leaves it `Esc`

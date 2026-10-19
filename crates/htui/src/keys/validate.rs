@@ -173,11 +173,25 @@ fn abort_gives_way(entry: &Row, default: &Row) -> bool {
 /// [`SHADOWING`] pair whose first act's layer is the narrower (MOD-67 D11).
 #[must_use]
 pub fn validate(keys: &Keys) -> Vec<KeyFileError> {
-    check(keys, SHADOWING, STATE_GUARDED)
+    validate_loaded(keys, &[])
 }
 
-/// [`validate`] over explicit allow-lists: the demand tests drop one entry at a time.
-fn check(keys: &Keys, shadowing: &[(Act, Act)], guarded: &[(Act, Act)]) -> Vec<KeyFileError> {
+/// [`validate`] after a load that dropped every chord of the rows in `dropped`: the loader
+/// reported each of those chords on its line, so the safety net does not report the row again
+/// for being empty (MOD-67 M6 D6: one error per mistake). `[editor] focus = ["ctrl-E"]` gives
+/// the chord's error only.
+#[must_use]
+pub(super) fn validate_loaded(keys: &Keys, dropped: &[(Context, Act)]) -> Vec<KeyFileError> {
+    check(keys, SHADOWING, STATE_GUARDED, dropped)
+}
+
+/// [`validate_loaded`] over explicit allow-lists: the demand tests drop one entry at a time.
+fn check(
+    keys: &Keys,
+    shadowing: &[(Act, Act)],
+    guarded: &[(Act, Act)],
+    dropped: &[(Context, Act)],
+) -> Vec<KeyFileError> {
     let mut check = Check {
         keys,
         guarded,
@@ -245,10 +259,12 @@ fn check(keys: &Keys, shadowing: &[(Act, Act)], guarded: &[(Act, Act)]) -> Vec<K
         }
     }
     // MOD-115 M2 D7, D-10: the safety nets. A row htui cannot do without keeps a chord: an entry
-    // that empties one is reported on its line, and so is one the merge left with none.
+    // that empties one is reported on its line, and so is one the merge left with none. A row
+    // emptied only because the loader refused every chord it listed was reported already.
     for spec in CATALOGUE {
         if let (Some(reason), Some(row)) = (must_keep(spec.act), keys.row(spec.context, spec.act))
             && row.chords.is_empty()
+            && !dropped.contains(&(spec.context, spec.act))
         {
             check.errors.push(KeyFileError {
                 line: line_of(row),
@@ -941,11 +957,11 @@ mod tests {
     #[test]
     fn every_allow_list_entry_is_demanded() {
         let keys = Keys::compiled();
-        assert_eq!(check(keys, SHADOWING, STATE_GUARDED), []);
+        assert_eq!(check(keys, SHADOWING, STATE_GUARDED, &[]), []);
         for entry in SHADOWING {
             let fewer: Vec<_> = SHADOWING.iter().copied().filter(|e| e != entry).collect();
             assert!(
-                !check(keys, &fewer, STATE_GUARDED).is_empty(),
+                !check(keys, &fewer, STATE_GUARDED, &[]).is_empty(),
                 "SHADOWING {entry:?} is not demanded"
             );
         }
@@ -956,7 +972,7 @@ mod tests {
                 .filter(|e| e != entry)
                 .collect();
             assert!(
-                !check(keys, SHADOWING, &fewer).is_empty(),
+                !check(keys, SHADOWING, &fewer, &[]).is_empty(),
                 "STATE_GUARDED {entry:?} is not demanded"
             );
         }
