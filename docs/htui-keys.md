@@ -18,7 +18,8 @@ that lists `Esc` on such a row still loads; `Esc` on any other row is refused in
 `ctrl-c` binds like any key: by default the first press opens the
 leave dialog (`global.quit`) and a second one leaves (`leave.confirm`). htui refuses a file that
 leaves `global.quit` or `leave.confirm` with no chord, and likewise `leave.stay`, `field.cancel`,
-`overlay.close` and `editor.focus`.
+`overlay.close` and `editor.focus`. A `version = 1` file's `quit` keeps `ctrl-c` unless the file
+binds `ctrl-c` elsewhere, so `quit = []` there leaves `ctrl-c`; in a `version = 2` file it is refused.
 
 This page is generated. After a change to the key catalogue, replace the block below with the
 output of `cargo run -q -p htui -- --default-keys --print-keys`; `cargo test -p htui --test

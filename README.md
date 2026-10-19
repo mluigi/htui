@@ -229,10 +229,11 @@ character typed into a text field is text. `Esc` is the exception: it is never c
 `version = 2` file cannot list it, and every action marked `Esc always` in `--print-keys` keeps it
 (`close = ["f2"]` above closes on `F2` and `Esc`). `ctrl-c` binds like any key: by default it opens
 the leave dialog and a second press leaves, and htui refuses a file that leaves no way to leave it.
-A file without `version`, or with `version = 1`, was written before these rules and two of them do
-not apply to it: it may list `Esc` on a row marked `Esc always` (`Esc` on any other row is refused in
-either version), and where a newer default takes one of its keys, the default gives way with a
-notice.
+A file without `version`, or with `version = 1`, was written before these rules and three of them
+do not apply to it: it may list `Esc` on a row marked `Esc always` (`Esc` on any other row is refused
+in either version); where a newer default takes one of its keys, the default gives way with a
+notice; and its `quit` keeps `ctrl-c` unless the file binds `ctrl-c` elsewhere, so `quit = []` there
+leaves `ctrl-c` (a `version = 2` file with `quit = []` is refused).
 
 Within one table, your keys win over the defaults you leave alone: if a key you list is the
 default of another action in the same table, that action gives it up, and is unbound if it had
