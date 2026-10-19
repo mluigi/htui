@@ -1305,14 +1305,6 @@ fn parse_cursor(cursor: &str) -> Option<(Selection, String)> {
     }
 }
 
-/// The body region split into the list pane and the detail pane by the default layout: what
-/// the tests that size a pane measure against.
-#[cfg(test)]
-fn panes(area: Rect) -> [Rect; 2] {
-    let areas = crate::ui::shell::layout::areas(area, &BACKLOG_LAYOUT, PaneId::List);
-    [areas.list.unwrap_or_default(), areas.detail]
-}
-
 /// The Backlog's sentence for a reveal of an item this workspace does not hold (MOD-64 D235, F5).
 #[must_use]
 pub fn not_in_this_backlog(key: &str) -> String {
@@ -4978,4 +4970,13 @@ mod tests {
         assert!(!tab.restore(&TabLoc::default(), &mut bench.ctx()));
         assert_eq!(tab.selected, Some(bench.first));
     }
+}
+
+/// The body region split into the list pane and the detail pane by the default layout: what
+/// the tests that size a pane measure against. After the tests module, so the source guards
+/// that read the file up to its first `#[cfg(test)]` (`keys/views.rs`) still read all of it.
+#[cfg(test)]
+fn panes(area: Rect) -> [Rect; 2] {
+    let areas = crate::ui::shell::layout::areas(area, &BACKLOG_LAYOUT, PaneId::List);
+    [areas.list.unwrap_or_default(), areas.detail]
 }

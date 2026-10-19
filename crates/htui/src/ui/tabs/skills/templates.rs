@@ -45,12 +45,6 @@ const SAVE_NAME: &str = REQUEST_NAMES[1];
 /// How many rows the notice may wrap to before it is cut; one when it fits.
 const NOTICE_LINES: usize = 2;
 
-/// The tree's width, borders included: two spaces, the name fitted to [`NAME_WIDTH`] cells, ` v`,
-/// a head of up to three digits, a space and the role make at most 28 cells. The view draws the
-/// Skills tab's shared layout (`library::LAYOUT`, MOD-115 M2 D2); a test pins it to this width.
-#[cfg(test)]
-const LIST_WIDTH: u16 = 32;
-
 /// A template row's name field, in cells: a name is fitted to it with `cells::fit`, so the head
 /// and the role stay on the row and in their columns.
 const NAME_WIDTH: usize = 13;
@@ -2418,3 +2412,11 @@ mod tests {
         );
     }
 }
+
+/// The tree's width, borders included: two spaces, the name fitted to [`NAME_WIDTH`] cells, ` v`,
+/// a head of up to three digits, a space and the role make at most 28 cells. The view draws the
+/// Skills tab's shared layout (`library::LAYOUT`, MOD-115 M2 D2); a test pins it to this width.
+/// After the tests module, so the source guards that read the file up to its first
+/// `#[cfg(test)]` (`keys/views.rs`) still read all of it.
+#[cfg(test)]
+const LIST_WIDTH: u16 = 32;
