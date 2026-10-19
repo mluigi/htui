@@ -133,8 +133,14 @@ pub fn load_str(src: &str) -> Result<Keys, Vec<KeyFileError>> {
         ..
     } = loader;
     // MOD-115 M2 (D-9): `ctrl-c` always quit before M2 and no file could list it, so a version-1
-    // file's quit keeps it. A version-2 file binds it like any chord.
+    // file's quit keeps it. A version-2 file binds it like any chord, and so does a version-1
+    // file that binds it to another row: it was written after M2 and moved it on purpose.
+    let moved = keys
+        .rows
+        .iter()
+        .any(|row| row.entry.is_some() && row.act != Act::Quit && row.chords.contains(&CTRL_C));
     if keys.version == 1
+        && !moved
         && let Some(quit) = keys.row(Context::Global, Act::Quit)
         && let Some(line) = quit.entry
         && !quit.chords.contains(&CTRL_C)
@@ -625,6 +631,18 @@ mod tests {
         assert_eq!(load_str("").expect("an empty file loads").version(), 1);
         assert_eq!(Keys::compiled().version(), crate::keys::VERSION);
         assert_eq!(crate::keys::VERSION, 2);
+    }
+
+    /// T5 repair: a version-1 file that binds `ctrl-c` to another row chose to move it, so its
+    /// quit is kept as written, and no error blames the quit line for a chord it never listed.
+    #[test]
+    fn a_version_1_file_that_moves_ctrl_c_keeps_its_quit_as_written() {
+        let keys = load_str("[global]\nquit = [\"q\"]\nfind = \"ctrl-c\"\n").expect("it loads");
+        assert_eq!(keys.chords(Context::Global, Act::Quit), [chord("q")]);
+        assert_eq!(keys.chords(Context::Global, Act::Find), [CTRL_C]);
+        let narrower = load_str("[global]\nquit = [\"z\"]\n[field]\ncancel = [\"ctrl-c\"]\n");
+        let narrower = narrower.expect("it loads");
+        assert_eq!(narrower.chords(Context::Global, Act::Quit), [chord("z")]);
     }
 
     /// MOD-115 M2 (D-9): `ctrl-c` always quit before M2 and no file could list it, so a
