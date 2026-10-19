@@ -3212,4 +3212,56 @@ pub(crate) mod shell_tests {
             );
         }
     }
+
+    /// T6R repair 1 (D3, D1): after a restart onto a layout that hides the list, the first
+    /// layout key that shows it again keeps the detail focused, as the same keys do in one
+    /// session, and records no move: the focus resolved onto the detail is the focus kept.
+    #[test]
+    fn a_layout_key_that_shows_the_list_after_a_restart_keeps_the_detail_focused() {
+        use crate::ui::state_file::UiStore;
+
+        let cases = [
+            (
+                TabLayout {
+                    preset: Preset::Focus,
+                    ..SPLIT_LAYOUT
+                },
+                KeyCode::Char('p'),
+            ),
+            (
+                TabLayout {
+                    list_on: false,
+                    ..SPLIT_LAYOUT
+                },
+                KeyCode::F(2),
+            ),
+        ];
+        for (layout, key) in cases {
+            let store = UiStore::memory();
+            let mut state = store.load().state;
+            state.layouts.insert(SPLIT.0.to_owned(), layout);
+            store.save(&state).expect("the memory store saves");
+
+            let mut app = split_app();
+            app.apply_ui_state(store.load().state);
+            app.ui_store = store;
+            let _ = draw(&mut app, 100, 30);
+            assert_eq!(focused(&app), PaneId::Detail, "{layout:?}: at load");
+
+            press(&mut app, key, KeyModifiers::NONE);
+            let _ = draw(&mut app, 100, 30);
+            let (_, areas) = claim(&app);
+            assert!(areas.list.is_some(), "{layout:?}: {key:?} shows the list");
+            assert_eq!(
+                focused(&app),
+                PaneId::Detail,
+                "{layout:?}: {key:?} keeps the detail focused"
+            );
+            assert!(
+                app.history.peek_back().is_none(),
+                "{layout:?}: {key:?} moved nothing: {:?}",
+                app.history.peek_back().map(|loc| &loc.label)
+            );
+        }
+    }
 }

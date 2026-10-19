@@ -142,9 +142,14 @@ impl App {
             LayoutAction::Zoom => layout.toggle_zoom(),
         }
         self.ui.layouts.insert(id.0.to_owned(), layout);
-        if self.hides(id, &layout, focus) {
-            self.focus.insert(id, PaneId::Detail);
-        }
+        // The focus is stored as resolved, always: one the old layout only derived (the detail of
+        // a restart onto a hidden list) stays put when the new layout shows the list again (T6R).
+        let focus = if self.hides(id, &layout, focus) {
+            PaneId::Detail
+        } else {
+            focus
+        };
+        self.focus.insert(id, focus);
         self.save_ui_state();
     }
 
