@@ -120,6 +120,61 @@ pub struct Ctx<'a> {
 /// panes the shell's layout gave it.
 pub type PaneClaim = (Rect, PaneAreas);
 
+/// What the shell keeps for one tab and hands it on every [`Ctx`] it builds for it (MOD-115 M2
+/// D2, D3, T6R): the focused pane, always a visible one, and a list + detail tab's layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TabView {
+    /// The focused pane: the one the shell keeps, else the list (list + detail) or the detail
+    /// (single pane); the detail when the layout hides it.
+    pub(crate) focus: PaneId,
+    /// The stored layout, else the tab's default; `None` for a single-pane tab.
+    pub(crate) layout: Option<TabLayout>,
+}
+
+impl TabView {
+    /// `tab`'s view out of the shell's focus map, UI state and last claim. One function, so the
+    /// render, the keys, the mouse, the history and the header all agree (T6R).
+    fn of(
+        tab: &dyn Tab,
+        focus: &HashMap<TabId, PaneId>,
+        ui: &UiState,
+        last_claim: Option<(TabId, Rect, PaneAreas)>,
+    ) -> Self {
+        let layout = match tab.panes() {
+            Panes::ListDetail(default) => {
+                Some(ui.layouts.get(tab.id().0).copied().unwrap_or(default))
+            }
+            Panes::Single => None,
+        };
+        let kept = focus.get(&tab.id()).copied().unwrap_or(match tab.panes() {
+            Panes::ListDetail(_) => PaneId::List,
+            Panes::Single => PaneId::Detail,
+        });
+        // D3: a pane the layout hides (a saved preset or toggle, before any key moved the
+        // focus) gives the focus to the detail, as a layout key that hides it does.
+        let focus = match layout {
+            Some(layout) if hides(last_claim, tab.id(), &layout, kept) => PaneId::Detail,
+            _ => kept,
+        };
+        Self { focus, layout }
+    }
+}
+
+/// Whether `layout` hides `pane` of tab `id` (MOD-115 M2 D3), drawn over the region the tab
+/// split last, else one that holds every pane: only which panes are shown matters here.
+fn hides(
+    last_claim: Option<(TabId, Rect, PaneAreas)>,
+    id: TabId,
+    layout: &TabLayout,
+    pane: PaneId,
+) -> bool {
+    let region = last_claim
+        .filter(|(claimed, _, _)| *claimed == id)
+        .map_or(Rect::new(0, 0, 200, 60), |(_, region, _)| region);
+    let areas = pane_layout::areas(region, layout, pane);
+    !pane_layout::visible(&areas).contains(&pane)
+}
+
 impl<'a> Ctx<'a> {
     /// Builds the context of one view. The shell is the only caller.
     #[must_use]
@@ -183,6 +238,16 @@ impl<'a> Ctx<'a> {
     #[must_use]
     pub const fn with_focus(mut self, focus: PaneId) -> Self {
         self.focus = Some(focus);
+        self
+    }
+
+    /// This context with what the shell keeps for its tab (MOD-115 M2 D2, D3, T6R): the focused
+    /// pane, and the layout of a list + detail tab. Only the shell calls it, through
+    /// `App::tab_ctx` and `App::call_tab`, so no tab's context goes without them.
+    #[must_use]
+    pub(crate) const fn with_tab_view(mut self, view: TabView) -> Self {
+        self.focus = Some(view.focus);
+        self.layout = view.layout;
         self
     }
 
@@ -518,27 +583,69 @@ impl App {
         }
     }
 
+    /// What the shell keeps for `tab` ([`TabView`]): its focused pane and its layout.
+    pub(crate) fn tab_view(&self, tab: &dyn Tab) -> TabView {
+        TabView::of(tab, &self.focus, &self.ui, self.last_claim)
+    }
+
     /// The layout the shell keeps for `tab` (MOD-115 M2 D2): the stored one, else the tab's own
     /// default; `None` for a single-pane tab.
     pub(crate) fn layout_of(&self, tab: &dyn Tab) -> Option<TabLayout> {
-        match tab.panes() {
-            Panes::ListDetail(default) => {
-                Some(self.ui.layouts.get(tab.id().0).copied().unwrap_or(default))
-            }
-            Panes::Single => None,
-        }
+        self.tab_view(tab).layout
     }
 
     /// The focused pane of `tab` (MOD-115 M2 D3): the one the shell keeps, else the list of a
-    /// list + detail tab and the detail of a single-pane one.
+    /// list + detail tab and the detail of a single-pane one; always a pane the layout shows
+    /// (the detail when it hides that one, T6R).
     pub(crate) fn focus_of(&self, tab: &dyn Tab) -> PaneId {
-        self.focus
-            .get(&tab.id())
-            .copied()
-            .unwrap_or(match tab.panes() {
-                Panes::ListDetail(_) => PaneId::List,
-                Panes::Single => PaneId::Detail,
-            })
+        self.tab_view(tab).focus
+    }
+
+    /// Whether `layout` hides `pane` of tab `id` (MOD-115 M2 D3), over the region it split last.
+    pub(super) fn hides(&self, id: TabId, layout: &TabLayout, pane: PaneId) -> bool {
+        hides(self.last_claim, id, layout, pane)
+    }
+
+    /// The context of `tab`, with its focused pane and layout (T6R): the read-only sites (the
+    /// render, the hints).
+    #[must_use]
+    pub(super) fn tab_ctx(&self, tab: &dyn Tab) -> Ctx<'_> {
+        self.ctx(Origin::Tab(tab.id()))
+            .with_tab_view(self.tab_view(tab))
+    }
+
+    /// Hands tab `id` its [`Ctx`] (its focused pane and layout, T6R) for `call`, then drains what
+    /// it emitted, addressed as that tab. Every mutable entry into a tab goes through here (keys,
+    /// mouse, paste, replies, refresh, reveal, restore, the editor's outcome). `None` when no tab
+    /// `id` is registered.
+    pub(super) fn call_tab<R>(
+        &mut self,
+        id: TabId,
+        call: impl FnOnce(&mut dyn Tab, &mut Ctx<'_>) -> R,
+    ) -> Option<R> {
+        let origin = Origin::Tab(id);
+        let result = {
+            let Self {
+                scope,
+                projects,
+                top_bar,
+                keys,
+                theme,
+                emit,
+                tabs,
+                focus,
+                ui,
+                last_claim,
+                ..
+            } = self;
+            let tab = tabs.by_id_mut(id)?;
+            let view = TabView::of(&*tab, focus, ui, *last_claim);
+            let mut ctx = Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit)
+                .with_tab_view(view);
+            call(tab, &mut ctx)
+        };
+        self.drain(&origin);
+        Some(result)
     }
 
     /// The shell's paint over the panes the active tab claimed (MOD-115 M2 §6.4): the activity
@@ -864,26 +971,12 @@ impl App {
     /// emitted, as `on_reply` does. A tab that is no longer registered drops it. Sets `dirty`.
     pub fn finish_external_edit(&mut self, tab: TabId, outcome: ExternalEditOutcome) {
         self.dirty = true;
-        let origin = Origin::Tab(tab);
+        if self
+            .call_tab(tab, |view, ctx| view.on_external_edit(outcome, ctx))
+            .is_none()
         {
-            let Self {
-                scope,
-                projects,
-                top_bar,
-                keys,
-                theme,
-                emit,
-                tabs,
-                ..
-            } = self;
-            let Some(view) = tabs.by_id_mut(tab) else {
-                tracing::debug!(%tab, "the tab that asked for the editor is gone");
-                return;
-            };
-            let mut ctx = Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit);
-            view.on_external_edit(outcome, &mut ctx);
+            tracing::debug!(%tab, "the tab that asked for the editor is gone");
         }
-        self.drain(&origin);
     }
 
     /// A terminal event. Key presses, bracketed pastes and (while a view wants them, MOD-71 D4)
@@ -950,26 +1043,8 @@ impl App {
         }
 
         if let Some(id) = self.tabs.active_id() {
-            let origin = Origin::Tab(id);
-            {
-                let Self {
-                    scope,
-                    projects,
-                    top_bar,
-                    keys,
-                    theme,
-                    emit,
-                    tabs,
-                    ..
-                } = self;
-                if let Some(tab) = tabs.active_mut() {
-                    let mut ctx =
-                        Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit);
-                    // `Pass` is the drop: there is no key table for a paste to fall through to.
-                    let _ = tab.on_paste(text, &mut ctx);
-                }
-            }
-            self.drain(&origin);
+            // `Pass` is the drop: there is no key table for a paste to fall through to.
+            let _ = self.call_tab(id, |tab, ctx| tab.on_paste(text, ctx));
         }
     }
 
@@ -1085,29 +1160,10 @@ impl App {
             }
             return;
         }
-        let origin = Origin::Tab(id);
         let status = self.status.take();
-        let handled = {
-            let Self {
-                scope,
-                projects,
-                top_bar,
-                keys,
-                theme,
-                emit,
-                tabs,
-                ..
-            } = self;
-            match tabs.active_mut() {
-                Some(tab) => {
-                    let mut ctx =
-                        Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit);
-                    tab.on_mouse(mouse, &mut ctx)
-                }
-                None => Handled::Pass,
-            }
-        };
-        self.drain(&origin);
+        let handled = self
+            .call_tab(id, |tab, ctx| tab.on_mouse(mouse, ctx))
+            .unwrap_or(Handled::Pass);
         if handled == Handled::Consumed {
             self.dirty = true;
         } else if self.status.is_none() {
@@ -1275,32 +1331,10 @@ impl App {
             }
         }
 
-        if let Some(id) = self.tabs.active_id() {
-            let origin = Origin::Tab(id);
-            let handled = {
-                let Self {
-                    scope,
-                    projects,
-                    top_bar,
-                    keys,
-                    theme,
-                    emit,
-                    tabs,
-                    ..
-                } = self;
-                match tabs.active_mut() {
-                    Some(tab) => {
-                        let mut ctx =
-                            Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit);
-                        tab.on_key(key, &mut ctx)
-                    }
-                    None => Handled::Pass,
-                }
-            };
-            self.drain(&origin);
-            if handled == Handled::Consumed {
-                return;
-            }
+        if let Some(id) = self.tabs.active_id()
+            && self.call_tab(id, |tab, ctx| tab.on_key(key, ctx)) == Some(Handled::Consumed)
+        {
+            return;
         }
 
         // The active tab's stack (MOD-67 M3 D6), else the base stack. The tab's, not
@@ -1459,14 +1493,10 @@ impl App {
 
         match self.tabs.active() {
             Some(tab) => {
-                let mut ctx = self
-                    .ctx(Origin::Tab(tab.id()))
+                let ctx = self
+                    .tab_ctx(tab)
                     .with_editor_area(&self.editor_area)
-                    .with_focus(self.focus_of(tab))
                     .with_pane_claim(&self.pane_claim);
-                if let Some(layout) = self.layout_of(tab) {
-                    ctx = ctx.with_layout(layout);
-                }
                 tab.render(frame, chrome.body, &ctx);
             }
             None => {
@@ -1510,7 +1540,7 @@ impl App {
                 }
             });
             let width = target.width.saturating_sub(4);
-            let hint = tab.key_hint(width, &self.ctx(Origin::Tab(tab.id())));
+            let hint = tab.key_hint(width, &self.tab_ctx(tab));
             if let Some(line) = hint {
                 paint_shell_hints(frame.buffer_mut(), target, line, self.theme.base);
             }
@@ -2990,5 +3020,196 @@ pub(crate) mod shell_tests {
         app.register_tab(Box::new(crate::ui::tabs::ChatTab::new()));
         let _ = draw(&mut app, 100, 30);
         assert_eq!(app.last_claim, None);
+    }
+
+    /// What a [`Watcher`] saw: each entry the shell called it through, and the focus its `Ctx`
+    /// carried there.
+    type Seen = std::rc::Rc<std::cell::RefCell<Vec<(&'static str, PaneId)>>>;
+
+    /// A list + detail tab that records `ctx.focus()` at every entry the shell calls it through
+    /// (T6R finding 1); `mouse` is whether its own gesture wants the mouse.
+    struct Watcher {
+        seen: Seen,
+        mouse: bool,
+    }
+
+    impl Watcher {
+        fn saw(&self, entry: &'static str, ctx: &Ctx<'_>) {
+            self.seen.borrow_mut().push((entry, ctx.focus()));
+        }
+    }
+
+    impl Tab for Watcher {
+        fn id(&self) -> TabId {
+            TabId("watcher")
+        }
+        fn title(&self) -> &str {
+            "Watcher"
+        }
+        fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+            Vec::new()
+        }
+        fn on_scope_change(&mut self, _scope: &Scope) {}
+        fn on_key(&mut self, _key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+            self.saw("key", ctx);
+            Handled::Pass
+        }
+        fn on_mouse(&mut self, _mouse: crossterm::event::MouseEvent, ctx: &mut Ctx<'_>) -> Handled {
+            self.saw("mouse", ctx);
+            Handled::Consumed
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
+            let areas = ctx.split(area, SPLIT_LAYOUT);
+            let block = || Block::bordered().border_type(BorderType::Rounded);
+            if let Some(list) = areas.list {
+                frame.render_widget(block(), list);
+            }
+            if !areas.detail.is_empty() {
+                frame.render_widget(block(), areas.detail);
+            }
+        }
+        fn key_stack(&self) -> Option<Stack<'static>> {
+            Some(views::BACKLOG_BODY)
+        }
+        fn key_hint(&self, _width: u16, ctx: &Ctx<'_>) -> Option<Line<'static>> {
+            self.saw("hint", ctx);
+            Some(Line::from("j/k move"))
+        }
+        fn panes(&self) -> Panes {
+            Panes::ListDetail(SPLIT_LAYOUT)
+        }
+        fn wants_mouse(&self) -> bool {
+            self.mouse
+        }
+        fn restore(&mut self, _loc: &TabLoc, ctx: &mut Ctx<'_>) -> bool {
+            self.saw("restore", ctx);
+            true
+        }
+    }
+
+    /// A shell with a [`Watcher`] registered, about off, drawn once (so it claimed its panes).
+    fn watched(mouse: bool) -> (App, Seen) {
+        let seen = Seen::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.about_visible = false;
+        app.register_tab(Box::new(Watcher {
+            seen: seen.clone(),
+            mouse,
+        }));
+        let _ = draw(&mut app, 100, 30);
+        (app, seen)
+    }
+
+    /// The focus the watcher's last `entry` call carried.
+    fn last_seen(seen: &Seen, entry: &str) -> Option<PaneId> {
+        seen.borrow()
+            .iter()
+            .rev()
+            .find(|(at, _)| *at == entry)
+            .map(|(_, focus)| *focus)
+    }
+
+    /// T6R finding 1 (D3): every `Ctx` the shell builds for a tab carries the tab's focused
+    /// pane, not only the render's: `on_key`, `key_hint`, `on_mouse` and `restore` see the
+    /// focus `Tab` moved.
+    #[test]
+    fn every_ctx_the_shell_builds_for_a_tab_carries_its_focus() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+
+        let (mut app, seen) = watched(true);
+        assert_eq!(last_seen(&seen, "hint"), Some(PaneId::List));
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(focused(&app), PaneId::Detail);
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(last_seen(&seen, "key"), Some(PaneId::Detail), "on_key");
+        let _ = draw(&mut app, 100, 30);
+        assert_eq!(last_seen(&seen, "hint"), Some(PaneId::Detail), "key_hint");
+        let (_, _, areas) = app.last_claim.expect("claimed");
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: areas.detail.x + 3,
+            row: areas.detail.y + 3,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(last_seen(&seen, "mouse"), Some(PaneId::Detail), "on_mouse");
+        // Back to the place `Tab` left (the list), then forward to the detail: each restore
+        // sees the pane it restores.
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(last_seen(&seen, "restore"), Some(PaneId::List), "back");
+        press(&mut app, KeyCode::Right, KeyModifiers::ALT);
+        assert_eq!(last_seen(&seen, "restore"), Some(PaneId::Detail), "forward");
+    }
+
+    /// T6R finding 1 with MD8: the wheel over the detail focuses it, and the motion key it
+    /// presses reaches the tab with the detail focused.
+    #[test]
+    fn the_wheel_over_the_detail_reaches_the_tab_with_the_detail_focused() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+
+        let (mut app, seen) = watched(false);
+        let (_, _, areas) = app.last_claim.expect("claimed");
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: areas.detail.x + 3,
+            row: areas.detail.y + 3,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(focused(&app), PaneId::Detail);
+        assert_eq!(last_seen(&seen, "key"), Some(PaneId::Detail));
+        assert_eq!(last_seen(&seen, "mouse"), None, "the tab wants no mouse");
+    }
+
+    /// T6R finding 2 (D3, D1): a restart onto a saved layout that hides the list (the detail
+    /// preset, or the list toggled off) focuses the detail: at load, in the frame (the accent),
+    /// in `here()`, and the first `Tab` records no way back to the hidden list.
+    #[test]
+    fn a_restart_onto_a_layout_that_hides_the_list_focuses_the_detail() {
+        use crate::ui::state_file::UiStore;
+
+        let hiding = [
+            TabLayout {
+                preset: Preset::Focus,
+                ..SPLIT_LAYOUT
+            },
+            TabLayout {
+                list_on: false,
+                ..SPLIT_LAYOUT
+            },
+        ];
+        for layout in hiding {
+            let store = UiStore::memory();
+            let mut state = store.load().state;
+            state.layouts.insert(SPLIT.0.to_owned(), layout);
+            store.save(&state).expect("the memory store saves");
+
+            let mut app = split_app();
+            app.apply_ui_state(store.load().state);
+            app.ui_store = store;
+            assert_eq!(focused(&app), PaneId::Detail, "{layout:?}: at load");
+            let here = app.here().expect("a place");
+            assert_eq!(here.pane, PaneId::Detail, "{layout:?}");
+            assert_eq!(here.label, "Backlog", "{layout:?}: the detail is not named");
+
+            let buf = draw(&mut app, 100, 30);
+            let (_, areas) = claim(&app);
+            assert_eq!(areas.list, None, "{layout:?}");
+            let accent = app.theme.tab_accent(SPLIT.0);
+            let detail = areas.detail;
+            assert_eq!(
+                buf[(detail.x, detail.y)].fg,
+                accent.fg.unwrap_or_default(),
+                "{layout:?}: the accent is on the detail"
+            );
+
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            assert_eq!(focused(&app), PaneId::Detail, "{layout:?}");
+            assert!(
+                app.history.peek_back().is_none(),
+                "{layout:?}: no way back to a hidden pane: {:?}",
+                app.history.peek_back().map(|loc| &loc.label)
+            );
+        }
     }
 }

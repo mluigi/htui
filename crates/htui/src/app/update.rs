@@ -6,8 +6,6 @@
 use htui_core::model::{RunId, Scope, StepId, WorkspaceId, WorkspaceSummary};
 use htui_orch::Command;
 
-use ratatui::layout::Rect;
-
 use crate::app::action::{
     Action, HistoryAction, LayoutAction, OverlayAction, PaneAction, RevealTarget, TabAction,
 };
@@ -16,11 +14,11 @@ use crate::connection::DsnState;
 use crate::run_worker::OrchRequest;
 use crate::store_worker::{Origin, ReplyEnvelope, StoreReply, StoreRequest};
 use crate::ui::overlay::{Overlay, OverlayId};
+use crate::ui::shell::PaneId;
 use crate::ui::shell::history::Loc;
 use crate::ui::shell::layout as pane_layout;
-use crate::ui::shell::{PaneId, TabLayout};
+use crate::ui::tabs::SettingsTab;
 use crate::ui::tabs::settings::ConnectionSection;
-use crate::ui::tabs::{SettingsTab, TabId};
 
 /// The top bar's counts are re-read once a second, i.e. every fourth 250 ms tick.
 const TICKS_PER_REFRESH: u64 = 4;
@@ -150,17 +148,6 @@ impl App {
         self.save_ui_state();
     }
 
-    /// Whether `layout` hides `pane` of tab `id` (MOD-115 M2 D3), drawn over the region the tab
-    /// split last, else one that holds every pane: only which panes are shown matters here.
-    fn hides(&self, id: TabId, layout: &TabLayout, pane: PaneId) -> bool {
-        let region = self
-            .last_claim
-            .filter(|(claimed, _, _)| *claimed == id)
-            .map_or(Rect::new(0, 0, 200, 60), |(_, region, _)| region);
-        let areas = pane_layout::areas(region, layout, pane);
-        !pane_layout::visible(&areas).contains(&pane)
-    }
-
     /// `history.back`/`forward` (MOD-115 M2 D5): to the place on the history, the place left
     /// kept for the way back; the move itself is not recorded.
     fn go_history(&mut self, step: HistoryAction) {
@@ -178,35 +165,15 @@ impl App {
         self.go(&to);
     }
 
-    /// Goes to `loc`: its tab, the tab's own location (`Tab::restore`, and what it emitted
-    /// drained) and the focused pane. A tab that is no longer registered is a no-op; the tab an
-    /// in-pane editor is open for is focused but not restored (MOD-57 M2 E5: nothing steers it).
+    /// Goes to `loc`: its tab, the focused pane and the tab's own location (`Tab::restore`, with
+    /// the pane it restores focused in its `Ctx`, and what it emitted drained). A tab that is no
+    /// longer registered is a no-op; the tab an in-pane editor is open for is focused but not
+    /// restored (MOD-57 M2 E5: nothing steers it).
     fn go(&mut self, loc: &Loc) {
         if self.tabs.title(loc.tab).is_none() {
             return;
         }
         self.update_tab(TabAction::Focus(loc.tab));
-        if self.editor_tab() != Some(loc.tab) {
-            let origin = Origin::Tab(loc.tab);
-            {
-                let Self {
-                    scope,
-                    projects,
-                    top_bar,
-                    keys,
-                    theme,
-                    emit,
-                    tabs,
-                    ..
-                } = self;
-                if let Some(view) = tabs.by_id_mut(loc.tab) {
-                    let mut ctx =
-                        Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit);
-                    let _ = view.restore(&loc.at, &mut ctx);
-                }
-            }
-            self.drain(&origin);
-        }
         // D3: a pane the layout has hidden since the place was left gives the focus to the
         // detail, as a layout key that hides it does.
         let hidden = self
@@ -217,6 +184,9 @@ impl App {
             .is_some_and(|layout| self.hides(loc.tab, &layout, loc.pane));
         let pane = if hidden { PaneId::Detail } else { loc.pane };
         self.focus.insert(loc.tab, pane);
+        if self.editor_tab() != Some(loc.tab) {
+            let _ = self.call_tab(loc.tab, |view, ctx| view.restore(&loc.at, ctx));
+        }
     }
 
     /// Opening and closing overlays. An unregistered id is ignored: the shell must not die
@@ -293,28 +263,9 @@ impl App {
     /// MOD-41 plan D16: the active tab's refresh hook, with a [`Ctx`] addressed as that tab, then
     /// what it emitted drained, as [`App::finish_external_edit`] does.
     fn refresh_active_tab(&mut self) {
-        let Some(id) = self.tabs.active_id() else {
-            return;
-        };
-        let origin = Origin::Tab(id);
-        {
-            let Self {
-                scope,
-                projects,
-                top_bar,
-                keys,
-                theme,
-                emit,
-                tabs,
-                ..
-            } = self;
-            let Some(view) = tabs.active_mut() else {
-                return;
-            };
-            let mut ctx = Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit);
-            view.on_refresh(&mut ctx);
+        if let Some(id) = self.tabs.active_id() {
+            let _ = self.call_tab(id, |view, ctx| view.on_refresh(ctx));
         }
-        self.drain(&origin);
     }
 
     /// MOD-12 M3 D9: the top overlay's refresh hook, with a [`Ctx`] addressed as that overlay, then
@@ -423,27 +374,9 @@ impl App {
             return;
         }
         self.update_tab(TabAction::Focus(tab));
-        let origin = Origin::Tab(tab);
-        {
-            let Self {
-                scope,
-                projects,
-                top_bar,
-                keys,
-                theme,
-                emit,
-                tabs,
-                ..
-            } = self;
-            let Some(view) = tabs.by_id_mut(tab) else {
-                return;
-            };
-            let mut ctx = Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit);
-            if !view.reveal(target, &mut ctx) {
-                tracing::debug!(%tab, "the tab does not reveal this target");
-            }
+        if self.call_tab(tab, |view, ctx| view.reveal(target, ctx)) == Some(false) {
+            tracing::debug!(%tab, "the tab does not reveal this target");
         }
-        self.drain(&origin);
     }
 
     /// A reply came back: top bar first, then the staleness gate, then the addressee.
@@ -462,25 +395,7 @@ impl App {
         match origin {
             Origin::App => self.on_app_reply(&reply),
             Origin::Tab(id) => {
-                let origin = Origin::Tab(id);
-                {
-                    let Self {
-                        scope,
-                        projects,
-                        top_bar,
-                        keys,
-                        theme,
-                        emit,
-                        tabs,
-                        ..
-                    } = self;
-                    if let Some(tab) = tabs.by_id_mut(id) {
-                        let mut ctx =
-                            Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit);
-                        tab.on_reply(&reply, &mut ctx);
-                    }
-                }
-                self.drain(&origin);
+                let _ = self.call_tab(id, |tab, ctx| tab.on_reply(&reply, ctx));
             }
             Origin::Overlay(id) => {
                 let origin = Origin::Overlay(id);
