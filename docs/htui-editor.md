@@ -273,8 +273,10 @@ is held to these rules:
   `[editor] abort = "ctrl-4": "ctrl-4" is already editor.focus (default) in [editor]`. The other
   way round is allowed: `[editor] focus = ["ctrl-x"]` takes `ctrl-x` from `abort`, which is then
   unbound, with the notice below.
-- **`ctrl-c` cannot be bound**, here as in every table:
-  `[editor] focus = "ctrl-c": ctrl-c always quits and cannot be bound`.
+- **`ctrl-c` is taken by default.** It is the default of `global.quit` and `leave.confirm`, which
+  act while an edit is open, so `[editor] focus = "ctrl-c"` is refused with
+  `[editor] focus = "ctrl-c": "ctrl-c" is already global.quit (default) while an edit is open`
+  (and the same for `leave.confirm`).
 - **A `[global]` key may take `abort`'s default.** The global keys act beside the editor's on the
   editor's tab, so a global key on an editor key is a collision, with one exception: `abort` left
   at its default gives its key up. `[global] quit = ["ctrl-x"]` loads, and `editor.abort` is then

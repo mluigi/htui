@@ -622,7 +622,7 @@ conflict. Their verdicts survive only where restated here.
   leaving, from every htui screen and field (the first press opens the leave dialog, the second
   leaves, R-TUI-18), and may be rebound like any key; a set that leaves no way to leave `htui` is
   refused, and so is one that leaves no way to stay in the leave dialog, out of a text field, out of
-  an overlay, or back into an in-pane editor. A pane that runs another program in a terminal
+  an overlay, or out of a focused in-pane editor. A pane that runs another program in a terminal
   forwards `ctrl-c` to that program and always keeps a key that leaves the pane. Every hint line and
   the `?` help show the keys in force, and the help opens from every screen. No default needs AltGr
   on common non-US layouts. Plain arrows never leave a pane; `Tab`/`Shift-Tab`, `Ctrl ←→` or a click

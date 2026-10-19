@@ -625,3 +625,5 @@ with T5 serially.
   MOD-115 while it is open in `HANDOFF.md` would break lifecycle step 3 (`.claude/rules/workflow-docs.md`). The
   `-decisions` name is supplementary prose to the validator. `docs/REQUIREMENTS.md` (header and R-TUI-10) links
   it. At close-out the item's write-up is `mod-115.md` with its index line, and it folds this file in.
+  T8 repair 2 touched `docs/htui-editor.md` outside the set: its `ctrl-c cannot be bound` bullet
+  contradicted README's Changing keys, which links it; it now names the `global.quit`/`leave.confirm` clash.
