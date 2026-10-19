@@ -75,7 +75,7 @@ const COMPOSE_HINT: HintSpec = &[Hint::Text("Enter send"), Hint::Text("Esc leave
 
 /// A parked permission request (`CHAT_LIVE`): the digits are `answer.option_*` (MOD-115 M2 D7).
 const PARKED_HINT: HintSpec = &[
-    Hint::Text("1-9 answer"),
+    Hint::Many(permission::ANSWERS, "answer"),
     Hint::One(Act::ChatCompose, "compose"),
     Hint::One(Act::ChatThoughts, "thoughts"),
 ];
@@ -885,7 +885,7 @@ impl Tab for ChatTab {
         }
 
         if let Some(row) = parked {
-            PermissionStrip::render(frame, strip, row, ctx.theme);
+            PermissionStrip::render(frame, strip, row, ctx.keys(), views::CHAT_LIVE, ctx.theme);
         }
         // Not under a replay: the composer belongs to the live view, and a replay must not show
         // an input line for a step that can take no input. The keys are the shell's hint row
@@ -1163,6 +1163,17 @@ mod tests {
             &mut shell.ctx(),
         );
         assert!(tab.transcript.parked().is_some(), "the agent asks");
+        // T5 repair: the hint names the keys that answer, not the digits.
+        assert!(
+            tab.hint_text(&shell.keys)
+                .starts_with("F8/2/3/4/5/6/7/8/9 answer · "),
+            "{}",
+            tab.hint_text(&shell.keys)
+        );
+        assert!(
+            tab.hint_text(Keys::compiled()).starts_with("1-9 answer · "),
+            "the defaults read as before"
+        );
         drop(shell.emit.take());
         assert_eq!(
             tab.on_key(key(KeyCode::Char('1')), &mut shell.ctx()),

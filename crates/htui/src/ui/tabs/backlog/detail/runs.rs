@@ -1496,7 +1496,7 @@ fn strip_options(options: &[RelayOption]) -> Vec<PermissionOption> {
 
 /// MOD-42 plan D14: the two lines under a step with a pending request, each exactly [`PANE`]
 /// wide: `asks: <summary>` from the status column, then the answer strip.
-fn permission_lines(pending: &StepPermission, theme: &Theme) -> [Line<'static>; 2] {
+fn permission_lines(pending: &StepPermission, keys: &Keys, theme: &Theme) -> [Line<'static>; 2] {
     let summary = pending.summary.as_deref().unwrap_or(NO_SUMMARY);
     let asks = Line::from(vec![
         Span::raw(blank(INDENT)),
@@ -1506,7 +1506,13 @@ fn permission_lines(pending: &StepPermission, theme: &Theme) -> [Line<'static>; 
         ),
     ]);
     let mut spans = cells::clip_spans(
-        &PermissionStrip::line(&strip_options(&pending.options), theme).spans,
+        &PermissionStrip::line(
+            &strip_options(&pending.options),
+            keys,
+            views::RUNS_BROWSE,
+            theme,
+        )
+        .spans,
         PANE,
     );
     let used: usize = spans.iter().map(|span| cell_width(&span.content)).sum();
@@ -1961,7 +1967,7 @@ impl DetailTab for RunsTab {
             return;
         }
         if self.view == View::Flow {
-            self.render_flow(frame, list, area, ctx.theme);
+            self.render_flow(frame, list, area, ctx.keys(), ctx.theme);
             return;
         }
 
@@ -1971,7 +1977,7 @@ impl DetailTab for RunsTab {
         let [head, body] =
             Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(list);
         frame.render_widget(Paragraph::new(Vec::from(header_lines(ctx.theme))), head);
-        let (lines, cursor_end) = self.list_lines(ctx.theme);
+        let (lines, cursor_end) = self.list_lines(ctx.keys(), ctx.theme);
         let skip = cursor_end.saturating_sub(usize::from(body.height));
         frame.render_widget(
             Paragraph::new(lines).scroll((u16::try_from(skip).unwrap_or(u16::MAX), 0)),
@@ -1985,11 +1991,18 @@ impl RunsTab {
     /// run and step, and the rest is the canvas, or "No steps yet." under a run with none. `pane`
     /// is the whole pane, footer included, whose size alone decides a resize reveal (MOD-71 D7,
     /// review M1).
-    fn render_flow(&self, frame: &mut Frame<'_>, area: Rect, pane: Rect, theme: &Theme) {
+    fn render_flow(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        pane: Rect,
+        keys: &Keys,
+        theme: &Theme,
+    ) {
         let Some(run) = self.entry_run() else {
             return;
         };
-        let lines = self.flow_head(run, theme);
+        let lines = self.flow_head(run, keys, theme);
         let [head, canvas] = Layout::vertical([
             Constraint::Length(u16::try_from(lines.len()).unwrap_or(u16::MAX)),
             Constraint::Min(0),
@@ -2013,7 +2026,7 @@ impl RunsTab {
     /// command), the step's parked reason, how its chat opened, the pending request the digits
     /// answer, so a digit in the flow never answers a request the pane does not show, and its
     /// follow-up's lines (MOD-70 D14: queued, sent or refused with its reason).
-    fn flow_head(&self, run: &RunSummary, theme: &Theme) -> Vec<Line<'static>> {
+    fn flow_head(&self, run: &RunSummary, keys: &Keys, theme: &Theme) -> Vec<Line<'static>> {
         let mut lines = run_lines(run, self.cancel_requested(run.id), theme);
         if self.waiting.contains(&run.id) {
             lines.push(Line::styled(cells::fit(WAITING_LINE, PANE), theme.warning));
@@ -2022,7 +2035,7 @@ impl RunsTab {
             lines.extend(note_line(step, theme));
             lines.extend(opening_lines(step, theme));
             if let Some(pending) = self.pending_on(step.id) {
-                lines.extend(permission_lines(pending, theme));
+                lines.extend(permission_lines(pending, keys, theme));
             }
             if let Some(view) = self.follow_up_on(step.id) {
                 lines.extend(follow_up_lines(view, theme));
@@ -2033,7 +2046,7 @@ impl RunsTab {
 
     /// The runs from the first visible one, each with its steps, and the line index just past the
     /// cursor's entry (0 with no cursor): what the list has to show to keep the cursor in view.
-    fn list_lines(&self, theme: &Theme) -> (Vec<Line<'static>>, usize) {
+    fn list_lines(&self, keys: &Keys, theme: &Theme) -> (Vec<Line<'static>>, usize) {
         let cursor = self.entry();
         let step_cursor = self.selected_step();
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -2061,7 +2074,7 @@ impl RunsTab {
                 // MOD-42 D14: the request's two lines belong to the step, so the cursor's end
                 // counts them and the scroll keeps them in view.
                 if let Some(pending) = self.pending_on(step.id) {
-                    lines.extend(permission_lines(pending, theme));
+                    lines.extend(permission_lines(pending, keys, theme));
                 }
                 // MOD-70 D14: so do the follow-up's.
                 if let Some(view) = self.follow_up_on(step.id) {
@@ -2588,7 +2601,7 @@ mod tests {
             Some("execute: cargo test"),
             two_options(),
         );
-        let [asks, _] = permission_lines(&pending, &theme);
+        let [asks, _] = permission_lines(&pending, Keys::compiled(), &theme);
         assert_eq!(styles(&asks), [theme.warning], "the asks: line");
 
         let shell = Shell::new();
@@ -2601,7 +2614,7 @@ mod tests {
             }),
             &mut shell.ctx(),
         );
-        let (listed, _) = pane.list_lines(&theme);
+        let (listed, _) = pane.list_lines(Keys::compiled(), &theme);
         let waiting = listed
             .iter()
             .find(|line| text(line).trim() == WAITING_LINE)
@@ -2612,7 +2625,7 @@ mod tests {
             .iter()
             .find(|run| run.id == ids::RUN_1)
             .expect("RUN_1 is listed");
-        let head = pane.flow_head(run, &theme);
+        let head = pane.flow_head(run, Keys::compiled(), &theme);
         let waiting = head
             .iter()
             .find(|line| text(line).trim() == WAITING_LINE)
@@ -2643,7 +2656,7 @@ mod tests {
     /// The text of the list's lines, trailing blanks trimmed: every line, where [`lines`] stops at
     /// the test terminal's sixteen rows.
     fn list_text(pane: &RunsTab, theme: &Theme) -> Vec<String> {
-        pane.list_lines(theme)
+        pane.list_lines(Keys::compiled(), theme)
             .0
             .iter()
             .map(|line| text(line).trim_end().to_owned())
@@ -3156,7 +3169,7 @@ mod tests {
             option("reject", "Reject once", RelayOptionKind::RejectOnce),
         ];
         let pending = pending_on(ids::RUN_1, ids::STEP_PRD, Some(&summary), options);
-        for line in permission_lines(&pending, &theme) {
+        for line in permission_lines(&pending, Keys::compiled(), &theme) {
             let used: usize = line
                 .spans
                 .iter()
@@ -3679,9 +3692,9 @@ mod tests {
             ["cancel this run?", "y cancel it · n keep it"]
         );
         // T5 repair: the question answers only yes or no, so its `?` box lists no choice keys.
-        assert_eq!(pane.stack(), crate::keys::views::RUNS_CANCEL);
+        assert_eq!(pane.stack(), views::RUNS_CANCEL);
         assert!(
-            crate::keys::Keys::compiled()
+            Keys::compiled()
                 .help_lines(pane.stack(), |_| false)
                 .iter()
                 .all(|line| line.heading != "Choice")
@@ -4661,7 +4674,7 @@ mod tests {
         pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
         let run = pane.runs[0].clone();
         let head: Vec<String> = pane
-            .flow_head(&run, &shell.theme)
+            .flow_head(&run, Keys::compiled(), &shell.theme)
             .iter()
             .map(|line| text(line).trim_end().to_owned())
             .collect();
@@ -5846,7 +5859,7 @@ mod tests {
             (Some("edit: src/lib.rs"), four),
         ] {
             let pending = pending_on(ids::RUN_1, ids::STEP_PRD, summary, options);
-            let [asks, strip] = permission_lines(&pending, &theme);
+            let [asks, strip] = permission_lines(&pending, Keys::compiled(), &theme);
             for line in [&asks, &strip] {
                 assert_eq!(
                     line.width(),

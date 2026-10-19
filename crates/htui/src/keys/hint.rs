@@ -42,6 +42,11 @@ pub enum Hint {
     /// `skills.switch_view`, whose six defaults `All` would spell out, reads `h/l view` (MOD-67
     /// M4 R1). One admitted chord renders alone.
     Two(Act, &'static str),
+    /// The first admitted chord of each act, merged as a `?` box entry merges them (`1-9` for a
+    /// run of three or more consecutive plain characters, else joined by `/`), then `text`: the
+    /// nine `answer.option_*` read `1-9 answer` until one moves (MOD-115 M2 T5). An unbound act
+    /// drops out, and the element with it when every act is unbound.
+    Many(&'static [Act], &'static str),
     /// Fixed text: a widget's own key (`Enter store`, `Esc cancel`) or a note (`typed text is
     /// never shown`). Never dropped, unless it is empty.
     Text(&'static str),
@@ -143,6 +148,19 @@ impl Keys {
                 labelled(self.labels(stack, act).into_iter().take(2).collect(), text)
             }
             Hint::All(act, text) => labelled(self.labels(stack, act), text),
+            Hint::Many(acts, text) => {
+                let chords: Vec<KeyChord> = acts
+                    .iter()
+                    .filter_map(|&act| {
+                        let (layer, row) = self.resolve_row(stack, act)?;
+                        row.chords
+                            .iter()
+                            .copied()
+                            .find(|chord| layer.admits_chord(*chord))
+                    })
+                    .collect();
+                (!chords.is_empty()).then(|| with_text(&chord_list(&chords), text))
+            }
             Hint::Text(text) => (!text.is_empty()).then(|| text.to_owned()),
         };
         spec.iter()
@@ -381,6 +399,26 @@ mod tests {
         keys.help_line(Context::Global, offered)
             .expect("the global context offers something")
             .text()
+    }
+
+    /// T5 repair: `Many` lists each act's first admitted chord, merged like a `?` box entry, so
+    /// the nine answers read `1-9` until one moves; an unbound act drops out, and so does the
+    /// element when every act is unbound.
+    #[test]
+    fn many_merges_the_first_chord_of_each_act() {
+        const ANSWERS: &[Act] = &[Act::AnswerOption1, Act::AnswerOption2, Act::AnswerOption3];
+        let spec = &[Hint::Many(ANSWERS, "answer"), Hint::Text("end")];
+        assert_eq!(
+            Keys::compiled().hint(views::CHAT_LIVE, spec),
+            "1-3 answer · end"
+        );
+        let moved = Keys::defaults().with_chords(Context::Answer, Act::AnswerOption2, &[]);
+        assert_eq!(moved.hint(views::CHAT_LIVE, spec), "1/3 answer · end");
+        let none = Keys::defaults()
+            .with_chords(Context::Answer, Act::AnswerOption1, &[])
+            .with_chords(Context::Answer, Act::AnswerOption2, &[])
+            .with_chords(Context::Answer, Act::AnswerOption3, &[]);
+        assert_eq!(none.hint(views::CHAT_LIVE, spec), "end");
     }
 
     #[test]

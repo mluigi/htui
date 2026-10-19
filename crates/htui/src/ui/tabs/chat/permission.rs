@@ -11,30 +11,64 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use crate::keys::{Act, Keys, Stack};
 use crate::ui::Theme;
 use crate::ui::tabs::chat::transcript::TranscriptRow;
+
+/// The rows that answer a parked request, option by option (MOD-115 M2 D7): the strip labels
+/// each option with its row's key, and the chat's parked hint lists them.
+pub const ANSWERS: &[Act] = &[
+    Act::AnswerOption1,
+    Act::AnswerOption2,
+    Act::AnswerOption3,
+    Act::AnswerOption4,
+    Act::AnswerOption5,
+    Act::AnswerOption6,
+    Act::AnswerOption7,
+    Act::AnswerOption8,
+    Act::AnswerOption9,
+];
 
 /// The one-line answer strip.
 #[derive(Debug, Clone, Copy)]
 pub struct PermissionStrip;
 
 impl PermissionStrip {
-    /// Draws `[1] Allow once  [2] Reject once` for the parked request.
-    pub fn render(frame: &mut Frame<'_>, area: Rect, row: &TranscriptRow, theme: &Theme) {
+    /// Draws `[1] Allow once  [2] Reject once` for the parked request, each option labelled with
+    /// its `answer.option_*` key through `stack`.
+    pub fn render(
+        frame: &mut Frame<'_>,
+        area: Rect,
+        row: &TranscriptRow,
+        keys: &Keys,
+        stack: Stack<'_>,
+        theme: &Theme,
+    ) {
         let TranscriptRow::Permission { options, .. } = row else {
             return;
         };
-        frame.render_widget(Paragraph::new(Self::line(options, theme)), area);
+        frame.render_widget(
+            Paragraph::new(Self::line(options, keys, stack, theme)),
+            area,
+        );
     }
 
     /// The strip itself, `answer  [1] Allow once  [2] Reject once`, over any list of offered
     /// options: the chat's parked row draws it, and so does the Runs pane's relayed request
-    /// (MOD-42 plan D14).
+    /// (MOD-42 plan D14). Each option's key is its `answer.option_*` row's first chord through
+    /// `stack` (MOD-115 M2 T5); an option whose row is unbound shows no key.
     #[must_use]
-    pub fn line(options: &[PermissionOption], theme: &Theme) -> Line<'static> {
+    pub fn line(
+        options: &[PermissionOption],
+        keys: &Keys,
+        stack: Stack<'_>,
+        theme: &Theme,
+    ) -> Line<'static> {
         let mut spans = vec![Span::styled("answer  ", theme.title)];
         for (index, option) in options.iter().enumerate() {
-            spans.push(Span::styled(format!("[{}] ", index + 1), theme.accent));
+            if let Some(label) = ANSWERS.get(index).and_then(|&act| keys.label(stack, act)) {
+                spans.push(Span::styled(format!("[{label}] "), theme.accent));
+            }
             spans.push(Span::styled(option.label.clone(), theme.base));
             // `htui` forwards an `_always` choice so the **agent** remembers it; `htui`'s own
             // `agent.settings.permission.remembered[]` has no editor yet (plan D21), and saying so
@@ -74,6 +108,7 @@ impl PermissionStrip {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keys::{Keys, load_str, views};
     use htui_agent::driver::PermissionRequestId;
 
     fn row() -> TranscriptRow {
@@ -106,6 +141,30 @@ mod tests {
             PermissionStrip::pick(&row(), '2').map(|option| option.id),
             Some("reject".to_owned())
         );
+    }
+
+    fn strip_text(keys: &Keys) -> String {
+        let TranscriptRow::Permission { options, .. } = row() else {
+            unreachable!("row() is a permission");
+        };
+        PermissionStrip::line(&options, keys, views::CHAT_LIVE, &Theme::default())
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// T5 repair: each option is labelled with its `answer.option_*` key in force, and an option
+    /// whose key is unbound shows no key.
+    #[test]
+    fn each_option_is_labelled_with_its_answer_key() {
+        assert_eq!(
+            strip_text(Keys::compiled()),
+            "answer  [1] Allow once  [2] Reject  "
+        );
+        let keys = load_str("version = 2\n[answer]\noption_1 = \"f8\"\noption_2 = []\n")
+            .expect("the keys load");
+        assert_eq!(strip_text(&keys), "answer  [F8] Allow once  Reject  ");
     }
 
     #[test]
