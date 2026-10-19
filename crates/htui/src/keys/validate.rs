@@ -22,7 +22,7 @@ use super::load::must_keep;
 use super::stack::WHILE_EDITING;
 use super::views::M2_LAYERS;
 use super::{
-    Act, CATALOGUE, Context, DECLARED, KeyChord, KeyFileError, Keys, Lost, Row, SHADOWING,
+    Act, CATALOGUE, Context, DECLARED, ESC, KeyChord, KeyFileError, Keys, Lost, Row, SHADOWING,
     STATE_GUARDED, Stack, V1_DEFAULTS, quote,
 };
 
@@ -56,6 +56,8 @@ use super::{
 /// ["f2"]` loads and `layout.toggle_list` loses `f2`. Only a chord the entry
 /// added gives way: one it repeats from its own default met the M2 default in the compiled keys
 /// already. A `version = 2` file gets the strict rules above.
+///
+/// MOD-115 M2 MD7 (T5R): a kept `Esc` ([`kept_esc`]) is never taken nor given, in either pass.
 pub(super) fn give_way(keys: &mut Keys) {
     let mut taken: Vec<(usize, Lost)> = Vec::new();
     for entry in keys.rows.iter().filter(|row| row.entry.is_some()) {
@@ -66,7 +68,11 @@ pub(super) fn give_way(keys: &mut Keys) {
             {
                 continue;
             }
-            for &chord in entry.chords.iter().filter(|c| default.chords.contains(c)) {
+            for &chord in entry
+                .chords
+                .iter()
+                .filter(|c| !kept_esc(**c) && default.chords.contains(c))
+            {
                 if !allowed(STATE_GUARDED, entry, default, chord)
                     && keeps_another(&taken, index, default)
                 {
@@ -95,7 +101,10 @@ pub(super) fn give_way(keys: &mut Keys) {
                 // Only a chord new in M2 and one the entry added: one it repeats from its own
                 // default met the M2 default in the compiled keys already, which validate.
                 for &chord in entry.chords.iter().filter(|c| {
-                    default.chords.contains(c) && new_in_m2(default.act, **c) && added(entry, **c)
+                    !kept_esc(**c)
+                        && default.chords.contains(c)
+                        && new_in_m2(default.act, **c)
+                        && added(entry, **c)
                 }) {
                     // E9 (d) holds `editor.focus` against every row in any context.
                     let meet = entry.act == Act::EditorFocus
@@ -126,6 +135,15 @@ pub(super) fn give_way(keys: &mut Keys) {
         row.chords.retain(|&chord| chord != lost.chord);
         row.lost.push(lost);
     }
+}
+
+/// Whether `chord` is a kept `Esc` (MOD-115 M2 MD7): the loader puts `Esc` only on a row whose
+/// compiled default (or, for a view's override of a shared verb, the shared row's) holds it, so
+/// every `Esc` in the keys is one. It never takes a chord from, nor gives way to, anything:
+/// `[chat] back = ["x"]` keeps back's `Esc` and `chat.end` keeps its own, so `Esc` still ends
+/// the chat (T5R).
+fn kept_esc(chord: KeyChord) -> bool {
+    chord == ESC
 }
 
 /// Whether `default` (row `index`) may give one more chord away (MOD-115 M2 D-10): always, unless

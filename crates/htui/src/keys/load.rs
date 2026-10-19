@@ -461,6 +461,8 @@ impl Loader<'_> {
                 Err(reason) => self.push(line, format!("[{table}] {name} = {shown}: {reason}")),
                 // MD7, MD4: a version-1 file listed `Esc` where the row has it anyway (the
                 // README's `close = ["esc", "f2"]`); it changes nothing, so it still loads.
+                // Deliberate: refusing it would break an existing user file, which MD4 forbids;
+                // only a version-2 file has `Esc` refused (MD7).
                 Ok(chord) if chord == ESC && self.keys.version == 1 && keeps_esc => {}
                 Ok(chord) if chord.is_esc() => {
                     self.push(line, format!("[{table}] {name} = {shown}: {ESC_REFUSED}"));
@@ -838,6 +840,93 @@ mod tests {
             errors("[list]\ntop = [\"g\", \"esc\"]\n"),
             one(2, &format!(r#"[list] top = "esc": {ESC_REFUSED}"#))
         );
+    }
+
+    /// Every declared stack's candidates for `Esc` in `keys` equal the compiled ones, so `Esc`
+    /// does on every screen what it does without a file (MD7).
+    fn esc_acts_as_compiled(keys: &Keys, what: &str) {
+        let esc = chord("esc");
+        for &(phrase, stack) in crate::keys::DECLARED {
+            assert_eq!(
+                keys.actions(stack, esc),
+                Keys::compiled().actions(stack, esc),
+                "{what}: Esc {phrase}"
+            );
+        }
+    }
+
+    /// MOD-115 M2 MD7 (T5R): a view's override of a shared verb whose shared row holds `Esc`
+    /// keeps that `Esc`, and the kept `Esc` takes nothing from the view's own `Esc` row: `Esc`
+    /// still ends the chat, cancels the agent help's turn and closes the personas import report.
+    #[test]
+    fn a_kept_esc_never_takes_esc_from_a_views_own_row() {
+        let esc = chord("esc");
+        for (entry, context, act, stack, own) in [
+            (
+                "[chat]\nback = [\"f12\"]\n",
+                Context::Chat,
+                Act::Back,
+                views::CHAT_LIVE,
+                Act::ChatEnd,
+            ),
+            (
+                "[skills.help]\nno = [\"f12\"]\n",
+                Context::SkillsHelp,
+                Act::ConfirmNo,
+                views::HELP_WAITING,
+                Act::SkillsHelpCancel,
+            ),
+            (
+                "[settings.personas]\nno = [\"f12\"]\n",
+                Context::SettingsPersonas,
+                Act::ConfirmNo,
+                views::PERSONAS_REPORT,
+                Act::Back,
+            ),
+        ] {
+            for version in ["", "version = 2\n"] {
+                let src = format!("{version}{entry}");
+                let keys = load_str(&src).unwrap_or_else(|errors| panic!("{src}: {errors:?}"));
+                assert_eq!(
+                    keys.chords(context, act),
+                    [chord("f12"), esc],
+                    "{src}: the override keeps the shared Esc"
+                );
+                assert_eq!(
+                    keys.actions(stack, esc).first(),
+                    Some(&own),
+                    "{src}: Esc does what it did"
+                );
+                assert!(keys.notices().is_empty(), "{src}: {:?}", keys.notices());
+                esc_acts_as_compiled(&keys, &src);
+            }
+        }
+    }
+
+    /// MOD-115 M2 MD7 (T5R): every view override of a shared verb whose shared row holds `Esc`,
+    /// in either version, loads, keeps `Esc`, and leaves `Esc` acting as compiled everywhere.
+    #[test]
+    fn no_view_override_of_a_shared_esc_verb_moves_esc() {
+        let esc = chord("esc");
+        for &context in Context::ALL {
+            for spec in super::overridable(context).filter(|spec| {
+                Keys::compiled()
+                    .chords(spec.context, spec.act)
+                    .contains(&esc)
+            }) {
+                for version in ["", "version = 2\n"] {
+                    let src = format!(
+                        "{version}[{}]\n{} = [\"f12\"]\n",
+                        context.table(),
+                        spec.name
+                    );
+                    let keys = load_str(&src).unwrap_or_else(|errors| panic!("{src}: {errors:?}"));
+                    assert!(keys.chords(context, spec.act).contains(&esc), "{src}");
+                    assert!(keys.notices().is_empty(), "{src}: {:?}", keys.notices());
+                    esc_acts_as_compiled(&keys, &src);
+                }
+            }
+        }
     }
 
     /// MOD-115 M2 D8: a version-1 file's entry takes a `since: 2` default's chord where a
