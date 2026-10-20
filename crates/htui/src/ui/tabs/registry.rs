@@ -153,6 +153,14 @@ pub trait Tab {
     fn restore(&mut self, _loc: &TabLoc, _ctx: &mut Ctx<'_>) -> bool {
         false
     }
+
+    /// MOD-115 M3 D1: whether this tab draws its own kit panes (title, chips, focus border,
+    /// hints). The shell then neither restyles its list/detail borders nor paints the hint
+    /// adapter over them; the hidden-pane note and the activity placeholder stay the shell's.
+    /// Defaulted to `false`. M4's last task deletes it with the adapter.
+    fn draws_chrome(&self) -> bool {
+        false
+    }
 }
 
 /// Every registered tab, in registration order, plus which one is active.

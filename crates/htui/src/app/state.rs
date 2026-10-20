@@ -7,6 +7,7 @@ use htui_core::model::{ProjectRef, Scope, WorkspaceId};
 use htui_worker::WaitingView;
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use std::cell::{Cell, RefCell};
@@ -295,6 +296,28 @@ impl<'a> Ctx<'a> {
     #[must_use]
     pub fn focus(&self) -> PaneId {
         self.focus.unwrap_or(PaneId::List)
+    }
+
+    /// MOD-115 M3 D1: how `pane` is drawn as a kit pane: focused when it is the shell's focused
+    /// pane ([`focus`](Self::focus), so [`PaneId::List`] on a bench, M2 B7).
+    #[must_use]
+    pub fn pane_focus(&self, pane: PaneId) -> Focus {
+        if self.focus() == pane {
+            Focus::Focused
+        } else {
+            Focus::Unfocused
+        }
+    }
+
+    /// MOD-115 M3 D1: the accent of the tab this context is addressed to
+    /// ([`Theme::tab_accent`]), else the theme's focus accent (an overlay's context, the shell's
+    /// own).
+    #[must_use]
+    pub fn accent(&self) -> Style {
+        match &self.origin {
+            Origin::Tab(id) => self.theme.tab_accent(id.0),
+            _ => self.theme.accent,
+        }
     }
 
     /// The open in-pane edit's label, if an edit is open (MOD-115 M2 D6).
@@ -694,7 +717,11 @@ impl App {
     /// The shell's paint over the panes the active tab claimed (MOD-115 M2 §6.4): the activity
     /// placeholder, then each visible pane's border restyled for focus (the tab accent on the
     /// focused one, the faint border on the others).
-    fn paint_panes(&self, frame: &mut Frame<'_>, areas: &PaneAreas) {
+    ///
+    /// MOD-115 M3 D1, C2: for a tab that draws its own kit panes (`chrome`), only the activity
+    /// placeholder, a shell pane, is drawn and restyled; while it is the focused pane and nothing
+    /// covers it, the tab's hints go on its bottom border, since no tab can put them there.
+    fn paint_panes(&self, frame: &mut Frame<'_>, areas: &PaneAreas, chrome: bool) {
         let Some(tab) = self.tabs.active() else {
             return;
         };
@@ -726,6 +753,9 @@ impl App {
         let focus = self.focus_of(tab);
         let accent = self.theme.tab_accent(tab.id().0);
         for pane in pane_layout::visible(areas) {
+            if chrome && pane != PaneId::Activity {
+                continue;
+            }
             if let Some(rect) = focused_rect(areas, pane) {
                 let state = if pane == focus {
                     Focus::Focused
@@ -733,6 +763,19 @@ impl App {
                     Focus::Unfocused
                 };
                 paint_focus(frame.buffer_mut(), rect, state, accent, &self.theme);
+            }
+        }
+        if chrome
+            && focus == PaneId::Activity
+            && self.overlays.is_empty()
+            && !self.editor_visible()
+            && let Some(activity) = focused_rect(areas, PaneId::Activity)
+            && activity.height >= 2
+        {
+            let width = activity.width.saturating_sub(4);
+            if let Some(line) = tab.key_hint(width, &self.tab_ctx(tab)) {
+                let row = Rect::new(activity.x, activity.bottom() - 1, activity.width, 1);
+                paint_bottom_hints(frame.buffer_mut(), row, line, self.theme.base);
             }
         }
     }
@@ -1572,8 +1615,10 @@ impl App {
             .active_id()
             .zip(claim)
             .map(|(id, (region, areas))| (id, region, areas));
+        // MOD-115 M3 D1: a tab that draws its own kit panes is not painted over.
+        let draws_chrome = self.tabs.active().is_some_and(|tab| tab.draws_chrome());
         if let Some((_, areas)) = claim {
-            self.paint_panes(frame, &areas);
+            self.paint_panes(frame, &areas, draws_chrome);
         }
 
         self.draw_editor(frame, chrome.body);
@@ -1583,6 +1628,7 @@ impl App {
         // MOD-115 M2 §6.4: on a tab that claimed panes they go on the focused pane's border,
         // from its left edge to the body's right one (with the list focused, the M1 rect).
         if let Some(tab) = self.tabs.active()
+            && !draws_chrome
             && self.overlays.is_empty()
             && !self.editor_visible()
             && chrome.body.height > 0
@@ -1761,7 +1807,7 @@ fn paint_shell_hints(
     buf: &mut ratatui::buffer::Buffer,
     body: Rect,
     hint: Line<'static>,
-    style: ratatui::style::Style,
+    style: Style,
 ) {
     let Some(row) = hint_row(buf, body) else {
         return;
@@ -2109,22 +2155,25 @@ mod tests {
 #[cfg(test)]
 pub(crate) mod shell_tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use htui_core::model::Scope;
+    use htui_core::model::{Scope, WorkspaceId};
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
+    use ratatui::style::{Color, Style};
     use ratatui::text::Line;
     use ratatui::widgets::{Block, BorderType};
     use ratatui::{Frame, Terminal};
     use tokio::sync::mpsc;
 
-    use super::{App, Ctx};
+    use super::{App, Ctx, Emit, TopBarState};
     use crate::app::Handled;
-    use crate::keys::{Stack, views};
-    use crate::store_worker::{StoreReply, StoreRequest};
+    use crate::keys::{Keys, Stack, views};
+    use crate::store_worker::{Origin, StoreReply, StoreRequest};
     use crate::ui::Theme;
+    use crate::ui::kit::pane::{Focus, Pane};
+    use crate::ui::overlay::AbortConfirm;
     use crate::ui::shell::{ListSize, PaneId, Panes, Preset, TabLayout, TabLoc};
-    use crate::ui::tabs::{Tab, TabId};
+    use crate::ui::tabs::{SettingsTab, Tab, TabId};
 
     /// The double's id: one the theme gives an accent of its own.
     pub(crate) const SPLIT: TabId = TabId("backlog");
@@ -2441,6 +2490,240 @@ pub(crate) mod shell_tests {
         assert!(inside.contains("Activity appears here"), "{inside}");
     }
 
+    /// What [`ChromeTab`] draws its focused border in: a colour no theme role uses, so a
+    /// border the shell repainted cannot pass for one the tab drew.
+    const SENTINEL: Style = Style::new().fg(Color::Red);
+
+    /// MOD-115 M3 D1: a list + detail tab that draws its own kit panes (`draws_chrome`): each
+    /// pane focused through `ctx.pane_focus`, in [`SENTINEL`], and no hints of its own; its
+    /// `key_hint` is what the adapter would paint.
+    struct ChromeTab;
+
+    impl Tab for ChromeTab {
+        fn id(&self) -> TabId {
+            SPLIT
+        }
+        fn title(&self) -> &str {
+            "Backlog"
+        }
+        fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+            Vec::new()
+        }
+        fn on_scope_change(&mut self, _scope: &Scope) {}
+        fn on_key(&mut self, _key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            Handled::Pass
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
+            let areas = ctx.split(area, SPLIT_LAYOUT);
+            if let Some(list) = areas.list {
+                Pane::new("List")
+                    .focus(ctx.pane_focus(PaneId::List))
+                    .accent(SENTINEL)
+                    .render(frame, list, ctx.theme);
+            }
+            if !areas.detail.is_empty() {
+                Pane::new("Detail")
+                    .focus(ctx.pane_focus(PaneId::Detail))
+                    .accent(SENTINEL)
+                    .render(frame, areas.detail, ctx.theme);
+            }
+        }
+        fn key_stack(&self) -> Option<Stack<'static>> {
+            Some(views::BACKLOG_BODY)
+        }
+        fn key_hint(&self, _width: u16, _ctx: &Ctx<'_>) -> Option<Line<'static>> {
+            Some(Line::from("j/k move"))
+        }
+        fn panes(&self) -> Panes {
+            Panes::ListDetail(SPLIT_LAYOUT)
+        }
+        fn draws_chrome(&self) -> bool {
+            true
+        }
+    }
+
+    /// A shell with [`ChromeTab`] registered, about off.
+    fn chrome_app() -> App {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.about_visible = false;
+        app.register_tab(Box::new(ChromeTab));
+        app
+    }
+
+    /// The rows of `buf` that contain `text`.
+    fn rows_with(buf: &Buffer, text: &str) -> Vec<u16> {
+        (0..buf.area.height)
+            .filter(|y| row(buf, *y).contains(text))
+            .collect()
+    }
+
+    /// M3 D1: the shell does not restyle a chrome tab's borders: the focused pane keeps the
+    /// tab's own accent, the other the faint role the kit gave it.
+    #[test]
+    fn a_chrome_tab_keeps_its_own_borders() {
+        let theme = Theme::default();
+        assert_ne!(
+            theme.tab_accent(SPLIT.0),
+            SENTINEL,
+            "the sentinel is not the accent"
+        );
+        let mut app = chrome_app();
+        let buf = draw(&mut app, 100, 30);
+        let (_, areas) = claim(&app);
+        let list = areas.list.expect("the list is shown");
+        let detail = areas.detail;
+        let red = SENTINEL.fg.unwrap_or_default();
+        let faint = theme.border_faint.fg.unwrap_or_default();
+        assert_eq!(buf[(list.x, list.y)].fg, red);
+        assert_eq!(buf[(detail.x, detail.y)].fg, faint);
+        app.focus.insert(SPLIT, PaneId::Detail);
+        let buf = draw(&mut app, 100, 30);
+        assert_eq!(buf[(detail.x, detail.y)].fg, red);
+        assert_eq!(buf[(list.x, list.y)].fg, faint);
+    }
+
+    /// M3 D1: no adapter hint lands on a chrome tab, whichever pane is focused.
+    #[test]
+    fn a_chrome_tab_gets_no_adapter_hint() {
+        let mut app = chrome_app();
+        let buf = draw(&mut app, 100, 30);
+        assert!(rows_with(&buf, "j/k move").is_empty());
+        app.focus.insert(SPLIT, PaneId::Detail);
+        let buf = draw(&mut app, 100, 30);
+        assert!(rows_with(&buf, "j/k move").is_empty());
+    }
+
+    /// M3 D1: the hidden-pane note stays the shell's, on the kit pane's rounded bottom border.
+    #[test]
+    fn the_hidden_pane_note_is_still_painted_on_a_chrome_tab() {
+        let mut app = chrome_app();
+        app.ui.layouts.insert(
+            SPLIT.0.to_owned(),
+            TabLayout {
+                list_on: false,
+                ..SPLIT_LAYOUT
+            },
+        );
+        app.focus.insert(SPLIT, PaneId::Detail);
+        let buf = draw(&mut app, 100, 30);
+        let (_, areas) = claim(&app);
+        assert_eq!(areas.list, None);
+        let text = row(&buf, areas.detail.bottom() - 1);
+        assert!(text.starts_with("\u{2570}\u{2500}"), "{text}");
+        assert!(
+            text.ends_with("F2 show list \u{b7} p layouts\u{2500}\u{256f}"),
+            "{text}"
+        );
+        assert!(!text.contains("j/k move"), "{text}");
+    }
+
+    /// M3 C2: the activity placeholder is a shell pane on a chrome tab too: drawn, restyled for
+    /// focus, and carrying the tab's hints when it is the focused pane.
+    #[test]
+    fn the_activity_placeholder_is_still_the_shells() {
+        let theme = Theme::default();
+        let mut app = chrome_app();
+        app.ui.layouts.insert(
+            SPLIT.0.to_owned(),
+            TabLayout {
+                preset: Preset::IdeActivity,
+                ..SPLIT_LAYOUT
+            },
+        );
+        let buf = draw(&mut app, 100, 30);
+        let (_, areas) = claim(&app);
+        let activity = areas.activity.expect("the preset shows the activity pane");
+        assert!(row(&buf, activity.y).contains(" Activity "));
+        assert_eq!(
+            buf[(activity.x, activity.y)].fg,
+            theme.border_faint.fg.unwrap_or_default()
+        );
+        assert!(rows_with(&buf, "j/k move").is_empty());
+
+        app.focus.insert(SPLIT, PaneId::Activity);
+        let buf = draw(&mut app, 100, 30);
+        let accent = theme.tab_accent(SPLIT.0);
+        assert_eq!(
+            buf[(activity.x, activity.y)].fg,
+            accent.fg.unwrap_or_default()
+        );
+        let bottom = activity.bottom() - 1;
+        assert_eq!(rows_with(&buf, "j/k move"), [bottom]);
+        let cells: Vec<&str> = (0..buf.area.width)
+            .map(|x| buf[(x, bottom)].symbol())
+            .collect();
+        let at = usize::from(activity.x);
+        assert_eq!(cells[at + 2..at + 10].concat(), "j/k move");
+        assert!(!cells[..at].concat().contains("j/k"));
+    }
+
+    /// A bench context addressed to `origin`, focused on `focus` when one is given.
+    fn bench_check<R>(
+        origin: Origin,
+        focus: Option<PaneId>,
+        check: impl FnOnce(&Ctx<'_>) -> R,
+    ) -> R {
+        let scope = Scope {
+            workspace_id: WorkspaceId::default(),
+            project_ids: Vec::new(),
+        };
+        let (top_bar, theme, emit) = (TopBarState::default(), Theme::default(), Emit::default());
+        let ctx = Ctx::new(
+            &scope,
+            &[],
+            &top_bar,
+            Keys::compiled(),
+            &theme,
+            origin,
+            &emit,
+        );
+        let ctx = match focus {
+            Some(pane) => ctx.with_focus(pane),
+            None => ctx,
+        };
+        check(&ctx)
+    }
+
+    /// M3 D1: a pane is focused when it is the shell's focused pane, so the list on a bench
+    /// (M2 B7) and whatever the shell keeps under it.
+    #[test]
+    fn pane_focus_follows_the_shell_and_defaults_to_the_list() {
+        let settings = Origin::Tab(SettingsTab::ID);
+        let (list, detail) = bench_check(settings.clone(), None, |ctx| {
+            (ctx.pane_focus(PaneId::List), ctx.pane_focus(PaneId::Detail))
+        });
+        assert_eq!((list, detail), (Focus::Focused, Focus::Unfocused));
+        let (list, detail) = bench_check(settings, Some(PaneId::Detail), |ctx| {
+            (ctx.pane_focus(PaneId::List), ctx.pane_focus(PaneId::Detail))
+        });
+        assert_eq!((list, detail), (Focus::Unfocused, Focus::Focused));
+
+        let mut app = chrome_app();
+        let _ = draw(&mut app, 100, 30);
+        let both = |app: &App| {
+            let ctx = app.tab_ctx(app.tabs.active().expect("a tab"));
+            (ctx.pane_focus(PaneId::List), ctx.pane_focus(PaneId::Detail))
+        };
+        assert_eq!(both(&app), (Focus::Focused, Focus::Unfocused));
+        app.focus.insert(SPLIT, PaneId::Detail);
+        assert_eq!(both(&app), (Focus::Unfocused, Focus::Focused));
+    }
+
+    /// M3 D1: the accent is the addressed tab's; an overlay's context keeps the focus accent.
+    #[test]
+    fn accent_is_the_addressed_tabs() {
+        let theme = Theme::default();
+        let app = chrome_app();
+        let shell = app.tab_ctx(app.tabs.active().expect("a tab")).accent();
+        assert_eq!(shell, theme.tab_accent(SPLIT.0));
+        let settings = bench_check(Origin::Tab(SettingsTab::ID), None, |ctx| ctx.accent());
+        assert_eq!(settings, theme.tab_accent(SettingsTab::ID.0));
+        let overlay = bench_check(Origin::Overlay(AbortConfirm::ID), None, |ctx| ctx.accent());
+        assert_eq!(overlay, theme.accent);
+    }
+
     fn focused(app: &App) -> PaneId {
         app.focus_of(app.tabs.active().expect("a tab"))
     }
@@ -2489,9 +2772,9 @@ pub(crate) mod shell_tests {
 
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut settings = App::new(tx);
-        settings.register_tab(Box::new(crate::ui::tabs::SettingsTab::with_sections(vec![
-            Box::new(crate::ui::tabs::settings::QdrantSection::new()),
-        ])));
+        settings.register_tab(Box::new(SettingsTab::with_sections(vec![Box::new(
+            crate::ui::tabs::settings::QdrantSection::new(),
+        )])));
         settings.register_tab(Box::new(SplitTab::new(SPLIT, "Backlog")));
         let _ = draw(&mut settings, 100, 30);
         let before = settings.tabs.active_id();
@@ -2914,7 +3197,7 @@ pub(crate) mod shell_tests {
                 (KeyEvent::from(KeyCode::Char('a')), chord("a")),
             ]
         );
-        let ctx = app.ctx(crate::store_worker::Origin::Tab(TabId("pressing")));
+        let ctx = app.ctx(Origin::Tab(TabId("pressing")));
         let left = KeyEvent::from(KeyCode::Left);
         assert_eq!(ctx.pressed(&left), chord("left"));
     }
