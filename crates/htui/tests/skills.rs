@@ -2021,3 +2021,21 @@ async fn the_pane_takes_motion_and_back_returns_to_the_skill_left() {
         "back on `tests`:\n{frame}"
     );
 }
+
+/// MOD-115 M2 §7 (T7 repair): the name prompt takes every key, so with the list zoomed `n`
+/// draws it, and what is typed, over the zoomed list.
+#[tokio::test]
+async fn the_name_prompt_opened_with_the_list_zoomed_is_on_screen() {
+    let mut harness = open().await;
+    harness.key("z");
+    harness.settle().await;
+    harness.render();
+    harness.key("n");
+    type_text(&mut harness, "qwe");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} new skill ") && frame.contains("new skill: qwe"),
+        "the prompt is drawn:\n{frame}"
+    );
+}

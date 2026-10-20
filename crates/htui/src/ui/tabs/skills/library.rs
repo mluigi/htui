@@ -1745,7 +1745,14 @@ impl LibraryView {
         // borders, the hints and the mouse; today's 32-cell list by default. A hidden pane is an
         // empty rect, which draws nothing.
         let areas = ctx.split(area, LAYOUT);
-        let (list_area, pane_area) = (areas.list.unwrap_or_default(), areas.detail);
+        // T7 repair: a prompt or the rename form takes every key, so with another pane zoomed
+        // the pane is drawn over the zoomed one rather than into its own empty rect.
+        let (list_area, pane_area) =
+            if areas.detail.is_empty() && !matches!(self.mode, Mode::Browse) {
+                (Rect::default(), area)
+            } else {
+                (areas.list.unwrap_or_default(), areas.detail)
+            };
 
         let list = Block::new().borders(Borders::ALL).title(" Skills ");
         let inner = list.inner(list_area);

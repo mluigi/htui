@@ -1469,3 +1469,21 @@ async fn the_pane_takes_motion_and_back_returns_to_the_template_left() {
         "back on `implement`:\n{frame}"
     );
 }
+
+/// MOD-115 M2 §7 (T7 repair): the name prompt takes every key, so with the tree zoomed `n` draws
+/// it, and what is typed, over the zoomed tree.
+#[tokio::test]
+async fn the_name_prompt_opened_with_the_tree_zoomed_is_on_screen() {
+    let mut harness = open().await;
+    harness.key("z");
+    harness.settle().await;
+    harness.render();
+    harness.key("n");
+    type_text(&mut harness, "qwe");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} new template ") && frame.contains(": qwe"),
+        "the prompt is drawn:\n{frame}"
+    );
+}
