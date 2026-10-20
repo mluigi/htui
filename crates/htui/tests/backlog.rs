@@ -3524,3 +3524,60 @@ async fn back_returns_to_the_sub_tab_and_the_item_left() {
         "and off the Body:\n{forward}"
     );
 }
+
+/// Presses each of `keys`, serving and drawing a frame after each as the app does, so the focus
+/// cycle reads the panes on screen.
+async fn press(harness: &mut Harness, keys: &[&str]) {
+    for key in keys {
+        harness.key(key);
+        harness.drive_to_end().await;
+        harness.render();
+    }
+}
+
+/// MOD-115 M2 §7 (T7 repair): a sub-tab's compose area takes every key, so with the list zoomed
+/// Notes' `a` draws it over the zoomed list.
+#[tokio::test]
+async fn a_compose_opened_with_the_list_zoomed_is_on_screen() {
+    let mut harness = backlog().await;
+    down(&mut harness, TO_FEAT_1).await;
+    sub_tab(&mut harness, 4);
+    harness.drive_to_end().await;
+    press(&mut harness, &["a"]).await;
+    let compose = harness.render();
+    assert!(
+        compose.contains(" New note "),
+        "the compose area:\n{compose}"
+    );
+    press(&mut harness, &["esc", "z"]).await;
+    let zoomed = harness.render();
+    assert!(
+        !zoomed.contains("Notes Prompt"),
+        "the list is zoomed:\n{zoomed}"
+    );
+    press(&mut harness, &["a"]).await;
+    let frame = harness.render();
+    assert!(
+        frame.contains(" New note "),
+        "the compose area is drawn:\n{frame}"
+    );
+}
+
+/// MOD-115 M2 §7 (T7 repair): the filter form takes every key, so with the activity pane zoomed
+/// `f` draws it at the bottom of the zoomed pane, not into the detail's empty rect.
+#[tokio::test]
+async fn the_filter_opened_with_the_activity_zoomed_is_on_screen() {
+    let mut harness = backlog().await;
+    press(&mut harness, &["p", "tab", "tab", "z"]).await;
+    let zoomed = harness.render();
+    assert!(
+        zoomed.contains("Activity") && !zoomed.contains("htui"),
+        "the activity pane is zoomed:\n{zoomed}"
+    );
+    press(&mut harness, &["f"]).await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} Filter "),
+        "the form is drawn:\n{frame}"
+    );
+}

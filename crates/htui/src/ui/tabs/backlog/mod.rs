@@ -1059,12 +1059,14 @@ impl Tab for BacklogTab {
             (rest, form)
         };
         // MOD-13 D1: the open form takes the bottom of the list pane; with the list hidden, the
-        // bottom of the detail's, so a form that captures every key is never off screen.
+        // bottom of the detail's, or of the whole area while the activity pane is zoomed (T7
+        // repair), so a form that captures every key is never off screen.
         let (list_area, detail_area, form_area) = match (self.form.is_some(), areas.list) {
             (true, Some(list)) => {
                 let (list, form) = below(list);
                 (Some(list), areas.detail, Some(form))
             }
+            (true, None) if areas.detail.is_empty() => (None, areas.detail, Some(below(area).1)),
             (true, None) => {
                 let (detail, form) = below(areas.detail);
                 (None, detail, Some(form))
@@ -1081,22 +1083,24 @@ impl Tab for BacklogTab {
             selected: self.selected,
             filter: summary.as_deref(),
         };
+        // MOD-13 milestone 2 D8: the open item form takes the detail pane's place, or the whole
+        // area while another pane is zoomed, so a form that captures every key is on screen; so
+        // does a sub-tab that captures every key, a compose area or a picker (T7 repair).
+        let capturing = self.item_form.is_some() || self.detail.captures_input();
+        let (list_area, detail_area) = if detail_area.is_empty() && capturing {
+            (None, area)
+        } else {
+            (list_area, detail_area)
+        };
         if let Some(list_area) = list_area {
             list::render(frame, list_area, &view, ctx.theme);
         }
         if let (Some(form), Some(at)) = (&self.form, form_area) {
             filter::render(frame, at, form, ctx.theme);
         }
-        // MOD-13 milestone 2 D8: the open item form takes the detail pane's place, or the whole
-        // area while another pane is zoomed, so a form that captures every key is on screen.
         match &self.item_form {
             Some(form) => {
-                let at = if detail_area.is_empty() {
-                    area
-                } else {
-                    detail_area
-                };
-                ctx.claim_editor_area(item_form::render(frame, at, form, ctx.theme));
+                ctx.claim_editor_area(item_form::render(frame, detail_area, form, ctx.theme));
             }
             None if detail_area.is_empty() => {}
             None => detail::render(
