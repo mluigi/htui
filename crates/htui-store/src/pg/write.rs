@@ -868,21 +868,34 @@ fn phase_fk_refused(err: sqlx::Error, phase: &StepGraphPhase) -> StoreError {
     map_sqlx(err)
 }
 
-/// MOD-137 D3: the three `uq_step_graph_*_name` partial uniques' `23505` in `MemStore`'s sentence;
-/// anything else through [`map_sqlx`].
+/// MOD-137 D3: the three `uq_step_graph_*_name` partial uniques' `23505` and the two owner FKs'
+/// `23503` in `MemStore`'s sentences; anything else through [`map_sqlx`].
 fn graph_name_refused(err: sqlx::Error, name: &str, scope: GraphScope) -> StoreError {
-    match &err {
-        sqlx::Error::Database(db)
-            if matches!(
-                db.constraint(),
-                Some(
-                    "uq_step_graph_project_name"
-                        | "uq_step_graph_workspace_name"
-                        | "uq_step_graph_library_name"
-                )
-            ) =>
-        {
-            StoreError::Constraint(graph_name_is_taken(name, scope))
+    let sqlx::Error::Database(db) = &err else {
+        return map_sqlx(err);
+    };
+    match (db.constraint(), scope) {
+        (
+            Some(
+                "uq_step_graph_project_name"
+                | "uq_step_graph_workspace_name"
+                | "uq_step_graph_library_name",
+            ),
+            _,
+        ) => StoreError::Constraint(graph_name_is_taken(name, scope)),
+        (Some("step_graph_project_id_fkey"), GraphScope::Project(project)) => {
+            StoreError::Constraint(references_no_row(
+                "step_graph.project_id",
+                project,
+                "project",
+            ))
+        }
+        (Some("fk_step_graph_workspace"), GraphScope::Workspace(workspace)) => {
+            StoreError::Constraint(references_no_row(
+                "step_graph.workspace_id",
+                workspace,
+                "workspace",
+            ))
         }
         _ => map_sqlx(err),
     }
@@ -3187,6 +3200,24 @@ impl WriteStore for PgStore {
     /// an owner that names no row (`23503`).
     async fn create_step_graph(&self, new: NewStepGraph) -> Result<StepGraph> {
         if new.is_override && !matches!(new.scope, GraphScope::Project(_)) {
+            // `MemStore`'s order: the owner first, then the override rule.
+            if let GraphScope::Workspace(workspace) = new.scope {
+                let known = sqlx::query_scalar!(
+                    r#"SELECT 1 AS "one!" FROM workspace WHERE id = $1"#,
+                    workspace.as_uuid(),
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?
+                .is_some();
+                if !known {
+                    return Err(StoreError::Constraint(references_no_row(
+                        "step_graph.workspace_id",
+                        workspace,
+                        "workspace",
+                    )));
+                }
+            }
             return Err(StoreError::Constraint(override_outside_project(new.scope)));
         }
         let row = sqlx::query_as!(

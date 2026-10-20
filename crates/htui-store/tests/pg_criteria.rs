@@ -11010,3 +11010,50 @@ async fn queue_item_records_its_workspace() {
 
     db.drop_db().await;
 }
+
+/// MOD-137 D3, blueprint F6: a graph whose owner names no row, or an override outside a project,
+/// is refused in `MemStore`'s sentence, owner first, never as a raw `23503`/`23514`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_graph_owner_refusal_reads_as_mem_store_words_it() {
+    use htui_core::model::{GraphScope, NewStepGraph, StepGraphId};
+    use htui_core::store::MemStore;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let mem = MemStore::demo();
+    let new = |scope: GraphScope, is_override: bool| NewStepGraph {
+        id: StepGraphId::new(),
+        scope,
+        name: "owned".to_owned(),
+        description: String::new(),
+        is_override,
+    };
+    let (project, workspace) = (ProjectId::new(), WorkspaceId::new());
+    for (case, graph) in [
+        ("unknown project", new(GraphScope::Project(project), false)),
+        (
+            "unknown workspace",
+            new(GraphScope::Workspace(workspace), false),
+        ),
+        (
+            "override in an unknown workspace",
+            new(GraphScope::Workspace(workspace), true),
+        ),
+        (
+            "override in a workspace",
+            new(GraphScope::Workspace(ids::WORKSPACE_PLATFORM), true),
+        ),
+        ("override in the library", new(GraphScope::Library, true)),
+    ] {
+        let pg = db.store.create_step_graph(graph.clone()).await;
+        let expected = mem.create_step_graph(graph).await;
+        assert!(
+            matches!(expected, Err(htui_core::store::StoreError::Constraint(_))),
+            "{case}: MemStore refuses ({expected:?})"
+        );
+        assert_eq!(pg, expected, "{case}: both stores word it the same");
+    }
+
+    db.drop_db().await;
+}
