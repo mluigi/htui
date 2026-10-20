@@ -433,7 +433,9 @@ record; `history_move: bool` set by Back/Forward suppresses the record of that d
 `location`/`restore` (Task 7): Backlog `subtab = detail.active_id().0` (`DetailId(&'static str)`,
 `detail/mod.rs:53`), cursor = the selected item id; restore selects the sub-tab and reveals the item (reuse the
 `reveal` path, `backlog/mod.rs:1067`); Requirements cursor = selected requirement id (reveal path `:1309`); Skills
-`subtab = "library"|"templates"`, cursor = list index; Settings (`settings/mod.rs`, added to Task 7) `subtab` =
+`subtab = "library"|"templates"`, cursor = `{index}:{skill id}` (library) or `{index}:{project}:{name}` /
+`{index}:{project}` (templates; a bare `{index}` when no row is under the cursor) — restore resolves the skill,
+template or project header wherever the list now holds it, falling back to the row index clamped to the list (RV3 M2); Settings (`settings/mod.rs`, added to Task 7) `subtab` =
 section id, restore = `focus_section`. Chat: defaults.
 **Header** (`ui/header.rs`, Task 6): `render(…, chips: &ShellChips, …)` with `pub struct ShellChips { pub back:
 Option<(String, String)> /* full, short */, pub forward: Option<String>, pub layout: Option<String> }`. App builds
