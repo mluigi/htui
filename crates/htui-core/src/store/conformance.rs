@@ -22,26 +22,29 @@ use crate::model::{
     FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest,
     FollowUpSettle, FollowUpText, FollowUpView, Gate, GateOutcome, GraphSnapshot, Isolation, Item,
     ItemCitation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkKind,
-    NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewNote, NewPersona, NewProject,
-    NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill,
-    NewSkillVersion, NewStepGraph, NewWorkspace, Note, NoteId, OpenPermission, OverlapRule,
-    PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaAnswer, PersonaId,
-    PersonaMatch, PersonaPatch, PersonaPermission, PersonaRule, PersonaTools, PhaseAgent, PhaseId,
-    PhasePatch, Priority, ProbedTool, ProjectId, ProjectPatch, PromptScope, PromptTemplate,
-    PromptTemplateId, QueueSetting, QueuedFollowUp, RelayOption, RelayOptionKind, RelaySessionId,
-    RelayView, RepoBoxPath, RepoId, RepoPatch, RepoScope, Requirement, RequirementAreaId,
-    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementState,
-    RequirementUpdate, Resolution, Run, RunCommandId, RunCommandKind, RunCommandStatus, RunId,
-    RunKind, RunMode, RunScope, RunStatus, RunStep, RunStepCommit, RunStepTree, Scope,
-    SessionEvent, SettleOutcome, Skill, SkillBindingKey, SkillId, SkillPatch, SkillVersion,
-    SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
-    StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, TIMESTAMPTZ_DIGITS,
-    ToolCallCount, Transport, UpstreamEntry, UserId, VerifyOutcome, WaitingCandidate,
-    WaitingPermission, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
-    WorkspaceStop, canonical_declared_tags, executor_scrub_refusal, missing_tags_failure,
+    MemoryEntry, MemoryEntryId, MemoryKind, MemoryPatch, MemoryRevision, MemoryState,
+    MemorySupersede, MemoryText, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem,
+    NewItemKind, NewMemoryEntry, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo,
+    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
+    NewStepGraph, NewWorkspace, Note, NoteId, OpenPermission, OverlapRule, PermissionChoice,
+    PermissionId, PermissionStatus, Persona, PersonaAnswer, PersonaId, PersonaMatch, PersonaPatch,
+    PersonaPermission, PersonaRule, PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority,
+    ProbedTool, ProjectId, ProjectPatch, PromptScope, PromptTemplate, PromptTemplateId,
+    QueueSetting, QueuedFollowUp, RelayOption, RelayOptionKind, RelaySessionId, RelayView,
+    RepoBoxPath, RepoId, RepoPatch, RepoScope, Requirement, RequirementAreaId, RequirementFilter,
+    RequirementId, RequirementPatch, RequirementRevision, RequirementState, RequirementUpdate,
+    Resolution, Run, RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode,
+    RunScope, RunStatus, RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, SettleOutcome,
+    Skill, SkillBindingKey, SkillId, SkillPatch, SkillVersion, SnapshotGraph, SnapshotSettings,
+    Status, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
+    StepPermission, StepStatus, StopMode, TIMESTAMPTZ_DIGITS, ToolCallCount, Transport,
+    UpstreamEntry, UserId, VerifyOutcome, WaitingCandidate, WaitingPermission, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop, canonical_declared_tags,
+    executor_scrub_refusal, missing_tags_failure,
 };
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
+use crate::scrub::MinimalScrubber;
 use crate::secret::{INFISICAL, SecretScope, project_scope};
 use crate::store::error::StoreError;
 use crate::store::traits::{
@@ -51,10 +54,11 @@ use crate::store::traits::{
     StepFence, StoredSetting, UpdateOutcome, WriteStore, allow_names_an_mcp_tool, already_exists,
     citation_key, command_finish_status, command_not_claimable, command_not_queued,
     document_needs_a_step, has_nul, illegal_move, invalid_area_code, invalid_persona_name,
-    kind_not_narrowable, link_key, link_not_proposed_by_run, link_outside_project, not_a_tool_name,
-    note_needs_a_step, queue_target_refusal, queue_token_refusal, references_no_row,
-    requirement_withdrawn, resolution_not_closable, rule_kind_unknown, self_link,
-    step_writes_own_item, withdrawn_requirement_cited,
+    kind_not_narrowable, link_key, link_not_proposed_by_run, link_outside_project,
+    memory_entry_closed, memory_subject_taken, not_a_tool_name, note_needs_a_step,
+    queue_target_refusal, queue_token_refusal, references_no_row, requirement_withdrawn,
+    resolution_not_closable, rule_kind_unknown, self_link, step_writes_own_item,
+    withdrawn_requirement_cited,
 };
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
@@ -234,6 +238,16 @@ pub const CASES: &[&str] = &[
     "a_run_without_a_workspace_is_never_gated",
     "adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped",
     "a_deleted_workspace_unscopes_its_runs_and_drops_its_stop",
+    "memory_create_writes_the_row_and_revision_1",
+    "memory_list_orders_by_updated_at_and_filters_by_state",
+    "memory_amend_is_cas_restamps_and_writes_a_revision",
+    "memory_retire_closes_the_entry_once",
+    "memory_subject_clash_is_refused_case_and_space_folded",
+    "memory_retired_subject_can_be_reused",
+    "memory_supersede_replaces_in_one_step",
+    "memory_supersede_refuses_stale_closed_and_clashing",
+    "memory_unknown_rows_and_authors_are_refused",
+    "project_delete_counts_memory",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -636,6 +650,30 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         "a_deleted_workspace_unscopes_its_runs_and_drops_its_stop" => {
             a_deleted_workspace_unscopes_its_runs_and_drops_its_stop(store).await;
         }
+        "memory_create_writes_the_row_and_revision_1" => {
+            memory_create_writes_the_row_and_revision_1(store).await
+        }
+        "memory_list_orders_by_updated_at_and_filters_by_state" => {
+            memory_list_orders_by_updated_at_and_filters_by_state(store).await
+        }
+        "memory_amend_is_cas_restamps_and_writes_a_revision" => {
+            memory_amend_is_cas_restamps_and_writes_a_revision(store).await
+        }
+        "memory_retire_closes_the_entry_once" => memory_retire_closes_the_entry_once(store).await,
+        "memory_subject_clash_is_refused_case_and_space_folded" => {
+            memory_subject_clash_is_refused_case_and_space_folded(store).await
+        }
+        "memory_retired_subject_can_be_reused" => memory_retired_subject_can_be_reused(store).await,
+        "memory_supersede_replaces_in_one_step" => {
+            memory_supersede_replaces_in_one_step(store).await
+        }
+        "memory_supersede_refuses_stale_closed_and_clashing" => {
+            memory_supersede_refuses_stale_closed_and_clashing(store).await
+        }
+        "memory_unknown_rows_and_authors_are_refused" => {
+            memory_unknown_rows_and_authors_are_refused(store).await
+        }
+        "project_delete_counts_memory" => project_delete_counts_memory(store).await,
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -21302,6 +21340,1152 @@ async fn queue_setting_refuses_a_foreign_key_and_a_bad_value_before_the_row<S: W
             .expect(CASE),
         None,
         "{CASE}: no refusal wrote an app row"
+    );
+}
+
+// ---- MOD-163 M1: project memory entries (plan D3-D6, D8) ---------------------------------------
+
+/// The scrubber a person's write uses (plan D5): no secret to mask, credential-shaped text still
+/// refused.
+fn memory_scrubber() -> MinimalScrubber {
+    MinimalScrubber::new(Vec::<String>::new())
+}
+
+/// A create request with a fresh id, written by the fixture user on the fixture box.
+fn memory_new(case: &str, kind: MemoryKind, subject: &str, body: &str) -> NewMemoryEntry {
+    let scrubber = memory_scrubber();
+    NewMemoryEntry {
+        id: MemoryEntryId::new(),
+        kind,
+        subject: MemoryText::subject(subject, &scrubber).expect(case),
+        body: MemoryText::body(body, &scrubber).expect(case),
+        created_by: ids::USER,
+        box_id: Some(ids::BOX),
+    }
+}
+
+/// A patch that moves the subject and/or the body, by the fixture user on the fixture box.
+fn memory_patch(case: &str, subject: Option<&str>, body: Option<&str>) -> MemoryPatch {
+    let scrubber = memory_scrubber();
+    MemoryPatch {
+        kind: None,
+        subject: subject.map(|text| MemoryText::subject(text, &scrubber).expect(case)),
+        body: body.map(|text| MemoryText::body(text, &scrubber).expect(case)),
+        author_id: ids::USER,
+        box_id: Some(ids::BOX),
+    }
+}
+
+/// The head an amend or a retire landed, or a panic naming the case.
+fn memory_updated(case: &str, outcome: MemoryUpdate) -> MemoryEntry {
+    match outcome {
+        MemoryUpdate::Updated(row) => row,
+        MemoryUpdate::Diverged { head, ancestor } => {
+            panic!(
+                "{case}: expected Updated, got Diverged {{ head: {head:?}, ancestor: {ancestor:?} }}"
+            )
+        }
+    }
+}
+
+/// The `(old, new)` heads a supersede landed, or a panic naming the case.
+fn memory_superseded(case: &str, outcome: MemorySupersede) -> (MemoryEntry, MemoryEntry) {
+    match outcome {
+        MemorySupersede::Superseded { old, new } => (old, new),
+        MemorySupersede::Diverged { head, ancestor } => {
+            panic!(
+                "{case}: expected Superseded, got Diverged {{ head: {head:?}, ancestor: {ancestor:?} }}"
+            )
+        }
+    }
+}
+
+/// Creates one entry in `project` through the trait, or panics naming the case.
+async fn memory_create<S: WriteStore>(
+    case: &str,
+    store: &S,
+    project: ProjectId,
+    subject: &str,
+    body: &str,
+) -> MemoryEntry {
+    store
+        .create_memory_entry(project, memory_new(case, MemoryKind::Fact, subject, body))
+        .await
+        .expect(case)
+}
+
+/// The project's entries in `states` on a store that keeps them (`MemStore`, `PgStore`).
+async fn memory_list<S: ReadStore>(
+    case: &str,
+    store: &S,
+    project: ProjectId,
+    states: Option<Vec<MemoryState>>,
+) -> Vec<MemoryEntry> {
+    store
+        .memory_entries(project, states)
+        .await
+        .expect(case)
+        .unwrap_or_else(|| panic!("{case}: a writable store keeps the memory entries of {project}"))
+}
+
+/// An entry's revisions on a store that keeps them (`MemStore`, `PgStore`).
+async fn memory_history<S: ReadStore>(
+    case: &str,
+    store: &S,
+    id: MemoryEntryId,
+) -> Vec<MemoryRevision> {
+    store
+        .memory_revisions(id)
+        .await
+        .expect(case)
+        .unwrap_or_else(|| panic!("{case}: a writable store keeps the revisions of {id}"))
+}
+
+/// `(version, reason, state, body)` of every revision, in the order the store answered.
+fn memory_history_view(rows: &[MemoryRevision]) -> Vec<(i32, &str, MemoryState, &str)> {
+    rows.iter()
+        .map(|row| {
+            (
+                row.version,
+                row.reason.as_str(),
+                row.state,
+                row.body.as_str(),
+            )
+        })
+        .collect()
+}
+
+/// Plan D6: a create inserts an `active` row at version 1, stamped once (plan D3), and its
+/// revision 1 with reason `created`, written by `created_by` on `box_id`. The text arrives
+/// trimmed (plan D5).
+async fn memory_create_writes_the_row_and_revision_1<S: WriteStore>(store: &S) {
+    const CASE: &str = "memory_create_writes_the_row_and_revision_1";
+
+    let new = memory_new(
+        CASE,
+        MemoryKind::Gotcha,
+        "  Build cache ",
+        "Clear target/ when the disk fills.",
+    );
+    let id = new.id;
+    let row = store
+        .create_memory_entry(ids::PROJECT_HTUI, new)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (
+            row.id,
+            row.project_id,
+            row.kind,
+            row.subject.as_str(),
+            row.body.as_str(),
+            row.state,
+            row.version,
+            row.superseded_by,
+            row.created_by,
+        ),
+        (
+            id,
+            ids::PROJECT_HTUI,
+            MemoryKind::Gotcha,
+            "Build cache",
+            "Clear target/ when the disk fills.",
+            MemoryState::Active,
+            1,
+            None,
+            ids::USER,
+        ),
+        "{CASE}: the row is the request, live at version 1"
+    );
+    assert_eq!(
+        (row.confirmed_at, row.updated_at),
+        (row.created_at, row.created_at),
+        "{CASE}: a create stamps confirmed_at, created_at and updated_at at once (plan D3)"
+    );
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_HTUI, None).await,
+        vec![row.clone()],
+        "{CASE}: the list reads the row back as the create returned it"
+    );
+    assert_eq!(
+        memory_history(CASE, store, id).await,
+        vec![MemoryRevision {
+            entry_id: id,
+            version: 1,
+            kind: MemoryKind::Gotcha,
+            subject: "Build cache".to_owned(),
+            body: "Clear target/ when the disk fills.".to_owned(),
+            state: MemoryState::Active,
+            author_id: ids::USER,
+            box_id: Some(ids::BOX),
+            reason: "created".to_owned(),
+            created_at: row.created_at,
+        }],
+        "{CASE}: revision 1 is the row as created"
+    );
+}
+
+/// Plan D6: the list is in `(updated_at DESC, id)` order, `None` is every state, a state list
+/// filters, an empty list is no row, and another or an unknown project lists nothing.
+async fn memory_list_orders_by_updated_at_and_filters_by_state<S: WriteStore>(store: &S) {
+    const CASE: &str = "memory_list_orders_by_updated_at_and_filters_by_state";
+
+    let a = memory_create(CASE, store, ids::PROJECT_HTUI, "Alpha", "The first entry.").await;
+    let b = memory_create(CASE, store, ids::PROJECT_HTUI, "Bravo", "The second entry.").await;
+    let c = memory_create(
+        CASE,
+        store,
+        ids::PROJECT_HTUI,
+        "Charlie",
+        "The third entry.",
+    )
+    .await;
+    let b = memory_updated(
+        CASE,
+        store
+            .retire_memory_entry(b.id, 1, ids::USER, Some(ids::BOX))
+            .await
+            .expect(CASE),
+    );
+
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_HTUI, None).await,
+        vec![b.clone(), c.clone(), a.clone()],
+        "{CASE}: every state, the latest write first"
+    );
+    assert_eq!(
+        memory_list(
+            CASE,
+            store,
+            ids::PROJECT_HTUI,
+            Some(vec![MemoryState::Active])
+        )
+        .await,
+        vec![c.clone(), a.clone()],
+        "{CASE}: only the active entries"
+    );
+    assert_eq!(
+        memory_list(
+            CASE,
+            store,
+            ids::PROJECT_HTUI,
+            Some(vec![MemoryState::Retired])
+        )
+        .await,
+        vec![b.clone()],
+        "{CASE}: only the retired entry"
+    );
+    assert_eq!(
+        memory_list(
+            CASE,
+            store,
+            ids::PROJECT_HTUI,
+            Some(MemoryState::ALL.to_vec())
+        )
+        .await,
+        vec![b, c, a],
+        "{CASE}: every state named is every state"
+    );
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_HTUI, Some(Vec::new())).await,
+        Vec::new(),
+        "{CASE}: an empty state list matches no row"
+    );
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_AGY, None).await,
+        Vec::new(),
+        "{CASE}: another project's list is its own"
+    );
+    assert_eq!(
+        store
+            .memory_entries(ProjectId::new(), None)
+            .await
+            .expect(CASE),
+        Some(Vec::new()),
+        "{CASE}: an unknown project lists nothing, and is not \"not available here\""
+    );
+}
+
+/// Plan D3, D6: an amend is a compare-and-set that keeps the state, moves the patched columns
+/// only, re-stamps `confirmed_at` and writes revision `v + 1`. A stale token answers `Diverged`
+/// with the ancestor and writes nothing; an empty patch re-confirms; a token newer than the head
+/// is `NotFound`.
+async fn memory_amend_is_cas_restamps_and_writes_a_revision<S: WriteStore>(store: &S) {
+    const CASE: &str = "memory_amend_is_cas_restamps_and_writes_a_revision";
+
+    let before = memory_create(
+        CASE,
+        store,
+        ids::PROJECT_HTUI,
+        "Release train",
+        "Ship on Tuesdays.",
+    )
+    .await;
+    let head = memory_updated(
+        CASE,
+        store
+            .amend_memory_entry(
+                before.id,
+                1,
+                memory_patch(CASE, None, Some("Ship on Thursdays.")),
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (
+            head.version,
+            head.body.as_str(),
+            head.subject.as_str(),
+            head.kind,
+            head.state,
+            head.superseded_by,
+            head.created_at,
+        ),
+        (
+            2,
+            "Ship on Thursdays.",
+            before.subject.as_str(),
+            before.kind,
+            MemoryState::Active,
+            None,
+            before.created_at,
+        ),
+        "{CASE}: the body moved, nothing else did, and the version went up by one"
+    );
+    assert!(
+        head.confirmed_at > before.confirmed_at,
+        "{CASE}: an amend re-stamps confirmed_at (plan D3)"
+    );
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_HTUI, None).await,
+        vec![head.clone()],
+        "{CASE}: the head reads back as returned"
+    );
+    let history = memory_history(CASE, store, before.id).await;
+    assert_eq!(
+        memory_history_view(&history),
+        vec![
+            (1, "created", MemoryState::Active, "Ship on Tuesdays."),
+            (2, "amended", MemoryState::Active, "Ship on Thursdays."),
+        ],
+        "{CASE}: revisions 1 and 2"
+    );
+
+    assert_eq!(
+        store
+            .amend_memory_entry(
+                before.id,
+                1,
+                memory_patch(CASE, None, Some("Ship on Fridays.")),
+            )
+            .await
+            .expect(CASE),
+        MemoryUpdate::Diverged {
+            head: head.clone(),
+            ancestor: history[0].clone(),
+        },
+        "{CASE}: a stale token answers the head and the revision it edited from"
+    );
+    assert_eq!(
+        memory_history(CASE, store, before.id).await,
+        history,
+        "{CASE}: a divergence writes no revision"
+    );
+
+    let again = memory_updated(
+        CASE,
+        store
+            .amend_memory_entry(before.id, 2, memory_patch(CASE, None, None))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (
+            again.version,
+            again.subject.as_str(),
+            again.body.as_str(),
+            again.kind,
+            again.state,
+        ),
+        (
+            3,
+            head.subject.as_str(),
+            head.body.as_str(),
+            head.kind,
+            MemoryState::Active,
+        ),
+        "{CASE}: an empty patch keeps the text and moves the version"
+    );
+    assert!(
+        again.confirmed_at > head.confirmed_at,
+        "{CASE}: an empty patch re-confirms the entry (plan D3)"
+    );
+
+    let renamed = memory_updated(
+        CASE,
+        store
+            .amend_memory_entry(
+                before.id,
+                3,
+                MemoryPatch {
+                    kind: Some(MemoryKind::Decision),
+                    ..memory_patch(CASE, Some("Release cadence"), None)
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (
+            renamed.version,
+            renamed.kind,
+            renamed.subject.as_str(),
+            renamed.body.as_str(),
+        ),
+        (
+            4,
+            MemoryKind::Decision,
+            "Release cadence",
+            "Ship on Thursdays."
+        ),
+        "{CASE}: the kind and the subject move, the body stays"
+    );
+    assert_eq!(
+        memory_history_view(&memory_history(CASE, store, before.id).await),
+        vec![
+            (1, "created", MemoryState::Active, "Ship on Tuesdays."),
+            (2, "amended", MemoryState::Active, "Ship on Thursdays."),
+            (3, "amended", MemoryState::Active, "Ship on Thursdays."),
+            (4, "amended", MemoryState::Active, "Ship on Thursdays."),
+        ],
+        "{CASE}: one revision per landed amend"
+    );
+
+    not_found_on(
+        CASE,
+        store
+            .amend_memory_entry(before.id, 9, memory_patch(CASE, None, Some("Never.")))
+            .await,
+        "memory_entry_revision",
+        "a token newer than the head",
+    );
+}
+
+/// Plan D3, D6: retire moves a live entry to `retired` once, leaves `confirmed_at`, and closes
+/// the entry: a second retire and an amend are refused. A stale token is a divergence before it
+/// is a refusal.
+async fn memory_retire_closes_the_entry_once<S: WriteStore>(store: &S) {
+    const CASE: &str = "memory_retire_closes_the_entry_once";
+
+    let entry = memory_create(
+        CASE,
+        store,
+        ids::PROJECT_HTUI,
+        "Store seam",
+        "Every backend implements WriteStore.",
+    )
+    .await;
+    let retired = memory_updated(
+        CASE,
+        store
+            .retire_memory_entry(entry.id, 1, ids::USER, Some(ids::BOX))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (
+            retired.state,
+            retired.version,
+            retired.confirmed_at,
+            retired.subject.as_str(),
+            retired.body.as_str(),
+        ),
+        (
+            MemoryState::Retired,
+            2,
+            entry.confirmed_at,
+            entry.subject.as_str(),
+            entry.body.as_str(),
+        ),
+        "{CASE}: retired at version 2, confirmed_at and the text untouched (plan D3)"
+    );
+    let history = memory_history(CASE, store, entry.id).await;
+    assert_eq!(
+        memory_history_view(&history),
+        vec![
+            (1, "created", MemoryState::Active, entry.body.as_str()),
+            (2, "retired", MemoryState::Retired, entry.body.as_str()),
+        ],
+        "{CASE}: the retire wrote a `retired` revision"
+    );
+    assert_eq!(
+        (history[1].author_id, history[1].box_id),
+        (ids::USER, Some(ids::BOX)),
+        "{CASE}: the retire's revision names its author and box"
+    );
+
+    let closed = Err(StoreError::Constraint(memory_entry_closed(
+        entry.id,
+        MemoryState::Retired,
+    )));
+    assert_eq!(
+        store
+            .retire_memory_entry(entry.id, 2, ids::USER, Some(ids::BOX))
+            .await,
+        closed,
+        "{CASE}: a second retire is refused"
+    );
+    assert_eq!(
+        store
+            .amend_memory_entry(entry.id, 2, memory_patch(CASE, None, Some("Revived.")))
+            .await,
+        closed,
+        "{CASE}: a retired entry is not amended"
+    );
+    assert_eq!(
+        store
+            .retire_memory_entry(entry.id, 1, ids::USER, Some(ids::BOX))
+            .await
+            .expect(CASE),
+        MemoryUpdate::Diverged {
+            head: retired.clone(),
+            ancestor: history[0].clone(),
+        },
+        "{CASE}: a stale token diverges before the closed state is looked at"
+    );
+    assert_eq!(
+        memory_history(CASE, store, entry.id).await,
+        history,
+        "{CASE}: no refusal wrote a revision"
+    );
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_HTUI, None).await,
+        vec![retired],
+        "{CASE}: no refusal moved the row"
+    );
+}
+
+/// Plan D4: one live entry per subject per project, compared case-insensitively after trimming.
+/// A clashing create or amend is refused naming the live holder's subject and id, and writes
+/// nothing; another project, and an entry's own subject, do not clash.
+async fn memory_subject_clash_is_refused_case_and_space_folded<S: WriteStore>(store: &S) {
+    const CASE: &str = "memory_subject_clash_is_refused_case_and_space_folded";
+
+    let a = memory_create(
+        CASE,
+        store,
+        ids::PROJECT_HTUI,
+        "Build cache",
+        "Clear target/ when the disk fills.",
+    )
+    .await;
+    let taken = Err(StoreError::Constraint(memory_subject_taken(
+        "Build cache",
+        a.id,
+    )));
+
+    let clash = memory_new(CASE, MemoryKind::Lesson, " build CACHE ", "A second say.");
+    let clash_id = clash.id;
+    assert_eq!(
+        store.create_memory_entry(ids::PROJECT_HTUI, clash).await,
+        taken,
+        "{CASE}: a create whose folded subject is live is refused, naming the holder"
+    );
+    assert_eq!(
+        memory_history(CASE, store, clash_id).await,
+        Vec::new(),
+        "{CASE}: the refused create wrote no revision"
+    );
+
+    let b = memory_create(CASE, store, ids::PROJECT_HTUI, "Other", "Something else.").await;
+    assert_eq!(
+        store
+            .amend_memory_entry(b.id, 1, memory_patch(CASE, Some("BUILD cache"), None))
+            .await
+            .map(|outcome| memory_updated(CASE, outcome)),
+        taken,
+        "{CASE}: an amend onto a live subject is refused, naming the holder"
+    );
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_HTUI, None).await,
+        vec![b.clone(), a.clone()],
+        "{CASE}: no refusal wrote a row"
+    );
+    assert_eq!(
+        memory_history(CASE, store, b.id).await.len(),
+        1,
+        "{CASE}: the refused amend wrote no revision"
+    );
+
+    let elsewhere = memory_create(
+        CASE,
+        store,
+        ids::PROJECT_AGY,
+        "Build cache",
+        "Another project's cache.",
+    )
+    .await;
+    assert_eq!(
+        (elsewhere.project_id, elsewhere.state),
+        (ids::PROJECT_AGY, MemoryState::Active),
+        "{CASE}: a subject is per project"
+    );
+
+    let own = memory_updated(
+        CASE,
+        store
+            .amend_memory_entry(a.id, 1, memory_patch(CASE, Some("build cache"), None))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (own.version, own.subject.as_str()),
+        (2, "build cache"),
+        "{CASE}: an entry's own subject never clashes with itself"
+    );
+}
+
+/// Plan D4: the live-subject rule covers `active | suspect` only, so a retired subject is free.
+async fn memory_retired_subject_can_be_reused<S: WriteStore>(store: &S) {
+    const CASE: &str = "memory_retired_subject_can_be_reused";
+
+    let first = memory_create(
+        CASE,
+        store,
+        ids::PROJECT_HTUI,
+        "Flaky test",
+        "Retry it once.",
+    )
+    .await;
+    let first = memory_updated(
+        CASE,
+        store
+            .retire_memory_entry(first.id, 1, ids::USER, Some(ids::BOX))
+            .await
+            .expect(CASE),
+    );
+    let second = memory_create(
+        CASE,
+        store,
+        ids::PROJECT_HTUI,
+        "flaky test",
+        "Run it with one test thread.",
+    )
+    .await;
+    assert_eq!(
+        memory_list(
+            CASE,
+            store,
+            ids::PROJECT_HTUI,
+            Some(vec![MemoryState::Active])
+        )
+        .await,
+        vec![second.clone()],
+        "{CASE}: only the reuse is live"
+    );
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_HTUI, None).await,
+        vec![second, first],
+        "{CASE}: the retired entry stays, as it was"
+    );
+}
+
+/// Plan D4 "replace", D6: a supersede moves the old entry to `superseded` naming the new one,
+/// with a `superseded` revision by the new entry's author, and creates the new entry live in the
+/// old one's project, in one step. The new subject may reuse the old one, or differ.
+async fn memory_supersede_replaces_in_one_step<S: WriteStore>(store: &S) {
+    const CASE: &str = "memory_supersede_replaces_in_one_step";
+
+    let a = memory_create(
+        CASE,
+        store,
+        ids::PROJECT_HTUI,
+        "Default branch",
+        "The default branch is main.",
+    )
+    .await;
+    let n = memory_new(
+        CASE,
+        MemoryKind::Decision,
+        "Default branch",
+        "The default branch is trunk.",
+    );
+    let n_id = n.id;
+    let (old, new) = memory_superseded(
+        CASE,
+        store.supersede_memory_entry(a.id, 1, n).await.expect(CASE),
+    );
+    assert_eq!(
+        (
+            old.id,
+            old.state,
+            old.superseded_by,
+            old.version,
+            old.confirmed_at,
+            old.subject.as_str(),
+            old.body.as_str(),
+        ),
+        (
+            a.id,
+            MemoryState::Superseded,
+            Some(n_id),
+            2,
+            a.confirmed_at,
+            a.subject.as_str(),
+            a.body.as_str(),
+        ),
+        "{CASE}: the old entry is superseded by the new one, its text and stamp untouched"
+    );
+    assert_eq!(
+        (
+            new.id,
+            new.project_id,
+            new.kind,
+            new.state,
+            new.version,
+            new.subject.as_str(),
+            new.body.as_str(),
+            new.superseded_by,
+            new.created_by,
+        ),
+        (
+            n_id,
+            ids::PROJECT_HTUI,
+            MemoryKind::Decision,
+            MemoryState::Active,
+            1,
+            "Default branch",
+            "The default branch is trunk.",
+            None,
+            ids::USER,
+        ),
+        "{CASE}: the new entry is live at version 1 in the old one's project"
+    );
+    assert_eq!(
+        new.confirmed_at, new.created_at,
+        "{CASE}: the new entry is stamped as a create stamps one"
+    );
+
+    let old_history = memory_history(CASE, store, a.id).await;
+    assert_eq!(
+        memory_history_view(&old_history),
+        vec![
+            (1, "created", MemoryState::Active, a.body.as_str()),
+            (2, "superseded", MemoryState::Superseded, a.body.as_str()),
+        ],
+        "{CASE}: the old entry's history ends in a `superseded` revision"
+    );
+    assert_eq!(
+        (old_history[1].author_id, old_history[1].box_id),
+        (ids::USER, Some(ids::BOX)),
+        "{CASE}: the new entry's author and box write the old entry's revision"
+    );
+    assert_eq!(
+        memory_history_view(&memory_history(CASE, store, n_id).await),
+        vec![(1, "created", MemoryState::Active, new.body.as_str())],
+        "{CASE}: the new entry has its revision 1"
+    );
+    assert_eq!(
+        memory_list(
+            CASE,
+            store,
+            ids::PROJECT_HTUI,
+            Some(vec![MemoryState::Active])
+        )
+        .await,
+        vec![new.clone()],
+        "{CASE}: only the new entry is live"
+    );
+    assert_eq!(
+        memory_list(
+            CASE,
+            store,
+            ids::PROJECT_HTUI,
+            Some(vec![MemoryState::Superseded])
+        )
+        .await,
+        vec![old],
+        "{CASE}: the old entry reads back as returned"
+    );
+
+    let m = memory_new(
+        CASE,
+        MemoryKind::Decision,
+        "Mainline branch",
+        "Trunk is the mainline.",
+    );
+    let m_id = m.id;
+    let (old, newer) = memory_superseded(
+        CASE,
+        store.supersede_memory_entry(n_id, 1, m).await.expect(CASE),
+    );
+    assert_eq!(
+        (
+            old.state,
+            old.superseded_by,
+            newer.id,
+            newer.subject.as_str()
+        ),
+        (MemoryState::Superseded, Some(m_id), m_id, "Mainline branch"),
+        "{CASE}: the new subject may differ from the old one"
+    );
+    assert_eq!(
+        memory_list(
+            CASE,
+            store,
+            ids::PROJECT_HTUI,
+            Some(vec![MemoryState::Active])
+        )
+        .await,
+        vec![newer],
+        "{CASE}: the chain has one live entry"
+    );
+}
+
+/// Plan D6: a supersede is refused whole. A stale token answers `Diverged` and writes nothing,
+/// the new entry included; a closed old entry and a new subject that a third live entry holds
+/// are `Constraint`; an unknown old entry is `NotFound`.
+async fn memory_supersede_refuses_stale_closed_and_clashing<S: WriteStore>(store: &S) {
+    const CASE: &str = "memory_supersede_refuses_stale_closed_and_clashing";
+
+    let a = memory_create(
+        CASE,
+        store,
+        ids::PROJECT_HTUI,
+        "Lint gate",
+        "Clippy runs with -D warnings.",
+    )
+    .await;
+    let a = memory_updated(
+        CASE,
+        store
+            .amend_memory_entry(
+                a.id,
+                1,
+                memory_patch(
+                    CASE,
+                    None,
+                    Some("Clippy runs with -D warnings, featureless too."),
+                ),
+            )
+            .await
+            .expect(CASE),
+    );
+    let a_history = memory_history(CASE, store, a.id).await;
+
+    let stale = memory_new(CASE, MemoryKind::Fact, "Lint gate", "Clippy is optional.");
+    let stale_id = stale.id;
+    assert_eq!(
+        store
+            .supersede_memory_entry(a.id, 1, stale)
+            .await
+            .expect(CASE),
+        MemorySupersede::Diverged {
+            head: a.clone(),
+            ancestor: a_history[0].clone(),
+        },
+        "{CASE}: a stale token answers the head and the revision it edited from"
+    );
+    assert_eq!(
+        memory_history(CASE, store, stale_id).await,
+        Vec::new(),
+        "{CASE}: a divergence wrote no new entry"
+    );
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_HTUI, None).await,
+        vec![a.clone()],
+        "{CASE}: a divergence moved nothing"
+    );
+
+    let r = memory_create(CASE, store, ids::PROJECT_HTUI, "Old lint", "Rustfmt only.").await;
+    memory_updated(
+        CASE,
+        store
+            .retire_memory_entry(r.id, 1, ids::USER, Some(ids::BOX))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        store
+            .supersede_memory_entry(
+                r.id,
+                2,
+                memory_new(CASE, MemoryKind::Fact, "New lint", "Rustfmt and clippy."),
+            )
+            .await,
+        Err(StoreError::Constraint(memory_entry_closed(
+            r.id,
+            MemoryState::Retired
+        ))),
+        "{CASE}: a retired entry is not superseded"
+    );
+
+    let c = memory_create(
+        CASE,
+        store,
+        ids::PROJECT_HTUI,
+        "Disk budget",
+        "Keep 20 GB free.",
+    )
+    .await;
+    let clash = memory_new(CASE, MemoryKind::Fact, "disk BUDGET", "Keep 50 GB free.");
+    let clash_id = clash.id;
+    assert_eq!(
+        store.supersede_memory_entry(a.id, 2, clash).await,
+        Err(StoreError::Constraint(memory_subject_taken(
+            "Disk budget",
+            c.id
+        ))),
+        "{CASE}: a new subject a third live entry holds is refused, naming it"
+    );
+    assert_eq!(
+        memory_history(CASE, store, a.id).await,
+        a_history,
+        "{CASE}: the refused supersede left the old entry's history"
+    );
+    assert_eq!(
+        memory_history(CASE, store, clash_id).await,
+        Vec::new(),
+        "{CASE}: the refused supersede wrote no new entry"
+    );
+    assert_eq!(
+        memory_list(
+            CASE,
+            store,
+            ids::PROJECT_HTUI,
+            Some(vec![MemoryState::Active])
+        )
+        .await,
+        vec![c, a.clone()],
+        "{CASE}: the old entry is still live, as it was"
+    );
+
+    let replacement = memory_new(CASE, MemoryKind::Fact, "Lint gate", "Clippy, twice.");
+    memory_superseded(
+        CASE,
+        store
+            .supersede_memory_entry(a.id, 2, replacement)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        store
+            .supersede_memory_entry(
+                a.id,
+                3,
+                memory_new(CASE, MemoryKind::Fact, "Lint gate v3", "Clippy, thrice."),
+            )
+            .await,
+        Err(StoreError::Constraint(memory_entry_closed(
+            a.id,
+            MemoryState::Superseded
+        ))),
+        "{CASE}: a superseded entry is not superseded again"
+    );
+
+    not_found_on(
+        CASE,
+        store
+            .supersede_memory_entry(
+                MemoryEntryId::new(),
+                1,
+                memory_new(CASE, MemoryKind::Fact, "Orphan", "No old entry."),
+            )
+            .await,
+        "memory_entry",
+        "an unknown old entry",
+    );
+}
+
+/// Plan D6: an unknown project or entry is `NotFound`, an unknown entry's history is empty (not
+/// "not available here"), and a duplicate id or an author or box that names no row is
+/// `Constraint`. No refusal writes.
+async fn memory_unknown_rows_and_authors_are_refused<S: WriteStore>(store: &S) {
+    const CASE: &str = "memory_unknown_rows_and_authors_are_refused";
+
+    not_found_on(
+        CASE,
+        store
+            .create_memory_entry(
+                ProjectId::new(),
+                memory_new(CASE, MemoryKind::Fact, "Nowhere", "No such project."),
+            )
+            .await,
+        "project",
+        "a create in an unknown project",
+    );
+    not_found_on(
+        CASE,
+        store
+            .amend_memory_entry(
+                MemoryEntryId::new(),
+                1,
+                memory_patch(CASE, None, Some("No such entry.")),
+            )
+            .await,
+        "memory_entry",
+        "an amend of an unknown entry",
+    );
+    not_found_on(
+        CASE,
+        store
+            .retire_memory_entry(MemoryEntryId::new(), 1, ids::USER, Some(ids::BOX))
+            .await,
+        "memory_entry",
+        "a retire of an unknown entry",
+    );
+    assert_eq!(
+        store
+            .memory_revisions(MemoryEntryId::new())
+            .await
+            .expect(CASE),
+        Some(Vec::new()),
+        "{CASE}: an unknown entry has no revisions"
+    );
+
+    let entry = memory_create(CASE, store, ids::PROJECT_HTUI, "Owner", "The one entry.").await;
+    let duplicate = NewMemoryEntry {
+        id: entry.id,
+        ..memory_new(
+            CASE,
+            MemoryKind::Fact,
+            "Duplicate",
+            "Same id, other subject.",
+        )
+    };
+    assert!(
+        matches!(
+            store
+                .create_memory_entry(ids::PROJECT_HTUI, duplicate)
+                .await,
+            Err(StoreError::Constraint(_))
+        ),
+        "{CASE}: a duplicate id is a Constraint"
+    );
+    let stranger = NewMemoryEntry {
+        created_by: UserId::new(),
+        ..memory_new(CASE, MemoryKind::Fact, "Stranger", "Nobody wrote this.")
+    };
+    assert!(
+        matches!(
+            store.create_memory_entry(ids::PROJECT_HTUI, stranger).await,
+            Err(StoreError::Constraint(_))
+        ),
+        "{CASE}: a created_by that names no user is a Constraint"
+    );
+    let boxless = NewMemoryEntry {
+        box_id: Some(BoxId::new()),
+        ..memory_new(CASE, MemoryKind::Fact, "Boxless", "No such box.")
+    };
+    assert!(
+        matches!(
+            store.create_memory_entry(ids::PROJECT_HTUI, boxless).await,
+            Err(StoreError::Constraint(_))
+        ),
+        "{CASE}: a box_id that names no box is a Constraint"
+    );
+    let nil_author = MemoryPatch {
+        author_id: UserId::default(),
+        ..memory_patch(CASE, None, Some("By nobody."))
+    };
+    assert!(
+        matches!(
+            store.amend_memory_entry(entry.id, 1, nil_author).await,
+            Err(StoreError::Constraint(_))
+        ),
+        "{CASE}: an amend by an author that names no user is a Constraint"
+    );
+
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_HTUI, None).await,
+        vec![entry.clone()],
+        "{CASE}: no refusal wrote a row or moved one"
+    );
+    assert_eq!(
+        memory_history(CASE, store, entry.id).await.len(),
+        1,
+        "{CASE}: no refusal wrote a revision"
+    );
+}
+
+/// Plan D8: a project delete takes its memory entries and their revisions, every state, counts
+/// both in the reach it shows first, and leaves another project's entries alone.
+async fn project_delete_counts_memory<S: WriteStore>(store: &S) {
+    const CASE: &str = "project_delete_counts_memory";
+
+    let e1 = memory_create(CASE, store, ids::PROJECT_HTUI, "Entry one", "First.").await;
+    memory_updated(
+        CASE,
+        store
+            .amend_memory_entry(e1.id, 1, memory_patch(CASE, None, Some("First, amended.")))
+            .await
+            .expect(CASE),
+    );
+    let e2 = memory_create(CASE, store, ids::PROJECT_HTUI, "Entry two", "Second.").await;
+    let e3 = memory_new(
+        CASE,
+        MemoryKind::Fact,
+        "Entry three",
+        "Third, replaces two.",
+    );
+    let e3_id = e3.id;
+    memory_superseded(
+        CASE,
+        store
+            .supersede_memory_entry(e2.id, 1, e3)
+            .await
+            .expect(CASE),
+    );
+    let agy = memory_create(
+        CASE,
+        store,
+        ids::PROJECT_AGY,
+        "Entry one",
+        "Another project.",
+    )
+    .await;
+
+    let reach = store
+        .delete_reach(DeleteTarget::Project(ids::PROJECT_HTUI))
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: fixture project reach"));
+    let report = store.delete_project(ids::PROJECT_HTUI).await.expect(CASE);
+    assert_eq!(
+        report, reach,
+        "{CASE}: the counts shown before are the counts the delete took (PRD D13)"
+    );
+    assert_eq!(
+        (report.memory_entries, report.memory_revisions),
+        (3, 5),
+        "{CASE}: three entries of every state, with 2 + 2 + 1 revisions"
+    );
+
+    assert_eq!(
+        store
+            .memory_entries(ids::PROJECT_HTUI, None)
+            .await
+            .expect(CASE),
+        Some(Vec::new()),
+        "{CASE}: the project's entries went with it"
+    );
+    for id in [e1.id, e2.id, e3_id] {
+        assert_eq!(
+            memory_history(CASE, store, id).await,
+            Vec::new(),
+            "{CASE}: the revisions of {id} went with it"
+        );
+    }
+    assert_eq!(
+        memory_list(CASE, store, ids::PROJECT_AGY, None).await,
+        vec![agy.clone()],
+        "{CASE}: another project's entry stays"
+    );
+    assert_eq!(
+        memory_history(CASE, store, agy.id).await.len(),
+        1,
+        "{CASE}: and so does its revision"
     );
 }
 
