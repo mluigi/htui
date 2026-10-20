@@ -41,9 +41,9 @@ use htui_core::model::{
     RunStepCommit, RunStepTree, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding,
     SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
     StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
-    StepStatus, UserId, VerifyOutcome, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject, canonical_declared_tags, missing_tags_failure, moved_order,
-    overlaps, scope_of,
+    StepStatus, StopMode, UserId, VerifyOutcome, WaitingPermission, Workspace, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop, canonical_declared_tags,
+    missing_tags_failure, moved_order, overlaps, scope_of,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
@@ -979,7 +979,7 @@ async fn finish_run_on(
         let live = sqlx::query_scalar!(
             "SELECT count(*) FROM run \
               WHERE item_id = $1 AND id <> $2 \
-                AND status IN ('queued','running','awaiting_approval')",
+                AND status IN ('queued','running','awaiting_approval','stopped')",
             item.as_uuid(),
             run.as_uuid(),
         )
@@ -4602,11 +4602,12 @@ impl WriteStore for PgStore {
             r#"
             INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id,
                              executing_box_id, graph_snapshot, started_by, queued_at, repo_scope,
-                             batch_id)
-            VALUES ($1, $2, $3, 'graph', $4, 'queued', $5, NULL, $6, $7, $8, $9::uuid[], $10)
+                             batch_id, workspace_id)
+            VALUES ($1, $2, $3, 'graph', $4, 'queued', $5, NULL, $6, $7, $8, $9::uuid[], $10, $11)
             RETURNING id               AS "id: RunId",
                       project_id       AS "project_id: ProjectId",
                       item_id          AS "item_id: ItemId",
+                      workspace_id     AS "workspace_id: WorkspaceId",
                       kind             AS "kind: RunKind",
                       mode             AS "mode: RunMode",
                       status           AS "status: RunStatus",
@@ -4633,6 +4634,7 @@ impl WriteStore for PgStore {
             new.queued_at,
             &scope,
             new.batch_id.map(BatchId::as_uuid),
+            new.workspace_id.map(WorkspaceId::as_uuid),
         )
         .fetch_one(&mut *tx)
         .await
@@ -4698,7 +4700,9 @@ impl WriteStore for PgStore {
     /// [`StoreError::Constraint`] for a TTL outside [`lease_ttl_micros`]'s range, before the
     /// transaction opens. [`StoreError::NotFound`] `{ entity: "run" }` or `{ entity: "box" }`, the
     /// run looked up first. Every refusal that is not an error is an `Ok` [`Claim`] other than
-    /// [`Claim::Admitted`], with nothing written, except [`Claim::MissingTags`]: the run is failed
+    /// [`Claim::Admitted`], with nothing written ([`Claim::WorkspaceStopped`], MOD-125 D5, decided
+    /// right after `NotClaimable` under a `FOR SHARE` on the `workspace_stop` row, included),
+    /// except [`Claim::MissingTags`]: the run is failed
     /// and its item blocked in this same transaction, which is then committed (MOD-7 milestone 3,
     /// D80). The run row and the box row are both locked `FOR UPDATE` before the tag read, so a
     /// concurrent `record_box_probe` or `edit_box` waits for the decision and the check cannot
@@ -4724,6 +4728,7 @@ impl WriteStore for PgStore {
             r#"
             SELECT status         AS "status: RunStatus",
                    target_box_id  AS "target_box_id: BoxId",
+                   workspace_id   AS "workspace_id: WorkspaceId",
                    repo_scope     AS "repo_scope: Vec<RepoId>",
                    graph_snapshot
               FROM run WHERE id = $1 FOR UPDATE
@@ -4752,6 +4757,26 @@ impl WriteStore for PgStore {
 
         if claimed.status != RunStatus::Queued || claimed.target_box_id != box_id {
             return Ok(Claim::NotClaimable);
+        }
+
+        // MOD-125 D5: run, then box, then the stop row. resume_workspace locks only workspace_stop;
+        // stop_workspace also takes FOR KEY SHARE on workspace and app_user through its foreign
+        // keys, neither of which a claim locks; delete_workspace locks run rows before the stop
+        // row, the claim's own order. So no cycle. FOR SHARE makes a racing resume (DELETE) or
+        // escalation wait for this decision; a stop inserted after this read is ordered after the claim, and
+        // M2's executor stops the run it admitted. The early return drops `tx`, which rolls back.
+        if let Some(workspace) = claimed.workspace_id {
+            let stopped = sqlx::query_scalar!(
+                r#"SELECT 1 AS "one!" FROM workspace_stop WHERE workspace_id = $1 FOR SHARE"#,
+                workspace.as_uuid(),
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .is_some();
+            if stopped {
+                return Ok(Claim::WorkspaceStopped { workspace });
+            }
         }
 
         // R-ORCH-10 at claim (MOD-7 milestone 3, D80, D81): inside the admission transaction,
@@ -4844,7 +4869,7 @@ impl WriteStore for PgStore {
             r#"
             SELECT id AS "id: RunId", graph_snapshot, repo_scope AS "repo_scope: Vec<RepoId>"
               FROM run
-             WHERE executing_box_id = $1 AND status IN ('running','awaiting_approval')
+             WHERE executing_box_id = $1 AND status IN ('running','awaiting_approval','stopped')
                AND repo_scope && $2::uuid[]
              ORDER BY queued_at, id
             "#,
@@ -4951,17 +4976,41 @@ impl WriteStore for PgStore {
 
     /// ANA-2 §4.9's sweep: every `running` **graph** run on the box whose lease is `NULL` or
     /// expired by `clock_timestamp()`, and is not already `owner`'s (plan D88), becomes `owner`'s,
-    /// in one statement, its lease `clock_timestamp()` plus the TTL (MOD-40 plan D10).
+    /// in one transaction, its lease `clock_timestamp()` plus the TTL (MOD-40 plan D10).
     ///
     /// A chat run (`kind = 'chat'`, `running` with no lease, `start_chat_run`) is never the
     /// sweep's: the engine cannot recover it, and leasing it fenced the chat's own unleased writes
     /// until `unrecovered` gave it back (MOD-24 D3b).
     ///
-    /// The candidates are locked in `(queued_at, id)` order with `FOR UPDATE SKIP LOCKED`
-    /// (blueprint A-5): two concurrent sweeps never wait on each other's row locks and cannot
-    /// deadlock, and a row one sweep holds is simply not the other's to adopt.
+    /// MOD-125 D6: a candidate whose workspace has a `workspace_stop` row is **settled, not
+    /// adopted**: `running -> stopped` with its running steps, the lease released as
+    /// [`WriteStore::release_lease`] releases it, and left out of the answer (blueprint F5, as
+    /// amended by review round R1):
     ///
-    /// `RETURNING` cannot carry an `ORDER BY`, so the update is a CTE and the ordering is the
+    /// 1. the candidates are locked in `(queued_at, id)` order, `FOR UPDATE SKIP LOCKED`;
+    /// 2. the stop rows of their workspaces are read `FOR SHARE` (the decision `claim_run` makes);
+    /// 3. only when a candidate's workspace is stopped, its running steps are read twice: once
+    ///    plainly, then locked `FOR NO KEY UPDATE SKIP LOCKED`. A stopped candidate whose every
+    ///    running step the second read locked is settled; one with a running step the first read
+    ///    saw and the second skipped (another transaction holds it) is **deferred** to a later
+    ///    sweep, neither settled nor adopted
+    ///    (`pg_criteria.rs::adopt_runs_defers_a_stopped_run_whose_step_is_held`); every other
+    ///    candidate is adopted. One `SKIP LOCKED` read alone cannot tell a held step from no step,
+    ///    and would settle a run whose step another transaction is writing;
+    /// 4. the settlement writes the steps, then the runs;
+    /// 5. the adoption is today's update, over the adopted ids.
+    ///
+    /// Every lock this sweep takes on `run` and `run_step` is `SKIP LOCKED` (blueprint A-5), and
+    /// every `UPDATE` touches only rows it already holds, so the sweep never waits on a run or step
+    /// lock: two concurrent sweeps cannot deadlock, a row one sweep holds is simply not the
+    /// other's, no sweep waits on a stalled former owner, and MOD-77's step → run order is
+    /// irrelevant here. The only waiting lock is `FOR SHARE` on `workspace_stop`, taken while the
+    /// sweep holds run locks but no step lock. Its writers hold the row lock briefly and wait on
+    /// nothing else while holding it: `resume_workspace` is one autocommit `DELETE`;
+    /// `stop_workspace` holds it from its upsert through at most one read-back `SELECT` and the
+    /// `COMMIT`; `delete_workspace`'s cascade reaches it last, right before its `COMMIT`.
+    ///
+    /// `RETURNING` cannot carry an `ORDER BY`, so the adoption is a CTE and the ordering is the
     /// `SELECT` over it — `queued_at`, as the contract says. A box that does not exist matches
     /// nothing and adopts nothing, which is an empty vector rather than a refusal.
     ///
@@ -4971,57 +5020,190 @@ impl WriteStore for PgStore {
     /// backend's own failures only.
     async fn adopt_runs(&self, box_id: BoxId, owner: Uuid, ttl: TimeDelta) -> Result<Vec<Run>> {
         let ttl = lease_ttl_micros(ttl)?;
-        sqlx::query_as!(
-            Run,
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        // 1. The candidates: today's predicate and order.
+        let candidates = sqlx::query!(
             r#"
-            WITH candidates AS (
-                SELECT id
-                  FROM run
-                 WHERE executing_box_id = $1
-                   AND status = 'running'
-                   AND kind = 'graph'
-                   AND (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp())
-                   AND lease_owner IS DISTINCT FROM $2
-                 ORDER BY queued_at, id
-                   FOR UPDATE SKIP LOCKED
-            ),
-            swept AS (
-                UPDATE run r
-                   SET lease_owner      = $2,
-                       lease_box_id     = $1,
-                       lease_expires_at = clock_timestamp() + $3::bigint * interval '1 microsecond'
-                  FROM candidates c
-                 WHERE r.id = c.id
-             RETURNING r.*
-            )
-            SELECT id               AS "id: RunId",
-                   project_id       AS "project_id: ProjectId",
-                   item_id          AS "item_id: ItemId",
-                   kind             AS "kind: RunKind",
-                   mode             AS "mode: RunMode",
-                   status           AS "status: RunStatus",
-                   target_box_id    AS "target_box_id: BoxId",
-                   executing_box_id AS "executing_box_id: BoxId",
-                   graph_snapshot,
-                   started_by       AS "started_by: UserId",
-                   queued_at,
-                   started_at,
-                   finished_at,
-                   failure,
-                   repo_scope       AS "repo_scope: Vec<RepoId>",
-                   lease_box_id     AS "lease_box_id: BoxId",
-                   lease_expires_at,
-                   updated_at
-              FROM swept
+            SELECT id           AS "id: RunId",
+                   workspace_id AS "workspace_id: WorkspaceId"
+              FROM run
+             WHERE executing_box_id = $1
+               AND status = 'running'
+               AND kind = 'graph'
+               AND (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp())
+               AND lease_owner IS DISTINCT FROM $2
              ORDER BY queued_at, id
+               FOR UPDATE SKIP LOCKED
             "#,
             box_id.as_uuid(),
             owner,
-            ttl,
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await
-        .map_err(map_sqlx)
+        .map_err(map_sqlx)?;
+
+        // 2. The stops held, for the candidates' workspaces.
+        let workspaces: Vec<Uuid> = candidates
+            .iter()
+            .filter_map(|row| row.workspace_id.map(|id| id.as_uuid()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let stopped: BTreeSet<Uuid> = if workspaces.is_empty() {
+            BTreeSet::new()
+        } else {
+            sqlx::query_scalar!(
+                r#"
+                SELECT workspace_id AS "workspace_id: WorkspaceId"
+                  FROM workspace_stop WHERE workspace_id = ANY($1::uuid[]) FOR SHARE
+                "#,
+                &workspaces,
+            )
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .into_iter()
+            .map(|id| id.as_uuid())
+            .collect()
+        };
+
+        let mut stopping: Vec<Uuid> = Vec::new();
+        let mut adopt: Vec<Uuid> = Vec::new();
+        for row in &candidates {
+            if row
+                .workspace_id
+                .is_some_and(|id| stopped.contains(&id.as_uuid()))
+            {
+                stopping.push(row.id.as_uuid());
+            } else {
+                adopt.push(row.id.as_uuid());
+            }
+        }
+
+        if !stopping.is_empty() {
+            // 3. The stopped candidates' running steps, read under the run locks: (a) every one
+            // plainly, then (b) the ones no other transaction holds, locked. A step (a) saw and
+            // (b) skipped is held elsewhere, and defers its run.
+            let running = sqlx::query!(
+                r#"
+                SELECT id     AS "id: StepId",
+                       run_id AS "run_id: RunId"
+                  FROM run_step WHERE run_id = ANY($1::uuid[]) AND status = 'running'
+                "#,
+                &stopping,
+            )
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+            let held: BTreeSet<Uuid> = sqlx::query_scalar!(
+                r#"
+                SELECT id AS "id: StepId"
+                  FROM run_step WHERE run_id = ANY($1::uuid[]) AND status = 'running'
+                 ORDER BY run_id, id
+                   FOR NO KEY UPDATE SKIP LOCKED
+                "#,
+                &stopping,
+            )
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .into_iter()
+            .map(|step| step.as_uuid())
+            .collect();
+            let deferred: BTreeSet<Uuid> = running
+                .iter()
+                .filter(|step| !held.contains(&step.id.as_uuid()))
+                .map(|step| step.run_id.as_uuid())
+                .collect();
+            for run in &deferred {
+                tracing::debug!(
+                    run = %run,
+                    "a stopped workspace's run is deferred: a step is locked"
+                );
+            }
+            let settle: Vec<Uuid> = stopping
+                .into_iter()
+                .filter(|run| !deferred.contains(run))
+                .collect();
+            let steps: Vec<Uuid> = running
+                .iter()
+                .filter(|step| settle.contains(&step.run_id.as_uuid()))
+                .map(|step| step.id.as_uuid())
+                .collect();
+
+            // 4. Settle: the steps, then the runs.
+            if !steps.is_empty() {
+                sqlx::query!(
+                    "UPDATE run_step SET status = 'stopped' WHERE id = ANY($1::uuid[]) AND status = 'running'",
+                    &steps,
+                )
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+            }
+            if !settle.is_empty() {
+                sqlx::query!(
+                    "UPDATE run SET status = 'stopped', lease_owner = NULL, lease_expires_at = clock_timestamp() \
+                      WHERE id = ANY($1::uuid[]) AND status = 'running'",
+                    &settle,
+                )
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+            }
+        }
+
+        // 5. Adopt.
+        let adopted = if adopt.is_empty() {
+            Vec::new()
+        } else {
+            sqlx::query_as!(
+                Run,
+                r#"
+                WITH swept AS (
+                    UPDATE run r
+                       SET lease_owner      = $2,
+                           lease_box_id     = $1,
+                           lease_expires_at = clock_timestamp() + $3::bigint * interval '1 microsecond'
+                     WHERE r.id = ANY($4::uuid[])
+                 RETURNING r.*
+                )
+                SELECT id               AS "id: RunId",
+                       project_id       AS "project_id: ProjectId",
+                       item_id          AS "item_id: ItemId",
+                       workspace_id     AS "workspace_id: WorkspaceId",
+                       kind             AS "kind: RunKind",
+                       mode             AS "mode: RunMode",
+                       status           AS "status: RunStatus",
+                       target_box_id    AS "target_box_id: BoxId",
+                       executing_box_id AS "executing_box_id: BoxId",
+                       graph_snapshot,
+                       started_by       AS "started_by: UserId",
+                       queued_at,
+                       started_at,
+                       finished_at,
+                       failure,
+                       repo_scope       AS "repo_scope: Vec<RepoId>",
+                       lease_box_id     AS "lease_box_id: BoxId",
+                       lease_expires_at,
+                       updated_at
+                  FROM swept
+                 ORDER BY queued_at, id
+                "#,
+                box_id.as_uuid(),
+                owner,
+                ttl,
+                &adopt,
+            )
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+        };
+
+        // 6. Commit.
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(adopted)
     }
 
     /// Plan D87: the lease of a run that is ours or free, in one compare-and-set `UPDATE`.
@@ -5125,6 +5307,228 @@ impl WriteStore for PgStore {
                 id: run.to_string(),
             })
         }
+    }
+
+    /// MOD-125 D4: the upsert on `workspace_stop`'s key that only escalates `graceful -> forced`,
+    /// in one transaction.
+    ///
+    /// The workspace and the user are read first, explicitly: the no-op conflict path writes no
+    /// row and so takes no foreign-key check, and without the user read an unknown `by` over a
+    /// stored row would be answered `Ok` here and `Constraint` by `MemStore`. `ON CONFLICT DO
+    /// UPDATE ... WHERE` returns no row when its `WHERE` is false, so the stored row is then read
+    /// back; the conflict locked it, so the read sees what the upsert decided on.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "workspace" }`; [`StoreError::Constraint`] for an
+    /// unknown user.
+    async fn stop_workspace(
+        &self,
+        workspace: WorkspaceId,
+        mode: StopMode,
+        by: UserId,
+        at: DateTime<Utc>,
+    ) -> Result<WorkspaceStop> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let known = sqlx::query_scalar!(
+            r#"SELECT 1 AS "one!" FROM workspace WHERE id = $1"#,
+            workspace.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .is_some();
+        if !known {
+            return Err(StoreError::NotFound {
+                entity: "workspace",
+                id: workspace.to_string(),
+            });
+        }
+        let user = sqlx::query_scalar!(
+            r#"SELECT 1 AS "one!" FROM app_user WHERE id = $1"#,
+            by.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .is_some();
+        if !user {
+            return Err(StoreError::Constraint(references_no_row(
+                "workspace_stop.requested_by",
+                by,
+                "app_user",
+            )));
+        }
+
+        let written = sqlx::query_as!(
+            WorkspaceStop,
+            r#"
+            INSERT INTO workspace_stop AS ws (workspace_id, mode, requested_by, requested_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (workspace_id) DO UPDATE
+               SET mode         = 'forced',
+                   requested_by = EXCLUDED.requested_by,
+                   requested_at = EXCLUDED.requested_at
+             WHERE ws.mode = 'graceful' AND EXCLUDED.mode = 'forced'
+            RETURNING workspace_id AS "workspace_id: WorkspaceId",
+                      mode         AS "mode: StopMode",
+                      requested_by AS "requested_by: UserId",
+                      requested_at
+            "#,
+            workspace.as_uuid(),
+            mode.as_str(),
+            by.as_uuid(),
+            at,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        let stored = match written {
+            Some(row) => row,
+            None => sqlx::query_as!(
+                WorkspaceStop,
+                r#"
+                    SELECT workspace_id AS "workspace_id: WorkspaceId",
+                           mode         AS "mode: StopMode",
+                           requested_by AS "requested_by: UserId",
+                           requested_at
+                      FROM workspace_stop WHERE workspace_id = $1
+                    "#,
+                workspace.as_uuid(),
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_sqlx)?,
+        };
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(stored)
+    }
+
+    /// MOD-125 D4: the workspace's stop record, read on the pool.
+    ///
+    /// # Errors
+    ///
+    /// The backend's own failures only.
+    async fn workspace_stop(&self, workspace: WorkspaceId) -> Result<Option<WorkspaceStop>> {
+        sqlx::query_as!(
+            WorkspaceStop,
+            r#"
+            SELECT workspace_id AS "workspace_id: WorkspaceId",
+                   mode         AS "mode: StopMode",
+                   requested_by AS "requested_by: UserId",
+                   requested_at
+              FROM workspace_stop WHERE workspace_id = $1
+            "#,
+            workspace.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// MOD-125 D4: one `DELETE`; zero rows are told apart from an unknown workspace by one
+    /// follow-up read, as [`WriteStore::refresh_lease`] tells its zero rows apart.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "workspace" }`.
+    async fn resume_workspace(&self, workspace: WorkspaceId) -> Result<bool> {
+        let deleted = sqlx::query!(
+            "DELETE FROM workspace_stop WHERE workspace_id = $1",
+            workspace.as_uuid(),
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+        if deleted == 1 {
+            return Ok(true);
+        }
+        let exists = sqlx::query_scalar!(
+            r#"SELECT 1 AS "one!" FROM workspace WHERE id = $1"#,
+            workspace.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .is_some();
+        if exists {
+            Ok(false)
+        } else {
+            Err(StoreError::NotFound {
+                entity: "workspace",
+                id: workspace.to_string(),
+            })
+        }
+    }
+
+    /// MOD-125 D7: the compare-and-set `running -> stopped`, in one transaction that locks the
+    /// run's `running` steps **before** the run (MOD-77 D1's step → run order, which `park_step`
+    /// and `upsert_step_tree` take; the reverse could deadlock against them,
+    /// `pg_criteria.rs::stop_run_takes_the_steps_first`).
+    ///
+    /// The first read is unlocked and only decides the early exit (unknown run, not running, not
+    /// ours), which takes no lock. The steps are then locked `FOR NO KEY UPDATE`, which waits,
+    /// since the run is ours; the run is re-checked under its own lock, and a run that is no
+    /// longer running or ours rolls back as `false`. The lease is released as
+    /// [`WriteStore::release_lease`] releases it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "run" }`, read first.
+    async fn stop_run(&self, run: RunId, owner: Uuid) -> Result<bool> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let seen = sqlx::query!(
+            r#"SELECT status AS "status: RunStatus", lease_owner AS "lease_owner?" FROM run WHERE id = $1"#,
+            run.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "run",
+            id: run.to_string(),
+        })?;
+        if seen.status != RunStatus::Running || seen.lease_owner != Some(owner) {
+            return Ok(false);
+        }
+
+        let steps = sqlx::query_scalar!(
+            r#"SELECT id AS "id: StepId" FROM run_step WHERE run_id = $1 AND status = 'running' ORDER BY id FOR NO KEY UPDATE"#,
+            run.as_uuid(),
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        let locked = sqlx::query!(
+            r#"SELECT status AS "status: RunStatus", lease_owner AS "lease_owner?" FROM run WHERE id = $1 FOR NO KEY UPDATE"#,
+            run.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if locked.status != RunStatus::Running || locked.lease_owner != Some(owner) {
+            return Ok(false);
+        }
+
+        let steps: Vec<Uuid> = steps.into_iter().map(|id| id.as_uuid()).collect();
+        sqlx::query!(
+            "UPDATE run_step SET status = 'stopped' WHERE id = ANY($1::uuid[]) AND status = 'running'",
+            &steps,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        sqlx::query!(
+            "UPDATE run SET status = 'stopped', lease_owner = NULL, lease_expires_at = clock_timestamp() WHERE id = $1",
+            run.as_uuid(),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(true)
     }
 
     /// A `run_step` at `pending` with every settle column `NULL`; `fanout_index = -1` is the judge
@@ -5589,7 +5993,9 @@ impl WriteStore for PgStore {
         tx.commit().await.map_err(map_sqlx)
     }
 
-    /// §4.4's loop half: `pending | awaiting_approval | done -> superseded`, and nothing else.
+    /// §4.4's loop half: `pending | awaiting_approval | done -> superseded`, plus M3's
+    /// fresh-rerun fallback `stopped -> superseded` (MOD-125 D1), and nothing else: the list is
+    /// the law's `-> superseded` column.
     ///
     /// The refusal is the law's table and not a stale compare-and-set, so the follow-up read has
     /// to fetch the *status* rather than a bare `SELECT 1`: it is what
@@ -5602,7 +6008,7 @@ impl WriteStore for PgStore {
     async fn supersede_step(&self, step: StepId) -> Result<()> {
         let moved = sqlx::query!(
             "UPDATE run_step SET status = 'superseded' \
-              WHERE id = $1 AND status IN ('pending','awaiting_approval','done')",
+              WHERE id = $1 AND status IN ('pending','awaiting_approval','stopped','done')",
             step.as_uuid(),
         )
         .execute(&self.pool)
@@ -6155,14 +6561,14 @@ impl WriteStore for PgStore {
         Ok(ParkOutcome::Parked)
     }
 
-    /// §4.3's failure row: `queued | running | awaiting_approval -> failed`, with the reason and
+    /// §4.3's failure row: `queued | running | awaiting_approval | stopped -> failed`, with the reason and
     /// the caller's instant.
     ///
     /// `finished_at` is `COALESCE`d rather than assigned, so a run that already stamped a finish
     /// (a `cancelled` racing a `failed` is not possible under the law, but a re-`finish` is) keeps
     /// the first instant. `failure` is assigned: the newest reason is the one the pane shows.
     ///
-    /// The three statuses in the `WHERE` are exactly [`RunStatus::can_move_to`]'s `-> Failed`
+    /// The four statuses in the `WHERE` are exactly [`RunStatus::can_move_to`]'s `-> Failed`
     /// column, so the compare-and-set *is* the law, and like
     /// [`supersede_step`](WriteStore::supersede_step) the follow-up read fetches the **status**
     /// rather than a bare `SELECT 1`: it is what [`illegal_move`] names in the sentence.
@@ -6175,7 +6581,7 @@ impl WriteStore for PgStore {
         let moved = sqlx::query!(
             "UPDATE run SET status = 'failed', failure = $2, \
                             finished_at = COALESCE(finished_at, $3) \
-              WHERE id = $1 AND status IN ('queued','running','awaiting_approval')",
+              WHERE id = $1 AND status IN ('queued','running','awaiting_approval','stopped')",
             run.as_uuid(),
             failure,
             at,
@@ -6276,7 +6682,7 @@ impl WriteStore for PgStore {
     ///
     /// [`StoreError::NotFound`] `{ entity: "item" }`, or `{ entity: "run_step" }` for a commit row
     /// naming a step that does not exist; [`StoreError::Constraint`] when a run of the item is
-    /// `queued | running | awaiting_approval`, when `summary.kind` is not `summary`, when
+    /// live (`queued | running | awaiting_approval | stopped`), when `summary.kind` is not `summary`, when
     /// `summary.item_id` is not `item`, when `resolution` does not close the item's status under
     /// ANA-11 §4.2 ([`resolution_not_closable`]), when a commit row names an unknown repo, or when
     /// the summary duplicates a document id or names an unknown `created_by` /
@@ -6309,7 +6715,7 @@ impl WriteStore for PgStore {
             SELECT id     AS "id: RunId",
                    status AS "status: RunStatus"
               FROM run
-             WHERE item_id = $1 AND status IN ('queued','running','awaiting_approval')
+             WHERE item_id = $1 AND status IN ('queued','running','awaiting_approval','stopped')
              ORDER BY queued_at, id
              LIMIT 1
             "#,
@@ -7883,16 +8289,19 @@ impl PgStore {
 impl PgStore {
     /// MOD-12 D1: queue `item` on `box_id`. Idempotent: an item already queued (on any box)
     /// answers its stored entry unchanged (`ON CONFLICT (item_id) DO NOTHING`, then the read).
-    /// `at` is microsecond-truncated by the driver.
+    /// `at` is microsecond-truncated by the driver. `workspace` (MOD-125 D3) is recorded on a new
+    /// entry. An entry already stored comes back unchanged, its workspace included.
     ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] `{ entity: "item" }` for an unknown item;
-    /// [`StoreError::Constraint`] for an unknown box or user (23503, through [`map_sqlx`]).
+    /// [`StoreError::Constraint`] for an unknown box, workspace or user (23503, through
+    /// [`map_sqlx`]).
     pub async fn queue_item(
         &self,
         item: ItemId,
         box_id: BoxId,
+        workspace: Option<WorkspaceId>,
         by: UserId,
         at: DateTime<Utc>,
     ) -> Result<QueueEntry> {
@@ -7910,14 +8319,15 @@ impl PgStore {
         })?;
         sqlx::query!(
             r#"
-            INSERT INTO queue_entry (item_id, box_id, position, queued_at, queued_by)
-            VALUES ($1, $2, NULL, $3, $4)
+            INSERT INTO queue_entry (item_id, box_id, position, queued_at, queued_by, workspace_id)
+            VALUES ($1, $2, NULL, $3, $4, $5)
             ON CONFLICT (item_id) DO NOTHING
             "#,
             item.as_uuid(),
             box_id.as_uuid(),
             at,
             by.as_uuid(),
+            workspace.map(WorkspaceId::as_uuid),
         )
         .execute(&mut *tx)
         .await
@@ -7928,6 +8338,7 @@ impl PgStore {
             SELECT e.item_id    AS "item_id: ItemId",
                    i.project_id AS "project_id: ProjectId",
                    e.box_id     AS "box_id: BoxId",
+                   e.workspace_id AS "workspace_id: WorkspaceId",
                    e.position,
                    e.queued_at,
                    e.queued_by  AS "queued_by: UserId"
@@ -8003,6 +8414,7 @@ impl PgStore {
             SELECT e.item_id    AS "item_id: ItemId",
                    i.project_id AS "project_id: ProjectId",
                    e.box_id     AS "box_id: BoxId",
+                   e.workspace_id AS "workspace_id: WorkspaceId",
                    e.position,
                    e.queued_at,
                    e.queued_by  AS "queued_by: UserId"
@@ -8144,10 +8556,11 @@ impl PgStore {
     }
 
     /// MOD-12 D3 (review M1), M3 D4 (L4): the runner's close of exactly `batch`, only while it is
-    /// open and no run of its own is `queued`, `running` or `awaiting_approval`. The entries the
-    /// runner read do not keep it open: it calls this when nothing is admissible (an empty queue,
-    /// or a stalled one). An entry it did not read does (review R1 L2): `seen` is the items of
-    /// the entries it read (empty when it read none), and an entry of the box for any other item
+    /// open and no run of its own is live (`queued`, `running`, `awaiting_approval` or, MOD-125
+    /// D2, `stopped`). The entries the runner read do not keep it open: it calls this when
+    /// nothing is admissible (an empty queue, or a stalled one). An entry it did not read does
+    /// (review R1 L2): `seen` is the items of the entries it read (empty when it read none),
+    /// and an entry of the box for any other item
     /// means an item may be ready that the runner never judged. The check is by item, not by
     /// `queued_at`: that is the queuing client's clock, not commit order, so a skewed clock or a
     /// queuer that stamped first and committed last could date an unread entry before every
@@ -8193,7 +8606,7 @@ impl PgStore {
                AND NOT EXISTS (
                        SELECT 1 FROM run r
                         WHERE r.batch_id = b.id
-                          AND r.status IN ('queued', 'running', 'awaiting_approval'))
+                          AND r.status IN ('queued', 'running', 'awaiting_approval', 'stopped'))
                AND NOT EXISTS (
                        SELECT 1 FROM queue_entry e
                         WHERE e.box_id = b.box_id

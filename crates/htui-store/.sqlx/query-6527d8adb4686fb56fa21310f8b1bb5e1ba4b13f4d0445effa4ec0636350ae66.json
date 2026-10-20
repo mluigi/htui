@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: StepId\" FROM run_step WHERE run_id = $1 AND status = 'running' ORDER BY id FOR NO KEY UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: StepId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6527d8adb4686fb56fa21310f8b1bb5e1ba4b13f4d0445effa4ec0636350ae66"
+}

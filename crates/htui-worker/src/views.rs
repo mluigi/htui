@@ -1063,6 +1063,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts");

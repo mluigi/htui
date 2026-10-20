@@ -504,7 +504,10 @@ impl BacklogTab {
                 let request = if view.entries.contains(&id) {
                     StoreRequest::DequeueItem { item: id }
                 } else {
-                    StoreRequest::QueueItem { item: id }
+                    StoreRequest::QueueItem {
+                        item: id,
+                        workspace: ctx.scope.workspace_id,
+                    }
                 };
                 self.queue_writing = Some((id, key));
                 request
@@ -1429,13 +1432,14 @@ mod tests {
         }
     }
 
-    /// The queue requests among `actions`, by name; a `queue_item` names its item too.
+    /// The queue requests among `actions`, by name; a `queue_item` names its item and the
+    /// workspace it records (MOD-125 D3) too.
     fn queue_requests(actions: &[Action]) -> Vec<String> {
         actions
             .iter()
             .filter_map(|action| match action {
-                Action::Store(StoreRequest::QueueItem { item }) => {
-                    Some(format!("queue_item {item}"))
+                Action::Store(StoreRequest::QueueItem { item, workspace }) => {
+                    Some(format!("queue_item {item} in {workspace}"))
                 }
                 Action::Store(request) if QUEUE_REQUEST_NAMES.contains(&request.name()) => {
                     Some(request.name().to_owned())
@@ -1466,7 +1470,10 @@ mod tests {
         tab.on_reply(&StoreReply::Queue(paused(Vec::new())), &mut bench.ctx());
         assert_eq!(
             queue_requests(&bench.actions()),
-            [format!("queue_item {ana_2}")]
+            [format!(
+                "queue_item {ana_2} in {}",
+                bench.scope.workspace_id
+            )]
         );
         tab.on_reply(&StoreReply::Queue(paused(Vec::new())), &mut bench.ctx());
         assert_eq!(
@@ -1582,12 +1589,21 @@ mod tests {
         tab.on_reply(&StoreReply::Queue(paused(Vec::new())), &mut bench.ctx());
         assert_eq!(
             queue_requests(&bench.actions()),
-            ["queue_state".to_owned(), format!("queue_item {ana_2}")]
+            [
+                "queue_state".to_owned(),
+                format!("queue_item {ana_2} in {}", bench.scope.workspace_id)
+            ]
         );
         press(&mut tab, &bench, KeyCode::Char('P'));
         assert_eq!(queue_requests(&bench.actions()), ["queue_state"]);
         tab.on_reply(
-            &refused(StoreRequest::QueueItem { item: ana_2 }.name()),
+            &refused(
+                StoreRequest::QueueItem {
+                    item: ana_2,
+                    workspace: bench.scope.workspace_id,
+                }
+                .name(),
+            ),
             &mut bench.ctx(),
         );
         assert!(
@@ -1632,7 +1648,10 @@ mod tests {
         tab.on_reply(&StoreReply::Queue(paused(Vec::new())), &mut bench.ctx());
         assert_eq!(
             queue_requests(&bench.actions()),
-            ["queue_state".to_owned(), format!("queue_item {ana_2}")]
+            [
+                "queue_state".to_owned(),
+                format!("queue_item {ana_2} in {}", bench.scope.workspace_id)
+            ]
         );
         tab.on_reply(&StoreReply::Items(Vec::new()), &mut bench.ctx());
         let _ = bench.actions();

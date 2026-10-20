@@ -331,7 +331,10 @@ pub fn cursor(snapshot: &GraphSnapshot, steps: &[RunStep]) -> Cursor {
         match step.status {
             StepStatus::Done => {}
             StepStatus::Pending => return Cursor::Run(step.id),
-            StepStatus::Running | StepStatus::AwaitingApproval | StepStatus::Failed => {
+            StepStatus::Running
+            | StepStatus::AwaitingApproval
+            | StepStatus::Stopped
+            | StepStatus::Failed => {
                 return Cursor::Rest {
                     step: step.id,
                     status: step.status,

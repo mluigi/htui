@@ -976,6 +976,7 @@ async fn a_run_with_no_steps_says_so_in_the_flow() {
     let store = MemStore::demo();
     store
         .create_run(NewRun {
+            workspace_id: None,
             id: RunId::new(),
             project_id: ids::PROJECT_HTUI,
             item_id: ids::HTUI_ANA_2,
@@ -3308,6 +3309,7 @@ async fn pausing_names_the_runs_still_running() {
     for item in [ids::HTUI_ANA_2, ids::HTUI_CLEAN_1] {
         let run = store
             .create_run(NewRun {
+                workspace_id: None,
                 id: RunId::new(),
                 project_id: ids::PROJECT_HTUI,
                 item_id: item,

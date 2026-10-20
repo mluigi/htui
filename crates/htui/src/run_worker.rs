@@ -818,6 +818,7 @@ pub(crate) mod tests {
             item,
             mode: RunMode::Manual,
             repo_scope: None,
+            workspace: None,
         }))
     }
 
@@ -1617,6 +1618,7 @@ pub(crate) mod tests {
         fixture
             .store
             .create_run(NewRun {
+                workspace_id: None,
                 id: run,
                 project_id: row.project_id,
                 item_id: row.id,
@@ -1659,6 +1661,7 @@ pub(crate) mod tests {
         fixture
             .store
             .create_run(NewRun {
+                workspace_id: None,
                 id: run,
                 project_id: row.project_id,
                 item_id: row.id,
@@ -1789,6 +1792,7 @@ pub(crate) mod tests {
             .queue_item(
                 ids::HTUI_ANA_2,
                 ids::BOX,
+                None,
                 ids::USER,
                 Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS),
             )
@@ -3046,6 +3050,7 @@ pub(crate) mod tests {
                 item: ids::HTUI_ANA_2,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             }),
             OrchRequest::Command(Command::AnswerGate {
                 run,

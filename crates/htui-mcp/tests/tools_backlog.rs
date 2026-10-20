@@ -75,6 +75,7 @@ impl Leased {
         let run = RunId::new();
         store
             .create_run(NewRun {
+                workspace_id: None,
                 id: run,
                 project_id: project,
                 item_id: item,

@@ -59,6 +59,7 @@ async fn run_with(store: &MemStore, snapshot: GraphSnapshot) -> Run {
         .expect("the fixture holds the item");
     store
         .create_run(NewRun {
+            workspace_id: None,
             id: RunId::new(),
             project_id: item.project_id,
             item_id: item.id,

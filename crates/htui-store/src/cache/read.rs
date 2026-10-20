@@ -229,7 +229,7 @@ const ITEM_SELECT: &str = "i.id, i.project_id, i.kind_id, i.key_prefix, i.key_nu
 /// is no use to a reader.
 const RUN_SELECT: &str = "id, project_id, item_id, kind, mode, status, target_box_id, \
      executing_box_id, graph_snapshot, started_by, queued_at, started_at, finished_at, failure, \
-     repo_scope, lease_box_id, lease_expires_at, updated_at";
+     repo_scope, lease_box_id, lease_expires_at, updated_at, workspace_id";
 
 /// One `run` row, every column of [`RUN_SELECT`].
 fn run_of(row: &SqliteRow) -> Result<Run> {
@@ -237,6 +237,10 @@ fn run_of(row: &SqliteRow) -> Result<Run> {
         id: uuid_col::<RunId>("run.id", &text(row, "id")?)?,
         project_id: uuid_col("run.project_id", &text(row, "project_id")?)?,
         item_id: opt_uuid_col::<ItemId>("run.item_id", opt_text(row, "item_id")?.as_deref())?,
+        workspace_id: opt_uuid_col::<WorkspaceId>(
+            "run.workspace_id",
+            opt_text(row, "workspace_id")?.as_deref(),
+        )?,
         kind: get::<RunKind>(row, "kind")?,
         mode: get::<RunMode>(row, "mode")?,
         status: get::<RunStatus>(row, "status")?,
@@ -1339,7 +1343,7 @@ impl ReadStore for CacheStore {
         }
         let sql = format!(
             "SELECT {RUN_SELECT} FROM run WHERE item_id IN ({}) \
-               AND status IN ('queued','running','awaiting_approval')",
+               AND status IN ('queued','running','awaiting_approval','stopped')",
             placeholders(items.len()),
         );
         let mut query = sqlx::query(AssertSqlSafe(sql));
@@ -1466,7 +1470,8 @@ impl CacheStore {
         }))
     }
 
-    /// How many runs of the scope are active (`RunStatus::is_active`).
+    /// How many runs of the scope are on the top bar's count (`RunStatus::on_top_bar`, MOD-125
+    /// D2: the live runs less `stopped`).
     ///
     /// # Errors
     ///

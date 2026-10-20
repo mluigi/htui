@@ -686,10 +686,27 @@ cancelled run completed nothing the item should carry forward.
 | `awaiting_approval` | cancel | - | `cancelled` | user |
 | `done`, `failed`, `cancelled` | - | terminal | - | - |
 
+*Amended by MOD-125 M1, 2026-10-18 (plan D1, D2, D6, `.claude/plans/mod-125-m1-stopped-state.plan.md`):* `run.status`
+gains `stopped` (`R-ORCH-16`), a run halted by a workspace stop and resumable. It is live, not
+terminal: it holds no slot (`claim_run` counts `running` only), but it keeps its trees and its
+branch, so it still refuses an overlapping scope (§4.7). It gets no `finished_at` and its item
+stays `in_progress`. Like `queued` and `cancelled` it is not derived from the steps: `stop_run`
+writes the run and its `running` steps in one transaction. M1 ships the state, `stop_run` and the
+recovery sweep's settlement; the "who" column names the milestone that first writes each row.
+
+| from | event | guard | to | who |
+|---|---|---|---|---|
+| `running` | workspace stop applied | - | `stopped` | orchestrator (M2) |
+| `running` | lease expired, workspace stopped | recovery sweep (§4.9), MOD-125 D6 | `stopped` | recovery sweep |
+| `stopped` | resume | session reopened or rerun fresh | `running` | orchestrator (M3) |
+| `stopped` | cancel | - | `cancelled` | user (M3) |
+| `stopped` | resume impossible and no rerun | - | `failed` | orchestrator (M3) |
+
 `run.status` is **derived from its steps** at every step transition, except `queued` (set at insert)
 and `cancelled` (only a human sets it). That derivation is the single reason the two machines cannot
-drift, and it is what the recovery sweep re-runs on adoption. `RunStatus::is_active()` stays
-`Queued | Running | AwaitingApproval` as shipped, and it is what `R-TUI-1`'s active-run count reads.
+drift, and it is what the recovery sweep re-runs on adoption. `RunStatus::is_active()` is the live
+set, `Queued | Running | AwaitingApproval | Stopped` since MOD-125; `R-TUI-1`'s active-run count reads
+`on_top_bar()`, the live set less `stopped` (amended by MOD-125 M1, 2026-10-18, plan D2).
 
 `R-ORCH-6`'s "escalates failures" is therefore `awaiting_approval`, not a new value: a run that
 escalated is parked for a human, which is precisely what `awaiting_approval` means everywhere else,
@@ -723,6 +740,26 @@ resolution of the "escalation has no run status" gap.
 | any non-terminal | run cancelled | - | `cancelled` | orchestrator |
 | `done`, `cancelled`, `superseded` | - | terminal | - | - |
 | `failed` | - | terminal, except for the promotion row above while its run is non-terminal | - | - |
+
+*Amended by MOD-125 M1, 2026-10-18 (plan D1, D6, D8, `.claude/plans/mod-125-m1-stopped-state.plan.md`):*
+`run_step.status` gains `stopped`, a step interrupted by a workspace stop. It is not terminal: it
+resumes to `running`, or a fresh rerun supersedes it. The rows below extend the table, including
+its list of who writes `superseded`.
+
+| from | event | guard | to | who |
+|---|---|---|---|---|
+| `running` | workspace stop applied | - | `stopped` | orchestrator (M2) |
+| `running` | lease expired, workspace stopped | recovery sweep | `stopped` | recovery sweep |
+| `stopped` | resume | session reopened | `running` | orchestrator (M3) |
+| `stopped` | resume cannot reopen the session | fresh rerun inserted | `superseded` | orchestrator (M3) |
+| `stopped` | run cancelled | - | `cancelled` | orchestrator |
+| `stopped` | run failed | - | `failed` | orchestrator |
+
+This narrows MOD-24's "no mid-step resume" and §4.9's rejected re-attach. Crash recovery is
+unchanged: a lapsed lease in a workspace that is not stopped is still adjudicated from durable
+artefacts, and a `running` step is never re-attached after a crash. A step halted by an explicit
+stop resumes in M3, by reopening its CLI session on the box that holds the session files (the run
+keeps `executing_box_id` for that) or by a fresh rerun.
 
 `superseded` carries exactly the two meanings its shipped doc comment gives it, "Replaced by a retry
 or by a fan-out winner", and this table is the complete list of who writes it.
@@ -1389,6 +1426,10 @@ the TUI opens in offline read-only mode from the cache ... No item creation, no 
 | **A run-level lease with an owner and an expiry, refreshed at half the TTL** | **Adopted** | It is the gap Microsoft Agent Framework is criticised for leaving open ("there is no automatic failure detection. The workflow runner has no heartbeat, no lease mechanism, no watchdog", https://www.diagrid.io/blog/still-not-durable-how-microsoft-agent-framework-and-strands-agents-repeat-the-same-mistake), and Oban's answer is the shape adopted: an `INSERT ... ON CONFLICT` with a TTL where "The leader refreshes at 2x the normal rate to hold the lease" (https://www.dimamik.com/posts/oban_py/). |
 | Cancel a live run when the store goes offline | Rejected | It cannot be recorded: `Backend::writable()` returns `None` offline, so the cancellation itself is unwritable. |
 | **Let the live session finish into the existing pending buffer; the lease expires; the reconnect sweep adjudicates** | **Adopted** | It reuses machinery MOD-6 already shipped and loses nothing. |
+
+*Amended by MOD-125 M1, 2026-10-18 (plan D6, D8):* the re-attach rejection above still holds for a
+crash. A step halted by an explicit workspace stop is `stopped`, not adjudicated, and resumes in M3
+(§4.3's amended step table). The sweep settles a lapsed run of a stopped workspace as `stopped`.
 
 **Verdict: what is durable, and what restarts.**
 

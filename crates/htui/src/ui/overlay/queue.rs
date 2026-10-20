@@ -717,6 +717,7 @@ mod tests {
     fn row(key: &str, title: &str) -> QueueRow {
         QueueRow {
             entry: QueueEntry {
+                workspace_id: None,
                 item_id: ItemId::new(),
                 project_id: ProjectId::default(),
                 box_id: ids::BOX,

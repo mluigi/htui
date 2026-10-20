@@ -100,6 +100,7 @@ async fn park_ana_2(store: &MemStore) -> (RunId, StepId, Uuid) {
     let at = Utc::now();
     let run = store
         .create_run(NewRun {
+            workspace_id: None,
             id: RunId::new(),
             project_id: ids::PROJECT_HTUI,
             item_id: ids::HTUI_ANA_2,

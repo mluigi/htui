@@ -547,7 +547,7 @@ impl Harness {
 
     async fn queue(&self, item: ItemId) {
         self.store
-            .queue_item(item, ids::BOX, ids::USER, Utc::now())
+            .queue_item(item, ids::BOX, None, ids::USER, Utc::now())
             .await
             .expect("the item queues");
     }
@@ -605,6 +605,7 @@ fn start_run(item: ItemId) -> RunRequest {
         item,
         mode: RunMode::Manual,
         repo_scope: None,
+        workspace: None,
     }))
 }
 
@@ -703,6 +704,45 @@ async fn a_resumed_box_admits_in_queue_order_up_to_the_cap() {
             .any(|(run, _)| *run == r0.id),
         "the woken admission is in the batch too"
     );
+}
+
+/// MOD-125 D3: the queue runner copies the entry's workspace onto the run it admits, so a
+/// workspace stop gates an auto run's claim as it gates a manual one; an unscoped entry's run
+/// carries none.
+#[tokio::test]
+async fn admit_records_the_entrys_workspace_on_the_run() {
+    let h = Harness::open().await;
+    let scoped = mint_ana(&h.store, "scoped", 1).await;
+    let unscoped = mint_ana(&h.store, "unscoped", 0).await;
+    h.store
+        .queue_item(
+            scoped,
+            ids::BOX,
+            Some(ids::WORKSPACE_PLATFORM),
+            ids::USER,
+            Utc::now(),
+        )
+        .await
+        .expect("the item queues");
+    h.queue(unscoped).await;
+    h.resume().await;
+    let mut runtime = h.runtime();
+    h.sweep(&mut runtime).await;
+
+    for (item, workspace) in [(scoped, Some(ids::WORKSPACE_PLATFORM)), (unscoped, None)] {
+        let admitted = h.only_run(item).await;
+        assert_eq!(admitted.mode, RunMode::Auto, "the queue runner admitted it");
+        let run = h
+            .store
+            .run(admitted.id)
+            .await
+            .expect("the read answers")
+            .expect("the run exists");
+        assert_eq!(
+            run.workspace_id, workspace,
+            "the run carries its queue entry's workspace"
+        );
+    }
 }
 
 /// (c) D5: an entry `ready_items` does not hold waits, and is admitted once it is ready. M3 D4
@@ -1900,7 +1940,7 @@ async fn two_runtimes_on_one_database_admit_each_item_once_pg() {
     );
     for item in [x, y] {
         db.store
-            .queue_item(item, ids::BOX, ids::USER, Utc::now())
+            .queue_item(item, ids::BOX, None, ids::USER, Utc::now())
             .await
             .expect("the item queues");
     }
@@ -1937,7 +1977,7 @@ async fn a_drained_batch_closes_drained_pg() {
     parts.open();
     let item = mint_ana(&db.store, "drains", 0).await;
     db.store
-        .queue_item(item, ids::BOX, ids::USER, Utc::now())
+        .queue_item(item, ids::BOX, None, ids::USER, Utc::now())
         .await
         .expect("the item queues");
     let batch = db
@@ -2020,7 +2060,7 @@ async fn manual_and_auto_overlap_serialise_on_postgres() {
 
     let auto = mint_ana(&db.store, "auto", 0).await;
     db.store
-        .queue_item(auto, ids::BOX, ids::USER, Utc::now())
+        .queue_item(auto, ids::BOX, None, ids::USER, Utc::now())
         .await
         .expect("the item queues");
     db.store
@@ -2123,7 +2163,7 @@ async fn a_batch_overshoots_its_cap_by_at_most_one_attempt_pg() {
     parts.open();
     let a1 = mint_ana(&db.store, "a1", 0).await;
     db.store
-        .queue_item(a1, ids::BOX, ids::USER, Utc::now())
+        .queue_item(a1, ids::BOX, None, ids::USER, Utc::now())
         .await
         .expect("the item queues");
     let batch = db
@@ -2225,7 +2265,7 @@ async fn a_batch_overshoots_its_cap_by_at_most_one_attempt_pg() {
 
     let a2 = mint_ana(&db.store, "a2", 1).await;
     db.store
-        .queue_item(a2, ids::BOX, ids::USER, Utc::now())
+        .queue_item(a2, ids::BOX, None, ids::USER, Utc::now())
         .await
         .expect("the item queues");
     runtime.sweep_with(&db.store, &TestSink::default());

@@ -286,7 +286,7 @@ mod tests {
     async fn queue(store: &MemStore, items: &[ItemId]) {
         for item in items {
             store
-                .queue_item(*item, ids::BOX, ids::USER, Utc::now())
+                .queue_item(*item, ids::BOX, None, ids::USER, Utc::now())
                 .await
                 .expect("the item queues");
         }
@@ -321,6 +321,7 @@ mod tests {
     ) -> RunId {
         store
             .create_run(NewRun {
+                workspace_id: None,
                 id: RunId::new(),
                 project_id: project,
                 item_id: item,

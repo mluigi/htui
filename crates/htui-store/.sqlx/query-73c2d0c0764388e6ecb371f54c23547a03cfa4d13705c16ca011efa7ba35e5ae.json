@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT workspace_id AS \"workspace_id: WorkspaceId\",\n                   mode         AS \"mode: StopMode\",\n                   requested_by AS \"requested_by: UserId\",\n                   requested_at\n              FROM workspace_stop WHERE workspace_id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "workspace_id: WorkspaceId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "workspace_stop",
+            "name": "workspace_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "mode: StopMode",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "workspace_stop",
+            "name": "mode"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "requested_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "workspace_stop",
+            "name": "requested_by"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "requested_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "workspace_stop",
+            "name": "requested_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "73c2d0c0764388e6ecb371f54c23547a03cfa4d13705c16ca011efa7ba35e5ae"
+}

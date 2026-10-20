@@ -256,6 +256,7 @@ impl Fixture {
                     item,
                     mode: RunMode::Manual,
                     repo_scope: Some(vec![self.core.id, self.docs.id]),
+                    workspace: None,
                 },
             )
             .await
@@ -2684,6 +2685,7 @@ async fn a_lost_merge_is_recognised_not_repeated() {
                     item: ids::HTUI_FEAT_3,
                     mode: RunMode::Manual,
                     repo_scope: Some(vec![fix.core.id, fix.docs.id]),
+                    workspace: None,
                 })
                 .await
         )

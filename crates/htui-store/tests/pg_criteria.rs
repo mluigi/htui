@@ -1081,6 +1081,7 @@ async fn count_running_on_box(pool: &PgPool, box_id: BoxId) -> i64 {
 /// never reads it back, so there is nothing to gain from the fixture's fuller one.
 fn race_run(item: ItemId) -> NewRun {
     NewRun {
+        workspace_id: None,
         id: RunId::new(),
         project_id: ids::PROJECT_HTUI,
         item_id: item,
@@ -7072,6 +7073,163 @@ async fn upsert_step_tree_takes_the_step_first() {
     db.drop_db().await;
 }
 
+/// MOD-125 D7 (blueprint F5): `stop_run` is the first writer that updates a run **and** its
+/// steps, so it takes MOD-77's step → run order: it waits on a held running step holding nothing
+/// on the run (a park holding the step then takes the run without `40P01`), then lands and stops
+/// both.
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_run_takes_the_steps_first() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (run, step, owner) = leased_running_step(&db).await;
+    let store = db.store.clone();
+    let answer =
+        assert_takes_the_step_first(
+            &db,
+            run,
+            step,
+            async move { store.stop_run(run, owner).await },
+        )
+        .await;
+    assert!(
+        answer.expect("the stop lands"),
+        "the owner's running run stops"
+    );
+    let (run_status, step_status): (String, String) = sqlx::query_as(
+        "SELECT r.status, s.status FROM run r JOIN run_step s ON s.run_id = r.id WHERE s.id = $1",
+    )
+    .bind(step.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("read the statuses");
+    assert_eq!(
+        (run_status.as_str(), step_status.as_str()),
+        ("stopped", "stopped"),
+        "the run and its running step are stopped together"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-125 D6 (blueprint F5 and T3.3, as amended by review round R1): under its run locks the
+/// sweep reads a stopped workspace's running steps plainly, then locks them `SKIP LOCKED`, so a run
+/// whose step another transaction holds is **deferred**: the sweep answers promptly, neither
+/// settling nor adopting it, and the next sweep after the holder commits settles it as `stopped`,
+/// its lease released. X's claim takes a zero TTL, so its lease lapses at once while X still owns
+/// it: the run is abandoned without a `release_lease`.
+#[tokio::test(flavor = "multi_thread")]
+async fn adopt_runs_defers_a_stopped_run_whose_step_is_held() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (x, y) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    let lease = TimeDelta::minutes(30);
+    let run = db
+        .store
+        .create_run(NewRun {
+            workspace_id: Some(ids::WORKSPACE_PLATFORM),
+            ..race_run(ids::HTUI_ANA_2)
+        })
+        .await
+        .expect("queue a scoped graph run")
+        .id;
+    assert_eq!(
+        db.store
+            .claim_run(run, ids::BOX, x, Utc::now(), TimeDelta::zero())
+            .await
+            .expect("claim the run"),
+        Claim::Admitted,
+        "X leases the run, for no time at all"
+    );
+    let step = db
+        .store
+        .create_step(htui_core::model::NewRunStep {
+            id: StepId::new(),
+            run_id: run,
+            position: 0,
+            attempt: 1,
+            fanout_index: 0,
+            phase_name: "implement".to_owned(),
+            agent_id: Some(ids::AGENT_CLAUDE),
+            model: None,
+        })
+        .await
+        .expect("create the step")
+        .id;
+    assert!(
+        db.store
+            .transition_step(
+                step,
+                htui_core::model::StepStatus::Pending,
+                htui_core::model::StepStatus::Running,
+                Utc::now(),
+            )
+            .await
+            .expect("start the step"),
+        "the step starts"
+    );
+    db.store
+        .stop_workspace(
+            ids::WORKSPACE_PLATFORM,
+            htui_core::model::StopMode::Graceful,
+            ids::USER,
+            Utc::now(),
+        )
+        .await
+        .expect("stop the workspace");
+
+    let mut holder = db.pool.begin().await.expect("begin the holder");
+    sqlx::query("SELECT 1 FROM run_step WHERE id = $1 FOR UPDATE")
+        .bind(step.as_uuid())
+        .fetch_one(&mut *holder)
+        .await
+        .expect("the holder locks the step");
+    let swept = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        db.store.adopt_runs(ids::BOX, y, lease),
+    )
+    .await
+    .expect("the sweep never waits on the held step")
+    .expect("the sweep answers");
+    assert!(swept.is_empty(), "the deferred run is not adopted");
+    let status: String = sqlx::query_scalar("SELECT status FROM run WHERE id = $1")
+        .bind(run.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read the run");
+    assert_eq!(status, "running", "nor settled while its step is held");
+    holder.commit().await.expect("the holder commits");
+
+    let swept = db
+        .store
+        .adopt_runs(ids::BOX, y, lease)
+        .await
+        .expect("the next sweep answers");
+    assert!(swept.is_empty(), "the settled run is not adopted either");
+    let (run_status, step_status): (String, String) = sqlx::query_as(
+        "SELECT r.status, s.status FROM run r JOIN run_step s ON s.run_id = r.id WHERE s.id = $1",
+    )
+    .bind(step.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("read the statuses");
+    assert_eq!(
+        (run_status.as_str(), step_status.as_str()),
+        ("stopped", "stopped"),
+        "the next sweep settles the run and its step"
+    );
+    let lease_owner: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT lease_owner FROM run WHERE id = $1")
+            .bind(run.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("read the lease owner");
+    assert_eq!(lease_owner, None, "and releases X's lapsed lease");
+
+    db.drop_db().await;
+}
+
 /// MOD-77 plan D1: `record_commits` waits on a held step holding nothing on its run, then lands.
 #[tokio::test(flavor = "multi_thread")]
 async fn record_commits_takes_the_step_first() {
@@ -7711,23 +7869,23 @@ async fn queue_surface_answers_alike_on_both_stores() {
         (ids::HTUI_FIX_1, later),
     ] {
         let on_pg = pg
-            .queue_item(item, ids::BOX, ids::USER, when)
+            .queue_item(item, ids::BOX, None, ids::USER, when)
             .await
             .expect("the Postgres queue_item lands");
         let on_mem = mem
-            .queue_item(item, ids::BOX, ids::USER, when)
+            .queue_item(item, ids::BOX, None, ids::USER, when)
             .await
             .expect("the MemStore queue_item lands");
         assert_eq!(on_pg, on_mem, "one entry, both stores");
         assert_eq!(on_pg.queued_at, when.trunc_subsecs(TIMESTAMPTZ_DIGITS));
     }
     let repeat = pg
-        .queue_item(ids::HTUI_ANA_2, BoxId::new(), ids::USER, later)
+        .queue_item(ids::HTUI_ANA_2, BoxId::new(), None, ids::USER, later)
         .await
         .expect("a repeat on Postgres answers the stored entry");
     assert_eq!(
         repeat,
-        mem.queue_item(ids::HTUI_ANA_2, BoxId::new(), ids::USER, later)
+        mem.queue_item(ids::HTUI_ANA_2, BoxId::new(), None, ids::USER, later)
             .await
             .expect("a repeat on MemStore answers the stored entry"),
     );
@@ -7749,20 +7907,22 @@ async fn queue_surface_answers_alike_on_both_stores() {
     );
 
     assert!(matches!(
-        pg.queue_item(ItemId::new(), ids::BOX, ids::USER, at).await,
+        pg.queue_item(ItemId::new(), ids::BOX, None, ids::USER, at)
+            .await,
         Err(htui_core::store::StoreError::NotFound { entity: "item", .. })
     ));
     assert!(matches!(
-        mem.queue_item(ItemId::new(), ids::BOX, ids::USER, at).await,
+        mem.queue_item(ItemId::new(), ids::BOX, None, ids::USER, at)
+            .await,
         Err(htui_core::store::StoreError::NotFound { entity: "item", .. })
     ));
     assert!(matches!(
-        pg.queue_item(ids::HTUI_CLEAN_1, BoxId::new(), ids::USER, at)
+        pg.queue_item(ids::HTUI_CLEAN_1, BoxId::new(), None, ids::USER, at)
             .await,
         Err(htui_core::store::StoreError::Constraint(_))
     ));
     assert!(matches!(
-        mem.queue_item(ids::HTUI_CLEAN_1, BoxId::new(), ids::USER, at)
+        mem.queue_item(ids::HTUI_CLEAN_1, BoxId::new(), None, ids::USER, at)
             .await,
         Err(htui_core::store::StoreError::Constraint(_))
     ));
@@ -8216,10 +8376,10 @@ async fn close_batch_cancels_its_queued_runs_and_the_drain_closes_only_its_batch
 
     let pg_batch = pg.open_batch(ids::BOX, ids::USER, at).await.expect("open");
     let mem_batch = mem.open_batch(ids::BOX, ids::USER, at).await.expect("open");
-    pg.queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+    pg.queue_item(ids::HTUI_ANA_2, ids::BOX, None, ids::USER, at)
         .await
         .expect("queue");
-    mem.queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+    mem.queue_item(ids::HTUI_ANA_2, ids::BOX, None, ids::USER, at)
         .await
         .expect("queue");
     let waiting = batch_run(ids::HTUI_ANA_2, Some(pg_batch.id));
@@ -8424,10 +8584,10 @@ async fn a_drain_skips_a_batch_with_an_entry_it_never_read_on_both_stores() {
 
     let pg_batch = pg.open_batch(ids::BOX, ids::USER, at).await.expect("open");
     let mem_batch = mem.open_batch(ids::BOX, ids::USER, at).await.expect("open");
-    pg.queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+    pg.queue_item(ids::HTUI_ANA_2, ids::BOX, None, ids::USER, at)
         .await
         .expect("queue");
-    mem.queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+    mem.queue_item(ids::HTUI_ANA_2, ids::BOX, None, ids::USER, at)
         .await
         .expect("queue");
     for (seen, why) in [
@@ -8493,10 +8653,10 @@ async fn a_drain_skips_a_batch_with_an_unread_entry_stamped_earlier_on_both_stor
     let mem_batch = mem.open_batch(ids::BOX, ids::USER, at).await.expect("open");
     // The runner reads ANA_2; FEAT_2 commits after its read, stamped by a clock behind.
     for (item, stamp) in [(ids::HTUI_ANA_2, at), (ids::HTUI_FEAT_2, earlier)] {
-        pg.queue_item(item, ids::BOX, ids::USER, stamp)
+        pg.queue_item(item, ids::BOX, None, ids::USER, stamp)
             .await
             .expect("queue");
-        mem.queue_item(item, ids::BOX, ids::USER, stamp)
+        mem.queue_item(item, ids::BOX, None, ids::USER, stamp)
             .await
             .expect("queue");
     }
@@ -8532,10 +8692,10 @@ async fn a_stalled_batch_closes_alike_on_both_stores() {
     let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
     let later = at + TimeDelta::seconds(1);
 
-    pg.queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+    pg.queue_item(ids::HTUI_ANA_2, ids::BOX, None, ids::USER, at)
         .await
         .expect("queue");
-    mem.queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+    mem.queue_item(ids::HTUI_ANA_2, ids::BOX, None, ids::USER, at)
         .await
         .expect("queue");
     let pg_batch = pg.open_batch(ids::BOX, ids::USER, at).await.expect("open");
@@ -8609,6 +8769,150 @@ async fn a_stalled_batch_closes_alike_on_both_stores() {
             .map(|open| open.id),
         Some(pg_next.id)
     );
+
+    db.drop_db().await;
+}
+
+/// MOD-125 D2 on both stores: a `stopped` run is live, so it keeps its scope and its batch, but it
+/// leaves the top bar. Each of Postgres' run-status lists below names `stopped` (or, for the top
+/// bar, leaves it out), and `MemStore`'s predicates agree: `active_runs` drops the run,
+/// `overlapping_runs` and `claim_run`'s overlap refusal still see it, and its auto batch is not
+/// drained until the run ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_run_is_live_everywhere_but_the_top_bar_on_both_stores() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let later = at + TimeDelta::seconds(1);
+    let owner = uuid::Uuid::now_v7();
+    let lease = TimeDelta::minutes(30);
+    let scope = htui_core::model::Scope {
+        workspace_id: ids::WORKSPACE_PLATFORM,
+        project_ids: vec![ids::PROJECT_HTUI, ids::PROJECT_AGY],
+    };
+    let repo = NewRepo {
+        id: RepoId::new(),
+        project_id: ids::PROJECT_HTUI,
+        name: "mod-125".to_owned(),
+        remote_url: None,
+        default_branch: "main".to_owned(),
+        is_primary: true,
+    };
+    pg.create_repo(repo.clone()).await.expect("pg repo");
+    mem.create_repo(repo.clone()).await.expect("mem repo");
+
+    let pg_batch = pg.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    let mem_batch = mem.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    let stopped = NewRun {
+        repo_scope: vec![repo.id],
+        ..batch_run(ids::HTUI_ANA_2, Some(pg_batch.id))
+    };
+    let run = stopped.id;
+    pg.create_run(stopped.clone()).await.expect("pg admits");
+    mem.create_run(NewRun {
+        batch_id: Some(mem_batch.id),
+        ..stopped
+    })
+    .await
+    .expect("mem admits");
+    assert_eq!(
+        pg.claim_run(run, ids::BOX, owner, at, lease)
+            .await
+            .expect("claim"),
+        Claim::Admitted
+    );
+    assert_eq!(
+        mem.claim_run(run, ids::BOX, owner, at, lease)
+            .await
+            .expect("claim"),
+        Claim::Admitted
+    );
+    assert_eq!(
+        (
+            pg.active_runs(&scope).await.expect("read"),
+            mem.active_runs(&scope).await.expect("read"),
+        ),
+        (2, 2),
+        "the fixture's queued RUN_2 and the running run are on the top bar"
+    );
+    for store_moved in [
+        pg.transition_run(run, RunStatus::Running, RunStatus::Stopped, at)
+            .await
+            .expect("stop"),
+        mem.transition_run(run, RunStatus::Running, RunStatus::Stopped, at)
+            .await
+            .expect("stop"),
+    ] {
+        assert!(store_moved, "running -> stopped (MOD-125 D1)");
+    }
+
+    assert_eq!(
+        (
+            pg.active_runs(&scope).await.expect("read"),
+            mem.active_runs(&scope).await.expect("read"),
+        ),
+        (1, 1),
+        "a stopped run leaves the top bar (D2 exclusion), on both stores"
+    );
+    let overlapping =
+        |runs: Vec<htui_core::model::Run>| runs.into_iter().map(|row| row.id).collect::<Vec<_>>();
+    assert_eq!(
+        (
+            overlapping(pg.overlapping_runs(&[repo.id]).await.expect("read")),
+            overlapping(mem.overlapping_runs(&[repo.id]).await.expect("read")),
+        ),
+        (vec![run], vec![run]),
+        "a stopped run still holds its scope"
+    );
+
+    let rival = NewRun {
+        repo_scope: vec![repo.id],
+        ..race_run(ids::HTUI_CLEAN_1)
+    };
+    pg.create_run(rival.clone()).await.expect("pg queues");
+    mem.create_run(rival.clone()).await.expect("mem queues");
+    let (pg_claim, mem_claim) = (
+        pg.claim_run(rival.id, ids::BOX, owner, at, lease)
+            .await
+            .expect("claim"),
+        mem.claim_run(rival.id, ids::BOX, owner, at, lease)
+            .await
+            .expect("claim"),
+    );
+    assert!(
+        matches!(&pg_claim, Claim::Overlaps { with, .. } if *with == run),
+        "a stopped run's scope refuses an overlapping claim, got {pg_claim:?}"
+    );
+    assert_eq!(pg_claim, mem_claim, "and MemStore refuses it alike");
+
+    assert_eq!(
+        (
+            pg.close_drained_batch(pg_batch.id, &[], later)
+                .await
+                .expect("close"),
+            mem.close_drained_batch(mem_batch.id, &[], later)
+                .await
+                .expect("close"),
+        ),
+        (None, None),
+        "a stopped run of its own keeps the batch open"
+    );
+    pg.fail_run(run, "abandoned", later).await.expect("fail");
+    mem.fail_run(run, "abandoned", later).await.expect("fail");
+    let (pg_closed, mem_closed) = (
+        pg.close_drained_batch(pg_batch.id, &[], later)
+            .await
+            .expect("close")
+            .expect("the run ended, so the batch drains"),
+        mem.close_drained_batch(mem_batch.id, &[], later)
+            .await
+            .expect("close")
+            .expect("the run ended, so the batch drains"),
+    );
+    assert_eq!(batch_shape(&pg_closed), batch_shape(&mem_closed));
 
     db.drop_db().await;
 }
@@ -9843,10 +10147,10 @@ async fn queue_entries_follow_one_order_on_both_stores() {
         .enumerate()
     {
         let when = at + TimeDelta::seconds(i64::try_from(seconds).expect("small"));
-        pg.queue_item(item, ids::BOX, ids::USER, when)
+        pg.queue_item(item, ids::BOX, None, ids::USER, when)
             .await
             .expect("queue on Postgres");
-        mem.queue_item(item, ids::BOX, ids::USER, when)
+        mem.queue_item(item, ids::BOX, None, ids::USER, when)
             .await
             .expect("queue on MemStore");
     }
@@ -9951,6 +10255,7 @@ fn queue_facts_mem(facts: &QueueFacts) -> htui_core::store::MemStore {
     }
     let chat_at = facts.at + TimeDelta::seconds(2);
     data.runs.push(htui_core::model::Run {
+        workspace_id: None,
         id: facts.chat,
         project_id: ids::PROJECT_HTUI,
         item_id: Some(ids::HTUI_ANA_2),
@@ -10127,10 +10432,10 @@ async fn queue_rows_answer_alike_on_both_stores() {
         ids::HTUI_FEAT_3,
         ids::HTUI_CLEAN_1,
     ] {
-        pg.queue_item(item, ids::BOX, ids::USER, facts.at)
+        pg.queue_item(item, ids::BOX, None, ids::USER, facts.at)
             .await
             .expect("queue on Postgres");
-        mem.queue_item(item, ids::BOX, ids::USER, facts.at)
+        mem.queue_item(item, ids::BOX, None, ids::USER, facts.at)
             .await
             .expect("queue on MemStore");
     }
@@ -10209,10 +10514,10 @@ async fn move_queue_entry_answers_alike_on_both_stores() {
     // Priority 0 each: created_at decides, ANA-2, FEAT-2, CLEAN-1.
     let (a, b, c) = (ids::HTUI_ANA_2, ids::HTUI_FEAT_2, ids::HTUI_CLEAN_1);
     for item in [c, b, a] {
-        pg.queue_item(item, ids::BOX, ids::USER, at)
+        pg.queue_item(item, ids::BOX, None, ids::USER, at)
             .await
             .expect("queue on Postgres");
-        mem.queue_item(item, ids::BOX, ids::USER, at)
+        mem.queue_item(item, ids::BOX, None, ids::USER, at)
             .await
             .expect("queue on MemStore");
     }
@@ -10248,10 +10553,10 @@ async fn move_queue_entry_answers_alike_on_both_stores() {
     let d = ItemId::new();
     queue_feat(pg, d, 9).await;
     queue_feat(&mem, d, 9).await;
-    pg.queue_item(d, ids::BOX, ids::USER, at)
+    pg.queue_item(d, ids::BOX, None, ids::USER, at)
         .await
         .expect("queue on Postgres");
-    mem.queue_item(d, ids::BOX, ids::USER, at)
+    mem.queue_item(d, ids::BOX, None, ids::USER, at)
         .await
         .expect("queue on MemStore");
     assert_eq!(
@@ -10284,7 +10589,7 @@ async fn queued_against_id_order(db: &common::TestDb) -> [ItemId; 3] {
     for &item in items.iter().rev() {
         queue_feat(&db.store, item, 0).await;
         db.store
-            .queue_item(item, ids::BOX, ids::USER, at)
+            .queue_item(item, ids::BOX, None, ids::USER, at)
             .await
             .expect("the item queues");
     }
@@ -10420,7 +10725,7 @@ async fn concurrent_moves_and_prunes_never_deadlock() {
             .expect("reopen the finished items");
         for &item in items.iter().rev() {
             db.store
-                .queue_item(item, ids::BOX, ids::USER, Utc::now())
+                .queue_item(item, ids::BOX, None, ids::USER, Utc::now())
                 .await
                 .expect("the item queues");
         }
@@ -10627,6 +10932,80 @@ async fn last_closed_batch_answers_alike_on_both_stores() {
         pg.last_closed_batch(BoxId::new()).await.expect("read"),
         None,
         "another box has none"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-125 D3: `queue_item` records the workspace the item was queued from on Postgres, as on
+/// `MemStore` (`mem.rs::queue_item_records_its_workspace`): stored and returned, read back by
+/// `queue_entries` and `queue_rows`; a repeat with another workspace answers the stored entry
+/// unchanged; an unknown workspace is `fk_queue_entry_workspace`'s refusal and stores nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_item_records_its_workspace() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let at = Utc::now();
+
+    let refused = pg
+        .queue_item(
+            ids::HTUI_CLEAN_1,
+            ids::BOX,
+            Some(WorkspaceId::new()),
+            ids::USER,
+            at,
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(htui_core::store::StoreError::Constraint(_))),
+        "an unknown workspace is refused: {refused:?}"
+    );
+    assert!(
+        pg.queue_entries(ids::BOX)
+            .await
+            .expect("the read answers")
+            .iter()
+            .all(|entry| entry.item_id != ids::HTUI_CLEAN_1),
+        "the refusal stored nothing"
+    );
+
+    let entry = pg
+        .queue_item(
+            ids::HTUI_ANA_2,
+            ids::BOX,
+            Some(ids::WORKSPACE_PLATFORM),
+            ids::USER,
+            at,
+        )
+        .await
+        .expect("an open item queues");
+    assert_eq!(entry.workspace_id, Some(ids::WORKSPACE_PLATFORM));
+    let stored = pg.queue_entries(ids::BOX).await.expect("the read answers");
+    assert!(stored.contains(&entry), "{stored:?}");
+    let rows = pg.queue_rows(ids::BOX).await.expect("the read answers");
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.entry.item_id == ids::HTUI_ANA_2)
+            .map(|row| row.entry.workspace_id),
+        Some(Some(ids::WORKSPACE_PLATFORM)),
+        "queue_rows carries the workspace too"
+    );
+
+    let again = pg
+        .queue_item(
+            ids::HTUI_ANA_2,
+            ids::BOX,
+            None,
+            ids::USER,
+            at + TimeDelta::minutes(1),
+        )
+        .await
+        .expect("a repeat is answered");
+    assert_eq!(
+        again, entry,
+        "a repeat answers the stored entry, its workspace included"
     );
 
     db.drop_db().await;

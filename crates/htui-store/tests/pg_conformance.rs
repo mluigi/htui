@@ -30,16 +30,23 @@ use htui_store::testkit as common;
 /// cases (plan D2, D4) make it 148, MOD-70 T0's nine follow-up cases (plan D1-D5, D9) make it 157
 /// and MOD-78's `lease_holds` case (plan D1, D2) makes it 158.
 /// and MOD-10 M4's secret-column case (plan D7) makes it 159,
-/// and MOD-12 M2's five queue-setting cases (plan D9) make it 164.
-const EXPECTED_CASES: usize = 164;
+/// and MOD-12 M2's five queue-setting cases (plan D9) make it 164,
+/// and MOD-125 M1's `create_run_records_its_workspace` (plan D3) makes it 165,
+/// and MOD-125 M1's four stop-verb cases (plan D4, D7) make it 169,
+/// and MOD-125 M1's four claim-gate cases (plan D5) make it 173,
+/// and MOD-125 M1's settlement case (plan D6) makes it 174,
+/// and MOD-125 M1's deleted-workspace case (blueprint F16) makes it 175.
+const EXPECTED_CASES: usize = 175;
 
 #[test]
 fn case_list_matches_mem_store() {
     assert_eq!(
         htui_core::store::conformance::CASES.len(),
         EXPECTED_CASES,
-        "every conformance case must run against PgStore too (164 since MOD-78's `lease_holds` \
-         case, MOD-10 M4's secret-column case and MOD-12 M2's five queue-setting cases)"
+        "every conformance case must run against PgStore too (175 since MOD-78's `lease_holds` \
+         case, MOD-10 M4's secret-column case, MOD-12 M2's five queue-setting cases and \
+         MOD-125 M1's run-workspace and four stop-verb and four claim-gate cases and its \
+         settlement and deleted-workspace cases)"
     );
 }
 

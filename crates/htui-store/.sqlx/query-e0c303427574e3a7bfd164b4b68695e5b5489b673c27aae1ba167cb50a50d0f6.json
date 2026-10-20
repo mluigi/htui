@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, project_id, item_id, kind, mode, status, target_box_id, executing_box_id, graph_snapshot, started_by, queued_at, started_at, finished_at, failure, repo_scope, lease_box_id, lease_expires_at, updated_at FROM run WHERE project_id = $1 AND updated_at > $2 ORDER BY updated_at",
+  "query": "\n                WITH swept AS (\n                    UPDATE run r\n                       SET lease_owner      = $2,\n                           lease_box_id     = $1,\n                           lease_expires_at = clock_timestamp() + $3::bigint * interval '1 microsecond'\n                     WHERE r.id = ANY($4::uuid[])\n                 RETURNING r.*\n                )\n                SELECT id               AS \"id: RunId\",\n                       project_id       AS \"project_id: ProjectId\",\n                       item_id          AS \"item_id: ItemId\",\n                       workspace_id     AS \"workspace_id: WorkspaceId\",\n                       kind             AS \"kind: RunKind\",\n                       mode             AS \"mode: RunMode\",\n                       status           AS \"status: RunStatus\",\n                       target_box_id    AS \"target_box_id: BoxId\",\n                       executing_box_id AS \"executing_box_id: BoxId\",\n                       graph_snapshot,\n                       started_by       AS \"started_by: UserId\",\n                       queued_at,\n                       started_at,\n                       finished_at,\n                       failure,\n                       repo_scope       AS \"repo_scope: Vec<RepoId>\",\n                       lease_box_id     AS \"lease_box_id: BoxId\",\n                       lease_expires_at,\n                       updated_at\n                  FROM swept\n                 ORDER BY queued_at, id\n                ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id",
+        "name": "id: RunId",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -16,7 +16,7 @@
       },
       {
         "ordinal": 1,
-        "name": "project_id",
+        "name": "project_id: ProjectId",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -27,7 +27,7 @@
       },
       {
         "ordinal": 2,
-        "name": "item_id",
+        "name": "item_id: ItemId",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -38,7 +38,18 @@
       },
       {
         "ordinal": 3,
-        "name": "kind",
+        "name": "workspace_id: WorkspaceId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "workspace_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "kind: RunKind",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -48,8 +59,8 @@
         }
       },
       {
-        "ordinal": 4,
-        "name": "mode",
+        "ordinal": 5,
+        "name": "mode: RunMode",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -59,8 +70,8 @@
         }
       },
       {
-        "ordinal": 5,
-        "name": "status",
+        "ordinal": 6,
+        "name": "status: RunStatus",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -70,8 +81,8 @@
         }
       },
       {
-        "ordinal": 6,
-        "name": "target_box_id",
+        "ordinal": 7,
+        "name": "target_box_id: BoxId",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -81,8 +92,8 @@
         }
       },
       {
-        "ordinal": 7,
-        "name": "executing_box_id",
+        "ordinal": 8,
+        "name": "executing_box_id: BoxId",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -92,7 +103,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "graph_snapshot",
         "type_info": "Jsonb",
         "origin": {
@@ -103,8 +114,8 @@
         }
       },
       {
-        "ordinal": 9,
-        "name": "started_by",
+        "ordinal": 10,
+        "name": "started_by: UserId",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -114,7 +125,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "queued_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -125,7 +136,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 12,
         "name": "started_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -136,7 +147,7 @@
         }
       },
       {
-        "ordinal": 12,
+        "ordinal": 13,
         "name": "finished_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -147,7 +158,7 @@
         }
       },
       {
-        "ordinal": 13,
+        "ordinal": 14,
         "name": "failure",
         "type_info": "Text",
         "origin": {
@@ -158,8 +169,8 @@
         }
       },
       {
-        "ordinal": 14,
-        "name": "repo_scope",
+        "ordinal": 15,
+        "name": "repo_scope: Vec<RepoId>",
         "type_info": "UuidArray",
         "origin": {
           "Table": {
@@ -169,8 +180,8 @@
         }
       },
       {
-        "ordinal": 15,
-        "name": "lease_box_id",
+        "ordinal": 16,
+        "name": "lease_box_id: BoxId",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -180,7 +191,7 @@
         }
       },
       {
-        "ordinal": 16,
+        "ordinal": 17,
         "name": "lease_expires_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -191,7 +202,7 @@
         }
       },
       {
-        "ordinal": 17,
+        "ordinal": 18,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -205,12 +216,15 @@
     "parameters": {
       "Left": [
         "Uuid",
-        "Timestamptz"
+        "Uuid",
+        "Int8",
+        "UuidArray"
       ]
     },
     "nullable": [
       false,
       false,
+      true,
       true,
       false,
       false,
@@ -229,5 +243,5 @@
       false
     ]
   },
-  "hash": "6d5c132b71c3678c0494bd8c184b14748d94a074f1cfc064e55010a6f2716315"
+  "hash": "e0c303427574e3a7bfd164b4b68695e5b5489b673c27aae1ba167cb50a50d0f6"
 }

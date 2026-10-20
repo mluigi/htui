@@ -1163,6 +1163,27 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
     async fn release_lease(&self, run: RunId, owner: Uuid) -> StoreResult<bool> {
         self.inner.release_lease(run, owner).await
     }
+    async fn stop_workspace(
+        &self,
+        workspace: WorkspaceId,
+        mode: htui_core::model::StopMode,
+        by: UserId,
+        at: DateTime<Utc>,
+    ) -> StoreResult<htui_core::model::WorkspaceStop> {
+        self.inner.stop_workspace(workspace, mode, by, at).await
+    }
+    async fn workspace_stop(
+        &self,
+        workspace: WorkspaceId,
+    ) -> StoreResult<Option<htui_core::model::WorkspaceStop>> {
+        self.inner.workspace_stop(workspace).await
+    }
+    async fn resume_workspace(&self, workspace: WorkspaceId) -> StoreResult<bool> {
+        self.inner.resume_workspace(workspace).await
+    }
+    async fn stop_run(&self, run: RunId, owner: Uuid) -> StoreResult<bool> {
+        self.inner.stop_run(run, owner).await
+    }
     async fn create_step(&self, new: NewRunStep) -> StoreResult<RunStep> {
         self.inner.create_step(new).await
     }

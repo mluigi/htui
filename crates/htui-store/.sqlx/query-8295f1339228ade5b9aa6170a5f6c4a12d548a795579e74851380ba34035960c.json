@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run SET status = 'stopped', lease_owner = NULL, lease_expires_at = clock_timestamp() WHERE id = ANY($1::uuid[]) AND status = 'running'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8295f1339228ade5b9aa6170a5f6c4a12d548a795579e74851380ba34035960c"
+}

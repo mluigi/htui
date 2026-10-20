@@ -1085,6 +1085,14 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   session load) and the CLI adapter, and what the worker does for runs it owns (MOD-41). **Amended by
   ANA-33 (2026-10-18, `docs/ANA-33.md` §9):** the test matrix includes a divided step (planner, parts, integrate)
   and a subgraph node, the bug classes Argo and LangGraph hit. Not blocked; its TUI half lands with MOD-116.
+  **Phase 1 landed (hr/MOD-125, 2026-10-20):** resumable `stopped` run and step status (live, holds
+  no slot, off the top-bar count), `run.workspace_id` and `queue_entry.workspace_id` (migration 0019,
+  one-workspace backfill), the `workspace_stop` record, a `WorkspaceStopped` claim gate, the sweep
+  settling a stopped workspace's abandoned runs as `stopped`, and a fenced `stop_run` verb; nothing
+  issues a stop yet. Graceful = cancel the turn and keep the session (PRD gate). Next, per
+  `.claude/prds/mod-125-stop-and-resume-runs.prd.md`: M2 the executor applies stops (plus the R1
+  deferrals: refuse deleting a workspace with stopped runs, readable FK refusal, minimum version),
+  M3 resume through saved sessions, M4 the `htui stop`/`htui resume` verbs.
 
 - [ ] **MOD-126 - Light model setting and run-start workflow pick** (from ANA-40, `docs/ANA-40.md` §5.4, §8 P1).
   `R-ORCH-1`, `R-ID-6`, `R-TUI-17`, `R-PRM-1`. One `app_setting` key `{agent_id, model}` (ANA-30 option B), a new

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run_step SET status = 'stopped' WHERE id = ANY($1::uuid[]) AND status = 'running'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "246108d63cd1bec11d9edd4f054c1ab9c9ff2f5e9cda0d1007a81d8852557dbc"
+}

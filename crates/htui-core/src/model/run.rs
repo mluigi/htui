@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::model::ids::{
     AgentId, BatchId, BoxId, CommandRunId, ItemId, ProjectId, RepoId, RunId, StepGraphId, StepId,
-    UserId,
+    UserId, WorkspaceId,
 };
 use crate::model::kind::{CommandQueue, Gate, Isolation};
 
@@ -39,6 +39,10 @@ str_enum!(
         Running => "running",
         /// Stopped at a gate.
         AwaitingApproval => "awaiting_approval",
+        /// Halted by a workspace stop (MOD-125 D1, `R-ORCH-16`): live and resumable. Holds no
+        /// slot, still refuses an overlapping scope (it keeps its trees and branch), has no
+        /// `finished_at`, and its item stays `in_progress`.
+        Stopped => "stopped",
         /// Finished successfully.
         Done => "done",
         /// Finished unsuccessfully.
@@ -49,13 +53,25 @@ str_enum!(
 );
 
 impl RunStatus {
-    /// Whether the run counts towards the top bar's active-run indicator.
+    /// Whether the run is **live** (MOD-125 D2): `queued | running | awaiting_approval |
+    /// stopped`. Every live run may still move; the complement is [`RunStatus::is_terminal`]. Not
+    /// the top bar's count, which is [`RunStatus::on_top_bar`].
     #[must_use]
     pub const fn is_active(self) -> bool {
-        matches!(self, Self::Queued | Self::Running | Self::AwaitingApproval)
+        matches!(
+            self,
+            Self::Queued | Self::Running | Self::AwaitingApproval | Self::Stopped
+        )
     }
 
-    /// ANA-2 §4.3's `run` table (`docs/ANA-2.md:600-616`): whether `self -> to` is a sanctioned
+    /// R-TUI-1's active-run count (MOD-125 D2): the live runs less `stopped`, so the top bar keeps
+    /// counting "running and waiting". `active_runs` in every store filters by it.
+    #[must_use]
+    pub const fn on_top_bar(self) -> bool {
+        self.is_active() && !matches!(self, Self::Stopped)
+    }
+
+    /// ANA-2 §4.3's `run` table (`docs/ANA-2.md:653-687`): whether `self -> to` is a sanctioned
     /// move. Every terminal status answers `false` for every `to`.
     #[must_use]
     pub const fn can_move_to(self, to: Self) -> bool {
@@ -63,9 +79,14 @@ impl RunStatus {
             Self::Queued => matches!(to, Self::Running | Self::Cancelled | Self::Failed),
             Self::Running => matches!(
                 to,
-                Self::AwaitingApproval | Self::Done | Self::Failed | Self::Cancelled
+                Self::AwaitingApproval
+                    | Self::Done
+                    | Self::Failed
+                    | Self::Cancelled
+                    | Self::Stopped
             ),
             Self::AwaitingApproval => matches!(to, Self::Running | Self::Failed | Self::Cancelled),
+            Self::Stopped => matches!(to, Self::Running | Self::Cancelled | Self::Failed),
             Self::Done | Self::Failed | Self::Cancelled => false,
         }
     }
@@ -87,6 +108,9 @@ str_enum!(
         Running => "running",
         /// Stopped at a gate.
         AwaitingApproval => "awaiting_approval",
+        /// Interrupted by a workspace stop (MOD-125 D1); resumes to `running` (M3), or is
+        /// superseded by a fresh rerun (M3's fallback), or is cancelled or failed with its run.
+        Stopped => "stopped",
         /// Finished successfully.
         Done => "done",
         /// Finished unsuccessfully.
@@ -99,7 +123,7 @@ str_enum!(
 );
 
 impl StepStatus {
-    /// ANA-2 §4.3's `run_step` table (`docs/ANA-2.md:630-654`). `failed` is **not** terminal for
+    /// ANA-2 §4.3's `run_step` table (`docs/ANA-2.md:700-740`). `failed` is **not** terminal for
     /// a step: it can be promoted to `awaiting_approval` (§4.8) while its run is live, and, like
     /// every non-terminal status, can be cancelled with its run. The "while the run is
     /// non-terminal" condition on promotion belongs to
@@ -114,7 +138,15 @@ impl StepStatus {
             Self::Pending => matches!(to, Self::Running | Self::Superseded | Self::Cancelled),
             Self::Running => matches!(
                 to,
-                Self::AwaitingApproval | Self::Done | Self::Failed | Self::Cancelled
+                Self::AwaitingApproval
+                    | Self::Done
+                    | Self::Failed
+                    | Self::Cancelled
+                    | Self::Stopped
+            ),
+            Self::Stopped => matches!(
+                to,
+                Self::Running | Self::Cancelled | Self::Failed | Self::Superseded
             ),
             Self::AwaitingApproval => matches!(
                 to,
@@ -186,6 +218,11 @@ pub struct Run {
     pub project_id: ProjectId,
     /// `run.item_id`; `None` for a free-standing chat.
     pub item_id: Option<ItemId>,
+    /// `run.workspace_id` (MOD-125 D3): the workspace a graph run was started from; `None` for a
+    /// chat run, a run started without a scope, or one whose project was in no or several
+    /// workspaces at 0019.
+    #[serde(default)]
+    pub workspace_id: Option<WorkspaceId>,
     /// `run.kind`.
     pub kind: RunKind,
     /// `run.mode`.
@@ -403,6 +440,9 @@ pub struct NewRun {
     /// `batch_runs`.
     #[serde(default)]
     pub batch_id: Option<BatchId>,
+    /// `run.workspace_id` (MOD-125 D3); `None` is never gated by a workspace stop.
+    #[serde(default)]
+    pub workspace_id: Option<WorkspaceId>,
 }
 
 /// Arguments of [`crate::store::WriteStore::create_step`]: a `run_step` inserted at `pending`
@@ -932,7 +972,7 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    /// Every row of ANA-2 §4.3's `run` transition table (`docs/ANA-2.md:600-616`), transcribed
+    /// Every row of ANA-2 §4.3's `run` transition table (`docs/ANA-2.md:653-687`), transcribed
     /// from the document rather than from [`RunStatus::can_move_to`].
     const RUN_SANCTIONED: &[(RunStatus, RunStatus)] = &[
         // `queued`
@@ -948,10 +988,15 @@ mod tests {
         (RunStatus::AwaitingApproval, RunStatus::Running),
         (RunStatus::AwaitingApproval, RunStatus::Failed),
         (RunStatus::AwaitingApproval, RunStatus::Cancelled),
+        // MOD-125 M1's amendment rows (D1)
+        (RunStatus::Running, RunStatus::Stopped),
+        (RunStatus::Stopped, RunStatus::Running),
+        (RunStatus::Stopped, RunStatus::Cancelled),
+        (RunStatus::Stopped, RunStatus::Failed),
         // `done`, `failed`, `cancelled` are terminal.
     ];
 
-    /// Every row of ANA-2 §4.3's `run_step` transition table (`docs/ANA-2.md:630-654`),
+    /// Every row of ANA-2 §4.3's `run_step` transition table (`docs/ANA-2.md:700-740`),
     /// transcribed from the document rather than from [`StepStatus::can_move_to`]. The
     /// `awaiting_approval -> awaiting_approval` self-move is §4.8's promotion row, and
     /// `failed -> awaiting_approval` is the same row from the escalation side.
@@ -972,12 +1017,18 @@ mod tests {
         (StepStatus::AwaitingApproval, StepStatus::AwaitingApproval),
         (StepStatus::AwaitingApproval, StepStatus::Cancelled),
         // `failed` — terminal except for the promotion row, and cancellable with its run
-        // (derived from row 652 + row 654's exception: ANA-2 §4.3's step table sanctions
+        // (derived from row 724 + row 726's exception: ANA-2 §4.3's step table sanctions
         // `failed -> awaiting_approval` only through §4.8's promotion, blueprint C-4).
         (StepStatus::Failed, StepStatus::AwaitingApproval),
         (StepStatus::Failed, StepStatus::Cancelled),
         // `done`
         (StepStatus::Done, StepStatus::Superseded),
+        // MOD-125 M1's amendment rows (D1)
+        (StepStatus::Running, StepStatus::Stopped),
+        (StepStatus::Stopped, StepStatus::Running),
+        (StepStatus::Stopped, StepStatus::Cancelled),
+        (StepStatus::Stopped, StepStatus::Failed),
+        (StepStatus::Stopped, StepStatus::Superseded),
         // `cancelled` and `superseded` are terminal.
     ];
 
@@ -1025,6 +1076,30 @@ mod tests {
                 "run.status `{from}`: is_terminal is the complement of is_active"
             );
         }
+    }
+
+    /// MOD-125 D2: `stopped` is live (it may still move) but off the top bar's count, which keeps
+    /// counting "running and waiting". The slot half is pinned by the store conformance case
+    /// `a_stopped_run_holds_no_slot_but_still_overlaps`.
+    #[test]
+    fn a_stopped_run_is_live_and_holds_no_slot() {
+        assert!(RunStatus::Stopped.is_active(), "a stopped run is live");
+        assert!(
+            !RunStatus::Stopped.is_terminal(),
+            "a stopped run is not terminal"
+        );
+        assert!(
+            !RunStatus::Stopped.on_top_bar(),
+            "a stopped run is off the top bar's count"
+        );
+        assert!(
+            RunStatus::Running.on_top_bar(),
+            "a running run is on the top bar's count"
+        );
+        assert!(
+            !StepStatus::Stopped.is_terminal(),
+            "a stopped step is not terminal"
+        );
     }
 
     /// `failed` is the one step status the two notions disagree about: it is not terminal,

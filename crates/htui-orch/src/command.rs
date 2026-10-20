@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use htui_agent::driver::AgentSessionRef;
 use htui_core::model::{
     AgentId, Claim, DocumentId, GraphSnapshot, Item, ItemId, RepoId, Resolution, Run, RunId,
-    RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId, StepStatus,
+    RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId, StepStatus, WorkspaceId,
 };
 use htui_core::prompt::AssembleError;
 use htui_core::store::StoreError;
@@ -62,6 +62,9 @@ pub enum Command {
         /// `None` resolves to the project's primary repo, or to nothing when it has none; an
         /// explicit empty scope on an item with a primary repo is refused (plan D14).
         repo_scope: Option<Vec<RepoId>>,
+        /// MOD-125 D3: the workspace the run is started from, recorded as `run.workspace_id`;
+        /// `None` (a test, an unscoped caller) is never gated by a workspace stop.
+        workspace: Option<WorkspaceId>,
     },
     /// §6.2's `approve` and `reject with note`: a human answers a parked gate.
     AnswerGate {
@@ -401,8 +404,9 @@ pub enum EngineError {
         item: ItemId,
     },
     /// Plan D83: why `claim_run` refused — the box is at `max_concurrent_items`, or the run's
-    /// scope overlaps a live one under ANA-2 §4.7's rules L, I or P. The run stays `queued`, and
-    /// `Engine::claim` re-attempts it (plan D84).
+    /// scope overlaps a live one under ANA-2 §4.7's rules L, I or P, or the run's workspace is
+    /// stopped (MOD-125 D5). The run stays `queued`, and `Engine::claim` re-attempts it (plan
+    /// D84).
     #[error("claim refused: {claim}")]
     ClaimRefused {
         /// The run that stayed queued.
@@ -961,10 +965,11 @@ fn unselected(
 
 /// §6.2's "Enabled when" for `cancel run` (plan D45): the run has not finished.
 ///
-/// `queued`, `running` and `awaiting_approval` are exactly the three `RunStatus::can_move_to`
-/// admits `cancelled` from (`crates/htui-core/src/model/run.rs`), and exactly
-/// [`RunStatus::is_active`]'s three — so the guard is stated against the table rather than against
-/// a list, and a status added to §4.3 cannot be silently left out of it.
+/// The three live statuses but `stopped`: `queued`, `running` and `awaiting_approval`.
+/// `RunStatus::can_move_to` admits `cancelled` from all four of [`RunStatus::is_active`]'s
+/// statuses (`crates/htui-core/src/model/run.rs`), so the guard is stated against the table
+/// rather than against a list, less `stopped` (MOD-125 D2: the law allows it; wired in M3, which
+/// applies a stopped run's cancel).
 ///
 /// A `queued` run has no steps and was never claimed; cancelling it is still legal and still ends
 /// with a cleanup, because the run may have been claimed and crashed between the two reads.
@@ -978,9 +983,9 @@ fn unselected(
 /// step of the run (plan D212).
 ///
 /// # Errors
-/// [`EngineError::RunStatus`] for a `done`, `failed` or `cancelled` run.
+/// [`EngineError::RunStatus`] for a `stopped`, `done`, `failed` or `cancelled` run.
 pub fn cancel_enabled(run: &Run) -> Result<(), EngineError> {
-    if run.status.is_active() {
+    if run.status.is_active() && run.status != RunStatus::Stopped {
         return Ok(());
     }
     Err(EngineError::RunStatus {
@@ -1266,7 +1271,8 @@ pub fn close_out_enabled(item: &Item, runs: &[Run]) -> Result<Resolution, Engine
 /// MOD-4 plan D177 (R-25): a manual cleanup retry is for a run that has finished.
 ///
 /// # Errors
-/// [`EngineError::NotTerminal`] for a `queued`, `running` or `awaiting_approval` run.
+/// [`EngineError::NotTerminal`] for a `queued`, `running`, `awaiting_approval` or `stopped` run
+/// (a stopped run keeps its trees, MOD-125 D2).
 pub fn cleanup_enabled(run: &Run) -> Result<(), EngineError> {
     if run.status.is_terminal() {
         return Ok(());
@@ -1644,8 +1650,8 @@ mod tests {
         );
     }
 
-    /// Plan D45 against §4.3's own table: the three statuses `cancelled` is reachable from are
-    /// the three the guard admits, and no other.
+    /// Plan D45 against §4.3's own table: the statuses `cancelled` is reachable from are the
+    /// ones the guard admits, less `stopped`, and no other.
     #[test]
     fn cancel_is_enabled_exactly_where_the_run_table_allows_it() {
         let mut run = demo_data()
@@ -1669,6 +1675,25 @@ mod tests {
                 "`{status}` is cancellable"
             );
         }
+
+        // MOD-125 D2: the law allows it; wired in M3.
+        run.status = RunStatus::Stopped;
+        assert!(
+            RunStatus::Stopped.can_move_to(RunStatus::Cancelled),
+            "`stopped` reaches `cancelled` in §4.3's amended table"
+        );
+        let refused = super::cancel_enabled(&run).expect_err("M1 shows no cancel of a stopped run");
+        assert!(
+            matches!(
+                &refused,
+                EngineError::RunStatus {
+                    status: RunStatus::Stopped,
+                    expected: "queued | running | awaiting_approval",
+                    ..
+                }
+            ),
+            "{refused}"
+        );
 
         for status in [RunStatus::Done, RunStatus::Failed, RunStatus::Cancelled] {
             run.status = status;
@@ -1722,6 +1747,20 @@ mod tests {
             }
             .to_string(),
             format!("claim refused: overlaps run {} (paths)", ids::RUN_1)
+        );
+        assert_eq!(
+            EngineError::ClaimRefused {
+                run: ids::RUN_2,
+                claim: Claim::WorkspaceStopped {
+                    workspace: ids::WORKSPACE_PLATFORM,
+                },
+            }
+            .to_string(),
+            format!(
+                "claim refused: workspace {} is stopped",
+                ids::WORKSPACE_PLATFORM
+            ),
+            "MOD-125 D5"
         );
         assert_eq!(
             EngineError::MissingTags {
@@ -2316,6 +2355,8 @@ mod tests {
             RunStatus::Queued,
             RunStatus::Running,
             RunStatus::AwaitingApproval,
+            // MOD-125 D2: a stopped run keeps its trees.
+            RunStatus::Stopped,
         ] {
             run.status = status;
             assert!(

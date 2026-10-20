@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id     AS \"id: RunId\",\n                   status AS \"status: RunStatus\"\n              FROM run\n             WHERE item_id = $1 AND status IN ('queued','running','awaiting_approval')\n             ORDER BY queued_at, id\n             LIMIT 1\n            ",
+  "query": "\n            SELECT id     AS \"id: RunId\",\n                   status AS \"status: RunStatus\"\n              FROM run\n             WHERE item_id = $1 AND status IN ('queued','running','awaiting_approval','stopped')\n             ORDER BY queued_at, id\n             LIMIT 1\n            ",
   "describe": {
     "columns": [
       {
@@ -36,5 +36,5 @@
       false
     ]
   },
-  "hash": "87463126eb7854d989eecb70e0460f40aca8673e3752ddae729b75de3b602860"
+  "hash": "c67322b6a8d9620c46074d6ea0de09137d0341202d2dff4009fbd28057c0468f"
 }

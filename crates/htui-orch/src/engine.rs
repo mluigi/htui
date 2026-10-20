@@ -40,7 +40,7 @@ use htui_core::model::{
     RepoId, Resolution, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary,
     SessionEvent, SnapshotCandidate, SnapshotPersona, SnapshotPhase, SnapshotTemplate, Status,
     StepFiles, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UserId,
-    VerifyOutcome, min_budget_micros, missing_tags_failure,
+    VerifyOutcome, WorkspaceId, min_budget_micros, missing_tags_failure,
 };
 use htui_core::prompt::excerpt::{
     BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoPath, RepoRoot, RootSource,
@@ -631,7 +631,8 @@ where
                 item,
                 mode,
                 repo_scope,
-            } => Box::pin(self.start_run(item, mode, repo_scope)).await,
+                workspace,
+            } => Box::pin(self.start_run(item, mode, repo_scope, workspace)).await,
             Command::AnswerGate { run, step, answer } => {
                 Box::pin(self.answer_gate(run, step, answer)).await
             }
@@ -668,6 +669,9 @@ where
     /// `pub` so milestone 6's `run_worker` can take the run's lock between this and
     /// [`Self::claim`]: `StartRun` is exactly the two, in that order.
     ///
+    /// `workspace` is recorded as `run.workspace_id` (MOD-125 D3): the workspace the run is
+    /// started from, which a workspace stop gates at the claim.
+    ///
     /// # Errors
     /// [`EngineError::Resolve`] (rung 4, after its note on the item),
     /// [`EngineError::MissingTags`] (`R-ORCH-10`, after its note on the item, before resolution),
@@ -677,8 +681,9 @@ where
         item: ItemId,
         mode: htui_core::model::RunMode,
         repo_scope: Option<Vec<RepoId>>,
+        workspace: Option<WorkspaceId>,
     ) -> Result<RunId, EngineError> {
-        Box::pin(self.enqueue_with(item, mode, repo_scope, None)).await
+        Box::pin(self.enqueue_with(item, mode, repo_scope, None, workspace)).await
     }
 
     /// MOD-12 D6, D7: [`Self::enqueue`] for the queue runner — an `auto` run over the item's
@@ -690,8 +695,16 @@ where
         &self,
         item: ItemId,
         batch: BatchId,
+        workspace: Option<WorkspaceId>,
     ) -> Result<RunId, EngineError> {
-        Box::pin(self.enqueue_with(item, htui_core::model::RunMode::Auto, None, Some(batch))).await
+        Box::pin(self.enqueue_with(
+            item,
+            htui_core::model::RunMode::Auto,
+            None,
+            Some(batch),
+            workspace,
+        ))
+        .await
     }
 
     /// The body `enqueue` had, with `batch_id` threaded into `NewRun` (MOD-12 D7).
@@ -701,6 +714,7 @@ where
         mode: htui_core::model::RunMode,
         repo_scope: Option<Vec<RepoId>>,
         batch: Option<BatchId>,
+        workspace: Option<WorkspaceId>,
     ) -> Result<RunId, EngineError> {
         let item = self.item(item).await?;
         // R-ORCH-10 at queue time (MOD-7 milestone 3, D79): before resolution, so an item that
@@ -743,6 +757,7 @@ where
         self.parts
             .store
             .create_run(NewRun {
+                workspace_id: workspace,
                 id,
                 project_id: item.project_id,
                 item_id: item.id,
@@ -764,8 +779,9 @@ where
         item: ItemId,
         mode: htui_core::model::RunMode,
         repo_scope: Option<Vec<RepoId>>,
+        workspace: Option<WorkspaceId>,
     ) -> Result<CommandOutcome, EngineError> {
-        let id = self.enqueue(item, mode, repo_scope).await?;
+        let id = self.enqueue(item, mode, repo_scope, workspace).await?;
         self.claim(id).await
     }
 
@@ -779,7 +795,8 @@ where
     ///
     /// # Errors
     /// [`EngineError::ClaimRefused`] naming the rule when the box is full or the scope overlaps,
-    /// the run then left `queued` with nothing written; [`EngineError::MissingTags`] when the
+    /// or the run's workspace is stopped (MOD-125 D5), the run then left `queued` with nothing
+    /// written; [`EngineError::MissingTags`] when the
     /// run's item needs tags this box lacks, after `claim_run` failed the run and blocked its item
     /// in its transaction and this engine wrote the note afterwards in a separate call, outside
     /// that transaction (`R-ORCH-10`, MOD-7 milestone 3 D85, as rung 4 does). If the walk is
@@ -794,8 +811,9 @@ where
         let ttl = self.lease_times().ttl;
         // Anything but `Admitted` is a refusal. `MissingTags` is `R-ORCH-10`'s: `claim_run`
         // already failed the run and blocked its item, and the engine adds the note (D78). The
-        // three verdicts named in the last arm are ANA-2 §4.7's admission, not claimable, box full
-        // or overlap (plan D83), which wrote nothing and left the run as it was.
+        // four verdicts named in the last arm are ANA-2 §4.7's admission, not claimable, box full
+        // or overlap (plan D83), and MOD-125 D5's stopped workspace, which wrote nothing and left
+        // the run as it was.
         let claim = self
             .parts
             .store
@@ -817,7 +835,10 @@ where
             }
             // Named, not a catch-all: a new `Claim` verdict is a compile error here until it is
             // sorted into a refusal or not (blueprint R-43).
-            claim @ (Claim::NotClaimable | Claim::SlotFull { .. } | Claim::Overlaps { .. }) => {
+            claim @ (Claim::NotClaimable
+            | Claim::WorkspaceStopped { .. }
+            | Claim::SlotFull { .. }
+            | Claim::Overlaps { .. }) => {
                 return Err(EngineError::ClaimRefused { run, claim });
             }
         }
@@ -3010,7 +3031,10 @@ where
                         expected: "running",
                     });
                 }
+                // MOD-125 D2: a `stopped` run is at rest like a parked one; `resting` writes
+                // nothing and answers `Rest { run: Stopped, .. }`, which no caller cleans up.
                 RunStatus::AwaitingApproval
+                | RunStatus::Stopped
                 | RunStatus::Done
                 | RunStatus::Failed
                 | RunStatus::Cancelled => {
@@ -4676,6 +4700,7 @@ where
                         .await;
                 }
                 StepStatus::Running
+                | StepStatus::Stopped
                 | StepStatus::Done
                 | StepStatus::Superseded
                 | StepStatus::Cancelled => {}
@@ -7639,12 +7664,13 @@ pub async fn enqueue_in_batch_fake(
     orch: &crate::fake::FakeOrchestrator,
     item: ItemId,
     batch: BatchId,
+    workspace: Option<WorkspaceId>,
 ) -> Result<RunId, EngineError> {
     let graphs = orch.graphs();
     let driver = |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
     let scrubber = RunSecrets::new(orch.secret_source());
     let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
-    engine.enqueue_in_batch(item, batch).await
+    engine.enqueue_in_batch(item, batch, workspace).await
 }
 
 /// [`Engine::resume`] over the same parts (ANA-2 §12 criterion 3).
@@ -8113,6 +8139,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -8206,6 +8233,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -8259,6 +8287,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -8377,6 +8406,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -8653,6 +8683,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -8740,6 +8771,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -8940,6 +8972,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the demo graph resolves and the box has a slot")
@@ -9033,6 +9066,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -9096,6 +9130,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -9137,6 +9172,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -9198,6 +9234,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -9241,6 +9278,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -9284,6 +9322,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -9469,6 +9508,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -9563,6 +9603,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -9624,6 +9665,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -9662,6 +9704,7 @@ mod tests {
             .orch
             .store
             .create_run(htui_core::model::NewRun {
+                workspace_id: None,
                 id: run,
                 project_id: ids::PROJECT_HTUI,
                 item_id: ids::HTUI_ANA_2,
@@ -9882,6 +9925,7 @@ mod tests {
             item: ids::HTUI_FEAT_3,
             mode: RunMode::Manual,
             repo_scope: None,
+            workspace: None,
         });
         match futures::future::select(Box::pin(walk), Box::pin(stalled.notified())).await {
             futures::future::Either::Left((outcome, _)) => {
@@ -10165,6 +10209,7 @@ mod tests {
             item: ids::HTUI_FEAT_3,
             mode: RunMode::Manual,
             repo_scope: None,
+            workspace: None,
         }));
         if let futures::future::Either::Left(_) =
             futures::future::select(walk.as_mut(), Box::pin(stalled.notified())).await
@@ -11017,6 +11062,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect_err("the gate's compare-and-set found the step moved");
@@ -11120,6 +11166,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk rests");
@@ -11144,6 +11191,7 @@ mod tests {
                 item: ids::HTUI_ANA_2,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("no repo, so nothing overlaps")
@@ -11251,6 +11299,7 @@ mod tests {
                 item: ids::HTUI_ANA_2,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("no repo, so nothing overlaps")
@@ -12011,6 +12060,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -12096,6 +12146,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk runs to the end")
@@ -12138,6 +12189,7 @@ mod tests {
                 item: ids::HTUI_ANA_2,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect_err("both items hold the whole primary repo");
@@ -12419,6 +12471,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -12687,6 +12740,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -12745,6 +12799,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -12856,6 +12911,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -12935,6 +12991,7 @@ mod tests {
             .orch
             .store
             .create_run(htui_core::model::NewRun {
+                workspace_id: None,
                 id: run,
                 project_id: item.project_id,
                 item_id: item.id,
@@ -13040,6 +13097,7 @@ mod tests {
             .orch
             .store
             .create_run(htui_core::model::NewRun {
+                workspace_id: None,
                 id: run,
                 project_id: item.project_id,
                 item_id: item.id,
@@ -13198,6 +13256,7 @@ mod tests {
                     item: ids::HTUI_FEAT_3,
                     mode,
                     repo_scope: None,
+                    workspace: None,
                 })
                 .await
                 .expect("the walk starts")
@@ -13316,6 +13375,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -13383,6 +13443,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -13457,6 +13518,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("a `reconcile` failure is never re-raised")
@@ -13503,6 +13565,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect_err("a driver that cannot start is re-raised after the settle");
@@ -13555,6 +13618,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect_err("the spy refuses to start");
@@ -13746,6 +13810,7 @@ mod tests {
             item: ids::HTUI_FEAT_3,
             mode: RunMode::Manual,
             repo_scope: None,
+            workspace: None,
         }))
         .await
         .expect("a candidate the spy refuses fails on its own; the group settles");
@@ -13870,6 +13935,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: Some(vec![docs, primary]),
+                workspace: None,
             })
             .await
             .expect("an explicit scope of the project's repos")
@@ -14258,6 +14324,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -14507,7 +14574,7 @@ mod tests {
         harness_engine!(harness.orch, engine);
 
         let run = engine
-            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None)
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
             .await
             .expect("the graph resolves");
         assert_eq!(harness.orch.run(run).await.status, RunStatus::Queued);
@@ -14519,7 +14586,7 @@ mod tests {
         assert!(harness.orch.steps(run).await.is_empty(), "nothing walked");
 
         let refused = engine
-            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None)
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
             .await
             .expect_err("`create_run`'s compare-and-set admits one run per item");
         assert!(matches!(refused, EngineError::Store(_)), "{refused}");
@@ -14593,7 +14660,7 @@ mod tests {
         harness_engine!(harness.orch, engine);
 
         let refused = engine
-            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None)
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
             .await
             .expect_err("the demo box has not got `vulkan`");
         assert!(
@@ -14689,7 +14756,7 @@ mod tests {
         harness_engine!(harness.orch, engine);
 
         let refused = engine
-            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None)
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
             .await
             .expect_err("the demo box has not got `vulkan`");
         assert!(
@@ -14758,7 +14825,7 @@ mod tests {
         harness_engine!(harness.orch, engine);
 
         let refused = engine
-            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None)
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
             .await
             .expect_err("a queued item admits no second run");
         assert!(
@@ -14797,7 +14864,7 @@ mod tests {
         harness_engine!(harness.orch, engine);
 
         let run = engine
-            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None)
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
             .await
             .expect("the box has both tags at enqueue");
         let notes_before = harness
@@ -15051,6 +15118,7 @@ mod tests {
             item: ids::HTUI_FEAT_3,
             mode: RunMode::Manual,
             repo_scope: None,
+            workspace: None,
         });
         match futures::future::select(Box::pin(walk), Box::pin(stalled.notified())).await {
             futures::future::Either::Left((outcome, _)) => {
@@ -15233,6 +15301,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -15503,6 +15572,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: Some(vec![repo]),
+                workspace: None,
             })
             .await
             .expect("an explicit scope of the project's repo")
@@ -16007,6 +16077,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the walk starts")
@@ -17241,6 +17312,7 @@ mod tests {
                 item: ids::HTUI_ANA_2,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             }
         }
 
@@ -17265,6 +17337,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             }
         }
 
@@ -18767,7 +18840,7 @@ mod tests {
                     .expect("the harness has a box"),
             );
             let run = engine
-                .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None)
+                .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
                 .await
                 .expect("the graph resolves");
 
@@ -19496,6 +19569,7 @@ mod tests {
                     item,
                     mode: RunMode::Manual,
                     repo_scope: None,
+                    workspace: None,
                 })
                 .await
         }
@@ -20224,6 +20298,7 @@ mod tests {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             }
         }
 
@@ -21444,7 +21519,7 @@ mod tests {
                 harness.orch.isolator.script_env_files(files.clone());
                 harness_engine!(harness.orch, engine);
                 let run = engine
-                    .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None)
+                    .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
                     .await
                     .expect("the graph resolves");
                 let now = harness.orch.clock.now();
@@ -21733,7 +21808,7 @@ mod tests {
 mod queued_cancel {
     use chrono::TimeDelta;
     use htui_core::fixtures::ids;
-    use htui_core::model::{RunMode, RunStatus, SnapshotCandidate, Status};
+    use htui_core::model::{Claim, RunMode, RunStatus, SnapshotCandidate, Status, StopMode};
     use htui_core::store::{ReadStore as _, WriteStore as _};
 
     use super::SessionKey;
@@ -21749,6 +21824,105 @@ mod queued_cancel {
             .await
             .expect("the seeded run is queued and cancellable");
         orch
+    }
+
+    /// MOD-125 D3: `StartRun` records the workspace it was started from as `run.workspace_id`;
+    /// an unscoped start records none.
+    #[tokio::test]
+    async fn start_run_records_the_workspace_it_was_started_from() {
+        for workspace in [Some(ids::WORKSPACE_PLATFORM), None] {
+            let orch = harness().await;
+            let CommandOutcome::Started { run, .. } = orch
+                .dispatch(Command::StartRun {
+                    item: ids::HTUI_FEAT_3,
+                    mode: RunMode::Manual,
+                    repo_scope: None,
+                    workspace,
+                })
+                .await
+                .expect("the item is open and the box admits the run")
+            else {
+                panic!("`StartRun` answers `Started`");
+            };
+            assert_eq!(
+                orch.run(run).await.workspace_id,
+                workspace,
+                "the run carries the workspace `StartRun` named"
+            );
+        }
+    }
+
+    /// MOD-125 D5: a run started from a stopped workspace is created `queued`, and its claim is
+    /// refused `WorkspaceStopped`: no lease, the item `queued`, no note, no step. After the resume
+    /// the same run's claim starts it.
+    #[tokio::test]
+    async fn a_claim_refused_for_a_stopped_workspace_leaves_the_run_queued_and_writes_nothing() {
+        let orch = harness().await;
+        orch.store
+            .stop_workspace(
+                ids::WORKSPACE_PLATFORM,
+                StopMode::Graceful,
+                ids::USER,
+                orch.clock.now(),
+            )
+            .await
+            .expect("the workspace exists");
+        let notes = orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .len();
+        let refused = orch
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+                workspace: Some(ids::WORKSPACE_PLATFORM),
+            })
+            .await;
+        let Err(EngineError::ClaimRefused {
+            run,
+            claim: Claim::WorkspaceStopped { workspace },
+        }) = refused
+        else {
+            panic!("a stopped workspace refuses the claim, not {refused:?}");
+        };
+        assert_eq!(workspace, ids::WORKSPACE_PLATFORM);
+        let row = orch.run(run).await;
+        assert_eq!(row.status, RunStatus::Queued);
+        assert_eq!(row.lease_expires_at, None, "never claimed: no lease");
+        let item = orch
+            .store
+            .item(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the item exists");
+        assert_eq!(item.status, Status::Queued);
+        assert_eq!(
+            orch.store
+                .notes(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .len(),
+            notes,
+            "no note"
+        );
+        assert!(orch.steps(run).await.is_empty(), "no step was created");
+        assert!(
+            orch.store
+                .resume_workspace(ids::WORKSPACE_PLATFORM)
+                .await
+                .expect("the write answers")
+        );
+        let outcome = orch
+            .claim(run)
+            .await
+            .expect("the resumed workspace admits the run");
+        assert!(
+            matches!(outcome, CommandOutcome::Started { run: started, .. } if started == run),
+            "{outcome:?}"
+        );
     }
 
     /// F-21: a claim lands between the cancel's read and its compare-and-set. `cancel_queued`
@@ -21768,7 +21942,7 @@ mod queued_cancel {
                 .expect("the harness has a box"),
         );
         let run = engine
-            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None)
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
             .await
             .expect("the item is open");
         let stale = orch
@@ -21865,7 +22039,7 @@ mod queued_cancel {
                 .expect("the harness has a box"),
         );
         let run = engine
-            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None)
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
             .await
             .expect("the item is open");
 
@@ -21900,6 +22074,7 @@ mod queued_cancel {
                 item: ids::HTUI_FEAT_3,
                 mode: RunMode::Manual,
                 repo_scope: None,
+                workspace: None,
             })
             .await
             .expect("the item is free for a second run");

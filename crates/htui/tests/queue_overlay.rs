@@ -37,7 +37,7 @@ async fn queued(items: &[ItemId]) -> MemStore {
     let store = MemStore::demo();
     for item in items {
         store
-            .queue_item(*item, ids::BOX, ids::USER, Utc::now())
+            .queue_item(*item, ids::BOX, None, ids::USER, Utc::now())
             .await
             .expect("the item queues");
     }
@@ -240,7 +240,7 @@ async fn the_overlay_re_reads_on_the_refresh_tick() {
 
     // Queued behind the overlay's back: nothing re-reads until the tick.
     store
-        .queue_item(ids::HTUI_TOOL_1, ids::BOX, ids::USER, Utc::now())
+        .queue_item(ids::HTUI_TOOL_1, ids::BOX, None, ids::USER, Utc::now())
         .await
         .expect("the item queues");
     harness.drive_to_end().await;
