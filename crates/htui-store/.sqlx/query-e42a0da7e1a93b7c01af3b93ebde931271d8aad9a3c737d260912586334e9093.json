@@ -1,0 +1,136 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT entry_id  AS \"entry_id: MemoryEntryId\",\n                   version,\n                   kind      AS \"kind: MemoryKind\",\n                   subject,\n                   body,\n                   state     AS \"state: MemoryState\",\n                   author_id AS \"author_id: UserId\",\n                   box_id    AS \"box_id: BoxId\",\n                   reason,\n                   created_at\n              FROM memory_entry_revision\n             WHERE entry_id = $1\n             ORDER BY version\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "entry_id: MemoryEntryId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "memory_entry_revision",
+            "name": "entry_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "memory_entry_revision",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "kind: MemoryKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_entry_revision",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "subject",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_entry_revision",
+            "name": "subject"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "body",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_entry_revision",
+            "name": "body"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "state: MemoryState",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_entry_revision",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "author_id: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "memory_entry_revision",
+            "name": "author_id"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "box_id: BoxId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "memory_entry_revision",
+            "name": "box_id"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_entry_revision",
+            "name": "reason"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "memory_entry_revision",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "e42a0da7e1a93b7c01af3b93ebde931271d8aad9a3c737d260912586334e9093"
+}

@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT id AS \"id: MemoryEntryId\", subject\n                  FROM memory_entry\n                 WHERE project_id = $1 AND state IN ('active','suspect')\n                   AND lower(btrim(subject)) = lower(btrim($2::text)) AND id <> $3\n                 ORDER BY id LIMIT 1\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: MemoryEntryId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "subject",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "subject"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "5fb3cbb33444bb8505521f4aad901a76a1f6e3423e522a1943afcce89ce81f76"
+}

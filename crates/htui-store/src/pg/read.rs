@@ -19,16 +19,16 @@ use htui_core::model::{
     BoxInfo, BoxProfile, BoxRow, BoxTool, CitationKind, CommandQueue, CoverageRow, Document,
     DocumentHead, DocumentId, Gate, GateOutcome, Isolation, Item, ItemCitation, ItemFilter, ItemId,
     ItemKind, ItemKindId, ItemSummary, LinkEdge, LinkGraph, LinkKind, MemoryEntry, MemoryEntryId,
-    MemoryRevision, MemoryState, Note, Persona, PersonaId, PersonaPermission, PersonaTools,
-    PhaseAgent, PhaseId, Priority, Project, ProjectId, ProjectRef, PromptScope, PromptTemplate,
-    QueueBatch, QueueEntry, QueueRow, QueueRunFact, Repo, RepoBoxPath, RepoId, Requirement,
-    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementRevision,
-    RequirementSpec, RequirementState, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase,
-    Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree,
-    RunSummary, Scope, SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId,
-    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPhase, StepId, StepStatus,
-    ToolCallCount, UpstreamEntry, UserId, VerifyOutcome, WaitingCandidate, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspaceProject, WorkspaceSummary,
+    MemoryKind, MemoryRevision, MemoryState, Note, Persona, PersonaId, PersonaPermission,
+    PersonaTools, PhaseAgent, PhaseId, Priority, Project, ProjectId, ProjectRef, PromptScope,
+    PromptTemplate, QueueBatch, QueueEntry, QueueRow, QueueRunFact, Repo, RepoBoxPath, RepoId,
+    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
+    RequirementRevision, RequirementSpec, RequirementState, Resolution, ResolvedGraph,
+    ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
+    RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillBinding,
+    SkillBindingId, SkillBindingKey, SkillId, SkillVersion, Status, StepGraph, StepGraphId,
+    StepGraphPhase, StepId, StepStatus, ToolCallCount, UpstreamEntry, UserId, VerifyOutcome,
+    WaitingCandidate, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspaceProject, WorkspaceSummary,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{ReadStore, Result, SettingRung, StoreError, StoredSetting};
@@ -1029,18 +1029,74 @@ impl ReadStore for PgStore {
         .map_err(map_sqlx)
     }
 
-    /// MOD-163 M1 T1 stub; T3 reads `memory_entry` (plan D6).
+    /// MOD-163 plan D6: one project's entries, newest update first (`updated_at DESC, id`), the
+    /// state filter bound as text (`None` every state; `Some(vec![])` none, as `= ANY('{}')`).
+    /// Always `Some`: Postgres holds every entry (only the cache answers `None`, plan D7).
     async fn memory_entries(
         &self,
-        _project: ProjectId,
-        _states: Option<Vec<MemoryState>>,
+        project: ProjectId,
+        states: Option<Vec<MemoryState>>,
     ) -> Result<Option<Vec<MemoryEntry>>> {
-        Err(StoreError::Backend("MOD-163 M1: not yet".into()))
+        let states = states.map(|list| {
+            list.iter()
+                .map(|s| s.as_str().to_owned())
+                .collect::<Vec<_>>()
+        });
+        sqlx::query_as!(
+            MemoryEntry,
+            r#"
+            SELECT id            AS "id: MemoryEntryId",
+                   project_id    AS "project_id: ProjectId",
+                   kind          AS "kind: MemoryKind",
+                   subject,
+                   body,
+                   state         AS "state: MemoryState",
+                   version,
+                   confirmed_at,
+                   superseded_by AS "superseded_by: MemoryEntryId",
+                   created_by    AS "created_by: UserId",
+                   created_at,
+                   updated_at
+              FROM memory_entry
+             WHERE project_id = $1
+               AND ($2::text[] IS NULL OR state = ANY($2))
+             ORDER BY updated_at DESC, id
+            "#,
+            project.as_uuid(),
+            states.as_deref(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map(Some)
+        .map_err(map_sqlx)
     }
 
-    /// MOD-163 M1 T1 stub; T3 reads `memory_entry_revision` (plan D6).
-    async fn memory_revisions(&self, _id: MemoryEntryId) -> Result<Option<Vec<MemoryRevision>>> {
-        Err(StoreError::Backend("MOD-163 M1: not yet".into()))
+    /// MOD-163 plan D6: one entry's history in `version` order. Always `Some`: an unknown id is
+    /// an empty history, as for [`requirement_revisions`](ReadStore::requirement_revisions).
+    async fn memory_revisions(&self, id: MemoryEntryId) -> Result<Option<Vec<MemoryRevision>>> {
+        sqlx::query_as!(
+            MemoryRevision,
+            r#"
+            SELECT entry_id  AS "entry_id: MemoryEntryId",
+                   version,
+                   kind      AS "kind: MemoryKind",
+                   subject,
+                   body,
+                   state     AS "state: MemoryState",
+                   author_id AS "author_id: UserId",
+                   box_id    AS "box_id: BoxId",
+                   reason,
+                   created_at
+              FROM memory_entry_revision
+             WHERE entry_id = $1
+             ORDER BY version
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map(Some)
+        .map_err(map_sqlx)
     }
 
     /// The item's live citations, each joined to the requirement as it is now, in

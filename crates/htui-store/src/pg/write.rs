@@ -28,23 +28,24 @@ use htui_core::model::{
     CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId, CommandRunStatus,
     DEFAULT_MAX_CONCURRENT_ITEMS, Document, Executor, FollowUpRequest, FollowUpSettle, GateOutcome,
     Isolation, Item, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement,
-    ItemRevision, MemoryEntry, MemoryEntryId, MemoryPatch, MemorySupersede, MemoryUpdate,
-    NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewMemoryEntry, NewNote,
-    NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun,
-    NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission,
-    PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch,
-    PersonaPermission, PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority, Project, ProjectId,
-    ProjectPatch, PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry, QueueMove,
-    QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch,
-    Requirement, RequirementArea, RequirementAreaId, RequirementId, RequirementPatch,
-    RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run,
-    RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding,
-    SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
-    StepStatus, StopMode, UserId, VerifyOutcome, WaitingPermission, Workspace, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop, canonical_declared_tags,
-    missing_tags_failure, moved_order, overlaps, scope_of,
+    ItemRevision, MemoryEntry, MemoryEntryId, MemoryKind, MemoryPatch, MemoryRevision, MemoryState,
+    MemorySupersede, MemoryText, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem,
+    NewItemKind, NewMemoryEntry, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo,
+    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
+    NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice, PermissionId,
+    PermissionStatus, Persona, PersonaId, PersonaPatch, PersonaPermission, PersonaTools,
+    PhaseAgent, PhaseId, PhasePatch, Priority, Project, ProjectId, ProjectPatch, PromptTemplate,
+    PromptTemplateId, QueueBatch, QueueEntry, QueueMove, QueueSetting, QueuedFollowUp,
+    RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
+    RequirementAreaId, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
+    RequirementState, RequirementUpdate, Resolution, Run, RunCommand, RunCommandId,
+    RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree,
+    Scope, SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingId, SkillBindingKey,
+    SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch,
+    StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, UserId,
+    VerifyOutcome, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    WorkspaceProject, WorkspaceStop, canonical_declared_tags, missing_tags_failure, moved_order,
+    overlaps, scope_of,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
@@ -53,9 +54,9 @@ use htui_core::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
     COMMAND_STALE_AFTER, EXECUTOR_MUST_BE_KNOWN, batch_is_closed, command_finish_status,
     command_not_claimable, command_not_queued, document_needs_a_step, link_key,
-    link_not_proposed_by_run, link_outside_project, note_needs_a_step,
-    project_settings_not_an_object, reaped_note, self_link, step_document_refusal,
-    step_note_refusal, step_writes_own_item,
+    link_not_proposed_by_run, link_outside_project, memory_entry_closed, memory_subject_taken,
+    note_needs_a_step, project_settings_not_an_object, reaped_note, self_link,
+    step_document_refusal, step_note_refusal, step_writes_own_item,
 };
 use htui_core::store::{
     BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ParkOutcome, QueueStored, QueueTarget,
@@ -495,7 +496,7 @@ async fn workspace_reach(conn: &mut PgConnection, id: WorkspaceId) -> Result<Opt
 /// What a project delete reaches, in one statement of scalar subqueries over `0001_init.sql`'s
 /// `ON DELETE CASCADE` chain (PRD D13, plan V11). `None` when no row has that id.
 ///
-/// The nine CTEs are the id sets the cascade walks, named as
+/// The ten CTEs are the id sets the cascade walks, named as
 /// [`MemStore`](htui_core::store::MemStore)'s `ProjectReach` names them, so the two backends count
 /// the same rows: `run` is reached by `project_id` **or** by an `item_id` of the project
 /// (`0001_init.sql:450` cascades from the item), and `item_link` by **either** end, tombstones
@@ -507,6 +508,9 @@ async fn workspace_reach(conn: &mut PgConnection, id: WorkspaceId) -> Result<Opt
 /// MOD-38's `ra` and `rq` are the project's requirement areas and requirements
 /// (`0006_requirements.sql`, blueprint §4.4). `item_requirement` is reached by **either** end, as
 /// `item_link` is: a citation from another project's item goes with the requirement it cites.
+///
+/// `me` is the project's memory entries (MOD-163 D8); `memory_entry_revision` is reached through
+/// it, as `requirement_revision` is through `rq`.
 ///
 /// `workspace_box_paths` is `0`: a project is not a workspace.
 async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<DeleteReach>> {
@@ -522,7 +526,8 @@ async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<
              t  AS (SELECT run_step_id FROM run_step_tree
                      WHERE run_step_id IN (SELECT id FROM s)),
              ra AS (SELECT id FROM requirement_area WHERE project_id = $1),
-             rq AS (SELECT id FROM requirement      WHERE project_id = $1)
+             rq AS (SELECT id FROM requirement      WHERE project_id = $1),
+             me AS (SELECT id FROM memory_entry     WHERE project_id = $1)
         SELECT (SELECT count(*) FROM workspace_project WHERE project_id = $1) AS "workspace_links!",
                (SELECT count(*) FROM i)                                       AS "items!",
                (SELECT count(*) FROM item_key_counter WHERE project_id = $1)  AS "item_key_counters!",
@@ -563,7 +568,10 @@ async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<
                  WHERE requirement_id IN (SELECT id FROM rq))                 AS "requirement_revisions!",
                (SELECT count(*) FROM item_requirement
                  WHERE item_id IN (SELECT id FROM i)
-                    OR requirement_id IN (SELECT id FROM rq))                 AS "item_requirements!"
+                    OR requirement_id IN (SELECT id FROM rq))                 AS "item_requirements!",
+               (SELECT count(*) FROM me)                                      AS "memory_entries!",
+               (SELECT count(*) FROM memory_entry_revision
+                 WHERE entry_id IN (SELECT id FROM me))                       AS "memory_revisions!"
           FROM project WHERE id = $1
         "#,
         id.as_uuid(),
@@ -601,10 +609,265 @@ async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<
         requirements: rows(row.requirements),
         requirement_revisions: rows(row.requirement_revisions),
         item_requirements: rows(row.item_requirements),
-        // MOD-163 M1 T1: T3 adds the two subselects (plan D8).
-        memory_entries: 0,
-        memory_revisions: 0,
+        memory_entries: rows(row.memory_entries),
+        memory_revisions: rows(row.memory_revisions),
     }))
+}
+
+// ------------------------------------------------------------------------------------------------
+// MOD-163 helpers (plan D4, D6; blueprint T3.4).
+// ------------------------------------------------------------------------------------------------
+
+/// What an amend, a retire or a supersede's first half writes (plan D6); `None` leaves a column.
+struct MemoryEdit {
+    kind: Option<MemoryKind>,
+    subject: Option<String>,
+    body: Option<String>,
+    state: Option<MemoryState>,
+    superseded_by: Option<MemoryEntryId>,
+    /// `confirmed_at = now()`: an amend only (plan D3).
+    restamp: bool,
+    author_id: UserId,
+    box_id: Option<BoxId>,
+    reason: &'static str,
+}
+
+/// The seam's first three decisions for an amend, a retire or a supersede, on the caller's
+/// transaction: the row is locked `FOR UPDATE`, so nothing moves between them and the write.
+///
+/// NotFound (no such entry), then divergence (`Ok(Err((head, ancestor)))`: the revision at
+/// `expected_version`; a token that names no revision is `NotFound { entity:
+/// "memory_entry_revision" }`, as for `requirement_revision`), then a closed entry
+/// ([`memory_entry_closed`]).
+async fn memory_cas_head(
+    conn: &mut PgConnection,
+    id: MemoryEntryId,
+    expected_version: i32,
+) -> Result<core::result::Result<MemoryEntry, (MemoryEntry, MemoryRevision)>> {
+    let Some(head) = sqlx::query_as!(
+        MemoryEntry,
+        r#"
+        SELECT id            AS "id: MemoryEntryId",
+               project_id    AS "project_id: ProjectId",
+               kind          AS "kind: MemoryKind",
+               subject,
+               body,
+               state         AS "state: MemoryState",
+               version,
+               confirmed_at,
+               superseded_by AS "superseded_by: MemoryEntryId",
+               created_by    AS "created_by: UserId",
+               created_at,
+               updated_at
+          FROM memory_entry WHERE id = $1 FOR UPDATE
+        "#,
+        id.as_uuid(),
+    )
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(map_sqlx)?
+    else {
+        return Err(StoreError::NotFound {
+            entity: "memory_entry",
+            id: id.to_string(),
+        });
+    };
+
+    if head.version != expected_version {
+        let ancestor = sqlx::query_as!(
+            MemoryRevision,
+            r#"
+            SELECT entry_id  AS "entry_id: MemoryEntryId",
+                   version,
+                   kind      AS "kind: MemoryKind",
+                   subject,
+                   body,
+                   state     AS "state: MemoryState",
+                   author_id AS "author_id: UserId",
+                   box_id    AS "box_id: BoxId",
+                   reason,
+                   created_at
+              FROM memory_entry_revision WHERE entry_id = $1 AND version = $2
+            "#,
+            id.as_uuid(),
+            expected_version,
+        )
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "memory_entry_revision",
+            id: format!("{id}@{expected_version}"),
+        })?;
+        return Ok(Err((head, ancestor)));
+    }
+    if !head.state.is_live() {
+        return Err(StoreError::Constraint(memory_entry_closed(id, head.state)));
+    }
+    Ok(Ok(head))
+}
+
+/// One statement under [`memory_cas_head`]'s lock: the row moves to `version + 1` and the
+/// revision at that version is written (`revise_requirement`'s `u`/`v` shape). `None` only if the
+/// locked row is gone, which the lock rules out; the caller answers that as a backend fault.
+async fn apply_memory_edit(
+    conn: &mut PgConnection,
+    id: MemoryEntryId,
+    edit: MemoryEdit,
+) -> core::result::Result<Option<MemoryEntry>, sqlx::Error> {
+    sqlx::query_as!(
+        MemoryEntry,
+        r#"
+        WITH u AS (
+            UPDATE memory_entry SET
+                kind          = COALESCE($2, kind),
+                subject       = COALESCE($3, subject),
+                body          = COALESCE($4, body),
+                state         = COALESCE($5, state),
+                superseded_by = COALESCE($6, superseded_by),
+                confirmed_at  = CASE WHEN $7::boolean THEN now() ELSE confirmed_at END,
+                version       = version + 1
+             WHERE id = $1
+            RETURNING id, project_id, kind, subject, body, state, version, confirmed_at,
+                      superseded_by, created_by, created_at, updated_at
+        ), v AS (
+            INSERT INTO memory_entry_revision (entry_id, version, kind, subject, body, state,
+                                               author_id, box_id, reason)
+            SELECT id, version, kind, subject, body, state, $8, $9, $10 FROM u
+            RETURNING entry_id
+        )
+        SELECT u.id            AS "id!: MemoryEntryId",
+               u.project_id    AS "project_id!: ProjectId",
+               u.kind          AS "kind!: MemoryKind",
+               u.subject       AS "subject!",
+               u.body          AS "body!",
+               u.state         AS "state!: MemoryState",
+               u.version       AS "version!",
+               u.confirmed_at  AS "confirmed_at!",
+               u.superseded_by AS "superseded_by: MemoryEntryId",
+               u.created_by    AS "created_by!: UserId",
+               u.created_at    AS "created_at!",
+               u.updated_at    AS "updated_at!"
+          FROM u, v
+        "#,
+        id.as_uuid(),
+        edit.kind.map(MemoryKind::as_str),
+        edit.subject,
+        edit.body,
+        edit.state.map(MemoryState::as_str),
+        edit.superseded_by.map(MemoryEntryId::as_uuid),
+        edit.restamp,
+        edit.author_id.as_uuid(),
+        edit.box_id.map(BoxId::as_uuid),
+        edit.reason,
+    )
+    .fetch_optional(&mut *conn)
+    .await
+}
+
+/// One statement: the row and its revision 1, `reason = 'created'` (`mint_requirement`'s shape).
+/// `None` when there is no such project. Shared by create and supersede, so both run one
+/// statement text.
+async fn insert_memory_entry(
+    conn: &mut PgConnection,
+    project: ProjectId,
+    new: &NewMemoryEntry,
+) -> core::result::Result<Option<MemoryEntry>, sqlx::Error> {
+    sqlx::query_as!(
+        MemoryEntry,
+        r#"
+        WITH p AS (SELECT id FROM project WHERE id = $1),
+             e AS (
+            INSERT INTO memory_entry (id, project_id, kind, subject, body, created_by)
+            SELECT $2, p.id, $3, $4, $5, $6 FROM p
+            RETURNING id, project_id, kind, subject, body, state, version, confirmed_at,
+                      superseded_by, created_by, created_at, updated_at
+        ), v AS (
+            INSERT INTO memory_entry_revision (entry_id, version, kind, subject, body, state,
+                                               author_id, box_id, reason)
+            SELECT id, version, kind, subject, body, state, $6, $7, 'created' FROM e
+            RETURNING entry_id
+        )
+        SELECT e.id            AS "id!: MemoryEntryId",
+               e.project_id    AS "project_id!: ProjectId",
+               e.kind          AS "kind!: MemoryKind",
+               e.subject       AS "subject!",
+               e.body          AS "body!",
+               e.state         AS "state!: MemoryState",
+               e.version       AS "version!",
+               e.confirmed_at  AS "confirmed_at!",
+               e.superseded_by AS "superseded_by: MemoryEntryId",
+               e.created_by    AS "created_by!: UserId",
+               e.created_at    AS "created_at!",
+               e.updated_at    AS "updated_at!"
+          FROM e, v
+        "#,
+        project.as_uuid(),
+        new.id.as_uuid(),
+        new.kind.as_str(),
+        new.subject.as_str(),
+        new.body.as_str(),
+        new.created_by.as_uuid(),
+        new.box_id.map(BoxId::as_uuid),
+    )
+    .fetch_optional(&mut *conn)
+    .await
+}
+
+/// A memory write's refusal in `MemStore`'s sentences (`persona_name_taken`'s rule, plus one
+/// read, blueprint P-4). Run it **after** the caller rolled back: the lookup goes through `pool`.
+///
+/// - `memory_entry_pkey` is the new entry's duplicate id: [`already_exists`]. So is
+///   `chk_memory_entry_superseded_by` when a supersede names the old entry's own id as the new one.
+/// - `uq_memory_entry_live_subject`'s `23505` names only the folded key, so the live holder of
+///   `subject`'s fold in `project`, other than `except`, is read back and named
+///   ([`memory_subject_taken`] with the holder's stored subject). If none is left (it was closed
+///   in between), the raw refusal stands.
+/// - Anything else goes through [`map_sqlx`].
+async fn memory_write_refused(
+    pool: &sqlx::PgPool,
+    err: sqlx::Error,
+    project: ProjectId,
+    subject: &str,
+    except: MemoryEntryId,
+    new_id: Option<MemoryEntryId>,
+) -> StoreError {
+    let constraint = match &err {
+        sqlx::Error::Database(db) => db.constraint().map(str::to_owned),
+        _ => None,
+    };
+    match (constraint.as_deref(), new_id) {
+        (Some("memory_entry_pkey"), Some(new_id)) => {
+            StoreError::Constraint(already_exists("memory_entry", new_id))
+        }
+        (Some("chk_memory_entry_superseded_by"), Some(new_id)) if new_id == except => {
+            StoreError::Constraint(already_exists("memory_entry", new_id))
+        }
+        (Some("uq_memory_entry_live_subject"), _) => {
+            let holder = sqlx::query!(
+                r#"
+                SELECT id AS "id: MemoryEntryId", subject
+                  FROM memory_entry
+                 WHERE project_id = $1 AND state IN ('active','suspect')
+                   AND lower(btrim(subject)) = lower(btrim($2::text)) AND id <> $3
+                 ORDER BY id LIMIT 1
+                "#,
+                project.as_uuid(),
+                subject,
+                except.as_uuid(),
+            )
+            .fetch_optional(pool)
+            .await;
+            match holder {
+                Ok(Some(holder)) => {
+                    StoreError::Constraint(memory_subject_taken(&holder.subject, holder.id))
+                }
+                Ok(None) => map_sqlx(err),
+                Err(lookup) => map_sqlx(lookup),
+            }
+        }
+        _ => map_sqlx(err),
+    }
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -7948,43 +8211,186 @@ impl WriteStore for PgStore {
         super::relay::open_permissions(self, scope).await
     }
 
-    // -- MOD-163 M1: project memory entries (plan D3-D6); T1 stubs, T3 writes the SQL
+    // -- MOD-163 M1: project memory entries (plan D3-D6; blueprint T3.4)
 
+    /// One statement (row and revision 1) on its own connection, so a refusal needs no
+    /// rollback before [`memory_write_refused`] reads the subject's holder.
     async fn create_memory_entry(
         &self,
-        _project: ProjectId,
-        _new: NewMemoryEntry,
+        project: ProjectId,
+        new: NewMemoryEntry,
     ) -> Result<MemoryEntry> {
-        Err(StoreError::Backend("MOD-163 M1: not yet".into()))
+        let inserted = {
+            let mut conn = self.pool.acquire().await.map_err(map_sqlx)?;
+            insert_memory_entry(&mut conn, project, &new).await
+        };
+        match inserted {
+            Ok(Some(entry)) => Ok(entry),
+            Ok(None) => Err(StoreError::NotFound {
+                entity: "project",
+                id: project.to_string(),
+            }),
+            Err(err) => Err(memory_write_refused(
+                &self.pool,
+                err,
+                project,
+                new.subject.as_str(),
+                new.id,
+                Some(new.id),
+            )
+            .await),
+        }
     }
 
+    /// [`memory_cas_head`]'s three decisions, then one statement that keeps the state, re-stamps
+    /// `confirmed_at` and writes the `amended` revision (plan D3, D6).
     async fn amend_memory_entry(
         &self,
-        _id: MemoryEntryId,
-        _expected_version: i32,
-        _patch: MemoryPatch,
+        id: MemoryEntryId,
+        expected_version: i32,
+        patch: MemoryPatch,
     ) -> Result<MemoryUpdate> {
-        Err(StoreError::Backend("MOD-163 M1: not yet".into()))
+        let subject = patch.subject.map(MemoryText::into_string);
+        let edit = MemoryEdit {
+            kind: patch.kind,
+            subject: subject.clone(),
+            body: patch.body.map(MemoryText::into_string),
+            state: None,
+            superseded_by: None,
+            restamp: true,
+            author_id: patch.author_id,
+            box_id: patch.box_id,
+            reason: "amended",
+        };
+        revise_memory_entry(&self.pool, id, expected_version, edit, subject).await
     }
 
+    /// [`memory_cas_head`]'s three decisions, then `active | suspect → retired` with its revision;
+    /// `confirmed_at` stays (plan D3, D6).
     async fn retire_memory_entry(
         &self,
-        _id: MemoryEntryId,
-        _expected_version: i32,
-        _author_id: UserId,
-        _box_id: Option<BoxId>,
+        id: MemoryEntryId,
+        expected_version: i32,
+        author_id: UserId,
+        box_id: Option<BoxId>,
     ) -> Result<MemoryUpdate> {
-        Err(StoreError::Backend("MOD-163 M1: not yet".into()))
+        let edit = MemoryEdit {
+            kind: None,
+            subject: None,
+            body: None,
+            state: Some(MemoryState::Retired),
+            superseded_by: None,
+            restamp: false,
+            author_id,
+            box_id,
+            reason: "retired",
+        };
+        revise_memory_entry(&self.pool, id, expected_version, edit, None).await
     }
 
+    /// One transaction (plan D6, blueprint P-2): [`memory_cas_head`] on the old entry, then the
+    /// old entry moves to `superseded` naming `new.id` (freeing its subject), then the new entry
+    /// is inserted in the old one's project. `superseded_by`'s FK is deferred to `COMMIT`, where
+    /// it holds. Any refusal rolls both halves back.
     async fn supersede_memory_entry(
         &self,
-        _old: MemoryEntryId,
-        _expected_version: i32,
-        _new: NewMemoryEntry,
+        old: MemoryEntryId,
+        expected_version: i32,
+        new: NewMemoryEntry,
     ) -> Result<MemorySupersede> {
-        Err(StoreError::Backend("MOD-163 M1: not yet".into()))
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let head = match memory_cas_head(&mut tx, old, expected_version).await? {
+            Ok(head) => head,
+            Err((head, ancestor)) => return Ok(MemorySupersede::Diverged { head, ancestor }),
+        };
+
+        let edit = MemoryEdit {
+            kind: None,
+            subject: None,
+            body: None,
+            state: Some(MemoryState::Superseded),
+            superseded_by: Some(new.id),
+            restamp: false,
+            author_id: new.created_by,
+            box_id: new.box_id,
+            reason: "superseded",
+        };
+        let written = match apply_memory_edit(&mut tx, old, edit).await {
+            Ok(Some(moved)) => insert_memory_entry(&mut tx, head.project_id, &new)
+                .await
+                .map(|inserted| inserted.map(|created| (moved, created))),
+            Ok(None) => Ok(None),
+            Err(err) => Err(err),
+        };
+        let (moved, created) = match written {
+            Ok(Some(pair)) => pair,
+            // Impossible: the old row is locked `FOR UPDATE`, and its project is held by the
+            // row's own foreign key.
+            Ok(None) => {
+                return Err(StoreError::Backend(format!(
+                    "memory entry `{old}` or its project `{}` vanished under the row lock this \
+                     transaction holds",
+                    head.project_id
+                )));
+            }
+            Err(err) => {
+                tx.rollback().await.map_err(map_sqlx)?;
+                return Err(memory_write_refused(
+                    &self.pool,
+                    err,
+                    head.project_id,
+                    new.subject.as_str(),
+                    old,
+                    Some(new.id),
+                )
+                .await);
+            }
+        };
+
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(MemorySupersede::Superseded {
+            old: moved,
+            new: created,
+        })
     }
+}
+
+/// Amend and retire's shared body (plan D6): one transaction, [`memory_cas_head`] under
+/// `FOR UPDATE`, then [`apply_memory_edit`]. A refusal from the statement rolls back first,
+/// then [`memory_write_refused`] names it; `subject` is the amend's new subject, if any, so a
+/// clash names the entry that holds it.
+async fn revise_memory_entry(
+    pool: &sqlx::PgPool,
+    id: MemoryEntryId,
+    expected_version: i32,
+    edit: MemoryEdit,
+    subject: Option<String>,
+) -> Result<MemoryUpdate> {
+    let mut tx = pool.begin().await.map_err(map_sqlx)?;
+    let head = match memory_cas_head(&mut tx, id, expected_version).await? {
+        Ok(head) => head,
+        Err((head, ancestor)) => return Ok(MemoryUpdate::Diverged { head, ancestor }),
+    };
+
+    let updated = match apply_memory_edit(&mut tx, id, edit).await {
+        Ok(Some(updated)) => updated,
+        // Impossible: the row has been locked `FOR UPDATE` since this transaction's first
+        // statement, and the `UPDATE` has no other conjunct.
+        Ok(None) => {
+            return Err(StoreError::Backend(format!(
+                "memory entry `{id}` did not move from version {expected_version} under the row \
+                 lock this transaction holds"
+            )));
+        }
+        Err(err) => {
+            tx.rollback().await.map_err(map_sqlx)?;
+            let subject = subject.as_deref().unwrap_or(&head.subject);
+            return Err(memory_write_refused(pool, err, head.project_id, subject, id, None).await);
+        }
+    };
+
+    tx.commit().await.map_err(map_sqlx)?;
+    Ok(MemoryUpdate::Updated(updated))
 }
 
 /// The thirty-five rows a project is born with (MOD-15 D9/D10), on the caller's transaction.
