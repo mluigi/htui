@@ -7,27 +7,19 @@ plan's settled D1-D8 and the OQ defaults, which this blueprint does not reopen.
 **Plan**: `.claude/plans/mod-146-project-type-table.plan.md` at `5d4ef2c8`, confirmed 2026-10-20.
 **Design source**: `docs/ANA-35.md` §7.4 (`:904-930`) and §7.9 P3 (`:1092-1110`).
 
-**Verified at**: HEAD `5d4ef2c8`, branch `hr/MOD-146`. Anchors were found through Gortex
-(`search_text`, `read_file`, `get_symbol_source`) and re-read at their lines. **Line numbers are
-pre-edit.** `graphify-out/` does not exist, so nothing here comes from it.
-`crates/htui-store/.sqlx/` holds 403 files, `crates/htui/tests/snapshots/` holds 171.
+**Verified at**: HEAD `5d4ef2c8`, branch `hr/MOD-146`, through Gortex (`search_text`,
+`read_file`, `get_symbol_source`); **line numbers are pre-edit**. `graphify-out/` does not exist.
 
-**Scope**:
-- **Order**: T1 → T2 → T3, serial, one tree (T4 is bookkeeping and not blueprinted).
-- **Migrations**: `0020_project_type.sql` (Postgres), `cache_migrations/0007_project_type.sql`.
-- **One new `WriteStore` method**: `project_types`, on all five implementors.
-- **New modules**: `htui::ui::tabs::settings::project_types`; no new worker module (the read is
-  one inline `try_serve` arm, the `AnswerPermission`/`FollowUp` precedent at
-  `store_worker.rs:2317-2390`).
-- **Request enums**: `StoreRequest` +1 (`ProjectTypes`), `StoreReply` +1 (`ProjectTypes`).
-- **Pins that move**: store `CASES` 175 → 177 (two pins); `TABLES` 46 → 47; migration versions
-  1..19 → 1..20; `.sqlx` 403 → 404 (5 replaced, 1 new); `Context::ALL` 48 → 49; `DECLARED` 82 → 83;
-  Settings strip 10 sections / 87 columns → 11 / 102 (F-1); snapshots 171 → 173 (two new, none
-  changed, F-2).
+**Scope**: T1 → T2 → T3, serial, one tree (T4 is not blueprinted). Two migrations, one
+`WriteStore` method on five implementors, one new module
+(`htui::ui::tabs::settings::project_types`). The read needs no worker module: it is one inline
+`try_serve` arm, the `AnswerPermission`/`FollowUp` precedent (`store_worker.rs:2317-2390`). Pins
+that move: `CASES` 175 → 177; `TABLES` 46 → 47; migration versions 1..19 → 1..20; `.sqlx`
+403 → 404 (5 replaced, 1 new); `Context::ALL` 48 → 49; `DECLARED` 82 → 83; the strip 87 → 102
+columns (F-1); snapshots 171 → 173 (2 new, 0 changed, F-2).
 
-**House style (carried)**: `missing_docs` warns on every lib, so every new `pub` item has a doc.
-Workspace lints are not edited. Implementers stage their own paths (never `-A`, never `stash`,
-never `--amend`) and commit incrementally. Gates run on the real tree with `--test-threads=1`.
+**House style**: every new `pub` item has a doc (`missing_docs`). The lints are not edited.
+Stage your own paths: never `-A`, `stash` or `--amend`. Gates run with `--test-threads=1`.
 
 ---
 
@@ -60,28 +52,17 @@ is a plain `Value`, as `Project.settings` is).
 /// creation. Editing or adding a type never re-seeds an existing project.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectType {
-    /// `project_type.slug`, the key `project.type` references.
-    pub slug: String,
-    /// `project_type.name`, e.g. `Software`.
+    // Each field `/// \`project_type.<column>\`…`, as `Project`'s are; the notes below go in them.
+    pub slug: String,               // the key `project.type` references
     pub name: String,
-    /// `project_type.description`.
     pub description: String,
-    /// `project_type.coding`: a software-like type, which ANA-39 and MOD-128 read.
-    pub coding: bool,
-    /// `project_type.builtin`: one of [`crate::seed::PROJECT_TYPES`].
-    pub builtin: bool,
-    /// `project_type.selectable`: offered for a new project; `false` for `workspace`.
-    pub selectable: bool,
-    /// `project_type.seed`: a user-defined type's recipe; `None` for a built-in, whose recipe code
-    /// holds.
-    pub seed: Option<Value>,
-    /// `project_type.seed_version`.
+    pub coding: bool,               // software-like; ANA-39 and MOD-128 read it
+    pub builtin: bool,              // one of `crate::seed::PROJECT_TYPES`
+    pub selectable: bool,           // offered for a new project; false for `workspace`
+    pub seed: Option<Value>,        // a user type's recipe; None for a built-in (code holds it)
     pub seed_version: i32,
-    /// `project_type.created_by`; `None` for a built-in.
-    pub created_by: Option<UserId>,
-    /// `project_type.created_at`.
+    pub created_by: Option<UserId>, // None for a built-in
     pub created_at: DateTime<Utc>,
-    /// `project_type.updated_at`.
     pub updated_at: DateTime<Utc>,
 }
 ```
@@ -107,15 +88,11 @@ Extend the import (`:22-25`) with `ProjectType`. Append after `template_row`, be
 /// [`project_type_row`] writes those.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuiltinProjectType {
-    /// `project_type.slug`; passes `chk_project_type_slug`.
+    // Each field documented `/// \`project_type.<column>\`.`
     pub slug: &'static str,
-    /// `project_type.name`.
     pub name: &'static str,
-    /// `project_type.description`.
     pub description: &'static str,
-    /// `project_type.coding`.
     pub coding: bool,
-    /// `project_type.selectable`.
     pub selectable: bool,
 }
 
@@ -126,50 +103,30 @@ pub const DEFAULT_PROJECT_TYPE: &str = "software";
 /// ANA-35 §7.4's six built-in types, in `slug` byte order, which is the order
 /// [`crate::store::WriteStore::project_types`] answers (MOD-146 D5). `0020_project_type.sql`
 /// inserts the same six, and `htui-store`'s `tests/migrations.rs` pins the two equal.
-pub const PROJECT_TYPES: [BuiltinProjectType; 6] = [
-    BuiltinProjectType { slug: "docs", name: "Documents",
-        description: "Documents outlined, drafted and reviewed.", coding: false, selectable: true },
-    BuiltinProjectType { slug: "general", name: "General",
-        description: "Tasks carried out and reviewed.", coding: false, selectable: true },
-    BuiltinProjectType { slug: "ops", name: "Operations",
-        description: "Operations planned, executed and verified; incidents investigated.",
-        coding: false, selectable: true },
-    BuiltinProjectType { slug: "research", name: "Research",
-        description: "Questions answered and research concluded with a verdict.",
-        coding: false, selectable: true },
-    BuiltinProjectType { slug: "software", name: "Software",
-        description: "Code in repositories: analyses, features, fixes.", coding: true,
-        selectable: true },
-    BuiltinProjectType { slug: "workspace", name: "Workspace",
-        description: "A workspace's own items; not offered for new projects.", coding: false,
-        selectable: false },
-];
+pub const PROJECT_TYPES: [BuiltinProjectType; 6] = [ /* six entries, below */ ];
 
 /// A built-in's `project_type` row. `at` fills both stamps: `MemStore` passes the epoch, and
 /// Postgres's rows carry the migration's `now()`.
 #[must_use]
 pub fn project_type_row(builtin: &BuiltinProjectType, at: DateTime<Utc>) -> ProjectType {
-    ProjectType {
-        slug: builtin.slug.to_owned(),
-        name: builtin.name.to_owned(),
-        description: builtin.description.to_owned(),
-        coding: builtin.coding,
-        builtin: true,
-        selectable: builtin.selectable,
-        seed: None,
-        seed_version: 1,
-        created_by: None,
-        created_at: at,
-        updated_at: at,
-    }
+    // the five fields copied, then builtin: true, seed: None, seed_version: 1,
+    // created_by: None, created_at: at, updated_at: at
 }
 ```
 
-(Let `cargo fmt` lay out the literals.) **Unit tests** in `seed::tests`:
-- `six_project_types_in_slug_byte_order_pass_the_check`: `len == 6`; `windows(2)` strictly
-  increasing by bytes (so the slugs are unique, and the order is the read order); every slug is
-  1-32 bytes, its first byte is `a..=z`, and the rest are `a..=z | 0..=9 | -` (a hand check, no
-  `regex` dep); names and descriptions are non-blank.
+The six `PROJECT_TYPES` entries, in this order, are byte for byte the plan's OQ-1 table and the
+`INSERT` of §2.1 (`(slug, name, coding, selectable)`, then the description):
+`docs` / Documents / no / yes, "Documents outlined, drafted and reviewed.";
+`general` / General / no / yes, "Tasks carried out and reviewed.";
+`ops` / Operations / no / yes, "Operations planned, executed and verified; incidents investigated.";
+`research` / Research / no / yes, "Questions answered and research concluded with a verdict.";
+`software` / Software / **yes** / yes, "Code in repositories: analyses, features, fixes.";
+`workspace` / Workspace / no / **no**, "A workspace's own items; not offered for new projects.".
+
+**Unit tests** in `seed::tests`:
+- `six_project_types_in_slug_byte_order_pass_the_check`: six; `windows(2)` strictly increasing
+  by bytes (so unique, in read order); each slug is 1-32 bytes of `a..=z | 0..=9 | -`, starting
+  `a..=z` (a hand check, no `regex`); names and descriptions are non-blank.
 - `software_is_the_one_coding_default_and_workspace_the_one_hidden`: the slugs with `coding` are
   `["software"]`; the slugs with `!selectable` are `["workspace"]`; `DEFAULT_PROJECT_TYPE` names a
   row that is `selectable` and `coding`.
@@ -220,12 +177,8 @@ The epoch keeps the rows identical across calls and handles. No state is read: n
 - `secret.rs:1380` (test) and `htui-orch/src/secrets.rs:214` (test): the same field, through
   `htui_core::seed::DEFAULT_PROJECT_TYPE` in the orch crate.
 - `htui-agent/src/conformance.rs` `UsageSpy`, after `delete_persona` (`:1060`), and
-  `htui-agent/tests/recorder.rs` `SpyStore`, after `:787`:
-  ```rust
-      async fn project_types(&self) -> StoreResult<Vec<htui_core::model::ProjectType>> {
-          self.inner.project_types().await
-      }
-  ```
+  `htui-agent/tests/recorder.rs` `SpyStore`, after `:787`: `async fn project_types(&self) ->
+  StoreResult<Vec<htui_core::model::ProjectType>> { self.inner.project_types().await }`.
 
 ### 1.6 Conformance (`crates/htui-core/src/store/conformance.rs`)
 
@@ -236,89 +189,45 @@ The epoch keeps the rows identical across calls and handles. No state is read: n
 - The bodies go at the end of the case code, before `#[cfg(test)] mod tests` (`:21308`), under
   `// MOD-146: the project type registry (plan D3-D5, D7)`. Mind F-8 in their docs.
 
-```rust
-/// MOD-146 plan D3, D5: the registry is ANA-35 §7.4's six built-ins in slug byte order, each as
-/// `seed::PROJECT_TYPES` spells it: `coding` on `software` alone, `selectable` false on
-/// `workspace` alone, every row built in with no recipe, `seed_version` 1, no author and never
-/// edited. The Postgres pin in `tests/migrations.rs` checks the migration's rows against the
-/// same constant.
-async fn project_types_are_the_six_builtins<S: WriteStore>(store: &S) {
-    const CASE: &str = "project_types_are_the_six_builtins";
-    let rows = store.project_types().await.expect(CASE);
-    assert_eq!(
-        rows.iter().map(|row| row.slug.as_str()).collect::<Vec<_>>(),
-        ["docs", "general", "ops", "research", "software", "workspace"],
-        "{CASE}: six rows in slug byte order"
-    );
-    for (row, builtin) in rows.iter().zip(PROJECT_TYPES.iter()) {
-        assert_eq!(
-            (row.slug.as_str(), row.name.as_str(), row.description.as_str(), row.coding,
-             row.selectable),
-            (builtin.slug, builtin.name, builtin.description, builtin.coding, builtin.selectable),
-            "{CASE}: `{}` is the built-in as seeded", builtin.slug
-        );
-        assert!(row.builtin, "{CASE}: `{}` is built in", row.slug);
-        assert_eq!((&row.seed, row.seed_version, row.created_by), (&None, 1, None),
-            "{CASE}: `{}` carries no recipe, version 1, no author", row.slug);
-        assert_eq!(row.created_at, row.updated_at, "{CASE}: `{}` was never edited", row.slug);
-    }
-    assert_eq!(
-        rows.iter().filter(|row| row.coding).map(|row| row.slug.as_str()).collect::<Vec<_>>(),
-        ["software"], "{CASE}: software is the one coding type");
-    assert_eq!(
-        rows.iter().filter(|row| !row.selectable).map(|row| row.slug.as_str())
-            .collect::<Vec<_>>(),
-        ["workspace"], "{CASE}: workspace is the one type a new project is not offered");
-    assert_eq!(store.project_types().await.expect(CASE), rows, "{CASE}: a second read agrees");
-}
+Both are `async fn <name><S: WriteStore>(store: &S)` with `const CASE: &str = "<name>";` and
+`"{CASE}: …"` messages, the `personas_are_listed_by_name_and_created_once` shape (`:18259`).
 
-/// MOD-146 plan D4: `NewProject` has no type, so a created project is `DEFAULT_PROJECT_TYPE`, it
-/// reads back so, and an edit leaves it; the demo projects, which existed before the column, are
-/// `software` too.
-async fn a_new_project_is_software<S: WriteStore>(store: &S) {
-    const CASE: &str = "a_new_project_is_software";
-    for id in [ids::PROJECT_HTUI, ids::PROJECT_AGY, ids::PROJECT_VULKAN] {
-        let project = store.project(id).await.expect(CASE).expect(CASE);
-        assert_eq!(project.project_type, DEFAULT_PROJECT_TYPE, "{CASE}: demo project {id}");
-    }
-    let created = store.create_project(new_project("typed")).await.expect(CASE);
-    assert_eq!(created.project_type, DEFAULT_PROJECT_TYPE, "{CASE}: the create answers it");
-    assert_eq!(
-        store.project(created.id).await.expect(CASE).map(|row| row.project_type),
-        Some(DEFAULT_PROJECT_TYPE.to_owned()), "{CASE}: it reads back");
-    let patch = ProjectPatch { name: Some("Typed".to_owned()), ..ProjectPatch::default() };
-    let edited = applied(CASE, store
-        .update_project(created.id, created.updated_at, patch).await.expect(CASE));
-    assert_eq!(edited.project_type, DEFAULT_PROJECT_TYPE, "{CASE}: an edit leaves the type");
-    let default = store.project_types().await.expect(CASE).into_iter()
-        .find(|row| row.slug == DEFAULT_PROJECT_TYPE)
-        .unwrap_or_else(|| panic!("{CASE}: the default names a row"));
-    assert!(default.selectable && default.coding, "{CASE}: the default is selectable, coding");
-}
-```
+**`project_types_are_the_six_builtins`**. Doc: "MOD-146 plan D3, D5: the registry is ANA-35
+§7.4's six built-ins in slug byte order, as `seed::PROJECT_TYPES` spells them. The Postgres pin in
+`tests/migrations.rs` checks the migration's rows against the same constant." Then
+`let rows = store.project_types().await.expect(CASE);` and:
+- the slugs are `["docs", "general", "ops", "research", "software", "workspace"]`;
+- for each `(row, builtin)` in `rows.iter().zip(PROJECT_TYPES.iter())`, `(slug, name,
+  description, coding, selectable)` equals the builtin's; `row.builtin`;
+  `(&row.seed, row.seed_version, row.created_by) == (&None, 1, None)`;
+  `row.created_at == row.updated_at` (never edited);
+- the slugs with `coding` are `["software"]`, the slugs with `!selectable` are `["workspace"]`;
+- a second `project_types()` equals `rows`.
 
-(`applied` and `new_project` exist: `:2714`, and `applied` is used at `:3093`. The demo
-project ids are `fixtures.rs:715-726`.)
+**`a_new_project_is_software`**. Doc: "MOD-146 plan D4: `NewProject` has no type, so a created
+project is `DEFAULT_PROJECT_TYPE`, reads back so and keeps it through an edit; the demo projects
+are `software` too." Then:
+- `ids::PROJECT_HTUI`, `PROJECT_AGY` and `PROJECT_VULKAN` (`fixtures.rs:715-726`) read back with
+  `project_type == DEFAULT_PROJECT_TYPE`;
+- `store.create_project(new_project("typed"))` (`new_project`, `:2714`) answers it, and
+  `store.project(created.id)` reads it back;
+- `applied(CASE, store.update_project(created.id, created.updated_at, ProjectPatch { name:
+  Some("Typed".to_owned()), ..ProjectPatch::default() }).await.expect(CASE))` keeps it;
+- the `project_types()` row whose slug is `DEFAULT_PROJECT_TYPE` exists and is `selectable &&
+  coding`.
 
 **Count pins**:
-- `htui-core/tests/mem_store.rs:36`: `175` → `177`; append to the message: `, and MOD-146's two
-  for the project type registry (plan D7)`.
-- `htui-store/tests/pg_conformance.rs:39`: `EXPECTED_CASES = 177`. Add a doc line,
-  `/// and MOD-146's two project type cases (plan D7) make it 177.`, and the message `177 since …
-  and MOD-146's two project type cases`. `pg_store_conformance` loops over `CASES`
-  (`pg_conformance.rs:58`), so its Pg wiring needs **no other edit**.
+- `htui-core/tests/mem_store.rs:36` and `htui-store/tests/pg_conformance.rs:39`
+  (`EXPECTED_CASES`) go 175 → 177. Each doc and message gains "and MOD-146's two project type
+  cases (plan D7)". `pg_store_conformance` loops over `CASES` (`pg_conformance.rs:58`), so its Pg
+  wiring needs **no other edit**.
 
-### 1.7 Commit
-`feat(core): MOD-146 T1 project types, built-ins and WriteStore::project_types`. Stage the
-htui-core, htui-agent and htui-orch paths, plus `htui-store/tests/pg_conformance.rs`. The body says:
-"htui-store and htui compile again at T2" (F-3).
-
-### 1.8 T1 gate (F-3)
-```bash
-cargo test -p htui-core --all-features -- --test-threads=1
-cargo clippy -p htui-core -p htui-agent -p htui-orch --all-targets --all-features -- -D warnings
-cargo clippy -p htui-core -p htui-agent -p htui-orch -- -D warnings
-```
+### 1.7 Commit and gate (F-3)
+One commit, `feat(core): MOD-146 T1 project types, built-ins and WriteStore::project_types`. Stage
+the htui-core, htui-agent and htui-orch paths and `htui-store/tests/pg_conformance.rs`. The body
+says "htui-store and htui compile again at T2". Gate: `cargo test -p htui-core --all-features --
+--test-threads=1`, then `cargo clippy -p htui-core -p htui-agent -p htui-orch` both with
+`--all-targets --all-features` and featureless, `-- -D warnings`.
 
 ---
 
@@ -329,20 +238,17 @@ cargo clippy -p htui-core -p htui-agent -p htui-orch -- -D warnings
 ```sql
 -- 0020_project_type.sql - MOD-146 (ANA-35 7.4, 7.9 P3; plan D1). Forward-only (R-STO-5).
 --
--- project_type is the registry of project types ANA-35 7.4 settles on. A project's type is set at
--- creation and its seed is copied into the project once, so editing or adding a type never
--- re-seeds an existing project. The six built-in rows carry no recipe (seed NULL): code holds
--- theirs, so ANA-33 can change the graph format; a user-defined type (ANA-33, R-TUI-8) must
--- carry one (chk_project_type_seed). coding marks the software-like types ANA-39 and MOD-128
--- read; selectable is false for workspace, which only MOD-147's scope rows take. MOD-146 adds no
--- write path: the INSERT below is the table's only writer.
+-- project_type is ANA-35 7.4's registry: a project's type is set at creation and its seed copied
+-- in once, so editing or adding a type never re-seeds a project. The six built-ins carry no
+-- recipe (code holds theirs, so ANA-33 can change the graph format); a user-defined type must
+-- (chk_project_type_seed). coding marks the types ANA-39 and MOD-128 read; selectable is false
+-- for workspace, which only MOD-147's scope rows take. The INSERT below is the only writer.
 --
--- project.type references the registry. Every existing project takes the column default
--- 'software', and so does every project created until MOD-148's picker sets it. No index stands
--- behind fk_project_type: projects are few and no type is ever deleted. The mirror gains
--- project.type in cache_migrations/0007_project_type.sql; project_type itself is not mirrored,
--- like persona. schema_version becomes 20, so each box rebuilds its mirror once on first start. A
--- headless worker never migrates: migrate from a TUI first.
+-- Every existing project takes project.type's default 'software', as does every project created
+-- before MOD-148's picker. No index stands behind fk_project_type: projects are few and no type
+-- is deleted. The mirror gains project.type in cache_migrations/0007_project_type.sql;
+-- project_type is not mirrored, like persona. schema_version becomes 20, so each box rebuilds
+-- its mirror once on first start. A headless worker never migrates: migrate from a TUI first.
 
 CREATE TABLE project_type (
     slug         TEXT        PRIMARY KEY
@@ -401,12 +307,9 @@ COMMENT ON COLUMN project.type IS
 
 ```sql
 -- ------------------------------------------------------------------------------------------------
--- Mirror side of MOD-146 (plan D6): project.type, the project's type slug
--- (migrations/0020_project_type.sql). TEXT with the same default and no foreign key: project_type
--- itself is not mirrored, and CacheStore::project builds a whole Project from this column.
---
--- cache_meta.schema_version moves to 20 through PgStore::schema_version(), which forces a full
--- rebuild, so no backfill is written here.
+-- Mirror side of MOD-146 (plan D6): project.type (migrations/0020_project_type.sql). TEXT, same
+-- default, no foreign key: project_type is not mirrored. cache_meta.schema_version moves to 20
+-- through PgStore::schema_version(), which forces a full rebuild, so no backfill is written here.
 -- ------------------------------------------------------------------------------------------------
 ALTER TABLE project ADD COLUMN type TEXT NOT NULL DEFAULT 'software';
 ```
@@ -418,27 +321,13 @@ The override is the **unquoted plain rename** `type AS project_type` (precedent:
 NULL` is `String`. `type` is a non-reserved keyword in both Postgres and SQLite, so it needs no
 quoting as a column, and the alias also keeps it from becoming a field of `query!`'s anonymous row.
 
-**`pg/read.rs:626-642` `PgStore::project`**:
-```sql
-            SELECT id              AS "id: ProjectId",
-                   slug,
-                   name,
-                   description,
-                   type            AS project_type,
-                   secret_provider,
-                   secret_scope,
-                   settings,
-                   created_by      AS "created_by: htui_core::model::UserId",
-                   created_at,
-                   updated_at
-              FROM project WHERE id = $1
-```
-**`pg/write.rs:2422-2437` `create_project`**: the `INSERT` line is unchanged (the column default
-writes `software`, D4). The `RETURNING` list gains `type            AS project_type,` after
-`description,`.
-
-**`pg/write.rs:2478-2497` `update_project`**: the `SET` list is unchanged (no write path). The
-`RETURNING` list gains the same line after `description,`.
+**The three `query_as!(Project …)` sites** each gain one line, `type            AS project_type,`
+(the alias aligned with its neighbours), after `description,`:
+- `pg/read.rs:626-642` `PgStore::project`, in the `SELECT` list.
+- `pg/write.rs:2422-2437` `create_project`, in the `RETURNING` list. The `INSERT` column list is
+  unchanged: the column default writes `software` (D4).
+- `pg/write.rs:2478-2497` `update_project`, in the `RETURNING` list. The `SET` list is unchanged
+  (no write path).
 
 **`pg/write.rs` `impl WriteStore for PgStore`, after `delete_persona` (`:3816`)**, with
 `ProjectType` added to the model import (`:23`):
@@ -450,17 +339,9 @@ writes `software`, D4). The `RETURNING` list gains `type            AS project_t
         sqlx::query_as!(
             ProjectType,
             r#"
-            SELECT slug,
-                   name,
-                   description,
-                   coding,
-                   builtin,
-                   selectable,
-                   seed,
-                   seed_version,
-                   created_by   AS "created_by: htui_core::model::UserId",
-                   created_at,
-                   updated_at
+            SELECT slug, name, description, coding, builtin, selectable, seed, seed_version,
+                   created_by AS "created_by: htui_core::model::UserId",
+                   created_at, updated_at
               FROM project_type
              ORDER BY slug COLLATE "C"
             "#,
@@ -470,17 +351,12 @@ writes `software`, D4). The `RETURNING` list gains `type            AS project_t
         .map_err(map_sqlx)
     }
 ```
-(`created_by` is nullable, so sqlx infers `Option<UserId>`; `seed` gives `Option<Value>`.)
+(`created_by` is nullable, so sqlx infers `Option<UserId>`; `seed` gives `Option<Value>`. Write
+the select list one column per line, as `persona_rows` does.)
 
-**`writer.rs`, after `delete_persona` (`:839`)**:
-```rust
-    async fn project_types(&self) -> Result<Vec<ProjectType>> {
-        match self {
-            Self::Memory(store) => store.project_types().await,
-            Self::Online(pg) => pg.project_types().await,
-        }
-    }
-```
+**`writer.rs`, after `delete_persona` (`:839`)**: `project_types` with the `personas` body
+(`:813-818`): `Self::Memory(store) => store.project_types().await` and `Self::Online(pg) =>
+pg.project_types().await`.
 
 **`cache/refresh.rs:684-739`**: `PROJECT_COLUMNS` gains `"type",` **last** (after
 `"updated_at"`). The `query!`:
@@ -514,10 +390,9 @@ with `row.project_type,` after `row.updated_at,`.
 `.bind(&project.project_type)` last.
 
 ### 2.5 `.sqlx`
-Prepare against a **migrated scratch DB** on `localhost:5439` (memory: the compose `htui` DB is
-empty). Expect five files replaced (`project`, `create_project`, `update_project`,
-`refresh_project`, the `load_demo` project insert) and one new (`project_types`): 403 → 404.
-`git status crates/htui-store/.sqlx` shows 5 `D` and 6 `??`. Stage the deletions too.
+Prepare against a **migrated scratch DB** on `localhost:5439`; the compose `htui` DB is empty.
+Five files are replaced (`project`, `create_project`, `update_project`, `refresh_project`,
+`load_demo`'s project insert) and one is new (`project_types`): 5 `D` and 6 `??`. Stage both.
 
 ### 2.6 `crates/htui-store/tests/migrations.rs`
 
@@ -527,39 +402,19 @@ empty). Expect five files replaced (`project`, `create_project`, `update_project
   "and MOD-146's 0020_project_type.sql"; `TABLES.len(), 47`; and both messages name the table.
 - The comment constants, after `MOD125_TABLE_COMMENT` (`:~597`). The texts are the SQL's, byte for
   byte:
-```rust
-/// The five `COMMENT ON COLUMN` texts of `0020_project_type.sql` (MOD-146 plan D1), verbatim and
-/// in migration order, for [`ANA_COLUMN_COMMENTS`]'s reason.
-const MOD146_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
-    ("project_type", "slug",
-     "MOD-146 D1: the key project.type references; a letter, then up to 31 of a-z, 0-9 and \
-      hyphens (chk_project_type_slug)."),
-    ("project_type", "coding",
-     "MOD-146 D1: a software-like type (software alone among the built-ins); ANA-39 and \
-      MOD-128 read it."),
-    ("project_type", "selectable",
-     "MOD-146 D1: false for workspace, which only scope rows take (MOD-147); a new-project \
-      picker offers the rest."),
-    ("project_type", "seed",
-     "MOD-146 D1: the JSONB recipe of a user-defined type; NULL for a built-in, whose recipe \
-      code holds (chk_project_type_seed)."),
-    ("project", "type",
-     "MOD-146 D1: the project type slug, set at creation; every project before MOD-148 is \
-      software."),
-];
-
-/// The one `COMMENT ON TABLE` of `0020_project_type.sql` (MOD-146 plan D1), verbatim.
-const MOD146_TABLE_COMMENT: (&str, &str) = (
-    "project_type",
-    "MOD-146 D1 (ANA-35 7.4): the project type registry. A type seeds a project once, at \
-     creation; editing or adding a type never re-seeds one. Six built-in rows; not mirrored.",
-);
-```
-- `the_ana_column_comments_are_present_and_verbatim` (`:869-970`): `.chain(MOD146_COLUMN_COMMENTS)`
-  after each of the three `.chain(MOD125_COLUMN_COMMENTS)` (`:880`, `:941`, `:960`). The table loop
-  becomes `[ANA_TABLE_COMMENT, MOD125_TABLE_COMMENT, MOD146_TABLE_COMMENT]`. The three messages add
-  "or MOD-146". `project` is already a named table (through `project.settings`), so `project.type`
-  **must** be in the list, or the "exactly … and no others" assertion fails.
+  `MOD146_COLUMN_COMMENTS: &[(&str, &str, &str)]`, documented "The five `COMMENT ON COLUMN`
+  texts of `0020_project_type.sql` (MOD-146 plan D1), verbatim and in migration order, for
+  [`ANA_COLUMN_COMMENTS`]'s reason", holds `("project_type","slug",…)`, `coding`,
+  `selectable`, `seed` and `("project","type",…)`. `MOD146_TABLE_COMMENT: (&str, &str) =
+  ("project_type", …)`. Each text is §2.1's adjacent SQL literals joined, written as a Rust
+  `"…\` continuation, the `MOD125_COLUMN_COMMENTS` way (`:600-638`). Example:
+  `"MOD-146 D1: the key project.type references; a letter, then up to 31 of a-z, 0-9 and \`
+  then a newline and `hyphens (chk_project_type_slug)."`. The space before `\` is what the SQL
+  piece ends with. `workspace''s` does not occur in any comment, so no quote needs undoubling.
+- `the_ana_column_comments_are_present_and_verbatim` (`:869-970`): add
+  `.chain(MOD146_COLUMN_COMMENTS)` after all three `MOD125` chains (`:880`, `:941`, `:960`) and
+  `MOD146_TABLE_COMMENT` to the table loop, and add "or MOD-146" to the messages. `project` is
+  already a named table, so `project.type` **must** be listed for "exactly … and no others".
 - **New tests**, after the 0019 block (`:~1700`), mirroring `migration_0019_scopes_only_…`
   (`:1465`, `bare_db` + `MIGRATOR.run_to(N-1)`):
   1. `migration_0020_types_an_existing_project_software`: `bare_db`, `run_to(19)`, insert an
@@ -572,15 +427,12 @@ const MOD146_TABLE_COMMENT: (&str, &str) = (
      created_by IS NULL FROM project_type ORDER BY slug COLLATE "C"`, which equals
      `htui_core::seed::PROJECT_TYPES` mapped to `(slug, name, description, coding, true,
      selectable, true, 1, true)` (D3's pin).
-  3. `migration_0020_refuses_an_unknown_type_a_bad_slug_and_a_recipeless_user_type`: `fresh_db`
-     and `plant_project_kind`. `UPDATE project SET type = 'nope'` is refused with
-     `assert_refused_by(err, "fk_project_type", …)` (if `map_sqlx` does not name 23503's
-     constraint, assert SQLSTATE `23503` instead, the `:1610-1617` way).
-     `INSERT INTO project_type (slug, name, builtin) VALUES ('Bad', 'Bad', true)` hits
-     `chk_project_type_slug`, and so does `'9lives'`. `VALUES ('custom', 'Custom', false)`
-     with no seed hits `chk_project_type_seed`. `INSERT … (slug, name, seed) VALUES ('custom',
-     'Custom', '{}')` is admitted, and `UPDATE project SET type = 'custom'` then succeeds (the
-     FK admits a known slug).
+  3. `migration_0020_refuses_an_unknown_type_a_bad_slug_and_a_recipeless_user_type`
+     (`fresh_db`, `plant_project_kind`). `UPDATE project SET type = 'nope'` →
+     `assert_refused_by(err, "fk_project_type", …)` (or SQLSTATE `23503`, the `:1610-1617` way).
+     A built-in insert with slug `'Bad'` or `'9lives'` → `chk_project_type_slug`. A non-builtin
+     with no seed → `chk_project_type_seed`. `('custom', 'Custom', seed '{}')` is admitted, and
+     `UPDATE project SET type = 'custom'` then succeeds.
 
 ### 2.7 `crates/htui-store/tests/cache.rs` (F-5)
 
@@ -592,36 +444,25 @@ const MOD146_TABLE_COMMENT: (&str, &str) = (
 it equals `db.store.project(ids::PROJECT_AGY)`. Then `teardown`. `projects_agree` is unchanged.
 
 ### 2.8 Commit and gate
-One commit: `feat(store): MOD-146 T2 project_type migration, PgStore, Writer and mirror`
-(migrations, src, tests, `.sqlx`). After it the workspace compiles again.
-```bash
-cargo test -p htui-store --all-features -- --test-threads=1
-cargo sqlx prepare --check --workspace
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo clippy --workspace -- -D warnings
-```
+One commit, `feat(store): MOD-146 T2 project_type migration, PgStore, Writer and mirror`
+(migrations, src, tests, `.sqlx`); after it the workspace compiles again. Gate: `cargo test -p
+htui-store --all-features -- --test-threads=1`, `cargo sqlx prepare --check --workspace`, and both
+workspace clippy runs (`--all-targets --all-features`, and featureless).
 
 ---
 
 ## 3. T3: Settings › Project types
 
 ### 3.1 `crates/htui/src/store_worker.rs`
-- `StoreRequest`, after `ImportPersonas { … }` (`:450`):
-  ```rust
-      /// The project type registry in slug order (MOD-146 D8). Served in [`try_serve`] through
-      /// the writer: `project_type` is not mirrored, so offline it is refused with
-      /// `DATABASE_UNREACHABLE`. Answered with [`StoreReply::ProjectTypes`].
-      ProjectTypes,
-  ```
+- `StoreRequest::ProjectTypes`, after `ImportPersonas { … }` (`:450`), documented "The project
+  type registry in slug order (MOD-146 D8). Served in [`try_serve`] through the writer:
+  `project_type` is not mirrored, so offline it is refused with `DATABASE_UNREACHABLE`. Answered
+  with [`StoreReply::ProjectTypes`]."
 - `name()`, after `Self::ImportPersonas { .. } => "import_personas",` (`:1223`):
   `Self::ProjectTypes => "project_types",`
-- `StoreReply`, after the persona replies (`:1612-…`):
-  ```rust
-      /// The project type registry in slug order: the answer to [`StoreRequest::ProjectTypes`]
-      /// (MOD-146 D8). Read-only; nothing writes a type yet.
-      ProjectTypes(Vec<ProjectType>),
-  ```
-  Add `ProjectType` to the model import.
+- `StoreReply::ProjectTypes(Vec<ProjectType>)`, after the persona replies (`:1612-…`), documented
+  "The project type registry in slug order: the answer to [`StoreRequest::ProjectTypes`] (MOD-146
+  D8). Read-only; nothing writes a type yet." Add `ProjectType` to the model import.
 - `try_serve`, after the persona arm (`:2217-2221`):
   ```rust
           // MOD-146 D8: the project type registry, through the writer. `project_type` is not
@@ -659,17 +500,10 @@ contiguous, the MOD-12 precedent):
 `settings.project_types, ` after `settings.queue, ` in both strings (re-wrap the `\` lines).
 
 **`keys/views.rs`**, after `QUEUE_BROWSE` (`:477-484`):
-```rust
-/// Settings > Project types, browsing (MOD-146 D8): read-only, so the list moves and the tab's
-/// section cycling are all it offers.
-pub const PROJECT_TYPES_BROWSE: Stack<'static> = Stack::new(&[
-    Layer::view(Context::SettingsProjectTypes, &[]),
-    SETTINGS,
-    LIST,
-    HISTORY,
-    GLOBAL,
-]);
-```
+`/// Settings > Project types, browsing (MOD-146 D8): read-only, so the list moves and the tab's
+section cycling are all it offers.` `pub const PROJECT_TYPES_BROWSE: Stack<'static> =
+Stack::new(&[Layer::view(Context::SettingsProjectTypes, &[]), SETTINGS, LIST, HISTORY, GLOBAL]);`
+(`QUEUE_BROWSE` without its `common` layer.)
 In its tests: `VIEWS` gains `source!("ui/tabs/settings/project_types.rs")` after `queue.rs`
 (`:1092`); `VIEW_STACKS` gains `PROJECT_TYPES_BROWSE` after `QUEUE_BROWSE` (`:1203`); `DELEGATES`
 gains `("PROJECT_TYPES_BROWSE", &[SETTINGS_TAB_RS])` after the queue row (`:1269`; `NextSection`
@@ -682,116 +516,53 @@ and `PrevSection` are handled by `settings/mod.rs`). `the_view_stacks_resolve_as
 `declared_starts_with_base_and_overlay_and_holds_every_view_stack` (`:413-428`): `len() == 83`, and
 `DECLARED[82] == ("in the leave dialog", views::LEAVE)`.
 
-The `j/k` acts are `Act::ListDown` / `Act::ListUp`, the ones Personas' browse view uses
-(`personas.rs:488-497`) through the shared `LIST` layer. Nothing is hard-coded: a user may rebind
-them under `[list]` or under `[settings.project_types]` (D10's per-view override).
+`j/k` are `Act::ListDown`/`Act::ListUp` through the shared `LIST` layer, as in Personas' browse
+(`personas.rs:488-497`). They can be rebound under `[list]` or `[settings.project_types]` (D10).
 
 ### 3.3 `crates/htui/src/ui/tabs/settings/project_types.rs` (new)
 
+The module doc says: read-only `project_type` registry (MOD-146 D8); global like `Personas`, so
+the read is unscoped and a scope change moves nothing; no store handle (`R-NF-3`); not mirrored,
+so offline it says "unavailable" and offers no key; no write and no `Mode` (user types and their
+editor are ANA-33's). Imports follow `personas.rs:19-44`, less what a writer needs. Each `pub`
+constant gets a one-line doc:
+
+| const | value |
+|---|---|
+| `HINT_BROWSE: HintSpec` | `&[Hint::Pair(Act::ListDown, Act::ListUp, "select")]` (`j/k select`) |
+| `HINT_UNAVAILABLE: HintSpec` | `&[]` (Personas' rule: no key offline) |
+| `READ_NAME` | `"project_types"` |
+| `NOT_READ` / `UNAVAILABLE` / `NO_TYPES` | `"project types not read yet"` / `"project types unavailable"` / `"no project types"` (Personas' wording) |
+| `CODING` / `NOT_SELECTABLE` | `"coding"` / `"not selectable"` |
+| `DOT` (private) | `" \u{b7} "` |
+
 ```rust
-//! The project type section of the Settings tab (MOD-146 D8): the `project_type` registry,
-//! read-only. One line per type (name, slug, a `coding` mark, `not selectable` on `workspace`)
-//! and the cursor row's description beneath it.
-//!
-//! A section like `Personas`: the registry is global, so the read is unscoped and a scope change
-//! moves nothing. It holds no store handle (`R-NF-3`): it names [`StoreRequest::ProjectTypes`]
-//! and renders what comes back. `project_type` is not mirrored, so offline the read is refused,
-//! the section says "unavailable" and offers no key. No write and no `Mode`: user-defined types
-//! and their editor are ANA-33's.
-
-use crossterm::event::KeyEvent;
-use htui_core::model::{ProjectType, Scope};
-use ratatui::Frame;
-use ratatui::layout::Rect;
-use ratatui::text::Line;
-use ratatui::widgets::Paragraph;
-
-use crate::app::{Ctx, Handled};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
-use crate::store_worker::{StoreReply, StoreRequest};
-use crate::ui::Theme;
-use crate::ui::tabs::settings::{SectionId, SettingsSection, wrapped};
-
-/// The Browse keys over a readable registry: `j/k select` with the default keys.
-pub const HINT_BROWSE: HintSpec = &[Hint::Pair(Act::ListDown, Act::ListUp, "select")];
-/// The Browse keys while the registry is unavailable: none (Personas' rule).
-pub const HINT_UNAVAILABLE: HintSpec = &[];
-/// The read's name, as `StoreRequest::name` spells it: a refused read leaves no list.
-pub const READ_NAME: &str = "project_types";
-/// Before the first read answered.
-pub const NOT_READ: &str = "project types not read yet";
-/// The opening of a refused read, drawn `{UNAVAILABLE}: {message}`.
-pub const UNAVAILABLE: &str = "project types unavailable";
-/// A readable, empty registry (a database short of `0020`'s rows).
-pub const NO_TYPES: &str = "no project types";
-/// The mark on a `coding` type's line.
-pub const CODING: &str = "coding";
-/// The mark on a type a new project is not offered.
-pub const NOT_SELECTABLE: &str = "not selectable";
-/// The separator of a line's segments.
-const DOT: &str = " \u{b7} ";
-
 /// `Settings > Project types` (MOD-146 D8).
 #[derive(Debug, Default)]
 pub struct ProjectTypesSection {
-    /// The registry in slug order, as the last `ProjectTypes` answered.
-    types: Vec<ProjectType>,
-    /// Whether any read has answered: before it, the pane says [`NOT_READ`].
-    read: bool,
-    /// `Some(message)` after `Failed { request: READ_NAME }`.
-    unavailable: Option<String>,
-    /// Index into `types`; no wrap.
-    cursor: usize,
+    types: Vec<ProjectType>,      // the last `ProjectTypes`, slug order
+    read: bool,                   // any read answered; before it, NOT_READ
+    unavailable: Option<String>,  // after `Failed { request: READ_NAME }`
+    cursor: usize,                // index into `types`; no wrap
 }
 
 impl ProjectTypesSection {
     /// Stable identity.
     pub const ID: SectionId = SectionId("project_types");
-
     /// A section with nothing read yet.
     #[must_use]
     pub fn new() -> Self { Self::default() }
-
-    /// Puts the cursor back inside the list after a read replaced it.
     fn clamp(&mut self) { self.cursor = self.cursor.min(self.types.len().saturating_sub(1)); }
-
-    /// The hint spec: no key while unavailable.
     fn hint_spec(&self) -> HintSpec {
         if self.unavailable.is_some() { HINT_UNAVAILABLE } else { HINT_BROWSE }
     }
 
-    /// One line per type, the cursor row in `theme.selected` with its description wrapped
-    /// under it in `theme.dim`, scrolled so the cursor row and its description stay on screen
-    /// (`PersonasSection::list_lines`, `personas.rs:1212-1242`).
+    /// One line per type, the cursor row in `theme.selected` with its description wrapped under
+    /// it in `theme.dim`, scrolled so both stay on screen.
     fn lines(&self, width: u16, height: u16, theme: &Theme) -> Vec<Line<'static>> {
-        if let Some(why) = &self.unavailable {
-            return wrapped(&format!("{UNAVAILABLE}: {why}"), usize::from(width).max(1))
-                .into_iter()
-                .map(|line| Line::styled(line, theme.error))
-                .collect();
-        }
-        if !self.read {
-            return vec![Line::styled(NOT_READ, theme.dim)];
-        }
-        if self.types.is_empty() {
-            return vec![Line::styled(NO_TYPES, theme.dim)];
-        }
-        let width = usize::from(width);
-        let mut lines = Vec::new();
-        let mut cursor_end = 0;
-        for (index, row) in self.types.iter().enumerate() {
-            if index == self.cursor {
-                lines.push(Line::styled(row_line(row), theme.selected));
-                for line in wrapped(&row.description, width.saturating_sub(4).max(1)) {
-                    lines.push(Line::styled(format!("    {line}"), theme.dim));
-                }
-                cursor_end = lines.len();
-            } else {
-                lines.push(Line::styled(row_line(row), theme.base));
-            }
-        }
-        let skip = cursor_end.saturating_sub(usize::from(height));
-        lines.into_iter().skip(skip).collect()
+        // `PersonasSection::list_lines` (personas.rs:1212-1242) line for line, with `self.types`,
+        // `NO_TYPES` for the empty case, `row_line(row)` (no width cut: the lines are short) for
+        // each row, and `wrapped(&row.description, width - 4)` indented four spaces as the detail.
     }
 }
 
@@ -815,16 +586,11 @@ impl SettingsSection for ProjectTypesSection {
         let chord = KeyChord::from_event(key);
         for act in ctx.keys().actions(views::PROJECT_TYPES_BROWSE, chord) {
             match act {
-                Act::ListDown => {
-                    if self.cursor + 1 < self.types.len() { self.cursor += 1; }
-                    return Handled::Consumed;
-                }
-                Act::ListUp => {
-                    self.cursor = self.cursor.saturating_sub(1);
-                    return Handled::Consumed;
-                }
+                Act::ListDown => { if self.cursor + 1 < self.types.len() { self.cursor += 1; } }
+                Act::ListUp => self.cursor = self.cursor.saturating_sub(1),
                 _ => continue, // a global act, or `settings.*`, which the tab took first
             }
+            return Handled::Consumed;
         }
         Handled::Pass
     }
@@ -833,27 +599,21 @@ impl SettingsSection for ProjectTypesSection {
         match reply {
             StoreReply::ProjectTypes(rows) => {
                 self.types.clone_from(rows);
-                self.read = true;
-                self.unavailable = None;
-                self.clamp();
+                (self.read, self.unavailable) = (true, None);
             }
             StoreReply::Failed { request, message } if *request == READ_NAME => {
                 self.types.clear();
-                self.read = true;
-                self.clamp();
-                self.unavailable = Some(message.clone());
+                (self.read, self.unavailable) = (true, Some(message.clone()));
             }
-            _ => {}
+            _ => return,
         }
+        self.clamp();
     }
     fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
         super::key_line(keys.hint(views::PROJECT_TYPES_BROWSE, self.hint_spec()), theme)
     }
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        frame.render_widget(
-            Paragraph::new(self.lines(area.width, area.height, ctx.theme)),
-            area,
-        );
+        frame.render_widget(Paragraph::new(self.lines(area.width, area.height, ctx.theme)), area);
     }
 }
 ```
@@ -883,11 +643,10 @@ These mirror `tests/personas.rs`'s helpers (`bench_with`, `frame`, `shows`, `req
 4. `a_refused_read_says_unavailable_and_offers_no_keys`: the bench replies `Failed { request:
    "project_types", message: "x" }`. The frame shows `project types unavailable: x`, and
    `bench.key_hint` holds no `j/k`.
-5. `offline_the_section_says_unavailable_and_offers_no_keys`: Personas' `:1361-1404` verbatim in
-   shape (`mock_keyring`, a `tempdir` that outlives the harness, `Backend::Offline`,
-   `with_store_state("offline · 0s", None)`). It shows `project types unavailable: store
-   unreachable:` and `DATABASE_UNREACHABLE`, has no `j/k select`, `j`/`k` change nothing below the
-   header, and ends with `insta::assert_snapshot!("offline", frame)`.
+5. `offline_the_section_says_unavailable_and_offers_no_keys`: shaped like Personas' `:1361-1404`
+   (`mock_keyring`, a `tempdir` that outlives the harness). It shows `project types unavailable:
+   store unreachable:` and `DATABASE_UNREACHABLE`, has no `j/k select`, and `j`/`k` change nothing
+   below the header. Snapshot `"offline"`.
 6. `the_product_registers_project_types_after_queue`: `Harness::demo()`, `register_all`, `"4"`,
    then ten `"l"`. The frame contains ` Queue  Project types ` (F-1 A: the strip has scrolled) and
    `Software · software · coding`, and the hint holds `j/k select`.
@@ -903,13 +662,10 @@ These mirror `tests/personas.rs`'s helpers (`bench_with`, `frame`, `shows`, `req
 ```rust
     // MOD-146 F-1: a strip wider than its area scrolls so the active title ends inside it; one
     // that fits draws as before, from column 0.
-    let mut end = 0usize;
-    let mut active_end = 0usize;
+    let (mut end, mut active_end) = (0usize, 0usize);
     for (id, title) in registry.titles() {
         end += cells::cell_width(title) + 2;
-        if Some(id) == active {
-            active_end = end;
-        }
+        if Some(id) == active { active_end = end; }
     }
     let offset = u16::try_from(active_end.saturating_sub(usize::from(area.width))).unwrap_or(u16::MAX);
     frame.render_widget(Paragraph::new(Line::from(spans)).scroll((0, offset)), area);
@@ -918,26 +674,20 @@ These mirror `tests/personas.rs`'s helpers (`bench_with`, `frame`, `shows`, `req
   tests: a `SettingsRegistry` with `ConnectionSection` and `QdrantSection` drawn by `render_strip`
   into `TestBackend::new(15, 1)` (the strip is 20 wide). With Connection active, the row starts
   ` Connection `; after `cycle_next`, it ends ` Qdrant `.
-- `tests/settings.rs:1081-1112`: the eleven sections, `assert_eq!(sections.len(), 11)`, and the
-  assertion becomes `assert_eq!(width, 102, …)`. Rewrite the doc: the eleven cost 102 of 100
-  columns, so the strip scrolls (`render_strip`, MOD-146 F-1), and the unit test above pins the
-  scroll. Rename it `the_section_strip_width_is_pinned`.
-- (B instead: the title `"Types"`, the test stays a ≤ 100 pin at 94 columns and asserts 11 sections,
-  test 6 looks for ` Queue  Types `, and §3.6's code is dropped.)
+- `tests/settings.rs:1081-1112`, renamed `the_section_strip_width_is_pinned`: eleven sections,
+  `assert_eq!(width, 102, …)`. Its doc says that the eleven cost 102 of 100 columns, so the strip
+  scrolls (`render_strip`, MOD-146 F-1), and that the unit test above pins the scroll.
+- (B instead: drop this code and title the section `"Types"`. The test stays a ≤ 100 pin, at 94
+  columns over 11 sections, and test 6 looks for ` Queue  Types `.)
 
 ### 3.7 What else may move (find with the full run)
-- **Offline full-shell tests**: every `register_all` shell over a non-`Memory` backend now also
-  issues `ProjectTypes`. Offline, its `Failed` reaches the status line (`app/update.rs:407`), so
-  a shell whose last flash was another section's may now show `project_types: store unreachable:
-  …`. The files that combine `register_all` with `over_backend` are `tests/backlog.rs`,
-  `connection.rs`, `keys.rs`, `personas.rs`, `secrets_settings.rs`, `settings.rs`, `skills_pg.rs`,
-  `templates_pg.rs`, `src/testkit.rs` and `src/ui/header.rs`. Look for failures that name
-  `project_types:`.
-- **Snapshots**: none expected (F-2). `cargo insta test --workspace --all-features
-  --test-runner nextest`, or the plain test run with `INSTA_UPDATE=no`, then `cargo insta
-  pending-snapshots`. Accept only the two new files.
-- The `?` box for the new view lists `Project types` only while that section is active. No pin
-  shows it.
+- **Offline full-shell tests**: a `register_all` shell offline now also gets a `Failed` for
+  `ProjectTypes` on its status line (`app/update.rs:407`), so its last flash may read
+  `project_types: store unreachable: …`. The suspects combine `register_all` with `over_backend`:
+  `tests/{backlog,connection,keys,personas,secrets_settings,settings,skills_pg,templates_pg}.rs`,
+  `src/testkit.rs` and `src/ui/header.rs`.
+- **Snapshots**: none expected to change (F-2). Run `cargo insta test --workspace
+  --all-features`, then `cargo insta pending-snapshots`, and accept only the two new files.
 
 ### 3.8 Commits and gate
 1. `feat(tui): MOD-146 T3 the Settings strip scrolls to its active section`: §3.6 alone. It is
@@ -947,41 +697,18 @@ These mirror `tests/personas.rs`'s helpers (`bench_with`, `frame`, `shows`, `req
    (`every_view_stack_is_named_by_a_view`) and the section registered in the same tree. No
    `todo!()` anywhere in the section: `SettingsTab::on_reply` hands every reply to every section.
 
-```bash
-cargo test -p htui --all-features --no-fail-fast -- --test-threads=1
-cargo insta test -p htui --all-features   # review: 2 new, 0 changed
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo clippy --workspace -- -D warnings
-cargo test --workspace --all-features --no-fail-fast -- --test-threads=1
-cargo sqlx prepare --check --workspace
-```
-(Memory: `htui`'s `tests/*.rs` run 0 tests without `--features testkit` / `--all-features`; grep
-the run for `SIGABRT`; re-run a `qdrant_live` timeout serially before calling it a regression.)
+Gate: `cargo test -p htui --all-features --no-fail-fast -- --test-threads=1`, the insta review
+(2 new, 0 changed), then the plan's whole Validation block. `htui`'s `tests/*.rs` run 0 tests
+without `--all-features`. Grep the run for `SIGABRT`, and re-run a `qdrant_live` timeout serially
+before calling it a regression.
 
 ---
 
 ## 4. Plan corrections
 
-1. **F-1**: the plan's D8 title overflows the pinned strip width (102 > 100). The plan's risk table
-   misses it. A maintainer choice is needed (A: the strip scrolls, the default; B: the title
-   `Types`).
-2. **F-2**: "every full-frame Settings strip snapshot gains ' Project types ', and the help box gains
-   a context" is false. No `.snap` draws the product strip, the `?` box or `--print-keys`. Expect
-   0 changed and 2 new snapshots.
-3. **F-3**: T1's `cargo clippy --workspace` cannot pass at T1's end. `htui-store`/`htui` compile
-   only after T2.
-4. **F-4**: the pins the files table omits: `mem_store.rs`, `pg_conformance.rs`, the
-   `migrations.rs` version list and comment test, `keys/stack.rs` `DECLARED`, `keys/load.rs`
-   `TABLES`, `tests/keys_file.rs`, `keys/views.rs`' three test lists, `Context::is_view`, and
-   `tests/settings.rs`.
-5. **F-5**: `projects_agree` needs no edit. It already compares whole rows, but only over the
-   default, so a real mirror test is added.
-6. **F-6**: `pg/demo.rs` `load_demo` and `testkit::seed_mirror` list `project` columns explicitly.
-   Both gain `type`, and `.sqlx` replaces 5 files, not 4.
-7. **F-7**: "P3 DDL verbatim" is kept for every column, type, default and CHECK body. The
-   constraints are named and the `updated_at` trigger is added, both for house style.
-8. **F-8**: case docs must not cite `tests/migrations.rs` test names (the cross-reference scanner).
-9. Plan T2 "Mirror: `PgStore::personas` / `persona_rows`": `persona_rows` maps through
-   `PersonaRow` only for its `Json<…>` columns. `project_types` reads straight into
-   `ProjectType` with `query_as!` (no `FromRow`, no row struct).
+F-1 to F-8 (§0) are the corrections: F-1 is the strip overflow (a maintainer choice), F-2 the
+overstated snapshot churn, F-3 T1's workspace gate, F-4 the unlisted pins, F-5 the vacuous mirror
+test, F-6 the demo and mirror fixture writers, F-7 the named constraints and the trigger, and F-8
+the scanner trap. One more: plan T2 says "Mirror: `PgStore::personas` / `persona_rows`".
+`persona_rows` maps through `PersonaRow` only for its `Json<…>` columns. `project_types` reads
+straight into `ProjectType` with `query_as!` (no `FromRow`, no row struct).
