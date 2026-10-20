@@ -5,7 +5,7 @@ override** (the router said PRD at exactly the 2-criteria threshold; ANA-33 §7.
 **Requirements**: `R-ORCH-1`, `R-ORCH-3`, `R-TUI-8` (storage half). **Answers**: ANA-40 P7.
 **Complexity**: Large (a migration, a model change on two core rows, five `WriteStore` implementors, seeds,
 two catalogue verbs, the re-override). Every task leaves `cargo check --workspace --all-targets --all-features` green.
-**Status**: draft — awaiting CONFIRM.
+**Status**: confirmed 2026-10-20 (maintainer CONFIRM); blueprint next.
 
 ## Summary
 
