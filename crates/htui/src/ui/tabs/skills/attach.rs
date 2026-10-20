@@ -40,7 +40,7 @@ use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::skills::{ProjectSkills, SkillsSnapshot};
 use crate::store_worker::StoreRequest;
 use crate::ui::cells;
-use crate::ui::tabs::settings::modal_rest;
+use crate::ui::kit::modal::modal_rest;
 use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::KeyEvent;
 

@@ -82,9 +82,9 @@ use crate::run_worker::{Enabled, FrameKind, ItemActions, ORCH_NAMES, OrchReply, 
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width};
+use crate::ui::kit::{chips::key_line, modal::modal_rest};
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, message};
 use crate::ui::tabs::chat::permission::PermissionStrip;
-use crate::ui::tabs::settings::{key_line, modal_rest};
 use crate::ui::text_field::{FieldOutcome, TextField};
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 

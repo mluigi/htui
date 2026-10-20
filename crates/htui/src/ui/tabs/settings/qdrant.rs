@@ -9,7 +9,8 @@ use crate::qdrant_settings_info::{QdrantSnapshot, QdrantState};
 use crate::secrets_settings::{DEMO_SESSION, Redacted};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
-use crate::ui::tabs::settings::{SectionId, SettingsSection, answers, asked, modal_rest, wrapped};
+use crate::ui::kit::{chips::key_line, modal::modal_rest, text::wrapped};
+use crate::ui::tabs::settings::{SectionId, SettingsSection, answers, asked};
 use crate::ui::{FieldOutcome, TextField};
 use crossterm::event::KeyEvent;
 
@@ -496,7 +497,7 @@ impl SettingsSection for QdrantSection {
     }
 
     fn key_hint(&self, keys: &Keys, theme: &crate::ui::Theme) -> Option<Line<'static>> {
-        super::key_line(self.hint_text(keys), theme)
+        key_line(self.hint_text(keys), theme)
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {

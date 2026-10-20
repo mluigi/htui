@@ -37,9 +37,10 @@ use crate::persona_import::PersonaOutcome;
 use crate::persona_settings::{IMPORT_NAME, PersonaWrite, READ_NAME, REQUEST_NAMES};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::{cell_width, graphemes};
+use crate::ui::kit::{chips::key_line, modal::modal_rest, text::wrapped};
 use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
-    is_error, modal_rest, wrapped, yes_or_no,
+    is_error, yes_or_no,
 };
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme};
 use crossterm::event::KeyEvent;
@@ -1959,7 +1960,7 @@ impl SettingsSection for PersonasSection {
     }
 
     fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
-        super::key_line(self.hint_text(keys), theme)
+        key_line(self.hint_text(keys), theme)
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {

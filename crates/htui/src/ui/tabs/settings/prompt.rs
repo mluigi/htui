@@ -45,9 +45,10 @@ use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::prompt_settings::{AppEntry, ProjectEntry, READ_NAME, REQUEST_NAMES, SettingsSnapshot};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
+use crate::ui::kit::{chips::key_line, modal::modal_rest, text::wrapped};
 use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
-    message, modal_rest, wrapped,
+    message,
 };
 use crate::ui::{FieldOutcome, TextField, Theme};
 use chrono::{DateTime, Utc};
@@ -918,7 +919,7 @@ impl SettingsSection for PromptSection {
     }
 
     fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
-        super::key_line(self.hint_text(keys), theme)
+        key_line(self.hint_text(keys), theme)
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {

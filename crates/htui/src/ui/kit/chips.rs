@@ -40,6 +40,14 @@ pub fn chip_line(pairs: &[(String, &str)], theme: &Theme) -> Line<'static> {
     Line::from(spans)
 }
 
+/// A view's keys as the shell's hint row draws them (MOD-67 M6 T2, every tab's
+/// [`Tab::key_hint`](crate::ui::tabs::Tab::key_hint)): `theme.dim`, `None` when no key of the
+/// spec is bound. Moved from the Settings tab (MOD-115 M3 D2), which lent it to every tab.
+#[must_use]
+pub fn key_line(text: String, theme: &Theme) -> Option<Line<'static>> {
+    (!text.is_empty()).then(|| Line::styled(text, theme.dim))
+}
+
 /// A legend of `(word, style)` entries: each word drawn in its own style, separated by a dim
 /// middle dot. The styles are the caller's (a status's, a kind's), so the legend can never
 /// disagree with the rows it explains.
@@ -148,5 +156,17 @@ mod tests {
     #[test]
     fn a_legend_of_nothing_is_empty() {
         assert!(legend(&[], &Theme::default()).spans.is_empty());
+    }
+
+    #[test]
+    fn a_key_line_is_the_hint_text_dimmed_and_nothing_when_empty() {
+        let theme = Theme::default();
+        let line = key_line("j/k move \u{b7} e edit".to_owned(), &theme).expect("a line");
+        assert_eq!(line.to_string(), "j/k move \u{b7} e edit");
+        assert_eq!(line.style, theme.dim);
+        assert_eq!(key_line(String::new(), &theme), None, "no key bound");
+        let mono = key_line("x".to_owned(), &Theme::monochrome()).expect("a line");
+        assert_eq!(mono.style.fg, None);
+        assert!(mono.style.add_modifier.contains(Modifier::DIM));
     }
 }

@@ -44,9 +44,10 @@ use crate::secrets_settings::{
 };
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
+use crate::ui::kit::{chips::key_line, text::wrapped};
 use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
-    answers, asked, wrapped,
+    answers, asked,
 };
 use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::KeyEvent;
@@ -1542,7 +1543,7 @@ impl SettingsSection for SecretsSection {
     }
 
     fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
-        super::key_line(self.hint_text(keys), theme)
+        key_line(self.hint_text(keys), theme)
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {

@@ -36,8 +36,8 @@ use crate::hand_written::{ADD_NOTE_NAME, HandText, WRITE_DOCUMENT_NAME};
 use crate::keys::{Act, KeyChord, Keys, Stack, views};
 use crate::store_worker::StoreRequest;
 use crate::ui::cells::{self, cell_width};
+use crate::ui::kit::text::wrapped;
 use crate::ui::tabs::backlog::item_form::{HINT_AREA, HINT_TEXT, PAGE, marker};
-use crate::ui::tabs::settings::wrapped;
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme};
 
 /// Width of a row's label, after the two-cell marker: `title` plus two.

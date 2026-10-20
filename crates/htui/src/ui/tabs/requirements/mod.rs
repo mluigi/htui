@@ -46,11 +46,11 @@ use crate::requirements::{
     mint_refused, not_the_maintainer,
 };
 use crate::store_worker::{StoreReply, StoreRequest};
+use crate::ui::kit::{modal::modal_rest, text::wrapped};
 use crate::ui::shell::{ListSize, PaneId, Panes, TabLayout, TabLoc};
 use crate::ui::tabs::backlog::detail::{Scroll, Step, capture_area};
 use crate::ui::tabs::backlog::list::window;
 use crate::ui::tabs::registry::{CLOSE_THE_FIELD_FIRST, Tab, TabId};
-use crate::ui::tabs::settings::{modal_rest, wrapped};
 use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::KeyEvent;
 

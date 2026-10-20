@@ -2490,8 +2490,8 @@ pub(crate) mod shell_tests {
         assert!(inside.contains("Activity appears here"), "{inside}");
     }
 
-    /// What [`ChromeTab`] draws its focused border in: a colour no theme role uses, so a
-    /// border the shell repainted cannot pass for one the tab drew.
+    /// What [`ChromeTab`] draws its focused border in: a colour no border role or tab accent
+    /// uses, so a border the shell repainted cannot pass for one the tab drew.
     const SENTINEL: Style = Style::new().fg(Color::Red);
 
     /// MOD-115 M3 D1: a list + detail tab that draws its own kit panes (`draws_chrome`): each

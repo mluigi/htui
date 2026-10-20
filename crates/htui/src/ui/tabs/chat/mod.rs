@@ -41,8 +41,8 @@ use crate::keys::{Act, Context, Hint, HintSpec, KeyChord, Keys, Stack, is_plain,
 use crate::run_worker::{OrchReply, Via};
 use crate::store_worker::{ChatFrame, StoreReply, StoreRequest};
 use crate::ui::cells::{self, cell_width};
+use crate::ui::kit::chips::key_line;
 use crate::ui::tabs::registry::{Tab, TabId};
-use crate::ui::tabs::settings::key_line;
 use composer::{Composer, ComposerOutcome};
 use crossterm::event::KeyEvent;
 use permission::PermissionStrip;

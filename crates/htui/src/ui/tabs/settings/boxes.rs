@@ -33,9 +33,10 @@ use crate::box_settings::{BoxesSnapshot, READ_NAME, REQUEST_NAMES, SpecView};
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::{self, cell_width};
+use crate::ui::kit::{chips::key_line, modal::modal_rest, text::wrapped};
 use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
-    is_error, message, modal_rest, wrapped,
+    is_error, message,
 };
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme};
 use chrono::{DateTime, Utc};
@@ -823,7 +824,7 @@ impl SettingsSection for BoxesSection {
     }
 
     fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
-        super::key_line(self.hint_text(keys), theme)
+        key_line(self.hint_text(keys), theme)
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {

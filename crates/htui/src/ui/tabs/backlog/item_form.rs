@@ -48,7 +48,7 @@ use crate::keys::translate::FieldEvent;
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::StoreRequest;
 use crate::ui::cells::{self, cell_width};
-use crate::ui::tabs::settings::wrapped;
+use crate::ui::kit::text::wrapped;
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme};
 
 /// Lines `PageUp`/`PageDown` move in the paths and body areas.
@@ -1078,7 +1078,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme)
     // The notice in rows of at most the pane's width in cells: broken at spaces, and inside a word
     // only when the word alone is wider (a long path in a refusal). Wrapped here rather than by
     // `Paragraph`'s `Wrap`, because the layout sizes the notice from this count before drawing it
-    // (the `settings::wrapped` precedent), and a count that disagreed would cut off the D11 hedge.
+    // (the `kit::text::wrapped` precedent), and a count that disagreed would cut off the D11 hedge.
     let mut notice_lines = form
         .notice
         .as_deref()

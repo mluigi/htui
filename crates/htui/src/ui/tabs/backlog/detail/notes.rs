@@ -47,11 +47,11 @@ use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells;
+use crate::ui::kit::{chips::key_line, text::wrapped};
 use crate::ui::tabs::backlog::detail::compose::{
     self, Compose, ComposeOutcome, could_not_check, may_have_landed, not_written,
 };
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, message};
-use crate::ui::tabs::settings::{key_line, wrapped};
 use crossterm::event::KeyEvent;
 
 /// The browse hint on the pane's last row (D11), through [`views::BACKLOG_NOTES`].

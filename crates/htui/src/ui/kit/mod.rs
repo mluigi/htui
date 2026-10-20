@@ -11,3 +11,4 @@ pub mod list;
 pub mod modal;
 pub mod pane;
 pub mod status;
+pub mod text;

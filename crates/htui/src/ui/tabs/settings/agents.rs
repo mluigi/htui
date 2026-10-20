@@ -90,9 +90,10 @@ use crate::app::{Action, Ctx, Handled};
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{AuthFrame, InstallFrame, StoreReply, StoreRequest};
 use crate::ui::cells::{self, cell_width};
+use crate::ui::kit::{chips::key_line, modal::modal_rest};
 use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
-    is_error, message, modal_rest,
+    is_error, message,
 };
 use crate::ui::text_field::PASTE_DOES_NOT_FIT;
 use crate::ui::{FieldOutcome, TextField, Theme};
@@ -2751,7 +2752,7 @@ impl SettingsSection for AgentsSection {
     }
 
     fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
-        super::key_line(self.hint_text(keys), theme)
+        key_line(self.hint_text(keys), theme)
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
