@@ -24,6 +24,7 @@
 | P-9 | D2 says `NewMemoryEntry` and `MemoryPatch` do not derive `Deserialize`. `MemoryText` follows `FollowUpText`, which has no serde at all (I-5), so neither struct can derive `Serialize` either. | `model/relay.rs:238-242, 296-308` (`NewFollowUp`: `Debug, Clone, PartialEq, Eq`) | **adopted**: `NewMemoryEntry`/`MemoryPatch` derive `Debug, Clone, PartialEq, Eq` (+`Default` on the patch). `StoreRequest` is `Debug, Clone` only (C4). |
 | P-10 | D1 lists two indexes. `ON DELETE SET NULL` on the self-FK scans `memory_entry` for referencing rows on every deleted entry, and a project cascade deletes all of them. Without an index that is quadratic. | `0006_requirements.sql:108-109` (`idx_requirement_revision_amended_by`, same reason) | **adopted**: a third, partial index `idx_memory_entry_superseded_by … WHERE superseded_by IS NOT NULL`. |
 | P-11 | Two small model helpers are needed by T2 (Mem) and T3 (Pg docs), and T2/T3 may not touch the model. | plan Risks row 1 | **adopted**: T1 ships `MemoryState::is_live()` and `memory_subject_key(&str) -> String` (Postgres's `lower(btrim())` in Rust). M3 can use the same fold to find the clashing entry in its loaded list instead of parsing the refusal string. |
+| P-12 | D5 lists three `MemoryTextError` variants. Postgres `text` cannot hold U+0000 (`22021`), so without a construction-time check `MemStore` would keep a text that `PgStore` fails with as a backend error, and the two stores would disagree. | Postgres `text` type (`22021 character_not_in_repertoire` on a NUL); commit `edf56188` | **adopted**: a fourth variant, `MemoryTextError::Nul`, checked in `checked` after `Empty` and before the scrub. Unit test `a_nul_is_refused`. M3's error-to-message mapping and T2/T3 expect **four** variants: `Empty`, `Nul`, `TooLong { max }`, `Unmasked`. |
 
 ---
 
@@ -270,6 +271,7 @@ impl MemoryText {
     ///
     /// # Errors
     /// [`MemoryTextError::Empty`] for an empty or whitespace-only text;
+    /// [`MemoryTextError::Nul`] when the text holds a U+0000 (P-12);
     /// [`MemoryTextError::Unmasked`] when `scrubber` leaves a credential-shaped leaf;
     /// [`MemoryTextError::TooLong`] `{ max: MEMORY_SUBJECT_MAX }` when the scrubbed text is longer.
     pub fn subject(raw: &str, scrubber: &dyn Scrubber) -> Result<Self, MemoryTextError>;
@@ -300,6 +302,9 @@ pub enum MemoryTextError {
     /// Empty or whitespace-only.
     #[error("the text is empty")]
     Empty,
+    /// Holds a U+0000, which Postgres `text` cannot store (`22021`, P-12).
+    #[error("the text must not contain a NUL character")]
+    Nul,
     /// Longer than `max` characters after scrubbing.
     #[error("the text is longer than {max} characters")]
     TooLong {
@@ -314,7 +319,7 @@ pub enum MemoryTextError {
 ```
 
 Body of the shared private `fn checked(raw: &str, max: usize, scrubber: &dyn Scrubber)`:
-`let text = raw.trim()`. If empty → `Empty`. Then `let mut v = Value::String(text.to_owned())` and
+`let text = raw.trim()`. If empty → `Empty`. If it contains `'\0'` → `Nul` (P-12). Then `let mut v = Value::String(text.to_owned())` and
 `scrubber.scrub(&mut v).map_err(MemoryTextError::Unmasked)?`. Take the `String` back out (a
 non-string result is impossible for `Value::String`; treat it as
 `Unmasked(Unmasked { path: String::new(), rule: "type_changed" })` or `unreachable!`. Prefer the
@@ -335,6 +340,7 @@ Unit tests (write first, `#[cfg(test)] mod tests` in `memory.rs`; scrubber
 | `a_credential_shaped_text_is_refused_without_repeating_it` | `"key sk-ant-api03-do-not-print-me"` → `Err(Unmasked(u))`, `u.rule == "anthropic_api_key"`; neither `err.to_string()` nor `{err:?}` contains `do-not-print-me` or `sk-ant-` |
 | `debug_prints_the_length_only` | `format!("{t:?}") == "MemoryText { len: 11 }"` for `"Build cache"` |
 | `memory_subject_key_folds_like_btrim_lower` | `" Build Cache "` → `"build cache"`; `"\tX"` → `"\tx"` (a tab is kept, as `btrim` keeps it) |
+| `a_nul_is_refused` | a text holding `'\0'` → `Err(Nul)` for `subject` and `body` (P-12) |
 | `only_active_and_suspect_are_live` | `is_live` over `MemoryState::ALL` == `[true, true, false, false]` |
 
 ### T1.2 `crates/htui-core/src/model/mod.rs` and `model/ids.rs`
