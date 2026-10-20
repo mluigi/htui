@@ -844,6 +844,12 @@ logic:
    sections, because a step that cannot see what it was asked to do is a wasted step.
 5. **the protected set** - never.
 
+*Amended by ANA-38, 2026-10-20 (`docs/decisions/ana/ana-38.md`, `R-PRM-1`, `R-PRM-3`):* a new internal
+section, `memory`, which no template names (like Persona and Output), filled in `phase_spec` from
+Postgres, sits between `excerpts` and `upstream`: it loses tokens after excerpts and before upstream,
+global entries before project and workspace ones. The kept entry ids and versions join the trim record
+(`RECORD_VERSION` 4 to 5).
+
 The two role-specific prompts reuse the same machinery with their own two-entry orders, which is why
 the §4.2 table gives them their own ranks. **Judge:** `judge_candidate:<i>` first (per-candidate
 isolate cap, then diff-stat-only, §4.6a), then `judge_task`; `template` stays protected. **Handoff:**

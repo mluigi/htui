@@ -1,7 +1,7 @@
 # CONCEPTS - htui
 
 **Owner:** Luigi Marrandino
-**Reviewed:** 2026-10-17
+**Reviewed:** 2026-10-20
 
 Standing architectural intent for `htui`. Governed by `.claude/rules/concept-docs.md`. Distilled
 from `docs/REQUIREMENTS.md`, which is the authority; requirement IDs in brackets.
@@ -80,8 +80,12 @@ nothing extra [R-ENT-9].
 - **Inlined skills.** Agents run with system skills disabled; `htui` owns skill and template text
   in Postgres and inlines it into one self-contained initial prompt [R-ID-5, R-PRM-1, R-SKL-1, 2].
 - **Bounded context.** Prior work reaches a prompt only as documents and upstream summaries within
-  one to two hops inside the active workspace, never as raw transcripts; template and skills are
-  never trimmed, the rest in a fixed order [R-PRM-1..3].
+  one to two hops inside the active workspace, and as capped memory (global memory the one input from
+  outside it), never as raw transcripts; template and skills are never trimmed, the rest in a fixed
+  order [R-PRM-1..3].
+- **Memory.** Verbatim facts, decisions, gotchas and lessons of a project, workspace or the global
+  scope, written by the light model with no person's gate; checks, freshness and selection are code
+  [R-ENT-13, R-ID-6].
 - **htui MCP server.** Agents propose links, write artifacts and, when exposed, queue heavy
   commands behind per-box limits through `htui`'s own MCP tools, scoped to their run step
   [R-MCP-1..4].

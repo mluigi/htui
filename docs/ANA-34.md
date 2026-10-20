@@ -557,7 +557,8 @@ step), seeded from the store's rows and, where `DriverCaps.resume` holds, resumi
 session. Coordinator turns are recorded as runs of a new kind `coordinator` with no item; a workspace
 coordinator's runs need a workspace owner, so `run` gains a workspace scope (nullable `project_id` with a
 `workspace_id` and a check that exactly one is set, or an equivalent the plan chooses). ANA-38's memory,
-when it lands, is added to the seed.
+when it lands, is added to the seed. *Amended by ANA-38, 2026-10-20:* the seed reads the scope's active,
+non-suspect memory entries (MOD-163) from rows, outside `R-PRM-3`'s ladder; MOD-136 supplies the turn.
 
 **7.3 Two levels of integration; the landing branch depends on the mode (5.3 B, conflicts (i)).**
 

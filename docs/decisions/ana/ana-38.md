@@ -100,6 +100,25 @@ ANA-38 was written without ANA-37's verdict (see Not verified). The maintainer r
   the `R-ID-6` exception stay owed and maintainer-gated.
 - **Items amended:** MOD-163, MOD-164, MOD-167, MOD-168, MOD-169.
 
+## Owed edits decided (2026-10-20)
+
+The maintainer then answered the owed, maintainer-gated edits of the Verdict:
+
+- **`R-ID-6` exception: allowed**, applied as §7.3 proposed it, with the light model's third use.
+  MOD-164 is unblocked on it.
+- **`R-ENT-13`: "must" as a whole**, automatic with its verifications (write-path checks, computed
+  freshness, re-validation, promotion gate, visibility). This replaces "must for P1 and P2, later for
+  P3..P6 until P7": MOD-163..169 are all "must"; MOD-168 is still built after MOD-169's first read, and
+  MOD-169 measures and tunes rather than deciding whether memory stays.
+- **The rest, applied:** `R-PRM-1`/`R-PRM-3` (memory in the prompt, after excerpts and before upstream
+  in the cut order, global cut first; global memory the one input from outside the workspace),
+  `R-ENT-12` (a global owner), `R-TUI-8` (memory switches and global entries in Settings), `R-TUI-14` (a
+  memory sub-tab per workspace and project), CONCEPTS ("Bounded context", "Memory"), and dated notes in
+  ANA-2 invariant 3, ANA-5 §4.4, ANA-34 §7.2 and MOD-98.
+- **Ranking prompt memory by Qdrant relevance:** deferred to MOD-169.
+- **Collection versions:** none while htui is in development; a payload change drops and reindexes
+  (MOD-144, MOD-147, MOD-159).
+
 ## Commits
 
 `8833d8bd` (draft), `59632c88` (draft v2), and the conclusion commit that adds this file and files

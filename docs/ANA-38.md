@@ -56,7 +56,8 @@
 > **Reconciled with ANA-37 (2026-10-20):** memory sits in its workspace's collection or a global one in
 > the single Qdrant, indexed by ANA-37's indexer; no entry is superseded from a similarity score and no
 > run queries Qdrant; the full-text fallback is dropped. Where this document says otherwise, the
-> "Reconciled" section of `docs/decisions/ana/ana-38.md` governs.
+> "Reconciled" section of `docs/decisions/ana/ana-38.md` governs. The §7.3 requirement edits are applied
+> (2026-10-20), and `R-ENT-13` is "must" as a whole; see "Owed edits decided" there.
 
 ---
 

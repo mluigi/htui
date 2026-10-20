@@ -14,61 +14,30 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-20):** **ANA-37 and ANA-38 are reconciled** (the "Reconciled" sections of `docs/decisions/ana/ana-37.md` and `docs/decisions/ana/ana-38.md`): one Qdrant for the whole database, run like Postgres, its URL one database-wide setting and one API key; a collection per workspace plus one global memory collection, an indexer lease each; memory is indexed by that indexer, never inside a run; a near-duplicate score records a candidate and supersedes nothing until MOD-169 measures a threshold; agents find memory only through knowledge search. `R-NF-2`, `R-STO-1`, `R-STO-8`, `R-TUI-8`, `R-ENT-13`, `R-MCP-1` and `R-MCP-2` are amended; MOD-130, MOD-158..160, MOD-162..164 and MOD-167..169 updated. **ANA-38 is concluded** (`docs/ANA-38.md`, `docs/decisions/ana/ana-38.md`): memory returns as verbatim entries (kinds `fact`, `decision`, `gotcha`, `lesson`; project, workspace and a new global scope), written automatically by the light model through a validated deterministic pipeline with no person's acceptance, which amends `R-ID-6` (owed, maintainer-gated); freshness is computed by code, the prompt section is Postgres-only, and Qdrant is an add-on. Spawned **MOD-163..169**. Before it, **ANA-37 is concluded** (`docs/ANA-37.md`, `docs/decisions/ana/ana-37.md`):
-knowledge search is a required workspace service on one shared Qdrant per workspace, required to be configured and
-failing open on outage ("knowledge search unavailable", nothing else affected); it covers everything a workspace
-knows except code, one htui process per workspace indexes it under a Postgres lease, and the Qdrant URL becomes a
-workspace setting with the API key in the keyring. Spawned **MOD-158..162**; the §10 requirement edits are applied
-(`R-NF-2`, `R-STO-8`, `R-STO-1`, `R-MCP-1`, `R-MCP-2`, `R-ENT-13`, `R-TUI-8`). Before it, **ANA-36 is concluded** (`docs/ANA-36.md`, `docs/decisions/ana/ana-36.md`): of 36
-candidate MCP tools, 11 are refuted and 15 stay with the items that own them (MOD-112, MOD-75, MOD-27, MOD-135,
-MOD-136 and others, each given its §7.2 design input); the ten unowned survivors are filed as **MOD-151..157**
-(tool guidance, async commands with stored logs, test results and presets, `item_status` as a typed request,
-pending agent links and citations; `document_patch` and attachment tools wanted later). An agent proposal that a
-status move, the scheduler, coverage or a prompt would read waits for a person, so a scheduling-kind `item_link`
-becomes pending (reversing MOD-11 OQ-4). Its §9 requirement edits are applied (`R-MCP-1..4`, `R-ENT-9`,
-`R-ENT-15`, `R-ID-5`; ANA-34's `R-MCP-2` coordinator sentence folded in). Before it, **ANA-35 is concluded** (`docs/ANA-35.md`, `docs/decisions/ana/ana-35.md`): an
-item stores only `open`, `blocked` or `closed`, and what a person sees (queued, running, needs you, failed, done) is
-derived from its latest graph run; the migration closes nothing a run can explain. A repo is `git` or `folder`
-(folders copy, never merge, push or clone); project types are rows whose seed is copied once; a workspace owns its
-items, kinds, keys, documents, requirements (`W-<AREA>-<N>`) and runs through one hidden scope row in `project`;
-attachments sit in Postgres under a 10 MiB cap; `parent`, `duplicates` and `implements` links join. Spawned
-**MOD-144..150**; the §10 requirement edits are applied (`docs/REQUIREMENTS.md` header). Before it, **ANA-34 is
-concluded** (`docs/ANA-34.md`, `docs/decisions/ana/ana-34.md`): a
-coordinator is a role over store rows, not a process; deterministic code in the run's executor lands finished runs
-per repo (`local` stays the default, `push` fast-forward only, `pull_request` through a forge adapter, OneDev
-first) and never resolves a conflict; its agent turns only propose; close-out stays a person's confirmation over a
-checklist. Spawned **MOD-133..136**; requirement edits (`R-TUI-9` final text and others, §10) wait for the
-maintainer, except `R-ENT-8`'s, applied with ANA-35's, and §10.11, applied through ANA-36's `R-MCP-2`. Before it, **ANA-33 is concluded** (`docs/ANA-33.md`, `docs/decisions/ana/ana-33.md`): step
-graphs become phase rows plus typed edges owned by a project, a workspace or the global workflow library, a run is
-pinned to a v2 snapshot, and fan-out divides work into a planner, planned parts and an integrate agent whose branch
-alone lands through ANA-2 §4.6. Spawned **MOD-137..143**; MOD-27 is narrowed to consult-mode `spawn_subagent`, and
-ANA-2, ANA-13, ANA-30, `R-MCP-3`, `R-TUI-8`, `R-ORCH-1` and `CONCEPTS.md` carry dated amendments. Before it,
-**ANA-40 is concluded** (`docs/ANA-40.md`, `docs/decisions/ana/ana-40.md`): the
-Toolbox has eleven kinds plus bundles, Postgres holds them all and the box probe only reports observed state, every
-attachable kind shares one generalised binding, and the light model becomes one setting (a partial reversal of
-ANA-30). Spawned **MOD-126..129**; requirement edits (`R-TUI-7` and others) wait for the maintainer. Before it, a
-**UI redesign review** with the maintainer, run on a throwaway
-ratatui skeleton (branch `spike/ui-skeleton`, `spikes/ui-skeleton/`), is concluded; every decision is
-in `docs/ui-redesign-findings-2026-10-15.md`. It added `R-ENT-17`, `R-AGT-11`, `R-ORCH-15`, `R-ORCH-16`, `R-SEC-5` and
-`R-TUI-12..18` and amended `R-TUI-1..8`, `R-TUI-10` and six more (`docs/REQUIREMENTS.md` header). Filed
-**ANA-40..42** (Toolbox, project workflows, execution targets) and **MOD-115..125** (the redesign's
-settled work); MOD-81, MOD-82, MOD-83, MOD-85 and MOD-88 are absorbed by MOD-115 and MOD-120, and
-MOD-113 is amended (Templates stay in the Toolbox). Before it (2026-10-15), a **requirements review** with the maintainer
-(`docs/requirements-review-2026-10-15.md`) went through every requirement and amended most of
-`docs/REQUIREMENTS.md`. The main changes: `htui` serves any kind of project; fan-out now divides work
-(best-of-N is later, `R-LATER-13`); a coordinator per project and per workspace (`R-ORCH-14`); key
-bindings move to Postgres; `R-LATER-3` and `R-LATER-7` are promoted to must; macOS is best effort. Filed
-**ANA-33..39** for the open designs and **MOD-107..114** for the settled work. Before it, a **requirements audit** (2026-10-14) found 69 of 90 `must` requirements fully met; the
-untracked gaps are filed as **MOD-99..106**, **ANA-31**, **ANA-32** and **TOOL-13**, and `R-NF-2`, `R-ORCH-6`,
-`R-ORCH-12` and `R-LATER-6` were amended (`docs/REQUIREMENTS.md` header). **MOD-99** (hard-coded Sentry DSN in a
-public repo) also owes key rotation and a history rewrite, after the live `hr` branches merge. Owed on the host from TOOL-14: `gate.ps1 -SelfTest` on Windows. Owed on the
-host from TOOL-8 (the `htui-dev` mod, `docs/htui-dev.md`): a Windows run (`claude -p "/gate fmt"` returns at once, the `.ps1` commands), `dev-health`'s
-docker path against the real `htui-postgres`, and the Postgres gate. Owed on the host from ANA-30: checking which credit the $100 is (Console), and one dev-database query for stored ACP
-`session_info_update` titles (`docs/ANA-30.md` §8 calls 2, 6). Earlier completions (**ANA-28**, **TOOL-14**, **TOOL-8**, **ANA-30**, **TOOL-10**, **CLEAN-12**, **TOOL-9**, **CLEAN-11**, **MOD-67**, **MOD-96**, **CLEAN-10**, **MOD-93**, **MOD-89**, **MOD-95**, **TOOL-11**,
-**MOD-91**, **MOD-92**) are in `DECISIONS.md`; their host Postgres gates on the merged tree, the Windows runs
-and MOD-93's live install and `tsc` on the mod stay owed; TOOL-9's Windows run of the `.ps1` gate files and TOOL-10's real
-`scripts/hr up` and Docker bats case are owed on the host too, as are ANA-30's checks of which credit the $100 is and
-of stored ACP `session_info_update` titles (`docs/ANA-30.md` §8 calls 2, 6). Open from ANA-29: **MOD-94** behind a maintainer decision.
+**Current status (2026-10-20):** **ANA-37 and ANA-38 are reconciled, and ANA-38's requirement edits
+are applied** (the "Reconciled" sections of `docs/decisions/ana/ana-37.md` and
+`docs/decisions/ana/ana-38.md`): one Qdrant for the whole database, run like Postgres, with one URL
+setting and one API key; a collection per workspace plus one global memory collection, unversioned while
+htui is in development, an indexer lease each; memory is "must" (`R-ENT-13`), automatic under
+`R-ID-6`'s memory exception, with verifications in code; no run queries Qdrant, and a near-duplicate
+score supersedes nothing until MOD-169 measures a threshold. **ANA-38 is concluded** (`docs/ANA-38.md`):
+verbatim memory entries (`fact`, `decision`, `gotcha`, `lesson`; project, workspace, global) written by
+the light model, freshness computed by code, a Postgres-only prompt section; spawned **MOD-163..169**.
+**ANA-37 is concluded** (`docs/ANA-37.md`): knowledge search is a required service failing open
+("knowledge search unavailable"), covering everything a workspace knows except code, one indexer under a
+Postgres lease; spawned **MOD-158..162**. Earlier completions, ANA-36 back to the 2026-10-14
+requirements audit, are in `DECISIONS.md`; the 2026-10-15 reviews are in
+`docs/requirements-review-2026-10-15.md` and `docs/ui-redesign-findings-2026-10-15.md`.
+Requirement edits still waiting for the maintainer: ANA-34's (`docs/ANA-34.md` §10, `R-TUI-9` final
+text and others; `R-ENT-8`'s and §10.11 already applied) and ANA-40's (`R-TUI-7` and others). Open
+from ANA-29: **MOD-94** behind a maintainer decision. **MOD-99** (hard-coded Sentry DSN in a public
+repo) owes key rotation and a history rewrite, after the live `hr` branches merge. Owed on the host: the
+Postgres gates on the merged tree (TOOL-8's included); the Windows runs (TOOL-14's `gate.ps1
+-SelfTest`, TOOL-8's `claude -p "/gate fmt"` and `.ps1` commands, TOOL-9's `.ps1` gate files);
+TOOL-8's `dev-health` docker path against the real `htui-postgres` (`docs/htui-dev.md`); MOD-93's live
+install and `tsc` on the mod; TOOL-10's real `scripts/hr up` and Docker bats case; ANA-30's checks of
+which credit the $100 is (Console) and of stored ACP `session_info_update` titles (`docs/ANA-30.md` §8
+calls 2, 6).
 Live coordinates after MOD-96: migrations run through `0018_seed_permission_mode` (MOD-96: data only, pins
 `acp.permission_mode` on the seeded `claude` row), before it `0017_follow_up` (`run_command.run_step_id`,
 `text`; `follow_up_window`; MOD-12's `0016_auto_queue`: `queue_entry`, `queue_batch`, `run.batch_id`), so **the next
@@ -440,7 +409,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   runs skipped); readiness and the "released" rule as "latest graph run `done`" (MOD-133 adds landed);
   `uq_run_item_live` and the `create_run` check; the new close-out law and `default_for` from the run's
   `graph_snapshot`; the orchestrator's 7 mirror calls dropped; store (Pg, Mem, cache), waiting
-  candidates and queue classification; Qdrant `htui_concepts_v3`; MCP enums; the prompt's upstream
+  candidates and queue classification; the Qdrant payload (no collection rename while htui is in
+  development: drop and reindex, MOD-159); MCP enums; the prompt's upstream
   word; the TUI status table, Backlog facet and grouping; fixtures and snapshots. The pre-flight count
   runs first, then §7.10 row 1's migration, unexplained `done`/`failed` rows included. Not blocked;
   MOD-135 lands after it or with it.
@@ -463,8 +433,9 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   prefix collision rule and qualified keys (`@shop:WS-1`); cross-workspace `propose_link`;
   `document.project_id` and nullable `item_id`, owner documents in the TUI;
   `workspace_box_path.folder_path` and its default; goals as a document; cache and the Backlog's
-  workspace group; search: `Owner::Document` points, the owner-document indexer pass, collection
-  `htui_concepts_v4`, MOD-112's workspace scope. The scope row owns the workspace's graphs as a project
+  workspace group; search: `Owner::Document` points and the owner-document indexer pass in MOD-159's
+  per-workspace collections (no `htui_concepts_v4` rename while htui is in development), MOD-112's
+  workspace scope. The scope row owns the workspace's graphs as a project
   does: coordinate with ANA-33's graph storage and owner scope (leased as MOD-137 on `hr/ANA-33`, not
   yet filed here). Blocked on MOD-146.
 - [ ] **MOD-148 - Per-type seeds and the type picker** (from ANA-35, `docs/ANA-35.md` §7.4, §7.2).
@@ -545,10 +516,10 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   (`RECORD_VERSION` bump); a line for entries left out names `search_concepts` only when the session is
   offered it (MOD-160), since agents find memory beyond the prompt through knowledge search only
   (`R-MCP-2`, no word-search fallback for memory). Ranking the section by Qdrant relevance to the item is
-  a later option, decided by MOD-169's measurement; until then the order is fixed. Requirement edits
-  owed: `R-ENT-13`'s final text (keeping its 2026-10-20 sentences on where memory is indexed),
-  `R-PRM-1`/`R-PRM-3`, CONCEPTS "Bounded context" (maintainer-gated, `docs/ANA-38.md` §7.3). Not blocked
-  for project scope; "must".
+  a later option, decided by MOD-169's measurement; until then the order is fixed. The TUI list is the
+  memory sub-tab of the Workspaces tab (`R-TUI-14`), global entries and the switches in Settings
+  (`R-TUI-8`). `R-ENT-13`, `R-PRM-1`/`R-PRM-3`, `R-ENT-12`, `R-TUI-8`, `R-TUI-14` and CONCEPTS are
+  amended (2026-10-20). Not blocked for project scope; "must".
 - [ ] **MOD-164 - Automatic memory capture at run end** (from ANA-38, `docs/ANA-38.md` §7.2 P2, §4.6).
   `R-ENT-13`, `R-ID-6`, `R-ID-7`, `R-ORCH-1`. An extraction turn by the light model (MOD-126) over the run's
   own evidence (errors seen, retries, fixes, measured wins) writing entries with no person's acceptance,
@@ -557,14 +528,14 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   in the run; automatic supersede at write time only on the same (scope, subject) key, with no
   full-text match and no Qdrant query in the run (near duplicates are MOD-167's, in the indexer);
   deterministic usage counters (entries injected, steps ended done or failed) for demotion; a per-run cost
-  budget and extraction skipped for runs with no error, retry or win. Needs the maintainer's `R-ID-6`
-  amendment (`docs/ANA-38.md` §7.3) before it is built. Blocked on MOD-163; workspace-owned entries need
+  budget and extraction skipped for runs with no error, retry or win. `R-ID-6`'s memory exception is
+  applied (2026-10-20). Blocked on MOD-163; workspace-owned entries need
   MOD-147; the coordinator seed reading entries needs MOD-136. "Must".
 - [ ] **MOD-165 - Lesson detector over run records** (from ANA-38, `docs/ANA-38.md` §7.2 P3). `R-ENT-13`,
   `R-ID-6`, `R-ORCH-11`. A deterministic detector over run records for repeated error signatures, retries,
   timeouts and outlier cost that triggers or feeds MOD-164's extraction. First task: verify what error and
   retry detail run records store today (not verified in ANA-38) and report before building. Blocked on
-  MOD-164. Later.
+  MOD-164. "Must" (`R-ENT-13`, 2026-10-20).
 - [ ] **MOD-166 - Memory freshness sweep, pins and re-validation** (from ANA-38, `docs/ANA-38.md` §7.2 P4).
   `R-ENT-13`, `R-ENT-15`, `R-ID-6`. A version-stamp suspect flag on cited rows (the `makes_suspect` /
   `reconfirm` pattern); an optional pin (repo, commit, cited paths or symbols, never lines) from the
@@ -573,7 +544,7 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   amends (new superseding version) or retires; auto-retire of an unresolved suspect entry after a
   configurable period (starting default 14 days); pin-as-trusted (exempt from auto-retire and usage
   demotion, still held back when suspect); a "why is this here" view. Blocked on MOD-163; the re-validation
-  turn needs MOD-164. Later.
+  turn needs MOD-164. "Must" (`R-ENT-13`, 2026-10-20).
 - [ ] **MOD-167 - Memory in Qdrant: point type and near-duplicate candidates** (from ANA-38,
   `docs/ANA-38.md` §7.2 P5; reconciled with ANA-37 on 2026-10-20). `R-STO-8`, `R-ENT-13`, `R-NF-2`. A
   memory point type (active entries; scope, kind and state in the payload; rebuilt when `version`
@@ -586,26 +557,29 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   visibility list and MOD-169. Nothing is superseded from a score (`R-ENT-13`, `R-STO-8`,
   `docs/ANA-37.md` §5.4) unless MOD-169 measures a usable threshold and the maintainer amends both; no run
   waits on Qdrant (`R-NF-2`), and there is no full-text fallback. Blocked on MOD-163, MOD-164 and
-  MOD-159; MOD-112 (4) for the tool's workspace scope. Later.
+  MOD-159; MOD-112 (4) for the tool's workspace scope. "Must" (`R-ENT-13`, 2026-10-20).
 - [ ] **MOD-168 - Global memory scope and automatic promotion** (from ANA-38, `docs/ANA-38.md` §7.2 P6).
   `R-ENT-13`, `R-PRM-1`, `R-ID-7`, `R-SEC-3`. A third hidden scope row (global), on the pattern of
   ANA-35's workspace scope row; an automatic promotion pipeline (a generalization check by the light model,
   then a deterministic validator that rejects project, workspace, path, host, URL and secret tokens and
   re-runs scrub; a failing entry keeps its scope; an agent never targets global directly); tool-version
   stamping so a global lesson goes suspect when the agent or CLI version changes; a small global prompt
-  section below project and workspace; the `R-PRM-1` clause that global tooling lessons are the one input
-  not bounded by the active workspace; the per-level promotion switch. Global entries are indexed in
+  section below project and workspace (`R-PRM-1` amended 2026-10-20: global memory is the one input
+  not bounded by the active workspace); the per-level promotion switch. Global entries are indexed in
   the global collection (MOD-159, MOD-167), never copied into a workspace's, and reach agents' search
   beside the workspace's (`R-MCP-1`, `R-MCP-2`, amended 2026-10-20). Build after MOD-169's first read on
-  MOD-163..167. Blocked on MOD-147 (scope row pattern), MOD-164 and MOD-166. Later.
+  MOD-163..167. Blocked on MOD-147 (scope row pattern), MOD-164 and MOD-166. "Must" (`R-ENT-13`,
+  2026-10-20); built after that first read.
 - [ ] **MOD-169 - Memory measurement on real htui steps** (from ANA-38, `docs/ANA-38.md` §7.2 P7).
   `R-ENT-13`, `R-STO-8`. Before/after on real steps, recall of known gotchas, harm from wrong or stale
   entries, light-model cost per run, validator recall for project-specific tokens; on MOD-162's harness,
   with `docs/ANA-37.md` §5.4's method (AUC; recall at zero false alarms, true duplicate entries against
   entries with none), the near-duplicate threshold that would let MOD-167 supersede from a score, and a
-  fixed-order against a Qdrant-ranked memory section (MOD-163's later option); decides whether
-  `R-ENT-13` stays "must" beyond MOD-163 and MOD-164 and feeds ANA-37's workspace-scale benchmark.
-  Blocked on MOD-163 and MOD-164; better after MOD-162, MOD-165 and MOD-167.
+  fixed-order against a Qdrant-ranked memory section (MOD-163's later option); tunes the starting
+  defaults (writes per run, scope caps, auto-retire period) and feeds ANA-37's workspace-scale
+  benchmark. `R-ENT-13` is "must" as a whole (2026-10-20), so this measures and tunes rather than
+  deciding whether memory stays. Blocked on MOD-163 and MOD-164; better after MOD-162, MOD-165 and
+  MOD-167.
 
 - [ ] **MOD-85 - Remaining accent (cyan) uses that do not mean focus or selection** (from MOD-80,
   `docs/decisions/mod/mod-80.md` "Carried"; blueprint B-6, review M1/L5). `R-TUI-1`. MOD-80 made
@@ -728,7 +702,9 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   keeps its registry row and does not read it. **Amended by ANA-33 (2026-10-18, `docs/ANA-33.md` §7.12):**
   the open choice is settled: "opt-in" means a seeded alternative graph per project (`feature-summary`,
   `bug-summary`) and a library workflow, each with a `summary` node after `review`, and no disabled-node flag (the
-  v2 model has none). It may land on today's linear model; MOD-137's edge backfill carries it. Not blocked.
+  v2 model has none). It may land on today's linear model; MOD-137's edge backfill carries it.
+  **ANA-38 (2026-10-20):** MOD-164's memory extraction turn is a run-end step before close-out, an
+  `R-ID-6` exception; close-out itself stays model-free. Not blocked.
 - [ ] **MOD-99 - Error-reporting endpoint from Settings; remove the hard-coded Sentry DSN** (from the
   2026-10-14 requirements audit). `R-NF-2`, `R-ID-7`, `R-ID-2`, `R-TUI-8`, `R-STO-1`. `body` in
   `crates/htui/src/main.rs:66-68` hard-codes a GlitchTip DSN and calls `sentry::init` on every start,
@@ -904,7 +880,9 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   `docs/ANA-37.md` §7.2, §7.3, §8 Q3-Q5; amended 2026-10-20, one Qdrant and a global collection).
   `R-STO-8`, `R-ENT-12`, `R-ENT-13`, `R-ENT-16`. In the one Qdrant (MOD-158): one collection per
   workspace, replacing `htui_concepts_v2`, and one global collection for global memory (MOD-168), never
-  copied into a workspace's; an indexer lease row in Postgres per collection (holder, box, expiry; taken
+  copied into a workspace's; collection names carry no version while htui is in development, so a
+  payload change (MOD-144, MOD-147, MOD-167) drops and reindexes instead of renaming (by maintainer
+  decision, 2026-10-20); an indexer lease row in Postgres per collection (holder, box, expiry; taken
   when free or expired, renewed each beat on the run lease's TTLs; renewed before each delete batch,
   orphans confirmed absent in the same pass; worker or TUI, one lease per collection a process serves);
   the run records the workspace it was queued from; a 60 s incremental cycle (timestamps with the cache
@@ -1281,6 +1259,6 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 6 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-39 mandatory context tools, ANA-41 project workflows, ANA-42 execution targets) |
-| MOD-N   | 91 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-144 item status reduction, MOD-145 folder repos and repo-less runs, MOD-146 project types, MOD-147 workspace scope, MOD-148 per-type seeds, MOD-149 workspace requirement keys, MOD-150 link kinds, MOD-151 tool guidance, MOD-152 async commands and logs, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-158 workspace Qdrant setting and key, MOD-159 knowledge indexer, MOD-160 knowledge search fail-open, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-163 memory entry store, MOD-164 automatic memory capture, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-115 TUI shell, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-137 step graph v2 storage, MOD-138 snapshot v2 and walker, MOD-139 divided fan-out runtime, MOD-140 planner tools and run-time changes, MOD-141 step-graph editor, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
+| MOD-N   | 91 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-144 item status reduction, MOD-145 folder repos and repo-less runs, MOD-146 project types, MOD-147 workspace scope, MOD-148 per-type seeds, MOD-149 workspace requirement keys, MOD-150 link kinds, MOD-151 tool guidance, MOD-152 async commands and logs, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-158 Qdrant setting and key, MOD-159 knowledge indexer, MOD-160 knowledge search fail-open, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-163 memory entry store, MOD-164 automatic memory capture, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-115 TUI shell, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-137 step graph v2 storage, MOD-138 snapshot v2 and walker, MOD-139 divided fan-out runtime, MOD-140 planner tools and run-time changes, MOD-141 step-graph editor, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
 | CLEAN-N | 0 |
 | TOOL-N  | 2 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check) |

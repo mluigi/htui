@@ -122,6 +122,9 @@ enforcement point in this design.
    document, never a status or a row.
    *Amended by ANA-33, 2026-10-18 (`docs/ANA-33.md` §7.5):* the planner's plan and the integrate agent's
    merge are item work, admitted and checked by code, not exceptions.
+   *Amended by ANA-38, 2026-10-20 (`docs/decisions/ana/ana-38.md`, `R-ID-6`):* memory writes by the
+   light model are an explicit exception to "no agent in a bookkeeping path". The extraction turn is a
+   run-end step before close-out; the close-out formatter itself stays model-free.
 4. **`htui` writes no files into a managed repository.** Worktrees and copies are created under a
    box-local scratch root outside every `repo_box_path` (`R-ID-4`). Enforced by `run_step_tree.path`
    being validated against every known `repo_box_path` prefix before creation, and by the

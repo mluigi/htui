@@ -89,6 +89,12 @@ R-TUI-8 (one Qdrant for the whole database, its URL a database-wide setting and 
 collection per workspace and one global collection, one indexer lease each), R-ENT-13 (where memory is
 indexed; no entry superseded from a score), R-MCP-1 and R-MCP-2 (memory entries, global ones included,
 in agents' read scope and knowledge search).
+amended 2026-10-20 by maintainer decision on ANA-38 (`docs/ANA-38.md` §7.3, `docs/decisions/ana/ana-38.md`) —
+R-ENT-13 settled as a must (automatic memory with verifications in code: kinds, scopes including
+global, states, freshness, promotion, visibility); amended in place: R-ID-6 (the memory exception, the
+light model's third use), R-ENT-12 (a global owner for memory), R-PRM-1 and R-PRM-3 (memory in the
+prompt and its place in the keep order), R-TUI-8 (memory switches and global entries in Settings) and
+R-TUI-14 (a memory sub-tab per workspace and project).
 amended 2026-10-18 by maintainer decision on MOD-115 milestone 2
 (`.claude/plans/mod-115-tui-shell-m2.plan.md` MD1-MD8, `docs/decisions/mod/mod-115-decisions.md`) —
 R-TUI-10 amended in place (every key bound to a named action and rebindable, only a printable
@@ -152,7 +158,14 @@ conflict. Their verdicts survive only where restated here.
   transitions it causes stay deterministic. The light model (R-ORCH-1) that picks a run's workflow
   and rewrites a new item's or requirement's draft (R-TUI-17) is outside it too: one is item work,
   the other a draft a person accepts. One configurable light model serves both, which partly
-  reverses ANA-30's rejection of a single `utility_model` setting. Amended 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`).
+  reverses ANA-30's rejection of a single `utility_model` setting. Exception (ANA-38): a memory entry
+  (R-ENT-13) is written by that same light model, its third use, without a person's acceptance,
+  through a deterministic write path (schema-validated, capped per run, scrubbed per R-ID-7,
+  provenance stamped by the platform, evidence drawn from the run). An active entry may reach a
+  prompt, the index and the coordinator seed. Nothing else changes: no status transition, link,
+  import or cache refresh reads model text, and an entry's state, supersede key, freshness and
+  selection are decided by code. Amended 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`)
+  and 2026-10-20 (ANA-38, the memory exception).
 - **R-ID-7 (must).** Anything persisted or sent off the box — transcripts, tool output, logs,
   telemetry, error reports, the cache — is scrubbed of secrets on the host box first. Scrubbing fails
   closed. A binary attachment a person adds is the one exception: it is stored as given, marked
@@ -292,18 +305,36 @@ conflict. Their verdicts survive only where restated here.
   versions may carry attachments (images, logs, other files), held in Postgres in version one under a
   size cap, 10 MiB by default and never above 64 MiB (an object store is R-LATER-10). Text attachments
   are scrubbed (R-ID-7); a binary attachment is accepted only from a person, who is told it is stored
-  as given. Amended 2026-10-15 and 2026-10-18 (ANA-35, attachment owners, cap and scrubbing).
-- **R-ENT-13 (reopened, pending ANA-38).** Project and workspace memory: facts, decisions and gotchas
-  that outlive one item, for the coordinator (R-ORCH-14) and for agents. ANA-1's atomic facts table with
-  importance scores (`artifact`, `artifact_link`) was withdrawn as over-engineered on 2026-09-03;
-  reopened 2026-10-15 by maintainer decision. ANA-38 settles who writes it, how it stays fresh, how it
-  meets R-ID-6, and its integration with semantic search (R-STO-8). Memory entries are indexed in
+  as given. A memory entry kept as a document may also be owned by the global scope (R-ENT-13), a
+  hidden scope row on the workspace scope row's pattern. Amended 2026-10-15, 2026-10-18 (ANA-35,
+  attachment owners, cap and scrubbing) and 2026-10-20 (ANA-38, the global owner).
+- **R-ENT-13 (must).** Memory: verbatim entries that outlive one item, read by the coordinator
+  (R-ORCH-14) and by agents. An entry has a subject, prose, a kind (`fact`, `decision`, `gotcha`, or
+  `lesson`: a recurring error, an optimization already done, a way to use the tools better), an owner
+  scope (a project, a workspace, or the global scope for lessons and gotchas that apply in any project),
+  a state (`active`, `suspect`, `superseded`, `retired`) and a freshness stamp. Memory is automatic: the
+  light model (R-ORCH-1) writes entries at the end of a run, fed by a deterministic lesson detector over
+  run records, and they become active with no person's acceptance (R-ID-6). Verifications in code take
+  the place of a person's gate: schema validation, a per-run write cap, scrubbing before persist
+  (R-ID-7), provenance stamped by the platform, and evidence that must cite something observed in the
+  run. Freshness is computed by code, never a model: a version stamp on the rows an entry cites and, for
+  git projects, an optional pin of commit and paths, checked by a sweep. A suspect entry is held back
+  from prompts until an automatic re-validation re-confirms, amends or retires it, and retires on its
+  own after a configurable period; usage counters demote entries whose steps fail. An entry reaches
+  global scope only through a generalization check and a validator that rejects project, workspace,
+  path, host, URL and secret text; a global entry goes suspect when the agent or CLI version it was
+  learned on changes. A person sees, edits, retires and pins entries, and can turn capture and global
+  promotion off per level (R-TUI-8, R-TUI-14). No importance scores, fact-to-fact links or recursive
+  injection: ANA-1's `artifact` tables stay withdrawn. Product memory is separate from the development
+  workflow's own memory files. Memory entries are indexed in
   knowledge search (R-STO-8): project and workspace entries in their workspace's collection, global
   entries (ANA-38) in the global collection. Agents find entries beyond their prompt through that search
   only. Memory reaches a prompt without it, so an outage of the Qdrant never empties a prompt (R-NF-2,
   ANA-37). An entry is superseded automatically only by a newer entry with the same scope and subject;
   a near duplicate found by search is recorded as a candidate, never superseded from a score (R-STO-8).
-  Amended 2026-10-20 (ANA-37 and ANA-38 reconciled).
+  Withdrawn 2026-09-03 as over-engineered; reopened 2026-10-15 by maintainer decision; settled by
+  maintainer decision on ANA-38, 2026-10-20 (`docs/ANA-38.md`, `docs/decisions/ana/ana-38.md`), with
+  ANA-37's indexing (2026-10-19) and the two reconciled (2026-10-20).
 - **R-ENT-14 (must).** `requirement`: key `R-<AREA>-<N>` minted per owner and area, never reused;
   the owner is a project or a workspace. It has body, rationale, priority `must`/`later`, state
   `active`/`withdrawn`, and a `version` with revisions naming the deciding item. Text changes only by
@@ -570,16 +601,22 @@ conflict. Their verdicts survive only where restated here.
 - **R-PRM-1 (must).** Each step receives one self-contained initial prompt built by `htui`:
   phase template, item body, input documents from prior steps, summaries of upstream items reached
   by `blocked_by` and `origin` edges within one to two hops and inside the active workspace (or
-  current project when no workspace), box profile, bound skill text, and any `htui`-selected file
-  excerpts. Never raw transcripts of other items. Beyond this prompt, an agent can pull more context
-  itself through `htui`'s MCP read tools (R-MCP-2). Amended 2026-10-15.
+  current project when no workspace), box profile, bound skill text, active non-suspect memory entries
+  of the project, its workspace and the global scope (R-ENT-13), each scope under its own cap, chosen
+  by code in a fixed order and snapshotted at run start, and any `htui`-selected file excerpts. Global
+  memory is the one input not bounded by the active workspace. Memory is rendered as quoted data
+  labelled with its source and trust, not as instructions. Never raw transcripts of other items.
+  Beyond this prompt, an agent can pull more context itself through `htui`'s MCP read tools and
+  knowledge search (R-MCP-2). Amended 2026-10-15 and 2026-10-20 (ANA-38, memory).
 - **R-PRM-2 (must).** Upstream items outside the active workspace appear as one-line status stubs.
 - **R-PRM-3 (must).** Per-step token budget. When the inputs exceed it, they are kept in a fixed
   priority order: the template and skills are never cut (a step whose template and skills alone
-  exceed the budget is refused), then the item body, prior documents, upstream summaries and
-  excerpts, the last cut first. The trim is recorded on the step. In manual mode, before a step
-  starts trimmed, `htui` says so and lets the user raise the budget. Amended 2026-10-15 (reworded as
-  a keep order, as ANA-5 §4.4 implements it; budget raise added).
+  exceed the budget is refused), then the item body, prior documents, upstream summaries, memory
+  (R-PRM-1; global memory cut before project and workspace memory) and excerpts, the last cut first.
+  The trim, with the memory entries and versions kept, is recorded on the step. In manual mode, before
+  a step starts trimmed, `htui` says so and lets the user raise the budget. Amended 2026-10-15
+  (reworded as a keep order, as ANA-5 §4.4 implements it; budget raise added) and 2026-10-20 (ANA-38,
+  memory).
 - **R-PRM-4 (must).** Prompt templates per phase are versioned rows in Postgres,
   with a documented placeholder contract, editable in the TUI. Templates form a library shared
   across projects and workspaces, with per-project overrides. Amended 2026-10-15. The library is a
@@ -726,11 +763,14 @@ conflict. Their verdicts survive only where restated here.
   the agent's run-time workflow changes apply on their own or ask first; the default workflow), the
   component catalogue (R-ENT-17), and the Qdrant (its URL, one setting stored in Postgres for the whole
   database; a masked field for this box's API key, stored in the keyring; the state of the last attempt;
-  a warning when none is configured; R-STO-8, R-NF-2); the connection section is named Postgres. Workspaces live in
+  a warning when none is configured; R-STO-8, R-NF-2), and memory (R-ENT-13: switches for automatic
+  capture and for global promotion, on by default, which a workspace and a project may override, and
+  the global entries with edit, retire, pin and "why is this here"); the connection section is named
+  Postgres. Workspaces live in
   their own tab (R-TUI-14) and the Backlog's grouping and done items are Backlog keys (R-TUI-2). A field
   edits on its row with its help beneath; arrows change a choice or a toggle, saved at once. Amended
   2026-10-15, 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`), 2026-10-19 (ANA-37) and
-  2026-10-20 (one Qdrant for the database).
+  2026-10-20 (one Qdrant for the database; ANA-38, memory).
 - **R-TUI-9 (must).** Close-out writes the final summary document, sets status, records commit
   hashes from the run. No markdown files are produced. The coordinator (R-ORCH-14) runs close-out
   and its checklist — follow-up items, re-confirming suspect citations, choosing the resolution —
@@ -785,9 +825,11 @@ conflict. Their verdicts survive only where restated here.
   sends the current one to the background without interrupting its runs; stopping and resuming
   runs follow R-ORCH-16. Sub-tabs, per workspace and per project: overview (state, folder,
   description, goals, projects, components, default target), components (R-ENT-17: a table, the
-  generated compose file, start and stop, each project's use) and requirements (R-ENT-14, R-ENT-15:
+  generated compose file, start and stop, each project's use), requirements (R-ENT-14, R-ENT-15:
   a tree with nesting, each covering item and linked requirement a selectable row that jumps there,
-  and a graph view). New workspaces (with their folder), projects (from a folder, a git URL or a new
+  and a graph view) and memory (R-ENT-13: the scope's entries, recent automatic ones first, with
+  their state, edit, retire, pin and a "why is this here" view of provenance, evidence and the runs
+  they reached; amended 2026-10-20, ANA-38). New workspaces (with their folder), projects (from a folder, a git URL or a new
   repo), components (a wizard over the catalogue) and requirements (R-TUI-17) are created here.
   Added by maintainer decision, 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`); MOD-116, MOD-117, MOD-118.
 - **R-TUI-15 (must).** Logs tab: `htui`'s own log, sources on the left with line and warning counts,
