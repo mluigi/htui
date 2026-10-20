@@ -25,10 +25,11 @@ use htui_core::model::{
     RequirementRevision, RequirementSpec, RequirementState, Resolution, ResolvedGraph,
     ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
     RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillBinding,
-    SkillBindingId, SkillBindingKey, SkillId, SkillVersion, Status, StepGraph, StepGraphId,
+    SkillBindingId, SkillBindingKey, SkillId, SkillVersion, Split, Status, StepGraph, StepGraphId,
     StepGraphPhase, StepId, StepStatus, ToolCallCount, UpstreamEntry, UserId, VerifyOutcome,
     WaitingCandidate, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspaceProject, WorkspaceSummary,
 };
+use htui_core::model::{GraphScope, PlanScope};
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{ReadStore, Result, SettingRung, StoreError, StoredSetting};
 use serde_json::Value;
@@ -2779,16 +2780,18 @@ impl PgStore {
     /// Whatever the driver reports, through [`map_sqlx`].
     pub(crate) async fn step_graph_row(&self, id: StepGraphId) -> Result<Option<StepGraph>> {
         sqlx::query_as!(
-            StepGraph,
+            StepGraphRow,
             r#"
-            SELECT id         AS "id: StepGraphId",
-                   project_id AS "project_id: ProjectId",
+            SELECT id           AS "id: StepGraphId",
+                   project_id   AS "project_id: ProjectId",
+                   workspace_id AS "workspace_id: WorkspaceId",
                    name,
                    description,
                    -- Inserted between `description` and `created_at`, never appended:
                    -- `is_override` sits mid-struct and `query_as!` binds positionally, so an
                    -- appended column would map `created_at` onto it and type-check (T1 audit A-4).
                    is_override,
+                   revision,
                    created_at,
                    updated_at
               FROM step_graph WHERE id = $1
@@ -2797,7 +2800,9 @@ impl PgStore {
         )
         .fetch_optional(&self.pool)
         .await
-        .map_err(map_sqlx)
+        .map_err(map_sqlx)?
+        .map(StepGraph::try_from)
+        .transpose()
     }
 
     /// One `step_graph_phase` row by id, for [`repo_row`](PgStore::repo_row)'s reason.
@@ -2826,6 +2831,16 @@ impl PgStore {
                    template_version,
                    token_budget,
                    persona_id       AS "persona_id: PersonaId",
+                   split                AS "split: Split",
+                   palette,
+                   plan_scope           AS "plan_scope: PlanScope",
+                   planner_persona_id   AS "planner_persona_id: PersonaId",
+                   planner_agent_id     AS "planner_agent_id: AgentId",
+                   planner_model,
+                   integrate_persona_id AS "integrate_persona_id: PersonaId",
+                   integrate_agent_id   AS "integrate_agent_id: AgentId",
+                   integrate_model,
+                   max_parts,
                    updated_at
               FROM step_graph_phase WHERE id = $1
             "#,
@@ -2923,16 +2938,18 @@ impl PgStore {
     /// Whatever the driver reports, through [`map_sqlx`].
     pub(crate) async fn step_graph_rows(&self, project: ProjectId) -> Result<Vec<StepGraph>> {
         sqlx::query_as!(
-            StepGraph,
+            StepGraphRow,
             r#"
-            SELECT id         AS "id: StepGraphId",
-                   project_id AS "project_id: ProjectId",
+            SELECT id           AS "id: StepGraphId",
+                   project_id   AS "project_id: ProjectId",
+                   workspace_id AS "workspace_id: WorkspaceId",
                    name,
                    description,
                    -- Inserted between `description` and `created_at`, never appended:
                    -- `is_override` sits mid-struct and `query_as!` binds positionally, so an
                    -- appended column would map `created_at` onto it and type-check (T1 audit A-4).
                    is_override,
+                   revision,
                    created_at,
                    updated_at
               FROM step_graph
@@ -2943,7 +2960,10 @@ impl PgStore {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(map_sqlx)
+        .map_err(map_sqlx)?
+        .into_iter()
+        .map(StepGraph::try_from)
+        .collect()
     }
 
     /// A graph's phases, ordered by `position`, which is unique per graph.
@@ -2972,6 +2992,16 @@ impl PgStore {
                    template_version,
                    token_budget,
                    persona_id       AS "persona_id: PersonaId",
+                   split                AS "split: Split",
+                   palette,
+                   plan_scope           AS "plan_scope: PlanScope",
+                   planner_persona_id   AS "planner_persona_id: PersonaId",
+                   planner_agent_id     AS "planner_agent_id: AgentId",
+                   planner_model,
+                   integrate_persona_id AS "integrate_persona_id: PersonaId",
+                   integrate_agent_id   AS "integrate_agent_id: AgentId",
+                   integrate_model,
+                   max_parts,
                    updated_at
               FROM step_graph_phase
              WHERE graph_id = $1
@@ -3290,6 +3320,44 @@ impl PgStore {
                 }))
             }
         }
+    }
+}
+
+/// `step_graph` as Postgres hands it over (MOD-137 D3, blueprint F13): the two owner columns,
+/// folded into [`GraphScope`] by `TryFrom`. Field order is the SELECT order.
+pub(crate) struct StepGraphRow {
+    pub(crate) id: StepGraphId,
+    pub(crate) project_id: Option<ProjectId>,
+    pub(crate) workspace_id: Option<WorkspaceId>,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) is_override: bool,
+    pub(crate) revision: i64,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) updated_at: DateTime<Utc>,
+}
+
+impl TryFrom<StepGraphRow> for StepGraph {
+    type Error = StoreError;
+
+    fn try_from(row: StepGraphRow) -> Result<Self> {
+        let scope =
+            GraphScope::from_columns(row.project_id, row.workspace_id).ok_or_else(|| {
+                StoreError::Backend(format!(
+                    "step_graph `{}` has both project_id and workspace_id (ck_step_graph_owner)",
+                    row.id
+                ))
+            })?;
+        Ok(Self {
+            id: row.id,
+            scope,
+            name: row.name,
+            description: row.description,
+            is_override: row.is_override,
+            revision: row.revision,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })
     }
 }
 

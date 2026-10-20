@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id               AS \"id: PhaseId\",\n                   graph_id         AS \"graph_id: StepGraphId\",\n                   position,\n                   name,\n                   fan_out,\n                   gate             AS \"gate: Gate\",\n                   gate_hard,\n                   retry_limit,\n                   input_kinds,\n                   output_kind,\n                   isolation        AS \"isolation: Isolation\",\n                   command_queue    AS \"command_queue: CommandQueue\",\n                   verify_command,\n                   template_name,\n                   template_version,\n                   token_budget,\n                   persona_id       AS \"persona_id: PersonaId\",\n                   updated_at\n              FROM step_graph_phase\n             WHERE graph_id = $1\n             ORDER BY position\n            ",
+  "query": "\n            SELECT id               AS \"id: PhaseId\",\n                   graph_id         AS \"graph_id: StepGraphId\",\n                   position,\n                   name,\n                   fan_out,\n                   gate             AS \"gate: Gate\",\n                   gate_hard,\n                   retry_limit,\n                   input_kinds,\n                   output_kind,\n                   isolation        AS \"isolation: Isolation\",\n                   command_queue    AS \"command_queue: CommandQueue\",\n                   verify_command,\n                   template_name,\n                   template_version,\n                   token_budget,\n                   persona_id       AS \"persona_id: PersonaId\",\n                   split                AS \"split: Split\",\n                   palette,\n                   plan_scope           AS \"plan_scope: PlanScope\",\n                   planner_persona_id   AS \"planner_persona_id: PersonaId\",\n                   planner_agent_id     AS \"planner_agent_id: AgentId\",\n                   planner_model,\n                   integrate_persona_id AS \"integrate_persona_id: PersonaId\",\n                   integrate_agent_id   AS \"integrate_agent_id: AgentId\",\n                   integrate_model,\n                   max_parts,\n                   updated_at\n              FROM step_graph_phase WHERE id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -192,6 +192,116 @@
       },
       {
         "ordinal": 17,
+        "name": "split: Split",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "split"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "palette",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "palette"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "plan_scope: PlanScope",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "plan_scope"
+          }
+        }
+      },
+      {
+        "ordinal": 20,
+        "name": "planner_persona_id: PersonaId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "planner_persona_id"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "planner_agent_id: AgentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "planner_agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 22,
+        "name": "planner_model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "planner_model"
+          }
+        }
+      },
+      {
+        "ordinal": 23,
+        "name": "integrate_persona_id: PersonaId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "integrate_persona_id"
+          }
+        }
+      },
+      {
+        "ordinal": 24,
+        "name": "integrate_agent_id: AgentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "integrate_agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 25,
+        "name": "integrate_model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "integrate_model"
+          }
+        }
+      },
+      {
+        "ordinal": 26,
+        "name": "max_parts",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "max_parts"
+          }
+        }
+      },
+      {
+        "ordinal": 27,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -225,8 +335,18 @@
       true,
       true,
       true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
       false
     ]
   },
-  "hash": "6e954b5f2a4de555515e062f9eb54c44c5fd3dd01e9274ff187d372cdf83a05f"
+  "hash": "eb8ed105453b0bb43d0cc8ac3ce3c6370edade5b2de3defad2ea88b5d75f1b0d"
 }

@@ -21,6 +21,7 @@ use htui_agent::driver::AgentSessionRef;
 use htui_agent::driver::{PermissionMatch, PermissionPolicy, PermissionRule, SessionSpec};
 use htui_agent::event::PermissionOptionKind;
 use htui_core::fixtures::ids;
+use htui_core::model::GraphScope;
 use htui_core::model::kind::HEAVY_COMMAND_PREFIXES;
 use htui_core::model::{
     AgentBox, AgentId, BatchId, Billing, CommandRun, CommandRunStatus, DocumentId, EventKind, Gate,
@@ -1210,7 +1211,7 @@ async fn repoint<O: Orchestrate>(orch: &O, item: ItemId, mutate: impl Fn(&mut St
         .store()
         .create_step_graph(NewStepGraph {
             id: StepGraphId::new(),
-            project_id: row.project_id,
+            scope: GraphScope::Project(row.project_id),
             name: format!("{}-edited", row.key),
             description: "a conformance case's edit of the live graph".to_owned(),
             is_override: false,
@@ -1224,6 +1225,14 @@ async fn repoint<O: Orchestrate>(orch: &O, item: ItemId, mutate: impl Fn(&mut St
             ..phase.phase.clone()
         };
         mutate(&mut edited);
+        // ck_phase_split_fan_out (MOD-137 D7): `split` follows the edited `fan_out`.
+        if edited.split != htui_core::model::Split::Divide {
+            edited.split = if edited.fan_out > 1 {
+                htui_core::model::Split::Compete
+            } else {
+                htui_core::model::Split::None
+            };
+        }
         orch.store()
             .create_phase(&edited)
             .await
@@ -1271,7 +1280,7 @@ async fn insert_verify_phase<O: Orchestrate>(orch: &O, item: ItemId) {
         .store()
         .create_step_graph(NewStepGraph {
             id: StepGraphId::new(),
-            project_id: row.project_id,
+            scope: GraphScope::Project(row.project_id),
             name: format!("{}-with-verify", row.key),
             description: "an intermediate position between implement and review".to_owned(),
             is_override: false,
@@ -1293,6 +1302,14 @@ async fn insert_verify_phase<O: Orchestrate>(orch: &O, item: ItemId) {
         };
         if edited.position > implement {
             edited.position += 1;
+        }
+        // ck_phase_split_fan_out (MOD-137 D7): `split` follows the edited `fan_out`.
+        if edited.split != htui_core::model::Split::Divide {
+            edited.split = if edited.fan_out > 1 {
+                htui_core::model::Split::Compete
+            } else {
+                htui_core::model::Split::None
+            };
         }
         orch.store()
             .create_phase(&edited)

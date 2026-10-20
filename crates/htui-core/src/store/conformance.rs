@@ -40,6 +40,7 @@ use crate::model::{
     WaitingPermission, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
     WorkspaceStop, canonical_declared_tags, executor_scrub_refusal, missing_tags_failure,
 };
+use crate::model::{GraphScope, Split};
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
 use crate::secret::{INFISICAL, SecretScope, project_scope};
@@ -2767,6 +2768,16 @@ fn new_phase(graph: StepGraphId, position: i32, name: &str) -> StepGraphPhase {
         template_version: None,
         token_budget: None,
         persona_id: None,
+        split: Split::None,
+        palette: false,
+        plan_scope: None,
+        planner_persona_id: None,
+        planner_agent_id: None,
+        planner_model: None,
+        integrate_persona_id: None,
+        integrate_agent_id: None,
+        integrate_model: None,
+        max_parts: None,
         updated_at: Utc::now(),
     }
 }
@@ -3465,7 +3476,8 @@ async fn project_create_seeds_the_catalogue<S: WriteStore>(store: &S) {
     );
     for graph in &graphs {
         assert_eq!(
-            graph.project_id, p,
+            graph.scope,
+            GraphScope::Project(p),
             "{CASE}: `{}` is the new project's (a)",
             graph.name
         );
@@ -4123,7 +4135,7 @@ async fn step_graph_and_phase_round_trip<S: WriteStore>(store: &S) {
     let graph = store
         .create_step_graph(NewStepGraph {
             id: StepGraphId::new(),
-            project_id: ids::PROJECT_HTUI,
+            scope: GraphScope::Project(ids::PROJECT_HTUI),
             name: "release".to_owned(),
             description: "Cut a release".to_owned(),
             is_override: false,
@@ -4134,7 +4146,7 @@ async fn step_graph_and_phase_round_trip<S: WriteStore>(store: &S) {
     let duplicate = store
         .create_step_graph(NewStepGraph {
             id: StepGraphId::new(),
-            project_id: ids::PROJECT_HTUI,
+            scope: GraphScope::Project(ids::PROJECT_HTUI),
             name: "analysis".to_owned(),
             description: String::new(),
             is_override: false,
@@ -4372,7 +4384,7 @@ async fn step_graph_and_phase_round_trip<S: WriteStore>(store: &S) {
     let marked = store
         .create_step_graph(NewStepGraph {
             id: StepGraphId::new(),
-            project_id: ids::PROJECT_HTUI,
+            scope: GraphScope::Project(ids::PROJECT_HTUI),
             name: "release-override".to_owned(),
             description: String::new(),
             is_override: true,
@@ -19044,7 +19056,7 @@ async fn a_bound_persona_is_not_deleted_and_names_its_phases<S: WriteStore>(stor
     let graph = store
         .create_step_graph(NewStepGraph {
             id: StepGraphId::new(),
-            project_id: ids::PROJECT_HTUI,
+            scope: GraphScope::Project(ids::PROJECT_HTUI),
             name: "HTUI-3-override".to_owned(),
             description: String::new(),
             is_override: true,

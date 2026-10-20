@@ -425,14 +425,18 @@ pub struct GraphBody {
 pub struct StepGraph {
     /// `step_graph.id`.
     pub id: StepGraphId,
-    /// `step_graph.project_id`.
-    pub project_id: ProjectId,
-    /// `step_graph.name`, unique within the project.
+    /// `step_graph.project_id` / `workspace_id` (MOD-137 D3). Replaces `project_id`.
+    pub scope: GraphScope,
+    /// `step_graph.name`, unique within its scope.
     pub name: String,
     /// `step_graph.description`.
     pub description: String,
     /// `step_graph.is_override` (ANA-2 §4.1): a per-item clone, hidden from the graph list.
     pub is_override: bool,
+    /// `step_graph.revision` (MOD-137 D5): bumped by every write to the graph's content; the
+    /// CAS token of `replace_graph`. 0 on a fresh graph.
+    #[serde(default)]
+    pub revision: i64,
     /// `step_graph.created_at`.
     pub created_at: DateTime<Utc>,
     /// `step_graph.updated_at`.
@@ -445,9 +449,10 @@ pub struct StepGraph {
 pub struct NewStepGraph {
     /// `step_graph.id`, minted client-side as a UUIDv7.
     pub id: StepGraphId,
-    /// `step_graph.project_id`.
-    pub project_id: ProjectId,
-    /// `step_graph.name`, unique within the project.
+    /// `step_graph.project_id` / `workspace_id` (MOD-137 D3); an override (`is_override`) must
+    /// be `Project` (`ck_step_graph_override_in_project`).
+    pub scope: GraphScope,
+    /// `step_graph.name`, unique within its scope.
     pub name: String,
     /// `step_graph.description`.
     pub description: String,
@@ -507,6 +512,37 @@ pub struct StepGraphPhase {
     /// none. Frozen by name and content into a run's snapshot at `StartRun` (D9).
     #[serde(default)]
     pub persona_id: Option<PersonaId>,
+    /// `step_graph_phase.split` (MOD-137 D7).
+    #[serde(default)]
+    pub split: Split,
+    /// `step_graph_phase.palette` (D7): a planner may instantiate it; the walk never reaches it;
+    /// it has no edges.
+    #[serde(default)]
+    pub palette: bool,
+    /// `step_graph_phase.plan_scope` (D7); `None` off a planner node.
+    #[serde(default)]
+    pub plan_scope: Option<PlanScope>,
+    /// `step_graph_phase.planner_persona_id` (D7); `divide` only.
+    #[serde(default)]
+    pub planner_persona_id: Option<PersonaId>,
+    /// `step_graph_phase.planner_agent_id` (D7); `divide` only.
+    #[serde(default)]
+    pub planner_agent_id: Option<AgentId>,
+    /// `step_graph_phase.planner_model` (D7); `divide` only.
+    #[serde(default)]
+    pub planner_model: Option<String>,
+    /// `step_graph_phase.integrate_persona_id` (D7); `divide` only.
+    #[serde(default)]
+    pub integrate_persona_id: Option<PersonaId>,
+    /// `step_graph_phase.integrate_agent_id` (D7); `divide` only.
+    #[serde(default)]
+    pub integrate_agent_id: Option<AgentId>,
+    /// `step_graph_phase.integrate_model` (D7); `divide` only.
+    #[serde(default)]
+    pub integrate_model: Option<String>,
+    /// `step_graph_phase.max_parts` (D7); `divide` only, `>= 1`.
+    #[serde(default)]
+    pub max_parts: Option<i32>,
     /// `step_graph_phase.updated_at`.
     pub updated_at: DateTime<Utc>,
 }
@@ -695,7 +731,7 @@ mod tests {
 
     use super::{
         CommandQueue, EdgeKind, GraphScope, HEAVY_BUILD_TAG, HEAVY_COMMAND_PREFIXES, ItemKind,
-        PhasePatch, PromptTemplate, Split, command_limit, command_queue_exposed,
+        PhasePatch, PromptTemplate, Split, StepGraphPhase, command_limit, command_queue_exposed,
         resolve_command_limits,
     };
     use crate::model::ids::{PersonaId, ProjectId, WorkspaceId};
@@ -983,6 +1019,42 @@ mod tests {
     #[test]
     fn split_defaults_to_none() {
         assert_eq!(Split::default(), Split::None);
+    }
+
+    /// MOD-137 D7: a phase serialised before the ten v2 keys existed decodes with their defaults.
+    #[test]
+    fn a_v1_phase_json_decodes_with_v2_defaults() {
+        let v1 = json!({
+            "id": "0190a000-0000-7000-8000-000000000001",
+            "graph_id": "0190a000-0000-7000-8000-000000000002",
+            "position": 0,
+            "name": "implement",
+            "fan_out": 1,
+            "gate": "never",
+            "gate_hard": false,
+            "retry_limit": 2,
+            "input_kinds": [],
+            "output_kind": "diff",
+            "isolation": null,
+            "command_queue": "off",
+            "verify_command": null,
+            "template_name": "implement",
+            "template_version": null,
+            "token_budget": null,
+            "updated_at": "2026-10-21T00:00:00Z",
+        });
+        let phase: StepGraphPhase = serde_json::from_value(v1).expect("a v1 phase decodes");
+        assert_eq!(phase.persona_id, None);
+        assert_eq!(phase.split, Split::None);
+        assert!(!phase.palette);
+        assert_eq!(phase.plan_scope, None);
+        assert_eq!(phase.planner_persona_id, None);
+        assert_eq!(phase.planner_agent_id, None);
+        assert_eq!(phase.planner_model, None);
+        assert_eq!(phase.integrate_persona_id, None);
+        assert_eq!(phase.integrate_agent_id, None);
+        assert_eq!(phase.integrate_model, None);
+        assert_eq!(phase.max_parts, None);
     }
 
     /// MOD-137 D6: `ck_step_graph_edge_predicate` and `ck_step_graph_edge_loop_limit_required`.

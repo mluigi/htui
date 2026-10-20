@@ -53,7 +53,7 @@ async fn feature_with_verify_snapshot_matches() {
         .store
         .create_step_graph(NewStepGraph {
             id: clone_id,
-            project_id: item.project_id,
+            scope: htui_core::model::GraphScope::Project(item.project_id),
             name: "feature-with-verify".to_owned(),
             description: "intermediate verify phase".to_owned(),
             is_override: false,

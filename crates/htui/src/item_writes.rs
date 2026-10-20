@@ -508,7 +508,7 @@ mod tests {
         let clone = store
             .create_step_graph(NewStepGraph {
                 id: StepGraphId::new(),
-                project_id: ids::PROJECT_HTUI,
+                scope: htui_core::model::GraphScope::Project(ids::PROJECT_HTUI),
                 name: "ANA-2 override".to_owned(),
                 description: String::new(),
                 is_override: true,
@@ -742,7 +742,7 @@ mod tests {
         let graph = store
             .create_step_graph(NewStepGraph {
                 id: StepGraphId::new(),
-                project_id: ids::PROJECT_HTUI,
+                scope: htui_core::model::GraphScope::Project(ids::PROJECT_HTUI),
                 name: "after the form".to_owned(),
                 description: String::new(),
                 is_override: false,

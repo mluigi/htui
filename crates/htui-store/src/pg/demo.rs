@@ -226,7 +226,7 @@ impl PgStore {
                 "INSERT INTO step_graph (id, project_id, name, description, created_at, \
                  updated_at) VALUES ($1, $2, $3, $4, $5, $6)",
                 StepGraphId::as_uuid(row.id),
-                ProjectId::as_uuid(row.project_id),
+                row.scope.project_id().map(ProjectId::as_uuid),
                 row.name,
                 row.description,
                 row.created_at,

@@ -71,6 +71,7 @@ use crate::model::{
     StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace,
     WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
 };
+use crate::model::{EdgeId, EdgeKind, GraphScope, Split};
 use crate::prompt::settings::{Rungs, SettingKey};
 use crate::prompt::template::{TemplateRole, parse};
 use crate::store::error::Result;
@@ -2617,8 +2618,9 @@ pub fn item_kind_is_held(prefix: &str, items: u64) -> String {
 const BOUND_PHASES_NAMED: usize = 5;
 
 /// MOD-26 milestone 2 D14 (I-9): `delete_persona`'s refusal while phases bind the persona. Each
-/// holder is `(project slug, graph name, phase name)`, named `` `<slug>/<graph>/<phase>` ``: a
-/// persona is global and a graph name is unique only per project (`0001_init.sql:221`). Sorted by
+/// holder is `(owner, graph name, phase name)`, named `` `<owner>/<graph>/<phase>` ``: a persona
+/// is global and a graph name is unique only per scope; the owner is the project slug,
+/// `workspace:<slug>` or `library` (MOD-137 D3, blueprint F8). Sorted by
 /// the triple's bytes and deduplicated **here**, so both stores word it the same whatever order
 /// they read in; at most five, then "and n more".
 #[must_use]
@@ -2727,6 +2729,126 @@ pub fn close_out_needs_a_summary(kind: &str) -> String {
 #[must_use]
 pub fn summary_names_another_item(item: ItemId, named: ItemId) -> String {
     format!("the summary of {item} cannot name item {named}")
+}
+
+// ---- MOD-137: the step graph v2 refusals (plan D3, D6-D8, D10; blueprint §1.5) ---------------
+//
+// Same reason as MOD-4's: both stores decide these before any write, so `MemStore` and `PgStore`
+// refuse the same input with the same sentence (blueprint F6).
+
+/// `uq_step_graph_{project,workspace,library}_name` (MOD-137 D3), in words.
+#[must_use]
+pub fn graph_name_is_taken(name: &str, scope: GraphScope) -> String {
+    format!("step_graph.name `{name}` is taken in {scope}")
+}
+
+/// `ck_step_graph_override_in_project` (MOD-137 D3), in words.
+#[must_use]
+pub fn override_outside_project(scope: GraphScope) -> String {
+    format!("an override graph is a per-item clone and belongs to a project, not {scope}")
+}
+
+/// A row of a graph write that names another graph than the one written (MOD-137 D10).
+#[must_use]
+pub fn row_names_another_graph(
+    column: &str,
+    row: impl std::fmt::Display,
+    graph: StepGraphId,
+) -> String {
+    format!("{column} `{row}` is not the graph being written (`{graph}`)")
+}
+
+/// `uq_step_graph_phase_position`, in words.
+#[must_use]
+pub fn phase_position_is_taken(position: i32, graph: StepGraphId) -> String {
+    format!("step_graph_phase.position {position} is taken in graph `{graph}`")
+}
+
+/// `uq_step_graph_phase_name`, in words.
+#[must_use]
+pub fn phase_name_is_taken(name: &str, graph: StepGraphId) -> String {
+    format!("step_graph_phase.name `{name}` is taken in graph `{graph}`")
+}
+
+/// `uq_phase_part_key` (MOD-137 D8), in words.
+#[must_use]
+pub fn phase_part_key_is_taken(key: &str, phase: PhaseId) -> String {
+    format!("phase_part.key `{key}` is taken in phase `{phase}`")
+}
+
+/// `fk_step_graph_edge_{from,to}` (MOD-137 D6), in words.
+#[must_use]
+pub fn edge_endpoint_outside_graph(column: &str, phase: PhaseId, graph: StepGraphId) -> String {
+    format!("step_graph_edge.{column} `{phase}` references no step_graph_phase in graph `{graph}`")
+}
+
+/// `ck_step_graph_edge_not_self` (MOD-137 D6), in words.
+#[must_use]
+pub fn edge_loops_to_itself(edge: EdgeId) -> String {
+    format!("step_graph_edge `{edge}` runs from a phase to itself")
+}
+
+/// `ck_step_graph_edge_predicate` (MOD-137 D6), in words.
+#[must_use]
+pub fn edge_predicate_mismatch(edge: EdgeId, kind: EdgeKind) -> String {
+    if kind.takes_predicate() {
+        format!("step_graph_edge `{edge}` is `{kind}` and carries no predicate")
+    } else {
+        format!("step_graph_edge `{edge}` is `{kind}` and carries a predicate; only `if` does")
+    }
+}
+
+/// `ck_step_graph_edge_loop_limit` (MOD-137 D6), in words.
+#[must_use]
+pub fn edge_loop_limit_negative(edge: EdgeId, limit: i32) -> String {
+    format!("step_graph_edge `{edge}` has loop_limit {limit}; a loop limit is 0 or more")
+}
+
+/// `ck_step_graph_edge_loop_limit_required` (MOD-137 D6), in words.
+#[must_use]
+pub fn edge_needs_loop_limit(edge: EdgeId, kind: EdgeKind) -> String {
+    format!("step_graph_edge `{edge}` is `{kind}` and carries no loop_limit")
+}
+
+/// `uq_step_graph_edge` (MOD-137 D6), in words.
+#[must_use]
+pub fn edge_is_taken(from: PhaseId, to: PhaseId, kind: EdgeKind, graph: StepGraphId) -> String {
+    format!("step_graph_edge ({from}, {to}, `{kind}`) is taken in graph `{graph}`")
+}
+
+/// MOD-137 D6: a palette node has no edges (a store check, not a CHECK).
+#[must_use]
+pub fn palette_phase_has_edges(phase: &str, edge: EdgeId) -> String {
+    format!("palette phase `{phase}` has step_graph_edge `{edge}`; a palette node has no edges")
+}
+
+/// `ck_phase_split_fan_out` (MOD-137 D7), in words.
+#[must_use]
+pub fn split_fan_out_mismatch(phase: &str, split: Split, fan_out: i32) -> String {
+    format!(
+        "phase `{phase}` is split `{split}` with fan_out {fan_out}; `compete` is exactly fan_out > 1"
+    )
+}
+
+/// `ck_phase_divide_columns` (MOD-137 D7), in words.
+#[must_use]
+pub fn divide_columns_off_divide(phase: &str, split: Split) -> String {
+    format!(
+        "phase `{phase}` is split `{split}`; planner_*, integrate_* and max_parts belong to a \
+         `divide` phase"
+    )
+}
+
+/// `ck_phase_max_parts` (MOD-137 D7), in words.
+#[must_use]
+pub fn max_parts_below_one(phase: &str, max_parts: i32) -> String {
+    format!("phase `{phase}` has max_parts {max_parts}; a divide phase takes at least 1")
+}
+
+/// MOD-137 D8: only a `divide` node has `phase_part` rows (a store check, not a CHECK).
+#[must_use]
+pub fn parts_off_divide(phase: &str, split: Split) -> String {
+    format!("phase `{phase}` is split `{split}`; only a `divide` phase has parts")
 }
 
 // ---- MOD-38: ANA-11's refusals ----

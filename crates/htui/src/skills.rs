@@ -618,10 +618,11 @@ mod tests {
         let mut data = fixtures::demo_data();
         data.graphs.push(StepGraph {
             id: StepGraphId::new(),
-            project_id: ids::PROJECT_HTUI,
+            scope: htui_core::model::GraphScope::Project(ids::PROJECT_HTUI),
             name: "FEAT-1-override".to_owned(),
             description: String::new(),
             is_override: true,
+            revision: 0,
             created_at: DateTime::UNIX_EPOCH,
             updated_at: DateTime::UNIX_EPOCH,
         });

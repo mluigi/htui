@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n                    UPDATE step_graph_phase SET token_budget = NULL\n                     WHERE id = $1 AND updated_at = $2\n                    RETURNING updated_at AS \"updated_at!\"\n                    ",
+  "query": "\n                        UPDATE step_graph_phase SET token_budget = NULL\n                         WHERE id = $1 AND updated_at = $2\n                        RETURNING updated_at AS \"updated_at!\"\n                        ",
   "describe": {
     "columns": [
       {
@@ -25,5 +25,5 @@
       false
     ]
   },
-  "hash": "2f5a4046f92e6dde3bcde2d2a10eec330a5a822e47683f7d5ce1d5e3f49090c0"
+  "hash": "84d975ac5c4fcd04fd2776a02e8be7b91a27bd07593d20550b6c4b34691afbc5"
 }

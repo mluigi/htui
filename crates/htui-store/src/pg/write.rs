@@ -45,6 +45,7 @@ use htui_core::model::{
     WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop, canonical_declared_tags,
     missing_tags_failure, moved_order, overlaps, scope_of,
 };
+use htui_core::model::{GraphScope, PlanScope, Split};
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
 use htui_core::seed;
@@ -71,13 +72,18 @@ use htui_core::store::{
     skill_version_key, step_is_not_promotable, summary_names_another_item, winner_is_not_settled,
     withdrawn_requirement_cited,
 };
+use htui_core::store::{
+    graph_name_is_taken, override_outside_project, phase_name_is_taken, phase_position_is_taken,
+    phase_row_refusal,
+};
 use serde_json::Value;
-use sqlx::PgConnection;
 use sqlx::types::Json;
+use sqlx::{PgConnection, PgExecutor};
 use uuid::Uuid;
 
 use crate::error::map_sqlx;
 use crate::pg::PgStore;
+use crate::pg::read::StepGraphRow;
 use crate::pg::rows::PersonaRow;
 
 /// The refusal text for a kind that is unknown or belongs to another project.
@@ -465,7 +471,9 @@ fn is_serialization_failure(err: &sqlx::Error) -> bool {
 }
 
 /// What a workspace delete reaches: its links and its box paths, and no project
-/// (`0001_init.sql:162,174`). `None` when no row has that id.
+/// (`0001_init.sql:162,174`); since MOD-137 D3 also its graphs, their phases and their candidates
+/// (`fk_step_graph_workspace ... ON DELETE CASCADE`), `MemStore`'s counts. `None` when no row has
+/// that id.
 ///
 /// Takes a connection rather than the pool so [`WriteStore::delete_reach`] can count on a borrowed
 /// one and [`WriteStore::delete_workspace`] can count **inside its own transaction** — which,
@@ -474,8 +482,14 @@ fn is_serialization_failure(err: &sqlx::Error) -> bool {
 async fn workspace_reach(conn: &mut PgConnection, id: WorkspaceId) -> Result<Option<DeleteReach>> {
     let counted = sqlx::query!(
         r#"
+        WITH g  AS (SELECT id FROM step_graph       WHERE workspace_id = $1),
+             ph AS (SELECT id FROM step_graph_phase WHERE graph_id IN (SELECT id FROM g))
         SELECT (SELECT count(*) FROM workspace_project  WHERE workspace_id = $1) AS "links!",
-               (SELECT count(*) FROM workspace_box_path WHERE workspace_id = $1) AS "paths!"
+               (SELECT count(*) FROM workspace_box_path WHERE workspace_id = $1) AS "paths!",
+               (SELECT count(*) FROM g)                                         AS "graphs!",
+               (SELECT count(*) FROM ph)                                        AS "phases!",
+               (SELECT count(*) FROM phase_agent
+                 WHERE phase_id IN (SELECT id FROM ph))                         AS "agents!"
           FROM workspace WHERE id = $1
         "#,
         id.as_uuid(),
@@ -487,6 +501,9 @@ async fn workspace_reach(conn: &mut PgConnection, id: WorkspaceId) -> Result<Opt
     Ok(counted.map(|row| DeleteReach {
         workspace_links: rows(row.links),
         workspace_box_paths: rows(row.paths),
+        step_graphs: rows(row.graphs),
+        phases: rows(row.phases),
+        phase_agents: rows(row.agents),
         ..DeleteReach::default()
     }))
 }
@@ -803,21 +820,223 @@ fn persona_insert_refused(err: sqlx::Error, new: &NewPersona) -> StoreError {
     }
 }
 
-/// MOD-26 D5: `fk_step_graph_phase_persona`'s `23503` in `MemStore`'s sentence (every other
-/// `23xxx` stays raw, `error.rs`); anything else through [`map_sqlx`].
-fn phase_persona_refused(err: sqlx::Error, persona: Option<PersonaId>) -> StoreError {
-    match (&err, persona) {
-        (sqlx::Error::Database(db), Some(persona))
-            if db.constraint() == Some("fk_step_graph_phase_persona") =>
+/// MOD-26 D5, MOD-137 D7: a phase row's five foreign keys (`fk_step_graph_phase_persona` and the
+/// four divide columns') in `MemStore`'s sentence (every other `23xxx` stays raw, `error.rs`);
+/// anything else through [`map_sqlx`]. Sound only because the writer decided the position and
+/// name clashes before the statement (blueprint §T2.2): the deferrable uniques are checked after
+/// every FK trigger, so an FK error no longer means "no clash".
+fn phase_fk_refused(err: sqlx::Error, phase: &StepGraphPhase) -> StoreError {
+    let refs: [(&str, &str, Option<Uuid>, &str); 5] = [
+        (
+            "fk_step_graph_phase_persona",
+            "step_graph_phase.persona_id",
+            phase.persona_id.map(PersonaId::as_uuid),
+            "persona",
+        ),
+        (
+            "fk_step_graph_phase_planner_persona",
+            "step_graph_phase.planner_persona_id",
+            phase.planner_persona_id.map(PersonaId::as_uuid),
+            "persona",
+        ),
+        (
+            "fk_step_graph_phase_integrate_persona",
+            "step_graph_phase.integrate_persona_id",
+            phase.integrate_persona_id.map(PersonaId::as_uuid),
+            "persona",
+        ),
+        (
+            "fk_step_graph_phase_planner_agent",
+            "step_graph_phase.planner_agent_id",
+            phase.planner_agent_id.map(AgentId::as_uuid),
+            "agent",
+        ),
+        (
+            "fk_step_graph_phase_integrate_agent",
+            "step_graph_phase.integrate_agent_id",
+            phase.integrate_agent_id.map(AgentId::as_uuid),
+            "agent",
+        ),
+    ];
+    if let sqlx::Error::Database(db) = &err
+        && let Some((_, column, Some(id), table)) = refs
+            .iter()
+            .find(|(constraint, ..)| db.constraint() == Some(*constraint))
+    {
+        return StoreError::Constraint(references_no_row(column, id, table));
+    }
+    map_sqlx(err)
+}
+
+/// MOD-137 D3: the three `uq_step_graph_*_name` partial uniques' `23505` in `MemStore`'s sentence;
+/// anything else through [`map_sqlx`].
+fn graph_name_refused(err: sqlx::Error, name: &str, scope: GraphScope) -> StoreError {
+    match &err {
+        sqlx::Error::Database(db)
+            if matches!(
+                db.constraint(),
+                Some(
+                    "uq_step_graph_project_name"
+                        | "uq_step_graph_workspace_name"
+                        | "uq_step_graph_library_name"
+                )
+            ) =>
         {
-            StoreError::Constraint(references_no_row(
-                "step_graph_phase.persona_id",
-                persona,
-                "persona",
-            ))
+            StoreError::Constraint(graph_name_is_taken(name, scope))
         }
         _ => map_sqlx(err),
     }
+}
+
+/// MOD-137 D5, F7: `graph`'s revision + 1, as the first statement of the caller's transaction
+/// (graph row first, then its phase rows). `false` when no such graph (the writer's own statement
+/// then refuses as it always has).
+async fn bump_graph(conn: &mut PgConnection, graph: StepGraphId) -> Result<bool> {
+    let bumped = sqlx::query!(
+        "UPDATE step_graph SET revision = revision + 1 WHERE id = $1",
+        graph.as_uuid(),
+    )
+    .execute(conn)
+    .await
+    .map_err(map_sqlx)?;
+    Ok(bumped.rows_affected() == 1)
+}
+
+/// [`bump_graph`] through a phase: `None` when the phase names no row.
+async fn bump_graph_of_phase(
+    conn: &mut PgConnection,
+    phase: PhaseId,
+) -> Result<Option<StepGraphId>> {
+    sqlx::query_scalar!(
+        r#"
+        UPDATE step_graph g SET revision = g.revision + 1
+          FROM step_graph_phase p
+         WHERE p.id = $1 AND g.id = p.graph_id
+        RETURNING g.id AS "id: StepGraphId"
+        "#,
+        phase.as_uuid(),
+    )
+    .fetch_optional(conn)
+    .await
+    .map_err(map_sqlx)
+}
+
+/// MOD-137 blueprint §T2.2 step 4, decided by the writer: after 0020 the deferrable
+/// `uq_step_graph_phase_{position,name}` are checked after every FK trigger, so the statement
+/// would report an unknown persona or agent before a clash. Run inside the writer's transaction,
+/// after its bump has locked the graph row, against the row as it will be written; `except` is
+/// the row's own id on an update. Position first, then name, `MemStore`'s order and sentences.
+async fn phase_clash(
+    conn: &mut PgConnection,
+    graph: StepGraphId,
+    position: i32,
+    name: &str,
+    except: Option<PhaseId>,
+) -> Result<Option<String>> {
+    let clash = sqlx::query!(
+        r#"
+        SELECT EXISTS (SELECT 1 FROM step_graph_phase
+                        WHERE graph_id = $1 AND position = $2
+                          AND id IS DISTINCT FROM $4) AS "position!",
+               EXISTS (SELECT 1 FROM step_graph_phase
+                        WHERE graph_id = $1 AND name = $3
+                          AND id IS DISTINCT FROM $4) AS "name!"
+        "#,
+        graph.as_uuid(),
+        position,
+        name,
+        except.map(PhaseId::as_uuid),
+    )
+    .fetch_one(conn)
+    .await
+    .map_err(map_sqlx)?;
+    Ok(if clash.position {
+        Some(phase_position_is_taken(position, graph))
+    } else if clash.name {
+        Some(phase_name_is_taken(name, graph))
+    } else {
+        None
+    })
+}
+
+/// The one `INSERT INTO step_graph_phase ... RETURNING` (MOD-137 blueprint §T2.2), so
+/// `create_phase` and `replace_graph` share the statement and its `.sqlx` entry. `updated_at` is
+/// left to the server. The driver's error comes back raw for the caller's [`phase_fk_refused`].
+async fn insert_phase<'e, E: PgExecutor<'e>>(
+    executor: E,
+    phase: &StepGraphPhase,
+) -> std::result::Result<StepGraphPhase, sqlx::Error> {
+    sqlx::query_as!(
+        StepGraphPhase,
+        r#"
+        INSERT INTO step_graph_phase (id, graph_id, position, name, fan_out, gate, gate_hard,
+                                      retry_limit, input_kinds, output_kind, isolation,
+                                      command_queue, verify_command, template_name,
+                                      template_version, token_budget, persona_id, split,
+                                      palette, plan_scope, planner_persona_id,
+                                      planner_agent_id, planner_model, integrate_persona_id,
+                                      integrate_agent_id, integrate_model, max_parts)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+        RETURNING id                   AS "id: PhaseId",
+                  graph_id             AS "graph_id: StepGraphId",
+                  position,
+                  name,
+                  fan_out,
+                  gate                 AS "gate: htui_core::model::Gate",
+                  gate_hard,
+                  retry_limit,
+                  input_kinds,
+                  output_kind,
+                  isolation            AS "isolation: Isolation",
+                  command_queue        AS "command_queue: htui_core::model::CommandQueue",
+                  verify_command,
+                  template_name,
+                  template_version,
+                  token_budget,
+                  persona_id           AS "persona_id: PersonaId",
+                  split                AS "split: Split",
+                  palette,
+                  plan_scope           AS "plan_scope: PlanScope",
+                  planner_persona_id   AS "planner_persona_id: PersonaId",
+                  planner_agent_id     AS "planner_agent_id: AgentId",
+                  planner_model,
+                  integrate_persona_id AS "integrate_persona_id: PersonaId",
+                  integrate_agent_id   AS "integrate_agent_id: AgentId",
+                  integrate_model,
+                  max_parts,
+                  updated_at
+        "#,
+        phase.id.as_uuid(),
+        phase.graph_id.as_uuid(),
+        phase.position,
+        phase.name,
+        phase.fan_out,
+        phase.gate.as_str(),
+        phase.gate_hard,
+        phase.retry_limit,
+        &phase.input_kinds[..],
+        phase.output_kind,
+        phase.isolation.map(Isolation::as_str),
+        phase.command_queue.as_str(),
+        phase.verify_command.as_deref(),
+        phase.template_name,
+        phase.template_version,
+        phase.token_budget,
+        phase.persona_id.map(PersonaId::as_uuid),
+        phase.split.as_str(),
+        phase.palette,
+        phase.plan_scope.map(PlanScope::as_str),
+        phase.planner_persona_id.map(PersonaId::as_uuid),
+        phase.planner_agent_id.map(AgentId::as_uuid),
+        phase.planner_model.as_deref(),
+        phase.integrate_persona_id.map(PersonaId::as_uuid),
+        phase.integrate_agent_id.map(AgentId::as_uuid),
+        phase.integrate_model.as_deref(),
+        phase.max_parts,
+    )
+    .fetch_one(executor)
+    .await
 }
 
 /// A persona blob as `JSONB`, `create_run`'s shape.
@@ -2958,35 +3177,45 @@ impl WriteStore for PgStore {
     // step_graph and phase
 
     /// One `INSERT ... RETURNING`; the phases are [`create_phase`](WriteStore::create_phase)'s.
+    /// MOD-137 D3: the scope binds both owner columns; an override outside a project is refused
+    /// before the statement in `MemStore`'s sentence, and so is a name taken in the scope (the
+    /// three partial unique indexes would word it as a constraint).
     ///
     /// # Errors
     ///
-    /// [`StoreError::Constraint`] when `(project_id, name)` is taken (`23505`) or `project_id`
-    /// names no row (`23503`).
+    /// [`StoreError::Constraint`] for an override outside a project, a name taken in the scope, or
+    /// an owner that names no row (`23503`).
     async fn create_step_graph(&self, new: NewStepGraph) -> Result<StepGraph> {
-        sqlx::query_as!(
-            StepGraph,
+        if new.is_override && !matches!(new.scope, GraphScope::Project(_)) {
+            return Err(StoreError::Constraint(override_outside_project(new.scope)));
+        }
+        let row = sqlx::query_as!(
+            StepGraphRow,
             r#"
-            INSERT INTO step_graph (id, project_id, name, description, is_override)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING id         AS "id: StepGraphId",
-                      project_id AS "project_id: ProjectId",
+            INSERT INTO step_graph (id, project_id, workspace_id, name, description, is_override)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id           AS "id: StepGraphId",
+                      project_id   AS "project_id: ProjectId",
+                      workspace_id AS "workspace_id: WorkspaceId",
                       name,
                       description,
                       -- Inserted, not appended: see `step_graph_row` in `pg/read.rs`.
                       is_override,
+                      revision,
                       created_at,
                       updated_at
             "#,
             new.id.as_uuid(),
-            new.project_id.as_uuid(),
+            new.scope.project_id().map(ProjectId::as_uuid),
+            new.scope.workspace_id().map(WorkspaceId::as_uuid),
             new.name,
             new.description,
             new.is_override,
         )
         .fetch_one(&self.pool)
         .await
-        .map_err(map_sqlx)
+        .map_err(|err| graph_name_refused(err, &new.name, new.scope))?;
+        StepGraph::try_from(row)
     }
 
     /// The compare-and-set of D3 over `name` and `description`.
@@ -3001,19 +3230,25 @@ impl WriteStore for PgStore {
         expected: DateTime<Utc>,
         patch: StepGraphPatch,
     ) -> Result<CasOutcome<StepGraph>> {
+        // MOD-137 D5: the bump rides in the CAS statement itself; the row is the graph, so the
+        // lock order (graph first) holds.
+        let name = patch.name.clone();
         let updated = sqlx::query_as!(
-            StepGraph,
+            StepGraphRow,
             r#"
             UPDATE step_graph SET
                 name        = COALESCE($3, name),
-                description = COALESCE($4, description)
+                description = COALESCE($4, description),
+                revision    = revision + 1
              WHERE id = $1 AND updated_at = $2
-            RETURNING id         AS "id: StepGraphId",
-                      project_id AS "project_id: ProjectId",
+            RETURNING id           AS "id: StepGraphId",
+                      project_id   AS "project_id: ProjectId",
+                      workspace_id AS "workspace_id: WorkspaceId",
                       name,
                       description,
                       -- Inserted, not appended: see `step_graph_row` in `pg/read.rs`.
                       is_override,
+                      revision,
                       created_at,
                       updated_at
             "#,
@@ -3023,11 +3258,20 @@ impl WriteStore for PgStore {
             patch.description,
         )
         .fetch_optional(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
+        .await;
+        let updated = match (updated, name) {
+            (Err(err), Some(name)) => {
+                let scope = self
+                    .step_graph_row(id)
+                    .await?
+                    .map_or(GraphScope::Library, |row| row.scope);
+                return Err(graph_name_refused(err, &name, scope));
+            }
+            (updated, _) => updated.map_err(map_sqlx)?,
+        };
 
         match updated {
-            Some(row) => Ok(CasOutcome::Applied(row)),
+            Some(row) => Ok(CasOutcome::Applied(StepGraph::try_from(row)?)),
             None => cas_miss(self.step_graph_row(id).await?, "step_graph", id),
         }
     }
@@ -3060,55 +3304,28 @@ impl WriteStore for PgStore {
         if TemplateRole::of_name(&phase.name) != TemplateRole::Phase {
             return Err(StoreError::Constraint(reserved_phase_name(&phase.name)));
         }
-
-        sqlx::query_as!(
-            StepGraphPhase,
-            r#"
-            INSERT INTO step_graph_phase (id, graph_id, position, name, fan_out, gate, gate_hard,
-                                          retry_limit, input_kinds, output_kind, isolation,
-                                          command_queue, verify_command, template_name,
-                                          template_version, token_budget, persona_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-            RETURNING id               AS "id: PhaseId",
-                      graph_id         AS "graph_id: StepGraphId",
-                      position,
-                      name,
-                      fan_out,
-                      gate             AS "gate: htui_core::model::Gate",
-                      gate_hard,
-                      retry_limit,
-                      input_kinds,
-                      output_kind,
-                      isolation        AS "isolation: Isolation",
-                      command_queue    AS "command_queue: htui_core::model::CommandQueue",
-                      verify_command,
-                      template_name,
-                      template_version,
-                      token_budget,
-                      persona_id       AS "persona_id: PersonaId",
-                      updated_at
-            "#,
-            phase.id.as_uuid(),
-            phase.graph_id.as_uuid(),
-            phase.position,
-            phase.name,
-            phase.fan_out,
-            phase.gate.as_str(),
-            phase.gate_hard,
-            phase.retry_limit,
-            &phase.input_kinds[..],
-            phase.output_kind,
-            phase.isolation.map(Isolation::as_str),
-            phase.command_queue.as_str(),
-            phase.verify_command.as_deref(),
-            phase.template_name,
-            phase.template_version,
-            phase.token_budget,
-            phase.persona_id.map(PersonaId::as_uuid),
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|err| phase_persona_refused(err, phase.persona_id))
+        if let Some(refusal) = phase_row_refusal(phase) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        // MOD-137 D5, F7: the bump is the transaction's first statement (graph row first).
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        if !bump_graph(&mut tx, phase.graph_id).await? {
+            return Err(StoreError::Constraint(references_no_row(
+                "step_graph_phase.graph_id",
+                phase.graph_id,
+                "step_graph",
+            )));
+        }
+        if let Some(clash) =
+            phase_clash(&mut tx, phase.graph_id, phase.position, &phase.name, None).await?
+        {
+            return Err(StoreError::Constraint(clash));
+        }
+        let row = insert_phase(&mut *tx, phase)
+            .await
+            .map_err(|err| phase_fk_refused(err, phase))?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(row)
     }
 
     /// One `UNNEST` insert (MOD-37 R-6), so the batch lands whole or not at all. A row naming
@@ -3133,6 +3350,10 @@ impl WriteStore for PgStore {
         let positions: Vec<i32> = agents.iter().map(|row| row.position).collect();
         let agent_ids: Vec<Uuid> = agents.iter().map(|row| row.agent_id.as_uuid()).collect();
         let models: Vec<String> = agents.iter().map(|row| row.model.clone()).collect();
+        // MOD-137 D5, F7: bump first; an unknown phase bumps nothing and still fails on the
+        // insert's `23503`, as before.
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        bump_graph_of_phase(&mut tx, phase).await?;
         sqlx::query!(
             r#"
             INSERT INTO phase_agent (phase_id, position, agent_id, model)
@@ -3144,9 +3365,10 @@ impl WriteStore for PgStore {
             &agent_ids,
             &models,
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)?;
         Ok(())
     }
 
@@ -3187,9 +3409,76 @@ impl WriteStore for PgStore {
             return Err(StoreError::Constraint(reserved_phase_name(name)));
         }
 
+        // MOD-137 D5, F7: bump first (graph row), then the phase row `FOR UPDATE`; a miss on
+        // either rolls the bump back.
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        if bump_graph_of_phase(&mut tx, id).await?.is_none() {
+            tx.rollback().await.map_err(map_sqlx)?;
+            return cas_miss(None, "step_graph_phase", id);
+        }
+        let current = sqlx::query_as!(
+            StepGraphPhase,
+            r#"
+            SELECT id                   AS "id: PhaseId",
+                   graph_id             AS "graph_id: StepGraphId",
+                   position,
+                   name,
+                   fan_out,
+                   gate                 AS "gate: htui_core::model::Gate",
+                   gate_hard,
+                   retry_limit,
+                   input_kinds,
+                   output_kind,
+                   isolation            AS "isolation: Isolation",
+                   command_queue        AS "command_queue: htui_core::model::CommandQueue",
+                   verify_command,
+                   template_name,
+                   template_version,
+                   token_budget,
+                   persona_id           AS "persona_id: PersonaId",
+                   split                AS "split: Split",
+                   palette,
+                   plan_scope           AS "plan_scope: PlanScope",
+                   planner_persona_id   AS "planner_persona_id: PersonaId",
+                   planner_agent_id     AS "planner_agent_id: AgentId",
+                   planner_model,
+                   integrate_persona_id AS "integrate_persona_id: PersonaId",
+                   integrate_agent_id   AS "integrate_agent_id: AgentId",
+                   integrate_model,
+                   max_parts,
+                   updated_at
+              FROM step_graph_phase WHERE id = $1
+               FOR UPDATE
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        // `MemStore`'s order: not found, then `Stale`, then the clash, then the persona.
+        if current.updated_at != expected {
+            tx.rollback().await.map_err(map_sqlx)?;
+            return Ok(CasOutcome::Stale(current));
+        }
+        if let Some(clash) = phase_clash(
+            &mut tx,
+            current.graph_id,
+            patch.position.unwrap_or(current.position),
+            patch.name.as_deref().unwrap_or(&current.name),
+            Some(id),
+        )
+        .await?
+        {
+            return Err(StoreError::Constraint(clash));
+        }
+
         // MOD-26 D5: `COALESCE` cannot clear, so the binding is a flag and a value; read before
         // the macro, which moves the patch's other fields.
         let persona = patch.persona;
+        let written = StepGraphPhase {
+            persona_id: persona.unwrap_or(current.persona_id),
+            ..current
+        };
         let updated = sqlx::query_as!(
             StepGraphPhase,
             r#"
@@ -3201,23 +3490,33 @@ impl WriteStore for PgStore {
                 input_kinds   = COALESCE($7, input_kinds),
                 persona_id    = CASE WHEN $8::bool THEN $9::uuid ELSE persona_id END
              WHERE id = $1 AND updated_at = $2
-            RETURNING id               AS "id: PhaseId",
-                      graph_id         AS "graph_id: StepGraphId",
+            RETURNING id                   AS "id: PhaseId",
+                      graph_id             AS "graph_id: StepGraphId",
                       position,
                       name,
                       fan_out,
-                      gate             AS "gate: htui_core::model::Gate",
+                      gate                 AS "gate: htui_core::model::Gate",
                       gate_hard,
                       retry_limit,
                       input_kinds,
                       output_kind,
-                      isolation        AS "isolation: Isolation",
-                      command_queue    AS "command_queue: htui_core::model::CommandQueue",
+                      isolation            AS "isolation: Isolation",
+                      command_queue        AS "command_queue: htui_core::model::CommandQueue",
                       verify_command,
                       template_name,
                       template_version,
                       token_budget,
-                      persona_id       AS "persona_id: PersonaId",
+                      persona_id           AS "persona_id: PersonaId",
+                      split                AS "split: Split",
+                      palette,
+                      plan_scope           AS "plan_scope: PlanScope",
+                      planner_persona_id   AS "planner_persona_id: PersonaId",
+                      planner_agent_id     AS "planner_agent_id: AgentId",
+                      planner_model,
+                      integrate_persona_id AS "integrate_persona_id: PersonaId",
+                      integrate_agent_id   AS "integrate_agent_id: AgentId",
+                      integrate_model,
+                      max_parts,
                       updated_at
             "#,
             id.as_uuid(),
@@ -3230,13 +3529,19 @@ impl WriteStore for PgStore {
             persona.is_some(),
             persona.flatten().map(PersonaId::as_uuid),
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(|err| phase_persona_refused(err, persona.flatten()))?;
+        .map_err(|err| phase_fk_refused(err, &written))?;
 
         match updated {
-            Some(row) => Ok(CasOutcome::Applied(row)),
-            None => cas_miss(self.phase_row(id).await?, "step_graph_phase", id),
+            Some(row) => {
+                tx.commit().await.map_err(map_sqlx)?;
+                Ok(CasOutcome::Applied(row))
+            }
+            None => {
+                tx.rollback().await.map_err(map_sqlx)?;
+                cas_miss(self.phase_row(id).await?, "step_graph_phase", id)
+            }
         }
     }
 
@@ -3557,9 +3862,11 @@ impl WriteStore for PgStore {
                         entity: "step_graph_phase",
                         id: id.to_string(),
                     })?;
+                // MOD-137 F9: a phase of a workspace or library graph has no project, so rule 2
+                // refuses its binding (plan D4: no use of a non-project graph yet).
                 self.step_graph_row(phase.graph_id)
                     .await?
-                    .map(|graph| graph.project_id)
+                    .and_then(|graph| graph.scope.project_id())
             }
             None => None,
         };
@@ -3804,7 +4111,7 @@ impl WriteStore for PgStore {
     /// persona row through `fk_step_graph_phase_persona`, which `FOR UPDATE` conflicts with: a bind
     /// in flight is waited for and then **seen** by the guarded `DELETE`'s snapshot (zero rows, the
     /// sentence); a bind that arrives after the lock waits behind it and gets `23503`, which
-    /// `phase_persona_refused` words as `references_no_row`. Without the lock the deleter itself
+    /// `phase_fk_refused` words as `references_no_row`. Without the lock the deleter itself
     /// would see a raw `23503` (probed, plan "Verified claims"). A guard that fired over holders an
     /// unbind removed before they were read runs again, so the sentence never names zero phases.
     ///
@@ -3838,16 +4145,22 @@ impl WriteStore for PgStore {
         //
         // That rests on `fk_step_graph_phase_persona` being NOT DEFERRABLE: a bind checks it at
         // its own statement and so waits on the `FOR UPDATE` lock above, rather than at a commit
-        // that could land between two passes. The holders read joins `step_graph` and `project`,
-        // which NOT NULL FKs make total today; should a holder ever be one the guard sees and the
-        // join cannot name, the passes are capped (R1 L-3) so the loop ends in an error rather
-        // than spinning, and the transaction rolls back with nothing deleted.
+        // that could land between two passes; MOD-137's four new persona FKs (the two divide
+        // columns, `phase_part.persona_id`) are NOT DEFERRABLE too. The holders read left-joins
+        // the graph's owner (MOD-137 D3, F8: a project, a workspace or the library), so the
+        // join names every holder whose parent rows exist; should a holder ever be one the guard
+        // sees and the join cannot name (a missing parent only), the passes are capped (R1 L-3)
+        // so the loop ends in an error rather than spinning, and the transaction rolls back with
+        // nothing deleted.
         for _ in 0..DELETE_PERSONA_PASSES {
             let removed = sqlx::query_scalar!(
                 r#"
             DELETE FROM persona
              WHERE id = $1
-               AND NOT EXISTS (SELECT 1 FROM step_graph_phase WHERE persona_id = $1)
+               AND NOT EXISTS (SELECT 1 FROM step_graph_phase
+                                WHERE persona_id = $1 OR planner_persona_id = $1
+                                   OR integrate_persona_id = $1)
+               AND NOT EXISTS (SELECT 1 FROM phase_part WHERE persona_id = $1)
             RETURNING id
             "#,
                 id.as_uuid(),
@@ -3864,11 +4177,23 @@ impl WriteStore for PgStore {
             // holders are read only to name them in the sentence.
             let holders = sqlx::query!(
                 r#"
-                SELECT pr.slug AS "project!", g.name AS "graph!", p.name AS "phase!"
+                SELECT CASE WHEN g.project_id   IS NOT NULL THEN pr.slug
+                            WHEN g.workspace_id IS NOT NULL THEN 'workspace:' || w.slug
+                            ELSE 'library'
+                       END AS "owner!",
+                       g.name AS "graph!",
+                       p.name AS "phase!"
                   FROM step_graph_phase p
                   JOIN step_graph g ON g.id = p.graph_id
-                  JOIN project pr ON pr.id = g.project_id
-                 WHERE p.persona_id = $1
+                  LEFT JOIN project pr ON pr.id = g.project_id
+                  LEFT JOIN workspace w ON w.id = g.workspace_id
+                 WHERE (p.persona_id = $1 OR p.planner_persona_id = $1
+                        OR p.integrate_persona_id = $1
+                        OR EXISTS (SELECT 1 FROM phase_part pp
+                                    WHERE pp.phase_id = p.id AND pp.persona_id = $1))
+                   -- A holder whose owner row is gone cannot be named (R1 L-3's capped loop).
+                   AND (g.project_id   IS NULL OR pr.id IS NOT NULL)
+                   AND (g.workspace_id IS NULL OR w.id  IS NOT NULL)
                 "#,
                 id.as_uuid(),
             )
@@ -3876,7 +4201,7 @@ impl WriteStore for PgStore {
             .await
             .map_err(map_sqlx)?
             .into_iter()
-            .map(|row| (row.project, row.graph, row.phase))
+            .map(|row| (row.owner, row.graph, row.phase))
             .collect::<Vec<_>>();
             if !holders.is_empty() {
                 return Err(StoreError::Constraint(persona_is_bound(&name, &holders)));
@@ -4026,19 +4351,31 @@ impl WriteStore for PgStore {
                              which is INTEGER"
                         ))
                     })?;
-                let landed = sqlx::query_scalar!(
-                    r#"
-                    UPDATE step_graph_phase SET token_budget = $2
-                     WHERE id = $1 AND updated_at = $3
-                    RETURNING updated_at AS "updated_at!"
-                    "#,
-                    id.as_uuid(),
-                    budget,
-                    token,
-                )
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(map_sqlx)?;
+                // MOD-137 D5, F7: `token_budget` is a node field, so the graph's revision moves;
+                // the bump goes first and a miss rolls it back.
+                let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+                let landed = if bump_graph_of_phase(&mut tx, id).await?.is_some() {
+                    sqlx::query_scalar!(
+                        r#"
+                        UPDATE step_graph_phase SET token_budget = $2
+                         WHERE id = $1 AND updated_at = $3
+                        RETURNING updated_at AS "updated_at!"
+                        "#,
+                        id.as_uuid(),
+                        budget,
+                        token,
+                    )
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(map_sqlx)?
+                } else {
+                    None
+                };
+                if landed.is_some() {
+                    tx.commit().await.map_err(map_sqlx)?;
+                } else {
+                    tx.rollback().await.map_err(map_sqlx)?;
+                }
 
                 match landed {
                     Some(updated_at) => Ok(CasOutcome::Applied(StoredSetting {
@@ -4124,18 +4461,29 @@ impl WriteStore for PgStore {
                 (landed, "project", id.to_string())
             }
             SettingRung::Phase(id) => {
-                let landed = sqlx::query_scalar!(
-                    r#"
-                    UPDATE step_graph_phase SET token_budget = NULL
-                     WHERE id = $1 AND updated_at = $2
-                    RETURNING updated_at AS "updated_at!"
-                    "#,
-                    id.as_uuid(),
-                    expected,
-                )
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(map_sqlx)?;
+                // MOD-137 F1: the clear writes a node field too, so it bumps as `set_setting`.
+                let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+                let landed = if bump_graph_of_phase(&mut tx, id).await?.is_some() {
+                    sqlx::query_scalar!(
+                        r#"
+                        UPDATE step_graph_phase SET token_budget = NULL
+                         WHERE id = $1 AND updated_at = $2
+                        RETURNING updated_at AS "updated_at!"
+                        "#,
+                        id.as_uuid(),
+                        expected,
+                    )
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(map_sqlx)?
+                } else {
+                    None
+                };
+                if landed.is_some() {
+                    tx.commit().await.map_err(map_sqlx)?;
+                } else {
+                    tx.rollback().await.map_err(map_sqlx)?;
+                }
                 (landed, "step_graph_phase", id.to_string())
             }
         };
@@ -7976,7 +8324,7 @@ async fn seed_project(
         sqlx::query!(
             "INSERT INTO step_graph (id, project_id, name, description) VALUES ($1, $2, $3, $4)",
             graph.id.as_uuid(),
-            graph.project_id.as_uuid(),
+            graph.scope.project_id().map(ProjectId::as_uuid),
             graph.name,
             graph.description,
         )

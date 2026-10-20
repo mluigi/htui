@@ -1,0 +1,51 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH g  AS (SELECT id FROM step_graph       WHERE workspace_id = $1),\n             ph AS (SELECT id FROM step_graph_phase WHERE graph_id IN (SELECT id FROM g))\n        SELECT (SELECT count(*) FROM workspace_project  WHERE workspace_id = $1) AS \"links!\",\n               (SELECT count(*) FROM workspace_box_path WHERE workspace_id = $1) AS \"paths!\",\n               (SELECT count(*) FROM g)                                         AS \"graphs!\",\n               (SELECT count(*) FROM ph)                                        AS \"phases!\",\n               (SELECT count(*) FROM phase_agent\n                 WHERE phase_id IN (SELECT id FROM ph))                         AS \"agents!\"\n          FROM workspace WHERE id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "links!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "paths!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "graphs!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "phases!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 4,
+        "name": "agents!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "cbb1fa07ff91f4a9868cf0bf74e43d69947f9dd0821fdd97f9a6f83dc496f74e"
+}

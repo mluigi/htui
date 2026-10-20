@@ -20,8 +20,8 @@
 use chrono::{DateTime, Utc};
 
 use crate::model::{
-    CommandQueue, Gate, ItemKind, ItemKindId, PhaseId, ProjectId, PromptTemplate, PromptTemplateId,
-    StepGraph, StepGraphId, StepGraphPhase, UserId,
+    CommandQueue, Gate, GraphScope, ItemKind, ItemKindId, PhaseId, ProjectId, PromptTemplate,
+    PromptTemplateId, Split, StepGraph, StepGraphId, StepGraphPhase, UserId,
 };
 
 /// One phase of a default graph: the three columns the table varies, in position order within
@@ -192,10 +192,11 @@ pub fn graph_row(
 ) -> StepGraph {
     StepGraph {
         id,
-        project_id,
+        scope: GraphScope::Project(project_id),
         name: kind.name.to_owned(),
         description: graph_description(kind.name),
         is_override: false,
+        revision: 0,
         created_at: now,
         updated_at: now,
     }
@@ -204,7 +205,9 @@ pub fn graph_row(
 /// A `step_graph_phase` row at `position` of `graph_id`: the seed's three columns plus ANA-2
 /// §4.1's frozen defaults — `fan_out 1`, `gate Always`, `retry_limit 1`, `isolation None`,
 /// `command_queue FanOutOnly`, `verify_command None`, `output_kind` and `template_name` equal to
-/// the name, `template_version None` (follow latest), `token_budget None` (project default).
+/// the name, `template_version None` (follow latest), `token_budget None` (project default),
+/// and MOD-137 D7's node defaults: `split None`, not a palette node, no plan scope, no divide
+/// columns.
 #[must_use]
 pub fn phase_row(
     id: PhaseId,
@@ -235,6 +238,16 @@ pub fn phase_row(
         template_version: None,
         token_budget: None,
         persona_id: None,
+        split: Split::None,
+        palette: false,
+        plan_scope: None,
+        planner_persona_id: None,
+        planner_agent_id: None,
+        planner_model: None,
+        integrate_persona_id: None,
+        integrate_agent_id: None,
+        integrate_model: None,
+        max_parts: None,
         updated_at: now,
     }
 }
@@ -292,8 +305,8 @@ mod tests {
 
     use super::{KINDS, PHASES_PER_PROJECT, graph_row, kind_row, phase_row, template_row};
     use crate::model::{
-        CommandQueue, Gate, ItemKind, ItemKindId, PhaseId, ProjectId, PromptTemplateId,
-        StepGraphId, UserId,
+        CommandQueue, Gate, GraphScope, ItemKind, ItemKindId, PhaseId, ProjectId, PromptTemplateId,
+        Split, StepGraphId, UserId,
     };
     use crate::prompt::{DEFAULT_TEMPLATES, TemplateRole, body_of};
     use chrono::Utc;
@@ -490,12 +503,35 @@ mod tests {
         assert_eq!(phase.graph_id, graph_id);
         assert_eq!(phase.position, 2);
         assert_eq!(phase.updated_at, now);
+        assert_eq!(
+            (
+                phase.split,
+                phase.palette,
+                phase.plan_scope,
+                phase.max_parts
+            ),
+            (Split::None, false, None, None),
+            "MOD-137 D7's node defaults"
+        );
+        assert_eq!(
+            (
+                phase.planner_persona_id,
+                phase.planner_agent_id,
+                phase.planner_model.as_deref(),
+                phase.integrate_persona_id,
+                phase.integrate_agent_id,
+                phase.integrate_model.as_deref(),
+            ),
+            (None, None, None, None, None, None),
+            "no divide columns"
+        );
 
         let graph = graph_row(StepGraphId::new(), project, feature, now);
         assert_eq!(graph.name, "feature");
         assert_eq!(graph.description, "Default graph for feature items");
         assert_eq!((graph.created_at, graph.updated_at), (now, now));
-        assert_eq!(graph.project_id, project);
+        assert_eq!(graph.scope, GraphScope::Project(project));
+        assert_eq!(graph.revision, 0, "a seeded graph starts at revision 0");
 
         let kind = kind_row(ItemKindId::new(), project, graph_id, 1, feature, now);
         assert_eq!(

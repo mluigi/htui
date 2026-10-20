@@ -996,10 +996,11 @@ async fn an_unreferenced_graph_is_listed_after_the_kinds() {
     snapshot.projects[0].graphs.push(GraphEntry {
         graph: StepGraph {
             id: StepGraphId::new(),
-            project_id: ids::PROJECT_VULKAN,
+            scope: htui_core::model::GraphScope::Project(ids::PROJECT_VULKAN),
             name: "orphan".to_owned(),
             description: String::new(),
             is_override: false,
+            revision: 0,
             created_at: now,
             updated_at: now,
         },

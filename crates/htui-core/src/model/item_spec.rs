@@ -495,7 +495,7 @@ mod tests {
     use chrono::{DateTime, Utc};
 
     use super::*;
-    use crate::model::{RepoId, Status};
+    use crate::model::{GraphScope, RepoId, Status};
 
     const EPOCH: DateTime<Utc> = DateTime::UNIX_EPOCH;
 
@@ -532,10 +532,11 @@ mod tests {
     fn graph(project: ProjectId, is_override: bool) -> StepGraph {
         StepGraph {
             id: StepGraphId::new(),
-            project_id: project,
+            scope: GraphScope::Project(project),
             name: "feat".to_owned(),
             description: String::new(),
             is_override,
+            revision: 0,
             created_at: EPOCH,
             updated_at: EPOCH,
         }

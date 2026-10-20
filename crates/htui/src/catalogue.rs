@@ -212,7 +212,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             writer
                 .create_step_graph(NewStepGraph {
                     id: StepGraphId::new(),
-                    project_id: *project,
+                    scope: htui_core::model::GraphScope::Project(*project),
                     name: name.clone(),
                     description: description.clone(),
                     is_override: false,

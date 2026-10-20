@@ -828,7 +828,7 @@ async fn repoint_at_no_template(store: &MemStore, item: ItemId) {
     let clone = store
         .create_step_graph(NewStepGraph {
             id: StepGraphId::new(),
-            project_id: row.project_id,
+            scope: htui_core::model::GraphScope::Project(row.project_id),
             name: format!("{}-edited", row.key),
             description: "a queue case's edit of the live graph".to_owned(),
             is_override: false,

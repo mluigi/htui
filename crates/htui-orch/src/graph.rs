@@ -14,6 +14,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
+use htui_core::model::GraphScope;
 use htui_core::model::{
     Agent, AgentBox, AgentId, Attachment, BindingChange, BoundSkill, BoxId, CapError, Gate,
     GraphSnapshot, Isolation, Item, ItemId, ItemPatch, NewStepGraph, PhaseAgent, PhaseId, Project,
@@ -546,7 +547,7 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
     let clone = store
         .create_step_graph(NewStepGraph {
             id: StepGraphId::new(),
-            project_id: item.project_id,
+            scope: GraphScope::Project(item.project_id),
             name: format!("{}-override", item.key),
             description: format!(
                 "Per-item override of `{}` for {}",

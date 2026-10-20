@@ -51,11 +51,13 @@ use crate::model::{
     WorkspaceSummary, canonical_declared_tags, missing_tags_failure, moved_order, overlaps,
     prompt_summary, scope_of,
 };
+use crate::model::{EdgeId, GraphScope, PhasePart, StepGraphEdge};
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
 use crate::prompt::template::TemplateRole;
 use crate::seed;
 use crate::store::error::{Result, StoreError};
+use crate::store::graph_rules::phase_row_refusal;
 use crate::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
     BindingFacts, COMMAND_STALE_AFTER, CasOutcome, DeleteReach, DeleteTarget,
@@ -75,6 +77,9 @@ use crate::store::traits::{
     skill_body_refusal, skill_patch_refusal, skill_version_key, step_document_refusal,
     step_is_not_promotable, step_note_refusal, step_slot_is_taken, step_writes_own_item,
     summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
+};
+use crate::store::traits::{
+    graph_name_is_taken, override_outside_project, phase_name_is_taken, phase_position_is_taken,
 };
 use uuid::Uuid;
 
@@ -212,6 +217,10 @@ struct State {
     /// each phase. Written by [`WriteStore::create_phase_agents`] only (MOD-37 R-6); no fixture
     /// loads it.
     phase_agents: BTreeMap<(PhaseId, i32), PhaseAgent>,
+    /// `step_graph_edge` (MOD-137 D6). Written by `replace_graph` and the seeders.
+    edges: BTreeMap<EdgeId, StepGraphEdge>,
+    /// `phase_part` (MOD-137 D8), keyed as its primary key is. Written by `replace_graph` only.
+    phase_parts: BTreeMap<(PhaseId, i32), PhasePart>,
     /// `prompt_template`, read by the inherent [`MemStore::prompt_templates`] (MOD-2 plan D102) and
     /// appended to only by [`WriteStore::append_prompt_template`] and the project seed (MOD-9 D1).
     templates: Vec<PromptTemplate>,
@@ -386,6 +395,8 @@ impl MemStore {
             graphs: data.graphs.into_iter().map(|row| (row.id, row)).collect(),
             phases: data.phases,
             phase_agents: BTreeMap::new(),
+            edges: BTreeMap::new(),
+            phase_parts: BTreeMap::new(),
             templates: data.templates,
             skills: data.skills.into_iter().map(|row| (row.id, row)).collect(),
             personas: data.personas.into_iter().map(|row| (row.id, row)).collect(),
@@ -3338,7 +3349,7 @@ impl State {
         if self
             .graphs
             .get(&graph)
-            .is_none_or(|row| row.project_id != project)
+            .is_none_or(|row| row.scope != GraphScope::Project(project))
         {
             return Err(StoreError::Constraint(graph_not_in_project(graph, project)));
         }
@@ -3473,11 +3484,23 @@ impl State {
     }
 
     fn create_step_graph(&mut self, new: NewStepGraph, now: DateTime<Utc>) -> Result<StepGraph> {
-        if !self.projects.contains_key(&new.project_id) {
-            return Err(StoreError::Constraint(format!(
-                "step_graph.project_id `{}` references no project",
-                new.project_id
-            )));
+        match new.scope {
+            GraphScope::Project(project) if !self.projects.contains_key(&project) => {
+                return Err(StoreError::Constraint(format!(
+                    "step_graph.project_id `{project}` references no project"
+                )));
+            }
+            GraphScope::Workspace(workspace) if !self.workspaces.contains_key(&workspace) => {
+                return Err(StoreError::Constraint(references_no_row(
+                    "step_graph.workspace_id",
+                    workspace,
+                    "workspace",
+                )));
+            }
+            _ => {}
+        }
+        if new.is_override && !matches!(new.scope, GraphScope::Project(_)) {
+            return Err(StoreError::Constraint(override_outside_project(new.scope)));
         }
         if self.graphs.contains_key(&new.id) {
             return Err(StoreError::Constraint(format!(
@@ -3488,24 +3511,33 @@ impl State {
         if self
             .graphs
             .values()
-            .any(|row| row.project_id == new.project_id && row.name == new.name)
+            .any(|row| row.scope == new.scope && row.name == new.name)
         {
-            return Err(StoreError::Constraint(format!(
-                "step_graph.name `{}` is taken in project `{}`",
-                new.name, new.project_id
+            return Err(StoreError::Constraint(graph_name_is_taken(
+                &new.name, new.scope,
             )));
         }
         let row = StepGraph {
             id: new.id,
-            project_id: new.project_id,
+            scope: new.scope,
             name: new.name,
             description: new.description,
             is_override: new.is_override,
+            revision: 0,
             created_at: now,
             updated_at: now,
         };
         self.graphs.insert(row.id, row.clone());
         Ok(row)
+    }
+
+    /// MOD-137 D5: one write to `graph`'s content: `revision + 1`, and `updated_at` moves as the
+    /// Postgres trigger moves it. Called after the writer's last refusal.
+    fn bump_graph(&mut self, graph: StepGraphId, now: DateTime<Utc>) {
+        if let Some(row) = self.graphs.get_mut(&graph) {
+            row.revision += 1;
+            row.updated_at = now;
+        }
     }
 
     /// Compare-and-set on `step_graph.updated_at`.
@@ -3528,13 +3560,14 @@ impl State {
             return Ok(CasOutcome::Stale(current));
         }
         if let Some(name) = &patch.name
-            && self.graphs.values().any(|row| {
-                row.id != id && row.project_id == current.project_id && row.name == *name
-            })
+            && self
+                .graphs
+                .values()
+                .any(|row| row.id != id && row.scope == current.scope && row.name == *name)
         {
-            return Err(StoreError::Constraint(format!(
-                "step_graph.name `{name}` is taken in project `{}`",
-                current.project_id
+            return Err(StoreError::Constraint(graph_name_is_taken(
+                name,
+                current.scope,
             )));
         }
         let row = self
@@ -3547,6 +3580,7 @@ impl State {
         if let Some(description) = patch.description {
             row.description = description;
         }
+        row.revision += 1;
         row.updated_at = now;
         Ok(CasOutcome::Applied(row.clone()))
     }
@@ -3556,7 +3590,7 @@ impl State {
         let mut rows: Vec<StepGraph> = self
             .graphs
             .values()
-            .filter(|row| row.project_id == project)
+            .filter(|row| row.scope == GraphScope::Project(project))
             .cloned()
             .collect();
         rows.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
@@ -3585,14 +3619,12 @@ impl State {
                 .any(|row| row.graph_id == graph && Some(row.id) != except && taken(row))
         };
         if clashes(&|row| row.position == position) {
-            return Err(StoreError::Constraint(format!(
-                "step_graph_phase.position {position} is taken in graph `{graph}`"
+            return Err(StoreError::Constraint(phase_position_is_taken(
+                position, graph,
             )));
         }
         if clashes(&|row| row.name == name) {
-            return Err(StoreError::Constraint(format!(
-                "step_graph_phase.name `{name}` is taken in graph `{graph}`"
-            )));
+            return Err(StoreError::Constraint(phase_name_is_taken(name, graph)));
         }
         Ok(())
     }
@@ -3603,6 +3635,14 @@ impl State {
         phase: &StepGraphPhase,
         now: DateTime<Utc>,
     ) -> Result<StepGraphPhase> {
+        // MOD-137 blueprint §T2.2's order: the reserved name, the node CHECKs, the graph, the
+        // clashes, then the persona and agent references.
+        if TemplateRole::of_name(&phase.name) != TemplateRole::Phase {
+            return Err(StoreError::Constraint(reserved_phase_name(&phase.name)));
+        }
+        if let Some(refusal) = phase_row_refusal(phase) {
+            return Err(StoreError::Constraint(refusal));
+        }
         self.check_phase(phase.graph_id, phase.position, &phase.name, None)?;
         if self.phase(phase.id).is_some() {
             return Err(StoreError::Constraint(format!(
@@ -3611,19 +3651,56 @@ impl State {
             )));
         }
         // MOD-26 D5: Postgres's order, the unique indexes at insert and the foreign key after.
-        if let Some(persona) = phase.persona_id {
-            self.require_persona(persona)?;
+        for (column, persona) in [
+            ("step_graph_phase.persona_id", phase.persona_id),
+            (
+                "step_graph_phase.planner_persona_id",
+                phase.planner_persona_id,
+            ),
+            (
+                "step_graph_phase.integrate_persona_id",
+                phase.integrate_persona_id,
+            ),
+        ] {
+            if let Some(persona) = persona
+                && !self.personas.contains_key(&persona)
+            {
+                return Err(StoreError::Constraint(references_no_row(
+                    column, persona, "persona",
+                )));
+            }
+        }
+        for (column, agent) in [
+            ("step_graph_phase.planner_agent_id", phase.planner_agent_id),
+            (
+                "step_graph_phase.integrate_agent_id",
+                phase.integrate_agent_id,
+            ),
+        ] {
+            if let Some(agent) = agent
+                && !self.agents.contains_key(&agent)
+            {
+                return Err(StoreError::Constraint(references_no_row(
+                    column, agent, "agent",
+                )));
+            }
         }
         let mut row = phase.clone();
         row.updated_at = now;
         self.phases.push(row.clone());
+        self.bump_graph(row.graph_id, now);
         Ok(row)
     }
 
     /// Inserts a phase's candidate rows, all or nothing (MOD-37 R-6): every refusal is decided
     /// before the first insert, and is a `Constraint` as `PgStore`'s is. An empty slice checks
     /// nothing.
-    fn create_phase_agents(&mut self, phase: PhaseId, agents: &[PhaseAgent]) -> Result<()> {
+    fn create_phase_agents(
+        &mut self,
+        phase: PhaseId,
+        agents: &[PhaseAgent],
+        now: DateTime<Utc>,
+    ) -> Result<()> {
         if agents.is_empty() {
             return Ok(());
         }
@@ -3663,6 +3740,9 @@ impl State {
                 .iter()
                 .map(|row| ((row.phase_id, row.position), row.clone())),
         );
+        if let Some(graph) = self.phase(phase).map(|row| row.graph_id) {
+            self.bump_graph(graph, now);
+        }
         Ok(())
     }
 
@@ -3724,7 +3804,9 @@ impl State {
             row.persona_id = persona;
         }
         row.updated_at = now;
-        Ok(CasOutcome::Applied(row.clone()))
+        let row = row.clone();
+        self.bump_graph(row.graph_id, now);
+        Ok(CasOutcome::Applied(row))
     }
 
     /// A graph's phases, ordered by `position`, which is unique per graph.
@@ -4008,22 +4090,45 @@ impl State {
     }
 
     /// MOD-26 M2 D14: `NotFound("persona")` → [`persona_is_bound`] naming every phase that binds
-    /// it (graph → project; a missing parent is named `?`, unreachable, B-5) → remove.
+    /// it (graph → owner; a missing parent is named `?`, unreachable, B-5) → remove. MOD-137 D7,
+    /// F8: a phase also holds it through `planner_persona_id`, `integrate_persona_id` and its
+    /// `phase_part` rows, and the owner is the project slug, `workspace:<slug>` or `library`.
     fn delete_persona(&mut self, id: PersonaId) -> Result<()> {
         let persona = self.personas.get(&id).ok_or_else(|| StoreError::NotFound {
             entity: "persona",
             id: id.to_string(),
         })?;
-        if self.phases.iter().any(|phase| phase.persona_id == Some(id)) {
+        let holds = |phase: &StepGraphPhase| {
+            [
+                phase.persona_id,
+                phase.planner_persona_id,
+                phase.integrate_persona_id,
+            ]
+            .contains(&Some(id))
+                || self
+                    .phase_parts
+                    .range((phase.id, i32::MIN)..=(phase.id, i32::MAX))
+                    .any(|(_, part)| part.persona_id == Some(id))
+        };
+        if self.phases.iter().any(holds) {
             let holders: Vec<(String, String, String)> = self
                 .phases
                 .iter()
-                .filter(|phase| phase.persona_id == Some(id))
+                .filter(|phase| holds(phase))
                 .map(|phase| {
                     let graph = self.graphs.get(&phase.graph_id);
-                    let project = graph.and_then(|graph| self.projects.get(&graph.project_id));
+                    let owner = graph.and_then(|graph| match graph.scope {
+                        GraphScope::Project(project) => {
+                            self.projects.get(&project).map(|row| row.slug.clone())
+                        }
+                        GraphScope::Workspace(workspace) => self
+                            .workspaces
+                            .get(&workspace)
+                            .map(|row| format!("workspace:{}", row.slug)),
+                        GraphScope::Library => Some("library".to_owned()),
+                    });
                     (
-                        project.map_or_else(|| "?".to_owned(), |row| row.slug.clone()),
+                        owner.unwrap_or_else(|| "?".to_owned()),
                         graph.map_or_else(|| "?".to_owned(), |row| row.name.clone()),
                         phase.name.clone(),
                     )
@@ -4136,9 +4241,11 @@ impl State {
                     entity: "step_graph_phase",
                     id: id.to_string(),
                 })?;
+                // MOD-137 F9: a phase of a workspace or library graph has no project, so rule 2
+                // refuses its binding (plan D4: no use of a non-project graph yet).
                 self.graphs
                     .get(&phase.graph_id)
-                    .map(|graph| graph.project_id)
+                    .and_then(|graph| graph.scope.project_id())
             }
             None => None,
         };
@@ -4349,6 +4456,8 @@ impl State {
                     .expect("the row was read a statement ago under the same lock");
                 phase.token_budget = Some(budget);
                 phase.updated_at = now;
+                let graph = phase.graph_id;
+                self.bump_graph(graph, now);
                 Ok(CasOutcome::Applied(StoredSetting {
                     value: Some(value),
                     updated_at: now,
@@ -4439,6 +4548,8 @@ impl State {
                     .expect("the row was read a statement ago under the same lock");
                 phase.token_budget = None;
                 phase.updated_at = now;
+                let graph = phase.graph_id;
+                self.bump_graph(graph, now);
                 Ok(CasOutcome::Applied(StoredSetting {
                     value: None,
                     updated_at: now,
@@ -4662,12 +4773,41 @@ impl State {
         }))
     }
 
-    /// What a workspace delete reaches: its links and its box paths, and no project (D4).
+    /// MOD-137 D3: a workspace's graphs and their phases, which its delete takes
+    /// (`fk_step_graph_workspace ... ON DELETE CASCADE`).
+    fn workspace_graphs(&self, id: WorkspaceId) -> (HashSet<StepGraphId>, HashSet<PhaseId>) {
+        let graphs: HashSet<StepGraphId> = self
+            .graphs
+            .values()
+            .filter(|row| row.scope == GraphScope::Workspace(id))
+            .map(|row| row.id)
+            .collect();
+        let phases = self
+            .phases
+            .iter()
+            .filter(|row| graphs.contains(&row.graph_id))
+            .map(|row| row.id)
+            .collect();
+        (graphs, phases)
+    }
+
+    /// What a workspace delete reaches: its links and its box paths, and no project (D4); since
+    /// MOD-137 D3 also its graphs, their phases and their candidates (no new `DeleteReach` field:
+    /// blueprint §4 item 9).
     fn workspace_reach(&self, id: WorkspaceId) -> Option<DeleteReach> {
         if !self.workspaces.contains_key(&id) {
             return None;
         }
+        let (graphs, phases) = self.workspace_graphs(id);
         Some(DeleteReach {
+            step_graphs: rows(graphs.len()),
+            phases: rows(phases.len()),
+            phase_agents: rows(
+                self.phase_agents
+                    .keys()
+                    .filter(|(phase, _)| phases.contains(phase))
+                    .count(),
+            ),
             workspace_links: rows(
                 self.workspace_projects
                     .iter()
@@ -4720,7 +4860,7 @@ impl State {
         let graphs: HashSet<StepGraphId> = self
             .graphs
             .values()
-            .filter(|row| row.project_id == id)
+            .filter(|row| row.scope == GraphScope::Project(id))
             .map(|row| row.id)
             .collect();
         let phases: HashSet<PhaseId> = self
@@ -4902,6 +5042,18 @@ impl State {
                 entity: "workspace",
                 id: id.to_string(),
             })?;
+        // MOD-137 D3: its graphs go, with everything that cascades from them.
+        let (graphs, phases) = self.workspace_graphs(id);
+        self.phase_agents
+            .retain(|(phase, _), _| !phases.contains(phase));
+        self.phase_parts
+            .retain(|(phase, _), _| !phases.contains(phase));
+        self.edges
+            .retain(|_, edge| !graphs.contains(&edge.graph_id));
+        self.skill_bindings
+            .retain(|row| row.phase_id.is_none_or(|phase| !phases.contains(&phase)));
+        self.phases.retain(|row| !phases.contains(&row.id));
+        self.graphs.retain(|graph, _| !graphs.contains(graph));
         self.workspace_projects.retain(|row| row.workspace_id != id);
         self.workspace_box_paths
             .retain(|row| row.workspace_id != id);
@@ -5015,6 +5167,11 @@ impl State {
         self.skill_bindings.retain(|row| row.project_id != Some(id));
         self.kinds.retain(|_, row| row.project_id != id);
         self.phase_agents
+            .retain(|(phase, _), _| !gone.phases.contains(phase));
+        // MOD-137 D6, D8: edges and parts go with their graph and phase (`ON DELETE CASCADE`).
+        self.edges
+            .retain(|_, edge| !gone.graphs.contains(&edge.graph_id));
+        self.phase_parts
             .retain(|(phase, _), _| !gone.phases.contains(phase));
         self.phases.retain(|row| !gone.phases.contains(&row.id));
         self.graphs.retain(|id, _| !gone.graphs.contains(id));
@@ -8657,7 +8814,8 @@ impl WriteStore for MemStore {
     }
 
     async fn create_phase_agents(&self, phase: PhaseId, agents: &[PhaseAgent]) -> Result<()> {
-        self.write(|state| state.create_phase_agents(phase, agents))
+        let now = self.now();
+        self.write(|state| state.create_phase_agents(phase, agents, now))
     }
 
     async fn update_phase(
@@ -9395,6 +9553,7 @@ mod tests {
         StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
         executor_scrub_refusal,
     };
+    use crate::model::{EdgeId, EdgeKind, GraphScope, PhasePart, StepGraphEdge};
     use crate::prompt::settings::SettingKey;
     use crate::prompt::{DEFAULT_TEMPLATES, body_of};
     use crate::store::error::StoreError;
@@ -11871,10 +12030,58 @@ mod tests {
             1,
             "precondition: its claim"
         );
+        // MOD-137 D6, D8: an edge and a part on the project's graphs, staged, so both new maps
+        // have a row the cascade must take.
+        store.write(|state| {
+            let graph = state
+                .graphs
+                .values()
+                .find(|row| row.scope == GraphScope::Project(gone))
+                .map(|row| row.id)
+                .expect("the project has a graph");
+            let phases = state.phase_rows(graph);
+            let (from, to) = (phases[0].id, phases[1].id);
+            let edge = EdgeId::new();
+            state.edges.insert(
+                edge,
+                StepGraphEdge {
+                    id: edge,
+                    graph_id: graph,
+                    from,
+                    to,
+                    kind: EdgeKind::Next,
+                    predicate: None,
+                    loop_limit: None,
+                },
+            );
+            state.phase_parts.insert(
+                (from, 0),
+                PhasePart {
+                    phase_id: from,
+                    position: 0,
+                    key: "core".to_owned(),
+                    title: "Core".to_owned(),
+                    brief: String::new(),
+                    owned_paths: Vec::new(),
+                    acceptance: None,
+                    agent_id: None,
+                    model: None,
+                    persona_id: None,
+                },
+            );
+        });
         store.delete_project(gone).await.expect("the delete lands");
 
         store.read(|state| {
             assert!(!state.projects.contains_key(&gone), "the project itself");
+            assert!(
+                state.edges.is_empty(),
+                "step_graph_edge goes with its graph (MOD-137 D6)"
+            );
+            assert!(
+                state.phase_parts.is_empty(),
+                "phase_part goes with its phase (MOD-137 D8)"
+            );
             assert!(
                 state
                     .permissions
@@ -11908,7 +12115,10 @@ mod tests {
                 "item_kind"
             );
             assert!(
-                state.graphs.values().all(|row| row.project_id != gone),
+                state
+                    .graphs
+                    .values()
+                    .all(|row| row.scope != GraphScope::Project(gone)),
                 "step_graph"
             );
             assert!(
