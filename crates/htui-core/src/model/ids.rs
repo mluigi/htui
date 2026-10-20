@@ -97,6 +97,8 @@ id_newtype!(
     StepGraphId,
     /// `step_graph_phase.id` (§5.4).
     PhaseId,
+    /// `step_graph_edge.id` (MOD-137 D6).
+    EdgeId,
     /// `prompt_template.id` (§5.4).
     PromptTemplateId,
     /// `agent.id` (§5.7).

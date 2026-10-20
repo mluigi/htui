@@ -6,8 +6,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use core::fmt;
+
 use crate::model::ids::{
-    AgentId, ItemKindId, PersonaId, PhaseId, ProjectId, PromptTemplateId, StepGraphId, UserId,
+    AgentId, EdgeId, ItemKindId, PersonaId, PhaseId, ProjectId, PromptTemplateId, StepGraphId,
+    UserId, WorkspaceId,
 };
 use crate::model::persona::Persona;
 
@@ -211,6 +214,210 @@ pub struct ItemKindPatch {
     pub default_graph_id: Option<StepGraphId>,
     /// `item_kind.position`.
     pub position: Option<i32>,
+}
+
+/// Who owns a `step_graph` row (MOD-137 D3): a project, a workspace, or neither — the global
+/// workflow library. `ck_step_graph_owner` keeps at most one of the two columns set. Who may *use*
+/// a non-project graph is MOD-138's (plan D4): today a kind or item still names only its own
+/// project's graphs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "owner", content = "id", rename_all = "snake_case")]
+pub enum GraphScope {
+    /// `step_graph.project_id` set.
+    Project(ProjectId),
+    /// `step_graph.workspace_id` set.
+    Workspace(WorkspaceId),
+    /// Neither set: the global workflow library (ANA-33 §7.1).
+    Library,
+}
+
+impl GraphScope {
+    /// `step_graph.project_id`.
+    #[must_use]
+    pub const fn project_id(self) -> Option<ProjectId> {
+        match self {
+            Self::Project(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// `step_graph.workspace_id`.
+    #[must_use]
+    pub const fn workspace_id(self) -> Option<WorkspaceId> {
+        match self {
+            Self::Workspace(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// The two columns back into a scope; `None` when both are set, which `ck_step_graph_owner`
+    /// makes unreachable on Postgres (the Pg row decoder answers `StoreError::Backend` then).
+    #[must_use]
+    pub const fn from_columns(
+        project: Option<ProjectId>,
+        workspace: Option<WorkspaceId>,
+    ) -> Option<Self> {
+        match (project, workspace) {
+            (Some(p), None) => Some(Self::Project(p)),
+            (None, Some(w)) => Some(Self::Workspace(w)),
+            (None, None) => Some(Self::Library),
+            (Some(_), Some(_)) => None,
+        }
+    }
+}
+
+/// `project `<id>``, `workspace `<id>`` or `the library`: the tail of every scope sentence.
+impl fmt::Display for GraphScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Project(id) => write!(f, "project `{id}`"),
+            Self::Workspace(id) => write!(f, "workspace `{id}`"),
+            Self::Library => f.write_str("the library"),
+        }
+    }
+}
+
+str_enum!(
+    /// `step_graph_phase.split` (MOD-137 D7, ANA-33 §7.1). `compete` is exactly `fan_out > 1`
+    /// (`ck_phase_split_fan_out`); `divide` alone may carry the planner/integrate columns and
+    /// `phase_part` rows. Always written qualified (`Split::None`), never glob-imported.
+    #[derive(Default)]
+    Split {
+        /// One step.
+        #[default]
+        None => "none",
+        /// Rival candidates, today's fan-out (ANA-2 §4.5).
+        Compete => "compete",
+        /// Planner, parts, integrate (ANA-33 §7.4).
+        Divide => "divide",
+    }
+);
+
+str_enum!(
+    /// `step_graph_phase.plan_scope` (MOD-137 D7, ANA-33 §7.5): what a planner node may plan.
+    PlanScope {
+        /// Only the divided node's parts.
+        Parts => "parts",
+        /// The node's successors.
+        Successors => "successors",
+        /// The whole graph.
+        Graph => "graph",
+    }
+);
+
+str_enum!(
+    /// `step_graph_edge.kind` (MOD-137 D6).
+    EdgeKind {
+        /// Unconditional successor.
+        Next => "next",
+        /// Taken when `predicate` holds (ANA-33 §7.3); the only kind with a predicate.
+        If => "if",
+        /// A person picks whether it is taken; forward or back, `loop_limit` optional here.
+        AsksYou => "asks_you",
+        /// The review loop (R-ORCH-3); carries `loop_limit`.
+        ChangesRequested => "changes_requested",
+        /// Taken when the source fails; carries `loop_limit`.
+        Fails => "fails",
+    }
+);
+
+impl EdgeKind {
+    /// `ck_step_graph_edge_predicate`: `if` and only `if` carries one.
+    #[must_use]
+    pub const fn takes_predicate(self) -> bool {
+        matches!(self, Self::If)
+    }
+
+    /// `ck_step_graph_edge_loop_limit_required`.
+    #[must_use]
+    pub const fn needs_loop_limit(self) -> bool {
+        matches!(self, Self::ChangesRequested | Self::Fails)
+    }
+}
+
+/// `step_graph_edge.predicate` (MOD-137 D6): opaque JSON in MOD-137; MOD-138 replaces the inside
+/// with ANA-33 §7.3's closed predicate set without a column change.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EdgePredicate(pub Value);
+
+/// A row of `step_graph_edge` (MOD-137 D6). Replaced, never edited: no `updated_at`, and
+/// `created_at` is not carried.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StepGraphEdge {
+    /// `step_graph_edge.id`, minted client-side as a UUIDv7.
+    pub id: EdgeId,
+    /// `step_graph_edge.graph_id`.
+    pub graph_id: StepGraphId,
+    /// `step_graph_edge.from_phase_id`; a phase of `graph_id`.
+    pub from: PhaseId,
+    /// `step_graph_edge.to_phase_id`; a phase of `graph_id`, never `from`.
+    pub to: PhaseId,
+    /// `step_graph_edge.kind`.
+    pub kind: EdgeKind,
+    /// `step_graph_edge.predicate`; `Some` iff `kind` is `if`.
+    #[serde(default)]
+    pub predicate: Option<EdgePredicate>,
+    /// `step_graph_edge.loop_limit` (ANA-33's `limit`, plan D2); required on
+    /// `changes_requested` and `fails`, `>= 0`.
+    #[serde(default)]
+    pub loop_limit: Option<i32>,
+}
+
+/// A row of `phase_part` (MOD-137 D8): one default part of a `divide` node, by `position`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PhasePart {
+    /// `phase_part.phase_id`.
+    pub phase_id: PhaseId,
+    /// `phase_part.position`.
+    pub position: i32,
+    /// `phase_part.key`, unique within the phase.
+    pub key: String,
+    /// `phase_part.title`.
+    pub title: String,
+    /// `phase_part.brief`.
+    #[serde(default)]
+    pub brief: String,
+    /// `phase_part.owned_paths`.
+    #[serde(default)]
+    pub owned_paths: Vec<String>,
+    /// `phase_part.acceptance`.
+    #[serde(default)]
+    pub acceptance: Option<String>,
+    /// `phase_part.agent_id`.
+    #[serde(default)]
+    pub agent_id: Option<AgentId>,
+    /// `phase_part.model`.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// `phase_part.persona_id` (`ON DELETE RESTRICT`).
+    #[serde(default)]
+    pub persona_id: Option<PersonaId>,
+}
+
+/// One node of a [`GraphBody`]: the phase row, its candidates and its parts, each by `position`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeBody {
+    /// The `step_graph_phase` row; `updated_at` is ignored on write.
+    pub phase: StepGraphPhase,
+    /// Its `phase_agent` rows, replaced wholesale.
+    #[serde(default)]
+    pub agents: Vec<PhaseAgent>,
+    /// Its `phase_part` rows, replaced wholesale; only a `divide` node has any.
+    #[serde(default)]
+    pub parts: Vec<PhasePart>,
+}
+
+/// A graph's whole editable content, the one write of MOD-141's editor (MOD-137 D10).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphBody {
+    /// The graph row. `name` and `description` are written; `scope`, `is_override`, `revision`
+    /// and the timestamps are read-only (ignored on write, the stored values on read).
+    pub graph: StepGraph,
+    /// By `position`.
+    pub nodes: Vec<NodeBody>,
+    /// By (from position, to position, kind bytes).
+    pub edges: Vec<StepGraphEdge>,
 }
 
 /// A row of `step_graph` (§5.4).
@@ -487,10 +694,11 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        CommandQueue, HEAVY_BUILD_TAG, HEAVY_COMMAND_PREFIXES, ItemKind, PhasePatch,
-        PromptTemplate, command_limit, command_queue_exposed, resolve_command_limits,
+        CommandQueue, EdgeKind, GraphScope, HEAVY_BUILD_TAG, HEAVY_COMMAND_PREFIXES, ItemKind,
+        PhasePatch, PromptTemplate, Split, command_limit, command_queue_exposed,
+        resolve_command_limits,
     };
-    use crate::model::ids::PersonaId;
+    use crate::model::ids::{PersonaId, ProjectId, WorkspaceId};
 
     fn tags(names: &[&str]) -> Vec<String> {
         names.iter().map(|name| (*name).to_owned()).collect()
@@ -693,6 +901,100 @@ mod tests {
             assert_eq!(back, patch, "`{text}` round-trips");
             let read: PhasePatch = serde_json::from_str(&json).expect("the literal deserialises");
             assert_eq!(read.persona, persona, "`{json}` reads as {persona:?}");
+        }
+    }
+
+    /// MOD-137 D3: the scope's wire shape names its owner, and carries an id only when it has one.
+    #[test]
+    fn graph_scope_round_trips_through_serde() {
+        let project = ProjectId::new();
+        let workspace = WorkspaceId::new();
+        for (scope, wire) in [
+            (
+                GraphScope::Project(project),
+                json!({"owner": "project", "id": project.to_string()}),
+            ),
+            (
+                GraphScope::Workspace(workspace),
+                json!({"owner": "workspace", "id": workspace.to_string()}),
+            ),
+            (GraphScope::Library, json!({"owner": "library"})),
+        ] {
+            assert_eq!(
+                serde_json::to_value(scope).expect("a scope serialises"),
+                wire
+            );
+            let back: GraphScope = serde_json::from_value(wire).expect("a scope deserialises");
+            assert_eq!(back, scope);
+        }
+    }
+
+    /// MOD-137 D3: `ck_step_graph_owner` in Rust: both columns set is no scope.
+    #[test]
+    fn graph_scope_from_columns_refuses_both() {
+        let project = ProjectId::new();
+        let workspace = WorkspaceId::new();
+        assert_eq!(
+            GraphScope::from_columns(Some(project), None),
+            Some(GraphScope::Project(project))
+        );
+        assert_eq!(
+            GraphScope::from_columns(None, Some(workspace)),
+            Some(GraphScope::Workspace(workspace))
+        );
+        assert_eq!(
+            GraphScope::from_columns(None, None),
+            Some(GraphScope::Library)
+        );
+        assert_eq!(
+            GraphScope::from_columns(Some(project), Some(workspace)),
+            None
+        );
+        for scope in [
+            GraphScope::Project(project),
+            GraphScope::Workspace(workspace),
+            GraphScope::Library,
+        ] {
+            assert_eq!(
+                GraphScope::from_columns(scope.project_id(), scope.workspace_id()),
+                Some(scope),
+                "the helpers are the columns"
+            );
+        }
+    }
+
+    /// MOD-137 §1.5: the tail of every scope sentence.
+    #[test]
+    fn graph_scope_display_spells_the_three_owners() {
+        let project = ProjectId::new();
+        let workspace = WorkspaceId::new();
+        assert_eq!(
+            GraphScope::Project(project).to_string(),
+            format!("project `{project}`")
+        );
+        assert_eq!(
+            GraphScope::Workspace(workspace).to_string(),
+            format!("workspace `{workspace}`")
+        );
+        assert_eq!(GraphScope::Library.to_string(), "the library");
+    }
+
+    /// MOD-137 D7: the column default.
+    #[test]
+    fn split_defaults_to_none() {
+        assert_eq!(Split::default(), Split::None);
+    }
+
+    /// MOD-137 D6: `ck_step_graph_edge_predicate` and `ck_step_graph_edge_loop_limit_required`.
+    #[test]
+    fn edge_kind_rules_match_the_checks() {
+        for kind in EdgeKind::ALL {
+            assert_eq!(kind.takes_predicate(), *kind == EdgeKind::If, "{kind}");
+            assert_eq!(
+                kind.needs_loop_limit(),
+                matches!(kind, EdgeKind::ChangesRequested | EdgeKind::Fails),
+                "{kind}"
+            );
         }
     }
 }

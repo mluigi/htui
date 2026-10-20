@@ -123,10 +123,10 @@ pub use hierarchy::{
     RepoPatch, Workspace, WorkspaceBoxPath, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
 };
 pub use ids::{
-    AgentId, BatchId, BoxId, CommandRunId, DocumentId, ItemId, ItemKindId, NoteId, PermissionId,
-    PersonaId, PhaseId, ProjectId, PromptTemplateId, RelaySessionId, RepoId, RequirementAreaId,
-    RequirementId, RunCommandId, RunId, SkillBindingId, SkillId, StepGraphId, StepId, UserId,
-    WorkspaceId,
+    AgentId, BatchId, BoxId, CommandRunId, DocumentId, EdgeId, ItemId, ItemKindId, NoteId,
+    PermissionId, PersonaId, PhaseId, ProjectId, PromptTemplateId, RelaySessionId, RepoId,
+    RequirementAreaId, RequirementId, RunCommandId, RunId, SkillBindingId, SkillId, StepGraphId,
+    StepId, UserId, WorkspaceId,
 };
 pub use item::{
     Item, ItemFilter, ItemPatch, ItemRevision, ItemSummary, NewItem, Resolution, Status,
@@ -134,9 +134,10 @@ pub use item::{
 pub use item_merge::{FieldState, Side, SpecField, SpecMerge};
 pub use item_spec::{EditReason, ItemSpec, SpecChanges, SpecContext, SpecError};
 pub use kind::{
-    CommandQueue, Gate, Isolation, ItemKind, ItemKindPatch, NewItemKind, NewPromptTemplate,
-    NewStepGraph, PhaseAgent, PhasePatch, ProjectSettings, PromptTemplate, ResolvedGraph,
-    ResolvedPhase, StepGraph, StepGraphPatch, StepGraphPhase,
+    CommandQueue, EdgeKind, EdgePredicate, Gate, GraphBody, GraphScope, Isolation, ItemKind,
+    ItemKindPatch, NewItemKind, NewPromptTemplate, NewStepGraph, NodeBody, PhaseAgent, PhasePart,
+    PhasePatch, PlanScope, ProjectSettings, PromptTemplate, ResolvedGraph, ResolvedPhase, Split,
+    StepGraph, StepGraphEdge, StepGraphPatch, StepGraphPhase,
 };
 pub use link::{ItemLink, LinkEdge, LinkGraph, LinkKind, LinkNode, UpstreamEntry};
 pub use note::{NewNote, Note};
@@ -376,6 +377,18 @@ mod tests {
         check_enum(CommandQueue::ALL, &["off", "fan_out_only", "always"]);
     }
 
+    /// `0020_step_graph_v2.sql`'s `ck_phase_split`, `ck_phase_plan_scope` and
+    /// `ck_step_graph_edge_kind` (MOD-137 D6, D7).
+    #[test]
+    fn graph_v2_enums_match_check_lists() {
+        check_enum(Split::ALL, &["none", "compete", "divide"]);
+        check_enum(PlanScope::ALL, &["parts", "successors", "graph"]);
+        check_enum(
+            EdgeKind::ALL,
+            &["next", "if", "asks_you", "changes_requested", "fails"],
+        );
+    }
+
     /// `0019_stop_runs.sql`'s `chk_workspace_stop_mode` (MOD-125 plan D4).
     #[test]
     fn stop_mode_matches_check_list() {
@@ -494,6 +507,7 @@ mod tests {
         check_id(DocumentId::from_uuid(u), u);
         check_id(StepGraphId::from_uuid(u), u);
         check_id(PhaseId::from_uuid(u), u);
+        check_id(EdgeId::from_uuid(u), u);
         check_id(PromptTemplateId::from_uuid(u), u);
         check_id(AgentId::from_uuid(u), u);
         check_id(RunId::from_uuid(u), u);
