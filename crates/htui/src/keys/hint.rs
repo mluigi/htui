@@ -265,7 +265,8 @@ impl Keys {
     /// The `?` box (D8, MOD-67 M3): one line per layer of `stack`, narrowest first, under the
     /// layer's `Context::heading`. A row is listed under the first layer that admits it and has
     /// a row for it (the `actions` shadowing rule, L-B Q6), with every chord that layer admits
-    /// but those a listed narrower act always takes ([`SHADOWING`], MOD-115 M2 T5R);
+    /// but those a listed narrower act always takes ([`SHADOWING`], MOD-115 M2 T5R) and those a
+    /// version-1 file's kept row steps aside from there (`stepped_aside`, MOD-115 M2 RV4);
     /// rows sharing a help label merge, and a row with no admitted chord drops. `offered` is
     /// consulted for `Global` and `Layout` rows only (the shell's: a layout key acts only on a
     /// tab with a list and a detail, MOD-115 M2 D2). Every global layer of the stack renders as **one**
@@ -310,7 +311,9 @@ impl Keys {
                     .iter()
                     .copied()
                     .filter(|chord| {
-                        layer.admits_chord(*chord) && !self.shadowed(stack, *chord, row.act)
+                        layer.admits_chord(*chord)
+                            && !self.shadowed(stack, *chord, row.act)
+                            && !self.stepped_aside(stack, *chord, row.act)
                     })
                     .collect();
                 match merged.iter_mut().find(|(help, _)| *help == row.help) {
@@ -351,6 +354,17 @@ impl Keys {
                         .spec()
                         .is_none_or(|spec| spec.context != Context::Field)
             })
+    }
+
+    /// Whether `act`, a kept row of a version-1 file, steps aside from `chord` in `stack`
+    /// (MOD-115 M2 RV4): [`Keys::actions`] drops it there for an older entry that added the
+    /// chord (`validate::v1_steps_aside`), so the box lists the chord under that entry only.
+    /// `[confirm] yes = ["space"]` puts `Space` under `Confirm` on the Runs close-out warning,
+    /// not also under `Choice` as the toggle.
+    fn stepped_aside(&self, stack: Stack<'_>, chord: KeyChord, act: Act) -> bool {
+        self.version == 1
+            && super::validate::steps_aside(act)
+            && !self.actions(stack, chord).contains(&act)
     }
 
     /// One `?` box line for `context` (D8): every offered and bound action, all its chords
@@ -897,6 +911,34 @@ mod tests {
             texts(keys.help_lines(views::CAPTURE, bare)),
             [FIELD_LINE, "Global: Ctrl+c quit · F1 help · F9 about"]
         );
+    }
+
+    /// MOD-115 M2 RV4 (MD4, RV1 repair 1): the box lists what acts, as `Keys::actions` resolves
+    /// it. Under a version-1 `[confirm] yes = ["space"]` the kept `choice.toggle` steps aside on
+    /// the Runs close-out warning (`validate::v1_steps_aside`), so `Space` answers yes there and
+    /// the box does not list it as the toggle; where the row keeps `Space` (the filter form, the
+    /// attachment form) the box still lists `Space toggle`.
+    #[test]
+    fn the_box_never_lists_a_row_that_steps_aside_under_a_version_1_file() {
+        let keys =
+            crate::keys::load_str("version = 1\n[confirm]\nyes = [\"space\"]\n").expect("loads");
+        assert_eq!(
+            texts(keys.help_lines(views::RUNS_CONFIRM, bare)),
+            [
+                "Choice: Left/h previous option · Right/l next option",
+                "Confirm: Space yes · n/Esc no",
+                "Global: Ctrl+c quit · F1 help · F9 about",
+            ]
+        );
+        for stack in [views::BACKLOG_FILTER, views::ATTACH_FORM] {
+            let lines = texts(keys.help_lines(stack, bare));
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.starts_with("Choice:") && line.contains("Space toggle")),
+                "{lines:?}"
+            );
+        }
     }
 
     /// MOD-67 M4 PA-2: every global layer of a stack feeds the status line and one `Global:`
