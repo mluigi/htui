@@ -16,7 +16,7 @@ saves layout and the about panel the moment they change. Per the maintainer deci
 `ctrl-c` special case all go through the keymap. Only characters typed into a text field stay text.
 This amends `R-TUI-10`.
 
-**Status**: CONFIRMED by the maintainer 2026-10-18 as written. That means one milestone, not split.
+**Status**: COMPLETE 2026-10-20 on hr/MOD-115 (tasks T0-T8 plus review rounds RV1-RV4; Task 9's snapshot check folded into every task's gate). CONFIRMED by the maintainer 2026-10-18 as written. That means one milestone, not split.
 The D4 defaults (`ctrl-pgdn`/`ctrl-pgup` for tabs) and the D6 wording are accepted. Tasks 0 and 5
 (every key configurable) land before the layout wiring.
 

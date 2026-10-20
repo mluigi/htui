@@ -718,6 +718,17 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   (chrome rows only). Next, per `.claude/prds/mod-115-tui-shell.prd.md`: M2 layouts, pane keys,
   history, leave dialog, UI-state file; M3/M4 port the tabs and delete the hint adapter
   (`join_panes_under`, `paint_bottom_hints` use).
+  **Phase 2 landed (hr/MOD-115, 2026-10-20):** per-tab layouts (four presets, resize by key or
+  drag, show/hide, zoom) saved to a per-machine `ui-state.toml` off the UI loop; pane focus
+  (`Tab`/`Ctrl ←→`, tabs on `Ctrl PgDn/PgUp`, sub-tabs `Shift ←→`); browser-style history (50,
+  `⌫`/`Alt ←` back, `Alt →` forward, header chip); the leave dialog on `q`/`ctrl-c` (says work stops,
+  no stop-all yet: `R-TUI-18` stays with MOD-116/MOD-125); Backlog, Requirements and Skills on the
+  shell's panes, mouse capture only there. Every key is configurable (maintainer 2026-10-18): the
+  `FIXED` register is gone, `ctrl-c` rebindable with a no-way-out net, `Esc` never configurable;
+  `R-TUI-10` amended; version-1 `keys.toml` files keep loading. Record:
+  `docs/decisions/mod/mod-115-decisions.md`; plan/blueprint `.claude/plans/mod-115-tui-shell-m2.*`.
+  Left for M3/M4: literal `Enter …` hints outside the former fixed sites (e.g. Settings › Agents)
+  and other forms reading a translated field key (blueprint D-13).
 - [ ] **MOD-116 - Workspaces tab and workspace lifecycle** (from the UI redesign review,
   `docs/ui-redesign-findings-2026-10-15.md` §4.1). `R-TUI-14`, `R-ENT-2`, `R-ORCH-16`, `R-TUI-18`. A new tab listing every saved
   workspace with its state (open, background with runs going, stopping, stopped), an overview and
