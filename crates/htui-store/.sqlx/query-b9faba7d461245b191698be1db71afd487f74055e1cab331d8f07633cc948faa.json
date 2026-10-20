@@ -1,0 +1,169 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH u AS (\n            UPDATE memory_entry SET\n                kind          = COALESCE($2, kind),\n                subject       = COALESCE($3, subject),\n                body          = COALESCE($4, body),\n                state         = COALESCE($5, state),\n                superseded_by = COALESCE($6, superseded_by),\n                confirmed_at  = CASE WHEN $7::boolean THEN now() ELSE confirmed_at END,\n                version       = version + 1\n             WHERE id = $1\n            RETURNING id, project_id, kind, subject, body, state, version, confirmed_at,\n                      superseded_by, created_by, created_at, updated_at\n        ), v AS (\n            INSERT INTO memory_entry_revision (entry_id, version, kind, subject, body, state,\n                                               author_id, box_id, reason)\n            SELECT id, version, kind, subject, body, state, $8, $9, $10 FROM u\n            RETURNING entry_id\n        )\n        SELECT u.id            AS \"id!: MemoryEntryId\",\n               u.project_id    AS \"project_id!: ProjectId\",\n               u.kind          AS \"kind!: MemoryKind\",\n               u.subject       AS \"subject!\",\n               u.body          AS \"body!\",\n               u.state         AS \"state!: MemoryState\",\n               u.version       AS \"version!\",\n               u.confirmed_at  AS \"confirmed_at!\",\n               u.superseded_by AS \"superseded_by: MemoryEntryId\",\n               u.created_by    AS \"created_by!: UserId\",\n               u.created_at    AS \"created_at!\",\n               u.updated_at    AS \"updated_at!\"\n          FROM u, v\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!: MemoryEntryId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id!: ProjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "project_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "kind!: MemoryKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "subject!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "subject"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "body!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "body"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "state!: MemoryState",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "version!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "confirmed_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "confirmed_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "superseded_by: MemoryEntryId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "superseded_by"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "created_by!: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "updated_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "memory_entry",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Uuid",
+        "Bool",
+        "Uuid",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "b9faba7d461245b191698be1db71afd487f74055e1cab331d8f07633cc948faa"
+}

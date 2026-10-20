@@ -22,11 +22,12 @@ use sqlx::Row as _;
 /// The `connect_timeout` every headless connect here passes.
 const HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The 46 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
+/// The 48 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
 /// adds (`run_step_tree`, ANA-2 §9), then the six of `0006_requirements.sql` (ANA-11 §5), then
 /// the two of `0011_permission_relay.sql` (MOD-42 plan D1), then the one of `0012_persona.sql`
 /// (MOD-26 plan D1), then the two of `0016_auto_queue.sql` (MOD-12 plan D1, D2), then the one of
-/// `0017_follow_up.sql` (MOD-70 plan D1), then the one of `0019_stop_runs.sql` (MOD-125 plan D4).
+/// `0017_follow_up.sql` (MOD-70 plan D1), then the one of `0019_stop_runs.sql` (MOD-125 plan D4),
+/// then the two of `0020_memory.sql` (MOD-163 plan D1).
 const TABLES: &[&str] = &[
     "app_user",
     "capability_tag",
@@ -81,6 +82,9 @@ const TABLES: &[&str] = &[
     "follow_up_window",
     // 0019_stop_runs.sql (MOD-125)
     "workspace_stop",
+    // 0020_memory.sql (MOD-163)
+    "memory_entry",
+    "memory_entry_revision",
 ];
 
 #[tokio::test]
@@ -102,7 +106,7 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(
         applied,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
         ],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
@@ -112,7 +116,8 @@ async fn migrations_apply_on_a_clean_database() {
          MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql, MOD-26 milestone 2's \
          0013_persona_phase_index.sql, MOD-37 milestone 5's 0014_run_step_opening.sql, \
          MOD-11's 0015_command_queue.sql, MOD-12's 0016_auto_queue.sql, MOD-70's 0017_follow_up.sql, \
-         MOD-96's 0018_seed_permission_mode.sql and MOD-125's 0019_stop_runs.sql, in ordinal order"
+         MOD-96's 0018_seed_permission_mode.sql, MOD-125's 0019_stop_runs.sql and MOD-163's \
+         0020_memory.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -130,20 +135,22 @@ async fn migrations_apply_on_a_clean_database() {
     }
     assert_eq!(
         TABLES.len(),
-        46,
+        48,
         "blueprint B.1 lists 32 tables (ANA-9 §3's prose count of 30 is wrong, H.1), \
          0003_orchestration.sql adds run_step_tree, 0006_requirements.sql adds ANA-11 §5's six, \
          MOD-42's 0011_permission_relay.sql adds step_permission and run_command, MOD-26's \
          0012_persona.sql adds persona and MOD-12's 0016_auto_queue.sql adds queue_batch and queue_entry and MOD-70's 0017_follow_up.sql adds follow_up_window and \
-         MOD-125's 0019_stop_runs.sql adds workspace_stop"
+         MOD-125's 0019_stop_runs.sql adds workspace_stop and MOD-163's 0020_memory.sql adds \
+         memory_entry and memory_entry_revision"
     );
     // `_sqlx_migrations` is the only extra table sqlx adds.
     assert_eq!(
         present.len(),
         TABLES.len() + 1,
-        "the migrations create the 46 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
+        "the migrations create the 48 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
          MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql and MOD-12's 0016_auto_queue.sql (queue_batch, queue_entry) and MOD-70's \
-         0017_follow_up.sql and MOD-125's 0019_stop_runs.sql and nothing else, \
+         0017_follow_up.sql and MOD-125's 0019_stop_runs.sql and MOD-163's 0020_memory.sql \
+         (memory_entry, memory_entry_revision) and nothing else, \
          got {present:?}"
     );
 
@@ -647,6 +654,53 @@ const MOD125_TABLE_COMMENT: (&str, &str) = (
      settles abandoned runs of the workspace as stopped. Resume deletes it. Not mirrored.",
 );
 
+/// The five `COMMENT ON COLUMN` texts of `0020_memory.sql` (MOD-163 plan D1, D3, D4, D6),
+/// verbatim and in migration order, for [`ANA_COLUMN_COMMENTS`]'s reason.
+const MOD163_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
+    (
+        "memory_entry",
+        "state",
+        "MOD-163 D4: active and suspect are live, one per folded subject per project; superseded \
+         and retired are closed. Nothing in M1 sets suspect.",
+    ),
+    (
+        "memory_entry",
+        "version",
+        "MOD-163 D3: the compare-and-set token; every write moves it by one and writes a revision.",
+    ),
+    (
+        "memory_entry",
+        "confirmed_at",
+        "MOD-163 D3: when the text was last written or confirmed; create and amend set it, retire \
+         and supersede leave it.",
+    ),
+    (
+        "memory_entry",
+        "superseded_by",
+        "MOD-163 D4, D6: the entry that replaced this one, set only on a superseded entry; NULL \
+         again if that entry is deleted.",
+    ),
+    (
+        "memory_entry_revision",
+        "reason",
+        "MOD-163 D1: created, amended, retired or superseded (no CHECK, as \
+         requirement_revision.reason).",
+    ),
+];
+
+/// The two `COMMENT ON TABLE` texts of `0020_memory.sql` (MOD-163 plan D1), verbatim.
+const MOD163_TABLE_COMMENTS: [(&str, &str); 2] = [
+    (
+        "memory_entry",
+        "MOD-163 D1: project memory entries (R-ENT-13), written by a person in M1. Not mirrored \
+         (D7).",
+    ),
+    (
+        "memory_entry_revision",
+        "MOD-163 D1: append-only history of memory_entry, one row per version.",
+    ),
+];
+
 /// MOD-11 plan D14 (OQ-3): `0015_command_queue.sql` gives `command_run` its two liveness columns,
 /// both nullable (every row written before the migration, and every verify row, has neither) and
 /// both commented.
@@ -878,6 +932,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD11_COLUMN_COMMENTS)
         .chain(MOD12_COLUMN_COMMENTS)
         .chain(MOD125_COLUMN_COMMENTS)
+        .chain(MOD163_COLUMN_COMMENTS)
     {
         let actual: Option<String> = sqlx::query_scalar(
             "SELECT pg_catalog.col_description(c.oid, a.attnum) \
@@ -895,13 +950,16 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
             actual.as_deref(),
             Some(*expected),
             "{table}.{column}'s comment is the ANA (or MOD-7, MOD-9, MOD-23, MOD-33, MOD-26, \
-             MOD-11, MOD-12 or MOD-125) text byte for byte"
+             MOD-11, MOD-12, MOD-125 or MOD-163) text byte for byte"
         );
     }
 
     // The table comments, which `col_description` above cannot see: a table's own comment is
     // `objsubid = 0` on the class, not on any attribute.
-    for (table, expected) in [ANA_TABLE_COMMENT, MOD125_TABLE_COMMENT] {
+    for (table, expected) in [ANA_TABLE_COMMENT, MOD125_TABLE_COMMENT]
+        .into_iter()
+        .chain(MOD163_TABLE_COMMENTS)
+    {
         let actual: Option<String> = sqlx::query_scalar(
             "SELECT pg_catalog.obj_description(c.oid, 'pg_class') FROM pg_class c \
              WHERE c.relnamespace = 'public'::regnamespace AND c.relkind = 'r' AND c.relname = $1",
@@ -913,7 +971,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         assert_eq!(
             actual.as_deref(),
             Some(expected),
-            "{table}'s table comment is the ANA-2 §9 (or MOD-125) text byte for byte"
+            "{table}'s table comment is the ANA-2 §9 (or MOD-125, MOD-163) text byte for byte"
         );
     }
 
@@ -939,6 +997,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
             .chain(MOD11_COLUMN_COMMENTS)
             .chain(MOD12_COLUMN_COMMENTS)
             .chain(MOD125_COLUMN_COMMENTS)
+            .chain(MOD163_COLUMN_COMMENTS)
             .map(|(table, _, _)| (*table).to_owned())
             .collect::<BTreeSet<String>>()
             .into_iter()
@@ -958,6 +1017,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD11_COLUMN_COMMENTS)
         .chain(MOD12_COLUMN_COMMENTS)
         .chain(MOD125_COLUMN_COMMENTS)
+        .chain(MOD163_COLUMN_COMMENTS)
         .map(|(table, column, _)| ((*table).to_owned(), (*column).to_owned()))
         .collect();
     expected.sort();
@@ -1706,6 +1766,179 @@ async fn migration_0019_a_deleted_workspace_unscopes_its_runs_and_drops_its_stop
     db.drop_db().await;
 }
 
+/// Inserts one `memory_entry` (`kind = 'fact'`, `state = 'active'`) and answers its id, or the
+/// statement's error for the 0020 refusal tests (MOD-163 plan D1).
+async fn insert_memory_entry(
+    conn: &mut sqlx::PgConnection,
+    project: uuid::Uuid,
+    user: uuid::Uuid,
+    subject: &str,
+) -> Result<uuid::Uuid, sqlx::Error> {
+    let id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO memory_entry (id, project_id, kind, subject, body, created_by) \
+         VALUES ($1, $2, 'fact', $3, 'body', $4)",
+    )
+    .bind(id)
+    .bind(project)
+    .bind(subject)
+    .bind(user)
+    .execute(conn)
+    .await?;
+    Ok(id)
+}
+
+/// MOD-163 plan D4: `uq_memory_entry_live_subject` folds a subject with `lower(btrim())` among a
+/// project's live entries. `' foo '` clashes with `'Foo'`; once `'Foo'` is retired the subject is
+/// free again; another project's `'FOO'` never clashes.
+#[tokio::test]
+async fn migration_0020_folds_live_subjects_per_project() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let pool = &db.pool;
+    let user = db.store.this_user().as_uuid();
+    let (project, _) = plant_project_kind(pool, user, "memory").await;
+    let (other, _) = plant_project_kind(pool, user, "memory-other").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+
+    let first = insert_memory_entry(&mut conn, project, user, "Foo")
+        .await
+        .expect("the first live 'Foo' lands");
+    let err = insert_memory_entry(&mut conn, project, user, " foo ")
+        .await
+        .expect_err("a second live entry with the same folded subject is refused");
+    assert_refused_by(
+        err,
+        "uq_memory_entry_live_subject",
+        "a live ' foo ' beside 'Foo'",
+    );
+
+    sqlx::query("UPDATE memory_entry SET state = 'retired' WHERE id = $1")
+        .bind(first)
+        .execute(&mut *conn)
+        .await
+        .expect("retire 'Foo'");
+    insert_memory_entry(&mut conn, project, user, " foo ")
+        .await
+        .expect("a retired entry frees its subject");
+    insert_memory_entry(&mut conn, other, user, "FOO")
+        .await
+        .expect("another project's 'FOO' never clashes");
+
+    drop(conn);
+    db.drop_db().await;
+}
+
+/// MOD-163 plan D1, D6 (blueprint P-2, P-3): `superseded_by` is set only on a superseded entry
+/// (`chk_memory_entry_superseded_by`), and its FK is deferred, so one transaction can move the
+/// old entry first and insert its same-subject successor second. A successor that never appears
+/// fails `fk_memory_entry_superseded_by` at `COMMIT`.
+#[tokio::test]
+async fn migration_0020_ties_superseded_by_to_the_superseded_state() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let pool = &db.pool;
+    let user = db.store.this_user().as_uuid();
+    let (project, _) = plant_project_kind(pool, user, "memory").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    let old = insert_memory_entry(&mut conn, project, user, "Foo")
+        .await
+        .expect("insert 'Foo'");
+    let spare = insert_memory_entry(&mut conn, project, user, "Bar")
+        .await
+        .expect("insert 'Bar'");
+    drop(conn);
+
+    let err = sqlx::query("UPDATE memory_entry SET superseded_by = $2 WHERE id = $1")
+        .bind(old)
+        .bind(spare)
+        .execute(pool)
+        .await
+        .expect_err("superseded_by on an active entry is refused");
+    assert_refused_by(
+        err,
+        "chk_memory_entry_superseded_by",
+        "superseded_by on an active row",
+    );
+
+    let new = uuid::Uuid::now_v7();
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("UPDATE memory_entry SET state = 'superseded', superseded_by = $2 WHERE id = $1")
+        .bind(old)
+        .bind(new)
+        .execute(&mut *tx)
+        .await
+        .expect("the old entry moves first, naming a successor that does not exist yet");
+    sqlx::query(
+        "INSERT INTO memory_entry (id, project_id, kind, subject, body, created_by) \
+         VALUES ($1, $2, 'fact', ' foo ', 'body', $3)",
+    )
+    .bind(new)
+    .bind(project)
+    .bind(user)
+    .execute(&mut *tx)
+    .await
+    .expect("the successor reuses the freed subject");
+    tx.commit().await.expect("the deferred FK holds at COMMIT");
+
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("UPDATE memory_entry SET state = 'superseded', superseded_by = $2 WHERE id = $1")
+        .bind(spare)
+        .bind(uuid::Uuid::now_v7())
+        .execute(&mut *tx)
+        .await
+        .expect("a deferred FK is not checked at the statement");
+    let err = tx
+        .commit()
+        .await
+        .expect_err("a successor that never appears is refused at COMMIT");
+    assert_refused_by(
+        err,
+        "fk_memory_entry_superseded_by",
+        "a dangling superseded_by",
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-163 plan D1, D5: the text CHECKs count characters, not bytes (`char_length`), and `kind`
+/// admits only the four kinds (`memory_entry_kind_check`).
+#[tokio::test]
+async fn migration_0020_caps_text_in_characters() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let pool = &db.pool;
+    let user = db.store.this_user().as_uuid();
+    let (project, _) = plant_project_kind(pool, user, "memory").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+
+    insert_memory_entry(&mut conn, project, user, &"é".repeat(120))
+        .await
+        .expect("120 two-byte characters fit the subject");
+    let err = insert_memory_entry(&mut conn, project, user, &"é".repeat(121))
+        .await
+        .expect_err("121 characters do not");
+    assert_refused_by(err, "memory_entry_subject_check", "a 121-character subject");
+
+    let err = sqlx::query(
+        "INSERT INTO memory_entry (id, project_id, kind, subject, body, created_by) \
+         VALUES ($1, $2, 'note', 'kind', 'body', $3)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(project)
+    .bind(user)
+    .execute(&mut *conn)
+    .await
+    .expect_err("an unknown kind is refused");
+    assert_refused_by(err, "memory_entry_kind_check", "kind = 'note'");
+
+    drop(conn);
+    db.drop_db().await;
+}
+
 /// The smallest FK chain an `item` row needs (project -> step_graph -> item_kind), under the
 /// `created_by` the caller names. Returns `(project, kind)`; the kind's prefix is `RES`.
 async fn plant_item_kind(pool: &sqlx::PgPool, user: uuid::Uuid) -> (uuid::Uuid, uuid::Uuid) {
@@ -1900,8 +2133,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(19),
-        "nineteen embedded migrations, none applied (through MOD-125's 0019_stop_runs.sql)"
+        MigrationState::Pending(20),
+        "twenty embedded migrations, none applied (through MOD-163's 0020_memory.sql)"
     );
 
     db.drop_db().await;
@@ -2001,8 +2234,8 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(19),
-        "nineteen embedded migrations, through MOD-125's 0019_stop_runs.sql"
+        MigrationState::Pending(20),
+        "twenty embedded migrations, through MOD-163's 0020_memory.sql"
     );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
@@ -2010,8 +2243,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("a pending schema is refused");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(19),
-        "every one of the nineteen, through MOD-125's 0019_stop_runs.sql, is pending"
+        HeadlessError::MigrationsPending(20),
+        "every one of the twenty, through MOD-163's 0020_memory.sql, is pending"
     );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
@@ -2033,8 +2266,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("no migrations table is every migration pending");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(19),
-        "every one of the nineteen, through MOD-125's 0019_stop_runs.sql, is pending"
+        HeadlessError::MigrationsPending(20),
+        "every one of the twenty, through MOD-163's 0020_memory.sql, is pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
@@ -2185,9 +2418,9 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        19,
-        "the later applies migrate nothing: the nineteen embedded migrations (through MOD-125's \
-         0019_stop_runs.sql) are applied once"
+        20,
+        "the later applies migrate nothing: the twenty embedded migrations (through MOD-163's \
+         0020_memory.sql) are applied once"
     );
 
     db.drop_db().await;
