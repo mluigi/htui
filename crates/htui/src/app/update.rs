@@ -25,9 +25,15 @@ const TICKS_PER_REFRESH: u64 = 4;
 
 impl App {
     /// Applies one action, recording the move it made in the history (MOD-115 M2 §8: a reply
-    /// that reveals or redirects is a new place too).
+    /// that reveals or redirects is a new place too). The tick moves nobody and comes four times a
+    /// second, so it is not recorded (RV2 M3); it also flashes a save the background writer
+    /// could not make (RV2 H1).
     pub fn update(&mut self, action: Action) {
-        self.recorded(|app| app.apply(action));
+        if matches!(action, Action::Tick) {
+            self.apply(action);
+        } else {
+            self.recorded(|app| app.apply(action));
+        }
     }
 
     /// [`update`](Self::update)'s body.
@@ -253,6 +259,11 @@ impl App {
     /// workspace, which is exactly the shell a first launch shows (blueprint D.5).
     fn on_tick(&mut self) {
         self.ticks += 1;
+        // RV2 H1: a save is written off the loop, so its failure is known only later.
+        if let Some(reason) = self.ui_store.take_failure() {
+            self.status = Some(reason);
+            self.dirty = true;
+        }
         if self.ticks.is_multiple_of(TICKS_PER_REFRESH) {
             self.dispatch(Origin::App, StoreRequest::StoreState);
             if !self.scope.is_empty() {

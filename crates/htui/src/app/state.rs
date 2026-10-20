@@ -127,8 +127,9 @@ pub type PaneClaim = (Rect, PaneAreas);
 /// D2, D3, T6R): the focused pane, always a visible one, and a list + detail tab's layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TabView {
-    /// The focused pane: the one the shell keeps, else the list (list + detail) or the detail
-    /// (single pane); the detail when the layout hides it.
+    /// The focused pane: the one the shell keeps, else the list (list + detail; the detail when
+    /// the layout is zoomed, RV2 M2) or the detail (single pane); the detail when the layout
+    /// hides it.
     pub(crate) focus: PaneId,
     /// The stored layout, else the tab's default; `None` for a single-pane tab.
     pub(crate) layout: Option<TabLayout>,
@@ -149,10 +150,17 @@ impl TabView {
             }
             Panes::Single => None,
         };
-        let kept = focus.get(&tab.id()).copied().unwrap_or(match tab.panes() {
-            Panes::ListDetail(_) => PaneId::List,
-            Panes::Single => PaneId::Detail,
-        });
+        // RV2 M2: the focus is not saved, so a restart onto a zoomed layout would zoom the list
+        // by default; zoom is the detail's reading mode (its border carries the unzoom note), so
+        // an unset focus is the detail when zoom is on.
+        let kept = focus
+            .get(&tab.id())
+            .copied()
+            .unwrap_or(match (tab.panes(), layout) {
+                (_, Some(layout)) if layout.zoom => PaneId::Detail,
+                (Panes::ListDetail(_), _) => PaneId::List,
+                (Panes::Single, _) => PaneId::Detail,
+            });
         // D3: a pane the layout hides (a saved preset or toggle, before any key moved the
         // focus) gives the focus to the detail, as a layout key that hides it does.
         let focus = match layout {
@@ -553,12 +561,23 @@ impl App {
     }
 
     /// Writes the UI state the moment it changes (MOD-115 M2 D1): the about panel and every
-    /// layout. A save that fails says why in the header and changes nothing on screen.
+    /// layout. A save that fails says why in the header and changes nothing on screen. In `run`
+    /// the store is a background writer (RV2 H1): this only renders the text and hands it over,
+    /// no file is touched on the loop, and a write that fails flashes on the next tick.
     pub(super) fn save_ui_state(&mut self) {
         self.ui.about = Some(self.about_visible);
         if let Err(reason) = self.ui_store.save(&self.ui) {
             self.status = Some(reason);
         }
+    }
+
+    /// Writes what the UI-state store still holds before htui exits (RV2 H1): `run` calls it
+    /// once the loop has ended, so the last layout key is on disk.
+    ///
+    /// # Errors
+    /// The last write failed; the reason names the path.
+    pub fn flush_ui_state(&self) -> Result<(), String> {
+        self.ui_store.flush()
     }
 
     /// Where the user is (MOD-115 M2 §8): the active tab, its focused pane, the tab's own
@@ -1158,21 +1177,23 @@ impl App {
     /// status line (blueprint E8): a pointer crossing the canvas must neither redraw once per cell
     /// nor wipe an error nobody acted on. The status is taken before dispatch, as
     /// [`on_key`](Self::on_key) clears it, so a failure the event causes still lands.
+    ///
+    /// RV2 M3: the gates run before the history records, so a dropped event (motion above all)
+    /// builds no place.
     pub fn on_mouse(&mut self, mouse: MouseEvent) {
+        if !self.wants_mouse()
+            || matches!(
+                mouse.kind,
+                MouseEventKind::Moved | MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+            )
+        {
+            return;
+        }
         self.recorded(|app| app.dispatch_mouse(mouse));
     }
 
-    /// [`on_mouse`](Self::on_mouse)'s body, recorded by it.
+    /// [`on_mouse`](Self::on_mouse)'s body, past its gates, recorded by it.
     fn dispatch_mouse(&mut self, mouse: MouseEvent) {
-        if !self.wants_mouse() {
-            return;
-        }
-        if matches!(
-            mouse.kind,
-            MouseEventKind::Moved | MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
-        ) {
-            return;
-        }
         let Some(id) = self.tabs.active_id() else {
             return;
         };
@@ -2389,6 +2410,8 @@ pub(crate) mod shell_tests {
                 ..SPLIT_LAYOUT
             },
         );
+        // The list zoomed from the list (an unset focus is the detail when zoomed, RV2 M2).
+        app.focus.insert(SPLIT, PaneId::List);
         let buf = draw(&mut app, 100, 30);
         let (region, areas) = claim(&app);
         assert_eq!(areas.list, Some(region));
@@ -2577,6 +2600,172 @@ pub(crate) mod shell_tests {
         assert_eq!(left.list, ListSize::Percent(60));
         assert!(left.zoom);
         assert!(!again.about_visible, "the about panel stays off");
+    }
+
+    /// RV2 H1, D1: a layout key saves through the background writer the moment it changes,
+    /// and quitting (`flush_ui_state`, before the shell is dropped) writes the last state.
+    #[test]
+    fn quitting_flushes_the_last_layout_the_background_writer_was_handed() {
+        use crate::ui::state_file::{FILE_NAME, UiStore};
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join(FILE_NAME);
+        let mut app = split_app();
+        app.ui_store = UiStore::File(path.clone()).background();
+        let _ = draw(&mut app, 100, 30);
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Char('>'), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Char('z'), KeyModifiers::NONE);
+        let left = layout(&app);
+        assert_eq!(app.flush_ui_state(), Ok(()));
+        assert_eq!(
+            UiStore::File(path).load().state.layouts.get(SPLIT.0),
+            Some(&left)
+        );
+        assert_eq!(app.status, None);
+    }
+
+    /// RV2 H1: dropping the shell (htui's exit) writes a state still pending.
+    #[test]
+    fn dropping_the_shell_writes_the_state_still_pending() {
+        use crate::ui::state_file::{FILE_NAME, UiStore};
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join(FILE_NAME);
+        let mut app = split_app();
+        app.ui_store = UiStore::File(path.clone()).background();
+        let _ = draw(&mut app, 100, 30);
+        press(&mut app, KeyCode::Char('>'), KeyModifiers::NONE);
+        let left = layout(&app);
+        drop(app);
+        assert_eq!(
+            UiStore::File(path).load().state.layouts.get(SPLIT.0),
+            Some(&left)
+        );
+    }
+
+    /// RV2 H1: a save the background writer could not make comes back as the header flash on
+    /// the next tick (it is not known when the key returns).
+    #[test]
+    fn a_background_save_that_failed_flashes_on_the_next_tick() {
+        use crate::ui::state_file::{FILE_NAME, UiStore};
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join(FILE_NAME);
+        std::fs::create_dir(&path).expect("a directory where the file goes");
+        let store = UiStore::File(path.clone()).background();
+        let mut app = split_app();
+        app.ui_store = store.clone();
+        let _ = draw(&mut app, 100, 30);
+        press(&mut app, KeyCode::Char('>'), KeyModifiers::NONE);
+        store.settle();
+        app.dirty = false;
+        app.update(crate::app::Action::Tick);
+        let status = app.status.clone().expect("the failure is flashed");
+        assert!(
+            status.starts_with(&format!("cannot save {}: ", path.display())),
+            "{status}"
+        );
+        assert!(app.dirty, "the flash is drawn");
+        app.status = None;
+        app.update(crate::app::Action::Tick);
+        assert_eq!(app.status, None, "once");
+    }
+
+    /// RV2 M2 (D1, D2): a restart with the detail zoomed brings the detail back zoomed, not the
+    /// list: the focus is not saved, and an unset focus resolves to the detail when zoom is on.
+    #[test]
+    fn a_restart_with_zoom_on_zooms_the_detail_again() {
+        use crate::ui::state_file::UiStore;
+
+        let store = UiStore::memory();
+        let mut app = split_app();
+        app.ui_store = store.clone();
+        let _ = draw(&mut app, 100, 30);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(focused(&app), PaneId::Detail);
+        press(&mut app, KeyCode::Char('z'), KeyModifiers::NONE);
+        let _ = draw(&mut app, 100, 30);
+        let (_, zoomed) = claim(&app);
+        assert_eq!(zoomed.list, None, "the detail is zoomed");
+        drop(app);
+
+        let mut again = split_app();
+        again.apply_ui_state(store.load().state);
+        again.ui_store = store;
+        assert_eq!(focused(&again), PaneId::Detail, "at load");
+        let _ = draw(&mut again, 100, 30);
+        let (_, restored) = claim(&again);
+        assert_eq!(restored, zoomed, "the detail comes back zoomed");
+    }
+
+    /// A list + detail tab whose own gesture wants the mouse, counting the calls to
+    /// [`Tab::location`] (RV2 M3: the history's cost).
+    struct Located(std::rc::Rc<std::cell::Cell<usize>>);
+
+    impl Tab for Located {
+        fn id(&self) -> TabId {
+            TabId("located")
+        }
+        fn title(&self) -> &str {
+            "Located"
+        }
+        fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+            Vec::new()
+        }
+        fn on_scope_change(&mut self, _scope: &Scope) {}
+        fn on_key(&mut self, _key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            Handled::Pass
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+        fn panes(&self) -> Panes {
+            Panes::ListDetail(SPLIT_LAYOUT)
+        }
+        fn wants_mouse(&self) -> bool {
+            true
+        }
+        fn location(&self) -> TabLoc {
+            self.0.set(self.0.get() + 1);
+            TabLoc::default()
+        }
+    }
+
+    /// RV2 M3 (§8): a dropped mouse event (motion, the horizontal wheel, one while capture is
+    /// off) and a tick build no history place: `Tab::location` is not called.
+    #[test]
+    fn a_dropped_mouse_event_and_a_tick_build_no_history_place() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.about_visible = false;
+        app.register_tab(Box::new(Located(calls.clone())));
+        let _ = draw(&mut app, 100, 30);
+        assert!(app.wants_mouse());
+        let at = |kind| MouseEvent {
+            kind,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        calls.set(0);
+        app.on_mouse(at(MouseEventKind::Moved));
+        app.on_mouse(at(MouseEventKind::ScrollLeft));
+        app.on_mouse(at(MouseEventKind::ScrollRight));
+        app.update(crate::app::Action::Tick);
+        app.help_visible = true;
+        assert!(!app.wants_mouse());
+        app.on_mouse(at(MouseEventKind::ScrollDown));
+        assert_eq!(calls.get(), 0, "no place was built");
+        app.help_visible = false;
+        app.on_mouse(at(MouseEventKind::ScrollDown));
+        assert!(
+            calls.get() > 0,
+            "a mouse event that is handled is still recorded"
+        );
     }
 
     /// D5: a tab change is a new place, a cursor move is not; back returns to the place left,

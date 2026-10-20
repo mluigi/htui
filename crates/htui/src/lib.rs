@@ -244,7 +244,8 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
         });
     let loaded = ui_store.load();
     app.apply_ui_state(loaded.state);
-    app.ui_store = ui_store;
+    // RV2 H1: saved through a latest-wins writer thread, so no write or fsync runs on the loop.
+    app.ui_store = ui_store.background();
     app.status = loaded.notice;
     app::register_all(&mut app);
     app.start();
@@ -252,6 +253,11 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
     let mut term = terminal::init();
     let outcome = event_loop::run(&mut term, &mut app, reply_rx).await;
     term.restore();
+    // RV2 H1: the last layout key may still be on its way to `ui-state.toml`; it is written
+    // before htui exits, and a write that failed is said on the restored terminal.
+    if let Err(reason) = app.flush_ui_state() {
+        eprintln!("htui: {reason}");
+    }
 
     // Quit order, and it matters (MOD-2 milestone 3). Dropping the shell closes the request
     // channel; the worker sees that, cancels every live chat and waits for each session task to
@@ -429,5 +435,20 @@ mod tests {
         let text = format!("{err:#} {err:?}");
         assert!(text.contains("unrecognised parameter"), "{text}");
         assert!(!text.contains("SENTINEL"), "the error echoes the DSN");
+    }
+
+    /// MOD-115 M2 RV2 H1: `run` saves the UI state through the background writer, and once the
+    /// loop has ended it writes what is still pending before the shell (and the writer) goes.
+    #[test]
+    fn run_saves_off_the_loop_and_flushes_the_ui_state_before_exit() {
+        let file = include_str!("lib.rs");
+        let code = &file[..file.find("#[cfg(test)]").unwrap_or(file.len())];
+        assert!(code.contains("app.ui_store = ui_store.background();"));
+        let looped = code
+            .find("event_loop::run(&mut term, &mut app, reply_rx)")
+            .expect("the loop");
+        let flush = code.find("app.flush_ui_state()").expect("the flush");
+        let dropped = code.find("drop(app);").expect("the shell is dropped");
+        assert!(looped < flush && flush < dropped);
     }
 }

@@ -824,3 +824,38 @@ async fn the_layout_and_the_about_panel_survive_a_restart() {
         Some(ListSize::Percent(55))
     );
 }
+
+/// MOD-115 M2 RV2 M2: a restart with zoom on brings back the pane that was zoomed (the detail),
+/// not the list: the new shell draws the detail over the whole body, as it was left.
+#[tokio::test]
+async fn a_restart_with_zoom_on_brings_the_zoomed_detail_back() {
+    use htui::ui::state_file::UiStore;
+
+    let store = UiStore::memory();
+    let drawn = split::Drawn::default();
+    let mut first = Harness::demo()
+        .with_ui_store(store.clone())
+        .with_tab(Box::new(split::Split(drawn.clone())));
+    first.settle().await;
+    let _ = first.render();
+    first.key("tab");
+    first.key("z");
+    let _ = first.render();
+    let left = *drawn.lock().expect("not poisoned").last().expect("drawn");
+    assert_eq!(left.list, None, "the detail is zoomed");
+    assert!(!left.detail.is_empty());
+    drop(first);
+
+    let redrawn = split::Drawn::default();
+    let mut again = Harness::demo()
+        .with_ui_store(store.clone())
+        .with_tab(Box::new(split::Split(redrawn.clone())));
+    again.settle().await;
+    let _ = again.render();
+    let restored = *redrawn.lock().expect("not poisoned").last().expect("drawn");
+    assert_eq!(restored, left, "the zoomed detail comes back");
+    again.key("z");
+    let _ = again.render();
+    let unzoomed = *redrawn.lock().expect("not poisoned").last().expect("drawn");
+    assert!(unzoomed.list.is_some(), "unzoomed, the list is back");
+}
