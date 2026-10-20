@@ -573,6 +573,18 @@ with T5 serially.
   still read the delivered key, so a rebound `field.line_up`/`line_down` chord a one-line field
   passes acts there as `Up`/`Down` (`form.prev_field`/`next_field`, the hit or agent cursor). The
   same `Ctx::pressed` closes it as M3/M4 port those views onto the kit.
+  *RV1 repair 2 (verifier, low).* **Limit kept, hints:** RV1 names the key in force on the
+  former `FIXED` sites it owns (the Runs reject, follow-up and typed answers, the chat compose,
+  the Requirements withdraw: `Hint::One(Act::FieldSubmit, ..)`, pinned by
+  `the_field_hints_name_the_submit_key_in_force`). The other text-field screens still carry a
+  literal `Hint::Text("Enter ..")`: `skills/library.rs` (`NAMING_HINT`, `IMPORT_HINT`),
+  `skills/templates.rs`, `skills/agent_help.rs`, `settings/{agents,boxes,connection,hierarchy,
+  kinds,personas,prompt,qdrant,queue,secrets}.rs` and `overlay/concepts_search.rs`. With
+  `[field] submit = "ctrl-t"` their hint row still reads `Enter`, not the key in force.
+  These were never in the `FIXED` register and lie outside RV1's file set, so RV1 leaves them;
+  each needs its own act checked before it moves to `Hint::One` (not every `Enter` there is
+  `field.submit`: `boxes.rs`'s "Enter breaks line" is the area's newline). `Esc ..` stays literal
+  text (MD7). They close as M3/M4 port those screens onto the kit, with the limit above.
 - **D-14 (Task 0 as built; inertness and the compiled defaults validating).** Recorded after T0 so Tasks 5 and 6
   refine what exists instead of writing it a second time.
   - *Shift arrows move to Task 6* (with D-4). `pane.next_subtab`/`prev_subtab`, `settings.next_section`/

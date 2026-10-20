@@ -153,6 +153,11 @@ hidden. The `HANDOFF.md` phase 1 note summarises the milestone.
   compose areas, the concepts search and the agent help still resolve from the delivered key, so
   a rebound `field.line_up`/`line_down` chord a one-line field passes moves the field or cursor
   there as `Up`/`Down` would; that closes with the same M3/M4 port.
+  Hints likewise (RV1 repair 2): the sites RV1 converted name the submit key in force, but the
+  other text-field screens (the Skills naming, import, template and agent-help fields, the
+  Settings forms, the concepts search) still print a literal `Enter ..`, so after `[field]
+  submit = "ctrl-t"` their hint row names `Enter`, not the key in force; those screens were
+  never in the `FIXED` register, and they move to `Hint::One` with the same M3/M4 port.
 - **D8 - existing key files keep loading:** MD4 above. Review RV1 H1: a version-1 entry never
   takes a chord from the rows M2 added for the keys a view kept before it (a text field's editing
   keys, a choice's value keys, the permission digits, the Requirements priority); the two share
@@ -180,5 +185,5 @@ hidden. The `HANDOFF.md` phase 1 note summarises the milestone.
 - Task 7 (the list + detail tabs adopt the layout and route motion by focus) and Task 9 (snapshots
   and the full gate) had not landed on `e4f048c3`, the base of this record.
 - D-15's two maintainer calls: the shift-arrow order and the tab keys left out of `MODAL`.
-- D-13's field-key limit, until M3/M4.
+- D-13's field-key limit and the literal `Enter ..` hints outside RV1's sites, until M3/M4.
 - `R-TUI-18`: MOD-116/MOD-125. `R-TUI-10`'s Postgres-stored overrides: MOD-109.
