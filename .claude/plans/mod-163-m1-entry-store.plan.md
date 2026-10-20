@@ -4,13 +4,13 @@
 **Selected Milestone**: 1 — Entry store
 **Complexity**: Large (a new entity across the store seam: a migration, MemStore and PgStore, five
 forwarding implementors, conformance, project-delete reach; no UI or prompt change)
-**Status**: draft 2026-10-20, awaiting CONFIRM.
+**Status**: confirmed 2026-10-20 (D4 answered at CONFIRM: on a subject clash the person is asked: edit the existing entry, or replace it).
 
 ## Summary
 
 Add the memory entry as a store entity: project-owned rows with kind, subject, prose, state, a
 compare-and-set version, a freshness stamp and an append-only revision history. Every backend can
-create, amend, retire and list entries. Text reaches the store only through a type that has already
+create, amend, retire, supersede and list entries. Text reaches the store only through a type that has already
 been capped and scrubbed fail-closed (`R-ID-7`). M1 ships the store and nothing that calls it: the
 prompt section is M2, and the TUI pane, store-worker requests and capture switch are M3.
 
@@ -26,6 +26,7 @@ prompt section is M2, and the TUI pane, store-worker requests and capture switch
     - `state TEXT CHECK IN ('active','suspect','superseded','retired') DEFAULT 'active'`;
     - `version INTEGER NOT NULL DEFAULT 1`;
     - `confirmed_at TIMESTAMPTZ NOT NULL` (the freshness stamp, D3);
+    - `superseded_by UUID NULL REFERENCES memory_entry(id) ON DELETE SET NULL`, set only together with `state = 'superseded'` (a CHECK ties the two);
     - `created_by UUID NOT NULL REFERENCES app_user(id)` (as `requirement.created_by`);
     - `created_at`, `updated_at` (a `set_updated_at()` trigger, created explicitly).
   - Indexes on `memory_entry`:
@@ -35,7 +36,7 @@ prompt section is M2, and the TUI pane, store-worker requests and capture switch
     - `PK (entry_id, version)`, with `entry_id ON DELETE CASCADE`;
     - `kind`, `subject`, `body`, `state`;
     - `author_id UUID NOT NULL REFERENCES app_user(id)`, `box_id REFERENCES box(id) ON DELETE SET NULL` (as `requirement_revision`);
-    - `reason TEXT` (`created` | `amended` | `retired`, no CHECK, like `requirement_revision.reason`);
+    - `reason TEXT` (`created` | `amended` | `retired` | `superseded`, no CHECK, like `requirement_revision.reason`);
     - `created_at`.
   - Forward-only (`R-STO-5`), with a header naming MOD-163 and `COMMENT ON` lines.
 - **D2 — Types (`htui-core/src/model/memory.rs`).**
@@ -46,14 +47,15 @@ prompt section is M2, and the TUI pane, store-worker requests and capture switch
   - `MemoryPatch { kind?, subject?, body?, author_id, box_id }`.
   - `MemoryRevision`.
   - `MemoryUpdate { Updated(MemoryEntry), Diverged { head, ancestor } }`, mirroring `RequirementUpdate`.
+  - `MemorySupersede { Superseded { old: MemoryEntry, new: MemoryEntry }, Diverged { head, ancestor } }`.
   - The row types derive `Serialize`/`Deserialize` like their requirement twins. `NewMemoryEntry` and `MemoryPatch` do not derive `Deserialize`, so the `MemoryText` guarantee cannot be bypassed by decoding.
 - **D3 — Freshness stamp.** `confirmed_at` is when the entry's text was last written or confirmed. Create and amend set it to now; retire leaves it as it was. `version` stays the compare-and-set token. MOD-166 adds the cited-row version stamps and pins beside it. The PRD's open question is answered this way.
 - **D4 — One live entry per subject.**
   - Subjects are compared case-insensitively after trimming, within a project, among `active` and `suspect` entries.
   - The fold is `lower(btrim(subject))` in Postgres. `btrim` strips spaces only, so MemStore folds with `trim_matches(' ')` plus `to_lowercase()` to agree with it.
   - A create, or an amend that changes the subject, whose subject collides with another live entry is refused: `StoreError::Constraint` via a `memory_subject_taken` helper that names the existing entry's id. Pg matches `db.constraint() == Some("uq_memory_entry_live_subject")`, as `persona_name_taken` does (`pg/write.rs:787-795`).
-  - The TUI (M3) turns that refusal into "an entry with this subject exists — edit it". **Asked at CONFIRM:** refuse (recommended) or supersede the old entry.
-  - MOD-164's automatic writes supersede on the same key. That is its own verb, not this one.
+  - **Decided at CONFIRM (maintainer, 2026-10-20): ask the person what they meant.** The store only refuses; the TUI (M3) turns the refusal into a choice: "An entry with this subject exists: edit it, or replace it?" Edit opens the existing entry. Replace calls `supersede_memory_entry` (D6) with the new text.
+  - MOD-164's automatic writes supersede on the same key through the same verb, with no question.
 - **D5 — `MemoryText`: cap and scrub at construction (`R-ID-7`).**
   - Built with `MemoryText::subject(raw, &dyn Scrubber)` / `MemoryText::body(raw, &dyn Scrubber)`.
   - Construction trims the text, refuses empty, and caps the length in characters (`MEMORY_SUBJECT_MAX = 120`, `MEMORY_BODY_MAX = 2000`; the DB CHECKs are the backstop).
@@ -79,7 +81,11 @@ prompt section is M2, and the TUI pane, store-worker requests and capture switch
     - moves `active | suspect → retired`;
     - writes a revision with `reason = "retired"`;
     - an already-retired or superseded entry is refused (`memory_entry_closed`).
-  - Nothing in M1 sets `suspect` or `superseded`.
+  - `supersede_memory_entry(old, expected_version, new: NewMemoryEntry) -> Result<MemorySupersede>`:
+    - one transaction: the old entry (`active | suspect`, compare-and-set on `expected_version`) moves to `superseded` with `superseded_by = new.id` and a revision `reason = "superseded"`; then the new entry is created in the old one's project, with revision 1;
+    - order: NotFound (old) → divergence → Constraint (`memory_entry_closed` on an old entry that is already retired or superseded; `memory_subject_taken` if the new subject clashes with a third live entry);
+    - the new subject may differ from the old one.
+  - Nothing in M1 sets `suspect`.
 - **D7 — Not mirrored.**
   - The SQLite cache gets no migration.
   - `CacheStore` answers `Ok(None)` to both reads, so the M3 pane can say it is not available offline.
@@ -90,7 +96,7 @@ prompt section is M2, and the TUI pane, store-worker requests and capture switch
   - Mem's `delete_project` drops the rows, matching Pg's cascade.
   - `reach_parts` (`htui/src/hierarchy.rs`) prints them.
 - **D9 — Deferred columns.** Each later item migrates its own columns, so M1 ships no dead columns:
-  - provenance (run, agent, item, commit) and `superseded_by` → MOD-164;
+  - provenance (run, agent, item, commit) → MOD-164 (`superseded_by` is in M1 because the person's "replace" needs it, D4);
   - usage counters → MOD-164;
   - pin and pinned-as-trusted → MOD-166;
   - `created_by` stays a person in M1, and MOD-164 relaxes it for model writes.
@@ -167,6 +173,7 @@ parallel fan-out.
   - retire → `retired`, and a second retire is refused;
   - amending a retired entry is refused;
   - a subject clash on create and on amend, case and whitespace folded, naming the existing id;
+  - supersede: the old entry becomes `superseded` with `superseded_by` and a `superseded` revision, and the new entry is live, in one step; a stale `expected_version` → `Diverged` with nothing written; superseding a retired entry is refused; the new entry may reuse the old subject;
   - a retired subject can be reused;
   - an unknown id or project → `NotFound`;
   - `memory_revisions` of an unknown id → `Some(vec![])`;
