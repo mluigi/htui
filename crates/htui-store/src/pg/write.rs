@@ -28,7 +28,8 @@ use htui_core::model::{
     CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId, CommandRunStatus,
     DEFAULT_MAX_CONCURRENT_ITEMS, Document, Executor, FollowUpRequest, FollowUpSettle, GateOutcome,
     Isolation, Item, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement,
-    ItemRevision, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewNote,
+    ItemRevision, MemoryEntry, MemoryEntryId, MemoryPatch, MemorySupersede, MemoryUpdate,
+    NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewMemoryEntry, NewNote,
     NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun,
     NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission,
     PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch,
@@ -600,6 +601,9 @@ async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<
         requirements: rows(row.requirements),
         requirement_revisions: rows(row.requirement_revisions),
         item_requirements: rows(row.item_requirements),
+        // MOD-163 M1 T1: T3 adds the two subselects (plan D8).
+        memory_entries: 0,
+        memory_revisions: 0,
     }))
 }
 
@@ -7942,6 +7946,44 @@ impl WriteStore for PgStore {
 
     async fn open_permissions(&self, scope: &Scope) -> Result<Vec<WaitingPermission>> {
         super::relay::open_permissions(self, scope).await
+    }
+
+    // -- MOD-163 M1: project memory entries (plan D3-D6); T1 stubs, T3 writes the SQL
+
+    async fn create_memory_entry(
+        &self,
+        _project: ProjectId,
+        _new: NewMemoryEntry,
+    ) -> Result<MemoryEntry> {
+        Err(StoreError::Backend("MOD-163 M1: not yet".into()))
+    }
+
+    async fn amend_memory_entry(
+        &self,
+        _id: MemoryEntryId,
+        _expected_version: i32,
+        _patch: MemoryPatch,
+    ) -> Result<MemoryUpdate> {
+        Err(StoreError::Backend("MOD-163 M1: not yet".into()))
+    }
+
+    async fn retire_memory_entry(
+        &self,
+        _id: MemoryEntryId,
+        _expected_version: i32,
+        _author_id: UserId,
+        _box_id: Option<BoxId>,
+    ) -> Result<MemoryUpdate> {
+        Err(StoreError::Backend("MOD-163 M1: not yet".into()))
+    }
+
+    async fn supersede_memory_entry(
+        &self,
+        _old: MemoryEntryId,
+        _expected_version: i32,
+        _new: NewMemoryEntry,
+    ) -> Result<MemorySupersede> {
+        Err(StoreError::Backend("MOD-163 M1: not yet".into()))
     }
 }
 

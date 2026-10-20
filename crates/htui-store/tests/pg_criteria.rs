@@ -3177,15 +3177,15 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
 
     /// Every table of PRD D13's chain, paired with the [`DeleteReach`] field that claims it.
     ///
-    /// Twenty-eight entries for twenty-eight fields: a field added without an entry leaves the
-    /// struct literal below incomplete and the crate does not compile. MOD-38's six requirement
-    /// tables close the list, in `DeleteReach` field order.
+    /// Thirty entries for thirty fields: a field added without an entry leaves the struct literal
+    /// below incomplete and the crate does not compile. MOD-38's six requirement tables follow, in
+    /// `DeleteReach` field order, and MOD-163's two memory tables close it (plan D8).
     ///
     /// `TABLES` and `claimed` are zipped **positionally**, so a new name goes where its field sits
     /// in `DeleteReach` and never simply at the end: `run_step_trees` is struct index 16, between
     /// `run_step_commits` and `command_runs`, and appending it to both arrays would compile while
     /// comparing every later field against the wrong table (T1 audit A-3).
-    const TABLES: [&str; 28] = [
+    const TABLES: [&str; 30] = [
         "workspace_project",
         "workspace_box_path",
         "item",
@@ -3214,6 +3214,8 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         "requirement",
         "requirement_revision",
         "item_requirement",
+        "memory_entry",
+        "memory_entry_revision",
     ];
 
     let mut before = Vec::with_capacity(TABLES.len());
@@ -3259,8 +3261,10 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         requirements,
         requirement_revisions,
         item_requirements,
+        memory_entries,
+        memory_revisions,
     } = report;
-    let claimed: [u64; 28] = [
+    let claimed: [u64; 30] = [
         workspace_links,
         workspace_box_paths,
         items,
@@ -3289,6 +3293,8 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         requirements,
         requirement_revisions,
         item_requirements,
+        memory_entries,
+        memory_revisions,
     ];
 
     for ((table, was), says) in TABLES.into_iter().zip(before).zip(claimed) {

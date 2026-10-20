@@ -18,16 +18,17 @@ use htui_core::model::{
     Activation, Agent, AgentBox, AgentId, AgentSummary, BatchClose, BatchId, BoundSkill, BoxId,
     BoxInfo, BoxProfile, BoxRow, BoxTool, CitationKind, CommandQueue, CoverageRow, Document,
     DocumentHead, DocumentId, Gate, GateOutcome, Isolation, Item, ItemCitation, ItemFilter, ItemId,
-    ItemKind, ItemKindId, ItemSummary, LinkEdge, LinkGraph, LinkKind, Note, Persona, PersonaId,
-    PersonaPermission, PersonaTools, PhaseAgent, PhaseId, Priority, Project, ProjectId, ProjectRef,
-    PromptScope, PromptTemplate, QueueBatch, QueueEntry, QueueRow, QueueRunFact, Repo, RepoBoxPath,
-    RepoId, Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
-    RequirementRevision, RequirementSpec, RequirementState, Resolution, ResolvedGraph,
-    ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
-    RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillBinding,
-    SkillBindingId, SkillBindingKey, SkillId, SkillVersion, Status, StepGraph, StepGraphId,
-    StepGraphPhase, StepId, StepStatus, ToolCallCount, UpstreamEntry, UserId, VerifyOutcome,
-    WaitingCandidate, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspaceProject, WorkspaceSummary,
+    ItemKind, ItemKindId, ItemSummary, LinkEdge, LinkGraph, LinkKind, MemoryEntry, MemoryEntryId,
+    MemoryRevision, MemoryState, Note, Persona, PersonaId, PersonaPermission, PersonaTools,
+    PhaseAgent, PhaseId, Priority, Project, ProjectId, ProjectRef, PromptScope, PromptTemplate,
+    QueueBatch, QueueEntry, QueueRow, QueueRunFact, Repo, RepoBoxPath, RepoId, Requirement,
+    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementRevision,
+    RequirementSpec, RequirementState, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase,
+    Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree,
+    RunSummary, Scope, SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId,
+    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPhase, StepId, StepStatus,
+    ToolCallCount, UpstreamEntry, UserId, VerifyOutcome, WaitingCandidate, Workspace,
+    WorkspaceBoxPath, WorkspaceId, WorkspaceProject, WorkspaceSummary,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{ReadStore, Result, SettingRung, StoreError, StoredSetting};
@@ -1026,6 +1027,20 @@ impl ReadStore for PgStore {
         .await
         .map(Some)
         .map_err(map_sqlx)
+    }
+
+    /// MOD-163 M1 T1 stub; T3 reads `memory_entry` (plan D6).
+    async fn memory_entries(
+        &self,
+        _project: ProjectId,
+        _states: Option<Vec<MemoryState>>,
+    ) -> Result<Option<Vec<MemoryEntry>>> {
+        Err(StoreError::Backend("MOD-163 M1: not yet".into()))
+    }
+
+    /// MOD-163 M1 T1 stub; T3 reads `memory_entry_revision` (plan D6).
+    async fn memory_revisions(&self, _id: MemoryEntryId) -> Result<Option<Vec<MemoryRevision>>> {
+        Err(StoreError::Backend("MOD-163 M1: not yet".into()))
     }
 
     /// The item's live citations, each joined to the requirement as it is now, in

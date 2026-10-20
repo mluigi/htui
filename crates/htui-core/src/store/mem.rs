@@ -31,25 +31,26 @@ use crate::model::{
     FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest,
     FollowUpSettle, FollowUpView, FollowUpWindow, GateOutcome, Item, ItemCitation, ItemFilter,
     ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRequirement,
-    ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument,
-    NewFollowUp, NewItem, NewItemKind, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo,
-    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
-    NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice, PermissionId,
-    PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project,
-    ProjectId, ProjectPatch, ProjectRef, PromptScope, PromptTemplate, PromptTemplateId, QueueBatch,
-    QueueEntry, QueueMove, QueueRow, QueueRunFact, QueueSetting, QueuedFollowUp, RelaySessionId,
-    RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
-    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
-    RequirementSpec, RequirementState, RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput,
-    ResolvedPhase, Run, RunCommand, RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind,
-    RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
-    SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId,
-    SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase,
-    StepId, StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, TIMESTAMPTZ_DIGITS,
-    ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
-    WorkspaceSummary, canonical_declared_tags, missing_tags_failure, moved_order, overlaps,
-    prompt_summary, scope_of,
+    ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, MemoryEntry, MemoryEntryId,
+    MemoryPatch, MemoryRevision, MemoryState, MemorySupersede, MemoryUpdate, NewCommandRun,
+    NewDocument, NewFollowUp, NewItem, NewItemKind, NewMemoryEntry, NewNote, NewPersona,
+    NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
+    NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice,
+    PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId,
+    PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef, PromptScope, PromptTemplate,
+    PromptTemplateId, QueueBatch, QueueEntry, QueueMove, QueueRow, QueueRunFact, QueueSetting,
+    QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
+    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
+    RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate, Resolution,
+    ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunCommand, RunCommandId, RunCommandKind,
+    RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary,
+    RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding,
+    SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
+    StepStatus, StopMode, TIMESTAMPTZ_DIGITS, ToolCallCount, UpstreamEntry, UserId,
+    WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    WorkspaceProject, WorkspaceStop, WorkspaceSummary, canonical_declared_tags,
+    missing_tags_failure, moved_order, overlaps, prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -4872,6 +4873,9 @@ impl State {
                     })
                     .count(),
             ),
+            // MOD-163 M1 T1: counted by T2 (plan D8).
+            memory_entries: 0,
+            memory_revisions: 0,
         };
         Some((
             reach,
@@ -8377,6 +8381,20 @@ impl ReadStore for MemStore {
     async fn waiting_candidates(&self, scope: &Scope) -> Result<Vec<WaitingCandidate>> {
         Ok(self.read(|state| state.waiting_candidates(scope)))
     }
+
+    // -- MOD-163 M1: project memory entries (plan D6); T2 fills these in
+
+    async fn memory_entries(
+        &self,
+        _project: ProjectId,
+        _states: Option<Vec<MemoryState>>,
+    ) -> Result<Option<Vec<MemoryEntry>>> {
+        Err(StoreError::Backend("MOD-163 M1: not yet".into()))
+    }
+
+    async fn memory_revisions(&self, _id: MemoryEntryId) -> Result<Option<Vec<MemoryRevision>>> {
+        Err(StoreError::Backend("MOD-163 M1: not yet".into()))
+    }
 }
 
 impl WriteStore for MemStore {
@@ -9320,6 +9338,44 @@ impl WriteStore for MemStore {
     async fn open_permissions(&self, scope: &Scope) -> Result<Vec<WaitingPermission>> {
         let now = self.now();
         Ok(self.read(|state| state.open_permissions(scope, now)))
+    }
+
+    // -- MOD-163 M1: project memory entries (plan D3-D6); T2 fills these in
+
+    async fn create_memory_entry(
+        &self,
+        _project: ProjectId,
+        _new: NewMemoryEntry,
+    ) -> Result<MemoryEntry> {
+        Err(StoreError::Backend("MOD-163 M1: not yet".into()))
+    }
+
+    async fn amend_memory_entry(
+        &self,
+        _id: MemoryEntryId,
+        _expected_version: i32,
+        _patch: MemoryPatch,
+    ) -> Result<MemoryUpdate> {
+        Err(StoreError::Backend("MOD-163 M1: not yet".into()))
+    }
+
+    async fn retire_memory_entry(
+        &self,
+        _id: MemoryEntryId,
+        _expected_version: i32,
+        _author_id: UserId,
+        _box_id: Option<BoxId>,
+    ) -> Result<MemoryUpdate> {
+        Err(StoreError::Backend("MOD-163 M1: not yet".into()))
+    }
+
+    async fn supersede_memory_entry(
+        &self,
+        _old: MemoryEntryId,
+        _expected_version: i32,
+        _new: NewMemoryEntry,
+    ) -> Result<MemorySupersede> {
+        Err(StoreError::Backend("MOD-163 M1: not yet".into()))
     }
 
     // -- MOD-70: follow-ups for engine steps (plan D1-D5, D9)

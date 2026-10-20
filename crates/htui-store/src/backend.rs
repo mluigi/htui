@@ -27,12 +27,13 @@ use chrono::{DateTime, Utc};
 use htui_core::model::{
     AgentBox, AgentSummary, BatchClose, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
     CoverageRow, Document, DocumentHead, DocumentId, Item, ItemCitation, ItemFilter, ItemId,
-    ItemKind, ItemKindId, ItemSummary, LinkGraph, Note, PhaseAgent, PhaseId, Project, ProjectId,
-    ProjectRef, PromptScope, PromptTemplate, QueueBatch, QueueEntry, QueueMove, QueueRow,
-    RepoBoxPath, RepoId, Requirement, RequirementArea, RequirementFilter, RequirementId,
-    RequirementRevision, RequirementSpec, ResolvedGraph, ResolvedInput, Run, RunId, RunStatus,
-    RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, StepGraph, StepGraphId,
-    StepId, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WorkspaceId, WorkspaceSummary,
+    ItemKind, ItemKindId, ItemSummary, LinkGraph, MemoryEntry, MemoryEntryId, MemoryRevision,
+    MemoryState, Note, PhaseAgent, PhaseId, Project, ProjectId, ProjectRef, PromptScope,
+    PromptTemplate, QueueBatch, QueueEntry, QueueMove, QueueRow, RepoBoxPath, RepoId, Requirement,
+    RequirementArea, RequirementFilter, RequirementId, RequirementRevision, RequirementSpec,
+    ResolvedGraph, ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree,
+    RunSummary, Scope, SessionEvent, StepGraph, StepGraphId, StepId, ToolCallCount, UpstreamEntry,
+    UserId, WaitingCandidate, WorkspaceId, WorkspaceSummary,
 };
 use htui_core::store::{MemStore, ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -1084,6 +1085,27 @@ impl ReadStore for Backend {
             Self::Memory(store) => store.requirement_revisions(id).await,
             Self::Online { pg, .. } => pg.requirement_revisions(id).await,
             Self::Offline { cache, .. } => cache.requirement_revisions(id).await,
+        }
+    }
+
+    /// MOD-163 plan D7: the offline arm answers `None` ("not available here").
+    async fn memory_entries(
+        &self,
+        project: ProjectId,
+        states: Option<Vec<MemoryState>>,
+    ) -> Result<Option<Vec<MemoryEntry>>> {
+        match self {
+            Self::Memory(store) => store.memory_entries(project, states).await,
+            Self::Online { pg, .. } => pg.memory_entries(project, states).await,
+            Self::Offline { cache, .. } => cache.memory_entries(project, states).await,
+        }
+    }
+
+    async fn memory_revisions(&self, id: MemoryEntryId) -> Result<Option<Vec<MemoryRevision>>> {
+        match self {
+            Self::Memory(store) => store.memory_revisions(id).await,
+            Self::Online { pg, .. } => pg.memory_revisions(id).await,
+            Self::Offline { cache, .. } => cache.memory_revisions(id).await,
         }
     }
 
