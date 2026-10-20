@@ -718,6 +718,22 @@ mod tests {
              [choice]\ntoggle = \"t\"\n",
         )
         .expect("the file loads");
+        // MOD-115 M2 RV4: the hint row and the `?` box name the rebound keys, not `m/l`/`Space`.
+        assert_eq!(
+            keys.hint(
+                views::REQUIREMENTS_FORM,
+                crate::ui::tabs::requirements::PRIORITY_HINT
+            ),
+            "M/Alt+l priority"
+        );
+        let entries: Vec<String> = keys
+            .help_lines(views::REQUIREMENTS_FORM, |_| true)
+            .into_iter()
+            .flat_map(|line| line.entries)
+            .collect();
+        for listed in ["M priority must", "Alt+l priority later", "t toggle"] {
+            assert!(entries.iter().any(|entry| entry == listed), "{entries:?}");
+        }
         let mut form = on_priority(Priority::Later);
         assert_eq!(press(&mut form, "m", &keys), FormOutcome::Pass);
         assert_eq!(form.priority, Priority::Later);
