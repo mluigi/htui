@@ -1461,6 +1461,23 @@ async fn the_pane_takes_motion_and_back_returns_to_the_template_left() {
         !frame.contains("\u{250c} implement v"),
         "on the Skills view:\n{frame}"
     );
+    // RV3 (review M1): back on the Templates view, its cursor moves off `implement`, so the
+    // Back that returns there has to put the row back, not only the view.
+    harness.key("l");
+    harness.key("j");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("\u{250c} implement v"),
+        "the cursor left `implement`:\n{frame}"
+    );
+    harness.key("backspace");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("\u{250c} implement v"),
+        "back on the Skills view:\n{frame}"
+    );
     harness.key("backspace");
     harness.settle().await;
     let frame = harness.render();

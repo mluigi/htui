@@ -2402,8 +2402,18 @@ mod tests {
         assert_eq!(here.subtab_title.as_deref(), Some("Templates"));
         assert_eq!(here.cursor.as_deref(), Some("2"));
 
+        // RV3 (review M1): each view's cursor moves off the row first, so a restore that put
+        // back only the view would leave it there.
+        tab.on_key(key('h'), &mut bench.ctx());
+        tab.on_key(key('j'), &mut bench.ctx());
+        assert_eq!(tab.location().subtab, Some("library"));
+        assert_ne!(tab.location(), library, "the library's cursor moved");
         assert!(tab.restore(&library, &mut bench.ctx()));
         assert_eq!(tab.location(), library, "back on the library's first row");
+        tab.on_key(key('l'), &mut bench.ctx());
+        tab.on_key(key('k'), &mut bench.ctx());
+        assert_eq!(tab.location().subtab, Some("templates"));
+        assert_ne!(tab.location(), here, "the tree's cursor moved");
         assert!(tab.restore(&here, &mut bench.ctx()));
         assert_eq!(tab.location(), here, "and forward to the template");
 

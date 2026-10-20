@@ -2013,6 +2013,23 @@ async fn the_pane_takes_motion_and_back_returns_to_the_skill_left() {
         !frame.contains("\u{250c} tests v"),
         "on the Templates view:\n{frame}"
     );
+    // RV3 (review M1): back on the library, its cursor moves off `tests`, so the Back that
+    // returns there has to put the row back, not only the view.
+    harness.key("h");
+    harness.key("k");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("\u{250c} tests v"),
+        "the cursor left `tests`:\n{frame}"
+    );
+    harness.key("backspace");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("\u{250c} tests v"),
+        "back on the Templates view:\n{frame}"
+    );
     harness.key("backspace");
     harness.settle().await;
     let frame = harness.render();
