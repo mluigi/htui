@@ -699,8 +699,15 @@ Transaction probes:
 The D9 **equality** test needs `seed::default_edges`, so it lands with T3 (§T3.6).
 
 Between T1 and T2 the Rust code still compiles. The Pg suites are only guaranteed green again at
-T2, because the existing `create_phase` does not bind `split`. T1's gate is therefore the two
-named test binaries.
+T2, for two reasons. The existing `create_phase` does not bind `split`. And the D10 deferrable
+uniques change the order in which Postgres reports violations (T1 repair 1): a deferrable unique is
+checked by an `AFTER ROW` `Unique_ConstraintTrigger_*`, triggers fire in name order, so every
+`RI_ConstraintTrigger_c_*` FK check runs first. A phase write that both clashes on position or name
+and names an unknown persona is therefore refused by `fk_step_graph_phase_persona`, not by the
+clash. At HEAD after T1, `pg_store_conformance` stops on `a_phase_naming_no_persona_is_refused`
+("a create with a taken position naming no persona (D5: the clash first)") for this reason; that
+case passing is a T2 exit criterion (§T2.2). `migration_0020_deferrable_uniques_report_after_foreign_keys`
+pins the database order. T1's gate is therefore the two named test binaries.
 
 ### T1 commits
 
@@ -793,9 +800,25 @@ so `replace_graph` (T3) reuses the byte-identical statement and its `.sqlx` entr
 5. `persona_id`, `planner_persona_id`, `integrate_persona_id` → `references_no_row("step_graph_phase.<column>", id, "persona")`;
 6. `planner_agent_id`, `integrate_agent_id` → `references_no_row("step_graph_phase.<column>", id, "agent")`.
 
+Pg cannot take step 4 from the database any more (T1 repair 1): after 0020 the deferrable
+`uq_step_graph_phase_{position,name}` are checked after every FK trigger, so the `INSERT`/`UPDATE`
+reports an unknown persona or agent before a clash. Pg `create_phase` and `update_phase` therefore
+decide step 4 themselves, inside the transaction §1.4 opens, after `bump_graph` has taken the
+graph row lock (so no concurrent writer of the graph can slip a clashing row in between): one
+pre-read of `(graph_id, position)` and `(graph_id, name)` excluding the row's own id, against the
+row as it will be written. For `update_phase` that is the patch applied over the current row, and
+Mem's order (`mem.rs` `update_phase`: not found, then `Stale`, then the clash, then the persona)
+means the pre-read runs only once the row is read `FOR UPDATE` and its `updated_at` equals the
+token; a stale token still answers `Stale` over a clash. A hit rolls
+back and answers Mem's position or name sentence (`mem.rs:3589`, `:3594`), position first, so
+both stores word a clash the same. `SET CONSTRAINTS … IMMEDIATE` does not help: an
+immediate deferrable unique is still checked by its after-row trigger, after the FK triggers. The
+unique stays as the backstop for anything the pre-read misses.
+
 Pg reaches step 5 and 6 through `phase_persona_refused` (`write.rs:808`). It is generalised to
 `phase_fk_refused(err, phase: &StepGraphPhase)` over a const table of `(constraint, column,
-Option<id>, target table)` for the five FKs. Anything else goes through `map_sqlx`.
+Option<id>, target table)` for the five FKs. Anything else goes through `map_sqlx`. This is sound
+only because step 4 was decided before the write.
 
 ### T2.3 MemStore (`store/mem.rs`)
 
@@ -911,6 +934,7 @@ statements at `:3106`, `:3612`. A `NULL` `project_id` never equals `$1`.
 | `seed.rs::rows_carry_the_frozen_defaults` (extended) | unit | scope + ten defaults |
 | `mem.rs::delete_project_leaves_no_row_in_any_map` (extended) | Mem | `edges`, `phase_parts` empty for the project |
 | existing core conformance, orch, worker, htui suites | Mem + Pg | green: no behaviour change beyond the bump |
+| existing `a_phase_naming_no_persona_is_refused` (core conformance) | Pg | green again (red since T1, §T1 tests): the clash is refused before the persona through §T2.2's pre-read, for `create_phase` and `update_phase` |
 
 The cases that pin the bump, the cascade and the persona references are T3's (plan): §T3.6
 cases 11, 14 and 16.

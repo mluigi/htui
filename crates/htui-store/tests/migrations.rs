@@ -2685,6 +2685,90 @@ async fn migration_0020_phase_uniques_are_deferrable() {
     db.drop_db().await;
 }
 
+/// MOD-137 plan D10, repair: a deferrable unique (even `INITIALLY IMMEDIATE`) is checked by an
+/// `AFTER ROW` `Unique_ConstraintTrigger_*`, and triggers fire in name order, so every
+/// `RI_ConstraintTrigger_c_*` foreign-key check runs first. Before 0020 a phase write that both
+/// clashed on position or name and named an unknown persona was refused by the unique; from 0020
+/// on the database refuses it by `fk_step_graph_phase_persona`. The schema therefore no longer
+/// carries MOD-26 D5's order (the clash before the persona): `PgStore`'s phase writers must decide
+/// the clash themselves before the write (MOD-137 blueprint §T2.2). This test pins the database
+/// order those writers cannot lean on.
+#[tokio::test]
+async fn migration_0020_deferrable_uniques_report_after_foreign_keys() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let pool = &db.pool;
+    let user = insert_user(pool, "order").await;
+    let project = insert_project(pool, user, "order").await;
+    let graph = insert_graph(pool, project, "ordered").await;
+    insert_phase(pool, graph, 0, "plan", 1, 1).await;
+    let other = insert_phase(pool, graph, 1, "implement", 1, 1).await;
+    let unknown = uuid::Uuid::now_v7();
+    let insert = "INSERT INTO step_graph_phase (graph_id, position, name, output_kind, \
+                  template_name, persona_id) VALUES ($1, $2, $3, 'doc', 'tpl', $4)";
+
+    for (position, name, what) in [(0, "cut", "a taken position"), (9, "plan", "a taken name")] {
+        assert_refused(
+            sqlx::query(insert)
+                .bind(graph)
+                .bind(position)
+                .bind(name)
+                .bind(None::<uuid::Uuid>)
+                .execute(pool)
+                .await,
+            "23505",
+            if position == 0 {
+                "uq_step_graph_phase_position"
+            } else {
+                "uq_step_graph_phase_name"
+            },
+            &format!("an insert with {what}"),
+        );
+        assert_refused(
+            sqlx::query(insert)
+                .bind(graph)
+                .bind(position)
+                .bind(name)
+                .bind(unknown)
+                .execute(pool)
+                .await,
+            "23503",
+            "fk_step_graph_phase_persona",
+            &format!("an insert with {what} naming no persona (the foreign key first)"),
+        );
+    }
+    for (update, what) in [
+        (
+            "UPDATE step_graph_phase SET position = 0, persona_id = $2 WHERE id = $1",
+            "a taken position",
+        ),
+        (
+            "UPDATE step_graph_phase SET name = 'plan', persona_id = $2 WHERE id = $1",
+            "a taken name",
+        ),
+    ] {
+        assert_refused(
+            sqlx::query(update)
+                .bind(other)
+                .bind(unknown)
+                .execute(pool)
+                .await,
+            "23503",
+            "fk_step_graph_phase_persona",
+            &format!("an update to {what} naming no persona (the foreign key first)"),
+        );
+    }
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM step_graph_phase WHERE graph_id = $1")
+        .bind(graph)
+        .fetch_one(pool)
+        .await
+        .expect("count the phases");
+    assert_eq!(rows, 2, "nothing was written");
+
+    db.drop_db().await;
+}
+
 /// The smallest FK chain an `item` row needs (project -> step_graph -> item_kind), under the
 /// `created_by` the caller names. Returns `(project, kind)`; the kind's prefix is `RES`.
 async fn plant_item_kind(pool: &sqlx::PgPool, user: uuid::Uuid) -> (uuid::Uuid, uuid::Uuid) {
