@@ -72,6 +72,10 @@ amended 2026-10-18 by maintainer decision on ANA-35 (`docs/ANA-35.md` §10,
 R-ENT-6, R-ENT-7, R-ENT-8 (with ANA-34's transition sentence, `docs/ANA-34.md` §10.4), R-ENT-9,
 R-ENT-12, R-ENT-14, R-ENT-16, R-STO-3, R-ORCH-8, R-TUI-2 and R-TUI-11 (project types, folders,
 workspace ownership and keys, the three item statuses and their derived states, links, attachments).
+amended 2026-10-18 by maintainer decision on ANA-36 (`docs/ANA-36.md` §8 Q13, §9,
+`docs/decisions/ana/ana-36.md`) — R-MCP-2 replaced (typed requests, the asynchronous command form,
+`requirement_cite`, proposals held until a person accepts them, and the coordinator's tools of
+`docs/ANA-34.md` §10.11); amended in place: R-MCP-1, R-MCP-3, R-MCP-4, R-ENT-9, R-ENT-15 and R-ID-5.
 **Governed by:** `.claude/rules/workflow-docs.md`
 
 This file is the product requirements for `htui`. It sits above every `ANA-N` analysis and every
@@ -116,8 +120,9 @@ conflict. Their verdicts survive only where restated here.
 - **R-ID-5 (must).** Agents run with their own system skills disabled. `htui` owns every prompt and
   every skill text and inlines them into the initial prompt, so behavior is identical on every box
   and agents never spend turns reading instruction files. Isolation is the default; a registry row
-  may opt out, and an opted-out agent is shown as such in Settings (ANA-31 settles `agy`). Amended
-  2026-10-15.
+  may opt out, and an opted-out agent is shown as such in Settings (ANA-31 settles `agy`). A step's
+  bound skills may carry resources (R-SKL-1) that the agent reads on demand through `htui`'s MCP read
+  tools; the skill text itself stays inlined. Amended 2026-10-15 and 2026-10-18 (ANA-36).
 - **R-ID-6 (must).** No LLM agent is ever in a sync, cache, import or bookkeeping path. Those are
   deterministic code. Outside it (ANA-30, 2026-10-14): a display-only label a model derives, and a
   draft a person accepts or edits before it is saved, as long as no status transition, link,
@@ -251,10 +256,12 @@ conflict. Their verdicts survive only where restated here.
   is provenance), `duplicates` and `implements`; a link may also target a document or an attachment.
   Because edges use UUIDs, cross-project links need nothing extra. Links are proposed by agents
   through the `htui` MCP server (R-MCP-2) and by the importer (R-LATER-3). Requirements are linked by
-  citation (R-ENT-15). An item has at most one `parent` and parents
-  never form a cycle. A link to a document names the version it was made against. There is no manual
-  link action, except that a person's close-out as `duplicate` or `superseded` records the link to the
-  item they name. Amended 2026-10-15 and 2026-10-18 (ANA-35, parent and document-link rules).
+  citation (R-ENT-15). An item has at most one `parent` and parents never form a cycle. A link to a
+  document names the version it was made against. There is no manual link action, except that a
+  person's close-out as `duplicate` or `superseded` records the link to the item they name. A proposed
+  link of a kind that scheduling, status or a subgraph reads (`blocked_by`, `supersedes`, `duplicates`,
+  `parent`) is pending until a person accepts it (R-ID-6). Amended 2026-10-15 and 2026-10-18 (ANA-35,
+  parent and document-link rules; ANA-36).
 - **R-ENT-10 (must).** Item body and title changes are recorded as revisions with author, box and
   reason. Concurrent edits on the same `version` are rejected and shown as a divergence with the
   common ancestor; no timestamp-based last-writer-wins anywhere.
@@ -284,10 +291,12 @@ conflict. Their verdicts survive only where restated here.
 - **R-ENT-15 (must).** Items cite requirements with kind `addresses`, `amends`, `withdraws`,
   `reserves` or `verifies` (a test or review item that verifies the requirement). Each citation
   records the requirement version it was made against, and a newer version marks it suspect until
-  re-confirmed. A workspace requirement can be split into project requirements, each refining it,
-  and its coverage derives from theirs: covered when all are, in progress when any is, open
-  otherwise. An agent may propose further splits, as drafts a person accepts. Amended 2026-10-15
-  (`verifies`) and 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`) (splits).
+  re-confirmed. A workspace requirement can be split into project requirements, each refining it, and
+  its coverage derives from theirs: covered when all are, in progress when any is, open otherwise. An
+  agent may propose further splits, as drafts a person accepts. An agent proposes a citation through
+  `requirement_cite` (R-MCP-2), as a draft a person accepts; amending or withdrawing a requirement is
+  a requirement draft (R-ENT-14). Amended 2026-10-15 (`verifies`), 2026-10-17 (UI review,
+  `docs/ui-redesign-findings-2026-10-15.md`) (splits) and 2026-10-18 (ANA-36) (`requirement_cite`).
 - **R-ENT-16 (must).** Workspace-owned items: a workspace has its own key space and kinds, and owns
   items, documents and requirements that span its member projects, linked to their items by UUID.
   A workspace item has no repos: it plans, decides and splits, and code work goes to child items in
@@ -566,23 +575,36 @@ conflict. Their verdicts survive only where restated here.
 ## 10. htui MCP server (R-MCP)
 
 - **R-MCP-1 (must).** `htui` exposes an MCP server to every session it launches. Every tool call is
-  scoped to the run step owning the session: an agent writes only within its run, and may read
-  beyond it — workspace items, documents and requirements. Amended 2026-10-15 (wider read scope).
-- **R-MCP-2 (must).** Tools: `item_link` (propose an edge, kind), `item_status` request,
-  `document_write` (the step's output artifact), `note_add`, `box_profile` read, `command_run`,
-  `spawn_subagent`; read tools for items, documents and requirements, and semantic search
-  (R-STO-8); `item_create`, which proposes an item as a draft a person accepts (R-ID-6); a question
-  to the user that parks the step (R-TUI-11, MOD-75); and the planner's tools for declaring parts and
-  next steps (R-ORCH-1, R-ORCH-7, ANA-33). ANA-36 surveys further tools. Amended 2026-10-15.
-- **R-MCP-3 (must).** `command_run` enqueues build, test and run commands behind per-box
-  concurrency limits by command class (for example one C++ build, four test runs) and returns
-  output. Exposure per phase is `off`, `fan_out_only` (default) or `always`, and can be forced on
-  by the item carrying the `heavy_build` label (R-ENT-5); `fan_out_only` exposes it when the session
-  has live siblings in the run (compete candidates, divided parts, parallel nodes). When off, the tool
-  is not advertised to the session. The exposure and the per-box limits are editable in Settings.
-  Amended 2026-10-15 and 2026-10-18 (ANA-33: the meaning of `fan_out_only`).
-- **R-MCP-4 (must).** Skill text instructs agents to use `command_run` for heavy commands when it is
-  exposed; ACP permission handling denies matching direct shell commands in that case.
+  scoped to the run step owning the session: an agent writes only within its run, and may read beyond
+  it — workspace items, documents and requirements. Read results mark the author of any model text
+  they return; a run's unaccepted drafts are returned only to that run; an upstream item outside the
+  active workspace reads as a one-line stub (R-PRM-2). Amended 2026-10-15 (wider read scope) and
+  2026-10-18 (ANA-36).
+- **R-MCP-2 (must).** Tools: `item_link` (propose an edge, kind), `item_status` (a typed request a
+  person accepts), `document_write` (the step's output artifact), `note_add`, `box_profile` read,
+  `command_run` and its asynchronous form (start, wait with a deadline, cancel) with reads of the
+  stored command output and structured test results, `spawn_subagent` (consult); read tools for
+  items, documents and requirements, and semantic search (R-STO-8); `item_create`, which proposes an
+  item as a draft a person accepts (R-ID-6); `requirement_cite`, which proposes a citation (R-ENT-15)
+  a person accepts; a question to the user that parks the step (R-TUI-11, MOD-75); the planner's
+  tools for declaring parts and next steps (R-ORCH-1, R-ORCH-7, ANA-33); and the coordinator's tools
+  (R-ORCH-14): read the runs and waiting rows below it, write proposals into the close-out checklist,
+  and request an enqueue or a link through a permission card. Any proposal an agent makes that a
+  status move, the scheduler, coverage or a prompt would read is held until a person accepts it
+  (R-ID-6). Each session is told which tools it has and when to use them. Amended 2026-10-15 and
+  2026-10-18 (ANA-36, with ANA-34's coordinator tools).
+- **R-MCP-3 (must).** `command_run` enqueues build, test and run commands behind per-box concurrency
+  limits by command class (for example one C++ build, four test runs) and returns output, or a handle
+  the session waits on with a deadline; the scrubbed output is stored on the step and readable by the
+  run's sessions. A project may name command presets with their own timeout. Exposure per phase is
+  `off`, `fan_out_only` (default) or `always`, and can be forced on by the item carrying the
+  `heavy_build` label (R-ENT-5); `fan_out_only` exposes it when the session has live siblings in the
+  run (compete candidates, divided parts, parallel nodes). When off, the tool is not advertised to the
+  session. The exposure and the per-box limits are editable in Settings. Amended 2026-10-15 and
+  2026-10-18 (ANA-36; ANA-33: the meaning of `fan_out_only`).
+- **R-MCP-4 (must).** The prompt and the MCP server's instructions tell agents to use `command_run`
+  for heavy commands when it is exposed; ACP permission handling denies matching direct shell
+  commands in that case. Amended 2026-10-18 (ANA-36).
 
 ## 11. TUI (R-TUI)
 

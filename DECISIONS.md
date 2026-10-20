@@ -3,6 +3,7 @@
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
 - **[ANA-35](docs/decisions/ana/ana-35.md)** - Entity model for any kind of project (concluded, 2026-10-18)
+- **[ANA-36](docs/decisions/ana/ana-36.md)** - Further MCP tools for agents (concluded, 2026-10-18)
 - **[ANA-34](docs/decisions/ana/ana-34.md)** - Coordinator at project and workspace level (concluded, 2026-10-18)
 - **[ANA-33](docs/decisions/ana/ana-33.md)** - Step graphs v2 and divided fan-out (concluded, 2026-10-18)
 - **[ANA-40](docs/decisions/ana/ana-40.md)** - Toolbox: kinds of run tools and how to show them (concluded, 2026-10-17)
