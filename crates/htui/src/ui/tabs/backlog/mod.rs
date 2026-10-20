@@ -1858,6 +1858,7 @@ mod tests {
             opening: None,
             queue_intent: None,
             queue_writing: None,
+            detail_drawn: Cell::new(true),
         };
 
         let (top_bar, keys, theme, emit) = (
@@ -2041,6 +2042,7 @@ mod tests {
             opening: None,
             queue_intent: None,
             queue_writing: None,
+            detail_drawn: Cell::new(true),
         };
         let (top_bar, keys, theme, emit) = (
             TopBarState::default(),
@@ -2093,6 +2095,7 @@ mod tests {
             opening: None,
             queue_intent: None,
             queue_writing: None,
+            detail_drawn: Cell::new(true),
         };
         let (top_bar, keys, theme, emit) = (
             TopBarState::default(),
