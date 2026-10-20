@@ -656,7 +656,13 @@ impl App {
             return;
         };
         let stack = tab.key_stack().unwrap_or(Stack::BASE);
-        if let Some(activity) = areas.activity.filter(|rect| !rect.is_empty()) {
+        // T7 repair: with the activity pane zoomed, a tab whose keys a modal stack holds (an
+        // open form) draws what captures them over the zoomed pane; no placeholder covers it.
+        let modal = stack.global().is_some_and(|(_, layer)| layer.is_modal());
+        let zoomed = areas.list.is_none() && areas.detail.is_empty();
+        if let Some(activity) = areas.activity.filter(|rect| !rect.is_empty())
+            && !(modal && zoomed)
+        {
             let next = self
                 .keys
                 .reachable_chord(stack, Act::LayoutToggleActivity)

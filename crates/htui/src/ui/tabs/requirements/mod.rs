@@ -1011,6 +1011,14 @@ impl RequirementsTab {
         );
     }
 
+    /// Whether a form is open (new area, requirement, withdraw): it takes every key.
+    const fn form_open(&self) -> bool {
+        matches!(
+            self.mode,
+            Mode::NewArea(_) | Mode::Requirement(_) | Mode::Withdraw(_)
+        )
+    }
+
     /// The right pane: the open form, or what the selected row says.
     fn render_detail(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let theme = ctx.theme;
@@ -1332,11 +1340,17 @@ impl Tab for RequirementsTab {
         // MOD-115 M2 B5: the panes the shell's layout gives the rows above the notice, claimed
         // for the focus borders, the hints and the mouse; today's 45/55 by default.
         let areas = ctx.split(content, REQUIREMENTS_LAYOUT);
-        if let Some(tree) = areas.list {
-            self.render_tree(frame, tree, ctx);
-        }
-        if !areas.detail.is_empty() {
-            self.render_detail(frame, areas.detail, ctx);
+        // T7 repair: a form takes every key, so with another pane zoomed it is drawn over the
+        // zoomed one rather than into the detail's empty rect.
+        if areas.detail.is_empty() && self.form_open() {
+            self.render_detail(frame, content, ctx);
+        } else {
+            if let Some(tree) = areas.list {
+                self.render_tree(frame, tree, ctx);
+            }
+            if !areas.detail.is_empty() {
+                self.render_detail(frame, areas.detail, ctx);
+            }
         }
         frame.render_widget(
             Paragraph::new(

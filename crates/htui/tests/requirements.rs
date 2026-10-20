@@ -777,3 +777,50 @@ async fn the_detail_takes_motion_and_back_returns_to_the_row_left() {
         "back on R-ENT-2:\n{frame}"
     );
 }
+
+/// MOD-115 M2 §7 (T7 repair): a form takes every key, so it is on screen whichever pane is
+/// zoomed. With the tree zoomed, `a` draws the new-area form over the zoomed tree.
+#[tokio::test]
+async fn a_form_opened_with_the_tree_zoomed_is_on_screen() {
+    let mut harness = open().await;
+    harness.key("z");
+    harness.settle().await;
+    assert!(
+        !harness.render().contains("New area in htui"),
+        "{}",
+        harness.render()
+    );
+    harness.key("a");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} New area in htui "),
+        "the form is drawn:\n{frame}"
+    );
+}
+
+/// MOD-115 M2 §7 (T7 repair): with the activity pane zoomed, `a` draws the new-area form over
+/// it, not under the shell's placeholder.
+#[tokio::test]
+async fn a_form_opened_with_the_activity_zoomed_is_on_screen() {
+    let mut harness = open().await;
+    // The layout with the activity pane, its focus (the third pane) and the zoom; a frame
+    // after each, as the app draws one, so the focus cycle reads the panes on screen.
+    for key in ["p", "tab", "tab", "z"] {
+        harness.key(key);
+        harness.settle().await;
+        harness.render();
+    }
+    assert!(
+        harness.render().contains("Activity"),
+        "the activity pane is zoomed:\n{}",
+        harness.render()
+    );
+    harness.key("a");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} New area in htui "),
+        "the form is drawn:\n{frame}"
+    );
+}
