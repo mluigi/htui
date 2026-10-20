@@ -123,6 +123,97 @@ mod binary {
         }
     }
 
+    /// MOD-115 M2 RV1 H1 (MD4) end to end: `v1_view_keys.toml`, a file from before M2 whose
+    /// entries sit on keys a view kept then (the reviewer's examples), still loads with the
+    /// notices it gave before M2 plus `history.back`'s, never one about a `[field]`, `[choice]`,
+    /// `[answer]` or priority key. Those rows keep their compiled chords, and each entry still acts
+    /// on its own screen while the view's key acts on the view's.
+    #[test]
+    fn a_version_1_file_on_the_keys_a_view_kept_keeps_them_all() {
+        use htui::keys::translate::translate;
+        use htui::keys::{Act, CATALOGUE, Context, KeyChord, views};
+
+        let home = tempfile::tempdir().expect("a throwaway home");
+        let path = fixture("v1_view_keys");
+        let output = run(
+            &["--keys", path.to_str().expect("UTF-8"), "--print-keys"],
+            home.path(),
+        );
+        let (stdout, stderr) = text(&output);
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        let shown = path.display();
+        assert_eq!(
+            stderr,
+            format!(
+                "htui: {shown}:7: [global] next_tab = \"backspace\" takes \"backspace\" from \
+                 history.back, which keeps \"alt-left\"\n\
+                 htui: {shown}:8: [global] select_tab_2 = \"1\" takes \"1\" from \
+                 global.select_tab_1, which is now unbound\n"
+            )
+        );
+        let keys = load_path(&path).expect("v1_view_keys.toml loads");
+        assert_eq!(stdout, print(&keys));
+
+        let kept = |act: Act, context: Context| {
+            matches!(
+                act,
+                Act::RequirementsPriorityMust | Act::RequirementsPriorityLater
+            ) || matches!(context, Context::Field | Context::Choice | Context::Answer)
+        };
+        let mut checked = 0;
+        for spec in CATALOGUE.iter().filter(|spec| kept(spec.act, spec.context)) {
+            checked += 1;
+            assert_eq!(
+                keys.chords(spec.context, spec.act),
+                Keys::compiled().chords(spec.context, spec.act),
+                "[{}] {}",
+                spec.context.table(),
+                spec.name
+            );
+        }
+        assert_eq!(checked, 26, "12 field, 3 choice, 9 answer, 2 priority rows");
+
+        let chord = |spec: &str| KeyChord::parse_strict(spec).expect("a valid spec");
+        let first = |stack, spec| keys.actions(stack, chord(spec)).first().copied();
+        // Each entry acts on its own screen.
+        assert_eq!(first(views::BACKLOG_BODY, "backspace"), Some(Act::NextTab));
+        assert_eq!(first(views::BACKLOG_BODY, "1"), Some(Act::SelectTab2));
+        assert_eq!(first(views::KINDS_CONFIRM, "space"), Some(Act::ConfirmYes));
+        assert_eq!(
+            first(views::REQUIREMENTS_BROWSE, "m"),
+            Some(Act::RequirementsAmend)
+        );
+        assert_eq!(
+            first(views::BACKLOG_FILTER, "home"),
+            Some(Act::FormNextField)
+        );
+        // The view's key acts on the view's screen, as it did before M2.
+        assert_eq!(
+            first(views::REQUIREMENTS_FORM, "m"),
+            Some(Act::RequirementsPriorityMust)
+        );
+        assert_eq!(first(views::RUNS_CONFIRM, "space"), Some(Act::ChoiceToggle));
+        assert_eq!(first(views::RUNS_BROWSE, "1"), Some(Act::AnswerOption1));
+        assert_eq!(first(views::CHAT_LIVE, "1"), Some(Act::AnswerOption1));
+        assert_eq!(
+            first(views::BACKLOG_FILTER, "space"),
+            Some(Act::ChoiceToggle)
+        );
+        // A text field still reads its editing keys: the translation delivers them as the
+        // widgets' own events (`backspace`, `home` and `enter`, the hierarchy editor's included).
+        for (stack, spec) in [
+            (views::CAPTURE, "backspace"),
+            (views::LIBRARY_PROMPT, "backspace"),
+            (views::AGENTS_FORM, "home"),
+            (views::HIERARCHY_EDITOR, "home"),
+            (views::HIERARCHY_EDITOR, "enter"),
+            (views::ITEM_FORM, "enter"),
+        ] {
+            let key = chord(spec).to_event();
+            assert_eq!(translate(&keys, stack, key), Some(key), "{spec}");
+        }
+    }
+
     #[test]
     fn print_keys_with_default_keys_prints_the_defaults() {
         let home = tempfile::tempdir().expect("a throwaway home");
