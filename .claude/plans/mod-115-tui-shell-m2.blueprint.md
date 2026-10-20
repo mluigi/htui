@@ -245,6 +245,13 @@ of an action from before M2, a chord from a row M2 added for a key a view kept b
 `[answer]`, `requirements.priority_*`: `validate::kept_by_a_view`); the two share it and the validator lets them
 (`v1_shares`), as the widget literal or `FIXED` key won there before M2. Pinned by
 `a_version_1_entry_never_takes_a_key_a_view_kept_before_m2` and `tests/fixtures/keys/v1_view_keys.toml`.
+*RV1 repair 1:* the share is judged per stack against the pre-M2 `FIXED` register, kept as `validate::V1_FIXED`.
+Where the view kept the chord there, the file was refused before M2 and still is (`[backlog.filter_form] clear =
+["left"]`), save the tab digits a permission request shadowed by design. Where it kept none, the `[choice]`,
+`[answer]` and priority rows step aside in that stack only (`validate::v1_steps_aside`, called by `Keys::actions` in
+`keys/stack.rs`), so the entry acts there as before M2: `[confirm] yes = ["space"]` continues the Runs close-out
+warning, and `choice.toggle` keeps `Space` everywhere else. A text field's rows never step aside (the widget read its
+editing keys wherever it had the focus).
 
 ## 3. `[field]` translation (Task 5 writes it, Task 6 calls it) — `keys/translate.rs`
 ```rust
@@ -559,7 +566,8 @@ with T5 serially.
   `choice.prev` on a picker). Fixed for every choice act: `Ctx::pressed(&key)` (`app/state.rs`,
   set by `App::dispatch_key` on the overlay's and the tab's context) is the chord the user
   pressed, and the filter form, the item form and the Requirements form (`on_pressed`, called
-  from `backlog/mod.rs` and `requirements/mod.rs`) resolve their choice and form acts from it.
+  from `backlog/mod.rs` and `requirements/mod.rs`) resolve their choice and form acts from it;
+  the Skills attachment form's activation resolves `choice.toggle` from it (RV1 repair 1).
   **Limit kept:** the other views that resolve a form act after a widget passed the key (the
   Settings and Skills forms, the Docs/Notes compose areas, the concepts search, the agent help)
   still read the delivered key, so a rebound `field.line_up`/`line_down` chord a one-line field

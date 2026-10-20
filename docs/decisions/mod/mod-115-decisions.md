@@ -147,15 +147,20 @@ hidden. The `HANDOFF.md` phase 1 note summarises the milestone.
   under its old chord there. Closing it needs `&Keys` in the widgets, which the plan rejected as a
   25-file signature change; it closes as M3/M4 port the tabs onto the kit. The reverse (review
   RV1 M) is fixed for every choice: a rebound field chord arrives as the canonical key, and the
-  filter, item and Requirements forms resolve their own acts from the chord pressed
-  (`Ctx::pressed`), so `field.left = ["ctrl-b"]` never fires `choice.prev`. The other forms, the
+  filter, item and Requirements forms and the Skills attachment activation resolve their own
+  acts from the chord pressed (`Ctx::pressed`), so `field.left = ["ctrl-b"]` never fires
+  `choice.prev`. The other forms, the
   compose areas, the concepts search and the agent help still resolve from the delivered key, so
   a rebound `field.line_up`/`line_down` chord a one-line field passes moves the field or cursor
   there as `Up`/`Down` would; that closes with the same M3/M4 port.
 - **D8 - existing key files keep loading:** MD4 above. Review RV1 H1: a version-1 entry never
   takes a chord from the rows M2 added for the keys a view kept before it (a text field's editing
   keys, a choice's value keys, the permission digits, the Requirements priority); the two share
-  it, and the view's key acts on its screen as before M2.
+  it, and the view's key acts on its screen as before M2. The share is judged per screen
+  against the keys each view kept then: where the view kept the key, the file was refused
+  before M2 and still is (`[backlog.filter_form] clear = ["left"]`); where it kept none, the
+  choice, answer and priority keys step aside on that screen only, so `[confirm] yes =
+  ["space"]` still continues the Runs close-out warning.
 
 ## Commits
 
