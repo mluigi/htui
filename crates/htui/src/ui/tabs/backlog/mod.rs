@@ -233,7 +233,8 @@ impl BacklogTab {
     ///
     /// MOD-13 D1: the open form takes the bottom of the list pane; with the list hidden, the
     /// bottom of the detail's, or of the whole area while the activity pane is zoomed (T7
-    /// repair), so a form that captures every key is never off screen. MOD-13 milestone 2 D8:
+    /// repair), so a form that captures every key is never off screen; there the list it
+    /// filters takes the rest of the area above it (RV3), not a blank body. MOD-13 milestone 2 D8:
     /// the open item form takes the detail pane's place, or the whole area while another pane is
     /// zoomed ([`capture_area`]); so does a sub-tab that captures every key, a compose area or a
     /// picker (T7 repair).
@@ -248,7 +249,10 @@ impl BacklogTab {
                 let (list, form) = below(list);
                 (Some(list), areas.detail, Some(form))
             }
-            (true, None) if areas.detail.is_empty() => (None, areas.detail, Some(below(area).1)),
+            (true, None) if areas.detail.is_empty() => {
+                let (list, form) = below(area);
+                (Some(list), areas.detail, Some(form))
+            }
             (true, None) => {
                 let (detail, form) = below(areas.detail);
                 (None, detail, Some(form))

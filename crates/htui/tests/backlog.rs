@@ -3619,3 +3619,28 @@ async fn the_filter_opened_with_the_activity_zoomed_is_on_screen() {
         "the form is drawn:\n{frame}"
     );
 }
+
+/// MOD-115 M2 §7, RV3 (review M3): with the activity pane zoomed, the filter form takes the
+/// bottom of the zoomed pane and the list it filters is drawn above it, not a blank body.
+#[tokio::test]
+async fn the_list_is_drawn_above_the_filter_opened_with_the_activity_zoomed() {
+    let mut harness = backlog().await;
+    press(&mut harness, &["p", "tab", "tab", "z"]).await;
+    let zoomed = harness.render();
+    assert!(
+        zoomed.contains("Activity") && !zoomed.contains("htui"),
+        "the activity pane is zoomed:\n{zoomed}"
+    );
+    press(&mut harness, &["f"]).await;
+    let frame = harness.render();
+    let lines: Vec<&str> = frame.lines().collect();
+    let form = lines
+        .iter()
+        .position(|line| line.contains("\u{250c} Filter "))
+        .unwrap_or_else(|| panic!("the form is drawn:\n{frame}"));
+    let list = lines
+        .iter()
+        .position(|line| line.contains("htui"))
+        .unwrap_or_else(|| panic!("the list is drawn:\n{frame}"));
+    assert!(list < form, "the list is above the form:\n{frame}");
+}

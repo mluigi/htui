@@ -824,3 +824,34 @@ async fn a_form_opened_with_the_activity_zoomed_is_on_screen() {
         "the form is drawn:\n{frame}"
     );
 }
+
+/// MOD-115 M2 §7, RV3 (review M3): with the activity pane zoomed, `/` opens the filter field on
+/// the bottom row, and the tree it filters is drawn above it, not a blank body.
+#[tokio::test]
+async fn the_tree_is_drawn_above_the_filter_opened_with_the_activity_zoomed() {
+    let mut harness = open().await;
+    for key in ["p", "tab", "tab", "z"] {
+        harness.key(key);
+        harness.settle().await;
+        harness.render();
+    }
+    let zoomed = harness.render();
+    assert!(
+        zoomed.contains("Activity") && !zoomed.contains("R-ENT-2"),
+        "the activity pane is zoomed:\n{zoomed}"
+    );
+    harness.key("/");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("R-ENT-2"),
+        "the tree is drawn over the zoomed pane:\n{frame}"
+    );
+    type_text(&mut harness, "STO");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("R-STO-1") && !frame.contains("R-ENT-2"),
+        "and it follows the filter typed:\n{frame}"
+    );
+}

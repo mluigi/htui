@@ -1350,7 +1350,15 @@ impl Tab for RequirementsTab {
         let areas = ctx.split(content, REQUIREMENTS_LAYOUT);
         // T7 repair: a form takes every key, so with another pane zoomed it is drawn over the
         // zoomed one rather than into the detail's empty rect.
-        let (tree, detail) = capture_area(&areas, content, self.form_open());
+        // RV3 (review M3): the filter field filters the tree, so with the activity pane zoomed
+        // the tree is drawn over the zoomed pane above the field, not a blank body.
+        let zoomed = areas.list.is_none() && areas.detail.is_empty();
+        let (tree, detail) = match capture_area(&areas, content, self.form_open()) {
+            (None, detail) if zoomed && matches!(self.mode, Mode::Filter { .. }) => {
+                (Some(content), detail)
+            }
+            drawn => drawn,
+        };
         if let Some(tree) = tree {
             self.render_tree(frame, tree, ctx);
         }
