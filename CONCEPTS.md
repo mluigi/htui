@@ -8,7 +8,7 @@ from `docs/REQUIREMENTS.md`, which is the authority; requirement IDs in brackets
 
 ## What htui is
 
-A cross-platform Rust TUI (`ratatui`, `crossterm`, `tokio`) that wraps AI agents to run a backlog
+A cross-platform Rust TUI that wraps AI agents to run a backlog
 of work items through configurable step graphs across projects, repositories and machines. Projects
 of any kind, coding the main one [R-ID-1]. Single developer today, teams later without redesign
 [R-USR-1..3].
@@ -55,8 +55,7 @@ nothing extra [R-ENT-9].
 ## Agents and orchestration
 
 - **One driver trait, ACP first.** Agents speak Agent Client Protocol; a CLI stream adapter covers
-  the rest. Adding an agent is a registry row plus at most a parser [R-AGT-1..5]. Version one:
-  `claude`, `claude-cli`, `agy`.
+  the rest. Adding an agent is a registry row plus at most a parser [R-AGT-1..5].
 - **Step graphs, not scripts.** Phases with candidate agents, gates, retries, loop-backs and
   isolation; fan-out divides work into parallel parts that an integrate step merges [R-ORCH-1..3, 7,
   8]. A coordinator per project and workspace only manages [R-ORCH-14]. Global workflow templates,
@@ -67,13 +66,9 @@ nothing extra [R-ENT-9].
   prepares it there and the work comes back by collecting the branch [R-ORCH-15]. Stopping a run
   saves its conversation and can always be resumed [R-ORCH-16]; leaving the TUI never stops work
   [R-TUI-18].
-- **Manual and auto.** Manual runs one item with gates as configured; auto is a queue runner that
-  downgrades non-hard gates and honors caps [R-ORCH-4, 6]. Any step can be promoted to interactive
-  chat and resumed [R-ORCH-5].
-- **Capability matching.** Items declare required tags, boxes declare and probe theirs; a mismatch
-  refuses the run [R-BOX-3, R-ORCH-10].
-- **Quota-aware routing.** Candidate agents are tried in priority order, skipping exhausted
-  subscriptions or reached token caps [R-AGT-7, 8].
+- **Routing.** A run needs a box whose probed tags cover the item's, or it is refused; agents are
+  tried in priority order, skipping exhausted subscriptions and reached token caps [R-BOX-3,
+  R-ORCH-10, R-AGT-7, 8].
 
 ## Prompt economy
 
@@ -98,10 +93,6 @@ scrubbed on the host box first, and scrubbing fails closed [R-ID-7, R-SEC-3].
 
 ## Which file answers which question
 
-- `docs/REQUIREMENTS.md` - what the product must do, with stable IDs (the contract).
-- `CONCEPTS.md` - standing invariants and why (the present).
-- `HANDOFF.md` - outstanding work and live coordinates (the future).
-- `DECISIONS.md` - reverse-chronological index of completed items (the past).
-- `docs/decisions/<prefix>/<prefix>-N.md` - write-up per completed item.
-- `docs/ANA-N.md` - research and verdict per analysis. ANA-1 and ANA-8 are superseded by
-  `docs/REQUIREMENTS.md` §15 where they conflict.
+`docs/REQUIREMENTS.md` is the contract, this file the present, `HANDOFF.md` the future, `DECISIONS.md`
+and `docs/decisions/` the past, `docs/ANA-N.md` one analysis each; the map is in
+`.claude/rules/workflow-docs.md`, superseded analyses in `docs/REQUIREMENTS.md` §15.
