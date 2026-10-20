@@ -33,6 +33,10 @@
 > workspace-knowledge framing, supported by the duplicate result; it is not proven for agents at today's size.
 > Filed: **MOD-158** (P1), **MOD-159** (P2), **MOD-160** (P3), **MOD-161** (P4), **MOD-162** (P5); the §10
 > requirement edits are applied to `docs/REQUIREMENTS.md`.
+>
+> **Reconciled with ANA-38 (2026-10-20):** one Qdrant for the whole database instead of one per workspace,
+> a global memory collection beside the per-workspace ones, one indexer lease per collection. Where this
+> document says otherwise, the "Reconciled" section of `docs/decisions/ana/ana-37.md` governs.
 
 ---
 

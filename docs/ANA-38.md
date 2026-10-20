@@ -52,6 +52,11 @@
 > leakage, runaway growth and self-reinforcing wrong lessons. Phasing P1..P7 is in section 7 and was filed as
 > **MOD-163** (P1), **MOD-164** (P2), **MOD-165** (P3), **MOD-166** (P4), **MOD-167** (P5), **MOD-168** (P6)
 > and **MOD-169** (P7).
+>
+> **Reconciled with ANA-37 (2026-10-20):** memory sits in its workspace's collection or a global one in
+> the single Qdrant, indexed by ANA-37's indexer; no entry is superseded from a similarity score and no
+> run queries Qdrant; the full-text fallback is dropped. Where this document says otherwise, the
+> "Reconciled" section of `docs/decisions/ana/ana-38.md` governs.
 
 ---
 

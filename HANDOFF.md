@@ -14,7 +14,7 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-20):** **ANA-38 is concluded** (`docs/ANA-38.md`, `docs/decisions/ana/ana-38.md`): memory returns as verbatim entries (kinds `fact`, `decision`, `gotcha`, `lesson`; project, workspace and a new global scope), written automatically by the light model through a validated deterministic pipeline with no person's acceptance, which amends `R-ID-6` (owed, maintainer-gated); freshness is computed by code, the prompt section is Postgres-only, and Qdrant is an add-on. Spawned **MOD-163..169**. Before it, **ANA-37 is concluded** (`docs/ANA-37.md`, `docs/decisions/ana/ana-37.md`):
+**Current status (2026-10-20):** **ANA-37 and ANA-38 are reconciled** (the "Reconciled" sections of `docs/decisions/ana/ana-37.md` and `docs/decisions/ana/ana-38.md`): one Qdrant for the whole database, run like Postgres, its URL one database-wide setting and one API key; a collection per workspace plus one global memory collection, an indexer lease each; memory is indexed by that indexer, never inside a run; a near-duplicate score records a candidate and supersedes nothing until MOD-169 measures a threshold; agents find memory only through knowledge search. `R-NF-2`, `R-STO-1`, `R-STO-8`, `R-TUI-8`, `R-ENT-13`, `R-MCP-1` and `R-MCP-2` are amended; MOD-130, MOD-158..160, MOD-162..164 and MOD-167..169 updated. **ANA-38 is concluded** (`docs/ANA-38.md`, `docs/decisions/ana/ana-38.md`): memory returns as verbatim entries (kinds `fact`, `decision`, `gotcha`, `lesson`; project, workspace and a new global scope), written automatically by the light model through a validated deterministic pipeline with no person's acceptance, which amends `R-ID-6` (owed, maintainer-gated); freshness is computed by code, the prompt section is Postgres-only, and Qdrant is an add-on. Spawned **MOD-163..169**. Before it, **ANA-37 is concluded** (`docs/ANA-37.md`, `docs/decisions/ana/ana-37.md`):
 knowledge search is a required workspace service on one shared Qdrant per workspace, required to be configured and
 failing open on outage ("knowledge search unavailable", nothing else affected); it covers everything a workspace
 knows except code, one htui process per workspace indexes it under a Postgres lease, and the Qdrant URL becomes a
@@ -373,8 +373,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   resolver; the queue keys on `executing_box_id`, not `target_box_id == here`, so a driven target starts
   on this box; the `R-NF-2` amendment (`dockerd` and `sshd` opt-in per target). Wires MOD-44's container
   box to the record. Not blocked; read beside MOD-43 and MOD-44. ANA-37 (concluded 2026-10-19,
-  `docs/decisions/ana/ana-37.md`): MOD-158's migration adds the Qdrant URL setting to `workspace`, the table
-  this item's `target_id` touches, so coordinate the two. `R-NF-2` was replaced on ANA-37; this item's
+  `docs/decisions/ana/ana-37.md`): the Qdrant URL became one database-wide setting on 2026-10-20, so
+  MOD-158 no longer touches `workspace` and needs no coordination here. `R-NF-2` was replaced on ANA-37; this item's
   `dockerd`/`sshd` sentence was not in it, so merge that sentence into the new text rather than replace it.
 - [ ] **MOD-131 - Driven targets: ssh and docker exec launch, MCP relay tunnel, remote bootstrap**
   (from ANA-42, `docs/ANA-42.md` §7.2-§7.4, §7.6; **proposed, pending §8**). `R-ORCH-15`, `R-AGT-11`,
@@ -542,14 +542,20 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   internal prompt section filled in `phase_spec` from Postgres (active, non-suspect entries by scope, fixed
   order, hard token cap, run-start snapshot, quoted data labelled with source and trust), ranked after
   Excerpts and before Upstream, unprotected, entry ids and versions in `trim_record`
-  (`RECORD_VERSION` bump). Requirement edits owed: `R-ENT-13`, `R-PRM-1`/`R-PRM-3`, CONCEPTS "Bounded
-  context" (maintainer-gated, `docs/ANA-38.md` §7.3). Not blocked for project scope; "must".
+  (`RECORD_VERSION` bump); a line for entries left out names `search_concepts` only when the session is
+  offered it (MOD-160), since agents find memory beyond the prompt through knowledge search only
+  (`R-MCP-2`, no word-search fallback for memory). Ranking the section by Qdrant relevance to the item is
+  a later option, decided by MOD-169's measurement; until then the order is fixed. Requirement edits
+  owed: `R-ENT-13`'s final text (keeping its 2026-10-20 sentences on where memory is indexed),
+  `R-PRM-1`/`R-PRM-3`, CONCEPTS "Bounded context" (maintainer-gated, `docs/ANA-38.md` §7.3). Not blocked
+  for project scope; "must".
 - [ ] **MOD-164 - Automatic memory capture at run end** (from ANA-38, `docs/ANA-38.md` §7.2 P2, §4.6).
   `R-ENT-13`, `R-ID-6`, `R-ID-7`, `R-ORCH-1`. An extraction turn by the light model (MOD-126) over the run's
   own evidence (errors seen, retries, fixes, measured wins) writing entries with no person's acceptance,
   through a deterministic write path: schema validation, a per-run write cap, scrub before persist,
   provenance stamped by the platform (run, agent, item, commit), evidence that must cite something observed
-  in the run; automatic dedup and supersede at write time (subject key plus full-text, Postgres only);
+  in the run; automatic supersede at write time only on the same (scope, subject) key, with no
+  full-text match and no Qdrant query in the run (near duplicates are MOD-167's, in the indexer);
   deterministic usage counters (entries injected, steps ended done or failed) for demotion; a per-run cost
   budget and extraction skipped for runs with no error, retry or win. Needs the maintainer's `R-ID-6`
   amendment (`docs/ANA-38.md` §7.3) before it is built. Blocked on MOD-163; workspace-owned entries need
@@ -568,14 +574,19 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   configurable period (starting default 14 days); pin-as-trusted (exempt from auto-retire and usage
   demotion, still held back when suspect); a "why is this here" view. Blocked on MOD-163; the re-validation
   turn needs MOD-164. Later.
-- [ ] **MOD-167 - Memory in Qdrant: point type and raw-cosine dedup** (from ANA-38, `docs/ANA-38.md` §7.2
-  P5). `R-STO-8`, `R-ENT-13`, `R-NF-2`. A memory point type (active entries only, rebuilt when `version`
-  differs, deleted with the row), a `search_concepts` type extension for agent pull, and a raw-cosine
-  `VectorStore` query for write-time dedup (the existing RRF score cannot be thresholded; the literature's
-  0.98 and 0.82 thresholds do not transfer). Memory works without it: Postgres full-text is the fallback.
-  Rides ANA-35's collection `htui_concepts_v4` rebuild (MOD-147). Check ANA-37's verdict (its items, filed
-  by the `hr/ANA-37` run, were not on this branch) and its indexer before building. Blocked on MOD-163,
-  MOD-164 and MOD-147; MOD-112 for read tools. Later.
+- [ ] **MOD-167 - Memory in Qdrant: point type and near-duplicate candidates** (from ANA-38,
+  `docs/ANA-38.md` §7.2 P5; reconciled with ANA-37 on 2026-10-20). `R-STO-8`, `R-ENT-13`, `R-NF-2`. A
+  memory point type (active entries; scope, kind and state in the payload; rebuilt when `version`
+  differs, deleted with the row): project and workspace entries in their workspace's collection, global
+  entries in the global collection (MOD-159), indexed by MOD-159's lease holder and never by the run that
+  wrote the entry; a `search_concepts` type extension on MOD-112 (4)'s workspace-scope tool, global
+  memory included, advertised under MOD-160's rule, the only search over memory; a raw-cosine
+  `VectorStore` query (the RRF score cannot be thresholded; the literature's 0.98 and 0.82 thresholds do
+  not transfer) that the indexer runs on each new entry, recording near duplicates as candidates for the
+  visibility list and MOD-169. Nothing is superseded from a score (`R-ENT-13`, `R-STO-8`,
+  `docs/ANA-37.md` §5.4) unless MOD-169 measures a usable threshold and the maintainer amends both; no run
+  waits on Qdrant (`R-NF-2`), and there is no full-text fallback. Blocked on MOD-163, MOD-164 and
+  MOD-159; MOD-112 (4) for the tool's workspace scope. Later.
 - [ ] **MOD-168 - Global memory scope and automatic promotion** (from ANA-38, `docs/ANA-38.md` §7.2 P6).
   `R-ENT-13`, `R-PRM-1`, `R-ID-7`, `R-SEC-3`. A third hidden scope row (global), on the pattern of
   ANA-35's workspace scope row; an automatic promotion pipeline (a generalization check by the light model,
@@ -583,14 +594,18 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   re-runs scrub; a failing entry keeps its scope; an agent never targets global directly); tool-version
   stamping so a global lesson goes suspect when the agent or CLI version changes; a small global prompt
   section below project and workspace; the `R-PRM-1` clause that global tooling lessons are the one input
-  not bounded by the active workspace; the per-level promotion switch. Build after MOD-169's first read on
+  not bounded by the active workspace; the per-level promotion switch. Global entries are indexed in
+  the global collection (MOD-159, MOD-167), never copied into a workspace's, and reach agents' search
+  beside the workspace's (`R-MCP-1`, `R-MCP-2`, amended 2026-10-20). Build after MOD-169's first read on
   MOD-163..167. Blocked on MOD-147 (scope row pattern), MOD-164 and MOD-166. Later.
 - [ ] **MOD-169 - Memory measurement on real htui steps** (from ANA-38, `docs/ANA-38.md` §7.2 P7).
   `R-ENT-13`, `R-STO-8`. Before/after on real steps, recall of known gotchas, harm from wrong or stale
-  entries, light-model cost per run, validator recall for project-specific tokens, Postgres full-text
-  versus Qdrant on real entries; decides whether `R-ENT-13` stays "must" beyond MOD-163 and MOD-164 and
-  feeds ANA-37's workspace-scale benchmark. Blocked on MOD-163 and MOD-164; better after MOD-165 and
-  MOD-167.
+  entries, light-model cost per run, validator recall for project-specific tokens; on MOD-162's harness,
+  with `docs/ANA-37.md` §5.4's method (AUC; recall at zero false alarms, true duplicate entries against
+  entries with none), the near-duplicate threshold that would let MOD-167 supersede from a score, and a
+  fixed-order against a Qdrant-ranked memory section (MOD-163's later option); decides whether
+  `R-ENT-13` stays "must" beyond MOD-163 and MOD-164 and feeds ANA-37's workspace-scale benchmark.
+  Blocked on MOD-163 and MOD-164; better after MOD-162, MOD-165 and MOD-167.
 
 - [ ] **MOD-85 - Remaining accent (cyan) uses that do not mean focus or selection** (from MOD-80,
   `docs/decisions/mod/mod-80.md` "Carried"; blueprint B-6, review M1/L5). `R-TUI-1`. MOD-80 made
@@ -877,34 +892,36 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   notes and transcript snippets); it plugs into MOD-159's indexer and is blocked on MOD-159. Part (1)'s
   read tools carry a text filter over keys, titles and bodies that works without Qdrant, agents' fallback
   while knowledge search is unavailable (`R-MCP-2`).
-- [ ] **MOD-158 - Workspace Qdrant: URL setting and API key** (from ANA-37, `docs/ANA-37.md` §7.5,
-  §8 Q1, Q2). `R-STO-1`, `R-STO-8`, `R-SEC-2`, `R-TUI-8`, `R-NF-2`. The Qdrant URL as a workspace
-  setting in Postgres (a `workspace` migration, coordinated with ANA-35's workspace schema (MOD-147,
-  MOD-149 on main) and MOD-130's `target_id`), set from Settings > Qdrant, whose URL row moves to it, and
-  from the CLI; a URL carrying credentials refused; a development and CI override per process. The API
-  key in the OS keyring, one entry per workspace; for a headless worker (`R-ORCH-12`) a systemd
-  credential or stdin, one key per workspace slug; for development and CI an environment variable
-  removed from every agent subprocess. The per-box keyring `qdrant-url` offered once as the workspace
-  setting, then retired; a setting changed after start picked up without a restart. Not blocked.
-- [ ] **MOD-159 - One knowledge indexer per workspace: lease, freshness, coverage** (from ANA-37,
-  `docs/ANA-37.md` §7.2, §7.3, §8 Q3-Q5). `R-STO-8`, `R-ENT-12`, `R-ENT-13`, `R-ENT-16`. A workspace
-  indexer lease row in Postgres (holder, box, expiry; taken when free or expired, renewed each beat on
-  the run lease's TTLs; renewed before each delete batch, orphans confirmed absent in the same pass;
-  worker or TUI, one lease per workspace a process serves); one collection per workspace, replacing
-  `htui_concepts_v2`; the run records the workspace it was queued from; a 60 s incremental cycle
-  (timestamps with the cache refresh's overlap window, transcripts by step and `seq`) plus the full
-  reconcile; `Ctrl+R` and `--index-items` take the lease only when free, otherwise request a pass and
-  show the holder's box; `--search-items` over several workspaces names those unavailable. Coverage
-  beyond MOD-112 (4), which keeps notes, transcripts, workspace-owned items and agents' scope: documents
-  owned by a project or the workspace, workspace requirements, and memory as ANA-38 designs it. Blocked
-  on MOD-158; the coverage parts on ANA-35 (MOD-147, MOD-149 on main) and ANA-38.
+- [ ] **MOD-158 - Qdrant: URL setting and API key** (from ANA-37, `docs/ANA-37.md` §7.5, §8 Q1, Q2;
+  one Qdrant for the whole database by maintainer decision, 2026-10-20). `R-STO-1`, `R-STO-8`, `R-SEC-2`,
+  `R-TUI-8`, `R-NF-2`. The Qdrant URL as one database-wide setting in Postgres (`app_setting`, no
+  `workspace` migration), set from Settings > Qdrant, whose URL row moves to it, and from the CLI; a URL
+  carrying credentials refused; a development and CI override per process. One API key in the OS
+  keyring; for a headless worker (`R-ORCH-12`) a systemd credential or stdin; for development and CI an
+  environment variable removed from every agent subprocess. The per-box keyring `qdrant-url` offered once
+  as the setting, then retired; a setting changed after start picked up without a restart. Not blocked.
+- [ ] **MOD-159 - One knowledge indexer per collection: lease, freshness, coverage** (from ANA-37,
+  `docs/ANA-37.md` §7.2, §7.3, §8 Q3-Q5; amended 2026-10-20, one Qdrant and a global collection).
+  `R-STO-8`, `R-ENT-12`, `R-ENT-13`, `R-ENT-16`. In the one Qdrant (MOD-158): one collection per
+  workspace, replacing `htui_concepts_v2`, and one global collection for global memory (MOD-168), never
+  copied into a workspace's; an indexer lease row in Postgres per collection (holder, box, expiry; taken
+  when free or expired, renewed each beat on the run lease's TTLs; renewed before each delete batch,
+  orphans confirmed absent in the same pass; worker or TUI, one lease per collection a process serves);
+  the run records the workspace it was queued from; a 60 s incremental cycle (timestamps with the cache
+  refresh's overlap window, transcripts by step and `seq`) plus the full reconcile; `Ctrl+R` and
+  `--index-items` take the lease only when free, otherwise request a pass and show the holder's box;
+  `--search-items` over several workspaces names those unavailable; a workspace search also queries the
+  global collection. Coverage beyond MOD-112 (4), which keeps notes, transcripts, workspace-owned items
+  and agents' scope: documents owned by a project or the workspace and workspace requirements. Memory is
+  MOD-167's point type and near-duplicate check, plugged into this indexer as MOD-112 (4) is. Blocked on
+  MOD-158; the coverage parts on ANA-35 (MOD-147, MOD-149 on main).
 - [ ] **MOD-160 - Knowledge search fails open cheaply and says so** (from ANA-37, `docs/ANA-37.md`
   §7.1, §7.4, §8 Q6). `R-NF-2`, `R-NF-3`, `R-STO-8`, `R-MCP-2`, `R-TUI-8`. The TUI search checks Qdrant
   and the collection before loading the model and never creates a collection, as the CLI does; every
   search surface answers "knowledge search unavailable" with its cause one key away; `search_concepts`
-  advertised only when the workspace has a Qdrant URL (checked at session start; today it is always
+  advertised only when a Qdrant URL is configured (checked at session start; today it is always
   advertised), answering the same words as a tool error during an outage; Settings, first run and
-  worker start warn, never block, when the workspace has no Qdrant, when it is unreachable, and when
+  worker start warn, never block, when no Qdrant is configured, when it is unreachable, and when
   this box lacks the key; CI runs `qdrant_live` and `qdrant_worker` against a Qdrant instead of
   skipping. May fold into MOD-158. Not blocked.
 - [ ] **MOD-161 - Related items at draft time** (from ANA-37, `docs/ANA-37.md` §7.4, §8 Q7).
@@ -919,8 +936,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   their hash, metrics, McNemar) from `/tmp` into the repo as a dev tool against a scratch Qdrant; build
   a workspace corpus from Postgres (several projects, notes, transcripts); add cross-project duplicate
   and question queries; report dense-only beside the hybrid; rerun the agent trial on a corpus that does
-  not fit one read. The workspace-scale gain stays unmeasured until it runs. Not blocked; the workspace
-  rerun needs MOD-112 (4) and MOD-8.
+  not fit one read. The workspace-scale gain stays unmeasured until it runs. MOD-169 runs its memory
+  measurements on this harness. Not blocked; the workspace rerun needs MOD-112 (4) and MOD-8.
 - [ ] **MOD-113 - Prompt library: templates and skills** (from the 2026-10-15 requirements review).
   `R-PRM-4`, `R-SKL-1`, `R-SKL-2`, `R-SKL-4`, `R-TUI-1`, `R-TUI-7`. (1) A **template library**
   shared across projects and workspaces, with per-project overrides, as a **group of the Toolbox

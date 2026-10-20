@@ -75,6 +75,31 @@ drafts and `item_create`); ANA-37 gains MOD-167 and MOD-169 as the things to mea
 workspace and global scope; MOD-126's light model gains a third use (workflow choice, draft rewrite,
 memory writes).
 
+## Reconciled with ANA-37 (2026-10-20)
+
+ANA-38 was written without ANA-37's verdict (see Not verified). The maintainer reconciled the two on
+2026-10-20; where they conflict, this section governs `docs/ANA-38.md` §4.6, §6, §7 and §8 Q6.
+
+- **One Qdrant, two kinds of collection.** One Qdrant for the whole database, run like Postgres.
+  Project and workspace entries sit in their workspace's collection; global entries in one global
+  collection, never copied into a workspace's. Not `htui_concepts_v4` or a single collection.
+- **Indexing.** ANA-37's lease-holding indexer (MOD-159), one lease per collection, indexes memory on
+  its 60 s cycle; MOD-167 supplies the point type. No run indexes its own entries.
+- **No supersede from a score.** Automatic supersede happens only on the same (scope, subject) key.
+  The raw-cosine check runs in the indexer when it indexes a new entry and records near duplicates as
+  candidates for the visibility list and MOD-169 (`docs/ANA-37.md` §5.4: no score separated duplicates).
+  The full-text fallback is dropped. MOD-169 may justify supersede-from-score later, with a requirement
+  amendment.
+- **No run waits on Qdrant** (`R-NF-2`): the extraction turn makes no Qdrant query.
+- **Agents find memory only through knowledge search** (`search_concepts`, global memory included);
+  no word-search fallback for memory. The prompt section stays Postgres-only and fixed-order; ranking it
+  by Qdrant relevance is a later option measured by MOD-169.
+- **Requirements amended:** `R-NF-2`, `R-STO-1`, `R-STO-8`, `R-TUI-8`, `R-ENT-13` (where memory is
+  indexed, no supersede from a score), `R-MCP-1`, `R-MCP-2`. Of this item's owed edits, `R-STO-8`'s memory
+  point type is done and its "raw-cosine write-time dedup" clause is dropped; `R-ENT-13`'s final text and
+  the `R-ID-6` exception stay owed and maintainer-gated.
+- **Items amended:** MOD-163, MOD-164, MOD-167, MOD-168, MOD-169.
+
 ## Commits
 
 `8833d8bd` (draft), `59632c88` (draft v2), and the conclusion commit that adds this file and files

@@ -75,6 +75,22 @@ Accepted with Q9 and applied in the conclusion commit (`docs/REQUIREMENTS.md` he
 `R-MCP-1` (§10.7) amended in place. MOD-130's pending `dockerd`/`sshd` sentence was not in this tree's
 `R-NF-2`, so it was not merged; MOD-130 carries the note.
 
+## Reconciled with ANA-38 (2026-10-20)
+
+Decided by the maintainer after reading both concluded analyses side by side; it amends D2, Q1, Q2 and
+Q3 above.
+
+- **One Qdrant for the whole database**, run like Postgres as its own service (amends D2's "per
+  workspace"). Its URL is one database-wide setting in Postgres (Q1); there is one API key (Q2), with
+  the same keyring, systemd-credential, stdin and environment-variable sources.
+- **Collections (Q3):** one per workspace, plus one global collection for ANA-38's global memory
+  entries, never copied into a workspace's. One indexer lease per collection (Q4, Q5 otherwise unchanged).
+- **Memory (Q8):** indexed by the lease holder like the rest; a near-duplicate score records a candidate
+  and writes nothing, as for items (§5.4, Q7); agents find memory only through knowledge search.
+- **Requirements amended:** `R-NF-2`, `R-STO-1`, `R-STO-8`, `R-TUI-8`, `R-ENT-13`, `R-MCP-1`, `R-MCP-2`.
+  **Items amended:** MOD-130, MOD-158, MOD-159, MOD-160, MOD-162. ANA-38's side is in
+  `docs/decisions/ana/ana-38.md`.
+
 ## Commits
 
 `ce55c61f` (first draft), `ac0707d6` (reframed under D1-D5), and the conclusion commit that adds this
