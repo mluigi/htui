@@ -5742,6 +5742,35 @@ mod tests {
         assert_ne!(footer(&pane), after, "Space cycles the resolution");
     }
 
+    /// MOD-115 M2 RV1 repair 1 (MD4): before M2 the warning took only its arrows and `h`/`l`,
+    /// so a version-1 `[confirm] yes = ["space"]` continued it on `Space`, and still does:
+    /// `choice.toggle` steps aside here, and the hint names `Space` as the continue key.
+    #[tokio::test]
+    async fn a_version_1_yes_on_space_continues_the_warning() {
+        let mut shell = Shell::new();
+        shell.keys =
+            crate::keys::load_str("version = 1\n[confirm]\nyes = [\"space\"]\n").expect("loads");
+        let mut pane = warned(&shell).await;
+        assert_eq!(
+            shell.keys.hint(pane.stack(), pane.hint_spec()),
+            "\u{2190}/\u{2192} resolution \u{b7} Space continue \u{b7} n cancel"
+        );
+        let resolution = picked(&pane);
+        assert_eq!(
+            pane.on_key(key(KeyCode::Char(' ')), &mut shell.ctx()),
+            Handled::Consumed
+        );
+        assert!(
+            matches!(
+                &pane.mode,
+                Mode::CloseOut(CloseOutStage::Typed { preview, .. })
+                    if preview.resolution == resolution
+            ),
+            "Space continues: {:?}",
+            pane.mode
+        );
+    }
+
     /// D14: a second digit while the first answer is in flight sends nothing. Its
     /// `AnswerPermission` would supersede the first in the app's staleness gate
     /// (`App::dispatch`), so the first answer's `PermissionAnswered` would be dropped and the

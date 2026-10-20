@@ -364,6 +364,9 @@ impl Keys {
             }
             seen.extend(here);
         }
+        // MOD-115 M2 RV1 repair 1 (MD4): a version-1 file's entry acts where its view kept no
+        // such key before M2.
+        super::validate::v1_steps_aside(self, stack, chord, &mut out);
         out
     }
 }

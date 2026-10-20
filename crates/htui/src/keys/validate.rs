@@ -195,10 +195,160 @@ fn keeps_a_views_key(keys: &Keys, entry: &Row, default: &Row) -> bool {
 /// text widget reads a canonical key the translation delivers unchanged (§3 rule 5), so the
 /// view's key wins as it did. `[confirm] yes = ["space"]` loads, `choice.toggle` keeps `Space`,
 /// and a confirm question's `Space` answers yes.
-fn v1_shares(keys: &Keys, first: &Row, second: &Row, chord: KeyChord) -> bool {
+///
+/// RV1 repair 1: in a [`DECLARED`] `stack` (the stack pass), only where the view did not keep
+/// `chord` ahead of the resolver before M2 ([`fixed_before_m2`]), or kept it and let the older
+/// action share it by design (the tab digits under a permission request's). Where it kept it,
+/// the file was refused before M2 and still is: `[backlog.filter_form] clear = ["left"]` would
+/// leave `choice.prev` dead on the filter's options. Where it kept none, a kept row other than
+/// a text field's steps aside in that stack ([`v1_steps_aside`]), so the pair never meets there.
+fn v1_shares(
+    keys: &Keys,
+    first: &Row,
+    second: &Row,
+    chord: KeyChord,
+    stack: Option<Stack<'_>>,
+) -> bool {
     let kept = |row: &Row| row.entry.is_none() && kept_by_a_view(row.act) && !added(row, chord);
     let older = |row: &Row| !kept_by_a_view(row.act) && before_m2(row.act);
-    keys.version == 1 && ((kept(first) && older(second)) || (kept(second) && older(first)))
+    let older_act = if kept(first) && older(second) {
+        Some(second.act)
+    } else if kept(second) && older(first) {
+        Some(first.act)
+    } else {
+        None
+    };
+    keys.version == 1
+        && older_act.is_some_and(|act| {
+            stack.is_none_or(|stack| {
+                fixed_before_m2(stack, chord).is_none_or(|fixed| fixed.shadowed.contains(&act))
+            })
+        })
+}
+
+/// A view's keys from before MOD-115 M2 (`keys::FIXED`, MOD-67 M5 R1 M1 and M6 D5): the chords
+/// its view matched ahead of the resolver in `stack`, which a key file could not bind to any act
+/// the stack resolved there, save the `shadowed` ones (the tab digits). M2 D7 made them rows
+/// (`[choice]`, `[answer]`, `[field]`, the Requirements priority); this register stays only to
+/// judge a version-1 file as it was judged then (RV1 repair 1, MD4).
+pub(super) struct Fixed {
+    stack: Stack<'static>,
+    chords: &'static [&'static str],
+    shadowed: &'static [Act],
+}
+
+/// The tab digits a permission request's answers shadowed by design (MOD-42 D14, D40).
+const TAB_SELECT: &[Act] = &[
+    Act::SelectTab1,
+    Act::SelectTab2,
+    Act::SelectTab3,
+    Act::SelectTab4,
+    Act::SelectTab5,
+    Act::SelectTab6,
+    Act::SelectTab7,
+    Act::SelectTab8,
+    Act::SelectTab9,
+];
+
+/// The permission answers' digits.
+const DIGITS: &[&str] = &["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+
+/// The `FIXED` register as it stood before MOD-115 M2, for the stacks where a row M2 added for
+/// a kept key resolves ([`kept_by_a_view`]); the Chat replay's entry, whose keys shadowed its
+/// global layer only and which no such row reaches, is left out.
+static V1_FIXED: &[Fixed] = &[
+    Fixed {
+        stack: super::views::ATTACH_FORM,
+        chords: &["space", "enter", "esc"],
+        shadowed: &[],
+    },
+    Fixed {
+        stack: super::views::REQUIREMENTS_FORM,
+        chords: &["m", "l", "space", "left", "right", "esc"],
+        shadowed: &[],
+    },
+    Fixed {
+        stack: super::views::RUNS_BROWSE,
+        chords: DIGITS,
+        shadowed: TAB_SELECT,
+    },
+    Fixed {
+        stack: super::views::RUNS_CONFIRM,
+        chords: &["left", "right", "h", "l"],
+        shadowed: &[],
+    },
+    Fixed {
+        stack: super::views::BACKLOG_FILTER,
+        chords: &["enter", "esc", "h", "l", "left", "right", "space"],
+        shadowed: &[],
+    },
+    Fixed {
+        stack: super::views::ITEM_FORM,
+        chords: &["left", "right", "h", "l", "enter", "esc"],
+        shadowed: &[],
+    },
+    Fixed {
+        stack: super::views::CHAT_LIVE,
+        chords: DIGITS,
+        shadowed: TAB_SELECT,
+    },
+];
+
+/// The [`V1_FIXED`] entry of `stack` that holds `chord`, if any: the view matched it ahead of
+/// the resolver before MOD-115 M2. A named key's SHIFT form counts (`keys::is_plain` let SHIFT
+/// through, MOD-67 M5 R1): `shift-left` moved the filter's option as `left` did.
+pub(super) fn fixed_before_m2(stack: Stack<'_>, chord: KeyChord) -> Option<&'static Fixed> {
+    V1_FIXED.iter().find(|fixed| {
+        fixed.stack == stack
+            && fixed.chords.iter().any(|written| {
+                let held = KeyChord::parse_strict(written)
+                    .unwrap_or_else(|err| panic!("fixed key {written:?}: {err}"));
+                held == chord
+                    || KeyChord::new(held.code, held.mods | crossterm::event::KeyModifiers::SHIFT)
+                        == chord
+            })
+    })
+}
+
+/// Whether `act` is a kept row ([`kept_by_a_view`]) other than a text field's: a `[choice]` or
+/// `[answer]` row or a Requirements priority key, which a view took only where its `FIXED` keys
+/// said (a text field read its editing keys wherever it had the focus).
+pub(super) fn steps_aside(act: Act) -> bool {
+    kept_by_a_view(act)
+        && act
+            .spec()
+            .is_some_and(|spec| spec.context != Context::Field)
+}
+
+/// MOD-115 M2 RV1 repair 1 (MD4): in a version-1 file, the kept rows other than a text field's
+/// ([`steps_aside`]) leave `candidates`, the ordered candidates for `chord` in `stack`, where an
+/// entry of the file for an action from before M2 added `chord` and the view kept no such key
+/// there before M2 ([`fixed_before_m2`]): the entry acted there then, so it still does. The rows
+/// keep the chord everywhere else. `[confirm] yes = ["space"]` continues the Runs close-out
+/// warning on `Space` (the view took only the arrows and `h`/`l` there), and `choice.toggle`
+/// keeps `Space` on the filter form and the attachment form. [`Keys::actions`] calls it.
+pub(super) fn v1_steps_aside(
+    keys: &Keys,
+    stack: Stack<'_>,
+    chord: KeyChord,
+    candidates: &mut Vec<Act>,
+) {
+    if keys.version != 1
+        || !candidates.iter().any(|&act| steps_aside(act))
+        || fixed_before_m2(stack, chord).is_some()
+    {
+        return;
+    }
+    let entry = candidates.iter().any(|&act| {
+        !kept_by_a_view(act)
+            && before_m2(act)
+            && keys
+                .resolve_row(stack, act)
+                .is_some_and(|(_, row)| added(row, chord))
+    });
+    if entry {
+        candidates.retain(|&act| !steps_aside(act));
+    }
 }
 
 /// Whether `default` (row `index`) may give one more chord away (MOD-115 M2 D-10): always, unless
@@ -281,7 +431,7 @@ fn check(
         {
             for &chord in first.chords.iter().filter(|c| second.chords.contains(c)) {
                 let place = format!("in [{}]", first.context.table());
-                check.report(first, second, chord, &place);
+                check.report(first, second, chord, &place, None);
             }
         }
     }
@@ -311,7 +461,7 @@ fn check(
                         && !added(first, chord)
                         && !added(second, chord);
                     if !shadowed && !met_in_m2(keys, stack, second.act) {
-                        check.report(first, second, chord, phrase);
+                        check.report(first, second, chord, phrase, Some(stack));
                     }
                 }
             }
@@ -327,7 +477,7 @@ fn check(
                 .iter()
                 .filter(|chord| focus.chords.contains(chord))
             {
-                check.report(row, focus, chord, WHILE_EDITING);
+                check.report(row, focus, chord, WHILE_EDITING, None);
             }
         }
     }
@@ -427,7 +577,14 @@ impl Check<'_> {
     /// `chord` (it is not that row's catalogue default) when exactly one did (review L1);
     /// otherwise the one with the later line (`None`, a default, before any line), `second` on
     /// a tie. A derived row is named and placed by its [`source`].
-    fn report(&mut self, first: &Row, second: &Row, chord: KeyChord, place: &str) {
+    fn report(
+        &mut self,
+        first: &Row,
+        second: &Row,
+        chord: KeyChord,
+        place: &str,
+        stack: Option<Stack<'_>>,
+    ) {
         let (first_source, second_source) = (source(self.keys, first), source(self.keys, second));
         let a = (first_source.context, first_source.act);
         let b = (second_source.context, second_source.act);
@@ -436,7 +593,7 @@ impl Check<'_> {
             .iter()
             .any(|&(x, y, c)| c == chord && ((x, y) == (a, b) || (x, y) == (b, a)))
             || allowed(self.guarded, first, second, chord)
-            || v1_shares(self.keys, first, second, chord)
+            || v1_shares(self.keys, first, second, chord, stack)
         {
             return;
         }
@@ -494,7 +651,10 @@ fn subject(row: &Row) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Row, before_m2, check, kept_by_a_view, line_of, new_in_m2, resolve_at, validate};
+    use super::{
+        Row, before_m2, check, fixed_before_m2, kept_by_a_view, line_of, new_in_m2, resolve_at,
+        steps_aside, validate,
+    };
     use crate::keys::{
         Act, CTRL_C, Context, DECLARED, ESC, KeyChord, Keys, SHADOWING, STATE_GUARDED, Stack,
         load_str, views,
@@ -744,19 +904,44 @@ mod tests {
                                 fixed.act
                             );
                         }
+                        // RV1 repair 1: where the entry acts, the screen does what it did before
+                        // M2: the view's key where the view kept it, the entry's elsewhere.
+                        for &(phrase, stack) in DECLARED {
+                            let candidates = keys.actions(stack, *chord);
+                            if !candidates.contains(&row.act) {
+                                continue;
+                            }
+                            if fixed_before_m2(stack, *chord).is_some() {
+                                assert!(
+                                    candidates.first().is_some_and(|&act| kept(act)),
+                                    "{src} {phrase}: {candidates:?}"
+                                );
+                            } else {
+                                assert!(
+                                    !candidates.iter().any(|&act| steps_aside(act)),
+                                    "{src} {phrase}: {candidates:?}"
+                                );
+                            }
+                        }
                     }
                     Err(errors) => {
                         refused += 1;
                         for error in &errors {
+                            // Only where the view kept the key before M2, which refused it then.
+                            let fixed = DECLARED.iter().any(|&(phrase, stack)| {
+                                error.message.ends_with(phrase)
+                                    && fixed_before_m2(stack, *chord).is_some()
+                            });
                             assert!(
-                                ![
-                                    "is already field.",
-                                    "is already choice.",
-                                    "is already answer.",
-                                    "is already requirements.priority_",
-                                ]
-                                .iter()
-                                .any(|named| error.message.contains(named)),
+                                fixed
+                                    || ![
+                                        "is already field.",
+                                        "is already choice.",
+                                        "is already answer.",
+                                        "is already requirements.priority_",
+                                    ]
+                                    .iter()
+                                    .any(|named| error.message.contains(named)),
                                 "{src}: {}",
                                 error.message
                             );
@@ -768,6 +953,76 @@ mod tests {
         assert!(
             loaded > 500 && refused > 0,
             "{loaded} loaded, {refused} refused"
+        );
+    }
+
+    /// MOD-115 M2 RV1 repair 1 (MD4): a version-1 entry on a key a view kept ahead of the
+    /// resolver before M2 ([`V1_FIXED`]) was refused then, and still is, with the version-2
+    /// error: the kept row would resolve behind the view's own act there, and its key go dead.
+    #[test]
+    fn a_version_1_entry_on_a_key_its_view_fixed_before_m2_is_refused_as_before() {
+        for body in [
+            "[backlog.filter_form]\nclear = [\"left\"]\nnext_row = [\"space\"]\n",
+            "[backlog.runs]\napprove = [\"1\"]\n",
+        ] {
+            let v1 = errors(&format!("version = 1\n{body}"));
+            let v2 = errors(&format!("version = 2\n{body}"));
+            assert!(!v1.is_empty(), "{body}");
+            assert_eq!(v1, v2, "{body}");
+        }
+        assert_eq!(
+            errors("version = 1\n[backlog.filter_form]\nclear = [\"left\"]\n"),
+            [
+                (
+                    3,
+                    r#"[backlog.filter_form] clear = "left": "left" is already field.left (default) in the Backlog filter form"#
+                        .to_owned()
+                ),
+                (
+                    3,
+                    r#"[backlog.filter_form] clear = "left": "left" is already choice.prev (default) in the Backlog filter form"#
+                        .to_owned()
+                ),
+            ]
+        );
+        // The first stack named is the first one whose view kept the key (the Agents form's
+        // text field read its `Enter` before M2 too, and the entry shares it there).
+        assert_eq!(
+            errors("version = 1\n[form]\nnext_field = [\"enter\"]\n"),
+            one(
+                3,
+                r#"[form] next_field = "enter": "enter" is already field.submit (default) in the Attachments form"#
+            )
+        );
+    }
+
+    /// MOD-115 M2 RV1 repair 1 (MD4): where a view kept no key before M2, a version-1 entry acted
+    /// there, and it still does: the kept row M2 added steps aside in that stack only.
+    /// `[confirm] yes = ["space"]` continues the Runs close-out warning on `Space`, while
+    /// `choice.toggle` keeps `Space` and toggles the filter form's option with it. A version-2
+    /// file gets the strict rules: the two collide in the warning.
+    #[test]
+    fn a_version_1_entry_acts_where_its_view_kept_no_key_before_m2() {
+        let space = chord("space");
+        assert_eq!(
+            Keys::compiled().actions(views::RUNS_CONFIRM, space),
+            [Act::ChoiceToggle]
+        );
+        let keys = load_str("version = 1\n[confirm]\nyes = [\"space\"]\n").expect("loads");
+        assert_eq!(
+            keys.chords(Context::Choice, Act::ChoiceToggle),
+            Keys::compiled().chords(Context::Choice, Act::ChoiceToggle)
+        );
+        assert_eq!(keys.actions(views::RUNS_CONFIRM, space), [Act::ConfirmYes]);
+        assert_eq!(keys.actions(views::KINDS_CONFIRM, space), [Act::ConfirmYes]);
+        assert_eq!(
+            keys.actions(views::BACKLOG_FILTER, space),
+            [Act::ChoiceToggle]
+        );
+        assert_eq!(keys.actions(views::ATTACH_FORM, space), [Act::ChoiceToggle]);
+        assert!(
+            !errors("version = 2\n[confirm]\nyes = [\"space\"]\n").is_empty(),
+            "version 2 is strict"
         );
     }
 

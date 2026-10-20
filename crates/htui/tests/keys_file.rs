@@ -179,6 +179,12 @@ mod binary {
         assert_eq!(first(views::BACKLOG_BODY, "backspace"), Some(Act::NextTab));
         assert_eq!(first(views::BACKLOG_BODY, "1"), Some(Act::SelectTab2));
         assert_eq!(first(views::KINDS_CONFIRM, "space"), Some(Act::ConfirmYes));
+        // RV1 repair 1: the Runs close-out warning took only its arrows and `h`/`l` before M2,
+        // so `Space` continues it there as it did; `choice.toggle` steps aside in that stack only.
+        assert_eq!(
+            keys.actions(views::RUNS_CONFIRM, chord("space")),
+            [Act::ConfirmYes]
+        );
         assert_eq!(
             first(views::REQUIREMENTS_BROWSE, "m"),
             Some(Act::RequirementsAmend)
@@ -192,7 +198,6 @@ mod binary {
             first(views::REQUIREMENTS_FORM, "m"),
             Some(Act::RequirementsPriorityMust)
         );
-        assert_eq!(first(views::RUNS_CONFIRM, "space"), Some(Act::ChoiceToggle));
         assert_eq!(first(views::RUNS_BROWSE, "1"), Some(Act::AnswerOption1));
         assert_eq!(first(views::CHAT_LIVE, "1"), Some(Act::AnswerOption1));
         assert_eq!(
