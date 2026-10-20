@@ -32,25 +32,26 @@ use crate::model::{
     FollowUpSettle, FollowUpView, FollowUpWindow, GateOutcome, Item, ItemCitation, ItemFilter,
     ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRequirement,
     ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, MemoryEntry, MemoryEntryId,
-    MemoryPatch, MemoryRevision, MemoryState, MemorySupersede, MemoryUpdate, NewCommandRun,
-    NewDocument, NewFollowUp, NewItem, NewItemKind, NewMemoryEntry, NewNote, NewPersona,
-    NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
-    NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice,
-    PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId,
-    PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef, PromptScope, PromptTemplate,
-    PromptTemplateId, QueueBatch, QueueEntry, QueueMove, QueueRow, QueueRunFact, QueueSetting,
-    QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
-    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
-    RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate, Resolution,
-    ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunCommand, RunCommandId, RunCommandKind,
-    RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary,
-    RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding,
-    SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
-    StepStatus, StopMode, TIMESTAMPTZ_DIGITS, ToolCallCount, UpstreamEntry, UserId,
-    WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject, WorkspaceStop, WorkspaceSummary, canonical_declared_tags,
-    missing_tags_failure, moved_order, overlaps, prompt_summary, scope_of,
+    MemoryKind, MemoryPatch, MemoryRevision, MemoryState, MemorySupersede, MemoryText,
+    MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewMemoryEntry,
+    NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
+    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
+    Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId,
+    PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef,
+    PromptScope, PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry, QueueMove, QueueRow,
+    QueueRunFact, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath,
+    RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter,
+    RequirementId, RequirementPatch, RequirementRevision, RequirementSpec, RequirementState,
+    RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunCommand,
+    RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep,
+    RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome,
+    Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion,
+    Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening,
+    StepOutcome, StepPermission, StepStatus, StopMode, TIMESTAMPTZ_DIGITS, ToolCallCount,
+    UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop, WorkspaceSummary,
+    canonical_declared_tags, memory_subject_key, missing_tags_failure, moved_order, overlaps,
+    prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -67,15 +68,16 @@ use crate::store::traits::{
     expected_on_row, failure_disagrees_with_status, finish_run_item_mirror,
     finish_run_needs_a_terminal_status, graph_not_in_project, invalid_area_code, invalid_prefix,
     item_has_a_live_run, item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move,
-    link_key, link_not_proposed_by_run, link_outside_project, new_persona_refusal,
-    new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status, note_needs_a_step,
-    persona_is_bound, persona_patch_refusal, project_settings_not_an_object, prompt_template_key,
-    prompt_template_refusal, queue_target_refusal, queue_token_refusal, reaped_note,
-    references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
-    row_names_another_phase, row_names_another_step, run_is_terminal, self_link,
-    skill_body_refusal, skill_patch_refusal, skill_version_key, step_document_refusal,
-    step_is_not_promotable, step_note_refusal, step_slot_is_taken, step_writes_own_item,
-    summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
+    link_key, link_not_proposed_by_run, link_outside_project, memory_entry_closed,
+    memory_subject_taken, new_persona_refusal, new_skill_refusal, not_a_fanout_candidate,
+    not_a_terminal_status, note_needs_a_step, persona_is_bound, persona_patch_refusal,
+    project_settings_not_an_object, prompt_template_key, prompt_template_refusal,
+    queue_target_refusal, queue_token_refusal, reaped_note, references_no_row,
+    requirement_withdrawn, reserved_phase_name, resolution_not_closable, row_names_another_phase,
+    row_names_another_step, run_is_terminal, self_link, skill_body_refusal, skill_patch_refusal,
+    skill_version_key, step_document_refusal, step_is_not_promotable, step_note_refusal,
+    step_slot_is_taken, step_writes_own_item, summary_names_another_item, winner_is_not_settled,
+    withdrawn_requirement_cited,
 };
 use uuid::Uuid;
 
@@ -327,6 +329,10 @@ struct State {
     requirement_revisions: Vec<RequirementRevision>,
     /// `item_requirement`; tombstones are kept, as [`State::links`] keeps them (plan D10).
     item_requirements: Vec<ItemRequirement>,
+    /// `memory_entry` (MOD-163 plan D1), by id. No fixture loads one (plan D10).
+    memory_entries: HashMap<MemoryEntryId, MemoryEntry>,
+    /// `memory_entry_revision`, append-only, as [`State::requirement_revisions`] is.
+    memory_revisions: Vec<MemoryRevision>,
 }
 
 impl MemStore {
@@ -443,6 +449,8 @@ impl MemStore {
                 .collect(),
             requirement_revisions: data.requirement_revisions,
             item_requirements: data.item_requirements,
+            memory_entries: HashMap::new(),
+            memory_revisions: Vec::new(),
         };
         Self {
             state: Arc::new(RwLock::new(state)),
@@ -4749,6 +4757,13 @@ impl State {
             .map(|row| row.id)
             .collect();
 
+        let memory_entries: HashSet<MemoryEntryId> = self
+            .memory_entries
+            .values()
+            .filter(|row| row.project_id == id)
+            .map(|row| row.id)
+            .collect();
+
         let reach = DeleteReach {
             workspace_links: rows(
                 self.workspace_projects
@@ -4873,9 +4888,14 @@ impl State {
                     })
                     .count(),
             ),
-            // MOD-163 M1 T1: counted by T2 (plan D8).
-            memory_entries: 0,
-            memory_revisions: 0,
+            // MOD-163 plan D8: every state, and the revisions of those entries.
+            memory_entries: rows(memory_entries.len()),
+            memory_revisions: rows(
+                self.memory_revisions
+                    .iter()
+                    .filter(|row| memory_entries.contains(&row.entry_id))
+                    .count(),
+            ),
         };
         Some((
             reach,
@@ -4888,6 +4908,7 @@ impl State {
                 repos,
                 requirement_areas,
                 requirements,
+                memory_entries,
             },
         ))
     }
@@ -5013,6 +5034,21 @@ impl State {
         self.requirement_areas
             .retain(|id, _| !gone.requirement_areas.contains(id));
         self.requirement_specs.remove(&id);
+        // MOD-163 plan D8: the entries and their revisions go with the project (`ON DELETE
+        // CASCADE`). A surviving entry superseded by a gone one keeps its state and loses the
+        // pointer (`ON DELETE SET NULL`, blueprint P-3), and the trigger stamps it; M1 cannot
+        // reach that, since a supersede stays inside one project.
+        self.memory_revisions
+            .retain(|row| !gone.memory_entries.contains(&row.entry_id));
+        self.memory_entries
+            .retain(|id, _| !gone.memory_entries.contains(id));
+        for row in self.memory_entries.values_mut().filter(|row| {
+            row.superseded_by
+                .is_some_and(|by| gone.memory_entries.contains(&by))
+        }) {
+            row.superseded_by = None;
+            row.updated_at = now;
+        }
         self.items.retain(|id, _| !gone.items.contains(id));
         self.item_key_counter
             .retain(|(project, _), _| *project != id);
@@ -7542,6 +7578,348 @@ struct ProjectReach {
     requirement_areas: HashSet<RequirementAreaId>,
     /// `requirement` ids of the project.
     requirements: HashSet<RequirementId>,
+    /// `memory_entry` ids of the project (MOD-163 plan D8).
+    memory_entries: HashSet<MemoryEntryId>,
+}
+
+/// What one memory writer moves on a live entry and the revision it writes (MOD-163 blueprint
+/// T2.2): an amend, a retire, or the old half of a supersede.
+struct MemoryEdit {
+    /// New `kind`, if any.
+    kind: Option<MemoryKind>,
+    /// New `subject`, already checked as a [`MemoryText`].
+    subject: Option<String>,
+    /// New `body`, already checked as a [`MemoryText`].
+    body: Option<String>,
+    /// New `state`, if any.
+    to: Option<MemoryState>,
+    /// `superseded_by` to set, if any.
+    superseded_by: Option<MemoryEntryId>,
+    /// Whether `confirmed_at` moves to now (plan D3: an amend does; retire and supersede do not).
+    restamp: bool,
+    /// The revision's `author_id`.
+    author_id: UserId,
+    /// The revision's `box_id`.
+    box_id: Option<BoxId>,
+    /// The revision's `reason`.
+    reason: &'static str,
+}
+
+impl MemoryEdit {
+    /// An amend (plan D3, D6): the patched columns, the state kept, `confirmed_at` re-stamped.
+    fn amend(patch: MemoryPatch) -> Self {
+        Self {
+            kind: patch.kind,
+            subject: patch.subject.map(MemoryText::into_string),
+            body: patch.body.map(MemoryText::into_string),
+            to: None,
+            superseded_by: None,
+            restamp: true,
+            author_id: patch.author_id,
+            box_id: patch.box_id,
+            reason: "amended",
+        }
+    }
+
+    /// A retire (plan D6): `retired`, the text and `confirmed_at` kept.
+    const fn retire(author_id: UserId, box_id: Option<BoxId>) -> Self {
+        Self {
+            kind: None,
+            subject: None,
+            body: None,
+            to: Some(MemoryState::Retired),
+            superseded_by: None,
+            restamp: false,
+            author_id,
+            box_id,
+            reason: "retired",
+        }
+    }
+
+    /// The old half of a supersede (plan D6): `superseded` by `new`, written by `new`'s author on
+    /// `new`'s box (blueprint §1), the text and `confirmed_at` kept.
+    const fn superseded_by(new: &NewMemoryEntry) -> Self {
+        Self {
+            kind: None,
+            subject: None,
+            body: None,
+            to: Some(MemoryState::Superseded),
+            superseded_by: Some(new.id),
+            restamp: false,
+            author_id: new.created_by,
+            box_id: new.box_id,
+            reason: "superseded",
+        }
+    }
+}
+
+/// MOD-163 M1: project memory entries (plan D3-D6; blueprint T2.2). Every writer checks in the
+/// order NotFound, divergence, Constraint, and inside Constraint: closed, duplicate id, subject
+/// clash, author, box (blueprint §1).
+impl State {
+    /// [`ReadStore::memory_entries`]: the project's rows whose state is in `states` (`None`: every
+    /// state), in `(updated_at DESC, id)` order.
+    fn memory_entry_rows(
+        &self,
+        project: ProjectId,
+        states: Option<&[MemoryState]>,
+    ) -> Vec<MemoryEntry> {
+        let mut rows: Vec<MemoryEntry> = self
+            .memory_entries
+            .values()
+            .filter(|row| {
+                row.project_id == project && states.is_none_or(|states| states.contains(&row.state))
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.id.cmp(&b.id)));
+        rows
+    }
+
+    /// [`ReadStore::memory_revisions`]: the entry's revisions in `version` order; none for an
+    /// unknown id.
+    fn memory_revision_rows(&self, id: MemoryEntryId) -> Vec<MemoryRevision> {
+        let mut rows: Vec<MemoryRevision> = self
+            .memory_revisions
+            .iter()
+            .filter(|row| row.entry_id == id)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|row| row.version);
+        rows
+    }
+
+    /// Plan D4: `Constraint(memory_subject_taken)` naming the live entry of `project`, other than
+    /// `except`, whose subject folds as `subject` does ([`memory_subject_key`], Postgres's
+    /// `lower(btrim())`); the lowest id when several do, which a store that keeps the rule never
+    /// holds.
+    fn memory_subject_free(
+        &self,
+        project: ProjectId,
+        subject: &str,
+        except: Option<MemoryEntryId>,
+    ) -> Result<()> {
+        let key = memory_subject_key(subject);
+        let holder = self
+            .memory_entries
+            .values()
+            .filter(|row| {
+                row.project_id == project
+                    && row.state.is_live()
+                    && Some(row.id) != except
+                    && memory_subject_key(&row.subject) == key
+            })
+            .min_by_key(|row| row.id);
+        match holder {
+            Some(holder) => Err(StoreError::Constraint(memory_subject_taken(
+                &holder.subject,
+                holder.id,
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// `memory_entry_revision.box_id` must name a `box` row, if any.
+    fn require_memory_box(&self, box_id: Option<BoxId>) -> Result<()> {
+        match box_id {
+            Some(box_id) if !self.boxes.contains_key(&box_id) => Err(StoreError::Constraint(
+                references_no_row("memory_entry_revision.box_id", box_id, "box"),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// [`WriteStore::create_memory_entry`]: a live row at version 1, stamped `now` three times
+    /// (plan D3), and its revision 1 `created`.
+    fn create_memory_entry(
+        &mut self,
+        project: ProjectId,
+        new: NewMemoryEntry,
+        now: DateTime<Utc>,
+    ) -> Result<MemoryEntry> {
+        if !self.projects.contains_key(&project) {
+            return Err(StoreError::NotFound {
+                entity: "project",
+                id: project.to_string(),
+            });
+        }
+        if self.memory_entries.contains_key(&new.id) {
+            return Err(StoreError::Constraint(already_exists(
+                "memory_entry",
+                new.id,
+            )));
+        }
+        self.memory_subject_free(project, new.subject.as_str(), None)?;
+        self.require_user(new.created_by, "memory_entry.created_by")?;
+        self.require_memory_box(new.box_id)?;
+
+        let row = MemoryEntry {
+            id: new.id,
+            project_id: project,
+            kind: new.kind,
+            subject: new.subject.into_string(),
+            body: new.body.into_string(),
+            state: MemoryState::Active,
+            version: 1,
+            confirmed_at: now,
+            superseded_by: None,
+            created_by: new.created_by,
+            created_at: now,
+            updated_at: now,
+        };
+        self.memory_revisions.push(MemoryRevision {
+            entry_id: row.id,
+            version: row.version,
+            kind: row.kind,
+            subject: row.subject.clone(),
+            body: row.body.clone(),
+            state: row.state,
+            author_id: new.created_by,
+            box_id: new.box_id,
+            reason: "created".to_owned(),
+            created_at: now,
+        });
+        self.memory_entries.insert(row.id, row.clone());
+        Ok(row)
+    }
+
+    /// The compare-and-set every memory writer starts with, so all three decide in one order:
+    /// NotFound, then divergence (`Diverged` with the revision at `expected_version`, or NotFound
+    /// on `memory_entry_revision` for a token no revision carries), then a closed entry
+    /// (`memory_entry_closed`). `Updated(head)` is the live head the caller may edit; nothing is
+    /// written here.
+    fn memory_cas_head(&self, id: MemoryEntryId, expected_version: i32) -> Result<MemoryUpdate> {
+        let head = self
+            .memory_entries
+            .get(&id)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "memory_entry",
+                id: id.to_string(),
+            })?;
+        if head.version != expected_version {
+            let ancestor = self
+                .memory_revisions
+                .iter()
+                .find(|row| row.entry_id == id && row.version == expected_version)
+                .cloned()
+                .ok_or_else(|| StoreError::NotFound {
+                    entity: "memory_entry_revision",
+                    id: format!("{id}@{expected_version}"),
+                })?;
+            return Ok(MemoryUpdate::Diverged {
+                head: head.clone(),
+                ancestor,
+            });
+        }
+        if !head.state.is_live() {
+            return Err(StoreError::Constraint(memory_entry_closed(id, head.state)));
+        }
+        Ok(MemoryUpdate::Updated(head.clone()))
+    }
+
+    /// Applies `edit` to the live entry `id` and writes its revision at `version + 1`. Infallible:
+    /// the caller checked everything under the same lock.
+    fn apply_memory_edit(
+        &mut self,
+        id: MemoryEntryId,
+        edit: MemoryEdit,
+        now: DateTime<Utc>,
+    ) -> MemoryEntry {
+        let row = self
+            .memory_entries
+            .get_mut(&id)
+            .expect("the caller read the row under the same lock");
+        if let Some(kind) = edit.kind {
+            row.kind = kind;
+        }
+        if let Some(subject) = edit.subject {
+            row.subject = subject;
+        }
+        if let Some(body) = edit.body {
+            row.body = body;
+        }
+        if let Some(state) = edit.to {
+            row.state = state;
+        }
+        if let Some(by) = edit.superseded_by {
+            row.superseded_by = Some(by);
+        }
+        row.version += 1;
+        row.updated_at = now;
+        if edit.restamp {
+            row.confirmed_at = now;
+        }
+        let head = row.clone();
+        self.memory_revisions.push(MemoryRevision {
+            entry_id: id,
+            version: head.version,
+            kind: head.kind,
+            subject: head.subject.clone(),
+            body: head.body.clone(),
+            state: head.state,
+            author_id: edit.author_id,
+            box_id: edit.box_id,
+            reason: edit.reason.to_owned(),
+            created_at: now,
+        });
+        head
+    }
+
+    /// [`WriteStore::amend_memory_entry`] and [`WriteStore::retire_memory_entry`]: the
+    /// compare-and-set, then a new subject's clash (never with the entry itself), the author and
+    /// the box, then the edit.
+    fn revise_memory_entry(
+        &mut self,
+        id: MemoryEntryId,
+        expected_version: i32,
+        edit: MemoryEdit,
+        now: DateTime<Utc>,
+    ) -> Result<MemoryUpdate> {
+        let head = match self.memory_cas_head(id, expected_version)? {
+            MemoryUpdate::Updated(head) => head,
+            diverged @ MemoryUpdate::Diverged { .. } => return Ok(diverged),
+        };
+        if let Some(subject) = &edit.subject {
+            self.memory_subject_free(head.project_id, subject, Some(id))?;
+        }
+        self.require_user(edit.author_id, "memory_entry_revision.author_id")?;
+        self.require_memory_box(edit.box_id)?;
+        Ok(MemoryUpdate::Updated(self.apply_memory_edit(id, edit, now)))
+    }
+
+    /// [`WriteStore::supersede_memory_entry`]: every check of both halves first (the old entry's
+    /// compare-and-set, then the new entry's id, subject, author and box), so a refusal writes
+    /// nothing; then the old entry moves to `superseded` before the new one is created, as
+    /// Postgres orders the two statements (blueprint P-2).
+    fn supersede_memory_entry(
+        &mut self,
+        old: MemoryEntryId,
+        expected_version: i32,
+        new: NewMemoryEntry,
+        now: DateTime<Utc>,
+    ) -> Result<MemorySupersede> {
+        let head = match self.memory_cas_head(old, expected_version)? {
+            MemoryUpdate::Updated(head) => head,
+            MemoryUpdate::Diverged { head, ancestor } => {
+                return Ok(MemorySupersede::Diverged { head, ancestor });
+            }
+        };
+        if self.memory_entries.contains_key(&new.id) {
+            return Err(StoreError::Constraint(already_exists(
+                "memory_entry",
+                new.id,
+            )));
+        }
+        self.memory_subject_free(head.project_id, new.subject.as_str(), Some(old))?;
+        self.require_user(new.created_by, "memory_entry.created_by")?;
+        self.require_memory_box(new.box_id)?;
+
+        let old = self.apply_memory_edit(old, MemoryEdit::superseded_by(&new), now);
+        let new = self
+            .create_memory_entry(head.project_id, new, now)
+            .expect("every check of the create passed above under the same lock");
+        Ok(MemorySupersede::Superseded { old, new })
+    }
 }
 
 /// A row count as the `u64` [`DeleteReach`] holds, saturating rather than casting: `usize` is
@@ -8382,18 +8760,20 @@ impl ReadStore for MemStore {
         Ok(self.read(|state| state.waiting_candidates(scope)))
     }
 
-    // -- MOD-163 M1: project memory entries (plan D6); T2 fills these in
+    // -- MOD-163 M1: project memory entries (plan D6)
 
     async fn memory_entries(
         &self,
-        _project: ProjectId,
-        _states: Option<Vec<MemoryState>>,
+        project: ProjectId,
+        states: Option<Vec<MemoryState>>,
     ) -> Result<Option<Vec<MemoryEntry>>> {
-        Err(StoreError::Backend("MOD-163 M1: not yet".into()))
+        Ok(Some(self.read(|state| {
+            state.memory_entry_rows(project, states.as_deref())
+        })))
     }
 
-    async fn memory_revisions(&self, _id: MemoryEntryId) -> Result<Option<Vec<MemoryRevision>>> {
-        Err(StoreError::Backend("MOD-163 M1: not yet".into()))
+    async fn memory_revisions(&self, id: MemoryEntryId) -> Result<Option<Vec<MemoryRevision>>> {
+        Ok(Some(self.read(|state| state.memory_revision_rows(id))))
     }
 }
 
@@ -9340,42 +9720,55 @@ impl WriteStore for MemStore {
         Ok(self.read(|state| state.open_permissions(scope, now)))
     }
 
-    // -- MOD-163 M1: project memory entries (plan D3-D6); T2 fills these in
+    // -- MOD-163 M1: project memory entries (plan D3-D6)
 
     async fn create_memory_entry(
         &self,
-        _project: ProjectId,
-        _new: NewMemoryEntry,
+        project: ProjectId,
+        new: NewMemoryEntry,
     ) -> Result<MemoryEntry> {
-        Err(StoreError::Backend("MOD-163 M1: not yet".into()))
+        let now = self.now();
+        self.write(|state| state.create_memory_entry(project, new, now))
     }
 
     async fn amend_memory_entry(
         &self,
-        _id: MemoryEntryId,
-        _expected_version: i32,
-        _patch: MemoryPatch,
+        id: MemoryEntryId,
+        expected_version: i32,
+        patch: MemoryPatch,
     ) -> Result<MemoryUpdate> {
-        Err(StoreError::Backend("MOD-163 M1: not yet".into()))
+        let now = self.now();
+        self.write(|state| {
+            state.revise_memory_entry(id, expected_version, MemoryEdit::amend(patch), now)
+        })
     }
 
     async fn retire_memory_entry(
         &self,
-        _id: MemoryEntryId,
-        _expected_version: i32,
-        _author_id: UserId,
-        _box_id: Option<BoxId>,
+        id: MemoryEntryId,
+        expected_version: i32,
+        author_id: UserId,
+        box_id: Option<BoxId>,
     ) -> Result<MemoryUpdate> {
-        Err(StoreError::Backend("MOD-163 M1: not yet".into()))
+        let now = self.now();
+        self.write(|state| {
+            state.revise_memory_entry(
+                id,
+                expected_version,
+                MemoryEdit::retire(author_id, box_id),
+                now,
+            )
+        })
     }
 
     async fn supersede_memory_entry(
         &self,
-        _old: MemoryEntryId,
-        _expected_version: i32,
-        _new: NewMemoryEntry,
+        old: MemoryEntryId,
+        expected_version: i32,
+        new: NewMemoryEntry,
     ) -> Result<MemorySupersede> {
-        Err(StoreError::Backend("MOD-163 M1: not yet".into()))
+        let now = self.now();
+        self.write(|state| state.supersede_memory_entry(old, expected_version, new, now))
     }
 
     // -- MOD-70: follow-ups for engine steps (plan D1-D5, D9)
@@ -11927,6 +12320,43 @@ mod tests {
             1,
             "precondition: its claim"
         );
+        // MOD-163 plan D8: no fixture seeds a memory row (plan D10), so one entry with one amend
+        // is staged on `htui` and one entry on `agy`, through the trait.
+        let scrubber = crate::scrub::MinimalScrubber::new(Vec::<String>::new());
+        let memory = |subject: &str| crate::model::NewMemoryEntry {
+            id: crate::model::MemoryEntryId::new(),
+            kind: crate::model::MemoryKind::Fact,
+            subject: crate::model::MemoryText::subject(subject, &scrubber).expect("a subject"),
+            body: crate::model::MemoryText::body("Staged for the delete.", &scrubber)
+                .expect("a body"),
+            created_by: ids::USER,
+            box_id: Some(ids::BOX),
+        };
+        let doomed = store
+            .create_memory_entry(gone, memory("Doomed"))
+            .await
+            .expect("the htui entry");
+        store
+            .amend_memory_entry(
+                doomed.id,
+                1,
+                crate::model::MemoryPatch {
+                    author_id: ids::USER,
+                    box_id: Some(ids::BOX),
+                    ..crate::model::MemoryPatch::default()
+                },
+            )
+            .await
+            .expect("the htui amend");
+        let kept = store
+            .create_memory_entry(ids::PROJECT_AGY, memory("Kept"))
+            .await
+            .expect("the agy entry");
+        assert_eq!(
+            store.read(|state| (state.memory_entries.len(), state.memory_revisions.len())),
+            (2, 3),
+            "precondition: two entries, three revisions"
+        );
         store.delete_project(gone).await.expect("the delete lands");
 
         store.read(|state| {
@@ -12105,6 +12535,33 @@ mod tests {
                         && state.requirements.contains_key(&row.requirement_id)
                 }),
                 "every surviving citation has both ends, tombstones included"
+            );
+            // MOD-163 plan D8: the memory entries and their revisions go with the project too.
+            assert!(
+                state
+                    .memory_entries
+                    .values()
+                    .all(|row| row.project_id != gone),
+                "memory_entry"
+            );
+            assert!(
+                state
+                    .memory_revisions
+                    .iter()
+                    .all(|row| state.memory_entries.contains_key(&row.entry_id)),
+                "every surviving memory revision has a surviving entry"
+            );
+            assert_eq!(
+                (
+                    state.memory_entries.get(&kept.id),
+                    state
+                        .memory_revisions
+                        .iter()
+                        .filter(|row| row.entry_id == kept.id)
+                        .count(),
+                ),
+                (Some(&kept), 1),
+                "agy's entry and its revision survive"
             );
 
             // …and what a project delete is not: the workspace, its sibling projects, and every
