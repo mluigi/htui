@@ -240,7 +240,11 @@ has a way out or is refused".
 both `E.act` and `D.act` in `keys.actions(stack, chord)`, `D` loses the chord (`Lost`, the existing notice text).
 Also, version 1 only, in `load_str` after the walk: if the file set `[global] quit` and it lacks `ctrl-c`, append
 `CTRL_C` (it was implicit in version 1; nothing in a v1 file can hold ctrl-c, the loader refused it). Version 2: the
-strict rules (no cross-context give-way).
+strict rules (no cross-context give-way). *RV1 (keys review H1, MD4):* neither give-way pass takes, for a version-1 entry
+of an action from before M2, a chord from a row M2 added for a key a view kept before it (`[field]`, `[choice]`,
+`[answer]`, `requirements.priority_*`: `validate::kept_by_a_view`); the two share it and the validator lets them
+(`v1_shares`), as the widget literal or `FIXED` key won there before M2. Pinned by
+`a_version_1_entry_never_takes_a_key_a_view_kept_before_m2` and `tests/fixtures/keys/v1_view_keys.toml`.
 
 ## 3. `[field]` translation (Task 5 writes it, Task 6 calls it) — `keys/translate.rs`
 ```rust
@@ -549,6 +553,18 @@ with T5 serially.
   where nothing else in the stack binds that key; where another act does (e.g. `choice.prev` keeping `left`), the key
   is delivered and a focused widget still reads it literally (§3 rule 4). Closing that fully needs `&Keys` in the
   widgets, which the plan rejected (25-file signature change). Record it in the decision doc.
+  *RV1 (keys review M, recorded at RV1).* The translation's other face: a rebound `[field]` chord
+  arrives as the canonical key, and a view that resolved its own acts from the delivered key read
+  it a second time as that key's other act (`[field] left = ["ctrl-b"]` made `ctrl-b` fire
+  `choice.prev` on a picker). Fixed for every choice act: `Ctx::pressed(&key)` (`app/state.rs`,
+  set by `App::dispatch_key` on the overlay's and the tab's context) is the chord the user
+  pressed, and the filter form, the item form and the Requirements form (`on_pressed`, called
+  from `backlog/mod.rs` and `requirements/mod.rs`) resolve their choice and form acts from it.
+  **Limit kept:** the other views that resolve a form act after a widget passed the key (the
+  Settings and Skills forms, the Docs/Notes compose areas, the concepts search, the agent help)
+  still read the delivered key, so a rebound `field.line_up`/`line_down` chord a one-line field
+  passes acts there as `Up`/`Down` (`form.prev_field`/`next_field`, the hit or agent cursor). The
+  same `Ctx::pressed` closes it as M3/M4 port those views onto the kit.
 - **D-14 (Task 0 as built; inertness and the compiled defaults validating).** Recorded after T0 so Tasks 5 and 6
   refine what exists instead of writing it a second time.
   - *Shift arrows move to Task 6* (with D-4). `pane.next_subtab`/`prev_subtab`, `settings.next_section`/

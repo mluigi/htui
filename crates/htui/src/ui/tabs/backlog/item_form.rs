@@ -62,9 +62,10 @@ pub const HINT_TEXT: HintSpec = &[
     Hint::Text("Esc cancel"),
 ];
 
-/// The shell's hint row on a picker: its value keys are the picker's own (MOD-67 M5, fixed).
+/// The shell's hint row on a picker: its value keys are `choice.prev`/`next` (`←/→ choose`
+/// under the defaults; MOD-115 M2 RV1 H2: the keys in force).
 pub const HINT_PICK: HintSpec = &[
-    Hint::Text("\u{2190}/\u{2192} choose"),
+    Hint::Glyphs(Act::ChoicePrev, Act::ChoiceNext, "choose"),
     Hint::One(Act::FormNextField, "field"),
     Hint::Text("Esc cancel"),
 ];
@@ -614,12 +615,17 @@ impl ItemForm {
     /// `form.external_editor` hands Body or Paths to `$EDITOR` (milestone 4 D1; swallowed on any
     /// other field), `form.next_field`/`prev_field` move the focus. Anything else is swallowed
     /// unless the modal layer passes it (`ctrl-c`, `F1`).
-    pub fn on_key(&mut self, key: KeyEvent, keys: &Keys) -> ItemFormOutcome {
+    ///
+    /// MOD-115 M2 RV1 M: `key` is the event the widgets read (the shell's `[field]` translation
+    /// made a rebound editing chord canonical) and `pressed` the chord the user pressed
+    /// (`Ctx::pressed`): the form's own acts resolve from `pressed`, so `field.left = ["ctrl-b"]`
+    /// never picks on a picker.
+    pub fn on_pressed(&mut self, key: KeyEvent, pressed: KeyChord, keys: &Keys) -> ItemFormOutcome {
         if self.resolving.is_some() {
             return self.on_view_key(key, keys);
         }
         let stack = views::ITEM_FORM;
-        let chord = KeyChord::from_event(key);
+        let chord = pressed;
         let acts = keys.actions(stack, chord);
         if self.busy.is_some() {
             let swallowed = acts
@@ -683,6 +689,13 @@ impl ItemForm {
         } else {
             ItemFormOutcome::Stay
         }
+    }
+
+    /// [`on_pressed`](Self::on_pressed) for a key the shell did not translate: the chord pressed
+    /// is the key's own.
+    #[cfg(test)]
+    pub fn on_key(&mut self, key: KeyEvent, keys: &Keys) -> ItemFormOutcome {
+        self.on_pressed(key, KeyChord::from_event(key), keys)
     }
 
     /// Into the focused text widget; dropped on a picker, while busy or while the view is open.
@@ -1478,6 +1491,15 @@ mod tests {
         let keys = crate::keys::load_str("version = 2\n[choice]\nnext = \"ctrl-n\"\n")
             .expect("the keys load");
         focus_on(&mut form, Field::Project);
+        // RV1 H2: the picker's hint names the choice keys in force.
+        assert_eq!(
+            form.key_hint(&keys),
+            "\u{2190}/Ctrl+n choose \u{b7} Tab field \u{b7} Esc cancel"
+        );
+        assert_eq!(
+            form.key_hint(Keys::compiled()),
+            "\u{2190}/\u{2192} choose \u{b7} Tab field \u{b7} Esc cancel"
+        );
         assert!(matches!(
             form.on_key(key(KeyCode::Char('l')), &keys),
             ItemFormOutcome::Stay
@@ -1505,6 +1527,44 @@ mod tests {
             form.on_key(key(KeyCode::Esc), &keys),
             ItemFormOutcome::Cancel
         ));
+    }
+
+    /// MOD-115 M2 RV1 M: the form resolves its own acts from the chord pressed, not from the
+    /// `[field]` translation's canonical event: with `field.left = ["ctrl-b"]`, `ctrl-b` arrives
+    /// as `Left` and picks nothing (it is the text field's), while a pressed `Left` still picks;
+    /// and `field.line_down = ["ctrl-j"]` never moves the field from a one-line field.
+    #[tokio::test]
+    async fn a_translated_field_chord_is_never_a_choice_or_form_act() {
+        let store = MemStore::demo();
+        let mut form = ItemForm::open_new(
+            context(&store, ids::PROJECT_HTUI, None).await,
+            &projects(),
+            None,
+        );
+        let keys = crate::keys::load_str(
+            "version = 2\n[field]\nleft = [\"ctrl-b\"]\nline_down = [\"ctrl-j\"]\n",
+        )
+        .expect("the keys load");
+        let chord = |spec: &str| KeyChord::parse_strict(spec).expect("a valid spec");
+        focus_on(&mut form, Field::Project);
+        form.on_pressed(key(KeyCode::Left), chord("ctrl-b"), &keys);
+        assert_eq!(form.busy(), None, "`ctrl-b` picks nothing");
+        assert_eq!(form.picker_label(Field::Project), "htui");
+        let outcome = form.on_pressed(key(KeyCode::Left), chord("left"), &keys);
+        assert!(
+            matches!(outcome, ItemFormOutcome::Reload(_)),
+            "a pressed `Left` picks: {outcome:?}"
+        );
+        let mut form = ItemForm::open_new(
+            context(&store, ids::PROJECT_HTUI, None).await,
+            &projects(),
+            None,
+        );
+        focus_on(&mut form, Field::Title);
+        form.on_pressed(key(KeyCode::Down), chord("ctrl-j"), &keys);
+        assert_eq!(form.focus, Field::Title, "`ctrl-j` is no field move");
+        form.on_pressed(key(KeyCode::Down), chord("down"), &keys);
+        assert_ne!(form.focus, Field::Title, "a pressed `Down` moves on");
     }
 
     #[tokio::test]

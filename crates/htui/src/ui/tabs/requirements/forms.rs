@@ -311,7 +311,17 @@ impl RequirementForm {
     /// `TextArea` never sees `ctrl-s`); `Enter` on the deciding key submits and `Esc` anywhere
     /// cancels. A key the field does not use passes: the tab moves the focus `Body → Rationale →
     /// Priority (→ Deciding)` or saves on it.
-    pub(super) fn on_key(&mut self, key: KeyEvent, keys: &Keys) -> FormOutcome {
+    ///
+    /// MOD-115 M2 RV1 M: `key` is the event the widgets read (the shell's `[field]` translation
+    /// made a rebound editing chord canonical) and `pressed` the chord the user pressed
+    /// (`Ctx::pressed`): the priority resolves its keys from `pressed`, so `field.left =
+    /// ["ctrl-b"]` never toggles it.
+    pub(super) fn on_pressed(
+        &mut self,
+        key: KeyEvent,
+        pressed: KeyChord,
+        keys: &Keys,
+    ) -> FormOutcome {
         if self.focus != FormFocus::Priority && !is_plain(&key) {
             return FormOutcome::Pass;
         }
@@ -331,9 +341,8 @@ impl RequirementForm {
                 }
             }
             FormFocus::Priority => {
-                let chord = KeyChord::from_event(key);
                 let chosen = keys
-                    .actions(views::REQUIREMENTS_FORM, chord)
+                    .actions(views::REQUIREMENTS_FORM, pressed)
                     .into_iter()
                     .find_map(|act| match act {
                         Act::RequirementsPriorityMust => Some(Some(Priority::Must)),
@@ -363,6 +372,13 @@ impl RequirementForm {
                 FieldOutcome::Pass => FormOutcome::Pass,
             },
         }
+    }
+
+    /// [`on_pressed`](Self::on_pressed) for a key the shell did not translate: the chord pressed
+    /// is the key's own.
+    #[cfg(test)]
+    pub(super) fn on_key(&mut self, key: KeyEvent, keys: &Keys) -> FormOutcome {
+        self.on_pressed(key, KeyChord::from_event(key), keys)
     }
 
     /// The deciding key as typed, trimmed.
@@ -714,6 +730,27 @@ mod tests {
         assert_eq!(form.priority, Priority::Must);
         // `l` is still `choice.next`, which toggles.
         assert_eq!(press(&mut form, "l", &keys), FormOutcome::Stay);
+        assert_eq!(form.priority, Priority::Later);
+    }
+
+    /// MOD-115 M2 RV1 M: the priority resolves its keys from the chord pressed, not from the
+    /// `[field]` translation's canonical event: with `field.left = ["ctrl-b"]`, `ctrl-b` arrives
+    /// as `Left` and toggles nothing, while a pressed `Left` still toggles.
+    #[test]
+    fn a_translated_field_chord_never_sets_the_priority() {
+        let keys = load_str("version = 2\n[field]\nleft = [\"ctrl-b\"]\n").expect("loads");
+        let chord = |spec: &str| KeyChord::parse_strict(spec).expect("a valid spec");
+        let left = chord("left").to_event();
+        let mut form = on_priority(Priority::Must);
+        assert_eq!(
+            form.on_pressed(left, chord("ctrl-b"), &keys),
+            FormOutcome::Pass
+        );
+        assert_eq!(form.priority, Priority::Must);
+        assert_eq!(
+            form.on_pressed(left, chord("left"), &keys),
+            FormOutcome::Stay
+        );
         assert_eq!(form.priority, Priority::Later);
     }
 

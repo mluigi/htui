@@ -145,8 +145,17 @@ hidden. The `HANDOFF.md` phase 1 note summarises the milestone.
   action does (`choice.prev` keeping `left` after `field.left` moved), the key is delivered and a
   focused widget still reads it literally, so a rebound field key other than `Esc` keeps working
   under its old chord there. Closing it needs `&Keys` in the widgets, which the plan rejected as a
-  25-file signature change; it closes as M3/M4 port the tabs onto the kit.
-- **D8 - existing key files keep loading:** MD4 above.
+  25-file signature change; it closes as M3/M4 port the tabs onto the kit. The reverse (review
+  RV1 M) is fixed for every choice: a rebound field chord arrives as the canonical key, and the
+  filter, item and Requirements forms resolve their own acts from the chord pressed
+  (`Ctx::pressed`), so `field.left = ["ctrl-b"]` never fires `choice.prev`. The other forms, the
+  compose areas, the concepts search and the agent help still resolve from the delivered key, so
+  a rebound `field.line_up`/`line_down` chord a one-line field passes moves the field or cursor
+  there as `Up`/`Down` would; that closes with the same M3/M4 port.
+- **D8 - existing key files keep loading:** MD4 above. Review RV1 H1: a version-1 entry never
+  takes a chord from the rows M2 added for the keys a view kept before it (a text field's editing
+  keys, a choice's value keys, the permission digits, the Requirements priority); the two share
+  it, and the view's key acts on its screen as before M2.
 
 ## Commits
 

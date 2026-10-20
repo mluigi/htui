@@ -31,11 +31,12 @@ use crate::ui::{FieldOutcome, TextField, Theme};
 /// the shell's hint row since MOD-67 M6 T2).
 pub const FORM_HEIGHT: u16 = 6;
 
-/// The hint under every row but Tags, through [`views::BACKLOG_FILTER`].
+/// The hint under every row but Tags, through [`views::BACKLOG_FILTER`]: `choice.toggle` and
+/// `field.submit` through the keys in force (MOD-115 M2 RV1 H2), `Esc` as written (MD7).
 pub const HINT_CHOICES: HintSpec = &[
-    Hint::Text("space toggle"),
+    Hint::One(Act::ChoiceToggle, "toggle"),
     Hint::One(Act::FilterClear, "clear"),
-    Hint::Text("Enter apply"),
+    Hint::One(Act::FieldSubmit, "apply"),
     Hint::Text("Esc cancel"),
 ];
 
@@ -44,7 +45,7 @@ pub const HINT_CHOICES: HintSpec = &[
 pub const HINT_TAGS: HintSpec = &[
     Hint::Text("comma list"),
     Hint::One(Act::FormNextField, "row"),
-    Hint::Text("Enter apply"),
+    Hint::One(Act::FieldSubmit, "apply"),
     Hint::Text("Esc cancel"),
 ];
 
@@ -243,7 +244,12 @@ impl FilterForm {
     /// (`j`/`k`) and the field moves move the row, and `backlog.filter_form.clear` (`x`) clears.
     /// Anything else is [`FormOutcome::Pass`]: a chord no row binds is never a form key (MOD-13
     /// review L4), so `Alt+x` clears nothing.
-    pub fn on_key(&mut self, key: KeyEvent, keys: &Keys) -> FormOutcome {
+    ///
+    /// MOD-115 M2 RV1 M: `key` is the event the widgets read (the shell's `[field]` translation
+    /// made a rebound editing chord canonical) and `pressed` the chord the user pressed
+    /// (`Ctx::pressed`): the acts resolve from `pressed`, so `field.left = ["ctrl-b"]` never moves
+    /// an option.
+    pub fn on_pressed(&mut self, key: KeyEvent, pressed: KeyChord, keys: &Keys) -> FormOutcome {
         if self.row == FilterRow::Tags {
             match self.tags.on_key(key) {
                 FieldOutcome::Submit => return self.apply(),
@@ -259,7 +265,7 @@ impl FilterForm {
             }
         }
         let options = self.row != FilterRow::Tags;
-        for act in keys.actions(views::BACKLOG_FILTER, KeyChord::from_event(key)) {
+        for act in keys.actions(views::BACKLOG_FILTER, pressed) {
             match act {
                 Act::ChoicePrev if options => return self.move_option(false),
                 Act::ChoiceNext if options => return self.move_option(true),
@@ -279,6 +285,13 @@ impl FilterForm {
             return FormOutcome::Stay;
         }
         FormOutcome::Pass
+    }
+
+    /// [`on_pressed`](Self::on_pressed) for a key the shell did not translate: the chord pressed
+    /// is the key's own.
+    #[cfg(test)]
+    pub fn on_key(&mut self, key: KeyEvent, keys: &Keys) -> FormOutcome {
+        self.on_pressed(key, KeyChord::from_event(key), keys)
     }
 
     /// A bracketed paste: the tag field's on the Tags row, dropped on every other row.
@@ -555,6 +568,11 @@ mod tests {
         );
         assert_eq!(form.on_key(ctrl('n'), &keys), FormOutcome::Stay);
         assert_eq!(form.on_key(ctrl('t'), &keys), FormOutcome::Stay);
+        // RV1 H2: the hint names the toggle in force.
+        assert_eq!(
+            form.key_hint(&keys),
+            "Ctrl+t toggle \u{b7} x clear \u{b7} Enter apply \u{b7} Esc cancel"
+        );
         assert_eq!(
             form.on_key(key(KeyCode::Enter), &keys),
             FormOutcome::Apply(BacklogFilter {
@@ -575,6 +593,62 @@ mod tests {
         assert_eq!(
             form.on_key(key(KeyCode::Esc), Keys::compiled()),
             FormOutcome::Cancel
+        );
+    }
+
+    /// MOD-115 M2 RV1 M: the form resolves its own acts from the chord pressed, not from the
+    /// `[field]` translation's canonical event: with `field.left = ["ctrl-b"]`, `ctrl-b` arrives
+    /// as `Left` and moves no option, while a pressed `Left` still does.
+    #[test]
+    fn a_translated_field_chord_moves_no_option() {
+        let keys = crate::keys::load_str("version = 2\n[field]\nleft = [\"ctrl-b\"]\n")
+            .expect("the keys load");
+        let chord = |spec: &str| KeyChord::parse_strict(spec).expect("a valid spec");
+        let mut form = open();
+        assert_eq!(
+            form.on_pressed(key(KeyCode::Left), chord("ctrl-b"), &keys),
+            FormOutcome::Pass
+        );
+        assert_eq!(form.status_at, 0, "`ctrl-b` is the text field's");
+        assert_eq!(
+            form.on_pressed(key(KeyCode::Left), chord("left"), &keys),
+            FormOutcome::Stay
+        );
+        assert_eq!(
+            form.status_at,
+            Status::ALL.len() - 1,
+            "a pressed `Left` moves"
+        );
+    }
+
+    /// MOD-115 M2 RV1 H2: both hints name the toggle and the submit key in force (`Space` and
+    /// `Enter` under the compiled keys); `Esc` is written as is (MD7).
+    #[test]
+    fn the_hints_name_the_choice_and_field_keys_in_force() {
+        let mut form = open();
+        let sep = " \u{b7} ";
+        assert_eq!(
+            form.key_hint(Keys::compiled()),
+            ["Space toggle", "x clear", "Enter apply", "Esc cancel"].join(sep)
+        );
+        let keys = crate::keys::load_str(
+            "version = 2\n[choice]\ntoggle = \"ctrl-t\"\n[field]\nsubmit = \"ctrl-y\"\n",
+        )
+        .expect("the keys load");
+        assert_eq!(
+            form.key_hint(&keys),
+            ["Ctrl+t toggle", "x clear", "Ctrl+y apply", "Esc cancel"].join(sep)
+        );
+        form.on_key(key(KeyCode::Tab), &keys);
+        form.on_key(key(KeyCode::Tab), &keys);
+        assert_eq!(form.row(), FilterRow::Tags);
+        assert_eq!(
+            form.key_hint(&keys),
+            ["comma list", "Tab row", "Ctrl+y apply", "Esc cancel"].join(sep)
+        );
+        assert_eq!(
+            form.key_hint(Keys::compiled()),
+            ["comma list", "Tab row", "Enter apply", "Esc cancel"].join(sep)
         );
     }
 

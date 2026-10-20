@@ -114,6 +114,9 @@ pub struct Ctx<'a> {
     /// MOD-115 M2 B5: where [`Ctx::split`] records the panes the tab claimed this frame, and the
     /// region it split; `None` at every site but the active tab's render.
     claim: Option<&'a Cell<Option<PaneClaim>>>,
+    /// MOD-115 M2 RV1 M: the key the shell is dispatching, as delivered after the `[field]`
+    /// translation, and the chord the user pressed for it; `None` at every other site.
+    pressed: Option<(KeyEvent, KeyChord)>,
 }
 
 /// What a list + detail tab claimed in one frame (MOD-115 M2 B5): the region it split and the
@@ -200,6 +203,27 @@ impl<'a> Ctx<'a> {
             open_edit: None,
             layout: None,
             claim: None,
+            pressed: None,
+        }
+    }
+
+    /// Tells this context the key being dispatched (MOD-115 M2 RV1 M): `delivered`, the event
+    /// the view is handed after the `[field]` translation, came from the user's `pressed` chord.
+    /// Only `App::dispatch_key` calls it.
+    pub(super) const fn set_pressed(&mut self, delivered: KeyEvent, pressed: KeyChord) {
+        self.pressed = Some((delivered, pressed));
+    }
+
+    /// The chord the user pressed for `key` (MOD-115 M2 RV1 M): the one before the shell's
+    /// `[field]` translation when `key` is the event the shell delivered, else `key`'s own. A
+    /// view resolves its own acts from it, after a widget had the canonical event: so a chord
+    /// bound to a `[field]` row (`field.left = ["ctrl-b"]`) is only that row's, and is never
+    /// re-resolved as another act of the canonical key (`choice.prev`'s `Left`).
+    #[must_use]
+    pub fn pressed(&self, key: &KeyEvent) -> KeyChord {
+        match self.pressed {
+            Some((delivered, pressed)) if delivered == *key => pressed,
+            _ => KeyChord::from_event(*key),
         }
     }
 
@@ -1283,7 +1307,9 @@ impl App {
         // MOD-115 M2 D7 (blueprint §3): while the view holding the keyboard captures text, a
         // chord bound to a `[field]` row becomes that row's canonical editing event, and a
         // canonical key no row binds any more is not delivered. The focused in-pane editor above
-        // never goes through it: it takes raw keys.
+        // never goes through it: it takes raw keys. RV1 M: the view is also told the chord
+        // pressed (`Ctx::pressed`), so it resolves its own acts from that, not the canonical key.
+        let pressed = chord;
         let Some(key) = self
             .active_stack()
             .map_or(Some(key), |stack| translate(&self.keys, stack, key))
@@ -1309,6 +1335,7 @@ impl App {
                     Some(top) => {
                         let mut ctx =
                             Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit);
+                        ctx.set_pressed(key, pressed);
                         top.on_key(key, &mut ctx)
                     }
                     None => Handled::Pass,
@@ -1338,7 +1365,10 @@ impl App {
         }
 
         if let Some(id) = self.tabs.active_id()
-            && self.call_tab(id, |tab, ctx| tab.on_key(key, ctx)) == Some(Handled::Consumed)
+            && self.call_tab(id, |tab, ctx| {
+                ctx.set_pressed(key, pressed);
+                tab.on_key(key, ctx)
+            }) == Some(Handled::Consumed)
         {
             return;
         }
@@ -2636,6 +2666,68 @@ pub(crate) mod shell_tests {
         fn key_stack(&self) -> Option<Stack<'static>> {
             Some(views::CAPTURE)
         }
+    }
+
+    /// A capturing tab that records each key it is handed with the chord its `Ctx` says was
+    /// pressed (MOD-115 M2 RV1 M).
+    struct Pressing(std::rc::Rc<std::cell::RefCell<Vec<(KeyEvent, crate::keys::KeyChord)>>>);
+
+    impl Tab for Pressing {
+        fn id(&self) -> TabId {
+            TabId("pressing")
+        }
+        fn title(&self) -> &str {
+            "Pressing"
+        }
+        fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+            Vec::new()
+        }
+        fn on_scope_change(&mut self, _scope: &Scope) {}
+        fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+            self.0.borrow_mut().push((key, ctx.pressed(&key)));
+            // A key the view builds itself is its own chord, whatever the shell delivered.
+            let built = KeyEvent::from(KeyCode::Char('x'));
+            assert_eq!(
+                ctx.pressed(&built),
+                crate::keys::KeyChord::from_event(built)
+            );
+            Handled::Consumed
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+        fn key_stack(&self) -> Option<Stack<'static>> {
+            Some(views::CAPTURE)
+        }
+    }
+
+    /// MOD-115 M2 RV1 M: a view is handed the `[field]` translation's canonical event and, on its
+    /// `Ctx`, the chord the user pressed, so it can resolve its own acts from that chord and never
+    /// re-resolve the canonical key (`field.left = ["ctrl-b"]` is never `choice.prev`). An
+    /// untranslated key is its own chord, and a bench's `Ctx` (no shell) reads the key's.
+    #[test]
+    fn a_view_is_told_the_chord_pressed_before_the_field_translation() {
+        use crate::keys::KeyChord;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.register_tab(Box::new(Pressing(Rc::clone(&seen))));
+        app.keys = crate::keys::load_str("version = 2\n[field]\nleft = [\"ctrl-b\"]\n")
+            .expect("the keys load");
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        let chord = |spec: &str| KeyChord::parse_strict(spec).expect("a valid spec");
+        assert_eq!(
+            *seen.borrow(),
+            [
+                (KeyEvent::from(KeyCode::Left), chord("ctrl-b")),
+                (KeyEvent::from(KeyCode::Char('a')), chord("a")),
+            ]
+        );
+        let ctx = app.ctx(crate::store_worker::Origin::Tab(TabId("pressing")));
+        let left = KeyEvent::from(KeyCode::Left);
+        assert_eq!(ctx.pressed(&left), chord("left"));
     }
 
     /// MOD-115 M2 D6, D7, `R-TUI-18`: `ctrl-c` is `global.quit` on every screen: from a tab, from

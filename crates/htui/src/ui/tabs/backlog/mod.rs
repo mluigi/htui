@@ -417,9 +417,11 @@ impl BacklogTab {
         let Some(form) = self.form.as_mut() else {
             return Handled::Pass;
         };
-        match form.on_key(key, ctx.keys()) {
+        // MOD-115 M2 RV1 M: the form resolves its acts from the chord pressed (`Ctx::pressed`).
+        let pressed = ctx.pressed(&key);
+        match form.on_pressed(key, pressed, ctx.keys()) {
             FormOutcome::Pass => {
-                return modal_rest(views::BACKLOG_FILTER, KeyChord::from_event(key));
+                return modal_rest(views::BACKLOG_FILTER, pressed);
             }
             FormOutcome::Stay => {}
             FormOutcome::Cancel => self.form = None,
@@ -580,7 +582,8 @@ impl BacklogTab {
         let Some(form) = self.item_form.as_mut() else {
             return Handled::Pass;
         };
-        match form.on_key(key, ctx.keys()) {
+        // MOD-115 M2 RV1 M: the form resolves its acts from the chord pressed (`Ctx::pressed`).
+        match form.on_pressed(key, ctx.pressed(&key), ctx.keys()) {
             ItemFormOutcome::Pass => return Handled::Pass,
             ItemFormOutcome::Stay => {}
             ItemFormOutcome::Cancel => self.item_form = None,

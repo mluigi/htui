@@ -137,11 +137,20 @@ const FORM_HINT: HintSpec = &[
     Hint::Text("Esc cancel"),
 ];
 
-/// Added to [`FORM_HINT`] on the priority field: the choice's own value keys (D10).
-const PRIORITY_HINT: HintSpec = &[Hint::Text("m/l priority")];
+/// Added to [`FORM_HINT`] on the priority field: the choice's own value keys (D10), through the
+/// keys in force (MOD-115 M2 RV1 H2; `m/l` under the defaults).
+const PRIORITY_HINT: HintSpec = &[Hint::Pair(
+    Act::RequirementsPriorityMust,
+    Act::RequirementsPriorityLater,
+    "priority",
+)];
 
-/// The hint row on the withdraw form: its field's own keys.
-const WITHDRAW_HINT: HintSpec = &[Hint::Text("Enter next"), Hint::Text("Esc cancel")];
+/// The hint row on the withdraw form: its field's own keys, `field.submit` through the keys in
+/// force (RV1 H2) and `Esc` as written (MD7).
+const WITHDRAW_HINT: HintSpec = &[
+    Hint::One(Act::FieldSubmit, "next"),
+    Hint::Text("Esc cancel"),
+];
 
 /// A key while a write is in flight: one at a time (the Skills tab's rule).
 fn in_flight(busy: &str) -> String {
@@ -579,7 +588,9 @@ impl RequirementsTab {
     /// stack passes still reaches the shell, everything else is swallowed.
     fn on_form_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
         let stack = self.stack();
-        let chord = KeyChord::from_event(key);
+        // MOD-115 M2 RV1 M: the acts resolve from the chord pressed, never from the `[field]`
+        // translation's canonical event (`Ctx::pressed`).
+        let chord = ctx.pressed(&key);
         if self.busy.is_some() {
             return match ctx.keys().actions(stack, chord).first() {
                 Some(Act::FormSave) => {
@@ -591,7 +602,7 @@ impl RequirementsTab {
         }
         // MOD-115 M2 D7: the requirement form resolves its priority's keys itself, chords too.
         let outcome = match &mut self.mode {
-            Mode::Requirement(form) => form.on_key(key, ctx.keys()),
+            Mode::Requirement(form) => form.on_pressed(key, chord, ctx.keys()),
             Mode::NewArea(form) if is_plain(&key) => form.on_key(key),
             Mode::Withdraw(form) if is_plain(&key) => form.on_key(key),
             Mode::NewArea(_) | Mode::Withdraw(_) => FormOutcome::Pass,
@@ -2574,5 +2585,34 @@ mod tests {
         assert_eq!(text(Keys::compiled()), "Enter apply \u{b7} Esc clear");
         let keys = load_str("version = 2\n[field]\nsubmit = \"ctrl-t\"\n").expect("loads");
         assert_eq!(text(&keys), "Ctrl+t apply \u{b7} Esc clear");
+    }
+
+    /// MOD-115 M2 RV1 H2: the priority field's hint names the priority keys in force, and the
+    /// withdraw form's the submit key (`m/l`, `Enter` under the compiled keys).
+    #[test]
+    fn the_priority_and_withdraw_hints_name_the_keys_in_force() {
+        use crate::keys::load_str;
+        let compiled = Keys::compiled();
+        assert_eq!(
+            compiled.hint(views::REQUIREMENTS_FORM, super::PRIORITY_HINT),
+            "m/l priority"
+        );
+        assert_eq!(
+            compiled.hint(views::REQUIREMENTS_WITHDRAW, super::WITHDRAW_HINT),
+            "Enter next \u{b7} Esc cancel"
+        );
+        let keys = load_str(
+            "version = 2\n[requirements]\npriority_must = \"M\"\npriority_later = \"alt-l\"\n\
+             [field]\nsubmit = \"ctrl-t\"\n",
+        )
+        .expect("the file loads");
+        assert_eq!(
+            keys.hint(views::REQUIREMENTS_FORM, super::PRIORITY_HINT),
+            "M/Alt+l priority"
+        );
+        assert_eq!(
+            keys.hint(views::REQUIREMENTS_WITHDRAW, super::WITHDRAW_HINT),
+            "Ctrl+t next \u{b7} Esc cancel"
+        );
     }
 }
