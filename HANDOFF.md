@@ -14,7 +14,7 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-18):** **ANA-35 is concluded** (`docs/ANA-35.md`, `docs/decisions/ana/ana-35.md`): an
+**Current status (2026-10-20):** **ANA-38 is concluded** (`docs/ANA-38.md`, `docs/decisions/ana/ana-38.md`): memory returns as verbatim entries (kinds `fact`, `decision`, `gotcha`, `lesson`; project, workspace and a new global scope), written automatically by the light model through a validated deterministic pipeline with no person's acceptance, which amends `R-ID-6` (owed, maintainer-gated); freshness is computed by code, the prompt section is Postgres-only, and Qdrant is an add-on. Spawned **MOD-163..169**. Before it, **ANA-35 is concluded** (`docs/ANA-35.md`, `docs/decisions/ana/ana-35.md`): an
 item stores only `open`, `blocked` or `closed`, and what a person sees (queued, running, needs you, failed, done) is
 derived from its latest graph run; the migration closes nothing a run can explain. A repo is `git` or `folder`
 (folders copy, never merge, push or clone); project types are rows whose seed is copied once; a workspace owns its
@@ -26,16 +26,7 @@ coordinator is a role over store rows, not a process; deterministic code in the 
 per repo (`local` stays the default, `push` fast-forward only, `pull_request` through a forge adapter, OneDev
 first) and never resolves a conflict; its agent turns only propose; close-out stays a person's confirmation over a
 checklist. Spawned **MOD-133..136**; requirement edits (`R-TUI-9` final text and others, §10) wait for the
-maintainer, except `R-ENT-8`'s, applied with ANA-35's. Before it, **ANA-33 is concluded** (`docs/ANA-33.md`, `docs/decisions/ana/ana-33.md`): step
-graphs become phase rows plus typed edges owned by a project, a workspace or the global workflow library, a run is
-pinned to a v2 snapshot, and fan-out divides work into a planner, planned parts and an integrate agent whose branch
-alone lands through ANA-2 §4.6. Spawned **MOD-137..143**; MOD-27 is narrowed to consult-mode `spawn_subagent`, and
-ANA-2, ANA-13, ANA-30, `R-MCP-3`, `R-TUI-8`, `R-ORCH-1` and `CONCEPTS.md` carry dated amendments. Before it,
-**ANA-40 is concluded** (`docs/ANA-40.md`, `docs/decisions/ana/ana-40.md`): the
-Toolbox has eleven kinds plus bundles, Postgres holds them all and the box probe only reports observed state, every
-attachable kind shares one generalised binding, and the light model becomes one setting (a partial reversal of
-ANA-30). Spawned **MOD-126..129**; requirement edits (`R-TUI-7` and others) wait for the maintainer. Before it, a
-**UI redesign review** with the maintainer, run on a throwaway
+maintainer, except `R-ENT-8`'s, applied with ANA-35's. Before it, a **UI redesign review** with the maintainer, run on a throwaway
 ratatui skeleton (branch `spike/ui-skeleton`, `spikes/ui-skeleton/`), is concluded; every decision is
 in `docs/ui-redesign-findings-2026-10-15.md`. It added `R-ENT-17`, `R-AGT-11`, `R-ORCH-15`, `R-ORCH-16`, `R-SEC-5` and
 `R-TUI-12..18` and amended `R-TUI-1..8`, `R-TUI-10` and six more (`docs/REQUIREMENTS.md` header). Filed
@@ -120,19 +111,10 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
 - [ ] **ANA-37 - Is Qdrant worth requiring** (from the 2026-10-15 requirements review). `R-NF-2`,
   `R-STO-8`, `R-ENT-13`. The maintainer wants Qdrant required "if it is very beneficial". Today it is
   optional and fails open (MOD-34, MOD-50, MOD-68). Measure what semantic search adds once agents can
-  search (MOD-112), triage and duplicate detection use it, and memory (ANA-38) sits on it. Weigh that
+  search (MOD-112), triage and duplicate detection use it, and memory (ANA-38, concluded: MOD-167 and MOD-169, `docs/decisions/ana/ana-38.md`) sits on it. Weigh that
   against the cost of a second required daemon on every box (install, Windows, a headless worker) and
   against Postgres-only alternatives (`pgvector`, full-text search). Verdict: required or optional,
   and the `R-NF-2` text. Not blocked.
-- [ ] **ANA-38 - Project and workspace memory** (from the 2026-10-15 requirements review; reopens
-  `R-ENT-13`). `R-ENT-13`, `R-ID-6`, `R-STO-8`, `R-ORCH-14`. ANA-1's atomic facts with importance
-  scores were dropped on 2026-09-03 as over-engineered ("summaries cover the need"). The maintainer
-  reopened the question for the coordinator (ANA-34) and agents: memory of facts, decisions and
-  gotchas that outlives one item. Settle who writes an entry (an agent, a person, close-out), how it
-  stays fresh against the code it describes (commit pinning, expiry, confirmation), the `R-ID-6` line
-  (a person accepts it, or not), how it reaches a prompt (`R-PRM-1`, `R-PRM-3`), and its
-  **integration with Qdrant** (indexed, searched, deduplicated). Not blocked. ANA-34 is concluded: a
-  coordinator turn is seeded from the store, and memory joins that seed when it lands (`docs/ANA-34.md` §7.2).
 - [ ] **ANA-39 - Mandatory context tools for coding sessions** (from the 2026-10-15 requirements
   review; `R-LATER-7` promoted to must). `R-LATER-7`, `R-NF-2`, `R-AGT-10`, `R-ID-5`, `R-MCP-4`,
   `R-PRM-1`. Code-context tools (Gortex, Serena, Graphify, Headroom) become mandatory in coding
@@ -484,6 +466,64 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   upstream prompt walk; close-out recording `duplicates`/`supersedes`; `item_artifact_link` with
   document version pinning (`to_attachment_id` without its FK, which MOD-114 (3) adds); MCP
   `to_document` and qualified keys; Graph legend and nodes. Blocked on MOD-144.
+- [ ] **MOD-163 - Memory: entry store and prompt section** (from ANA-38, `docs/ANA-38.md` §7.2 P1, §4.6).
+  `R-ENT-13`, `R-PRM-1`, `R-PRM-3`, `R-ENT-12`, `R-ENT-10`. A memory entry with kind (`fact`, `decision`,
+  `gotcha`, `lesson`), subject, prose, owner scope (project; workspace after MOD-147), state (`active`,
+  `suspect`, `superseded`, `retired`) and a freshness stamp, stored as an ANA-35 owner document of a
+  conventional kind or as a small table (decide first: Q3, the pin and state columns decide it); a TUI list
+  with edit, retire and manual write, and the per-level capture switch in the Settings cascade; a new
+  internal prompt section filled in `phase_spec` from Postgres (active, non-suspect entries by scope, fixed
+  order, hard token cap, run-start snapshot, quoted data labelled with source and trust), ranked after
+  Excerpts and before Upstream, unprotected, entry ids and versions in `trim_record`
+  (`RECORD_VERSION` bump). Requirement edits owed: `R-ENT-13`, `R-PRM-1`/`R-PRM-3`, CONCEPTS "Bounded
+  context" (maintainer-gated, `docs/ANA-38.md` §7.3). Not blocked for project scope; "must".
+- [ ] **MOD-164 - Automatic memory capture at run end** (from ANA-38, `docs/ANA-38.md` §7.2 P2, §4.6).
+  `R-ENT-13`, `R-ID-6`, `R-ID-7`, `R-ORCH-1`. An extraction turn by the light model (MOD-126) over the run's
+  own evidence (errors seen, retries, fixes, measured wins) writing entries with no person's acceptance,
+  through a deterministic write path: schema validation, a per-run write cap, scrub before persist,
+  provenance stamped by the platform (run, agent, item, commit), evidence that must cite something observed
+  in the run; automatic dedup and supersede at write time (subject key plus full-text, Postgres only);
+  deterministic usage counters (entries injected, steps ended done or failed) for demotion; a per-run cost
+  budget and extraction skipped for runs with no error, retry or win. Needs the maintainer's `R-ID-6`
+  amendment (`docs/ANA-38.md` §7.3) before it is built. Blocked on MOD-163; workspace-owned entries need
+  MOD-147; the coordinator seed reading entries needs MOD-136. "Must".
+- [ ] **MOD-165 - Lesson detector over run records** (from ANA-38, `docs/ANA-38.md` §7.2 P3). `R-ENT-13`,
+  `R-ID-6`, `R-ORCH-11`. A deterministic detector over run records for repeated error signatures, retries,
+  timeouts and outlier cost that triggers or feeds MOD-164's extraction. First task: verify what error and
+  retry detail run records store today (not verified in ANA-38) and report before building. Blocked on
+  MOD-164. Later.
+- [ ] **MOD-166 - Memory freshness sweep, pins and re-validation** (from ANA-38, `docs/ANA-38.md` §7.2 P4).
+  `R-ENT-13`, `R-ENT-15`, `R-ID-6`. A version-stamp suspect flag on cited rows (the `makes_suspect` /
+  `reconfirm` pattern); an optional pin (repo, commit, cited paths or symbols, never lines) from the
+  writing step's `after_hash`, git projects only, checked by a sweep arm and never inside prompt assembly;
+  a suspect entry held back from prompts, then an automatic re-validation turn that re-confirms (new stamp),
+  amends (new superseding version) or retires; auto-retire of an unresolved suspect entry after a
+  configurable period (starting default 14 days); pin-as-trusted (exempt from auto-retire and usage
+  demotion, still held back when suspect); a "why is this here" view. Blocked on MOD-163; the re-validation
+  turn needs MOD-164. Later.
+- [ ] **MOD-167 - Memory in Qdrant: point type and raw-cosine dedup** (from ANA-38, `docs/ANA-38.md` §7.2
+  P5). `R-STO-8`, `R-ENT-13`, `R-NF-2`. A memory point type (active entries only, rebuilt when `version`
+  differs, deleted with the row), a `search_concepts` type extension for agent pull, and a raw-cosine
+  `VectorStore` query for write-time dedup (the existing RRF score cannot be thresholded; the literature's
+  0.98 and 0.82 thresholds do not transfer). Memory works without it: Postgres full-text is the fallback.
+  Rides ANA-35's collection `htui_concepts_v4` rebuild (MOD-147). Check ANA-37's verdict (its items, filed
+  by the `hr/ANA-37` run, were not on this branch) and its indexer before building. Blocked on MOD-163,
+  MOD-164 and MOD-147; MOD-112 for read tools. Later.
+- [ ] **MOD-168 - Global memory scope and automatic promotion** (from ANA-38, `docs/ANA-38.md` §7.2 P6).
+  `R-ENT-13`, `R-PRM-1`, `R-ID-7`, `R-SEC-3`. A third hidden scope row (global), on the pattern of
+  ANA-35's workspace scope row; an automatic promotion pipeline (a generalization check by the light model,
+  then a deterministic validator that rejects project, workspace, path, host, URL and secret tokens and
+  re-runs scrub; a failing entry keeps its scope; an agent never targets global directly); tool-version
+  stamping so a global lesson goes suspect when the agent or CLI version changes; a small global prompt
+  section below project and workspace; the `R-PRM-1` clause that global tooling lessons are the one input
+  not bounded by the active workspace; the per-level promotion switch. Build after MOD-169's first read on
+  MOD-163..167. Blocked on MOD-147 (scope row pattern), MOD-164 and MOD-166. Later.
+- [ ] **MOD-169 - Memory measurement on real htui steps** (from ANA-38, `docs/ANA-38.md` §7.2 P7).
+  `R-ENT-13`, `R-STO-8`. Before/after on real steps, recall of known gotchas, harm from wrong or stale
+  entries, light-model cost per run, validator recall for project-specific tokens, Postgres full-text
+  versus Qdrant on real entries; decides whether `R-ENT-13` stays "must" beyond MOD-163 and MOD-164 and
+  feeds ANA-37's workspace-scale benchmark. Blocked on MOD-163 and MOD-164; better after MOD-165 and
+  MOD-167.
 
 - [ ] **MOD-85 - Remaining accent (cyan) uses that do not mean focus or selection** (from MOD-80,
   `docs/decisions/mod/mod-80.md` "Carried"; blueprint B-6, review M1/L5). `R-TUI-1`. MOD-80 made
@@ -1067,7 +1107,7 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 9 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-36 further MCP tools, ANA-37 Qdrant required?, ANA-38 project memory, ANA-39 mandatory context tools, ANA-41 project workflows, ANA-42 execution targets) |
-| MOD-N   | 72 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-144 item status reduction, MOD-145 folder repos and repo-less runs, MOD-146 project types, MOD-147 workspace scope, MOD-148 per-type seeds, MOD-149 workspace requirement keys, MOD-150 link kinds, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-115 TUI shell, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-137 step graph v2 storage, MOD-138 snapshot v2 and walker, MOD-139 divided fan-out runtime, MOD-140 planner tools and run-time changes, MOD-141 step-graph editor, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
+| ANA-N   | 8 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-36 further MCP tools, ANA-37 Qdrant required?, ANA-39 mandatory context tools, ANA-41 project workflows, ANA-42 execution targets) |
+| MOD-N   | 79 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-144 item status reduction, MOD-145 folder repos and repo-less runs, MOD-146 project types, MOD-147 workspace scope, MOD-148 per-type seeds, MOD-149 workspace requirement keys, MOD-150 link kinds, MOD-163 memory entry store, MOD-164 automatic memory capture, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-115 TUI shell, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-137 step graph v2 storage, MOD-138 snapshot v2 and walker, MOD-139 divided fan-out runtime, MOD-140 planner tools and run-time changes, MOD-141 step-graph editor, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
 | CLEAN-N | 0 |
 | TOOL-N  | 2 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check) |

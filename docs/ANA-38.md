@@ -10,7 +10,7 @@
 > that reads memory), ANA-35 (owner documents, a candidate home) and ANA-37 (is Qdrant required), which is
 > not on this branch. This is draft v2: the maintainer answered section 8 on 2026-10-19 and changed the
 > direction (fully automatic memory, a `lesson` kind, a global scope). The answers are recorded in
-> section 8, with the residual questions at its end; nothing else here is a decision until they are answered.
+> section 8, with the residual questions at its end, which were answered "all as recommended" on 2026-10-20.
 >
 > **Requirements addressed:** `R-ENT-13` (reopened, pending ANA-38), `R-ID-6`, `R-STO-8`, `R-PRM-1`,
 > `R-PRM-3`. Touched at their seams: `R-ORCH-14` (coordinator seed), `R-ENT-12` (owner documents),
@@ -19,7 +19,8 @@
 > inlines prompts), `R-ID-7` (scrub before persist), `R-STO-3` (offline cache mirror), `R-NF-2` (Qdrant
 > fails open), `R-ORCH-1` (the configurable light model that would write entries).
 >
-> **Status (2026-10-19: draft v2, maintainer answered section 8; residual questions in section 8).** No
+> **Status (2026-10-20): concluded; the maintainer answered section 8 (2026-10-19) and its five residual
+> questions "all as recommended" (2026-10-20).** Filed: **MOD-163..169** (P1..P7). No
 > implementation code is written here and no requirement text is edited. The maintainer answered the ten
 > questions of section 8 "all as recommended" and then amended them with three further decisions that
 > override parts of questions 1, 2 and 9 and adjust 4, 6 and 8. Recommended verdict (section 7), in short:
@@ -48,8 +49,9 @@
 > something to measure without depending on its answer. **Not** brought back: importance scores 1-10, the
 > fact-to-fact link graph, recursive-CTE injection. The costs that remain are named plainly in section 6:
 > unreviewed standing instructions, memory poisoning with no human gate, a model call on every run, global
-> leakage, runaway growth and self-reinforcing wrong lessons. Phasing P1..P7 is in section 7; the P's are
-> proposed and not yet filed, and no IDs are minted.
+> leakage, runaway growth and self-reinforcing wrong lessons. Phasing P1..P7 is in section 7 and was filed as
+> **MOD-163** (P1), **MOD-164** (P2), **MOD-165** (P3), **MOD-166** (P4), **MOD-167** (P5), **MOD-168** (P6)
+> and **MOD-169** (P7).
 
 ---
 
@@ -851,7 +853,7 @@ recursive-CTE injection, model-ranked selection.
 On ANA-1's atomic facts specifically: neither as they were nor summaries alone. Keep summaries; add
 automatically written entries beside them.
 
-### 7.2 Proposed phases (not filed; IDs are minted only after the maintainer accepts)
+### 7.2 Phases (filed 2026-10-20: P1 = MOD-163, P2 = MOD-164, P3 = MOD-165, P4 = MOD-166, P5 = MOD-167, P6 = MOD-168, P7 = MOD-169)
 
 | P | Subject | Scope | Blocked on |
 |---|---|---|---|
@@ -864,7 +866,7 @@ automatically written entries beside them.
 | P7 | Measurement on real htui steps | Before/after on real steps, recall of known gotchas, harm from wrong entries, FTS versus Qdrant; decides whether `R-ENT-13` stays "must" beyond P1 and P2; feeds ANA-37 | P1, P2; ideally P3, P5, P6 |
 
 `R-ENT-13` priority: "must" for P1 and P2; "later" for P3..P6 until P7 reports. P1..P7 are a proposal and no
-IDs are minted; the number may change at filing, as ANA-34's P1..P4 did before they became MOD-133..136.
+IDs were minted at filing (above), one item per phase, as ANA-34's P1..P4 became MOD-133..136.
 MOD-135 (the draft store) no longer blocks memory; MOD-147 blocks workspace and global scope; MOD-136 is
 needed only for the coordinator seed.
 
@@ -1083,7 +1085,8 @@ Answer (2026-10-19): decided as stated above (decisions 1a, 1b, 1c); the design 
 and the phases are P1..P7 in 7.2. The `R-ID-6` amendment, `R-ENT-13`, `R-PRM-1`/`R-PRM-3`, `R-STO-8` and
 CONCEPTS edits are owed (7.3).
 
-**Residual questions (genuinely still open; each with a recommended answer).**
+**Residual questions (answered 2026-10-20: all five as recommended).** The recommended defaults below are
+now the maintainer's settings, still tuned at P7 (MOD-169).
 
 1. **Default sizes.** What are the per-run write cap and the prompt caps per scope? Recommended: configurable
    settings with starting defaults of 5 writes per run, about 1,500 tokens for the project section, 500 for

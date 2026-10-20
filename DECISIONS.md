@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[ANA-38](docs/decisions/ana/ana-38.md)** - Project and workspace memory (concluded, 2026-10-20)
 - **[ANA-35](docs/decisions/ana/ana-35.md)** - Entity model for any kind of project (concluded, 2026-10-18)
 - **[ANA-34](docs/decisions/ana/ana-34.md)** - Coordinator at project and workspace level (concluded, 2026-10-18)
 - **[ANA-33](docs/decisions/ana/ana-33.md)** - Step graphs v2 and divided fan-out (concluded, 2026-10-18)
