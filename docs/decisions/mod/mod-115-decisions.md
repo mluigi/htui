@@ -158,6 +158,15 @@ hidden. The `HANDOFF.md` phase 1 note summarises the milestone.
   Settings forms, the concepts search) still print a literal `Enter ..`, so after `[field]
   submit = "ctrl-t"` their hint row names `Enter`, not the key in force; those screens were
   never in the `FIXED` register, and they move to `Hint::One` with the same M3/M4 port.
+  Settings > Agents' pasting hint (`Enter sends · Esc cancels`, `settings/agents.rs`
+  `HINT_PASTING`) is one of them. Deferring these literal texts to M3/M4 awaits the
+  maintainer's confirmation (review RV4).
+  The choice hints that were literal arrows (`←/→ choose` on the item form, `←/→ resolution`
+  on the Runs close-out warning) use a new hint element, `Hint::Glyphs`: the first chord of
+  each side written as the header's chips write it (`KeyChord::short_label`), because the
+  existing `Pair` writes `Left/Right` and would have changed those hints and their snapshots.
+  Under the compiled keys they read as before; a rebound side shows its own chord
+  (`←/Ctrl+n choose`).
 - **D8 - existing key files keep loading:** MD4 above. Review RV1 H1: a version-1 entry never
   takes a chord from the rows M2 added for the keys a view kept before it (a text field's editing
   keys, a choice's value keys, the permission digits, the Requirements priority); the two share
@@ -165,7 +174,11 @@ hidden. The `HANDOFF.md` phase 1 note summarises the milestone.
   against the keys each view kept then: where the view kept the key, the file was refused
   before M2 and still is (`[backlog.filter_form] clear = ["left"]`); where it kept none, the
   choice, answer and priority keys step aside on that screen only, so `[confirm] yes =
-  ["space"]` still continues the Runs close-out warning.
+  ["space"]` still continues the Runs close-out warning. The same step-aside rule governs
+  dispatch (`Keys::actions` in `keys/stack.rs` calls it, an RV1 edit outside its planned file
+  set, as is `ui/tabs/backlog/mod.rs` passing the chord pressed to the filter and item forms),
+  and, since review RV4, the `?` box: it lists only what acts, so under that file the warning's
+  box reads `Space yes` and no longer also `Space toggle`.
 
 ## Commits
 
@@ -185,5 +198,6 @@ hidden. The `HANDOFF.md` phase 1 note summarises the milestone.
 - Task 7 (the list + detail tabs adopt the layout and route motion by focus) and Task 9 (snapshots
   and the full gate) had not landed on `e4f048c3`, the base of this record.
 - D-15's two maintainer calls: the shift-arrow order and the tab keys left out of `MODAL`.
-- D-13's field-key limit and the literal `Enter ..` hints outside RV1's sites, until M3/M4.
+- D-13's field-key limit and the literal `Enter ..` hints outside RV1's sites, until M3/M4; the
+  deferral of the literal hints awaits the maintainer's confirmation.
 - `R-TUI-18`: MOD-116/MOD-125. `R-TUI-10`'s Postgres-stored overrides: MOD-109.

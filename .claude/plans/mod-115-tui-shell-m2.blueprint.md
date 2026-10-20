@@ -587,6 +587,29 @@ with T5 serially.
   each needs its own act checked before it moves to `Hint::One` (not every `Enter` there is
   `field.submit`: `boxes.rs`'s "Enter breaks line" is the area's newline). `Esc ..` stays literal
   text (MD7). They close as M3/M4 port those screens onto the kit, with the limit above.
+  *RV4 (final review fix-up).*
+  - **`Hint::Glyphs` (new `Hint` variant, RV1 H2, `970ce776`).** `Pair` with each first
+    admitted chord written as the header chips write it (`KeyChord::short_label`), for the
+    item form's `←/→ choose` and the Runs close-out warning's `←/→ resolution`. `Pair` writes
+    `Left/Right` (`KeyChord::label`), so moving those two literal hints to `Pair` would have
+    changed their text and their snapshots; `Glyphs` reads as the literal did under the
+    compiled keys and names a rebound side's own chord (`←/Ctrl+n choose`). Pinned by
+    `keys::hint::tests::glyphs_pair_the_first_chords_as_the_chips_write_them`.
+  - **RV1's edits outside its file set.** `keys/stack.rs`: `Keys::actions` calls
+    `validate::v1_steps_aside` (RV1 repair 1, `24552af4`), so the step-aside judged at load also
+    governs dispatch; `ui/tabs/backlog/mod.rs`: `on_form_key` and `on_item_form_key` pass
+    `Ctx::pressed(&key)` to the filter and item forms' `on_pressed` (RV1 M, `ed5b3ec0`).
+  - **The `?` box follows the step-aside (RV4).** `Keys::help_lines` drops a kept row's chord
+    where `Keys::actions` no longer resolves the row (`Keys::stepped_aside`, version 1 only),
+    so the box lists what acts: under `[confirm] yes = ["space"]` the Runs close-out warning's
+    box reads `Confirm: Space yes`, no longer also `Choice: .. Space toggle`; the filter and
+    attachment forms still list `Space toggle`. Pinned by
+    `the_box_never_lists_a_row_that_steps_aside_under_a_version_1_file`. No snapshot changed
+    (the compiled keys are version 2).
+  - **Deferred, pending the maintainer's confirmation:** the literal hint texts outside the
+    former `FIXED` sites stay literal in M2 (the RV1 repair 2 list above, and Settings > Agents'
+    `HINT_PASTING` `Enter sends · Esc cancels` in `settings/agents.rs`), an M3/M4 item as those
+    screens port onto the kit.
 - **D-14 (Task 0 as built; inertness and the compiled defaults validating).** Recorded after T0 so Tasks 5 and 6
   refine what exists instead of writing it a second time.
   - *Shift arrows move to Task 6* (with D-4). `pane.next_subtab`/`prev_subtab`, `settings.next_section`/
