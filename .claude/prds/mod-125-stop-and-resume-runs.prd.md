@@ -121,7 +121,7 @@ Decisions taken at the PRD gate (maintainer, 2026-10-18):
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Stopped state and workspace gate | Runs and steps can be `stopped`; a run knows its workspace; a stopped workspace admits, claims and adopts nothing, on both stores | in-progress | `.claude/plans/mod-125-m1-stopped-state.plan.md` |
+| 1 | Stopped state and workspace gate | Runs and steps can be `stopped`; a run knows its workspace; a stopped workspace admits, claims and adopts nothing, on both stores | complete | `.claude/plans/mod-125-m1-stopped-state.plan.md` |
 | 2 | Stop applied by the executor | A durable stop request, graceful or forced, settles every run of the workspace as `stopped` with the conversation recorded, in process and on a worker | pending | — |
 | 3 | Resume through saved sessions | Resume reopens each agent step's session (ACP load/resume, CLI `--resume`), redoes a forced-stop turn, reruns checks, falls back to a fresh rerun with `resume_failed` | pending | — |
 | 4 | CLI verbs | `htui stop [--force] <workspace>` and `htui resume <workspace>` confirm, report what stopped and how each run resumes, and the workspace's state reads as stopping or stopped | pending | — |

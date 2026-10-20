@@ -4,7 +4,7 @@
 **Selected Milestone**: 1 — Stopped state and workspace gate
 **Complexity**: Large (a store seam over five implementors plus a migration; a mechanical fan-out of
 one new status and one new run column)
-**Status**: fact-checked 2026-10-18 (verified claims at the end). Awaiting CONFIRM.
+**Status**: complete 2026-10-20 (confirmed 2026-10-18; T1-T5 and review-fix round R1 landed on `hr/MOD-125`; rust-reviewer: approve with fixes, R1 applied, deferrals below).
 
 ## Summary
 
