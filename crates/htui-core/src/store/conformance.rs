@@ -22005,12 +22005,18 @@ async fn memory_supersede_replaces_in_one_step<S: WriteStore>(store: &S) {
         "The default branch is main.",
     )
     .await;
-    let n = memory_new(
-        CASE,
-        MemoryKind::Decision,
-        "Default branch",
-        "The default branch is trunk.",
-    );
+    // No box on the new entry where the old one has the fixture box: the old entry's
+    // `superseded` revision must take `new.box_id`, not its own (blueprint §1). One fixture
+    // user exists, so the author half cannot be told apart.
+    let n = NewMemoryEntry {
+        box_id: None,
+        ..memory_new(
+            CASE,
+            MemoryKind::Decision,
+            "Default branch",
+            "The default branch is trunk.",
+        )
+    };
     let n_id = n.id;
     let (old, new) = memory_superseded(
         CASE,
@@ -22078,7 +22084,7 @@ async fn memory_supersede_replaces_in_one_step<S: WriteStore>(store: &S) {
     );
     assert_eq!(
         (old_history[1].author_id, old_history[1].box_id),
-        (ids::USER, Some(ids::BOX)),
+        (ids::USER, None),
         "{CASE}: the new entry's author and box write the old entry's revision"
     );
     assert_eq!(
