@@ -252,7 +252,7 @@ cargo test --workspace --all-features --no-fail-fast -- --test-threads=1 2>&1 | 
 cargo insta test --workspace --all-features --check
 cargo test -p htui-store --all-features --test migrations --test connect
 HTUI_TEST_DATABASE_URL=postgres://postgres@localhost:5439/postgres cargo test -p htui-store --all-features --test pg_conformance
-cargo sqlx prepare --workspace -- --all-targets --all-features   # DATABASE_URL = scratch DB migrated to 0020; then check SQLX_OFFLINE build
+(cd crates/htui-store && DATABASE_URL=postgres://postgres@localhost:5439/prep137 cargo sqlx prepare --check -- --all-targets --all-features)
 bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 ```
 
@@ -279,6 +279,15 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 - [ ] Re-override works; the owed note at `graph.rs:458-461` is gone
 - [ ] Engine behaviour unchanged (full workspace gate green, no snapshot churn)
 - [ ] Validation block passes; validator green
+
+## Amendments from the blueprint (2026-10-21)
+
+The blueprint's §0 (F1–F14) corrects or extends the fact-checked plan without reopening a decision:
+`clear_setting` on the Phase rung also bumps `revision` (D5); 14 real `StepGraphPhase {` literals, not 22;
+`cargo sqlx prepare` runs inside `crates/htui-store`, never `--workspace`; "previous" in D9 is previous in
+position order (gaps exist); `default_edges` takes an id-minting closure; T5 touches only `graph.rs`; Pg
+decides refusal wording before writing rather than mapping commit-time errors; one extra trait read
+`graph_body(graph)`. The blueprint is authoritative where they differ.
 
 ## Verified claims
 
