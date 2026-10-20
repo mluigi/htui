@@ -35,6 +35,8 @@ pub mod filter;
 pub mod item_form;
 pub mod list;
 
+use std::cell::Cell;
+
 use htui_core::model::{ItemId, ItemKindId, ItemSummary, ProjectId, RunId, Scope, Status, StepId};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -187,6 +189,10 @@ pub struct BacklogTab {
     /// MOD-12 D9: the item write in flight and its key, for the status line its answer sets.
     /// Kept apart from `queue_intent`, so the answer never wipes a toggle pressed since.
     queue_writing: Option<(ItemId, String)>,
+    /// MOD-115 M2 §7 (T7 repair 2): whether the last frame drew the detail pane. A zoom that
+    /// hides it leaves the Runs flow's hit-test canvas where it was last drawn, so the mouse is
+    /// declined until the pane is on screen again (`wants_mouse`).
+    detail_drawn: Cell<bool>,
 }
 
 /// What `N` or `e` asked for, so only the answer to it opens a form (blueprint E8): a tab's
@@ -248,6 +254,7 @@ impl BacklogTab {
             opening: None,
             queue_intent: None,
             queue_writing: None,
+            detail_drawn: Cell::new(true),
         }
     }
 
@@ -777,15 +784,19 @@ impl Tab for BacklogTab {
 
     /// MOD-71 D1: the mouse is wanted while the detail pane is on screen with nothing typed over
     /// it — no filter form, no item form (which replaces the pane, and its divergence view the
-    /// whole tab, `render`) — and its active sub-tab wants it.
+    /// whole tab, `render`) — and its active sub-tab wants it. MOD-115 M2 §7: not while a zoom
+    /// hides the pane, so the wheel there is the list's motion (MD8).
     fn wants_mouse(&self) -> bool {
-        self.form.is_none() && self.item_form.is_none() && self.detail.wants_mouse()
+        self.form.is_none()
+            && self.item_form.is_none()
+            && self.detail_drawn.get()
+            && self.detail.wants_mouse()
     }
 
-    /// MOD-71 D4: to the detail pane, under `wants_mouse`'s form guard; the registry checks the
-    /// sub-tab's own answer. The list takes no mouse event.
+    /// MOD-71 D4: to the detail pane, under `wants_mouse`'s form and hidden-pane guards; the
+    /// registry checks the sub-tab's own answer. The list takes no mouse event.
     fn on_mouse(&mut self, mouse: MouseEvent, ctx: &mut Ctx<'_>) -> Handled {
-        if self.form.is_some() || self.item_form.is_some() {
+        if self.form.is_some() || self.item_form.is_some() || !self.detail_drawn.get() {
             return Handled::Pass;
         }
         self.detail.on_mouse(mouse, ctx)
@@ -1111,6 +1122,8 @@ impl Tab for BacklogTab {
                 ctx,
             ),
         }
+        self.detail_drawn
+            .set(self.item_form.is_none() && !detail_area.is_empty());
     }
 
     /// MOD-115 M2 D2: a list and a detail, today's 55/45 by default.

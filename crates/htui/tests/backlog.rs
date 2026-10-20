@@ -17,6 +17,7 @@ use htui::run_worker::{self, LiveChats, RunRuntime, StepAuthor};
 use htui::store_worker::StoreRequest;
 use htui::testkit::Harness;
 use htui::ui::tabs::backlog::BacklogTab;
+use htui::ui::tabs::registry::Tab;
 use htui_agent::conformance::{Script, ScriptEvent};
 use htui_agent::event::{DoneEvent, DriverEvent, StopReason};
 use htui_agent::fake::FakeAdapter;
@@ -1202,6 +1203,43 @@ async fn a_lost_capture_ends_the_flow_s_pan_end_to_end() {
         cell_of(&after, "0.1/0 done"),
         (column + 2, row + 1),
         "a bare drag pans nothing:\n{after}"
+    );
+}
+
+/// MOD-115 M2 §7, MD8 (T7 repair 2): with the list zoomed the flow is off screen, so a click on
+/// the list where the flow was last drawn moves no step cursor, and the wheel there is the list's
+/// motion, not the hidden graph's zoom.
+#[tokio::test]
+async fn a_click_on_the_zoomed_list_misses_the_hidden_flow() {
+    let mut harness = backlog().await;
+    sub_tab(&mut harness, 1);
+    harness.key("v");
+    harness.drive_to_end().await;
+    let (column, row) = cell_of(&harness.render(), "0.1/1 superseded");
+    harness.key("z");
+    let zoomed = harness.render();
+    assert!(
+        !zoomed.contains("0.1/1 superseded"),
+        "the list is zoomed and the flow hidden:\n{zoomed}"
+    );
+    assert!(
+        !harness.app().tabs.active().is_some_and(Tab::wants_mouse),
+        "the hidden flow wants no mouse"
+    );
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), column, row);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), column, row);
+
+    harness.key("z");
+    harness.key("v");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(
+        listed(&frame, "0.1/0").contains('\u{25b8}'),
+        "the cursor stayed on the first candidate:\n{frame}"
+    );
+    assert!(
+        !listed(&frame, "0.1/1").contains('\u{25b8}'),
+        "the click reached no hidden step:\n{frame}"
     );
 }
 
