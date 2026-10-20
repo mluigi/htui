@@ -29,6 +29,10 @@ pub enum Hint {
     /// `"{label}/{label} {text}"`, e.g. `j/k rows`; one side unbound renders the other alone,
     /// and an empty `text` renders the labels alone (`j/k`).
     Pair(Act, Act, &'static str),
+    /// [`Pair`](Self::Pair), each label as the header's chips write it
+    /// ([`KeyChord::short_label`]: an arrow is `←→↑↓`): a choice's `←/→ choose` (MOD-115 M2 RV1
+    /// H2), which reads as the literal hint did until a side moves.
+    Glyphs(Act, Act, &'static str),
     /// Every admitted chord of the act, joined by `/`, then `text`: `n/Esc cancel` (MOD-67 D9).
     All(Act, &'static str),
     /// The act's first two admitted chords, joined by `/`, then `text`: a toggle such as
@@ -131,6 +135,16 @@ impl Keys {
             .find(|chord| self.actions(stack, *chord).first() == Some(&act))
     }
 
+    /// The first chord of `act` through `stack` that its layer admits: what [`label`](Self::label)
+    /// writes, as a chord.
+    fn first_chord(&self, stack: Stack<'_>, act: Act) -> Option<KeyChord> {
+        let (layer, row) = self.resolve_row(stack, act)?;
+        row.chords
+            .iter()
+            .copied()
+            .find(|chord| layer.admits_chord(*chord))
+    }
+
     /// Every chord of `act` through `stack` that its layer admits, as labels (MOD-67 D9).
     #[must_use]
     pub fn labels(&self, stack: Stack<'_>, act: Act) -> Vec<String> {
@@ -162,6 +176,14 @@ impl Keys {
                     .collect(),
                 text,
             ),
+            Hint::Glyphs(first, second, text) => labelled(
+                [first, second]
+                    .into_iter()
+                    .filter_map(|act| self.first_chord(stack, act))
+                    .map(|chord| chord.short_label())
+                    .collect(),
+                text,
+            ),
             Hint::Two(act, text) => {
                 labelled(self.labels(stack, act).into_iter().take(2).collect(), text)
             }
@@ -169,13 +191,7 @@ impl Keys {
             Hint::Many(acts, text) => {
                 let chords: Vec<KeyChord> = acts
                     .iter()
-                    .filter_map(|&act| {
-                        let (layer, row) = self.resolve_row(stack, act)?;
-                        row.chords
-                            .iter()
-                            .copied()
-                            .find(|chord| layer.admits_chord(*chord))
-                    })
+                    .filter_map(|&act| self.first_chord(stack, act))
                     .collect();
                 (!chords.is_empty()).then(|| with_text(&chord_list(&chords), text))
             }
@@ -469,6 +485,30 @@ mod tests {
             .with_chords(Context::Answer, Act::AnswerOption2, &[])
             .with_chords(Context::Answer, Act::AnswerOption3, &[]);
         assert_eq!(none.hint(views::CHAT_LIVE, spec), "end");
+    }
+
+    /// MOD-115 M2 RV1 H2: `Glyphs` is `Pair` with the header chips' labels, so a choice's arrows
+    /// read `←/→` as the literal hints did, and a rebound side shows its own chord; one side
+    /// unbound renders the other alone, both unbound drop the element.
+    #[test]
+    fn glyphs_pair_the_first_chords_as_the_chips_write_them() {
+        let spec = &[
+            Hint::Glyphs(Act::ChoicePrev, Act::ChoiceNext, "choose"),
+            Hint::Text("end"),
+        ];
+        assert_eq!(
+            Keys::compiled().hint(views::ITEM_FORM, spec),
+            "\u{2190}/\u{2192} choose · end"
+        );
+        let moved = Keys::defaults().with_chords(Context::Choice, Act::ChoiceNext, &["ctrl-n"]);
+        assert_eq!(
+            moved.hint(views::ITEM_FORM, spec),
+            "\u{2190}/Ctrl+n choose · end"
+        );
+        let one = Keys::defaults().with_chords(Context::Choice, Act::ChoicePrev, &[]);
+        assert_eq!(one.hint(views::ITEM_FORM, spec), "\u{2192} choose · end");
+        let none = one.with_chords(Context::Choice, Act::ChoiceNext, &[]);
+        assert_eq!(none.hint(views::ITEM_FORM, spec), "end");
     }
 
     #[test]

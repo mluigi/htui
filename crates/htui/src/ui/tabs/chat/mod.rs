@@ -70,8 +70,9 @@ const REPLAY_HINT: HintSpec = &[
     Hint::Pair(Act::ListDown, Act::ListUp, "scroll"),
 ];
 
-/// The open composer's keys (`CAPTURE`): its own, fixed (ANA-26 §6.1).
-const COMPOSE_HINT: HintSpec = &[Hint::Text("Enter send"), Hint::Text("Esc leave")];
+/// The open composer's keys (`CAPTURE`): `field.submit` through the keys in force (MOD-115 M2
+/// RV1 H2), `Esc` as written (MD7).
+const COMPOSE_HINT: HintSpec = &[Hint::One(Act::FieldSubmit, "send"), Hint::Text("Esc leave")];
 
 /// A parked permission request (`CHAT_LIVE`): the digits are `answer.option_*` (MOD-115 M2 D7).
 const PARKED_HINT: HintSpec = &[
@@ -1134,6 +1135,24 @@ mod tests {
         }
         assert!(shell.emit.is_empty(), "a replay sends nothing");
         assert!(tab.replay().is_some(), "and is still open");
+    }
+
+    /// MOD-115 M2 RV1 H2: the open composer's hint names the submit key in force (`Enter` under
+    /// the compiled keys); `Esc` is written as is (MD7).
+    #[test]
+    fn the_compose_hint_names_the_submit_key_in_force() {
+        let mut shell = Shell::new();
+        let mut tab = live(&shell);
+        tab.on_key(KeyEvent::from(KeyCode::Char('i')), &mut shell.ctx());
+        assert!(tab.composer.is_active(), "`i` opens the composer");
+        assert_eq!(tab.stack(), views::CAPTURE);
+        assert_eq!(
+            tab.hint_text(Keys::compiled()),
+            "Enter send \u{b7} Esc leave"
+        );
+        shell.keys = crate::keys::load_str("version = 2\n[field]\nsubmit = \"ctrl-t\"\n")
+            .expect("the keys load");
+        assert_eq!(tab.hint_text(&shell.keys), "Ctrl+t send \u{b7} Esc leave");
     }
 
     /// MOD-115 M2 D7: a parked request answers on `answer.option_*`: a rebound option answers,

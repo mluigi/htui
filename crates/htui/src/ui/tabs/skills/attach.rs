@@ -86,10 +86,11 @@ const BROWSE_HINT: HintSpec = &[
     Hint::One(Act::Back, "back"),
 ];
 
-/// The hint row on the form: `Space` is the activation's own key, `Esc` the form's.
+/// The hint row on the form: `choice.toggle` (`Space`) cycles the activation (MOD-115 M2 RV1
+/// H2: named through the keys in force); `Esc` is the form's, written as is (MD7).
 const FORM_HINT: HintSpec = &[
     Hint::All(Act::FormNextField, "field"),
-    Hint::Text("Space activation"),
+    Hint::One(Act::ChoiceToggle, "activation"),
     Hint::One(Act::AttachRepo, "repo"),
     Hint::One(Act::FormSave, "save"),
     Hint::Text("Esc cancel"),
@@ -1271,6 +1272,19 @@ mod tests {
         let outcome = activation_key(&mut form, event("space"), &keys, views::ATTACH_FORM);
         assert_eq!(outcome, FieldOutcome::Pass, "Space is no toggle now");
         assert_eq!(form.activation, Activation::Off);
+        // RV1 H2: the form's hint names the toggle in force.
+        let hint = |keys: &Keys| keys.hint(views::ATTACH_FORM, FORM_HINT);
+        assert!(
+            hint(compiled).contains(" \u{b7} Space activation \u{b7} "),
+            "{}",
+            hint(compiled)
+        );
+        assert!(
+            hint(&keys).contains(" \u{b7} Ctrl+t activation \u{b7} "),
+            "{}",
+            hint(&keys)
+        );
+        assert!(!hint(&keys).contains("Space"), "{}", hint(&keys));
         for (spec, expected) in [
             ("enter", FieldOutcome::Submit),
             ("esc", FieldOutcome::Cancel),

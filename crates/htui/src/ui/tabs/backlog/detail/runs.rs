@@ -145,10 +145,11 @@ const CONFIRM_CANCEL_HINT: HintSpec = &[
 /// What the close-out says while it counts.
 const COUNTING_HINT: HintSpec = &[Hint::Text("counting what the close-out writes\u{2026}")];
 
-/// The close-out warning's hint: the resolution's fixed value keys, then its answers
-/// (`←/→ resolution · y continue · n cancel` under the defaults).
+/// The close-out warning's hint: the resolution's `choice.prev`/`next`, then its answers
+/// (`←/→ resolution · y continue · n cancel` under the defaults; MOD-115 M2 RV1 H2: the keys
+/// in force).
 const WARN_HINT: HintSpec = &[
-    Hint::Text("←/→ resolution"),
+    Hint::Glyphs(Act::ChoicePrev, Act::ChoiceNext, "resolution"),
     Hint::One(Act::ConfirmYes, "continue"),
     Hint::One(Act::ConfirmNo, "cancel"),
 ];
@@ -176,14 +177,24 @@ const RUNS_EMPTY_HINT: HintSpec = &[
     Hint::One(Act::Help, "keys"),
 ];
 
-/// The rejection note's hint: the field's own keys.
-const REJECT_HINT: HintSpec = &[Hint::Text("Enter reject"), Hint::Text("Esc cancel")];
+/// The rejection note's hint: the field's own keys, `field.submit` through the keys in force
+/// (MOD-115 M2 RV1 H2) and `Esc` as written (MD7).
+const REJECT_HINT: HintSpec = &[
+    Hint::One(Act::FieldSubmit, "reject"),
+    Hint::Text("Esc cancel"),
+];
 
-/// The follow-up input's hint: the field's own keys.
-const FOLLOW_UP_HINT: HintSpec = &[Hint::Text("Enter send"), Hint::Text("Esc cancel")];
+/// The follow-up input's hint: the field's own keys, as [`REJECT_HINT`].
+const FOLLOW_UP_HINT: HintSpec = &[
+    Hint::One(Act::FieldSubmit, "send"),
+    Hint::Text("Esc cancel"),
+];
 
-/// The close-out's typed stage's hint: the field's own keys.
-const TYPED_HINT: HintSpec = &[Hint::Text("Enter close"), Hint::Text("Esc cancel")];
+/// The close-out's typed stage's hint: the field's own keys, as [`REJECT_HINT`].
+const TYPED_HINT: HintSpec = &[
+    Hint::One(Act::FieldSubmit, "close"),
+    Hint::Text("Esc cancel"),
+];
 
 /// What the close-out says while its command is in flight.
 const IN_FLIGHT_HINT: HintSpec = &[Hint::Text("closing\u{2026}")];
@@ -5650,6 +5661,14 @@ mod tests {
         shell.keys = crate::keys::load_str("version = 2\n[answer]\noption_2 = \"f8\"\n")
             .expect("the keys load");
         let (mut pane, pending) = asking(&shell).await;
+        // RV1 H2: the request's options name the answers in force.
+        let [_, options] = permission_lines(&pending, &shell.keys, &Theme::default());
+        let options = text(&options);
+        assert!(
+            options.contains("[1] Allow once") && options.contains("[F8] Reject once"),
+            "{options:?}"
+        );
+        assert!(!options.contains("[2]"), "{options:?}");
         assert_eq!(
             pane.on_key(key(KeyCode::Char('2')), &mut shell.ctx()),
             Handled::Pass
@@ -5670,6 +5689,28 @@ mod tests {
         );
     }
 
+    /// MOD-115 M2 RV1 H2: the rejection note, the follow-up and the close-out's typed stage name
+    /// the submit key in force (`Enter` under the compiled keys); `Esc` is written as is (MD7).
+    #[test]
+    fn the_field_hints_name_the_submit_key_in_force() {
+        let keys = crate::keys::load_str("version = 2\n[field]\nsubmit = \"ctrl-t\"\n")
+            .expect("the keys load");
+        for (spec, verb) in [
+            (REJECT_HINT, "reject"),
+            (FOLLOW_UP_HINT, "send"),
+            (TYPED_HINT, "close"),
+        ] {
+            assert_eq!(
+                Keys::compiled().hint(views::CAPTURE, spec),
+                format!("Enter {verb} \u{b7} Esc cancel")
+            );
+            assert_eq!(
+                keys.hint(views::CAPTURE, spec),
+                format!("Ctrl+t {verb} \u{b7} Esc cancel")
+            );
+        }
+    }
+
     /// MOD-115 M2 D7: the close-out warning's resolution keys are the `[choice]` rows: a rebound
     /// one cycles the resolution, the old letter no longer does.
     #[tokio::test]
@@ -5678,6 +5719,15 @@ mod tests {
         shell.keys = crate::keys::load_str("version = 2\n[choice]\nnext = \"ctrl-n\"\n")
             .expect("the keys load");
         let mut pane = warned(&shell).await;
+        // RV1 H2: the warning's hint names the resolution keys in force.
+        assert_eq!(
+            shell.keys.hint(pane.stack(), pane.hint_spec()),
+            "\u{2190}/Ctrl+n resolution \u{b7} y continue \u{b7} n cancel"
+        );
+        assert_eq!(
+            Keys::compiled().hint(pane.stack(), pane.hint_spec()),
+            "\u{2190}/\u{2192} resolution \u{b7} y continue \u{b7} n cancel"
+        );
         let before = footer(&pane);
         pane.on_key(key(KeyCode::Char('l')), &mut shell.ctx());
         assert_eq!(footer(&pane), before, "`l` is no resolution key now");
