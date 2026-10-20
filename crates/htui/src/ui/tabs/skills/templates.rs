@@ -33,8 +33,7 @@ use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::{READ_NAME, REQUEST_NAMES, TemplateBody, TemplatesSnapshot};
 use crate::ui::cells::{self, cell_width};
-use crate::ui::shell::PaneId;
-use crate::ui::tabs::backlog::detail::{Scroll, Step};
+use crate::ui::tabs::backlog::detail::{Scroll, Step, capture_area};
 use crate::ui::tabs::settings::{modal_rest, wrapped};
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme, diff};
 use crossterm::event::KeyEvent;
@@ -618,6 +617,10 @@ impl TemplatesView {
     /// Browse (plan D13; MOD-67 M4, blueprint §6.1): the first candidate through
     /// [`views::TEMPLATES_BROWSE`] this view acts on; a global act is the shell's. The tab took
     /// `skills.switch_view` first.
+    ///
+    /// MOD-115 M2 §7: only motion follows the focus ([`Step::by_focus`]): the tree's cursor
+    /// with the tree focused, the pane's scroll with the pane focused, nothing with the activity
+    /// pane focused. Every other act acts whatever pane is focused.
     fn on_browse_key(
         &mut self,
         key: KeyEvent,
@@ -625,15 +628,9 @@ impl TemplatesView {
         ctx: &mut Ctx<'_>,
     ) -> Handled {
         let chord = KeyChord::from_event(key);
-        // MOD-115 M2 §7: only motion follows the focus: the tree's cursor with the tree
-        // focused, the pane's scroll with the pane focused, nothing with the activity pane
-        // focused. Every other act acts whatever pane is focused.
-        let focus = ctx.focus();
+        let (focus, rows) = (ctx.focus(), self.pane_rows.get());
         for act in ctx.keys().actions(stack, chord) {
-            if let (Some(step), false) = (Step::of(act), focus == PaneId::List) {
-                if focus == PaneId::Detail {
-                    return self.scroll.follow(step, self.pane_rows.get());
-                }
+            if Step::by_focus(act, focus, |step| self.scroll.follow(step, rows)) {
                 return Handled::Consumed;
             }
             match act {
@@ -1186,12 +1183,8 @@ impl TemplatesView {
         let areas = ctx.split(area, super::library::LAYOUT);
         // T7 repair: the name prompt takes every key, so with another pane zoomed the pane is
         // drawn over the zoomed one rather than into its own empty rect.
-        let (list_area, pane_area) =
-            if areas.detail.is_empty() && !matches!(self.mode, Mode::Browse) {
-                (Rect::default(), area)
-            } else {
-                (areas.list.unwrap_or_default(), areas.detail)
-            };
+        let (list_area, pane_area) = capture_area(&areas, area, !matches!(self.mode, Mode::Browse));
+        let list_area = list_area.unwrap_or_default();
 
         let list = Block::new().borders(Borders::ALL).title(" Templates ");
         let inner = list.inner(list_area);

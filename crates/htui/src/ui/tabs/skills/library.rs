@@ -46,8 +46,8 @@ use crate::skills::{READ_NAME, REQUEST_NAMES, SkillWrite, SkillsSnapshot, StaleW
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::TemplateBody;
 use crate::ui::cells::{self, cell_width};
-use crate::ui::shell::{ListSize, PaneId, TabLayout};
-use crate::ui::tabs::backlog::detail::{Scroll, Step};
+use crate::ui::shell::{ListSize, TabLayout};
+use crate::ui::tabs::backlog::detail::{Scroll, Step, capture_area};
 use crate::ui::tabs::settings::{modal_rest, wrapped};
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme, diff};
 use crossterm::event::KeyEvent;
@@ -835,12 +835,9 @@ impl LibraryView {
     /// pane is focused.
     fn on_browse_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let chord = KeyChord::from_event(key);
-        let focus = ctx.focus();
+        let (focus, rows) = (ctx.focus(), self.pane_rows.get());
         for act in ctx.keys().actions(views::LIBRARY_BROWSE, chord) {
-            if let (Some(step), false) = (Step::of(act), focus == PaneId::List) {
-                if focus == PaneId::Detail {
-                    return self.scroll.follow(step, self.pane_rows.get());
-                }
+            if Step::by_focus(act, focus, |step| self.scroll.follow(step, rows)) {
                 return Handled::Consumed;
             }
             match act {
@@ -1747,12 +1744,8 @@ impl LibraryView {
         let areas = ctx.split(area, LAYOUT);
         // T7 repair: a prompt or the rename form takes every key, so with another pane zoomed
         // the pane is drawn over the zoomed one rather than into its own empty rect.
-        let (list_area, pane_area) =
-            if areas.detail.is_empty() && !matches!(self.mode, Mode::Browse) {
-                (Rect::default(), area)
-            } else {
-                (areas.list.unwrap_or_default(), areas.detail)
-            };
+        let (list_area, pane_area) = capture_area(&areas, area, !matches!(self.mode, Mode::Browse));
+        let list_area = list_area.unwrap_or_default();
 
         let list = Block::new().borders(Borders::ALL).title(" Skills ");
         let inner = list.inner(list_area);

@@ -31,6 +31,7 @@ use crate::editor::ExternalEditOutcome;
 use crate::keys::{Act, Keys, Stack, views};
 use crate::store_worker::StoreReply;
 use crate::ui::Theme;
+use crate::ui::shell::{PaneAreas, PaneId};
 use crossterm::event::{KeyEvent, MouseEvent};
 
 pub use body::BodyTab;
@@ -488,6 +489,34 @@ impl Step {
             Self::Bottom => isize::MAX,
         }
     }
+
+    /// MOD-115 M2 §7, the one rule every list + detail tab routes motion by: only motion
+    /// follows the focus. Whether the motion was taken away from the list: `false` when `act`
+    /// is no list motion or the list is focused, so the tab's own arms take it; with the detail
+    /// focused `detail` takes the step, and whatever it answers the motion is taken (a pane at
+    /// its end does not hand the key back); with the activity pane focused nothing moves.
+    pub fn by_focus(act: Act, focus: PaneId, detail: impl FnOnce(Self) -> Handled) -> bool {
+        let Some(step) = Self::of(act).filter(|_| focus != PaneId::List) else {
+            return false;
+        };
+        if focus == PaneId::Detail {
+            let _ = detail(step);
+        }
+        true
+    }
+}
+
+/// MOD-115 M2 §7 (T7 repair): where a list + detail tab draws its list and its detail. While
+/// what the detail shows takes every key (`capturing`: a form, a prompt, a compose area) and
+/// another pane is zoomed, so the detail's rect is empty, the detail takes the whole `area` and
+/// the list nothing: what is typed is on screen. Otherwise the panes the layout gave.
+#[must_use]
+pub fn capture_area(areas: &PaneAreas, area: Rect, capturing: bool) -> (Option<Rect>, Rect) {
+    if areas.detail.is_empty() && capturing {
+        (None, area)
+    } else {
+        (areas.list, areas.detail)
+    }
 }
 
 /// Vertical scroll shared by every sub-tab.
@@ -565,6 +594,60 @@ mod tests {
     use crate::app::{Ctx, Handled};
     use crate::keys::{Act, Stack, views};
     use crate::store_worker::StoreReply;
+    use crate::ui::shell::{PaneAreas, PaneId};
+
+    /// MOD-115 M2 §7 (RV3): only motion follows the focus. A list motion with the list focused,
+    /// or any other act, is the tab's own; with the detail focused the detail takes the step,
+    /// and the motion is taken even when the detail declines it; with the activity pane focused
+    /// it is taken and nothing moves.
+    #[test]
+    fn by_focus_routes_only_motion_away_from_the_list() {
+        let never = |_: Step| -> Handled { panic!("the detail is not asked") };
+        assert!(!Step::by_focus(Act::ListDown, PaneId::List, never));
+        assert!(!Step::by_focus(Act::Edit, PaneId::Detail, never));
+        assert!(!Step::by_focus(Act::ListFold, PaneId::Activity, never));
+        let mut seen = None;
+        let taken = Step::by_focus(Act::ListBottom, PaneId::Detail, |step| {
+            seen = Some(step);
+            Handled::Pass
+        });
+        assert_eq!((taken, seen), (true, Some(Step::Bottom)));
+        assert!(Step::by_focus(Act::ListUp, PaneId::Activity, never));
+    }
+
+    /// MOD-115 M2 §7 (RV3): a detail that takes every key gets the whole area only while another
+    /// pane is zoomed; otherwise each pane keeps the rect the layout gave it.
+    #[test]
+    fn capture_area_gives_a_capturing_detail_the_area_only_when_zoomed_away() {
+        let area = Rect::new(0, 0, 100, 30);
+        let list = Rect::new(0, 0, 55, 30);
+        let detail = Rect::new(55, 0, 45, 30);
+        let shown = PaneAreas {
+            list: Some(list),
+            detail,
+            activity: None,
+            list_hidden: None,
+            activity_hidden: None,
+        };
+        assert_eq!(
+            super::capture_area(&shown, area, true),
+            (Some(list), detail)
+        );
+        assert_eq!(
+            super::capture_area(&shown, area, false),
+            (Some(list), detail)
+        );
+        let zoomed = PaneAreas {
+            list: Some(area),
+            detail: Rect::default(),
+            ..shown
+        };
+        assert_eq!(
+            super::capture_area(&zoomed, area, false),
+            (Some(area), Rect::default())
+        );
+        assert_eq!(super::capture_area(&zoomed, area, true), (None, area));
+    }
 
     /// `Scroll::apply`, the pane scroll's one entry (MOD-67 M5 dropped the key-matching
     /// `on_key`): a row or a page per act, clamped to the last row; any other act passes.

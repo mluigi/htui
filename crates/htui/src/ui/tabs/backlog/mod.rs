@@ -48,10 +48,10 @@ use crate::item_writes::{self, ItemDivergence, ItemFormContext, ItemWrite};
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{QUEUE_REQUEST_NAMES, QueueView, QueueWrite, StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
-use crate::ui::shell::{ListSize, PaneId, Panes, TabLayout, TabLoc};
+use crate::ui::shell::{ListSize, PaneAreas, PaneId, Panes, TabLayout, TabLoc};
 use crate::ui::tabs::backlog::detail::{
     BodyTab, DetailId, DetailRegistry, DocumentsTab, GraphTab, NotesTab, PromptTab, ReqsTab,
-    RunsTab, Step,
+    RunsTab, Step, capture_area,
 };
 use crate::ui::tabs::backlog::filter::{BacklogFilter, FilterForm, FormOutcome};
 use crate::ui::tabs::backlog::item_form::{
@@ -226,6 +226,46 @@ impl BacklogTab {
             return None;
         }
         Some(keys.hint(self.detail.key_stack(), LIST_HINT)).filter(|hint| !hint.is_empty())
+    }
+
+    /// Where the list, the detail and the open filter form are drawn this frame, from the panes
+    /// the shell's layout gave the tab (`areas`) over the tab's whole `area`.
+    ///
+    /// MOD-13 D1: the open form takes the bottom of the list pane; with the list hidden, the
+    /// bottom of the detail's, or of the whole area while the activity pane is zoomed (T7
+    /// repair), so a form that captures every key is never off screen. MOD-13 milestone 2 D8:
+    /// the open item form takes the detail pane's place, or the whole area while another pane is
+    /// zoomed ([`capture_area`]); so does a sub-tab that captures every key, a compose area or a
+    /// picker (T7 repair).
+    fn body_areas(&self, area: Rect, areas: PaneAreas) -> (Option<Rect>, Rect, Option<Rect>) {
+        let below = |host: Rect| -> (Rect, Rect) {
+            Layout::vertical([Constraint::Min(0), Constraint::Length(filter::FORM_HEIGHT)])
+                .areas::<2>(host)
+                .into()
+        };
+        let (list, detail, form) = match (self.form.is_some(), areas.list) {
+            (true, Some(list)) => {
+                let (list, form) = below(list);
+                (Some(list), areas.detail, Some(form))
+            }
+            (true, None) if areas.detail.is_empty() => (None, areas.detail, Some(below(area).1)),
+            (true, None) => {
+                let (detail, form) = below(areas.detail);
+                (None, detail, Some(form))
+            }
+            (false, list) => (list, areas.detail, None),
+        };
+        let capturing = self.item_form.is_some() || self.detail.captures_input();
+        let (list, detail) = capture_area(
+            &PaneAreas {
+                list,
+                detail,
+                ..areas
+            },
+            area,
+            capturing,
+        );
+        (list, detail, form)
     }
 
     /// A Backlog tab with the seven detail sub-tabs registered, in blueprint order; Reqs is
@@ -846,10 +886,7 @@ impl Tab for BacklogTab {
             return Handled::Consumed;
         }
         for act in acts {
-            if let (Some(step), false) = (Step::of(act), focus == PaneId::List) {
-                if focus == PaneId::Detail {
-                    let _ = self.detail.step(step, ctx);
-                }
+            if Step::by_focus(act, focus, |step| self.detail.step(step, ctx)) {
                 return Handled::Consumed;
             }
             match act {
@@ -1065,29 +1102,8 @@ impl Tab for BacklogTab {
         }
         // MOD-115 M2 B5: the panes the shell's layout gives the tab, claimed for the focus
         // borders, the hints and the mouse; today's 55/45 split by default.
-        let areas = ctx.split(area, BACKLOG_LAYOUT);
-        let below = |host: Rect| {
-            let [rest, form] =
-                Layout::vertical([Constraint::Min(0), Constraint::Length(filter::FORM_HEIGHT)])
-                    .areas(host);
-            (rest, form)
-        };
-        // MOD-13 D1: the open form takes the bottom of the list pane; with the list hidden, the
-        // bottom of the detail's, or of the whole area while the activity pane is zoomed (T7
-        // repair), so a form that captures every key is never off screen.
-        let (list_area, detail_area, form_area) = match (self.form.is_some(), areas.list) {
-            (true, Some(list)) => {
-                let (list, form) = below(list);
-                (Some(list), areas.detail, Some(form))
-            }
-            (true, None) if areas.detail.is_empty() => (None, areas.detail, Some(below(area).1)),
-            (true, None) => {
-                let (detail, form) = below(areas.detail);
-                (None, detail, Some(form))
-            }
-            (false, list) => (list, areas.detail, None),
-        };
-
+        let (list_area, detail_area, form_area) =
+            self.body_areas(area, ctx.split(area, BACKLOG_LAYOUT));
         // MOD-13 review M1: the filter the rows were read under, not the one still in flight.
         let summary = self.shown.summary(ctx.projects);
         let view = ListView {
@@ -1096,15 +1112,6 @@ impl Tab for BacklogTab {
             folded: &self.folded,
             selected: self.selected,
             filter: summary.as_deref(),
-        };
-        // MOD-13 milestone 2 D8: the open item form takes the detail pane's place, or the whole
-        // area while another pane is zoomed, so a form that captures every key is on screen; so
-        // does a sub-tab that captures every key, a compose area or a picker (T7 repair).
-        let capturing = self.item_form.is_some() || self.detail.captures_input();
-        let (list_area, detail_area) = if detail_area.is_empty() && capturing {
-            (None, area)
-        } else {
-            (list_area, detail_area)
         };
         if let Some(list_area) = list_area {
             list::render(frame, list_area, &view, ctx.theme);

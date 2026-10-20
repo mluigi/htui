@@ -47,7 +47,7 @@ use crate::requirements::{
 };
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::shell::{ListSize, PaneId, Panes, TabLayout, TabLoc};
-use crate::ui::tabs::backlog::detail::{Scroll, Step};
+use crate::ui::tabs::backlog::detail::{Scroll, Step, capture_area};
 use crate::ui::tabs::backlog::list::window;
 use crate::ui::tabs::registry::{CLOSE_THE_FIELD_FIRST, Tab, TabId};
 use crate::ui::tabs::settings::{modal_rest, wrapped};
@@ -496,12 +496,9 @@ impl RequirementsTab {
     /// moves. Every other act acts whatever pane is focused.
     fn on_browse_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
         let chord = KeyChord::from_event(key);
-        let focus = ctx.focus();
+        let (focus, rows) = (ctx.focus(), self.pane_rows.get());
         for act in ctx.keys().actions(views::REQUIREMENTS_BROWSE, chord) {
-            if let (Some(step), false) = (Step::of(act), focus == PaneId::List) {
-                if focus == PaneId::Detail {
-                    return self.scroll.follow(step, self.pane_rows.get());
-                }
+            if Step::by_focus(act, focus, |step| self.scroll.follow(step, rows)) {
                 return Handled::Consumed;
             }
             match act {
@@ -1353,15 +1350,12 @@ impl Tab for RequirementsTab {
         let areas = ctx.split(content, REQUIREMENTS_LAYOUT);
         // T7 repair: a form takes every key, so with another pane zoomed it is drawn over the
         // zoomed one rather than into the detail's empty rect.
-        if areas.detail.is_empty() && self.form_open() {
-            self.render_detail(frame, content, ctx);
-        } else {
-            if let Some(tree) = areas.list {
-                self.render_tree(frame, tree, ctx);
-            }
-            if !areas.detail.is_empty() {
-                self.render_detail(frame, areas.detail, ctx);
-            }
+        let (tree, detail) = capture_area(&areas, content, self.form_open());
+        if let Some(tree) = tree {
+            self.render_tree(frame, tree, ctx);
+        }
+        if !detail.is_empty() {
+            self.render_detail(frame, detail, ctx);
         }
         frame.render_widget(
             Paragraph::new(
