@@ -197,9 +197,9 @@ pub enum MemorySupersede {
 }
 
 /// Plan D5 (`R-ID-7`): a subject or body, checked when built. The text is trimmed and must be
-/// non-empty, then scrubbed fail-closed by the caller's [`Scrubber`] (a known secret masked,
-/// credential-shaped text refused), and the **scrubbed** text is then capped in characters
-/// (blueprint P-1). The DB CHECKs are the backstop. `Debug` prints the length only; no `Display`,
+/// non-empty and free of NUL (Postgres `text` cannot hold one), then scrubbed fail-closed by the
+/// caller's [`Scrubber`] (a known secret masked, credential-shaped text refused), and the
+/// **scrubbed** text is then capped in characters (blueprint P-1). The DB CHECKs are the backstop. `Debug` prints the length only; no `Display`,
 /// no serde (I-5, as [`FollowUpText`](crate::model::FollowUpText)).
 #[derive(Clone, PartialEq, Eq)]
 pub struct MemoryText(String);
@@ -209,6 +209,7 @@ impl MemoryText {
     ///
     /// # Errors
     /// [`MemoryTextError::Empty`] for an empty or whitespace-only text;
+    /// [`MemoryTextError::Nul`] when the text holds a U+0000;
     /// [`MemoryTextError::Unmasked`] when `scrubber` leaves a credential-shaped leaf;
     /// [`MemoryTextError::TooLong`] `{ max: MEMORY_SUBJECT_MAX }` when the scrubbed text is longer.
     pub fn subject(raw: &str, scrubber: &dyn Scrubber) -> Result<Self, MemoryTextError> {
@@ -235,11 +236,17 @@ impl MemoryText {
         self.0
     }
 
-    /// Trim, refuse empty, scrub (fail-closed), then cap the scrubbed text in characters.
+    /// Trim, refuse empty, refuse a NUL, scrub (fail-closed), then cap the scrubbed text in
+    /// characters.
     fn checked(raw: &str, max: usize, scrubber: &dyn Scrubber) -> Result<Self, MemoryTextError> {
         let text = raw.trim();
         if text.is_empty() {
             return Err(MemoryTextError::Empty);
+        }
+        // Postgres `text` cannot hold U+0000 (`22021`): refused here so `MemStore` cannot keep
+        // what `PgStore` would fail as a backend error.
+        if text.contains('\0') {
+            return Err(MemoryTextError::Nul);
         }
         let mut value = Value::String(text.to_owned());
         scrubber
@@ -275,6 +282,9 @@ pub enum MemoryTextError {
     /// Empty or whitespace-only.
     #[error("the text is empty")]
     Empty,
+    /// Holds a U+0000, which Postgres `text` cannot store (`22021`).
+    #[error("the text must not contain a NUL character")]
+    Nul,
     /// Longer than `max` characters after scrubbing.
     #[error("the text is longer than {max} characters")]
     TooLong {
@@ -384,6 +394,28 @@ mod tests {
             assert!(!shown.contains("do-not-print-me"), "{shown}");
             assert!(!shown.contains("sk-ant-"), "{shown}");
         }
+    }
+
+    /// Postgres `text` cannot hold U+0000 (`22021`); refusing it here keeps `MemStore` and
+    /// `PgStore` answering alike (as `SpecError::Nul` and `HandWrittenError::Nul` do).
+    #[test]
+    fn a_nul_is_refused() {
+        for raw in ["build\0cache", "\0", " a\0b "] {
+            assert_eq!(
+                MemoryText::subject(raw, &plain()),
+                Err(MemoryTextError::Nul),
+                "subject {raw:?}"
+            );
+            assert_eq!(
+                MemoryText::body(raw, &plain()),
+                Err(MemoryTextError::Nul),
+                "body {raw:?}"
+            );
+        }
+        assert_eq!(
+            MemoryTextError::Nul.to_string(),
+            "the text must not contain a NUL character"
+        );
     }
 
     #[test]
