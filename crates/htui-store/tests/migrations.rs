@@ -22,11 +22,12 @@ use sqlx::Row as _;
 /// The `connect_timeout` every headless connect here passes.
 const HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The 46 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
+/// The 48 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
 /// adds (`run_step_tree`, ANA-2 §9), then the six of `0006_requirements.sql` (ANA-11 §5), then
 /// the two of `0011_permission_relay.sql` (MOD-42 plan D1), then the one of `0012_persona.sql`
 /// (MOD-26 plan D1), then the two of `0016_auto_queue.sql` (MOD-12 plan D1, D2), then the one of
-/// `0017_follow_up.sql` (MOD-70 plan D1), then the one of `0019_stop_runs.sql` (MOD-125 plan D4).
+/// `0017_follow_up.sql` (MOD-70 plan D1), then the one of `0019_stop_runs.sql` (MOD-125 plan D4),
+/// then the two of `0020_step_graph_v2.sql` (MOD-137 plan D6, D8).
 const TABLES: &[&str] = &[
     "app_user",
     "capability_tag",
@@ -81,6 +82,9 @@ const TABLES: &[&str] = &[
     "follow_up_window",
     // 0019_stop_runs.sql (MOD-125)
     "workspace_stop",
+    // 0020_step_graph_v2.sql (MOD-137)
+    "step_graph_edge",
+    "phase_part",
 ];
 
 #[tokio::test]
@@ -102,7 +106,7 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(
         applied,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
         ],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
@@ -112,7 +116,8 @@ async fn migrations_apply_on_a_clean_database() {
          MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql, MOD-26 milestone 2's \
          0013_persona_phase_index.sql, MOD-37 milestone 5's 0014_run_step_opening.sql, \
          MOD-11's 0015_command_queue.sql, MOD-12's 0016_auto_queue.sql, MOD-70's 0017_follow_up.sql, \
-         MOD-96's 0018_seed_permission_mode.sql and MOD-125's 0019_stop_runs.sql, in ordinal order"
+         MOD-96's 0018_seed_permission_mode.sql, MOD-125's 0019_stop_runs.sql and MOD-137's \
+         0020_step_graph_v2.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -130,20 +135,22 @@ async fn migrations_apply_on_a_clean_database() {
     }
     assert_eq!(
         TABLES.len(),
-        46,
+        48,
         "blueprint B.1 lists 32 tables (ANA-9 §3's prose count of 30 is wrong, H.1), \
          0003_orchestration.sql adds run_step_tree, 0006_requirements.sql adds ANA-11 §5's six, \
          MOD-42's 0011_permission_relay.sql adds step_permission and run_command, MOD-26's \
          0012_persona.sql adds persona and MOD-12's 0016_auto_queue.sql adds queue_batch and queue_entry and MOD-70's 0017_follow_up.sql adds follow_up_window and \
-         MOD-125's 0019_stop_runs.sql adds workspace_stop"
+         MOD-125's 0019_stop_runs.sql adds workspace_stop and MOD-137's 0020_step_graph_v2.sql \
+         adds step_graph_edge and phase_part"
     );
     // `_sqlx_migrations` is the only extra table sqlx adds.
     assert_eq!(
         present.len(),
         TABLES.len() + 1,
-        "the migrations create the 46 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
+        "the migrations create the 48 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
          MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql and MOD-12's 0016_auto_queue.sql (queue_batch, queue_entry) and MOD-70's \
-         0017_follow_up.sql and MOD-125's 0019_stop_runs.sql and nothing else, \
+         0017_follow_up.sql and MOD-125's 0019_stop_runs.sql and MOD-137's 0020_step_graph_v2.sql \
+         and nothing else, \
          got {present:?}"
     );
 
@@ -647,6 +654,86 @@ const MOD125_TABLE_COMMENT: (&str, &str) = (
      settles abandoned runs of the workspace as stopped. Resume deletes it. Not mirrored.",
 );
 
+/// The ten `COMMENT ON COLUMN` texts of `0020_step_graph_v2.sql` (MOD-137 plan D2, D3, D5, D6,
+/// D7), verbatim and in migration order, for [`ANA_COLUMN_COMMENTS`]'s reason.
+/// `step_graph.project_id` had no comment before.
+const MOD137_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
+    (
+        "step_graph",
+        "project_id",
+        "MOD-137 D3: the owning project; NULL for a workspace graph or a library graph. At most \
+         one of project_id and workspace_id is set (ck_step_graph_owner).",
+    ),
+    (
+        "step_graph",
+        "workspace_id",
+        "MOD-137 D3: the owning workspace; NULL for a project graph or a library graph (neither \
+         set). ON DELETE CASCADE.",
+    ),
+    (
+        "step_graph",
+        "revision",
+        "MOD-137 D5: whole-graph compare-and-set token; every write to the graph, its phases, \
+         candidates, parts or edges bumps it by one; replace_graph compares it.",
+    ),
+    (
+        "step_graph_phase",
+        "split",
+        "MOD-137 D7: none, compete (fan_out > 1, rival candidates) or divide (planner, parts, \
+         integrate; ANA-33 7.4); compete iff fan_out > 1.",
+    ),
+    (
+        "step_graph_phase",
+        "palette",
+        "MOD-137 D7: a node a planner may instantiate but the walk never reaches on its own; has \
+         no edges.",
+    ),
+    (
+        "step_graph_phase",
+        "plan_scope",
+        "MOD-137 D7: what a planner node may plan: parts, successors or graph (ANA-33 7.5); NULL \
+         off a planner.",
+    ),
+    (
+        "step_graph_phase",
+        "max_parts",
+        "MOD-137 D7: the most parts a divide planner may propose; divide nodes only, like the six \
+         planner_* and integrate_* columns.",
+    ),
+    (
+        "step_graph_edge",
+        "kind",
+        "MOD-137 D6: next, if (carries predicate), asks_you, changes_requested or fails (both \
+         carry loop_limit).",
+    ),
+    (
+        "step_graph_edge",
+        "predicate",
+        "MOD-137 D6: the if edge's condition, NULL on every other kind; MOD-138 closes its shape \
+         (ANA-33 7.3).",
+    ),
+    (
+        "step_graph_edge",
+        "loop_limit",
+        "MOD-137 D2, D6: how often a loop edge may be taken (ANA-33 limit; LIMIT is reserved); \
+         required on changes_requested and fails.",
+    ),
+];
+
+/// The two `COMMENT ON TABLE` texts of `0020_step_graph_v2.sql` (MOD-137 plan D6, D8), verbatim.
+const MOD137_TABLE_COMMENTS: &[(&str, &str)] = &[
+    (
+        "step_graph_edge",
+        "MOD-137 D6: one link between two phases of one graph; replaced, never edited. Acyclicity \
+         and reachability are the shared validator's (MOD-138), not CHECKs.",
+    ),
+    (
+        "phase_part",
+        "MOD-137 D8: a divide node's default parts (ANA-33 7.4, 7.6); written only by \
+         replace_graph.",
+    ),
+];
+
 /// MOD-11 plan D14 (OQ-3): `0015_command_queue.sql` gives `command_run` its two liveness columns,
 /// both nullable (every row written before the migration, and every verify row, has neither) and
 /// both commented.
@@ -878,6 +965,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD11_COLUMN_COMMENTS)
         .chain(MOD12_COLUMN_COMMENTS)
         .chain(MOD125_COLUMN_COMMENTS)
+        .chain(MOD137_COLUMN_COMMENTS)
     {
         let actual: Option<String> = sqlx::query_scalar(
             "SELECT pg_catalog.col_description(c.oid, a.attnum) \
@@ -895,13 +983,16 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
             actual.as_deref(),
             Some(*expected),
             "{table}.{column}'s comment is the ANA (or MOD-7, MOD-9, MOD-23, MOD-33, MOD-26, \
-             MOD-11, MOD-12 or MOD-125) text byte for byte"
+             MOD-11, MOD-12, MOD-125 or MOD-137) text byte for byte"
         );
     }
 
     // The table comments, which `col_description` above cannot see: a table's own comment is
     // `objsubid = 0` on the class, not on any attribute.
-    for (table, expected) in [ANA_TABLE_COMMENT, MOD125_TABLE_COMMENT] {
+    for (table, expected) in [ANA_TABLE_COMMENT, MOD125_TABLE_COMMENT]
+        .into_iter()
+        .chain(MOD137_TABLE_COMMENTS.iter().copied())
+    {
         let actual: Option<String> = sqlx::query_scalar(
             "SELECT pg_catalog.obj_description(c.oid, 'pg_class') FROM pg_class c \
              WHERE c.relnamespace = 'public'::regnamespace AND c.relkind = 'r' AND c.relname = $1",
@@ -913,13 +1004,13 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         assert_eq!(
             actual.as_deref(),
             Some(expected),
-            "{table}'s table comment is the ANA-2 §9 (or MOD-125) text byte for byte"
+            "{table}'s table comment is the ANA-2 §9 (or MOD-125, MOD-137) text byte for byte"
         );
     }
 
     // And nothing else in those tables carries one, so a reader of `\d+` sees exactly the
-    // contracts the three ANAs, MOD-7, ANA-22, MOD-23, MOD-33, MOD-26, MOD-11, MOD-12 and MOD-125
-    // wrote and no half-finished extra one.
+    // contracts the three ANAs, MOD-7, ANA-22, MOD-23, MOD-33, MOD-26, MOD-11, MOD-12, MOD-125 and
+    // MOD-137 wrote and no half-finished extra one.
     let commented: Vec<(String, String)> = sqlx::query_as(
         "SELECT c.relname::text, a.attname::text FROM pg_class c \
          JOIN pg_attribute a ON a.attrelid = c.oid \
@@ -939,6 +1030,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
             .chain(MOD11_COLUMN_COMMENTS)
             .chain(MOD12_COLUMN_COMMENTS)
             .chain(MOD125_COLUMN_COMMENTS)
+            .chain(MOD137_COLUMN_COMMENTS)
             .map(|(table, _, _)| (*table).to_owned())
             .collect::<BTreeSet<String>>()
             .into_iter()
@@ -958,6 +1050,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD11_COLUMN_COMMENTS)
         .chain(MOD12_COLUMN_COMMENTS)
         .chain(MOD125_COLUMN_COMMENTS)
+        .chain(MOD137_COLUMN_COMMENTS)
         .map(|(table, column, _)| ((*table).to_owned(), (*column).to_owned()))
         .collect();
     expected.sort();
@@ -1706,6 +1799,892 @@ async fn migration_0019_a_deleted_workspace_unscopes_its_runs_and_drops_its_stop
     db.drop_db().await;
 }
 
+/// Inserts a `project` under `slug`, created by `user`, and answers its id.
+async fn insert_project(pool: &sqlx::PgPool, user: uuid::Uuid, slug: &str) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    sqlx::query("INSERT INTO project (id, slug, name, created_by) VALUES ($1, $2, $2, $3)")
+        .bind(id)
+        .bind(slug)
+        .bind(user)
+        .execute(pool)
+        .await
+        .expect("insert project");
+    id
+}
+
+/// Inserts an `app_user` named `name` and answers its id.
+async fn insert_user(pool: &sqlx::PgPool, name: &str) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    sqlx::query("INSERT INTO app_user (id, name) VALUES ($1, $2)")
+        .bind(id)
+        .bind(name)
+        .execute(pool)
+        .await
+        .expect("insert app_user");
+    id
+}
+
+/// Inserts a project-owned `step_graph` named `name` through the columns every schema version
+/// has (so it works staged before 0020 and after it), and answers its id.
+async fn insert_graph(pool: &sqlx::PgPool, project: uuid::Uuid, name: &str) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    sqlx::query("INSERT INTO step_graph (id, project_id, name) VALUES ($1, $2, $3)")
+        .bind(id)
+        .bind(project)
+        .bind(name)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|err| panic!("insert step_graph `{name}`: {err}"));
+    id
+}
+
+/// Inserts a `step_graph` under the 0020 owner columns, `is_override` as given; the result is the
+/// statement's, so a refusal can be asserted.
+async fn try_scoped_graph(
+    pool: &sqlx::PgPool,
+    project: Option<uuid::Uuid>,
+    workspace: Option<uuid::Uuid>,
+    name: &str,
+    is_override: bool,
+) -> Result<uuid::Uuid, sqlx::Error> {
+    let id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO step_graph (id, project_id, workspace_id, name, is_override) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(id)
+    .bind(project)
+    .bind(workspace)
+    .bind(name)
+    .bind(is_override)
+    .execute(pool)
+    .await
+    .map(|_| id)
+}
+
+/// Inserts a `step_graph_phase` row raw through the columns a v19 table already has: the seed's
+/// own row ([`htui_core::seed::phase_row`]) with `retry_limit` and `fan_out` as the caller sets
+/// them.
+async fn insert_phase_row(pool: &sqlx::PgPool, row: &htui_core::model::StepGraphPhase) {
+    sqlx::query(
+        "INSERT INTO step_graph_phase (id, graph_id, position, name, fan_out, gate, gate_hard, \
+         retry_limit, input_kinds, output_kind, command_queue, template_name) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+    )
+    .bind(row.id.as_uuid())
+    .bind(row.graph_id.as_uuid())
+    .bind(row.position)
+    .bind(&row.name)
+    .bind(row.fan_out)
+    .bind(row.gate.as_str())
+    .bind(row.gate_hard)
+    .bind(row.retry_limit)
+    .bind(&row.input_kinds)
+    .bind(&row.output_kind)
+    .bind(row.command_queue.as_str())
+    .bind(&row.template_name)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|err| panic!("insert step_graph_phase `{}`: {err}", row.name));
+}
+
+/// A phase of `graph` at `position` named `name`, with `fan_out` and `retry_limit` as given and
+/// every other column [`htui_core::seed::phase_row`]'s; answers its id.
+async fn insert_phase(
+    pool: &sqlx::PgPool,
+    graph: uuid::Uuid,
+    position: i32,
+    name: &str,
+    fan_out: i32,
+    retry_limit: i32,
+) -> uuid::Uuid {
+    let seed = htui_core::seed::PhaseSeed {
+        name: "unused",
+        input_kinds: &[],
+        gate_hard: false,
+    };
+    let mut row = htui_core::seed::phase_row(
+        htui_core::model::PhaseId::new(),
+        htui_core::model::StepGraphId::from_uuid(graph),
+        position,
+        &seed,
+        at_2026(),
+    );
+    name.clone_into(&mut row.name);
+    name.clone_into(&mut row.output_kind);
+    name.clone_into(&mut row.template_name);
+    row.fan_out = fan_out;
+    row.retry_limit = retry_limit;
+    insert_phase_row(pool, &row).await;
+    row.id.as_uuid()
+}
+
+/// Inserts a `step_graph_edge` raw; the result is the statement's, so a refusal can be asserted.
+async fn try_edge(
+    pool: &sqlx::PgPool,
+    graph: uuid::Uuid,
+    from: uuid::Uuid,
+    to: uuid::Uuid,
+    kind: &str,
+    predicate: Option<serde_json::Value>,
+    loop_limit: Option<i32>,
+) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO step_graph_edge (graph_id, from_phase_id, to_phase_id, kind, predicate, \
+         loop_limit) VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(graph)
+    .bind(from)
+    .bind(to)
+    .bind(kind)
+    .bind(predicate.map(sqlx::types::Json))
+    .bind(loop_limit)
+    .execute(pool)
+    .await
+}
+
+/// Asserts `result` is a refusal with SQLSTATE `code` naming exactly `constraint` (or index),
+/// straight off the driver: a statement may trip only the one rule under test.
+fn assert_refused<T: std::fmt::Debug>(
+    result: Result<T, sqlx::Error>,
+    code: &str,
+    constraint: &str,
+    what: &str,
+) {
+    let err = match result {
+        Ok(ok) => panic!("{what} was admitted: {ok:?}"),
+        Err(err) => err,
+    };
+    let Some(db) = err.as_database_error() else {
+        panic!("{what}: expected a database error, got {err:?}");
+    };
+    assert_eq!(
+        (db.code().as_deref(), db.constraint()),
+        (Some(code), Some(constraint)),
+        "{what} is refused by {constraint} ({code}), got {db:?}"
+    );
+}
+
+/// Every `step_graph_edge` as `(graph, from, to, kind, loop_limit)` names, by graph name, then
+/// from position, to position and kind (bytewise).
+async fn edge_names(pool: &sqlx::PgPool) -> Vec<(String, String, String, String, Option<i32>)> {
+    sqlx::query_as(
+        "SELECT g.name, f.name, t.name, e.kind, e.loop_limit FROM step_graph_edge e \
+         JOIN step_graph g ON g.id = e.graph_id \
+         JOIN step_graph_phase f ON f.id = e.from_phase_id \
+         JOIN step_graph_phase t ON t.id = e.to_phase_id \
+         ORDER BY g.name COLLATE \"C\", f.position, t.position, e.kind COLLATE \"C\"",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read step_graph_edge")
+}
+
+/// MOD-137 plan D9 (blueprint F4, T1.3): `0020_step_graph_v2.sql` writes today's implied topology
+/// as data. Per graph, a `next` edge between each pair of phases adjacent in position order (gaps
+/// included); for each `review`, a `changes_requested` edge to the greatest earlier `implement`,
+/// else to the phase just before it in position order, bounded by the target's `retry_limit`.
+///
+/// Staged at v19 through [`MIGRATOR`] (the `migration_0019_*` staging): the five seeded kinds'
+/// graphs are raw-inserted from [`htui_core::seed::KINDS`] through `seed::phase_row`, with
+/// `implement` and `fix` at `retry_limit 3` so a bound is told apart from the default 1, beside
+/// `gappy` (the implement rule beats "previous"), `gap-no-implement` (previous in order, not
+/// `position - 1`) and `solo` (a lone review has no target). The plain `run` then applies 0020.
+#[tokio::test]
+async fn migration_0020_backfills_next_and_review_edges() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(19, &db.pool)
+        .await
+        .expect("apply 0001 through 0019");
+    let pool = &db.pool;
+    let user = insert_user(pool, "graph").await;
+    let project = insert_project(pool, user, "graphs").await;
+
+    for kind in &htui_core::seed::KINDS {
+        let graph = insert_graph(pool, project, kind.name).await;
+        for (position, phase) in kind.phases.iter().enumerate() {
+            let mut row = htui_core::seed::phase_row(
+                htui_core::model::PhaseId::new(),
+                htui_core::model::StepGraphId::from_uuid(graph),
+                i32::try_from(position).expect("a seeded position fits i32"),
+                phase,
+                at_2026(),
+            );
+            if matches!(phase.name, "implement" | "fix") {
+                row.retry_limit = 3;
+            }
+            insert_phase_row(pool, &row).await;
+        }
+    }
+    let gappy = insert_graph(pool, project, "gappy").await;
+    insert_phase(pool, gappy, 0, "implement", 1, 4).await;
+    insert_phase(pool, gappy, 5, "docs", 1, 1).await;
+    insert_phase(pool, gappy, 9, "review", 1, 1).await;
+    let gap = insert_graph(pool, project, "gap-no-implement").await;
+    insert_phase(pool, gap, 0, "draft", 1, 2).await;
+    insert_phase(pool, gap, 4, "review", 1, 1).await;
+    let solo = insert_graph(pool, project, "solo").await;
+    insert_phase(pool, solo, 0, "review", 1, 1).await;
+
+    MIGRATOR.run(pool).await.expect("apply 0020");
+
+    let edge = |graph: &str, from: &str, to: &str, kind: &str, limit: Option<i32>| {
+        (
+            graph.to_owned(),
+            from.to_owned(),
+            to.to_owned(),
+            kind.to_owned(),
+            limit,
+        )
+    };
+    let next = "next";
+    let loops = "changes_requested";
+    assert_eq!(
+        edge_names(pool).await,
+        vec![
+            edge("analysis", "research", "verdict", next, None),
+            edge("bug", "reproduce", "fix", next, None),
+            edge("bug", "fix", "review", next, None),
+            edge("bug", "review", "fix", loops, Some(3)),
+            edge("feature", "prd", "plan", next, None),
+            edge("feature", "plan", "implement", next, None),
+            edge("feature", "implement", "review", next, None),
+            edge("feature", "review", "implement", loops, Some(3)),
+            edge("gap-no-implement", "draft", "review", next, None),
+            edge("gap-no-implement", "review", "draft", loops, Some(2)),
+            edge("gappy", "implement", "docs", next, None),
+            edge("gappy", "docs", "review", next, None),
+            edge("gappy", "review", "implement", loops, Some(4)),
+            edge("refactor", "plan", "implement", next, None),
+            edge("refactor", "implement", "review", next, None),
+            edge("refactor", "review", "implement", loops, Some(3)),
+            edge("tooling", "plan", "implement", next, None),
+            edge("tooling", "implement", "review", next, None),
+            edge("tooling", "review", "implement", loops, Some(3)),
+        ],
+        "n - 1 next edges per graph in position order; review loops to the greatest earlier \
+         implement, else the previous phase in order, bounded by the target's retry_limit; \
+         analysis and solo have no loop edge"
+    );
+    let predicates: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM step_graph_edge WHERE predicate IS NOT NULL")
+            .fetch_one(pool)
+            .await
+            .expect("count predicates");
+    assert_eq!(predicates, 0, "no backfilled edge carries a predicate");
+    let stray: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM step_graph_edge e JOIN step_graph_phase f ON f.id = e.from_phase_id \
+         JOIN step_graph_phase t ON t.id = e.to_phase_id \
+         WHERE f.graph_id <> e.graph_id OR t.graph_id <> e.graph_id",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("count cross-graph edges");
+    assert_eq!(stray, 0, "every backfilled edge stays inside its graph");
+    let revisions: Vec<i64> = sqlx::query_scalar("SELECT DISTINCT revision FROM step_graph")
+        .fetch_all(pool)
+        .await
+        .expect("read revisions");
+    assert_eq!(
+        revisions,
+        vec![0],
+        "every existing graph starts at revision 0"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-137 plan D7: `0020_step_graph_v2.sql` marks a v19 phase with `fan_out > 1` `compete` and
+/// every other `none`; `palette` is false and `plan_scope` plus the seven divide columns are
+/// `NULL` on every existing row.
+#[tokio::test]
+async fn migration_0020_marks_fanned_out_phases_compete() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(19, &db.pool)
+        .await
+        .expect("apply 0001 through 0019");
+    let pool = &db.pool;
+    let user = insert_user(pool, "split").await;
+    let project = insert_project(pool, user, "split").await;
+    let graph = insert_graph(pool, project, "fanned").await;
+    insert_phase(pool, graph, 0, "plan", 1, 1).await;
+    insert_phase(pool, graph, 1, "implement", 2, 1).await;
+    insert_phase(pool, graph, 2, "polish", 3, 1).await;
+
+    MIGRATOR.run(pool).await.expect("apply 0020");
+
+    let rows: Vec<(String, String, bool, bool)> = sqlx::query_as(
+        "SELECT name, split, palette, \
+                plan_scope IS NULL AND planner_persona_id IS NULL AND planner_agent_id IS NULL \
+            AND planner_model IS NULL AND integrate_persona_id IS NULL \
+            AND integrate_agent_id IS NULL AND integrate_model IS NULL AND max_parts IS NULL \
+           FROM step_graph_phase ORDER BY position",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read the phases");
+    let row = |name: &str, split: &str| (name.to_owned(), split.to_owned(), false, true);
+    assert_eq!(
+        rows,
+        vec![
+            row("plan", "none"),
+            row("implement", "compete"),
+            row("polish", "compete")
+        ],
+        "fan_out > 1 is compete, the rest none; no palette, no plan_scope, no divide columns"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-137 plan D7 (blueprint T1.3): the new phase CHECKs refuse what they should, each by name,
+/// and a `divide` node may carry its planner columns.
+#[tokio::test]
+async fn migration_0020_phase_checks_refuse_what_they_should() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let pool = &db.pool;
+    let user = insert_user(pool, "checks").await;
+    let project = insert_project(pool, user, "checks").await;
+    let graph = insert_graph(pool, project, "checked").await;
+    let phase = insert_phase(pool, graph, 0, "plan", 1, 1).await;
+    let wide = insert_phase(pool, graph, 1, "implement", 1, 1).await;
+
+    let set = |sql: &'static str, id: uuid::Uuid| {
+        let pool = pool.clone();
+        async move { sqlx::query(sql).bind(id).execute(&pool).await }
+    };
+    assert_refused(
+        set(
+            "UPDATE step_graph_phase SET split = 'compete' WHERE id = $1",
+            phase,
+        )
+        .await,
+        "23514",
+        "ck_phase_split_fan_out",
+        "compete with fan_out 1",
+    );
+    assert_refused(
+        set(
+            "UPDATE step_graph_phase SET fan_out = 2 WHERE id = $1",
+            wide,
+        )
+        .await,
+        "23514",
+        "ck_phase_split_fan_out",
+        "fan_out 2 left at split none",
+    );
+    set(
+        "UPDATE step_graph_phase SET fan_out = 2, split = 'compete' WHERE id = $1",
+        wide,
+    )
+    .await
+    .expect("fan_out 2 with split compete is admitted");
+    assert_refused(
+        set(
+            "UPDATE step_graph_phase SET split = 'spread' WHERE id = $1",
+            phase,
+        )
+        .await,
+        "23514",
+        "ck_phase_split",
+        "an unknown split",
+    );
+    assert_refused(
+        set(
+            "UPDATE step_graph_phase SET plan_scope = 'world' WHERE id = $1",
+            phase,
+        )
+        .await,
+        "23514",
+        "ck_phase_plan_scope",
+        "an unknown plan_scope",
+    );
+    set(
+        "UPDATE step_graph_phase SET plan_scope = 'parts' WHERE id = $1",
+        phase,
+    )
+    .await
+    .expect("a known plan_scope is admitted on any node");
+    assert_refused(
+        set(
+            "UPDATE step_graph_phase SET max_parts = 2 WHERE id = $1",
+            phase,
+        )
+        .await,
+        "23514",
+        "ck_phase_divide_columns",
+        "max_parts on a none node",
+    );
+    assert_refused(
+        set(
+            "UPDATE step_graph_phase SET planner_model = 'm' WHERE id = $1",
+            phase,
+        )
+        .await,
+        "23514",
+        "ck_phase_divide_columns",
+        "a planner column on a none node",
+    );
+    set(
+        "UPDATE step_graph_phase SET split = 'divide', max_parts = 2, planner_model = 'm', \
+         integrate_model = 'n' WHERE id = $1",
+        phase,
+    )
+    .await
+    .expect("a divide node carries its planner and integrate columns");
+    assert_refused(
+        set(
+            "UPDATE step_graph_phase SET max_parts = 0 WHERE id = $1",
+            phase,
+        )
+        .await,
+        "23514",
+        "ck_phase_max_parts",
+        "max_parts 0 on a divide node",
+    );
+    let unknown = uuid::Uuid::now_v7();
+    assert_refused(
+        sqlx::query("UPDATE step_graph_phase SET planner_persona_id = $2 WHERE id = $1")
+            .bind(phase)
+            .bind(unknown)
+            .execute(pool)
+            .await,
+        "23503",
+        "fk_step_graph_phase_planner_persona",
+        "a planner persona that names no persona",
+    );
+    assert_refused(
+        sqlx::query("UPDATE step_graph_phase SET integrate_agent_id = $2 WHERE id = $1")
+            .bind(phase)
+            .bind(unknown)
+            .execute(pool)
+            .await,
+        "23503",
+        "fk_step_graph_phase_integrate_agent",
+        "an integrate agent that names no agent",
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-137 plan D3, D5: at most one owner (`ck_step_graph_owner`), names unique per scope through
+/// one partial index each, the same name free across the three scopes, an override only in a
+/// project, `revision` 0 by default, and a workspace delete takes its graphs.
+#[tokio::test]
+async fn migration_0020_owner_scope_refuses_what_it_should() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let pool = &db.pool;
+    let user = insert_user(pool, "scope").await;
+    let project = insert_project(pool, user, "scoped").await;
+    let workspace = insert_workspace(pool, user, "scoped").await;
+
+    assert_refused(
+        try_scoped_graph(pool, Some(project), Some(workspace), "both", false).await,
+        "23514",
+        "ck_step_graph_owner",
+        "a graph with both owners",
+    );
+    let in_project = try_scoped_graph(pool, Some(project), None, "flow", false)
+        .await
+        .expect("a project graph");
+    let in_workspace = try_scoped_graph(pool, None, Some(workspace), "flow", false)
+        .await
+        .expect("the same name in a workspace");
+    let in_library = try_scoped_graph(pool, None, None, "flow", false)
+        .await
+        .expect("the same name in the library");
+    assert_refused(
+        try_scoped_graph(pool, Some(project), None, "flow", false).await,
+        "23505",
+        "uq_step_graph_project_name",
+        "a duplicate name in one project",
+    );
+    assert_refused(
+        try_scoped_graph(pool, None, Some(workspace), "flow", false).await,
+        "23505",
+        "uq_step_graph_workspace_name",
+        "a duplicate name in one workspace",
+    );
+    assert_refused(
+        try_scoped_graph(pool, None, None, "flow", false).await,
+        "23505",
+        "uq_step_graph_library_name",
+        "a duplicate name in the library",
+    );
+    let other = insert_project(pool, user, "other").await;
+    try_scoped_graph(pool, Some(other), None, "flow", false)
+        .await
+        .expect("the same name in another project");
+    assert_refused(
+        try_scoped_graph(pool, None, None, "FEAT-1-override", true).await,
+        "23514",
+        "ck_step_graph_override_in_project",
+        "an override in the library",
+    );
+    assert_refused(
+        try_scoped_graph(pool, None, Some(workspace), "FEAT-1-override", true).await,
+        "23514",
+        "ck_step_graph_override_in_project",
+        "an override in a workspace",
+    );
+    try_scoped_graph(pool, Some(project), None, "FEAT-1-override", true)
+        .await
+        .expect("an override in a project");
+
+    let revisions: Vec<i64> = sqlx::query_scalar("SELECT DISTINCT revision FROM step_graph")
+        .fetch_all(pool)
+        .await
+        .expect("read revisions");
+    assert_eq!(revisions, vec![0], "revision defaults to 0");
+
+    sqlx::query("DELETE FROM workspace WHERE id = $1")
+        .bind(workspace)
+        .execute(pool)
+        .await
+        .expect("delete the workspace");
+    let left: Vec<uuid::Uuid> =
+        sqlx::query_scalar("SELECT id FROM step_graph WHERE id = ANY($1) ORDER BY id")
+            .bind(vec![in_project, in_workspace, in_library])
+            .fetch_all(pool)
+            .await
+            .expect("read the graphs left");
+    let mut kept = vec![in_project, in_library];
+    kept.sort();
+    assert_eq!(
+        left, kept,
+        "the workspace's graph went with it; the others stay"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-137 plan D6, D8: an edge never points into another graph (the composite foreign keys over
+/// `uq_step_graph_phase_graph_id`), every edge CHECK refuses by name, a phase delete takes its
+/// edges and parts, and a graph delete takes the rest.
+#[tokio::test]
+async fn migration_0020_edges_stay_inside_their_graph() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let pool = &db.pool;
+    let user = insert_user(pool, "edges").await;
+    let project = insert_project(pool, user, "edges").await;
+    let graph = insert_graph(pool, project, "inside").await;
+    let a0 = insert_phase(pool, graph, 0, "a0", 1, 1).await;
+    let a1 = insert_phase(pool, graph, 1, "a1", 1, 1).await;
+    let a2 = insert_phase(pool, graph, 2, "a2", 1, 1).await;
+    let elsewhere = insert_graph(pool, project, "elsewhere").await;
+    let b0 = insert_phase(pool, elsewhere, 0, "b0", 1, 1).await;
+
+    assert_refused(
+        try_edge(pool, graph, a0, b0, "next", None, None).await,
+        "23503",
+        "fk_step_graph_edge_to",
+        "an edge into another graph",
+    );
+    assert_refused(
+        try_edge(pool, graph, b0, a0, "next", None, None).await,
+        "23503",
+        "fk_step_graph_edge_from",
+        "an edge out of another graph",
+    );
+    assert_refused(
+        try_edge(pool, graph, a0, a1, "jump", None, None).await,
+        "23514",
+        "ck_step_graph_edge_kind",
+        "an unknown edge kind",
+    );
+    assert_refused(
+        try_edge(pool, graph, a0, a1, "if", None, None).await,
+        "23514",
+        "ck_step_graph_edge_predicate",
+        "an if edge without a predicate",
+    );
+    assert_refused(
+        try_edge(
+            pool,
+            graph,
+            a0,
+            a1,
+            "next",
+            Some(json!({"field": "x"})),
+            None,
+        )
+        .await,
+        "23514",
+        "ck_step_graph_edge_predicate",
+        "a next edge with a predicate",
+    );
+    assert_refused(
+        try_edge(pool, graph, a0, a1, "next", None, Some(-1)).await,
+        "23514",
+        "ck_step_graph_edge_loop_limit",
+        "a negative loop_limit",
+    );
+    for kind in ["changes_requested", "fails"] {
+        assert_refused(
+            try_edge(pool, graph, a1, a0, kind, None, None).await,
+            "23514",
+            "ck_step_graph_edge_loop_limit_required",
+            &format!("a {kind} edge without a loop_limit"),
+        );
+    }
+    assert_refused(
+        try_edge(pool, graph, a0, a0, "next", None, None).await,
+        "23514",
+        "ck_step_graph_edge_not_self",
+        "an edge from a phase to itself",
+    );
+
+    try_edge(pool, graph, a0, a1, "next", None, None)
+        .await
+        .expect("a next edge");
+    try_edge(pool, graph, a1, a2, "if", Some(json!({"field": "x"})), None)
+        .await
+        .expect("an if edge with a predicate");
+    try_edge(pool, graph, a2, a0, "asks_you", None, None)
+        .await
+        .expect("an asks_you edge needs no loop_limit");
+    try_edge(pool, graph, a2, a1, "fails", None, Some(0))
+        .await
+        .expect("a fails edge with loop_limit 0");
+    assert_refused(
+        try_edge(pool, graph, a0, a1, "next", None, None).await,
+        "23505",
+        "uq_step_graph_edge",
+        "a duplicate edge",
+    );
+    try_edge(pool, graph, a0, a1, "asks_you", None, None)
+        .await
+        .expect("the same pair under another kind");
+
+    let part = |phase: uuid::Uuid, position: i32, key: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO phase_part (phase_id, position, key, title) VALUES ($1, $2, $3, $3)",
+            )
+            .bind(phase)
+            .bind(position)
+            .bind(key)
+            .execute(&pool)
+            .await
+        }
+    };
+    part(a1, 0, "ui").await.expect("a part");
+    part(a2, 0, "ui")
+        .await
+        .expect("the same key on another phase");
+    assert_refused(
+        part(a1, 1, "ui").await,
+        "23505",
+        "uq_phase_part_key",
+        "a duplicate part key in one phase",
+    );
+    assert_refused(
+        part(a1, 0, "api").await,
+        "23505",
+        "pk_phase_part",
+        "a duplicate part position in one phase",
+    );
+    let defaults: (String, Vec<String>, Option<String>) =
+        sqlx::query_as("SELECT brief, owned_paths, acceptance FROM phase_part WHERE phase_id = $1")
+            .bind(a1)
+            .fetch_one(pool)
+            .await
+            .expect("read the part");
+    assert_eq!(
+        defaults,
+        (String::new(), Vec::new(), None),
+        "a part defaults to an empty brief, no owned paths and no acceptance"
+    );
+
+    let count_in = |sql: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(sql)
+                .bind(graph)
+                .fetch_one(&pool)
+                .await
+                .expect("count")
+        }
+    };
+    let edges_sql = "SELECT count(*) FROM step_graph_edge WHERE graph_id = $1";
+    assert_eq!(count_in(edges_sql).await, 5, "five edges stand");
+
+    sqlx::query("DELETE FROM step_graph_phase WHERE id = $1")
+        .bind(a1)
+        .execute(pool)
+        .await
+        .expect("delete a1");
+    assert_eq!(
+        edge_names(pool).await,
+        vec![(
+            "inside".to_owned(),
+            "a2".to_owned(),
+            "a0".to_owned(),
+            "asks_you".to_owned(),
+            None
+        )],
+        "deleting a1 takes every edge from or to it"
+    );
+    let parts: Vec<uuid::Uuid> = sqlx::query_scalar("SELECT phase_id FROM phase_part")
+        .fetch_all(pool)
+        .await
+        .expect("read the parts");
+    assert_eq!(parts, vec![a2], "deleting a1 takes its part");
+
+    sqlx::query("DELETE FROM step_graph WHERE id = $1")
+        .bind(graph)
+        .execute(pool)
+        .await
+        .expect("delete the graph");
+    assert_eq!(
+        common::count(pool, "step_graph_edge").await,
+        0,
+        "the graph took its edges"
+    );
+    assert_eq!(
+        common::count(pool, "phase_part").await,
+        0,
+        "the graph took its parts"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-137 plan D10: the position and name uniques of `step_graph_phase` are re-created
+/// `DEFERRABLE INITIALLY IMMEDIATE` under `uq_` names (the 0001 ones are gone, and so is
+/// `step_graph_project_id_name_key`), so one transaction can swap two phases' positions and names
+/// under `SET CONSTRAINTS ... DEFERRED`; outside that, and at `SET CONSTRAINTS ALL IMMEDIATE`, a
+/// clash is still refused. `uq_step_graph_phase_graph_id`, the edges' key, is not deferrable.
+#[tokio::test]
+async fn migration_0020_phase_uniques_are_deferrable() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let pool = &db.pool;
+    let constraints: Vec<(String, bool, bool)> = sqlx::query_as(
+        "SELECT conname::text, condeferrable, condeferred FROM pg_constraint \
+          WHERE conrelid IN ('step_graph'::regclass, 'step_graph_phase'::regclass) \
+            AND contype = 'u' ORDER BY 1",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read pg_constraint");
+    assert_eq!(
+        constraints,
+        vec![
+            ("uq_step_graph_phase_graph_id".to_owned(), false, false),
+            ("uq_step_graph_phase_name".to_owned(), true, false),
+            ("uq_step_graph_phase_position".to_owned(), true, false),
+        ],
+        "the two uniques are deferrable but immediate by default, the edges' key is not \
+         deferrable, and 0001's three unnamed uniques are gone"
+    );
+    let indexes: BTreeSet<String> = sqlx::query_scalar(
+        "SELECT indexname::text FROM pg_indexes WHERE schemaname = 'public' \
+         AND tablename IN ('step_graph', 'step_graph_phase', 'step_graph_edge', 'phase_part')",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read pg_indexes")
+    .into_iter()
+    .collect();
+    for name in [
+        "uq_step_graph_project_name",
+        "uq_step_graph_workspace_name",
+        "uq_step_graph_library_name",
+        "idx_step_graph_phase_planner_persona",
+        "idx_step_graph_phase_integrate_persona",
+        "idx_step_graph_edge_graph",
+        "idx_step_graph_edge_to",
+        "idx_phase_part_persona",
+    ] {
+        assert!(
+            indexes.contains(name),
+            "0020 creates `{name}`, got {indexes:?}"
+        );
+    }
+
+    let user = insert_user(pool, "swap").await;
+    let project = insert_project(pool, user, "swap").await;
+    let graph = insert_graph(pool, project, "swapped").await;
+    let first = insert_phase(pool, graph, 0, "plan", 1, 1).await;
+    let second = insert_phase(pool, graph, 1, "implement", 1, 1).await;
+    let move_to = "UPDATE step_graph_phase SET position = $2, name = $3 WHERE id = $1";
+
+    assert_refused(
+        sqlx::query("UPDATE step_graph_phase SET position = 1 WHERE id = $1")
+            .bind(first)
+            .execute(pool)
+            .await,
+        "23505",
+        "uq_step_graph_phase_position",
+        "a position clash outside a deferred transaction",
+    );
+
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SET CONSTRAINTS uq_step_graph_phase_position, uq_step_graph_phase_name DEFERRED")
+        .execute(&mut *tx)
+        .await
+        .expect("defer the two uniques");
+    for (id, position, name) in [(first, 1, "implement"), (second, 0, "plan")] {
+        sqlx::query(move_to)
+            .bind(id)
+            .bind(position)
+            .bind(name)
+            .execute(&mut *tx)
+            .await
+            .expect("move a phase while deferred");
+    }
+    tx.commit().await.expect("the swap commits");
+    let order: Vec<(uuid::Uuid, String)> = sqlx::query_as(
+        "SELECT id, name FROM step_graph_phase WHERE graph_id = $1 ORDER BY position",
+    )
+    .bind(graph)
+    .fetch_all(pool)
+    .await
+    .expect("read the order");
+    assert_eq!(
+        order,
+        vec![(second, "plan".to_owned()), (first, "implement".to_owned())],
+        "positions and names swapped in one transaction"
+    );
+
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SET CONSTRAINTS uq_step_graph_phase_position, uq_step_graph_phase_name DEFERRED")
+        .execute(&mut *tx)
+        .await
+        .expect("defer the two uniques");
+    sqlx::query("UPDATE step_graph_phase SET position = 0 WHERE id = $1")
+        .bind(first)
+        .execute(&mut *tx)
+        .await
+        .expect("a clash waits while deferred");
+    assert_refused(
+        sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+            .execute(&mut *tx)
+            .await,
+        "23505",
+        "uq_step_graph_phase_position",
+        "a real clash, forced at SET CONSTRAINTS ALL IMMEDIATE",
+    );
+    tx.rollback().await.expect("roll back");
+
+    db.drop_db().await;
+}
+
 /// The smallest FK chain an `item` row needs (project -> step_graph -> item_kind), under the
 /// `created_by` the caller names. Returns `(project, kind)`; the kind's prefix is `RES`.
 async fn plant_item_kind(pool: &sqlx::PgPool, user: uuid::Uuid) -> (uuid::Uuid, uuid::Uuid) {
@@ -1900,8 +2879,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(19),
-        "nineteen embedded migrations, none applied (through MOD-125's 0019_stop_runs.sql)"
+        MigrationState::Pending(20),
+        "twenty embedded migrations, none applied (through MOD-137's 0020_step_graph_v2.sql)"
     );
 
     db.drop_db().await;
@@ -2001,8 +2980,8 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(19),
-        "nineteen embedded migrations, through MOD-125's 0019_stop_runs.sql"
+        MigrationState::Pending(20),
+        "twenty embedded migrations, through MOD-137's 0020_step_graph_v2.sql"
     );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
@@ -2010,8 +2989,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("a pending schema is refused");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(19),
-        "every one of the nineteen, through MOD-125's 0019_stop_runs.sql, is pending"
+        HeadlessError::MigrationsPending(20),
+        "every one of the twenty, through MOD-137's 0020_step_graph_v2.sql, is pending"
     );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
@@ -2033,8 +3012,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("no migrations table is every migration pending");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(19),
-        "every one of the nineteen, through MOD-125's 0019_stop_runs.sql, is pending"
+        HeadlessError::MigrationsPending(20),
+        "every one of the twenty, through MOD-137's 0020_step_graph_v2.sql, is pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
@@ -2185,9 +3164,9 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        19,
-        "the later applies migrate nothing: the nineteen embedded migrations (through MOD-125's \
-         0019_stop_runs.sql) are applied once"
+        20,
+        "the later applies migrate nothing: the twenty embedded migrations (through MOD-137's \
+         0020_step_graph_v2.sql) are applied once"
     );
 
     db.drop_db().await;

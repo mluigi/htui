@@ -137,9 +137,9 @@ async fn start_reports_the_pending_count_over_a_bare_database() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(19),
-        "the harness left the schema unapplied: nineteen embedded migrations, through MOD-125's \
-         0019_stop_runs.sql"
+        MigrationState::Pending(20),
+        "the harness left the schema unapplied: twenty embedded migrations, through MOD-137's \
+         0020_step_graph_v2.sql"
     );
     let root = tempfile::tempdir().expect("temp root");
 
@@ -153,9 +153,9 @@ async fn start_reports_the_pending_count_over_a_bare_database() {
 
     match next_event(&mut started, "a bare database").await {
         ConnEvent::MigrationsPending(_, pending) => assert_eq!(
-            pending, 19,
-            "all nineteen embedded migrations are waiting (R-STO-5: nothing is applied unasked); \
-             nineteen embedded migrations, through MOD-125's 0019_stop_runs.sql"
+            pending, 20,
+            "all twenty embedded migrations are waiting (R-STO-5: nothing is applied unasked); \
+             twenty embedded migrations, through MOD-137's 0020_step_graph_v2.sql"
         ),
         other => panic!("expected MigrationsPending, got {other:?}"),
     }
@@ -239,9 +239,9 @@ async fn apply_migrations_then_persist_writes_a_minted_id_back() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(19),
-        "the store was handed back before any registration (nineteen embedded migrations since \
-         MOD-125's 0019_stop_runs.sql)"
+        MigrationState::Pending(20),
+        "the store was handed back before any registration (twenty embedded migrations since \
+         MOD-137's 0020_step_graph_v2.sql)"
     );
 
     // The schema and the single `app_user` exist before this store registers, so the other
