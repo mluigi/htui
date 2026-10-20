@@ -1284,7 +1284,13 @@ mod tests {
         let mut form = activation_form(Activation::Always);
         let key = |form: &mut Form, spec: &str, keys: &Keys| {
             let key = event(spec);
-            activation_key(form, key, KeyChord::from_event(key), keys, views::ATTACH_FORM)
+            activation_key(
+                form,
+                key,
+                KeyChord::from_event(key),
+                keys,
+                views::ATTACH_FORM,
+            )
         };
         let outcome = key(&mut form, "space", compiled);
         assert_eq!(outcome, FieldOutcome::Consumed);
