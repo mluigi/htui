@@ -210,22 +210,24 @@ impl Tab for SkillsTab {
         Panes::ListDetail(library::LAYOUT)
     }
 
-    /// MOD-115 M2 §8: the shown view (`library` or `templates`, with its title) and its row.
+    /// MOD-115 M2 §8: the shown view (`library` or `templates`, with its title) and its row:
+    /// the row's index and, RV3, what it holds (the skill's id, the template's `project:name`).
     fn location(&self) -> TabLoc {
         let cursor = match self.view {
-            View::Skills => self.library.cursor(),
-            View::Templates => self.templates.cursor(),
+            View::Skills => self.library.location_cursor(),
+            View::Templates => self.templates.location_cursor(),
         };
         TabLoc {
             subtab: Some(self.view.id()),
             subtab_title: Some(self.view.title().to_owned()),
-            cursor: Some(cursor.to_string()),
+            cursor: Some(cursor),
         }
     }
 
-    /// MOD-115 M2 §8: back to a [`location`](Tab::location): its view shown and its row under
-    /// the cursor. Nothing while either view is taking keys: a move would leave a prompt or an
-    /// editor behind.
+    /// MOD-115 M2 §8: back to a [`location`](Tab::location): its view shown and the cursor on
+    /// the skill or template it held, wherever a create, an import or a delete moved it, else
+    /// on its row (clamped). Nothing while either view is taking keys: a move would leave a
+    /// prompt or an editor behind.
     fn restore(&mut self, loc: &TabLoc, _ctx: &mut Ctx<'_>) -> bool {
         let target = View::ALL
             .into_iter()
@@ -236,14 +238,10 @@ impl Tab for SkillsTab {
         if let Some(view) = target {
             self.view = view;
         }
-        let row = loc
-            .cursor
-            .as_deref()
-            .and_then(|cursor| cursor.parse().ok())
-            .is_some_and(|index| match self.view {
-                View::Skills => self.library.restore_cursor(index),
-                View::Templates => self.templates.restore_cursor(index),
-            });
+        let row = loc.cursor.as_deref().is_some_and(|cursor| match self.view {
+            View::Skills => self.library.restore_cursor(cursor),
+            View::Templates => self.templates.restore_cursor(cursor),
+        });
         target.is_some() || row
     }
 

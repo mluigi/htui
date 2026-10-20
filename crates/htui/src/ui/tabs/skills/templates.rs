@@ -1081,19 +1081,42 @@ impl TemplatesView {
         self.notice = None;
     }
 
-    /// The row under the cursor, for the tab's history location (MOD-115 M2 §8).
-    pub(super) const fn cursor(&self) -> usize {
-        self.cursor
+    /// The row under the cursor, for the tab's history location (MOD-115 M2 §8): its index and
+    /// what it holds (RV3), `{index}:{project}:{name}` on a template, `{index}:{project}` on a
+    /// project header, so Back finds the row again after a create moved it.
+    pub(super) fn location_cursor(&self) -> String {
+        match self.rows().into_iter().nth(self.cursor) {
+            Some(Row::Template { project, name }) => format!("{}:{project}:{name}", self.cursor),
+            Some(Row::Project(project)) => format!("{}:{project}", self.cursor),
+            None => self.cursor.to_string(),
+        }
     }
 
-    /// MOD-115 M2 §8: the cursor back on row `index` (clamped to the tree), the head's body
-    /// shown from its top, as a move shows it. Only while browsing with no draft handed off:
-    /// the name prompt and an editor keep their row. Whether it moved.
-    pub(super) fn restore_cursor(&mut self, index: usize) -> bool {
+    /// MOD-115 M2 §8: the cursor back on a [`location_cursor`](Self::location_cursor): onto its
+    /// template or header wherever the tree now holds it, else on its row (clamped to the
+    /// tree), the head's body shown from its top, as a move shows it. Only while browsing with
+    /// no draft handed off: the name prompt and an editor keep their row. Whether it moved; a
+    /// cursor with no row moves nothing.
+    pub(super) fn restore_cursor(&mut self, cursor: &str) -> bool {
+        let mut parts = cursor.splitn(3, ':');
+        let Some(Ok(index)) = parts.next().map(str::parse::<usize>) else {
+            return false;
+        };
+        let held = match (parts.next().map(str::parse), parts.next()) {
+            (Some(Ok(project)), Some(name)) => Some(Row::Template {
+                project,
+                name: name.to_owned(),
+            }),
+            (Some(Ok(project)), None) => Some(Row::Project(project)),
+            _ => None,
+        };
         if !matches!(self.mode, Mode::Browse) || self.handed_off().is_some() {
             return false;
         }
-        self.cursor = index.min(self.rows().len().saturating_sub(1));
+        let rows = self.rows();
+        self.cursor = held
+            .and_then(|held| rows.iter().position(|row| *row == held))
+            .unwrap_or_else(|| index.min(rows.len().saturating_sub(1)));
         self.shown = None;
         self.base = None;
         self.pane = Pane::Body;
@@ -2374,6 +2397,51 @@ mod tests {
         assert!(bench.emit.take().is_empty());
     }
 
+    /// MOD-115 M2 §8, RV3 (review M2): the location names the row under the cursor as well as
+    /// its index: a template by `{index}:{project}:{name}`, a project header by
+    /// `{index}:{project}`. A template created before it moves its row, and the cursor goes back
+    /// onto the same template; one that is gone falls back to the row, clamped.
+    #[tokio::test]
+    async fn the_cursor_finds_its_template_after_the_tree_changed() {
+        let bench = Bench::new();
+        let mut view = browsing(&bench).await;
+        let project = match view.rows()[0] {
+            Row::Project(project) => project,
+            Row::Template { .. } => panic!("the tree opens on a project header"),
+        };
+        assert_eq!(view.location_cursor(), format!("0:{project}"));
+        view.move_cursor(true);
+        view.move_cursor(true);
+        let Some((_, name)) = view.selected_template() else {
+            panic!("a template on the third row");
+        };
+        let at = view.location_cursor();
+        assert_eq!(at, format!("2:{project}:{name}"));
+
+        let snapshot = view.snapshot.as_mut().expect("read");
+        let mut created = snapshot.projects[0].templates[0].clone();
+        created.name = "aaa-triage".to_owned();
+        snapshot.projects[0].templates.insert(0, created);
+        view.cursor = 0;
+        assert!(view.restore_cursor(&at));
+        assert_eq!(
+            view.selected_template(),
+            Some((project, name.clone())),
+            "on the same template"
+        );
+        assert_eq!(view.cursor, 3, "a row down");
+
+        let snapshot = view.snapshot.as_mut().expect("read");
+        snapshot.projects[0]
+            .templates
+            .retain(|row| row.name != name);
+        view.cursor = 0;
+        assert!(view.restore_cursor(&at));
+        assert_eq!(view.cursor, 2, "the template is gone: its row");
+        assert!(!view.restore_cursor("not a row"));
+        assert_eq!(view.cursor, 2, "an unreadable cursor moves nothing");
+    }
+
     /// MOD-115 M2 §8: the Skills tab's location is the shown view (`library` or `templates`,
     /// with its title) and that view's row; restoring it shows the view and puts the row back.
     /// Nothing moves under an open prompt.
@@ -2392,7 +2460,13 @@ mod tests {
         let library = tab.location();
         assert_eq!(library.subtab, Some("library"));
         assert_eq!(library.subtab_title.as_deref(), Some("Skills"));
-        assert_eq!(library.cursor.as_deref(), Some("0"));
+        assert!(
+            library
+                .cursor
+                .as_deref()
+                .is_some_and(|at| at.starts_with("0:")),
+            "the library's first row and its skill: {library:?}"
+        );
 
         tab.on_key(key('l'), &mut bench.ctx());
         tab.on_key(key('j'), &mut bench.ctx());
@@ -2400,7 +2474,12 @@ mod tests {
         let here = tab.location();
         assert_eq!(here.subtab, Some("templates"));
         assert_eq!(here.subtab_title.as_deref(), Some("Templates"));
-        assert_eq!(here.cursor.as_deref(), Some("2"));
+        assert!(
+            here.cursor
+                .as_deref()
+                .is_some_and(|at| at.starts_with("2:")),
+            "the tree's third row and its template: {here:?}"
+        );
 
         // RV3 (review M1): each view's cursor moves off the row first, so a restore that put
         // back only the view would leave it there.

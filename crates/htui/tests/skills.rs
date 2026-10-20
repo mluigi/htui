@@ -2056,3 +2056,39 @@ async fn the_name_prompt_opened_with_the_list_zoomed_is_on_screen() {
         "the prompt is drawn:\n{frame}"
     );
 }
+
+/// MOD-115 M2 §8, RV3 (review M2): the history names the skill left, not its row. A skill
+/// created between leaving and Back sorts before `tests` and moves its row down one; Back still
+/// lands on `tests`, not on the skill that took its row.
+#[tokio::test]
+async fn back_lands_on_the_skill_left_after_a_create_moved_its_row() {
+    let mut harness = open().await;
+    select(&mut harness, "tests");
+    // To the Templates view and back: the library's place is in the history.
+    harness.key("l");
+    harness.key("h");
+    harness.settle().await;
+    harness.key("n");
+    type_text(&mut harness, "aaa-docs");
+    harness.key("enter");
+    type_text(&mut harness, "How docs read");
+    harness.key("enter");
+    type_text(&mut harness, "Write in the active voice.");
+    harness.key("ctrl-s");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} aaa-docs v1 (head v1)"),
+        "the new skill, first in the library, is under the cursor:\n{frame}"
+    );
+    harness.key("backspace");
+    harness.settle().await;
+    harness.render();
+    harness.key("backspace");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} tests v"),
+        "back on `tests`:\n{frame}"
+    );
+}

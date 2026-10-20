@@ -1504,3 +1504,37 @@ async fn the_name_prompt_opened_with_the_tree_zoomed_is_on_screen() {
         "the prompt is drawn:\n{frame}"
     );
 }
+
+/// MOD-115 M2 §8, RV3 (review M2): the history names the template left (`project:name`), not
+/// its row. A template created between leaving and Back sorts before `implement` and moves its
+/// row down one; Back still lands on `implement`, not on the template that took its row.
+#[tokio::test]
+async fn back_lands_on_the_template_left_after_a_create_moved_its_row() {
+    let store = MemStore::demo();
+    let mut harness = open_over(store.clone()).await;
+    select(&mut harness, "implement");
+    // To the Skills view and back: the tree's place is in the history.
+    harness.key("h");
+    harness.key("l");
+    harness.settle().await;
+    harness.key("n");
+    type_text(&mut harness, "aaa-triage");
+    harness.key("enter");
+    type_text(&mut harness, "Triage {{item}}");
+    harness.key("ctrl-s");
+    harness.settle().await;
+    assert!(
+        head(&store, "aaa-triage").await.is_some(),
+        "the new name was saved"
+    );
+    harness.key("backspace");
+    harness.settle().await;
+    harness.render();
+    harness.key("backspace");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} implement v"),
+        "back on `implement`:\n{frame}"
+    );
+}

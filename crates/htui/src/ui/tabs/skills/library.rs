@@ -42,7 +42,7 @@ use crate::editor::{ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, ed
 use crate::keys::translate::FieldEvent;
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::skill_import::ImportOutcome;
-use crate::skills::{READ_NAME, REQUEST_NAMES, SkillWrite, SkillsSnapshot, StaleWhat};
+use crate::skills::{READ_NAME, REQUEST_NAMES, SkillEntry, SkillWrite, SkillsSnapshot, StaleWhat};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::TemplateBody;
 use crate::ui::cells::{self, cell_width};
@@ -1672,16 +1672,28 @@ impl LibraryView {
         self.notice = None;
     }
 
-    /// The row under the cursor, for the tab's history location (MOD-115 M2 §8).
-    pub(super) const fn cursor(&self) -> usize {
-        self.cursor
+    /// The row under the cursor, for the tab's history location (MOD-115 M2 §8): its index and,
+    /// on a skill, the skill's id (`{index}:{id}`, RV3), so Back finds the skill again after a
+    /// create, an import or a delete moved its row.
+    pub(super) fn location_cursor(&self) -> String {
+        match self.entry_at(self.cursor) {
+            Some(entry) => format!("{}:{}", self.cursor, entry.skill.id),
+            None => self.cursor.to_string(),
+        }
     }
 
-    /// MOD-115 M2 §8: the cursor back on row `index` (clamped to the library), the head's body
-    /// shown from its top, as a move shows it. Only while browsing with nothing open over the
-    /// list: a prompt, the attachments pane or a handed-off draft keeps its row. Whether it
-    /// moved.
-    pub(super) fn restore_cursor(&mut self, index: usize) -> bool {
+    /// MOD-115 M2 §8: the cursor back on a [`location_cursor`](Self::location_cursor): onto its
+    /// skill wherever the library now holds it ([`select`](Self::select)), else on its row
+    /// (clamped to the library), the head's body shown from its top, as a move shows it. Only
+    /// while browsing with nothing open over the list: a prompt, the attachments pane or a
+    /// handed-off draft keeps its row. Whether it moved; a cursor with no row moves nothing.
+    pub(super) fn restore_cursor(&mut self, cursor: &str) -> bool {
+        let (index, skill) = cursor
+            .split_once(':')
+            .map_or((cursor, None), |(index, skill)| (index, skill.parse().ok()));
+        let Ok(index) = index.parse::<usize>() else {
+            return false;
+        };
         if !matches!(self.mode, Mode::Browse)
             || self.attach.is_some()
             || self.handed_off().is_some()
@@ -1693,8 +1705,16 @@ impl LibraryView {
             .as_ref()
             .map_or(0, |snapshot| snapshot.skills.len().saturating_sub(1));
         self.cursor = index.min(last);
-        self.reset_pane();
+        match skill {
+            Some(skill) => self.select(skill),
+            None => self.reset_pane(),
+        }
         true
+    }
+
+    /// The library's entry on row `index`, if the library is read and holds that row.
+    fn entry_at(&self, index: usize) -> Option<&SkillEntry> {
+        self.snapshot.as_ref()?.skills.get(index)
     }
 
     /// The cursor onto `skill`, its head's body shown.
@@ -3725,22 +3745,53 @@ mod tests {
     }
 
     /// MOD-115 M2 §8: the cursor goes back to a row while browsing (the head's body from its
-    /// top, as a move shows it), clamped to the library; never under an open prompt.
+    /// top, as a move shows it), clamped to the library; never under an open prompt, and not
+    /// for a cursor this view did not write.
     #[tokio::test]
     async fn the_cursor_is_restored_only_while_browsing() {
         let bench = Bench::new();
         let mut view = browsing(&bench).await;
         view.scroll = Scroll::at(3);
-        assert!(view.restore_cursor(1));
+        assert!(view.restore_cursor("1"));
         assert_eq!((view.cursor, view.scroll.offset()), (1, 0));
-        assert!(view.restore_cursor(99));
+        assert!(view.restore_cursor("99"));
         let last = view.snapshot.as_ref().map_or(0, |s| s.skills.len() - 1);
         assert_eq!(view.cursor, last, "clamped");
+        assert!(!view.restore_cursor("not a row"));
+        assert_eq!(view.cursor, last, "an unreadable cursor moves nothing");
 
         view.mode = Mode::Naming {
             field: TextField::new(),
         };
-        assert!(!view.restore_cursor(0));
+        assert!(!view.restore_cursor("0"));
         assert_eq!(view.cursor, last, "the prompt keeps the row");
+    }
+
+    /// MOD-115 M2 §8, RV3 (review M2): the location names the skill under the cursor as well as
+    /// its row (`{index}:{id}`). A skill created before it moves its row, and the cursor goes
+    /// back onto the same skill; a skill that is gone falls back to the row, clamped.
+    #[tokio::test]
+    async fn the_cursor_finds_its_skill_after_the_library_changed() {
+        let bench = Bench::new();
+        let mut view = browsing(&bench).await;
+        view.on_key(key(KeyCode::Char('j')), &mut bench.ctx());
+        let skill = view.snapshot.as_ref().expect("read").skills[1].skill.id;
+        let at = view.location_cursor();
+        assert_eq!(at, format!("1:{skill}"));
+
+        let snapshot = view.snapshot.as_mut().expect("read");
+        let mut created = snapshot.skills[0].clone();
+        created.skill.id = SkillId::new();
+        created.skill.name = "aaa-docs".to_owned();
+        snapshot.skills.insert(0, created);
+        view.cursor = 0;
+        assert!(view.restore_cursor(&at));
+        assert_eq!(view.cursor, 2, "on the same skill, a row down");
+
+        let snapshot = view.snapshot.as_mut().expect("read");
+        snapshot.skills.retain(|entry| entry.skill.id != skill);
+        view.cursor = 0;
+        assert!(view.restore_cursor(&at));
+        assert_eq!(view.cursor, 1, "the skill is gone: its row");
     }
 }
