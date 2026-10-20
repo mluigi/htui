@@ -1,0 +1,20 @@
+# A key file from before MOD-115 M2 (no `version`): each entry binds an action of its own screen
+# to a key a view kept then (a text field's editing key, a choice's value key, a permission
+# digit, the Requirements priority). It loaded before M2, and still does with every one of those
+# keys working (MOD-115 M2 RV1 H1, MD4).
+
+[global]
+next_tab = ["backspace"]
+select_tab_2 = ["1"]
+
+[form]
+next_field = ["home"]
+
+[confirm]
+yes = ["space"]
+
+[requirements]
+amend = ["m"]
+
+[settings.hierarchy]
+prev_field = ["enter"]

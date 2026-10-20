@@ -29,6 +29,7 @@ use crate::run_worker::{RunRuntime, RunServed, TuiRuns as _};
 use crate::store_worker::{self, Origin, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::overlay::Overlay;
+use crate::ui::state_file::UiStore;
 use crate::ui::tabs::Tab;
 use crate::ui::tabs::settings::{SettingsSection, SettingsTab};
 
@@ -187,6 +188,27 @@ impl Harness {
     pub fn with_keys(mut self, keys: Keys) -> Self {
         self.app.keys = keys;
         self
+    }
+
+    /// Keeps the UI state in `store` (MOD-115 M2 D1) and starts from what it holds, as `run`
+    /// starts from `ui-state.toml`. Two harnesses over one [`UiStore::memory`] handle (a clone
+    /// shares it) are one machine restarted: the restart acceptance test.
+    #[must_use]
+    pub fn with_ui_store(mut self, store: UiStore) -> Self {
+        let loaded = store.load();
+        self.app.apply_ui_state(loaded.state);
+        self.app.ui_store = store;
+        if loaded.notice.is_some() {
+            self.app.status = loaded.notice;
+        }
+        self
+    }
+
+    /// The store the shell saves its UI state in: [`UiStore::memory`] unless
+    /// [`with_ui_store`](Self::with_ui_store) handed it another.
+    #[must_use]
+    pub fn ui_store(&self) -> UiStore {
+        self.app.ui_store.clone()
     }
 
     /// What the harness does with a [`RunServed`] that is not a plain reply, as the store loop's
@@ -499,6 +521,19 @@ impl Harness {
     #[must_use]
     pub fn with_tab(mut self, tab: Box<dyn Tab>) -> Self {
         self.app.register_tab(tab);
+        self
+    }
+
+    /// Registers the leave dialog (MOD-115 M2 D6), as [`register_all`](crate::app::register_all)
+    /// does: `global.quit` then opens it rather than leaving at once, and its `leave.confirm` (a
+    /// second `ctrl-c`, `Enter`) leaves. A harness without it leaves on the first quit.
+    #[must_use]
+    pub fn with_leave_dialog(mut self) -> Self {
+        use crate::ui::overlay::LeaveDialog;
+        self.app
+            .overlay_factories
+            .register(LeaveDialog::ID, || Box::new(LeaveDialog::new()));
+        self.app.leave_overlay = Some(LeaveDialog::ID);
         self
     }
 
@@ -969,7 +1004,8 @@ mod tests {
         // An empty store leaves the registration's switcher up and a modal overlay swallows what
         // it does not handle, so the tab bindings only apply once it is closed.
         harness.key("esc");
-        harness.key("tab");
+        // MOD-115 M2 D4: `ctrl-pgdn` is the next tab (`Tab` moves the pane focus).
+        harness.key("ctrl-pgdn");
         harness.settle().await;
         assert!(harness.render().contains("Skills"));
         assert_eq!(
@@ -1069,8 +1105,15 @@ mod tests {
         harness.key("esc");
         assert!(harness.app().overlays.is_empty());
 
-        // With no overlay left, the global table sees the key again.
+        // With no overlay left, the global table sees the key again: `q` opens the leave dialog
+        // (MOD-115 M2 D6), whose `Enter` leaves.
         harness.key("q");
+        assert!(!harness.app().should_quit);
+        assert_eq!(
+            harness.app().overlays.top().map(Overlay::id),
+            Some(crate::ui::overlay::LeaveDialog::ID)
+        );
+        harness.key("enter");
         assert!(harness.app().should_quit);
     }
 }

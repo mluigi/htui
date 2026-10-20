@@ -292,7 +292,7 @@ async fn esc_answers_the_prompt_like_n() {
 }
 
 /// MOD-52: the switcher is modal and swallows `q`, but `ctrl-c` quits through the overlay
-/// wildcard binding.
+/// stack's quit layer: it opens the leave dialog (MOD-115 M2 D6), and a second one leaves.
 #[tokio::test]
 async fn ctrl_c_quits_from_the_modal_switcher() {
     let mut harness = open_over_demo().await;
@@ -300,6 +300,17 @@ async fn ctrl_c_quits_from_the_modal_switcher() {
     assert!(
         !harness.app().should_quit,
         "the modal overlay still swallows `q`"
+    );
+    assert_eq!(
+        harness.app().overlays.iter().count(),
+        1,
+        "and opens nothing"
+    );
+    harness.key("ctrl-c");
+    assert_eq!(
+        harness.app().overlays.top().map(|overlay| overlay.id()),
+        Some(htui::ui::overlay::LeaveDialog::ID),
+        "`ctrl-c` asks first"
     );
     harness.key("ctrl-c");
     assert!(harness.app().should_quit, "`ctrl-c` quits from it");
@@ -600,4 +611,251 @@ async fn a_ten_row_frame_drops_the_about_panel() {
         let frame = harness.render();
         assert_eq!(frame.contains("About"), shown, "{height} rows: {frame}");
     }
+}
+
+/// The demo shell with `keys` installed (the defaults when `None`), moved to the Platform
+/// workspace and on the Requirements tab, as `tests/requirements.rs` opens it.
+async fn requirements_shell(keys: Option<&str>) -> Harness {
+    use htui::ui::tabs::RequirementsTab;
+
+    let mut harness = Harness::over(htui_core::store::MemStore::demo());
+    if let Some(file) = keys {
+        harness = harness.with_keys(htui::keys::load_str(file).expect("the keys load"));
+    }
+    register_all(harness.app());
+    harness.settle().await;
+    harness.key("w");
+    harness.settle().await;
+    harness.key("j");
+    harness.key("enter");
+    harness.settle().await;
+    harness.key("3");
+    harness.settle().await;
+    assert_eq!(harness.app().tabs.active_id(), Some(RequirementsTab::ID));
+    harness
+}
+
+/// Presses each key of `keys` in turn, settling after each.
+async fn press_all(harness: &mut Harness, keys: &[&str]) {
+    for key in keys {
+        harness.key(key);
+        harness.settle().await;
+    }
+}
+
+/// Whether the view holding the keyboard captures text (a `[field]` layer in its stack).
+fn captures(harness: &mut Harness) -> bool {
+    harness
+        .app()
+        .active_stack()
+        .is_some_and(htui::keys::Stack::captures_text)
+}
+
+/// MOD-115 M2 D7 (blueprint §3), T6R finding 3: the shell's `[field]` translation, end to end on
+/// a real capturing screen (the Requirements filter). With `field.submit` and
+/// `field.delete_back` rebound, the rebound chords edit and submit the filter exactly as the
+/// canonical `Backspace` and `Enter` do with the defaults; `Esc` still cancels with
+/// `field.cancel` moved to another chord (MD7), and so does that chord.
+#[tokio::test]
+async fn a_rebound_field_key_edits_and_submits_a_real_field_as_its_canonical_key_did() {
+    const REBOUND: &str = "version = 2\n[field]\nsubmit = [\"ctrl-t\"]\ndelete_back = [\"f7\"]\ncancel = [\"ctrl-o\"]\n";
+
+    let mut canonical = requirements_shell(None).await;
+    let mut rebound = requirements_shell(Some(REBOUND)).await;
+    press_all(&mut canonical, &["/"]).await;
+    press_all(&mut rebound, &["/"]).await;
+    assert!(
+        captures(&mut canonical) && captures(&mut rebound),
+        "the filter is open"
+    );
+
+    press_all(&mut canonical, &["S", "T", "O", "X", "backspace"]).await;
+    press_all(&mut rebound, &["S", "T", "O", "X", "f7"]).await;
+    // MOD-115 M2 T7: the filter's hint names `field.submit` through the keys (MD1), so the
+    // rebound frame reads `Ctrl+t apply` where the canonical one reads `Enter apply`, one rule
+    // cell shorter; the rest is the same frame.
+    let open = rebound.render();
+    assert!(
+        open.contains("Ctrl+t apply"),
+        "the hint names the rebound key: {open}"
+    );
+    assert_eq!(
+        open.replace(
+            "Ctrl+t apply \u{b7} Esc clear",
+            "Enter apply \u{b7} Esc clear\u{2500}"
+        ),
+        canonical.render(),
+        "`F7` deleted back as `Backspace` did"
+    );
+    press_all(&mut canonical, &["enter"]).await;
+    press_all(&mut rebound, &["ctrl-t"]).await;
+    let frame = rebound.render();
+    assert_eq!(
+        frame,
+        canonical.render(),
+        "`ctrl-t` submitted as `Enter` did"
+    );
+    assert!(!captures(&mut rebound), "the filter is submitted: {frame}");
+    assert!(
+        frame.contains("R-STO-1") && !frame.contains("R-ENT-2"),
+        "the list is filtered on `STO`: {frame}"
+    );
+
+    // MD7: `Esc` is never configurable; the moved `field.cancel` chord cancels too.
+    for cancel in ["esc", "ctrl-o"] {
+        let mut canonical = requirements_shell(None).await;
+        let mut rebound = requirements_shell(Some(REBOUND)).await;
+        press_all(&mut canonical, &["/", "E", "N", "T", "esc"]).await;
+        press_all(&mut rebound, &["/", "E", "N", "T", cancel]).await;
+        assert!(!captures(&mut rebound), "`{cancel}` closed the filter");
+        assert_eq!(
+            rebound.render(),
+            canonical.render(),
+            "`{cancel}` cancelled as `Esc` does"
+        );
+    }
+}
+
+/// A list + detail tab that records the panes the shell gives it, for the layout cases (MOD-115
+/// M2 T6): the production tabs adopt the layout in Task 7.
+mod split {
+    use std::sync::{Arc, Mutex};
+
+    use crossterm::event::KeyEvent;
+    use htui::app::{Ctx, Handled};
+    use htui::keys::{Stack, views};
+    use htui::store_worker::{StoreReply, StoreRequest};
+    use htui::ui::shell::{PaneAreas, Panes, TabLayout};
+    use htui::ui::tabs::{Tab, TabId};
+    use htui_core::model::Scope;
+    use ratatui::Frame;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::{Block, BorderType};
+
+    /// The panes of every frame drawn, last last.
+    pub type Drawn = Arc<Mutex<Vec<PaneAreas>>>;
+
+    pub struct Split(pub Drawn);
+
+    impl Tab for Split {
+        fn id(&self) -> TabId {
+            TabId("split")
+        }
+        fn title(&self) -> &str {
+            "Split"
+        }
+        fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+            Vec::new()
+        }
+        fn on_scope_change(&mut self, _scope: &Scope) {}
+        fn on_key(&mut self, _key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            Handled::Pass
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
+            let areas = ctx.split(area, TabLayout::DEFAULT);
+            self.0.lock().expect("not poisoned").push(areas);
+            for pane in [areas.list, Some(areas.detail), areas.activity]
+                .into_iter()
+                .flatten()
+                .filter(|rect| !rect.is_empty())
+            {
+                frame.render_widget(Block::bordered().border_type(BorderType::Rounded), pane);
+            }
+        }
+        fn key_stack(&self) -> Option<Stack<'static>> {
+            Some(views::BACKLOG_BODY)
+        }
+        fn panes(&self) -> Panes {
+            Panes::ListDetail(TabLayout::DEFAULT)
+        }
+    }
+}
+
+/// MOD-115 M2 D1, the plan's acceptance: the layout and the about panel survive a restart.
+/// Change both, drop the shell, build another over the same UI-state store, and the new shell
+/// draws the layout and shows the about panel as they were left.
+#[tokio::test]
+async fn the_layout_and_the_about_panel_survive_a_restart() {
+    use htui::ui::shell::ListSize;
+    use htui::ui::state_file::UiStore;
+
+    let store = UiStore::memory();
+    let drawn = split::Drawn::default();
+    let mut first = Harness::demo()
+        .with_ui_store(store.clone())
+        .with_tab(Box::new(split::Split(drawn.clone())));
+    first.settle().await;
+    let _ = first.render();
+    let before = *drawn.lock().expect("not poisoned").last().expect("drawn");
+    first.key(">");
+    first.key("f2");
+    assert!(!first.app().about_visible);
+    first.key("f9");
+    assert!(first.app().about_visible);
+    let _ = first.render();
+    let left = *drawn.lock().expect("not poisoned").last().expect("drawn");
+    assert_eq!(left.list, None, "f2 hid the list");
+    drop(first);
+
+    let redrawn = split::Drawn::default();
+    let mut again = Harness::demo()
+        .with_ui_store(store.clone())
+        .with_tab(Box::new(split::Split(redrawn.clone())));
+    again.settle().await;
+    assert!(again.app().about_visible, "the about panel stays on");
+    let _ = again.render();
+    let restored = *redrawn.lock().expect("not poisoned").last().expect("drawn");
+    assert_eq!(restored, left, "the layout is drawn as it was left");
+    assert_ne!(restored, before);
+    again.key("f2");
+    let _ = again.render();
+    let shown = *redrawn.lock().expect("not poisoned").last().expect("drawn");
+    let list = shown.list.expect("f2 shows the list again");
+    let body = list.width + shown.detail.width;
+    assert_eq!(
+        list.width,
+        body * 55 / 100,
+        "the grown list (55%, from `>`) came back with it"
+    );
+    let state = store.load().state;
+    assert_eq!(
+        state.layouts.get("split").map(|layout| layout.list),
+        Some(ListSize::Percent(55))
+    );
+}
+
+/// MOD-115 M2 RV2 M2: a restart with zoom on brings back the pane that was zoomed (the detail),
+/// not the list: the new shell draws the detail over the whole body, as it was left.
+#[tokio::test]
+async fn a_restart_with_zoom_on_brings_the_zoomed_detail_back() {
+    use htui::ui::state_file::UiStore;
+
+    let store = UiStore::memory();
+    let drawn = split::Drawn::default();
+    let mut first = Harness::demo()
+        .with_ui_store(store.clone())
+        .with_tab(Box::new(split::Split(drawn.clone())));
+    first.settle().await;
+    let _ = first.render();
+    first.key("tab");
+    first.key("z");
+    let _ = first.render();
+    let left = *drawn.lock().expect("not poisoned").last().expect("drawn");
+    assert_eq!(left.list, None, "the detail is zoomed");
+    assert!(!left.detail.is_empty());
+    drop(first);
+
+    let redrawn = split::Drawn::default();
+    let mut again = Harness::demo()
+        .with_ui_store(store.clone())
+        .with_tab(Box::new(split::Split(redrawn.clone())));
+    again.settle().await;
+    let _ = again.render();
+    let restored = *redrawn.lock().expect("not poisoned").last().expect("drawn");
+    assert_eq!(restored, left, "the zoomed detail comes back");
+    again.key("z");
+    let _ = again.render();
+    let unzoomed = *redrawn.lock().expect("not poisoned").last().expect("drawn");
+    assert!(unzoomed.list.is_some(), "unzoomed, the list is back");
 }

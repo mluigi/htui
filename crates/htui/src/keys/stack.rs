@@ -172,6 +172,13 @@ impl<'a> Stack<'a> {
             .find(|(_, layer)| layer.context == Context::Global)
     }
 
+    /// Whether the stack captures text (MOD-115 M2 B3): it has a `[field]` layer. The shell
+    /// translates the `[field]` chords into the widgets' canonical events only then.
+    #[must_use]
+    pub fn captures_text(self) -> bool {
+        self.0.iter().any(|layer| layer.context == Context::Field)
+    }
+
     /// Whether this stack has a layer of `context` that admits `act` (the D10 legality test).
     pub(crate) fn view_admits(self, context: Context, act: Act) -> bool {
         self.0
@@ -185,10 +192,12 @@ impl Stack<'static> {
     /// `[global]`: D6 step 6, the status line and the `?` box's global line.
     pub const BASE: Self = Self(&[Layer::all(Context::Global)]);
 
-    /// `[overlay, global ∩ {help}]`: D6 step 2. `Esc` closes and `?`/`F1` toggle help over a
-    /// modal overlay, for keys the overlay passed.
+    /// `[overlay, global ∩ {quit} (filtered), global ∩ {help}]`: D6 step 2. `Esc` closes and
+    /// `?`/`F1` toggle help over a modal overlay, for keys the overlay passed; MOD-115 M2 B4 adds
+    /// the quit layer, so `ctrl-c` resolves to `global.quit` over every overlay.
     pub const OVERLAY: Self = Self(&[
         Layer::all(Context::Overlay),
+        Layer::only(Context::Global, &[Act::Quit]).with_modal_filter(),
         Layer::only(Context::Global, &[Act::Help]),
     ]);
 
@@ -284,17 +293,18 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("in the agent help proposal", views::HELP_PROPOSAL),
     ("in Requirements", views::REQUIREMENTS_BROWSE),
     ("in a Requirements form", views::REQUIREMENTS_FORM),
+    ("in a Requirements area form", views::AREA_FORM),
     (
         "in the Requirements withdraw form",
         views::REQUIREMENTS_WITHDRAW,
     ),
-    ("in the quit question", views::QUIT_CONFIRM),
     ("in the abort question", views::ABORT_CONFIRM),
     (WHILE_EDITING, Stack::EDITOR_OPEN),
     // MOD-67 M5: the Backlog and Chat stacks, in strip order, after M4's (blueprint §4.3).
     ("in Backlog > Body", views::BACKLOG_BODY),
     ("in Backlog > Runs", views::RUNS_BROWSE),
     ("in a Runs question", views::RUNS_CONFIRM),
+    ("in a Runs cancel question", views::RUNS_CANCEL),
     ("while the Runs close-out counts", views::RUNS_COUNTING),
     ("in the Runs document view", views::RUNS_ARTIFACT),
     ("in Backlog > Graph", views::BACKLOG_GRAPH),
@@ -316,113 +326,9 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     // existing first-reported phrase is unchanged.
     ("in the queue overlay", views::QUEUE_OVERLAY),
     ("in the Hierarchy directory picker", views::HIERARCHY_PICKER),
-];
-
-/// Keys a view matches ahead of the resolver in one declared stack (ANA-26 §6.1, MOD-67 M5 D5):
-/// a choice's value keys, a form's own `Enter`/`Esc`, the permission digits. They are not
-/// actions, and no key file moves them, so an act bound to one never hears it there; the
-/// validator refuses such a binding (M5 R1 M1), on the user's line, naming the stack.
-#[derive(Debug, Clone, Copy)]
-pub struct Fixed {
-    /// The stack, one of [`DECLARED`]'s; its phrase names it in the error.
-    pub stack: Stack<'static>,
-    /// The keys, spelled as in a key file, matched on plain keys only (SHIFT aside), so the
-    /// validator also refuses a named key's SHIFT form (`shift-left`); a character has none.
-    pub chords: &'static [&'static str],
-    /// The keys shadow only the stack's global layer: the Chat replay resolves its own acts
-    /// first and swallows what they left (M5 R1 M1 (a)).
-    pub only_global: bool,
-    /// Acts the keys shadow by design, on any of them: the tab select, whose digit must not move
-    /// the user off a parked request or a replay (MOD-42 D14, D40).
-    pub shadowed: &'static [Act],
-}
-
-/// The tab select's acts: the digits a parked request or a replay takes are theirs by default.
-const TAB_SELECT: &[Act] = &[
-    Act::SelectTab1,
-    Act::SelectTab2,
-    Act::SelectTab3,
-    Act::SelectTab4,
-    Act::SelectTab5,
-    Act::SelectTab6,
-    Act::SelectTab7,
-    Act::SelectTab8,
-    Act::SelectTab9,
-];
-
-/// The plain digits a permission request answers on.
-const DIGITS: &[&str] = &["1", "2", "3", "4", "5", "6", "7", "8", "9"];
-
-/// Every declared stack with keys its view keeps fixed (MOD-67 M5 R1 M1), in [`DECLARED`] order,
-/// each citing the arm that matches them. M5's views and the M3/M4 forms' choice keys (MOD-67
-/// M6 D5): the Attachments activation, the Requirements priority.
-pub static FIXED: &[Fixed] = &[
-    // attach.rs `activation_key`: the activation field's plain `Space` cycles it, `Enter`
-    // submits and `Esc` cancels (a choice field's value keys, ANA-26 §6.1); library.rs
-    // `on_attach_key` also refuses `Esc` while the form's save is in flight.
-    Fixed {
-        stack: views::ATTACH_FORM,
-        chords: &["space", "enter", "esc"],
-        only_global: false,
-        shadowed: &[],
-    },
-    // requirements/forms.rs `RequirementForm::on_key`: the priority's `m`/`l` choose,
-    // `Space`/`Left`/`Right` toggle, `Esc` cancels (MOD-67 M4 D10).
-    Fixed {
-        stack: views::REQUIREMENTS_FORM,
-        chords: &["m", "l", "space", "left", "right", "esc"],
-        only_global: false,
-        shadowed: &[],
-    },
-    // runs.rs `RunsTab::on_key`: while the step under the cursor has a pending request, every
-    // plain digit answers it (MOD-42 D14).
-    Fixed {
-        stack: views::RUNS_BROWSE,
-        chords: DIGITS,
-        only_global: false,
-        shadowed: TAB_SELECT,
-    },
-    // runs.rs `close_out_key`: the close-out warning's arrows and `h`/`l` pick the resolution
-    // (MOD-39 P13); the cancel question shares the stack.
-    Fixed {
-        stack: views::RUNS_CONFIRM,
-        chords: &["left", "right", "h", "l"],
-        only_global: false,
-        shadowed: &[],
-    },
-    // filter.rs `FilterForm::on_key`: an option row's `Enter` applies, `Esc` cancels, `h`/`l` and
-    // the arrows move the option, `Space` ticks it.
-    Fixed {
-        stack: views::BACKLOG_FILTER,
-        chords: &["enter", "esc", "h", "l", "left", "right", "space"],
-        only_global: false,
-        shadowed: &[],
-    },
-    // item_form.rs `ItemForm::on_picker_key`: a picker's `h`/`l` and arrows choose, `Enter`
-    // moves on, `Esc` cancels.
-    Fixed {
-        stack: views::ITEM_FORM,
-        chords: &["left", "right", "h", "l", "enter", "esc"],
-        only_global: false,
-        shadowed: &[],
-    },
-    // chat/mod.rs `ChatTab::on_key`: a parked request takes every plain digit.
-    Fixed {
-        stack: views::CHAT_LIVE,
-        chords: DIGITS,
-        only_global: false,
-        shadowed: TAB_SELECT,
-    },
-    // chat/mod.rs `ChatTab::on_key_replay`: what the replay's own acts left of the live tab's
-    // keys is swallowed (D40, D41).
-    Fixed {
-        stack: views::CHAT_REPLAY,
-        chords: &[
-            "1", "2", "3", "4", "5", "6", "7", "8", "9", "i", "a", "enter",
-        ],
-        only_global: true,
-        shadowed: TAB_SELECT,
-    },
+    // MOD-115 M2 §1.5: the leave dialog, appended so every first-reported phrase is unchanged.
+    // It replaced the quit question (T6), whose entry went with `quit_confirm.rs`.
+    ("in the leave dialog", views::LEAVE),
 ];
 
 impl Keys {
@@ -430,8 +336,9 @@ impl Keys {
     /// the first layer that has one binds `chord`, narrowest layer first, catalogue order within
     /// a layer. A row in a narrower layer **shadows** the same act in every wider layer, even
     /// when it is unbound or binds other chords. The caller handles the first candidate it
-    /// accepts. [`CTRL_C`](super::CTRL_C) is never a candidate: no catalogue default binds it and
-    /// M2's loader refuses it, and `App::on_key` checks it before any stack regardless.
+    /// accepts. MOD-115 M2: [`CTRL_C`](super::CTRL_C) is `global.quit`'s and `leave.confirm`'s
+    /// default, so it is their candidate like any chord. No key is matched ahead of this
+    /// (MOD-115 M2 D7: the former `FIXED` keys are rows).
     ///
     /// A row is in a layer when [`Stack::admits`] says the layer offers its act (a view layer
     /// inherits the shared acts offered below it, PA-3). A modal layer's row is a candidate only
@@ -457,6 +364,9 @@ impl Keys {
             }
             seen.extend(here);
         }
+        // MOD-115 M2 RV1 repair 1 (MD4): a version-1 file's entry acts where its view kept no
+        // such key before M2.
+        super::validate::v1_steps_aside(self, stack, chord, &mut out);
         out
     }
 }
@@ -465,7 +375,7 @@ impl Keys {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{DECLARED, FIXED, Layer, Stack, WHILE_EDITING};
+    use super::{DECLARED, Layer, Stack, WHILE_EDITING};
     use crate::keys::{Act, CTRL_C, Context, KeyChord, Keys, load_str, views};
 
     fn chord(spec: &str) -> KeyChord {
@@ -484,8 +394,11 @@ mod tests {
     fn the_base_stack_resolves_quit_tabs_digits_help_and_the_offered_globals() {
         let keys = Keys::compiled();
         assert_eq!(base(keys, "q"), [Act::Quit]);
-        assert_eq!(base(keys, "tab"), [Act::NextTab]);
-        assert_eq!(base(keys, "shift-tab"), [Act::PrevTab]);
+        // MOD-115 M2 D4: `Tab` moves the pane focus, `ctrl-pgdn` the tab.
+        assert_eq!(base(keys, "tab"), [Act::NextPane]);
+        assert_eq!(base(keys, "ctrl-pgdn"), [Act::NextTab]);
+        assert_eq!(base(keys, "shift-tab"), [Act::PrevPane]);
+        assert_eq!(base(keys, "ctrl-pgup"), [Act::PrevTab]);
         assert_eq!(base(keys, "3"), [Act::SelectTab3]);
         assert_eq!(base(keys, "?"), [Act::Help]);
         assert_eq!(base(keys, "f1"), [Act::Help]);
@@ -506,51 +419,12 @@ mod tests {
             DECLARED[2],
             ("in the focused in-pane editor", Stack::EDITOR_FOCUSED)
         );
-        assert_eq!(DECLARED.len(), 80);
+        // MOD-115 M2 T6: the quit question's entry went with it.
+        assert_eq!(DECLARED.len(), 82);
+        assert_eq!(DECLARED[81], ("in the leave dialog", views::LEAVE));
         assert!(DECLARED.contains(&(WHILE_EDITING, Stack::EDITOR_OPEN)));
         let phrases: HashSet<&str> = DECLARED.iter().map(|(phrase, _)| *phrase).collect();
         assert_eq!(phrases.len(), DECLARED.len(), "a phrase is used twice");
-    }
-
-    /// MOD-67 M5 R1 M1: every `FIXED` entry names a declared stack (its phrase is the error's),
-    /// once, and its keys parse.
-    #[test]
-    fn every_fixed_entry_is_a_declared_stack_once() {
-        for (index, entry) in FIXED.iter().enumerate() {
-            assert!(
-                DECLARED.iter().any(|(_, stack)| *stack == entry.stack),
-                "FIXED[{index}] is not declared"
-            );
-            assert!(
-                FIXED[index + 1..]
-                    .iter()
-                    .all(|other| other.stack != entry.stack),
-                "FIXED[{index}] is listed twice"
-            );
-            for written in entry.chords {
-                assert!(KeyChord::parse_strict(written).is_ok(), "{written:?}");
-            }
-            assert!(!entry.only_global || entry.stack.global().is_some());
-        }
-    }
-
-    /// MOD-67 M6 D5: `FIXED` keeps `DECLARED` order, so a row and chord two entries fix is
-    /// reported naming the first declared stack.
-    #[test]
-    fn fixed_follows_declared_order() {
-        let at = |stack: Stack<'static>| {
-            DECLARED
-                .iter()
-                .position(|(_, declared)| *declared == stack)
-                .expect("a declared stack")
-        };
-        for pair in FIXED.windows(2) {
-            assert!(
-                at(pair[0].stack) < at(pair[1].stack),
-                "FIXED is out of DECLARED order at {:?}",
-                DECLARED[at(pair[1].stack)].0
-            );
-        }
     }
 
     /// MOD-67 M4 R1 L1: `skills.switch_view` is offered only by the Library and Templates
@@ -638,13 +512,48 @@ mod tests {
         assert!(!Stack::new(&layers).passes(CTRL_C));
     }
 
+    /// MOD-115 M2 §1.4, B4: `ctrl-c` is `global.quit`'s on every screen, over every overlay and
+    /// in every field, but the focused in-pane editor still receives it.
     #[test]
-    fn ctrl_c_is_no_action_in_either_stack() {
+    fn ctrl_c_is_quit_on_every_screen_but_the_focused_editor() {
         let keys = Keys::compiled();
-        assert_eq!(keys.actions(Stack::BASE, CTRL_C), []);
-        assert_eq!(keys.actions(Stack::OVERLAY, CTRL_C), []);
+        assert_eq!(keys.actions(Stack::BASE, CTRL_C), [Act::Quit]);
+        assert_eq!(keys.actions(Stack::OVERLAY, CTRL_C), [Act::Quit]);
         assert_eq!(keys.actions(Stack::EDITOR_FOCUSED, CTRL_C), []);
-        assert_eq!(keys.actions(Stack::EDITOR_OPEN, CTRL_C), []);
+        assert_eq!(keys.actions(Stack::EDITOR_OPEN, CTRL_C), [Act::Quit]);
+        assert_eq!(keys.actions(views::LEAVE, CTRL_C), [Act::LeaveConfirm]);
+        for &(phrase, stack) in DECLARED {
+            if [Stack::EDITOR_FOCUSED, views::LEAVE].contains(&stack) {
+                continue;
+            }
+            assert_eq!(keys.actions(stack, CTRL_C), [Act::Quit], "{phrase}");
+        }
+    }
+
+    /// MOD-115 M2 B3: a stack captures text exactly when it has a `[field]` layer.
+    #[test]
+    fn a_stack_captures_text_when_it_has_a_field_layer() {
+        assert!(views::CAPTURE.captures_text());
+        assert!(views::ITEM_FORM.captures_text());
+        assert!(views::CONCEPTS_QUERY.captures_text());
+        assert!(!Stack::BASE.captures_text());
+        assert!(!Stack::OVERLAY.captures_text());
+        assert!(!views::BACKLOG_BODY.captures_text());
+        assert!(!views::RUNS_CONFIRM.captures_text());
+        let layers = [Layer::all(Context::Field)];
+        assert!(Stack::new(&layers).captures_text());
+    }
+
+    /// MOD-115 M2 B4: the overlay stack's quit layer is filtered and sits before the help
+    /// layer, so `Stack::global` is still the help layer and `q` is no candidate.
+    #[test]
+    fn the_overlay_stack_quits_on_ctrl_c_only() {
+        let keys = Keys::compiled();
+        assert_eq!(overlay(keys, "q"), []);
+        assert_eq!(overlay(keys, "ctrl-c"), [Act::Quit]);
+        let (index, layer) = Stack::OVERLAY.global().expect("a global layer");
+        assert_eq!(index, Stack::OVERLAY.layers().len() - 1);
+        assert!(layer.admits(Act::Help) && !layer.admits(Act::Quit));
     }
 
     #[test]
@@ -707,8 +616,10 @@ mod tests {
         assert_eq!(open(keys, "q"), [Act::Quit]);
         assert_eq!(open(keys, "?"), [Act::Help]);
         assert_eq!(open(keys, "f1"), [Act::Help]);
-        assert_eq!(open(keys, "tab"), [Act::NextTab]);
-        assert_eq!(open(keys, "shift-tab"), [Act::PrevTab]);
+        assert_eq!(open(keys, "tab"), [Act::NextPane]);
+        assert_eq!(open(keys, "ctrl-pgdn"), [Act::NextTab]);
+        assert_eq!(open(keys, "shift-tab"), [Act::PrevPane]);
+        assert_eq!(open(keys, "ctrl-pgup"), [Act::PrevTab]);
         assert_eq!(open(keys, "1"), [Act::SelectTab1]);
         assert_eq!(open(keys, "w"), [Act::Workspaces]);
         assert_eq!(open(keys, "ctrl-f"), [Act::Find]);

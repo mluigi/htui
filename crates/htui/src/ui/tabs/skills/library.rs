@@ -39,16 +39,18 @@ use super::agent_help::{AgentHelp, HelpOutcome, Report, accepted};
 use super::attach::{AttachOutcome, AttachPane};
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::{ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, edited};
+use crate::keys::translate::FieldEvent;
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::skill_import::ImportOutcome;
-use crate::skills::{READ_NAME, REQUEST_NAMES, SkillWrite, SkillsSnapshot, StaleWhat};
+use crate::skills::{READ_NAME, REQUEST_NAMES, SkillEntry, SkillWrite, SkillsSnapshot, StaleWhat};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::TemplateBody;
 use crate::ui::cells::{self, cell_width};
-use crate::ui::tabs::backlog::detail::Scroll;
+use crate::ui::shell::{ListSize, TabLayout};
+use crate::ui::tabs::backlog::detail::{Scroll, Step, capture_area};
 use crate::ui::tabs::settings::{modal_rest, wrapped};
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme, diff};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 
 /// How many rows the notice may wrap to before it is cut; one when it fits.
 const NOTICE_LINES: usize = 2;
@@ -60,6 +62,15 @@ const IMPORT_NAME: &str = REQUEST_NAMES[5];
 /// The list's width, borders included: two spaces, the name fitted to [`NAME_WIDTH`] cells, ` v`
 /// and a head of up to three digits make 29 cells.
 const LIST_WIDTH: u16 = 32;
+
+/// The Skills tab's default layout (MOD-115 M2 D2, blueprint D-3), the Library's and the
+/// Templates view's alike: a [`LIST_WIDTH`]-cell list beside the pane, as
+/// `[Length(32), Min(1)]` split them before the shell kept layouts. Cells, not a percentage:
+/// none reproduces 32 cells at every width.
+pub(super) const LAYOUT: TabLayout = TabLayout {
+    list: ListSize::Cells(LIST_WIDTH),
+    ..TabLayout::DEFAULT
+};
 
 /// A library row's name field, in cells: a name is fitted to it with `cells::fit`.
 const NAME_WIDTH: usize = 22;
@@ -817,9 +828,18 @@ impl LibraryView {
     /// `views::LIBRARY_BROWSE`, the first this view uses taken. Chord equality includes the
     /// modifiers, so `ctrl-e` is not `e`. Anything else passes for the shell to resolve through the
     /// same stack (`q`, `Tab`, the digits, `?`). The tab took `skills.switch_view` first.
+    ///
+    /// MOD-115 M2 §7: only motion follows the focus. With the list focused `list.*` move the
+    /// cursor; with the pane focused they scroll it (`pane.scroll_*`'s scroll); with the
+    /// activity pane focused they are taken and nothing moves. Every other act acts whatever
+    /// pane is focused.
     fn on_browse_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let chord = KeyChord::from_event(key);
+        let (focus, rows) = (ctx.focus(), self.pane_rows.get());
         for act in ctx.keys().actions(views::LIBRARY_BROWSE, chord) {
+            if Step::by_focus(act, focus, |step| self.scroll.follow(step, rows)) {
+                return Handled::Consumed;
+            }
             match act {
                 Act::ListDown => self.move_cursor(true),
                 Act::ListUp => self.move_cursor(false),
@@ -1379,12 +1399,12 @@ impl LibraryView {
             self.attach = None;
             return Handled::Pass;
         };
-        // The form's save is in flight: its reply closes the form or keeps it, so `Esc` waits for
-        // it, as the editor's does. `Esc` is the form's own cancel key (widget-owned, MOD-67 M4
-        // D10), not a resolved act.
+        // The form's save is in flight: its reply closes the form or keeps it, so the cancel
+        // waits for it, as the editor's does. The canonical `Esc` is `field.cancel` after the
+        // shell's translation (MOD-115 M2 D7), so it is decoded, not resolved.
         if let Some(busy) = self.busy
             && pane.in_form()
-            && key.code == KeyCode::Esc
+            && FieldEvent::of(&key) == Some(FieldEvent::Cancel)
         {
             self.notice = Some(Notice::Error(in_flight(busy)));
             return Handled::Consumed;
@@ -1652,6 +1672,51 @@ impl LibraryView {
         self.notice = None;
     }
 
+    /// The row under the cursor, for the tab's history location (MOD-115 M2 §8): its index and,
+    /// on a skill, the skill's id (`{index}:{id}`, RV3), so Back finds the skill again after a
+    /// create, an import or a delete moved its row.
+    pub(super) fn location_cursor(&self) -> String {
+        match self.entry_at(self.cursor) {
+            Some(entry) => format!("{}:{}", self.cursor, entry.skill.id),
+            None => self.cursor.to_string(),
+        }
+    }
+
+    /// MOD-115 M2 §8: the cursor back on a [`location_cursor`](Self::location_cursor): onto its
+    /// skill wherever the library now holds it ([`select`](Self::select)), else on its row
+    /// (clamped to the library), the head's body shown from its top, as a move shows it. Only
+    /// while browsing with nothing open over the list: a prompt, the attachments pane or a
+    /// handed-off draft keeps its row. Whether it moved; a cursor with no row moves nothing.
+    pub(super) fn restore_cursor(&mut self, cursor: &str) -> bool {
+        let (index, skill) = cursor
+            .split_once(':')
+            .map_or((cursor, None), |(index, skill)| (index, skill.parse().ok()));
+        let Ok(index) = index.parse::<usize>() else {
+            return false;
+        };
+        if !matches!(self.mode, Mode::Browse)
+            || self.attach.is_some()
+            || self.handed_off().is_some()
+        {
+            return false;
+        }
+        let last = self
+            .snapshot
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.skills.len().saturating_sub(1));
+        self.cursor = index.min(last);
+        match skill {
+            Some(skill) => self.select(skill),
+            None => self.reset_pane(),
+        }
+        true
+    }
+
+    /// The library's entry on row `index`, if the library is read and holds that row.
+    fn entry_at(&self, index: usize) -> Option<&SkillEntry> {
+        self.snapshot.as_ref()?.skills.get(index)
+    }
+
     /// The cursor onto `skill`, its head's body shown.
     fn select(&mut self, skill: SkillId) {
         if let Some(index) = self.snapshot.as_ref().and_then(|snapshot| {
@@ -1693,8 +1758,14 @@ impl LibraryView {
     /// Browse, the prompts and the rename form: the list on the left, the pane on the right.
     fn render_browse(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let theme = ctx.theme;
-        let [list_area, pane_area] =
-            Layout::horizontal([Constraint::Length(LIST_WIDTH), Constraint::Min(1)]).areas(area);
+        // MOD-115 M2 B5: the panes the shell's layout gives the tab, claimed for the focus
+        // borders, the hints and the mouse; today's 32-cell list by default. A hidden pane is an
+        // empty rect, which draws nothing.
+        let areas = ctx.split(area, LAYOUT);
+        // T7 repair: a prompt or the rename form takes every key, so with another pane zoomed
+        // the pane is drawn over the zoomed one rather than into its own empty rect.
+        let (list_area, pane_area) = capture_area(&areas, area, !matches!(self.mode, Mode::Browse));
+        let list_area = list_area.unwrap_or_default();
 
         let list = Block::new().borders(Borders::ALL).title(" Skills ");
         let inner = list.inner(list_area);
@@ -2003,7 +2074,7 @@ mod tests {
     use std::sync::Arc;
 
     use chrono::TimeDelta;
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::clock::{TestClock, epoch};
     use htui_core::fixtures::ids;
     use htui_core::model::{Attachment, ProjectRef, Scope, SkillBindingKey, StepId};
@@ -2018,6 +2089,7 @@ mod tests {
     use crate::ui::Theme;
     use crate::ui::cells::cell_width;
     use crate::ui::tabs::SkillsTab;
+    use crate::ui::tabs::registry::Tab as _;
     use crate::ui::tabs::skills::agent_help::fixtures as agent_fixtures;
     use htui_agent::event::StopReason;
 
@@ -3596,5 +3668,130 @@ mod tests {
         let shown = format!("{:?}", editor(&view));
         assert!(shown.contains("help: Some("), "{shown}");
         assert!(!shown.contains("One error enum"), "{shown}");
+    }
+
+    // ---- MOD-115 M2 T7: the panes, motion by focus, the location ---------------------------
+
+    /// A view browsing the demo library, the cursor on its first skill.
+    async fn browsing(bench: &Bench) -> LibraryView {
+        let backend = Backend::memory(MemStore::demo());
+        let mut view = LibraryView::default();
+        let reply = serve(&backend, &StoreRequest::Skills(bench.scope.clone())).await;
+        view.on_reply(&reply, &mut bench.ctx());
+        assert!(
+            view.snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.skills.len() >= 2),
+            "the demo library has two skills"
+        );
+        view
+    }
+
+    /// MOD-115 M2 D2: the Skills tab's default layout is the 32-cell list both views drew, and
+    /// the browse frame claims exactly the old `[Length(32), Min(1)]` split.
+    #[tokio::test]
+    async fn the_browse_frame_claims_the_32_cell_list() {
+        use crate::ui::shell::{ListSize, Panes};
+        assert_eq!(LAYOUT.list, ListSize::Cells(LIST_WIDTH));
+        assert_eq!(LIST_WIDTH, 32);
+        assert_eq!(SkillsTab::new().panes(), Panes::ListDetail(LAYOUT));
+
+        let bench = Bench::new();
+        let view = browsing(&bench).await;
+        let claim = Cell::new(None);
+        let ctx = bench.ctx().with_pane_claim(&claim);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 28)).expect("terminal");
+        terminal
+            .draw(|frame| view.render(frame, frame.area(), &ctx))
+            .expect("the frame draws");
+        let (region, areas) = claim.get().expect("browse claims its panes");
+        let [list, pane] =
+            Layout::horizontal([Constraint::Length(32), Constraint::Min(1)]).areas(region);
+        assert_eq!((areas.list, areas.detail), (Some(list), pane));
+    }
+
+    /// MOD-115 M2 §7: with the list focused, motion moves the cursor; with the detail focused
+    /// it scrolls the pane and the cursor stays; with the activity pane focused nothing moves.
+    #[tokio::test]
+    async fn motion_follows_the_focused_pane() {
+        use crate::ui::shell::PaneId;
+        let bench = Bench::new();
+        let mut view = browsing(&bench).await;
+        view.pane_rows.set(10);
+        let press = |view: &mut LibraryView, focus: PaneId, code: KeyCode| {
+            view.on_key(key(code), &mut bench.ctx().with_focus(focus))
+        };
+        for (code, offset) in [
+            (KeyCode::Char('j'), 1),
+            (KeyCode::Down, 2),
+            (KeyCode::Char('k'), 1),
+        ] {
+            assert_eq!(press(&mut view, PaneId::Detail, code), Handled::Consumed);
+            assert_eq!(view.scroll.offset(), offset, "{code:?}");
+        }
+        assert_eq!(view.cursor, 0, "the cursor stayed");
+        assert_eq!(
+            press(&mut view, PaneId::Activity, KeyCode::Char('j')),
+            Handled::Consumed
+        );
+        assert_eq!((view.cursor, view.scroll.offset()), (0, 1), "nothing moved");
+        assert_eq!(
+            press(&mut view, PaneId::List, KeyCode::Char('j')),
+            Handled::Consumed
+        );
+        assert_eq!(view.cursor, 1, "the list's");
+        assert!(bench.emit.take().is_empty());
+    }
+
+    /// MOD-115 M2 §8: the cursor goes back to a row while browsing (the head's body from its
+    /// top, as a move shows it), clamped to the library; never under an open prompt, and not
+    /// for a cursor this view did not write.
+    #[tokio::test]
+    async fn the_cursor_is_restored_only_while_browsing() {
+        let bench = Bench::new();
+        let mut view = browsing(&bench).await;
+        view.scroll = Scroll::at(3);
+        assert!(view.restore_cursor("1"));
+        assert_eq!((view.cursor, view.scroll.offset()), (1, 0));
+        assert!(view.restore_cursor("99"));
+        let last = view.snapshot.as_ref().map_or(0, |s| s.skills.len() - 1);
+        assert_eq!(view.cursor, last, "clamped");
+        assert!(!view.restore_cursor("not a row"));
+        assert_eq!(view.cursor, last, "an unreadable cursor moves nothing");
+
+        view.mode = Mode::Naming {
+            field: TextField::new(),
+        };
+        assert!(!view.restore_cursor("0"));
+        assert_eq!(view.cursor, last, "the prompt keeps the row");
+    }
+
+    /// MOD-115 M2 §8, RV3 (review M2): the location names the skill under the cursor as well as
+    /// its row (`{index}:{id}`). A skill created before it moves its row, and the cursor goes
+    /// back onto the same skill; a skill that is gone falls back to the row, clamped.
+    #[tokio::test]
+    async fn the_cursor_finds_its_skill_after_the_library_changed() {
+        let bench = Bench::new();
+        let mut view = browsing(&bench).await;
+        view.on_key(key(KeyCode::Char('j')), &mut bench.ctx());
+        let skill = view.snapshot.as_ref().expect("read").skills[1].skill.id;
+        let at = view.location_cursor();
+        assert_eq!(at, format!("1:{skill}"));
+
+        let snapshot = view.snapshot.as_mut().expect("read");
+        let mut created = snapshot.skills[0].clone();
+        created.skill.id = SkillId::new();
+        created.skill.name = "aaa-docs".to_owned();
+        snapshot.skills.insert(0, created);
+        view.cursor = 0;
+        assert!(view.restore_cursor(&at));
+        assert_eq!(view.cursor, 2, "on the same skill, a row down");
+
+        let snapshot = view.snapshot.as_mut().expect("read");
+        snapshot.skills.retain(|entry| entry.skill.id != skill);
+        view.cursor = 0;
+        assert!(view.restore_cursor(&at));
+        assert_eq!(view.cursor, 1, "the skill is gone: its row");
     }
 }

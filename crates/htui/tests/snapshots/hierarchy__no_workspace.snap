@@ -2,7 +2,7 @@
 source: crates/htui/tests/hierarchy.rs
 expression: harness.render()
 ---
-no workspace   ¹Settings              0 working · 0 waiting · memory · no box ·  F9  about   ?  keys
+no workspace   ¹Settings     0 working · 0 waiting · memory · no box ·  F9  about   ?  keys · ⌫ back
 ┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
 │ Agents  Hierarchy                                                                                │
 │no workspace — `N` creates one                                                                    │

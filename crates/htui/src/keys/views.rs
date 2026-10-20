@@ -2,7 +2,7 @@
 //!
 //! Each stack opens with the view's own layer ([`Layer::view`]: the mode's own acts plus the
 //! shared acts a wider layer offers, PA-3), except [`SETTINGS_TAB`], [`CAPTURE`],
-//! [`QUIT_CONFIRM`] and [`ABORT_CONFIRM`] (only `editor.abort`), which have none, and ends
+//! and [`ABORT_CONFIRM`] (only `editor.abort`), which have none, and ends
 //! with the global layer: unfiltered in a
 //! browse mode, [`Layer::modal`] in a capturing or confirming one (D5). Layer order is fixed:
 //! view, `settings`, `confirm`, `form`, `common`, `list`, `overlay`, `global` (only the layers
@@ -22,11 +22,43 @@
 //! `every_backlog_browse_stack_offers_the_tab_and_the_list` pins that all seven share it.
 //!
 //! M6 adds the queue overlay's and the directory picker's stacks.
+//!
+//! MOD-115 M2 (blueprint §1.5) adds the shell's and the text fields' layers. Layer order: view,
+//! **`field`**, **`choice`**, **`answer`**, then the order above, then **`layout`** and
+//! **`history`** right before the unfiltered global layer; an overlay's [`QUIT`] layer sits right
+//! before its last `global ∩ {help}` layer. A capturing stack is one with a `field` layer
+//! ([`Stack::captures_text`]); no capturing stack has `layout` or `history` (B1), and
+//! [`MODAL`] admits neither pane key (B2). [`LEAVE`] is the leave dialog's.
 
 use super::{Act, Context, Layer, Stack};
 
-/// The global layer of a capturing or confirming mode: CONTROL, ALT and function keys only.
-const MODAL: Layer = Layer::modal(Context::Global);
+/// Every global act but the pane keys (MOD-115 M2 B2): `ctrl-right` is word-right in a field,
+/// so a capturing or confirming mode never moves the pane focus. Nor the tab keys (T6): their
+/// `tab`/`backtab` never passed a capturing or confirming mode, and their `ctrl-pgdn`/`ctrl-pgup`
+/// would, so a form would start switching tabs; a capturing Skills mode still hands them to the
+/// shell through its own `TABS` layer (MOD-67 M4 PA-2).
+const MODAL_GLOBALS: &[Act] = &[
+    Act::Quit,
+    Act::SelectTab1,
+    Act::SelectTab2,
+    Act::SelectTab3,
+    Act::SelectTab4,
+    Act::SelectTab5,
+    Act::SelectTab6,
+    Act::SelectTab7,
+    Act::SelectTab8,
+    Act::SelectTab9,
+    Act::Help,
+    Act::About,
+    Act::Workspaces,
+    Act::Find,
+    Act::Waiting,
+    Act::Queue,
+];
+
+/// The global layer of a capturing or confirming mode: CONTROL, ALT and function keys only, and
+/// no pane or tab key (MOD-115 M2 B2).
+const MODAL: Layer = Layer::only(Context::Global, MODAL_GLOBALS).with_modal_filter();
 
 /// The unfiltered global layer of a browse mode.
 const GLOBAL: Layer = Layer::all(Context::Global);
@@ -133,16 +165,49 @@ const NO: Layer = Layer::only(Context::Confirm, &[Act::ConfirmNo]);
 /// All four, `external_editor` included; [`FORM_ALL`] is the three without it (renamed in M6).
 const FORM: Layer = Layer::all(Context::Form);
 
+/// Every `field` act (MOD-115 M2 D7): the stack has a text field, so it captures text
+/// ([`Stack::captures_text`]). Always right after the view layer.
+const FIELD: Layer = Layer::all(Context::Field);
+
+/// Every `choice` act: a form with a choice field (the filter form, the Requirements priority,
+/// the close-out warning's resolution).
+const CHOICE: Layer = Layer::all(Context::Choice);
+
+/// `choice ∩ {prev, next}`: the item form's pickers, which only move (T5 repair: `toggle`
+/// would be listed in the `?` box and do nothing there).
+const PICK: Layer = Layer::only(Context::Choice, &[Act::ChoicePrev, Act::ChoiceNext]);
+
+/// `choice ∩ {toggle}`: the attachment form's activation field, which only cycles.
+const TOGGLE: Layer = Layer::only(Context::Choice, &[Act::ChoiceToggle]);
+
+/// Every `answer` act: a view that answers a parked request (Runs, Chat).
+const ANSWER: Layer = Layer::all(Context::Answer);
+
+/// Every `layout` act (MOD-115 M2 B1): a list + detail browse stack, before its history layer.
+const LAYOUT: Layer = Layer::all(Context::Layout);
+
+/// Every `history` act (MOD-115 M2 B1): every tab browse stack, right before [`GLOBAL`].
+const HISTORY: Layer = Layer::all(Context::History);
+
+/// `global ∩ {quit}`, filtered (MOD-115 M2 B4): an overlay's way to leave, `ctrl-c` by default,
+/// right before its last [`HELP`] layer so `Stack::global` still finds the help layer.
+const QUIT: Layer = Layer::only(Context::Global, &[Act::Quit]).with_modal_filter();
+
+/// The layers MOD-115 M2 added to stacks from before it (D8, MD4): in a version-1 file, an act
+/// from before M2 that a stack offers only through one of them meets that stack's narrower acts
+/// only since M2, so the narrower act keeps a chord they share there (`validate`).
+pub(super) const M2_LAYERS: &[Layer] = &[QUIT, LAYOUT, HISTORY];
+
 /// The Settings tab while its section has no stack of its own: section cycling, then global
 /// (L-A Q11). `SettingsTab` resolves `settings.next_section`/`prev_section` through it.
-pub const SETTINGS_TAB: Stack<'static> = Stack::new(&[SETTINGS, GLOBAL]);
+pub const SETTINGS_TAB: Stack<'static> = Stack::new(&[SETTINGS, HISTORY, GLOBAL]);
 
 /// A mode that is a text field or an opaque widget and nothing else (PA-7): the agents paste field,
 /// the Qdrant URL and key editors, the connection, prompt and queue editors, the boxes tags editor,
 /// hierarchy's typed delete, its in-flight delete and its path picker's go-to field, the personas
 /// import path and the secrets URL; the Requirements filter (MOD-67 M4); the Runs note, follow-up
 /// and typed key, a close-out in flight and the chat composer (MOD-67 M5).
-pub const CAPTURE: Stack<'static> = Stack::new(&[MODAL]);
+pub const CAPTURE: Stack<'static> = Stack::new(&[FIELD, MODAL]);
 
 /// Settings > Agents, browsing the agent list.
 pub const AGENTS_BROWSE: Stack<'static> = Stack::new(&[
@@ -162,6 +227,7 @@ pub const AGENTS_BROWSE: Stack<'static> = Stack::new(&[
     SETTINGS,
     Layer::only(Context::Common, &[Act::New, Act::Edit, Act::Dismiss]),
     LIST,
+    HISTORY,
     GLOBAL,
 ]);
 
@@ -170,6 +236,7 @@ pub const AGENTS_CONSENT: Stack<'static> = Stack::new(&[
     Layer::view(Context::SettingsAgents, &[]),
     SETTINGS,
     CONFIRM,
+    HISTORY,
     GLOBAL,
 ]);
 
@@ -182,12 +249,14 @@ pub const AGENTS_CHOOSER: Stack<'static> = Stack::new(&[
     SETTINGS,
     Layer::only(Context::Confirm, &[Act::ConfirmNo]),
     LIST,
+    HISTORY,
     GLOBAL,
 ]);
 
 /// Settings > Agents, the create/edit form and the paths form.
 pub const AGENTS_FORM: Stack<'static> = Stack::new(&[
     Layer::view(Context::SettingsAgents, &[]),
+    FIELD,
     FORM_FIELDS,
     MODAL,
 ]);
@@ -209,12 +278,14 @@ pub const HIERARCHY_BROWSE: Stack<'static> = Stack::new(&[
         &[Act::Edit, Act::New, Act::Delete, Act::Reload, Act::Dismiss],
     ),
     LIST,
+    HISTORY,
     GLOBAL,
 ]);
 
 /// Settings > Hierarchy, the editor form.
 pub const HIERARCHY_EDITOR: Stack<'static> = Stack::new(&[
     Layer::view(Context::SettingsHierarchy, &[]),
+    FIELD,
     FORM_FIELDS,
     MODAL,
 ]);
@@ -242,12 +313,17 @@ pub const KINDS_BROWSE: Stack<'static> = Stack::new(&[
         &[Act::Edit, Act::New, Act::Delete, Act::Reload, Act::Dismiss],
     ),
     LIST,
+    HISTORY,
     GLOBAL,
 ]);
 
 /// Settings > Kinds, the editor form.
-pub const KINDS_EDITOR: Stack<'static> =
-    Stack::new(&[Layer::view(Context::SettingsKinds, &[]), FORM_FIELDS, MODAL]);
+pub const KINDS_EDITOR: Stack<'static> = Stack::new(&[
+    Layer::view(Context::SettingsKinds, &[]),
+    FIELD,
+    FORM_FIELDS,
+    MODAL,
+]);
 
 /// Settings > Kinds, the prefix warning and the delete question (asking and in flight).
 pub const KINDS_CONFIRM: Stack<'static> =
@@ -259,6 +335,7 @@ pub const PROMPT_BROWSE: Stack<'static> = Stack::new(&[
     SETTINGS,
     Layer::only(Context::Common, &[Act::Edit, Act::Reload, Act::Dismiss]),
     LIST,
+    HISTORY,
     GLOBAL,
 ]);
 
@@ -274,6 +351,7 @@ pub const CONNECTION_BROWSE: Stack<'static> = Stack::new(&[
         &[Act::Edit, Act::Clear, Act::Reload, Act::Dismiss],
     ),
     LIST,
+    HISTORY,
     GLOBAL,
 ]);
 
@@ -290,6 +368,7 @@ pub const QDRANT_BROWSE: Stack<'static> = Stack::new(&[
     SETTINGS,
     Layer::only(Context::Common, &[Act::Edit, Act::Clear, Act::Reload]),
     LIST,
+    HISTORY,
     GLOBAL,
 ]);
 
@@ -312,12 +391,17 @@ pub const BOXES_BROWSE: Stack<'static> = Stack::new(&[
     SETTINGS,
     Layer::only(Context::Common, &[Act::Reload, Act::Dismiss]),
     LIST,
+    HISTORY,
     GLOBAL,
 ]);
 
 /// Settings > Boxes, the quirks and probe spec editors.
-pub const BOXES_EDITOR: Stack<'static> =
-    Stack::new(&[Layer::view(Context::SettingsBoxes, &[]), FORM_SAVE, MODAL]);
+pub const BOXES_EDITOR: Stack<'static> = Stack::new(&[
+    Layer::view(Context::SettingsBoxes, &[]),
+    FIELD,
+    FORM_SAVE,
+    MODAL,
+]);
 
 /// Settings > Boxes, the executor question.
 pub const BOXES_EXECUTOR: Stack<'static> =
@@ -332,12 +416,14 @@ pub const PERSONAS_BROWSE: Stack<'static> = Stack::new(&[
     SETTINGS,
     Layer::only(Context::Common, &[Act::New, Act::Edit, Act::Delete]),
     LIST,
+    HISTORY,
     GLOBAL,
 ]);
 
 /// Settings > Personas, the create/edit form.
 pub const PERSONAS_FORM: Stack<'static> = Stack::new(&[
     Layer::view(Context::SettingsPersonas, &[]),
+    FIELD,
     FORM_FIELDS,
     MODAL,
 ]);
@@ -345,6 +431,7 @@ pub const PERSONAS_FORM: Stack<'static> = Stack::new(&[
 /// Settings > Personas, the body and rules editors.
 pub const PERSONAS_EDITOR: Stack<'static> = Stack::new(&[
     Layer::view(Context::SettingsPersonas, &[]),
+    FIELD,
     FORM_SAVE,
     MODAL,
 ]);
@@ -370,12 +457,14 @@ pub const SECRETS_BROWSE: Stack<'static> = Stack::new(&[
         &[Act::Edit, Act::Clear, Act::Reload, Act::Dismiss],
     ),
     LIST,
+    HISTORY,
     GLOBAL,
 ]);
 
 /// Settings > Secrets, the identity and scope forms.
 pub const SECRETS_FORM: Stack<'static> = Stack::new(&[
     Layer::view(Context::SettingsSecrets, &[]),
+    FIELD,
     FORM_FIELDS,
     MODAL,
 ]);
@@ -390,6 +479,7 @@ pub const QUEUE_BROWSE: Stack<'static> = Stack::new(&[
     SETTINGS,
     Layer::only(Context::Common, &[Act::Edit, Act::Reload, Act::Dismiss]),
     LIST,
+    HISTORY,
     GLOBAL,
 ]);
 
@@ -405,7 +495,9 @@ pub const CONCEPTS_QUERY: Stack<'static> = Stack::new(&[
             Act::ConceptsDown,
         ],
     ),
+    FIELD,
     OVERLAY,
+    QUIT,
     HELP.with_modal_filter(),
 ]);
 
@@ -414,28 +506,38 @@ pub const SWITCHER: Stack<'static> = Stack::new(&[
     Layer::view(Context::Switcher, &[Act::SwitcherSwitch]),
     LIST,
     OVERLAY,
+    QUIT,
     HELP,
 ]);
 
 /// The schema migration prompt overlay.
-pub const MIGRATION: Stack<'static> =
-    Stack::new(&[Layer::view(Context::Migration, &[]), CONFIRM, OVERLAY, HELP]);
-
-/// The quit question (MOD-57 M2 E4): `confirm.yes` quits, `confirm.no` and `overlay.close` keep
-/// the edit, `global.help` toggles the box. No view layer: the question has no keys of its own,
-/// so `[confirm]`, `[overlay]` and `[global] help` rebind it, and no `[quit]` table exists.
-pub const QUIT_CONFIRM: Stack<'static> = Stack::new(&[CONFIRM, OVERLAY, HELP]);
+pub const MIGRATION: Stack<'static> = Stack::new(&[
+    Layer::view(Context::Migration, &[]),
+    CONFIRM,
+    OVERLAY,
+    QUIT,
+    HELP,
+]);
 
 /// The abort question (MOD-57 M2 R1 M-2): `editor.abort` again aborts; every other key keeps the
-/// edit, so no other layer: not even `overlay.close` or `global.help` act there.
+/// edit, so no other layer: not even `overlay.close` or `global.help` act there. MOD-115 M2 B4:
+/// but [`QUIT`], so `ctrl-c` opens the leave dialog from the question too (Task 6).
 pub const ABORT_CONFIRM: Stack<'static> =
-    Stack::new(&[Layer::only(Context::Editor, &[Act::EditorAbort])]);
+    Stack::new(&[Layer::only(Context::Editor, &[Act::EditorAbort]), QUIT]);
+
+/// The leave dialog (MOD-115 M2 D6): its own two answers, then `global ∩ {help}`. No quit layer:
+/// its `ctrl-c` is `leave.confirm`.
+pub const LEAVE: Stack<'static> = Stack::new(&[
+    Layer::view(Context::Leave, &[Act::LeaveConfirm, Act::LeaveStay]),
+    HELP,
+]);
 
 /// The waiting list overlay.
 pub const WAITING_LIST: Stack<'static> = Stack::new(&[
     Layer::view(Context::Waiting, &[Act::WaitingOpen]),
     LIST,
     OVERLAY,
+    QUIT,
     HELP,
 ]);
 
@@ -449,20 +551,27 @@ pub const LIBRARY_BROWSE: Stack<'static> = Stack::new(&[
     Layer::only(Context::Common, &[Act::New, Act::Edit, Act::Reload]),
     LIST,
     PANE_SCROLL,
+    LAYOUT,
+    HISTORY,
     GLOBAL,
 ]);
 
 /// Skills > Library, the name, description and import path prompts.
 pub const LIBRARY_PROMPT: Stack<'static> =
-    Stack::new(&[Layer::view(Context::SkillsLibrary, &[]), TABS, MODAL]);
+    Stack::new(&[Layer::view(Context::SkillsLibrary, &[]), FIELD, TABS, MODAL]);
 
 /// Skills > Library, the rename form (`Info`).
-pub const LIBRARY_INFO: Stack<'static> =
-    Stack::new(&[Layer::view(Context::SkillsLibrary, &[]), FORM_ALL, MODAL]);
+pub const LIBRARY_INFO: Stack<'static> = Stack::new(&[
+    Layer::view(Context::SkillsLibrary, &[]),
+    FIELD,
+    FORM_ALL,
+    MODAL,
+]);
 
 /// Skills > Library, the editor with no agent help open.
 pub const LIBRARY_EDITOR: Stack<'static> = Stack::new(&[
     Layer::view(Context::SkillsLibrary, &[]),
+    FIELD,
     SKILLS_ASK,
     FORM_EDITOR,
     TABS,
@@ -476,6 +585,7 @@ pub const LIBRARY_REPORT: Stack<'static> = Stack::new(&[
     Layer::only(Context::Common, &[Act::Reload, Act::Back]),
     LIST,
     PANE_SCROLL,
+    HISTORY,
     GLOBAL,
 ]);
 
@@ -489,12 +599,15 @@ pub const ATTACH_BROWSE: Stack<'static> = Stack::new(&[
     SKILLS_SWITCH,
     Layer::only(Context::Common, &[Act::Reload, Act::Back]),
     LIST,
+    HISTORY,
     GLOBAL,
 ]);
 
 /// Skills > Library > Attachments, the attachment form.
 pub const ATTACH_FORM: Stack<'static> = Stack::new(&[
     Layer::view(Context::SkillsAttach, &[Act::AttachRepo]),
+    FIELD,
+    TOGGLE,
     FORM_ALL,
     MODAL,
 ]);
@@ -518,16 +631,23 @@ pub const TEMPLATES_BROWSE: Stack<'static> = Stack::new(&[
     Layer::only(Context::Common, &[Act::New, Act::Edit, Act::Reload]),
     LIST,
     PANE_SCROLL,
+    LAYOUT,
+    HISTORY,
     GLOBAL,
 ]);
 
 /// Skills > Templates, the name prompt.
-pub const TEMPLATES_PROMPT: Stack<'static> =
-    Stack::new(&[Layer::view(Context::SkillsTemplates, &[]), TABS, MODAL]);
+pub const TEMPLATES_PROMPT: Stack<'static> = Stack::new(&[
+    Layer::view(Context::SkillsTemplates, &[]),
+    FIELD,
+    TABS,
+    MODAL,
+]);
 
 /// Skills > Templates, the editor with no agent help open.
 pub const TEMPLATES_EDITOR: Stack<'static> = Stack::new(&[
     Layer::view(Context::SkillsTemplates, &[]),
+    FIELD,
     SKILLS_ASK,
     FORM_EDITOR,
     TABS,
@@ -540,6 +660,7 @@ pub const HELP_ASKING: Stack<'static> = Stack::new(&[
         Context::SkillsHelp,
         &[Act::SkillsHelpPrevAgent, Act::SkillsHelpNextAgent],
     ),
+    FIELD,
     TABS,
     MODAL,
 ]);
@@ -583,16 +704,42 @@ pub const REQUIREMENTS_BROWSE: Stack<'static> = Stack::new(&[
         ],
     ),
     PANE_SCROLL,
+    LAYOUT,
+    HISTORY,
     GLOBAL,
 ]);
 
-/// Requirements, the area form and the requirement form (mint and amend).
-pub const REQUIREMENTS_FORM: Stack<'static> =
-    Stack::new(&[Layer::view(Context::Requirements, &[]), FORM_ALL, MODAL]);
+/// Requirements, the requirement form (mint and amend).
+pub const REQUIREMENTS_FORM: Stack<'static> = Stack::new(&[
+    Layer::view(
+        Context::Requirements,
+        &[
+            Act::RequirementsPriorityMust,
+            Act::RequirementsPriorityLater,
+        ],
+    ),
+    FIELD,
+    CHOICE,
+    FORM_ALL,
+    MODAL,
+]);
+
+/// Requirements, the area form: a code and a title, so no priority and no choice (T5 repair:
+/// sharing [`REQUIREMENTS_FORM`] listed keys the form types as text).
+pub const AREA_FORM: Stack<'static> = Stack::new(&[
+    Layer::view(Context::Requirements, &[]),
+    FIELD,
+    FORM_ALL,
+    MODAL,
+]);
 
 /// Requirements, the withdraw form (both stages).
-pub const REQUIREMENTS_WITHDRAW: Stack<'static> =
-    Stack::new(&[Layer::view(Context::Requirements, &[]), FORM_SAVE, MODAL]);
+pub const REQUIREMENTS_WITHDRAW: Stack<'static> = Stack::new(&[
+    Layer::view(Context::Requirements, &[]),
+    FIELD,
+    FORM_SAVE,
+    MODAL,
+]);
 
 /// The Backlog's Body sub-tab (MOD-67 M5 PA-1), and `DetailTab::key_stack`'s default: no own
 /// verb, the pane's scroll and sub-tab cycling, then the tail every Backlog browse stack shares.
@@ -602,6 +749,8 @@ pub const BACKLOG_BODY: Stack<'static> = Stack::new(&[
     BACKLOG,
     EDIT,
     LIST_ALL,
+    LAYOUT,
+    HISTORY,
     GLOBAL,
 ]);
 
@@ -632,15 +781,26 @@ pub const RUNS_BROWSE: Stack<'static> = Stack::new(&[
             Act::RunsZoomFit,
         ],
     ),
+    ANSWER,
     PANE_PAGE,
     BACKLOG,
     EDIT,
     LIST_ALL,
+    LAYOUT,
+    HISTORY,
     GLOBAL,
 ]);
 
-/// Backlog > Runs, the cancel question and the close-out warning.
-pub const RUNS_CONFIRM: Stack<'static> =
+/// Backlog > Runs, the close-out warning (its resolution is a choice).
+pub const RUNS_CONFIRM: Stack<'static> = Stack::new(&[
+    Layer::view(Context::BacklogRuns, &[]),
+    CHOICE,
+    CONFIRM,
+    MODAL,
+]);
+
+/// Backlog > Runs, the cancel question: yes or no, no choice (T5 repair).
+pub const RUNS_CANCEL: Stack<'static> =
     Stack::new(&[Layer::view(Context::BacklogRuns, &[]), CONFIRM, MODAL]);
 
 /// Backlog > Runs, while the close-out counts (it can only be left).
@@ -671,6 +831,8 @@ pub const BACKLOG_GRAPH: Stack<'static> = Stack::new(&[
     BACKLOG,
     EDIT,
     LIST_ALL,
+    LAYOUT,
+    HISTORY,
     GLOBAL,
 ]);
 
@@ -689,12 +851,14 @@ pub const BACKLOG_DOCS: Stack<'static> = Stack::new(&[
     BACKLOG,
     EDIT,
     LIST_ALL,
+    LAYOUT,
+    HISTORY,
     GLOBAL,
 ]);
 
 /// Backlog > Docs, the compose area (kind, title and body).
 pub const DOCS_COMPOSE: Stack<'static> =
-    Stack::new(&[Layer::view(Context::BacklogDocs, &[]), FORM, MODAL]);
+    Stack::new(&[Layer::view(Context::BacklogDocs, &[]), FIELD, FORM, MODAL]);
 
 /// Backlog > Notes, no compose area open.
 pub const BACKLOG_NOTES: Stack<'static> = Stack::new(&[
@@ -703,12 +867,18 @@ pub const BACKLOG_NOTES: Stack<'static> = Stack::new(&[
     BACKLOG,
     EDIT,
     LIST_ALL,
+    LAYOUT,
+    HISTORY,
     GLOBAL,
 ]);
 
 /// Backlog > Notes, the compose area (a body only: its `TextArea` takes `Up`/`Down`).
-pub const NOTES_COMPOSE: Stack<'static> =
-    Stack::new(&[Layer::view(Context::BacklogNotes, &[]), FORM_EDITOR, MODAL]);
+pub const NOTES_COMPOSE: Stack<'static> = Stack::new(&[
+    Layer::view(Context::BacklogNotes, &[]),
+    FIELD,
+    FORM_EDITOR,
+    MODAL,
+]);
 
 /// Backlog > Prompt (MOD-67 M5 PA-1).
 pub const BACKLOG_PROMPT: Stack<'static> = Stack::new(&[
@@ -720,6 +890,8 @@ pub const BACKLOG_PROMPT: Stack<'static> = Stack::new(&[
     BACKLOG,
     EDIT,
     LIST_ALL,
+    LAYOUT,
+    HISTORY,
     GLOBAL,
 ]);
 
@@ -739,6 +911,8 @@ pub const BACKLOG_REQS: Stack<'static> = Stack::new(&[
     BACKLOG,
     EDIT,
     LIST_ALL,
+    LAYOUT,
+    HISTORY,
     GLOBAL,
 ]);
 
@@ -773,13 +947,20 @@ pub const BACKLOG_FILTER: Stack<'static> = Stack::new(&[
         Context::BacklogFilter,
         &[Act::FilterNextRow, Act::FilterPrevRow, Act::FilterClear],
     ),
+    FIELD,
+    CHOICE,
     FORM_FIELDS,
     MODAL,
 ]);
 
 /// The Backlog's item form (also while it saves).
-pub const ITEM_FORM: Stack<'static> =
-    Stack::new(&[Layer::view(Context::BacklogItem, &[]), FORM, MODAL]);
+pub const ITEM_FORM: Stack<'static> = Stack::new(&[
+    Layer::view(Context::BacklogItem, &[]),
+    FIELD,
+    PICK,
+    FORM,
+    MODAL,
+]);
 
 /// The item form's divergence view.
 pub const ITEM_DIVERGENCE: Stack<'static> = Stack::new(&[
@@ -806,7 +987,9 @@ pub const CHAT_LIVE: Stack<'static> = Stack::new(&[
             Act::ChatBottom,
         ],
     ),
+    ANSWER,
     LIST,
+    HISTORY,
     GLOBAL,
 ]);
 
@@ -818,6 +1001,7 @@ pub const CHAT_REPLAY: Stack<'static> = Stack::new(&[
     ),
     BACK,
     LIST,
+    HISTORY,
     GLOBAL,
 ]);
 
@@ -836,6 +1020,7 @@ pub const QUEUE_OVERLAY: Stack<'static> = Stack::new(&[
     ),
     LIST,
     OVERLAY,
+    QUIT,
     HELP,
 ]);
 
@@ -881,7 +1066,6 @@ mod tests {
         Stack::EDITOR_OPEN,
         SETTINGS_TAB,
         CAPTURE,
-        QUIT_CONFIRM,
         ABORT_CONFIRM,
     ];
 
@@ -911,7 +1095,7 @@ mod tests {
         source!("ui/overlay/concepts_search.rs"),
         source!("ui/overlay/migration_prompt.rs"),
         source!("ui/overlay/queue.rs"),
-        source!("ui/overlay/quit_confirm.rs"),
+        source!("ui/overlay/leave.rs"),
         source!("ui/overlay/waiting_list.rs"),
         source!("ui/overlay/workspace_switcher.rs"),
         source!("ui/tabs/skills/mod.rs"),
@@ -956,6 +1140,28 @@ mod tests {
     /// The directory picker: it handles the picker acts of the Hierarchy stack that hosts it.
     const PATH_PICKER_RS: &str = "ui/path_picker.rs";
 
+    /// MOD-115 M2 Task 0: acts a view stack offers whose sites a later task writes: the leave
+    /// dialog's (Task 4), the choice, answer and Requirements priority keys (Task 5, the former
+    /// `FIXED` sites). Not demanded, so those tasks need not touch this file; Task 6 empties it.
+    const PENDING: &[Act] = &[
+        Act::LeaveConfirm,
+        Act::LeaveStay,
+        Act::ChoicePrev,
+        Act::ChoiceNext,
+        Act::ChoiceToggle,
+        Act::AnswerOption1,
+        Act::AnswerOption2,
+        Act::AnswerOption3,
+        Act::AnswerOption4,
+        Act::AnswerOption5,
+        Act::AnswerOption6,
+        Act::AnswerOption7,
+        Act::AnswerOption8,
+        Act::AnswerOption9,
+        Act::RequirementsPriorityMust,
+        Act::RequirementsPriorityLater,
+    ];
+
     /// Pairs every stack this module declares with its name (MOD-67 M6 R1 LOW-4).
     macro_rules! by_name {
         ($($stack:ident),* $(,)?) => {
@@ -998,7 +1204,6 @@ mod tests {
         CONCEPTS_QUERY,
         SWITCHER,
         MIGRATION,
-        QUIT_CONFIRM,
         ABORT_CONFIRM,
         WAITING_LIST,
         LIBRARY_BROWSE,
@@ -1018,10 +1223,12 @@ mod tests {
         HELP_PROPOSAL,
         REQUIREMENTS_BROWSE,
         REQUIREMENTS_FORM,
+        AREA_FORM,
         REQUIREMENTS_WITHDRAW,
         BACKLOG_BODY,
         RUNS_BROWSE,
         RUNS_CONFIRM,
+        RUNS_CANCEL,
         RUNS_COUNTING,
         RUNS_ARTIFACT,
         BACKLOG_GRAPH,
@@ -1041,6 +1248,7 @@ mod tests {
         CHAT_REPLAY,
         QUEUE_OVERLAY,
         HIERARCHY_PICKER,
+        LEAVE,
     ];
 
     /// The files a stack's acts are handled in beside the files that name it (MOD-67 M6 R1
@@ -1113,15 +1321,37 @@ mod tests {
         Keys::compiled().actions(stack, chord(spec))
     }
 
+    /// MOD-115 M2 T6 (blueprint D-15): `MODAL` admits neither the pane keys (B2) nor the tab
+    /// keys, so a form never switches tabs, on the default `ctrl-pgdn` or on a `next_tab` rebound
+    /// to a chord the modal filter passes; the capturing Skills modes keep them through `TABS`.
+    #[test]
+    fn a_capturing_mode_never_switches_tabs() {
+        assert_eq!(resolve(ITEM_FORM, "ctrl-pgdn"), []);
+        assert_eq!(resolve(ITEM_FORM, "ctrl-pgup"), []);
+        let rebound = crate::keys::load_str("version = 2\n[global]\nnext_tab = [\"f7\"]\n")
+            .expect("the file loads");
+        assert_eq!(rebound.actions(ITEM_FORM, chord("f7")), []);
+        assert_eq!(rebound.actions(BACKLOG_BODY, chord("f7")), [Act::NextTab]);
+        assert_eq!(resolve(LIBRARY_EDITOR, "ctrl-pgdn"), [Act::NextTab]);
+    }
+
     #[test]
     fn the_view_stacks_resolve_as_designed() {
         assert_eq!(resolve(HIERARCHY_BROWSE, "ctrl-d"), []);
         assert_eq!(resolve(KINDS_BROWSE, "ctrl-d"), []);
         assert_eq!(resolve(HIERARCHY_BROWSE, "d"), [Act::Delete]);
         assert_eq!(resolve(HIERARCHY_BROWSE, "down"), [Act::ListDown]);
-        assert_eq!(resolve(HIERARCHY_BROWSE, "tab"), [Act::NextTab]);
+        // MOD-115 M2 D4: `Tab` moves the pane focus (nothing on a single-pane tab).
+        assert_eq!(resolve(HIERARCHY_BROWSE, "tab"), [Act::NextPane]);
+        assert_eq!(resolve(HIERARCHY_BROWSE, "ctrl-pgdn"), [Act::NextTab]);
         assert_eq!(resolve(AGENTS_FORM, "tab"), [Act::FormNextField]);
-        assert_eq!(resolve(AGENTS_FORM, "down"), [Act::FormNextField]);
+        // MOD-115 M2: a text area takes `Down` too; the form's own move comes first.
+        assert_eq!(
+            resolve(AGENTS_FORM, "down"),
+            [Act::FormNextField, Act::FieldLineDown]
+        );
+        assert_eq!(resolve(AGENTS_FORM, "enter"), [Act::FieldSubmit]);
+        assert_eq!(resolve(AGENTS_FORM, "ctrl-right"), []);
         assert_eq!(resolve(QUEUE_BROWSE, "enter"), [Act::Edit]);
         assert_eq!(resolve(MIGRATION, "Y"), [Act::ConfirmYes]);
         assert_eq!(resolve(MIGRATION, "N"), [Act::ConfirmNo]);
@@ -1140,7 +1370,15 @@ mod tests {
         assert_eq!(resolve(KINDS_BROWSE, "g"), [Act::KindsGraph]);
         assert_eq!(resolve(CONCEPTS_QUERY, "?"), []);
         assert_eq!(resolve(CONCEPTS_QUERY, "f1"), [Act::Help]);
-        assert_eq!(resolve(CONCEPTS_QUERY, "esc"), [Act::OverlayClose]);
+        assert_eq!(
+            resolve(CONCEPTS_QUERY, "esc"),
+            [Act::FieldCancel, Act::OverlayClose]
+        );
+        assert_eq!(
+            resolve(CONCEPTS_QUERY, "up"),
+            [Act::ConceptsUp, Act::FieldLineUp]
+        );
+        assert_eq!(resolve(CONCEPTS_QUERY, "ctrl-c"), [Act::Quit]);
         let capital =
             KeyChord::from_event(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::CONTROL));
         assert_eq!(
@@ -1153,16 +1391,15 @@ mod tests {
         );
         assert_eq!(resolve(SWITCHER, "enter"), [Act::SwitcherSwitch]);
         assert_eq!(resolve(SWITCHER, "2"), []);
-        assert_eq!(resolve(QUIT_CONFIRM, "y"), [Act::ConfirmYes]);
-        assert_eq!(resolve(QUIT_CONFIRM, "n"), [Act::ConfirmNo]);
-        assert_eq!(
-            resolve(QUIT_CONFIRM, "esc"),
-            [Act::ConfirmNo, Act::OverlayClose]
-        );
-        assert_eq!(resolve(QUIT_CONFIRM, "?"), [Act::Help]);
-        assert_eq!(resolve(QUIT_CONFIRM, "f1"), [Act::Help]);
-        for spec in ["q", "Y", "enter"] {
-            assert_eq!(resolve(QUIT_CONFIRM, spec), [], "{spec}");
+        // MOD-115 M2 D6: the leave dialog (it replaced the quit question).
+        assert_eq!(resolve(LEAVE, "enter"), [Act::LeaveConfirm]);
+        assert_eq!(resolve(LEAVE, "ctrl-c"), [Act::LeaveConfirm]);
+        assert_eq!(resolve(LEAVE, "esc"), [Act::LeaveStay]);
+        assert_eq!(resolve(LEAVE, "n"), [Act::LeaveStay]);
+        assert_eq!(resolve(LEAVE, "?"), [Act::Help]);
+        assert_eq!(resolve(LEAVE, "f1"), [Act::Help]);
+        for spec in ["q", "y", "Y"] {
+            assert_eq!(resolve(LEAVE, spec), [], "{spec}");
         }
     }
 
@@ -1180,7 +1417,10 @@ mod tests {
         assert_eq!(resolve(LIBRARY_BROWSE, "ctrl-e"), []);
         assert_eq!(resolve(LIBRARY_BROWSE, "J"), [Act::PaneScrollDown]);
         assert_eq!(resolve(LIBRARY_BROWSE, "q"), [Act::Quit]);
-        assert_eq!(resolve(LIBRARY_EDITOR, "tab"), [Act::NextTab]);
+        // MOD-115 M2 D4: the tab keys are `ctrl-pgdn`/`ctrl-pgup` (the `TABS` layer still hands
+        // them to the shell); `Tab` reaches neither the panes (B2) nor the tabs.
+        assert_eq!(resolve(LIBRARY_EDITOR, "tab"), []);
+        assert_eq!(resolve(LIBRARY_EDITOR, "ctrl-pgdn"), [Act::NextTab]);
         assert_eq!(resolve(LIBRARY_EDITOR, "ctrl-g"), [Act::SkillsAskAgent]);
         assert_eq!(resolve(LIBRARY_EDITOR, "ctrl-s"), [Act::FormSave]);
         assert_eq!(resolve(LIBRARY_EDITOR, "ctrl-e"), [Act::FormExternalEditor]);
@@ -1188,23 +1428,53 @@ mod tests {
         assert_eq!(resolve(LIBRARY_EDITOR, "q"), []);
         assert_eq!(resolve(LIBRARY_EDITOR, "f1"), [Act::Help]);
         assert!(!LIBRARY_EDITOR.passes(chord("tab")));
-        assert_eq!(resolve(LIBRARY_INFO, "down"), [Act::FormNextField]);
+        assert_eq!(
+            resolve(LIBRARY_INFO, "down"),
+            [Act::FormNextField, Act::FieldLineDown]
+        );
         assert_eq!(resolve(ATTACH_BROWSE, "a"), [Act::LibraryAttach]);
         assert_eq!(resolve(ATTACH_BROWSE, "enter"), [Act::AttachChoose]);
         assert_eq!(resolve(ATTACH_BROWSE, "esc"), [Act::Back]);
         assert_eq!(resolve(ATTACH_FORM, "ctrl-r"), [Act::AttachRepo]);
-        assert_eq!(resolve(ATTACH_FORM, "down"), [Act::FormNextField]);
+        assert_eq!(
+            resolve(ATTACH_FORM, "down"),
+            [Act::FormNextField, Act::FieldLineDown]
+        );
+        assert_eq!(resolve(ATTACH_FORM, "space"), [Act::ChoiceToggle]);
+        assert_eq!(resolve(ATTACH_FORM, "left"), [Act::FieldLeft]);
         assert_eq!(resolve(ATTACH_CONFIRM, "ctrl-y"), []);
         assert_eq!(resolve(TEMPLATES_BROWSE, "D"), [Act::TemplatesDiffDefault]);
-        assert_eq!(resolve(HELP_ASKING, "down"), [Act::SkillsHelpNextAgent]);
-        assert_eq!(resolve(HELP_ASKING, "tab"), [Act::NextTab]);
+        assert_eq!(
+            resolve(HELP_ASKING, "down"),
+            [Act::SkillsHelpNextAgent, Act::FieldLineDown]
+        );
+        assert_eq!(resolve(HELP_ASKING, "tab"), []);
+        assert_eq!(resolve(HELP_ASKING, "ctrl-pgup"), [Act::PrevTab]);
         assert_eq!(resolve(HELP_PROPOSAL, "y"), [Act::SkillsHelpAccept]);
         assert_eq!(resolve(HELP_PROPOSAL, "esc"), [Act::ConfirmNo]);
         assert_eq!(resolve(HELP_WAITING, "esc"), [Act::SkillsHelpCancel]);
         assert_eq!(resolve(REQUIREMENTS_BROWSE, "/"), [Act::RequirementsFilter]);
         assert_eq!(resolve(REQUIREMENTS_BROWSE, "enter"), [Act::ListFold]);
         assert_eq!(resolve(REQUIREMENTS_BROWSE, "ctrl-j"), []);
-        assert_eq!(resolve(REQUIREMENTS_FORM, "down"), [Act::FormNextField]);
+        assert_eq!(
+            resolve(REQUIREMENTS_FORM, "down"),
+            [Act::FormNextField, Act::FieldLineDown]
+        );
+        assert_eq!(
+            resolve(REQUIREMENTS_FORM, "l"),
+            [Act::RequirementsPriorityLater, Act::ChoiceNext]
+        );
+        assert_eq!(
+            resolve(REQUIREMENTS_FORM, "m"),
+            [Act::RequirementsPriorityMust]
+        );
+        assert_eq!(
+            resolve(REQUIREMENTS_FORM, "left"),
+            [Act::FieldLeft, Act::ChoicePrev]
+        );
+        assert_eq!(resolve(LIBRARY_BROWSE, "z"), [Act::LayoutZoom]);
+        assert_eq!(resolve(LIBRARY_BROWSE, "backspace"), [Act::HistoryBack]);
+        assert_eq!(resolve(REQUIREMENTS_BROWSE, "f2"), [Act::LayoutToggleList]);
         assert_eq!(resolve(REQUIREMENTS_FORM, "q"), []);
         assert_eq!(resolve(REQUIREMENTS_WITHDRAW, "tab"), []);
         assert_eq!(resolve(REQUIREMENTS_WITHDRAW, "ctrl-s"), [Act::FormSave]);
@@ -1235,7 +1505,14 @@ mod tests {
             resolve(RUNS_BROWSE, "enter"),
             [Act::BacklogReplay, Act::ListFold]
         );
-        assert_eq!(resolve(RUNS_BROWSE, "1"), [Act::SelectTab1]);
+        assert_eq!(
+            resolve(RUNS_BROWSE, "1"),
+            [Act::AnswerOption1, Act::SelectTab1]
+        );
+        assert_eq!(
+            resolve(RUNS_BROWSE, "p"),
+            [Act::RunsPromote, Act::LayoutNextPreset]
+        );
         assert_eq!(resolve(RUNS_BROWSE, "j"), [Act::ListDown]);
         assert_eq!(resolve(RUNS_CONFIRM, "y"), [Act::ConfirmYes]);
         assert_eq!(resolve(RUNS_CONFIRM, "esc"), [Act::ConfirmNo]);
@@ -1258,7 +1535,10 @@ mod tests {
         assert_eq!(resolve(BACKLOG_GRAPH, "pgdn"), [Act::PanePageDown]);
         assert_eq!(resolve(BACKLOG_DOCS, "v"), [Act::DocsNewVersion]);
         assert_eq!(resolve(BACKLOG_DOCS, "J"), [Act::DocsNextRow]);
-        assert_eq!(resolve(DOCS_COMPOSE, "down"), [Act::FormNextField]);
+        assert_eq!(
+            resolve(DOCS_COMPOSE, "down"),
+            [Act::FormNextField, Act::FieldLineDown]
+        );
         assert_eq!(resolve(DOCS_COMPOSE, "ctrl-s"), [Act::FormSave]);
         assert_eq!(resolve(DOCS_COMPOSE, "ctrl-e"), [Act::FormExternalEditor]);
         assert_eq!(resolve(DOCS_COMPOSE, "q"), []);
@@ -1279,10 +1559,18 @@ mod tests {
         assert_eq!(resolve(REQS_CONFIRM, "alt-y"), []);
         assert_eq!(resolve(BACKLOG_FILTER, "x"), [Act::FilterClear]);
         assert_eq!(resolve(BACKLOG_FILTER, "j"), [Act::FilterNextRow]);
-        assert_eq!(resolve(BACKLOG_FILTER, "down"), [Act::FormNextField]);
+        assert_eq!(
+            resolve(BACKLOG_FILTER, "down"),
+            [Act::FormNextField, Act::FieldLineDown]
+        );
+        assert_eq!(resolve(BACKLOG_FILTER, "space"), [Act::ChoiceToggle]);
         assert_eq!(resolve(BACKLOG_FILTER, "tab"), [Act::FormNextField]);
         assert_eq!(resolve(BACKLOG_FILTER, "q"), []);
-        assert_eq!(resolve(ITEM_FORM, "down"), [Act::FormNextField]);
+        assert_eq!(
+            resolve(ITEM_FORM, "down"),
+            [Act::FormNextField, Act::FieldLineDown]
+        );
+        assert_eq!(resolve(ITEM_FORM, "h"), [Act::ChoicePrev]);
         assert_eq!(resolve(ITEM_FORM, "ctrl-s"), [Act::FormSave]);
         assert_eq!(resolve(ITEM_FORM, "f1"), [Act::Help]);
         assert_eq!(resolve(ITEM_FORM, "q"), []);
@@ -1294,7 +1582,17 @@ mod tests {
         assert_eq!(resolve(CHAT_LIVE, "enter"), [Act::ChatCompose]);
         assert_eq!(resolve(CHAT_LIVE, "esc"), [Act::ChatEnd]);
         assert_eq!(resolve(CHAT_LIVE, "home"), []);
-        assert_eq!(resolve(CHAT_LIVE, "1"), [Act::SelectTab1]);
+        assert_eq!(
+            resolve(CHAT_LIVE, "1"),
+            [Act::AnswerOption1, Act::SelectTab1]
+        );
+        assert_eq!(resolve(CHAT_LIVE, "backspace"), [Act::HistoryBack]);
+        assert_eq!(resolve(CHAT_LIVE, "z"), []);
+        assert_eq!(
+            resolve(BACKLOG_BODY, "P"),
+            [Act::BacklogPauseQueue, Act::LayoutPrevPreset]
+        );
+        assert_eq!(resolve(BACKLOG_BODY, "ctrl-right"), [Act::NextPane]);
         assert_eq!(resolve(CHAT_LIVE, "q"), [Act::Quit]);
         assert_eq!(resolve(CHAT_REPLAY, "esc"), [Act::Back]);
         assert_eq!(resolve(CHAT_REPLAY, "i"), []);
@@ -1370,12 +1668,156 @@ mod tests {
             );
             assert_eq!(resolve(stack, "q"), [Act::Quit], "{name}");
             let layers = stack.layers();
+            // MOD-115 M2 B1: the layout and history layers close the tail.
             assert_eq!(
-                layers[layers.len() - 4..],
-                [BACKLOG, EDIT, LIST_ALL, GLOBAL],
+                layers[layers.len() - 6..],
+                [BACKLOG, EDIT, LIST_ALL, LAYOUT, HISTORY, GLOBAL],
                 "{name}"
             );
         }
+    }
+
+    /// MOD-115 M2 §1.5 (the implementer check, mechanised): every view source whose production
+    /// code builds a text widget (`TextField`, `TextArea`, the chat `Composer`) names a stack
+    /// that captures text, so a mode that feeds one cannot sit on a non-capturing stack alone.
+    #[test]
+    fn every_view_that_builds_a_text_widget_names_a_capturing_stack() {
+        let capturing: Vec<&str> = VIEW_STACKS
+            .iter()
+            .filter(|(_, stack)| stack.captures_text())
+            .map(|&(name, _)| name)
+            .collect();
+        // A widget's owner whose host names the stack: the Requirements forms (the tab picks
+        // `REQUIREMENTS_FORM`/`REQUIREMENTS_WITHDRAW`) and the directory picker's go-to field
+        // (Hierarchy puts it on `CAPTURE`).
+        const HOSTED: &[(&str, &str)] = &[
+            (
+                "ui/tabs/requirements/forms.rs",
+                "ui/tabs/requirements/mod.rs",
+            ),
+            (PATH_PICKER_RS, "ui/tabs/settings/hierarchy.rs"),
+        ];
+        let sources: Vec<(&str, String)> = VIEWS
+            .iter()
+            .chain(ACT_SITES)
+            .map(|&(path, source)| (path, production(source)))
+            .collect();
+        let code_of = |path: &str| {
+            sources
+                .iter()
+                .find(|(at, _)| *at == path)
+                .map(|(_, code)| code)
+                .unwrap_or_else(|| panic!("{path} is not a view source"))
+        };
+        let mut builders = 0;
+        let mut bare = Vec::new();
+        for (path, code) in &sources {
+            if !["TextField::", "TextArea::", "Composer::"]
+                .iter()
+                .any(|widget| code.contains(widget))
+            {
+                continue;
+            }
+            builders += 1;
+            let named = HOSTED
+                .iter()
+                .find(|(owner, _)| owner == path)
+                .map_or(code, |&(_, host)| code_of(host));
+            if !capturing.iter().any(|name| names_in(named, name)) {
+                bare.push(*path);
+            }
+        }
+        assert!(builders > 0, "some view builds a text widget");
+        assert_eq!(
+            bare,
+            Vec::<&str>::new(),
+            "build a text widget, name no capturing stack"
+        );
+    }
+
+    /// MOD-115 M2 §1.5, B1-B3: exactly the blueprint's stacks capture text (a `[field]` layer,
+    /// right after the view layer, in a stack whose global layer is modal); no capturing stack
+    /// has the layout or history layer; no modal global layer admits the pane keys; the layout
+    /// and history layers sit right before an unfiltered global layer.
+    #[test]
+    fn the_m2_layers_sit_where_the_blueprint_puts_them() {
+        let capturing: Vec<&str> = VIEW_STACKS
+            .iter()
+            .filter(|(_, stack)| stack.captures_text())
+            .map(|&(name, _)| name)
+            .collect();
+        assert_eq!(
+            capturing,
+            [
+                "CAPTURE",
+                "AGENTS_FORM",
+                "HIERARCHY_EDITOR",
+                "KINDS_EDITOR",
+                "BOXES_EDITOR",
+                "PERSONAS_FORM",
+                "PERSONAS_EDITOR",
+                "SECRETS_FORM",
+                "CONCEPTS_QUERY",
+                "LIBRARY_PROMPT",
+                "LIBRARY_INFO",
+                "LIBRARY_EDITOR",
+                "ATTACH_FORM",
+                "TEMPLATES_PROMPT",
+                "TEMPLATES_EDITOR",
+                "HELP_ASKING",
+                "REQUIREMENTS_FORM",
+                "AREA_FORM",
+                "REQUIREMENTS_WITHDRAW",
+                "DOCS_COMPOSE",
+                "NOTES_COMPOSE",
+                "BACKLOG_FILTER",
+                "ITEM_FORM",
+            ]
+        );
+        for &(phrase, stack) in DECLARED {
+            let layers = stack.layers();
+            let at = |layer: Layer| layers.iter().position(|&here| here == layer);
+            if let Some(field) = at(FIELD) {
+                assert_eq!(field, usize::from(layers[0].inherits()), "{phrase}: field");
+                let (_, global) = stack.global().expect("a global layer");
+                assert!(
+                    global.is_modal(),
+                    "{phrase}: captures under an unfiltered layer"
+                );
+                assert!(at(LAYOUT).is_none() && at(HISTORY).is_none(), "{phrase}");
+            }
+            for (index, layer) in layers.iter().enumerate() {
+                if layer.context() == Context::Global && layer.is_modal() {
+                    assert!(
+                        !stack.admits(index, Act::NextPane) && !stack.admits(index, Act::PrevPane),
+                        "{phrase}: a modal layer offers the pane keys"
+                    );
+                }
+            }
+            if let Some(history) = at(HISTORY) {
+                assert_eq!(
+                    layers[history + 1],
+                    GLOBAL,
+                    "{phrase}: history before global"
+                );
+                if let Some(layout) = at(LAYOUT) {
+                    assert_eq!(layout + 1, history, "{phrase}: layout before history");
+                }
+            } else {
+                assert!(at(LAYOUT).is_none(), "{phrase}: layout without history");
+            }
+        }
+        assert_eq!(resolve(AGENTS_FORM, "ctrl-left"), []);
+        assert_eq!(resolve(SETTINGS_TAB, "backspace"), [Act::HistoryBack]);
+        assert_eq!(resolve(SETTINGS_TAB, "z"), []);
+        assert_eq!(resolve(LEAVE, "enter"), [Act::LeaveConfirm]);
+        assert_eq!(resolve(LEAVE, "n"), [Act::LeaveStay]);
+        assert_eq!(resolve(LEAVE, "esc"), [Act::LeaveStay]);
+        assert_eq!(resolve(LEAVE, "?"), [Act::Help]);
+        assert_eq!(resolve(LEAVE, "q"), []);
+        assert_eq!(resolve(RUNS_CONFIRM, "h"), [Act::ChoicePrev]);
+        assert_eq!(resolve(ABORT_CONFIRM, "ctrl-c"), [Act::Quit]);
+        assert_eq!(resolve(ABORT_CONFIRM, "q"), []);
     }
 
     /// MOD-67 M4 D5: a capturing or confirming mode never offers the Skills view switch, so a
@@ -1406,7 +1848,7 @@ mod tests {
             .iter()
             .filter(|(_, stack)| !NOT_VIEW_LED.contains(stack))
             .collect();
-        assert_eq!(views.len(), 72);
+        assert_eq!(views.len(), 75);
         for &&(phrase, stack) in &views {
             let first = stack.layers()[0];
             assert!(first.inherits(), "{phrase}: layer 0 is not a view layer");
@@ -1429,11 +1871,20 @@ mod tests {
             for layer in &stack.layers()[1..] {
                 assert!(!layer.inherits(), "{phrase}: a view layer below the first");
             }
-            // MOD-67 M4 PA-2: a second global layer is `TABS`, just before the modal one.
+            // MOD-67 M4 PA-2: a second global layer is `TABS`, just before the modal one; or
+            // (MOD-115 M2 B4) an overlay's `QUIT`, just before its last `HELP` layer.
             let globals: Vec<usize> = (0..stack.layers().len())
                 .filter(|&at| stack.layers()[at].context() == Context::Global)
                 .collect();
-            if let [tabs, _] = globals[..] {
+            if let [quit, _] = globals[..]
+                && stack.layers()[quit] == QUIT
+            {
+                assert_eq!(quit, index - 1, "{phrase}: QUIT is not just before HELP");
+                assert!(
+                    global.admits(Act::Help) && !global.admits(Act::Quit),
+                    "{phrase}"
+                );
+            } else if let [tabs, _] = globals[..] {
                 assert_eq!(tabs, index - 1, "{phrase}: TABS is not just before MODAL");
                 assert!(
                     global.is_modal(),
@@ -1531,7 +1982,9 @@ mod tests {
 
     /// MOD-67 M6 D7 (ANA-26 §8, risk "a stack action no view handles"): every catalogue act is
     /// offered by some declared stack in a layer of its own context, and every act a view stack
-    /// offers outside the global, overlay and editor contexts (the shell's) is named `Act::X` in
+    /// offers outside the global, overlay and editor contexts (the shell's), and (MOD-115 M2)
+    /// the layout and history contexts (the shell's) and the field context (the shell's
+    /// translation turns it into the widgets' own events), is named `Act::X` in
     /// that stack's own files: the production code of the files that name `views::<STACK>`, plus
     /// its [`DELEGATES`] (MOD-67 M6 R1 LOW-4, so an act shared by many stacks is checked for each
     /// stack rather than passing on any view that names it).
@@ -1583,7 +2036,12 @@ mod tests {
             for (index, layer) in stack.layers().iter().enumerate() {
                 if matches!(
                     layer.context(),
-                    Context::Global | Context::Overlay | Context::Editor
+                    Context::Global
+                        | Context::Overlay
+                        | Context::Editor
+                        | Context::Layout
+                        | Context::History
+                        | Context::Field
                 ) {
                     continue;
                 }
@@ -1592,7 +2050,7 @@ mod tests {
                     .filter(|spec| spec.context == layer.context() && stack.admits(index, spec.act))
                 {
                     let act = format!("Act::{:?}", spec.act);
-                    if own.iter().any(|code| names_in(code, &act)) {
+                    if PENDING.contains(&spec.act) || own.iter().any(|code| names_in(code, &act)) {
                         continue;
                     }
                     let mut handled = false;

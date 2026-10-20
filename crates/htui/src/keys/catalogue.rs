@@ -9,14 +9,15 @@
 //! Defaults are strict spec strings (blueprint B4): lower-case key names (`tab`, `esc`, `pgdn`,
 //! `f1`), the character itself for a character (`G`, `]`), and `ctrl-x` for a ctrl chord. This
 //! module does not parse them; `keys::Keys::defaults` does, and its tests pin that every one
-//! parses. `ctrl-c` is never a default: it is fixed (`keys::chord::CTRL_C`).
+//! parses. MOD-115 M2 (MD2): `ctrl-c` is a default of `global.quit` and `leave.confirm`, like any
+//! chord; the shell still answers it ahead of every stack until M2's Task 6 removes that branch.
 //!
 //! `in_capture` is a property of an action (blueprint B3). It means "offered while a text field
 //! captures", so every default and every user chord of the action must be non-printable
 //! (`KeyChord::is_printable`; M2's validator). The global layer is **not** marked. Under a
 //! capturing mode (M3) the global layer is filtered chord by chord, and printable chords drop
 //! out. So `global.help` (`?`, `f1`) reaches help through `f1` while a field types `?`, and
-//! `global.quit` (`q`) is unreachable there. `ctrl-c` quits regardless.
+//! `global.quit` (`q`) is unreachable there, while its `ctrl-c` passes the filter.
 //!
 //! MOD-67 M3 appends the Settings tab's context, one context per Settings section and one per
 //! overlay, in strip order (plan D1). A view context holds the view's own verbs; the shared verbs
@@ -35,12 +36,19 @@
 //! MOD-67 M6 appends `queue` (the queue overlay) and `picker` (the directory picker), the last
 //! two views that matched raw keys.
 
+//!
+//! MOD-115 M2 appends the shell's and the text fields' contexts (blueprint §1.2): `layout`,
+//! `history`, `leave` (the leave dialog), `field` (a text field's editing keys), `choice` (a
+//! choice field's value keys) and `answer` (a parked request's numbered options). Every row M2
+//! adds or changes carries `since: 2` (§1.1), so a key file from before M2 can give way to it.
+
 use Context::{
-    Backlog, BacklogDocs, BacklogFilter, BacklogGraph, BacklogItem, BacklogNotes, BacklogPrompt,
-    BacklogReqs, BacklogRuns, Chat, Common, Concepts, Confirm, Editor, Form, Global, List, Overlay,
-    Pane, Picker, Queue, Requirements, Settings, SettingsAgents, SettingsBoxes, SettingsConnection,
-    SettingsHierarchy, SettingsKinds, SettingsPersonas, SettingsSecrets, Skills, SkillsAttach,
-    SkillsHelp, SkillsLibrary, SkillsTemplates, Switcher, Waiting,
+    Answer, Backlog, BacklogDocs, BacklogFilter, BacklogGraph, BacklogItem, BacklogNotes,
+    BacklogPrompt, BacklogReqs, BacklogRuns, Chat, Choice, Common, Concepts, Confirm, Editor,
+    Field, Form, Global, History, Layout, Leave, List, Overlay, Pane, Picker, Queue, Requirements,
+    Settings, SettingsAgents, SettingsBoxes, SettingsConnection, SettingsHierarchy, SettingsKinds,
+    SettingsPersonas, SettingsSecrets, Skills, SkillsAttach, SkillsHelp, SkillsLibrary,
+    SkillsTemplates, Switcher, Waiting,
 };
 
 /// A key context: a TOML table of `keys.toml` and a layer of a context stack (ANA-26 §7.2-§7.3).
@@ -141,6 +149,21 @@ pub enum Context {
     /// `[picker]`: the directory picker a Settings section opens (MOD-67 M6 D3; today
     /// Hierarchy's).
     Picker,
+    /// `[layout]`: the shell's pane layout of a list + detail tab (MOD-115 M2 B1): presets,
+    /// split sizes, hiding and zoom. Only the list + detail browse stacks carry it.
+    Layout,
+    /// `[history]`: back and forward through the places visited (MOD-115 M2 B1). Every tab
+    /// browse stack carries it; no capturing one does.
+    History,
+    /// `[leave]`: the leave dialog (MOD-115 M2 D6), an overlay's view like `[waiting]`.
+    Leave,
+    /// `[field]`: a text field's editing keys (MOD-115 M2 D7). The shell translates them into the
+    /// widgets' canonical events while a stack captures text.
+    Field,
+    /// `[choice]`: a choice field's value keys (MOD-115 M2 D7): move the option, tick it.
+    Choice,
+    /// `[answer]`: a parked request's numbered options (MOD-115 M2 D7), in Runs and in Chat.
+    Answer,
 }
 
 impl Context {
@@ -189,6 +212,12 @@ impl Context {
         Self::Chat,
         Self::Queue,
         Self::Picker,
+        Self::Layout,
+        Self::History,
+        Self::Leave,
+        Self::Field,
+        Self::Choice,
+        Self::Answer,
     ];
 
     /// The TOML table name: `global`, `overlay`, `list`, ..., `settings.agents`, `concepts`.
@@ -237,6 +266,12 @@ impl Context {
             Self::Chat => "chat",
             Self::Queue => "queue",
             Self::Picker => "picker",
+            Self::Layout => "layout",
+            Self::History => "history",
+            Self::Leave => "leave",
+            Self::Field => "field",
+            Self::Choice => "choice",
+            Self::Answer => "answer",
         }
     }
 
@@ -287,6 +322,12 @@ impl Context {
             Self::Chat => "Chat",
             Self::Queue => "Queue",
             Self::Picker => "Picker",
+            Self::Layout => "Layout",
+            Self::History => "History",
+            Self::Leave => "Leave htui?",
+            Self::Field => "Text field",
+            Self::Choice => "Choice",
+            Self::Answer => "Answer",
         }
     }
 
@@ -330,6 +371,7 @@ impl Context {
                 | Self::Chat
                 | Self::Queue
                 | Self::Picker
+                | Self::Leave
         )
     }
 
@@ -698,6 +740,88 @@ pub enum Act {
     PickerGoTo,
     /// `picker.hidden`: show or hide hidden entries.
     PickerHidden,
+    /// `global.next_pane`: focus the next visible pane (MOD-115 M2 D3).
+    NextPane,
+    /// `global.prev_pane`: focus the previous visible pane.
+    PrevPane,
+    /// `layout.next_preset`: the next layout preset.
+    LayoutNextPreset,
+    /// `layout.prev_preset`: the previous layout preset.
+    LayoutPrevPreset,
+    /// `layout.grow_list`: widen the list.
+    LayoutGrowList,
+    /// `layout.shrink_list`: narrow the list.
+    LayoutShrinkList,
+    /// `layout.grow_activity`: grow the activity pane.
+    LayoutGrowActivity,
+    /// `layout.shrink_activity`: shrink the activity pane.
+    LayoutShrinkActivity,
+    /// `layout.toggle_list`: show or hide the list.
+    LayoutToggleList,
+    /// `layout.toggle_activity`: show or hide the activity pane.
+    LayoutToggleActivity,
+    /// `layout.zoom`: zoom the focused pane, or unzoom.
+    LayoutZoom,
+    /// `history.back`: back to the place visited before (MOD-115 M2 D5).
+    HistoryBack,
+    /// `history.forward`: forward again after going back.
+    HistoryForward,
+    /// `leave.confirm`: leave htui from the leave dialog (MOD-115 M2 D6).
+    LeaveConfirm,
+    /// `leave.stay`: close the leave dialog and stay.
+    LeaveStay,
+    /// `field.submit`: a text field's submit (its canonical `Enter`, MOD-115 M2 D7).
+    FieldSubmit,
+    /// `field.cancel`: a text field's cancel (its canonical `Esc`).
+    FieldCancel,
+    /// `field.left`: the cursor one character left.
+    FieldLeft,
+    /// `field.right`: the cursor one character right.
+    FieldRight,
+    /// `field.home`: the cursor to the line's start.
+    FieldHome,
+    /// `field.end`: the cursor to the line's end.
+    FieldEnd,
+    /// `field.delete_back`: delete the character before the cursor.
+    FieldDeleteBack,
+    /// `field.delete_forward`: delete the character under the cursor.
+    FieldDeleteForward,
+    /// `field.line_up`: a text area's cursor one line up (MOD-115 M2 D-8).
+    FieldLineUp,
+    /// `field.line_down`: a text area's cursor one line down.
+    FieldLineDown,
+    /// `field.page_up`: a text area's cursor one page up.
+    FieldPageUp,
+    /// `field.page_down`: a text area's cursor one page down.
+    FieldPageDown,
+    /// `choice.prev`: a choice field's previous option (MOD-115 M2 D7).
+    ChoicePrev,
+    /// `choice.next`: a choice field's next option.
+    ChoiceNext,
+    /// `choice.toggle`: tick or untick a choice field's option.
+    ChoiceToggle,
+    /// `answer.option_1`: answer a parked request with option 1 (MOD-115 M2 D7).
+    AnswerOption1,
+    /// `answer.option_2`: answer a parked request with option 2.
+    AnswerOption2,
+    /// `answer.option_3`: answer a parked request with option 3.
+    AnswerOption3,
+    /// `answer.option_4`: answer a parked request with option 4.
+    AnswerOption4,
+    /// `answer.option_5`: answer a parked request with option 5.
+    AnswerOption5,
+    /// `answer.option_6`: answer a parked request with option 6.
+    AnswerOption6,
+    /// `answer.option_7`: answer a parked request with option 7.
+    AnswerOption7,
+    /// `answer.option_8`: answer a parked request with option 8.
+    AnswerOption8,
+    /// `answer.option_9`: answer a parked request with option 9.
+    AnswerOption9,
+    /// `requirements.priority_must`: set a requirement form's priority to must.
+    RequirementsPriorityMust,
+    /// `requirements.priority_later`: set a requirement form's priority to later.
+    RequirementsPriorityLater,
 }
 
 impl Act {
@@ -714,6 +838,24 @@ impl Act {
             Self::SelectTab7 => 6,
             Self::SelectTab8 => 7,
             Self::SelectTab9 => 8,
+            _ => return None,
+        })
+    }
+
+    /// The option index of `answer.option_1`..`_9` (0..=8), [`tab_index`](Self::tab_index)'s
+    /// twin; `None` for every other action.
+    #[must_use]
+    pub const fn answer_index(self) -> Option<usize> {
+        Some(match self {
+            Self::AnswerOption1 => 0,
+            Self::AnswerOption2 => 1,
+            Self::AnswerOption3 => 2,
+            Self::AnswerOption4 => 3,
+            Self::AnswerOption5 => 4,
+            Self::AnswerOption6 => 5,
+            Self::AnswerOption7 => 6,
+            Self::AnswerOption8 => 7,
+            Self::AnswerOption9 => 8,
             _ => return None,
         })
     }
@@ -742,6 +884,20 @@ pub struct ActionSpec {
     pub help: &'static str,
     /// Offered while a text field captures, so every chord must be non-printable (ANA-26 §6.4).
     pub in_capture: bool,
+    /// The key-file version the row's defaults are from (MOD-115 M2 §1.1): `1` for a row as it
+    /// was before M2, `2` for a row M2 added or whose defaults it changed. A `version = 1` file
+    /// may take a `since: 2` default's chord (D8).
+    pub since: u8,
+}
+
+impl ActionSpec {
+    /// This row, tagged as from key-file `version` (MOD-115 M2 §1.1).
+    const fn since(self, version: u8) -> Self {
+        Self {
+            since: version,
+            ..self
+        }
+    }
 }
 
 /// A row that is not offered while a text field captures.
@@ -759,6 +915,7 @@ const fn row(
         defaults,
         help,
         in_capture: false,
+        since: 1,
     }
 }
 
@@ -780,16 +937,20 @@ const fn capture_row(
 /// it). M3-M5 append their contexts' blocks at the end.
 pub static CATALOGUE: &[ActionSpec] = &[
     // [global]: the pre-MOD-67 keymap's `default_global` rows and `app/mod.rs` `register_all`
-    // labels, in status-line order. `ctrl-c` is fixed (`CTRL_C`) and never listed.
-    row(Act::Quit, Global, "quit", &["q"], "quit"),
-    row(Act::NextTab, Global, "next_tab", &["tab"], "next tab"),
+    // labels, in status-line order. MOD-115 M2 (MD2): `ctrl-c` is a default of quit (the leave
+    // dialog), no longer a fixed key. Plan D4: `next_tab` and `prev_tab` moved to
+    // `ctrl-pgdn`/`ctrl-pgup` (T6, B6), `tab`/`backtab` to the pane rows, so they are `since: 2`;
+    // digits and clicks remain the main way between tabs.
+    row(Act::Quit, Global, "quit", &["q", "ctrl-c"], "quit").since(2),
+    row(Act::NextTab, Global, "next_tab", &["ctrl-pgdn"], "next tab").since(2),
     row(
         Act::PrevTab,
         Global,
         "prev_tab",
-        &["backtab"],
+        &["ctrl-pgup"],
         "previous tab",
-    ),
+    )
+    .since(2),
     row(
         Act::SelectTab1,
         Global,
@@ -864,6 +1025,24 @@ pub static CATALOGUE: &[ActionSpec] = &[
     row(Act::Find, Global, "find", &["ctrl-f"], "find"),
     row(Act::Waiting, Global, "waiting", &["ctrl-w"], "waiting"),
     row(Act::Queue, Global, "queue", &["ctrl-q"], "queue"),
+    // MOD-115 M2 D3: pane focus. After `queue`, so every keys line keeps its prefix. `tab` and
+    // `backtab` since `next_tab` gave them up (T6, B6); the modal stack never offers them (B2).
+    row(
+        Act::NextPane,
+        Global,
+        "next_pane",
+        &["tab", "ctrl-right"],
+        "next pane",
+    )
+    .since(2),
+    row(
+        Act::PrevPane,
+        Global,
+        "prev_pane",
+        &["backtab", "ctrl-left"],
+        "previous pane",
+    )
+    .since(2),
     // [overlay]: the pre-MOD-67 keymap's wildcard overlay row. In capture because the concepts
     // field returns `Pass` on `Esc` and this layer closes it (`concepts_search.rs:334-335`).
     capture_row(Act::OverlayClose, Overlay, "close", &["esc"], "close"),
@@ -902,21 +1081,25 @@ pub static CATALOGUE: &[ActionSpec] = &[
     // backlog/detail/mod.rs:469.
     row(Act::PanePageUp, Pane, "page_up", &["pgup"], "page up"),
     // backlog/mod.rs:793. Settings cycles sections through `settings.next_section` (M3).
+    // MOD-115 M2 T6 (B6, plan D4): the shift arrows replace the plain ones (arrows stay in the
+    // focused pane). Appended, so the hint rows' first chords (`h/l sub-tab`) stay.
     row(
         Act::PaneNextSubtab,
         Pane,
         "next_subtab",
-        &["l", "]", "right"],
+        &["l", "]", "shift-right"],
         "next sub-tab",
-    ),
+    )
+    .since(2),
     // backlog/mod.rs:794. Settings: `settings.prev_section` (M3).
     row(
         Act::PanePrevSubtab,
         Pane,
         "prev_subtab",
-        &["h", "[", "left"],
+        &["h", "[", "shift-left"],
         "previous sub-tab",
-    ),
+    )
+    .since(2),
     // [confirm]
     // connection.rs:483, qdrant.rs:214, kinds.rs:715, hierarchy.rs:769, personas.rs:785,
     // boxes.rs:545, runs.rs:721, :1144, detail/requirements.rs:352. migration_prompt.rs:92 also
@@ -1002,22 +1185,24 @@ pub static CATALOGUE: &[ActionSpec] = &[
     row(Act::EditorAbort, Editor, "abort", &["ctrl-x"], "abort edit"),
     // [settings]: the Settings tab's own section cycling (MOD-67 M3 D1). Every non-capturing
     // section stack carries this layer, so a section's view layer may override both.
-    // settings/mod.rs:347.
+    // settings/mod.rs:347. MOD-115 M2 T6: the shift arrows, as on `pane.next_subtab`.
     row(
         Act::NextSection,
         Settings,
         "next_section",
-        &["l", "]", "right"],
+        &["l", "]", "shift-right"],
         "next section",
-    ),
+    )
+    .since(2),
     // settings/mod.rs:351.
     row(
         Act::PrevSection,
         Settings,
         "prev_section",
-        &["h", "[", "left"],
+        &["h", "[", "shift-left"],
         "previous section",
-    ),
+    )
+    .since(2),
     // [settings.agents]
     // agents.rs:2479-2498 (`r` probes; not `common.reload`).
     row(Act::AgentsProbe, SettingsAgents, "probe", &["r"], "probe"),
@@ -1259,13 +1444,15 @@ pub static CATALOGUE: &[ActionSpec] = &[
     // [skills]: the verbs Library and Templates share (MOD-67 M4 D2), one row each, so
     // `[skills.library]` and `[skills.templates]` may override them per view.
     // skills/mod.rs:111-118: one toggle between two views (D2), so no next/prev pair.
+    // MOD-115 M2 T6: the shift arrows, as on `pane.next_subtab`.
     row(
         Act::SkillsSwitchView,
         Skills,
         "switch_view",
-        &["h", "l", "[", "]", "left", "right"],
+        &["h", "l", "[", "]", "shift-left", "shift-right"],
         "switch view",
-    ),
+    )
+    .since(2),
     // library.rs:762, :799, templates.rs:576, :616 (`','`).
     row(
         Act::SkillsPrevVersion,
@@ -1416,6 +1603,23 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["/"],
         "filter",
     ),
+    // MOD-115 M2 D7: requirements/forms.rs:325-333, the priority's `m`/`l` (once `FIXED`).
+    row(
+        Act::RequirementsPriorityMust,
+        Requirements,
+        "priority_must",
+        &["m"],
+        "priority must",
+    )
+    .since(2),
+    row(
+        Act::RequirementsPriorityLater,
+        Requirements,
+        "priority_later",
+        &["l"],
+        "priority later",
+    )
+    .since(2),
     // [backlog]: the Backlog tab's own verbs (MOD-67 M5 D1), one row each, so each sub-tab's
     // table may override them; every Backlog browse stack carries this layer.
     // backlog/mod.rs:784 (the pane's `Enter`: runs.rs:1711 replays) and backlog/mod.rs:820 (the
@@ -1811,6 +2015,175 @@ pub static CATALOGUE: &[ActionSpec] = &[
     row(Act::PickerGoTo, Picker, "go_to", &["/"], "go to path"),
     // path_picker.rs:178-181.
     row(Act::PickerHidden, Picker, "hidden", &["."], "show hidden"),
+    // [layout]: MOD-115 M2 D2/D4, the list + detail tabs' layout (B1: its own context, only in
+    // the list + detail browse stacks). `p`/`P` give way to a view's own letter (D4a,
+    // `SHADOWING`); `<`/`>` need no AltGr on IT/DE/FR keyboards; `{`/`}` do on IT, so the ctrl
+    // arrows are the AltGr-free default.
+    row(
+        Act::LayoutNextPreset,
+        Layout,
+        "next_preset",
+        &["p"],
+        "next layout",
+    )
+    .since(2),
+    row(
+        Act::LayoutPrevPreset,
+        Layout,
+        "prev_preset",
+        &["P"],
+        "previous layout",
+    )
+    .since(2),
+    row(
+        Act::LayoutGrowList,
+        Layout,
+        "grow_list",
+        &[">"],
+        "wider list",
+    )
+    .since(2),
+    row(
+        Act::LayoutShrinkList,
+        Layout,
+        "shrink_list",
+        &["<"],
+        "narrower list",
+    )
+    .since(2),
+    row(
+        Act::LayoutGrowActivity,
+        Layout,
+        "grow_activity",
+        &["}", "ctrl-down"],
+        "larger activity",
+    )
+    .since(2),
+    row(
+        Act::LayoutShrinkActivity,
+        Layout,
+        "shrink_activity",
+        &["{", "ctrl-up"],
+        "smaller activity",
+    )
+    .since(2),
+    row(
+        Act::LayoutToggleList,
+        Layout,
+        "toggle_list",
+        &["f2", "alt-1"],
+        "show/hide list",
+    )
+    .since(2),
+    row(
+        Act::LayoutToggleActivity,
+        Layout,
+        "toggle_activity",
+        &["f3", "alt-2"],
+        "show/hide activity",
+    )
+    .since(2),
+    row(Act::LayoutZoom, Layout, "zoom", &["z"], "zoom").since(2),
+    // [history]: MOD-115 M2 D5. A capturing field keeps `backspace` (no capturing stack has
+    // the layer, B1); the directory picker keeps it as `picker.parent`.
+    row(
+        Act::HistoryBack,
+        History,
+        "back",
+        &["backspace", "alt-left"],
+        "back",
+    )
+    .since(2),
+    row(
+        Act::HistoryForward,
+        History,
+        "forward",
+        &["alt-right"],
+        "forward",
+    )
+    .since(2),
+    // [leave]: MOD-115 M2 D6, the leave dialog. The second `ctrl-c` leaves (R-TUI-18).
+    row(
+        Act::LeaveConfirm,
+        Leave,
+        "confirm",
+        &["enter", "ctrl-c"],
+        "leave",
+    )
+    .since(2),
+    row(Act::LeaveStay, Leave, "stay", &["esc", "n"], "stay").since(2),
+    // [field]: MOD-115 M2 D7, a text field's editing keys: the `TextField`, `TextArea` and
+    // `Composer` literals (text_field.rs, text_area.rs:236-239). All named keys, so in capture.
+    capture_row(Act::FieldSubmit, Field, "submit", &["enter"], "submit").since(2),
+    capture_row(Act::FieldCancel, Field, "cancel", &["esc"], "cancel").since(2),
+    capture_row(Act::FieldLeft, Field, "left", &["left"], "cursor left").since(2),
+    capture_row(Act::FieldRight, Field, "right", &["right"], "cursor right").since(2),
+    capture_row(Act::FieldHome, Field, "home", &["home"], "line start").since(2),
+    capture_row(Act::FieldEnd, Field, "end", &["end"], "line end").since(2),
+    capture_row(
+        Act::FieldDeleteBack,
+        Field,
+        "delete_back",
+        &["backspace"],
+        "delete back",
+    )
+    .since(2),
+    capture_row(
+        Act::FieldDeleteForward,
+        Field,
+        "delete_forward",
+        &["delete"],
+        "delete forward",
+    )
+    .since(2),
+    capture_row(Act::FieldLineUp, Field, "line_up", &["up"], "line up").since(2),
+    capture_row(
+        Act::FieldLineDown,
+        Field,
+        "line_down",
+        &["down"],
+        "line down",
+    )
+    .since(2),
+    capture_row(Act::FieldPageUp, Field, "page_up", &["pgup"], "page up").since(2),
+    capture_row(
+        Act::FieldPageDown,
+        Field,
+        "page_down",
+        &["pgdn"],
+        "page down",
+    )
+    .since(2),
+    // [choice]: MOD-115 M2 D7, a choice field's value keys (filter.rs:254-258,
+    // item_form.rs:753-759, runs.rs:1126-1127, attach.rs:271). Printable, so view-resolved.
+    row(
+        Act::ChoicePrev,
+        Choice,
+        "prev",
+        &["left", "h"],
+        "previous option",
+    )
+    .since(2),
+    row(
+        Act::ChoiceNext,
+        Choice,
+        "next",
+        &["right", "l"],
+        "next option",
+    )
+    .since(2),
+    row(Act::ChoiceToggle, Choice, "toggle", &["space"], "toggle").since(2),
+    // [answer]: MOD-115 M2 D7, a parked request's options (runs.rs:1669-1675,
+    // chat/mod.rs:603-611). One help label, so the `?` box merges them into `1-9 answer`.
+    row(Act::AnswerOption1, Answer, "option_1", &["1"], "answer").since(2),
+    row(Act::AnswerOption2, Answer, "option_2", &["2"], "answer").since(2),
+    row(Act::AnswerOption3, Answer, "option_3", &["3"], "answer").since(2),
+    row(Act::AnswerOption4, Answer, "option_4", &["4"], "answer").since(2),
+    row(Act::AnswerOption5, Answer, "option_5", &["5"], "answer").since(2),
+    row(Act::AnswerOption6, Answer, "option_6", &["6"], "answer").since(2),
+    row(Act::AnswerOption7, Answer, "option_7", &["7"], "answer").since(2),
+    row(Act::AnswerOption8, Answer, "option_8", &["8"], "answer").since(2),
+    row(Act::AnswerOption9, Answer, "option_9", &["9"], "answer").since(2),
 ];
 
 /// Extra default chords a view adds to a shared act, on top of whatever the shared row resolves
@@ -1871,12 +2244,46 @@ pub static VIEW_DEFAULTS: &[(Context, Act, &[&str])] = &[
 /// (`every_allow_list_entry_is_demanded`).
 pub static SHADOWING: &[(Act, Act)] = &[
     // migration_prompt.rs:97 + VIEW_DEFAULTS: `[migration] no` derives ["n", "esc", "N"], and
-    // `Esc` is also overlay.close below it. Both close the prompt, nothing applied. And the quit
-    // question (`views::QUIT_CONFIRM`): `Esc` is `confirm.no` there too.
+    // `Esc` is also overlay.close below it. Both close the prompt, nothing applied.
     (Act::ConfirmNo, Act::OverlayClose),
     // graph.rs:712: the Graph pane answers `Enter` itself (re-root), always; the Backlog's
     // replay miss never fires there (MOD-67 M5 PA-2).
     (Act::GraphReroot, Act::BacklogReplay),
+    // MOD-115 M2 D4a (blueprint §1.6): a view's own letter wins over the layout's. `p` promotes
+    // in Runs and is the previous template in Prompt; `P` pauses the queue on every Backlog
+    // sub-tab, so there no default cycles the presets backwards.
+    (Act::RunsPromote, Act::LayoutNextPreset),
+    (Act::PromptPrevTemplate, Act::LayoutNextPreset),
+    (Act::BacklogPauseQueue, Act::LayoutPrevPreset),
+    // concepts_search.rs:334-335: the query field passes `Esc` (cancel) and `overlay.close`
+    // closes the box: both end the search.
+    (Act::FieldCancel, Act::OverlayClose),
+    // requirements/forms.rs:326: on the priority `l` sets later, as today; `h` toggles.
+    (Act::RequirementsPriorityLater, Act::ChoiceNext),
+    // concepts_search.rs:315-319: the query is one line, so the hit cursor always wins.
+    (Act::ConceptsUp, Act::FieldLineUp),
+    (Act::ConceptsDown, Act::FieldLineDown),
+    // agent_help.rs:328: the help prompt's arrows pick the agent.
+    (Act::SkillsHelpPrevAgent, Act::FieldLineUp),
+    (Act::SkillsHelpNextAgent, Act::FieldLineDown),
+];
+
+/// The version-1 defaults of every row M2 changed (MOD-115 M2 D8): each `since: 2` row that
+/// existed before M2, with the defaults it had then. A version-1 key file's entry takes only an
+/// M2 chord from a default: a chord listed here already met the file's entries before M2, and the
+/// file loaded (or was refused) with it. A row M2 appended had no chord before.
+pub static V1_DEFAULTS: &[(Act, &[&str])] = &[
+    (Act::Quit, &["q"]),
+    (Act::NextTab, &["tab"]),
+    (Act::PrevTab, &["backtab"]),
+    (Act::PaneNextSubtab, &["l", "]", "right"]),
+    (Act::PanePrevSubtab, &["h", "[", "left"]),
+    (Act::NextSection, &["l", "]", "right"]),
+    (Act::PrevSection, &["h", "[", "left"]),
+    (
+        Act::SkillsSwitchView,
+        &["h", "l", "[", "]", "left", "right"],
+    ),
 ];
 
 /// Default pairs that share a chord in one context or stack because a view accepts at most one
@@ -1893,13 +2300,32 @@ pub static STATE_GUARDED: &[(Act, Act)] = &[
     (Act::ListFold, Act::BacklogReplay),
     // On a header the Graph has no item; on an item row the fold declines.
     (Act::ListFold, Act::GraphReroot),
+    // MOD-115 M2 §1.6: a form focuses a text field or a choice, never both (the filter form,
+    // the item form, the Requirements forms).
+    (Act::FieldLeft, Act::ChoicePrev),
+    (Act::FieldRight, Act::ChoiceNext),
+    // A `TextArea` takes `Down`/`Up`, a `TextField` passes them to the form's field moves
+    // (text_field.rs:197, the `VIEW_DEFAULTS` rows).
+    (Act::FieldLineDown, Act::FormNextField),
+    (Act::FieldLineUp, Act::FormPrevField),
+    // runs.rs:1669-1675, chat/mod.rs:603-611: the digits answer only while a request is parked,
+    // else they select a tab.
+    (Act::AnswerOption1, Act::SelectTab1),
+    (Act::AnswerOption2, Act::SelectTab2),
+    (Act::AnswerOption3, Act::SelectTab3),
+    (Act::AnswerOption4, Act::SelectTab4),
+    (Act::AnswerOption5, Act::SelectTab5),
+    (Act::AnswerOption6, Act::SelectTab6),
+    (Act::AnswerOption7, Act::SelectTab7),
+    (Act::AnswerOption8, Act::SelectTab8),
+    (Act::AnswerOption9, Act::SelectTab9),
 ];
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
-    use super::{Act, CATALOGUE, Context, STATE_GUARDED};
+    use super::{Act, CATALOGUE, Context, STATE_GUARDED, V1_DEFAULTS};
 
     /// `context`'s index in [`Context::ALL`]. No wildcard arm: a new context fails to compile
     /// here until it is listed, and then in `ALL` too, or `every_context_is_listed_once_in_all`
@@ -1948,12 +2374,18 @@ mod tests {
             Context::Chat => 39,
             Context::Queue => 40,
             Context::Picker => 41,
+            Context::Layout => 42,
+            Context::History => 43,
+            Context::Leave => 44,
+            Context::Field => 45,
+            Context::Choice => 46,
+            Context::Answer => 47,
         }
     }
 
     #[test]
     fn every_context_is_listed_once_in_all() {
-        assert_eq!(Context::ALL.len(), 42);
+        assert_eq!(Context::ALL.len(), 48);
         for (index, context) in Context::ALL.iter().enumerate() {
             assert_eq!(
                 context_position(*context),
@@ -2164,6 +2596,47 @@ mod tests {
         Act::PickerChooseDir,
         Act::PickerGoTo,
         Act::PickerHidden,
+        Act::NextPane,
+        Act::PrevPane,
+        Act::LayoutNextPreset,
+        Act::LayoutPrevPreset,
+        Act::LayoutGrowList,
+        Act::LayoutShrinkList,
+        Act::LayoutGrowActivity,
+        Act::LayoutShrinkActivity,
+        Act::LayoutToggleList,
+        Act::LayoutToggleActivity,
+        Act::LayoutZoom,
+        Act::HistoryBack,
+        Act::HistoryForward,
+        Act::LeaveConfirm,
+        Act::LeaveStay,
+        Act::FieldSubmit,
+        Act::FieldCancel,
+        Act::FieldLeft,
+        Act::FieldRight,
+        Act::FieldHome,
+        Act::FieldEnd,
+        Act::FieldDeleteBack,
+        Act::FieldDeleteForward,
+        Act::FieldLineUp,
+        Act::FieldLineDown,
+        Act::FieldPageUp,
+        Act::FieldPageDown,
+        Act::ChoicePrev,
+        Act::ChoiceNext,
+        Act::ChoiceToggle,
+        Act::AnswerOption1,
+        Act::AnswerOption2,
+        Act::AnswerOption3,
+        Act::AnswerOption4,
+        Act::AnswerOption5,
+        Act::AnswerOption6,
+        Act::AnswerOption7,
+        Act::AnswerOption8,
+        Act::AnswerOption9,
+        Act::RequirementsPriorityMust,
+        Act::RequirementsPriorityLater,
     ];
 
     /// `act`'s index in [`ALL`]. No wildcard arm: a new variant fails to compile here until it is
@@ -2341,6 +2814,47 @@ mod tests {
             Act::PickerChooseDir => 168,
             Act::PickerGoTo => 169,
             Act::PickerHidden => 170,
+            Act::NextPane => 171,
+            Act::PrevPane => 172,
+            Act::LayoutNextPreset => 173,
+            Act::LayoutPrevPreset => 174,
+            Act::LayoutGrowList => 175,
+            Act::LayoutShrinkList => 176,
+            Act::LayoutGrowActivity => 177,
+            Act::LayoutShrinkActivity => 178,
+            Act::LayoutToggleList => 179,
+            Act::LayoutToggleActivity => 180,
+            Act::LayoutZoom => 181,
+            Act::HistoryBack => 182,
+            Act::HistoryForward => 183,
+            Act::LeaveConfirm => 184,
+            Act::LeaveStay => 185,
+            Act::FieldSubmit => 186,
+            Act::FieldCancel => 187,
+            Act::FieldLeft => 188,
+            Act::FieldRight => 189,
+            Act::FieldHome => 190,
+            Act::FieldEnd => 191,
+            Act::FieldDeleteBack => 192,
+            Act::FieldDeleteForward => 193,
+            Act::FieldLineUp => 194,
+            Act::FieldLineDown => 195,
+            Act::FieldPageUp => 196,
+            Act::FieldPageDown => 197,
+            Act::ChoicePrev => 198,
+            Act::ChoiceNext => 199,
+            Act::ChoiceToggle => 200,
+            Act::AnswerOption1 => 201,
+            Act::AnswerOption2 => 202,
+            Act::AnswerOption3 => 203,
+            Act::AnswerOption4 => 204,
+            Act::AnswerOption5 => 205,
+            Act::AnswerOption6 => 206,
+            Act::AnswerOption7 => 207,
+            Act::AnswerOption8 => 208,
+            Act::AnswerOption9 => 209,
+            Act::RequirementsPriorityMust => 210,
+            Act::RequirementsPriorityLater => 211,
         }
     }
 
@@ -2374,7 +2888,7 @@ mod tests {
 
     #[test]
     fn every_act_has_exactly_one_row() {
-        assert_eq!(CATALOGUE.len(), 171);
+        assert_eq!(CATALOGUE.len(), 212);
         let acts: HashSet<Act> = CATALOGUE.iter().map(|row| row.act).collect();
         assert_eq!(acts.len(), CATALOGUE.len(), "an act has two rows");
         for row in CATALOGUE {
@@ -2415,8 +2929,11 @@ mod tests {
         assert!(!focus.defaults.is_empty());
     }
 
+    /// MOD-115 M2 §1.4 (MD2): `ctrl-c` is an ordinary default chord now, of `global.quit` and
+    /// `leave.confirm` only, spelled `ctrl-c` (no other spelling of it is a default).
     #[test]
-    fn no_default_spells_ctrl_c() {
+    fn only_quit_and_leave_confirm_default_to_ctrl_c() {
+        let mut holders = Vec::new();
         for row in CATALOGUE {
             for spec in row.defaults {
                 let folded: String = spec
@@ -2424,13 +2941,169 @@ mod tests {
                     .filter(|c| !c.is_whitespace())
                     .collect::<String>()
                     .to_lowercase();
+                if ["ctrl-c", "ctrl+c", "control-c"].contains(&folded.as_str()) {
+                    assert_eq!(*spec, "ctrl-c", "{:?} spells ctrl-c {spec:?}", row.act);
+                    holders.push(row.act);
+                }
+            }
+        }
+        assert_eq!(holders, [Act::Quit, Act::LeaveConfirm]);
+    }
+
+    /// MOD-115 M2 §1.1: every row M2 adds or changes, and nothing else, is `since: 2`.
+    #[test]
+    fn every_m2_row_is_since_2() {
+        let changed = [
+            Act::Quit,
+            Act::NextTab,
+            Act::PrevTab,
+            Act::PaneNextSubtab,
+            Act::PanePrevSubtab,
+            Act::NextSection,
+            Act::PrevSection,
+            Act::SkillsSwitchView,
+        ];
+        let added = ALL
+            .iter()
+            .copied()
+            .skip_while(|act| *act != Act::NextPane)
+            .collect::<Vec<_>>();
+        assert_eq!(added.len(), 41, "M2 appends 41 acts");
+        for row in CATALOGUE {
+            let m2 = changed.contains(&row.act) || added.contains(&row.act);
+            assert_eq!(row.since == 2, m2, "{:?} is since {}", row.act, row.since);
+        }
+    }
+
+    /// MOD-115 M2 D8: `V1_DEFAULTS` lists exactly the `since: 2` rows that existed before M2,
+    /// each with defaults that parse.
+    #[test]
+    fn the_v1_defaults_are_the_changed_rows_before_m2() {
+        let appended: Vec<Act> = ALL
+            .iter()
+            .copied()
+            .skip_while(|act| *act != Act::NextPane)
+            .collect();
+        let changed: Vec<Act> = CATALOGUE
+            .iter()
+            .filter(|row| row.since == 2 && !appended.contains(&row.act))
+            .map(|row| row.act)
+            .collect();
+        let listed: Vec<Act> = V1_DEFAULTS.iter().map(|&(act, _)| act).collect();
+        assert_eq!(listed, changed);
+        for &(act, defaults) in V1_DEFAULTS {
+            for written in defaults {
                 assert!(
-                    !["ctrl-c", "ctrl+c", "control-c"].contains(&folded.as_str()),
-                    "{:?} binds {spec:?}",
-                    row.act
+                    crate::keys::KeyChord::parse_strict(written).is_ok(),
+                    "{act:?} {written:?}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn since_is_1_or_2() {
+        for row in CATALOGUE {
+            assert!(matches!(row.since, 1 | 2), "{:?}: {}", row.act, row.since);
+        }
+    }
+
+    /// MOD-115 M2 §1.4 (B6, D-4, plan D4): Task 6 flips the meanings with their wiring: `tab`
+    /// and `backtab` move the pane focus, the tabs move to `ctrl-pgdn`/`ctrl-pgup`, and the
+    /// sub-tab, section and view switches take the shift arrows instead of the plain ones
+    /// (arrows stay in the pane), appended so every hint's first chord stays.
+    #[test]
+    fn the_m2_rows_have_their_task_6_defaults() {
+        let defaults = |act: Act| act.spec().expect("a row").defaults;
+        assert_eq!(defaults(Act::Quit), ["q", "ctrl-c"]);
+        assert_eq!(defaults(Act::NextTab), ["ctrl-pgdn"]);
+        assert_eq!(defaults(Act::PrevTab), ["ctrl-pgup"]);
+        assert_eq!(defaults(Act::NextPane), ["tab", "ctrl-right"]);
+        assert_eq!(defaults(Act::PrevPane), ["backtab", "ctrl-left"]);
+        assert_eq!(defaults(Act::PaneNextSubtab), ["l", "]", "shift-right"]);
+        assert_eq!(defaults(Act::PanePrevSubtab), ["h", "[", "shift-left"]);
+        assert_eq!(defaults(Act::NextSection), ["l", "]", "shift-right"]);
+        assert_eq!(defaults(Act::PrevSection), ["h", "[", "shift-left"]);
+        assert_eq!(
+            defaults(Act::SkillsSwitchView),
+            ["h", "l", "[", "]", "shift-left", "shift-right"]
+        );
+        assert_eq!(defaults(Act::LayoutNextPreset), ["p"]);
+        assert_eq!(defaults(Act::LayoutPrevPreset), ["P"]);
+        assert_eq!(defaults(Act::LayoutGrowList), [">"]);
+        assert_eq!(defaults(Act::LayoutShrinkList), ["<"]);
+        assert_eq!(defaults(Act::LayoutGrowActivity), ["}", "ctrl-down"]);
+        assert_eq!(defaults(Act::LayoutShrinkActivity), ["{", "ctrl-up"]);
+        assert_eq!(defaults(Act::LayoutToggleList), ["f2", "alt-1"]);
+        assert_eq!(defaults(Act::LayoutToggleActivity), ["f3", "alt-2"]);
+        assert_eq!(defaults(Act::LayoutZoom), ["z"]);
+        assert_eq!(defaults(Act::HistoryBack), ["backspace", "alt-left"]);
+        assert_eq!(defaults(Act::HistoryForward), ["alt-right"]);
+        assert_eq!(defaults(Act::LeaveConfirm), ["enter", "ctrl-c"]);
+        assert_eq!(defaults(Act::LeaveStay), ["esc", "n"]);
+        assert_eq!(defaults(Act::ChoicePrev), ["left", "h"]);
+        assert_eq!(defaults(Act::ChoiceNext), ["right", "l"]);
+        assert_eq!(defaults(Act::ChoiceToggle), ["space"]);
+        assert_eq!(defaults(Act::RequirementsPriorityMust), ["m"]);
+        assert_eq!(defaults(Act::RequirementsPriorityLater), ["l"]);
+        let field: Vec<&[&str]> = [
+            Act::FieldSubmit,
+            Act::FieldCancel,
+            Act::FieldLeft,
+            Act::FieldRight,
+            Act::FieldHome,
+            Act::FieldEnd,
+            Act::FieldDeleteBack,
+            Act::FieldDeleteForward,
+            Act::FieldLineUp,
+            Act::FieldLineDown,
+            Act::FieldPageUp,
+            Act::FieldPageDown,
+        ]
+        .into_iter()
+        .map(defaults)
+        .collect();
+        assert_eq!(
+            field,
+            [
+                &["enter"][..],
+                &["esc"],
+                &["left"],
+                &["right"],
+                &["home"],
+                &["end"],
+                &["backspace"],
+                &["delete"],
+                &["up"],
+                &["down"],
+                &["pgup"],
+                &["pgdn"],
+            ]
+        );
+    }
+
+    #[test]
+    fn answer_index_maps_the_nine_options() {
+        let options = [
+            Act::AnswerOption1,
+            Act::AnswerOption2,
+            Act::AnswerOption3,
+            Act::AnswerOption4,
+            Act::AnswerOption5,
+            Act::AnswerOption6,
+            Act::AnswerOption7,
+            Act::AnswerOption8,
+            Act::AnswerOption9,
+        ];
+        for (index, act) in options.into_iter().enumerate() {
+            assert_eq!(act.answer_index(), Some(index), "{act:?}");
+            assert_eq!(act.tab_index(), None, "{act:?}");
+            let spec = act.spec().expect("a row");
+            assert_eq!(spec.context, Context::Answer);
+            assert_eq!(spec.defaults, [format!("{}", index + 1)]);
+        }
+        assert_eq!(Act::SelectTab1.answer_index(), None);
+        assert_eq!(Act::Quit.answer_index(), None);
     }
 
     #[test]
@@ -2485,6 +3158,9 @@ mod tests {
                 "find",
                 "waiting",
                 "queue",
+                // MOD-115 M2 §1.4: after `queue`, so every pinned keys line keeps its prefix.
+                "next_pane",
+                "prev_pane",
             ]
         );
     }
@@ -2542,6 +3218,12 @@ mod tests {
             (Context::Chat, "chat", "Chat"),
             (Context::Queue, "queue", "Queue"),
             (Context::Picker, "picker", "Picker"),
+            (Context::Layout, "layout", "Layout"),
+            (Context::History, "history", "History"),
+            (Context::Leave, "leave", "Leave htui?"),
+            (Context::Field, "field", "Text field"),
+            (Context::Choice, "choice", "Choice"),
+            (Context::Answer, "answer", "Answer"),
         ];
         assert_eq!(table.len(), Context::ALL.len());
         for (context, name, heading) in table {
@@ -2584,6 +3266,19 @@ mod tests {
         // MOD-67 M6 §4.1: the queue overlay and the directory picker are views.
         for context in [Context::Queue, Context::Picker] {
             assert!(context.is_view() && !context.is_shared(), "{context:?}");
+        }
+        // MOD-115 M2 §1.2: the leave dialog is an overlay's view; the shell's and the fields'
+        // contexts are neither views nor shared (B1: `history.back` would clash with the shared
+        // `common.back` name).
+        assert!(Context::Leave.is_view() && !Context::Leave.is_shared());
+        for context in [
+            Context::Layout,
+            Context::History,
+            Context::Field,
+            Context::Choice,
+            Context::Answer,
+        ] {
+            assert!(!context.is_view() && !context.is_shared(), "{context:?}");
         }
     }
 
@@ -2628,7 +3323,7 @@ mod tests {
     }
 
     #[test]
-    fn in_capture_acts_are_the_form_overlay_close_editor_focus_concepts_and_the_skills_chords() {
+    fn in_capture_acts_are_the_form_overlay_close_editor_focus_concepts_skills_and_field_chords() {
         let captured: HashSet<Act> = CATALOGUE
             .iter()
             .filter(|row| row.in_capture)
@@ -2652,6 +3347,19 @@ mod tests {
                 Act::AttachRepo,
                 Act::SkillsHelpPrevAgent,
                 Act::SkillsHelpNextAgent,
+                // MOD-115 M2 §1.4: a text field's editing keys, all named keys.
+                Act::FieldSubmit,
+                Act::FieldCancel,
+                Act::FieldLeft,
+                Act::FieldRight,
+                Act::FieldHome,
+                Act::FieldEnd,
+                Act::FieldDeleteBack,
+                Act::FieldDeleteForward,
+                Act::FieldLineUp,
+                Act::FieldLineDown,
+                Act::FieldPageUp,
+                Act::FieldPageDown,
             ])
         );
     }

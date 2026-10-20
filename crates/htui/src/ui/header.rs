@@ -26,9 +26,11 @@
 //! 4. what is left over, in this order: the full key chips (`? keys` grows to `F9 about ? keys`),
 //!    the store label, the working count, the box name.
 //!
-//! In other words the right side loses, as the row narrows: the box name, the working count,
-//! the store label, then `F9 about` (the chips collapse to `? keys`), then `? keys` itself, and
-//! last the waiting count.
+//! In other words the right side loses, as the row narrows: the shell's chips first (MOD-115 M2
+//! §8: `Alt→ forward`, the layout name, then `⌫ back to <place>`, which collapses to `⌫ back`
+//! before it goes), the box name, the working count, the store label, then `F9 about` (the chips
+//! collapse to `? keys`), then `? keys` itself, and last the waiting count. The shell's chips
+//! are drawn after the key chips, so no other part moves when they appear.
 //!
 //! With a flash the tab chips (the active one too) give way to it first: the flash is the thing
 //! the person must read.
@@ -75,6 +77,24 @@ pub struct Flash {
     /// Its style.
     pub style: Style,
 }
+
+/// The shell's own chips (MOD-115 M2 §8, `R-TUI-1`), drawn after the key chips and the first to
+/// give way: the history's way back and forward, and the active tab's layout. Every label is
+/// resolved from [`Keys`] by the caller, so a rebound or unbound key shows its chord or no chip.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShellChips {
+    /// `⌫ back to Backlog › Runs`, and the `⌫ back` it collapses to.
+    pub back: Option<(String, String)>,
+    /// `Alt→ forward`, while there is somewhere forward.
+    pub forward: Option<String>,
+    /// The active tab's layout, `list+detail` (`· zoom` while zoomed), on a list + detail tab.
+    pub layout: Option<String>,
+}
+
+/// The ranks of the shell's chips: higher than every other part, so they go first.
+const RANK_BACK: u8 = 6;
+const RANK_LAYOUT: u8 = 7;
+const RANK_FORWARD: u8 = 8;
 
 /// Where the header's clickable parts landed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -179,9 +199,16 @@ impl Part {
     }
 }
 
-/// The right side's parts in display order: `N working`, `M waiting`, store, box, key chips.
-/// The chords are labelled through `stack`, the one that holds the keyboard.
-fn right_parts(state: &TopBarState, keys: &Keys, stack: Stack<'_>, theme: &Theme) -> Vec<Part> {
+/// The right side's parts in display order: `N working`, `M waiting`, store, box, key chips,
+/// then the shell's chips (back, layout, forward). The chords are labelled through `stack`, the
+/// one that holds the keyboard.
+fn right_parts(
+    state: &TopBarState,
+    keys: &Keys,
+    stack: Stack<'_>,
+    chips: &ShellChips,
+    theme: &Theme,
+) -> Vec<Part> {
     let (working, waiting) = state
         .waiting
         .as_ref()
@@ -229,6 +256,20 @@ fn right_parts(state: &TopBarState, keys: &Keys, stack: Stack<'_>, theme: &Theme
                 .then_some((short.spans, short_width)),
             spans: full.spans,
         });
+    }
+    if let Some((full, short)) = &chips.back {
+        let mut back = Part::text(RANK_BACK, full.clone(), theme.dim);
+        let short_width = cells::cell_width(short);
+        if short_width < back.width {
+            back.short = Some((vec![Span::styled(short.clone(), theme.dim)], short_width));
+        }
+        parts.push(back);
+    }
+    if let Some(layout) = &chips.layout {
+        parts.push(Part::text(RANK_LAYOUT, layout.clone(), theme.dim));
+    }
+    if let Some(forward) = &chips.forward {
+        parts.push(Part::text(RANK_FORWARD, forward.clone(), theme.dim));
     }
     parts
 }
@@ -325,6 +366,7 @@ fn clip_chip(chip: &mut TabChip, width: usize) {
 ///
 /// `stack` is the key stack that holds the keyboard (`App::active_stack`, else `Stack::BASE`): the
 /// key chips are labelled through it, so a chord the stack does not take is not advertised.
+/// `shell` are the shell's chips (history and layout), already labelled.
 ///
 /// With a `flash` the right side is the flash alone; the tab chips give way to it first, then the
 /// workspace name is cut, and only then is the flash itself truncated. Without one the left side
@@ -339,6 +381,7 @@ pub fn render(
     flash: Option<&Flash>,
     keys: &Keys,
     stack: Stack<'_>,
+    shell: &ShellChips,
     theme: &Theme,
 ) -> HeaderHits {
     let width = usize::from(area.width);
@@ -399,7 +442,7 @@ pub fn render(
             }
             let workspace_text = cells::clip(workspace, workspace_width);
             let workspace_width = cells::cell_width(&workspace_text);
-            let parts = right_parts(state, keys, stack, theme);
+            let parts = right_parts(state, keys, stack, shell, theme);
             let core = core_width(&parts);
             let reserve = if core > 0 { GAP + core } else { 0 };
             let budget = width.saturating_sub(workspace_width + GAP + reserve);
@@ -520,7 +563,17 @@ mod tests {
         let mut hits = HeaderHits::default();
         terminal
             .draw(|frame| {
-                hits = render(frame, frame.area(), state, tabs, flash, keys, stack, theme);
+                hits = render(
+                    frame,
+                    frame.area(),
+                    state,
+                    tabs,
+                    flash,
+                    keys,
+                    stack,
+                    &ShellChips::default(),
+                    theme,
+                );
             })
             .expect("draw");
         (terminal.backend().buffer().clone(), hits)
@@ -764,7 +817,7 @@ mod tests {
     }
 
     /// An overlay's stack labels the chips: `F9 about` is gone under the waiting list, the
-    /// switcher, the migration prompt and the quit question, `? keys` stays; under a tab's
+    /// switcher, the migration prompt and the leave dialog, `? keys` stays; under a tab's
     /// modal form `F9 about` stays and help is `F1`.
     #[test]
     fn the_chips_follow_the_active_key_stack() {
@@ -777,7 +830,7 @@ mod tests {
             views::WAITING_LIST,
             views::SWITCHER,
             views::MIGRATION,
-            views::QUIT_CONFIRM,
+            views::LEAVE,
         ] {
             let text = at(stack);
             assert!(!text.contains("about") && !text.contains("F9"), "{text}");
@@ -1093,10 +1146,116 @@ mod tests {
                     None,
                     Keys::compiled(),
                     Stack::BASE,
+                    &ShellChips::default(),
                     &Theme::default(),
                 );
             })
             .expect("draw");
         assert_eq!(hits, HeaderHits::default());
+    }
+
+    /// The header drawn `width` wide with the shell's `chips`, under the base stack.
+    fn draw_chips(width: u16, chips: &ShellChips, theme: &Theme) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).expect("a test terminal");
+        let tabs = registry();
+        terminal
+            .draw(|frame| {
+                let _ = render(
+                    frame,
+                    frame.area(),
+                    &state(),
+                    &tabs,
+                    None,
+                    Keys::compiled(),
+                    Stack::BASE,
+                    chips,
+                    theme,
+                );
+            })
+            .expect("draw");
+        terminal.backend().buffer().clone()
+    }
+
+    fn chips() -> ShellChips {
+        ShellChips {
+            back: Some((
+                "\u{232b} back to Backlog \u{203a} Runs".to_owned(),
+                "\u{232b} back".to_owned(),
+            )),
+            forward: Some("Alt\u{2192} forward".to_owned()),
+            layout: Some("list+detail".to_owned()),
+        }
+    }
+
+    /// MOD-115 M2 §8: with room, the shell's chips follow the key chips: back, layout, forward;
+    /// none of the other parts moves.
+    #[test]
+    fn the_shell_chips_follow_the_key_chips() {
+        let theme = Theme::default();
+        let text = line(&draw_chips(200, &chips(), &theme));
+        assert!(
+            text.ends_with(
+                " F9  about   ?  keys \u{b7} \u{232b} back to Backlog \u{203a} Runs \u{b7} \
+                 list+detail \u{b7} Alt\u{2192} forward"
+            ),
+            "{text}"
+        );
+        let bare = line(&draw_chips(200, &ShellChips::default(), &theme));
+        assert!(bare.ends_with(" F9  about   ?  keys"), "{bare}");
+        let right = &bare[bare.find("working").expect("the counts") - 2..];
+        assert!(
+            text.contains(&format!("{right} \u{b7} \u{232b} back")),
+            "every other part keeps its order: {text}"
+        );
+    }
+
+    /// MOD-115 M2 §8: the shell's chips give way first, forward, then the layout, then back
+    /// collapses to `⌫ back` and goes, before the box name or any other part.
+    #[test]
+    fn the_shell_chips_give_way_first() {
+        let theme = Theme::default();
+        let full = line(&draw_chips(200, &chips(), &theme));
+        let bare = line(&draw_chips(200, &ShellChips::default(), &theme));
+        let mut seen = Vec::new();
+        for width in (40..=200).rev() {
+            let text = line(&draw_chips(width, &chips(), &theme));
+            let stage = if text.contains("forward") {
+                0
+            } else if text.contains("list+detail") {
+                1
+            } else if text.contains("back to") {
+                2
+            } else if text.contains("\u{232b} back") {
+                3
+            } else {
+                4
+            };
+            if seen.last() != Some(&stage) {
+                seen.push(stage);
+            }
+            if stage < 4 {
+                assert!(
+                    text.contains("DESKTOP-HTUI"),
+                    "{width}: the box name stays: {text}"
+                );
+            }
+        }
+        assert_eq!(seen, [0, 1, 2, 3, 4], "{full}\n{bare}");
+    }
+
+    /// The shell's chips are dim, in colour and in monochrome.
+    #[test]
+    fn the_shell_chips_are_dim() {
+        for theme in [Theme::default(), Theme::monochrome()] {
+            let buffer = draw_chips(200, &chips(), &theme);
+            let text = line(&buffer);
+            let at = text
+                .chars()
+                .position(|c| c == '\u{232b}')
+                .expect("the back chip");
+            let x = u16::try_from(at).expect("fits");
+            assert_eq!(buffer[(x, 0)].modifier, theme.dim.add_modifier);
+            assert_eq!(buffer[(x, 0)].fg, theme.dim.fg.unwrap_or_default());
+        }
     }
 }

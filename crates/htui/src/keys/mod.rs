@@ -14,26 +14,45 @@ pub mod hint;
 pub mod load;
 pub mod print;
 pub mod stack;
+pub mod translate;
 pub mod validate;
 pub mod views;
 
-pub use catalogue::{Act, ActionSpec, CATALOGUE, Context, SHADOWING, STATE_GUARDED, VIEW_DEFAULTS};
-pub use chord::{CTRL_C, ChordError, KeyChord};
+pub use catalogue::{
+    Act, ActionSpec, CATALOGUE, Context, SHADOWING, STATE_GUARDED, V1_DEFAULTS, VIEW_DEFAULTS,
+};
+pub use chord::{CTRL_C, ChordError, ESC, KeyChord};
 pub use hint::{HelpLine, Hint, HintSpec};
 pub use load::{FILE_NAME, KeyFileError, KeysError, Resolved, load_path, load_str, resolve};
 pub use print::print;
-pub use stack::{DECLARED, FIXED, Fixed, Layer, Stack};
+pub use stack::{DECLARED, Layer, Stack};
 pub use validate::validate;
 
 /// The keys in force: every catalogue action's chords per context (MOD-67 D9, D10). Built once
 /// from the compiled defaults ([`Keys::compiled`]); M2 builds one from `keys.toml` instead
-/// ([`load_str`]). Equality compares bindings only, not the file lines that set them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// ([`load_str`]). Equality compares bindings only, not the file lines that set them, nor the
+/// file's version.
+#[derive(Debug, Clone)]
 pub struct Keys {
     /// One row per `(context, act)`, in catalogue order. A row with no chords is an unbound
     /// action. It still shadows the same act in wider layers (M2's narrower overrides).
     rows: Vec<Row>,
+    /// The key-file version the keys were read from (MOD-115 M2 §1.7): `2` for the compiled
+    /// defaults and a `version = 2` file, `1` for a file that says `version = 1` or nothing.
+    /// A version-1 file's entries take a `since: 2` default's chord (D8).
+    version: u8,
 }
+
+impl PartialEq for Keys {
+    fn eq(&self, other: &Self) -> bool {
+        self.rows == other.rows
+    }
+}
+
+impl Eq for Keys {}
+
+/// The key-file version the compiled defaults and `--print-keys` are (MOD-115 M2 §1.7).
+pub const VERSION: u8 = 2;
 
 /// One binding row (private: no `pub` doc may link it). Equality ignores `line` (MOD-67 M2
 /// PA-3): two tables with the same bindings are equal whatever file set them, so a provenance
@@ -144,6 +163,7 @@ impl Keys {
         });
         let mut keys = Self {
             rows: catalogue.chain(derived).collect(),
+            version: VERSION,
         };
         keys.derive(&[]);
         keys
@@ -178,6 +198,13 @@ impl Keys {
                 row.chords = derived;
             }
         }
+    }
+
+    /// The key-file version these keys were read from: [`VERSION`] for the compiled defaults, `1`
+    /// for a file from before MOD-115 M2 (MOD-115 M2 §1.7).
+    #[must_use]
+    pub const fn version(&self) -> u8 {
+        self.version
     }
 
     /// The chords of `act` in exactly `context`, or `&[]` if there is no row or it is unbound.
@@ -309,10 +336,9 @@ impl Keys {
     }
 }
 
-/// Whether `key` carries no modifier but `SHIFT`, which is how a terminal reports a capital. The
-/// keys a view keeps fixed ahead of the resolver (ANA-26 §6.1, MOD-67 M5 D5: a choice's value
-/// keys, the permission digits, the Chat replay's swallow) match only such a key, so a chord with
-/// CONTROL, ALT, SUPER, HYPER or META passes on to the resolver.
+/// Whether `key` carries no modifier but `SHIFT`, which is how a terminal reports a capital: what
+/// a text widget takes (MOD-67 M4: a form's text fields see plain keys only), and the keys that
+/// disarm the chat's double `Esc`. A chord with CONTROL, ALT, SUPER, HYPER or META is not plain.
 pub(crate) fn is_plain(key: &crossterm::event::KeyEvent) -> bool {
     (key.modifiers - crossterm::event::KeyModifiers::SHIFT).is_empty()
 }
@@ -427,22 +453,29 @@ mod tests {
         }
     }
 
+    /// MOD-115 M2 (MD2): `ctrl-c` is a compiled chord of `global.quit` and `leave.confirm`
+    /// only.
     #[test]
-    fn the_compiled_keys_are_the_catalogue_and_never_ctrl_c() {
+    fn the_compiled_keys_are_the_catalogue_and_only_quit_and_leave_confirm_hold_ctrl_c() {
         let keys = Keys::compiled();
         for row in CATALOGUE {
             let chords = keys.chords(row.context, row.act);
             assert_eq!(chords, parsed(row), "{:?}", row.act);
-            assert!(!chords.contains(&CTRL_C), "{:?} binds ctrl-c", row.act);
         }
-        for row in &keys.rows {
-            assert!(
-                !row.chords.contains(&CTRL_C),
-                "[{}] {:?} binds ctrl-c",
-                row.context.table(),
-                row.act
-            );
-        }
+        let holders: Vec<(Context, Act)> = keys
+            .rows
+            .iter()
+            .filter(|row| row.chords.contains(&CTRL_C))
+            .map(|row| (row.context, row.act))
+            .collect();
+        assert_eq!(
+            holders,
+            [
+                (Context::Global, Act::Quit),
+                (Context::Leave, Act::LeaveConfirm)
+            ]
+        );
+        assert_eq!(keys.version(), super::VERSION);
         assert_eq!(keys.rows.len(), CATALOGUE.len() + VIEW_DEFAULTS.len());
     }
 

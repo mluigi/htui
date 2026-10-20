@@ -488,6 +488,13 @@ impl DetailTab for DocumentsTab {
         Handled::Pass
     }
 
+    /// MOD-115 M2 §7: the list's motion moves the row cursor while the detail is focused, as
+    /// its own `J`/`K` (`Act::DocsNextRow`/`DocsPrevRow`) do.
+    fn step(&mut self, step: super::Step, _ctx: &Ctx<'_>) -> Handled {
+        self.move_cursor(step.delta());
+        Handled::Consumed
+    }
+
     /// `DOCS_COMPOSE` while the area is open, else `BACKLOG_DOCS` (MOD-67 M5 D4).
     fn key_stack(&self) -> Stack<'static> {
         self.compose
@@ -820,6 +827,26 @@ mod tests {
         fewer.truncate(1);
         pane.on_reply(&StoreReply::Documents(fewer), &mut shell.ctx());
         assert_eq!(pane.cursor, 0);
+    }
+
+    /// MOD-115 M2 §7: with the detail focused the list's motion moves the row cursor, a row as
+    /// `J` and `K` do, or to either end; nothing is asked of the store.
+    #[tokio::test]
+    async fn a_step_moves_the_row_cursor_as_j_and_k_do() {
+        use crate::ui::tabs::backlog::detail::Step;
+
+        let shell = Shell::new();
+        let (store, _) = demo();
+        let mut pane = pane(&shell, &store).await;
+        assert_eq!(pane.step(Step::Down, &shell.ctx()), Handled::Consumed);
+        assert_eq!(pane.cursor, 1, "a row, as `J`");
+        assert_eq!(pane.step(Step::Bottom, &shell.ctx()), Handled::Consumed);
+        assert_eq!(pane.cursor, 2, "the last of three");
+        assert_eq!(pane.step(Step::Up, &shell.ctx()), Handled::Consumed);
+        assert_eq!(pane.cursor, 1, "a row up, as `K`");
+        assert_eq!(pane.step(Step::Top, &shell.ctx()), Handled::Consumed);
+        assert_eq!(pane.cursor, 0);
+        assert!(shell.actions().is_empty());
     }
 
     #[tokio::test]

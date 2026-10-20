@@ -83,14 +83,140 @@ mod binary {
         assert_eq!(output.status.code(), Some(0), "{stderr}");
         assert_eq!(stderr, "");
         assert_eq!(stdout, print(&load_path(&valid).expect("valid.toml loads")));
+        // MOD-115 M2: a version-1 quit keeps `ctrl-c` (D-9); `Esc` is never printed (MD7).
         assert!(
-            stdout.contains("quit         = [\"ctrl-y\"]   # quit (changed)\n"),
+            stdout.contains("quit         = [\"ctrl-y\", \"ctrl-c\"]      # quit (changed)\n"),
             "{stdout}"
         );
         assert!(
-            stdout.contains("close = [\"esc\", \"f2\"]  # close (changed)\n"),
+            stdout.contains("close = [\"f2\"]  # close; Esc always (changed)\n"),
             "{stdout}"
         );
+    }
+
+    /// MOD-115 M2 (MD2, MD7) end to end: `ctrl-c` binds like any chord, and a file that empties
+    /// a row holding `Esc` loads with `Esc` kept, each printing what it loaded.
+    #[test]
+    fn ctrl_c_binds_and_an_emptied_esc_row_keeps_esc() {
+        let home = tempfile::tempdir().expect("a throwaway home");
+        for (name, line) in [
+            (
+                "ctrl_c",
+                "find         = [\"ctrl-c\"]                # find (changed)\n",
+            ),
+            ("overlay_close", "close = []  # close; Esc always\n"),
+        ] {
+            let path = fixture(name);
+            let output = run(
+                &["--keys", path.to_str().expect("UTF-8"), "--print-keys"],
+                home.path(),
+            );
+            let (stdout, stderr) = text(&output);
+            assert_eq!(output.status.code(), Some(0), "{name}: {stderr}");
+            assert_eq!(stderr, "", "{name}");
+            assert_eq!(
+                stdout,
+                print(&load_path(&path).expect("the file loads")),
+                "{name}"
+            );
+            assert!(stdout.contains(line), "{name}: {stdout}");
+        }
+    }
+
+    /// MOD-115 M2 RV1 H1 (MD4) end to end: `v1_view_keys.toml`, a file from before M2 whose
+    /// entries sit on keys a view kept then (the reviewer's examples), still loads with the
+    /// notices it gave before M2 plus `history.back`'s, never one about a `[field]`, `[choice]`,
+    /// `[answer]` or priority key. Those rows keep their compiled chords, and each entry still acts
+    /// on its own screen while the view's key acts on the view's.
+    #[test]
+    fn a_version_1_file_on_the_keys_a_view_kept_keeps_them_all() {
+        use htui::keys::translate::translate;
+        use htui::keys::{Act, CATALOGUE, Context, KeyChord, views};
+
+        let home = tempfile::tempdir().expect("a throwaway home");
+        let path = fixture("v1_view_keys");
+        let output = run(
+            &["--keys", path.to_str().expect("UTF-8"), "--print-keys"],
+            home.path(),
+        );
+        let (stdout, stderr) = text(&output);
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        let shown = path.display();
+        assert_eq!(
+            stderr,
+            format!(
+                "htui: {shown}:7: [global] next_tab = \"backspace\" takes \"backspace\" from \
+                 history.back, which keeps \"alt-left\"\n\
+                 htui: {shown}:8: [global] select_tab_2 = \"1\" takes \"1\" from \
+                 global.select_tab_1, which is now unbound\n"
+            )
+        );
+        let keys = load_path(&path).expect("v1_view_keys.toml loads");
+        assert_eq!(stdout, print(&keys));
+
+        let kept = |act: Act, context: Context| {
+            matches!(
+                act,
+                Act::RequirementsPriorityMust | Act::RequirementsPriorityLater
+            ) || matches!(context, Context::Field | Context::Choice | Context::Answer)
+        };
+        let mut checked = 0;
+        for spec in CATALOGUE.iter().filter(|spec| kept(spec.act, spec.context)) {
+            checked += 1;
+            assert_eq!(
+                keys.chords(spec.context, spec.act),
+                Keys::compiled().chords(spec.context, spec.act),
+                "[{}] {}",
+                spec.context.table(),
+                spec.name
+            );
+        }
+        assert_eq!(checked, 26, "12 field, 3 choice, 9 answer, 2 priority rows");
+
+        let chord = |spec: &str| KeyChord::parse_strict(spec).expect("a valid spec");
+        let first = |stack, spec| keys.actions(stack, chord(spec)).first().copied();
+        // Each entry acts on its own screen.
+        assert_eq!(first(views::BACKLOG_BODY, "backspace"), Some(Act::NextTab));
+        assert_eq!(first(views::BACKLOG_BODY, "1"), Some(Act::SelectTab2));
+        assert_eq!(first(views::KINDS_CONFIRM, "space"), Some(Act::ConfirmYes));
+        // RV1 repair 1: the Runs close-out warning took only its arrows and `h`/`l` before M2,
+        // so `Space` continues it there as it did; `choice.toggle` steps aside in that stack only.
+        assert_eq!(
+            keys.actions(views::RUNS_CONFIRM, chord("space")),
+            [Act::ConfirmYes]
+        );
+        assert_eq!(
+            first(views::REQUIREMENTS_BROWSE, "m"),
+            Some(Act::RequirementsAmend)
+        );
+        assert_eq!(
+            first(views::BACKLOG_FILTER, "home"),
+            Some(Act::FormNextField)
+        );
+        // The view's key acts on the view's screen, as it did before M2.
+        assert_eq!(
+            first(views::REQUIREMENTS_FORM, "m"),
+            Some(Act::RequirementsPriorityMust)
+        );
+        assert_eq!(first(views::RUNS_BROWSE, "1"), Some(Act::AnswerOption1));
+        assert_eq!(first(views::CHAT_LIVE, "1"), Some(Act::AnswerOption1));
+        assert_eq!(
+            first(views::BACKLOG_FILTER, "space"),
+            Some(Act::ChoiceToggle)
+        );
+        // A text field still reads its editing keys: the translation delivers them as the
+        // widgets' own events (`backspace`, `home` and `enter`, the hierarchy editor's included).
+        for (stack, spec) in [
+            (views::CAPTURE, "backspace"),
+            (views::LIBRARY_PROMPT, "backspace"),
+            (views::AGENTS_FORM, "home"),
+            (views::HIERARCHY_EDITOR, "home"),
+            (views::HIERARCHY_EDITOR, "enter"),
+            (views::ITEM_FORM, "enter"),
+        ] {
+            let key = chord(spec).to_event();
+            assert_eq!(translate(&keys, stack, key), Some(key), "{spec}");
+        }
     }
 
     #[test]
@@ -110,7 +236,8 @@ mod binary {
             (
                 "errors",
                 vec![
-                    "2: version: write version = 1, the only version htui reads".to_owned(),
+                    "2: version: write version = 2 (version = 1 is a file from before MOD-115)"
+                        .to_owned(),
                     r#"5: [list] down: write a chord such as "q", or a list such as ["q", "x"]"#
                         .to_owned(),
                     r#"6: [list] up: write each chord as a string, such as "q""#.to_owned(),
@@ -122,12 +249,12 @@ mod binary {
                      skills.templates, skills.attach, skills.help, requirements, backlog, \
                      backlog.body, backlog.runs, backlog.graph, backlog.docs, backlog.notes, \
                      backlog.prompt, backlog.reqs, backlog.filter_form, backlog.item, chat, \
-                     queue, picker"
+                     queue, picker, layout, history, leave, field, choice, answer"
                         .to_owned(),
                     "12: [global] quitt: no such action; [global] has quit, next_tab, prev_tab, \
                      select_tab_1, select_tab_2, select_tab_3, select_tab_4, select_tab_5, \
                      select_tab_6, select_tab_7, select_tab_8, select_tab_9, help, about, workspaces, \
-                     find, waiting, queue"
+                     find, waiting, queue, next_pane, prev_pane"
                         .to_owned(),
                     r#"13: [global] quit = "shift-a": write a shifted letter as "A""#.to_owned(),
                     r#"13: [global] quit = "x": "x" is already settings.agents.cancel (default) in Settings > Agents"#
@@ -139,19 +266,19 @@ mod binary {
                 ],
             ),
             (
-                "ctrl_c",
+                "esc",
                 vec![
-                    r#"3: [global] quit = "ctrl-c": ctrl-c always quits and cannot be bound"#
+                    r#"3: [global] quit = "esc": esc always closes, cancels or goes back and cannot be bound"#
                         .to_owned(),
-                    r#"4: [global] find = "ctrl-C": ctrl-c always quits and cannot be bound"#
+                    r#"4: [global] find = "Escape": esc always closes, cancels or goes back and cannot be bound"#
                         .to_owned(),
                 ],
             ),
             (
-                "overlay_close",
+                "quit_unbound",
                 vec![
-                    "3: [overlay] close: must keep at least one chord: overlays swallow every \
-                     other key"
+                    "5: [global] quit: must keep at least one chord: global.quit opens the leave \
+                     dialog and leave.confirm leaves; without both htui cannot be left"
                         .to_owned(),
                 ],
             ),
@@ -162,15 +289,8 @@ mod binary {
                         .to_owned(),
                     r#"5: [global] quit = "w": "w" is already settings.boxes.executor (default) in Settings > Boxes"#
                         .to_owned(),
-                    r#"6: [global] help = "esc": "esc" is already overlay.close (default) over an overlay"#
-                        .to_owned(),
-                    r#"6: [global] help = "esc": "esc" is already common.dismiss (default) in Settings > Agents"#
-                        .to_owned(),
-                    r#"6: [global] help = "esc": "esc" is already confirm.no (default) in the Agents install question"#
-                        .to_owned(),
-                    r#"6: [global] help = "esc": "esc" is already common.back (default) in the Library import report"#
-                        .to_owned(),
-                    r#"6: [global] help = "esc": "esc" is already chat.end (default) in Chat"#
+                    // MOD-115 M2 MD7: `esc` itself is refused, before any collision.
+                    r#"6: [global] help = "esc": esc always closes, cancels or goes back and cannot be bound"#
                         .to_owned(),
                     r#"9: [form] save = "s": "s" is typed text while a field captures: bind a ctrl or alt chord or a named key"#
                         .to_owned(),
@@ -288,7 +408,11 @@ mod binary {
             row("queue").ends_with("# queue (unbound by quit)"),
             "{stdout}"
         );
-        assert!(row("quit").contains(r#"= ["ctrl-q"]"#), "{stdout}");
+        // MOD-115 M2 (D-9): a version-1 quit keeps `ctrl-c`.
+        assert!(
+            row("quit").contains(r#"= ["ctrl-q", "ctrl-c"]"#),
+            "{stdout}"
+        );
         assert!(row("quit").ends_with("# quit (changed)"), "{stdout}");
     }
 
@@ -352,46 +476,45 @@ mod binary {
         assert_eq!(stderr, report("both", &path, &[line.to_owned()]));
     }
 
-    /// MOD-67 M5 R1 M1 end to end: a key the filter form's option rows keep for themselves
-    /// (`Space`, `l`, `Enter`, `Shift+Left`) cannot be given to one of its acts; each file is
-    /// refused before anything starts, on the entry's line, naming the form.
+    /// MOD-115 M2 D7 end to end: the filter form's option keys are `[choice]` rows, so a
+    /// version-2 file that gives one to another of the form's acts is an ordinary collision,
+    /// refused before anything starts on the entry's line, and one that also moves the choice
+    /// row off it loads.
     #[test]
-    fn a_rebind_onto_a_filter_form_fixed_key_exits_2() {
+    fn a_rebind_onto_a_choice_key_collides_and_moving_the_choice_frees_it() {
         let home = tempfile::tempdir().expect("a throwaway home");
-        for (name, entry, line) in [
+        for (name, src, line) in [
             (
                 "space",
-                r#"clear = ["space"]"#,
-                r#"2: [backlog.filter_form] clear = "space": "space" is fixed in the Backlog filter form"#,
+                "version = 2\n[backlog.filter_form]\nclear = [\"space\"]\n",
+                Some(
+                    r#"3: [backlog.filter_form] clear = "space": "space" is already choice.toggle (default) in the Backlog filter form"#,
+                ),
             ),
             (
-                "ell",
-                r#"next_row = ["l"]"#,
-                r#"2: [backlog.filter_form] next_row = "l": "l" is fixed in the Backlog filter form"#,
-            ),
-            (
-                "enter",
-                r#"clear = ["enter"]"#,
-                r#"2: [backlog.filter_form] clear = "enter": "enter" is fixed in the Backlog filter form"#,
-            ),
-            // M5 R1 fix: the option rows take a shifted arrow too (`keys::is_plain`).
-            (
-                "shift-left",
-                r#"clear = ["shift-left"]"#,
-                r#"2: [backlog.filter_form] clear = "shift-left": "shift-left" is fixed in the Backlog filter form"#,
+                "moved",
+                "version = 2\n[choice]\ntoggle = [\"t\"]\n[backlog.filter_form]\nclear = [\"space\"]\n",
+                None,
             ),
         ] {
             let path = home.path().join(format!("{name}.toml"));
-            std::fs::write(&path, format!("[backlog.filter_form]\n{entry}\n"))
-                .expect("the file is written");
+            std::fs::write(&path, src).expect("the file is written");
             let output = run(
                 &["--keys", path.to_str().expect("UTF-8"), "--print-keys"],
                 home.path(),
             );
             let (stdout, stderr) = text(&output);
-            assert_eq!(output.status.code(), Some(2), "{name}: {stderr}");
-            assert_eq!(stdout, "", "{name}");
-            assert_eq!(stderr, report(name, &path, &[line.to_owned()]), "{name}");
+            match line {
+                Some(line) => {
+                    assert_eq!(output.status.code(), Some(2), "{name}: {stderr}");
+                    assert_eq!(stdout, "", "{name}");
+                    assert_eq!(stderr, report(name, &path, &[line.to_owned()]), "{name}");
+                }
+                None => {
+                    assert_eq!(output.status.code(), Some(0), "{name}: {stderr}");
+                    assert!(stdout.contains("toggle = [\"t\"]"), "{name}: {stdout}");
+                }
+            }
         }
     }
 
@@ -435,8 +558,8 @@ mod default_path {
     use super::child::{run, text};
     use htui::keys::{Keys, print};
 
-    /// A key file with one error on line 2.
-    const BROKEN: &str = "[global]\nquit = \"ctrl-c\"\n";
+    /// A key file with one error on line 2 (MOD-115 M2 MD7: `Esc` is never listed).
+    const BROKEN: &str = "[global]\nquit = \"esc\"\n";
 
     /// `<home>/htui/keys.toml` holding `BROKEN`.
     fn broken_file(home: &std::path::Path) -> std::path::PathBuf {
@@ -458,8 +581,8 @@ mod default_path {
         assert_eq!(
             stderr,
             format!(
-                "htui: {} has 1 error:\n  keys.toml:2: [global] quit = \"ctrl-c\": ctrl-c always \
-                 quits and cannot be bound\n{HINT}",
+                "htui: {} has 1 error:\n  keys.toml:2: [global] quit = \"esc\": esc always \
+                 closes, cancels or goes back and cannot be bound\n{HINT}",
                 path.display()
             )
         );
@@ -517,7 +640,10 @@ mod app {
         harness.key("q");
         assert!(!harness.app().should_quit, "`q` no longer quits");
         let line = status_line(&mut harness);
-        assert!(line.starts_with("Ctrl+y quit · Tab next tab"), "{line}");
+        assert!(
+            line.starts_with("Ctrl+y quit · Ctrl+PgDn next tab"),
+            "{line}"
+        );
 
         harness.key("?");
         assert!(harness.app().help_visible, "`?` opens the box");
@@ -542,13 +668,21 @@ mod app {
         harness.drive_to_end().await;
         harness.key("?");
         let frame = harness.render();
-        assert!(frame.contains("Overlay: Esc/F2 close"), "{frame}");
+        // MOD-115 M2 MD7: the file lists `f2` only; `Esc` is kept after it.
+        assert!(frame.contains("Overlay: F2/Esc close"), "{frame}");
         harness.key("?");
         harness.key("esc");
         assert!(harness.app().overlays.is_empty(), "`Esc` still closes it");
 
+        // MOD-115 M2 D6: the rebound quit opens the leave dialog, whose `Enter` leaves.
         harness.key("ctrl-y");
-        assert!(harness.app().should_quit, "`Ctrl+y` quits");
+        assert_eq!(
+            harness.app().overlays.top().map(|overlay| overlay.id()),
+            Some(htui::ui::overlay::LeaveDialog::ID),
+            "`Ctrl+y` asks first"
+        );
+        harness.key("enter");
+        assert!(harness.app().should_quit, "`Ctrl+y` leaves");
     }
 
     /// MOD-12 M3 R1 H1: the shell over a file that gives `ctrl-q` to quit starts, shows quit on
@@ -563,7 +697,10 @@ mod app {
         harness.drive_to_end().await;
 
         let line = status_line(&mut harness);
-        assert!(line.starts_with("Ctrl+q quit · Tab next tab"), "{line}");
+        assert!(
+            line.starts_with("Ctrl+q quit · Ctrl+PgDn next tab"),
+            "{line}"
+        );
         harness.key("?");
         let frame = harness.render();
         assert!(frame.contains("Ctrl+q/Ctrl+c quit"), "{frame}");
@@ -572,11 +709,13 @@ mod app {
         assert!(!harness.app().help_visible, "`?` closes the box");
 
         harness.key("ctrl-q");
-        assert!(
-            harness.app().overlays.is_empty(),
-            "`Ctrl+q` no longer opens the queue"
+        assert_eq!(
+            harness.app().overlays.top().map(|overlay| overlay.id()),
+            Some(htui::ui::overlay::LeaveDialog::ID),
+            "`Ctrl+q` no longer opens the queue: it opens the leave dialog (MOD-115 M2 D6)"
         );
-        assert!(harness.app().should_quit, "`Ctrl+q` quits");
+        harness.key("enter");
+        assert!(harness.app().should_quit, "`Ctrl+q` leaves");
     }
 }
 

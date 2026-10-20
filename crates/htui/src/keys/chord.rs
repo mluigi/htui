@@ -132,13 +132,47 @@ impl KeyChord {
         }
         out
     }
+
+    /// The chord as the header's chips write it (MOD-115 M2 D-12): `Backspace` is `⌫`, an arrow
+    /// is `←→↑↓` after its modifiers with no `+` (`Alt←`, `Ctrl→`); everything else is
+    /// [`label`](Self::label).
+    #[must_use]
+    pub fn short_label(&self) -> String {
+        let glyph = match self.code {
+            KeyCode::Backspace => "\u{232b}",
+            KeyCode::Left => "\u{2190}",
+            KeyCode::Right => "\u{2192}",
+            KeyCode::Up => "\u{2191}",
+            KeyCode::Down => "\u{2193}",
+            _ => return self.label(),
+        };
+        let mut out = String::new();
+        for (modifier, name) in [
+            (KeyModifiers::CONTROL, "Ctrl"),
+            (KeyModifiers::ALT, "Alt"),
+            (KeyModifiers::SHIFT, "Shift"),
+        ] {
+            if self.mods.contains(modifier) {
+                out.push_str(name);
+            }
+        }
+        out.push_str(glyph);
+        out
+    }
 }
 
-/// `ctrl-c`: always quits (ANA-26 §6.4). `App::on_key` checks it before any overlay or view, and
-/// no catalogue action may bind it.
+/// `ctrl-c`: the default `global.quit`/`leave.confirm` chord (MOD-115 M2 MD2), bound and
+/// rebindable like any other; a version-1 key file's quit keeps it (D-9).
 pub const CTRL_C: KeyChord = KeyChord {
     code: KeyCode::Char('c'),
     mods: KeyModifiers::CONTROL,
+};
+
+/// `Esc`, the one key that is never configurable (MOD-115 M2 MD7): a key file cannot list it, and
+/// every row whose compiled default holds it keeps it whatever the file says.
+pub const ESC: KeyChord = KeyChord {
+    code: KeyCode::Esc,
+    mods: KeyModifiers::NONE,
 };
 
 impl KeyChord {
@@ -238,6 +272,24 @@ impl KeyChord {
             other => out.push_str(&format!("{other:?}").to_ascii_lowercase()),
         }
         out
+    }
+
+    /// The character of a plain character chord (no modifier: a `Char` already carries its
+    /// shift), else `None`: `1` is `'1'`, `J` is `'J'`, `ctrl-a`, `F1` and `Esc` are `None`. The
+    /// `?` box spells a run of them as `1-9`.
+    #[must_use]
+    pub fn plain_char(&self) -> Option<char> {
+        match self.code {
+            KeyCode::Char(c) if self.mods.is_empty() => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Whether this is the `Esc` key, with any modifier (MOD-115 M2 MD7): what a key file may
+    /// never list.
+    #[must_use]
+    pub fn is_esc(&self) -> bool {
+        matches!(self.code, KeyCode::Esc)
     }
 
     /// Whether a text field would take this chord as typed text: a `Char` with neither CONTROL
@@ -999,5 +1051,41 @@ mod tests {
         for spec in ["ctrl-q", "alt-q", "f1", "tab", "esc"] {
             assert!(!chord(spec).is_printable(), "{spec}");
         }
+    }
+
+    /// MOD-115 M2: `plain_char` is a character chord with no modifier, `is_esc` the `Esc` key
+    /// with any.
+    #[test]
+    fn plain_char_and_is_esc() {
+        let parse = |spec: &str| KeyChord::parse_strict(spec).expect("a valid spec");
+        assert_eq!(parse("1").plain_char(), Some('1'));
+        assert_eq!(parse("J").plain_char(), Some('J'));
+        assert_eq!(parse("space").plain_char(), Some(' '));
+        for spec in ["ctrl-a", "alt-1", "f1", "esc", "enter"] {
+            assert_eq!(parse(spec).plain_char(), None, "{spec}");
+        }
+        assert!(ESC.is_esc());
+        assert_eq!(parse("esc"), ESC);
+        assert!(parse("alt-esc").is_esc());
+        assert!(!parse("enter").is_esc());
+    }
+
+    /// MOD-115 M2 D-12: the header's chips write `⌫`, `Alt←` and `Alt→`; a key without a short
+    /// form keeps its label.
+    #[test]
+    fn the_short_label_draws_backspace_and_the_arrows() {
+        let short = |spec: &str| {
+            KeyChord::parse_strict(spec)
+                .unwrap_or_else(|error| panic!("{spec}: {error:?}"))
+                .short_label()
+        };
+        assert_eq!(short("backspace"), "\u{232b}");
+        assert_eq!(short("alt-left"), "Alt\u{2190}");
+        assert_eq!(short("alt-right"), "Alt\u{2192}");
+        assert_eq!(short("ctrl-up"), "Ctrl\u{2191}");
+        assert_eq!(short("down"), "\u{2193}");
+        assert_eq!(short("ctrl-pgdn"), "Ctrl+PgDn");
+        assert_eq!(short("f2"), "F2");
+        assert_eq!(short("q"), "q");
     }
 }

@@ -57,16 +57,18 @@ fn help_box(frame: &str) -> Vec<String> {
     lines
 }
 
-/// The browse status line of a lone Backlog tab: `Stack::BASE`'s.
-const BROWSE: &str =
-    "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · F9 about";
+/// The browse status line of a lone Backlog tab: `Stack::BASE`'s, and the pane keys of a list +
+/// detail tab (MOD-115 M2 T7).
+const BROWSE: &str = "q quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · 1 select tab · \
+                      ? help · F9 about · Tab next pane · Shift+Tab previous pane";
 
 /// The status line of a capturing mode in a lone Backlog tab (D9).
 const CAPTURING: &str = "Ctrl+c quit · F1 help · F9 about";
 
 /// D12: on the Runs pane with a step under the cursor, the status line is the browse one and the
-/// `?` box lists every layer of `RUNS_BROWSE`, in order: the pane's own verbs, the pane scroll and
-/// sub-tab keys, the Backlog's verbs, `Common`, the list, the global keys, the closer.
+/// `?` box lists every layer of `RUNS_BROWSE`, in order: the pane's own verbs, the answers
+/// (MOD-115 M2 D7: `answer.option_*`, a parked request's digits), the pane scroll and sub-tab
+/// keys, the Backlog's verbs, `Common`, the list, the global keys, the closer.
 #[tokio::test]
 async fn the_runs_pane_status_line_and_box_list_every_layer() {
     let adapter = FakeAdapter::new();
@@ -93,14 +95,22 @@ async fn the_runs_pane_status_line_and_box_list_every_layer() {
              p promote to chat · s select winner · A accept output · o open output · \
              c cancel run · T retry cleanup · u unblock · R start run · C close out · \
              i follow up · v list / flow · + zoom in · - zoom out · = fit the run",
-            "Pane: PgDn page down · PgUp page up · l/]/Right next sub-tab · \
-             h/[/Left previous sub-tab",
+            "Answer: 1-9 answer",
+            "Pane: PgDn page down · PgUp page up · l/]/Shift+Right next sub-tab · \
+             h/[/Shift+Left previous sub-tab",
             "Backlog: Enter replay step · m open graph · f filter · F clear filter · \
              N new item · Q queue / dequeue · P pause / resume queue",
             "Common: e edit",
             "List: j/Down down · k/Up up · g/Home top · G/End bottom · Enter fold",
-            "Global: q/Ctrl+c quit · Tab next tab · Shift+Tab previous tab · 1-9 select tab · \
-             ?/F1 help · F9 about",
+            // MOD-115 M2 T7: the Backlog claims a list and a detail, so the layout and pane keys
+            // act here; Runs keeps `p` (promote) and `P` (pause queue), so no preset key is
+            // offered (blueprint D-1). The history keys act on every tab.
+            "Layout: > wider list · < narrower list · }/Ctrl+Down larger activity · \
+             {/Ctrl+Up smaller activity · F2/Alt+1 show/hide list · F3/Alt+2 show/hide activity · \
+             z zoom",
+            "History: Backspace/Alt+Left back · Alt+Right forward",
+            "Global: q/Ctrl+c quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · 1-9 select tab · \
+             ?/F1 help · F9 about · Tab/Ctrl+Right next pane · Shift+Tab/Ctrl+Left previous pane",
             "?/F1 closes this box",
         ],
         "the box:\n{frame}"
@@ -127,6 +137,10 @@ async fn a_capturing_pane_drives_the_status_line_and_box() {
     assert_eq!(
         help_box(&frame),
         [
+            // MOD-115 M2 T6: the note's field lists its editing keys.
+            "Text field: Enter submit · Esc cancel · Left cursor left · Right cursor right · \
+             Home line start · End line end · Backspace delete back · Del delete forward · \
+             Up line up · Down line down · PgUp page up · PgDn page down",
             "Global: Ctrl+c quit · F1 help · F9 about",
             "F1 closes this box"
         ],

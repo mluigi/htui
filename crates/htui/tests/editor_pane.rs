@@ -20,7 +20,7 @@ use htui::app::register_all;
 use htui::editor::pane::{PaneChild, PaneEvent, PtyChild};
 use htui::editor::{EDITOR_ABORTED, EditorCommand};
 use htui::testkit::Harness;
-use htui::ui::overlay::{Overlay, QuitConfirm};
+use htui::ui::overlay::{LeaveDialog, Overlay};
 use htui_core::store::MemStore;
 use tempfile::TempDir;
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -457,13 +457,13 @@ async fn quitting_with_a_live_editor_leaves_no_child() {
     assert!(!harness.app().should_quit, "`q` asks first");
     assert_eq!(
         harness.app().overlays.top().map(Overlay::id),
-        Some(QuitConfirm::ID),
-        "the quit question is up"
+        Some(LeaveDialog::ID),
+        "the leave dialog is up"
     );
     assert!(harness.app().editor_open(), "the editor lives under it");
     assert!(alive(&pid), "the editor runs under the question");
-    harness.key("y");
-    assert!(harness.app().should_quit, "`y` quits");
+    harness.key("enter");
+    assert!(harness.app().should_quit, "`Enter` leaves");
     drop(harness);
     gone(&pid).await;
 }
@@ -582,10 +582,10 @@ async fn the_editor_waits_while_another_tab_works_and_reads_back_on_return() {
     assert!(!file.exists(), "the temp file is removed");
 }
 
-/// MOD-57 M2 E4, B-M2-8 (PRD D5's other half): `ctrl-c` with htui holding the keys quits at once,
-/// with no question, and leaves no child.
+/// MOD-57 M2 B-M2-8, MOD-115 M2 D6 (`R-TUI-18`): `ctrl-c` with htui holding the keys opens the
+/// leave dialog, a second `ctrl-c` leaves, and no child is left behind.
 #[tokio::test]
-async fn ctrl_c_with_htui_holding_the_keys_quits_at_once_and_leaves_no_child() {
+async fn ctrl_c_twice_with_htui_holding_the_keys_leaves_no_child() {
     let dir = TempDir::new().expect("a temp dir");
     let pidfile = dir.path().join("pid");
     let cmd = script(
@@ -609,8 +609,14 @@ async fn ctrl_c_with_htui_holding_the_keys_quits_at_once_and_leaves_no_child() {
 
     harness.key("ctrl-4");
     harness.key("ctrl-c");
-    assert!(harness.app().should_quit, "`ctrl-c` quits at once");
-    assert!(harness.app().overlays.top().is_none(), "no question");
+    assert!(!harness.app().should_quit, "`ctrl-c` asks first");
+    assert_eq!(
+        harness.app().overlays.top().map(Overlay::id),
+        Some(LeaveDialog::ID),
+        "the leave dialog is up"
+    );
+    harness.key("ctrl-c");
+    assert!(harness.app().should_quit, "the second `ctrl-c` leaves");
     drop(harness);
     gone(&pid).await;
 }

@@ -1,8 +1,9 @@
 //! The key file's semantic checks over the merged keys (MOD-67 M2 D8 steps 5-6; ANA-26 §7.4
 //! step 7): collisions in every context and in every declared stack, printable chords on
-//! actions offered while a field captures, and (MOD-67 M5 R1) a user chord on a key a view keeps
-//! for itself ahead of the resolver ([`FIXED`]). Before them, `give_way` lets an entry of the
-//! file take its chord from an action the file leaves at its default (MOD-12 M3 R1 H1).
+//! actions offered while a field captures, and (MOD-115 M2 D7) the safety nets: the rows without
+//! which htui cannot be left or a mode cannot be closed keep a chord. Before them, `give_way`
+//! lets an entry of the file take its chord from an action the file leaves at its default
+//! (MOD-12 M3 R1 H1).
 //!
 //! MOD-67 M3: the per-context pass skips view contexts (PA-4: a view context holds rows of modes
 //! that never meet; the stack pass checks every declared stack), the stack pass allows a
@@ -12,19 +13,27 @@
 //! MOD-57 M2 (E9): `editor.focus` never gives way, and no other action may share its chord in any
 //! context: while an edit is open it acts ahead of every view. `editor.abort` left at its default
 //! gives way to a global entry too (M2 R1 M-1): a file that binds `ctrl-x` in `[global]` loads.
+//!
+//! MOD-115 M2 D7: no key is fixed ahead of the resolver any more (`FIXED` and its pass are gone):
+//! a choice's value keys, a form's `Enter`/`Esc` and the permission digits are rows, checked by
+//! the passes above like every other.
 
+use super::load::must_keep;
 use super::stack::WHILE_EDITING;
+use super::views::M2_LAYERS;
 use super::{
-    Act, Context, DECLARED, FIXED, Fixed, KeyChord, KeyFileError, Keys, Lost, Row, SHADOWING,
-    STATE_GUARDED, Stack, quote,
+    Act, CATALOGUE, Context, DECLARED, ESC, KeyChord, KeyFileError, Keys, Lost, Row, SHADOWING,
+    STATE_GUARDED, Stack, V1_DEFAULTS, quote,
 };
-use crossterm::event::KeyModifiers;
 
 /// The user's binding wins (MOD-12 M3 R1 H1, maintainer 2026-10-08): an entry of the file that
 /// shares a chord with an action in **its own context** that the file leaves at its default
 /// takes the chord, and that action loses it (unbound when it has no other). A
 /// [`STATE_GUARDED`] pair that shares the chord by default keeps sharing it, and
 /// `overlay.close` and `editor.focus` never give way (each must keep a chord; MOD-67 M4 D8.1).
+/// The other rows that must keep a chord (`global.quit`, `leave.confirm`, `leave.stay`,
+/// `field.cancel`; MOD-115 M2 D-10) give one away only while they keep another, so
+/// `[global] help = ["q"]` loads with a notice and quit keeps `ctrl-c`.
 ///
 /// One default gives way across contexts (MOD-57 M2 R1 M-1): `editor.abort` gives its chord to
 /// an entry of a context [`Stack::EDITOR_OPEN`] composes with `[editor]` (today `[global]`), so
@@ -38,6 +47,24 @@ use crossterm::event::KeyModifiers;
 /// against `overlay.close`, either way; any context against `editor.focus`; an `[editor] abort`
 /// entry against a global default). A context no declared stack composes with the entry's is
 /// not compared: `[global] quit = ["j"]` loads, and `list.down` keeps `j`.
+///
+/// MOD-115 M2 D8 (MD4): a file from before M2 (`version = 1`, or no version) keeps loading. A
+/// default M2 added or changed (`since: 2`) that the file leaves alone gives its chord to an entry
+/// of any context wherever a [`DECLARED`] stack makes both candidates for it, with the same
+/// notice; `[global] quit = ["z"]` loads and `layout.zoom` loses `z`. An `[editor] focus` entry
+/// takes it in any context, since E9 (d) holds focus against every row: `[editor] focus =
+/// ["f2"]` loads and `layout.toggle_list` loses `f2`. Only a chord the entry
+/// added gives way: one it repeats from its own default met the M2 default in the compiled keys
+/// already. A `version = 2` file gets the strict rules above.
+///
+/// MOD-115 M2 RV1 H1 (MD4): in a version-1 file, an entry for an action from before M2 takes
+/// nothing, in either pass, from a row M2 added for a key a view kept before it (the `[field]`,
+/// `[choice]` and `[answer]` rows, the Requirements priority keys: [`kept_by_a_view`]). Before M2
+/// the view took those keys ahead of every binding, so the file loaded and left them working; the
+/// two rows share the chord now ([`v1_shares`]). `[settings.hierarchy] prev_field = [\"enter\"]`
+/// loads, and `field.submit` keeps `Enter` everywhere.
+///
+/// MOD-115 M2 MD7 (T5R): a kept `Esc` ([`kept_esc`]) is never taken nor given, in either pass.
 pub(super) fn give_way(keys: &mut Keys) {
     let mut taken: Vec<(usize, Lost)> = Vec::new();
     for entry in keys.rows.iter().filter(|row| row.entry.is_some()) {
@@ -45,11 +72,18 @@ pub(super) fn give_way(keys: &mut Keys) {
             if default.entry.is_some()
                 || !(default.context == entry.context || abort_gives_way(entry, default))
                 || matches!(default.act, Act::OverlayClose | Act::EditorFocus)
+                || keeps_a_views_key(keys, entry, default)
             {
                 continue;
             }
-            for &chord in entry.chords.iter().filter(|c| default.chords.contains(c)) {
-                if !allowed(STATE_GUARDED, entry, default, chord) {
+            for &chord in entry
+                .chords
+                .iter()
+                .filter(|c| !kept_esc(**c) && default.chords.contains(c))
+            {
+                if !allowed(STATE_GUARDED, entry, default, chord)
+                    && keeps_another(&taken, index, default)
+                {
                     taken.push((
                         index,
                         Lost {
@@ -63,11 +97,277 @@ pub(super) fn give_way(keys: &mut Keys) {
             }
         }
     }
+    if keys.version == 1 {
+        for entry in keys.rows.iter().filter(|row| row.entry.is_some()) {
+            for (index, default) in keys.rows.iter().enumerate() {
+                if default.entry.is_some()
+                    || default.context == entry.context
+                    || matches!(default.act, Act::OverlayClose | Act::EditorFocus)
+                    || keeps_a_views_key(keys, entry, default)
+                {
+                    continue;
+                }
+                // Only a chord new in M2 and one the entry added: one it repeats from its own
+                // default met the M2 default in the compiled keys already, which validate.
+                for &chord in entry.chords.iter().filter(|c| {
+                    !kept_esc(**c)
+                        && default.chords.contains(c)
+                        && new_in_m2(default.act, **c)
+                        && added(entry, **c)
+                }) {
+                    // E9 (d) holds `editor.focus` against every row in any context.
+                    let meet = entry.act == Act::EditorFocus
+                        || DECLARED.iter().any(|&(_, stack)| {
+                            let candidates = keys.actions(stack, chord);
+                            candidates.contains(&entry.act) && candidates.contains(&default.act)
+                        });
+                    let known = taken
+                        .iter()
+                        .any(|(at, lost)| *at == index && lost.chord == chord);
+                    if meet && !known && keeps_another(&taken, index, default) {
+                        taken.push((
+                            index,
+                            Lost {
+                                chord,
+                                from: entry.context,
+                                to: entry.act,
+                                line: entry.entry.unwrap_or(0),
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+    }
     for (index, lost) in taken {
         let row = &mut keys.rows[index];
         row.chords.retain(|&chord| chord != lost.chord);
         row.lost.push(lost);
     }
+}
+
+/// Whether `chord` is a kept `Esc` (MOD-115 M2 MD7): the loader puts `Esc` only on a row whose
+/// compiled default (or, for a view's override of a shared verb, the shared row's) holds it, so
+/// every `Esc` in the keys is one. It never takes a chord from, nor gives way to, anything:
+/// `[chat] back = ["x"]` keeps back's `Esc` and `chat.end` keeps its own, so `Esc` still ends
+/// the chat (T5R).
+fn kept_esc(chord: KeyChord) -> bool {
+    chord == ESC
+}
+
+/// Whether `act` is a row MOD-115 M2 added for a key a view kept before it (RV1 H1, MD4): the
+/// `[field]` rows (the text widgets' own literals), the `[choice]` and `[answer]` rows and the
+/// Requirements priority keys (the `FIXED` register's). Before M2 no key file could take one of
+/// those keys from its view, so a file from before M2 never does now.
+pub(super) fn kept_by_a_view(act: Act) -> bool {
+    matches!(
+        act,
+        Act::RequirementsPriorityMust | Act::RequirementsPriorityLater
+    ) || act.spec().is_some_and(|spec| {
+        matches!(
+            spec.context,
+            Context::Field | Context::Choice | Context::Answer
+        )
+    })
+}
+
+/// Whether `act` existed before MOD-115 M2 (D8): a `since: 1` row, or a changed row listed in
+/// [`V1_DEFAULTS`] such as quit.
+fn before_m2(act: Act) -> bool {
+    act.spec().is_some_and(|spec| spec.since == 1)
+        || V1_DEFAULTS.iter().any(|&(known, _)| known == act)
+}
+
+/// Whether, in a version-1 file, `default` keeps its chords against `entry` (MOD-115 M2 RV1 H1,
+/// MD4): `default` is a row M2 added for a key a view kept ([`kept_by_a_view`]) and `entry` is
+/// for an action from before M2. Neither give-way pass takes such a chord, in any context: the
+/// two rows share it, and [`v1_shares`] lets them.
+fn keeps_a_views_key(keys: &Keys, entry: &Row, default: &Row) -> bool {
+    keys.version == 1 && kept_by_a_view(default.act) && before_m2(entry.act)
+}
+
+/// Whether `first` and `second` may share `chord` in a version-1 file (MOD-115 M2 RV1 H1, MD4):
+/// one is a row M2 added for a key a view kept ([`kept_by_a_view`]), left at its default and
+/// holding `chord` by default, and the other is for an action from before M2. Before M2 the view
+/// took that key ahead of the resolver (a text widget's literal, a `FIXED` key), so the file
+/// loaded and both actions acted, each on its own screen. They still do: where a stack offers
+/// both, the `[field]`, `[choice]` and `[answer]` layers sit right after the view's own, and a
+/// text widget reads a canonical key the translation delivers unchanged (§3 rule 5), so the
+/// view's key wins as it did. `[confirm] yes = ["space"]` loads, `choice.toggle` keeps `Space`,
+/// and a confirm question's `Space` answers yes.
+///
+/// RV1 repair 1: in a [`DECLARED`] `stack` (the stack pass), only where the view did not keep
+/// `chord` ahead of the resolver before M2 ([`fixed_before_m2`]), or kept it and let the older
+/// action share it by design (the tab digits under a permission request's). Where it kept it,
+/// the file was refused before M2 and still is: `[backlog.filter_form] clear = ["left"]` would
+/// leave `choice.prev` dead on the filter's options. Where it kept none, a kept row other than
+/// a text field's steps aside in that stack ([`v1_steps_aside`]), so the pair never meets there.
+fn v1_shares(
+    keys: &Keys,
+    first: &Row,
+    second: &Row,
+    chord: KeyChord,
+    stack: Option<Stack<'_>>,
+) -> bool {
+    let kept = |row: &Row| row.entry.is_none() && kept_by_a_view(row.act) && !added(row, chord);
+    let older = |row: &Row| !kept_by_a_view(row.act) && before_m2(row.act);
+    let older_act = if kept(first) && older(second) {
+        Some(second.act)
+    } else if kept(second) && older(first) {
+        Some(first.act)
+    } else {
+        None
+    };
+    keys.version == 1
+        && older_act.is_some_and(|act| {
+            stack.is_none_or(|stack| {
+                fixed_before_m2(stack, chord).is_none_or(|fixed| fixed.shadowed.contains(&act))
+            })
+        })
+}
+
+/// A view's keys from before MOD-115 M2 (`keys::FIXED`, MOD-67 M5 R1 M1 and M6 D5): the chords
+/// its view matched ahead of the resolver in `stack`, which a key file could not bind to any act
+/// the stack resolved there, save the `shadowed` ones (the tab digits). M2 D7 made them rows
+/// (`[choice]`, `[answer]`, `[field]`, the Requirements priority); this register stays only to
+/// judge a version-1 file as it was judged then (RV1 repair 1, MD4).
+pub(super) struct Fixed {
+    stack: Stack<'static>,
+    chords: &'static [&'static str],
+    shadowed: &'static [Act],
+}
+
+/// The tab digits a permission request's answers shadowed by design (MOD-42 D14, D40).
+const TAB_SELECT: &[Act] = &[
+    Act::SelectTab1,
+    Act::SelectTab2,
+    Act::SelectTab3,
+    Act::SelectTab4,
+    Act::SelectTab5,
+    Act::SelectTab6,
+    Act::SelectTab7,
+    Act::SelectTab8,
+    Act::SelectTab9,
+];
+
+/// The permission answers' digits.
+const DIGITS: &[&str] = &["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+
+/// The `FIXED` register as it stood before MOD-115 M2, for the stacks where a row M2 added for
+/// a kept key resolves ([`kept_by_a_view`]); the Chat replay's entry, whose keys shadowed its
+/// global layer only and which no such row reaches, is left out.
+static V1_FIXED: &[Fixed] = &[
+    Fixed {
+        stack: super::views::ATTACH_FORM,
+        chords: &["space", "enter", "esc"],
+        shadowed: &[],
+    },
+    Fixed {
+        stack: super::views::REQUIREMENTS_FORM,
+        chords: &["m", "l", "space", "left", "right", "esc"],
+        shadowed: &[],
+    },
+    Fixed {
+        stack: super::views::RUNS_BROWSE,
+        chords: DIGITS,
+        shadowed: TAB_SELECT,
+    },
+    Fixed {
+        stack: super::views::RUNS_CONFIRM,
+        chords: &["left", "right", "h", "l"],
+        shadowed: &[],
+    },
+    Fixed {
+        stack: super::views::BACKLOG_FILTER,
+        chords: &["enter", "esc", "h", "l", "left", "right", "space"],
+        shadowed: &[],
+    },
+    Fixed {
+        stack: super::views::ITEM_FORM,
+        chords: &["left", "right", "h", "l", "enter", "esc"],
+        shadowed: &[],
+    },
+    Fixed {
+        stack: super::views::CHAT_LIVE,
+        chords: DIGITS,
+        shadowed: TAB_SELECT,
+    },
+];
+
+/// The [`V1_FIXED`] entry of `stack` that holds `chord`, if any: the view matched it ahead of
+/// the resolver before MOD-115 M2. A named key's SHIFT form counts (`keys::is_plain` let SHIFT
+/// through, MOD-67 M5 R1): `shift-left` moved the filter's option as `left` did.
+pub(super) fn fixed_before_m2(stack: Stack<'_>, chord: KeyChord) -> Option<&'static Fixed> {
+    V1_FIXED.iter().find(|fixed| {
+        fixed.stack == stack
+            && fixed.chords.iter().any(|written| {
+                let held = KeyChord::parse_strict(written)
+                    .unwrap_or_else(|err| panic!("fixed key {written:?}: {err}"));
+                held == chord
+                    || KeyChord::new(held.code, held.mods | crossterm::event::KeyModifiers::SHIFT)
+                        == chord
+            })
+    })
+}
+
+/// Whether `act` is a kept row ([`kept_by_a_view`]) other than a text field's: a `[choice]` or
+/// `[answer]` row or a Requirements priority key, which a view took only where its `FIXED` keys
+/// said (a text field read its editing keys wherever it had the focus).
+pub(super) fn steps_aside(act: Act) -> bool {
+    kept_by_a_view(act)
+        && act
+            .spec()
+            .is_some_and(|spec| spec.context != Context::Field)
+}
+
+/// MOD-115 M2 RV1 repair 1 (MD4): in a version-1 file, the kept rows other than a text field's
+/// ([`steps_aside`]) leave `candidates`, the ordered candidates for `chord` in `stack`, where an
+/// entry of the file for an action from before M2 added `chord` and the view kept no such key
+/// there before M2 ([`fixed_before_m2`]): the entry acted there then, so it still does. The rows
+/// keep the chord everywhere else. `[confirm] yes = ["space"]` continues the Runs close-out
+/// warning on `Space` (the view took only the arrows and `h`/`l` there), and `choice.toggle`
+/// keeps `Space` on the filter form and the attachment form. [`Keys::actions`] calls it.
+pub(super) fn v1_steps_aside(
+    keys: &Keys,
+    stack: Stack<'_>,
+    chord: KeyChord,
+    candidates: &mut Vec<Act>,
+) {
+    if keys.version != 1
+        || !candidates.iter().any(|&act| steps_aside(act))
+        || fixed_before_m2(stack, chord).is_some()
+    {
+        return;
+    }
+    let entry = candidates.iter().any(|&act| {
+        !kept_by_a_view(act)
+            && before_m2(act)
+            && keys
+                .resolve_row(stack, act)
+                .is_some_and(|(_, row)| added(row, chord))
+    });
+    if entry {
+        candidates.retain(|&act| !steps_aside(act));
+    }
+}
+
+/// Whether `default` (row `index`) may give one more chord away (MOD-115 M2 D-10): always, unless
+/// it must keep a chord ([`must_keep`]) and the chords `taken` from it so far leave it only one.
+fn keeps_another(taken: &[(usize, Lost)], index: usize, default: &Row) -> bool {
+    must_keep(default.act).is_none()
+        || taken.iter().filter(|(at, _)| *at == index).count() + 1 < default.chords.len()
+}
+
+/// Whether `chord` is a default M2 gave `act` (MOD-115 M2 D8): the row is `since: 2` and the
+/// chord is not among its [`V1_DEFAULTS`].
+fn new_in_m2(act: Act, chord: KeyChord) -> bool {
+    act.spec().is_some_and(|spec| spec.since == 2)
+        && !V1_DEFAULTS.iter().any(|&(known, defaults)| {
+            known == act
+                && defaults
+                    .iter()
+                    .any(|written| KeyChord::parse_strict(written) == Ok(chord))
+        })
 }
 
 /// Whether `default`, in another context than `entry`, still gives way to it (MOD-57 M2 R1 M-1):
@@ -82,36 +382,43 @@ fn abort_gives_way(entry: &Row, default: &Row) -> bool {
             .any(|layer| layer.context() == entry.context && layer.admits(entry.act))
 }
 
-/// Every collision and capture error in `keys`, reported on the user's line (D8 steps 5-6).
-/// The compiled defaults give none (`the_compiled_defaults_validate`).
+/// Every collision, capture and safety-net error in `keys`, reported on the user's line (D8 steps
+/// 5-6). The compiled defaults give none (`the_compiled_defaults_validate`).
 ///
-/// Four passes, in this order: two actions sharing a chord in one shared or global context; two
+/// Five passes, in this order: two actions sharing a chord in one shared or global context; two
 /// candidates for one chord in a [`DECLARED`] stack; a chord shared with `editor.focus` in any
-/// context (MOD-57 M2 E9 (d)); a printable chord on an `in_capture` action; an act of a stack bound
-/// to a key its view keeps fixed ([`FIXED`], MOD-67 M5 R1 M1). `give_way` ran first, so a default
-/// that gave its chord away (the abort's to a global entry, M2 R1 M-1) is no collision; a focus
-/// chord shared with anything, and an `[editor] abort` entry on a global default, still are. A pair
-/// and chord seen by two passes is reported once, and a line's chord the fixed pass would repeat
-/// after a collision or capture error is not reported again (MOD-67 M6 D6). A [`STATE_GUARDED`]
-/// pair may share a chord only when it is a catalogue default of both actions (PA-2), and so may a
+/// context (MOD-57 M2 E9 (d)); a row that must keep a chord and has none (MOD-115 M2 D7's safety
+/// nets, [`must_keep`]); a printable chord on an `in_capture` action. `give_way` ran first, so a
+/// default that gave its chord away (the abort's to a global entry, M2 R1 M-1) is no collision;
+/// a focus chord shared with anything, and an `[editor] abort` entry on a global default, still
+/// are. A pair and chord seen by two passes is reported once. A [`STATE_GUARDED`] pair may share
+/// a chord only when it is a catalogue default of both actions (PA-2), and so may a
 /// [`SHADOWING`] pair whose first act's layer is the narrower (MOD-67 D11).
 #[must_use]
 pub fn validate(keys: &Keys) -> Vec<KeyFileError> {
-    check(keys, SHADOWING, STATE_GUARDED, FIXED)
+    validate_loaded(keys, &[])
 }
 
-/// [`validate`] over explicit allow-lists: the demand tests drop one entry at a time.
+/// [`validate`] after a load that dropped every chord of the rows in `dropped`: the loader
+/// reported each of those chords on its line, so the safety net does not report the row again
+/// for being empty (MOD-67 M6 D6: one error per mistake). `[editor] focus = ["ctrl-E"]` gives
+/// the chord's error only.
+#[must_use]
+pub(super) fn validate_loaded(keys: &Keys, dropped: &[(Context, Act)]) -> Vec<KeyFileError> {
+    check(keys, SHADOWING, STATE_GUARDED, dropped)
+}
+
+/// [`validate_loaded`] over explicit allow-lists: the demand tests drop one entry at a time.
 fn check(
     keys: &Keys,
     shadowing: &[(Act, Act)],
     guarded: &[(Act, Act)],
-    fixed: &[Fixed],
+    dropped: &[(Context, Act)],
 ) -> Vec<KeyFileError> {
     let mut check = Check {
         keys,
         guarded,
         reported: Vec::new(),
-        said: Vec::new(),
         errors: Vec::new(),
     };
     for (i, first) in keys.rows.iter().enumerate() {
@@ -124,7 +431,7 @@ fn check(
         {
             for &chord in first.chords.iter().filter(|c| second.chords.contains(c)) {
                 let place = format!("in [{}]", first.context.table());
-                check.report(first, second, chord, &place);
+                check.report(first, second, chord, &place, None);
             }
         }
     }
@@ -153,8 +460,8 @@ fn check(
                     let shadowed = shadowing.contains(&(first.act, second.act))
                         && !added(first, chord)
                         && !added(second, chord);
-                    if !shadowed {
-                        check.report(first, second, chord, phrase);
+                    if !shadowed && !met_in_m2(keys, stack, second.act) {
+                        check.report(first, second, chord, phrase, Some(stack));
                     }
                 }
             }
@@ -170,8 +477,22 @@ fn check(
                 .iter()
                 .filter(|chord| focus.chords.contains(chord))
             {
-                check.report(row, focus, chord, WHILE_EDITING);
+                check.report(row, focus, chord, WHILE_EDITING, None);
             }
+        }
+    }
+    // MOD-115 M2 D7, D-10: the safety nets. A row htui cannot do without keeps a chord: an entry
+    // that empties one is reported on its line, and so is one the merge left with none. A row
+    // emptied only because the loader refused every chord it listed was reported already.
+    for spec in CATALOGUE {
+        if let (Some(reason), Some(row)) = (must_keep(spec.act), keys.row(spec.context, spec.act))
+            && row.chords.is_empty()
+            && !dropped.contains(&(spec.context, spec.act))
+        {
+            check.errors.push(KeyFileError {
+                line: line_of(row),
+                message: format!("{}: must keep at least one chord: {reason}", subject(row)),
+            });
         }
     }
     for row in &keys.rows {
@@ -182,10 +503,8 @@ fn check(
         }
         for &chord in row.chords.iter().filter(|chord| chord.is_printable()) {
             let shown = quote(&chord.spec());
-            let line = line_of(row);
-            check.said.push((line, chord));
             check.errors.push(KeyFileError {
-                line,
+                line: line_of(row),
                 message: format!(
                     "{} = {shown}: {shown} is typed text while a field captures: bind a ctrl or \
                      alt chord or a named key",
@@ -194,8 +513,20 @@ fn check(
             });
         }
     }
-    check.fixed(fixed);
     check.errors
+}
+
+/// Whether, in a version-1 file, `act` (from before M2: `since: 1`, or a changed row in
+/// [`V1_DEFAULTS`] such as quit) meets `stack`'s narrower candidates only
+/// since MOD-115 M2 (D8, MD4): the stack offers it only through a layer M2 added
+/// ([`M2_LAYERS`], the overlays' `QUIT`). The stack pass then lets the narrower candidate keep
+/// the chord, which it does: the resolver handles the first candidate, so the stack acts as it
+/// did before M2. `[global] quit = ["ctrl-d"]` loads, and the concepts search keeps `ctrl-d`.
+fn met_in_m2(keys: &Keys, stack: Stack<'_>, act: Act) -> bool {
+    keys.version == 1
+        && before_m2(act)
+        && resolve_at(keys, stack, act)
+            .is_some_and(|(index, _)| M2_LAYERS.contains(&stack.layers()[index]))
 }
 
 /// The layer index and row of `act` as `stack` sees it: [`Keys::resolve_row`], with the index.
@@ -237,73 +568,23 @@ struct Check<'k> {
     guarded: &'k [(Act, Act)],
     /// `((context, act), (context, act), chord)` of every reported collision, by source row.
     reported: Vec<(Slot, Slot, KeyChord)>,
-    /// `(line, chord)` of every collision and capture error, so the fixed pass, which runs last,
-    /// does not report a line's chord again (MOD-67 M6 D6, PA-13).
-    said: Vec<(usize, KeyChord)>,
     errors: Vec<KeyFileError>,
 }
 
 impl Check<'_> {
-    /// The fixed-key pass (MOD-67 M5 R1 M1): every act a [`Fixed`] entry's stack resolves on one
-    /// of its keys or on a named key's SHIFT form, in the layers the keys shadow, unless the
-    /// entry shadows that act by design.
-    /// A row and chord are reported once, naming the first stack, on the row's [`source`]; a
-    /// line's chord an earlier pass reported is skipped (MOD-67 M6 D6: the first pass wins).
-    fn fixed(&mut self, table: &[Fixed]) {
-        let mut seen: Vec<(Slot, KeyChord)> = Vec::new();
-        for entry in table {
-            let phrase = DECLARED
-                .iter()
-                .find(|(_, stack)| *stack == entry.stack)
-                .map_or("", |(phrase, _)| phrase);
-            let first = if entry.only_global {
-                entry.stack.global().map_or(usize::MAX, |(index, _)| index)
-            } else {
-                0
-            };
-            let chords = entry.chords.iter().flat_map(|written| {
-                let chord = KeyChord::parse_strict(written)
-                    .unwrap_or_else(|err| panic!("fixed key {written:?}: {err}"));
-                // A view matches its fixed keys with `keys::is_plain`, which lets SHIFT through,
-                // and a named key keeps SHIFT in its chord (a character drops it), so the
-                // shifted named key is fixed too (M5 R1 fix): `shift-left` moves the option.
-                let shifted = KeyChord::new(chord.code, chord.mods | KeyModifiers::SHIFT);
-                std::iter::once(chord).chain((shifted != chord).then_some(shifted))
-            });
-            for chord in chords {
-                for act in self.keys.actions(entry.stack, chord) {
-                    if entry.shadowed.contains(&act) {
-                        continue;
-                    }
-                    let Some((index, row)) = resolve_at(self.keys, entry.stack, act) else {
-                        continue;
-                    };
-                    let row = source(self.keys, row);
-                    let slot = (row.context, row.act);
-                    let line = line_of(row);
-                    if index < first
-                        || seen.contains(&(slot, chord))
-                        || self.said.contains(&(line, chord))
-                    {
-                        continue;
-                    }
-                    seen.push((slot, chord));
-                    let shown = quote(&chord.spec());
-                    self.errors.push(KeyFileError {
-                        line,
-                        message: format!("{} = {shown}: {shown} is fixed {phrase}", subject(row)),
-                    });
-                }
-            }
-        }
-    }
-
     /// Reports that `first` and `second` both bind `chord` (`place` ends the message), unless
     /// the pair was reported already or is allowed. The reported row is the one that added
     /// `chord` (it is not that row's catalogue default) when exactly one did (review L1);
     /// otherwise the one with the later line (`None`, a default, before any line), `second` on
     /// a tie. A derived row is named and placed by its [`source`].
-    fn report(&mut self, first: &Row, second: &Row, chord: KeyChord, place: &str) {
+    fn report(
+        &mut self,
+        first: &Row,
+        second: &Row,
+        chord: KeyChord,
+        place: &str,
+        stack: Option<Stack<'_>>,
+    ) {
         let (first_source, second_source) = (source(self.keys, first), source(self.keys, second));
         let a = (first_source.context, first_source.act);
         let b = (second_source.context, second_source.act);
@@ -312,6 +593,7 @@ impl Check<'_> {
             .iter()
             .any(|&(x, y, c)| c == chord && ((x, y) == (a, b) || (x, y) == (b, a)))
             || allowed(self.guarded, first, second, chord)
+            || v1_shares(self.keys, first, second, chord, stack)
         {
             return;
         }
@@ -330,10 +612,8 @@ impl Check<'_> {
             .map_or_else(|| "default".to_owned(), |line| format!("line {line}"));
         let shown = quote(&chord.spec());
         let other_name = other.act.spec().map_or("", |spec| spec.name);
-        let line = line_of(reported_source);
-        self.said.push((line, chord));
         self.errors.push(KeyFileError {
-            line,
+            line: line_of(reported_source),
             message: format!(
                 "{} = {shown}: {shown} is already {}.{other_name} ({origin}) {place}",
                 subject(reported_source),
@@ -371,9 +651,13 @@ fn subject(row: &Row) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{check, line_of, validate};
+    use super::{
+        Row, before_m2, check, fixed_before_m2, kept_by_a_view, line_of, new_in_m2, resolve_at,
+        steps_aside, validate,
+    };
     use crate::keys::{
-        Act, Context, FIXED, Fixed, KeyChord, Keys, SHADOWING, STATE_GUARDED, load_str,
+        Act, CTRL_C, Context, DECLARED, ESC, KeyChord, Keys, SHADOWING, STATE_GUARDED, Stack,
+        load_str, views,
     };
 
     fn chord(spec: &str) -> KeyChord {
@@ -398,6 +682,348 @@ mod tests {
     #[test]
     fn the_compiled_defaults_validate() {
         assert_eq!(validate(Keys::compiled()), []);
+    }
+
+    /// MOD-115 M2 D8 (MD4): an overlay's `QUIT` layer is new in M2, so a version-1 file's quit
+    /// meets the concepts search's own keys only since M2. The narrower act keeps the chord
+    /// there, as before M2, and the file loads with no notice; a version-2 file is refused.
+    #[test]
+    fn a_version_1_quit_on_a_concepts_search_key_loads_and_the_search_keeps_it() {
+        for (spec, act) in [
+            ("ctrl-d", Act::ConceptsDecisions),
+            ("ctrl-p", Act::ConceptsProject),
+        ] {
+            let src = format!("[global]\nquit = [\"{spec}\"]\n");
+            let keys = load_str(&src).unwrap_or_else(|errors| panic!("{spec}: {errors:?}"));
+            assert_eq!(
+                keys.chords(Context::Global, Act::Quit),
+                [chord(spec), CTRL_C],
+                "{spec}"
+            );
+            assert_eq!(
+                keys.chords(Context::Concepts, act),
+                Keys::compiled().chords(Context::Concepts, act),
+                "{spec}"
+            );
+            assert_eq!(
+                keys.actions(views::CONCEPTS_QUERY, chord(spec)),
+                [act, Act::Quit],
+                "{spec}: the search's own act comes first"
+            );
+            assert!(keys.notices().is_empty(), "{spec}");
+            let strict = errors(&format!("version = 2\n{src}"));
+            assert!(
+                strict.iter().any(
+                    |(line, message)| *line == 3 && message.ends_with("in the concepts search")
+                ),
+                "{spec}: {strict:?}"
+            );
+        }
+    }
+
+    /// MOD-115 M2 D8 (MD4): a version-1 `[editor] focus` on a chord only a default M2 added
+    /// holds loaded before M2, so it still loads: E9 (d) holds focus against every row in any
+    /// context, so the M2 default gives way to it wherever it sits, with the usual notice, and
+    /// focus keeps the chord. A version-2 file is refused (`f2`, `layout.toggle_list`). A key a
+    /// view kept before M2 (RV1 H1: `field.delete_forward`'s `Delete`) is shared instead: the
+    /// row keeps it, and an open edit's focus takes it first, as it did before M2.
+    #[test]
+    fn a_version_1_focus_takes_any_chord_only_an_m2_default_holds() {
+        let compiled = Keys::compiled();
+        let mut checked = 0;
+        for row in &compiled.rows {
+            for &key in row.chords.iter().filter(|&&c| new_in_m2(row.act, c)) {
+                // Only a chord nothing from before M2 holds: any other loaded no better before.
+                // Nor one a view kept (shared, below).
+                if key == CTRL_C
+                    || key.is_printable()
+                    || compiled.rows.iter().any(|other| {
+                        other.chords.contains(&key)
+                            && (!new_in_m2(other.act, key) || kept_by_a_view(other.act))
+                    })
+                {
+                    continue;
+                }
+                checked += 1;
+                let src = format!("version = 1\n[editor]\nfocus = [{:?}]\n", key.spec());
+                let keys = load_str(&src).unwrap_or_else(|errors| panic!("{src}: {errors:?}"));
+                assert_eq!(
+                    keys.chords(Context::Editor, Act::EditorFocus),
+                    [key],
+                    "{src}"
+                );
+                assert!(
+                    keys.rows
+                        .iter()
+                        .all(|row| row.act == Act::EditorFocus || !row.chords.contains(&key)),
+                    "{src}: another row kept it"
+                );
+                assert!(
+                    keys.notices().iter().any(|notice| notice.line == 3
+                        && notice.message.starts_with(&format!(
+                            "[editor] focus = {:?} takes {:?} from ",
+                            key.spec(),
+                            key.spec()
+                        ))),
+                    "{src}: {:?}",
+                    keys.notices()
+                );
+            }
+        }
+        assert!(checked >= 9, "{checked} chords checked");
+        let keys = load_str("version = 1\n[editor]\nfocus = [\"delete\"]\n").expect("it loads");
+        assert_eq!(
+            keys.chords(Context::Editor, Act::EditorFocus),
+            [chord("delete")]
+        );
+        assert_eq!(
+            keys.chords(Context::Field, Act::FieldDeleteForward),
+            [chord("delete")]
+        );
+        assert!(keys.notices().is_empty());
+        assert_eq!(
+            errors("version = 2\n[editor]\nfocus = [\"f2\"]\n"),
+            one(
+                3,
+                r#"[editor] focus = "f2": "f2" is already layout.toggle_list (default) while an edit is open"#
+            )
+        );
+    }
+
+    /// MOD-115 M2 D8 (MD4): in no stack where quit is offered only through a layer M2 added
+    /// ([`views::M2_LAYERS`]) does a version-1 `[global] quit` on a chord that stack binds for
+    /// another act collide there.
+    #[test]
+    fn a_version_1_quit_never_collides_through_a_layer_m2_added() {
+        let compiled = Keys::compiled();
+        let mut checked = 0;
+        for &(phrase, stack) in DECLARED {
+            let Some((at, _)) = resolve_at(compiled, stack, Act::Quit) else {
+                continue;
+            };
+            if !views::M2_LAYERS.contains(&stack.layers()[at]) {
+                continue;
+            }
+            let quit = compiled.chords(Context::Global, Act::Quit);
+            let mut chords: Vec<KeyChord> = Vec::new();
+            for (index, layer) in stack.layers().iter().enumerate() {
+                for row in compiled.rows.iter().filter(|row| {
+                    row.act != Act::Quit
+                        && row.context == layer.context()
+                        && stack.admits(index, row.act)
+                }) {
+                    chords.extend(row.chords.iter().filter(|c| !quit.contains(c)));
+                }
+            }
+            for chord in chords {
+                checked += 1;
+                let src = format!("[global]\nquit = [{:?}]\n", chord.spec());
+                let errors = errors(&src);
+                assert!(
+                    !errors
+                        .iter()
+                        .any(|(_, message)| message.ends_with(&format!(" {phrase}"))),
+                    "{src}: {errors:?}"
+                );
+            }
+        }
+        assert!(
+            checked > 0,
+            "some stack offers quit through the M2 quit layer"
+        );
+    }
+
+    /// MOD-115 M2 RV1 H1 (MD4): the `[field]`, `[choice]` and `[answer]` rows and the
+    /// Requirements priority keys are the keys a view kept before M2 (the `FIXED` register and
+    /// the text widgets' own literals). No entry a file from before M2 could hold takes one of
+    /// their chords: a version-1 file with one such entry loads with every one of those rows at
+    /// its compiled chords, or is refused for a reason that names none of them.
+    #[test]
+    fn a_version_1_entry_never_takes_a_key_a_view_kept_before_m2() {
+        let compiled = Keys::compiled();
+        let kept = kept_by_a_view;
+        let mut chords: Vec<KeyChord> = Vec::new();
+        for row in compiled.rows.iter().filter(|row| kept(row.act)) {
+            for &chord in &row.chords {
+                if chord != ESC && !chords.contains(&chord) {
+                    chords.push(chord);
+                }
+            }
+        }
+        // Where an entry could meet a kept row: a stack offering both, the row's own context, or
+        // anywhere for `editor.focus` (E9 (d)). The other pairs never meet, and would only slow
+        // the sweep down.
+        let offers = |stack: Stack<'_>, row: &Row| {
+            stack.layers().iter().enumerate().any(|(index, layer)| {
+                layer.context() == row.context && stack.admits(index, row.act)
+            })
+        };
+        let kept_in: Vec<(Stack<'_>, Vec<KeyChord>)> = DECLARED
+            .iter()
+            .map(|&(_, stack)| {
+                let held = compiled
+                    .rows
+                    .iter()
+                    .filter(|row| kept(row.act) && offers(stack, row))
+                    .flat_map(|row| row.chords.iter().copied())
+                    .collect();
+                (stack, held)
+            })
+            .collect();
+        let (mut loaded, mut refused) = (0, 0);
+        for row in compiled
+            .rows
+            .iter()
+            .filter(|row| before_m2(row.act) && !kept(row.act))
+        {
+            let name = row.act.spec().map_or("", |spec| spec.name);
+            for chord in chords.iter().filter(|&&chord| {
+                row.act == Act::EditorFocus
+                    || compiled.rows.iter().any(|other| {
+                        kept(other.act)
+                            && other.context == row.context
+                            && other.chords.contains(&chord)
+                    })
+                    || kept_in
+                        .iter()
+                        .any(|(stack, held)| held.contains(&chord) && offers(*stack, row))
+            }) {
+                let src = format!(
+                    "version = 1\n[{}]\n{name} = [{:?}]\n",
+                    row.context.table(),
+                    chord.spec()
+                );
+                match load_str(&src) {
+                    Ok(keys) => {
+                        loaded += 1;
+                        for fixed in compiled.rows.iter().filter(|row| kept(row.act)) {
+                            assert_eq!(
+                                keys.chords(fixed.context, fixed.act),
+                                fixed.chords,
+                                "{src}: {:?} lost a chord",
+                                fixed.act
+                            );
+                        }
+                        // RV1 repair 1: where the entry acts, the screen does what it did before
+                        // M2: the view's key where the view kept it, the entry's elsewhere.
+                        for &(phrase, stack) in DECLARED {
+                            let candidates = keys.actions(stack, *chord);
+                            if !candidates.contains(&row.act) {
+                                continue;
+                            }
+                            if fixed_before_m2(stack, *chord).is_some() {
+                                assert!(
+                                    candidates.first().is_some_and(|&act| kept(act)),
+                                    "{src} {phrase}: {candidates:?}"
+                                );
+                            } else {
+                                assert!(
+                                    !candidates.iter().any(|&act| steps_aside(act)),
+                                    "{src} {phrase}: {candidates:?}"
+                                );
+                            }
+                        }
+                    }
+                    Err(errors) => {
+                        refused += 1;
+                        for error in &errors {
+                            // Only where the view kept the key before M2, which refused it then.
+                            let fixed = DECLARED.iter().any(|&(phrase, stack)| {
+                                error.message.ends_with(phrase)
+                                    && fixed_before_m2(stack, *chord).is_some()
+                            });
+                            assert!(
+                                fixed
+                                    || ![
+                                        "is already field.",
+                                        "is already choice.",
+                                        "is already answer.",
+                                        "is already requirements.priority_",
+                                    ]
+                                    .iter()
+                                    .any(|named| error.message.contains(named)),
+                                "{src}: {}",
+                                error.message
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            loaded > 500 && refused > 0,
+            "{loaded} loaded, {refused} refused"
+        );
+    }
+
+    /// MOD-115 M2 RV1 repair 1 (MD4): a version-1 entry on a key a view kept ahead of the
+    /// resolver before M2 ([`V1_FIXED`]) was refused then, and still is, with the version-2
+    /// error: the kept row would resolve behind the view's own act there, and its key go dead.
+    #[test]
+    fn a_version_1_entry_on_a_key_its_view_fixed_before_m2_is_refused_as_before() {
+        for body in [
+            "[backlog.filter_form]\nclear = [\"left\"]\nnext_row = [\"space\"]\n",
+            "[backlog.runs]\napprove = [\"1\"]\n",
+        ] {
+            let v1 = errors(&format!("version = 1\n{body}"));
+            let v2 = errors(&format!("version = 2\n{body}"));
+            assert!(!v1.is_empty(), "{body}");
+            assert_eq!(v1, v2, "{body}");
+        }
+        assert_eq!(
+            errors("version = 1\n[backlog.filter_form]\nclear = [\"left\"]\n"),
+            [
+                (
+                    3,
+                    r#"[backlog.filter_form] clear = "left": "left" is already field.left (default) in the Backlog filter form"#
+                        .to_owned()
+                ),
+                (
+                    3,
+                    r#"[backlog.filter_form] clear = "left": "left" is already choice.prev (default) in the Backlog filter form"#
+                        .to_owned()
+                ),
+            ]
+        );
+        // The first stack named is the first one whose view kept the key (the Agents form's
+        // text field read its `Enter` before M2 too, and the entry shares it there).
+        assert_eq!(
+            errors("version = 1\n[form]\nnext_field = [\"enter\"]\n"),
+            one(
+                3,
+                r#"[form] next_field = "enter": "enter" is already field.submit (default) in the Attachments form"#
+            )
+        );
+    }
+
+    /// MOD-115 M2 RV1 repair 1 (MD4): where a view kept no key before M2, a version-1 entry acted
+    /// there, and it still does: the kept row M2 added steps aside in that stack only.
+    /// `[confirm] yes = ["space"]` continues the Runs close-out warning on `Space`, while
+    /// `choice.toggle` keeps `Space` and toggles the filter form's option with it. A version-2
+    /// file gets the strict rules: the two collide in the warning.
+    #[test]
+    fn a_version_1_entry_acts_where_its_view_kept_no_key_before_m2() {
+        let space = chord("space");
+        assert_eq!(
+            Keys::compiled().actions(views::RUNS_CONFIRM, space),
+            [Act::ChoiceToggle]
+        );
+        let keys = load_str("version = 1\n[confirm]\nyes = [\"space\"]\n").expect("loads");
+        assert_eq!(
+            keys.chords(Context::Choice, Act::ChoiceToggle),
+            Keys::compiled().chords(Context::Choice, Act::ChoiceToggle)
+        );
+        assert_eq!(keys.actions(views::RUNS_CONFIRM, space), [Act::ConfirmYes]);
+        assert_eq!(keys.actions(views::KINDS_CONFIRM, space), [Act::ConfirmYes]);
+        assert_eq!(
+            keys.actions(views::BACKLOG_FILTER, space),
+            [Act::ChoiceToggle]
+        );
+        assert_eq!(keys.actions(views::ATTACH_FORM, space), [Act::ChoiceToggle]);
+        assert!(
+            !errors("version = 2\n[confirm]\nyes = [\"space\"]\n").is_empty(),
+            "version 2 is strict"
+        );
     }
 
     /// MOD-67 M6 R1 LOW-5: every pass reports a row on one line, so D6's `(line, chord)` keys
@@ -456,7 +1082,11 @@ mod tests {
     fn a_global_entry_takes_ctrl_x_from_the_abort_with_a_notice() {
         let readme = "version = 1\n\n[global]\nquit = [\"ctrl-x\"]\n\n[overlay]\nclose = [\"esc\", \"f2\"]\n";
         let keys = load_str(readme).expect("the abort gives way");
-        assert_eq!(keys.chords(Context::Global, Act::Quit), [chord("ctrl-x")]);
+        // MOD-115 M2 (D-9): quit keeps its implicit `ctrl-c`.
+        assert_eq!(
+            keys.chords(Context::Global, Act::Quit),
+            [chord("ctrl-x"), CTRL_C]
+        );
         assert!(keys.chords(Context::Editor, Act::EditorAbort).is_empty());
         assert_eq!(keys.line(Context::Editor, Act::EditorAbort), None);
         let notices: Vec<(usize, String)> = keys
@@ -500,7 +1130,10 @@ mod tests {
     }
 
     /// M2 R1 M-1: a global entry on the abort's chord that the file also sets is two entries on
-    /// one chord: still refused.
+    /// one chord: still refused. MOD-115 M2 B4: the abort question now offers quit (its
+    /// `ctrl-c`) through the M2 `QUIT` layer, declared before the open edit; a version-1 file
+    /// meets it there only since M2 (D8), so it still names the open edit, and a version-2 file
+    /// names the question.
     #[test]
     fn a_global_entry_on_an_abort_entrys_chord_is_still_refused() {
         assert_eq!(
@@ -508,6 +1141,13 @@ mod tests {
             one(
                 4,
                 r#"[global] quit = "ctrl-x": "ctrl-x" is already editor.abort (line 2) while an edit is open"#
+            )
+        );
+        assert_eq!(
+            errors("version = 2\n[editor]\nabort = \"ctrl-x\"\n[global]\nquit = \"ctrl-x\"\n"),
+            one(
+                5,
+                r#"[global] quit = "ctrl-x": "ctrl-x" is already editor.abort (line 3) in the abort question"#
             )
         );
     }
@@ -552,13 +1192,24 @@ mod tests {
         );
     }
 
+    /// MOD-115 M2 (MD2): `ctrl-c` binds in `[editor]` like any chord. A version-1 focus takes it
+    /// from quit and the leave dialog's confirm, which had it only since M2 (D8), and each keeps
+    /// another; a version-2 one collides with quit while an edit is open.
     #[test]
-    fn ctrl_c_is_refused_in_the_editor_table() {
+    fn ctrl_c_in_the_editor_table_follows_the_version_rules() {
+        let keys = load_str("[editor]\nfocus = \"ctrl-c\"\n").expect("version 1 loads");
+        assert_eq!(keys.chords(Context::Editor, Act::EditorFocus), [CTRL_C]);
+        assert_eq!(keys.chords(Context::Global, Act::Quit), [chord("q")]);
         assert_eq!(
-            errors("[editor]\nfocus = \"ctrl-c\"\n"),
-            one(
-                2,
-                r#"[editor] focus = "ctrl-c": ctrl-c always quits and cannot be bound"#
+            keys.chords(Context::Leave, Act::LeaveConfirm),
+            [chord("enter")]
+        );
+        assert_eq!(
+            errors("version = 2\n[editor]\nfocus = \"ctrl-c\"\n")[0],
+            (
+                3,
+                r#"[editor] focus = "ctrl-c": "ctrl-c" is already global.quit (default) while an edit is open"#
+                    .to_owned()
             )
         );
     }
@@ -584,7 +1235,11 @@ mod tests {
         assert_eq!(keys.line(Context::List, Act::ListDown), None);
 
         let keys = load_str("[global]\nquit = [\"ctrl-q\"]\n").expect("the queue gives way");
-        assert_eq!(keys.chords(Context::Global, Act::Quit), [chord("ctrl-q")]);
+        // MOD-115 M2 (D-9): quit keeps its implicit `ctrl-c`.
+        assert_eq!(
+            keys.chords(Context::Global, Act::Quit),
+            [chord("ctrl-q"), CTRL_C]
+        );
         assert!(keys.chords(Context::Global, Act::Queue).is_empty());
         assert_eq!(keys.line(Context::Global, Act::Queue), None);
     }
@@ -639,51 +1294,27 @@ mod tests {
 
     /// A default only gives way in its own table (MOD-12 M3 R1 H1): where a declared stack
     /// makes both candidates, a chord the user adds onto another table's default is still
-    /// refused, either way.
-    /// MOD-67 M3: `esc` also dismisses in the Settings browse stacks and answers no in their
-    /// questions, so those collisions follow, each pair reported once, in `DECLARED` order.
+    /// refused, either way. MOD-115 M2 MD7: `esc` itself is never listed, so it cannot collide.
     #[test]
     fn a_collision_over_an_overlay_is_found_in_the_overlay_stack() {
-        let found = errors("[global]\nhelp = [\"esc\"]\n");
         assert_eq!(
-            found[0],
-            (
+            errors("[global]\nhelp = [\"esc\"]\n"),
+            one(
                 2,
-                r#"[global] help = "esc": "esc" is already overlay.close (default) over an overlay"#
-                    .to_owned()
+                r#"[global] help = "esc": esc always closes, cancels or goes back and cannot be bound"#
             )
-        );
-        assert_eq!(
-            found[1..],
-            [
-                (
-                    2,
-                    r#"[global] help = "esc": "esc" is already common.dismiss (default) in Settings > Agents"#
-                        .to_owned()
-                ),
-                (
-                    2,
-                    r#"[global] help = "esc": "esc" is already confirm.no (default) in the Agents install question"#
-                        .to_owned()
-                ),
-                // MOD-67 M4: the first stack where `esc` goes back and help is unfiltered.
-                (
-                    2,
-                    r#"[global] help = "esc": "esc" is already common.back (default) in the Library import report"#
-                        .to_owned()
-                ),
-                // MOD-67 M5: and `esc` ends a chat (the Chat replay's `common.back` is reported).
-                (
-                    2,
-                    r#"[global] help = "esc": "esc" is already chat.end (default) in Chat"#
-                        .to_owned()
-                ),
-            ]
         );
         assert_eq!(
             errors("[overlay]\nclose = [\"esc\", \"f1\"]\n"),
             one(
                 2,
+                r#"[overlay] close = "f1": "f1" is already global.help (default) over an overlay"#
+            )
+        );
+        assert_eq!(
+            errors("version = 2\n[overlay]\nclose = [\"f1\"]\n"),
+            one(
+                3,
                 r#"[overlay] close = "f1": "f1" is already global.help (default) over an overlay"#
             )
         );
@@ -765,11 +1396,11 @@ mod tests {
     #[test]
     fn every_allow_list_entry_is_demanded() {
         let keys = Keys::compiled();
-        assert_eq!(check(keys, SHADOWING, STATE_GUARDED, FIXED), []);
+        assert_eq!(check(keys, SHADOWING, STATE_GUARDED, &[]), []);
         for entry in SHADOWING {
             let fewer: Vec<_> = SHADOWING.iter().copied().filter(|e| e != entry).collect();
             assert!(
-                !check(keys, &fewer, STATE_GUARDED, FIXED).is_empty(),
+                !check(keys, &fewer, STATE_GUARDED, &[]).is_empty(),
                 "SHADOWING {entry:?} is not demanded"
             );
         }
@@ -780,26 +1411,9 @@ mod tests {
                 .filter(|e| e != entry)
                 .collect();
             assert!(
-                !check(keys, SHADOWING, &fewer, FIXED).is_empty(),
+                !check(keys, SHADOWING, &fewer, &[]).is_empty(),
                 "STATE_GUARDED {entry:?} is not demanded"
             );
-        }
-        // MOD-67 M5 R1 M1: each act a `FIXED` entry shadows by design has a default on its keys.
-        for (index, entry) in FIXED.iter().enumerate() {
-            for act in entry.shadowed {
-                let fewer: Vec<Act> = entry
-                    .shadowed
-                    .iter()
-                    .copied()
-                    .filter(|a| a != act)
-                    .collect();
-                let mut table: Vec<Fixed> = FIXED.to_vec();
-                table[index].shadowed = fewer.leak();
-                assert!(
-                    !check(keys, SHADOWING, STATE_GUARDED, &table).is_empty(),
-                    "FIXED[{index}] shadowed {act:?} is not demanded"
-                );
-            }
         }
     }
 
@@ -817,13 +1431,21 @@ mod tests {
 
     #[test]
     fn a_user_chord_shared_with_a_shadowed_act_is_refused() {
+        // MOD-115 M2 MD7: `esc` is never listed; `f7` on both sides stands in for it.
         assert_eq!(
             errors("[migration]\nyes = [\"y\", \"esc\"]\n"),
-            // `migration.no` is in the entry's own table, so it gives `esc` up (MOD-12 M3 R1 H1);
-            // `overlay.close` is another table's, so it is still refused.
             one(
                 2,
-                r#"[migration] yes = "esc": "esc" is already overlay.close (default) in the migration prompt"#
+                r#"[migration] yes = "esc": esc always closes, cancels or goes back and cannot be bound"#
+            )
+        );
+        assert_eq!(
+            errors(
+                "version = 2\n[overlay]\nclose = [\"f7\"]\n[migration]\nyes = [\"y\", \"f7\"]\n"
+            ),
+            one(
+                5,
+                r#"[migration] yes = "f7": "f7" is already overlay.close (line 3) in the migration prompt"#
             )
         );
         assert_eq!(errors("[settings.boxes]\nexecutor = [\"w\", \"W\"]\n"), []);
@@ -883,166 +1505,90 @@ mod tests {
         assert!(load_str("[global]\nquit = [\"q\", \"ctrl-x\"]\n").is_ok());
     }
 
-    /// MOD-67 M5 R1 M1: a key a view matches ahead of the resolver (`keys::FIXED`) cannot be
-    /// given to an act of its stack. The filter form's option rows keep `Space`, `h`/`l`, the
-    /// arrows, `Enter` and `Esc`.
+    /// MOD-115 M2 D7: no key is fixed ahead of the resolver any more. A chord the filter form,
+    /// the item form or a Runs question used to keep fixed is a `[choice]` or `[field]` row's,
+    /// so binding another act of the stack to it is an ordinary collision, and moving the row
+    /// off it frees it.
     #[test]
-    fn a_rebind_onto_a_filter_form_fixed_key_is_refused() {
-        let fixed = |entry: &str, shown: &str| {
-            one(
-                2,
-                &format!(
-                    r#"[backlog.filter_form] {entry} = "{shown}": "{shown}" is fixed in the Backlog filter form"#
-                ),
-            )
-        };
+    fn a_former_fixed_key_is_a_row_and_collides_as_one() {
         assert_eq!(
-            errors("[backlog.filter_form]\nclear = [\"space\"]\n"),
-            fixed("clear", "space")
-        );
-        assert_eq!(
-            errors("[backlog.filter_form]\nnext_row = [\"l\"]\n"),
-            fixed("next_row", "l")
-        );
-        assert_eq!(
-            errors("[backlog.filter_form]\nclear = [\"enter\"]\n"),
-            fixed("clear", "enter")
-        );
-        assert_eq!(
-            errors("[backlog.filter_form]\nprev_row = [\"k\", \"left\"]\n"),
-            fixed("prev_row", "left")
-        );
-        // A shared act the form offers is refused there too, once, naming the first stack.
-        // MOD-67 M6: the first declared stack that keeps the key fixed.
-        assert_eq!(
-            errors("[form]\nnext_field = [\"tab\", \"right\"]\n"),
-            one(
-                2,
-                r#"[form] next_field = "right": "right" is fixed in a Requirements form"#
-            )
-        );
-    }
-
-    /// MOD-67 M5 R1 M1: the item form's pickers keep `Left`/`Right`, `h`/`l`, `Enter`, `Esc`; the
-    /// Runs close-out warning keeps its resolution keys.
-    #[test]
-    fn a_rebind_onto_an_item_form_or_runs_question_fixed_key_is_refused() {
-        // MOD-67 M6: the first declared stack that keeps the key fixed.
-        assert_eq!(
-            errors("[form]\nsave = [\"ctrl-s\", \"esc\"]\n"),
-            one(
-                2,
-                r#"[form] save = "esc": "esc" is fixed in the Attachments form"#
-            )
-        );
-        assert_eq!(
-            errors("[backlog.runs]\nyes = [\"y\", \"right\"]\n"),
-            one(
-                2,
-                r#"[backlog.runs] yes = "right": "right" is fixed in a Runs question"#
-            )
-        );
-    }
-
-    /// MOD-67 M5 R1 fix: a view matches its fixed keys with `keys::is_plain`, which lets SHIFT
-    /// through, and a named key keeps its SHIFT in a chord, so `shift-left` is as fixed as `left`.
-    #[test]
-    fn a_shifted_named_fixed_key_is_refused_too() {
-        assert_eq!(
-            errors("[backlog.filter_form]\nclear = [\"shift-left\"]\n"),
-            one(
-                2,
-                r#"[backlog.filter_form] clear = "shift-left": "shift-left" is fixed in the Backlog filter form"#
-            )
-        );
-        assert_eq!(
-            errors("[backlog.filter_form]\nnext_row = [\"shift-right\"]\n"),
-            one(
-                2,
-                r#"[backlog.filter_form] next_row = "shift-right": "shift-right" is fixed in the Backlog filter form"#
-            )
-        );
-        // MOD-67 M6: the first declared stack that keeps the key fixed.
-        assert_eq!(
-            errors("[form]\nsave = [\"ctrl-s\", \"shift-left\"]\n"),
-            one(
-                2,
-                r#"[form] save = "shift-left": "shift-left" is fixed in a Requirements form"#
-            )
-        );
-        assert_eq!(
-            errors("[backlog.runs]\nyes = [\"y\", \"shift-right\"]\n"),
-            one(
-                2,
-                r#"[backlog.runs] yes = "shift-right": "shift-right" is fixed in a Runs question"#
-            )
-        );
-        // An unfixed shifted key is still free: `shift-up` is no option key.
-        assert_eq!(
-            errors("[backlog.filter_form]\nclear = [\"x\", \"shift-up\"]\n"),
-            []
-        );
-    }
-
-    /// MOD-67 M6 D5: the Requirements forms' priority keys and the Attachments form's activation
-    /// keys are matched ahead of the resolver, so no act of their stacks may take one.
-    #[test]
-    fn a_rebind_onto_a_requirements_priority_or_attachment_key_is_refused() {
-        assert_eq!(
-            errors("[requirements]\nnext_field = [\"tab\", \"right\"]\n"),
-            one(
-                2,
-                r#"[requirements] next_field = "right": "right" is fixed in a Requirements form"#
-            )
-        );
-        assert_eq!(
-            errors("[form]\nnext_field = [\"tab\", \"enter\"]\n"),
-            one(
-                2,
-                r#"[form] next_field = "enter": "enter" is fixed in the Attachments form"#
-            )
-        );
-        assert_eq!(
-            errors("[form]\nsave = [\"ctrl-s\", \"left\"]\n"),
-            one(
-                2,
-                r#"[form] save = "left": "left" is fixed in a Requirements form"#
-            )
-        );
-    }
-
-    /// MOD-67 M5 R1 M1: a parked request takes the plain digits in Backlog > Runs and in Chat; only
-    /// the tab select sits on them by design.
-    #[test]
-    fn a_rebind_onto_a_permission_digit_is_refused() {
-        assert_eq!(
-            errors("[global]\nselect_tab_1 = []\n[backlog.runs]\napprove = [\"a\", \"1\"]\n"),
-            one(
-                4,
-                r#"[backlog.runs] approve = "1": "1" is fixed in Backlog > Runs"#
-            )
-        );
-        assert_eq!(
-            errors("[global]\nselect_tab_1 = []\n[chat]\nthoughts = [\"t\", \"1\"]\n"),
-            one(4, r#"[chat] thoughts = "1": "1" is fixed in Chat"#)
-        );
-        // The tab select may move between digits: the swallow shadows it by design.
-        assert_eq!(
-            errors("[global]\nselect_tab_1 = [\"2\"]\nselect_tab_2 = [\"1\"]\n"),
-            []
-        );
-    }
-
-    /// MOD-67 M6 D6 (PA-13): a line's chord that collides and is also fixed in the same stack
-    /// is reported once, by the collision; the fixed pass does not repeat it.
-    #[test]
-    fn a_line_both_colliding_and_fixed_is_reported_once() {
-        assert_eq!(
-            errors("version = 1\n[backlog.runs]\napprove = [\"a\", \"1\"]\n"),
+            errors("version = 2\n[backlog.filter_form]\nclear = [\"space\"]\n"),
             one(
                 3,
-                r#"[backlog.runs] approve = "1": "1" is already global.select_tab_1 (default) in Backlog > Runs"#
+                r#"[backlog.filter_form] clear = "space": "space" is already choice.toggle (default) in the Backlog filter form"#
             )
+        );
+        assert_eq!(
+            errors("version = 2\n[backlog.runs]\nyes = [\"y\", \"right\"]\n"),
+            one(
+                3,
+                r#"[backlog.runs] yes = "right": "right" is already choice.next (default) in a Runs question"#
+            )
+        );
+        assert_eq!(
+            errors(
+                "version = 2\n[choice]\ntoggle = [\"t\"]\n[backlog.filter_form]\nclear = [\"space\"]\n"
+            ),
+            []
+        );
+    }
+
+    /// MOD-115 M2 D7: the permission digits are `answer.option_*` rows; a view act on one
+    /// collides with the answer, and moving the answer frees the digit.
+    #[test]
+    fn a_rebind_onto_a_permission_digit_collides_with_the_answer() {
+        assert_eq!(
+            errors(
+                "version = 2\n[global]\nselect_tab_1 = []\n[backlog.runs]\napprove = [\"a\", \"1\"]\n"
+            ),
+            one(
+                5,
+                r#"[backlog.runs] approve = "1": "1" is already answer.option_1 (default) in Backlog > Runs"#
+            )
+        );
+        assert_eq!(
+            errors(
+                "version = 2\n[global]\nselect_tab_1 = []\n[answer]\noption_1 = [\"f8\"]\n\
+                 [backlog.runs]\napprove = [\"a\", \"1\"]\n"
+            ),
+            []
+        );
+        // A file from before M2 may move the tab select between digits: the answers keep theirs
+        // and share them, answering only while a request is parked (RV1 H1).
+        let src = "[global]\nselect_tab_1 = [\"2\"]\nselect_tab_2 = [\"1\"]\n";
+        assert_eq!(errors(src), []);
+        let keys = load_str(src).expect("it loads");
+        assert_eq!(
+            keys.chords(Context::Answer, Act::AnswerOption1),
+            [chord("1")]
+        );
+        assert_eq!(
+            keys.actions(views::RUNS_BROWSE, chord("1")),
+            [Act::AnswerOption1, Act::SelectTab2]
+        );
+    }
+
+    /// MOD-115 M2 D7, D-10: the safety nets, as the validator reports them over merged keys:
+    /// a must-keep row with no chord is refused naming why, and the compiled keys have none.
+    #[test]
+    fn a_must_keep_row_with_no_chord_is_refused() {
+        let keys = Keys::defaults()
+            .with_chords(Context::Global, Act::Quit, &[])
+            .with_chords(Context::Field, Act::FieldCancel, &[])
+            .with_chords(Context::Leave, Act::LeaveStay, &[]);
+        let messages: Vec<String> = validate(&keys)
+            .into_iter()
+            .map(|error| error.message)
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                "[global] quit: must keep at least one chord: global.quit opens the leave dialog \
+                 and leave.confirm leaves; without both htui cannot be left",
+                "[leave] stay: must keep at least one chord: it is the way back from the leave \
+                 dialog",
+                "[field] cancel: must keep at least one chord: it is the way out of a text field",
+            ]
         );
     }
 

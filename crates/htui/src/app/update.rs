@@ -6,12 +6,17 @@
 use htui_core::model::{RunId, Scope, StepId, WorkspaceId, WorkspaceSummary};
 use htui_orch::Command;
 
-use crate::app::action::{Action, OverlayAction, RevealTarget, TabAction};
+use crate::app::action::{
+    Action, HistoryAction, LayoutAction, OverlayAction, PaneAction, RevealTarget, TabAction,
+};
 use crate::app::state::{App, Ctx, EDITOR_NEEDS_A_TAB};
 use crate::connection::DsnState;
 use crate::run_worker::OrchRequest;
 use crate::store_worker::{Origin, ReplyEnvelope, StoreReply, StoreRequest};
 use crate::ui::overlay::{Overlay, OverlayId};
+use crate::ui::shell::PaneId;
+use crate::ui::shell::history::Loc;
+use crate::ui::shell::layout as pane_layout;
 use crate::ui::tabs::SettingsTab;
 use crate::ui::tabs::settings::ConnectionSection;
 
@@ -19,8 +24,20 @@ use crate::ui::tabs::settings::ConnectionSection;
 const TICKS_PER_REFRESH: u64 = 4;
 
 impl App {
-    /// Applies one action.
+    /// Applies one action, recording the move it made in the history (MOD-115 M2 §8: a reply
+    /// that reveals or redirects is a new place too). The tick moves nobody and comes four times a
+    /// second, so it is not recorded (RV2 M3); it also flashes a save the background writer
+    /// could not make (RV2 H1).
     pub fn update(&mut self, action: Action) {
+        if matches!(action, Action::Tick) {
+            self.apply(action);
+        } else {
+            self.recorded(|app| app.apply(action));
+        }
+    }
+
+    /// [`update`](Self::update)'s body.
+    fn apply(&mut self, action: Action) {
         match action {
             Action::Quit => self.should_quit = true,
             Action::Tab(tab) => self.update_tab(tab),
@@ -40,7 +57,13 @@ impl App {
             Action::EditExternally(_) => self.status = Some(EDITOR_NEEDS_A_TAB.to_owned()),
             Action::AbortEdit => self.abort_editor(),
             Action::ToggleHelp => self.help_visible = !self.help_visible,
-            Action::ToggleAbout => self.about_visible = !self.about_visible,
+            Action::ToggleAbout => {
+                self.about_visible = !self.about_visible;
+                self.save_ui_state();
+            }
+            Action::Pane(pane) => self.step_pane(pane),
+            Action::Layout(step) => self.change_layout(step),
+            Action::History(step) => self.go_history(step),
             Action::Error(message) => self.status = Some(message),
             Action::Tick => {
                 self.on_tick();
@@ -82,6 +105,98 @@ impl App {
                 self.close_abort_question();
             }
             self.activate_tab();
+        }
+    }
+
+    /// `global.next_pane`/`prev_pane` (MOD-115 M2 D3): the next visible pane of the panes the
+    /// active tab claimed in the last frame. Nothing on a tab that claimed none (a single-pane
+    /// tab).
+    fn step_pane(&mut self, step: PaneAction) {
+        let Some(tab) = self.tabs.active() else {
+            return;
+        };
+        let id = tab.id();
+        let from = self.focus_of(tab);
+        let Some((_, _, areas)) = self.last_claim.filter(|(claimed, _, _)| *claimed == id) else {
+            return;
+        };
+        let to = pane_layout::step(&areas, from, step == PaneAction::Next);
+        self.focus.insert(id, to);
+    }
+
+    /// One `[layout]` key on the active tab (MOD-115 M2 D2): the stored layout steps, a focused
+    /// pane it hides gives the focus to the detail, and the UI state is saved. Nothing on a
+    /// single-pane tab.
+    fn change_layout(&mut self, step: LayoutAction) {
+        let Some(tab) = self.tabs.active() else {
+            return;
+        };
+        let id = tab.id();
+        let focus = self.focus_of(tab);
+        let Some(mut layout) = self.layout_of(tab) else {
+            return;
+        };
+        match step {
+            LayoutAction::NextPreset => layout.next_preset(),
+            LayoutAction::PrevPreset => layout.prev_preset(),
+            LayoutAction::GrowList => layout.grow_list(),
+            LayoutAction::ShrinkList => layout.shrink_list(),
+            LayoutAction::GrowActivity => layout.grow_activity(),
+            LayoutAction::ShrinkActivity => layout.shrink_activity(),
+            LayoutAction::ToggleList => layout.toggle_list(),
+            LayoutAction::ToggleActivity => layout.toggle_activity(),
+            LayoutAction::Zoom => layout.toggle_zoom(),
+        }
+        self.ui.layouts.insert(id.0.to_owned(), layout);
+        // The focus is stored as resolved, always: one the old layout only derived (the detail of
+        // a restart onto a hidden list) stays put when the new layout shows the list again (T6R).
+        let focus = if self.hides(id, &layout, focus) {
+            PaneId::Detail
+        } else {
+            focus
+        };
+        self.focus.insert(id, focus);
+        self.save_ui_state();
+    }
+
+    /// `history.back`/`forward` (MOD-115 M2 D5): to the place on the history, the place left
+    /// kept for the way back; the move itself is not recorded.
+    fn go_history(&mut self, step: HistoryAction) {
+        let Some(here) = self.here() else {
+            return;
+        };
+        let to = match step {
+            HistoryAction::Back => self.history.back(here),
+            HistoryAction::Forward => self.history.forward(here),
+        };
+        let Some(to) = to else {
+            return;
+        };
+        self.history_move = true;
+        self.go(&to);
+    }
+
+    /// Goes to `loc`: its tab, the focused pane and the tab's own location (`Tab::restore`, with
+    /// the pane it restores focused in its `Ctx`, and what it emitted drained). A tab that is no
+    /// longer registered is a no-op; the tab an in-pane editor is open for is focused but not
+    /// restored (MOD-57 M2 E5: nothing steers it).
+    fn go(&mut self, loc: &Loc) {
+        if self.tabs.title(loc.tab).is_none() {
+            return;
+        }
+        self.update_tab(TabAction::Focus(loc.tab));
+        // D3: a pane the layout has hidden since the place was left gives the focus to the
+        // detail, as a layout key that hides it does.
+        let hidden = self
+            .tabs
+            .active()
+            .filter(|tab| tab.id() == loc.tab)
+            .and_then(|tab| self.layout_of(tab))
+            .is_some_and(|layout| self.hides(loc.tab, &layout, loc.pane));
+        let pane = if hidden { PaneId::Detail } else { loc.pane };
+        self.focus.insert(loc.tab, pane);
+        if self.editor_tab() != Some(loc.tab) {
+            let _ = self.call_tab(loc.tab, |view, ctx| view.restore(&loc.at, ctx));
         }
     }
 
@@ -144,6 +259,11 @@ impl App {
     /// workspace, which is exactly the shell a first launch shows (blueprint D.5).
     fn on_tick(&mut self) {
         self.ticks += 1;
+        // RV2 H1: a save is written off the loop, so its failure is known only later.
+        if let Some(reason) = self.ui_store.take_failure() {
+            self.status = Some(reason);
+            self.dirty = true;
+        }
         if self.ticks.is_multiple_of(TICKS_PER_REFRESH) {
             self.dispatch(Origin::App, StoreRequest::StoreState);
             if !self.scope.is_empty() {
@@ -159,28 +279,9 @@ impl App {
     /// MOD-41 plan D16: the active tab's refresh hook, with a [`Ctx`] addressed as that tab, then
     /// what it emitted drained, as [`App::finish_external_edit`] does.
     fn refresh_active_tab(&mut self) {
-        let Some(id) = self.tabs.active_id() else {
-            return;
-        };
-        let origin = Origin::Tab(id);
-        {
-            let Self {
-                scope,
-                projects,
-                top_bar,
-                keys,
-                theme,
-                emit,
-                tabs,
-                ..
-            } = self;
-            let Some(view) = tabs.active_mut() else {
-                return;
-            };
-            let mut ctx = Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit);
-            view.on_refresh(&mut ctx);
+        if let Some(id) = self.tabs.active_id() {
+            let _ = self.call_tab(id, |view, ctx| view.on_refresh(ctx));
         }
-        self.drain(&origin);
     }
 
     /// MOD-12 M3 D9: the top overlay's refresh hook, with a [`Ctx`] addressed as that overlay, then
@@ -289,27 +390,9 @@ impl App {
             return;
         }
         self.update_tab(TabAction::Focus(tab));
-        let origin = Origin::Tab(tab);
-        {
-            let Self {
-                scope,
-                projects,
-                top_bar,
-                keys,
-                theme,
-                emit,
-                tabs,
-                ..
-            } = self;
-            let Some(view) = tabs.by_id_mut(tab) else {
-                return;
-            };
-            let mut ctx = Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit);
-            if !view.reveal(target, &mut ctx) {
-                tracing::debug!(%tab, "the tab does not reveal this target");
-            }
+        if self.call_tab(tab, |view, ctx| view.reveal(target, ctx)) == Some(false) {
+            tracing::debug!(%tab, "the tab does not reveal this target");
         }
-        self.drain(&origin);
     }
 
     /// A reply came back: top bar first, then the staleness gate, then the addressee.
@@ -328,25 +411,7 @@ impl App {
         match origin {
             Origin::App => self.on_app_reply(&reply),
             Origin::Tab(id) => {
-                let origin = Origin::Tab(id);
-                {
-                    let Self {
-                        scope,
-                        projects,
-                        top_bar,
-                        keys,
-                        theme,
-                        emit,
-                        tabs,
-                        ..
-                    } = self;
-                    if let Some(tab) = tabs.by_id_mut(id) {
-                        let mut ctx =
-                            Ctx::new(scope, projects, top_bar, keys, theme, origin.clone(), emit);
-                        tab.on_reply(&reply, &mut ctx);
-                    }
-                }
-                self.drain(&origin);
+                let _ = self.call_tab(id, |tab, ctx| tab.on_reply(&reply, ctx));
             }
             Origin::Overlay(id) => {
                 let origin = Origin::Overlay(id);
@@ -1559,16 +1624,22 @@ mod tests {
         })
     }
 
-    /// MOD-71 D1: every view the shell starts with keeps the terminal's own text selection.
+    /// MOD-71 D1: every single-pane view the shell starts with keeps the terminal's own text
+    /// selection; MOD-115 M2 MD8 (T7): a tab with a list and a detail takes the mouse for pane
+    /// focus and seams.
     #[test]
-    fn no_tab_wants_the_mouse_at_start_up() {
+    fn only_a_list_and_detail_tab_wants_the_mouse_at_start_up() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx);
         crate::app::register_all(&mut app);
         assert!(!app.tabs.is_empty());
         for i in 0..app.tabs.len() {
             assert!(app.tabs.select(i));
-            assert!(!app.wants_mouse(), "{:?}", app.tabs.active_id());
+            let split = app
+                .tabs
+                .active()
+                .is_some_and(|tab| matches!(tab.panes(), crate::ui::shell::Panes::ListDetail(_)));
+            assert_eq!(app.wants_mouse(), split, "{:?}", app.tabs.active_id());
         }
     }
 

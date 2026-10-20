@@ -1,4 +1,5 @@
-//! The empty state: what is missing and always a next step (MOD-115).
+//! The empty state: what is missing and always a next step (MOD-115), and the placeholder pane
+//! that frames one where a pane has nothing to show yet (M2's activity pane).
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
@@ -7,6 +8,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::ui::Theme;
 use crate::ui::cells::clip_line;
+use crate::ui::kit::pane::Pane;
 use crate::ui::layout::centered;
 
 /// The next step an empty state points at. Required, so no empty state is a dead end.
@@ -35,12 +37,29 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, what: &str, next: NextStep<'_>,
     frame.render_widget(Paragraph::new(lines), target);
 }
 
+/// Draws the empty state of a pane nothing fills yet into `area` (MOD-115 M2 D2: the activity
+/// pane until MOD-122): a rounded block in the faint border role titled ` {title} `, with the
+/// empty state for `what` and `next` centred inside. The shell restyles its border for focus
+/// afterwards, like any pane's.
+pub fn placeholder(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    what: &str,
+    next: NextStep<'_>,
+    theme: &Theme,
+) {
+    let inner = Pane::new(title).render(frame, area, theme);
+    render(frame, inner, what, next, theme);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::style::Modifier;
+    use ratatui::buffer::Buffer;
+    use ratatui::style::{Color, Modifier};
 
     fn draw(width: u16, height: u16, what: &str, next: &str, theme: &Theme) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
@@ -140,6 +159,96 @@ mod tests {
                 render(
                     frame,
                     Rect::new(0, 0, 0, 0),
+                    "x",
+                    NextStep("y"),
+                    &Theme::default(),
+                );
+            })
+            .expect("draw");
+    }
+
+    fn draw_placeholder(width: u16, height: u16, theme: &Theme) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                placeholder(
+                    frame,
+                    frame.area(),
+                    "Activity",
+                    "no activity yet",
+                    NextStep("it lands with MOD-122"),
+                    theme,
+                );
+            })
+            .expect("draw");
+        terminal.backend().buffer().clone()
+    }
+
+    fn text(buffer: &Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn the_placeholder_is_a_rounded_faint_pane_titled_with_the_state_inside() {
+        let theme = Theme::default();
+        let buffer = draw_placeholder(30, 6, &theme);
+        let top = text(&buffer, 0);
+        assert!(top.starts_with("╭─ Activity ─"), "{top}");
+        assert!(top.ends_with('╮'), "{top}");
+        assert!(text(&buffer, 5).starts_with('╰') && text(&buffer, 5).ends_with('╯'));
+        for (x, y) in [(0, 0), (29, 0), (0, 3), (29, 5)] {
+            assert_eq!(buffer[(x, y)].fg, Color::Indexed(240), "({x},{y})");
+        }
+        let inner: Vec<String> = (1..5).map(|y| text(&buffer, y)).collect();
+        assert!(
+            inner
+                .iter()
+                .any(|row| row.trim_matches(['│', ' ']) == "no activity yet"),
+            "{inner:?}"
+        );
+        assert!(
+            inner
+                .iter()
+                .any(|row| row.trim_matches(['│', ' ']) == "it lands with MOD-122"),
+            "{inner:?}"
+        );
+        let what = inner
+            .iter()
+            .position(|row| row.contains("no activity yet"))
+            .unwrap();
+        assert_eq!(what, 1, "centred in the four inner rows: {inner:?}");
+    }
+
+    #[test]
+    fn the_placeholder_border_is_dim_in_monochrome() {
+        let theme = Theme::monochrome();
+        let buffer = draw_placeholder(30, 6, &theme);
+        for (x, y) in [(0, 0), (29, 0), (0, 3), (29, 5)] {
+            let cell = &buffer[(x, y)];
+            assert!(cell.modifier.contains(Modifier::DIM), "({x},{y})");
+            assert_eq!(
+                (cell.fg, cell.bg),
+                (Color::Reset, Color::Reset),
+                "({x},{y})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tiny_placeholder_does_not_panic() {
+        for (width, height) in [(1, 1), (2, 2), (5, 2), (12, 3)] {
+            let buffer = draw_placeholder(width, height, &Theme::default());
+            assert_eq!(buffer.area.width, width);
+        }
+        let mut terminal = Terminal::new(TestBackend::new(5, 5)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                placeholder(
+                    frame,
+                    Rect::default(),
+                    "Activity",
                     "x",
                     NextStep("y"),
                     &Theme::default(),

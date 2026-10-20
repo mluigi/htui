@@ -8,11 +8,15 @@
 //!
 //! Every style is a [`Theme`] role, so the monochrome theme keeps focus visible: a focused border
 //! is bold, an unfocused one dim.
+//!
+//! For panes a tab still frames itself, the shell paints over them (MOD-115 M2 D3):
+//! [`paint_focus`] restyles a drawn border for the shell's focus, [`paint_bottom_hints`] and
+//! [`paint_bottom_note`] put the hints (left) and a hidden pane's note (right) on its bottom rule.
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::layout::{Position, Rect};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Widget};
 
@@ -42,6 +46,7 @@ pub struct Pane<'a> {
     sub_tabs: Vec<&'a str>,
     active: usize,
     hints: Option<Line<'a>>,
+    note: Option<Line<'a>>,
     focus: Focus,
     accent: Option<Style>,
     scrollbar: Option<(usize, usize)>,
@@ -56,6 +61,7 @@ impl<'a> Pane<'a> {
             sub_tabs: Vec::new(),
             active: 0,
             hints: None,
+            note: None,
             focus: Focus::Unfocused,
             accent: None,
             scrollbar: None,
@@ -74,6 +80,15 @@ impl<'a> Pane<'a> {
     #[must_use]
     pub fn hints(mut self, hints: Line<'a>) -> Self {
         self.hints = Some(hints);
+        self
+    }
+
+    /// A note on the bottom border, right-aligned and drawn focused or not: what a hidden pane
+    /// says about bringing it back (`R-TUI-12`). It takes only the rule the hints left, less
+    /// the one rule cell that parts it from them.
+    #[must_use]
+    pub fn note(mut self, note: Line<'a>) -> Self {
+        self.note = Some(note);
         self
     }
 
@@ -160,6 +175,13 @@ impl<'a> Pane<'a> {
                 let line = cells::clip_line(hints, width);
                 line.render(Rect::new(area.x + 2, area.bottom() - 1, width, 1), buf);
             }
+        }
+
+        if let Some(note) = self.note
+            && area.height >= 2
+        {
+            let row = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+            paint_bottom_note(buf, row, note, theme.dim);
         }
 
         if let Some((total, offset)) = self.scrollbar {
@@ -253,6 +275,85 @@ pub fn paint_bottom_hints(buf: &mut Buffer, row: Rect, hints: Line<'_>, style: S
     let line = cells::clip_line(hints.patch_style(style), room);
     let shown = u16::try_from(line.width()).unwrap_or(room).min(room);
     let origin = Rect::new(start, row.y, shown, 1).intersection(buf.area);
+    if origin.is_empty() {
+        return;
+    }
+    let mut scratch = Buffer::empty(origin);
+    line.render(origin, &mut scratch);
+    for col in origin.x..origin.right() {
+        buf[(col, origin.y)] = scratch[(col, origin.y)].clone();
+    }
+}
+
+/// Whether `symbol` is one box-drawing glyph (U+2500..=U+257F), the only cell [`paint_focus`]
+/// restyles.
+fn is_box_drawing(symbol: &str) -> bool {
+    let mut chars = symbol.chars();
+    matches!((chars.next(), chars.next()), (Some(c), None) if ('\u{2500}'..='\u{257F}').contains(&c))
+}
+
+/// Restyles the border of a pane a tab already drew into `area` for `focus` (the shell's focus,
+/// MOD-115 M2 D3): focused, the `accent` (the tab accent; bold in monochrome), else the faint
+/// border role (dim in monochrome). Only the box-drawing cells on `area`'s edge change, so the
+/// title, the chips, the hints and the note keep their style, and so does the pane's content.
+pub fn paint_focus(buf: &mut Buffer, area: Rect, focus: Focus, accent: Style, theme: &Theme) {
+    if area.is_empty() {
+        return;
+    }
+    let style = match focus {
+        Focus::Focused => accent,
+        Focus::Unfocused => theme.border_faint,
+    };
+    let (right, bottom) = (area.right() - 1, area.bottom() - 1);
+    let edge = (area.x..=right)
+        .flat_map(|x| [(x, area.y), (x, bottom)])
+        .chain((area.y..=bottom).flat_map(|y| [(area.x, y), (right, y)]));
+    for (x, y) in edge {
+        if !buf.area.contains(Position::new(x, y)) {
+            continue;
+        }
+        let cell = &mut buf[(x, y)];
+        if is_box_drawing(cell.symbol()) {
+            // Replace the colour and the modifiers rather than patch them, so a dim border
+            // that gains focus is bold alone; the background is the pane's own.
+            cell.fg = Color::Reset;
+            cell.modifier = Modifier::empty();
+            cell.set_style(style);
+        }
+    }
+}
+
+/// Draws `note` over the horizontal border glyphs of `row`, right-aligned: the twin of
+/// [`paint_bottom_hints`], ending two cells before the right corner. It is clipped to
+/// `row.width - 4` and drawn only over the run of plain rule that ends there, so it stops (with
+/// an ellipsis) one rule cell short of the first cell that is not one, a hint or the tab's own
+/// text, so a rule cell always parts the two. `style` is the note's base style.
+pub fn paint_bottom_note(buf: &mut Buffer, row: Rect, note: Line<'_>, style: Style) {
+    let width = row.width.saturating_sub(4);
+    let row = row.intersection(buf.area);
+    if width == 0 || row.is_empty() {
+        return;
+    }
+    // One past the note's last cell: the corner and one rule cell stay to its right.
+    let end = row.right().saturating_sub(2);
+    let run = (1..=width)
+        .take_while(|k| end >= row.x + k && is_rule(buf[(end - k, row.y)].symbol()))
+        .count();
+    let run = u16::try_from(run).unwrap_or(width).min(width);
+    // A run cut short by a hint or the tab's own text keeps one rule cell beside it, so the
+    // note never reads as one word with what stopped it; a run of the whole width already
+    // leaves the rule cell after the left corner.
+    let room = if run < width {
+        run.saturating_sub(1)
+    } else {
+        run
+    };
+    if room == 0 {
+        return;
+    }
+    let line = cells::clip_line(note.patch_style(style), room);
+    let shown = u16::try_from(line.width()).unwrap_or(room).min(room);
+    let origin = Rect::new(end - shown, row.y, shown, 1).intersection(buf.area);
     if origin.is_empty() {
         return;
     }
@@ -616,5 +717,287 @@ mod tests {
             "{text}"
         );
         assert_eq!(text.chars().count(), 12);
+    }
+
+    /// A 12 by 4 plain-bordered block in `border`, its title in yellow, a yellow hint on the
+    /// bottom border and two green rule glyphs inside.
+    fn framed(border: Style) -> Buffer {
+        let area = Rect::new(0, 0, 12, 4);
+        let mut buffer = Buffer::empty(area);
+        Block::bordered()
+            .border_style(border)
+            .title(Line::styled(" Items ", Style::new().fg(Color::Yellow)))
+            .render(area, &mut buffer);
+        paint_bottom_hints(
+            &mut buffer,
+            Rect::new(0, 3, 12, 1),
+            Line::from("a b"),
+            Style::new().fg(Color::Yellow),
+        );
+        buffer.set_string(2, 1, "──", Style::new().fg(Color::Green));
+        buffer
+    }
+
+    /// The edge cells of a 12 by 4 area that are still border glyphs in [`framed`].
+    const EDGE: [(u16, u16); 8] = [
+        (0, 0),
+        (11, 0),
+        (9, 0),
+        (0, 1),
+        (11, 2),
+        (0, 3),
+        (8, 3),
+        (11, 3),
+    ];
+
+    #[test]
+    fn paint_focus_gives_a_focused_border_the_accent_and_leaves_the_text_alone() {
+        let theme = Theme::default();
+        let mut buffer = framed(Style::new().fg(Color::White));
+        paint_focus(
+            &mut buffer,
+            Rect::new(0, 0, 12, 4),
+            Focus::Focused,
+            accent(),
+            &theme,
+        );
+        for (x, y) in EDGE {
+            assert_eq!(buffer[(x, y)].fg, Color::Magenta, "({x},{y})");
+        }
+        assert_eq!(buffer[(2, 0)].symbol(), "I");
+        assert_eq!(
+            buffer[(2, 0)].fg,
+            Color::Yellow,
+            "the title keeps its style"
+        );
+        assert_eq!(buffer[(2, 3)].symbol(), "a");
+        assert_eq!(buffer[(2, 3)].fg, Color::Yellow, "the hint keeps its style");
+        assert_eq!(buffer[(2, 1)].symbol(), "─");
+        assert_eq!(
+            buffer[(2, 1)].fg,
+            Color::Green,
+            "the content is not the border"
+        );
+    }
+
+    #[test]
+    fn paint_focus_gives_an_unfocused_border_the_faint_role() {
+        let theme = Theme::default();
+        let mut buffer = framed(accent());
+        paint_focus(
+            &mut buffer,
+            Rect::new(0, 0, 12, 4),
+            Focus::Unfocused,
+            accent(),
+            &theme,
+        );
+        for (x, y) in EDGE {
+            assert_eq!(buffer[(x, y)].fg, Color::Indexed(240), "({x},{y})");
+        }
+        assert_eq!(buffer[(2, 0)].fg, Color::Yellow);
+        assert_eq!(buffer[(2, 1)].fg, Color::Green);
+    }
+
+    #[test]
+    fn paint_focus_in_monochrome_is_bold_or_dim_never_both_and_never_coloured() {
+        let theme = Theme::monochrome();
+        let area = Rect::new(0, 0, 12, 4);
+        let mut buffer = framed(theme.border_faint);
+        paint_focus(
+            &mut buffer,
+            area,
+            Focus::Focused,
+            theme.tab_accent("backlog"),
+            &theme,
+        );
+        for (x, y) in EDGE {
+            let cell = &buffer[(x, y)];
+            assert!(cell.modifier.contains(Modifier::BOLD), "({x},{y})");
+            assert!(!cell.modifier.contains(Modifier::DIM), "({x},{y})");
+            assert_eq!(
+                (cell.fg, cell.bg),
+                (Color::Reset, Color::Reset),
+                "({x},{y})"
+            );
+        }
+        paint_focus(
+            &mut buffer,
+            area,
+            Focus::Unfocused,
+            theme.tab_accent("backlog"),
+            &theme,
+        );
+        for (x, y) in EDGE {
+            let cell = &buffer[(x, y)];
+            assert!(cell.modifier.contains(Modifier::DIM), "({x},{y})");
+            assert!(!cell.modifier.contains(Modifier::BOLD), "({x},{y})");
+            assert_eq!(
+                (cell.fg, cell.bg),
+                (Color::Reset, Color::Reset),
+                "({x},{y})"
+            );
+        }
+    }
+
+    #[test]
+    fn paint_focus_restyles_a_rounded_pane_and_its_scrollbar() {
+        let theme = Theme::default();
+        let (mut buffer, _) = draw(10, 6, &theme, Pane::new("").scrollbar(8, 0));
+        paint_focus(
+            &mut buffer,
+            Rect::new(0, 0, 10, 6),
+            Focus::Focused,
+            accent(),
+            &theme,
+        );
+        assert_eq!(buffer[(0, 0)].symbol(), "╭");
+        assert_eq!(buffer[(0, 0)].fg, Color::Magenta);
+        assert_eq!(buffer[(9, 1)].symbol(), THUMB);
+        assert_eq!(buffer[(9, 1)].fg, Color::Magenta);
+    }
+
+    #[test]
+    fn paint_focus_outside_the_buffer_or_on_nothing_does_not_panic() {
+        let theme = Theme::default();
+        let mut buffer = framed(Style::new());
+        paint_focus(
+            &mut buffer,
+            Rect::new(6, 2, 20, 10),
+            Focus::Focused,
+            accent(),
+            &theme,
+        );
+        assert_eq!(
+            buffer[(11, 2)].fg,
+            Color::Magenta,
+            "the clipped edge's own cells"
+        );
+        paint_focus(
+            &mut buffer,
+            Rect::default(),
+            Focus::Focused,
+            accent(),
+            &theme,
+        );
+        paint_focus(
+            &mut buffer,
+            Rect::new(40, 40, 3, 3),
+            Focus::Focused,
+            accent(),
+            &theme,
+        );
+    }
+
+    #[test]
+    fn a_bottom_note_ends_two_cells_before_the_corner() {
+        let mut buffer = bordered_row(&format!("╰{}╯", "─".repeat(16)));
+        paint_bottom_note(
+            &mut buffer,
+            Rect::new(0, 0, 18, 1),
+            Line::from("a b"),
+            Style::new().fg(Color::Yellow),
+        );
+        assert_eq!(row(&buffer, 0), format!("╰{}a b─╯", "─".repeat(12)));
+        assert_eq!(buffer[(13, 0)].fg, Color::Yellow, "the note's style");
+    }
+
+    #[test]
+    fn a_bottom_note_takes_only_the_rule_the_hints_left() {
+        let text = format!("╰─abcdef{}╯", "─".repeat(6));
+        let mut clipped = bordered_row(&text);
+        paint_bottom_note(
+            &mut clipped,
+            Rect::new(0, 0, 15, 1),
+            Line::from("123456789"),
+            Style::new(),
+        );
+        assert_eq!(
+            row(&clipped, 0),
+            "╰─abcdef─123…─╯",
+            "one rule cell stays between the note and what stopped it"
+        );
+        let mut exact = bordered_row(&text);
+        paint_bottom_note(
+            &mut exact,
+            Rect::new(0, 0, 15, 1),
+            Line::from("1234"),
+            Style::new(),
+        );
+        assert_eq!(row(&exact, 0), "╰─abcdef─1234─╯");
+        let mut fits = bordered_row(&text);
+        paint_bottom_note(
+            &mut fits,
+            Rect::new(0, 0, 15, 1),
+            Line::from("ab"),
+            Style::new(),
+        );
+        assert_eq!(row(&fits, 0), "╰─abcdef───ab─╯");
+    }
+
+    #[test]
+    fn a_bottom_note_skips_a_row_that_is_not_a_border_or_has_no_room() {
+        let mut text = bordered_row("│ some body text │");
+        paint_bottom_note(
+            &mut text,
+            Rect::new(0, 0, 18, 1),
+            Line::from("z unzoom"),
+            Style::new(),
+        );
+        assert_eq!(row(&text, 0), "│ some body text │");
+        let mut tiny = bordered_row("╰──╯");
+        paint_bottom_note(
+            &mut tiny,
+            Rect::new(0, 0, 4, 1),
+            Line::from("z"),
+            Style::new(),
+        );
+        assert_eq!(row(&tiny, 0), "╰──╯");
+        let mut long = bordered_row(&format!("╰{}╯", "─".repeat(10)));
+        paint_bottom_note(
+            &mut long,
+            Rect::new(0, 0, 12, 1),
+            Line::from("F2 show list · p layouts"),
+            Style::new(),
+        );
+        let shown = row(&long, 0);
+        assert!(
+            shown.starts_with("╰─") && shown.ends_with("─╯") && shown.contains('…'),
+            "{shown}"
+        );
+        assert_eq!(shown.chars().count(), 12);
+    }
+
+    #[test]
+    fn a_panes_note_sits_right_aligned_on_the_bottom_border_focused_or_not() {
+        let theme = Theme::default();
+        let (unfocused, _) = draw(24, 4, &theme, Pane::new("T").note(Line::from("z unzoom")));
+        assert_eq!(row(&unfocused, 3), format!("╰{}z unzoom─╯", "─".repeat(13)));
+        let (focused, _) = draw(
+            30,
+            4,
+            &theme,
+            Pane::new("T")
+                .hints(Line::from("enter open"))
+                .note(Line::from("z unzoom"))
+                .focus(Focus::Focused),
+        );
+        assert_eq!(
+            row(&focused, 3),
+            format!("╰─enter open{}z unzoom─╯", "─".repeat(8))
+        );
+        let (tight, _) = draw(
+            22,
+            4,
+            &theme,
+            Pane::new("T")
+                .hints(Line::from("enter open"))
+                .note(Line::from("z unzoom"))
+                .focus(Focus::Focused),
+        );
+        assert_eq!(
+            row(&tight, 3),
+            "╰─enter open─z unzo…─╯",
+            "the note never runs into the hints"
+        );
     }
 }

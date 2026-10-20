@@ -31,6 +31,7 @@ use crate::editor::ExternalEditOutcome;
 use crate::keys::{Act, Keys, Stack, views};
 use crate::store_worker::StoreReply;
 use crate::ui::Theme;
+use crate::ui::shell::{PaneAreas, PaneId};
 use crossterm::event::{KeyEvent, MouseEvent};
 
 pub use body::BodyTab;
@@ -115,6 +116,13 @@ pub trait DetailTab {
     /// A mouse event, offered only while [`wants_mouse`](DetailTab::wants_mouse) is true (MOD-71
     /// D4). The default `Pass` drops it.
     fn on_mouse(&mut self, _mouse: MouseEvent, _ctx: &mut Ctx<'_>) -> Handled {
+        Handled::Pass
+    }
+    /// MOD-115 M2 §7: a list motion while the detail is focused. A pane that reads as text
+    /// (Body, Notes, Prompt) scrolls; one with a row cursor (Runs, Graph, Docs, Reqs) moves it,
+    /// as its own `J`/`K` do. The default `Pass` takes no step, and the Backlog still keeps its
+    /// list cursor where it is: only motion follows the focus.
+    fn step(&mut self, _step: Step, _ctx: &Ctx<'_>) -> Handled {
         Handled::Pass
     }
     /// Mouse capture went off above the pane (MOD-74 D3): the Backlog tab hands every sub-tab the
@@ -347,6 +355,15 @@ impl DetailRegistry {
         }
     }
 
+    /// Hands a list motion to the active sub-tab while the detail is focused (MOD-115 M2 §7);
+    /// `Pass` while the registry is empty or the sub-tab takes no step.
+    pub fn step(&mut self, step: Step, ctx: &Ctx<'_>) -> Handled {
+        match self.tabs.get_mut(self.active) {
+            Some(tab) => tab.step(step, ctx),
+            None => Handled::Pass,
+        }
+    }
+
     /// Offers a key to the active sub-tab.
     pub fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         match self.tabs.get_mut(self.active) {
@@ -435,6 +452,73 @@ pub fn message(frame: &mut Frame<'_>, area: Rect, text: &str, theme: &Theme) {
     );
 }
 
+/// One list motion, as a focused detail pane takes it (MOD-115 M2 §7): `list.down`, `list.up`,
+/// `list.top` or `list.bottom`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Step {
+    /// A row down.
+    Down,
+    /// A row up.
+    Up,
+    /// To the first row.
+    Top,
+    /// To the last row.
+    Bottom,
+}
+
+impl Step {
+    /// The step `act` is, if it is a list motion.
+    #[must_use]
+    pub const fn of(act: Act) -> Option<Self> {
+        match act {
+            Act::ListDown => Some(Self::Down),
+            Act::ListUp => Some(Self::Up),
+            Act::ListTop => Some(Self::Top),
+            Act::ListBottom => Some(Self::Bottom),
+            _ => None,
+        }
+    }
+
+    /// The step as rows to move a clamped cursor by: one either way, or as far as it goes.
+    #[must_use]
+    pub const fn delta(self) -> isize {
+        match self {
+            Self::Down => 1,
+            Self::Up => -1,
+            Self::Top => isize::MIN,
+            Self::Bottom => isize::MAX,
+        }
+    }
+
+    /// MOD-115 M2 §7, the one rule every list + detail tab routes motion by: only motion
+    /// follows the focus. Whether the motion was taken away from the list: `false` when `act`
+    /// is no list motion or the list is focused, so the tab's own arms take it; with the detail
+    /// focused `detail` takes the step, and whatever it answers the motion is taken (a pane at
+    /// its end does not hand the key back); with the activity pane focused nothing moves.
+    pub fn by_focus(act: Act, focus: PaneId, detail: impl FnOnce(Self) -> Handled) -> bool {
+        let Some(step) = Self::of(act).filter(|_| focus != PaneId::List) else {
+            return false;
+        };
+        if focus == PaneId::Detail {
+            let _ = detail(step);
+        }
+        true
+    }
+}
+
+/// MOD-115 M2 §7 (T7 repair): where a list + detail tab draws its list and its detail. While
+/// what the detail shows takes every key (`capturing`: a form, a prompt, a compose area) and
+/// another pane is zoomed, so the detail's rect is empty, the detail takes the whole `area` and
+/// the list nothing: what is typed is on screen. Otherwise the panes the layout gave.
+#[must_use]
+pub fn capture_area(areas: &PaneAreas, area: Rect, capturing: bool) -> (Option<Rect>, Rect) {
+    if areas.detail.is_empty() && capturing {
+        (None, area)
+    } else {
+        (areas.list, areas.detail)
+    }
+}
+
 /// Vertical scroll shared by every sub-tab.
 ///
 /// The clamp is against the number of *unwrapped* rows, which is a lower bound on the number of
@@ -484,6 +568,12 @@ impl Scroll {
         self.step(step, len)
     }
 
+    /// A list motion over `len` rows while the pane is focused (MOD-115 M2 §7): a row, as
+    /// `pane.scroll_down`/`scroll_up`, or to either end, clamped to the last row.
+    pub fn follow(&mut self, step: Step, len: usize) -> Handled {
+        self.step(step.delta(), len)
+    }
+
     /// Moves `step` rows, clamped to the last of `len` rows.
     fn step(&mut self, step: isize, len: usize) -> Handled {
         let max = u16::try_from(len.saturating_sub(1)).unwrap_or(u16::MAX);
@@ -500,10 +590,64 @@ mod tests {
     use ratatui::Frame;
     use ratatui::layout::Rect;
 
-    use super::{DetailId, DetailRegistry, DetailTab, Scroll};
+    use super::{DetailId, DetailRegistry, DetailTab, Scroll, Step};
     use crate::app::{Ctx, Handled};
     use crate::keys::{Act, Stack, views};
     use crate::store_worker::StoreReply;
+    use crate::ui::shell::{PaneAreas, PaneId};
+
+    /// MOD-115 M2 §7 (RV3): only motion follows the focus. A list motion with the list focused,
+    /// or any other act, is the tab's own; with the detail focused the detail takes the step,
+    /// and the motion is taken even when the detail declines it; with the activity pane focused
+    /// it is taken and nothing moves.
+    #[test]
+    fn by_focus_routes_only_motion_away_from_the_list() {
+        let never = |_: Step| -> Handled { panic!("the detail is not asked") };
+        assert!(!Step::by_focus(Act::ListDown, PaneId::List, never));
+        assert!(!Step::by_focus(Act::Edit, PaneId::Detail, never));
+        assert!(!Step::by_focus(Act::ListFold, PaneId::Activity, never));
+        let mut seen = None;
+        let taken = Step::by_focus(Act::ListBottom, PaneId::Detail, |step| {
+            seen = Some(step);
+            Handled::Pass
+        });
+        assert_eq!((taken, seen), (true, Some(Step::Bottom)));
+        assert!(Step::by_focus(Act::ListUp, PaneId::Activity, never));
+    }
+
+    /// MOD-115 M2 §7 (RV3): a detail that takes every key gets the whole area only while another
+    /// pane is zoomed; otherwise each pane keeps the rect the layout gave it.
+    #[test]
+    fn capture_area_gives_a_capturing_detail_the_area_only_when_zoomed_away() {
+        let area = Rect::new(0, 0, 100, 30);
+        let list = Rect::new(0, 0, 55, 30);
+        let detail = Rect::new(55, 0, 45, 30);
+        let shown = PaneAreas {
+            list: Some(list),
+            detail,
+            activity: None,
+            list_hidden: None,
+            activity_hidden: None,
+        };
+        assert_eq!(
+            super::capture_area(&shown, area, true),
+            (Some(list), detail)
+        );
+        assert_eq!(
+            super::capture_area(&shown, area, false),
+            (Some(list), detail)
+        );
+        let zoomed = PaneAreas {
+            list: Some(area),
+            detail: Rect::default(),
+            ..shown
+        };
+        assert_eq!(
+            super::capture_area(&zoomed, area, false),
+            (Some(area), Rect::default())
+        );
+        assert_eq!(super::capture_area(&zoomed, area, true), (None, area));
+    }
 
     /// `Scroll::apply`, the pane scroll's one entry (MOD-67 M5 dropped the key-matching
     /// `on_key`): a row or a page per act, clamped to the last row; any other act passes.
@@ -598,5 +742,89 @@ mod tests {
             views::RUNS_BROWSE,
             "back on the override"
         );
+    }
+
+    /// MOD-115 M2 §7: the four list motions are the steps a focused detail pane takes; every
+    /// other act is none.
+    #[test]
+    fn the_list_motions_are_the_detail_steps() {
+        assert_eq!(Step::of(Act::ListDown), Some(Step::Down));
+        assert_eq!(Step::of(Act::ListUp), Some(Step::Up));
+        assert_eq!(Step::of(Act::ListTop), Some(Step::Top));
+        assert_eq!(Step::of(Act::ListBottom), Some(Step::Bottom));
+        for act in [
+            Act::ListFold,
+            Act::PaneScrollDown,
+            Act::PanePageDown,
+            Act::Edit,
+        ] {
+            assert_eq!(Step::of(act), None, "{act:?}");
+        }
+    }
+
+    /// MOD-115 M2 §7: a step scrolls a row, or to either end, clamped to the last row.
+    #[test]
+    fn a_step_scrolls_a_row_or_to_an_end() {
+        let mut scroll = Scroll::default();
+        assert_eq!(scroll.follow(Step::Down, 5), Handled::Consumed);
+        assert_eq!(scroll.offset(), 1);
+        assert_eq!(scroll.follow(Step::Bottom, 5), Handled::Consumed);
+        assert_eq!(scroll.offset(), 4, "the last of five rows");
+        assert_eq!(scroll.follow(Step::Down, 5), Handled::Consumed);
+        assert_eq!(scroll.offset(), 4, "clamped");
+        assert_eq!(scroll.follow(Step::Up, 5), Handled::Consumed);
+        assert_eq!(scroll.offset(), 3);
+        assert_eq!(scroll.follow(Step::Top, 5), Handled::Consumed);
+        assert_eq!(scroll.offset(), 0);
+        assert_eq!(scroll.follow(Step::Up, 5), Handled::Consumed);
+        assert_eq!(scroll.offset(), 0, "clamped at the top");
+        assert_eq!(scroll.follow(Step::Bottom, 0), Handled::Consumed);
+        assert_eq!(scroll.offset(), 0, "nothing to scroll over");
+    }
+
+    /// A sub-tab that records the steps it is handed.
+    struct Stepper(std::rc::Rc<std::cell::RefCell<Vec<Step>>>);
+
+    impl DetailTab for Stepper {
+        fn id(&self) -> DetailId {
+            DetailId("stepper")
+        }
+        fn title(&self) -> &str {
+            "Stepper"
+        }
+        fn on_item_change(&mut self, _item: Option<ItemId>) {}
+        fn on_key(&mut self, _key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            Handled::Pass
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+        fn step(&mut self, step: Step, _ctx: &Ctx<'_>) -> Handled {
+            self.0.borrow_mut().push(step);
+            Handled::Consumed
+        }
+    }
+
+    /// MOD-115 M2 §7: the registry hands a step to the active sub-tab only; a sub-tab that keeps
+    /// the default declines it, and an empty registry has nobody to hand it to.
+    #[test]
+    fn the_registry_hands_a_step_to_the_active_pane() {
+        let shell = super::compose::bench::Shell::new();
+        let ctx = shell.ctx();
+        let mut registry = DetailRegistry::new();
+        assert_eq!(registry.step(Step::Down, &ctx), Handled::Pass, "empty");
+
+        let seen = std::rc::Rc::default();
+        registry.register(Box::new(Plain));
+        registry.register(Box::new(Stepper(std::rc::Rc::clone(&seen))));
+        assert_eq!(
+            registry.step(Step::Down, &ctx),
+            Handled::Pass,
+            "the default"
+        );
+        assert!(seen.borrow().is_empty(), "a hidden pane is not stepped");
+
+        registry.cycle_next();
+        assert_eq!(registry.step(Step::Bottom, &ctx), Handled::Consumed);
+        assert_eq!(*seen.borrow(), [Step::Bottom]);
     }
 }

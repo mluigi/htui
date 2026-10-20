@@ -2,7 +2,7 @@
 source: crates/htui/tests/kinds.rs
 expression: frame
 ---
-Graphics   ¹Settings            0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
+Graphics   ¹Settings   0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys · ⌫ back
 ┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
 │ Agents  Hierarchy  Kinds                                                                         │
 │vulkan-tutorials  Vulkan Tutorials                                                                │

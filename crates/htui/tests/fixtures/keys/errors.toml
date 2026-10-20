@@ -1,5 +1,5 @@
 # MOD-67 M2 fixture: one of each entry error, out of order on purpose.
-version = 2
+version = 3
 
 [list]
 down = 5

@@ -13,6 +13,7 @@ use crate::app::{Ctx, Handled, RevealTarget};
 use crate::editor::ExternalEditOutcome;
 use crate::keys::Stack;
 use crate::store_worker::{StoreReply, StoreRequest};
+use crate::ui::shell::{Panes, TabLoc};
 use crate::ui::tabs::settings::SectionId;
 use crossterm::event::{KeyEvent, MouseEvent};
 
@@ -106,34 +107,52 @@ pub trait Tab {
     /// changes. A view trait, not a store trait: the no-default rule does not apply.
     fn on_refresh(&mut self, _ctx: &mut Ctx<'_>) {}
 
-    /// Whether this tab wants the terminal's mouse right now (MOD-71 D1). Capture takes the
-    /// terminal's own text selection away, so the event loop turns it on only while the active
-    /// tab says yes and nothing is drawn over it. Defaulted to `false`, so no other tab changes:
-    /// only the Backlog answers, for its Runs pane's flow view.
+    /// Whether this tab's own gesture wants the terminal's mouse right now (MOD-71 D1). Capture
+    /// takes the terminal's own text selection away, so the event loop turns it on only while
+    /// the active tab says yes (or, MOD-115 M2 MD8, is a list + detail tab, for the shell's pane
+    /// clicks and seam drags) and nothing is drawn over it. Defaulted to `false`, so no other tab
+    /// changes: only the Backlog answers, for its Runs pane's flow view.
     ///
-    /// Being the sole implementor is load-bearing (MOD-74 review L1): a loss is the shell's
-    /// on-to-off capture edge, and a switch between two views that both want the mouse keeps
-    /// capture on. A second implementor must handle that switch too (e.g. by tracking the capture
-    /// holder), or the review-L3 stale anchor returns.
+    /// MOD-74 review L1: a loss used to be only the shell's on-to-off capture edge. Since the
+    /// tabs with a list and a detail keep capture on across a tab switch, the shell tracks the
+    /// tab whose own gesture holds the mouse and tells every tab when it changes too
+    /// (`App::mouse_capture`), so the review-L3 stale anchor stays gone.
     fn wants_mouse(&self) -> bool {
         false
     }
     /// A mouse event reached this tab (MOD-71 D4), only while [`wants_mouse`](Tab::wants_mouse)
-    /// says so. `Consumed` asks for a redraw; `Pass` is the drop and costs nothing — no key table
+    /// says so (the shell's own gestures, MOD-115 M2 §7, come first). `Consumed` asks for a redraw; `Pass` is the drop and costs nothing — no key table
     /// reads a mouse event. Defaulted to `Pass`, so no other tab changes.
     fn on_mouse(&mut self, _mouse: MouseEvent, _ctx: &mut Ctx<'_>) -> Handled {
         Handled::Pass
     }
     /// MOD-74 D1, D3: mouse capture went off while this tab may hold a gesture: an overlay, `?`, a
     /// form, a sub-tab or tab switch, or an `$EDITOR` handoff. Told to every registered tab, active
-    /// or not, once per on-to-off edge. Defaulted to nothing, so no other tab changes.
-    ///
-    /// A "loss" is that on-to-off capture edge, which equals "the gesture holder lost the
-    /// pointer" only because `RunsTab` is the sole view that wants the mouse. A second
-    /// [`wants_mouse`](Tab::wants_mouse) implementor must also handle a switch between two
-    /// capturing views (e.g. by tracking the capture holder), or the review-L3 stale anchor
-    /// returns.
+    /// or not, once per on-to-off edge, and (MOD-115 M2 MD8) once whenever the tab whose own
+    /// gesture held the mouse changes while capture stays on. Defaulted to nothing, so no other
+    /// tab changes.
     fn on_mouse_lost(&mut self) {}
+
+    /// The panes this tab has (MOD-115 M2 D2): one (the default: Chat, Settings, the test
+    /// doubles) or a list and a detail with the tab's default layout. A list + detail tab splits
+    /// its body with [`Ctx::split`](crate::app::Ctx::split), where the shell's layout for it
+    /// applies; on a single-pane tab the pane and layout keys do nothing.
+    fn panes(&self) -> Panes {
+        Panes::Single
+    }
+
+    /// Where this tab is (MOD-115 M2 D5): its sub-tab and its opaque cursor, for the history.
+    /// Defaulted to nowhere in particular, so only the tab itself is recorded.
+    fn location(&self) -> TabLoc {
+        TabLoc::default()
+    }
+
+    /// Goes back to `loc`, a [`location`](Tab::location) this tab gave (MOD-115 M2 D5): selects
+    /// the sub-tab and moves the cursor. `false` when nothing could be restored, which is what
+    /// the default says.
+    fn restore(&mut self, _loc: &TabLoc, _ctx: &mut Ctx<'_>) -> bool {
+        false
+    }
 }
 
 /// Every registered tab, in registration order, plus which one is active.

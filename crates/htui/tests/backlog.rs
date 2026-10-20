@@ -17,6 +17,7 @@ use htui::run_worker::{self, LiveChats, RunRuntime, StepAuthor};
 use htui::store_worker::StoreRequest;
 use htui::testkit::Harness;
 use htui::ui::tabs::backlog::BacklogTab;
+use htui::ui::tabs::registry::Tab;
 use htui_agent::conformance::{Script, ScriptEvent};
 use htui_agent::event::{DoneEvent, DriverEvent, StopReason};
 use htui_agent::fake::FakeAdapter;
@@ -1081,10 +1082,9 @@ fn listed<'a>(frame: &'a str, slot: &str) -> &'a str {
 async fn a_click_in_the_flow_moves_the_cursor_an_action_key_reads() {
     let mut harness = backlog().await;
     sub_tab(&mut harness, 1);
-    assert!(
-        !harness.app().wants_mouse(),
-        "the list keeps the terminal's selection"
-    );
+    // MOD-115 M2 MD8 (T7): the Backlog claims a list and a detail, so the shell takes the mouse
+    // for pane focus and seams whichever Runs view is shown.
+    assert!(harness.app().wants_mouse(), "a list + detail tab");
     harness.key("v");
     harness.drive_to_end().await;
     assert!(harness.app().wants_mouse(), "the flow wants the mouse");
@@ -1109,7 +1109,7 @@ async fn a_click_in_the_flow_moves_the_cursor_an_action_key_reads() {
 
     harness.key("v");
     harness.drive_to_end().await;
-    assert!(!harness.app().wants_mouse());
+    assert!(harness.app().wants_mouse(), "still a list + detail tab");
     let frame = harness.render();
     assert!(
         listed(&frame, "0.1/1").contains('\u{25b8}'),
@@ -1204,6 +1204,43 @@ async fn a_lost_capture_ends_the_flow_s_pan_end_to_end() {
         cell_of(&after, "0.1/0 done"),
         (column + 2, row + 1),
         "a bare drag pans nothing:\n{after}"
+    );
+}
+
+/// MOD-115 M2 §7, MD8 (T7 repair 2): with the list zoomed the flow is off screen, so a click on
+/// the list where the flow was last drawn moves no step cursor, and the wheel there is the list's
+/// motion, not the hidden graph's zoom.
+#[tokio::test]
+async fn a_click_on_the_zoomed_list_misses_the_hidden_flow() {
+    let mut harness = backlog().await;
+    sub_tab(&mut harness, 1);
+    harness.key("v");
+    harness.drive_to_end().await;
+    let (column, row) = cell_of(&harness.render(), "0.1/1 superseded");
+    harness.key("z");
+    let zoomed = harness.render();
+    assert!(
+        !zoomed.contains("0.1/1 superseded"),
+        "the list is zoomed and the flow hidden:\n{zoomed}"
+    );
+    assert!(
+        !harness.app().tabs.active().is_some_and(Tab::wants_mouse),
+        "the hidden flow wants no mouse"
+    );
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), column, row);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), column, row);
+
+    harness.key("z");
+    harness.key("v");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(
+        listed(&frame, "0.1/0").contains('\u{25b8}'),
+        "the cursor stayed on the first candidate:\n{frame}"
+    );
+    assert!(
+        !listed(&frame, "0.1/1").contains('\u{25b8}'),
+        "the click reached no hidden step:\n{frame}"
     );
 }
 
@@ -3443,4 +3480,169 @@ async fn a_rebound_save_key_is_named_by_the_item_form() {
         frame.contains("still behind v2; F2 compares again"),
         "the notice:\n{frame}"
     );
+}
+
+/// The row of `frame` that holds `needle`, from the top.
+fn row_of(frame: &str, needle: &str) -> Option<usize> {
+    frame.lines().position(|row| row.contains(needle))
+}
+
+/// MOD-115 M2 §7 (T7): `Tab` focuses the detail, where `j` scrolls the Body and the list cursor
+/// stays on its item; focused again, the list takes `j` as before.
+#[tokio::test]
+async fn with_the_detail_focused_j_scrolls_the_body_and_the_list_stays() {
+    let mut harness = backlog().await;
+    down(&mut harness, TO_FEAT_1).await;
+    let before = harness.render();
+    // The head block stays; the body below it scrolls.
+    let first = "Stand up the terminal application";
+    let second = "workspace-scoped shell with a tab strip";
+    let at = row_of(&before, second).expect("the body's second row");
+    assert!(before.contains(first), "{before}");
+
+    harness.key("tab");
+    harness.drive_to_end().await;
+    harness.key("j");
+    harness.drive_to_end().await;
+    let after = harness.render();
+    assert!(
+        after.contains("┌ FEAT-1"),
+        "the list cursor stayed:\n{after}"
+    );
+    assert!(
+        !after.contains(first),
+        "the body's first row scrolled off:\n{after}"
+    );
+    assert_eq!(row_of(&after, second), Some(at - 1), "a row:\n{after}");
+
+    // Detail -> list: the panes cycle, and `j` is the list's again.
+    harness.key("tab");
+    harness.drive_to_end().await;
+    harness.key("j");
+    harness.drive_to_end().await;
+    assert!(
+        !harness.render().contains("┌ FEAT-1"),
+        "the list moved on:\n{}",
+        harness.render()
+    );
+}
+
+/// MOD-115 M2 D5 (T7): a sub-tab change is a place in the history; Back returns to the sub-tab
+/// left and the item the cursor was on then, and Forward to the one it moved to since.
+#[tokio::test]
+async fn back_returns_to_the_sub_tab_and_the_item_left() {
+    let mut harness = backlog().await;
+    down(&mut harness, TO_FEAT_1).await;
+    sub_tab(&mut harness, 1);
+    harness.drive_to_end().await;
+    down(&mut harness, 1).await;
+    let runs = harness.render();
+    assert!(!runs.contains("┌ FEAT-1"), "the cursor moved on:\n{runs}");
+    assert!(
+        runs.contains("\u{232b} back"),
+        "the header offers the way back:\n{runs}"
+    );
+
+    harness.key("backspace");
+    harness.drive_to_end().await;
+    let body = harness.render();
+    assert!(body.contains("┌ FEAT-1"), "back on FEAT-1:\n{body}");
+    assert!(
+        body.contains("FEAT-1  FEAT  in_progress"),
+        "on its Body:\n{body}"
+    );
+
+    harness.key("alt-right");
+    harness.drive_to_end().await;
+    let forward = harness.render();
+    assert!(
+        !forward.contains("┌ FEAT-1"),
+        "forward to the item left:\n{forward}"
+    );
+    assert!(
+        !forward.contains("FEAT-1  FEAT  in_progress"),
+        "and off the Body:\n{forward}"
+    );
+}
+
+/// Presses each of `keys`, serving and drawing a frame after each as the app does, so the focus
+/// cycle reads the panes on screen.
+async fn press(harness: &mut Harness, keys: &[&str]) {
+    for key in keys {
+        harness.key(key);
+        harness.drive_to_end().await;
+        harness.render();
+    }
+}
+
+/// MOD-115 M2 §7 (T7 repair): a sub-tab's compose area takes every key, so with the list zoomed
+/// Notes' `a` draws it over the zoomed list.
+#[tokio::test]
+async fn a_compose_opened_with_the_list_zoomed_is_on_screen() {
+    let mut harness = backlog().await;
+    down(&mut harness, TO_FEAT_1).await;
+    sub_tab(&mut harness, 4);
+    harness.drive_to_end().await;
+    press(&mut harness, &["a"]).await;
+    let compose = harness.render();
+    assert!(
+        compose.contains(" New note "),
+        "the compose area:\n{compose}"
+    );
+    press(&mut harness, &["esc", "z"]).await;
+    let zoomed = harness.render();
+    assert!(
+        !zoomed.contains("Notes Prompt"),
+        "the list is zoomed:\n{zoomed}"
+    );
+    press(&mut harness, &["a"]).await;
+    let frame = harness.render();
+    assert!(
+        frame.contains(" New note "),
+        "the compose area is drawn:\n{frame}"
+    );
+}
+
+/// MOD-115 M2 §7 (T7 repair): the filter form takes every key, so with the activity pane zoomed
+/// `f` draws it at the bottom of the zoomed pane, not into the detail's empty rect.
+#[tokio::test]
+async fn the_filter_opened_with_the_activity_zoomed_is_on_screen() {
+    let mut harness = backlog().await;
+    press(&mut harness, &["p", "tab", "tab", "z"]).await;
+    let zoomed = harness.render();
+    assert!(
+        zoomed.contains("Activity") && !zoomed.contains("htui"),
+        "the activity pane is zoomed:\n{zoomed}"
+    );
+    press(&mut harness, &["f"]).await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} Filter "),
+        "the form is drawn:\n{frame}"
+    );
+}
+
+/// MOD-115 M2 §7, RV3 (review M3): with the activity pane zoomed, the filter form takes the
+/// bottom of the zoomed pane and the list it filters is drawn above it, not a blank body.
+#[tokio::test]
+async fn the_list_is_drawn_above_the_filter_opened_with_the_activity_zoomed() {
+    let mut harness = backlog().await;
+    press(&mut harness, &["p", "tab", "tab", "z"]).await;
+    let zoomed = harness.render();
+    assert!(
+        zoomed.contains("Activity") && !zoomed.contains("htui"),
+        "the activity pane is zoomed:\n{zoomed}"
+    );
+    press(&mut harness, &["f"]).await;
+    let frame = harness.render();
+    let lines: Vec<&str> = frame.lines().collect();
+    let form = lines
+        .iter()
+        .position(|line| line.contains("\u{250c} Filter "))
+        .unwrap_or_else(|| panic!("the form is drawn:\n{frame}"));
+    let list = lines
+        .iter()
+        .position(|line| line.contains("htui"))
+        .unwrap_or_else(|| panic!("the list is drawn:\n{frame}"));
+    assert!(list < form, "the list is above the form:\n{frame}");
 }

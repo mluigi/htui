@@ -77,7 +77,7 @@ use serde_json::Value;
 
 use self::execution_graph::{ExecutionGraph, by_step, drawable};
 use crate::app::{Action, Ctx, Handled};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, is_plain, views};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::run_worker::{Enabled, FrameKind, ItemActions, ORCH_NAMES, OrchReply, OrchRequest};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
@@ -86,7 +86,7 @@ use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, messa
 use crate::ui::tabs::chat::permission::PermissionStrip;
 use crate::ui::tabs::settings::{key_line, modal_rest};
 use crate::ui::text_field::{FieldOutcome, TextField};
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 
 /// What an action key says while the verdicts it reads have not arrived.
 pub const NOT_LOADED: &str = "the run actions have not loaded yet";
@@ -145,10 +145,11 @@ const CONFIRM_CANCEL_HINT: HintSpec = &[
 /// What the close-out says while it counts.
 const COUNTING_HINT: HintSpec = &[Hint::Text("counting what the close-out writes\u{2026}")];
 
-/// The close-out warning's hint: the resolution's fixed value keys, then its answers
-/// (`←/→ resolution · y continue · n cancel` under the defaults).
+/// The close-out warning's hint: the resolution's `choice.prev`/`next`, then its answers
+/// (`←/→ resolution · y continue · n cancel` under the defaults; MOD-115 M2 RV1 H2: the keys
+/// in force).
 const WARN_HINT: HintSpec = &[
-    Hint::Text("←/→ resolution"),
+    Hint::Glyphs(Act::ChoicePrev, Act::ChoiceNext, "resolution"),
     Hint::One(Act::ConfirmYes, "continue"),
     Hint::One(Act::ConfirmNo, "cancel"),
 ];
@@ -176,14 +177,24 @@ const RUNS_EMPTY_HINT: HintSpec = &[
     Hint::One(Act::Help, "keys"),
 ];
 
-/// The rejection note's hint: the field's own keys.
-const REJECT_HINT: HintSpec = &[Hint::Text("Enter reject"), Hint::Text("Esc cancel")];
+/// The rejection note's hint: the field's own keys, `field.submit` through the keys in force
+/// (MOD-115 M2 RV1 H2) and `Esc` as written (MD7).
+const REJECT_HINT: HintSpec = &[
+    Hint::One(Act::FieldSubmit, "reject"),
+    Hint::Text("Esc cancel"),
+];
 
-/// The follow-up input's hint: the field's own keys.
-const FOLLOW_UP_HINT: HintSpec = &[Hint::Text("Enter send"), Hint::Text("Esc cancel")];
+/// The follow-up input's hint: the field's own keys, as [`REJECT_HINT`].
+const FOLLOW_UP_HINT: HintSpec = &[
+    Hint::One(Act::FieldSubmit, "send"),
+    Hint::Text("Esc cancel"),
+];
 
-/// The close-out's typed stage's hint: the field's own keys.
-const TYPED_HINT: HintSpec = &[Hint::Text("Enter close"), Hint::Text("Esc cancel")];
+/// The close-out's typed stage's hint: the field's own keys, as [`REJECT_HINT`].
+const TYPED_HINT: HintSpec = &[
+    Hint::One(Act::FieldSubmit, "close"),
+    Hint::Text("Esc cancel"),
+];
 
 /// What the close-out says while its command is in flight.
 const IN_FLIGHT_HINT: HintSpec = &[Hint::Text("closing\u{2026}")];
@@ -698,9 +709,8 @@ impl RunsTab {
             | Mode::CloseOut(CloseOutStage::Typed { .. } | CloseOutStage::InFlight) => {
                 views::CAPTURE
             }
-            Mode::ConfirmCancel { .. } | Mode::CloseOut(CloseOutStage::Warn(_)) => {
-                views::RUNS_CONFIRM
-            }
+            Mode::ConfirmCancel { .. } => views::RUNS_CANCEL,
+            Mode::CloseOut(CloseOutStage::Warn(_)) => views::RUNS_CONFIRM,
             Mode::CloseOut(CloseOutStage::Counting) => views::RUNS_COUNTING,
             Mode::Artifact { .. } => views::RUNS_ARTIFACT,
         }
@@ -1105,8 +1115,9 @@ fn cycle(status: Status, current: Resolution, forward: bool) -> Resolution {
 /// leaves the pane in, and whether the key was used.
 ///
 /// Counting and warning leave on `confirm.no` (`n`/`Esc`), the warning goes on with
-/// `confirm.yes` (`y`); the warning's `←`/`→` (and `h`/`l`) pick the resolution (MOD-39 plan
-/// P13), fixed value keys matched on plain keys before the resolver (MOD-67 M5); the typed stage
+/// `confirm.yes` (`y`); the warning's `choice.prev`/`next` (`←`/`→`, `h`/`l`) pick the
+/// resolution, and `choice.toggle` (Space) steps forward (MOD-39 plan P13, MOD-115 M2 D7); the
+/// typed stage
 /// leaves on `Esc` only, because `n` is a letter there; in flight, every key waits for the
 /// answer. A key no stage used is `modal_rest`'s.
 fn close_out_key(
@@ -1122,30 +1133,23 @@ fn close_out_key(
             Some(Act::ConfirmNo) => return (Mode::Browse, Handled::Consumed),
             _ => (CloseOutStage::Counting, modal_rest(stack, chord)),
         },
-        CloseOutStage::Warn(mut preview) => {
-            let forward = match key.code {
-                KeyCode::Right | KeyCode::Char('l') => Some(true),
-                KeyCode::Left | KeyCode::Char('h') => Some(false),
-                _ => None,
-            };
-            match forward.filter(|_| is_plain(&key)) {
-                Some(forward) => {
-                    preview.resolution = cycle(preview.status, preview.resolution, forward);
-                    (CloseOutStage::Warn(preview), Handled::Consumed)
-                }
-                None => match ctx.keys().actions(stack, chord).first() {
-                    Some(Act::ConfirmYes) => (
-                        CloseOutStage::Typed {
-                            preview,
-                            field: TextField::new(),
-                        },
-                        Handled::Consumed,
-                    ),
-                    Some(Act::ConfirmNo) => return (Mode::Browse, Handled::Consumed),
-                    _ => (CloseOutStage::Warn(preview), modal_rest(stack, chord)),
-                },
+        CloseOutStage::Warn(mut preview) => match ctx.keys().actions(stack, chord).first() {
+            // `choice.toggle` (Space) steps forward, as the `?` box's `Space toggle` says.
+            Some(&act @ (Act::ChoiceNext | Act::ChoicePrev | Act::ChoiceToggle)) => {
+                let forward = act != Act::ChoicePrev;
+                preview.resolution = cycle(preview.status, preview.resolution, forward);
+                (CloseOutStage::Warn(preview), Handled::Consumed)
             }
-        }
+            Some(Act::ConfirmYes) => (
+                CloseOutStage::Typed {
+                    preview,
+                    field: TextField::new(),
+                },
+                Handled::Consumed,
+            ),
+            Some(Act::ConfirmNo) => return (Mode::Browse, Handled::Consumed),
+            _ => (CloseOutStage::Warn(preview), modal_rest(stack, chord)),
+        },
         CloseOutStage::Typed { preview, mut field } => match field.on_key(key) {
             FieldOutcome::Submit if field.text() == Some(preview.key.as_str()) => {
                 ctx.request(command(Command::CloseOut {
@@ -1505,7 +1509,7 @@ fn strip_options(options: &[RelayOption]) -> Vec<PermissionOption> {
 
 /// MOD-42 plan D14: the two lines under a step with a pending request, each exactly [`PANE`]
 /// wide: `asks: <summary>` from the status column, then the answer strip.
-fn permission_lines(pending: &StepPermission, theme: &Theme) -> [Line<'static>; 2] {
+fn permission_lines(pending: &StepPermission, keys: &Keys, theme: &Theme) -> [Line<'static>; 2] {
     let summary = pending.summary.as_deref().unwrap_or(NO_SUMMARY);
     let asks = Line::from(vec![
         Span::raw(blank(INDENT)),
@@ -1515,7 +1519,13 @@ fn permission_lines(pending: &StepPermission, theme: &Theme) -> [Line<'static>; 
         ),
     ]);
     let mut spans = cells::clip_spans(
-        &PermissionStrip::line(&strip_options(&pending.options), theme).spans,
+        &PermissionStrip::line(
+            &strip_options(&pending.options),
+            keys,
+            views::RUNS_BROWSE,
+            theme,
+        )
+        .spans,
         PANE,
     );
     let used: usize = spans.iter().map(|span| cell_width(&span.content)).sum();
@@ -1668,11 +1678,18 @@ impl DetailTab for RunsTab {
         if !matches!(self.mode, Mode::Browse) {
             return self.modal_key(key, ctx);
         }
-        // MOD-42 D14: while the step under the cursor has a pending request, every plain digit is
-        // this pane's, as the chat's parked strip takes them (`chat/mod.rs`); otherwise digits pass
-        // to the global tab select. A fixed key of MOD-67 D5, ahead of the resolver.
-        if is_plain(&key)
-            && let KeyCode::Char(digit @ '1'..='9') = key.code
+        let chord = KeyChord::from_event(key);
+        // MOD-42 D14: while the step under the cursor has a pending request, `answer.option_*`
+        // (the digits) is this pane's, as the chat's parked strip takes it (`chat/mod.rs`);
+        // otherwise the chord passes on, and a digit selects a tab (MOD-115 M2 D7: no fixed key).
+        if let Some(index) = ctx
+            .keys()
+            .actions(self.stack(), chord)
+            .first()
+            .and_then(|act| act.answer_index())
+            && let Some(digit) = u32::try_from(index + 1)
+                .ok()
+                .and_then(|n| char::from_digit(n, 10))
             && let Some(pending) = self.pending_under_cursor()
         {
             // One answer per request: a digit while it is in flight is swallowed.
@@ -1689,7 +1706,6 @@ impl DetailTab for RunsTab {
             }
             return Handled::Consumed;
         }
-        let chord = KeyChord::from_event(key);
         for act in ctx.keys().actions(self.stack(), chord) {
             match act {
                 Act::RunsNextStep => {
@@ -1748,6 +1764,14 @@ impl DetailTab for RunsTab {
 
     fn captures_input(&self) -> bool {
         !matches!(self.mode, Mode::Browse)
+    }
+
+    /// MOD-115 M2 §7: the list's motion moves the step cursor while the detail is focused, as
+    /// its own `J`/`K` (`Act::RunsNextStep`/`RunsPrevStep`) do; the flow follows it.
+    fn step(&mut self, step: super::Step, ctx: &Ctx<'_>) -> Handled {
+        self.move_cursor(step.delta());
+        self.sync_graph(ctx.theme);
+        Handled::Consumed
     }
 
     fn key_stack(&self) -> Stack<'static> {
@@ -1964,7 +1988,7 @@ impl DetailTab for RunsTab {
             return;
         }
         if self.view == View::Flow {
-            self.render_flow(frame, list, area, ctx.theme);
+            self.render_flow(frame, list, area, ctx.keys(), ctx.theme);
             return;
         }
 
@@ -1974,7 +1998,7 @@ impl DetailTab for RunsTab {
         let [head, body] =
             Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(list);
         frame.render_widget(Paragraph::new(Vec::from(header_lines(ctx.theme))), head);
-        let (lines, cursor_end) = self.list_lines(ctx.theme);
+        let (lines, cursor_end) = self.list_lines(ctx.keys(), ctx.theme);
         let skip = cursor_end.saturating_sub(usize::from(body.height));
         frame.render_widget(
             Paragraph::new(lines).scroll((u16::try_from(skip).unwrap_or(u16::MAX), 0)),
@@ -1988,11 +2012,18 @@ impl RunsTab {
     /// run and step, and the rest is the canvas, or "No steps yet." under a run with none. `pane`
     /// is the whole pane, footer included, whose size alone decides a resize reveal (MOD-71 D7,
     /// review M1).
-    fn render_flow(&self, frame: &mut Frame<'_>, area: Rect, pane: Rect, theme: &Theme) {
+    fn render_flow(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        pane: Rect,
+        keys: &Keys,
+        theme: &Theme,
+    ) {
         let Some(run) = self.entry_run() else {
             return;
         };
-        let lines = self.flow_head(run, theme);
+        let lines = self.flow_head(run, keys, theme);
         let [head, canvas] = Layout::vertical([
             Constraint::Length(u16::try_from(lines.len()).unwrap_or(u16::MAX)),
             Constraint::Min(0),
@@ -2016,7 +2047,7 @@ impl RunsTab {
     /// command), the step's parked reason, how its chat opened, the pending request the digits
     /// answer, so a digit in the flow never answers a request the pane does not show, and its
     /// follow-up's lines (MOD-70 D14: queued, sent or refused with its reason).
-    fn flow_head(&self, run: &RunSummary, theme: &Theme) -> Vec<Line<'static>> {
+    fn flow_head(&self, run: &RunSummary, keys: &Keys, theme: &Theme) -> Vec<Line<'static>> {
         let mut lines = run_lines(run, self.cancel_requested(run.id), theme);
         if self.waiting.contains(&run.id) {
             lines.push(Line::styled(cells::fit(WAITING_LINE, PANE), theme.warning));
@@ -2025,7 +2056,7 @@ impl RunsTab {
             lines.extend(note_line(step, theme));
             lines.extend(opening_lines(step, theme));
             if let Some(pending) = self.pending_on(step.id) {
-                lines.extend(permission_lines(pending, theme));
+                lines.extend(permission_lines(pending, keys, theme));
             }
             if let Some(view) = self.follow_up_on(step.id) {
                 lines.extend(follow_up_lines(view, theme));
@@ -2036,7 +2067,7 @@ impl RunsTab {
 
     /// The runs from the first visible one, each with its steps, and the line index just past the
     /// cursor's entry (0 with no cursor): what the list has to show to keep the cursor in view.
-    fn list_lines(&self, theme: &Theme) -> (Vec<Line<'static>>, usize) {
+    fn list_lines(&self, keys: &Keys, theme: &Theme) -> (Vec<Line<'static>>, usize) {
         let cursor = self.entry();
         let step_cursor = self.selected_step();
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -2064,7 +2095,7 @@ impl RunsTab {
                 // MOD-42 D14: the request's two lines belong to the step, so the cursor's end
                 // counts them and the scroll keeps them in view.
                 if let Some(pending) = self.pending_on(step.id) {
-                    lines.extend(permission_lines(pending, theme));
+                    lines.extend(permission_lines(pending, keys, theme));
                 }
                 // MOD-70 D14: so do the follow-up's.
                 if let Some(view) = self.follow_up_on(step.id) {
@@ -2143,7 +2174,7 @@ mod tests {
     use crate::run_worker::{RunActions, RunFrame, StepActions};
     use crate::store_worker::Origin;
     use chrono::TimeDelta;
-    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use htui_core::fixtures::{demo_at, ids};
     use htui_core::model::{
         FOLLOW_UP_EMPTY, FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_CANCELLED,
@@ -2251,6 +2282,31 @@ mod tests {
             Some(ids::STEP_PRD),
             "and stops on the first going back"
         );
+    }
+
+    /// MOD-115 M2 §7: with the detail focused the list's motion moves the step cursor, a row as
+    /// `J` and `K` do, or to either end; nothing is asked of the store.
+    #[tokio::test]
+    async fn a_step_moves_the_step_cursor_as_j_and_k_do() {
+        use crate::ui::tabs::backlog::detail::Step;
+
+        let shell = Shell::new();
+        let mut pane = pane(&shell).await;
+        assert_eq!(pane.step(Step::Down, &shell.ctx()), Handled::Consumed);
+        assert_eq!(pane.selected_step(), Some(ids::STEP_PLAN), "a row, as `J`");
+        assert_eq!(pane.step(Step::Bottom, &shell.ctx()), Handled::Consumed);
+        assert_eq!(
+            pane.selected_step(),
+            Some(ids::STEP_REVIEW),
+            "the last step"
+        );
+        assert_eq!(pane.step(Step::Down, &shell.ctx()), Handled::Consumed);
+        assert_eq!(pane.selected_step(), Some(ids::STEP_REVIEW), "clamped");
+        assert_eq!(pane.step(Step::Top, &shell.ctx()), Handled::Consumed);
+        assert_eq!(pane.selected_step(), Some(ids::STEP_PRD), "the first step");
+        assert_eq!(pane.step(Step::Up, &shell.ctx()), Handled::Consumed);
+        assert_eq!(pane.selected_step(), Some(ids::STEP_PRD), "clamped");
+        assert!(shell.emit.take().is_empty(), "a cursor move reads nothing");
     }
 
     #[tokio::test]
@@ -2591,7 +2647,7 @@ mod tests {
             Some("execute: cargo test"),
             two_options(),
         );
-        let [asks, _] = permission_lines(&pending, &theme);
+        let [asks, _] = permission_lines(&pending, Keys::compiled(), &theme);
         assert_eq!(styles(&asks), [theme.warning], "the asks: line");
 
         let shell = Shell::new();
@@ -2604,7 +2660,7 @@ mod tests {
             }),
             &mut shell.ctx(),
         );
-        let (listed, _) = pane.list_lines(&theme);
+        let (listed, _) = pane.list_lines(Keys::compiled(), &theme);
         let waiting = listed
             .iter()
             .find(|line| text(line).trim() == WAITING_LINE)
@@ -2615,7 +2671,7 @@ mod tests {
             .iter()
             .find(|run| run.id == ids::RUN_1)
             .expect("RUN_1 is listed");
-        let head = pane.flow_head(run, &theme);
+        let head = pane.flow_head(run, Keys::compiled(), &theme);
         let waiting = head
             .iter()
             .find(|line| text(line).trim() == WAITING_LINE)
@@ -2646,7 +2702,7 @@ mod tests {
     /// The text of the list's lines, trailing blanks trimmed: every line, where [`lines`] stops at
     /// the test terminal's sixteen rows.
     fn list_text(pane: &RunsTab, theme: &Theme) -> Vec<String> {
-        pane.list_lines(theme)
+        pane.list_lines(Keys::compiled(), theme)
             .0
             .iter()
             .map(|line| text(line).trim_end().to_owned())
@@ -3159,7 +3215,7 @@ mod tests {
             option("reject", "Reject once", RelayOptionKind::RejectOnce),
         ];
         let pending = pending_on(ids::RUN_1, ids::STEP_PRD, Some(&summary), options);
-        for line in permission_lines(&pending, &theme) {
+        for line in permission_lines(&pending, Keys::compiled(), &theme) {
             let used: usize = line
                 .spans
                 .iter()
@@ -3682,6 +3738,14 @@ mod tests {
         assert_eq!(
             footer(&pane),
             ["cancel this run?", "y cancel it · n keep it"]
+        );
+        // T5 repair: the question answers only yes or no, so its `?` box lists no choice keys.
+        assert_eq!(pane.stack(), views::RUNS_CANCEL);
+        assert!(
+            Keys::compiled()
+                .help_lines(pane.stack(), |_| false)
+                .iter()
+                .all(|line| line.heading != "Choice")
         );
 
         for swallowed in ['q', 'j', 'x', '1'] {
@@ -4658,7 +4722,7 @@ mod tests {
         pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
         let run = pane.runs[0].clone();
         let head: Vec<String> = pane
-            .flow_head(&run, &shell.theme)
+            .flow_head(&run, Keys::compiled(), &shell.theme)
             .iter()
             .map(|line| text(line).trim_end().to_owned())
             .collect();
@@ -5593,6 +5657,124 @@ mod tests {
         );
     }
 
+    /// MOD-115 M2 D7: the answers are `answer.option_*` rows: a rebound option answers, and its
+    /// old digit passes on (it selects a tab).
+    #[tokio::test]
+    async fn a_rebound_answer_answers_and_its_old_digit_passes() {
+        let mut shell = Shell::new();
+        shell.keys = crate::keys::load_str("version = 2\n[answer]\noption_2 = \"f8\"\n")
+            .expect("the keys load");
+        let (mut pane, pending) = asking(&shell).await;
+        // RV1 H2: the request's options name the answers in force.
+        let [_, options] = permission_lines(&pending, &shell.keys, &Theme::default());
+        let options = text(&options);
+        assert!(
+            options.contains("[1] Allow once") && options.contains("[F8] Reject once"),
+            "{options:?}"
+        );
+        assert!(!options.contains("[2]"), "{options:?}");
+        assert_eq!(
+            pane.on_key(key(KeyCode::Char('2')), &mut shell.ctx()),
+            Handled::Pass
+        );
+        assert!(
+            requests(shell.emit.take()).is_empty(),
+            "`2` answers nothing"
+        );
+        assert_eq!(
+            pane.on_key(key(KeyCode::F(8)), &mut shell.ctx()),
+            Handled::Consumed
+        );
+        let sent = requests(shell.emit.take());
+        assert!(
+            matches!(sent.as_slice(), [StoreRequest::AnswerPermission { permission, option_id }]
+                if *permission == pending.id && option_id == "reject"),
+            "the second option's id: {sent:?}"
+        );
+    }
+
+    /// MOD-115 M2 RV1 H2: the rejection note, the follow-up and the close-out's typed stage name
+    /// the submit key in force (`Enter` under the compiled keys); `Esc` is written as is (MD7).
+    #[test]
+    fn the_field_hints_name_the_submit_key_in_force() {
+        let keys = crate::keys::load_str("version = 2\n[field]\nsubmit = \"ctrl-t\"\n")
+            .expect("the keys load");
+        for (spec, verb) in [
+            (REJECT_HINT, "reject"),
+            (FOLLOW_UP_HINT, "send"),
+            (TYPED_HINT, "close"),
+        ] {
+            assert_eq!(
+                Keys::compiled().hint(views::CAPTURE, spec),
+                format!("Enter {verb} \u{b7} Esc cancel")
+            );
+            assert_eq!(
+                keys.hint(views::CAPTURE, spec),
+                format!("Ctrl+t {verb} \u{b7} Esc cancel")
+            );
+        }
+    }
+
+    /// MOD-115 M2 D7: the close-out warning's resolution keys are the `[choice]` rows: a rebound
+    /// one cycles the resolution, the old letter no longer does.
+    #[tokio::test]
+    async fn a_rebound_resolution_key_cycles_and_the_old_letter_does_not() {
+        let mut shell = Shell::new();
+        shell.keys = crate::keys::load_str("version = 2\n[choice]\nnext = \"ctrl-n\"\n")
+            .expect("the keys load");
+        let mut pane = warned(&shell).await;
+        // RV1 H2: the warning's hint names the resolution keys in force.
+        assert_eq!(
+            shell.keys.hint(pane.stack(), pane.hint_spec()),
+            "\u{2190}/Ctrl+n resolution \u{b7} y continue \u{b7} n cancel"
+        );
+        assert_eq!(
+            Keys::compiled().hint(pane.stack(), pane.hint_spec()),
+            "\u{2190}/\u{2192} resolution \u{b7} y continue \u{b7} n cancel"
+        );
+        let before = footer(&pane);
+        pane.on_key(key(KeyCode::Char('l')), &mut shell.ctx());
+        assert_eq!(footer(&pane), before, "`l` is no resolution key now");
+        pane.on_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            &mut shell.ctx(),
+        );
+        let after = footer(&pane);
+        assert_ne!(after, before, "`ctrl-n` cycles the resolution");
+        // `choice.toggle` steps forward too, as the `?` box lists it.
+        pane.on_key(key(KeyCode::Char(' ')), &mut shell.ctx());
+        assert_ne!(footer(&pane), after, "Space cycles the resolution");
+    }
+
+    /// MOD-115 M2 RV1 repair 1 (MD4): before M2 the warning took only its arrows and `h`/`l`,
+    /// so a version-1 `[confirm] yes = ["space"]` continued it on `Space`, and still does:
+    /// `choice.toggle` steps aside here, and the hint names `Space` as the continue key.
+    #[tokio::test]
+    async fn a_version_1_yes_on_space_continues_the_warning() {
+        let mut shell = Shell::new();
+        shell.keys =
+            crate::keys::load_str("version = 1\n[confirm]\nyes = [\"space\"]\n").expect("loads");
+        let mut pane = warned(&shell).await;
+        assert_eq!(
+            shell.keys.hint(pane.stack(), pane.hint_spec()),
+            "\u{2190}/\u{2192} resolution \u{b7} Space continue \u{b7} n cancel"
+        );
+        let resolution = picked(&pane);
+        assert_eq!(
+            pane.on_key(key(KeyCode::Char(' ')), &mut shell.ctx()),
+            Handled::Consumed
+        );
+        assert!(
+            matches!(
+                &pane.mode,
+                Mode::CloseOut(CloseOutStage::Typed { preview, .. })
+                    if preview.resolution == resolution
+            ),
+            "Space continues: {:?}",
+            pane.mode
+        );
+    }
+
     /// D14: a second digit while the first answer is in flight sends nothing. Its
     /// `AnswerPermission` would supersede the first in the app's staleness gate
     /// (`App::dispatch`), so the first answer's `PermissionAnswered` would be dropped and the
@@ -5793,7 +5975,7 @@ mod tests {
             (Some("edit: src/lib.rs"), four),
         ] {
             let pending = pending_on(ids::RUN_1, ids::STEP_PRD, summary, options);
-            let [asks, strip] = permission_lines(&pending, &theme);
+            let [asks, strip] = permission_lines(&pending, Keys::compiled(), &theme);
             for line in [&asks, &strip] {
                 assert_eq!(
                     line.width(),

@@ -33,7 +33,7 @@ use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::{READ_NAME, REQUEST_NAMES, TemplateBody, TemplatesSnapshot};
 use crate::ui::cells::{self, cell_width};
-use crate::ui::tabs::backlog::detail::Scroll;
+use crate::ui::tabs::backlog::detail::{Scroll, Step, capture_area};
 use crate::ui::tabs::settings::{modal_rest, wrapped};
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme, diff};
 use crossterm::event::KeyEvent;
@@ -43,10 +43,6 @@ const SAVE_NAME: &str = REQUEST_NAMES[1];
 
 /// How many rows the notice may wrap to before it is cut; one when it fits.
 const NOTICE_LINES: usize = 2;
-
-/// The tree's width, borders included: two spaces, the name fitted to [`NAME_WIDTH`] cells, ` v`,
-/// a head of up to three digits, a space and the role make at most 28 cells.
-const LIST_WIDTH: u16 = 32;
 
 /// A template row's name field, in cells: a name is fitted to it with `cells::fit`, so the head
 /// and the role stay on the row and in their columns.
@@ -621,6 +617,10 @@ impl TemplatesView {
     /// Browse (plan D13; MOD-67 M4, blueprint §6.1): the first candidate through
     /// [`views::TEMPLATES_BROWSE`] this view acts on; a global act is the shell's. The tab took
     /// `skills.switch_view` first.
+    ///
+    /// MOD-115 M2 §7: only motion follows the focus ([`Step::by_focus`]): the tree's cursor
+    /// with the tree focused, the pane's scroll with the pane focused, nothing with the activity
+    /// pane focused. Every other act acts whatever pane is focused.
     fn on_browse_key(
         &mut self,
         key: KeyEvent,
@@ -628,7 +628,11 @@ impl TemplatesView {
         ctx: &mut Ctx<'_>,
     ) -> Handled {
         let chord = KeyChord::from_event(key);
+        let (focus, rows) = (ctx.focus(), self.pane_rows.get());
         for act in ctx.keys().actions(stack, chord) {
+            if Step::by_focus(act, focus, |step| self.scroll.follow(step, rows)) {
+                return Handled::Consumed;
+            }
             match act {
                 Act::ListDown => self.move_cursor(true),
                 Act::ListUp => self.move_cursor(false),
@@ -1077,6 +1081,49 @@ impl TemplatesView {
         self.notice = None;
     }
 
+    /// The row under the cursor, for the tab's history location (MOD-115 M2 §8): its index and
+    /// what it holds (RV3), `{index}:{project}:{name}` on a template, `{index}:{project}` on a
+    /// project header, so Back finds the row again after a create moved it.
+    pub(super) fn location_cursor(&self) -> String {
+        match self.rows().into_iter().nth(self.cursor) {
+            Some(Row::Template { project, name }) => format!("{}:{project}:{name}", self.cursor),
+            Some(Row::Project(project)) => format!("{}:{project}", self.cursor),
+            None => self.cursor.to_string(),
+        }
+    }
+
+    /// MOD-115 M2 §8: the cursor back on a [`location_cursor`](Self::location_cursor): onto its
+    /// template or header wherever the tree now holds it, else on its row (clamped to the
+    /// tree), the head's body shown from its top, as a move shows it. Only while browsing with
+    /// no draft handed off: the name prompt and an editor keep their row. Whether it moved; a
+    /// cursor with no row moves nothing.
+    pub(super) fn restore_cursor(&mut self, cursor: &str) -> bool {
+        let mut parts = cursor.splitn(3, ':');
+        let Some(Ok(index)) = parts.next().map(str::parse::<usize>) else {
+            return false;
+        };
+        let held = match (parts.next().map(str::parse), parts.next()) {
+            (Some(Ok(project)), Some(name)) => Some(Row::Template {
+                project,
+                name: name.to_owned(),
+            }),
+            (Some(Ok(project)), None) => Some(Row::Project(project)),
+            _ => None,
+        };
+        if !matches!(self.mode, Mode::Browse) || self.handed_off().is_some() {
+            return false;
+        }
+        let rows = self.rows();
+        self.cursor = held
+            .and_then(|held| rows.iter().position(|row| *row == held))
+            .unwrap_or_else(|| index.min(rows.len().saturating_sub(1)));
+        self.shown = None;
+        self.base = None;
+        self.pane = Pane::Body;
+        self.scroll.reset();
+        true
+    }
+
     /// Keeps the cursor on a row after the tree changed.
     fn clamp_cursor(&mut self) {
         self.cursor = self.cursor.min(self.rows().len().saturating_sub(1));
@@ -1153,8 +1200,14 @@ impl TemplatesView {
     /// Browse and Naming: the tree on the left, the pane on the right.
     fn render_browse(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let theme = ctx.theme;
-        let [list_area, pane_area] =
-            Layout::horizontal([Constraint::Length(LIST_WIDTH), Constraint::Min(1)]).areas(area);
+        // MOD-115 M2 B5: the panes the shell's layout gives the tab, claimed for the focus
+        // borders, the hints and the mouse; today's 32-cell list by default. A hidden pane is an
+        // empty rect, which draws nothing.
+        let areas = ctx.split(area, super::library::LAYOUT);
+        // T7 repair: the name prompt takes every key, so with another pane zoomed the pane is
+        // drawn over the zoomed one rather than into its own empty rect.
+        let (list_area, pane_area) = capture_area(&areas, area, !matches!(self.mode, Mode::Browse));
+        let list_area = list_area.unwrap_or_default();
 
         let list = Block::new().borders(Borders::ALL).title(" Templates ");
         let inner = list.inner(list_area);
@@ -1404,6 +1457,12 @@ mod tests {
 
     use super::*;
 
+    /// The tree's width, borders included: two spaces, the name fitted to [`NAME_WIDTH`] cells,
+    /// ` v`, a head of up to three digits, a space and the role make at most 28 cells. The view
+    /// draws the Skills tab's shared layout (`library::LAYOUT`, MOD-115 M2 D2), which
+    /// `the_browse_frame_claims_the_32_cell_list` pins to this width.
+    const LIST_WIDTH: u16 = 32;
+
     /// MOD-67 M6 D4: the Templates notices name the key in force, and drop it unbound.
     #[test]
     fn the_templates_notices_name_their_key_or_none() {
@@ -1432,6 +1491,7 @@ mod tests {
     use crate::ui::Theme;
     use crate::ui::cells::cell_width;
     use crate::ui::tabs::SkillsTab;
+    use crate::ui::tabs::registry::Tab as _;
     use crate::ui::tabs::skills::agent_help::fixtures as agent_fixtures;
     use crossterm::event::{KeyCode, KeyModifiers};
     use htui_agent::event::StopReason;
@@ -2258,5 +2318,192 @@ mod tests {
         assert!(editor(&view).help.is_none());
         view.on_key(key('z'), &mut ctx);
         assert_eq!(editor(&view).area.text(), format!("z{before}"));
+    }
+
+    // ---- MOD-115 M2 T7: the panes, motion by focus, the location ---------------------------
+
+    /// A view browsing the demo tree, the cursor on its first row.
+    async fn browsing(bench: &Bench) -> TemplatesView {
+        let backend = Backend::memory(MemStore::demo());
+        let mut view = TemplatesView::default();
+        let reply = serve(&backend, StoreRequest::Templates(bench.scope.clone())).await;
+        view.on_reply(&reply, &mut bench.ctx());
+        assert!(
+            view.rows().len() >= 3,
+            "the demo tree has rows to move over"
+        );
+        view
+    }
+
+    /// MOD-115 M2 D2: the Templates view shares the Skills tab's layout, the 32-cell list both
+    /// views drew, and its browse frame claims exactly the old `[Length(32), Min(1)]` split.
+    #[tokio::test]
+    async fn the_browse_frame_claims_the_32_cell_list() {
+        use crate::ui::shell::ListSize;
+        assert_eq!(LIST_WIDTH, 32);
+        assert_eq!(
+            super::super::library::LAYOUT.list,
+            ListSize::Cells(LIST_WIDTH)
+        );
+
+        let bench = Bench::new();
+        let view = browsing(&bench).await;
+        let claim = Cell::new(None);
+        let ctx = bench.ctx().with_pane_claim(&claim);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 28)).expect("terminal");
+        terminal
+            .draw(|frame| view.render(frame, frame.area(), &ctx))
+            .expect("the frame draws");
+        let (region, areas) = claim.get().expect("browse claims its panes");
+        let [list, pane] =
+            Layout::horizontal([Constraint::Length(32), Constraint::Min(1)]).areas(region);
+        assert_eq!((areas.list, areas.detail), (Some(list), pane));
+    }
+
+    /// MOD-115 M2 §7: with the tree focused, motion moves the cursor; with the detail focused
+    /// it scrolls the pane and the cursor stays; with the activity pane focused nothing moves.
+    #[tokio::test]
+    async fn motion_follows_the_focused_pane() {
+        use crate::ui::shell::PaneId;
+        let bench = Bench::new();
+        let mut view = browsing(&bench).await;
+        view.pane_rows.set(10);
+        let press = |view: &mut TemplatesView, focus: PaneId, code: KeyCode| {
+            view.on_key(
+                KeyEvent::new(code, KeyModifiers::NONE),
+                &mut bench.ctx().with_focus(focus),
+            )
+        };
+        for (code, offset) in [
+            (KeyCode::Char('j'), 1),
+            (KeyCode::Down, 2),
+            (KeyCode::Char('k'), 1),
+        ] {
+            assert_eq!(press(&mut view, PaneId::Detail, code), Handled::Consumed);
+            assert_eq!(view.scroll.offset(), offset, "{code:?}");
+        }
+        assert_eq!(view.cursor, 0, "the cursor stayed");
+        assert_eq!(
+            press(&mut view, PaneId::Activity, KeyCode::Char('j')),
+            Handled::Consumed
+        );
+        assert_eq!((view.cursor, view.scroll.offset()), (0, 1), "nothing moved");
+        assert_eq!(
+            press(&mut view, PaneId::List, KeyCode::Char('j')),
+            Handled::Consumed
+        );
+        assert_eq!(view.cursor, 1, "the tree's");
+        assert!(bench.emit.take().is_empty());
+    }
+
+    /// MOD-115 M2 §8, RV3 (review M2): the location names the row under the cursor as well as
+    /// its index: a template by `{index}:{project}:{name}`, a project header by
+    /// `{index}:{project}`. A template created before it moves its row, and the cursor goes back
+    /// onto the same template; one that is gone falls back to the row, clamped.
+    #[tokio::test]
+    async fn the_cursor_finds_its_template_after_the_tree_changed() {
+        let bench = Bench::new();
+        let mut view = browsing(&bench).await;
+        let project = match view.rows()[0] {
+            Row::Project(project) => project,
+            Row::Template { .. } => panic!("the tree opens on a project header"),
+        };
+        assert_eq!(view.location_cursor(), format!("0:{project}"));
+        view.move_cursor(true);
+        view.move_cursor(true);
+        let Some((_, name)) = view.selected_template() else {
+            panic!("a template on the third row");
+        };
+        let at = view.location_cursor();
+        assert_eq!(at, format!("2:{project}:{name}"));
+
+        let snapshot = view.snapshot.as_mut().expect("read");
+        let mut created = snapshot.projects[0].templates[0].clone();
+        created.name = "aaa-triage".to_owned();
+        snapshot.projects[0].templates.insert(0, created);
+        view.cursor = 0;
+        assert!(view.restore_cursor(&at));
+        assert_eq!(
+            view.selected_template(),
+            Some((project, name.clone())),
+            "on the same template"
+        );
+        assert_eq!(view.cursor, 3, "a row down");
+
+        let snapshot = view.snapshot.as_mut().expect("read");
+        snapshot.projects[0]
+            .templates
+            .retain(|row| row.name != name);
+        view.cursor = 0;
+        assert!(view.restore_cursor(&at));
+        assert_eq!(view.cursor, 2, "the template is gone: its row");
+        assert!(!view.restore_cursor("not a row"));
+        assert_eq!(view.cursor, 2, "an unreadable cursor moves nothing");
+    }
+
+    /// MOD-115 M2 §8: the Skills tab's location is the shown view (`library` or `templates`,
+    /// with its title) and that view's row; restoring it shows the view and puts the row back.
+    /// Nothing moves under an open prompt.
+    #[tokio::test]
+    async fn the_location_is_the_view_and_its_row_and_restore_returns_to_them() {
+        let bench = Bench::new();
+        let backend = Backend::memory(MemStore::demo());
+        let mut tab = SkillsTab::new();
+        let templates = serve(&backend, StoreRequest::Templates(bench.scope.clone())).await;
+        let skills = crate::skills::serve(&backend, &StoreRequest::Skills(bench.scope.clone()))
+            .await
+            .expect("the library reads");
+        tab.on_reply(&templates, &mut bench.ctx());
+        tab.on_reply(&skills, &mut bench.ctx());
+
+        let library = tab.location();
+        assert_eq!(library.subtab, Some("library"));
+        assert_eq!(library.subtab_title.as_deref(), Some("Skills"));
+        assert!(
+            library
+                .cursor
+                .as_deref()
+                .is_some_and(|at| at.starts_with("0:")),
+            "the library's first row and its skill: {library:?}"
+        );
+
+        tab.on_key(key('l'), &mut bench.ctx());
+        tab.on_key(key('j'), &mut bench.ctx());
+        tab.on_key(key('j'), &mut bench.ctx());
+        let here = tab.location();
+        assert_eq!(here.subtab, Some("templates"));
+        assert_eq!(here.subtab_title.as_deref(), Some("Templates"));
+        assert!(
+            here.cursor
+                .as_deref()
+                .is_some_and(|at| at.starts_with("2:")),
+            "the tree's third row and its template: {here:?}"
+        );
+
+        // RV3 (review M1): each view's cursor moves off the row first, so a restore that put
+        // back only the view would leave it there.
+        tab.on_key(key('h'), &mut bench.ctx());
+        tab.on_key(key('j'), &mut bench.ctx());
+        assert_eq!(tab.location().subtab, Some("library"));
+        assert_ne!(tab.location(), library, "the library's cursor moved");
+        assert!(tab.restore(&library, &mut bench.ctx()));
+        assert_eq!(tab.location(), library, "back on the library's first row");
+        tab.on_key(key('l'), &mut bench.ctx());
+        tab.on_key(key('k'), &mut bench.ctx());
+        assert_eq!(tab.location().subtab, Some("templates"));
+        assert_ne!(tab.location(), here, "the tree's cursor moved");
+        assert!(tab.restore(&here, &mut bench.ctx()));
+        assert_eq!(tab.location(), here, "and forward to the template");
+
+        tab.on_key(key('n'), &mut bench.ctx());
+        assert!(tab.templates.captures_input(), "the name prompt is open");
+        assert!(!tab.restore(&library, &mut bench.ctx()));
+        assert_eq!(tab.location().subtab, Some("templates"), "nothing moved");
+        let mut fresh = SkillsTab::new();
+        assert!(
+            !fresh.restore(&crate::ui::shell::TabLoc::default(), &mut bench.ctx()),
+            "a location that names nothing restores nothing"
+        );
     }
 }

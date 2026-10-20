@@ -48,14 +48,15 @@ use ratatui::widgets::Paragraph;
 /// A DSN that parses and names a port nothing listens on (`tests/connection.rs`'s).
 const DEAD_DSN: &str = "postgres://htui:s3cret@127.0.0.1:1/htui?sslmode=disable";
 
-/// The keys line of the bare shell, the one the status row listed before MOD-115.
-const BARE_STATUS: &str =
-    "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · F9 about";
+/// The keys line of the bare shell, the one the status row listed before MOD-115, and the pane
+/// keys the Backlog offers as a list + detail tab (MOD-115 M2 T7).
+const BARE_STATUS: &str = "q quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · 1 select tab · \
+                           ? help · F9 about · Tab next pane · Shift+Tab previous pane";
 
-/// The keys line with `register_all`.
-const FULL_STATUS: &str = "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · \
+/// The keys line with `register_all`, on the Backlog.
+const FULL_STATUS: &str = "q quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · 1 select tab · \
                            ? help · F9 about · w workspaces · Ctrl+f find · Ctrl+w waiting · \
-                           Ctrl+q queue";
+                           Ctrl+q queue · Tab next pane · Shift+Tab previous pane";
 
 /// The `?` box's closing line.
 const CLOSER: &str = "?/F1 closes this box";
@@ -101,7 +102,8 @@ async fn ctrl_c_quits_from_connection_browse_with_a_stored_dsn() {
     .with_tab(Box::new(BacklogTab::new()))
     .with_tab(Box::new(SettingsTab::with_sections(vec![Box::new(
         ConnectionSection::new(),
-    )])));
+    )])))
+    .with_leave_dialog();
     harness.settle().await;
     harness.app().update(Action::Tab(TabAction::FocusSection(
         SettingsTab::ID,
@@ -114,16 +116,21 @@ async fn ctrl_c_quits_from_connection_browse_with_a_stored_dsn() {
         "the section is in browse mode, no field open: {frame}"
     );
 
+    // MOD-115 M2 D6: `ctrl-c` opens the leave dialog before the section sees it; a second one
+    // leaves.
     harness.key("ctrl-c");
-    assert!(
-        harness.app().should_quit,
-        "`ctrl-c` quits before the section sees it"
+    assert_eq!(
+        top(&mut harness),
+        Some(htui::ui::overlay::LeaveDialog::ID),
+        "`ctrl-c` asks before the section sees it"
     );
     let frame = harness.render();
     assert!(
         !frame.contains("Remove the DSN from the keyring?"),
         "the modifier-blind `c` arm never ran: {frame}"
     );
+    harness.key("ctrl-c");
+    assert!(harness.app().should_quit, "the second `ctrl-c` leaves");
 
     cache.close().await;
     drop(root);
@@ -143,11 +150,16 @@ async fn ctrl_c_quits_from_qdrant_browse() {
         "Qdrant is in browse mode, no field open: {frame}"
     );
 
+    // MOD-115 M2 D6: `ctrl-c` opens the leave dialog before the section sees it; a second
+    // one leaves.
     harness.key("ctrl-c");
-    assert!(
-        harness.app().should_quit,
-        "`ctrl-c` quits before the section sees it"
+    assert_eq!(
+        top(&mut harness),
+        Some(htui::ui::overlay::LeaveDialog::ID),
+        "`ctrl-c` asks first"
     );
+    harness.key("ctrl-c");
+    assert!(harness.app().should_quit, "the second `ctrl-c` leaves");
 }
 
 #[tokio::test]
@@ -167,9 +179,15 @@ async fn ctrl_c_quits_over_every_modal_overlay() {
         }
         assert_eq!(top(&mut harness), Some(expected), "`{opener}` opened it");
         harness.key("ctrl-c");
+        assert_eq!(
+            top(&mut harness),
+            Some(htui::ui::overlay::LeaveDialog::ID),
+            "`ctrl-c` opens the leave dialog over {expected:?}"
+        );
+        harness.key("ctrl-c");
         assert!(
             harness.app().should_quit,
-            "`ctrl-c` quits over {expected:?}"
+            "a second `ctrl-c` leaves over {expected:?}"
         );
     }
 
@@ -178,9 +196,15 @@ async fn ctrl_c_quits_over_every_modal_overlay() {
     harness.drive_to_end().await;
     assert_eq!(top(&mut harness), Some(MigrationPrompt::ID));
     harness.key("ctrl-c");
+    assert_eq!(
+        top(&mut harness),
+        Some(htui::ui::overlay::LeaveDialog::ID),
+        "`ctrl-c` opens the leave dialog over the migration prompt"
+    );
+    harness.key("ctrl-c");
     assert!(
         harness.app().should_quit,
-        "`ctrl-c` quits over the migration prompt"
+        "a second `ctrl-c` leaves over the migration prompt"
     );
 }
 
@@ -405,21 +429,27 @@ async fn ctrl_l_and_ctrl_h_do_not_cycle_sections() {
     let frame = harness.render();
     assert!(on_connection(&frame), "Connection is active: {frame}");
 
-    for key in ["ctrl-l", "ctrl-h", "shift-right", "alt-["] {
+    // MOD-115 M2 D4: plain arrows stay in the section; the shift arrows are section keys now.
+    for key in ["ctrl-l", "ctrl-h", "right", "alt-["] {
         harness.key(key);
         harness.drive_to_end().await;
         let frame = harness.render();
         assert!(on_connection(&frame), "`{key}` did not cycle: {frame}");
     }
 
-    harness.key("l");
-    harness.drive_to_end().await;
-    let frame = harness.render();
-    assert!(!on_connection(&frame), "`l` moved to Qdrant: {frame}");
-    harness.key("h");
-    harness.drive_to_end().await;
-    let frame = harness.render();
-    assert!(on_connection(&frame), "`h` moved back: {frame}");
+    for (forward, back) in [("l", "h"), ("shift-right", "shift-left")] {
+        harness.key(forward);
+        harness.drive_to_end().await;
+        let frame = harness.render();
+        assert!(
+            !on_connection(&frame),
+            "`{forward}` moved to Qdrant: {frame}"
+        );
+        harness.key(back);
+        harness.drive_to_end().await;
+        let frame = harness.render();
+        assert!(on_connection(&frame), "`{back}` moved back: {frame}");
+    }
 }
 
 /// MOD-67 M4 D5 pin (ANA-26 §2.6 defect 1): the Skills view switch is `skills.switch_view`
@@ -433,26 +463,30 @@ async fn ctrl_l_and_ctrl_h_do_not_switch_skills_views() {
     let frame = harness.render();
     assert!(on_library(&frame), "the tab opens on the Library: {frame}");
 
-    for key in ["ctrl-l", "ctrl-h", "alt-l", "shift-right"] {
+    // MOD-115 M2 D4: plain arrows stay in the pane; the shift arrows switch the view now.
+    for key in ["ctrl-l", "ctrl-h", "alt-l", "right"] {
         harness.key(key);
         harness.drive_to_end().await;
         let frame = harness.render();
         assert!(on_library(&frame), "`{key}` did not switch: {frame}");
     }
 
-    harness.key("l");
-    harness.drive_to_end().await;
-    let frame = harness.render();
-    assert!(!on_library(&frame), "`l` showed Templates: {frame}");
-    assert!(frame.contains("default"), "the Templates hint: {frame}");
-    harness.key("h");
-    harness.drive_to_end().await;
-    let frame = harness.render();
-    assert!(on_library(&frame), "`h` went back: {frame}");
+    for (forward, back) in [("l", "h"), ("shift-right", "shift-left")] {
+        harness.key(forward);
+        harness.drive_to_end().await;
+        let frame = harness.render();
+        assert!(!on_library(&frame), "`{forward}` showed Templates: {frame}");
+        assert!(frame.contains("default"), "the Templates hint: {frame}");
+        harness.key(back);
+        harness.drive_to_end().await;
+        let frame = harness.render();
+        assert!(on_library(&frame), "`{back}` went back: {frame}");
+    }
 }
 
 /// MOD-67 M4 PA-2 pin at the shell: a capturing Skills mode offers no view switch (`l` is typed)
-/// and still hands `Tab` to the shell, the draft kept; the agent help over it too.
+/// and still hands the tab key (`ctrl-pgdn` since MOD-115 M2 D4) to the shell, the draft kept;
+/// the agent help over it too.
 #[tokio::test]
 async fn a_capturing_skills_view_keeps_tab_and_offers_no_switch() {
     let mut harness = shell(true).await;
@@ -473,11 +507,11 @@ async fn a_capturing_skills_view_keeps_tab_and_offers_no_switch() {
     let frame = harness.render();
     assert!(frame.contains("lYou are running"), "`l` is typed: {frame}");
     let skills_then_requirements = |harness: &mut Harness| {
-        harness.key("tab");
+        harness.key("ctrl-pgdn");
         assert_eq!(
             harness.app().tabs.active_id().map(|id| id.0),
             Some("requirements"),
-            "`Tab` passes to the shell"
+            "`Ctrl+PgDn` passes to the shell"
         );
         harness.key("2");
         assert_eq!(harness.app().tabs.active_id(), Some(SkillsTab::ID));
@@ -507,10 +541,11 @@ async fn a_capturing_skills_view_keeps_tab_and_offers_no_switch() {
 
 #[tokio::test]
 async fn a_capturing_section_shows_the_filtered_status_line_and_box() {
-    let mut harness =
-        Harness::demo().with_tab(Box::new(SettingsTab::with_sections(vec![Box::new(
+    let mut harness = Harness::demo()
+        .with_tab(Box::new(SettingsTab::with_sections(vec![Box::new(
             StackProbe,
-        )])));
+        )])))
+        .with_leave_dialog();
     harness.drive_to_end().await;
     assert_eq!(
         status_line(&mut harness),
@@ -535,8 +570,15 @@ async fn a_capturing_section_shows_the_filtered_status_line_and_box() {
     harness.key("f1");
     assert!(!harness.app().help_visible, "`F1` closes it");
 
+    // MOD-115 M2 D6: `ctrl-c` still reaches `global.quit`: the leave dialog, then leaving.
     harness.key("ctrl-c");
-    assert!(harness.app().should_quit, "`ctrl-c` still quits");
+    assert_eq!(
+        top(&mut harness),
+        Some(htui::ui::overlay::LeaveDialog::ID),
+        "`ctrl-c` asks first"
+    );
+    harness.key("ctrl-c");
+    assert!(harness.app().should_quit, "the second `ctrl-c` leaves");
 }
 
 #[tokio::test]
@@ -578,7 +620,7 @@ async fn with_keys_installs_the_keys() {
         .with_keys(keys);
     harness.drive_to_end().await;
     assert!(
-        status_line(&mut harness).starts_with("F10 quit · Tab next tab"),
+        status_line(&mut harness).starts_with("F10 quit · Ctrl+PgDn next tab"),
         "{}",
         harness.render()
     );

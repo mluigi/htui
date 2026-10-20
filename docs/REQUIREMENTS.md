@@ -83,6 +83,12 @@ draft time); amended in place: R-STO-1 (the Qdrant API key in the keyring, the U
 setting), R-MCP-1 (notes and transcripts through search), R-MCP-2 (a text filter on the read tools,
 knowledge search at workspace scope), R-ENT-13 (memory indexed, and reaching a prompt without it) and
 R-TUI-8 (the workspace's Qdrant in Settings).
+amended 2026-10-18 by maintainer decision on MOD-115 milestone 2
+(`.claude/plans/mod-115-tui-shell-m2.plan.md` MD1-MD8, `docs/decisions/mod/mod-115-decisions.md`) —
+R-TUI-10 amended in place (every key bound to a named action and rebindable, only a printable
+character typed into a text field excepted; `ctrl-c` a rebindable default of leaving, with a way out
+of htui always kept; `Esc` never configurable; the fixed field, choice and numbered-choice keys
+withdrawn).
 **Governed by:** `.claude/rules/workflow-docs.md`
 
 This file is the product requirements for `htui`. It sits above every `ANA-N` analysis and every
@@ -710,22 +716,31 @@ conflict. Their verdicts survive only where restated here.
   hashes from the run. No markdown files are produced. The coordinator (R-ORCH-14) runs close-out
   and its checklist — follow-up items, re-confirming suspect citations, choosing the resolution —
   and the merge, push or pull request; ANA-34 settles the split. Amended 2026-10-15.
-- **R-TUI-10 (must).** Every key outside text entry is bound to a named action. The default
-  bindings ship in `htui`. A user overrides them in the Settings tab; the overrides are stored in
-  Postgres per user and shared by every `htui` that connects to it, and the read-only cache keeps the
-  last known set, so the keys in force offline are the last ones seen online. Overrides list only
-  the actions they change and may unbind one. Printable characters, editing keys inside a text
-  field, a field's Enter and Esc, numbered choices, and a choice field's value keys are fixed.
-  `htui` refuses an invalid set and names every error, including a chord bound twice on one screen
-  and a printable chord bound where a text field is typing; `htui --default-keys` starts with the
-  defaults instead. `ctrl-c` always quits, from every htui screen and field (the first press asks,
-  the second leaves, R-TUI-18), and cannot be unbound or bound to anything else; a pane that runs another program in a terminal forwards
-  it to that program and always keeps a key that leaves the pane. Every hint line and the `?`
-  help show the keys in force, and the help opens from every screen. No default needs AltGr on common
-  non-US layouts. Plain arrows never leave a pane; `Tab`/`Shift-Tab`, `Ctrl ←→` or a click move
-  between panes, `Shift ←→` changes sub-tab, and digits switch tabs. Amended by maintainer decision,
-  2026-10-15, reversing ANA-26's local `keys.toml` (MOD-67), and 2026-10-17 (UI review, `docs/ui-redesign-findings-2026-10-15.md`) (navigation
-  defaults).
+- **R-TUI-10 (must).** Every key is bound to a named action and, but for `Esc`, can be rebound; a
+  printable character typed into a text field is text, not a binding. The default bindings ship in
+  `htui`. A user overrides them in the Settings tab; the overrides are stored in Postgres per user
+  and shared by every `htui` that connects to it, and the read-only cache keeps the last known set,
+  so the keys in force offline are the last ones seen online. Overrides list only the actions they
+  change and may unbind one. `Esc` is the one key that is never configurable and always does what it
+  does by default (close, cancel, go back, dismiss, answer no): an override cannot list it, and an
+  action whose default holds `Esc` keeps it whatever the override says; a set written before this
+  rule that lists `Esc` on such an action keeps loading. `htui` refuses an invalid set and names
+  every error, including a chord bound twice on one screen and a printable chord bound where a text
+  field is typing; `htui --default-keys` starts with the defaults instead. `ctrl-c` is a default of
+  leaving, from every htui screen and field (the first press opens the leave dialog, the second
+  leaves, R-TUI-18), and may be rebound like any key; a set that leaves no way to leave `htui` is
+  refused, and so is one that leaves no way to stay in the leave dialog, out of a text field, out of
+  an overlay, or out of a focused in-pane editor. A pane that runs another program in a terminal
+  forwards `ctrl-c` to that program and always keeps a key that leaves the pane. Every hint line and
+  the `?` help show the keys in force, and the help opens from every screen. No default needs AltGr
+  on common non-US layouts. Plain arrows never leave a pane; `Tab`/`Shift-Tab`, `Ctrl ←→` or a click
+  move between panes, `Shift ←→` changes sub-tab, and digits switch tabs. Known limit until
+  MOD-115's tab ports (M3/M4): a text field's key other than `Esc`, rebound to another chord, still
+  works under its old chord on a screen where another action also uses that old chord. Amended by
+  maintainer decision, 2026-10-15, reversing ANA-26's local `keys.toml` (MOD-67), 2026-10-17 (UI
+  review, `docs/ui-redesign-findings-2026-10-15.md`) (navigation defaults), and 2026-10-18 (MOD-115
+  M2, `docs/decisions/mod/mod-115-decisions.md`) (every key configurable, `ctrl-c` rebindable with a
+  way out kept, `Esc` never configurable).
 - **R-TUI-11 (must).** One overlay, opened from every screen, lists every run, or item, in the
   active workspace that waits on a person — a gate, a fan-out selection, a judge failure, a blocked
   item, an open permission request, and an agent's open question — with the reason and the step, and

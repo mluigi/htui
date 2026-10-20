@@ -5,7 +5,10 @@ mod pane;
 pub mod state;
 pub mod update;
 
-pub use action::{Action, Handled, OverlayAction, RevealKind, RevealTarget, TabAction};
+pub use action::{
+    Action, Handled, HistoryAction, LayoutAction, OverlayAction, PaneAction, RevealKind,
+    RevealTarget, TabAction,
+};
 // Only tests outside `app` read it (the item form's and the Backlog's claim tests, R1 nit a).
 #[cfg(test)]
 pub(crate) use pane::MIN_PANE;
@@ -13,7 +16,7 @@ pub use state::{App, Ctx, EDITOR_NEEDS_A_TAB, Emit, TopBarState};
 
 use crate::keys::Act;
 use crate::ui::overlay::{
-    AbortConfirm, ConceptsSearch, MigrationPrompt, QueueOverlay, QuitConfirm, WaitingList,
+    AbortConfirm, ConceptsSearch, LeaveDialog, MigrationPrompt, QueueOverlay, WaitingList,
     WorkspaceSwitcher,
 };
 use crate::ui::tabs::settings::{
@@ -54,8 +57,9 @@ use crate::ui::tabs::{BacklogTab, ChatTab, RequirementsTab, SettingsTab, SkillsT
 ///    open it (MOD-69 D7), a chord for `Ctrl+F`'s reason.
 /// 9. The queue overlay's factory goes in and global `Ctrl+Q` is offered as [`Act::Queue`] to
 ///    open it (MOD-12 M3 D8), a chord for the same reason.
-/// 10. The quit question's factory goes in and it is named as the quit overlay (MOD-57 M2 E4);
-///     no key opens it but `global.quit` with an in-pane editor alive.
+/// 10. The leave dialog's factory goes in and it is named as the leave overlay (MOD-115 M2 D6,
+///     `R-TUI-18`; it replaced MOD-57 M2 E4's quit question): `global.quit` (`q`, `ctrl-c`)
+///     opens it on every screen, and its `leave.confirm` (`Enter`, a second `ctrl-c`) leaves.
 ///
 /// Calling this twice would stack a second switcher; the shell calls it exactly once, between
 /// [`App::new`] and [`App::start`].
@@ -121,10 +125,10 @@ pub fn register_all(app: &mut App) {
         .register(MigrationPrompt::ID, || Box::new(MigrationPrompt::new()));
     app.migration_overlay = Some(MigrationPrompt::ID);
 
-    // MOD-57 M2 E4: the quit question, an id for the migration prompt's reason.
+    // MOD-115 M2 D6: the leave dialog, an id for the migration prompt's reason.
     app.overlay_factories
-        .register(QuitConfirm::ID, || Box::new(QuitConfirm::new()));
-    app.quit_overlay = Some(QuitConfirm::ID);
+        .register(LeaveDialog::ID, || Box::new(LeaveDialog::new()));
+    app.leave_overlay = Some(LeaveDialog::ID);
     // MOD-57 M2 R1 M-2: the abort question, for the same reason.
     app.overlay_factories
         .register(AbortConfirm::ID, || Box::new(AbortConfirm::new()));

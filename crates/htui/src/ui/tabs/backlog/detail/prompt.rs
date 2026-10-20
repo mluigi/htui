@@ -21,7 +21,7 @@ use crate::keys::{Act, KeyChord, Keys, Stack, views};
 use crate::preview::PromptPreview;
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells;
-use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Scroll, message};
+use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Scroll, Step, message};
 use crossterm::event::KeyEvent;
 
 /// How wide the label gutter is: every header line is `label` then the value.
@@ -375,6 +375,11 @@ impl DetailTab for PromptTab {
         Handled::Pass
     }
 
+    /// MOD-115 M2 §7: the list's motion scrolls the prompt while the detail is focused.
+    fn step(&mut self, step: Step, _ctx: &Ctx<'_>) -> Handled {
+        self.scroll.follow(step, self.lines.len())
+    }
+
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         if let StoreReply::Failed { request, message } = reply
             && *request == crate::store_worker::PROMPT_PREVIEW
@@ -507,6 +512,31 @@ mod tests {
 
             assert_eq!(whole, only, "the two disagree at offset {offset}");
         }
+    }
+
+    /// MOD-115 M2 §7: with the detail focused the list's motion scrolls the prompt, a row as `J`
+    /// and `K` do, or to either end, clamped to its last row.
+    #[test]
+    fn a_step_scrolls_the_prompt_as_its_scroll_keys_do() {
+        use crate::ui::tabs::backlog::detail::compose::bench::{Shell, key};
+        use crossterm::event::KeyCode;
+
+        let shell = Shell::new();
+        let filled = || PromptTab {
+            lines: (0..6).map(|n| Row::plain(format!("row {n}"))).collect(),
+            ..PromptTab::new()
+        };
+        let (mut stepped, mut keyed) = (filled(), filled());
+        assert_eq!(stepped.step(Step::Down, &shell.ctx()), Handled::Consumed);
+        let _ = keyed.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+        assert_eq!(stepped.scroll, keyed.scroll, "a row, as `J`");
+        assert_eq!(stepped.scroll.offset(), 1);
+        assert_eq!(stepped.step(Step::Bottom, &shell.ctx()), Handled::Consumed);
+        assert_eq!(stepped.scroll.offset(), 5, "the last of six rows");
+        assert_eq!(stepped.step(Step::Up, &shell.ctx()), Handled::Consumed);
+        assert_eq!(stepped.scroll.offset(), 4);
+        assert_eq!(stepped.step(Step::Top, &shell.ctx()), Handled::Consumed);
+        assert_eq!(stepped.scroll.offset(), 0);
     }
 
     #[test]

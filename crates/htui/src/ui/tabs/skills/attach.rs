@@ -35,13 +35,14 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::library::{Notice, Sent};
 use crate::app::{Ctx, Handled};
+use crate::keys::translate::FieldEvent;
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::skills::{ProjectSkills, SkillsSnapshot};
 use crate::store_worker::StoreRequest;
 use crate::ui::cells;
 use crate::ui::tabs::settings::modal_rest;
 use crate::ui::{FieldOutcome, TextField, Theme};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 
 /// A row's label field, in cells: a label is fitted to it with `cells::fit`, so the summary stays
 /// on the row and in one column.
@@ -85,14 +86,18 @@ const BROWSE_HINT: HintSpec = &[
     Hint::One(Act::Back, "back"),
 ];
 
-/// The hint row on the form: `Space` is the activation's own key, `Esc` the form's.
+/// The hint row on the form: `choice.toggle` (`Space`) cycles the activation (MOD-115 M2 RV1
+/// H2: named through the keys in force); `Esc` is the form's, written as is (MD7).
 const FORM_HINT: HintSpec = &[
     Hint::All(Act::FormNextField, "field"),
-    Hint::Text("Space activation"),
+    Hint::One(Act::ChoiceToggle, "activation"),
     Hint::One(Act::AttachRepo, "repo"),
     Hint::One(Act::FormSave, "save"),
     Hint::Text("Esc cancel"),
 ];
+
+/// The activation row's own label in the form body ([`activation_label`]).
+const ACTIVATION_HINT: HintSpec = &[Hint::One(Act::ChoiceToggle, "cycles")];
 
 /// The hint row in the repo picker.
 const PICKER_HINT: HintSpec = &[
@@ -260,24 +265,31 @@ impl From<Handled> for AttachOutcome {
     }
 }
 
-/// A key on the form's activation, which is not typed (a widget's value key, MOD-67 M4 D10):
-/// `Space` (no modifier but `SHIFT`) cycles `always \u{2192} glob \u{2192} off`, `Enter` submits
-/// and `Esc` cancels as a text field's do; anything else passes to the form's stack.
-fn activation_key(form: &mut Form, key: KeyEvent) -> FieldOutcome {
-    if !(key.modifiers - KeyModifiers::SHIFT).is_empty() {
-        return FieldOutcome::Pass;
+/// A key on the form's activation, which is not typed (a choice field, MOD-67 M4 D10; MOD-115
+/// M2 D7): `choice.toggle` (`Space`) through `stack` cycles `always \u{2192} glob \u{2192} off`,
+/// and the canonical `Enter`/`Esc` (`field.submit`/`field.cancel` after the shell's translation,
+/// [`FieldEvent::of`]) submit and cancel as a text field's do; anything else passes to the form's
+/// stack. The toggle resolves from `pressed`, the chord the user pressed (`Ctx::pressed`,
+/// MOD-115 M2 RV1 M): a rebound `[field]` chord the shell delivered as its canonical key is the
+/// text field's, never the choice's.
+fn activation_key(
+    form: &mut Form,
+    key: KeyEvent,
+    pressed: KeyChord,
+    keys: &Keys,
+    stack: Stack<'_>,
+) -> FieldOutcome {
+    if keys.actions(stack, pressed).contains(&Act::ChoiceToggle) {
+        form.activation = match form.activation {
+            Activation::Always => Activation::Glob,
+            Activation::Glob => Activation::Off,
+            Activation::Off => Activation::Always,
+        };
+        return FieldOutcome::Consumed;
     }
-    match key.code {
-        KeyCode::Char(' ') => {
-            form.activation = match form.activation {
-                Activation::Always => Activation::Glob,
-                Activation::Glob => Activation::Off,
-                Activation::Off => Activation::Always,
-            };
-            FieldOutcome::Consumed
-        }
-        KeyCode::Enter => FieldOutcome::Submit,
-        KeyCode::Esc => FieldOutcome::Cancel,
+    match FieldEvent::of(&key) {
+        Some(FieldEvent::Submit) => FieldOutcome::Submit,
+        Some(FieldEvent::Cancel) => FieldOutcome::Cancel,
         _ => FieldOutcome::Pass,
     }
 }
@@ -553,7 +565,9 @@ impl AttachPane {
         ctx: &Ctx<'_>,
     ) -> AttachOutcome {
         let outcome = match form.focus {
-            FormField::Activation => activation_key(&mut form, key),
+            FormField::Activation => {
+                activation_key(&mut form, key, ctx.pressed(&key), ctx.keys(), stack)
+            }
             FormField::Pin => form.pin.on_key(key),
             FormField::Position => form.position.on_key(key),
             FormField::Languages => form.languages.on_key(key),
@@ -604,10 +618,10 @@ impl AttachPane {
         AttachOutcome::Consumed
     }
 
-    /// The picker, through `views::ATTACH_PICKER`. `attach.choose` types `<repo>:` into the globs
-    /// field at its cursor, one char key at a time (D101: `TextField` has no insert API, and a key
-    /// is what inserts at the cursor), after `, ` when the text before the cursor ends in anything
-    /// but `,` or whitespace; `common.back` returns to the form. Any other key is `modal_rest`'s.
+    /// The picker, through `views::ATTACH_PICKER`. `attach.choose` inserts `<repo>:` into the
+    /// globs field at its cursor (`TextField::on_paste`, MOD-115 M2: no key event is forged),
+    /// after `, ` when the text before the cursor ends in anything but `,` or whitespace;
+    /// `common.back` returns to the form. Any other key is `modal_rest`'s.
     fn on_picker_key(
         &mut self,
         stack: Stack<'static>,
@@ -637,9 +651,8 @@ impl AttachPane {
                         .and_then(|before| before.chars().last())
                         .is_some_and(|last| last != ',' && !last.is_whitespace());
                     let inserted = format!("{}{repo}:", if separator { ", " } else { "" });
-                    for c in inserted.chars() {
-                        form.globs.on_key(KeyEvent::from(KeyCode::Char(c)));
-                    }
+                    // Unmasked, so the paste always fits (it grows the field).
+                    form.globs.on_paste(&inserted);
                     form.focus = FormField::Globs;
                 }
                 self.mode = AttachMode::Form(form);
@@ -1071,6 +1084,17 @@ fn build(form: &Form) -> Result<Attachment, String> {
 
 /// The form panel: five inputs, the `effective:` line, and the help line — or, in its place, the
 /// sentence the store would refuse a qualifier with.
+/// The activation row's label: `choice.toggle` through the keys in force (MOD-115 M2 RV1 H2),
+/// `  (Space cycles)` under the compiled keys; nothing while the toggle is unbound.
+fn activation_label(keys: &Keys) -> String {
+    let hint = keys.hint(views::ATTACH_FORM, ACTIVATION_HINT);
+    if hint.is_empty() {
+        String::new()
+    } else {
+        format!("  ({hint})")
+    }
+}
+
 fn render_form(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1109,7 +1133,7 @@ fn render_form(
         Line::from(vec![
             Span::styled(format!("{:<FORM_LABEL$}", "activation"), theme.base),
             Span::styled(form.activation.as_str(), activation_style),
-            Span::styled("  (Space cycles)", theme.dim),
+            Span::styled(activation_label(ctx.keys()), theme.dim),
         ]),
         field("pin", &form.pin, FormField::Pin),
         field("position", &form.position, FormField::Position),
@@ -1225,6 +1249,117 @@ mod tests {
             detach_question("tests", "global", None),
             "detach `tests` from global?"
         );
+    }
+
+    /// A form over the global row, focus on the activation.
+    fn activation_form(activation: Activation) -> Form {
+        Form {
+            key: SkillBindingKey {
+                skill: SkillId::new(),
+                project: None,
+                phase: None,
+            },
+            target: "global".to_owned(),
+            token: None,
+            activation,
+            pin: TextField::with_text("latest"),
+            position: TextField::with_text("0"),
+            languages: TextField::new(),
+            globs: TextField::new(),
+            focus: FormField::Activation,
+        }
+    }
+
+    fn event(spec: &str) -> KeyEvent {
+        KeyChord::parse_strict(spec)
+            .expect("a valid spec")
+            .to_event()
+    }
+
+    /// MOD-115 M2 D7: the activation cycles on `choice.toggle`, so a rebound toggle cycles it and
+    /// `Space` no longer does; `Enter` and `Esc` submit and cancel.
+    #[test]
+    fn the_activation_cycles_on_the_toggle_in_force() {
+        let compiled = Keys::compiled();
+        let mut form = activation_form(Activation::Always);
+        let key = |form: &mut Form, spec: &str, keys: &Keys| {
+            let key = event(spec);
+            activation_key(
+                form,
+                key,
+                KeyChord::from_event(key),
+                keys,
+                views::ATTACH_FORM,
+            )
+        };
+        let outcome = key(&mut form, "space", compiled);
+        assert_eq!(outcome, FieldOutcome::Consumed);
+        assert_eq!(form.activation, Activation::Glob);
+        let keys =
+            crate::keys::load_str("version = 2\n[choice]\ntoggle = \"ctrl-t\"\n").expect("loads");
+        let outcome = key(&mut form, "ctrl-t", &keys);
+        assert_eq!(outcome, FieldOutcome::Consumed);
+        assert_eq!(form.activation, Activation::Off);
+        let outcome = key(&mut form, "space", &keys);
+        assert_eq!(outcome, FieldOutcome::Pass, "Space is no toggle now");
+        assert_eq!(form.activation, Activation::Off);
+        // RV1 H2 (repair 1): the body's label names the toggle in force too.
+        assert_eq!(activation_label(compiled), "  (Space cycles)");
+        assert_eq!(activation_label(&keys), "  (Ctrl+t cycles)");
+        // RV1 H2: the form's hint names the toggle in force.
+        let hint = |keys: &Keys| keys.hint(views::ATTACH_FORM, FORM_HINT);
+        assert!(
+            hint(compiled).contains(" \u{b7} Space activation \u{b7} "),
+            "{}",
+            hint(compiled)
+        );
+        assert!(
+            hint(&keys).contains(" \u{b7} Ctrl+t activation \u{b7} "),
+            "{}",
+            hint(&keys)
+        );
+        assert!(!hint(&keys).contains("Space"), "{}", hint(&keys));
+        for (spec, expected) in [
+            ("enter", FieldOutcome::Submit),
+            ("esc", FieldOutcome::Cancel),
+            ("ctrl-r", FieldOutcome::Pass),
+            ("x", FieldOutcome::Pass),
+        ] {
+            let outcome = key(&mut form, spec, compiled);
+            assert_eq!(outcome, expected, "{spec}");
+        }
+    }
+
+    /// MOD-115 M2 RV1 M (repair 1): the activation resolves `choice.toggle` from the chord
+    /// pressed, so a rebound `[field]` chord the shell delivered as the canonical key never
+    /// cycles it: with `field.home` on `ctrl-a` and `choice.toggle` on `home`, `ctrl-a` arrives
+    /// as `Home` and passes, while a pressed `Home` cycles.
+    #[test]
+    fn a_translated_field_chord_never_cycles_the_activation() {
+        let keys = crate::keys::load_str(
+            "version = 2\n[choice]\ntoggle = [\"home\"]\n[field]\nhome = [\"ctrl-a\"]\n",
+        )
+        .expect("the keys load");
+        let chord = |spec: &str| KeyChord::parse_strict(spec).expect("a valid spec");
+        let mut form = activation_form(Activation::Always);
+        let outcome = activation_key(
+            &mut form,
+            event("home"),
+            chord("ctrl-a"),
+            &keys,
+            views::ATTACH_FORM,
+        );
+        assert_eq!(outcome, FieldOutcome::Pass, "`ctrl-a` is the text field's");
+        assert_eq!(form.activation, Activation::Always);
+        let outcome = activation_key(
+            &mut form,
+            event("home"),
+            chord("home"),
+            &keys,
+            views::ATTACH_FORM,
+        );
+        assert_eq!(outcome, FieldOutcome::Consumed, "a pressed `Home` cycles");
+        assert_eq!(form.activation, Activation::Glob);
     }
 
     /// A ZWJ family: one cluster of five code points, 2 cells.

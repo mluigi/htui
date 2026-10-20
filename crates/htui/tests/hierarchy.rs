@@ -1396,11 +1396,12 @@ async fn q_quits_from_browse() {
     );
 }
 
-/// MOD-52: inside a half-typed field `q` is a letter, and `ctrl-c` still quits, because the field
-/// and the section pass `CONTROL` chords on to the global table.
+/// MOD-52, MOD-115 M2 D6: inside a half-typed field `q` is a letter, and `ctrl-c` still reaches
+/// `global.quit`, because the field and the section pass `CONTROL` chords on to the global table:
+/// it opens the leave dialog, and a second one leaves.
 #[tokio::test]
 async fn ctrl_c_quits_from_a_half_typed_field() {
-    let mut harness = hierarchy_over(MemStore::demo()).await;
+    let mut harness = hierarchy_over(MemStore::demo()).await.with_leave_dialog();
     harness.key("j");
     harness.key("n");
     harness.settle().await;
@@ -1411,7 +1412,18 @@ async fn ctrl_c_quits_from_a_half_typed_field() {
 
     harness.key("ctrl-c");
     harness.settle().await;
-    assert!(harness.app().should_quit, "`ctrl-c` quits from the field");
+    assert!(!harness.app().should_quit, "`ctrl-c` asks first");
+    assert_eq!(
+        harness
+            .app()
+            .overlays
+            .top()
+            .map(htui::ui::overlay::Overlay::id),
+        Some(htui::ui::overlay::LeaveDialog::ID),
+        "the leave dialog is open over the field"
+    );
+    harness.key("ctrl-c");
+    assert!(harness.app().should_quit, "the second `ctrl-c` leaves");
 }
 
 /// Types one key per char, as a user would: the field is the only thing that sees them.

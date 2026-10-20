@@ -691,6 +691,13 @@ impl DetailTab for GraphTab {
         views::BACKLOG_GRAPH
     }
 
+    /// MOD-115 M2 §7: the list's motion moves the row cursor while the detail is focused, as
+    /// its own `J`/`K` (`Act::GraphNextRow`/`GraphPrevRow`) do.
+    fn step(&mut self, step: super::Step, _ctx: &Ctx<'_>) -> Handled {
+        self.move_cursor(step.delta());
+        Handled::Consumed
+    }
+
     /// `J` / `K` and `PageDown` / `PageUp` move the cursor, `+` / `-` change the view depth,
     /// `Enter` re-roots (D5, D6).
     ///
@@ -1309,6 +1316,25 @@ mod tests {
             Handled::Consumed
         );
         assert_eq!(empty.cursor, 0);
+    }
+
+    /// MOD-115 M2 §7: with the detail focused the list's motion moves the row cursor, a row as
+    /// `J` and `K` do, or to either end.
+    #[tokio::test]
+    async fn a_step_moves_the_row_cursor_as_j_and_k_do() {
+        use crate::ui::tabs::backlog::detail::Step;
+
+        let shell = Shell::platform().await;
+        let ctx = shell.ctx();
+        let mut tab = pane(demo(ids::HTUI_FEAT_1).await);
+        assert_eq!(tab.step(Step::Down, &ctx), Handled::Consumed);
+        assert_eq!(tab.cursor, 1, "a row, as `J`");
+        assert_eq!(tab.step(Step::Bottom, &ctx), Handled::Consumed);
+        assert_eq!(tab.cursor, 7, "the last row");
+        assert_eq!(tab.step(Step::Up, &ctx), Handled::Consumed);
+        assert_eq!(tab.cursor, 6, "a row up, as `K`");
+        assert_eq!(tab.step(Step::Top, &ctx), Handled::Consumed);
+        assert_eq!(tab.cursor, 0, "the root");
     }
 
     #[tokio::test]

@@ -395,6 +395,13 @@ async fn a_reply_to_a_closed_search_is_not_shown_by_a_reopened_one() {
 async fn ctrl_c_still_quits_from_the_search() {
     let mut harness = open(Some(seeded().await)).await;
     harness.key("ctrl-f");
+    // MOD-115 M2 D6: the leave dialog opens over the search, and a second `ctrl-c` leaves.
+    harness.key("ctrl-c");
+    assert!(!harness.app().should_quit);
+    assert_eq!(
+        harness.app().overlays.top().map(|overlay| overlay.id()),
+        Some(htui::ui::overlay::LeaveDialog::ID)
+    );
     harness.key("ctrl-c");
     assert!(harness.app().should_quit);
 }

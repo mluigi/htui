@@ -1003,11 +1003,11 @@ async fn tab_and_digits_still_switch_tabs_with_a_draft_open() {
         harness.render().contains("2Prefer"),
         "`2` is text in the editor"
     );
-    harness.key("tab");
+    harness.key("ctrl-pgdn");
     assert_eq!(
         harness.app().tabs.active_id().map(|id| id.0),
         Some("requirements"),
-        "`Tab` passes to the shell, and Requirements follows Skills"
+        "`Ctrl+PgDn` passes to the shell, and Requirements follows Skills"
     );
     harness.key("2");
     harness.settle().await;
@@ -1784,7 +1784,7 @@ async fn the_library_editor_status_line_keeps_tab() {
     let stack = harness.app().active_stack().expect("a converted view");
     let line = harness.app().keys.status_line(stack, |_| true);
     assert!(
-        line.starts_with("Ctrl+c quit · Tab next tab · Shift+Tab previous tab · F1 help"),
+        line.starts_with("Ctrl+c quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · F1 help"),
         "{line}"
     );
 }
@@ -1985,5 +1985,110 @@ async fn a_rebound_reload_and_edit_key_are_named() {
     assert!(
         notice(&frame).contains("`tests` exists \u{2014} select it and press o"),
         "{frame}"
+    );
+}
+
+/// MOD-115 M2 §7, §8 (T7): `Tab` focuses the pane, where `k` leaves the library's cursor where
+/// it is; a view switch is a place in the history, and Back returns to the library and the skill
+/// it was on.
+#[tokio::test]
+async fn the_pane_takes_motion_and_back_returns_to_the_skill_left() {
+    let mut harness = open().await;
+    select(&mut harness, "tests");
+    harness.key("tab");
+    harness.key("k");
+    harness.key("g");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} tests v"),
+        "the cursor stayed:\n{frame}"
+    );
+
+    harness.key("tab");
+    harness.key("l");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("\u{250c} tests v"),
+        "on the Templates view:\n{frame}"
+    );
+    // RV3 (review M1): back on the library, its cursor moves off `tests`, so the Back that
+    // returns there has to put the row back, not only the view.
+    harness.key("h");
+    harness.key("k");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("\u{250c} tests v"),
+        "the cursor left `tests`:\n{frame}"
+    );
+    harness.key("backspace");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("\u{250c} tests v"),
+        "back on the Templates view:\n{frame}"
+    );
+    harness.key("backspace");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} tests v"),
+        "back on `tests`:\n{frame}"
+    );
+}
+
+/// MOD-115 M2 §7 (T7 repair): the name prompt takes every key, so with the list zoomed `n`
+/// draws it, and what is typed, over the zoomed list.
+#[tokio::test]
+async fn the_name_prompt_opened_with_the_list_zoomed_is_on_screen() {
+    let mut harness = open().await;
+    harness.key("z");
+    harness.settle().await;
+    harness.render();
+    harness.key("n");
+    type_text(&mut harness, "qwe");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} new skill ") && frame.contains("new skill: qwe"),
+        "the prompt is drawn:\n{frame}"
+    );
+}
+
+/// MOD-115 M2 §8, RV3 (review M2): the history names the skill left, not its row. A skill
+/// created between leaving and Back sorts before `tests` and moves its row down one; Back still
+/// lands on `tests`, not on the skill that took its row.
+#[tokio::test]
+async fn back_lands_on_the_skill_left_after_a_create_moved_its_row() {
+    let mut harness = open().await;
+    select(&mut harness, "tests");
+    // To the Templates view and back: the library's place is in the history.
+    harness.key("l");
+    harness.key("h");
+    harness.settle().await;
+    harness.key("n");
+    type_text(&mut harness, "aaa-docs");
+    harness.key("enter");
+    type_text(&mut harness, "How docs read");
+    harness.key("enter");
+    type_text(&mut harness, "Write in the active voice.");
+    harness.key("ctrl-s");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} aaa-docs v1 (head v1)"),
+        "the new skill, first in the library, is under the cursor:\n{frame}"
+    );
+    harness.key("backspace");
+    harness.settle().await;
+    harness.render();
+    harness.key("backspace");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} tests v"),
+        "back on `tests`:\n{frame}"
     );
 }

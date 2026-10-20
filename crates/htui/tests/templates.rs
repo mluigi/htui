@@ -543,7 +543,7 @@ async fn another_session_s_version_is_not_taken_for_the_save() {
     harness.key("e");
     type_text(&mut harness, "MINE ");
     // `Tab` away and `2` back queues a `Templates` read ahead of the save.
-    harness.key("tab");
+    harness.key("ctrl-pgdn");
     harness.key("2");
     harness.key("ctrl-s");
     // Another session appends v2 before either request is served.
@@ -923,11 +923,11 @@ async fn tab_and_digits_while_editing() {
         harness.render().contains("2You are running"),
         "`2` is text in the editor"
     );
-    harness.key("tab");
+    harness.key("ctrl-pgdn");
     assert_eq!(
         harness.app().tabs.active_id().map(|id| id.0),
         Some("requirements"),
-        "`Tab` passes to the shell, and Requirements follows Skills"
+        "`Ctrl+PgDn` passes to the shell, and Requirements follows Skills"
     );
     harness.key("2");
     harness.settle().await;
@@ -1077,7 +1077,7 @@ async fn the_templates_editor_status_line_and_help_box() {
     harness.key("e");
     assert!(
         harness.app().keys_line().starts_with(
-            "Ctrl+c quit · Tab next tab · Shift+Tab previous tab · F1 help · F9 about · Ctrl+f find"
+            "Ctrl+c quit · Ctrl+PgDn next tab · Ctrl+PgUp previous tab · F1 help · F9 about · Ctrl+f find"
         ),
         "the keys line is the filtered one"
     );
@@ -1100,7 +1100,7 @@ async fn the_templates_editor_status_line_and_help_box() {
         .filter(|line| line.contains("Global:"))
         .collect();
     assert_eq!(globals.len(), 1, "one `Global:` line: {frame}");
-    assert!(globals[0].contains("Tab next tab"), "{frame}");
+    assert!(globals[0].contains("Ctrl+PgDn next tab"), "{frame}");
     assert!(frame.contains("F1 closes this box"), "{frame}");
     assert!(!frame.contains("?/F1 closes this box"), "{frame}");
     harness.key("f1");
@@ -1150,11 +1150,11 @@ async fn tab_leaves_the_name_prompt_and_the_agent_help_with_the_draft() {
 
     harness.key("n");
     type_text(&mut harness, "tri");
-    harness.key("tab");
+    harness.key("ctrl-pgdn");
     assert_eq!(
         requirements(&mut harness),
         Some("requirements"),
-        "the prompt passes `Tab`"
+        "the prompt passes `Ctrl+PgDn`"
     );
     harness.key("2");
     harness.drive().await;
@@ -1172,11 +1172,11 @@ async fn tab_leaves_the_name_prompt_and_the_agent_help_with_the_draft() {
     harness.key("ctrl-g");
     harness.drive().await;
     type_text(&mut harness, "short");
-    harness.key("tab");
+    harness.key("ctrl-pgdn");
     assert_eq!(
         requirements(&mut harness),
         Some("requirements"),
-        "the help passes `Tab`"
+        "the help passes `Ctrl+PgDn`"
     );
     harness.key("2");
     harness.drive().await;
@@ -1434,4 +1434,107 @@ async fn a_rebound_save_key_is_named_by_the_template_warning() {
         "{frame}"
     );
     assert_eq!(head(&store, "triage").await, None, "nothing was sent");
+}
+
+/// MOD-115 M2 §7, §8 (T7): `Tab` focuses the pane, where `j` leaves the tree's cursor where it
+/// is; a view switch is a place in the history, and Back returns to the Templates view and the
+/// template it was on.
+#[tokio::test]
+async fn the_pane_takes_motion_and_back_returns_to_the_template_left() {
+    let mut harness = open().await;
+    select(&mut harness, "implement");
+    harness.key("tab");
+    harness.key("j");
+    harness.key("G");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} implement v"),
+        "the cursor stayed:\n{frame}"
+    );
+
+    harness.key("tab");
+    harness.key("h");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("\u{250c} implement v"),
+        "on the Skills view:\n{frame}"
+    );
+    // RV3 (review M1): back on the Templates view, its cursor moves off `implement`, so the
+    // Back that returns there has to put the row back, not only the view.
+    harness.key("l");
+    harness.key("j");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("\u{250c} implement v"),
+        "the cursor left `implement`:\n{frame}"
+    );
+    harness.key("backspace");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("\u{250c} implement v"),
+        "back on the Skills view:\n{frame}"
+    );
+    harness.key("backspace");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} implement v"),
+        "back on `implement`:\n{frame}"
+    );
+}
+
+/// MOD-115 M2 §7 (T7 repair): the name prompt takes every key, so with the tree zoomed `n` draws
+/// it, and what is typed, over the zoomed tree.
+#[tokio::test]
+async fn the_name_prompt_opened_with_the_tree_zoomed_is_on_screen() {
+    let mut harness = open().await;
+    harness.key("z");
+    harness.settle().await;
+    harness.render();
+    harness.key("n");
+    type_text(&mut harness, "qwe");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} new template ") && frame.contains(": qwe"),
+        "the prompt is drawn:\n{frame}"
+    );
+}
+
+/// MOD-115 M2 §8, RV3 (review M2): the history names the template left (`project:name`), not
+/// its row. A template created between leaving and Back sorts before `implement` and moves its
+/// row down one; Back still lands on `implement`, not on the template that took its row.
+#[tokio::test]
+async fn back_lands_on_the_template_left_after_a_create_moved_its_row() {
+    let store = MemStore::demo();
+    let mut harness = open_over(store.clone()).await;
+    select(&mut harness, "implement");
+    // To the Skills view and back: the tree's place is in the history.
+    harness.key("h");
+    harness.key("l");
+    harness.settle().await;
+    harness.key("n");
+    type_text(&mut harness, "aaa-triage");
+    harness.key("enter");
+    type_text(&mut harness, "Triage {{item}}");
+    harness.key("ctrl-s");
+    harness.settle().await;
+    assert!(
+        head(&store, "aaa-triage").await.is_some(),
+        "the new name was saved"
+    );
+    harness.key("backspace");
+    harness.settle().await;
+    harness.render();
+    harness.key("backspace");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} implement v"),
+        "back on `implement`:\n{frame}"
+    );
 }

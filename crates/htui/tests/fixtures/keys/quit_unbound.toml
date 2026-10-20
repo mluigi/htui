@@ -1,0 +1,5 @@
+# MOD-115 M2 (D7) fixture: a version-2 file that leaves htui no way to be left.
+version = 2
+
+[global]
+quit = []
