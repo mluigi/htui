@@ -1204,7 +1204,7 @@ pub trait WriteStore: ReadStore {
 
     // settings (D7, D8)
 
-    /// Writes one setting on one rung after [`validate`](crate::prompt::settings::validate):
+    /// Writes one setting on one rung after [`validate`]:
     /// rung, kind, range, `not_above` against the same rung's current peer (or its default).
     /// `App` is an `app_setting` row (`expected: None` = "I expect no row", the insert after a
     /// clear; `Stale` if one exists); `Project` merges one key into `project.settings` under CAS
@@ -3397,7 +3397,7 @@ pub enum SettingRung {
 }
 
 impl SettingRung {
-    /// The flag [`validate`](crate::prompt::settings::validate) checks against
+    /// The flag [`validate`] checks against
     /// [`SettingSpec::rungs`](crate::prompt::settings::SettingSpec::rungs).
     #[must_use]
     pub const fn flag(self) -> Rungs {

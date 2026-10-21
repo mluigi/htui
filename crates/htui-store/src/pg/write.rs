@@ -3517,13 +3517,13 @@ impl WriteStore for PgStore {
     /// ([`phase_token_budget_refusal`](htui_core::store::phase_token_budget_refusal))); a
     /// `graph_id` that names no row (the bump touches no
     /// row); a taken `(graph_id, position)`, then `(graph_id, name)`, then an `id` any phase holds
-    /// ([`already_exists`]), decided by [`phase_clash`]'s pre-read since 0020's deferrable uniques
+    /// ([`already_exists`]), decided by `phase_clash`'s pre-read since 0020's deferrable uniques
     /// report after the foreign keys;
     /// then `persona_id`, `planner_persona_id`, `integrate_persona_id`, `planner_agent_id`,
-    /// `integrate_agent_id` naming no row, decided by [`phase_reference_refusal`]'s pre-read and
+    /// `integrate_agent_id` naming no row, decided by `phase_reference_refusal`'s pre-read and
     /// worded `references_no_row("step_graph_phase.<column>", id, "persona" | "agent")` (MOD-26
     /// D5); a row deleted after that read is the five FKs' `23503`, mapped to the same words by
-    /// [`phase_fk_refused`].
+    /// `phase_fk_refused`.
     async fn create_phase(&self, phase: &StepGraphPhase) -> Result<StepGraphPhase> {
         if TemplateRole::of_name(&phase.name) != TemplateRole::Phase {
             return Err(StoreError::Constraint(reserved_phase_name(&phase.name)));
@@ -3619,7 +3619,7 @@ impl WriteStore for PgStore {
     ///
     /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Constraint`] for a reserved name,
     /// a `(graph_id, position)` / `(graph_id, name)` collision against the patched row, decided by
-    /// [`phase_clash`]'s pre-read once the row is locked and its token matches (MOD-137 blueprint
+    /// `phase_clash`'s pre-read once the row is locked and its token matches (MOD-137 blueprint
     /// §T2.2: 0020's deferrable uniques report after the foreign keys), or a `persona_id` that
     /// names no row (`fk_step_graph_phase_persona`'s `23503`, worded
     /// `references_no_row("step_graph_phase.persona_id", id, "persona")`), checked after the
@@ -4209,7 +4209,7 @@ impl WriteStore for PgStore {
     }
 
     /// The whole body, read in one `REPEATABLE READ READ ONLY` transaction (review R1 A-L2):
-    /// [`graph_body_on`]'s five statements share one snapshot, so a write committed between
+    /// `graph_body_on`'s five statements share one snapshot, so a write committed between
     /// two of them cannot tear the body (a graph row of one revision with phases of another).
     ///
     /// # Errors
