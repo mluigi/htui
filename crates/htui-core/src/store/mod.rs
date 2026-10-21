@@ -13,7 +13,10 @@ mod worker;
 pub mod conformance;
 
 pub use error::{Result, StoreError};
-pub use graph_rules::phase_row_refusal;
+pub use graph_rules::{
+    body_agent_refs, body_persona_refs, graph_body_shape_refusal, graph_body_topology_refusal,
+    phase_row_refusal,
+};
 pub use mem::MemStore;
 pub use traits::{
     BLANK_PERSONA_BODY, BLANK_SKILL_BODY, BindingFacts, CasOutcome, DeleteReach, DeleteTarget,
