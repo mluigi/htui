@@ -26,8 +26,8 @@ expression: frame
      1. implement · template implement · soft gate · inputs plan, review · budget inherited
 ▌name              research
  position          0
- template_name     research
- gate_hard (y/n)   n
- input_kinds
- token_budget
+ template          research
+ hard gate (y/n)   n
+ inputs
+ token budget
  persona

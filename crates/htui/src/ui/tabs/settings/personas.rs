@@ -257,8 +257,10 @@ pub struct PersonasSection {
     /// An import report that landed over an editor (R1 M-1): it opens on the next return to
     /// Browse, so no refusal, skip or dropped entry goes unnamed (OQ-7, R-13).
     pending_report: Option<Vec<PersonaOutcome>>,
-    /// The list's `(lines, first line drawn)` as of the last render, for the Settings pane's
-    /// scrollbar (MOD-115 M3 D-11); `None` while no list is drawn.
+    /// The list's or the import report's `(lines, first line drawn)` as of the last render, for
+    /// the Settings pane's scrollbar (MOD-115 M3 D-11), in the pane's terms: the notice rows under
+    /// it count as lines, since the pane measures the bar against its whole inner rect. `None`
+    /// while neither is drawn.
     scroll: Cell<Option<(usize, usize)>>,
 }
 
@@ -1911,7 +1913,19 @@ fn adds_one(keys: &Keys) -> String {
 
 /// The refusal of a write key while a write is in flight.
 fn in_flight(busy: &str) -> String {
-    format!("`{busy}` is still in flight")
+    format!("still {} \u{2014} wait for the store's answer", doing(busy))
+}
+
+/// A write in flight in words (MOD-115 M3: no request name on screen), by request name.
+fn doing(busy: &str) -> &'static str {
+    match busy {
+        "personas" => "reading the personas",
+        "create_persona" => "adding the persona",
+        "update_persona" => "saving the persona",
+        "delete_persona" => "deleting the persona",
+        "import_personas" => "importing personas",
+        _ => "writing",
+    }
 }
 
 impl SettingsSection for PersonasSection {
@@ -2072,6 +2086,27 @@ impl SettingsSection for PersonasSection {
                 );
             }
         }
+        // The report scrolls with `j`/`k`: its counts line and its entries, from the clamped top.
+        if let Mode::Report {
+            report,
+            top,
+            max_top,
+        } = &self.mode
+        {
+            let entries = if report.is_empty() {
+                0
+            } else {
+                max_top.get() + 1
+            };
+            self.scroll
+                .set(Some((1 + entries, (*top).min(max_top.get()))));
+        }
+        // The pane's bar is measured against the whole inner rect (D-11): the notice rows under
+        // the list are added, so it shows exactly when a line is hidden.
+        if let Some((total, offset)) = self.scroll.get() {
+            let below = usize::from(area.height.saturating_sub(pane.height));
+            self.scroll.set(Some((total + below, offset)));
+        }
         if !notice.is_empty() {
             frame.render_widget(Paragraph::new(notice), notice_area);
         }
@@ -2095,5 +2130,15 @@ mod tests {
             "changed elsewhere since you opened it \u{2014} reloaded; save again to retry against \
              the current row"
         );
+    }
+
+    /// MOD-115 M3: a write in flight reads in words: every request name has its own phrase, and
+    /// the refusal never prints the name itself.
+    #[test]
+    fn a_write_in_flight_reads_in_words() {
+        for name in REQUEST_NAMES {
+            assert_ne!(doing(name), doing("unknown"), "`{name}` has its own phrase");
+            assert!(!in_flight(name).contains('_'), "{}", in_flight(name));
+        }
     }
 }

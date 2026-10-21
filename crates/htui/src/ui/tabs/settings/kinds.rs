@@ -123,10 +123,10 @@ const POSITION_IS_A_NUMBER: &str = "`position` is a whole number";
 ///
 /// The only bound this section checks: every other one — the range, the column's width — is the
 /// store's, and it answers with its own sentence (M1 D7).
-const BUDGET_IS_A_NUMBER: &str = "`token_budget` is a whole number or empty";
+const BUDGET_IS_A_NUMBER: &str = "`token budget` is a whole number or empty";
 
 /// What the phase editor says when `gate_hard` is neither `y` nor `n` (B-10).
-const GATE_IS_Y_OR_N: &str = "`gate_hard (y/n)` is y or n";
+const GATE_IS_Y_OR_N: &str = "`hard gate (y/n)` is y or n";
 
 /// The delete confirmation's keys (D11), on the hint row and at the end of the question.
 const HINT_DELETING: HintSpec = &[
@@ -419,7 +419,9 @@ pub struct KindsSection {
     /// The last outcome, on the notice row under the pane.
     notice: Option<Notice>,
     /// The tree's `(lines, first line drawn)` as of the last render, for the Settings pane's
-    /// scrollbar (MOD-115 M3 D-11); `None` while no tree is drawn.
+    /// scrollbar (MOD-115 M3 D-11), in the pane's terms: the rows under the tree (an open editor
+    /// or question, the notice line) count as lines, since the pane measures the bar against its
+    /// whole inner rect. `None` while no tree is drawn.
     scroll: Cell<Option<(usize, usize)>>,
 }
 
@@ -1359,7 +1361,7 @@ impl KindsSection {
             // Only in Browse: an editor's own hint says what `Enter` is for, and a write in flight
             // is why `Enter` is not answering.
             Some(busy) if matches!(self.mode, Mode::Browse) && self.notice.is_none() => {
-                format!("{keys} \u{b7} {busy} in flight")
+                format!("{keys} \u{b7} {}\u{2026}", doing(busy))
             }
             _ => keys,
         }
@@ -1463,7 +1465,8 @@ impl KindsSection {
                 let answers = ctx.keys().hint(views::KINDS_CONFIRM, HINT_DELETING);
                 let mut lines = warning(&delete_question(name, prefix, &answers));
                 if matches!(stage, DeleteStage::InFlight) {
-                    lines.push(notice("delete_kind in flight", Tone::Info, theme));
+                    let waiting = format!("{}\u{2026}", doing(REQUEST_NAMES[3]));
+                    lines.push(notice(&waiting, Tone::Info, theme));
                 }
                 lines
             }
@@ -1599,7 +1602,7 @@ impl SettingsSection for KindsSection {
                 self.busy = None;
                 // The editor stays open over its text: a refused write is retried by fixing what
                 // was refused and pressing `Enter` again. A refused **delete** is not: the seam
-                // answered the question the confirmation asked, so leaving `delete_kind in flight`
+                // answered the question the confirmation asked, so leaving `deleting the kind…`
                 // on screen would be waiting for something that already came back.
                 if matches!(self.mode, Mode::Deleting { .. }) {
                     self.mode = Mode::Browse;
@@ -1673,7 +1676,10 @@ impl SettingsSection for KindsSection {
                     ctx.accent(),
                     theme,
                 );
-                self.scroll.set(Some((total, offset)));
+                // The pane's bar is measured against the whole inner rect (D-11): the rows under
+                // the tree are added, so it shows exactly when a tree line is hidden.
+                let below = usize::from(area.height.saturating_sub(rows.height));
+                self.scroll.set(Some((total + below, offset)));
             }
         }
         if !pane.is_empty() {
@@ -1790,9 +1796,9 @@ fn new_phase_fields(entry: &GraphEntry) -> Vec<Field> {
             "position",
             &next_position(entry.phases.iter().map(|phase| phase.position)),
         ),
-        Field::required("template_name", ""),
-        Field::required("gate_hard (y/n)", "n"),
-        Field::optional("input_kinds", ""),
+        Field::required("template", ""),
+        Field::required("hard gate (y/n)", "n"),
+        Field::optional("inputs", ""),
     ]
 }
 
@@ -1801,10 +1807,10 @@ fn edit_phase_fields(phase: &StepGraphPhase, personas: &[PersonaSummary]) -> Vec
     vec![
         Field::required("name", &phase.name),
         Field::required("position", &phase.position.to_string()),
-        Field::required("template_name", &phase.template_name),
-        Field::required("gate_hard (y/n)", if phase.gate_hard { "y" } else { "n" }),
-        Field::optional("input_kinds", &phase.input_kinds.join(",")),
-        Field::optional("token_budget", &budget_text(phase.token_budget)),
+        Field::required("template", &phase.template_name),
+        Field::required("hard gate (y/n)", if phase.gate_hard { "y" } else { "n" }),
+        Field::optional("inputs", &phase.input_kinds.join(",")),
+        Field::optional("token budget", &budget_text(phase.token_budget)),
         Field::optional("persona", &persona_text(phase.persona_id, personas)),
     ]
 }
@@ -2000,7 +2006,24 @@ fn deleted_notice(prefix: Option<&str>, mirror: &MirrorAfterDelete) -> String {
 
 /// What a second write of the same kind is told while the first is still out.
 fn in_flight(busy: &str) -> String {
-    format!("`{busy}` is still in flight")
+    format!("still {} \u{2014} wait for the store's answer", doing(busy))
+}
+
+/// A write in flight in words (MOD-115 M3: no request name on screen), by
+/// [`StoreRequest::name`].
+fn doing(busy: &str) -> &'static str {
+    match busy {
+        "catalogue" => "reading the catalogue",
+        "create_kind" => "adding the kind",
+        "update_kind" => "saving the kind",
+        "delete_kind" => "deleting the kind",
+        "create_graph" => "adding the graph",
+        "update_graph" => "saving the graph",
+        "create_phase" => "adding the phase",
+        "update_phase" => "saving the phase",
+        "set_phase_budget" => "saving the budget",
+        _ => "writing",
+    }
 }
 
 /// What an empty required field is told, before the store is asked anything.
@@ -2154,5 +2177,24 @@ mod tests {
             .key_hint(Keys::compiled(), &theme)
             .expect("the defaults bind the keys");
         assert_eq!(keys.to_string(), section.hint_text(Keys::compiled()));
+    }
+
+    /// MOD-115 M3: a write in flight reads in words. Every request name has its own phrase, and
+    /// neither the refusal nor the Browse hint prints the name itself.
+    #[test]
+    fn a_write_in_flight_reads_in_words() {
+        for name in REQUEST_NAMES {
+            assert_ne!(doing(name), doing("unknown"), "`{name}` has its own phrase");
+            assert!(!in_flight(name).contains('_'), "{}", in_flight(name));
+        }
+        let section = KindsSection {
+            busy: Some(REQUEST_NAMES[8]),
+            ..KindsSection::new()
+        };
+        let hint = section.hint_text(Keys::compiled());
+        assert!(
+            hint.ends_with(" \u{b7} saving the budget\u{2026}"),
+            "{hint}"
+        );
     }
 }

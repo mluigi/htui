@@ -10,6 +10,7 @@ use htui::persona_settings::PersonaWrite;
 use htui::store_worker::{StoreReply, StoreRequest};
 use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
+use htui::ui::kit::pane::Pane;
 use htui::ui::tabs::settings::personas::{
     COMMAND_RUN_IS_Y_OR_N, ENTER_A_PATH, IMPORTING, UNCHANGED, unsaved,
 };
@@ -841,7 +842,8 @@ async fn a_write_key_while_a_write_is_in_flight_is_refused() {
 
     assert!(!section.captures_input(), "no form opened");
     assert!(
-        error_text(&bench, &section).contains("`update_persona` is still in flight"),
+        error_text(&bench, &section)
+            .contains("still saving the persona \u{2014} wait for the store's answer"),
         "{}",
         frame(&bench, &section)
     );
@@ -1783,6 +1785,41 @@ async fn the_sentences_name_the_keys_in_force() {
     );
 }
 
+/// A field changed on both sides names the retry key in force too (MD-A, D-5): the clash
+/// sentence under `[field]` moved.
+#[tokio::test]
+async fn a_clash_names_the_retry_key_in_force() {
+    let (bench, mut section) = bench_with_keys(FIELD_REBOUND).await;
+    keys(&bench, &mut section, &["e", "down"]);
+    type_text(&bench, &mut section, " mine");
+    // The bench hands the section the canonical `Enter`, as the shell's `[field]` translation does.
+    bench.key(&mut section, "enter");
+    let _ = one_update(requests(&bench));
+
+    let (rows, row) = moved_elsewhere("Theirs.").await;
+    bench.reply(
+        &mut section,
+        &StoreReply::PersonaWritten {
+            personas: rows,
+            outcome: PersonaWrite::Stale { id: row.id },
+        },
+    );
+
+    let frame = frame(&bench, &section);
+    assert!(
+        shows(
+            &frame,
+            "changed elsewhere \u{2014} reloaded; Ctrl+t retries \u{b7} also changed elsewhere: \
+             description"
+        ),
+        "{frame}"
+    );
+    assert!(
+        !frame.contains("Enter retries"),
+        "no literal key is left: {frame}"
+    );
+}
+
 /// MOD-85: in the fields form and the import path the accent marks the focused row's gutter
 /// alone; no label is drawn in it.
 #[tokio::test]
@@ -1888,6 +1925,91 @@ async fn the_section_reports_its_scroll_for_the_pane() {
     let _ = frame(&bench, &section);
     // Two rows and the cursor row's one detail line.
     assert_eq!(section.scroll(), Some((3, 0)));
+}
+
+/// One section drawn inside a kit pane as the Settings tab draws it (MOD-115 M3 C3, D-11): the
+/// section into the pane's inner rect first, then the frame with the section's scroll as its bar.
+fn framed_at(bench: &SectionBench, section: &dyn SettingsSection, height: u16) -> Buffer {
+    let area = Rect::new(0, 0, 100, height);
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(100, height),
+        TerminalOptions {
+            viewport: Viewport::Fixed(area),
+        },
+    )
+    .expect("a test terminal");
+    let ctx = bench.ctx();
+    let theme = Theme::default();
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            section.render(frame, Pane::inner(area), &ctx);
+            let mut pane = Pane::new(section.title());
+            if let Some((total, offset)) = section.scroll() {
+                pane = pane.scrollbar(total, offset);
+            }
+            let _ = pane.render(frame, area, &theme);
+        })
+        .expect("the section draws");
+    terminal.backend().buffer().clone()
+}
+
+/// Whether the scrollbar's thumb (`┃`) is drawn on the right border.
+fn has_thumb(buffer: &Buffer) -> bool {
+    let x = buffer.area.width - 1;
+    (0..buffer.area.height).any(|y| buffer[(x, y)].symbol() == "\u{2503}")
+}
+
+/// MOD-115 M3 D-11: the pane measures its bar against its whole inner rect, so the section
+/// reports its scroll in the pane's terms: a notice under the list takes rows from it, and a row
+/// it hides shows a thumb. The import report scrolls with `j`, and its bar follows.
+#[tokio::test]
+async fn the_pane_draws_a_thumb_exactly_when_a_row_is_hidden() {
+    let architect = architect(&demo_rows().await);
+    let rows: Vec<Persona> = (0..6)
+        .map(|n| Persona {
+            name: format!("persona-{n}"),
+            ..architect.clone()
+        })
+        .collect();
+    let (bench, mut section) = bench_with(rows).await;
+    // Six rows and the cursor row's one detail line in seven inner rows: all of it fits.
+    assert!(
+        !has_thumb(&framed_at(&bench, &section, 9)),
+        "nothing is hidden"
+    );
+
+    start_import(&bench, &mut section);
+    let _ = requests(&bench);
+    assert!(
+        has_thumb(&framed_at(&bench, &section, 9)),
+        "the import notice hides the last row, and the bar says so"
+    );
+
+    bench.reply(
+        &mut section,
+        &StoreReply::PersonaImports(Box::new(PersonaImports {
+            personas: Ok(demo_rows().await),
+            report: mixed_report(),
+        })),
+    );
+    assert!(section.captures_input(), "the report is open");
+    assert!(
+        has_thumb(&framed_at(&bench, &section, 6)),
+        "a long report has a bar"
+    );
+    assert_eq!(section.scroll().map(|(_, offset)| offset), Some(0));
+    bench.key(&mut section, "j");
+    let _ = framed_at(&bench, &section, 6);
+    assert_eq!(
+        section.scroll().map(|(_, offset)| offset),
+        Some(1),
+        "`j` scrolls the report, and the bar follows"
+    );
+    assert!(
+        !has_thumb(&framed_at(&bench, &section, 30)),
+        "the whole report fits"
+    );
 }
 
 /// MOD-81: the section at 80 columns, through the shell.

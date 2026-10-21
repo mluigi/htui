@@ -12,6 +12,7 @@ use htui::hierarchy::MirrorAfterDelete;
 use htui::store_worker::{StoreReply, StoreRequest, serve};
 use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
+use htui::ui::kit::pane::Pane;
 use htui::ui::tabs::settings::{
     AgentsSection, HierarchySection, KindsSection, SettingsSection, SettingsTab,
 };
@@ -1179,8 +1180,15 @@ async fn n_on_a_kind_opens_the_kind_editor_and_enter_creates() {
     bench.key(&mut section, "enter");
     assert!(bench.drained().is_empty());
     assert!(
-        error_text(&bench, &section, 100).contains(&"`create_kind` is still in flight".to_owned()),
-        "a second Enter says why it did nothing"
+        error_text(&bench, &section, 100)
+            .contains(&"still adding the kind \u{2014} wait for the store's answer".to_owned()),
+        "a second Enter says why it did nothing, in words"
+    );
+    assert!(
+        !error_text(&bench, &section, 100)
+            .iter()
+            .any(|text| text.contains("create_kind")),
+        "no request name is printed (MOD-115 M3)"
     );
 }
 
@@ -1596,7 +1604,8 @@ async fn y_on_the_prefix_warning_writes_once() {
     bench.key(&mut section, "enter");
     assert!(bench.drained().is_empty(), "one write of a kind at a time");
     assert!(
-        error_text(&bench, &section, 100).contains(&"`update_kind` is still in flight".to_owned())
+        error_text(&bench, &section, 100)
+            .contains(&"still saving the kind \u{2014} wait for the store's answer".to_owned())
     );
 }
 
@@ -1624,10 +1633,10 @@ async fn e_on_a_phase_opens_seven_fields_and_enter_sends_update_phase() {
     let rows: Vec<usize> = [
         "name",
         "position",
-        "template_name",
-        "gate_hard (y/n)",
-        "input_kinds",
-        "token_budget",
+        "template",
+        "hard gate (y/n)",
+        "inputs",
+        "token budget",
         "persona",
     ]
     .into_iter()
@@ -1786,7 +1795,7 @@ async fn a_non_number_budget_is_refused() {
     assert!(bench.drained().is_empty());
     assert!(
         error_text(&bench, &section, 100)
-            .contains(&"`token_budget` is a whole number or empty".to_owned())
+            .contains(&"`token budget` is a whole number or empty".to_owned())
     );
 }
 
@@ -1978,7 +1987,7 @@ async fn n_on_a_phase_creates_in_its_graph() {
     bench.key(&mut section, "n");
     let frame = bench.render_section(&section, 100);
     assert!(
-        !frame.contains("token_budget"),
+        !frame.contains("token budget"),
         "a new phase inherits its budget; the column is set by `e` afterwards (B-3): {frame}"
     );
     type_at(&bench, &mut section, "triage");
@@ -2034,7 +2043,7 @@ async fn a_gate_hard_that_is_not_y_or_n_is_refused() {
     bench.key(&mut section, "enter");
 
     assert!(bench.drained().is_empty());
-    assert!(error_text(&bench, &section, 100).contains(&"`gate_hard (y/n)` is y or n".to_owned()));
+    assert!(error_text(&bench, &section, 100).contains(&"`hard gate (y/n)` is y or n".to_owned()));
 }
 
 // -------------------------------------------------------------------------------------------
@@ -2363,6 +2372,12 @@ async fn y_sends_delete_kind_and_a_refusal_is_the_seams_sentence() {
     };
     assert_eq!(*scope, bench_scope().await);
     assert_eq!(*id, ids::KIND_VULKAN_FEAT);
+    let waiting = bench.render_section(&section, 100);
+    assert!(
+        waiting.contains("deleting the kind\u{2026}"),
+        "the delete in flight reads in words: {waiting}"
+    );
+    assert!(!waiting.contains("delete_kind"), "{waiting}");
 
     bench.reply(
         &mut section,
@@ -2521,7 +2536,7 @@ async fn ctrl_d_in_browse_opens_no_delete_question() {
         "no question on screen"
     );
 
-    for chord in ["ctrl-n", "ctrl-o", "ctrl-e", "ctrl-r"] {
+    for chord in ["ctrl-n", "ctrl-g", "ctrl-o", "ctrl-e", "ctrl-r"] {
         assert_eq!(bench.key(&mut section, chord), Handled::Pass, "{chord}");
         assert!(!section.captures_input(), "{chord} opened nothing");
         assert!(bench.drained().is_empty(), "{chord} asked nothing");
@@ -2709,6 +2724,9 @@ async fn a_phase_row_reads_its_gate_inputs_and_budget_in_words() {
         frame.contains("inputs plan, review"),
         "a list of inputs reads as one: {frame}"
     );
+    // `budget inherited` (MOD-115 M3 L-kinds deviation from §5.4's `inherits the budget`): three
+    // cells shorter, so a bound phase's persona still fits a 100-column row. The raw column read
+    // `budget inherit` followed by a separator.
     for raw in ["gate soft", "gate hard", "in none", "budget inherit "] {
         assert!(!frame.contains(raw), "`{raw}` is gone: {frame}");
     }
@@ -2854,8 +2872,9 @@ async fn the_section_reports_its_scroll_for_the_pane() {
         })
         .sum::<usize>();
 
+    // In the pane's terms (D-11): the notice line under the tree is a row the tree cannot use.
     let _ = drawn_at(&bench, &section, 100, 10);
-    assert_eq!(section.scroll(), Some((rows, 0)));
+    assert_eq!(section.scroll(), Some((rows + 1, 0)));
 
     // The last kind, `TOOL`, with its three phases under it: a kind row has no detail line.
     let tool = rows - 4;
@@ -2864,11 +2883,96 @@ async fn the_section_reports_its_scroll_for_the_pane() {
     }
     let buffer = drawn_at(&bench, &section, 100, 10);
     // Nine rows above the notice line; the cursor's is the last of them.
-    assert_eq!(section.scroll(), Some((rows, tool - 8)));
+    assert_eq!(section.scroll(), Some((rows + 1, tool - 8)));
     let last: String = (0..100).map(|x| buffer[(x, 8)].symbol()).collect();
     assert!(
         last.starts_with('\u{258c}') && last.contains("TOOL"),
         "the cursor is on screen: {last}"
+    );
+}
+
+/// The demo tree's line count: the project row, then each kind's row and its graph's phases.
+fn tree_lines(snapshot: &CatalogueSnapshot) -> usize {
+    1 + snapshot.projects[0]
+        .kinds
+        .iter()
+        .map(|kind| {
+            1 + snapshot.projects[0]
+                .graph(kind.default_graph_id)
+                .map_or(0, |entry| entry.phases.len())
+        })
+        .sum::<usize>()
+}
+
+/// One section drawn inside a kit pane as the Settings tab draws it (MOD-115 M3 C3, D-11): the
+/// section into the pane's inner rect first, then the frame with the section's scroll as its bar.
+fn framed_at(
+    bench: &SectionBench,
+    section: &dyn SettingsSection,
+    width: u16,
+    height: u16,
+) -> Buffer {
+    let area = Rect::new(0, 0, width, height);
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(width, height),
+        TerminalOptions {
+            viewport: Viewport::Fixed(area),
+        },
+    )
+    .expect("a test terminal");
+    let ctx = bench.ctx();
+    let theme = Theme::default();
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            section.render(frame, Pane::inner(area), &ctx);
+            let mut pane = Pane::new(section.title());
+            if let Some((total, offset)) = section.scroll() {
+                pane = pane.scrollbar(total, offset);
+            }
+            let _ = pane.render(frame, area, &theme);
+        })
+        .expect("the section draws");
+    terminal.backend().buffer().clone()
+}
+
+/// The rows of the right border the scrollbar's thumb (`┃`) is drawn on.
+fn thumb_rows(buffer: &Buffer) -> Vec<u16> {
+    let x = buffer.area.width - 1;
+    (0..buffer.area.height)
+        .filter(|y| buffer[(x, *y)].symbol() == "\u{2503}")
+        .collect()
+}
+
+/// MOD-115 M3 D-11: the pane measures its bar against its whole inner rect, so the section
+/// reports its scroll in the pane's terms. A thumb shows exactly when a tree row is hidden: the
+/// notice line, and an open editor, are rows under the tree it cannot use.
+#[tokio::test]
+async fn the_pane_draws_a_thumb_exactly_when_a_tree_row_is_hidden() {
+    let (bench, mut section, snapshot) = bench_with_demo().await;
+    let rows = tree_lines(&snapshot);
+    // The borders, the tree, the notice line: every tree row fits.
+    let height = u16::try_from(rows + 3).expect("a small tree");
+    let fits = framed_at(&bench, &section, 100, height);
+    assert!(thumb_rows(&fits).is_empty(), "nothing is hidden, no bar");
+
+    // One row less: the last phase is off screen, and the bar says so.
+    let cut = framed_at(&bench, &section, 100, height - 1);
+    assert!(!thumb_rows(&cut).is_empty(), "a hidden row shows a thumb");
+
+    // The last phase's editor under the tree: the tree scrolls to its end, the thumb with it.
+    for _ in 1..rows {
+        bench.key(&mut section, "j");
+    }
+    bench.key(&mut section, "e");
+    assert!(section.captures_input(), "the phase editor is open");
+    let editing = framed_at(&bench, &section, 100, height);
+    let thumb = thumb_rows(&editing);
+    assert!(!thumb.is_empty(), "the form hides tree rows");
+    assert_eq!(
+        thumb.last(),
+        Some(&(height - 2)),
+        "scrolled to the end, the thumb sits at the bottom: {thumb:?}"
     );
 }
 
@@ -2888,5 +2992,9 @@ async fn the_section_at_80_columns() {
     harness.settle().await;
     let frame = harness.render();
     assert!(frame.contains("soft gate"), "{frame}");
+    assert!(
+        frame.contains('\u{2503}'),
+        "the tree overflows the pane, so the pane shows a thumb: {frame}"
+    );
     insta::assert_snapshot!("demo_80", frame);
 }
