@@ -1380,15 +1380,16 @@ async fn a_valid_dsn_emits_set_dsn_and_marks_busy() {
     assert!(!section.captures_input(), "the field closed behind it");
     let hint = bench.key_hint(&section);
     assert!(
-        hint.ends_with("set_dsn in flight"),
-        "the hint says what is out: {hint}"
+        hint.ends_with("\u{b7} storing the DSN\u{2026}"),
+        "the hint says what is out, in words: {hint}"
     );
 
     // A second write is refused until the first answers (the one-write-in-flight guard, D5).
     bench.key(&mut section, "e");
     assert!(!section.captures_input(), "{:?}", section);
     assert!(
-        flattened(&frame_of(&bench, &section)).contains("set_dsn"),
+        flattened(&frame_of(&bench, &section))
+            .contains("still storing the DSN \u{2014} wait for the store's answer"),
         "and says why"
     );
 }
@@ -1939,7 +1940,7 @@ async fn a_failed_write_shows_the_seams_sentence() {
     let frame = frame_of(&bench, &section);
     assert!(flattened(&frame).contains(DEMO_SESSION), "{frame}");
     assert!(
-        !bench.key_hint(&section).contains("in flight"),
+        !bench.key_hint(&section).contains("rebuilding the mirror"),
         "and nothing is still out: {frame}"
     );
     assert!(
@@ -2180,4 +2181,201 @@ async fn a_rebound_answer_ends_the_question() {
     bench.key(&mut section, "y");
     assert!(section.captures_input(), "`y` is not an answer any more");
     assert!(bench.drained().is_empty(), "`y` sends nothing");
+}
+
+// ---- MOD-115 M3 (lane L-sec): the section on the kit ----------------------------------------------
+
+/// `field.submit` and `field.cancel` moved (MOD-115 M3 C6): every field's `Enter` and `Esc`.
+const FIELD_REBOUND: &str = "version = 2\n[field]\nsubmit = [\"ctrl-t\"]\ncancel = [\"ctrl-o\"]\n";
+
+/// A bench over `file`'s keys, `snapshot` already delivered.
+async fn bench_with_keys(
+    file: &str,
+    snapshot: &ConnectionSnapshot,
+) -> (SectionBench, ConnectionSection) {
+    let keys = htui::keys::load_str(file).expect("the key file loads");
+    let bench = SectionBench::new().await.with_keys(keys);
+    let mut section = ConnectionSection::new();
+    feed(&bench, &mut section, snapshot);
+    (bench, section)
+}
+
+/// One section drawn into a 100x30 buffer: a marker's colour is a style, not text.
+fn drawn(bench: &SectionBench, section: &ConnectionSection) -> ratatui::buffer::Buffer {
+    let area = ratatui::layout::Rect::new(0, 0, 100, 30);
+    let mut terminal = ratatui::Terminal::with_options(
+        ratatui::backend::TestBackend::new(100, 30),
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(area),
+        },
+    )
+    .expect("a test terminal");
+    let ctx = bench.ctx();
+    terminal
+        .draw(|frame| section.render(frame, frame.area(), &ctx))
+        .expect("the section draws");
+    terminal.backend().buffer().clone()
+}
+
+/// The field's hint reads as before under the compiled keys and names the rebound chords once
+/// `[field]` moves them (MD-A, C6).
+#[tokio::test]
+async fn the_field_hint_names_the_field_keys_in_force() {
+    let (bench, mut section) = bench_with_keys(FIELD_REBOUND, &stored_snapshot()).await;
+    let compiled = SectionBench::new().await;
+    bench.key(&mut section, "e");
+    assert_eq!(
+        compiled.key_hint(&section),
+        "Enter store \u{b7} Esc cancel \u{b7} typed text is never shown"
+    );
+    assert_eq!(
+        bench.key_hint(&section),
+        "Ctrl+t store \u{b7} Ctrl+o cancel \u{b7} typed text is never shown"
+    );
+}
+
+/// The guides under the DSN field name the submit key in force (C5, D-15).
+#[tokio::test]
+async fn the_guides_name_the_submit_key_in_force() {
+    let (bench, section) = bench_with_keys(FIELD_REBOUND, &empty_snapshot()).await;
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(
+        frame.contains("no DSN is stored; type one and press Ctrl+t"),
+        "{frame}"
+    );
+
+    let (bench, mut section) = bench_with_keys(FIELD_REBOUND, &stored_snapshot()).await;
+    bench.key(&mut section, "e");
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(frame.contains("Ctrl+t replaces the stored DSN"), "{frame}");
+    assert!(!frame.contains("Enter replaces"), "{frame}");
+
+    let (bench, mut section) = bench_with_keys(FIELD_REBOUND, &unreadable_snapshot()).await;
+    bench.key(&mut section, "e");
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(
+        frame.contains("the keyring could not be read; Ctrl+t tries to store a DSN in it"),
+        "{frame}"
+    );
+}
+
+/// The field is on the DSN row (D3, audit item 3), behind the form's marker; no label is drawn
+/// in the accent, only the focused row's gutter in the tab's (MOD-85).
+#[tokio::test]
+async fn the_field_is_on_the_dsn_row() {
+    let (bench, mut section) = bench_with(&stored_snapshot()).await;
+    bench.key(&mut section, "e");
+    typed(&bench, &mut section, TYPED);
+    let buffer = drawn(&bench, &section);
+    let text = |y: u16| {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect::<String>()
+    };
+    let dsn = (0..buffer.area.height)
+        .find(|y| text(*y).contains("(19)"))
+        .expect("the field is drawn");
+    assert!(text(dsn).starts_with("\u{258c}DSN "), "{:?}", text(dsn));
+    assert!(
+        !(0..buffer.area.height).any(|y| text(y).starts_with("DSN: ")),
+        "the field under the rows is gone"
+    );
+    let theme = htui::ui::Theme::default();
+    let accent = theme.tab_accent("settings");
+    assert_eq!(
+        buffer[(0, dsn)].fg,
+        accent.fg.unwrap_or(ratatui::style::Color::Reset)
+    );
+    for y in 0..buffer.area.height {
+        for x in 1..buffer.area.width {
+            assert_ne!(
+                buffer[(x, y)].style().fg,
+                theme.accent.fg,
+                "no label in the accent at ({x}, {y}): {:?}",
+                text(y)
+            );
+        }
+    }
+}
+
+/// MOD-83: a count with a noun is plural only when it is more than one.
+#[tokio::test]
+async fn pending_migrations_are_counted_in_words() {
+    for (n, words) in [(1, "1 migration pending"), (3, "3 migrations pending")] {
+        let mut snapshot = stored_snapshot();
+        snapshot.last_attempt = Some(Attempt {
+            at: at(10, 20),
+            outcome: AttemptOutcome::MigrationsPending(n),
+        });
+        let (bench, section) = bench_with(&snapshot).await;
+        let frame = flattened(&frame_of(&bench, &section));
+        assert!(
+            frame.contains(&format!("last dial 10:20:00: {words}")),
+            "{frame}"
+        );
+    }
+}
+
+/// MOD-83: a refused read names what brings the rows back.
+#[tokio::test]
+async fn a_failed_read_names_the_next_step() {
+    let bench = SectionBench::new().await;
+    let mut section = ConnectionSection::new();
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: READ_NAME,
+            message: NO_WORKER.to_owned(),
+        },
+    );
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(
+        frame.contains("r asks again once the store answers"),
+        "{frame}"
+    );
+}
+
+/// Each question is the error line of the row it is about: the clear under DSN, the rebuild under
+/// Rebuild cache.
+#[tokio::test]
+async fn each_question_sits_under_its_row() {
+    let (bench, mut section) = bench_with(&stored_snapshot()).await;
+    bench.key(&mut section, "c");
+    let frame = frame_of(&bench, &section);
+    let lines: Vec<&str> = frame.lines().collect();
+    let dsn = lines
+        .iter()
+        .position(|line| line.starts_with("\u{258c}DSN"))
+        .expect("the DSN row is focused");
+    assert!(
+        lines[dsn + 1].contains("Remove the DSN from the keyring?"),
+        "{frame}"
+    );
+
+    bench.key(&mut section, "n");
+    bench.key(&mut section, "R");
+    let frame = frame_of(&bench, &section);
+    let lines: Vec<&str> = frame.lines().collect();
+    let rebuild = lines
+        .iter()
+        .position(|line| line.starts_with("\u{258c}Rebuild cache"))
+        .expect("the Rebuild row is focused");
+    assert!(
+        lines[rebuild + 1].contains("Rebuild the mirror?"),
+        "{frame}"
+    );
+}
+
+/// MOD-81: the section at 80 columns, through the shell (`--demo`: no keyring, no mirror).
+#[tokio::test]
+async fn the_section_at_80_columns() {
+    let mut harness = Harness::demo()
+        .size(80, 24)
+        .with_tab(Box::new(SettingsTab::with_sections(vec![Box::new(
+            ConnectionSection::new(),
+        )])));
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(frame.contains("n/a in a demo session"), "{frame}");
+    insta::assert_snapshot!("demo_80", frame);
 }
