@@ -34,26 +34,31 @@ use serde_json::{Value, json};
 /// before `a`: the cursor is what `a` acts on.
 const ROW: &str = "demo-login";
 
-/// Where `on this box` starts in a rendered row: the seven columns before it — MOD-2 D89's `name`
-/// 10, then 9, 12, 6, D76's `default` 21, 7 and D73's `quota` 13 — plus one space of
-/// `column_spacing` after each.
+/// Where `on this box` starts in a rendered row, behind `kit::list`'s gutter cell: the seven
+/// columns before it — MOD-2 D89's `name` 10, then 9, 12, 6, D76's `default` 21, `active` 6 and
+/// D73's `quota` 13 — plus one space of spacing after each.
 ///
 /// **D89 moved this by 2.** `name` became the table's flexible column and `on this box` became the
 /// donor that paid for it, fixed at [`ON_BOX_WIDTH`]. Inside the Settings pane's border the section
-/// draws 98, so `name` draws 10 here.
-const ON_BOX_AT: usize = 85;
+/// draws 98, and since MOD-115 M3 the gutter takes one of them, so `name` draws 10 here only
+/// because `enabled` became `active` in 6 (MOD-81).
+const ON_BOX_AT: usize = 84;
 
 /// How wide `on this box` draws since D89: 13 at every width, because it is no longer the column
-/// that absorbs the slack. `unauthenticated` is 15 and therefore clips — the stated price of D89,
-/// which [`the_name_column_holds_the_whole_row_name_and_on_this_box_pays`] in `tests/settings.rs`
-/// records as accepted rather than as damage.
-///
-/// [`the_name_column_holds_the_whole_row_name_and_on_this_box_pays`]: crate
+/// that absorbs the slack. The verdict a probe of `unauthenticated` reads as, `⚠ needs login`
+/// (MOD-83, D-18), is 13 and fills it.
 const ON_BOX_WIDTH: usize = 13;
 
-/// How wide the `name` column draws inside the pane's border (D89): 10, which is what
-/// `Constraint::Min(10)` guarantees at the narrowest width the app draws in. [`ROW`] is 10
-/// characters and now renders **whole**, where D76's 8 clipped it to `demo-log`.
+/// What the `on this box` cell reads for a probe that found no login (MOD-83, D-18).
+const NEEDS_LOGIN: &str = "\u{26a0} needs login";
+
+/// The re-probe's verdict a finished login's notice names when the probe found the login
+/// (`logged in: ● ready`, MOD-83).
+const READY: &str = "\u{25cf} ready";
+
+/// How wide the `name` column draws inside the pane's border (D89): 10, which is what the
+/// table's 10-cell minimum guarantees at the narrowest width the app draws every column in.
+/// [`ROW`] is 10 characters and renders **whole**, where D76's 8 clipped it to `demo-log`.
 const NAME_WIDTH: usize = 10;
 
 /// The one method the fixture advertises. A made-up id: the chooser is fed by the agent's own live
@@ -396,13 +401,16 @@ impl Rig {
     /// `a`, then the chooser the agent's own `initialize` fed.
     async fn start_login(&mut self) {
         self.harness.key("a");
-        // `choose a meth`, not `choose a method`: D89 fixed the `on this box` column at
-        // [`ON_BOX_WIDTH`] and this prompt is 15 characters, so the frame carries the clipped form.
+        // `choose a met…`, not `choose a method`: D89 fixed the `on this box` column at
+        // [`ON_BOX_WIDTH`] and this prompt is 15 characters, so the frame carries the form
+        // `cells::fit` cut (MOD-115 M3).
         // Matching the whole string here would wait out [`PATIENCE`] on a screen that is doing
         // exactly what it was asked to — which is the failure this comment exists to prevent
         // somebody re-introducing.
-        self.until("offered a method", |frame| frame.contains("choose a meth"))
-            .await;
+        self.until("offered a method", |frame| {
+            frame.contains("choose a met\u{2026}")
+        })
+        .await;
     }
 
     /// The login row's line, unbordered, found by the name **as the `name` column drew it**.
@@ -414,9 +422,13 @@ impl Rig {
         let drawn = ROW.chars().take(NAME_WIDTH).collect::<String>();
         frame
             .lines()
-            .find(|line| line.trim_start_matches('\u{2502}').starts_with(&drawn))
+            // Behind the border and `kit::list`'s gutter cell (MOD-115 M3).
+            .map(|line| {
+                let line = line.trim_matches('\u{2502}');
+                line.char_indices().nth(1).map_or("", |(at, _)| &line[at..])
+            })
+            .find(|line| line.starts_with(&drawn))
             .unwrap_or_else(|| panic!("the `{ROW}` row is rendered:\n{frame}"))
-            .trim_matches('\u{2502}')
             .to_owned()
     }
 
@@ -486,7 +498,7 @@ async fn a_then_enter_logs_in_and_the_cell_reads_the_probes_verdict() {
     let mut rig = Rig::new(&[("FIXTURE_KEY", "set"), ("FIXTURE_CRED", CREDENTIAL)]).await;
     assert_eq!(
         rig.on_box_cell(),
-        "unauthenticat",
+        NEEDS_LOGIN,
         "the box starts where the probe left it"
     );
 
@@ -497,7 +509,7 @@ async fn a_then_enter_logs_in_and_the_cell_reads_the_probes_verdict() {
         .await;
 
     assert!(
-        frame.contains("logged in: ready"),
+        frame.contains(&format!("logged in: {READY}")),
         "the notice is the probe's verdict, not the call's: {frame}"
     );
     assert_eq!(
@@ -507,7 +519,7 @@ async fn a_then_enter_logs_in_and_the_cell_reads_the_probes_verdict() {
     );
     assert_ne!(
         rig.on_box_cell(),
-        "unauthenticat",
+        NEEDS_LOGIN,
         "the cell was re-read from that row: {}",
         rig.harness.render()
     );
@@ -530,14 +542,14 @@ async fn a_then_enter_into_no_credential_still_reads_unauthenticated() {
         .await;
 
     assert!(
-        frame.contains("logged in: unauthenticated"),
+        frame.contains(&format!("logged in: {NEEDS_LOGIN}")),
         "the call returned and the box says otherwise: {frame}"
     );
     assert_eq!(
         rig.stored_status().await.as_deref(),
         Some("unauthenticated")
     );
-    assert_eq!(rig.on_box_cell(), "unauthenticat");
+    assert_eq!(rig.on_box_cell(), NEEDS_LOGIN);
 }
 
 /// `x` mid-login: the runtime is asked to stop, the stream ends `Cancelled`, and the row goes back
@@ -567,7 +579,7 @@ async fn x_mid_login_ends_cancelled_and_the_cell_goes_back() {
     assert!(frame.contains("login cancelled"), "{frame}");
     assert_eq!(
         rig.on_box_cell(),
-        "unauthenticat",
+        NEEDS_LOGIN,
         "a cancelled login leaves the box exactly as it found it: {frame}"
     );
     assert_eq!(
@@ -711,7 +723,7 @@ async fn p_paste_enter_delivers_to_the_listener_and_the_cell_reads_the_probes_ve
     .await;
     assert_eq!(
         rig.on_box_cell(),
-        "unauthenticat",
+        NEEDS_LOGIN,
         "the box starts where the probe left it"
     );
 
@@ -785,7 +797,7 @@ async fn p_paste_enter_delivers_to_the_listener_and_the_cell_reads_the_probes_ve
         })
         .await;
     assert!(
-        frame.contains("logged in: ready"),
+        frame.contains(&format!("logged in: {READY}")),
         "the notice is the probe's verdict, not the call's: {frame}"
     );
     assert_eq!(
@@ -797,7 +809,7 @@ async fn p_paste_enter_delivers_to_the_listener_and_the_cell_reads_the_probes_ve
     swept(&frame);
     assert_ne!(
         rig.on_box_cell(),
-        "unauthenticat",
+        NEEDS_LOGIN,
         "the cell was re-read from that row: {frame}"
     );
 }

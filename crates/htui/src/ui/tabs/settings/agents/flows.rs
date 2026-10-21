@@ -10,18 +10,23 @@ use htui_agent::probe::{ProbeSnapshot, ProbeStatus};
 use htui_agent::registry::caps_for;
 use htui_agent::{InstallOutcome, InstallPhase, InstallPlan, ManualSteps};
 use htui_core::model::AgentId;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::path::Path;
 
 use crate::app::{Action, Ctx, Handled};
-use crate::keys::{Act, KeyChord, Keys, views};
+use crate::keys::{Act, Keys, views};
 use crate::store_worker::{AuthFrame, InstallFrame, StoreRequest};
+use crate::ui::kit::form::{Field as FormRow, Form, Value as FormValue};
+use crate::ui::kit::label::{self, plural};
+use crate::ui::kit::list::{self, GUTTER};
 use crate::ui::kit::modal::modal_rest;
 use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::KeyEvent;
 
+use super::table::verdict;
 use super::{AgentsSection, Mode, swallows};
 
 /// What the `on this box` column reads between `x` and the install's own last frame.
@@ -275,9 +280,9 @@ impl AgentsSection {
         // and the seam's own sentence is the one to print.
         if !caps_for(&summary.agent).authenticate {
             ctx.emit(Action::Error(format!(
-                "`{}` is a `{}` agent; it has no `authenticate` call",
+                "`{}` is a {} agent; it has no `authenticate` call",
                 summary.agent.name,
-                summary.agent.transport.as_str()
+                label::transport(summary.agent.transport)
             )));
             return;
         }
@@ -321,7 +326,7 @@ impl AgentsSection {
     /// tab-switches dead for as long as a human is reading a method list — which is why the choice
     /// is `Enter` and not a digit in the first place.
     pub(super) fn answer_chooser(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         for act in ctx.keys().actions(views::AGENTS_CHOOSER, chord) {
             match act {
                 Act::ListDown => self.move_choice(true),
@@ -516,7 +521,7 @@ impl AgentsSection {
                 *paste = None;
                 Handled::Consumed
             }
-            FieldOutcome::Pass => modal_rest(views::CAPTURE, KeyChord::from_event(key)),
+            FieldOutcome::Pass => modal_rest(views::CAPTURE, ctx.pressed(&key)),
             FieldOutcome::Submit => {
                 let url = RedirectUrl::new(field.take());
                 match advertised
@@ -619,7 +624,7 @@ impl AgentsSection {
                     AuthCall::Logout => "logged out",
                 };
                 self.auth = AuthState::Idle;
-                self.notice = Some(format!("{what}: {status}"));
+                self.notice = Some(format!("{what}: {}", verdict(*status)));
                 ctx.request(StoreRequest::Agents);
             }
             // The agent's own sentence, verbatim (MOD-21 D5): the live refusal names the variable
@@ -688,12 +693,21 @@ impl AgentsSection {
     /// The login half of the pane: the chooser, or the stream (MOD-21 D20).
     ///
     /// Under the stream's link, at most one line of MOD-22's (D270, D282), the first that applies:
-    /// the open paste field (a prompt, then `› ` and the masked field), a delivery in flight, or
-    /// the advertised redirect with the key that pastes for it. The prompt and the field replace
-    /// the redirect line rather than joining it, so the pane is at most six stderr lines, the link
-    /// and two more. Every one of them names [`Advertised::target`] and never a pasted byte. It
-    /// takes the width because the field draws a window of its dots.
-    pub(super) fn auth_pane(&self, width: u16, theme: &Theme, keys: &Keys) -> Vec<Line<'static>> {
+    /// the open paste field (a prompt, then the masked field as a one-row `kit::form`), a delivery
+    /// in flight, or the advertised redirect with the key that pastes for it. The prompt and the
+    /// field replace the redirect line rather than joining it, so the pane is at most six stderr
+    /// lines, the link and two more. Every one of them names [`Advertised::target`] and never a
+    /// pasted byte. It takes the width because the field draws a window of its dots.
+    ///
+    /// Every line sits behind `kit::list`'s gutter (MOD-115 M3), the chooser's cursor row in it
+    /// and the band.
+    pub(super) fn auth_pane(
+        &self,
+        width: u16,
+        accent: Style,
+        theme: &Theme,
+        keys: &Keys,
+    ) -> Vec<Line<'static>> {
         match &self.auth {
             AuthState::Choosing {
                 methods,
@@ -702,14 +716,15 @@ impl AgentsSection {
                 cursor,
                 ..
             } => {
-                let style = |row: usize| {
+                let choice = |row: usize, text: String| {
+                    let line = Line::styled(text, theme.base);
                     if row == *cursor {
-                        theme.accent
+                        chosen(line, width, accent, theme)
                     } else {
-                        theme.base
+                        behind_gutter(line, width)
                     }
                 };
-                let mut lines = vec![Line::default()];
+                let mut lines = vec![behind_gutter(Line::default(), width)];
                 // The agent's own words, in the agent's own order. The **id** is what `Enter`
                 // sends and is deliberately never drawn: it is a wire value, not a label.
                 for (row, method) in methods.iter().enumerate() {
@@ -717,18 +732,24 @@ impl AgentsSection {
                         Some(description) => format!("{} \u{2014} {description}", method.name),
                         None => method.name.clone(),
                     };
-                    lines.push(Line::styled(text, style(row)));
+                    lines.push(choice(row, text));
                 }
                 if *logout {
-                    lines.push(Line::styled(LOGOUT_ROW, style(methods.len())));
+                    lines.push(choice(methods.len(), LOGOUT_ROW.to_owned()));
                 }
                 // Named rather than offered (MOD-21 D4, D21): the spec forbids handing a
                 // `terminal` method to `authenticate`, and a user who cannot see the one they were
                 // told to use would otherwise think the list was broken.
                 if *hidden > 0 {
-                    lines.push(Line::styled(
-                        format!("{hidden} method(s) need a terminal htui does not provide"),
-                        theme.dim,
+                    lines.push(behind_gutter(
+                        Line::styled(
+                            format!(
+                                "{} a terminal htui does not provide",
+                                plural(*hidden, "method needs", "methods need")
+                            ),
+                            theme.dim,
+                        ),
+                        width,
                     ));
                 }
                 lines
@@ -748,20 +769,28 @@ impl AgentsSection {
                         url.iter()
                             .map(|url| Line::styled(format!("link: {url}"), theme.base)),
                     )
+                    .map(|line| behind_gutter(line, width))
                     .collect();
                 if let Some(target) = advertised.as_ref().map(Advertised::target) {
                     if let Some(field) = paste {
-                        pane.push(Line::styled(
-                            format!("paste the address the browser could not open ({target}):"),
-                            theme.base,
+                        pane.push(behind_gutter(
+                            Line::styled(
+                                format!("paste the address the browser could not open ({target}):"),
+                                theme.base,
+                            ),
+                            width,
                         ));
-                        let mut spans = vec![Span::styled("\u{203a} ", theme.accent)];
-                        spans.extend(field.line(width.saturating_sub(2), true, theme).spans);
-                        pane.push(Line::from(spans));
+                        pane.extend(
+                            Form::new()
+                                .field(FormRow::new(PASTE_LABEL, FormValue::Text(field)))
+                                .focus(0)
+                                .editing(true)
+                                .lines(width, accent, theme),
+                        );
                     } else if *delivering {
-                        pane.push(Line::styled(
-                            format!("delivering to {target}\u{2026}"),
-                            theme.dim,
+                        pane.push(behind_gutter(
+                            Line::styled(format!("delivering to {target}\u{2026}"), theme.dim),
+                            width,
                         ));
                     } else {
                         let paste = keys.label(views::AGENTS_BROWSE, Act::AgentsPasteRedirect);
@@ -772,7 +801,7 @@ impl AgentsSection {
                             ),
                             None => format!("redirect: {target}"),
                         };
-                        pane.push(Line::styled(line, theme.dim));
+                        pane.push(behind_gutter(Line::styled(line, theme.dim), width));
                     }
                 }
                 pane
@@ -827,7 +856,7 @@ impl AgentsSection {
     /// Modality, local and sufficient (MOD-20 D19): the tab consumes `h`/`l`/`[`/`]`/arrows before
     /// the section is offered a key, so the strip still works and a plan waits rather than traps.
     pub(super) fn answer_consent(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         for act in ctx.keys().actions(views::AGENTS_CONSENT, chord) {
             match act {
                 Act::ConfirmYes => {
@@ -952,39 +981,49 @@ impl AgentsSection {
     /// and no login is in flight, so the one it can cover is a `Manual` pane, which is back the
     /// moment the form closes. It takes the width because its fields draw a window of their text.
     /// The tool-paths form (MOD-66 D10) is drawn the same way and wins for the same reason.
-    pub(super) fn pane(&self, width: u16, theme: &Theme, keys: &Keys) -> Vec<Line<'static>> {
+    ///
+    /// Every line is `width` cells behind `kit::list`'s gutter (MOD-115 M3), so the pane starts
+    /// where the table's rows do; a form's rows are `kit::form`'s, marker in `accent`.
+    pub(super) fn pane(
+        &self,
+        width: u16,
+        accent: Style,
+        theme: &Theme,
+        keys: &Keys,
+    ) -> Vec<Line<'static>> {
+        let plain = |text: String, style: Style| behind_gutter(Line::styled(text, style), width);
         match &self.mode {
             Mode::Editing(editor) => {
-                return core::iter::once(Line::styled(editor.header(), theme.base))
-                    .chain(editor.lines(width, theme))
+                return core::iter::once(plain(editor.header(), theme.base))
+                    .chain(editor.lines(width, accent, theme))
                     .collect();
             }
             Mode::Paths(form) => {
-                return core::iter::once(Line::styled(form.header(), theme.base))
-                    .chain(form.lines(width, theme))
+                return core::iter::once(plain(form.header(), theme.base))
+                    .chain(form.lines(width, accent, theme))
                     .collect();
             }
             Mode::Browse => {}
         }
         match &self.install {
-            InstallState::Pending { plan } => core::iter::once(Line::default())
+            InstallState::Pending { plan } => core::iter::once(plain(String::new(), theme.base))
                 .chain(
                     plan.consent_lines()
                         .into_iter()
-                        .map(|line| Line::styled(line, theme.base)),
+                        .map(|line| plain(line, theme.base)),
                 )
                 .collect(),
             InstallState::Manual { steps, message } => {
-                core::iter::once(Line::styled(message.clone(), theme.error))
+                core::iter::once(plain(message.clone(), theme.error))
                     .chain(
                         steps
                             .lines()
                             .into_iter()
-                            .map(|line| Line::styled(line, theme.base)),
+                            .map(|line| plain(line, theme.base)),
                     )
                     .collect()
             }
-            _ => self.auth_pane(width, theme, keys),
+            _ => self.auth_pane(width, accent, theme, keys),
         }
     }
 
@@ -1079,7 +1118,7 @@ pub(super) fn entry_id(dir: &Path) -> String {
 pub(super) fn first_line(tail: Option<&[String]>, status: ProbeStatus) -> String {
     tail.and_then(<[String]>::first)
         .cloned()
-        .unwrap_or_else(|| status.to_string())
+        .unwrap_or_else(|| verdict(status))
 }
 
 /// A byte count as a progress cell says it.
@@ -1097,8 +1136,49 @@ pub(super) fn human_bytes(bytes: u64) -> String {
     } else if bytes >= KIB {
         format!("{:.1} KB", bytes as f64 / KIB as f64)
     } else {
-        format!("{bytes} bytes")
+        plural(
+            usize::try_from(bytes).unwrap_or(usize::MAX),
+            "byte",
+            "bytes",
+        )
     }
+}
+
+/// The paste field's label (MOD-115 M3): the prompt above it names what is pasted, and the row
+/// is a `kit::form` row, so the field carries the form's marker rather than a `›` of its own.
+const PASTE_LABEL: &str = "address";
+
+/// A pane line behind `kit::list`'s blank gutter cell, cut with `…` to the rest of `width`: what
+/// `kit::list` draws for a row that is not selected.
+fn behind_gutter(line: Line<'static>, width: u16) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    spans.extend(own_spans(list::ellipsize(line, width.saturating_sub(1))));
+    Line::from(spans)
+}
+
+/// The login chooser's cursor row: `kit::list`'s gutter in `accent`, then its selection band
+/// over the rest of `width`.
+fn chosen(line: Line<'static>, width: u16, accent: Style, theme: &Theme) -> Line<'static> {
+    let mut spans = vec![Span::styled(GUTTER, accent)];
+    spans.extend(own_spans(list::selection_band(
+        line,
+        width.saturating_sub(1),
+        theme,
+    )));
+    Line::from(spans)
+}
+
+/// `line`'s spans with the line's own style patched under each, so a gutter put in front keeps
+/// out of that style (a band ends at the gutter, as `kit::list` draws it).
+fn own_spans(line: Line<'static>) -> Vec<Span<'static>> {
+    let style = line.style;
+    line.spans
+        .into_iter()
+        .map(|span| {
+            let patched = style.patch(span.style);
+            span.style(patched)
+        })
+        .collect()
 }
 
 #[cfg(test)]

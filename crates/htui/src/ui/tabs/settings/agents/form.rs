@@ -5,14 +5,18 @@ use chrono::{DateTime, Utc};
 use htui_agent::launch::AgentLaunch;
 use htui_agent::probe::{ProbeSnapshot, ProbeStatus};
 use htui_core::model::{Agent, AgentId, AgentSummary, Transport};
-use ratatui::text::{Line, Span};
+use ratatui::style::Style;
+use ratatui::text::Line;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
 use crate::agent_settings::{self, AgentDraft, DraftFields, FIELD_LABELS, LITERAL_LAUNCH, Refusal};
 use crate::store_worker::StoreRequest;
-use crate::ui::cells::{self, cell_width};
+use crate::ui::cells::cell_width;
+use crate::ui::kit::form::{Field as FormRow, Form, Value};
 use crate::ui::{TextField, Theme};
+
+use super::table::verdict;
 
 /// What an edit that changed nothing says as it closes (plan D239's "unchanged closes").
 pub(super) const UNCHANGED: &str = "nothing changed; nothing was written";
@@ -22,7 +26,9 @@ pub(super) const LAUNCH_UNREADABLE: &str =
     "this row's launch does not parse; nothing declares a tool";
 
 /// What a missing row says when no form is open to close: the write was `t`'s, or the form went
-/// before its answer came back. Opens like [`DELETED_ELSEWHERE`], so [`is_error`] draws it the same.
+/// before its answer came back. Opens like
+/// [`DELETED_ELSEWHERE`](crate::ui::tabs::settings::DELETED_ELSEWHERE), so
+/// [`is_error`](crate::ui::tabs::settings::is_error) draws it the same.
 pub(super) const GONE_CLOSED: &str = "deleted elsewhere; nothing was written";
 
 /// What `Created` adds for a `cli` row with no `settings.cli` block (plan R-9, blueprint F-13): such
@@ -32,15 +38,29 @@ pub(super) const NEEDS_CLI_BLOCK: &str =
     " \u{b7} a `cli` row needs a settings.cli block to chat (adapter id `cli` is not registered)";
 
 /// What a spent token says when fields the user changed were changed elsewhere too (review M-1),
-/// before their labels ([`clash_notice`]): shorter than [`CHANGED_ELSEWHERE`] so labels fit the
-/// bordered 98. Labels only, never a value. Opens like [`CHANGED_ELSEWHERE`], so [`is_error`] draws
-/// it the same.
-pub(super) const CHANGED_ON_BOTH_SIDES: &str =
-    "changed elsewhere \u{2014} reloaded; Enter retries \u{b7} also changed elsewhere: ";
+/// before their labels ([`clash_notice`]): shorter than
+/// [`changed_elsewhere`](crate::ui::tabs::settings::changed_elsewhere) so labels fit the note's
+/// [`NOTE_WIDTH`]. Labels only, never a value. Opens like it, so
+/// [`is_error`](crate::ui::tabs::settings::is_error) draws it the same.
+///
+/// `retry` is the label of the key that saves again through `AGENTS_FORM` (`field.submit`,
+/// MOD-115 M3 MD-A), `None` when unbound: `Enter` under the compiled keys, as the sentence was
+/// written before.
+pub(super) fn changed_on_both_sides(retry: Option<&str>) -> String {
+    match retry {
+        Some(key) => format!(
+            "changed elsewhere \u{2014} reloaded; {key} retries \u{b7} also changed elsewhere: "
+        ),
+        None => "changed elsewhere \u{2014} reloaded; save again to retry \u{b7} also changed \
+                 elsewhere: "
+            .to_owned(),
+    }
+}
 
 /// The widest note line the running app draws (MOD-23 re-review Low-2): the Settings pane's
-/// border costs two of the harness's 100, and the note is one line with no wrap.
-pub(super) const NOTE_WIDTH: usize = 98;
+/// border costs two of the harness's 100 and `kit::list`'s gutter, which the note sits behind,
+/// one more (MOD-115 M3); the note is one line with no wrap.
+pub(super) const NOTE_WIDTH: usize = 97;
 
 /// The tool-paths form (MOD-66 D10, B7). It holds its own row identity (MOD-23 F-14), never an
 /// index into the table. Its `Debug` is written by hand: it prints how many paths were
@@ -304,34 +324,18 @@ impl Editor {
         }
     }
 
-    /// One line per field, the focused label accented and the focused field carrying the cursor:
-    /// `settings/hierarchy.rs`'s `Editor::lines`. The label column is 13 wide (`default model`),
-    /// which leaves 83 columns of text at the bordered 98 (D231).
-    pub(super) fn lines(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
-        let label_width = self
-            .fields
-            .iter()
-            .map(|field| cell_width(field.label))
-            .max()
-            .unwrap_or(0);
+    /// The form (MOD-115 M3 D3): one `kit::form` row per field, the focused one carrying the
+    /// marker in `accent` and the cursor, every label in one column: the longest label and one
+    /// (`default model`, 14), which leaves 81 cells of text at the bordered 98 (D231).
+    pub(super) fn lines(&self, width: u16, accent: Style, theme: &Theme) -> Vec<Line<'static>> {
         self.fields
             .iter()
-            .enumerate()
-            .map(|(index, field)| {
-                let focused = index == self.focus;
-                let style = if focused { theme.accent } else { theme.dim };
-                let label = cells::pad(field.label, label_width);
-                let mut spans = vec![Span::styled(format!("{label}: "), style)];
-                let room = usize::from(width).saturating_sub(label_width + 2);
-                spans.extend(
-                    field
-                        .input
-                        .line(u16::try_from(room).unwrap_or(u16::MAX), focused, theme)
-                        .spans,
-                );
-                Line::from(spans)
+            .fold(Form::new(), |form, field| {
+                form.field(FormRow::new(field.label, Value::Text(&field.input)))
             })
-            .collect()
+            .focus(self.focus)
+            .editing(true)
+            .lines(width, accent, theme)
     }
 }
 
@@ -403,36 +407,20 @@ impl PathsForm {
         format!("tool paths for {} \u{b7} empty = no manual path", self.name)
     }
 
-    /// One line per tool, [`Editor::lines`]' shape (MOD-66 D11, B8). The label column is the
-    /// longest tool name in cells, capped at a third of `width`. Each name is `cells::fit` to the
-    /// column (MOD-60): padded when it fits, else cut to at most one cell less than the column and
-    /// ending in `…`, then padded back, so every label ends at the same cell.
-    pub(super) fn lines(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
-        let longest = self
-            .fields
-            .iter()
-            .map(|field| cell_width(&field.tool))
-            .max()
-            .unwrap_or(0);
-        let column = longest.min(usize::from(width) / 3);
+    /// One `kit::form` row per tool, [`Editor::lines`]' shape (MOD-66 D11, B8; MOD-115 M3 D3).
+    /// The label column is the longest tool name in cells and one, capped at a third of `width`
+    /// (the form's own cap). Each name is `cells::fit` to the column (MOD-60): padded when it fits,
+    /// else cut to at most one cell less than the column and ending in `…`, then padded back, so
+    /// every label ends at the same cell.
+    pub(super) fn lines(&self, width: u16, accent: Style, theme: &Theme) -> Vec<Line<'static>> {
         self.fields
             .iter()
-            .enumerate()
-            .map(|(index, field)| {
-                let focused = index == self.focus;
-                let style = if focused { theme.accent } else { theme.dim };
-                let label = cells::fit(&field.tool, column);
-                let mut spans = vec![Span::styled(format!("{label}: "), style)];
-                let room = usize::from(width).saturating_sub(column + 2);
-                spans.extend(
-                    field
-                        .input
-                        .line(u16::try_from(room).unwrap_or(u16::MAX), focused, theme)
-                        .spans,
-                );
-                Line::from(spans)
+            .fold(Form::new(), |form, field| {
+                form.field(FormRow::new(&field.tool, Value::Text(&field.input)))
             })
-            .collect()
+            .focus(self.focus)
+            .editing(true)
+            .lines(width, accent, theme)
     }
 }
 
@@ -451,12 +439,12 @@ impl Field {
     }
 }
 
-/// [`CHANGED_ON_BOTH_SIDES`] with the clashing labels in form order, as many as fit
-/// [`NOTE_WIDTH`], then ` +N more` for the rest (MOD-23 re-review Low-2). Greedy and
+/// [`changed_on_both_sides`] (naming `retry`) with the clashing labels in form order, as many as
+/// fit [`NOTE_WIDTH`], then ` +N more` for the rest (MOD-23 re-review Low-2). Greedy and
 /// deterministic: a label is shown only if it and the count still owed after it fit, so the
 /// line never passes the width.
-pub(super) fn clash_notice(clashes: &[&str]) -> String {
-    let mut notice = CHANGED_ON_BOTH_SIDES.to_owned();
+pub(super) fn clash_notice(clashes: &[&str], retry: Option<&str>) -> String {
+    let mut notice = changed_on_both_sides(retry);
     let mut shown = 0;
     for (index, label) in clashes.iter().enumerate() {
         let separator = if index == 0 { "" } else { ", " };
@@ -504,9 +492,13 @@ pub(super) fn needs_cli_block(agent: &Agent) -> bool {
     agent.transport == Transport::Cli && agent.settings.get("cli").is_none()
 }
 
-/// What `AgentWritten::ToolPaths` says (MOD-66 D10): the row and the probe's word, never a path.
+/// What `AgentWritten::ToolPaths` says (MOD-66 D10): the row and the probe's verdict, as its
+/// `kit::label` mark (MOD-83), never a path.
 pub(super) fn tool_paths_saved(name: &str, status: ProbeStatus) -> String {
-    format!("tool paths saved for `{name}` \u{b7} this box: {status}")
+    format!(
+        "tool paths saved for `{name}` \u{b7} this box: {}",
+        verdict(status)
+    )
 }
 
 #[cfg(test)]
@@ -516,15 +508,16 @@ mod tests {
     /// MOD-60: the tool-name column is measured and cut in cells. A CJK name that fits the
     /// column by `char` count is twice as wide on screen; it is cut with `…` so every label,
     /// wide or not, ends at the same cell. At an odd column (63 / 3 = 21) the cut lands on a
-    /// cluster boundary and `…` sits right against the `": "`; at an even one (60 / 3 = 20)
-    /// a wide glyph cannot fill the last cell before `…`, so `cells::fit` pads one space after
-    /// it. Both pin the exact label, so an over-clip padded back to the column cannot pass.
+    /// cluster boundary and `…` fills the last cell; at an even one (60 / 3 = 20) a wide glyph
+    /// cannot fill the last cell before `…`, so `cells::fit` pads one space after it. Both pin
+    /// the exact label, so an over-clip padded back to the column cannot pass. Since MOD-115 M3
+    /// the row is `kit::form`'s: the gutter, the label column, two blanks, the value.
     #[test]
     fn a_wide_tool_name_is_fitted_to_the_label_column() {
         let wide = "\u{6f22}";
         let cases = [
-            (63, format!("{}\u{2026}: ", wide.repeat(10))),
-            (60, format!("{}\u{2026} : ", wide.repeat(9))),
+            (63, format!("{}\u{2026}", wide.repeat(10))),
+            (60, format!("{}\u{2026} ", wide.repeat(9))),
         ];
         for (width, expected) in cases {
             let column = usize::from(width) / 3;
@@ -542,17 +535,28 @@ mod tests {
                 focus: 0,
             };
 
-            let lines = form.lines(width, &Theme::default());
+            let lines: Vec<String> = form
+                .lines(width, Style::new(), &Theme::default())
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect()
+                })
+                .collect();
 
-            for line in &lines {
-                let label = &line.spans[0].content;
-                assert_eq!(cell_width(label), column + 2, "{label:?} against {column}");
-            }
-            assert_eq!(lines[0].spans[0].content, expected, "width {width}");
-            assert_eq!(
-                lines[1].spans[0].content,
-                format!("{:<column$}: ", "git"),
-                "width {width}"
+            // Both labels fill the column exactly, so both values start at the same cell.
+            assert_eq!(cell_width(&expected), column, "width {width}");
+            assert!(
+                lines[0].starts_with(&format!("\u{258c}{expected}  ")),
+                "width {width}: {:?}",
+                lines[0]
+            );
+            assert!(
+                lines[1].starts_with(&format!(" {:<column$}  ", "git")),
+                "width {width}: {:?}",
+                lines[1]
             );
         }
     }

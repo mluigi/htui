@@ -405,32 +405,36 @@ impl Rig {
     }
 }
 
-/// Where `on this box` starts in a rendered row: the seven columns before it — MOD-2 D89's `name`
-/// 10, then 9, 12, 6, D76's `default` 21, 7 and D73's `quota` 13 — plus one space of
-/// `column_spacing` after each.
+/// Where `on this box` starts in a rendered row, behind `kit::list`'s gutter cell: the seven
+/// columns before it — MOD-2 D89's `name` 10, then 9, 12, 6, D76's `default` 21, `active` 6 and
+/// D73's `quota` 13 — plus one space of spacing after each.
 ///
-/// **D89 moved this by 2**, and the eighth column is now a fixed `Length(13)` rather than the one
-/// that absorbs the slack: `name` became `Constraint::Fill(1)` and takes every spare column, so
-/// inside the Settings pane's border — where the section draws 98 — `name` is 10 and everything
-/// after it starts two columns later than it used to.
+/// **D89 moved this by 2**, and the eighth column is now a fixed 13 rather than the one that
+/// absorbs the slack: `name` takes every spare column, so inside the Settings pane's border —
+/// where the section draws 98, one of them the gutter since MOD-115 M3 — `name` is 10 and
+/// everything after it starts where `enabled` becoming `active` in 6 puts it (MOD-81).
 ///
 /// This file's progress cells never fitted the eighth column and still do not:
 /// `downloading 12.0 MB` is 19 against 13, and it exceeded the 15 the column drew before D89 as
-/// well. No width was ever spent on them, which is why a clipped byte count is not a regression
+/// well. No width was ever spent on them, which is why a cut byte count is not a regression
 /// here — it is a figure that keeps ticking on the next frame.
-const ON_BOX_AT: usize = 85;
+const ON_BOX_AT: usize = 84;
 
 /// The `on this box` cell of the installable row.
 ///
 /// By character offset since D73's `quota` column landed in front of it: that cell holds spaces of
 /// its own (`62% to 09-08 08:00`), so the columns after it can no longer be counted in words.
 fn on_box_cell(frame: &str) -> String {
+    // Behind the border and `kit::list`'s gutter cell (MOD-115 M3).
     let line = frame
         .lines()
-        .find(|line| line.trim_start_matches('\u{2502}').starts_with(ROW))
+        .map(|line| {
+            let line = line.trim_matches('\u{2502}');
+            line.char_indices().nth(1).map_or("", |(at, _)| &line[at..])
+        })
+        .find(|line| line.starts_with(ROW))
         .unwrap_or_else(|| panic!("the `{ROW}` row is rendered:\n{frame}"));
-    line.trim_matches('\u{2502}')
-        .chars()
+    line.chars()
         .skip(ON_BOX_AT)
         .collect::<String>()
         .trim_end()
@@ -546,7 +550,8 @@ async fn y_streams_to_done_and_the_cell_reads_the_probes_verdict() {
     );
     assert_eq!(
         on_box_cell(&frame),
-        "failed",
+        // MOD-83, D-18: the probe's verdict as its `kit::label` mark.
+        "\u{2717} failed",
         "and the cell is the probe's answer, not the installer's: {frame}"
     );
     assert!(

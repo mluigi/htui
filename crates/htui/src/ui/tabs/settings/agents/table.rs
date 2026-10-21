@@ -1,15 +1,23 @@
 //! The Agents table (MOD-115 M3 D7): its rows and cursor, the `on this box` and `quota` cells,
 //! and the column constants they read.
+//!
+//! Since MOD-115 M3 it draws through the kit: a header in `theme.title`, then one `kit::list`
+//! row per agent, the cursor's in the gutter and the band, every cell fitted to its column
+//! ([`columns`]). The enum cells are `kit::label` words (MOD-83), never the wire values.
 
 use chrono::{DateTime, Utc};
+use htui_agent::probe::ProbeStatus;
 use htui_core::model::{AgentBox, AgentSummary};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Rect};
-use ratatui::text::Line;
-use ratatui::widgets::{Cell, Row, Table};
+use ratatui::layout::Rect;
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 use serde_json::Value;
 
 use crate::app::Ctx;
+use crate::ui::kit::label;
+use crate::ui::kit::list::{self, Row, RowKind};
+use crate::ui::{Theme, cells};
 
 use super::AgentsSection;
 
@@ -36,20 +44,147 @@ pub(super) const SWITCHED_OFF: &str = "switched off";
 
 /// What the `on this box` cell appends when `probe.source` is `manual` (MOD-66 D10, the
 /// maintainer's answer to blueprint F-3). One character, so the 13-wide column keeps it on every
-/// verdict but `unauthenticated`, which that column already clips.
+/// verdict but `⚠ needs login`, which fills that column and is cut to make room.
 pub(super) const MANUAL_SUFFIX: &str = "*";
 
 /// What the idle note adds while any row's `probe.source` is `manual`: the key to
-/// [`MANUAL_SUFFIX`] (MOD-66, the amendment to blueprint §5). 60 of the 98 columns with
-/// [`quota_note`].
+/// [`MANUAL_SUFFIX`] (MOD-66, the amendment to blueprint §5). 60 of the 97 cells with
+/// [`quota_note`](super::quota_note).
 pub(super) const MANUAL_NOTE: &str = " \u{b7} * manual path";
+
+/// The `enabled` cell of a row the registry switches on, and of one it switches off: the form
+/// toggle's glyphs and words (`kit::form`'s `Value::Toggle`).
+const ON: &str = "\u{25cf} on";
+/// See [`ON`].
+const OFF: &str = "\u{25cb} off";
+
+/// The narrowest the `name` column gets while a column is left to give way (MOD-81): 10 cells,
+/// so `claude-cli`, the longest seeded name, is drawn whole.
+pub(super) const NAME_MIN: u16 = 10;
+
+/// One column of the table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Column {
+    /// The flexible one: every cell the others leave (MOD-2 D89).
+    Name,
+    /// `label::transport`, 9 for its header.
+    Transport,
+    /// `label::billing`, 12 for `subscription`.
+    Billing,
+    /// How many models the row lists, 6 for its header.
+    Models,
+    /// The model id `docs/ANA-4.md` §4.4 selects by, 21 for `gemini-3.7-flash-high` (D76's #1).
+    Default,
+    /// The registry switch, `● on`/`○ off`; 6 for its header, `active`.
+    Enabled,
+    /// The tightest window, 13 for `100% to 09-08`.
+    Quota,
+    /// This box's verdict, 13 for `⚠ needs login` (D-18: never the donor).
+    OnBox,
+}
+
+impl Column {
+    /// Every column, in table order.
+    pub(super) const ALL: [Self; 8] = [
+        Self::Name,
+        Self::Transport,
+        Self::Billing,
+        Self::Models,
+        Self::Default,
+        Self::Enabled,
+        Self::Quota,
+        Self::OnBox,
+    ];
+
+    /// The columns that give way below the width every column needs, in the order they go
+    /// (MOD-81, the maintainer's answer of 2026-10-21): the count first, then the billing, then
+    /// the transport. `default` and `quota` never do.
+    const GIVE_WAY: [Self; 3] = [Self::Models, Self::Billing, Self::Transport];
+
+    /// The header.
+    ///
+    /// `enabled` reads `active` since MOD-115 M3: `kit::list`'s gutter took one cell of the 98,
+    /// and with every other column at its own longest string and `on this box` not the donor
+    /// (D-18), the one cell `name` needed for its 10 came from this header, whose cells now read
+    /// `● on`/`○ off` in 5.
+    pub(super) const fn header(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Transport => "transport",
+            Self::Billing => "billing",
+            Self::Models => "models",
+            Self::Default => "default",
+            Self::Enabled => "active",
+            Self::Quota => "quota",
+            Self::OnBox => "on this box",
+        }
+    }
+
+    /// The fixed width, `None` for [`Column::Name`], which takes the rest.
+    pub(super) const fn width(self) -> Option<u16> {
+        match self {
+            Self::Name => None,
+            Self::Transport => Some(9),
+            Self::Billing => Some(12),
+            Self::Models | Self::Enabled => Some(6),
+            Self::Default => Some(21),
+            Self::Quota | Self::OnBox => Some(13),
+        }
+    }
+}
+
+/// The columns a row `width` cells wide holds, each with its width, one cell between each pair.
+///
+/// Every column while `name` keeps [`NAME_MIN`]; below that, [`Column::GIVE_WAY`] in order until
+/// it does (MOD-81). `name` then takes every cell left, so a wider terminal still goes to it
+/// first (D89); with all three gone it takes what is left, even under the minimum.
+#[must_use]
+pub(super) fn columns(width: u16) -> Vec<(Column, u16)> {
+    let mut shown = Column::ALL.to_vec();
+    for column in Column::GIVE_WAY {
+        if name_room(width, &shown) >= NAME_MIN {
+            break;
+        }
+        shown.retain(|shown| *shown != column);
+    }
+    let name = name_room(width, &shown);
+    shown
+        .into_iter()
+        .map(|column| (column, column.width().unwrap_or(name)))
+        .collect()
+}
+
+/// What `shown`'s fixed columns and the cells between them leave of `width` for `name`.
+fn name_room(width: u16, shown: &[Column]) -> u16 {
+    let fixed: u16 = shown.iter().filter_map(|column| column.width()).sum();
+    let gaps = u16::try_from(shown.len().saturating_sub(1)).unwrap_or(u16::MAX);
+    width.saturating_sub(fixed.saturating_add(gaps))
+}
+
+/// One table line: each cell fitted to its column (`cells::fit`: padded, or cut with `…`), one
+/// blank between each pair.
+fn table_line(cells: impl IntoIterator<Item = (String, u16, Style)>) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (index, (text, width, style)) in cells.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(cells::fit(&text, usize::from(width)), style));
+    }
+    Line::from(spans)
+}
+
+/// A probe verdict as the section says it (MOD-83, D-18): its `kit::label` glyph and word.
+#[must_use]
+pub(super) fn verdict(status: ProbeStatus) -> String {
+    let mark = label::probe(status);
+    format!("{} {}", mark.glyph, mark.word)
+}
 
 impl AgentsSection {
     /// The highlighted row, or `None` while the table is empty.
     pub(super) fn selected(&self) -> Option<&AgentSummary> {
-        self.cursor
-            .selected()
-            .and_then(|index| self.agents.get(index))
+        self.cursor.and_then(|index| self.agents.get(index))
     }
 
     /// Moves the cursor one row and stops at the end it reaches.
@@ -58,16 +193,16 @@ impl AgentsSection {
     /// from the last row to the first would make a held `j` install a row the user never aimed at.
     pub(super) fn move_cursor(&mut self, down: bool) {
         let Some(last) = self.agents.len().checked_sub(1) else {
-            self.cursor.select(None);
+            self.cursor = None;
             return;
         };
-        let current = self.cursor.selected().unwrap_or(0).min(last);
+        let current = self.cursor.unwrap_or(0).min(last);
         let next = if down {
             current.saturating_add(1).min(last)
         } else {
             current.saturating_sub(1)
         };
-        self.cursor.select(Some(next));
+        self.cursor = Some(next);
     }
 
     /// Puts the cursor back inside the table after a read replaced the rows.
@@ -75,15 +210,15 @@ impl AgentsSection {
     /// A fresh read selects the first row rather than nothing, so `i` has something to act on the
     /// moment the section is looked at.
     pub(super) fn clamp_cursor(&mut self) {
-        match self.agents.len().checked_sub(1) {
-            Some(last) => self
-                .cursor
-                .select(Some(self.cursor.selected().unwrap_or(0).min(last))),
-            None => self.cursor.select(None),
-        }
+        self.cursor = self
+            .agents
+            .len()
+            .checked_sub(1)
+            .map(|last| self.cursor.unwrap_or(0).min(last));
     }
 
-    /// What the `on this box` column says about one row, in the order plan D54 sets.
+    /// What the `on this box` column says about one row, in the order plan D54 sets, and the
+    /// style it says it in.
     ///
     /// An install this section is running wins over everything, because it is the one thing on
     /// screen the user is waiting on. Then a probe in flight, because none of the rows on screen
@@ -93,52 +228,65 @@ impl AgentsSection {
     /// switch wrote that no probe has filled (`probed_at` and `probe` both absent), which is the
     /// same fact. Then the snapshot's own verdict when it is not `ready` — `missing`,
     /// `unauthenticated` and `failed` are the three facts a version string cannot express (plan
-    /// D50). Everything left is a row that works, or one written before the `probe` column
+    /// D50), each drawn as its `kit::label` mark in its tone (`✗ missing`, `⚠ needs login`,
+    /// `✗ failed`). Everything left is a row that works, or one written before the `probe` column
     /// existed, and both are answered by the version.
     ///
     /// A `manual` row's verdict ends in `*`, whatever it is (MOD-66 D10, B17): the status word or
     /// the version, never the install, login, probing, switched-off or not-probed cells, which are
     /// not the snapshot's verdict.
-    pub(super) fn on_box_cell(&self, summary: &AgentSummary) -> String {
+    pub(super) fn on_box_cell(&self, summary: &AgentSummary, theme: &Theme) -> (String, Style) {
         if let Some(cell) = self.install_cell(summary.agent.id) {
-            return cell;
+            return (cell, theme.dim);
         }
         // Beside the install and for its reason: a login this section is running is the one thing
         // on screen the user is waiting on, and it outlasts every other answer here.
         if let Some(cell) = self.auth_cell(summary.agent.id) {
-            return cell;
+            return (cell, theme.dim);
         }
         if self.probing {
-            return PROBING.to_owned();
+            return (PROBING.to_owned(), theme.dim);
         }
         if summary.user_off {
-            return SWITCHED_OFF.to_owned();
+            return (SWITCHED_OFF.to_owned(), theme.dim);
         }
         let Some(row) = summary.on_box.as_ref() else {
-            return NOT_PROBED.to_owned();
+            return (NOT_PROBED.to_owned(), theme.dim);
         };
         if row.probed_at.is_none() && row.probe.is_none() {
-            return NOT_PROBED.to_owned();
+            return (NOT_PROBED.to_owned(), theme.dim);
         }
         let status = row
             .probe
             .as_ref()
             .and_then(|probe| probe.get("status"))
             .and_then(Value::as_str);
-        let cell = if let Some(status @ ("missing" | "unauthenticated" | "failed")) = status {
-            status.to_owned()
+        // Read by key, as `status` always was: the three verdicts a version cannot express.
+        let failed = [
+            ProbeStatus::Missing,
+            ProbeStatus::Unauthenticated,
+            ProbeStatus::Failed,
+        ]
+        .into_iter()
+        .find(|verdict| status == Some(verdict.as_str()));
+        let (cell, style) = if let Some(status) = failed {
+            (
+                verdict(status),
+                label::tone_style(label::probe(status).tone, theme),
+            )
         } else {
             let version = row.version.as_deref().unwrap_or(NONE);
-            if row.enabled {
+            let cell = if row.enabled {
                 version.to_owned()
             } else {
                 format!("{version} (off)")
-            }
+            };
+            (cell, theme.dim)
         };
         if is_manual(row) {
-            format!("{cell}{MANUAL_SUFFIX}")
+            (format!("{cell}{MANUAL_SUFFIX}"), style)
         } else {
-            cell
+            (cell, style)
         }
     }
 
@@ -155,124 +303,90 @@ impl AgentsSection {
                 .any(|summary| !summary.user_off && summary.on_box.as_ref().is_some_and(is_manual))
     }
 
-    /// The eight-column table, with the cursor row accented.
-    pub(super) fn render_table(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let rows = self.agents.iter().map(|summary| {
-            let agent = &summary.agent;
-            let quota = quota_cell(summary);
-            let on_box = self.on_box_cell(summary);
-            let style = if agent.enabled {
-                ctx.theme.base
-            } else {
-                ctx.theme.dim
-            };
-            Row::new(vec![
-                Cell::from(Line::styled(agent.name.clone(), style)),
-                Cell::from(Line::styled(agent.transport.as_str(), ctx.theme.dim)),
-                Cell::from(Line::styled(agent.billing.as_str(), ctx.theme.dim)),
-                Cell::from(Line::styled(agent.models.len().to_string(), ctx.theme.dim)),
-                Cell::from(Line::styled(
+    /// One agent's row: its cells in `columns`' order, `name` in the base role (dim for a row
+    /// the registry switches off) and the rest dim, but for the verdict's own tone.
+    fn row(
+        &self,
+        summary: &AgentSummary,
+        columns: &[(Column, u16)],
+        theme: &Theme,
+    ) -> Line<'static> {
+        let agent = &summary.agent;
+        let style = if agent.enabled { theme.base } else { theme.dim };
+        table_line(columns.iter().map(|&(column, width)| {
+            let (text, style) = match column {
+                Column::Name => (agent.name.clone(), style),
+                Column::Transport => (label::transport(agent.transport).to_owned(), theme.dim),
+                Column::Billing => (label::billing(agent.billing).to_owned(), theme.dim),
+                Column::Models => (agent.models.len().to_string(), theme.dim),
+                Column::Default => (
                     agent
                         .default_model
                         .clone()
                         .unwrap_or_else(|| NONE.to_owned()),
-                    ctx.theme.dim,
-                )),
-                Cell::from(Line::styled(
-                    if agent.enabled { "yes" } else { "no" },
-                    style,
-                )),
-                Cell::from(Line::styled(quota, ctx.theme.dim)),
-                Cell::from(Line::styled(on_box, ctx.theme.dim)),
-            ])
+                    theme.dim,
+                ),
+                Column::Enabled => {
+                    if agent.enabled {
+                        (ON.to_owned(), style)
+                    } else {
+                        (OFF.to_owned(), style)
+                    }
+                }
+                Column::Quota => (quota_cell(summary), theme.dim),
+                Column::OnBox => self.on_box_cell(summary, theme),
+            };
+            (text, width, style)
+        }))
+    }
+
+    /// The table (MOD-115 M3): the header in `theme.title` behind the gutter's blank, then the
+    /// rows through `kit::list`, the cursor's in the gutter (`ctx.accent()`) and the band, scrolled
+    /// the least that keeps it in view. The rows are rebuilt every frame and the offset is
+    /// computed from 0 each time, as the `TableState` clone it replaces did, so the frame never
+    /// depends on how often it was drawn.
+    ///
+    /// Answers `(rows, rows shown, offset)`, for the pane's scrollbar.
+    pub(super) fn render_table(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        ctx: &Ctx<'_>,
+    ) -> (usize, usize, usize) {
+        let theme = ctx.theme;
+        if area.width < 2 || area.height == 0 {
+            return (self.agents.len(), 0, 0);
+        }
+        let width = area.width - 1;
+        let columns = columns(width);
+        let header = table_line(
+            columns
+                .iter()
+                .map(|&(column, width)| (column.header().to_owned(), width, theme.title)),
+        );
+        frame
+            .buffer_mut()
+            .set_line(area.x + 1, area.y, &header, width);
+
+        let body = Rect {
+            y: area.y + 1,
+            height: area.height - 1,
+            ..area
+        };
+        let rows: Vec<Row<'static>> = self
+            .agents
+            .iter()
+            .map(|summary| Row {
+                line: self.row(summary, &columns, theme),
+                kind: RowKind::Item,
+            })
+            .collect();
+        let shown = usize::from(body.height).min(rows.len());
+        let offset = self.cursor.map_or(0, |cursor| {
+            list::scroll_into_view(cursor, 0, usize::from(body.height), rows.len())
         });
-
-        let header = Row::new(vec![
-            Cell::from("name"),
-            Cell::from("transport"),
-            Cell::from("billing"),
-            Cell::from("models"),
-            Cell::from("default"),
-            Cell::from("enabled"),
-            Cell::from("quota"),
-            Cell::from("on this box"),
-        ])
-        .style(ctx.theme.title);
-
-        // MOD-2 D89's packing, which **reverses D76's ranking**: `name` takes the slack, and
-        // `on this box` is the donor that pays for it.
-        //
-        // **`name` has no width of its own to tune, and that is the decision.** `Fill(1)` takes
-        // every column the seven fixed ones leave, so the answer to "how wide should a name be" is
-        // "as wide as the terminal allows" rather than a constant somebody chose. D76 had it as
-        // `Length(8)` — a number picked to fit the longest name *then in the tree*, which is a
-        // constant that goes stale the next time a registry row is added, and did: `claude-cli` is
-        // 10.
-        //
-        // The instruction that produced this was "wider, like 128", and then "increase it to
-        // maximum or like 256, there is no need to optimize the length". Both are satisfied here,
-        // and the measured reason a literal 256 is *not* what the code says is worth recording,
-        // because it is counter-intuitive: as a `Min` it does not widen this column, it **deletes
-        // the other seven**. `Min(256)` and `Min(128)` both resolve to `[91, 0, 0, 0, 0, 0, 0, 0]`
-        // at the bordered 98 — one column of names and seven of nothing — and `Min(128)` is still
-        // `[128, 4, 3, 4, 3, 4, 3, 4]` at 160. Measured against ratatui 0.30.2's solver, not
-        // reasoned about. As a `Max`, 256 is a no-op: `Max(256)` and `Fill(1)` resolve identically
-        // at every width, so `Fill(1)` is the same behaviour written without a number that invites
-        // a reader to think it means something.
-        //
-        // What `Fill(1)` gives at each width, which is the whole of the intent: 10 at the bordered
-        // 98, 12 at 100, 32 at 120, 72 at 160, 112 at 200. **Every character a wider terminal adds
-        // goes here first**, without a cap of any kind.
-        //
-        // Below ~98 the column yields rather than starving its neighbours, and can reach 0. That is
-        // the one thing a `Min(10)` floor would have bought, and it is not bought here: at those
-        // widths the table is already past the point of being readable — `default` gets 6 columns
-        // for a 21-character model id — so a floor would preserve the *name* of a row whose every
-        // other cell had become nonsense. The section is drawn inside a pane the app does not offer
-        // below a usable size.
-        //
-        // The seven fixed columns each sit at their own longest string, which is why they are the
-        // ones that do not move: `transport` (9), `models` (6) and `enabled` (7) at their headers,
-        // `billing` (12) at `subscription`, `default` (21) at `gemini-3.7-flash-high` — the model id
-        // `docs/ANA-4.md` §4.4 selects by, and D76's #1, which D89 leaves untouched — `quota` (13)
-        // at `100% to 09-08`, the exhausted window that column exists to warn about, and
-        // `on this box` (13), the donor.
-        //
-        // **The donor's price is stated rather than discovered.** At 13, its two longest cells clip:
-        // `unauthenticated` (15) renders `unauthenticat` and `choose a method` (15) renders
-        // `choose a meth`. Both are MOD-21's login flow written into a cell and the loss is real.
-        // It is the affordable one because this column carries *status words*, where `default`
-        // carries a selection coordinate and `quota` carries an exhaustion warning, and a truncated
-        // status word is still legible as itself. D76 had already ranked its slack last for that
-        // reason. The `a` key is still offered on the row.
-        //
-        // A number to be sceptical of if you are reading this to add a ninth column: the 98 that
-        // every "at the bordered width" claim above refers to is **the test harness**, not a
-        // screen. `testkit.rs`'s `DEFAULT_SIZE` is 100x30 and the pane's border costs two of it.
-        // Nobody runs `htui` at 98 columns. It is the width the snapshots are pinned to, so it is
-        // the width a regression is *caught* at, which is worth something — but it is not the width
-        // the packing should be designed for, and D76's ranking was tighter than it needed to be
-        // because it treated a fixture constant as a constraint.
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Fill(1),
-                Constraint::Length(9),
-                Constraint::Length(12),
-                Constraint::Length(6),
-                Constraint::Length(21),
-                Constraint::Length(7),
-                Constraint::Length(13),
-                Constraint::Length(13),
-            ],
-        )
-        .header(header)
-        .row_highlight_style(ctx.theme.accent);
-
-        // The cursor is cloned because `render` takes `&self`: ratatui writes the scroll offset it
-        // computed back into the state, and a view that mutated during a draw would be a view
-        // whose frame depends on how often it was drawn.
-        frame.render_stateful_widget(table, area, &mut self.cursor.clone());
+        list::render(frame, body, &rows, self.cursor, offset, ctx.accent(), theme);
+        (rows.len(), shown, offset)
     }
 }
 
@@ -399,4 +513,104 @@ pub(super) fn reset_of(window: &Value) -> Option<String> {
     DateTime::parse_from_rfc3339(resets_at)
         .ok()
         .map(|resets_at| resets_at.with_timezone(&Utc).format("%m-%d").to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MOD-81 (MOD-115 M3, the maintainer's answer of 2026-10-21): over every width from 60 to
+    /// 160 the columns fit, `default`, `quota` and `on this box` keep their widths, and `models`,
+    /// `billing` and `transport` give way in that order and only while `name` would be under 10.
+    #[test]
+    fn the_columns_give_way_in_order_and_keep_the_name_at_ten() {
+        for section in 60..=160_u16 {
+            // `kit::list`'s gutter takes one cell of the section.
+            let width = section - 1;
+            let shown = columns(width);
+            let of = |wanted: Column| shown.iter().find(|(column, _)| *column == wanted);
+            let name = of(Column::Name).map_or(0, |(_, width)| *width);
+            let used: u16 =
+                shown.iter().map(|(_, width)| width).sum::<u16>() + shown.len() as u16 - 1;
+            for kept in [
+                Column::Default,
+                Column::Quota,
+                Column::OnBox,
+                Column::Enabled,
+            ] {
+                assert_eq!(
+                    of(kept).map(|(_, width)| *width),
+                    kept.width(),
+                    "{section}: {kept:?} stays whole"
+                );
+            }
+            let dropped: Vec<Column> = Column::GIVE_WAY
+                .into_iter()
+                .filter(|column| of(*column).is_none())
+                .collect();
+            assert_eq!(
+                dropped.as_slice(),
+                &Column::GIVE_WAY[..dropped.len()],
+                "{section}: they give way in order"
+            );
+            if dropped.len() < Column::GIVE_WAY.len() {
+                assert!(
+                    name >= NAME_MIN,
+                    "{section}: `name` keeps {NAME_MIN}: {shown:?}"
+                );
+            }
+            if let Some(last) = dropped.last() {
+                // The last one to go was needed: with it back, `name` would be under 10.
+                let mut back: Vec<Column> = shown.iter().map(|(column, _)| *column).collect();
+                back.push(*last);
+                assert!(
+                    name_room(width, &back) < NAME_MIN,
+                    "{section}: {last:?} went early"
+                );
+            }
+            if name > 0 {
+                assert_eq!(
+                    used, width,
+                    "{section}: `name` takes every cell left: {shown:?}"
+                );
+            }
+        }
+    }
+
+    /// The two widths the snapshots pin: every column at the bordered 98 (`name` 10), and at 78
+    /// (an 80-column frame) `models` and `billing` gone, `name` 10 again.
+    #[test]
+    fn the_snapshot_widths_pack_as_pinned() {
+        let all = columns(97);
+        assert_eq!(all.len(), 8);
+        assert_eq!(all[0], (Column::Name, NAME_MIN));
+        let narrow = columns(77);
+        assert_eq!(
+            narrow
+                .iter()
+                .map(|(column, _)| column.header())
+                .collect::<Vec<_>>(),
+            [
+                "name",
+                "transport",
+                "default",
+                "active",
+                "quota",
+                "on this box"
+            ]
+        );
+        assert_eq!(narrow[0], (Column::Name, NAME_MIN));
+    }
+
+    /// D-18: every verdict the column can show fits its 13 cells, `⚠ needs login` exactly.
+    #[test]
+    fn every_verdict_fits_the_on_this_box_column() {
+        for status in ProbeStatus::ALL {
+            assert!(cells::cell_width(&verdict(*status)) <= 13, "{status:?}");
+        }
+        assert_eq!(
+            verdict(ProbeStatus::Unauthenticated),
+            "\u{26a0} needs login"
+        );
+    }
 }

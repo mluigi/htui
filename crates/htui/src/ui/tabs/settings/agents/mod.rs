@@ -71,17 +71,19 @@ use htui_core::model::{AgentId, AgentSummary, Scope};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, TableState};
+use std::cell::Cell;
 
 use crate::agent_settings::{self, AgentWrite, LITERAL_LAUNCH, REQUEST_NAMES};
 use crate::agent_worker::{AUTH_ALREADY_CHOSEN, LOGIN_ENDED, NO_LOGIN_RUNNING};
 use crate::app::{Action, Ctx, Handled};
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
+use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::text::{Tone, notice};
 use crate::ui::kit::{chips::key_line, modal::modal_rest};
 use crate::ui::tabs::settings::{
-    CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
-    is_error, message,
+    CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection, changed_elsewhere,
+    is_error,
 };
 use crate::ui::text_field::PASTE_DOES_NOT_FIT;
 use crate::ui::{FieldOutcome, TextField, Theme};
@@ -93,6 +95,25 @@ use form::{
     needs_cli_block, tool_paths_saved,
 };
 use table::MANUAL_NOTE;
+
+/// What the section says when the store could not read the registry, and its next step
+/// (MOD-115 M3 D4, MOD-83): an offline store mirrors `agent` but a store that is neither online nor
+/// holding a mirror has nothing to show.
+const UNAVAILABLE: &str = "agent registry needs Postgres";
+/// See [`UNAVAILABLE`].
+const UNAVAILABLE_NEXT: &str = "Settings \u{203a} Connection stores a DSN";
+
+/// What an empty registry says (MOD-115 M3 D4): the next step is [`no_agents_next`].
+const NO_AGENTS: &str = "no agents registered";
+
+/// [`NO_AGENTS`]' next step: the create key through `AGENTS_BROWSE`, so a rebound one is the one
+/// named.
+fn no_agents_next(keys: &Keys) -> String {
+    match keys.label(views::AGENTS_BROWSE, Act::New) {
+        Some(new) => format!("{new} adds one"),
+        None => "a key bound to new in keys.toml adds one".to_owned(),
+    }
+}
 
 /// The keys line with nothing in flight (89 of the 98 columns, MOD-23 D245, MOD-66 D10). It stands
 /// in for a help entry: a Settings section has no tab-level key rows of its own
@@ -113,12 +134,14 @@ const HINT_IDLE: HintSpec = &[
     Hint::One(Act::AgentsAuthenticate, "authenticate"),
 ];
 
-/// The keys line while a registry form is open (MOD-23 D245). `Enter` and `Esc` are the focused
-/// field's own keys (MOD-67 D13), so they are fixed text.
+/// The keys line while a registry form is open (MOD-23 D245). Saving and cancelling are the
+/// focused field's own keys (MOD-67 D13), named through `AGENTS_FORM`'s `[field]` layer since
+/// MOD-115 M3 (MD-A, C6), so a rebound `field.submit` or `field.cancel` shows its chord: with the
+/// default keys it reads `Tab next field · Enter saves · Esc cancels`.
 const HINT_EDITING: HintSpec = &[
     Hint::One(Act::FormNextField, "next field"),
-    Hint::Text("Enter saves"),
-    Hint::Text("Esc cancels"),
+    Hint::One(Act::FieldSubmit, "saves"),
+    Hint::One(Act::FieldCancel, "cancels"),
 ];
 
 /// The hint line while a plan waits for an answer.
@@ -148,8 +171,13 @@ const HINT_AUTH_RUNNING: HintSpec = &[
     Hint::One(Act::AgentsCancel, "cancel"),
 ];
 
-/// The hint line while the paste field is open (MOD-22 D270): the field's own keys (MOD-67 D13).
-const HINT_PASTING: HintSpec = &[Hint::Text("Enter sends"), Hint::Text("Esc cancels")];
+/// The hint line while the paste field is open (MOD-22 D270): the field's own keys (MOD-67 D13),
+/// through `CAPTURE`'s `[field]` layer since MOD-115 M3 (MD-A, C6): `Enter sends · Esc cancels`
+/// under the default keys.
+const HINT_PASTING: HintSpec = &[
+    Hint::One(Act::FieldSubmit, "sends"),
+    Hint::One(Act::FieldCancel, "cancels"),
+];
 
 /// Which of the section's key modes is live (MOD-67 M3 L-A §2.1), in the order `on_key` answers
 /// them: a form, the install question, the login chooser, the paste field, else browse.
@@ -192,9 +220,9 @@ pub struct AgentsSection {
     probing: bool,
     /// The highlighted row — the first cursor in a Settings section (MOD-20 D19).
     ///
-    /// `i` acts on one row, so there has to be a row it acts on. [`TableState`] is ratatui's own,
-    /// and it is what scrolls the table once there are more agents than rows on screen.
-    cursor: TableState,
+    /// `i` acts on one row, so there has to be a row it acts on. An index into `agents`, `None`
+    /// while the table is empty; the table scrolls to keep it in view (`kit::list`).
+    cursor: Option<usize>,
     /// The install this section is waiting on.
     install: InstallState,
     /// The login this section is waiting on (MOD-21 D20).
@@ -207,6 +235,9 @@ pub struct AgentsSection {
     busy: Option<&'static str>,
     /// The last outcome, on the note line under the keys.
     notice: Option<String>,
+    /// `(rows, offset)` as the last render drew the table, measured in the section's rows, for the
+    /// Settings pane's scrollbar (MOD-115 M3 D-11); `None` while every row fits.
+    scroll: Cell<Option<(usize, usize)>>,
 }
 
 impl AgentsSection {
@@ -280,7 +311,7 @@ impl AgentsSection {
     /// modals' "no", and they answer before this. An act this state declines (`o`, `p`, `x`, `Esc`
     /// with nothing to act on) falls through to the next candidate, and finally to the shell.
     fn on_browse_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         for act in ctx.keys().actions(views::AGENTS_BROWSE, chord) {
             match act {
                 // MOD-23 D232 and blueprint F-20: one registry write at a time, and none of the
@@ -499,9 +530,12 @@ impl AgentsSection {
                 self.notice = None;
                 Handled::Consumed
             }
-            FieldOutcome::Pass => {
-                form_navigation(key, ctx.keys(), &mut editor.focus, editor.fields.len())
-            }
+            FieldOutcome::Pass => form_navigation(
+                ctx.pressed(&key),
+                ctx.keys(),
+                &mut editor.focus,
+                editor.fields.len(),
+            ),
         }
     }
 
@@ -528,9 +562,12 @@ impl AgentsSection {
                 self.notice = None;
                 Handled::Consumed
             }
-            FieldOutcome::Pass => {
-                form_navigation(key, ctx.keys(), &mut form.focus, form.fields.len())
-            }
+            FieldOutcome::Pass => form_navigation(
+                ctx.pressed(&key),
+                ctx.keys(),
+                &mut form.focus,
+                form.fields.len(),
+            ),
         }
     }
 
@@ -622,7 +659,7 @@ impl AgentsSection {
                     .iter()
                     .position(|summary| summary.agent.id == *id);
                 if let Some(index) = row {
-                    self.cursor.select(Some(index));
+                    self.cursor = Some(index);
                 }
                 let mut notice = format!("created `{name}`");
                 if row
@@ -675,10 +712,12 @@ impl AgentsSection {
                             // `editing(id)` held above, so only the edit form reaches here.
                             Mode::Browse | Mode::Paths(_) => Vec::new(),
                         };
+                        // MD-A (D-5): the key that retries, through the form's own stack.
+                        let retry = keys.label(views::AGENTS_FORM, Act::FieldSubmit);
                         self.notice = Some(if clashes.is_empty() {
-                            CHANGED_ELSEWHERE.to_owned()
+                            changed_elsewhere(retry.as_deref())
                         } else {
-                            clash_notice(&clashes)
+                            clash_notice(&clashes, retry.as_deref())
                         });
                     }
                     None => {
@@ -733,10 +772,13 @@ impl AgentsSection {
 /// `VIEW_DEFAULTS`) move the focus with a wrap; a chord the modal global layer admits passes, so
 /// `ctrl-c` still quits and `F1` opens help (MOD-67 D5); everything else is swallowed rather than
 /// offered to the shell.
-fn form_navigation(key: KeyEvent, keys: &Keys, focus: &mut usize, fields: usize) -> Handled {
+///
+/// `chord` is the one the user pressed (`Ctx::pressed`, MOD-115 M3 MD-A), never the canonical
+/// event the shell's `[field]` translation handed the field: a chord bound to a `[field]` row is
+/// only that row's.
+fn form_navigation(chord: KeyChord, keys: &Keys, focus: &mut usize, fields: usize) -> Handled {
     let len = fields.max(1);
     let stack = views::AGENTS_FORM;
-    let chord = KeyChord::from_event(key);
     // The first candidate decides (MOD-67 M3 §6.3): a global act there is the pass rule's.
     match keys.actions(stack, chord).first() {
         Some(Act::FormNextField) => {
@@ -1015,33 +1057,60 @@ impl SettingsSection for AgentsSection {
         key_line(self.hint_text(keys), theme)
     }
 
+    /// The table, the pane under it (a consent, manual steps, a login, a form) and the note line
+    /// (MOD-115 M3): the table through `kit::list`, an empty or unreadable registry as
+    /// `kit::empty` with its next step, and the note as `kit::text::notice`. The pane's and the
+    /// note's lines start behind `kit::list`'s gutter, so every row of the section starts at the
+    /// table's first cell. The table's scroll is kept for the Settings pane's scrollbar (C3).
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let pane = self.pane(area.width, ctx.theme, ctx.keys());
-        let [rows, consent, note_area] = Layout::vertical([
+        let pane = self.pane(area.width, ctx.accent(), ctx.theme, ctx.keys());
+        let [rows, under, note_area] = Layout::vertical([
             Constraint::Min(3),
             Constraint::Length(u16::try_from(pane.len()).unwrap_or(u16::MAX)),
             Constraint::Length(1),
         ])
         .areas(area);
 
+        self.scroll.set(None);
         if self.unavailable.is_some() {
-            message(frame, rows, "agent registry needs Postgres", ctx.theme);
+            empty::render(
+                frame,
+                rows,
+                UNAVAILABLE,
+                NextStep(UNAVAILABLE_NEXT),
+                ctx.theme,
+            );
         } else if self.agents.is_empty() {
-            message(frame, rows, "no agents registered", ctx.theme);
+            let next = no_agents_next(ctx.keys());
+            empty::render(frame, rows, NO_AGENTS, NextStep(&next), ctx.theme);
         } else {
-            self.render_table(frame, rows, ctx);
+            let (total, shown, offset) = self.render_table(frame, rows, ctx);
+            if total > shown {
+                // Measured in the section's rows, the pane's whole inner height being its
+                // viewport: the rows the table could not show are what the bar travels over.
+                self.scroll
+                    .set(Some((usize::from(area.height) + total - shown, offset)));
+            }
         }
-        if !pane.is_empty() {
-            frame.render_widget(Paragraph::new(pane), consent);
+        let buf = frame.buffer_mut();
+        for (y, line) in (under.y..under.bottom()).zip(&pane) {
+            buf.set_line(under.x, y, line, under.width);
         }
-        if let Some(note) = self.note(ctx.keys()) {
+        if let Some(note) = self.note(ctx.keys())
+            && note_area.width > 1
+        {
             // `settings/mod.rs`'s rule: a compare-and-set miss is the one notice to act on.
-            let style = if is_error(&note) {
-                ctx.theme.error
+            let tone = if is_error(&note) {
+                Tone::Error
             } else {
-                ctx.theme.dim
+                Tone::Info
             };
-            frame.render_widget(Paragraph::new(Line::styled(note, style)), note_area);
+            let line = notice(&note, tone, ctx.theme);
+            buf.set_line(note_area.x + 1, note_area.y, &line, note_area.width - 1);
         }
+    }
+
+    fn scroll(&self) -> Option<(usize, usize)> {
+        self.scroll.get()
     }
 }
