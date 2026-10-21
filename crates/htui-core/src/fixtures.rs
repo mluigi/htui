@@ -21,14 +21,15 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::model::{
-    Activation, Agent, AppUser, BoxRow, BoxTool, CitationKind, Document, EventKind, EventRole,
-    GateOutcome, GraphSnapshot, Isolation, Item, ItemKind, ItemKindId, ItemLink, ItemRequirement,
-    ItemRevision, LinkKind, Note, NoteId, OsFamily, Persona, PhaseId, Priority, Project, ProjectId,
-    PromptTemplate, PromptTemplateId, Requirement, RequirementArea, RequirementAreaId,
-    RequirementId, RequirementRevision, RequirementSpec, RequirementState, Resolution, Run,
-    RunKind, RunMode, RunStatus, RunStep, SessionEvent, Skill, SkillBinding, SkillVersion,
-    SnapshotCandidate, SnapshotGraph, SnapshotPhase, SnapshotSettings, SnapshotTemplate, Status,
-    StepGraph, StepGraphId, StepGraphPhase, StepId, StepStatus, Workspace, WorkspaceProject,
+    Activation, Agent, AppUser, BoxRow, BoxTool, CitationKind, Document, EdgeId, EventKind,
+    EventRole, GateOutcome, GraphSnapshot, Isolation, Item, ItemKind, ItemKindId, ItemLink,
+    ItemRequirement, ItemRevision, LinkKind, Note, NoteId, OsFamily, Persona, PhaseId, Priority,
+    Project, ProjectId, PromptTemplate, PromptTemplateId, Requirement, RequirementArea,
+    RequirementAreaId, RequirementId, RequirementRevision, RequirementSpec, RequirementState,
+    Resolution, Run, RunKind, RunMode, RunStatus, RunStep, SessionEvent, Skill, SkillBinding,
+    SkillVersion, SnapshotCandidate, SnapshotGraph, SnapshotPhase, SnapshotSettings,
+    SnapshotTemplate, Status, StepGraph, StepGraphEdge, StepGraphId, StepGraphPhase, StepId,
+    StepStatus, Workspace, WorkspaceProject,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::seed;
@@ -82,6 +83,8 @@ mod class {
     pub const REQUIREMENT: u8 = 19;
     /// `persona` (MOD-26).
     pub const PERSONA: u8 = 20;
+    /// `step_graph_edge` (MOD-137). `phase_part` needs none: its key is `(phase_id, position)`.
+    pub const EDGE: u8 = 21;
 }
 
 /// A v7-shaped, fully deterministic UUID: 48-bit timestamp = [`DEMO_EPOCH_MS`] + `class` * 1000 +
@@ -366,6 +369,8 @@ pub struct DemoData {
     pub graphs: Vec<StepGraph>,
     /// `step_graph_phase` rows.
     pub phases: Vec<StepGraphPhase>,
+    /// `step_graph_edge` rows (MOD-137 D9): each graph's [`seed::default_edges`].
+    pub edges: Vec<StepGraphEdge>,
     /// `prompt_template` rows.
     pub templates: Vec<PromptTemplate>,
     /// `agent` rows.
@@ -415,7 +420,7 @@ pub struct DemoData {
 /// Builds the fixture. Pure: no I/O, no randomness, no clock.
 #[must_use]
 pub fn demo_data() -> DemoData {
-    let (kinds, graphs, phases, templates) = catalogue();
+    let (kinds, graphs, phases, edges, templates) = catalogue();
     DemoData {
         users: users(),
         boxes: boxes(),
@@ -426,6 +431,7 @@ pub fn demo_data() -> DemoData {
         kinds,
         graphs,
         phases,
+        edges,
         templates,
         agents: agents(),
         personas: personas(),
@@ -749,24 +755,30 @@ fn projects() -> Vec<Project> {
         .collect()
 }
 
-/// Kinds, their default graphs, the graphs' phases and one template version per default
+/// [`catalogue`]'s rows: kinds, graphs, phases, edges (MOD-137 D9) and templates.
+type Catalogue = (
+    Vec<ItemKind>,
+    Vec<StepGraph>,
+    Vec<StepGraphPhase>,
+    Vec<StepGraphEdge>,
+    Vec<PromptTemplate>,
+);
+
+/// Kinds, their default graphs, the graphs' phases and edges, and one template version per default
 /// template name, all built through [`seed`]'s constructors with [`demo_uuid`] ids.
 ///
 /// Ids follow blueprint §G: kind and graph `n` are `project_index * KINDS.len() + kind_index`,
 /// phases are numbered across the whole project ([`seed::PHASES_PER_PROJECT`] per project),
-/// templates are `project_index * DEFAULT_TEMPLATES.len() + template_index`.
+/// templates are `project_index * DEFAULT_TEMPLATES.len() + template_index`. Edges (MOD-137 D9)
+/// are [`seed::default_edges`] per graph, numbered by one running counter across the fixture:
+/// fourteen per project, forty-two in all, below the `u8` ceiling of [`demo_uuid`].
 ///
 /// Every stride is the length of the table it indexes and not a literal, because it is a
 /// primary-key input and not a formatting choice: [`demo_uuid`] is a pure function of
 /// `(class, n)`, so a stride below the number of rows per project hands project *i*'s first row
 /// the id project *i−1*'s late rows already hold, and `load_demo` fails on the second insert
 /// (blueprint E-5, when the template stride was `8` for eight names).
-fn catalogue() -> (
-    Vec<ItemKind>,
-    Vec<StepGraph>,
-    Vec<StepGraphPhase>,
-    Vec<PromptTemplate>,
-) {
+fn catalogue() -> Catalogue {
     let kinds_per_project = seed::KINDS.len() as u8;
     let phases_per_project = seed::PHASES_PER_PROJECT as u8;
     let templates_per_project = DEFAULT_TEMPLATES.len() as u8;
@@ -774,7 +786,9 @@ fn catalogue() -> (
     let mut kinds = Vec::new();
     let mut graphs = Vec::new();
     let mut phases = Vec::new();
+    let mut edges = Vec::new();
     let mut templates = Vec::new();
+    let mut edge_n: u8 = 0;
 
     for (project_index, (project_id, _, _, _)) in PROJECT_SPECS.iter().enumerate() {
         let project_index = project_index as u8;
@@ -799,16 +813,28 @@ fn catalogue() -> (
                 epoch(),
             ));
 
-            for (position, phase) in kind.phases.iter().enumerate() {
-                phases.push(seed::phase_row(
-                    PhaseId::from_uuid(demo_uuid(class::PHASE, phase_n)),
-                    graph_id,
-                    position as i32,
-                    phase,
-                    epoch(),
-                ));
-                phase_n += 1;
-            }
+            let graph_phases: Vec<StepGraphPhase> = kind
+                .phases
+                .iter()
+                .enumerate()
+                .map(|(position, phase)| {
+                    let row = seed::phase_row(
+                        PhaseId::from_uuid(demo_uuid(class::PHASE, phase_n)),
+                        graph_id,
+                        position as i32,
+                        phase,
+                        epoch(),
+                    );
+                    phase_n += 1;
+                    row
+                })
+                .collect();
+            edges.extend(seed::default_edges(&graph_phases, || {
+                let id = EdgeId::from_uuid(demo_uuid(class::EDGE, edge_n));
+                edge_n += 1;
+                id
+            }));
+            phases.extend(graph_phases);
         }
 
         for (template_index, (name, _, body)) in DEFAULT_TEMPLATES.iter().enumerate() {
@@ -826,7 +852,7 @@ fn catalogue() -> (
         }
     }
 
-    (kinds, graphs, phases, templates)
+    (kinds, graphs, phases, edges, templates)
 }
 
 /// `item_key_counter` (§4.1) after the fixture is loaded: the highest number ever minted per
@@ -1350,7 +1376,7 @@ fn document(
 ///
 /// Never for the fixture: the assertions name rows [`catalogue`] and [`steps`] always seed.
 fn demo_graph_snapshot() -> Value {
-    let (_, graphs, phases, _) = catalogue();
+    let (_, graphs, phases, _, _) = catalogue();
     let graph = graphs
         .into_iter()
         .find(|row| row.id == ids::GRAPH_HTUI_FEAT)

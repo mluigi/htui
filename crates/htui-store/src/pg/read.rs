@@ -25,14 +25,19 @@ use htui_core::model::{
     RequirementRevision, RequirementSpec, RequirementState, Resolution, ResolvedGraph,
     ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
     RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillBinding,
-    SkillBindingId, SkillBindingKey, SkillId, SkillVersion, Status, StepGraph, StepGraphId,
+    SkillBindingId, SkillBindingKey, SkillId, SkillVersion, Split, Status, StepGraph, StepGraphId,
     StepGraphPhase, StepId, StepStatus, ToolCallCount, UpstreamEntry, UserId, VerifyOutcome,
     WaitingCandidate, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspaceProject, WorkspaceSummary,
+};
+use htui_core::model::{
+    EdgeId, EdgeKind, EdgePredicate, GraphBody, GraphScope, NodeBody, PhasePart, PlanScope,
+    StepGraphEdge,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{ReadStore, Result, SettingRung, StoreError, StoredSetting};
 use serde_json::Value;
 use sqlx::types::Json;
+use sqlx::{PgConnection, PgExecutor};
 use uuid::Uuid;
 
 use crate::error::map_sqlx;
@@ -2778,26 +2783,7 @@ impl PgStore {
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
     pub(crate) async fn step_graph_row(&self, id: StepGraphId) -> Result<Option<StepGraph>> {
-        sqlx::query_as!(
-            StepGraph,
-            r#"
-            SELECT id         AS "id: StepGraphId",
-                   project_id AS "project_id: ProjectId",
-                   name,
-                   description,
-                   -- Inserted between `description` and `created_at`, never appended:
-                   -- `is_override` sits mid-struct and `query_as!` binds positionally, so an
-                   -- appended column would map `created_at` onto it and type-check (T1 audit A-4).
-                   is_override,
-                   created_at,
-                   updated_at
-              FROM step_graph WHERE id = $1
-            "#,
-            id.as_uuid(),
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(map_sqlx)
+        step_graph_row_on(&self.pool, id).await
     }
 
     /// One `step_graph_phase` row by id, for [`repo_row`](PgStore::repo_row)'s reason.
@@ -2826,6 +2812,16 @@ impl PgStore {
                    template_version,
                    token_budget,
                    persona_id       AS "persona_id: PersonaId",
+                   split                AS "split: Split",
+                   palette,
+                   plan_scope           AS "plan_scope: PlanScope",
+                   planner_persona_id   AS "planner_persona_id: PersonaId",
+                   planner_agent_id     AS "planner_agent_id: AgentId",
+                   planner_model,
+                   integrate_persona_id AS "integrate_persona_id: PersonaId",
+                   integrate_agent_id   AS "integrate_agent_id: AgentId",
+                   integrate_model,
+                   max_parts,
                    updated_at
               FROM step_graph_phase WHERE id = $1
             "#,
@@ -2923,16 +2919,18 @@ impl PgStore {
     /// Whatever the driver reports, through [`map_sqlx`].
     pub(crate) async fn step_graph_rows(&self, project: ProjectId) -> Result<Vec<StepGraph>> {
         sqlx::query_as!(
-            StepGraph,
+            StepGraphRow,
             r#"
-            SELECT id         AS "id: StepGraphId",
-                   project_id AS "project_id: ProjectId",
+            SELECT id           AS "id: StepGraphId",
+                   project_id   AS "project_id: ProjectId",
+                   workspace_id AS "workspace_id: WorkspaceId",
                    name,
                    description,
                    -- Inserted between `description` and `created_at`, never appended:
                    -- `is_override` sits mid-struct and `query_as!` binds positionally, so an
                    -- appended column would map `created_at` onto it and type-check (T1 audit A-4).
                    is_override,
+                   revision,
                    created_at,
                    updated_at
               FROM step_graph
@@ -2943,7 +2941,10 @@ impl PgStore {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(map_sqlx)
+        .map_err(map_sqlx)?
+        .into_iter()
+        .map(StepGraph::try_from)
+        .collect()
     }
 
     /// A graph's phases, ordered by `position`, which is unique per graph.
@@ -2952,36 +2953,7 @@ impl PgStore {
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
     pub(crate) async fn phase_rows(&self, graph: StepGraphId) -> Result<Vec<StepGraphPhase>> {
-        sqlx::query_as!(
-            StepGraphPhase,
-            r#"
-            SELECT id               AS "id: PhaseId",
-                   graph_id         AS "graph_id: StepGraphId",
-                   position,
-                   name,
-                   fan_out,
-                   gate             AS "gate: Gate",
-                   gate_hard,
-                   retry_limit,
-                   input_kinds,
-                   output_kind,
-                   isolation        AS "isolation: Isolation",
-                   command_queue    AS "command_queue: CommandQueue",
-                   verify_command,
-                   template_name,
-                   template_version,
-                   token_budget,
-                   persona_id       AS "persona_id: PersonaId",
-                   updated_at
-              FROM step_graph_phase
-             WHERE graph_id = $1
-             ORDER BY position
-            "#,
-            graph.as_uuid(),
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_sqlx)
+        phase_rows_on(&self.pool, graph).await
     }
 
     // ---- MOD-26 milestone 1: the persona readers (plan D4, D6; blueprint B-15) --------------
@@ -3290,6 +3262,299 @@ impl PgStore {
                 }))
             }
         }
+    }
+}
+
+// ---- MOD-137: the graph v2 readers (plan D10, D11; blueprint §T3.4) ----------------------------
+//
+// Generic over the executor so `replace_graph` reads back, inside its transaction, the body it
+// wrote with the same statements (and `.sqlx` entries) the pool readers use.
+
+/// [`PgStore::step_graph_row`] on any executor.
+pub(crate) async fn step_graph_row_on<'e, E: PgExecutor<'e>>(
+    executor: E,
+    id: StepGraphId,
+) -> Result<Option<StepGraph>> {
+    sqlx::query_as!(
+        StepGraphRow,
+        r#"
+            SELECT id           AS "id: StepGraphId",
+                   project_id   AS "project_id: ProjectId",
+                   workspace_id AS "workspace_id: WorkspaceId",
+                   name,
+                   description,
+                   -- Inserted between `description` and `created_at`, never appended:
+                   -- `is_override` sits mid-struct and `query_as!` binds positionally, so an
+                   -- appended column would map `created_at` onto it and type-check (T1 audit A-4).
+                   is_override,
+                   revision,
+                   created_at,
+                   updated_at
+              FROM step_graph WHERE id = $1
+            "#,
+        id.as_uuid(),
+    )
+    .fetch_optional(executor)
+    .await
+    .map_err(map_sqlx)?
+    .map(StepGraph::try_from)
+    .transpose()
+}
+
+/// [`PgStore::phase_rows`] on any executor.
+pub(crate) async fn phase_rows_on<'e, E: PgExecutor<'e>>(
+    executor: E,
+    graph: StepGraphId,
+) -> Result<Vec<StepGraphPhase>> {
+    sqlx::query_as!(
+        StepGraphPhase,
+        r#"
+            SELECT id               AS "id: PhaseId",
+                   graph_id         AS "graph_id: StepGraphId",
+                   position,
+                   name,
+                   fan_out,
+                   gate             AS "gate: Gate",
+                   gate_hard,
+                   retry_limit,
+                   input_kinds,
+                   output_kind,
+                   isolation        AS "isolation: Isolation",
+                   command_queue    AS "command_queue: CommandQueue",
+                   verify_command,
+                   template_name,
+                   template_version,
+                   token_budget,
+                   persona_id       AS "persona_id: PersonaId",
+                   split                AS "split: Split",
+                   palette,
+                   plan_scope           AS "plan_scope: PlanScope",
+                   planner_persona_id   AS "planner_persona_id: PersonaId",
+                   planner_agent_id     AS "planner_agent_id: AgentId",
+                   planner_model,
+                   integrate_persona_id AS "integrate_persona_id: PersonaId",
+                   integrate_agent_id   AS "integrate_agent_id: AgentId",
+                   integrate_model,
+                   max_parts,
+                   updated_at
+              FROM step_graph_phase
+             WHERE graph_id = $1
+             ORDER BY position
+            "#,
+        graph.as_uuid(),
+    )
+    .fetch_all(executor)
+    .await
+    .map_err(map_sqlx)
+}
+
+/// `step_graph_edge` as Postgres hands it over: `predicate` as plain JSON, folded into
+/// [`EdgePredicate`]. Field order is the SELECT order.
+struct EdgeRow {
+    id: EdgeId,
+    graph_id: StepGraphId,
+    from_phase_id: PhaseId,
+    to_phase_id: PhaseId,
+    kind: EdgeKind,
+    predicate: Option<Value>,
+    loop_limit: Option<i32>,
+}
+
+impl From<EdgeRow> for StepGraphEdge {
+    fn from(row: EdgeRow) -> Self {
+        Self {
+            id: row.id,
+            graph_id: row.graph_id,
+            from: row.from_phase_id,
+            to: row.to_phase_id,
+            kind: row.kind,
+            predicate: row.predicate.map(EdgePredicate),
+            loop_limit: row.loop_limit,
+        }
+    }
+}
+
+/// A graph's edges by (from position, to position, kind bytes), blueprint §1.3; empty for an
+/// unknown graph.
+///
+/// # Errors
+///
+/// Whatever the driver reports, through [`map_sqlx`].
+pub(crate) async fn graph_edges_on<'e, E: PgExecutor<'e>>(
+    executor: E,
+    graph: StepGraphId,
+) -> Result<Vec<StepGraphEdge>> {
+    let rows = sqlx::query_as!(
+        EdgeRow,
+        r#"
+        SELECT e.id            AS "id: EdgeId",
+               e.graph_id      AS "graph_id: StepGraphId",
+               e.from_phase_id AS "from_phase_id: PhaseId",
+               e.to_phase_id   AS "to_phase_id: PhaseId",
+               e.kind          AS "kind: EdgeKind",
+               e.predicate,
+               e.loop_limit
+          FROM step_graph_edge e
+          JOIN step_graph_phase f ON f.id = e.from_phase_id
+          JOIN step_graph_phase t ON t.id = e.to_phase_id
+         WHERE e.graph_id = $1
+         ORDER BY f.position, t.position, e.kind COLLATE "C"
+        "#,
+        graph.as_uuid(),
+    )
+    .fetch_all(executor)
+    .await
+    .map_err(map_sqlx)?;
+    Ok(rows.into_iter().map(StepGraphEdge::from).collect())
+}
+
+/// A phase's parts by `position`; empty for an unknown phase.
+///
+/// # Errors
+///
+/// Whatever the driver reports, through [`map_sqlx`].
+pub(crate) async fn phase_parts_on<'e, E: PgExecutor<'e>>(
+    executor: E,
+    phase: PhaseId,
+) -> Result<Vec<PhasePart>> {
+    sqlx::query_as!(
+        PhasePart,
+        r#"
+        SELECT phase_id   AS "phase_id: PhaseId",
+               position,
+               key,
+               title,
+               brief,
+               owned_paths,
+               acceptance,
+               agent_id   AS "agent_id: AgentId",
+               model,
+               persona_id AS "persona_id: PersonaId"
+          FROM phase_part
+         WHERE phase_id = $1
+         ORDER BY position
+        "#,
+        phase.as_uuid(),
+    )
+    .fetch_all(executor)
+    .await
+    .map_err(map_sqlx)
+}
+
+/// The whole body `replace_graph` writes, as stored (blueprint F10, §T3.4): the graph row, its
+/// phases, their candidates and parts (one statement each, grouped by phase here) and its edges.
+/// `None` for an unknown graph.
+///
+/// # Errors
+///
+/// Whatever the driver reports, through [`map_sqlx`].
+pub(crate) async fn graph_body_on(
+    conn: &mut PgConnection,
+    graph: StepGraphId,
+) -> Result<Option<GraphBody>> {
+    let Some(row) = step_graph_row_on(&mut *conn, graph).await? else {
+        return Ok(None);
+    };
+    let phases = phase_rows_on(&mut *conn, graph).await?;
+    let agents = sqlx::query_as!(
+        PhaseAgent,
+        r#"
+        SELECT a.phase_id AS "phase_id: PhaseId",
+               a.position,
+               a.agent_id AS "agent_id: AgentId",
+               a.model
+          FROM phase_agent a
+          JOIN step_graph_phase p ON p.id = a.phase_id
+         WHERE p.graph_id = $1
+         ORDER BY p.position, a.position
+        "#,
+        graph.as_uuid(),
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(map_sqlx)?;
+    let parts = sqlx::query_as!(
+        PhasePart,
+        r#"
+        SELECT pp.phase_id   AS "phase_id: PhaseId",
+               pp.position,
+               pp.key,
+               pp.title,
+               pp.brief,
+               pp.owned_paths,
+               pp.acceptance,
+               pp.agent_id   AS "agent_id: AgentId",
+               pp.model,
+               pp.persona_id AS "persona_id: PersonaId"
+          FROM phase_part pp
+          JOIN step_graph_phase p ON p.id = pp.phase_id
+         WHERE p.graph_id = $1
+         ORDER BY p.position, pp.position
+        "#,
+        graph.as_uuid(),
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(map_sqlx)?;
+    let edges = graph_edges_on(&mut *conn, graph).await?;
+    let mut agents_of: BTreeMap<PhaseId, Vec<PhaseAgent>> = BTreeMap::new();
+    for agent in agents {
+        agents_of.entry(agent.phase_id).or_default().push(agent);
+    }
+    let mut parts_of: BTreeMap<PhaseId, Vec<PhasePart>> = BTreeMap::new();
+    for part in parts {
+        parts_of.entry(part.phase_id).or_default().push(part);
+    }
+    let nodes = phases
+        .into_iter()
+        .map(|phase| NodeBody {
+            agents: agents_of.remove(&phase.id).unwrap_or_default(),
+            parts: parts_of.remove(&phase.id).unwrap_or_default(),
+            phase,
+        })
+        .collect();
+    Ok(Some(GraphBody {
+        graph: row,
+        nodes,
+        edges,
+    }))
+}
+
+/// `step_graph` as Postgres hands it over (MOD-137 D3, blueprint F13): the two owner columns,
+/// folded into [`GraphScope`] by `TryFrom`. Field order is the SELECT order.
+pub(crate) struct StepGraphRow {
+    pub(crate) id: StepGraphId,
+    pub(crate) project_id: Option<ProjectId>,
+    pub(crate) workspace_id: Option<WorkspaceId>,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) is_override: bool,
+    pub(crate) revision: i64,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) updated_at: DateTime<Utc>,
+}
+
+impl TryFrom<StepGraphRow> for StepGraph {
+    type Error = StoreError;
+
+    fn try_from(row: StepGraphRow) -> Result<Self> {
+        let scope =
+            GraphScope::from_columns(row.project_id, row.workspace_id).ok_or_else(|| {
+                StoreError::Backend(format!(
+                    "step_graph `{}` has both project_id and workspace_id (ck_step_graph_owner)",
+                    row.id
+                ))
+            })?;
+        Ok(Self {
+            id: row.id,
+            scope,
+            name: row.name,
+            description: row.description,
+            is_override: row.is_override,
+            revision: row.revision,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })
     }
 }
 

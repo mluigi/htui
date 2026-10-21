@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO step_graph_phase (id, graph_id, position, name, fan_out, gate, gate_hard, retry_limit, input_kinds, output_kind, isolation, command_queue, verify_command, template_name, template_version, token_budget, updated_at, persona_id, split, palette, plan_scope, planner_persona_id, planner_agent_id, planner_model, integrate_persona_id, integrate_agent_id, integrate_model, max_parts) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int4",
+        "Text",
+        "Int4",
+        "Text",
+        "Bool",
+        "Int4",
+        "TextArray",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int4",
+        "Int4",
+        "Timestamptz",
+        "Uuid",
+        "Text",
+        "Bool",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "899fe8ae7d3c47efe53c90fa5d84a325a7288717350312e2c54a5ac8c056c0d6"
+}

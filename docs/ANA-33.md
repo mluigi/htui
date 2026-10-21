@@ -398,6 +398,8 @@ Resume:
 - **Nodes and edges.** `step_graph_phase` rows stay the nodes. A new
   `step_graph_edge(id, graph_id, from_phase_id, to_phase_id, kind, predicate JSONB, limit)` holds the
   links, with `kind IN ('next','if','asks_you','changes_requested','fails')`.
+  *Amended by MOD-137 (2026-10-21):* the column is `loop_limit`, since `limit` is reserved in
+  Postgres; the migration is `0020`, since MOD-125 took `0019`.
 - **Owner scope.** `step_graph` gains a nullable `workspace_id`, and `project_id` becomes nullable,
   under a CHECK that at most one is set. Neither set means the **global workflow library**. Uniqueness
   becomes one partial unique index per scope.
@@ -814,7 +816,7 @@ column and land before ANA-35.
 ## 10. Spawned items
 
 - **MOD-137 - Step graph v2 storage: edges, owner scope, revision, atomic edits.**
-  - **Migration `0019`:**
+  - **Migration `0019`** (landed as `0020_step_graph_v2.sql`; MOD-125 took `0019`):
     - `step_graph_edge`;
     - `step_graph.workspace_id`, a nullable `project_id`, the scope CHECK and partial unique indexes;
     - `step_graph.revision`;

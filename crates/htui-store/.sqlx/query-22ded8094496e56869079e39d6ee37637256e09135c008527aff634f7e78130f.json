@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE step_graph_phase SET position = $3, name = $4, fan_out = $5, gate = $6,\n            gate_hard = $7, retry_limit = $8, input_kinds = $9, output_kind = $10, isolation = $11,\n            command_queue = $12, verify_command = $13, template_name = $14,\n            template_version = $15, token_budget = $16, persona_id = $17, split = $18,\n            palette = $19, plan_scope = $20, planner_persona_id = $21, planner_agent_id = $22,\n            planner_model = $23, integrate_persona_id = $24, integrate_agent_id = $25,\n            integrate_model = $26, max_parts = $27\n         WHERE id = $1 AND graph_id = $2\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int4",
+        "Text",
+        "Int4",
+        "Text",
+        "Bool",
+        "Int4",
+        "TextArray",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int4",
+        "Int4",
+        "Uuid",
+        "Text",
+        "Bool",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "22ded8094496e56869079e39d6ee37637256e09135c008527aff634f7e78130f"
+}

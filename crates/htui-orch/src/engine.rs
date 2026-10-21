@@ -7847,7 +7847,8 @@ mod tests {
         /// `fan_out` are none of them** (`model/kind.rs:230-251`), so the blueprint's
         /// `update_phase(review, expected, PhasePatch { gate: Some(Gate::Never), .. })` does not
         /// exist. `create_phase` takes a whole `StepGraphPhase`, so a clone with the row a test
-        /// wants is the reachable edit — the same two writers `graph::override_graph` uses.
+        /// wants is the reachable edit (`graph::override_graph` writes through `replace_graph`
+        /// since MOD-137).
         async fn repoint(
             &self,
             item: htui_core::model::ItemId,
@@ -7872,7 +7873,7 @@ mod tests {
                 .store
                 .create_step_graph(NewStepGraph {
                     id: StepGraphId::new(),
-                    project_id: row.project_id,
+                    scope: htui_core::model::GraphScope::Project(row.project_id),
                     name: format!("{}-edited", row.key),
                     description: "a test's edit of the live graph".to_owned(),
                     is_override: false,
@@ -7886,6 +7887,10 @@ mod tests {
                     ..phase.phase.clone()
                 };
                 mutate(&mut edited);
+                // ck_phase_split_fan_out (MOD-137 D7): `split` follows the edited `fan_out`.
+                if edited.split != htui_core::model::Split::Divide {
+                    edited.split = htui_core::model::Split::for_fan_out(edited.fan_out);
+                }
                 self.orch
                     .store
                     .create_phase(&edited)

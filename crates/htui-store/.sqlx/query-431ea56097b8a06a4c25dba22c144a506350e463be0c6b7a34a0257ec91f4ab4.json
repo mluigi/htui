@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO step_graph_phase (id, graph_id, position, name, fan_out, gate, gate_hard,\n                                          retry_limit, input_kinds, output_kind, isolation,\n                                          command_queue, verify_command, template_name,\n                                          template_version, token_budget, persona_id)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)\n            RETURNING id               AS \"id: PhaseId\",\n                      graph_id         AS \"graph_id: StepGraphId\",\n                      position,\n                      name,\n                      fan_out,\n                      gate             AS \"gate: htui_core::model::Gate\",\n                      gate_hard,\n                      retry_limit,\n                      input_kinds,\n                      output_kind,\n                      isolation        AS \"isolation: Isolation\",\n                      command_queue    AS \"command_queue: htui_core::model::CommandQueue\",\n                      verify_command,\n                      template_name,\n                      template_version,\n                      token_budget,\n                      persona_id       AS \"persona_id: PersonaId\",\n                      updated_at\n            ",
+  "query": "\n            SELECT id               AS \"id: PhaseId\",\n                   graph_id         AS \"graph_id: StepGraphId\",\n                   position,\n                   name,\n                   fan_out,\n                   gate             AS \"gate: Gate\",\n                   gate_hard,\n                   retry_limit,\n                   input_kinds,\n                   output_kind,\n                   isolation        AS \"isolation: Isolation\",\n                   command_queue    AS \"command_queue: CommandQueue\",\n                   verify_command,\n                   template_name,\n                   template_version,\n                   token_budget,\n                   persona_id       AS \"persona_id: PersonaId\",\n                   split                AS \"split: Split\",\n                   palette,\n                   plan_scope           AS \"plan_scope: PlanScope\",\n                   planner_persona_id   AS \"planner_persona_id: PersonaId\",\n                   planner_agent_id     AS \"planner_agent_id: AgentId\",\n                   planner_model,\n                   integrate_persona_id AS \"integrate_persona_id: PersonaId\",\n                   integrate_agent_id   AS \"integrate_agent_id: AgentId\",\n                   integrate_model,\n                   max_parts,\n                   updated_at\n              FROM step_graph_phase\n             WHERE graph_id = $1\n             ORDER BY position\n            ",
   "describe": {
     "columns": [
       {
@@ -60,7 +60,7 @@
       },
       {
         "ordinal": 5,
-        "name": "gate: htui_core::model::Gate",
+        "name": "gate: Gate",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -126,7 +126,7 @@
       },
       {
         "ordinal": 11,
-        "name": "command_queue: htui_core::model::CommandQueue",
+        "name": "command_queue: CommandQueue",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -192,6 +192,116 @@
       },
       {
         "ordinal": 17,
+        "name": "split: Split",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "split"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "palette",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "palette"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "plan_scope: PlanScope",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "plan_scope"
+          }
+        }
+      },
+      {
+        "ordinal": 20,
+        "name": "planner_persona_id: PersonaId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "planner_persona_id"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "planner_agent_id: AgentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "planner_agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 22,
+        "name": "planner_model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "planner_model"
+          }
+        }
+      },
+      {
+        "ordinal": 23,
+        "name": "integrate_persona_id: PersonaId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "integrate_persona_id"
+          }
+        }
+      },
+      {
+        "ordinal": 24,
+        "name": "integrate_agent_id: AgentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "integrate_agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 25,
+        "name": "integrate_model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "integrate_model"
+          }
+        }
+      },
+      {
+        "ordinal": 26,
+        "name": "max_parts",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "max_parts"
+          }
+        }
+      },
+      {
+        "ordinal": 27,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -204,22 +314,6 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Uuid",
-        "Int4",
-        "Text",
-        "Int4",
-        "Text",
-        "Bool",
-        "Int4",
-        "TextArray",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Int4",
-        "Int4",
         "Uuid"
       ]
     },
@@ -241,8 +335,18 @@
       true,
       true,
       true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
       false
     ]
   },
-  "hash": "64322867aa0870fb1cd10499f2631aa81f1e8cd95732d7f0a9bafe222c071b43"
+  "hash": "431ea56097b8a06a4c25dba22c144a506350e463be0c6b7a34a0257ec91f4ab4"
 }

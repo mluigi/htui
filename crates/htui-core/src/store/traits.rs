@@ -71,7 +71,8 @@ use crate::model::{
     StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace,
     WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
 };
-use crate::prompt::settings::{Rungs, SettingKey};
+use crate::model::{EdgeId, EdgeKind, GraphBody, GraphScope, PhasePart, Split, StepGraphEdge};
+use crate::prompt::settings::{Rungs, SettingKey, validate};
 use crate::prompt::template::{TemplateRole, parse};
 use crate::store::error::Result;
 
@@ -882,18 +883,24 @@ pub trait WriteStore: ReadStore {
 
     // step_graph and phase
 
-    /// Inserts a graph (no phases; [`create_phase`](Self::create_phase) adds them).
+    /// Inserts a graph (no phases; [`create_phase`](Self::create_phase) adds them) at
+    /// `revision` 0. MOD-137 D3: `new.scope` names the owner (a project, a workspace or the
+    /// library), and a name is unique per scope.
     ///
     /// # Errors
-    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when `(project_id, name)`
-    /// is taken or `project_id` names no row.
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint), in this order: an owner
+    /// that names no row (`step_graph.project_id` / `step_graph.workspace_id`, the latter
+    /// [`references_no_row`]); an override outside a project ([`override_outside_project`]); a
+    /// name taken in the scope ([`graph_name_is_taken`]). A taken `id` is refused too; where it
+    /// falls in that order is the backend's.
     async fn create_step_graph(&self, new: NewStepGraph) -> Result<StepGraph>;
 
-    /// Edits `name` / `description` under CAS.
+    /// Edits `name` / `description` under CAS; an applied edit bumps `revision` (MOD-137 D5).
     ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id;
-    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) on a `name` collision.
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) on a `name` taken in the
+    /// graph's scope ([`graph_name_is_taken`]).
     async fn update_step_graph(
         &self,
         id: StepGraphId,
@@ -911,11 +918,20 @@ pub trait WriteStore: ReadStore {
     /// returned. `judge` and `handoff` are template roles, not phase names
     /// ([`TemplateRole::of_name`](crate::prompt::template::TemplateRole::of_name)).
     ///
+    /// A successful insert bumps the graph's `revision` (MOD-137 D5).
+    ///
     /// # Errors
-    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a reserved name, a
-    /// taken `(graph_id, position)` or `(graph_id, name)`, a `graph_id` that names no row, or a
-    /// `persona_id` that names no row (`references_no_row("step_graph_phase.persona_id", id,
-    /// "persona")`), checked after the position and name clashes (MOD-26 D5).
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint), in MOD-137 blueprint
+    /// §T2.2's order (both stores), nothing written on any of them: a reserved name
+    /// ([`reserved_phase_name`]); a node CHECK
+    /// [`phase_row_refusal`](crate::store::phase_row_refusal) decides (`split`/`fan_out`, divide
+    /// columns off a divide node, `max_parts` below one, then `fan_out` below one, a negative
+    /// `retry_limit` and a `token_budget` below 1 ([`phase_token_budget_refusal`])); a `graph_id`
+    /// that names no row; a taken `(graph_id, position)`, then `(graph_id, name)`, then an `id`
+    /// any phase holds ([`already_exists`]); then `persona_id`,
+    /// `planner_persona_id`, `integrate_persona_id`, `planner_agent_id`, `integrate_agent_id`
+    /// naming no row, in that order and worded
+    /// `references_no_row("step_graph_phase.<column>", id, "persona" | "agent")` (MOD-26 D5).
     async fn create_phase(&self, phase: &StepGraphPhase) -> Result<StepGraphPhase>;
 
     /// Inserts `agents` as `phase`'s candidate rows, all or nothing; an empty slice writes nothing
@@ -950,6 +966,91 @@ pub trait WriteStore: ReadStore {
     /// # Errors
     /// The backend's own failures only.
     async fn phases(&self, graph: StepGraphId) -> Result<Vec<StepGraphPhase>>;
+
+    // MOD-137: graph v2 writers and reads (plan D10, D11)
+
+    /// Replaces a graph's editable content in one write (MOD-137 D10). From `body.graph` only
+    /// `name` and `description` are written; its `id` must be `graph`, and `scope`,
+    /// `is_override`, `revision` and the timestamps are ignored. Nodes are diffed **by phase
+    /// id**: a kept id is updated in place and keeps its `skill_binding` rows; a new id is
+    /// inserted; a stored id missing from `body` is deleted with its candidates, parts, edges and
+    /// phase bindings. Every node's candidates and parts, and the graph's edges, are replaced
+    /// wholesale. `revision` + 1.
+    ///
+    /// Answers `Applied` with the body as stored (nodes, candidates and parts by `position`,
+    /// edges by from position, to position and kind bytes; every `updated_at` the store's clock).
+    /// The phase columns [`StepGraphPhase`] does not carry (`judge_agent_id`, `judge_model`,
+    /// `deadline_seconds`, blueprint F14) keep their values on a kept node and are `NULL` on a
+    /// new one. Store-level checks only: acyclicity, back-edge kinds and reachability are
+    /// MOD-138's shared validator, which this writer will call once it exists.
+    ///
+    /// # Errors
+    /// In this order, and nothing is written on any of them:
+    /// 1. [`StoreError::NotFound`](crate::store::StoreError::NotFound) `"step_graph"` for an
+    ///    unknown `graph`;
+    /// 2. `Ok(CasOutcome::Stale(current body))` when `expected_revision` is not the stored one;
+    /// 3. [`StoreError::Constraint`](crate::store::StoreError::Constraint) with
+    ///    [`graph_body_shape_refusal`](crate::store::graph_body_shape_refusal)'s sentence (ids of
+    ///    the body against `graph` and their own node, reserved names, duplicate ids, position and
+    ///    name clashes, candidate and part position/key clashes, duplicate edge ids);
+    /// 4. `Constraint` [`graph_name_is_taken`] when the new name is taken in the graph's scope;
+    /// 5. `Constraint` [`already_exists`] for a phase or edge id held by another graph;
+    /// 6. `Constraint` [`references_no_row`] for the first persona, then the first agent, that
+    ///    names no row, in [`body_persona_refs`](crate::store::body_persona_refs) /
+    ///    [`body_agent_refs`](crate::store::body_agent_refs) order;
+    /// 7. `Constraint` with
+    ///    [`graph_body_topology_refusal`](crate::store::graph_body_topology_refusal)'s sentence
+    ///    (edge endpoints, edge CHECKs, duplicate edges, node CHECKs, palette edges, parts on a
+    ///    non-divide node).
+    async fn replace_graph(
+        &self,
+        graph: StepGraphId,
+        expected_revision: i64,
+        body: GraphBody,
+    ) -> Result<CasOutcome<GraphBody>>;
+
+    /// Deletes a phase with its candidates, parts, edges and phase bindings (MOD-137 D11); the
+    /// graph's last phase may go. `revision` + 1.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `"step_graph_phase"` for an
+    /// unknown id.
+    async fn delete_phase(&self, id: PhaseId) -> Result<()>;
+
+    /// Deletes one edge (MOD-137 D11). `revision` + 1.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `"step_graph_edge"` for an
+    /// unknown id.
+    async fn delete_edge(&self, id: EdgeId) -> Result<()>;
+
+    /// Deletes every candidate of `phase` (MOD-137 D11); the editor re-adds through
+    /// [`create_phase_agents`](Self::create_phase_agents). `revision` + 1, also when the phase had
+    /// none.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `"step_graph_phase"` for an
+    /// unknown phase.
+    async fn delete_phase_agents(&self, phase: PhaseId) -> Result<()>;
+
+    /// A graph's edges by (from position, to position, kind bytes); empty for an unknown graph.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn graph_edges(&self, graph: StepGraphId) -> Result<Vec<StepGraphEdge>>;
+
+    /// A phase's parts by `position`; empty for an unknown phase.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn phase_parts(&self, phase: PhaseId) -> Result<Vec<PhasePart>>;
+
+    /// The whole body [`replace_graph`](Self::replace_graph) writes, as stored (blueprint F10);
+    /// `None` for an unknown graph. Any scope: the one reader of a workspace or library graph.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn graph_body(&self, graph: StepGraphId) -> Result<Option<GraphBody>>;
 
     // prompt_template (MOD-9 milestone 1, plan D1-D4)
 
@@ -1103,7 +1204,7 @@ pub trait WriteStore: ReadStore {
 
     // settings (D7, D8)
 
-    /// Writes one setting on one rung after [`validate`](crate::prompt::settings::validate):
+    /// Writes one setting on one rung after [`validate`]:
     /// rung, kind, range, `not_above` against the same rung's current peer (or its default).
     /// `App` is an `app_setting` row (`expected: None` = "I expect no row", the insert after a
     /// clear; `Stale` if one exists); `Project` merges one key into `project.settings` under CAS
@@ -2617,8 +2718,9 @@ pub fn item_kind_is_held(prefix: &str, items: u64) -> String {
 const BOUND_PHASES_NAMED: usize = 5;
 
 /// MOD-26 milestone 2 D14 (I-9): `delete_persona`'s refusal while phases bind the persona. Each
-/// holder is `(project slug, graph name, phase name)`, named `` `<slug>/<graph>/<phase>` ``: a
-/// persona is global and a graph name is unique only per project (`0001_init.sql:221`). Sorted by
+/// holder is `(owner, graph name, phase name)`, named `` `<owner>/<graph>/<phase>` ``: a persona
+/// is global and a graph name is unique only per scope; the owner is the project slug,
+/// `workspace:<slug>` or `library` (MOD-137 D3, blueprint F8). Sorted by
 /// the triple's bytes and deduplicated **here**, so both stores word it the same whatever order
 /// they read in; at most five, then "and n more".
 #[must_use]
@@ -2727,6 +2829,153 @@ pub fn close_out_needs_a_summary(kind: &str) -> String {
 #[must_use]
 pub fn summary_names_another_item(item: ItemId, named: ItemId) -> String {
     format!("the summary of {item} cannot name item {named}")
+}
+
+// ---- MOD-137: the step graph v2 refusals (plan D3, D6-D8, D10; blueprint §1.5) ---------------
+//
+// Same reason as MOD-4's: both stores decide these before any write, so `MemStore` and `PgStore`
+// refuse the same input with the same sentence (blueprint F6).
+
+/// `uq_step_graph_{project,workspace,library}_name` (MOD-137 D3), in words.
+#[must_use]
+pub fn graph_name_is_taken(name: &str, scope: GraphScope) -> String {
+    format!("step_graph.name `{name}` is taken in {scope}")
+}
+
+/// `ck_step_graph_override_in_project` (MOD-137 D3), in words.
+#[must_use]
+pub fn override_outside_project(scope: GraphScope) -> String {
+    format!("an override graph is a per-item clone and belongs to a project, not {scope}")
+}
+
+/// A row of a graph write that names another graph than the one written (MOD-137 D10).
+#[must_use]
+pub fn row_names_another_graph(
+    column: &str,
+    row: impl std::fmt::Display,
+    graph: StepGraphId,
+) -> String {
+    format!("{column} `{row}` is not the graph being written (`{graph}`)")
+}
+
+/// `uq_step_graph_phase_position`, in words.
+#[must_use]
+pub fn phase_position_is_taken(position: i32, graph: StepGraphId) -> String {
+    format!("step_graph_phase.position {position} is taken in graph `{graph}`")
+}
+
+/// `uq_step_graph_phase_name`, in words.
+#[must_use]
+pub fn phase_name_is_taken(name: &str, graph: StepGraphId) -> String {
+    format!("step_graph_phase.name `{name}` is taken in graph `{graph}`")
+}
+
+/// `uq_phase_part_key` (MOD-137 D8), in words.
+#[must_use]
+pub fn phase_part_key_is_taken(key: &str, phase: PhaseId) -> String {
+    format!("phase_part.key `{key}` is taken in phase `{phase}`")
+}
+
+/// `fk_step_graph_edge_{from,to}` (MOD-137 D6), in words.
+#[must_use]
+pub fn edge_endpoint_outside_graph(column: &str, phase: PhaseId, graph: StepGraphId) -> String {
+    format!("step_graph_edge.{column} `{phase}` references no step_graph_phase in graph `{graph}`")
+}
+
+/// `ck_step_graph_edge_not_self` (MOD-137 D6), in words.
+#[must_use]
+pub fn edge_loops_to_itself(edge: EdgeId) -> String {
+    format!("step_graph_edge `{edge}` runs from a phase to itself")
+}
+
+/// `ck_step_graph_edge_predicate` (MOD-137 D6), in words.
+#[must_use]
+pub fn edge_predicate_mismatch(edge: EdgeId, kind: EdgeKind) -> String {
+    if kind.takes_predicate() {
+        format!("step_graph_edge `{edge}` is `{kind}` and carries no predicate")
+    } else {
+        format!("step_graph_edge `{edge}` is `{kind}` and carries a predicate; only `if` does")
+    }
+}
+
+/// `ck_step_graph_edge_loop_limit` (MOD-137 D6), in words.
+#[must_use]
+pub fn edge_loop_limit_negative(edge: EdgeId, limit: i32) -> String {
+    format!("step_graph_edge `{edge}` has loop_limit {limit}; a loop limit is 0 or more")
+}
+
+/// `ck_step_graph_edge_loop_limit_required` (MOD-137 D6), in words.
+#[must_use]
+pub fn edge_needs_loop_limit(edge: EdgeId, kind: EdgeKind) -> String {
+    format!("step_graph_edge `{edge}` is `{kind}` and carries no loop_limit")
+}
+
+/// `uq_step_graph_edge` (MOD-137 D6), in words.
+#[must_use]
+pub fn edge_is_taken(from: PhaseId, to: PhaseId, kind: EdgeKind, graph: StepGraphId) -> String {
+    format!("step_graph_edge ({from}, {to}, `{kind}`) is taken in graph `{graph}`")
+}
+
+/// MOD-137 D6: a palette node has no edges (a store check, not a CHECK).
+#[must_use]
+pub fn palette_phase_has_edges(phase: &str, edge: EdgeId) -> String {
+    format!("palette phase `{phase}` has step_graph_edge `{edge}`; a palette node has no edges")
+}
+
+/// `ck_phase_split_fan_out` (MOD-137 D7), in words.
+#[must_use]
+pub fn split_fan_out_mismatch(phase: &str, split: Split, fan_out: i32) -> String {
+    format!(
+        "phase `{phase}` is split `{split}` with fan_out {fan_out}; `compete` is exactly fan_out > 1"
+    )
+}
+
+/// `ck_phase_divide_columns` (MOD-137 D7), in words.
+#[must_use]
+pub fn divide_columns_off_divide(phase: &str, split: Split) -> String {
+    format!(
+        "phase `{phase}` is split `{split}`; planner_*, integrate_* and max_parts belong to a \
+         `divide` phase"
+    )
+}
+
+/// `ck_phase_max_parts` (MOD-137 D7), in words.
+#[must_use]
+pub fn max_parts_below_one(phase: &str, max_parts: i32) -> String {
+    format!("phase `{phase}` has max_parts {max_parts}; a divide phase takes at least 1")
+}
+
+/// 0001's `step_graph_phase.fan_out` CHECK (`fan_out >= 1`), in words.
+#[must_use]
+pub fn fan_out_below_one(phase: &str, fan_out: i32) -> String {
+    format!("phase `{phase}` has fan_out {fan_out}; a phase runs at least 1 candidate")
+}
+
+/// 0001's `step_graph_phase.retry_limit` CHECK (`retry_limit >= 0`), in words.
+#[must_use]
+pub fn retry_limit_negative(phase: &str, retry_limit: i32) -> String {
+    format!("phase `{phase}` has retry_limit {retry_limit}; a retry limit is 0 or more")
+}
+
+/// MOD-137 review R1 B-L2: a node's `token_budget` the `Phase` rung of
+/// [`WriteStore::set_setting`] would refuse (below 1), in the very sentence that rung gives it
+/// ([`validate`]'s range refusal), so `create_phase` and `replace_graph` cannot store a budget the
+/// settings editor could never write. `None` when the budget is accepted.
+#[must_use]
+pub fn phase_token_budget_refusal(budget: i32) -> Option<String> {
+    validate(
+        SettingKey::TokenBudget,
+        Rungs::PHASE,
+        &Value::from(budget),
+        None,
+    )
+    .err()
+}
+
+/// MOD-137 D8: only a `divide` node has `phase_part` rows (a store check, not a CHECK).
+#[must_use]
+pub fn parts_off_divide(phase: &str, split: Split) -> String {
+    format!("phase `{phase}` is split `{split}`; only a `divide` phase has parts")
 }
 
 // ---- MOD-38: ANA-11's refusals ----
@@ -3148,7 +3397,7 @@ pub enum SettingRung {
 }
 
 impl SettingRung {
-    /// The flag [`validate`](crate::prompt::settings::validate) checks against
+    /// The flag [`validate`] checks against
     /// [`SettingSpec::rungs`](crate::prompt::settings::SettingSpec::rungs).
     #[must_use]
     pub const fn flag(self) -> Rungs {

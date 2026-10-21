@@ -153,7 +153,7 @@ enum Row {
         /// Index into that project's `graphs`.
         g: usize,
     },
-    /// `projects[p].graphs[g].phases[i]`, whichever parent it is drawn under.
+    /// `projects[p].graphs[g].nodes[i].phase`, whichever parent it is drawn under.
     ///
     /// A phase under a kind and a phase under an unreferenced graph are the same row: both carry
     /// the graph's index, and every key on a phase row acts on the graph. Indentation is the only
@@ -433,7 +433,7 @@ impl KindsSection {
                     .iter()
                     .position(|entry| entry.graph.id == kind.default_graph_id)
                 {
-                    for i in 0..project.graphs[g].phases.len() {
+                    for i in 0..project.graphs[g].nodes.len() {
                         rows.push(Row::Phase { p, g, i });
                     }
                 }
@@ -447,7 +447,7 @@ impl KindsSection {
                     continue;
                 }
                 rows.push(Row::Graph { p, g });
-                for i in 0..entry.phases.len() {
+                for i in 0..entry.nodes.len() {
                     rows.push(Row::Phase { p, g, i });
                 }
             }
@@ -491,7 +491,7 @@ impl KindsSection {
 
     /// One phase of one graph.
     fn phase_at(&self, p: usize, g: usize, i: usize) -> Option<&StepGraphPhase> {
-        self.graph_at(p, g)?.phases.get(i)
+        self.graph_at(p, g)?.nodes.get(i).map(|node| &node.phase)
     }
 
     /// The row under the cursor, or `None` while there is no tree.
@@ -1084,7 +1084,7 @@ impl KindsSection {
             .projects
             .iter()
             .flat_map(|project| project.graphs.iter())
-            .flat_map(|entry| entry.phases.iter())
+            .flat_map(|entry| entry.nodes.iter().map(|node| &node.phase))
             .find(|phase| phase.id == id)
     }
 
@@ -1755,7 +1755,7 @@ fn new_phase_fields(entry: &GraphEntry) -> Vec<Field> {
         Field::required("name", ""),
         Field::required(
             "position",
-            &next_position(entry.phases.iter().map(|phase| phase.position)),
+            &next_position(entry.nodes.iter().map(|node| node.phase.position)),
         ),
         Field::required("template_name", ""),
         Field::required("gate_hard (y/n)", "n"),
@@ -1926,7 +1926,7 @@ fn reload(snapshot: &CatalogueSnapshot, kind: EditorKind) -> Reload {
             .projects
             .iter()
             .flat_map(|project| project.graphs.iter())
-            .flat_map(|entry| entry.phases.iter())
+            .flat_map(|entry| entry.nodes.iter().map(|node| &node.phase))
             .find(|phase| phase.id == id)
             .map_or(Reload::Gone, |phase| Reload::Token(phase.updated_at)),
     }

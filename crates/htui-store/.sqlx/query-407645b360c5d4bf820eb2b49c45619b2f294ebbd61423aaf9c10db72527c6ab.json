@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            DELETE FROM persona\n             WHERE id = $1\n               AND NOT EXISTS (SELECT 1 FROM step_graph_phase WHERE persona_id = $1)\n            RETURNING id\n            ",
+  "query": "SELECT id AS \"id: PersonaId\" FROM persona WHERE id = ANY($1) FOR KEY SHARE",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id",
+        "name": "id: PersonaId",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -17,12 +17,12 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "UuidArray"
       ]
     },
     "nullable": [
       false
     ]
   },
-  "hash": "3025fe1cbeee25bfb141ef74a7a13f15f42a3dffe6dcf718db58ad1dd3e11d07"
+  "hash": "407645b360c5d4bf820eb2b49c45619b2f294ebbd61423aaf9c10db72527c6ab"
 }

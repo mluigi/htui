@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id AS \"id: EdgeId\" FROM step_graph_edge\n             WHERE id = ANY($1) AND graph_id <> $2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: EdgeId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_edge",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "52c62fbf05398fd4018f1d707c90d2a45746fd08fc7f7f5e46e86928ed3ed2cf"
+}

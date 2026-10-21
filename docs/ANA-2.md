@@ -316,9 +316,11 @@ only, and a phase binding on an override graph is created explicitly.
 The name is `<item.key>-override`. `step_graph.name` is `UNIQUE (project_id, name)` and `item.key`
 is unique per project, so a second override *of the same item* is not a collision but a re-override:
 MOD-4 deletes the existing override graph's phases and re-clones in one transaction, leaving
-`item.step_graph_id` untouched. That is safe because a live run reads its own `graph_snapshot`
-(invariant 2), never the table. `step_graph.is_override BOOLEAN NOT NULL DEFAULT false` (0003) hides
-overrides from the Settings graph list (`R-TUI-8`) and is what MOD-15's project view filters on.
+`item.step_graph_id` untouched. *Built by MOD-137 (2026-10-21):* the re-clone is one `replace_graph`
+from the kind's default graph (never from the override itself), edges included. That is safe because
+a live run reads its own `graph_snapshot` (invariant 2), never the table.
+`step_graph.is_override BOOLEAN NOT NULL DEFAULT false` (0003) hides overrides from the Settings
+graph list (`R-TUI-8`) and is what MOD-15's project view filters on.
 Orphan collection: an override graph whose item has been `closed` for longer than
 `project.settings.retention_days` is dropped by the same sweep that drops steps; until then it is
 history a run snapshot may still be compared against.

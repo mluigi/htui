@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE step_graph_phase SET\n                name          = COALESCE($3, name),\n                position      = COALESCE($4, position),\n                template_name = COALESCE($5, template_name),\n                gate_hard     = COALESCE($6, gate_hard),\n                input_kinds   = COALESCE($7, input_kinds),\n                persona_id    = CASE WHEN $8::bool THEN $9::uuid ELSE persona_id END\n             WHERE id = $1 AND updated_at = $2\n            RETURNING id               AS \"id: PhaseId\",\n                      graph_id         AS \"graph_id: StepGraphId\",\n                      position,\n                      name,\n                      fan_out,\n                      gate             AS \"gate: htui_core::model::Gate\",\n                      gate_hard,\n                      retry_limit,\n                      input_kinds,\n                      output_kind,\n                      isolation        AS \"isolation: Isolation\",\n                      command_queue    AS \"command_queue: htui_core::model::CommandQueue\",\n                      verify_command,\n                      template_name,\n                      template_version,\n                      token_budget,\n                      persona_id       AS \"persona_id: PersonaId\",\n                      updated_at\n            ",
+  "query": "\n            UPDATE step_graph_phase SET\n                name          = COALESCE($3, name),\n                position      = COALESCE($4, position),\n                template_name = COALESCE($5, template_name),\n                gate_hard     = COALESCE($6, gate_hard),\n                input_kinds   = COALESCE($7, input_kinds),\n                persona_id    = CASE WHEN $8::bool THEN $9::uuid ELSE persona_id END\n             WHERE id = $1 AND updated_at = $2\n            RETURNING id                   AS \"id: PhaseId\",\n                      graph_id             AS \"graph_id: StepGraphId\",\n                      position,\n                      name,\n                      fan_out,\n                      gate                 AS \"gate: htui_core::model::Gate\",\n                      gate_hard,\n                      retry_limit,\n                      input_kinds,\n                      output_kind,\n                      isolation            AS \"isolation: Isolation\",\n                      command_queue        AS \"command_queue: htui_core::model::CommandQueue\",\n                      verify_command,\n                      template_name,\n                      template_version,\n                      token_budget,\n                      persona_id           AS \"persona_id: PersonaId\",\n                      split                AS \"split: Split\",\n                      palette,\n                      plan_scope           AS \"plan_scope: PlanScope\",\n                      planner_persona_id   AS \"planner_persona_id: PersonaId\",\n                      planner_agent_id     AS \"planner_agent_id: AgentId\",\n                      planner_model,\n                      integrate_persona_id AS \"integrate_persona_id: PersonaId\",\n                      integrate_agent_id   AS \"integrate_agent_id: AgentId\",\n                      integrate_model,\n                      max_parts,\n                      updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -192,6 +192,116 @@
       },
       {
         "ordinal": 17,
+        "name": "split: Split",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "split"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "palette",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "palette"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "plan_scope: PlanScope",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "plan_scope"
+          }
+        }
+      },
+      {
+        "ordinal": 20,
+        "name": "planner_persona_id: PersonaId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "planner_persona_id"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "planner_agent_id: AgentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "planner_agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 22,
+        "name": "planner_model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "planner_model"
+          }
+        }
+      },
+      {
+        "ordinal": 23,
+        "name": "integrate_persona_id: PersonaId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "integrate_persona_id"
+          }
+        }
+      },
+      {
+        "ordinal": 24,
+        "name": "integrate_agent_id: AgentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "integrate_agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 25,
+        "name": "integrate_model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "integrate_model"
+          }
+        }
+      },
+      {
+        "ordinal": 26,
+        "name": "max_parts",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "max_parts"
+          }
+        }
+      },
+      {
+        "ordinal": 27,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -233,8 +343,18 @@
       true,
       true,
       true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
       false
     ]
   },
-  "hash": "f5924b3456749f2953916f0fcedfb571705de1d87f76ea6d60b3157c7ef6d890"
+  "hash": "816f2c717d3e6a71b4e8d9e71dea163da6f749b65a5b22977d9dd988819ca48f"
 }

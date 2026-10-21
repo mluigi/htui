@@ -21,6 +21,7 @@ use htui_agent::driver::AgentSessionRef;
 use htui_agent::driver::{PermissionMatch, PermissionPolicy, PermissionRule, SessionSpec};
 use htui_agent::event::PermissionOptionKind;
 use htui_core::fixtures::ids;
+use htui_core::model::GraphScope;
 use htui_core::model::kind::HEAVY_COMMAND_PREFIXES;
 use htui_core::model::{
     AgentBox, AgentId, BatchId, Billing, CommandRun, CommandRunStatus, DocumentId, EventKind, Gate,
@@ -1193,8 +1194,8 @@ async fn free_feat_3<O: Orchestrate>(orch: &O) {
 /// and `token_budget` are none of them** (`crates/htui-core/src/model/kind.rs:230-251`), so the
 /// blueprint's `update_phase(review, expected, PhasePatch { gate: Some(Gate::Never), .. })`
 /// recipe does not compile. `create_phase` takes a whole `StepGraphPhase`, so a clone carrying the
-/// row a case wants is the reachable edit — and it is the same pair of writers
-/// `graph::override_graph` uses.
+/// row a case wants is the reachable edit. (`graph::override_graph` itself writes its clone
+/// through one `replace_graph` since MOD-137.)
 ///
 /// # Panics
 /// When any of the three writes is refused, which means the fixture moved under the case.
@@ -1210,7 +1211,7 @@ async fn repoint<O: Orchestrate>(orch: &O, item: ItemId, mutate: impl Fn(&mut St
         .store()
         .create_step_graph(NewStepGraph {
             id: StepGraphId::new(),
-            project_id: row.project_id,
+            scope: GraphScope::Project(row.project_id),
             name: format!("{}-edited", row.key),
             description: "a conformance case's edit of the live graph".to_owned(),
             is_override: false,
@@ -1224,6 +1225,10 @@ async fn repoint<O: Orchestrate>(orch: &O, item: ItemId, mutate: impl Fn(&mut St
             ..phase.phase.clone()
         };
         mutate(&mut edited);
+        // ck_phase_split_fan_out (MOD-137 D7): `split` follows the edited `fan_out`.
+        if edited.split != htui_core::model::Split::Divide {
+            edited.split = htui_core::model::Split::for_fan_out(edited.fan_out);
+        }
         orch.store()
             .create_phase(&edited)
             .await
@@ -1271,7 +1276,7 @@ async fn insert_verify_phase<O: Orchestrate>(orch: &O, item: ItemId) {
         .store()
         .create_step_graph(NewStepGraph {
             id: StepGraphId::new(),
-            project_id: row.project_id,
+            scope: GraphScope::Project(row.project_id),
             name: format!("{}-with-verify", row.key),
             description: "an intermediate position between implement and review".to_owned(),
             is_override: false,
@@ -1293,6 +1298,10 @@ async fn insert_verify_phase<O: Orchestrate>(orch: &O, item: ItemId) {
         };
         if edited.position > implement {
             edited.position += 1;
+        }
+        // ck_phase_split_fan_out (MOD-137 D7): `split` follows the edited `fan_out`.
+        if edited.split != htui_core::model::Split::Divide {
+            edited.split = htui_core::model::Split::for_fan_out(edited.fan_out);
         }
         orch.store()
             .create_phase(&edited)

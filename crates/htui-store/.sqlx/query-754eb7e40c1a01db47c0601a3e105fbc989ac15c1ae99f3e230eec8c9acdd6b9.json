@@ -1,0 +1,47 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT CASE WHEN g.project_id   IS NOT NULL THEN pr.slug\n                            WHEN g.workspace_id IS NOT NULL THEN 'workspace:' || w.slug\n                            ELSE 'library'\n                       END AS \"owner!\",\n                       g.name AS \"graph!\",\n                       p.name AS \"phase!\"\n                  FROM step_graph_phase p\n                  JOIN step_graph g ON g.id = p.graph_id\n                  LEFT JOIN project pr ON pr.id = g.project_id\n                  LEFT JOIN workspace w ON w.id = g.workspace_id\n                 WHERE (p.persona_id = $1 OR p.planner_persona_id = $1\n                        OR p.integrate_persona_id = $1\n                        OR EXISTS (SELECT 1 FROM phase_part pp\n                                    WHERE pp.phase_id = p.id AND pp.persona_id = $1))\n                   -- A holder whose owner row is gone cannot be named (R1 L-3's capped loop).\n                   AND (g.project_id   IS NULL OR pr.id IS NOT NULL)\n                   AND (g.workspace_id IS NULL OR w.id  IS NOT NULL)\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "owner!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "graph!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "phase!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "name"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      false,
+      false
+    ]
+  },
+  "hash": "754eb7e40c1a01db47c0601a3e105fbc989ac15c1ae99f3e230eec8c9acdd6b9"
+}

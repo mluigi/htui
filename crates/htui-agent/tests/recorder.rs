@@ -50,6 +50,7 @@ use htui_core::model::{
     StepStatus, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission,
     Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, normalize,
 };
+use htui_core::model::{EdgeId, GraphBody, PhasePart, StepGraphEdge};
 use htui_core::prompt::settings::SettingKey;
 use htui_core::scrub::{MinimalScrubber, Scrubber as _};
 use htui_core::store::{
@@ -723,6 +724,41 @@ impl WriteStore for SpyStore {
     }
     async fn phases(&self, graph: StepGraphId) -> StoreResult<Vec<StepGraphPhase>> {
         self.inner.phases(graph).await
+    }
+
+    async fn replace_graph(
+        &self,
+        graph: StepGraphId,
+        expected_revision: i64,
+        body: GraphBody,
+    ) -> StoreResult<CasOutcome<GraphBody>> {
+        self.inner
+            .replace_graph(graph, expected_revision, body)
+            .await
+    }
+
+    async fn delete_phase(&self, id: PhaseId) -> StoreResult<()> {
+        self.inner.delete_phase(id).await
+    }
+
+    async fn delete_edge(&self, id: EdgeId) -> StoreResult<()> {
+        self.inner.delete_edge(id).await
+    }
+
+    async fn delete_phase_agents(&self, phase: PhaseId) -> StoreResult<()> {
+        self.inner.delete_phase_agents(phase).await
+    }
+
+    async fn graph_edges(&self, graph: StepGraphId) -> StoreResult<Vec<StepGraphEdge>> {
+        self.inner.graph_edges(graph).await
+    }
+
+    async fn phase_parts(&self, phase: PhaseId) -> StoreResult<Vec<PhasePart>> {
+        self.inner.phase_parts(phase).await
+    }
+
+    async fn graph_body(&self, graph: StepGraphId) -> StoreResult<Option<GraphBody>> {
+        self.inner.graph_body(graph).await
     }
     async fn append_prompt_template(
         &self,

@@ -1,0 +1,378 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO step_graph_phase (id, graph_id, position, name, fan_out, gate, gate_hard,\n                                      retry_limit, input_kinds, output_kind, isolation,\n                                      command_queue, verify_command, template_name,\n                                      template_version, token_budget, persona_id, split,\n                                      palette, plan_scope, planner_persona_id,\n                                      planner_agent_id, planner_model, integrate_persona_id,\n                                      integrate_agent_id, integrate_model, max_parts)\n        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,\n                $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)\n        RETURNING id                   AS \"id: PhaseId\",\n                  graph_id             AS \"graph_id: StepGraphId\",\n                  position,\n                  name,\n                  fan_out,\n                  gate                 AS \"gate: htui_core::model::Gate\",\n                  gate_hard,\n                  retry_limit,\n                  input_kinds,\n                  output_kind,\n                  isolation            AS \"isolation: Isolation\",\n                  command_queue        AS \"command_queue: htui_core::model::CommandQueue\",\n                  verify_command,\n                  template_name,\n                  template_version,\n                  token_budget,\n                  persona_id           AS \"persona_id: PersonaId\",\n                  split                AS \"split: Split\",\n                  palette,\n                  plan_scope           AS \"plan_scope: PlanScope\",\n                  planner_persona_id   AS \"planner_persona_id: PersonaId\",\n                  planner_agent_id     AS \"planner_agent_id: AgentId\",\n                  planner_model,\n                  integrate_persona_id AS \"integrate_persona_id: PersonaId\",\n                  integrate_agent_id   AS \"integrate_agent_id: AgentId\",\n                  integrate_model,\n                  max_parts,\n                  updated_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: PhaseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "graph_id: StepGraphId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "graph_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "position",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "position"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "fan_out",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "fan_out"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "gate: htui_core::model::Gate",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "gate"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "gate_hard",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "gate_hard"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "retry_limit",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "retry_limit"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "input_kinds",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "input_kinds"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "output_kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "output_kind"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "isolation: Isolation",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "isolation"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "command_queue: htui_core::model::CommandQueue",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "command_queue"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "verify_command",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "verify_command"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "template_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "template_name"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "template_version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "template_version"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "token_budget",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "token_budget"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "persona_id: PersonaId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "persona_id"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "split: Split",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "split"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "palette",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "palette"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "plan_scope: PlanScope",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "plan_scope"
+          }
+        }
+      },
+      {
+        "ordinal": 20,
+        "name": "planner_persona_id: PersonaId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "planner_persona_id"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "planner_agent_id: AgentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "planner_agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 22,
+        "name": "planner_model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "planner_model"
+          }
+        }
+      },
+      {
+        "ordinal": 23,
+        "name": "integrate_persona_id: PersonaId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "integrate_persona_id"
+          }
+        }
+      },
+      {
+        "ordinal": 24,
+        "name": "integrate_agent_id: AgentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "integrate_agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 25,
+        "name": "integrate_model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "integrate_model"
+          }
+        }
+      },
+      {
+        "ordinal": 26,
+        "name": "max_parts",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "max_parts"
+          }
+        }
+      },
+      {
+        "ordinal": 27,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int4",
+        "Text",
+        "Int4",
+        "Text",
+        "Bool",
+        "Int4",
+        "TextArray",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int4",
+        "Int4",
+        "Uuid",
+        "Text",
+        "Bool",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "0d9ffabaa38af7d373c99e0205190148ea5a2fbe0d54e4dbd22bf984ffd2a3fb"
+}

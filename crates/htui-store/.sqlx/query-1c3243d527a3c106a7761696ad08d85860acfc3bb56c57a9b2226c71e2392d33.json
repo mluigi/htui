@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM step_graph_edge WHERE graph_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1c3243d527a3c106a7761696ad08d85860acfc3bb56c57a9b2226c71e2392d33"
+}

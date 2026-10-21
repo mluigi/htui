@@ -40,9 +40,14 @@ use crate::model::{
     WaitingPermission, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
     WorkspaceStop, canonical_declared_tags, executor_scrub_refusal, missing_tags_failure,
 };
+use crate::model::{
+    EdgeId, EdgeKind, EdgePredicate, GraphBody, GraphScope, NodeBody, PhasePart, PlanScope,
+    SkillBinding, Split, StepGraphEdge,
+};
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
 use crate::secret::{INFISICAL, SecretScope, project_scope};
+use crate::seed;
 use crate::store::error::StoreError;
 use crate::store::traits::{
     BLANK_PERSONA_BODY, BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT,
@@ -55,6 +60,12 @@ use crate::store::traits::{
     note_needs_a_step, queue_target_refusal, queue_token_refusal, references_no_row,
     requirement_withdrawn, resolution_not_closable, rule_kind_unknown, self_link,
     step_writes_own_item, withdrawn_requirement_cited,
+};
+use crate::store::traits::{
+    divide_columns_off_divide, edge_endpoint_outside_graph, edge_predicate_mismatch,
+    fan_out_below_one, graph_name_is_taken, override_outside_project, palette_phase_has_edges,
+    parts_off_divide, persona_is_bound, phase_position_is_taken, phase_token_budget_refusal,
+    reserved_phase_name, retry_limit_negative, split_fan_out_mismatch,
 };
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
@@ -234,6 +245,27 @@ pub const CASES: &[&str] = &[
     "a_run_without_a_workspace_is_never_gated",
     "adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped",
     "a_deleted_workspace_unscopes_its_runs_and_drops_its_stop",
+    // MOD-137: graph v2 writers and reads (plan D3-D11, blueprint §T3.6)
+    "replace_graph_applies_nodes_edges_and_bumps_revision",
+    "replace_graph_refuses_a_stale_revision_and_writes_nothing",
+    "replace_graph_keeps_bindings_of_kept_phases",
+    "replace_graph_swaps_positions_and_names",
+    "replace_graph_refuses_an_edge_into_another_graph",
+    "replace_graph_refuses_edges_on_a_palette_node",
+    "replace_graph_refuses_parts_on_a_non_divide_node",
+    "replace_graph_refusal_order",
+    "delete_phase_cascades_edges_candidates_parts_and_bindings",
+    "delete_edge_and_delete_phase_agents_bump_revision",
+    "every_graph_write_bumps_revision",
+    "graph_scopes_are_unique_per_scope",
+    "an_override_is_project_scoped",
+    "delete_workspace_takes_its_graphs",
+    "project_create_seeds_default_edges",
+    "a_persona_held_by_divide_columns_or_parts_is_not_deleted",
+    "replace_graph_round_trips_every_node_field",
+    "create_phase_keeps_split_in_step_with_fan_out",
+    // MOD-137 review round 1 (B-L4)
+    "replace_graph_replaces_candidates_and_parts_by_position",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -245,396 +277,591 @@ pub const CASES: &[&str] = &[
 /// that carry their own messages, and turning twenty bodies into error-returning functions would
 /// rewrite the whole suite to gain a string the panic already prints. MOD-6's `pg_conformance.rs`
 /// gets its per-case reporting from the loop, not from a `Result`.
+///
+/// Every arm is boxed, and so is the match (MOD-137): inline, the match's future is as large as its
+/// largest case's and sits under every case's poll, and the Postgres run built with the whole
+/// workspace's features overflowed the 2 MiB debug test stack. Boxed, the suite passes at 1.5 MiB
+/// (`RUST_MIN_STACK`); a new arm is boxed like the others.
 pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
+    Box::pin(run_case_inline(name, store)).await;
+}
+
+async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
     match name {
-        "mint_consecutive_keys" => mint_consecutive_keys(store).await,
-        "mint_prefix_isolation" => mint_prefix_isolation(store).await,
-        "mint_writes_revision_v1" => mint_writes_revision_v1(store).await,
-        "mint_unknown_kind_rejected" => mint_unknown_kind_rejected(store).await,
-        "update_cas_success" => update_cas_success(store).await,
-        "update_kind_keeps_key_and_project" => update_kind_keeps_key_and_project(store).await,
-        "update_cas_diverged" => update_cas_diverged(store).await,
-        "status_cas_keeps_version" => status_cas_keeps_version(store).await,
-        "no_delete_path" => no_delete_path(store).await,
-        "links_hops_1_vs_2" => links_hops_1_vs_2(store).await,
-        "filter_status_project_tags_ready" => filter_status_project_tags_ready(store).await,
-        "documents_ordered_by_version" => documents_ordered_by_version(store).await,
-        "notes_ordered_by_created_at" => notes_ordered_by_created_at(store).await,
-        "events_ordered_by_seq" => events_ordered_by_seq(store).await,
-        "nil_author_rejected" => nil_author_rejected(store).await,
-        "append_events_idempotent_and_ordered" => append_events_idempotent_and_ordered(store).await,
+        "mint_consecutive_keys" => Box::pin(mint_consecutive_keys(store)).await,
+        "mint_prefix_isolation" => Box::pin(mint_prefix_isolation(store)).await,
+        "mint_writes_revision_v1" => Box::pin(mint_writes_revision_v1(store)).await,
+        "mint_unknown_kind_rejected" => Box::pin(mint_unknown_kind_rejected(store)).await,
+        "update_cas_success" => Box::pin(update_cas_success(store)).await,
+        "update_kind_keeps_key_and_project" => {
+            Box::pin(update_kind_keeps_key_and_project(store)).await
+        }
+        "update_cas_diverged" => Box::pin(update_cas_diverged(store)).await,
+        "status_cas_keeps_version" => Box::pin(status_cas_keeps_version(store)).await,
+        "no_delete_path" => Box::pin(no_delete_path(store)).await,
+        "links_hops_1_vs_2" => Box::pin(links_hops_1_vs_2(store)).await,
+        "filter_status_project_tags_ready" => {
+            Box::pin(filter_status_project_tags_ready(store)).await
+        }
+        "documents_ordered_by_version" => Box::pin(documents_ordered_by_version(store)).await,
+        "notes_ordered_by_created_at" => Box::pin(notes_ordered_by_created_at(store)).await,
+        "events_ordered_by_seq" => Box::pin(events_ordered_by_seq(store)).await,
+        "nil_author_rejected" => Box::pin(nil_author_rejected(store)).await,
+        "append_events_idempotent_and_ordered" => {
+            Box::pin(append_events_idempotent_and_ordered(store)).await
+        }
         "set_step_usage_writes_usage_and_digest" => {
-            set_step_usage_writes_usage_and_digest(store).await;
+            Box::pin(set_step_usage_writes_usage_and_digest(store)).await;
         }
-        "start_chat_run_mints_chat_rows" => start_chat_run_mints_chat_rows(store).await,
-        "upsert_agent_by_id_name_unique" => upsert_agent_by_id_name_unique(store).await,
-        "upsert_agent_box_by_pk" => upsert_agent_box_by_pk(store).await,
+        "start_chat_run_mints_chat_rows" => Box::pin(start_chat_run_mints_chat_rows(store)).await,
+        "upsert_agent_by_id_name_unique" => Box::pin(upsert_agent_by_id_name_unique(store)).await,
+        "upsert_agent_box_by_pk" => Box::pin(upsert_agent_box_by_pk(store)).await,
         "set_agent_box_quota_updates_two_columns_or_not_found" => {
-            set_agent_box_quota_updates_two_columns_or_not_found(store).await;
+            Box::pin(set_agent_box_quota_updates_two_columns_or_not_found(store)).await;
         }
-        "upsert_agent_box_cannot_write_quota" => upsert_agent_box_cannot_write_quota(store).await,
+        "upsert_agent_box_cannot_write_quota" => {
+            Box::pin(upsert_agent_box_cannot_write_quota(store)).await
+        }
         "set_step_prompt_writes_digest_and_trim" => {
-            set_step_prompt_writes_digest_and_trim(store).await;
+            Box::pin(set_step_prompt_writes_digest_and_trim(store)).await;
         }
-        "workspace_round_trip_and_cas" => workspace_round_trip_and_cas(store).await,
+        "workspace_round_trip_and_cas" => Box::pin(workspace_round_trip_and_cas(store)).await,
         "workspace_links_and_box_paths_upsert" => {
-            workspace_links_and_box_paths_upsert(store).await;
+            Box::pin(workspace_links_and_box_paths_upsert(store)).await;
         }
-        "workspace_delete_reports_its_reach" => workspace_delete_reports_its_reach(store).await,
-        "project_create_update_cas" => project_create_update_cas(store).await,
+        "workspace_delete_reports_its_reach" => {
+            Box::pin(workspace_delete_reports_its_reach(store)).await
+        }
+        "project_create_update_cas" => Box::pin(project_create_update_cas(store)).await,
         "project_secret_columns_set_clear_cas" => {
-            project_secret_columns_set_clear_cas(store).await;
+            Box::pin(project_secret_columns_set_clear_cas(store)).await;
         }
         "project_delete_takes_everything_and_says_so" => {
-            project_delete_takes_everything_and_says_so(store).await;
+            Box::pin(project_delete_takes_everything_and_says_so(store)).await;
         }
-        "repo_round_trip_and_primary_flag" => repo_round_trip_and_primary_flag(store).await,
+        "repo_round_trip_and_primary_flag" => {
+            Box::pin(repo_round_trip_and_primary_flag(store)).await
+        }
         "item_kind_round_trip_and_prefix_rules" => {
-            item_kind_round_trip_and_prefix_rules(store).await;
+            Box::pin(item_kind_round_trip_and_prefix_rules(store)).await;
         }
         "item_kind_delete_refused_while_referenced" => {
-            item_kind_delete_refused_while_referenced(store).await;
+            Box::pin(item_kind_delete_refused_while_referenced(store)).await;
         }
-        "step_graph_and_phase_round_trip" => step_graph_and_phase_round_trip(store).await,
-        "settings_app_rung_validates_and_cas" => settings_app_rung_validates_and_cas(store).await,
-        "settings_project_rung_merges_keys" => settings_project_rung_merges_keys(store).await,
+        "step_graph_and_phase_round_trip" => Box::pin(step_graph_and_phase_round_trip(store)).await,
+        "settings_app_rung_validates_and_cas" => {
+            Box::pin(settings_app_rung_validates_and_cas(store)).await
+        }
+        "settings_project_rung_merges_keys" => {
+            Box::pin(settings_project_rung_merges_keys(store)).await
+        }
         "settings_phase_rung_writes_token_budget_only" => {
-            settings_phase_rung_writes_token_budget_only(store).await;
+            Box::pin(settings_phase_rung_writes_token_budget_only(store)).await;
         }
-        "project_create_seeds_the_catalogue" => project_create_seeds_the_catalogue(store).await,
-        "run_create_moves_the_item" => run_create_moves_the_item(store).await,
-        "create_run_records_its_workspace" => create_run_records_its_workspace(store).await,
+        "project_create_seeds_the_catalogue" => {
+            Box::pin(project_create_seeds_the_catalogue(store)).await
+        }
+        "run_create_moves_the_item" => Box::pin(run_create_moves_the_item(store)).await,
+        "create_run_records_its_workspace" => {
+            Box::pin(create_run_records_its_workspace(store)).await
+        }
         "claim_run_admits_one_and_refuses_the_second" => {
-            claim_run_admits_one_and_refuses_the_second(store).await;
+            Box::pin(claim_run_admits_one_and_refuses_the_second(store)).await;
         }
-        "lease_refresh_is_a_cas_on_owner" => lease_refresh_is_a_cas_on_owner(store).await,
-        "step_create_and_transition_law" => step_create_and_transition_law(store).await,
-        "finish_step_records_the_settle" => finish_step_records_the_settle(store).await,
-        "gate_answers_write_their_outcome" => gate_answers_write_their_outcome(store).await,
-        "select_fanout_is_one_transaction" => select_fanout_is_one_transaction(store).await,
-        "trees_and_commits_round_trip" => trees_and_commits_round_trip(store).await,
-        "verify_run_is_recorded" => verify_run_is_recorded(store).await,
-        "write_document_allocates_its_version" => write_document_allocates_its_version(store).await,
-        "close_out_refuses_a_live_run" => close_out_refuses_a_live_run(store).await,
-        "illegal_transitions_are_constraint" => illegal_transitions_are_constraint(store).await,
+        "lease_refresh_is_a_cas_on_owner" => Box::pin(lease_refresh_is_a_cas_on_owner(store)).await,
+        "step_create_and_transition_law" => Box::pin(step_create_and_transition_law(store)).await,
+        "finish_step_records_the_settle" => Box::pin(finish_step_records_the_settle(store)).await,
+        "gate_answers_write_their_outcome" => {
+            Box::pin(gate_answers_write_their_outcome(store)).await
+        }
+        "select_fanout_is_one_transaction" => {
+            Box::pin(select_fanout_is_one_transaction(store)).await
+        }
+        "trees_and_commits_round_trip" => Box::pin(trees_and_commits_round_trip(store)).await,
+        "verify_run_is_recorded" => Box::pin(verify_run_is_recorded(store)).await,
+        "write_document_allocates_its_version" => {
+            Box::pin(write_document_allocates_its_version(store)).await
+        }
+        "close_out_refuses_a_live_run" => Box::pin(close_out_refuses_a_live_run(store)).await,
+        "illegal_transitions_are_constraint" => {
+            Box::pin(illegal_transitions_are_constraint(store)).await
+        }
         "finish_run_moves_run_and_item_together" => {
-            finish_run_moves_run_and_item_together(store).await;
+            Box::pin(finish_run_moves_run_and_item_together(store)).await;
         }
         "claim_run_applies_the_isolation_and_path_rules" => {
-            claim_run_applies_the_isolation_and_path_rules(store).await;
+            Box::pin(claim_run_applies_the_isolation_and_path_rules(store)).await;
         }
         "take_lease_moves_only_our_own_or_an_expired_lease" => {
-            take_lease_moves_only_our_own_or_an_expired_lease(store).await;
+            Box::pin(take_lease_moves_only_our_own_or_an_expired_lease(store)).await;
         }
-        "interrupt_step_is_a_cas_on_running" => interrupt_step_is_a_cas_on_running(store).await,
+        "interrupt_step_is_a_cas_on_running" => {
+            Box::pin(interrupt_step_is_a_cas_on_running(store)).await
+        }
         "release_lease_frees_the_run_for_its_own_sweep" => {
-            release_lease_frees_the_run_for_its_own_sweep(store).await;
+            Box::pin(release_lease_frees_the_run_for_its_own_sweep(store)).await;
         }
         "record_box_probe_replaces_profile_and_tools" => {
-            record_box_probe_replaces_profile_and_tools(store).await;
+            Box::pin(record_box_probe_replaces_profile_and_tools(store)).await;
         }
         "record_box_probe_refuses_an_unknown_box" => {
-            record_box_probe_refuses_an_unknown_box(store).await;
+            Box::pin(record_box_probe_refuses_an_unknown_box(store)).await;
         }
-        "boxes_lists_every_box_with_its_tools" => boxes_lists_every_box_with_its_tools(store).await,
-        "close_out_resolution_law" => close_out_resolution_law(store).await,
-        "transition_never_reaches_closed" => transition_never_reaches_closed(store).await,
+        "boxes_lists_every_box_with_its_tools" => {
+            Box::pin(boxes_lists_every_box_with_its_tools(store)).await
+        }
+        "close_out_resolution_law" => Box::pin(close_out_resolution_law(store)).await,
+        "transition_never_reaches_closed" => Box::pin(transition_never_reaches_closed(store)).await,
         "requirement_mint_is_per_area_and_never_reused" => {
-            requirement_mint_is_per_area_and_never_reused(store).await;
+            Box::pin(requirement_mint_is_per_area_and_never_reused(store)).await;
         }
         "requirement_area_create_checks_the_code" => {
-            requirement_area_create_checks_the_code(store).await;
+            Box::pin(requirement_area_create_checks_the_code(store)).await;
         }
         "requirement_amend_is_cas_and_names_the_item" => {
-            requirement_amend_is_cas_and_names_the_item(store).await;
+            Box::pin(requirement_amend_is_cas_and_names_the_item(store)).await;
         }
         "requirement_withdraw_refuses_new_addresses" => {
-            requirement_withdraw_refuses_new_addresses(store).await;
+            Box::pin(requirement_withdraw_refuses_new_addresses(store)).await;
         }
-        "amend_records_the_deciding_citation" => amend_records_the_deciding_citation(store).await,
+        "amend_records_the_deciding_citation" => {
+            Box::pin(amend_records_the_deciding_citation(store)).await
+        }
         "a_newer_version_makes_a_citation_suspect_until_reconfirmed" => {
-            a_newer_version_makes_a_citation_suspect_until_reconfirmed(store).await;
+            Box::pin(a_newer_version_makes_a_citation_suspect_until_reconfirmed(
+                store,
+            ))
+            .await;
         }
-        "uncite_tombstones_and_cite_revives" => uncite_tombstones_and_cite_revives(store).await,
+        "uncite_tombstones_and_cite_revives" => {
+            Box::pin(uncite_tombstones_and_cite_revives(store)).await
+        }
         "coverage_lists_citing_items_with_resolution" => {
-            coverage_lists_citing_items_with_resolution(store).await;
+            Box::pin(coverage_lists_citing_items_with_resolution(store)).await;
         }
-        "spec_is_cas" => spec_is_cas(store).await,
-        "project_delete_counts_requirements" => project_delete_counts_requirements(store).await,
-        "edit_box_is_cas_on_edit_version" => edit_box_is_cas_on_edit_version(store).await,
+        "spec_is_cas" => Box::pin(spec_is_cas(store)).await,
+        "project_delete_counts_requirements" => {
+            Box::pin(project_delete_counts_requirements(store)).await
+        }
+        "edit_box_is_cas_on_edit_version" => Box::pin(edit_box_is_cas_on_edit_version(store)).await,
         "edit_box_survives_a_probe_between_read_and_write" => {
-            edit_box_survives_a_probe_between_read_and_write(store).await;
+            Box::pin(edit_box_survives_a_probe_between_read_and_write(store)).await;
         }
-        "edit_box_refuses_an_invalid_tag" => edit_box_refuses_an_invalid_tag(store).await,
+        "edit_box_refuses_an_invalid_tag" => Box::pin(edit_box_refuses_an_invalid_tag(store)).await,
         "prompt_template_append_is_a_cas_on_the_head" => {
-            prompt_template_append_is_a_cas_on_the_head(store).await;
+            Box::pin(prompt_template_append_is_a_cas_on_the_head(store)).await;
         }
         "prompt_template_new_name_starts_at_one" => {
-            prompt_template_new_name_starts_at_one(store).await;
+            Box::pin(prompt_template_new_name_starts_at_one(store)).await;
         }
         "prompt_template_refuses_what_parse_refuses" => {
-            prompt_template_refuses_what_parse_refuses(store).await;
+            Box::pin(prompt_template_refuses_what_parse_refuses(store)).await;
         }
         "claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks" => {
-            claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks(store).await;
+            Box::pin(claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks(
+                store,
+            ))
+            .await;
         }
         "claim_run_checks_tags_after_claimability_and_before_the_slot" => {
-            claim_run_checks_tags_after_claimability_and_before_the_slot(store).await;
+            Box::pin(claim_run_checks_tags_after_claimability_and_before_the_slot(store)).await;
         }
         "infer_repo_box_path_inserts_only_where_absent" => {
-            infer_repo_box_path_inserts_only_where_absent(store).await;
+            Box::pin(infer_repo_box_path_inserts_only_where_absent(store)).await;
         }
         "skill_create_reads_back_with_version_one" => {
-            skill_create_reads_back_with_version_one(store).await;
+            Box::pin(skill_create_reads_back_with_version_one(store)).await;
         }
         "skill_update_is_a_compare_and_set_and_refuses_a_taken_name" => {
-            skill_update_is_a_compare_and_set_and_refuses_a_taken_name(store).await;
+            Box::pin(skill_update_is_a_compare_and_set_and_refuses_a_taken_name(
+                store,
+            ))
+            .await;
         }
         "skill_version_append_is_a_compare_and_set_on_the_head" => {
-            skill_version_append_is_a_compare_and_set_on_the_head(store).await;
+            Box::pin(skill_version_append_is_a_compare_and_set_on_the_head(store)).await;
         }
         "skill_binding_attach_change_detach_are_compare_and_set" => {
-            skill_binding_attach_change_detach_are_compare_and_set(store).await;
+            Box::pin(skill_binding_attach_change_detach_are_compare_and_set(
+                store,
+            ))
+            .await;
         }
-        "skill_binding_refuses_by_rule" => skill_binding_refuses_by_rule(store).await,
+        "skill_binding_refuses_by_rule" => Box::pin(skill_binding_refuses_by_rule(store)).await,
         "skill_binding_stores_expanded_globs_and_languages_as_typed" => {
-            skill_binding_stores_expanded_globs_and_languages_as_typed(store).await;
+            Box::pin(skill_binding_stores_expanded_globs_and_languages_as_typed(
+                store,
+            ))
+            .await;
         }
         "a_stale_owner_writes_nothing_to_the_step" => {
-            a_stale_owner_writes_nothing_to_the_step(store).await
+            Box::pin(a_stale_owner_writes_nothing_to_the_step(store)).await
         }
-        "the_new_owner_writes_the_step" => the_new_owner_writes_the_step(store).await,
-        "an_unleased_fence_writes_a_chat_step" => an_unleased_fence_writes_a_chat_step(store).await,
+        "the_new_owner_writes_the_step" => Box::pin(the_new_owner_writes_the_step(store)).await,
+        "an_unleased_fence_writes_a_chat_step" => {
+            Box::pin(an_unleased_fence_writes_a_chat_step(store)).await
+        }
         "an_unleased_fence_is_refused_on_a_leased_run" => {
-            an_unleased_fence_is_refused_on_a_leased_run(store).await
+            Box::pin(an_unleased_fence_is_refused_on_a_leased_run(store)).await
         }
         "a_replayed_batch_under_the_right_fence_is_ok_zero" => {
-            a_replayed_batch_under_the_right_fence_is_ok_zero(store).await
+            Box::pin(a_replayed_batch_under_the_right_fence_is_ok_zero(store)).await
         }
         "a_missing_step_keeps_its_old_error_not_fenced" => {
-            a_missing_step_keeps_its_old_error_not_fenced(store).await
+            Box::pin(a_missing_step_keeps_its_old_error_not_fenced(store)).await
         }
-        "an_older_quota_is_a_no_op" => an_older_quota_is_a_no_op(store).await,
+        "an_older_quota_is_a_no_op" => Box::pin(an_older_quota_is_a_no_op(store)).await,
         "an_equal_quota_at_rewrites_idempotently" => {
-            an_equal_quota_at_rewrites_idempotently(store).await
+            Box::pin(an_equal_quota_at_rewrites_idempotently(store)).await
         }
-        "a_missing_agent_box_is_not_found" => a_missing_agent_box_is_not_found(store).await,
+        "a_missing_agent_box_is_not_found" => {
+            Box::pin(a_missing_agent_box_is_not_found(store)).await
+        }
         "upsert_agent_with_none_inserts_and_is_stale_when_present" => {
-            upsert_agent_with_none_inserts_and_is_stale_when_present(store).await
+            Box::pin(upsert_agent_with_none_inserts_and_is_stale_when_present(
+                store,
+            ))
+            .await
         }
         "upsert_agent_with_a_spent_token_is_stale_and_writes_nothing" => {
-            upsert_agent_with_a_spent_token_is_stale_and_writes_nothing(store).await
+            Box::pin(upsert_agent_with_a_spent_token_is_stale_and_writes_nothing(
+                store,
+            ))
+            .await
         }
         "upsert_agent_with_the_current_token_applies" => {
-            upsert_agent_with_the_current_token_applies(store).await
+            Box::pin(upsert_agent_with_the_current_token_applies(store)).await
         }
-        "a_lease_ttl_out_of_range_is_refused" => a_lease_ttl_out_of_range_is_refused(store).await,
+        "a_lease_ttl_out_of_range_is_refused" => {
+            Box::pin(a_lease_ttl_out_of_range_is_refused(store)).await
+        }
         "set_agent_box_enabled_switches_one_row_or_refuses" => {
-            set_agent_box_enabled_switches_one_row_or_refuses(store).await
+            Box::pin(set_agent_box_enabled_switches_one_row_or_refuses(store)).await
         }
         "a_stale_owner_writes_no_prompt_tree_or_commits" => {
-            a_stale_owner_writes_no_prompt_tree_or_commits(store).await;
+            Box::pin(a_stale_owner_writes_no_prompt_tree_or_commits(store)).await;
         }
         "the_new_owner_writes_prompt_tree_and_commits" => {
-            the_new_owner_writes_prompt_tree_and_commits(store).await;
+            Box::pin(the_new_owner_writes_prompt_tree_and_commits(store)).await;
         }
         "an_unleased_prompt_write_is_refused_on_a_leased_run" => {
-            an_unleased_prompt_write_is_refused_on_a_leased_run(store).await;
+            Box::pin(an_unleased_prompt_write_is_refused_on_a_leased_run(store)).await;
         }
         "a_missing_step_is_not_found_before_the_fence" => {
-            a_missing_step_is_not_found_before_the_fence(store).await;
+            Box::pin(a_missing_step_is_not_found_before_the_fence(store)).await;
         }
         "edit_box_writes_the_executor_and_keeps_every_other_setting" => {
-            edit_box_writes_the_executor_and_keeps_every_other_setting(store).await;
+            Box::pin(edit_box_writes_the_executor_and_keeps_every_other_setting(
+                store,
+            ))
+            .await;
         }
         "an_unknown_executor_is_refused_and_writes_nothing" => {
-            an_unknown_executor_is_refused_and_writes_nothing(store).await;
+            Box::pin(an_unknown_executor_is_refused_and_writes_nothing(store)).await;
         }
         "an_executor_edit_is_a_compare_and_set" => {
-            an_executor_edit_is_a_compare_and_set(store).await;
+            Box::pin(an_executor_edit_is_a_compare_and_set(store)).await;
         }
         "box_probe_spec_is_cas_on_updated_at" => {
-            box_probe_spec_is_cas_on_updated_at(store).await;
+            Box::pin(box_probe_spec_is_cas_on_updated_at(store)).await;
         }
         "set_box_probe_spec_refuses_a_non_object_and_a_clear_without_a_token" => {
-            set_box_probe_spec_refuses_a_non_object_and_a_clear_without_a_token(store).await;
+            Box::pin(set_box_probe_spec_refuses_a_non_object_and_a_clear_without_a_token(store))
+                .await;
         }
         "a_pending_permission_is_answered_once" => {
-            a_pending_permission_is_answered_once(store).await
+            Box::pin(a_pending_permission_is_answered_once(store)).await
         }
         "an_answer_after_the_owner_changed_is_refused_executor_gone" => {
-            an_answer_after_the_owner_changed_is_refused_executor_gone(store).await
+            Box::pin(an_answer_after_the_owner_changed_is_refused_executor_gone(
+                store,
+            ))
+            .await
         }
         "an_option_the_request_did_not_offer_is_refused" => {
-            an_option_the_request_did_not_offer_is_refused(store).await
+            Box::pin(an_option_the_request_did_not_offer_is_refused(store)).await
         }
-        "apply_is_fenced_on_the_lease_owner" => apply_is_fenced_on_the_lease_owner(store).await,
+        "apply_is_fenced_on_the_lease_owner" => {
+            Box::pin(apply_is_fenced_on_the_lease_owner(store)).await
+        }
         "opening_a_permission_stales_older_sessions_of_the_step" => {
-            opening_a_permission_stales_older_sessions_of_the_step(store).await
+            Box::pin(opening_a_permission_stales_older_sessions_of_the_step(
+                store,
+            ))
+            .await
         }
         "opening_a_permission_is_fenced_on_the_lease" => {
-            opening_a_permission_is_fenced_on_the_lease(store).await
+            Box::pin(opening_a_permission_is_fenced_on_the_lease(store)).await
         }
         "settle_moves_only_pending_and_answered_rows" => {
-            settle_moves_only_pending_and_answered_rows(store).await
+            Box::pin(settle_moves_only_pending_and_answered_rows(store)).await
         }
-        "a_run_has_at_most_one_pending_cancel" => a_run_has_at_most_one_pending_cancel(store).await,
-        "resolve_command_is_a_compare_and_set" => resolve_command_is_a_compare_and_set(store).await,
+        "a_run_has_at_most_one_pending_cancel" => {
+            Box::pin(a_run_has_at_most_one_pending_cancel(store)).await
+        }
+        "resolve_command_is_a_compare_and_set" => {
+            Box::pin(resolve_command_is_a_compare_and_set(store)).await
+        }
         "pending_commands_are_the_owners_and_the_boxs_free_runs" => {
-            pending_commands_are_the_owners_and_the_boxs_free_runs(store).await
+            Box::pin(pending_commands_are_the_owners_and_the_boxs_free_runs(
+                store,
+            ))
+            .await
         }
         "relay_view_lists_live_pending_requests_and_pending_cancels" => {
-            relay_view_lists_live_pending_requests_and_pending_cancels(store).await
+            Box::pin(relay_view_lists_live_pending_requests_and_pending_cancels(
+                store,
+            ))
+            .await
         }
         "deleting_a_project_takes_its_relay_rows" => {
-            deleting_a_project_takes_its_relay_rows(store).await
+            Box::pin(deleting_a_project_takes_its_relay_rows(store)).await
         }
-        "adopt_runs_never_leases_a_chat_run" => adopt_runs_never_leases_a_chat_run(store).await,
-        "update_spec_columns_roundtrip" => update_spec_columns_roundtrip(store).await,
-        "item_edit_reason_lands_in_revision" => item_edit_reason_lands_in_revision(store).await,
+        "adopt_runs_never_leases_a_chat_run" => {
+            Box::pin(adopt_runs_never_leases_a_chat_run(store)).await
+        }
+        "update_spec_columns_roundtrip" => Box::pin(update_spec_columns_roundtrip(store)).await,
+        "item_edit_reason_lands_in_revision" => {
+            Box::pin(item_edit_reason_lands_in_revision(store)).await
+        }
         "queued_at_ties_inside_a_microsecond_break_on_id" => {
-            queued_at_ties_inside_a_microsecond_break_on_id(store).await;
+            Box::pin(queued_at_ties_inside_a_microsecond_break_on_id(store)).await;
         }
         "phase_agents_are_written_whole_and_counted" => {
-            phase_agents_are_written_whole_and_counted(store).await;
+            Box::pin(phase_agents_are_written_whole_and_counted(store)).await;
         }
         "pass_step_writes_done_and_skipped_under_the_fence" => {
-            pass_step_writes_done_and_skipped_under_the_fence(store).await;
+            Box::pin(pass_step_writes_done_and_skipped_under_the_fence(store)).await;
         }
         "park_step_moves_step_run_and_item_or_nothing" => {
-            park_step_moves_step_run_and_item_or_nothing(store).await;
+            Box::pin(park_step_moves_step_run_and_item_or_nothing(store)).await;
         }
         "personas_are_listed_by_name_and_created_once" => {
-            personas_are_listed_by_name_and_created_once(store).await;
+            Box::pin(personas_are_listed_by_name_and_created_once(store)).await;
         }
-        "update_persona_is_a_compare_and_set" => update_persona_is_a_compare_and_set(store).await,
+        "update_persona_is_a_compare_and_set" => {
+            Box::pin(update_persona_is_a_compare_and_set(store)).await
+        }
         "persona_writers_refuse_every_widening_shape" => {
-            persona_writers_refuse_every_widening_shape(store).await;
+            Box::pin(persona_writers_refuse_every_widening_shape(store)).await;
         }
-        "a_phase_naming_no_persona_is_refused" => a_phase_naming_no_persona_is_refused(store).await,
+        "a_phase_naming_no_persona_is_refused" => {
+            Box::pin(a_phase_naming_no_persona_is_refused(store)).await
+        }
         "a_phase_persona_binding_sets_keeps_and_clears" => {
-            a_phase_persona_binding_sets_keeps_and_clears(store).await;
+            Box::pin(a_phase_persona_binding_sets_keeps_and_clears(store)).await;
         }
         "tool_call_counts_group_by_step_and_kind" => {
-            tool_call_counts_group_by_step_and_kind(store).await;
+            Box::pin(tool_call_counts_group_by_step_and_kind(store)).await;
         }
         "delete_persona_removes_an_unbound_row_once" => {
-            delete_persona_removes_an_unbound_row_once(store).await;
+            Box::pin(delete_persona_removes_an_unbound_row_once(store)).await;
         }
         "a_bound_persona_is_not_deleted_and_names_its_phases" => {
-            a_bound_persona_is_not_deleted_and_names_its_phases(store).await;
+            Box::pin(a_bound_persona_is_not_deleted_and_names_its_phases(store)).await;
         }
         "a_persona_bound_to_many_phases_names_five_and_counts_the_rest" => {
-            a_persona_bound_to_many_phases_names_five_and_counts_the_rest(store).await;
+            Box::pin(a_persona_bound_to_many_phases_names_five_and_counts_the_rest(store)).await;
         }
-        "hand_written_rows_round_trip" => hand_written_rows_round_trip(store).await,
+        "hand_written_rows_round_trip" => Box::pin(hand_written_rows_round_trip(store)).await,
         "record_opening_lands_on_the_run_summary_and_bumps_updated_at" => {
-            record_opening_lands_on_the_run_summary_and_bumps_updated_at(store).await;
+            Box::pin(record_opening_lands_on_the_run_summary_and_bumps_updated_at(store)).await;
         }
         "write_step_document_fenced_and_versioned" => {
-            write_step_document_fenced_and_versioned(store).await;
+            Box::pin(write_step_document_fenced_and_versioned(store)).await;
         }
         "write_step_document_refuses_a_foreign_item" => {
-            write_step_document_refuses_a_foreign_item(store).await;
+            Box::pin(write_step_document_refuses_a_foreign_item(store)).await;
         }
-        "add_step_note_fenced_on_its_own_item" => add_step_note_fenced_on_its_own_item(store).await,
+        "add_step_note_fenced_on_its_own_item" => {
+            Box::pin(add_step_note_fenced_on_its_own_item(store)).await
+        }
         "propose_link_upserts_revives_and_keeps_a_live_proposer" => {
-            propose_link_upserts_revives_and_keeps_a_live_proposer(store).await;
+            Box::pin(propose_link_upserts_revives_and_keeps_a_live_proposer(
+                store,
+            ))
+            .await;
         }
         "withdraw_link_only_what_this_run_proposed" => {
-            withdraw_link_only_what_this_run_proposed(store).await;
+            Box::pin(withdraw_link_only_what_this_run_proposed(store)).await;
         }
         "item_by_key_answers_within_its_project" => {
-            item_by_key_answers_within_its_project(store).await;
+            Box::pin(item_by_key_answers_within_its_project(store)).await;
         }
         "enqueue_command_queues_on_an_existing_step" => {
-            enqueue_command_queues_on_an_existing_step(store).await;
+            Box::pin(enqueue_command_queues_on_an_existing_step(store)).await;
         }
         "claim_command_admits_up_to_the_limit_in_queue_order" => {
-            claim_command_admits_up_to_the_limit_in_queue_order(store).await;
+            Box::pin(claim_command_admits_up_to_the_limit_in_queue_order(store)).await;
         }
-        "beat_and_finish_need_the_claimant" => beat_and_finish_need_the_claimant(store).await,
+        "beat_and_finish_need_the_claimant" => {
+            Box::pin(beat_and_finish_need_the_claimant(store)).await
+        }
         "cancel_command_ends_a_queued_or_running_row" => {
-            cancel_command_ends_a_queued_or_running_row(store).await;
+            Box::pin(cancel_command_ends_a_queued_or_running_row(store)).await;
         }
         "waiting_candidates_hold_every_park_and_nothing_else" => {
-            waiting_candidates_hold_every_park_and_nothing_else(store).await;
+            Box::pin(waiting_candidates_hold_every_park_and_nothing_else(store)).await;
         }
         "open_permissions_list_live_pending_item_requests" => {
-            open_permissions_list_live_pending_item_requests(store).await;
+            Box::pin(open_permissions_list_live_pending_item_requests(store)).await;
         }
         "a_follow_up_is_refused_in_the_documented_order" => {
-            a_follow_up_is_refused_in_the_documented_order(store).await;
+            Box::pin(a_follow_up_is_refused_in_the_documented_order(store)).await;
         }
         "a_step_has_at_most_one_pending_follow_up" => {
-            a_step_has_at_most_one_pending_follow_up(store).await;
+            Box::pin(a_step_has_at_most_one_pending_follow_up(store)).await;
         }
         "settling_a_follow_up_is_a_fenced_compare_and_set" => {
-            settling_a_follow_up_is_a_fenced_compare_and_set(store).await;
+            Box::pin(settling_a_follow_up_is_a_fenced_compare_and_set(store)).await;
         }
         "closing_the_window_refuses_what_is_still_queued" => {
-            closing_the_window_refuses_what_is_still_queued(store).await;
+            Box::pin(closing_the_window_refuses_what_is_still_queued(store)).await;
         }
         "opening_a_window_refuses_an_older_windows_follow_up" => {
-            opening_a_window_refuses_an_older_windows_follow_up(store).await;
+            Box::pin(opening_a_window_refuses_an_older_windows_follow_up(store)).await;
         }
         "a_cancel_refuses_the_runs_pending_follow_ups" => {
-            a_cancel_refuses_the_runs_pending_follow_ups(store).await;
+            Box::pin(a_cancel_refuses_the_runs_pending_follow_ups(store)).await;
         }
         "pending_commands_list_cancels_only" => {
-            pending_commands_list_cancels_only(store).await;
+            Box::pin(pending_commands_list_cancels_only(store)).await;
         }
         "relay_view_lists_the_newest_follow_up_per_step_without_text" => {
-            relay_view_lists_the_newest_follow_up_per_step_without_text(store).await;
+            Box::pin(relay_view_lists_the_newest_follow_up_per_step_without_text(
+                store,
+            ))
+            .await;
         }
         "closing_a_dropped_walks_windows_needs_the_lease" => {
-            closing_a_dropped_walks_windows_needs_the_lease(store).await;
+            Box::pin(closing_a_dropped_walks_windows_needs_the_lease(store)).await;
         }
-        "lease_holds_reads_the_owner" => lease_holds_reads_the_owner(store).await,
+        "lease_holds_reads_the_owner" => Box::pin(lease_holds_reads_the_owner(store)).await,
         "queue_setting_on_a_project_merges_under_cas_and_keeps_foreign_keys" => {
-            queue_setting_on_a_project_merges_under_cas_and_keeps_foreign_keys(store).await
+            Box::pin(queue_setting_on_a_project_merges_under_cas_and_keeps_foreign_keys(store))
+                .await
         }
         "queue_setting_on_app_upserts_and_refuses_a_stale_token" => {
-            queue_setting_on_app_upserts_and_refuses_a_stale_token(store).await
+            Box::pin(queue_setting_on_app_upserts_and_refuses_a_stale_token(
+                store,
+            ))
+            .await
         }
         "clear_queue_setting_removes_the_key_on_every_target" => {
-            clear_queue_setting_removes_the_key_on_every_target(store).await
+            Box::pin(clear_queue_setting_removes_the_key_on_every_target(store)).await
         }
         "queue_setting_on_a_box_merges_under_edit_version_and_keeps_executor" => {
-            queue_setting_on_a_box_merges_under_edit_version_and_keeps_executor(store).await
+            Box::pin(queue_setting_on_a_box_merges_under_edit_version_and_keeps_executor(store))
+                .await
         }
         "queue_setting_refuses_a_foreign_key_and_a_bad_value_before_the_row" => {
-            queue_setting_refuses_a_foreign_key_and_a_bad_value_before_the_row(store).await
+            Box::pin(queue_setting_refuses_a_foreign_key_and_a_bad_value_before_the_row(store))
+                .await
         }
         "stop_workspace_upserts_and_escalates_never_downgrades" => {
-            stop_workspace_upserts_and_escalates_never_downgrades(store).await;
+            Box::pin(stop_workspace_upserts_and_escalates_never_downgrades(store)).await;
         }
         "resume_workspace_deletes_and_reports" => {
-            resume_workspace_deletes_and_reports(store).await;
+            Box::pin(resume_workspace_deletes_and_reports(store)).await;
         }
         "stop_run_is_a_fenced_cas_on_running" => {
-            stop_run_is_a_fenced_cas_on_running(store).await;
+            Box::pin(stop_run_is_a_fenced_cas_on_running(store)).await;
         }
         "a_stopped_run_holds_no_slot_but_still_overlaps" => {
-            a_stopped_run_holds_no_slot_but_still_overlaps(store).await;
+            Box::pin(a_stopped_run_holds_no_slot_but_still_overlaps(store)).await;
         }
         "claim_run_refuses_a_stopped_workspace_and_writes_nothing" => {
-            claim_run_refuses_a_stopped_workspace_and_writes_nothing(store).await;
+            Box::pin(claim_run_refuses_a_stopped_workspace_and_writes_nothing(
+                store,
+            ))
+            .await;
         }
         "claim_run_checks_the_stop_before_tags" => {
-            claim_run_checks_the_stop_before_tags(store).await;
+            Box::pin(claim_run_checks_the_stop_before_tags(store)).await;
         }
         "claim_run_admits_after_resume" => {
-            claim_run_admits_after_resume(store).await;
+            Box::pin(claim_run_admits_after_resume(store)).await;
         }
         "a_run_without_a_workspace_is_never_gated" => {
-            a_run_without_a_workspace_is_never_gated(store).await;
+            Box::pin(a_run_without_a_workspace_is_never_gated(store)).await;
         }
         "adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped" => {
-            adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped(store).await;
+            Box::pin(adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped(store)).await;
         }
         "a_deleted_workspace_unscopes_its_runs_and_drops_its_stop" => {
-            a_deleted_workspace_unscopes_its_runs_and_drops_its_stop(store).await;
+            Box::pin(a_deleted_workspace_unscopes_its_runs_and_drops_its_stop(
+                store,
+            ))
+            .await;
+        }
+        "replace_graph_applies_nodes_edges_and_bumps_revision" => {
+            Box::pin(replace_graph_applies_nodes_edges_and_bumps_revision(store)).await;
+        }
+        "replace_graph_refuses_a_stale_revision_and_writes_nothing" => {
+            Box::pin(replace_graph_refuses_a_stale_revision_and_writes_nothing(
+                store,
+            ))
+            .await;
+        }
+        "replace_graph_keeps_bindings_of_kept_phases" => {
+            Box::pin(replace_graph_keeps_bindings_of_kept_phases(store)).await;
+        }
+        "replace_graph_swaps_positions_and_names" => {
+            Box::pin(replace_graph_swaps_positions_and_names(store)).await;
+        }
+        "replace_graph_refuses_an_edge_into_another_graph" => {
+            Box::pin(replace_graph_refuses_an_edge_into_another_graph(store)).await;
+        }
+        "replace_graph_refuses_edges_on_a_palette_node" => {
+            Box::pin(replace_graph_refuses_edges_on_a_palette_node(store)).await;
+        }
+        "replace_graph_refuses_parts_on_a_non_divide_node" => {
+            Box::pin(replace_graph_refuses_parts_on_a_non_divide_node(store)).await;
+        }
+        "replace_graph_refusal_order" => {
+            Box::pin(replace_graph_refusal_order(store)).await;
+        }
+        "delete_phase_cascades_edges_candidates_parts_and_bindings" => {
+            Box::pin(delete_phase_cascades_edges_candidates_parts_and_bindings(
+                store,
+            ))
+            .await;
+        }
+        "delete_edge_and_delete_phase_agents_bump_revision" => {
+            Box::pin(delete_edge_and_delete_phase_agents_bump_revision(store)).await;
+        }
+        "every_graph_write_bumps_revision" => {
+            Box::pin(every_graph_write_bumps_revision(store)).await;
+        }
+        "graph_scopes_are_unique_per_scope" => {
+            Box::pin(graph_scopes_are_unique_per_scope(store)).await;
+        }
+        "an_override_is_project_scoped" => {
+            Box::pin(an_override_is_project_scoped(store)).await;
+        }
+        "delete_workspace_takes_its_graphs" => {
+            Box::pin(delete_workspace_takes_its_graphs(store)).await;
+        }
+        "project_create_seeds_default_edges" => {
+            Box::pin(project_create_seeds_default_edges(store)).await;
+        }
+        "a_persona_held_by_divide_columns_or_parts_is_not_deleted" => {
+            Box::pin(a_persona_held_by_divide_columns_or_parts_is_not_deleted(
+                store,
+            ))
+            .await;
+        }
+        "replace_graph_round_trips_every_node_field" => {
+            Box::pin(replace_graph_round_trips_every_node_field(store)).await;
+        }
+        "create_phase_keeps_split_in_step_with_fan_out" => {
+            Box::pin(create_phase_keeps_split_in_step_with_fan_out(store)).await;
+        }
+        "replace_graph_replaces_candidates_and_parts_by_position" => {
+            Box::pin(replace_graph_replaces_candidates_and_parts_by_position(
+                store,
+            ))
+            .await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -2767,6 +2994,16 @@ fn new_phase(graph: StepGraphId, position: i32, name: &str) -> StepGraphPhase {
         template_version: None,
         token_budget: None,
         persona_id: None,
+        split: Split::None,
+        palette: false,
+        plan_scope: None,
+        planner_persona_id: None,
+        planner_agent_id: None,
+        planner_model: None,
+        integrate_persona_id: None,
+        integrate_agent_id: None,
+        integrate_model: None,
+        max_parts: None,
         updated_at: Utc::now(),
     }
 }
@@ -3465,7 +3702,8 @@ async fn project_create_seeds_the_catalogue<S: WriteStore>(store: &S) {
     );
     for graph in &graphs {
         assert_eq!(
-            graph.project_id, p,
+            graph.scope,
+            GraphScope::Project(p),
             "{CASE}: `{}` is the new project's (a)",
             graph.name
         );
@@ -4123,7 +4361,7 @@ async fn step_graph_and_phase_round_trip<S: WriteStore>(store: &S) {
     let graph = store
         .create_step_graph(NewStepGraph {
             id: StepGraphId::new(),
-            project_id: ids::PROJECT_HTUI,
+            scope: GraphScope::Project(ids::PROJECT_HTUI),
             name: "release".to_owned(),
             description: "Cut a release".to_owned(),
             is_override: false,
@@ -4134,7 +4372,7 @@ async fn step_graph_and_phase_round_trip<S: WriteStore>(store: &S) {
     let duplicate = store
         .create_step_graph(NewStepGraph {
             id: StepGraphId::new(),
-            project_id: ids::PROJECT_HTUI,
+            scope: GraphScope::Project(ids::PROJECT_HTUI),
             name: "analysis".to_owned(),
             description: String::new(),
             is_override: false,
@@ -4372,7 +4610,7 @@ async fn step_graph_and_phase_round_trip<S: WriteStore>(store: &S) {
     let marked = store
         .create_step_graph(NewStepGraph {
             id: StepGraphId::new(),
-            project_id: ids::PROJECT_HTUI,
+            scope: GraphScope::Project(ids::PROJECT_HTUI),
             name: "release-override".to_owned(),
             description: String::new(),
             is_override: true,
@@ -18606,7 +18844,9 @@ async fn persona_writers_refuse_every_widening_shape<S: WriteStore>(store: &S) {
 /// MOD-26 plan D5: a phase that names no persona row is refused with `references_no_row`'s
 /// sentence by both phase writers, after the position and name clashes: a write that both clashes
 /// and names no persona is refused with the clash's own sentence, the one the same write naming
-/// no persona at all gets (MOD-26 review L3); nothing is written.
+/// no persona at all gets (MOD-26 review L3); nothing is written. MOD-137 blueprint §T2.2 steps
+/// 5-6: a divide node's four references are refused in the same words, each alone, and a row
+/// with two bad references names the personas before the agents in both stores.
 async fn a_phase_naming_no_persona_is_refused<S: WriteStore>(store: &S) {
     const CASE: &str = "a_phase_naming_no_persona_is_refused";
     let unknown = PersonaId::new();
@@ -18644,6 +18884,73 @@ async fn a_phase_naming_no_persona_is_refused<S: WriteStore>(store: &S) {
             &clash,
             &format!("a create with {what} naming no persona (D5: the clash first)"),
         );
+    }
+
+    // MOD-137 §T2.2 steps 5-6: Postgres's FK triggers fire in constraint order (planner_agent
+    // before integrate_persona), so the two-references rows pin that the writer decides first.
+    let divide = || StepGraphPhase {
+        split: Split::Divide,
+        ..new_phase(ids::GRAPH_HTUI_FEAT, 9, "cut")
+    };
+    let (persona, agent) = (PersonaId::new(), AgentId::new());
+    let persona_sentence =
+        |column: &str| references_no_row(&format!("step_graph_phase.{column}"), persona, "persona");
+    let agent_sentence =
+        |column: &str| references_no_row(&format!("step_graph_phase.{column}"), agent, "agent");
+    for (phase, sentence, what) in [
+        (
+            StepGraphPhase {
+                planner_persona_id: Some(persona),
+                ..divide()
+            },
+            persona_sentence("planner_persona_id"),
+            "a divide node naming no planner persona",
+        ),
+        (
+            StepGraphPhase {
+                planner_agent_id: Some(agent),
+                ..divide()
+            },
+            agent_sentence("planner_agent_id"),
+            "a divide node naming no planner agent",
+        ),
+        (
+            StepGraphPhase {
+                integrate_persona_id: Some(persona),
+                ..divide()
+            },
+            persona_sentence("integrate_persona_id"),
+            "a divide node naming no integrate persona",
+        ),
+        (
+            StepGraphPhase {
+                integrate_agent_id: Some(agent),
+                ..divide()
+            },
+            agent_sentence("integrate_agent_id"),
+            "a divide node naming no integrate agent",
+        ),
+        (
+            StepGraphPhase {
+                planner_agent_id: Some(agent),
+                integrate_persona_id: Some(persona),
+                ..divide()
+            },
+            persona_sentence("integrate_persona_id"),
+            "a divide node naming no planner agent and no integrate persona (personas first)",
+        ),
+        (
+            StepGraphPhase {
+                planner_agent_id: Some(agent),
+                integrate_agent_id: Some(agent),
+                planner_persona_id: Some(persona),
+                ..divide()
+            },
+            persona_sentence("planner_persona_id"),
+            "a divide node naming no planner persona and no agents (personas first)",
+        ),
+    ] {
+        constraint_exactly(CASE, store.create_phase(&phase).await, &sentence, what);
     }
 
     let phase = before
@@ -19044,7 +19351,7 @@ async fn a_bound_persona_is_not_deleted_and_names_its_phases<S: WriteStore>(stor
     let graph = store
         .create_step_graph(NewStepGraph {
             id: StepGraphId::new(),
-            project_id: ids::PROJECT_HTUI,
+            scope: GraphScope::Project(ids::PROJECT_HTUI),
             name: "HTUI-3-override".to_owned(),
             description: String::new(),
             is_override: true,
@@ -21302,6 +21609,1674 @@ async fn queue_setting_refuses_a_foreign_key_and_a_bad_value_before_the_row<S: W
             .expect(CASE),
         None,
         "{CASE}: no refusal wrote an app row"
+    );
+}
+
+// ---- MOD-137: graph v2 writers and reads (plan D3-D11, blueprint §T3.6) ----------------------
+
+/// A `PROJECT_HTUI` graph named `name` whose phases `names` are created one by one through
+/// [`WriteStore::create_phase`], at positions `0..`; the graph id and the phases as stored.
+async fn scratch_graph<S: WriteStore>(
+    case: &str,
+    store: &S,
+    name: &str,
+    names: &[&str],
+) -> (StepGraphId, Vec<StepGraphPhase>) {
+    let graph = store
+        .create_step_graph(NewStepGraph {
+            id: StepGraphId::new(),
+            scope: GraphScope::Project(ids::PROJECT_HTUI),
+            name: name.to_owned(),
+            description: String::new(),
+            is_override: false,
+        })
+        .await
+        .expect(case);
+    let mut phases = Vec::new();
+    for (position, phase) in (0..).zip(names) {
+        phases.push(
+            store
+                .create_phase(&new_phase(graph.id, position, phase))
+                .await
+                .expect(case),
+        );
+    }
+    (graph.id, phases)
+}
+
+/// A graph request of `scope` with a fresh id.
+fn scoped_graph(scope: GraphScope, name: &str, is_override: bool) -> NewStepGraph {
+    NewStepGraph {
+        id: StepGraphId::new(),
+        scope,
+        name: name.to_owned(),
+        description: String::new(),
+        is_override,
+    }
+}
+
+/// `graph`'s stored body, or a panic naming the case.
+async fn body_now<S: WriteStore>(case: &str, store: &S, graph: StepGraphId) -> GraphBody {
+    store
+        .graph_body(graph)
+        .await
+        .expect(case)
+        .unwrap_or_else(|| panic!("{case}: graph {graph} has a body"))
+}
+
+/// A node carrying `phase` and no candidates or parts.
+fn bare_node(phase: StepGraphPhase) -> NodeBody {
+    NodeBody {
+        phase,
+        agents: Vec::new(),
+        parts: Vec::new(),
+    }
+}
+
+/// An edge of `graph` with a fresh id and no predicate; `loop_limit` 2 where the kind needs one
+/// (0020's loop-limit CHECK, [`EdgeKind::needs_loop_limit`]).
+fn graph_edge(graph: StepGraphId, from: PhaseId, to: PhaseId, kind: EdgeKind) -> StepGraphEdge {
+    StepGraphEdge {
+        id: EdgeId::new(),
+        graph_id: graph,
+        from,
+        to,
+        kind,
+        predicate: None,
+        loop_limit: kind.needs_loop_limit().then_some(2),
+    }
+}
+
+/// A `phase_agent` row.
+fn candidate(phase: PhaseId, position: i32, agent: AgentId) -> PhaseAgent {
+    PhaseAgent {
+        phase_id: phase,
+        position,
+        agent_id: agent,
+        model: "sonnet".to_owned(),
+    }
+}
+
+/// A `phase_part` row with only its required columns.
+fn part_row(phase: PhaseId, position: i32, key: &str) -> PhasePart {
+    PhasePart {
+        phase_id: phase,
+        position,
+        key: key.to_owned(),
+        title: key.to_uppercase(),
+        brief: String::new(),
+        owned_paths: Vec::new(),
+        acceptance: None,
+        agent_id: None,
+        model: None,
+        persona_id: None,
+    }
+}
+
+/// An edge without its id: `(from, to, kind, predicate, loop_limit)`.
+type EdgeShape = (
+    PhaseId,
+    PhaseId,
+    EdgeKind,
+    Option<EdgePredicate>,
+    Option<i32>,
+);
+
+/// Edges without their ids, in their order.
+fn edge_shape(edges: &[StepGraphEdge]) -> Vec<EdgeShape> {
+    edges
+        .iter()
+        .map(|edge| {
+            (
+                edge.from,
+                edge.to,
+                edge.kind,
+                edge.predicate.clone(),
+                edge.loop_limit,
+            )
+        })
+        .collect()
+}
+
+/// One step of a refusal-order walk: the exact sentence expected, then the mend that clears it.
+type Mend = (String, Box<dyn Fn(&mut GraphBody) + Send + Sync>);
+
+/// MOD-137 D10: one call replaces the graph's name, nodes (kept by id, dropped, new),
+/// candidates and edges, and bumps `revision` once. The answer is the stored body, nodes and
+/// candidates by position and edges by (from position, to position, kind), whatever order the
+/// body came in; `scope` and `revision` of the body are ignored.
+async fn replace_graph_applies_nodes_edges_and_bumps_revision<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_applies_nodes_edges_and_bumps_revision";
+    let (graph, phases) =
+        scratch_graph(CASE, store, "replace-me", &["plan", "implement", "review"]).await;
+    let before = body_now(CASE, store, graph).await;
+    let r0 = before.graph.revision;
+    assert_eq!(
+        r0, 3,
+        "{CASE}: three create_phase bumps on a fresh graph (D5)"
+    );
+    let (plan, implement, review) = (phases[0].clone(), phases[1].clone(), phases[2].clone());
+    let build = new_phase(graph, 1, "build");
+
+    let mut written = before.clone();
+    written.graph.name = "replaced".to_owned();
+    written.graph.description = "Rewritten in one call".to_owned();
+    written.graph.scope = GraphScope::Library;
+    written.graph.revision = 99;
+    let mut edited = plan.clone();
+    edited.gate_hard = true;
+    edited.retry_limit = 2;
+    written.nodes = vec![
+        bare_node(review.clone()),
+        NodeBody {
+            phase: edited,
+            agents: vec![candidate(plan.id, 0, ids::AGENT_CLAUDE)],
+            parts: Vec::new(),
+        },
+        NodeBody {
+            phase: build.clone(),
+            agents: vec![
+                candidate(build.id, 1, ids::AGENT_CLAUDE),
+                candidate(build.id, 0, ids::AGENT_AGY),
+            ],
+            parts: Vec::new(),
+        },
+    ];
+    let first = graph_edge(graph, plan.id, build.id, EdgeKind::Next);
+    let second = graph_edge(graph, build.id, review.id, EdgeKind::Next);
+    let mut asks = graph_edge(graph, review.id, build.id, EdgeKind::AsksYou);
+    asks.loop_limit = Some(1);
+    written.edges = vec![asks.clone(), second.clone(), first.clone()];
+
+    let answer = applied(
+        CASE,
+        store.replace_graph(graph, r0, written).await.expect(CASE),
+    );
+    assert_eq!(
+        answer.graph.revision,
+        r0 + 1,
+        "{CASE}: one replace is one bump"
+    );
+    assert_eq!(
+        (
+            answer.graph.id,
+            answer.graph.name.as_str(),
+            answer.graph.description.as_str(),
+            answer.graph.scope,
+            answer.graph.is_override,
+        ),
+        (
+            graph,
+            "replaced",
+            "Rewritten in one call",
+            GraphScope::Project(ids::PROJECT_HTUI),
+            false
+        ),
+        "{CASE}: name and description written, scope and is_override not editable"
+    );
+    assert_eq!(
+        answer
+            .nodes
+            .iter()
+            .map(|node| (node.phase.id, node.phase.position, node.phase.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (plan.id, 0, "plan"),
+            (build.id, 1, "build"),
+            (review.id, 2, "review")
+        ],
+        "{CASE}: nodes by position; the kept ids kept, the new one in"
+    );
+    assert!(
+        answer
+            .nodes
+            .iter()
+            .all(|node| node.phase.id != implement.id),
+        "{CASE}: the dropped node is gone"
+    );
+    assert_eq!(
+        (
+            answer.nodes[0].phase.gate_hard,
+            answer.nodes[0].phase.retry_limit
+        ),
+        (true, 2),
+        "{CASE}: the kept node is edited in place"
+    );
+    assert_eq!(
+        answer.nodes[0].agents,
+        vec![candidate(plan.id, 0, ids::AGENT_CLAUDE)],
+        "{CASE}: the kept node's candidates"
+    );
+    assert_eq!(
+        answer.nodes[1].agents,
+        vec![
+            candidate(build.id, 0, ids::AGENT_AGY),
+            candidate(build.id, 1, ids::AGENT_CLAUDE),
+        ],
+        "{CASE}: candidates by position"
+    );
+    assert!(answer.nodes[2].agents.is_empty(), "{CASE}: none on review");
+    assert_eq!(
+        answer.edges,
+        vec![first, second, asks],
+        "{CASE}: edges by from position, to position, kind"
+    );
+    assert_eq!(
+        store.graph_body(graph).await.expect(CASE),
+        Some(answer.clone()),
+        "{CASE}: graph_body reads back the answer"
+    );
+    assert_eq!(
+        store.phases(graph).await.expect(CASE),
+        answer
+            .nodes
+            .iter()
+            .map(|node| node.phase.clone())
+            .collect::<Vec<_>>(),
+        "{CASE}: phases agrees"
+    );
+    assert_eq!(
+        store.graph_edges(graph).await.expect(CASE),
+        answer.edges,
+        "{CASE}: graph_edges agrees"
+    );
+}
+
+/// MOD-137 D10: a spent `revision` answers `Stale` with the body as it is now, before any check
+/// of the body, and writes nothing; an unknown graph is `NotFound`.
+async fn replace_graph_refuses_a_stale_revision_and_writes_nothing<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_refuses_a_stale_revision_and_writes_nothing";
+    let (graph, phases) = scratch_graph(CASE, store, "stale-me", &["plan", "review"]).await;
+    let before = body_now(CASE, store, graph).await;
+    let r0 = before.graph.revision;
+    let mut written = before.clone();
+    written.nodes[0].agents = vec![candidate(phases[0].id, 0, ids::AGENT_CLAUDE)];
+    written.edges = vec![graph_edge(
+        graph,
+        phases[0].id,
+        phases[1].id,
+        EdgeKind::Next,
+    )];
+    let current = applied(
+        CASE,
+        store
+            .replace_graph(graph, r0, written.clone())
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(current.graph.revision, r0 + 1, "{CASE}: the first lands");
+
+    let mut again = written;
+    again.graph.name = "never-written".to_owned();
+    again.nodes.pop();
+    again.edges.clear();
+    let spent = stale(
+        CASE,
+        store
+            .replace_graph(graph, r0, again.clone())
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        spent, current,
+        "{CASE}: Stale carries the body as it is now"
+    );
+    again.nodes[0].phase.name = "judge".to_owned();
+    let spent = stale(
+        CASE,
+        store.replace_graph(graph, r0, again).await.expect(CASE),
+    );
+    assert_eq!(
+        spent, current,
+        "{CASE}: a spent token answers Stale even for a body that would be refused"
+    );
+    assert_eq!(
+        body_now(CASE, store, graph).await,
+        current,
+        "{CASE}: name, revision, phases, candidates and edges unchanged"
+    );
+    let unknown = store.replace_graph(StepGraphId::new(), 0, current).await;
+    assert!(
+        matches!(
+            unknown,
+            Err(StoreError::NotFound {
+                entity: "step_graph",
+                ..
+            })
+        ),
+        "{CASE}: an unknown graph is NotFound, got {unknown:?}"
+    );
+}
+
+/// MOD-137 D10: a kept node is updated in place, so its phase-level `skill_binding` survives; a
+/// dropped node takes its binding with it.
+async fn replace_graph_keeps_bindings_of_kept_phases<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_keeps_bindings_of_kept_phases";
+    let (graph, phases) = scratch_graph(CASE, store, "bound", &["keep", "drop"]).await;
+    let (kept, dropped) = (phases[0].id, phases[1].id);
+    for phase in [kept, dropped] {
+        applied(
+            CASE,
+            store
+                .set_skill_binding(
+                    key(ids::SKILL_TESTS, Some(ids::PROJECT_HTUI), Some(phase)),
+                    None,
+                    BindingChange::Attach(attachment(Activation::Always, 1)),
+                )
+                .await
+                .expect(CASE),
+        );
+    }
+    let bound = |rows: Vec<SkillBinding>| -> Vec<PhaseId> {
+        let mut phases: Vec<PhaseId> = rows
+            .into_iter()
+            .filter_map(|row| row.phase_id)
+            .filter(|phase| *phase == kept || *phase == dropped)
+            .collect();
+        phases.sort_unstable();
+        phases
+    };
+    let mut both = vec![kept, dropped];
+    both.sort_unstable();
+    assert_eq!(
+        bound(
+            store
+                .skill_bindings(Some(ids::PROJECT_HTUI))
+                .await
+                .expect(CASE)
+        ),
+        both,
+        "{CASE}: precondition, both phases bound"
+    );
+
+    let mut written = body_now(CASE, store, graph).await;
+    written.nodes.retain(|node| node.phase.id == kept);
+    written.nodes[0].phase.name = "kept".to_owned();
+    applied(
+        CASE,
+        store
+            .replace_graph(graph, written.graph.revision, written)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        bound(
+            store
+                .skill_bindings(Some(ids::PROJECT_HTUI))
+                .await
+                .expect(CASE)
+        ),
+        vec![kept],
+        "{CASE}: the kept phase keeps its binding, the dropped one's went with it"
+    );
+}
+
+/// MOD-137 D10: two nodes trade position and name in one call; each id keeps its own row. On
+/// Postgres this is the deferred-unique case.
+async fn replace_graph_swaps_positions_and_names<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_swaps_positions_and_names";
+    let (graph, phases) = scratch_graph(CASE, store, "swap", &["a", "b"]).await;
+    let (a, b) = (phases[0].id, phases[1].id);
+    let mut written = body_now(CASE, store, graph).await;
+    written.nodes[0].phase.position = 1;
+    written.nodes[0].phase.name = "b".to_owned();
+    written.nodes[0].phase.gate_hard = true;
+    written.nodes[1].phase.position = 0;
+    written.nodes[1].phase.name = "a".to_owned();
+    let answer = applied(
+        CASE,
+        store
+            .replace_graph(graph, written.graph.revision, written)
+            .await
+            .expect(CASE),
+    );
+    let view = |rows: Vec<StepGraphPhase>| {
+        rows.into_iter()
+            .map(|row| (row.id, row.position, row.name, row.gate_hard))
+            .collect::<Vec<_>>()
+    };
+    let expected = vec![(b, 0, "a".to_owned(), false), (a, 1, "b".to_owned(), true)];
+    assert_eq!(
+        view(answer.nodes.into_iter().map(|node| node.phase).collect()),
+        expected,
+        "{CASE}: the swap lands, each id with its own row"
+    );
+    assert_eq!(
+        view(store.phases(graph).await.expect(CASE)),
+        expected,
+        "{CASE}: and reads back"
+    );
+}
+
+/// MOD-137 D6: an edge cannot point into another graph; the sentence is exact and nothing is
+/// written.
+async fn replace_graph_refuses_an_edge_into_another_graph<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_refuses_an_edge_into_another_graph";
+    let (graph, phases) = scratch_graph(CASE, store, "fenced", &["plan", "review"]).await;
+    let before = body_now(CASE, store, graph).await;
+    let foreign = ids::PHASE_HTUI_IMPLEMENT;
+    let mut written = before.clone();
+    written.edges = vec![graph_edge(graph, phases[0].id, foreign, EdgeKind::Next)];
+    constraint_exactly(
+        CASE,
+        store
+            .replace_graph(graph, before.graph.revision, written)
+            .await,
+        &edge_endpoint_outside_graph("to_phase_id", foreign, graph),
+        "an edge into GRAPH_HTUI_FEAT",
+    );
+    assert_eq!(
+        body_now(CASE, store, graph).await,
+        before,
+        "{CASE}: nothing written"
+    );
+}
+
+/// MOD-137 D6: a palette node has no edges, in or out; without them it is stored.
+async fn replace_graph_refuses_edges_on_a_palette_node<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_refuses_edges_on_a_palette_node";
+    let (graph, phases) = scratch_graph(CASE, store, "palette", &["plan", "spare"]).await;
+    let before = body_now(CASE, store, graph).await;
+    let mut written = before.clone();
+    written.nodes[1].phase.palette = true;
+    let edge = graph_edge(graph, phases[0].id, phases[1].id, EdgeKind::Next);
+    written.edges = vec![edge.clone()];
+    constraint_exactly(
+        CASE,
+        store
+            .replace_graph(graph, before.graph.revision, written.clone())
+            .await,
+        &palette_phase_has_edges("spare", edge.id),
+        "an edge into a palette node",
+    );
+    assert_eq!(
+        body_now(CASE, store, graph).await,
+        before,
+        "{CASE}: nothing written"
+    );
+    written.edges.clear();
+    let answer = applied(
+        CASE,
+        store
+            .replace_graph(graph, before.graph.revision, written)
+            .await
+            .expect(CASE),
+    );
+    assert!(
+        answer.nodes[1].phase.palette && answer.edges.is_empty(),
+        "{CASE}: a palette node without edges is stored"
+    );
+}
+
+/// MOD-137 D8: parts belong to a `divide` node; on one, every part column round-trips through
+/// [`WriteStore::phase_parts`].
+async fn replace_graph_refuses_parts_on_a_non_divide_node<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_refuses_parts_on_a_non_divide_node";
+    let (graph, phases) = scratch_graph(CASE, store, "divided", &["plan", "split"]).await;
+    let before = body_now(CASE, store, graph).await;
+    let split = phases[1].id;
+    let mut core = part_row(split, 0, "core");
+    core.title = "Core crate".to_owned();
+    core.brief = "The store seam".to_owned();
+    core.owned_paths = vec!["crates/htui-core/".to_owned(), "docs/".to_owned()];
+    core.acceptance = Some("cargo test passes".to_owned());
+    core.agent_id = Some(ids::AGENT_CLAUDE);
+    core.model = Some("opus".to_owned());
+    core.persona_id = Some(ids::PERSONA_REVIEWER);
+    let parts = vec![core, part_row(split, 1, "docs")];
+    let mut written = before.clone();
+    written.nodes[1].parts = parts.clone();
+    constraint_exactly(
+        CASE,
+        store
+            .replace_graph(graph, before.graph.revision, written.clone())
+            .await,
+        &parts_off_divide("split", Split::None),
+        "parts on a `none` node",
+    );
+    assert_eq!(
+        body_now(CASE, store, graph).await,
+        before,
+        "{CASE}: nothing written"
+    );
+
+    written.nodes[1].phase.split = Split::Divide;
+    written.nodes[1].phase.max_parts = Some(3);
+    written.nodes[1].phase.planner_model = Some("opus".to_owned());
+    let answer = applied(
+        CASE,
+        store
+            .replace_graph(graph, before.graph.revision, written)
+            .await
+            .expect(CASE),
+    );
+    let node = &answer.nodes[1];
+    assert_eq!(
+        (
+            node.phase.split,
+            node.phase.max_parts,
+            node.phase.planner_model.as_deref()
+        ),
+        (Split::Divide, Some(3), Some("opus")),
+        "{CASE}: the divide columns"
+    );
+    assert_eq!(node.parts, parts, "{CASE}: the answer carries the parts");
+    assert_eq!(
+        store.phase_parts(split).await.expect(CASE),
+        parts,
+        "{CASE}: every part column round-trips"
+    );
+    assert!(
+        store
+            .phase_parts(PhaseId::new())
+            .await
+            .expect(CASE)
+            .is_empty(),
+        "{CASE}: an unknown phase has no parts"
+    );
+}
+
+/// MOD-137 D10: the refusal order, both stores, one sentence each (blueprint §T3.1, §T3.2). One
+/// body breaks every rule, the graph name and a foreign phase and edge id among them, so shape <
+/// name < foreign id < persona < agent < topology is pinned; each call mends one and expects
+/// exactly the next sentence. Then the node CHECKs a kept node trips alone. The revision never
+/// moves until the mended body is applied.
+async fn replace_graph_refusal_order<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_refusal_order";
+    let (graph, phases) = scratch_graph(CASE, store, "ordered", &["plan", "build", "review"]).await;
+    let before = body_now(CASE, store, graph).await;
+    let revision = before.graph.revision;
+    let (plan, build) = (phases[0].id, phases[1].id);
+    let ghost_persona = PersonaId::new();
+    let ghost_agent = AgentId::new();
+    let stray = PhaseId::new();
+    let dangling = graph_edge(graph, plan, stray, EdgeKind::Next);
+    let into_palette = graph_edge(graph, plan, build, EdgeKind::Next);
+    let foreign_edge = store
+        .graph_edges(ids::GRAPH_HTUI_FEAT)
+        .await
+        .expect(CASE)
+        .first()
+        .map(|edge| edge.id)
+        .unwrap_or_else(|| panic!("{CASE}: the fixture's feature graph has edges"));
+    let taken = GraphScope::Project(ids::PROJECT_HTUI);
+
+    // Review R1 B-M1: the body breaks every step at once, D10's steps 3 (shape), 4 (the graph's
+    // name), 5 (a phase id, then an edge id, another graph holds), 6 (personas, then agents) and
+    // 7 (topology), so each mend proves the next sentence outranks everything after it.
+    let mut body = before.clone();
+    body.graph.name = "analysis".to_owned();
+    body.nodes.push(bare_node(StepGraphPhase {
+        id: ids::PHASE_HTUI_IMPLEMENT,
+        ..new_phase(graph, 7, "borrowed")
+    }));
+    body.nodes[1].phase.name = "judge".to_owned();
+    body.nodes[2].phase.position = 0;
+    body.nodes[0].phase.persona_id = Some(ghost_persona);
+    body.nodes[0].agents = vec![candidate(plan, 0, ghost_agent)];
+    body.edges = vec![
+        dangling.clone(),
+        into_palette.clone(),
+        StepGraphEdge {
+            id: foreign_edge,
+            ..graph_edge(graph, build, plan, EdgeKind::AsksYou)
+        },
+    ];
+    body.nodes[2].phase.fan_out = 2;
+    body.nodes[2].phase.retry_limit = -1;
+    body.nodes[1].phase.palette = true;
+    body.nodes[0].parts = vec![part_row(plan, 0, "core")];
+
+    let dangling_id = dangling.id;
+    let steps: Vec<Mend> = vec![
+        (
+            reserved_phase_name("judge"),
+            Box::new(|b: &mut GraphBody| b.nodes[1].phase.name = "build".to_owned()),
+        ),
+        (
+            phase_position_is_taken(0, graph),
+            Box::new(|b: &mut GraphBody| b.nodes[2].phase.position = 2),
+        ),
+        (
+            graph_name_is_taken("analysis", taken),
+            Box::new(|b: &mut GraphBody| b.graph.name = "ordered".to_owned()),
+        ),
+        (
+            already_exists("step_graph_phase", ids::PHASE_HTUI_IMPLEMENT),
+            Box::new(|b: &mut GraphBody| {
+                b.nodes
+                    .retain(|node| node.phase.id != ids::PHASE_HTUI_IMPLEMENT);
+            }),
+        ),
+        (
+            already_exists("step_graph_edge", foreign_edge),
+            Box::new(move |b: &mut GraphBody| b.edges.retain(|edge| edge.id != foreign_edge)),
+        ),
+        (
+            references_no_row("step_graph_phase.persona_id", ghost_persona, "persona"),
+            Box::new(|b: &mut GraphBody| b.nodes[0].phase.persona_id = None),
+        ),
+        (
+            references_no_row("phase_agent.agent_id", ghost_agent, "agent"),
+            Box::new(move |b: &mut GraphBody| {
+                b.nodes[0].agents = vec![candidate(plan, 0, ids::AGENT_CLAUDE)]
+            }),
+        ),
+        (
+            edge_endpoint_outside_graph("to_phase_id", stray, graph),
+            Box::new(move |b: &mut GraphBody| b.edges.retain(|edge| edge.id != dangling_id)),
+        ),
+        (
+            split_fan_out_mismatch("review", Split::None, 2),
+            Box::new(|b: &mut GraphBody| b.nodes[2].phase.split = Split::Compete),
+        ),
+        (
+            retry_limit_negative("review", -1),
+            Box::new(|b: &mut GraphBody| b.nodes[2].phase.retry_limit = 0),
+        ),
+        (
+            palette_phase_has_edges("build", into_palette.id),
+            Box::new(|b: &mut GraphBody| b.nodes[1].phase.palette = false),
+        ),
+        (
+            parts_off_divide("plan", Split::None),
+            Box::new(|b: &mut GraphBody| b.nodes[0].parts.clear()),
+        ),
+    ];
+    for (sentence, mend) in steps {
+        constraint_exactly(
+            CASE,
+            store.replace_graph(graph, revision, body.clone()).await,
+            &sentence,
+            "the next rule in order",
+        );
+        mend(&mut body);
+    }
+
+    body.nodes[1].phase.fan_out = 0;
+    constraint_exactly(
+        CASE,
+        store.replace_graph(graph, revision, body.clone()).await,
+        &fan_out_below_one("build", 0),
+        "fan_out 0 on a kept node (0001's CHECK)",
+    );
+    body.nodes[1].phase.fan_out = 1;
+
+    body.nodes[1].phase.token_budget = Some(-5);
+    constraint_exactly(
+        CASE,
+        store.replace_graph(graph, revision, body.clone()).await,
+        &phase_token_budget_refusal(-5).expect("a negative budget is refused"),
+        "a token_budget below 1 on a kept node (set_setting's Phase rung refuses it)",
+    );
+    body.nodes[1].phase.token_budget = None;
+
+    assert_eq!(
+        body_now(CASE, store, graph).await,
+        before,
+        "{CASE}: no refusal wrote anything or moved the revision"
+    );
+    let answer = applied(
+        CASE,
+        store
+            .replace_graph(graph, revision, body)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        answer.graph.revision,
+        revision + 1,
+        "{CASE}: the mended body was the last refusal"
+    );
+}
+
+/// MOD-137 D11: deleting a phase takes its candidates, parts, edges in and out, and phase
+/// bindings, and bumps once; again is `NotFound`; a graph's last phase may go.
+async fn delete_phase_cascades_edges_candidates_parts_and_bindings<S: WriteStore>(store: &S) {
+    const CASE: &str = "delete_phase_cascades_edges_candidates_parts_and_bindings";
+    let (graph, phases) = scratch_graph(CASE, store, "cascade", &["plan", "split", "review"]).await;
+    let (plan, split, review) = (phases[0].id, phases[1].id, phases[2].id);
+    let mut body = body_now(CASE, store, graph).await;
+    body.nodes[1].phase.split = Split::Divide;
+    body.nodes[1].phase.max_parts = Some(2);
+    body.nodes[1].agents = vec![candidate(split, 0, ids::AGENT_CLAUDE)];
+    body.nodes[1].parts = vec![part_row(split, 0, "core")];
+    let skip = graph_edge(graph, plan, review, EdgeKind::AsksYou);
+    body.edges = vec![
+        graph_edge(graph, plan, split, EdgeKind::Next),
+        graph_edge(graph, split, review, EdgeKind::Next),
+        skip.clone(),
+    ];
+    applied(
+        CASE,
+        store
+            .replace_graph(graph, body.graph.revision, body)
+            .await
+            .expect(CASE),
+    );
+    applied(
+        CASE,
+        store
+            .set_skill_binding(
+                key(ids::SKILL_TESTS, Some(ids::PROJECT_HTUI), Some(split)),
+                None,
+                BindingChange::Attach(attachment(Activation::Always, 1)),
+            )
+            .await
+            .expect(CASE),
+    );
+    let revision = body_now(CASE, store, graph).await.graph.revision;
+
+    store.delete_phase(split).await.expect(CASE);
+    let after = body_now(CASE, store, graph).await;
+    assert_eq!(after.graph.revision, revision + 1, "{CASE}: one bump");
+    assert_eq!(
+        after
+            .nodes
+            .iter()
+            .map(|node| node.phase.id)
+            .collect::<Vec<_>>(),
+        vec![plan, review],
+        "{CASE}: the phase is gone"
+    );
+    assert_eq!(
+        store.graph_edges(graph).await.expect(CASE),
+        vec![skip],
+        "{CASE}: its edges in and out went with it"
+    );
+    assert!(
+        store.phase_parts(split).await.expect(CASE).is_empty(),
+        "{CASE}: its parts went with it"
+    );
+    assert!(
+        store
+            .skill_bindings(Some(ids::PROJECT_HTUI))
+            .await
+            .expect(CASE)
+            .iter()
+            .all(|row| row.phase_id != Some(split)),
+        "{CASE}: its binding went with it"
+    );
+    let again = store.delete_phase(split).await;
+    assert!(
+        matches!(
+            again,
+            Err(StoreError::NotFound {
+                entity: "step_graph_phase",
+                ..
+            })
+        ),
+        "{CASE}: a second delete is NotFound, got {again:?}"
+    );
+    store.delete_phase(plan).await.expect(CASE);
+    store.delete_phase(review).await.expect(CASE);
+    let empty = body_now(CASE, store, graph).await;
+    assert!(
+        empty.nodes.is_empty() && empty.edges.is_empty(),
+        "{CASE}: a graph's last phase may go"
+    );
+    assert!(
+        store.phases(graph).await.expect(CASE).is_empty(),
+        "{CASE}: phases agrees"
+    );
+}
+
+/// MOD-137 D11: `delete_edge` and `delete_phase_agents` each remove exactly their rows and bump
+/// once, `delete_phase_agents` also on a phase with none; unknown ids are `NotFound`.
+async fn delete_edge_and_delete_phase_agents_bump_revision<S: WriteStore>(store: &S) {
+    const CASE: &str = "delete_edge_and_delete_phase_agents_bump_revision";
+    let (graph, phases) = scratch_graph(CASE, store, "trim", &["plan", "build", "review"]).await;
+    let (plan, build, review) = (phases[0].id, phases[1].id, phases[2].id);
+    let mut body = body_now(CASE, store, graph).await;
+    body.nodes[0].agents = vec![
+        candidate(plan, 0, ids::AGENT_CLAUDE),
+        candidate(plan, 1, ids::AGENT_AGY),
+    ];
+    body.nodes[1].agents = vec![candidate(build, 0, ids::AGENT_CLAUDE)];
+    let first = graph_edge(graph, plan, build, EdgeKind::Next);
+    let second = graph_edge(graph, build, review, EdgeKind::Next);
+    body.edges = vec![first.clone(), second.clone()];
+    let revision = applied(
+        CASE,
+        store
+            .replace_graph(graph, body.graph.revision, body)
+            .await
+            .expect(CASE),
+    )
+    .graph
+    .revision;
+
+    store.delete_edge(first.id).await.expect(CASE);
+    assert_eq!(
+        body_now(CASE, store, graph).await.graph.revision,
+        revision + 1,
+        "{CASE}: delete_edge bumps"
+    );
+    assert_eq!(
+        store.graph_edges(graph).await.expect(CASE),
+        vec![second],
+        "{CASE}: exactly the one edge went"
+    );
+    let again = store.delete_edge(first.id).await;
+    assert!(
+        matches!(
+            again,
+            Err(StoreError::NotFound {
+                entity: "step_graph_edge",
+                ..
+            })
+        ),
+        "{CASE}: an unknown edge is NotFound, got {again:?}"
+    );
+
+    store.delete_phase_agents(plan).await.expect(CASE);
+    let after = body_now(CASE, store, graph).await;
+    assert_eq!(
+        after.graph.revision,
+        revision + 2,
+        "{CASE}: delete_phase_agents bumps"
+    );
+    assert!(
+        after.nodes[0].agents.is_empty(),
+        "{CASE}: plan's candidates went"
+    );
+    assert_eq!(
+        after.nodes[1].agents,
+        vec![candidate(build, 0, ids::AGENT_CLAUDE)],
+        "{CASE}: build's stayed"
+    );
+    store.delete_phase_agents(review).await.expect(CASE);
+    assert_eq!(
+        body_now(CASE, store, graph).await.graph.revision,
+        revision + 3,
+        "{CASE}: a phase with no candidates still bumps"
+    );
+    let unknown = store.delete_phase_agents(PhaseId::new()).await;
+    assert!(
+        matches!(
+            unknown,
+            Err(StoreError::NotFound {
+                entity: "step_graph_phase",
+                ..
+            })
+        ),
+        "{CASE}: an unknown phase is NotFound, got {unknown:?}"
+    );
+    assert_eq!(
+        body_now(CASE, store, graph).await.graph.revision,
+        revision + 3,
+        "{CASE}: the refusals bumped nothing"
+    );
+}
+
+/// MOD-137 D5 (blueprint §1.4, F1): every write to a graph's content bumps `revision` by one and
+/// moves `step_graph.updated_at`; a write that writes nothing, a stale one and a refused one bump
+/// nothing.
+async fn every_graph_write_bumps_revision<S: WriteStore>(store: &S) {
+    const CASE: &str = "every_graph_write_bumps_revision";
+    let graph = store
+        .create_step_graph(scoped_graph(
+            GraphScope::Project(ids::PROJECT_HTUI),
+            "bumps",
+            false,
+        ))
+        .await
+        .expect(CASE);
+    assert_eq!(graph.revision, 0, "{CASE}: a fresh graph is at 0");
+    let mut last = graph.clone();
+    let mut expect = async |revision: i64, what: &str| {
+        let now = body_now(CASE, store, graph.id).await.graph;
+        assert_eq!(now.revision, revision, "{CASE}: {what}");
+        if revision == last.revision {
+            assert_eq!(
+                now.updated_at, last.updated_at,
+                "{CASE}: {what} moved nothing"
+            );
+        } else {
+            // `>=`, not `>`: a frozen clock (`MemStore::with_clock`) stamps every write alike.
+            assert!(
+                now.updated_at >= last.updated_at,
+                "{CASE}: {what} moved step_graph.updated_at"
+            );
+        }
+        last = now;
+    };
+
+    applied(
+        CASE,
+        store
+            .update_step_graph(
+                graph.id,
+                graph.updated_at,
+                StepGraphPatch {
+                    name: Some("bumped".to_owned()),
+                    ..StepGraphPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    expect(1, "update_step_graph").await;
+    let phase = store
+        .create_phase(&new_phase(graph.id, 0, "plan"))
+        .await
+        .expect(CASE);
+    expect(2, "create_phase").await;
+    store
+        .create_phase_agents(phase.id, &[candidate(phase.id, 0, ids::AGENT_CLAUDE)])
+        .await
+        .expect(CASE);
+    expect(3, "create_phase_agents").await;
+    let edited = applied(
+        CASE,
+        store
+            .update_phase(
+                phase.id,
+                phase.updated_at,
+                PhasePatch {
+                    gate_hard: Some(true),
+                    ..PhasePatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    expect(4, "update_phase").await;
+    let rung = SettingRung::Phase(phase.id);
+    let written = applied(
+        CASE,
+        store
+            .set_setting(
+                rung,
+                SettingKey::TokenBudget,
+                json!(50_000),
+                Some(edited.updated_at),
+            )
+            .await
+            .expect(CASE),
+    );
+    expect(5, "set_setting on the Phase rung").await;
+    applied(
+        CASE,
+        store
+            .clear_setting(rung, SettingKey::TokenBudget, written.updated_at)
+            .await
+            .expect(CASE),
+    );
+    expect(6, "clear_setting on the Phase rung (F1)").await;
+
+    store.create_phase_agents(phase.id, &[]).await.expect(CASE);
+    expect(6, "an empty create_phase_agents").await;
+    stale(
+        CASE,
+        store
+            .update_phase(phase.id, phase.updated_at, PhasePatch::default())
+            .await
+            .expect(CASE),
+    );
+    expect(6, "a stale update_phase").await;
+    let refused = store.create_phase(&new_phase(graph.id, 1, "judge")).await;
+    assert!(
+        matches!(refused, Err(StoreError::Constraint(_))),
+        "{CASE}: a reserved name is refused, got {refused:?}"
+    );
+    expect(6, "a refused create_phase").await;
+
+    // Review R1 B-L3: `replace_graph` and the three deleters move it too. Boxed, so this case's
+    // future stays within the Postgres run's 2 MiB debug test stack.
+    let mut body = body_now(CASE, store, graph.id).await;
+    let build = new_phase(graph.id, 1, "build");
+    let build_id = build.id;
+    body.nodes.push(bare_node(build));
+    let edge = graph_edge(graph.id, phase.id, build_id, EdgeKind::Next);
+    let edge_id = edge.id;
+    body.edges = vec![edge];
+    applied(
+        CASE,
+        Box::pin(store.replace_graph(graph.id, body.graph.revision, body))
+            .await
+            .expect(CASE),
+    );
+    expect(7, "replace_graph").await;
+    Box::pin(store.delete_edge(edge_id)).await.expect(CASE);
+    expect(8, "delete_edge").await;
+    Box::pin(store.delete_phase_agents(phase.id))
+        .await
+        .expect(CASE);
+    expect(9, "delete_phase_agents").await;
+    Box::pin(store.delete_phase(build_id)).await.expect(CASE);
+    expect(10, "delete_phase").await;
+}
+
+/// MOD-137 D3: a name is unique per scope: the library, a workspace and a project may each hold
+/// `lib`; an owner that names no row is refused; `graph_body` is the one reader of a non-project
+/// graph, and `step_graphs` lists only the project's.
+async fn graph_scopes_are_unique_per_scope<S: WriteStore>(store: &S) {
+    const CASE: &str = "graph_scopes_are_unique_per_scope";
+    let workspace = GraphScope::Workspace(ids::WORKSPACE_PLATFORM);
+    let lib = store
+        .create_step_graph(scoped_graph(GraphScope::Library, "lib", false))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (lib.scope, lib.revision),
+        (GraphScope::Library, 0),
+        "{CASE}: a library graph at revision 0"
+    );
+    // Review R1 B-L5: both create refusals in their exact sentences.
+    constraint_exactly(
+        CASE,
+        store
+            .create_step_graph(scoped_graph(GraphScope::Library, "lib", false))
+            .await,
+        &graph_name_is_taken("lib", GraphScope::Library),
+        "the library holds `lib` once",
+    );
+    let in_workspace = store
+        .create_step_graph(scoped_graph(workspace, "lib", false))
+        .await
+        .expect(CASE);
+    assert_eq!(in_workspace.scope, workspace, "{CASE}: the workspace's own");
+    let in_project = store
+        .create_step_graph(scoped_graph(
+            GraphScope::Project(ids::PROJECT_HTUI),
+            "lib",
+            false,
+        ))
+        .await
+        .expect(CASE);
+    let nowhere = WorkspaceId::new();
+    constraint_exactly(
+        CASE,
+        store
+            .create_step_graph(scoped_graph(GraphScope::Workspace(nowhere), "lib", false))
+            .await,
+        &references_no_row("step_graph.workspace_id", nowhere, "workspace"),
+        "a workspace that names no row",
+    );
+    let body = body_now(CASE, store, lib.id).await;
+    assert_eq!(body.graph, lib, "{CASE}: graph_body reads the library row");
+    assert!(
+        body.nodes.is_empty() && body.edges.is_empty(),
+        "{CASE}: an empty graph"
+    );
+    assert_eq!(
+        store
+            .step_graphs(ids::PROJECT_HTUI)
+            .await
+            .expect(CASE)
+            .into_iter()
+            .filter(|graph| graph.name == "lib")
+            .map(|graph| graph.id)
+            .collect::<Vec<_>>(),
+        vec![in_project.id],
+        "{CASE}: step_graphs lists the project's graphs only"
+    );
+
+    let second = store
+        .create_step_graph(scoped_graph(workspace, "lib-two", false))
+        .await
+        .expect(CASE);
+    let mut renamed = body_now(CASE, store, second.id).await;
+    renamed.graph.name = "lib".to_owned();
+    constraint_exactly(
+        CASE,
+        store
+            .replace_graph(second.id, renamed.graph.revision, renamed)
+            .await,
+        &graph_name_is_taken("lib", workspace),
+        "a rename into a name the workspace holds",
+    );
+}
+
+/// MOD-137 D3: an override is a per-item clone and belongs to a project (0020's override CHECK),
+/// worded once for both stores.
+async fn an_override_is_project_scoped<S: WriteStore>(store: &S) {
+    const CASE: &str = "an_override_is_project_scoped";
+    for scope in [
+        GraphScope::Library,
+        GraphScope::Workspace(ids::WORKSPACE_PLATFORM),
+    ] {
+        let new = scoped_graph(scope, "override-copy", true);
+        let id = new.id;
+        constraint_exactly(
+            CASE,
+            store.create_step_graph(new).await,
+            &override_outside_project(scope),
+            "an override outside a project",
+        );
+        assert_eq!(
+            store.graph_body(id).await.expect(CASE),
+            None,
+            "{CASE}: no row for {scope}"
+        );
+    }
+    let kept = store
+        .create_step_graph(scoped_graph(
+            GraphScope::Project(ids::PROJECT_HTUI),
+            "override-copy",
+            true,
+        ))
+        .await
+        .expect(CASE);
+    assert!(
+        kept.is_override && kept.scope == GraphScope::Project(ids::PROJECT_HTUI),
+        "{CASE}: a project override is stored"
+    );
+}
+
+/// MOD-137 D3: a workspace's graphs go with it; the reach counts them into the existing
+/// `step_graphs`, `phases` and `phase_agents` (blueprint §4 item 9), and project graphs stay.
+async fn delete_workspace_takes_its_graphs<S: WriteStore>(store: &S) {
+    const CASE: &str = "delete_workspace_takes_its_graphs";
+    let workspace = store
+        .create_workspace(new_workspace("scratch-graphs"))
+        .await
+        .expect(CASE);
+    let graph = store
+        .create_step_graph(scoped_graph(
+            GraphScope::Workspace(workspace.id),
+            "ws-graph",
+            false,
+        ))
+        .await
+        .expect(CASE);
+    let phase = store
+        .create_phase(&new_phase(graph.id, 0, "plan"))
+        .await
+        .expect(CASE);
+    store
+        .create_phase_agents(
+            phase.id,
+            &[
+                candidate(phase.id, 0, ids::AGENT_CLAUDE),
+                candidate(phase.id, 1, ids::AGENT_AGY),
+            ],
+        )
+        .await
+        .expect(CASE);
+    // Review R1 B-L4: parts and an edge too, so the delete's edge and part drop has rows to take.
+    let mut body = body_now(CASE, store, graph.id).await;
+    body.nodes[0].phase.split = Split::Divide;
+    body.nodes[0].parts = vec![part_row(phase.id, 0, "core")];
+    let ship = new_phase(graph.id, 1, "ship");
+    let ship_id = ship.id;
+    body.nodes.push(bare_node(ship));
+    body.edges = vec![graph_edge(graph.id, phase.id, ship_id, EdgeKind::Next)];
+    applied(
+        CASE,
+        store
+            .replace_graph(graph.id, body.graph.revision, body)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        store.graph_edges(graph.id).await.expect(CASE).len(),
+        1,
+        "{CASE}: the workspace graph has its edge"
+    );
+    let project_graphs = store.step_graphs(ids::PROJECT_HTUI).await.expect(CASE);
+
+    let reach = store
+        .delete_reach(DeleteTarget::Workspace(workspace.id))
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the workspace exists"));
+    assert_eq!(
+        (reach.step_graphs, reach.phases, reach.phase_agents),
+        (1, 2, 2),
+        "{CASE}: the reach counts the graph, its phases and its candidates"
+    );
+    let done = store.delete_workspace(workspace.id).await.expect(CASE);
+    assert_eq!(
+        (done.step_graphs, done.phases, done.phase_agents),
+        (1, 2, 2),
+        "{CASE}: the delete reports what the reach said"
+    );
+    assert!(
+        store.graph_edges(graph.id).await.expect(CASE).is_empty(),
+        "{CASE}: the graph's edges went with it"
+    );
+    assert!(
+        store.phase_parts(phase.id).await.expect(CASE).is_empty(),
+        "{CASE}: and its parts"
+    );
+    assert_eq!(
+        store.graph_body(graph.id).await.expect(CASE),
+        None,
+        "{CASE}: the graph went with its workspace"
+    );
+    assert!(
+        store.phases(graph.id).await.expect(CASE).is_empty(),
+        "{CASE}: and its phases"
+    );
+    assert_eq!(
+        store.step_graphs(ids::PROJECT_HTUI).await.expect(CASE),
+        project_graphs,
+        "{CASE}: project graphs untouched"
+    );
+}
+
+/// MOD-137 D9: a new project's five graphs carry [`seed::default_edges`] of their phases, in
+/// §1.3's order: fourteen edges, `bug`'s loop falling back to `fix`.
+async fn project_create_seeds_default_edges<S: WriteStore>(store: &S) {
+    const CASE: &str = "project_create_seeds_default_edges";
+    let project = store
+        .create_project(new_project("edged"))
+        .await
+        .expect(CASE);
+    let graphs = store.step_graphs(project.id).await.expect(CASE);
+    assert_eq!(graphs.len(), 5, "{CASE}: five default graphs");
+    let mut total = 0;
+    for graph in &graphs {
+        let phases = store.phases(graph.id).await.expect(CASE);
+        let stored = store.graph_edges(graph.id).await.expect(CASE);
+        assert_eq!(
+            edge_shape(&stored),
+            edge_shape(&seed::default_edges(&phases, EdgeId::new)),
+            "{CASE}: `{}` carries its default edges, in order",
+            graph.name
+        );
+        assert!(
+            stored.iter().all(|edge| edge.graph_id == graph.id),
+            "{CASE}: `{}`'s edges are its own",
+            graph.name
+        );
+        total += stored.len();
+    }
+    assert_eq!(total, 14, "{CASE}: ten next edges and four review loops");
+
+    let bug = graphs
+        .iter()
+        .find(|graph| graph.name == "bug")
+        .unwrap_or_else(|| panic!("{CASE}: a bug graph"));
+    let fix = phase_named(CASE, store, bug.id, "fix").await;
+    let review = phase_named(CASE, store, bug.id, "review").await;
+    assert!(
+        edge_shape(&store.graph_edges(bug.id).await.expect(CASE)).contains(&(
+            review.id,
+            fix.id,
+            EdgeKind::ChangesRequested,
+            None,
+            Some(fix.retry_limit),
+        )),
+        "{CASE}: bug's review loops back to fix, bounded by fix's retry_limit"
+    );
+}
+
+/// MOD-137 D7, D8 (blueprint F8): a persona held by a divide column or a part is not deleted;
+/// the holder of a library graph is named `library/<graph>/<phase>`. Cleared through
+/// `replace_graph`, the delete goes through.
+async fn a_persona_held_by_divide_columns_or_parts_is_not_deleted<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_persona_held_by_divide_columns_or_parts_is_not_deleted";
+    let planner = store
+        .create_persona(new_persona("planner", "Plans the parts."))
+        .await
+        .expect(CASE);
+    let library = store
+        .create_step_graph(scoped_graph(GraphScope::Library, "held-lib", false))
+        .await
+        .expect(CASE);
+    let mut node = new_phase(library.id, 0, "divide");
+    node.split = Split::Divide;
+    node.planner_persona_id = Some(planner.id);
+    let mut body = body_now(CASE, store, library.id).await;
+    body.nodes = vec![bare_node(node)];
+    let held_lib = applied(
+        CASE,
+        store
+            .replace_graph(library.id, body.graph.revision, body)
+            .await
+            .expect(CASE),
+    );
+    constraint_exactly(
+        CASE,
+        store.delete_persona(planner.id).await,
+        &persona_is_bound(
+            "planner",
+            &[(
+                "library".to_owned(),
+                "held-lib".to_owned(),
+                "divide".to_owned(),
+            )],
+        ),
+        "a library graph's planner persona",
+    );
+
+    let splitter = store
+        .create_persona(new_persona("splitter", "Owns a part."))
+        .await
+        .expect(CASE);
+    let (graph, phases) = scratch_graph(CASE, store, "held-proj", &["split"]).await;
+    let mut body = body_now(CASE, store, graph).await;
+    body.nodes[0].phase.split = Split::Divide;
+    let mut part = part_row(phases[0].id, 0, "core");
+    part.persona_id = Some(splitter.id);
+    body.nodes[0].parts = vec![part];
+    let held_proj = applied(
+        CASE,
+        store
+            .replace_graph(graph, body.graph.revision, body)
+            .await
+            .expect(CASE),
+    );
+    constraint_exactly(
+        CASE,
+        store.delete_persona(splitter.id).await,
+        &persona_is_bound(
+            "splitter",
+            &[(
+                "htui".to_owned(),
+                "held-proj".to_owned(),
+                "split".to_owned(),
+            )],
+        ),
+        "a part's persona",
+    );
+    let names = persona_names(CASE, store).await;
+    assert!(
+        names.contains(&"planner".to_owned()) && names.contains(&"splitter".to_owned()),
+        "{CASE}: both rows survive, got {names:?}"
+    );
+
+    let mut cleared = held_lib;
+    cleared.nodes[0].phase.planner_persona_id = None;
+    applied(
+        CASE,
+        store
+            .replace_graph(library.id, cleared.graph.revision, cleared)
+            .await
+            .expect(CASE),
+    );
+    let mut cleared = held_proj;
+    cleared.nodes[0].parts[0].persona_id = None;
+    applied(
+        CASE,
+        store
+            .replace_graph(graph, cleared.graph.revision, cleared)
+            .await
+            .expect(CASE),
+    );
+    store.delete_persona(planner.id).await.expect(CASE);
+    store.delete_persona(splitter.id).await.expect(CASE);
+    let names = persona_names(CASE, store).await;
+    assert!(
+        !names.contains(&"planner".to_owned()) && !names.contains(&"splitter".to_owned()),
+        "{CASE}: once cleared, both are deleted, got {names:?}"
+    );
+}
+
+/// MOD-137 D7 (blueprint §1.2, F13): every phase column, on a kept node (the replace's `UPDATE`)
+/// and on a new one (the shared insert), and an `if` edge's JSON predicate read back field for
+/// field: the struct-order guard for the Postgres lists.
+async fn replace_graph_round_trips_every_node_field<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_round_trips_every_node_field";
+    let (graph, phases) = scratch_graph(CASE, store, "every-field", &["plan", "split"]).await;
+    let full = |mut row: StepGraphPhase| {
+        row.fan_out = 1;
+        row.gate = Gate::OnFailure;
+        row.gate_hard = true;
+        row.retry_limit = 4;
+        row.input_kinds = vec!["plan".to_owned()];
+        row.output_kind = "parts".to_owned();
+        row.isolation = Some(Isolation::Worktree);
+        row.command_queue = CommandQueue::Always;
+        row.verify_command = Some("cargo test".to_owned());
+        row.template_name = "implement".to_owned();
+        row.template_version = Some(3);
+        row.token_budget = Some(64_000);
+        row.persona_id = Some(ids::PERSONA_ARCHITECT);
+        row.split = Split::Divide;
+        row.palette = false;
+        row.plan_scope = Some(PlanScope::Graph);
+        row.planner_persona_id = Some(ids::PERSONA_REVIEWER);
+        row.planner_agent_id = Some(ids::AGENT_CLAUDE);
+        row.planner_model = Some("opus".to_owned());
+        row.integrate_persona_id = Some(ids::PERSONA_ARCHITECT);
+        row.integrate_agent_id = Some(ids::AGENT_AGY);
+        row.integrate_model = Some("sonnet".to_owned());
+        row.max_parts = Some(2);
+        row
+    };
+    let mut body = body_now(CASE, store, graph).await;
+    body.nodes[1].phase = full(body.nodes[1].phase.clone());
+    let fresh = full(new_phase(graph, 2, "merge"));
+    let fresh_id = fresh.id;
+    body.nodes.push(bare_node(fresh));
+    let mut when = graph_edge(graph, phases[0].id, phases[1].id, EdgeKind::If);
+    when.predicate = Some(EdgePredicate(json!({"verdict": "approve", "min": 2})));
+    body.edges = vec![
+        when,
+        graph_edge(graph, phases[1].id, fresh_id, EdgeKind::Next),
+    ];
+    let answer = applied(
+        CASE,
+        store
+            .replace_graph(graph, body.graph.revision, body.clone())
+            .await
+            .expect(CASE),
+    );
+    for (got, want) in answer.nodes.iter().zip(&body.nodes) {
+        let want = StepGraphPhase {
+            updated_at: got.phase.updated_at,
+            ..want.phase.clone()
+        };
+        assert_eq!(
+            got.phase, want,
+            "{CASE}: `{}` round-trips field for field",
+            want.name
+        );
+    }
+    assert_eq!(
+        answer.edges, body.edges,
+        "{CASE}: the edges and the predicate"
+    );
+    assert_eq!(
+        body_now(CASE, store, graph).await,
+        answer,
+        "{CASE}: graph_body reads the same"
+    );
+
+    // Review R1 B-L1: a JSON `null` predicate is no predicate. An `if` edge carrying one is
+    // refused (Postgres would store `jsonb 'null'` and serde read it back as none); any other
+    // edge carrying one is stored with none.
+    let mut nulled = answer.clone();
+    let mut when = graph_edge(graph, phases[0].id, phases[1].id, EdgeKind::If);
+    when.predicate = Some(EdgePredicate(Value::Null));
+    let when_id = when.id;
+    nulled.edges = vec![when];
+    constraint_exactly(
+        CASE,
+        store
+            .replace_graph(graph, answer.graph.revision, nulled.clone())
+            .await,
+        &edge_predicate_mismatch(when_id, EdgeKind::If),
+        "an `if` edge whose predicate is JSON null",
+    );
+    let mut next = graph_edge(graph, phases[0].id, phases[1].id, EdgeKind::Next);
+    next.predicate = Some(EdgePredicate(Value::Null));
+    nulled.edges = vec![next.clone()];
+    let stored = applied(
+        CASE,
+        store
+            .replace_graph(graph, answer.graph.revision, nulled)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        stored.edges,
+        vec![StepGraphEdge {
+            predicate: None,
+            ..next
+        }],
+        "{CASE}: a `next` edge's JSON null predicate is stored as none"
+    );
+}
+
+/// MOD-137 D7 (blueprint §T2.2): `create_phase` keeps `split` in step with `fan_out`, keeps the
+/// divide columns on a `divide` node, and names an unknown planner persona, each in its exact
+/// sentence.
+async fn create_phase_keeps_split_in_step_with_fan_out<S: WriteStore>(store: &S) {
+    const CASE: &str = "create_phase_keeps_split_in_step_with_fan_out";
+    let (graph, _) = scratch_graph(CASE, store, "split-rules", &[]).await;
+    constraint_exactly(
+        CASE,
+        store
+            .create_phase(&StepGraphPhase {
+                fan_out: 2,
+                ..new_phase(graph, 0, "race")
+            })
+            .await,
+        &split_fan_out_mismatch("race", Split::None, 2),
+        "fan_out 2 that is not compete",
+    );
+    let raced = store
+        .create_phase(&StepGraphPhase {
+            fan_out: 2,
+            split: Split::Compete,
+            ..new_phase(graph, 0, "race")
+        })
+        .await
+        .expect(CASE);
+    assert_eq!(
+        raced.split,
+        Split::Compete,
+        "{CASE}: compete with fan_out 2"
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .create_phase(&StepGraphPhase {
+                max_parts: Some(2),
+                ..new_phase(graph, 1, "parts")
+            })
+            .await,
+        &divide_columns_off_divide("parts", Split::None),
+        "max_parts off a divide node",
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .create_phase(&StepGraphPhase {
+                fan_out: 0,
+                ..new_phase(graph, 1, "idle")
+            })
+            .await,
+        &fan_out_below_one("idle", 0),
+        "fan_out 0 (0001's CHECK, which ck_phase_split_fan_out lets through)",
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .create_phase(&StepGraphPhase {
+                retry_limit: -1,
+                ..new_phase(graph, 1, "eager")
+            })
+            .await,
+        &retry_limit_negative("eager", -1),
+        "a negative retry_limit (0001's CHECK)",
+    );
+    // Review R1 B-L2: `set_setting`'s `Phase` rung refuses a budget below 1, so the whole-row
+    // writers do too, in its words.
+    constraint_exactly(
+        CASE,
+        store
+            .create_phase(&StepGraphPhase {
+                token_budget: Some(0),
+                ..new_phase(graph, 1, "broke")
+            })
+            .await,
+        &phase_token_budget_refusal(0).expect("a budget of 0 is refused"),
+        "a token_budget below 1 (set_setting's Phase rung refuses it)",
+    );
+    let ghost = PersonaId::new();
+    constraint_exactly(
+        CASE,
+        store
+            .create_phase(&StepGraphPhase {
+                split: Split::Divide,
+                planner_persona_id: Some(ghost),
+                ..new_phase(graph, 1, "parts")
+            })
+            .await,
+        &references_no_row("step_graph_phase.planner_persona_id", ghost, "persona"),
+        "an unknown planner persona",
+    );
+    // Review R1 A-L4: an id any graph's phase holds is refused before the persona is looked up.
+    constraint_exactly(
+        CASE,
+        store
+            .create_phase(&StepGraphPhase {
+                id: ids::PHASE_HTUI_IMPLEMENT,
+                persona_id: Some(ghost),
+                ..new_phase(graph, 1, "borrowed")
+            })
+            .await,
+        &already_exists("step_graph_phase", ids::PHASE_HTUI_IMPLEMENT),
+        "a phase id another graph holds, before an unknown persona",
+    );
+    assert_eq!(
+        store.phases(graph).await.expect(CASE),
+        vec![raced],
+        "{CASE}: only the valid row was written"
+    );
+}
+
+/// MOD-137 D10 (review R1 B-L4): a kept node's candidates and parts are replaced wholesale, so
+/// rows the new body puts at other positions leave none of the old positions behind.
+async fn replace_graph_replaces_candidates_and_parts_by_position<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_replaces_candidates_and_parts_by_position";
+    let (graph, phases) = scratch_graph(CASE, store, "reslotted", &["split"]).await;
+    let split = phases[0].id;
+    let mut body = body_now(CASE, store, graph).await;
+    body.nodes[0].phase.split = Split::Divide;
+    body.nodes[0].agents = vec![
+        candidate(split, 0, ids::AGENT_CLAUDE),
+        candidate(split, 1, ids::AGENT_AGY),
+    ];
+    body.nodes[0].parts = vec![part_row(split, 0, "core"), part_row(split, 1, "docs")];
+    let first = applied(
+        CASE,
+        store
+            .replace_graph(graph, body.graph.revision, body)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (first.nodes[0].agents.len(), first.nodes[0].parts.len()),
+        (2, 2),
+        "{CASE}: the first body's rows"
+    );
+
+    let mut moved = first.clone();
+    moved.nodes[0].agents = vec![candidate(split, 5, ids::AGENT_AGY)];
+    moved.nodes[0].parts = vec![part_row(split, 7, "core")];
+    let answer = applied(
+        CASE,
+        store
+            .replace_graph(graph, first.graph.revision, moved)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        answer.nodes[0].agents,
+        vec![candidate(split, 5, ids::AGENT_AGY)],
+        "{CASE}: only the new candidate slot"
+    );
+    assert_eq!(
+        answer.nodes[0].parts,
+        vec![part_row(split, 7, "core")],
+        "{CASE}: only the new part slot"
+    );
+    assert_eq!(
+        store.phase_parts(split).await.expect(CASE),
+        vec![part_row(split, 7, "core")],
+        "{CASE}: phase_parts agrees"
+    );
+    assert_eq!(
+        body_now(CASE, store, graph).await,
+        answer,
+        "{CASE}: graph_body agrees"
     );
 }
 

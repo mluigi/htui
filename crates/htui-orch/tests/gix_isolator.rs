@@ -350,7 +350,7 @@ async fn repoint(store: &MemStore, item: ItemId, mutate: impl Fn(&mut StepGraphP
     let clone = store
         .create_step_graph(NewStepGraph {
             id,
-            project_id: row.project_id,
+            scope: htui_core::model::GraphScope::Project(row.project_id),
             name: format!("{}-isolated-{id}", row.key),
             description: "a gix_isolator case's edit of the live graph".to_owned(),
             is_override: false,
@@ -364,6 +364,10 @@ async fn repoint(store: &MemStore, item: ItemId, mutate: impl Fn(&mut StepGraphP
             ..phase.phase.clone()
         };
         mutate(&mut edited);
+        // ck_phase_split_fan_out (MOD-137 D7): `split` follows the edited `fan_out`.
+        if edited.split != htui_core::model::Split::Divide {
+            edited.split = htui_core::model::Split::for_fan_out(edited.fan_out);
+        }
         store
             .create_phase(&edited)
             .await

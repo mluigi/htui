@@ -1,0 +1,55 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT ($1::uuid IS NULL OR EXISTS (SELECT 1 FROM persona WHERE id = $1)) AS \"persona!\",\n               ($2::uuid IS NULL OR EXISTS (SELECT 1 FROM persona WHERE id = $2))\n                   AS \"planner_persona!\",\n               ($3::uuid IS NULL OR EXISTS (SELECT 1 FROM persona WHERE id = $3))\n                   AS \"integrate_persona!\",\n               ($4::uuid IS NULL OR EXISTS (SELECT 1 FROM agent WHERE id = $4))\n                   AS \"planner_agent!\",\n               ($5::uuid IS NULL OR EXISTS (SELECT 1 FROM agent WHERE id = $5))\n                   AS \"integrate_agent!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "persona!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "planner_persona!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "integrate_persona!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "planner_agent!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 4,
+        "name": "integrate_agent!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "e77a8a828af52e993202e5e8c08e20a3f95e42c899588f81ebba7ef57acab9b3"
+}
