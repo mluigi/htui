@@ -98,6 +98,8 @@ pub enum Context {
     SettingsSecrets,
     /// `[settings.queue]`: the Queue section (no own action; overrides and view defaults).
     SettingsQueue,
+    /// `[settings.project_types]`: the Project types section (no own action; list moves only).
+    SettingsProjectTypes,
     /// `[concepts]`: the concepts search overlay.
     Concepts,
     /// `[switcher]`: the workspace switcher overlay.
@@ -189,6 +191,7 @@ impl Context {
         Self::SettingsPersonas,
         Self::SettingsSecrets,
         Self::SettingsQueue,
+        Self::SettingsProjectTypes,
         Self::Concepts,
         Self::Switcher,
         Self::Migration,
@@ -243,6 +246,7 @@ impl Context {
             Self::SettingsPersonas => "settings.personas",
             Self::SettingsSecrets => "settings.secrets",
             Self::SettingsQueue => "settings.queue",
+            Self::SettingsProjectTypes => "settings.project_types",
             Self::Concepts => "concepts",
             Self::Switcher => "switcher",
             Self::Migration => "migration",
@@ -299,6 +303,7 @@ impl Context {
             Self::SettingsPersonas => "Personas",
             Self::SettingsSecrets => "Secrets",
             Self::SettingsQueue => "Queue",
+            Self::SettingsProjectTypes => "Project types",
             Self::Concepts => "Search concepts",
             Self::Switcher => "Workspaces",
             Self::Migration => "Schema",
@@ -350,6 +355,7 @@ impl Context {
                 | Self::SettingsPersonas
                 | Self::SettingsSecrets
                 | Self::SettingsQueue
+                | Self::SettingsProjectTypes
                 | Self::Concepts
                 | Self::Switcher
                 | Self::Migration
@@ -2351,41 +2357,42 @@ mod tests {
             Context::SettingsPersonas => 16,
             Context::SettingsSecrets => 17,
             Context::SettingsQueue => 18,
-            Context::Concepts => 19,
-            Context::Switcher => 20,
-            Context::Migration => 21,
-            Context::Waiting => 22,
-            Context::Skills => 23,
-            Context::SkillsLibrary => 24,
-            Context::SkillsTemplates => 25,
-            Context::SkillsAttach => 26,
-            Context::SkillsHelp => 27,
-            Context::Requirements => 28,
-            Context::Backlog => 29,
-            Context::BacklogBody => 30,
-            Context::BacklogRuns => 31,
-            Context::BacklogGraph => 32,
-            Context::BacklogDocs => 33,
-            Context::BacklogNotes => 34,
-            Context::BacklogPrompt => 35,
-            Context::BacklogReqs => 36,
-            Context::BacklogFilter => 37,
-            Context::BacklogItem => 38,
-            Context::Chat => 39,
-            Context::Queue => 40,
-            Context::Picker => 41,
-            Context::Layout => 42,
-            Context::History => 43,
-            Context::Leave => 44,
-            Context::Field => 45,
-            Context::Choice => 46,
-            Context::Answer => 47,
+            Context::SettingsProjectTypes => 19,
+            Context::Concepts => 20,
+            Context::Switcher => 21,
+            Context::Migration => 22,
+            Context::Waiting => 23,
+            Context::Skills => 24,
+            Context::SkillsLibrary => 25,
+            Context::SkillsTemplates => 26,
+            Context::SkillsAttach => 27,
+            Context::SkillsHelp => 28,
+            Context::Requirements => 29,
+            Context::Backlog => 30,
+            Context::BacklogBody => 31,
+            Context::BacklogRuns => 32,
+            Context::BacklogGraph => 33,
+            Context::BacklogDocs => 34,
+            Context::BacklogNotes => 35,
+            Context::BacklogPrompt => 36,
+            Context::BacklogReqs => 37,
+            Context::BacklogFilter => 38,
+            Context::BacklogItem => 39,
+            Context::Chat => 40,
+            Context::Queue => 41,
+            Context::Picker => 42,
+            Context::Layout => 43,
+            Context::History => 44,
+            Context::Leave => 45,
+            Context::Field => 46,
+            Context::Choice => 47,
+            Context::Answer => 48,
         }
     }
 
     #[test]
     fn every_context_is_listed_once_in_all() {
-        assert_eq!(Context::ALL.len(), 48);
+        assert_eq!(Context::ALL.len(), 49);
         for (index, context) in Context::ALL.iter().enumerate() {
             assert_eq!(
                 context_position(*context),
@@ -3195,6 +3202,11 @@ mod tests {
             (Context::SettingsPersonas, "settings.personas", "Personas"),
             (Context::SettingsSecrets, "settings.secrets", "Secrets"),
             (Context::SettingsQueue, "settings.queue", "Queue"),
+            (
+                Context::SettingsProjectTypes,
+                "settings.project_types",
+                "Project types",
+            ),
             (Context::Concepts, "concepts", "Search concepts"),
             (Context::Switcher, "switcher", "Workspaces"),
             (Context::Migration, "migration", "Schema"),
@@ -3236,6 +3248,11 @@ mod tests {
                 "{context:?} is both a view and a shared context"
             );
         }
+        // MOD-146 D8: Project types is a view; `is_view` is a `matches!`, so only this catches
+        // a context left out of it.
+        assert!(
+            Context::SettingsProjectTypes.is_view() && !Context::SettingsProjectTypes.is_shared()
+        );
         // MOD-67 M4 §3.1: `skills` is shared (Library and Templates inherit it), the rest views.
         assert!(Context::Skills.is_shared() && !Context::Skills.is_view());
         for context in [

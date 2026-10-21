@@ -22,12 +22,13 @@ use sqlx::Row as _;
 /// The `connect_timeout` every headless connect here passes.
 const HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The 48 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
+/// The 49 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
 /// adds (`run_step_tree`, ANA-2 §9), then the six of `0006_requirements.sql` (ANA-11 §5), then
 /// the two of `0011_permission_relay.sql` (MOD-42 plan D1), then the one of `0012_persona.sql`
 /// (MOD-26 plan D1), then the two of `0016_auto_queue.sql` (MOD-12 plan D1, D2), then the one of
 /// `0017_follow_up.sql` (MOD-70 plan D1), then the one of `0019_stop_runs.sql` (MOD-125 plan D4),
-/// then the two of `0020_step_graph_v2.sql` (MOD-137 plan D6, D8).
+/// then the two of `0020_step_graph_v2.sql` (MOD-137 plan D6, D8), then the one of
+/// `0021_project_type.sql` (MOD-146 plan D1).
 const TABLES: &[&str] = &[
     "app_user",
     "capability_tag",
@@ -85,6 +86,8 @@ const TABLES: &[&str] = &[
     // 0020_step_graph_v2.sql (MOD-137)
     "step_graph_edge",
     "phase_part",
+    // 0021_project_type.sql (MOD-146)
+    "project_type",
 ];
 
 #[tokio::test]
@@ -106,7 +109,7 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(
         applied,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21
         ],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
@@ -116,8 +119,8 @@ async fn migrations_apply_on_a_clean_database() {
          MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql, MOD-26 milestone 2's \
          0013_persona_phase_index.sql, MOD-37 milestone 5's 0014_run_step_opening.sql, \
          MOD-11's 0015_command_queue.sql, MOD-12's 0016_auto_queue.sql, MOD-70's 0017_follow_up.sql, \
-         MOD-96's 0018_seed_permission_mode.sql, MOD-125's 0019_stop_runs.sql and MOD-137's \
-         0020_step_graph_v2.sql, in ordinal order"
+         MOD-96's 0018_seed_permission_mode.sql, MOD-125's 0019_stop_runs.sql, MOD-137's \
+         0020_step_graph_v2.sql and MOD-146's 0021_project_type.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -135,22 +138,23 @@ async fn migrations_apply_on_a_clean_database() {
     }
     assert_eq!(
         TABLES.len(),
-        48,
+        49,
         "blueprint B.1 lists 32 tables (ANA-9 §3's prose count of 30 is wrong, H.1), \
          0003_orchestration.sql adds run_step_tree, 0006_requirements.sql adds ANA-11 §5's six, \
          MOD-42's 0011_permission_relay.sql adds step_permission and run_command, MOD-26's \
          0012_persona.sql adds persona and MOD-12's 0016_auto_queue.sql adds queue_batch and queue_entry and MOD-70's 0017_follow_up.sql adds follow_up_window and \
-         MOD-125's 0019_stop_runs.sql adds workspace_stop and MOD-137's 0020_step_graph_v2.sql \
-         adds step_graph_edge and phase_part"
+         MOD-125's 0019_stop_runs.sql adds workspace_stop, MOD-137's 0020_step_graph_v2.sql \
+         adds step_graph_edge and phase_part and MOD-146's 0021_project_type.sql adds \
+         project_type"
     );
     // `_sqlx_migrations` is the only extra table sqlx adds.
     assert_eq!(
         present.len(),
         TABLES.len() + 1,
-        "the migrations create the 48 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
+        "the migrations create the 49 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
          MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql and MOD-12's 0016_auto_queue.sql (queue_batch, queue_entry) and MOD-70's \
          0017_follow_up.sql and MOD-125's 0019_stop_runs.sql and MOD-137's 0020_step_graph_v2.sql \
-         and nothing else, \
+         and MOD-146's 0021_project_type.sql (project_type) and nothing else, \
          got {present:?}"
     );
 
@@ -734,6 +738,48 @@ const MOD137_TABLE_COMMENTS: &[(&str, &str)] = &[
     ),
 ];
 
+/// The five `COMMENT ON COLUMN` texts of `0021_project_type.sql` (MOD-146 plan D1), verbatim and
+/// in migration order, for [`ANA_COLUMN_COMMENTS`]'s reason.
+const MOD146_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
+    (
+        "project_type",
+        "slug",
+        "MOD-146 D1: the key project.type references; a letter, then up to 31 of a-z, 0-9 and \
+         hyphens (chk_project_type_slug).",
+    ),
+    (
+        "project_type",
+        "coding",
+        "MOD-146 D1: a software-like type (software alone among the built-ins); ANA-39 and MOD-128 \
+         read it.",
+    ),
+    (
+        "project_type",
+        "selectable",
+        "MOD-146 D1: false for workspace, which only scope rows take (MOD-147); a new-project picker \
+         offers the rest.",
+    ),
+    (
+        "project_type",
+        "seed",
+        "MOD-146 D1: the JSONB recipe of a user-defined type; NULL for a built-in, whose recipe code \
+         holds (chk_project_type_seed).",
+    ),
+    (
+        "project",
+        "type",
+        "MOD-146 D1: the project type slug, set at creation; every project before MOD-148 is \
+         software.",
+    ),
+];
+
+/// The one `COMMENT ON TABLE` of `0021_project_type.sql` (MOD-146 plan D1), verbatim.
+const MOD146_TABLE_COMMENT: (&str, &str) = (
+    "project_type",
+    "MOD-146 D1 (ANA-35 7.4): the project type registry. A type seeds a project once, at \
+     creation; editing or adding a type never re-seeds one. Six built-in rows; not mirrored.",
+);
+
 /// MOD-11 plan D14 (OQ-3): `0015_command_queue.sql` gives `command_run` its two liveness columns,
 /// both nullable (every row written before the migration, and every verify row, has neither) and
 /// both commented.
@@ -966,6 +1012,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD12_COLUMN_COMMENTS)
         .chain(MOD125_COLUMN_COMMENTS)
         .chain(MOD137_COLUMN_COMMENTS)
+        .chain(MOD146_COLUMN_COMMENTS)
     {
         let actual: Option<String> = sqlx::query_scalar(
             "SELECT pg_catalog.col_description(c.oid, a.attnum) \
@@ -983,15 +1030,19 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
             actual.as_deref(),
             Some(*expected),
             "{table}.{column}'s comment is the ANA (or MOD-7, MOD-9, MOD-23, MOD-33, MOD-26, \
-             MOD-11, MOD-12, MOD-125 or MOD-137) text byte for byte"
+             MOD-11, MOD-12, MOD-125, MOD-137 or MOD-146) text byte for byte"
         );
     }
 
     // The table comments, which `col_description` above cannot see: a table's own comment is
     // `objsubid = 0` on the class, not on any attribute.
-    for (table, expected) in [ANA_TABLE_COMMENT, MOD125_TABLE_COMMENT]
-        .into_iter()
-        .chain(MOD137_TABLE_COMMENTS.iter().copied())
+    for (table, expected) in [
+        ANA_TABLE_COMMENT,
+        MOD125_TABLE_COMMENT,
+        MOD146_TABLE_COMMENT,
+    ]
+    .into_iter()
+    .chain(MOD137_TABLE_COMMENTS.iter().copied())
     {
         let actual: Option<String> = sqlx::query_scalar(
             "SELECT pg_catalog.obj_description(c.oid, 'pg_class') FROM pg_class c \
@@ -1004,13 +1055,13 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         assert_eq!(
             actual.as_deref(),
             Some(expected),
-            "{table}'s table comment is the ANA-2 §9 (or MOD-125, MOD-137) text byte for byte"
+            "{table}'s table comment is the ANA-2 §9 (or MOD-125, MOD-137 or MOD-146) text byte for byte"
         );
     }
 
     // And nothing else in those tables carries one, so a reader of `\d+` sees exactly the
     // contracts the three ANAs, MOD-7, ANA-22, MOD-23, MOD-33, MOD-26, MOD-11, MOD-12, MOD-125 and
-    // MOD-137 wrote and no half-finished extra one.
+    // MOD-137 and MOD-146 wrote and no half-finished extra one.
     let commented: Vec<(String, String)> = sqlx::query_as(
         "SELECT c.relname::text, a.attname::text FROM pg_class c \
          JOIN pg_attribute a ON a.attrelid = c.oid \
@@ -1031,6 +1082,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
             .chain(MOD12_COLUMN_COMMENTS)
             .chain(MOD125_COLUMN_COMMENTS)
             .chain(MOD137_COLUMN_COMMENTS)
+            .chain(MOD146_COLUMN_COMMENTS)
             .map(|(table, _, _)| (*table).to_owned())
             .collect::<BTreeSet<String>>()
             .into_iter()
@@ -1051,6 +1103,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD12_COLUMN_COMMENTS)
         .chain(MOD125_COLUMN_COMMENTS)
         .chain(MOD137_COLUMN_COMMENTS)
+        .chain(MOD146_COLUMN_COMMENTS)
         .map(|(table, column, _)| ((*table).to_owned(), (*column).to_owned()))
         .collect();
     expected.sort();
@@ -2097,6 +2150,61 @@ async fn migration_0020_backfills_next_and_review_edges() {
     db.drop_db().await;
 }
 
+/// MOD-146 plan D1, D4 (ANA-35 §7.4): a project that existed before 0021 takes `project.type`'s
+/// default, `software`, and the column is `TEXT NOT NULL DEFAULT 'software'`.
+///
+/// Staged at v20 through [`MIGRATOR`] so the project exists before 0021 runs, as on a real box
+/// (the 0019 staging above); the plain `run` then applies 0021.
+#[tokio::test]
+async fn migration_0021_types_an_existing_project_software() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(20, &db.pool)
+        .await
+        .expect("apply 0001 through 0020");
+    let pool = &db.pool;
+    let user = uuid::Uuid::now_v7();
+    sqlx::query("INSERT INTO app_user (id, name) VALUES ($1, 'typed')")
+        .bind(user)
+        .execute(pool)
+        .await
+        .expect("insert app_user");
+    let (project, _) = plant_project_kind(pool, user, "before").await;
+
+    MIGRATOR.run(pool).await.expect("apply 0021");
+
+    let project_type: String = sqlx::query_scalar("SELECT type FROM project WHERE id = $1")
+        .bind(project)
+        .fetch_one(pool)
+        .await
+        .expect("read project.type");
+    assert_eq!(
+        project_type, "software",
+        "a project from before 0021 is software"
+    );
+    let column: (String, String, Option<String>) = sqlx::query_as(
+        "SELECT data_type::text, is_nullable::text, column_default::text \
+         FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'project' AND column_name = 'type'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read project.type's column");
+    assert_eq!(
+        column,
+        (
+            "text".to_owned(),
+            "NO".to_owned(),
+            Some("'software'::text".to_owned())
+        ),
+        "project.type is TEXT NOT NULL DEFAULT 'software'"
+    );
+
+    db.drop_db().await;
+}
+
 /// MOD-137 plan D9 (blueprint §T3.6): the SQL backfill and [`htui_core::seed::default_edges`]
 /// are one rule in two places, pinned equal. Staged at v19: the five seeded kinds' graphs (with
 /// `implement` and `fix` at `retry_limit 3`), `gappy` and `gap-no-implement`, raw-inserted; then
@@ -2672,6 +2780,105 @@ async fn migration_0020_edges_stay_inside_their_graph() {
     db.drop_db().await;
 }
 
+/// MOD-146 plan D3: the six rows 0021 inserts are `htui_core::seed::PROJECT_TYPES` verbatim, in
+/// slug byte order, each a built-in with no recipe, version 1 and no author.
+#[tokio::test]
+async fn migration_0021_seeds_the_six_builtin_types_verbatim() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    type Row = (String, String, String, bool, bool, bool, bool, i32, bool);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT slug, name, description, coding, builtin, selectable, seed IS NULL, \
+                seed_version, created_by IS NULL \
+           FROM project_type ORDER BY slug COLLATE \"C\"",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("read project_type");
+    let expected: Vec<Row> = htui_core::seed::PROJECT_TYPES
+        .iter()
+        .map(|builtin| {
+            (
+                builtin.slug.to_owned(),
+                builtin.name.to_owned(),
+                builtin.description.to_owned(),
+                builtin.coding,
+                true,
+                builtin.selectable,
+                true,
+                1,
+                true,
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows, expected,
+        "0021's rows are seed::PROJECT_TYPES byte for byte"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-146 plan D1, D7 (blueprint F-7): `fk_project_type` refuses an unknown `project.type`,
+/// `chk_project_type_slug` a slug outside `^[a-z][a-z0-9-]{0,31}$`, and `chk_project_type_seed`
+/// a user type without a recipe. A user type with one is admitted, and a project can take it.
+#[tokio::test]
+async fn migration_0021_refuses_an_unknown_type_a_bad_slug_and_a_recipeless_user_type() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let pool = &db.pool;
+    let user = db.store.this_user().as_uuid();
+    let (project, _) = plant_project_kind(pool, user, "typed").await;
+
+    let err = sqlx::query("UPDATE project SET type = 'nope' WHERE id = $1")
+        .bind(project)
+        .execute(pool)
+        .await
+        .expect_err("an unknown type is refused");
+    assert_eq!(
+        err.as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("23503"),
+        "refused by a foreign key: {err}"
+    );
+    assert_refused_by(err, "fk_project_type", "project.type = 'nope'");
+
+    for slug in ["Bad", "9lives"] {
+        let err =
+            sqlx::query("INSERT INTO project_type (slug, name, builtin) VALUES ($1, 'Bad', true)")
+                .bind(slug)
+                .execute(pool)
+                .await
+                .expect_err("a slug outside the CHECK is refused");
+        assert_refused_by(
+            err,
+            "chk_project_type_slug",
+            &format!("project_type.slug = '{slug}'"),
+        );
+    }
+
+    let err = sqlx::query("INSERT INTO project_type (slug, name) VALUES ('recipeless', 'R')")
+        .execute(pool)
+        .await
+        .expect_err("a user type without a recipe is refused");
+    assert_refused_by(err, "chk_project_type_seed", "a user type with no seed");
+
+    sqlx::query("INSERT INTO project_type (slug, name, seed) VALUES ('custom', 'Custom', '{}')")
+        .execute(pool)
+        .await
+        .expect("a user type with a recipe is admitted");
+    sqlx::query("UPDATE project SET type = 'custom' WHERE id = $1")
+        .bind(project)
+        .execute(pool)
+        .await
+        .expect("a project can take a known type");
+
+    db.drop_db().await;
+}
+
 /// MOD-137 plan D10: the position and name uniques of `step_graph_phase` are re-created
 /// `DEFERRABLE INITIALLY IMMEDIATE` under `uq_` names (the 0001 ones are gone, and so is
 /// `step_graph_project_id_name_key`), so one transaction can swap two phases' positions and names
@@ -2878,6 +3085,55 @@ async fn migration_0020_deferrable_uniques_report_after_foreign_keys() {
     db.drop_db().await;
 }
 
+/// MOD-146 plan D1: `trg_project_type_updated_at` is 0001's `set_updated_at`, BEFORE UPDATE only
+/// (0012's persona shape): an explicit INSERT stamp stands, and an UPDATE of a user-defined type
+/// moves `updated_at` and leaves `created_at` alone. The item trigger's case,
+/// `the_trigger_bumps_updated_at_on_update_only`, one table across.
+#[tokio::test]
+async fn migration_0021_bumps_a_project_types_updated_at_on_update_only() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let pool = &db.pool;
+    let stamp = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+        .expect("a literal RFC-3339 timestamp")
+        .with_timezone(&chrono::Utc);
+    sqlx::query(
+        "INSERT INTO project_type (slug, name, seed, created_at, updated_at) \
+         VALUES ('custom', 'Custom', '{\"graph\": []}'::jsonb, $1, $1)",
+    )
+    .bind(stamp)
+    .execute(pool)
+    .await
+    .expect("insert a user-defined type");
+    let stamps = || async {
+        sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>(
+            "SELECT created_at, updated_at FROM project_type WHERE slug = 'custom'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read project_type's stamps")
+    };
+    assert_eq!(
+        stamps().await,
+        (stamp, stamp),
+        "the BEFORE UPDATE trigger leaves an explicit INSERT timestamp alone"
+    );
+
+    sqlx::query("UPDATE project_type SET name = 'Renamed' WHERE slug = 'custom'")
+        .execute(pool)
+        .await
+        .expect("update the type");
+    let (created, updated) = stamps().await;
+    assert_eq!(created, stamp, "an UPDATE leaves created_at alone");
+    assert!(
+        updated > stamp,
+        "trg_project_type_updated_at moves updated_at on UPDATE: {updated}"
+    );
+
+    db.drop_db().await;
+}
+
 /// The smallest FK chain an `item` row needs (project -> step_graph -> item_kind), under the
 /// `created_by` the caller names. Returns `(project, kind)`; the kind's prefix is `RES`.
 async fn plant_item_kind(pool: &sqlx::PgPool, user: uuid::Uuid) -> (uuid::Uuid, uuid::Uuid) {
@@ -3072,8 +3328,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(20),
-        "twenty embedded migrations, none applied (through MOD-137's 0020_step_graph_v2.sql)"
+        MigrationState::Pending(21),
+        "twenty-one embedded migrations, none applied (through MOD-146's 0021_project_type.sql)"
     );
 
     db.drop_db().await;
@@ -3173,8 +3429,8 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(20),
-        "twenty embedded migrations, through MOD-137's 0020_step_graph_v2.sql"
+        MigrationState::Pending(21),
+        "twenty-one embedded migrations, through MOD-146's 0021_project_type.sql"
     );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
@@ -3182,8 +3438,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("a pending schema is refused");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(20),
-        "every one of the twenty, through MOD-137's 0020_step_graph_v2.sql, is pending"
+        HeadlessError::MigrationsPending(21),
+        "every one of the twenty-one, through MOD-146's 0021_project_type.sql, is pending"
     );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
@@ -3205,8 +3461,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("no migrations table is every migration pending");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(20),
-        "every one of the twenty, through MOD-137's 0020_step_graph_v2.sql, is pending"
+        HeadlessError::MigrationsPending(21),
+        "every one of the twenty-one, through MOD-146's 0021_project_type.sql, is pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
@@ -3357,9 +3613,9 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        20,
-        "the later applies migrate nothing: the twenty embedded migrations (through MOD-137's \
-         0020_step_graph_v2.sql) are applied once"
+        21,
+        "the later applies migrate nothing: the twenty-one embedded migrations (through MOD-146's \
+         0021_project_type.sql) are applied once"
     );
 
     db.drop_db().await;

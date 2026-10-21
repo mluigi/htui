@@ -36,20 +36,20 @@ use crate::model::{
     NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
     NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice, PermissionId,
     PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project,
-    ProjectId, ProjectPatch, ProjectRef, PromptScope, PromptTemplate, PromptTemplateId, QueueBatch,
-    QueueEntry, QueueMove, QueueRow, QueueRunFact, QueueSetting, QueuedFollowUp, RelaySessionId,
-    RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
-    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
-    RequirementSpec, RequirementState, RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput,
-    ResolvedPhase, Run, RunCommand, RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind,
-    RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
-    SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId,
-    SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase,
-    StepId, StepOpening, StepOutcome, StepPermission, StepStatus, StopMode, TIMESTAMPTZ_DIGITS,
-    ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
-    WorkspaceSummary, canonical_declared_tags, missing_tags_failure, moved_order, overlaps,
-    prompt_summary, scope_of,
+    ProjectId, ProjectPatch, ProjectRef, ProjectType, PromptScope, PromptTemplate,
+    PromptTemplateId, QueueBatch, QueueEntry, QueueMove, QueueRow, QueueRunFact, QueueSetting,
+    QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
+    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
+    RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate, Resolution,
+    ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunCommand, RunCommandId, RunCommandKind,
+    RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary,
+    RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding,
+    SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
+    StepStatus, StopMode, TIMESTAMPTZ_DIGITS, ToolCallCount, UpstreamEntry, UserId,
+    WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    WorkspaceProject, WorkspaceStop, WorkspaceSummary, canonical_declared_tags,
+    missing_tags_failure, moved_order, overlaps, prompt_summary, scope_of,
 };
 use crate::model::{EdgeId, GraphBody, GraphScope, NodeBody, PhasePart, StepGraphEdge};
 use crate::prompt::DEFAULT_TEMPLATES;
@@ -3047,6 +3047,7 @@ impl State {
             slug: new.slug,
             name: new.name,
             description: new.description,
+            project_type: seed::DEFAULT_PROJECT_TYPE.to_owned(),
             secret_provider: None,
             secret_scope: None,
             settings: Value::Object(serde_json::Map::new()),
@@ -9189,6 +9190,14 @@ impl WriteStore for MemStore {
 
     async fn delete_persona(&self, id: PersonaId) -> Result<()> {
         self.write(|state| state.delete_persona(id))
+    }
+
+    async fn project_types(&self) -> Result<Vec<ProjectType>> {
+        // No writer exists, so no state is read; the epoch keeps the rows identical across calls.
+        Ok(seed::PROJECT_TYPES
+            .iter()
+            .map(|builtin| seed::project_type_row(builtin, DateTime::UNIX_EPOCH))
+            .collect())
     }
 
     async fn set_setting(

@@ -1138,6 +1138,47 @@ async fn the_0005_opening_reaches_the_mirror() {
     teardown(db, &[&cache]).await;
 }
 
+/// MOD-146 plan D6 (blueprint F-5): `project.type` (`cache_migrations/0007_project_type.sql`)
+/// reaches the mirror. Every demo project is `software`, which is also the mirror column's
+/// default, so an equality against Postgres proves nothing about it: this writes another type by
+/// raw SQL (the project trigger bumps `updated_at`), refreshes, and reads it off the mirror.
+#[tokio::test]
+async fn the_0007_project_type_reaches_the_mirror() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+
+    sqlx::query("UPDATE project SET type = 'research' WHERE id = $1")
+        .bind(ids::PROJECT_AGY.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("type the project research");
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("one pass");
+
+    let mirrored = cache
+        .project(ids::PROJECT_AGY)
+        .await
+        .expect("cache project")
+        .expect("the project is mirrored");
+    assert_eq!(
+        mirrored.project_type, "research",
+        "`project.type` comes off the mirror"
+    );
+    assert_eq!(
+        Some(mirrored),
+        db.store
+            .project(ids::PROJECT_AGY)
+            .await
+            .expect("pg project"),
+        "and the two backends project the row alike"
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
 /// `run_step_tree` is the seventeenth mirrored table, and — having no `updated_at` of its own —
 /// it rides its parent step's, exactly as `run_step_commit` does (ANA-2 §4.6, plan D9).
 ///

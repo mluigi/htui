@@ -404,7 +404,10 @@ impl App {
         }
         // Below the gate: a superseded failure is as stale as any other reply, and reporting it
         // would blame the user's current selection for a request they have already moved past.
-        if let StoreReply::Failed { request, message } = &envelope.reply {
+        // A tab that draws the refusal itself keeps it off the line (MOD-146 R1 L4).
+        if let StoreReply::Failed { request, message } = &envelope.reply
+            && !self.absorbed(&envelope.origin, request)
+        {
             self.update(Action::Error(format!("{request}: {message}")));
         }
         let ReplyEnvelope { origin, reply, .. } = envelope;
@@ -435,6 +438,18 @@ impl App {
                 }
                 self.drain(&origin);
             }
+        }
+    }
+
+    /// Whether the tab a refused `request` was issued from draws it itself
+    /// ([`Tab::absorbs_failure`]). The shell's and an overlay's refusals are always the line's.
+    fn absorbed(&mut self, origin: &Origin, request: &str) -> bool {
+        match origin {
+            Origin::Tab(id) => self
+                .tabs
+                .by_id_mut(*id)
+                .is_some_and(|tab| tab.absorbs_failure(request)),
+            Origin::App | Origin::Overlay(_) => false,
         }
     }
 

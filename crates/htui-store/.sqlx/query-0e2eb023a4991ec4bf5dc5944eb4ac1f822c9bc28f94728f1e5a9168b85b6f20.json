@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, slug, name, description, secret_provider, secret_scope, settings, created_by, created_at, updated_at FROM project WHERE id = $1 AND updated_at > $2 ORDER BY updated_at",
+  "query": "\n            INSERT INTO project (id, slug, name, description, created_by)\n            VALUES ($1, $2, $3, $4, $5)\n            RETURNING id              AS \"id: ProjectId\",\n                      slug,\n                      name,\n                      description,\n                      type            AS project_type,\n                      secret_provider,\n                      secret_scope,\n                      settings,\n                      created_by      AS \"created_by: htui_core::model::UserId\",\n                      created_at,\n                      updated_at\n            ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id",
+        "name": "id: ProjectId",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -49,6 +49,17 @@
       },
       {
         "ordinal": 4,
+        "name": "project_type",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "project",
+            "name": "type"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
         "name": "secret_provider",
         "type_info": "Text",
         "origin": {
@@ -59,7 +70,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "secret_scope",
         "type_info": "Text",
         "origin": {
@@ -70,7 +81,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "settings",
         "type_info": "Jsonb",
         "origin": {
@@ -81,8 +92,8 @@
         }
       },
       {
-        "ordinal": 7,
-        "name": "created_by",
+        "ordinal": 8,
+        "name": "created_by: htui_core::model::UserId",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -92,7 +103,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -103,7 +114,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -117,10 +128,14 @@
     "parameters": {
       "Left": [
         "Uuid",
-        "Timestamptz"
+        "Text",
+        "Text",
+        "Text",
+        "Uuid"
       ]
     },
     "nullable": [
+      false,
       false,
       false,
       false,
@@ -133,5 +148,5 @@
       false
     ]
   },
-  "hash": "bb3c1e7f6b225784e800a2a1f9b4afbfa322ff1546ad14141db8844b32153b36"
+  "hash": "0e2eb023a4991ec4bf5dc5944eb4ac1f822c9bc28f94728f1e5a9168b85b6f20"
 }

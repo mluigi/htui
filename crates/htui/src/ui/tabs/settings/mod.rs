@@ -3,9 +3,9 @@
 //! A registry for the same reason the tabs and the detail sub-tabs are one (MOD-1 plan D5):
 //! MOD-2's agent registry, MOD-7's `Boxes` section (every box of the user, this box marked),
 //! MOD-9's skills, MOD-15's hierarchy, MOD-26's persona registry (`Personas`, milestone 2),
-//! MOD-10's secret provider (`Secrets`, milestone 4) and MOD-12's queue caps (`Queue`, milestone 2)
-//! each want a section of this tab, and each should be a file plus one `register` line rather
-//! than a `match` arm growing in here.
+//! MOD-10's secret provider (`Secrets`, milestone 4), MOD-12's queue caps (`Queue`, milestone 2)
+//! and MOD-146's project types (`Project types`) each want a section of this tab, and each should
+//! be a file plus one `register` line rather than a `match` arm growing in here.
 //! [`SettingsSection`] mirrors
 //! [`DetailTab`](crate::ui::tabs::backlog::detail::DetailTab) one level across, with
 //! [`on_scope_change`](SettingsSection::on_scope_change) where the detail pane has
@@ -17,6 +17,7 @@ pub mod connection;
 pub mod hierarchy;
 pub mod kinds;
 pub mod personas;
+pub mod project_types;
 pub mod prompt;
 /// The Qdrant DSN settings section.
 pub mod qdrant;
@@ -46,6 +47,7 @@ pub use connection::ConnectionSection;
 pub use hierarchy::HierarchySection;
 pub use kinds::KindsSection;
 pub use personas::PersonasSection;
+pub use project_types::ProjectTypesSection;
 pub use prompt::PromptSection;
 pub use qdrant::QdrantSection;
 pub use queue::QueueSection;
@@ -217,6 +219,11 @@ pub trait SettingsSection {
     }
     /// A reply addressed to the Settings tab. Sections that do not care ignore it.
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>);
+    /// Whether this section's pane says a refused `request` itself, so the shell keeps it off the
+    /// status line ([`Tab::absorbs_failure`], MOD-146 R1 L4). Defaulted to `false`.
+    fn absorbs_failure(&self, _request: &str) -> bool {
+        false
+    }
     /// Draws below the section strip.
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>);
     /// This section's keys (its mode's spec through its stack, plus what a write in flight adds),
@@ -441,6 +448,15 @@ impl Tab for SettingsTab {
         }
     }
 
+    /// Any section's: every reply goes to every section, so the one that issued the read is
+    /// among them.
+    fn absorbs_failure(&self, request: &str) -> bool {
+        self.sections
+            .sections
+            .iter()
+            .any(|section| section.absorbs_failure(request))
+    }
+
     /// The one tab that has sections to focus (MOD-15 M6 D7).
     ///
     /// No re-activation is needed on the way in: [`wants_requests`](Tab::wants_requests) above
@@ -506,13 +522,21 @@ impl Tab for SettingsTab {
 }
 
 /// Draws the section strip, the active one in `active_tab` (bold, underlined).
+///
+/// A strip whose active title would end past `area` scrolls so that it ends inside it (MOD-146
+/// F-1 (A)), behind a `theme.dim` `…` in column 0 that marks the cut (R1 L5); the scroll is
+/// counted against the columns right of the `…`, so the title stays whole. One whose active title
+/// fits draws as it always did, from column 0.
 pub fn render_strip(frame: &mut Frame<'_>, area: Rect, registry: &SettingsRegistry, theme: &Theme) {
     let active = registry.active_id();
-    let spans: Vec<Span<'_>> = registry
-        .titles()
-        .into_iter()
-        .map(|(id, title)| {
+    let titles = registry.titles();
+    let (mut end, mut active_end) = (0usize, 0usize);
+    let spans: Vec<Span<'_>> = titles
+        .iter()
+        .map(|&(id, title)| {
+            end += cells::cell_width(title) + 2;
             let style: Style = if Some(id) == active {
+                active_end = end;
                 theme.active_tab
             } else {
                 theme.dim
@@ -520,7 +544,19 @@ pub fn render_strip(frame: &mut Frame<'_>, area: Rect, registry: &SettingsRegist
             Span::styled(format!(" {title} "), style)
         })
         .collect();
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    let mut area = area;
+    // A width of 1 has no room for both the `…` and a column of strip: it scrolls without one.
+    if active_end > usize::from(area.width) && area.width > 1 {
+        frame.render_widget(
+            Paragraph::new(Line::styled("\u{2026}", theme.dim)),
+            Rect { width: 1, ..area },
+        );
+        area.x += 1;
+        area.width -= 1;
+    }
+    let offset =
+        u16::try_from(active_end.saturating_sub(usize::from(area.width))).unwrap_or(u16::MAX);
+    frame.render_widget(Paragraph::new(Line::from(spans)).scroll((0, offset)), area);
 }
 
 /// The one line a section renders instead of a blank pane.
@@ -557,6 +593,67 @@ mod tests {
         let other = &buffer[(second, 0)];
         assert_eq!(other.symbol(), "Q");
         assert!(!other.modifier.intersects(marked), "{other:?}");
+    }
+
+    /// One row of `registry`'s strip drawn `width` columns wide.
+    fn strip_row(registry: &SettingsRegistry, width: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1)).expect("terminal");
+        terminal
+            .draw(|frame| render_strip(frame, frame.area(), registry, &Theme::monochrome()))
+            .expect("the strip draws");
+        let buffer = terminal.backend().buffer();
+        (0..width).map(|x| buffer[(x, 0)].symbol()).collect()
+    }
+
+    /// MOD-146 F-1 (A): a strip wider than its area scrolls so the active title ends inside it,
+    /// and one that fits draws from column 0 as it always did. A scrolled strip opens on a dim
+    /// `…` (MOD-146 R1 L5), so the cut reads as deliberate; the title still ends inside it.
+    #[test]
+    fn a_strip_wider_than_its_area_scrolls_to_the_active_section() {
+        let mut tab = SettingsTab::with_sections(vec![
+            Box::new(ConnectionSection::new()),
+            Box::new(QdrantSection::new()),
+        ]);
+        // ` Connection ` and ` Qdrant `: 20 columns in all.
+        assert_eq!(
+            strip_row(&tab.sections, 15),
+            " Connection  Qd",
+            "an active title that fits is not scrolled to, and no `…` opens the row"
+        );
+        assert_eq!(
+            strip_row(&tab.sections, 40).trim_end(),
+            " Connection  Qdrant"
+        );
+        tab.sections.cycle_next();
+        let narrow = strip_row(&tab.sections, 15);
+        assert!(narrow.ends_with(" Qdrant "), "{narrow:?}");
+        assert_eq!(narrow, "\u{2026}ction  Qdrant ");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(15, 1)).expect("terminal");
+        terminal
+            .draw(|frame| render_strip(frame, frame.area(), &tab.sections, &Theme::monochrome()))
+            .expect("the strip draws");
+        let ellipsis = &terminal.backend().buffer()[(0, 0)];
+        assert!(
+            ellipsis.modifier.contains(ratatui::style::Modifier::DIM),
+            "the `…` is theme.dim: {ellipsis:?}"
+        );
+        assert_eq!(
+            strip_row(&tab.sections, 9),
+            "\u{2026} Qdrant ",
+            "the `…` costs a column of the scroll, not of the active title"
+        );
+        assert_eq!(
+            strip_row(&tab.sections, 40).trim_end(),
+            " Connection  Qdrant",
+            "a strip that fits does not scroll"
+        );
+        assert_eq!(
+            strip_row(&tab.sections, 20),
+            " Connection  Qdrant ",
+            "exactly fitting does not scroll either"
+        );
     }
 
     /// MOD-115 M2 §8: the location names the active section; restoring it activates that

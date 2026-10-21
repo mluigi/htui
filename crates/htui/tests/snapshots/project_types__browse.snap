@@ -1,0 +1,11 @@
+---
+source: crates/htui/tests/project_types.rs
+expression: frame
+---
+Documents · docs
+    Documents outlined, drafted and reviewed.
+General · general
+Operations · ops
+Research · research
+Software · software · coding
+Workspace · workspace · not selectable

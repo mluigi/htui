@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE project SET\n                slug            = COALESCE($3, slug),\n                name            = COALESCE($4, name),\n                description     = COALESCE($5, description),\n                secret_provider = CASE WHEN $6 THEN $7 ELSE secret_provider END,\n                secret_scope    = CASE WHEN $6 THEN $8 ELSE secret_scope END\n             WHERE id = $1 AND updated_at = $2\n            RETURNING id              AS \"id: ProjectId\",\n                      slug,\n                      name,\n                      description,\n                      secret_provider,\n                      secret_scope,\n                      settings,\n                      created_by      AS \"created_by: htui_core::model::UserId\",\n                      created_at,\n                      updated_at\n            ",
+  "query": "\n            SELECT id              AS \"id: ProjectId\",\n                   slug,\n                   name,\n                   description,\n                   type            AS project_type,\n                   secret_provider,\n                   secret_scope,\n                   settings,\n                   created_by      AS \"created_by: htui_core::model::UserId\",\n                   created_at,\n                   updated_at\n              FROM project WHERE id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -49,6 +49,17 @@
       },
       {
         "ordinal": 4,
+        "name": "project_type",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "project",
+            "name": "type"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
         "name": "secret_provider",
         "type_info": "Text",
         "origin": {
@@ -59,7 +70,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "secret_scope",
         "type_info": "Text",
         "origin": {
@@ -70,7 +81,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "settings",
         "type_info": "Jsonb",
         "origin": {
@@ -81,7 +92,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "created_by: htui_core::model::UserId",
         "type_info": "Uuid",
         "origin": {
@@ -92,7 +103,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -103,7 +114,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -116,17 +127,11 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Timestamptz",
-        "Text",
-        "Text",
-        "Text",
-        "Bool",
-        "Text",
-        "Text"
+        "Uuid"
       ]
     },
     "nullable": [
+      false,
       false,
       false,
       false,
@@ -139,5 +144,5 @@
       false
     ]
   },
-  "hash": "c492c94bcba047ffed629ec5e368d7ff21bcb874ef2605586a7aa419b4068acd"
+  "hash": "49da2eef23b87f864fdd1fee9602cb05a9df50418de74a23289fec9080457204"
 }

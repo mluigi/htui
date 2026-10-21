@@ -896,7 +896,7 @@ impl ReadStore for CacheStore {
 
     async fn project(&self, id: ProjectId) -> Result<Option<Project>> {
         let row = sqlx::query(
-            "SELECT id, slug, name, description, secret_provider, secret_scope, settings, \
+            "SELECT id, slug, name, description, type, secret_provider, secret_scope, settings, \
              created_by, created_at, updated_at FROM project WHERE id = ?",
         )
         .bind(id.to_string())
@@ -909,6 +909,7 @@ impl ReadStore for CacheStore {
             slug: text(&row, "slug")?,
             name: text(&row, "name")?,
             description: text(&row, "description")?,
+            project_type: text(&row, "type")?,
             secret_provider: opt_text(&row, "secret_provider")?,
             secret_scope: opt_text(&row, "secret_scope")?,
             settings: json_col("project.settings", &text(&row, "settings")?)?,

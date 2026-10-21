@@ -22,8 +22,8 @@ use chrono::{DateTime, Utc};
 
 use crate::model::{
     CommandQueue, EdgeId, EdgeKind, Gate, GraphScope, ItemKind, ItemKindId, PhaseId, ProjectId,
-    PromptTemplate, PromptTemplateId, Split, StepGraph, StepGraphEdge, StepGraphId, StepGraphPhase,
-    UserId,
+    ProjectType, PromptTemplate, PromptTemplateId, Split, StepGraph, StepGraphEdge, StepGraphId,
+    StepGraphPhase, UserId,
 };
 
 /// One phase of a default graph: the three columns the table varies, in position order within
@@ -371,13 +371,101 @@ pub fn template_row(
     }
 }
 
+/// One built-in `project_type` row (MOD-146 D3): the five columns the six vary. Every built-in is
+/// `builtin`, has no `seed` (code holds its recipe, ANA-35 §7.4), `seed_version` 1 and no author;
+/// [`project_type_row`] writes those.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinProjectType {
+    /// `project_type.slug`.
+    pub slug: &'static str,
+    /// `project_type.name`.
+    pub name: &'static str,
+    /// `project_type.description`.
+    pub description: &'static str,
+    /// `project_type.coding`.
+    pub coding: bool,
+    /// `project_type.selectable`.
+    pub selectable: bool,
+}
+
+/// The type every project takes until MOD-148's picker chooses one (MOD-146 D4): the column
+/// default of `project.type` in `0021_project_type.sql`.
+pub const DEFAULT_PROJECT_TYPE: &str = "software";
+
+/// ANA-35 §7.4's six built-in types, in `slug` byte order, which is the order
+/// [`crate::store::WriteStore::project_types`] answers (MOD-146 D5). `0021_project_type.sql`
+/// inserts the same six, and `htui-store`'s `tests/migrations.rs` pins the two equal.
+pub const PROJECT_TYPES: [BuiltinProjectType; 6] = [
+    BuiltinProjectType {
+        slug: "docs",
+        name: "Documents",
+        description: "Documents outlined, drafted and reviewed.",
+        coding: false,
+        selectable: true,
+    },
+    BuiltinProjectType {
+        slug: "general",
+        name: "General",
+        description: "Tasks carried out and reviewed.",
+        coding: false,
+        selectable: true,
+    },
+    BuiltinProjectType {
+        slug: "ops",
+        name: "Operations",
+        description: "Operations planned, executed and verified; incidents investigated.",
+        coding: false,
+        selectable: true,
+    },
+    BuiltinProjectType {
+        slug: "research",
+        name: "Research",
+        description: "Questions answered and research concluded with a verdict.",
+        coding: false,
+        selectable: true,
+    },
+    BuiltinProjectType {
+        slug: "software",
+        name: "Software",
+        description: "Code in repositories: analyses, features, fixes.",
+        coding: true,
+        selectable: true,
+    },
+    BuiltinProjectType {
+        slug: "workspace",
+        name: "Workspace",
+        description: "A workspace's own items; not offered for new projects.",
+        coding: false,
+        selectable: false,
+    },
+];
+
+/// A built-in's `project_type` row, `at` in both stamps. Only `MemStore` calls it, with the
+/// epoch; Postgres's rows are the migration's own, stamped by its `now()`.
+#[must_use]
+pub fn project_type_row(builtin: &BuiltinProjectType, at: DateTime<Utc>) -> ProjectType {
+    ProjectType {
+        slug: builtin.slug.to_owned(),
+        name: builtin.name.to_owned(),
+        description: builtin.description.to_owned(),
+        coding: builtin.coding,
+        builtin: true,
+        selectable: builtin.selectable,
+        seed: None,
+        seed_version: 1,
+        created_by: None,
+        created_at: at,
+        updated_at: at,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
     use super::{
-        KINDS, PHASES_PER_PROJECT, PhaseSeed, default_edges, graph_row, kind_row, phase_row,
-        template_row,
+        DEFAULT_PROJECT_TYPE, KINDS, PHASES_PER_PROJECT, PROJECT_TYPES, PhaseSeed, default_edges,
+        graph_row, kind_row, phase_row, project_type_row, template_row,
     };
     use crate::model::{
         CommandQueue, EdgeId, EdgeKind, Gate, GraphScope, ItemKind, ItemKindId, PhaseId, ProjectId,
@@ -807,5 +895,97 @@ mod tests {
             (10, 4),
             "fifteen phases in five graphs, four reviews"
         );
+    }
+
+    /// MOD-146 D3: ANA-35 §7.4's six, unique and in the order the stores answer, each slug
+    /// passing `0021_project_type.sql`'s `chk_project_type_slug` (`^[a-z][a-z0-9-]{0,31}$`).
+    #[test]
+    fn six_project_types_in_slug_byte_order_pass_the_check() {
+        assert_eq!(PROJECT_TYPES.len(), 6, "ANA-35 §7.4 fixes six built-ins");
+        for pair in PROJECT_TYPES.windows(2) {
+            assert!(
+                pair[0].slug.as_bytes() < pair[1].slug.as_bytes(),
+                "`{}` sorts before `{}` by bytes, so the slugs are unique and in read order",
+                pair[0].slug,
+                pair[1].slug
+            );
+        }
+        for builtin in &PROJECT_TYPES {
+            let bytes = builtin.slug.as_bytes();
+            assert!(
+                (1..=32).contains(&bytes.len()),
+                "`{}` is 1-32 bytes",
+                builtin.slug
+            );
+            assert!(
+                bytes[0].is_ascii_lowercase(),
+                "`{}` starts with a-z",
+                builtin.slug
+            );
+            assert!(
+                bytes
+                    .iter()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-'),
+                "`{}` is a-z, 0-9 and hyphens",
+                builtin.slug
+            );
+            assert!(
+                !builtin.name.trim().is_empty() && !builtin.description.trim().is_empty(),
+                "`{}` has a name and a description",
+                builtin.slug
+            );
+        }
+    }
+
+    /// MOD-146 D3, D4: `coding` is software's alone, `selectable` is false for workspace alone,
+    /// and the default type is a coding type a picker offers.
+    #[test]
+    fn software_is_the_one_coding_default_and_workspace_the_one_hidden() {
+        let coding: Vec<_> = PROJECT_TYPES
+            .iter()
+            .filter(|builtin| builtin.coding)
+            .map(|builtin| builtin.slug)
+            .collect();
+        assert_eq!(coding, ["software"]);
+        let hidden: Vec<_> = PROJECT_TYPES
+            .iter()
+            .filter(|builtin| !builtin.selectable)
+            .map(|builtin| builtin.slug)
+            .collect();
+        assert_eq!(hidden, ["workspace"]);
+        let default = PROJECT_TYPES
+            .iter()
+            .find(|builtin| builtin.slug == DEFAULT_PROJECT_TYPE)
+            .expect("DEFAULT_PROJECT_TYPE names a built-in");
+        assert!(default.selectable && default.coding);
+    }
+
+    /// MOD-146 D3: a built-in row carries no recipe, version 1, no author and `at` twice.
+    #[test]
+    fn project_type_row_carries_the_builtin_columns() {
+        let at = chrono::DateTime::UNIX_EPOCH;
+        let builtin = &PROJECT_TYPES[0];
+        let row = project_type_row(builtin, at);
+        assert_eq!(
+            (
+                row.slug.as_str(),
+                row.name.as_str(),
+                row.description.as_str(),
+                row.coding,
+                row.selectable,
+            ),
+            (
+                builtin.slug,
+                builtin.name,
+                builtin.description,
+                builtin.coding,
+                builtin.selectable,
+            )
+        );
+        assert!(row.builtin);
+        assert_eq!(row.seed, None);
+        assert_eq!(row.seed_version, 1);
+        assert_eq!(row.created_by, None);
+        assert_eq!((row.created_at, row.updated_at), (at, at));
     }
 }

@@ -63,6 +63,9 @@ pub struct Project {
     pub name: String,
     /// `project.description`.
     pub description: String,
+    /// `project.type`: the slug of the [`ProjectType`] the project was created as (MOD-146 D2).
+    /// `software` for every project until MOD-148's picker chooses one.
+    pub project_type: String,
     /// `project.secret_provider`, e.g. `infisical`.
     pub secret_provider: Option<String>,
     /// `project.secret_scope`: provider-specific project/environment reference.
@@ -74,6 +77,34 @@ pub struct Project {
     /// `project.created_at`.
     pub created_at: DateTime<Utc>,
     /// `project.updated_at`.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A row of `project_type` (MOD-146 D2, ANA-35 §7.4): what a project is, which seeds it once at
+/// creation. Editing or adding a type never re-seeds an existing project.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectType {
+    /// `project_type.slug`: the key `project.type` references.
+    pub slug: String,
+    /// `project_type.name`.
+    pub name: String,
+    /// `project_type.description`.
+    pub description: String,
+    /// `project_type.coding`: a software-like type; ANA-39 and MOD-128 read it.
+    pub coding: bool,
+    /// `project_type.builtin`: one of [`crate::seed::PROJECT_TYPES`].
+    pub builtin: bool,
+    /// `project_type.selectable`: offered for a new project; false for `workspace`.
+    pub selectable: bool,
+    /// `project_type.seed`: a user type's recipe; `None` for a built-in, whose recipe code holds.
+    pub seed: Option<Value>,
+    /// `project_type.seed_version`.
+    pub seed_version: i32,
+    /// `project_type.created_by`: `None` for a built-in.
+    pub created_by: Option<UserId>,
+    /// `project_type.created_at`.
+    pub created_at: DateTime<Utc>,
+    /// `project_type.updated_at`.
     pub updated_at: DateTime<Utc>,
 }
 

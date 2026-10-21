@@ -898,6 +898,13 @@ impl WriteStore for Writer {
         }
     }
 
+    async fn project_types(&self) -> Result<Vec<htui_core::model::ProjectType>> {
+        match self {
+            Self::Memory(store) => store.project_types().await,
+            Self::Online(pg) => pg.project_types().await,
+        }
+    }
+
     async fn set_setting(
         &self,
         rung: SettingRung,

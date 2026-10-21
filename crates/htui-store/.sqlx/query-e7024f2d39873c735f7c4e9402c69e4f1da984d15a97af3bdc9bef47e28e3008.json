@@ -1,0 +1,146 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT slug,\n                   name,\n                   description,\n                   coding,\n                   builtin,\n                   selectable,\n                   seed,\n                   seed_version,\n                   created_by      AS \"created_by: htui_core::model::UserId\",\n                   created_at,\n                   updated_at\n              FROM project_type\n             ORDER BY slug COLLATE \"C\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "slug",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "project_type",
+            "name": "slug"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "project_type",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "description",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "project_type",
+            "name": "description"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "coding",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "project_type",
+            "name": "coding"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "builtin",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "project_type",
+            "name": "builtin"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "selectable",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "project_type",
+            "name": "selectable"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "seed",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "project_type",
+            "name": "seed"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "seed_version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "project_type",
+            "name": "seed_version"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "created_by: htui_core::model::UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "project_type",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "project_type",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "project_type",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "e7024f2d39873c735f7c4e9402c69e4f1da984d15a97af3bdc9bef47e28e3008"
+}

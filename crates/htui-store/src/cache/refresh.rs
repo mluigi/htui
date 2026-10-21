@@ -692,6 +692,7 @@ const PROJECT_COLUMNS: &[&str] = &[
     "created_by",
     "created_at",
     "updated_at",
+    "type",
 ];
 
 async fn refresh_project(
@@ -703,7 +704,7 @@ async fn refresh_project(
 ) -> Result<Batch> {
     let rows = sqlx::query!(
         "SELECT id, slug, name, description, secret_provider, secret_scope, settings, created_by, \
-                created_at, updated_at \
+                created_at, updated_at, type AS project_type \
            FROM project WHERE id = $1 AND updated_at > $2 ORDER BY updated_at",
         project.as_uuid(),
         since,
@@ -726,6 +727,7 @@ async fn refresh_project(
             .bind(row.created_by.to_string())
             .bind(ts_bind(row.created_at))
             .bind(ts_bind(row.updated_at))
+            .bind(&row.project_type)
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx)?;

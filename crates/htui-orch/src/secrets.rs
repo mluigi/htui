@@ -216,6 +216,7 @@ mod tests {
             slug: "p".to_owned(),
             name: "P".to_owned(),
             description: String::new(),
+            project_type: htui_core::seed::DEFAULT_PROJECT_TYPE.to_owned(),
             secret_provider: provider.map(str::to_owned),
             secret_scope: scope.map(str::to_owned),
             settings: json!({}),

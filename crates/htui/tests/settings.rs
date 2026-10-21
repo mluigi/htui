@@ -15,8 +15,9 @@ use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
 use htui::ui::tabs::settings::{
     AgentsSection, BoxesSection, ConnectionSection, HierarchySection, KindsSection,
-    PersonasSection, PromptSection, QdrantSection, QueueSection, SecretsSection, SectionId,
-    SettingsSection, SettingsTab, message,
+    PersonasSection, ProjectTypesSection, PromptSection, QdrantSection, QueueSection,
+    SecretsSection, SectionId, SettingsRegistry, SettingsSection, SettingsTab, message,
+    render_strip,
 };
 use htui::ui::text_field::PASTE_DOES_NOT_FIT;
 use htui_agent::acp::Handshake;
@@ -1078,21 +1079,24 @@ async fn a_bracketed_paste_under_a_modal_overlay_reaches_no_field() {
     );
 }
 
-/// The strip has to fit the frame it is drawn in (D4; PRD risk "strip overflow at 100 columns").
+/// The section strip's full width is pinned, and every active title stays whole on screen (D4;
+/// PRD risk "strip overflow at 100 columns").
 ///
 /// `render_strip` draws `format!(" {title} ")` per registered section, so the joined width is
 /// `Σ (title chars + 2)`. The pin is over the sections the product registers, not over a test
-/// fixture: the moment a section makes the strip 101 columns wide this fails, and that is the one
-/// warning a snapshot of a clipped strip could not give.
+/// fixture, so a section added, dropped or renamed fails it here and the width is re-pinned on
+/// purpose.
 ///
-/// The seventh section is MOD-7 milestone 2's `Boxes` (D47), the eighth MOD-26 milestone 2's
-/// `Personas` (D22), the ninth MOD-10 milestone 4's `Secrets` (D1) and the tenth MOD-12
-/// milestone 2's `Queue` (D8), each appended last as `register_all` appends it. The ten
-/// (`Agents`, `Hierarchy`, `Kinds`, `Prompt`, `Connection`, `Qdrant`, `Boxes`, `Personas`,
-/// `Secrets`, `Queue`) cost 87 of the 100 columns, so the pin is re-run rather than relaxed — if
-/// an eleventh ever does not fit, the fix is the strip's, not a shorter title.
+/// The eleven, each appended last as `register_all` appends it (`Agents`, `Hierarchy`, `Kinds`,
+/// `Prompt`, `Connection`, `Qdrant`, MOD-7 M2's `Boxes`, MOD-26 M2's `Personas`, MOD-10 M4's
+/// `Secrets`, MOD-12 M2's `Queue` and MOD-146 D8's `Project types`), make the strip 102 columns
+/// wide, wider than the 98 inside the Settings border at 100. MOD-146 F-1 (A) answered that in the
+/// strip, not with a shorter title: `render_strip` scrolls a strip wider than its area so that the
+/// active title ends inside it. So the law is drawn, not summed: at 98 columns, with each section
+/// active in turn, the active section's whole ` title ` is on the row. (The scroll itself is pinned
+/// by `render_strip`'s unit test, `a_strip_wider_than_its_area_scrolls_to_the_active_section`.)
 #[test]
-fn the_section_strip_fits_the_frame() {
+fn the_section_strip_width_is_pinned() {
     let sections: Vec<Box<dyn SettingsSection>> = vec![
         Box::new(AgentsSection::new()),
         Box::new(HierarchySection::new()),
@@ -1104,16 +1108,38 @@ fn the_section_strip_fits_the_frame() {
         Box::new(PersonasSection::new()),
         Box::new(SecretsSection::new()),
         Box::new(QueueSection::new()),
+        Box::new(ProjectTypesSection::new()),
     ];
-    assert_eq!(sections.len(), 10);
+    assert_eq!(sections.len(), 11);
     let width: usize = sections
         .iter()
         .map(|section| section.title().chars().count() + 2)
         .sum();
-    assert!(
-        width <= usize::from(SECTION_WIDE),
-        "the section strip is {width} columns and the frame is {SECTION_WIDE}"
-    );
+    assert_eq!(width, 102, "the strip's full width, for the doc above");
+    let titles: Vec<String> = sections
+        .iter()
+        .map(|section| section.title().to_owned())
+        .collect();
+    let mut registry = SettingsRegistry::new();
+    for section in sections {
+        registry.register(section);
+    }
+    for title in &titles {
+        let mut terminal =
+            Terminal::new(TestBackend::new(SECTION_BORDERED, 1)).expect("a test terminal");
+        terminal
+            .draw(|frame| render_strip(frame, frame.area(), &registry, &Theme::monochrome()))
+            .expect("the strip draws");
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..SECTION_BORDERED)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect();
+        assert!(
+            row.contains(&format!(" {title} ")),
+            "with {title} active the {SECTION_BORDERED}-column strip reads {row:?}"
+        );
+        registry.cycle_next();
+    }
 }
 
 // -------------------------------------------------------------------------------------------
