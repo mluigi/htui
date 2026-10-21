@@ -156,6 +156,8 @@ pub struct Transcript {
     rendered: std::cell::Cell<usize>,
     /// Height the last render was given, for the same reason.
     height: std::cell::Cell<usize>,
+    /// The first line the last render drew: the scrollbar's offset (MOD-115 M3 D5).
+    first: std::cell::Cell<usize>,
     /// The agent-side session id, taken from the banner rather than rendered as a row.
     session_ref: Option<AgentSessionRef>,
 }
@@ -524,7 +526,15 @@ impl Transcript {
             Scroll::Tail => lines.len().saturating_sub(height),
             Scroll::At(line) => line.min(lines.len().saturating_sub(1)),
         };
+        self.first.set(first);
         lines.into_iter().skip(first).take(height).collect()
+    }
+
+    /// The scrollbar's numbers as of the last [`Transcript::lines`] (MOD-115 M3 D5): every line
+    /// the rows rendered to, and the first one drawn.
+    #[must_use]
+    pub fn scroll_position(&self) -> (usize, usize) {
+        (self.rendered.get(), self.first.get())
     }
 
     /// One row's lines; a folded thought names `unfold` ([`Transcript::lines`]).
@@ -1054,8 +1064,13 @@ mod tests {
             tail[2].to_string()
         );
 
+        // MOD-115 M3 D5: the scrollbar's numbers are the last render's, every line and the first
+        // one drawn.
+        assert_eq!(transcript.scroll_position(), (10, 7));
+
         transcript.on_act(Act::ChatTop);
         let top = transcript.lines(3, &theme, Some("t"));
+        assert_eq!(transcript.scroll_position(), (10, 0));
         assert!(
             top[0].to_string().contains("end_turn"),
             "`g` goes to the first line: {:?}",

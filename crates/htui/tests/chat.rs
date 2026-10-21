@@ -627,13 +627,14 @@ fn stable_step() -> insta::Settings {
     settings
 }
 
-/// The transcript area of a rendered frame: everything between the tab's header line and its
-/// bottom border. Three lines of chrome above (the header row, the block border, the tab's own
-/// header) and one below (the block border, which carries the hints), all fixed by the layout —
-/// which is exactly why the live and the replayed body can be compared line for line.
+/// The transcript area of a rendered frame: everything between the pane's top border and its
+/// bottom one. Two lines of chrome above (the shell's header row, the top border, which carries
+/// the session as the pane's title since MOD-115 M3 D5) and one below (the bottom border, which
+/// carries the hints), all fixed by the layout — which is exactly why the live and the replayed
+/// body can be compared line for line.
 fn body_lines(render: &str) -> Vec<&str> {
     let lines: Vec<&str> = render.lines().collect();
-    lines[3..lines.len() - 1].to_vec()
+    lines[2..lines.len() - 1].to_vec()
 }
 
 /// A shell over the demo fixture with a Chat tab and nothing running in it.
@@ -2093,6 +2094,37 @@ async fn the_composer_hint_shows_while_composing() {
     assert_eq!(composer_row(&frame), "> _", "{frame}");
 }
 
+/// MOD-115 M3 MD-A: a rebound `[field] cancel` is the composer's way out, as its hint says. The
+/// composer reads the canonical `Esc` the shell turns the chord into, so the chord is not passed
+/// on to the shell as a CONTROL chord would be.
+#[tokio::test]
+async fn a_rebound_field_cancel_leaves_the_composer_and_is_named() {
+    let keys = htui::keys::load_str("version = 2\n[field]\ncancel = \"ctrl-o\"\n")
+        .expect("the key file loads");
+    let (mut harness, _) = harness_over(Script::default(), Transport::Acp, |harness| {
+        harness.with_keys(keys)
+    })
+    .await;
+    harness.key("i");
+    harness.key("h");
+    let frame = harness.render();
+    assert_eq!(hint_row(&frame), "Enter send · Ctrl+o leave", "{frame}");
+    assert_eq!(composer_row(&frame), "> h_", "{frame}");
+
+    harness.key("ctrl-o");
+    let frame = harness.render();
+    assert_eq!(
+        composer_row(&frame),
+        "",
+        "`ctrl-o` left the composer: {frame}"
+    );
+    assert_eq!(
+        hint_row(&frame),
+        "i compose the first prompt · a next agent",
+        "{frame}"
+    );
+}
+
 /// MOD-67 M5 (D12, PA-4): an open composer is `CAPTURE`. The status line drops `q quit`, `?` is
 /// text, and `F1` opens the box (the composer used to swallow it) and closes it again over a
 /// composer that keeps its text.
@@ -2342,7 +2374,7 @@ async fn a_rebound_thoughts_key_folds_and_t_is_inert() {
 
 /// MOD-67 M5 R1 M1 (a): the replay resolves `CHAT_REPLAY` first and swallows a plain `i`, `a`,
 /// `Enter` or digit only when no act of the replay's own took it. `[common] back = ["i"]` leaves
-/// the replay on `i`, and its header names that key.
+/// the replay on `i`, and its hint names that key (MOD-115 M3 D5: the title no longer does).
 #[tokio::test]
 async fn a_back_rebound_onto_i_leaves_the_replay() {
     let keys = htui::keys::load_str("version = 1\n[common]\nback = [\"i\"]\n")
@@ -2354,7 +2386,8 @@ async fn a_back_rebound_onto_i_leaves_the_replay() {
     harness.settle().await;
     replay(&mut harness, ids::STEP_PLAN).await;
     let frame = harness.render();
-    assert!(frame.contains("read-only · i leave"), "{frame}");
+    assert!(frame.contains("read-only"), "{frame}");
+    assert!(hint_row(&frame).starts_with("i leave replay"), "{frame}");
 
     harness.key("i");
     harness.drive().await;
