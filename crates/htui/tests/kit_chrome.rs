@@ -10,6 +10,8 @@
 
 mod token_scan;
 
+use std::path::Path;
+
 use token_scan::{aliases, relative, sites, sites_except, sources, src_root};
 
 /// The idents that build a frame by hand.
@@ -108,24 +110,33 @@ fn violations_in(name: &str, src: &str) -> Vec<usize> {
     sites_except(src, &needles, &[], own_block(name))
 }
 
-/// The files the guard reads, relative to `src/`: all of them.
-fn scanned_names() -> Vec<String> {
-    sources(&src_root())
-        .iter()
-        .map(|path| relative(path))
-        .collect()
+/// `path` relative to `root`, with `/` separators.
+fn name_under(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .expect("under the scanned root")
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
-/// Every `src/<path>:<line>` site, with the file it is in.
-fn scanned() -> Vec<(String, usize)> {
+/// Every frame-building site in every `.rs` file under `root` (all of them, RV1 L7), as the file
+/// relative to `root` and the line.
+fn scan(root: &Path) -> Vec<(String, usize)> {
     let mut found = Vec::new();
-    for name in scanned_names() {
-        let src = std::fs::read_to_string(src_root().join(&name)).expect("a readable source");
+    for path in sources(root) {
+        let name = name_under(root, &path);
+        let src = std::fs::read_to_string(&path).expect("a readable source");
         for line in violations_in(&name, &src) {
             found.push((name.clone(), line));
         }
     }
     found
+}
+
+/// Every `src/<path>:<line>` site, with the file it is in.
+fn scanned() -> Vec<(String, usize)> {
+    scan(&src_root())
 }
 
 #[test]
@@ -285,11 +296,30 @@ fn an_aliased_frame_is_still_a_frame() {
 /// RV1 L7: the guard reads every file under `src/`, not only `ui/` and `app/`.
 #[test]
 fn the_guard_reads_all_of_src() {
+    // A tree shaped like `src`, with a frame at the root, one in a tree other than `ui/` and
+    // `app/`, and one under `ui/` for contrast: the scan reports all three.
+    let root = tempfile::tempdir().expect("a throwaway source tree");
+    let frame = "fn a() {}\nfn b() { let _ = Block::bordered(); }\n";
+    for name in ["main.rs", "store/sync.rs", "ui/view.rs"] {
+        let path = root.path().join(name);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("a writable tree");
+        std::fs::write(&path, frame).expect("a writable source");
+    }
+    let found = scan(root.path());
+    assert_eq!(
+        found,
+        [
+            ("main.rs".to_owned(), 2),
+            ("store/sync.rs".to_owned(), 2),
+            ("ui/view.rs".to_owned(), 2),
+        ],
+        "a frame outside `ui/` and `app/` is reported too"
+    );
+    // The real `src` is read through the same scan, and has files outside the two trees.
     let names: Vec<String> = sources(&src_root())
         .iter()
         .map(|path| relative(path))
         .collect();
-    assert_eq!(scanned_names(), names, "every source file is scanned");
     assert!(names.iter().any(|name| name == "main.rs"), "{names:?}");
 }
 
