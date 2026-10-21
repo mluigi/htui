@@ -3,8 +3,7 @@ source: crates/htui/tests/hierarchy.rs
 expression: harness.render()
 ---
 Graphics   ¹Settings   0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys · ⌫ back
-┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
-│ Agents  Hierarchy                                                                                │
+╭─ Hierarchy ─────────────────────────────────────────────────────────────────── Agents  Hierarchy ╮
 │Graphics (graphics) — root on this box: unset                                                     │
 │  vulkan-tutorials  Vulkan Tutorials                                                              │
 │                                                                                                  │
@@ -31,4 +30,5 @@ Graphics   ¹Settings   0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9 
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-└─j/k · N workspace · n project/repo · e edit · p primary · b path · i infer · d delete · r reload─┘
+│                                                                                                  │
+╰─j/k · N workspace · n project/repo · e edit · p primary · b path · i infer · d delete · r reload─╯
