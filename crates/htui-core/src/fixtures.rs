@@ -735,6 +735,7 @@ fn projects() -> Vec<Project> {
             slug: (*slug).to_owned(),
             name: (*name).to_owned(),
             description: (*description).to_owned(),
+            project_type: seed::DEFAULT_PROJECT_TYPE.to_owned(),
             secret_provider: None,
             secret_scope: None,
             settings: json!({

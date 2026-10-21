@@ -119,8 +119,9 @@ pub use document::{Document, DocumentHead, NewDocument, ResolvedInput};
 pub use event::{EventKind, EventRole, SessionEvent};
 pub use hand_written::HandWrittenError;
 pub use hierarchy::{
-    NewProject, NewRepo, NewWorkspace, Project, ProjectPatch, ProjectRef, Repo, RepoBoxPath,
-    RepoPatch, Workspace, WorkspaceBoxPath, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
+    NewProject, NewRepo, NewWorkspace, Project, ProjectPatch, ProjectRef, ProjectType, Repo,
+    RepoBoxPath, RepoPatch, Workspace, WorkspaceBoxPath, WorkspacePatch, WorkspaceProject,
+    WorkspaceSummary,
 };
 pub use ids::{
     AgentId, BatchId, BoxId, CommandRunId, DocumentId, ItemId, ItemKindId, NoteId, PermissionId,

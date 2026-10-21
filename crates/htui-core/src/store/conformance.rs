@@ -43,6 +43,7 @@ use crate::model::{
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
 use crate::secret::{INFISICAL, SecretScope, project_scope};
+use crate::seed::{DEFAULT_PROJECT_TYPE, PROJECT_TYPES};
 use crate::store::error::StoreError;
 use crate::store::traits::{
     BLANK_PERSONA_BODY, BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT,
@@ -234,6 +235,8 @@ pub const CASES: &[&str] = &[
     "a_run_without_a_workspace_is_never_gated",
     "adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped",
     "a_deleted_workspace_unscopes_its_runs_and_drops_its_stop",
+    "project_types_are_the_six_builtins",
+    "a_new_project_is_software",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -635,6 +638,12 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         }
         "a_deleted_workspace_unscopes_its_runs_and_drops_its_stop" => {
             a_deleted_workspace_unscopes_its_runs_and_drops_its_stop(store).await;
+        }
+        "project_types_are_the_six_builtins" => {
+            project_types_are_the_six_builtins(store).await;
+        }
+        "a_new_project_is_software" => {
+            a_new_project_is_software(store).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -21302,6 +21311,152 @@ async fn queue_setting_refuses_a_foreign_key_and_a_bad_value_before_the_row<S: W
             .expect(CASE),
         None,
         "{CASE}: no refusal wrote an app row"
+    );
+}
+
+// MOD-146: the project type registry (plan D3-D5, D7)
+
+/// MOD-146 plan D3, D5: the registry is ANA-35 §7.4's six built-ins in slug byte order, as
+/// `seed::PROJECT_TYPES` spells them. The Postgres pin in `tests/migrations.rs` checks the
+/// migration's rows against the same constant.
+async fn project_types_are_the_six_builtins<S: WriteStore>(store: &S) {
+    const CASE: &str = "project_types_are_the_six_builtins";
+    let rows = store.project_types().await.expect(CASE);
+    assert_eq!(
+        rows.iter().map(|row| row.slug.as_str()).collect::<Vec<_>>(),
+        [
+            "docs",
+            "general",
+            "ops",
+            "research",
+            "software",
+            "workspace"
+        ],
+        "{CASE}: the six built-ins, in slug byte order"
+    );
+    assert_eq!(
+        rows.len(),
+        PROJECT_TYPES.len(),
+        "{CASE}: one row per built-in"
+    );
+    for (row, builtin) in rows.iter().zip(PROJECT_TYPES.iter()) {
+        assert_eq!(
+            (
+                row.slug.as_str(),
+                row.name.as_str(),
+                row.description.as_str(),
+                row.coding,
+                row.selectable,
+            ),
+            (
+                builtin.slug,
+                builtin.name,
+                builtin.description,
+                builtin.coding,
+                builtin.selectable,
+            ),
+            "{CASE}: `{}` is `seed::PROJECT_TYPES`' row",
+            builtin.slug
+        );
+        assert!(row.builtin, "{CASE}: `{}` is a built-in", row.slug);
+        assert_eq!(
+            (&row.seed, row.seed_version, row.created_by),
+            (&None, 1, None),
+            "{CASE}: `{}` carries no recipe, version 1 and no author",
+            row.slug
+        );
+        assert_eq!(
+            row.created_at, row.updated_at,
+            "{CASE}: `{}` was never edited",
+            row.slug
+        );
+    }
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.coding)
+            .map(|row| row.slug.as_str())
+            .collect::<Vec<_>>(),
+        ["software"],
+        "{CASE}: software alone is a coding type"
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| !row.selectable)
+            .map(|row| row.slug.as_str())
+            .collect::<Vec<_>>(),
+        ["workspace"],
+        "{CASE}: workspace alone is not offered for a new project"
+    );
+    assert_eq!(
+        store.project_types().await.expect(CASE),
+        rows,
+        "{CASE}: a second read answers the same rows"
+    );
+}
+
+/// MOD-146 plan D4: `NewProject` has no type, so a created project is `DEFAULT_PROJECT_TYPE`,
+/// reads back so and keeps it through an edit; the demo projects are `software` too.
+async fn a_new_project_is_software<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_new_project_is_software";
+    for id in [ids::PROJECT_HTUI, ids::PROJECT_AGY, ids::PROJECT_VULKAN] {
+        let project = store
+            .project(id)
+            .await
+            .expect(CASE)
+            .unwrap_or_else(|| panic!("{CASE}: the demo project {id:?} exists"));
+        assert_eq!(
+            project.project_type, DEFAULT_PROJECT_TYPE,
+            "{CASE}: the demo project `{}` is software",
+            project.slug
+        );
+    }
+
+    let created = store
+        .create_project(new_project("typed"))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        created.project_type, DEFAULT_PROJECT_TYPE,
+        "{CASE}: the created row answers the default type"
+    );
+    let read = store
+        .project(created.id)
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the created project reads back"));
+    assert_eq!(
+        read.project_type, DEFAULT_PROJECT_TYPE,
+        "{CASE}: the created project reads back as the default type"
+    );
+
+    let edited = applied(
+        CASE,
+        store
+            .update_project(
+                created.id,
+                created.updated_at,
+                ProjectPatch {
+                    name: Some("Typed".to_owned()),
+                    ..ProjectPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(edited.name, "Typed", "{CASE}: the edit applied");
+    assert_eq!(
+        edited.project_type, DEFAULT_PROJECT_TYPE,
+        "{CASE}: an edit keeps the type"
+    );
+
+    let types = store.project_types().await.expect(CASE);
+    let default = types
+        .iter()
+        .find(|row| row.slug == DEFAULT_PROJECT_TYPE)
+        .unwrap_or_else(|| panic!("{CASE}: the default type is a registry row"));
+    assert!(
+        default.selectable && default.coding,
+        "{CASE}: the default type is selectable and coding"
     );
 }
 

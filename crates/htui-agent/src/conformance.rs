@@ -1060,6 +1060,9 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
     async fn delete_persona(&self, id: htui_core::model::PersonaId) -> StoreResult<()> {
         self.inner.delete_persona(id).await
     }
+    async fn project_types(&self) -> StoreResult<Vec<htui_core::model::ProjectType>> {
+        self.inner.project_types().await
+    }
     async fn set_setting(
         &self,
         rung: SettingRung,
