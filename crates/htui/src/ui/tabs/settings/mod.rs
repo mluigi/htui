@@ -523,8 +523,10 @@ impl Tab for SettingsTab {
 
 /// Draws the section strip, the active one in `active_tab` (bold, underlined).
 ///
-/// A strip wider than `area` scrolls so that the active title ends inside it (MOD-146 F-1 (A));
-/// one that fits draws as it always did, from column 0.
+/// A strip whose active title would end past `area` scrolls so that it ends inside it (MOD-146
+/// F-1 (A)), behind a `theme.dim` `…` in column 0 that marks the cut (R1 L5); the scroll is
+/// counted against the columns right of the `…`, so the title stays whole. One whose active title
+/// fits draws as it always did, from column 0.
 pub fn render_strip(frame: &mut Frame<'_>, area: Rect, registry: &SettingsRegistry, theme: &Theme) {
     let active = registry.active_id();
     let titles = registry.titles();
@@ -542,6 +544,16 @@ pub fn render_strip(frame: &mut Frame<'_>, area: Rect, registry: &SettingsRegist
             Span::styled(format!(" {title} "), style)
         })
         .collect();
+    let mut area = area;
+    // A width of 1 has no room for both the `…` and a column of strip: it scrolls without one.
+    if active_end > usize::from(area.width) && area.width > 1 {
+        frame.render_widget(
+            Paragraph::new(Line::styled("\u{2026}", theme.dim)),
+            Rect { width: 1, ..area },
+        );
+        area.x += 1;
+        area.width -= 1;
+    }
     let offset =
         u16::try_from(active_end.saturating_sub(usize::from(area.width))).unwrap_or(u16::MAX);
     frame.render_widget(Paragraph::new(Line::from(spans)).scroll((0, offset)), area);
@@ -595,7 +607,8 @@ mod tests {
     }
 
     /// MOD-146 F-1 (A): a strip wider than its area scrolls so the active title ends inside it,
-    /// and one that fits draws from column 0 as it always did.
+    /// and one that fits draws from column 0 as it always did. A scrolled strip opens on a dim
+    /// `…` (MOD-146 R1 L5), so the cut reads as deliberate; the title still ends inside it.
     #[test]
     fn a_strip_wider_than_its_area_scrolls_to_the_active_section() {
         let mut tab = SettingsTab::with_sections(vec![
@@ -603,7 +616,11 @@ mod tests {
             Box::new(QdrantSection::new()),
         ]);
         // ` Connection ` and ` Qdrant `: 20 columns in all.
-        assert_eq!(strip_row(&tab.sections, 15), " Connection  Qd");
+        assert_eq!(
+            strip_row(&tab.sections, 15),
+            " Connection  Qd",
+            "an active title that fits is not scrolled to, and no `…` opens the row"
+        );
         assert_eq!(
             strip_row(&tab.sections, 40).trim_end(),
             " Connection  Qdrant"
@@ -611,7 +628,22 @@ mod tests {
         tab.sections.cycle_next();
         let narrow = strip_row(&tab.sections, 15);
         assert!(narrow.ends_with(" Qdrant "), "{narrow:?}");
-        assert_eq!(narrow, "ection  Qdrant ");
+        assert_eq!(narrow, "\u{2026}ction  Qdrant ");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(15, 1)).expect("terminal");
+        terminal
+            .draw(|frame| render_strip(frame, frame.area(), &tab.sections, &Theme::monochrome()))
+            .expect("the strip draws");
+        let ellipsis = &terminal.backend().buffer()[(0, 0)];
+        assert!(
+            ellipsis.modifier.contains(ratatui::style::Modifier::DIM),
+            "the `…` is theme.dim: {ellipsis:?}"
+        );
+        assert_eq!(
+            strip_row(&tab.sections, 9),
+            "\u{2026} Qdrant ",
+            "the `…` costs a column of the scroll, not of the active title"
+        );
         assert_eq!(
             strip_row(&tab.sections, 40).trim_end(),
             " Connection  Qdrant",
