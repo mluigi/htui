@@ -406,13 +406,14 @@ impl Rig {
 }
 
 /// Where `on this box` starts in a rendered row, behind `kit::list`'s gutter cell: the seven
-/// columns before it — MOD-2 D89's `name` 10, then 9, 12, 6, D76's `default` 21, `active` 6 and
+/// columns before it — MOD-2 D89's `name` 10, then 9, 12, 6, D76's `default` 21, `enabled` 6 and
 /// D73's `quota` 13 — plus one space of spacing after each.
 ///
 /// **D89 moved this by 2**, and the eighth column is now a fixed 13 rather than the one that
 /// absorbs the slack: `name` takes every spare column, so inside the Settings pane's border —
 /// where the section draws 98, one of them the gutter since MOD-115 M3 — `name` is 10 and
-/// everything after it starts where `enabled` becoming `active` in 6 puts it (MOD-81).
+/// everything after it starts where `enabled` in 6 puts it, its header starting in the gap
+/// before it (MOD-81).
 ///
 /// This file's progress cells never fitted the eighth column and still do not:
 /// `downloading 12.0 MB` is 19 against 13, and it exceeded the 15 the column drew before D89 as

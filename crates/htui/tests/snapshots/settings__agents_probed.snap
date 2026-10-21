@@ -2,7 +2,7 @@
 source: crates/htui/tests/settings.rs
 expression: rendered
 ---
- name         transport billing      models default               active quota         on this box
+ name         transport billing      models default              enabled quota         on this box
 ▌ready-on     ACP       subscription 0      —                     ● on   —             0.48.0
  ready-off    ACP       subscription 0      —                     ● on   —             0.48.0 (off)
  gone         ACP       subscription 0      —                     ● on   —             ✗ missing

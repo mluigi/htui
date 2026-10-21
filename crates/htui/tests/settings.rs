@@ -444,7 +444,7 @@ const HEADERS: [&str; 8] = [
     "billing",
     "models",
     "default",
-    "active",
+    "enabled",
     "quota",
     "on this box",
 ];
@@ -580,7 +580,8 @@ async fn the_default_column_holds_the_whole_model_id() {
 /// - `claude-cli` — the registry name MOD-2 milestone 8 adds, and the longest in the tree —
 ///   renders **whole** at 98. That is what the 10-cell minimum is for, and 10 is not a round
 ///   number: it is that name's length, with nothing to spare. Since MOD-115 M3 `kit::list`'s
-///   gutter costs one cell of the 98, and `active` (was `enabled`) gave it back (MOD-81).
+///   gutter costs one cell of the 98, and `enabled`'s header gave it back: it starts in the blank
+///   gap before its 6-cell column (MOD-81).
 /// - the verdict reads `⚠ needs login` (MOD-83, the maintainer's answer of 2026-10-21): 13 cells,
 ///   the column whole, where D89's `unauthenticated` (15) had clipped to `unauthenticat`. The
 ///   column stays 13 (D-18: never the donor again).
@@ -6480,7 +6481,7 @@ async fn at_80_columns_the_table_drops_models_and_billing_and_keeps_the_name() {
         "name",
         "transport",
         "default",
-        "active",
+        "enabled",
         "quota",
         "on this box",
     ] {
@@ -6491,6 +6492,93 @@ async fn at_80_columns_the_table_drops_models_and_billing_and_keeps_the_name() {
     }
     assert!(!frame.contains("subscription"), "{frame}");
     insta::assert_snapshot!("agents_80", frame);
+}
+
+/// MOD-115 M3 repair 2, finding 4: the registry switch's column is headed `enabled`, the word the
+/// create and edit forms use (`enabled (y/n)`), never `active`, which a row switched off on this
+/// box contradicts in its next cell. At the bordered 98 the header has no cell to spare: it starts
+/// in the blank gap before its 6-cell column (the `default` header leaves that gap empty), so
+/// `name` keeps 10 and the cells after it stay where they were.
+#[tokio::test]
+async fn the_registry_switch_is_headed_enabled_as_the_form_names_it() {
+    let bench = SectionBench::new().await;
+    let mut row = registry_row("vetoed", true);
+    row.user_off = true;
+    let mut section = section_over(&bench, vec![row]);
+    let rendered = render_section_at(&section, &bench.ctx(), SECTION_BORDERED);
+    let bordered = SECTION_BORDERED as usize;
+    let header = content(
+        rendered
+            .lines()
+            .next()
+            .expect("the table draws a header row"),
+    );
+    let column = default_at(bordered) + DEFAULT_WIDTH + 1;
+    assert_eq!(
+        header.chars().skip(column - 1).take(8).collect::<String>(),
+        "enabled ",
+        "the header starts in the gap before its column: {header}"
+    );
+    assert!(!header.contains("active"), "{header}");
+    assert_eq!(
+        cell_at(&rendered, "vetoed", bordered, column, 6),
+        "\u{25cf} on",
+        "and the cell sits in the column: {rendered}"
+    );
+    assert_eq!(
+        cell_at(&rendered, "vetoed", bordered, 0, name_width(bordered)),
+        "vetoed",
+        "{rendered}"
+    );
+    assert!(rendered.contains("switched off"), "{rendered}");
+
+    assert_eq!(bench.key(&mut section, "n"), Handled::Consumed);
+    let form = render_section(&section, &bench.ctx());
+    assert!(
+        form.contains("enabled (y/n)"),
+        "the form names the same switch: {form}"
+    );
+}
+
+/// MOD-115 M3 repair 2, finding 5 (D-18): a manual row whose probe found no login keeps its `*`.
+/// `⚠ needs login*` is 14 cells against the 13-cell `on this box`: wherever `name` has a cell past
+/// its 10 the column takes it and draws the cell whole; at the bordered 98, where it has none, the
+/// verdict gives up a letter and the `*` stays, so the idle note's `* manual path` still names a
+/// mark the table draws.
+#[tokio::test]
+async fn a_manual_row_that_needs_login_keeps_its_star() {
+    let bench = SectionBench::new().await;
+    let manual = paths_row_with(
+        "m-auth",
+        &["alpha_tool"],
+        &[("alpha_tool", tool_path("htui-mod66-alpha").as_str())],
+        ProbeSource::Manual,
+        ProbeStatus::Unauthenticated,
+    );
+    let section = section_over(&bench, vec![manual]);
+
+    let wide = render_section_at(&section, &bench.ctx(), 120);
+    assert!(
+        row_line(&wide, "m-auth")
+            .trim_end()
+            .ends_with("\u{26a0} needs login*"),
+        "a spare cell draws it whole: {wide}"
+    );
+    assert!(wide.contains("* manual path"), "{wide}");
+
+    let bordered = render_section_at(&section, &bench.ctx(), SECTION_BORDERED);
+    let line = row_line(&bordered, "m-auth").trim_end();
+    assert!(
+        line.ends_with("\u{26a0} needs log\u{2026}*"),
+        "no spare cell: the word gives way, the `*` stays: {bordered}"
+    );
+    let at = SECTION_BORDERED as usize;
+    assert_eq!(
+        cell_at(&bordered, "m-auth", at, 0, name_width(at)),
+        "m-auth",
+        "and `name` keeps its column: {bordered}"
+    );
+    assert!(bordered.contains("* manual path"), "{bordered}");
 }
 
 /// MOD-81: at the harness's 100 columns every column is drawn and `name` has its 10 cells,

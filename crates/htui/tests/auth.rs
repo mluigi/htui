@@ -35,13 +35,13 @@ use serde_json::{Value, json};
 const ROW: &str = "demo-login";
 
 /// Where `on this box` starts in a rendered row, behind `kit::list`'s gutter cell: the seven
-/// columns before it — MOD-2 D89's `name` 10, then 9, 12, 6, D76's `default` 21, `active` 6 and
+/// columns before it — MOD-2 D89's `name` 10, then 9, 12, 6, D76's `default` 21, `enabled` 6 and
 /// D73's `quota` 13 — plus one space of spacing after each.
 ///
 /// **D89 moved this by 2.** `name` became the table's flexible column and `on this box` became the
 /// donor that paid for it, fixed at [`ON_BOX_WIDTH`]. Inside the Settings pane's border the section
 /// draws 98, and since MOD-115 M3 the gutter takes one of them, so `name` draws 10 here only
-/// because `enabled` became `active` in 6 (MOD-81).
+/// because `enabled` draws in 6, its header starting in the gap before it (MOD-81).
 const ON_BOX_AT: usize = 84;
 
 /// How wide `on this box` draws since D89: 13 at every width, because it is no longer the column

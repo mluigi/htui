@@ -4,7 +4,7 @@ expression: probed
 ---
 Graphics   ¹Settings            0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
 ╭─ Agents ───────────────────────────────────────────────────────────────────────────────── Agents ╮
-│ name       transport billing      models default               active quota         on this box  │
+│ name       transport billing      models default              enabled quota         on this box  │
 │▌agy        ACP       subscription 11     gemini-3.7-flash-high ● on   —             ✗ missing    │
 │ claude     ACP       subscription 0      —                     ● on   —             ✗ missing    │
 │ claude-cli CLI       subscription 0      —                     ● on   —             ✗ missing    │

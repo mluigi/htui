@@ -2,7 +2,7 @@
 source: crates/htui/tests/settings.rs
 expression: rendered
 ---
- name         transport billing      models default               active quota         on this box
+ name         transport billing      models default              enabled quota         on this box
  agent-a      ACP       subscription 0      —                     ● on   —             not probed
 ▌agent-b      ACP       subscription 11     gemini-3.7-flash-high ● on   —             not probed
 

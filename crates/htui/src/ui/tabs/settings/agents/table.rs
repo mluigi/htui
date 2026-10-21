@@ -43,8 +43,11 @@ pub(super) const NEARLY_FULL: f64 = 99.0;
 pub(super) const SWITCHED_OFF: &str = "switched off";
 
 /// What the `on this box` cell appends when `probe.source` is `manual` (MOD-66 D10, the
-/// maintainer's answer to blueprint F-3). One character, so the 13-wide column keeps it on every
-/// verdict but `⚠ needs login`, which fills that column and is cut to make room.
+/// maintainer's answer to blueprint F-3). One character, so the 13-wide column keeps it beside
+/// every verdict but `⚠ needs login`, which fills that column: then the column takes a cell from
+/// `name` while `name` has one past [`NAME_MIN`], and where it has none the verdict gives up a
+/// letter rather than the mark (`⚠ needs log…*`, [`fit_on_box`]), so the idle note's
+/// [`MANUAL_NOTE`] never names a mark the table does not draw (repair 2, D-18).
 pub(super) const MANUAL_SUFFIX: &str = "*";
 
 /// What the idle note adds while any row's `probe.source` is `manual`: the key to
@@ -75,7 +78,9 @@ pub(super) enum Column {
     Models,
     /// The model id `docs/ANA-4.md` §4.4 selects by, 21 for `gemini-3.7-flash-high` (D76's #1).
     Default,
-    /// The registry switch, `● on`/`○ off`; 6 for its header, `active`.
+    /// The registry switch, `● on`/`○ off`: 6, one past `○ off`. Its header, `enabled` (the
+    /// form's own word for the flag), is 7 and starts in the blank gap before the column
+    /// ([`header_cells`]).
     Enabled,
     /// The tightest window, 13 for `100% to 09-08`.
     Quota,
@@ -103,10 +108,12 @@ impl Column {
 
     /// The header.
     ///
-    /// `enabled` reads `active` since MOD-115 M3: `kit::list`'s gutter took one cell of the 98,
-    /// and with every other column at its own longest string and `on this box` not the donor
-    /// (D-18), the one cell `name` needed for its 10 came from this header, whose cells now read
-    /// `● on`/`○ off` in 5.
+    /// `enabled` is one cell wider than its column since MOD-115 M3: `kit::list`'s gutter took one
+    /// cell of the 98, and with every other column at its own longest string and `on this box`
+    /// not the donor (D-18), the one cell `name` needed for its 10 came from this column, whose
+    /// cells read `● on`/`○ off` in 5. The header keeps the word the create and edit forms use
+    /// (`enabled (y/n)`) and borrows the gap before it ([`header_cells`]); `active` would claim the
+    /// agent is live on this box, which a row switched off here contradicts in its next cell.
     pub(super) const fn header(self) -> &'static str {
         match self {
             Self::Name => "name",
@@ -114,7 +121,7 @@ impl Column {
             Self::Billing => "billing",
             Self::Models => "models",
             Self::Default => "default",
-            Self::Enabled => "active",
+            Self::Enabled => "enabled",
             Self::Quota => "quota",
             Self::OnBox => "on this box",
         }
@@ -159,6 +166,64 @@ fn name_room(width: u16, shown: &[Column]) -> u16 {
     let fixed: u16 = shown.iter().filter_map(|column| column.width()).sum();
     let gaps = u16::try_from(shown.len().saturating_sub(1)).unwrap_or(u16::MAX);
     width.saturating_sub(fixed.saturating_add(gaps))
+}
+
+/// Lends `on this box` one of `name`'s cells while `name` has one past [`NAME_MIN`]: for a manual
+/// row whose verdict fills the column, so `⚠ needs login*` draws whole (D-18, repair 2). A table
+/// with no such row keeps D89's rule, every spare cell to `name`.
+fn lend_on_box_a_cell(columns: &mut [(Column, u16)]) {
+    let Some(name) = columns
+        .iter()
+        .position(|(column, width)| *column == Column::Name && *width > NAME_MIN)
+    else {
+        return;
+    };
+    let Some(on_box) = columns
+        .iter()
+        .position(|(column, _)| *column == Column::OnBox)
+    else {
+        return;
+    };
+    columns[name].1 -= 1;
+    columns[on_box].1 += 1;
+}
+
+/// The header cells of `columns`: each header in its column, but for one a cell wider than its
+/// column (`enabled` over the 6-cell [`Column::Enabled`]), which starts one cell early, in the gap
+/// before it, when the header before it leaves its own last cell blank. The cells after it keep
+/// their places, so every header still starts over its column or the gap just before it.
+fn header_cells(columns: &[(Column, u16)]) -> Vec<(&'static str, u16)> {
+    let mut headers: Vec<(&'static str, u16)> = columns
+        .iter()
+        .map(|&(column, width)| (column.header(), width))
+        .collect();
+    for index in 1..headers.len() {
+        let (before, width_before) = headers[index - 1];
+        let (header, width) = headers[index];
+        if cells::cell_width(header) == usize::from(width) + 1
+            && cells::cell_width(before) < usize::from(width_before)
+        {
+            headers[index - 1].1 -= 1;
+            headers[index].1 += 1;
+        }
+    }
+    headers
+}
+
+/// An `on this box` cell fitted to its `width`: a `starred` (manual) verdict keeps its
+/// [`MANUAL_SUFFIX`] and gives up the verdict's last cells for it (`⚠ needs log…*`), since the
+/// idle note's [`MANUAL_NOTE`] promises the mark; every other cell is `table_line`'s to fit.
+#[must_use]
+fn fit_on_box(cell: &str, starred: bool, width: u16) -> String {
+    if !starred {
+        return cell.to_owned();
+    }
+    let star = cells::cell_width(MANUAL_SUFFIX);
+    let width = usize::from(width);
+    if cells::cell_width(cell) + star <= width || width <= star {
+        return format!("{cell}{MANUAL_SUFFIX}");
+    }
+    format!("{}{MANUAL_SUFFIX}", cells::fit(cell, width - star))
 }
 
 /// One table line: each cell fitted to its column (`cells::fit`: padded, or cut with `…`), one
@@ -234,27 +299,29 @@ impl AgentsSection {
     ///
     /// A `manual` row's verdict ends in `*`, whatever it is (MOD-66 D10, B17): the status word or
     /// the version, never the install, login, probing, switched-off or not-probed cells, which are
-    /// not the snapshot's verdict.
-    pub(super) fn on_box_cell(&self, summary: &AgentSummary, theme: &Theme) -> (String, Style) {
+    /// not the snapshot's verdict. Answered in parts, the cell without its [`MANUAL_SUFFIX`], its
+    /// style and whether the suffix follows, so the table keeps the mark when it fits the cell to
+    /// its column ([`fit_on_box`]).
+    fn on_box_parts(&self, summary: &AgentSummary, theme: &Theme) -> (String, Style, bool) {
         if let Some(cell) = self.install_cell(summary.agent.id) {
-            return (cell, theme.dim);
+            return (cell, theme.dim, false);
         }
         // Beside the install and for its reason: a login this section is running is the one thing
         // on screen the user is waiting on, and it outlasts every other answer here.
         if let Some(cell) = self.auth_cell(summary.agent.id) {
-            return (cell, theme.dim);
+            return (cell, theme.dim, false);
         }
         if self.probing {
-            return (PROBING.to_owned(), theme.dim);
+            return (PROBING.to_owned(), theme.dim, false);
         }
         if summary.user_off {
-            return (SWITCHED_OFF.to_owned(), theme.dim);
+            return (SWITCHED_OFF.to_owned(), theme.dim, false);
         }
         let Some(row) = summary.on_box.as_ref() else {
-            return (NOT_PROBED.to_owned(), theme.dim);
+            return (NOT_PROBED.to_owned(), theme.dim, false);
         };
         if row.probed_at.is_none() && row.probe.is_none() {
-            return (NOT_PROBED.to_owned(), theme.dim);
+            return (NOT_PROBED.to_owned(), theme.dim, false);
         }
         let status = row
             .probe
@@ -283,15 +350,11 @@ impl AgentsSection {
             };
             (cell, theme.dim)
         };
-        if is_manual(row) {
-            (format!("{cell}{MANUAL_SUFFIX}"), style)
-        } else {
-            (cell, style)
-        }
+        (cell, style, is_manual(row))
     }
 
     /// Whether any listed row's cell shows `*`: the idle note then says what it means (MOD-66,
-    /// the amendment to blueprint §5). Only a star [`on_box_cell`](Self::on_box_cell) can draw
+    /// the amendment to blueprint §5). Only a star [`on_box_parts`](Self::on_box_parts) can draw
     /// counts (review N1): none while `probing` covers every cell, and none on a row switched off
     /// here, whose cell reads `switched off`. The install and login cells need no test: the note
     /// is the idle one, so neither is running.
@@ -334,7 +397,10 @@ impl AgentsSection {
                     }
                 }
                 Column::Quota => (quota_cell(summary), theme.dim),
-                Column::OnBox => self.on_box_cell(summary, theme),
+                Column::OnBox => {
+                    let (cell, style, starred) = self.on_box_parts(summary, theme);
+                    (fit_on_box(&cell, starred, width), style)
+                }
             };
             (text, width, style)
         }))
@@ -358,11 +424,19 @@ impl AgentsSection {
             return (self.agents.len(), 0, 0);
         }
         let width = area.width - 1;
-        let columns = columns(width);
+        let mut columns = columns(width);
+        if self.agents.iter().any(|summary| {
+            let (cell, _, starred) = self.on_box_parts(summary, theme);
+            starred
+                && cells::cell_width(&cell) + cells::cell_width(MANUAL_SUFFIX)
+                    > Column::OnBox.width().map_or(0, usize::from)
+        }) {
+            lend_on_box_a_cell(&mut columns);
+        }
         let header = table_line(
-            columns
-                .iter()
-                .map(|&(column, width)| (column.header().to_owned(), width, theme.title)),
+            header_cells(&columns)
+                .into_iter()
+                .map(|(header, width)| (header.to_owned(), width, theme.title)),
         );
         frame
             .buffer_mut()
@@ -391,7 +465,7 @@ impl AgentsSection {
 }
 
 /// Whether an `agent_box` row's `probe.source` is `manual` (MOD-66 D10). Read by key, as
-/// [`AgentsSection::on_box_cell`] reads `status`, so a snapshot this build cannot parse whole is
+/// [`AgentsSection::on_box_parts`] reads `status`, so a snapshot this build cannot parse whole is
 /// still marked.
 pub(super) fn is_manual(row: &AgentBox) -> bool {
     row.probe
@@ -403,7 +477,7 @@ pub(super) fn is_manual(row: &AgentBox) -> bool {
 
 /// The `quota` column of one row (`R-TUI-8`, MOD-2 D73).
 ///
-/// Read off `agent_box.quota` the way [`AgentsSection::on_box_cell`] reads `probe.status`: **by
+/// Read off `agent_box.quota` the way [`AgentsSection::on_box_parts`] reads `probe.status`: **by
 /// key**, off a [`Value`]. That is what keeps this column free of the driver crate, and it is also
 /// `R-AGT-5` — nothing here is keyed on an agent's name, only on what its row says.
 ///
@@ -594,12 +668,40 @@ mod tests {
                 "name",
                 "transport",
                 "default",
-                "active",
+                "enabled",
                 "quota",
                 "on this box"
             ]
         );
         assert_eq!(narrow[0], (Column::Name, NAME_MIN));
+    }
+
+    /// Repair 2 (D-18): a manual verdict keeps its `*` at any width, giving up the verdict's last
+    /// cells for it; an unmarked cell is left to `table_line`.
+    #[test]
+    fn a_manual_verdict_keeps_its_star() {
+        let login = verdict(ProbeStatus::Unauthenticated);
+        assert_eq!(fit_on_box(&login, true, 14), "\u{26a0} needs login*");
+        assert_eq!(fit_on_box(&login, true, 13), "\u{26a0} needs log\u{2026}*");
+        assert_eq!(fit_on_box("0.48.0", true, 13), "0.48.0*");
+        assert_eq!(fit_on_box(&login, false, 13), login);
+    }
+
+    /// Repair 2 (finding 4): `enabled` starts in the gap before its column, taking the cell the
+    /// blank end of `default`'s header leaves; every header after it keeps its place.
+    #[test]
+    fn the_enabled_header_borrows_the_gap_before_it() {
+        let shown = columns(97);
+        let headers = header_cells(&shown);
+        for (index, ((column, width), (header, drawn))) in shown.iter().zip(&headers).enumerate() {
+            assert_eq!(*header, column.header());
+            let expected = match column {
+                Column::Default => width - 1,
+                Column::Enabled => width + 1,
+                _ => *width,
+            };
+            assert_eq!(*drawn, expected, "{index}: {column:?}");
+        }
     }
 
     /// D-18: every verdict the column can show fits its 13 cells, `⚠ needs login` exactly.
