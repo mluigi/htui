@@ -808,9 +808,8 @@ mod tests {
         assert!(active.modifier.contains(marked), "{active:?}");
         let other = &buffer[(at(" Qdrant ") + 1, 0)];
         assert_eq!(other.symbol(), "Q");
-        // The chip text is patched over the focused border's style (bold in monochrome), so
-        // only the underline sets the active chip apart from the dim others.
-        assert!(!other.modifier.contains(Modifier::UNDERLINED), "{other:?}");
+        // The others are neither, not even the focused border's bold (blueprint §4.1).
+        assert!(!other.modifier.intersects(marked), "{other:?}");
         assert!(other.modifier.contains(Modifier::DIM), "{other:?}");
         assert!(!active.modifier.contains(Modifier::DIM), "{active:?}");
     }

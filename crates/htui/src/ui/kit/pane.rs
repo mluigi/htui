@@ -157,6 +157,9 @@ impl<'a> Pane<'a> {
         }
         let buf = frame.buffer_mut();
 
+        // The chips and marks are patched over the border, bold when focused in monochrome: the
+        // border's bold is taken off all but the active chip, so only it reads bold (MOD-80 D5).
+        let faint = theme.dim.remove_modifier(Modifier::BOLD);
         let strip = chip_strip(area, &self.sub_tabs, self.active);
         let mut limit = area.right() - 1;
         let mut cut = false;
@@ -171,7 +174,7 @@ impl<'a> Pane<'a> {
             let label_style = if index == self.active {
                 theme.active_tab
             } else {
-                theme.dim
+                faint
             };
             let chip = Line::from(vec![
                 Span::raw(" "),
@@ -184,7 +187,7 @@ impl<'a> Pane<'a> {
         for (mark, glyph) in [(strip.before, BEFORE), (strip.after, AFTER)] {
             if let Some(rect) = mark {
                 limit = limit.min(rect.x);
-                buf.set_stringn(rect.x, rect.y, glyph, 1, theme.dim);
+                buf.set_stringn(rect.x, rect.y, glyph, 1, faint);
             }
         }
 
@@ -788,6 +791,48 @@ mod tests {
         );
         assert!(top.starts_with("╭──"), "{top}");
         assert!(!top.contains('…'), "no clipped title either: {top}");
+    }
+
+    /// MOD-80 D5 (MOD-115 M3 §4.1): on a focused pane's border, bold in monochrome, only the
+    /// active chip is bold; the other chips and the marks are dim, never bold.
+    #[test]
+    fn on_a_focused_border_only_the_active_chip_is_bold_without_colour() {
+        let theme = Theme::monochrome();
+        let area = Rect::new(0, 0, 80, 3);
+        let strip = chip_strip(area, &SECTIONS, 4);
+        let pane = Pane::new("")
+            .sub_tabs(&SECTIONS, 4)
+            .focus(Focus::Focused)
+            .accent(theme.tab_accent("settings"));
+        let (buffer, _) = draw(80, 3, &theme, pane);
+        for (index, chip) in strip.chips.iter().enumerate() {
+            if chip.width < 2 {
+                continue;
+            }
+            let label = &buffer[(chip.x + 1, 0)];
+            if index == 4 {
+                assert!(
+                    label.modifier.contains(Modifier::BOLD),
+                    "{index}: {label:?}"
+                );
+                assert!(
+                    !label.modifier.contains(Modifier::DIM),
+                    "{index}: {label:?}"
+                );
+            } else {
+                assert!(
+                    !label.modifier.contains(Modifier::BOLD),
+                    "{index}: {label:?}"
+                );
+                assert!(label.modifier.contains(Modifier::DIM), "{index}: {label:?}");
+            }
+        }
+        for mark in [strip.before, strip.after] {
+            let mark = mark.expect("both marks at active 4");
+            let cell = &buffer[(mark.x, 0)];
+            assert!(!cell.modifier.contains(Modifier::BOLD), "{mark:?}");
+            assert!(cell.modifier.contains(Modifier::DIM), "{mark:?}");
+        }
     }
 
     #[test]
