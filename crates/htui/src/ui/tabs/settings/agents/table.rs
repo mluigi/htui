@@ -210,20 +210,44 @@ fn header_cells(columns: &[(Column, u16)]) -> Vec<(&'static str, u16)> {
     headers
 }
 
-/// An `on this box` cell fitted to its `width`: a `starred` (manual) verdict keeps its
-/// [`MANUAL_SUFFIX`] and gives up the verdict's last cells for it (`⚠ needs log…*`), since the
-/// idle note's [`MANUAL_NOTE`] promises the mark; every other cell is `table_line`'s to fit.
+/// What one row's `on this box` cell says before it is fitted to its column
+/// ([`AgentsSection::on_box_parts`]): the cell without its [`MANUAL_SUFFIX`], its style, whether
+/// the suffix follows, and the probe verdict it reads, when it is one.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct OnBox {
+    /// The cell's words.
+    pub(super) text: String,
+    /// Its style.
+    pub(super) style: Style,
+    /// A `manual` row's verdict: [`MANUAL_SUFFIX`] follows.
+    pub(super) starred: bool,
+    /// The verdict `text` says (`⚠ needs login`), `None` for a version or any other cell.
+    pub(super) status: Option<ProbeStatus>,
+}
+
+/// An `on this box` cell fitted to its `width`, and whether it was drawn as its icon alone. A
+/// `starred` (manual) verdict keeps its [`MANUAL_SUFFIX`], since the idle note's [`MANUAL_NOTE`]
+/// promises the mark: a status verdict that does not fit beside it is its icon alone (`⚠*`, the
+/// maintainer's answer, MOD-115 M3 RV2 L5), whose word the idle note then says; a version gives
+/// up its last cells. Every other cell is `table_line`'s to fit.
 #[must_use]
-fn fit_on_box(cell: &str, starred: bool, width: u16) -> String {
-    if !starred {
-        return cell.to_owned();
+fn fit_on_box(cell: &OnBox, width: u16) -> (String, bool) {
+    if !cell.starred {
+        return (cell.text.clone(), false);
     }
     let star = cells::cell_width(MANUAL_SUFFIX);
     let width = usize::from(width);
-    if cells::cell_width(cell) + star <= width || width <= star {
-        return format!("{cell}{MANUAL_SUFFIX}");
+    if cells::cell_width(&cell.text) + star <= width || width <= star {
+        return (format!("{}{MANUAL_SUFFIX}", cell.text), false);
     }
-    format!("{}{MANUAL_SUFFIX}", cells::fit(cell, width - star))
+    if let Some(status) = cell.status {
+        let glyph = label::probe(status).glyph;
+        if cells::cell_width(glyph) + star <= width {
+            return (format!("{glyph}{MANUAL_SUFFIX}"), true);
+        }
+    }
+    let cut = cells::fit(&cell.text, width - star);
+    (format!("{cut}{MANUAL_SUFFIX}"), false)
 }
 
 /// One table line: each cell fitted to its column (`cells::fit`: padded, or cut with `…`), one
@@ -299,29 +323,34 @@ impl AgentsSection {
     ///
     /// A `manual` row's verdict ends in `*`, whatever it is (MOD-66 D10, B17): the status word or
     /// the version, never the install, login, probing, switched-off or not-probed cells, which are
-    /// not the snapshot's verdict. Answered in parts, the cell without its [`MANUAL_SUFFIX`], its
-    /// style and whether the suffix follows, so the table keeps the mark when it fits the cell to
-    /// its column ([`fit_on_box`]).
-    fn on_box_parts(&self, summary: &AgentSummary, theme: &Theme) -> (String, Style, bool) {
+    /// not the snapshot's verdict. Answered in parts ([`OnBox`]), so the table keeps the mark
+    /// when it fits the cell to its column ([`fit_on_box`]).
+    fn on_box_parts(&self, summary: &AgentSummary, theme: &Theme) -> OnBox {
+        let plain = |text: String| OnBox {
+            text,
+            style: theme.dim,
+            starred: false,
+            status: None,
+        };
         if let Some(cell) = self.install_cell(summary.agent.id) {
-            return (cell, theme.dim, false);
+            return plain(cell);
         }
         // Beside the install and for its reason: a login this section is running is the one thing
         // on screen the user is waiting on, and it outlasts every other answer here.
         if let Some(cell) = self.auth_cell(summary.agent.id) {
-            return (cell, theme.dim, false);
+            return plain(cell);
         }
         if self.probing {
-            return (PROBING.to_owned(), theme.dim, false);
+            return plain(PROBING.to_owned());
         }
         if summary.user_off {
-            return (SWITCHED_OFF.to_owned(), theme.dim, false);
+            return plain(SWITCHED_OFF.to_owned());
         }
         let Some(row) = summary.on_box.as_ref() else {
-            return (NOT_PROBED.to_owned(), theme.dim, false);
+            return plain(NOT_PROBED.to_owned());
         };
         if row.probed_at.is_none() && row.probe.is_none() {
-            return (NOT_PROBED.to_owned(), theme.dim, false);
+            return plain(NOT_PROBED.to_owned());
         }
         let status = row
             .probe
@@ -336,7 +365,7 @@ impl AgentsSection {
         ]
         .into_iter()
         .find(|verdict| status == Some(verdict.as_str()));
-        let (cell, style) = if let Some(status) = failed {
+        let (text, style) = if let Some(status) = failed {
             (
                 verdict(status),
                 label::tone_style(label::probe(status).tone, theme),
@@ -350,7 +379,12 @@ impl AgentsSection {
             };
             (cell, theme.dim)
         };
-        (cell, style, is_manual(row))
+        OnBox {
+            text,
+            style,
+            starred: is_manual(row),
+            status: failed,
+        }
     }
 
     /// Whether any listed row's cell shows `*`: the idle note then says what it means (MOD-66,
@@ -368,11 +402,15 @@ impl AgentsSection {
 
     /// One agent's row: its cells in `columns`' order, `name` in the base role (dim for a row
     /// the registry switches off) and the rest dim, but for the verdict's own tone.
+    /// `on_box` is the row's [`on_box_parts`](Self::on_box_parts), worked out once per row
+    /// ([`render_table`](Self::render_table), RV2 L3); `icons` collects the verdicts drawn as
+    /// their icon alone ([`fit_on_box`]).
     fn row(
-        &self,
         summary: &AgentSummary,
+        on_box: &OnBox,
         columns: &[(Column, u16)],
         theme: &Theme,
+        icons: &mut Vec<ProbeStatus>,
     ) -> Line<'static> {
         let agent = &summary.agent;
         let style = if agent.enabled { theme.base } else { theme.dim };
@@ -398,8 +436,14 @@ impl AgentsSection {
                 }
                 Column::Quota => (quota_cell(summary), theme.dim),
                 Column::OnBox => {
-                    let (cell, style, starred) = self.on_box_parts(summary, theme);
-                    (fit_on_box(&cell, starred, width), style)
+                    let (cell, icon) = fit_on_box(on_box, width);
+                    if icon
+                        && let Some(status) = on_box.status
+                        && !icons.contains(&status)
+                    {
+                        icons.push(status);
+                    }
+                    (cell, on_box.style)
                 }
             };
             (text, width, style)
@@ -412,23 +456,26 @@ impl AgentsSection {
     /// computed from 0 each time, as the `TableState` clone it replaces did, so the frame never
     /// depends on how often it was drawn.
     ///
-    /// Answers `(rows, rows shown, offset)`, for the pane's scrollbar.
-    pub(super) fn render_table(
-        &self,
-        frame: &mut Frame<'_>,
-        area: Rect,
-        ctx: &Ctx<'_>,
-    ) -> (usize, usize, usize) {
+    /// Answers what it drew ([`Drawn`]), for the pane's scrollbar and the idle note.
+    pub(super) fn render_table(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) -> Drawn {
         let theme = ctx.theme;
         if area.width < 2 || area.height == 0 {
-            return (self.agents.len(), 0, 0);
+            return Drawn {
+                total: self.agents.len(),
+                ..Drawn::default()
+            };
         }
         let width = area.width - 1;
         let mut columns = columns(width);
-        if self.agents.iter().any(|summary| {
-            let (cell, _, starred) = self.on_box_parts(summary, theme);
-            starred
-                && cells::cell_width(&cell) + cells::cell_width(MANUAL_SUFFIX)
+        // Once per row (RV2 L3): the column's width and the row's cell both read it.
+        let on_box: Vec<OnBox> = self
+            .agents
+            .iter()
+            .map(|summary| self.on_box_parts(summary, theme))
+            .collect();
+        if on_box.iter().any(|cell| {
+            cell.starred
+                && cells::cell_width(&cell.text) + cells::cell_width(MANUAL_SUFFIX)
                     > Column::OnBox.width().map_or(0, usize::from)
         }) {
             lend_on_box_a_cell(&mut columns);
@@ -447,21 +494,42 @@ impl AgentsSection {
             height: area.height - 1,
             ..area
         };
+        let mut icons = Vec::new();
         let rows: Vec<Row<'static>> = self
             .agents
             .iter()
-            .map(|summary| Row {
-                line: self.row(summary, &columns, theme),
+            .zip(&on_box)
+            .map(|(summary, on_box)| Row {
+                line: Self::row(summary, on_box, &columns, theme, &mut icons),
                 kind: RowKind::Item,
             })
             .collect();
-        let shown = usize::from(body.height).min(rows.len());
         let offset = self.cursor.map_or(0, |cursor| {
             list::scroll_into_view(cursor, 0, usize::from(body.height), rows.len())
         });
         list::render(frame, body, &rows, self.cursor, offset, ctx.accent(), theme);
-        (rows.len(), shown, offset)
+        Drawn {
+            total: rows.len(),
+            offset,
+            body,
+            icons,
+        }
     }
+}
+
+/// What [`AgentsSection::render_table`] drew: its rows in all, the first one shown, the rect
+/// they were drawn into (under the header), and the verdicts drawn as their icon alone, whose
+/// words the idle note says (RV2 L5).
+#[derive(Debug, Clone, Default)]
+pub(super) struct Drawn {
+    /// The table's rows.
+    pub(super) total: usize,
+    /// The first row shown.
+    pub(super) offset: usize,
+    /// The rows' rect, under the header.
+    pub(super) body: Rect,
+    /// The verdicts drawn as `⚠*`, each once.
+    pub(super) icons: Vec<ProbeStatus>,
 }
 
 /// Whether an `agent_box` row's `probe.source` is `manual` (MOD-66 D10). Read by key, as
@@ -676,15 +744,43 @@ mod tests {
         assert_eq!(narrow[0], (Column::Name, NAME_MIN));
     }
 
-    /// Repair 2 (D-18): a manual verdict keeps its `*` at any width, giving up the verdict's last
-    /// cells for it; an unmarked cell is left to `table_line`.
+    /// Repair 2 (D-18): a manual verdict keeps its `*` at any width; an unmarked cell is left to
+    /// `table_line`. RV2 L5 (the maintainer's answer): a status verdict that does not fit beside
+    /// its `*` is its icon alone (`⚠*`), never a cut word, and says so; a version that does not
+    /// fit still gives up its last cells.
     #[test]
     fn a_manual_verdict_keeps_its_star() {
-        let login = verdict(ProbeStatus::Unauthenticated);
-        assert_eq!(fit_on_box(&login, true, 14), "\u{26a0} needs login*");
-        assert_eq!(fit_on_box(&login, true, 13), "\u{26a0} needs log\u{2026}*");
-        assert_eq!(fit_on_box("0.48.0", true, 13), "0.48.0*");
-        assert_eq!(fit_on_box(&login, false, 13), login);
+        let status = |status: ProbeStatus| OnBox {
+            text: verdict(status),
+            style: Style::new(),
+            starred: true,
+            status: Some(status),
+        };
+        let login = status(ProbeStatus::Unauthenticated);
+        assert_eq!(
+            fit_on_box(&login, 14),
+            ("\u{26a0} needs login*".to_owned(), false)
+        );
+        assert_eq!(fit_on_box(&login, 13), ("\u{26a0}*".to_owned(), true));
+        let version = |text: &str| OnBox {
+            text: text.to_owned(),
+            style: Style::new(),
+            starred: true,
+            status: None,
+        };
+        assert_eq!(
+            fit_on_box(&version("0.48.0"), 13),
+            ("0.48.0*".to_owned(), false)
+        );
+        assert_eq!(
+            fit_on_box(&version("0.48.0-nightly-2026"), 13),
+            ("0.48.0-nigh\u{2026}*".to_owned(), false)
+        );
+        let unmarked = OnBox {
+            starred: false,
+            ..login
+        };
+        assert_eq!(fit_on_box(&unmarked, 13), (unmarked.text.clone(), false));
     }
 
     /// Repair 2 (finding 4): `enabled` starts in the gap before its column, taking the cell the

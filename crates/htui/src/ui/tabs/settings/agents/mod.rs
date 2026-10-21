@@ -67,6 +67,7 @@ mod form;
 mod table;
 
 use htui_agent::auth::loopback::{self, PASTE_MAX};
+use htui_agent::probe::ProbeStatus;
 use htui_core::model::{AgentId, AgentSummary, Scope};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -281,9 +282,10 @@ impl AgentsSection {
     /// The line under the pane (MOD-23 D245): the last outcome, else [`quota_note`] while the
     /// section is idle. A `None` note still takes its line, so the layout never changes height with
     /// it. While a `manual` row is listed, the idle note ends in [`MANUAL_NOTE`], the key to the
-    /// cell's `*` (MOD-66). The keys that shared the pane with it moved to the shell's hint row
-    /// (MOD-67 M6 T2).
-    fn note(&self, keys: &Keys) -> Option<String> {
+    /// cell's `*` (MOD-66), then the word of each verdict the table drew as its icon alone
+    /// (`icons`, `⚠*`: RV2 L5). The keys that shared the pane with it moved to the shell's hint
+    /// row (MOD-67 M6 T2).
+    fn note(&self, keys: &Keys, icons: &[ProbeStatus]) -> Option<String> {
         let idle = matches!(self.mode, Mode::Browse)
             && matches!(self.install, InstallState::Idle)
             && matches!(self.auth, AuthState::Idle);
@@ -294,7 +296,11 @@ impl AgentsSection {
                         .as_deref(),
                 );
                 if self.lists_a_manual_row() {
-                    format!("{note}{MANUAL_NOTE}")
+                    let words: String = icons
+                        .iter()
+                        .map(|status| format!(" \u{b7} {}", table::verdict(*status)))
+                        .collect();
+                    format!("{note}{MANUAL_NOTE}{words}")
                 } else {
                     note
                 }
@@ -1089,6 +1095,7 @@ impl SettingsSection for AgentsSection {
         .areas(area);
 
         self.scroll.set(None);
+        let mut icons = Vec::new();
         if self.unavailable.is_some() {
             empty::render(
                 frame,
@@ -1101,21 +1108,21 @@ impl SettingsSection for AgentsSection {
             let next = no_agents_next(ctx.keys());
             empty::render(frame, rows, NO_AGENTS, NextStep(&next), ctx.theme);
         } else {
-            let (total, shown, offset) = self.render_table(frame, rows, ctx);
-            if total > shown {
-                // Measured in the section's rows, the pane's whole inner height being its
-                // viewport: the rows the table could not show are what the bar travels over.
-                self.scroll.set(Some(ScrollSpan::new(
-                    usize::from(area.height) + total - shown,
-                    offset,
-                )));
+            let drawn = self.render_table(frame, rows, ctx);
+            if drawn.total > usize::from(drawn.body.height) {
+                // The table's rows, beside the rect they were drawn into (RV1 M2's span): the
+                // header over them and the pane and note under them do not scroll.
+                self.scroll.set(Some(
+                    ScrollSpan::new(drawn.total, drawn.offset).rows(drawn.body),
+                ));
             }
+            icons = drawn.icons;
         }
         let buf = frame.buffer_mut();
         for (y, line) in (under.y..under.bottom()).zip(&pane) {
             buf.set_line(under.x, y, line, under.width);
         }
-        if let Some(note) = self.note(ctx.keys())
+        if let Some(note) = self.note(ctx.keys(), &icons)
             && note_area.width > 1
         {
             // `settings/mod.rs`'s rule: a compare-and-set miss is the one notice to act on.

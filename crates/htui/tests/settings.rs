@@ -6562,8 +6562,8 @@ async fn the_registry_switch_is_headed_enabled_as_the_form_names_it() {
 /// MOD-115 M3 repair 2, finding 5 (D-18): a manual row whose probe found no login keeps its `*`.
 /// `⚠ needs login*` is 14 cells against the 13-cell `on this box`: wherever `name` has a cell past
 /// its 10 the column takes it and draws the cell whole; at the bordered 98, where it has none, the
-/// verdict gives up a letter and the `*` stays, so the idle note's `* manual path` still names a
-/// mark the table draws.
+/// cell is the icon and the `*` (`⚠*`, RV2 L5) and the idle note says the word, so the note's
+/// `* manual path` still names a mark the table draws.
 #[tokio::test]
 async fn a_manual_row_that_needs_login_keeps_its_star() {
     let bench = SectionBench::new().await;
@@ -6587,9 +6587,23 @@ async fn a_manual_row_that_needs_login_keeps_its_star() {
 
     let bordered = render_section_at(&section, &bench.ctx(), SECTION_BORDERED);
     let line = row_line(&bordered, "m-auth").trim_end();
+    // RV2 L5 (the maintainer's answer): no spare cell, the icon alone and its `*`, never a cut
+    // word; the word is the note's.
     assert!(
-        line.ends_with("\u{26a0} needs log\u{2026}*"),
-        "no spare cell: the word gives way, the `*` stays: {bordered}"
+        line.ends_with(" \u{26a0}*"),
+        "no spare cell: the icon and the `*`: {bordered}"
+    );
+    assert!(
+        !bordered.contains("needs log\u{2026}"),
+        "no word is cut: {bordered}"
+    );
+    assert!(
+        bordered.contains("* manual path \u{b7} \u{26a0} needs login"),
+        "the note names the icon: {bordered}"
+    );
+    assert!(
+        !wide.contains("manual path \u{b7} \u{26a0}"),
+        "a cell drawn whole needs no word in the note: {wide}"
     );
     let at = SECTION_BORDERED as usize;
     assert_eq!(
@@ -6774,12 +6788,14 @@ async fn a_long_table_reports_its_scroll_and_keeps_the_cursor_in_view() {
         panic!("40 rows do not fit 30");
     };
     assert_eq!(offset, 0, "the cursor starts on the first row");
-    // The header, the note and the 28 rows between them: 12 rows are left over.
-    assert_eq!(
-        total,
-        30 + 40 - 28,
-        "the section's height and the rows it could not show"
-    );
+    // RV2: the table's own rows, beside the 28 between the header and the note (RV1 M2's span),
+    // with no padding for the rows under them.
+    assert_eq!(total, 40, "the table's rows");
+    let body = section
+        .scroll()
+        .and_then(|span| span.rows)
+        .expect("the rows the table scrolls");
+    assert_eq!((body.y, body.height), (1, 28), "under the header: {body:?}");
 
     pressed(&bench, &mut section, "j", 39);
     let rendered = render_section(&section, &bench.ctx());
