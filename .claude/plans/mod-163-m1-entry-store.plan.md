@@ -4,7 +4,7 @@
 **Selected Milestone**: 1 — Entry store
 **Complexity**: Large (a new entity across the store seam: a migration, MemStore and PgStore, five
 forwarding implementors, conformance, project-delete reach; no UI or prompt change)
-**Status**: confirmed 2026-10-20 (D4 answered at CONFIRM: on a subject clash the person is asked: edit the existing entry, or replace it).
+**Status**: complete 2026-10-21 (confirmed 2026-10-20, D4 answered at CONFIRM: on a subject clash the person is asked: edit the existing entry, or replace it). T1-T4 and review-fix round R1 landed on `hr/MOD-163`; rust-reviewer: approve with fixes, R1 applied, deferrals below.
 
 ## Summary
 
@@ -250,3 +250,25 @@ scratch database, which was then dropped.
 | C10 `reach_parts` reads fields by name | **FALSE → amended** | `labelled()` `hierarchy.rs:729-794` destructures exhaustively into `[(u64,&str); 28]`; no insta snapshots, tests use `..Default` |
 | C11 `RequirementText` length-only `Debug` | TRUE | `requirements.rs:72, 88-94` (byte length) |
 | C12 `cargo sqlx prepare --workspace --check` | **FALSE → amended** | `.sqlx` is `crates/htui-store/.sqlx`; README:705-719 runs prepare from `crates/htui-store` |
+
+## Review outcome (rust-reviewer, 2026-10-21)
+
+Verdict **Approve with fixes**: no critical or high findings. Each finding was checked by its own
+adversarial verifier before any fix.
+
+| # | Finding | Verifier | Outcome |
+|---|---|---|---|
+| 1 | `MemoryText` did not record its cap; a body could be passed as a subject (Mem stores it, Pg refuses) | real, low | **Fixed (R1, `7e9ab951`)**: split into `MemorySubject` / `MemoryBody`, with `compile_fail` doctests |
+| 2 | Pg-only supersede/unknown-box refusal paths untested; duplicate-id check matched `Constraint(_)` only | real, low | **Fixed (R1, `c38a0ab3`)**: tests only; both stores already behaved |
+| 3 | `confirmed_at` vs `updated_at`: Pg strictly less after an amend, Mem equal | real, nit | **Documented + pinned (R1, `e7a14e11`)**: `confirmed_at <= updated_at`; carried to MOD-166 below |
+| 4 | Pg CAS `UPDATE` has no `AND version = $expected` | refuted (the row lock under READ COMMITTED decides; as `revise_requirement`) | Deferred hardening, below |
+| 5 | Early returns rely on the transaction's drop to roll back | refuted (the pattern of the other 36 transaction sites) | No change |
+| 6 | Fold doc overclaimed ASCII agreement (Turkic locales) | real, nit | **Fixed (R1, `e7a14e11`)** |
+| 7 | Refusal precedence differs between stores when several inputs are wrong | real, nit | **Documented (R1, `e7a14e11`, `91718de0`)**: refusals are not ordered across backends; `already_exists`, `memory_subject_taken` and `memory_entry_closed` have backend-independent text |
+| 8 | Nits: two `.expect()` in `mem.rs`, clones, `MemoryEdit` field names, `Eq` derives, no `CHECK (version >= 1)`, no `memory_entry_revision(box_id)` index | real, nit | Deferred, below |
+
+### Deferred (needs the maintainer's OK; proposed at M1 close-out)
+
+- **F4:** add the version predicate to the Pg memory `UPDATE`, plus a two-writer `tokio::join!` race test. This is hardening only, because the row lock already decides the compare-and-set. Take it when M2/M3 next touch `pg/write.rs`.
+- **F8 nits:** a check-free insert helper in `mem.rs` (removes the second `.expect()`), `apply_memory_edit(&MemoryEdit)`, `&[&str]` binding in `memory_entries`, one field name across both `MemoryEdit`s, `Eq` on `MemoryEntry`/`MemoryRevision`, `CHECK (version >= 1)` and a `memory_entry_revision(box_id)` index in a later migration (`requirement_revision` lacks both too).
+- **Carried to MOD-166:** freshness must not compare `confirmed_at` with `updated_at` for equality; Postgres makes `confirmed_at` strictly earlier after an amend.

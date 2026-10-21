@@ -519,7 +519,13 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   a later option, decided by MOD-169's measurement; until then the order is fixed. The TUI list is the
   memory sub-tab of the Workspaces tab (`R-TUI-14`), global entries and the switches in Settings
   (`R-TUI-8`). `R-ENT-13`, `R-PRM-1`/`R-PRM-3`, `R-ENT-12`, `R-TUI-8`, `R-TUI-14` and CONCEPTS are
-  amended (2026-10-20). Not blocked for project scope; "must".
+  amended (2026-10-20). Not blocked for project scope; "must". PRD
+  `.claude/prds/mod-163-memory-entry-store.prd.md` (Q1 dedicated table, Q2 interim pane in Settings, Q3
+  switch here, Q4 left-out line is a count only). **Phase M1 landed (`hr/MOD-163`, 2026-10-21):** entry
+  store: `memory_entry` and its revisions (migration 0020), `MemorySubject`/`MemoryBody` scrubbed and
+  capped at construction, create/amend/retire/supersede/list on MemStore and PgStore (the cache answers
+  none); a subject clash is refused naming the live entry, and M3 asks edit or replace. M2 (prompt
+  section) and M3 (TUI pane, switch) open; review deferrals in the M1 plan.
 - [ ] **MOD-164 - Automatic memory capture at run end** (from ANA-38, `docs/ANA-38.md` §7.2 P2, §4.6).
   `R-ENT-13`, `R-ID-6`, `R-ID-7`, `R-ORCH-1`. An extraction turn by the light model (MOD-126) over the run's
   own evidence (errors seen, retries, fixes, measured wins) writing entries with no person's acceptance,
