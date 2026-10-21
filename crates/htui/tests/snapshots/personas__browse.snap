@@ -2,6 +2,6 @@
 source: crates/htui/tests/personas.rs
 expression: frame
 ---
-architect · Designs the change before it is built, stud… · deny edit,delete,move · allow 0 · rules 0
-    allow all · disallowed none · command-run y · default inherit
-reviewer · Reviews the step's inputs and code for corre… · deny edit,delete,move · allow 0 · rules 0
+▌architect · Designs the change before it is built, stu… · deny edit,delete,move · allow 0 · rules 0
+     allow all · disallowed none · command-run y · default inherit
+ reviewer · Reviews the step's inputs and code for corr… · deny edit,delete,move · allow 0 · rules 0

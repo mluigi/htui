@@ -4,7 +4,6 @@ expression: frame
 ---
 no workspace   ¹Settings     0 working · 0 waiting · memory · no box ·  F9  about   ?  keys · ⌫ back
 ╭─ Kinds ──────────────────────────────────────────────────────────────── Agents  Hierarchy  Kinds ╮
-│no project in scope                                                                               │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -17,7 +16,8 @@ no workspace   ¹Settings     0 working · 0 waiting · memory · no box ·  F9 
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-│                                                                                                  │
+│                                        no project in scope                                       │
+│                                Settings › Hierarchy adds a project                               │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

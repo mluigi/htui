@@ -5,7 +5,7 @@ expression: frame
 no workspace     personas: store unreachable: this box browses its read-only cache and starts no run
 ╭─ Personas ───────────────────────────────────────────────────────────────────────────── Personas ╮
 │personas unavailable: store unreachable: this box browses its read-only cache and starts no run   │
-│                                                                                                  │
+│personas are not mirrored: they return once the store answers                                     │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
