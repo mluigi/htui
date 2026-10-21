@@ -289,8 +289,8 @@ mod tests {
     use super::*;
     use crate::ui::cells::cell_width;
 
-    /// `BudgetSource` has no generated `ALL`; this list is checked complete by the `match` below,
-    /// which stops compiling when a variant is added.
+    /// `BudgetSource` has no generated `ALL`, so this list is by hand. It is checked against
+    /// [`budget_source_after`], whose `match` stops compiling when a variant is added.
     const BUDGET_SOURCES: [BudgetSource; 4] = [
         BudgetSource::Phase,
         BudgetSource::Project,
@@ -298,12 +298,15 @@ mod tests {
         BudgetSource::AppSettingDefault,
     ];
 
-    const fn budget_source_is_listed(source: BudgetSource) -> bool {
+    /// The rung after `source`, in chain order. Walking it from `Phase` visits every variant, so
+    /// the walk is what [`BUDGET_SOURCES`] must equal. A new variant needs an arm here, and the
+    /// rung before it must name it.
+    const fn budget_source_after(source: BudgetSource) -> Option<BudgetSource> {
         match source {
-            BudgetSource::Phase
-            | BudgetSource::Project
-            | BudgetSource::AppSetting
-            | BudgetSource::AppSettingDefault => true,
+            BudgetSource::Phase => Some(BudgetSource::Project),
+            BudgetSource::Project => Some(BudgetSource::AppSetting),
+            BudgetSource::AppSetting => Some(BudgetSource::AppSettingDefault),
+            BudgetSource::AppSettingDefault => None,
         }
     }
 
@@ -417,14 +420,18 @@ mod tests {
 
     #[test]
     fn the_budget_source_hand_list_is_complete() {
-        assert!(BUDGET_SOURCES.iter().all(|s| budget_source_is_listed(*s)));
-        for (i, a) in BUDGET_SOURCES.iter().enumerate() {
-            assert!(!BUDGET_SOURCES[i + 1..].contains(a), "{a:?} listed twice");
+        let mut chain = vec![BudgetSource::Phase];
+        while let Some(next) = chain.last().copied().and_then(budget_source_after) {
+            assert!(!chain.contains(&next), "the chain loops at {next:?}");
+            chain.push(next);
         }
+        assert_eq!(BUDGET_SOURCES.as_slice(), chain.as_slice());
     }
 
+    /// D-4's "no label contains `_`" and "every multi-word value is relabelled" are one check: a
+    /// multi-word value is snake_case, so a label without `_` cannot be that value verbatim.
     #[test]
-    fn no_label_carries_an_underscore_and_every_multi_word_value_is_relabelled() {
+    fn no_label_carries_an_underscore_so_no_multi_word_value_shows_raw() {
         let mut every: Vec<(&str, &str, &str)> = Vec::new();
         for (name, table) in word_tables() {
             every.extend(table.into_iter().map(|(raw, label)| (name, raw, label)));
@@ -435,9 +442,6 @@ mod tests {
         for (name, raw, label) in every {
             assert!(!label.is_empty(), "{name}::{raw} has no label");
             assert!(!label.contains('_'), "{name}::{raw} shows {label:?}");
-            if raw.contains('_') {
-                assert_ne!(label, raw, "{name}::{raw} is not relabelled");
-            }
         }
     }
 
