@@ -4,21 +4,25 @@
 
 use std::collections::HashSet;
 
-use crate::model::{AgentId, GraphBody, PersonaId, Split, StepGraphId, StepGraphPhase};
+use crate::model::{
+    AgentId, EdgePredicate, GraphBody, PersonaId, Split, StepGraphEdge, StepGraphId, StepGraphPhase,
+};
 use crate::prompt::template::TemplateRole;
 use crate::store::traits::{
     already_exists, divide_columns_off_divide, edge_endpoint_outside_graph, edge_is_taken,
     edge_loop_limit_negative, edge_loops_to_itself, edge_needs_loop_limit, edge_predicate_mismatch,
     fan_out_below_one, max_parts_below_one, palette_phase_has_edges, parts_off_divide,
-    phase_name_is_taken, phase_part_key_is_taken, phase_position_is_taken, reserved_phase_name,
-    retry_limit_negative, row_names_another_graph, row_names_another_phase, split_fan_out_mismatch,
+    phase_name_is_taken, phase_part_key_is_taken, phase_position_is_taken,
+    phase_token_budget_refusal, reserved_phase_name, retry_limit_negative, row_names_another_graph,
+    row_names_another_phase, split_fan_out_mismatch,
 };
 
 /// D7's node CHECKs on one row: `ck_phase_split_fan_out`, then `ck_phase_divide_columns`, then
 /// `ck_phase_max_parts`; then 0001's column CHECKs `fan_out >= 1` and `retry_limit >= 0`, so
 /// `MemStore` never stores a row Postgres refuses (`Split::None` with `fan_out 0` passes
-/// `ck_phase_split_fan_out`). `None` when the row passes. `create_phase` and `replace_graph` call
-/// it.
+/// `ck_phase_split_fan_out`); then a `token_budget` below 1, which no CHECK refuses but
+/// `set_setting`'s `Phase` rung does ([`phase_token_budget_refusal`], review R1 B-L2). `None` when
+/// the row passes. `create_phase` and `replace_graph` call it.
 #[must_use]
 pub fn phase_row_refusal(phase: &StepGraphPhase) -> Option<String> {
     if (phase.split == Split::Compete) != (phase.fan_out > 1) {
@@ -47,7 +51,17 @@ pub fn phase_row_refusal(phase: &StepGraphPhase) -> Option<String> {
     if phase.retry_limit < 0 {
         return Some(retry_limit_negative(&phase.name, phase.retry_limit));
     }
-    None
+    phase.token_budget.and_then(phase_token_budget_refusal)
+}
+
+/// The predicate an edge carries, a JSON `null` read as none (review R1 B-L1): serde reads
+/// `Some(EdgePredicate(Value::Null))` back as `None`, so the topology rule judges an edge by this
+/// and both stores write this, never `jsonb 'null'`.
+#[must_use]
+pub fn edge_predicate(edge: &StepGraphEdge) -> Option<&EdgePredicate> {
+    edge.predicate
+        .as_ref()
+        .filter(|predicate| !predicate.0.is_null())
 }
 
 /// D10 step 3 (blueprint §T3.2): the body's own shape, before any store row is read. The first
@@ -158,7 +172,8 @@ pub fn graph_body_shape_refusal(graph: StepGraphId, body: &GraphBody) -> Option<
 ///
 /// - a. per edge, `from`, then `to`, not a node of the body ([`edge_endpoint_outside_graph`]
 ///   `"from_phase_id"` / `"to_phase_id"`);
-/// - b. per edge: [`edge_loops_to_itself`], [`edge_predicate_mismatch`],
+/// - b. per edge: [`edge_loops_to_itself`], [`edge_predicate_mismatch`] (a JSON `null`
+///   predicate is none, [`edge_predicate`]),
 ///   [`edge_loop_limit_negative`], [`edge_needs_loop_limit`];
 /// - c. an edge whose `(from, to, kind)` an earlier edge holds ([`edge_is_taken`]);
 /// - d. per node, [`phase_row_refusal`];
@@ -178,7 +193,7 @@ pub fn graph_body_topology_refusal(graph: StepGraphId, body: &GraphBody) -> Opti
         if edge.from == edge.to {
             return Some(edge_loops_to_itself(edge.id));
         }
-        if edge.predicate.is_some() != edge.kind.takes_predicate() {
+        if edge_predicate(edge).is_some() != edge.kind.takes_predicate() {
             return Some(edge_predicate_mismatch(edge.id, edge.kind));
         }
         match edge.loop_limit {
@@ -289,8 +304,8 @@ mod tests {
     use chrono::Utc;
 
     use super::{
-        body_agent_refs, body_persona_refs, graph_body_shape_refusal, graph_body_topology_refusal,
-        phase_row_refusal,
+        body_agent_refs, body_persona_refs, edge_predicate, graph_body_shape_refusal,
+        graph_body_topology_refusal, phase_row_refusal,
     };
     use crate::model::{
         AgentId, CommandQueue, EdgeId, EdgeKind, EdgePredicate, Gate, GraphBody, GraphScope,
@@ -304,7 +319,9 @@ mod tests {
         phase_part_key_is_taken, phase_position_is_taken, reserved_phase_name,
         row_names_another_graph, row_names_another_phase, split_fan_out_mismatch,
     };
-    use crate::store::traits::{fan_out_below_one, retry_limit_negative};
+    use crate::store::traits::{
+        fan_out_below_one, phase_token_budget_refusal, retry_limit_negative,
+    };
 
     fn phase(split: Split, fan_out: i32) -> StepGraphPhase {
         StepGraphPhase {
@@ -465,6 +482,33 @@ mod tests {
             Some("phase `implement` has retry_limit -1; a retry limit is 0 or more")
         );
         row.retry_limit = 0;
+        assert_eq!(phase_row_refusal(&row), None);
+    }
+
+    /// Review R1 B-L2: a `token_budget` below 1 is refused in `set_setting`'s `Phase`-rung
+    /// sentence, after the CHECK rules; none, or 1 and up, passes.
+    #[test]
+    fn token_budget_is_at_least_one() {
+        assert_eq!(
+            phase_token_budget_refusal(0).as_deref(),
+            Some("`token_budget` = 0 is outside 1..=2147483647 tokens"),
+            "set_setting's Phase rung words it so"
+        );
+        assert_eq!(phase_token_budget_refusal(1), None);
+        assert_eq!(phase_token_budget_refusal(i32::MAX), None);
+        let mut row = phase(Split::None, 1);
+        row.token_budget = Some(-1);
+        assert_eq!(phase_row_refusal(&row), phase_token_budget_refusal(-1));
+        row.retry_limit = -1;
+        assert_eq!(
+            phase_row_refusal(&row),
+            Some(retry_limit_negative("implement", -1)),
+            "after 0001's CHECKs"
+        );
+        row.retry_limit = 0;
+        row.token_budget = Some(1);
+        assert_eq!(phase_row_refusal(&row), None);
+        row.token_budget = None;
         assert_eq!(phase_row_refusal(&row), None);
     }
 
@@ -810,6 +854,19 @@ mod tests {
                 EdgeKind::Next
             ))
         );
+
+        // Review R1 B-L1: a JSON `null` predicate is none, on an `if` edge and on any other.
+        let mut null_if = body.clone();
+        null_if.edges[0].kind = EdgeKind::If;
+        null_if.edges[0].predicate = Some(EdgePredicate(serde_json::Value::Null));
+        assert_eq!(edge_predicate(&null_if.edges[0]), None);
+        assert_eq!(
+            graph_body_topology_refusal(graph, &null_if),
+            Some(edge_predicate_mismatch(null_if.edges[0].id, EdgeKind::If))
+        );
+        let mut null_next = body.clone();
+        null_next.edges[0].predicate = Some(EdgePredicate(serde_json::Value::Null));
+        assert_eq!(graph_body_topology_refusal(graph, &null_next), None);
 
         let mut negative = body.clone();
         negative.edges[2].loop_limit = Some(-1);

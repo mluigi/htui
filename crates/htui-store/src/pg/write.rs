@@ -73,9 +73,9 @@ use htui_core::store::{
     withdrawn_requirement_cited,
 };
 use htui_core::store::{
-    body_agent_refs, body_persona_refs, graph_body_shape_refusal, graph_body_topology_refusal,
-    graph_name_is_taken, override_outside_project, phase_name_is_taken, phase_position_is_taken,
-    phase_row_refusal,
+    body_agent_refs, body_persona_refs, edge_predicate, graph_body_shape_refusal,
+    graph_body_topology_refusal, graph_name_is_taken, override_outside_project,
+    phase_name_is_taken, phase_position_is_taken, phase_row_refusal,
 };
 use serde_json::Value;
 use sqlx::types::Json;
@@ -1150,7 +1150,8 @@ pub(super) async fn insert_edge<'e, E: PgExecutor<'e>>(
         edge.from.as_uuid(),
         edge.to.as_uuid(),
         edge.kind.as_str(),
-        edge.predicate.as_ref().map(|predicate| &predicate.0),
+        // Review R1 B-L1: a JSON `null` predicate is SQL `NULL`, never `jsonb 'null'`.
+        edge_predicate(edge).map(|predicate| &predicate.0),
         edge.loop_limit,
     )
     .execute(executor)

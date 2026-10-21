@@ -62,9 +62,10 @@ use crate::store::traits::{
     step_writes_own_item, withdrawn_requirement_cited,
 };
 use crate::store::traits::{
-    divide_columns_off_divide, edge_endpoint_outside_graph, fan_out_below_one, graph_name_is_taken,
-    override_outside_project, palette_phase_has_edges, parts_off_divide, persona_is_bound,
-    phase_position_is_taken, reserved_phase_name, retry_limit_negative, split_fan_out_mismatch,
+    divide_columns_off_divide, edge_endpoint_outside_graph, edge_predicate_mismatch,
+    fan_out_below_one, graph_name_is_taken, override_outside_project, palette_phase_has_edges,
+    parts_off_divide, persona_is_bound, phase_position_is_taken, phase_token_budget_refusal,
+    reserved_phase_name, retry_limit_negative, split_fan_out_mismatch,
 };
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
@@ -22149,6 +22150,15 @@ async fn replace_graph_refusal_order<S: WriteStore>(store: &S) {
     );
     body.nodes[1].phase.fan_out = 1;
 
+    body.nodes[1].phase.token_budget = Some(-5);
+    constraint_exactly(
+        CASE,
+        store.replace_graph(graph, revision, body.clone()).await,
+        &phase_token_budget_refusal(-5).expect("a negative budget is refused"),
+        "a token_budget below 1 on a kept node (set_setting's Phase rung refuses it)",
+    );
+    body.nodes[1].phase.token_budget = None;
+
     body.nodes.push(bare_node(StepGraphPhase {
         id: ids::PHASE_HTUI_IMPLEMENT,
         ..new_phase(graph, 7, "borrowed")
@@ -22891,6 +22901,41 @@ async fn replace_graph_round_trips_every_node_field<S: WriteStore>(store: &S) {
         answer,
         "{CASE}: graph_body reads the same"
     );
+
+    // Review R1 B-L1: a JSON `null` predicate is no predicate. An `if` edge carrying one is
+    // refused (Postgres would store `jsonb 'null'` and serde read it back as none); any other
+    // edge carrying one is stored with none.
+    let mut nulled = answer.clone();
+    let mut when = graph_edge(graph, phases[0].id, phases[1].id, EdgeKind::If);
+    when.predicate = Some(EdgePredicate(Value::Null));
+    let when_id = when.id;
+    nulled.edges = vec![when];
+    constraint_exactly(
+        CASE,
+        store
+            .replace_graph(graph, answer.graph.revision, nulled.clone())
+            .await,
+        &edge_predicate_mismatch(when_id, EdgeKind::If),
+        "an `if` edge whose predicate is JSON null",
+    );
+    let mut next = graph_edge(graph, phases[0].id, phases[1].id, EdgeKind::Next);
+    next.predicate = Some(EdgePredicate(Value::Null));
+    nulled.edges = vec![next.clone()];
+    let stored = applied(
+        CASE,
+        store
+            .replace_graph(graph, answer.graph.revision, nulled)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        stored.edges,
+        vec![StepGraphEdge {
+            predicate: None,
+            ..next
+        }],
+        "{CASE}: a `next` edge's JSON null predicate is stored as none"
+    );
 }
 
 /// MOD-137 D7 (blueprint §T2.2): `create_phase` keeps `split` in step with `fan_out`, keeps the
@@ -22955,6 +23000,19 @@ async fn create_phase_keeps_split_in_step_with_fan_out<S: WriteStore>(store: &S)
             .await,
         &retry_limit_negative("eager", -1),
         "a negative retry_limit (0001's CHECK)",
+    );
+    // Review R1 B-L2: `set_setting`'s `Phase` rung refuses a budget below 1, so the whole-row
+    // writers do too, in its words.
+    constraint_exactly(
+        CASE,
+        store
+            .create_phase(&StepGraphPhase {
+                token_budget: Some(0),
+                ..new_phase(graph, 1, "broke")
+            })
+            .await,
+        &phase_token_budget_refusal(0).expect("a budget of 0 is refused"),
+        "a token_budget below 1 (set_setting's Phase rung refuses it)",
     );
     let ghost = PersonaId::new();
     constraint_exactly(

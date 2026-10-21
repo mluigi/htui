@@ -58,8 +58,8 @@ use crate::prompt::template::TemplateRole;
 use crate::seed;
 use crate::store::error::{Result, StoreError};
 use crate::store::graph_rules::{
-    body_agent_refs, body_persona_refs, graph_body_shape_refusal, graph_body_topology_refusal,
-    phase_row_refusal,
+    body_agent_refs, body_persona_refs, edge_predicate, graph_body_shape_refusal,
+    graph_body_topology_refusal, phase_row_refusal,
 };
 use crate::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
@@ -3988,8 +3988,11 @@ impl State {
                     .map(|part| ((part.phase_id, part.position), part)),
             );
         }
-        self.edges
-            .extend(body.edges.into_iter().map(|edge| (edge.id, edge)));
+        // Review R1 B-L1: a JSON `null` predicate is stored as none, as `PgStore` writes it.
+        self.edges.extend(body.edges.into_iter().map(|edge| {
+            let predicate = edge_predicate(&edge).cloned();
+            (edge.id, StepGraphEdge { predicate, ..edge })
+        }));
         let row = self
             .graphs
             .get_mut(&graph)

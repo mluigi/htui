@@ -72,7 +72,7 @@ use crate::model::{
     WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
 };
 use crate::model::{EdgeId, EdgeKind, GraphBody, GraphScope, PhasePart, Split, StepGraphEdge};
-use crate::prompt::settings::{Rungs, SettingKey};
+use crate::prompt::settings::{Rungs, SettingKey, validate};
 use crate::prompt::template::{TemplateRole, parse};
 use crate::store::error::Result;
 
@@ -2955,6 +2955,21 @@ pub fn fan_out_below_one(phase: &str, fan_out: i32) -> String {
 #[must_use]
 pub fn retry_limit_negative(phase: &str, retry_limit: i32) -> String {
     format!("phase `{phase}` has retry_limit {retry_limit}; a retry limit is 0 or more")
+}
+
+/// MOD-137 review R1 B-L2: a node's `token_budget` the `Phase` rung of
+/// [`WriteStore::set_setting`] would refuse (below 1), in the very sentence that rung gives it
+/// ([`validate`]'s range refusal), so `create_phase` and `replace_graph` cannot store a budget the
+/// settings editor could never write. `None` when the budget is accepted.
+#[must_use]
+pub fn phase_token_budget_refusal(budget: i32) -> Option<String> {
+    validate(
+        SettingKey::TokenBudget,
+        Rungs::PHASE,
+        &Value::from(budget),
+        None,
+    )
+    .err()
 }
 
 /// MOD-137 D8: only a `divide` node has `phase_part` rows (a store check, not a CHECK).
