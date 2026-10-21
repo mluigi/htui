@@ -16,12 +16,12 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 
 use htui_core::model::GraphScope;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Attachment, BindingChange, BoundSkill, BoxId, CapError, Gate,
-    GraphSnapshot, Isolation, Item, ItemId, ItemPatch, NewStepGraph, PhaseAgent, PhaseId, Project,
-    ProjectCaps, ProjectId, ProjectSettings, PromptTemplate, RepoId, ResolvedGraph, ResolvedPhase,
-    RunMode, SkillBinding, SkillBindingKey, SnapshotCandidate, SnapshotGraph, SnapshotJudge,
-    SnapshotPersona, SnapshotPhase, SnapshotSettings, SnapshotTemplate, StepGraph, StepGraphId,
-    StepGraphPhase,
+    Agent, AgentBox, AgentId, Attachment, BindingChange, BoundSkill, BoxId, CapError, EdgeId, Gate,
+    GraphBody, GraphSnapshot, Isolation, Item, ItemId, ItemPatch, NewStepGraph, NodeBody,
+    PhaseAgent, PhaseId, PhasePart, Project, ProjectCaps, ProjectId, ProjectSettings,
+    PromptTemplate, RepoId, ResolvedGraph, ResolvedPhase, RunMode, SkillBinding, SkillBindingKey,
+    SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPersona, SnapshotPhase,
+    SnapshotSettings, SnapshotTemplate, StepGraph, StepGraphEdge, StepGraphId, StepGraphPhase,
 };
 use htui_core::store::{
     BindingFacts, CasOutcome, Result, StoreError, UpdateOutcome, WriteStore, check_attachment,
@@ -452,14 +452,18 @@ fn frozen_persona(
 /// such a row refuses the clone whole and leaves no orphan graph; the user fixes the attachment
 /// and clones again.
 ///
-/// Each source phase's `phase_agent` rows, as `source.resolve_graph` answers them, are written
-/// onto its clone through `create_phase_agents`, re-keyed to the cloned phase (MOD-37 R-6), so the
-/// clone is deep over `step_graph_phase`, `phase_agent` and the phase attachments alike.
+/// Each source phase's `phase_agent` and `phase_part` rows are re-keyed to the cloned phase
+/// (MOD-37 R-6), and the source graph's edges are copied, remapped onto the cloned phases with
+/// fresh edge ids (MOD-137 D13), so the clone is deep over `step_graph_phase`, `phase_agent`,
+/// `phase_part`, `step_graph_edge` and the phase attachments alike. All of it but the attachments
+/// is written by one [`WriteStore::replace_graph`] (revision 0 → 1 on a first override), so a
+/// failure part-way leaves at most a graph row with no phases.
 ///
-/// **Re-override is still owed** (ANA-2 `:297-300`: delete the existing override's phases and
-/// re-clone, leaving `item.step_graph_id` alone). It needs a phase deleter `WriteStore` does not
-/// carry; until it does, a second call earns `create_step_graph`'s own `(project_id, name)`
-/// `Constraint`, which is a refusal rather than a wrong answer.
+/// A second call on an item whose `step_graph_id` already names its override re-clones **from
+/// the kind's default graph** (the override is never a source) into the same graph through one
+/// `replace_graph`, with fresh phase and edge ids, and leaves `item.step_graph_id` alone (ANA-2
+/// `:317-320`, MOD-137 D13). The previous clone's phases go with their candidates, parts, edges
+/// and attachments; no `update_item` runs, so `item.version` does not move.
 ///
 /// # Errors
 /// [`ResolveError::NoGraph`] when the item resolves to no graph; [`ResolveError::Store`] for the
@@ -467,7 +471,9 @@ fn frozen_persona(
 /// caller, and, before any write, a `Constraint` carrying [`check_attachment`]'s sentence when a
 /// source phase attachment would be refused by `set_skill_binding` (for a stale `<repo>:` glob,
 /// [`glob_names_unknown_repo`](htui_core::store::glob_names_unknown_repo)'s), or a `NotFound` for
-/// an attachment whose skill is gone.
+/// an attachment whose skill is gone. A `Constraint` too when the override graph moved between
+/// the read and the re-clone (`replace_graph`'s `Stale`: override again), or when the source
+/// graph's edges name a phase its phase read did not answer (it moved while being read).
 pub async fn override_graph<S: WriteStore, G: GraphSource>(
     store: &S,
     source: &G,
@@ -477,12 +483,42 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
         .resolve_graph(item.id)
         .await?
         .ok_or(ResolveError::NoGraph(item.id))?;
+    // MOD-137 D13: the item already runs under its own override, so this call re-clones it.
+    let reclone = resolved.graph.is_override && item.step_graph_id == Some(resolved.graph.id);
+
+    // The clone's source: the kind's default graph on a re-override (the override is never a
+    // source), else the graph the item runs under.
+    let (source_name, rows, source_edges) = if reclone {
+        let default = store
+            .item_kinds(item.project_id)
+            .await?
+            .into_iter()
+            .find(|kind| kind.id == item.kind_id)
+            .ok_or(ResolveError::NoGraph(item.id))?
+            .default_graph_id;
+        let body = store
+            .graph_body(default)
+            .await?
+            .ok_or(ResolveError::NoGraph(item.id))?;
+        (body.graph.name, body.nodes, body.edges)
+    } else {
+        let mut rows = Vec::with_capacity(resolved.phases.len());
+        for row in &resolved.phases {
+            rows.push(NodeBody {
+                phase: row.phase.clone(),
+                agents: row.agents.clone(),
+                parts: store.phase_parts(row.phase.id).await?,
+            });
+        }
+        let edges = store.graph_edges(resolved.graph.id).await?;
+        (resolved.graph.name.clone(), rows, edges)
+    };
 
     // D96 (F-H): every source phase attachment must pass `set_skill_binding`'s whole rule chain
     // (D78's `check_attachment`) before the clone writes anything, so a row the writer would refuse
     // (a stale `<repo>:` glob, a negative position, a pin naming no version) refuses the clone
     // whole and leaves no orphan graph.
-    let sources: Vec<PhaseId> = resolved.phases.iter().map(|row| row.phase.id).collect();
+    let sources: Vec<PhaseId> = rows.iter().map(|node| node.phase.id).collect();
     let copies: Vec<SkillBinding> = store
         .skill_bindings(Some(item.project_id))
         .await?
@@ -544,45 +580,103 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
         }
     }
 
-    let clone = store
-        .create_step_graph(NewStepGraph {
-            id: StepGraphId::new(),
-            scope: GraphScope::Project(item.project_id),
-            name: format!("{}-override", item.key),
-            description: format!(
-                "Per-item override of `{}` for {}",
-                resolved.graph.name, item.key
-            ),
-            is_override: true,
-        })
-        .await?;
-
+    // The body is built before anything is written: the target's id is known up front (the
+    // override itself on a re-clone, a fresh id otherwise).
+    let target_id = if reclone {
+        resolved.graph.id
+    } else {
+        StepGraphId::new()
+    };
     // Old phase id → cloned phase id, in the source's order (D80).
-    let mut cloned: Vec<(PhaseId, PhaseId)> = Vec::with_capacity(resolved.phases.len());
-    for row in &resolved.phases {
-        let id = PhaseId::new();
-        store
-            .create_phase(&StepGraphPhase {
+    let cloned: Vec<(PhaseId, PhaseId)> =
+        sources.iter().map(|&old| (old, PhaseId::new())).collect();
+    let remap = |old: PhaseId| {
+        cloned
+            .iter()
+            .find(|(from, _)| *from == old)
+            .map(|&(_, id)| id)
+    };
+    let nodes: Vec<NodeBody> = rows
+        .into_iter()
+        .zip(&cloned)
+        .map(|(node, &(_, id))| NodeBody {
+            phase: StepGraphPhase {
                 id,
-                graph_id: clone.id,
-                ..row.phase.clone()
+                graph_id: target_id,
+                ..node.phase
+            },
+            // The source phase's candidates and parts, re-keyed onto the clone (MOD-37 R-6).
+            agents: node
+                .agents
+                .into_iter()
+                .map(|agent| PhaseAgent {
+                    phase_id: id,
+                    ..agent
+                })
+                .collect(),
+            parts: node
+                .parts
+                .into_iter()
+                .map(|part| PhasePart {
+                    phase_id: id,
+                    ..part
+                })
+                .collect(),
+        })
+        .collect();
+    // The source's edges, remapped onto the cloned phases with fresh ids (MOD-137 D13).
+    let edges = source_edges
+        .into_iter()
+        .map(|edge| match (remap(edge.from), remap(edge.to)) {
+            (Some(from), Some(to)) => Ok(StepGraphEdge {
+                id: EdgeId::new(),
+                graph_id: target_id,
+                from,
+                to,
+                ..edge
+            }),
+            _ => Err(ResolveError::Store(StoreError::Constraint(format!(
+                "graph `{source_name}` moved while it was being cloned; override again"
+            )))),
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let name = format!("{}-override", item.key);
+    let description = format!("Per-item override of `{source_name}` for {}", item.key);
+    let target = if reclone {
+        resolved.graph.clone()
+    } else {
+        store
+            .create_step_graph(NewStepGraph {
+                id: target_id,
+                scope: GraphScope::Project(item.project_id),
+                name: name.clone(),
+                description: description.clone(),
+                is_override: true,
             })
-            .await?;
-        // The source phase's candidates, re-keyed onto the clone (MOD-37 R-6).
-        store
-            .create_phase_agents(
-                id,
-                &row.agents
-                    .iter()
-                    .map(|agent| PhaseAgent {
-                        phase_id: id,
-                        ..agent.clone()
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .await?;
-        cloned.push((row.phase.id, id));
-    }
+            .await?
+    };
+    let body = GraphBody {
+        graph: StepGraph {
+            name: name.clone(),
+            description,
+            ..target.clone()
+        },
+        nodes,
+        edges,
+    };
+    let clone = match store
+        .replace_graph(target.id, target.revision, body)
+        .await?
+    {
+        CasOutcome::Applied(applied) => applied.graph,
+        CasOutcome::Stale(_) => {
+            let verb = if reclone { "re-cloned" } else { "cloned" };
+            return Err(ResolveError::Store(StoreError::Constraint(format!(
+                "override graph `{name}` moved while it was being {verb}; override again"
+            ))));
+        }
+    };
 
     // Every phase-level attachment of a source phase, onto its clone (D80). Project and global
     // rows apply to the clone already; a copy of them would be a second row at the same level.
@@ -605,6 +699,12 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
                 "a skill attachment already sits on the cloned phase {phase}"
             ))));
         }
+    }
+
+    // A re-clone wrote into the graph the item already names: nothing to repoint, and the item's
+    // version stays where it is (MOD-137 D13).
+    if reclone {
+        return Ok(clone);
     }
 
     // The item is repointed last, so a failure part-way through leaves an orphan graph rather than
@@ -992,8 +1092,9 @@ async fn agent_name<G: GraphSource>(
 mod tests {
     use htui_core::fixtures::{DemoData, demo_data, ids};
     use htui_core::model::{
-        Activation, Gate, NewRepo, PersonaId, PromptTemplateId, RepoId, RepoScope, RunScope,
-        SkillBinding, SkillBindingId, SnapshotPersona,
+        Activation, EdgeId, EdgeKind, Gate, NewRepo, NodeBody, PersonaId, PromptTemplateId, RepoId,
+        RepoPatch, RepoScope, RunScope, SkillBinding, SkillBindingId, SnapshotPersona,
+        StepGraphEdge,
     };
     use htui_core::store::{
         MemStore, ReadStore, StoreError, glob_names_unknown_repo, negative_position,
@@ -1002,10 +1103,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Agent, AgentBox, AgentId, BTreeMap, BoundSkill, BoxId, GraphSource, Isolation, Item,
-        ItemId, PhaseAgent, PhaseId, ProjectId, PromptTemplate, ResolveError, Resolved,
-        ResolvedGraph, Result, RunMode, SnapshotTemplate, StepGraphId, StepGraphPhase, Value,
-        WriteStore, effective_gate, first_decode_failure, override_graph, project_settings,
+        Agent, AgentBox, AgentId, BTreeMap, BoundSkill, BoxId, CasOutcome, GraphSource, Isolation,
+        Item, ItemId, PhaseAgent, PhaseId, ProjectId, PromptTemplate, ResolveError, Resolved,
+        ResolvedGraph, Result, RunMode, SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase,
+        Value, WriteStore, effective_gate, first_decode_failure, override_graph, project_settings,
         resolve,
     };
 
@@ -2301,6 +2402,503 @@ question and not a test fix. Decide the version bump first, then paste the new d
             item.step_graph_id,
             "and the item is not repointed"
         );
+    }
+
+    /// `(from name, to name, kind, loop_limit)` of every edge, in the store's order: what a clone
+    /// must copy, with the phase ids it must not.
+    fn named_edges(
+        phases: &[StepGraphPhase],
+        edges: &[StepGraphEdge],
+    ) -> Vec<(String, String, EdgeKind, Option<i32>)> {
+        let name = |id: PhaseId| {
+            phases
+                .iter()
+                .find(|phase| phase.id == id)
+                .map(|phase| phase.name.clone())
+                .expect("an edge joins two phases of its graph")
+        };
+        edges
+            .iter()
+            .map(|edge| (name(edge.from), name(edge.to), edge.kind, edge.loop_limit))
+            .collect()
+    }
+
+    /// Every edge of `clone` is the clone's own: its `graph_id`, both endpoints among its phases,
+    /// an id none of `elsewhere` holds.
+    async fn assert_edges_are_the_clones(
+        store: &MemStore,
+        clone: StepGraphId,
+        elsewhere: &[StepGraphEdge],
+    ) {
+        let phases = store
+            .phases(clone)
+            .await
+            .expect("MemStore never fails a read");
+        for edge in store
+            .graph_edges(clone)
+            .await
+            .expect("MemStore never fails a read")
+        {
+            assert_eq!(edge.graph_id, clone, "the edge belongs to the clone");
+            for end in [edge.from, edge.to] {
+                assert!(
+                    phases.iter().any(|phase| phase.id == end),
+                    "edge {} ends at {end}, a phase of the clone",
+                    edge.id
+                );
+            }
+            assert!(
+                !elsewhere.iter().any(|other| other.id == edge.id),
+                "edge {} has a fresh id",
+                edge.id
+            );
+        }
+    }
+
+    /// The `-override` graphs of `htui`.
+    async fn overrides(store: &MemStore) -> Vec<StepGraph> {
+        store
+            .step_graphs(ids::PROJECT_HTUI)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .filter(|graph| graph.is_override)
+            .collect()
+    }
+
+    /// MOD-137 D13: the first override copies the kind default's edges too, remapped onto the
+    /// cloned phases, in the one `replace_graph` that writes the clone (revision 0 → 1).
+    #[tokio::test]
+    async fn override_clone_copies_edges_remapped() {
+        let store = MemStore::demo();
+        let item = feat_1(&store).await;
+        let default_phases = store
+            .phases(ids::GRAPH_HTUI_FEAT)
+            .await
+            .expect("MemStore never fails a read");
+        let default_edges = store
+            .graph_edges(ids::GRAPH_HTUI_FEAT)
+            .await
+            .expect("MemStore never fails a read");
+        assert!(
+            !default_edges.is_empty(),
+            "the seeded feature graph has edges, which is what makes this test able to fail"
+        );
+
+        let clone = override_graph(&store, &TestSource::claude(&store), &item)
+            .await
+            .expect("the item takes an override");
+        assert_eq!(clone.revision, 1, "one replace_graph over a fresh graph");
+
+        let cloned_phases = store
+            .phases(clone.id)
+            .await
+            .expect("MemStore never fails a read");
+        let cloned_edges = store
+            .graph_edges(clone.id)
+            .await
+            .expect("MemStore never fails a read");
+        assert_eq!(
+            named_edges(&cloned_phases, &cloned_edges),
+            named_edges(&default_phases, &default_edges),
+            "the clone's edges say what the default's do"
+        );
+        assert_edges_are_the_clones(&store, clone.id, &default_edges).await;
+    }
+
+    /// MOD-137 D13 (ANA-2 `:317-320`): a second override re-clones from the kind's default graph
+    /// into the same override graph, with fresh phase and edge ids; the user's edit of the override
+    /// is not a source, and the item is neither repointed nor versioned.
+    #[tokio::test]
+    async fn re_override_reclones_from_the_kind_default_into_the_same_graph() {
+        let store = MemStore::demo();
+        let source = TestSource::claude(&store);
+        let first = override_graph(&store, &source, &feat_1(&store).await)
+            .await
+            .expect("the item takes an override");
+
+        // The user edits the override: `prd` goes, with its edges.
+        let mut body = store
+            .graph_body(first.id)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the override is there");
+        let first_phases: Vec<PhaseId> = body.nodes.iter().map(|node| node.phase.id).collect();
+        let first_edges = body.edges.clone();
+        let prd = body
+            .nodes
+            .iter()
+            .find(|node| node.phase.name == "prd")
+            .expect("the feature graph has a prd phase")
+            .phase
+            .id;
+        body.nodes.retain(|node| node.phase.id != prd);
+        body.edges.retain(|edge| edge.from != prd && edge.to != prd);
+        let edited = store
+            .replace_graph(first.id, body.graph.revision, body)
+            .await
+            .expect("the edit is a valid body");
+        assert!(
+            matches!(&edited, CasOutcome::Applied(body) if body.graph.revision == 2),
+            "the edit applies: {edited:?}"
+        );
+
+        let pointed = feat_1(&store).await;
+        assert_eq!(pointed.step_graph_id, Some(first.id));
+        let again = override_graph(&store, &source, &pointed)
+            .await
+            .expect("the item takes a second override");
+        assert_eq!(again.id, first.id, "the same graph, re-cloned");
+        assert_eq!(again.revision, 3, "create 0, clone 1, edit 2, re-clone 3");
+        assert_eq!(again.name, format!("{}-override", pointed.key));
+        assert!(again.is_override);
+        assert_eq!(overrides(&store).await.len(), 1, "no second override graph");
+
+        let after = feat_1(&store).await;
+        assert_eq!(
+            after.step_graph_id,
+            Some(first.id),
+            "the item is not repointed"
+        );
+        assert_eq!(after.version, pointed.version, "nor versioned");
+
+        let default_phases = store
+            .phases(ids::GRAPH_HTUI_FEAT)
+            .await
+            .expect("MemStore never fails a read");
+        let default_edges = store
+            .graph_edges(ids::GRAPH_HTUI_FEAT)
+            .await
+            .expect("MemStore never fails a read");
+        let phases = store
+            .phases(first.id)
+            .await
+            .expect("MemStore never fails a read");
+        assert_eq!(
+            phases.iter().map(|phase| &phase.name).collect::<Vec<_>>(),
+            default_phases
+                .iter()
+                .map(|phase| &phase.name)
+                .collect::<Vec<_>>(),
+            "the default's phases, `prd` included"
+        );
+        for phase in &phases {
+            assert!(
+                !first_phases.contains(&phase.id),
+                "`{}` has a fresh id, not the first clone's",
+                phase.name
+            );
+            assert!(
+                !default_phases.iter().any(|row| row.id == phase.id),
+                "nor the default's"
+            );
+        }
+        let edges = store
+            .graph_edges(first.id)
+            .await
+            .expect("MemStore never fails a read");
+        assert_eq!(
+            named_edges(&phases, &edges),
+            named_edges(&default_phases, &default_edges),
+            "the default's edges, remapped"
+        );
+        let mut seen = first_edges;
+        seen.extend(default_edges);
+        assert_edges_are_the_clones(&store, first.id, &seen).await;
+    }
+
+    /// MOD-137 D13: the re-clone reads the kind default as it is now, so a phase and edges added
+    /// to it after the first override reach the override.
+    #[tokio::test]
+    async fn re_override_picks_up_a_changed_kind_default() {
+        let store = MemStore::demo();
+        let source = TestSource::claude(&store);
+        let first = override_graph(&store, &source, &feat_1(&store).await)
+            .await
+            .expect("the item takes an override");
+
+        let mut body = store
+            .graph_body(ids::GRAPH_HTUI_FEAT)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the kind default is there");
+        let review = body
+            .nodes
+            .iter()
+            .find(|node| node.phase.name == "review")
+            .expect("the feature graph has a review phase")
+            .phase
+            .clone();
+        let docs = PhaseId::new();
+        let position = body
+            .nodes
+            .iter()
+            .map(|node| node.phase.position)
+            .max()
+            .expect("the default has phases")
+            + 1;
+        body.nodes.push(NodeBody {
+            phase: StepGraphPhase {
+                id: docs,
+                position,
+                name: "docs".to_owned(),
+                input_kinds: vec!["review".to_owned()],
+                ..review.clone()
+            },
+            agents: Vec::new(),
+            parts: Vec::new(),
+        });
+        for (from, to, kind, loop_limit) in [
+            (review.id, docs, EdgeKind::Next, None),
+            (docs, review.id, EdgeKind::Fails, Some(1)),
+        ] {
+            body.edges.push(StepGraphEdge {
+                id: EdgeId::new(),
+                graph_id: ids::GRAPH_HTUI_FEAT,
+                from,
+                to,
+                kind,
+                predicate: None,
+                loop_limit,
+            });
+        }
+        let changed = store
+            .replace_graph(ids::GRAPH_HTUI_FEAT, body.graph.revision, body)
+            .await
+            .expect("the change is a valid body");
+        assert!(
+            matches!(changed, CasOutcome::Applied(_)),
+            "the change applies: {changed:?}"
+        );
+
+        let again = override_graph(&store, &source, &feat_1(&store).await)
+            .await
+            .expect("the item takes a second override");
+        assert_eq!(again.id, first.id);
+
+        let default_phases = store
+            .phases(ids::GRAPH_HTUI_FEAT)
+            .await
+            .expect("MemStore never fails a read");
+        let phases = store
+            .phases(first.id)
+            .await
+            .expect("MemStore never fails a read");
+        assert_eq!(
+            phases.iter().map(|phase| &phase.name).collect::<Vec<_>>(),
+            default_phases
+                .iter()
+                .map(|phase| &phase.name)
+                .collect::<Vec<_>>(),
+            "the override has the default's phases now"
+        );
+        assert!(phases.iter().any(|phase| phase.name == "docs"));
+        let edges = named_edges(
+            &phases,
+            &store
+                .graph_edges(first.id)
+                .await
+                .expect("MemStore never fails a read"),
+        );
+        assert_eq!(
+            edges,
+            named_edges(
+                &default_phases,
+                &store
+                    .graph_edges(ids::GRAPH_HTUI_FEAT)
+                    .await
+                    .expect("MemStore never fails a read"),
+            ),
+            "and its edges"
+        );
+        for edge in [
+            ("review".to_owned(), "docs".to_owned(), EdgeKind::Next, None),
+            (
+                "docs".to_owned(),
+                "review".to_owned(),
+                EdgeKind::Fails,
+                Some(1),
+            ),
+        ] {
+            assert!(edges.contains(&edge), "{edge:?} reached the override");
+        }
+    }
+
+    /// MOD-137 D13 with MOD-9 D80: a re-override copies each default-phase attachment onto the
+    /// fresh clone phase; the first clone's copies go with its phases.
+    #[tokio::test]
+    async fn re_override_moves_phase_attachments_to_the_fresh_clone() {
+        let store = MemStore::demo();
+        let source = TestSource::claude(&store);
+        let first = override_graph(&store, &source, &feat_1(&store).await)
+            .await
+            .expect("the item takes an override");
+        let first_phases: Vec<PhaseId> = store
+            .phases(first.id)
+            .await
+            .expect("MemStore never fails a read")
+            .iter()
+            .map(|phase| phase.id)
+            .collect();
+        let source_row = store
+            .skill_bindings(Some(ids::PROJECT_HTUI))
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .find(|row| row.phase_id == Some(ids::PHASE_HTUI_IMPLEMENT))
+            .expect("the fixture's one phase-level binding");
+
+        override_graph(&store, &source, &feat_1(&store).await)
+            .await
+            .expect("the item takes a second override");
+
+        let phases = store
+            .phases(first.id)
+            .await
+            .expect("MemStore never fails a read");
+        let implement = phases
+            .iter()
+            .find(|phase| phase.name == "implement")
+            .expect("the feature graph has an implement phase");
+        let rows = store
+            .skill_bindings(Some(ids::PROJECT_HTUI))
+            .await
+            .expect("MemStore never fails a read");
+        assert!(
+            !rows.iter().any(|row| row
+                .phase_id
+                .is_some_and(|phase| first_phases.contains(&phase))),
+            "the first clone's copies are gone: {rows:?}"
+        );
+        let copies: Vec<&SkillBinding> = rows
+            .iter()
+            .filter(|row| {
+                row.phase_id
+                    .is_some_and(|phase| phases.iter().any(|clone| clone.id == phase))
+            })
+            .collect();
+        assert_eq!(copies.len(), 1, "one copy, on implement only: {copies:?}");
+        let copy = copies[0];
+        assert_eq!(copy.phase_id, Some(implement.id));
+        assert_eq!(
+            (
+                copy.skill_id,
+                copy.pinned_version,
+                copy.position,
+                copy.activation,
+                copy.globs.as_slice()
+            ),
+            (
+                source_row.skill_id,
+                source_row.pinned_version,
+                source_row.position,
+                source_row.activation,
+                source_row.globs.as_slice()
+            ),
+            "and says what the source row says"
+        );
+        assert!(
+            rows.contains(&source_row),
+            "the source row is untouched, id and updated_at included"
+        );
+    }
+
+    /// MOD-137 D13 with MOD-9 D96: the re-clone runs the same attachment pre-check before it
+    /// writes. A default-phase glob naming a repo the project has renamed refuses the re-override
+    /// with the writer's sentence, and the override is left as it was.
+    #[tokio::test]
+    async fn re_override_refuses_a_stale_attachment_before_writing() {
+        let store = store_with(|data| {
+            let phase_row = data
+                .skill_bindings
+                .iter()
+                .find(|row| row.phase_id == Some(ids::PHASE_HTUI_IMPLEMENT))
+                .expect("the fixture's one phase-level binding")
+                .clone();
+            data.skill_bindings.push(SkillBinding {
+                id: SkillBindingId::new(),
+                skill_id: ids::SKILL_TESTS,
+                pinned_version: None,
+                activation: Activation::Glob,
+                globs: vec!["core:src/**".to_owned()],
+                ..phase_row
+            });
+        });
+        let repo = store
+            .create_repo(NewRepo {
+                id: RepoId::new(),
+                project_id: ids::PROJECT_HTUI,
+                name: "core".to_owned(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                is_primary: true,
+            })
+            .await
+            .expect("the fixture project takes a repo");
+        let source = TestSource::claude(&store);
+        let first = override_graph(&store, &source, &feat_1(&store).await)
+            .await
+            .expect("`core` is a repo of the project, so the first override passes");
+
+        let renamed = store
+            .update_repo(
+                repo.id,
+                repo.updated_at,
+                RepoPatch {
+                    name: Some("lib".to_owned()),
+                    ..RepoPatch::default()
+                },
+            )
+            .await
+            .expect("the repo takes a new name");
+        assert!(matches!(renamed, CasOutcome::Applied(_)), "{renamed:?}");
+        let slug = store
+            .project(ids::PROJECT_HTUI)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the fixture holds htui")
+            .slug;
+        let body_before = store
+            .graph_body(first.id)
+            .await
+            .expect("MemStore never fails a read");
+        let rows_before = store
+            .skill_bindings(Some(ids::PROJECT_HTUI))
+            .await
+            .expect("MemStore never fails a read");
+        let pointed = feat_1(&store).await;
+
+        let error = override_graph(&store, &source, &pointed)
+            .await
+            .expect_err("`core` is no repo of the project any more");
+        assert_eq!(
+            error,
+            ResolveError::Store(StoreError::Constraint(glob_names_unknown_repo(
+                "core:src/**",
+                "core",
+                &slug
+            )))
+        );
+
+        let body_after = store
+            .graph_body(first.id)
+            .await
+            .expect("MemStore never fails a read");
+        assert_eq!(
+            body_after.as_ref().map(|body| body.graph.revision),
+            Some(1),
+            "the override's revision is unchanged"
+        );
+        assert_eq!(body_after, body_before, "and so is its body");
+        assert_eq!(
+            store
+                .skill_bindings(Some(ids::PROJECT_HTUI))
+                .await
+                .expect("MemStore never fails a read"),
+            rows_before,
+            "nor any attachment"
+        );
+        assert_eq!(feat_1(&store).await, pointed, "and the item is untouched");
     }
 
     /// An item whose kind names no graph and which names none itself cannot be run.
