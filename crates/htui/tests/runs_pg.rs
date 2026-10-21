@@ -484,8 +484,10 @@ impl Stack {
             .execute(&db.pool)
             .await
             .expect("the ANA graph is ungated");
+        // `split` follows `fan_out` (`ck_phase_split_fan_out`, MOD-137 D7).
         sqlx::query(
-            "UPDATE step_graph_phase SET fan_out = 2 WHERE graph_id = $1 AND name = 'research'",
+            "UPDATE step_graph_phase SET fan_out = 2, split = 'compete' \
+              WHERE graph_id = $1 AND name = 'research'",
         )
         .bind(ids::GRAPH_HTUI_ANA.as_uuid())
         .execute(&db.pool)
