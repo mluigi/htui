@@ -245,7 +245,8 @@ mod binary {
                      confirm, form, common, editor, settings, settings.agents, settings.hierarchy, \
                      settings.kinds, settings.prompt, settings.connection, settings.qdrant, \
                      settings.boxes, settings.personas, settings.secrets, settings.queue, \
-                     concepts, switcher, migration, waiting, skills, skills.library, \
+                     settings.project_types, concepts, switcher, migration, waiting, \
+                     skills, skills.library, \
                      skills.templates, skills.attach, skills.help, requirements, backlog, \
                      backlog.body, backlog.runs, backlog.graph, backlog.docs, backlog.notes, \
                      backlog.prompt, backlog.reqs, backlog.filter_form, backlog.item, chat, \

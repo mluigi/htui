@@ -3,8 +3,8 @@
 //! A registry for the same reason the tabs and the detail sub-tabs are one (MOD-1 plan D5):
 //! MOD-2's agent registry, MOD-7's `Boxes` section (every box of the user, this box marked),
 //! MOD-9's skills, MOD-15's hierarchy, MOD-26's persona registry (`Personas`, milestone 2),
-//! MOD-10's secret provider (`Secrets`, milestone 4) and MOD-12's queue caps (`Queue`, milestone 2)
-//! each want a section of this tab, and each should be a file plus one `register` line rather
+//! MOD-10's secret provider (`Secrets`, milestone 4), MOD-12's queue caps (`Queue`, milestone 2)
+//! and MOD-146's project types (`Project types`) each want a section of this tab, and each should be a file plus one `register` line rather
 //! than a `match` arm growing in here.
 //! [`SettingsSection`] mirrors
 //! [`DetailTab`](crate::ui::tabs::backlog::detail::DetailTab) one level across, with
@@ -17,6 +17,7 @@ pub mod connection;
 pub mod hierarchy;
 pub mod kinds;
 pub mod personas;
+pub mod project_types;
 pub mod prompt;
 /// The Qdrant DSN settings section.
 pub mod qdrant;
@@ -46,6 +47,7 @@ pub use connection::ConnectionSection;
 pub use hierarchy::HierarchySection;
 pub use kinds::KindsSection;
 pub use personas::PersonasSection;
+pub use project_types::ProjectTypesSection;
 pub use prompt::PromptSection;
 pub use qdrant::QdrantSection;
 pub use queue::QueueSection;

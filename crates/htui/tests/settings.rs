@@ -15,8 +15,9 @@ use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
 use htui::ui::tabs::settings::{
     AgentsSection, BoxesSection, ConnectionSection, HierarchySection, KindsSection,
-    PersonasSection, PromptSection, QdrantSection, QueueSection, SecretsSection, SectionId,
-    SettingsRegistry, SettingsSection, SettingsTab, message, render_strip,
+    PersonasSection, ProjectTypesSection, PromptSection, QdrantSection, QueueSection,
+    SecretsSection, SectionId, SettingsRegistry, SettingsSection, SettingsTab, message,
+    render_strip,
 };
 use htui::ui::text_field::PASTE_DOES_NOT_FIT;
 use htui_agent::acp::Handshake;
@@ -1093,7 +1094,8 @@ async fn a_bracketed_paste_under_a_modal_overlay_reaches_no_field() {
 /// an eleventh ever does not fit, the fix is the strip's, not a shorter title.
 ///
 /// MOD-146 F-1 (A) made that fix: `render_strip` scrolls a strip wider than its area so that the
-/// active title ends inside it. So the pin is now drawn rather than summed: at the 98 columns
+/// active title ends inside it. MOD-146 D8's eleventh, `Project types`, brings the strip to 102
+/// columns, so the pin is now drawn rather than summed: at the 98 columns
 /// inside the Settings border, with each section active in turn, the active section's whole
 /// ` title ` is on the row. (The scroll itself is pinned by `render_strip`'s unit test,
 /// `a_strip_wider_than_its_area_scrolls_to_the_active_section`.)
@@ -1110,13 +1112,14 @@ fn the_section_strip_fits_the_frame() {
         Box::new(PersonasSection::new()),
         Box::new(SecretsSection::new()),
         Box::new(QueueSection::new()),
+        Box::new(ProjectTypesSection::new()),
     ];
-    assert_eq!(sections.len(), 10);
+    assert_eq!(sections.len(), 11);
     let width: usize = sections
         .iter()
         .map(|section| section.title().chars().count() + 2)
         .sum();
-    assert_eq!(width, 87, "the strip's full width, for the doc above");
+    assert_eq!(width, 102, "the strip's full width, for the doc above");
     let titles: Vec<String> = sections
         .iter()
         .map(|section| section.title().to_owned())

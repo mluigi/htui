@@ -21,7 +21,8 @@ use crate::ui::overlay::{
 };
 use crate::ui::tabs::settings::{
     AgentsSection, BoxesSection, ConnectionSection, HierarchySection, KindsSection,
-    PersonasSection, PromptSection, QdrantSection, QueueSection, SecretsSection,
+    PersonasSection, ProjectTypesSection, PromptSection, QdrantSection, QueueSection,
+    SecretsSection,
 };
 use crate::ui::tabs::{BacklogTab, ChatTab, RequirementsTab, SettingsTab, SkillsTab};
 
@@ -84,6 +85,8 @@ pub fn register_all(app: &mut App) {
         Box::new(SecretsSection::new()),
         // Last (MOD-12 milestone 2, D8): appending moves no existing section's line.
         Box::new(QueueSection::new()),
+        // Last (MOD-146 D8): appending moves no existing section's line.
+        Box::new(ProjectTypesSection::new()),
     ])));
     app.register_tab(Box::new(ChatTab::new()));
 

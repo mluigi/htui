@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/project_types.rs
+expression: frame
+---
+no worksp…  project_types: store unreachable: this box browses its read-only cache and starts no run
+┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
+│ Project types                                                                                    │
+│project types unavailable: store unreachable: this box browses its read-only cache and starts no  │
+│run                                                                                               │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘

@@ -26,10 +26,10 @@ use htui_core::model::{
     BoxInfo, CitationKind, Document, DocumentHead, DocumentId, EditReason, FollowUpRequest,
     FollowUpText, Item, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemSpec, ItemSummary,
     LinkGraph, NewFollowUp, NewPersona, Note, PermissionId, Persona, PersonaId, PersonaPatch,
-    PhaseId, PhasePatch, Priority, ProjectId, ProjectPatch, RelayView, RepoId, RepoPatch,
-    RequirementAreaId, RequirementId, RunCommandId, RunStatus, RunSummary, Scope, SessionEvent,
-    SkillBindingKey, SkillId, SkillPatch, SpecChanges, StepGraphId, StepGraphPatch, StepId,
-    TIMESTAMPTZ_DIGITS, ToolCallCount, WaitingPermission, WorkspaceId, WorkspacePatch,
+    PhaseId, PhasePatch, Priority, ProjectId, ProjectPatch, ProjectType, RelayView, RepoId,
+    RepoPatch, RequirementAreaId, RequirementId, RunCommandId, RunStatus, RunSummary, Scope,
+    SessionEvent, SkillBindingKey, SkillId, SkillPatch, SpecChanges, StepGraphId, StepGraphPatch,
+    StepId, TIMESTAMPTZ_DIGITS, ToolCallCount, WaitingPermission, WorkspaceId, WorkspacePatch,
     WorkspaceSummary,
 };
 use htui_core::model::{QueueMove, QueueOverview, QueueSetting};
@@ -451,6 +451,10 @@ pub enum StoreRequest {
         /// The path exactly as typed (one line, never split).
         path: String,
     },
+    /// The project type registry in slug order (MOD-146 D8). Served in [`try_serve`] through the
+    /// writer: `project_type` is not mirrored, so offline it is refused with
+    /// `DATABASE_UNREACHABLE`. Answered with [`StoreReply::ProjectTypes`].
+    ProjectTypes,
     /// Pre-flight an adapter install for one registry row (MOD-20 D13, D18).
     ///
     /// One registry read, one `HEAD`, **no archive byte**: what this box would fetch and how it
@@ -1221,6 +1225,7 @@ impl StoreRequest {
             Self::UpdatePersona { .. } => "update_persona",
             Self::DeletePersona { .. } => "delete_persona",
             Self::ImportPersonas { .. } => "import_personas",
+            Self::ProjectTypes => "project_types",
             Self::InstallPlan { .. } => "install_plan",
             Self::InstallConfirm { .. } => "install_confirm",
             Self::InstallCancel => "install_cancel",
@@ -1620,6 +1625,9 @@ pub enum StoreReply {
         /// What the write did.
         outcome: PersonaWrite,
     },
+    /// The project type registry in slug order: the answer to [`StoreRequest::ProjectTypes`]
+    /// (MOD-146 D8). Read-only; nothing writes a type yet.
+    ProjectTypes(Vec<ProjectType>),
     /// Answer to [`StoreRequest::QueueState`].
     Queue(QueueView),
     /// Answer to the five queue writes: what was done, and the queue after it.
@@ -2219,6 +2227,15 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::UpdatePersona { .. }
         | StoreRequest::DeletePersona { .. }
         | StoreRequest::ImportPersonas { .. } => persona_settings::serve(backend, request).await?,
+        // MOD-146 D8: the project type registry, through the writer. `project_type` is not
+        // mirrored, so offline it is refused before any read, as `Personas` is; the `?` keeps
+        // `go_offline` working for an `Unreachable` from the read.
+        StoreRequest::ProjectTypes => {
+            let writer = backend
+                .writer()
+                .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))?;
+            StoreReply::ProjectTypes(WriteStore::project_types(&writer).await?)
+        }
         // The ten requirement requests, or-ed for the reason the arms above are: a guard does not
         // count towards exhaustivity in a wildcard-free `match` (MOD-15 M3 plan F-12, MOD-39 plan
         // P1).
@@ -5128,6 +5145,7 @@ mod tests {
     /// rather than dropping the reply (MOD-21 D18).
     #[test]
     fn name_arms_are_stable() {
+        assert_eq!(StoreRequest::ProjectTypes.name(), "project_types");
         assert_eq!(
             StoreRequest::AuthStart {
                 agent_id: AgentId::new()

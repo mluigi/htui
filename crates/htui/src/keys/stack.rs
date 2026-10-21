@@ -269,6 +269,7 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("in a Secrets form", views::SECRETS_FORM),
     ("in a Secrets question", views::SECRETS_CONFIRM),
     ("in Settings > Queue", views::QUEUE_BROWSE),
+    ("in Settings > Project types", views::PROJECT_TYPES_BROWSE),
     ("in the concepts search", views::CONCEPTS_QUERY),
     ("in the workspace switcher", views::SWITCHER),
     ("in the migration prompt", views::MIGRATION),
@@ -420,8 +421,8 @@ mod tests {
             ("in the focused in-pane editor", Stack::EDITOR_FOCUSED)
         );
         // MOD-115 M2 T6: the quit question's entry went with it.
-        assert_eq!(DECLARED.len(), 82);
-        assert_eq!(DECLARED[81], ("in the leave dialog", views::LEAVE));
+        assert_eq!(DECLARED.len(), 83);
+        assert_eq!(DECLARED[82], ("in the leave dialog", views::LEAVE));
         assert!(DECLARED.contains(&(WHILE_EDITING, Stack::EDITOR_OPEN)));
         let phrases: HashSet<&str> = DECLARED.iter().map(|(phrase, _)| *phrase).collect();
         assert_eq!(phrases.len(), DECLARED.len(), "a phrase is used twice");
