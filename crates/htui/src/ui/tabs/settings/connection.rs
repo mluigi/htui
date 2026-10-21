@@ -204,7 +204,9 @@ fn rebuild_keys(keys: &Keys) -> String {
 const CONFIRM_CLEAR: &str = "Remove the DSN from the keyring? This session keeps its current connection; the next launch starts offline.";
 
 /// D14's question, written from `CacheStore::rebuild`'s own body; the table count is
-/// [`MIRRORED_TABLES`]'s, so a table joining the mirror cannot leave the copy behind.
+/// [`MIRRORED_TABLES`]'s, so a table joining the mirror cannot leave the copy behind. Each item
+/// is named in words, not by its column (plan item 3): `schema_version`, `db_fingerprint` and
+/// `built_at` survive; `cache_cursor` and `last_full_refresh_at` go.
 ///
 /// Both lists, always. The action is never extended to clear anything else — if it were, one of
 /// these two halves would quietly stop being true, and a confirmation that is wrong about what it
@@ -215,7 +217,7 @@ const CONFIRM_CLEAR: &str = "Remove the DSN from the keyring? This session keeps
 fn confirm_rebuild(answers: &str) -> String {
     asked(
         &format!(
-            "Rebuild the mirror? Survives: the file, schema_version, db_fingerprint, built_at. Goes: the {} mirrored tables, cache_cursor, last_full_refresh_at. The next refresh pass refills it.",
+            "Rebuild the mirror? Survives: the file, the schema version, the database fingerprint, the build time. Goes: the {} mirrored tables, the refresh cursors, the last full refresh time. The next refresh pass refills it.",
             MIRRORED_TABLES.len()
         ),
         answers,
@@ -1178,14 +1180,24 @@ mod tests {
     fn the_rebuild_copy_names_both_lists() {
         let tables = format!("{} mirrored tables", MIRRORED_TABLES.len());
         for named in [
+            "the schema version",
+            "the database fingerprint",
+            "the build time",
+            tables.as_str(),
+            "the refresh cursors",
+            "the last full refresh time",
+        ] {
+            assert!(confirm_rebuild("y / n").contains(named), "`{named}`");
+        }
+        // Plan item 3: no internal column name on screen, only what it means.
+        for column in [
             "schema_version",
             "db_fingerprint",
             "built_at",
-            tables.as_str(),
             "cache_cursor",
             "last_full_refresh_at",
         ] {
-            assert!(confirm_rebuild("y / n").contains(named), "`{named}`");
+            assert!(!confirm_rebuild("y / n").contains(column), "`{column}`");
         }
         assert!(
             !confirm_rebuild("y / n").contains("pending/"),

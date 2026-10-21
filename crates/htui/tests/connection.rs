@@ -1662,7 +1662,11 @@ async fn rebuild_needs_a_confirmation_and_names_both_lists() {
     assert!(bench.drained().is_empty());
 
     let frame = flattened(&frame_of(&bench, &section));
-    for survives in ["schema_version", "db_fingerprint", "built_at"] {
+    for survives in [
+        "the schema version",
+        "the database fingerprint",
+        "the build time",
+    ] {
         assert!(frame.contains(survives), "`{survives}` survives: {frame}");
     }
     assert!(
@@ -1673,8 +1677,24 @@ async fn rebuild_needs_a_confirmation_and_names_both_lists() {
         "{} mirrored tables",
         htui_store::cache::MIRRORED_TABLES.len()
     );
-    for goes in [tables.as_str(), "cache_cursor", "last_full_refresh_at"] {
+    for goes in [
+        tables.as_str(),
+        "the refresh cursors",
+        "the last full refresh time",
+    ] {
         assert!(frame.contains(goes), "`{goes}` goes: {frame}");
+    }
+    for column in [
+        "schema_version",
+        "db_fingerprint",
+        "built_at",
+        "cache_cursor",
+        "last_full_refresh_at",
+    ] {
+        assert!(
+            !frame.contains(column),
+            "plan item 3: no internal column name on screen, `{column}`: {frame}"
+        );
     }
     assert!(
         frame.contains("Survives:") && frame.contains("Goes:"),
