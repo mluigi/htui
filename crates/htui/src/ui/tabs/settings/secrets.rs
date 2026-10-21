@@ -1054,12 +1054,12 @@ impl SecretsSection {
         }
     }
 
-    /// The rows as one kit form (MOD-115 M3 D3), with the item to focus: the four fixed rows, a
-    /// blank, the `Projects` heading and one row per project. An open form's fields are rows of
-    /// their own right under the row they replace (so what is stored stays on screen), the
-    /// focused one carrying its guide or refusal; a question is the error line of the row it is
-    /// about; the latch is the Identity row's error and the Health guide the Health row's help.
-    fn form(&self, keys: &Keys) -> (Form<'_>, usize) {
+    /// The rows as one kit form (MOD-115 M3 D3): the four fixed rows, a blank, the `Projects`
+    /// heading and one row per project. An open form's fields are rows of their own right under
+    /// the row they replace (so what is stored stays on screen), the focused one carrying its
+    /// guide or refusal; a question is the error line of the row it is about; the latch is the
+    /// Identity row's error and the Health guide the Health row's help.
+    fn form(&self, keys: &Keys) -> Form<'_> {
         let stack = views::SECRETS_BROWSE;
         let answers = answers(keys, views::SECRETS_CONFIRM);
         let mut form = Form::new().label_width(self.label_width());
@@ -1168,8 +1168,7 @@ impl SecretsSection {
                 }
             }
         }
-        let focus = focus.unwrap_or(0);
-        (form.focus(focus).editing(self.editing()), focus)
+        form.focus(focus.unwrap_or(0)).editing(self.editing())
     }
 
     /// Whether a form is open: its focused field is being typed into.
@@ -1652,7 +1651,7 @@ impl SettingsSection for SecretsSection {
                 frame.render_widget(Paragraph::new(lines), rows);
             }
             None => {
-                let (form, _) = self.form(ctx.keys());
+                let form = self.form(ctx.keys());
                 let mut lines = form.lines(rows.width, ctx.accent(), theme);
                 let notes = self.notes(rows.width, theme);
                 if !notes.is_empty() {
