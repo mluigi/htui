@@ -22,7 +22,7 @@
 //! a save and its reply (a scope change or a tab re-activation) is taken for that reply and closes
 //! the editor early; if the save then comes back `BoxesStale`, `CHANGED_ELSEWHERE_CLOSED` says
 //! nothing was written and how to retry. For a probe spec save the early close also shows
-//! `SPEC_SAVED` and loses the typed text, as for `edit_box`; the real reply's notice then
+//! [`spec_saved`]'s notice and loses the typed text, as for `edit_box`; the real reply's notice then
 //! replaces it (`CHANGED_ELSEWHERE_CLOSED`, or the refusal's sentence), and nothing is written
 //! wrongly (MOD-51 F-11, blueprint R-1). The same race can also land a tags or quirks save's
 //! `BoxesStale` in the probe spec editor's branch (opened after the early close), refreshing the
@@ -152,9 +152,13 @@ const HINT_SPEC: HintSpec = &[
 const SPEC_TITLE: &str =
     "stored overlay box_probe_spec, merged into the seed by name; blank clears it";
 
-/// A probe spec save applied (MOD-51 D6, D8): nothing re-probes now; the next `p` or connect does.
-const SPEC_SAVED: &str =
-    "probe spec saved \u{2014} the next p (or the next connect) re-probes under it";
+/// A probe spec save applied (MOD-51 D6, D8): nothing re-probes now; the next probe or connect
+/// does. `probe` is the label of `settings.boxes.probe` through the browse stack (MOD-115 M3 C5),
+/// `p` by default; unbound, the sentence names the probe and no key.
+fn spec_saved(probe: Option<&str>) -> String {
+    let next = probe.unwrap_or("probe");
+    format!("probe spec saved \u{2014} the next {next} (or the next connect) re-probes under it")
+}
 
 /// The opening of a probe spec that does not parse; `serde_json`'s own sentence follows.
 const SPEC_NOT_JSON: &str = "the overlay is not JSON";
@@ -408,11 +412,12 @@ impl BoxesSection {
     /// read (`r`, activation, the re-read after a probe or a reconnect) leaves the editor, its
     /// text and its token alone. A probe spec save that applied says the next `p` re-probes
     /// (MOD-51 D6, D8).
-    fn on_boxes(&mut self, snapshot: &BoxesSnapshot) {
+    fn on_boxes(&mut self, snapshot: &BoxesSnapshot, keys: &Keys) {
         self.replace(snapshot);
         if let Some(name) = self.busy.take() {
             self.mode = Mode::Browse;
-            self.notice = (name == SPEC_NAME).then(|| SPEC_SAVED.to_owned());
+            self.notice = (name == SPEC_NAME)
+                .then(|| spec_saved(keys.label(views::BOXES_BROWSE, Act::BoxesProbe).as_deref()));
         }
     }
 
@@ -831,7 +836,7 @@ impl SettingsSection for BoxesSection {
 
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         match reply {
-            StoreReply::Boxes(snapshot) => self.on_boxes(snapshot),
+            StoreReply::Boxes(snapshot) => self.on_boxes(snapshot, ctx.keys()),
             StoreReply::BoxesStale(snapshot) => self.on_stale(snapshot, ctx.keys()),
             // The report carries counts, not rows (D49): the list is read again.
             StoreReply::BoxProbed(_) => {

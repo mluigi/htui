@@ -2511,3 +2511,37 @@ async fn the_section_at_80_columns() {
         insta::assert_snapshot!("demo_80", frame);
     });
 }
+
+/// MD-A, C5: the spec-saved notice names the probe key in force (`p` by default), and the probe
+/// itself when the key is unbound, never a literal `p`.
+#[tokio::test]
+async fn the_spec_saved_notice_names_the_probe_key_in_force() {
+    for (file, expected) in [
+        (
+            "version = 1\n",
+            "probe spec saved \u{2014} the next p (or the next connect) re-probes under it",
+        ),
+        (
+            "version = 1\n[settings.boxes]\nprobe = \"P\"\n",
+            "probe spec saved \u{2014} the next P (or the next connect) re-probes under it",
+        ),
+        (
+            "version = 1\n[settings.boxes]\nprobe = []\n",
+            "probe spec saved \u{2014} the next probe (or the next connect) re-probes under it",
+        ),
+    ] {
+        let bench = SectionBench::new().await.with_keys(rebound(file));
+        let mut section = BoxesSection::new();
+        feed(&bench, &mut section, &snap_of(MemStore::demo()).await);
+        bench.key(&mut section, "s");
+        bench.paste(&mut section, "{}");
+        bench.key(&mut section, "ctrl-s");
+        only_spec(&requests(&bench));
+        bench.reply(
+            &mut section,
+            &StoreReply::Boxes(Box::new(snap_of(terraform_store()).await)),
+        );
+        let frame = bench.render_section(&section, 100);
+        assert_eq!(last_line(&frame).trim(), expected, "{file}");
+    }
+}
