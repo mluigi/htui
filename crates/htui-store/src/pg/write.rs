@@ -33,7 +33,7 @@ use htui_core::model::{
     NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission,
     PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch,
     PersonaPermission, PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority, Project, ProjectId,
-    ProjectPatch, PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry, QueueMove,
+    ProjectPatch, ProjectType, PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry, QueueMove,
     QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch,
     Requirement, RequirementArea, RequirementAreaId, RequirementId, RequirementPatch,
     RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run,
@@ -2428,6 +2428,7 @@ impl WriteStore for PgStore {
                       slug,
                       name,
                       description,
+                      type            AS project_type,
                       secret_provider,
                       secret_scope,
                       settings,
@@ -2489,6 +2490,7 @@ impl WriteStore for PgStore {
                       slug,
                       name,
                       description,
+                      type            AS project_type,
                       secret_provider,
                       secret_scope,
                       settings,
@@ -3886,6 +3888,33 @@ impl WriteStore for PgStore {
         Err(StoreError::Backend(
             "delete_persona: holders kept changing".to_owned(),
         ))
+    }
+
+    // project_type (MOD-146, plan D5)
+
+    /// Every project type in `slug` byte order (`COLLATE "C"`).
+    async fn project_types(&self) -> Result<Vec<ProjectType>> {
+        sqlx::query_as!(
+            ProjectType,
+            r#"
+            SELECT slug,
+                   name,
+                   description,
+                   coding,
+                   builtin,
+                   selectable,
+                   seed,
+                   seed_version,
+                   created_by      AS "created_by: htui_core::model::UserId",
+                   created_at,
+                   updated_at
+              FROM project_type
+             ORDER BY slug COLLATE "C"
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
     }
 
     // settings (D7, D8)

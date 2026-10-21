@@ -631,6 +631,7 @@ impl ReadStore for PgStore {
                    slug,
                    name,
                    description,
+                   type            AS project_type,
                    secret_provider,
                    secret_scope,
                    settings,

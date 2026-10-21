@@ -114,8 +114,8 @@ impl PgStore {
         for row in &data.projects {
             sqlx::query!(
                 "INSERT INTO project (id, slug, name, description, secret_provider, secret_scope, \
-                 settings, created_by, created_at, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                 settings, created_by, created_at, updated_at, type) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
                 row.id.as_uuid(),
                 row.slug,
                 row.name,
@@ -126,6 +126,7 @@ impl PgStore {
                 row.created_by.as_uuid(),
                 row.created_at,
                 row.updated_at,
+                row.project_type,
             )
             .execute(&mut *tx)
             .await
