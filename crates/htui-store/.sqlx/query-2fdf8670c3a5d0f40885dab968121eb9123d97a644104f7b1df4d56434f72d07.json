@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id              AS \"id: ProjectId\",\n                   slug,\n                   name,\n                   description,\n                   secret_provider,\n                   secret_scope,\n                   settings,\n                   created_by      AS \"created_by: htui_core::model::UserId\",\n                   created_at,\n                   updated_at\n              FROM project WHERE id = $1\n            ",
+  "query": "SELECT id, slug, name, description, secret_provider, secret_scope, settings, created_by, created_at, updated_at, type AS project_type FROM project WHERE id = $1 AND updated_at > $2 ORDER BY updated_at",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id: ProjectId",
+        "name": "id",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -82,7 +82,7 @@
       },
       {
         "ordinal": 7,
-        "name": "created_by: htui_core::model::UserId",
+        "name": "created_by",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -112,11 +112,23 @@
             "name": "updated_at"
           }
         }
+      },
+      {
+        "ordinal": 10,
+        "name": "project_type",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "project",
+            "name": "type"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Uuid",
+        "Timestamptz"
       ]
     },
     "nullable": [
@@ -129,8 +141,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "1c9bf6bb22c78410fd1b2dab8996bfac3c7c87c222233a9d0e9d04756172eb9f"
+  "hash": "2fdf8670c3a5d0f40885dab968121eb9123d97a644104f7b1df4d56434f72d07"
 }
