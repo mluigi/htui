@@ -2254,6 +2254,10 @@ pub trait WriteStore: ReadStore {
     /// duplicate id, a subject that folds to a live entry's of the same project
     /// ([`memory_subject_taken`], naming that entry; plan D4), or a `created_by` / `box_id` that
     /// names no row.
+    ///
+    /// `Constraint` refusals are not ordered among themselves across backends: when two apply,
+    /// either may answer. Only [`already_exists`] and [`memory_subject_taken`] have
+    /// backend-independent text.
     async fn create_memory_entry(
         &self,
         project: ProjectId,
@@ -2272,6 +2276,10 @@ pub trait WriteStore: ReadStore {
     /// than the head; [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a
     /// `retired` or `superseded` entry ([`memory_entry_closed`]), a new subject that folds to
     /// another live entry's ([`memory_subject_taken`]), or an author / box that names no row.
+    ///
+    /// `Constraint` refusals are not ordered among themselves across backends: when two apply,
+    /// either may answer. Only [`already_exists`] and [`memory_subject_taken`] have
+    /// backend-independent text.
     async fn amend_memory_entry(
         &self,
         id: MemoryEntryId,
@@ -2287,6 +2295,10 @@ pub trait WriteStore: ReadStore {
     /// # Errors
     /// As [`amend_memory_entry`](WriteStore::amend_memory_entry), an already-retired or superseded
     /// entry included ([`memory_entry_closed`]).
+    ///
+    /// `Constraint` refusals are not ordered among themselves across backends: when two apply,
+    /// either may answer. Only [`already_exists`] and [`memory_subject_taken`] have
+    /// backend-independent text.
     async fn retire_memory_entry(
         &self,
         id: MemoryEntryId,
@@ -2310,6 +2322,10 @@ pub trait WriteStore: ReadStore {
     /// already `retired` or `superseded` ([`memory_entry_closed`]), a duplicate `new.id`, a new
     /// subject that folds to a **third** live entry's ([`memory_subject_taken`]), or a
     /// `created_by` / `box_id` that names no row.
+    ///
+    /// `Constraint` refusals are not ordered among themselves across backends: when two apply,
+    /// either may answer. Only [`already_exists`] and [`memory_subject_taken`] have
+    /// backend-independent text.
     async fn supersede_memory_entry(
         &self,
         old: MemoryEntryId,

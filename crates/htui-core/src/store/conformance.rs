@@ -21657,6 +21657,11 @@ async fn memory_amend_is_cas_restamps_and_writes_a_revision<S: WriteStore>(store
         head.confirmed_at > before.confirmed_at,
         "{CASE}: an amend re-stamps confirmed_at (plan D3)"
     );
+    assert!(
+        head.confirmed_at <= head.updated_at,
+        "{CASE}: after an amend confirmed_at is at or before updated_at, never after (Postgres \
+         stamps the two from different clocks; blueprint P-15)"
+    );
     assert_eq!(
         memory_list(CASE, store, ids::PROJECT_HTUI, None).await,
         vec![head.clone()],

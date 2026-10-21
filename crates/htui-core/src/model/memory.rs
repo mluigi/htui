@@ -56,10 +56,16 @@ impl MemoryState {
 
 /// Plan D4: the fold `uq_memory_entry_live_subject` compares by, Postgres's
 /// `lower(btrim(subject))`. `btrim` strips spaces only, so this is `trim_matches(' ')` then
-/// `to_lowercase()`, not `trim()`. The two agree on ASCII. A non-ASCII subject can fold differently
-/// in `MemStore` and Postgres, as [`RequirementFilter::text`] warns.
+/// `to_lowercase()`, not `trim()`.
 ///
-/// [`RequirementFilter::text`]: crate::model::requirement::RequirementFilter::text
+/// The two folds agree on ASCII only under a non-Turkic database locale: Postgres's `lower()`
+/// follows the database's `LC_CTYPE`, and under a Turkish or Azerbaijani one (`tr`, `az`)
+/// `lower('I')` is `ı` (U+0131), where this answers `i`. Outside ASCII they may differ under any
+/// locale (Unicode's case tables here, the locale's there). So `MemStore` and `PgStore` can
+/// disagree on whether two subjects clash; [`RequirementFilter::text`]'s case folding carries the
+/// same caveat (blueprint P-16).
+///
+/// [`RequirementFilter::text`]: crate::model::RequirementFilter::text
 #[must_use]
 pub fn memory_subject_key(subject: &str) -> String {
     subject.trim_matches(' ').to_lowercase()
@@ -84,6 +90,12 @@ pub struct MemoryEntry {
     pub version: i32,
     /// `memory_entry.confirmed_at`: when the text was last written or confirmed (plan D3). Create
     /// and amend set it; retire and supersede leave it.
+    ///
+    /// After an amend `confirmed_at <= updated_at`, and the two are not comparable for equality:
+    /// Postgres stamps `confirmed_at` with `now()` (transaction start) and `updated_at` with the
+    /// trigger's `clock_timestamp()`, so there it is strictly less; `MemStore` stamps both from one
+    /// clock reading, so there they are equal. No reader may compare them for equality, e.g. to
+    /// tell an amend from a retire (blueprint P-15).
     pub confirmed_at: DateTime<Utc>,
     /// `memory_entry.superseded_by`: the entry that replaced this one. `Some` only on a
     /// `superseded` entry. `None` on a superseded entry whose successor was deleted
