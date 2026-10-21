@@ -816,10 +816,10 @@ async fn orphaned_override<S: WriteStore>(
         ))));
     }
     // Only an item of the graph's own project can name it (`check_graph`, MOD-137 D4), and
-    // `items` narrows by `project_ids` alone; no store reads the workspace, so a fresh id stands
+    // `items` narrows by `project_ids` alone; no store reads the workspace, so the nil id stands
     // in for the one the project may not even have.
     let scope = Scope {
-        workspace_id: WorkspaceId::new(),
+        workspace_id: WorkspaceId::default(),
         project_ids: vec![item.project_id],
     };
     for summary in store.items(&scope, &ItemFilter::default()).await? {
