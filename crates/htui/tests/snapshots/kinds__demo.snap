@@ -3,8 +3,7 @@ source: crates/htui/tests/kinds.rs
 expression: frame
 ---
 Graphics   ¹Settings   0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys · ⌫ back
-┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
-│ Agents  Hierarchy  Kinds                                                                         │
+╭─ Kinds ──────────────────────────────────────────────────────────────── Agents  Hierarchy  Kinds ╮
 │vulkan-tutorials  Vulkan Tutorials                                                                │
 │  ANA  analysis · graph analysis                                                                  │
 │    0. research · template research · gate soft · in none · budget inherit                        │
@@ -31,4 +30,5 @@ Graphics   ¹Settings   0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9 
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-└─j/k · n kind/phase · N graph · e edit · g graph · d delete kind · r reload───────────────────────┘
+│                                                                                                  │
+╰─j/k · n kind/phase · N graph · e edit · g graph · d delete kind · r reload───────────────────────╯
