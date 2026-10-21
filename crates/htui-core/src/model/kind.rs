@@ -266,7 +266,7 @@ impl GraphScope {
     }
 }
 
-/// `project `<id>``, `workspace `<id>`` or `the library`: the tail of every scope sentence.
+/// ``project `<id>` ``, ``workspace `<id>` `` or `the library`: the tail of every scope sentence.
 impl fmt::Display for GraphScope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

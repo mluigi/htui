@@ -883,18 +883,24 @@ pub trait WriteStore: ReadStore {
 
     // step_graph and phase
 
-    /// Inserts a graph (no phases; [`create_phase`](Self::create_phase) adds them).
+    /// Inserts a graph (no phases; [`create_phase`](Self::create_phase) adds them) at
+    /// `revision` 0. MOD-137 D3: `new.scope` names the owner (a project, a workspace or the
+    /// library), and a name is unique per scope.
     ///
     /// # Errors
-    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when `(project_id, name)`
-    /// is taken or `project_id` names no row.
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint), in this order: an owner
+    /// that names no row (`step_graph.project_id` / `step_graph.workspace_id`, the latter
+    /// [`references_no_row`]); an override outside a project ([`override_outside_project`]); a
+    /// name taken in the scope ([`graph_name_is_taken`]). A taken `id` is refused too; where it
+    /// falls in that order is the backend's.
     async fn create_step_graph(&self, new: NewStepGraph) -> Result<StepGraph>;
 
-    /// Edits `name` / `description` under CAS.
+    /// Edits `name` / `description` under CAS; an applied edit bumps `revision` (MOD-137 D5).
     ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id;
-    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) on a `name` collision.
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) on a `name` taken in the
+    /// graph's scope ([`graph_name_is_taken`]).
     async fn update_step_graph(
         &self,
         id: StepGraphId,
@@ -912,11 +918,19 @@ pub trait WriteStore: ReadStore {
     /// returned. `judge` and `handoff` are template roles, not phase names
     /// ([`TemplateRole::of_name`](crate::prompt::template::TemplateRole::of_name)).
     ///
+    /// A successful insert bumps the graph's `revision` (MOD-137 D5).
+    ///
     /// # Errors
-    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a reserved name, a
-    /// taken `(graph_id, position)` or `(graph_id, name)`, a `graph_id` that names no row, or a
-    /// `persona_id` that names no row (`references_no_row("step_graph_phase.persona_id", id,
-    /// "persona")`), checked after the position and name clashes (MOD-26 D5).
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint), in MOD-137 blueprint
+    /// §T2.2's order (both stores), nothing written on any of them: a reserved name
+    /// ([`reserved_phase_name`]); a node CHECK
+    /// [`phase_row_refusal`](crate::store::phase_row_refusal) decides (`split`/`fan_out`, divide
+    /// columns off a divide node, `max_parts` below one); a `graph_id` that names no row; a taken
+    /// `(graph_id, position)`, then `(graph_id, name)`; then `persona_id`, `planner_persona_id`,
+    /// `integrate_persona_id`, `planner_agent_id`, `integrate_agent_id` naming no row, in that
+    /// order and worded `references_no_row("step_graph_phase.<column>", id, "persona" | "agent")`
+    /// (MOD-26 D5). A taken phase `id` is refused too; where it falls in that order is the
+    /// backend's.
     async fn create_phase(&self, phase: &StepGraphPhase) -> Result<StepGraphPhase>;
 
     /// Inserts `agents` as `phase`'s candidate rows, all or nothing; an empty slice writes nothing
