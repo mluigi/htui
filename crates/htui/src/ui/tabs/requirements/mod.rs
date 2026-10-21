@@ -1150,14 +1150,15 @@ impl RequirementsTab {
             pane = pane.hints(hints.clone());
         }
         let inner = Pane::inner(area);
+        let accent = ctx.accent();
         match &self.mode {
-            Mode::NewArea(form) => form.render(frame, inner, theme),
-            Mode::Requirement(form) => form.render(frame, inner, theme),
+            Mode::NewArea(form) => form.render(frame, inner, accent, theme),
+            Mode::Requirement(form) => form.render(frame, inner, accent, theme),
             Mode::Withdraw(form) => {
                 let body = snapshot
                     .and_then(|snapshot| snapshot.requirement(form.id()))
                     .map_or("", |row| row.body.as_str());
-                form.render(frame, inner, body, theme);
+                form.render(frame, inner, body, accent, theme);
             }
             Mode::Browse | Mode::Filter { .. } => {
                 if let Some(lines) = self.detail_lines(inner.width, ctx) {
@@ -2972,6 +2973,94 @@ mod tests {
         assert_eq!(
             keys.hint(views::REQUIREMENTS_WITHDRAW, super::WITHDRAW_HINT),
             "Ctrl+t next \u{b7} F7 cancel"
+        );
+    }
+
+    /// MOD-115 M3 D6, MOD-85: the open form draws through `kit::form`. The focused field carries
+    /// the gutter in the tab's accent (no label in `theme.accent` any more), and the priority is a
+    /// choice whose value is in the base style and whose marks are dim.
+    #[tokio::test]
+    async fn the_requirement_form_is_a_kit_form() {
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let mut tab = tab_on(snapshot);
+        bench.key(&mut tab, KeyCode::Char('e'));
+        let ctx = bench.ctx();
+        let (buffer, rows) = drawn(&tab, &ctx, 100, 30);
+        assert!(
+            rows[0].contains("\u{256d}\u{2500} Amend R-ENT-1 (v2) \u{2500}"),
+            "{rows:#?}"
+        );
+        let (x, y) = find(&rows, "\u{258c}body").expect("the focused body row");
+        assert_eq!(
+            buffer[(x, y)].fg,
+            ctx.accent().fg.expect("a coloured accent")
+        );
+        assert_ne!(
+            buffer[(x + 1, y)].fg,
+            bench.theme.accent.fg.unwrap_or_default(),
+            "the label is banded, not accented"
+        );
+        assert!(find(&rows, " rationale").is_some(), "{rows:#?}");
+        assert!(find(&rows, " deciding item").is_some(), "{rows:#?}");
+        let choice = find(&rows, "\u{2039} must \u{203a}").expect("the priority choice");
+        assert_eq!(
+            buffer[(choice.0, choice.1)].style().fg,
+            bench.theme.dim.fg,
+            "the marks are dim"
+        );
+        assert_eq!(
+            buffer[(choice.0 + 2, choice.1)].style().fg,
+            bench.theme.base.fg.or(Some(ratatui::style::Color::Reset)),
+            "the value is base"
+        );
+        assert!(rows.iter().all(|row| !row.contains("[must]")), "{rows:#?}");
+    }
+
+    /// MOD-85 in monochrome: the choice's value and marks differ by modifier alone, and the
+    /// focused field's gutter is bold.
+    #[tokio::test]
+    async fn the_requirement_form_reads_without_colour() {
+        use ratatui::style::{Color, Modifier};
+        let (snapshot, projects, scope) = platform().await;
+        let mut bench = Bench::new(scope, projects);
+        bench.theme = Theme::monochrome();
+        let mut tab = tab_on(snapshot);
+        bench.key(&mut tab, KeyCode::Char('e'));
+        let (buffer, rows) = drawn(&tab, &bench.ctx(), 100, 30);
+        let (x, y) = find(&rows, "\u{2039} must \u{203a}").expect("the priority choice");
+        let mark = buffer[(x, y)].style();
+        let value = buffer[(x + 2, y)].style();
+        assert!(mark.add_modifier.contains(Modifier::DIM), "{mark:?}");
+        assert!(!value.add_modifier.contains(Modifier::DIM), "{value:?}");
+        let (x, y) = find(&rows, "\u{258c}body").expect("the focused body row");
+        let gutter = buffer[(x, y)].style();
+        assert_eq!(gutter.fg, Some(Color::Reset));
+        assert!(gutter.add_modifier.contains(Modifier::BOLD), "{gutter:?}");
+    }
+
+    /// MOD-115 M3 D3: the area code's rule is help under the code field, and the withdraw's
+    /// sentence help under its field: on the line under the field they are about.
+    #[tokio::test]
+    async fn the_form_help_sits_under_its_field() {
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let mut tab = tab_on(snapshot.clone());
+        bench.key(&mut tab, KeyCode::Char('a'));
+        let (_, rows) = drawn(&tab, &bench.ctx(), 100, 30);
+        let (_, code) = find(&rows, "\u{258c}code").expect("the focused code row");
+        assert!(
+            rows[usize::from(code) + 1].contains("A code is a capital letter"),
+            "{rows:#?}"
+        );
+
+        let mut tab = tab_on(snapshot);
+        bench.key(&mut tab, KeyCode::Char('W'));
+        let (_, rows) = drawn(&tab, &bench.ctx(), 100, 30);
+        let (_, field) = find(&rows, "\u{258c}deciding item").expect("the deciding row");
+        assert!(
+            rows[usize::from(field) + 1].contains("A withdrawn requirement"),
+            "{rows:#?}"
         );
     }
 
