@@ -1655,7 +1655,10 @@ impl SettingsSection for SecretsSection {
                 let mut lines = form.lines(rows.width, ctx.accent(), theme);
                 let notes = self.notes(rows.width, theme);
                 if !notes.is_empty() {
-                    lines.push(Line::default());
+                    // One blank between the form and its notes: the form may end on its own.
+                    if lines.last().is_some_and(|line| line.width() > 0) {
+                        lines.push(Line::default());
+                    }
                     lines.extend(notes);
                 }
                 let offset = in_view(&lines, form.focus_line(rows.width), rows.height);

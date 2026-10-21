@@ -3349,3 +3349,21 @@ async fn the_section_at_80_columns() {
     assert!(frame.contains("n/a in a demo session"), "{frame}");
     insta::assert_snapshot!("demo_80", frame);
 }
+
+/// With no tree to list, the note sits one blank row under the fixed rows, as before the port.
+#[tokio::test]
+async fn no_workspace_is_one_blank_under_the_rows() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    bench.reply(&mut section, &StoreReply::SecretsTree(None));
+    let shown = frame(&bench, &section);
+    let lines: Vec<&str> = shown.lines().collect();
+    let health = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("Health"))
+        .expect("the Health row");
+    assert_eq!(lines[health + 1].trim(), "", "{shown}");
+    assert!(
+        lines[health + 2].contains("no workspace: project scopes need one"),
+        "{shown}"
+    );
+}
