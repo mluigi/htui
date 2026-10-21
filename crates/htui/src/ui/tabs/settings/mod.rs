@@ -103,14 +103,6 @@ pub(crate) fn asked(question: &str, answers: &str) -> String {
     }
 }
 
-/// What a compare-and-set miss says while an editor is open (M4 D8, PRD D8): the text is kept, the
-/// token is not, and the retry is the user's. (M4 D14, promoted for M5.)
-///
-/// Transitional (MOD-115 M3 C4, D-5): it names `Enter` literally, so each section moves to
-/// [`changed_elsewhere`] with the key in force, and M3's T4 deletes this once none uses it.
-/// `pub` until then, so the last lane to drop it does not leave a dead `pub(crate)` item.
-pub const CHANGED_ELSEWHERE: &str = "changed elsewhere since you opened it \u{2014} reloaded; Enter retries against the current row";
-
 /// What the same miss says with **no editor open** to retry from.
 ///
 /// `Enter retries against the current row` would name a row that is not on screen: the editor went
@@ -198,14 +190,13 @@ pub trait SettingsSection {
     }
 }
 
-/// The compare-and-set miss while an editor is open (M4 D8): reloaded, text kept; `retry` is
-/// the label of the key that saves again through the editor's stack (`field.submit`, or
-/// `form.save` for a `TextArea` editor), `None` when unbound (MOD-115 M3 MD-A, D-5). Under the
-/// compiled keys it reads as [`CHANGED_ELSEWHERE`] did. `pub` for the same reason the const is
-/// (C4): no section calls it until its lane converts, and a `pub(crate)` item nothing calls
-/// would fail `-D warnings` in between.
+/// What a compare-and-set miss says while an editor is open (M4 D8, PRD D8): the text is kept, the
+/// token is not, and the retry is the user's. `retry` is the label of the key that saves again
+/// through the editor's stack (`field.submit`, or `form.save` for a `TextArea` editor), `None`
+/// when unbound (MOD-115 M3 MD-A, D-5). Under the compiled keys it reads as M2's
+/// `CHANGED_ELSEWHERE` did, which M3's T4 deleted once no section named `Enter` literally.
 #[must_use]
-pub fn changed_elsewhere(retry: Option<&str>) -> String {
+pub(crate) fn changed_elsewhere(retry: Option<&str>) -> String {
     match retry {
         Some(key) => format!(
             "changed elsewhere since you opened it \u{2014} reloaded; {key} retries against the current row"
@@ -837,7 +828,10 @@ mod tests {
     #[test]
     fn changed_elsewhere_names_the_retry_key_in_force() {
         let compiled = Keys::compiled().label(views::CAPTURE, Act::FieldSubmit);
-        assert_eq!(changed_elsewhere(compiled.as_deref()), CHANGED_ELSEWHERE);
+        assert_eq!(
+            changed_elsewhere(compiled.as_deref()),
+            "changed elsewhere since you opened it \u{2014} reloaded; Enter retries against the current row"
+        );
         let rebound =
             crate::keys::load_str("version = 2\n[field]\nsubmit = [\"ctrl-t\"]\n").expect("loads");
         let label = rebound.label(views::CAPTURE, Act::FieldSubmit);
