@@ -275,6 +275,13 @@ pub const fn os_family(os: OsFamily) -> &'static str {
     }
 }
 
+/// A count with its noun: `1 option`, `0 options`, `3 options`. Never `option(s)`.
+#[must_use]
+pub fn plural(count: usize, one: &str, many: &str) -> String {
+    let noun = if count == 1 { one } else { many };
+    format!("{count} {noun}")
+}
+
 #[cfg(test)]
 mod tests {
     use std::fmt::Debug;
@@ -704,6 +711,24 @@ mod tests {
         ] {
             let style = tone_style(tone, &theme);
             assert_eq!((style.fg, style.bg), (None, None), "{tone:?}");
+        }
+    }
+
+    #[test]
+    fn one_takes_the_singular_and_every_other_count_the_plural() {
+        assert_eq!(plural(0, "option", "options"), "0 options");
+        assert_eq!(plural(1, "option", "options"), "1 option");
+        assert_eq!(plural(2, "option", "options"), "2 options");
+        assert_eq!(plural(1, "entry", "entries"), "1 entry");
+        assert_eq!(plural(12, "entry", "entries"), "12 entries");
+    }
+
+    #[test]
+    fn a_plural_never_hedges_with_a_parenthesis() {
+        for count in 0..4 {
+            let text = plural(count, "agent", "agents");
+            assert!(!text.contains("(s)"), "{text}");
+            assert!(text.starts_with(&count.to_string()), "{text}");
         }
     }
 }
