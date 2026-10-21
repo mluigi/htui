@@ -24,12 +24,12 @@ use htui_agent::probe::ProbeStatus;
 use htui_core::model::{
     AgentId, AgentSummary, AnswerOutcome, BatchClose, BatchId, BindingChange, BoxEdit, BoxId,
     BoxInfo, CitationKind, Document, DocumentHead, DocumentId, EditReason, FollowUpRequest,
-    FollowUpText, Item, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemSpec, ItemSummary,
-    LinkGraph, NewFollowUp, NewPersona, Note, PermissionId, Persona, PersonaId, PersonaPatch,
-    PhaseId, PhasePatch, Priority, ProjectId, ProjectPatch, RelayView, RepoId, RepoPatch,
-    RequirementAreaId, RequirementId, RunCommandId, RunStatus, RunSummary, Scope, SessionEvent,
-    SkillBindingKey, SkillId, SkillPatch, SpecChanges, StepGraphId, StepGraphPatch, StepId,
-    TIMESTAMPTZ_DIGITS, ToolCallCount, WaitingPermission, WorkspaceId, WorkspacePatch,
+    FollowUpText, GraphBody, Item, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemSpec,
+    ItemSummary, LinkGraph, NewFollowUp, NewPersona, Note, PermissionId, Persona, PersonaId,
+    PersonaPatch, PhaseId, PhasePatch, Priority, ProjectId, ProjectPatch, RelayView, RepoId,
+    RepoPatch, RequirementAreaId, RequirementId, RunCommandId, RunStatus, RunSummary, Scope,
+    SessionEvent, SkillBindingKey, SkillId, SkillPatch, SpecChanges, StepGraphId, StepGraphPatch,
+    StepId, TIMESTAMPTZ_DIGITS, ToolCallCount, WaitingPermission, WorkspaceId, WorkspacePatch,
     WorkspaceSummary,
 };
 use htui_core::model::{QueueMove, QueueOverview, QueueSetting};
@@ -645,9 +645,10 @@ pub enum StoreRequest {
         show_hidden: bool,
     },
 
-    // MOD-15 milestone 4 (D5): the nine catalogue requests, served by [`crate::catalogue`]. Every
-    // write carries the `Scope` because the tree the reply re-reads *is* the scope (M4 D7), and all
-    // nine are served through one further or-ed arm of [`try_serve`].
+    // MOD-15 milestone 4 (D5): the eleven catalogue requests (M4's nine, then MOD-137 D12's
+    // `ReplaceGraph` and `DeletePhase`), served by [`crate::catalogue`]. Every write carries the
+    // `Scope` because the tree the reply re-reads *is* the scope (M4 D7), and all eleven are served
+    // through one further or-ed arm of [`try_serve`].
     /// The catalogue of every project in the scope (M4 D2): kinds, graphs, phases. One request per
     /// event, never one per project — the staleness index keeps only the newest of a variant, so N
     /// requests of one variant would leave all but one project undrawn.
@@ -753,6 +754,27 @@ pub enum StoreRequest {
         expected: DateTime<Utc>,
         /// The budget to set, or `None` to clear it and let the rung below answer (D16).
         budget: Option<i64>,
+    },
+    /// MOD-137 D12: the editor's one write. `replace_graph` under CAS on `step_graph.revision`;
+    /// `Stale` answers [`StoreReply::CatalogueStale`], a refusal `Failed { request: "replace_graph" }`.
+    ReplaceGraph {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// The graph to replace; must equal `body.graph.id`.
+        graph: StepGraphId,
+        /// The `revision` the editor opened on.
+        expected_revision: i64,
+        /// Nodes, candidates, parts and edges as the editor holds them. Boxed so the request does
+        /// not grow by a whole graph (clippy `large_enum_variant`).
+        body: Box<GraphBody>,
+    },
+    /// MOD-137 D11/D12: deletes a phase with its candidates, parts, edges and phase bindings.
+    /// Answers [`StoreReply::Catalogue`].
+    DeletePhase {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// The phase to delete.
+        phase: PhaseId,
     },
     /// The ten prompt keys on `App` plus the `Project`-rung keys of every scope project (M5 D3).
     PromptSettings(Scope),
@@ -1248,7 +1270,7 @@ impl StoreRequest {
             Self::InferRepoPaths(..) => "infer_repo_paths",
             // MOD-49: outside `hierarchy::REQUEST_NAMES` on purpose (blueprint D2).
             Self::ListDir { .. } => LIST_DIR,
-            // The nine of `catalogue::REQUEST_NAMES`, in that order (MOD-15 M4 D5).
+            // The eleven of `catalogue::REQUEST_NAMES`, in that order (MOD-15 M4 D5, MOD-137 D12).
             Self::Catalogue(..) => "catalogue",
             Self::CreateKind { .. } => "create_kind",
             Self::UpdateKind { .. } => "update_kind",
@@ -1258,6 +1280,8 @@ impl StoreRequest {
             Self::CreatePhase { .. } => "create_phase",
             Self::UpdatePhase { .. } => "update_phase",
             Self::SetPhaseBudget { .. } => "set_phase_budget",
+            Self::ReplaceGraph { .. } => "replace_graph",
+            Self::DeletePhase { .. } => "delete_phase",
             // The three of `prompt_settings::REQUEST_NAMES`, in that order (MOD-15 M5 D7).
             Self::PromptSettings(..) => "prompt_settings",
             Self::SetSetting { .. } => "set_setting",
@@ -2158,7 +2182,7 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::InferRepoPaths(..)
         | StoreRequest::SetProjectSecretScope { .. }
         | StoreRequest::SecretsTree(..) => hierarchy::serve(backend, request).await?,
-        // The nine catalogue requests, or-ed for the same reason the fourteen above are: a guard
+        // The eleven catalogue requests, or-ed for the same reason the fourteen above are: a guard
         // does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would be an
         // E0004 here (MOD-15 M3 plan F-12, M4 plan F-2).
         StoreRequest::Catalogue(..)
@@ -2169,8 +2193,10 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::UpdateGraph { .. }
         | StoreRequest::CreatePhase { .. }
         | StoreRequest::UpdatePhase { .. }
-        | StoreRequest::SetPhaseBudget { .. } => catalogue::serve(backend, request).await?,
-        // The three prompt settings requests, or-ed for the same reason the twenty-three above are:
+        | StoreRequest::SetPhaseBudget { .. }
+        | StoreRequest::ReplaceGraph { .. }
+        | StoreRequest::DeletePhase { .. } => catalogue::serve(backend, request).await?,
+        // The three prompt settings requests, or-ed for the same reason the twenty-five above are:
         // a guard does not count towards exhaustivity in a wildcard-free `match`, so `_ if …`
         // would be an E0004 here (MOD-15 M3 plan F-12, M5 plan F-13).
         StoreRequest::PromptSettings(..)
@@ -2190,7 +2216,7 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::SaveSkillVersion { .. }
         | StoreRequest::SetSkillBinding { .. }
         | StoreRequest::ImportSkills { .. } => skills::serve(backend, request).await?,
-        // The four connection requests, or-ed for the same reason the twenty-six above are: a
+        // The four connection requests, or-ed for the same reason the twenty-eight above are: a
         // guard does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would
         // be an E0004 here (MOD-15 M3 plan F-12, M6 plan D9). Only the read is answered: the three
         // writers need `reconnect`, `refresher` and the connect context, none of which a function
@@ -2199,7 +2225,7 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::SetDsn(_)
         | StoreRequest::ClearDsn
         | StoreRequest::RebuildCache => connection::serve(backend, request).await?,
-        // The three box requests, or-ed for the same reason the thirty above are: a guard
+        // The three box requests, or-ed for the same reason the thirty-two above are: a guard
         // does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would be an
         // E0004 here (MOD-15 M3 plan F-12, MOD-7 milestone 2 D46, MOD-51 D4).
         StoreRequest::Boxes | StoreRequest::EditBox { .. } | StoreRequest::SetProbeSpec { .. } => {

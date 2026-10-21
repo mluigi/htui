@@ -10,8 +10,8 @@
 
 use chrono::Utc;
 use htui_core::model::{
-    ItemKind, ItemKindId, NewItemKind, NewStepGraph, PersonaId, PhaseId, Project, Scope, StepGraph,
-    StepGraphId, StepGraphPhase,
+    GraphScope, ItemKind, ItemKindId, NewItemKind, NewStepGraph, PersonaId, PhaseId, Project,
+    Scope, StepGraph, StepGraphEdge, StepGraphId, StepGraphPhase,
 };
 use htui_core::prompt::SettingKey;
 use htui_core::seed;
@@ -62,13 +62,16 @@ pub struct ProjectCatalogue {
     pub graphs: Vec<GraphEntry>,
 }
 
-/// One graph and its phases by `position`.
+/// One graph, its phases by `position` and its edges.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GraphEntry {
-    /// The graph row; `updated_at` is its CAS token.
+    /// The graph row; `updated_at` is the CAS token of [`StoreRequest::UpdateGraph`] and
+    /// `revision` that of [`StoreRequest::ReplaceGraph`] (MOD-137 D5).
     pub graph: StepGraph,
     /// Its phases, ordered by `position` (unique per graph).
     pub phases: Vec<StepGraphPhase>,
+    /// `graph_edges(graph)`, by (from position, to position, kind bytes) (MOD-137 D12).
+    pub edges: Vec<StepGraphEdge>,
 }
 
 impl ProjectCatalogue {
@@ -84,15 +87,17 @@ impl ProjectCatalogue {
 }
 
 /// One read of the whole scope: every project of `scope.project_ids` that still names a row, with
-/// its kinds, its graphs and each graph's phases, then the persona registry by name (MOD-26 M2
+/// its kinds, its graphs and each graph's phases and edges, then the persona registry by name (MOD-26 M2
 /// D23) — global rather than per project, so one `personas()` read whatever the scope holds.
 ///
 /// N+1 reads on purpose (D3, M3 D5's trade, same words): they happen per event — activation, a
 /// scope change, after a write — never per keystroke, and a joined reader would be a seam method
 /// six implementors would owe for a read nothing else wants.
 ///
+/// MOD-137 D12 adds one `graph_edges` read per graph to the same N+1 (D3's accepted trade).
+///
 /// The bound is `ReadStore + WriteStore` rather than `ReadStore` alone because `item_kinds`,
-/// `step_graphs` and `phases` live on [`WriteStore`] (which extends [`ReadStore`]); only
+/// `step_graphs`, `phases` and `graph_edges` live on [`WriteStore`] (which extends [`ReadStore`]); only
 /// `project` is on the read half. Same shape as [`crate::hierarchy::snapshot`]'s bound.
 ///
 /// # Errors
@@ -110,7 +115,12 @@ pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
         let mut graphs = Vec::new();
         for graph in store.step_graphs(*id).await? {
             let phases = store.phases(graph.id).await?;
-            graphs.push(GraphEntry { graph, phases });
+            let edges = store.graph_edges(graph.id).await?;
+            graphs.push(GraphEntry {
+                graph,
+                phases,
+                edges,
+            });
         }
         projects.push(ProjectCatalogue {
             project,
@@ -143,7 +153,7 @@ pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
 ///
 /// # Errors
 /// Whatever the seam reports, plus [`StoreError::Unreachable`] offline and
-/// [`StoreError::Backend`] for a request that is not one of this module's nine.
+/// [`StoreError::Backend`] for a request that is not one of this module's eleven.
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreReply> {
     let writer = backend
         .writer()
@@ -212,7 +222,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             writer
                 .create_step_graph(NewStepGraph {
                     id: StepGraphId::new(),
-                    scope: htui_core::model::GraphScope::Project(*project),
+                    scope: GraphScope::Project(*project),
                     name: name.clone(),
                     description: description.clone(),
                     is_override: false,
@@ -307,7 +317,25 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             };
             cas(&writer, scope, &outcome).await
         }
-        // `try_serve` routes exactly this module's nine variants here, so the last arm is
+        // MOD-137 D12: the editor's one write, CAS on `step_graph.revision`. A refusal is the
+        // seam's `Constraint`, which the worker turns into `Failed { request: "replace_graph" }`.
+        StoreRequest::ReplaceGraph {
+            scope,
+            graph,
+            expected_revision,
+            body,
+        } => {
+            let outcome = writer
+                .replace_graph(*graph, *expected_revision, (**body).clone())
+                .await?;
+            cas(&writer, scope, &outcome).await
+        }
+        // MOD-137 D11/D12: the phase goes with its candidates, parts, edges and phase bindings.
+        StoreRequest::DeletePhase { scope, phase } => {
+            writer.delete_phase(*phase).await?;
+            reread(&writer, scope).await
+        }
+        // `try_serve` routes exactly this module's eleven variants here, so the last arm is
         // unreachable from the shell; a caller that reached it anyway is better told which request
         // it sent than killed.
         other => Err(StoreError::Backend(format!(
@@ -338,11 +366,11 @@ async fn cas<T>(writer: &Writer, scope: &Scope, outcome: &CasOutcome<T>) -> Resu
     })
 }
 
-/// The nine request names, in [`StoreRequest`] order.
+/// The eleven request names, in [`StoreRequest`] order: MOD-15 M4's nine, then MOD-137 D12's two.
 ///
-/// [`StoreRequest::name`]'s arms and the section's `Failed` match both read from here, so a tenth
+/// [`StoreRequest::name`]'s arms and the section's `Failed` match both read from here, so a twelfth
 /// request cannot be named in one place and matched in the other.
-pub const REQUEST_NAMES: [&str; 9] = [
+pub const REQUEST_NAMES: [&str; 11] = [
     "catalogue",
     "create_kind",
     "update_kind",
@@ -352,4 +380,6 @@ pub const REQUEST_NAMES: [&str; 9] = [
     "create_phase",
     "update_phase",
     "set_phase_budget",
+    "replace_graph",
+    "delete_phase",
 ];

@@ -17,12 +17,14 @@ use htui::ui::tabs::settings::{
 };
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    ItemKind, ItemKindId, ItemKindPatch, NewProject, PersonaId, PhaseId, PhasePatch, ProjectId,
-    Scope, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, WorkspaceId,
+    EdgeId, EdgeKind, GraphBody, GraphScope, ItemKind, ItemKindId, ItemKindPatch, NewProject,
+    NodeBody, PersonaId, PhaseId, PhasePatch, ProjectId, Scope, StepGraph, StepGraphEdge,
+    StepGraphId, StepGraphPatch, StepGraphPhase, WorkspaceId,
 };
 use htui_core::seed::{PHASES_PER_PROJECT, PhaseSeed, phase_row};
 use htui_core::store::{
-    MemStore, ReadStore, StoreError, WriteStore, item_kind_is_held, reserved_phase_name,
+    MemStore, ReadStore, StoreError, WriteStore, item_kind_is_held, palette_phase_has_edges,
+    reserved_phase_name,
 };
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
 use ratatui::backend::TestBackend;
@@ -68,7 +70,7 @@ async fn demo_catalogue(backend: &Backend) -> CatalogueSnapshot {
     catalogue(serve(backend, &StoreRequest::Catalogue(vulkan_scope())).await)
 }
 
-/// The empty scope every name-only request is built against: the nine names are a property of the
+/// The empty scope every name-only request is built against: the eleven names are a property of the
 /// enum, not of a store.
 fn nil_scope() -> Scope {
     Scope {
@@ -77,7 +79,7 @@ fn nil_scope() -> Scope {
     }
 }
 
-/// One of each of the nine, in [`REQUEST_NAMES`] order. The ids are nil where the request never
+/// One of each of the eleven, in [`REQUEST_NAMES`] order. The ids are nil where the request never
 /// reaches a store.
 fn catalogue_requests() -> Vec<StoreRequest> {
     vec![
@@ -134,6 +136,29 @@ fn catalogue_requests() -> Vec<StoreRequest> {
             expected: Utc::now(),
             budget: None,
         },
+        StoreRequest::ReplaceGraph {
+            scope: nil_scope(),
+            graph: StepGraphId::default(),
+            expected_revision: 0,
+            body: Box::new(GraphBody {
+                graph: StepGraph {
+                    id: StepGraphId::default(),
+                    scope: GraphScope::Project(ProjectId::default()),
+                    name: String::new(),
+                    description: String::new(),
+                    is_override: false,
+                    revision: 0,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            }),
+        },
+        StoreRequest::DeletePhase {
+            scope: nil_scope(),
+            phase: PhaseId::default(),
+        },
     ]
 }
 
@@ -143,7 +168,12 @@ fn catalogue_requests() -> Vec<StoreRequest> {
 fn catalogue_names_are_stable() {
     let requests = catalogue_requests();
     assert_eq!(requests.len(), REQUEST_NAMES.len());
-    assert_eq!(REQUEST_NAMES.len(), 9);
+    assert_eq!(REQUEST_NAMES.len(), 11);
+    assert_eq!(
+        REQUEST_NAMES[9..],
+        ["replace_graph", "delete_phase"],
+        "the two MOD-137 verbs follow the nine (D12)"
+    );
     for (request, name) in requests.iter().zip(REQUEST_NAMES) {
         assert_eq!(request.name(), name);
     }
@@ -256,7 +286,7 @@ async fn an_unknown_project_id_is_skipped() {
     assert_eq!(snapshot.projects[0].project.slug, "vulkan-tutorials");
 }
 
-/// Offline, every one of the nine is refused by its own name with MOD-25's one sentence:
+/// Offline, every one of the eleven is refused by its own name with MOD-25's one sentence:
 /// `Backend::writer()` is `None`, so `serve` never reaches the seam — the read included (D7).
 #[tokio::test]
 async fn offline_refuses_every_catalogue_request_by_name() {
@@ -279,7 +309,7 @@ async fn offline_refuses_every_catalogue_request_by_name() {
     }
 }
 
-/// `catalogue::serve` is reachable only through `try_serve`'s nine or-ed patterns, so a request
+/// `catalogue::serve` is reachable only through `try_serve`'s eleven or-ed patterns, so a request
 /// from anywhere else is told which one it sent rather than panicking.
 #[tokio::test]
 async fn serve_refuses_a_foreign_request_by_name() {
@@ -772,6 +802,238 @@ async fn delete_kind_of_an_unreferenced_kind_reports_the_mirror() {
     );
 }
 
+// ---- MOD-137 T4: edges in the catalogue, `ReplaceGraph` and `DeletePhase` ----
+
+/// The entry of one of the demo project's graphs, or a panic naming the id.
+#[track_caller]
+fn graph_entry(snapshot: &CatalogueSnapshot, graph: StepGraphId) -> &GraphEntry {
+    snapshot.projects[0]
+        .graph(graph)
+        .unwrap_or_else(|| panic!("the catalogue names graph {graph}"))
+}
+
+/// The phase of `entry` called `name`, or a panic.
+#[track_caller]
+fn phase_named<'a>(entry: &'a GraphEntry, name: &str) -> &'a StepGraphPhase {
+    entry
+        .phases
+        .iter()
+        .find(|phase| phase.name == name)
+        .unwrap_or_else(|| panic!("graph `{}` has a phase `{name}`", entry.graph.name))
+}
+
+/// The body an editor would send for `entry` as the catalogue holds it: every phase a node with no
+/// candidates and no parts (the demo seeds none), and the entry's edges.
+fn body_of(entry: &GraphEntry) -> GraphBody {
+    GraphBody {
+        graph: entry.graph.clone(),
+        nodes: entry
+            .phases
+            .iter()
+            .map(|phase| NodeBody {
+                phase: phase.clone(),
+                agents: Vec::new(),
+                parts: Vec::new(),
+            })
+            .collect(),
+        edges: entry.edges.clone(),
+    }
+}
+
+/// The analysis graph with `verdict` renamed `decide` and an `asks_you decide → research` edge
+/// (`loop_limit 1`) added, as a `ReplaceGraph` on the revision the catalogue carries.
+fn rename_verdict_request(entry: &GraphEntry) -> StoreRequest {
+    let mut body = body_of(entry);
+    let research = phase_named(entry, "research").id;
+    let verdict = phase_named(entry, "verdict").id;
+    for node in &mut body.nodes {
+        if node.phase.id == verdict {
+            node.phase.name = "decide".to_owned();
+        }
+    }
+    body.edges.push(StepGraphEdge {
+        id: EdgeId::new(),
+        graph_id: entry.graph.id,
+        from: verdict,
+        to: research,
+        kind: EdgeKind::AsksYou,
+        predicate: None,
+        loop_limit: Some(1),
+    });
+    StoreRequest::ReplaceGraph {
+        scope: vulkan_scope(),
+        graph: entry.graph.id,
+        expected_revision: entry.graph.revision,
+        body: Box::new(body),
+    }
+}
+
+/// Every graph entry carries its seeded edges (MOD-137 D9, D12): one `next` in analysis, the bug
+/// graph's `review → fix` loop, fourteen in the project, every graph on revision 0.
+#[tokio::test]
+async fn the_demo_catalogue_carries_seeded_edges() {
+    let snapshot = demo_catalogue(&demo()).await;
+
+    let analysis = graph_entry(&snapshot, ids::GRAPH_VULKAN_ANA);
+    assert_eq!(analysis.edges.len(), 1);
+    assert_eq!(analysis.edges[0].kind, EdgeKind::Next);
+    assert_eq!(analysis.edges[0].from, phase_named(analysis, "research").id);
+    assert_eq!(analysis.edges[0].to, phase_named(analysis, "verdict").id);
+
+    let bug = graph_entry(&snapshot, ids::GRAPH_VULKAN_FIX);
+    let review = phase_named(bug, "review").id;
+    let fix = phase_named(bug, "fix");
+    let loops: Vec<&StepGraphEdge> = bug
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::ChangesRequested)
+        .collect();
+    assert_eq!(loops.len(), 1, "one review loop in the bug graph");
+    assert_eq!((loops[0].from, loops[0].to), (review, fix.id));
+    assert_eq!(loops[0].loop_limit, Some(fix.retry_limit));
+
+    let graphs = &snapshot.projects[0].graphs;
+    let edges: usize = graphs.iter().map(|entry| entry.edges.len()).sum();
+    assert_eq!(edges, 14, "ten `next` and four review loops");
+    for entry in graphs {
+        assert_eq!(
+            entry.graph.revision, 0,
+            "`{}` is unedited",
+            entry.graph.name
+        );
+        assert!(
+            entry
+                .edges
+                .iter()
+                .all(|edge| edge.graph_id == entry.graph.id),
+            "`{}` carries only its own edges",
+            entry.graph.name
+        );
+    }
+}
+
+/// The editor's one write lands whole and the reply is the catalogue re-read: the renamed phase,
+/// the new edge, and the revision moved by one (MOD-137 D10, D12).
+#[tokio::test]
+async fn replace_graph_round_trips_through_the_catalogue() {
+    let backend = demo();
+    let before = demo_catalogue(&backend).await;
+    let entry = graph_entry(&before, ids::GRAPH_VULKAN_ANA);
+    let verdict = phase_named(entry, "verdict").id;
+    let research = phase_named(entry, "research").id;
+
+    let snapshot = catalogue(serve(&backend, &rename_verdict_request(entry)).await);
+
+    let after = graph_entry(&snapshot, ids::GRAPH_VULKAN_ANA);
+    assert_eq!(after.graph.revision, 1);
+    let names: Vec<&str> = after.phases.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["research", "decide"]);
+    assert_eq!(
+        phase_named(after, "decide").id,
+        verdict,
+        "a kept node keeps its id"
+    );
+    let asks: Vec<&StepGraphEdge> = after
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::AsksYou)
+        .collect();
+    assert_eq!(asks.len(), 1);
+    assert_eq!((asks[0].from, asks[0].to), (verdict, research));
+    assert_eq!(asks[0].loop_limit, Some(1));
+    assert_eq!(after.edges.len(), 2, "the seeded `next` survives");
+}
+
+/// The same request twice: the second carries a spent revision and answers `CatalogueStale` with
+/// the catalogue as the first left it (D5, D8).
+#[tokio::test]
+async fn a_spent_revision_answers_catalogue_stale() {
+    let backend = demo();
+    let before = demo_catalogue(&backend).await;
+    let request = rename_verdict_request(graph_entry(&before, ids::GRAPH_VULKAN_ANA));
+
+    let first = catalogue(serve(&backend, &request).await);
+    let reply = serve(&backend, &request).await;
+
+    let StoreReply::CatalogueStale(snapshot) = reply else {
+        panic!("a spent revision answers stale: {reply:?}");
+    };
+    assert_eq!(*snapshot, first, "the refused write changed nothing");
+    assert_eq!(
+        graph_entry(&snapshot, ids::GRAPH_VULKAN_ANA).graph.revision,
+        1
+    );
+}
+
+/// A store refusal of the body answers `Failed` by the request's own name with the seam's
+/// sentence (MOD-137 §1.5): here a palette node that keeps an edge.
+#[tokio::test]
+async fn a_refused_replace_graph_answers_failed_by_name() {
+    let backend = demo();
+    let before = demo_catalogue(&backend).await;
+    let entry = graph_entry(&before, ids::GRAPH_VULKAN_ANA);
+    let mut body = body_of(entry);
+    let research = phase_named(entry, "research").id;
+    for node in &mut body.nodes {
+        if node.phase.id == research {
+            node.phase.palette = true;
+        }
+    }
+    let edge = body.edges[0].id;
+
+    let (request, message) = refusal(
+        serve(
+            &backend,
+            &StoreRequest::ReplaceGraph {
+                scope: vulkan_scope(),
+                graph: entry.graph.id,
+                expected_revision: entry.graph.revision,
+                body: Box::new(body),
+            },
+        )
+        .await,
+    );
+
+    assert_eq!(request, "replace_graph");
+    assert!(
+        message.contains(&palette_phase_has_edges("research", edge)),
+        "the sentence names the palette node and its edge: {message}"
+    );
+    assert_eq!(
+        graph_entry(&demo_catalogue(&backend).await, ids::GRAPH_VULKAN_ANA)
+            .graph
+            .revision,
+        0,
+        "the refused write bumped nothing"
+    );
+}
+
+/// A phase deleted goes with its edges, the graph's revision moves, and the reply is the catalogue
+/// re-read (MOD-137 D11, D12).
+#[tokio::test]
+async fn delete_phase_rereads_the_catalogue() {
+    let backend = demo();
+    let before = demo_catalogue(&backend).await;
+    let verdict = phase_named(graph_entry(&before, ids::GRAPH_VULKAN_ANA), "verdict").id;
+
+    let snapshot = catalogue(
+        serve(
+            &backend,
+            &StoreRequest::DeletePhase {
+                scope: vulkan_scope(),
+                phase: verdict,
+            },
+        )
+        .await,
+    );
+
+    let after = graph_entry(&snapshot, ids::GRAPH_VULKAN_ANA);
+    let names: Vec<&str> = after.phases.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["research"]);
+    assert!(after.edges.is_empty(), "the phase's edge went with it");
+    assert_eq!(after.graph.revision, 1);
+}
+
 // -------------------------------------------------------------------------------------------
 // ---- section (T2) ----
 //
@@ -996,7 +1258,7 @@ async fn an_unreferenced_graph_is_listed_after_the_kinds() {
     snapshot.projects[0].graphs.push(GraphEntry {
         graph: StepGraph {
             id: StepGraphId::new(),
-            scope: htui_core::model::GraphScope::Project(ids::PROJECT_VULKAN),
+            scope: GraphScope::Project(ids::PROJECT_VULKAN),
             name: "orphan".to_owned(),
             description: String::new(),
             is_override: false,
@@ -1005,6 +1267,7 @@ async fn an_unreferenced_graph_is_listed_after_the_kinds() {
             updated_at: now,
         },
         phases: Vec::new(),
+        edges: Vec::new(),
     });
     bench.reply(&mut section, &StoreReply::Catalogue(Box::new(snapshot)));
     let _ = bench.drained();
