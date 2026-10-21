@@ -355,8 +355,8 @@ pub const PROJECT_TYPES: [BuiltinProjectType; 6] = [
     },
 ];
 
-/// A built-in's `project_type` row. `at` fills both stamps: `MemStore` passes the epoch, and
-/// Postgres's rows carry the migration's `now()`.
+/// A built-in's `project_type` row, `at` in both stamps. Only `MemStore` calls it, with the
+/// epoch; Postgres's rows are the migration's own, stamped by its `now()`.
 #[must_use]
 pub fn project_type_row(builtin: &BuiltinProjectType, at: DateTime<Utc>) -> ProjectType {
     ProjectType {

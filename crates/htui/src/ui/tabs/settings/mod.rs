@@ -4,8 +4,8 @@
 //! MOD-2's agent registry, MOD-7's `Boxes` section (every box of the user, this box marked),
 //! MOD-9's skills, MOD-15's hierarchy, MOD-26's persona registry (`Personas`, milestone 2),
 //! MOD-10's secret provider (`Secrets`, milestone 4), MOD-12's queue caps (`Queue`, milestone 2)
-//! and MOD-146's project types (`Project types`) each want a section of this tab, and each should be a file plus one `register` line rather
-//! than a `match` arm growing in here.
+//! and MOD-146's project types (`Project types`) each want a section of this tab, and each should
+//! be a file plus one `register` line rather than a `match` arm growing in here.
 //! [`SettingsSection`] mirrors
 //! [`DetailTab`](crate::ui::tabs::backlog::detail::DetailTab) one level across, with
 //! [`on_scope_change`](SettingsSection::on_scope_change) where the detail pane has
