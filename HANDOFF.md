@@ -14,7 +14,12 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-20):** **ANA-37 and ANA-38 are reconciled, and ANA-38's requirement edits
+**Current status (2026-10-21):** **MOD-146 is done** (`docs/decisions/mod/mod-146.md`): a
+`project_type` table with six built-in rows (software, research, docs, ops, general, workspace),
+`project.type` (existing projects `software`), the `coding` flag ANA-39 and MOD-128 read, and a
+read-only Settings › Project types section; the Settings strip now scrolls to its active section.
+MOD-147 is unblocked; MOD-148 waits on MOD-145 only.
+**ANA-37 and ANA-38 are reconciled, and ANA-38's requirement edits
 are applied** (the "Reconciled" sections of `docs/decisions/ana/ana-37.md` and
 `docs/decisions/ana/ana-38.md`): one Qdrant for the whole database, run like Postgres, with one URL
 setting and one API key; a collection per workspace plus one global memory collection, unversioned while
@@ -23,9 +28,7 @@ htui is in development, an indexer lease each; memory is "must" (`R-ENT-13`), au
 score supersedes nothing until MOD-169 measures a threshold. **ANA-38 is concluded** (`docs/ANA-38.md`):
 verbatim memory entries (`fact`, `decision`, `gotcha`, `lesson`; project, workspace, global) written by
 the light model, freshness computed by code, a Postgres-only prompt section; spawned **MOD-163..169**.
-**ANA-37 is concluded** (`docs/ANA-37.md`): knowledge search is a required service failing open
-("knowledge search unavailable"), covering everything a workspace knows except code, one indexer under a
-Postgres lease; spawned **MOD-158..162**. Earlier completions, ANA-36 back to the 2026-10-14
+Earlier completions, ANA-37 back to the 2026-10-14
 requirements audit, are in `DECISIONS.md`; the 2026-10-15 reviews are in
 `docs/requirements-review-2026-10-15.md` and `docs/ui-redesign-findings-2026-10-15.md`.
 Requirement edits still waiting for the maintainer: ANA-34's (`docs/ANA-34.md` §10, `R-TUI-9` final
@@ -98,8 +101,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   `R-AGT-5`); what a coding session is (the project type, phase or kind); install and detection
   through R-AGT-10's tool managers; per-box indexing cost and freshness; and the excerpt-provider half
   of `R-PRM-1` (ANA-3 shipped none). Not blocked. ANA-35 is concluded: a coding session can key on
-  `project_type.coding` (MOD-146, `docs/ANA-35.md` §7.4).
-  of `R-PRM-1` (ANA-3 shipped none). Not blocked.
+  `project_type.coding` (shipped by MOD-146, `docs/decisions/mod/mod-146.md`; read through
+  `WriteStore::project_types`).
   ANA-36 §10 adds design input: htui ships no code search or read tool of its own; these tools cover it.
 
 - [ ] **ANA-41 - Project workflows** (from the UI redesign review, `docs/ui-redesign-findings-2026-10-15.md` §8). `R-ORCH-1`,
@@ -422,10 +425,6 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   session folder; chat fallback; `touched_paths` refused for repo-less projects; cwd → project via
   `--project` or the workspace folder; clone and driven-target refusals for folders. Not blocked; lands
   with MOD-106.
-- [ ] **MOD-146 - Project type table** (from ANA-35, `docs/ANA-35.md` §7.4). `R-ID-1`, `R-ENT-3`,
-  `R-TUI-8`. `project_type` with its six built-in rows (software, research, docs, ops, general,
-  workspace; no recipes), `project.type` (existing projects `software`), and the `coding` flag ANA-39
-  and MOD-128 read; types listed read-only in Settings. Small. Not blocked.
 - [ ] **MOD-147 - Workspace scope: items, kinds, documents, folder** (from ANA-35, `docs/ANA-35.md`
   §7.5). `R-ENT-2`, `R-ENT-5`, `R-ENT-7`, `R-ENT-12`, `R-ENT-16`, `R-STO-3`, `R-STO-8`, `R-MCP-1`. The
   scope row (type `workspace`, slug `@<workspace-slug>`), its visibility predicate and bootstrap
@@ -437,13 +436,14 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   per-workspace collections (no `htui_concepts_v4` rename while htui is in development), MOD-112's
   workspace scope. The scope row owns the workspace's graphs as a project
   does: coordinate with ANA-33's graph storage and owner scope (leased as MOD-137 on `hr/ANA-33`, not
-  yet filed here). Blocked on MOD-146.
+  yet filed here). Not blocked: MOD-146 shipped the `project_type` table and its `workspace` row
+  (`docs/decisions/mod/mod-146.md`).
 - [ ] **MOD-148 - Per-type seeds and the type picker** (from ANA-35, `docs/ANA-35.md` §7.4, §7.2).
   `R-ENT-3`, `R-ENT-6`, `R-ORCH-8`, `R-TUI-8`. Per-type kinds, graphs, phases, `needs_repo`, default
   isolation (`settings.default_isolation`: `worktree` for software, `local` otherwise) and templates,
   copied once at creation; new template bodies (`question`, `answer`, `outline`, `draft`, `execute`,
   `verify`, `investigate`, `postmortem`, the workspace `plan`), `verify` and `postmortem` hard-gated;
-  the type picker in the new-project form; per-type fixture strides. Blocked on MOD-145 and MOD-146.
+  the type picker in the new-project form; per-type fixture strides. Blocked on MOD-145 (MOD-146 is done, `docs/decisions/mod/mod-146.md`).
 - [ ] **MOD-149 - Workspace requirements and nested keys** (from ANA-35, `docs/ANA-35.md` §7.7).
   `R-ENT-14`, `R-ENT-15`. `W-<AREA>-<N>` minting in scope rows; stored keys with
   `UNIQUE (project_id, key)`; `refines_id` with the cross-owner rule; `child_number`, a nullable
@@ -1122,8 +1122,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   `R-AGT-10`, `R-BOX-2`, `R-TUI-7`. A bundle record (Gortex, Headroom, Serena, Graphify) is one `tools` entry with
   linked parts, each toggleable alone, default-on for coding projects and switchable off per project; the box
   probe reports install, daemon and proxy status per part, which may need `box_probe_spec` beyond `kind:path`
-  (unverified). "Coding projects" are those whose type has `project_type.coding` (MOD-146, from
-  ANA-35). Blocked on ANA-39, MOD-127 and MOD-146.
+  (unverified). "Coding projects" are those whose type has `project_type.coding` (shipped by MOD-146,
+  `docs/decisions/mod/mod-146.md`). Blocked on ANA-39 and MOD-127.
 - [ ] **MOD-129 - Hooks, sub-agents and mods as run resources; plugin import into parts** (from ANA-40, §8 P5, P6).
   `R-SKL-4`, `R-TUI-7`, `R-ID-5`, `R-ID-4`. Capability flags on the agent registry row, per-run materialisation
   in an htui-owned location or by launch arguments (never into a managed repository), skip-and-record on mismatch;
@@ -1259,6 +1259,6 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 6 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-39 mandatory context tools, ANA-41 project workflows, ANA-42 execution targets) |
-| MOD-N   | 91 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-144 item status reduction, MOD-145 folder repos and repo-less runs, MOD-146 project types, MOD-147 workspace scope, MOD-148 per-type seeds, MOD-149 workspace requirement keys, MOD-150 link kinds, MOD-151 tool guidance, MOD-152 async commands and logs, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-158 Qdrant setting and key, MOD-159 knowledge indexer, MOD-160 knowledge search fail-open, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-163 memory entry store, MOD-164 automatic memory capture, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-115 TUI shell, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-137 step graph v2 storage, MOD-138 snapshot v2 and walker, MOD-139 divided fan-out runtime, MOD-140 planner tools and run-time changes, MOD-141 step-graph editor, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
+| MOD-N   | 90 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-144 item status reduction, MOD-145 folder repos and repo-less runs, MOD-147 workspace scope, MOD-148 per-type seeds, MOD-149 workspace requirement keys, MOD-150 link kinds, MOD-151 tool guidance, MOD-152 async commands and logs, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-158 Qdrant setting and key, MOD-159 knowledge indexer, MOD-160 knowledge search fail-open, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-163 memory entry store, MOD-164 automatic memory capture, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-115 TUI shell, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-137 step graph v2 storage, MOD-138 snapshot v2 and walker, MOD-139 divided fan-out runtime, MOD-140 planner tools and run-time changes, MOD-141 step-graph editor, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
 | CLEAN-N | 0 |
 | TOOL-N  | 2 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check) |

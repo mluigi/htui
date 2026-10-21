@@ -15,7 +15,8 @@ override.
 **Complexity**: Small. One Postgres migration, one mirror migration, one model type and one new field
 on `Project`, one `WriteStore` read across five implementors, one Settings section.
 
-**Status**: **confirmed** 2026-10-20 at the CONFIRM gate with the defaults of OQ-1–OQ-4;
+**Status**: **complete** 2026-10-21 (`608764f1`..`ee29adab`, write-up `docs/decisions/mod/mod-146.md`).
+**Confirmed** 2026-10-20 at the CONFIRM gate with the defaults of OQ-1–OQ-4;
 fact-checked the same day (see "Verified claims").
 
 **Out of scope (owned elsewhere)**: per-type seeds, templates, `needs_repo`, default isolation and the
