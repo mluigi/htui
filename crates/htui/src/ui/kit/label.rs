@@ -169,15 +169,16 @@ pub const fn billing(billing: Billing) -> &'static str {
     }
 }
 
-/// An agent's probe verdict on a box. `⚠ needs login` is 13 cells, the Agents table's
-/// `on this box` column; `✗ probe failed` is 14.
+/// An agent's probe verdict on a box. Every mark fits the Agents table's 13-cell `on this box`
+/// column whole; `⚠ needs login` fills it. The column already says it is the probe, so a failed
+/// probe reads `✗ failed`, the word that cell shows today.
 #[must_use]
 pub const fn probe(status: ProbeStatus) -> Mark {
     match status {
         ProbeStatus::Ready => mark("●", "ready", Tone::Done),
         ProbeStatus::Unauthenticated => mark("⚠", "needs login", Tone::NeedsYou),
         ProbeStatus::Missing => mark("✗", "missing", Tone::Failed),
-        ProbeStatus::Failed => mark("✗", "probe failed", Tone::Failed),
+        ProbeStatus::Failed => FAILED,
     }
 }
 
@@ -584,10 +585,15 @@ mod tests {
                 ("●", "ready", Tone::Done),
                 ("⚠", "needs login", Tone::NeedsYou),
                 ("✗", "missing", Tone::Failed),
-                ("✗", "probe failed", Tone::Failed),
+                ("✗", "failed", Tone::Failed),
             ]
         );
-        // The Agents table's `on this box` cell is 13 wide, and the login prompt fills it.
+        // The Agents table's `on this box` cell is 13 wide: every verdict fits it whole, and the
+        // login prompt fills it.
+        for (raw, mark) in &table {
+            let width = cell_width(&format!("{} {}", mark.glyph, mark.word));
+            assert!(width <= 13, "ProbeStatus::{raw} is {width} cells");
+        }
         let login = probe(ProbeStatus::Unauthenticated);
         assert_eq!(cell_width(&format!("{} {}", login.glyph, login.word)), 13);
     }
