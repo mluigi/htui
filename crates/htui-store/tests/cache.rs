@@ -18,9 +18,9 @@ use htui_store::testkit as common;
 use chrono::{SubsecRound as _, TimeDelta, Utc};
 use htui_core::fixtures::{self, ids};
 use htui_core::model::{
-    CitationKind, DocumentId, EventKind, EventRole, ItemFilter, LinkGraph, NewDocument, ProjectId,
-    PromptScope, Resolution, RunId, Scope, SessionEvent, Status, StepId, StepOpening, UserId,
-    WorkspaceSummary,
+    CitationKind, DocumentId, EventKind, EventRole, ItemFilter, LinkGraph, MemoryEntryId,
+    NewDocument, ProjectId, PromptScope, Resolution, RunId, Scope, SessionEvent, Status, StepId,
+    StepOpening, UserId, WorkspaceSummary,
 };
 use htui_core::store::{MemStore, ReadStore as _, StepFence, StoreError, WriteStore as _};
 use htui_store::cache::refresh::{RefreshSettings, Refresher, run_pass};
@@ -2581,6 +2581,23 @@ async fn this_user_resolves_the_synced_name_and_refuses_an_unsynced_one() {
     );
 
     teardown(db, &[&cache]).await;
+}
+
+/// MOD-163 plan D7: `memory_entry` and `memory_entry_revision` are not mirrored, so the cache
+/// answers both memory reads `None` ("not available here"). Cache-only rather than a `READ_CASES`
+/// entry, because `MemStore` and `PgStore` answer `Some`. No database: a plain temp directory.
+#[tokio::test]
+async fn memory_is_not_mirrored_so_the_cache_answers_none() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let cache = CacheStore::open(dir.path(), "memory-not-mirrored", 1)
+        .await
+        .expect("open a fresh mirror");
+    assert_eq!(
+        cache.memory_entries(ids::PROJECT_HTUI, None).await,
+        Ok(None)
+    );
+    assert_eq!(cache.memory_revisions(MemoryEntryId::new()).await, Ok(None));
+    cache.close().await;
 }
 
 // ------------------------------------------------------------------------------------------------

@@ -31,13 +31,14 @@ use chrono::{DateTime, Utc};
 use htui_core::model::{
     Agent, AgentId, AgentSummary, Billing, BoxId, BoxInfo, CitationKind, CoverageRow, Document,
     DocumentHead, DocumentId, EventKind, EventRole, GateOutcome, Isolation, Item, ItemCitation,
-    ItemFilter, ItemId, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, Note, NoteId,
-    OsFamily, Priority, Project, ProjectId, ProjectRef, PromptScope, RepoId, Requirement,
-    RequirementArea, RequirementFilter, RequirementId, RequirementRevision, RequirementSpec,
-    RequirementState, Resolution, ResolvedInput, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
-    RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Status,
-    StepGraphId, StepId, StepOpening, StepStatus, ToolCallCount, Transport, UpstreamEntry, UserId,
-    VerifyOutcome, WaitingCandidate, WorkspaceId, WorkspaceSummary,
+    ItemFilter, ItemId, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, MemoryEntry,
+    MemoryEntryId, MemoryRevision, MemoryState, Note, NoteId, OsFamily, Priority, Project,
+    ProjectId, ProjectRef, PromptScope, RepoId, Requirement, RequirementArea, RequirementFilter,
+    RequirementId, RequirementRevision, RequirementSpec, RequirementState, Resolution,
+    ResolvedInput, Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary,
+    RunStepTree, RunSummary, Scope, SessionEvent, Status, StepGraphId, StepId, StepOpening,
+    StepStatus, ToolCallCount, Transport, UpstreamEntry, UserId, VerifyOutcome, WaitingCandidate,
+    WorkspaceId, WorkspaceSummary,
 };
 use htui_core::store::{ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -1218,6 +1219,22 @@ impl ReadStore for CacheStore {
         &self,
         _id: RequirementId,
     ) -> Result<Option<Vec<RequirementRevision>>> {
+        Ok(None)
+    }
+
+    /// Always `None`: `memory_entry` is not mirrored (MOD-163 plan D7); `None` is the seam's
+    /// "not available here".
+    async fn memory_entries(
+        &self,
+        _project: ProjectId,
+        _states: Option<Vec<MemoryState>>,
+    ) -> Result<Option<Vec<MemoryEntry>>> {
+        Ok(None)
+    }
+
+    /// Always `None`: `memory_entry_revision` is not mirrored (MOD-163 plan D7); `None` is the
+    /// seam's "not available here".
+    async fn memory_revisions(&self, _id: MemoryEntryId) -> Result<Option<Vec<MemoryRevision>>> {
         Ok(None)
     }
 

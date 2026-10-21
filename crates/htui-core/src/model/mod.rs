@@ -90,6 +90,7 @@ pub mod item_merge;
 pub mod item_spec;
 pub mod kind;
 pub mod link;
+pub mod memory;
 pub mod note;
 pub mod overlap;
 pub mod persona;
@@ -124,8 +125,8 @@ pub use hierarchy::{
     WorkspaceSummary,
 };
 pub use ids::{
-    AgentId, BatchId, BoxId, CommandRunId, DocumentId, EdgeId, ItemId, ItemKindId, NoteId,
-    PermissionId, PersonaId, PhaseId, ProjectId, PromptTemplateId, RelaySessionId, RepoId,
+    AgentId, BatchId, BoxId, CommandRunId, DocumentId, EdgeId, ItemId, ItemKindId, MemoryEntryId,
+    NoteId, PermissionId, PersonaId, PhaseId, ProjectId, PromptTemplateId, RelaySessionId, RepoId,
     RequirementAreaId, RequirementId, RunCommandId, RunId, SkillBindingId, SkillId, StepGraphId,
     StepId, UserId, WorkspaceId,
 };
@@ -141,6 +142,11 @@ pub use kind::{
     StepGraph, StepGraphEdge, StepGraphPatch, StepGraphPhase,
 };
 pub use link::{ItemLink, LinkEdge, LinkGraph, LinkKind, LinkNode, UpstreamEntry};
+pub use memory::{
+    MEMORY_BODY_MAX, MEMORY_SUBJECT_MAX, MemoryBody, MemoryEntry, MemoryKind, MemoryPatch,
+    MemoryRevision, MemoryState, MemorySubject, MemorySupersede, MemoryTextError, MemoryUpdate,
+    NewMemoryEntry, memory_subject_key,
+};
 pub use note::{NewNote, Note};
 pub use overlap::{
     Claim, OverlapRule, RepoScope, RunScope, missing_tags_failure, overlaps, scope_of,
@@ -396,6 +402,21 @@ mod tests {
         check_enum(StopMode::ALL, &["graceful", "forced"]);
     }
 
+    /// `0022_memory.sql`'s `memory_entry.kind` CHECK (MOD-163 plan D1).
+    #[test]
+    fn memory_kind_matches_check_list() {
+        check_enum(MemoryKind::ALL, &["fact", "decision", "gotcha", "lesson"]);
+    }
+
+    /// `0022_memory.sql`'s `memory_entry.state` CHECK (MOD-163 plan D1).
+    #[test]
+    fn memory_state_matches_check_list() {
+        check_enum(
+            MemoryState::ALL,
+            &["active", "suspect", "superseded", "retired"],
+        );
+    }
+
     /// `0011_permission_relay.sql`'s `chk_step_permission_status` (MOD-42 plan D1).
     #[test]
     fn permission_status_matches_check_list() {
@@ -523,6 +544,7 @@ mod tests {
         check_id(RelaySessionId::from_uuid(u), u);
         check_id(PersonaId::from_uuid(u), u);
         check_id(BatchId::from_uuid(u), u);
+        check_id(MemoryEntryId::from_uuid(u), u);
     }
 
     #[test]

@@ -41,6 +41,10 @@
 //! live session, over `run_command` (a second kind) and `follow_up_window`; neither is mirrored
 //! (plan D1). `RelayStore` forwards five of them; `request_follow_up`, the answer side, stays here
 //! alone, as `answer_permission` does.
+//!
+//! **MOD-163** (plan D6, D7) adds two `ReadStore` reads and four `WriteStore` writers over
+//! `memory_entry` and `memory_entry_revision`. Neither table is mirrored, so `CacheStore` answers both
+//! reads `None` ("not available here"), as it answers `requirement_revisions`.
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::Value;
@@ -56,19 +60,20 @@ use crate::model::{
     CommandRunId, CommandRunStatus, CoverageRow, Document, DocumentHead, DocumentId,
     FollowUpRequest, FollowUpSettle, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind,
     ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkGraph,
-    NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewNote, NewPersona, NewProject,
-    NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill,
-    NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice,
-    PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId,
-    PhasePatch, Project, ProjectId, ProjectPatch, ProjectType, PromptScope, PromptTemplate,
-    QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch,
-    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate, Resolution,
-    ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill,
-    SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
-    StepStatus, StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
+    MemoryEntry, MemoryEntryId, MemoryPatch, MemoryRevision, MemoryState, MemorySupersede,
+    MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewMemoryEntry,
+    NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
+    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
+    Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId,
+    PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectType,
+    PromptScope, PromptTemplate, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo,
+    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
+    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
+    RequirementUpdate, Resolution, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus,
+    RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent,
+    SettleOutcome, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
+    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
+    StepPermission, StepStatus, StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
     WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
     WorkspaceStop,
 };
@@ -316,6 +321,29 @@ pub trait ReadStore: Send + Sync {
     /// # Errors
     /// The backend's own failures only.
     async fn waiting_candidates(&self, scope: &Scope) -> Result<Vec<WaitingCandidate>>;
+
+    // ---- MOD-163 M1: project memory entries (plan D6, D7) ------------------------------------
+
+    /// The project's memory entries whose `state` is in `states` (`None`: every state; an empty
+    /// list: none), in `(updated_at DESC, id)` order. `Some(vec![])` for an unknown project on
+    /// `MemStore`/`PgStore`. `None` means "not available here": `memory_entry` is not mirrored
+    /// (plan D7), so the offline mirror answers `None` and the M3 pane says so.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn memory_entries(
+        &self,
+        project: ProjectId,
+        states: Option<Vec<MemoryState>>,
+    ) -> Result<Option<Vec<MemoryEntry>>>;
+
+    /// The entry's revisions in `version` order. `Some(vec![])` for an unknown id on
+    /// `MemStore`/`PgStore`; `None` = not available here (the mirror, plan D7), as
+    /// [`requirement_revisions`](Self::requirement_revisions) answers.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn memory_revisions(&self, id: MemoryEntryId) -> Result<Option<Vec<MemoryRevision>>>;
 }
 
 /// Everything a write path needs.
@@ -2325,6 +2353,98 @@ pub trait WriteStore: ReadStore {
     /// # Errors
     /// The backend's own failures only.
     async fn open_permissions(&self, scope: &Scope) -> Result<Vec<WaitingPermission>>;
+
+    // ---- MOD-163 M1: project memory entries (plan D3-D6) ------------------------------------
+
+    /// Inserts a live (`active`) entry at version 1 in `project` with `confirmed_at` = now, and
+    /// its revision 1 (`reason = "created"`, `author_id = new.created_by`, `box_id = new.box_id`),
+    /// in one statement. The text arrives as [`MemorySubject`](crate::model::MemorySubject) and
+    /// [`MemoryBody`](crate::model::MemoryBody), already trimmed, scrubbed and capped (`R-ID-7`). Checked in the order NotFound, Constraint.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "project" }` for an
+    /// unknown project; [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a
+    /// duplicate id, a subject that folds to a live entry's of the same project
+    /// ([`memory_subject_taken`], naming that entry; plan D4), or a `created_by` / `box_id` that
+    /// names no row.
+    ///
+    /// `Constraint` refusals are not ordered among themselves across backends: when two apply,
+    /// either may answer. Only [`already_exists`] and [`memory_subject_taken`] have
+    /// backend-independent text.
+    async fn create_memory_entry(
+        &self,
+        project: ProjectId,
+        new: NewMemoryEntry,
+    ) -> Result<MemoryEntry>;
+
+    /// Compare-and-set amend, one transaction (plan D3, D6): the patched columns, `version + 1`,
+    /// `confirmed_at` = now and a revision with `reason = "amended"`; the state is kept. A patch that
+    /// sets nothing re-confirms the entry. Checked in the order NotFound, divergence, Constraint.
+    /// A token that does not match answers `Diverged` with the revision at `expected_version` and
+    /// writes nothing.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "memory_entry" }`,
+    /// or `{ entity: "memory_entry_revision", id: "<id>@<expected_version>" }` for a token newer
+    /// than the head; [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a
+    /// `retired` or `superseded` entry ([`memory_entry_closed`]), a new subject that folds to
+    /// another live entry's ([`memory_subject_taken`]), or an author / box that names no row.
+    ///
+    /// `Constraint` refusals are not ordered among themselves across backends: when two apply,
+    /// either may answer. Only [`already_exists`], [`memory_subject_taken`] and
+    /// [`memory_entry_closed`] have backend-independent text.
+    async fn amend_memory_entry(
+        &self,
+        id: MemoryEntryId,
+        expected_version: i32,
+        patch: MemoryPatch,
+    ) -> Result<MemoryUpdate>;
+
+    /// `active | suspect → retired`, compare-and-set like
+    /// [`amend_memory_entry`](WriteStore::amend_memory_entry): `version + 1`, a revision with
+    /// `reason = "retired"`, and `confirmed_at` left as it was (plan D3). A retired subject is free
+    /// again (plan D4).
+    ///
+    /// # Errors
+    /// As [`amend_memory_entry`](WriteStore::amend_memory_entry), an already-retired or superseded
+    /// entry included ([`memory_entry_closed`]).
+    ///
+    /// `Constraint` refusals are not ordered among themselves across backends: when two apply,
+    /// either may answer. Only [`already_exists`], [`memory_subject_taken`] and
+    /// [`memory_entry_closed`] have backend-independent text.
+    async fn retire_memory_entry(
+        &self,
+        id: MemoryEntryId,
+        expected_version: i32,
+        author_id: UserId,
+        box_id: Option<BoxId>,
+    ) -> Result<MemoryUpdate>;
+
+    /// Plan D4's "replace" and MOD-164's automatic supersede, in one transaction (plan D6). `old`
+    /// (`active | suspect`, compare-and-set on `expected_version`) moves to `superseded` with
+    /// `superseded_by = new.id`, `version + 1` and a revision with `reason = "superseded"`, written by
+    /// `new.created_by` / `new.box_id`; its `confirmed_at` is left. Then `new` is created in
+    /// `old`'s project as [`create_memory_entry`](WriteStore::create_memory_entry) creates one.
+    /// The new subject may equal or differ from the old one. Checked in the order NotFound (old),
+    /// divergence, Constraint. A divergence or a refusal writes nothing, the new entry included.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "memory_entry" }`
+    /// for an unknown `old` (or `{ entity: "memory_entry_revision" }` as above);
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for an `old` that is
+    /// already `retired` or `superseded` ([`memory_entry_closed`]), a duplicate `new.id`, a new
+    /// subject that folds to a **third** live entry's ([`memory_subject_taken`]), or a
+    /// `created_by` / `box_id` that names no row.
+    ///
+    /// `Constraint` refusals are not ordered among themselves across backends: when two apply,
+    /// either may answer. Only [`already_exists`], [`memory_subject_taken`] and
+    /// [`memory_entry_closed`] have backend-independent text.
+    async fn supersede_memory_entry(
+        &self,
+        old: MemoryEntryId,
+        expected_version: i32,
+        new: NewMemoryEntry,
+    ) -> Result<MemorySupersede>;
 }
 
 /// The `run_step.status` a terminal [`RunStatus`] closes a chat step with, or `None` when the
@@ -3023,6 +3143,22 @@ pub fn citation_key(item: ItemId, requirement: RequirementId, kind: CitationKind
     format!("{item}/{requirement}/{kind}")
 }
 
+// ---- MOD-163: the memory writers' refusals (plan D4, D6) ----
+
+/// Plan D4: a live entry of the same project already holds this folded subject. `subject` is
+/// **that entry's** stored subject, and `existing` its id, so both stores spell the refusal alike
+/// and M3 can offer "edit it, or replace it".
+#[must_use]
+pub fn memory_subject_taken(subject: &str, existing: MemoryEntryId) -> String {
+    format!("memory subject `{subject}` is taken by live entry {existing}")
+}
+
+/// Plan D6: only a live (`active | suspect`) entry is amended, retired or superseded.
+#[must_use]
+pub fn memory_entry_closed(id: MemoryEntryId, state: MemoryState) -> String {
+    format!("memory entry {id} is `{state}`; only an active or suspect entry changes")
+}
+
 // ---- MOD-11: the agent writes' refusals (plan D13, B-4..B-6) ----
 
 /// D13: [`WriteStore::write_step_document`] writes a document a step produced, so it names one.
@@ -3326,7 +3462,8 @@ pub enum DeleteTarget {
 /// `workspace_links` and `workspace_box_paths` only. `phase_agents` is counted on both stores
 /// since MOD-37 R-6 gave `MemStore` the table, and is `0` on the demo fixture, which seeds none;
 /// `run_step_commits`, `run_step_trees` and `command_runs` are counted on both since MOD-4.
-/// MOD-38's six requirement fields are counted on both stores.
+/// MOD-38's six requirement fields are counted on both stores. MOD-163's two memory fields are
+/// counted on both stores (plan D8).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeleteReach {
     /// `workspace_project` rows.
@@ -3391,6 +3528,10 @@ pub struct DeleteReach {
     /// `item_requirement` rows whose item **or** requirement is in the project, tombstones
     /// included: a cross-project citation goes with either end, as `links` does.
     pub item_requirements: u64,
+    /// `memory_entry` rows of the project, every state (MOD-163 plan D8).
+    pub memory_entries: u64,
+    /// `memory_entry_revision` rows of those entries.
+    pub memory_revisions: u64,
 }
 
 /// Where a setting lives (D8): an `app_setting` row, one key of `project.settings`, or

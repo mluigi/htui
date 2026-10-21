@@ -27,16 +27,17 @@ use htui_core::model::{
     BoxRow, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun, CoverageRow, Document,
     DocumentHead, DocumentId, FollowUpRequest, FollowUpSettle, GateOutcome, Item, ItemCitation,
     ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement,
-    ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewNote,
-    NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun,
-    NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission,
-    PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent,
-    PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, PromptTemplate,
-    QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch,
-    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate, Resolution,
-    ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill,
+    ItemSummary, LinkGraph, MemoryEntry, MemoryEntryId, MemoryPatch, MemoryRevision, MemoryState,
+    MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind,
+    NewMemoryEntry, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
+    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
+    Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId,
+    PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope,
+    PromptTemplate, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath,
+    RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter,
+    RequirementId, RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate,
+    Resolution, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus,
+    RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill,
     SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
     StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
     StepStatus, StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
@@ -325,6 +326,24 @@ impl ReadStore for Writer {
         match self {
             Self::Memory(store) => store.waiting_candidates(scope).await,
             Self::Online(pg) => pg.waiting_candidates(scope).await,
+        }
+    }
+
+    async fn memory_entries(
+        &self,
+        project: ProjectId,
+        states: Option<Vec<MemoryState>>,
+    ) -> Result<Option<Vec<MemoryEntry>>> {
+        match self {
+            Self::Memory(store) => store.memory_entries(project, states).await,
+            Self::Online(pg) => pg.memory_entries(project, states).await,
+        }
+    }
+
+    async fn memory_revisions(&self, id: MemoryEntryId) -> Result<Option<Vec<MemoryRevision>>> {
+        match self {
+            Self::Memory(store) => store.memory_revisions(id).await,
+            Self::Online(pg) => pg.memory_revisions(id).await,
         }
     }
 }
@@ -1610,6 +1629,67 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.open_permissions(scope).await,
             Self::Online(pg) => pg.open_permissions(scope).await,
+        }
+    }
+
+    // -- MOD-163 M1: project memory entries (plan D3-D6)
+
+    async fn create_memory_entry(
+        &self,
+        project: ProjectId,
+        new: NewMemoryEntry,
+    ) -> Result<MemoryEntry> {
+        match self {
+            Self::Memory(store) => store.create_memory_entry(project, new).await,
+            Self::Online(pg) => pg.create_memory_entry(project, new).await,
+        }
+    }
+
+    async fn amend_memory_entry(
+        &self,
+        id: MemoryEntryId,
+        expected_version: i32,
+        patch: MemoryPatch,
+    ) -> Result<MemoryUpdate> {
+        match self {
+            Self::Memory(store) => store.amend_memory_entry(id, expected_version, patch).await,
+            Self::Online(pg) => pg.amend_memory_entry(id, expected_version, patch).await,
+        }
+    }
+
+    async fn retire_memory_entry(
+        &self,
+        id: MemoryEntryId,
+        expected_version: i32,
+        author_id: UserId,
+        box_id: Option<BoxId>,
+    ) -> Result<MemoryUpdate> {
+        match self {
+            Self::Memory(store) => {
+                store
+                    .retire_memory_entry(id, expected_version, author_id, box_id)
+                    .await
+            }
+            Self::Online(pg) => {
+                pg.retire_memory_entry(id, expected_version, author_id, box_id)
+                    .await
+            }
+        }
+    }
+
+    async fn supersede_memory_entry(
+        &self,
+        old: MemoryEntryId,
+        expected_version: i32,
+        new: NewMemoryEntry,
+    ) -> Result<MemorySupersede> {
+        match self {
+            Self::Memory(store) => {
+                store
+                    .supersede_memory_entry(old, expected_version, new)
+                    .await
+            }
+            Self::Online(pg) => pg.supersede_memory_entry(old, expected_version, new).await,
         }
     }
 

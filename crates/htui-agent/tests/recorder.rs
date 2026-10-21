@@ -35,20 +35,22 @@ use htui_core::model::{
     BoxRecord, BoxRow, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun, CoverageRow,
     Document, DocumentHead, DocumentId, EventKind, EventRole, FollowUpRequest, FollowUpSettle,
     GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch,
-    ItemPatch, ItemRequirement, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewFollowUp,
-    NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
-    Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId,
-    PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, PromptTemplate, QueuedFollowUp,
-    Quota, QuotaSource, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch,
-    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate, Resolution,
-    ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill,
-    SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
-    StepStatus, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission,
-    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, normalize,
+    ItemPatch, ItemRequirement, ItemSummary, LinkGraph, MemoryEntry, MemoryEntryId, MemoryPatch,
+    MemoryRevision, MemoryState, MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument,
+    NewFollowUp, NewItem, NewItemKind, NewMemoryEntry, NewNote, NewProject, NewPromptTemplate,
+    NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
+    NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice, PermissionId,
+    PermissionStatus, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
+    PromptScope, PromptTemplate, QueuedFollowUp, Quota, QuotaSource, RelaySessionId, RelayView,
+    Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
+    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
+    RequirementUpdate, Resolution, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus,
+    RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent,
+    SettleOutcome, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
+    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
+    StepPermission, StepStatus, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
+    WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    normalize,
 };
 use htui_core::model::{EdgeId, GraphBody, PhasePart, StepGraphEdge};
 use htui_core::prompt::settings::SettingKey;
@@ -434,6 +436,20 @@ impl ReadStore for SpyStore {
     }
     async fn waiting_candidates(&self, scope: &Scope) -> StoreResult<Vec<WaitingCandidate>> {
         self.inner.waiting_candidates(scope).await
+    }
+
+    async fn memory_entries(
+        &self,
+        project: ProjectId,
+        states: Option<Vec<MemoryState>>,
+    ) -> StoreResult<Option<Vec<MemoryEntry>>> {
+        self.inner.memory_entries(project, states).await
+    }
+    async fn memory_revisions(
+        &self,
+        id: MemoryEntryId,
+    ) -> StoreResult<Option<Vec<MemoryRevision>>> {
+        self.inner.memory_revisions(id).await
     }
 }
 
@@ -1283,6 +1299,49 @@ impl WriteStore for SpyStore {
 
     async fn open_permissions(&self, scope: &Scope) -> StoreResult<Vec<WaitingPermission>> {
         self.inner.open_permissions(scope).await
+    }
+
+    // MOD-163 M1: forwarded, never logged.
+    async fn create_memory_entry(
+        &self,
+        project: ProjectId,
+        new: NewMemoryEntry,
+    ) -> StoreResult<MemoryEntry> {
+        self.inner.create_memory_entry(project, new).await
+    }
+
+    async fn amend_memory_entry(
+        &self,
+        id: MemoryEntryId,
+        expected_version: i32,
+        patch: MemoryPatch,
+    ) -> StoreResult<MemoryUpdate> {
+        self.inner
+            .amend_memory_entry(id, expected_version, patch)
+            .await
+    }
+
+    async fn retire_memory_entry(
+        &self,
+        id: MemoryEntryId,
+        expected_version: i32,
+        author_id: UserId,
+        box_id: Option<BoxId>,
+    ) -> StoreResult<MemoryUpdate> {
+        self.inner
+            .retire_memory_entry(id, expected_version, author_id, box_id)
+            .await
+    }
+
+    async fn supersede_memory_entry(
+        &self,
+        old: MemoryEntryId,
+        expected_version: i32,
+        new: NewMemoryEntry,
+    ) -> StoreResult<MemorySupersede> {
+        self.inner
+            .supersede_memory_entry(old, expected_version, new)
+            .await
     }
 
     async fn request_follow_up(&self, new: NewFollowUp) -> StoreResult<FollowUpRequest> {

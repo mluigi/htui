@@ -129,4 +129,6 @@ id_newtype!(
     PersonaId,
     /// `queue_batch.id` (MOD-12 plan D1): one queue activation of one box.
     BatchId,
+    /// `memory_entry.id` (MOD-163 plan D1): one project memory entry.
+    MemoryEntryId,
 );

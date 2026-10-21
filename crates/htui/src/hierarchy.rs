@@ -726,7 +726,7 @@ pub const REQUEST_NAMES: [&str; 13] = [
 /// [`DeleteReach`] fails to compile here rather than being silently left out of a warning that
 /// claims to list everything a delete removes (the zero-omission rule, PRD D13). Shared by
 /// [`reach_parts`] and [`reach_totals`] so the two cannot disagree about what they counted.
-fn labelled(reach: &DeleteReach) -> [(u64, &'static str); 28] {
+fn labelled(reach: &DeleteReach) -> [(u64, &'static str); 30] {
     let DeleteReach {
         workspace_links,
         workspace_box_paths,
@@ -756,6 +756,8 @@ fn labelled(reach: &DeleteReach) -> [(u64, &'static str); 28] {
         requirements,
         requirement_revisions,
         item_requirements,
+        memory_entries,
+        memory_revisions,
     } = *reach;
     [
         (workspace_links, "workspace links"),
@@ -786,6 +788,8 @@ fn labelled(reach: &DeleteReach) -> [(u64, &'static str); 28] {
         (requirements, "requirements"),
         (requirement_revisions, "requirement revisions"),
         (item_requirements, "citations"),
+        (memory_entries, "memory entries"),
+        (memory_revisions, "memory revisions"),
     ]
 }
 
@@ -963,6 +967,27 @@ mod tests {
             ]
         );
         assert_eq!(reach_totals(&reach), (32, 8));
+    }
+
+    /// MOD-163 plan D8: a project delete's memory entries and their revisions are named in the
+    /// warning, last and in field order.
+    #[test]
+    fn reach_parts_names_the_memory_tables() {
+        let reach = DeleteReach {
+            documents: 2,
+            memory_entries: 3,
+            memory_revisions: 5,
+            ..DeleteReach::default()
+        };
+        assert_eq!(
+            reach_parts(&reach),
+            vec![
+                "2 documents".to_owned(),
+                "3 memory entries".to_owned(),
+                "5 memory revisions".to_owned(),
+            ]
+        );
+        assert_eq!(reach_totals(&reach), (10, 3));
     }
 
     #[test]

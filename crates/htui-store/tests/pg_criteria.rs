@@ -21,20 +21,22 @@ use htui_core::model::{
     Agent, AgentBox, AgentId, AnswerOutcome, AnswerRefusal, Billing, BoxId, CancelRequest,
     ChatRunSpec, Claim, CommandRunId, CommandRunStatus, EventKind, EventRole,
     FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest, FollowUpSettle, FollowUpText,
-    GraphSnapshot, Isolation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch,
-    NewCommandRun, NewFollowUp, NewItem, NewProject, NewRepo, NewRequirement, NewRun, NewWorkspace,
-    OpenPermission, PermissionId, PermissionStatus, Priority, ProjectId, QueuedFollowUp,
-    RelayOption, RelayOptionKind, RelaySessionId, RepoId, RequirementId, RunCommandId,
-    RunCommandStatus, RunId, RunMode, RunStatus, RunStepCommit, RunStepTree, SessionEvent,
-    SettleOutcome, SnapshotGraph, SnapshotSettings, Status, StepId, StepOutcome,
+    GraphSnapshot, Isolation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch, MemoryBody,
+    MemoryEntryId, MemoryKind, MemoryPatch, MemoryState, MemorySubject, MemorySupersede,
+    MemoryUpdate, NewCommandRun, NewFollowUp, NewItem, NewMemoryEntry, NewProject, NewRepo,
+    NewRequirement, NewRun, NewWorkspace, OpenPermission, PermissionId, PermissionStatus, Priority,
+    ProjectId, QueuedFollowUp, RelayOption, RelayOptionKind, RelaySessionId, RepoId, RequirementId,
+    RunCommandId, RunCommandStatus, RunId, RunMode, RunStatus, RunStepCommit, RunStepTree,
+    SessionEvent, SettleOutcome, SnapshotGraph, SnapshotSettings, Status, StepId, StepOutcome,
     TIMESTAMPTZ_DIGITS, Transport, UserId, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::prompt::{DEFAULT_TEMPLATES, body_of};
+use htui_core::scrub::MinimalScrubber;
 use htui_core::store::conformance::assert_leased_for;
 use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, SettingRung, StepFence, UpdateOutcome,
-    WriteStore as _,
+    WriteStore as _, already_exists, memory_entry_closed, memory_subject_taken,
 };
 use htui_store::PgStore;
 use sqlx::Row as _;
@@ -3084,6 +3086,9 @@ async fn a_command_run_is_counted_and_taken_by_the_project_delete() {
 /// a case that measured `WriteStore` with `WriteStore` would be self-confirming in exactly the way
 /// this one is written to stop being.
 ///
+/// MOD-163's two memory tables are the exception (blueprint P-6): one entry and one amend go in
+/// through the store, which is safe because the case still measures them with `count(*)`.
+///
 /// `workspace_box_path` is in the list and must **not** move: a project is not a workspace.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_cascade_table_loses_exactly_what_the_report_names() {
@@ -3174,18 +3179,53 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
     .execute(&db.pool)
     .await
     .expect("seed a command_run");
+    // MOD-163 plan D8 (blueprint P-6): one memory entry with one amend, written through the store,
+    // so `memory_entries` / `memory_revisions` below are 1 and 2 rather than `0 == 0`.
+    let scrubber = MinimalScrubber::new([]);
+    let entry = db
+        .store
+        .create_memory_entry(
+            project,
+            NewMemoryEntry {
+                id: MemoryEntryId::new(),
+                kind: MemoryKind::Fact,
+                subject: MemorySubject::new("Cascade", &scrubber).expect("subject"),
+                body: MemoryBody::new("A project delete takes its memory.", &scrubber)
+                    .expect("body"),
+                created_by: ids::USER,
+                box_id: None,
+            },
+        )
+        .await
+        .expect("seed a memory entry");
+    let amended = db
+        .store
+        .amend_memory_entry(
+            entry.id,
+            entry.version,
+            MemoryPatch {
+                author_id: ids::USER,
+                ..MemoryPatch::default()
+            },
+        )
+        .await
+        .expect("amend the memory entry");
+    assert!(
+        matches!(amended, MemoryUpdate::Updated(ref head) if head.version == 2),
+        "the re-confirming amend lands at version 2, got {amended:?}"
+    );
 
     /// Every table of PRD D13's chain, paired with the [`DeleteReach`] field that claims it.
     ///
-    /// Twenty-eight entries for twenty-eight fields: a field added without an entry leaves the
-    /// struct literal below incomplete and the crate does not compile. MOD-38's six requirement
-    /// tables close the list, in `DeleteReach` field order.
+    /// Thirty entries for thirty fields: a field added without an entry leaves the struct literal
+    /// below incomplete and the crate does not compile. MOD-38's six requirement tables follow, in
+    /// `DeleteReach` field order, and MOD-163's two memory tables close it (plan D8).
     ///
     /// `TABLES` and `claimed` are zipped **positionally**, so a new name goes where its field sits
     /// in `DeleteReach` and never simply at the end: `run_step_trees` is struct index 16, between
     /// `run_step_commits` and `command_runs`, and appending it to both arrays would compile while
     /// comparing every later field against the wrong table (T1 audit A-3).
-    const TABLES: [&str; 28] = [
+    const TABLES: [&str; 30] = [
         "workspace_project",
         "workspace_box_path",
         "item",
@@ -3214,6 +3254,8 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         "requirement",
         "requirement_revision",
         "item_requirement",
+        "memory_entry",
+        "memory_entry_revision",
     ];
 
     let mut before = Vec::with_capacity(TABLES.len());
@@ -3259,8 +3301,10 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         requirements,
         requirement_revisions,
         item_requirements,
+        memory_entries,
+        memory_revisions,
     } = report;
-    let claimed: [u64; 28] = [
+    let claimed: [u64; 30] = [
         workspace_links,
         workspace_box_paths,
         items,
@@ -3289,6 +3333,8 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         requirements,
         requirement_revisions,
         item_requirements,
+        memory_entries,
+        memory_revisions,
     ];
 
     for ((table, was), says) in TABLES.into_iter().zip(before).zip(claimed) {
@@ -3310,9 +3356,421 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
             run_step_commits,
             run_step_trees,
             command_runs,
-            repo_box_paths
-        ) == (1, 1, 1, 1, 1),
-        "the six seeded tables are non-zero, so none of them passed on `0 == 0`"
+            repo_box_paths,
+            memory_entries,
+            memory_revisions
+        ) == (1, 1, 1, 1, 1, 1, 2),
+        "the eight seeded tables are non-zero, so none of them passed on `0 == 0`"
+    );
+
+    db.drop_db().await;
+}
+
+/// A [`MemorySubject`] for the MOD-163 cases; the fixtures hold no secret.
+fn memory_subject(raw: &str) -> MemorySubject {
+    MemorySubject::new(raw, &MinimalScrubber::new([])).expect("plain memory subject")
+}
+
+/// A [`MemoryBody`] for the MOD-163 cases; the fixtures hold no secret.
+fn memory_body(raw: &str) -> MemoryBody {
+    MemoryBody::new(raw, &MinimalScrubber::new([])).expect("plain memory body")
+}
+
+/// A [`NewMemoryEntry`] by [`ids::USER`] with no box, for the MOD-163 cases.
+fn new_memory(subject: &str) -> NewMemoryEntry {
+    NewMemoryEntry {
+        id: MemoryEntryId::new(),
+        kind: MemoryKind::Fact,
+        subject: memory_subject(subject),
+        body: memory_body("body"),
+        created_by: ids::USER,
+        box_id: None,
+    }
+}
+
+/// MOD-163 plan D4 (blueprint P-4, T3.4): Postgres's `23505` names only the folded key, so
+/// `PgStore` rolls back and reads the live holder. A clash on create or on an amend's subject
+/// names the holder's stored subject and id, and leaves nothing written; the primary key's
+/// `23505` is the duplicate id; an unknown project is `NotFound`. Once the holder is retired its
+/// subject is free, and another project never clashes. `pg_conformance` holds the
+/// backend-neutral cases; this one pins the Postgres-only mapping.
+#[tokio::test]
+async fn pg_memory_refusals_name_the_live_holder() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let project = ids::PROJECT_HTUI;
+    let holder = db
+        .store
+        .create_memory_entry(project, new_memory("Foo"))
+        .await
+        .expect("create 'Foo'");
+    assert_eq!(
+        (holder.version, holder.confirmed_at, holder.superseded_by),
+        (1, holder.created_at, None),
+        "a create is version 1, confirmed when it was created, superseded by nothing"
+    );
+    assert_eq!(holder.updated_at, holder.created_at);
+
+    let refused = db
+        .store
+        .create_memory_entry(project, new_memory("FOO"))
+        .await
+        .expect_err("a second live 'foo' is refused");
+    assert_eq!(
+        refused,
+        htui_core::store::StoreError::Constraint(memory_subject_taken("Foo", holder.id)),
+        "the refusal names the holder's stored subject and id"
+    );
+
+    let mut twin = new_memory("Bar");
+    twin.id = holder.id;
+    let refused = db
+        .store
+        .create_memory_entry(project, twin)
+        .await
+        .expect_err("a duplicate id is refused");
+    assert_eq!(
+        refused,
+        htui_core::store::StoreError::Constraint(already_exists("memory_entry", holder.id))
+    );
+
+    let refused = db
+        .store
+        .create_memory_entry(ProjectId::new(), new_memory("Baz"))
+        .await
+        .expect_err("an unknown project is refused");
+    assert!(
+        matches!(
+            refused,
+            htui_core::store::StoreError::NotFound {
+                entity: "project",
+                ..
+            }
+        ),
+        "got {refused:?}"
+    );
+
+    let bar = db
+        .store
+        .create_memory_entry(project, new_memory("Bar"))
+        .await
+        .expect("create 'Bar'");
+    let refused = db
+        .store
+        .amend_memory_entry(
+            bar.id,
+            1,
+            MemoryPatch {
+                subject: Some(memory_subject("foo")),
+                author_id: ids::USER,
+                ..MemoryPatch::default()
+            },
+        )
+        .await
+        .expect_err("an amend onto a taken subject is refused");
+    assert_eq!(
+        refused,
+        htui_core::store::StoreError::Constraint(memory_subject_taken("Foo", holder.id))
+    );
+    assert_eq!(
+        db.store
+            .memory_revisions(bar.id)
+            .await
+            .expect("read revisions")
+            .map(|history| history.len()),
+        Some(1),
+        "the refused amend wrote no revision"
+    );
+
+    let retired = db
+        .store
+        .retire_memory_entry(holder.id, 1, ids::USER, Some(ids::BOX))
+        .await
+        .expect("retire 'Foo'");
+    let MemoryUpdate::Updated(retired) = retired else {
+        panic!("retire diverged: {retired:?}");
+    };
+    assert_eq!(
+        (retired.state, retired.version, retired.confirmed_at),
+        (MemoryState::Retired, 2, holder.confirmed_at),
+        "retire moves the state and the version, not confirmed_at"
+    );
+    let refused = db
+        .store
+        .retire_memory_entry(holder.id, 2, ids::USER, None)
+        .await
+        .expect_err("a second retire is refused");
+    assert_eq!(
+        refused,
+        htui_core::store::StoreError::Constraint(memory_entry_closed(
+            holder.id,
+            MemoryState::Retired
+        ))
+    );
+
+    let MemoryUpdate::Updated(amended) = db
+        .store
+        .amend_memory_entry(
+            bar.id,
+            1,
+            MemoryPatch {
+                kind: Some(MemoryKind::Gotcha),
+                subject: Some(memory_subject("foo")),
+                author_id: ids::USER,
+                box_id: Some(ids::BOX),
+                ..MemoryPatch::default()
+            },
+        )
+        .await
+        .expect("the freed subject can be taken")
+    else {
+        panic!("amend diverged");
+    };
+    assert_eq!(
+        (
+            amended.kind,
+            amended.subject.as_str(),
+            amended.body.as_str(),
+            amended.version
+        ),
+        (MemoryKind::Gotcha, "foo", "body", 2)
+    );
+    assert!(
+        amended.confirmed_at > bar.confirmed_at,
+        "an amend re-stamps confirmed_at"
+    );
+    db.store
+        .create_memory_entry(ids::PROJECT_AGY, new_memory("FOO"))
+        .await
+        .expect("another project's 'FOO' never clashes");
+
+    let history = db
+        .store
+        .memory_revisions(bar.id)
+        .await
+        .expect("read revisions")
+        .expect("Postgres holds every revision");
+    assert_eq!(
+        history
+            .iter()
+            .map(|r| (r.version, r.reason.as_str(), r.subject.as_str(), r.box_id))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, "created", "Bar", None),
+            (2, "amended", "foo", Some(ids::BOX))
+        ]
+    );
+    assert_eq!(
+        db.store
+            .memory_revisions(MemoryEntryId::new())
+            .await
+            .expect("read revisions"),
+        Some(vec![]),
+        "an unknown id is an empty history"
+    );
+
+    let live = db
+        .store
+        .memory_entries(
+            project,
+            Some(vec![MemoryState::Active, MemoryState::Suspect]),
+        )
+        .await
+        .expect("list live")
+        .expect("Postgres lists memory");
+    assert_eq!(
+        live.iter().map(|e| e.id).collect::<Vec<_>>(),
+        vec![bar.id],
+        "the state filter keeps live entries only"
+    );
+    let all = db
+        .store
+        .memory_entries(project, None)
+        .await
+        .expect("list all")
+        .expect("Postgres lists memory");
+    assert_eq!(
+        all.iter().map(|e| e.id).collect::<Vec<_>>(),
+        vec![bar.id, holder.id],
+        "newest update first"
+    );
+    assert_eq!(
+        db.store
+            .memory_entries(project, Some(vec![]))
+            .await
+            .expect("list none"),
+        Some(vec![]),
+        "an empty state filter lists nothing"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-163 plan D6 (blueprint P-2, T3.4): a supersede moves the old entry first and inserts its
+/// successor second, in one transaction, so the successor may reuse the old subject. A stale
+/// version is `Diverged` with the ancestor and nothing written; a closed old entry is refused; a
+/// successor clashing with a third live entry rolls the whole supersede back and names that entry.
+#[tokio::test]
+async fn pg_memory_supersede_is_one_transaction() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let project = ids::PROJECT_HTUI;
+    let old = db
+        .store
+        .create_memory_entry(project, new_memory("Foo"))
+        .await
+        .expect("create 'Foo'");
+    let third = db
+        .store
+        .create_memory_entry(project, new_memory("Bar"))
+        .await
+        .expect("create 'Bar'");
+
+    let refused = db
+        .store
+        .supersede_memory_entry(MemoryEntryId::new(), 1, new_memory("Baz"))
+        .await
+        .expect_err("an unknown old entry is refused");
+    assert!(
+        matches!(
+            refused,
+            htui_core::store::StoreError::NotFound {
+                entity: "memory_entry",
+                ..
+            }
+        ),
+        "got {refused:?}"
+    );
+
+    let refused = db
+        .store
+        .supersede_memory_entry(old.id, 1, new_memory("bar"))
+        .await
+        .expect_err("a successor onto a third live entry's subject is refused");
+    assert_eq!(
+        refused,
+        htui_core::store::StoreError::Constraint(memory_subject_taken("Bar", third.id))
+    );
+    assert_eq!(
+        db.store
+            .memory_revisions(old.id)
+            .await
+            .expect("read revisions")
+            .map(|history| history.len()),
+        Some(1),
+        "the refused supersede rolled the old entry's move back"
+    );
+
+    let stale = db
+        .store
+        .supersede_memory_entry(old.id, 7, new_memory("Baz"))
+        .await;
+    assert!(
+        matches!(
+            stale,
+            Err(htui_core::store::StoreError::NotFound {
+                entity: "memory_entry_revision",
+                ..
+            })
+        ),
+        "a token newer than the head names no revision, got {stale:?}"
+    );
+
+    let successor = new_memory(" foo ");
+    let successor_id = successor.id;
+    let MemorySupersede::Superseded { old: moved, new } = db
+        .store
+        .supersede_memory_entry(old.id, 1, successor)
+        .await
+        .expect("supersede 'Foo' with 'foo'")
+    else {
+        panic!("supersede diverged");
+    };
+    assert_eq!(
+        (
+            moved.state,
+            moved.superseded_by,
+            moved.version,
+            moved.confirmed_at
+        ),
+        (
+            MemoryState::Superseded,
+            Some(successor_id),
+            2,
+            old.confirmed_at
+        )
+    );
+    assert_eq!(
+        (new.id, new.subject.as_str(), new.state, new.version),
+        (successor_id, "foo", MemoryState::Active, 1)
+    );
+    let history = db
+        .store
+        .memory_revisions(old.id)
+        .await
+        .expect("read revisions")
+        .expect("Postgres holds every revision");
+    assert_eq!(
+        history
+            .iter()
+            .map(|r| (r.version, r.reason.as_str(), r.state))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, "created", MemoryState::Active),
+            (2, "superseded", MemoryState::Superseded)
+        ]
+    );
+
+    let refused = db
+        .store
+        .supersede_memory_entry(old.id, 2, new_memory("Qux"))
+        .await
+        .expect_err("a superseded entry is closed");
+    assert_eq!(
+        refused,
+        htui_core::store::StoreError::Constraint(memory_entry_closed(
+            old.id,
+            MemoryState::Superseded
+        ))
+    );
+
+    let MemoryUpdate::Updated(_) = db
+        .store
+        .amend_memory_entry(
+            third.id,
+            1,
+            MemoryPatch {
+                author_id: ids::USER,
+                ..MemoryPatch::default()
+            },
+        )
+        .await
+        .expect("re-confirm 'Bar'")
+    else {
+        panic!("amend diverged");
+    };
+    let MemorySupersede::Diverged { head, ancestor } = db
+        .store
+        .supersede_memory_entry(third.id, 1, new_memory("Qux"))
+        .await
+        .expect("a stale supersede is no error")
+    else {
+        panic!("a stale supersede must diverge");
+    };
+    assert_eq!(
+        (head.version, ancestor.version, ancestor.reason.as_str()),
+        (2, 1, "created")
+    );
+    assert_eq!(
+        db.store
+            .memory_entries(project, None)
+            .await
+            .expect("list")
+            .map(|all| all.len()),
+        Some(3),
+        "the diverged supersede wrote nothing"
     );
 
     db.drop_db().await;
