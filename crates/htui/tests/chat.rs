@@ -858,8 +858,8 @@ async fn an_answered_permission_replays_resolved() {
     replay(&mut harness, step).await;
     let rendered = harness.render();
     assert!(
-        rendered.contains("permission  reject (by user)"),
-        "the log says who answered and with what: {rendered}"
+        rendered.contains("permission  Reject (by user)"),
+        "the log says who answered and with which option, by its label: {rendered}"
     );
     stable_step().bind(|| insta::assert_snapshot!("replay_answered_permission", rendered));
 }

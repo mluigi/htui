@@ -6,7 +6,7 @@ Graphics   ¹Chat                0 working · 0 waiting · memory · DESKTOP-HTU
 ╭─ replay · step …<step> · 4 rows · read-only ───────────────────────────────────────────────────╮
 │you  clean the build                                                                              │
 │run rm -rf build  ✗ rejected                                                                      │
-│permission  reject (by user)                                                                      │
+│permission  Reject (by user)                                                                      │
 │— turn ended —                                                                                    │
 │                                                                                                  │
 │                                                                                                  │

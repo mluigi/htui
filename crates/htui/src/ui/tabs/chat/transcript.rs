@@ -674,9 +674,14 @@ impl Transcript {
                         // `denied` before the absent option: both a refusal and a cancellation
                         // carry `option_id: None`, and reporting a policy refusal as "cancelled"
                         // would tell the user they stopped their own tool call.
+                        // MOD-115 M3 MOD-83: the chosen option by its label, not the agent's
+                        // id (`allow_always`); an id no option carries is shown as is.
                         let chosen = match (denied, option_id.as_deref()) {
                             (true, _) => "denied",
-                            (false, Some(option)) => option,
+                            (false, Some(option)) => options
+                                .iter()
+                                .find(|candidate| candidate.id == option)
+                                .map_or(option, |candidate| candidate.label.as_str()),
                             (false, None) => "cancelled",
                         };
                         format!("permission  {chosen} (by {by})")
@@ -1298,6 +1303,34 @@ mod tests {
         assert_eq!(
             shown(&parked(vec![option("allow"), option("reject")])),
             ["permission  waiting on you (2 options)"]
+        );
+    }
+
+    /// MOD-115 M3 MOD-83: an answered request names the chosen option by its label, never by
+    /// the agent's own id (`allow_always`); an id no option carries is still shown as is.
+    #[test]
+    fn an_answered_request_names_the_option_by_its_label() {
+        let answered = |option_id: &str| TranscriptRow::Permission {
+            request_id: PermissionRequestId::new("req-1"),
+            tool_call_id: None,
+            options: vec![PermissionOption {
+                id: "allow_always".to_owned(),
+                label: "Always Allow".to_owned(),
+                kind: PermissionOptionKind::AllowAlways,
+            }],
+            resolved: Some(Resolution {
+                option_id: Some(option_id.to_owned()),
+                by: "user".to_owned(),
+                denied: false,
+            }),
+        };
+        assert_eq!(
+            shown(&answered("allow_always")),
+            ["permission  Always Allow (by user)"]
+        );
+        assert_eq!(
+            shown(&answered("unknown")),
+            ["permission  unknown (by user)"]
         );
     }
 
