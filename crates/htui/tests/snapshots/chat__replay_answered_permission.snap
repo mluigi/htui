@@ -3,12 +3,11 @@ source: crates/htui/tests/chat.rs
 expression: rendered
 ---
 Graphics   ¹Chat                0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
-┌ Chat ────────────────────────────────────────────────────────────────────────────────────────────┐
-│replay · step …<step> · 4 rows · read-only · Esc leave                                          │
+╭─ replay · step …<step> · 4 rows · read-only ───────────────────────────────────────────────────╮
 │you  clean the build                                                                              │
-│execute rm -rf build  [rejected]                                                                  │
-│permission  reject (by user)                                                                      │
-│— turn ended (end_turn) —                                                                         │
+│run rm -rf build  ✗ rejected                                                                      │
+│permission  Reject (by user)                                                                      │
+│— turn ended —                                                                                    │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -31,4 +30,5 @@ Graphics   ¹Chat                0 working · 0 waiting · memory · DESKTOP-HTU
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-└─Esc leave replay · t thoughts · j/k scroll───────────────────────────────────────────────────────┘
+│                                                                                                  │
+╰─Esc leave replay · t thoughts · j/k scroll───────────────────────────────────────────────────────╯

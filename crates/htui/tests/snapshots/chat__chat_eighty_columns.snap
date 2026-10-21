@@ -1,0 +1,28 @@
+---
+source: crates/htui/tests/chat.rs
+expression: frame
+---
+Graphics   ¹Chat           0 working · 0 waiting · memory ·  F9  about   ?  keys
+╭─ scripted · sonnet · Vulkan Tu… · fake-<session> ─╮
+│you  clean the build                                                          │
+│run rm -rf build  ◐ running                                                   │
+│permission  waiting on you (3 options)                                        │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│answer   1  Allow once   2  Allow always (agent remembers)   3  Reject        │
+│                                                                              │
+╰─1-9 answer · i compose · t thoughts──────────────────────────────────────────╯

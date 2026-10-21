@@ -23,6 +23,10 @@
 //! the step, and the session the chat runtime binds to it answers at the same address. The header
 //! then reads `promoted · <phase> · <resumed | handoff> · …`, and every command is keyed by the
 //! step's own id as it is for any chat. `Esc Esc` ends the session and leaves the step promoted.
+//!
+//! Since MOD-115 M3 (D5) the tab draws one kit [`Pane`], titled by the session (or the replayed
+//! step): the transcript's scrollbar runs on its right border beside the transcript's rows only,
+//! the composer is its last inner row and the mode's hints sit on its bottom border.
 
 pub mod composer;
 pub mod permission;
@@ -33,8 +37,8 @@ use htui_agent::event::DriverEvent;
 use htui_core::model::{AgentSummary, Scope, StepId};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::text::Line;
+use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::app::{Ctx, Handled};
 use crate::keys::{Act, Context, Hint, HintSpec, KeyChord, Keys, Stack, is_plain, views};
@@ -42,6 +46,11 @@ use crate::run_worker::{OrchReply, Via};
 use crate::store_worker::{ChatFrame, StoreReply, StoreRequest};
 use crate::ui::cells::{self, cell_width};
 use crate::ui::kit::chips::key_line;
+use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::label::plural;
+use crate::ui::kit::pane::Pane;
+use crate::ui::kit::text::{Tone, notice};
+use crate::ui::shell::PaneId;
 use crate::ui::tabs::registry::{Tab, TabId};
 use composer::{Composer, ComposerOutcome};
 use crossterm::event::KeyEvent;
@@ -70,9 +79,12 @@ const REPLAY_HINT: HintSpec = &[
     Hint::Pair(Act::ListDown, Act::ListUp, "scroll"),
 ];
 
-/// The open composer's keys (`CAPTURE`): `field.submit` through the keys in force (MOD-115 M2
-/// RV1 H2), `Esc` as written (MD7).
-const COMPOSE_HINT: HintSpec = &[Hint::One(Act::FieldSubmit, "send"), Hint::Text("Esc leave")];
+/// The open composer's keys (`CAPTURE`): `field.submit` and `field.cancel` through the keys in
+/// force (MOD-115 M2 RV1 H2, M3 MD-A).
+const COMPOSE_HINT: HintSpec = &[
+    Hint::One(Act::FieldSubmit, "send"),
+    Hint::One(Act::FieldCancel, "leave"),
+];
 
 /// A parked permission request (`CHAT_LIVE`): the digits are `answer.option_*` (MOD-115 M2 D7).
 const PARKED_HINT: HintSpec = &[
@@ -101,6 +113,22 @@ const IDLE_HINT: HintSpec = &[
     Hint::One(Act::ChatCompose, "compose the first prompt"),
     Hint::One(Act::ChatNextAgent, "next agent"),
 ];
+
+/// The empty Chat when no agent is enabled, and its next step.
+const NO_AGENT: &str = "no agent is registered on this box";
+const NO_AGENT_NEXT: &str = "Settings \u{203a} Agents adds one";
+
+/// The empty Chat with an agent to talk to.
+const NO_CHAT: &str = "type a prompt to start a chat";
+
+/// The empty Chat's next step: the compose key in force (`chat.compose` through `CHAT_LIVE`), or
+/// where to bind one when it is unbound.
+fn compose_next(keys: &Keys) -> String {
+    keys.label(views::CHAT_LIVE, Act::ChatCompose).map_or_else(
+        || "bind [chat] compose to write the first prompt".to_owned(),
+        |key| format!("{key} composes the first prompt"),
+    )
+}
 
 /// `StoreRequest::name` of a promotion (blueprint D209): its refusal is this tab's to show, since
 /// the shell asked for it on the tab's behalf.
@@ -314,22 +342,16 @@ impl ChatTab {
         handled
     }
 
-    /// The replay header: which step is on screen, how much of it there is, and that it is over,
-    /// naming the key that leaves it (`common.back` through `CHAT_REPLAY`; unbound, no key).
-    fn replay_header(replay: &ReplayState, ctx: &Ctx<'_>) -> Line<'static> {
+    /// The replay header, the pane's title while a replay is open: which step is on screen, how
+    /// much of it there is, and that it is over. The key that leaves it is the bottom border's
+    /// (`REPLAY_HINT`, MOD-115 M3 D5), so the title names none.
+    fn replay_header(replay: &ReplayState) -> String {
         let id = replay.step_id.to_string();
         let step = id.get(id.len().saturating_sub(STEP_TAIL)..).unwrap_or(&id);
-        let leave = ctx.keys().label(views::CHAT_REPLAY, Act::Back).map_or_else(
-            || " · read-only".to_owned(),
-            |label| format!(" · read-only · {label} leave"),
-        );
-        Line::from(vec![
-            Span::styled(
-                format!("replay · step …{step} · {} rows", replay.transcript.len()),
-                ctx.theme.accent,
-            ),
-            Span::styled(leave, ctx.theme.dim),
-        ])
+        format!(
+            "replay · step …{step} · {} · read-only",
+            plural(replay.transcript.len(), "row", "rows")
+        )
     }
 
     /// The current mode's stack, which [`Tab::key_stack`] reports and the hints label through.
@@ -398,65 +420,46 @@ impl ChatTab {
         Handled::Consumed
     }
 
-    /// The header: who is talking, about which project, in which session.
+    /// The header, the pane's title (MOD-115 M3 D5): who is talking, about which project, in
+    /// which session — `<agent> · <model> · <project> · session <ref>`.
     ///
     /// A promoted step's chat names the step instead (D165): `promoted · <phase> · <resumed |
-    /// handoff> · <agent> · <model> · session <ref>`, fitted to `width`. Every other chat's header
-    /// is unchanged.
-    fn header(&self, ctx: &Ctx<'_>, width: u16) -> Line<'static> {
+    /// handoff> · <agent> · <model> · session <ref>`. Either is fitted to `width`, the title's
+    /// room, so the pane never clips it ([`fit_header`]).
+    fn header(&self, ctx: &Ctx<'_>, width: u16) -> String {
         let session = self
             .session
             .as_ref()
             .and_then(|state| state.session_ref.as_ref())
             .map_or(NONE.to_owned(), |reference| reference.as_str().to_owned());
-        if let Some(promoted) = &self.promoted {
-            let via = match promoted.via {
-                Via::Resumed => "resumed",
-                Via::Handoff => "handoff",
-            };
-            let model = promoted.model.as_deref().unwrap_or("default");
-            // The session ref is the one field here that exists to be read back (a later
-            // `session/load`), so the border never cuts it: a line too wide drops the `session `
-            // label first, then cuts the fields before the ref with an ellipsis.
-            let width = usize::from(width);
-            let lead = format!("promoted · {}", promoted.phase);
-            let middle = format!(" · {via} · {} · {model}", promoted.agent);
-            let mut tail = format!(" · session {session}");
-            if cell_width(&lead) + cell_width(&middle) + cell_width(&tail) > width {
-                tail = format!(" · {session}");
+        let (lead, middle) = match &self.promoted {
+            Some(promoted) => {
+                let via = match promoted.via {
+                    Via::Resumed => "resumed",
+                    Via::Handoff => "handoff",
+                };
+                let model = promoted.model.as_deref().unwrap_or("default");
+                (
+                    format!("promoted · {}", promoted.phase),
+                    format!(" · {via} · {} · {model}", promoted.agent),
+                )
             }
-            let room = width.saturating_sub(cell_width(&tail));
-            // A lead cut through a wide cluster comes back a cell short; that leftover cell would
-            // only hold a second ellipsis, so a cut lead takes the middle's room with it.
-            let middle = if cell_width(&lead) > room {
-                String::new()
-            } else {
-                cells::clip(&middle, room - cell_width(&lead))
-            };
-            let lead = cells::clip(&lead, room);
-            return Line::from(vec![
-                Span::styled(lead, ctx.theme.accent),
-                Span::styled(format!("{middle}{tail}"), ctx.theme.dim),
-            ]);
-        }
-        let agent = self
-            .agent()
-            .map_or(NONE.to_owned(), |summary| summary.agent.name.clone());
-        let model = self
-            .agent()
-            .and_then(|summary| summary.agent.default_model.clone())
-            .unwrap_or_else(|| "default".to_owned());
-        let project = ctx
-            .projects
-            .first()
-            .map_or(NONE.to_owned(), |project| project.name.clone());
-        Line::from(vec![
-            Span::styled(agent, ctx.theme.accent),
-            Span::styled(
-                format!(" · {model} · {project} · session {session}"),
-                ctx.theme.dim,
-            ),
-        ])
+            None => {
+                let agent = self
+                    .agent()
+                    .map_or(NONE.to_owned(), |summary| summary.agent.name.clone());
+                let model = self
+                    .agent()
+                    .and_then(|summary| summary.agent.default_model.clone())
+                    .unwrap_or_else(|| "default".to_owned());
+                let project = ctx
+                    .projects
+                    .first()
+                    .map_or(NONE.to_owned(), |project| project.name.clone());
+                (agent, format!(" · {model} · {project}"))
+            }
+        };
+        fit_header(&lead, &middle, &session, usize::from(width))
     }
 
     /// The line naming what this transport cannot do, or `None` when it can do everything.
@@ -567,10 +570,18 @@ impl Tab for ChatTab {
         views::CHAT_LIVE
     }
 
-    /// The current mode's keys (MOD-67 M6 T2): `hint_text`, in `theme.dim`.
+    /// The current mode's keys (MOD-67 M6 T2): `hint_text`, in `theme.dim`. The pane draws them
+    /// on its bottom border itself (MOD-115 M3 D5); the shell reads them for the activity
+    /// placeholder only (C2).
     fn key_hint(&self, _width: u16, ctx: &Ctx<'_>) -> Option<Line<'static>> {
         let hint = self.hint_text(ctx.keys());
         key_line(hint, ctx.theme)
+    }
+
+    /// MOD-115 M3 D5: the Chat draws its own kit pane, so the shell paints no focus or hints
+    /// over it.
+    fn draws_chrome(&self) -> bool {
+        true
     }
 
     /// Each mode resolves through its stack (MOD-67 M5 D4, D5): the open composer reads its
@@ -581,7 +592,11 @@ impl Tab for ChatTab {
         // A refusal is transient: it says what the last key could not do, and the next one clears
         // it whatever it was.
         self.refusal = None;
+        // The delivered (canonical) chord is the composer's, so a `[field]` chord the shell
+        // translated (`field.cancel = "ctrl-o"` into `Esc`) is never passed as a CONTROL chord;
+        // the live view's own acts resolve from the chord pressed (MOD-115 M3 MD-A).
         let chord = KeyChord::from_event(key);
+        let pressed = ctx.pressed(&key);
         // Before the composer, before the digits, before anything that could send: a replay is a
         // mode with no command path at all (D40), and `on_key_replay` is handed no `ctx` to prove
         // it. An open composer underneath keeps its text — it simply cannot be typed into until
@@ -611,7 +626,7 @@ impl Tab for ChatTab {
         // MOD-115 M2 D7: the answers are `answer.option_*` rows (the digits by default).
         if let Some(index) = ctx
             .keys()
-            .actions(views::CHAT_LIVE, chord)
+            .actions(views::CHAT_LIVE, pressed)
             .first()
             .and_then(|act| act.answer_index())
             && let Some(digit) = u32::try_from(index + 1)
@@ -624,7 +639,11 @@ impl Tab for ChatTab {
             return Handled::Consumed;
         }
 
-        let first = ctx.keys().actions(views::CHAT_LIVE, chord).first().copied();
+        let first = ctx
+            .keys()
+            .actions(views::CHAT_LIVE, pressed)
+            .first()
+            .copied();
         let handled = match first {
             Some(Act::ChatCompose) => {
                 self.composer.enter();
@@ -806,11 +825,12 @@ impl Tab for ChatTab {
         }
     }
 
+    /// MOD-115 M3 D5: one kit pane titled by the session (or the replayed step), its one pane
+    /// being `PaneId::Detail` (C1). The content is drawn into the pane's inner rect first, so the
+    /// transcript's scrollbar knows its numbers when the frame is drawn (C3): the banner, the
+    /// body, the permission strip and the composer, top to bottom, the bar beside the body only.
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let block = Block::new().borders(Borders::ALL).title(" Chat ");
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-
+        let inner = Pane::inner(area);
         let replay = self.replay.as_ref();
         // A replay draws neither: the capability banner is a property of the *live* transport,
         // and a strip offering options over a finished step would be a question nobody can
@@ -819,8 +839,7 @@ impl Tab for ChatTab {
             Some(_) => (None, None),
             None => (self.caps_banner(), self.transcript.parked()),
         };
-        let [header, banner_area, body, strip, composer] = Layout::vertical([
-            Constraint::Length(1),
+        let [banner_area, body, strip, composer] = Layout::vertical([
             Constraint::Length(u16::from(banner.is_some())),
             Constraint::Min(1),
             Constraint::Length(u16::from(parked.is_some())),
@@ -828,23 +847,20 @@ impl Tab for ChatTab {
         ])
         .areas(inner);
 
-        let header_line = match replay {
-            Some(replay) => Self::replay_header(replay, ctx),
-            None => self.header(ctx, header.width),
-        };
-        frame.render_widget(Paragraph::new(header_line), header);
         if let Some(text) = banner {
             frame.render_widget(
-                Paragraph::new(Line::styled(text, ctx.theme.error)),
+                Paragraph::new(notice(&text, Tone::Error, ctx.theme)),
                 banner_area,
             );
         }
 
+        // The transcript's numbers for the scrollbar, when a transcript is what the body shows.
+        let mut scroll = None;
         if let Some(replay) = replay {
             // The same renderer the live view uses, over rows instead of frames (`R-TUI-6`).
             match replay_body(replay) {
                 Some(text) => {
-                    frame.render_widget(Paragraph::new(Line::styled(text, ctx.theme.dim)), body)
+                    frame.render_widget(Paragraph::new(notice(text, Tone::Info, ctx.theme)), body);
                 }
                 None => {
                     let unfold = ctx.keys().label(views::CHAT_REPLAY, Act::ChatThoughts);
@@ -853,6 +869,7 @@ impl Tab for ChatTab {
                             .transcript
                             .lines(body.height as usize, ctx.theme, unfold.as_deref());
                     frame.render_widget(Paragraph::new(lines), body);
+                    scroll = Some(replay.transcript.scroll_position());
                 }
             }
         }
@@ -871,30 +888,72 @@ impl Tab for ChatTab {
             lines.push(Line::styled(refusal.clone(), ctx.theme.error));
             frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), body);
         } else if self.session.is_none() && !self.pending_start {
-            let text = if self.agents.is_empty() {
-                "no agent is registered on this box".to_owned()
+            // MOD-115 M3: an empty state says what is missing and the next step (audit item 2).
+            let (what, next) = if self.agents.is_empty() {
+                (NO_AGENT, NO_AGENT_NEXT.to_owned())
             } else {
-                "type a prompt to start a chat".to_owned()
+                (NO_CHAT, compose_next(ctx.keys()))
             };
-            frame.render_widget(Paragraph::new(Line::styled(text, ctx.theme.dim)), body);
+            empty::render(frame, body, what, NextStep(&next), ctx.theme);
         } else {
             let unfold = ctx.keys().label(views::CHAT_LIVE, Act::ChatThoughts);
             let lines = self
                 .transcript
                 .lines(body.height as usize, ctx.theme, unfold.as_deref());
             frame.render_widget(Paragraph::new(lines), body);
+            scroll = Some(self.transcript.scroll_position());
         }
 
         if let Some(row) = parked {
             PermissionStrip::render(frame, strip, row, ctx.keys(), views::CHAT_LIVE, ctx.theme);
         }
         // Not under a replay: the composer belongs to the live view, and a replay must not show
-        // an input line for a step that can take no input. The keys are the shell's hint row
-        // (MOD-67 M6 T2, `key_hint`).
+        // an input line for a step that can take no input.
         if replay.is_none() {
-            Composer::render(frame, composer, &self.composer, ctx.theme);
+            Composer::render(frame, composer, &self.composer, ctx.accent(), ctx.theme);
         }
+
+        // The title's room: the pane draws ` {title} ` two cells past the corner and stops one
+        // rule cell short of the other, so a header fitted to six cells under the width is never
+        // clipped by it — the promoted header's session ref stays whole (D165).
+        let title = match replay {
+            Some(replay) => Self::replay_header(replay),
+            None => self.header(ctx, area.width.saturating_sub(6)),
+        };
+        let mut pane = Pane::new(&title)
+            .focus(ctx.pane_focus(PaneId::Detail))
+            .accent(ctx.accent());
+        if let Some(hints) = key_line(self.hint_text(ctx.keys()), ctx.theme) {
+            pane = pane.hints(hints);
+        }
+        if let Some((total, first)) = scroll {
+            pane = pane
+                .scrollbar(total, first)
+                .scrollbar_span(body.y.saturating_sub(inner.y), body.height);
+        }
+        pane.render(frame, area, ctx.theme);
     }
+}
+
+/// `lead`, `middle` and the session ref as one header line of at most `width` cells (D165, MOD-60
+/// D9). The session ref is the one field here that exists to be read back (a later
+/// `session/load`), so it is never cut: a line too wide drops the `session ` label first, then
+/// cuts the fields before the ref with an ellipsis.
+fn fit_header(lead: &str, middle: &str, session: &str, width: usize) -> String {
+    let mut tail = format!(" · session {session}");
+    if cell_width(lead) + cell_width(middle) + cell_width(&tail) > width {
+        tail = format!(" · {session}");
+    }
+    let room = width.saturating_sub(cell_width(&tail));
+    // A lead cut through a wide cluster comes back a cell short; that leftover cell would only
+    // hold a second ellipsis, so a cut lead takes the middle's room with it.
+    let middle = if cell_width(lead) > room {
+        String::new()
+    } else {
+        cells::clip(middle, room - cell_width(lead))
+    };
+    let lead = cells::clip(lead, room);
+    format!("{lead}{middle}{tail}")
 }
 
 #[cfg(test)]
@@ -904,6 +963,7 @@ mod tests {
     use crate::keys::Keys;
     use crate::store_worker::Origin;
     use crate::ui::Theme;
+    use crate::ui::shell::PaneId;
     use chrono::{TimeZone as _, Utc};
     use crossterm::event::{KeyCode, KeyModifiers};
     use htui_agent::event::{DriverEnvelope, DriverEvent, TextChunk};
@@ -911,6 +971,7 @@ mod tests {
     use htui_core::model::{
         EventKind, EventRole, ProjectRef, Scope, SessionEvent, StepId, WorkspaceId,
     };
+    use ratatui::style::{Color, Modifier};
     use serde_json::json;
 
     /// Everything a [`Ctx`] borrows, kept alive for the length of a test — and the [`Emit`] that
@@ -1137,8 +1198,8 @@ mod tests {
         assert!(tab.replay().is_some(), "and is still open");
     }
 
-    /// MOD-115 M2 RV1 H2: the open composer's hint names the submit key in force (`Enter` under
-    /// the compiled keys); `Esc` is written as is (MD7).
+    /// MOD-115 M2 RV1 H2, M3 MD-A: the open composer's hint names the submit and the cancel keys
+    /// in force through `CAPTURE` (`Enter` and `Esc` under the compiled keys).
     #[test]
     fn the_compose_hint_names_the_submit_key_in_force() {
         let mut shell = Shell::new();
@@ -1153,6 +1214,289 @@ mod tests {
         shell.keys = crate::keys::load_str("version = 2\n[field]\nsubmit = \"ctrl-t\"\n")
             .expect("the keys load");
         assert_eq!(tab.hint_text(&shell.keys), "Ctrl+t send \u{b7} Esc leave");
+        shell.keys = crate::keys::load_str("version = 2\n[field]\ncancel = \"ctrl-o\"\n")
+            .expect("the keys load");
+        assert_eq!(
+            tab.hint_text(&shell.keys),
+            "Enter send \u{b7} Ctrl+o leave",
+            "the leave key is `field.cancel`'s, not a literal `Esc` (MD-A)"
+        );
+    }
+
+    /// `tab` drawn into a `width` by `height` bench under `theme`, the shell's focus on the
+    /// Chat's one pane (`PaneId::Detail`, C1) when `focused`; a bench without it focuses the list
+    /// (M2 B7), so the pane reads unfocused.
+    fn draw_with(
+        tab: &ChatTab,
+        shell: &Shell,
+        (width, height): (u16, u16),
+        focused: bool,
+        theme: &Theme,
+    ) -> ratatui::buffer::Buffer {
+        let ctx = Ctx::new(
+            &shell.scope,
+            &shell.projects,
+            &shell.top_bar,
+            &shell.keys,
+            theme,
+            Origin::Tab(ChatTab::ID),
+            &shell.emit,
+        );
+        let ctx = if focused {
+            ctx.with_focus(PaneId::Detail)
+        } else {
+            ctx
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("terminal");
+        terminal
+            .draw(|frame| tab.render(frame, frame.area(), &ctx))
+            .expect("the frame draws");
+        terminal.backend().buffer().clone()
+    }
+
+    /// [`draw_with`] under the default theme.
+    fn draw(
+        tab: &ChatTab,
+        shell: &Shell,
+        size: (u16, u16),
+        focused: bool,
+    ) -> ratatui::buffer::Buffer {
+        draw_with(tab, shell, size, focused, &shell.theme)
+    }
+
+    fn rows_of(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// MOD-115 M3 D5: the Chat draws its own kit pane, so the shell paints no focus or hints
+    /// over it.
+    #[test]
+    fn chat_draws_its_own_chrome() {
+        assert!(ChatTab::new().draws_chrome());
+    }
+
+    /// MOD-115 M3 D5: one rounded pane titled by the session; the `┌ Chat ─` box and the header
+    /// row inside it are gone, so the transcript starts on the first inner row, and the focused
+    /// pane carries the mode's hints on its bottom border.
+    #[test]
+    fn the_frame_is_one_rounded_pane_titled_by_the_session() {
+        let shell = Shell::new();
+        let tab = live(&shell);
+        let rows = rows_of(&draw(&tab, &shell, (60, 8), true));
+        assert!(
+            rows[0].starts_with("\u{256d}\u{2500} \u{2014} \u{b7} default \u{b7} \u{2014} \u{b7} session live-1 \u{2500}"),
+            "{rows:#?}"
+        );
+        assert!(rows[0].ends_with('\u{256e}'), "{rows:#?}");
+        assert!(rows[1].contains("still talking"), "{rows:#?}");
+        assert!(
+            rows[7].starts_with("\u{2570}\u{2500}i compose \u{b7} Esc Esc end"),
+            "{rows:#?}"
+        );
+        assert!(rows[7].ends_with('\u{256f}'), "{rows:#?}");
+        assert!(
+            rows.iter()
+                .all(|row| !row.contains('\u{250c}') && !row.contains(" Chat ")),
+            "no square box and no tab-name title: {rows:#?}"
+        );
+    }
+
+    /// C1: on a bench nothing focuses the Chat's pane, so it carries no hints and a dim title.
+    #[test]
+    fn an_unfocused_chat_draws_no_hints() {
+        let shell = Shell::new();
+        let tab = live(&shell);
+        let buffer = draw(&tab, &shell, (60, 8), false);
+        let rows = rows_of(&buffer);
+        assert!(!rows[7].contains("compose"), "{rows:#?}");
+        assert_eq!(buffer[(3, 0)].style().fg, shell.theme.dim.fg, "a dim title");
+    }
+
+    /// MOD-115 M3 D5, MOD-85: the session header is the pane's title, in the tab accent and bold
+    /// while focused; without colour it is still bold.
+    #[test]
+    fn the_title_takes_the_tab_accent_bold_when_focused() {
+        let shell = Shell::new();
+        let tab = live(&shell);
+        let buffer = draw(&tab, &shell, (60, 8), true);
+        let title = buffer[(3, 0)].style();
+        assert_eq!(buffer[(3, 0)].symbol(), "\u{2014}");
+        assert_eq!(title.fg, shell.ctx().accent().fg, "the Chat's accent");
+        assert!(title.add_modifier.contains(Modifier::BOLD));
+
+        let mono = Theme::monochrome();
+        let buffer = draw_with(&tab, &shell, (60, 8), true, &mono);
+        let title = buffer[(3, 0)].style();
+        assert_eq!(
+            (title.fg, title.bg),
+            (Some(Color::Reset), Some(Color::Reset)),
+            "no colour"
+        );
+        assert!(title.add_modifier.contains(Modifier::BOLD));
+    }
+
+    /// MOD-115 M3 D-17, MOD-85: the open composer's `> ` takes the Chat's accent (the one focus
+    /// use left in the tab), not the theme's modal accent.
+    #[test]
+    fn the_composer_takes_the_tab_accent() {
+        let shell = Shell::new();
+        let mut tab = live(&shell);
+        tab.on_key(key(KeyCode::Char('i')), &mut shell.ctx());
+        let buffer = draw(&tab, &shell, (60, 8), true);
+        // The composer is the pane's last inner row.
+        assert_eq!(buffer[(1, 6)].symbol(), ">");
+        assert_eq!(
+            Some(buffer[(1, 6)].fg),
+            shell.ctx().accent().fg,
+            "the tab accent"
+        );
+    }
+
+    /// MOD-115 M3: an empty Chat says what is missing and what to do next (audit item 2).
+    #[test]
+    fn the_empty_chat_names_a_next_step() {
+        let shell = Shell::new();
+        let tab = ChatTab::new();
+        let rows = rows_of(&draw(&tab, &shell, (60, 10), true));
+        let screen = rows.join("\n");
+        assert!(
+            screen.contains("no agent is registered on this box"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("Settings \u{203a} Agents adds one"),
+            "{screen}"
+        );
+    }
+
+    /// MOD-115 M3 D-11: the transcript's scrollbar sits on the right border beside the
+    /// transcript's rows only, never beside the banner, the permission strip or the composer.
+    #[test]
+    fn the_scrollbar_runs_beside_the_transcript_only() {
+        use htui_agent::driver::PermissionRequestId;
+        use htui_agent::event::{PermissionOption, PermissionOptionKind, PermissionRequestEvent};
+        let shell = Shell::new();
+        let mut tab = ChatTab::new();
+        // All-false caps: a banner row above the transcript.
+        tab.on_reply(
+            &StoreReply::ChatAccepted {
+                step_id: StepId::new(),
+                session_ref: None,
+                caps: DriverCaps::default(),
+                prompts: false,
+            },
+            &mut shell.ctx(),
+        );
+        let event = |event: DriverEvent| {
+            StoreReply::Chat(ChatFrame::Event(Box::new(DriverEnvelope {
+                event,
+                raw: None,
+                at: Utc.timestamp_opt(0, 0).single().expect("epoch is a time"),
+            })))
+        };
+        let text = (0..30)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        tab.on_reply(
+            &event(DriverEvent::AssistantChunk(TextChunk {
+                text,
+                message_id: Some("m1".to_owned()),
+            })),
+            &mut shell.ctx(),
+        );
+        // A parked request: a strip row under the transcript.
+        tab.on_reply(
+            &event(DriverEvent::PermissionRequest(PermissionRequestEvent {
+                request_id: PermissionRequestId::new("req-1"),
+                tool_call_id: None,
+                options: vec![PermissionOption {
+                    id: "allow".to_owned(),
+                    label: "Allow".to_owned(),
+                    kind: PermissionOptionKind::AllowOnce,
+                }],
+            })),
+            &mut shell.ctx(),
+        );
+        // 12 rows: the top border, the banner (1), the transcript (2..=8), the strip (9), the
+        // composer (10) and the bottom border.
+        let buffer = draw(&tab, &shell, (40, 12), true);
+        let thumb: Vec<u16> = (0..12)
+            .filter(|&y| buffer[(39, y)].symbol() == "\u{2503}")
+            .collect();
+        assert!(!thumb.is_empty(), "{:#?}", rows_of(&buffer));
+        assert!(
+            thumb.iter().all(|y| (2..=8).contains(y)),
+            "the thumb stays beside the transcript: {thumb:?} {:#?}",
+            rows_of(&buffer)
+        );
+        assert_eq!(thumb.last(), Some(&8), "the tail is at the bottom of it");
+
+        // Scrolled to the top, the thumb is at the top of the transcript's rows.
+        let mut tab = tab;
+        tab.transcript.on_act(Act::ChatTop);
+        let buffer = draw(&tab, &shell, (40, 12), true);
+        assert_eq!(buffer[(39, 2)].symbol(), "\u{2503}");
+    }
+
+    /// MOD-115 M3 D5: a replay is titled by its step, its rows counted in words; the key that
+    /// leaves it is on the bottom border (`REPLAY_HINT`), no longer in the title.
+    #[test]
+    fn a_replay_is_titled_by_its_step_and_its_hint_names_the_way_out() {
+        let shell = Shell::new();
+        let mut tab = live(&shell);
+        replay(&mut tab, &shell, two_rows());
+        let rows = rows_of(&draw(&tab, &shell, (80, 8), true));
+        let id = ids::STEP_PLAN.to_string();
+        let tail = &id[id.len() - STEP_TAIL..];
+        assert!(
+            rows[0].starts_with(&format!(
+                "\u{256d}\u{2500} replay \u{b7} step \u{2026}{tail} \u{b7} 2 rows \u{b7} read-only \u{2500}"
+            )),
+            "{rows:#?}"
+        );
+        assert!(
+            rows[7].starts_with("\u{2570}\u{2500}Esc leave replay"),
+            "{rows:#?}"
+        );
+
+        replay(
+            &mut tab,
+            &shell,
+            Some(vec![row(0, EventKind::Prompt, json!({ "text": "one" }))]),
+        );
+        assert!(
+            ChatTab::replay_header(tab.replay().expect("open")).contains(" \u{b7} 1 row \u{b7} "),
+            "one row, not `1 rows`"
+        );
+    }
+
+    /// The plain header is fitted to the title's room the way the promoted one is: the
+    /// `session ` label goes first, then the fields before the ref are cut, never the ref.
+    #[test]
+    fn a_narrow_plain_header_keeps_the_whole_session_ref() {
+        let shell = Shell::new();
+        let tab = live(&shell);
+        let text = |width: u16| tab.header(&shell.ctx(), width);
+        assert_eq!(
+            text(200),
+            "\u{2014} \u{b7} default \u{b7} \u{2014} \u{b7} session live-1"
+        );
+        assert_eq!(
+            text(30),
+            "\u{2014} \u{b7} default \u{b7} \u{2014} \u{b7} live-1",
+            "the label goes first"
+        );
+        assert_eq!(text(15), "\u{2014} \u{b7} d\u{2026} \u{b7} live-1");
+        assert_eq!(cell_width(&text(15)), 15, "and the line fits");
     }
 
     /// MOD-115 M2 D7: a parked request answers on `answer.option_*`: a rebound option answers,
@@ -1484,13 +1828,7 @@ mod tests {
             htui_agent::event::RESUME_FAILED,
             json!({ "session_id": "s1", "reason": REASON, "note": CONTEXT_NOT_CARRIED }),
         );
-        let header = |tab: &ChatTab| -> String {
-            tab.header(&shell.ctx(), 200)
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect()
-        };
+        let header = |tab: &ChatTab| -> String { tab.header(&shell.ctx(), 200) };
 
         let mut tab = ChatTab::new();
         let step = StepId::new();
@@ -1619,7 +1957,8 @@ mod tests {
                 .position(|row| row.contains(needle))
                 .unwrap_or_else(|| panic!("`{needle}` is drawn: {rows:#?}"))
         };
-        assert!(rows[1].contains(" · handoff · "), "{rows:#?}");
+        // MOD-115 M3 D5: the header is the pane's title, on the top border.
+        assert!(rows[0].contains(" · handoff · "), "{rows:#?}");
         let reason = row_of("resume failed  session/load failed: gone");
         let note = row_of(CONTEXT_NOT_CARRIED);
         let refusal = row_of("second refusal");
@@ -1643,13 +1982,7 @@ mod tests {
             model: Some("sonnet".to_owned()),
             via: Via::Handoff,
         });
-        let text = |width: u16| -> String {
-            tab.header(&shell.ctx(), width)
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect()
-        };
+        let text = |width: u16| -> String { tab.header(&shell.ctx(), width) };
 
         assert_eq!(
             text(200),
@@ -1676,10 +2009,6 @@ mod tests {
             via: Via::Handoff,
         });
         tab.header(&shell.ctx(), width)
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect()
     }
 
     /// MOD-60 D9: a halfwidth sound mark is a cell of its own, as `ratatui` draws it. `Span::width`

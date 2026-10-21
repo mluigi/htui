@@ -3,18 +3,17 @@ source: crates/htui/tests/chat.rs
 expression: rendered
 ---
 Graphics   ¹Chat                0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
-┌ Chat ────────────────────────────────────────────────────────────────────────────────────────────┐
-│replay · step …00000d01 · 7 rows · read-only · Esc leave                                          │
+╭─ replay · step …00000d01 · 7 rows · read-only ───────────────────────────────────────────────────╮
 │you  Plan the TUI scaffold against the store seam.                                                │
 │Reading the PRD and the ANA-9 seam.                                                               │
 │thought  The store trait is the only seam that matters here. (t to unfold)                        │
-│read Read docs/ANA-9.md  [ok]                                                                     │
+│read Read docs/ANA-9.md  ● done                                                                   │
 │plan                                                                                              │
-│  [completed] Split the crates                                                                    │
-│  [in_progress] Fix the store seam                                                                │
-│  [pending] Snapshot the shell                                                                    │
+│  ● done  Split the crates                                                                        │
+│  ◐ in progress  Fix the store seam                                                               │
+│  ○ pending  Snapshot the shell                                                                   │
 │usage                                                                                             │
-│— turn ended (end_turn) —                                                                         │
+│— turn ended —                                                                                    │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -31,4 +30,5 @@ Graphics   ¹Chat                0 working · 0 waiting · memory · DESKTOP-HTU
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-└─Esc leave replay · t thoughts · j/k scroll───────────────────────────────────────────────────────┘
+│                                                                                                  │
+╰─Esc leave replay · t thoughts · j/k scroll───────────────────────────────────────────────────────╯

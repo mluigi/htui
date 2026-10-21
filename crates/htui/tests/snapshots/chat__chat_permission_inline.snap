@@ -3,10 +3,9 @@ source: crates/htui/tests/chat.rs
 expression: harness.render()
 ---
 Graphics   ¹Chat                0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
-┌ Chat ────────────────────────────────────────────────────────────────────────────────────────────┐
-│scripted · sonnet · Vulkan Tutorials · session fake-<session>          │
+╭─ scripted · sonnet · Vulkan Tutorials · session fake-<session> ───────╮
 │you  clean the build                                                                              │
-│execute rm -rf build  […]                                                                         │
+│run rm -rf build  ◐ running                                                                       │
 │permission  waiting on you (2 options)                                                            │
 │                                                                                                  │
 │                                                                                                  │
@@ -29,6 +28,7 @@ Graphics   ¹Chat                0 working · 0 waiting · memory · DESKTOP-HTU
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-│answer  [1] Allow once  [2] Reject                                                                │
 │                                                                                                  │
-└─1-9 answer · i compose · t thoughts──────────────────────────────────────────────────────────────┘
+│answer   1  Allow once   2  Reject                                                                │
+│                                                                                                  │
+╰─1-9 answer · i compose · t thoughts──────────────────────────────────────────────────────────────╯
