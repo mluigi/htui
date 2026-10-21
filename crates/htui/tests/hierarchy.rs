@@ -3203,9 +3203,9 @@ async fn f1_opens_help_from_the_editor() {
     harness.key("?");
     let frame = harness.render();
     assert!(
-        frame
-            .lines()
-            .any(|line| line.contains("\u{258c}name") && line.trim_end().ends_with('?')),
+        frame.lines().any(
+            |line| line.contains("\u{258c}name") && line.split_whitespace().nth(1) == Some("?")
+        ),
         "{frame}"
     );
     assert!(!frame.contains("closes this box"), "{frame}");
@@ -3421,7 +3421,7 @@ async fn f1_over_the_picker_opens_help_and_q_does_not_quit() {
 // -------------------------------------------------------------------------------------------
 
 /// `field.submit` and `field.cancel` moved (MOD-115 M3 C6): the editor's `Enter` and `Esc`.
-const FIELD_REBOUND: &str = "version = 2\n[field]\nsubmit = [\"ctrl-t\"]\ncancel = [\"ctrl-g\"]\n";
+const FIELD_REBOUND: &str = "version = 2\n[field]\nsubmit = [\"ctrl-t\"]\ncancel = [\"ctrl-o\"]\n";
 
 /// `keys` loaded, or a panic naming the file.
 fn rebound(file: &str) -> htui::keys::Keys {
@@ -3501,7 +3501,7 @@ async fn the_editor_hint_names_the_field_keys_in_force() {
 
     let bench = bench.with_keys(rebound(FIELD_REBOUND));
     let hint = bench.key_hint(&section);
-    assert!(hint.contains("Ctrl+t save \u{b7} Ctrl+g cancel"), "{hint}");
+    assert!(hint.contains("Ctrl+t save \u{b7} Ctrl+o cancel"), "{hint}");
     assert!(
         !hint.contains("Enter") && !hint.contains("Esc"),
         "no literal key is left: {hint}"
@@ -3526,7 +3526,7 @@ async fn the_typed_confirmation_names_the_field_keys_in_force() {
 
     let bench = bench.with_keys(rebound(FIELD_REBOUND));
     let hint = bench.key_hint(&section);
-    assert!(hint.contains("Ctrl+t confirm \u{b7} Ctrl+g stop"), "{hint}");
+    assert!(hint.contains("Ctrl+t confirm \u{b7} Ctrl+o stop"), "{hint}");
     assert!(!hint.contains("Enter"), "no literal key is left: {hint}");
 }
 

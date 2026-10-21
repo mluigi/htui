@@ -2304,7 +2304,7 @@ async fn a_rebound_save_key_is_named_after_a_stale_quirks_save() {
 // -------------------------------------------------------------------------------------------
 
 /// `field.submit` and `field.cancel` moved (MOD-115 M3 C6): the editors' `Enter` and `Esc`.
-const FIELD_REBOUND: &str = "version = 2\n[field]\nsubmit = [\"ctrl-t\"]\ncancel = [\"ctrl-g\"]\n";
+const FIELD_REBOUND: &str = "version = 2\n[field]\nsubmit = [\"ctrl-t\"]\ncancel = [\"ctrl-o\"]\n";
 
 /// `keys` loaded, or a panic naming the file.
 fn rebound(file: &str) -> htui::keys::Keys {
@@ -2351,7 +2351,7 @@ async fn the_editor_hints_name_the_field_keys_in_force() {
     let bench = bench.with_keys(rebound(FIELD_REBOUND));
     let hint = bench.key_hint(&section);
     assert!(
-        hint.contains("Ctrl+t saves \u{b7} Ctrl+g cancels \u{b7} comma-separated"),
+        hint.contains("Ctrl+t saves \u{b7} Ctrl+o cancels \u{b7} comma-separated"),
         "{hint}"
     );
     bench.key(&mut section, "esc");
@@ -2359,7 +2359,7 @@ async fn the_editor_hints_name_the_field_keys_in_force() {
     bench.key(&mut section, "e");
     let hint = bench.key_hint(&section);
     assert!(
-        hint.contains("Ctrl+s saves \u{b7} Ctrl+g cancels \u{b7} Ctrl+t breaks the line"),
+        hint.contains("Ctrl+s saves \u{b7} Ctrl+o cancels \u{b7} Ctrl+t breaks the line"),
         "{hint}"
     );
     assert!(
@@ -2372,7 +2372,7 @@ async fn the_editor_hints_name_the_field_keys_in_force() {
     let hint = bench.key_hint(&section);
     assert!(
         hint.contains(
-            "Ctrl+s saves \u{b7} Ctrl+g cancels \u{b7} Ctrl+t breaks the line \u{b7} blank clears"
+            "Ctrl+s saves \u{b7} Ctrl+o cancels \u{b7} Ctrl+t breaks the line \u{b7} blank clears"
         ),
         "{hint}"
     );
