@@ -274,7 +274,16 @@ pub const CASES: &[&str] = &[
 /// that carry their own messages, and turning twenty bodies into error-returning functions would
 /// rewrite the whole suite to gain a string the panic already prints. MOD-6's `pg_conformance.rs`
 /// gets its per-case reporting from the loop, not from a `Result`.
+///
+/// The match's future is as large as its largest case's, and every case's poll sits on it, so it
+/// is boxed once here (MOD-137): with the graph v2 cases the Postgres run built with the whole
+/// workspace's features overflowed the 2 MiB test stack in an unrelated case
+/// (`waiting_candidates_hold_every_park_and_nothing_else`).
 pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
+    Box::pin(run_case_inline(name, store)).await;
+}
+
+async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
     match name {
         "mint_consecutive_keys" => mint_consecutive_keys(store).await,
         "mint_prefix_isolation" => mint_prefix_isolation(store).await,
