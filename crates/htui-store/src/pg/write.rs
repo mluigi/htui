@@ -45,7 +45,7 @@ use htui_core::model::{
     WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop, canonical_declared_tags,
     missing_tags_failure, moved_order, overlaps, scope_of,
 };
-use htui_core::model::{EdgeId, GraphScope, PlanScope, Split, StepGraphEdge};
+use htui_core::model::{EdgeId, GraphBody, GraphScope, PhasePart, PlanScope, Split, StepGraphEdge};
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
 use htui_core::seed;
@@ -73,6 +73,7 @@ use htui_core::store::{
     withdrawn_requirement_cited,
 };
 use htui_core::store::{
+    body_agent_refs, body_persona_refs, graph_body_shape_refusal, graph_body_topology_refusal,
     graph_name_is_taken, override_outside_project, phase_name_is_taken, phase_position_is_taken,
     phase_row_refusal,
 };
@@ -83,7 +84,7 @@ use uuid::Uuid;
 
 use crate::error::map_sqlx;
 use crate::pg::PgStore;
-use crate::pg::read::StepGraphRow;
+use crate::pg::read::{StepGraphRow, graph_body_on, graph_edges_on, phase_parts_on};
 use crate::pg::rows::PersonaRow;
 
 /// The refusal text for a kind that is unknown or belongs to another project.
@@ -1141,6 +1142,79 @@ pub(super) async fn insert_edge<'e, E: PgExecutor<'e>>(
         edge.loop_limit,
     )
     .execute(executor)
+    .await
+    .map_err(map_sqlx)?;
+    Ok(())
+}
+
+/// `replace_graph`'s in-place write of a kept node (MOD-137 blueprint §T3.4 step 10): every
+/// column [`StepGraphPhase`] carries, `judge_agent_id`, `judge_model` and `deadline_seconds` left
+/// as they are (F14). The driver's error comes back raw for the caller's [`phase_fk_refused`].
+async fn update_kept_phase(
+    conn: &mut PgConnection,
+    phase: &StepGraphPhase,
+) -> std::result::Result<(), sqlx::Error> {
+    sqlx::query!(
+        r#"
+        UPDATE step_graph_phase SET position = $3, name = $4, fan_out = $5, gate = $6,
+            gate_hard = $7, retry_limit = $8, input_kinds = $9, output_kind = $10, isolation = $11,
+            command_queue = $12, verify_command = $13, template_name = $14,
+            template_version = $15, token_budget = $16, persona_id = $17, split = $18,
+            palette = $19, plan_scope = $20, planner_persona_id = $21, planner_agent_id = $22,
+            planner_model = $23, integrate_persona_id = $24, integrate_agent_id = $25,
+            integrate_model = $26, max_parts = $27
+         WHERE id = $1 AND graph_id = $2
+        "#,
+        phase.id.as_uuid(),
+        phase.graph_id.as_uuid(),
+        phase.position,
+        phase.name,
+        phase.fan_out,
+        phase.gate.as_str(),
+        phase.gate_hard,
+        phase.retry_limit,
+        &phase.input_kinds[..],
+        phase.output_kind,
+        phase.isolation.map(Isolation::as_str),
+        phase.command_queue.as_str(),
+        phase.verify_command.as_deref(),
+        phase.template_name,
+        phase.template_version,
+        phase.token_budget,
+        phase.persona_id.map(PersonaId::as_uuid),
+        phase.split.as_str(),
+        phase.palette,
+        phase.plan_scope.map(PlanScope::as_str),
+        phase.planner_persona_id.map(PersonaId::as_uuid),
+        phase.planner_agent_id.map(AgentId::as_uuid),
+        phase.planner_model.as_deref(),
+        phase.integrate_persona_id.map(PersonaId::as_uuid),
+        phase.integrate_agent_id.map(AgentId::as_uuid),
+        phase.integrate_model.as_deref(),
+        phase.max_parts,
+    )
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// One `phase_part` row (MOD-137 D8), written by `replace_graph` only.
+async fn insert_part(conn: &mut PgConnection, part: &PhasePart) -> Result<()> {
+    sqlx::query!(
+        "INSERT INTO phase_part (phase_id, position, key, title, brief, owned_paths, acceptance, \
+         agent_id, model, persona_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        part.phase_id.as_uuid(),
+        part.position,
+        part.key,
+        part.title,
+        part.brief,
+        &part.owned_paths[..],
+        part.acceptance.as_deref(),
+        part.agent_id.map(AgentId::as_uuid),
+        part.model.as_deref(),
+        part.persona_id.map(PersonaId::as_uuid),
+    )
+    .execute(conn)
     .await
     .map_err(map_sqlx)?;
     Ok(())
@@ -3688,6 +3762,394 @@ impl WriteStore for PgStore {
     /// Whatever the driver reports, through [`map_sqlx`].
     async fn phases(&self, graph: StepGraphId) -> Result<Vec<StepGraphPhase>> {
         self.phase_rows(graph).await
+    }
+
+    /// MOD-137 D10 in one transaction (blueprint §T3.4). The CAS on `revision` is the bump and
+    /// the graph row lock (F7); every refusal the conformance suite pins is decided by a pre-read
+    /// or a shared pure rule before the first write (F6), in `MemStore`'s order, so the sentences
+    /// are its own. The position and name uniques are deferred for the swap a reorder needs and
+    /// forced immediate before the read-back, so a clash the pre-reads missed surfaces at a
+    /// statement, never at `COMMIT`.
+    ///
+    /// # Errors
+    ///
+    /// The trait's, in its order; anything else through [`map_sqlx`].
+    async fn replace_graph(
+        &self,
+        graph: StepGraphId,
+        expected_revision: i64,
+        body: GraphBody,
+    ) -> Result<CasOutcome<GraphBody>> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        sqlx::query!(
+            "SET CONSTRAINTS uq_step_graph_phase_position, uq_step_graph_phase_name DEFERRED"
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        // 1. CAS + bump + lock.
+        let owner = sqlx::query!(
+            r#"
+            UPDATE step_graph SET revision = revision + 1
+             WHERE id = $1 AND revision = $2
+            RETURNING project_id   AS "project_id: ProjectId",
+                      workspace_id AS "workspace_id: WorkspaceId"
+            "#,
+            graph.as_uuid(),
+            expected_revision,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        let Some(owner) = owner else {
+            tx.rollback().await.map_err(map_sqlx)?;
+            return match self.graph_body(graph).await? {
+                None => Err(StoreError::NotFound {
+                    entity: "step_graph",
+                    id: graph.to_string(),
+                }),
+                Some(current) => Ok(CasOutcome::Stale(current)),
+            };
+        };
+        let scope =
+            GraphScope::from_columns(owner.project_id, owner.workspace_id).ok_or_else(|| {
+                StoreError::Backend(format!(
+                    "step_graph `{graph}` has both project_id and workspace_id (ck_step_graph_owner)"
+                ))
+            })?;
+
+        // 2. The body's own shape.
+        if let Some(refusal) = graph_body_shape_refusal(graph, &body) {
+            return Err(StoreError::Constraint(refusal));
+        }
+
+        // 3. The name in the graph's scope.
+        let taken = sqlx::query_scalar!(
+            r#"
+            SELECT EXISTS (SELECT 1 FROM step_graph
+                            WHERE id <> $1 AND name = $2
+                              AND project_id IS NOT DISTINCT FROM $3
+                              AND workspace_id IS NOT DISTINCT FROM $4) AS "taken!"
+            "#,
+            graph.as_uuid(),
+            body.graph.name,
+            scope.project_id().map(ProjectId::as_uuid),
+            scope.workspace_id().map(WorkspaceId::as_uuid),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if taken {
+            return Err(StoreError::Constraint(graph_name_is_taken(
+                &body.graph.name,
+                scope,
+            )));
+        }
+
+        // 4. Phase and edge ids another graph holds, the first in body order.
+        let node_ids: Vec<Uuid> = body
+            .nodes
+            .iter()
+            .map(|node| node.phase.id.as_uuid())
+            .collect();
+        let foreign_phases = sqlx::query_scalar!(
+            r#"
+            SELECT id AS "id: PhaseId" FROM step_graph_phase
+             WHERE id = ANY($1) AND graph_id <> $2
+            "#,
+            &node_ids,
+            graph.as_uuid(),
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if let Some(node) = body
+            .nodes
+            .iter()
+            .find(|node| foreign_phases.contains(&node.phase.id))
+        {
+            return Err(StoreError::Constraint(already_exists(
+                "step_graph_phase",
+                node.phase.id,
+            )));
+        }
+        let edge_ids: Vec<Uuid> = body.edges.iter().map(|edge| edge.id.as_uuid()).collect();
+        let foreign_edges = sqlx::query_scalar!(
+            r#"
+            SELECT id AS "id: EdgeId" FROM step_graph_edge
+             WHERE id = ANY($1) AND graph_id <> $2
+            "#,
+            &edge_ids,
+            graph.as_uuid(),
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if let Some(edge) = body
+            .edges
+            .iter()
+            .find(|edge| foreign_edges.contains(&edge.id))
+        {
+            return Err(StoreError::Constraint(already_exists(
+                "step_graph_edge",
+                edge.id,
+            )));
+        }
+
+        // 5. Personas, then agents, that name no row; `FOR KEY SHARE` holds what was found, so a
+        //    concurrent `delete_persona` waits for this transaction.
+        let persona_refs = body_persona_refs(&body);
+        let persona_ids: Vec<Uuid> = persona_refs.iter().map(|(_, id)| id.as_uuid()).collect();
+        let personas = sqlx::query_scalar!(
+            r#"SELECT id AS "id: PersonaId" FROM persona WHERE id = ANY($1) FOR KEY SHARE"#,
+            &persona_ids,
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if let Some((column, id)) = persona_refs
+            .into_iter()
+            .find(|(_, id)| !personas.contains(id))
+        {
+            return Err(StoreError::Constraint(references_no_row(
+                column, id, "persona",
+            )));
+        }
+        let agent_refs = body_agent_refs(&body);
+        let agent_ids: Vec<Uuid> = agent_refs.iter().map(|(_, id)| id.as_uuid()).collect();
+        let agents = sqlx::query_scalar!(
+            r#"SELECT id AS "id: AgentId" FROM agent WHERE id = ANY($1) FOR KEY SHARE"#,
+            &agent_ids,
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if let Some((column, id)) = agent_refs.into_iter().find(|(_, id)| !agents.contains(id)) {
+            return Err(StoreError::Constraint(references_no_row(
+                column, id, "agent",
+            )));
+        }
+
+        // 6. Topology and the node CHECKs.
+        if let Some(refusal) = graph_body_topology_refusal(graph, &body) {
+            return Err(StoreError::Constraint(refusal));
+        }
+
+        // 7. The graph row's two editable columns.
+        sqlx::query!(
+            "UPDATE step_graph SET name = $2, description = $3 WHERE id = $1",
+            graph.as_uuid(),
+            body.graph.name,
+            body.graph.description,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        // 8. The dropped nodes, cascading their candidates, parts, edges and phase bindings;
+        //    what is left of the graph's phases is the kept set.
+        sqlx::query!(
+            "DELETE FROM step_graph_phase WHERE graph_id = $1 AND NOT (id = ANY($2))",
+            graph.as_uuid(),
+            &node_ids,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        let kept = sqlx::query_scalar!(
+            r#"SELECT id AS "id: PhaseId" FROM step_graph_phase WHERE graph_id = $1"#,
+            graph.as_uuid(),
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        let kept_ids: Vec<Uuid> = kept.iter().map(|id| id.as_uuid()).collect();
+
+        // 9. Edges, candidates and parts are replaced wholesale.
+        sqlx::query!(
+            "DELETE FROM step_graph_edge WHERE graph_id = $1",
+            graph.as_uuid()
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        sqlx::query!(
+            "DELETE FROM phase_agent WHERE phase_id = ANY($1)",
+            &kept_ids
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        sqlx::query!("DELETE FROM phase_part WHERE phase_id = ANY($1)", &kept_ids)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+
+        // 10. Kept nodes in place (the columns `StepGraphPhase` lacks keep their values, F14),
+        //     new ones through the shared insert.
+        for node in &body.nodes {
+            let phase = &node.phase;
+            if kept.contains(&phase.id) {
+                update_kept_phase(&mut tx, phase)
+                    .await
+                    .map_err(|err| phase_fk_refused(err, phase))?;
+            } else {
+                insert_phase(&mut *tx, phase)
+                    .await
+                    .map_err(|err| phase_fk_refused(err, phase))?;
+            }
+        }
+
+        // 11. Candidates in one statement, then parts and edges row by row.
+        let agents: Vec<&PhaseAgent> = body.nodes.iter().flat_map(|node| &node.agents).collect();
+        if !agents.is_empty() {
+            let phases: Vec<Uuid> = agents.iter().map(|row| row.phase_id.as_uuid()).collect();
+            let positions: Vec<i32> = agents.iter().map(|row| row.position).collect();
+            let agent_ids: Vec<Uuid> = agents.iter().map(|row| row.agent_id.as_uuid()).collect();
+            let models: Vec<String> = agents.iter().map(|row| row.model.clone()).collect();
+            sqlx::query!(
+                r#"
+                INSERT INTO phase_agent (phase_id, position, agent_id, model)
+                SELECT t.phase_id, t.position, t.agent_id, t.model
+                  FROM UNNEST($1::uuid[], $2::int4[], $3::uuid[], $4::text[])
+                       AS t(phase_id, position, agent_id, model)
+                "#,
+                &phases,
+                &positions,
+                &agent_ids,
+                &models,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+        for part in body.nodes.iter().flat_map(|node| &node.parts) {
+            insert_part(&mut tx, part).await?;
+        }
+        for edge in &body.edges {
+            insert_edge(&mut *tx, edge).await?;
+        }
+
+        // 12. F6's backstop: a clash the pre-reads missed is a statement error here.
+        sqlx::query!("SET CONSTRAINTS ALL IMMEDIATE")
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+
+        // 13-14. What this transaction wrote, then commit.
+        let written = graph_body_on(&mut tx, graph).await?.ok_or_else(|| {
+            StoreError::Backend(format!(
+                "step_graph `{graph}` vanished inside its own replace"
+            ))
+        })?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(CasOutcome::Applied(written))
+    }
+
+    /// MOD-137 D11 (blueprint §1.4 row 8): bump first, then the delete, whose cascade takes the
+    /// candidates, parts, edges and phase bindings.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `"step_graph_phase"` for an unknown id.
+    async fn delete_phase(&self, id: PhaseId) -> Result<()> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        if bump_graph_of_phase(&mut tx, id).await?.is_none() {
+            return Err(StoreError::NotFound {
+                entity: "step_graph_phase",
+                id: id.to_string(),
+            });
+        }
+        sqlx::query!("DELETE FROM step_graph_phase WHERE id = $1", id.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)
+    }
+
+    /// MOD-137 D11 (blueprint §1.4 row 9): bump through the edge, then the delete.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `"step_graph_edge"` for an unknown id.
+    async fn delete_edge(&self, id: EdgeId) -> Result<()> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let bumped = sqlx::query_scalar!(
+            r#"
+            UPDATE step_graph g SET revision = g.revision + 1
+              FROM step_graph_edge e
+             WHERE e.id = $1 AND g.id = e.graph_id
+            RETURNING g.id AS "id: StepGraphId"
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if bumped.is_none() {
+            return Err(StoreError::NotFound {
+                entity: "step_graph_edge",
+                id: id.to_string(),
+            });
+        }
+        sqlx::query!("DELETE FROM step_graph_edge WHERE id = $1", id.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)
+    }
+
+    /// MOD-137 D11 (blueprint §1.4 row 10): bump first, then every candidate of the phase; the
+    /// bump stands when there were none.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `"step_graph_phase"` for an unknown phase.
+    async fn delete_phase_agents(&self, phase: PhaseId) -> Result<()> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        if bump_graph_of_phase(&mut tx, phase).await?.is_none() {
+            return Err(StoreError::NotFound {
+                entity: "step_graph_phase",
+                id: phase.to_string(),
+            });
+        }
+        sqlx::query!(
+            "DELETE FROM phase_agent WHERE phase_id = $1",
+            phase.as_uuid()
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)
+    }
+
+    /// A graph's edges in blueprint §1.3's order.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    async fn graph_edges(&self, graph: StepGraphId) -> Result<Vec<StepGraphEdge>> {
+        graph_edges_on(&self.pool, graph).await
+    }
+
+    /// A phase's parts by `position`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    async fn phase_parts(&self, phase: PhaseId) -> Result<Vec<PhasePart>> {
+        phase_parts_on(&self.pool, phase).await
+    }
+
+    /// The whole body, read on one connection.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    async fn graph_body(&self, graph: StepGraphId) -> Result<Option<GraphBody>> {
+        let mut conn = self.pool.acquire().await.map_err(map_sqlx)?;
+        graph_body_on(&mut conn, graph).await
     }
 
     // prompt_template (MOD-9 milestone 1)

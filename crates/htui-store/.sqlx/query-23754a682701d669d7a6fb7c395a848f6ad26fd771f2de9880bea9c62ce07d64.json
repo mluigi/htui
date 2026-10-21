@@ -1,0 +1,100 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT e.id            AS \"id: EdgeId\",\n               e.graph_id      AS \"graph_id: StepGraphId\",\n               e.from_phase_id AS \"from_phase_id: PhaseId\",\n               e.to_phase_id   AS \"to_phase_id: PhaseId\",\n               e.kind          AS \"kind: EdgeKind\",\n               e.predicate,\n               e.loop_limit\n          FROM step_graph_edge e\n          JOIN step_graph_phase f ON f.id = e.from_phase_id\n          JOIN step_graph_phase t ON t.id = e.to_phase_id\n         WHERE e.graph_id = $1\n         ORDER BY f.position, t.position, e.kind COLLATE \"C\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: EdgeId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_edge",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "graph_id: StepGraphId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_edge",
+            "name": "graph_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "from_phase_id: PhaseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_edge",
+            "name": "from_phase_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "to_phase_id: PhaseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_edge",
+            "name": "to_phase_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "kind: EdgeKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_edge",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "predicate",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "step_graph_edge",
+            "name": "predicate"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "loop_limit",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "step_graph_edge",
+            "name": "loop_limit"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "23754a682701d669d7a6fb7c395a848f6ad26fd771f2de9880bea9c62ce07d64"
+}

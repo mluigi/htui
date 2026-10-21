@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SET CONSTRAINTS uq_step_graph_phase_position, uq_step_graph_phase_name DEFERRED",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "793e742c13d3e57dbe4921bd797ce5a6ea2cfd9381d1849ec968265cd824b251"
+}

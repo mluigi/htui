@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: PersonaId\" FROM persona WHERE id = ANY($1) FOR KEY SHARE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: PersonaId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "persona",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "407645b360c5d4bf820eb2b49c45619b2f294ebbd61423aaf9c10db72527c6ab"
+}

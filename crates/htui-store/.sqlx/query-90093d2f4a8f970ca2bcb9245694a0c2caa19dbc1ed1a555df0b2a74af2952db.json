@@ -1,0 +1,136 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT phase_id   AS \"phase_id: PhaseId\",\n               position,\n               key,\n               title,\n               brief,\n               owned_paths,\n               acceptance,\n               agent_id   AS \"agent_id: AgentId\",\n               model,\n               persona_id AS \"persona_id: PersonaId\"\n          FROM phase_part\n         WHERE phase_id = $1\n         ORDER BY position\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "phase_id: PhaseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "phase_part",
+            "name": "phase_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "position",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "phase_part",
+            "name": "position"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "phase_part",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "title",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "phase_part",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "brief",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "phase_part",
+            "name": "brief"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "owned_paths",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "phase_part",
+            "name": "owned_paths"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "acceptance",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "phase_part",
+            "name": "acceptance"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "agent_id: AgentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "phase_part",
+            "name": "agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "phase_part",
+            "name": "model"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "persona_id: PersonaId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "phase_part",
+            "name": "persona_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "90093d2f4a8f970ca2bcb9245694a0c2caa19dbc1ed1a555df0b2a74af2952db"
+}

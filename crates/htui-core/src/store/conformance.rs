@@ -40,10 +40,14 @@ use crate::model::{
     WaitingPermission, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
     WorkspaceStop, canonical_declared_tags, executor_scrub_refusal, missing_tags_failure,
 };
-use crate::model::{GraphScope, Split};
+use crate::model::{
+    EdgeId, EdgeKind, EdgePredicate, GraphBody, GraphScope, NodeBody, PhasePart, PlanScope,
+    SkillBinding, Split, StepGraphEdge,
+};
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
 use crate::secret::{INFISICAL, SecretScope, project_scope};
+use crate::seed;
 use crate::store::error::StoreError;
 use crate::store::traits::{
     BLANK_PERSONA_BODY, BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT,
@@ -56,6 +60,11 @@ use crate::store::traits::{
     note_needs_a_step, queue_target_refusal, queue_token_refusal, references_no_row,
     requirement_withdrawn, resolution_not_closable, rule_kind_unknown, self_link,
     step_writes_own_item, withdrawn_requirement_cited,
+};
+use crate::store::traits::{
+    divide_columns_off_divide, edge_endpoint_outside_graph, graph_name_is_taken,
+    override_outside_project, palette_phase_has_edges, parts_off_divide, persona_is_bound,
+    phase_position_is_taken, reserved_phase_name, split_fan_out_mismatch,
 };
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
@@ -235,6 +244,25 @@ pub const CASES: &[&str] = &[
     "a_run_without_a_workspace_is_never_gated",
     "adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped",
     "a_deleted_workspace_unscopes_its_runs_and_drops_its_stop",
+    // MOD-137: graph v2 writers and reads (plan D3-D11, blueprint §T3.6)
+    "replace_graph_applies_nodes_edges_and_bumps_revision",
+    "replace_graph_refuses_a_stale_revision_and_writes_nothing",
+    "replace_graph_keeps_bindings_of_kept_phases",
+    "replace_graph_swaps_positions_and_names",
+    "replace_graph_refuses_an_edge_into_another_graph",
+    "replace_graph_refuses_edges_on_a_palette_node",
+    "replace_graph_refuses_parts_on_a_non_divide_node",
+    "replace_graph_refusal_order",
+    "delete_phase_cascades_edges_candidates_parts_and_bindings",
+    "delete_edge_and_delete_phase_agents_bump_revision",
+    "every_graph_write_bumps_revision",
+    "graph_scopes_are_unique_per_scope",
+    "an_override_is_project_scoped",
+    "delete_workspace_takes_its_graphs",
+    "project_create_seeds_default_edges",
+    "a_persona_held_by_divide_columns_or_parts_is_not_deleted",
+    "replace_graph_round_trips_every_node_field",
+    "create_phase_keeps_split_in_step_with_fan_out",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -636,6 +664,72 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         }
         "a_deleted_workspace_unscopes_its_runs_and_drops_its_stop" => {
             a_deleted_workspace_unscopes_its_runs_and_drops_its_stop(store).await;
+        }
+        // MOD-137: boxed, so the graph v2 cases' futures (each holding a whole `replace_graph`)
+        // do not widen this match's future, which every case's poll sits on; the Postgres run's
+        // 2 MiB test stack had no room left for it.
+        "replace_graph_applies_nodes_edges_and_bumps_revision" => {
+            Box::pin(replace_graph_applies_nodes_edges_and_bumps_revision(store)).await;
+        }
+        "replace_graph_refuses_a_stale_revision_and_writes_nothing" => {
+            Box::pin(replace_graph_refuses_a_stale_revision_and_writes_nothing(
+                store,
+            ))
+            .await;
+        }
+        "replace_graph_keeps_bindings_of_kept_phases" => {
+            Box::pin(replace_graph_keeps_bindings_of_kept_phases(store)).await;
+        }
+        "replace_graph_swaps_positions_and_names" => {
+            Box::pin(replace_graph_swaps_positions_and_names(store)).await;
+        }
+        "replace_graph_refuses_an_edge_into_another_graph" => {
+            Box::pin(replace_graph_refuses_an_edge_into_another_graph(store)).await;
+        }
+        "replace_graph_refuses_edges_on_a_palette_node" => {
+            Box::pin(replace_graph_refuses_edges_on_a_palette_node(store)).await;
+        }
+        "replace_graph_refuses_parts_on_a_non_divide_node" => {
+            Box::pin(replace_graph_refuses_parts_on_a_non_divide_node(store)).await;
+        }
+        "replace_graph_refusal_order" => {
+            Box::pin(replace_graph_refusal_order(store)).await;
+        }
+        "delete_phase_cascades_edges_candidates_parts_and_bindings" => {
+            Box::pin(delete_phase_cascades_edges_candidates_parts_and_bindings(
+                store,
+            ))
+            .await;
+        }
+        "delete_edge_and_delete_phase_agents_bump_revision" => {
+            Box::pin(delete_edge_and_delete_phase_agents_bump_revision(store)).await;
+        }
+        "every_graph_write_bumps_revision" => {
+            Box::pin(every_graph_write_bumps_revision(store)).await;
+        }
+        "graph_scopes_are_unique_per_scope" => {
+            Box::pin(graph_scopes_are_unique_per_scope(store)).await;
+        }
+        "an_override_is_project_scoped" => {
+            Box::pin(an_override_is_project_scoped(store)).await;
+        }
+        "delete_workspace_takes_its_graphs" => {
+            Box::pin(delete_workspace_takes_its_graphs(store)).await;
+        }
+        "project_create_seeds_default_edges" => {
+            Box::pin(project_create_seeds_default_edges(store)).await;
+        }
+        "a_persona_held_by_divide_columns_or_parts_is_not_deleted" => {
+            Box::pin(a_persona_held_by_divide_columns_or_parts_is_not_deleted(
+                store,
+            ))
+            .await;
+        }
+        "replace_graph_round_trips_every_node_field" => {
+            Box::pin(replace_graph_round_trips_every_node_field(store)).await;
+        }
+        "create_phase_keeps_split_in_step_with_fan_out" => {
+            Box::pin(create_phase_keeps_split_in_step_with_fan_out(store)).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -21383,6 +21477,1457 @@ async fn queue_setting_refuses_a_foreign_key_and_a_bad_value_before_the_row<S: W
             .expect(CASE),
         None,
         "{CASE}: no refusal wrote an app row"
+    );
+}
+
+// ---- MOD-137: graph v2 writers and reads (plan D3-D11, blueprint §T3.6) ----------------------
+
+/// A `PROJECT_HTUI` graph named `name` whose phases `names` are created one by one through
+/// [`WriteStore::create_phase`], at positions `0..`; the graph id and the phases as stored.
+async fn scratch_graph<S: WriteStore>(
+    case: &str,
+    store: &S,
+    name: &str,
+    names: &[&str],
+) -> (StepGraphId, Vec<StepGraphPhase>) {
+    let graph = store
+        .create_step_graph(NewStepGraph {
+            id: StepGraphId::new(),
+            scope: GraphScope::Project(ids::PROJECT_HTUI),
+            name: name.to_owned(),
+            description: String::new(),
+            is_override: false,
+        })
+        .await
+        .expect(case);
+    let mut phases = Vec::new();
+    for (position, phase) in (0..).zip(names) {
+        phases.push(
+            store
+                .create_phase(&new_phase(graph.id, position, phase))
+                .await
+                .expect(case),
+        );
+    }
+    (graph.id, phases)
+}
+
+/// A graph request of `scope` with a fresh id.
+fn scoped_graph(scope: GraphScope, name: &str, is_override: bool) -> NewStepGraph {
+    NewStepGraph {
+        id: StepGraphId::new(),
+        scope,
+        name: name.to_owned(),
+        description: String::new(),
+        is_override,
+    }
+}
+
+/// `graph`'s stored body, or a panic naming the case.
+async fn body_now<S: WriteStore>(case: &str, store: &S, graph: StepGraphId) -> GraphBody {
+    store
+        .graph_body(graph)
+        .await
+        .expect(case)
+        .unwrap_or_else(|| panic!("{case}: graph {graph} has a body"))
+}
+
+/// A node carrying `phase` and no candidates or parts.
+fn bare_node(phase: StepGraphPhase) -> NodeBody {
+    NodeBody {
+        phase,
+        agents: Vec::new(),
+        parts: Vec::new(),
+    }
+}
+
+/// An edge of `graph` with a fresh id and no predicate; `loop_limit` 2 where the kind needs one
+/// (0020's loop-limit CHECK, [`EdgeKind::needs_loop_limit`]).
+fn graph_edge(graph: StepGraphId, from: PhaseId, to: PhaseId, kind: EdgeKind) -> StepGraphEdge {
+    StepGraphEdge {
+        id: EdgeId::new(),
+        graph_id: graph,
+        from,
+        to,
+        kind,
+        predicate: None,
+        loop_limit: kind.needs_loop_limit().then_some(2),
+    }
+}
+
+/// A `phase_agent` row.
+fn candidate(phase: PhaseId, position: i32, agent: AgentId) -> PhaseAgent {
+    PhaseAgent {
+        phase_id: phase,
+        position,
+        agent_id: agent,
+        model: "sonnet".to_owned(),
+    }
+}
+
+/// A `phase_part` row with only its required columns.
+fn part_row(phase: PhaseId, position: i32, key: &str) -> PhasePart {
+    PhasePart {
+        phase_id: phase,
+        position,
+        key: key.to_owned(),
+        title: key.to_uppercase(),
+        brief: String::new(),
+        owned_paths: Vec::new(),
+        acceptance: None,
+        agent_id: None,
+        model: None,
+        persona_id: None,
+    }
+}
+
+/// An edge without its id: `(from, to, kind, predicate, loop_limit)`.
+type EdgeShape = (
+    PhaseId,
+    PhaseId,
+    EdgeKind,
+    Option<EdgePredicate>,
+    Option<i32>,
+);
+
+/// Edges without their ids, in their order.
+fn edge_shape(edges: &[StepGraphEdge]) -> Vec<EdgeShape> {
+    edges
+        .iter()
+        .map(|edge| {
+            (
+                edge.from,
+                edge.to,
+                edge.kind,
+                edge.predicate.clone(),
+                edge.loop_limit,
+            )
+        })
+        .collect()
+}
+
+/// One step of a refusal-order walk: the exact sentence expected, then the mend that clears it.
+type Mend = (String, Box<dyn Fn(&mut GraphBody) + Send + Sync>);
+
+/// MOD-137 D10: one call replaces the graph's name, nodes (kept by id, dropped, new),
+/// candidates and edges, and bumps `revision` once. The answer is the stored body, nodes and
+/// candidates by position and edges by (from position, to position, kind), whatever order the
+/// body came in; `scope` and `revision` of the body are ignored.
+async fn replace_graph_applies_nodes_edges_and_bumps_revision<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_applies_nodes_edges_and_bumps_revision";
+    let (graph, phases) =
+        scratch_graph(CASE, store, "replace-me", &["plan", "implement", "review"]).await;
+    let before = body_now(CASE, store, graph).await;
+    let r0 = before.graph.revision;
+    assert_eq!(
+        r0, 3,
+        "{CASE}: three create_phase bumps on a fresh graph (D5)"
+    );
+    let (plan, implement, review) = (phases[0].clone(), phases[1].clone(), phases[2].clone());
+    let build = new_phase(graph, 1, "build");
+
+    let mut written = before.clone();
+    written.graph.name = "replaced".to_owned();
+    written.graph.description = "Rewritten in one call".to_owned();
+    written.graph.scope = GraphScope::Library;
+    written.graph.revision = 99;
+    let mut edited = plan.clone();
+    edited.gate_hard = true;
+    edited.retry_limit = 2;
+    written.nodes = vec![
+        bare_node(review.clone()),
+        NodeBody {
+            phase: edited,
+            agents: vec![candidate(plan.id, 0, ids::AGENT_CLAUDE)],
+            parts: Vec::new(),
+        },
+        NodeBody {
+            phase: build.clone(),
+            agents: vec![
+                candidate(build.id, 1, ids::AGENT_CLAUDE),
+                candidate(build.id, 0, ids::AGENT_AGY),
+            ],
+            parts: Vec::new(),
+        },
+    ];
+    let first = graph_edge(graph, plan.id, build.id, EdgeKind::Next);
+    let second = graph_edge(graph, build.id, review.id, EdgeKind::Next);
+    let mut asks = graph_edge(graph, review.id, build.id, EdgeKind::AsksYou);
+    asks.loop_limit = Some(1);
+    written.edges = vec![asks.clone(), second.clone(), first.clone()];
+
+    let answer = applied(
+        CASE,
+        store.replace_graph(graph, r0, written).await.expect(CASE),
+    );
+    assert_eq!(
+        answer.graph.revision,
+        r0 + 1,
+        "{CASE}: one replace is one bump"
+    );
+    assert_eq!(
+        (
+            answer.graph.id,
+            answer.graph.name.as_str(),
+            answer.graph.description.as_str(),
+            answer.graph.scope,
+            answer.graph.is_override,
+        ),
+        (
+            graph,
+            "replaced",
+            "Rewritten in one call",
+            GraphScope::Project(ids::PROJECT_HTUI),
+            false
+        ),
+        "{CASE}: name and description written, scope and is_override not editable"
+    );
+    assert_eq!(
+        answer
+            .nodes
+            .iter()
+            .map(|node| (node.phase.id, node.phase.position, node.phase.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (plan.id, 0, "plan"),
+            (build.id, 1, "build"),
+            (review.id, 2, "review")
+        ],
+        "{CASE}: nodes by position; the kept ids kept, the new one in"
+    );
+    assert!(
+        answer
+            .nodes
+            .iter()
+            .all(|node| node.phase.id != implement.id),
+        "{CASE}: the dropped node is gone"
+    );
+    assert_eq!(
+        (
+            answer.nodes[0].phase.gate_hard,
+            answer.nodes[0].phase.retry_limit
+        ),
+        (true, 2),
+        "{CASE}: the kept node is edited in place"
+    );
+    assert_eq!(
+        answer.nodes[0].agents,
+        vec![candidate(plan.id, 0, ids::AGENT_CLAUDE)],
+        "{CASE}: the kept node's candidates"
+    );
+    assert_eq!(
+        answer.nodes[1].agents,
+        vec![
+            candidate(build.id, 0, ids::AGENT_AGY),
+            candidate(build.id, 1, ids::AGENT_CLAUDE),
+        ],
+        "{CASE}: candidates by position"
+    );
+    assert!(answer.nodes[2].agents.is_empty(), "{CASE}: none on review");
+    assert_eq!(
+        answer.edges,
+        vec![first, second, asks],
+        "{CASE}: edges by from position, to position, kind"
+    );
+    assert_eq!(
+        store.graph_body(graph).await.expect(CASE),
+        Some(answer.clone()),
+        "{CASE}: graph_body reads back the answer"
+    );
+    assert_eq!(
+        store.phases(graph).await.expect(CASE),
+        answer
+            .nodes
+            .iter()
+            .map(|node| node.phase.clone())
+            .collect::<Vec<_>>(),
+        "{CASE}: phases agrees"
+    );
+    assert_eq!(
+        store.graph_edges(graph).await.expect(CASE),
+        answer.edges,
+        "{CASE}: graph_edges agrees"
+    );
+}
+
+/// MOD-137 D10: a spent `revision` answers `Stale` with the body as it is now, before any check
+/// of the body, and writes nothing; an unknown graph is `NotFound`.
+async fn replace_graph_refuses_a_stale_revision_and_writes_nothing<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_refuses_a_stale_revision_and_writes_nothing";
+    let (graph, phases) = scratch_graph(CASE, store, "stale-me", &["plan", "review"]).await;
+    let before = body_now(CASE, store, graph).await;
+    let r0 = before.graph.revision;
+    let mut written = before.clone();
+    written.nodes[0].agents = vec![candidate(phases[0].id, 0, ids::AGENT_CLAUDE)];
+    written.edges = vec![graph_edge(
+        graph,
+        phases[0].id,
+        phases[1].id,
+        EdgeKind::Next,
+    )];
+    let current = applied(
+        CASE,
+        store
+            .replace_graph(graph, r0, written.clone())
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(current.graph.revision, r0 + 1, "{CASE}: the first lands");
+
+    let mut again = written;
+    again.graph.name = "never-written".to_owned();
+    again.nodes.pop();
+    again.edges.clear();
+    let spent = stale(
+        CASE,
+        store
+            .replace_graph(graph, r0, again.clone())
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        spent, current,
+        "{CASE}: Stale carries the body as it is now"
+    );
+    again.nodes[0].phase.name = "judge".to_owned();
+    let spent = stale(
+        CASE,
+        store.replace_graph(graph, r0, again).await.expect(CASE),
+    );
+    assert_eq!(
+        spent, current,
+        "{CASE}: a spent token answers Stale even for a body that would be refused"
+    );
+    assert_eq!(
+        body_now(CASE, store, graph).await,
+        current,
+        "{CASE}: name, revision, phases, candidates and edges unchanged"
+    );
+    let unknown = store.replace_graph(StepGraphId::new(), 0, current).await;
+    assert!(
+        matches!(
+            unknown,
+            Err(StoreError::NotFound {
+                entity: "step_graph",
+                ..
+            })
+        ),
+        "{CASE}: an unknown graph is NotFound, got {unknown:?}"
+    );
+}
+
+/// MOD-137 D10: a kept node is updated in place, so its phase-level `skill_binding` survives; a
+/// dropped node takes its binding with it.
+async fn replace_graph_keeps_bindings_of_kept_phases<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_keeps_bindings_of_kept_phases";
+    let (graph, phases) = scratch_graph(CASE, store, "bound", &["keep", "drop"]).await;
+    let (kept, dropped) = (phases[0].id, phases[1].id);
+    for phase in [kept, dropped] {
+        applied(
+            CASE,
+            store
+                .set_skill_binding(
+                    key(ids::SKILL_TESTS, Some(ids::PROJECT_HTUI), Some(phase)),
+                    None,
+                    BindingChange::Attach(attachment(Activation::Always, 1)),
+                )
+                .await
+                .expect(CASE),
+        );
+    }
+    let bound = |rows: Vec<SkillBinding>| -> Vec<PhaseId> {
+        let mut phases: Vec<PhaseId> = rows
+            .into_iter()
+            .filter_map(|row| row.phase_id)
+            .filter(|phase| *phase == kept || *phase == dropped)
+            .collect();
+        phases.sort_unstable();
+        phases
+    };
+    let mut both = vec![kept, dropped];
+    both.sort_unstable();
+    assert_eq!(
+        bound(
+            store
+                .skill_bindings(Some(ids::PROJECT_HTUI))
+                .await
+                .expect(CASE)
+        ),
+        both,
+        "{CASE}: precondition, both phases bound"
+    );
+
+    let mut written = body_now(CASE, store, graph).await;
+    written.nodes.retain(|node| node.phase.id == kept);
+    written.nodes[0].phase.name = "kept".to_owned();
+    applied(
+        CASE,
+        store
+            .replace_graph(graph, written.graph.revision, written)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        bound(
+            store
+                .skill_bindings(Some(ids::PROJECT_HTUI))
+                .await
+                .expect(CASE)
+        ),
+        vec![kept],
+        "{CASE}: the kept phase keeps its binding, the dropped one's went with it"
+    );
+}
+
+/// MOD-137 D10: two nodes trade position and name in one call; each id keeps its own row. On
+/// Postgres this is the deferred-unique case.
+async fn replace_graph_swaps_positions_and_names<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_swaps_positions_and_names";
+    let (graph, phases) = scratch_graph(CASE, store, "swap", &["a", "b"]).await;
+    let (a, b) = (phases[0].id, phases[1].id);
+    let mut written = body_now(CASE, store, graph).await;
+    written.nodes[0].phase.position = 1;
+    written.nodes[0].phase.name = "b".to_owned();
+    written.nodes[0].phase.gate_hard = true;
+    written.nodes[1].phase.position = 0;
+    written.nodes[1].phase.name = "a".to_owned();
+    let answer = applied(
+        CASE,
+        store
+            .replace_graph(graph, written.graph.revision, written)
+            .await
+            .expect(CASE),
+    );
+    let view = |rows: Vec<StepGraphPhase>| {
+        rows.into_iter()
+            .map(|row| (row.id, row.position, row.name, row.gate_hard))
+            .collect::<Vec<_>>()
+    };
+    let expected = vec![(b, 0, "a".to_owned(), false), (a, 1, "b".to_owned(), true)];
+    assert_eq!(
+        view(answer.nodes.into_iter().map(|node| node.phase).collect()),
+        expected,
+        "{CASE}: the swap lands, each id with its own row"
+    );
+    assert_eq!(
+        view(store.phases(graph).await.expect(CASE)),
+        expected,
+        "{CASE}: and reads back"
+    );
+}
+
+/// MOD-137 D6: an edge cannot point into another graph; the sentence is exact and nothing is
+/// written.
+async fn replace_graph_refuses_an_edge_into_another_graph<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_refuses_an_edge_into_another_graph";
+    let (graph, phases) = scratch_graph(CASE, store, "fenced", &["plan", "review"]).await;
+    let before = body_now(CASE, store, graph).await;
+    let foreign = ids::PHASE_HTUI_IMPLEMENT;
+    let mut written = before.clone();
+    written.edges = vec![graph_edge(graph, phases[0].id, foreign, EdgeKind::Next)];
+    constraint_exactly(
+        CASE,
+        store
+            .replace_graph(graph, before.graph.revision, written)
+            .await,
+        &edge_endpoint_outside_graph("to_phase_id", foreign, graph),
+        "an edge into GRAPH_HTUI_FEAT",
+    );
+    assert_eq!(
+        body_now(CASE, store, graph).await,
+        before,
+        "{CASE}: nothing written"
+    );
+}
+
+/// MOD-137 D6: a palette node has no edges, in or out; without them it is stored.
+async fn replace_graph_refuses_edges_on_a_palette_node<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_refuses_edges_on_a_palette_node";
+    let (graph, phases) = scratch_graph(CASE, store, "palette", &["plan", "spare"]).await;
+    let before = body_now(CASE, store, graph).await;
+    let mut written = before.clone();
+    written.nodes[1].phase.palette = true;
+    let edge = graph_edge(graph, phases[0].id, phases[1].id, EdgeKind::Next);
+    written.edges = vec![edge.clone()];
+    constraint_exactly(
+        CASE,
+        store
+            .replace_graph(graph, before.graph.revision, written.clone())
+            .await,
+        &palette_phase_has_edges("spare", edge.id),
+        "an edge into a palette node",
+    );
+    assert_eq!(
+        body_now(CASE, store, graph).await,
+        before,
+        "{CASE}: nothing written"
+    );
+    written.edges.clear();
+    let answer = applied(
+        CASE,
+        store
+            .replace_graph(graph, before.graph.revision, written)
+            .await
+            .expect(CASE),
+    );
+    assert!(
+        answer.nodes[1].phase.palette && answer.edges.is_empty(),
+        "{CASE}: a palette node without edges is stored"
+    );
+}
+
+/// MOD-137 D8: parts belong to a `divide` node; on one, every part column round-trips through
+/// [`WriteStore::phase_parts`].
+async fn replace_graph_refuses_parts_on_a_non_divide_node<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_refuses_parts_on_a_non_divide_node";
+    let (graph, phases) = scratch_graph(CASE, store, "divided", &["plan", "split"]).await;
+    let before = body_now(CASE, store, graph).await;
+    let split = phases[1].id;
+    let mut core = part_row(split, 0, "core");
+    core.title = "Core crate".to_owned();
+    core.brief = "The store seam".to_owned();
+    core.owned_paths = vec!["crates/htui-core/".to_owned(), "docs/".to_owned()];
+    core.acceptance = Some("cargo test passes".to_owned());
+    core.agent_id = Some(ids::AGENT_CLAUDE);
+    core.model = Some("opus".to_owned());
+    core.persona_id = Some(ids::PERSONA_REVIEWER);
+    let parts = vec![core, part_row(split, 1, "docs")];
+    let mut written = before.clone();
+    written.nodes[1].parts = parts.clone();
+    constraint_exactly(
+        CASE,
+        store
+            .replace_graph(graph, before.graph.revision, written.clone())
+            .await,
+        &parts_off_divide("split", Split::None),
+        "parts on a `none` node",
+    );
+    assert_eq!(
+        body_now(CASE, store, graph).await,
+        before,
+        "{CASE}: nothing written"
+    );
+
+    written.nodes[1].phase.split = Split::Divide;
+    written.nodes[1].phase.max_parts = Some(3);
+    written.nodes[1].phase.planner_model = Some("opus".to_owned());
+    let answer = applied(
+        CASE,
+        store
+            .replace_graph(graph, before.graph.revision, written)
+            .await
+            .expect(CASE),
+    );
+    let node = &answer.nodes[1];
+    assert_eq!(
+        (
+            node.phase.split,
+            node.phase.max_parts,
+            node.phase.planner_model.as_deref()
+        ),
+        (Split::Divide, Some(3), Some("opus")),
+        "{CASE}: the divide columns"
+    );
+    assert_eq!(node.parts, parts, "{CASE}: the answer carries the parts");
+    assert_eq!(
+        store.phase_parts(split).await.expect(CASE),
+        parts,
+        "{CASE}: every part column round-trips"
+    );
+    assert!(
+        store
+            .phase_parts(PhaseId::new())
+            .await
+            .expect(CASE)
+            .is_empty(),
+        "{CASE}: an unknown phase has no parts"
+    );
+}
+
+/// MOD-137 D10: the refusal order, both stores, one sentence each (blueprint §T3.1, §T3.2). One
+/// body breaks every rule; each call mends one and expects exactly the next sentence. Then the
+/// graph name and a foreign phase or edge id. The revision never moves until the mended body is
+/// applied.
+async fn replace_graph_refusal_order<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_refusal_order";
+    let (graph, phases) = scratch_graph(CASE, store, "ordered", &["plan", "build", "review"]).await;
+    let before = body_now(CASE, store, graph).await;
+    let revision = before.graph.revision;
+    let (plan, build) = (phases[0].id, phases[1].id);
+    let ghost_persona = PersonaId::new();
+    let ghost_agent = AgentId::new();
+    let stray = PhaseId::new();
+    let dangling = graph_edge(graph, plan, stray, EdgeKind::Next);
+    let into_palette = graph_edge(graph, plan, build, EdgeKind::Next);
+
+    let mut body = before.clone();
+    body.nodes[1].phase.name = "judge".to_owned();
+    body.nodes[2].phase.position = 0;
+    body.nodes[0].phase.persona_id = Some(ghost_persona);
+    body.nodes[0].agents = vec![candidate(plan, 0, ghost_agent)];
+    body.edges = vec![dangling.clone(), into_palette.clone()];
+    body.nodes[2].phase.fan_out = 2;
+    body.nodes[1].phase.palette = true;
+    body.nodes[0].parts = vec![part_row(plan, 0, "core")];
+
+    let dangling_id = dangling.id;
+    let steps: Vec<Mend> = vec![
+        (
+            reserved_phase_name("judge"),
+            Box::new(|b: &mut GraphBody| b.nodes[1].phase.name = "build".to_owned()),
+        ),
+        (
+            phase_position_is_taken(0, graph),
+            Box::new(|b: &mut GraphBody| b.nodes[2].phase.position = 2),
+        ),
+        (
+            references_no_row("step_graph_phase.persona_id", ghost_persona, "persona"),
+            Box::new(|b: &mut GraphBody| b.nodes[0].phase.persona_id = None),
+        ),
+        (
+            references_no_row("phase_agent.agent_id", ghost_agent, "agent"),
+            Box::new(move |b: &mut GraphBody| {
+                b.nodes[0].agents = vec![candidate(plan, 0, ids::AGENT_CLAUDE)]
+            }),
+        ),
+        (
+            edge_endpoint_outside_graph("to_phase_id", stray, graph),
+            Box::new(move |b: &mut GraphBody| b.edges.retain(|edge| edge.id != dangling_id)),
+        ),
+        (
+            split_fan_out_mismatch("review", Split::None, 2),
+            Box::new(|b: &mut GraphBody| b.nodes[2].phase.split = Split::Compete),
+        ),
+        (
+            palette_phase_has_edges("build", into_palette.id),
+            Box::new(|b: &mut GraphBody| b.nodes[1].phase.palette = false),
+        ),
+        (
+            parts_off_divide("plan", Split::None),
+            Box::new(|b: &mut GraphBody| b.nodes[0].parts.clear()),
+        ),
+    ];
+    for (sentence, mend) in steps {
+        constraint_exactly(
+            CASE,
+            store.replace_graph(graph, revision, body.clone()).await,
+            &sentence,
+            "the next rule in order",
+        );
+        mend(&mut body);
+    }
+
+    body.graph.name = "analysis".to_owned();
+    constraint_exactly(
+        CASE,
+        store.replace_graph(graph, revision, body.clone()).await,
+        &graph_name_is_taken("analysis", GraphScope::Project(ids::PROJECT_HTUI)),
+        "a name the project's analysis graph holds",
+    );
+    body.graph.name = "ordered".to_owned();
+
+    body.nodes.push(bare_node(StepGraphPhase {
+        id: ids::PHASE_HTUI_IMPLEMENT,
+        ..new_phase(graph, 7, "borrowed")
+    }));
+    constraint_exactly(
+        CASE,
+        store.replace_graph(graph, revision, body.clone()).await,
+        &already_exists("step_graph_phase", ids::PHASE_HTUI_IMPLEMENT),
+        "a node id another graph holds",
+    );
+    body.nodes.pop();
+
+    let foreign_edge = store
+        .graph_edges(ids::GRAPH_HTUI_FEAT)
+        .await
+        .expect(CASE)
+        .first()
+        .map(|edge| edge.id)
+        .unwrap_or_else(|| panic!("{CASE}: the fixture's feature graph has edges"));
+    body.edges.push(StepGraphEdge {
+        id: foreign_edge,
+        ..graph_edge(graph, build, plan, EdgeKind::AsksYou)
+    });
+    constraint_exactly(
+        CASE,
+        store.replace_graph(graph, revision, body.clone()).await,
+        &already_exists("step_graph_edge", foreign_edge),
+        "an edge id another graph holds",
+    );
+    body.edges.pop();
+
+    assert_eq!(
+        body_now(CASE, store, graph).await,
+        before,
+        "{CASE}: no refusal wrote anything or moved the revision"
+    );
+    let answer = applied(
+        CASE,
+        store
+            .replace_graph(graph, revision, body)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        answer.graph.revision,
+        revision + 1,
+        "{CASE}: the mended body was the last refusal"
+    );
+}
+
+/// MOD-137 D11: deleting a phase takes its candidates, parts, edges in and out, and phase
+/// bindings, and bumps once; again is `NotFound`; a graph's last phase may go.
+async fn delete_phase_cascades_edges_candidates_parts_and_bindings<S: WriteStore>(store: &S) {
+    const CASE: &str = "delete_phase_cascades_edges_candidates_parts_and_bindings";
+    let (graph, phases) = scratch_graph(CASE, store, "cascade", &["plan", "split", "review"]).await;
+    let (plan, split, review) = (phases[0].id, phases[1].id, phases[2].id);
+    let mut body = body_now(CASE, store, graph).await;
+    body.nodes[1].phase.split = Split::Divide;
+    body.nodes[1].phase.max_parts = Some(2);
+    body.nodes[1].agents = vec![candidate(split, 0, ids::AGENT_CLAUDE)];
+    body.nodes[1].parts = vec![part_row(split, 0, "core")];
+    let skip = graph_edge(graph, plan, review, EdgeKind::AsksYou);
+    body.edges = vec![
+        graph_edge(graph, plan, split, EdgeKind::Next),
+        graph_edge(graph, split, review, EdgeKind::Next),
+        skip.clone(),
+    ];
+    applied(
+        CASE,
+        store
+            .replace_graph(graph, body.graph.revision, body)
+            .await
+            .expect(CASE),
+    );
+    applied(
+        CASE,
+        store
+            .set_skill_binding(
+                key(ids::SKILL_TESTS, Some(ids::PROJECT_HTUI), Some(split)),
+                None,
+                BindingChange::Attach(attachment(Activation::Always, 1)),
+            )
+            .await
+            .expect(CASE),
+    );
+    let revision = body_now(CASE, store, graph).await.graph.revision;
+
+    store.delete_phase(split).await.expect(CASE);
+    let after = body_now(CASE, store, graph).await;
+    assert_eq!(after.graph.revision, revision + 1, "{CASE}: one bump");
+    assert_eq!(
+        after
+            .nodes
+            .iter()
+            .map(|node| node.phase.id)
+            .collect::<Vec<_>>(),
+        vec![plan, review],
+        "{CASE}: the phase is gone"
+    );
+    assert_eq!(
+        store.graph_edges(graph).await.expect(CASE),
+        vec![skip],
+        "{CASE}: its edges in and out went with it"
+    );
+    assert!(
+        store.phase_parts(split).await.expect(CASE).is_empty(),
+        "{CASE}: its parts went with it"
+    );
+    assert!(
+        store
+            .skill_bindings(Some(ids::PROJECT_HTUI))
+            .await
+            .expect(CASE)
+            .iter()
+            .all(|row| row.phase_id != Some(split)),
+        "{CASE}: its binding went with it"
+    );
+    let again = store.delete_phase(split).await;
+    assert!(
+        matches!(
+            again,
+            Err(StoreError::NotFound {
+                entity: "step_graph_phase",
+                ..
+            })
+        ),
+        "{CASE}: a second delete is NotFound, got {again:?}"
+    );
+    store.delete_phase(plan).await.expect(CASE);
+    store.delete_phase(review).await.expect(CASE);
+    let empty = body_now(CASE, store, graph).await;
+    assert!(
+        empty.nodes.is_empty() && empty.edges.is_empty(),
+        "{CASE}: a graph's last phase may go"
+    );
+    assert!(
+        store.phases(graph).await.expect(CASE).is_empty(),
+        "{CASE}: phases agrees"
+    );
+}
+
+/// MOD-137 D11: `delete_edge` and `delete_phase_agents` each remove exactly their rows and bump
+/// once, `delete_phase_agents` also on a phase with none; unknown ids are `NotFound`.
+async fn delete_edge_and_delete_phase_agents_bump_revision<S: WriteStore>(store: &S) {
+    const CASE: &str = "delete_edge_and_delete_phase_agents_bump_revision";
+    let (graph, phases) = scratch_graph(CASE, store, "trim", &["plan", "build", "review"]).await;
+    let (plan, build, review) = (phases[0].id, phases[1].id, phases[2].id);
+    let mut body = body_now(CASE, store, graph).await;
+    body.nodes[0].agents = vec![
+        candidate(plan, 0, ids::AGENT_CLAUDE),
+        candidate(plan, 1, ids::AGENT_AGY),
+    ];
+    body.nodes[1].agents = vec![candidate(build, 0, ids::AGENT_CLAUDE)];
+    let first = graph_edge(graph, plan, build, EdgeKind::Next);
+    let second = graph_edge(graph, build, review, EdgeKind::Next);
+    body.edges = vec![first.clone(), second.clone()];
+    let revision = applied(
+        CASE,
+        store
+            .replace_graph(graph, body.graph.revision, body)
+            .await
+            .expect(CASE),
+    )
+    .graph
+    .revision;
+
+    store.delete_edge(first.id).await.expect(CASE);
+    assert_eq!(
+        body_now(CASE, store, graph).await.graph.revision,
+        revision + 1,
+        "{CASE}: delete_edge bumps"
+    );
+    assert_eq!(
+        store.graph_edges(graph).await.expect(CASE),
+        vec![second],
+        "{CASE}: exactly the one edge went"
+    );
+    let again = store.delete_edge(first.id).await;
+    assert!(
+        matches!(
+            again,
+            Err(StoreError::NotFound {
+                entity: "step_graph_edge",
+                ..
+            })
+        ),
+        "{CASE}: an unknown edge is NotFound, got {again:?}"
+    );
+
+    store.delete_phase_agents(plan).await.expect(CASE);
+    let after = body_now(CASE, store, graph).await;
+    assert_eq!(
+        after.graph.revision,
+        revision + 2,
+        "{CASE}: delete_phase_agents bumps"
+    );
+    assert!(
+        after.nodes[0].agents.is_empty(),
+        "{CASE}: plan's candidates went"
+    );
+    assert_eq!(
+        after.nodes[1].agents,
+        vec![candidate(build, 0, ids::AGENT_CLAUDE)],
+        "{CASE}: build's stayed"
+    );
+    store.delete_phase_agents(review).await.expect(CASE);
+    assert_eq!(
+        body_now(CASE, store, graph).await.graph.revision,
+        revision + 3,
+        "{CASE}: a phase with no candidates still bumps"
+    );
+    let unknown = store.delete_phase_agents(PhaseId::new()).await;
+    assert!(
+        matches!(
+            unknown,
+            Err(StoreError::NotFound {
+                entity: "step_graph_phase",
+                ..
+            })
+        ),
+        "{CASE}: an unknown phase is NotFound, got {unknown:?}"
+    );
+    assert_eq!(
+        body_now(CASE, store, graph).await.graph.revision,
+        revision + 3,
+        "{CASE}: the refusals bumped nothing"
+    );
+}
+
+/// MOD-137 D5 (blueprint §1.4, F1): every write to a graph's content bumps `revision` by one and
+/// moves `step_graph.updated_at`; a write that writes nothing, a stale one and a refused one bump
+/// nothing.
+async fn every_graph_write_bumps_revision<S: WriteStore>(store: &S) {
+    const CASE: &str = "every_graph_write_bumps_revision";
+    let graph = store
+        .create_step_graph(scoped_graph(
+            GraphScope::Project(ids::PROJECT_HTUI),
+            "bumps",
+            false,
+        ))
+        .await
+        .expect(CASE);
+    assert_eq!(graph.revision, 0, "{CASE}: a fresh graph is at 0");
+    let mut last = graph.clone();
+    let mut expect = async |revision: i64, what: &str| {
+        let now = body_now(CASE, store, graph.id).await.graph;
+        assert_eq!(now.revision, revision, "{CASE}: {what}");
+        if revision == last.revision {
+            assert_eq!(
+                now.updated_at, last.updated_at,
+                "{CASE}: {what} moved nothing"
+            );
+        } else {
+            assert!(
+                now.updated_at > last.updated_at,
+                "{CASE}: {what} moved step_graph.updated_at"
+            );
+        }
+        last = now;
+    };
+
+    applied(
+        CASE,
+        store
+            .update_step_graph(
+                graph.id,
+                graph.updated_at,
+                StepGraphPatch {
+                    name: Some("bumped".to_owned()),
+                    ..StepGraphPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    expect(1, "update_step_graph").await;
+    let phase = store
+        .create_phase(&new_phase(graph.id, 0, "plan"))
+        .await
+        .expect(CASE);
+    expect(2, "create_phase").await;
+    store
+        .create_phase_agents(phase.id, &[candidate(phase.id, 0, ids::AGENT_CLAUDE)])
+        .await
+        .expect(CASE);
+    expect(3, "create_phase_agents").await;
+    let edited = applied(
+        CASE,
+        store
+            .update_phase(
+                phase.id,
+                phase.updated_at,
+                PhasePatch {
+                    gate_hard: Some(true),
+                    ..PhasePatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    expect(4, "update_phase").await;
+    let rung = SettingRung::Phase(phase.id);
+    let written = applied(
+        CASE,
+        store
+            .set_setting(
+                rung,
+                SettingKey::TokenBudget,
+                json!(50_000),
+                Some(edited.updated_at),
+            )
+            .await
+            .expect(CASE),
+    );
+    expect(5, "set_setting on the Phase rung").await;
+    applied(
+        CASE,
+        store
+            .clear_setting(rung, SettingKey::TokenBudget, written.updated_at)
+            .await
+            .expect(CASE),
+    );
+    expect(6, "clear_setting on the Phase rung (F1)").await;
+
+    store.create_phase_agents(phase.id, &[]).await.expect(CASE);
+    expect(6, "an empty create_phase_agents").await;
+    stale(
+        CASE,
+        store
+            .update_phase(phase.id, phase.updated_at, PhasePatch::default())
+            .await
+            .expect(CASE),
+    );
+    expect(6, "a stale update_phase").await;
+    let refused = store.create_phase(&new_phase(graph.id, 1, "judge")).await;
+    assert!(
+        matches!(refused, Err(StoreError::Constraint(_))),
+        "{CASE}: a reserved name is refused, got {refused:?}"
+    );
+    expect(6, "a refused create_phase").await;
+}
+
+/// MOD-137 D3: a name is unique per scope: the library, a workspace and a project may each hold
+/// `lib`; an owner that names no row is refused; `graph_body` is the one reader of a non-project
+/// graph, and `step_graphs` lists only the project's.
+async fn graph_scopes_are_unique_per_scope<S: WriteStore>(store: &S) {
+    const CASE: &str = "graph_scopes_are_unique_per_scope";
+    let workspace = GraphScope::Workspace(ids::WORKSPACE_PLATFORM);
+    let lib = store
+        .create_step_graph(scoped_graph(GraphScope::Library, "lib", false))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (lib.scope, lib.revision),
+        (GraphScope::Library, 0),
+        "{CASE}: a library graph at revision 0"
+    );
+    let twin = store
+        .create_step_graph(scoped_graph(GraphScope::Library, "lib", false))
+        .await;
+    assert!(
+        matches!(twin, Err(StoreError::Constraint(_))),
+        "{CASE}: the library holds `lib` once, got {twin:?}"
+    );
+    let in_workspace = store
+        .create_step_graph(scoped_graph(workspace, "lib", false))
+        .await
+        .expect(CASE);
+    assert_eq!(in_workspace.scope, workspace, "{CASE}: the workspace's own");
+    let in_project = store
+        .create_step_graph(scoped_graph(
+            GraphScope::Project(ids::PROJECT_HTUI),
+            "lib",
+            false,
+        ))
+        .await
+        .expect(CASE);
+    let orphan = store
+        .create_step_graph(scoped_graph(
+            GraphScope::Workspace(WorkspaceId::new()),
+            "lib",
+            false,
+        ))
+        .await;
+    assert!(
+        matches!(orphan, Err(StoreError::Constraint(_))),
+        "{CASE}: a workspace that names no row is refused, got {orphan:?}"
+    );
+    let body = body_now(CASE, store, lib.id).await;
+    assert_eq!(body.graph, lib, "{CASE}: graph_body reads the library row");
+    assert!(
+        body.nodes.is_empty() && body.edges.is_empty(),
+        "{CASE}: an empty graph"
+    );
+    assert_eq!(
+        store
+            .step_graphs(ids::PROJECT_HTUI)
+            .await
+            .expect(CASE)
+            .into_iter()
+            .filter(|graph| graph.name == "lib")
+            .map(|graph| graph.id)
+            .collect::<Vec<_>>(),
+        vec![in_project.id],
+        "{CASE}: step_graphs lists the project's graphs only"
+    );
+
+    let second = store
+        .create_step_graph(scoped_graph(workspace, "lib-two", false))
+        .await
+        .expect(CASE);
+    let mut renamed = body_now(CASE, store, second.id).await;
+    renamed.graph.name = "lib".to_owned();
+    constraint_exactly(
+        CASE,
+        store
+            .replace_graph(second.id, renamed.graph.revision, renamed)
+            .await,
+        &graph_name_is_taken("lib", workspace),
+        "a rename into a name the workspace holds",
+    );
+}
+
+/// MOD-137 D3: an override is a per-item clone and belongs to a project (0020's override CHECK),
+/// worded once for both stores.
+async fn an_override_is_project_scoped<S: WriteStore>(store: &S) {
+    const CASE: &str = "an_override_is_project_scoped";
+    for scope in [
+        GraphScope::Library,
+        GraphScope::Workspace(ids::WORKSPACE_PLATFORM),
+    ] {
+        let new = scoped_graph(scope, "override-copy", true);
+        let id = new.id;
+        constraint_exactly(
+            CASE,
+            store.create_step_graph(new).await,
+            &override_outside_project(scope),
+            "an override outside a project",
+        );
+        assert_eq!(
+            store.graph_body(id).await.expect(CASE),
+            None,
+            "{CASE}: no row for {scope}"
+        );
+    }
+    let kept = store
+        .create_step_graph(scoped_graph(
+            GraphScope::Project(ids::PROJECT_HTUI),
+            "override-copy",
+            true,
+        ))
+        .await
+        .expect(CASE);
+    assert!(
+        kept.is_override && kept.scope == GraphScope::Project(ids::PROJECT_HTUI),
+        "{CASE}: a project override is stored"
+    );
+}
+
+/// MOD-137 D3: a workspace's graphs go with it; the reach counts them into the existing
+/// `step_graphs`, `phases` and `phase_agents` (blueprint §4 item 9), and project graphs stay.
+async fn delete_workspace_takes_its_graphs<S: WriteStore>(store: &S) {
+    const CASE: &str = "delete_workspace_takes_its_graphs";
+    let workspace = store
+        .create_workspace(new_workspace("scratch-graphs"))
+        .await
+        .expect(CASE);
+    let graph = store
+        .create_step_graph(scoped_graph(
+            GraphScope::Workspace(workspace.id),
+            "ws-graph",
+            false,
+        ))
+        .await
+        .expect(CASE);
+    let phase = store
+        .create_phase(&new_phase(graph.id, 0, "plan"))
+        .await
+        .expect(CASE);
+    store
+        .create_phase_agents(
+            phase.id,
+            &[
+                candidate(phase.id, 0, ids::AGENT_CLAUDE),
+                candidate(phase.id, 1, ids::AGENT_AGY),
+            ],
+        )
+        .await
+        .expect(CASE);
+    let project_graphs = store.step_graphs(ids::PROJECT_HTUI).await.expect(CASE);
+
+    let reach = store
+        .delete_reach(DeleteTarget::Workspace(workspace.id))
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the workspace exists"));
+    assert_eq!(
+        (reach.step_graphs, reach.phases, reach.phase_agents),
+        (1, 1, 2),
+        "{CASE}: the reach counts the graph, its phase and its candidates"
+    );
+    let done = store.delete_workspace(workspace.id).await.expect(CASE);
+    assert_eq!(
+        (done.step_graphs, done.phases, done.phase_agents),
+        (1, 1, 2),
+        "{CASE}: the delete reports what the reach said"
+    );
+    assert_eq!(
+        store.graph_body(graph.id).await.expect(CASE),
+        None,
+        "{CASE}: the graph went with its workspace"
+    );
+    assert!(
+        store.phases(graph.id).await.expect(CASE).is_empty(),
+        "{CASE}: and its phase"
+    );
+    assert_eq!(
+        store.step_graphs(ids::PROJECT_HTUI).await.expect(CASE),
+        project_graphs,
+        "{CASE}: project graphs untouched"
+    );
+}
+
+/// MOD-137 D9: a new project's five graphs carry [`seed::default_edges`] of their phases, in
+/// §1.3's order: fourteen edges, `bug`'s loop falling back to `fix`.
+async fn project_create_seeds_default_edges<S: WriteStore>(store: &S) {
+    const CASE: &str = "project_create_seeds_default_edges";
+    let project = store
+        .create_project(new_project("edged"))
+        .await
+        .expect(CASE);
+    let graphs = store.step_graphs(project.id).await.expect(CASE);
+    assert_eq!(graphs.len(), 5, "{CASE}: five default graphs");
+    let mut total = 0;
+    for graph in &graphs {
+        let phases = store.phases(graph.id).await.expect(CASE);
+        let stored = store.graph_edges(graph.id).await.expect(CASE);
+        assert_eq!(
+            edge_shape(&stored),
+            edge_shape(&seed::default_edges(&phases, EdgeId::new)),
+            "{CASE}: `{}` carries its default edges, in order",
+            graph.name
+        );
+        assert!(
+            stored.iter().all(|edge| edge.graph_id == graph.id),
+            "{CASE}: `{}`'s edges are its own",
+            graph.name
+        );
+        total += stored.len();
+    }
+    assert_eq!(total, 14, "{CASE}: ten next edges and four review loops");
+
+    let bug = graphs
+        .iter()
+        .find(|graph| graph.name == "bug")
+        .unwrap_or_else(|| panic!("{CASE}: a bug graph"));
+    let fix = phase_named(CASE, store, bug.id, "fix").await;
+    let review = phase_named(CASE, store, bug.id, "review").await;
+    assert!(
+        edge_shape(&store.graph_edges(bug.id).await.expect(CASE)).contains(&(
+            review.id,
+            fix.id,
+            EdgeKind::ChangesRequested,
+            None,
+            Some(fix.retry_limit),
+        )),
+        "{CASE}: bug's review loops back to fix, bounded by fix's retry_limit"
+    );
+}
+
+/// MOD-137 D7, D8 (blueprint F8): a persona held by a divide column or a part is not deleted;
+/// the holder of a library graph is named `library/<graph>/<phase>`. Cleared through
+/// `replace_graph`, the delete goes through.
+async fn a_persona_held_by_divide_columns_or_parts_is_not_deleted<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_persona_held_by_divide_columns_or_parts_is_not_deleted";
+    let planner = store
+        .create_persona(new_persona("planner", "Plans the parts."))
+        .await
+        .expect(CASE);
+    let library = store
+        .create_step_graph(scoped_graph(GraphScope::Library, "held-lib", false))
+        .await
+        .expect(CASE);
+    let mut node = new_phase(library.id, 0, "divide");
+    node.split = Split::Divide;
+    node.planner_persona_id = Some(planner.id);
+    let mut body = body_now(CASE, store, library.id).await;
+    body.nodes = vec![bare_node(node)];
+    let held_lib = applied(
+        CASE,
+        store
+            .replace_graph(library.id, body.graph.revision, body)
+            .await
+            .expect(CASE),
+    );
+    constraint_exactly(
+        CASE,
+        store.delete_persona(planner.id).await,
+        &persona_is_bound(
+            "planner",
+            &[(
+                "library".to_owned(),
+                "held-lib".to_owned(),
+                "divide".to_owned(),
+            )],
+        ),
+        "a library graph's planner persona",
+    );
+
+    let splitter = store
+        .create_persona(new_persona("splitter", "Owns a part."))
+        .await
+        .expect(CASE);
+    let (graph, phases) = scratch_graph(CASE, store, "held-proj", &["split"]).await;
+    let mut body = body_now(CASE, store, graph).await;
+    body.nodes[0].phase.split = Split::Divide;
+    let mut part = part_row(phases[0].id, 0, "core");
+    part.persona_id = Some(splitter.id);
+    body.nodes[0].parts = vec![part];
+    let held_proj = applied(
+        CASE,
+        store
+            .replace_graph(graph, body.graph.revision, body)
+            .await
+            .expect(CASE),
+    );
+    constraint_exactly(
+        CASE,
+        store.delete_persona(splitter.id).await,
+        &persona_is_bound(
+            "splitter",
+            &[(
+                "htui".to_owned(),
+                "held-proj".to_owned(),
+                "split".to_owned(),
+            )],
+        ),
+        "a part's persona",
+    );
+    let names = persona_names(CASE, store).await;
+    assert!(
+        names.contains(&"planner".to_owned()) && names.contains(&"splitter".to_owned()),
+        "{CASE}: both rows survive, got {names:?}"
+    );
+
+    let mut cleared = held_lib;
+    cleared.nodes[0].phase.planner_persona_id = None;
+    applied(
+        CASE,
+        store
+            .replace_graph(library.id, cleared.graph.revision, cleared)
+            .await
+            .expect(CASE),
+    );
+    let mut cleared = held_proj;
+    cleared.nodes[0].parts[0].persona_id = None;
+    applied(
+        CASE,
+        store
+            .replace_graph(graph, cleared.graph.revision, cleared)
+            .await
+            .expect(CASE),
+    );
+    store.delete_persona(planner.id).await.expect(CASE);
+    store.delete_persona(splitter.id).await.expect(CASE);
+    let names = persona_names(CASE, store).await;
+    assert!(
+        !names.contains(&"planner".to_owned()) && !names.contains(&"splitter".to_owned()),
+        "{CASE}: once cleared, both are deleted, got {names:?}"
+    );
+}
+
+/// MOD-137 D7 (blueprint §1.2, F13): every phase column, on a kept node (the replace's `UPDATE`)
+/// and on a new one (the shared insert), and an `if` edge's JSON predicate read back field for
+/// field: the struct-order guard for the Postgres lists.
+async fn replace_graph_round_trips_every_node_field<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_round_trips_every_node_field";
+    let (graph, phases) = scratch_graph(CASE, store, "every-field", &["plan", "split"]).await;
+    let full = |mut row: StepGraphPhase| {
+        row.fan_out = 1;
+        row.gate = Gate::OnFailure;
+        row.gate_hard = true;
+        row.retry_limit = 4;
+        row.input_kinds = vec!["plan".to_owned()];
+        row.output_kind = "parts".to_owned();
+        row.isolation = Some(Isolation::Worktree);
+        row.command_queue = CommandQueue::Always;
+        row.verify_command = Some("cargo test".to_owned());
+        row.template_name = "implement".to_owned();
+        row.template_version = Some(3);
+        row.token_budget = Some(64_000);
+        row.persona_id = Some(ids::PERSONA_ARCHITECT);
+        row.split = Split::Divide;
+        row.palette = false;
+        row.plan_scope = Some(PlanScope::Graph);
+        row.planner_persona_id = Some(ids::PERSONA_REVIEWER);
+        row.planner_agent_id = Some(ids::AGENT_CLAUDE);
+        row.planner_model = Some("opus".to_owned());
+        row.integrate_persona_id = Some(ids::PERSONA_ARCHITECT);
+        row.integrate_agent_id = Some(ids::AGENT_AGY);
+        row.integrate_model = Some("sonnet".to_owned());
+        row.max_parts = Some(2);
+        row
+    };
+    let mut body = body_now(CASE, store, graph).await;
+    body.nodes[1].phase = full(body.nodes[1].phase.clone());
+    let fresh = full(new_phase(graph, 2, "merge"));
+    let fresh_id = fresh.id;
+    body.nodes.push(bare_node(fresh));
+    let mut when = graph_edge(graph, phases[0].id, phases[1].id, EdgeKind::If);
+    when.predicate = Some(EdgePredicate(json!({"verdict": "approve", "min": 2})));
+    body.edges = vec![
+        when,
+        graph_edge(graph, phases[1].id, fresh_id, EdgeKind::Next),
+    ];
+    let answer = applied(
+        CASE,
+        store
+            .replace_graph(graph, body.graph.revision, body.clone())
+            .await
+            .expect(CASE),
+    );
+    for (got, want) in answer.nodes.iter().zip(&body.nodes) {
+        let want = StepGraphPhase {
+            updated_at: got.phase.updated_at,
+            ..want.phase.clone()
+        };
+        assert_eq!(
+            got.phase, want,
+            "{CASE}: `{}` round-trips field for field",
+            want.name
+        );
+    }
+    assert_eq!(
+        answer.edges, body.edges,
+        "{CASE}: the edges and the predicate"
+    );
+    assert_eq!(
+        body_now(CASE, store, graph).await,
+        answer,
+        "{CASE}: graph_body reads the same"
+    );
+}
+
+/// MOD-137 D7 (blueprint §T2.2): `create_phase` keeps `split` in step with `fan_out`, keeps the
+/// divide columns on a `divide` node, and names an unknown planner persona, each in its exact
+/// sentence.
+async fn create_phase_keeps_split_in_step_with_fan_out<S: WriteStore>(store: &S) {
+    const CASE: &str = "create_phase_keeps_split_in_step_with_fan_out";
+    let (graph, _) = scratch_graph(CASE, store, "split-rules", &[]).await;
+    constraint_exactly(
+        CASE,
+        store
+            .create_phase(&StepGraphPhase {
+                fan_out: 2,
+                ..new_phase(graph, 0, "race")
+            })
+            .await,
+        &split_fan_out_mismatch("race", Split::None, 2),
+        "fan_out 2 that is not compete",
+    );
+    let raced = store
+        .create_phase(&StepGraphPhase {
+            fan_out: 2,
+            split: Split::Compete,
+            ..new_phase(graph, 0, "race")
+        })
+        .await
+        .expect(CASE);
+    assert_eq!(
+        raced.split,
+        Split::Compete,
+        "{CASE}: compete with fan_out 2"
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .create_phase(&StepGraphPhase {
+                max_parts: Some(2),
+                ..new_phase(graph, 1, "parts")
+            })
+            .await,
+        &divide_columns_off_divide("parts", Split::None),
+        "max_parts off a divide node",
+    );
+    let ghost = PersonaId::new();
+    constraint_exactly(
+        CASE,
+        store
+            .create_phase(&StepGraphPhase {
+                split: Split::Divide,
+                planner_persona_id: Some(ghost),
+                ..new_phase(graph, 1, "parts")
+            })
+            .await,
+        &references_no_row("step_graph_phase.planner_persona_id", ghost, "persona"),
+        "an unknown planner persona",
+    );
+    assert_eq!(
+        store.phases(graph).await.expect(CASE),
+        vec![raced],
+        "{CASE}: only the valid row was written"
     );
 }
 

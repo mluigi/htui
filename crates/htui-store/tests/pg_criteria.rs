@@ -11057,3 +11057,90 @@ async fn a_graph_owner_refusal_reads_as_mem_store_words_it() {
 
     db.drop_db().await;
 }
+
+/// MOD-137 blueprint F7 (§T3.6): every graph-content writer bumps `revision` as the first
+/// statement of its transaction, so a `replace_graph` that arrives while a phase write holds the
+/// graph row waits on that row lock and, once the phase write commits, answers `Stale` (its
+/// revision moved), never a deadlock (`40P01`) or a write over the other.
+#[tokio::test(flavor = "multi_thread")]
+async fn replace_graph_waits_for_a_concurrent_phase_write() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let review = htui_feature_phase(&db.store, "review").await;
+    let before = db
+        .store
+        .graph_body(ids::GRAPH_HTUI_FEAT)
+        .await
+        .expect("read the feature graph")
+        .expect("the fixture's feature graph");
+    let revision = before.graph.revision;
+
+    let mut racer = PgConnection::connect(&db.url)
+        .await
+        .expect("a second connection");
+    sqlx::raw_sql("BEGIN")
+        .execute(&mut racer)
+        .await
+        .expect("BEGIN on the racing connection");
+    sqlx::query(
+        "UPDATE step_graph g SET revision = g.revision + 1 FROM step_graph_phase p \
+         WHERE p.id = $1 AND g.id = p.graph_id",
+    )
+    .bind(review.id.as_uuid())
+    .execute(&mut racer)
+    .await
+    .expect("the racing bump, graph row first");
+    sqlx::query("UPDATE step_graph_phase SET gate_hard = true WHERE id = $1")
+        .bind(review.id.as_uuid())
+        .execute(&mut racer)
+        .await
+        .expect("the racing phase write");
+
+    let store = db.store.clone();
+    let mut written = before.clone();
+    written.graph.description = "never written".to_owned();
+    let replacing = tokio::spawn(async move {
+        store
+            .replace_graph(ids::GRAPH_HTUI_FEAT, revision, written)
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !replacing.is_finished(),
+        "replace_graph waits on the graph row the phase write holds"
+    );
+    sqlx::raw_sql("COMMIT")
+        .execute(&mut racer)
+        .await
+        .expect("COMMIT on the racing connection");
+    racer.close().await.expect("close the racing connection");
+
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(5), replacing)
+        .await
+        .expect("replace_graph finishes once the phase write commits")
+        .expect("the replace task");
+    match answer {
+        Ok(CasOutcome::Stale(current)) => {
+            assert_eq!(
+                current.graph.revision,
+                revision + 1,
+                "Stale carries the revision the phase write moved"
+            );
+            assert_eq!(
+                current.graph.description, before.graph.description,
+                "the stale replace wrote nothing"
+            );
+            assert!(
+                current
+                    .nodes
+                    .iter()
+                    .any(|node| node.phase.id == review.id && node.phase.gate_hard),
+                "Stale carries the committed phase write"
+            );
+        }
+        other => panic!("a replace behind a phase write is Stale, got {other:?}"),
+    }
+
+    db.drop_db().await;
+}

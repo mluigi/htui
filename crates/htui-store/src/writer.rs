@@ -43,6 +43,7 @@ use htui_core::model::{
     WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
     WorkspaceStop,
 };
+use htui_core::model::{EdgeId, GraphBody, PhasePart, StepGraphEdge};
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, MemStore, ParkOutcome, QueueStored, QueueTarget,
@@ -732,6 +733,60 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.phases(graph).await,
             Self::Online(pg) => pg.phases(graph).await,
+        }
+    }
+
+    async fn replace_graph(
+        &self,
+        graph: StepGraphId,
+        expected_revision: i64,
+        body: GraphBody,
+    ) -> Result<CasOutcome<GraphBody>> {
+        match self {
+            Self::Memory(store) => store.replace_graph(graph, expected_revision, body).await,
+            Self::Online(pg) => pg.replace_graph(graph, expected_revision, body).await,
+        }
+    }
+
+    async fn delete_phase(&self, id: PhaseId) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.delete_phase(id).await,
+            Self::Online(pg) => pg.delete_phase(id).await,
+        }
+    }
+
+    async fn delete_edge(&self, id: EdgeId) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.delete_edge(id).await,
+            Self::Online(pg) => pg.delete_edge(id).await,
+        }
+    }
+
+    async fn delete_phase_agents(&self, phase: PhaseId) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.delete_phase_agents(phase).await,
+            Self::Online(pg) => pg.delete_phase_agents(phase).await,
+        }
+    }
+
+    async fn graph_edges(&self, graph: StepGraphId) -> Result<Vec<StepGraphEdge>> {
+        match self {
+            Self::Memory(store) => store.graph_edges(graph).await,
+            Self::Online(pg) => pg.graph_edges(graph).await,
+        }
+    }
+
+    async fn phase_parts(&self, phase: PhaseId) -> Result<Vec<PhasePart>> {
+        match self {
+            Self::Memory(store) => store.phase_parts(phase).await,
+            Self::Online(pg) => pg.phase_parts(phase).await,
+        }
+    }
+
+    async fn graph_body(&self, graph: StepGraphId) -> Result<Option<GraphBody>> {
+        match self {
+            Self::Memory(store) => store.graph_body(graph).await,
+            Self::Online(pg) => pg.graph_body(graph).await,
         }
     }
 

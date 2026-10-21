@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT a.phase_id AS \"phase_id: PhaseId\",\n               a.position,\n               a.agent_id AS \"agent_id: AgentId\",\n               a.model\n          FROM phase_agent a\n          JOIN step_graph_phase p ON p.id = a.phase_id\n         WHERE p.graph_id = $1\n         ORDER BY p.position, a.position\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "phase_id: PhaseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "phase_agent",
+            "name": "phase_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "position",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "phase_agent",
+            "name": "position"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "agent_id: AgentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "phase_agent",
+            "name": "agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "phase_agent",
+            "name": "model"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "cbe3b601de338988ed48be27890c70bdcbbff7e4dd0e65124f504d618bd31713"
+}

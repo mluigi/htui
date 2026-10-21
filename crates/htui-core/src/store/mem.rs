@@ -51,13 +51,16 @@ use crate::model::{
     WorkspaceSummary, canonical_declared_tags, missing_tags_failure, moved_order, overlaps,
     prompt_summary, scope_of,
 };
-use crate::model::{EdgeId, GraphScope, PhasePart, StepGraphEdge};
+use crate::model::{EdgeId, GraphBody, GraphScope, NodeBody, PhasePart, StepGraphEdge};
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
 use crate::prompt::template::TemplateRole;
 use crate::seed;
 use crate::store::error::{Result, StoreError};
-use crate::store::graph_rules::phase_row_refusal;
+use crate::store::graph_rules::{
+    body_agent_refs, body_persona_refs, graph_body_shape_refusal, graph_body_topology_refusal,
+    phase_row_refusal,
+};
 use crate::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
     BindingFacts, COMMAND_STALE_AFTER, CasOutcome, DeleteReach, DeleteTarget,
@@ -3825,6 +3828,221 @@ impl State {
             .collect();
         rows.sort_by_key(|row| row.position);
         rows
+    }
+
+    /// A phase's `phase_part` rows in `position` order, the map's own order (MOD-137 D8).
+    fn phase_parts_of(&self, phase: PhaseId) -> Vec<PhasePart> {
+        self.phase_parts
+            .range((phase, i32::MIN)..=(phase, i32::MAX))
+            .map(|(_, row)| row.clone())
+            .collect()
+    }
+
+    /// A graph's edges by (from position, to position, kind bytes), blueprint §1.3.
+    fn graph_edge_rows(&self, graph: StepGraphId) -> Vec<StepGraphEdge> {
+        let position = |phase: PhaseId| self.phase(phase).map_or(i32::MAX, |row| row.position);
+        let mut rows: Vec<StepGraphEdge> = self
+            .edges
+            .values()
+            .filter(|edge| edge.graph_id == graph)
+            .cloned()
+            .collect();
+        rows.sort_by_cached_key(|edge| {
+            (
+                position(edge.from),
+                position(edge.to),
+                edge.kind.as_str().as_bytes(),
+            )
+        });
+        rows
+    }
+
+    /// MOD-137 D10 (blueprint F10): the whole body `replace_graph` writes, as stored; `None` for
+    /// an unknown graph.
+    fn graph_body(&self, graph: StepGraphId) -> Option<GraphBody> {
+        let row = self.graphs.get(&graph)?.clone();
+        let nodes = self
+            .phase_rows(graph)
+            .into_iter()
+            .map(|phase| NodeBody {
+                agents: self.phase_agents_of(phase.id),
+                parts: self.phase_parts_of(phase.id),
+                phase,
+            })
+            .collect();
+        Some(GraphBody {
+            graph: row,
+            nodes,
+            edges: self.graph_edge_rows(graph),
+        })
+    }
+
+    /// MOD-137 D10 (blueprint §T3.3): decide every refusal on the body and the state, in the
+    /// trait's order, then mutate; `write()` has no rollback, so nothing below the last refusal
+    /// can fail.
+    fn replace_graph(
+        &mut self,
+        graph: StepGraphId,
+        expected_revision: i64,
+        body: GraphBody,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<GraphBody>> {
+        let current = self
+            .graphs
+            .get(&graph)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "step_graph",
+                id: graph.to_string(),
+            })?;
+        if current.revision != expected_revision {
+            return Ok(CasOutcome::Stale(
+                self.graph_body(graph)
+                    .expect("the graph was read a statement ago under the same lock"),
+            ));
+        }
+        if let Some(refusal) = graph_body_shape_refusal(graph, &body) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        if self
+            .graphs
+            .values()
+            .any(|row| row.id != graph && row.scope == current.scope && row.name == body.graph.name)
+        {
+            return Err(StoreError::Constraint(graph_name_is_taken(
+                &body.graph.name,
+                current.scope,
+            )));
+        }
+        if let Some(node) = body.nodes.iter().find(|node| {
+            self.phase(node.phase.id)
+                .is_some_and(|row| row.graph_id != graph)
+        }) {
+            return Err(StoreError::Constraint(already_exists(
+                "step_graph_phase",
+                node.phase.id,
+            )));
+        }
+        if let Some(edge) = body.edges.iter().find(|edge| {
+            self.edges
+                .get(&edge.id)
+                .is_some_and(|row| row.graph_id != graph)
+        }) {
+            return Err(StoreError::Constraint(already_exists(
+                "step_graph_edge",
+                edge.id,
+            )));
+        }
+        if let Some((column, persona)) = body_persona_refs(&body)
+            .into_iter()
+            .find(|(_, persona)| !self.personas.contains_key(persona))
+        {
+            return Err(StoreError::Constraint(references_no_row(
+                column, persona, "persona",
+            )));
+        }
+        if let Some((column, agent)) = body_agent_refs(&body)
+            .into_iter()
+            .find(|(_, agent)| !self.agents.contains_key(agent))
+        {
+            return Err(StoreError::Constraint(references_no_row(
+                column, agent, "agent",
+            )));
+        }
+        if let Some(refusal) = graph_body_topology_refusal(graph, &body) {
+            return Err(StoreError::Constraint(refusal));
+        }
+
+        // Mutate: nothing below can fail.
+        let kept: HashSet<PhaseId> = body.nodes.iter().map(|node| node.phase.id).collect();
+        let stored: HashSet<PhaseId> = self
+            .phases
+            .iter()
+            .filter(|row| row.graph_id == graph)
+            .map(|row| row.id)
+            .collect();
+        let removed: HashSet<PhaseId> = stored.difference(&kept).copied().collect();
+        self.phase_agents
+            .retain(|(phase, _), _| !stored.contains(phase));
+        self.phase_parts
+            .retain(|(phase, _), _| !stored.contains(phase));
+        self.edges.retain(|_, edge| edge.graph_id != graph);
+        self.skill_bindings
+            .retain(|row| row.phase_id.is_none_or(|phase| !removed.contains(&phase)));
+        self.phases.retain(|row| !removed.contains(&row.id));
+        for node in body.nodes {
+            let mut row = node.phase;
+            row.updated_at = now;
+            match self.phase_mut(row.id) {
+                Some(slot) => *slot = row,
+                None => self.phases.push(row),
+            }
+            self.phase_agents.extend(
+                node.agents
+                    .into_iter()
+                    .map(|agent| ((agent.phase_id, agent.position), agent)),
+            );
+            self.phase_parts.extend(
+                node.parts
+                    .into_iter()
+                    .map(|part| ((part.phase_id, part.position), part)),
+            );
+        }
+        self.edges
+            .extend(body.edges.into_iter().map(|edge| (edge.id, edge)));
+        let row = self
+            .graphs
+            .get_mut(&graph)
+            .expect("the graph was read a statement ago under the same lock");
+        row.name = body.graph.name;
+        row.description = body.graph.description;
+        self.bump_graph(graph, now);
+        Ok(CasOutcome::Applied(
+            self.graph_body(graph).expect("written under the same lock"),
+        ))
+    }
+
+    /// MOD-137 D11: a phase with its candidates, parts, edges in and out and phase bindings.
+    fn delete_phase(&mut self, id: PhaseId, now: DateTime<Utc>) -> Result<()> {
+        let graph = self
+            .phase(id)
+            .map(|row| row.graph_id)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "step_graph_phase",
+                id: id.to_string(),
+            })?;
+        self.phases.retain(|row| row.id != id);
+        self.phase_agents.retain(|(phase, _), _| *phase != id);
+        self.phase_parts.retain(|(phase, _), _| *phase != id);
+        self.edges
+            .retain(|_, edge| edge.from != id && edge.to != id);
+        self.skill_bindings.retain(|row| row.phase_id != Some(id));
+        self.bump_graph(graph, now);
+        Ok(())
+    }
+
+    /// MOD-137 D11: one edge.
+    fn delete_edge(&mut self, id: EdgeId, now: DateTime<Utc>) -> Result<()> {
+        let edge = self.edges.remove(&id).ok_or_else(|| StoreError::NotFound {
+            entity: "step_graph_edge",
+            id: id.to_string(),
+        })?;
+        self.bump_graph(edge.graph_id, now);
+        Ok(())
+    }
+
+    /// MOD-137 D11: every candidate of `phase`; bumps also when there were none.
+    fn delete_phase_agents(&mut self, phase: PhaseId, now: DateTime<Utc>) -> Result<()> {
+        let graph =
+            self.phase(phase)
+                .map(|row| row.graph_id)
+                .ok_or_else(|| StoreError::NotFound {
+                    entity: "step_graph_phase",
+                    id: phase.to_string(),
+                })?;
+        self.phase_agents.retain(|(row, _), _| *row != phase);
+        self.bump_graph(graph, now);
+        Ok(())
     }
 
     /// MOD-9 D1/D4/D18: the head of `(project, name)` is the token; token, then input, then keys.
@@ -8836,6 +9054,43 @@ impl WriteStore for MemStore {
 
     async fn phases(&self, graph: StepGraphId) -> Result<Vec<StepGraphPhase>> {
         Ok(self.read(|state| state.phase_rows(graph)))
+    }
+
+    async fn replace_graph(
+        &self,
+        graph: StepGraphId,
+        expected_revision: i64,
+        body: GraphBody,
+    ) -> Result<CasOutcome<GraphBody>> {
+        let now = self.now();
+        self.write(|state| state.replace_graph(graph, expected_revision, body, now))
+    }
+
+    async fn delete_phase(&self, id: PhaseId) -> Result<()> {
+        let now = self.now();
+        self.write(|state| state.delete_phase(id, now))
+    }
+
+    async fn delete_edge(&self, id: EdgeId) -> Result<()> {
+        let now = self.now();
+        self.write(|state| state.delete_edge(id, now))
+    }
+
+    async fn delete_phase_agents(&self, phase: PhaseId) -> Result<()> {
+        let now = self.now();
+        self.write(|state| state.delete_phase_agents(phase, now))
+    }
+
+    async fn graph_edges(&self, graph: StepGraphId) -> Result<Vec<StepGraphEdge>> {
+        Ok(self.read(|state| state.graph_edge_rows(graph)))
+    }
+
+    async fn phase_parts(&self, phase: PhaseId) -> Result<Vec<PhasePart>> {
+        Ok(self.read(|state| state.phase_parts_of(phase)))
+    }
+
+    async fn graph_body(&self, graph: StepGraphId) -> Result<Option<GraphBody>> {
+        Ok(self.read(|state| state.graph_body(graph)))
     }
 
     async fn append_prompt_template(

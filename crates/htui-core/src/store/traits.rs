@@ -71,7 +71,7 @@ use crate::model::{
     StopMode, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace,
     WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop,
 };
-use crate::model::{EdgeId, EdgeKind, GraphScope, Split};
+use crate::model::{EdgeId, EdgeKind, GraphBody, GraphScope, PhasePart, Split, StepGraphEdge};
 use crate::prompt::settings::{Rungs, SettingKey};
 use crate::prompt::template::{TemplateRole, parse};
 use crate::store::error::Result;
@@ -965,6 +965,91 @@ pub trait WriteStore: ReadStore {
     /// # Errors
     /// The backend's own failures only.
     async fn phases(&self, graph: StepGraphId) -> Result<Vec<StepGraphPhase>>;
+
+    // MOD-137: graph v2 writers and reads (plan D10, D11)
+
+    /// Replaces a graph's editable content in one write (MOD-137 D10). From `body.graph` only
+    /// `name` and `description` are written; its `id` must be `graph`, and `scope`,
+    /// `is_override`, `revision` and the timestamps are ignored. Nodes are diffed **by phase
+    /// id**: a kept id is updated in place and keeps its `skill_binding` rows; a new id is
+    /// inserted; a stored id missing from `body` is deleted with its candidates, parts, edges and
+    /// phase bindings. Every node's candidates and parts, and the graph's edges, are replaced
+    /// wholesale. `revision` + 1.
+    ///
+    /// Answers `Applied` with the body as stored (nodes, candidates and parts by `position`,
+    /// edges by from position, to position and kind bytes; every `updated_at` the store's clock).
+    /// The phase columns [`StepGraphPhase`] does not carry (`judge_agent_id`, `judge_model`,
+    /// `deadline_seconds`, blueprint F14) keep their values on a kept node and are `NULL` on a
+    /// new one. Store-level checks only: acyclicity, back-edge kinds and reachability are
+    /// MOD-138's shared validator, which this writer will call once it exists.
+    ///
+    /// # Errors
+    /// In this order, and nothing is written on any of them:
+    /// 1. [`StoreError::NotFound`](crate::store::StoreError::NotFound) `"step_graph"` for an
+    ///    unknown `graph`;
+    /// 2. `Ok(CasOutcome::Stale(current body))` when `expected_revision` is not the stored one;
+    /// 3. [`StoreError::Constraint`](crate::store::StoreError::Constraint) with
+    ///    [`graph_body_shape_refusal`](crate::store::graph_body_shape_refusal)'s sentence (ids of
+    ///    the body against `graph` and their own node, reserved names, duplicate ids, position and
+    ///    name clashes, candidate and part position/key clashes, duplicate edge ids);
+    /// 4. `Constraint` [`graph_name_is_taken`] when the new name is taken in the graph's scope;
+    /// 5. `Constraint` [`already_exists`] for a phase or edge id held by another graph;
+    /// 6. `Constraint` [`references_no_row`] for the first persona, then the first agent, that
+    ///    names no row, in [`body_persona_refs`](crate::store::body_persona_refs) /
+    ///    [`body_agent_refs`](crate::store::body_agent_refs) order;
+    /// 7. `Constraint` with
+    ///    [`graph_body_topology_refusal`](crate::store::graph_body_topology_refusal)'s sentence
+    ///    (edge endpoints, edge CHECKs, duplicate edges, node CHECKs, palette edges, parts on a
+    ///    non-divide node).
+    async fn replace_graph(
+        &self,
+        graph: StepGraphId,
+        expected_revision: i64,
+        body: GraphBody,
+    ) -> Result<CasOutcome<GraphBody>>;
+
+    /// Deletes a phase with its candidates, parts, edges and phase bindings (MOD-137 D11); the
+    /// graph's last phase may go. `revision` + 1.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `"step_graph_phase"` for an
+    /// unknown id.
+    async fn delete_phase(&self, id: PhaseId) -> Result<()>;
+
+    /// Deletes one edge (MOD-137 D11). `revision` + 1.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `"step_graph_edge"` for an
+    /// unknown id.
+    async fn delete_edge(&self, id: EdgeId) -> Result<()>;
+
+    /// Deletes every candidate of `phase` (MOD-137 D11); the editor re-adds through
+    /// [`create_phase_agents`](Self::create_phase_agents). `revision` + 1, also when the phase had
+    /// none.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `"step_graph_phase"` for an
+    /// unknown phase.
+    async fn delete_phase_agents(&self, phase: PhaseId) -> Result<()>;
+
+    /// A graph's edges by (from position, to position, kind bytes); empty for an unknown graph.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn graph_edges(&self, graph: StepGraphId) -> Result<Vec<StepGraphEdge>>;
+
+    /// A phase's parts by `position`; empty for an unknown phase.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn phase_parts(&self, phase: PhaseId) -> Result<Vec<PhasePart>>;
+
+    /// The whole body [`replace_graph`](Self::replace_graph) writes, as stored (blueprint F10);
+    /// `None` for an unknown graph. Any scope: the one reader of a workspace or library graph.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn graph_body(&self, graph: StepGraphId) -> Result<Option<GraphBody>>;
 
     // prompt_template (MOD-9 milestone 1, plan D1-D4)
 

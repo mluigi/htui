@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE step_graph g SET revision = g.revision + 1\n              FROM step_graph_edge e\n             WHERE e.id = $1 AND g.id = e.graph_id\n            RETURNING g.id AS \"id: StepGraphId\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: StepGraphId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a88c5b6c4dc4616db9ebb7aac759225fecac1b4e657a53e52c3731f66c320aec"
+}

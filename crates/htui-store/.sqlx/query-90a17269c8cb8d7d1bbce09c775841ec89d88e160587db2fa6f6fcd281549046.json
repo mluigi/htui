@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: AgentId\" FROM agent WHERE id = ANY($1) FOR KEY SHARE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: AgentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "90a17269c8cb8d7d1bbce09c775841ec89d88e160587db2fa6f6fcd281549046"
+}

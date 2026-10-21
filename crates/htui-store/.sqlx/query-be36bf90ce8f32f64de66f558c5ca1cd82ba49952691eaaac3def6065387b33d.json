@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT EXISTS (SELECT 1 FROM step_graph\n                            WHERE id <> $1 AND name = $2\n                              AND project_id IS NOT DISTINCT FROM $3\n                              AND workspace_id IS NOT DISTINCT FROM $4) AS \"taken!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "taken!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "be36bf90ce8f32f64de66f558c5ca1cd82ba49952691eaaac3def6065387b33d"
+}

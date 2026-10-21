@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM phase_agent WHERE phase_id = ANY($1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cadc94304ad9bfd28cb352818c89b7e08fec6ae2fdec5cf40c68c52992ab3654"
+}
