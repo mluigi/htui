@@ -67,6 +67,7 @@ pub struct Field<'a> {
     help: Option<Cow<'a, str>>,
     error: Option<Cow<'a, str>>,
     style: Option<Style>,
+    stacked: bool,
 }
 
 impl<'a> Field<'a> {
@@ -79,6 +80,7 @@ impl<'a> Field<'a> {
             help: None,
             error: None,
             style: None,
+            stacked: false,
         }
     }
 
@@ -93,6 +95,17 @@ impl<'a> Field<'a> {
     #[must_use]
     pub fn error(mut self, text: impl Into<Cow<'a, str>>) -> Self {
         self.error = Some(text.into());
+        self
+    }
+
+    /// The label on a row of its own and the value under it, across the form's
+    /// [`content_width`](Form::content_width) rather than the value column: a `TextArea`'s
+    /// [`Value::Lines`] that would be squeezed beside the labels (RV1, for RV3 M2). The help and
+    /// the error go under the value, indented as it is; the label does not widen the shared
+    /// label column.
+    #[must_use]
+    pub fn stacked(mut self) -> Self {
+        self.stacked = true;
         self
     }
 
@@ -181,7 +194,8 @@ impl<'a> Form<'a> {
                 .items
                 .iter()
                 .filter_map(|item| match item {
-                    Item::Field(field) => Some(cells::cell_width(field.label)),
+                    Item::Field(field) if !field.stacked => Some(cells::cell_width(field.label)),
+                    Item::Field(_) => None,
                     Item::Heading(_) | Item::Blank => None,
                 })
                 .max()
@@ -198,6 +212,13 @@ impl<'a> Form<'a> {
     #[must_use]
     pub fn value_width(&self, width: u16) -> u16 {
         width.saturating_sub(1 + self.label_column(width) + GAP)
+    }
+
+    /// The cells after the gutter in a form `width` wide: what a [`stacked`](Field::stacked)
+    /// field's value rows get.
+    #[must_use]
+    pub const fn content_width(&self, width: u16) -> u16 {
+        width.saturating_sub(1)
     }
 
     /// The form as lines `width` cells wide, one block of rows per item.
@@ -305,6 +326,7 @@ impl<'a> Form<'a> {
                 let rows = Rows {
                     label: geometry.label,
                     value: geometry.value,
+                    content,
                     focused,
                     editing: focused && self.editing,
                 };
@@ -376,9 +398,11 @@ fn own_spans(line: Line<'static>) -> Vec<Span<'static>> {
 }
 
 /// The geometry and focus state one field's rows are laid out with.
+#[derive(Clone, Copy)]
 struct Rows {
     label: u16,
     value: u16,
+    content: u16,
     focused: bool,
     editing: bool,
 }
@@ -387,6 +411,9 @@ impl Rows {
     /// `field`'s rows: its value rows (the first one labelled), then its help while focused,
     /// then its error.
     fn field(&self, field: &Field<'_>, gutter: Span<'static>, theme: &Theme) -> Vec<Line<'static>> {
+        if field.stacked {
+            return self.stacked(field, gutter, theme);
+        }
         let label = usize::from(self.label);
         let gap = Span::raw(" ".repeat(usize::from(GAP)));
         let mut lines: Vec<Line<'static>> = self
@@ -430,22 +457,86 @@ impl Rows {
                 line
             })
             .collect();
+        self.notes(
+            field,
+            1 + label + usize::from(GAP),
+            self.value,
+            theme,
+            &mut lines,
+        );
+        lines
+    }
+
+    /// A [`stacked`](Field::stacked) `field`'s rows: its label, then its value rows across the
+    /// content width, then its help while focused and its error, indented as the value is.
+    /// Browsing, every row is banded whole; editing, only the label is.
+    fn stacked(
+        &self,
+        field: &Field<'_>,
+        gutter: Span<'static>,
+        theme: &Theme,
+    ) -> Vec<Line<'static>> {
+        let content = self.content;
+        let name = cells::clip(field.label, usize::from(content));
+        let named = u16::try_from(cells::cell_width(&name)).unwrap_or(content);
+        let name = Line::from(Span::styled(name, theme.base));
+        let name = match (self.focused, self.editing) {
+            (true, false) => selection_band(name, content, theme),
+            (true, true) => selection_band(name, named, theme),
+            (false, _) => name,
+        };
+        let below = Self {
+            value: content,
+            ..*self
+        };
+        let values = below.values(&field.value, theme).into_iter().map(|value| {
+            let value = Line::from(own_spans(value));
+            if self.focused && !self.editing {
+                selection_band(value, content, theme)
+            } else {
+                value
+            }
+        });
+        let mut lines: Vec<Line<'static>> = std::iter::once(name)
+            .chain(values)
+            .map(|line| {
+                let mut spans = vec![gutter.clone()];
+                spans.extend(own_spans(line));
+                let line = Line::from(spans);
+                match field.style {
+                    Some(style) => line.patch_style(style),
+                    None => line,
+                }
+            })
+            .collect();
+        self.notes(field, 1, content, theme, &mut lines);
+        lines
+    }
+
+    /// `field`'s help (while focused) then its error, wrapped to `width` and `indent` cells in.
+    fn notes(
+        &self,
+        field: &Field<'_>,
+        indent: usize,
+        width: u16,
+        theme: &Theme,
+        lines: &mut Vec<Line<'static>>,
+    ) {
         let notes = self
             .focused
             .then_some(field.help.as_deref().map(|help| (help, theme.dim)))
             .flatten()
             .into_iter()
             .chain(field.error.as_deref().map(|error| (error, theme.error)));
-        let indent = " ".repeat(1 + label + usize::from(GAP));
+        let indent = " ".repeat(indent);
         for (text, style) in notes {
-            for row in wrapped(text, usize::from(self.value)) {
+            for row in wrapped(text, usize::from(width)) {
                 lines.push(Line::from(vec![
                     Span::raw(indent.clone()),
                     Span::styled(row, style),
                 ]));
             }
         }
-        lines
     }
 
     /// `value`'s rows, each at most the value column wide; at least one.
@@ -919,6 +1010,54 @@ mod tests {
             .expect("draw");
         let drawn = terminal.backend().buffer().clone();
         assert_eq!(drawn, draw(&form, 20, 3, 3, &theme));
+    }
+
+    /// RV1, for Requirements' text areas (RV3 M2): a stacked field has its label on a row of
+    /// its own and its value under it across the content width, so a `TextArea` is not
+    /// squeezed into the value column. Its label does not widen the shared column.
+    #[test]
+    fn a_stacked_field_puts_its_value_under_its_label_across_the_content_width() {
+        let theme = Theme::default();
+        let wide = "y".repeat(19);
+        let form = Form::new()
+            .field(
+                Field::new(
+                    "a long body label",
+                    Value::Lines(vec![Line::from(wide.clone()), Line::from("two")]),
+                )
+                .stacked()
+                .help("help under it"),
+            )
+            .field(Field::new("p", Value::Toggle(true)));
+        assert_eq!(form.label_column(60), 2, "the stacked label is not counted");
+        assert_eq!(form.content_width(20), 19);
+        assert_eq!(
+            texts(&form.lines(20, accent(), &theme)),
+            [
+                " a long body label".to_owned(),
+                format!(" {wide}"),
+                " two".to_owned(),
+                " p   ● on".to_owned(),
+            ]
+        );
+        // Focused while browsing: every row carries the marker and the band; the help is
+        // indented to the content, under the value.
+        let focused = form.clone().focus(0).lines(20, accent(), &theme);
+        for line in &focused[..3] {
+            assert_eq!(line.spans[0].content, GUTTER, "{line:?}");
+            assert_eq!(line.width(), 20, "{line:?}");
+        }
+        assert_eq!(texts(&focused)[3], " help under it");
+        assert_eq!(form.clone().focus(0).focus_lines(20), Some(0..4));
+        assert_eq!(form.clone().focus(1).focus_lines(20), Some(3..4));
+        // Editing: only the label is banded, the value rows are not.
+        let mono = Theme::monochrome();
+        let buffer = draw(&form.clone().focus(0).editing(true), 20, 3, 0, &mono);
+        let reversed = |x: u16, y: u16| buffer[(x, y)].modifier.contains(Modifier::REVERSED);
+        assert!((1..=17).all(|x| reversed(x, 0)), "the label is banded");
+        assert!(!(18..20).any(|x| reversed(x, 0)), "only the label");
+        assert!(!(1..20).any(|x| reversed(x, 1)), "the value row is not");
+        assert_eq!(row(&buffer, 0), "▌a long body label");
     }
 
     #[test]
