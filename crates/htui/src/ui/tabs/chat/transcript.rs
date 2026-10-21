@@ -731,9 +731,42 @@ impl Transcript {
                 lines
             }
             TranscriptRow::Other { update } => {
-                vec![Line::styled(format!("· {update}"), theme.dim)]
+                vec![Line::styled(
+                    format!("· {}", other_label(update)),
+                    theme.dim,
+                )]
             }
         }
+    }
+}
+
+/// An uninterpreted update named in words (MOD-115 M3 MOD-83): the names the agents are known to
+/// send read as a phrase, and any other wire name is spelled out with its `_`, `/` and `<>`
+/// punctuation turned into spaces, so the datum stays on screen without a snake_case value.
+fn other_label(update: &str) -> String {
+    let known = match update {
+        "available_commands_update" => Some("agent commands updated"),
+        "config_option_update" => Some("agent settings updated"),
+        "current_mode_update" => Some("agent mode changed"),
+        "session_info_update" => Some("session info updated"),
+        htui_agent::acp::MODEL_UNAVAILABLE => Some("model unavailable"),
+        "unhandled_request" => Some("unhandled agent request"),
+        "unknown_session_message" => Some("unrecognised agent message"),
+        htui_agent::cli::UNPARSED => Some("unparsed agent output"),
+        _ => None,
+    };
+    if let Some(known) = known {
+        return known.to_owned();
+    }
+    let words = update
+        .split(['_', '/', '<', '>'])
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if words.is_empty() {
+        "agent update".to_owned()
+    } else {
+        words
     }
 }
 
@@ -1266,6 +1299,44 @@ mod tests {
             shown(&parked(vec![option("allow"), option("reject")])),
             ["permission  waiting on you (2 options)"]
         );
+    }
+
+    /// MOD-115 M3 MOD-83: a row the tab does not interpret is named in words, never by the
+    /// transport's own wire name (`available_commands_update`, `<unparsed>`, `system/init`).
+    #[test]
+    fn an_uninterpreted_update_is_named_in_words() {
+        let other = |update: &str| TranscriptRow::Other {
+            update: update.to_owned(),
+        };
+        assert_eq!(
+            shown(&other("available_commands_update")),
+            ["\u{b7} agent commands updated"]
+        );
+        assert_eq!(
+            shown(&other(htui_agent::cli::UNPARSED)),
+            ["\u{b7} unparsed agent output"]
+        );
+        assert_eq!(shown(&other("system/init")), ["\u{b7} system init"]);
+        for update in [
+            "available_commands_update",
+            "config_option_update",
+            "current_mode_update",
+            "session_info_update",
+            htui_agent::acp::MODEL_UNAVAILABLE,
+            "unhandled_request",
+            "unknown_session_message",
+            htui_agent::cli::UNPARSED,
+            "system/init",
+            "_vendor.dev/some_ext",
+            "",
+        ] {
+            let text = shown(&other(update)).concat();
+            assert!(
+                !text.contains(['_', '/', '<', '>']),
+                "{update:?} rendered as {text:?}"
+            );
+            assert!(text.len() > "\u{b7} ".len(), "{update:?} rendered empty");
+        }
     }
 
     /// MOD-115 M3 MOD-83: an edit proposal's state is a glyph and a word, never `[accepted]`.
