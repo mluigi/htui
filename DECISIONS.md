@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-137](docs/decisions/mod/mod-137.md)** - Step graph v2 storage: edges, owner scope, revision, atomic edits (done, 2026-10-21)
 - **[ANA-38](docs/decisions/ana/ana-38.md)** - Project and workspace memory (concluded, 2026-10-20)
 - **[ANA-37](docs/decisions/ana/ana-37.md)** - Is Qdrant worth requiring (concluded, 2026-10-19)
 - **[ANA-35](docs/decisions/ana/ana-35.md)** - Entity model for any kind of project (concluded, 2026-10-18)

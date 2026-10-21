@@ -5,7 +5,7 @@ override** (the router said PRD at exactly the 2-criteria threshold; ANA-33 §7.
 **Requirements**: `R-ORCH-1`, `R-ORCH-3`, `R-TUI-8` (storage half). **Answers**: ANA-40 P7.
 **Complexity**: Large (a migration, a model change on two core rows, five `WriteStore` implementors, seeds,
 two catalogue verbs, the re-override). Every task leaves `cargo check --workspace --all-targets --all-features` green.
-**Status**: confirmed 2026-10-20 (maintainer CONFIRM); blueprint next.
+**Status**: complete 2026-10-21 (T1-T6, review round R1 in two lanes, stack headroom fix; rust-reviewer x3: approve with fixes, all applied). Write-up: `docs/decisions/mod/mod-137.md`.
 
 ## Summary
 
@@ -271,14 +271,14 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 
 ## Acceptance
 
-- [ ] T1–T6 complete; every task left `cargo check --workspace --all-targets --all-features` green
-- [ ] A migrated database holds the backfilled edges and `split`, equal to `seed::default_edges`
-- [ ] `replace_graph` + deleters + reads on all five implementors, conformance-pinned on Mem and Pg
-- [ ] New projects and the demo load seed edges
-- [ ] `ReplaceGraph` / `DeletePhase` served by `catalogue::serve`
-- [ ] Re-override works; the owed note at `graph.rs:458-461` is gone
-- [ ] Engine behaviour unchanged (full workspace gate green, no snapshot churn)
-- [ ] Validation block passes; validator green
+- [x] T1–T6 complete; every task left `cargo check --workspace --all-targets --all-features` green
+- [x] A migrated database holds the backfilled edges and `split`, equal to `seed::default_edges`
+- [x] `replace_graph` + deleters + reads on all five implementors, conformance-pinned on Mem and Pg
+- [x] New projects and the demo load seed edges
+- [x] `ReplaceGraph` / `DeletePhase` served by `catalogue::serve`
+- [x] Re-override works; the owed note at `graph.rs:458-461` is gone
+- [x] Engine behaviour unchanged (full workspace gate green, no snapshot churn)
+- [x] Validation block passes; validator green
 
 ## Amendments from the blueprint (2026-10-21)
 
