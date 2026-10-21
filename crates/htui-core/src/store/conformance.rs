@@ -22149,9 +22149,38 @@ async fn memory_supersede_replaces_in_one_step<S: WriteStore>(store: &S) {
     );
 }
 
+/// After a refused supersede of `old` (`what` names it): `old`'s revisions are still
+/// `old_history` and the project's active entries are still `active`, in order.
+async fn memory_supersede_wrote_nothing<S: ReadStore>(
+    case: &str,
+    store: &S,
+    what: &str,
+    old: MemoryEntryId,
+    old_history: &[MemoryRevision],
+    active: &[MemoryEntry],
+) {
+    assert_eq!(
+        memory_history(case, store, old).await,
+        old_history,
+        "{case}: {what} left the old entry's history"
+    );
+    assert_eq!(
+        memory_list(
+            case,
+            store,
+            ids::PROJECT_HTUI,
+            Some(vec![MemoryState::Active])
+        )
+        .await,
+        active,
+        "{case}: {what} left the active list"
+    );
+}
+
 /// Plan D6: a supersede is refused whole. A stale token answers `Diverged` and writes nothing,
-/// the new entry included; a closed old entry and a new subject that a third live entry holds
-/// are `Constraint`; an unknown old entry is `NotFound`.
+/// the new entry included; a closed old entry, a new subject that a third live entry holds, a
+/// new id that is the old entry's own or a third entry's, and a `created_by` or `box_id` that
+/// names no row are `Constraint`; an unknown old entry is `NotFound`.
 async fn memory_supersede_refuses_stale_closed_and_clashing<S: WriteStore>(store: &S) {
     const CASE: &str = "memory_supersede_refuses_stale_closed_and_clashing";
 
@@ -22263,8 +22292,112 @@ async fn memory_supersede_refuses_stale_closed_and_clashing<S: WriteStore>(store
             Some(vec![MemoryState::Active])
         )
         .await,
-        vec![c, a.clone()],
+        vec![c.clone(), a.clone()],
         "{CASE}: the old entry is still live, as it was"
+    );
+    let active = vec![c.clone(), a.clone()];
+    let c_history = memory_history(CASE, store, c.id).await;
+
+    let own_id = NewMemoryEntry {
+        id: a.id,
+        ..memory_new(
+            CASE,
+            MemoryKind::Fact,
+            "Lint rules",
+            "Same id as the old entry.",
+        )
+    };
+    assert_eq!(
+        store.supersede_memory_entry(a.id, 2, own_id).await,
+        Err(StoreError::Constraint(already_exists("memory_entry", a.id))),
+        "{CASE}: a new entry under the old entry's own id is a duplicate id"
+    );
+    memory_supersede_wrote_nothing(
+        CASE,
+        store,
+        "the own-id supersede",
+        a.id,
+        &a_history,
+        &active,
+    )
+    .await;
+
+    let third_id = NewMemoryEntry {
+        id: c.id,
+        ..memory_new(CASE, MemoryKind::Fact, "Lint rules", "A third entry's id.")
+    };
+    assert_eq!(
+        store.supersede_memory_entry(a.id, 2, third_id).await,
+        Err(StoreError::Constraint(already_exists("memory_entry", c.id))),
+        "{CASE}: a new entry under a third entry's id is a duplicate id"
+    );
+    memory_supersede_wrote_nothing(
+        CASE,
+        store,
+        "the third-id supersede",
+        a.id,
+        &a_history,
+        &active,
+    )
+    .await;
+    assert_eq!(
+        memory_history(CASE, store, c.id).await,
+        c_history,
+        "{CASE}: the third-id supersede left the third entry's history"
+    );
+
+    let stranger = NewMemoryEntry {
+        created_by: UserId::new(),
+        ..memory_new(CASE, MemoryKind::Fact, "Lint rules", "Nobody wrote this.")
+    };
+    let stranger_id = stranger.id;
+    assert!(
+        matches!(
+            store.supersede_memory_entry(a.id, 2, stranger).await,
+            Err(StoreError::Constraint(_))
+        ),
+        "{CASE}: a supersede by a created_by that names no user is a Constraint"
+    );
+    memory_supersede_wrote_nothing(
+        CASE,
+        store,
+        "the stranger's supersede",
+        a.id,
+        &a_history,
+        &active,
+    )
+    .await;
+    assert_eq!(
+        memory_history(CASE, store, stranger_id).await,
+        Vec::new(),
+        "{CASE}: the stranger's supersede wrote no new entry"
+    );
+
+    let boxless = NewMemoryEntry {
+        box_id: Some(BoxId::new()),
+        ..memory_new(CASE, MemoryKind::Fact, "Lint rules", "No such box.")
+    };
+    let boxless_id = boxless.id;
+    assert!(
+        matches!(
+            store.supersede_memory_entry(a.id, 2, boxless).await,
+            Err(StoreError::Constraint(_))
+        ),
+        "{CASE}: a supersede on a box_id that names no box is a Constraint"
+    );
+    memory_supersede_wrote_nothing(
+        CASE,
+        store,
+        "the boxless supersede",
+        a.id,
+        &a_history,
+        &active,
+    )
+    .await;
+    assert_eq!(
+        memory_history(CASE, store, boxless_id).await,
+        Vec::new(),
+        "{CASE}: the boxless supersede wrote no new entry"
     );
 
     let replacement = memory_new(CASE, MemoryKind::Fact, "Lint gate", "Clippy, twice.");
@@ -22306,7 +22439,7 @@ async fn memory_supersede_refuses_stale_closed_and_clashing<S: WriteStore>(store
 
 /// Plan D6: an unknown project or entry is `NotFound`, an unknown entry's history is empty (not
 /// "not available here"), and a duplicate id or an author or box that names no row is
-/// `Constraint`. No refusal writes.
+/// `Constraint` (a duplicate id in `already_exists`'s text on every store). No refusal writes.
 async fn memory_unknown_rows_and_authors_are_refused<S: WriteStore>(store: &S) {
     const CASE: &str = "memory_unknown_rows_and_authors_are_refused";
 
@@ -22360,14 +22493,15 @@ async fn memory_unknown_rows_and_authors_are_refused<S: WriteStore>(store: &S) {
             "Same id, other subject.",
         )
     };
-    assert!(
-        matches!(
-            store
-                .create_memory_entry(ids::PROJECT_HTUI, duplicate)
-                .await,
-            Err(StoreError::Constraint(_))
-        ),
-        "{CASE}: a duplicate id is a Constraint"
+    assert_eq!(
+        store
+            .create_memory_entry(ids::PROJECT_HTUI, duplicate)
+            .await,
+        Err(StoreError::Constraint(already_exists(
+            "memory_entry",
+            entry.id
+        ))),
+        "{CASE}: a duplicate id is refused with the same text on every store"
     );
     let stranger = NewMemoryEntry {
         created_by: UserId::new(),
@@ -22401,6 +22535,26 @@ async fn memory_unknown_rows_and_authors_are_refused<S: WriteStore>(store: &S) {
             Err(StoreError::Constraint(_))
         ),
         "{CASE}: an amend by an author that names no user is a Constraint"
+    );
+    let boxless_amend = MemoryPatch {
+        box_id: Some(BoxId::new()),
+        ..memory_patch(CASE, None, Some("On no box."))
+    };
+    assert!(
+        matches!(
+            store.amend_memory_entry(entry.id, 1, boxless_amend).await,
+            Err(StoreError::Constraint(_))
+        ),
+        "{CASE}: an amend on a box_id that names no box is a Constraint"
+    );
+    assert!(
+        matches!(
+            store
+                .retire_memory_entry(entry.id, 1, ids::USER, Some(BoxId::new()))
+                .await,
+            Err(StoreError::Constraint(_))
+        ),
+        "{CASE}: a retire on a box_id that names no box is a Constraint"
     );
 
     assert_eq!(
