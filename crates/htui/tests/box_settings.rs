@@ -630,9 +630,14 @@ fn executor_row(executor: &str) -> String {
     format!("{:<16}{executor}", "executor")
 }
 
-/// A frame's words joined by single spaces, so a sentence the detail pane wrapped reads whole.
+/// A frame's words joined by single spaces, so a sentence the detail pane wrapped reads whole. The
+/// kit form's `▌` marks every row of its focused field (MOD-115 M3), so it is read as a blank.
 fn words(frame: &str) -> String {
-    frame.split_whitespace().collect::<Vec<_>>().join(" ")
+    frame
+        .replace('\u{258c}', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The last line of a frame that is not blank: the notice when one shows, else the hint.
