@@ -22,7 +22,15 @@
 //! only as fresh rows; its tree read is its own (R1 L-3), so it never reaches the Hierarchy
 //! section as the answer to that section's write. `--demo` (D10) shows `n/a`, refuses keyring
 //! edits and checks here (no request is sent), and still edits scopes, which live in the store.
+//!
+//! The rows are one kit form (MOD-115 M3 D3): an open form's fields are rows of their own right
+//! under the row they replace, the focused one carrying its guide or refusal; a question is the
+//! error line of the row it is about; the last outcome is a kit notice line under the form. Every
+//! sentence that names a key reads it from the keys in force (MD-A, C5, D-5), and the forms' acts
+//! resolve from [`Ctx::pressed`].
 
+use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
@@ -30,24 +38,27 @@ use htui_core::model::{Project, ProjectId, Scope};
 use htui_core::secret::{INFISICAL, ProviderHealth, SecretError, SecretScope, project_scope};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::text::Line;
+use ratatui::widgets::Paragraph;
 use zeroize::Zeroizing;
 
 use crate::app::{Action, Ctx, Handled};
 use crate::hierarchy::{HierarchySnapshot, ProjectEntry, ScopeWrite};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::secrets_settings::{
     CHECK_SECRET_PROVIDER, CHECK_SECRET_SCOPE, IdentityEntry, IdentityState, READ_NAME,
     REQUEST_NAMES, Redacted, SET_PROJECT_SECRET_SCOPE, SecretCheck, SecretsSnapshot, UrlState,
 };
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
-use crate::ui::kit::{chips::key_line, text::wrapped};
+use crate::ui::kit::chips::key_line;
+use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::form::{self, Form, Value};
+use crate::ui::kit::list::{self, GUTTER};
+use crate::ui::kit::text::{Tone, notice, wrapped};
 use crate::ui::tabs::settings::{
-    CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
-    answers, asked,
+    CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection, answers, asked,
+    changed_elsewhere,
 };
 use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::KeyEvent;
@@ -70,8 +81,11 @@ const CHECKING: &str = "checking\u{2026}";
 const NO_PROVIDER: &str = "no secret provider";
 /// The `Projects` line with no tree to list.
 const NO_WORKSPACE: &str = "no workspace: project scopes need one";
-/// What the rows say when the keyring read itself was refused; the seam's sentence follows it.
+/// What the rows say when the keyring read itself was refused; the seam's sentence follows it,
+/// then the next step ([`asks_again`], MOD-83).
 const UNAVAILABLE: &str = "secret settings are unavailable";
+/// The heading over the project rows.
+const PROJECTS: &str = "Projects";
 /// `SetInfisicalUrl` landed.
 const URL_STORED: &str = "stored; the next walk, chat or check uses it";
 /// `ClearInfisicalUrl` landed.
@@ -141,12 +155,12 @@ const URL_GUIDE: &str =
 const IDENTITY_GUIDE: &str = "the client secret is never shown; storing replaces both halves";
 /// The scope form's guide.
 const SCOPE_GUIDE: &str = "Infisical project ID, environment slug and folder path (starts with /)";
-/// The URL form's label.
-const URL_LABEL: &str = "URL: ";
-/// The identity form's labels.
-const IDENTITY_LABELS: [&str; 2] = ["client ID: ", "client secret: "];
-/// The scope form's labels.
-const SCOPE_LABELS: [&str; 3] = ["project ID: ", "environment: ", "path: "];
+/// The URL field's label: its own row, under the URL row it replaces.
+const NEW_URL_LABEL: &str = "new URL";
+/// The identity form's labels, rows under the Identity row.
+const IDENTITY_LABELS: [&str; 2] = ["client ID", "client secret"];
+/// The scope form's labels, rows under the project's row.
+const SCOPE_LABELS: [&str; 3] = ["project ID", "environment", "path"];
 
 /// Browse's keys, with something to browse: `e edit · c clear · t check · r reload · j/k rows`.
 const HINT_BROWSE: HintSpec = &[
@@ -158,20 +172,24 @@ const HINT_BROWSE: HintSpec = &[
 ];
 /// Browse's keys with nothing read, or the read refused: `r reload`.
 const HINT_NO_SNAPSHOT: HintSpec = &[Hint::One(Act::Reload, "reload")];
-/// The URL form's keys, the field's own: `Enter store · Esc cancel`.
-const HINT_URL: HintSpec = &[Hint::Text("Enter store"), Hint::Text("Esc cancel")];
-/// The identity form's keys, and the promise the mask is.
+/// The URL field's keys, `field.submit` and `field.cancel` through `CAPTURE` (MOD-115 M3 C6):
+/// `Enter store · Esc cancel` under the compiled keys.
+const HINT_URL: HintSpec = &[
+    Hint::One(Act::FieldSubmit, "store"),
+    Hint::One(Act::FieldCancel, "cancel"),
+];
+/// The identity form's keys through `SECRETS_FORM`, and the promise the mask is.
 const HINT_IDENTITY: HintSpec = &[
     Hint::One(Act::FormNextField, "next field"),
-    Hint::Text("Enter store"),
-    Hint::Text("Esc cancel"),
+    Hint::One(Act::FieldSubmit, "store"),
+    Hint::One(Act::FieldCancel, "cancel"),
     Hint::Text("the secret is never shown"),
 ];
-/// The scope form's keys: `Tab next field · Enter save · Esc cancel`.
+/// The scope form's keys: `Tab next field · Enter save · Esc cancel` under the compiled keys.
 const HINT_SCOPE: HintSpec = &[
     Hint::One(Act::FormNextField, "next field"),
-    Hint::Text("Enter save"),
-    Hint::Text("Esc cancel"),
+    Hint::One(Act::FieldSubmit, "save"),
+    Hint::One(Act::FieldCancel, "cancel"),
 ];
 /// Every question's keys: `y confirm · n/Esc cancel`.
 const HINT_CONFIRM: HintSpec = &[
@@ -179,20 +197,12 @@ const HINT_CONFIRM: HintSpec = &[
     Hint::All(Act::ConfirmNo, "cancel"),
 ];
 
-/// The width the four fixed labels pad to.
-const FIXED_LABEL_WIDTH: usize = 8;
-
 /// `c` on a scoped project, ended by `answers` ([`answers`], MOD-67 M6 PA-6).
 fn confirm_clear_scope(slug: &str, answers: &str) -> String {
     asked(
         &format!("Remove `{slug}`'s secret scope? Its walks and chats then get no secrets."),
         answers,
     )
-}
-
-/// What a second write is told while the first is still out.
-fn in_flight(busy: &str) -> String {
-    format!("`{busy}` is still in flight")
 }
 
 /// One row, top to bottom: the four fixed rows, then one per project of the tree.
@@ -442,6 +452,10 @@ pub struct SecretsSection {
     check_outdated: bool,
     /// The last outcome.
     notice: Option<Notice>,
+    /// The form's `(lines, first line drawn)` as of the last render, for the Settings pane's
+    /// scrollbar (MOD-115 M3 D-11), the notice rows under it counted; `None` while the refusal
+    /// stands in for the rows.
+    scroll: Cell<Option<(usize, usize)>>,
 }
 
 impl SecretsSection {
@@ -502,7 +516,7 @@ impl SecretsSection {
     /// Refuses with the write in flight, if there is one.
     fn refused_busy(&mut self) -> bool {
         if let Some(busy) = self.busy {
-            self.refuse(in_flight(busy.name()));
+            self.refuse(in_flight(busy));
             return true;
         }
         false
@@ -730,9 +744,11 @@ impl SecretsSection {
                 self.mode = Mode::Browse;
                 self.notice = None;
             }
+            // The chord the user pressed (MOD-115 M3 MD-A): a `[field]` chord the field passed is
+            // the field's, never re-read as another act of its canonical key.
             FieldOutcome::Pass => {
                 let stack = self.stack();
-                let chord = KeyChord::from_event(key);
+                let chord = ctx.pressed(&key);
                 match ctx.keys().actions(stack, chord).first() {
                     Some(Act::FormNextField) => self.cycle_focus(true),
                     Some(Act::FormPrevField) => self.cycle_focus(false),
@@ -860,7 +876,7 @@ impl SecretsSection {
     /// shell, so `alt-y` answers nothing; everything else is swallowed.
     fn on_confirm_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let stack = views::SECRETS_CONFIRM;
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         // The narrowest candidate decides: a global act is the pass rule's.
         match ctx.keys().actions(stack, chord).first() {
             Some(Act::ConfirmYes) if self.closed_if_gone() => {}
@@ -996,158 +1012,213 @@ impl SecretsSection {
             )
     }
 
-    /// Row `index`'s style, by its absolute index in cursor order (H-22): the cursor's is
-    /// `theme.selected`.
-    fn style_of(&self, index: usize, theme: &Theme) -> Style {
-        if index == self.cursor {
-            theme.selected
-        } else {
-            theme.base
+    /// The label column every row and every form field shares, so opening a form moves no value
+    /// (MOD-115 M3 D3): the widest fixed label, form label and project slug, and one cell.
+    fn label_width(&self) -> u16 {
+        let slugs = self
+            .tree
+            .iter()
+            .flat_map(|tree| &tree.projects)
+            .map(|entry| cell_width(&entry.project.slug));
+        let labels = Row::FIXED
+            .iter()
+            .map(|row| row.label())
+            .chain([NEW_URL_LABEL])
+            .chain(IDENTITY_LABELS)
+            .chain(SCOPE_LABELS)
+            .map(cell_width);
+        let widest = labels.chain(slugs).max().unwrap_or(0);
+        u16::try_from(widest + 1).unwrap_or(u16::MAX)
+    }
+
+    /// A fixed row's value: a stored or absent identity is the kit's secret value, every other
+    /// row its text, wrapped under its own column.
+    fn row_value(&self, row: Row) -> Value<'static> {
+        if row == Row::Identity {
+            match self.snapshot.as_ref().map(|snapshot| &snapshot.identity) {
+                Some(IdentityState::Stored) => return Value::Secret(true),
+                Some(IdentityState::NotStored) => return Value::Secret(false),
+                _ => {}
+            }
+        }
+        Value::ReadOnly(Cow::Owned(self.row_text(row)))
+    }
+
+    /// One form field with what the notice says about it: a refusal as its error, a report as
+    /// its help, else `guide` as its help (shown while it is focused).
+    fn noted<'a>(&'a self, field: form::Field<'a>, guide: &'a str) -> form::Field<'a> {
+        match &self.notice {
+            Some(Notice::Error(text)) => field.error(text.as_str()),
+            Some(Notice::Info(text)) => field.help(text.as_str()),
+            None => field.help(guide),
         }
     }
 
-    /// The rows: the four fixed ones, the `Projects` line, one per project, then the guide and
-    /// [`MARK_REFUSED`] (R1 M-1).
-    fn lines(&self, width: u16, theme: &Theme, keys: &Keys) -> Vec<Line<'static>> {
-        let mut lines = Vec::new();
+    /// The rows as one kit form (MOD-115 M3 D3), with the item to focus: the four fixed rows, a
+    /// blank, the `Projects` heading and one row per project. An open form's fields are rows of
+    /// their own right under the row they replace (so what is stored stays on screen), the
+    /// focused one carrying its guide or refusal; a question is the error line of the row it is
+    /// about; the latch is the Identity row's error and the Health guide the Health row's help.
+    fn form(&self, keys: &Keys) -> (Form<'_>, usize) {
+        let stack = views::SECRETS_BROWSE;
+        let answers = answers(keys, views::SECRETS_CONFIRM);
+        let mut form = Form::new().label_width(self.label_width());
+        let mut item = 0;
+        let mut focus = None;
         for (index, row) in Row::FIXED.into_iter().enumerate() {
-            push_row(
-                &mut lines,
-                row.label(),
-                FIXED_LABEL_WIDTH,
-                &self.row_text(row),
-                width,
-                self.style_of(index, theme),
-            );
+            let mut field = form::Field::new(row.label(), self.row_value(row));
+            match (&self.mode, row) {
+                (Mode::ConfirmClearUrl, Row::Url) => {
+                    field = field.error(asked(CONFIRM_CLEAR_URL, &answers));
+                }
+                (Mode::ConfirmClearIdentity, Row::Identity) => {
+                    field = field.error(asked(CONFIRM_CLEAR_IDENTITY, &answers));
+                }
+                (_, Row::Identity) if self.latched() => {
+                    field = field.error(latched(keys.label(stack, Act::Edit).as_deref()));
+                }
+                (_, Row::Health) => {
+                    field = field.help(health_guide(
+                        keys.label(stack, Act::SecretsCheck).as_deref(),
+                    ));
+                }
+                _ => {}
+            }
+            if self.cursor == index && !self.editing() {
+                focus = Some(item);
+            }
+            form = form.field(field);
+            item += 1;
+            match (&self.mode, row) {
+                (Mode::EditingUrl(input), Row::Url) => {
+                    focus = Some(item);
+                    let field = form::Field::new(NEW_URL_LABEL, Value::Text(input));
+                    form = form.field(self.noted(field, URL_GUIDE));
+                    item += 1;
+                }
+                (
+                    Mode::EditingIdentity {
+                        client_id,
+                        client_secret,
+                        focus: on,
+                    },
+                    Row::Identity,
+                ) => {
+                    for (n, (label, input)) in IDENTITY_LABELS
+                        .into_iter()
+                        .zip([client_id, client_secret])
+                        .enumerate()
+                    {
+                        let field = form::Field::new(label, Value::Text(input));
+                        let field = if n == *on {
+                            focus = Some(item);
+                            self.noted(field, IDENTITY_GUIDE)
+                        } else {
+                            field
+                        };
+                        form = form.field(field);
+                        item += 1;
+                    }
+                }
+                _ => {}
+            }
         }
-        lines.push(Line::default());
-        self.project_lines(&mut lines, width, theme);
-        let room = usize::from(width).saturating_sub(2).max(1);
-        let mark = self.mark_refused.then(|| MARK_REFUSED.to_owned());
-        for note in [self.guide(keys), mark].into_iter().flatten() {
-            lines.push(Line::default());
-            lines.extend(
-                wrapped(&note, room)
-                    .into_iter()
-                    .map(|line| Line::styled(format!("  {line}"), theme.dim)),
-            );
-        }
-        lines
-    }
-
-    /// The `Projects` heading and one row per project, or [`NO_WORKSPACE`].
-    fn project_lines(&self, lines: &mut Vec<Line<'static>>, width: u16, theme: &Theme) {
-        match &self.tree {
-            None => lines.push(Line::styled(format!("  {NO_WORKSPACE}"), theme.dim)),
-            Some(tree) => {
-                lines.push(Line::styled("  Projects".to_owned(), theme.dim));
-                let slug_width = tree
-                    .projects
-                    .iter()
-                    .map(|entry| cell_width(&entry.project.slug))
-                    .max()
-                    .unwrap_or(0);
-                for (index, entry) in tree.projects.iter().enumerate() {
-                    push_row(
-                        lines,
-                        &entry.project.slug,
-                        slug_width,
-                        &self.project_text(&entry.project),
-                        width,
-                        self.style_of(Row::FIXED.len() + index, theme),
-                    );
+        form = form.blank();
+        item += 1;
+        if let Some(tree) = &self.tree {
+            form = form.heading(PROJECTS);
+            item += 1;
+            for (index, entry) in tree.projects.iter().enumerate() {
+                let project = &entry.project;
+                let mut field = form::Field::new(
+                    project.slug.as_str(),
+                    Value::ReadOnly(Cow::Owned(self.project_text(project))),
+                );
+                if let Mode::ConfirmClearScope {
+                    project: id, slug, ..
+                } = &self.mode
+                    && *id == project.id
+                {
+                    field = field.error(confirm_clear_scope(slug, &answers));
+                }
+                if self.cursor == Row::FIXED.len() + index && !self.editing() {
+                    focus = Some(item);
+                }
+                form = form.field(field);
+                item += 1;
+                if let Mode::EditingScope {
+                    project: id,
+                    fields,
+                    focus: on,
+                    ..
+                } = &self.mode
+                    && *id == project.id
+                {
+                    for (n, (label, input)) in SCOPE_LABELS.into_iter().zip(fields).enumerate() {
+                        let field = form::Field::new(label, Value::Text(input));
+                        let field = if n == *on {
+                            focus = Some(item);
+                            self.noted(field, SCOPE_GUIDE)
+                        } else {
+                            field
+                        };
+                        form = form.field(field);
+                        item += 1;
+                    }
                 }
             }
         }
+        let focus = focus.unwrap_or(0);
+        (form.focus(focus).editing(self.editing()), focus)
     }
 
-    /// The guide under the rows: [`latched`], else [`health_guide`] on Health, else none; each
-    /// names its key as `keys` binds it in `SECRETS_BROWSE` (MOD-67 M6 D4).
-    fn guide(&self, keys: &Keys) -> Option<String> {
-        let stack = views::SECRETS_BROWSE;
-        if self.latched() {
-            Some(latched(keys.label(stack, Act::Edit).as_deref()))
-        } else if self.row() == Row::Health {
-            Some(health_guide(
-                keys.label(stack, Act::SecretsCheck).as_deref(),
-            ))
-        } else {
-            None
+    /// Whether a form is open: its focused field is being typed into.
+    fn editing(&self) -> bool {
+        matches!(
+            self.mode,
+            Mode::EditingUrl(_) | Mode::EditingIdentity { .. } | Mode::EditingScope { .. }
+        )
+    }
+
+    /// The notes under the form: [`NO_WORKSPACE`] with no tree to list, and [`MARK_REFUSED`] after
+    /// a keyring write whose mark was refused (R1 M-1), each a kit notice line.
+    fn notes(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+        let room = usize::from(width).saturating_sub(1).max(1);
+        let mut lines = Vec::new();
+        let notes = [
+            self.tree.is_none().then_some(NO_WORKSPACE),
+            self.mark_refused.then_some(MARK_REFUSED),
+        ];
+        for note in notes.into_iter().flatten() {
+            if !lines.is_empty() {
+                lines.push(Line::default());
+            }
+            lines.extend(
+                wrapped(note, room)
+                    .into_iter()
+                    .map(|line| notice(&format!(" {line}"), Tone::Info, theme)),
+            );
         }
-    }
-
-    /// The pane under the rows: the form, or the question, or nothing.
-    fn pane(&self, width: u16, theme: &Theme, keys: &Keys) -> Vec<Line<'static>> {
-        let room = usize::from(width).max(1);
-        let answers = answers(keys, views::SECRETS_CONFIRM);
-        let (mut lines, guide) = match &self.mode {
-            Mode::Browse => return Vec::new(),
-            Mode::ConfirmClearUrl => {
-                return question(&asked(CONFIRM_CLEAR_URL, &answers), room, theme);
-            }
-            Mode::ConfirmClearIdentity => {
-                return question(&asked(CONFIRM_CLEAR_IDENTITY, &answers), room, theme);
-            }
-            Mode::ConfirmClearScope { slug, .. } => {
-                return question(&confirm_clear_scope(slug, &answers), room, theme);
-            }
-            Mode::EditingUrl(field) => (form(&[URL_LABEL], &[field], 0, width, theme), URL_GUIDE),
-            Mode::EditingIdentity {
-                client_id,
-                client_secret,
-                focus,
-            } => (
-                form(
-                    &IDENTITY_LABELS,
-                    &[client_id, client_secret],
-                    *focus,
-                    width,
-                    theme,
-                ),
-                IDENTITY_GUIDE,
-            ),
-            Mode::EditingScope { fields, focus, .. } => (
-                form(
-                    &SCOPE_LABELS,
-                    &[&fields[0], &fields[1], &fields[2]],
-                    *focus,
-                    width,
-                    theme,
-                ),
-                SCOPE_GUIDE,
-            ),
-        };
-        // Under the form rather than on the notice row: a refusal is about what was just typed.
-        let (text, style) = match &self.notice {
-            Some(notice) if notice.is_error() => (notice.text(), theme.error),
-            Some(notice) => (notice.text(), theme.dim),
-            None => (guide, theme.dim),
-        };
-        lines.extend(
-            wrapped(text, room)
-                .into_iter()
-                .map(|line| Line::styled(line, style)),
-        );
         lines
     }
 
-    /// The one line under the pane: the last outcome, in `theme.error` when it is one to act on
-    /// rather than read (a compare-and-set miss). The keys this mode binds moved to the shell's
-    /// hint row (MOD-67 M6 T2, [`SettingsSection::key_hint`]), so the outcome has the line to
-    /// itself; blank without one.
-    /// Browse only: every other mode draws it in the pane, next to what it is about.
-    fn notice_line(&self, theme: &Theme) -> Line<'static> {
-        let (Some(notice), Mode::Browse) = (&self.notice, &self.mode) else {
-            return Line::default();
+    /// The rows under the form in Browse: the last outcome, as kit notice lines in `theme.error`
+    /// when it is one to act on (a compare-and-set miss). The keys this mode binds are on the
+    /// pane's border (MOD-67 M6 T2, [`SettingsSection::key_hint`]); every other mode draws its
+    /// outcome in the form, next to what it is about.
+    fn notice_lines(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+        let (Some(said), Mode::Browse) = (&self.notice, &self.mode) else {
+            return Vec::new();
         };
-        Line::styled(
-            notice.text().to_owned(),
-            if notice.is_error() {
-                theme.error
-            } else {
-                theme.dim
-            },
-        )
+        let tone = if said.is_error() {
+            Tone::Error
+        } else {
+            Tone::Info
+        };
+        wrapped(said.text(), usize::from(width).max(1))
+            .into_iter()
+            .map(|line| notice(&line, tone, theme))
+            .collect()
     }
 
     /// The mode's keys for the shell's hint row, rendered through the mode's stack with the keys
@@ -1171,7 +1242,7 @@ impl SecretsSection {
         let keys = keys.hint(self.stack(), spec);
         match self.busy {
             Some(busy) if matches!(self.mode, Mode::Browse) && self.notice.is_none() => {
-                format!("{keys} \u{b7} {} in flight", busy.name())
+                format!("{keys} \u{b7} {}\u{2026}", doing(busy))
             }
             _ => keys,
         }
@@ -1300,12 +1371,13 @@ impl SecretsSection {
                 self.mode = Mode::Browse;
                 self.say(if clear { SCOPE_CLEARED } else { SCOPE_SAVED });
             }
-            ScopeWrite::Stale => self.on_scope_stale(project, tree),
+            ScopeWrite::Stale => self.on_scope_stale(project, tree, ctx.keys()),
         }
     }
 
-    /// A stale scope write: refresh the open form's token, close it if the project left, or say so.
-    fn on_scope_stale(&mut self, project: ProjectId, tree: &HierarchySnapshot) {
+    /// A stale scope write: refresh the open form's token, close it if the project left, or say so,
+    /// naming the retry key in force (`field.submit` through `SECRETS_FORM`, D-5).
+    fn on_scope_stale(&mut self, project: ProjectId, tree: &HierarchySnapshot, keys: &Keys) {
         let current = tree
             .projects
             .iter()
@@ -1321,7 +1393,8 @@ impl SecretsSection {
                 Some(updated_at),
             ) if *open == project => {
                 *expected = updated_at;
-                self.refuse(CHANGED_ELSEWHERE.to_owned());
+                let retry = keys.label(views::SECRETS_FORM, Act::FieldSubmit);
+                self.refuse(changed_elsewhere(retry.as_deref()));
             }
             (Mode::EditingScope { project: open, .. }, None) if *open == project => {
                 self.mode = Mode::Browse;
@@ -1492,7 +1565,7 @@ impl SettingsSection for SecretsSection {
         }
         // Browse, through `SECRETS_BROWSE`. Chord equality includes modifiers: `ctrl-t` is not
         // `t` (a provider check is a login that can latch), `ctrl-e` is not `e`.
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         for act in ctx.keys().actions(views::SECRETS_BROWSE, chord) {
             match act {
                 Act::Edit => self.edit(ctx.keys()),
@@ -1546,104 +1619,101 @@ impl SettingsSection for SecretsSection {
         key_line(self.hint_text(keys), theme)
     }
 
+    fn scroll(&self) -> Option<(usize, usize)> {
+        self.scroll.get()
+    }
+
+    /// The form over the rows, its notes under it, the notice at the foot; the refusal and its
+    /// next step stand in for the rows while the keyring read is refused.
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let pane = self.pane(area.width, ctx.theme, ctx.keys());
-        let [rows, pane_area, hint] = Layout::vertical([
-            Constraint::Min(3),
-            Constraint::Length(u16::try_from(pane.len()).unwrap_or(u16::MAX)),
-            Constraint::Length(1),
+        let theme = ctx.theme;
+        let said = self.notice_lines(area.width, theme);
+        let [rows, notice_area] = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(u16::try_from(said.len()).unwrap_or(u16::MAX)),
         ])
         .areas(area);
-
+        self.scroll.set(None);
         match &self.unavailable {
             // The refusal wins the rows (Connection's rule): what is on screen would otherwise be
             // a keyring nothing has confirmed since the outage started.
-            Some(why) => frame.render_widget(
-                Paragraph::new(Line::styled(
-                    format!("{UNAVAILABLE}: {why}"),
-                    ctx.theme.error,
-                ))
-                .wrap(Wrap { trim: true }),
-                rows,
-            ),
-            None => frame.render_widget(
-                Paragraph::new(self.lines(rows.width, ctx.theme, ctx.keys())),
-                rows,
-            ),
+            Some(why) => {
+                let mut lines: Vec<Line<'static>> = wrapped(
+                    &format!("{UNAVAILABLE}: {why}"),
+                    usize::from(rows.width).max(1),
+                )
+                .into_iter()
+                .map(|line| notice(&line, Tone::Error, theme))
+                .collect();
+                // MOD-83: the next step, in the empty state's own role.
+                let reload = ctx.keys().label(views::SECRETS_BROWSE, Act::Reload);
+                let next = asks_again(reload.as_deref());
+                lines.extend(empty::lines("", NextStep(&next), theme).pop());
+                frame.render_widget(Paragraph::new(lines), rows);
+            }
+            None => {
+                let (form, _) = self.form(ctx.keys());
+                let mut lines = form.lines(rows.width, ctx.accent(), theme);
+                let notes = self.notes(rows.width, theme);
+                if !notes.is_empty() {
+                    lines.push(Line::default());
+                    lines.extend(notes);
+                }
+                let offset = in_view(&lines, form.focus_line(rows.width), rows.height);
+                let total = lines.len();
+                frame.render_widget(Paragraph::new(lines[offset..].to_vec()), rows);
+                // The pane's bar is measured against the whole inner rect (D-11).
+                let below = usize::from(area.height.saturating_sub(rows.height));
+                self.scroll.set(Some((total + below, offset)));
+            }
         }
-        if !pane.is_empty() {
-            frame.render_widget(Paragraph::new(pane), pane_area);
+        if !said.is_empty() {
+            frame.render_widget(Paragraph::new(said), notice_area);
         }
-        frame.render_widget(Paragraph::new(self.notice_line(ctx.theme)), hint);
     }
 }
 
-/// One labelled row, its value wrapped under its own column.
-fn push_row(
-    lines: &mut Vec<Line<'static>>,
-    label: &str,
-    label_width: usize,
-    value: &str,
-    width: u16,
-    style: Style,
-) {
-    let gutter = label_width + 4;
-    let room = usize::from(width).saturating_sub(gutter).max(1);
-    let chunks = wrapped(value, room);
-    let chunks = if chunks.is_empty() {
-        vec![String::new()]
-    } else {
-        chunks
+/// The first line to draw so the focused row is on screen: its first line to the last of its
+/// value rows (each behind the marker) and its help and error (indented past the label column),
+/// or its first line alone when the block is taller than `height`.
+fn in_view(lines: &[Line<'_>], start: Option<usize>, height: u16) -> usize {
+    let Some(start) = start.filter(|start| *start < lines.len()) else {
+        return 0;
     };
-    for (n, chunk) in chunks.into_iter().enumerate() {
-        let label = if n == 0 { label } else { "" };
-        let pad = " ".repeat(label_width.saturating_sub(cell_width(label)));
-        lines.push(Line::styled(format!("  {label}{pad}  {chunk}"), style));
+    let rest = lines[start + 1..]
+        .iter()
+        .take_while(|line| {
+            let text = line.to_string();
+            text.starts_with(GUTTER) || text.starts_with("  ")
+        })
+        .count();
+    list::scroll_into_view(start + rest, 0, usize::from(height), lines.len()).min(start)
+}
+
+/// What a second write is told while the first is still out, in words (no request name).
+fn in_flight(busy: Write) -> String {
+    format!("still {} \u{2014} wait for the store's answer", doing(busy))
+}
+
+/// What the write `busy` is doing, as the user reads it.
+const fn doing(busy: Write) -> &'static str {
+    match busy {
+        Write::Url => "storing the Infisical URL",
+        Write::ClearUrl => "clearing the Infisical URL",
+        Write::Identity => "storing the machine identity",
+        Write::ClearIdentity => "clearing the machine identity",
+        Write::Scope { clear: false, .. } => "saving the secret scope",
+        Write::Scope { clear: true, .. } => "clearing the secret scope",
     }
 }
 
-/// A form: one labelled field per line, labels padded to the widest, the focused one drawing the
-/// cursor.
-fn form(
-    labels: &[&str],
-    fields: &[&TextField],
-    focus: usize,
-    width: u16,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
-    let label_width = labels
-        .iter()
-        .map(|label| cell_width(label))
-        .max()
-        .unwrap_or(0);
-    let field_room = usize::from(width).saturating_sub(label_width);
-    labels
-        .iter()
-        .zip(fields)
-        .enumerate()
-        .map(|(index, (label, field))| {
-            let pad = " ".repeat(label_width.saturating_sub(cell_width(label)));
-            let mut spans = vec![Span::styled(format!("{label}{pad}"), theme.accent)];
-            spans.extend(
-                field
-                    .line(
-                        u16::try_from(field_room).unwrap_or(u16::MAX),
-                        index == focus,
-                        theme,
-                    )
-                    .spans,
-            );
-            Line::from(spans)
-        })
-        .collect()
-}
-
-/// A question, wrapped and in `theme.error`.
-fn question(text: &str, room: usize, theme: &Theme) -> Vec<Line<'static>> {
-    wrapped(text, room)
-        .into_iter()
-        .map(|line| Line::styled(line, theme.error))
-        .collect()
+/// The next step of [`UNAVAILABLE`] (MOD-83): the reload key in force, or what happens without
+/// one.
+fn asks_again(reload: Option<&str>) -> String {
+    reload.map_or_else(
+        || "it is asked again when the section opens".to_owned(),
+        |key| format!("{key} asks again once the store answers"),
+    )
 }
 
 #[cfg(test)]
