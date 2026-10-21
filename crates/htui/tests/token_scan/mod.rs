@@ -17,10 +17,28 @@ use proc_macro2::{Delimiter, Spacing, TokenStream, TokenTree};
 /// The 1-based lines of every `<needle>::` in `src` outside a test item and outside a function
 /// named in `skip_fns`.
 pub fn sites(src: &str, needles: &[&str], skip_fns: &[&str]) -> Vec<usize> {
+    sites_except(src, needles, skip_fns, &[])
+}
+
+/// [`sites`], less the paths in `exempt`: a `<needle>::<next>` whose `"<needle>::<next>"` is listed
+/// there is no site (a file's own `Block::Blank` is not ratatui's `Block::bordered()`).
+pub fn sites_except(src: &str, needles: &[&str], skip_fns: &[&str], exempt: &[&str]) -> Vec<usize> {
     let stream = TokenStream::from_str(src).expect("the source tokenises");
+    let scan = Scan {
+        needles,
+        skip_fns,
+        exempt,
+    };
     let mut lines = Vec::new();
-    walk(stream, needles, skip_fns, &mut lines);
+    walk(stream, &scan, &mut lines);
     lines
+}
+
+/// What [`walk`] looks for.
+struct Scan<'a> {
+    needles: &'a [&'a str],
+    skip_fns: &'a [&'a str],
+    exempt: &'a [&'a str],
 }
 
 /// Whether a `#[…]` group's contents mark a test item: `cfg(test)`, `test`, `tokio::test`.
@@ -30,7 +48,7 @@ fn is_test_attr(group: &TokenStream) -> bool {
         || text.starts_with("tokio::test(")
 }
 
-fn walk(stream: TokenStream, needles: &[&str], skip_fns: &[&str], lines: &mut Vec<usize>) {
+fn walk(stream: TokenStream, scan: &Scan<'_>, lines: &mut Vec<usize>) {
     let tokens: Vec<TokenTree> = stream.into_iter().collect();
     let mut i = 0;
     while i < tokens.len() {
@@ -59,26 +77,28 @@ fn walk(stream: TokenStream, needles: &[&str], skip_fns: &[&str], lines: &mut Ve
             }
             TokenTree::Ident(ident) if ident == "fn" => {
                 if let Some(TokenTree::Ident(name)) = tokens.get(i + 1)
-                    && skip_fns.iter().any(|skip| name == skip)
+                    && scan.skip_fns.iter().any(|skip| name == skip)
                 {
                     i = skip_item(&tokens, i + 2);
                     continue;
                 }
                 i += 1;
             }
-            TokenTree::Ident(ident) if needles.iter().any(|needle| ident == needle) => {
+            TokenTree::Ident(ident) if scan.needles.iter().any(|needle| ident == needle) => {
                 if let (Some(TokenTree::Punct(first)), Some(TokenTree::Punct(second))) =
                     (tokens.get(i + 1), tokens.get(i + 2))
                     && first.as_char() == ':'
                     && first.spacing() == Spacing::Joint
                     && second.as_char() == ':'
+                    && !matches!(tokens.get(i + 3), Some(TokenTree::Ident(next))
+                        if scan.exempt.iter().any(|path| *path == format!("{ident}::{next}")))
                 {
                     lines.push(ident.span().start().line);
                 }
                 i += 1;
             }
             TokenTree::Group(group) => {
-                walk(group.stream(), needles, skip_fns, lines);
+                walk(group.stream(), scan, lines);
                 i += 1;
             }
             _ => i += 1,

@@ -9,10 +9,25 @@
 
 mod token_scan;
 
-use token_scan::{relative, sites, sources, src_root};
+use token_scan::{relative, sites, sites_except, sources, src_root};
 
 /// The idents that build a frame by hand.
 const NEEDLES: &[&str] = &["Block", "Borders"];
+
+/// Files that declare a `Block` of their own, with the paths that name it: no frame, and no work
+/// for M4, so they are not in [`GROUP_B`]. Only those paths are exempt, so a ratatui frame added
+/// to such a file (`ratatui::widgets::Block::bordered()`, `Borders::ALL`) is still a site.
+const OWN_BLOCK: &[(&str, &[&str], &str)] = &[(
+    "ui/markdown.rs",
+    &[
+        "Block::Blank",
+        "Block::Plain",
+        "Block::Literal",
+        "Block::Paragraph",
+        "Block::Item",
+    ],
+    "its `enum Block` is a parsed markdown block, not a ratatui frame",
+)];
 
 /// The trees the guard reads, relative to `src/`.
 const SCOPE: &[&str] = &["ui/", "app/"];
@@ -30,11 +45,10 @@ const KIT: &str = "ui/kit/";
 
 /// Still framing themselves, each with what it frames; M4 ports each and deletes its entry. Built
 /// from a scan of the merged M3 tree (`8e4568ba`): every non-test `Block::`/`Borders::` site in
-/// `src/ui` and `src/app` outside group A and the kit.
+/// `src/ui` and `src/app` outside group A and the kit, less the [`OWN_BLOCK`] name collisions.
 const GROUP_B: &[(&str, &str)] = &[
     ("app/state.rs", "the `?` box and the no-tab body"),
     ("ui/editor_pane.rs", "the in-pane editor"),
-    ("ui/markdown.rs", "markdown blocks"),
     ("ui/overlay/abort_confirm.rs", "overlay"),
     ("ui/overlay/concepts_search.rs", "overlay"),
     ("ui/overlay/migration_prompt.rs", "overlay"),
@@ -71,6 +85,19 @@ fn violations(src: &str) -> Vec<usize> {
     sites(src, NEEDLES, &[])
 }
 
+/// The paths that name `name`'s own `Block`, if [`OWN_BLOCK`] lists it.
+fn own_block(name: &str) -> &'static [&'static str] {
+    OWN_BLOCK
+        .iter()
+        .find(|(listed, _, _)| *listed == name)
+        .map_or(&[], |(_, paths, _)| paths)
+}
+
+/// Every frame-building site in the production code of `src`, the source of `name`.
+fn violations_in(name: &str, src: &str) -> Vec<usize> {
+    sites_except(src, NEEDLES, &[], own_block(name))
+}
+
 /// Every `src/<path>:<line>` site in scope, with the file it is in.
 fn scanned() -> Vec<(String, usize)> {
     let mut found = Vec::new();
@@ -80,7 +107,7 @@ fn scanned() -> Vec<(String, usize)> {
             continue;
         }
         let src = std::fs::read_to_string(&path).expect("a readable source");
-        for line in violations(&src) {
+        for line in violations_in(&name, &src) {
             found.push((name.clone(), line));
         }
     }
@@ -125,10 +152,48 @@ fn every_m4_entry_still_frames_itself() {
     for (name, what) in GROUP_B {
         let src = std::fs::read_to_string(src_root().join(name)).expect("a listed file exists");
         assert!(
-            !violations(&src).is_empty(),
+            !violations_in(name, &src).is_empty(),
             "src/{name} ({what}) frames itself no more: drop it from GROUP_B"
         );
     }
+}
+
+/// A stale exemption fails too: each listed file still names its own `Block`, through a path
+/// the exemption is what keeps from being a site.
+#[test]
+fn every_own_block_entry_is_still_needed() {
+    for (name, paths, what) in OWN_BLOCK {
+        let src = std::fs::read_to_string(src_root().join(name)).expect("a listed file exists");
+        let blocks = sites(&src, &["Block"], &[]);
+        let frames = sites_except(&src, &["Block"], &[], paths);
+        assert!(
+            blocks.len() > frames.len(),
+            "src/{name} ({what}) names its own `Block` no more: drop it from OWN_BLOCK"
+        );
+        assert!(
+            !in_group_a(name) && !under(name, KIT) && SCOPE.iter().any(|p| under(name, p)),
+            "src/{name} ({what}) is group A, the kit, or outside the scanned trees"
+        );
+        assert!(
+            !GROUP_B.iter().any(|(listed, _)| listed == name),
+            "src/{name} ({what}) frames nothing: it is no work for M4"
+        );
+    }
+}
+
+#[test]
+fn an_own_block_path_is_no_frame_but_a_ratatui_block_still_is() {
+    let src = "enum Block { Blank, Item { at: usize } }\n\
+               fn a() -> Block { Block::Blank }\n\
+               fn b(x: &Block) -> bool { matches!(x, Block::Item { .. }) }\n\
+               fn c() { let _ = ratatui::widgets::Block::bordered(); }\n\
+               fn d() { let _ = Borders::ALL; }\n";
+    let exempt = ["Block::Blank", "Block::Item"];
+    assert_eq!(sites_except(src, NEEDLES, &[], &exempt), [4, 5]);
+    assert_eq!(violations(src), [2, 3, 4, 5]);
+    // The exemption is the listed file's alone.
+    assert_eq!(violations_in("ui/markdown.rs", src), [4, 5]);
+    assert_eq!(violations_in("ui/editor_pane.rs", src), [2, 3, 4, 5]);
 }
 
 #[test]
