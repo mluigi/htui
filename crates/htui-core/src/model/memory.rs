@@ -1,6 +1,6 @@
 //! Project memory entries (MOD-163 M1, plan D1-D6; `R-ENT-13`, ANA-38 §4.6): the row, its
-//! revisions, the write arguments, and [`MemoryText`], the only way prose reaches the store
-//! (`R-ID-7`). Not mirrored (plan D7).
+//! revisions, the write arguments, and [`MemorySubject`] / [`MemoryBody`], the only way prose
+//! reaches the store (`R-ID-7`). Not mirrored (plan D7).
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -126,7 +126,8 @@ pub struct MemoryRevision {
 /// Arguments of [`WriteStore::create_memory_entry`](crate::store::WriteStore::create_memory_entry)
 /// and the new half of
 /// [`WriteStore::supersede_memory_entry`](crate::store::WriteStore::supersede_memory_entry). No
-/// serde (plan D2, blueprint P-9): the text is a [`MemoryText`], so nothing builds one by decoding.
+/// serde (plan D2, blueprint P-9): the text is a [`MemorySubject`] and a [`MemoryBody`], so nothing
+/// builds one by decoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewMemoryEntry {
     /// Client-minted id (`MemoryEntryId::new()`).
@@ -134,9 +135,9 @@ pub struct NewMemoryEntry {
     /// The kind.
     pub kind: MemoryKind,
     /// The checked subject.
-    pub subject: MemoryText,
+    pub subject: MemorySubject,
     /// The checked body.
-    pub body: MemoryText,
+    pub body: MemoryBody,
     /// `memory_entry.created_by`, and the `author_id` of revision 1 (and of the old entry's
     /// `superseded` revision on a supersede).
     pub created_by: UserId,
@@ -152,9 +153,9 @@ pub struct MemoryPatch {
     /// New kind.
     pub kind: Option<MemoryKind>,
     /// New subject.
-    pub subject: Option<MemoryText>,
+    pub subject: Option<MemorySubject>,
     /// New body.
-    pub body: Option<MemoryText>,
+    pub body: Option<MemoryBody>,
     /// The revision's `author_id`.
     pub author_id: UserId,
     /// The revision's `box_id`.
@@ -196,15 +197,45 @@ pub enum MemorySupersede {
     },
 }
 
-/// Plan D5 (`R-ID-7`): a subject or body, checked when built. The text is trimmed and must be
-/// non-empty and free of NUL (Postgres `text` cannot hold one), then scrubbed fail-closed by the
-/// caller's [`Scrubber`] (a known secret masked, credential-shaped text refused), and the
-/// **scrubbed** text is then capped in characters (blueprint P-1). The DB CHECKs are the backstop. `Debug` prints the length only; no `Display`,
-/// no serde (I-5, as [`FollowUpText`](crate::model::FollowUpText)).
+/// Plan D5 (`R-ID-7`): a subject, checked when built. The text is trimmed and must be non-empty
+/// and free of NUL (Postgres `text` cannot hold one), then scrubbed fail-closed by the caller's
+/// [`Scrubber`] (a known secret masked, credential-shaped text refused), and the **scrubbed** text
+/// is then capped at [`MEMORY_SUBJECT_MAX`] characters (blueprint P-1). The DB CHECKs are the
+/// backstop. `Debug` prints the length only; no `Display`, no serde (I-5, as
+/// [`FollowUpText`](crate::model::FollowUpText)).
+///
+/// A distinct type from [`MemoryBody`] (blueprint P-13), so the cap a text was built under is
+/// part of its type: a body-capped text does not type-check as a subject.
+///
+/// ```compile_fail,E0308
+/// use htui_core::model::{MemoryBody, MemoryPatch};
+///
+/// fn subject_from_a_body(body: MemoryBody) -> MemoryPatch {
+///     MemoryPatch { subject: Some(body), ..MemoryPatch::default() }
+/// }
+/// ```
+///
+/// ```compile_fail,E0308
+/// use htui_core::model::{MemoryBody, MemorySubject};
+///
+/// fn subject_from_a_body(body: MemoryBody) -> MemorySubject {
+///     body
+/// }
+/// ```
+///
+/// The same shape with a [`MemorySubject`] compiles:
+///
+/// ```
+/// use htui_core::model::{MemoryPatch, MemorySubject};
+///
+/// fn subject_from_a_subject(subject: MemorySubject) -> MemoryPatch {
+///     MemoryPatch { subject: Some(subject), ..MemoryPatch::default() }
+/// }
+/// ```
 #[derive(Clone, PartialEq, Eq)]
-pub struct MemoryText(String);
+pub struct MemorySubject(String);
 
-impl MemoryText {
+impl MemorySubject {
     /// A subject: [`MEMORY_SUBJECT_MAX`] characters after scrubbing.
     ///
     /// # Errors
@@ -212,16 +243,8 @@ impl MemoryText {
     /// [`MemoryTextError::Nul`] when the text holds a U+0000;
     /// [`MemoryTextError::Unmasked`] when `scrubber` leaves a credential-shaped leaf;
     /// [`MemoryTextError::TooLong`] `{ max: MEMORY_SUBJECT_MAX }` when the scrubbed text is longer.
-    pub fn subject(raw: &str, scrubber: &dyn Scrubber) -> Result<Self, MemoryTextError> {
-        Self::checked(raw, MEMORY_SUBJECT_MAX, scrubber)
-    }
-
-    /// A body: [`MEMORY_BODY_MAX`] characters after scrubbing.
-    ///
-    /// # Errors
-    /// As [`MemoryText::subject`], with `max: MEMORY_BODY_MAX`.
-    pub fn body(raw: &str, scrubber: &dyn Scrubber) -> Result<Self, MemoryTextError> {
-        Self::checked(raw, MEMORY_BODY_MAX, scrubber)
+    pub fn new(raw: &str, scrubber: &dyn Scrubber) -> Result<Self, MemoryTextError> {
+        checked(raw, MEMORY_SUBJECT_MAX, scrubber).map(Self)
     }
 
     /// The checked text.
@@ -235,45 +258,90 @@ impl MemoryText {
     pub fn into_string(self) -> String {
         self.0
     }
-
-    /// Trim, refuse empty, refuse a NUL, scrub (fail-closed), then cap the scrubbed text in
-    /// characters.
-    fn checked(raw: &str, max: usize, scrubber: &dyn Scrubber) -> Result<Self, MemoryTextError> {
-        let text = raw.trim();
-        if text.is_empty() {
-            return Err(MemoryTextError::Empty);
-        }
-        // Postgres `text` cannot hold U+0000 (`22021`): refused here so `MemStore` cannot keep
-        // what `PgStore` would fail as a backend error.
-        if text.contains('\0') {
-            return Err(MemoryTextError::Nul);
-        }
-        let mut value = Value::String(text.to_owned());
-        scrubber
-            .scrub(&mut value)
-            .map_err(MemoryTextError::Unmasked)?;
-        // A scrubber masks a string leaf in place; anything else is a scrubber fault, refused
-        // rather than panicked on (nothing in this crate panics on input).
-        let Value::String(scrubbed) = value else {
-            return Err(MemoryTextError::Unmasked(Unmasked {
-                path: String::new(),
-                rule: "type_changed",
-            }));
-        };
-        if scrubbed.chars().count() > max {
-            return Err(MemoryTextError::TooLong { max });
-        }
-        Ok(Self(scrubbed))
-    }
 }
 
-impl core::fmt::Debug for MemoryText {
-    /// `MemoryText { len: <bytes> }`, never the text.
+impl core::fmt::Debug for MemorySubject {
+    /// `MemorySubject { len: <bytes> }`, never the text.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("MemoryText")
+        f.debug_struct("MemorySubject")
             .field("len", &self.0.len())
             .finish()
     }
+}
+
+/// Plan D5 (`R-ID-7`): a body, checked as a [`MemorySubject`] is but capped at
+/// [`MEMORY_BODY_MAX`] characters after scrubbing. A distinct type (blueprint P-13): it never
+/// stands where a subject is expected. `Debug` prints the length only; no `Display`, no serde.
+///
+/// ```compile_fail,E0308
+/// use htui_core::model::{MemoryBody, MemorySubject};
+///
+/// fn body_from_a_subject(subject: MemorySubject) -> MemoryBody {
+///     subject
+/// }
+/// ```
+#[derive(Clone, PartialEq, Eq)]
+pub struct MemoryBody(String);
+
+impl MemoryBody {
+    /// A body: [`MEMORY_BODY_MAX`] characters after scrubbing.
+    ///
+    /// # Errors
+    /// As [`MemorySubject::new`], with `max: MEMORY_BODY_MAX`.
+    pub fn new(raw: &str, scrubber: &dyn Scrubber) -> Result<Self, MemoryTextError> {
+        checked(raw, MEMORY_BODY_MAX, scrubber).map(Self)
+    }
+
+    /// The checked text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The checked text, moved out.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl core::fmt::Debug for MemoryBody {
+    /// `MemoryBody { len: <bytes> }`, never the text.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MemoryBody")
+            .field("len", &self.0.len())
+            .finish()
+    }
+}
+
+/// The one path both text types are built through: trim, refuse empty, refuse a NUL, scrub
+/// (fail-closed), then cap the scrubbed text at `max` characters.
+fn checked(raw: &str, max: usize, scrubber: &dyn Scrubber) -> Result<String, MemoryTextError> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return Err(MemoryTextError::Empty);
+    }
+    // Postgres `text` cannot hold U+0000 (`22021`): refused here so `MemStore` cannot keep what
+    // `PgStore` would fail as a backend error.
+    if text.contains('\0') {
+        return Err(MemoryTextError::Nul);
+    }
+    let mut value = Value::String(text.to_owned());
+    scrubber
+        .scrub(&mut value)
+        .map_err(MemoryTextError::Unmasked)?;
+    // A scrubber masks a string leaf in place; anything else is a scrubber fault, refused rather
+    // than panicked on (nothing in this crate panics on input).
+    let Value::String(scrubbed) = value else {
+        return Err(MemoryTextError::Unmasked(Unmasked {
+            path: String::new(),
+            rule: "type_changed",
+        }));
+    };
+    if scrubbed.chars().count() > max {
+        return Err(MemoryTextError::TooLong { max });
+    }
+    Ok(scrubbed)
 }
 
 /// Why a text was not accepted (plan D5). Nothing reached a store.
@@ -310,16 +378,16 @@ mod tests {
     fn a_blank_text_is_empty() {
         for raw in ["", "   \n\t"] {
             assert_eq!(
-                MemoryText::subject(raw, &plain()),
+                MemorySubject::new(raw, &plain()),
                 Err(MemoryTextError::Empty)
             );
-            assert_eq!(MemoryText::body(raw, &plain()), Err(MemoryTextError::Empty));
+            assert_eq!(MemoryBody::new(raw, &plain()), Err(MemoryTextError::Empty));
         }
     }
 
     #[test]
     fn the_text_is_trimmed() {
-        let text = MemoryText::subject("  Build cache \n", &plain()).expect("a subject");
+        let text = MemorySubject::new("  Build cache \n", &plain()).expect("a subject");
         assert_eq!(text.as_str(), "Build cache");
         assert_eq!(text.into_string(), "Build cache");
     }
@@ -328,24 +396,22 @@ mod tests {
     fn one_character_over_the_cap_is_too_long() {
         let at = "a".repeat(MEMORY_SUBJECT_MAX);
         assert_eq!(
-            MemoryText::subject(&at, &plain())
+            MemorySubject::new(&at, &plain())
                 .expect("at the cap")
                 .as_str(),
             at
         );
         assert_eq!(
-            MemoryText::subject(&"a".repeat(121), &plain()),
+            MemorySubject::new(&"a".repeat(121), &plain()),
             Err(MemoryTextError::TooLong { max: 120 })
         );
         let at = "a".repeat(MEMORY_BODY_MAX);
         assert_eq!(
-            MemoryText::body(&at, &plain())
-                .expect("at the cap")
-                .as_str(),
+            MemoryBody::new(&at, &plain()).expect("at the cap").as_str(),
             at
         );
         assert_eq!(
-            MemoryText::body(&"a".repeat(2001), &plain()),
+            MemoryBody::new(&"a".repeat(2001), &plain()),
             Err(MemoryTextError::TooLong { max: 2000 })
         );
     }
@@ -354,9 +420,9 @@ mod tests {
     fn the_cap_counts_characters_not_bytes() {
         let at = "é".repeat(120);
         assert_eq!(at.len(), 240);
-        assert!(MemoryText::subject(&at, &plain()).is_ok());
+        assert!(MemorySubject::new(&at, &plain()).is_ok());
         assert_eq!(
-            MemoryText::subject(&"é".repeat(121), &plain()),
+            MemorySubject::new(&"é".repeat(121), &plain()),
             Err(MemoryTextError::TooLong { max: 120 })
         );
     }
@@ -364,7 +430,7 @@ mod tests {
     #[test]
     fn a_known_secret_is_masked() {
         let scrubber = MinimalScrubber::new(["hunter2-secret".to_owned()]);
-        let text = MemoryText::body("pass is hunter2-secret", &scrubber).expect("masked");
+        let text = MemoryBody::new("pass is hunter2-secret", &scrubber).expect("masked");
         assert_eq!(text.as_str(), "pass is [REDACTED]");
     }
 
@@ -375,16 +441,16 @@ mod tests {
         let scrubber = MinimalScrubber::new(["abcdef".to_owned()]);
         let raw = vec!["abcdef"; 17].join(" ");
         assert_eq!(raw.chars().count(), 118);
-        assert!(MemoryText::subject(&raw, &plain()).is_ok(), "fits unmasked");
+        assert!(MemorySubject::new(&raw, &plain()).is_ok(), "fits unmasked");
         assert_eq!(
-            MemoryText::subject(&raw, &scrubber),
+            MemorySubject::new(&raw, &scrubber),
             Err(MemoryTextError::TooLong { max: 120 })
         );
     }
 
     #[test]
     fn a_credential_shaped_text_is_refused_without_repeating_it() {
-        let err = MemoryText::body("key sk-ant-api03-do-not-print-me", &plain())
+        let err = MemoryBody::new("key sk-ant-api03-do-not-print-me", &plain())
             .expect_err("credential-shaped");
         let MemoryTextError::Unmasked(u) = &err else {
             panic!("expected Unmasked, got {err:?}");
@@ -402,12 +468,12 @@ mod tests {
     fn a_nul_is_refused() {
         for raw in ["build\0cache", "\0", " a\0b "] {
             assert_eq!(
-                MemoryText::subject(raw, &plain()),
+                MemorySubject::new(raw, &plain()),
                 Err(MemoryTextError::Nul),
                 "subject {raw:?}"
             );
             assert_eq!(
-                MemoryText::body(raw, &plain()),
+                MemoryBody::new(raw, &plain()),
                 Err(MemoryTextError::Nul),
                 "body {raw:?}"
             );
@@ -420,8 +486,25 @@ mod tests {
 
     #[test]
     fn debug_prints_the_length_only() {
-        let text = MemoryText::subject("Build cache", &plain()).expect("a subject");
-        assert_eq!(format!("{text:?}"), "MemoryText { len: 11 }");
+        let subject = MemorySubject::new("Build cache", &plain()).expect("a subject");
+        assert_eq!(format!("{subject:?}"), "MemorySubject { len: 11 }");
+        let body = MemoryBody::new("Clear target/.", &plain()).expect("a body");
+        assert_eq!(format!("{body:?}"), "MemoryBody { len: 14 }");
+    }
+
+    /// Blueprint P-13: a body-capped text is a [`MemoryBody`], which no subject field accepts, so
+    /// a 121..=2000-character subject cannot reach a store (the type split; the `compile_fail`
+    /// examples on [`MemorySubject`] pin the other direction).
+    #[test]
+    fn a_body_length_text_is_not_a_subject() {
+        let long = "a".repeat(MEMORY_SUBJECT_MAX + 1);
+        assert!(MemoryBody::new(&long, &plain()).is_ok(), "fits a body");
+        assert_eq!(
+            MemorySubject::new(&long, &plain()),
+            Err(MemoryTextError::TooLong {
+                max: MEMORY_SUBJECT_MAX
+            })
+        );
     }
 
     #[test]

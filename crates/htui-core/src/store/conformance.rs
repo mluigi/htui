@@ -22,8 +22,8 @@ use crate::model::{
     FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest,
     FollowUpSettle, FollowUpText, FollowUpView, Gate, GateOutcome, GraphSnapshot, Isolation, Item,
     ItemCitation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkKind,
-    MemoryEntry, MemoryEntryId, MemoryKind, MemoryPatch, MemoryRevision, MemoryState,
-    MemorySupersede, MemoryText, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem,
+    MemoryBody, MemoryEntry, MemoryEntryId, MemoryKind, MemoryPatch, MemoryRevision, MemoryState,
+    MemorySubject, MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem,
     NewItemKind, NewMemoryEntry, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo,
     NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
     NewStepGraph, NewWorkspace, Note, NoteId, OpenPermission, OverlapRule, PermissionChoice,
@@ -21357,8 +21357,8 @@ fn memory_new(case: &str, kind: MemoryKind, subject: &str, body: &str) -> NewMem
     NewMemoryEntry {
         id: MemoryEntryId::new(),
         kind,
-        subject: MemoryText::subject(subject, &scrubber).expect(case),
-        body: MemoryText::body(body, &scrubber).expect(case),
+        subject: MemorySubject::new(subject, &scrubber).expect(case),
+        body: MemoryBody::new(body, &scrubber).expect(case),
         created_by: ids::USER,
         box_id: Some(ids::BOX),
     }
@@ -21369,8 +21369,8 @@ fn memory_patch(case: &str, subject: Option<&str>, body: Option<&str>) -> Memory
     let scrubber = memory_scrubber();
     MemoryPatch {
         kind: None,
-        subject: subject.map(|text| MemoryText::subject(text, &scrubber).expect(case)),
-        body: body.map(|text| MemoryText::body(text, &scrubber).expect(case)),
+        subject: subject.map(|text| MemorySubject::new(text, &scrubber).expect(case)),
+        body: body.map(|text| MemoryBody::new(text, &scrubber).expect(case)),
         author_id: ids::USER,
         box_id: Some(ids::BOX),
     }

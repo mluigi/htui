@@ -141,9 +141,9 @@ pub use kind::{
 };
 pub use link::{ItemLink, LinkEdge, LinkGraph, LinkKind, LinkNode, UpstreamEntry};
 pub use memory::{
-    MEMORY_BODY_MAX, MEMORY_SUBJECT_MAX, MemoryEntry, MemoryKind, MemoryPatch, MemoryRevision,
-    MemoryState, MemorySupersede, MemoryText, MemoryTextError, MemoryUpdate, NewMemoryEntry,
-    memory_subject_key,
+    MEMORY_BODY_MAX, MEMORY_SUBJECT_MAX, MemoryBody, MemoryEntry, MemoryKind, MemoryPatch,
+    MemoryRevision, MemoryState, MemorySubject, MemorySupersede, MemoryTextError, MemoryUpdate,
+    NewMemoryEntry, memory_subject_key,
 };
 pub use note::{NewNote, Note};
 pub use overlap::{

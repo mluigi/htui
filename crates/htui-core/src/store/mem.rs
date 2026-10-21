@@ -31,10 +31,10 @@ use crate::model::{
     FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest,
     FollowUpSettle, FollowUpView, FollowUpWindow, GateOutcome, Item, ItemCitation, ItemFilter,
     ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRequirement,
-    ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, MemoryEntry, MemoryEntryId,
-    MemoryKind, MemoryPatch, MemoryRevision, MemoryState, MemorySupersede, MemoryText,
-    MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewMemoryEntry,
-    NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
+    ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, MemoryBody, MemoryEntry,
+    MemoryEntryId, MemoryKind, MemoryPatch, MemoryRevision, MemoryState, MemorySubject,
+    MemorySupersede, MemoryUpdate, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind,
+    NewMemoryEntry, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
     NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
     Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId,
     PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef,
@@ -7587,9 +7587,9 @@ struct ProjectReach {
 struct MemoryEdit {
     /// New `kind`, if any.
     kind: Option<MemoryKind>,
-    /// New `subject`, already checked as a [`MemoryText`].
+    /// New `subject`, already checked as a [`MemorySubject`].
     subject: Option<String>,
-    /// New `body`, already checked as a [`MemoryText`].
+    /// New `body`, already checked as a [`MemoryBody`].
     body: Option<String>,
     /// New `state`, if any.
     to: Option<MemoryState>,
@@ -7610,8 +7610,8 @@ impl MemoryEdit {
     fn amend(patch: MemoryPatch) -> Self {
         Self {
             kind: patch.kind,
-            subject: patch.subject.map(MemoryText::into_string),
-            body: patch.body.map(MemoryText::into_string),
+            subject: patch.subject.map(MemorySubject::into_string),
+            body: patch.body.map(MemoryBody::into_string),
             to: None,
             superseded_by: None,
             restamp: true,
@@ -12326,8 +12326,8 @@ mod tests {
         let memory = |subject: &str| crate::model::NewMemoryEntry {
             id: crate::model::MemoryEntryId::new(),
             kind: crate::model::MemoryKind::Fact,
-            subject: crate::model::MemoryText::subject(subject, &scrubber).expect("a subject"),
-            body: crate::model::MemoryText::body("Staged for the delete.", &scrubber)
+            subject: crate::model::MemorySubject::new(subject, &scrubber).expect("a subject"),
+            body: crate::model::MemoryBody::new("Staged for the delete.", &scrubber)
                 .expect("a body"),
             created_by: ids::USER,
             box_id: Some(ids::BOX),

@@ -21,11 +21,11 @@ use htui_core::model::{
     Agent, AgentBox, AgentId, AnswerOutcome, AnswerRefusal, Billing, BoxId, CancelRequest,
     ChatRunSpec, Claim, CommandRunId, CommandRunStatus, EventKind, EventRole,
     FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest, FollowUpSettle, FollowUpText,
-    GraphSnapshot, Isolation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch,
-    MemoryEntryId, MemoryKind, MemoryPatch, MemoryState, MemorySupersede, MemoryText, MemoryUpdate,
-    NewCommandRun, NewFollowUp, NewItem, NewMemoryEntry, NewProject, NewRepo, NewRequirement,
-    NewRun, NewWorkspace, OpenPermission, PermissionId, PermissionStatus, Priority, ProjectId,
-    QueuedFollowUp, RelayOption, RelayOptionKind, RelaySessionId, RepoId, RequirementId,
+    GraphSnapshot, Isolation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch, MemoryBody,
+    MemoryEntryId, MemoryKind, MemoryPatch, MemoryState, MemorySubject, MemorySupersede,
+    MemoryUpdate, NewCommandRun, NewFollowUp, NewItem, NewMemoryEntry, NewProject, NewRepo,
+    NewRequirement, NewRun, NewWorkspace, OpenPermission, PermissionId, PermissionStatus, Priority,
+    ProjectId, QueuedFollowUp, RelayOption, RelayOptionKind, RelaySessionId, RepoId, RequirementId,
     RunCommandId, RunCommandStatus, RunId, RunMode, RunStatus, RunStepCommit, RunStepTree,
     SessionEvent, SettleOutcome, SnapshotGraph, SnapshotSettings, Status, StepId, StepOutcome,
     TIMESTAMPTZ_DIGITS, Transport, UserId, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
@@ -3189,8 +3189,8 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
             NewMemoryEntry {
                 id: MemoryEntryId::new(),
                 kind: MemoryKind::Fact,
-                subject: MemoryText::subject("Cascade", &scrubber).expect("subject"),
-                body: MemoryText::body("A project delete takes its memory.", &scrubber)
+                subject: MemorySubject::new("Cascade", &scrubber).expect("subject"),
+                body: MemoryBody::new("A project delete takes its memory.", &scrubber)
                     .expect("body"),
                 created_by: ids::USER,
                 box_id: None,
@@ -3366,9 +3366,14 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
     db.drop_db().await;
 }
 
-/// A [`MemoryText`] subject or body for the MOD-163 cases; the fixtures hold no secret.
-fn memory_text(raw: &str) -> MemoryText {
-    MemoryText::body(raw, &MinimalScrubber::new([])).expect("plain memory text")
+/// A [`MemorySubject`] for the MOD-163 cases; the fixtures hold no secret.
+fn memory_subject(raw: &str) -> MemorySubject {
+    MemorySubject::new(raw, &MinimalScrubber::new([])).expect("plain memory subject")
+}
+
+/// A [`MemoryBody`] for the MOD-163 cases; the fixtures hold no secret.
+fn memory_body(raw: &str) -> MemoryBody {
+    MemoryBody::new(raw, &MinimalScrubber::new([])).expect("plain memory body")
 }
 
 /// A [`NewMemoryEntry`] by [`ids::USER`] with no box, for the MOD-163 cases.
@@ -3376,8 +3381,8 @@ fn new_memory(subject: &str) -> NewMemoryEntry {
     NewMemoryEntry {
         id: MemoryEntryId::new(),
         kind: MemoryKind::Fact,
-        subject: memory_text(subject),
-        body: memory_text("body"),
+        subject: memory_subject(subject),
+        body: memory_body("body"),
         created_by: ids::USER,
         box_id: None,
     }
@@ -3457,7 +3462,7 @@ async fn pg_memory_refusals_name_the_live_holder() {
             bar.id,
             1,
             MemoryPatch {
-                subject: Some(memory_text("foo")),
+                subject: Some(memory_subject("foo")),
                 author_id: ids::USER,
                 ..MemoryPatch::default()
             },
@@ -3511,7 +3516,7 @@ async fn pg_memory_refusals_name_the_live_holder() {
             1,
             MemoryPatch {
                 kind: Some(MemoryKind::Gotcha),
-                subject: Some(memory_text("foo")),
+                subject: Some(memory_subject("foo")),
                 author_id: ids::USER,
                 box_id: Some(ids::BOX),
                 ..MemoryPatch::default()

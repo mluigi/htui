@@ -2245,8 +2245,8 @@ pub trait WriteStore: ReadStore {
 
     /// Inserts a live (`active`) entry at version 1 in `project` with `confirmed_at` = now, and
     /// its revision 1 (`reason = "created"`, `author_id = new.created_by`, `box_id = new.box_id`),
-    /// in one statement. The text arrives as [`MemoryText`](crate::model::MemoryText), already
-    /// trimmed, scrubbed and capped (`R-ID-7`). Checked in the order NotFound, Constraint.
+    /// in one statement. The text arrives as [`MemorySubject`](crate::model::MemorySubject) and
+    /// [`MemoryBody`](crate::model::MemoryBody), already trimmed, scrubbed and capped (`R-ID-7`). Checked in the order NotFound, Constraint.
     ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "project" }` for an
