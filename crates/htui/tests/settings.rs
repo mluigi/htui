@@ -1078,6 +1078,50 @@ async fn a_bracketed_paste_under_a_modal_overlay_reaches_no_field() {
     );
 }
 
+/// The Settings pane's bottom border in `frame`: the last row that opens with its rounded
+/// corner.
+fn settings_bottom_border(frame: &str) -> &str {
+    frame
+        .lines()
+        .rfind(|line| line.starts_with('\u{2570}'))
+        .expect("the Settings pane has a bottom border")
+}
+
+/// MOD-115 M3 T3 (repair 1): an overlay holds the keys, so the Settings pane under it draws
+/// unfocused and its bottom border carries no section hint, as the M2 shell blanked the hint row
+/// under an overlay (MOD-67 M6 T2). Closing it brings the hints back.
+#[tokio::test]
+async fn under_an_overlay_the_settings_pane_carries_no_section_hint() {
+    let mut harness = Harness::demo().with_tab(Box::new(SettingsTab::with_sections(vec![
+        Box::new(AgentsSection::new()),
+        Box::new(ProbeSection),
+    ])));
+    harness.settle().await;
+    let frame = harness.render();
+    let hinted = settings_bottom_border(&frame).to_owned();
+    assert!(hinted.contains("j/k"), "the section's hints: {frame}");
+
+    harness
+        .app()
+        .push_overlay(Box::new(htui::ui::overlay::WorkspaceSwitcher::new()));
+    harness.settle().await;
+    let frame = harness.render();
+    let bottom = settings_bottom_border(&frame);
+    assert!(
+        bottom
+            .trim_start_matches('\u{2570}')
+            .trim_end_matches('\u{256f}')
+            .chars()
+            .all(|c| c == '\u{2500}'),
+        "a bare rule under the overlay: {frame}"
+    );
+
+    harness.key("esc");
+    harness.settle().await;
+    let frame = harness.render();
+    assert_eq!(settings_bottom_border(&frame), hinted, "{frame}");
+}
+
 /// The strip has to fit the frame it is drawn in (D4; PRD risk "strip overflow at 100 columns").
 ///
 /// `render_strip` draws `format!(" {title} ")` per registered section, so the joined width is

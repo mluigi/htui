@@ -118,6 +118,10 @@ pub struct Ctx<'a> {
     /// MOD-115 M2 RV1 M: the key the shell is dispatching, as delivered after the `[field]`
     /// translation, and the chord the user pressed for it; `None` at every other site.
     pressed: Option<(KeyEvent, KeyChord)>,
+    /// MOD-115 M3 D1 (T3 repair 1): whether an overlay or the in-pane editor covers the tab and
+    /// holds its keys, so [`Ctx::pane_focus`] focuses no pane; `false` at every site but the
+    /// active tab's render.
+    covered: bool,
 }
 
 /// What a list + detail tab claimed in one frame (MOD-115 M2 B5): the region it split and the
@@ -213,6 +217,7 @@ impl<'a> Ctx<'a> {
             layout: None,
             claim: None,
             pressed: None,
+            covered: false,
         }
     }
 
@@ -298,11 +303,22 @@ impl<'a> Ctx<'a> {
         self.focus.unwrap_or(PaneId::List)
     }
 
+    /// This context with whether an overlay or the in-pane editor covers the tab (MOD-115 M3
+    /// D1, T3 repair 1). Only `App::render` calls it, for the active tab's render.
+    #[must_use]
+    pub(crate) const fn with_covered(mut self, covered: bool) -> Self {
+        self.covered = covered;
+        self
+    }
+
     /// MOD-115 M3 D1: how `pane` is drawn as a kit pane: focused when it is the shell's focused
-    /// pane ([`focus`](Self::focus), so [`PaneId::List`] on a bench, M2 B7).
+    /// pane ([`focus`](Self::focus), so [`PaneId::List`] on a bench, M2 B7) and nothing covers
+    /// the tab. Under an overlay or the in-pane editor, which hold the keys, no pane is focused,
+    /// so a kit pane draws no hints there (the M2 adapter's `overlays.is_empty()` and
+    /// `!editor_visible()` rule, MOD-67 M6 T2).
     #[must_use]
     pub fn pane_focus(&self, pane: PaneId) -> Focus {
-        if self.focus() == pane {
+        if !self.covered && self.focus() == pane {
             Focus::Focused
         } else {
             Focus::Unfocused
@@ -1596,7 +1612,8 @@ impl App {
                 let ctx = self
                     .tab_ctx(tab)
                     .with_editor_area(&self.editor_area)
-                    .with_pane_claim(&self.pane_claim);
+                    .with_pane_claim(&self.pane_claim)
+                    .with_covered(!self.overlays.is_empty() || self.editor_visible());
                 tab.render(frame, chrome.body, &ctx);
             }
             None => {
@@ -2593,6 +2610,33 @@ pub(crate) mod shell_tests {
         app.focus.insert(SPLIT, PaneId::Detail);
         let buf = draw(&mut app, 100, 30);
         assert!(rows_with(&buf, "j/k move").is_empty());
+    }
+
+    /// M3 D1 (T3 repair 1): an overlay holds the keys, so a chrome tab under it is handed no
+    /// focused pane (and a kit pane draws no hints unfocused), as the M2 adapter painted no hint
+    /// under one; closing it gives the focus back.
+    #[test]
+    fn under_an_overlay_a_chrome_tab_draws_no_focused_pane() {
+        use crate::ui::overlay::WorkspaceSwitcher;
+
+        let theme = Theme::default();
+        let mut app = chrome_app();
+        let _ = draw(&mut app, 100, 30);
+        let (_, areas) = claim(&app);
+        let list = areas.list.expect("the list is shown");
+        let red = SENTINEL.fg.unwrap_or_default();
+        let faint = theme.border_faint.fg.unwrap_or_default();
+        app.push_overlay(Box::new(WorkspaceSwitcher::new()));
+        let buf = draw(&mut app, 100, 30);
+        assert_eq!(
+            buf[(list.x, list.y)].fg,
+            faint,
+            "unfocused under the overlay"
+        );
+        assert_eq!(buf[(areas.detail.x, areas.detail.y)].fg, faint);
+        app.overlays.clear();
+        let buf = draw(&mut app, 100, 30);
+        assert_eq!(buf[(list.x, list.y)].fg, red, "focused again");
     }
 
     /// M3 D1: the hidden-pane note stays the shell's, on the kit pane's rounded bottom border.
