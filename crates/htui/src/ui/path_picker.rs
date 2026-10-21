@@ -7,7 +7,12 @@
 //! `R-BOX-4`): the one canonicalisation is the write the section sends on [`PickerOutcome::Chosen`].
 //!
 //! Its keys resolve through the owner's stack (`views::HIERARCHY_PICKER` for Settings ›
-//! Hierarchy, MOD-67 M6); the go-to field's keys are the field's.
+//! Hierarchy, MOD-67 M6), from the chord the user pressed (MOD-115 M3 MD-A); the go-to field's
+//! keys are the field's.
+//!
+//! It draws through the kit (MOD-115 M3): a `kit::modal` box, the entries a `kit::list` (the
+//! cursor is the list's gutter and band, MOD-85), the path header in the title role and the go-to
+//! field a one-row `kit::form`.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -15,20 +20,20 @@ use crossterm::event::KeyEvent;
 use htui_core::root_path::DirListing;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::text::Line;
+use ratatui::widgets::Paragraph;
 
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack};
 use crate::store_worker::{LIST_DIR, StoreReply, StoreRequest};
 use crate::ui::cells::{cell_width, graphemes};
-use crate::ui::layout::centered;
+use crate::ui::kit::form::{Field, Form, Value};
+use crate::ui::kit::list::{self, RowKind};
+use crate::ui::kit::modal::{Modal, ModalSize};
 use crate::ui::{FieldOutcome, TextField, Theme};
 
-/// Marker in front of the highlighted entry, visible in a snapshot (the workspace switcher's).
-const CURSOR: &str = "> ";
-
-/// The marker's width, in front of every other line, so names stay in one column.
-const NO_CURSOR: &str = "  ";
+/// The list's gutter width, in front of every line that is not an entry, so the texts stay in the
+/// entries' column (the cursor is the gutter's `▌`, MOD-115 M3).
+const INDENT: &str = " ";
 
 /// The first half of the hint under the entries: the keys that move and choose (MOD-49 P8;
 /// MOD-67 M6 D3), through the owner's stack: `j/k move · Enter open · h up · s choose · S this
@@ -53,8 +58,8 @@ const HINT_MORE: HintSpec = &[
 /// Between the two halves when they share a line.
 const HINT_GAP: &str = " \u{b7} ";
 
-/// The label in front of the go-to field (P6).
-const GOTO: &str = "go to: ";
+/// The go-to field's label (P6), its one-row form's.
+const GOTO: &str = "go to";
 
 /// The widest the popup gets (blueprint D14): a listing can't be sized to its content.
 const MAX_WIDTH: u16 = 96;
@@ -143,12 +148,14 @@ impl PathPicker {
 
     /// One key (MOD-49 P8, blueprint D11, D12, D15; MOD-67 M6 D3). While go-to is open the field
     /// takes it (its keys are the widget's, ANA-26 §6.1) and the answer is always `Some`.
-    /// Otherwise the chord resolves through `stack` (the owner's picker stack) and the first act
-    /// the picker takes wins; a chord equal to no picker act is `None`, for the owner's modal rest
-    /// (`q`, `?`, the digits are swallowed there, `F1` and `ctrl-c` pass).
+    /// Otherwise `pressed`, the chord the user pressed (the owner's `Ctx::pressed`, MOD-115 M3
+    /// MD-A), resolves through `stack` (the owner's picker stack) and the first act the picker
+    /// takes wins; a chord equal to no picker act is `None`, for the owner's modal rest (`q`, `?`,
+    /// the digits are swallowed there, `F1` and `ctrl-c` pass).
     pub fn on_key(
         &mut self,
         key: KeyEvent,
+        pressed: KeyChord,
         keys: &Keys,
         stack: Stack<'_>,
     ) -> Option<PickerOutcome> {
@@ -170,8 +177,7 @@ impl PathPicker {
                 FieldOutcome::Consumed | FieldOutcome::Pass => PickerOutcome::Stay,
             });
         }
-        let chord = KeyChord::from_event(key);
-        keys.actions(stack, chord)
+        keys.actions(stack, pressed)
             .into_iter()
             .find_map(|act| self.on_act(act))
     }
@@ -278,9 +284,11 @@ impl PathPicker {
         }
     }
 
-    /// The popup, centred over `area` (blueprint D14): a fixed box, because a listing of up to
-    /// `LIST_CAP` entries can't be sized to its content. Its hint is rendered through `stack`
-    /// with `keys` (MOD-67 M6), so a rebound picker key shows its new chord.
+    /// The popup, centred over `area` (blueprint D14): the kit's modal at a fixed size, because a
+    /// listing of up to `LIST_CAP` entries can't be sized to its content. Inside it the path header,
+    /// the entries (a `kit::list`), then the footer: go-to while open, a blank line and the hint.
+    /// Its hint is rendered through `stack` with `keys` (MOD-67 M6), so a rebound picker key shows
+    /// its new chord.
     pub fn render(
         &self,
         frame: &mut Frame<'_>,
@@ -291,27 +299,41 @@ impl PathPicker {
     ) {
         let hints = (keys.hint(stack, HINT_MOVE), keys.hint(stack, HINT_MORE));
         let hidden = keys.label(stack, Act::PickerHidden);
-        let box_area = centered(
-            area,
-            area.width.saturating_sub(4).min(MAX_WIDTH),
-            area.height.saturating_sub(2),
-        );
-        let lines = self.lines(
-            box_area.width.saturating_sub(2),
-            usize::from(box_area.height.saturating_sub(2)),
-            theme,
-            (&hints.0, &hints.1),
-            hidden.as_deref(),
-        );
-        frame.render_widget(Clear, box_area);
+        let content = Modal::new(&self.title)
+            .size(ModalSize::Fixed {
+                w: area.width.saturating_sub(4).min(MAX_WIDTH),
+                h: area.height.saturating_sub(2),
+            })
+            .render(frame, area, theme);
+        if content.width == 0 || content.height == 0 {
+            return;
+        }
+        let footer = self.footer(content.width, theme, (&hints.0, &hints.1));
         frame.render_widget(
-            Paragraph::new(Text::from(lines)).block(
-                Block::new()
-                    .borders(Borders::ALL)
-                    .title(Span::styled(format!(" {} ", self.title), theme.title)),
-            ),
-            box_area,
+            Paragraph::new(Line::styled(
+                clip_left(&self.path, usize::from(content.width)),
+                theme.title,
+            )),
+            Rect {
+                height: 1,
+                ..content
+            },
         );
+        let room = usize::from(content.height).saturating_sub(1 + footer.len());
+        let (rows, selected) = self.body(content.width, room, theme, hidden.as_deref());
+        let body = Rect {
+            y: content.y + 1,
+            height: u16::try_from(rows.len().min(room)).unwrap_or(u16::MAX),
+            ..content
+        };
+        // The modal's own accent marks the cursor, as its border does.
+        list::render(frame, body, &rows, selected, 0, theme.accent, theme);
+        let below = Rect {
+            y: body.bottom(),
+            height: content.bottom().saturating_sub(body.bottom()),
+            ..content
+        };
+        frame.render_widget(Paragraph::new(footer), below);
     }
 
     /// `ask(p)`: remember `p` as the newest path asked for (P9) and build its request. `.` and
@@ -341,107 +363,95 @@ impl PathPicker {
         Some(child(&self.path, &entry.name))
     }
 
-    /// The box's contents for an inner area of `width` × `height`: the header, the entries
-    /// window (or one of the three empty texts), go-to while open, a blank line and the hint's two
-    /// rendered halves (`hints`; an empty one dropped). `hidden` is the label of
-    /// `picker.hidden`, for the empty listing's text.
-    fn lines(
-        &self,
-        width: u16,
-        height: usize,
-        theme: &Theme,
-        hints: (&str, &str),
-        hidden: Option<&str>,
-    ) -> Vec<Line<'static>> {
+    /// The footer for a content `width` wide: go-to while open (a one-row kit form, its marker in
+    /// the modal's accent), a blank line and the hint's two rendered halves (`hints`; an empty one
+    /// dropped). The two halves share one line when it fits and take one line each when it
+    /// doesn't (review L-2).
+    fn footer(&self, width: u16, theme: &Theme, hints: (&str, &str)) -> Vec<Line<'static>> {
         let mut footer = Vec::new();
         if let Some(field) = &self.goto {
-            let room = width.saturating_sub(u16::try_from(cell_width(GOTO)).unwrap_or(u16::MAX));
-            let mut spans = vec![Span::styled(GOTO, theme.base)];
-            spans.extend(field.line(room, true, theme).spans);
-            footer.push(Line::from(spans));
+            footer.extend(
+                Form::new()
+                    .field(Field::new(GOTO, Value::Text(field)))
+                    .focus(0)
+                    .editing(true)
+                    .lines(width, theme.accent, theme),
+            );
         }
         footer.push(Line::raw(""));
         let (first, second) = hints;
-        let one_line = format!("{NO_CURSOR}{first}{HINT_GAP}{second}");
+        let one_line = format!("{INDENT}{first}{HINT_GAP}{second}");
         if !first.is_empty() && !second.is_empty() && cell_width(&one_line) <= usize::from(width) {
             footer.push(Line::styled(one_line, theme.dim));
         } else {
             for half in [first, second].into_iter().filter(|half| !half.is_empty()) {
-                footer.push(Line::styled(format!("{NO_CURSOR}{half}"), theme.dim));
+                footer.push(Line::styled(format!("{INDENT}{half}"), theme.dim));
             }
         }
-
-        let rows = height.saturating_sub(1 + footer.len());
-        let mut lines = vec![Line::styled(
-            clip_left(&self.path, usize::from(width)),
-            theme.accent,
-        )];
-        lines.extend(self.body(width, rows, theme, hidden));
-        lines.extend(footer);
-        lines
+        footer
     }
 
-    /// The entries in a window of `rows` lines that always holds the cursor, then `+N more`; or
-    /// the error, "reading…", or the empty text — three different screens (the switcher's rule).
-    /// The error is wrapped to `width` (review L-2): it names a path, and a long one would push
-    /// the reason off the edge. The empty text names `hidden`, the label of `picker.hidden`, and
-    /// no key when it is unbound (MOD-67 M6 D4).
+    /// The body's list rows in a window of `rows` lines that always holds the cursor, then `+N
+    /// more`, with the cursor's index among them; or the error, "reading…", or the empty text as
+    /// note rows — three different screens (the switcher's rule). The error is wrapped to the
+    /// list's content width (review L-2): it names a path, and a long one would push the reason
+    /// off the edge. The empty text names `hidden`, the label of `picker.hidden`, and no key when
+    /// it is unbound (MOD-67 M6 D4).
     fn body(
         &self,
         width: u16,
         rows: usize,
         theme: &Theme,
         hidden: Option<&str>,
-    ) -> Vec<Line<'static>> {
+    ) -> (Vec<list::Row<'static>>, Option<usize>) {
+        let note = |text: String, style| list::Row {
+            line: Line::styled(text, style),
+            kind: RowKind::Note,
+        };
         if let Some(error) = &self.error {
-            let room = usize::from(width).saturating_sub(cell_width(NO_CURSOR));
-            return wrap(error, room)
+            // The gutter's cell is the list's own.
+            let room = usize::from(width).saturating_sub(cell_width(INDENT));
+            let notes = wrap(error, room)
                 .into_iter()
-                .map(|line| Line::styled(format!("{NO_CURSOR}{line}"), theme.error))
+                .map(|line| note(line, theme.error))
                 .collect();
+            return (notes, None);
         }
         let Some(listing) = &self.listing else {
-            return vec![Line::styled(
-                format!("{NO_CURSOR}reading\u{2026}"),
-                theme.dim,
-            )];
+            return (vec![note("reading\u{2026}".to_owned(), theme.dim)], None);
         };
         if listing.entries.is_empty() {
             let hidden = match hidden {
                 Some(label) if !self.show_hidden => format!(" \u{b7} {label} shows hidden"),
                 _ => String::new(),
             };
-            return vec![Line::styled(
-                format!("{NO_CURSOR}no directories here{hidden}"),
-                theme.dim,
-            )];
+            return (
+                vec![note(format!("no directories here{hidden}"), theme.dim)],
+                None,
+            );
         }
         let window = rows.saturating_sub(usize::from(listing.more > 0)).max(1);
         // Stateless scroll: the window ends on the cursor once it passes the bottom, so `render`
         // stays `&self` and the cursor is always on screen.
         let offset = self.cursor.saturating_sub(window - 1);
-        let mut lines: Vec<Line<'static>> = listing
+        let mut lines: Vec<list::Row<'static>> = listing
             .entries
             .iter()
-            .enumerate()
             .skip(offset)
             .take(window)
-            .map(|(index, entry)| {
-                let selected = index == self.cursor;
-                let marker = if selected { CURSOR } else { NO_CURSOR };
+            .map(|entry| {
                 // `ls -F` marks: a link is `@` and never shows where it points (`R-BOX-4`).
                 let kind = if entry.is_link { '@' } else { '/' };
-                let style = if selected { theme.accent } else { theme.base };
-                Line::styled(format!("{marker}{}{kind}", entry.name), style)
+                list::Row {
+                    line: Line::styled(format!("{}{kind}", entry.name), theme.base),
+                    kind: RowKind::Item,
+                }
             })
             .collect();
         if listing.more > 0 {
-            lines.push(Line::styled(
-                format!("{NO_CURSOR}+{} more", listing.more),
-                theme.dim,
-            ));
+            lines.push(note(format!("+{} more", listing.more), theme.dim));
         }
-        lines
+        (lines, Some(self.cursor - offset))
     }
 }
 
@@ -560,7 +570,7 @@ fn clip_left(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{PathPicker, PickerOutcome, start_dir};
-    use crate::keys::{Keys, load_str, views};
+    use crate::keys::{KeyChord, Keys, load_str, views};
     use crate::store_worker::{LIST_DIR, StoreReply, StoreRequest};
     use crate::ui::Theme;
     use crate::ui::cells::cell_width;
@@ -568,6 +578,7 @@ mod tests {
     use htui_core::root_path::{DirEntry, DirListing};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Modifier;
 
     /// A key with no modifiers.
     fn key(code: KeyCode) -> KeyEvent {
@@ -588,7 +599,12 @@ mod tests {
     /// key no picker act takes read as swallowed (`Stay`), as Hierarchy's modal rest does.
     fn press(picker: &mut PathPicker, key: KeyEvent) -> PickerOutcome {
         picker
-            .on_key(key, Keys::compiled(), views::HIERARCHY_PICKER)
+            .on_key(
+                key,
+                KeyChord::from_event(key),
+                Keys::compiled(),
+                views::HIERARCHY_PICKER,
+            )
             .unwrap_or(PickerOutcome::Stay)
     }
 
@@ -635,6 +651,14 @@ mod tests {
     /// Whether an outcome is `Stay`.
     fn stays(outcome: &PickerOutcome) -> bool {
         matches!(outcome, PickerOutcome::Stay)
+    }
+
+    /// The go-to field's value on a rendered frame (MOD-115 M3: a one-row `kit::form`, the marker
+    /// then `go to` and the field), or `None` while go-to is closed.
+    fn goto_value(frame: &str) -> Option<String> {
+        let line = frame.lines().find(|line| line.contains("\u{258c}go to"))?;
+        let (_, rest) = line.split_once("\u{258c}go to")?;
+        Some(rest.trim_end_matches('\u{2502}').trim().to_owned())
     }
 
     /// A picker opened on `/srv` with `htui/`, `notes/` and `shared@` listed.
@@ -852,7 +876,7 @@ mod tests {
     fn slash_opens_go_to_and_enter_lists_what_was_typed() {
         let mut picker = at_srv();
         assert!(stays(&press(&mut picker, ch('/'))));
-        assert!(render(&picker).contains("go to: /"));
+        assert_eq!(goto_value(&render(&picker)).as_deref(), Some("/"));
         for c in "srv/htui".chars() {
             // Bound letters type into go-to instead of acting (`h`, `s`, `j` among them).
             assert!(stays(&press(&mut picker, ch(c))));
@@ -861,7 +885,7 @@ mod tests {
             asked(press(&mut picker, key(KeyCode::Enter))),
             ("/srv/htui".to_owned(), false)
         );
-        assert!(!render(&picker).contains("go to:"), "a submit closes go-to");
+        assert_eq!(goto_value(&render(&picker)), None, "a submit closes go-to");
     }
 
     #[test]
@@ -900,7 +924,7 @@ mod tests {
         let mut picker = at_srv();
         press(&mut picker, ch('/'));
         assert!(stays(&press(&mut picker, key(KeyCode::Esc))));
-        assert!(!render(&picker).contains("go to:"));
+        assert_eq!(goto_value(&render(&picker)), None);
         assert!(matches!(
             press(&mut picker, key(KeyCode::Esc)),
             PickerOutcome::Cancelled
@@ -950,7 +974,7 @@ mod tests {
         press(&mut picker, ch('/'));
         press(&mut picker, key(KeyCode::Backspace));
         assert!(stays(&press(&mut picker, key(KeyCode::Enter))));
-        assert!(!render(&picker).contains("go to:"));
+        assert_eq!(goto_value(&render(&picker)), None);
     }
 
     /// Blueprint D1: `.` re-asks the worker, which filters before the cap.
@@ -1043,7 +1067,12 @@ mod tests {
         for c in ['q', '?', '1'] {
             assert!(
                 picker
-                    .on_key(ch(c), Keys::compiled(), views::HIERARCHY_PICKER)
+                    .on_key(
+                        ch(c),
+                        KeyChord::from_event(ch(c)),
+                        Keys::compiled(),
+                        views::HIERARCHY_PICKER,
+                    )
                     .is_none(),
                 "{c}"
             );
@@ -1064,7 +1093,12 @@ mod tests {
         ] {
             assert!(
                 picker
-                    .on_key(key, Keys::compiled(), views::HIERARCHY_PICKER)
+                    .on_key(
+                        key,
+                        KeyChord::from_event(key),
+                        Keys::compiled(),
+                        views::HIERARCHY_PICKER,
+                    )
                     .is_none(),
                 "{key:?}"
             );
@@ -1083,7 +1117,12 @@ mod tests {
     fn a_rebound_open_key_opens_and_enter_is_inert() {
         let keys = picker_keys("open = \"o\"\n");
         let mut picker = at_srv();
-        let opened = picker.on_key(ch('o'), &keys, views::HIERARCHY_PICKER);
+        let opened = picker.on_key(
+            ch('o'),
+            KeyChord::from_event(ch('o')),
+            &keys,
+            views::HIERARCHY_PICKER,
+        );
         assert_eq!(
             asked(opened.expect("`o` is the picker's")),
             ("/srv/htui".to_owned(), false)
@@ -1092,7 +1131,12 @@ mod tests {
         let mut picker = at_srv();
         assert!(
             picker
-                .on_key(key(KeyCode::Enter), &keys, views::HIERARCHY_PICKER)
+                .on_key(
+                    key(KeyCode::Enter),
+                    KeyChord::from_event(key(KeyCode::Enter)),
+                    &keys,
+                    views::HIERARCHY_PICKER,
+                )
                 .is_none()
         );
         let frame = render_with(&picker, &keys, 100, 30);
@@ -1109,20 +1153,31 @@ mod tests {
         let mut picker = at_srv();
         assert!(stays(&press(&mut picker, ch('/'))));
         for key in [ch('q'), ch('j'), chord('a', KeyModifiers::CONTROL)] {
-            let outcome = picker.on_key(key, Keys::compiled(), views::HIERARCHY_PICKER);
+            let outcome = picker.on_key(
+                key,
+                KeyChord::from_event(key),
+                Keys::compiled(),
+                views::HIERARCHY_PICKER,
+            );
             assert!(
                 matches!(outcome, Some(PickerOutcome::Stay)),
                 "{key:?}: {outcome:?}"
             );
         }
-        assert!(
-            render(&picker).contains("go to: /qj"),
+        assert_eq!(
+            goto_value(&render(&picker)).as_deref(),
+            Some("/qj"),
             "{}",
             render(&picker)
         );
-        let closed = picker.on_key(key(KeyCode::Esc), Keys::compiled(), views::HIERARCHY_PICKER);
+        let closed = picker.on_key(
+            key(KeyCode::Esc),
+            KeyChord::from_event(key(KeyCode::Esc)),
+            Keys::compiled(),
+            views::HIERARCHY_PICKER,
+        );
         assert!(matches!(closed, Some(PickerOutcome::Stay)), "{closed:?}");
-        assert!(!render(&picker).contains("go to:"));
+        assert_eq!(goto_value(&render(&picker)), None);
         assert_eq!(
             picker.path(),
             "/srv",
@@ -1183,9 +1238,9 @@ mod tests {
         let frame = render(&picker);
         assert!(frame.contains("Root of `graphics` on this box"), "{frame}");
         assert!(frame.contains("/srv"), "{frame}");
-        assert!(frame.contains("> htui/"), "{frame}");
-        assert!(frame.contains("  notes/"), "{frame}");
-        assert!(frame.contains("  shared@"), "{frame}");
+        assert!(frame.contains("\u{258c}htui/"), "{frame}");
+        assert!(frame.contains("\u{2502} notes/"), "{frame}");
+        assert!(frame.contains("\u{2502} shared@"), "{frame}");
         assert!(frame.contains("+3 more"), "{frame}");
         assert!(frame.contains("j/k move"), "{frame}");
         assert!(frame.contains("Esc cancel"), "{frame}");
@@ -1202,7 +1257,7 @@ mod tests {
             press(&mut picker, ch('j'));
         }
         let frame = render(&picker);
-        assert!(frame.contains("> d50/"), "{frame}");
+        assert!(frame.contains("\u{258c}d50/"), "{frame}");
         assert!(!frame.contains("d00/"), "{frame}");
     }
 
@@ -1228,5 +1283,68 @@ mod tests {
         let refused = render(&picker);
         assert!(refused.contains("cannot be read on this box"), "{refused}");
         assert!(!refused.contains("no directories here"), "{refused}");
+    }
+
+    /// MOD-115 M3 MD-A: the picker's acts resolve from the chord the user pressed, which the owner
+    /// hands it ([`crate::app::Ctx::pressed`]), not from the delivered event: a `[field]` row's
+    /// chord the shell translated to a canonical key moves nothing it was not bound to.
+    #[test]
+    fn the_acts_resolve_from_the_pressed_chord() {
+        let mut picker = at_srv();
+        let moved = picker.on_key(
+            key(KeyCode::Down),
+            KeyChord::from_event(ch('j')),
+            Keys::compiled(),
+            views::HIERARCHY_PICKER,
+        );
+        assert!(matches!(moved, Some(PickerOutcome::Stay)), "{moved:?}");
+        assert_eq!(
+            chosen(press(&mut picker, ch('s'))),
+            "/srv/notes",
+            "`j` moved"
+        );
+
+        let mut picker = at_srv();
+        let inert = picker.on_key(
+            key(KeyCode::Down),
+            KeyChord::from_event(chord('b', KeyModifiers::CONTROL)),
+            Keys::compiled(),
+            views::HIERARCHY_PICKER,
+        );
+        assert!(inert.is_none(), "`ctrl-b` is no picker key: {inert:?}");
+        assert_eq!(chosen(press(&mut picker, ch('s'))), "/srv/htui");
+    }
+
+    /// MOD-115 M3, MOD-85: the popup is the kit's modal, rounded and titled, and its cursor is the
+    /// list's gutter and band; the path header is in the title role, never the accent.
+    #[test]
+    fn the_popup_is_a_kit_modal_with_the_cursor_in_the_band() {
+        let picker = at_srv();
+        let theme = Theme::default();
+        let mut term = Terminal::new(TestBackend::new(60, 12)).expect("a test backend");
+        term.draw(|frame| {
+            picker.render(
+                frame,
+                frame.area(),
+                &theme,
+                Keys::compiled(),
+                views::HIERARCHY_PICKER,
+            );
+        })
+        .expect("the picker draws");
+        let buffer = term.backend().buffer();
+        let row = |y: u16| -> String { (0..60).map(|x| buffer[(x, y)].symbol()).collect() };
+        assert!(row(1).starts_with("  \u{256d} Root "), "{}", row(1));
+        assert!(row(10).starts_with("  \u{2570}"), "{}", row(10));
+        // Content starts at (3, 2): the header, then the entries behind their gutter.
+        assert!(row(2).contains("\u{2502}/srv"), "{}", row(2));
+        assert!(buffer[(3, 2)].modifier.contains(Modifier::BOLD));
+        assert_ne!(buffer[(3, 2)].fg, theme.accent.fg.unwrap_or_default());
+        assert_eq!(buffer[(3, 3)].symbol(), "\u{258c}");
+        assert_eq!(buffer[(3, 3)].fg, theme.accent.fg.unwrap_or_default());
+        assert_eq!(buffer[(4, 3)].bg, theme.selected.bg.unwrap_or_default());
+        assert!(row(3).contains("htui/"), "{}", row(3));
+        assert_eq!(buffer[(3, 4)].symbol(), " ", "no marker off the cursor");
+        assert_ne!(buffer[(4, 4)].bg, theme.selected.bg.unwrap_or_default());
     }
 }

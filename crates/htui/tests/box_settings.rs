@@ -16,6 +16,7 @@ use htui::app::{Action, Handled};
 use htui::box_settings::{self, BoxesSnapshot, REQUEST_NAMES, spec_view};
 use htui::store_worker::{StoreReply, StoreRequest, serve};
 use htui::testkit::{Harness, SectionBench};
+use htui::ui::Theme;
 use htui::ui::tabs::settings::{BoxesSection, PromptSection, SettingsSection, SettingsTab};
 use htui_agent::box_probe::spec;
 use htui_core::fixtures::{demo_data, ids};
@@ -23,6 +24,11 @@ use htui_core::model::{BoxEdit, BoxId, BoxRecord, Executor, Scope, canonical_dec
 use htui_core::store::traits::BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN;
 use htui_core::store::{MemStore, StoreError};
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
+use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::Color;
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -612,19 +618,26 @@ fn tags_of(edit: &BoxEdit) -> Option<Vec<&str>> {
         .map(|tags| tags.iter().map(String::as_str).collect())
 }
 
-/// The detail pane's `host` row for `hostname`: the 14-wide label column, then the value.
+/// The detail pane's `host` row for `hostname`: the 14-wide label column and the form's two-cell
+/// gap (MOD-115 M3), then the value.
 fn host_row(hostname: &str) -> String {
-    format!("{:<14}{hostname}", "host")
+    format!("{:<16}{hostname}", "host")
 }
 
-/// The detail pane's `executor` row for `executor`: the 14-wide label column, then the value.
+/// The detail pane's `executor` row for `executor`: the 14-wide label column and the form's
+/// two-cell gap (MOD-115 M3), then the value.
 fn executor_row(executor: &str) -> String {
-    format!("{:<14}{executor}", "executor")
+    format!("{:<16}{executor}", "executor")
 }
 
-/// A frame's words joined by single spaces, so a sentence the detail pane wrapped reads whole.
+/// A frame's words joined by single spaces, so a sentence the detail pane wrapped reads whole. The
+/// kit form's `▌` marks every row of its focused field (MOD-115 M3), so it is read as a blank.
 fn words(frame: &str) -> String {
-    frame.split_whitespace().collect::<Vec<_>>().join(" ")
+    frame
+        .replace('\u{258c}', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The last line of a frame that is not blank: the notice when one shows, else the hint.
@@ -722,7 +735,7 @@ async fn t_opens_the_tag_editor_prefilled_and_enter_sends_only_the_tags() {
     assert!(section.captures_input());
     let frame = bench.render_section(&section, 100);
     assert!(
-        frame.contains(&format!("{:<14}gpu", "declared tags")),
+        frame.contains(&format!("{:<16}gpu", "declared tags")),
         "the field holds the stored list: {frame}"
     );
 
@@ -925,7 +938,10 @@ async fn a_second_save_while_saving_sends_nothing() {
 
     only_edit(&requests(&bench));
     let frame = bench.render_section(&section, 100);
-    assert!(frame.contains("edit_box in flight"), "{frame}");
+    assert!(
+        frame.contains("still saving the box \u{2014} wait for the store's answer"),
+        "{frame}"
+    );
 }
 
 /// §6.4: a refused save keeps the editor over its text, says why, and frees the next save; an
@@ -956,7 +972,10 @@ async fn a_refused_save_keeps_the_editor_and_frees_the_next_save() {
     let (_, expected, _) = only_edit(&requests(&bench));
     assert_eq!(expected, 0);
     let frame = bench.render_section(&section, 100);
-    assert!(!frame.contains("edit_box in flight"), "{frame}");
+    assert!(
+        !frame.contains("still saving the box \u{2014} wait for the store's answer"),
+        "{frame}"
+    );
 }
 
 /// D56 (the kinds section's `blocked`): no editor opens while a save is in flight, because that
@@ -975,7 +994,10 @@ async fn no_editor_opens_while_a_save_is_in_flight() {
     assert!(!section.captures_input(), "no editor opened");
     assert!(requests(&bench).is_empty());
     let frame = bench.render_section(&section, 100);
-    assert!(frame.contains("edit_box in flight"), "{frame}");
+    assert!(
+        frame.contains("still saving the box \u{2014} wait for the store's answer"),
+        "{frame}"
+    );
 }
 
 /// OQ-16: over the quirks editor `Enter` breaks the line, so the stale notice names `ctrl-s` as
@@ -1469,7 +1491,10 @@ async fn w_while_a_save_is_in_flight_opens_nothing() {
     assert!(!section.captures_input(), "no confirmation opened");
     assert!(requests(&bench).is_empty());
     let frame = bench.render_section(&section, 100);
-    assert!(frame.contains("edit_box in flight"), "{frame}");
+    assert!(
+        frame.contains("still saving the box \u{2014} wait for the store's answer"),
+        "{frame}"
+    );
 }
 
 /// MOD-41 plan D10: `w` shadows the global workspace switcher only over a listed box. Before the
@@ -1586,7 +1611,7 @@ async fn s_opens_the_spec_editor_over_the_pretty_printed_overlay() {
     for expected in [
         "\"terraform\": {",
         "\"kind\": \"path\"",
-        "stored overlay box_probe_spec, merged into the seed by name; blank clears it",
+        "stored overlay, merged into the seed by tool name; blank clears it",
         "probe spec: seed + stored overlay \u{b7} ",
     ] {
         assert!(frame.contains(expected), "`{expected}` in {frame}");
@@ -1597,6 +1622,23 @@ async fn s_opens_the_spec_editor_over_the_pretty_printed_overlay() {
         "{frame}"
     );
     assert!(requests(&bench).is_empty(), "opening sends nothing");
+}
+
+/// MOD-115 M3 (Definition of ported, item 3): the spec editor's title names no setting key, and
+/// it wraps in a narrow body rather than clipping.
+#[tokio::test]
+async fn the_spec_editor_title_names_no_setting_key_and_wraps() {
+    let (bench, mut section) = bench_with(&snap_of(terraform_store()).await).await;
+    bench.key(&mut section, "s");
+    assert!(section.captures_input(), "the spec editor takes the keys");
+    let frame = bench.render_section(&section, 40);
+    assert!(
+        !frame.contains("box_probe_spec"),
+        "no setting key on screen: {frame}"
+    );
+    for expected in ["stored overlay, merged into the seed by", "blank clears it"] {
+        assert!(frame.contains(expected), "`{expected}` in {frame}");
+    }
 }
 
 /// MOD-51 D6, F-3: the spec is app-wide, so over a read list with no box in it the hint offers
@@ -1624,7 +1666,7 @@ async fn s_with_no_box_listed_still_opens_the_spec_editor() {
     // The spec line is drawn over an empty list in Browse too (review LOW-6), so the editor's own
     // title is what proves the editor is the thing drawn.
     assert!(
-        frame.contains("stored overlay box_probe_spec, merged into the seed by name"),
+        frame.contains("stored overlay, merged into the seed by tool name"),
         "the spec editor is drawn over no box: {frame}"
     );
 
@@ -1961,7 +2003,10 @@ async fn a_second_spec_save_while_saving_sends_nothing() {
 
     only_spec(&requests(&bench));
     let frame = bench.render_section(&section, 100);
-    assert!(frame.contains("set_probe_spec in flight"), "{frame}");
+    assert!(
+        frame.contains("still saving the probe spec \u{2014} wait for the store's answer"),
+        "{frame}"
+    );
 }
 
 /// MOD-51 F-5, MOD-7 D56: no editor opens while either write is in flight, and the notice names
@@ -1978,7 +2023,10 @@ async fn no_editor_opens_across_the_two_writes() {
         bench.key(&mut section, key);
         assert!(!section.captures_input(), "{key} opened nothing");
         let frame = bench.render_section(&section, 100);
-        assert!(frame.contains("set_probe_spec in flight"), "{key}: {frame}");
+        assert!(
+            frame.contains("still saving the probe spec \u{2014} wait for the store's answer"),
+            "{key}: {frame}"
+        );
     }
     assert!(requests(&bench).is_empty());
 
@@ -1991,7 +2039,10 @@ async fn no_editor_opens_across_the_two_writes() {
     assert_eq!(bench.key(&mut section, "s"), Handled::Consumed);
     assert!(!section.captures_input(), "s opened nothing");
     let frame = bench.render_section(&section, 100);
-    assert!(frame.contains("edit_box in flight"), "{frame}");
+    assert!(
+        frame.contains("still saving the box \u{2014} wait for the store's answer"),
+        "{frame}"
+    );
 }
 
 /// MOD-51 F-6(b): a refused read over a spec editor opened over no box keeps the editor on
@@ -2041,7 +2092,7 @@ async fn the_demo_box_renders() {
     for expected in [
         " Boxes ",
         "DESKTOP-HTUI (this box)",
-        "windows 10.0.26200 \u{b7} x86_64",
+        "Windows 10.0.26200 \u{b7} x86_64",
         "last probe",
         "probed under the current spec: no",
         "cargo 1.98.0, cmake, git 2.51.0, rustc 1.98.0",
@@ -2265,4 +2316,249 @@ async fn a_rebound_save_key_is_named_after_a_stale_quirks_save() {
         words.contains("reloaded; F2 retries against the current row"),
         "{frame}"
     );
+}
+
+// -------------------------------------------------------------------------------------------
+// MOD-115 M3 (lane L-hier): the section on the kit. The list is a `kit::list`, the detail a
+// `kit::form` whose open editor is the focused row, the notices `kit::text` lines and the empty
+// states `kit::empty` with a next step; every hint and every sentence that names a key reads it
+// from the keys in force.
+// -------------------------------------------------------------------------------------------
+
+/// `field.submit` and `field.cancel` moved (MOD-115 M3 C6): the editors' `Enter` and `Esc`.
+const FIELD_REBOUND: &str = "version = 2\n[field]\nsubmit = [\"ctrl-t\"]\ncancel = [\"ctrl-o\"]\n";
+
+/// `keys` loaded, or a panic naming the file.
+fn rebound(file: &str) -> htui::keys::Keys {
+    htui::keys::load_str(file).expect("the key file loads")
+}
+
+/// The section drawn into a `width`x30 buffer, for the styles a text frame cannot show.
+fn drawn(bench: &SectionBench, section: &BoxesSection, width: u16) -> Buffer {
+    let area = Rect::new(0, 0, width, 30);
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(width, 30),
+        TerminalOptions {
+            viewport: Viewport::Fixed(area),
+        },
+    )
+    .expect("a test terminal");
+    let ctx = bench.ctx();
+    terminal
+        .draw(|frame| section.render(frame, frame.area(), &ctx))
+        .expect("the section draws");
+    terminal.backend().buffer().clone()
+}
+
+/// The text of row `y` of `buffer`.
+fn row_text(buffer: &Buffer, y: u16) -> String {
+    (0..buffer.area.width)
+        .map(|x| buffer[(x, y)].symbol())
+        .collect()
+}
+
+/// Every editor's hint names the field's own keys through its stack (MD-A, C6): the tag editor's
+/// `Enter`/`Esc` (`views::CAPTURE`), and the line break and the way out of the quirks and probe
+/// spec editors (`views::BOXES_EDITOR`), under the compiled keys and once `[field]` moves them.
+#[tokio::test]
+async fn the_editor_hints_name_the_field_keys_in_force() {
+    let (bench, mut section) = bench_with(&snap_of(MemStore::demo()).await).await;
+    bench.key(&mut section, "t");
+    let hint = bench.key_hint(&section);
+    assert!(
+        hint.contains("Enter saves \u{b7} Esc cancels \u{b7} comma-separated"),
+        "{hint}"
+    );
+
+    let bench = bench.with_keys(rebound(FIELD_REBOUND));
+    let hint = bench.key_hint(&section);
+    assert!(
+        hint.contains("Ctrl+t saves \u{b7} Ctrl+o cancels \u{b7} comma-separated"),
+        "{hint}"
+    );
+    bench.key(&mut section, "esc");
+
+    bench.key(&mut section, "e");
+    let hint = bench.key_hint(&section);
+    assert!(
+        hint.contains("Ctrl+s saves \u{b7} Ctrl+o cancels \u{b7} Ctrl+t breaks the line"),
+        "{hint}"
+    );
+    assert!(
+        !hint.contains("Enter") && !hint.contains("Esc"),
+        "no literal key is left: {hint}"
+    );
+    bench.key(&mut section, "esc");
+
+    bench.key(&mut section, "s");
+    let hint = bench.key_hint(&section);
+    assert!(
+        hint.contains(
+            "Ctrl+s saves \u{b7} Ctrl+o cancels \u{b7} Ctrl+t breaks the line \u{b7} blank clears"
+        ),
+        "{hint}"
+    );
+}
+
+/// A stale tag save names `field.submit` in force as its retry (MD-A, D-5).
+#[tokio::test]
+async fn a_stale_tag_save_names_the_retry_key_in_force() {
+    let bench = SectionBench::new().await.with_keys(rebound(FIELD_REBOUND));
+    let mut section = BoxesSection::new();
+    feed(&bench, &mut section, &snap_of(MemStore::demo()).await);
+    bench.key(&mut section, "t");
+    type_at(&bench, &mut section, ", vulkan");
+    bench.key(&mut section, "enter");
+    only_edit(&requests(&bench));
+    bench.reply(
+        &mut section,
+        &StoreReply::BoxesStale(Box::new(demo_at_version(5).await)),
+    );
+
+    let frame = words(&bench.render_section(&section, 100));
+    assert!(
+        frame.contains("reloaded; Ctrl+t retries against the current row"),
+        "{frame}"
+    );
+    assert!(!frame.contains("Enter retries"), "{frame}");
+}
+
+/// `kit::list` and MOD-85: the selected box carries the gutter in the tab's accent and the band;
+/// an open editor's row carries the form's marker; nothing else takes the accent.
+#[tokio::test]
+async fn the_list_and_the_editor_mark_their_rows_with_the_gutter() {
+    let (bench, mut section) = bench_with(&snap_of(two_boxes()).await).await;
+    let accent = bench
+        .ctx()
+        .accent()
+        .fg
+        .expect("the Settings accent has a colour");
+    let band = Theme::default().selected.bg.unwrap_or(Color::Reset);
+    let accented = |buffer: &Buffer| -> Vec<(u16, u16)> {
+        (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .filter(|(x, y)| buffer[(*x, *y)].fg == accent)
+            .collect()
+    };
+
+    let buffer = drawn(&bench, &section, 100);
+    let marks = accented(&buffer);
+    assert_eq!(marks.len(), 1, "the selected box alone: {marks:?}");
+    let (x, y) = marks[0];
+    assert_eq!((x, buffer[(x, y)].symbol()), (0, "\u{258c}"));
+    assert!(
+        row_text(&buffer, y).contains("(this box)"),
+        "the first read selects this box"
+    );
+    assert_eq!(buffer[(1, y)].bg, band, "the row is in the band");
+
+    bench.key(&mut section, "t");
+    let buffer = drawn(&bench, &section, 100);
+    let marks = accented(&buffer);
+    assert!(
+        marks
+            .iter()
+            .all(|(x, y)| buffer[(*x, *y)].symbol() == "\u{258c}"),
+        "only gutters take the accent: {marks:?}"
+    );
+    assert_eq!(marks.len(), 2, "the box and the field: {marks:?}");
+    assert!(
+        marks
+            .iter()
+            .any(|(x, y)| *x > 0 && row_text(&buffer, *y).contains("declared tags")),
+        "the tag editor's row is marked: {marks:?}"
+    );
+}
+
+/// The empty states say what is missing and what to do next (MOD-115 audit item 2, MOD-83).
+#[tokio::test]
+async fn the_empty_states_carry_a_next_step() {
+    let bench = SectionBench::new().await;
+    let mut section = BoxesSection::new();
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("boxes not read yet"), "{frame}");
+    assert!(frame.contains("r reads the boxes"), "{frame}");
+
+    feed(&bench, &mut section, &no_boxes().await);
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("no box is registered for this user yet"),
+        "{frame}"
+    );
+    assert!(
+        frame.contains("a box is listed once htui connects from it"),
+        "{frame}"
+    );
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: box_settings::READ_NAME,
+            message: "store unreachable".to_owned(),
+        },
+    );
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("boxes unavailable: store unreachable"),
+        "{frame}"
+    );
+    assert!(
+        frame.contains("r asks again once the store answers"),
+        "{frame}"
+    );
+}
+
+/// MOD-83: the OS reads by its name, not by its column value.
+#[tokio::test]
+async fn the_os_reads_by_its_name() {
+    let (bench, section) = bench_with(&snap_of(MemStore::demo()).await).await;
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("Windows 10.0.26200"), "{frame}");
+    assert!(!frame.contains("windows"), "{frame}");
+}
+
+/// MOD-81: the section at 80 columns, through the shell.
+#[tokio::test]
+async fn the_section_at_80_columns() {
+    let mut harness = boxes_over(MemStore::demo()).await.size(80, 24);
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(frame.contains("DESKTOP-HTUI (this box)"), "{frame}");
+    insta::with_settings!({ filters => vec![DIGEST_FILTER] }, {
+        insta::assert_snapshot!("demo_80", frame);
+    });
+}
+
+/// MD-A, C5: the spec-saved notice names the probe key in force (`p` by default), and the probe
+/// itself when the key is unbound, never a literal `p`.
+#[tokio::test]
+async fn the_spec_saved_notice_names_the_probe_key_in_force() {
+    for (file, expected) in [
+        (
+            "version = 1\n",
+            "probe spec saved \u{2014} the next p (or the next connect) re-probes under it",
+        ),
+        (
+            "version = 1\n[settings.boxes]\nprobe = \"P\"\n",
+            "probe spec saved \u{2014} the next P (or the next connect) re-probes under it",
+        ),
+        (
+            "version = 1\n[settings.boxes]\nprobe = []\n",
+            "probe spec saved \u{2014} the next probe (or the next connect) re-probes under it",
+        ),
+    ] {
+        let bench = SectionBench::new().await.with_keys(rebound(file));
+        let mut section = BoxesSection::new();
+        feed(&bench, &mut section, &snap_of(MemStore::demo()).await);
+        bench.key(&mut section, "s");
+        bench.paste(&mut section, "{}");
+        bench.key(&mut section, "ctrl-s");
+        only_spec(&requests(&bench));
+        bench.reply(
+            &mut section,
+            &StoreReply::Boxes(Box::new(snap_of(terraform_store()).await)),
+        );
+        let frame = bench.render_section(&section, 100);
+        assert_eq!(last_line(&frame).trim(), expected, "{file}");
+    }
 }

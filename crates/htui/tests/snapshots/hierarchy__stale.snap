@@ -2,8 +2,8 @@
 source: crates/htui/tests/hierarchy.rs
 expression: "bench.render_section(&section, 100)"
 ---
-Graphics, renamed (graphics) — root on this box: unset
-  vulkan-tutorials  Vulkan Tutorials
+▌Graphics, renamed (graphics) — root on this box: unset
+   vulkan-tutorials  Vulkan Tutorials
 
 
 
@@ -28,7 +28,7 @@ Graphics, renamed (graphics) — root on this box: unset
 
 
 
-slug       : graphics-2
-name       : Graphics
-description: Rendering experiments
+▌slug          graphics-2
+ name          Graphics
+ description   Rendering experiments
 changed elsewhere since you opened it — reloaded; Enter retries against the current row

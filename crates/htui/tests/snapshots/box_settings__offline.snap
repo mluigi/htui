@@ -5,7 +5,7 @@ expression: frame
 no workspace        boxes: store unreachable: this box browses its read-only cache and starts no run
 ╭─ Boxes ─────────────────────────────────────────────────────────────────────────────────── Boxes ╮
 │boxes unavailable: store unreachable: this box browses its read-only cache and starts no run      │
-│                                                                                                  │
+│r asks again once the store answers                                                               │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

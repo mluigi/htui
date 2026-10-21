@@ -4,8 +4,8 @@ expression: harness.render()
 ---
 Graphics   ¹Settings   0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys · ⌫ back
 ╭─ Hierarchy ─────────────────────────────────────────────────────────────────── Agents  Hierarchy ╮
-│Graphics (graphics) — root on this box: unset                                                     │
-│  vulkan-tutorials  Vulkan Tutorials                                                              │
+│▌Graphics (graphics) — root on this box: unset                                                    │
+│   vulkan-tutorials  Vulkan Tutorials                                                             │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

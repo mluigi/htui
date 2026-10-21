@@ -11,12 +11,18 @@
 //! ([`crate::box_settings::serve`]): no row is ever patched in locally, so there is exactly one
 //! source of truth (the rule [`crate::prompt_settings`] states in its module doc).
 //!
+//! It draws through the kit (MOD-115 M3): the list is a `kit::list` (gutter, band), the detail a
+//! `kit::form` whose open editor is its focused row (MOD-85: the marker, not an accented label),
+//! the notice `kit::text` lines and the empty states `kit::empty` with a next step. Every hint and
+//! every sentence that names a key reads it through the mode's stack, and acts resolve from
+//! [`Ctx::pressed`] (MD-A).
+//!
 //! Known residue, the kinds section's H-9 (D56, R-29): a `Boxes` reply carries nothing that says
 //! which request it answers, so `busy` is the whole of the attribution. A read that lands between
 //! a save and its reply (a scope change or a tab re-activation) is taken for that reply and closes
 //! the editor early; if the save then comes back `BoxesStale`, `CHANGED_ELSEWHERE_CLOSED` says
 //! nothing was written and how to retry. For a probe spec save the early close also shows
-//! `SPEC_SAVED` and loses the typed text, as for `edit_box`; the real reply's notice then
+//! [`spec_saved`]'s notice and loses the typed text, as for `edit_box`; the real reply's notice then
 //! replaces it (`CHANGED_ELSEWHERE_CLOSED`, or the refusal's sentence), and nothing is written
 //! wrongly (MOD-51 F-11, blueprint R-1). The same race can also land a tags or quirks save's
 //! `BoxesStale` in the probe spec editor's branch (opened after the early close), refreshing the
@@ -30,13 +36,18 @@ use std::collections::BTreeSet;
 
 use crate::app::{Ctx, Handled};
 use crate::box_settings::{BoxesSnapshot, READ_NAME, REQUEST_NAMES, SpecView};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::{self, cell_width};
-use crate::ui::kit::{chips::key_line, modal::modal_rest, text::wrapped};
+use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::form::{self, Form};
+use crate::ui::kit::label;
+use crate::ui::kit::list::{self, RowKind};
+use crate::ui::kit::text::{Tone, notice, wrapped};
+use crate::ui::kit::{chips::key_line, modal::modal_rest};
 use crate::ui::tabs::settings::{
-    CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
-    is_error, message,
+    CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection, changed_elsewhere,
+    is_error,
 };
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme};
 use chrono::{DateTime, Utc};
@@ -46,17 +57,39 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 use serde_json::Value;
 
-/// What the body says before any boxes have arrived.
+/// What the body says before any boxes have arrived; [`reads_them`] is its next step.
 const NOT_READ: &str = "boxes not read yet";
 
-/// The opening of the one line a refused read leaves (the prompt section's `UNAVAILABLE` style).
+/// The next step of [`NOT_READ`]: `reload`, the label of `common.reload` through the browse
+/// stack, reads them; unbound, opening the section does.
+fn reads_them(reload: Option<&str>) -> String {
+    match reload {
+        Some(reload) => format!("{reload} reads the boxes"),
+        None => "the boxes are read when this section opens".to_owned(),
+    }
+}
+
+/// The opening of the one line a refused read leaves (the prompt section's `UNAVAILABLE` style);
+/// [`asks_again`] is its next step.
 const UNAVAILABLE: &str = "boxes unavailable";
+
+/// The next step of [`UNAVAILABLE`] (MOD-83): `reload` asks again; unbound, opening the section
+/// does.
+fn asks_again(reload: Option<&str>) -> String {
+    match reload {
+        Some(reload) => format!("{reload} asks again once the store answers"),
+        None => "the store is asked again when this section opens".to_owned(),
+    }
+}
 
 /// What the body says over a list with no box in it.
 const NO_BOXES: &str = "no box is registered for this user yet";
+
+/// The next step of [`NO_BOXES`]: a box registers itself when it connects.
+const NO_BOXES_NEXT: &str = "a box is listed once htui connects from it";
 
 /// The Browse keys (MOD-51 D6: `s` opens the probe spec editor; `p probe this box` became
 /// `p probe` so the line fits an 80-column terminal, blueprint F-10, and [`THIS_BOX_ONLY`] still
@@ -82,18 +115,21 @@ const HINT_NO_LIST: HintSpec = &[
 /// (MOD-51 F-3).
 const HINT_RELOAD: HintSpec = &[Hint::One(Act::Reload, "reload")];
 
-/// The tag editor's keys: the field's own (MOD-67 D13).
+/// The tag editor's keys: the field's own (MOD-67 D13), `field.submit` and `field.cancel` through
+/// [`views::CAPTURE`] (MOD-115 M3 C6): `Enter saves · Esc cancels` by default.
 const HINT_TAGS: HintSpec = &[
-    Hint::Text("Enter saves"),
-    Hint::Text("Esc cancels"),
+    Hint::One(Act::FieldSubmit, "saves"),
+    Hint::One(Act::FieldCancel, "cancels"),
     Hint::Text("comma-separated"),
 ];
 
 /// The quirks editor's keys (OQ-16: `Enter` is a line break, so `form.save`, `Ctrl+s`, saves).
+/// The way out and the line break are the field's (C6): `field.submit`'s chord reaches the
+/// `TextArea` as `Enter`, so it is the key that breaks the line.
 const HINT_QUIRKS: HintSpec = &[
     Hint::One(Act::FormSave, "saves"),
-    Hint::Text("Esc cancels"),
-    Hint::Text("Enter breaks the line"),
+    Hint::One(Act::FieldCancel, "cancels"),
+    Hint::One(Act::FieldSubmit, "breaks the line"),
 ];
 
 /// The executor confirmation's keys (MOD-41 plan D10): `y write · n/Esc cancel` by default.
@@ -106,19 +142,22 @@ const HINT_EXECUTOR: HintSpec = &[
 /// saves).
 const HINT_SPEC: HintSpec = &[
     Hint::One(Act::FormSave, "saves"),
-    Hint::Text("Esc cancels"),
-    Hint::Text("Enter breaks the line"),
+    Hint::One(Act::FieldCancel, "cancels"),
+    Hint::One(Act::FieldSubmit, "breaks the line"),
     Hint::Text("blank clears"),
 ];
 
 /// The dim line above the probe spec editor: what the text is, and what blank does (MOD-51 D6).
-/// It fits a 78-column body unclipped.
-const SPEC_TITLE: &str =
-    "stored overlay box_probe_spec, merged into the seed by name; blank clears it";
+/// It names no setting key (MOD-115 M3: no internal value on screen) and wraps in a narrow body.
+const SPEC_TITLE: &str = "stored overlay, merged into the seed by tool name; blank clears it";
 
-/// A probe spec save applied (MOD-51 D6, D8): nothing re-probes now; the next `p` or connect does.
-const SPEC_SAVED: &str =
-    "probe spec saved \u{2014} the next p (or the next connect) re-probes under it";
+/// A probe spec save applied (MOD-51 D6, D8): nothing re-probes now; the next probe or connect
+/// does. `probe` is the label of `settings.boxes.probe` through the browse stack (MOD-115 M3 C5),
+/// `p` by default; unbound, the sentence names the probe and no key.
+fn spec_saved(probe: Option<&str>) -> String {
+    let next = probe.unwrap_or("probe");
+    format!("probe spec saved \u{2014} the next {next} (or the next connect) re-probes under it")
+}
 
 /// The opening of a probe spec that does not parse; `serde_json`'s own sentence follows.
 const SPEC_NOT_JSON: &str = "the overlay is not JSON";
@@ -127,11 +166,15 @@ const SPEC_NOT_JSON: &str = "the overlay is not JSON";
 /// the frame, which `on_key` cannot see.
 const SPEC_PAGE: u16 = 10;
 
-/// The list pane's width, the one-column gutter to the detail pane included.
-const LIST_WIDTH: u16 = 28;
+/// The list pane's width: the kit's one-cell gutter, 27 cells of label and the one-column gap to
+/// the detail pane (MOD-115 M3: one more than before, for the gutter, so a label keeps its room).
+const LIST_WIDTH: u16 = 29;
 
-/// The detail pane's label column.
-const LABEL_WIDTH: usize = 14;
+/// The detail form's label column (the kit form adds its gutter before it and two cells after).
+const LABEL_WIDTH: u16 = 14;
+
+/// The gap `kit::form` leaves between its label column and the value.
+const FORM_GAP: u16 = 2;
 
 /// How many lines the quirks editor shows at most.
 const QUIRKS_HEIGHT: u16 = 6;
@@ -142,27 +185,23 @@ const DIGEST_SHOWN: usize = 12;
 /// How many hex digits of a box id tell two same-named boxes apart (PRD `:262`).
 const ID_SUFFIX: usize = 8;
 
-/// What a second write says while one is in flight, after the request's name (D56, MOD-51
-/// F-5): `edit_box in flight` is byte-identical to the sentence before MOD-51.
-const IN_FLIGHT: &str = "in flight";
+/// What a second write is told while the first is still out (D56, MOD-51 F-5), in words
+/// (MOD-115 M3: no request name on screen).
+fn in_flight(busy: &str) -> String {
+    format!("still {} \u{2014} wait for the store's answer", doing(busy))
+}
 
-/// [`CHANGED_ELSEWHERE`] for the two save-key editors, quirks and the probe spec (MOD-51 D6),
-/// where `Enter` breaks the line (OQ-16) and `save`, `FormSave`'s label through `BOXES_EDITOR`
-/// (MOD-67 M6 D4), is the save that retries; with none bound the sentence says a save. Starts
-/// `changed elsewhere`, so `is_error` draws it in `theme.error`.
-fn changed_elsewhere_quirks(save: Option<&str>) -> String {
-    match save {
-        Some(save) => format!(
-            "changed elsewhere since you opened it \u{2014} reloaded; {save} retries against the \
-             current row"
-        ),
-        None => "changed elsewhere since you opened it \u{2014} reloaded; save again to retry \
-                 against the current row"
-            .to_owned(),
+/// A request in flight in words, by [`StoreRequest::name`] ([`REQUEST_NAMES`]).
+fn doing(busy: &str) -> &'static str {
+    match busy {
+        "boxes" => "reading the boxes",
+        "edit_box" => "saving the box",
+        "set_probe_spec" => "saving the probe spec",
+        _ => "writing",
     }
 }
 
-/// [`CHANGED_ELSEWHERE`] for the executor confirmation, where `yes`, `ConfirmYes`'s label through
+/// [`changed_elsewhere`] for the executor confirmation, where `yes`, `ConfirmYes`'s label through
 /// `BOXES_EXECUTOR` (MOD-67 M6 D4), is the write that retries (MOD-41 plan D10); with none bound
 /// the clause goes. Starts `changed elsewhere`, so `is_error` draws it in `theme.error`.
 fn changed_elsewhere_executor(yes: Option<&str>) -> String {
@@ -372,19 +411,22 @@ impl BoxesSection {
     /// read (`r`, activation, the re-read after a probe or a reconnect) leaves the editor, its
     /// text and its token alone. A probe spec save that applied says the next `p` re-probes
     /// (MOD-51 D6, D8).
-    fn on_boxes(&mut self, snapshot: &BoxesSnapshot) {
+    fn on_boxes(&mut self, snapshot: &BoxesSnapshot, keys: &Keys) {
         self.replace(snapshot);
         if let Some(name) = self.busy.take() {
             self.mode = Mode::Browse;
-            self.notice = (name == SPEC_NAME).then(|| SPEC_SAVED.to_owned());
+            self.notice = (name == SPEC_NAME)
+                .then(|| spec_saved(keys.label(views::BOXES_BROWSE, Act::BoxesProbe).as_deref()));
         }
     }
 
     /// `BoxesStale` (D48): the list is replaced, the editor keeps its text and takes the current
     /// row's token, and the retry is a second save rather than an automatic write. The sentence
-    /// names the retry key `keys` binds there (MOD-67 M6 D4).
+    /// names the retry key `keys` binds there (MOD-67 M6 D4): `form.save` in the quirks and spec
+    /// editors, where `Enter` breaks the line, `field.submit` in the tag editor (MOD-115 M3 D-5).
     fn on_stale(&mut self, snapshot: &BoxesSnapshot, keys: &Keys) {
         let save = keys.label(views::BOXES_EDITOR, Act::FormSave);
+        let submit = keys.label(views::CAPTURE, Act::FieldSubmit);
         self.busy = None;
         self.replace(snapshot);
         // MOD-51 F-6(a): the probe spec editor is over no box, so it is settled before
@@ -392,7 +434,7 @@ impl BoxesSection {
         // when the row is gone (the retry is then an insert).
         if let Mode::Spec(editor) = &mut self.mode {
             editor.expected = snapshot.spec.stored.as_ref().map(|row| row.updated_at);
-            self.notice = Some(changed_elsewhere_quirks(save.as_deref()));
+            self.notice = Some(changed_elsewhere(save.as_deref()));
             return;
         }
         let Some(box_id) = self.editor_box() else {
@@ -408,11 +450,11 @@ impl BoxesSection {
         let notice = match (now, &mut self.mode) {
             (Some(token), Mode::Tags(editor)) => {
                 editor.expected = token;
-                CHANGED_ELSEWHERE.to_owned()
+                changed_elsewhere(submit.as_deref())
             }
             (Some(token), Mode::Quirks(editor)) => {
                 editor.expected = token;
-                changed_elsewhere_quirks(save.as_deref())
+                changed_elsewhere(save.as_deref())
             }
             (Some(token), Mode::Executor(flip)) => {
                 flip.expected = token;
@@ -421,7 +463,7 @@ impl BoxesSection {
                         .as_deref(),
                 )
             }
-            (Some(_), Mode::Browse | Mode::Spec(_)) => CHANGED_ELSEWHERE.to_owned(),
+            (Some(_), Mode::Browse | Mode::Spec(_)) => changed_elsewhere(submit.as_deref()),
             (None, _) => {
                 self.mode = Mode::Browse;
                 DELETED_ELSEWHERE.to_owned()
@@ -439,7 +481,7 @@ impl BoxesSection {
             return true;
         }
         if let Some(name) = self.busy {
-            self.notice = Some(format!("{name} {IN_FLIGHT}"));
+            self.notice = Some(in_flight(name));
             return true;
         }
         false
@@ -590,7 +632,7 @@ impl BoxesSection {
             FieldOutcome::Pass => {}
         }
         let stack = self.stack();
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         // `form.save` is the first layer below the view's, so the first candidate decides; only
         // the quirks and spec editors' stack offers it.
         if ctx.keys().actions(stack, chord).first() == Some(&Act::FormSave) {
@@ -606,7 +648,7 @@ impl BoxesSection {
     /// key is swallowed. `alt-y` is not `y`.
     fn on_executor_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
         let stack = views::BOXES_EXECUTOR;
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         // The answers' layer comes before the global one, so the first candidate decides.
         match ctx.keys().actions(stack, chord).first() {
             Some(Act::ConfirmYes) => self.submit(ctx),
@@ -626,7 +668,7 @@ impl BoxesSection {
     /// or a clear when the text is blank. The editor stays open until the reply.
     fn submit(&mut self, ctx: &Ctx<'_>) {
         if let Some(name) = self.busy {
-            self.notice = Some(format!("{name} {IN_FLIGHT}"));
+            self.notice = Some(in_flight(name));
             return;
         }
         let request = match &self.mode {
@@ -758,8 +800,8 @@ impl SettingsSection for BoxesSection {
         // or a declined one is the shell's. `executor` (MOD-41 plan D10) shadows the global
         // workspace switcher only while a box is listed to act on; over no list it declines, so
         // the switcher is still one key away (`STATE_GUARDED`). `Ctrl+W` is another chord: the
-        // global waiting list (MOD-69 D7).
-        let chord = KeyChord::from_event(key);
+        // global waiting list (MOD-69 D7). Resolved from the chord pressed (MOD-115 M3 MD-A).
+        let chord = ctx.pressed(&key);
         for act in ctx.keys().actions(views::BOXES_BROWSE, chord) {
             match act {
                 Act::ListDown => self.move_selection(true),
@@ -793,7 +835,7 @@ impl SettingsSection for BoxesSection {
 
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         match reply {
-            StoreReply::Boxes(snapshot) => self.on_boxes(snapshot),
+            StoreReply::Boxes(snapshot) => self.on_boxes(snapshot, ctx.keys()),
             StoreReply::BoxesStale(snapshot) => self.on_stale(snapshot, ctx.keys()),
             // The report carries counts, not rows (D49): the list is read again.
             StoreReply::BoxProbed(_) => {
@@ -829,31 +871,46 @@ impl SettingsSection for BoxesSection {
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let theme = ctx.theme;
-        let notice = self
+        let width = usize::from(area.width).max(1);
+        let notices: Vec<Line<'static>> = self
             .notice
             .as_deref()
-            .map(|text| wrapped(text, usize::from(area.width).max(1)))
+            .map(|text| {
+                let tone = if is_error(text) {
+                    Tone::Error
+                } else {
+                    Tone::Info
+                };
+                wrapped(text, width)
+                    .into_iter()
+                    .map(|line| notice(&line, tone, theme))
+                    .collect()
+            })
             .unwrap_or_default();
         // MOD-67 M6 T2: the keys row went to the shell's hint row; the body gains it.
         let [body, notice_area] = Layout::vertical([
             Constraint::Min(3),
-            Constraint::Length(u16::try_from(notice.len()).unwrap_or(u16::MAX)),
+            Constraint::Length(u16::try_from(notices.len()).unwrap_or(u16::MAX)),
         ])
         .areas(area);
+        let reload = ctx.keys().label(views::BOXES_BROWSE, Act::Reload);
+        // An editor that still takes keys stays on screen under a refused read: the refusal takes
+        // the body's first line and the editor keeps the rest.
+        let under_refusal = |frame: &mut Frame<'_>, why: &str| -> Rect {
+            let [refusal, rest] =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
+            frame.render_widget(
+                Paragraph::new(notice(&format!("{UNAVAILABLE}: {why}"), Tone::Error, theme)),
+                refusal,
+            );
+            rest
+        };
 
         if let (Mode::Spec(editor), Some(snapshot)) = (&self.mode, &self.snapshot) {
-            // MOD-51 F-6(b): an editor that takes keys stays on screen (the rule below), box or
-            // no box: a refused read takes the body's first line and the editor keeps the rest.
+            // MOD-51 F-6(b): an editor that takes keys stays on screen (the rule above), box or
+            // no box.
             let area = match &self.unavailable {
-                Some(why) => {
-                    let [refusal, rest] =
-                        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
-                    frame.render_widget(
-                        Paragraph::new(Line::styled(format!("{UNAVAILABLE}: {why}"), theme.error)),
-                        refusal,
-                    );
-                    rest
-                }
+                Some(why) => under_refusal(frame, why),
                 None => body,
             };
             render_spec(frame, area, snapshot, editor, theme);
@@ -865,52 +922,47 @@ impl SettingsSection for BoxesSection {
                 (Some(why), Some(snapshot))
                     if !matches!(self.mode, Mode::Browse) && !snapshot.boxes.is_empty() =>
                 {
-                    let [refusal, rest] =
-                        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
-                    frame.render_widget(
-                        Paragraph::new(Line::styled(format!("{UNAVAILABLE}: {why}"), theme.error)),
-                        refusal,
-                    );
-                    self.render_body(frame, rest, snapshot, theme);
+                    let rest = under_refusal(frame, why);
+                    self.render_body(frame, rest, snapshot, ctx);
                 }
                 // The refusal wins the body even with a list behind it: what is on screen
                 // would otherwise be boxes nothing has confirmed since the outage started (the
-                // kinds rule).
-                (Some(why), _) => frame.render_widget(
-                    Paragraph::new(Line::styled(format!("{UNAVAILABLE}: {why}"), theme.error))
-                        .wrap(Wrap { trim: true }),
+                // kinds rule). Its next step follows in the empty state's own role.
+                (Some(why), _) => {
+                    let next = asks_again(reload.as_deref());
+                    let mut lines: Vec<Line<'static>> =
+                        wrapped(&format!("{UNAVAILABLE}: {why}"), width)
+                            .into_iter()
+                            .map(|line| notice(&line, Tone::Error, theme))
+                            .collect();
+                    lines.extend(empty::lines("", NextStep(&next), theme).pop());
+                    frame.render_widget(Paragraph::new(lines), body);
+                }
+                (None, None) => empty::render(
+                    frame,
                     body,
+                    NOT_READ,
+                    NextStep(&reads_them(reload.as_deref())),
+                    theme,
                 ),
-                (None, None) => message(frame, body, NOT_READ, theme),
                 // MOD-51 LOW-6: the spec is app-wide, so it is drawn with no box listed too: a
                 // save over an empty list shows the new source and digest, and an ignored
                 // overlay says why.
                 (None, Some(snapshot)) if snapshot.boxes.is_empty() => {
-                    let width = usize::from(body.width).max(1);
                     let mut lines: Vec<Line<'static>> = wrapped(NO_BOXES, width)
                         .into_iter()
                         .map(|line| Line::styled(line, theme.dim))
                         .collect();
+                    lines.extend(empty::lines("", NextStep(NO_BOXES_NEXT), theme).pop());
                     lines.push(Line::default());
                     lines.extend(spec_lines(&snapshot.spec, width, theme));
                     frame.render_widget(Paragraph::new(lines), body);
                 }
-                (None, Some(snapshot)) => self.render_body(frame, body, snapshot, theme),
+                (None, Some(snapshot)) => self.render_body(frame, body, snapshot, ctx),
             }
         }
 
-        if let Some(text) = &self.notice {
-            let style = if is_error(text) {
-                theme.error
-            } else {
-                theme.dim
-            };
-            let lines: Vec<Line<'static>> = notice
-                .into_iter()
-                .map(|line| Line::styled(line, style))
-                .collect();
-            frame.render_widget(Paragraph::new(lines), notice_area);
-        }
+        frame.render_widget(Paragraph::new(notices), notice_area);
     }
 }
 
@@ -921,104 +973,103 @@ impl BoxesSection {
         frame: &mut Frame<'_>,
         area: Rect,
         snapshot: &BoxesSnapshot,
-        theme: &Theme,
+        ctx: &Ctx<'_>,
     ) {
         let [list, detail] =
             Layout::horizontal([Constraint::Length(LIST_WIDTH), Constraint::Min(0)]).areas(area);
-        self.render_list(frame, list, snapshot, theme);
+        self.render_list(frame, list, snapshot, ctx);
         if let Some(record) = self.selected_record() {
             frame.render_widget(
-                Paragraph::new(self.detail(record, snapshot, detail.width, theme)),
+                Paragraph::new(self.detail(record, snapshot, detail.width, ctx)),
                 detail,
             );
         }
     }
 
-    /// The list pane: one row per box, the selected one in `theme.selected`, scrolled so the
-    /// selection stays on screen.
+    /// The list pane: one `kit::list` row per box, the selected one behind the gutter in the
+    /// tab's accent and in the band, scrolled so the selection stays on screen.
     fn render_list(
         &self,
         frame: &mut Frame<'_>,
         area: Rect,
         snapshot: &BoxesSnapshot,
-        theme: &Theme,
+        ctx: &Ctx<'_>,
     ) {
-        // One column is the gutter between the two panes.
+        // One column is the gap between the two panes, and one more the list's gutter.
+        let area = Rect {
+            width: area.width.saturating_sub(1),
+            ..area
+        };
         let room = usize::from(area.width.saturating_sub(1));
-        let lines: Vec<Line<'static>> = snapshot
+        let rows: Vec<list::Row<'static>> = snapshot
             .boxes
             .iter()
-            .map(|record| {
-                let style = if Some(record.row.id) == self.selected {
-                    theme.selected
-                } else {
-                    theme.base
-                };
-                Line::styled(list_label(record, snapshot, room), style)
+            .map(|record| list::Row {
+                line: Line::styled(list_label(record, snapshot, room), ctx.theme.base),
+                kind: RowKind::Item,
             })
             .collect();
         let at = self
             .selected
-            .and_then(|id| snapshot.boxes.iter().position(|record| record.row.id == id))
-            .unwrap_or(0);
-        let offset = at.saturating_sub(usize::from(area.height).saturating_sub(1));
-        frame.render_widget(
-            Paragraph::new(lines).scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0)),
-            area,
-        );
+            .and_then(|id| snapshot.boxes.iter().position(|record| record.row.id == id));
+        let offset =
+            list::scroll_into_view(at.unwrap_or(0), 0, usize::from(area.height), rows.len());
+        list::render(frame, area, &rows, at, offset, ctx.accent(), ctx.theme);
     }
 
-    /// The detail pane for one box: a 14-wide label column, then the value; an open editor draws
-    /// in its row whichever box is selected, so a reload that moved the selection never leaves
-    /// someone typing into a field they cannot see.
+    /// The detail pane for one box: a `kit::form` with a 14-wide label column, one read-only row
+    /// per field; an open editor is its row's value and the form's focus, whichever box is
+    /// selected, so a reload that moved the selection never leaves someone typing into a field
+    /// they cannot see. The spec the next probe runs under follows the form.
     fn detail(
         &self,
         record: &BoxRecord,
         snapshot: &BoxesSnapshot,
         width: u16,
-        theme: &Theme,
+        ctx: &Ctx<'_>,
     ) -> Vec<Line<'static>> {
+        let theme = ctx.theme;
         let row = &record.row;
-        let room = usize::from(width).saturating_sub(LABEL_WIDTH).max(1);
-        let value_width = u16::try_from(room).unwrap_or(u16::MAX);
+        let label_column = Form::new().label_width(LABEL_WIDTH).label_column(width);
+        let value_width = width.saturating_sub(1 + label_column + FORM_GAP).max(1);
+        let read = |name: &'static str, value: String| {
+            form::Field::new(name, form::Value::ReadOnly(value.into()))
+        };
         let this_box = snapshot.this_box == Some(row.id);
-        let mut lines = vec![
-            labelled(
+        let mut fields = vec![
+            read(
                 "host",
                 format!(
                     "{}{}",
                     row.hostname,
                     if this_box { " (this box)" } else { "" }
                 ),
-                theme,
             ),
-            labelled(
+            read(
                 "os",
-                format!("{} {} \u{b7} {}", row.os_family, row.os_version, row.arch),
-                theme,
+                format!(
+                    "{} {} \u{b7} {}",
+                    label::os_family(row.os_family),
+                    row.os_version,
+                    row.arch
+                ),
             ),
-            labelled("cpu", row.cpu.clone(), theme),
-            labelled(
+            read("cpu", row.cpu.clone()),
+            read(
                 "ram",
                 row.ram_mb
                     .map_or_else(|| "unknown".to_owned(), |mb| format!("{mb} MB")),
-                theme,
             ),
-            labelled(
-                "gpu",
-                gpu(row.gpu_present, row.gpu_vendor.as_deref()),
-                theme,
-            ),
-            labelled("htui", row.htui_version.clone(), theme),
-            labelled(
+            read("gpu", gpu(row.gpu_present, row.gpu_vendor.as_deref())),
+            read("htui", row.htui_version.clone()),
+            read(
                 "last probe",
                 row.last_probed_at.map_or_else(
                     || "never probed".to_owned(),
                     |at| at.format("%Y-%m-%d %H:%M UTC").to_string(),
                 ),
-                theme,
             ),
-            labelled(
+            read(
                 "spec",
                 format!(
                     "probed under the current spec: {}",
@@ -1028,61 +1079,51 @@ impl BoxesSection {
                         "no"
                     }
                 ),
-                theme,
             ),
-            labelled("probed tags", tag_list(&row.probed_tags), theme),
+            read("probed tags", tag_list(&row.probed_tags)),
         ];
+        let mut focus = None;
 
         match &self.mode {
+            // D50: every tag seen on a listed box, as the field's help under it.
             Mode::Tags(editor) => {
-                let mut spans = vec![label("declared tags", theme)];
-                spans.extend(editor.input.line(value_width, true, theme).spans);
-                lines.push(Line::from(spans));
-                lines.push(indented(
-                    Span::styled(format!("seen: {}", seen(snapshot)), theme.dim),
-                    theme,
-                ));
+                focus = Some(fields.len());
+                fields.push(
+                    form::Field::new("declared tags", form::Value::Text(&editor.input))
+                        .help(format!("seen: {}", seen(snapshot))),
+                );
             }
-            _ => lines.push(labelled(
-                "declared tags",
-                tag_list(&row.declared_tags),
-                theme,
-            )),
+            _ => fields.push(read("declared tags", tag_list(&row.declared_tags))),
         }
 
         match &self.mode {
             Mode::Quirks(editor) => {
-                let area = editor.input.lines(value_width, QUIRKS_HEIGHT, true, theme);
-                lines.extend(under_label("quirks", area, theme));
+                focus = Some(fields.len());
+                fields.push(form::Field::new(
+                    "quirks",
+                    form::Value::Lines(editor.input.lines(value_width, QUIRKS_HEIGHT, true, theme)),
+                ));
             }
-            _ if row.quirks.is_empty() => {
-                lines.push(labelled("quirks", "(none)".to_owned(), theme))
-            }
-            _ => {
-                let note = row
-                    .quirks
-                    .lines()
-                    .map(|line| Line::styled(line.to_owned(), theme.base))
-                    .collect();
-                lines.extend(under_label("quirks", note, theme));
-            }
+            _ if row.quirks.is_empty() => fields.push(read("quirks", "(none)".to_owned())),
+            _ => fields.push(form::Field::new(
+                "quirks",
+                form::Value::Lines(
+                    row.quirks
+                        .lines()
+                        .map(|line| Line::styled(line.to_owned(), theme.base))
+                        .collect(),
+                ),
+            )),
         }
 
         match &self.mode {
+            // The flip names its own box, kept from open: after a reload that dropped it the
+            // selection is another box, and `y` still writes to the flip's.
             Mode::Executor(flip) => {
-                // The flip names its own box, kept from open: after a reload that dropped it the
-                // selection is another box, and `y` still writes to the flip's.
-                let question = wrapped(&flip.question(), room)
-                    .into_iter()
-                    .map(|line| Line::styled(line, theme.base))
-                    .collect();
-                lines.extend(under_label("executor", question, theme));
+                focus = Some(fields.len());
+                fields.push(read("executor", flip.question()));
             }
-            _ => lines.push(labelled(
-                "executor",
-                Executor::of(&row.settings).to_string(),
-                theme,
-            )),
+            _ => fields.push(read("executor", Executor::of(&row.settings).to_string())),
         }
 
         let tools: Vec<String> = record
@@ -1097,17 +1138,32 @@ impl BoxesSection {
             })
             .collect();
         if tools.is_empty() {
-            lines.push(labelled("tools", "(none)".to_owned(), theme));
+            fields.push(read("tools", "(none)".to_owned()));
         } else {
-            let wrapped_tools = wrapped(&tools.join(", "), room)
-                .into_iter()
-                .map(|line| Line::styled(line, theme.base))
-                .collect();
-            lines.extend(under_label("tools", wrapped_tools, theme));
+            fields.push(read("tools", tools.join(", ")));
         }
 
+        let form = fields
+            .into_iter()
+            .fold(Form::new().label_width(LABEL_WIDTH), Form::field);
+        // An open editor is the focused row: its label is marked and its value takes the keys.
+        let form = match focus {
+            Some(item) => form.focus(item).editing(true),
+            None => form,
+        };
+        let mut lines = form.lines(width, ctx.accent(), theme);
         lines.push(Line::default());
-        lines.extend(spec_lines(&snapshot.spec, usize::from(width).max(1), theme));
+        // Behind the form's gutter cell, so the spec lines up with the labels above it.
+        let room = usize::from(width.saturating_sub(1)).max(1);
+        lines.extend(
+            spec_lines(&snapshot.spec, room, theme)
+                .into_iter()
+                .map(|line| {
+                    let mut spans = vec![Span::raw(" ")];
+                    spans.extend(line.spans);
+                    Line::from(spans).style(line.style)
+                }),
+        );
         lines
     }
 
@@ -1173,39 +1229,6 @@ fn list_label(record: &BoxRecord, snapshot: &BoxesSnapshot, room: usize) -> Stri
     cells::clip(&label, room)
 }
 
-/// The label column's span.
-fn label(name: &str, theme: &Theme) -> Span<'static> {
-    Span::styled(format!("{name:<LABEL_WIDTH$}"), theme.dim)
-}
-
-/// One detail row: the label, then the value.
-fn labelled(name: &str, value: String, theme: &Theme) -> Line<'static> {
-    Line::from(vec![label(name, theme), Span::styled(value, theme.base)])
-}
-
-/// A continuation row: the value column, with nothing in the label column.
-fn indented(value: Span<'static>, theme: &Theme) -> Line<'static> {
-    Line::from(vec![label("", theme), value])
-}
-
-/// Several value lines: the first on the label's row, the rest indented to the value column.
-fn under_label(name: &str, values: Vec<Line<'static>>, theme: &Theme) -> Vec<Line<'static>> {
-    values
-        .into_iter()
-        .enumerate()
-        .map(|(index, value)| {
-            let head = if index == 0 {
-                label(name, theme)
-            } else {
-                label("", theme)
-            };
-            let mut spans = vec![head];
-            spans.extend(value.spans);
-            Line::from(spans)
-        })
-        .collect()
-}
-
 /// The `gpu` row: the vendor when there is one, `present` without, `none` without a GPU.
 fn gpu(present: bool, vendor: Option<&str>) -> String {
     match (present, vendor) {
@@ -1252,8 +1275,13 @@ fn render_spec(
     editor: &SpecEditor,
     theme: &Theme,
 ) {
-    let mut lines = spec_lines(&snapshot.spec, usize::from(area.width).max(1), theme);
-    lines.push(Line::styled(SPEC_TITLE, theme.dim));
+    let width = usize::from(area.width).max(1);
+    let mut lines = spec_lines(&snapshot.spec, width, theme);
+    lines.extend(
+        wrapped(SPEC_TITLE, width)
+            .into_iter()
+            .map(|line| Line::styled(line, theme.dim)),
+    );
     let used = u16::try_from(lines.len()).unwrap_or(u16::MAX);
     lines.extend(
         editor
@@ -1293,15 +1321,16 @@ mod tests {
     use htui_core::model::{BoxRow, OsFamily, UserId};
 
     /// MOD-67 M6 D4: the stale notices name the retry key, and say a save (or nothing) unbound.
+    /// The save-key editors' sentence is the shared one (MOD-115 M3 D-5).
     #[test]
     fn the_stale_notices_name_the_retry_key_or_none() {
         assert_eq!(
-            changed_elsewhere_quirks(Some("Ctrl+s")),
+            changed_elsewhere(Some("Ctrl+s")),
             "changed elsewhere since you opened it \u{2014} reloaded; Ctrl+s retries against the \
              current row"
         );
         assert_eq!(
-            changed_elsewhere_quirks(None),
+            changed_elsewhere(None),
             "changed elsewhere since you opened it \u{2014} reloaded; save again to retry against \
              the current row"
         );
@@ -1313,6 +1342,38 @@ mod tests {
         assert_eq!(
             changed_elsewhere_executor(None),
             "changed elsewhere since you opened it \u{2014} reloaded"
+        );
+    }
+
+    /// MOD-115 M3: a write in flight reads in words. Every request name has its own phrase, and
+    /// no refusal prints the name itself.
+    #[test]
+    fn a_write_in_flight_reads_in_words() {
+        for name in REQUEST_NAMES {
+            assert_ne!(doing(name), doing("unknown"), "`{name}` has its own phrase");
+            assert!(!in_flight(name).contains('_'), "{}", in_flight(name));
+        }
+        assert_eq!(
+            in_flight(EDIT_NAME),
+            "still saving the box \u{2014} wait for the store's answer"
+        );
+    }
+
+    /// MOD-115 M3 C6: the editors' hints read as before under the compiled keys.
+    #[test]
+    fn the_editor_hints_read_as_before_under_the_compiled_keys() {
+        let keys = Keys::compiled();
+        assert_eq!(
+            keys.hint(views::CAPTURE, HINT_TAGS),
+            "Enter saves \u{b7} Esc cancels \u{b7} comma-separated"
+        );
+        assert_eq!(
+            keys.hint(views::BOXES_EDITOR, HINT_QUIRKS),
+            "Ctrl+s saves \u{b7} Esc cancels \u{b7} Enter breaks the line"
+        );
+        assert_eq!(
+            keys.hint(views::BOXES_EDITOR, HINT_SPEC),
+            "Ctrl+s saves \u{b7} Esc cancels \u{b7} Enter breaks the line \u{b7} blank clears"
         );
     }
 
