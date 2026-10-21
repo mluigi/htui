@@ -757,6 +757,12 @@ pub enum StoreRequest {
     },
     /// MOD-137 D12: the editor's one write. `replace_graph` under CAS on `step_graph.revision`;
     /// `Stale` answers [`StoreReply::CatalogueStale`], a refusal `Failed { request: "replace_graph" }`.
+    ///
+    /// `body` must start from the graph's whole stored body — a
+    /// [`GraphEntry`](crate::catalogue::GraphEntry) of the catalogue, or
+    /// `WriteStore::graph_body` — and be edited from there: `replace_graph` replaces candidates,
+    /// parts and edges wholesale, so whatever a body built from less leaves out is deleted
+    /// (MOD-137 R1b, review C-M2).
     ReplaceGraph {
         /// The scope the reply re-reads.
         scope: Scope,

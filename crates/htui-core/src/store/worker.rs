@@ -136,8 +136,10 @@ pub trait RelayStore: Send + Sync {
 
 /// Every store call of the engine, `gate`, `graph::resolve` and the progress sink (plan D4).
 ///
-/// `graph::override_graph`'s eight extra methods are deliberately absent: it has no production
-/// caller and keeps its [`WriteStore`] bound.
+/// `graph::override_graph`'s ten extra methods (`graph_body`, `step_graphs`, `items`,
+/// `create_step_graph`, `replace_graph`, `skill_bindings`, `skills`, `skill_versions`,
+/// `set_skill_binding`, `update_item`) are deliberately absent: it has no production caller and
+/// keeps its [`WriteStore`] bound.
 pub trait WorkerStore: RecorderStore + RelayStore {
     // -- 14 ReadStore reads
     /// [`ReadStore::item`].

@@ -293,6 +293,19 @@ str_enum!(
     }
 );
 
+impl Split {
+    /// The split `fan_out` implies for a node that does not divide: [`Split::Compete`] exactly
+    /// when `fan_out > 1`, else [`Split::None`] (`ck_phase_split_fan_out`, MOD-137 D7).
+    #[must_use]
+    pub const fn for_fan_out(fan_out: i32) -> Self {
+        if fan_out > 1 {
+            Self::Compete
+        } else {
+            Self::None
+        }
+    }
+}
+
 str_enum!(
     /// `step_graph_phase.plan_scope` (MOD-137 D7, ANA-33 §7.5): what a planner node may plan.
     PlanScope {
@@ -1019,6 +1032,15 @@ mod tests {
     #[test]
     fn split_defaults_to_none() {
         assert_eq!(Split::default(), Split::None);
+    }
+
+    /// MOD-137 D7 (`ck_phase_split_fan_out`): the split a `fan_out` implies short of `divide`.
+    #[test]
+    fn split_for_fan_out_is_compete_exactly_above_one() {
+        assert_eq!(Split::for_fan_out(0), Split::None);
+        assert_eq!(Split::for_fan_out(1), Split::None);
+        assert_eq!(Split::for_fan_out(2), Split::Compete);
+        assert_eq!(Split::for_fan_out(4), Split::Compete);
     }
 
     /// MOD-137 D7: a phase serialised before the ten v2 keys existed decodes with their defaults.
