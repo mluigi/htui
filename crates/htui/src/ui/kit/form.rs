@@ -275,8 +275,22 @@ fn marked(
         ellipsize(line, width)
     };
     let mut spans = vec![gutter];
-    spans.extend(line.spans);
-    Line::from(spans).style(line.style)
+    spans.extend(own_spans(line));
+    Line::from(spans)
+}
+
+/// `line`'s spans with its own style patched under each, so they draw as they did on their
+/// line while the gutter put before them keeps out of that style (a band ends at the gutter, as
+/// `kit::list` draws it).
+fn own_spans(line: Line<'static>) -> Vec<Span<'static>> {
+    let style = line.style;
+    line.spans
+        .into_iter()
+        .map(|span| {
+            let patched = style.patch(span.style);
+            span.style(patched)
+        })
+        .collect()
 }
 
 /// The geometry and focus state one field's rows are laid out with.
@@ -314,8 +328,8 @@ impl Rows {
                         theme,
                     );
                     let mut out = vec![gutter.clone()];
-                    out.extend(banded.spans);
-                    Line::from(out).style(banded.style)
+                    out.extend(own_spans(banded));
+                    Line::from(out)
                 } else {
                     let name = if self.focused {
                         selection_band(name, self.label, theme)
@@ -582,6 +596,45 @@ mod tests {
         // Browsing the same row bands it whole, and the field shows no cursor.
         let buffer = draw(&form.clone().editing(false), 30, 2, 0, &theme);
         assert!((1..30).all(|x| buffer[(x, 0)].modifier.contains(Modifier::REVERSED)));
+    }
+
+    #[test]
+    fn the_focus_marker_stays_outside_the_band_as_a_list_rows_does() {
+        let field = TextField::with_text("htui");
+        let form = Form::new()
+            .field(Field::new("name", Value::Text(&field)))
+            .heading("group")
+            .blank()
+            .field(Field::new("mode", Value::Toggle(true)).style(Style::new().fg(Color::Gray)));
+        for theme in [Theme::default(), Theme::monochrome()] {
+            for item in 0..4 {
+                for editing in [false, true] {
+                    let form = form.clone().focus(item).editing(editing);
+                    let buffer = draw(&form, 30, 4, 0, &theme);
+                    let y = u16::try_from(item).unwrap();
+                    let marker = &buffer[(0, y)];
+                    let banded = &buffer[(1, y)];
+                    assert_eq!(marker.symbol(), GUTTER, "item {item}");
+                    assert!(
+                        !marker.modifier.contains(Modifier::REVERSED),
+                        "item {item}, editing {editing}: {marker:?}"
+                    );
+                    assert_ne!(
+                        Some(marker.bg),
+                        theme.selected.bg,
+                        "item {item}, editing {editing}: {marker:?}"
+                    );
+                    assert_eq!(
+                        banded.modifier.contains(Modifier::REVERSED),
+                        theme.selected.add_modifier.contains(Modifier::REVERSED),
+                        "item {item}: the band still starts at cell 1"
+                    );
+                    if theme.selected.bg.is_some() {
+                        assert_eq!(Some(banded.bg), theme.selected.bg, "item {item}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
