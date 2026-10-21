@@ -204,8 +204,7 @@ fn mint_failed(why: &str, save: Option<&str>) -> String {
 }
 
 /// A `RequirementsStale` over an open form: the text is kept and the token moved to the head.
-/// The tab's own sentence rather than Settings' `CHANGED_ELSEWHERE`, whose retry is `Enter`
-/// (blueprint F-1). `save` is `FormSave`'s label through the open form's stack (MOD-67 M6 D4);
+/// The tab's own sentence rather than Settings' `changed_elsewhere(retry)` (blueprint F-1). `save` is `FormSave`'s label through the open form's stack (MOD-67 M6 D4);
 /// with none bound the clause goes.
 fn requirement_changed_elsewhere(head: i32, save: Option<&str>) -> String {
     let kept =

@@ -124,7 +124,7 @@ const REVIEW_WIRE: &str = "wire: first 3 lines `---` / `verdict: approve|request
 const JUDGE_WIRE: &str = "wire: end with one ```json block {winner, reasons}";
 
 /// `TemplatesStale` over an open editor (plan D11). The view's own sentence, not the Settings
-/// tab's `CHANGED_ELSEWHERE`: that one names `Enter`, which is not this editor's key. `save` is
+/// tab's `changed_elsewhere(retry)`, which names its editor's retry key, not this one's. `save` is
 /// `FormSave`'s label through `TEMPLATES_EDITOR` (MOD-67 M6 D4); with none bound the sentence
 /// says what saving writes.
 fn template_changed_elsewhere(head: i32, save: Option<&str>) -> String {

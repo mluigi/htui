@@ -3704,8 +3704,8 @@ const IDLE_NOTE: &str = "quota latches per chat, r cannot refresh it";
 /// What an edit that changed nothing says (blueprint §5.1).
 const UNCHANGED: &str = "nothing changed; nothing was written";
 
-/// `settings/mod.rs`'s `CHANGED_ELSEWHERE`, which is `pub(crate)`: the section's own sentence for
-/// a spent token under an open editor.
+/// `settings/mod.rs`'s `changed_elsewhere(retry)` under the compiled keys, which is `pub(crate)`:
+/// the section's own sentence for a spent token under an open editor.
 const CHANGED_ELSEWHERE: &str = "changed elsewhere since you opened it \u{2014} reloaded; Enter retries against the current row";
 
 /// `settings/mod.rs`'s `DELETED_ELSEWHERE`, for the same reason.
