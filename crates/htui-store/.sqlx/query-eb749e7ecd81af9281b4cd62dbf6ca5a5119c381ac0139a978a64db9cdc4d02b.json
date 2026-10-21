@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT EXISTS (SELECT 1 FROM step_graph_phase\n                        WHERE graph_id = $1 AND position = $2\n                          AND id IS DISTINCT FROM $4) AS \"position!\",\n               EXISTS (SELECT 1 FROM step_graph_phase\n                        WHERE graph_id = $1 AND name = $3\n                          AND id IS DISTINCT FROM $4) AS \"name!\",\n               EXISTS (SELECT 1 FROM step_graph_phase WHERE id = $5) AS \"id!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "position!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "name!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "id!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Text",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "eb749e7ecd81af9281b4cd62dbf6ca5a5119c381ac0139a978a64db9cdc4d02b"
+}

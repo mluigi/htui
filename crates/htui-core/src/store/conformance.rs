@@ -22969,6 +22969,19 @@ async fn create_phase_keeps_split_in_step_with_fan_out<S: WriteStore>(store: &S)
         &references_no_row("step_graph_phase.planner_persona_id", ghost, "persona"),
         "an unknown planner persona",
     );
+    // Review R1 A-L4: an id any graph's phase holds is refused before the persona is looked up.
+    constraint_exactly(
+        CASE,
+        store
+            .create_phase(&StepGraphPhase {
+                id: ids::PHASE_HTUI_IMPLEMENT,
+                persona_id: Some(ghost),
+                ..new_phase(graph, 1, "borrowed")
+            })
+            .await,
+        &already_exists("step_graph_phase", ids::PHASE_HTUI_IMPLEMENT),
+        "a phase id another graph holds, before an unknown persona",
+    );
     assert_eq!(
         store.phases(graph).await.expect(CASE),
         vec![raced],

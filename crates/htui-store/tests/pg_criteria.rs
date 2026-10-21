@@ -11144,3 +11144,472 @@ async fn replace_graph_waits_for_a_concurrent_phase_write() {
 
     db.drop_db().await;
 }
+
+/// The graph `revision` as `graph_body` reads it.
+async fn graph_revision(store: &PgStore, graph: htui_core::model::StepGraphId) -> i64 {
+    store
+        .graph_body(graph)
+        .await
+        .expect("read the graph")
+        .expect("the graph exists")
+        .graph
+        .revision
+}
+
+/// A new phase of `graph` at `position`, every other column copied from `like`, written through
+/// `create_phase`.
+async fn scratch_phase(
+    store: &PgStore,
+    like: &htui_core::model::StepGraphPhase,
+    position: i32,
+) -> htui_core::model::StepGraphPhase {
+    store
+        .create_phase(&htui_core::model::StepGraphPhase {
+            id: htui_core::model::PhaseId::new(),
+            position,
+            name: format!("race-{position}"),
+            ..like.clone()
+        })
+        .await
+        .expect("create a scratch phase")
+}
+
+/// MOD-137 review R1 A-M1: a second connection bumps `graph` (holding its row) and runs `sql`
+/// with `row` bound, the concurrent delete; then `write` starts, and once it waits on the graph
+/// row the second connection commits. Answers what `write` answered.
+async fn behind_a_concurrent_graph_delete<T: Send + 'static>(
+    url: &str,
+    graph: htui_core::model::StepGraphId,
+    sql: &'static str,
+    row: uuid::Uuid,
+    write: impl Future<Output = T> + Send + 'static,
+) -> T {
+    let mut racer = PgConnection::connect(url)
+        .await
+        .expect("a second connection");
+    sqlx::raw_sql("BEGIN")
+        .execute(&mut racer)
+        .await
+        .expect("BEGIN on the racing connection");
+    sqlx::query("UPDATE step_graph SET revision = revision + 1 WHERE id = $1")
+        .bind(graph.as_uuid())
+        .execute(&mut racer)
+        .await
+        .expect("the racing bump, graph row first");
+    sqlx::query(sql)
+        .bind(row)
+        .execute(&mut racer)
+        .await
+        .expect("the racing delete");
+    let writing = tokio::spawn(write);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !writing.is_finished(),
+        "the writer waits on the graph row the racer holds"
+    );
+    sqlx::raw_sql("COMMIT")
+        .execute(&mut racer)
+        .await
+        .expect("COMMIT on the racing connection");
+    racer.close().await.expect("close the racing connection");
+    tokio::time::timeout(std::time::Duration::from_secs(5), writing)
+        .await
+        .expect("the writer finishes once the racer commits")
+        .expect("the writer task")
+}
+
+/// MOD-137 review R1 A-M1: the bump's `UPDATE step_graph ... FROM step_graph_phase` (or
+/// `step_graph_edge`) re-checks only the graph row after waiting on its lock and reuses the
+/// joined row it read before the wait, so the bump lands for a phase or edge a concurrent
+/// transaction deleted. A new statement after the bump decides existence: each writer answers
+/// `NotFound` for its own entity and rolls its bump back (the revision moved once, the racer's).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_graph_write_behind_a_concurrent_delete_answers_not_found() {
+    use htui_core::model::PhasePatch;
+    use htui_core::store::StoreError;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let graph = ids::GRAPH_HTUI_FEAT;
+    let like = db
+        .store
+        .phases(graph)
+        .await
+        .expect("read the feature graph's phases")
+        .into_iter()
+        .next()
+        .expect("the feature graph has phases");
+    let not_found = |answer: &Result<(), StoreError>, entity: &str| matches!(answer, Err(StoreError::NotFound { entity: e, .. }) if *e == entity);
+
+    // delete_edge
+    let edge = db
+        .store
+        .graph_edges(graph)
+        .await
+        .expect("read the feature graph's edges")
+        .first()
+        .map(|edge| edge.id)
+        .expect("the feature graph has edges");
+    let before = graph_revision(&db.store, graph).await;
+    let store = db.store.clone();
+    let answer = behind_a_concurrent_graph_delete(
+        &db.url,
+        graph,
+        "DELETE FROM step_graph_edge WHERE id = $1",
+        edge.as_uuid(),
+        async move { store.delete_edge(edge).await },
+    )
+    .await;
+    assert!(
+        not_found(&answer, "step_graph_edge"),
+        "delete_edge behind a concurrent delete is NotFound, got {answer:?}"
+    );
+    assert_eq!(
+        graph_revision(&db.store, graph).await,
+        before + 1,
+        "delete_edge rolled its bump back"
+    );
+
+    // delete_phase_agents
+    let phase = scratch_phase(&db.store, &like, 101).await;
+    let before = graph_revision(&db.store, graph).await;
+    let store = db.store.clone();
+    let answer = behind_a_concurrent_graph_delete(
+        &db.url,
+        graph,
+        "DELETE FROM step_graph_phase WHERE id = $1",
+        phase.id.as_uuid(),
+        async move { store.delete_phase_agents(phase.id).await },
+    )
+    .await;
+    assert!(
+        not_found(&answer, "step_graph_phase"),
+        "delete_phase_agents behind a concurrent delete is NotFound, got {answer:?}"
+    );
+    assert_eq!(
+        graph_revision(&db.store, graph).await,
+        before + 1,
+        "delete_phase_agents rolled its bump back"
+    );
+
+    // delete_phase
+    let phase = scratch_phase(&db.store, &like, 102).await;
+    let before = graph_revision(&db.store, graph).await;
+    let store = db.store.clone();
+    let answer = behind_a_concurrent_graph_delete(
+        &db.url,
+        graph,
+        "DELETE FROM step_graph_phase WHERE id = $1",
+        phase.id.as_uuid(),
+        async move { store.delete_phase(phase.id).await },
+    )
+    .await;
+    assert!(
+        not_found(&answer, "step_graph_phase"),
+        "delete_phase behind a concurrent delete is NotFound, got {answer:?}"
+    );
+    assert_eq!(
+        graph_revision(&db.store, graph).await,
+        before + 1,
+        "delete_phase rolled its bump back"
+    );
+
+    // update_phase
+    let phase = scratch_phase(&db.store, &like, 103).await;
+    let before = graph_revision(&db.store, graph).await;
+    let store = db.store.clone();
+    let answer = behind_a_concurrent_graph_delete(
+        &db.url,
+        graph,
+        "DELETE FROM step_graph_phase WHERE id = $1",
+        phase.id.as_uuid(),
+        async move {
+            store
+                .update_phase(
+                    phase.id,
+                    phase.updated_at,
+                    PhasePatch {
+                        gate_hard: Some(!phase.gate_hard),
+                        ..PhasePatch::default()
+                    },
+                )
+                .await
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            answer,
+            Err(StoreError::NotFound {
+                entity: "step_graph_phase",
+                ..
+            })
+        ),
+        "update_phase behind a concurrent delete is NotFound, got {answer:?}"
+    );
+    assert_eq!(
+        graph_revision(&db.store, graph).await,
+        before + 1,
+        "update_phase rolled its bump back"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-137 review R1 A-L1: a second connection holds `graph`'s row `FOR NO KEY UPDATE`; `write`
+/// starts and must wait on it; then, under a short `lock_timeout`, the second connection takes
+/// `phase`'s row `FOR UPDATE`, which succeeds only if the writer has not touched the phase before
+/// its bump (blueprint §1.4, F7: graph row first). Answers what `write` answered once the second
+/// connection commits.
+async fn the_writer_bumps_before_it_touches_the_phase<T: Send + 'static>(
+    url: &str,
+    graph: htui_core::model::StepGraphId,
+    phase: htui_core::model::PhaseId,
+    write: impl Future<Output = T> + Send + 'static,
+) -> T {
+    let mut racer = PgConnection::connect(url)
+        .await
+        .expect("a second connection");
+    sqlx::raw_sql("BEGIN")
+        .execute(&mut racer)
+        .await
+        .expect("BEGIN on the racing connection");
+    sqlx::query("SELECT 1 FROM step_graph WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(graph.as_uuid())
+        .execute(&mut racer)
+        .await
+        .expect("hold the graph row");
+    let writing = tokio::spawn(write);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !writing.is_finished(),
+        "the writer waits on the graph row the racer holds"
+    );
+    sqlx::raw_sql("SET LOCAL lock_timeout = '200ms'")
+        .execute(&mut racer)
+        .await
+        .expect("a short lock_timeout");
+    let locked = sqlx::query("SELECT 1 FROM step_graph_phase WHERE id = $1 FOR UPDATE")
+        .bind(phase.as_uuid())
+        .fetch_optional(&mut racer)
+        .await;
+    assert!(
+        matches!(locked, Ok(Some(_))),
+        "the phase row is free while the writer waits on the graph row, got {locked:?}"
+    );
+    sqlx::raw_sql("COMMIT")
+        .execute(&mut racer)
+        .await
+        .expect("COMMIT on the racing connection");
+    racer.close().await.expect("close the racing connection");
+    tokio::time::timeout(std::time::Duration::from_secs(5), writing)
+        .await
+        .expect("the writer finishes once the racer commits")
+        .expect("the writer task")
+}
+
+/// MOD-137 review R1 A-L1: the real writers keep F7's lock order, graph row before phase row,
+/// which `replace_graph_waits_for_a_concurrent_phase_write` only plays with raw SQL.
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_writers_lock_the_graph_row_before_the_phase_row() {
+    use htui_core::model::{PhaseAgent, PhasePatch};
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let graph = ids::GRAPH_HTUI_FEAT;
+    let like = db
+        .store
+        .phases(graph)
+        .await
+        .expect("read the feature graph's phases")
+        .into_iter()
+        .next()
+        .expect("the feature graph has phases");
+
+    let phase = scratch_phase(&db.store, &like, 111).await;
+    let store = db.store.clone();
+    let answer =
+        the_writer_bumps_before_it_touches_the_phase(&db.url, graph, phase.id, async move {
+            store
+                .update_phase(
+                    phase.id,
+                    phase.updated_at,
+                    PhasePatch {
+                        gate_hard: Some(!phase.gate_hard),
+                        ..PhasePatch::default()
+                    },
+                )
+                .await
+        })
+        .await;
+    assert!(
+        matches!(answer, Ok(CasOutcome::Applied(_))),
+        "update_phase lands after the wait, got {answer:?}"
+    );
+
+    let phase = scratch_phase(&db.store, &like, 112).await;
+    let store = db.store.clone();
+    let answer =
+        the_writer_bumps_before_it_touches_the_phase(&db.url, graph, phase.id, async move {
+            store
+                .create_phase_agents(
+                    phase.id,
+                    &[PhaseAgent {
+                        phase_id: phase.id,
+                        position: 0,
+                        agent_id: ids::AGENT_CLAUDE,
+                        model: "opus".to_owned(),
+                    }],
+                )
+                .await
+        })
+        .await;
+    assert!(
+        answer.is_ok(),
+        "create_phase_agents lands after the wait, got {answer:?}"
+    );
+
+    let phase = scratch_phase(&db.store, &like, 113).await;
+    let store = db.store.clone();
+    let answer =
+        the_writer_bumps_before_it_touches_the_phase(&db.url, graph, phase.id, async move {
+            store.delete_phase(phase.id).await
+        })
+        .await;
+    assert!(
+        answer.is_ok(),
+        "delete_phase lands after the wait, got {answer:?}"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-137 review R1 A-L3: a graph name committed after `replace_graph`'s name pre-read (step 3)
+/// reaches step 7's `UPDATE` as the scope unique's `23505`, and is worded as the pre-read words
+/// it, never as raw driver text.
+#[tokio::test(flavor = "multi_thread")]
+async fn replace_graph_words_a_name_taken_behind_its_pre_read() {
+    use htui_core::model::GraphScope;
+    use htui_core::store::{StoreError, graph_name_is_taken};
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let graph = ids::GRAPH_HTUI_FEAT;
+    let mut body = db
+        .store
+        .graph_body(graph)
+        .await
+        .expect("read the feature graph")
+        .expect("the fixture's feature graph");
+    let revision = body.graph.revision;
+    body.graph.name = "taken-late".to_owned();
+
+    let mut racer = PgConnection::connect(&db.url)
+        .await
+        .expect("a second connection");
+    sqlx::raw_sql("BEGIN")
+        .execute(&mut racer)
+        .await
+        .expect("BEGIN on the racing connection");
+    sqlx::query(
+        "INSERT INTO step_graph (id, project_id, name, description) VALUES ($1, $2, 'taken-late', '')",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(ids::PROJECT_HTUI.as_uuid())
+    .execute(&mut racer)
+    .await
+    .expect("the racing graph, not yet committed");
+
+    let store = db.store.clone();
+    let replacing = tokio::spawn(async move { store.replace_graph(graph, revision, body).await });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !replacing.is_finished(),
+        "the rename waits on the uncommitted name in the scope's unique index"
+    );
+    sqlx::raw_sql("COMMIT")
+        .execute(&mut racer)
+        .await
+        .expect("COMMIT on the racing connection");
+    racer.close().await.expect("close the racing connection");
+
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(5), replacing)
+        .await
+        .expect("replace_graph finishes once the racer commits")
+        .expect("the replace task");
+    assert_eq!(
+        answer,
+        Err(StoreError::Constraint(graph_name_is_taken(
+            "taken-late",
+            GraphScope::Project(ids::PROJECT_HTUI),
+        ))),
+        "the lost race reads as the pre-read's sentence"
+    );
+    assert_eq!(
+        graph_revision(&db.store, graph).await,
+        revision,
+        "the refused replace wrote nothing"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-137 review R1 A-L5: `load_demo` writes every column a fixture graph and phase carry, so a
+/// demo with MOD-137 D7's node columns (or a moved revision) loads as `MemStore::from_demo` holds
+/// it, never with those columns silently at their defaults.
+#[tokio::test(flavor = "multi_thread")]
+async fn load_demo_keeps_every_graph_and_phase_column() {
+    use htui_core::model::{PlanScope, Split};
+
+    let Some(mut db) = common::fresh_db().await else {
+        return;
+    };
+    let mut data = htui_core::fixtures::demo_data();
+    let phase = data
+        .phases
+        .iter_mut()
+        .find(|row| row.id == ids::PHASE_HTUI_IMPLEMENT)
+        .expect("the fixture's implement phase");
+    phase.split = Split::Divide;
+    phase.fan_out = 1;
+    phase.palette = true;
+    phase.plan_scope = Some(PlanScope::Graph);
+    phase.planner_persona_id = Some(ids::PERSONA_REVIEWER);
+    phase.planner_agent_id = Some(ids::AGENT_CLAUDE);
+    phase.planner_model = Some("opus".to_owned());
+    phase.integrate_persona_id = Some(ids::PERSONA_ARCHITECT);
+    phase.integrate_agent_id = Some(ids::AGENT_AGY);
+    phase.integrate_model = Some("sonnet".to_owned());
+    phase.max_parts = Some(3);
+    let phase = phase.clone();
+    let graph = data
+        .graphs
+        .iter_mut()
+        .find(|row| row.id == phase.graph_id)
+        .expect("the implement phase's graph");
+    graph.revision = 7;
+    graph.is_override = true;
+    let graph = graph.clone();
+
+    db.store.load_demo(&data).await.expect("load the demo");
+    let body = db
+        .store
+        .graph_body(graph.id)
+        .await
+        .expect("read the graph")
+        .expect("the graph loaded");
+    assert_eq!(body.graph, graph, "every step_graph column loaded");
+    assert_eq!(
+        body.nodes
+            .iter()
+            .find(|node| node.phase.id == phase.id)
+            .map(|node| &node.phase),
+        Some(&phase),
+        "every step_graph_phase column loaded"
+    );
+
+    db.drop_db().await;
+}

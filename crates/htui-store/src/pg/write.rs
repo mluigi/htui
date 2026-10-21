@@ -919,6 +919,11 @@ async fn bump_graph(conn: &mut PgConnection, graph: StepGraphId) -> Result<bool>
 }
 
 /// [`bump_graph`] through a phase: `None` when the phase names no row.
+///
+/// `Some` does **not** prove the phase still exists (review R1 A-M1): after waiting on the graph
+/// row lock, `UPDATE ... FROM` re-checks only the graph row and reuses the phase row it joined
+/// before the wait, so a phase a concurrent transaction deleted still bumps. The caller's next
+/// statement, which takes a new snapshot, must decide existence and roll back on a miss.
 async fn bump_graph_of_phase(
     conn: &mut PgConnection,
     phase: PhaseId,
@@ -941,13 +946,16 @@ async fn bump_graph_of_phase(
 /// `uq_step_graph_phase_{position,name}` are checked after every FK trigger, so the statement
 /// would report an unknown persona or agent before a clash. Run inside the writer's transaction,
 /// after its bump has locked the graph row, against the row as it will be written; `except` is
-/// the row's own id on an update. Position first, then name, `MemStore`'s order and sentences.
+/// the row's own id on an update. `new` is the id an insert mints (`None` on an update): one held
+/// by any graph's phase is refused here, so the persona and agent pre-read cannot answer first
+/// (review R1 A-L4). Position first, then name, then the id, `MemStore`'s order and sentences.
 async fn phase_clash(
     conn: &mut PgConnection,
     graph: StepGraphId,
     position: i32,
     name: &str,
     except: Option<PhaseId>,
+    new: Option<PhaseId>,
 ) -> Result<Option<String>> {
     let clash = sqlx::query!(
         r#"
@@ -956,12 +964,14 @@ async fn phase_clash(
                           AND id IS DISTINCT FROM $4) AS "position!",
                EXISTS (SELECT 1 FROM step_graph_phase
                         WHERE graph_id = $1 AND name = $3
-                          AND id IS DISTINCT FROM $4) AS "name!"
+                          AND id IS DISTINCT FROM $4) AS "name!",
+               EXISTS (SELECT 1 FROM step_graph_phase WHERE id = $5) AS "id!"
         "#,
         graph.as_uuid(),
         position,
         name,
         except.map(PhaseId::as_uuid),
+        new.map(PhaseId::as_uuid),
     )
     .fetch_one(conn)
     .await
@@ -970,6 +980,8 @@ async fn phase_clash(
         Some(phase_position_is_taken(position, graph))
     } else if clash.name {
         Some(phase_name_is_taken(name, graph))
+    } else if let Some(id) = new.filter(|_| clash.id) {
+        Some(already_exists("step_graph_phase", id))
     } else {
         None
     })
@@ -3461,11 +3473,14 @@ impl WriteStore for PgStore {
         .await;
         let updated = match (updated, name) {
             (Err(err), Some(name)) => {
-                let scope = self
-                    .step_graph_row(id)
-                    .await?
-                    .map_or(GraphScope::Library, |row| row.scope);
-                return Err(graph_name_refused(err, &name, scope));
+                // Review R1 A-L6: a row deleted since the clash has no scope to word it in.
+                let Some(row) = self.step_graph_row(id).await? else {
+                    return Err(StoreError::NotFound {
+                        entity: "step_graph",
+                        id: id.to_string(),
+                    });
+                };
+                return Err(graph_name_refused(err, &name, row.scope));
             }
             (updated, _) => updated.map_err(map_sqlx)?,
         };
@@ -3499,8 +3514,9 @@ impl WriteStore for PgStore {
     /// name; a node CHECK [`phase_row_refusal`] decides (`split`/`fan_out`, divide columns off a
     /// divide node, `max_parts` below one, then `fan_out` below one and a negative
     /// `retry_limit`); a `graph_id` that names no row (the bump touches no
-    /// row); a taken `(graph_id, position)`, then `(graph_id, name)`, decided by
-    /// [`phase_clash`]'s pre-read since 0020's deferrable uniques report after the foreign keys;
+    /// row); a taken `(graph_id, position)`, then `(graph_id, name)`, then an `id` any phase holds
+    /// ([`already_exists`]), decided by [`phase_clash`]'s pre-read since 0020's deferrable uniques
+    /// report after the foreign keys;
     /// then `persona_id`, `planner_persona_id`, `integrate_persona_id`, `planner_agent_id`,
     /// `integrate_agent_id` naming no row, decided by [`phase_reference_refusal`]'s pre-read and
     /// worded `references_no_row("step_graph_phase.<column>", id, "persona" | "agent")` (MOD-26
@@ -3522,8 +3538,15 @@ impl WriteStore for PgStore {
                 "step_graph",
             )));
         }
-        if let Some(clash) =
-            phase_clash(&mut tx, phase.graph_id, phase.position, &phase.name, None).await?
+        if let Some(clash) = phase_clash(
+            &mut tx,
+            phase.graph_id,
+            phase.position,
+            &phase.name,
+            None,
+            Some(phase.id),
+        )
+        .await?
         {
             return Err(StoreError::Constraint(clash));
         }
@@ -3663,9 +3686,16 @@ impl WriteStore for PgStore {
             "#,
             id.as_uuid(),
         )
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(map_sqlx)?;
+        // Review R1 A-M1: the bump's join reuses the phase row it read before waiting on the
+        // graph row lock, so it lands for a phase deleted meanwhile; this read is a new statement
+        // and decides existence.
+        let Some(current) = current else {
+            tx.rollback().await.map_err(map_sqlx)?;
+            return cas_miss(None, "step_graph_phase", id);
+        };
         // `MemStore`'s order: not found, then `Stale`, then the clash, then the persona.
         if current.updated_at != expected {
             tx.rollback().await.map_err(map_sqlx)?;
@@ -3677,6 +3707,7 @@ impl WriteStore for PgStore {
             patch.position.unwrap_or(current.position),
             patch.name.as_deref().unwrap_or(&current.name),
             Some(id),
+            None,
         )
         .await?
         {
@@ -3937,7 +3968,8 @@ impl WriteStore for PgStore {
             return Err(StoreError::Constraint(refusal));
         }
 
-        // 7. The graph row's two editable columns.
+        // 7. The graph row's two editable columns; a name taken by a graph committed after step
+        //    3's read is the scope's unique, worded as step 3 words it (review R1 A-L3).
         sqlx::query!(
             "UPDATE step_graph SET name = $2, description = $3 WHERE id = $1",
             graph.as_uuid(),
@@ -3946,7 +3978,7 @@ impl WriteStore for PgStore {
         )
         .execute(&mut *tx)
         .await
-        .map_err(map_sqlx)?;
+        .map_err(|err| graph_name_refused(err, &body.graph.name, scope))?;
 
         // 8. The dropped nodes, cascading their candidates, parts, edges and phase bindings;
         //    what is left of the graph's phases is the kept set.
@@ -4051,21 +4083,31 @@ impl WriteStore for PgStore {
     /// MOD-137 D11 (blueprint §1.4 row 8): bump first, then the delete, whose cascade takes the
     /// candidates, parts, edges and phase bindings.
     ///
+    /// The bump's join reuses the phase row it read before waiting on the graph row lock (review
+    /// R1 A-M1), so it can land for a phase a concurrent transaction deleted; the `DELETE`, a new
+    /// statement with a new snapshot, is what decides existence, and a miss rolls the bump back.
+    ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] `"step_graph_phase"` for an unknown id.
     async fn delete_phase(&self, id: PhaseId) -> Result<()> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
-        if bump_graph_of_phase(&mut tx, id).await?.is_none() {
+        let deleted = if bump_graph_of_phase(&mut tx, id).await?.is_some() {
+            sqlx::query!("DELETE FROM step_graph_phase WHERE id = $1", id.as_uuid())
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?
+                .rows_affected()
+        } else {
+            0
+        };
+        if deleted == 0 {
+            tx.rollback().await.map_err(map_sqlx)?;
             return Err(StoreError::NotFound {
                 entity: "step_graph_phase",
                 id: id.to_string(),
             });
         }
-        sqlx::query!("DELETE FROM step_graph_phase WHERE id = $1", id.as_uuid())
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx)?;
         tx.commit().await.map_err(map_sqlx)
     }
 
@@ -4088,16 +4130,24 @@ impl WriteStore for PgStore {
         .fetch_optional(&mut *tx)
         .await
         .map_err(map_sqlx)?;
-        if bumped.is_none() {
+        // Review R1 A-M1: the bump may have joined an edge deleted while it waited; the `DELETE`
+        // decides, and a miss rolls the bump back.
+        let deleted = if bumped.is_some() {
+            sqlx::query!("DELETE FROM step_graph_edge WHERE id = $1", id.as_uuid())
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?
+                .rows_affected()
+        } else {
+            0
+        };
+        if deleted == 0 {
+            tx.rollback().await.map_err(map_sqlx)?;
             return Err(StoreError::NotFound {
                 entity: "step_graph_edge",
                 id: id.to_string(),
             });
         }
-        sqlx::query!("DELETE FROM step_graph_edge WHERE id = $1", id.as_uuid())
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx)?;
         tx.commit().await.map_err(map_sqlx)
     }
 
@@ -4109,7 +4159,20 @@ impl WriteStore for PgStore {
     /// [`StoreError::NotFound`] `"step_graph_phase"` for an unknown phase.
     async fn delete_phase_agents(&self, phase: PhaseId) -> Result<()> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
-        if bump_graph_of_phase(&mut tx, phase).await?.is_none() {
+        // Review R1 A-M1: the bump may have joined a phase deleted while it waited, and the
+        // candidates' `DELETE` touches no row for a phase with none, so a new statement decides
+        // existence (and holds the row against a delete until commit); a miss rolls back.
+        let exists = bump_graph_of_phase(&mut tx, phase).await?.is_some()
+            && sqlx::query_scalar!(
+                r#"SELECT 1 AS "one!" FROM step_graph_phase WHERE id = $1 FOR KEY SHARE"#,
+                phase.as_uuid(),
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .is_some();
+        if !exists {
+            tx.rollback().await.map_err(map_sqlx)?;
             return Err(StoreError::NotFound {
                 entity: "step_graph_phase",
                 id: phase.to_string(),
@@ -4143,14 +4206,22 @@ impl WriteStore for PgStore {
         phase_parts_on(&self.pool, phase).await
     }
 
-    /// The whole body, read on one connection.
+    /// The whole body, read in one `REPEATABLE READ READ ONLY` transaction (review R1 A-L2):
+    /// [`graph_body_on`]'s five statements share one snapshot, so a write committed between
+    /// two of them cannot tear the body (a graph row of one revision with phases of another).
     ///
     /// # Errors
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
     async fn graph_body(&self, graph: StepGraphId) -> Result<Option<GraphBody>> {
-        let mut conn = self.pool.acquire().await.map_err(map_sqlx)?;
-        graph_body_on(&mut conn, graph).await
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        sqlx::raw_sql("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        let body = graph_body_on(&mut tx, graph).await?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(body)
     }
 
     // prompt_template (MOD-9 milestone 1)

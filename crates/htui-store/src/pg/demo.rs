@@ -13,8 +13,8 @@
 use htui_core::fixtures::DemoData;
 use htui_core::model::{
     AgentId, BoxId, CommandQueue, DocumentId, Gate, GateOutcome, Isolation, ItemId, ItemKindId,
-    NoteId, PersonaId, PhaseId, ProjectId, RequirementAreaId, RequirementId, Resolution, RunId,
-    SkillBindingId, SkillId, StepGraphId, StepId, UserId, WorkspaceId,
+    NoteId, PersonaId, PhaseId, PlanScope, ProjectId, RequirementAreaId, RequirementId, Resolution,
+    RunId, SkillBindingId, SkillId, Split, StepGraphId, StepId, UserId, WorkspaceId,
 };
 use htui_core::store::{Result, StoreError};
 
@@ -222,13 +222,19 @@ impl PgStore {
         }
 
         for row in &data.graphs {
+            // Every column `StepGraph` carries (review R1 A-L5): a fixture graph loads as
+            // `MemStore::from_demo` holds it.
             sqlx::query!(
-                "INSERT INTO step_graph (id, project_id, name, description, created_at, \
-                 updated_at) VALUES ($1, $2, $3, $4, $5, $6)",
+                "INSERT INTO step_graph (id, project_id, workspace_id, name, description, \
+                 is_override, revision, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                 StepGraphId::as_uuid(row.id),
                 row.scope.project_id().map(ProjectId::as_uuid),
+                row.scope.workspace_id().map(WorkspaceId::as_uuid),
                 row.name,
                 row.description,
+                row.is_override,
+                row.revision,
                 row.created_at,
                 row.updated_at,
             )
@@ -237,14 +243,17 @@ impl PgStore {
             .map_err(map_sqlx)?;
         }
 
+        // Every column `StepGraphPhase` carries, MOD-137 D7's ten included (review R1 A-L5).
         for row in &data.phases {
             sqlx::query!(
                 "INSERT INTO step_graph_phase (id, graph_id, position, name, fan_out, gate, \
                  gate_hard, retry_limit, input_kinds, output_kind, isolation, command_queue, \
                  verify_command, template_name, template_version, token_budget, updated_at, \
-                 persona_id) \
+                 persona_id, split, palette, plan_scope, planner_persona_id, planner_agent_id, \
+                 planner_model, integrate_persona_id, integrate_agent_id, integrate_model, \
+                 max_parts) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-                 $17, $18)",
+                 $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)",
                 row.id.as_uuid(),
                 StepGraphId::as_uuid(row.graph_id),
                 row.position,
@@ -263,6 +272,16 @@ impl PgStore {
                 row.token_budget,
                 row.updated_at,
                 row.persona_id.map(PersonaId::as_uuid),
+                Split::as_str(row.split),
+                row.palette,
+                row.plan_scope.map(PlanScope::as_str),
+                row.planner_persona_id.map(PersonaId::as_uuid),
+                row.planner_agent_id.map(AgentId::as_uuid),
+                row.planner_model.as_deref(),
+                row.integrate_persona_id.map(PersonaId::as_uuid),
+                row.integrate_agent_id.map(AgentId::as_uuid),
+                row.integrate_model.as_deref(),
+                row.max_parts,
             )
             .execute(&mut *tx)
             .await
