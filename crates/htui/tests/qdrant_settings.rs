@@ -397,6 +397,47 @@ async fn c_with_nothing_stored_names_the_way_forward() {
     assert!(!frame.contains("unavailable"), "{frame}");
 }
 
+/// MOD-83: `c` over an unreadable keyring says the keyring could not be read, with why and the
+/// key that reads it again, and never that nothing is stored: nobody knows that.
+#[tokio::test]
+async fn c_over_an_unreadable_keyring_never_says_nothing_is_stored() {
+    let (bench, mut section) = bench_with(unreadable()).await;
+    assert_eq!(bench.key(&mut section, "c"), Handled::Consumed);
+    assert!(bench.drained().is_empty(), "nothing is cleared");
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(
+        frame.contains(&format!(
+            "the keyring could not be read: {UNREADABLE_WHY}; r reads it again"
+        )),
+        "{frame}"
+    );
+    assert!(!frame.contains("is stored"), "{frame}");
+    assert!(!frame.contains("nothing to clear"), "{frame}");
+}
+
+/// The same over a keyring whose URL is known absent and whose key is unreadable: one unknown
+/// row is enough to make "nothing is stored" a guess.
+#[tokio::test]
+async fn c_over_an_unreadable_key_row_never_says_nothing_is_stored() {
+    let (bench, mut section) = bench_with(QdrantSnapshot {
+        url_state: QdrantState::NotStored,
+        key_state: QdrantState::Unreadable(UNREADABLE_WHY.to_owned()),
+        url_summary: None,
+    })
+    .await;
+    bench.key(&mut section, "esc");
+    assert_eq!(bench.key(&mut section, "c"), Handled::Consumed);
+    assert!(bench.drained().is_empty(), "nothing is cleared");
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(
+        frame.contains(&format!(
+            "the keyring could not be read: {UNREADABLE_WHY}; r reads it again"
+        )),
+        "{frame}"
+    );
+    assert!(!frame.contains("is stored"), "{frame}");
+}
+
 /// A write in flight reads in words, never as a store request's name.
 #[tokio::test]
 async fn a_write_in_flight_reads_in_words() {

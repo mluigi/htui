@@ -94,6 +94,16 @@ fn nothing_to_clear(edit: Option<&str>) -> String {
     }
 }
 
+/// `c` over an unreadable row (MOD-83): the row's own words and the key that reads it again,
+/// never [`nothing_to_clear`], since nobody knows whether anything is stored. `reload` is
+/// `Reload`'s label through `QDRANT_BROWSE`.
+fn unreadable_refusal(why: String, reload: Option<&str>) -> String {
+    match reload {
+        Some(key) => format!("{UNREADABLE}: {why}; {key} reads it again"),
+        None => format!("{UNREADABLE}: {why}"),
+    }
+}
+
 /// The next step of [`UNAVAILABLE`] (MOD-83): the reload key in force, or what happens without
 /// one.
 fn asks_again(reload: Option<&str>) -> String {
@@ -388,6 +398,11 @@ impl QdrantSection {
                         {
                             self.notice = None;
                             self.mode = Mode::ConfirmClear;
+                        } else if let Some(why) = self.unreadable_why() {
+                            // An unreadable row is not an empty one (Connection's rule): its own
+                            // words, never a claim that nothing is stored.
+                            let reload = ctx.keys().label(views::QDRANT_BROWSE, Act::Reload);
+                            self.refuse(unreadable_refusal(why, reload.as_deref()));
                         } else {
                             let edit = ctx.keys().label(views::QDRANT_BROWSE, Act::Edit);
                             self.refuse(nothing_to_clear(edit.as_deref()));
@@ -415,6 +430,17 @@ impl QdrantSection {
             }
         }
         Handled::Pass
+    }
+
+    /// Why the first unreadable row, URL then key, could not be read: `None` when both are known.
+    fn unreadable_why(&self) -> Option<String> {
+        let snapshot = self.snapshot.as_ref()?;
+        [&snapshot.url_state, &snapshot.key_state]
+            .into_iter()
+            .find_map(|state| match state {
+                QdrantState::Unreadable(why) => Some(why.clone()),
+                _ => None,
+            })
     }
 
     /// Sends one write and remembers its name until the reply, so `on_snapshot` can say what it
