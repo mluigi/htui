@@ -1789,8 +1789,8 @@ mod tests {
         );
     }
 
-    /// MOD-67 M6 T2: the row under the pane carries the notice alone, and the keys are the
-    /// section's [`SettingsSection::key_hint`], the shell's row.
+    /// MOD-67 M6 T2: the rows under the form carry the notice alone, as kit notice lines, and
+    /// the keys are the section's [`SettingsSection::key_hint`], the pane's border.
     #[test]
     fn the_notice_row_carries_the_notice_alone() {
         let notice = "\u{6f22}".repeat(10);
@@ -1799,10 +1799,10 @@ mod tests {
             ..SecretsSection::new()
         };
         let theme = Theme::default();
-        let line = section.notice_line(&theme);
-        assert_eq!(line.spans.len(), 1, "{line:?}");
-        assert_eq!(line.spans[0].content, notice);
-        assert_eq!(line.style, theme.error);
+        let lines = section.notice_lines(100, &theme);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].to_string(), notice);
+        assert_eq!(lines[0].style, theme.error);
         let keys = section
             .key_hint(Keys::compiled(), &theme)
             .expect("the defaults bind the keys");
@@ -1817,7 +1817,7 @@ mod tests {
             mark_refused: true,
             ..SecretsSection::new()
         };
-        let lines = section.lines(100, &theme, Keys::compiled());
+        let lines = section.notes(100, &theme);
         let shown: Vec<&Line<'_>> = lines
             .iter()
             .filter(|line| line.to_string().contains("htui/infisical-write-mark"))
@@ -1826,7 +1826,7 @@ mod tests {
         assert_eq!(shown[0].style, theme.dim);
         assert!(
             !SecretsSection::new()
-                .lines(100, &theme, Keys::compiled())
+                .notes(100, &theme)
                 .iter()
                 .any(|line| line.to_string().contains("write-mark")),
             "no line without a refused mark"
