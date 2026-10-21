@@ -4,7 +4,8 @@
 //! A section like `Personas`: the registry is global, so the read is unscoped and a scope change
 //! moves nothing. It holds no store handle (`R-NF-3`): it names [`StoreRequest::ProjectTypes`]
 //! and keeps the last [`StoreReply::ProjectTypes`]. `project_type` is not mirrored, so offline the
-//! read is refused, the section says "unavailable" and offers no key. There is no write and no
+//! read is refused, the section says "unavailable" and offers no key; it absorbs the refusal, so
+//! the status line does not repeat it. There is no write and no
 //! mode: user-defined types and their editor are ANA-33's.
 
 use htui_core::model::{ProjectType, Scope};
@@ -186,6 +187,12 @@ impl SettingsSection for ProjectTypesSection {
             _ => return,
         }
         self.clamp();
+    }
+
+    /// Its own read (MOD-146 R1 L4): the pane already says "unavailable", and offline the status
+    /// line keeps the refusal before it rather than cutting the header's workspace label.
+    fn absorbs_failure(&self, request: &str) -> bool {
+        request == READ_NAME
     }
 
     fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {

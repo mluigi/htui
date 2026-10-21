@@ -59,6 +59,13 @@ pub trait Tab {
     }
     /// A reply addressed to this tab arrived and is not stale.
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>);
+    /// Whether this tab says a refused `request` (its [`StoreRequest::name`]) itself, so the shell
+    /// keeps it off the status line (MOD-146 R1 L4). Asked before [`on_reply`](Tab::on_reply),
+    /// which is handed the `Failed` reply either way. Defaulted to `false`: every other refusal
+    /// is the status line's.
+    fn absorbs_failure(&self, _request: &str) -> bool {
+        false
+    }
     /// Draws into the body region.
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>);
     /// Moves this tab's own focus to `section` (MOD-15 M6 D7).

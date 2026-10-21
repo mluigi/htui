@@ -7,7 +7,9 @@ use htui::app::Action;
 use htui::store_worker::{StoreReply, StoreRequest};
 use htui::testkit::{Harness, SectionBench};
 use htui::ui::tabs::settings::project_types::{self, UNAVAILABLE};
-use htui::ui::tabs::settings::{ProjectTypesSection, SettingsSection, SettingsTab};
+use htui::ui::tabs::settings::{
+    PersonasSection, ProjectTypesSection, SettingsSection, SettingsTab,
+};
 use htui_core::model::{ProjectType, Scope};
 use htui_core::store::{MemStore, WriteStore as _};
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
@@ -179,6 +181,9 @@ async fn a_refused_read_says_unavailable_and_offers_no_keys() {
     assert!(shows(&frame, &format!("{UNAVAILABLE}: x")), "{frame}");
     assert!(shows(&frame, "project types unavailable: x"), "{frame}");
     assert!(!bench.key_hint(&section).contains("j/k"), "{frame}");
+    // MOD-146 R1 L4: its own read's refusal is the pane's; anyone else's is the status line's.
+    assert!(section.absorbs_failure(project_types::READ_NAME));
+    assert!(!section.absorbs_failure("personas"));
 }
 
 /// `project_type` is not mirrored: offline the read is refused, the section says so and offers
@@ -213,8 +218,23 @@ async fn offline_the_section_says_unavailable_and_offers_no_keys() {
         shows(&frame, "project types unavailable: store unreachable:"),
         "{frame}"
     );
-    assert!(shows(&frame, DATABASE_UNREACHABLE), "{frame}");
+    // The pane wraps the sentence inside the Settings border, so the border is read as blanks.
+    assert!(
+        shows(&frame.replace('\u{2502}', " "), DATABASE_UNREACHABLE),
+        "{frame}"
+    );
     assert!(!frame.contains(BROWSE_KEYS), "no keys are offered: {frame}");
+    // MOD-146 R1 L4: the pane says it, so the refusal stays off the status line, which would
+    // otherwise cut the header's workspace label.
+    let header = frame.lines().next().unwrap_or_default();
+    assert!(
+        !header.contains("project_types:"),
+        "the section absorbs its refused read: {header:?}"
+    );
+    assert!(
+        header.contains("no workspace"),
+        "the label is whole: {header:?}"
+    );
 
     // The first line is the shell's header: the refused read's flash gives way on the first key,
     // so the section's rows are what must not move.
@@ -232,6 +252,40 @@ async fn offline_the_section_says_unavailable_and_offers_no_keys() {
         );
     }
     insta::assert_snapshot!("offline", frame);
+}
+
+/// MOD-146 R1 L4: offline, every section's read is refused and the last refusal used to win the
+/// status line. `Project types` absorbs its own, so the line keeps the one before it: here
+/// `Personas`', registered first as `register_all` registers it.
+#[tokio::test]
+async fn offline_the_status_line_keeps_the_refusal_before_project_types() {
+    let _keyring = htui_store::testkit::mock_keyring().await;
+    let root = tempfile::tempdir().expect("a throwaway config root");
+    let cache = CacheStore::open(
+        root.path(),
+        "project-types-status",
+        PgStore::schema_version(),
+    )
+    .await
+    .expect("a fresh mirror");
+    let mut harness = Harness::over_backend(Backend::Offline {
+        cache,
+        since: Some(chrono::Utc::now()),
+    })
+    .with_tab(Box::new(SettingsTab::with_sections(vec![
+        Box::new(PersonasSection::new()),
+        Box::new(ProjectTypesSection::new()),
+    ])))
+    .with_store_state("offline \u{b7} 0s", None);
+    harness.settle().await;
+
+    let frame = harness.render();
+    let header = frame.lines().next().unwrap_or_default();
+    assert!(
+        header.contains("personas: store unreachable"),
+        "the refusal before it stays: {header:?}"
+    );
+    assert!(!header.contains("project_types:"), "{header:?}");
 }
 
 /// D8: the product registers `Project types` after `Queue`, so ten `l` reach it; the strip

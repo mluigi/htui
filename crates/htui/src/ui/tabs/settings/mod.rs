@@ -219,6 +219,11 @@ pub trait SettingsSection {
     }
     /// A reply addressed to the Settings tab. Sections that do not care ignore it.
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>);
+    /// Whether this section's pane says a refused `request` itself, so the shell keeps it off the
+    /// status line ([`Tab::absorbs_failure`], MOD-146 R1 L4). Defaulted to `false`.
+    fn absorbs_failure(&self, _request: &str) -> bool {
+        false
+    }
     /// Draws below the section strip.
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>);
     /// This section's keys (its mode's spec through its stack, plus what a write in flight adds),
@@ -441,6 +446,15 @@ impl Tab for SettingsTab {
         for section in &mut self.sections.sections {
             section.on_reply(reply, ctx);
         }
+    }
+
+    /// Any section's: every reply goes to every section, so the one that issued the read is
+    /// among them.
+    fn absorbs_failure(&self, request: &str) -> bool {
+        self.sections
+            .sections
+            .iter()
+            .any(|section| section.absorbs_failure(request))
     }
 
     /// The one tab that has sections to focus (MOD-15 M6 D7).
