@@ -18618,7 +18618,9 @@ async fn persona_writers_refuse_every_widening_shape<S: WriteStore>(store: &S) {
 /// MOD-26 plan D5: a phase that names no persona row is refused with `references_no_row`'s
 /// sentence by both phase writers, after the position and name clashes: a write that both clashes
 /// and names no persona is refused with the clash's own sentence, the one the same write naming
-/// no persona at all gets (MOD-26 review L3); nothing is written.
+/// no persona at all gets (MOD-26 review L3); nothing is written. MOD-137 blueprint §T2.2 steps
+/// 5-6: a divide node's four references are refused in the same words, each alone, and a row
+/// with two bad references names the personas before the agents in both stores.
 async fn a_phase_naming_no_persona_is_refused<S: WriteStore>(store: &S) {
     const CASE: &str = "a_phase_naming_no_persona_is_refused";
     let unknown = PersonaId::new();
@@ -18656,6 +18658,73 @@ async fn a_phase_naming_no_persona_is_refused<S: WriteStore>(store: &S) {
             &clash,
             &format!("a create with {what} naming no persona (D5: the clash first)"),
         );
+    }
+
+    // MOD-137 §T2.2 steps 5-6: Postgres's FK triggers fire in constraint order (planner_agent
+    // before integrate_persona), so the two-references rows pin that the writer decides first.
+    let divide = || StepGraphPhase {
+        split: Split::Divide,
+        ..new_phase(ids::GRAPH_HTUI_FEAT, 9, "cut")
+    };
+    let (persona, agent) = (PersonaId::new(), AgentId::new());
+    let persona_sentence =
+        |column: &str| references_no_row(&format!("step_graph_phase.{column}"), persona, "persona");
+    let agent_sentence =
+        |column: &str| references_no_row(&format!("step_graph_phase.{column}"), agent, "agent");
+    for (phase, sentence, what) in [
+        (
+            StepGraphPhase {
+                planner_persona_id: Some(persona),
+                ..divide()
+            },
+            persona_sentence("planner_persona_id"),
+            "a divide node naming no planner persona",
+        ),
+        (
+            StepGraphPhase {
+                planner_agent_id: Some(agent),
+                ..divide()
+            },
+            agent_sentence("planner_agent_id"),
+            "a divide node naming no planner agent",
+        ),
+        (
+            StepGraphPhase {
+                integrate_persona_id: Some(persona),
+                ..divide()
+            },
+            persona_sentence("integrate_persona_id"),
+            "a divide node naming no integrate persona",
+        ),
+        (
+            StepGraphPhase {
+                integrate_agent_id: Some(agent),
+                ..divide()
+            },
+            agent_sentence("integrate_agent_id"),
+            "a divide node naming no integrate agent",
+        ),
+        (
+            StepGraphPhase {
+                planner_agent_id: Some(agent),
+                integrate_persona_id: Some(persona),
+                ..divide()
+            },
+            persona_sentence("integrate_persona_id"),
+            "a divide node naming no planner agent and no integrate persona (personas first)",
+        ),
+        (
+            StepGraphPhase {
+                planner_agent_id: Some(agent),
+                integrate_agent_id: Some(agent),
+                planner_persona_id: Some(persona),
+                ..divide()
+            },
+            persona_sentence("planner_persona_id"),
+            "a divide node naming no planner persona and no agents (personas first)",
+        ),
+    ] {
+        constraint_exactly(CASE, store.create_phase(&phase).await, &sentence, what);
     }
 
     let phase = before

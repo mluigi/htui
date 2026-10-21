@@ -824,7 +824,9 @@ fn persona_insert_refused(err: sqlx::Error, new: &NewPersona) -> StoreError {
 /// four divide columns') in `MemStore`'s sentence (every other `23xxx` stays raw, `error.rs`);
 /// anything else through [`map_sqlx`]. Sound only because the writer decided the position and
 /// name clashes before the statement (blueprint §T2.2): the deferrable uniques are checked after
-/// every FK trigger, so an FK error no longer means "no clash".
+/// every FK trigger, so an FK error no longer means "no clash". `create_phase` reaches it only
+/// for a row deleted after [`phase_reference_refusal`]'s pre-read; `update_phase`'s one column
+/// (`persona_id`) has no rival reference to order against.
 fn phase_fk_refused(err: sqlx::Error, phase: &StepGraphPhase) -> StoreError {
     let refs: [(&str, &str, Option<Uuid>, &str); 5] = [
         (
@@ -970,6 +972,71 @@ async fn phase_clash(
     } else {
         None
     })
+}
+
+/// MOD-137 blueprint §T2.2 steps 5-6, decided by the writer: the five foreign-key triggers fire in
+/// constraint creation order (persona, planner persona, planner agent, integrate persona,
+/// integrate agent), so a row with two bad references would name a different column than
+/// `MemStore`, which checks the three personas before the two agents. One pre-read inside the
+/// writer's transaction, after [`phase_clash`]; `None` when every named row exists. A row deleted
+/// between this read and the insert still reaches [`phase_fk_refused`].
+async fn phase_reference_refusal(
+    conn: &mut PgConnection,
+    phase: &StepGraphPhase,
+) -> Result<Option<String>> {
+    let found = sqlx::query!(
+        r#"
+        SELECT ($1::uuid IS NULL OR EXISTS (SELECT 1 FROM persona WHERE id = $1)) AS "persona!",
+               ($2::uuid IS NULL OR EXISTS (SELECT 1 FROM persona WHERE id = $2))
+                   AS "planner_persona!",
+               ($3::uuid IS NULL OR EXISTS (SELECT 1 FROM persona WHERE id = $3))
+                   AS "integrate_persona!",
+               ($4::uuid IS NULL OR EXISTS (SELECT 1 FROM agent WHERE id = $4))
+                   AS "planner_agent!",
+               ($5::uuid IS NULL OR EXISTS (SELECT 1 FROM agent WHERE id = $5))
+                   AS "integrate_agent!"
+        "#,
+        phase.persona_id.map(PersonaId::as_uuid),
+        phase.planner_persona_id.map(PersonaId::as_uuid),
+        phase.integrate_persona_id.map(PersonaId::as_uuid),
+        phase.planner_agent_id.map(AgentId::as_uuid),
+        phase.integrate_agent_id.map(AgentId::as_uuid),
+    )
+    .fetch_one(conn)
+    .await
+    .map_err(map_sqlx)?;
+    let personas = [
+        ("step_graph_phase.persona_id", found.persona, phase.persona_id),
+        (
+            "step_graph_phase.planner_persona_id",
+            found.planner_persona,
+            phase.planner_persona_id,
+        ),
+        (
+            "step_graph_phase.integrate_persona_id",
+            found.integrate_persona,
+            phase.integrate_persona_id,
+        ),
+    ];
+    if let Some((column, _, Some(id))) = personas.into_iter().find(|(_, found, _)| !found) {
+        return Ok(Some(references_no_row(column, id, "persona")));
+    }
+    let agents = [
+        (
+            "step_graph_phase.planner_agent_id",
+            found.planner_agent,
+            phase.planner_agent_id,
+        ),
+        (
+            "step_graph_phase.integrate_agent_id",
+            found.integrate_agent,
+            phase.integrate_agent_id,
+        ),
+    ];
+    if let Some((column, _, Some(id))) = agents.into_iter().find(|(_, found, _)| !found) {
+        return Ok(Some(references_no_row(column, id, "agent")));
+    }
+    Ok(None)
 }
 
 /// The one `INSERT INTO step_graph_phase ... RETURNING` (MOD-137 blueprint §T2.2), so
@@ -3326,11 +3393,16 @@ impl WriteStore for PgStore {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Constraint`] for a reserved name, a taken `(graph_id, position)` or
-    /// `(graph_id, name)` (`23505`), a `graph_id` that names no row (`23503`), or a `persona_id`
-    /// that names no row (`fk_step_graph_phase_persona`'s `23503`, worded
-    /// `references_no_row("step_graph_phase.persona_id", id, "persona")`), checked after the
-    /// clashes (MOD-26 D5).
+    /// [`StoreError::Constraint`], in MOD-137 blueprint §T2.2's order (both stores): a reserved
+    /// name; a node CHECK [`phase_row_refusal`] decides (`split`/`fan_out`, divide columns off a
+    /// divide node, `max_parts` below one); a `graph_id` that names no row (the bump touches no
+    /// row); a taken `(graph_id, position)`, then `(graph_id, name)`, decided by
+    /// [`phase_clash`]'s pre-read since 0020's deferrable uniques report after the foreign keys;
+    /// then `persona_id`, `planner_persona_id`, `integrate_persona_id`, `planner_agent_id`,
+    /// `integrate_agent_id` naming no row, decided by [`phase_reference_refusal`]'s pre-read and
+    /// worded `references_no_row("step_graph_phase.<column>", id, "persona" | "agent")` (MOD-26
+    /// D5); a row deleted after that read is the five FKs' `23503`, mapped to the same words by
+    /// [`phase_fk_refused`].
     async fn create_phase(&self, phase: &StepGraphPhase) -> Result<StepGraphPhase> {
         if TemplateRole::of_name(&phase.name) != TemplateRole::Phase {
             return Err(StoreError::Constraint(reserved_phase_name(&phase.name)));
@@ -3351,6 +3423,9 @@ impl WriteStore for PgStore {
             phase_clash(&mut tx, phase.graph_id, phase.position, &phase.name, None).await?
         {
             return Err(StoreError::Constraint(clash));
+        }
+        if let Some(refusal) = phase_reference_refusal(&mut tx, phase).await? {
+            return Err(StoreError::Constraint(refusal));
         }
         let row = insert_phase(&mut *tx, phase)
             .await
@@ -3415,7 +3490,9 @@ impl WriteStore for PgStore {
     /// # Errors
     ///
     /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Constraint`] for a reserved name,
-    /// a `(graph_id, position)` / `(graph_id, name)` collision (`23505`), or a `persona_id` that
+    /// a `(graph_id, position)` / `(graph_id, name)` collision against the patched row, decided by
+    /// [`phase_clash`]'s pre-read once the row is locked and its token matches (MOD-137 blueprint
+    /// §T2.2: 0020's deferrable uniques report after the foreign keys), or a `persona_id` that
     /// names no row (`fk_step_graph_phase_persona`'s `23503`, worded
     /// `references_no_row("step_graph_phase.persona_id", id, "persona")`), checked after the
     /// clashes (MOD-26 D5).
