@@ -94,10 +94,9 @@ fn unavailable_next(reload: Option<&str>) -> String {
     }
 }
 
-/// Browse's keys: the ones that change something first and the move last, so the pane's border,
-/// which cuts the row at its width, drops the move before a write (80 columns, MOD-115 M3 MOD-81;
-/// the order the maintainer chose for Requirements' D-14).
+/// Browse's keys.
 const HINT_BROWSE: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, ""),
     Hint::One(Act::HierarchyNewWorkspace, "workspace"),
     Hint::One(Act::New, "project/repo"),
     Hint::One(Act::Edit, "edit"),
@@ -106,7 +105,6 @@ const HINT_BROWSE: HintSpec = &[
     Hint::One(Act::HierarchyInfer, "infer"),
     Hint::One(Act::Delete, "delete"),
     Hint::One(Act::Reload, "reload"),
-    Hint::Pair(Act::ListDown, Act::ListUp, ""),
 ];
 
 /// Browse's keys with nothing read: only the two that do not need a tree.
