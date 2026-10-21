@@ -2278,8 +2278,8 @@ pub trait WriteStore: ReadStore {
     /// another live entry's ([`memory_subject_taken`]), or an author / box that names no row.
     ///
     /// `Constraint` refusals are not ordered among themselves across backends: when two apply,
-    /// either may answer. Only [`already_exists`] and [`memory_subject_taken`] have
-    /// backend-independent text.
+    /// either may answer. Only [`already_exists`], [`memory_subject_taken`] and
+    /// [`memory_entry_closed`] have backend-independent text.
     async fn amend_memory_entry(
         &self,
         id: MemoryEntryId,
@@ -2297,8 +2297,8 @@ pub trait WriteStore: ReadStore {
     /// entry included ([`memory_entry_closed`]).
     ///
     /// `Constraint` refusals are not ordered among themselves across backends: when two apply,
-    /// either may answer. Only [`already_exists`] and [`memory_subject_taken`] have
-    /// backend-independent text.
+    /// either may answer. Only [`already_exists`], [`memory_subject_taken`] and
+    /// [`memory_entry_closed`] have backend-independent text.
     async fn retire_memory_entry(
         &self,
         id: MemoryEntryId,
@@ -2324,8 +2324,8 @@ pub trait WriteStore: ReadStore {
     /// `created_by` / `box_id` that names no row.
     ///
     /// `Constraint` refusals are not ordered among themselves across backends: when two apply,
-    /// either may answer. Only [`already_exists`] and [`memory_subject_taken`] have
-    /// backend-independent text.
+    /// either may answer. Only [`already_exists`], [`memory_subject_taken`] and
+    /// [`memory_entry_closed`] have backend-independent text.
     async fn supersede_memory_entry(
         &self,
         old: MemoryEntryId,
