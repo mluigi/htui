@@ -1626,7 +1626,7 @@ async fn deleting_the_last_workspace_leaves_the_pane_empty() {
     bench.reply(&mut section, &StoreReply::Workspaces(Vec::new()));
     let frame = bench.render_section(&section, 100);
     assert!(
-        frame.contains("no workspace \u{2014} `N` creates one"),
+        frame.contains("no workspace") && frame.contains("`N` creates one"),
         "an empty list leaves the pane naming the key that fixes it: {frame}"
     );
     assert!(
@@ -1670,7 +1670,7 @@ async fn a_second_enter_does_not_resend_the_write() {
     };
     let frame = bench.render_section(&section, 100);
     assert!(
-        frame.contains("`update_workspace` is still in flight"),
+        frame.contains("still saving the workspace \u{2014} wait for the store's answer"),
         "and the second one says why it did nothing: {frame}"
     );
 }
@@ -1792,10 +1792,8 @@ async fn a_refused_read_is_echoed_and_then_cleared() {
         !frame.contains("hierarchy needs Postgres"),
         "a read that answered is not an outage: {frame}"
     );
-    assert!(
-        frame.contains("no workspace \u{2014} `N` creates one"),
-        "{frame}"
-    );
+    assert!(frame.contains("no workspace"), "{frame}");
+    assert!(frame.contains("`N` creates one"), "{frame}");
 }
 
 /// Offline the tree is one refused read: `Backend::writer()` is `None`, so the section says what is
@@ -2128,7 +2126,7 @@ async fn i_is_refused_while_a_write_is_in_flight() {
     );
     let frame = bench.render_section(&section, 100);
     assert!(
-        frame.contains("`update_repo` is still in flight"),
+        frame.contains("still saving the repo \u{2014} wait for the store's answer"),
         "and the refusal names the write it is waiting for: {frame}"
     );
 }
@@ -2412,8 +2410,12 @@ async fn an_inference_report_keeps_its_cause_and_drops_a_refusal_shown_during_th
     bench.key(&mut section, "e");
     let frame = bench.render_section(&section, 100);
     assert!(
-        frame.contains("`infer_repo_paths` is still in flight"),
+        frame.contains("still inferring the repo paths \u{2014} wait for the store's answer"),
         "`e` is refused during the walk: {frame}"
+    );
+    assert!(
+        !frame.contains("infer_repo_paths"),
+        "no request name: {frame}"
     );
     bench.reply(
         &mut section,
@@ -2428,7 +2430,7 @@ async fn an_inference_report_keeps_its_cause_and_drops_a_refusal_shown_during_th
         "the follow-up's cause stays in front of the report: {frame}"
     );
     assert!(
-        !frame.contains("in flight"),
+        !frame.contains("wait for the store"),
         "nothing is in flight: {frame}"
     );
 
@@ -2449,7 +2451,7 @@ async fn an_inference_report_keeps_its_cause_and_drops_a_refusal_shown_during_th
         "the report is shown: {frame}"
     );
     assert!(
-        !frame.contains("in flight") && !frame.contains("stored as"),
+        !frame.contains("wait for the store") && !frame.contains("stored as"),
         "and nothing in front of it: {frame}"
     );
 }
@@ -2910,7 +2912,12 @@ async fn a_listing_is_not_a_write_in_flight() {
     let mut section = picker_section(&bench, tree, None);
 
     bench.key(&mut section, "b");
-    assert!(!bench.render_section(&section, 100).contains("in flight"));
+    assert!(
+        !bench
+            .render_section(&section, 100)
+            .contains("wait for the store")
+    );
+    assert!(!bench.key_hint(&section).contains('\u{2026}'));
     bench.key(&mut section, "esc");
     let _ = bench.drained();
     bench.key(&mut section, "i");
@@ -2994,7 +3001,7 @@ async fn picking_in_the_shell_lists_the_root_and_keeps_h_and_l() {
     harness.key("h");
     harness.settle().await;
     let frame = harness.render();
-    assert!(frame.contains("> alpha/"), "back on `alpha`: {frame}");
+    assert!(frame.contains("\u{258c}alpha/"), "back on `alpha`: {frame}");
 
     harness.key("l");
     harness.settle().await;
@@ -3038,28 +3045,33 @@ async fn a_directory_gone_before_the_choice_is_refused_on_the_status_line() {
     );
     assert!(frame.contains("does not exist on this box"), "{frame}");
     assert!(
-        frame.contains("> beta/"),
+        frame.contains("\u{258c}beta/"),
         "the picker is still open: {frame}"
     );
 }
 
-/// MOD-80 review L1: the rows a section drew in `theme.selected`, as `(y, text)`, each checked to
-/// be black on cyan over its whole text so no span's own colour shows through the cursor.
+/// MOD-80 review L1, MOD-115 M3: the rows a section drew in the kit's selection band, as
+/// `(y, text)`: the `▌` gutter in the tab's accent at column 0, then the row black on cyan over
+/// the whole width so no span's own colour shows through the cursor.
 fn selected_rows(buffer: &Buffer) -> Vec<(u16, String)> {
     let selected = Theme::default().selected;
+    let accent = Theme::default().tab_accent("settings");
     let (fg, bg) = (
         selected.fg.expect("selected has a foreground"),
         selected.bg.expect("selected has a background"),
     );
     (0..buffer.area.height)
-        .filter(|y| buffer[(0, *y)].bg == bg)
+        .filter(|y| buffer[(1, *y)].bg == bg)
         .map(|y| {
-            let text: String = (0..buffer.area.width)
+            let gutter = &buffer[(0, y)];
+            assert_eq!(gutter.symbol(), "\u{258c}", "the gutter marks row {y}");
+            assert_eq!(gutter.fg, accent.fg.unwrap_or(Color::Reset), "row {y}");
+            let text: String = (1..buffer.area.width)
                 .map(|x| buffer[(x, y)].symbol())
                 .collect::<String>()
                 .trim_end()
                 .to_owned();
-            for x in 0..u16::try_from(text.chars().count()).expect("a narrow row") {
+            for x in 1..buffer.area.width {
                 let cell = &buffer[(x, y)];
                 assert_eq!((cell.fg, cell.bg), (fg, bg), "{text:?} at x = {x}");
             }
@@ -3068,7 +3080,7 @@ fn selected_rows(buffer: &Buffer) -> Vec<(u16, String)> {
         .collect()
 }
 
-/// MOD-80 review L1: the Hierarchy cursor row is drawn in `theme.selected`, as Connection's is.
+/// MOD-80 review L1: the Hierarchy cursor row is drawn in the selection band, as Connection's is.
 #[tokio::test]
 async fn the_cursor_row_is_drawn_selected() {
     let bench = SectionBench::new().await;
@@ -3168,8 +3180,16 @@ async fn the_editor_moves_focus_on_down_and_up() {
     type_at(&bench, &mut section, "alpha");
 
     let frame = bench.render_section(&section, 100);
-    assert!(frame.contains("name          : alpha"), "{frame}");
-    assert!(frame.contains("remote_url    : git@x"), "{frame}");
+    assert_eq!(
+        field_value(&frame, "name").as_deref(),
+        Some("alpha"),
+        "{frame}"
+    );
+    assert_eq!(
+        field_value(&frame, "remote url").as_deref(),
+        Some("git@x"),
+        "{frame}"
+    );
 }
 
 /// MOD-67 D5: `F1` reaches help from inside the editor (the modal global layer admits function
@@ -3182,7 +3202,12 @@ async fn f1_opens_help_from_the_editor() {
     harness.settle().await;
     harness.key("?");
     let frame = harness.render();
-    assert!(frame.contains("name          : ?"), "{frame}");
+    assert!(
+        frame
+            .lines()
+            .any(|line| line.contains("\u{258c}name") && line.trim_end().ends_with('?')),
+        "{frame}"
+    );
     assert!(!frame.contains("closes this box"), "{frame}");
 
     harness.key("f1");
@@ -3307,11 +3332,14 @@ async fn a_rebound_new_workspace_key_is_the_one_the_empty_tree_names() {
 
     bench.key(&mut section, "e");
     let frame = bench.render_section(&section, 100);
-    let sentence = "no workspace \u{2014} `W` creates one";
+    assert!(
+        frame.contains("no workspace \u{2014} `W` creates one"),
+        "the refusal names `W`: {frame}"
+    );
     assert_eq!(
-        frame.matches(sentence).count(),
+        frame.matches("`W` creates one").count(),
         2,
-        "the rows pane and the refusal name `W`: {frame}"
+        "the rows pane's next step and the refusal name `W`: {frame}"
     );
     assert!(!frame.contains("`N`"), "{frame}");
 
@@ -3383,4 +3411,454 @@ async fn f1_over_the_picker_opens_help_and_q_does_not_quit() {
         frame.contains("j/k move"),
         "the picker is still open: {frame}"
     );
+}
+
+// -------------------------------------------------------------------------------------------
+// MOD-115 M3 (lane L-hier): the section on the kit. The tree is a `kit::list`, the editor a
+// `kit::form`, the notices `kit::text` lines and the empty states `kit::empty` with a next step;
+// the picker is a `kit::modal` over a `kit::list`; every hint and every sentence that names a key
+// reads it from the keys in force.
+// -------------------------------------------------------------------------------------------
+
+/// `field.submit` and `field.cancel` moved (MOD-115 M3 C6): the editor's `Enter` and `Esc`.
+const FIELD_REBOUND: &str = "version = 2\n[field]\nsubmit = [\"ctrl-t\"]\ncancel = [\"ctrl-g\"]\n";
+
+/// `keys` loaded, or a panic naming the file.
+fn rebound(file: &str) -> htui::keys::Keys {
+    htui::keys::load_str(file).expect("the key file loads")
+}
+
+/// A frame line with the kit's one-cell gutter (`▌` on the focused row, blank elsewhere) taken
+/// off the front.
+fn past_gutter(line: &str) -> &str {
+    let mut chars = line.chars();
+    chars.next();
+    chars.as_str()
+}
+
+/// The index of the editor row labelled `label` (MOD-115 M3: a `kit::form` row reads
+/// `[gutter][label column][two blanks][value]`), or `None` when no row carries it.
+fn field_line(frame: &str, label: &str) -> Option<usize> {
+    frame.lines().position(|line| {
+        past_gutter(line)
+            .strip_prefix(label)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("  "))
+    })
+}
+
+/// What the editor row labelled `label` shows, trimmed; `""` for a blank field.
+fn field_value(frame: &str, label: &str) -> Option<String> {
+    let line = frame.lines().nth(field_line(frame, label)?)?;
+    Some(past_gutter(line)[label.len()..].trim().to_owned())
+}
+
+/// The frame's words joined by single spaces, so a wrapped sentence reads as one.
+fn flat(frame: &str) -> String {
+    frame.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// One section drawn into a `width`x`height` buffer.
+fn drawn_at(
+    bench: &SectionBench,
+    section: &dyn SettingsSection,
+    width: u16,
+    height: u16,
+) -> Buffer {
+    let area = Rect::new(0, 0, width, height);
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(width, height),
+        TerminalOptions {
+            viewport: Viewport::Fixed(area),
+        },
+    )
+    .expect("a test terminal");
+    let ctx = bench.ctx();
+    terminal
+        .draw(|frame| section.render(frame, frame.area(), &ctx))
+        .expect("the section draws");
+    terminal.backend().buffer().clone()
+}
+
+/// The text of row `y` of `buffer`.
+fn row_text(buffer: &Buffer, y: u16) -> String {
+    (0..buffer.area.width)
+        .map(|x| buffer[(x, y)].symbol())
+        .collect()
+}
+
+/// The editor's hint names the field's own keys through the editor's stack (MD-A, C6): `Enter
+/// save · Esc cancel` under the compiled keys, the rebound chords once `[field]` moves them.
+#[tokio::test]
+async fn the_editor_hint_names_the_field_keys_in_force() {
+    let bench = SectionBench::new().await;
+    let mut section = bench_over_demo(&bench).await;
+    bench.key(&mut section, "e");
+    let hint = bench.key_hint(&section);
+    assert!(
+        hint.contains("Tab/Shift+Tab field \u{b7} Enter save \u{b7} Esc cancel"),
+        "{hint}"
+    );
+
+    let bench = bench.with_keys(rebound(FIELD_REBOUND));
+    let hint = bench.key_hint(&section);
+    assert!(hint.contains("Ctrl+t save \u{b7} Ctrl+g cancel"), "{hint}");
+    assert!(
+        !hint.contains("Enter") && !hint.contains("Esc"),
+        "no literal key is left: {hint}"
+    );
+}
+
+/// The typed confirmation's hint is the field's keys too (C6, through `views::CAPTURE`).
+#[tokio::test]
+async fn the_typed_confirmation_names_the_field_keys_in_force() {
+    let bench = SectionBench::new().await;
+    let mut section = bench_over_demo(&bench).await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "d");
+    let _ = bench.drained();
+    bench.reply(
+        &mut section,
+        &StoreReply::DeleteReach(Some(Box::new(DeleteReach::default()))),
+    );
+    bench.key(&mut section, "y");
+    let hint = bench.key_hint(&section);
+    assert!(hint.contains("Enter confirm \u{b7} Esc stop"), "{hint}");
+
+    let bench = bench.with_keys(rebound(FIELD_REBOUND));
+    let hint = bench.key_hint(&section);
+    assert!(hint.contains("Ctrl+t confirm \u{b7} Ctrl+g stop"), "{hint}");
+    assert!(!hint.contains("Enter"), "no literal key is left: {hint}");
+}
+
+/// A compare-and-set miss under an open editor names the key that retries as the editor's stack
+/// binds it (MD-A, D-5): `Enter` under the compiled keys, the rebound chord otherwise.
+#[tokio::test]
+async fn a_stale_reply_names_the_retry_key_in_force() {
+    let bench = SectionBench::new().await.with_keys(rebound(FIELD_REBOUND));
+    let mut section = HierarchySection::new();
+    let opened = demo_tree(&demo(), ids::WORKSPACE_GRAPHICS).await;
+    bench.reply(
+        &mut section,
+        &StoreReply::Hierarchy(Some(Box::new(opened.clone()))),
+    );
+    let _ = bench.drained();
+    bench.key(&mut section, "e");
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+
+    bench.reply(&mut section, &StoreReply::HierarchyStale(Box::new(opened)));
+
+    let flagged = error_text(&bench, &section, 100);
+    assert_eq!(
+        flagged,
+        [
+            "changed elsewhere since you opened it \u{2014} reloaded; Ctrl+t retries against the \
+             current row"
+        ],
+        "{flagged:?}"
+    );
+}
+
+/// MOD-83: the repo editor's labels read as words, not as column names.
+#[tokio::test]
+async fn the_editor_labels_read_as_words() {
+    let bench = SectionBench::new().await;
+    let mut section = bench_over_demo(&bench).await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "n");
+    let frame = bench.render_section(&section, 100);
+    let rows: Vec<usize> = ["name", "remote url", "default branch", "primary (y/n)"]
+        .into_iter()
+        .map(|label| field_line(&frame, label).unwrap_or_else(|| panic!("`{label}`: {frame}")))
+        .collect();
+    assert!(
+        rows.windows(2).all(|pair| pair[0] + 1 == pair[1]),
+        "one row per field, in editor order: {rows:?} {frame}"
+    );
+    assert_eq!(
+        field_value(&frame, "default branch").as_deref(),
+        Some("main")
+    );
+    for raw in ["remote_url", "default_branch"] {
+        assert!(!frame.contains(raw), "`{raw}` is gone: {frame}");
+    }
+
+    // The name is required, and the refusal names the field as the form does.
+    bench.key(&mut section, "enter");
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("`name` is required"), "{frame}");
+}
+
+/// MOD-85: in the editor the accent marks the focused row's gutter and the tree's cursor, and
+/// nothing else: no label is drawn in it.
+#[tokio::test]
+async fn the_editor_marks_its_focused_row_and_no_label_takes_the_accent() {
+    let bench = SectionBench::new().await;
+    let mut section = bench_over_demo(&bench).await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "n");
+    bench.key(&mut section, "tab");
+    let frame = bench.render_section(&section, 100);
+    let url = u16::try_from(field_line(&frame, "remote url").expect("a `remote url` row"))
+        .expect("a row");
+    let accent = bench
+        .ctx()
+        .accent()
+        .fg
+        .expect("the Settings accent has a colour");
+    let buffer = drawn(&bench, &section, 100);
+    let accented: Vec<(u16, u16)> = (0..buffer.area.height)
+        .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+        .filter(|(x, y)| buffer[(*x, *y)].fg == accent)
+        .collect();
+    assert!(
+        accented
+            .iter()
+            .all(|(x, y)| *x == 0 && buffer[(*x, *y)].symbol() == "\u{258c}"),
+        "only gutters take the accent: {accented:?}"
+    );
+    assert!(
+        accented.contains(&(0, url)),
+        "the focused field is marked: {accented:?} {frame}"
+    );
+    assert_eq!(
+        accented.len(),
+        2,
+        "that field and the tree's cursor: {accented:?}"
+    );
+}
+
+/// The empty states say what is missing and what to do next (MOD-115 audit item 2, MOD-83).
+#[tokio::test]
+async fn the_empty_states_carry_a_next_step() {
+    let bench = SectionBench::new().await;
+    let mut section = HierarchySection::new();
+    bench.reply(&mut section, &StoreReply::Hierarchy(None));
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("no workspace"), "{frame}");
+    assert!(frame.contains("`N` creates one"), "{frame}");
+
+    let unbound = SectionBench::new()
+        .await
+        .with_keys(keys_from("[settings.hierarchy]\nnew_workspace = []\n"));
+    let frame = unbound.render_section(&section, 100);
+    assert!(!frame.contains("creates one"), "{frame}");
+    assert!(
+        frame.contains("a workspace created elsewhere shows up here"),
+        "{frame}"
+    );
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "hierarchy",
+            message: "connection refused".to_owned(),
+        },
+    );
+    let flagged = error_text(&bench, &section, 100);
+    assert!(
+        flagged.contains(&"hierarchy needs Postgres".to_owned()),
+        "the refusal is an error: {flagged:?}"
+    );
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("Settings \u{203a} Connection stores a DSN"),
+        "{frame}"
+    );
+    assert!(
+        frame.contains("r asks again once the store answers"),
+        "{frame}"
+    );
+}
+
+/// MOD-83: the counts of a delete read as words with their nouns, never `1 rows`.
+#[tokio::test]
+async fn a_delete_counts_in_words() {
+    let bench = SectionBench::new().await;
+    let mut section = bench_over_demo(&bench).await;
+    bench.key(&mut section, "d");
+    let _ = bench.drained();
+    bench.reply(
+        &mut section,
+        &StoreReply::DeleteReach(Some(Box::new(DeleteReach {
+            workspace_links: 1,
+            workspace_box_paths: 1,
+            ..DeleteReach::default()
+        }))),
+    );
+    let frame = flat(&bench.render_section(&section, 100));
+    assert!(
+        frame.contains("1 project link and 1 box root path"),
+        "{frame}"
+    );
+
+    bench.key(&mut section, "y");
+    type_at(&bench, &mut section, "graphics");
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+    bench.reply(
+        &mut section,
+        &StoreReply::Deleted {
+            target: DeleteTarget::Workspace(ids::WORKSPACE_GRAPHICS),
+            reach: Box::new(DeleteReach {
+                workspace_links: 1,
+                ..DeleteReach::default()
+            }),
+            mirror: MirrorAfterDelete::NotNeeded,
+        },
+    );
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("deleted `graphics`: 1 row across 1 table; no rebuild needed"),
+        "{frame}"
+    );
+}
+
+/// MOD-83: a write in flight reads in words, on the Browse hint as in the refusal, and never as a
+/// store request name.
+#[tokio::test]
+async fn a_write_in_flight_reads_in_words() {
+    let bench = SectionBench::new().await;
+    let mut section = bench_over_demo(&bench).await;
+    bench.key(&mut section, "i");
+    let _ = bench.drained();
+    let hint = bench.key_hint(&section);
+    assert!(
+        hint.ends_with(" \u{b7} inferring the repo paths\u{2026}"),
+        "{hint}"
+    );
+    for name in REQUEST_NAMES {
+        assert!(!hint.contains(name), "`{name}` on the hint: {hint}");
+    }
+}
+
+/// MOD-83: the primary repo says so in a word, not with a bare `*`.
+#[tokio::test]
+async fn the_primary_repo_reads_as_a_word() {
+    let bench = SectionBench::new().await;
+    let tree = tree_with_two_repos(&demo()).await;
+    let section = picker_section(&bench, tree, None);
+    let frame = bench.render_section(&section, 100);
+    let row = |name: &str| -> String {
+        frame
+            .lines()
+            .find(|line| line.contains(&format!(" {name} ")))
+            .unwrap_or_else(|| panic!("the {name} row: {frame}"))
+            .trim()
+            .to_owned()
+    };
+    assert!(
+        row("alpha").starts_with("alpha \u{b7} primary  main"),
+        "{}",
+        row("alpha")
+    );
+    assert!(!row("beta").contains("primary"), "{}", row("beta"));
+    assert!(!frame.contains('*'), "{frame}");
+}
+
+/// The section reports its scroll for the Settings pane's scrollbar (MOD-115 M3 D-11), in the
+/// pane's terms: the tree's rows plus the rows under it, and the first one drawn, the cursor kept
+/// on screen.
+#[tokio::test]
+async fn the_section_reports_its_scroll_for_the_pane() {
+    let bench = SectionBench::new().await;
+    let tree = tree_with_two_repos(&demo()).await;
+    let mut section = picker_section(&bench, tree, None);
+    assert_eq!(section.scroll(), None, "nothing is drawn yet");
+
+    // Four tree rows (workspace, project, two repos) over three, the notice line under them.
+    let _ = drawn_at(&bench, &section, 100, 4);
+    assert_eq!(section.scroll(), Some((5, 0)));
+
+    for _ in 0..3 {
+        bench.key(&mut section, "j");
+    }
+    let buffer = drawn_at(&bench, &section, 100, 4);
+    assert_eq!(section.scroll(), Some((5, 1)));
+    let last = row_text(&buffer, 2);
+    assert!(
+        last.starts_with('\u{258c}') && last.contains("beta"),
+        "the cursor is on screen: {last}"
+    );
+}
+
+/// The picker is a kit modal (MOD-115 M3): rounded, titled, its cursor the list's gutter and
+/// band (MOD-85: not the accent alone), its path header in the title role.
+#[tokio::test]
+async fn the_picker_is_a_kit_modal_over_a_kit_list() {
+    let bench = SectionBench::new().await;
+    let rooted = with_root(demo_tree(&demo(), ids::WORKSPACE_GRAPHICS).await, "/srv");
+    let mut section = picker_section(&bench, rooted, None);
+    bench.key(&mut section, "b");
+    bench.reply(
+        &mut section,
+        &dirs("/srv", &[("htui", false), ("notes", false)], 0),
+    );
+    bench.key(&mut section, "j");
+
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("\u{256d} Root of `graphics` on this box \u{2500}"),
+        "{frame}"
+    );
+    assert!(frame.contains("\u{258c}notes/"), "{frame}");
+    assert!(!frame.contains("> "), "no `>` cursor: {frame}");
+
+    let theme = Theme::default();
+    let buffer = drawn(&bench, &section, 100);
+    // The modal's content starts on row 2 of the 30: the tree's own `/srv` is on row 0, under it.
+    let at = |needle: &str| -> (u16, u16) {
+        (2..buffer.area.height)
+            .find_map(|y| {
+                let text = row_text(&buffer, y);
+                text.find(needle).map(|byte| {
+                    let x = text[..byte].chars().count();
+                    (u16::try_from(x).expect("a column"), y)
+                })
+            })
+            .unwrap_or_else(|| panic!("`{needle}` is drawn"))
+    };
+    let (x, y) = at("notes/");
+    assert_eq!(buffer[(x, y)].bg, theme.selected.bg.unwrap_or(Color::Reset));
+    assert_eq!(
+        buffer[(x - 1, y)].fg,
+        theme.accent.fg.unwrap_or(Color::Reset),
+        "the modal's own accent marks the gutter"
+    );
+    let (x, y) = at("/srv");
+    assert_eq!(y, 2, "the header is the modal's first row");
+    assert!(
+        buffer[(x, y)]
+            .modifier
+            .contains(ratatui::style::Modifier::BOLD),
+        "the header is in the title role"
+    );
+    assert_ne!(buffer[(x, y)].fg, theme.accent.fg.unwrap_or(Color::Reset));
+    let (x, y) = at("htui/");
+    assert_ne!(buffer[(x, y)].fg, theme.accent.fg.unwrap_or(Color::Reset));
+
+    // The go-to field is a one-row form: the marker, its label, the field.
+    bench.key(&mut section, "/");
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.lines().any(|line| line.contains("\u{258c}go to")
+            && line
+                .trim_end()
+                .trim_end_matches('\u{2502}')
+                .trim_end()
+                .ends_with('/')),
+        "{frame}"
+    );
+}
+
+/// MOD-81: the section at 80 columns, through the shell.
+#[tokio::test]
+async fn the_section_at_80_columns() {
+    let store = MemStore::demo();
+    let _ = tree_with_two_repos(&Backend::memory(store.clone())).await;
+    let mut harness = hierarchy_over(store).await.size(80, 24);
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(frame.contains("alpha \u{b7} primary"), "{frame}");
+    insta::assert_snapshot!("demo_80", frame);
 }
