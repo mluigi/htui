@@ -300,15 +300,19 @@ pub fn default_edges(
         .map(|pair| edge(pair[0], pair[1], EdgeKind::Next, None, mint()))
         .collect();
     for (index, review) in sorted.iter().enumerate() {
-        if review.name != REVIEW || index == 0 {
+        if review.name != REVIEW {
             continue;
         }
+        // The phases before this review; a review first in order has none and gets no loop.
         let earlier = &sorted[..index];
+        let Some(previous) = earlier.last() else {
+            continue;
+        };
         let target = earlier
             .iter()
             .rev()
             .find(|phase| phase.name == IMPLEMENT)
-            .unwrap_or(&earlier[index - 1]);
+            .unwrap_or(previous);
         edges.push(edge(
             review,
             target,

@@ -3493,8 +3493,10 @@ impl State {
     fn create_step_graph(&mut self, new: NewStepGraph, now: DateTime<Utc>) -> Result<StepGraph> {
         match new.scope {
             GraphScope::Project(project) if !self.projects.contains_key(&project) => {
-                return Err(StoreError::Constraint(format!(
-                    "step_graph.project_id `{project}` references no project"
+                return Err(StoreError::Constraint(references_no_row(
+                    "step_graph.project_id",
+                    project,
+                    "project",
                 )));
             }
             GraphScope::Workspace(workspace) if !self.workspaces.contains_key(&workspace) => {
@@ -3510,10 +3512,7 @@ impl State {
             return Err(StoreError::Constraint(override_outside_project(new.scope)));
         }
         if self.graphs.contains_key(&new.id) {
-            return Err(StoreError::Constraint(format!(
-                "step_graph `{}` already exists",
-                new.id
-            )));
+            return Err(StoreError::Constraint(already_exists("step_graph", new.id)));
         }
         if self
             .graphs
@@ -3604,7 +3603,8 @@ impl State {
         rows
     }
 
-    /// The reserved-name rule and the two uniqueness rules of `step_graph_phase` (D11).
+    /// The graph reference and the two uniqueness rules of `step_graph_phase` (D11); each caller
+    /// checks the reserved-name rule first, where its own order puts it.
     fn check_phase(
         &self,
         graph: StepGraphId,
@@ -3612,12 +3612,11 @@ impl State {
         name: &str,
         except: Option<PhaseId>,
     ) -> Result<()> {
-        if TemplateRole::of_name(name) != TemplateRole::Phase {
-            return Err(StoreError::Constraint(reserved_phase_name(name)));
-        }
         if !self.graphs.contains_key(&graph) {
-            return Err(StoreError::Constraint(format!(
-                "step_graph_phase.graph_id `{graph}` references no step_graph"
+            return Err(StoreError::Constraint(references_no_row(
+                "step_graph_phase.graph_id",
+                graph,
+                "step_graph",
             )));
         }
         let clashes = |taken: &dyn Fn(&StepGraphPhase) -> bool| {
@@ -3652,9 +3651,9 @@ impl State {
         }
         self.check_phase(phase.graph_id, phase.position, &phase.name, None)?;
         if self.phase(phase.id).is_some() {
-            return Err(StoreError::Constraint(format!(
-                "step_graph_phase `{}` already exists",
-                phase.id
+            return Err(StoreError::Constraint(already_exists(
+                "step_graph_phase",
+                phase.id,
             )));
         }
         // MOD-26 D5, MOD-137 §T2.2 steps 5-6: the three personas, then the two agents, after the
@@ -3782,6 +3781,11 @@ impl State {
         if current.updated_at != expected {
             return Ok(CasOutcome::Stale(current));
         }
+        if let Some(name) = &patch.name
+            && TemplateRole::of_name(name) != TemplateRole::Phase
+        {
+            return Err(StoreError::Constraint(reserved_phase_name(name)));
+        }
         self.check_phase(
             current.graph_id,
             patch.position.unwrap_or(current.position),
@@ -3887,15 +3891,15 @@ impl State {
         body: GraphBody,
         now: DateTime<Utc>,
     ) -> Result<CasOutcome<GraphBody>> {
-        let current = self
+        let (scope, revision) = self
             .graphs
             .get(&graph)
-            .cloned()
+            .map(|row| (row.scope, row.revision))
             .ok_or_else(|| StoreError::NotFound {
                 entity: "step_graph",
                 id: graph.to_string(),
             })?;
-        if current.revision != expected_revision {
+        if revision != expected_revision {
             return Ok(CasOutcome::Stale(
                 self.graph_body(graph)
                     .expect("the graph was read a statement ago under the same lock"),
@@ -3907,11 +3911,11 @@ impl State {
         if self
             .graphs
             .values()
-            .any(|row| row.id != graph && row.scope == current.scope && row.name == body.graph.name)
+            .any(|row| row.id != graph && row.scope == scope && row.name == body.graph.name)
         {
             return Err(StoreError::Constraint(graph_name_is_taken(
                 &body.graph.name,
-                current.scope,
+                scope,
             )));
         }
         if let Some(node) = body.nodes.iter().find(|node| {
@@ -5026,7 +5030,18 @@ impl State {
             return None;
         }
         let (graphs, phases) = self.workspace_graphs(id);
-        Some(DeleteReach {
+        Some(self.workspace_reach_of(id, &graphs, &phases))
+    }
+
+    /// [`Self::workspace_reach`] over [`Self::workspace_graphs`]'s sets, so `delete_workspace`
+    /// counts and removes from one computation of them.
+    fn workspace_reach_of(
+        &self,
+        id: WorkspaceId,
+        graphs: &HashSet<StepGraphId>,
+        phases: &HashSet<PhaseId>,
+    ) -> DeleteReach {
+        DeleteReach {
             step_graphs: rows(graphs.len()),
             phases: rows(phases.len()),
             phase_agents: rows(
@@ -5048,7 +5063,7 @@ impl State {
                     .count(),
             ),
             ..DeleteReach::default()
-        })
+        }
     }
 
     /// What a project delete reaches, counted and identified in one pass (PRD D13).
@@ -5263,14 +5278,15 @@ impl State {
     /// unscoped (`ON DELETE SET NULL`). A run's `updated_at` moves, as Postgres's trigger moves it
     /// on the `SET NULL`; `queue_entry` has no `updated_at`.
     fn delete_workspace(&mut self, id: WorkspaceId, now: DateTime<Utc>) -> Result<DeleteReach> {
-        let reach = self
-            .workspace_reach(id)
-            .ok_or_else(|| StoreError::NotFound {
+        if !self.workspaces.contains_key(&id) {
+            return Err(StoreError::NotFound {
                 entity: "workspace",
                 id: id.to_string(),
-            })?;
+            });
+        }
         // MOD-137 D3: its graphs go, with everything that cascades from them.
         let (graphs, phases) = self.workspace_graphs(id);
+        let reach = self.workspace_reach_of(id, &graphs, &phases);
         self.phase_agents
             .retain(|(phase, _), _| !phases.contains(phase));
         self.phase_parts
