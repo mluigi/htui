@@ -100,7 +100,9 @@ pub(super) fn lines(detail: &RequirementDetail, width: u16, theme: &Theme) -> Ve
     out.push(Line::styled("Revisions", theme.title));
     match &detail.revisions {
         Some(rows) => out.extend(rows.iter().map(|row| revision(row, theme))),
-        None => out.push(Line::styled(REVISIONS_NEED_THE_DATABASE, theme.dim)),
+        // L-req repair 2: wrapped, as the rationale is; the pane does not wrap, and at 80 columns
+        // the next step would be cut past its 42nd cell.
+        None => out.extend(paragraph(REVISIONS_NEED_THE_DATABASE, width, theme.dim)),
     }
     out
 }
@@ -464,6 +466,47 @@ mod tests {
         assert!(
             !text(&drawn).contains("by ANA-2"),
             "no revision row is drawn"
+        );
+    }
+
+    /// L-req repair 2: the pane draws without wrapping, so the offline note wraps itself; at
+    /// 80x24 the detail is 42 columns inside its border, and the next step is drawn whole.
+    #[tokio::test]
+    async fn the_offline_next_step_survives_an_80_column_terminal() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::{Paragraph, Widget as _};
+
+        let theme = Theme::default();
+        let mut detail = r_ent_1().await;
+        detail.revisions = None;
+        let area = Rect::new(0, 0, 42, 40);
+        let drawn = lines(&detail, area.width, &theme);
+        let mut buffer = Buffer::empty(area);
+        Paragraph::new(drawn.clone()).render(area, &mut buffer);
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect();
+        let start = rows
+            .iter()
+            .position(|row| row.starts_with("revisions need"))
+            .unwrap_or_else(|| panic!("the note is drawn: {rows:#?}"));
+        let note = rows[start..]
+            .iter()
+            .take_while(|row| !row.is_empty())
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(note, REVISIONS_NEED_THE_DATABASE, "{rows:#?}");
+        assert!(
+            drawn[start..].iter().all(|line| line.style == theme.dim),
+            "the note is dim"
         );
     }
 }
