@@ -2,7 +2,8 @@
 //!
 //! `R-ENT-6` fixes five item kinds, each with a default step graph; ANA-5 §5.4 fixes ten prompt
 //! templates. One table for both of this crate's row sources: `store::mem` and `htui-store`'s
-//! `PgStore` build a project's thirty-five rows from it with fresh UUIDv7 ids, and the demo
+//! `PgStore` build a project's forty-nine rows from it (MOD-137 D9 adds the fourteen edges of
+//! [`default_edges`]) with fresh UUIDv7 ids, and the demo
 //! fixture builds the same rows with its deterministic `demo_uuid` ids. There is no second copy
 //! anywhere, which is what makes PRD risk "seed and fixture drift" structurally impossible.
 //!
@@ -20,8 +21,9 @@
 use chrono::{DateTime, Utc};
 
 use crate::model::{
-    CommandQueue, Gate, GraphScope, ItemKind, ItemKindId, PhaseId, ProjectId, PromptTemplate,
-    PromptTemplateId, Split, StepGraph, StepGraphId, StepGraphPhase, UserId,
+    CommandQueue, EdgeId, EdgeKind, Gate, GraphScope, ItemKind, ItemKindId, PhaseId, ProjectId,
+    PromptTemplate, PromptTemplateId, Split, StepGraph, StepGraphEdge, StepGraphId, StepGraphPhase,
+    UserId,
 };
 
 /// One phase of a default graph: the three columns the table varies, in position order within
@@ -252,6 +254,72 @@ pub fn phase_row(
     }
 }
 
+/// The phase a review loop prefers to send work back to (D9; `htui_orch::gate`'s
+/// `IMPLEMENT_PHASE`).
+const IMPLEMENT: &str = "implement";
+
+/// The phase whose `changes_requested` loops back (D9; `htui_orch::engine`'s review rule).
+const REVIEW: &str = "review";
+
+/// MOD-137 D9: today's implied topology as edges, the rule `0020_step_graph_v2.sql`'s backfill
+/// applies. Phases sorted by `position` (any slice order): a `next` edge between each adjacent
+/// pair, then for each phase named `review` a `changes_requested` edge to the greatest earlier
+/// phase named `implement`, else to the phase just before it in position order (blueprint F4:
+/// positions may have gaps), with `loop_limit` = the target's `retry_limit`; a `review` first in
+/// order gets none. All `phases` share one `graph_id` (`debug_assert!`); empty in, empty out.
+/// `mint` names each edge (UUIDv7 in the stores, `demo_uuid` in the fixture).
+///
+/// The output lists every `next` edge in position order, then the loop edges in review-position
+/// order. The run-time twins are `htui_orch::gate::loop_target` and the review rule of
+/// `htui_orch::engine` (this crate cannot depend on `htui-orch`); MOD-138's edge walker retires
+/// the name rule and lifts v1 graphs through this function.
+#[must_use]
+pub fn default_edges(
+    phases: &[StepGraphPhase],
+    mut mint: impl FnMut() -> EdgeId,
+) -> Vec<StepGraphEdge> {
+    let mut sorted: Vec<&StepGraphPhase> = phases.iter().collect();
+    sorted.sort_by_key(|phase| phase.position);
+    debug_assert!(
+        sorted
+            .windows(2)
+            .all(|pair| pair[0].graph_id == pair[1].graph_id),
+        "default_edges takes the phases of one graph"
+    );
+    let edge = |from: &StepGraphPhase, to: &StepGraphPhase, kind, loop_limit, id| StepGraphEdge {
+        id,
+        graph_id: from.graph_id,
+        from: from.id,
+        to: to.id,
+        kind,
+        predicate: None,
+        loop_limit,
+    };
+    let mut edges: Vec<StepGraphEdge> = sorted
+        .windows(2)
+        .map(|pair| edge(pair[0], pair[1], EdgeKind::Next, None, mint()))
+        .collect();
+    for (index, review) in sorted.iter().enumerate() {
+        if review.name != REVIEW || index == 0 {
+            continue;
+        }
+        let earlier = &sorted[..index];
+        let target = earlier
+            .iter()
+            .rev()
+            .find(|phase| phase.name == IMPLEMENT)
+            .unwrap_or(&earlier[index - 1]);
+        edges.push(edge(
+            review,
+            target,
+            EdgeKind::ChangesRequested,
+            Some(target.retry_limit),
+            mint(),
+        ));
+    }
+    edges
+}
+
 /// An `item_kind` row whose default graph is `graph_id` (the row [`graph_row`] built for the
 /// same `kind`) and whose `position` is the kind's index in [`KINDS`].
 #[must_use]
@@ -303,10 +371,13 @@ pub fn template_row(
 mod tests {
     use std::collections::HashSet;
 
-    use super::{KINDS, PHASES_PER_PROJECT, graph_row, kind_row, phase_row, template_row};
+    use super::{
+        KINDS, PHASES_PER_PROJECT, PhaseSeed, default_edges, graph_row, kind_row, phase_row,
+        template_row,
+    };
     use crate::model::{
-        CommandQueue, Gate, GraphScope, ItemKind, ItemKindId, PhaseId, ProjectId, PromptTemplateId,
-        Split, StepGraphId, UserId,
+        CommandQueue, EdgeId, EdgeKind, Gate, GraphScope, ItemKind, ItemKindId, PhaseId, ProjectId,
+        PromptTemplateId, Split, StepGraphEdge, StepGraphId, StepGraphPhase, UserId,
     };
     use crate::prompt::{DEFAULT_TEMPLATES, TemplateRole, body_of};
     use chrono::Utc;
@@ -551,5 +622,186 @@ mod tests {
         assert_eq!(template.body, body);
         assert_eq!(template.created_by, author, "the caller's, not a constant");
         assert_eq!((template.created_at, template.updated_at), (now, now));
+    }
+
+    /// `(name, position, retry_limit)` rows of one graph, through [`phase_row`].
+    fn graph_of(rows: &[(&'static str, i32, i32)]) -> Vec<StepGraphPhase> {
+        let graph = StepGraphId::new();
+        rows.iter()
+            .map(|&(name, position, retry_limit)| {
+                let seed = PhaseSeed {
+                    name,
+                    input_kinds: &[],
+                    gate_hard: false,
+                };
+                let mut row = phase_row(PhaseId::new(), graph, position, &seed, Utc::now());
+                row.retry_limit = retry_limit;
+                row
+            })
+            .collect()
+    }
+
+    /// The edges as `(from name, to name, kind, loop_limit)`, ids and predicates aside.
+    fn shape(
+        phases: &[StepGraphPhase],
+        edges: &[StepGraphEdge],
+    ) -> Vec<(String, String, EdgeKind, Option<i32>)> {
+        let name = |id| {
+            phases
+                .iter()
+                .find(|phase| phase.id == id)
+                .map(|phase| phase.name.clone())
+                .expect("an endpoint of the graph")
+        };
+        edges
+            .iter()
+            .map(|edge| {
+                assert_eq!(edge.predicate, None, "default edges carry no predicate");
+                (name(edge.from), name(edge.to), edge.kind, edge.loop_limit)
+            })
+            .collect()
+    }
+
+    fn row(
+        from: &str,
+        to: &str,
+        kind: EdgeKind,
+        limit: Option<i32>,
+    ) -> (String, String, EdgeKind, Option<i32>) {
+        (from.to_owned(), to.to_owned(), kind, limit)
+    }
+
+    #[test]
+    fn default_edges_link_adjacent_phases() {
+        let phases = graph_of(&[("a", 0, 1), ("b", 1, 1), ("c", 2, 1), ("d", 3, 1)]);
+        let edges = default_edges(&phases, EdgeId::new);
+        assert_eq!(
+            shape(&phases, &edges),
+            [
+                row("a", "b", EdgeKind::Next, None),
+                row("b", "c", EdgeKind::Next, None),
+                row("c", "d", EdgeKind::Next, None),
+            ]
+        );
+        assert!(edges.iter().all(|edge| edge.graph_id == phases[0].graph_id));
+        let ids: HashSet<EdgeId> = edges.iter().map(|edge| edge.id).collect();
+        assert_eq!(ids.len(), 3, "each edge minted its own id");
+    }
+
+    #[test]
+    fn default_edges_loop_review_to_the_greatest_earlier_implement() {
+        let phases = graph_of(&[("implement", 0, 4), ("docs", 5, 1), ("review", 9, 1)]);
+        assert_eq!(
+            shape(&phases, &default_edges(&phases, EdgeId::new)),
+            [
+                row("implement", "docs", EdgeKind::Next, None),
+                row("docs", "review", EdgeKind::Next, None),
+                row("review", "implement", EdgeKind::ChangesRequested, Some(4)),
+            ]
+        );
+        let twice = graph_of(&[
+            ("implement", 0, 2),
+            ("x", 1, 1),
+            ("implement2", 2, 1),
+            ("review", 3, 1),
+        ]);
+        let loops: Vec<_> = shape(&twice, &default_edges(&twice, EdgeId::new))
+            .into_iter()
+            .filter(|edge| edge.2 == EdgeKind::ChangesRequested)
+            .collect();
+        assert_eq!(
+            loops,
+            [row(
+                "review",
+                "implement",
+                EdgeKind::ChangesRequested,
+                Some(2)
+            )],
+            "only the name `implement` counts"
+        );
+    }
+
+    #[test]
+    fn default_edges_fall_back_to_the_previous_phase() {
+        let bug = &KINDS[2];
+        assert_eq!(bug.name, "bug");
+        let graph = StepGraphId::new();
+        let phases: Vec<StepGraphPhase> = bug
+            .phases
+            .iter()
+            .zip(0..)
+            .map(|(seed, position)| phase_row(PhaseId::new(), graph, position, seed, Utc::now()))
+            .collect();
+        assert_eq!(
+            shape(&phases, &default_edges(&phases, EdgeId::new)),
+            [
+                row("reproduce", "fix", EdgeKind::Next, None),
+                row("fix", "review", EdgeKind::Next, None),
+                row("review", "fix", EdgeKind::ChangesRequested, Some(1)),
+            ]
+        );
+        let gap = graph_of(&[("draft", 0, 2), ("review", 4, 1)]);
+        assert_eq!(
+            shape(&gap, &default_edges(&gap, EdgeId::new)),
+            [
+                row("draft", "review", EdgeKind::Next, None),
+                row("review", "draft", EdgeKind::ChangesRequested, Some(2)),
+            ],
+            "previous in position order, not position - 1 (F4)"
+        );
+    }
+
+    #[test]
+    fn default_edges_give_a_first_review_no_loop() {
+        let phases = graph_of(&[("review", 0, 1)]);
+        assert_eq!(default_edges(&phases, EdgeId::new), []);
+        assert_eq!(default_edges(&[], EdgeId::new), []);
+    }
+
+    #[test]
+    fn default_edges_ignore_slice_order() {
+        let phases = graph_of(&[
+            ("plan", 0, 1),
+            ("implement", 3, 3),
+            ("review", 7, 1),
+            ("docs", 9, 1),
+        ]);
+        let mut shuffled = phases.clone();
+        shuffled.reverse();
+        shuffled.swap(0, 2);
+        assert_eq!(
+            shape(&phases, &default_edges(&shuffled, EdgeId::new)),
+            shape(&phases, &default_edges(&phases, EdgeId::new))
+        );
+    }
+
+    #[test]
+    fn every_seeded_graph_has_its_default_edges() {
+        let (mut next, mut loops) = (0, 0);
+        for kind in &KINDS {
+            let graph = StepGraphId::new();
+            let phases: Vec<StepGraphPhase> = kind
+                .phases
+                .iter()
+                .zip(0..)
+                .map(|(seed, position)| {
+                    phase_row(PhaseId::new(), graph, position, seed, Utc::now())
+                })
+                .collect();
+            let edges = default_edges(&phases, EdgeId::new);
+            next += edges
+                .iter()
+                .filter(|edge| edge.kind == EdgeKind::Next)
+                .count();
+            loops += edges
+                .iter()
+                .filter(|edge| edge.kind == EdgeKind::ChangesRequested)
+                .count();
+        }
+        assert_eq!(
+            (next, loops),
+            (10, 4),
+            "fifteen phases in five graphs, four reviews"
+        );
     }
 }

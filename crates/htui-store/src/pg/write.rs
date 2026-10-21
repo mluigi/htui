@@ -45,7 +45,7 @@ use htui_core::model::{
     WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceStop, canonical_declared_tags,
     missing_tags_failure, moved_order, overlaps, scope_of,
 };
-use htui_core::model::{GraphScope, PlanScope, Split};
+use htui_core::model::{EdgeId, GraphScope, PlanScope, Split, StepGraphEdge};
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
 use htui_core::seed;
@@ -1006,7 +1006,11 @@ async fn phase_reference_refusal(
     .await
     .map_err(map_sqlx)?;
     let personas = [
-        ("step_graph_phase.persona_id", found.persona, phase.persona_id),
+        (
+            "step_graph_phase.persona_id",
+            found.persona,
+            phase.persona_id,
+        ),
         (
             "step_graph_phase.planner_persona_id",
             found.planner_persona,
@@ -1117,6 +1121,29 @@ async fn insert_phase<'e, E: PgExecutor<'e>>(
     )
     .fetch_one(executor)
     .await
+}
+
+/// The one `INSERT INTO step_graph_edge` (MOD-137 blueprint §T3.4), shared by `replace_graph`,
+/// `seed_project` and `load_demo` so the three bind one statement and one `.sqlx` entry.
+pub(super) async fn insert_edge<'e, E: PgExecutor<'e>>(
+    executor: E,
+    edge: &StepGraphEdge,
+) -> Result<()> {
+    sqlx::query!(
+        "INSERT INTO step_graph_edge (id, graph_id, from_phase_id, to_phase_id, kind, predicate, \
+         loop_limit) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        edge.id.as_uuid(),
+        edge.graph_id.as_uuid(),
+        edge.from.as_uuid(),
+        edge.to.as_uuid(),
+        edge.kind.as_str(),
+        edge.predicate.as_ref().map(|predicate| &predicate.0),
+        edge.loop_limit,
+    )
+    .execute(executor)
+    .await
+    .map_err(map_sqlx)?;
+    Ok(())
 }
 
 /// A persona blob as `JSONB`, `create_run`'s shape.
@@ -2702,8 +2729,9 @@ impl WriteStore for PgStore {
 
     // project
 
-    /// The project row and, in the same transaction, the thirty-five rows `seed_project` gives
-    /// every project: five default graphs, their fifteen phases, five kinds and the ten
+    /// The project row and, in the same transaction, the forty-nine rows `seed_project` gives
+    /// every project: five default graphs, their fifteen phases and fourteen default edges
+    /// (MOD-137 D9), five kinds and the ten
     /// `DEFAULT_TEMPLATES` at version 1 (M1 D9, M2 D4). `settings` takes the column default `{}`
     /// and the two secret columns are MOD-10's.
     ///
@@ -8401,9 +8429,10 @@ impl WriteStore for PgStore {
     }
 }
 
-/// The thirty-five rows a project is born with (MOD-15 D9/D10), on the caller's transaction.
+/// The forty-nine rows a project is born with (MOD-15 D9/D10, MOD-137 D9), on the caller's
+/// transaction.
 ///
-/// Graphs first, then each graph's phases, then the kind (`item_kind.default_graph_id` is
+/// Graphs first, then each graph's phases and its [`seed::default_edges`], then the kind (`item_kind.default_graph_id` is
 /// `NOT NULL REFERENCES step_graph`, `0001_init.sql:288`), then the templates, which reference
 /// only the project and its creator. Every non-timestamp column is bound — `gate_hard` and
 /// `input_kinds` included, where they happen to equal the column default — so [`seed::KINDS`] is
@@ -8440,6 +8469,7 @@ async fn seed_project(
         .await
         .map_err(map_sqlx)?;
 
+        let mut rows = Vec::with_capacity(kind.phases.len());
         for (phase_position, phase) in kind.phases.iter().enumerate() {
             let row = seed::phase_row(PhaseId::new(), graph.id, phase_position as i32, phase, now);
             sqlx::query!(
@@ -8467,6 +8497,11 @@ async fn seed_project(
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx)?;
+            rows.push(row);
+        }
+        // MOD-137 D9: the implied topology as edges, the rule 0020's backfill applies.
+        for edge in seed::default_edges(&rows, EdgeId::new) {
+            insert_edge(&mut *tx, &edge).await?;
         }
 
         let kind_row = seed::kind_row(

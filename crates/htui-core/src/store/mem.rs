@@ -395,7 +395,7 @@ impl MemStore {
             graphs: data.graphs.into_iter().map(|row| (row.id, row)).collect(),
             phases: data.phases,
             phase_agents: BTreeMap::new(),
-            edges: BTreeMap::new(),
+            edges: data.edges.into_iter().map(|row| (row.id, row)).collect(),
             phase_parts: BTreeMap::new(),
             templates: data.templates,
             skills: data.skills.into_iter().map(|row| (row.id, row)).collect(),
@@ -3012,9 +3012,9 @@ impl State {
         rows
     }
 
-    /// A project with `settings = {}` and no secret provider (M1 D9), plus the thirty-five rows
-    /// `seed` gives every project — five graphs, fifteen phases, five kinds, ten templates (M2
-    /// D4).
+    /// A project with `settings = {}` and no secret provider (M1 D9), plus the forty-nine rows
+    /// `seed` gives every project — five graphs, fifteen phases, their fourteen default edges
+    /// (MOD-137 D9), five kinds, ten templates (M2 D4).
     ///
     /// Validate, then mutate: `require_user`, the duplicate id and the duplicate slug all fire
     /// before the first insert, and nothing after it can fail — the rows come from `seed::KINDS`
@@ -3058,15 +3058,19 @@ impl State {
             let graph = seed::graph_row(StepGraphId::new(), project_id, kind, now);
             let graph_id = graph.id;
             self.graphs.insert(graph_id, graph);
-            for (phase_position, phase) in kind.phases.iter().enumerate() {
-                self.phases.push(seed::phase_row(
-                    PhaseId::new(),
-                    graph_id,
-                    phase_position as i32,
-                    phase,
-                    now,
-                ));
+            let rows: Vec<StepGraphPhase> = kind
+                .phases
+                .iter()
+                .enumerate()
+                .map(|(phase_position, phase)| {
+                    seed::phase_row(PhaseId::new(), graph_id, phase_position as i32, phase, now)
+                })
+                .collect();
+            // MOD-137 D9: the implied topology as edges, the rule 0020's backfill applies.
+            for edge in seed::default_edges(&rows, EdgeId::new) {
+                self.edges.insert(edge.id, edge);
             }
+            self.phases.extend(rows);
             let kind_row = seed::kind_row(
                 ItemKindId::new(),
                 project_id,
@@ -12077,8 +12081,12 @@ mod tests {
         store.read(|state| {
             assert!(!state.projects.contains_key(&gone), "the project itself");
             assert!(
-                state.edges.is_empty(),
-                "step_graph_edge goes with its graph (MOD-137 D6)"
+                state
+                    .edges
+                    .values()
+                    .all(|edge| state.graphs.contains_key(&edge.graph_id)),
+                "step_graph_edge goes with its graph (MOD-137 D6); the other projects keep \
+                 their seeded edges (D9)"
             );
             assert!(
                 state.phase_parts.is_empty(),

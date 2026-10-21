@@ -2097,6 +2097,115 @@ async fn migration_0020_backfills_next_and_review_edges() {
     db.drop_db().await;
 }
 
+/// MOD-137 plan D9 (blueprint §T3.6): the SQL backfill and [`htui_core::seed::default_edges`]
+/// are one rule in two places, pinned equal. Staged at v19: the five seeded kinds' graphs (with
+/// `implement` and `fix` at `retry_limit 3`), `gappy` and `gap-no-implement`, raw-inserted; then
+/// 0020 runs. Per graph, the backfilled `(from, to, kind, loop_limit)` set equals what
+/// `default_edges` derives from the same phase rows (ids aside: the backfill mints v4 ids).
+#[tokio::test]
+async fn migration_0020_backfill_equals_default_edges() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(19, &db.pool)
+        .await
+        .expect("apply 0001 through 0019");
+    let pool = &db.pool;
+    let user = insert_user(pool, "graph").await;
+    let project = insert_project(pool, user, "graphs").await;
+
+    let mut graphs = Vec::new();
+    for kind in &htui_core::seed::KINDS {
+        let graph = insert_graph(pool, project, kind.name).await;
+        graphs.push(graph);
+        for (position, phase) in kind.phases.iter().enumerate() {
+            let mut row = htui_core::seed::phase_row(
+                htui_core::model::PhaseId::new(),
+                htui_core::model::StepGraphId::from_uuid(graph),
+                i32::try_from(position).expect("a seeded position fits i32"),
+                phase,
+                at_2026(),
+            );
+            if matches!(phase.name, "implement" | "fix") {
+                row.retry_limit = 3;
+            }
+            insert_phase_row(pool, &row).await;
+        }
+    }
+    let gappy = insert_graph(pool, project, "gappy").await;
+    insert_phase(pool, gappy, 0, "implement", 1, 4).await;
+    insert_phase(pool, gappy, 5, "docs", 1, 1).await;
+    insert_phase(pool, gappy, 9, "review", 1, 1).await;
+    let gap = insert_graph(pool, project, "gap-no-implement").await;
+    insert_phase(pool, gap, 0, "draft", 1, 2).await;
+    insert_phase(pool, gap, 4, "review", 1, 1).await;
+    graphs.extend([gappy, gap]);
+
+    MIGRATOR.run(pool).await.expect("apply 0020");
+
+    let mut total = 0;
+    for graph in graphs {
+        let rows: Vec<(uuid::Uuid, i32, String, i32)> = sqlx::query_as(
+            "SELECT id, position, name, retry_limit FROM step_graph_phase WHERE graph_id = $1",
+        )
+        .bind(graph)
+        .fetch_all(pool)
+        .await
+        .expect("read the graph's phases");
+        let phases: Vec<htui_core::model::StepGraphPhase> = rows
+            .into_iter()
+            .map(|(id, position, name, retry_limit)| {
+                let seed = htui_core::seed::PhaseSeed {
+                    name: "unused",
+                    input_kinds: &[],
+                    gate_hard: false,
+                };
+                let mut row = htui_core::seed::phase_row(
+                    htui_core::model::PhaseId::from_uuid(id),
+                    htui_core::model::StepGraphId::from_uuid(graph),
+                    position,
+                    &seed,
+                    at_2026(),
+                );
+                row.name = name;
+                row.retry_limit = retry_limit;
+                row
+            })
+            .collect();
+        let mut derived: Vec<(uuid::Uuid, uuid::Uuid, String, Option<i32>)> =
+            htui_core::seed::default_edges(&phases, htui_core::model::EdgeId::new)
+                .into_iter()
+                .map(|edge| {
+                    (
+                        edge.from.as_uuid(),
+                        edge.to.as_uuid(),
+                        edge.kind.as_str().to_owned(),
+                        edge.loop_limit,
+                    )
+                })
+                .collect();
+        derived.sort();
+        let mut backfilled: Vec<(uuid::Uuid, uuid::Uuid, String, Option<i32>)> = sqlx::query_as(
+            "SELECT from_phase_id, to_phase_id, kind, loop_limit FROM step_graph_edge \
+             WHERE graph_id = $1",
+        )
+        .bind(graph)
+        .fetch_all(pool)
+        .await
+        .expect("read the graph's edges");
+        backfilled.sort();
+        assert_eq!(
+            backfilled, derived,
+            "graph {graph}: the 0020 backfill is seed::default_edges"
+        );
+        total += derived.len();
+    }
+    assert_eq!(total, 19, "14 seeded + 3 gappy + 2 gap-no-implement");
+
+    db.drop_db().await;
+}
+
 /// MOD-137 plan D7: `0020_step_graph_v2.sql` marks a v19 phase with `fan_out > 1` `compete` and
 /// every other `none`; `palette` is false and `plan_scope` plus the seven divide columns are
 /// `NULL` on every existing row.
@@ -3969,6 +4078,7 @@ async fn load_demo_round_trips_a_count_per_table() {
         "persona",
         "step_graph",
         "step_graph_phase",
+        "step_graph_edge",
         "prompt_template",
         "item_kind",
         "item_key_counter",
@@ -3995,7 +4105,12 @@ async fn load_demo_round_trips_a_count_per_table() {
     let data = htui_core::fixtures::demo_data();
     db.store.load_demo(&data).await.expect("load the fixture");
 
-    let expected: [(&str, usize); 26] = [
+    assert_eq!(
+        data.edges.len(),
+        42,
+        "fourteen default edges per project (MOD-137 D9)"
+    );
+    let expected: [(&str, usize); 27] = [
         ("app_user", data.users.len()),
         ("box", data.boxes.len()),
         ("workspace", data.workspaces.len()),
@@ -4005,6 +4120,7 @@ async fn load_demo_round_trips_a_count_per_table() {
         ("persona", data.personas.len()),
         ("step_graph", data.graphs.len()),
         ("step_graph_phase", data.phases.len()),
+        ("step_graph_edge", data.edges.len()),
         ("prompt_template", data.templates.len()),
         ("item_kind", data.kinds.len()),
         ("item_key_counter", data.item_key_counter.len()),

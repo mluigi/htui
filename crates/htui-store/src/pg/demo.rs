@@ -269,6 +269,11 @@ impl PgStore {
             .map_err(map_sqlx)?;
         }
 
+        // MOD-137 D9: each graph's default edges, after both endpoints exist.
+        for edge in &data.edges {
+            super::write::insert_edge(&mut *tx, edge).await?;
+        }
+
         for row in &data.templates {
             sqlx::query!(
                 "INSERT INTO prompt_template (id, project_id, name, version, body, created_by, \
