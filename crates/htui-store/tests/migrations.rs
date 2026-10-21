@@ -1915,6 +1915,55 @@ async fn migration_0020_refuses_an_unknown_type_a_bad_slug_and_a_recipeless_user
     db.drop_db().await;
 }
 
+/// MOD-146 plan D1: `trg_project_type_updated_at` is 0001's `set_updated_at`, BEFORE UPDATE only
+/// (0012's persona shape): an explicit INSERT stamp stands, and an UPDATE of a user-defined type
+/// moves `updated_at` and leaves `created_at` alone. The item trigger's case,
+/// `the_trigger_bumps_updated_at_on_update_only`, one table across.
+#[tokio::test]
+async fn migration_0020_bumps_a_project_types_updated_at_on_update_only() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let pool = &db.pool;
+    let stamp = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+        .expect("a literal RFC-3339 timestamp")
+        .with_timezone(&chrono::Utc);
+    sqlx::query(
+        "INSERT INTO project_type (slug, name, seed, created_at, updated_at) \
+         VALUES ('custom', 'Custom', '{\"graph\": []}'::jsonb, $1, $1)",
+    )
+    .bind(stamp)
+    .execute(pool)
+    .await
+    .expect("insert a user-defined type");
+    let stamps = || async {
+        sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>(
+            "SELECT created_at, updated_at FROM project_type WHERE slug = 'custom'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read project_type's stamps")
+    };
+    assert_eq!(
+        stamps().await,
+        (stamp, stamp),
+        "the BEFORE UPDATE trigger leaves an explicit INSERT timestamp alone"
+    );
+
+    sqlx::query("UPDATE project_type SET name = 'Renamed' WHERE slug = 'custom'")
+        .execute(pool)
+        .await
+        .expect("update the type");
+    let (created, updated) = stamps().await;
+    assert_eq!(created, stamp, "an UPDATE leaves created_at alone");
+    assert!(
+        updated > stamp,
+        "trg_project_type_updated_at moves updated_at on UPDATE: {updated}"
+    );
+
+    db.drop_db().await;
+}
+
 /// The smallest FK chain an `item` row needs (project -> step_graph -> item_kind), under the
 /// `created_by` the caller names. Returns `(project, kind)`; the kind's prefix is `RES`.
 async fn plant_item_kind(pool: &sqlx::PgPool, user: uuid::Uuid) -> (uuid::Uuid, uuid::Uuid) {
