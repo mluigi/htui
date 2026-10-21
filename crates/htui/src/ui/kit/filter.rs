@@ -7,8 +7,10 @@
 //! - applied: ` / ` dim, then the query in `theme.base`;
 //! - either way `{shown} of {total}` in `theme.dim`, against the right edge.
 //!
-//! The count is never cut: the field gives way first, then the slash. An applied query that is
-//! empty is no band at all, and the caller does not reserve its row.
+//! The count gives way last: the field first, then the slash, and only a count wider than the
+//! whole row is cut, ending with `…` so it never reads as another number (`3 of 1` for
+//! `3 of 12`). An applied query that is empty is no band at all, and the caller does not reserve
+//! its row.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -45,8 +47,9 @@ pub enum Filter<'a> {
     },
 }
 
-/// The band as one line of exactly `width` cells (wider only when the count alone is); an empty
-/// applied query is an empty line. `accent` is the typing marker's style (`ctx.accent()`).
+/// The band as one line of exactly `width` cells, the count cut with `…` when it alone is wider;
+/// an empty applied query is an empty line. `accent` is the typing marker's style
+/// (`ctx.accent()`).
 #[must_use]
 pub fn line(filter: &Filter<'_>, width: u16, accent: Style, theme: &Theme) -> Line<'static> {
     let (shown, total) = match *filter {
@@ -55,9 +58,9 @@ pub fn line(filter: &Filter<'_>, width: u16, accent: Style, theme: &Theme) -> Li
             (shown, total)
         }
     };
-    let count = format!("{shown} of {total}");
-    let count_width = cells::cell_width(&count);
     let width = usize::from(width);
+    let count = cells::clip(&format!("{shown} of {total}"), width);
+    let count_width = cells::cell_width(&count);
     let mut spans: Vec<Span<'static>> = Vec::new();
     // The prefix, one blank before the count, and the count: what is left is the query's.
     if width >= PREFIX + 1 + count_width {
@@ -208,6 +211,38 @@ mod tests {
         }
         let applied = line(&applied, 20, accent(), &theme);
         assert_eq!(text(&applied), " / a long q… 3 of 12");
+    }
+
+    /// RV1 L1: a count wider than the row is cut with `…`, never to a believable wrong number
+    /// (`3 of 1` for `3 of 12`), and the band is never wider than the row.
+    #[test]
+    fn a_count_wider_than_the_row_ends_with_an_ellipsis() {
+        let theme = Theme::default();
+        let applied = Filter::Applied {
+            query: "bug",
+            shown: 3,
+            total: 12,
+        };
+        for width in 0..7u16 {
+            let band = line(&applied, width, accent(), &theme);
+            assert_eq!(band.width(), usize::from(width), "{width}: {band:?}");
+            let shown = text(&band);
+            assert!(width == 0 || shown.ends_with('…'), "{width}: {shown}");
+            assert!(!shown.contains("of 1"), "{width}: {shown}");
+        }
+        assert_eq!(text(&line(&applied, 6, accent(), &theme)), "3 of …");
+        assert_eq!(
+            style_of(&line(&applied, 6, accent(), &theme), "…"),
+            theme.dim
+        );
+        let mut terminal = Terminal::new(TestBackend::new(6, 1)).expect("a test terminal");
+        terminal
+            .draw(|frame| render(frame, frame.area(), &applied, accent(), &theme))
+            .expect("draw");
+        let row: String = (0..6)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect();
+        assert_eq!(row, "3 of …");
     }
 
     #[test]
