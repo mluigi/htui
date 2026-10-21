@@ -7,6 +7,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -110,15 +111,22 @@ impl Composer {
     }
 
     /// Draws the input line while the composer is open; nothing otherwise (the keys that open it
-    /// are the shell's hint row since MOD-67 M6 T2).
-    pub fn render(frame: &mut Frame<'_>, area: Rect, composer: &Self, theme: &Theme) {
+    /// are the pane's hints since MOD-67 M6 T2). The prompt `> ` and the cursor `_` take
+    /// `accent`, the tab's focus accent (MOD-115 M3 D-17, MOD-85); the text is plain.
+    pub fn render(
+        frame: &mut Frame<'_>,
+        area: Rect,
+        composer: &Self,
+        accent: Style,
+        theme: &Theme,
+    ) {
         if !composer.active {
             return;
         }
         let line = Line::from(vec![
-            Span::styled("> ", theme.accent),
+            Span::styled("> ", accent),
             Span::styled(composer.text.clone(), theme.base),
-            Span::styled("_", theme.accent),
+            Span::styled("_", accent),
         ]);
         frame.render_widget(Paragraph::new(line), area);
     }
@@ -188,6 +196,29 @@ mod tests {
             "an empty turn is not a turn"
         );
         assert!(composer.is_active());
+    }
+
+    /// MOD-115 M3 D-17, MOD-85: the prompt `> ` and the cursor `_` take the accent the tab
+    /// passes (its focus accent, the one focus use left in the Chat); the text is plain.
+    #[test]
+    fn the_prompt_marks_take_the_accent_passed_in() {
+        use ratatui::style::{Color, Style};
+        let theme = Theme::default();
+        let accent = Style::new().fg(Color::Red);
+        let mut composer = Composer::default();
+        composer.enter();
+        composer.on_key(key(KeyCode::Char('h')));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(10, 1)).expect("terminal");
+        terminal
+            .draw(|frame| Composer::render(frame, frame.area(), &composer, accent, &theme))
+            .expect("the frame draws");
+        let buffer = terminal.backend().buffer();
+        let cell = |x: u16| (buffer[(x, 0)].symbol().to_owned(), buffer[(x, 0)].fg);
+        assert_eq!(cell(0), (">".to_owned(), Color::Red));
+        assert_eq!(cell(3), ("_".to_owned(), Color::Red));
+        assert_eq!(buffer[(2, 0)].symbol(), "h");
+        assert_eq!(buffer[(2, 0)].fg, theme.base.fg.unwrap_or(Color::Reset));
     }
 
     #[test]

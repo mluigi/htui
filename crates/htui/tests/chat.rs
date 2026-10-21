@@ -175,7 +175,11 @@ fn done() -> ScriptEvent {
 #[tokio::test]
 async fn an_unstarted_chat_names_its_agent_and_asks_for_a_prompt() {
     let (mut harness, _) = harness(Script::default()).await;
-    stable().bind(|| insta::assert_snapshot!("chat_empty", harness.render()));
+    let frame = harness.render();
+    // MOD-115 M3: the empty state names its next step, the compose key in force.
+    assert!(frame.contains("type a prompt to start a chat"), "{frame}");
+    assert!(frame.contains("i composes the first prompt"), "{frame}");
+    stable().bind(|| insta::assert_snapshot!("chat_empty", frame));
 }
 
 #[tokio::test]

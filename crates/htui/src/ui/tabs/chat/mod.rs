@@ -46,6 +46,7 @@ use crate::run_worker::{OrchReply, Via};
 use crate::store_worker::{ChatFrame, StoreReply, StoreRequest};
 use crate::ui::cells::{self, cell_width};
 use crate::ui::kit::chips::key_line;
+use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::label::plural;
 use crate::ui::kit::pane::Pane;
 use crate::ui::kit::text::{Tone, notice};
@@ -112,6 +113,22 @@ const IDLE_HINT: HintSpec = &[
     Hint::One(Act::ChatCompose, "compose the first prompt"),
     Hint::One(Act::ChatNextAgent, "next agent"),
 ];
+
+/// The empty Chat when no agent is enabled, and its next step.
+const NO_AGENT: &str = "no agent is registered on this box";
+const NO_AGENT_NEXT: &str = "Settings \u{203a} Agents adds one";
+
+/// The empty Chat with an agent to talk to.
+const NO_CHAT: &str = "type a prompt to start a chat";
+
+/// The empty Chat's next step: the compose key in force (`chat.compose` through `CHAT_LIVE`), or
+/// where to bind one when it is unbound.
+fn compose_next(keys: &Keys) -> String {
+    keys.label(views::CHAT_LIVE, Act::ChatCompose).map_or_else(
+        || "bind [chat] compose to write the first prompt".to_owned(),
+        |key| format!("{key} composes the first prompt"),
+    )
+}
 
 /// `StoreRequest::name` of a promotion (blueprint D209): its refusal is this tab's to show, since
 /// the shell asked for it on the tab's behalf.
@@ -871,12 +888,13 @@ impl Tab for ChatTab {
             lines.push(Line::styled(refusal.clone(), ctx.theme.error));
             frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), body);
         } else if self.session.is_none() && !self.pending_start {
-            let text = if self.agents.is_empty() {
-                "no agent is registered on this box".to_owned()
+            // MOD-115 M3: an empty state says what is missing and the next step (audit item 2).
+            let (what, next) = if self.agents.is_empty() {
+                (NO_AGENT, NO_AGENT_NEXT.to_owned())
             } else {
-                "type a prompt to start a chat".to_owned()
+                (NO_CHAT, compose_next(ctx.keys()))
             };
-            frame.render_widget(Paragraph::new(Line::styled(text, ctx.theme.dim)), body);
+            empty::render(frame, body, what, NextStep(&next), ctx.theme);
         } else {
             let unfold = ctx.keys().label(views::CHAT_LIVE, Act::ChatThoughts);
             let lines = self
@@ -892,7 +910,7 @@ impl Tab for ChatTab {
         // Not under a replay: the composer belongs to the live view, and a replay must not show
         // an input line for a step that can take no input.
         if replay.is_none() {
-            Composer::render(frame, composer, &self.composer, ctx.theme);
+            Composer::render(frame, composer, &self.composer, ctx.accent(), ctx.theme);
         }
 
         // The title's room: the pane draws ` {title} ` two cells past the corner and stops one
@@ -1323,6 +1341,40 @@ mod tests {
             "no colour"
         );
         assert!(title.add_modifier.contains(Modifier::BOLD));
+    }
+
+    /// MOD-115 M3 D-17, MOD-85: the open composer's `> ` takes the Chat's accent (the one focus
+    /// use left in the tab), not the theme's modal accent.
+    #[test]
+    fn the_composer_takes_the_tab_accent() {
+        let shell = Shell::new();
+        let mut tab = live(&shell);
+        tab.on_key(key(KeyCode::Char('i')), &mut shell.ctx());
+        let buffer = draw(&tab, &shell, (60, 8), true);
+        // The composer is the pane's last inner row.
+        assert_eq!(buffer[(1, 6)].symbol(), ">");
+        assert_eq!(
+            Some(buffer[(1, 6)].fg),
+            shell.ctx().accent().fg,
+            "the tab accent"
+        );
+    }
+
+    /// MOD-115 M3: an empty Chat says what is missing and what to do next (audit item 2).
+    #[test]
+    fn the_empty_chat_names_a_next_step() {
+        let shell = Shell::new();
+        let tab = ChatTab::new();
+        let rows = rows_of(&draw(&tab, &shell, (60, 10), true));
+        let screen = rows.join("\n");
+        assert!(
+            screen.contains("no agent is registered on this box"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("Settings \u{203a} Agents adds one"),
+            "{screen}"
+        );
     }
 
     /// MOD-115 M3 D-11: the transcript's scrollbar sits on the right border beside the
