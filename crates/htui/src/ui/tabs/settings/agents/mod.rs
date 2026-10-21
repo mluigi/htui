@@ -810,9 +810,25 @@ fn swallows(keys: &Keys, chord: KeyChord, swallowed: &[Act]) -> Handled {
     }
 }
 
-/// The refusal of a key pressed while a registry write is in flight (blueprint F-20).
+/// The refusal of a key pressed while a registry write is in flight (blueprint F-20), in words
+/// (MOD-115 M3 RV2: no request name on screen).
 fn in_flight(request: &str) -> String {
-    format!("`{request}` is still in flight")
+    format!(
+        "still {} \u{2014} wait for the store's answer",
+        doing(request)
+    )
+}
+
+/// What the registry write `busy` is doing, as the user reads it, by request name
+/// ([`REQUEST_NAMES`] and [`agent_settings::SET_TOOL_PATHS`]).
+fn doing(busy: &str) -> &'static str {
+    match busy {
+        "create_agent" => "adding the agent",
+        "edit_agent" => "saving the agent",
+        "set_agent_on_box" => "switching the agent on this box",
+        agent_settings::SET_TOOL_PATHS => "saving the tool paths",
+        _ => "writing",
+    }
 }
 
 impl SettingsSection for AgentsSection {
@@ -1158,5 +1174,23 @@ mod tests {
             Handled::Pass,
             "the modal global layer's help passes"
         );
+    }
+
+    /// MOD-115 M3 RV2 L1: a registry write in flight reads in words, as in the other sections:
+    /// every request name `busy` can hold has its own phrase, and the refusal names none of them.
+    #[test]
+    fn a_write_in_flight_reads_in_words() {
+        for name in REQUEST_NAMES
+            .into_iter()
+            .chain([agent_settings::SET_TOOL_PATHS])
+        {
+            assert_ne!(doing(name), doing("unknown"), "`{name}` has its own phrase");
+            let refusal = in_flight(name);
+            assert!(!refusal.contains(name), "{refusal}");
+            assert!(
+                !refusal.contains('_') && !refusal.contains('`'),
+                "{refusal}"
+            );
+        }
     }
 }

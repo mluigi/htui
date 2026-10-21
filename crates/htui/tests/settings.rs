@@ -3955,7 +3955,7 @@ async fn enter_on_the_create_form_sends_create_agent_with_the_parsed_draft_and_t
     );
     assert_eq!(
         errors_of(&emitted),
-        vec!["`create_agent` is still in flight".to_owned()]
+        vec!["still adding the agent \u{2014} wait for the store's answer".to_owned()]
     );
 }
 
@@ -4654,7 +4654,7 @@ async fn esc_during_an_edit_then_each_answer_lands_on_the_closed_form() {
         bench.key(&mut section, "e");
         assert_eq!(
             errors_of(&bench.drained()),
-            vec!["`edit_agent` is still in flight".to_owned()],
+            vec!["still saving the agent \u{2014} wait for the store's answer".to_owned()],
             "the guard outlives the form"
         );
 
@@ -4702,7 +4702,10 @@ async fn a_failed_for_another_request_does_not_clear_the_write_guard() {
         let emitted = bench.drained();
         assert_eq!(
             errors_of(&emitted),
-            vec!["`set_agent_on_box` is still in flight".to_owned()],
+            vec![
+                "still switching the agent on this box \u{2014} wait for the store's answer"
+                    .to_owned()
+            ],
             "`{other}` is not this write's answer"
         );
         assert!(!asked_anything(&emitted), "`{other}`: {emitted:?}");
@@ -4903,7 +4906,10 @@ async fn r_i_and_a_are_refused_while_a_registry_write_is_in_flight() {
         let emitted = bench.drained();
         assert_eq!(
             errors_of(&emitted),
-            vec!["`set_agent_on_box` is still in flight".to_owned()],
+            vec![
+                "still switching the agent on this box \u{2014} wait for the store's answer"
+                    .to_owned()
+            ],
             "{chord}"
         );
         assert!(!asked_anything(&emitted), "{chord}: {emitted:?}");
@@ -5296,7 +5302,10 @@ async fn m_is_refused_while_a_write_or_a_probe_is_in_flight() {
     let _ = bench.drained();
 
     for (section, expected) in [
-        (&mut writing, "`set_agent_on_box` is still in flight"),
+        (
+            &mut writing,
+            "still switching the agent on this box \u{2014} wait for the store's answer",
+        ),
         (&mut probing, "a probe is running; edit afterwards"),
         (&mut installing, "an install is running; edit afterwards"),
         (&mut logging_in, "a login is running; edit afterwards"),
@@ -5361,7 +5370,7 @@ async fn enter_sends_set_tool_paths_with_trimmed_non_empty_entries() {
     let emitted = bench.drained();
     assert_eq!(
         errors_of(&emitted),
-        vec!["`set_tool_paths` is still in flight".to_owned()]
+        vec!["still saving the tool paths \u{2014} wait for the store's answer".to_owned()]
     );
     assert!(!asked_anything(&emitted), "{emitted:?}");
 }
