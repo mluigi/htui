@@ -826,6 +826,14 @@ async fn orphaned_override<S: WriteStore>(
         let Some(other) = store.item(summary.id).await? else {
             continue;
         };
+        if other.step_graph_id == Some(graph.id) && other.id == item.id {
+            // The caller's copy of the item is older than the store's, which already runs under
+            // this override: a call with the fresh item re-clones it.
+            return Err(ResolveError::Store(StoreError::Constraint(format!(
+                "item {} already runs under `{name}`; override again",
+                item.key
+            ))));
+        }
         if other.step_graph_id == Some(graph.id) {
             return Err(ResolveError::Store(StoreError::Constraint(format!(
                 "graph `{name}` already exists and item {} runs under it; rename it and override \
@@ -3314,6 +3322,34 @@ question and not a test fix. Decide the version bump first, then paste the new d
             "nothing is written into it"
         );
         assert_eq!(feat_1(&store).await, item, "and the item is untouched");
+    }
+
+    /// MOD-137 R1b (review C-M1): a caller holding the item from before its override landed is
+    /// not told someone else holds the name: the item itself runs under it, and a call with the
+    /// fresh item re-clones it.
+    #[tokio::test]
+    async fn a_stale_copy_of_an_overridden_item_is_told_to_override_again() {
+        let store = MemStore::demo();
+        let source = TestSource::claude(&store);
+        let stale = feat_1(&store).await;
+        let first = override_graph(&store, &source, &stale)
+            .await
+            .expect("the item takes an override");
+
+        let error = override_graph(&store, &source, &stale)
+            .await
+            .expect_err("the copy predates the override");
+        assert_eq!(
+            error,
+            ResolveError::Store(StoreError::Constraint(format!(
+                "item {} already runs under `{}-override`; override again",
+                stale.key, stale.key
+            )))
+        );
+        let again = override_graph(&store, &source, &feat_1(&store).await)
+            .await
+            .expect("the fresh item re-clones");
+        assert_eq!((again.id, again.revision), (first.id, 2));
     }
 
     /// MOD-137 R1b (review C-M1): a plain graph holding the `<key>-override` name is never
