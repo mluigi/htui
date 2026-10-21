@@ -2259,10 +2259,11 @@ async fn the_guides_name_the_submit_key_in_force() {
     );
 }
 
-/// The field is on the DSN row (D3, audit item 3), behind the form's marker; no label is drawn
-/// in the accent, only the focused row's gutter in the tab's (MOD-85).
+/// The field is on its own row right under the DSN row it replaces (D3, audit item 3), behind
+/// the form's marker, with the stored summary still on screen; no label is drawn in the accent,
+/// only the focused row's gutter in the tab's (MOD-85).
 #[tokio::test]
-async fn the_field_is_on_the_dsn_row() {
+async fn the_field_is_under_the_dsn_row() {
     let (bench, mut section) = bench_with(&stored_snapshot()).await;
     bench.key(&mut section, "e");
     typed(&bench, &mut section, TYPED);
@@ -2275,7 +2276,13 @@ async fn the_field_is_on_the_dsn_row() {
     let dsn = (0..buffer.area.height)
         .find(|y| text(*y).contains("(19)"))
         .expect("the field is drawn");
-    assert!(text(dsn).starts_with("\u{258c}DSN "), "{:?}", text(dsn));
+    assert!(text(dsn).starts_with("\u{258c}new DSN "), "{:?}", text(dsn));
+    assert!(
+        text(dsn - 1).starts_with(" DSN ")
+            && text(dsn - 1).contains("stored \u{2014} postgres://htui@db.example:5432/htui"),
+        "the row it replaces is right above: {:?}",
+        text(dsn - 1)
+    );
     assert!(
         !(0..buffer.area.height).any(|y| text(y).starts_with("DSN: ")),
         "the field under the rows is gone"
