@@ -62,9 +62,9 @@ use crate::store::traits::{
     step_writes_own_item, withdrawn_requirement_cited,
 };
 use crate::store::traits::{
-    divide_columns_off_divide, edge_endpoint_outside_graph, graph_name_is_taken,
+    divide_columns_off_divide, edge_endpoint_outside_graph, fan_out_below_one, graph_name_is_taken,
     override_outside_project, palette_phase_has_edges, parts_off_divide, persona_is_bound,
-    phase_position_is_taken, reserved_phase_name, split_fan_out_mismatch,
+    phase_position_is_taken, reserved_phase_name, retry_limit_negative, split_fan_out_mismatch,
 };
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
@@ -22067,6 +22067,7 @@ async fn replace_graph_refusal_order<S: WriteStore>(store: &S) {
     body.nodes[0].agents = vec![candidate(plan, 0, ghost_agent)];
     body.edges = vec![dangling.clone(), into_palette.clone()];
     body.nodes[2].phase.fan_out = 2;
+    body.nodes[2].phase.retry_limit = -1;
     body.nodes[1].phase.palette = true;
     body.nodes[0].parts = vec![part_row(plan, 0, "core")];
 
@@ -22099,6 +22100,10 @@ async fn replace_graph_refusal_order<S: WriteStore>(store: &S) {
             Box::new(|b: &mut GraphBody| b.nodes[2].phase.split = Split::Compete),
         ),
         (
+            retry_limit_negative("review", -1),
+            Box::new(|b: &mut GraphBody| b.nodes[2].phase.retry_limit = 0),
+        ),
+        (
             palette_phase_has_edges("build", into_palette.id),
             Box::new(|b: &mut GraphBody| b.nodes[1].phase.palette = false),
         ),
@@ -22125,6 +22130,15 @@ async fn replace_graph_refusal_order<S: WriteStore>(store: &S) {
         "a name the project's analysis graph holds",
     );
     body.graph.name = "ordered".to_owned();
+
+    body.nodes[1].phase.fan_out = 0;
+    constraint_exactly(
+        CASE,
+        store.replace_graph(graph, revision, body.clone()).await,
+        &fan_out_below_one("build", 0),
+        "fan_out 0 on a kept node (0001's CHECK)",
+    );
+    body.nodes[1].phase.fan_out = 1;
 
     body.nodes.push(bare_node(StepGraphPhase {
         id: ids::PHASE_HTUI_IMPLEMENT,
@@ -22910,6 +22924,28 @@ async fn create_phase_keeps_split_in_step_with_fan_out<S: WriteStore>(store: &S)
             .await,
         &divide_columns_off_divide("parts", Split::None),
         "max_parts off a divide node",
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .create_phase(&StepGraphPhase {
+                fan_out: 0,
+                ..new_phase(graph, 1, "idle")
+            })
+            .await,
+        &fan_out_below_one("idle", 0),
+        "fan_out 0 (0001's CHECK, which ck_phase_split_fan_out lets through)",
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .create_phase(&StepGraphPhase {
+                retry_limit: -1,
+                ..new_phase(graph, 1, "eager")
+            })
+            .await,
+        &retry_limit_negative("eager", -1),
+        "a negative retry_limit (0001's CHECK)",
     );
     let ghost = PersonaId::new();
     constraint_exactly(

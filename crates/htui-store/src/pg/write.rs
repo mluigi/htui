@@ -3497,7 +3497,8 @@ impl WriteStore for PgStore {
     ///
     /// [`StoreError::Constraint`], in MOD-137 blueprint §T2.2's order (both stores): a reserved
     /// name; a node CHECK [`phase_row_refusal`] decides (`split`/`fan_out`, divide columns off a
-    /// divide node, `max_parts` below one); a `graph_id` that names no row (the bump touches no
+    /// divide node, `max_parts` below one, then `fan_out` below one and a negative
+    /// `retry_limit`); a `graph_id` that names no row (the bump touches no
     /// row); a taken `(graph_id, position)`, then `(graph_id, name)`, decided by
     /// [`phase_clash`]'s pre-read since 0020's deferrable uniques report after the foreign keys;
     /// then `persona_id`, `planner_persona_id`, `integrate_persona_id`, `planner_agent_id`,

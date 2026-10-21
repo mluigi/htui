@@ -9,13 +9,16 @@ use crate::prompt::template::TemplateRole;
 use crate::store::traits::{
     already_exists, divide_columns_off_divide, edge_endpoint_outside_graph, edge_is_taken,
     edge_loop_limit_negative, edge_loops_to_itself, edge_needs_loop_limit, edge_predicate_mismatch,
-    max_parts_below_one, palette_phase_has_edges, parts_off_divide, phase_name_is_taken,
-    phase_part_key_is_taken, phase_position_is_taken, reserved_phase_name, row_names_another_graph,
-    row_names_another_phase, split_fan_out_mismatch,
+    fan_out_below_one, max_parts_below_one, palette_phase_has_edges, parts_off_divide,
+    phase_name_is_taken, phase_part_key_is_taken, phase_position_is_taken, reserved_phase_name,
+    retry_limit_negative, row_names_another_graph, row_names_another_phase, split_fan_out_mismatch,
 };
 
 /// D7's node CHECKs on one row: `ck_phase_split_fan_out`, then `ck_phase_divide_columns`, then
-/// `ck_phase_max_parts`. `None` when the row passes. `create_phase` and `replace_graph` call it.
+/// `ck_phase_max_parts`; then 0001's column CHECKs `fan_out >= 1` and `retry_limit >= 0`, so
+/// `MemStore` never stores a row Postgres refuses (`Split::None` with `fan_out 0` passes
+/// `ck_phase_split_fan_out`). `None` when the row passes. `create_phase` and `replace_graph` call
+/// it.
 #[must_use]
 pub fn phase_row_refusal(phase: &StepGraphPhase) -> Option<String> {
     if (phase.split == Split::Compete) != (phase.fan_out > 1) {
@@ -35,10 +38,16 @@ pub fn phase_row_refusal(phase: &StepGraphPhase) -> Option<String> {
     if phase.split != Split::Divide && divide_columns {
         return Some(divide_columns_off_divide(&phase.name, phase.split));
     }
-    match phase.max_parts {
-        Some(max_parts) if max_parts < 1 => Some(max_parts_below_one(&phase.name, max_parts)),
-        _ => None,
+    if let Some(max_parts) = phase.max_parts.filter(|max_parts| *max_parts < 1) {
+        return Some(max_parts_below_one(&phase.name, max_parts));
     }
+    if phase.fan_out < 1 {
+        return Some(fan_out_below_one(&phase.name, phase.fan_out));
+    }
+    if phase.retry_limit < 0 {
+        return Some(retry_limit_negative(&phase.name, phase.retry_limit));
+    }
+    None
 }
 
 /// D10 step 3 (blueprint §T3.2): the body's own shape, before any store row is read. The first
@@ -295,6 +304,7 @@ mod tests {
         phase_part_key_is_taken, phase_position_is_taken, reserved_phase_name,
         row_names_another_graph, row_names_another_phase, split_fan_out_mismatch,
     };
+    use crate::store::traits::{fan_out_below_one, retry_limit_negative};
 
     fn phase(split: Split, fan_out: i32) -> StepGraphPhase {
         StepGraphPhase {
@@ -415,6 +425,47 @@ mod tests {
                 .expect("refused")
                 .contains("max_parts 0")
         );
+        row.max_parts = None;
+        row.split = Split::None;
+        row.fan_out = 0;
+        row.retry_limit = -1;
+        assert_eq!(
+            phase_row_refusal(&row),
+            Some(fan_out_below_one("implement", 0)),
+            "0001's fan_out CHECK after the D7 ones"
+        );
+        row.fan_out = 1;
+        assert_eq!(
+            phase_row_refusal(&row),
+            Some(retry_limit_negative("implement", -1)),
+            "then 0001's retry_limit CHECK"
+        );
+    }
+
+    /// 0001's `fan_out >= 1`: `Split::None` with `fan_out 0` passes `ck_phase_split_fan_out`
+    /// (both sides false), so the column CHECK must be a rule of its own (MemStore would store
+    /// a row Postgres refuses).
+    #[test]
+    fn fan_out_is_at_least_one() {
+        assert_eq!(
+            phase_row_refusal(&phase(Split::None, 0)).as_deref(),
+            Some("phase `implement` has fan_out 0; a phase runs at least 1 candidate")
+        );
+        assert!(phase_row_refusal(&phase(Split::Divide, -3)).is_some());
+        assert_eq!(phase_row_refusal(&phase(Split::None, 1)), None);
+    }
+
+    /// 0001's `retry_limit >= 0`.
+    #[test]
+    fn retry_limit_is_never_negative() {
+        let mut row = phase(Split::None, 1);
+        row.retry_limit = -1;
+        assert_eq!(
+            phase_row_refusal(&row).as_deref(),
+            Some("phase `implement` has retry_limit -1; a retry limit is 0 or more")
+        );
+        row.retry_limit = 0;
+        assert_eq!(phase_row_refusal(&row), None);
     }
 
     // ---- graph bodies (§T3.2) ----

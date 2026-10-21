@@ -925,7 +925,8 @@ pub trait WriteStore: ReadStore {
     /// §T2.2's order (both stores), nothing written on any of them: a reserved name
     /// ([`reserved_phase_name`]); a node CHECK
     /// [`phase_row_refusal`](crate::store::phase_row_refusal) decides (`split`/`fan_out`, divide
-    /// columns off a divide node, `max_parts` below one); a `graph_id` that names no row; a taken
+    /// columns off a divide node, `max_parts` below one, then `fan_out` below one and a negative
+    /// `retry_limit`); a `graph_id` that names no row; a taken
     /// `(graph_id, position)`, then `(graph_id, name)`; then `persona_id`, `planner_persona_id`,
     /// `integrate_persona_id`, `planner_agent_id`, `integrate_agent_id` naming no row, in that
     /// order and worded `references_no_row("step_graph_phase.<column>", id, "persona" | "agent")`
@@ -2942,6 +2943,18 @@ pub fn divide_columns_off_divide(phase: &str, split: Split) -> String {
 #[must_use]
 pub fn max_parts_below_one(phase: &str, max_parts: i32) -> String {
     format!("phase `{phase}` has max_parts {max_parts}; a divide phase takes at least 1")
+}
+
+/// 0001's `step_graph_phase.fan_out` CHECK (`fan_out >= 1`), in words.
+#[must_use]
+pub fn fan_out_below_one(phase: &str, fan_out: i32) -> String {
+    format!("phase `{phase}` has fan_out {fan_out}; a phase runs at least 1 candidate")
+}
+
+/// 0001's `step_graph_phase.retry_limit` CHECK (`retry_limit >= 0`), in words.
+#[must_use]
+pub fn retry_limit_negative(phase: &str, retry_limit: i32) -> String {
+    format!("phase `{phase}` has retry_limit {retry_limit}; a retry limit is 0 or more")
 }
 
 /// MOD-137 D8: only a `divide` node has `phase_part` rows (a store check, not a CHECK).
