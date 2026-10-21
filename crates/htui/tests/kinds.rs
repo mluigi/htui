@@ -18,13 +18,13 @@ use htui::ui::tabs::settings::{
 use htui_core::fixtures::ids;
 use htui_core::model::{
     EdgeId, EdgeKind, GraphBody, GraphScope, ItemKind, ItemKindId, ItemKindPatch, NewProject,
-    NodeBody, PersonaId, PhaseId, PhasePatch, ProjectId, Scope, StepGraph, StepGraphEdge,
-    StepGraphId, StepGraphPatch, StepGraphPhase, WorkspaceId,
+    PersonaId, PhaseAgent, PhaseId, PhasePart, PhasePatch, ProjectId, Scope, Split, StepGraph,
+    StepGraphEdge, StepGraphId, StepGraphPatch, StepGraphPhase, WorkspaceId,
 };
 use htui_core::seed::{PHASES_PER_PROJECT, PhaseSeed, phase_row};
 use htui_core::store::{
-    MemStore, ReadStore, StoreError, WriteStore, item_kind_is_held, palette_phase_has_edges,
-    reserved_phase_name,
+    CasOutcome, MemStore, ReadStore, StoreError, WriteStore, item_kind_is_held,
+    palette_phase_has_edges, reserved_phase_name,
 };
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
 use ratatui::backend::TestBackend;
@@ -193,7 +193,7 @@ async fn the_demo_catalogue_reads_back_the_seed() {
     assert_eq!(prefixes, ["ANA", "FEAT", "FIX", "CLEAN", "TOOL"]);
 
     assert_eq!(entry.graphs.len(), 5);
-    let phases: usize = entry.graphs.iter().map(|g| g.phases.len()).sum();
+    let phases: usize = entry.graphs.iter().map(|g| g.nodes.len()).sum();
     assert_eq!(phases, PHASES_PER_PROJECT);
 
     for kind in &entry.kinds {
@@ -209,7 +209,11 @@ async fn the_demo_catalogue_reads_back_the_seed() {
     let analysis = entry
         .graph(ids::GRAPH_VULKAN_ANA)
         .expect("the analysis graph");
-    let names: Vec<&str> = analysis.phases.iter().map(|p| p.name.as_str()).collect();
+    let names: Vec<&str> = analysis
+        .nodes
+        .iter()
+        .map(|n| n.phase.name.as_str())
+        .collect();
     assert_eq!(names, ["research", "verdict"], "phases in position order");
 }
 
@@ -483,7 +487,7 @@ async fn create_graph_and_update_graph() {
         .iter()
         .find(|g| g.graph.name == "docs")
         .expect("the new graph");
-    assert!(entry.phases.is_empty(), "a graph is created without phases");
+    assert!(entry.nodes.is_empty(), "a graph is created without phases");
     let id = entry.graph.id;
     let expected = entry.graph.updated_at;
 
@@ -532,11 +536,14 @@ async fn create_graph_and_update_graph() {
 
 /// One graph's phases, in position order.
 #[track_caller]
-fn phases(snapshot: &CatalogueSnapshot, graph: StepGraphId) -> &[StepGraphPhase] {
-    &snapshot.projects[0]
+fn phases(snapshot: &CatalogueSnapshot, graph: StepGraphId) -> Vec<StepGraphPhase> {
+    snapshot.projects[0]
         .graph(graph)
         .unwrap_or_else(|| panic!("the catalogue still names {graph}"))
-        .phases
+        .nodes
+        .iter()
+        .map(|node| node.phase.clone())
+        .collect()
 }
 
 /// A created phase is the seeder's own row with exactly the request's five columns written over
@@ -816,28 +823,17 @@ fn graph_entry(snapshot: &CatalogueSnapshot, graph: StepGraphId) -> &GraphEntry 
 #[track_caller]
 fn phase_named<'a>(entry: &'a GraphEntry, name: &str) -> &'a StepGraphPhase {
     entry
-        .phases
+        .nodes
         .iter()
+        .map(|node| &node.phase)
         .find(|phase| phase.name == name)
         .unwrap_or_else(|| panic!("graph `{}` has a phase `{name}`", entry.graph.name))
 }
 
-/// The body an editor would send for `entry` as the catalogue holds it: every phase a node with no
-/// candidates and no parts (the demo seeds none), and the entry's edges.
+/// The body an editor would send for `entry` as the catalogue holds it: the entry itself, which
+/// is the graph's whole body (MOD-137 R1b, review C-M2).
 fn body_of(entry: &GraphEntry) -> GraphBody {
-    GraphBody {
-        graph: entry.graph.clone(),
-        nodes: entry
-            .phases
-            .iter()
-            .map(|phase| NodeBody {
-                phase: phase.clone(),
-                agents: Vec::new(),
-                parts: Vec::new(),
-            })
-            .collect(),
-        edges: entry.edges.clone(),
-    }
+    entry.clone()
 }
 
 /// The analysis graph with `verdict` renamed `decide` and an `asks_you decide → research` edge
@@ -926,7 +922,7 @@ async fn replace_graph_round_trips_through_the_catalogue() {
 
     let after = graph_entry(&snapshot, ids::GRAPH_VULKAN_ANA);
     assert_eq!(after.graph.revision, 1);
-    let names: Vec<&str> = after.phases.iter().map(|p| p.name.as_str()).collect();
+    let names: Vec<&str> = after.nodes.iter().map(|n| n.phase.name.as_str()).collect();
     assert_eq!(names, ["research", "decide"]);
     assert_eq!(
         phase_named(after, "decide").id,
@@ -942,6 +938,90 @@ async fn replace_graph_round_trips_through_the_catalogue() {
     assert_eq!((asks[0].from, asks[0].to), (verdict, research));
     assert_eq!(asks[0].loop_limit, Some(1));
     assert_eq!(after.edges.len(), 2, "the seeded `next` survives");
+}
+
+/// MOD-137 R1b (review C-M2): the catalogue carries each graph's whole body, so the editor's
+/// `ReplaceGraph` built from an entry keeps the candidates and parts it did not touch rather than
+/// wiping them.
+#[tokio::test]
+async fn replace_graph_from_the_catalogue_keeps_candidates_and_parts() {
+    let backend = demo();
+    let writer = backend.writer().expect("a memory backend writes");
+    let seeded = demo_catalogue(&backend).await;
+    let entry = graph_entry(&seeded, ids::GRAPH_VULKAN_ANA);
+    let research = phase_named(entry, "research").id;
+    let verdict = phase_named(entry, "verdict").id;
+    let candidate = PhaseAgent {
+        phase_id: research,
+        position: 0,
+        agent_id: ids::AGENT_CLAUDE,
+        model: "sonnet".to_owned(),
+    };
+    writer
+        .create_phase_agents(research, std::slice::from_ref(&candidate))
+        .await
+        .expect("research takes a candidate");
+    let part = PhasePart {
+        phase_id: verdict,
+        position: 0,
+        key: "api".to_owned(),
+        title: "The API".to_owned(),
+        brief: String::new(),
+        owned_paths: vec!["src/api/**".to_owned()],
+        acceptance: None,
+        agent_id: None,
+        model: None,
+        persona_id: None,
+    };
+    let mut divided = writer
+        .graph_body(ids::GRAPH_VULKAN_ANA)
+        .await
+        .expect("a memory read")
+        .expect("the analysis graph is there");
+    for node in &mut divided.nodes {
+        if node.phase.id == verdict {
+            node.phase.split = Split::Divide;
+            node.parts = vec![part.clone()];
+        }
+    }
+    let revision = divided.graph.revision;
+    let outcome = writer
+        .replace_graph(ids::GRAPH_VULKAN_ANA, revision, divided)
+        .await
+        .expect("verdict divides into one part");
+    assert!(matches!(outcome, CasOutcome::Applied(_)), "{outcome:?}");
+
+    // The editor opens the graph from the catalogue and renames `verdict`.
+    let opened = demo_catalogue(&backend).await;
+    let snapshot = catalogue(
+        serve(
+            &backend,
+            &rename_verdict_request(graph_entry(&opened, ids::GRAPH_VULKAN_ANA)),
+        )
+        .await,
+    );
+
+    let after = graph_entry(&snapshot, ids::GRAPH_VULKAN_ANA);
+    assert_eq!(after.graph.revision, 3, "candidates 1, divide 2, rename 3");
+    assert_eq!(phase_named(after, "decide").id, verdict);
+    let stored = writer
+        .graph_body(ids::GRAPH_VULKAN_ANA)
+        .await
+        .expect("a memory read")
+        .expect("the analysis graph is there");
+    let node = |id: PhaseId| {
+        stored
+            .nodes
+            .iter()
+            .find(|node| node.phase.id == id)
+            .expect("the node is kept")
+    };
+    assert_eq!(
+        node(research).agents,
+        [candidate],
+        "research keeps its candidate"
+    );
+    assert_eq!(node(verdict).parts, [part], "and the renamed node its part");
 }
 
 /// The same request twice: the second carries a spent revision and answers `CatalogueStale` with
@@ -1028,7 +1108,7 @@ async fn delete_phase_rereads_the_catalogue() {
     );
 
     let after = graph_entry(&snapshot, ids::GRAPH_VULKAN_ANA);
-    let names: Vec<&str> = after.phases.iter().map(|p| p.name.as_str()).collect();
+    let names: Vec<&str> = after.nodes.iter().map(|n| n.phase.name.as_str()).collect();
     assert_eq!(names, ["research"]);
     assert!(after.edges.is_empty(), "the phase's edge went with it");
     assert_eq!(after.graph.revision, 1);
@@ -1266,7 +1346,7 @@ async fn an_unreferenced_graph_is_listed_after_the_kinds() {
             created_at: now,
             updated_at: now,
         },
-        phases: Vec::new(),
+        nodes: Vec::new(),
         edges: Vec::new(),
     });
     bench.reply(&mut section, &StoreReply::Catalogue(Box::new(snapshot)));
@@ -1831,7 +1911,8 @@ fn research(snapshot: &CatalogueSnapshot) -> StepGraphPhase {
     snapshot.projects[0]
         .graph(ids::GRAPH_VULKAN_ANA)
         .expect("the analysis graph")
-        .phases[0]
+        .nodes[0]
+        .phase
         .clone()
 }
 
@@ -1963,7 +2044,8 @@ async fn clearing_the_budget_sends_none() {
         .iter_mut()
         .find(|entry| entry.graph.id == ids::GRAPH_VULKAN_ANA)
         .expect("the analysis graph")
-        .phases[0]
+        .nodes[0]
+        .phase
         .token_budget = Some(60_000);
     bench.reply(
         &mut section,
@@ -2292,7 +2374,7 @@ async fn bench_with_bound(
         .await
         .expect("the binding is written");
     assert!(
-        matches!(outcome, htui_core::store::CasOutcome::Applied(_)),
+        matches!(outcome, CasOutcome::Applied(_)),
         "against the row's own token: {outcome:?}"
     );
     let snapshot = catalogue(
@@ -2486,7 +2568,8 @@ async fn an_id_the_list_does_not_know_prints_as_the_id_and_is_left_alone() {
         .iter_mut()
         .find(|entry| entry.graph.id == ids::GRAPH_VULKAN_ANA)
         .expect("the analysis graph")
-        .phases[0]
+        .nodes[0]
+        .phase
         .persona_id = Some(unknown);
     bench.reply(&mut section, &StoreReply::Catalogue(Box::new(snapshot)));
     let _ = bench.drained();
