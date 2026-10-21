@@ -7889,11 +7889,7 @@ mod tests {
                 mutate(&mut edited);
                 // ck_phase_split_fan_out (MOD-137 D7): `split` follows the edited `fan_out`.
                 if edited.split != htui_core::model::Split::Divide {
-                    edited.split = if edited.fan_out > 1 {
-                        htui_core::model::Split::Compete
-                    } else {
-                        htui_core::model::Split::None
-                    };
+                    edited.split = htui_core::model::Split::for_fan_out(edited.fan_out);
                 }
                 self.orch
                     .store
