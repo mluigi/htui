@@ -977,8 +977,9 @@ async fn the_demo_snapshot_renders_the_tree() {
             "so the compiled table answers for it, named in words (MOD-83): {row}"
         );
         let expected = DEFAULTS.value_of(key).to_string();
+        // The reserve reads in percent with its fraction beside it (MOD-83).
         assert!(
-            row.contains(&format!("| {expected}")),
+            row.contains(&format!("| {expected}")) || row.contains(&format!("% ({expected})")),
             "`{key}` shows the number the reader would use ({expected}): {row}"
         );
     }
@@ -1787,7 +1788,7 @@ async fn the_fraction_row_renders_both_units_and_round_trips() {
     let frame = bench.render_section(&section, 100);
     assert!(
         row_of(&frame, SettingKey::PromptReserveFraction, 0)
-            .contains("0.1 | 10% (0.1) (app setting)   fraction"),
+            .contains("0.1 | 10% (0.1) (app setting) fraction"),
         "{frame}"
     );
 
@@ -2127,7 +2128,8 @@ async fn the_reserve_reads_in_percent_and_is_typed_as_a_fraction() {
     let frame = bench.render_section(&section, 100);
     let row = row_of(&frame, SettingKey::PromptReserveFraction, 0);
     assert!(
-        row.ends_with("unset | 10% (0.1) (default)   fraction"),
+        row.trim_end()
+            .ends_with("unset | 10% (0.1) (default) fraction"),
         "{row}"
     );
     assert!(
@@ -2281,4 +2283,17 @@ async fn the_section_at_80_columns() {
         );
     }
     insta::assert_snapshot!("demo_80", frame);
+
+    // A key wider than the label column (a third of the width) is cut there, and named whole in
+    // the help under it once it is focused.
+    let key = SettingKey::ExcerptProviderDeadlineMs;
+    assert!(!frame.contains(key.key()), "cut at 80 columns: {frame}");
+    for _ in 0..app_row(key) {
+        harness.key("j");
+    }
+    let frame = harness.render();
+    assert!(
+        from_focus(&frame)[1].trim_start().starts_with(key.key()),
+        "{frame}"
+    );
 }
