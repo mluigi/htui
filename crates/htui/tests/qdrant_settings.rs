@@ -295,10 +295,11 @@ async fn the_key_guide_is_a_sentence() {
     assert!(!frame.contains("Enter API key"), "{frame}");
 }
 
-/// The field is on the row it edits (D3, audit item 3), behind the form's marker, and no label is
-/// drawn in the accent: only the focused row's gutter carries the tab's (MOD-85).
+/// The field is its own row right under the row it replaces (D3, audit item 3), behind the
+/// form's marker, with what is stored still on screen; no label is drawn in the accent: only the
+/// focused row's gutter carries the tab's (MOD-85).
 #[tokio::test]
-async fn the_field_is_on_the_row_it_edits() {
+async fn the_field_is_under_the_row_it_replaces() {
     let (bench, mut section) = bench_with(stored()).await;
     bench.key(&mut section, "e");
     typed(&bench, &mut section, "https://q.example");
@@ -307,7 +308,12 @@ async fn the_field_is_on_the_row_it_edits() {
         .find(|y| row(&buffer, *y).contains("https://q.example"))
         .expect("the field is drawn");
     let text = row(&buffer, url_row);
-    assert!(text.starts_with("\u{258c}URL"), "{text}");
+    assert!(text.starts_with("\u{258c}new URL"), "{text}");
+    let above = row(&buffer, url_row - 1);
+    assert!(
+        above.starts_with(" URL") && above.contains(SUMMARY),
+        "the row it replaces is right above: {above}"
+    );
     assert!(
         !(0..buffer.area.height).any(|y| row(&buffer, y).contains("URL:")),
         "the old field under the rows is gone"
