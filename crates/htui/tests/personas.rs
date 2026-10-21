@@ -1677,7 +1677,7 @@ async fn a_rebound_import_opens_on_its_new_chord_only() {
 // ---- MOD-115 M3 (lane L-kinds): the section on the kit ---------------------------------------------
 
 /// `field.submit` and `field.cancel` moved (MOD-115 M3 C6): every field's `Enter` and `Esc`.
-const FIELD_REBOUND: &str = "version = 2\n[field]\nsubmit = [\"ctrl-t\"]\ncancel = [\"ctrl-g\"]\n";
+const FIELD_REBOUND: &str = "version = 2\n[field]\nsubmit = [\"ctrl-t\"]\ncancel = [\"ctrl-o\"]\n";
 
 /// Every converted hint reads as before under the compiled keys and names the rebound chords once
 /// `[field]` moves them (MD-A, C6): the forms, the body and rules editors and the import path.
@@ -1691,7 +1691,7 @@ async fn every_field_hint_names_the_field_keys_in_force() {
     bench.key(&mut section, "e");
     assert!(compiled_hint(&section).contains(FORM_EDIT_KEYS));
     assert!(
-        hint(&section).contains("Tab/Shift+Tab field \u{b7} Ctrl+t save \u{b7} Ctrl+g cancel"),
+        hint(&section).contains("Tab/Shift+Tab field \u{b7} Ctrl+t save \u{b7} Ctrl+o cancel"),
         "{}",
         hint(&section)
     );
@@ -1702,7 +1702,7 @@ async fn every_field_hint_names_the_field_keys_in_force() {
         compiled_hint(&section).contains("Tab/Shift+Tab field \u{b7} Enter body \u{b7} Esc cancel")
     );
     assert!(
-        hint(&section).contains("Ctrl+t body \u{b7} Ctrl+g cancel"),
+        hint(&section).contains("Ctrl+t body \u{b7} Ctrl+o cancel"),
         "{}",
         hint(&section)
     );
@@ -1714,7 +1714,7 @@ async fn every_field_hint_names_the_field_keys_in_force() {
         compiled_hint(&section)
     );
     assert!(
-        hint(&section).contains("Ctrl+s create \u{b7} Ctrl+g back to the fields"),
+        hint(&section).contains("Ctrl+s create \u{b7} Ctrl+o back to the fields"),
         "{}",
         hint(&section)
     );
@@ -1724,7 +1724,7 @@ async fn every_field_hint_names_the_field_keys_in_force() {
     bench.key(&mut section, "b");
     assert!(compiled_hint(&section).contains(EDITOR_KEYS));
     assert!(
-        hint(&section).contains("Ctrl+s save \u{b7} Ctrl+g cancel \u{b7} Ctrl+t breaks the line"),
+        hint(&section).contains("Ctrl+s save \u{b7} Ctrl+o cancel \u{b7} Ctrl+t breaks the line"),
         "{}",
         hint(&section)
     );
@@ -1733,7 +1733,7 @@ async fn every_field_hint_names_the_field_keys_in_force() {
     bench.key(&mut section, "I");
     assert!(compiled_hint(&section).contains(IMPORT_KEYS));
     assert!(
-        hint(&section).contains("Ctrl+t import \u{b7} Ctrl+g cancel"),
+        hint(&section).contains("Ctrl+t import \u{b7} Ctrl+o cancel"),
         "{}",
         hint(&section)
     );
@@ -1750,7 +1750,7 @@ async fn the_sentences_name_the_keys_in_force() {
     bench.key(&mut section, "esc");
     let warned = frame(&bench, &section);
     assert!(
-        warned.contains("unsaved changes \u{2014} Ctrl+g again discards"),
+        warned.contains("unsaved changes \u{2014} Ctrl+o again discards"),
         "{warned}"
     );
     assert_eq!(unsaved_esc(), "unsaved changes \u{2014} Esc again discards");
@@ -1828,7 +1828,7 @@ async fn the_forms_mark_the_focused_row_and_no_label_takes_the_accent() {
     let path = u16::try_from(
         drawn_text
             .lines()
-            .position(|line| past_gutter(line).starts_with("path "))
+            .position(|line| past_gutter(line).split_whitespace().next() == Some("path"))
             .unwrap_or_else(|| panic!("a path row: {drawn_text}")),
     )
     .expect("a row");

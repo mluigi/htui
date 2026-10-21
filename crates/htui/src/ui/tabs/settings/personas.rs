@@ -13,8 +13,14 @@
 //! (I-8): the form runs the store's rule over a one-field patch, so no second grammar can drift.
 //! `r` edits the permission rules one per line (D17), `d` asks before deleting (a bound persona is
 //! refused by the store, D14), and `I` hands a path to the worker, which reads the files (D20);
-//! anything refused, skipped or dropped opens a report. Personas are not mirrored, so offline the read is refused and the section offers no key but
-//! navigation.
+//! anything refused, skipped or dropped opens a report. Personas are not mirrored, so offline the
+//! read is refused and the section offers no key but navigation.
+//!
+//! It draws through the kit (MOD-115 M3 L-kinds): the registry is a [`list`] with the cursor
+//! row's detail as note rows, the fields form and the import path are [`Form`]s whose focused row
+//! carries the marker, the outcome is [`notice`] lines and an empty registry is an [`empty`] state
+//! with a next step. Every hint and every sentence that names a key reads it from the stack in
+//! force (MD-A), and the acts resolve from [`Ctx::pressed`].
 
 use core::cell::Cell;
 
@@ -28,7 +34,7 @@ use htui_core::model::{
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
 use crate::app::{Ctx, Handled};
@@ -37,9 +43,13 @@ use crate::persona_import::PersonaOutcome;
 use crate::persona_settings::{IMPORT_NAME, PersonaWrite, READ_NAME, REQUEST_NAMES};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::{cell_width, graphemes};
-use crate::ui::kit::{chips::key_line, modal::modal_rest, text::wrapped};
+use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::form::{self, Form, Value};
+use crate::ui::kit::list::{self, RowKind};
+use crate::ui::kit::text::{Tone, notice, wrapped};
+use crate::ui::kit::{chips::key_line, modal::modal_rest};
 use crate::ui::tabs::settings::{
-    CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
+    CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection, changed_elsewhere,
     is_error, yes_or_no,
 };
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme};
@@ -66,31 +76,34 @@ pub const HINT_EMPTY: HintSpec = &[
 /// The Browse keys while the registry is unavailable: none but navigation.
 pub const HINT_UNAVAILABLE: HintSpec = &[];
 
-/// The create form's keys: `Tab/Shift+Tab field · Enter body · Esc cancel`.
+/// The create form's keys: `Tab/Shift+Tab field · Enter body · Esc cancel` with the compiled
+/// keys; the field's submit and cancel through the form's `[field]` layer (MOD-115 M3 C6).
 pub const HINT_FORM_NEW: HintSpec = &[
     Hint::Pair(Act::FormNextField, Act::FormPrevField, "field"),
-    Hint::Text("Enter body"),
-    Hint::Text("Esc cancel"),
+    Hint::One(Act::FieldSubmit, "body"),
+    Hint::One(Act::FieldCancel, "cancel"),
 ];
 
-/// The edit form's keys: `Tab/Shift+Tab field · Enter save · Esc cancel`.
+/// The edit form's keys: `Tab/Shift+Tab field · Enter save · Esc cancel` with the compiled keys.
 pub const HINT_FORM_EDIT: HintSpec = &[
     Hint::Pair(Act::FormNextField, Act::FormPrevField, "field"),
-    Hint::Text("Enter save"),
-    Hint::Text("Esc cancel"),
+    Hint::One(Act::FieldSubmit, "save"),
+    Hint::One(Act::FieldCancel, "cancel"),
 ];
 
 /// The new persona's body editor keys: `Ctrl+s create · Esc back to the fields`.
 pub const HINT_BODY_NEW: HintSpec = &[
     Hint::One(Act::FormSave, "create"),
-    Hint::Text("Esc back to the fields"),
+    Hint::One(Act::FieldCancel, "back to the fields"),
 ];
 
 /// The body (edit) and rules editors' keys: `Ctrl+s save · Esc cancel · Enter breaks the line`.
+/// The line break is `field.submit`'s chord: the shell turns it into the canonical `Enter`, which
+/// the `TextArea` reads as a newline (MOD-115 M3 C6).
 pub const HINT_EDITOR: HintSpec = &[
     Hint::One(Act::FormSave, "save"),
-    Hint::Text("Esc cancel"),
-    Hint::Text("Enter breaks the line"),
+    Hint::One(Act::FieldCancel, "cancel"),
+    Hint::One(Act::FieldSubmit, "breaks the line"),
 ];
 
 /// The delete question's keys: `y delete · n/Esc stop`.
@@ -99,8 +112,12 @@ pub const HINT_DELETING: HintSpec = &[
     Hint::All(Act::ConfirmNo, "stop"),
 ];
 
-/// The import path's keys, the field's own: `Enter import · Esc cancel`.
-pub const HINT_IMPORT: HintSpec = &[Hint::Text("Enter import"), Hint::Text("Esc cancel")];
+/// The import path's keys, the field's own through `CAPTURE`'s `[field]` layer: `Enter import ·
+/// Esc cancel` with the compiled keys.
+pub const HINT_IMPORT: HintSpec = &[
+    Hint::One(Act::FieldSubmit, "import"),
+    Hint::One(Act::FieldCancel, "cancel"),
+];
 
 /// The import report's keys: `j/k scroll · Esc close`.
 pub const HINT_REPORT: HintSpec = &[
@@ -123,6 +140,12 @@ pub const RULES_HELP: &str = "one rule per line: reject_once|reject_always kind=
 /// Before the first read answered.
 pub const NOT_READ: &str = "personas not read yet";
 
+/// The next step of [`NOT_READ`].
+const NOT_READ_NEXT: &str = "they appear once the store answers";
+
+/// The next step of [`UNAVAILABLE`]: the registry has no read-only copy to fall back on.
+const UNAVAILABLE_NEXT: &str = "personas are not mirrored: they return once the store answers";
+
 /// The opening of a refused read, drawn `{UNAVAILABLE}: {message}`.
 pub const UNAVAILABLE: &str = "personas unavailable";
 
@@ -135,8 +158,16 @@ pub const NO_ROW: &str = "no persona is selected";
 /// A save that would write what the row already holds.
 pub const UNCHANGED: &str = "nothing changed; nothing was written";
 
-/// The first `Esc` over an edited body or rules text.
-pub const UNSAVED: &str = "unsaved changes \u{2014} Esc again discards";
+/// The first cancel over an edited body or rules text: `cancel` is `field.cancel`'s label
+/// through `PERSONAS_EDITOR` (`Esc` with the compiled keys, MOD-115 M3 C5), and with none bound
+/// the sentence says a cancel.
+#[must_use]
+pub fn unsaved(cancel: Option<&str>) -> String {
+    match cancel {
+        Some(cancel) => format!("unsaved changes \u{2014} {cancel} again discards"),
+        None => "unsaved changes \u{2014} cancel again to discard".to_owned(),
+    }
+}
 
 /// The `command-run (y/n)` field holds neither.
 pub const COMMAND_RUN_IS_Y_OR_N: &str = "`command-run (y/n)` is y or n";
@@ -160,10 +191,20 @@ pub fn changed_elsewhere_save(save: Option<&str>) -> String {
 }
 
 /// What a spent token says when fields the user changed were changed elsewhere too, before their
-/// labels (copied from `agents.rs`, which stays untouched). Opens like `CHANGED_ELSEWHERE`, so
-/// `is_error` draws it the same.
-pub const CHANGED_ON_BOTH_SIDES: &str =
-    "changed elsewhere \u{2014} reloaded; Enter retries \u{b7} also changed elsewhere: ";
+/// labels (copied from `agents.rs`). `retry` is `field.submit`'s label through `PERSONAS_FORM`
+/// (`Enter` with the compiled keys, MOD-115 M3 D-5); with none bound the sentence says a save.
+/// Opens like `changed_elsewhere`, so `is_error` draws it the same.
+#[must_use]
+pub fn changed_on_both_sides(retry: Option<&str>) -> String {
+    match retry {
+        Some(retry) => format!(
+            "changed elsewhere \u{2014} reloaded; {retry} retries \u{b7} also changed elsewhere: "
+        ),
+        None => "changed elsewhere \u{2014} reloaded; save again to retry \u{b7} also changed \
+                 elsewhere: "
+            .to_owned(),
+    }
+}
 
 /// A write answered `Gone` with no editor of that row open.
 pub const GONE_CLOSED: &str = "deleted elsewhere; nothing was written";
@@ -216,6 +257,9 @@ pub struct PersonasSection {
     /// An import report that landed over an editor (R1 M-1): it opens on the next return to
     /// Browse, so no refusal, skip or dropped entry goes unnamed (OQ-7, R-13).
     pending_report: Option<Vec<PersonaOutcome>>,
+    /// The list's `(lines, first line drawn)` as of the last render, for the Settings pane's
+    /// scrollbar (MOD-115 M3 D-11); `None` while no list is drawn.
+    scroll: Cell<Option<(usize, usize)>>,
 }
 
 /// What the section is doing.
@@ -485,7 +529,7 @@ impl PersonasSection {
     /// delete` and `settings.personas.body/rules/import`. Every other chord, a global act among
     /// them, passes; chord equality includes modifiers, so `ctrl-d` is not `d`.
     fn on_browse_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         for act in ctx.keys().actions(views::PERSONAS_BROWSE, chord) {
             match act {
                 Act::ListDown => {
@@ -588,9 +632,11 @@ impl PersonasSection {
                 self.notice = None;
                 Handled::Consumed
             }
+            // The chord the user pressed (MOD-115 M3 MD-A): a `[field]` chord the field passed is
+            // that row's, never re-read as another act of its canonical key.
             FieldOutcome::Pass => form_navigation(
                 ctx.keys(),
-                KeyChord::from_event(key),
+                ctx.pressed(&key),
                 &mut editor.focus,
                 editor.fields.len(),
             ),
@@ -648,6 +694,7 @@ impl PersonasSection {
     /// `PERSONAS_EDITOR`, the only save: the widget passes `Ctrl+s` like every chord (MOD-67 M4
     /// D6).
     fn on_body_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
+        let cancel = ctx.keys().label(views::PERSONAS_EDITOR, Act::FieldCancel);
         let Mode::Body(editor) = &mut self.mode else {
             return Handled::Pass;
         };
@@ -665,10 +712,10 @@ impl PersonasSection {
                 Handled::Consumed
             }
             FieldOutcome::Cancel => {
-                self.cancel_body();
+                self.cancel_body(cancel.as_deref());
                 Handled::Consumed
             }
-            FieldOutcome::Pass => match editor_act(ctx.keys(), key) {
+            FieldOutcome::Pass => match editor_act(ctx.keys(), ctx.pressed(&key)) {
                 Ok(()) => {
                     self.save_body(ctx);
                     Handled::Consumed
@@ -678,8 +725,9 @@ impl PersonasSection {
         }
     }
 
-    /// `Esc` in the body editor.
-    fn cancel_body(&mut self) {
+    /// `Esc` in the body editor; `cancel` is the key that discards on a second press, as the
+    /// warning names it.
+    fn cancel_body(&mut self, cancel: Option<&str>) {
         if let Some(busy) = self.own_write() {
             self.notice = Some(Notice::Error(in_flight(busy)));
             return;
@@ -709,7 +757,7 @@ impl PersonasSection {
             self.notice = None;
         } else {
             editor.esc_armed = true;
-            self.notice = Some(Notice::Info(UNSAVED.to_owned()));
+            self.notice = Some(Notice::Info(unsaved(cancel)));
         }
     }
 
@@ -779,6 +827,7 @@ impl PersonasSection {
     /// One key while the rules editor is open: as the body editor.
     fn on_rules_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
         let own = self.own_write();
+        let cancel = ctx.keys().label(views::PERSONAS_EDITOR, Act::FieldCancel);
         let Mode::Rules(editor) = &mut self.mode else {
             return Handled::Pass;
         };
@@ -803,11 +852,11 @@ impl PersonasSection {
                     self.notice = None;
                 } else {
                     editor.esc_armed = true;
-                    self.notice = Some(Notice::Info(UNSAVED.to_owned()));
+                    self.notice = Some(Notice::Info(unsaved(cancel.as_deref())));
                 }
                 Handled::Consumed
             }
-            FieldOutcome::Pass => match editor_act(ctx.keys(), key) {
+            FieldOutcome::Pass => match editor_act(ctx.keys(), ctx.pressed(&key)) {
                 Ok(()) => {
                     self.save_rules(ctx);
                     Handled::Consumed
@@ -867,7 +916,7 @@ impl PersonasSection {
     /// passes (CONTROL, ALT, function keys) goes to the shell; everything else is swallowed.
     fn on_delete_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
         let stack = views::PERSONAS_DELETE;
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         let Mode::Deleting { id, stage, .. } = &mut self.mode else {
             return Handled::Pass;
         };
@@ -917,7 +966,7 @@ impl PersonasSection {
                 self.notice = None;
                 Handled::Consumed
             }
-            FieldOutcome::Pass => modal_rest(views::CAPTURE, KeyChord::from_event(key)),
+            FieldOutcome::Pass => modal_rest(views::CAPTURE, ctx.pressed(&key)),
         }
     }
 
@@ -926,7 +975,7 @@ impl PersonasSection {
     /// (L-D Q8): a chord a modal mode passes goes to the shell, everything else is swallowed.
     fn on_report_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
         let stack = views::PERSONAS_REPORT;
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         let Mode::Report { top, max_top, .. } = &mut self.mode else {
             return Handled::Pass;
         };
@@ -1102,6 +1151,8 @@ impl PersonasSection {
     /// editors' sentence names their save key as `keys` binds it (MOD-67 M6 D4).
     fn on_stale(&mut self, id: PersonaId, keys: &Keys) {
         let save = keys.label(views::PERSONAS_EDITOR, Act::FormSave);
+        // The fields form retries on `field.submit` (MOD-115 M3 D-5).
+        let retry = keys.label(views::PERSONAS_FORM, Act::FieldSubmit);
         if !self.editing(id) {
             self.notice = Some(Notice::Error(CHANGED_ELSEWHERE_CLOSED.to_owned()));
             return;
@@ -1115,9 +1166,9 @@ impl PersonasSection {
             Mode::Editing(editor) => {
                 let clashes = editor.rebase(&row);
                 if clashes.is_empty() {
-                    CHANGED_ELSEWHERE.to_owned()
+                    changed_elsewhere(retry.as_deref())
                 } else {
-                    clash_notice(&clashes)
+                    clash_notice(&clashes, retry.as_deref())
                 }
             }
             Mode::Body(editor) => {
@@ -1155,13 +1206,15 @@ impl PersonasSection {
         self.notice = Some(Notice::Error(notice));
     }
 
-    /// The pane above the notice: the list, or the open editor.
-    fn body_lines(&self, width: u16, height: u16, theme: &Theme) -> Vec<Line<'static>> {
+    /// The pane above the notice while an editor or the report is open (the list is
+    /// [`render_list`](Self::render_list)'s).
+    fn body_lines(&self, width: u16, height: u16, ctx: &Ctx<'_>) -> Vec<Line<'static>> {
+        let theme = ctx.theme;
         match &self.mode {
-            Mode::Browse => self.list_lines(width, height, theme),
+            Mode::Browse | Mode::Deleting { .. } | Mode::ImportPath { .. } => Vec::new(),
             Mode::Editing(editor) => {
                 let mut lines = vec![Line::styled(editor.header(), theme.base), Line::default()];
-                lines.extend(editor.lines(width, theme));
+                lines.extend(editor.form().lines(width, ctx.accent(), theme));
                 lines
             }
             Mode::Body(editor) => {
@@ -1197,9 +1250,6 @@ impl PersonasSection {
                 );
                 lines
             }
-            Mode::Deleting { .. } | Mode::ImportPath { .. } => {
-                self.list_lines(width, height, theme)
-            }
             Mode::Report {
                 report,
                 top,
@@ -1208,60 +1258,94 @@ impl PersonasSection {
         }
     }
 
-    /// The registry: one line per persona, the cursor row selected with its detail under it,
-    /// scrolled so the cursor row and its detail are on screen.
-    fn list_lines(&self, width: u16, height: u16, theme: &Theme) -> Vec<Line<'static>> {
+    /// The registry as a kit list: one row per persona, the cursor row in the band with its
+    /// detail under it as note rows, scrolled so the cursor row and its detail are on screen; or
+    /// the empty state that says why there is none and what comes next.
+    fn render_list(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
+        let theme = ctx.theme;
         if let Some(why) = &self.unavailable {
-            return wrapped(&format!("{UNAVAILABLE}: {why}"), usize::from(width).max(1))
-                .into_iter()
-                .map(|line| Line::styled(line, theme.error))
-                .collect();
+            let mut lines: Vec<Line<'static>> = wrapped(
+                &format!("{UNAVAILABLE}: {why}"),
+                usize::from(area.width).max(1),
+            )
+            .into_iter()
+            .map(|line| notice(&line, Tone::Error, theme))
+            .collect();
+            // The next step in the empty state's own role.
+            lines.extend(empty::lines("", NextStep(UNAVAILABLE_NEXT), theme).pop());
+            frame.render_widget(Paragraph::new(lines), area);
+            return;
         }
         if !self.read {
-            return vec![Line::styled(NOT_READ, theme.dim)];
+            empty::render(frame, area, NOT_READ, NextStep(NOT_READ_NEXT), theme);
+            return;
         }
         if self.personas.is_empty() {
-            return vec![Line::styled(NO_PERSONAS, theme.dim)];
+            let next = adds_one(ctx.keys());
+            empty::render(frame, area, NO_PERSONAS, NextStep(&next), theme);
+            return;
         }
-        let width = usize::from(width);
-        let mut lines = Vec::new();
+        // The list's own width: the gutter takes one cell.
+        let width = usize::from(area.width.saturating_sub(1));
+        let mut rows = Vec::new();
         let mut cursor_end = 0;
         for (index, row) in self.personas.iter().enumerate() {
+            rows.push(list::Row {
+                line: Line::styled(row_line(row, width), theme.base),
+                kind: RowKind::Item,
+            });
             if index == self.cursor {
-                lines.push(Line::styled(row_line(row, width), theme.selected));
                 let detail = detail_line(row);
                 for line in wrapped(&detail, width.saturating_sub(4).max(1)) {
-                    lines.push(Line::styled(format!("    {line}"), theme.dim));
+                    rows.push(list::Row {
+                        line: Line::styled(format!("    {line}"), theme.dim),
+                        kind: RowKind::Note,
+                    });
                 }
-                cursor_end = lines.len();
-            } else {
-                lines.push(Line::styled(row_line(row, width), theme.base));
+                cursor_end = rows.len() - 1;
             }
         }
-        let skip = cursor_end.saturating_sub(usize::from(height));
-        lines.into_iter().skip(skip).collect()
+        let total = rows.len();
+        let offset =
+            list::scroll_into_view(cursor_end, 0, usize::from(area.height), total).min(self.cursor);
+        list::render(
+            frame,
+            area,
+            &rows,
+            Some(self.cursor),
+            offset,
+            ctx.accent(),
+            theme,
+        );
+        self.scroll.set(Some((total, offset)));
     }
 
-    /// The notice row's lines, wrapped.
-    fn notice_lines(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    /// The notice row's lines: the import path as a one-row kit form while it is open, then the
+    /// last outcome as kit notice lines, wrapped.
+    fn notice_lines(&self, width: u16, ctx: &Ctx<'_>) -> Vec<Line<'static>> {
+        let theme = ctx.theme;
         let mut lines = Vec::new();
         if let Mode::ImportPath { field } = &self.mode {
-            let mut spans = vec![Span::styled("path: ", theme.accent)];
-            spans.extend(field.line(width.saturating_sub(6), true, theme).spans);
-            lines.push(Line::from(spans));
+            lines.extend(
+                Form::new()
+                    .field(form::Field::new("path", Value::Text(field)))
+                    .focus(0)
+                    .editing(true)
+                    .lines(width, ctx.accent(), theme),
+            );
         }
-        let Some(notice) = &self.notice else {
+        let Some(said) = &self.notice else {
             return lines;
         };
-        let style = match notice {
-            Notice::Error(_) => theme.error,
-            Notice::Info(text) if is_error(text) => theme.error,
-            Notice::Info(_) => theme.dim,
+        let tone = match said {
+            Notice::Error(_) => Tone::Error,
+            Notice::Info(text) if is_error(text) => Tone::Error,
+            Notice::Info(_) => Tone::Info,
         };
         lines.extend(
-            wrapped(notice.text(), usize::from(width).max(1))
+            wrapped(said.text(), usize::from(width).max(1))
                 .into_iter()
-                .map(|line| Line::styled(line, style)),
+                .map(|line| notice(&line, tone, theme)),
         );
         lines
     }
@@ -1448,34 +1532,17 @@ impl Editor {
         }
     }
 
-    /// One line per field, the focused label accented and the focused field carrying the cursor
-    /// (agents' `Editor::lines`); the label column is the widest label, `permission-default`.
-    fn lines(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
-        let label_width = FIELD_LABELS
-            .iter()
-            .map(|label| label.chars().count())
-            .max()
-            .unwrap_or(0);
+    /// The fields as a kit form (MOD-115 M3 D3): one row per field in tab order, the focused one
+    /// carrying the marker and the cursor, the labels in one shared column (the widest,
+    /// `permission-default`, and one).
+    fn form(&self) -> Form<'_> {
         self.fields
             .iter()
-            .enumerate()
-            .map(|(index, field)| {
-                let focused = index == self.focus;
-                let style = if focused { theme.accent } else { theme.dim };
-                let mut spans = vec![Span::styled(
-                    format!("{:<label_width$}: ", field.label),
-                    style,
-                )];
-                let room = usize::from(width).saturating_sub(label_width + 2);
-                spans.extend(
-                    field
-                        .input
-                        .line(u16::try_from(room).unwrap_or(u16::MAX), focused, theme)
-                        .spans,
-                );
-                Line::from(spans)
+            .fold(Form::new(), |form, field| {
+                form.field(form::Field::new(field.label, Value::Text(&field.input)))
             })
-            .collect()
+            .focus(self.focus)
+            .editing(true)
     }
 }
 
@@ -1687,19 +1754,18 @@ fn form_navigation(keys: &Keys, chord: KeyChord, focus: &mut usize, fields: usiz
 /// What the body and rules editors do with a key their `TextArea` passed on: `Ok` for
 /// `form.save` through `PERSONAS_EDITOR` (the editors' only save: the widget passes `Ctrl+s` like
 /// every chord, MOD-67 M4 D6), else `Err` with [`modal_rest`]'s answer.
-fn editor_act(keys: &Keys, key: KeyEvent) -> Result<(), Handled> {
+fn editor_act(keys: &Keys, chord: KeyChord) -> Result<(), Handled> {
     let stack = views::PERSONAS_EDITOR;
-    let chord = KeyChord::from_event(key);
     if keys.actions(stack, chord).first() == Some(&Act::FormSave) {
         return Ok(());
     }
     Err(modal_rest(stack, chord))
 }
 
-/// [`CHANGED_ON_BOTH_SIDES`] with the clashing labels in form order, as many as fit
+/// [`changed_on_both_sides`] with the clashing labels in form order, as many as fit
 /// [`NOTE_WIDTH`], then ` +N more` (a private copy of `agents.rs`' `clash_notice`).
-fn clash_notice(clashes: &[&str]) -> String {
-    let mut notice = CHANGED_ON_BOTH_SIDES.to_owned();
+fn clash_notice(clashes: &[&str], retry: Option<&str>) -> String {
+    let mut notice = changed_on_both_sides(retry);
     let mut shown = 0;
     for (index, label) in clashes.iter().enumerate() {
         let separator = if index == 0 { "" } else { ", " };
@@ -1822,6 +1888,25 @@ fn delete_question(name: &str) -> String {
         "delete persona `{}`? a persona bound to a phase is refused.",
         name.escape_debug()
     )
+}
+
+/// The next step of [`NO_PERSONAS`]: the keys in force that add one (MD-A).
+fn adds_one(keys: &Keys) -> String {
+    let stack = views::PERSONAS_BROWSE;
+    let steps: Vec<String> = [
+        keys.label(stack, Act::New)
+            .map(|key| format!("{key} adds one")),
+        keys.label(stack, Act::PersonasImport)
+            .map(|key| format!("{key} imports a file")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if steps.is_empty() {
+        "no key in force adds one".to_owned()
+    } else {
+        steps.join(DOT)
+    }
 }
 
 /// The refusal of a write key while a write is in flight.
@@ -1963,18 +2048,30 @@ impl SettingsSection for PersonasSection {
         key_line(self.hint_text(keys), theme)
     }
 
+    fn scroll(&self) -> Option<(usize, usize)> {
+        self.scroll.get()
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let notice = self.notice_lines(area.width, ctx.theme);
+        let notice = self.notice_lines(area.width, ctx);
         // MOD-67 M6 T2: the keys row went to the shell's hint row; the pane gains it.
         let [pane, notice_area] = Layout::vertical([
             Constraint::Min(3),
             Constraint::Length(u16::try_from(notice.len()).unwrap_or(u16::MAX)),
         ])
         .areas(area);
-        frame.render_widget(
-            Paragraph::new(self.body_lines(pane.width, pane.height, ctx.theme)),
-            pane,
-        );
+        self.scroll.set(None);
+        match &self.mode {
+            Mode::Browse | Mode::Deleting { .. } | Mode::ImportPath { .. } => {
+                self.render_list(frame, pane, ctx);
+            }
+            Mode::Editing(_) | Mode::Body(_) | Mode::Rules(_) | Mode::Report { .. } => {
+                frame.render_widget(
+                    Paragraph::new(self.body_lines(pane.width, pane.height, ctx)),
+                    pane,
+                );
+            }
+        }
         if !notice.is_empty() {
             frame.render_widget(Paragraph::new(notice), notice_area);
         }
