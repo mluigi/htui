@@ -1,4 +1,5 @@
-//! The Settings tab: a strip of sections, one per area of configuration.
+//! The Settings tab: one pane, its sections (one per area of configuration) as chips on its top
+//! border (MOD-115 M3 D4).
 //!
 //! A registry for the same reason the tabs and the detail sub-tabs are one (MOD-1 plan D5):
 //! MOD-2's agent registry, MOD-7's `Boxes` section (every box of the user, this box marked),
@@ -26,16 +27,17 @@ pub mod secrets;
 
 use htui_core::model::Scope;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::layout::Rect;
+use ratatui::text::Line;
+use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::app::{Ctx, Handled};
 use crate::keys::{Act, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
-use crate::ui::shell::TabLoc;
+use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::pane::Pane;
+use crate::ui::shell::{PaneId, TabLoc};
 use crate::ui::tabs::registry::{Tab, TabId};
 use crossterm::event::KeyEvent;
 
@@ -103,7 +105,11 @@ pub(crate) fn asked(question: &str, answers: &str) -> String {
 
 /// What a compare-and-set miss says while an editor is open (M4 D8, PRD D8): the text is kept, the
 /// token is not, and the retry is the user's. (M4 D14, promoted for M5.)
-pub(crate) const CHANGED_ELSEWHERE: &str = "changed elsewhere since you opened it \u{2014} reloaded; Enter retries against the current row";
+///
+/// Transitional (MOD-115 M3 C4, D-5): it names `Enter` literally, so each section moves to
+/// [`changed_elsewhere`] with the key in force, and M3's T4 deletes this once none uses it.
+/// `pub` until then, so the last lane to drop it does not leave a dead `pub(crate)` item.
+pub const CHANGED_ELSEWHERE: &str = "changed elsewhere since you opened it \u{2014} reloaded; Enter retries against the current row";
 
 /// What the same miss says with **no editor open** to retry from.
 ///
@@ -145,8 +151,9 @@ pub trait SettingsSection {
     /// The scope changed: drop cached rows whose ids belong to the previous workspace.
     fn on_scope_change(&mut self, scope: &Scope);
     /// Whether this section is consuming every printable key right now, so the tab must not take
-    /// `h`/`l`/`[`/`]`/`Left`/`Right` for section cycling (ANA-10 §4.9; the chat tab's rule,
-    /// `chat/mod.rs:403-412`, one tab across). Derived from a mode, never a flag.
+    /// `settings.next_section`/`prev_section`'s chords for section cycling (ANA-10 §4.9; the
+    /// chat tab's rule, `chat/mod.rs:403-412`, one tab across). Derived from a mode, never a
+    /// flag.
     fn captures_input(&self) -> bool {
         false
     }
@@ -174,14 +181,45 @@ pub trait SettingsSection {
     }
     /// A reply addressed to the Settings tab. Sections that do not care ignore it.
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>);
-    /// Draws below the section strip.
+    /// Draws inside the Settings pane's inner rect (MOD-115 M3 D4): the pane's frame, its
+    /// section chips, hints and scrollbar are the tab's.
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>);
     /// This section's keys (its mode's spec through its stack, plus what a write in flight adds),
-    /// for the shell's hint row (MOD-67 M6 T2). Defaulted to `None`.
+    /// for the Settings pane's bottom border (MOD-67 M6 T2, MOD-115 M3 D4). Defaulted to `None`.
     fn key_hint(&self, _keys: &Keys, _theme: &Theme) -> Option<Line<'static>> {
         None
     }
+    /// This section's scroll as of its last render, `(total rows, offset)`, for the Settings
+    /// pane's scrollbar (MOD-115 M3 D-11), or `None` when it does not scroll. A section draws
+    /// before the pane's frame (C3), so a section that scrolls records it in a `Cell` in its
+    /// [`render`](SettingsSection::render). Defaulted to `None`.
+    fn scroll(&self) -> Option<(usize, usize)> {
+        None
+    }
 }
+
+/// The compare-and-set miss while an editor is open (M4 D8): reloaded, text kept; `retry` is
+/// the label of the key that saves again through the editor's stack (`field.submit`, or
+/// `form.save` for a `TextArea` editor), `None` when unbound (MOD-115 M3 MD-A, D-5). Under the
+/// compiled keys it reads as [`CHANGED_ELSEWHERE`] did. `pub` for the same reason the const is
+/// (C4): no section calls it until its lane converts, and a `pub(crate)` item nothing calls
+/// would fail `-D warnings` in between.
+#[must_use]
+pub fn changed_elsewhere(retry: Option<&str>) -> String {
+    match retry {
+        Some(key) => format!(
+            "changed elsewhere since you opened it \u{2014} reloaded; {key} retries against the current row"
+        ),
+        None => "changed elsewhere since you opened it \u{2014} reloaded; save again to retry against the current row"
+            .to_owned(),
+    }
+}
+
+/// What the pane says with no section registered (only a test registers none; `register_all`
+/// registers ten).
+const NO_SECTIONS: &str = "No settings sections in this build.";
+/// The next step of [`NO_SECTIONS`].
+const NO_SECTIONS_NEXT: &str = "Install a build of htui that registers them.";
 
 /// The registered sections, in strip order, plus which one is active.
 #[derive(Default)]
@@ -242,14 +280,14 @@ impl SettingsRegistry {
         self.active().map(SettingsSection::id)
     }
 
-    /// Activates the next section, wrapping (`l`, `]`, `Right`).
+    /// Activates the next section, wrapping (`settings.next_section`).
     pub fn cycle_next(&mut self) {
         if !self.sections.is_empty() {
             self.active = (self.active + 1) % self.sections.len();
         }
     }
 
-    /// Activates the previous section, wrapping (`h`, `[`, `Left`).
+    /// Activates the previous section, wrapping (`settings.prev_section`).
     pub fn cycle_prev(&mut self) {
         if !self.sections.is_empty() {
             self.active = (self.active + self.sections.len() - 1) % self.sections.len();
@@ -434,50 +472,57 @@ impl Tab for SettingsTab {
             .is_some_and(|id| self.sections.focus(SectionId(id)))
     }
 
-    /// The active section's keys (MOD-67 M6 T2).
+    /// The active section's keys (MOD-67 M6 T2). Kept for the `Tab` contract: since MOD-115 M3
+    /// D4 the pane draws them itself, and the shell no longer paints them for Settings.
     fn key_hint(&self, _width: u16, ctx: &Ctx<'_>) -> Option<Line<'static>> {
         self.sections
             .active()
             .and_then(|section| section.key_hint(ctx.keys(), ctx.theme))
     }
 
+    /// MOD-115 M3 D4: Settings draws its own kit pane, so the shell paints no focus or hints
+    /// over it.
+    fn draws_chrome(&self) -> bool {
+        true
+    }
+
+    /// MOD-115 M3 D4: one kit pane, titled by the active section, with every section as a chip
+    /// on its top border (the active one kept and the rest marked when they overflow, D3), the
+    /// section's hints on its bottom border and the section's scrollbar on its right one. A
+    /// single pane is `PaneId::Detail` (C1). The section draws into the pane's inner rect first,
+    /// so its scroll is known when the frame is drawn (C3, D-11).
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let block = Block::new().borders(Borders::ALL).title(" Settings ");
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-
-        let [strip, content] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
-        render_strip(frame, strip, &self.sections, ctx.theme);
-
-        match self.sections.active() {
-            Some(section) => section.render(frame, content, ctx),
-            None => message(
+        let section = self.sections.active();
+        let inner = Pane::inner(area);
+        match section {
+            Some(section) => section.render(frame, inner, ctx),
+            None => empty::render(
                 frame,
-                content,
-                "Workspace, project, repo and kind management arrives with MOD-15.",
+                inner,
+                NO_SECTIONS,
+                NextStep(NO_SECTIONS_NEXT),
                 ctx.theme,
             ),
         }
-    }
-}
 
-/// Draws the section strip, the active one in `active_tab` (bold, underlined).
-pub fn render_strip(frame: &mut Frame<'_>, area: Rect, registry: &SettingsRegistry, theme: &Theme) {
-    let active = registry.active_id();
-    let spans: Vec<Span<'_>> = registry
-        .titles()
-        .into_iter()
-        .map(|(id, title)| {
-            let style: Style = if Some(id) == active {
-                theme.active_tab
-            } else {
-                theme.dim
-            };
-            Span::styled(format!(" {title} "), style)
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        let titles: Vec<&str> = self
+            .sections
+            .titles()
+            .into_iter()
+            .map(|(_, title)| title)
+            .collect();
+        let mut pane = Pane::new(section.map_or("Settings", SettingsSection::title))
+            .sub_tabs(&titles, self.sections.active)
+            .focus(ctx.pane_focus(PaneId::Detail))
+            .accent(ctx.accent());
+        if let Some(hints) = section.and_then(|section| section.key_hint(ctx.keys(), ctx.theme)) {
+            pane = pane.hints(hints);
+        }
+        if let Some((total, offset)) = section.and_then(SettingsSection::scroll) {
+            pane = pane.scrollbar(total, offset);
+        }
+        pane.render(frame, area, ctx.theme);
+    }
 }
 
 /// The one line a section renders instead of a blank pane.
@@ -491,29 +536,323 @@ pub fn message(frame: &mut Frame<'_>, area: Rect, text: &str, theme: &Theme) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::cells::cell_width;
+    use crate::app::{Emit, TopBarState};
+    use crate::store_worker::Origin;
+    use crate::ui::shell::PaneId;
+    use htui_core::model::WorkspaceId;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::style::{Modifier, Style};
 
-    /// MOD-80 D5: under the monochrome theme only modifiers can mark the active section.
+    /// The ten sections `register_all` registers, by title, in strip order.
+    const TEN: [&str; 10] = [
+        "Agents",
+        "Hierarchy",
+        "Kinds",
+        "Prompt",
+        "Connection",
+        "Qdrant",
+        "Boxes",
+        "Personas",
+        "Secrets",
+        "Queue",
+    ];
+
+    /// A section that draws `{title} body` on its first row and `last` on its last, hands the
+    /// pane `hint` and reports `scroll`.
+    struct Fake {
+        title: &'static str,
+        hint: Option<&'static str>,
+        scroll: Option<(usize, usize)>,
+    }
+
+    impl Fake {
+        fn boxed(title: &'static str) -> Box<dyn SettingsSection> {
+            Box::new(Self {
+                title,
+                hint: Some("j/k move"),
+                scroll: None,
+            })
+        }
+    }
+
+    impl SettingsSection for Fake {
+        fn id(&self) -> SectionId {
+            SectionId(self.title)
+        }
+        fn title(&self) -> &str {
+            self.title
+        }
+        fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+            Vec::new()
+        }
+        fn on_scope_change(&mut self, _scope: &Scope) {}
+        fn on_key(&mut self, _key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            Handled::Pass
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, frame: &mut Frame<'_>, area: Rect, _ctx: &Ctx<'_>) {
+            let buf = frame.buffer_mut();
+            buf.set_string(area.x, area.y, format!("{} body", self.title), Style::new());
+            buf.set_string(area.x, area.bottom() - 1, "last", Style::new());
+        }
+        fn key_hint(&self, _keys: &Keys, _theme: &Theme) -> Option<Line<'static>> {
+            self.hint.map(Line::raw)
+        }
+        fn scroll(&self) -> Option<(usize, usize)> {
+            self.scroll
+        }
+    }
+
+    fn tab_of(titles: &[&'static str]) -> SettingsTab {
+        SettingsTab::with_sections(titles.iter().map(|title| Fake::boxed(title)).collect())
+    }
+
+    /// `tab` drawn into a `width` by `height` bench, the shell's focus on `focus` when given
+    /// (a bench without one focuses the list, M2 B7).
+    fn draw(
+        tab: &SettingsTab,
+        width: u16,
+        height: u16,
+        focus: Option<PaneId>,
+        theme: &Theme,
+    ) -> Buffer {
+        let scope = Scope {
+            workspace_id: WorkspaceId::default(),
+            project_ids: Vec::new(),
+        };
+        let (top_bar, emit) = (TopBarState::default(), Emit::default());
+        let ctx = Ctx::new(
+            &scope,
+            &[],
+            &top_bar,
+            Keys::compiled(),
+            theme,
+            Origin::Tab(SettingsTab::ID),
+            &emit,
+        );
+        let ctx = match focus {
+            Some(pane) => ctx.with_focus(pane),
+            None => ctx,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| tab.render(frame, frame.area(), &ctx))
+            .expect("the tab draws");
+        terminal.backend().buffer().clone()
+    }
+
+    fn row(buffer: &Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    fn rows(buffer: &Buffer) -> Vec<String> {
+        (0..buffer.area.height).map(|y| row(buffer, y)).collect()
+    }
+
+    /// MOD-115 M3 D4: Settings draws its own frame, so the shell neither restyles it nor paints
+    /// its hint adapter over it.
+    #[test]
+    fn settings_draws_its_own_chrome() {
+        assert!(SettingsTab::new().draws_chrome());
+        assert!(tab_of(&TEN).draws_chrome());
+    }
+
+    /// MOD-115 M3 D4: one rounded pane titled by the active section; the `┌ Settings ─` box is
+    /// gone.
+    #[test]
+    fn the_frame_is_one_rounded_pane_titled_by_the_section() {
+        let buffer = draw(
+            &tab_of(&["Agents", "Kinds"]),
+            60,
+            8,
+            Some(PaneId::Detail),
+            &Theme::default(),
+        );
+        let lines = rows(&buffer);
+        assert!(lines[0].starts_with("╭─ Agents "), "{lines:#?}");
+        assert!(lines[0].ends_with('╮'), "{lines:#?}");
+        assert!(
+            lines[7].starts_with('╰') && lines[7].ends_with('╯'),
+            "{lines:#?}"
+        );
+        let all = lines.concat();
+        assert!(
+            !all.contains('┌') && !all.contains("Settings"),
+            "{lines:#?}"
+        );
+    }
+
+    /// MOD-115 M3 D4: the sections are chips on the top border, flush with its right corner,
+    /// and the strip row under it is gone: the section draws into the whole inner rect.
+    #[test]
+    fn the_ten_sections_are_chips_on_the_top_border_and_the_section_fills_the_pane() {
+        let buffer = draw(
+            &tab_of(&TEN),
+            100,
+            10,
+            Some(PaneId::Detail),
+            &Theme::default(),
+        );
+        let lines = rows(&buffer);
+        let strip: String = TEN.iter().map(|title| format!(" {title} ")).collect();
+        assert!(lines[0].ends_with(&format!("{strip}╮")), "{lines:#?}");
+        assert!(lines[1].starts_with("│Agents body"), "{lines:#?}");
+        assert!(lines[8].starts_with("│last"), "{lines:#?}");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("Hierarchy"))
+                .count(),
+            1,
+            "no strip inside the pane: {lines:#?}"
+        );
+    }
+
+    /// MOD-115 M3 D3/D4: at 80 columns the ten chips overflow; the active one stays, the ones cut
+    /// off are marked, and the pane's title gives way (D-10).
+    #[test]
+    fn at_80_columns_the_active_chip_is_shown_and_the_cut_ones_marked() {
+        let mut tab = tab_of(&TEN);
+        for (index, title) in TEN.iter().enumerate() {
+            let buffer = draw(&tab, 80, 6, Some(PaneId::Detail), &Theme::default());
+            let top = row(&buffer, 0);
+            assert!(top.contains(&format!(" {title} ")), "{index}: {top}");
+            assert_eq!(
+                top.contains('‹'),
+                !top.contains(" Agents "),
+                "{index}: {top}"
+            );
+            assert_eq!(
+                top.contains('›'),
+                !top.contains(" Queue "),
+                "{index}: {top}"
+            );
+            assert!(top.contains('‹') || top.contains('›'), "{index}: {top}");
+            assert!(
+                row(&buffer, 1).starts_with(&format!("│{title} body")),
+                "{index}"
+            );
+            tab.sections.cycle_next();
+        }
+    }
+
+    /// MOD-115 M3 D4: the active section's hint is on the bottom border, while the pane is
+    /// focused only (C1: a single pane is `PaneId::Detail`).
+    #[test]
+    fn the_section_hint_is_on_the_bottom_border_when_focused_only() {
+        let tab = tab_of(&["Agents", "Kinds"]);
+        let focused = draw(&tab, 60, 6, Some(PaneId::Detail), &Theme::default());
+        assert!(
+            row(&focused, 5).starts_with("╰─j/k move─"),
+            "{:#?}",
+            rows(&focused)
+        );
+        let unfocused = draw(&tab, 60, 6, None, &Theme::default());
+        assert!(!rows(&unfocused).concat().contains("j/k move"));
+        assert!(
+            row(&unfocused, 5).starts_with("╰────"),
+            "{:#?}",
+            rows(&unfocused)
+        );
+    }
+
+    /// MOD-115 M3 D-11: the pane's scrollbar is the section's, as of its last render.
+    #[test]
+    fn the_scrollbar_follows_the_section_scroll() {
+        let thumb = |tab: &SettingsTab| {
+            let buffer = draw(tab, 40, 10, Some(PaneId::Detail), &Theme::default());
+            (1..9)
+                .filter(|&y| buffer[(39, y)].symbol() == "┃")
+                .collect::<Vec<u16>>()
+        };
+        let still = SettingsTab::with_sections(vec![Box::new(Fake {
+            title: "Kinds",
+            hint: None,
+            scroll: None,
+        })]);
+        assert!(thumb(&still).is_empty());
+        let top = SettingsTab::with_sections(vec![Box::new(Fake {
+            title: "Kinds",
+            hint: None,
+            scroll: Some((32, 0)),
+        })]);
+        let bottom = SettingsTab::with_sections(vec![Box::new(Fake {
+            title: "Kinds",
+            hint: None,
+            scroll: Some((32, 24)),
+        })]);
+        let (top, bottom) = (thumb(&top), thumb(&bottom));
+        assert_eq!(top.first(), Some(&1), "{top:?}");
+        assert_eq!(bottom.last(), Some(&8), "{bottom:?}");
+        assert!(top.len() < 8 && bottom.len() < 8, "{top:?} {bottom:?}");
+    }
+
+    /// MOD-80 D5: under the monochrome theme only modifiers can mark the active section, now a
+    /// chip on the pane's top border.
     #[test]
     fn active_section_is_bold_and_underlined_without_colour() {
-        let tab = SettingsTab::with_sections(vec![
-            Box::new(ConnectionSection::new()),
-            Box::new(QdrantSection::new()),
-        ]);
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 1)).expect("terminal");
-        terminal
-            .draw(|frame| render_strip(frame, frame.area(), &tab.sections, &Theme::monochrome()))
-            .expect("the strip draws");
-        let buffer = terminal.backend().buffer();
-        let marked = ratatui::style::Modifier::BOLD | ratatui::style::Modifier::UNDERLINED;
-        let active = &buffer[(1, 0)];
+        let tab = tab_of(&["Connection", "Qdrant"]);
+        let buffer = draw(&tab, 40, 4, Some(PaneId::Detail), &Theme::monochrome());
+        let top = row(&buffer, 0);
+        let marked = Modifier::BOLD | Modifier::UNDERLINED;
+        let at = |text: &str| {
+            let byte = top.find(text).expect("the chip is drawn");
+            u16::try_from(top[..byte].chars().count()).expect("narrow")
+        };
+        let active = &buffer[(at(" Connection  Qdrant ") + 1, 0)];
         assert_eq!(active.symbol(), "C");
         assert!(active.modifier.contains(marked), "{active:?}");
-        let second = u16::try_from(1 + cell_width(" Connection ")).expect("narrow");
-        let other = &buffer[(second, 0)];
+        let other = &buffer[(at(" Qdrant ") + 1, 0)];
         assert_eq!(other.symbol(), "Q");
-        assert!(!other.modifier.intersects(marked), "{other:?}");
+        // The chip text is patched over the focused border's style (bold in monochrome), so
+        // only the underline sets the active chip apart from the dim others.
+        assert!(!other.modifier.contains(Modifier::UNDERLINED), "{other:?}");
+        assert!(other.modifier.contains(Modifier::DIM), "{other:?}");
+        assert!(!active.modifier.contains(Modifier::DIM), "{active:?}");
+    }
+
+    /// MOD-115 M3 D4: with no section registered the pane says so and what to do, through
+    /// `kit::empty`.
+    #[test]
+    fn no_section_is_an_empty_state_with_a_next_step() {
+        let buffer = draw(
+            &SettingsTab::new(),
+            70,
+            8,
+            Some(PaneId::Detail),
+            &Theme::default(),
+        );
+        let all = rows(&buffer).concat();
+        assert!(row(&buffer, 0).starts_with("╭─ Settings "), "{all}");
+        assert!(all.contains(NO_SECTIONS), "{all}");
+        assert!(all.contains(NO_SECTIONS_NEXT), "{all}");
+    }
+
+    /// MOD-115 M3 MD-A, C4: the compare-and-set sentence names the key that retries through
+    /// `Keys`. Under the compiled keys it is the old sentence byte for byte; rebound, it names
+    /// the new chord; unbound, it names no key.
+    #[test]
+    fn changed_elsewhere_names_the_retry_key_in_force() {
+        let compiled = Keys::compiled().label(views::CAPTURE, Act::FieldSubmit);
+        assert_eq!(changed_elsewhere(compiled.as_deref()), CHANGED_ELSEWHERE);
+        let rebound =
+            crate::keys::load_str("version = 2\n[field]\nsubmit = [\"ctrl-t\"]\n").expect("loads");
+        let label = rebound.label(views::CAPTURE, Act::FieldSubmit);
+        let label = label.expect("ctrl-t is bound");
+        assert!(label.to_ascii_lowercase().contains("ctrl"), "{label}");
+        let text = changed_elsewhere(Some(&label));
+        assert!(text.contains(&format!("{label} retries")), "{text}");
+        assert!(!text.contains("Enter"), "{text}");
+        let unbound = changed_elsewhere(None);
+        assert!(!unbound.contains("Enter"), "{unbound}");
+        assert!(unbound.contains("save again"), "{unbound}");
+        for text in [text, unbound] {
+            assert!(is_error(&text), "still an error notice: {text}");
+        }
     }
 
     /// MOD-115 M2 §8: the location names the active section; restoring it activates that
