@@ -382,7 +382,7 @@ pub enum Tone { Done, Running, NeedsYou, Failed, Idle, Dim }
 | `StepStatus` (`run.rs:104`) | none in group A | `step_status(s) -> Mark` | pending `○ pending` · running · awaiting_approval `⚠ needs you` · stopped · done · failed · cancelled (as `RunStatus`) · superseded `↷ superseded` (Dim) |
 | `Transport` (`crates/htui-core/src/model/agent.rs:11`) | `settings/agents.rs:1981` | `transport(t) -> &str` | acp `ACP` · cli `CLI` |
 | `Billing` (`agent.rs:21`) | `agents.rs:1982` | `billing(b) -> &str` | subscription `subscription` · per_token `per token` |
-| `ProbeStatus` (`crates/htui-agent/src/probe.rs:290-302`) | `agents.rs:1335-1342` (raw `missing`/`unauthenticated`/`failed` in the 13-wide cell) | `probe(s) -> Mark` | ready `● ready` Done · unauthenticated `⚠ needs login` NeedsYou (13 cells, fits the column) · missing `✗ missing` Failed · failed `✗ probe failed` Failed |
+| `ProbeStatus` (`crates/htui-agent/src/probe.rs:290-302`) | `agents.rs:1335-1342` (raw `missing`/`unauthenticated`/`failed` in the 13-wide cell) | `probe(s) -> Mark` | ready `● ready` Done · unauthenticated `⚠ needs login` NeedsYou (13 cells, fits the column) · missing `✗ missing` Failed · failed `✗ failed` Failed (D-18) |
 | `BudgetSource` (`crates/htui-core/src/prompt/settings.rs:613`) | `settings/prompt.rs:1023` (and `present_source` `:1010`, `switch` `:986`) | `setting_source(s) -> &str` | phase `phase` · project `project` · app_setting `app setting` · app_setting_default `default` |
 | `Priority` (`crates/htui-core/src/model/requirement.rs:14`) | `requirements/tree.rs:316`, `detail.rs:76`, `forms.rs:436-438` | `priority(p) -> &str` | must · later |
 | `RequirementState` (`requirement.rs:24`) | `detail.rs:76` (`must · active · v2`) | `requirement_state(s) -> Mark` | active `● active` Idle · withdrawn `✕ withdrawn` Dim (the tree's `WITHDRAWN_MARK` U+2715, `tree.rs:32`) |
@@ -673,13 +673,15 @@ Every lane:
 - **MOD-81**:
   - **The name column keeps a minimum width.** `kit::list`'s gutter costs one column, so at the harness's 100 the
     current packing would give `name` 9, below `claude-cli`'s 10.
-  - The column is `Min(10)` and the donor is `on this box`, already D89's stated donor (`:2051-2057`): 13 → 12.
+  - The column is `Min(10)`. `on this box` is **not** the donor (D-18): it stays 13, the width of the approved
+    `⚠ needs login`. The cell comes from another column (L-agents picks it, pinned by the 80-column snapshot), or
+    the maintainer is asked again.
   - Below 98 cells, columns drop in this order until `name ≥ 10`: `models`, then `billing`, then `transport`.
     `default` (the model id `docs/ANA-4.md` §4.4 selects by) and `quota` stay.
   - Pin this with an 80-column snapshot and a unit test over widths 60..=160.
 - **MOD-83**:
   - `:1981-1982` → `label::transport`/`billing`;
-  - `:1335-1342` → `label::probe` spans in the cell (`⚠ needs login` fits the 12/13);
+  - `:1335-1342` → `label::probe` spans in the cell (`⚠ needs login` is 13 cells and fills the 13-cell column; a failed probe reads `✗ failed`, D-18);
   - `:1992` enabled `yes`/`no` → `● on`/`○ off`;
   - `:1108` `{hidden} method(s)` → `plural(hidden, "method needs", "methods need")`;
   - `:2996` `{bytes} bytes` → `plural`;
@@ -1011,6 +1013,15 @@ The list is the current non-test `Block::`/`Borders::` sites outside group A and
   word are built in `transcript.rs` (L-chat) with `kit::label::Mark`, because the kit never imports a tab.
 - **D-17 (D5 accents).** `Composer::render` (`chat/composer.rs:114`) gains an `accent: Style` parameter so the
   prompt `> ` can take the tab accent (the one focus use left in Chat). Its only caller is `chat/mod.rs:895`.
+- **D-18 (T2 probe marks vs. the `on this box` column; recorded by T2's repair).** Two §3/§5.3 claims did not hold:
+  - `✗ probe failed` is 14 cells, one past the 13-cell `on this box` column (`agents.rs:2076-2077`). T2 shows
+    `✗ failed` (the shared failed mark, and the word the cell shows today); the column already names the probe.
+    L-agents' snapshot review expects `✗ failed`.
+  - §5.3's donor `on this box` 13 → 12 would cut the maintainer-approved `⚠ needs login` (13 cells) to
+    `⚠ needs logi`. `on_box_cell` can also append `MANUAL_SUFFIX` (`agents.rs:1352`), so the cell may already run
+    past 13 today. L-agents keeps the column at 13 at least and takes the name column's extra cell from another
+    column; shortening the word needs a new maintainer call. T2's test
+    `a_probe_verdict_says_what_to_do_and_fits_the_agents_column` pins every probe mark at 13 cells or fewer.
 
 ## Maintainer calls
 1. **D-14**: Requirements' hint row loses its write keys with the tree focused at 100 columns. Accept the trim

@@ -589,7 +589,7 @@ mod tests {
             ]
         );
         // The Agents table's `on this box` cell is 13 wide: every verdict fits it whole, and the
-        // login prompt fills it.
+        // login prompt fills it, so the port must not narrow that column (blueprint D-18).
         for (raw, mark) in &table {
             let width = cell_width(&format!("{} {}", mark.glyph, mark.word));
             assert!(width <= 13, "ProbeStatus::{raw} is {width} cells");
