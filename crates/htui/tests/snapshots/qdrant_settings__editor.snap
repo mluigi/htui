@@ -1,0 +1,8 @@
+---
+source: crates/htui/tests/qdrant_settings.rs
+expression: frame
+---
+  URL    stored · https://qdrant.example:6334
+  Key    stored · <redacted>
+URL: https://q.example:6334
+Enter replaces the stored Qdrant URL

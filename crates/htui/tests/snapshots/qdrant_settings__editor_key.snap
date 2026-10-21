@@ -1,0 +1,8 @@
+---
+source: crates/htui/tests/qdrant_settings.rs
+expression: frame
+---
+  URL    stored · https://qdrant.example:6334
+  Key    stored · <redacted>
+Key: •••••••••••••••••••••  (21)
+Enter API key, or leave blank if none
