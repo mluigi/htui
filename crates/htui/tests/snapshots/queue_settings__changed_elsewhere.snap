@@ -2,15 +2,16 @@
 source: crates/htui/tests/queue_settings.rs
 expression: frame
 ---
-project vulkan-tutorials
-  run cap         unbounded
-  batch cap       unbounded
-all boxes
-  min budget      none
-  max concurrent  2 (default)
-  window          not set · stored, not enforced
-this box (DESKTOP-HTUI)
-  max concurrent  3
+ project vulkan-tutorials
+ run cap         unbounded
+ batch cap       unbounded
+ all boxes
+ min budget      none
+ max concurrent  2 (default)
+ window          not set · stored, not enforced
+ this box (DESKTOP-HTUI)
+▌max concurrent  4
+                 runs · now 3
 
 
 
@@ -30,5 +31,4 @@ this box (DESKTOP-HTUI)
 
 
 a run whose agent reports no USD cost is never capped (unknown is unbounded)
-max concurrent (runs): 4
 changed elsewhere since you opened it — reloaded; Enter retries against the current row
