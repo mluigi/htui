@@ -925,13 +925,13 @@ pub trait WriteStore: ReadStore {
     /// §T2.2's order (both stores), nothing written on any of them: a reserved name
     /// ([`reserved_phase_name`]); a node CHECK
     /// [`phase_row_refusal`](crate::store::phase_row_refusal) decides (`split`/`fan_out`, divide
-    /// columns off a divide node, `max_parts` below one, then `fan_out` below one and a negative
-    /// `retry_limit`); a `graph_id` that names no row; a taken
-    /// `(graph_id, position)`, then `(graph_id, name)`; then `persona_id`, `planner_persona_id`,
-    /// `integrate_persona_id`, `planner_agent_id`, `integrate_agent_id` naming no row, in that
-    /// order and worded `references_no_row("step_graph_phase.<column>", id, "persona" | "agent")`
-    /// (MOD-26 D5). A taken phase `id` is refused too; where it falls in that order is the
-    /// backend's.
+    /// columns off a divide node, `max_parts` below one, then `fan_out` below one, a negative
+    /// `retry_limit` and a `token_budget` below 1 ([`phase_token_budget_refusal`])); a `graph_id`
+    /// that names no row; a taken `(graph_id, position)`, then `(graph_id, name)`, then an `id`
+    /// any phase holds ([`already_exists`]); then `persona_id`,
+    /// `planner_persona_id`, `integrate_persona_id`, `planner_agent_id`, `integrate_agent_id`
+    /// naming no row, in that order and worded
+    /// `references_no_row("step_graph_phase.<column>", id, "persona" | "agent")` (MOD-26 D5).
     async fn create_phase(&self, phase: &StepGraphPhase) -> Result<StepGraphPhase>;
 
     /// Inserts `agents` as `phase`'s candidate rows, all or nothing; an empty slice writes nothing

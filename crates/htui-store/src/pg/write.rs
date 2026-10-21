@@ -3512,8 +3512,10 @@ impl WriteStore for PgStore {
     ///
     /// [`StoreError::Constraint`], in MOD-137 blueprint §T2.2's order (both stores): a reserved
     /// name; a node CHECK [`phase_row_refusal`] decides (`split`/`fan_out`, divide columns off a
-    /// divide node, `max_parts` below one, then `fan_out` below one and a negative
-    /// `retry_limit`); a `graph_id` that names no row (the bump touches no
+    /// divide node, `max_parts` below one, then `fan_out` below one, a negative `retry_limit` and a
+    /// `token_budget` below 1
+    /// ([`phase_token_budget_refusal`](htui_core::store::phase_token_budget_refusal))); a
+    /// `graph_id` that names no row (the bump touches no
     /// row); a taken `(graph_id, position)`, then `(graph_id, name)`, then an `id` any phase holds
     /// ([`already_exists`]), decided by [`phase_clash`]'s pre-read since 0020's deferrable uniques
     /// report after the foreign keys;
