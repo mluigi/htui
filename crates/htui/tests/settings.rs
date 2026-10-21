@@ -5789,7 +5789,7 @@ async fn a_qdrant_write_says_what_it_did_or_why_it_failed() {
     assert!(
         bench
             .key_hint(&section)
-            .contains("clear_qdrant_settings in flight"),
+            .contains("\u{b7} clearing the Qdrant settings\u{2026}"),
         "{rendered}"
     );
     bench.reply(
@@ -5824,7 +5824,9 @@ async fn a_qdrant_write_says_what_it_did_or_why_it_failed() {
         "{rendered}"
     );
     assert!(
-        !bench.key_hint(&section).contains("in flight"),
+        !bench
+            .key_hint(&section)
+            .contains("clearing the Qdrant settings"),
         "{rendered}"
     );
 }
@@ -5846,7 +5848,9 @@ async fn a_qdrant_write_in_flight_refuses_e_and_c_but_not_r() {
         assert!(!section.captures_input(), "`{chord}` opens nothing");
         let rendered = render_section(&section, &bench.ctx());
         assert!(
-            rendered.contains("`clear_qdrant_settings` is still in flight"),
+            rendered.contains(
+                "still clearing the Qdrant settings \u{2014} wait for the store's answer"
+            ),
             "`{chord}` is refused by name: {rendered}"
         );
     }
@@ -5916,7 +5920,7 @@ async fn a_qdrant_reload_just_before_a_write_is_not_taken_as_its_answer() {
     assert!(
         bench
             .key_hint(&section)
-            .contains("clear_qdrant_settings in flight"),
+            .contains("\u{b7} clearing the Qdrant settings\u{2026}"),
         "the clear is still out: {rendered}"
     );
 
@@ -6136,7 +6140,7 @@ async fn tab_in_the_qdrant_editor_keeps_the_settings_tab() {
     harness.drive_to_end().await;
     assert_eq!(harness.app().tabs.active_id(), Some(SettingsTab::ID));
     let frame = harness.render();
-    assert!(frame.contains("URL:"), "the editor is open: {frame}");
+    assert!(frame.contains("Qdrant URL"), "the editor is open: {frame}");
 
     for chord in ["tab", "backtab"] {
         harness.key(chord);
@@ -6148,7 +6152,7 @@ async fn tab_in_the_qdrant_editor_keeps_the_settings_tab() {
         );
         let frame = harness.render();
         assert!(
-            frame.contains("URL:"),
+            frame.contains("Qdrant URL"),
             "`{chord}` keeps the editor: {frame}"
         );
     }
@@ -6174,7 +6178,7 @@ async fn ctrl_e_and_ctrl_r_in_qdrant_browse_do_nothing() {
     assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
     let rendered = render_section(&section, &bench.ctx());
     assert!(
-        rendered.contains("URL:"),
+        rendered.contains("Qdrant URL"),
         "`ctrl-j` did not move the cursor, so `e` edits the URL row: {rendered}"
     );
 }

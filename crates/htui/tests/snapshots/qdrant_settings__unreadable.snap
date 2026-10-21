@@ -1,0 +1,8 @@
+---
+source: crates/htui/tests/qdrant_settings.rs
+expression: "frame_of(&bench, &section)"
+---
+▌URL       the keyring could not be read: cannot read the keyring entry (htui/qdrant-url): Secret
+▌          Service: no result found
+ API key   the keyring could not be read: cannot read the keyring entry (htui/qdrant-url): Secret
+           Service: no result found
