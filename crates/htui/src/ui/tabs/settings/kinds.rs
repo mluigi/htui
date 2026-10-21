@@ -2062,6 +2062,12 @@ fn phase_line(phase: &StepGraphPhase, personas: &[PersonaSummary]) -> String {
 
 /// `token_budget` as the tree prints it: an empty column inherits from the project or the app rung
 /// rather than holding a number nobody wrote (D16).
+///
+/// The inherited case reads `budget inherited`, not blueprint §5.4's `inherits the budget`: the
+/// same meaning three cells shorter, so a bound research row (`kinds__phase_persona`: `... ·
+/// budget inherited · persona reviewer`, 98 cells) still fits a 100-column pane; the blueprint's
+/// wording takes it to 101 and clips the persona's name. Keeping `budget` first also lines it up with `budget {n}
+/// tokens`. Pinned by `a_phase_row_reads_its_gate_inputs_and_budget_in_words`.
 fn budget_label(budget: Option<i32>) -> String {
     budget.map_or_else(
         || "budget inherited".to_owned(),
