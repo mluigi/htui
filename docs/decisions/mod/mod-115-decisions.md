@@ -183,9 +183,9 @@ hidden. The `HANDOFF.md` phase 1 note summarises the milestone.
 ## Milestone 3: review notes
 
 - **Under an overlay, a ported tab's pane drops focus; an unported one keeps the shell accent**
-  (review RV1 L2, recorded, no code change; M3 blueprint decision C7). A ported tab draws its own
-  pane through `Ctx::pane_focus`, which answers `Unfocused` while an overlay covers the tab, so
-  its border goes faint and its hints go. An unported (group B) tab is still restyled by the
+  (review RV1 L2, recorded, no code change). A ported tab draws its own pane through
+  `Ctx::pane_focus`, which answers `Unfocused` while an overlay covers the tab, so its border goes
+  faint and its hints go. An unported (group B) tab is still restyled by the
   shell's `paint_focus`, which keeps the focused pane's accent under the overlay. The two read
   differently until M4 ports group B; the ported behaviour (the overlay has the keys, so no pane
   under it reads focused) is the target, and M4's port brings group B in line with it.
