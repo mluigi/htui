@@ -6613,3 +6613,39 @@ async fn the_chooser_counts_hidden_methods_in_words() {
     );
     assert!(!rendered.contains("(s)"), "{rendered}");
 }
+
+/// MOD-115 M3 D-11: a table longer than the section reports its scroll for the Settings pane's
+/// scrollbar, in the section's rows, and keeps the cursor in view; one that fits reports none.
+#[tokio::test]
+async fn a_long_table_reports_its_scroll_and_keeps_the_cursor_in_view() {
+    let bench = SectionBench::new().await;
+    let rows: Vec<AgentSummary> = (0..40)
+        .map(|index| registry_row(&format!("agent-{index:02}"), false))
+        .collect();
+    let mut section = section_over(&bench, rows);
+    let _ = render_section(&section, &bench.ctx());
+    let Some((total, offset)) = section.scroll() else {
+        panic!("40 rows do not fit 30");
+    };
+    assert_eq!(offset, 0, "the cursor starts on the first row");
+    // The header, the note and the 28 rows between them: 12 rows are left over.
+    assert_eq!(
+        total,
+        30 + 40 - 28,
+        "the section's height and the rows it could not show"
+    );
+
+    pressed(&bench, &mut section, "j", 39);
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(
+        accented_lines(&section, &bench.ctx())
+            .iter()
+            .any(|line| line.starts_with("agent-39")),
+        "the cursor's row is drawn: {rendered}"
+    );
+    assert_eq!(section.scroll().map(|(_, offset)| offset), Some(12));
+
+    let short = section_over(&bench, vec![registry_row("alpha", false)]);
+    let _ = render_section(&short, &bench.ctx());
+    assert_eq!(short.scroll(), None);
+}

@@ -1114,3 +1114,46 @@ impl SettingsSection for AgentsSection {
         self.scroll.get()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chord(text: &str) -> KeyChord {
+        KeyChord::parse(text).unwrap_or_else(|| panic!("`{text}` is a chord"))
+    }
+
+    /// MOD-115 M3 MD-A: the form's navigation reads the chord it is handed, the one the user
+    /// pressed (`Ctx::pressed`): `form.next_field`/`prev_field` move with a wrap, a chord the
+    /// modal global layer admits passes, and anything else is swallowed.
+    #[test]
+    fn form_navigation_reads_the_chord_it_is_handed() {
+        let keys = Keys::compiled();
+        let mut focus = 0;
+        assert_eq!(
+            form_navigation(chord("tab"), keys, &mut focus, 3),
+            Handled::Consumed
+        );
+        assert_eq!(focus, 1);
+        assert_eq!(
+            form_navigation(chord("up"), keys, &mut focus, 3),
+            Handled::Consumed
+        );
+        assert_eq!(
+            form_navigation(chord("up"), keys, &mut focus, 3),
+            Handled::Consumed
+        );
+        assert_eq!(focus, 2, "the focus wraps");
+        assert_eq!(
+            form_navigation(chord("x"), keys, &mut focus, 3),
+            Handled::Consumed,
+            "a chord no act holds is swallowed"
+        );
+        assert_eq!(focus, 2);
+        assert_eq!(
+            form_navigation(chord("f1"), keys, &mut focus, 3),
+            Handled::Pass,
+            "the modal global layer's help passes"
+        );
+    }
+}
