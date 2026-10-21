@@ -59,7 +59,9 @@ async fn pg_store_conformance() {
     use htui_core::store::conformance;
 
     for name in conformance::CASES {
-        let Some(db) = common::demo_db().await else {
+        // Boxed (MOD-137): `demo_db`'s connect, migrate and `load_demo` future is otherwise inline
+        // in this test's future, on the 2 MiB test thread's stack, under every case's poll.
+        let Some(db) = Box::pin(common::demo_db()).await else {
             return; // `common` printed the skip line already (plan D13).
         };
         println!("case {name}");

@@ -278,409 +278,522 @@ pub const CASES: &[&str] = &[
 /// rewrite the whole suite to gain a string the panic already prints. MOD-6's `pg_conformance.rs`
 /// gets its per-case reporting from the loop, not from a `Result`.
 ///
-/// The match's future is as large as its largest case's, and every case's poll sits on it, so it
-/// is boxed once here (MOD-137): with the graph v2 cases the Postgres run built with the whole
-/// workspace's features overflowed the 2 MiB test stack in an unrelated case
-/// (`waiting_candidates_hold_every_park_and_nothing_else`).
+/// Every arm is boxed, and so is the match (MOD-137): inline, the match's future is as large as its
+/// largest case's and sits under every case's poll, and the Postgres run built with the whole
+/// workspace's features overflowed the 2 MiB debug test stack. Boxed, the suite passes at 1.5 MiB
+/// (`RUST_MIN_STACK`); a new arm is boxed like the others.
 pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
     Box::pin(run_case_inline(name, store)).await;
 }
 
 async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
     match name {
-        "mint_consecutive_keys" => mint_consecutive_keys(store).await,
-        "mint_prefix_isolation" => mint_prefix_isolation(store).await,
-        "mint_writes_revision_v1" => mint_writes_revision_v1(store).await,
-        "mint_unknown_kind_rejected" => mint_unknown_kind_rejected(store).await,
-        "update_cas_success" => update_cas_success(store).await,
-        "update_kind_keeps_key_and_project" => update_kind_keeps_key_and_project(store).await,
-        "update_cas_diverged" => update_cas_diverged(store).await,
-        "status_cas_keeps_version" => status_cas_keeps_version(store).await,
-        "no_delete_path" => no_delete_path(store).await,
-        "links_hops_1_vs_2" => links_hops_1_vs_2(store).await,
-        "filter_status_project_tags_ready" => filter_status_project_tags_ready(store).await,
-        "documents_ordered_by_version" => documents_ordered_by_version(store).await,
-        "notes_ordered_by_created_at" => notes_ordered_by_created_at(store).await,
-        "events_ordered_by_seq" => events_ordered_by_seq(store).await,
-        "nil_author_rejected" => nil_author_rejected(store).await,
-        "append_events_idempotent_and_ordered" => append_events_idempotent_and_ordered(store).await,
+        "mint_consecutive_keys" => Box::pin(mint_consecutive_keys(store)).await,
+        "mint_prefix_isolation" => Box::pin(mint_prefix_isolation(store)).await,
+        "mint_writes_revision_v1" => Box::pin(mint_writes_revision_v1(store)).await,
+        "mint_unknown_kind_rejected" => Box::pin(mint_unknown_kind_rejected(store)).await,
+        "update_cas_success" => Box::pin(update_cas_success(store)).await,
+        "update_kind_keeps_key_and_project" => {
+            Box::pin(update_kind_keeps_key_and_project(store)).await
+        }
+        "update_cas_diverged" => Box::pin(update_cas_diverged(store)).await,
+        "status_cas_keeps_version" => Box::pin(status_cas_keeps_version(store)).await,
+        "no_delete_path" => Box::pin(no_delete_path(store)).await,
+        "links_hops_1_vs_2" => Box::pin(links_hops_1_vs_2(store)).await,
+        "filter_status_project_tags_ready" => {
+            Box::pin(filter_status_project_tags_ready(store)).await
+        }
+        "documents_ordered_by_version" => Box::pin(documents_ordered_by_version(store)).await,
+        "notes_ordered_by_created_at" => Box::pin(notes_ordered_by_created_at(store)).await,
+        "events_ordered_by_seq" => Box::pin(events_ordered_by_seq(store)).await,
+        "nil_author_rejected" => Box::pin(nil_author_rejected(store)).await,
+        "append_events_idempotent_and_ordered" => {
+            Box::pin(append_events_idempotent_and_ordered(store)).await
+        }
         "set_step_usage_writes_usage_and_digest" => {
-            set_step_usage_writes_usage_and_digest(store).await;
+            Box::pin(set_step_usage_writes_usage_and_digest(store)).await;
         }
-        "start_chat_run_mints_chat_rows" => start_chat_run_mints_chat_rows(store).await,
-        "upsert_agent_by_id_name_unique" => upsert_agent_by_id_name_unique(store).await,
-        "upsert_agent_box_by_pk" => upsert_agent_box_by_pk(store).await,
+        "start_chat_run_mints_chat_rows" => Box::pin(start_chat_run_mints_chat_rows(store)).await,
+        "upsert_agent_by_id_name_unique" => Box::pin(upsert_agent_by_id_name_unique(store)).await,
+        "upsert_agent_box_by_pk" => Box::pin(upsert_agent_box_by_pk(store)).await,
         "set_agent_box_quota_updates_two_columns_or_not_found" => {
-            set_agent_box_quota_updates_two_columns_or_not_found(store).await;
+            Box::pin(set_agent_box_quota_updates_two_columns_or_not_found(store)).await;
         }
-        "upsert_agent_box_cannot_write_quota" => upsert_agent_box_cannot_write_quota(store).await,
+        "upsert_agent_box_cannot_write_quota" => {
+            Box::pin(upsert_agent_box_cannot_write_quota(store)).await
+        }
         "set_step_prompt_writes_digest_and_trim" => {
-            set_step_prompt_writes_digest_and_trim(store).await;
+            Box::pin(set_step_prompt_writes_digest_and_trim(store)).await;
         }
-        "workspace_round_trip_and_cas" => workspace_round_trip_and_cas(store).await,
+        "workspace_round_trip_and_cas" => Box::pin(workspace_round_trip_and_cas(store)).await,
         "workspace_links_and_box_paths_upsert" => {
-            workspace_links_and_box_paths_upsert(store).await;
+            Box::pin(workspace_links_and_box_paths_upsert(store)).await;
         }
-        "workspace_delete_reports_its_reach" => workspace_delete_reports_its_reach(store).await,
-        "project_create_update_cas" => project_create_update_cas(store).await,
+        "workspace_delete_reports_its_reach" => {
+            Box::pin(workspace_delete_reports_its_reach(store)).await
+        }
+        "project_create_update_cas" => Box::pin(project_create_update_cas(store)).await,
         "project_secret_columns_set_clear_cas" => {
-            project_secret_columns_set_clear_cas(store).await;
+            Box::pin(project_secret_columns_set_clear_cas(store)).await;
         }
         "project_delete_takes_everything_and_says_so" => {
-            project_delete_takes_everything_and_says_so(store).await;
+            Box::pin(project_delete_takes_everything_and_says_so(store)).await;
         }
-        "repo_round_trip_and_primary_flag" => repo_round_trip_and_primary_flag(store).await,
+        "repo_round_trip_and_primary_flag" => {
+            Box::pin(repo_round_trip_and_primary_flag(store)).await
+        }
         "item_kind_round_trip_and_prefix_rules" => {
-            item_kind_round_trip_and_prefix_rules(store).await;
+            Box::pin(item_kind_round_trip_and_prefix_rules(store)).await;
         }
         "item_kind_delete_refused_while_referenced" => {
-            item_kind_delete_refused_while_referenced(store).await;
+            Box::pin(item_kind_delete_refused_while_referenced(store)).await;
         }
-        "step_graph_and_phase_round_trip" => step_graph_and_phase_round_trip(store).await,
-        "settings_app_rung_validates_and_cas" => settings_app_rung_validates_and_cas(store).await,
-        "settings_project_rung_merges_keys" => settings_project_rung_merges_keys(store).await,
+        "step_graph_and_phase_round_trip" => Box::pin(step_graph_and_phase_round_trip(store)).await,
+        "settings_app_rung_validates_and_cas" => {
+            Box::pin(settings_app_rung_validates_and_cas(store)).await
+        }
+        "settings_project_rung_merges_keys" => {
+            Box::pin(settings_project_rung_merges_keys(store)).await
+        }
         "settings_phase_rung_writes_token_budget_only" => {
-            settings_phase_rung_writes_token_budget_only(store).await;
+            Box::pin(settings_phase_rung_writes_token_budget_only(store)).await;
         }
-        "project_create_seeds_the_catalogue" => project_create_seeds_the_catalogue(store).await,
-        "run_create_moves_the_item" => run_create_moves_the_item(store).await,
-        "create_run_records_its_workspace" => create_run_records_its_workspace(store).await,
+        "project_create_seeds_the_catalogue" => {
+            Box::pin(project_create_seeds_the_catalogue(store)).await
+        }
+        "run_create_moves_the_item" => Box::pin(run_create_moves_the_item(store)).await,
+        "create_run_records_its_workspace" => {
+            Box::pin(create_run_records_its_workspace(store)).await
+        }
         "claim_run_admits_one_and_refuses_the_second" => {
-            claim_run_admits_one_and_refuses_the_second(store).await;
+            Box::pin(claim_run_admits_one_and_refuses_the_second(store)).await;
         }
-        "lease_refresh_is_a_cas_on_owner" => lease_refresh_is_a_cas_on_owner(store).await,
-        "step_create_and_transition_law" => step_create_and_transition_law(store).await,
-        "finish_step_records_the_settle" => finish_step_records_the_settle(store).await,
-        "gate_answers_write_their_outcome" => gate_answers_write_their_outcome(store).await,
-        "select_fanout_is_one_transaction" => select_fanout_is_one_transaction(store).await,
-        "trees_and_commits_round_trip" => trees_and_commits_round_trip(store).await,
-        "verify_run_is_recorded" => verify_run_is_recorded(store).await,
-        "write_document_allocates_its_version" => write_document_allocates_its_version(store).await,
-        "close_out_refuses_a_live_run" => close_out_refuses_a_live_run(store).await,
-        "illegal_transitions_are_constraint" => illegal_transitions_are_constraint(store).await,
+        "lease_refresh_is_a_cas_on_owner" => Box::pin(lease_refresh_is_a_cas_on_owner(store)).await,
+        "step_create_and_transition_law" => Box::pin(step_create_and_transition_law(store)).await,
+        "finish_step_records_the_settle" => Box::pin(finish_step_records_the_settle(store)).await,
+        "gate_answers_write_their_outcome" => {
+            Box::pin(gate_answers_write_their_outcome(store)).await
+        }
+        "select_fanout_is_one_transaction" => {
+            Box::pin(select_fanout_is_one_transaction(store)).await
+        }
+        "trees_and_commits_round_trip" => Box::pin(trees_and_commits_round_trip(store)).await,
+        "verify_run_is_recorded" => Box::pin(verify_run_is_recorded(store)).await,
+        "write_document_allocates_its_version" => {
+            Box::pin(write_document_allocates_its_version(store)).await
+        }
+        "close_out_refuses_a_live_run" => Box::pin(close_out_refuses_a_live_run(store)).await,
+        "illegal_transitions_are_constraint" => {
+            Box::pin(illegal_transitions_are_constraint(store)).await
+        }
         "finish_run_moves_run_and_item_together" => {
-            finish_run_moves_run_and_item_together(store).await;
+            Box::pin(finish_run_moves_run_and_item_together(store)).await;
         }
         "claim_run_applies_the_isolation_and_path_rules" => {
-            claim_run_applies_the_isolation_and_path_rules(store).await;
+            Box::pin(claim_run_applies_the_isolation_and_path_rules(store)).await;
         }
         "take_lease_moves_only_our_own_or_an_expired_lease" => {
-            take_lease_moves_only_our_own_or_an_expired_lease(store).await;
+            Box::pin(take_lease_moves_only_our_own_or_an_expired_lease(store)).await;
         }
-        "interrupt_step_is_a_cas_on_running" => interrupt_step_is_a_cas_on_running(store).await,
+        "interrupt_step_is_a_cas_on_running" => {
+            Box::pin(interrupt_step_is_a_cas_on_running(store)).await
+        }
         "release_lease_frees_the_run_for_its_own_sweep" => {
-            release_lease_frees_the_run_for_its_own_sweep(store).await;
+            Box::pin(release_lease_frees_the_run_for_its_own_sweep(store)).await;
         }
         "record_box_probe_replaces_profile_and_tools" => {
-            record_box_probe_replaces_profile_and_tools(store).await;
+            Box::pin(record_box_probe_replaces_profile_and_tools(store)).await;
         }
         "record_box_probe_refuses_an_unknown_box" => {
-            record_box_probe_refuses_an_unknown_box(store).await;
+            Box::pin(record_box_probe_refuses_an_unknown_box(store)).await;
         }
-        "boxes_lists_every_box_with_its_tools" => boxes_lists_every_box_with_its_tools(store).await,
-        "close_out_resolution_law" => close_out_resolution_law(store).await,
-        "transition_never_reaches_closed" => transition_never_reaches_closed(store).await,
+        "boxes_lists_every_box_with_its_tools" => {
+            Box::pin(boxes_lists_every_box_with_its_tools(store)).await
+        }
+        "close_out_resolution_law" => Box::pin(close_out_resolution_law(store)).await,
+        "transition_never_reaches_closed" => Box::pin(transition_never_reaches_closed(store)).await,
         "requirement_mint_is_per_area_and_never_reused" => {
-            requirement_mint_is_per_area_and_never_reused(store).await;
+            Box::pin(requirement_mint_is_per_area_and_never_reused(store)).await;
         }
         "requirement_area_create_checks_the_code" => {
-            requirement_area_create_checks_the_code(store).await;
+            Box::pin(requirement_area_create_checks_the_code(store)).await;
         }
         "requirement_amend_is_cas_and_names_the_item" => {
-            requirement_amend_is_cas_and_names_the_item(store).await;
+            Box::pin(requirement_amend_is_cas_and_names_the_item(store)).await;
         }
         "requirement_withdraw_refuses_new_addresses" => {
-            requirement_withdraw_refuses_new_addresses(store).await;
+            Box::pin(requirement_withdraw_refuses_new_addresses(store)).await;
         }
-        "amend_records_the_deciding_citation" => amend_records_the_deciding_citation(store).await,
+        "amend_records_the_deciding_citation" => {
+            Box::pin(amend_records_the_deciding_citation(store)).await
+        }
         "a_newer_version_makes_a_citation_suspect_until_reconfirmed" => {
-            a_newer_version_makes_a_citation_suspect_until_reconfirmed(store).await;
+            Box::pin(a_newer_version_makes_a_citation_suspect_until_reconfirmed(
+                store,
+            ))
+            .await;
         }
-        "uncite_tombstones_and_cite_revives" => uncite_tombstones_and_cite_revives(store).await,
+        "uncite_tombstones_and_cite_revives" => {
+            Box::pin(uncite_tombstones_and_cite_revives(store)).await
+        }
         "coverage_lists_citing_items_with_resolution" => {
-            coverage_lists_citing_items_with_resolution(store).await;
+            Box::pin(coverage_lists_citing_items_with_resolution(store)).await;
         }
-        "spec_is_cas" => spec_is_cas(store).await,
-        "project_delete_counts_requirements" => project_delete_counts_requirements(store).await,
-        "edit_box_is_cas_on_edit_version" => edit_box_is_cas_on_edit_version(store).await,
+        "spec_is_cas" => Box::pin(spec_is_cas(store)).await,
+        "project_delete_counts_requirements" => {
+            Box::pin(project_delete_counts_requirements(store)).await
+        }
+        "edit_box_is_cas_on_edit_version" => Box::pin(edit_box_is_cas_on_edit_version(store)).await,
         "edit_box_survives_a_probe_between_read_and_write" => {
-            edit_box_survives_a_probe_between_read_and_write(store).await;
+            Box::pin(edit_box_survives_a_probe_between_read_and_write(store)).await;
         }
-        "edit_box_refuses_an_invalid_tag" => edit_box_refuses_an_invalid_tag(store).await,
+        "edit_box_refuses_an_invalid_tag" => Box::pin(edit_box_refuses_an_invalid_tag(store)).await,
         "prompt_template_append_is_a_cas_on_the_head" => {
-            prompt_template_append_is_a_cas_on_the_head(store).await;
+            Box::pin(prompt_template_append_is_a_cas_on_the_head(store)).await;
         }
         "prompt_template_new_name_starts_at_one" => {
-            prompt_template_new_name_starts_at_one(store).await;
+            Box::pin(prompt_template_new_name_starts_at_one(store)).await;
         }
         "prompt_template_refuses_what_parse_refuses" => {
-            prompt_template_refuses_what_parse_refuses(store).await;
+            Box::pin(prompt_template_refuses_what_parse_refuses(store)).await;
         }
         "claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks" => {
-            claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks(store).await;
+            Box::pin(claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks(
+                store,
+            ))
+            .await;
         }
         "claim_run_checks_tags_after_claimability_and_before_the_slot" => {
-            claim_run_checks_tags_after_claimability_and_before_the_slot(store).await;
+            Box::pin(claim_run_checks_tags_after_claimability_and_before_the_slot(store)).await;
         }
         "infer_repo_box_path_inserts_only_where_absent" => {
-            infer_repo_box_path_inserts_only_where_absent(store).await;
+            Box::pin(infer_repo_box_path_inserts_only_where_absent(store)).await;
         }
         "skill_create_reads_back_with_version_one" => {
-            skill_create_reads_back_with_version_one(store).await;
+            Box::pin(skill_create_reads_back_with_version_one(store)).await;
         }
         "skill_update_is_a_compare_and_set_and_refuses_a_taken_name" => {
-            skill_update_is_a_compare_and_set_and_refuses_a_taken_name(store).await;
+            Box::pin(skill_update_is_a_compare_and_set_and_refuses_a_taken_name(
+                store,
+            ))
+            .await;
         }
         "skill_version_append_is_a_compare_and_set_on_the_head" => {
-            skill_version_append_is_a_compare_and_set_on_the_head(store).await;
+            Box::pin(skill_version_append_is_a_compare_and_set_on_the_head(store)).await;
         }
         "skill_binding_attach_change_detach_are_compare_and_set" => {
-            skill_binding_attach_change_detach_are_compare_and_set(store).await;
+            Box::pin(skill_binding_attach_change_detach_are_compare_and_set(
+                store,
+            ))
+            .await;
         }
-        "skill_binding_refuses_by_rule" => skill_binding_refuses_by_rule(store).await,
+        "skill_binding_refuses_by_rule" => Box::pin(skill_binding_refuses_by_rule(store)).await,
         "skill_binding_stores_expanded_globs_and_languages_as_typed" => {
-            skill_binding_stores_expanded_globs_and_languages_as_typed(store).await;
+            Box::pin(skill_binding_stores_expanded_globs_and_languages_as_typed(
+                store,
+            ))
+            .await;
         }
         "a_stale_owner_writes_nothing_to_the_step" => {
-            a_stale_owner_writes_nothing_to_the_step(store).await
+            Box::pin(a_stale_owner_writes_nothing_to_the_step(store)).await
         }
-        "the_new_owner_writes_the_step" => the_new_owner_writes_the_step(store).await,
-        "an_unleased_fence_writes_a_chat_step" => an_unleased_fence_writes_a_chat_step(store).await,
+        "the_new_owner_writes_the_step" => Box::pin(the_new_owner_writes_the_step(store)).await,
+        "an_unleased_fence_writes_a_chat_step" => {
+            Box::pin(an_unleased_fence_writes_a_chat_step(store)).await
+        }
         "an_unleased_fence_is_refused_on_a_leased_run" => {
-            an_unleased_fence_is_refused_on_a_leased_run(store).await
+            Box::pin(an_unleased_fence_is_refused_on_a_leased_run(store)).await
         }
         "a_replayed_batch_under_the_right_fence_is_ok_zero" => {
-            a_replayed_batch_under_the_right_fence_is_ok_zero(store).await
+            Box::pin(a_replayed_batch_under_the_right_fence_is_ok_zero(store)).await
         }
         "a_missing_step_keeps_its_old_error_not_fenced" => {
-            a_missing_step_keeps_its_old_error_not_fenced(store).await
+            Box::pin(a_missing_step_keeps_its_old_error_not_fenced(store)).await
         }
-        "an_older_quota_is_a_no_op" => an_older_quota_is_a_no_op(store).await,
+        "an_older_quota_is_a_no_op" => Box::pin(an_older_quota_is_a_no_op(store)).await,
         "an_equal_quota_at_rewrites_idempotently" => {
-            an_equal_quota_at_rewrites_idempotently(store).await
+            Box::pin(an_equal_quota_at_rewrites_idempotently(store)).await
         }
-        "a_missing_agent_box_is_not_found" => a_missing_agent_box_is_not_found(store).await,
+        "a_missing_agent_box_is_not_found" => {
+            Box::pin(a_missing_agent_box_is_not_found(store)).await
+        }
         "upsert_agent_with_none_inserts_and_is_stale_when_present" => {
-            upsert_agent_with_none_inserts_and_is_stale_when_present(store).await
+            Box::pin(upsert_agent_with_none_inserts_and_is_stale_when_present(
+                store,
+            ))
+            .await
         }
         "upsert_agent_with_a_spent_token_is_stale_and_writes_nothing" => {
-            upsert_agent_with_a_spent_token_is_stale_and_writes_nothing(store).await
+            Box::pin(upsert_agent_with_a_spent_token_is_stale_and_writes_nothing(
+                store,
+            ))
+            .await
         }
         "upsert_agent_with_the_current_token_applies" => {
-            upsert_agent_with_the_current_token_applies(store).await
+            Box::pin(upsert_agent_with_the_current_token_applies(store)).await
         }
-        "a_lease_ttl_out_of_range_is_refused" => a_lease_ttl_out_of_range_is_refused(store).await,
+        "a_lease_ttl_out_of_range_is_refused" => {
+            Box::pin(a_lease_ttl_out_of_range_is_refused(store)).await
+        }
         "set_agent_box_enabled_switches_one_row_or_refuses" => {
-            set_agent_box_enabled_switches_one_row_or_refuses(store).await
+            Box::pin(set_agent_box_enabled_switches_one_row_or_refuses(store)).await
         }
         "a_stale_owner_writes_no_prompt_tree_or_commits" => {
-            a_stale_owner_writes_no_prompt_tree_or_commits(store).await;
+            Box::pin(a_stale_owner_writes_no_prompt_tree_or_commits(store)).await;
         }
         "the_new_owner_writes_prompt_tree_and_commits" => {
-            the_new_owner_writes_prompt_tree_and_commits(store).await;
+            Box::pin(the_new_owner_writes_prompt_tree_and_commits(store)).await;
         }
         "an_unleased_prompt_write_is_refused_on_a_leased_run" => {
-            an_unleased_prompt_write_is_refused_on_a_leased_run(store).await;
+            Box::pin(an_unleased_prompt_write_is_refused_on_a_leased_run(store)).await;
         }
         "a_missing_step_is_not_found_before_the_fence" => {
-            a_missing_step_is_not_found_before_the_fence(store).await;
+            Box::pin(a_missing_step_is_not_found_before_the_fence(store)).await;
         }
         "edit_box_writes_the_executor_and_keeps_every_other_setting" => {
-            edit_box_writes_the_executor_and_keeps_every_other_setting(store).await;
+            Box::pin(edit_box_writes_the_executor_and_keeps_every_other_setting(
+                store,
+            ))
+            .await;
         }
         "an_unknown_executor_is_refused_and_writes_nothing" => {
-            an_unknown_executor_is_refused_and_writes_nothing(store).await;
+            Box::pin(an_unknown_executor_is_refused_and_writes_nothing(store)).await;
         }
         "an_executor_edit_is_a_compare_and_set" => {
-            an_executor_edit_is_a_compare_and_set(store).await;
+            Box::pin(an_executor_edit_is_a_compare_and_set(store)).await;
         }
         "box_probe_spec_is_cas_on_updated_at" => {
-            box_probe_spec_is_cas_on_updated_at(store).await;
+            Box::pin(box_probe_spec_is_cas_on_updated_at(store)).await;
         }
         "set_box_probe_spec_refuses_a_non_object_and_a_clear_without_a_token" => {
-            set_box_probe_spec_refuses_a_non_object_and_a_clear_without_a_token(store).await;
+            Box::pin(set_box_probe_spec_refuses_a_non_object_and_a_clear_without_a_token(store))
+                .await;
         }
         "a_pending_permission_is_answered_once" => {
-            a_pending_permission_is_answered_once(store).await
+            Box::pin(a_pending_permission_is_answered_once(store)).await
         }
         "an_answer_after_the_owner_changed_is_refused_executor_gone" => {
-            an_answer_after_the_owner_changed_is_refused_executor_gone(store).await
+            Box::pin(an_answer_after_the_owner_changed_is_refused_executor_gone(
+                store,
+            ))
+            .await
         }
         "an_option_the_request_did_not_offer_is_refused" => {
-            an_option_the_request_did_not_offer_is_refused(store).await
+            Box::pin(an_option_the_request_did_not_offer_is_refused(store)).await
         }
-        "apply_is_fenced_on_the_lease_owner" => apply_is_fenced_on_the_lease_owner(store).await,
+        "apply_is_fenced_on_the_lease_owner" => {
+            Box::pin(apply_is_fenced_on_the_lease_owner(store)).await
+        }
         "opening_a_permission_stales_older_sessions_of_the_step" => {
-            opening_a_permission_stales_older_sessions_of_the_step(store).await
+            Box::pin(opening_a_permission_stales_older_sessions_of_the_step(
+                store,
+            ))
+            .await
         }
         "opening_a_permission_is_fenced_on_the_lease" => {
-            opening_a_permission_is_fenced_on_the_lease(store).await
+            Box::pin(opening_a_permission_is_fenced_on_the_lease(store)).await
         }
         "settle_moves_only_pending_and_answered_rows" => {
-            settle_moves_only_pending_and_answered_rows(store).await
+            Box::pin(settle_moves_only_pending_and_answered_rows(store)).await
         }
-        "a_run_has_at_most_one_pending_cancel" => a_run_has_at_most_one_pending_cancel(store).await,
-        "resolve_command_is_a_compare_and_set" => resolve_command_is_a_compare_and_set(store).await,
+        "a_run_has_at_most_one_pending_cancel" => {
+            Box::pin(a_run_has_at_most_one_pending_cancel(store)).await
+        }
+        "resolve_command_is_a_compare_and_set" => {
+            Box::pin(resolve_command_is_a_compare_and_set(store)).await
+        }
         "pending_commands_are_the_owners_and_the_boxs_free_runs" => {
-            pending_commands_are_the_owners_and_the_boxs_free_runs(store).await
+            Box::pin(pending_commands_are_the_owners_and_the_boxs_free_runs(
+                store,
+            ))
+            .await
         }
         "relay_view_lists_live_pending_requests_and_pending_cancels" => {
-            relay_view_lists_live_pending_requests_and_pending_cancels(store).await
+            Box::pin(relay_view_lists_live_pending_requests_and_pending_cancels(
+                store,
+            ))
+            .await
         }
         "deleting_a_project_takes_its_relay_rows" => {
-            deleting_a_project_takes_its_relay_rows(store).await
+            Box::pin(deleting_a_project_takes_its_relay_rows(store)).await
         }
-        "adopt_runs_never_leases_a_chat_run" => adopt_runs_never_leases_a_chat_run(store).await,
-        "update_spec_columns_roundtrip" => update_spec_columns_roundtrip(store).await,
-        "item_edit_reason_lands_in_revision" => item_edit_reason_lands_in_revision(store).await,
+        "adopt_runs_never_leases_a_chat_run" => {
+            Box::pin(adopt_runs_never_leases_a_chat_run(store)).await
+        }
+        "update_spec_columns_roundtrip" => Box::pin(update_spec_columns_roundtrip(store)).await,
+        "item_edit_reason_lands_in_revision" => {
+            Box::pin(item_edit_reason_lands_in_revision(store)).await
+        }
         "queued_at_ties_inside_a_microsecond_break_on_id" => {
-            queued_at_ties_inside_a_microsecond_break_on_id(store).await;
+            Box::pin(queued_at_ties_inside_a_microsecond_break_on_id(store)).await;
         }
         "phase_agents_are_written_whole_and_counted" => {
-            phase_agents_are_written_whole_and_counted(store).await;
+            Box::pin(phase_agents_are_written_whole_and_counted(store)).await;
         }
         "pass_step_writes_done_and_skipped_under_the_fence" => {
-            pass_step_writes_done_and_skipped_under_the_fence(store).await;
+            Box::pin(pass_step_writes_done_and_skipped_under_the_fence(store)).await;
         }
         "park_step_moves_step_run_and_item_or_nothing" => {
-            park_step_moves_step_run_and_item_or_nothing(store).await;
+            Box::pin(park_step_moves_step_run_and_item_or_nothing(store)).await;
         }
         "personas_are_listed_by_name_and_created_once" => {
-            personas_are_listed_by_name_and_created_once(store).await;
+            Box::pin(personas_are_listed_by_name_and_created_once(store)).await;
         }
-        "update_persona_is_a_compare_and_set" => update_persona_is_a_compare_and_set(store).await,
+        "update_persona_is_a_compare_and_set" => {
+            Box::pin(update_persona_is_a_compare_and_set(store)).await
+        }
         "persona_writers_refuse_every_widening_shape" => {
-            persona_writers_refuse_every_widening_shape(store).await;
+            Box::pin(persona_writers_refuse_every_widening_shape(store)).await;
         }
-        "a_phase_naming_no_persona_is_refused" => a_phase_naming_no_persona_is_refused(store).await,
+        "a_phase_naming_no_persona_is_refused" => {
+            Box::pin(a_phase_naming_no_persona_is_refused(store)).await
+        }
         "a_phase_persona_binding_sets_keeps_and_clears" => {
-            a_phase_persona_binding_sets_keeps_and_clears(store).await;
+            Box::pin(a_phase_persona_binding_sets_keeps_and_clears(store)).await;
         }
         "tool_call_counts_group_by_step_and_kind" => {
-            tool_call_counts_group_by_step_and_kind(store).await;
+            Box::pin(tool_call_counts_group_by_step_and_kind(store)).await;
         }
         "delete_persona_removes_an_unbound_row_once" => {
-            delete_persona_removes_an_unbound_row_once(store).await;
+            Box::pin(delete_persona_removes_an_unbound_row_once(store)).await;
         }
         "a_bound_persona_is_not_deleted_and_names_its_phases" => {
-            a_bound_persona_is_not_deleted_and_names_its_phases(store).await;
+            Box::pin(a_bound_persona_is_not_deleted_and_names_its_phases(store)).await;
         }
         "a_persona_bound_to_many_phases_names_five_and_counts_the_rest" => {
-            a_persona_bound_to_many_phases_names_five_and_counts_the_rest(store).await;
+            Box::pin(a_persona_bound_to_many_phases_names_five_and_counts_the_rest(store)).await;
         }
-        "hand_written_rows_round_trip" => hand_written_rows_round_trip(store).await,
+        "hand_written_rows_round_trip" => Box::pin(hand_written_rows_round_trip(store)).await,
         "record_opening_lands_on_the_run_summary_and_bumps_updated_at" => {
-            record_opening_lands_on_the_run_summary_and_bumps_updated_at(store).await;
+            Box::pin(record_opening_lands_on_the_run_summary_and_bumps_updated_at(store)).await;
         }
         "write_step_document_fenced_and_versioned" => {
-            write_step_document_fenced_and_versioned(store).await;
+            Box::pin(write_step_document_fenced_and_versioned(store)).await;
         }
         "write_step_document_refuses_a_foreign_item" => {
-            write_step_document_refuses_a_foreign_item(store).await;
+            Box::pin(write_step_document_refuses_a_foreign_item(store)).await;
         }
-        "add_step_note_fenced_on_its_own_item" => add_step_note_fenced_on_its_own_item(store).await,
+        "add_step_note_fenced_on_its_own_item" => {
+            Box::pin(add_step_note_fenced_on_its_own_item(store)).await
+        }
         "propose_link_upserts_revives_and_keeps_a_live_proposer" => {
-            propose_link_upserts_revives_and_keeps_a_live_proposer(store).await;
+            Box::pin(propose_link_upserts_revives_and_keeps_a_live_proposer(
+                store,
+            ))
+            .await;
         }
         "withdraw_link_only_what_this_run_proposed" => {
-            withdraw_link_only_what_this_run_proposed(store).await;
+            Box::pin(withdraw_link_only_what_this_run_proposed(store)).await;
         }
         "item_by_key_answers_within_its_project" => {
-            item_by_key_answers_within_its_project(store).await;
+            Box::pin(item_by_key_answers_within_its_project(store)).await;
         }
         "enqueue_command_queues_on_an_existing_step" => {
-            enqueue_command_queues_on_an_existing_step(store).await;
+            Box::pin(enqueue_command_queues_on_an_existing_step(store)).await;
         }
         "claim_command_admits_up_to_the_limit_in_queue_order" => {
-            claim_command_admits_up_to_the_limit_in_queue_order(store).await;
+            Box::pin(claim_command_admits_up_to_the_limit_in_queue_order(store)).await;
         }
-        "beat_and_finish_need_the_claimant" => beat_and_finish_need_the_claimant(store).await,
+        "beat_and_finish_need_the_claimant" => {
+            Box::pin(beat_and_finish_need_the_claimant(store)).await
+        }
         "cancel_command_ends_a_queued_or_running_row" => {
-            cancel_command_ends_a_queued_or_running_row(store).await;
+            Box::pin(cancel_command_ends_a_queued_or_running_row(store)).await;
         }
         "waiting_candidates_hold_every_park_and_nothing_else" => {
-            waiting_candidates_hold_every_park_and_nothing_else(store).await;
+            Box::pin(waiting_candidates_hold_every_park_and_nothing_else(store)).await;
         }
         "open_permissions_list_live_pending_item_requests" => {
-            open_permissions_list_live_pending_item_requests(store).await;
+            Box::pin(open_permissions_list_live_pending_item_requests(store)).await;
         }
         "a_follow_up_is_refused_in_the_documented_order" => {
-            a_follow_up_is_refused_in_the_documented_order(store).await;
+            Box::pin(a_follow_up_is_refused_in_the_documented_order(store)).await;
         }
         "a_step_has_at_most_one_pending_follow_up" => {
-            a_step_has_at_most_one_pending_follow_up(store).await;
+            Box::pin(a_step_has_at_most_one_pending_follow_up(store)).await;
         }
         "settling_a_follow_up_is_a_fenced_compare_and_set" => {
-            settling_a_follow_up_is_a_fenced_compare_and_set(store).await;
+            Box::pin(settling_a_follow_up_is_a_fenced_compare_and_set(store)).await;
         }
         "closing_the_window_refuses_what_is_still_queued" => {
-            closing_the_window_refuses_what_is_still_queued(store).await;
+            Box::pin(closing_the_window_refuses_what_is_still_queued(store)).await;
         }
         "opening_a_window_refuses_an_older_windows_follow_up" => {
-            opening_a_window_refuses_an_older_windows_follow_up(store).await;
+            Box::pin(opening_a_window_refuses_an_older_windows_follow_up(store)).await;
         }
         "a_cancel_refuses_the_runs_pending_follow_ups" => {
-            a_cancel_refuses_the_runs_pending_follow_ups(store).await;
+            Box::pin(a_cancel_refuses_the_runs_pending_follow_ups(store)).await;
         }
         "pending_commands_list_cancels_only" => {
-            pending_commands_list_cancels_only(store).await;
+            Box::pin(pending_commands_list_cancels_only(store)).await;
         }
         "relay_view_lists_the_newest_follow_up_per_step_without_text" => {
-            relay_view_lists_the_newest_follow_up_per_step_without_text(store).await;
+            Box::pin(relay_view_lists_the_newest_follow_up_per_step_without_text(
+                store,
+            ))
+            .await;
         }
         "closing_a_dropped_walks_windows_needs_the_lease" => {
-            closing_a_dropped_walks_windows_needs_the_lease(store).await;
+            Box::pin(closing_a_dropped_walks_windows_needs_the_lease(store)).await;
         }
-        "lease_holds_reads_the_owner" => lease_holds_reads_the_owner(store).await,
+        "lease_holds_reads_the_owner" => Box::pin(lease_holds_reads_the_owner(store)).await,
         "queue_setting_on_a_project_merges_under_cas_and_keeps_foreign_keys" => {
-            queue_setting_on_a_project_merges_under_cas_and_keeps_foreign_keys(store).await
+            Box::pin(queue_setting_on_a_project_merges_under_cas_and_keeps_foreign_keys(store))
+                .await
         }
         "queue_setting_on_app_upserts_and_refuses_a_stale_token" => {
-            queue_setting_on_app_upserts_and_refuses_a_stale_token(store).await
+            Box::pin(queue_setting_on_app_upserts_and_refuses_a_stale_token(
+                store,
+            ))
+            .await
         }
         "clear_queue_setting_removes_the_key_on_every_target" => {
-            clear_queue_setting_removes_the_key_on_every_target(store).await
+            Box::pin(clear_queue_setting_removes_the_key_on_every_target(store)).await
         }
         "queue_setting_on_a_box_merges_under_edit_version_and_keeps_executor" => {
-            queue_setting_on_a_box_merges_under_edit_version_and_keeps_executor(store).await
+            Box::pin(queue_setting_on_a_box_merges_under_edit_version_and_keeps_executor(store))
+                .await
         }
         "queue_setting_refuses_a_foreign_key_and_a_bad_value_before_the_row" => {
-            queue_setting_refuses_a_foreign_key_and_a_bad_value_before_the_row(store).await
+            Box::pin(queue_setting_refuses_a_foreign_key_and_a_bad_value_before_the_row(store))
+                .await
         }
         "stop_workspace_upserts_and_escalates_never_downgrades" => {
-            stop_workspace_upserts_and_escalates_never_downgrades(store).await;
+            Box::pin(stop_workspace_upserts_and_escalates_never_downgrades(store)).await;
         }
         "resume_workspace_deletes_and_reports" => {
-            resume_workspace_deletes_and_reports(store).await;
+            Box::pin(resume_workspace_deletes_and_reports(store)).await;
         }
         "stop_run_is_a_fenced_cas_on_running" => {
-            stop_run_is_a_fenced_cas_on_running(store).await;
+            Box::pin(stop_run_is_a_fenced_cas_on_running(store)).await;
         }
         "a_stopped_run_holds_no_slot_but_still_overlaps" => {
-            a_stopped_run_holds_no_slot_but_still_overlaps(store).await;
+            Box::pin(a_stopped_run_holds_no_slot_but_still_overlaps(store)).await;
         }
         "claim_run_refuses_a_stopped_workspace_and_writes_nothing" => {
-            claim_run_refuses_a_stopped_workspace_and_writes_nothing(store).await;
+            Box::pin(claim_run_refuses_a_stopped_workspace_and_writes_nothing(
+                store,
+            ))
+            .await;
         }
         "claim_run_checks_the_stop_before_tags" => {
-            claim_run_checks_the_stop_before_tags(store).await;
+            Box::pin(claim_run_checks_the_stop_before_tags(store)).await;
         }
         "claim_run_admits_after_resume" => {
-            claim_run_admits_after_resume(store).await;
+            Box::pin(claim_run_admits_after_resume(store)).await;
         }
         "a_run_without_a_workspace_is_never_gated" => {
-            a_run_without_a_workspace_is_never_gated(store).await;
+            Box::pin(a_run_without_a_workspace_is_never_gated(store)).await;
         }
         "adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped" => {
-            adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped(store).await;
+            Box::pin(adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped(store)).await;
         }
         "a_deleted_workspace_unscopes_its_runs_and_drops_its_stop" => {
-            a_deleted_workspace_unscopes_its_runs_and_drops_its_stop(store).await;
+            Box::pin(a_deleted_workspace_unscopes_its_runs_and_drops_its_stop(
+                store,
+            ))
+            .await;
         }
-        // MOD-137: boxed, so the graph v2 cases' futures (each holding a whole `replace_graph`)
-        // do not widen this match's future. The stack overflow itself is fixed by `run_case`'s
-        // one outer box (073b8462), which moves the whole match off the stack; these only keep
-        // that one heap allocation, which every case pays, from growing to the largest graph case.
         "replace_graph_applies_nodes_edges_and_bumps_revision" => {
             Box::pin(replace_graph_applies_nodes_edges_and_bumps_revision(store)).await;
         }

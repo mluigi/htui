@@ -3805,6 +3805,9 @@ impl WriteStore for PgStore {
     /// forced immediate before the read-back, so a clash the pre-reads missed surfaces at a
     /// statement, never at `COMMIT`.
     ///
+    /// The nested writers and reads are boxed: inline, their futures made this one's poll frame
+    /// overflow the 2 MiB debug test stack under the conformance suite.
+    ///
     /// # Errors
     ///
     /// The trait's, in its order; anything else through [`map_sqlx`].
@@ -3838,7 +3841,7 @@ impl WriteStore for PgStore {
         .map_err(map_sqlx)?;
         let Some(owner) = owner else {
             tx.rollback().await.map_err(map_sqlx)?;
-            return match self.graph_body(graph).await? {
+            return match Box::pin(self.graph_body(graph)).await? {
                 None => Err(StoreError::NotFound {
                     entity: "step_graph",
                     id: graph.to_string(),
@@ -4026,11 +4029,11 @@ impl WriteStore for PgStore {
         for node in &body.nodes {
             let phase = &node.phase;
             if kept.contains(&phase.id) {
-                update_kept_phase(&mut tx, phase)
+                Box::pin(update_kept_phase(&mut tx, phase))
                     .await
                     .map_err(|err| phase_fk_refused(err, phase))?;
             } else {
-                insert_phase(&mut *tx, phase)
+                Box::pin(insert_phase(&mut *tx, phase))
                     .await
                     .map_err(|err| phase_fk_refused(err, phase))?;
             }
@@ -4060,10 +4063,10 @@ impl WriteStore for PgStore {
             .map_err(map_sqlx)?;
         }
         for part in body.nodes.iter().flat_map(|node| &node.parts) {
-            insert_part(&mut tx, part).await?;
+            Box::pin(insert_part(&mut tx, part)).await?;
         }
         for edge in &body.edges {
-            insert_edge(&mut *tx, edge).await?;
+            Box::pin(insert_edge(&mut *tx, edge)).await?;
         }
 
         // 12. F6's backstop: a clash the pre-reads missed is a statement error here.
@@ -4073,11 +4076,13 @@ impl WriteStore for PgStore {
             .map_err(map_sqlx)?;
 
         // 13-14. What this transaction wrote, then commit.
-        let written = graph_body_on(&mut tx, graph).await?.ok_or_else(|| {
-            StoreError::Backend(format!(
-                "step_graph `{graph}` vanished inside its own replace"
-            ))
-        })?;
+        let written = Box::pin(graph_body_on(&mut tx, graph))
+            .await?
+            .ok_or_else(|| {
+                StoreError::Backend(format!(
+                    "step_graph `{graph}` vanished inside its own replace"
+                ))
+            })?;
         tx.commit().await.map_err(map_sqlx)?;
         Ok(CasOutcome::Applied(written))
     }
