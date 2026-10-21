@@ -2861,7 +2861,11 @@ async fn the_empty_states_carry_a_next_step() {
 #[tokio::test]
 async fn the_section_reports_its_scroll_for_the_pane() {
     let (bench, mut section, snapshot) = bench_with_demo().await;
-    assert_eq!(section.scroll(), None, "nothing is drawn yet");
+    assert_eq!(
+        section.scroll().map(|span| (span.total, span.offset)),
+        None,
+        "nothing is drawn yet"
+    );
     let rows = 1 + snapshot.projects[0]
         .kinds
         .iter()
@@ -2872,9 +2876,17 @@ async fn the_section_reports_its_scroll_for_the_pane() {
         })
         .sum::<usize>();
 
-    // In the pane's terms (D-11): the notice line under the tree is a row the tree cannot use.
+    // The tree's own rows (RV1 M2): the notice line under it is not padded in.
     let _ = drawn_at(&bench, &section, 100, 10);
-    assert_eq!(section.scroll(), Some((rows + 1, 0)));
+    assert_eq!(
+        section.scroll().map(|span| (span.total, span.offset)),
+        Some((rows, 0))
+    );
+    let tree = section
+        .scroll()
+        .and_then(|span| span.rows)
+        .expect("the tree's rows");
+    assert_eq!(tree.height, 9, "the rows above the notice line");
 
     // The last kind, `TOOL`, with its three phases under it: a kind row has no detail line.
     let tool = rows - 4;
@@ -2883,7 +2895,10 @@ async fn the_section_reports_its_scroll_for_the_pane() {
     }
     let buffer = drawn_at(&bench, &section, 100, 10);
     // Nine rows above the notice line; the cursor's is the last of them.
-    assert_eq!(section.scroll(), Some((rows + 1, tool - 8)));
+    assert_eq!(
+        section.scroll().map(|span| (span.total, span.offset)),
+        Some((rows, tool - 8))
+    );
     let last: String = (0..100).map(|x| buffer[(x, 8)].symbol()).collect();
     assert!(
         last.starts_with('\u{258c}') && last.contains("TOOL"),
@@ -2927,8 +2942,8 @@ fn framed_at(
             let area = frame.area();
             section.render(frame, Pane::inner(area), &ctx);
             let mut pane = Pane::new(section.title());
-            if let Some((total, offset)) = section.scroll() {
-                pane = pane.scrollbar(total, offset);
+            if let Some(span) = section.scroll() {
+                pane = pane.scroll(span);
             }
             let _ = pane.render(frame, area, &theme);
         })
@@ -2944,9 +2959,9 @@ fn thumb_rows(buffer: &Buffer) -> Vec<u16> {
         .collect()
 }
 
-/// MOD-115 M3 D-11: the pane measures its bar against its whole inner rect, so the section
-/// reports its scroll in the pane's terms. A thumb shows exactly when a tree row is hidden: the
-/// notice line, and an open editor, are rows under the tree it cannot use.
+/// MOD-115 M3 D-11, RV1 M2: the pane measures its bar against the rows the section says it
+/// scrolls, the tree's. A thumb shows exactly when a tree row is hidden: the notice line, and an
+/// open editor, are rows under the tree it cannot use.
 #[tokio::test]
 async fn the_pane_draws_a_thumb_exactly_when_a_tree_row_is_hidden() {
     let (bench, mut section, snapshot) = bench_with_demo().await;
@@ -2969,10 +2984,23 @@ async fn the_pane_draws_a_thumb_exactly_when_a_tree_row_is_hidden() {
     let editing = framed_at(&bench, &section, 100, height);
     let thumb = thumb_rows(&editing);
     assert!(!thumb.is_empty(), "the form hides tree rows");
+    // RV1 M2: beside the tree's rows only, never the editor's under them.
+    let tree = section
+        .scroll()
+        .and_then(|span| span.rows)
+        .expect("the tree's rows");
+    assert!(
+        tree.bottom() < height - 1,
+        "the editor takes rows: {tree:?}"
+    );
     assert_eq!(
         thumb.last(),
-        Some(&(height - 2)),
-        "scrolled to the end, the thumb sits at the bottom: {thumb:?}"
+        Some(&(tree.bottom() - 1)),
+        "scrolled to the end, the thumb sits beside the tree's last row: {thumb:?}"
+    );
+    assert!(
+        thumb.iter().all(|y| (tree.y..tree.bottom()).contains(y)),
+        "{thumb:?}"
     );
 }
 

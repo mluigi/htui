@@ -49,14 +49,14 @@ pub enum Focus {
 #[derive(Debug, Clone)]
 pub struct Pane<'a> {
     title: &'a str,
-    sub_tabs: Vec<&'a str>,
+    sub_tabs: &'a [&'a str],
     active: usize,
     hints: Option<Line<'a>>,
     note: Option<Line<'a>>,
     focus: Focus,
     accent: Option<Style>,
     scrollbar: Option<(usize, usize)>,
-    span: Option<(u16, u16)>,
+    span: Option<Rect>,
 }
 
 impl<'a> Pane<'a> {
@@ -65,7 +65,7 @@ impl<'a> Pane<'a> {
     pub fn new(title: &'a str) -> Self {
         Self {
             title,
-            sub_tabs: Vec::new(),
+            sub_tabs: &[],
             active: 0,
             hints: None,
             note: None,
@@ -78,8 +78,8 @@ impl<'a> Pane<'a> {
 
     /// Sub-tab chips on the top border, `active` being the current one.
     #[must_use]
-    pub fn sub_tabs(mut self, titles: &[&'a str], active: usize) -> Self {
-        self.sub_tabs = titles.to_vec();
+    pub fn sub_tabs(mut self, titles: &'a [&'a str], active: usize) -> Self {
+        self.sub_tabs = titles;
         self.active = active;
         self
     }
@@ -121,13 +121,25 @@ impl<'a> Pane<'a> {
         self
     }
 
-    /// Keeps the scrollbar beside inner rows `top..top + height` only (Chat's transcript, between
-    /// its banner and its composer), measured against that span's height. The default is the
-    /// whole inner rect; a span past it is cut to it.
+    /// Keeps the scrollbar beside the rows of `rows` only (Chat's transcript, between its banner
+    /// and its composer), measured against their height. `rows` is an absolute rect, the one the
+    /// scrolled content was drawn into; it is cut to the inner rect, so a rect past it loses the
+    /// rows it does not share. The default is the whole inner rect.
     #[must_use]
-    pub fn scrollbar_span(mut self, top: u16, height: u16) -> Self {
-        self.span = Some((top, height));
+    pub fn scrollbar_span(mut self, rows: Rect) -> Self {
+        self.span = Some(rows);
         self
+    }
+
+    /// [`scrollbar`](Self::scrollbar) and, when the span names its rows,
+    /// [`scrollbar_span`](Self::scrollbar_span), from one [`ScrollSpan`].
+    #[must_use]
+    pub fn scroll(self, span: ScrollSpan) -> Self {
+        let pane = self.scrollbar(span.total, span.offset);
+        match span.rows {
+            Some(rows) => pane.scrollbar_span(rows),
+            None => pane,
+        }
     }
 
     /// The inner rect a pane drawn into `area` gives its content, without drawing it: what
@@ -152,19 +164,23 @@ impl<'a> Pane<'a> {
             .border_style(border);
         let inner = Self::inner(area);
         frame.render_widget(block, area);
-        if area.width < 2 || area.height == 0 {
+        let buf = frame.buffer_mut();
+        // The border rows and the right edge are written cell by cell below: a pane whose rect
+        // runs past the buffer draws only what lies on it (RV1 L4).
+        let top_on = area.y < buf.area.bottom() && area.y >= buf.area.y;
+        if area.width < 2 || area.height == 0 || area.intersection(buf.area).is_empty() {
             return inner;
         }
-        let buf = frame.buffer_mut();
 
         // The chips and marks are patched over the border, bold when focused in monochrome: the
         // border's bold is taken off all but the active chip, so only it reads bold (MOD-80 D5).
         let faint = theme.dim.remove_modifier(Modifier::BOLD);
-        let strip = chip_strip(area, &self.sub_tabs, self.active);
+        let strip = chip_strip(area, self.sub_tabs, self.active);
         let mut limit = area.right() - 1;
         let mut cut = false;
-        for (index, (rect, title)) in strip.chips.iter().zip(&self.sub_tabs).enumerate() {
-            if usize::from(rect.width) < cells::cell_width(title) + 2 {
+        for (index, (rect, title)) in strip.chips.iter().zip(self.sub_tabs).enumerate() {
+            let wanted = cells::cell_width(title) + 2;
+            if usize::from(rect.width) < wanted {
                 cut = true;
             }
             if rect.width == 0 {
@@ -176,46 +192,67 @@ impl<'a> Pane<'a> {
             } else {
                 faint
             };
-            let chip = Line::from(vec![
-                Span::raw(" "),
-                Span::styled((*title).to_owned(), label_style),
-                Span::raw(" "),
-            ]);
-            let chip = cells::clip_line(chip, rect.width);
-            buf.set_line(rect.x, rect.y, &chip, rect.width);
+            if !top_on {
+                continue;
+            }
+            // A chip that fits is drawn from the borrowed title; only a clipped one is built.
+            if usize::from(rect.width) >= wanted && plain(title) {
+                put(buf, rect.x, rect.y, " ", rect.width, Style::new());
+                put(buf, rect.x + 1, rect.y, title, rect.width - 1, label_style);
+                put(buf, rect.right() - 1, rect.y, " ", 1, Style::new());
+            } else {
+                let chip = Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(*title, label_style),
+                    Span::raw(" "),
+                ]);
+                let chip = cells::clip_line(chip, rect.width);
+                set_line(buf, rect.x, rect.y, &chip, rect.width);
+            }
         }
         for (mark, glyph) in [(strip.before, BEFORE), (strip.after, AFTER)] {
             if let Some(rect) = mark {
                 limit = limit.min(rect.x);
-                buf.set_stringn(rect.x, rect.y, glyph, 1, faint);
+                if top_on {
+                    put(buf, rect.x, rect.y, glyph, 1, faint);
+                }
             }
         }
 
         // The title gives way before any chip does (MOD-115 M3 D-10): once one is cut off, the
         // active chip carries the name and the title is not drawn at all.
-        if !self.title.is_empty() && !cut {
+        if !self.title.is_empty() && !cut && top_on {
             let start = area.x + 2;
-            let room = usize::from(limit.saturating_sub(1).saturating_sub(start));
+            let room = limit.saturating_sub(1).saturating_sub(start);
             if room > 2 {
-                let text = cells::clip(&format!(" {} ", self.title), room);
                 let style = if focused {
                     border.add_modifier(Modifier::BOLD)
                 } else {
                     theme.dim
                 };
-                buf.set_stringn(start, area.y, text, room, style);
+                // ` title `, built only when it has to be clipped.
+                let width = cells::cell_width(self.title) + 2;
+                if width <= usize::from(room) && plain(self.title) {
+                    put(buf, start, area.y, " ", 1, style);
+                    put(buf, start + 1, area.y, self.title, room - 1, style);
+                    let end = start + u16::try_from(width).unwrap_or(room) - 1;
+                    put(buf, end, area.y, " ", 1, style);
+                } else {
+                    let text = cells::clip(&format!(" {} ", self.title), usize::from(room));
+                    put(buf, start, area.y, &text, room, style);
+                }
             }
         }
 
+        // The hints are painted over the rule cells they take and no other: a hint line's own
+        // style (`chips::key_line`'s `theme.dim`) must not restyle the rest of the bottom rule,
+        // nor stack on the border's bold in monochrome (RV1 H1).
         if focused
             && let Some(hints) = self.hints
             && area.height >= 2
         {
-            let width = area.width.saturating_sub(4);
-            if width > 0 {
-                let line = cells::clip_line(hints, width);
-                line.render(Rect::new(area.x + 2, area.bottom() - 1, width, 1), buf);
-            }
+            let row = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+            paint_bottom_hints(buf, row, hints, Style::new());
         }
 
         if let Some(note) = self.note
@@ -226,17 +263,41 @@ impl<'a> Pane<'a> {
         }
 
         if let Some((total, offset)) = self.scrollbar {
-            let rows = match self.span {
-                Some((top, height)) => {
-                    let top = top.min(inner.height);
-                    let height = height.min(inner.height - top);
-                    Rect::new(inner.x, inner.y + top, inner.width, height)
-                }
-                None => inner,
-            };
+            let rows = self.span.map_or(inner, |rows| rows.intersection(inner));
             paint_scrollbar(buf, area, rows, total, offset, border);
         }
         inner
+    }
+}
+
+/// What scrolls in a view, for its pane's scrollbar (MOD-115 M3 RV1 M2): `total` rows scrolled
+/// to `offset`, beside `rows` (absolute, as drawn) or, when `None`, the whole inner rect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollSpan {
+    /// The rows in all.
+    pub total: usize,
+    /// The first row shown.
+    pub offset: usize,
+    /// The rect the rows are drawn into; `None` is the pane's whole inner rect.
+    pub rows: Option<Rect>,
+}
+
+impl ScrollSpan {
+    /// `total` rows scrolled to `offset`, beside the whole inner rect.
+    #[must_use]
+    pub const fn new(total: usize, offset: usize) -> Self {
+        Self {
+            total,
+            offset,
+            rows: None,
+        }
+    }
+
+    /// Beside `rows` only: the rect the scrolled rows are drawn into.
+    #[must_use]
+    pub const fn rows(mut self, rows: Rect) -> Self {
+        self.rows = Some(rows);
+        self
     }
 }
 
@@ -261,8 +322,32 @@ fn paint_scrollbar(
     let top = (offset * travel + max / 2) / max;
     let x = area.right() - 1;
     for row in top..top + length {
-        let y = rows.y + u16::try_from(row).unwrap_or(u16::MAX);
-        buf[(x, y)].set_symbol(THUMB).set_style(style);
+        let y = rows
+            .y
+            .saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
+        if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+            cell.set_symbol(THUMB).set_style(style);
+        }
+    }
+}
+
+/// Whether `text` holds no control character, so it draws as it is, without
+/// `cells::clip`'s flattening (a control character is one blank cell there).
+fn plain(text: &str) -> bool {
+    !text.chars().any(char::is_control)
+}
+
+/// `text` at `(x, y)`, at most `width` cells, when that cell is on `buf`; else nothing.
+fn put(buf: &mut Buffer, x: u16, y: u16, text: &str, width: u16, style: Style) {
+    if buf.area.contains(Position::new(x, y)) {
+        buf.set_stringn(x, y, text, usize::from(width), style);
+    }
+}
+
+/// [`Buffer::set_line`] when `(x, y)` is on `buf`; else nothing.
+fn set_line(buf: &mut Buffer, x: u16, y: u16, line: &Line<'_>, width: u16) {
+    if buf.area.contains(Position::new(x, y)) {
+        buf.set_line(x, y, line, width);
     }
 }
 
@@ -901,7 +986,7 @@ mod tests {
                 &Theme::default(),
                 Pane::new("")
                     .scrollbar(20, offset)
-                    .scrollbar_span(span.0, span.1),
+                    .scrollbar_span(Rect::new(1, 1 + span.0, 8, span.1)),
             );
             (0..10)
                 .filter(|&y| buffer[(9, y)].symbol() == THUMB)
@@ -924,7 +1009,9 @@ mod tests {
             10,
             10,
             &Theme::default(),
-            Pane::new("").scrollbar(3, 0).scrollbar_span(0, 4),
+            Pane::new("")
+                .scrollbar(3, 0)
+                .scrollbar_span(Rect::new(1, 1, 8, 4)),
         );
         assert!((0..10).all(|y| buffer[(9, y)].symbol() != THUMB));
     }
@@ -1425,6 +1512,133 @@ mod tests {
             row(&tight, 3),
             "╰─enter open─z unzo…─╯",
             "the note never runs into the hints"
+        );
+    }
+
+    /// RV1 H1: a hint line with a style of its own (`chips::key_line`'s `theme.dim`) styles its
+    /// own cells only; the rule past it keeps the focused border's accent, and in monochrome the
+    /// rule stays bold, not dim, while the hint cells are dim, not bold.
+    #[test]
+    fn a_styled_hint_line_restyles_only_its_own_cells() {
+        let theme = Theme::default();
+        let pane = Pane::new("T")
+            .hints(Line::styled("enter open", theme.dim))
+            .focus(Focus::Focused)
+            .accent(accent());
+        let (buffer, _) = draw(24, 4, &theme, pane);
+        assert_eq!(row(&buffer, 3), format!("╰─enter open{}╯", "─".repeat(11)));
+        for x in [0, 1, 12, 17, 22, 23] {
+            assert_eq!(buffer[(x, 3)].fg, Color::Magenta, "rule cell {x}");
+        }
+        for x in 2..12 {
+            assert_eq!(Some(buffer[(x, 3)].fg), theme.dim.fg, "hint cell {x}");
+        }
+
+        let mono = Theme::monochrome();
+        let pane = Pane::new("T")
+            .hints(Line::styled("enter open", mono.dim))
+            .focus(Focus::Focused)
+            .accent(mono.tab_accent("settings"));
+        let (buffer, _) = draw(24, 4, &mono, pane);
+        for x in [1, 12, 17, 22] {
+            let cell = &buffer[(x, 3)];
+            assert!(
+                cell.modifier.contains(Modifier::BOLD),
+                "rule cell {x}: {cell:?}"
+            );
+            assert!(
+                !cell.modifier.contains(Modifier::DIM),
+                "rule cell {x}: {cell:?}"
+            );
+        }
+        for x in 2..12 {
+            let cell = &buffer[(x, 3)];
+            assert!(
+                cell.modifier.contains(Modifier::DIM),
+                "hint cell {x}: {cell:?}"
+            );
+            assert!(
+                !cell.modifier.contains(Modifier::BOLD),
+                "hint cell {x}: {cell:?}"
+            );
+        }
+    }
+
+    /// RV1 L4: a pane drawn into a rect that runs past the buffer draws what fits and never
+    /// indexes a cell outside it (the scrollbar did).
+    #[test]
+    fn a_pane_past_the_buffer_draws_what_fits() {
+        let theme = Theme::default();
+        let mut terminal = Terminal::new(TestBackend::new(12, 6)).expect("a test terminal");
+        terminal
+            .draw(|frame| {
+                for area in [
+                    Rect::new(0, 0, 16, 10),
+                    Rect::new(4, 3, 20, 20),
+                    Rect::new(30, 30, 6, 6),
+                ] {
+                    let _ = Pane::new("Title")
+                        .sub_tabs(&["Ab", "Cd"], 0)
+                        .hints(Line::from("x y"))
+                        .note(Line::from("n"))
+                        .focus(Focus::Focused)
+                        .scrollbar(40, 20)
+                        .render(frame, area, &theme);
+                }
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].symbol(), "╭");
+        assert_eq!(buffer[(4, 3)].symbol(), "╭");
+    }
+
+    /// RV1 L6: the scrollbar's span is an absolute rect, cut to the inner rect.
+    #[test]
+    fn the_scrollbar_span_is_an_absolute_rect_cut_to_the_inner_one() {
+        let thumb = |rows: Rect| -> Vec<u16> {
+            let (buffer, _) = draw(
+                10,
+                10,
+                &Theme::default(),
+                Pane::new("").scrollbar(20, 99).scrollbar_span(rows),
+            );
+            (0..10)
+                .filter(|&y| buffer[(9, y)].symbol() == THUMB)
+                .collect()
+        };
+        // Terminal rows 3..=6: the thumb ends on row 6.
+        assert_eq!(thumb(Rect::new(1, 3, 8, 4)), vec![6]);
+        // A rect past the inner one (rows 1..=8) is cut to it, above and below.
+        assert_eq!(thumb(Rect::new(0, 7, 10, 10)), vec![8]);
+        assert!(
+            thumb(Rect::new(0, 0, 10, 3))
+                .iter()
+                .all(|y| (1..=2).contains(y))
+        );
+        // A rect clear of the inner one draws no thumb.
+        assert!(thumb(Rect::new(0, 20, 10, 4)).is_empty());
+    }
+
+    /// RV1 M2: a [`ScrollSpan`] carries its rows to the pane in one call.
+    #[test]
+    fn a_scroll_span_sets_the_total_the_offset_and_the_rows() {
+        let span = ScrollSpan::new(20, 99).rows(Rect::new(1, 3, 8, 4));
+        assert_eq!((span.total, span.offset), (20, 99));
+        let (buffer, _) = draw(10, 10, &Theme::default(), Pane::new("").scroll(span));
+        let rows: Vec<u16> = (0..10)
+            .filter(|&y| buffer[(9, y)].symbol() == THUMB)
+            .collect();
+        assert_eq!(rows, vec![6]);
+        let (whole, _) = draw(
+            10,
+            10,
+            &Theme::default(),
+            Pane::new("").scroll(ScrollSpan::new(20, 99)),
+        );
+        assert_eq!(
+            whole[(9, 8)].symbol(),
+            THUMB,
+            "no rows: the whole inner rect"
         );
     }
 }

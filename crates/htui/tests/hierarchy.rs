@@ -3764,17 +3764,27 @@ async fn the_section_reports_its_scroll_for_the_pane() {
     let bench = SectionBench::new().await;
     let tree = tree_with_two_repos(&demo()).await;
     let mut section = picker_section(&bench, tree, None);
-    assert_eq!(section.scroll(), None, "nothing is drawn yet");
+    assert_eq!(
+        section.scroll().map(|span| (span.total, span.offset)),
+        None,
+        "nothing is drawn yet"
+    );
 
     // Four tree rows (workspace, project, two repos) over three, the notice line under them.
     let _ = drawn_at(&bench, &section, 100, 4);
-    assert_eq!(section.scroll(), Some((5, 0)));
+    assert_eq!(
+        section.scroll().map(|span| (span.total, span.offset)),
+        Some((5, 0))
+    );
 
     for _ in 0..3 {
         bench.key(&mut section, "j");
     }
     let buffer = drawn_at(&bench, &section, 100, 4);
-    assert_eq!(section.scroll(), Some((5, 1)));
+    assert_eq!(
+        section.scroll().map(|span| (span.total, span.offset)),
+        Some((5, 1))
+    );
     let last = row_text(&buffer, 2);
     assert!(
         last.starts_with('\u{258c}') && last.contains("beta"),

@@ -1921,10 +1921,17 @@ async fn the_empty_states_carry_a_next_step() {
 #[tokio::test]
 async fn the_section_reports_its_scroll_for_the_pane() {
     let (bench, section) = bench_with_demo().await;
-    assert_eq!(section.scroll(), None, "nothing is drawn yet");
+    assert_eq!(
+        section.scroll().map(|span| (span.total, span.offset)),
+        None,
+        "nothing is drawn yet"
+    );
     let _ = frame(&bench, &section);
     // Two rows and the cursor row's one detail line.
-    assert_eq!(section.scroll(), Some((3, 0)));
+    assert_eq!(
+        section.scroll().map(|span| (span.total, span.offset)),
+        Some((3, 0))
+    );
 }
 
 /// One section drawn inside a kit pane as the Settings tab draws it (MOD-115 M3 C3, D-11): the
@@ -1945,7 +1952,7 @@ fn framed_at(bench: &SectionBench, section: &dyn SettingsSection, height: u16) -
             let area = frame.area();
             section.render(frame, Pane::inner(area), &ctx);
             let mut pane = Pane::new(section.title());
-            if let Some((total, offset)) = section.scroll() {
+            if let Some((total, offset)) = section.scroll().map(|span| (span.total, span.offset)) {
                 pane = pane.scrollbar(total, offset);
             }
             let _ = pane.render(frame, area, &theme);
@@ -1998,11 +2005,20 @@ async fn the_pane_draws_a_thumb_exactly_when_a_row_is_hidden() {
         has_thumb(&framed_at(&bench, &section, 6)),
         "a long report has a bar"
     );
-    assert_eq!(section.scroll().map(|(_, offset)| offset), Some(0));
+    assert_eq!(
+        section
+            .scroll()
+            .map(|span| (span.total, span.offset))
+            .map(|(_, offset)| offset),
+        Some(0)
+    );
     bench.key(&mut section, "j");
     let _ = framed_at(&bench, &section, 6);
     assert_eq!(
-        section.scroll().map(|(_, offset)| offset),
+        section
+            .scroll()
+            .map(|span| (span.total, span.offset))
+            .map(|(_, offset)| offset),
         Some(1),
         "`j` scrolls the report, and the bar follows"
     );

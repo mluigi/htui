@@ -1064,7 +1064,7 @@ impl RequirementsTab {
         let offset = window(cursor.unwrap_or(0), rows.len(), usize::from(body.height));
         list::render(frame, body, &rows, cursor, offset, ctx.accent(), theme);
         pane.scrollbar(rows.len(), offset)
-            .scrollbar_span(band_rows, body.height)
+            .scrollbar_span(body)
             .render(frame, area, theme);
     }
 

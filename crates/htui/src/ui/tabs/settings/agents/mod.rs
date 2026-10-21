@@ -79,6 +79,7 @@ use crate::app::{Action, Ctx, Handled};
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::pane::ScrollSpan;
 use crate::ui::kit::text::{Tone, notice};
 use crate::ui::kit::{chips::key_line, modal::modal_rest};
 use crate::ui::tabs::settings::{
@@ -237,7 +238,7 @@ pub struct AgentsSection {
     notice: Option<String>,
     /// `(rows, offset)` as the last render drew the table, measured in the section's rows, for the
     /// Settings pane's scrollbar (MOD-115 M3 D-11); `None` while every row fits.
-    scroll: Cell<Option<(usize, usize)>>,
+    scroll: Cell<Option<ScrollSpan>>,
 }
 
 impl AgentsSection {
@@ -1088,8 +1089,10 @@ impl SettingsSection for AgentsSection {
             if total > shown {
                 // Measured in the section's rows, the pane's whole inner height being its
                 // viewport: the rows the table could not show are what the bar travels over.
-                self.scroll
-                    .set(Some((usize::from(area.height) + total - shown, offset)));
+                self.scroll.set(Some(ScrollSpan::new(
+                    usize::from(area.height) + total - shown,
+                    offset,
+                )));
             }
         }
         let buf = frame.buffer_mut();
@@ -1110,7 +1113,7 @@ impl SettingsSection for AgentsSection {
         }
     }
 
-    fn scroll(&self) -> Option<(usize, usize)> {
+    fn scroll(&self) -> Option<ScrollSpan> {
         self.scroll.get()
     }
 }

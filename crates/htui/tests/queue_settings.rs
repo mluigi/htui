@@ -1141,7 +1141,10 @@ async fn the_section_reports_its_scroll() {
     let snapshot = bench_settings(&demo()).await;
     let (bench, section) = bench_from(&snapshot).await;
     let _ = bench.render_section(&section, 100);
-    let (total, offset) = section.scroll().expect("the rows scroll");
+    let (total, offset) = section
+        .scroll()
+        .map(|span| (span.total, span.offset))
+        .expect("the rows scroll");
     assert_eq!(offset, 0);
     assert_eq!(
         total,

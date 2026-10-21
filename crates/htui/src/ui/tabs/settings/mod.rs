@@ -35,7 +35,7 @@ use crate::keys::{Act, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::kit::empty::{self, NextStep};
-use crate::ui::kit::pane::Pane;
+use crate::ui::kit::pane::{Pane, ScrollSpan};
 use crate::ui::shell::{PaneId, TabLoc};
 use crate::ui::tabs::registry::{Tab, TabId};
 use crossterm::event::KeyEvent;
@@ -180,11 +180,14 @@ pub trait SettingsSection {
     fn key_hint(&self, _keys: &Keys, _theme: &Theme) -> Option<Line<'static>> {
         None
     }
-    /// This section's scroll as of its last render, `(total rows, offset)`, for the Settings
-    /// pane's scrollbar (MOD-115 M3 D-11), or `None` when it does not scroll. A section draws
-    /// before the pane's frame (C3), so a section that scrolls records it in a `Cell` in its
+    /// This section's scroll as of its last render, for the Settings pane's scrollbar (MOD-115
+    /// M3 D-11), or `None` when it does not scroll: the rows in all, the first one shown and,
+    /// when the section scrolls only part of the pane, the rect those rows were drawn into
+    /// ([`ScrollSpan::rows`], RV1 M2), so the bar is measured against them and sits beside
+    /// them; without it, against the whole inner rect. A section draws before the pane's frame
+    /// (C3), so a section that scrolls records it in a `Cell` in its
     /// [`render`](SettingsSection::render). Defaulted to `None`.
-    fn scroll(&self) -> Option<(usize, usize)> {
+    fn scroll(&self) -> Option<ScrollSpan> {
         None
     }
 }
@@ -497,9 +500,9 @@ impl Tab for SettingsTab {
 
         let titles: Vec<&str> = self
             .sections
-            .titles()
-            .into_iter()
-            .map(|(_, title)| title)
+            .sections
+            .iter()
+            .map(|section| section.title())
             .collect();
         let mut pane = Pane::new(section.map_or("Settings", SettingsSection::title))
             .sub_tabs(&titles, self.sections.active)
@@ -508,8 +511,8 @@ impl Tab for SettingsTab {
         if let Some(hints) = section.and_then(|section| section.key_hint(ctx.keys(), ctx.theme)) {
             pane = pane.hints(hints);
         }
-        if let Some((total, offset)) = section.and_then(SettingsSection::scroll) {
-            pane = pane.scrollbar(total, offset);
+        if let Some(span) = section.and_then(SettingsSection::scroll) {
+            pane = pane.scroll(span);
         }
         pane.render(frame, area, ctx.theme);
     }
@@ -546,7 +549,7 @@ mod tests {
     struct Fake {
         title: &'static str,
         hint: Option<&'static str>,
-        scroll: Option<(usize, usize)>,
+        scroll: Option<ScrollSpan>,
     }
 
     impl Fake {
@@ -582,7 +585,7 @@ mod tests {
         fn key_hint(&self, _keys: &Keys, _theme: &Theme) -> Option<Line<'static>> {
             self.hint.map(Line::raw)
         }
-        fn scroll(&self) -> Option<(usize, usize)> {
+        fn scroll(&self) -> Option<ScrollSpan> {
             self.scroll
         }
     }
@@ -760,17 +763,49 @@ mod tests {
         let top = SettingsTab::with_sections(vec![Box::new(Fake {
             title: "Kinds",
             hint: None,
-            scroll: Some((32, 0)),
+            scroll: Some(ScrollSpan::new(32, 0)),
         })]);
         let bottom = SettingsTab::with_sections(vec![Box::new(Fake {
             title: "Kinds",
             hint: None,
-            scroll: Some((32, 24)),
+            scroll: Some(ScrollSpan::new(32, 24)),
         })]);
         let (top, bottom) = (thumb(&top), thumb(&bottom));
         assert_eq!(top.first(), Some(&1), "{top:?}");
         assert_eq!(bottom.last(), Some(&8), "{bottom:?}");
         assert!(top.len() < 8 && bottom.len() < 8, "{top:?} {bottom:?}");
+    }
+
+    /// RV1 M2: a section that scrolls part of the pane (a list over a notice line) says which
+    /// rows, and the bar is measured against them and sits beside them only: it reaches their
+    /// last row at the end and never the rows under them.
+    #[test]
+    fn the_scrollbar_sits_beside_the_rows_the_section_scrolls() {
+        // A 40 by 10 pane: inner rows 1..=8; the section scrolls rows 1..=6 over two of its own.
+        let rows = Rect::new(1, 1, 38, 6);
+        let thumb = |offset: usize| {
+            let tab = SettingsTab::with_sections(vec![Box::new(Fake {
+                title: "Kinds",
+                hint: None,
+                scroll: Some(ScrollSpan::new(12, offset).rows(rows)),
+            })]);
+            let buffer = draw(&tab, 40, 10, Some(PaneId::Detail), &Theme::default());
+            (1..9)
+                .filter(|&y| buffer[(39, y)].symbol() == "┃")
+                .collect::<Vec<u16>>()
+        };
+        assert_eq!(thumb(0).first(), Some(&1));
+        assert_eq!(
+            thumb(6).last(),
+            Some(&6),
+            "the end is the last scrolled row"
+        );
+        for offset in 0..12 {
+            assert!(
+                thumb(offset).iter().all(|y| (1..=6).contains(y)),
+                "{offset}"
+            );
+        }
     }
 
     /// MOD-80 D5: under the monochrome theme only modifiers can mark the active section, now a

@@ -2249,16 +2249,27 @@ async fn nothing_read_yet_says_how_to_read() {
     assert!(frame.contains("r reads the settings again"), "{frame}");
 }
 
-/// MOD-115 M3 D-11: the section reports its scroll in the pane's terms, and keeps the cursor and
-/// its help on screen in a short pane.
+/// MOD-115 M3 D-11, RV1 M2: the section reports its scroll against the rows the tree is drawn
+/// into, and keeps the cursor and its help on screen in a short pane.
 #[tokio::test]
 async fn the_section_scrolls_its_cursor_and_help_into_view() {
     let (bench, mut section, _) = bench_with(&demo()).await;
     let rows = SettingKey::app_keys().count() + project_keys().count() + 2;
     let _ = drawn(&bench, &section, 100);
-    let (total, offset) = section.scroll().expect("a tree scrolls");
+    let (total, offset) = section
+        .scroll()
+        .map(|span| (span.total, span.offset))
+        .expect("a tree scrolls");
     assert_eq!(offset, 0);
-    assert_eq!(total, rows + 1, "the tree and the notice line under it");
+    assert_eq!(
+        total, rows,
+        "the tree alone: the notice line under it is not padded in"
+    );
+    let tree = section
+        .scroll()
+        .and_then(|span| span.rows)
+        .expect("the tree's rows");
+    assert!(tree.height > 0, "{tree:?}");
 
     move_to(&bench, &mut section, rows - 1);
     let area = Rect::new(0, 0, 100, 8);
@@ -2286,7 +2297,10 @@ async fn the_section_scrolls_its_cursor_and_help_into_view() {
         "{text:#?}"
     );
     assert!(at + 1 < 7, "its help is on screen too: {text:#?}");
-    let (_, offset) = section.scroll().expect("a tree scrolls");
+    let (_, offset) = section
+        .scroll()
+        .map(|span| (span.total, span.offset))
+        .expect("a tree scrolls");
     assert!(offset > 0, "scrolled: {text:#?}");
 }
 

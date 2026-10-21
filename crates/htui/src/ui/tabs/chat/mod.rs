@@ -927,9 +927,7 @@ impl Tab for ChatTab {
             pane = pane.hints(hints);
         }
         if let Some((total, first)) = scroll {
-            pane = pane
-                .scrollbar(total, first)
-                .scrollbar_span(body.y.saturating_sub(inner.y), body.height);
+            pane = pane.scrollbar(total, first).scrollbar_span(body);
         }
         pane.render(frame, area, ctx.theme);
     }

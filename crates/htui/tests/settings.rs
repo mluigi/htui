@@ -6761,7 +6761,7 @@ async fn a_long_table_reports_its_scroll_and_keeps_the_cursor_in_view() {
         .collect();
     let mut section = section_over(&bench, rows);
     let _ = render_section(&section, &bench.ctx());
-    let Some((total, offset)) = section.scroll() else {
+    let Some((total, offset)) = section.scroll().map(|span| (span.total, span.offset)) else {
         panic!("40 rows do not fit 30");
     };
     assert_eq!(offset, 0, "the cursor starts on the first row");
@@ -6780,9 +6780,15 @@ async fn a_long_table_reports_its_scroll_and_keeps_the_cursor_in_view() {
             .any(|line| line.starts_with("agent-39")),
         "the cursor's row is drawn: {rendered}"
     );
-    assert_eq!(section.scroll().map(|(_, offset)| offset), Some(12));
+    assert_eq!(
+        section
+            .scroll()
+            .map(|span| (span.total, span.offset))
+            .map(|(_, offset)| offset),
+        Some(12)
+    );
 
     let short = section_over(&bench, vec![registry_row("alpha", false)]);
     let _ = render_section(&short, &bench.ctx());
-    assert_eq!(short.scroll(), None);
+    assert_eq!(short.scroll().map(|span| (span.total, span.offset)), None);
 }

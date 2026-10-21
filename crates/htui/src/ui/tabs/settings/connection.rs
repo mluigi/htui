@@ -50,6 +50,7 @@ use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::form::{self, Form, Value};
 use crate::ui::kit::label::plural;
 use crate::ui::kit::list::{self, GUTTER};
+use crate::ui::kit::pane::ScrollSpan;
 use crate::ui::kit::text::{Tone, notice, wrapped};
 use crate::ui::kit::{chips::key_line, modal::modal_rest};
 use crate::ui::tabs::settings::{SectionId, SettingsSection, answers, asked};
@@ -381,7 +382,7 @@ pub struct ConnectionSection {
     /// The form's `(lines, first line drawn)` as of the last render, for the Settings pane's
     /// scrollbar (MOD-115 M3 D-11), in the pane's terms: the notice rows under the form count.
     /// `None` while the refusal stands in for the rows.
-    scroll: Cell<Option<(usize, usize)>>,
+    scroll: Cell<Option<ScrollSpan>>,
 }
 
 impl ConnectionSection {
@@ -964,7 +965,7 @@ impl SettingsSection for ConnectionSection {
         key_line(self.hint_text(keys), theme)
     }
 
-    fn scroll(&self) -> Option<(usize, usize)> {
+    fn scroll(&self) -> Option<ScrollSpan> {
         self.scroll.get()
     }
 
@@ -1004,7 +1005,8 @@ impl SettingsSection for ConnectionSection {
                 frame.render_widget(Paragraph::new(lines[offset..].to_vec()), rows);
                 // The pane's bar is measured against the whole inner rect (D-11).
                 let below = usize::from(area.height.saturating_sub(rows.height));
-                self.scroll.set(Some((total + below, offset)));
+                self.scroll
+                    .set(Some(ScrollSpan::new(total + below, offset)));
             }
         }
         if !said.is_empty() {

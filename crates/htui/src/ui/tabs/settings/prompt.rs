@@ -57,6 +57,7 @@ use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::form::{self, Field, Form};
 use crate::ui::kit::label;
 use crate::ui::kit::list;
+use crate::ui::kit::pane::ScrollSpan;
 use crate::ui::kit::text::{Tone, notice, wrapped};
 use crate::ui::kit::{chips::key_line, modal::modal_rest};
 use crate::ui::tabs::settings::{
@@ -317,9 +318,9 @@ pub struct PromptSection {
     busy: Option<&'static str>,
     /// The last outcome, on the notice row under the pane.
     notice: Option<Notice>,
-    /// `(total rows, offset)` as of the last render, for the Settings pane's scrollbar (MOD-115
-    /// M3 D-11); `None` while nothing scrolls.
-    scroll: Cell<Option<(usize, usize)>>,
+    /// The form's lines, first line drawn and rows as of the last render, for the Settings
+    /// pane's scrollbar (MOD-115 M3 D-11, RV1 M2); `None` while nothing scrolls.
+    scroll: Cell<Option<ScrollSpan>>,
 }
 
 /// One item of the tree's form, in [`rows`](PromptSection::rows) order: built once per frame
@@ -978,7 +979,7 @@ impl SettingsSection for PromptSection {
         key_line(self.hint_text(keys), theme)
     }
 
-    fn scroll(&self) -> Option<(usize, usize)> {
+    fn scroll(&self) -> Option<ScrollSpan> {
         self.scroll.get()
     }
 
@@ -1029,10 +1030,10 @@ impl SettingsSection for PromptSection {
                 let offset =
                     list::scroll_into_view(end, 0, usize::from(rows.height), total).min(start);
                 form.render(frame, rows, offset, ctx.accent(), theme);
-                // The pane's bar is measured against the whole inner rect (D-11): the notice
-                // line under the tree is added, so it shows exactly when a tree line is hidden.
-                let below = usize::from(area.height.saturating_sub(rows.height));
-                self.scroll.set(Some((total + below, offset)));
+                // The pane's bar is measured against the rows the tree is drawn into and sits
+                // beside them (RV1 M2), so the rows under the tree need no padding.
+                self.scroll
+                    .set(Some(ScrollSpan::new(total, offset).rows(rows)));
             }
         }
         frame.render_widget(Paragraph::new(self.notice_line(theme)), hint);
