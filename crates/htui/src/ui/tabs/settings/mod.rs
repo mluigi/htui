@@ -506,13 +506,19 @@ impl Tab for SettingsTab {
 }
 
 /// Draws the section strip, the active one in `active_tab` (bold, underlined).
+///
+/// A strip wider than `area` scrolls so that the active title ends inside it (MOD-146 F-1 (A));
+/// one that fits draws as it always did, from column 0.
 pub fn render_strip(frame: &mut Frame<'_>, area: Rect, registry: &SettingsRegistry, theme: &Theme) {
     let active = registry.active_id();
-    let spans: Vec<Span<'_>> = registry
-        .titles()
-        .into_iter()
-        .map(|(id, title)| {
+    let titles = registry.titles();
+    let (mut end, mut active_end) = (0usize, 0usize);
+    let spans: Vec<Span<'_>> = titles
+        .iter()
+        .map(|&(id, title)| {
+            end += cells::cell_width(title) + 2;
             let style: Style = if Some(id) == active {
+                active_end = end;
                 theme.active_tab
             } else {
                 theme.dim
@@ -520,7 +526,9 @@ pub fn render_strip(frame: &mut Frame<'_>, area: Rect, registry: &SettingsRegist
             Span::styled(format!(" {title} "), style)
         })
         .collect();
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    let offset =
+        u16::try_from(active_end.saturating_sub(usize::from(area.width))).unwrap_or(u16::MAX);
+    frame.render_widget(Paragraph::new(Line::from(spans)).scroll((0, offset)), area);
 }
 
 /// The one line a section renders instead of a blank pane.
@@ -557,6 +565,47 @@ mod tests {
         let other = &buffer[(second, 0)];
         assert_eq!(other.symbol(), "Q");
         assert!(!other.modifier.intersects(marked), "{other:?}");
+    }
+
+    /// One row of `registry`'s strip drawn `width` columns wide.
+    fn strip_row(registry: &SettingsRegistry, width: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1)).expect("terminal");
+        terminal
+            .draw(|frame| render_strip(frame, frame.area(), registry, &Theme::monochrome()))
+            .expect("the strip draws");
+        let buffer = terminal.backend().buffer();
+        (0..width).map(|x| buffer[(x, 0)].symbol()).collect()
+    }
+
+    /// MOD-146 F-1 (A): a strip wider than its area scrolls so the active title ends inside it,
+    /// and one that fits draws from column 0 as it always did.
+    #[test]
+    fn a_strip_wider_than_its_area_scrolls_to_the_active_section() {
+        let mut tab = SettingsTab::with_sections(vec![
+            Box::new(ConnectionSection::new()),
+            Box::new(QdrantSection::new()),
+        ]);
+        // ` Connection ` and ` Qdrant `: 20 columns in all.
+        assert_eq!(strip_row(&tab.sections, 15), " Connection  Qd");
+        assert_eq!(
+            strip_row(&tab.sections, 40).trim_end(),
+            " Connection  Qdrant"
+        );
+        tab.sections.cycle_next();
+        let narrow = strip_row(&tab.sections, 15);
+        assert!(narrow.ends_with(" Qdrant "), "{narrow:?}");
+        assert_eq!(narrow, "ection  Qdrant ");
+        assert_eq!(
+            strip_row(&tab.sections, 40).trim_end(),
+            " Connection  Qdrant",
+            "a strip that fits does not scroll"
+        );
+        assert_eq!(
+            strip_row(&tab.sections, 20),
+            " Connection  Qdrant ",
+            "exactly fitting does not scroll either"
+        );
     }
 
     /// MOD-115 M2 §8: the location names the active section; restoring it activates that

@@ -16,7 +16,7 @@ use htui::ui::Theme;
 use htui::ui::tabs::settings::{
     AgentsSection, BoxesSection, ConnectionSection, HierarchySection, KindsSection,
     PersonasSection, PromptSection, QdrantSection, QueueSection, SecretsSection, SectionId,
-    SettingsSection, SettingsTab, message,
+    SettingsRegistry, SettingsSection, SettingsTab, message, render_strip,
 };
 use htui::ui::text_field::PASTE_DOES_NOT_FIT;
 use htui_agent::acp::Handshake;
@@ -1091,6 +1091,12 @@ async fn a_bracketed_paste_under_a_modal_overlay_reaches_no_field() {
 /// (`Agents`, `Hierarchy`, `Kinds`, `Prompt`, `Connection`, `Qdrant`, `Boxes`, `Personas`,
 /// `Secrets`, `Queue`) cost 87 of the 100 columns, so the pin is re-run rather than relaxed — if
 /// an eleventh ever does not fit, the fix is the strip's, not a shorter title.
+///
+/// MOD-146 F-1 (A) made that fix: `render_strip` scrolls a strip wider than its area so that the
+/// active title ends inside it. So the pin is now drawn rather than summed: at the 98 columns
+/// inside the Settings border, with each section active in turn, the active section's whole
+/// ` title ` is on the row. (The scroll itself is pinned by `render_strip`'s unit test,
+/// `a_strip_wider_than_its_area_scrolls_to_the_active_section`.)
 #[test]
 fn the_section_strip_fits_the_frame() {
     let sections: Vec<Box<dyn SettingsSection>> = vec![
@@ -1110,10 +1116,31 @@ fn the_section_strip_fits_the_frame() {
         .iter()
         .map(|section| section.title().chars().count() + 2)
         .sum();
-    assert!(
-        width <= usize::from(SECTION_WIDE),
-        "the section strip is {width} columns and the frame is {SECTION_WIDE}"
-    );
+    assert_eq!(width, 87, "the strip's full width, for the doc above");
+    let titles: Vec<String> = sections
+        .iter()
+        .map(|section| section.title().to_owned())
+        .collect();
+    let mut registry = SettingsRegistry::new();
+    for section in sections {
+        registry.register(section);
+    }
+    for title in &titles {
+        let mut terminal =
+            Terminal::new(TestBackend::new(SECTION_BORDERED, 1)).expect("a test terminal");
+        terminal
+            .draw(|frame| render_strip(frame, frame.area(), &registry, &Theme::monochrome()))
+            .expect("the strip draws");
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..SECTION_BORDERED)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect();
+        assert!(
+            row.contains(&format!(" {title} ")),
+            "with {title} active the {SECTION_BORDERED}-column strip reads {row:?}"
+        );
+        registry.cycle_next();
+    }
 }
 
 // -------------------------------------------------------------------------------------------
