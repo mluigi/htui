@@ -17,6 +17,7 @@
 //! the audit's item 3).
 
 use std::borrow::Cow;
+use std::ops::Range;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -190,20 +191,66 @@ impl<'a> Form<'a> {
         wanted.min(width / 3).max(1)
     }
 
+    /// The value column's cells in a form `width` wide: what the gutter, the
+    /// [`label column`](Self::label_column) and the gap leave, 0 at the least. A caller that
+    /// sizes a value itself (a `TextArea`'s [`Value::Lines`]) asks here rather than restating
+    /// the gap (RV1 M1).
+    #[must_use]
+    pub fn value_width(&self, width: u16) -> u16 {
+        width.saturating_sub(1 + self.label_column(width) + GAP)
+    }
+
     /// The form as lines `width` cells wide, one block of rows per item.
     #[must_use]
     pub fn lines(&self, width: u16, accent: Style, theme: &Theme) -> Vec<Line<'static>> {
-        self.blocks(width, accent, theme).concat()
+        self.layout(width, accent, theme).lines
+    }
+
+    /// The form's lines and the focused item's lines among them, from one pass (RV1 L5): what
+    /// [`lines`](Self::lines) and [`focus_lines`](Self::focus_lines) give, for a view that
+    /// scrolls the focus into view and then draws.
+    #[must_use]
+    pub fn layout(&self, width: u16, accent: Style, theme: &Theme) -> FormLines {
+        let geometry = self.geometry(width);
+        let mut lines = Vec::new();
+        let mut focus = None;
+        for (index, item) in self.items.iter().enumerate() {
+            let start = lines.len();
+            lines.extend(self.block(index, item, geometry, accent, theme));
+            if self.focus == Some(index) {
+                focus = Some(start..lines.len());
+            }
+        }
+        FormLines { lines, focus }
     }
 
     /// The first line of the focused item, to scroll it into view; `None` when nothing (or
     /// nothing that exists) is focused.
     #[must_use]
     pub fn focus_line(&self, width: u16) -> Option<usize> {
+        self.focus_lines(width).map(|lines| lines.start)
+    }
+
+    /// The focused item's lines: its rows, then its help and its error, so a view can bring
+    /// the whole of it into view (RV1, Settings M1); `None` when nothing (or nothing that
+    /// exists) is focused. Only the items up to the focused one are laid out.
+    #[must_use]
+    pub fn focus_lines(&self, width: u16) -> Option<Range<usize>> {
         let focus = self.focus.filter(|focus| *focus < self.items.len())?;
+        let geometry = self.geometry(width);
         // Line counts do not depend on styles, so any theme measures them.
-        let blocks = self.blocks(width, Style::new(), &Theme::default());
-        Some(blocks[..focus].iter().map(Vec::len).sum())
+        let theme = Theme::default();
+        let mut start = 0;
+        for (index, item) in self.items[..=focus].iter().enumerate() {
+            let len = self
+                .block(index, item, geometry, Style::new(), &theme)
+                .len();
+            if index == focus {
+                return Some(start..start + len);
+            }
+            start += len;
+        }
+        None
     }
 
     /// Draws the form's lines from `offset` into `area`, one per row.
@@ -215,50 +262,85 @@ impl<'a> Form<'a> {
         accent: Style,
         theme: &Theme,
     ) {
-        let lines = self.lines(area.width, accent, theme);
-        let buf = frame.buffer_mut();
-        for (y, line) in (area.y..area.bottom()).zip(lines.iter().skip(offset)) {
-            buf.set_line(area.x, y, line, area.width);
+        self.layout(area.width, accent, theme)
+            .render(frame, area, offset);
+    }
+
+    /// The columns every row of a form `width` wide is laid out in.
+    fn geometry(&self, width: u16) -> Geometry {
+        let label = self.label_column(width);
+        Geometry {
+            label,
+            value: width.saturating_sub(1 + label + GAP),
+            content: width.saturating_sub(1),
         }
     }
 
-    /// Each item's rows.
-    fn blocks(&self, width: u16, accent: Style, theme: &Theme) -> Vec<Vec<Line<'static>>> {
-        let label = self.label_column(width);
-        let value = width.saturating_sub(1 + label + GAP);
-        self.items
-            .iter()
-            .enumerate()
-            .map(|(index, item)| {
-                let focused = self.focus == Some(index);
-                let gutter = if focused {
-                    Span::styled(GUTTER, accent)
-                } else {
-                    Span::raw(" ")
+    /// The rows of `item`, the form's `index`th.
+    fn block(
+        &self,
+        index: usize,
+        item: &Item<'_>,
+        geometry: Geometry,
+        accent: Style,
+        theme: &Theme,
+    ) -> Vec<Line<'static>> {
+        let focused = self.focus == Some(index);
+        let gutter = if focused {
+            Span::styled(GUTTER, accent)
+        } else {
+            Span::raw(" ")
+        };
+        let content = geometry.content;
+        match item {
+            Item::Heading(text) => {
+                let line = Line::from(Span::styled(text.to_string(), theme.title));
+                vec![marked(gutter, line, focused, content, theme)]
+            }
+            Item::Blank if focused => {
+                vec![marked(gutter, Line::default(), true, content, theme)]
+            }
+            Item::Blank => vec![Line::default()],
+            Item::Field(field) => {
+                let rows = Rows {
+                    label: geometry.label,
+                    value: geometry.value,
+                    focused,
+                    editing: focused && self.editing,
                 };
-                let content = width.saturating_sub(1);
-                match item {
-                    Item::Heading(text) => {
-                        let line = Line::from(Span::styled(text.to_string(), theme.title));
-                        vec![marked(gutter, line, focused, content, theme)]
-                    }
-                    Item::Blank if focused => {
-                        vec![marked(gutter, Line::default(), true, content, theme)]
-                    }
-                    Item::Blank => vec![Line::default()],
-                    Item::Field(field) => {
-                        let rows = Rows {
-                            label,
-                            value,
-                            focused,
-                            editing: focused && self.editing,
-                        };
-                        rows.field(field, gutter, theme)
-                    }
-                }
-            })
-            .collect()
+                rows.field(field, gutter, theme)
+            }
+        }
     }
+}
+
+/// A form laid out at one width ([`Form::layout`]): its lines, and the focused item's.
+#[derive(Debug, Clone, Default)]
+pub struct FormLines {
+    /// Every line, one block of rows per item.
+    pub lines: Vec<Line<'static>>,
+    /// The focused item's lines ([`Form::focus_lines`]); `None` when nothing is focused.
+    pub focus: Option<Range<usize>>,
+}
+
+impl FormLines {
+    /// Draws the lines from `offset` into `area`, one per row, as [`Form::render`] does. The
+    /// lines are drawn as laid out: lay the form out at `area.width`.
+    pub fn render(&self, frame: &mut Frame<'_>, area: Rect, offset: usize) {
+        let buf = frame.buffer_mut();
+        for (y, line) in (area.y..area.bottom()).zip(self.lines.iter().skip(offset)) {
+            buf.set_line(area.x, y, line, area.width);
+        }
+    }
+}
+
+/// The columns of a form's rows: the label column, the value column and everything after the
+/// gutter.
+#[derive(Debug, Clone, Copy)]
+struct Geometry {
+    label: u16,
+    value: u16,
+    content: u16,
 }
 
 /// `line` behind `gutter`: banded to `width` when `focused`, else cut to it.
@@ -318,15 +400,15 @@ impl Rows {
                     " ".repeat(label)
                 };
                 let name = Line::from(Span::styled(text, theme.base));
+                // The value line's own style goes to its own spans only: a styled
+                // `Value::Lines` row must not restyle the label or the gutter (RV1 M3).
+                let value = own_spans(value);
                 let mut line = if self.focused && !self.editing {
                     let mut spans = name.spans;
                     spans.push(gap.clone());
-                    spans.extend(value.spans);
-                    let banded = selection_band(
-                        Line::from(spans).style(value.style),
-                        self.label + GAP + self.value,
-                        theme,
-                    );
+                    spans.extend(value);
+                    let banded =
+                        selection_band(Line::from(spans), self.label + GAP + self.value, theme);
                     let mut out = vec![gutter.clone()];
                     out.extend(own_spans(banded));
                     Line::from(out)
@@ -339,8 +421,8 @@ impl Rows {
                     let mut out = vec![gutter.clone()];
                     out.extend(name.spans);
                     out.push(gap.clone());
-                    out.extend(value.spans);
-                    Line::from(out).style(value.style)
+                    out.extend(value);
+                    Line::from(out)
                 };
                 if let Some(style) = field.style {
                     line = line.patch_style(style);
@@ -722,6 +804,121 @@ mod tests {
         assert_eq!(form.clone().focus(9).focus_line(20), None, "past the end");
         let lines = form.clone().focus(3).lines(20, accent(), &Theme::default());
         assert_eq!(lines[5].spans[0].content, GUTTER);
+    }
+
+    /// RV1 M1: the value column's width is the kit's to say, so a caller sizing a value (a
+    /// `TextArea`'s lines) never restates the gutter or the gap.
+    #[test]
+    fn value_width_is_what_the_gutter_the_label_column_and_the_gap_leave() {
+        let theme = Theme::default();
+        let form = Form::new().field(Field::new("name", Value::Toggle(true)));
+        // The gutter 1, the label column 5, the gap 2.
+        assert_eq!(form.value_width(30), 22);
+        assert_eq!(
+            form.clone().label_width(14).value_width(60),
+            60 - 1 - 14 - 2
+        );
+        assert_eq!(Form::new().value_width(2), 0, "never below nothing");
+        let wide = "x".repeat(22);
+        let lines = form
+            .clone()
+            .field(Field::new(
+                "body",
+                Value::Lines(vec![Line::from(wide.clone())]),
+            ))
+            .lines(30, accent(), &theme);
+        assert!(
+            texts(&lines)[1].ends_with(&wide),
+            "a value that wide is not cut: {lines:?}"
+        );
+    }
+
+    /// RV1 M3: a styled `Value::Lines` line (a `TextArea`'s placeholder, a dimmed value) keeps
+    /// its style to the value's own cells: the gutter and the label are not restyled by it.
+    #[test]
+    fn a_styled_lines_value_does_not_restyle_the_gutter_or_the_label() {
+        let red = Style::new().fg(Color::Red);
+        let form = Form::new().field(Field::new(
+            "body",
+            Value::Lines(vec![Line::styled("text", red), Line::styled("more", red)]),
+        ));
+        for theme in [Theme::default(), Theme::monochrome()] {
+            for (focus, editing) in [(None, false), (Some(0), false), (Some(0), true)] {
+                let mut shown = form.clone().editing(editing);
+                if let Some(item) = focus {
+                    shown = shown.focus(item);
+                }
+                // The gutter at 0, the label column 1..=5, the gap 6..=7, the value from 8.
+                let buffer = draw(&shown, 30, 2, 0, &theme);
+                for y in 0..2 {
+                    for x in 0..8 {
+                        assert_ne!(
+                            buffer[(x, y)].fg,
+                            Color::Red,
+                            "{focus:?}/{editing}: cell ({x},{y}) {:?}",
+                            buffer[(x, y)]
+                        );
+                    }
+                    // Browsing, the band paints the whole row; else the value keeps its own.
+                    if focus.is_none() || editing {
+                        assert_eq!(
+                            buffer[(8, y)].fg,
+                            Color::Red,
+                            "{focus:?}/{editing}: row {y}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// RV1 (Settings M1): the focused item's lines, its help and error included, so a section
+    /// scrolls the whole of it into view without laying the form out again.
+    #[test]
+    fn focus_lines_are_the_focused_items_lines_help_and_error_included() {
+        // Field `a` takes two rows of value, one of help while focused and one of error; then a
+        // heading, a blank, `b`.
+        let form = Form::new()
+            .field(
+                Field::new("a", Value::ReadOnly("one two three four five six".into()))
+                    .help("some help for a")
+                    .error("bad"),
+            )
+            .heading("group")
+            .blank()
+            .field(Field::new("b", Value::Toggle(true)));
+        assert_eq!(form.focus_lines(20), None, "nothing focused");
+        assert_eq!(form.clone().focus(0).focus_lines(20), Some(0..4));
+        assert_eq!(form.clone().focus(1).focus_lines(20), Some(3..4));
+        assert_eq!(form.clone().focus(2).focus_lines(20), Some(4..5));
+        assert_eq!(form.clone().focus(3).focus_lines(20), Some(5..6));
+        assert_eq!(form.clone().focus(9).focus_lines(20), None, "past the end");
+    }
+
+    /// RV1 L5: one pass gives the lines and the focused item's lines, the same as asking for
+    /// each, and draws what `render` draws.
+    #[test]
+    fn layout_gives_the_lines_and_the_focus_in_one_pass() {
+        let theme = Theme::default();
+        let form = Form::new()
+            .field(
+                Field::new("a", Value::ReadOnly("one two three four five six".into())).error("bad"),
+            )
+            .heading("group")
+            .field(Field::new("b", Value::Toggle(true)).help("help"))
+            .focus(2);
+        let laid = form.layout(20, accent(), &theme);
+        assert_eq!(texts(&laid.lines), texts(&form.lines(20, accent(), &theme)));
+        assert_eq!(laid.focus, form.focus_lines(20));
+        assert_eq!(laid.focus, Some(4..6));
+        assert_eq!(form.focus_line(20), Some(4));
+        assert_eq!(Form::new().layout(20, accent(), &theme).focus, None);
+        let mut terminal = Terminal::new(TestBackend::new(20, 3)).expect("a test terminal");
+        terminal
+            .draw(|frame| laid.render(frame, frame.area(), 3))
+            .expect("draw");
+        let drawn = terminal.backend().buffer().clone();
+        assert_eq!(drawn, draw(&form, 20, 3, 3, &theme));
     }
 
     #[test]

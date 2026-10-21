@@ -173,9 +173,6 @@ const LIST_WIDTH: u16 = 29;
 /// The detail form's label column (the kit form adds its gutter before it and two cells after).
 const LABEL_WIDTH: u16 = 14;
 
-/// The gap `kit::form` leaves between its label column and the value.
-const FORM_GAP: u16 = 2;
-
 /// How many lines the quirks editor shows at most.
 const QUIRKS_HEIGHT: u16 = 6;
 
@@ -1030,8 +1027,10 @@ impl BoxesSection {
     ) -> Vec<Line<'static>> {
         let theme = ctx.theme;
         let row = &record.row;
-        let label_column = Form::new().label_width(LABEL_WIDTH).label_column(width);
-        let value_width = width.saturating_sub(1 + label_column + FORM_GAP).max(1);
+        let value_width = Form::new()
+            .label_width(LABEL_WIDTH)
+            .value_width(width)
+            .max(1);
         let read = |name: &'static str, value: String| {
             form::Field::new(name, form::Value::ReadOnly(value.into()))
         };

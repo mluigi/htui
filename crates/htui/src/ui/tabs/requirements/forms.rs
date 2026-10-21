@@ -406,9 +406,7 @@ impl RequirementForm {
         ])
         .areas(area);
         let shared = form();
-        let value = area
-            .width
-            .saturating_sub(1 + shared.label_column(area.width) + 2);
+        let value = shared.value_width(area.width);
         let text = |field: &TextArea, rows: u16, focus: FormFocus| {
             let mut lines = field.lines(value, rows, self.focus == focus, theme);
             lines.resize(usize::from(rows).max(1), Line::default());
