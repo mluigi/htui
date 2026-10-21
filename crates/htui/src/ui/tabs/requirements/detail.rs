@@ -5,6 +5,10 @@
 //! Lines are built here and drawn by the tab, which scrolls them (`J`/`K`, `PgUp`/`PgDn`). Offline
 //! the mirror holds no revisions, and the pane says so in one line rather than showing an empty
 //! trail (PRD "Offline", blueprint F-14).
+//!
+//! MOD-115 M3 (MOD-83): every value is shown by its label, never its internal name: the state as
+//! a `kit::label` mark, a citing item's status as `kit::status`'s, the citation kind and the
+//! resolution as `kit::label`'s words, the counts through `kit::label::plural`.
 
 use htui_core::model::{CoverageRow, ProjectRef, RequirementArea, RequirementState};
 use ratatui::text::{Line, Span};
@@ -13,10 +17,12 @@ use crate::requirements::{ProjectRequirements, RequirementDetail, RevisionRow};
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width};
 use crate::ui::kit::text::wrapped;
+use crate::ui::kit::{label, status};
 use crate::ui::tabs::backlog::detail::STAMP;
 
-/// What the Revisions heading says over a detail read from the mirror.
-pub(super) const REVISIONS_NEED_THE_DATABASE: &str = "revisions need the database";
+/// What the Revisions heading says over a detail read from the mirror, and where to fix it.
+pub(super) const REVISIONS_NEED_THE_DATABASE: &str =
+    "revisions need the database \u{b7} Settings \u{203a} Connection";
 
 /// A requirement no item cites.
 const NO_COVERAGE: &str = "no item cites it";
@@ -55,8 +61,8 @@ fn paragraph(text: &str, width: usize, style: ratatui::style::Style) -> Vec<Line
 }
 
 /// One requirement, `width` columns wide (plan P7): the body; its rationale, when it has one;
-/// `must · active · v2`; the coverage rows, a suspect one marked in `theme.error`; the revisions,
-/// each with the key of the item that decided it, or [`REVISIONS_NEED_THE_DATABASE`].
+/// `must · ● active · v2`; the coverage rows, a suspect one marked in `theme.error`; the
+/// revisions, each with the key of the item that decided it, or [`REVISIONS_NEED_THE_DATABASE`].
 pub(super) fn lines(detail: &RequirementDetail, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let width = usize::from(width).max(1);
     let requirement = &detail.requirement;
@@ -70,13 +76,19 @@ pub(super) fn lines(detail: &RequirementDetail, width: u16, theme: &Theme) -> Ve
         let text = format!("rationale: {}", requirement.rationale);
         out.extend(paragraph(&text, width, theme.dim));
     }
-    out.push(Line::styled(
-        format!(
-            "{} \u{b7} {} \u{b7} v{}",
-            requirement.priority, requirement.state, requirement.version
-        ),
+    let mut facts = vec![Span::styled(
+        format!("{} \u{b7} ", label::priority(requirement.priority)),
+        theme.base,
+    )];
+    facts.extend(label::spans(
+        label::requirement_state(requirement.state),
+        theme,
+    ));
+    facts.push(Span::styled(
+        format!(" \u{b7} v{}", requirement.version),
         theme.base,
     ));
+    out.push(Line::from(facts));
     out.push(Line::default());
     out.push(Line::styled("Coverage", theme.title));
     if detail.coverage.is_empty() {
@@ -93,7 +105,7 @@ pub(super) fn lines(detail: &RequirementDetail, width: u16, theme: &Theme) -> Ve
     out
 }
 
-/// `ANA-1  addresses v1  ! suspect  done  —`, one line per citing item.
+/// `ANA-1  addresses v1  ! suspect  ● done  —`, one line per citing item.
 ///
 /// The suspect marker comes straight after the stamp it judges (as the item's Reqs sub-tab puts
 /// it), not at the end of the row: the pane does not wrap, and at 80 columns it is 42 wide, so a
@@ -105,22 +117,25 @@ fn coverage(rows: &[CoverageRow], theme: &Theme) -> Vec<Line<'static>> {
         .map(|row| cell_width(&row.item.key))
         .max()
         .unwrap_or(0);
-    let status_width = rows
-        .iter()
-        .map(|row| cell_width(row.item.status.as_str()))
-        .max()
-        .unwrap_or(0);
+    let mark_width = |row: &CoverageRow| {
+        let mark = status::mark(row.item.status);
+        cell_width(mark.glyph) + 1 + cell_width(mark.word)
+    };
+    let status_width = rows.iter().map(mark_width).max().unwrap_or(0);
     let any_suspect = rows.iter().any(|row| row.suspect);
     rows.iter()
         .map(|row| {
-            let resolution = row.resolution.map_or_else(
-                || "\u{2014}".to_owned(),
-                |resolution| resolution.to_string(),
-            );
+            let resolution = row
+                .resolution
+                .map_or("\u{2014}", label::resolution)
+                .to_owned();
             let mut spans = vec![
                 Span::styled(cells::pad(&row.item.key, key_width), theme.key),
                 Span::raw("  "),
-                Span::styled(cells::pad(row.kind.as_str(), KIND_WIDTH), theme.base),
+                Span::styled(
+                    cells::pad(label::citation(row.kind), KIND_WIDTH),
+                    theme.base,
+                ),
                 Span::raw(" "),
                 Span::styled(
                     cells::pad(&format!("v{}", row.requirement_version), 3),
@@ -134,10 +149,8 @@ fn coverage(rows: &[CoverageRow], theme: &Theme) -> Vec<Line<'static>> {
             } else if any_suspect {
                 spans.push(Span::raw(cells::pad("", cell_width(SUSPECT) + 2)));
             }
-            spans.push(Span::styled(
-                cells::pad(row.item.status.as_str(), status_width),
-                theme.status_style(row.item.status),
-            ));
+            spans.extend(status::spans(row.item.status, theme));
+            spans.push(Span::raw(" ".repeat(status_width - mark_width(row))));
             spans.push(Span::raw("  "));
             spans.push(Span::styled(resolution, theme.dim));
             Line::from(spans)
@@ -182,9 +195,9 @@ pub(super) fn project_lines(
     out.push(Line::default());
     out.push(Line::styled(
         format!(
-            "{} areas \u{b7} {} requirements",
-            entry.areas.len(),
-            entry.requirements.len()
+            "{} \u{b7} {}",
+            label::plural(entry.areas.len(), "area", "areas"),
+            label::plural(entry.requirements.len(), "requirement", "requirements")
         ),
         theme.base,
     ));
@@ -211,7 +224,10 @@ pub(super) fn area_lines(
         ));
     }
     out.push(Line::default());
-    out.push(Line::styled(format!("{count} requirements"), theme.base));
+    out.push(Line::styled(
+        label::plural(count, "requirement", "requirements"),
+        theme.base,
+    ));
     out
 }
 
@@ -248,7 +264,10 @@ mod tests {
     async fn the_detail_lists_coverage_and_revisions() {
         let theme = Theme::default();
         let drawn = text(&lines(&r_ent_1().await, 53, &theme));
-        assert!(drawn.contains("must \u{b7} active \u{b7} v2"), "{drawn}");
+        assert!(
+            drawn.contains("must \u{b7} \u{25cf} active \u{b7} v2"),
+            "{drawn}"
+        );
         assert!(
             drawn.contains("rationale: Keys are what people type."),
             "{drawn}"
@@ -318,7 +337,7 @@ mod tests {
                     .map(|span| span.content.as_ref())
                     .collect();
                 let at = drawn
-                    .find(row.kind.as_str())
+                    .find(crate::ui::kit::label::citation(row.kind))
                     .unwrap_or_else(|| panic!("{drawn:?} shows its kind"));
                 cell_width(&drawn[..at])
             })
@@ -361,6 +380,69 @@ mod tests {
             offsets.windows(2).all(|pair| pair[0].1 == pair[1].1),
             "the stamp starts at one cell offset on every row: {offsets:#?}"
         );
+    }
+
+    /// MOD-115 M3, MOD-83: no internal value reaches the pane. The state is a glyph and a word,
+    /// a citing item's status the item's mark (`◐ running`, not `in_progress`), its kind and
+    /// resolution `kit::label`'s words, and the counts pluralised.
+    #[tokio::test]
+    async fn the_detail_shows_labels_not_internal_values() {
+        use htui_core::model::{CitationKind, Resolution, Status};
+        let theme = Theme::default();
+        let mut detail = r_ent_1().await;
+        detail.coverage[0].item.status = Status::InProgress;
+        detail.coverage[0].kind = CitationKind::Amends;
+        detail.coverage[1].item.status = Status::AwaitingApproval;
+        detail.coverage[1].resolution = Some(Resolution::Superseded);
+        detail.requirement.state = htui_core::model::RequirementState::Withdrawn;
+        let drawn = text(&lines(&detail, 53, &theme));
+        assert!(
+            drawn.contains("must \u{b7} \u{2715} withdrawn \u{b7} v2"),
+            "{drawn}"
+        );
+        assert!(drawn.contains("\u{25d0} running"), "{drawn}");
+        assert!(drawn.contains("\u{26a0} needs you"), "{drawn}");
+        assert!(drawn.contains("superseded"), "{drawn}");
+        for raw in ["in_progress", "awaiting_approval"] {
+            assert!(!drawn.contains(raw), "`{raw}`: {drawn}");
+        }
+        let state = lines(&detail, 53, &theme)
+            .into_iter()
+            .flat_map(|line| line.spans)
+            .find(|span| span.content == "withdrawn")
+            .map(|span| span.style)
+            .expect("the state's word is drawn");
+        assert_eq!(state, theme.dim, "a withdrawn mark reads dim");
+    }
+
+    /// MOD-115 M3, MOD-83: a project's and an area's counts say `1 area`, never `1 areas`.
+    #[tokio::test]
+    async fn the_header_counts_are_pluralised() {
+        use crate::ui::tabs::requirements::tests::platform;
+        let theme = Theme::default();
+        let (snapshot, projects, _) = platform().await;
+        let entry = snapshot
+            .project(ids::PROJECT_HTUI)
+            .expect("htui's requirements");
+        let project = projects
+            .iter()
+            .find(|row| row.project_id == ids::PROJECT_HTUI)
+            .expect("htui");
+        let drawn = text(&super::project_lines(project, entry, 53, &theme));
+        assert!(drawn.contains("2 areas \u{b7} 3 requirements"), "{drawn}");
+        let mut one = entry.clone();
+        one.areas.truncate(1);
+        one.requirements.truncate(1);
+        let drawn = text(&super::project_lines(project, &one, 53, &theme));
+        assert!(drawn.contains("1 area \u{b7} 1 requirement"), "{drawn}");
+        let sto = entry
+            .areas
+            .iter()
+            .find(|area| area.id == ids::AREA_STO)
+            .expect("STO");
+        let drawn = text(&super::area_lines(sto, entry, 53, &theme));
+        assert!(drawn.contains("1 requirement"), "{drawn}");
+        assert!(!drawn.contains("1 requirements"), "{drawn}");
     }
 
     /// Blueprint F-14: the mirror holds no revisions, and the pane says so.
