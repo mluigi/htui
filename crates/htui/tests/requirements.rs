@@ -919,3 +919,64 @@ async fn the_amend_form() {
     assert!(frame.contains("deciding item"), "{frame}");
     insta::assert_snapshot!("requirements_amend_form", frame);
 }
+
+/// Whether `hints` start on the detail's stretch of the bottom border in `frame`: past the tree's
+/// bottom-right corner.
+fn hints_on_the_detail(frame: &str, hints: &str) -> bool {
+    let line = frame.lines().nth(bottom_border(frame)).unwrap_or_default();
+    matches!(
+        (line.find('\u{256f}'), line.find(hints)),
+        (Some(corner), Some(at)) if at > corner
+    )
+}
+
+/// The style of the bottom-left corner of the pane starting at column `x` on row `y`.
+fn corner_at(buffer: &Buffer, x: u16, y: u16) -> Style {
+    assert_eq!(buffer[(x, y)].symbol(), "\u{2570}", "a corner at {x}");
+    buffer[(x, y)].style()
+}
+
+/// The column of the detail's bottom-left corner on row `y`: the second pane's.
+fn detail_x(buffer: &Buffer, y: u16) -> u16 {
+    (1..buffer.area.width)
+        .find(|x| buffer[(*x, y)].symbol() == "\u{2570}")
+        .expect("the detail's corner")
+}
+
+/// L-req repair 1: a form holds every key, so the detail it is drawn in is the focused pane, not
+/// the tree the shell's focus stayed on; its hints go on the detail's wider border, the priority
+/// field's whole row at 100 columns.
+#[tokio::test]
+async fn a_form_draws_its_hints_on_the_detail_that_holds_it() {
+    let mut harness = open().await;
+    let buffer = harness.render_buffer();
+    let y = border_y(&buffer);
+    let focused = corner_at(&buffer, 0, y);
+    harness.key("e");
+    harness.key("tab");
+    harness.key("tab");
+    let frame = harness.render();
+    assert!(frame.contains(MUST), "on the priority: {frame}");
+    let row = "m/l priority \u{b7} Tab field \u{b7} Ctrl+s save \u{b7} Esc cancel";
+    assert_eq!(hint(&frame), row, "{frame}");
+    assert!(hints_on_the_detail(&frame, row), "{frame}");
+    let buffer = harness.render_buffer();
+    let y = border_y(&buffer);
+    assert_eq!(corner_at(&buffer, detail_x(&buffer, y), y), focused);
+    assert_ne!(corner_at(&buffer, 0, y), focused, "the tree is not focused");
+}
+
+/// L-req repair 1: at 80 columns every form's hints are on the detail that holds it, and a body
+/// field's are whole there.
+#[tokio::test]
+async fn every_form_draws_its_hints_on_the_detail_at_80_columns() {
+    for key in ["a", "n", "e", "W"] {
+        let mut harness = open_platform_in(Harness::over(MemStore::demo()).size(80, 24)).await;
+        harness.key(key);
+        let frame = harness.render();
+        let hints = hint(&frame);
+        assert!(!hints.is_empty(), "`{key}`: {frame}");
+        assert!(hints_on_the_detail(&frame, &hints), "`{key}`: {frame}");
+        assert!(hints.ends_with("cancel"), "`{key}`, whole: {frame}");
+    }
+}

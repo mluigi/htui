@@ -1474,13 +1474,24 @@ impl Tab for RequirementsTab {
             };
             ctx.pane_focus(if own { pane } else { ctx.focus() })
         };
+        // L-req repair 1: an open form holds every key and is drawn in the detail, so the detail
+        // takes the tree's focus, and the form's hints its wider border.
+        let form = self.form_open();
         let hints = self.keys_line(ctx.keys(), ctx.theme);
         if let Some(tree) = tree {
-            let focus = focus_of(tree, PaneId::List);
+            let focus = if form {
+                Focus::Unfocused
+            } else {
+                focus_of(tree, PaneId::List)
+            };
             self.render_tree(frame, tree, focus, hints.as_ref(), ctx);
         }
         if !detail.is_empty() {
-            let focus = focus_of(detail, PaneId::Detail);
+            let focus = if form && ctx.focus() == PaneId::List {
+                ctx.pane_focus(PaneId::List)
+            } else {
+                focus_of(detail, PaneId::Detail)
+            };
             self.render_detail(frame, detail, focus, hints.as_ref(), ctx);
         }
         frame.render_widget(
