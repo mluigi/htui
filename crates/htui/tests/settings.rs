@@ -6352,6 +6352,45 @@ async fn f1_from_the_agents_form_opens_help_and_keeps_the_form() {
     );
 }
 
+/// MOD-115 M3 MD-A, end to end through the shell: a chord bound to a `[field]` row is only that
+/// row's in the Agents form. With `field.line_down` moved to `ctrl-n`, the shell hands the
+/// focused field the canonical `Down`, which a one-line field passes on; the form resolves its
+/// navigation from the chord the user pressed (`Ctx::pressed`), so `ctrl-n` never moves the focus
+/// the way `Down`'s `form.next_field` does, and `Down` itself still does.
+#[tokio::test]
+async fn a_rebound_field_chord_never_moves_the_agents_form_focus() {
+    let keys = htui::keys::load_str("version = 2\n[field]\nline_down = [\"ctrl-n\"]\n")
+        .expect("the key file loads");
+    let mut harness =
+        Harness::demo()
+            .with_keys(keys)
+            .with_tab(Box::new(SettingsTab::with_sections(vec![Box::new(
+                AgentsSection::new(),
+            )])));
+    harness.settle().await;
+    harness.key("n");
+    harness.settle().await;
+    let open = harness.render();
+    assert!(open.contains("Tab next field"), "the form is open: {open}");
+
+    harness.key("ctrl-n");
+    harness.settle().await;
+    assert_eq!(
+        harness.render(),
+        open,
+        "`ctrl-n` is `field.line_down`'s alone: the focus stayed on the first field"
+    );
+
+    harness.key("down");
+    harness.settle().await;
+    let moved = harness.render();
+    assert_ne!(moved, open, "`Down` is still `form.next_field`: {moved}");
+    assert!(
+        moved.contains("Tab next field"),
+        "and the form is still open: {moved}"
+    );
+}
+
 /// MOD-67 M6 D4: a rebound probe key is the one the Agents notes name, the idle note and the
 /// switched-on notice alike.
 #[tokio::test]
