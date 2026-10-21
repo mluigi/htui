@@ -59,6 +59,14 @@ anchors are for `c93584ec` (`hr/MOD-115`).
     `SECRETS_FORM`, `AREA_FORM` (`keys/views.rs:729-734`), `REQUIREMENTS_FORM`, `REQUIREMENTS_WITHDRAW`.
   - So `Keys::hint` never drops one. Each lane pins this with a test: the converted hint reads the same under the
     compiled keys, and names the rebound chord under `[field] submit = ["ctrl-t"]`.
+- **C7. Under an overlay, a ported tab's pane drops focus; an unported one keeps the shell accent (review RV1 L2,
+  recorded, no code change).**
+  - A ported tab draws its own pane through `Ctx::pane_focus`, which answers `Unfocused` while an overlay covers
+    the tab (`covered`), so its border goes faint and its hints go.
+  - An unported (group B) tab is still restyled by the shell's `paint_focus`, which keeps the focused pane's
+    accent under an overlay.
+  - The two read differently until M4 ports group B; the ported behaviour (the overlay has the keys, so no pane
+    under it reads focused) is the target, and M4's port brings group B in line with it.
 
 ## 1. Task 0: seam, neutral helpers, stubs (serial, primary tree; no snapshot may move)
 
