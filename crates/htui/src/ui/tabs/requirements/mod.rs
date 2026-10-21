@@ -62,8 +62,8 @@ use forms::{AreaForm, FormFocus, FormOutcome, FormTarget, RequirementForm, Withd
 use tree::{Fold, Row, TreeView};
 
 /// The Requirements tab's default layout (MOD-115 M2 D2): the tree beside the detail, 45% of
-/// the rows above the notice and the filter row, as `Layout::horizontal([Percentage(45),
-/// Percentage(55)])` split them before the shell kept layouts.
+/// the rows above the notice, as `Layout::horizontal([Percentage(45), Percentage(55)])` split
+/// them before the shell kept layouts.
 pub const REQUIREMENTS_LAYOUT: TabLayout = TabLayout {
     list: ListSize::Percent(45),
     ..TabLayout::DEFAULT
@@ -265,7 +265,7 @@ pub struct RequirementsTab {
     /// The tab write in flight, by `StoreRequest::name`: one at a time, and the only write a
     /// `RequirementWritten` lands (MOD-59 D4).
     busy: Option<&'static str>,
-    /// The last outcome, on the notice rows above the filter row.
+    /// The last outcome, on the notice rows under the panes.
     notice: Option<Notice>,
     /// A reveal waiting for the next `Requirements` reply (MOD-64 D235).
     pending_reveal: Option<(RequirementId, String)>,
@@ -290,7 +290,7 @@ enum Mode {
     Withdraw(WithdrawForm),
 }
 
-/// The report on the notice rows, above the filter row.
+/// The report on the notice rows, under the panes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Notice {
     /// Dim.
@@ -1217,9 +1217,10 @@ impl RequirementsTab {
         Some(lines)
     }
 
-    /// The keys of the current mode for the shell's hint row, through its stack and `keys`
-    /// (MOD-67 M4 D9, M6 T2): Browse's three groups, the writes greyed where a write would be
-    /// refused; a form's spec. `None` when no key of it is bound.
+    /// The keys of the current mode, through its stack and `keys` (MOD-67 M4 D9, M6 T2): Browse's
+    /// three groups, the writes first and greyed where a write would be refused (MOD-115 M3
+    /// D-14); a form's spec. The focused kit pane draws them on its bottom border, and the shell
+    /// on the activity placeholder's (C2). `None` when no key of it is bound.
     fn keys_line(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
         let line = match &self.mode {
             Mode::Browse => {
