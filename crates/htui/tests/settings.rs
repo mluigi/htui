@@ -1124,8 +1124,8 @@ async fn under_an_overlay_the_settings_pane_carries_no_section_hint() {
 
 /// The strip has to fit the frame it is drawn in (D4; PRD risk "strip overflow at 100 columns").
 ///
-/// `render_strip` draws `format!(" {title} ")` per registered section, so the joined width is
-/// `Σ (title chars + 2)`. The pin is over the sections the product registers, not over a test
+/// The Settings pane draws one top-border chip (`Pane::sub_tabs`) per registered section, each
+/// chip ` {title} `, so the joined width is `Σ (title chars + 2)`. The pin is over the sections the product registers, not over a test
 /// fixture: the moment a section makes the strip 101 columns wide this fails, and that is the one
 /// warning a snapshot of a clipped strip could not give.
 ///
