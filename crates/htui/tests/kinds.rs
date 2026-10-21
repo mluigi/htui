@@ -17,8 +17,8 @@ use htui::ui::tabs::settings::{
 };
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    ItemKind, ItemKindId, ItemKindPatch, NewProject, PersonaId, PhaseId, PhasePatch, ProjectId,
-    Scope, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, WorkspaceId,
+    Isolation, ItemKind, ItemKindId, ItemKindPatch, NewProject, PersonaId, PhaseId, PhasePatch,
+    ProjectId, Scope, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, WorkspaceId,
 };
 use htui_core::seed::{PHASES_PER_PROJECT, PhaseSeed, phase_row};
 use htui_core::store::{
@@ -1087,6 +1087,35 @@ fn type_at(bench: &SectionBench, section: &mut dyn SettingsSection, text: &str) 
     }
 }
 
+/// A frame line with the kit's one-cell gutter (`▌` on the focused row, blank elsewhere) taken
+/// off the front.
+fn past_gutter(line: &str) -> &str {
+    let mut chars = line.chars();
+    chars.next();
+    chars.as_str()
+}
+
+/// The index of the editor row labelled `label` (MOD-115 M3: a `kit::form` row reads
+/// `[gutter][label column][two blanks][value]`), or `None` when no row carries it.
+fn field_line(frame: &str, label: &str) -> Option<usize> {
+    frame.lines().position(|line| {
+        past_gutter(line)
+            .strip_prefix(label)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("  "))
+    })
+}
+
+/// What the editor row labelled `label` shows, trimmed; `""` for a blank field.
+fn field_value(frame: &str, label: &str) -> Option<String> {
+    let line = frame.lines().nth(field_line(frame, label)?)?;
+    Some(past_gutter(line)[label.len()..].trim().to_owned())
+}
+
+/// The frame's words joined by single spaces, so a wrapped sentence reads as one.
+fn flat(frame: &str) -> String {
+    frame.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// While an editor is open every printable key is text, `l` included, so the tab's own section
 /// cycle is off for as long as something is being typed (M3 D2).
 #[tokio::test]
@@ -1098,8 +1127,9 @@ async fn l_is_a_letter_while_editing() {
 
     assert_eq!(bench.key(&mut section, "l"), Handled::Consumed);
     let frame = bench.render_section(&section, 100);
-    assert!(
-        frame.contains("prefix     : l"),
+    assert_eq!(
+        field_value(&frame, "prefix").as_deref(),
+        Some("l"),
         "`l` went into the field, not to the strip: {frame}"
     );
     assert!(bench.drained().is_empty(), "typing asks the store nothing");
@@ -1256,7 +1286,11 @@ async fn g_opens_the_owning_graphs_editor_from_a_kind_and_from_a_phase() {
     bench.key(&mut section, "j");
     bench.key(&mut section, "g");
     let frame = bench.render_section(&section, 100);
-    assert!(frame.contains("name       : analysis"), "{frame}");
+    assert_eq!(
+        field_value(&frame, "name").as_deref(),
+        Some("analysis"),
+        "{frame}"
+    );
     bench.key(&mut section, "enter");
     let asked = bench.drained();
     let [
@@ -1516,7 +1550,11 @@ async fn n_on_the_prefix_warning_returns_to_the_editor_with_its_text() {
         bench.key_hint(&section).contains("Tab/Shift+Tab field"),
         "the editor is back: {frame}"
     );
-    assert!(frame.contains("prefix     : AN"), "with its text: {frame}");
+    assert_eq!(
+        field_value(&frame, "prefix").as_deref(),
+        Some("AN"),
+        "with its text: {frame}"
+    );
     assert!(bench.drained().is_empty());
 
     bench.key(&mut section, "enter");
@@ -1583,7 +1621,7 @@ async fn e_on_a_phase_opens_seven_fields_and_enter_sends_update_phase() {
 
     bench.key(&mut section, "e");
     let frame = bench.render_section(&section, 100);
-    for label in [
+    let rows: Vec<usize> = [
         "name",
         "position",
         "template_name",
@@ -1591,22 +1629,21 @@ async fn e_on_a_phase_opens_seven_fields_and_enter_sends_update_phase() {
         "input_kinds",
         "token_budget",
         "persona",
-    ] {
-        assert!(
-            frame.contains(label),
-            "`{label}` is an editable column: {frame}"
-        );
-    }
-    let fields: Vec<&str> = frame
-        .lines()
-        .filter(|line| line.contains(": ") || line.trim_end().ends_with(':'))
-        .filter(|line| !line.starts_with(' '))
-        .collect();
+    ]
+    .into_iter()
+    .map(|label| {
+        field_line(&frame, label)
+            .unwrap_or_else(|| panic!("`{label}` is an editable column: {frame}"))
+    })
+    .collect();
     assert!(
-        fields
-            .last()
-            .is_some_and(|line| line.starts_with("persona ") && line.trim_end().ends_with(':')),
-        "`persona` is the last field, blank for an unbound phase: {fields:?}"
+        rows.windows(2).all(|pair| pair[0] + 1 == pair[1]),
+        "one row per field, in editor order, `persona` last: {rows:?} {frame}"
+    );
+    assert_eq!(
+        field_value(&frame, "persona").as_deref(),
+        Some(""),
+        "`persona` is blank for an unbound phase: {frame}"
     );
     assert!(
         !frame.contains("fan_out  "),
@@ -1707,7 +1744,9 @@ async fn clearing_the_budget_sends_none() {
     );
     let _ = bench.drained();
     assert!(
-        bench.render_section(&section, 100).contains("budget 60000"),
+        bench
+            .render_section(&section, 100)
+            .contains("budget 60000 tokens"),
         "the row prints the number it holds"
     );
 
@@ -2052,12 +2091,8 @@ async fn bench_with_bound(
 #[track_caller]
 fn persona_field(bench: &SectionBench, section: &KindsSection) -> String {
     let frame = bench.render_section(section, 100);
-    frame
-        .lines()
-        .find(|line| line.starts_with("persona "))
+    field_value(&frame, "persona")
         .unwrap_or_else(|| panic!("the editor draws a `persona` field: {frame}"))
-        .trim_end()
-        .to_owned()
 }
 
 /// Opens the phase editor on `research` (project → ANA → `research`).
@@ -2134,10 +2169,10 @@ async fn a_persona_and_budget_change_sends_the_patch_then_the_budget() {
 async fn blanking_a_bound_persona_sends_some_none() {
     let (bench, mut section, _) = bench_with_bound(Some(ids::PERSONA_REVIEWER)).await;
     edit_research(&bench, &mut section);
-    assert!(
-        persona_field(&bench, &section).ends_with(": reviewer"),
-        "prefilled with the bound name: {}",
-        persona_field(&bench, &section)
+    assert_eq!(
+        persona_field(&bench, &section),
+        "reviewer",
+        "prefilled with the bound name"
     );
     focus_persona(&bench, &mut section);
     for _ in 0.."reviewer".len() {
@@ -2239,10 +2274,10 @@ async fn an_id_the_list_does_not_know_prints_as_the_id_and_is_left_alone() {
     );
 
     edit_research(&bench, &mut section);
-    assert!(
-        persona_field(&bench, &section).ends_with(&format!(": {unknown}")),
-        "and prefills the field: {}",
-        persona_field(&bench, &section)
+    assert_eq!(
+        persona_field(&bench, &section),
+        unknown.to_string(),
+        "and prefills the field"
     );
     type_at(&bench, &mut section, "2");
     bench.key(&mut section, "enter");
@@ -2268,7 +2303,7 @@ async fn a_bound_phase_line_names_its_persona() {
     assert!(
         research
             .trim_end()
-            .ends_with(" \u{b7} budget inherit \u{b7} persona reviewer"),
+            .ends_with(" \u{b7} inherits the budget \u{b7} persona reviewer"),
         "the bound row names its persona last: {research}"
     );
     let verdict = frame
@@ -2405,23 +2440,28 @@ async fn d_on_a_phase_or_graph_is_refused() {
     );
 }
 
-/// MOD-80 review L1: the rows a section drew in `theme.selected`, as `(y, text)`, each checked to
-/// be black on cyan over its whole text so no span's own colour shows through the cursor.
+/// MOD-80 review L1, MOD-115 M3: the rows a section drew in the kit's selection band, as
+/// `(y, text)`: the `▌` gutter in the tab's accent at column 0, then the row black on cyan over
+/// the whole width so no span's own colour shows through the cursor.
 fn selected_rows(buffer: &Buffer) -> Vec<(u16, String)> {
     let selected = Theme::default().selected;
+    let accent = Theme::default().tab_accent("settings");
     let (fg, bg) = (
         selected.fg.expect("selected has a foreground"),
         selected.bg.expect("selected has a background"),
     );
     (0..buffer.area.height)
-        .filter(|y| buffer[(0, *y)].bg == bg)
+        .filter(|y| buffer[(1, *y)].bg == bg)
         .map(|y| {
-            let text: String = (0..buffer.area.width)
+            let gutter = &buffer[(0, y)];
+            assert_eq!(gutter.symbol(), "\u{258c}", "the gutter marks row {y}");
+            assert_eq!(gutter.fg, accent.fg.unwrap_or(Color::Reset), "row {y}");
+            let text: String = (1..buffer.area.width)
                 .map(|x| buffer[(x, y)].symbol())
                 .collect::<String>()
                 .trim_end()
                 .to_owned();
-            for x in 0..u16::try_from(text.chars().count()).expect("a narrow row") {
+            for x in 1..buffer.area.width {
                 let cell = &buffer[(x, y)];
                 assert_eq!((cell.fg, cell.bg), (fg, bg), "{text:?} at x = {x}");
             }
@@ -2523,8 +2563,16 @@ async fn the_editor_moves_focus_on_down_and_up() {
     type_at(&bench, &mut section, "DOC");
 
     let frame = bench.render_section(&section, 100);
-    assert!(frame.contains("prefix     : DOC"), "{frame}");
-    assert!(frame.contains("name       : docs"), "{frame}");
+    assert_eq!(
+        field_value(&frame, "prefix").as_deref(),
+        Some("DOC"),
+        "{frame}"
+    );
+    assert_eq!(
+        field_value(&frame, "name").as_deref(),
+        Some("docs"),
+        "{frame}"
+    );
 }
 
 /// MOD-67 D14, a second rebinding: `[settings.kinds] graph = "G"` opens the graph editor on `G`,
@@ -2547,10 +2595,298 @@ async fn a_rebound_graph_acts_on_its_new_chord_and_the_hint_follows() {
     assert_eq!(bench.key(&mut section, "g"), Handled::Pass);
     assert!(!section.captures_input(), "`g` is unbound now");
     assert_eq!(bench.key(&mut section, "G"), Handled::Consumed);
-    assert!(
-        bench
-            .render_section(&section, 100)
-            .contains("name       : analysis"),
+    assert_eq!(
+        field_value(&bench.render_section(&section, 100), "name").as_deref(),
+        Some("analysis"),
         "`G` opened the kind's graph"
     );
+}
+
+// -------------------------------------------------------------------------------------------
+// MOD-115 M3 (lane L-kinds): the section on the kit. The tree is a `kit::list`, the editor a
+// `kit::form`, the notices `kit::text` lines and the empty states `kit::empty` with a next
+// step; every hint and every sentence that names a key reads it from the keys in force.
+// -------------------------------------------------------------------------------------------
+
+/// `field.submit` and `field.cancel` moved (MOD-115 M3 C6): the editor's `Enter` and `Esc`.
+const FIELD_REBOUND: &str = "version = 2\n[field]\nsubmit = [\"ctrl-t\"]\ncancel = [\"ctrl-g\"]\n";
+
+/// `keys` loaded, or a panic naming the file.
+fn rebound(file: &str) -> htui::keys::Keys {
+    htui::keys::load_str(file).expect("the key file loads")
+}
+
+/// One section drawn into a `width`x`height` buffer.
+fn drawn_at(
+    bench: &SectionBench,
+    section: &dyn SettingsSection,
+    width: u16,
+    height: u16,
+) -> Buffer {
+    let area = Rect::new(0, 0, width, height);
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(width, height),
+        TerminalOptions {
+            viewport: Viewport::Fixed(area),
+        },
+    )
+    .expect("a test terminal");
+    let ctx = bench.ctx();
+    terminal
+        .draw(|frame| section.render(frame, frame.area(), &ctx))
+        .expect("the section draws");
+    terminal.backend().buffer().clone()
+}
+
+/// The editor's hint names the field's own keys through the editor's stack (MD-A, C6): `Enter
+/// save · Esc cancel` under the compiled keys, the rebound chords once `[field]` moves them.
+#[tokio::test]
+async fn the_editor_hint_names_the_field_keys_in_force() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "e");
+    let hint = bench.key_hint(&section);
+    assert!(
+        hint.contains("Tab/Shift+Tab field \u{b7} Enter save \u{b7} Esc cancel"),
+        "{hint}"
+    );
+
+    let bench = bench.with_keys(rebound(FIELD_REBOUND));
+    let hint = bench.key_hint(&section);
+    assert!(hint.contains("Ctrl+t save \u{b7} Ctrl+g cancel"), "{hint}");
+    assert!(!hint.contains("Enter"), "no literal key is left: {hint}");
+}
+
+/// A compare-and-set miss under an open editor names the key that retries as the editor's stack
+/// binds it (MD-A, D-5): `Enter` under the compiled keys, the rebound chord otherwise.
+#[tokio::test]
+async fn a_stale_reply_names_the_retry_key_in_force() {
+    let (bench, mut section, snapshot) = bench_with_demo().await;
+    let bench = bench.with_keys(rebound(FIELD_REBOUND));
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "e");
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+
+    bench.reply(
+        &mut section,
+        &StoreReply::CatalogueStale(Box::new(snapshot)),
+    );
+
+    let flagged = error_text(&bench, &section, 100);
+    assert!(
+        flagged.iter().any(|line| line
+            == "changed elsewhere since you opened it \u{2014} reloaded; Ctrl+t retries against \
+                the current row"),
+        "{flagged:?}"
+    );
+}
+
+/// MOD-83: a phase row reads its gate, inputs and budget as words, not as column values.
+#[tokio::test]
+async fn a_phase_row_reads_its_gate_inputs_and_budget_in_words() {
+    let (bench, section, _) = bench_with_demo().await;
+    let frame = bench.render_section(&section, 100);
+    let row = |name: &str| -> String {
+        frame
+            .lines()
+            .find(|line| line.contains(&format!(". {name} ")))
+            .unwrap_or_else(|| panic!("the {name} row: {frame}"))
+            .trim()
+            .to_owned()
+    };
+    assert_eq!(
+        row("research"),
+        "0. research \u{b7} template research \u{b7} soft gate \u{b7} no inputs \u{b7} inherits \
+         the budget"
+    );
+    assert_eq!(
+        row("verdict"),
+        "1. verdict \u{b7} template verdict \u{b7} hard gate \u{b7} inputs research \u{b7} \
+         inherits the budget"
+    );
+    assert!(
+        frame.contains("inputs plan, review"),
+        "a list of inputs reads as one: {frame}"
+    );
+    for raw in ["gate soft", "gate hard", "in none", "budget inherit"] {
+        assert!(!frame.contains(raw), "`{raw}` is gone: {frame}");
+    }
+}
+
+/// MOD-83: the read-only line under the selected phase names its columns in words and shows the
+/// gate, isolation and command queue through their labels (D15 kept: MOD-4 still owns them).
+#[tokio::test]
+async fn the_read_only_line_names_its_columns_in_words() {
+    let (bench, mut section, mut snapshot) = bench_with_demo().await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "j");
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        flat(&frame).contains(
+            "fan-out 1 \u{b7} gate: always \u{b7} isolation: project default \u{b7} commands: \
+             queued when fanned out \u{b7} verify: none \u{b7} retries 1 \u{b7} output: research \
+             \u{b7} template: latest \u{2014} MOD-4 owns these"
+        ),
+        "{frame}"
+    );
+    for raw in [
+        "fan_out",
+        "command_queue",
+        "verify_command",
+        "retry_limit",
+        "output_kind",
+        "template_version",
+    ] {
+        assert!(!frame.contains(raw), "`{raw}` is not on screen: {frame}");
+    }
+
+    let phase = snapshot.projects[0]
+        .graphs
+        .iter_mut()
+        .find(|entry| entry.graph.id == ids::GRAPH_VULKAN_ANA)
+        .expect("the analysis graph")
+        .phases
+        .get_mut(0)
+        .expect("research");
+    phase.isolation = Some(Isolation::Local);
+    phase.template_version = Some(3);
+    phase.verify_command = Some("cargo test".to_owned());
+    bench.reply(&mut section, &StoreReply::Catalogue(Box::new(snapshot)));
+    let frame = flat(&bench.render_section(&section, 100));
+    for words in [
+        "isolation: none (local tree)",
+        "verify: cargo test",
+        "template: v3",
+    ] {
+        assert!(frame.contains(words), "`{words}`: {frame}");
+    }
+}
+
+/// MOD-85: in the editor the accent marks the focused row's gutter and the tree's cursor, and
+/// nothing else: no label is drawn in it.
+#[tokio::test]
+async fn the_editor_marks_its_focused_row_and_no_label_takes_the_accent() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "e");
+    bench.key(&mut section, "tab");
+    let frame = bench.render_section(&section, 100);
+    let name = u16::try_from(field_line(&frame, "name").expect("a `name` row")).expect("a row");
+    let accent = bench
+        .ctx()
+        .accent()
+        .fg
+        .expect("the Settings accent has a colour");
+    let buffer = drawn(&bench, &section, 100);
+    let accented: Vec<(u16, u16)> = (0..buffer.area.height)
+        .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+        .filter(|(x, y)| buffer[(*x, *y)].fg == accent)
+        .collect();
+    assert!(
+        accented
+            .iter()
+            .all(|(x, y)| *x == 0 && buffer[(*x, *y)].symbol() == "\u{258c}"),
+        "only gutters take the accent: {accented:?}"
+    );
+    assert!(
+        accented.contains(&(0, name)),
+        "the focused field is marked: {accented:?} {frame}"
+    );
+    assert_eq!(
+        accented.len(),
+        2,
+        "that field and the tree's cursor: {accented:?}"
+    );
+}
+
+/// The empty states say what is missing and what to do next (MOD-115 audit item 2).
+#[tokio::test]
+async fn the_empty_states_carry_a_next_step() {
+    let bench = SectionBench::new().await;
+    let mut section = KindsSection::new();
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("no workspace: nothing to list"), "{frame}");
+    assert!(frame.contains("r reads the catalogue again"), "{frame}");
+
+    let mut snapshot = demo_catalogue(&demo()).await;
+    snapshot.projects.clear();
+    bench.reply(&mut section, &StoreReply::Catalogue(Box::new(snapshot)));
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("no project in scope"), "{frame}");
+    assert!(
+        frame.contains("Settings \u{203a} Hierarchy adds a project"),
+        "{frame}"
+    );
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "catalogue",
+            message: "store unreachable".to_owned(),
+        },
+    );
+    let flagged = error_text(&bench, &section, 100);
+    assert!(
+        flagged.contains(&"catalogue unavailable: store unreachable".to_owned()),
+        "the refusal is an error: {flagged:?}"
+    );
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("r asks again once the store answers"),
+        "{frame}"
+    );
+}
+
+/// The section reports its scroll for the Settings pane's scrollbar (MOD-115 M3 D-11): the
+/// tree's rows and the first one drawn, the cursor kept on screen.
+#[tokio::test]
+async fn the_section_reports_its_scroll_for_the_pane() {
+    let (bench, mut section, snapshot) = bench_with_demo().await;
+    assert_eq!(section.scroll(), None, "nothing is drawn yet");
+    let rows = 1 + snapshot.projects[0]
+        .kinds
+        .iter()
+        .map(|kind| {
+            1 + snapshot.projects[0]
+                .graph(kind.default_graph_id)
+                .map_or(0, |entry| entry.phases.len())
+        })
+        .sum::<usize>();
+
+    let _ = drawn_at(&bench, &section, 100, 10);
+    assert_eq!(section.scroll(), Some((rows, 0)));
+
+    // The last kind, `TOOL`, with its three phases under it: a kind row has no detail line.
+    let tool = rows - 4;
+    for _ in 0..tool {
+        bench.key(&mut section, "j");
+    }
+    let buffer = drawn_at(&bench, &section, 100, 10);
+    // Nine rows above the notice line; the cursor's is the last of them.
+    assert_eq!(section.scroll(), Some((rows, tool - 8)));
+    let last: String = (0..100).map(|x| buffer[(x, 8)].symbol()).collect();
+    assert!(
+        last.starts_with('\u{258c}') && last.contains("TOOL"),
+        "the cursor is on screen: {last}"
+    );
+}
+
+/// MOD-81: the section at 80 columns, through the shell.
+#[tokio::test]
+async fn the_section_at_80_columns() {
+    let mut harness = Harness::over(MemStore::demo())
+        .size(80, 24)
+        .with_tab(Box::new(SettingsTab::with_sections(vec![
+            Box::new(AgentsSection::new()),
+            Box::new(HierarchySection::new()),
+            Box::new(KindsSection::new()),
+        ])));
+    harness.settle().await;
+    harness.key("l");
+    harness.key("l");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(frame.contains("soft gate"), "{frame}");
+    insta::assert_snapshot!("demo_80", frame);
 }

@@ -11,7 +11,7 @@ use htui::store_worker::{StoreReply, StoreRequest};
 use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
 use htui::ui::tabs::settings::personas::{
-    COMMAND_RUN_IS_Y_OR_N, ENTER_A_PATH, IMPORTING, UNCHANGED, UNSAVED,
+    COMMAND_RUN_IS_Y_OR_N, ENTER_A_PATH, IMPORTING, UNCHANGED, unsaved,
 };
 use htui::ui::tabs::settings::{PersonasSection, SettingsSection, SettingsTab};
 use htui_core::fixtures::ids;
@@ -156,10 +156,31 @@ fn error_text(bench: &SectionBench, section: &dyn SettingsSection) -> String {
     rows.join(" ")
 }
 
-/// One form line as the section draws it: the label padded to the widest
-/// (`permission-default`, 18), then `: ` and the text.
+/// One form line as the section draws it after the kit's gutter (MOD-115 M3): the label padded
+/// to the shared column (the widest, `permission-default`, and one: 19), two blanks, the text.
 fn field(label: &str, text: &str) -> String {
-    format!("{label:<18}: {text}")
+    format!("{label:<19}  {text}")
+}
+
+/// A frame line with the kit's one-cell gutter (`▌` on the focused row, blank elsewhere) taken
+/// off the front.
+fn past_gutter(line: &str) -> &str {
+    let mut chars = line.chars();
+    chars.next();
+    chars.as_str()
+}
+
+/// The frame's lines, each past its gutter.
+fn content(frame: &str) -> Vec<String> {
+    frame
+        .lines()
+        .map(|line| past_gutter(line).to_owned())
+        .collect()
+}
+
+/// The unsaved-changes warning under the compiled keys.
+fn unsaved_esc() -> String {
+    unsaved(Some("Esc"))
 }
 
 /// The `UpdatePersona` the section sent, or a panic naming what went out.
@@ -196,7 +217,7 @@ fn architect(rows: &[Persona]) -> Persona {
 async fn the_registry_lists_one_line_per_persona() {
     let (bench, section) = bench_with_demo().await;
     let frame = frame(&bench, &section);
-    let lines: Vec<&str> = frame.lines().collect();
+    let lines = content(&frame);
 
     assert!(
         lines[0].starts_with("architect \u{b7} Designs the change"),
@@ -233,7 +254,7 @@ async fn a_wide_description_is_cut_by_cells_and_keeps_the_tail() {
     }
     let (bench, section) = bench_with(rows).await;
     let frame = frame(&bench, &section);
-    let lines: Vec<&str> = frame.lines().collect();
+    let lines = content(&frame);
 
     assert!(
         lines[0].starts_with("architect \u{b7} \u{1f50d}"),
@@ -261,12 +282,12 @@ async fn j_and_k_move_the_cursor_and_stop_at_the_ends() {
         at_top
             .lines()
             .nth(1)
-            .is_some_and(|line| line.starts_with("    allow"))
+            .is_some_and(|line| past_gutter(line).starts_with("    allow"))
     );
 
     keys(&bench, &mut section, &["j", "j", "j"]);
     let at_end = frame(&bench, &section);
-    let lines: Vec<&str> = at_end.lines().collect();
+    let lines = content(&at_end);
     assert!(lines[0].starts_with("architect"), "{at_end}");
     assert!(lines[1].starts_with("reviewer"), "{at_end}");
     assert!(
@@ -409,7 +430,7 @@ async fn a_created_reply_closes_the_editor_and_selects_the_row() {
 
     assert!(!section.captures_input(), "back to Browse");
     let frame = frame(&bench, &section);
-    let lines: Vec<&str> = frame.lines().collect();
+    let lines = content(&frame);
     assert!(lines[2].starts_with("scout"), "{frame}");
     assert!(
         lines[3].starts_with("    allow"),
@@ -435,7 +456,7 @@ async fn e_opens_the_prefilled_form() {
         field("permission-default", ""),
     ] {
         assert!(
-            frame.lines().any(|row| row == line.trim_end()),
+            frame.lines().any(|row| past_gutter(row) == line.trim_end()),
             "{line}: {frame}"
         );
     }
@@ -536,7 +557,7 @@ async fn a_form_refusal_is_the_stores_sentence_and_focuses_its_field() {
     assert!(
         typed
             .lines()
-            .any(|line| line.starts_with("tools") && line.contains("mcp__x__yZ")),
+            .any(|line| past_gutter(line).starts_with("tools") && line.contains("mcp__x__yZ")),
         "the focus moved to `tools`: {typed}"
     );
 }
@@ -608,7 +629,7 @@ async fn esc_on_an_edited_body_warns_once() {
     bench.key(&mut section, "esc");
 
     let warned = frame(&bench, &section);
-    assert!(warned.contains(UNSAVED), "{warned}");
+    assert!(warned.contains(&unsaved_esc()), "{warned}");
     assert!(section.captures_input(), "still open");
 
     bench.key(&mut section, "esc");
@@ -623,16 +644,16 @@ async fn a_paste_after_the_warning_disarms_the_body_esc() {
     bench.key(&mut section, "b");
     type_text(&bench, &mut section, "x");
     bench.key(&mut section, "esc");
-    assert!(frame(&bench, &section).contains(UNSAVED));
+    assert!(frame(&bench, &section).contains(&unsaved_esc()));
 
     assert_eq!(bench.paste(&mut section, "pasted"), Handled::Consumed);
     let pasted = frame(&bench, &section);
-    assert!(!pasted.contains(UNSAVED), "{pasted}");
+    assert!(!pasted.contains(&unsaved_esc()), "{pasted}");
 
     bench.key(&mut section, "esc");
     let warned = frame(&bench, &section);
     assert!(section.captures_input(), "the paste re-arms the warning");
-    assert!(warned.contains(UNSAVED), "{warned}");
+    assert!(warned.contains(&unsaved_esc()), "{warned}");
     assert!(requests(&bench).is_empty());
 }
 
@@ -660,7 +681,7 @@ async fn an_untouched_body_holding_a_carriage_return_is_unchanged() {
         "Esc closes an untouched body without the warning: {}",
         frame(&bench, &section)
     );
-    assert!(!frame(&bench, &section).contains(UNSAVED));
+    assert!(!frame(&bench, &section).contains(&unsaved_esc()));
 
     keys(&bench, &mut section, &["b", "ctrl-s"]);
     assert!(requests(&bench).is_empty(), "nothing is sent");
@@ -923,15 +944,15 @@ async fn a_paste_after_the_warning_disarms_the_rules_esc() {
     bench.key(&mut section, "r");
     type_text(&bench, &mut section, "x");
     bench.key(&mut section, "esc");
-    assert!(frame(&bench, &section).contains(UNSAVED));
+    assert!(frame(&bench, &section).contains(&unsaved_esc()));
 
     assert_eq!(bench.paste(&mut section, "pasted"), Handled::Consumed);
-    assert!(!frame(&bench, &section).contains(UNSAVED));
+    assert!(!frame(&bench, &section).contains(&unsaved_esc()));
 
     bench.key(&mut section, "esc");
     let warned = frame(&bench, &section);
     assert!(section.captures_input(), "the paste re-arms the warning");
-    assert!(warned.contains(UNSAVED), "{warned}");
+    assert!(warned.contains(&unsaved_esc()), "{warned}");
     assert!(requests(&bench).is_empty());
 }
 
@@ -1432,23 +1453,28 @@ async fn the_product_registers_personas_last() {
     );
 }
 
-/// MOD-80 review L1: the rows a section drew in `theme.selected`, as `(y, text)`, each checked to
-/// be black on cyan over its whole text so no span's own colour shows through the cursor.
+/// MOD-80 review L1, MOD-115 M3: the rows a section drew in the kit's selection band, as
+/// `(y, text)`: the `▌` gutter in the tab's accent at column 0, then the row black on cyan over
+/// the whole width so no span's own colour shows through the cursor.
 fn selected_rows(buffer: &Buffer) -> Vec<(u16, String)> {
     let selected = Theme::default().selected;
+    let accent = Theme::default().tab_accent("settings");
     let (fg, bg) = (
         selected.fg.expect("selected has a foreground"),
         selected.bg.expect("selected has a background"),
     );
     (0..buffer.area.height)
-        .filter(|y| buffer[(0, *y)].bg == bg)
+        .filter(|y| buffer[(1, *y)].bg == bg)
         .map(|y| {
-            let text: String = (0..buffer.area.width)
+            let gutter = &buffer[(0, y)];
+            assert_eq!(gutter.symbol(), "\u{258c}", "the gutter marks row {y}");
+            assert_eq!(gutter.fg, accent.fg.unwrap_or(Color::Reset), "row {y}");
+            let text: String = (1..buffer.area.width)
                 .map(|x| buffer[(x, y)].symbol())
                 .collect::<String>()
                 .trim_end()
                 .to_owned();
-            for x in 0..u16::try_from(text.chars().count()).expect("a narrow row") {
+            for x in 1..buffer.area.width {
                 let cell = &buffer[(x, y)];
                 assert_eq!((cell.fg, cell.bg), (fg, bg), "{text:?} at x = {x}");
             }
@@ -1646,4 +1672,234 @@ async fn a_rebound_import_opens_on_its_new_chord_only() {
     harness.settle().await;
     let opened = harness.render();
     assert!(opened.contains(IMPORT_KEYS), "`i` opens the path: {opened}");
+}
+
+// ---- MOD-115 M3 (lane L-kinds): the section on the kit ---------------------------------------------
+
+/// `field.submit` and `field.cancel` moved (MOD-115 M3 C6): every field's `Enter` and `Esc`.
+const FIELD_REBOUND: &str = "version = 2\n[field]\nsubmit = [\"ctrl-t\"]\ncancel = [\"ctrl-g\"]\n";
+
+/// Every converted hint reads as before under the compiled keys and names the rebound chords once
+/// `[field]` moves them (MD-A, C6): the forms, the body and rules editors and the import path.
+#[tokio::test]
+async fn every_field_hint_names_the_field_keys_in_force() {
+    let (bench, mut section) = bench_with_keys(FIELD_REBOUND).await;
+    let compiled = SectionBench::new().await;
+    let hint = |section: &PersonasSection| bench.key_hint(section);
+    let compiled_hint = |section: &PersonasSection| compiled.key_hint(section);
+
+    bench.key(&mut section, "e");
+    assert!(compiled_hint(&section).contains(FORM_EDIT_KEYS));
+    assert!(
+        hint(&section).contains("Tab/Shift+Tab field \u{b7} Ctrl+t save \u{b7} Ctrl+g cancel"),
+        "{}",
+        hint(&section)
+    );
+    bench.key(&mut section, "esc");
+
+    bench.key(&mut section, "n");
+    assert!(
+        compiled_hint(&section).contains("Tab/Shift+Tab field \u{b7} Enter body \u{b7} Esc cancel")
+    );
+    assert!(
+        hint(&section).contains("Ctrl+t body \u{b7} Ctrl+g cancel"),
+        "{}",
+        hint(&section)
+    );
+    type_text(&bench, &mut section, "scout");
+    bench.key(&mut section, "enter");
+    assert!(
+        compiled_hint(&section).contains("Ctrl+s create \u{b7} Esc back to the fields"),
+        "{}",
+        compiled_hint(&section)
+    );
+    assert!(
+        hint(&section).contains("Ctrl+s create \u{b7} Ctrl+g back to the fields"),
+        "{}",
+        hint(&section)
+    );
+    bench.key(&mut section, "esc");
+    bench.key(&mut section, "esc");
+
+    bench.key(&mut section, "b");
+    assert!(compiled_hint(&section).contains(EDITOR_KEYS));
+    assert!(
+        hint(&section).contains("Ctrl+s save \u{b7} Ctrl+g cancel \u{b7} Ctrl+t breaks the line"),
+        "{}",
+        hint(&section)
+    );
+    bench.key(&mut section, "esc");
+
+    bench.key(&mut section, "I");
+    assert!(compiled_hint(&section).contains(IMPORT_KEYS));
+    assert!(
+        hint(&section).contains("Ctrl+t import \u{b7} Ctrl+g cancel"),
+        "{}",
+        hint(&section)
+    );
+    assert!(!hint(&section).contains("Enter"), "{}", hint(&section));
+}
+
+/// The sentences that name a key read it from the keys in force (MD-A, C5, D-5): the unsaved
+/// warning names the cancel key, a stale form the retry key, a clash the retry key too.
+#[tokio::test]
+async fn the_sentences_name_the_keys_in_force() {
+    let (bench, mut section) = bench_with_keys(FIELD_REBOUND).await;
+    bench.key(&mut section, "b");
+    type_text(&bench, &mut section, "x");
+    bench.key(&mut section, "esc");
+    let warned = frame(&bench, &section);
+    assert!(
+        warned.contains("unsaved changes \u{2014} Ctrl+g again discards"),
+        "{warned}"
+    );
+    assert_eq!(unsaved_esc(), "unsaved changes \u{2014} Esc again discards");
+    assert_eq!(
+        unsaved(None),
+        "unsaved changes \u{2014} cancel again to discard"
+    );
+    bench.key(&mut section, "esc");
+
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, "-x");
+    bench.key(&mut section, "enter");
+    let _ = one_update(requests(&bench));
+    let (rows, row) = moved_elsewhere("Moved elsewhere.").await;
+    bench.reply(
+        &mut section,
+        &StoreReply::PersonaWritten {
+            personas: rows,
+            outcome: PersonaWrite::Stale { id: row.id },
+        },
+    );
+    let frame_text = frame(&bench, &section);
+    assert!(
+        shows(
+            &frame_text,
+            "changed elsewhere since you opened it \u{2014} reloaded; Ctrl+t retries against the \
+             current row"
+        ),
+        "{frame_text}"
+    );
+}
+
+/// MOD-85: in the fields form and the import path the accent marks the focused row's gutter
+/// alone; no label is drawn in it.
+#[tokio::test]
+async fn the_forms_mark_the_focused_row_and_no_label_takes_the_accent() {
+    let (bench, mut section) = bench_with_demo().await;
+    let accent = bench
+        .ctx()
+        .accent()
+        .fg
+        .expect("the Settings accent has a colour");
+    let accented = |section: &PersonasSection| -> Vec<(u16, u16)> {
+        let buffer = drawn(&bench, section);
+        (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .filter(|(x, y)| buffer[(*x, *y)].fg == accent)
+            .filter(|(x, y)| {
+                assert_eq!(
+                    buffer[(*x, *y)].symbol(),
+                    "\u{258c}",
+                    "only a gutter: ({x},{y})"
+                );
+                true
+            })
+            .collect()
+    };
+
+    bench.key(&mut section, "e");
+    bench.key(&mut section, "tab");
+    let marked = accented(&section);
+    let description = u16::try_from(
+        frame(&bench, &section)
+            .lines()
+            .position(|line| past_gutter(line).starts_with("description "))
+            .expect("a description row"),
+    )
+    .expect("a row");
+    assert_eq!(marked, vec![(0, description)], "the focused field alone");
+    bench.key(&mut section, "esc");
+
+    bench.key(&mut section, "I");
+    let marked = accented(&section);
+    let drawn_text = frame(&bench, &section);
+    let path = u16::try_from(
+        drawn_text
+            .lines()
+            .position(|line| past_gutter(line).starts_with("path "))
+            .unwrap_or_else(|| panic!("a path row: {drawn_text}")),
+    )
+    .expect("a row");
+    assert!(marked.contains(&(0, path)), "{marked:?} {drawn_text}");
+    assert_eq!(
+        marked.len(),
+        2,
+        "the path row and the list cursor: {marked:?}"
+    );
+}
+
+/// The empty states say what is missing and what to do next (MOD-115 audit item 2), with the
+/// keys in force.
+#[tokio::test]
+async fn the_empty_states_carry_a_next_step() {
+    let bench = SectionBench::new().await;
+    let mut section = PersonasSection::new();
+    let unread = frame(&bench, &section);
+    assert!(unread.contains("personas not read yet"), "{unread}");
+    assert!(
+        unread.contains("they appear once the store answers"),
+        "{unread}"
+    );
+
+    bench.reply(&mut section, &StoreReply::Personas(Vec::new()));
+    let none = frame(&bench, &section);
+    assert!(none.contains("no personas yet"), "{none}");
+    assert!(
+        none.contains("n adds one \u{b7} I imports a file"),
+        "{none}"
+    );
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "personas",
+            message: "store unreachable".to_owned(),
+        },
+    );
+    assert!(
+        error_text(&bench, &section).contains("personas unavailable: store unreachable"),
+        "{}",
+        error_text(&bench, &section)
+    );
+    let refused = frame(&bench, &section);
+    assert!(
+        refused.contains("personas are not mirrored: they return once the store answers"),
+        "{refused}"
+    );
+}
+
+/// The section reports its scroll for the Settings pane's scrollbar (MOD-115 M3 D-11).
+#[tokio::test]
+async fn the_section_reports_its_scroll_for_the_pane() {
+    let (bench, section) = bench_with_demo().await;
+    assert_eq!(section.scroll(), None, "nothing is drawn yet");
+    let _ = frame(&bench, &section);
+    // Two rows and the cursor row's one detail line.
+    assert_eq!(section.scroll(), Some((3, 0)));
+}
+
+/// MOD-81: the section at 80 columns, through the shell.
+#[tokio::test]
+async fn the_section_at_80_columns() {
+    let mut harness = Harness::demo()
+        .size(80, 24)
+        .with_tab(Box::new(SettingsTab::with_sections(vec![Box::new(
+            PersonasSection::new(),
+        )])));
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(frame.contains("architect \u{b7} "), "{frame}");
+    insta::assert_snapshot!("browse_80", frame);
 }
