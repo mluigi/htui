@@ -13,10 +13,11 @@ use htui::store_worker::{
 };
 use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
+use htui::ui::kit::text::{Tone, notice};
 use htui::ui::tabs::settings::{
     AgentsSection, BoxesSection, ConnectionSection, HierarchySection, KindsSection,
     PersonasSection, PromptSection, QdrantSection, QueueSection, SecretsSection, SectionId,
-    SettingsSection, SettingsTab, message,
+    SettingsSection, SettingsTab,
 };
 use htui::ui::text_field::PASTE_DOES_NOT_FIT;
 use htui_agent::acp::Handshake;
@@ -855,7 +856,10 @@ impl SettingsSection for ProbeSection {
     fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        message(frame, area, "box profile arrives with MOD-7", ctx.theme);
+        frame.render_widget(
+            notice("box profile arrives with MOD-7", Tone::Info, ctx.theme),
+            area,
+        );
     }
 }
 
@@ -929,11 +933,13 @@ impl SettingsSection for CapturingProbe {
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let pasted = self.pasted.join("|").replace('\n', "\\n");
-        message(
-            frame,
+        frame.render_widget(
+            notice(
+                &format!("seen {} pasted [{pasted}]", self.seen.len()),
+                Tone::Info,
+                ctx.theme,
+            ),
             area,
-            &format!("seen {} pasted [{pasted}]", self.seen.len()),
-            ctx.theme,
         );
     }
 }

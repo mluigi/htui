@@ -29,7 +29,6 @@ use htui_core::model::Scope;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::app::{Ctx, Handled};
 use crate::keys::{Act, KeyChord, Keys, Stack, views};
@@ -514,14 +513,6 @@ impl Tab for SettingsTab {
         }
         pane.render(frame, area, ctx.theme);
     }
-}
-
-/// The one line a section renders instead of a blank pane.
-pub fn message(frame: &mut Frame<'_>, area: Rect, text: &str, theme: &Theme) {
-    frame.render_widget(
-        Paragraph::new(Line::styled(text.to_owned(), theme.dim)).wrap(Wrap { trim: true }),
-        area,
-    );
 }
 
 #[cfg(test)]
