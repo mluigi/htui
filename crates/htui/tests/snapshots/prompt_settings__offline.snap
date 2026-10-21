@@ -5,7 +5,7 @@ expression: frame
 no workspace   ¹Settings        0 working · 0 waiting · offline · 0s · no box ·  F9  about   ?  keys
 ╭─ Prompt ─────────────────────────────────────────────────────── Agents  Hierarchy  Kinds  Prompt ╮
 │settings unavailable: store unreachable: this box browses its read-only cache and starts no run   │
-│                                                                                                  │
+│r asks again once the store answers                                                               │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

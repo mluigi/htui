@@ -4,17 +4,17 @@ expression: frame
 ---
 no workspace   ¹Settings     0 working · 0 waiting · memory · no box ·  F9  about   ?  keys · ⌫ back
 ╭─ Prompt ─────────────────────────────────────────────────────── Agents  Hierarchy  Kinds  Prompt ╮
-│app                                                                                               │
-│  excerpt_file_line_cap         unset | 400 (app_setting_default)   lines                         │
-│  excerpt_head_lines            unset | 200 (app_setting_default)   lines                         │
-│  excerpt_max_file_bytes        unset | 524288 (app_setting_default)   bytes                      │
-│  excerpt_max_files             unset | 12 (app_setting_default)   files                          │
-│  excerpt_max_scan_files        unset | 20000 (app_setting_default)   files                       │
-│  excerpt_provider_deadline_ms  unset | 1500 (app_setting_default)   ms                           │
-│  max_skill_tokens              unset | 20000 (app_setting_default)   tokens                      │
-│  prompt_reserve_fraction       unset | 0.1 (1000 bp) (app_setting_default)   bp                  │
-│  prompt_upstream_hops          unset | 2 (app_setting_default)   hops                            │
-│  token_budget                  unset | 120000 (app_setting_default)   tokens                     │
+│▌app                                                                                              │
+│ excerpt_file_line_cap          unset | 400 (default) lines                                       │
+│ excerpt_head_lines             unset | 200 (default) lines                                       │
+│ excerpt_max_file_bytes         unset | 524288 (default) bytes                                    │
+│ excerpt_max_files              unset | 12 (default) files                                        │
+│ excerpt_max_scan_files         unset | 20000 (default) files                                     │
+│ excerpt_provider_deadline_ms   unset | 1500 (default) ms                                         │
+│ max_skill_tokens               unset | 20000 (default) tokens                                    │
+│ prompt_reserve_fraction        unset | 10% (0.1) (default) fraction                              │
+│ prompt_upstream_hops           unset | 2 (default) hops                                          │
+│ token_budget                   unset | 120000 (default) tokens                                   │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
