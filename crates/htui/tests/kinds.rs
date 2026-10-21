@@ -2303,7 +2303,7 @@ async fn a_bound_phase_line_names_its_persona() {
     assert!(
         research
             .trim_end()
-            .ends_with(" \u{b7} inherits the budget \u{b7} persona reviewer"),
+            .ends_with(" \u{b7} budget inherited \u{b7} persona reviewer"),
         "the bound row names its persona last: {research}"
     );
     let verdict = frame
@@ -2521,7 +2521,7 @@ async fn ctrl_d_in_browse_opens_no_delete_question() {
         "no question on screen"
     );
 
-    for chord in ["ctrl-n", "ctrl-g", "ctrl-e", "ctrl-r"] {
+    for chord in ["ctrl-n", "ctrl-o", "ctrl-e", "ctrl-r"] {
         assert_eq!(bench.key(&mut section, chord), Handled::Pass, "{chord}");
         assert!(!section.captures_input(), "{chord} opened nothing");
         assert!(bench.drained().is_empty(), "{chord} asked nothing");
@@ -2609,7 +2609,7 @@ async fn a_rebound_graph_acts_on_its_new_chord_and_the_hint_follows() {
 // -------------------------------------------------------------------------------------------
 
 /// `field.submit` and `field.cancel` moved (MOD-115 M3 C6): the editor's `Enter` and `Esc`.
-const FIELD_REBOUND: &str = "version = 2\n[field]\nsubmit = [\"ctrl-t\"]\ncancel = [\"ctrl-g\"]\n";
+const FIELD_REBOUND: &str = "version = 2\n[field]\nsubmit = [\"ctrl-t\"]\ncancel = [\"ctrl-o\"]\n";
 
 /// `keys` loaded, or a panic naming the file.
 fn rebound(file: &str) -> htui::keys::Keys {
@@ -2653,7 +2653,7 @@ async fn the_editor_hint_names_the_field_keys_in_force() {
 
     let bench = bench.with_keys(rebound(FIELD_REBOUND));
     let hint = bench.key_hint(&section);
-    assert!(hint.contains("Ctrl+t save \u{b7} Ctrl+g cancel"), "{hint}");
+    assert!(hint.contains("Ctrl+t save \u{b7} Ctrl+o cancel"), "{hint}");
     assert!(!hint.contains("Enter"), "no literal key is left: {hint}");
 }
 
@@ -2697,19 +2697,19 @@ async fn a_phase_row_reads_its_gate_inputs_and_budget_in_words() {
     };
     assert_eq!(
         row("research"),
-        "0. research \u{b7} template research \u{b7} soft gate \u{b7} no inputs \u{b7} inherits \
-         the budget"
+        "0. research \u{b7} template research \u{b7} soft gate \u{b7} no inputs \u{b7} budget \
+         inherited"
     );
     assert_eq!(
         row("verdict"),
         "1. verdict \u{b7} template verdict \u{b7} hard gate \u{b7} inputs research \u{b7} \
-         inherits the budget"
+         budget inherited"
     );
     assert!(
         frame.contains("inputs plan, review"),
         "a list of inputs reads as one: {frame}"
     );
-    for raw in ["gate soft", "gate hard", "in none", "budget inherit"] {
+    for raw in ["gate soft", "gate hard", "in none", "budget inherit "] {
         assert!(!frame.contains(raw), "`{raw}` is gone: {frame}");
     }
 }

@@ -2,32 +2,32 @@
 source: crates/htui/tests/kinds.rs
 expression: frame
 ---
-vulkan-tutorials  Vulkan Tutorials
-  ANA  analysis · graph analysis
-    0. research · template research · gate soft · in none · budget inherit
-      fan_out 1 · gate always · isolation none · command_queue fan_out_only · verify_command none ·
-      retry_limit 1 · output_kind research · template_version none — MOD-4 owns these
-    1. verdict · template verdict · gate hard · in research · budget inherit
-  FEAT  feature · graph feature
-    0. prd · template prd · gate hard · in none · budget inherit
-    1. plan · template plan · gate hard · in prd · budget inherit
-    2. implement · template implement · gate soft · in plan,review · budget inherit
-    3. review · template review · gate soft · in implement · budget inherit
-  FIX  bug · graph bug
-    0. reproduce · template reproduce · gate soft · in none · budget inherit
-    1. fix · template fix · gate soft · in reproduce,review · budget inherit
-    2. review · template review · gate soft · in fix · budget inherit
-  CLEAN  refactor · graph refactor
-    0. plan · template plan · gate soft · in none · budget inherit
-    1. implement · template implement · gate soft · in plan,review · budget inherit
-    2. review · template review · gate soft · in implement · budget inherit
-  TOOL  tooling · graph tooling
-    0. plan · template plan · gate soft · in none · budget inherit
-    1. implement · template implement · gate soft · in plan,review · budget inherit
-name           : research
-position       : 0
-template_name  : research
-gate_hard (y/n): n
-input_kinds    :
-token_budget   :
-persona        :
+ vulkan-tutorials  Vulkan Tutorials
+   ANA  analysis · graph analysis
+▌    0. research · template research · soft gate · no inputs · budget inherited
+       fan-out 1 · gate: always · isolation: project default · commands: queued when fanned out ·
+       verify: none · retries 1 · output: research · template: latest — MOD-4 owns these
+     1. verdict · template verdict · hard gate · inputs research · budget inherited
+   FEAT  feature · graph feature
+     0. prd · template prd · hard gate · no inputs · budget inherited
+     1. plan · template plan · hard gate · inputs prd · budget inherited
+     2. implement · template implement · soft gate · inputs plan, review · budget inherited
+     3. review · template review · soft gate · inputs implement · budget inherited
+   FIX  bug · graph bug
+     0. reproduce · template reproduce · soft gate · no inputs · budget inherited
+     1. fix · template fix · soft gate · inputs reproduce, review · budget inherited
+     2. review · template review · soft gate · inputs fix · budget inherited
+   CLEAN  refactor · graph refactor
+     0. plan · template plan · soft gate · no inputs · budget inherited
+     1. implement · template implement · soft gate · inputs plan, review · budget inherited
+     2. review · template review · soft gate · inputs implement · budget inherited
+   TOOL  tooling · graph tooling
+     0. plan · template plan · soft gate · no inputs · budget inherited
+     1. implement · template implement · soft gate · inputs plan, review · budget inherited
+▌name              research
+ position          0
+ template_name     research
+ gate_hard (y/n)   n
+ input_kinds
+ token_budget
+ persona

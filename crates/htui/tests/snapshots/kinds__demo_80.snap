@@ -1,0 +1,28 @@
+---
+source: crates/htui/tests/kinds.rs
+expression: frame
+---
+Graphics   ¹Settings       0 working · 0 waiting · memory ·  F9  about   ?  keys
+╭─ Kinds ──────────────────────────────────────────── Agents  Hierarchy  Kinds ╮
+│▌vulkan-tutorials  Vulkan Tutorials                                           │
+│   ANA  analysis · graph analysis                                             │
+│     0. research · template research · soft gate · no inputs · budget inherit…│
+│     1. verdict · template verdict · hard gate · inputs research · budget inh…│
+│   FEAT  feature · graph feature                                              │
+│     0. prd · template prd · hard gate · no inputs · budget inherited         │
+│     1. plan · template plan · hard gate · inputs prd · budget inherited      │
+│     2. implement · template implement · soft gate · inputs plan, review · bu…│
+│     3. review · template review · soft gate · inputs implement · budget inhe…│
+│   FIX  bug · graph bug                                                       │
+│     0. reproduce · template reproduce · soft gate · no inputs · budget inher…│
+│     1. fix · template fix · soft gate · inputs reproduce, review · budget in…│
+│     2. review · template review · soft gate · inputs fix · budget inherited  │
+│   CLEAN  refactor · graph refactor                                           │
+│     0. plan · template plan · soft gate · no inputs · budget inherited       │
+│     1. implement · template implement · soft gate · inputs plan, review · bu…│
+│     2. review · template review · soft gate · inputs implement · budget inhe…│
+│   TOOL  tooling · graph tooling                                              │
+│     0. plan · template plan · soft gate · no inputs · budget inherited       │
+│     1. implement · template implement · soft gate · inputs plan, review · bu…│
+│                                                                              │
+╰─j/k · n kind/phase · N graph · e edit · g graph · d delete kind · r reload───╯
