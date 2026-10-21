@@ -980,3 +980,38 @@ async fn every_form_draws_its_hints_on_the_detail_at_80_columns() {
         assert!(hints.ends_with("cancel"), "`{key}`, whole: {frame}");
     }
 }
+
+/// L-req repair 2: the filter is typed in the tree's band, so with the detail focused `/` hands
+/// the tree the focus and the filter's hints, as an open form hands them to the detail: the
+/// capturing field and its keys are in one pane.
+#[tokio::test]
+async fn a_filter_typed_from_the_detail_focuses_the_tree_that_holds_it() {
+    let mut harness = open().await;
+    let buffer = harness.render_buffer();
+    let y = border_y(&buffer);
+    let focused = corner_at(&buffer, 0, y);
+    harness.key("tab");
+    let buffer = harness.render_buffer();
+    assert_eq!(
+        corner_at(&buffer, detail_x(&buffer, y), y),
+        focused,
+        "the detail is focused before the filter opens"
+    );
+    harness.key("/");
+    type_text(&mut harness, "STO");
+    let frame = harness.render();
+    assert!(
+        band(&frame).contains("STO"),
+        "the band is in the tree: {frame}"
+    );
+    let hints = hint(&frame);
+    assert!(hints.contains("apply"), "the filter's hints: {frame}");
+    assert!(!hints_on_the_detail(&frame, &hints), "on the tree: {frame}");
+    let buffer = harness.render_buffer();
+    assert_eq!(corner_at(&buffer, 0, y), focused, "the tree is focused");
+    assert_ne!(
+        corner_at(&buffer, detail_x(&buffer, y), y),
+        focused,
+        "the detail is not"
+    );
+}

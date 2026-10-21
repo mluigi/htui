@@ -1475,12 +1475,17 @@ impl Tab for RequirementsTab {
             ctx.pane_focus(if own { pane } else { ctx.focus() })
         };
         // L-req repair 1: an open form holds every key and is drawn in the detail, so the detail
-        // takes the tree's focus, and the form's hints its wider border.
+        // takes the tree's focus, and the form's hints its wider border. L-req repair 2: mirrored,
+        // the filter is typed in the tree's band, so the tree takes the detail's focus and the
+        // filter's hints. An activity pane the shell focuses keeps it either way.
         let form = self.form_open();
+        let filter = matches!(self.mode, Mode::Filter { .. });
         let hints = self.keys_line(ctx.keys(), ctx.theme);
         if let Some(tree) = tree {
             let focus = if form {
                 Focus::Unfocused
+            } else if filter && ctx.focus() == PaneId::Detail {
+                ctx.pane_focus(PaneId::Detail)
             } else {
                 focus_of(tree, PaneId::List)
             };
@@ -1489,6 +1494,8 @@ impl Tab for RequirementsTab {
         if !detail.is_empty() {
             let focus = if form && ctx.focus() == PaneId::List {
                 ctx.pane_focus(PaneId::List)
+            } else if filter && tree.is_some() {
+                Focus::Unfocused
             } else {
                 focus_of(detail, PaneId::Detail)
             };
