@@ -1081,7 +1081,9 @@ mod tests {
     /// handles an act a view stack offers.
     const VIEWS: &[(&str, &str)] = &[
         source!("ui/tabs/settings/mod.rs"),
-        source!("ui/tabs/settings/agents.rs"),
+        source!("ui/tabs/settings/agents/mod.rs"),
+        source!("ui/tabs/settings/agents/flows.rs"),
+        source!("ui/tabs/settings/agents/form.rs"),
         source!("ui/tabs/settings/boxes.rs"),
         source!("ui/tabs/settings/connection.rs"),
         source!("ui/tabs/settings/hierarchy.rs"),
@@ -1688,9 +1690,14 @@ mod tests {
             .map(|&(name, _)| name)
             .collect();
         // A widget's owner whose host names the stack: the Requirements forms (the tab picks
-        // `REQUIREMENTS_FORM`/`REQUIREMENTS_WITHDRAW`) and the directory picker's go-to field
-        // (Hierarchy puts it on `CAPTURE`).
+        // `REQUIREMENTS_FORM`/`REQUIREMENTS_WITHDRAW`), the Agents forms (the section picks
+        // `AGENTS_FORM`, MOD-115 M3 D7) and the directory picker's go-to field (Hierarchy puts it
+        // on `CAPTURE`).
         const HOSTED: &[(&str, &str)] = &[
+            (
+                "ui/tabs/settings/agents/form.rs",
+                "ui/tabs/settings/agents/mod.rs",
+            ),
             (
                 "ui/tabs/requirements/forms.rs",
                 "ui/tabs/requirements/mod.rs",

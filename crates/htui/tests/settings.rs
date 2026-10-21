@@ -109,24 +109,37 @@ fn render_section_at(section: &dyn SettingsSection, ctx: &Ctx<'_>, width: u16) -
     text_of(&draw_section_at(section, ctx, width))
 }
 
-/// The lines a section drew in the theme's accent colour.
+/// The lines a section drew with the cursor's mark: `kit::list`'s gutter (`▌`) in the Settings
+/// accent (MOD-115 M3), each without that gutter cell, so a line reads from its first cell.
 ///
-/// The row cursor is a *style*, not a character: nothing in the text says which row is
+/// The row cursor is a *style*, not a character: nothing in the row's own text says which row is
 /// highlighted, so a test that only read [`render_section`] could not tell a moved cursor from a
 /// stuck one.
 fn accented_lines(section: &dyn SettingsSection, ctx: &Ctx<'_>) -> Vec<String> {
-    let accent = Theme::default().accent.fg;
+    let accent = ctx.accent().fg.unwrap_or(Color::Reset);
     let buffer = draw_section(section, ctx);
     (0..buffer.area.height)
-        .filter(|y| buffer[(0, *y)].fg == accent.unwrap_or(Color::Reset))
+        .filter(|y| buffer[(0, *y)].symbol() == GUTTER && buffer[(0, *y)].fg == accent)
         .map(|y| {
-            (0..buffer.area.width)
+            (1..buffer.area.width)
                 .map(|x| buffer[(x, y)].symbol())
                 .collect::<String>()
                 .trim_end()
                 .to_owned()
         })
         .collect()
+}
+
+/// What the `on this box` cell reads for a probe that found no login (MOD-83, D-18): 13 cells,
+/// the column whole.
+const NEEDS_LOGIN: &str = "\u{26a0} needs login";
+
+/// `kit::list`'s cursor mark, in front of the cursor's row and the focused form row.
+const GUTTER: &str = "\u{258c}";
+
+/// `line` without its first cell, `kit::list`'s gutter (MOD-115 M3): a blank, or [`GUTTER`].
+fn content(line: &str) -> &str {
+    line.char_indices().nth(1).map_or("", |(at, _)| &line[at..])
 }
 
 /// A settled Settings tab over `store`, with the agent section registered.
@@ -153,8 +166,9 @@ async fn the_demo_registry_lists_every_seeded_agent() {
     // Two seeds are `acp` and one is `cli` since MOD-2 D79 gave the CLI transport its own row
     // rather than hiding it inside `claude`'s; all three are `subscription`. The fixture is derived
     // from them, so both transports appear here without this test naming either agent.
-    assert!(frame.contains("acp"), "the transport column");
-    assert!(frame.contains("cli"), "and the degraded transport's row");
+    // MOD-83: the transport's display label, never its wire value.
+    assert!(frame.contains("ACP"), "the transport column");
+    assert!(frame.contains("CLI"), "and the degraded transport's row");
     assert!(frame.contains("subscription"), "the billing column");
     insta::assert_snapshot!("agents_demo", frame);
 }
@@ -331,9 +345,10 @@ async fn the_status_column_renders_each_probe_outcome() {
     for (row, expected) in [
         ("ready-on", "0.48.0"),
         ("ready-off", "0.48.0 (off)"),
-        ("gone", "missing"),
-        ("needs-auth", "unauthenticated"),
-        ("broke", "failed"),
+        // MOD-83, D-18: the verdicts a version cannot express, as their `kit::label` marks.
+        ("gone", "\u{2717} missing"),
+        ("needs-auth", NEEDS_LOGIN),
+        ("broke", "\u{2717} failed"),
         ("legacy", "9.9.9"),
     ] {
         let line = row_line(&rendered, row);
@@ -356,7 +371,7 @@ async fn the_status_column_renders_each_probe_outcome() {
 /// Seven, not eight, because D89 made `name` the flexible one. Every other column sits at its own
 /// longest string, which is the arithmetic behind "widening `name` is never free": there is nothing
 /// in this figure that is not already being spent.
-const FIXED_TOTAL: usize = 81;
+const FIXED_TOTAL: usize = 80;
 
 /// The `column_spacing` this table draws: one column between each pair of eight, so seven.
 const GAPS: usize = 7;
@@ -372,8 +387,11 @@ const GAPS: usize = 7;
 /// row names are longer than the narrow widths (`needs-auth`, `spend-only`, `unparsable`,
 /// `loginable`), and no registry name is.
 const fn name_width(section: usize) -> usize {
-    section - FIXED_TOTAL - GAPS
+    section - GUTTER_CELLS - FIXED_TOTAL - GAPS
 }
+
+/// `kit::list`'s gutter, in front of every row and the header (MOD-115 M3).
+const GUTTER_CELLS: usize = 1;
 
 /// Where the `default` column starts: `name`'s own width, then `transport`'s 9, `billing`'s 12 and
 /// `models`' 6, plus one space of `column_spacing` after each.
@@ -389,7 +407,7 @@ const DEFAULT_WIDTH: usize = 21;
 /// Where the `quota` column starts: [`default_at`] plus `default`'s 21 and `enabled`'s 7, each with
 /// its space.
 const fn quota_at(section: usize) -> usize {
-    default_at(section) + DEFAULT_WIDTH + 1 + 7 + 1
+    default_at(section) + DEFAULT_WIDTH + 1 + 6 + 1
 }
 
 /// Where `on this box` starts: [`quota_at`] plus the quota column's own 13 (D76) and its space.
@@ -478,6 +496,7 @@ fn cell_at(rendered: &str, name: &str, section: usize, from: usize, width: usize
     let drawn = name.chars().take(name_width(section)).collect::<String>();
     rendered
         .lines()
+        .map(content)
         .find(|line| line.starts_with(&drawn))
         .unwrap_or_else(|| panic!("the `{name}` row is rendered:\n{rendered}"))
         .chars()
@@ -511,6 +530,7 @@ fn row_line<'a>(rendered: &'a str, name: &str) -> &'a str {
     let drawn = name.chars().take(NAME_WIDTH).collect::<String>();
     rendered
         .lines()
+        .map(content)
         .find(|line| line.starts_with(&drawn))
         .unwrap_or_else(|| panic!("the `{name}` row is rendered:\n{rendered}"))
 }
@@ -558,13 +578,13 @@ async fn the_default_column_holds_the_whole_model_id() {
 /// one.
 ///
 /// - `claude-cli` — the registry name MOD-2 milestone 8 adds, and the longest in the tree —
-///   renders **whole** at 98. That is what `Constraint::Min(10)` is for, and 10 is not a round
-///   number: it is that name's length, with nothing to spare.
-/// - `unauthenticated` renders `unauthenticat`, and this case **records that as accepted**. It is
-///   the stated price of D89 and not an accident. That verdict is where MOD-21's login flow starts
-///   — `a` is offered on a row that says it — and the reason it is the affordable loss is that this
-///   column carries status words, where `default` carries a selection coordinate and `quota`
-///   carries an exhaustion warning. A truncated status word is still legible as itself.
+///   renders **whole** at 98. That is what the 10-cell minimum is for, and 10 is not a round
+///   number: it is that name's length, with nothing to spare. Since MOD-115 M3 `kit::list`'s
+///   gutter costs one cell of the 98, and `enabled`'s header gave it back: it starts in the blank
+///   gap before its 6-cell column (MOD-81).
+/// - the verdict reads `⚠ needs login` (MOD-83, the maintainer's answer of 2026-10-21): 13 cells,
+///   the column whole, where D89's `unauthenticated` (15) had clipped to `unauthenticat`. The
+///   column stays 13 (D-18: never the donor again).
 /// - the model id still costs nothing, which is the half of D76 that D89 left standing.
 ///
 /// Asserted on **one row and one render**, because the three claims are the ends of one trade: a
@@ -600,9 +620,8 @@ async fn the_name_column_holds_the_whole_row_name_and_on_this_box_pays() {
             on_box_at(bordered),
             ON_BOX_WIDTH
         ),
-        "unauthenticat",
-        "and `on this box` pays for it, which is D89's stated price and not a \
-         regression:\n{rendered}"
+        NEEDS_LOGIN,
+        "and `on this box` holds its whole verdict:\n{rendered}"
     );
     assert_eq!(
         cell_at(
@@ -645,8 +664,8 @@ async fn the_name_column_absorbs_every_character_a_wider_terminal_adds() {
         assert_eq!(
             name_width(width),
             expected,
-            "the arithmetic D89 was decided on: width minus the seven fixed columns and their \
-             seven gaps, with no cap above it"
+            "the arithmetic D89 was decided on: width minus the gutter, the seven fixed \
+             columns and their seven gaps, with no cap above it"
         );
         let rendered = render_section_at(
             &section,
@@ -654,7 +673,9 @@ async fn the_name_column_absorbs_every_character_a_wider_terminal_adds() {
             u16::try_from(width).expect("a terminal width"),
         );
         assert!(
-            rendered.lines().any(|line| line.starts_with("claude-cli")),
+            rendered
+                .lines()
+                .any(|line| content(line).starts_with("claude-cli")),
             "and the name draws whole at {width} columns:\n{rendered}"
         );
     }
@@ -1301,12 +1322,12 @@ fn on_box_cell(rendered: &str, name: &str) -> String {
 /// test with `unauthenticat` inlined in it would read as a bug rather than as a packing decision;
 /// this clips them the way the frame does.
 fn as_drawn(expected: &str) -> String {
-    expected
-        .chars()
-        .take(ON_BOX_WIDTH)
-        .collect::<String>()
-        .trim_end()
-        .to_owned()
+    // Since MOD-115 M3 a cell is fitted with `…` (`cells::fit`): one cell less, then the mark.
+    if expected.chars().count() > ON_BOX_WIDTH {
+        let kept: String = expected.chars().take(ON_BOX_WIDTH - 1).collect();
+        return format!("{kept}\u{2026}");
+    }
+    expected.trim_end().to_owned()
 }
 
 /// Plan D19's cursor: `j`/`k` only, no wrap at either end.
@@ -2058,7 +2079,7 @@ async fn a_on_a_cli_row_is_refused_by_name_and_sends_nothing() {
     let emitted = bench.drained();
     assert_eq!(
         errors_of(&emitted),
-        vec!["`cli-row` is a `cli` agent; it has no `authenticate` call".to_owned()]
+        vec!["`cli-row` is a CLI agent; it has no `authenticate` call".to_owned()]
     );
     assert!(
         !asked_anything(&emitted),
@@ -2066,7 +2087,7 @@ async fn a_on_a_cli_row_is_refused_by_name_and_sends_nothing() {
     );
     assert_eq!(
         on_box_cell(&render_section(&section, &bench.ctx()), "cli-row"),
-        as_drawn("unauthenticated"),
+        NEEDS_LOGIN,
         "and the row is exactly where it was"
     );
 }
@@ -2265,7 +2286,7 @@ async fn a_methods_frame_renders_the_chooser_with_names_descriptions_logout_and_
         "the agent advertised a logout verb: {rendered}"
     );
     assert!(
-        rendered.contains("2 method(s) need a terminal htui does not provide"),
+        rendered.contains("2 methods need a terminal htui does not provide"),
         "and the terminal-typed ones are named as missing, not offered: {rendered}"
     );
     assert_eq!(
@@ -2523,7 +2544,7 @@ async fn x_sends_auth_cancel_and_the_cell_reads_cancelling() {
     assert!(rendered.contains("login cancelled"), "{rendered}");
     assert_eq!(
         on_box_cell(&rendered, "loginable"),
-        as_drawn("unauthenticated"),
+        NEEDS_LOGIN,
         "and the row goes back to what the probe last said about it: {rendered}"
     );
 }
@@ -2558,7 +2579,7 @@ async fn a_refused_open_keeps_the_pane_and_a_refused_start_clears_it() {
     );
     assert_eq!(
         on_box_cell(&render_section(&section, &bench.ctx()), "loginable"),
-        as_drawn("unauthenticated"),
+        NEEDS_LOGIN,
         "a refused request of the flow itself leaves a state a second `a` can start from"
     );
 }
@@ -2608,7 +2629,7 @@ async fn a_methods_frame_does_not_undo_a_cancel_pressed_while_starting() {
     bench.reply(&mut section, &StoreReply::Auth(AuthFrame::Cancelled));
     assert_eq!(
         on_box_cell(&render_section(&section, &bench.ctx()), "loginable"),
-        as_drawn("unauthenticated")
+        NEEDS_LOGIN
     );
 }
 
@@ -2657,7 +2678,7 @@ async fn a_second_choice_refused_by_a_live_flow_keeps_the_pane_and_the_others_cl
         );
         assert_eq!(
             on_box_cell(&render_section(&section, &bench.ctx()), "loginable"),
-            as_drawn("unauthenticated"),
+            NEEDS_LOGIN,
             "`{message}` leaves a state a second `a` can start from"
         );
     }
@@ -2684,7 +2705,7 @@ async fn done_clears_the_state_notes_the_status_and_re_reads_the_registry() {
         "the probe is the authority, so the section re-reads what the flow wrote: {emitted:?}"
     );
     let rendered = render_section(&section, &bench.ctx());
-    assert!(rendered.contains("logged in: ready"), "{rendered}");
+    assert!(rendered.contains("logged in: \u{25cf} ready"), "{rendered}");
     assert!(
         bench.key_hint(&section).contains("a authenticate"),
         "and the section is idle again: {rendered}"
@@ -2705,7 +2726,7 @@ async fn done_clears_the_state_notes_the_status_and_re_reads_the_registry() {
         }),
     );
     assert!(
-        render_section(&section, &bench.ctx()).contains("logged out: unauthenticated"),
+        render_section(&section, &bench.ctx()).contains("logged out: \u{26a0} needs login"),
         "a logout says which way it went"
     );
 }
@@ -2737,7 +2758,7 @@ async fn refused_shows_the_agents_sentence() {
     );
     assert_eq!(
         on_box_cell(&rendered, "loginable"),
-        as_drawn("unauthenticated"),
+        NEEDS_LOGIN,
         "and the flow is over"
     );
 }
@@ -2928,9 +2949,13 @@ fn delivering_over(bench: &SectionBench) -> AgentsSection {
     section
 }
 
-/// The one line of a render the field is drawn on, found by its `› ` prefix.
+/// What the paste field draws, found by its `kit::form` row (MOD-115 M3): behind the gutter,
+/// the `address` label and its column, then the masked field.
 fn field_line(rendered: &str) -> Option<&str> {
-    rendered.lines().find(|line| line.starts_with("\u{203a} "))
+    rendered
+        .lines()
+        .map(content)
+        .find_map(|line| line.strip_prefix("address   "))
 }
 
 /// D270, D282: `p` opens a masked field, and from then on the section's letters, the shell's `q`,
@@ -3383,11 +3408,7 @@ async fn a_delivered_frame_notes_what_the_listener_said_and_the_login_keeps_runn
         &StoreReply::Auth(AuthFrame::Delivered(reply.clone())),
     );
     let rendered = render_section(&section, &bench.ctx());
-    assert_eq!(
-        rendered.lines().last(),
-        Some(reply.summary().as_str()),
-        "{rendered}"
-    );
+    assert_eq!(note_line(&rendered), reply.summary(), "{rendered}");
     assert_eq!(on_box_cell(&rendered, "loginable"), "logging in\u{2026}");
     assert!(rendered.contains(REDIRECT_LINE), "{rendered}");
     assert!(!rendered.contains(DELIVERING), "{rendered}");
@@ -3502,7 +3523,7 @@ async fn a_deliver_refused_because_no_login_is_running_clears_the_pane() {
     let rendered = render_section(&section, &bench.ctx());
     assert_eq!(
         on_box_cell(&rendered, "loginable"),
-        as_drawn("unauthenticated"),
+        NEEDS_LOGIN,
         "a state a second `a` can start from"
     );
     assert!(!rendered.contains(DELIVERING), "{rendered}");
@@ -3548,10 +3569,7 @@ async fn a_deliver_overtaken_by_the_logins_end_waits_for_the_flows_last_frame() 
     bench.reply(&mut section, &StoreReply::Auth(AuthFrame::Cancelled));
     let _ = bench.drained();
     let rendered = render_section(&section, &bench.ctx());
-    assert_eq!(
-        on_box_cell(&rendered, "loginable"),
-        as_drawn("unauthenticated")
-    );
+    assert_eq!(on_box_cell(&rendered, "loginable"), NEEDS_LOGIN);
     assert_eq!(bench.key(&mut section, "a"), Handled::Consumed);
     assert!(
         matches!(&requests_of(&bench)[..], [StoreRequest::AuthStart { .. }]),
@@ -3673,8 +3691,9 @@ async fn the_paste_field_renders_under_the_link() {
 // -------------------------------------------------------------------------------------------
 
 /// The label column of the form: `default model` and `enabled (y/n)` are both 13 wide (D231);
-/// MOD-91's `mods (y/n)` (10) fits inside it.
-const LABEL_WIDTH: usize = 13;
+/// MOD-91's `mods (y/n)` (10) fits inside it. `kit::form` adds one cell to the longest label
+/// (MOD-115 M3), so the column is 14.
+const LABEL_WIDTH: usize = 14;
 
 /// The idle keys line (D245), written out rather than read from the section: this is the pin.
 const IDLE_KEYS: &str = "j/k select \u{b7} n new \u{b7} e edit \u{b7} m paths \u{b7} t this box \u{b7} r probe \u{b7} i install \u{b7} a authenticate";
@@ -3738,29 +3757,41 @@ fn filled(bench: &SectionBench, section: &mut AgentsSection, values: &[&str]) {
 
 /// The text of one form field as drawn, or `None` when the form has no such field.
 fn field_of(rendered: &str, label: &str) -> Option<String> {
-    let prefix = format!("{label:<width$}: ", width = LABEL_WIDTH);
-    rendered
-        .lines()
-        .find_map(|line| line.strip_prefix(prefix.as_str()))
-        .map(|rest| rest.trim_end().to_owned())
+    form_value(rendered, label, LABEL_WIDTH)
+}
+
+/// The value of the `kit::form` row labelled `label` in a label column `column` cells wide
+/// (MOD-115 M3): behind the gutter, the label padded to the column, then two blanks. An empty
+/// field draws its label alone, which the trimmed line ends on.
+fn form_value(rendered: &str, label: &str, column: usize) -> Option<String> {
+    let prefix = format!("{label:<column$}  ");
+    rendered.lines().map(content).find_map(|line| {
+        if line == label {
+            return Some(String::new());
+        }
+        line.strip_prefix(prefix.as_str())
+            .map(|rest| rest.trim().to_owned())
+    })
 }
 
 /// Whether the field labelled `label` holds the focus: its label is the accented one.
 fn focused_on(section: &AgentsSection, bench: &SectionBench, label: &str) -> bool {
-    let prefix = format!("{label:<width$}: ", width = LABEL_WIDTH);
+    let prefix = format!("{label:<width$}  ", width = LABEL_WIDTH);
     accented_lines(section, &bench.ctx())
         .iter()
-        // Trimmed: a field holding only spaces draws its label and nothing after the colon.
-        .any(|line| line.starts_with(prefix.trim_end()))
+        // A field holding only spaces draws its label alone, the line trimmed after it.
+        .any(|line| line.starts_with(&prefix) || line == label)
 }
 
 /// The section's last line: the note (D245).
 fn note_line(rendered: &str) -> String {
-    rendered
-        .lines()
-        .last()
-        .expect("the section always draws a note line")
-        .to_owned()
+    content(
+        rendered
+            .lines()
+            .last()
+            .expect("the section always draws a note line"),
+    )
+    .to_owned()
 }
 
 /// A registry row carrying a model list, a default and a stamp of its own, so an edit has
@@ -4943,7 +4974,8 @@ async fn the_idle_keys_are_the_shell_row_and_the_note_is_last() {
     let lines: Vec<&str> = rendered.lines().collect();
     assert_eq!(bench.key_hint(&section), IDLE_KEYS, "{rendered}");
     assert!(!rendered.contains(IDLE_KEYS), "{rendered}");
-    assert_eq!(lines[lines.len() - 1], IDLE_NOTE, "{rendered}");
+    assert_eq!(lines.len(), 30, "{rendered}");
+    assert_eq!(note_line(&rendered), IDLE_NOTE, "{rendered}");
 }
 
 /// The create form under the table (D230, D231).
@@ -5114,11 +5146,8 @@ fn paths_row(
 /// form sizes its label column to its own tools, so [`field_of`]'s 13 does not apply). An empty
 /// field draws its label and nothing after the colon, and the line is trimmed.
 fn paths_field_of(rendered: &str, label: &str, width: usize) -> Option<String> {
-    let prefix = format!("{label:<width$}:");
-    rendered
-        .lines()
-        .find_map(|line| line.strip_prefix(prefix.as_str()))
-        .map(|rest| rest.trim().to_owned())
+    // `kit::form`'s column is the longest label and one (MOD-115 M3).
+    form_value(rendered, label, width + 1)
 }
 
 /// Whether the tool-paths field labelled `label` holds the focus: its label is the accented one.
@@ -5175,7 +5204,7 @@ async fn m_opens_the_tool_paths_form_with_one_field_per_declared_tool() {
         "a tool with no manual path is an empty field: {rendered}"
     );
     let alpha_at = rendered.find("alpha_tool").expect("alpha_tool is drawn");
-    let beta_at = rendered.find("beta_tool ").expect("beta_tool is drawn");
+    let beta_at = rendered.find("\n beta_tool").expect("beta_tool is drawn");
     assert!(alpha_at < beta_at, "fields in name order: {rendered}");
     assert!(
         paths_focused_on(&section, &bench, "alpha_tool"),
@@ -5460,7 +5489,7 @@ async fn agent_written_tool_paths_closes_the_form_and_notes_the_status() {
     assert!(!section.captures_input(), "its own answer closes it");
     assert_eq!(
         note_line(&render_section(&section, &bench.ctx())),
-        "tool paths saved for `paths` \u{b7} this box: ready"
+        "tool paths saved for `paths` \u{b7} this box: \u{25cf} ready"
     );
 }
 
@@ -5561,7 +5590,7 @@ async fn a_manual_row_reads_manual_in_the_on_this_box_cell() {
     assert_eq!(on_box_cell(&rendered, "m-ready"), "0.48.0*", "{rendered}");
     assert_eq!(
         on_box_cell(&rendered, "m-missing"),
-        "missing*",
+        "\u{2717} missing*",
         "{rendered}"
     );
     assert_eq!(on_box_cell(&rendered, "p-ready"), "0.48.0", "{rendered}");
@@ -6324,6 +6353,45 @@ async fn f1_from_the_agents_form_opens_help_and_keeps_the_form() {
     );
 }
 
+/// MOD-115 M3 MD-A, end to end through the shell: a chord bound to a `[field]` row is only that
+/// row's in the Agents form. With `field.line_down` moved to `ctrl-n`, the shell hands the
+/// focused field the canonical `Down`, which a one-line field passes on; the form resolves its
+/// navigation from the chord the user pressed (`Ctx::pressed`), so `ctrl-n` never moves the focus
+/// the way `Down`'s `form.next_field` does, and `Down` itself still does.
+#[tokio::test]
+async fn a_rebound_field_chord_never_moves_the_agents_form_focus() {
+    let keys = htui::keys::load_str("version = 2\n[field]\nline_down = [\"ctrl-n\"]\n")
+        .expect("the key file loads");
+    let mut harness =
+        Harness::demo()
+            .with_keys(keys)
+            .with_tab(Box::new(SettingsTab::with_sections(vec![Box::new(
+                AgentsSection::new(),
+            )])));
+    harness.settle().await;
+    harness.key("n");
+    harness.settle().await;
+    let open = harness.render();
+    assert!(open.contains("Tab next field"), "the form is open: {open}");
+
+    harness.key("ctrl-n");
+    harness.settle().await;
+    assert_eq!(
+        harness.render(),
+        open,
+        "`ctrl-n` is `field.line_down`'s alone: the focus stayed on the first field"
+    );
+
+    harness.key("down");
+    harness.settle().await;
+    let moved = harness.render();
+    assert_ne!(moved, open, "`Down` is still `form.next_field`: {moved}");
+    assert!(
+        moved.contains("Tab next field"),
+        "and the form is still open: {moved}"
+    );
+}
+
 /// MOD-67 M6 D4: a rebound probe key is the one the Agents notes name, the idle note and the
 /// switched-on notice alike.
 #[tokio::test]
@@ -6334,9 +6402,8 @@ async fn a_rebound_settings_key_is_the_one_the_sentence_names() {
     let row = registry_row("declared", true);
     let mut section = section_over(&bench, vec![row.clone()]);
     let rendered = render_section(&section, &bench.ctx());
-    let lines: Vec<&str> = rendered.lines().collect();
     assert_eq!(
-        lines[lines.len() - 1],
+        note_line(&rendered),
         "quota latches per chat, P cannot refresh it",
         "{rendered}"
     );
@@ -6357,4 +6424,355 @@ async fn a_rebound_settings_key_is_the_one_the_sentence_names() {
         note_line(&render_section(&section, &bench.ctx())),
         "`declared` switched on; not probed yet \u{b7} P probes"
     );
+}
+
+// -------------------------------------------------------------------------------------------
+// MOD-115 M3 L-agents: the section on the kit (labels, widths, the keys in force)
+// -------------------------------------------------------------------------------------------
+
+/// MOD-83 (MOD-115 M3 D3): the table's enum cells are display labels, never wire values:
+/// `ACP`/`CLI` for the transport, `per token` for the billing, `● on`/`○ off` for the switch.
+#[tokio::test]
+async fn the_table_shows_display_labels_not_wire_values() {
+    let bench = SectionBench::new().await;
+    let ready = || Some(json!({ "status": "ready", "source": "probe" }));
+    let mut metered = probed_row("metered", true, Some("0.48.0"), ready());
+    metered.agent.billing = Billing::PerToken;
+    let mut piped = probed_row("piped", true, Some("0.48.0"), ready());
+    piped.agent.transport = Transport::Cli;
+    piped.agent.enabled = false;
+    let section = section_over(&bench, vec![metered, piped]);
+    let rendered = render_section(&section, &bench.ctx());
+
+    let metered = row_line(&rendered, "metered");
+    assert!(metered.contains(" ACP "), "{metered}");
+    assert!(metered.contains(" per token "), "{metered}");
+    assert!(metered.contains(" \u{25cf} on "), "{metered}");
+    let piped = row_line(&rendered, "piped");
+    assert!(piped.contains(" CLI "), "{piped}");
+    assert!(piped.contains(" subscription "), "{piped}");
+    assert!(piped.contains(" \u{25cb} off "), "{piped}");
+    for raw in [" acp ", " cli ", "per_token", " yes ", " no "] {
+        assert!(
+            !rendered.contains(raw),
+            "`{raw}` is a wire value: {rendered}"
+        );
+    }
+}
+
+/// MOD-81: below the 98 cells a bordered 100-column frame gives the section, the table drops
+/// `models`, then `billing`, then `transport` until `name` has its 10 cells (`claude-cli` whole);
+/// `default` (the model id `docs/ANA-4.md` §4.4 selects by), `quota` and `on this box` stay.
+#[tokio::test]
+async fn at_80_columns_the_table_drops_models_and_billing_and_keeps_the_name() {
+    let mut harness = settings_over(MemStore::demo()).await.size(80, 24);
+    let frame = harness.render();
+
+    assert!(frame.contains("claude-cli "), "the name is whole: {frame}");
+    assert!(
+        frame.contains(SEEDED_MODEL),
+        "and so is the model id: {frame}"
+    );
+    let header = frame
+        .lines()
+        .find(|line| line.contains("on this box"))
+        .unwrap_or_else(|| panic!("the header is drawn: {frame}"));
+    for kept in [
+        "name",
+        "transport",
+        "default",
+        "enabled",
+        "quota",
+        "on this box",
+    ] {
+        assert!(header.contains(kept), "`{kept}` is kept: {header}");
+    }
+    for dropped in ["models", "billing"] {
+        assert!(!header.contains(dropped), "`{dropped}` gives way: {header}");
+    }
+    assert!(!frame.contains("subscription"), "{frame}");
+    insta::assert_snapshot!("agents_80", frame);
+}
+
+/// MOD-115 M3 repair 2, finding 4: the registry switch's column is headed `enabled`, the word the
+/// create and edit forms use (`enabled (y/n)`), never `active`, which a row switched off on this
+/// box contradicts in its next cell. At the bordered 98 the header has no cell to spare: it starts
+/// in the blank gap before its 6-cell column (the `default` header leaves that gap empty), so
+/// `name` keeps 10 and the cells after it stay where they were.
+#[tokio::test]
+async fn the_registry_switch_is_headed_enabled_as_the_form_names_it() {
+    let bench = SectionBench::new().await;
+    let mut row = registry_row("vetoed", true);
+    row.user_off = true;
+    let mut section = section_over(&bench, vec![row]);
+    let rendered = render_section_at(&section, &bench.ctx(), SECTION_BORDERED);
+    let bordered = SECTION_BORDERED as usize;
+    let header = content(
+        rendered
+            .lines()
+            .next()
+            .expect("the table draws a header row"),
+    );
+    let column = default_at(bordered) + DEFAULT_WIDTH + 1;
+    assert_eq!(
+        header.chars().skip(column - 1).take(8).collect::<String>(),
+        "enabled ",
+        "the header starts in the gap before its column: {header}"
+    );
+    assert!(!header.contains("active"), "{header}");
+    assert_eq!(
+        cell_at(&rendered, "vetoed", bordered, column, 6),
+        "\u{25cf} on",
+        "and the cell sits in the column: {rendered}"
+    );
+    assert_eq!(
+        cell_at(&rendered, "vetoed", bordered, 0, name_width(bordered)),
+        "vetoed",
+        "{rendered}"
+    );
+    assert!(rendered.contains("switched off"), "{rendered}");
+
+    assert_eq!(bench.key(&mut section, "n"), Handled::Consumed);
+    let form = render_section(&section, &bench.ctx());
+    assert!(
+        form.contains("enabled (y/n)"),
+        "the form names the same switch: {form}"
+    );
+}
+
+/// MOD-115 M3 repair 2, finding 5 (D-18): a manual row whose probe found no login keeps its `*`.
+/// `⚠ needs login*` is 14 cells against the 13-cell `on this box`: wherever `name` has a cell past
+/// its 10 the column takes it and draws the cell whole; at the bordered 98, where it has none, the
+/// verdict gives up a letter and the `*` stays, so the idle note's `* manual path` still names a
+/// mark the table draws.
+#[tokio::test]
+async fn a_manual_row_that_needs_login_keeps_its_star() {
+    let bench = SectionBench::new().await;
+    let manual = paths_row_with(
+        "m-auth",
+        &["alpha_tool"],
+        &[("alpha_tool", tool_path("htui-mod66-alpha").as_str())],
+        ProbeSource::Manual,
+        ProbeStatus::Unauthenticated,
+    );
+    let section = section_over(&bench, vec![manual]);
+
+    let wide = render_section_at(&section, &bench.ctx(), 120);
+    assert!(
+        row_line(&wide, "m-auth")
+            .trim_end()
+            .ends_with("\u{26a0} needs login*"),
+        "a spare cell draws it whole: {wide}"
+    );
+    assert!(wide.contains("* manual path"), "{wide}");
+
+    let bordered = render_section_at(&section, &bench.ctx(), SECTION_BORDERED);
+    let line = row_line(&bordered, "m-auth").trim_end();
+    assert!(
+        line.ends_with("\u{26a0} needs log\u{2026}*"),
+        "no spare cell: the word gives way, the `*` stays: {bordered}"
+    );
+    let at = SECTION_BORDERED as usize;
+    assert_eq!(
+        cell_at(&bordered, "m-auth", at, 0, name_width(at)),
+        "m-auth",
+        "and `name` keeps its column: {bordered}"
+    );
+    assert!(bordered.contains("* manual path"), "{bordered}");
+}
+
+/// MOD-81: at the harness's 100 columns every column is drawn and `name` has its 10 cells,
+/// though `kit::list`'s gutter costs one.
+#[tokio::test]
+async fn at_100_columns_every_column_is_drawn_and_the_name_keeps_ten_cells() {
+    let mut harness = settings_over(MemStore::demo()).await;
+    let frame = harness.render();
+    let header = frame
+        .lines()
+        .find(|line| line.contains("on this box"))
+        .unwrap_or_else(|| panic!("the header is drawn: {frame}"));
+    for column in HEADERS {
+        assert!(header.contains(column), "`{column}`: {header}");
+    }
+    assert!(frame.contains("claude-cli "), "{frame}");
+}
+
+/// MOD-115 M3 MD-A (C6): the open form's and the paste field's hints name the `[field]` keys in
+/// force, through the form's and the field's own stacks.
+#[tokio::test]
+async fn the_form_and_paste_hints_name_the_field_keys_in_force() {
+    let bench = SectionBench::new().await;
+    let mut section = section_over(&bench, vec![registry_row("declared", true)]);
+    assert_eq!(bench.key(&mut section, "n"), Handled::Consumed);
+    assert_eq!(
+        bench.key_hint(&section),
+        "Tab next field \u{b7} Enter saves \u{b7} Esc cancels"
+    );
+    assert_eq!(bench.key_hint(&pasting_over(&bench)), HINT_PASTING);
+
+    let keys = htui::keys::load_str("version = 2\n[field]\nsubmit = \"ctrl-t\"\ncancel = \"f7\"\n")
+        .expect("the key file loads");
+    let bench = SectionBench::new().await.with_keys(keys);
+    let mut section = section_over(&bench, vec![registry_row("declared", true)]);
+    assert_eq!(bench.key(&mut section, "n"), Handled::Consumed);
+    assert_eq!(
+        bench.key_hint(&section),
+        "Tab next field \u{b7} Ctrl+t saves \u{b7} F7 cancels"
+    );
+    assert_eq!(
+        bench.key_hint(&pasting_over(&bench)),
+        "Ctrl+t sends \u{b7} F7 cancels"
+    );
+}
+
+/// MOD-115 M3 MD-A (D-5): a spent token under the open edit form names the key that retries,
+/// through the form's stack: `Enter` under the compiled keys, the rebound chord otherwise, and
+/// the clash sentence the same.
+#[tokio::test]
+async fn a_spent_token_names_the_retry_key_in_force() {
+    let keys = htui::keys::load_str("version = 2\n[field]\nsubmit = \"ctrl-t\"\n")
+        .expect("the key file loads");
+    let bench = SectionBench::new().await.with_keys(keys);
+    let row = editable_row("alpha");
+    let agent_id = row.agent.id;
+    let mut section = section_over(&bench, vec![row.clone()]);
+    bench.key(&mut section, "e");
+    pressed(&bench, &mut section, "tab", 3);
+    typed(&bench, &mut section, ", m9");
+    let _ = bench.drained();
+
+    let mut moved = row.clone();
+    moved.agent.updated_at = htui_core::fixtures::demo_at(2, 0);
+    bench.reply(
+        &mut section,
+        &written(vec![moved], AgentWrite::Stale { id: agent_id }),
+    );
+    assert_eq!(
+        note_line(&render_section(&section, &bench.ctx())),
+        CHANGED_ELSEWHERE.replace("Enter", "Ctrl+t")
+    );
+
+    let mut clashed = row;
+    clashed.agent.updated_at = htui_core::fixtures::demo_at(3, 0);
+    clashed.agent.models = vec!["m7".to_owned()];
+    bench.reply(
+        &mut section,
+        &written(vec![clashed], AgentWrite::Stale { id: agent_id }),
+    );
+    let note = note_line(&render_section(&section, &bench.ctx()));
+    assert!(
+        note.starts_with("changed elsewhere \u{2014} reloaded; Ctrl+t retries \u{b7} also changed elsewhere: models"),
+        "{note}"
+    );
+}
+
+/// MOD-115 M3 D4: the empty states say what is missing and the next step, through the keys in
+/// force where the step is a key.
+#[tokio::test]
+async fn the_empty_states_carry_a_next_step() {
+    let bench = SectionBench::new().await;
+    let section = section_over(&bench, Vec::new());
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(rendered.contains("no agents registered"), "{rendered}");
+    assert!(rendered.contains("n adds one"), "{rendered}");
+
+    let mut section = AgentsSection::new();
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "agents",
+            message: "the store is unreachable".to_owned(),
+        },
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(
+        rendered.contains("agent registry needs Postgres"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("Settings \u{203a} Connection stores a DSN"),
+        "{rendered}"
+    );
+}
+
+/// MOD-85 (MOD-115 M3): the cursor row carries `kit::list`'s gutter in the Settings accent and
+/// the selection band; the other rows neither.
+#[tokio::test]
+async fn the_cursor_row_carries_the_gutter_and_the_band() {
+    let bench = SectionBench::new().await;
+    let section = section_over(
+        &bench,
+        vec![registry_row("alpha", false), registry_row("beta", false)],
+    );
+    let ctx = bench.ctx();
+    let buffer = draw_section(&section, &ctx);
+    let accent = ctx.accent().fg.expect("the Settings accent has a colour");
+    let alpha = (0..buffer.area.height)
+        .find(|y| buffer[(1, *y)].symbol() == "a" && buffer[(2, *y)].symbol() == "l")
+        .expect("the alpha row is drawn");
+    assert_eq!(buffer[(0, alpha)].symbol(), "\u{258c}");
+    assert_eq!(buffer[(0, alpha)].fg, accent);
+    assert_eq!(
+        buffer[(1, alpha)].bg,
+        Theme::default().selected.bg.expect("a band colour")
+    );
+    assert_eq!(
+        buffer[(0, alpha + 1)].symbol(),
+        " ",
+        "beta has no gutter mark"
+    );
+    assert_ne!(
+        buffer[(1, alpha + 1)].bg,
+        buffer[(1, alpha)].bg,
+        "nor the band"
+    );
+}
+
+/// MOD-83: the chooser counts what it hides in words, not `(s)`.
+#[tokio::test]
+async fn the_chooser_counts_hidden_methods_in_words() {
+    let bench = SectionBench::new().await;
+    let one = chooser_over(&bench, false, 1);
+    let rendered = render_section(&one, &bench.ctx());
+    assert!(
+        rendered.contains("1 method needs a terminal htui does not provide"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("(s)"), "{rendered}");
+}
+
+/// MOD-115 M3 D-11: a table longer than the section reports its scroll for the Settings pane's
+/// scrollbar, in the section's rows, and keeps the cursor in view; one that fits reports none.
+#[tokio::test]
+async fn a_long_table_reports_its_scroll_and_keeps_the_cursor_in_view() {
+    let bench = SectionBench::new().await;
+    let rows: Vec<AgentSummary> = (0..40)
+        .map(|index| registry_row(&format!("agent-{index:02}"), false))
+        .collect();
+    let mut section = section_over(&bench, rows);
+    let _ = render_section(&section, &bench.ctx());
+    let Some((total, offset)) = section.scroll() else {
+        panic!("40 rows do not fit 30");
+    };
+    assert_eq!(offset, 0, "the cursor starts on the first row");
+    // The header, the note and the 28 rows between them: 12 rows are left over.
+    assert_eq!(
+        total,
+        30 + 40 - 28,
+        "the section's height and the rows it could not show"
+    );
+
+    pressed(&bench, &mut section, "j", 39);
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(
+        accented_lines(&section, &bench.ctx())
+            .iter()
+            .any(|line| line.starts_with("agent-39")),
+        "the cursor's row is drawn: {rendered}"
+    );
+    assert_eq!(section.scroll().map(|(_, offset)| offset), Some(12));
+
+    let short = section_over(&bench, vec![registry_row("alpha", false)]);
+    let _ = render_section(&short, &bench.ctx());
+    assert_eq!(short.scroll(), None);
 }
