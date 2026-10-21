@@ -2117,6 +2117,52 @@ async fn the_cursor_row_is_the_forms_marker() {
         .expect("the marked row");
     let accent = bench.ctx().accent();
     assert_eq!(buffer[(0, y)].fg, accent.fg.unwrap_or(Color::Reset));
+    let selected = bench.ctx().theme.selected.bg;
+    assert_ne!(
+        Some(buffer[(0, y)].bg),
+        selected,
+        "the gutter is not banded"
+    );
+    assert!(
+        (1..buffer.area.width).all(|x| Some(buffer[(x, y)].bg) == selected),
+        "the band runs the rest of the row"
+    );
+}
+
+/// MOD-85, while editing: the gutter keeps the tab's accent and only the label column is banded,
+/// so the field's cursor is not lost in the band.
+#[tokio::test]
+async fn an_open_editor_bands_its_label_alone() {
+    let (bench, mut section, _) = bench_with(&demo()).await;
+    move_to(&bench, &mut section, app_row(SettingKey::TokenBudget));
+    bench.key(&mut section, "e");
+    clear_field(&bench, &mut section);
+    type_at(&bench, &mut section, "4000");
+
+    let buffer = drawn(&bench, &section, 100);
+    let rows: Vec<u16> = (0..buffer.area.height)
+        .filter(|y| buffer[(0, *y)].symbol() == GUTTER.to_string())
+        .collect();
+    let [y] = rows.as_slice() else {
+        panic!("one marked row, got {rows:?}");
+    };
+    let text: String = (1..buffer.area.width)
+        .map(|x| buffer[(x, *y)].symbol())
+        .collect();
+    let key = SettingKey::TokenBudget.key();
+    assert!(text.starts_with(key), "{text}");
+    let accent = bench.ctx().accent();
+    assert_eq!(buffer[(0, *y)].fg, accent.fg.unwrap_or(Color::Reset));
+    let selected = bench.ctx().theme.selected.bg;
+    let banded = |x: u16| Some(buffer[(x, *y)].bg) == selected;
+    let label = u16::try_from(key.len()).expect("fits");
+    assert!((1..=label).all(banded), "the label is banded: {text}");
+    let value = u16::try_from(text.find("4000").expect("the typed value")).expect("fits") + 1;
+    assert!(
+        (value..value + 4).all(|x| !banded(x)),
+        "the typed value is not: {text}"
+    );
+    assert!(!banded(buffer.area.width - 1));
 }
 
 /// MOD-83: the fraction key reads in percent with the fraction it is typed as beside it, its

@@ -25,6 +25,11 @@ use htui_core::model::{
 };
 use htui_core::store::{MemStore, QueueTarget, QueueToken, StoreError};
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
+use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::Color;
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use serde_json::{Value, json};
 
 /// The demo world behind a memory backend.
@@ -495,6 +500,44 @@ fn only_request(bench: &SectionBench) -> StoreRequest {
 
 /// The kit form's gutter on the focused row (MOD-115 M3 D3).
 const GUTTER: char = '\u{258c}';
+
+/// The section drawn into a `width`x30 buffer: [`SectionBench::render_section`] answers text, and
+/// the MOD-85 accent is a style.
+fn drawn(bench: &SectionBench, section: &dyn SettingsSection, width: u16) -> Buffer {
+    let area = Rect::new(0, 0, width, 30);
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(width, 30),
+        TerminalOptions {
+            viewport: Viewport::Fixed(area),
+        },
+    )
+    .expect("a test terminal");
+    let ctx = bench.ctx();
+    terminal
+        .draw(|frame| section.render(frame, frame.area(), &ctx))
+        .expect("the section draws");
+    terminal.backend().buffer().clone()
+}
+
+/// The one buffer row whose first cell is the gutter, and the cells after it as text.
+#[track_caller]
+fn marked_row(buffer: &Buffer) -> (u16, String) {
+    let rows: Vec<u16> = (0..buffer.area.height)
+        .filter(|y| buffer[(0, *y)].symbol() == GUTTER.to_string())
+        .collect();
+    let [y] = rows.as_slice() else {
+        panic!("one marked row, got {rows:?}");
+    };
+    let text = (1..buffer.area.width)
+        .map(|x| buffer[(x, *y)].symbol())
+        .collect();
+    (*y, text)
+}
+
+/// Whether cell `x` of row `y` is in the bench theme's selection band.
+fn banded(bench: &SectionBench, buffer: &Buffer, x: u16, y: u16) -> bool {
+    Some(buffer[(x, y)].bg) == bench.ctx().theme.selected.bg
+}
 
 /// The frame line that starts with `label` after its gutter, or a panic naming the frame.
 #[track_caller]
@@ -1002,7 +1045,7 @@ async fn the_editor_is_the_row_it_edits() {
 }
 
 /// MOD-85: the focused row is marked by the form's gutter in the tab's accent, never a whole row
-/// in `theme.selected`.
+/// in `theme.selected`: the gutter stays out of the band, which runs the rest of the row.
 #[tokio::test]
 async fn the_cursor_row_is_the_forms_marker() {
     let snapshot = bench_settings(&demo()).await;
@@ -1015,6 +1058,43 @@ async fn the_cursor_row_is_the_forms_marker() {
         .collect();
     assert_eq!(marked.len(), 1, "{frame}");
     assert!(marked[0].contains("min budget"), "{frame}");
+
+    let buffer = drawn(&bench, &section, 100);
+    let (y, text) = marked_row(&buffer);
+    assert!(text.starts_with("min budget"), "{text}");
+    let accent = bench.ctx().accent();
+    assert_eq!(buffer[(0, y)].fg, accent.fg.unwrap_or(Color::Reset));
+    assert!(!banded(&bench, &buffer, 0, y), "the gutter is not banded");
+    assert!(
+        (1..buffer.area.width).all(|x| banded(&bench, &buffer, x, y)),
+        "the band runs the rest of the row"
+    );
+}
+
+/// MOD-85, while editing: the gutter keeps the tab's accent and only the label column is banded,
+/// so the field's cursor is not lost in the band.
+#[tokio::test]
+async fn an_open_editor_bands_its_label_alone() {
+    let snapshot = bench_settings(&demo()).await;
+    let (bench, mut section) = bench_from(&snapshot).await;
+    edit(&bench, &mut section, row::BATCH_CAP, "1.5");
+
+    let buffer = drawn(&bench, &section, 100);
+    let (y, text) = marked_row(&buffer);
+    assert!(text.starts_with("batch cap"), "{text}");
+    let accent = bench.ctx().accent();
+    assert_eq!(buffer[(0, y)].fg, accent.fg.unwrap_or(Color::Reset));
+    let value = u16::try_from(text.find("1.5").expect("the typed value")).expect("fits") + 1;
+    let label = u16::try_from("batch cap".len()).expect("fits");
+    assert!(
+        (1..=label).all(|x| banded(&bench, &buffer, x, y)),
+        "the label is banded: {text}"
+    );
+    assert!(
+        (value..value + 3).all(|x| !banded(&bench, &buffer, x, y)),
+        "the typed value is not: {text}"
+    );
+    assert!(!banded(&bench, &buffer, buffer.area.width - 1, y));
 }
 
 /// A write in flight is named in words (MOD-83: no request name on screen), on the refusal and on
