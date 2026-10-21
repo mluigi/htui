@@ -34,6 +34,40 @@ pub fn sites_except(src: &str, needles: &[&str], skip_fns: &[&str], exempt: &[&s
     lines
 }
 
+/// The names `src` gives the `needles` with `as` (`use ratatui::widgets::Block as Framed;`,
+/// or inside a `use` group), so a guard can look for them too: `Framed::bordered()` is the same
+/// frame (MOD-115 M3 RV1 L7). `as _` names nothing. Read everywhere, test items included: a
+/// name's scope is not the scanner's to tell.
+#[allow(dead_code)] // `tests/no_hardcoded_keys.rs` shares this module and does not use it.
+pub fn aliases(src: &str, needles: &[&str]) -> Vec<String> {
+    let stream = TokenStream::from_str(src).expect("the source tokenises");
+    let mut found = Vec::new();
+    collect_aliases(stream, needles, &mut found);
+    found
+}
+
+fn collect_aliases(stream: TokenStream, needles: &[&str], found: &mut Vec<String>) {
+    let tokens: Vec<TokenTree> = stream.into_iter().collect();
+    for (i, token) in tokens.iter().enumerate() {
+        match token {
+            TokenTree::Ident(ident) if needles.iter().any(|needle| ident == needle) => {
+                if let (Some(TokenTree::Ident(word)), Some(TokenTree::Ident(alias))) =
+                    (tokens.get(i + 1), tokens.get(i + 2))
+                    && word == "as"
+                    && alias != "_"
+                {
+                    let alias = alias.to_string();
+                    if !found.contains(&alias) {
+                        found.push(alias);
+                    }
+                }
+            }
+            TokenTree::Group(group) => collect_aliases(group.stream(), needles, found),
+            _ => {}
+        }
+    }
+}
+
 /// What [`walk`] looks for.
 struct Scan<'a> {
     needles: &'a [&'a str],
