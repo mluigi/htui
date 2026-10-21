@@ -2,6 +2,6 @@
 source: crates/htui/tests/qdrant_settings.rs
 expression: "frame_of(&bench, &section)"
 ---
-  URL    stored · https://qdrant.example:6334
-  Key    stored · <redacted>
-Remove the Qdrant settings from the keyring? y / n
+▌URL       stored · https://qdrant.example:6334
+           Remove the Qdrant settings from the keyring? y / n
+ API key   •••••••• stored

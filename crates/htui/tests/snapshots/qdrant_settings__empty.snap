@@ -2,7 +2,7 @@
 source: crates/htui/tests/qdrant_settings.rs
 expression: "frame_of(&bench, &section)"
 ---
-  URL    not stored
-  Key    not stored
-URL:
-no Qdrant URL is stored; type one and press Enter
+ URL       not stored
+▌new URL
+           no Qdrant URL is stored; type one and press Enter
+ API key   not stored
