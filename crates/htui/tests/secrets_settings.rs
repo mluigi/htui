@@ -3367,3 +3367,41 @@ async fn no_workspace_is_one_blank_under_the_rows() {
         "{shown}"
     );
 }
+
+/// Content parity (L-sec repair): a project slug wider than the form's label column is shown
+/// whole, not cut with `…`, so two projects that share a long prefix stay apart by name.
+#[tokio::test]
+async fn a_long_project_slug_is_shown_whole_at_80_columns() {
+    let (bench, mut section, tree) = loaded(configured()).await;
+    let slug = "graphics-vulkan-tutorials-for-the-long-slug-case";
+    let mut long = tree.clone();
+    long.projects[0].project.slug = slug.to_owned();
+    bench.reply(&mut section, &tree_reply(&long));
+    let shown = bench.render_section(&section, 78);
+    assert!(shown.contains(slug), "the whole slug: {shown}");
+    assert!(!shown.contains('\u{2026}'), "nothing is cut: {shown}");
+    assert!(
+        flat(&shown).contains(&format!("{slug} \u{b7} no secret provider")),
+        "the row's scope follows it: {shown}"
+    );
+}
+
+/// Content parity (L-sec repair): the latched-login note stays on screen while the question
+/// about the same Identity row is open.
+#[tokio::test]
+async fn the_latch_stays_while_the_identity_question_is_open() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    bench.reply(
+        &mut section,
+        &StoreReply::SecretCheck(SecretCheck::Provider {
+            at: at(14, 2, 11),
+            generation: 0,
+            outcome: Err(SecretError::BadCredentials),
+        }),
+    );
+    go_to(&bench, &mut section, ROW_IDENTITY);
+    bench.key(&mut section, "c");
+    let shown = flat(&frame(&bench, &section));
+    assert!(shown.contains("Remove the machine identity"), "{shown}");
+    assert!(shown.contains("the last login was refused"), "{shown}");
+}

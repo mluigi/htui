@@ -54,6 +54,7 @@ use crate::ui::cells::cell_width;
 use crate::ui::kit::chips::key_line;
 use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::form::{self, Form, Value};
+use crate::ui::kit::label::plural;
 use crate::ui::kit::list::{self, GUTTER};
 use crate::ui::kit::text::{Tone, notice, wrapped};
 use crate::ui::tabs::settings::{
@@ -982,15 +983,11 @@ impl SecretsSection {
         } else {
             match self.scope_checks.get(&project.id) {
                 None => String::new(),
-                Some((at, Ok(1))) => {
-                    format!(" \u{b7} checked {}: 1 key visible", at.format("%H:%M:%S"))
-                }
-                Some((at, Ok(n))) => {
-                    format!(
-                        " \u{b7} checked {}: {n} keys visible",
-                        at.format("%H:%M:%S")
-                    )
-                }
+                Some((at, Ok(n))) => format!(
+                    " \u{b7} checked {}: {} visible",
+                    at.format("%H:%M:%S"),
+                    plural(*n, "key", "keys")
+                ),
                 Some((at, Err(err))) => format!(" \u{b7} checked {}: {err}", at.format("%H:%M:%S")),
             }
         };
@@ -1012,14 +1009,19 @@ impl SecretsSection {
             )
     }
 
-    /// The label column every row and every form field shares, so opening a form moves no value
-    /// (MOD-115 M3 D3): the widest fixed label, form label and project slug, and one cell.
-    fn label_width(&self) -> u16 {
+    /// The label column every row and every form field shares in a form `width` wide, so opening
+    /// a form moves no value (MOD-115 M3 D3): the widest fixed label, form label and project slug,
+    /// and one cell, capped as the kit caps it (a third of `width`). A slug that would not fit
+    /// under that cap is left out: its row carries it in the value column instead
+    /// ([`Self::slug_fits`]), whole.
+    fn label_width(&self, width: u16) -> u16 {
+        let cap = usize::from(width / 3);
         let slugs = self
             .tree
             .iter()
             .flat_map(|tree| &tree.projects)
-            .map(|entry| cell_width(&entry.project.slug));
+            .map(|entry| cell_width(&entry.project.slug))
+            .filter(|cells| *cells < cap);
         let labels = Row::FIXED
             .iter()
             .map(|row| row.label())
@@ -1029,6 +1031,13 @@ impl SecretsSection {
             .map(cell_width);
         let widest = labels.chain(slugs).max().unwrap_or(0);
         u16::try_from(widest + 1).unwrap_or(u16::MAX)
+    }
+
+    /// Whether `slug` fits whole, with its one blank, in a label column `column` cells wide.
+    /// A slug that does not is never cut with `…` (two projects sharing a long prefix would read
+    /// as one): its row's label stays empty and the value column starts with it.
+    fn slug_fits(slug: &str, column: u16) -> bool {
+        cell_width(slug) < usize::from(column)
     }
 
     /// A fixed row's value: a stored or absent identity is the kit's secret value, every other
@@ -1059,10 +1068,11 @@ impl SecretsSection {
     /// the row they replace (so what is stored stays on screen), the focused one carrying its
     /// guide or refusal; a question is the error line of the row it is about; the latch is the
     /// Identity row's error and the Health guide the Health row's help.
-    fn form(&self, keys: &Keys) -> Form<'_> {
+    fn form(&self, width: u16, keys: &Keys) -> Form<'_> {
         let stack = views::SECRETS_BROWSE;
         let answers = answers(keys, views::SECRETS_CONFIRM);
-        let mut form = Form::new().label_width(self.label_width());
+        let mut form = Form::new().label_width(self.label_width(width));
+        let column = form.label_column(width);
         let mut item = 0;
         let mut focus = None;
         for (index, row) in Row::FIXED.into_iter().enumerate() {
@@ -1072,6 +1082,11 @@ impl SecretsSection {
                     field = field.error(asked(CONFIRM_CLEAR_URL, &answers));
                 }
                 (Mode::ConfirmClearIdentity, Row::Identity) => {
+                    // The row is focused while its question is open, so the latch rides as
+                    // its help, over the question: neither drops the other.
+                    if self.latched() {
+                        field = field.help(latched(keys.label(stack, Act::Edit).as_deref()));
+                    }
                     field = field.error(asked(CONFIRM_CLEAR_IDENTITY, &answers));
                 }
                 (_, Row::Identity) if self.latched() => {
@@ -1130,10 +1145,13 @@ impl SecretsSection {
             item += 1;
             for (index, entry) in tree.projects.iter().enumerate() {
                 let project = &entry.project;
-                let mut field = form::Field::new(
-                    project.slug.as_str(),
-                    Value::ReadOnly(Cow::Owned(self.project_text(project))),
-                );
+                let text = self.project_text(project);
+                let mut field = if Self::slug_fits(&project.slug, column) {
+                    form::Field::new(project.slug.as_str(), Value::ReadOnly(Cow::Owned(text)))
+                } else {
+                    let whole = format!("{} \u{b7} {text}", project.slug);
+                    form::Field::new("", Value::ReadOnly(Cow::Owned(whole)))
+                };
                 if let Mode::ConfirmClearScope {
                     project: id, slug, ..
                 } = &self.mode
@@ -1651,7 +1669,7 @@ impl SettingsSection for SecretsSection {
                 frame.render_widget(Paragraph::new(lines), rows);
             }
             None => {
-                let form = self.form(ctx.keys());
+                let form = self.form(rows.width, ctx.keys());
                 let mut lines = form.lines(rows.width, ctx.accent(), theme);
                 let notes = self.notes(rows.width, theme);
                 if !notes.is_empty() {
