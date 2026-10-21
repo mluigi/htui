@@ -1021,3 +1021,9 @@ The list is the current non-test `Block::`/`Borders::` sites outside group A and
    - L-agents: `unauthenticated` → `⚠ needs login`;
    - L-agents: below 98 cells the Agents table drops `models`, then `billing`, then `transport` to keep the name
      column at 10 or more.
+
+### Maintainer answers (2026-10-21)
+1. **D-14: write keys first.** L-req orders the tree pane's hint `a area · n new · e amend · W withdraw · / filter …`,
+   so the keys that change something survive a cut.
+2. **All three copy changes go ahead**: Prompt `10% (0.1)` with the bp range in the help line; Agents
+   `⚠ needs login`; the Agents table drops `models`, then `billing`, then `transport` below 98 cells.
