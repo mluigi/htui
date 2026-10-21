@@ -1194,8 +1194,8 @@ async fn free_feat_3<O: Orchestrate>(orch: &O) {
 /// and `token_budget` are none of them** (`crates/htui-core/src/model/kind.rs:230-251`), so the
 /// blueprint's `update_phase(review, expected, PhasePatch { gate: Some(Gate::Never), .. })`
 /// recipe does not compile. `create_phase` takes a whole `StepGraphPhase`, so a clone carrying the
-/// row a case wants is the reachable edit — and it is the same pair of writers
-/// `graph::override_graph` uses.
+/// row a case wants is the reachable edit. (`graph::override_graph` itself writes its clone
+/// through one `replace_graph` since MOD-137.)
 ///
 /// # Panics
 /// When any of the three writes is refused, which means the fixture moved under the case.

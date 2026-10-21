@@ -7847,7 +7847,8 @@ mod tests {
         /// `fan_out` are none of them** (`model/kind.rs:230-251`), so the blueprint's
         /// `update_phase(review, expected, PhasePatch { gate: Some(Gate::Never), .. })` does not
         /// exist. `create_phase` takes a whole `StepGraphPhase`, so a clone with the row a test
-        /// wants is the reachable edit — the same two writers `graph::override_graph` uses.
+        /// wants is the reachable edit (`graph::override_graph` writes through `replace_graph`
+        /// since MOD-137).
         async fn repoint(
             &self,
             item: htui_core::model::ItemId,
