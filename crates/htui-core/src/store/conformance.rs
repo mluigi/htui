@@ -264,6 +264,8 @@ pub const CASES: &[&str] = &[
     "a_persona_held_by_divide_columns_or_parts_is_not_deleted",
     "replace_graph_round_trips_every_node_field",
     "create_phase_keeps_split_in_step_with_fan_out",
+    // MOD-137 review round 1 (B-L4)
+    "replace_graph_replaces_candidates_and_parts_by_position",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -676,8 +678,9 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
             a_deleted_workspace_unscopes_its_runs_and_drops_its_stop(store).await;
         }
         // MOD-137: boxed, so the graph v2 cases' futures (each holding a whole `replace_graph`)
-        // do not widen this match's future, which every case's poll sits on; the Postgres run's
-        // 2 MiB test stack had no room left for it.
+        // do not widen this match's future. The stack overflow itself is fixed by `run_case`'s
+        // one outer box (073b8462), which moves the whole match off the stack; these only keep
+        // that one heap allocation, which every case pays, from growing to the largest graph case.
         "replace_graph_applies_nodes_edges_and_bumps_revision" => {
             Box::pin(replace_graph_applies_nodes_edges_and_bumps_revision(store)).await;
         }
@@ -740,6 +743,12 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "create_phase_keeps_split_in_step_with_fan_out" => {
             Box::pin(create_phase_keeps_split_in_step_with_fan_out(store)).await;
+        }
+        "replace_graph_replaces_candidates_and_parts_by_position" => {
+            Box::pin(replace_graph_replaces_candidates_and_parts_by_position(
+                store,
+            ))
+            .await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -22055,9 +22064,10 @@ async fn replace_graph_refuses_parts_on_a_non_divide_node<S: WriteStore>(store: 
 }
 
 /// MOD-137 D10: the refusal order, both stores, one sentence each (blueprint §T3.1, §T3.2). One
-/// body breaks every rule; each call mends one and expects exactly the next sentence. Then the
-/// graph name and a foreign phase or edge id. The revision never moves until the mended body is
-/// applied.
+/// body breaks every rule, the graph name and a foreign phase and edge id among them, so shape <
+/// name < foreign id < persona < agent < topology is pinned; each call mends one and expects
+/// exactly the next sentence. Then the node CHECKs a kept node trips alone. The revision never
+/// moves until the mended body is applied.
 async fn replace_graph_refusal_order<S: WriteStore>(store: &S) {
     const CASE: &str = "replace_graph_refusal_order";
     let (graph, phases) = scratch_graph(CASE, store, "ordered", &["plan", "build", "review"]).await;
@@ -22069,13 +22079,36 @@ async fn replace_graph_refusal_order<S: WriteStore>(store: &S) {
     let stray = PhaseId::new();
     let dangling = graph_edge(graph, plan, stray, EdgeKind::Next);
     let into_palette = graph_edge(graph, plan, build, EdgeKind::Next);
+    let foreign_edge = store
+        .graph_edges(ids::GRAPH_HTUI_FEAT)
+        .await
+        .expect(CASE)
+        .first()
+        .map(|edge| edge.id)
+        .unwrap_or_else(|| panic!("{CASE}: the fixture's feature graph has edges"));
+    let taken = GraphScope::Project(ids::PROJECT_HTUI);
 
+    // Review R1 B-M1: the body breaks every step at once, D10's steps 3 (shape), 4 (the graph's
+    // name), 5 (a phase id, then an edge id, another graph holds), 6 (personas, then agents) and
+    // 7 (topology), so each mend proves the next sentence outranks everything after it.
     let mut body = before.clone();
+    body.graph.name = "analysis".to_owned();
+    body.nodes.push(bare_node(StepGraphPhase {
+        id: ids::PHASE_HTUI_IMPLEMENT,
+        ..new_phase(graph, 7, "borrowed")
+    }));
     body.nodes[1].phase.name = "judge".to_owned();
     body.nodes[2].phase.position = 0;
     body.nodes[0].phase.persona_id = Some(ghost_persona);
     body.nodes[0].agents = vec![candidate(plan, 0, ghost_agent)];
-    body.edges = vec![dangling.clone(), into_palette.clone()];
+    body.edges = vec![
+        dangling.clone(),
+        into_palette.clone(),
+        StepGraphEdge {
+            id: foreign_edge,
+            ..graph_edge(graph, build, plan, EdgeKind::AsksYou)
+        },
+    ];
     body.nodes[2].phase.fan_out = 2;
     body.nodes[2].phase.retry_limit = -1;
     body.nodes[1].phase.palette = true;
@@ -22090,6 +22123,21 @@ async fn replace_graph_refusal_order<S: WriteStore>(store: &S) {
         (
             phase_position_is_taken(0, graph),
             Box::new(|b: &mut GraphBody| b.nodes[2].phase.position = 2),
+        ),
+        (
+            graph_name_is_taken("analysis", taken),
+            Box::new(|b: &mut GraphBody| b.graph.name = "ordered".to_owned()),
+        ),
+        (
+            already_exists("step_graph_phase", ids::PHASE_HTUI_IMPLEMENT),
+            Box::new(|b: &mut GraphBody| {
+                b.nodes
+                    .retain(|node| node.phase.id != ids::PHASE_HTUI_IMPLEMENT);
+            }),
+        ),
+        (
+            already_exists("step_graph_edge", foreign_edge),
+            Box::new(move |b: &mut GraphBody| b.edges.retain(|edge| edge.id != foreign_edge)),
         ),
         (
             references_no_row("step_graph_phase.persona_id", ghost_persona, "persona"),
@@ -22132,15 +22180,6 @@ async fn replace_graph_refusal_order<S: WriteStore>(store: &S) {
         mend(&mut body);
     }
 
-    body.graph.name = "analysis".to_owned();
-    constraint_exactly(
-        CASE,
-        store.replace_graph(graph, revision, body.clone()).await,
-        &graph_name_is_taken("analysis", GraphScope::Project(ids::PROJECT_HTUI)),
-        "a name the project's analysis graph holds",
-    );
-    body.graph.name = "ordered".to_owned();
-
     body.nodes[1].phase.fan_out = 0;
     constraint_exactly(
         CASE,
@@ -22158,37 +22197,6 @@ async fn replace_graph_refusal_order<S: WriteStore>(store: &S) {
         "a token_budget below 1 on a kept node (set_setting's Phase rung refuses it)",
     );
     body.nodes[1].phase.token_budget = None;
-
-    body.nodes.push(bare_node(StepGraphPhase {
-        id: ids::PHASE_HTUI_IMPLEMENT,
-        ..new_phase(graph, 7, "borrowed")
-    }));
-    constraint_exactly(
-        CASE,
-        store.replace_graph(graph, revision, body.clone()).await,
-        &already_exists("step_graph_phase", ids::PHASE_HTUI_IMPLEMENT),
-        "a node id another graph holds",
-    );
-    body.nodes.pop();
-
-    let foreign_edge = store
-        .graph_edges(ids::GRAPH_HTUI_FEAT)
-        .await
-        .expect(CASE)
-        .first()
-        .map(|edge| edge.id)
-        .unwrap_or_else(|| panic!("{CASE}: the fixture's feature graph has edges"));
-    body.edges.push(StepGraphEdge {
-        id: foreign_edge,
-        ..graph_edge(graph, build, plan, EdgeKind::AsksYou)
-    });
-    constraint_exactly(
-        CASE,
-        store.replace_graph(graph, revision, body.clone()).await,
-        &already_exists("step_graph_edge", foreign_edge),
-        "an edge id another graph holds",
-    );
-    body.edges.pop();
 
     assert_eq!(
         body_now(CASE, store, graph).await,
@@ -22412,8 +22420,9 @@ async fn every_graph_write_bumps_revision<S: WriteStore>(store: &S) {
                 "{CASE}: {what} moved nothing"
             );
         } else {
+            // `>=`, not `>`: a frozen clock (`MemStore::with_clock`) stamps every write alike.
             assert!(
-                now.updated_at > last.updated_at,
+                now.updated_at >= last.updated_at,
                 "{CASE}: {what} moved step_graph.updated_at"
             );
         }
@@ -22499,6 +22508,31 @@ async fn every_graph_write_bumps_revision<S: WriteStore>(store: &S) {
         "{CASE}: a reserved name is refused, got {refused:?}"
     );
     expect(6, "a refused create_phase").await;
+
+    // Review R1 B-L3: `replace_graph` and the three deleters move it too. Boxed, so this case's
+    // future stays within the Postgres run's 2 MiB debug test stack.
+    let mut body = body_now(CASE, store, graph.id).await;
+    let build = new_phase(graph.id, 1, "build");
+    let build_id = build.id;
+    body.nodes.push(bare_node(build));
+    let edge = graph_edge(graph.id, phase.id, build_id, EdgeKind::Next);
+    let edge_id = edge.id;
+    body.edges = vec![edge];
+    applied(
+        CASE,
+        Box::pin(store.replace_graph(graph.id, body.graph.revision, body))
+            .await
+            .expect(CASE),
+    );
+    expect(7, "replace_graph").await;
+    Box::pin(store.delete_edge(edge_id)).await.expect(CASE);
+    expect(8, "delete_edge").await;
+    Box::pin(store.delete_phase_agents(phase.id))
+        .await
+        .expect(CASE);
+    expect(9, "delete_phase_agents").await;
+    Box::pin(store.delete_phase(build_id)).await.expect(CASE);
+    expect(10, "delete_phase").await;
 }
 
 /// MOD-137 D3: a name is unique per scope: the library, a workspace and a project may each hold
@@ -22516,12 +22550,14 @@ async fn graph_scopes_are_unique_per_scope<S: WriteStore>(store: &S) {
         (GraphScope::Library, 0),
         "{CASE}: a library graph at revision 0"
     );
-    let twin = store
-        .create_step_graph(scoped_graph(GraphScope::Library, "lib", false))
-        .await;
-    assert!(
-        matches!(twin, Err(StoreError::Constraint(_))),
-        "{CASE}: the library holds `lib` once, got {twin:?}"
+    // Review R1 B-L5: both create refusals in their exact sentences.
+    constraint_exactly(
+        CASE,
+        store
+            .create_step_graph(scoped_graph(GraphScope::Library, "lib", false))
+            .await,
+        &graph_name_is_taken("lib", GraphScope::Library),
+        "the library holds `lib` once",
     );
     let in_workspace = store
         .create_step_graph(scoped_graph(workspace, "lib", false))
@@ -22536,16 +22572,14 @@ async fn graph_scopes_are_unique_per_scope<S: WriteStore>(store: &S) {
         ))
         .await
         .expect(CASE);
-    let orphan = store
-        .create_step_graph(scoped_graph(
-            GraphScope::Workspace(WorkspaceId::new()),
-            "lib",
-            false,
-        ))
-        .await;
-    assert!(
-        matches!(orphan, Err(StoreError::Constraint(_))),
-        "{CASE}: a workspace that names no row is refused, got {orphan:?}"
+    let nowhere = WorkspaceId::new();
+    constraint_exactly(
+        CASE,
+        store
+            .create_step_graph(scoped_graph(GraphScope::Workspace(nowhere), "lib", false))
+            .await,
+        &references_no_row("step_graph.workspace_id", nowhere, "workspace"),
+        "a workspace that names no row",
     );
     let body = body_now(CASE, store, lib.id).await;
     assert_eq!(body.graph, lib, "{CASE}: graph_body reads the library row");
@@ -22648,6 +22682,26 @@ async fn delete_workspace_takes_its_graphs<S: WriteStore>(store: &S) {
         )
         .await
         .expect(CASE);
+    // Review R1 B-L4: parts and an edge too, so the delete's edge and part drop has rows to take.
+    let mut body = body_now(CASE, store, graph.id).await;
+    body.nodes[0].phase.split = Split::Divide;
+    body.nodes[0].parts = vec![part_row(phase.id, 0, "core")];
+    let ship = new_phase(graph.id, 1, "ship");
+    let ship_id = ship.id;
+    body.nodes.push(bare_node(ship));
+    body.edges = vec![graph_edge(graph.id, phase.id, ship_id, EdgeKind::Next)];
+    applied(
+        CASE,
+        store
+            .replace_graph(graph.id, body.graph.revision, body)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        store.graph_edges(graph.id).await.expect(CASE).len(),
+        1,
+        "{CASE}: the workspace graph has its edge"
+    );
     let project_graphs = store.step_graphs(ids::PROJECT_HTUI).await.expect(CASE);
 
     let reach = store
@@ -22657,14 +22711,22 @@ async fn delete_workspace_takes_its_graphs<S: WriteStore>(store: &S) {
         .unwrap_or_else(|| panic!("{CASE}: the workspace exists"));
     assert_eq!(
         (reach.step_graphs, reach.phases, reach.phase_agents),
-        (1, 1, 2),
-        "{CASE}: the reach counts the graph, its phase and its candidates"
+        (1, 2, 2),
+        "{CASE}: the reach counts the graph, its phases and its candidates"
     );
     let done = store.delete_workspace(workspace.id).await.expect(CASE);
     assert_eq!(
         (done.step_graphs, done.phases, done.phase_agents),
-        (1, 1, 2),
+        (1, 2, 2),
         "{CASE}: the delete reports what the reach said"
+    );
+    assert!(
+        store.graph_edges(graph.id).await.expect(CASE).is_empty(),
+        "{CASE}: the graph's edges went with it"
+    );
+    assert!(
+        store.phase_parts(phase.id).await.expect(CASE).is_empty(),
+        "{CASE}: and its parts"
     );
     assert_eq!(
         store.graph_body(graph.id).await.expect(CASE),
@@ -22673,7 +22735,7 @@ async fn delete_workspace_takes_its_graphs<S: WriteStore>(store: &S) {
     );
     assert!(
         store.phases(graph.id).await.expect(CASE).is_empty(),
-        "{CASE}: and its phase"
+        "{CASE}: and its phases"
     );
     assert_eq!(
         store.step_graphs(ids::PROJECT_HTUI).await.expect(CASE),
@@ -23044,6 +23106,64 @@ async fn create_phase_keeps_split_in_step_with_fan_out<S: WriteStore>(store: &S)
         store.phases(graph).await.expect(CASE),
         vec![raced],
         "{CASE}: only the valid row was written"
+    );
+}
+
+/// MOD-137 D10 (review R1 B-L4): a kept node's candidates and parts are replaced wholesale, so
+/// rows the new body puts at other positions leave none of the old positions behind.
+async fn replace_graph_replaces_candidates_and_parts_by_position<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_replaces_candidates_and_parts_by_position";
+    let (graph, phases) = scratch_graph(CASE, store, "reslotted", &["split"]).await;
+    let split = phases[0].id;
+    let mut body = body_now(CASE, store, graph).await;
+    body.nodes[0].phase.split = Split::Divide;
+    body.nodes[0].agents = vec![
+        candidate(split, 0, ids::AGENT_CLAUDE),
+        candidate(split, 1, ids::AGENT_AGY),
+    ];
+    body.nodes[0].parts = vec![part_row(split, 0, "core"), part_row(split, 1, "docs")];
+    let first = applied(
+        CASE,
+        store
+            .replace_graph(graph, body.graph.revision, body)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (first.nodes[0].agents.len(), first.nodes[0].parts.len()),
+        (2, 2),
+        "{CASE}: the first body's rows"
+    );
+
+    let mut moved = first.clone();
+    moved.nodes[0].agents = vec![candidate(split, 5, ids::AGENT_AGY)];
+    moved.nodes[0].parts = vec![part_row(split, 7, "core")];
+    let answer = applied(
+        CASE,
+        store
+            .replace_graph(graph, first.graph.revision, moved)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        answer.nodes[0].agents,
+        vec![candidate(split, 5, ids::AGENT_AGY)],
+        "{CASE}: only the new candidate slot"
+    );
+    assert_eq!(
+        answer.nodes[0].parts,
+        vec![part_row(split, 7, "core")],
+        "{CASE}: only the new part slot"
+    );
+    assert_eq!(
+        store.phase_parts(split).await.expect(CASE),
+        vec![part_row(split, 7, "core")],
+        "{CASE}: phase_parts agrees"
+    );
+    assert_eq!(
+        body_now(CASE, store, graph).await,
+        answer,
+        "{CASE}: graph_body agrees"
     );
 }
 

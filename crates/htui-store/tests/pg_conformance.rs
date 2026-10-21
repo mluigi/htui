@@ -36,18 +36,20 @@ use htui_store::testkit as common;
 /// and MOD-125 M1's four claim-gate cases (plan D5) make it 173,
 /// and MOD-125 M1's settlement case (plan D6) makes it 174,
 /// and MOD-125 M1's deleted-workspace case (blueprint F16) makes it 175,
-/// and MOD-137 T3's eighteen graph v2 cases (plan D3-D11, blueprint §T3.6) make it 193.
-const EXPECTED_CASES: usize = 193;
+/// and MOD-137 T3's eighteen graph v2 cases (plan D3-D11, blueprint §T3.6) make it 193,
+/// and MOD-137 review round 1's kept-node slot case (plan D10) makes it 194.
+const EXPECTED_CASES: usize = 194;
 
 #[test]
 fn case_list_matches_mem_store() {
     assert_eq!(
         htui_core::store::conformance::CASES.len(),
         EXPECTED_CASES,
-        "every conformance case must run against PgStore too (193 since MOD-78's `lease_holds` \
+        "every conformance case must run against PgStore too (194 since MOD-78's `lease_holds` \
          case, MOD-10 M4's secret-column case, MOD-12 M2's five queue-setting cases and \
          MOD-125 M1's run-workspace and four stop-verb and four claim-gate cases and its \
-         settlement and deleted-workspace cases, MOD-137's eighteen graph v2 cases)"
+         settlement and deleted-workspace cases, MOD-137's eighteen graph v2 cases and its \
+         review round's kept-node slot case)"
     );
 }
 
