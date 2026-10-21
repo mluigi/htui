@@ -334,6 +334,64 @@ async fn a_parked_permission_is_answered_with_a_digit_and_recorded_as_the_users(
     );
 }
 
+/// MOD-115 M3 (MOD-81): the Chat at 80 columns, a request parked. The title is fitted to the
+/// narrower border, so it drops the `session ` label and cuts the fields before the ref, never
+/// the ref itself; the transcript, the permission strip's key chips and the hints all fit.
+#[tokio::test]
+async fn the_chat_at_eighty_columns() {
+    let script = Script::one_turn(vec![
+        ScriptEvent::Emit(DriverEvent::ToolCall(ToolCallEvent {
+            tool_call_id: "call-1".to_owned(),
+            title: "rm -rf build".to_owned(),
+            tool_kind: ToolKind::Execute,
+            input: json!({ "command": "rm -rf build" }),
+            locations: Vec::new(),
+        })),
+        ScriptEvent::ParkPermission(PermissionRequestEvent {
+            request_id: PermissionRequestId::new("req-1"),
+            tool_call_id: Some("call-1".to_owned()),
+            options: vec![
+                PermissionOption {
+                    id: "allow".to_owned(),
+                    label: "Allow once".to_owned(),
+                    kind: PermissionOptionKind::AllowOnce,
+                },
+                PermissionOption {
+                    id: "always".to_owned(),
+                    label: "Allow always".to_owned(),
+                    kind: PermissionOptionKind::AllowAlways,
+                },
+                PermissionOption {
+                    id: "reject".to_owned(),
+                    label: "Reject".to_owned(),
+                    kind: PermissionOptionKind::RejectOnce,
+                },
+            ],
+        }),
+        done(),
+    ]);
+    let (mut harness, _) =
+        harness_over(script, Transport::Acp, |harness| harness.size(80, 24)).await;
+    compose(&mut harness, "clean the build");
+    harness.drive().await;
+    let frame = harness.render();
+    let shown = frame.split_once("fake-").map(|(_, tail)| {
+        tail.chars()
+            .take_while(|c| c.is_ascii_hexdigit() || *c == '-')
+            .count()
+    });
+    assert_eq!(shown, Some(36), "the whole session ref: {frame}");
+    assert!(
+        frame.contains("run rm -rf build  \u{25d0} running"),
+        "{frame}"
+    );
+    assert!(
+        frame.contains("answer   1  Allow once   2  Allow always (agent remembers)   3  Reject"),
+        "{frame}"
+    );
+    stable().bind(|| insta::assert_snapshot!("chat_eighty_columns", frame));
+}
+
 #[tokio::test]
 async fn a_follow_up_opens_a_second_turn() {
     let script = Script::turns(vec![

@@ -3,14 +3,13 @@ source: crates/htui/tests/chat.rs
 expression: replayed
 ---
 Graphics   ¹Chat                0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
-┌ Chat ────────────────────────────────────────────────────────────────────────────────────────────┐
-│replay · step …<step> · 6 rows · read-only · Esc leave                                          │
+╭─ replay · step …<step> · 6 rows · read-only ───────────────────────────────────────────────────╮
 │you  what is in main.rs                                                                           │
 │thought  I should read the file first (t to unfold)                                               │
 │Reading it now.                                                                                   │
-│read src/main.rs  [ok]                                                                            │
+│read src/main.rs  ● done                                                                          │
 │It is empty.                                                                                      │
-│— turn ended (end_turn) —                                                                         │
+│— turn ended —                                                                                    │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -31,4 +30,5 @@ Graphics   ¹Chat                0 working · 0 waiting · memory · DESKTOP-HTU
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-└─Esc leave replay · t thoughts · j/k scroll───────────────────────────────────────────────────────┘
+│                                                                                                  │
+╰─Esc leave replay · t thoughts · j/k scroll───────────────────────────────────────────────────────╯

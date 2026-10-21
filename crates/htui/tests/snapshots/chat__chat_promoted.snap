@@ -3,11 +3,10 @@ source: crates/htui/tests/chat.rs
 expression: rendered
 ---
 Graphics   ¹Chat                0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
-┌ Chat ────────────────────────────────────────────────────────────────────────────────────────────┐
-│promoted · research · handoff · scripted · sonnet · fake-<session>     │
+╭─ promoted · research · handoff · scripted · sonnet · fake-<session> ──╮
 │you  You are continuing work already under way on htui:ANA-2, phase research, attempt 1.A previous│
 │Picking the step back up.                                                                         │
-│— turn ended (end_turn) —                                                                         │
+│— turn ended —                                                                                    │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -31,4 +30,5 @@ Graphics   ¹Chat                0 working · 0 waiting · memory · DESKTOP-HTU
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-└─i compose · Esc Esc end · t thoughts · j/k scroll────────────────────────────────────────────────┘
+│                                                                                                  │
+╰─i compose · Esc Esc end · t thoughts · j/k scroll────────────────────────────────────────────────╯
