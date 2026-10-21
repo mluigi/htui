@@ -3,16 +3,16 @@ source: crates/htui/tests/requirements.rs
 expression: frame
 ---
 Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       1 waiting ·  F9  about   ?  keys
-┌ Requirements (3) ─────────────────────────┐┌ UI ─────────────────────────────────────────────────┐
-│▾ htui (3)                                 ││UI User interface                                    │
-│  ▾ ENT Entity model (2)                   ││                                                     │
-│    R-ENT-1  must   Every item has a stabl…││0 requirements                                       │
-│    R-ENT-2  later  An item may carry a fr…││                                                     │
-│  ▾ STO Storage (1)                        ││                                                     │
-│    R-STO-1  must   Postgres is the source…││                                                     │
-│  ▾ UI User interface (0)                  ││                                                     │
-│▾ agy (0)                                  ││                                                     │
-│  no areas                                 ││                                                     │
+╭─ Requirements (3) ────────────────────────╮╭─ UI ────────────────────────────────────────────────╮
+│ ▾ htui (3)                                ││UI User interface                                    │
+│   ▾ ENT Entity model (2)                  ││                                                     │
+│     R-ENT-1  must   Every item has a stab…││0 requirements                                       │
+│     R-ENT-2  later  An item may carry a f…││                                                     │
+│   ▾ STO Storage (1)                       ││                                                     │
+│     R-STO-1  must   Postgres is the sourc…││                                                     │
+│▌  ▾ UI User interface (0)                 ││                                                     │
+│ ▾ agy (0)                                 ││                                                     │
+│   no areas                                ││                                                     │
 │                                           ││                                                     │
 │                                           ││                                                     │
 │                                           ││                                                     │
@@ -29,5 +29,6 @@ Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       1 wai
 │                                           ││                                                     │
 │                                           ││                                                     │
 │                                           ││                                                     │
-└─j/k move · Enter fold · / filter · a area · n new · e amend · W withdraw · r reload──────────────┘
+│                                           ││                                                     │
+╰─a area · n new · e amend · W withdraw · …─╯╰─────────────────────────────────────────────────────╯
  added area UI

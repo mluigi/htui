@@ -271,7 +271,11 @@ async fn enter_on_a_requirement_hit_opens_it_in_the_requirements_tab() {
     assert!(harness.app().overlays.is_empty());
     assert_eq!(harness.app().tabs.active_id(), Some(RequirementsTab::ID));
     let frame = harness.render();
-    assert!(frame.contains(&format!("\u{250c} {} ", hit.key)), "{frame}");
+    // MOD-115 M3 L-req: the Requirements detail is a kit pane, titled `╭─ KEY `.
+    assert!(
+        frame.contains(&format!("\u{256d}\u{2500} {} ", hit.key)),
+        "{frame}"
+    );
     assert!(!frame.contains("select a requirement"), "{frame}");
 }
 

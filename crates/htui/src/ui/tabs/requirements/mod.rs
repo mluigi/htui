@@ -34,9 +34,8 @@ use htui_core::store::{invalid_area_code, requirement_withdrawn};
 use htui_store::DATABASE_UNREACHABLE;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 
 use crate::app::{Action, Ctx, Handled, RevealTarget};
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, is_plain, views};
@@ -46,7 +45,12 @@ use crate::requirements::{
     mint_refused, not_the_maintainer,
 };
 use crate::store_worker::{StoreReply, StoreRequest};
-use crate::ui::kit::{modal::modal_rest, text::wrapped};
+use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::filter::{self, Filter};
+use crate::ui::kit::list;
+use crate::ui::kit::modal::modal_rest;
+use crate::ui::kit::pane::{Focus, Pane};
+use crate::ui::kit::text::{self as kit_text, Tone, wrapped};
 use crate::ui::shell::{ListSize, PaneId, Panes, TabLayout, TabLoc};
 use crate::ui::tabs::backlog::detail::{Scroll, Step, capture_area};
 use crate::ui::tabs::backlog::list::window;
@@ -58,8 +62,8 @@ use forms::{AreaForm, FormFocus, FormOutcome, FormTarget, RequirementForm, Withd
 use tree::{Fold, Row, TreeView};
 
 /// The Requirements tab's default layout (MOD-115 M2 D2): the tree beside the detail, 45% of
-/// the rows above the notice and the filter row, as `Layout::horizontal([Percentage(45),
-/// Percentage(55)])` split them before the shell kept layouts.
+/// the rows above the notice, as `Layout::horizontal([Percentage(45), Percentage(55)])` split
+/// them before the shell kept layouts.
 pub const REQUIREMENTS_LAYOUT: TabLayout = TabLayout {
     list: ListSize::Percent(45),
     ..TabLayout::DEFAULT
@@ -81,14 +85,29 @@ const NOTICE_LINES: usize = 2;
 /// The tree before the first reply.
 const NOT_READ: &str = "requirements not read yet";
 
+/// [`NOT_READ`]'s next step (MOD-115 M3, audit item 2).
+const NOT_READ_NEXT: &str = "they appear once the store answers";
+
 /// A tree with nothing under the filter.
 const NOTHING_MATCHES: &str = "nothing matches the filter";
+
+/// [`NOTHING_MATCHES`]'s next step with no key bound to clear the filter.
+const CLEAR_THE_FILTER: &str = "clear the filter to see every row";
 
 /// A scope with no project to show.
 const NO_PROJECTS: &str = "No projects in this workspace.";
 
+/// [`NO_PROJECTS`]'s next step.
+const NO_PROJECTS_NEXT: &str = "Settings \u{203a} Hierarchy adds a project";
+
 /// The detail pane with nothing selected.
 const SELECT_A_ROW: &str = "select a requirement";
+
+/// [`SELECT_A_ROW`]'s next step, through the keys in force (`j/k chooses one`).
+const CHOOSE_A_ROW: HintSpec = &[Hint::Pair(Act::ListDown, Act::ListUp, "chooses one")];
+
+/// [`CHOOSE_A_ROW`] with neither motion bound.
+const CHOOSE_A_ROW_UNBOUND: &str = "a row of the tree opens here";
 
 /// A write went out.
 const SAVING: &str = "saving\u{2026}";
@@ -102,14 +121,17 @@ const SELECT_A_REQUIREMENT: &str = "select a requirement first";
 /// The withdraw's typed-back key did not match.
 const NOT_THE_REQUIREMENT_KEY: &str = "that is not the requirement's key";
 
-/// The hint row's words before the write keys (MOD-67 M4 D9).
+/// The hint row's words after the write keys (MOD-67 M4 D9; MOD-115 M3 D-14: after them, so a
+/// pane's cut takes these first).
 const HINT_MOVE: HintSpec = &[
+    Hint::One(Act::RequirementsFilter, "filter"),
     Hint::Pair(Act::ListDown, Act::ListUp, "move"),
     Hint::One(Act::ListFold, "fold"),
-    Hint::One(Act::RequirementsFilter, "filter"),
 ];
 
-/// The four write keys, dimmed when the selected project refuses them.
+/// The four write keys, dimmed when the selected project refuses them. First on the hint row
+/// (MOD-115 M3 D-14, the maintainer's call of 2026-10-21): the keys that change something
+/// survive the cut to the tree pane's width.
 const HINT_WRITES: HintSpec = &[
     Hint::One(Act::RequirementsNewArea, "area"),
     Hint::One(Act::New, "new"),
@@ -120,36 +142,34 @@ const HINT_WRITES: HintSpec = &[
 /// The hint row's words after the write keys.
 const HINT_RELOAD: HintSpec = &[Hint::One(Act::Reload, "reload")];
 
-/// The hint row while the filter is open: the field's own keys, `field.submit` through the keys
-/// (MOD-115 M2 MD1) and `Esc` as written (MD7).
+/// The hint row while the filter is open: the field's own keys, `field.submit` and
+/// `field.cancel` through the keys (MOD-115 M2 MD1; M3 MD-A, C6: `Esc` under the compiled ones).
 const FILTER_HINT: HintSpec = &[
     Hint::One(Act::FieldSubmit, "apply"),
-    Hint::Text("Esc clear"),
+    Hint::One(Act::FieldCancel, "clear"),
 ];
 
-/// The filter field's width on the filter row.
-const FILTER_WIDTH: u16 = 30;
-
-/// The hint row on the area and requirement forms (MOD-67 M4 D9).
+/// The hint row on the area and requirement forms (MOD-67 M4 D9; MOD-115 M3 MD-A, C6).
 const FORM_HINT: HintSpec = &[
     Hint::One(Act::FormNextField, "field"),
     Hint::One(Act::FormSave, "save"),
-    Hint::Text("Esc cancel"),
+    Hint::One(Act::FieldCancel, "cancel"),
 ];
 
-/// Added to [`FORM_HINT`] on the priority field: the choice's own value keys (D10), through the
-/// keys in force (MOD-115 M2 RV1 H2; `m/l` under the defaults).
+/// Put before [`FORM_HINT`] on the priority field: the choice's own value keys (D10), through the
+/// keys in force (MOD-115 M2 RV1 H2; `m/l` under the defaults). First, so the pane's cut keeps
+/// the keys that act on the focused field (MOD-115 M3, as D-14 orders the tree's).
 const PRIORITY_HINT: HintSpec = &[Hint::Pair(
     Act::RequirementsPriorityMust,
     Act::RequirementsPriorityLater,
     "priority",
 )];
 
-/// The hint row on the withdraw form: its field's own keys, `field.submit` through the keys in
-/// force (RV1 H2) and `Esc` as written (MD7).
+/// The hint row on the withdraw form: its field's own keys, `field.submit` and `field.cancel`
+/// through the keys in force (RV1 H2; MOD-115 M3 MD-A, C6).
 const WITHDRAW_HINT: HintSpec = &[
     Hint::One(Act::FieldSubmit, "next"),
-    Hint::Text("Esc cancel"),
+    Hint::One(Act::FieldCancel, "cancel"),
 ];
 
 /// A key while a write is in flight: one at a time (the Skills tab's rule).
@@ -245,7 +265,7 @@ pub struct RequirementsTab {
     /// The tab write in flight, by `StoreRequest::name`: one at a time, and the only write a
     /// `RequirementWritten` lands (MOD-59 D4).
     busy: Option<&'static str>,
-    /// The last outcome, on the notice rows above the filter row.
+    /// The last outcome, on the notice rows under the panes.
     notice: Option<Notice>,
     /// A reveal waiting for the next `Requirements` reply (MOD-64 D235).
     pending_reveal: Option<(RequirementId, String)>,
@@ -270,7 +290,7 @@ enum Mode {
     Withdraw(WithdrawForm),
 }
 
-/// The report on the notice rows, above the filter row.
+/// The report on the notice rows, under the panes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Notice {
     /// Dim.
@@ -569,7 +589,8 @@ impl RequirementsTab {
                 self.mode = Mode::Browse;
                 self.reselect(ctx);
             }
-            FieldOutcome::Pass => return modal_rest(stack, KeyChord::from_event(key)),
+            // MOD-115 M3 MD-A: the rest resolves from the chord pressed (`Ctx::pressed`).
+            FieldOutcome::Pass => return modal_rest(stack, ctx.pressed(&key)),
         }
         Handled::Consumed
     }
@@ -969,31 +990,58 @@ impl RequirementsTab {
 
     // --- render --------------------------------------------------------------------------------
 
-    /// The left pane.
-    fn render_tree(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
+    /// The left pane (MOD-115 M3 D6): a kit pane titled with the count, the filter band as its
+    /// first row while a filter is typed or applied, then the tree through `kit::list`.
+    fn render_tree(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        focus: Focus,
+        hints: Option<&Line<'static>>,
+        ctx: &Ctx<'_>,
+    ) {
+        let theme = ctx.theme;
         let count = self.snapshot.as_ref().map_or(0, |snapshot| {
             tree::count(snapshot, ctx.projects, &self.filter)
         });
-        let title = if self.filter.is_empty() {
-            format!(" Requirements ({count}) ")
-        } else {
-            format!(" Requirements ({count}) \u{b7} /{} ", self.filter)
-        };
-        let block = Block::new().borders(Borders::ALL).title(title);
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        let message = |text: &str, style: Style| {
-            Paragraph::new(Line::styled(text.to_owned(), style)).wrap(Wrap { trim: true })
-        };
+        let title = format!("Requirements ({count})");
+        let mut pane = Pane::new(&title).focus(focus).accent(ctx.accent());
+        if let Some(hints) = hints {
+            pane = pane.hints(hints.clone());
+        }
+        let inner = Pane::inner(area);
         let Some(snapshot) = &self.snapshot else {
-            let (text, style) = self
-                .unavailable
-                .as_ref()
-                .map_or((NOT_READ, ctx.theme.dim), |error| {
-                    (error.as_str(), ctx.theme.error)
-                });
-            frame.render_widget(message(text, style), inner);
+            match &self.unavailable {
+                Some(error) => self.render_unavailable(frame, inner, error, ctx),
+                None => empty::render(frame, inner, NOT_READ, NextStep(NOT_READ_NEXT), theme),
+            }
+            pane.render(frame, area, theme);
             return;
+        };
+        // The band, while the filter is typed or a non-empty one is applied (D3: an empty applied
+        // query is no band, and its row is not reserved).
+        let total = tree::count(snapshot, ctx.projects, "");
+        let band = match &self.mode {
+            Mode::Filter { field } => Some(Filter::Typing {
+                field,
+                shown: count,
+                total,
+            }),
+            _ if !self.filter.is_empty() => Some(Filter::Applied {
+                query: &self.filter,
+                shown: count,
+                total,
+            }),
+            _ => None,
+        };
+        let band_rows = u16::from(band.is_some()).min(inner.height);
+        if let Some(band) = &band {
+            filter::render(frame, inner, band, ctx.accent(), theme);
+        }
+        let body = Rect {
+            y: inner.y + band_rows,
+            height: inner.height - band_rows,
+            ..inner
         };
         let view = TreeView {
             snapshot,
@@ -1002,21 +1050,50 @@ impl RequirementsTab {
             filter: &self.filter,
             selected: self.selected,
         };
-        let (mut lines, cursor) = tree::lines(&view, usize::from(inner.width), ctx.theme);
-        if lines.is_empty() {
-            let text = if self.filter.is_empty() {
-                NO_PROJECTS
+        let (rows, cursor) = tree::lines(&view, usize::from(body.width.saturating_sub(1)), theme);
+        if rows.is_empty() {
+            if self.filter.is_empty() {
+                empty::render(frame, body, NO_PROJECTS, NextStep(NO_PROJECTS_NEXT), theme);
             } else {
-                NOTHING_MATCHES
-            };
-            frame.render_widget(message(text, ctx.theme.dim), inner);
+                let next = self.clear_filter_next(ctx.keys());
+                empty::render(frame, body, NOTHING_MATCHES, NextStep(&next), theme);
+            }
+            pane.render(frame, area, theme);
             return;
         }
-        let offset = window(cursor.unwrap_or(0), lines.len(), usize::from(inner.height));
-        frame.render_widget(
-            Paragraph::new(lines.split_off(offset.min(lines.len()))),
-            inner,
-        );
+        let offset = window(cursor.unwrap_or(0), rows.len(), usize::from(body.height));
+        list::render(frame, body, &rows, cursor, offset, ctx.accent(), theme);
+        pane.scrollbar(rows.len(), offset)
+            .scrollbar_span(band_rows, body.height)
+            .render(frame, area, theme);
+    }
+
+    /// The tree with no snapshot after a refused read: the refusal, and the key that reads again.
+    fn render_unavailable(&self, frame: &mut Frame<'_>, area: Rect, error: &str, ctx: &Ctx<'_>) {
+        let theme = ctx.theme;
+        let width = usize::from(area.width).max(1);
+        let mut lines: Vec<Line<'static>> = wrapped(error, width)
+            .into_iter()
+            .map(|row| Line::styled(row, theme.error))
+            .collect();
+        if let Some(reload) = ctx.keys().label(views::REQUIREMENTS_BROWSE, Act::Reload) {
+            lines.push(Line::styled(format!("{reload} reads again"), ctx.accent()));
+        }
+        frame.render_widget(Paragraph::new(lines), area);
+    }
+
+    /// [`NOTHING_MATCHES`]'s next step: the key that clears the filter as the mode binds it,
+    /// `field.cancel` while it is typed and `common.back` once applied (`Esc` for both by
+    /// default).
+    fn clear_filter_next(&self, keys: &Keys) -> String {
+        let key = match self.mode {
+            Mode::Filter { .. } => keys.label(views::CAPTURE, Act::FieldCancel),
+            _ => keys.label(views::REQUIREMENTS_BROWSE, Act::Back),
+        };
+        key.map_or_else(
+            || CLEAR_THE_FILTER.to_owned(),
+            |key| format!("{key} clears the filter"),
+        )
     }
 
     /// Whether a form is open (new area, requirement, withdraw): it takes every key.
@@ -1027,8 +1104,17 @@ impl RequirementsTab {
         )
     }
 
-    /// The right pane: the open form, or what the selected row says.
-    fn render_detail(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
+    /// The right pane (MOD-115 M3 D6): a kit pane titled by what it shows, the open form, or
+    /// what the selected row says, scrolled with its scrollbar on the border. The lines are drawn
+    /// before the frame, which needs their count (C3).
+    fn render_detail(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        focus: Focus,
+        hints: Option<&Line<'static>>,
+        ctx: &Ctx<'_>,
+    ) {
         let theme = ctx.theme;
         let snapshot = self.snapshot.as_ref();
         let project_name = |id: ProjectId| {
@@ -1038,81 +1124,103 @@ impl RequirementsTab {
                 .map_or_else(|| id.to_string(), |row| row.name.clone())
         };
         let title = match &self.mode {
-            Mode::NewArea(form) => format!(" New area in {} ", project_name(form.project)),
+            Mode::NewArea(form) => format!("New area in {}", project_name(form.project)),
             Mode::Requirement(form) => match &form.target {
-                FormTarget::Mint { code, .. } => format!(" New requirement in {code} "),
+                FormTarget::Mint { code, .. } => format!("New requirement in {code}"),
                 FormTarget::Amend {
                     key,
                     expected_version,
                     ..
-                } => format!(" Amend {key} (v{expected_version}) "),
+                } => format!("Amend {key} (v{expected_version})"),
             },
-            Mode::Withdraw(form) => format!(" Withdraw {} ", form.key()),
+            Mode::Withdraw(form) => format!("Withdraw {}", form.key()),
             Mode::Browse | Mode::Filter { .. } => match (self.selected, snapshot) {
                 (Some(Row::Requirement(id)), Some(snapshot)) => snapshot
                     .requirement(id)
-                    .map_or_else(String::new, |row| format!(" {} ", row.key)),
+                    .map_or_else(String::new, |row| row.key.clone()),
                 (Some(Row::Area(id)), Some(snapshot)) => snapshot
                     .area(id)
-                    .map_or_else(String::new, |row| format!(" {} ", row.code)),
-                (Some(Row::Project(id)), _) => format!(" {} ", project_name(id)),
+                    .map_or_else(String::new, |row| row.code.clone()),
+                (Some(Row::Project(id)), _) => project_name(id),
                 _ => String::new(),
             },
         };
-        let block = Block::new().borders(Borders::ALL).title(title);
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
+        let mut pane = Pane::new(&title).focus(focus).accent(ctx.accent());
+        if let Some(hints) = hints {
+            pane = pane.hints(hints.clone());
+        }
+        let inner = Pane::inner(area);
+        let accent = ctx.accent();
         match &self.mode {
-            Mode::NewArea(form) => return form.render(frame, inner, theme),
-            Mode::Requirement(form) => return form.render(frame, inner, theme),
+            Mode::NewArea(form) => form.render(frame, inner, accent, theme),
+            Mode::Requirement(form) => form.render(frame, inner, accent, theme),
             Mode::Withdraw(form) => {
                 let body = snapshot
                     .and_then(|snapshot| snapshot.requirement(form.id()))
                     .map_or("", |row| row.body.as_str());
-                return form.render(frame, inner, body, theme);
+                form.render(frame, inner, body, accent, theme);
             }
-            Mode::Browse | Mode::Filter { .. } => {}
-        }
-        let lines = match (self.selected, snapshot) {
-            (Some(Row::Requirement(id)), Some(snapshot)) => {
-                match (&self.detail, &self.detail_error) {
-                    (Some(detail), _) if detail.requirement.id == id => {
-                        detail::lines(detail, inner.width, theme)
-                    }
-                    (_, Some(error)) => vec![Line::styled(error.clone(), theme.error)],
-                    _ => {
-                        let key = snapshot.requirement(id).map_or("", |row| row.key.as_str());
-                        vec![Line::styled(format!("reading {key}\u{2026}"), theme.dim)]
-                    }
+            Mode::Browse | Mode::Filter { .. } => {
+                if let Some(lines) = self.detail_lines(inner.width, ctx) {
+                    self.pane_rows.set(lines.len());
+                    pane = pane.scrollbar(lines.len(), self.scroll.skip());
+                    frame.render_widget(
+                        Paragraph::new(lines).scroll((self.scroll.offset(), 0)),
+                        inner,
+                    );
+                } else {
+                    self.pane_rows.set(0);
+                    let next = ctx.keys().hint(views::REQUIREMENTS_BROWSE, CHOOSE_A_ROW);
+                    let next = if next.is_empty() {
+                        CHOOSE_A_ROW_UNBOUND.to_owned()
+                    } else {
+                        next
+                    };
+                    empty::render(frame, inner, SELECT_A_ROW, NextStep(&next), theme);
                 }
             }
-            (Some(Row::Area(id)), Some(snapshot)) => snapshot
+        }
+        pane.render(frame, area, theme);
+    }
+
+    /// What the selected row says in Browse, `width` cells wide; `None` with nothing to show.
+    fn detail_lines(&self, width: u16, ctx: &Ctx<'_>) -> Option<Vec<Line<'static>>> {
+        let theme = ctx.theme;
+        let snapshot = self.snapshot.as_ref()?;
+        let lines = match self.selected? {
+            Row::Requirement(id) => match (&self.detail, &self.detail_error) {
+                (Some(detail), _) if detail.requirement.id == id => {
+                    detail::lines(detail, width, theme)
+                }
+                (_, Some(error)) => vec![Line::styled(error.clone(), theme.error)],
+                _ => {
+                    let key = snapshot.requirement(id).map_or("", |row| row.key.as_str());
+                    vec![Line::styled(format!("reading {key}\u{2026}"), theme.dim)]
+                }
+            },
+            Row::Area(id) => snapshot
                 .area(id)
                 .and_then(|area| {
                     snapshot
                         .project(area.project_id)
-                        .map(|entry| detail::area_lines(area, entry, inner.width, theme))
+                        .map(|entry| detail::area_lines(area, entry, width, theme))
                 })
                 .unwrap_or_default(),
-            (Some(Row::Project(id)), Some(snapshot)) => ctx
+            Row::Project(id) => ctx
                 .projects
                 .iter()
                 .find(|row| row.project_id == id)
                 .zip(snapshot.project(id))
-                .map(|(project, entry)| detail::project_lines(project, entry, inner.width, theme))
+                .map(|(project, entry)| detail::project_lines(project, entry, width, theme))
                 .unwrap_or_default(),
-            _ => vec![Line::styled(SELECT_A_ROW, theme.dim)],
         };
-        self.pane_rows.set(lines.len());
-        frame.render_widget(
-            Paragraph::new(lines).scroll((self.scroll.offset(), 0)),
-            inner,
-        );
+        Some(lines)
     }
 
-    /// The keys of the current mode for the shell's hint row, through its stack and `keys`
-    /// (MOD-67 M4 D9, M6 T2): Browse's three groups, the writes greyed where a write would be
-    /// refused; a form's spec. `None` when no key of it is bound.
+    /// The keys of the current mode, through its stack and `keys` (MOD-67 M4 D9, M6 T2): Browse's
+    /// three groups, the writes first and greyed where a write would be refused (MOD-115 M3
+    /// D-14); a form's spec. The focused kit pane draws them on its bottom border, and the shell
+    /// on the activity placeholder's (C2). `None` when no key of it is bound.
     fn keys_line(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
         let line = match &self.mode {
             Mode::Browse => {
@@ -1125,9 +1233,10 @@ impl RequirementsTab {
                 // its separator.
                 let stack = self.stack();
                 let mut spans = Vec::new();
+                // MOD-115 M3 D-14: the writes first, so the pane's cut takes the rest.
                 for (spec, style) in [
-                    (HINT_MOVE, theme.base),
                     (HINT_WRITES, writes),
+                    (HINT_MOVE, theme.base),
                     (HINT_RELOAD, theme.base),
                 ] {
                     let text = keys.hint(stack, spec);
@@ -1146,26 +1255,20 @@ impl RequirementsTab {
             Mode::Requirement(form) => {
                 let mut text = keys.hint(self.stack(), FORM_HINT);
                 if form.focus == FormFocus::Priority {
-                    text.push_str(" \u{b7} ");
-                    text.push_str(&keys.hint(self.stack(), PRIORITY_HINT));
+                    let priority = keys.hint(self.stack(), PRIORITY_HINT);
+                    if !priority.is_empty() {
+                        text = if text.is_empty() {
+                            priority
+                        } else {
+                            format!("{priority} \u{b7} {text}")
+                        };
+                    }
                 }
                 Line::styled(text, theme.dim)
             }
             Mode::Withdraw(_) => Line::styled(keys.hint(self.stack(), WITHDRAW_HINT), theme.dim),
         };
         (line.width() > 0).then_some(line)
-    }
-
-    /// The row under the notice: the filter's input (` /` and the field) while it is open, blank
-    /// otherwise. Kept in every mode so the tree's height does not move; the keys that shared it
-    /// are the shell's hint row (MOD-67 M6 T2, [`Tab::key_hint`]).
-    fn filter_row(&self, theme: &Theme) -> Line<'static> {
-        let Mode::Filter { field } = &self.mode else {
-            return Line::default();
-        };
-        let mut spans = vec![Span::styled(" /", theme.accent)];
-        spans.extend(field.line(FILTER_WIDTH, true, theme).spans);
-        Line::from(spans)
     }
 }
 
@@ -1330,23 +1433,27 @@ impl Tab for RequirementsTab {
         self.keys_line(ctx.keys(), ctx.theme)
     }
 
+    /// MOD-115 M3 D1, D6: the tree and the detail as kit panes, their hints on the focused one.
+    fn draws_chrome(&self) -> bool {
+        true
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let (notice, style) = match &self.notice {
-            Some(Notice::Info(text)) => (text.as_str(), ctx.theme.dim),
-            Some(Notice::Error(text)) => (text.as_str(), ctx.theme.error),
-            None => ("", ctx.theme.dim),
+        let (notice, tone) = match &self.notice {
+            Some(Notice::Info(text)) => (text.as_str(), Tone::Info),
+            Some(Notice::Error(text)) => (text.as_str(), Tone::Error),
+            None => ("", Tone::Info),
         };
         let mut notice = wrapped(notice, usize::from(area.width.saturating_sub(1)).max(1));
         notice.truncate(NOTICE_LINES);
         let notice_height = u16::try_from(notice.len().max(1)).unwrap_or(1);
-        let [content, notice_row, hint_row] = Layout::vertical([
-            Constraint::Min(1),
-            Constraint::Length(notice_height),
-            Constraint::Length(1),
-        ])
-        .areas(area);
+        // MOD-115 M3 D6: the filter is the tree's band, so the notice rows are all that is left
+        // under the panes (kept outside them, M2 B5).
+        let [content, notice_row] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(notice_height)]).areas(area);
         // MOD-115 M2 B5: the panes the shell's layout gives the rows above the notice, claimed
-        // for the focus borders, the hints and the mouse; today's 45/55 by default.
+        // for the hidden-pane note, the activity placeholder and the mouse; today's 45/55 by
+        // default.
         let areas = ctx.split(content, REQUIREMENTS_LAYOUT);
         // T7 repair: a form takes every key, so with another pane zoomed it is drawn over the
         // zoomed one rather than into the detail's empty rect.
@@ -1359,22 +1466,50 @@ impl Tab for RequirementsTab {
             }
             drawn => drawn,
         };
+        // A pane drawn over the zoomed one stands for it, and takes its focus.
+        let focus_of = |rect: Rect, pane: PaneId| {
+            let own = match pane {
+                PaneId::List => areas.list == Some(rect),
+                _ => areas.detail == rect,
+            };
+            ctx.pane_focus(if own { pane } else { ctx.focus() })
+        };
+        // L-req repair 1: an open form holds every key and is drawn in the detail, so the detail
+        // takes the tree's focus, and the form's hints its wider border. L-req repair 2: mirrored,
+        // the filter is typed in the tree's band, so the tree takes the detail's focus and the
+        // filter's hints. An activity pane the shell focuses keeps it either way.
+        let form = self.form_open();
+        let filter = matches!(self.mode, Mode::Filter { .. });
+        let hints = self.keys_line(ctx.keys(), ctx.theme);
         if let Some(tree) = tree {
-            self.render_tree(frame, tree, ctx);
+            let focus = if form {
+                Focus::Unfocused
+            } else if filter && ctx.focus() == PaneId::Detail {
+                ctx.pane_focus(PaneId::Detail)
+            } else {
+                focus_of(tree, PaneId::List)
+            };
+            self.render_tree(frame, tree, focus, hints.as_ref(), ctx);
         }
         if !detail.is_empty() {
-            self.render_detail(frame, detail, ctx);
+            let focus = if form && ctx.focus() == PaneId::List {
+                ctx.pane_focus(PaneId::List)
+            } else if filter && tree.is_some() {
+                Focus::Unfocused
+            } else {
+                focus_of(detail, PaneId::Detail)
+            };
+            self.render_detail(frame, detail, focus, hints.as_ref(), ctx);
         }
         frame.render_widget(
             Paragraph::new(
                 notice
                     .into_iter()
-                    .map(|line| Line::styled(format!(" {line}"), style))
+                    .map(|line| kit_text::notice(&format!(" {line}"), tone, ctx.theme))
                     .collect::<Vec<_>>(),
             ),
             notice_row,
         );
-        frame.render_widget(Paragraph::new(self.filter_row(ctx.theme)), hint_row);
     }
 
     /// MOD-115 M2 D2: the tree and the detail, today's 45/55 by default.
@@ -2418,7 +2553,7 @@ mod tests {
     }
 
     /// MOD-115 M2 D2: the Requirements tab is a list + detail tab, its default today's 45/55
-    /// split of the rows above the notice and the filter row, claimed cell for cell.
+    /// split of the rows above the notice, claimed cell for cell.
     #[tokio::test]
     async fn the_tree_and_the_detail_are_claimed_at_today_s_split() {
         assert_eq!(
@@ -2431,11 +2566,8 @@ mod tests {
         let claim = Cell::new(None);
         draw(&tab_on(snapshot), &bench.ctx().with_pane_claim(&claim));
         let (region, areas) = claim.get().expect("the render claims its panes");
-        assert_eq!(
-            region,
-            Rect::new(0, 0, 100, 28),
-            "above the notice and filter rows"
-        );
+        // MOD-115 M3 D6: the filter is a band in the tree, so only the notice row is under them.
+        assert_eq!(region, Rect::new(0, 0, 100, 29), "above the notice row");
         let [left, right] =
             Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
                 .areas(region);
@@ -2585,6 +2717,7 @@ mod tests {
                 .unwrap_or_default()
         };
         assert_eq!(text(Keys::compiled()), "Enter apply \u{b7} Esc clear");
+        // MOD-115 M3 MD-A: `Esc` through the keys too (C6), the compiled text unchanged.
         let keys = load_str("version = 2\n[field]\nsubmit = \"ctrl-t\"\n").expect("loads");
         assert_eq!(text(&keys), "Ctrl+t apply \u{b7} Esc clear");
     }
@@ -2615,6 +2748,382 @@ mod tests {
         assert_eq!(
             keys.hint(views::REQUIREMENTS_WITHDRAW, super::WITHDRAW_HINT),
             "Ctrl+t next \u{b7} Esc cancel"
+        );
+    }
+
+    // ---- MOD-115 M3 L-req: the tab on the kit ------------------------------------------------
+
+    /// The tab drawn at `width` x `height` through `ctx`, read back as the buffer and its rows.
+    fn drawn(
+        tab: &RequirementsTab,
+        ctx: &Ctx<'_>,
+        width: u16,
+        height: u16,
+    ) -> (ratatui::buffer::Buffer, Vec<String>) {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("terminal");
+        terminal
+            .draw(|frame| tab.render(frame, frame.area(), ctx))
+            .expect("the frame draws");
+        let buffer = terminal.backend().buffer().clone();
+        let rows = (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        (buffer, rows)
+    }
+
+    /// The `(x, y)` where `text` starts on the rows, if it is drawn.
+    fn find(rows: &[String], text: &str) -> Option<(u16, u16)> {
+        rows.iter().enumerate().find_map(|(y, row)| {
+            let cells: Vec<char> = row.chars().collect();
+            (0..cells.len())
+                .find(|&x| cells[x..].iter().collect::<String>().starts_with(text))
+                .map(|x| {
+                    (
+                        u16::try_from(x).expect("a narrow row"),
+                        u16::try_from(y).expect("a short frame"),
+                    )
+                })
+        })
+    }
+
+    /// The style of the cell where `text` starts.
+    fn style_of(buffer: &ratatui::buffer::Buffer, rows: &[String], text: &str) -> Style {
+        let (x, y) = find(rows, text).unwrap_or_else(|| panic!("`{text}` is drawn: {rows:#?}"));
+        buffer[(x, y)].style()
+    }
+
+    /// MOD-115 M3 D1: the tab draws its own kit panes, so the shell paints nothing over them.
+    #[test]
+    fn the_tab_draws_its_own_chrome() {
+        assert!(RequirementsTab::new().draws_chrome());
+    }
+
+    /// MOD-115 M3 D6: the tree and the detail are rounded kit panes titled on their top border,
+    /// the focused one in the tab's accent; nothing is drawn with a square corner.
+    #[tokio::test]
+    async fn the_tree_and_the_detail_are_kit_panes() {
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let ctx = bench.ctx();
+        let (buffer, rows) = drawn(&tab_on(snapshot), &ctx, 100, 30);
+        assert!(
+            rows[0].starts_with("\u{256d}\u{2500} Requirements (3) \u{2500}"),
+            "{rows:#?}"
+        );
+        assert!(
+            rows[0].contains("\u{256e}\u{256d}\u{2500} R-ENT-1 \u{2500}"),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter().all(|row| !row.contains('\u{250c}')),
+            "{rows:#?}"
+        );
+        let accent = ctx.accent();
+        assert_eq!(buffer[(0, 0)].fg, accent.fg.expect("a coloured accent"));
+        assert_eq!(
+            buffer[(45, 0)].fg,
+            bench
+                .theme
+                .border_faint
+                .fg
+                .expect("a coloured faint border"),
+            "the unfocused detail"
+        );
+    }
+
+    /// MOD-115 M3 D-14 (maintainer, 2026-10-21): the hints are the focused pane's, and the tree's
+    /// lead with the write keys, so the keys that change something survive the pane's cut.
+    #[tokio::test]
+    async fn the_tree_hint_leads_with_the_write_keys() {
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let tab = tab_on(snapshot);
+        let line = tab
+            .keys_line(&bench.keys, &bench.theme)
+            .expect("the defaults bind the keys")
+            .to_string();
+        assert_eq!(
+            line,
+            "a area \u{b7} n new \u{b7} e amend \u{b7} W withdraw \u{b7} / filter \u{b7} j/k move \
+             \u{b7} Enter fold \u{b7} r reload"
+        );
+        let (_, rows) = drawn(&tab, &bench.ctx(), 100, 30);
+        let bottom = rows
+            .iter()
+            .rposition(|row| row.starts_with('\u{2570}'))
+            .expect("the panes' bottom border");
+        assert!(
+            rows[bottom].starts_with("\u{2570}\u{2500}a area \u{b7} n new \u{b7} e amend"),
+            "{rows:#?}"
+        );
+        assert!(
+            rows[bottom].contains('\u{2026}'),
+            "the rest is cut inside the tree: {rows:#?}"
+        );
+        // With the detail focused the hints are on its border, and none on the tree's.
+        let (_, rows) = drawn(&tab, &bench.ctx().with_focus(PaneId::Detail), 100, 30);
+        let (left, right) = rows[bottom].split_at(
+            rows[bottom]
+                .char_indices()
+                .nth(45)
+                .map_or(rows[bottom].len(), |(at, _)| at),
+        );
+        assert!(!left.contains("a area"), "{rows:#?}");
+        assert!(right.starts_with("\u{2570}\u{2500}a area"), "{rows:#?}");
+    }
+
+    /// MOD-115 M3 D3, D6: while the filter is typed, the band is the tree pane's first row: the
+    /// marker in the tab's accent (MOD-85: it was ` /` in the theme's), the field and `n of m`.
+    /// The title no longer carries the filter, and the tab's last row is no filter row.
+    #[tokio::test]
+    async fn the_filter_band_is_the_tree_s_first_row() {
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let mut tab = tab_on(snapshot);
+        bench.key(&mut tab, KeyCode::Char('/'));
+        bench.typed(&mut tab, "sto");
+        let ctx = bench.ctx();
+        let (buffer, rows) = drawn(&tab, &ctx, 100, 30);
+        assert!(
+            rows[0].starts_with("\u{256d}\u{2500} Requirements (1) \u{2500}"),
+            "{rows:#?}"
+        );
+        assert!(rows[1].starts_with("\u{2502}\u{258c}/ sto"), "{rows:#?}");
+        assert!(rows[1].contains("1 of 3\u{2502}"), "{rows:#?}");
+        assert!(rows[2].contains("\u{25be} htui (1)"), "{rows:#?}");
+        assert_eq!(
+            style_of(&buffer, &rows, "\u{258c}/ sto").fg,
+            ctx.accent().fg
+        );
+        assert!(
+            !rows[29].contains('/'),
+            "no filter row under the panes: {rows:#?}"
+        );
+
+        // Applied: the band stays, without the marker.
+        bench.key(&mut tab, KeyCode::Enter);
+        let (_, rows) = drawn(&tab, &bench.ctx(), 100, 30);
+        assert!(rows[1].starts_with("\u{2502} / sto "), "{rows:#?}");
+        assert!(rows[1].contains("1 of 3\u{2502}"), "{rows:#?}");
+
+        // No filter: no band, the tree starts on the first row.
+        bench.key(&mut tab, KeyCode::Esc);
+        let (_, rows) = drawn(&tab, &bench.ctx(), 100, 30);
+        assert!(
+            rows[1].starts_with("\u{2502} \u{25be} htui (3)"),
+            "{rows:#?}"
+        );
+    }
+
+    /// MOD-115 M3 D3: the band's marker keeps its emphasis without colour.
+    #[tokio::test]
+    async fn the_filter_marker_is_bold_without_colour() {
+        let (snapshot, projects, scope) = platform().await;
+        let mut bench = Bench::new(scope, projects);
+        bench.theme = Theme::monochrome();
+        let mut tab = tab_on(snapshot);
+        bench.key(&mut tab, KeyCode::Char('/'));
+        let (buffer, rows) = drawn(&tab, &bench.ctx(), 100, 30);
+        let marker = style_of(&buffer, &rows, "\u{258c}/");
+        assert_eq!(marker.fg, Some(ratatui::style::Color::Reset));
+        assert!(
+            marker.add_modifier.contains(ratatui::style::Modifier::BOLD),
+            "{marker:?}"
+        );
+    }
+
+    /// MOD-115 M3 D6: the cursor's row carries the kit's gutter in the tab's accent and the band.
+    #[tokio::test]
+    async fn the_tree_cursor_is_the_kit_gutter_and_band() {
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let ctx = bench.ctx();
+        let (buffer, rows) = drawn(&tab_on(snapshot), &ctx, 100, 30);
+        let (x, y) = find(&rows, "\u{258c}    R-ENT-1").expect("the cursor's row");
+        assert_eq!(
+            buffer[(x, y)].fg,
+            ctx.accent().fg.expect("a coloured accent")
+        );
+        assert_eq!(
+            buffer[(x + 1, y)].bg,
+            bench.theme.selected.bg.expect("a banded row")
+        );
+        assert_eq!(
+            buffer[(43, y)].bg,
+            bench.theme.selected.bg.expect("a banded row"),
+            "the band runs to the pane's edge"
+        );
+    }
+
+    /// MOD-115 M3 MD-A, C6: the cancel key of the filter, the forms and the withdraw is named
+    /// through the keys, `Esc` under the compiled ones and the rebound chord otherwise.
+    #[test]
+    fn the_cancel_hints_name_a_rebound_field_key() {
+        use crate::keys::load_str;
+        let compiled = Keys::compiled();
+        assert_eq!(
+            compiled.hint(views::CAPTURE, super::FILTER_HINT),
+            "Enter apply \u{b7} Esc clear"
+        );
+        assert_eq!(
+            compiled.hint(views::REQUIREMENTS_FORM, super::FORM_HINT),
+            "Tab field \u{b7} Ctrl+s save \u{b7} Esc cancel"
+        );
+        assert_eq!(
+            compiled.hint(views::AREA_FORM, super::FORM_HINT),
+            "Tab field \u{b7} Ctrl+s save \u{b7} Esc cancel"
+        );
+        let keys = load_str("version = 2\n[field]\ncancel = \"f7\"\nsubmit = \"ctrl-t\"\n")
+            .expect("loads");
+        assert_eq!(
+            keys.hint(views::CAPTURE, super::FILTER_HINT),
+            "Ctrl+t apply \u{b7} F7 clear"
+        );
+        assert_eq!(
+            keys.hint(views::REQUIREMENTS_FORM, super::FORM_HINT),
+            "Tab field \u{b7} Ctrl+s save \u{b7} F7 cancel"
+        );
+        assert_eq!(
+            keys.hint(views::AREA_FORM, super::FORM_HINT),
+            "Tab field \u{b7} Ctrl+s save \u{b7} F7 cancel"
+        );
+        assert_eq!(
+            keys.hint(views::REQUIREMENTS_WITHDRAW, super::WITHDRAW_HINT),
+            "Ctrl+t next \u{b7} F7 cancel"
+        );
+    }
+
+    /// MOD-115 M3 D6, MOD-85: the open form draws through `kit::form`. The focused field carries
+    /// the gutter in the tab's accent (no label in `theme.accent` any more), and the priority is a
+    /// choice whose value is in the base style and whose marks are dim.
+    #[tokio::test]
+    async fn the_requirement_form_is_a_kit_form() {
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let mut tab = tab_on(snapshot);
+        bench.key(&mut tab, KeyCode::Char('e'));
+        let ctx = bench.ctx();
+        let (buffer, rows) = drawn(&tab, &ctx, 100, 30);
+        assert!(
+            rows[0].contains("\u{256d}\u{2500} Amend R-ENT-1 (v2) \u{2500}"),
+            "{rows:#?}"
+        );
+        let (x, y) = find(&rows, "\u{258c}body").expect("the focused body row");
+        assert_eq!(
+            buffer[(x, y)].fg,
+            ctx.accent().fg.expect("a coloured accent")
+        );
+        assert_ne!(
+            buffer[(x + 1, y)].fg,
+            bench.theme.accent.fg.unwrap_or_default(),
+            "the label is banded, not accented"
+        );
+        assert!(find(&rows, " rationale").is_some(), "{rows:#?}");
+        assert!(find(&rows, " deciding item").is_some(), "{rows:#?}");
+        let choice = find(&rows, "\u{2039} must \u{203a}").expect("the priority choice");
+        assert_eq!(
+            buffer[(choice.0, choice.1)].style().fg,
+            bench.theme.dim.fg,
+            "the marks are dim"
+        );
+        assert_eq!(
+            buffer[(choice.0 + 2, choice.1)].style().fg,
+            bench.theme.base.fg.or(Some(ratatui::style::Color::Reset)),
+            "the value is base"
+        );
+        assert!(rows.iter().all(|row| !row.contains("[must]")), "{rows:#?}");
+    }
+
+    /// MOD-85 in monochrome: the choice's value and marks differ by modifier alone, and the
+    /// focused field's gutter is bold.
+    #[tokio::test]
+    async fn the_requirement_form_reads_without_colour() {
+        use ratatui::style::{Color, Modifier};
+        let (snapshot, projects, scope) = platform().await;
+        let mut bench = Bench::new(scope, projects);
+        bench.theme = Theme::monochrome();
+        let mut tab = tab_on(snapshot);
+        bench.key(&mut tab, KeyCode::Char('e'));
+        let (buffer, rows) = drawn(&tab, &bench.ctx(), 100, 30);
+        let (x, y) = find(&rows, "\u{2039} must \u{203a}").expect("the priority choice");
+        let mark = buffer[(x, y)].style();
+        let value = buffer[(x + 2, y)].style();
+        assert!(mark.add_modifier.contains(Modifier::DIM), "{mark:?}");
+        assert!(!value.add_modifier.contains(Modifier::DIM), "{value:?}");
+        let (x, y) = find(&rows, "\u{258c}body").expect("the focused body row");
+        let gutter = buffer[(x, y)].style();
+        assert_eq!(gutter.fg, Some(Color::Reset));
+        assert!(gutter.add_modifier.contains(Modifier::BOLD), "{gutter:?}");
+    }
+
+    /// MOD-115 M3 D3: the area code's rule is help under the code field, and the withdraw's
+    /// sentence help under its field: on the line under the field they are about.
+    #[tokio::test]
+    async fn the_form_help_sits_under_its_field() {
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let mut tab = tab_on(snapshot.clone());
+        bench.key(&mut tab, KeyCode::Char('a'));
+        let (_, rows) = drawn(&tab, &bench.ctx(), 100, 30);
+        let (_, code) = find(&rows, "\u{258c}code").expect("the focused code row");
+        assert!(
+            rows[usize::from(code) + 1].contains("A code is a capital letter"),
+            "{rows:#?}"
+        );
+
+        let mut tab = tab_on(snapshot);
+        bench.key(&mut tab, KeyCode::Char('W'));
+        let (_, rows) = drawn(&tab, &bench.ctx(), 100, 30);
+        let (_, field) = find(&rows, "\u{258c}deciding item").expect("the deciding row");
+        assert!(
+            rows[usize::from(field) + 1].contains("A withdrawn requirement"),
+            "{rows:#?}"
+        );
+    }
+
+    /// MOD-115 M3, MOD-83 (audit item 2): every empty state says what to do next.
+    #[tokio::test]
+    async fn every_empty_state_has_a_next_step() {
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope.clone(), projects);
+        // Nothing read yet: the tree says it waits, the detail how to choose a row.
+        let (_, rows) = drawn(&RequirementsTab::new(), &bench.ctx(), 100, 30);
+        let text = rows.join("\n");
+        assert!(text.contains(super::NOT_READ), "{text}");
+        assert!(
+            text.contains("they appear once the store answers"),
+            "{text}"
+        );
+        assert!(text.contains(super::SELECT_A_ROW), "{text}");
+        assert!(text.contains("j/k chooses one"), "{text}");
+
+        // A refused first read: the refusal, and the key that reads again.
+        let refused = RequirementsTab {
+            unavailable: Some(DATABASE_UNREACHABLE.to_owned()),
+            ..RequirementsTab::default()
+        };
+        let (_, rows) = drawn(&refused, &bench.ctx(), 100, 30);
+        let text = rows.join("\n");
+        assert!(text.contains("r reads again"), "{text}");
+
+        // A filter that hides every row: its clearing key.
+        let mut tab = tab_on(snapshot.clone());
+        tab.filter = "nothing like it".to_owned();
+        let (_, rows) = drawn(&tab, &bench.ctx(), 100, 30);
+        let text = rows.join("\n");
+        assert!(text.contains(super::NOTHING_MATCHES), "{text}");
+        assert!(text.contains("Esc clears the filter"), "{text}");
+
+        // No project: where projects come from.
+        let empty = Bench::new(scope, Vec::new());
+        let (_, rows) = drawn(&tab_on(snapshot), &empty.ctx(), 100, 30);
+        let text = rows.join("\n");
+        assert!(text.contains(super::NO_PROJECTS), "{text}");
+        assert!(
+            text.contains("Settings \u{203a} Hierarchy adds a project"),
+            "{text}"
         );
     }
 }

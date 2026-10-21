@@ -1,0 +1,33 @@
+---
+source: crates/htui/tests/requirements.rs
+expression: frame
+---
+Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      1 waiting ·  F9  about   F1  keys
+╭─ Requirements (1) ────────────────────────╮╭─ R-ENT-1 ───────────────────────────────────────────╮
+│▌/ STO                               1 of 3││Every item has a stable key of the form PREFIX-N.    │
+│ ▾ htui (1)                                ││                                                     │
+│   ▾ STO Storage (1)                       ││rationale: Keys are what people type.                │
+│     R-STO-1  must   Postgres is the sourc…││must · ● active · v2                                 │
+│                                           ││                                                     │
+│                                           ││Coverage                                             │
+│                                           ││ANA-1  addresses v1  ! suspect  ● done  —            │
+│                                           ││ANA-2  amends    v2             ○ open  —            │
+│                                           ││                                                     │
+│                                           ││Revisions                                            │
+│                                           ││v1   created                09-03 10:00              │
+│                                           ││v2   amended   by ANA-2     09-05 10:00              │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+╰─Enter apply · Esc clear───────────────────╯╰─────────────────────────────────────────────────────╯

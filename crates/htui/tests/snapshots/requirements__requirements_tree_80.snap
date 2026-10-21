@@ -1,0 +1,27 @@
+---
+source: crates/htui/tests/requirements.rs
+expression: frame
+---
+Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings      1 waiting ·  ?  keys
+╭─ Requirements (3) ───────────────╮╭─ R-ENT-1 ────────────────────────────────╮
+│ ▾ htui (3)                       ││Every item has a stable key of the form   │
+│   ▾ ENT Entity model (2)         ││PREFIX-N.                                 │
+│▌    R-ENT-1  must   Every item h…││                                          │
+│     R-ENT-2  later  An item may …││rationale: Keys are what people type.     │
+│   ▾ STO Storage (1)              ││must · ● active · v2                      │
+│     R-STO-1  must   Postgres is …││                                          │
+│ ▾ agy (0)                        ││Coverage                                  │
+│   no areas                       ││ANA-1  addresses v1  ! suspect  ● done  — │
+│                                  ││ANA-2  amends    v2             ○ open  — │
+│                                  ││                                          │
+│                                  ││Revisions                                 │
+│                                  ││v1   created                09-03 10:00   │
+│                                  ││v2   amended   by ANA-2     09-05 10:00   │
+│                                  ││                                          │
+│                                  ││                                          │
+│                                  ││                                          │
+│                                  ││                                          │
+│                                  ││                                          │
+│                                  ││                                          │
+│                                  ││                                          │
+╰─a area · n new · e amend · W wi…─╯╰──────────────────────────────────────────╯
