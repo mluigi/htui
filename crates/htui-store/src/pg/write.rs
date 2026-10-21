@@ -980,10 +980,9 @@ async fn phase_clash(
         Some(phase_position_is_taken(position, graph))
     } else if clash.name {
         Some(phase_name_is_taken(name, graph))
-    } else if let Some(id) = new.filter(|_| clash.id) {
-        Some(already_exists("step_graph_phase", id))
     } else {
-        None
+        new.filter(|_| clash.id)
+            .map(|id| already_exists("step_graph_phase", id))
     })
 }
 
