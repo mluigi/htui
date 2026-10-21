@@ -16,9 +16,9 @@ use chrono::Utc;
 use htui::app::{Action, Handled};
 use htui::queue_settings::{self, QueueSettingsSnapshot, REQUEST_NAMES};
 use htui::store_worker::{StoreReply, StoreRequest, serve};
-use htui::testkit::SectionBench;
-use htui::ui::tabs::settings::SettingsSection;
+use htui::testkit::{Harness, SectionBench};
 use htui::ui::tabs::settings::queue::{NOTHING_SET, QueueSection, UNKNOWN_COST};
+use htui::ui::tabs::settings::{SettingsSection, SettingsTab};
 use htui_core::fixtures::ids;
 use htui_core::model::{
     DEFAULT_MAX_CONCURRENT_ITEMS, QueueSetting, Scope, USD_TOO_PRECISE, WorkspaceId,
@@ -493,12 +493,19 @@ fn only_request(bench: &SectionBench) -> StoreRequest {
     }
 }
 
-/// The frame line that starts with `label` after its indent, or a panic naming the frame.
+/// The kit form's gutter on the focused row (MOD-115 M3 D3).
+const GUTTER: char = '\u{258c}';
+
+/// The frame line that starts with `label` after its gutter, or a panic naming the frame.
 #[track_caller]
 fn line_of<'a>(frame: &'a str, label: &str, nth: usize) -> &'a str {
     frame
         .lines()
-        .filter(|line| line.trim_start().starts_with(label))
+        .filter(|line| {
+            line.trim_start_matches(GUTTER)
+                .trim_start()
+                .starts_with(label)
+        })
         .nth(nth)
         .unwrap_or_else(|| panic!("no line {nth} for `{label}`: {frame}"))
 }
@@ -755,6 +762,10 @@ async fn offline_the_section_says_the_server_is_needed() {
     let frame = bench.render_section(&section, 100);
     assert!(frame.contains(DATABASE_UNREACHABLE), "{frame}");
     assert!(!frame.contains("all boxes"), "{frame}");
+    assert!(
+        frame.contains("r asks again once the store answers"),
+        "the refusal has a next step, through the reload key (MOD-83): {frame}"
+    );
     insta::assert_snapshot!("offline", frame);
 }
 
@@ -908,4 +919,171 @@ async fn enter_edits_and_modifier_chords_are_not_their_letters_in_queue() {
         "the tab stays"
     );
     assert!(section.captures_input(), "the editor is still open");
+}
+
+// -------------------------------------------------------------------------------------------
+// MOD-115 M3 (lane L-prompt): the section on the kit. The rows are a `kit::form` of read-only
+// values under group headings, the open editor is the row it edits with its unit under it, the
+// notices are `kit::text` lines and the refusals `kit::empty` next steps; every hint and every
+// sentence that names a key reads it from the keys in force.
+// -------------------------------------------------------------------------------------------
+
+/// `field.submit` and `field.cancel` moved (MOD-115 M3 C6): the editor's `Enter` and `Esc`.
+const FIELD_REBOUND: &str = "version = 2\n[field]\nsubmit = [\"ctrl-t\"]\ncancel = [\"ctrl-o\"]\n";
+
+/// `keys` loaded, or a panic naming the file.
+fn rebound(file: &str) -> htui::keys::Keys {
+    htui::keys::load_str(file).expect("the key file loads")
+}
+
+/// The editor's hint names the field's own keys through the editor's stack (MD-A, C6): `Enter
+/// save · Esc cancel` under the compiled keys, the rebound chords once `[field]` moves them.
+#[tokio::test]
+async fn the_editor_hint_names_the_field_keys_in_force() {
+    let snapshot = bench_settings(&demo()).await;
+    let (bench, mut section) = bench_from(&snapshot).await;
+    move_to(&bench, &mut section, row::BATCH_CAP);
+    bench.key(&mut section, "e");
+    assert_eq!(
+        bench.key_hint(&section),
+        "Enter save \u{b7} Esc cancel \u{b7} empty clears"
+    );
+
+    let bench = bench.with_keys(rebound(FIELD_REBOUND));
+    assert_eq!(
+        bench.key_hint(&section),
+        "Ctrl+t save \u{b7} Ctrl+o cancel \u{b7} empty clears"
+    );
+}
+
+/// A compare-and-set miss under an open editor names the key that retries as the editor's stack
+/// binds it (MD-A, D-5): the rebound chord, never a literal `Enter`.
+#[tokio::test]
+async fn a_stale_reply_names_the_retry_key_in_force() {
+    let snapshot = bench_settings(&demo()).await;
+    let (bench, mut section) = bench_from(&snapshot).await;
+    let bench = bench.with_keys(rebound(FIELD_REBOUND));
+    edit(&bench, &mut section, row::BOX_LIMIT, "4");
+
+    bench.reply(
+        &mut section,
+        &StoreReply::QueueSettingsStale(Box::new(snapshot)),
+    );
+
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains(
+            "changed elsewhere since you opened it \u{2014} reloaded; Ctrl+t retries against the \
+             current row"
+        ),
+        "{frame}"
+    );
+}
+
+/// MOD-115 M3 D3: the open editor is the row it edits, its label banded and its unit (and what
+/// the row held) on the line under it, rather than a `label (unit): ` pane under the rows.
+#[tokio::test]
+async fn the_editor_is_the_row_it_edits() {
+    let snapshot = bench_settings(&demo()).await;
+    let (bench, mut section) = bench_from(&snapshot).await;
+    edit(&bench, &mut section, row::BATCH_CAP, "1.5");
+
+    let frame = bench.render_section(&section, 100);
+    let lines: Vec<&str> = frame.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with(GUTTER))
+        .unwrap_or_else(|| panic!("the focused row: {frame}"));
+    let row = lines[at].trim_start_matches(GUTTER);
+    assert!(row.starts_with("batch cap"), "{frame}");
+    assert_eq!(row["batch cap".len()..].trim(), "1.5", "{frame}");
+    assert_eq!(lines[at + 1].trim(), "USD \u{b7} now unbounded", "{frame}");
+    assert!(!frame.contains("(USD): "), "no separate pane: {frame}");
+}
+
+/// MOD-85: the focused row is marked by the form's gutter in the tab's accent, never a whole row
+/// in `theme.selected`.
+#[tokio::test]
+async fn the_cursor_row_is_the_forms_marker() {
+    let snapshot = bench_settings(&demo()).await;
+    let (bench, mut section) = bench_from(&snapshot).await;
+    move_to(&bench, &mut section, row::MIN_BUDGET);
+    let frame = bench.render_section(&section, 100);
+    let marked: Vec<&str> = frame
+        .lines()
+        .filter(|line| line.starts_with(GUTTER))
+        .collect();
+    assert_eq!(marked.len(), 1, "{frame}");
+    assert!(marked[0].contains("min budget"), "{frame}");
+}
+
+/// A write in flight is named in words (MOD-83: no request name on screen), on the refusal and on
+/// the hint row.
+#[tokio::test]
+async fn a_write_in_flight_is_named_in_words() {
+    let snapshot = bench_settings(&demo()).await;
+    let (bench, mut section) = bench_from(&snapshot).await;
+    edit(&bench, &mut section, row::BATCH_CAP, "1.5");
+    bench.key(&mut section, "enter");
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("still saving the setting \u{2014} wait for the store's answer"),
+        "{frame}"
+    );
+
+    bench.key(&mut section, "esc");
+    bench.key(&mut section, "esc");
+    assert_eq!(
+        bench.key_hint(&section),
+        "j/k \u{b7} e edit \u{b7} r reload \u{b7} saving the setting\u{2026}"
+    );
+}
+
+/// Nothing read yet is an empty state with its next step (MOD-83), through the reload key.
+#[tokio::test]
+async fn nothing_read_yet_says_how_to_read() {
+    let bench = SectionBench::new().await;
+    let section = QueueSection::new();
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("queue settings not read yet"), "{frame}");
+    assert!(
+        frame.contains("r reads the queue settings again"),
+        "{frame}"
+    );
+}
+
+/// MOD-115 M3 D-11: the section reports its scroll in the pane's terms: the rows, then the help
+/// line and the notice line under them.
+#[tokio::test]
+async fn the_section_reports_its_scroll() {
+    let snapshot = bench_settings(&demo()).await;
+    let (bench, section) = bench_from(&snapshot).await;
+    let _ = bench.render_section(&section, 100);
+    let (total, offset) = section.scroll().expect("the rows scroll");
+    assert_eq!(offset, 0);
+    assert_eq!(
+        total,
+        row::BOX_LIMIT + 1 + 2,
+        "nine rows, the help, the notice"
+    );
+}
+
+/// MOD-81: the section at 80 columns, through the shell.
+#[tokio::test]
+async fn the_section_at_80_columns() {
+    let mut harness = Harness::over(MemStore::demo())
+        .size(80, 24)
+        .with_tab(Box::new(SettingsTab::with_sections(vec![Box::new(
+            QueueSection::new(),
+        )])));
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(frame.contains("project vulkan-tutorials"), "{frame}");
+    assert!(
+        frame.contains("not set \u{b7} stored, not enforced"),
+        "{frame}"
+    );
+    insta::assert_snapshot!("demo_80", frame);
 }
