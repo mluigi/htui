@@ -1611,7 +1611,7 @@ async fn s_opens_the_spec_editor_over_the_pretty_printed_overlay() {
     for expected in [
         "\"terraform\": {",
         "\"kind\": \"path\"",
-        "stored overlay box_probe_spec, merged into the seed by name; blank clears it",
+        "stored overlay, merged into the seed by tool name; blank clears it",
         "probe spec: seed + stored overlay \u{b7} ",
     ] {
         assert!(frame.contains(expected), "`{expected}` in {frame}");
@@ -1622,6 +1622,23 @@ async fn s_opens_the_spec_editor_over_the_pretty_printed_overlay() {
         "{frame}"
     );
     assert!(requests(&bench).is_empty(), "opening sends nothing");
+}
+
+/// MOD-115 M3 (Definition of ported, item 3): the spec editor's title names no setting key, and
+/// it wraps in a narrow body rather than clipping.
+#[tokio::test]
+async fn the_spec_editor_title_names_no_setting_key_and_wraps() {
+    let (bench, mut section) = bench_with(&snap_of(terraform_store()).await).await;
+    bench.key(&mut section, "s");
+    assert!(section.captures_input(), "the spec editor takes the keys");
+    let frame = bench.render_section(&section, 40);
+    assert!(
+        !frame.contains("box_probe_spec"),
+        "no setting key on screen: {frame}"
+    );
+    for expected in ["stored overlay, merged into the seed by", "blank clears it"] {
+        assert!(frame.contains(expected), "`{expected}` in {frame}");
+    }
 }
 
 /// MOD-51 D6, F-3: the spec is app-wide, so over a read list with no box in it the hint offers
@@ -1649,7 +1666,7 @@ async fn s_with_no_box_listed_still_opens_the_spec_editor() {
     // The spec line is drawn over an empty list in Browse too (review LOW-6), so the editor's own
     // title is what proves the editor is the thing drawn.
     assert!(
-        frame.contains("stored overlay box_probe_spec, merged into the seed by name"),
+        frame.contains("stored overlay, merged into the seed by tool name"),
         "the spec editor is drawn over no box: {frame}"
     );
 

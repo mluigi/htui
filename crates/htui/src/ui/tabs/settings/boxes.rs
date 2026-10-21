@@ -148,9 +148,8 @@ const HINT_SPEC: HintSpec = &[
 ];
 
 /// The dim line above the probe spec editor: what the text is, and what blank does (MOD-51 D6).
-/// It fits a 78-column body unclipped.
-const SPEC_TITLE: &str =
-    "stored overlay box_probe_spec, merged into the seed by name; blank clears it";
+/// It names no setting key (MOD-115 M3: no internal value on screen) and wraps in a narrow body.
+const SPEC_TITLE: &str = "stored overlay, merged into the seed by tool name; blank clears it";
 
 /// A probe spec save applied (MOD-51 D6, D8): nothing re-probes now; the next probe or connect
 /// does. `probe` is the label of `settings.boxes.probe` through the browse stack (MOD-115 M3 C5),
@@ -1276,8 +1275,13 @@ fn render_spec(
     editor: &SpecEditor,
     theme: &Theme,
 ) {
-    let mut lines = spec_lines(&snapshot.spec, usize::from(area.width).max(1), theme);
-    lines.push(Line::styled(SPEC_TITLE, theme.dim));
+    let width = usize::from(area.width).max(1);
+    let mut lines = spec_lines(&snapshot.spec, width, theme);
+    lines.extend(
+        wrapped(SPEC_TITLE, width)
+            .into_iter()
+            .map(|line| Line::styled(line, theme.dim)),
+    );
     let used = u16::try_from(lines.len()).unwrap_or(u16::MAX);
     lines.extend(
         editor
