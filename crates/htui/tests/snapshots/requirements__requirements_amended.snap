@@ -3,16 +3,16 @@ source: crates/htui/tests/requirements.rs
 expression: frame
 ---
 Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       1 waiting ·  F9  about   ?  keys
-┌ Requirements (3) ─────────────────────────┐┌ R-ENT-1 ────────────────────────────────────────────┐
-│▾ htui (3)                                 ││Every item has a stable key of the form PREFIX-N.    │
-│  ▾ ENT Entity model (2)                   ││Keys never change.                                   │
-│    R-ENT-1  must   Every item has a stabl…││                                                     │
-│    R-ENT-2  later  An item may carry a fr…││rationale: Keys are what people type.                │
-│  ▾ STO Storage (1)                        ││must · active · v3                                   │
-│    R-STO-1  must   Postgres is the source…││                                                     │
-│▾ agy (0)                                  ││Coverage                                             │
-│  no areas                                 ││ANA-1  addresses v1  ! suspect  done  —              │
-│                                           ││ANA-2  amends    v3             open  —              │
+╭─ Requirements (3) ────────────────────────╮╭─ R-ENT-1 ───────────────────────────────────────────╮
+│ ▾ htui (3)                                ││Every item has a stable key of the form PREFIX-N.    │
+│   ▾ ENT Entity model (2)                  ││Keys never change.                                   │
+│▌    R-ENT-1  must   Every item has a stab…││                                                     │
+│     R-ENT-2  later  An item may carry a f…││rationale: Keys are what people type.                │
+│   ▾ STO Storage (1)                       ││must · ● active · v3                                 │
+│     R-STO-1  must   Postgres is the sourc…││                                                     │
+│ ▾ agy (0)                                 ││Coverage                                             │
+│   no areas                                ││ANA-1  addresses v1  ! suspect  ● done  —            │
+│                                           ││ANA-2  amends    v3             ○ open  —            │
 │                                           ││                                                     │
 │                                           ││Revisions                                            │
 │                                           ││v1   created                MM-DD hh:mm              │
@@ -29,5 +29,6 @@ Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       1 wai
 │                                           ││                                                     │
 │                                           ││                                                     │
 │                                           ││                                                     │
-└─j/k move · Enter fold · / filter · a area · n new · e amend · W withdraw · r reload──────────────┘
+│                                           ││                                                     │
+╰─a area · n new · e amend · W withdraw · …─╯╰─────────────────────────────────────────────────────╯
  amended R-ENT-1 to v3

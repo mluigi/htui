@@ -1,0 +1,33 @@
+---
+source: crates/htui/tests/requirements.rs
+expression: frame
+---
+Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      1 waiting ·  F9  about   F1  keys
+╭─ Requirements (3) ────────────────────────╮╭─ Amend R-ENT-1 (v2) ────────────────────────────────╮
+│ ▾ htui (3)                                ││▌body             Every item has a stable key of the │
+│   ▾ ENT Entity model (2)                  ││▌                                                    │
+│▌    R-ENT-1  must   Every item has a stab…││▌                                                    │
+│     R-ENT-2  later  An item may carry a f…││▌                                                    │
+│   ▾ STO Storage (1)                       ││▌                                                    │
+│     R-STO-1  must   Postgres is the sourc…││▌                                                    │
+│ ▾ agy (0)                                 ││▌                                                    │
+│   no areas                                ││▌                                                    │
+│                                           ││▌                                                    │
+│                                           ││▌                                                    │
+│                                           ││▌                                                    │
+│                                           ││▌                                                    │
+│                                           ││▌                                                    │
+│                                           ││▌                                                    │
+│                                           ││▌                                                    │
+│                                           ││▌                                                    │
+│                                           ││ rationale        Keys are what people type.         │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││ priority         ‹ must ›                           │
+│                                           ││ deciding item                                       │
+╰─Tab field · Ctrl+s save · Esc cancel──────╯╰─────────────────────────────────────────────────────╯

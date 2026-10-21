@@ -3,16 +3,16 @@ source: crates/htui/tests/requirements.rs
 expression: frame
 ---
 Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       1 waiting ·  F9  about   ?  keys
-┌ Requirements (4) ─────────────────────────┐┌ R-ENT-3 ────────────────────────────────────────────┐
-│▾ htui (4)                                 ││Every item has a title.                              │
-│  ▾ ENT Entity model (3)                   ││                                                     │
-│    R-ENT-1  must   Every item has a stabl…││rationale: Titles are what people read.              │
-│    R-ENT-2  later  An item may carry a fr…││must · active · v1                                   │
-│    R-ENT-3  must   Every item has a title.││                                                     │
-│  ▾ STO Storage (1)                        ││Coverage                                             │
-│    R-STO-1  must   Postgres is the source…││no item cites it                                     │
-│▾ agy (0)                                  ││                                                     │
-│  no areas                                 ││Revisions                                            │
+╭─ Requirements (4) ────────────────────────╮╭─ R-ENT-3 ───────────────────────────────────────────╮
+│ ▾ htui (4)                                ││Every item has a title.                              │
+│   ▾ ENT Entity model (3)                  ││                                                     │
+│     R-ENT-1  must   Every item has a stab…││rationale: Titles are what people read.              │
+│     R-ENT-2  later  An item may carry a f…││must · ● active · v1                                 │
+│▌    R-ENT-3  must   Every item has a titl…││                                                     │
+│   ▾ STO Storage (1)                       ││Coverage                                             │
+│     R-STO-1  must   Postgres is the sourc…││no item cites it                                     │
+│ ▾ agy (0)                                 ││                                                     │
+│   no areas                                ││Revisions                                            │
 │                                           ││v1   created                MM-DD hh:mm              │
 │                                           ││                                                     │
 │                                           ││                                                     │
@@ -29,5 +29,6 @@ Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       1 wai
 │                                           ││                                                     │
 │                                           ││                                                     │
 │                                           ││                                                     │
-└─j/k move · Enter fold · / filter · a area · n new · e amend · W withdraw · r reload──────────────┘
+│                                           ││                                                     │
+╰─a area · n new · e amend · W withdraw · …─╯╰─────────────────────────────────────────────────────╯
  minted R-ENT-3

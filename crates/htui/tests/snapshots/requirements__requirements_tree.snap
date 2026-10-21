@@ -3,15 +3,15 @@ source: crates/htui/tests/requirements.rs
 expression: frame
 ---
 Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       1 waiting ·  F9  about   ?  keys
-┌ Requirements (3) ─────────────────────────┐┌ R-ENT-1 ────────────────────────────────────────────┐
-│▾ htui (3)                                 ││Every item has a stable key of the form PREFIX-N.    │
-│  ▾ ENT Entity model (2)                   ││                                                     │
-│    R-ENT-1  must   Every item has a stabl…││rationale: Keys are what people type.                │
-│    R-ENT-2  later  An item may carry a fr…││must · active · v2                                   │
-│  ▾ STO Storage (1)                        ││                                                     │
-│    R-STO-1  must   Postgres is the source…││Coverage                                             │
-│▾ agy (0)                                  ││ANA-1  addresses v1  ! suspect  done  —              │
-│  no areas                                 ││ANA-2  amends    v2             open  —              │
+╭─ Requirements (3) ────────────────────────╮╭─ R-ENT-1 ───────────────────────────────────────────╮
+│ ▾ htui (3)                                ││Every item has a stable key of the form PREFIX-N.    │
+│   ▾ ENT Entity model (2)                  ││                                                     │
+│▌    R-ENT-1  must   Every item has a stab…││rationale: Keys are what people type.                │
+│     R-ENT-2  later  An item may carry a f…││must · ● active · v2                                 │
+│   ▾ STO Storage (1)                       ││                                                     │
+│     R-STO-1  must   Postgres is the sourc…││Coverage                                             │
+│ ▾ agy (0)                                 ││ANA-1  addresses v1  ! suspect  ● done  —            │
+│   no areas                                ││ANA-2  amends    v2             ○ open  —            │
 │                                           ││                                                     │
 │                                           ││Revisions                                            │
 │                                           ││v1   created                09-03 10:00              │
@@ -29,4 +29,5 @@ Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       1 wai
 │                                           ││                                                     │
 │                                           ││                                                     │
 │                                           ││                                                     │
-└─j/k move · Enter fold · / filter · a area · n new · e amend · W withdraw · r reload──────────────┘
+│                                           ││                                                     │
+╰─a area · n new · e amend · W withdraw · …─╯╰─────────────────────────────────────────────────────╯
