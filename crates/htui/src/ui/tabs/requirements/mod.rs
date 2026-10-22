@@ -97,8 +97,8 @@ const CLEAR_THE_FILTER: &str = "clear the filter to see every row";
 /// A scope with no project to show.
 const NO_PROJECTS: &str = "No projects in this workspace.";
 
-/// [`NO_PROJECTS`]'s next step.
-const NO_PROJECTS_NEXT: &str = "Settings \u{203a} Hierarchy adds a project";
+/// [`NO_PROJECTS`]'s next step, whole in the tree's 34 inner cells at 80 columns (MOD-115 M3 RV3).
+const NO_PROJECTS_NEXT: &str = "Settings \u{203a} Hierarchy adds one";
 
 /// The detail pane with nothing selected.
 const SELECT_A_ROW: &str = "select a requirement";
@@ -3141,6 +3141,18 @@ mod tests {
         assert_eq!(style.fg, bench.theme.accent.fg, "the next step's role");
     }
 
+    /// MOD-115 M3 RV3 (carried L-req): at 80 columns the tree's inner rows are 34 cells, and the
+    /// no-projects state's next step is whole in them, not cut.
+    #[tokio::test]
+    async fn the_no_projects_next_step_fits_the_tree_at_80_columns() {
+        let (snapshot, _, scope) = platform().await;
+        let empty = Bench::new(scope, Vec::new());
+        let (_, rows) = drawn(&tab_on(snapshot), &empty.ctx(), 80, 24);
+        let text = rows.join("\n");
+        assert!(text.contains(super::NO_PROJECTS), "{text}");
+        assert!(text.contains(super::NO_PROJECTS_NEXT), "{text}");
+    }
+
     /// MOD-115 M3, MOD-83 (audit item 2): every empty state says what to do next.
     #[tokio::test]
     async fn every_empty_state_has_a_next_step() {
@@ -3180,7 +3192,7 @@ mod tests {
         let text = rows.join("\n");
         assert!(text.contains(super::NO_PROJECTS), "{text}");
         assert!(
-            text.contains("Settings \u{203a} Hierarchy adds a project"),
+            text.contains("Settings \u{203a} Hierarchy adds one"),
             "{text}"
         );
     }
