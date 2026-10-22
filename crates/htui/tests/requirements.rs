@@ -958,6 +958,94 @@ async fn a_filter_typed_with_the_tree_hidden_is_on_screen() {
     );
 }
 
+/// MOD-115 M3 RV3 repair (review M1, activity presets): with the tree hidden beside a shown
+/// activity pane, `/` draws the tree over the detail's rect only, so the shell's Activity
+/// placeholder neither cuts the tree's bottom border (where the filter's hints are) nor takes
+/// the tree's rows into its own pane. `presets` is how many `p` reach the preset.
+async fn filter_with_the_tree_hidden_beside_the_activity(presets: usize) -> String {
+    let mut harness = open().await;
+    let mut keys = vec!["p"; presets];
+    keys.push("f2");
+    let hidden = after(&mut harness, &keys).await;
+    assert!(
+        hidden.contains(&titled("Activity")) && !hidden.contains(&titled("Requirements (3)")),
+        "the activity pane is shown, the tree hidden:\n{hidden}"
+    );
+    let frame = filtered_by_sto(&mut harness).await;
+    assert!(
+        frame.contains(&titled("Activity")),
+        "the activity pane stays:\n{frame}"
+    );
+    assert!(
+        frame.contains("Enter apply \u{b7} Esc clear"),
+        "the filter's hints are on the tree's border:\n{frame}"
+    );
+    frame
+}
+
+#[tokio::test]
+async fn a_filter_typed_with_the_tree_hidden_keeps_ide_activity_s_panes_whole() {
+    let frame = filter_with_the_tree_hidden_beside_the_activity(1).await;
+    let tree = frame
+        .lines()
+        .position(|line| line.contains(&titled("Requirements (1)")))
+        .unwrap_or_else(|| panic!("the tree:\n{frame}"));
+    let activity = frame
+        .lines()
+        .position(|line| line.contains(&titled("Activity")))
+        .unwrap_or_else(|| panic!("the activity:\n{frame}"));
+    assert!(
+        activity > tree,
+        "the activity pane under the tree:\n{frame}"
+    );
+    let bottom = frame.lines().nth(activity - 1).unwrap_or_default();
+    assert!(
+        bottom.starts_with('\u{2570}') && bottom.contains("apply"),
+        "the tree's bottom border, its hints on it, right above the activity:\n{frame}"
+    );
+}
+
+#[tokio::test]
+async fn a_filter_typed_with_the_tree_hidden_keeps_columns_panes_whole() {
+    let frame = filter_with_the_tree_hidden_beside_the_activity(2).await;
+    let top = frame
+        .lines()
+        .find(|line| line.contains(&titled("Activity")))
+        .unwrap_or_else(|| panic!("the activity:\n{frame}"));
+    assert!(
+        top.contains(&titled("Requirements (1)")),
+        "side by side:\n{frame}"
+    );
+    // The Activity pane's left column: where its top-left corner is, in cells.
+    let column = top
+        .chars()
+        .skip(1)
+        .position(|c| c == '\u{256d}')
+        .map(|at| at + 1)
+        .expect("the activity's corner");
+    assert_eq!(
+        top.chars().nth(column - 1),
+        Some('\u{256e}'),
+        "the tree's top-right corner stands before the Activity pane:\n{frame}"
+    );
+    let band = band(&frame);
+    assert!(
+        band.chars()
+            .take(column)
+            .collect::<String>()
+            .ends_with("1 of 3\u{2502}"),
+        "the band ends at the tree's own right border:\n{frame}"
+    );
+    assert!(
+        !frame.lines().any(|line| line
+            .chars()
+            .skip(column)
+            .collect::<String>()
+            .contains("mirror")),
+        "no tree row in the Activity pane:\n{frame}"
+    );
+}
+
 /// MOD-115 M3 RV3 (carried L-req), MD-A end to end: the filter resolves what its field passes
 /// from the chord pressed (`Ctx::pressed`). With `field.line_down` moved to `ctrl-n`, the shell
 /// hands the filter's field the canonical `Down`, which a one-line field passes on; `ctrl-n` is

@@ -1461,10 +1461,18 @@ impl Tab for RequirementsTab {
         // zoomed one rather than into the detail's empty rect.
         // MOD-115 M3 RV3 (review M1): the filter is typed in the tree's band, so whenever no
         // tree would be drawn (the activity pane or the detail zoomed, the tree hidden) the tree
-        // is drawn over the content while the filter is open, and the detail is not drawn.
+        // is drawn while the filter is open, and the detail is not drawn. Repair: over the
+        // detail's rect when the layout gives one, which leaves out a shown activity pane (the
+        // shell paints its placeholder there); over the whole content only with the activity
+        // zoomed, when the shell paints none under a modal tab.
         let (tree, detail) = match capture_area(&areas, content, self.form_open()) {
             (None, _) if matches!(self.mode, Mode::Filter { .. }) => {
-                (Some(content), Rect::default())
+                let over = if areas.detail.is_empty() {
+                    content
+                } else {
+                    areas.detail
+                };
+                (Some(over), Rect::default())
             }
             drawn => drawn,
         };
