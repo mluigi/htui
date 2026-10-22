@@ -316,6 +316,6 @@ if the known empty dir appeared.
 - [ ] Every group-A hint names keys through `Keys`
 - [ ] Content parity reviewed per snapshot
 
-**Status**: CONFIRMED by the maintainer 2026-10-20 as written: all six open points as proposed.
+**Status**: COMPLETE 2026-10-22 on hr/MOD-115 (T0-T4, lanes in two waves, review rounds RV1-RV4; record `docs/decisions/mod/mod-115-decisions.md` "Milestone 3"). CONFIRMED by the maintainer 2026-10-20 as written: all six open points as proposed.
 That means D-15a keeps the shift arrows listed last, D-15b keeps tab keys out of forms, and the
 RV4 deferral of the literal `Enter …` hints is confirmed (group A in M3, group B in M4).
