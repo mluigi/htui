@@ -1246,77 +1246,72 @@ impl KindsSection {
     }
 
     /// One list row per tree row, in [`rows`](KindsSection::rows) order, plus the read-only
-    /// detail of the selected phase as note rows (D15, B-11), with the index of the selection's
-    /// last line, so the detail scrolls into view with its phase.
+    /// detail of the selected phase as note rows (D15, B-11): the lines, the cursor's own line
+    /// and the selection's last line, so the detail scrolls into view with its phase.
     ///
-    /// The detail is a note: the cursor never lands on it, so a row's index is its line's index
-    /// up to and including the selection. `width` is the list's, the gutter included.
-    fn list_rows(&self, width: u16, theme: &Theme) -> (Vec<list::Row<'static>>, usize) {
+    /// The cursor's line is answered, not taken for the cursor's row index (RV2 L2): the list
+    /// is handed the line it bands. Every row is one line, a blank one should a lookup miss,
+    /// so a row never shifts the lines under it. `width` is the list's, the gutter included.
+    fn list_rows(&self, width: u16, theme: &Theme) -> Listed {
         let item = |line: Line<'static>| list::Row {
             line,
             kind: RowKind::Item,
         };
         let mut lines = Vec::new();
+        let mut at = None;
         let mut end = 0;
         for (index, row) in self.rows().into_iter().enumerate() {
             let selected = index == self.cursor;
-            match row {
+            if selected {
+                at = Some(lines.len());
+            }
+            let line = match row {
                 // A project heads its kinds and graphs: the kit's group row, never folded.
-                Row::Project { p } => {
-                    if let Some(entry) = self.project(p) {
-                        lines.push(list::Row {
-                            line: Line::styled(
-                                format!("{}  {}", entry.project.slug, entry.project.name),
-                                theme.title,
-                            ),
-                            kind: RowKind::Group { folded: false },
-                        });
-                    }
-                }
-                Row::Kind { p, k } => {
-                    let Some(project) = self.project(p) else {
-                        continue;
-                    };
-                    let Some(kind) = project.kinds.get(k) else {
-                        continue;
-                    };
-                    let head = format!("  {}  {} \u{b7} ", kind.prefix, kind.name);
-                    // The tail is the one thing on this line the user has to act on, so it is
-                    // the one thing in `theme.error` (the band covers it on the cursor row).
-                    let tail = match project.graph(kind.default_graph_id) {
-                        Some(entry) => {
-                            Span::styled(format!("graph {}", entry.graph.name), theme.base)
-                        }
-                        None => Span::styled(GRAPH_MISSING.to_owned(), theme.error),
-                    };
-                    lines.push(item(Line::from(vec![Span::styled(head, theme.base), tail])));
-                }
-                Row::Graph { p, g } => {
-                    if let Some(entry) = self.graph_at(p, g) {
-                        lines.push(item(Line::styled(
-                            format!("  {} \u{b7} graph, no kind", entry.graph.name),
-                            theme.dim,
-                        )));
-                    }
-                }
-                Row::Phase { p, g, i } => {
-                    let Some(phase) = self.phase_at(p, g, i) else {
-                        continue;
-                    };
-                    lines.push(item(Line::styled(
-                        phase_line(phase, self.personas()),
-                        theme.base,
-                    )));
-                    if selected {
-                        lines.extend(detail_lines(phase, width.saturating_sub(1), theme));
-                    }
-                }
+                Row::Project { p } => self.project(p).map(|entry| list::Row {
+                    line: Line::styled(
+                        format!("{}  {}", entry.project.slug, entry.project.name),
+                        theme.title,
+                    ),
+                    kind: RowKind::Group { folded: false },
+                }),
+                Row::Kind { p, k } => self.kind_line(p, k, theme).map(item),
+                Row::Graph { p, g } => self.graph_at(p, g).map(|entry| {
+                    item(Line::styled(
+                        format!("  {} \u{b7} graph, no kind", entry.graph.name),
+                        theme.dim,
+                    ))
+                }),
+                Row::Phase { p, g, i } => self.phase_at(p, g, i).map(|phase| {
+                    item(Line::styled(phase_line(phase, self.personas()), theme.base))
+                }),
+            };
+            lines.push(line.unwrap_or_else(|| item(Line::default())));
+            if selected
+                && let Row::Phase { p, g, i } = row
+                && let Some(phase) = self.phase_at(p, g, i)
+            {
+                lines.extend(detail_lines(phase, width.saturating_sub(1), theme));
             }
             if selected {
                 end = lines.len().saturating_sub(1);
             }
         }
-        (lines, end)
+        Listed { lines, at, end }
+    }
+
+    /// A kind's line: its prefix and name, then its graph, or the missing graph in
+    /// `theme.error`; `None` should the snapshot not hold it.
+    fn kind_line(&self, p: usize, k: usize, theme: &Theme) -> Option<Line<'static>> {
+        let project = self.project(p)?;
+        let kind = project.kinds.get(k)?;
+        let head = format!("  {}  {} \u{b7} ", kind.prefix, kind.name);
+        // The tail is the one thing on this line the user has to act on, so it is
+        // the one thing in `theme.error` (the band covers it on the cursor row).
+        let tail = match project.graph(kind.default_graph_id) {
+            Some(entry) => Span::styled(format!("graph {}", entry.graph.name), theme.base),
+            None => Span::styled(GRAPH_MISSING.to_owned(), theme.error),
+        };
+        Some(Line::from(vec![Span::styled(head, theme.base), tail]))
     }
 
     /// The one line under the pane: the last outcome as a kit notice, in `theme.error` when it is
@@ -1663,19 +1658,11 @@ impl SettingsSection for KindsSection {
                 // Scrolled so the cursor is on screen, its detail with it when it fits: the tree
                 // of a scope with several projects is longer than the pane, and a selection
                 // nobody can see is a cursor that acts blind.
-                let (lines, end) = self.list_rows(rows.width, theme);
+                let Listed { lines, at, end } = self.list_rows(rows.width, theme);
                 let total = lines.len();
                 let offset = list::scroll_into_view(end, 0, usize::from(rows.height), total)
-                    .min(self.cursor);
-                list::render(
-                    frame,
-                    rows,
-                    &lines,
-                    Some(self.cursor),
-                    offset,
-                    ctx.accent(),
-                    theme,
-                );
+                    .min(at.unwrap_or(0));
+                list::render(frame, rows, &lines, at, offset, ctx.accent(), theme);
                 // The pane's bar is measured against the rows the tree is drawn into and sits
                 // beside them (RV1 M2), so the rows under the tree need no padding.
                 self.scroll
@@ -1687,6 +1674,16 @@ impl SettingsSection for KindsSection {
         }
         frame.render_widget(Paragraph::new(self.notice_line(theme)), hint);
     }
+}
+
+/// The tree as [`KindsSection::list_rows`] lists it (RV2 L2).
+struct Listed {
+    /// One line per tree row, the selected phase's detail under it.
+    lines: Vec<list::Row<'static>>,
+    /// The cursor's line, the one the list bands; `None` with no row under the cursor.
+    at: Option<usize>,
+    /// The selection's last line, its detail's when it has one.
+    end: usize,
 }
 
 impl Field {
@@ -2202,5 +2199,48 @@ mod tests {
             hint.ends_with(" \u{b7} saving the budget\u{2026}"),
             "{hint}"
         );
+    }
+
+    /// MOD-115 M3 RV2 L2: the list is handed the cursor's own line, which `list_rows` answers,
+    /// not the cursor's row index: over the whole demo tree the line it names is the cursor
+    /// row's, and the selection's last line closes the detail drawn under it.
+    #[tokio::test]
+    async fn list_rows_answer_the_cursors_line() {
+        use htui_core::store::{MemStore, ReadStore};
+        let store = MemStore::demo();
+        let workspaces = store
+            .workspaces()
+            .await
+            .expect("the memory store never fails");
+        let scope = Scope::from_workspace(workspaces.first().expect("a workspace"));
+        let snapshot = crate::catalogue::snapshot(&store, &scope)
+            .await
+            .expect("the demo catalogue");
+        let theme = Theme::default();
+        let mut section = KindsSection {
+            snapshot: Some(snapshot),
+            ..KindsSection::new()
+        };
+        let rows = section.rows().len();
+        assert!(rows > 3, "a tree to walk");
+        let mut details = 0;
+        for cursor in 0..rows {
+            section.cursor = cursor;
+            let listed = section.list_rows(100, &theme);
+            let at = listed.at.expect("the cursor's row is listed");
+            assert!(
+                matches!(listed.lines[at].kind, RowKind::Item | RowKind::Group { .. }),
+                "{cursor}: the cursor's line is a row, not a note"
+            );
+            assert!(listed.end >= at, "{cursor}");
+            assert!(
+                listed.lines[at + 1..=listed.end]
+                    .iter()
+                    .all(|line| matches!(line.kind, RowKind::Note)),
+                "{cursor}: the lines after it, through `end`, are its detail"
+            );
+            details += listed.end - at;
+        }
+        assert!(details > 0, "a phase with its detail was walked");
     }
 }
