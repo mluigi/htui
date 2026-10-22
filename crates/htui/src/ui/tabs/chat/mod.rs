@@ -864,12 +864,12 @@ impl Tab for ChatTab {
                 }
                 None => {
                     let unfold = ctx.keys().label(views::CHAT_REPLAY, Act::ChatThoughts);
-                    let lines =
+                    let shown =
                         replay
                             .transcript
                             .lines(body.height as usize, ctx.theme, unfold.as_deref());
-                    frame.render_widget(Paragraph::new(lines), body);
-                    scroll = Some(replay.transcript.scroll_position());
+                    scroll = Some((shown.total, shown.first));
+                    frame.render_widget(Paragraph::new(shown.lines), body);
                 }
             }
         }
@@ -897,11 +897,11 @@ impl Tab for ChatTab {
             empty::render(frame, body, what, NextStep(&next), ctx.theme);
         } else {
             let unfold = ctx.keys().label(views::CHAT_LIVE, Act::ChatThoughts);
-            let lines = self
+            let shown = self
                 .transcript
                 .lines(body.height as usize, ctx.theme, unfold.as_deref());
-            frame.render_widget(Paragraph::new(lines), body);
-            scroll = Some(self.transcript.scroll_position());
+            scroll = Some((shown.total, shown.first));
+            frame.render_widget(Paragraph::new(shown.lines), body);
         }
 
         if let Some(row) = parked {

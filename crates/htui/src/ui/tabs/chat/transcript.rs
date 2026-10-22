@@ -219,10 +219,69 @@ pub struct Transcript {
     rendered: std::cell::Cell<usize>,
     /// Height the last render was given, for the same reason.
     height: std::cell::Cell<usize>,
-    /// The first line the last render drew: the scrollbar's offset (MOD-115 M3 D5).
-    first: std::cell::Cell<usize>,
+    /// Each row's lines as last rendered (MOD-115 M3 RV3 L4): a frame renders only the rows
+    /// that changed since the last one.
+    cache: std::cell::RefCell<LineCache>,
+    /// How many rows the cache has rendered, for the tests that pin what it re-renders.
+    #[cfg(test)]
+    renders: std::cell::Cell<usize>,
     /// The agent-side session id, taken from the banner rather than rendered as a row.
     session_ref: Option<AgentSessionRef>,
+}
+
+/// What [`Transcript::lines`] drew: the window's lines and the scrollbar's numbers (MOD-115 M3
+/// D5), every line the rows render to and the first one drawn.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Shown {
+    /// The lines in view, at most the height asked for.
+    pub lines: Vec<Line<'static>>,
+    /// Every line the rows render to.
+    pub total: usize,
+    /// The first line drawn.
+    pub first: usize,
+}
+
+/// Each row's lines as last rendered, beside the row they were rendered from, and what every
+/// row was rendered with (MOD-115 M3 RV3 L4). A row that differs from its copy (a streamed
+/// chunk, a call's result, a proposal's answer) is rendered again; another theme, another
+/// unfold key or the thoughts folded the other way render every row again.
+#[derive(Debug, Default)]
+struct LineCache {
+    theme: Option<Theme>,
+    unfold: Option<String>,
+    fold_thoughts: bool,
+    rows: Vec<(TranscriptRow, Vec<Line<'static>>)>,
+}
+
+impl LineCache {
+    /// Brings the cache up to `rows`, rendering through `render` each row it does not hold as
+    /// is.
+    fn refresh(
+        &mut self,
+        rows: &[TranscriptRow],
+        fold_thoughts: bool,
+        theme: &Theme,
+        unfold: Option<&str>,
+        render: impl Fn(&TranscriptRow) -> Vec<Line<'static>>,
+    ) {
+        if self.theme.as_ref() != Some(theme)
+            || self.unfold.as_deref() != unfold
+            || self.fold_thoughts != fold_thoughts
+        {
+            self.rows.clear();
+            self.theme = Some(*theme);
+            self.unfold = unfold.map(str::to_owned);
+            self.fold_thoughts = fold_thoughts;
+        }
+        self.rows.truncate(rows.len());
+        for (index, row) in rows.iter().enumerate() {
+            match self.rows.get_mut(index) {
+                Some((cached, _)) if cached == row => {}
+                Some(slot) => *slot = (row.clone(), render(row)),
+                None => self.rows.push((row.clone(), render(row))),
+            }
+        }
+    }
 }
 
 /// Where the view is.
@@ -579,29 +638,38 @@ impl Transcript {
     /// The transcript as lines, tail-first when nothing has been scrolled. `unfold` is the
     /// thoughts key a folded thought names, `ChatThoughts`'s label through the stack the
     /// transcript is read in (MOD-67 M6 D4); with none bound a folded thought names no key.
+    /// The window comes with the scrollbar's numbers ([`Shown`]), and only the rows that changed
+    /// since the last call are rendered again (MOD-115 M3 RV3 L4).
     #[must_use]
-    pub fn lines(&self, height: usize, theme: &Theme, unfold: Option<&str>) -> Vec<Line<'static>> {
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        for row in &self.rows {
-            lines.extend(self.render_row(row, theme, unfold));
-        }
-        self.rendered.set(lines.len());
+    pub fn lines(&self, height: usize, theme: &Theme, unfold: Option<&str>) -> Shown {
+        let mut cache = self.cache.borrow_mut();
+        cache.refresh(&self.rows, self.fold_thoughts, theme, unfold, |row| {
+            #[cfg(test)]
+            self.renders.set(self.renders.get() + 1);
+            self.render_row(row, theme, unfold)
+        });
+        let total = cache.rows.iter().map(|(_, lines)| lines.len()).sum();
+        self.rendered.set(total);
         self.height.set(height);
         // MOD-115 M3 RV3 (review L1): a view parked past the last page (thoughts folded again)
         // shows the last page.
         let first = match self.scroll {
-            Scroll::Tail => lines.len().saturating_sub(height),
-            Scroll::At(line) => line.min(lines.len().saturating_sub(height)),
+            Scroll::Tail => total.saturating_sub(height),
+            Scroll::At(line) => line.min(total.saturating_sub(height)),
         };
-        self.first.set(first);
-        lines.into_iter().skip(first).take(height).collect()
-    }
-
-    /// The scrollbar's numbers as of the last [`Transcript::lines`] (MOD-115 M3 D5): every line
-    /// the rows rendered to, and the first one drawn.
-    #[must_use]
-    pub fn scroll_position(&self) -> (usize, usize) {
-        (self.rendered.get(), self.first.get())
+        let lines = cache
+            .rows
+            .iter()
+            .flat_map(|(_, lines)| lines)
+            .skip(first)
+            .take(height)
+            .cloned()
+            .collect();
+        Shown {
+            lines,
+            total,
+            first,
+        }
     }
 
     /// One row's lines; a folded thought names `unfold` ([`Transcript::lines`]).
@@ -1080,14 +1148,22 @@ mod tests {
             message_id: None,
         })));
         let theme = Theme::default();
-        assert_eq!(transcript.lines(20, &theme, Some("t")).len(), 1, "folded");
+        assert_eq!(
+            transcript.lines(20, &theme, Some("t")).lines.len(),
+            1,
+            "folded"
+        );
         // MOD-67 M6 D4: the folded row names the thoughts key in force, and none unbound.
-        let named = |unfold| transcript.lines(20, &theme, unfold)[0].to_string();
+        let named = |unfold| transcript.lines(20, &theme, unfold).lines[0].to_string();
         assert_eq!(named(Some("T")), "thought  first (T to unfold)");
         assert_eq!(named(None), "thought  first");
 
         transcript.on_act(Act::ChatThoughts);
-        assert_eq!(transcript.lines(20, &theme, Some("t")).len(), 3, "unfolded");
+        assert_eq!(
+            transcript.lines(20, &theme, Some("t")).lines.len(),
+            3,
+            "unfolded"
+        );
     }
 
     /// The fixture's `plan` step is eight persisted rows and seven rendered ones: the
@@ -1162,22 +1238,22 @@ mod tests {
         }
         let theme = Theme::default();
         let tail = transcript.lines(3, &theme, Some("t"));
-        assert_eq!(tail.len(), 3);
+        assert_eq!(tail.lines.len(), 3);
         assert!(
-            tail[2].to_string().contains("cancelled"),
+            tail.lines[2].to_string().contains("cancelled"),
             "the newest line is visible: {:?}",
-            tail[2].to_string()
+            tail.lines[2].to_string()
         );
 
         // MOD-115 M3 D5: the scrollbar's numbers are the last render's, every line and the first
         // one drawn.
-        assert_eq!(transcript.scroll_position(), (10, 7));
+        assert_eq!((tail.total, tail.first), (10, 7));
 
         transcript.on_act(Act::ChatTop);
         let top = transcript.lines(3, &theme, Some("t"));
-        assert_eq!(transcript.scroll_position(), (10, 0));
+        assert_eq!((top.total, top.first), (10, 0));
         assert_eq!(
-            top[0].to_string(),
+            top.lines[0].to_string(),
             "\u{2014} turn ended \u{2014}",
             "`g` goes to the first line"
         );
@@ -1193,34 +1269,34 @@ mod tests {
             transcript.apply(&chunk(&format!("line {n}"), &format!("m{n}")));
         }
         let theme = Theme::default();
-        transcript.lines(3, &theme, Some("t"));
+        let _ = transcript.lines(3, &theme, Some("t"));
         transcript.on_act(Act::ChatTop);
-        transcript.lines(3, &theme, Some("t"));
-        assert_eq!(transcript.scroll_position(), (10, 0));
+        let shown = transcript.lines(3, &theme, Some("t"));
+        assert_eq!((shown.total, shown.first), (10, 0));
         for _ in 0..20 {
             transcript.on_act(Act::ListDown);
         }
         let shown = transcript.lines(3, &theme, Some("t"));
         assert_eq!(
-            transcript.scroll_position(),
+            (shown.total, shown.first),
             (10, 7),
             "the last page, not past the end"
         );
-        assert_eq!(shown.len(), 3, "a full page");
+        assert_eq!(shown.lines.len(), 3, "a full page");
 
         transcript.apply(&chunk("streamed", "m10"));
         let shown = transcript.lines(3, &theme, Some("t"));
-        assert_eq!(transcript.scroll_position(), (11, 8), "the tail again");
-        assert_eq!(shown[2].to_string(), "streamed");
+        assert_eq!((shown.total, shown.first), (11, 8), "the tail again");
+        assert_eq!(shown.lines[2].to_string(), "streamed");
 
         // One step back from the tail, and one down is the tail again.
         transcript.on_act(Act::ListUp);
-        transcript.lines(3, &theme, Some("t"));
-        assert_eq!(transcript.scroll_position(), (11, 7));
+        let shown = transcript.lines(3, &theme, Some("t"));
+        assert_eq!((shown.total, shown.first), (11, 7));
         transcript.on_act(Act::ListDown);
         transcript.apply(&chunk("more", "m11"));
-        transcript.lines(3, &theme, Some("t"));
-        assert_eq!(transcript.scroll_position(), (12, 9), "it follows the tail");
+        let shown = transcript.lines(3, &theme, Some("t"));
+        assert_eq!((shown.total, shown.first), (12, 9), "it follows the tail");
     }
 
     /// MOD-115 M3 RV3 (review L1): a view parked past what the rows now render to (thoughts
@@ -1239,15 +1315,115 @@ mod tests {
         transcript.apply(&chunk("last", "m2"));
         let theme = Theme::default();
         transcript.on_act(Act::ChatThoughts);
-        transcript.lines(3, &theme, Some("t"));
-        assert_eq!(transcript.scroll_position(), (12, 9), "unfolded");
+        let shown = transcript.lines(3, &theme, Some("t"));
+        assert_eq!((shown.total, shown.first), (12, 9), "unfolded");
         transcript.on_act(Act::ListUp);
-        transcript.lines(3, &theme, Some("t"));
-        assert_eq!(transcript.scroll_position(), (12, 8), "parked");
+        let shown = transcript.lines(3, &theme, Some("t"));
+        assert_eq!((shown.total, shown.first), (12, 8), "parked");
         transcript.on_act(Act::ChatThoughts);
         let shown = transcript.lines(3, &theme, Some("t"));
-        assert_eq!(transcript.scroll_position(), (3, 0), "folded: the one page");
-        assert_eq!(shown.len(), 3, "{shown:?}");
+        assert_eq!((shown.total, shown.first), (3, 0), "folded: the one page");
+        assert_eq!(shown.lines.len(), 3, "{shown:?}");
+    }
+
+    /// The lines in view, as text.
+    fn texts(shown: &Shown) -> Vec<String> {
+        shown.lines.iter().map(ToString::to_string).collect()
+    }
+
+    /// MOD-115 M3 RV3 (review L4): a frame renders only the rows that changed since the last
+    /// one. A streamed chunk re-renders its own row, with the new text on screen; a call's result
+    /// re-renders the call's row above it; nothing changed renders nothing.
+    #[test]
+    fn a_frame_renders_only_the_rows_that_changed() {
+        let mut transcript = Transcript::new();
+        transcript.apply(&envelope(DriverEvent::ToolCall(ToolCallEvent {
+            tool_call_id: "call-1".to_owned(),
+            title: "Read main.rs".to_owned(),
+            tool_kind: ToolKind::Read,
+            input: json!({}),
+            locations: Vec::new(),
+        })));
+        for n in 0..4 {
+            transcript.apply(&chunk(&format!("line {n}"), &format!("m{n}")));
+        }
+        let theme = Theme::default();
+        let first = transcript.lines(10, &theme, Some("t"));
+        assert_eq!(transcript.renders.get(), 5, "every row once");
+        assert_eq!(
+            transcript.lines(10, &theme, Some("t")),
+            first,
+            "the same lines"
+        );
+        assert_eq!(transcript.renders.get(), 5, "and none rendered again");
+
+        transcript.apply(&chunk(" and more", "m3"));
+        let shown = transcript.lines(10, &theme, Some("t"));
+        assert_eq!(transcript.renders.get(), 6, "the streamed row alone");
+        assert_eq!(texts(&shown)[4], "line 3 and more", "{shown:?}");
+        assert_eq!(shown.total, 5);
+
+        transcript.apply(&envelope(DriverEvent::ToolResult(ToolResultEvent {
+            tool_call_id: "call-1".to_owned(),
+            status: ToolResultStatus::Completed,
+            output: None,
+            locations: Vec::new(),
+            terminal_reason: None,
+        })));
+        let shown = transcript.lines(10, &theme, Some("t"));
+        assert_eq!(transcript.renders.get(), 7, "the call's row alone");
+        assert!(texts(&shown)[0].contains("done"), "{shown:?}");
+        assert!(!texts(&shown)[0].contains("running"), "{shown:?}");
+
+        transcript.apply(&chunk("new row", "m4"));
+        let shown = transcript.lines(10, &theme, Some("t"));
+        assert_eq!(transcript.renders.get(), 8, "the new row alone");
+        assert_eq!((shown.total, texts(&shown)[5].as_str()), (6, "new row"));
+    }
+
+    /// MOD-115 M3 RV3 (review L4): the cached lines follow what they were rendered with: the
+    /// thoughts unfolded and folded again, another unfold key, another theme.
+    #[test]
+    fn the_cached_lines_follow_the_fold_the_unfold_key_and_the_theme() {
+        let mut transcript = Transcript::new();
+        transcript.apply(&envelope(DriverEvent::ThoughtChunk(TextChunk {
+            text: "first\nsecond".to_owned(),
+            message_id: None,
+        })));
+        transcript.apply(&chunk("said", "m1"));
+        let theme = Theme::default();
+        let folded = transcript.lines(10, &theme, Some("t"));
+        assert_eq!(
+            texts(&folded),
+            ["thought  first (t to unfold)", "said"],
+            "folded"
+        );
+
+        transcript.on_act(Act::ChatThoughts);
+        let unfolded = transcript.lines(10, &theme, Some("t"));
+        assert_eq!(
+            texts(&unfolded),
+            ["thought  first", "thought  second", "said"],
+            "unfolded"
+        );
+        transcript.on_act(Act::ChatThoughts);
+        assert_eq!(
+            transcript.lines(10, &theme, Some("t")),
+            folded,
+            "folded again"
+        );
+
+        let rebound = transcript.lines(10, &theme, Some("T"));
+        assert_eq!(texts(&rebound)[0], "thought  first (T to unfold)");
+        let unbound = transcript.lines(10, &theme, None);
+        assert_eq!(texts(&unbound)[0], "thought  first");
+
+        let mono = Theme::monochrome();
+        assert_ne!(mono.dim, theme.dim, "two themes to tell apart");
+        let shown = transcript.lines(10, &mono, Some("t"));
+        assert_eq!(shown.lines[0].style, mono.dim, "the new theme's");
+        let shown = transcript.lines(10, &theme, Some("t"));
+        assert_eq!(shown.lines[0].style, theme.dim, "and back");
     }
 
     /// The lines `row` renders to, as text.
