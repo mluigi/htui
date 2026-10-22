@@ -596,7 +596,10 @@ impl Transcript {
             Act::ListUp => {
                 self.scroll = match self.scroll {
                     // The tail shows the last `height` lines, so stepping back from it means the
-                    // line just above that window — not `rows.len()`, which counts rows.
+                    // line just above that window — not `rows.len()`, which counts rows. A chat
+                    // that fits one page has no such line, so it stays the tail and keeps
+                    // following what streams in (MOD-115 M3 RV4).
+                    Scroll::Tail if self.last_page() == 0 => Scroll::Tail,
                     Scroll::Tail => Scroll::At(self.last_page().saturating_sub(1)),
                     Scroll::At(line) => Scroll::At(line.min(self.last_page()).saturating_sub(1)),
                 };
@@ -1324,6 +1327,28 @@ mod tests {
         let shown = transcript.lines(3, &theme, Some("t"));
         assert_eq!((shown.total, shown.first), (3, 0), "folded: the one page");
         assert_eq!(shown.lines.len(), 3, "{shown:?}");
+    }
+
+    /// MOD-115 M3 RV4: on a chat that fits one page there is no line above the window, so a
+    /// step up stays on the tail; the lines streamed after it are followed, not left below.
+    #[test]
+    fn a_step_up_on_a_one_page_chat_keeps_the_tail() {
+        let mut transcript = Transcript::new();
+        let theme = Theme::default();
+        transcript.apply(&chunk("first", "m0"));
+        let shown = transcript.lines(5, &theme, Some("t"));
+        assert_eq!((shown.total, shown.first), (1, 0), "one page");
+        transcript.on_act(Act::ListUp);
+        for n in 1..12 {
+            transcript.apply(&chunk(&format!("line {n}"), &format!("m{n}")));
+        }
+        let shown = transcript.lines(5, &theme, Some("t"));
+        assert_eq!((shown.total, shown.first), (12, 7), "still the tail");
+        assert_eq!(
+            texts(&shown),
+            ["line 7", "line 8", "line 9", "line 10", "line 11"],
+            "the last five lines"
+        );
     }
 
     /// The lines in view, as text.
