@@ -567,8 +567,10 @@ impl RequirementsTab {
     /// The filter: every key updates `filter` and sends nothing (F-13); `Enter` applies and
     /// re-selects, `Esc` clears and re-selects (the field's own keys, MOD-67 M4 D10). A key the
     /// field passes is swallowed but for the chords its stack passes (`ctrl-c`, `F1`); the stack
-    /// offers no `form.save`, so `ctrl-s` saves nothing here.
-    fn on_filter_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
+    /// offers no `form.save`, so `ctrl-s` saves nothing here. MOD-115 M3 RV3 repair: `pressed`
+    /// is the chord the user pressed (`Ctx::pressed`, MD-A), `key` the event delivered after the
+    /// `[field]` translation; the caller hands both, so a test pins the rest's resolution.
+    fn on_filter_pressed(&mut self, key: KeyEvent, pressed: KeyChord, ctx: &Ctx<'_>) -> Handled {
         let stack = self.stack();
         let Mode::Filter { field } = &mut self.mode else {
             return Handled::Pass;
@@ -590,7 +592,7 @@ impl RequirementsTab {
                 self.reselect(ctx);
             }
             // MOD-115 M3 MD-A: the rest resolves from the chord pressed (`Ctx::pressed`).
-            FieldOutcome::Pass => return modal_rest(stack, ctx.pressed(&key)),
+            FieldOutcome::Pass => return modal_rest(stack, pressed),
         }
         Handled::Consumed
     }
@@ -1310,7 +1312,7 @@ impl Tab for RequirementsTab {
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         match self.mode {
             Mode::Browse => self.on_browse_key(key, ctx),
-            Mode::Filter { .. } => self.on_filter_key(key, ctx),
+            Mode::Filter { .. } => self.on_filter_pressed(key, ctx.pressed(&key), ctx),
             Mode::NewArea(_) | Mode::Requirement(_) | Mode::Withdraw(_) => {
                 self.on_form_key(key, ctx)
             }
@@ -2730,6 +2732,37 @@ mod tests {
         // MOD-115 M3 MD-A: `Esc` through the keys too (C6), the compiled text unchanged.
         let keys = load_str("version = 2\n[field]\nsubmit = \"ctrl-t\"\n").expect("loads");
         assert_eq!(text(&keys), "Ctrl+t apply \u{b7} Esc clear");
+    }
+
+    /// MOD-115 M3 RV3 repair (MD-A, carried L-req): what the filter's field passes is resolved
+    /// from the chord pressed, not the event delivered. With `field.line_down` on `ctrl-n` the
+    /// shell delivers the canonical `Down`, which the one-line field passes: the pressed
+    /// `ctrl-n` is a chord the stack passes on (`ctrl-c`, `F1`), a pressed `Down` is swallowed.
+    /// Resolving the delivered `Down` would swallow both; no frame tells them apart, the shell
+    /// having nothing for the canonical `Down` it is handed back.
+    #[tokio::test]
+    async fn the_filter_resolves_what_its_field_passes_from_the_chord_pressed() {
+        use crate::keys::KeyChord;
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let mut tab = tab_on(snapshot);
+        tab.mode = Mode::Filter {
+            field: TextField::new(),
+        };
+        let chord = |spec: &str| KeyChord::parse_strict(spec).expect("a valid spec");
+        let down = KeyEvent::from(KeyCode::Down);
+        assert_eq!(
+            tab.on_filter_pressed(down, chord("ctrl-n"), &bench.ctx()),
+            Handled::Pass,
+            "a pressed `ctrl-n` delivered as `Down` passes"
+        );
+        assert!(matches!(tab.mode, Mode::Filter { .. }), "the filter stays");
+        assert_eq!(
+            tab.on_filter_pressed(down, chord("down"), &bench.ctx()),
+            Handled::Consumed,
+            "a pressed `Down` is swallowed"
+        );
+        assert!(matches!(tab.mode, Mode::Filter { .. }), "the filter stays");
     }
 
     /// MOD-115 M2 RV1 H2: the priority field's hint names the priority keys in force, and the

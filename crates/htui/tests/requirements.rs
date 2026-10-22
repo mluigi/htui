@@ -1046,11 +1046,14 @@ async fn a_filter_typed_with_the_tree_hidden_keeps_columns_panes_whole() {
     );
 }
 
-/// MOD-115 M3 RV3 (carried L-req), MD-A end to end: the filter resolves what its field passes
-/// from the chord pressed (`Ctx::pressed`). With `field.line_down` moved to `ctrl-n`, the shell
-/// hands the filter's field the canonical `Down`, which a one-line field passes on; `ctrl-n` is
-/// that row's alone, so the filter typed, the tree and the hints stay as they were, and the
-/// filter still takes what is typed next.
+/// MOD-115 M3 RV3 (carried L-req), MD-A end to end: the `[field]` translation in the filter.
+/// With `field.line_down` moved to `ctrl-n`, the shell hands the filter's field the canonical
+/// `Down`, which a one-line field passes on; `ctrl-n` is that row's alone, so the filter typed,
+/// the tree and the hints stay as they were, and the filter still takes what is typed next.
+/// Whether the filter resolves what its field passes from the chord pressed (`Ctx::pressed`)
+/// shows on no frame (the shell has nothing for the canonical `Down` either way): the
+/// requirements tab's unit test
+/// `the_filter_resolves_what_its_field_passes_from_the_chord_pressed` pins it (RV3 repair).
 #[tokio::test]
 async fn a_rebound_field_chord_in_the_filter_is_only_that_row_s() {
     let mut harness = open_with_keys("version = 2\n[field]\nline_down = [\"ctrl-n\"]\n").await;
