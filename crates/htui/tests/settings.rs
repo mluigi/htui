@@ -6625,7 +6625,7 @@ async fn a_manual_row_that_needs_login_keeps_its_star() {
 
 /// RV4 (the maintainer's answer, "just use the icon"): a manual verdict that does not fit beside
 /// its `*` is its icon alone (`⚠*`) in every state and at every width, never a cut word. The word
-/// stays where it already is: the idle note, while it has room, and the help.
+/// stays where it already is: the idle note, while it has room.
 #[tokio::test]
 async fn a_manual_verdict_is_its_icon_alone_whatever_the_note_holds() {
     let bench = SectionBench::new().await;

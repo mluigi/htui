@@ -231,7 +231,7 @@ pub(super) struct OnBox {
 /// `starred` (manual) verdict keeps its [`MANUAL_SUFFIX`], since the idle note's [`MANUAL_NOTE`]
 /// promises the mark: a status verdict that does not fit beside it is its icon alone (`⚠*`, the
 /// maintainer's answer, MOD-115 M3 RV2 L5), in every state and at every width (RV4: "just use the
-/// icon"); its word is the idle note's and the help's, never a cut one in the cell. A version
+/// icon"); its word is the idle note's, never a cut one in the cell. A version
 /// gives up its last cells. Every other cell is `table_line`'s to fit.
 #[must_use]
 fn fit_on_box(cell: &OnBox, width: u16) -> (String, bool) {

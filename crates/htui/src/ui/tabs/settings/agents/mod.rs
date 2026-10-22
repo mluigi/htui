@@ -283,8 +283,7 @@ impl AgentsSection {
     /// section is idle. A `None` note still takes its line, so the layout never changes height with
     /// it. While a `manual` row is listed, the idle note ends in [`MANUAL_NOTE`], the key to the
     /// cell's `*` (MOD-66), then the word of each verdict the table drew as its icon alone
-    /// (`icons`, `⚠*`: RV2 L5); the table draws that icon whatever the line holds (RV4), and the
-    /// help says the word too. The keys that shared the pane with it moved to the
+    /// (`icons`, `⚠*`: RV2 L5); the table draws that icon whatever the line holds (RV4). The keys that shared the pane with it moved to the
     /// shell's hint row (MOD-67 M6 T2).
     fn note(&self, keys: &Keys, icons: &[ProbeStatus]) -> Option<String> {
         self.notice.clone().or_else(|| {
