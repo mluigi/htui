@@ -2206,7 +2206,7 @@ mod tests {
     /// row's, and the selection's last line closes the detail drawn under it.
     #[tokio::test]
     async fn list_rows_answer_the_cursors_line() {
-        use htui_core::store::{MemStore, ReadStore};
+        use htui_core::store::MemStore;
         let store = MemStore::demo();
         let workspaces = store
             .workspaces()
