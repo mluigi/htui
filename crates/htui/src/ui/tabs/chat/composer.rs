@@ -112,7 +112,8 @@ impl Composer {
 
     /// Draws the input line while the composer is open; nothing otherwise (the keys that open it
     /// are the pane's hints since MOD-67 M6 T2). The prompt `> ` and the cursor `_` take
-    /// `accent`, the tab's focus accent (MOD-115 M3 D-17, MOD-85); the text is plain.
+    /// `accent`: the tab's focus accent while the pane is focused, the dim role otherwise
+    /// (MOD-115 M3 D-17, MOD-85, RV3 L2); the text is plain.
     pub fn render(
         frame: &mut Frame<'_>,
         area: Rect,

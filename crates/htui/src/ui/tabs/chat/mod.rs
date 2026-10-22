@@ -48,7 +48,7 @@ use crate::ui::cells::{self, cell_width};
 use crate::ui::kit::chips::key_line;
 use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::label::plural;
-use crate::ui::kit::pane::Pane;
+use crate::ui::kit::pane::{Focus, Pane};
 use crate::ui::kit::text::{Tone, notice};
 use crate::ui::shell::PaneId;
 use crate::ui::tabs::registry::{Tab, TabId};
@@ -909,8 +909,15 @@ impl Tab for ChatTab {
         }
         // Not under a replay: the composer belongs to the live view, and a replay must not show
         // an input line for a step that can take no input.
+        // MOD-115 M3 RV3 (review L2): the tab accent marks the focused pane alone, so an
+        // unfocused pane's composer is dim.
+        let focus = ctx.pane_focus(PaneId::Detail);
         if replay.is_none() {
-            Composer::render(frame, composer, &self.composer, ctx.accent(), ctx.theme);
+            let accent = match focus {
+                Focus::Focused => ctx.accent(),
+                Focus::Unfocused => ctx.theme.dim,
+            };
+            Composer::render(frame, composer, &self.composer, accent, ctx.theme);
         }
 
         // The title's room: the pane draws ` {title} ` two cells past the corner and stops one
@@ -920,9 +927,7 @@ impl Tab for ChatTab {
             Some(replay) => Self::replay_header(replay),
             None => self.header(ctx, area.width.saturating_sub(6)),
         };
-        let mut pane = Pane::new(&title)
-            .focus(ctx.pane_focus(PaneId::Detail))
-            .accent(ctx.accent());
+        let mut pane = Pane::new(&title).focus(focus).accent(ctx.accent());
         if let Some(hints) = key_line(self.hint_text(ctx.keys()), ctx.theme) {
             pane = pane.hints(hints);
         }
@@ -1356,6 +1361,21 @@ mod tests {
             shell.ctx().accent().fg,
             "the tab accent"
         );
+    }
+
+    /// MOD-115 M3 RV3 (review L2): the tab accent marks the focused pane alone, so the open
+    /// composer's `> ` and `_` are dim while the Chat's pane is not focused.
+    #[test]
+    fn the_composer_is_dim_while_the_pane_is_unfocused() {
+        let shell = Shell::new();
+        let mut tab = live(&shell);
+        tab.on_key(key(KeyCode::Char('i')), &mut shell.ctx());
+        let buffer = draw(&tab, &shell, (60, 8), false);
+        // The composer is the pane's last inner row: `> `, no text yet, then the cursor.
+        assert_eq!(buffer[(1, 6)].symbol(), ">");
+        assert_eq!(Some(buffer[(1, 6)].fg), shell.theme.dim.fg, "a dim prompt");
+        assert_eq!(buffer[(3, 6)].symbol(), "_");
+        assert_eq!(Some(buffer[(3, 6)].fg), shell.theme.dim.fg, "a dim cursor");
     }
 
     /// MOD-115 M3: an empty Chat says what is missing and what to do next (audit item 2).
