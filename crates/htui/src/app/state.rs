@@ -228,6 +228,16 @@ impl<'a> Ctx<'a> {
         self.pressed = Some((delivered, pressed));
     }
 
+    /// [`set_pressed`](Self::set_pressed) for a view's own unit tests (MOD-115 M3 RV3): a tab's
+    /// test drives its `on_key` with the chord the shell would report, so the call that resolves
+    /// it through [`pressed`](Self::pressed) is pinned, not only the function it feeds.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn with_pressed(mut self, delivered: KeyEvent, pressed: KeyChord) -> Self {
+        self.set_pressed(delivered, pressed);
+        self
+    }
+
     /// The chord the user pressed for `key` (MOD-115 M2 RV1 M): the one before the shell's
     /// `[field]` translation when `key` is the event the shell delivered, else `key`'s own. A
     /// view resolves its own acts from it, after a widget had the canonical event: so a chord
@@ -330,9 +340,10 @@ impl<'a> Ctx<'a> {
     /// own).
     #[must_use]
     pub fn accent(&self) -> Style {
+        // Every origin by name (RV1 L3): a new one has to say which accent it takes.
         match &self.origin {
             Origin::Tab(id) => self.theme.tab_accent(id.0),
-            _ => self.theme.accent,
+            Origin::App | Origin::Overlay(_) => self.theme.accent,
         }
     }
 
@@ -2766,6 +2777,9 @@ pub(crate) mod shell_tests {
         assert_eq!(settings, theme.tab_accent(SettingsTab::ID.0));
         let overlay = bench_check(Origin::Overlay(AbortConfirm::ID), None, |ctx| ctx.accent());
         assert_eq!(overlay, theme.accent);
+        // RV1 L3: the shell's own context keeps it too.
+        let shell_own = bench_check(Origin::App, None, |ctx| ctx.accent());
+        assert_eq!(shell_own, theme.accent);
     }
 
     fn focused(app: &App) -> PaneId {

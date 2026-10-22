@@ -46,6 +46,7 @@ use crate::ui::cells::{cell_width, graphemes};
 use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::form::{self, Form, Value};
 use crate::ui::kit::list::{self, RowKind};
+use crate::ui::kit::pane::ScrollSpan;
 use crate::ui::kit::text::{Tone, notice, wrapped};
 use crate::ui::kit::{chips::key_line, modal::modal_rest};
 use crate::ui::tabs::settings::{
@@ -261,7 +262,7 @@ pub struct PersonasSection {
     /// the Settings pane's scrollbar (MOD-115 M3 D-11), in the pane's terms: the notice rows under
     /// it count as lines, since the pane measures the bar against its whole inner rect. `None`
     /// while neither is drawn.
-    scroll: Cell<Option<(usize, usize)>>,
+    scroll: Cell<Option<ScrollSpan>>,
 }
 
 /// What the section is doing.
@@ -1319,7 +1320,7 @@ impl PersonasSection {
             ctx.accent(),
             theme,
         );
-        self.scroll.set(Some((total, offset)));
+        self.scroll.set(Some(ScrollSpan::new(total, offset)));
     }
 
     /// The notice row's lines: the import path as a one-row kit form while it is open, then the
@@ -2062,7 +2063,7 @@ impl SettingsSection for PersonasSection {
         key_line(self.hint_text(keys), theme)
     }
 
-    fn scroll(&self) -> Option<(usize, usize)> {
+    fn scroll(&self) -> Option<ScrollSpan> {
         self.scroll.get()
     }
 
@@ -2098,14 +2099,15 @@ impl SettingsSection for PersonasSection {
             } else {
                 max_top.get() + 1
             };
-            self.scroll
-                .set(Some((1 + entries, (*top).min(max_top.get()))));
+            self.scroll.set(Some(ScrollSpan::new(
+                1 + entries,
+                (*top).min(max_top.get()),
+            )));
         }
-        // The pane's bar is measured against the whole inner rect (D-11): the notice rows under
-        // the list are added, so it shows exactly when a line is hidden.
-        if let Some((total, offset)) = self.scroll.get() {
-            let below = usize::from(area.height.saturating_sub(pane.height));
-            self.scroll.set(Some((total + below, offset)));
+        // The pane's bar is measured against the rows the list or report was drawn into and
+        // sits beside them (RV1 M2's span): the notice rows under them do not scroll.
+        if let Some(span) = self.scroll.get() {
+            self.scroll.set(Some(span.rows(pane)));
         }
         if !notice.is_empty() {
             frame.render_widget(Paragraph::new(notice), notice_area);

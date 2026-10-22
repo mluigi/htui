@@ -5,21 +5,21 @@ expression: frame
 Graphics   ¹Settings   0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys · ⌫ back
 ╭─ Prompt ─────────────────────────────────────────────────────── Agents  Hierarchy  Kinds  Prompt ╮
 │▌app                                                                                              │
-│ excerpt_file_line_cap          unset | 400 (default) lines                                       │
-│ excerpt_head_lines             unset | 200 (default) lines                                       │
-│ excerpt_max_file_bytes         unset | 524288 (default) bytes                                    │
-│ excerpt_max_files              unset | 12 (default) files                                        │
-│ excerpt_max_scan_files         unset | 20000 (default) files                                     │
-│ excerpt_provider_deadline_ms   unset | 1500 (default) ms                                         │
-│ max_skill_tokens               unset | 20000 (default) tokens                                    │
-│ prompt_reserve_fraction        unset | 10% (0.1) (default) fraction                              │
-│ prompt_upstream_hops           unset | 2 (default) hops                                          │
-│ token_budget                   unset | 120000 (default) tokens                                   │
+│   excerpt_file_line_cap          unset | 400 (default) lines                                     │
+│   excerpt_head_lines             unset | 200 (default) lines                                     │
+│   excerpt_max_file_bytes         unset | 524288 (default) bytes                                  │
+│   excerpt_max_files              unset | 12 (default) files                                      │
+│   excerpt_max_scan_files         unset | 20000 (default) files                                   │
+│   excerpt_provider_deadline_ms   unset | 1500 (default) ms                                       │
+│   max_skill_tokens               unset | 20000 (default) tokens                                  │
+│   prompt_reserve_fraction        unset | 10% (0.1) (default) fraction                            │
+│   prompt_upstream_hops           unset | 2 (default) hops                                        │
+│   token_budget                   unset | 120000 (default) tokens                                 │
 │ project Vulkan Tutorials                                                                         │
-│ allow_env_files                unset | off (default) on/off                                      │
-│ box_hostname                   unset | on (default) on/off                                       │
-│ prompt_upstream_hops           unset | 2 (default) hops                                          │
-│ token_budget                   120000 | 120000 (project) tokens                                  │
+│   allow_env_files                unset | off (default) on/off                                    │
+│   box_hostname                   unset | on (default) on/off                                     │
+│   prompt_upstream_hops           unset | 2 (default) hops                                        │
+│   token_budget                   120000 | 120000 (project) tokens                                │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

@@ -1037,7 +1037,8 @@ async fn the_editor_is_the_row_it_edits() {
         .iter()
         .position(|line| line.starts_with(GUTTER))
         .unwrap_or_else(|| panic!("the focused row: {frame}"));
-    let row = lines[at].trim_start_matches(GUTTER);
+    // A group's row sits two cells in from its heading (RV2 L4).
+    let row = lines[at].trim_start_matches(GUTTER).trim_start();
     assert!(row.starts_with("batch cap"), "{frame}");
     assert_eq!(row["batch cap".len()..].trim(), "1.5", "{frame}");
     assert_eq!(lines[at + 1].trim(), "USD \u{b7} now unbounded", "{frame}");
@@ -1061,7 +1062,10 @@ async fn the_cursor_row_is_the_forms_marker() {
 
     let buffer = drawn(&bench, &section, 100);
     let (y, text) = marked_row(&buffer);
-    assert!(text.starts_with("min budget"), "{text}");
+    assert!(
+        text.starts_with("  min budget"),
+        "two cells in, banded with it: {text}"
+    );
     let accent = bench.ctx().accent();
     assert_eq!(buffer[(0, y)].fg, accent.fg.unwrap_or(Color::Reset));
     assert!(!banded(&bench, &buffer, 0, y), "the gutter is not banded");
@@ -1081,11 +1085,12 @@ async fn an_open_editor_bands_its_label_alone() {
 
     let buffer = drawn(&bench, &section, 100);
     let (y, text) = marked_row(&buffer);
-    assert!(text.starts_with("batch cap"), "{text}");
+    assert!(text.starts_with("  batch cap"), "{text}");
     let accent = bench.ctx().accent();
     assert_eq!(buffer[(0, y)].fg, accent.fg.unwrap_or(Color::Reset));
     let value = u16::try_from(text.find("1.5").expect("the typed value")).expect("fits") + 1;
-    let label = u16::try_from("batch cap".len()).expect("fits");
+    // The group's indent is the label's (RV2 L4): banded with it.
+    let label = u16::try_from("  batch cap".len()).expect("fits");
     assert!(
         (1..=label).all(|x| banded(&bench, &buffer, x, y)),
         "the label is banded: {text}"
@@ -1134,19 +1139,21 @@ async fn nothing_read_yet_says_how_to_read() {
     );
 }
 
-/// MOD-115 M3 D-11: the section reports its scroll in the pane's terms: the rows, then the help
-/// line and the notice line under them.
+/// MOD-115 M3 D-11, RV2 (RV1 M2's span): the section reports its own rows' scroll, beside the
+/// rect they were drawn into; the help and notice lines under them are not padded in.
 #[tokio::test]
 async fn the_section_reports_its_scroll() {
     let snapshot = bench_settings(&demo()).await;
     let (bench, section) = bench_from(&snapshot).await;
     let _ = bench.render_section(&section, 100);
-    let (total, offset) = section.scroll().expect("the rows scroll");
-    assert_eq!(offset, 0);
+    let span = section.scroll().expect("the rows scroll");
+    assert_eq!(span.offset, 0);
+    assert_eq!(span.total, row::BOX_LIMIT + 1, "nine rows");
+    let rows = span.rows.expect("the rect the rows were drawn into");
     assert_eq!(
-        total,
-        row::BOX_LIMIT + 1 + 2,
-        "nine rows, the help, the notice"
+        (rows.y, rows.height),
+        (0, 28),
+        "above the help and notice: {rows:?}"
     );
 }
 
@@ -1166,4 +1173,37 @@ async fn the_section_at_80_columns() {
         "{frame}"
     );
     insta::assert_snapshot!("demo_80", frame);
+}
+
+/// MOD-115 M3 RV2 L4: each group's rows sit two cells in from its heading, so the two
+/// `max concurrent` rows read as two groups' rather than one list's.
+#[tokio::test]
+async fn the_rows_are_indented_under_their_group() {
+    let snapshot = bench_settings(&demo()).await;
+    let (bench, section) = bench_from(&snapshot).await;
+    let frame = bench.render_section(&section, 100);
+    let lines: Vec<&str> = frame.lines().map(after_gutter).collect();
+    let at = |prefix: &str| {
+        lines
+            .iter()
+            .position(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("a line at `{prefix}`: {frame}"))
+    };
+    assert!(
+        lines[at("project ") + 1].starts_with("  run cap"),
+        "{frame}"
+    );
+    assert!(
+        lines[at("all boxes") + 1].starts_with("  min budget"),
+        "{frame}"
+    );
+    assert!(
+        lines[at("this box (") + 1].starts_with("  max concurrent"),
+        "{frame}"
+    );
+}
+
+/// `line` past its first cell, the form's gutter.
+fn after_gutter(line: &str) -> &str {
+    line.char_indices().nth(1).map_or("", |(at, _)| &line[at..])
 }

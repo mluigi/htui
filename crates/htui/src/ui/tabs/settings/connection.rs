@@ -49,7 +49,7 @@ use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::form::{self, Form, Value};
 use crate::ui::kit::label::plural;
-use crate::ui::kit::list::{self, GUTTER};
+use crate::ui::kit::pane::ScrollSpan;
 use crate::ui::kit::text::{Tone, notice, wrapped};
 use crate::ui::kit::{chips::key_line, modal::modal_rest};
 use crate::ui::tabs::settings::{SectionId, SettingsSection, answers, asked};
@@ -381,7 +381,7 @@ pub struct ConnectionSection {
     /// The form's `(lines, first line drawn)` as of the last render, for the Settings pane's
     /// scrollbar (MOD-115 M3 D-11), in the pane's terms: the notice rows under the form count.
     /// `None` while the refusal stands in for the rows.
-    scroll: Cell<Option<(usize, usize)>>,
+    scroll: Cell<Option<ScrollSpan>>,
 }
 
 impl ConnectionSection {
@@ -964,7 +964,7 @@ impl SettingsSection for ConnectionSection {
         key_line(self.hint_text(keys), theme)
     }
 
-    fn scroll(&self) -> Option<(usize, usize)> {
+    fn scroll(&self) -> Option<ScrollSpan> {
         self.scroll.get()
     }
 
@@ -997,37 +997,24 @@ impl SettingsSection for ConnectionSection {
                 frame.render_widget(Paragraph::new(lines), rows);
             }
             None => {
-                let form = self.form(ctx.keys());
-                let lines = form.lines(rows.width, ctx.accent(), theme);
-                let offset = in_view(&lines, form.focus_line(rows.width), rows.height);
-                let total = lines.len();
-                frame.render_widget(Paragraph::new(lines[offset..].to_vec()), rows);
-                // The pane's bar is measured against the whole inner rect (D-11).
-                let below = usize::from(area.height.saturating_sub(rows.height));
-                self.scroll.set(Some((total + below, offset)));
+                let mut laid = self
+                    .form(ctx.keys())
+                    .layout(rows.width, ctx.accent(), theme);
+                // The form's own measure of the focused row (RV2 M1), not a guess.
+                let offset = laid.offset(rows.height);
+                let total = laid.lines.len();
+                let shown: Vec<Line<'static>> = laid.lines.drain(offset.min(total)..).collect();
+                frame.render_widget(Paragraph::new(shown), rows);
+                // Beside the rows the form was drawn into (RV1 M2): the notice under them does
+                // not scroll.
+                self.scroll
+                    .set(Some(ScrollSpan::new(total, offset).rows(rows)));
             }
         }
         if !said.is_empty() {
             frame.render_widget(Paragraph::new(said), notice_area);
         }
     }
-}
-
-/// The first line to draw so the focused row is on screen: its first line to the last of its
-/// value rows (each behind the marker) and its help and error (indented past the label column),
-/// or its first line alone when the block is taller than `height`.
-fn in_view(lines: &[Line<'_>], start: Option<usize>, height: u16) -> usize {
-    let Some(start) = start.filter(|start| *start < lines.len()) else {
-        return 0;
-    };
-    let rest = lines[start + 1..]
-        .iter()
-        .take_while(|line| {
-            let text = line.to_string();
-            text.starts_with(GUTTER) || text.starts_with("  ")
-        })
-        .count();
-    list::scroll_into_view(start + rest, 0, usize::from(height), lines.len()).min(start)
 }
 
 /// The DSN row's value column, and the sentence `c` refuses with when there is nothing to clear.

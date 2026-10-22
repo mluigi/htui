@@ -97,8 +97,8 @@ const CLEAR_THE_FILTER: &str = "clear the filter to see every row";
 /// A scope with no project to show.
 const NO_PROJECTS: &str = "No projects in this workspace.";
 
-/// [`NO_PROJECTS`]'s next step.
-const NO_PROJECTS_NEXT: &str = "Settings \u{203a} Hierarchy adds a project";
+/// [`NO_PROJECTS`]'s next step, whole in the tree's 34 inner cells at 80 columns (MOD-115 M3 RV3).
+const NO_PROJECTS_NEXT: &str = "Settings \u{203a} Hierarchy adds one";
 
 /// The detail pane with nothing selected.
 const SELECT_A_ROW: &str = "select a requirement";
@@ -567,8 +567,10 @@ impl RequirementsTab {
     /// The filter: every key updates `filter` and sends nothing (F-13); `Enter` applies and
     /// re-selects, `Esc` clears and re-selects (the field's own keys, MOD-67 M4 D10). A key the
     /// field passes is swallowed but for the chords its stack passes (`ctrl-c`, `F1`); the stack
-    /// offers no `form.save`, so `ctrl-s` saves nothing here.
-    fn on_filter_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
+    /// offers no `form.save`, so `ctrl-s` saves nothing here. MOD-115 M3 RV3 repair: `pressed`
+    /// is the chord the user pressed (`Ctx::pressed`, MD-A), `key` the event delivered after the
+    /// `[field]` translation; the caller hands both, so a test pins the rest's resolution.
+    fn on_filter_pressed(&mut self, key: KeyEvent, pressed: KeyChord, ctx: &Ctx<'_>) -> Handled {
         let stack = self.stack();
         let Mode::Filter { field } = &mut self.mode else {
             return Handled::Pass;
@@ -590,7 +592,7 @@ impl RequirementsTab {
                 self.reselect(ctx);
             }
             // MOD-115 M3 MD-A: the rest resolves from the chord pressed (`Ctx::pressed`).
-            FieldOutcome::Pass => return modal_rest(stack, ctx.pressed(&key)),
+            FieldOutcome::Pass => return modal_rest(stack, pressed),
         }
         Handled::Consumed
     }
@@ -1064,7 +1066,7 @@ impl RequirementsTab {
         let offset = window(cursor.unwrap_or(0), rows.len(), usize::from(body.height));
         list::render(frame, body, &rows, cursor, offset, ctx.accent(), theme);
         pane.scrollbar(rows.len(), offset)
-            .scrollbar_span(band_rows, body.height)
+            .scrollbar_span(body)
             .render(frame, area, theme);
     }
 
@@ -1077,7 +1079,9 @@ impl RequirementsTab {
             .map(|row| Line::styled(row, theme.error))
             .collect();
         if let Some(reload) = ctx.keys().label(views::REQUIREMENTS_BROWSE, Act::Reload) {
-            lines.push(Line::styled(format!("{reload} reads again"), ctx.accent()));
+            // MOD-115 M3 RV3 (review L3): a next step, in `kit::empty`'s next-step role; the
+            // tab's accent marks the focused pane alone.
+            lines.push(Line::styled(format!("{reload} reads again"), theme.accent));
         }
         frame.render_widget(Paragraph::new(lines), area);
     }
@@ -1308,7 +1312,7 @@ impl Tab for RequirementsTab {
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         match self.mode {
             Mode::Browse => self.on_browse_key(key, ctx),
-            Mode::Filter { .. } => self.on_filter_key(key, ctx),
+            Mode::Filter { .. } => self.on_filter_pressed(key, ctx.pressed(&key), ctx),
             Mode::NewArea(_) | Mode::Requirement(_) | Mode::Withdraw(_) => {
                 self.on_form_key(key, ctx)
             }
@@ -1457,12 +1461,20 @@ impl Tab for RequirementsTab {
         let areas = ctx.split(content, REQUIREMENTS_LAYOUT);
         // T7 repair: a form takes every key, so with another pane zoomed it is drawn over the
         // zoomed one rather than into the detail's empty rect.
-        // RV3 (review M3): the filter field filters the tree, so with the activity pane zoomed
-        // the tree is drawn over the zoomed pane above the field, not a blank body.
-        let zoomed = areas.list.is_none() && areas.detail.is_empty();
+        // MOD-115 M3 RV3 (review M1): the filter is typed in the tree's band, so whenever no
+        // tree would be drawn (the activity pane or the detail zoomed, the tree hidden) the tree
+        // is drawn while the filter is open, and the detail is not drawn. Repair: over the
+        // detail's rect when the layout gives one, which leaves out a shown activity pane (the
+        // shell paints its placeholder there); over the whole content only with the activity
+        // zoomed, when the shell paints none under a modal tab.
         let (tree, detail) = match capture_area(&areas, content, self.form_open()) {
-            (None, detail) if zoomed && matches!(self.mode, Mode::Filter { .. }) => {
-                (Some(content), detail)
+            (None, _) if matches!(self.mode, Mode::Filter { .. }) => {
+                let over = if areas.detail.is_empty() {
+                    content
+                } else {
+                    areas.detail
+                };
+                (Some(over), Rect::default())
             }
             drawn => drawn,
         };
@@ -2722,6 +2734,39 @@ mod tests {
         assert_eq!(text(&keys), "Ctrl+t apply \u{b7} Esc clear");
     }
 
+    /// MOD-115 M3 RV3 repair (MD-A, carried L-req): what the filter's field passes is resolved
+    /// from the chord pressed, not the event delivered. With `field.line_down` on `ctrl-n` the
+    /// shell delivers the canonical `Down`, which the one-line field passes: the pressed
+    /// `ctrl-n` is a chord the stack passes on (`ctrl-c`, `F1`), a pressed `Down` is swallowed.
+    /// Resolving the delivered `Down` would swallow both; no frame tells them apart, the shell
+    /// having nothing for the canonical `Down` it is handed back.
+    /// Driven through `on_key` with the chord the shell reports (`Ctx::with_pressed`), so the
+    /// `Ctx::pressed` call in `on_key` is what is pinned (RV3 repair 2).
+    #[tokio::test]
+    async fn the_filter_resolves_what_its_field_passes_from_the_chord_pressed() {
+        use crate::keys::KeyChord;
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let mut tab = tab_on(snapshot);
+        tab.mode = Mode::Filter {
+            field: TextField::new(),
+        };
+        let chord = |spec: &str| KeyChord::parse_strict(spec).expect("a valid spec");
+        let down = KeyEvent::from(KeyCode::Down);
+        assert_eq!(
+            tab.on_key(down, &mut bench.ctx().with_pressed(down, chord("ctrl-n"))),
+            Handled::Pass,
+            "a pressed `ctrl-n` delivered as `Down` passes"
+        );
+        assert!(matches!(tab.mode, Mode::Filter { .. }), "the filter stays");
+        assert_eq!(
+            tab.on_key(down, &mut bench.ctx().with_pressed(down, chord("down"))),
+            Handled::Consumed,
+            "a pressed `Down` is swallowed"
+        );
+        assert!(matches!(tab.mode, Mode::Filter { .. }), "the filter stays");
+    }
+
     /// MOD-115 M2 RV1 H2: the priority field's hint names the priority keys in force, and the
     /// withdraw form's the submit key (`m/l`, `Enter` under the compiled keys).
     #[test]
@@ -3058,6 +3103,40 @@ mod tests {
         assert!(gutter.add_modifier.contains(Modifier::BOLD), "{gutter:?}");
     }
 
+    /// MOD-115 M3 RV3 (review M2): the body and the rationale are text areas across the form's
+    /// width, each under its label on a row of its own, not squeezed into the value column
+    /// beside the labels: R-ENT-1's 49-cell body is one row in a 53-cell form.
+    #[tokio::test]
+    async fn the_text_areas_take_the_form_s_width_under_their_label() {
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let mut tab = tab_on(snapshot);
+        bench.key(&mut tab, KeyCode::Char('e'));
+        let (_, rows) = drawn(&tab, &bench.ctx(), 100, 30);
+        let (x, y) = find(&rows, "\u{258c}body").expect("the focused body label");
+        let y = usize::from(y);
+        assert!(
+            !rows[y].contains("Every item"),
+            "the label is a row of its own: {rows:#?}"
+        );
+        assert!(
+            rows[y + 1].contains("Every item has a stable key of the form PREFIX-N."),
+            "the body is whole under it: {rows:#?}"
+        );
+        let (body_x, _) = find(&rows, "Every item").expect("the body");
+        assert_eq!(body_x, x + 1, "past the gutter, under the label: {rows:#?}");
+        let (_, label) = find(&rows, " rationale").expect("the rationale label");
+        let label = usize::from(label);
+        assert!(
+            !rows[label].contains("Keys are"),
+            "the label is a row of its own: {rows:#?}"
+        );
+        assert!(
+            rows[label + 1].contains("Keys are what people type."),
+            "the rationale under it: {rows:#?}"
+        );
+    }
+
     /// MOD-115 M3 D3: the area code's rule is help under the code field, and the withdraw's
     /// sentence help under its field: on the line under the field they are about.
     #[tokio::test]
@@ -3081,6 +3160,40 @@ mod tests {
             rows[usize::from(field) + 1].contains("A withdrawn requirement"),
             "{rows:#?}"
         );
+    }
+
+    /// MOD-115 M3 RV3 (review L3): the key that reads again after a refused read is a next step,
+    /// drawn as `kit::empty` draws one (the theme's focus role), not in the tab's accent, which
+    /// marks the focused pane alone.
+    #[tokio::test]
+    async fn the_reload_next_step_is_an_empty_state_s_not_the_tab_accent() {
+        let (_, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let refused = RequirementsTab {
+            unavailable: Some(DATABASE_UNREACHABLE.to_owned()),
+            ..RequirementsTab::default()
+        };
+        let ctx = bench.ctx();
+        let (buffer, rows) = drawn(&refused, &ctx, 100, 30);
+        let style = style_of(&buffer, &rows, "r reads again");
+        assert_ne!(
+            bench.theme.accent.fg,
+            ctx.accent().fg,
+            "two accents to tell apart"
+        );
+        assert_eq!(style.fg, bench.theme.accent.fg, "the next step's role");
+    }
+
+    /// MOD-115 M3 RV3 (carried L-req): at 80 columns the tree's inner rows are 34 cells, and the
+    /// no-projects state's next step is whole in them, not cut.
+    #[tokio::test]
+    async fn the_no_projects_next_step_fits_the_tree_at_80_columns() {
+        let (snapshot, _, scope) = platform().await;
+        let empty = Bench::new(scope, Vec::new());
+        let (_, rows) = drawn(&tab_on(snapshot), &empty.ctx(), 80, 24);
+        let text = rows.join("\n");
+        assert!(text.contains(super::NO_PROJECTS), "{text}");
+        assert!(text.contains(super::NO_PROJECTS_NEXT), "{text}");
     }
 
     /// MOD-115 M3, MOD-83 (audit item 2): every empty state says what to do next.
@@ -3122,7 +3235,7 @@ mod tests {
         let text = rows.join("\n");
         assert!(text.contains(super::NO_PROJECTS), "{text}");
         assert!(
-            text.contains("Settings \u{203a} Hierarchy adds a project"),
+            text.contains("Settings \u{203a} Hierarchy adds one"),
             "{text}"
         );
     }

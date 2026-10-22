@@ -3756,25 +3756,44 @@ async fn the_primary_repo_reads_as_a_word() {
     assert!(!frame.contains('*'), "{frame}");
 }
 
-/// The section reports its scroll for the Settings pane's scrollbar (MOD-115 M3 D-11), in the
-/// pane's terms: the tree's rows plus the rows under it, and the first one drawn, the cursor kept
-/// on screen.
+/// The section reports its scroll for the Settings pane's scrollbar (MOD-115 M3 D-11): the tree's
+/// rows beside the rect they were drawn into (RV2, RV1 M2's span), the rows under it not padded
+/// in, and the first one drawn, the cursor kept on screen.
 #[tokio::test]
 async fn the_section_reports_its_scroll_for_the_pane() {
     let bench = SectionBench::new().await;
     let tree = tree_with_two_repos(&demo()).await;
     let mut section = picker_section(&bench, tree, None);
-    assert_eq!(section.scroll(), None, "nothing is drawn yet");
+    assert_eq!(
+        section.scroll().map(|span| (span.total, span.offset)),
+        None,
+        "nothing is drawn yet"
+    );
 
     // Four tree rows (workspace, project, two repos) over three, the notice line under them.
     let _ = drawn_at(&bench, &section, 100, 4);
-    assert_eq!(section.scroll(), Some((5, 0)));
+    assert_eq!(
+        section.scroll().map(|span| (span.total, span.offset)),
+        Some((4, 0))
+    );
+    let tree = section
+        .scroll()
+        .and_then(|span| span.rows)
+        .expect("the tree's rows");
+    assert_eq!(
+        (tree.y, tree.height),
+        (0, 3),
+        "above the notice line: {tree:?}"
+    );
 
     for _ in 0..3 {
         bench.key(&mut section, "j");
     }
     let buffer = drawn_at(&bench, &section, 100, 4);
-    assert_eq!(section.scroll(), Some((5, 1)));
+    assert_eq!(
+        section.scroll().map(|span| (span.total, span.offset)),
+        Some((4, 1))
+    );
     let last = row_text(&buffer, 2);
     assert!(
         last.starts_with('\u{258c}') && last.contains("beta"),

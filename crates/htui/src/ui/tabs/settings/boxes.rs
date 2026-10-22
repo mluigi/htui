@@ -32,6 +32,7 @@ use htui_core::model::{
     BoxId, BoxRecord, Executor, Scope, canonical_declared_tags, declared_tags_from_text,
 };
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
 
 use crate::app::{Ctx, Handled};
@@ -43,6 +44,7 @@ use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::form::{self, Form};
 use crate::ui::kit::label;
 use crate::ui::kit::list::{self, RowKind};
+use crate::ui::kit::pane::ScrollSpan;
 use crate::ui::kit::text::{Tone, notice, wrapped};
 use crate::ui::kit::{chips::key_line, modal::modal_rest};
 use crate::ui::tabs::settings::{
@@ -173,9 +175,6 @@ const LIST_WIDTH: u16 = 29;
 /// The detail form's label column (the kit form adds its gutter before it and two cells after).
 const LABEL_WIDTH: u16 = 14;
 
-/// The gap `kit::form` leaves between its label column and the value.
-const FORM_GAP: u16 = 2;
-
 /// How many lines the quirks editor shows at most.
 const QUIRKS_HEIGHT: u16 = 6;
 
@@ -241,6 +240,9 @@ pub struct BoxesSection {
     probing: bool,
     /// The one notice line; drawn in `theme.error` when `is_error` says so.
     notice: Option<String>,
+    /// The list's scroll as of the last render, for the Settings pane's scrollbar (MOD-115 M3
+    /// D-11, RV2): beside the list's rows; `None` while no list is drawn.
+    scroll: Cell<Option<ScrollSpan>>,
 }
 
 /// Browse, or one editor open: over one box, or over the app-wide probe spec (MOD-51 D6).
@@ -869,8 +871,13 @@ impl SettingsSection for BoxesSection {
         key_line(self.hint_text(keys), theme)
     }
 
+    fn scroll(&self) -> Option<ScrollSpan> {
+        self.scroll.get()
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let theme = ctx.theme;
+        self.scroll.set(None);
         let width = usize::from(area.width).max(1);
         let notices: Vec<Line<'static>> = self
             .notice
@@ -1015,6 +1022,9 @@ impl BoxesSection {
         let offset =
             list::scroll_into_view(at.unwrap_or(0), 0, usize::from(area.height), rows.len());
         list::render(frame, area, &rows, at, offset, ctx.accent(), ctx.theme);
+        // Beside the list's rows (RV1 M2's span): the detail pane beside them does not scroll.
+        self.scroll
+            .set(Some(ScrollSpan::new(rows.len(), offset).rows(area)));
     }
 
     /// The detail pane for one box: a `kit::form` with a 14-wide label column, one read-only row
@@ -1030,8 +1040,10 @@ impl BoxesSection {
     ) -> Vec<Line<'static>> {
         let theme = ctx.theme;
         let row = &record.row;
-        let label_column = Form::new().label_width(LABEL_WIDTH).label_column(width);
-        let value_width = width.saturating_sub(1 + label_column + FORM_GAP).max(1);
+        let value_width = Form::new()
+            .label_width(LABEL_WIDTH)
+            .value_width(width)
+            .max(1);
         let read = |name: &'static str, value: String| {
             form::Field::new(name, form::Value::ReadOnly(value.into()))
         };

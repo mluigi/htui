@@ -49,6 +49,7 @@ use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::form::{self, Form, Value};
 use crate::ui::kit::label::plural;
 use crate::ui::kit::list::{self, RowKind};
+use crate::ui::kit::pane::ScrollSpan;
 use crate::ui::kit::text::{Tone, notice, wrapped};
 use crate::ui::kit::{chips::key_line, modal::modal_rest};
 use crate::ui::path_picker::{PathPicker, PickerOutcome, start_dir};
@@ -362,7 +363,7 @@ pub struct HierarchySection {
     /// scrollbar (MOD-115 M3 D-11), in the pane's terms: the rows under the tree (an open editor
     /// or warning, the notice line) count as lines, since the pane measures the bar against its
     /// whole inner rect. `None` while no tree is drawn.
-    scroll: Cell<Option<(usize, usize)>>,
+    scroll: Cell<Option<ScrollSpan>>,
 }
 
 impl HierarchySection {
@@ -1588,7 +1589,7 @@ impl SettingsSection for HierarchySection {
         key_line(self.hint_text(keys), theme)
     }
 
-    fn scroll(&self) -> Option<(usize, usize)> {
+    fn scroll(&self) -> Option<ScrollSpan> {
         self.scroll.get()
     }
 
@@ -1640,10 +1641,10 @@ impl SettingsSection for HierarchySection {
                 ctx.accent(),
                 theme,
             );
-            // The pane's bar is measured against the whole inner rect (D-11): the rows under the
-            // tree are added, so it shows exactly when a tree line is hidden.
-            let below = usize::from(area.height.saturating_sub(rows.height));
-            self.scroll.set(Some((total + below, offset)));
+            // The pane's bar is measured against the rows the tree was drawn into and sits
+            // beside them (RV1 M2's span): the rows under the tree do not scroll.
+            self.scroll
+                .set(Some(ScrollSpan::new(total, offset).rows(rows)));
         }
         if !pane.is_empty() {
             frame.render_widget(Paragraph::new(pane), pane_area);

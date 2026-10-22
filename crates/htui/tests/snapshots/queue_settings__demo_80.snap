@@ -5,14 +5,14 @@ expression: frame
 Graphics   ¹Settings       0 working · 0 waiting · memory ·  F9  about   ?  keys
 ╭─ Queue ─────────────────────────────────────────────────────────────── Queue ╮
 │▌project vulkan-tutorials                                                     │
-│ run cap         unbounded                                                    │
-│ batch cap       unbounded                                                    │
+│   run cap         unbounded                                                  │
+│   batch cap       unbounded                                                  │
 │ all boxes                                                                    │
-│ min budget      none                                                         │
-│ max concurrent  2 (default)                                                  │
-│ window          not set · stored, not enforced                               │
+│   min budget      none                                                       │
+│   max concurrent  2 (default)                                                │
+│   window          not set · stored, not enforced                             │
 │ this box (DESKTOP-HTUI)                                                      │
-│ max concurrent  2                                                            │
+│   max concurrent  2                                                          │
 │                                                                              │
 │                                                                              │
 │                                                                              │

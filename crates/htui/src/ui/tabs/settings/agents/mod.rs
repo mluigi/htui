@@ -67,6 +67,7 @@ mod form;
 mod table;
 
 use htui_agent::auth::loopback::{self, PASTE_MAX};
+use htui_agent::probe::ProbeStatus;
 use htui_core::model::{AgentId, AgentSummary, Scope};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -79,6 +80,7 @@ use crate::app::{Action, Ctx, Handled};
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::pane::ScrollSpan;
 use crate::ui::kit::text::{Tone, notice};
 use crate::ui::kit::{chips::key_line, modal::modal_rest};
 use crate::ui::tabs::settings::{
@@ -86,7 +88,7 @@ use crate::ui::tabs::settings::{
     is_error,
 };
 use crate::ui::text_field::PASTE_DOES_NOT_FIT;
-use crate::ui::{FieldOutcome, TextField, Theme};
+use crate::ui::{FieldOutcome, TextField, Theme, cells};
 use crossterm::event::KeyEvent;
 
 use flows::{AuthState, InstallState, quota_note, reprobes};
@@ -237,7 +239,7 @@ pub struct AgentsSection {
     notice: Option<String>,
     /// `(rows, offset)` as the last render drew the table, measured in the section's rows, for the
     /// Settings pane's scrollbar (MOD-115 M3 D-11); `None` while every row fits.
-    scroll: Cell<Option<(usize, usize)>>,
+    scroll: Cell<Option<ScrollSpan>>,
 }
 
 impl AgentsSection {
@@ -280,24 +282,40 @@ impl AgentsSection {
     /// The line under the pane (MOD-23 D245): the last outcome, else [`quota_note`] while the
     /// section is idle. A `None` note still takes its line, so the layout never changes height with
     /// it. While a `manual` row is listed, the idle note ends in [`MANUAL_NOTE`], the key to the
-    /// cell's `*` (MOD-66). The keys that shared the pane with it moved to the shell's hint row
-    /// (MOD-67 M6 T2).
-    fn note(&self, keys: &Keys) -> Option<String> {
-        let idle = matches!(self.mode, Mode::Browse)
+    /// cell's `*` (MOD-66), then the word of each verdict the table drew as its icon alone
+    /// (`icons`, `⚠*`: RV2 L5), which the table draws only while [`idle_note`](Self::idle_note)
+    /// leaves room for them (RV2 repair 1). The keys that shared the pane with it moved to the
+    /// shell's hint row (MOD-67 M6 T2).
+    fn note(&self, keys: &Keys, icons: &[ProbeStatus]) -> Option<String> {
+        self.notice.clone().or_else(|| {
+            self.idle_note(keys).map(|note| {
+                let words: String = icons
+                    .iter()
+                    .map(|status| table::note_word(*status))
+                    .collect();
+                format!("{note}{words}")
+            })
+        })
+    }
+
+    /// The idle note before any verdict's word: [`quota_note`], then [`MANUAL_NOTE`] while a
+    /// `manual` row is listed. `None` while a notice holds the line or the section is not idle,
+    /// so no word of a `⚠*` cell would be on screen (RV2 repair 1).
+    fn idle_note(&self, keys: &Keys) -> Option<String> {
+        let idle = self.notice.is_none()
+            && matches!(self.mode, Mode::Browse)
             && matches!(self.install, InstallState::Idle)
             && matches!(self.auth, AuthState::Idle);
-        self.notice.clone().or_else(|| {
-            idle.then(|| {
-                let note = quota_note(
-                    keys.label(views::AGENTS_BROWSE, Act::AgentsProbe)
-                        .as_deref(),
-                );
-                if self.lists_a_manual_row() {
-                    format!("{note}{MANUAL_NOTE}")
-                } else {
-                    note
-                }
-            })
+        idle.then(|| {
+            let note = quota_note(
+                keys.label(views::AGENTS_BROWSE, Act::AgentsProbe)
+                    .as_deref(),
+            );
+            if self.lists_a_manual_row() {
+                format!("{note}{MANUAL_NOTE}")
+            } else {
+                note
+            }
         })
     }
 
@@ -809,9 +827,25 @@ fn swallows(keys: &Keys, chord: KeyChord, swallowed: &[Act]) -> Handled {
     }
 }
 
-/// The refusal of a key pressed while a registry write is in flight (blueprint F-20).
+/// The refusal of a key pressed while a registry write is in flight (blueprint F-20), in words
+/// (MOD-115 M3 RV2: no request name on screen).
 fn in_flight(request: &str) -> String {
-    format!("`{request}` is still in flight")
+    format!(
+        "still {} \u{2014} wait for the store's answer",
+        doing(request)
+    )
+}
+
+/// What the registry write `busy` is doing, as the user reads it, by request name
+/// ([`REQUEST_NAMES`] and [`agent_settings::SET_TOOL_PATHS`]).
+fn doing(busy: &str) -> &'static str {
+    match busy {
+        "create_agent" => "adding the agent",
+        "edit_agent" => "saving the agent",
+        "set_agent_on_box" => "switching the agent on this box",
+        agent_settings::SET_TOOL_PATHS => "saving the tool paths",
+        _ => "writing",
+    }
 }
 
 impl SettingsSection for AgentsSection {
@@ -1072,6 +1106,7 @@ impl SettingsSection for AgentsSection {
         .areas(area);
 
         self.scroll.set(None);
+        let mut icons = Vec::new();
         if self.unavailable.is_some() {
             empty::render(
                 frame,
@@ -1084,19 +1119,27 @@ impl SettingsSection for AgentsSection {
             let next = no_agents_next(ctx.keys());
             empty::render(frame, rows, NO_AGENTS, NextStep(&next), ctx.theme);
         } else {
-            let (total, shown, offset) = self.render_table(frame, rows, ctx);
-            if total > shown {
-                // Measured in the section's rows, the pane's whole inner height being its
-                // viewport: the rows the table could not show are what the bar travels over.
-                self.scroll
-                    .set(Some((usize::from(area.height) + total - shown, offset)));
+            // The cells the idle note leaves for the words of `⚠*` cells (RV2 repair 1): the note
+            // is drawn behind the gutter, in `note_area.width - 1` cells.
+            let room = self.idle_note(ctx.keys()).map_or(0, |note| {
+                usize::from(note_area.width.saturating_sub(1))
+                    .saturating_sub(cells::cell_width(&note))
+            });
+            let drawn = self.render_table(frame, rows, ctx, room);
+            if drawn.total > usize::from(drawn.body.height) {
+                // The table's rows, beside the rect they were drawn into (RV1 M2's span): the
+                // header over them and the pane and note under them do not scroll.
+                self.scroll.set(Some(
+                    ScrollSpan::new(drawn.total, drawn.offset).rows(drawn.body),
+                ));
             }
+            icons = drawn.icons;
         }
         let buf = frame.buffer_mut();
         for (y, line) in (under.y..under.bottom()).zip(&pane) {
             buf.set_line(under.x, y, line, under.width);
         }
-        if let Some(note) = self.note(ctx.keys())
+        if let Some(note) = self.note(ctx.keys(), &icons)
             && note_area.width > 1
         {
             // `settings/mod.rs`'s rule: a compare-and-set miss is the one notice to act on.
@@ -1110,7 +1153,7 @@ impl SettingsSection for AgentsSection {
         }
     }
 
-    fn scroll(&self) -> Option<(usize, usize)> {
+    fn scroll(&self) -> Option<ScrollSpan> {
         self.scroll.get()
     }
 }
@@ -1155,5 +1198,23 @@ mod tests {
             Handled::Pass,
             "the modal global layer's help passes"
         );
+    }
+
+    /// MOD-115 M3 RV2 L1: a registry write in flight reads in words, as in the other sections:
+    /// every request name `busy` can hold has its own phrase, and the refusal names none of them.
+    #[test]
+    fn a_write_in_flight_reads_in_words() {
+        for name in REQUEST_NAMES
+            .into_iter()
+            .chain([agent_settings::SET_TOOL_PATHS])
+        {
+            assert_ne!(doing(name), doing("unknown"), "`{name}` has its own phrase");
+            let refusal = in_flight(name);
+            assert!(!refusal.contains(name), "{refusal}");
+            assert!(
+                !refusal.contains('_') && !refusal.contains('`'),
+                "{refusal}"
+            );
+        }
     }
 }

@@ -56,7 +56,7 @@ use crate::ui::cells::cell_width;
 use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::form::{self, Field, Form};
 use crate::ui::kit::label;
-use crate::ui::kit::list;
+use crate::ui::kit::pane::ScrollSpan;
 use crate::ui::kit::text::{Tone, notice, wrapped};
 use crate::ui::kit::{chips::key_line, modal::modal_rest};
 use crate::ui::tabs::settings::{
@@ -317,13 +317,13 @@ pub struct PromptSection {
     busy: Option<&'static str>,
     /// The last outcome, on the notice row under the pane.
     notice: Option<Notice>,
-    /// `(total rows, offset)` as of the last render, for the Settings pane's scrollbar (MOD-115
-    /// M3 D-11); `None` while nothing scrolls.
-    scroll: Cell<Option<(usize, usize)>>,
+    /// The form's lines, first line drawn and rows as of the last render, for the Settings
+    /// pane's scrollbar (MOD-115 M3 D-11, RV1 M2); `None` while nothing scrolls.
+    scroll: Cell<Option<ScrollSpan>>,
 }
 
 /// One item of the tree's form, in [`rows`](PromptSection::rows) order: built once per frame
-/// and folded into a [`Form`] as often as the scroll needs to measure it.
+/// and folded into one [`Form`] (RV2 L3).
 #[derive(Clone)]
 enum Entry<'a> {
     /// A group line (`app`, `project {name}`).
@@ -334,14 +334,22 @@ enum Entry<'a> {
     Blank,
 }
 
+/// The cells a group's rows sit in from its heading (MOD-115 M3 RV2 L4): rows that share a
+/// label across groups (`max concurrent`, `token_budget`) read as each group's own.
+const GROUP_INDENT: u16 = 2;
+
 /// `entries` as one form, `focus` focused, the label column the registry's widest key wide.
-fn form_of<'a>(entries: &[Entry<'a>], focus: usize, editing: bool) -> Form<'a> {
+fn form_of<'a>(entries: Vec<Entry<'a>>, focus: usize, editing: bool) -> Form<'a> {
     let width = u16::try_from(*KEY_WIDTH + 1).unwrap_or(u16::MAX);
-    entries.iter().fold(
-        Form::new().label_width(width).focus(focus).editing(editing),
+    entries.into_iter().fold(
+        Form::new()
+            .label_width(width)
+            .indent_under_headings(GROUP_INDENT)
+            .focus(focus)
+            .editing(editing),
         |form, entry| match entry {
-            Entry::Heading(text) => form.heading(text.clone()),
-            Entry::Field(field) => form.field(field.clone()),
+            Entry::Heading(text) => form.heading(text),
+            Entry::Field(field) => form.field(field),
             Entry::Blank => form.blank(),
         },
     )
@@ -726,7 +734,7 @@ impl PromptSection {
     /// `width` is the form's: a key wider than the label column there (a third of the width,
     /// MOD-60) is cut with `…`, so the focused row's help names it whole.
     fn entries(&self, snapshot: &SettingsSnapshot, width: u16) -> (Vec<Entry<'_>>, usize) {
-        let column = usize::from(form_of(&[], 0, false).label_column(width));
+        let column = usize::from(form_of(Vec::new(), 0, false).label_column(width));
         let help = |key: SettingKey, now: Option<&str>| {
             let cut = cell_width(key.key()) > column;
             help_text(key, now, cut)
@@ -978,7 +986,7 @@ impl SettingsSection for PromptSection {
         key_line(self.hint_text(keys), theme)
     }
 
-    fn scroll(&self) -> Option<(usize, usize)> {
+    fn scroll(&self) -> Option<ScrollSpan> {
         self.scroll.get()
     }
 
@@ -1016,23 +1024,16 @@ impl SettingsSection for PromptSection {
                 let width = rows.width;
                 let (entries, focus) = self.entries(snapshot, width);
                 let editing = matches!(self.mode, Mode::Editing(_));
-                let form = form_of(&entries, focus, editing);
-                let total = form.lines(width, ctx.accent(), theme).len();
-                // Scrolled so the focused row and what the form put under it are on screen, the
-                // row itself first when both do not fit: a cursor nobody can see acts blind.
-                let start = form.focus_line(width).unwrap_or(0);
-                let through = entries.get(..=focus).unwrap_or(&entries);
-                let end = form_of(through, focus, editing)
-                    .lines(width, ctx.accent(), theme)
-                    .len()
-                    .saturating_sub(1);
-                let offset =
-                    list::scroll_into_view(end, 0, usize::from(rows.height), total).min(start);
-                form.render(frame, rows, offset, ctx.accent(), theme);
-                // The pane's bar is measured against the whole inner rect (D-11): the notice
-                // line under the tree is added, so it shows exactly when a tree line is hidden.
-                let below = usize::from(area.height.saturating_sub(rows.height));
-                self.scroll.set(Some((total + below, offset)));
+                // One layout per frame (RV2 L3), scrolled by the form's own measure of the focused
+                // row and what it put under it (RV2 M1): the row itself first when both do not
+                // fit, because a cursor nobody can see acts blind.
+                let laid = form_of(entries, focus, editing).layout(width, ctx.accent(), theme);
+                let offset = laid.offset(rows.height);
+                laid.render(frame, rows, offset);
+                // The pane's bar is measured against the rows the tree is drawn into and sits
+                // beside them (RV1 M2), so the rows under the tree need no padding.
+                self.scroll
+                    .set(Some(ScrollSpan::new(laid.lines.len(), offset).rows(rows)));
             }
         }
         frame.render_widget(Paragraph::new(self.notice_line(theme)), hint);

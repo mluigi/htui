@@ -24,6 +24,7 @@ use htui_orch::infer::{Checkout, Choice, MatchedBy};
 use htui_store::{Backend, DATABASE_UNREACHABLE, Writer};
 
 use crate::store_worker::{StoreReply, StoreRequest};
+use crate::ui::kit::label::plural;
 
 /// A workspace, its projects in position order, their repos by name, and this box's paths.
 ///
@@ -719,14 +720,15 @@ pub const REQUEST_NAMES: [&str; 13] = [
     "infer_repo_paths",
 ];
 
-/// Every count of a [`DeleteReach`] with the word the warning pane uses, in the struct's **field
-/// order** (`htui-core`'s `store::traits`).
+/// Every count of a [`DeleteReach`] with the words the warning pane uses for one and for any
+/// other number (MOD-83: `1 link`, never `1 links`), in the struct's **field order**
+/// (`htui-core`'s `store::traits`).
 ///
 /// The destructuring carries no `..`, and the array's length is written out: a field added to
 /// [`DeleteReach`] fails to compile here rather than being silently left out of a warning that
 /// claims to list everything a delete removes (the zero-omission rule, PRD D13). Shared by
 /// [`reach_parts`] and [`reach_totals`] so the two cannot disagree about what they counted.
-fn labelled(reach: &DeleteReach) -> [(u64, &'static str); 28] {
+fn labelled(reach: &DeleteReach) -> [(u64, &'static str, &'static str); 28] {
     let DeleteReach {
         workspace_links,
         workspace_box_paths,
@@ -758,38 +760,47 @@ fn labelled(reach: &DeleteReach) -> [(u64, &'static str); 28] {
         item_requirements,
     } = *reach;
     [
-        (workspace_links, "workspace links"),
-        (workspace_box_paths, "box root paths"),
-        (items, "items"),
-        (item_key_counters, "key counters"),
-        (item_kinds, "kinds"),
-        (step_graphs, "graphs"),
-        (phases, "phases"),
-        (phase_agents, "phase agents"),
-        (prompt_templates, "templates"),
-        (repos, "repos"),
-        (repo_box_paths, "repo paths"),
-        (skill_bindings, "skill bindings"),
-        (runs, "runs"),
-        (run_steps, "run steps"),
-        (session_events, "session events"),
-        (run_step_commits, "run step commits"),
-        (run_step_trees, "run step trees"),
-        (command_runs, "command runs"),
-        (notes, "notes"),
-        (revisions, "revisions"),
-        (links, "links"),
-        (documents, "documents"),
-        (requirement_specs, "requirement specs"),
-        (requirement_areas, "requirement areas"),
-        (requirement_key_counters, "requirement key counters"),
-        (requirements, "requirements"),
-        (requirement_revisions, "requirement revisions"),
-        (item_requirements, "citations"),
+        (workspace_links, "workspace link", "workspace links"),
+        (workspace_box_paths, "box root path", "box root paths"),
+        (items, "item", "items"),
+        (item_key_counters, "key counter", "key counters"),
+        (item_kinds, "kind", "kinds"),
+        (step_graphs, "graph", "graphs"),
+        (phases, "phase", "phases"),
+        (phase_agents, "phase agent", "phase agents"),
+        (prompt_templates, "template", "templates"),
+        (repos, "repo", "repos"),
+        (repo_box_paths, "repo path", "repo paths"),
+        (skill_bindings, "skill binding", "skill bindings"),
+        (runs, "run", "runs"),
+        (run_steps, "run step", "run steps"),
+        (session_events, "session event", "session events"),
+        (run_step_commits, "run step commit", "run step commits"),
+        (run_step_trees, "run step tree", "run step trees"),
+        (command_runs, "command run", "command runs"),
+        (notes, "note", "notes"),
+        (revisions, "revision", "revisions"),
+        (links, "link", "links"),
+        (documents, "document", "documents"),
+        (requirement_specs, "requirement spec", "requirement specs"),
+        (requirement_areas, "requirement area", "requirement areas"),
+        (
+            requirement_key_counters,
+            "requirement key counter",
+            "requirement key counters",
+        ),
+        (requirements, "requirement", "requirements"),
+        (
+            requirement_revisions,
+            "requirement revision",
+            "requirement revisions",
+        ),
+        (item_requirements, "citation", "citations"),
     ]
 }
 
-/// One `"{n} {label}"` per **non-zero** count, in [`DeleteReach`] field order.
+/// One `"{n} {label}"` per **non-zero** count, in [`DeleteReach`] field order, singular for one
+/// ([`plural`]).
 ///
 /// A zero is omitted rather than printed: the pane lists what a delete takes, and "0 runs" is not
 /// something being taken.
@@ -797,8 +808,8 @@ fn labelled(reach: &DeleteReach) -> [(u64, &'static str); 28] {
 pub fn reach_parts(reach: &DeleteReach) -> Vec<String> {
     labelled(reach)
         .into_iter()
-        .filter(|(count, _)| *count > 0)
-        .map(|(count, label)| format!("{count} {label}"))
+        .filter(|(count, _, _)| *count > 0)
+        .map(|(count, one, many)| plural(usize::try_from(count).unwrap_or(usize::MAX), one, many))
         .collect()
 }
 
@@ -806,8 +817,8 @@ pub fn reach_parts(reach: &DeleteReach) -> Vec<String> {
 #[must_use]
 pub fn reach_totals(reach: &DeleteReach) -> (u64, usize) {
     let counts = labelled(reach);
-    let rows = counts.iter().map(|(count, _)| *count).sum();
-    let tables = counts.iter().filter(|(count, _)| *count > 0).count();
+    let rows = counts.iter().map(|(count, _, _)| *count).sum();
+    let tables = counts.iter().filter(|(count, _, _)| *count > 0).count();
     (rows, tables)
 }
 
@@ -822,7 +833,7 @@ mod tests {
     use htui_orch::infer::Checkout;
     use htui_store::Backend;
 
-    use super::{InferOutcome, box_id, infer_one, reach_parts, reach_totals};
+    use super::{InferOutcome, box_id, infer_one, labelled, reach_parts, reach_totals};
     use crate::store_worker::{StoreRequest, serve};
 
     /// A path write on a box with no row is refused by name rather than stored under a nil id.
@@ -954,7 +965,7 @@ mod tests {
             vec![
                 "12 items".to_owned(),
                 "2 documents".to_owned(),
-                "1 requirement specs".to_owned(),
+                "1 requirement spec".to_owned(),
                 "2 requirement areas".to_owned(),
                 "2 requirement key counters".to_owned(),
                 "3 requirements".to_owned(),
@@ -963,6 +974,30 @@ mod tests {
             ]
         );
         assert_eq!(reach_totals(&reach), (32, 8));
+    }
+
+    /// MOD-115 M3 RV2 (MOD-83): one of a thing reads singular (`1 workspace link`, `1 link`),
+    /// through `kit::label::plural`; every label has a singular of its own.
+    #[test]
+    fn reach_parts_say_one_in_the_singular() {
+        for (_, one, many) in labelled(&DeleteReach::default()) {
+            assert_ne!(one, many, "`{many}` has a singular");
+            assert!(!one.ends_with('s'), "`{one}` reads as one");
+        }
+        let reach = DeleteReach {
+            workspace_links: 1,
+            links: 1,
+            phases: 2,
+            ..DeleteReach::default()
+        };
+        assert_eq!(
+            reach_parts(&reach),
+            vec![
+                "1 workspace link".to_owned(),
+                "2 phases".to_owned(),
+                "1 link".to_owned()
+            ]
+        );
     }
 
     #[test]

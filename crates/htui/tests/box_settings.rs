@@ -2562,3 +2562,49 @@ async fn the_spec_saved_notice_names_the_probe_key_in_force() {
         assert_eq!(last_line(&frame).trim(), expected, "{file}");
     }
 }
+
+/// The demo world plus `extra` more boxes of the demo user, `BOX-00` on, whose ids sort after the
+/// fixture box's.
+fn many_boxes(extra: u128) -> MemStore {
+    let mut data = demo_data();
+    let fixture = data
+        .boxes
+        .iter()
+        .find(|row| row.id == ids::BOX)
+        .expect("the fixture box")
+        .clone();
+    for n in 0..extra {
+        let mut row = fixture.clone();
+        row.id = BoxId::from_uuid(Uuid::from_u128(u128::MAX - extra + n));
+        row.hostname = format!("BOX-{n:02}");
+        data.boxes.push(row);
+    }
+    MemStore::from_demo(data)
+}
+
+/// MOD-115 M3 RV2: the list reports its scroll for the Settings pane's scrollbar, beside the
+/// rows it was drawn into (RV1 M2's span), and keeps the selection in view. Boxes reported none,
+/// so a list longer than the pane had no bar.
+#[tokio::test]
+async fn the_list_reports_its_scroll_for_the_pane() {
+    let snapshot = snap_of(many_boxes(40)).await;
+    let total = snapshot.boxes.len();
+    assert!(total > 30, "more boxes than rows");
+    let (bench, mut section) = bench_with(&snapshot).await;
+    let _ = bench.render_section(&section, 100);
+    let span = section.scroll().expect("a long list reports its scroll");
+    assert_eq!((span.total, span.offset), (total, 0));
+    let rows = span.rows.expect("the rect the list was drawn into");
+    assert_eq!((rows.y, rows.height), (0, 30), "{rows:?}");
+
+    for _ in 0..total {
+        bench.key(&mut section, "j");
+    }
+    let frame = bench.render_section(&section, 100);
+    let span = section.scroll().expect("the list scrolls");
+    assert_eq!(
+        span.offset,
+        total - 30,
+        "the selection is on the last row: {frame}"
+    );
+}

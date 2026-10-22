@@ -3955,7 +3955,7 @@ async fn enter_on_the_create_form_sends_create_agent_with_the_parsed_draft_and_t
     );
     assert_eq!(
         errors_of(&emitted),
-        vec!["`create_agent` is still in flight".to_owned()]
+        vec!["still adding the agent \u{2014} wait for the store's answer".to_owned()]
     );
 }
 
@@ -4654,7 +4654,7 @@ async fn esc_during_an_edit_then_each_answer_lands_on_the_closed_form() {
         bench.key(&mut section, "e");
         assert_eq!(
             errors_of(&bench.drained()),
-            vec!["`edit_agent` is still in flight".to_owned()],
+            vec!["still saving the agent \u{2014} wait for the store's answer".to_owned()],
             "the guard outlives the form"
         );
 
@@ -4702,7 +4702,10 @@ async fn a_failed_for_another_request_does_not_clear_the_write_guard() {
         let emitted = bench.drained();
         assert_eq!(
             errors_of(&emitted),
-            vec!["`set_agent_on_box` is still in flight".to_owned()],
+            vec![
+                "still switching the agent on this box \u{2014} wait for the store's answer"
+                    .to_owned()
+            ],
             "`{other}` is not this write's answer"
         );
         assert!(!asked_anything(&emitted), "`{other}`: {emitted:?}");
@@ -4903,7 +4906,10 @@ async fn r_i_and_a_are_refused_while_a_registry_write_is_in_flight() {
         let emitted = bench.drained();
         assert_eq!(
             errors_of(&emitted),
-            vec!["`set_agent_on_box` is still in flight".to_owned()],
+            vec![
+                "still switching the agent on this box \u{2014} wait for the store's answer"
+                    .to_owned()
+            ],
             "{chord}"
         );
         assert!(!asked_anything(&emitted), "{chord}: {emitted:?}");
@@ -5296,7 +5302,10 @@ async fn m_is_refused_while_a_write_or_a_probe_is_in_flight() {
     let _ = bench.drained();
 
     for (section, expected) in [
-        (&mut writing, "`set_agent_on_box` is still in flight"),
+        (
+            &mut writing,
+            "still switching the agent on this box \u{2014} wait for the store's answer",
+        ),
         (&mut probing, "a probe is running; edit afterwards"),
         (&mut installing, "an install is running; edit afterwards"),
         (&mut logging_in, "a login is running; edit afterwards"),
@@ -5361,7 +5370,7 @@ async fn enter_sends_set_tool_paths_with_trimmed_non_empty_entries() {
     let emitted = bench.drained();
     assert_eq!(
         errors_of(&emitted),
-        vec!["`set_tool_paths` is still in flight".to_owned()]
+        vec!["still saving the tool paths \u{2014} wait for the store's answer".to_owned()]
     );
     assert!(!asked_anything(&emitted), "{emitted:?}");
 }
@@ -6146,7 +6155,10 @@ async fn tab_in_the_qdrant_editor_keeps_the_settings_tab() {
     harness.drive_to_end().await;
     assert_eq!(harness.app().tabs.active_id(), Some(SettingsTab::ID));
     let frame = harness.render();
-    assert!(frame.contains("Qdrant URL"), "the editor is open: {frame}");
+    assert!(
+        editing_the_qdrant_url(&frame),
+        "the editor is open: {frame}"
+    );
 
     for chord in ["tab", "backtab"] {
         harness.key(chord);
@@ -6158,7 +6170,7 @@ async fn tab_in_the_qdrant_editor_keeps_the_settings_tab() {
         );
         let frame = harness.render();
         assert!(
-            frame.contains("Qdrant URL"),
+            editing_the_qdrant_url(&frame),
             "`{chord}` keeps the editor: {frame}"
         );
     }
@@ -6184,9 +6196,15 @@ async fn ctrl_e_and_ctrl_r_in_qdrant_browse_do_nothing() {
     assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
     let rendered = render_section(&section, &bench.ctx());
     assert!(
-        rendered.contains("Qdrant URL"),
+        editing_the_qdrant_url(&rendered),
         "`ctrl-j` did not move the cursor, so `e` edits the URL row: {rendered}"
     );
+}
+
+/// Whether `frame` shows the Qdrant URL editor: its focused `new URL` row (RV2 L6). `Qdrant URL`
+/// alone also matches the guides and refusals (`no Qdrant URL is stored`), editor or not.
+fn editing_the_qdrant_url(frame: &str) -> bool {
+    frame.contains("\u{258c}new URL")
 }
 
 /// The clear question answers `y` and `n`/`Esc`, swallows the rest, and passes what the modal
@@ -6553,8 +6571,8 @@ async fn the_registry_switch_is_headed_enabled_as_the_form_names_it() {
 /// MOD-115 M3 repair 2, finding 5 (D-18): a manual row whose probe found no login keeps its `*`.
 /// `⚠ needs login*` is 14 cells against the 13-cell `on this box`: wherever `name` has a cell past
 /// its 10 the column takes it and draws the cell whole; at the bordered 98, where it has none, the
-/// verdict gives up a letter and the `*` stays, so the idle note's `* manual path` still names a
-/// mark the table draws.
+/// cell is the icon and the `*` (`⚠*`, RV2 L5) and the idle note says the word, so the note's
+/// `* manual path` still names a mark the table draws.
 #[tokio::test]
 async fn a_manual_row_that_needs_login_keeps_its_star() {
     let bench = SectionBench::new().await;
@@ -6578,9 +6596,23 @@ async fn a_manual_row_that_needs_login_keeps_its_star() {
 
     let bordered = render_section_at(&section, &bench.ctx(), SECTION_BORDERED);
     let line = row_line(&bordered, "m-auth").trim_end();
+    // RV2 L5 (the maintainer's answer): no spare cell, the icon alone and its `*`, never a cut
+    // word; the word is the note's.
     assert!(
-        line.ends_with("\u{26a0} needs log\u{2026}*"),
-        "no spare cell: the word gives way, the `*` stays: {bordered}"
+        line.ends_with(" \u{26a0}*"),
+        "no spare cell: the icon and the `*`: {bordered}"
+    );
+    assert!(
+        !bordered.contains("needs log\u{2026}"),
+        "no word is cut: {bordered}"
+    );
+    assert!(
+        bordered.contains("* manual path \u{b7} \u{26a0} needs login"),
+        "the note names the icon: {bordered}"
+    );
+    assert!(
+        !wide.contains("manual path \u{b7} \u{26a0}"),
+        "a cell drawn whole needs no word in the note: {wide}"
     );
     let at = SECTION_BORDERED as usize;
     assert_eq!(
@@ -6589,6 +6621,57 @@ async fn a_manual_row_that_needs_login_keeps_its_star() {
         "and `name` keeps its column: {bordered}"
     );
     assert!(bordered.contains("* manual path"), "{bordered}");
+}
+
+/// RV2 repair 1: the icon alone (`⚠*`) is drawn only while the note says its word in full. A
+/// notice that holds the note line, or a line too narrow for the word, leaves the cell its cut
+/// word (`⚠ needs log…*`), so the status word is never off the screen.
+#[tokio::test]
+async fn a_manual_verdict_keeps_its_word_when_the_note_cannot_say_it() {
+    let bench = SectionBench::new().await;
+    let manual = paths_row_with(
+        "m-auth",
+        &["alpha_tool"],
+        &[("alpha_tool", tool_path("htui-mod66-alpha").as_str())],
+        ProbeSource::Manual,
+        ProbeStatus::Unauthenticated,
+    );
+    let mut section = section_over(&bench, vec![manual]);
+
+    // The idle note at 60 cells is cut before the word it would add.
+    let narrow = render_section_at(&section, &bench.ctx(), 60);
+    // `name` is cut to `m…` here, so the row is found by the cursor's gutter.
+    let line = narrow
+        .lines()
+        .find(|line| line.starts_with('\u{258c}'))
+        .unwrap_or_else(|| panic!("the cursor's row is drawn: {narrow}"))
+        .trim_end();
+    assert!(
+        line.ends_with(" \u{26a0} needs log\u{2026}*"),
+        "the note cannot say the word, so the cell keeps it, cut: {narrow}"
+    );
+    assert!(narrow.contains("* manual path"), "{narrow}");
+    assert!(
+        !narrow.contains("manual path \u{b7}"),
+        "and the note names no icon the table does not draw: {narrow}"
+    );
+
+    // A notice holds the note line: the word is the cell's.
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "edit_agent",
+            message: "the store refused".to_owned(),
+        },
+    );
+    let bordered = render_section_at(&section, &bench.ctx(), SECTION_BORDERED);
+    assert!(bordered.contains("the store refused"), "{bordered}");
+    let line = row_line(&bordered, "m-auth").trim_end();
+    assert!(
+        line.ends_with(" \u{26a0} needs log\u{2026}*"),
+        "a notice up: the cut word and the `*`: {bordered}"
+    );
+    assert!(!line.ends_with("\u{26a0}*"), "{bordered}");
 }
 
 /// MOD-81: at the harness's 100 columns every column is drawn and `name` has its 10 cells,
@@ -6761,16 +6844,18 @@ async fn a_long_table_reports_its_scroll_and_keeps_the_cursor_in_view() {
         .collect();
     let mut section = section_over(&bench, rows);
     let _ = render_section(&section, &bench.ctx());
-    let Some((total, offset)) = section.scroll() else {
+    let Some((total, offset)) = section.scroll().map(|span| (span.total, span.offset)) else {
         panic!("40 rows do not fit 30");
     };
     assert_eq!(offset, 0, "the cursor starts on the first row");
-    // The header, the note and the 28 rows between them: 12 rows are left over.
-    assert_eq!(
-        total,
-        30 + 40 - 28,
-        "the section's height and the rows it could not show"
-    );
+    // RV2: the table's own rows, beside the 28 between the header and the note (RV1 M2's span),
+    // with no padding for the rows under them.
+    assert_eq!(total, 40, "the table's rows");
+    let body = section
+        .scroll()
+        .and_then(|span| span.rows)
+        .expect("the rows the table scrolls");
+    assert_eq!((body.y, body.height), (1, 28), "under the header: {body:?}");
 
     pressed(&bench, &mut section, "j", 39);
     let rendered = render_section(&section, &bench.ctx());
@@ -6780,9 +6865,15 @@ async fn a_long_table_reports_its_scroll_and_keeps_the_cursor_in_view() {
             .any(|line| line.starts_with("agent-39")),
         "the cursor's row is drawn: {rendered}"
     );
-    assert_eq!(section.scroll().map(|(_, offset)| offset), Some(12));
+    assert_eq!(
+        section
+            .scroll()
+            .map(|span| (span.total, span.offset))
+            .map(|(_, offset)| offset),
+        Some(12)
+    );
 
     let short = section_over(&bench, vec![registry_row("alpha", false)]);
     let _ = render_section(&short, &bench.ctx());
-    assert_eq!(short.scroll(), None);
+    assert_eq!(short.scroll().map(|span| (span.total, span.offset)), None);
 }

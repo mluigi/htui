@@ -67,7 +67,10 @@ fn r_sto_1() -> RevealTarget {
 /// Whether `frame` (or a row of it) shows a detail pane titled `key`: the Backlog's self-drawn
 /// `┌ KEY `, or a kit pane's `╭─ KEY ` (MOD-115 M3: Requirements; the Backlog in M4).
 fn titled(frame: &str, key: &str) -> bool {
-    frame.contains(&format!("\u{250c} {key} ")) || frame.contains(&format!("\u{2500} {key} "))
+    // MOD-115 M3 RV3 (review L5): the kit's title at its corner, so a rule (`─ KEY `) elsewhere
+    // in the frame does not pass for one.
+    frame.contains(&format!("\u{250c} {key} "))
+        || frame.contains(&format!("\u{256d}\u{2500} {key} "))
 }
 
 /// The Requirements tab's notice: the rows under the content's bottom border, joined (the
