@@ -481,7 +481,7 @@ pub const SPECS: [SettingSpec; 12] = [
         rungs: Rungs::APP.or(Rungs::PROJECT).or(Rungs::PHASE),
         not_above: None,
         unit: "tokens",
-        doc: "Prompt budget; the phase column is INTEGER, so that rung caps at i32::MAX.",
+        doc: "Prompt budget; the phase rung holds up to 2147483647.",
     },
 ];
 

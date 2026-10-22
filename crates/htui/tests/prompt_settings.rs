@@ -1839,6 +1839,16 @@ async fn the_pane_prints_doc_range_and_rungs() {
         "{frame}"
     );
     assert!(flat.contains("rungs app|project|phase"), "{frame}");
+    // RV2 L7 (the maintainer's answer): the phase rung's cap in plain words, never the column
+    // type or a Rust constant.
+    assert!(
+        flat.contains("the phase rung holds up to 2147483647"),
+        "{frame}"
+    );
+    assert!(
+        !flat.contains("INTEGER") && !flat.contains("i32::MAX"),
+        "{frame}"
+    );
 
     // MOD-115 M3 D3: the help is on the line under the row it is about, not under the tree.
     let under = from_focus(&frame);

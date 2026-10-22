@@ -13,9 +13,9 @@ expression: frame
  prompt_reserve_fraction        unset | 10% (0.1) (default) fraction
  prompt_upstream_hops           unset | 2 (default) hops
 ▌token_budget                   7000
-                                now 6000 | 6000 (app setting) tokens · Prompt budget; the phase
-                                column is INTEGER, so that rung caps at i32::MAX · range
-                                1..=9223372036854775807 tokens · rungs app|project|phase
+                                now 6000 | 6000 (app setting) tokens · Prompt budget; the phase rung
+                                holds up to 2147483647 · range 1..=9223372036854775807 tokens ·
+                                rungs app|project|phase
  project Vulkan Tutorials
  allow_env_files                unset | off (default) on/off
  box_hostname                   unset | on (default) on/off
