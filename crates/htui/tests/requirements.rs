@@ -958,6 +958,35 @@ async fn a_filter_typed_with_the_tree_hidden_is_on_screen() {
     );
 }
 
+/// MOD-115 M3 RV3 (carried L-req), MD-A end to end: the filter resolves what its field passes
+/// from the chord pressed (`Ctx::pressed`). With `field.line_down` moved to `ctrl-n`, the shell
+/// hands the filter's field the canonical `Down`, which a one-line field passes on; `ctrl-n` is
+/// that row's alone, so the filter typed, the tree and the hints stay as they were, and the
+/// filter still takes what is typed next.
+#[tokio::test]
+async fn a_rebound_field_chord_in_the_filter_is_only_that_row_s() {
+    let mut harness = open_with_keys("version = 2\n[field]\nline_down = [\"ctrl-n\"]\n").await;
+    let typed = filtered_by_sto(&mut harness).await;
+    assert!(
+        band(&typed).contains("/ STO"),
+        "the filter is typed: {typed}"
+    );
+    harness.key("ctrl-n");
+    harness.settle().await;
+    assert_eq!(
+        harness.render(),
+        typed,
+        "`ctrl-n` is `field.line_down`'s alone: nothing else moved"
+    );
+    harness.key("1");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        band(&frame).contains("/ STO1"),
+        "the filter is still open to type into: {frame}"
+    );
+}
+
 // ---- MOD-115 M3 L-req: the tab on the kit ---------------------------------------------------
 
 /// MOD-81: the tab at 80 columns, the tree and the detail side by side with their hints cut
