@@ -6155,7 +6155,10 @@ async fn tab_in_the_qdrant_editor_keeps_the_settings_tab() {
     harness.drive_to_end().await;
     assert_eq!(harness.app().tabs.active_id(), Some(SettingsTab::ID));
     let frame = harness.render();
-    assert!(frame.contains("Qdrant URL"), "the editor is open: {frame}");
+    assert!(
+        editing_the_qdrant_url(&frame),
+        "the editor is open: {frame}"
+    );
 
     for chord in ["tab", "backtab"] {
         harness.key(chord);
@@ -6167,7 +6170,7 @@ async fn tab_in_the_qdrant_editor_keeps_the_settings_tab() {
         );
         let frame = harness.render();
         assert!(
-            frame.contains("Qdrant URL"),
+            editing_the_qdrant_url(&frame),
             "`{chord}` keeps the editor: {frame}"
         );
     }
@@ -6193,9 +6196,15 @@ async fn ctrl_e_and_ctrl_r_in_qdrant_browse_do_nothing() {
     assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
     let rendered = render_section(&section, &bench.ctx());
     assert!(
-        rendered.contains("Qdrant URL"),
+        editing_the_qdrant_url(&rendered),
         "`ctrl-j` did not move the cursor, so `e` edits the URL row: {rendered}"
     );
+}
+
+/// Whether `frame` shows the Qdrant URL editor: its focused `new URL` row (RV2 L6). `Qdrant URL`
+/// alone also matches the guides and refusals (`no Qdrant URL is stored`), editor or not.
+fn editing_the_qdrant_url(frame: &str) -> bool {
+    frame.contains("\u{258c}new URL")
 }
 
 /// The clear question answers `y` and `n`/`Esc`, swallows the rest, and passes what the modal
