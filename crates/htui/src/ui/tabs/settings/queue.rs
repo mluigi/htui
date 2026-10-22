@@ -285,11 +285,16 @@ enum Entry<'a> {
     Blank,
 }
 
+/// The cells a group's rows sit in from its heading (MOD-115 M3 RV2 L4): rows that share a
+/// label across groups (`max concurrent`, `token_budget`) read as each group's own.
+const GROUP_INDENT: u16 = 2;
+
 /// `entries` as one form, `focus` focused, on today's label column.
 fn form_of<'a>(entries: Vec<Entry<'a>>, focus: usize, editing: bool) -> Form<'a> {
     entries.into_iter().fold(
         Form::new()
             .label_width(LABEL_WIDTH)
+            .indent_under_headings(GROUP_INDENT)
             .focus(focus)
             .editing(editing),
         |form, entry| match entry {

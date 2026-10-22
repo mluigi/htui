@@ -872,13 +872,25 @@ fn body(frame: &str) -> Vec<&str> {
 /// The kit form's gutter on the focused row (MOD-115 M3 D3).
 const GUTTER: char = '\u{258c}';
 
-/// A form row's text after its one-cell gutter (blank, or `▌` on the focused row), or `None` for a
-/// line that is not a row: the help and error lines under a row are indented to its value column.
+/// A form row's text after its one-cell gutter (blank, or `▌` on the focused row) and, for a
+/// group's row, the two cells it sits in from its heading (RV2 L4); `None` for a line that is not
+/// a row: the help and error lines under a row are indented to its value column.
 fn row_text(line: &str) -> Option<&str> {
     let rest = line
         .strip_prefix(GUTTER)
         .or_else(|| line.strip_prefix(' '))?;
+    let rest = ungrouped(rest);
     (!rest.is_empty() && !rest.starts_with(' ')).then_some(rest)
+}
+
+/// The cells a group's rows sit in from its heading (RV2 L4).
+const GROUP_INDENT: &str = "  ";
+
+/// `rest` without a group row's indent, when it has one.
+fn ungrouped(rest: &str) -> &str {
+    rest.strip_prefix(GROUP_INDENT)
+        .filter(|row| !row.starts_with(' '))
+        .unwrap_or(rest)
 }
 
 /// The value rows of the frame: every form row whose label is a registry key.
@@ -905,7 +917,7 @@ fn field_of(frame: &str, key: SettingKey) -> String {
     body(frame)
         .into_iter()
         .filter_map(|line| line.strip_prefix(GUTTER))
-        .find_map(|line| line.strip_prefix(key.key()))
+        .find_map(|line| ungrouped(line).strip_prefix(key.key()))
         .map(|rest| rest.trim().to_owned())
         .unwrap_or_else(|| panic!("no open field for `{key}`: {frame}"))
 }
@@ -1853,7 +1865,10 @@ async fn the_pane_prints_doc_range_and_rungs() {
     // MOD-115 M3 D3: the help is on the line under the row it is about, not under the tree.
     let under = from_focus(&frame);
     assert!(
-        under[0].starts_with(&format!("{GUTTER}{}", SettingKey::TokenBudget.key())),
+        under[0].starts_with(&format!(
+            "{GUTTER}{GROUP_INDENT}{}",
+            SettingKey::TokenBudget.key()
+        )),
         "{frame}"
     );
     assert!(under[1].trim_start().starts_with(doc), "{frame}");
@@ -2117,7 +2132,10 @@ async fn the_cursor_row_is_the_forms_marker() {
         .collect();
     assert_eq!(focused.len(), 1, "one marked row: {frame}");
     assert!(
-        focused[0].starts_with(&format!("{GUTTER}{}", SettingKey::TokenBudget.key())),
+        focused[0].starts_with(&format!(
+            "{GUTTER}{GROUP_INDENT}{}",
+            SettingKey::TokenBudget.key()
+        )),
         "{frame}"
     );
 
@@ -2160,12 +2178,13 @@ async fn an_open_editor_bands_its_label_alone() {
         .map(|x| buffer[(x, *y)].symbol())
         .collect();
     let key = SettingKey::TokenBudget.key();
-    assert!(text.starts_with(key), "{text}");
+    assert!(ungrouped(&text).starts_with(key), "{text}");
     let accent = bench.ctx().accent();
     assert_eq!(buffer[(0, *y)].fg, accent.fg.unwrap_or(Color::Reset));
     let selected = bench.ctx().theme.selected.bg;
     let banded = |x: u16| Some(buffer[(x, *y)].bg) == selected;
-    let label = u16::try_from(key.len()).expect("fits");
+    // The group's indent is the label's (RV2 L4): banded with it.
+    let label = u16::try_from(GROUP_INDENT.len() + key.len()).expect("fits");
     assert!((1..=label).all(banded), "the label is banded: {text}");
     let value = u16::try_from(text.find("4000").expect("the typed value")).expect("fits") + 1;
     assert!(
@@ -2366,4 +2385,37 @@ async fn the_section_at_80_columns() {
         from_focus(&frame)[1].trim_start().starts_with(key.key()),
         "{frame}"
     );
+}
+
+/// MOD-115 M3 RV2 L4: each group's rows sit two cells in from its heading, so the two
+/// `token_budget` rows read as the app's and the project's rather than one list's.
+#[tokio::test]
+async fn the_rows_are_indented_under_their_group() {
+    let (bench, section, _) = bench_with(&demo()).await;
+    let frame = bench.render_section(&section, 100);
+    let lines: Vec<&str> = frame.lines().map(after_gutter).collect();
+    let at = |prefix: &str| {
+        lines
+            .iter()
+            .position(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("a line at `{prefix}`: {frame}"))
+    };
+    assert!(lines[at("app") + 1].starts_with("  excerpt_"), "{frame}");
+    assert!(lines[at("project ") + 1].starts_with("  "), "{frame}");
+    let budgets: Vec<&&str> = lines
+        .iter()
+        .filter(|line| line.trim_start().starts_with("token_budget"))
+        .collect();
+    assert_eq!(budgets.len(), 2, "{frame}");
+    assert!(
+        budgets
+            .iter()
+            .all(|line| line.starts_with("  token_budget")),
+        "{frame}"
+    );
+}
+
+/// `line` past its first cell, the form's gutter.
+fn after_gutter(line: &str) -> &str {
+    line.char_indices().nth(1).map_or("", |(at, _)| &line[at..])
 }

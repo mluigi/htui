@@ -133,6 +133,7 @@ pub struct Form<'a> {
     focus: Option<usize>,
     editing: bool,
     label_width: Option<u16>,
+    indent: u16,
 }
 
 impl<'a> Form<'a> {
@@ -175,6 +176,16 @@ impl<'a> Form<'a> {
     #[must_use]
     pub fn editing(mut self, on: bool) -> Self {
         self.editing = on;
+        self
+    }
+
+    /// Indents every field after a heading by `cells` past the gutter, its help and error with
+    /// it, so the fields read as the heading's and two groups that share labels read as two
+    /// lists (MOD-115 M3 RV2 L4). The label column stays shared; the value column gives the
+    /// cells up. Fields before the first heading stay put.
+    #[must_use]
+    pub fn indent_under_headings(mut self, cells: u16) -> Self {
+        self.indent = cells;
         self
     }
 
@@ -235,9 +246,11 @@ impl<'a> Form<'a> {
         let geometry = self.geometry(width);
         let mut lines = Vec::new();
         let mut focus = None;
+        let mut under = false;
         for (index, item) in self.items.iter().enumerate() {
             let start = lines.len();
-            lines.extend(self.block(index, item, geometry, accent, theme));
+            let indent = self.indent_of(item, &mut under);
+            lines.extend(self.block(index, item, geometry, indent, accent, theme));
             if self.focus == Some(index) {
                 focus = Some(start..lines.len());
             }
@@ -262,9 +275,11 @@ impl<'a> Form<'a> {
         // Line counts do not depend on styles, so any theme measures them.
         let theme = Theme::default();
         let mut start = 0;
+        let mut under = false;
         for (index, item) in self.items[..=focus].iter().enumerate() {
+            let indent = self.indent_of(item, &mut under);
             let len = self
-                .block(index, item, geometry, Style::new(), &theme)
+                .block(index, item, geometry, indent, Style::new(), &theme)
                 .len();
             if index == focus {
                 return Some(start..start + len);
@@ -297,12 +312,26 @@ impl<'a> Form<'a> {
         }
     }
 
-    /// The rows of `item`, the form's `index`th.
+    /// The cells `item` is indented by ([`indent_under_headings`](Self::indent_under_headings)):
+    /// a field after a heading, which `under` records as the items go by.
+    fn indent_of(&self, item: &Item<'_>, under: &mut bool) -> u16 {
+        match item {
+            Item::Heading(_) => {
+                *under = true;
+                0
+            }
+            Item::Field(_) if *under => self.indent,
+            Item::Field(_) | Item::Blank => 0,
+        }
+    }
+
+    /// The rows of `item`, the form's `index`th, `indent` cells in past the gutter.
     fn block(
         &self,
         index: usize,
         item: &Item<'_>,
         geometry: Geometry,
+        indent: u16,
         accent: Style,
         theme: &Theme,
     ) -> Vec<Line<'static>> {
@@ -325,8 +354,9 @@ impl<'a> Form<'a> {
             Item::Field(field) => {
                 let rows = Rows {
                     label: geometry.label,
-                    value: geometry.value,
+                    value: geometry.value.saturating_sub(indent),
                     content,
+                    indent,
                     focused,
                     editing: focused && self.editing,
                 };
@@ -421,6 +451,9 @@ struct Rows {
     label: u16,
     value: u16,
     content: u16,
+    /// The blanks before the label ([`Form::indent_under_headings`]): inside the band, as a
+    /// `kit::list` row's own leading blanks are.
+    indent: u16,
     focused: bool,
     editing: bool,
 }
@@ -433,6 +466,7 @@ impl Rows {
             return self.stacked(field, gutter, theme);
         }
         let label = usize::from(self.label);
+        let pad = " ".repeat(usize::from(self.indent));
         let gap = Span::raw(" ".repeat(usize::from(GAP)));
         let mut lines: Vec<Line<'static>> = self
             .values(&field.value, theme)
@@ -440,9 +474,9 @@ impl Rows {
             .enumerate()
             .map(|(row, value)| {
                 let text = if row == 0 {
-                    cells::fit(field.label, label)
+                    format!("{pad}{}", cells::fit(field.label, label))
                 } else {
-                    " ".repeat(label)
+                    " ".repeat(pad.len() + label)
                 };
                 let name = Line::from(Span::styled(text, theme.base));
                 // The value line's own style goes to its own spans only: a styled
@@ -452,14 +486,17 @@ impl Rows {
                     let mut spans = name.spans;
                     spans.push(gap.clone());
                     spans.extend(value);
-                    let banded =
-                        selection_band(Line::from(spans), self.label + GAP + self.value, theme);
+                    let banded = selection_band(
+                        Line::from(spans),
+                        self.indent + self.label + GAP + self.value,
+                        theme,
+                    );
                     let mut out = vec![gutter.clone()];
                     out.extend(own_spans(banded));
                     Line::from(out)
                 } else {
                     let name = if self.focused {
-                        selection_band(name, self.label, theme)
+                        selection_band(name, self.indent + self.label, theme)
                     } else {
                         name
                     };
@@ -477,7 +514,7 @@ impl Rows {
             .collect();
         self.notes(
             field,
-            1 + label + usize::from(GAP),
+            1 + pad.len() + label + usize::from(GAP),
             self.value,
             theme,
             &mut lines,
@@ -495,20 +532,27 @@ impl Rows {
         theme: &Theme,
     ) -> Vec<Line<'static>> {
         let content = self.content;
-        let name = cells::clip(field.label, usize::from(content));
-        let named = u16::try_from(cells::cell_width(&name)).unwrap_or(content);
-        let name = Line::from(Span::styled(name, theme.base));
+        let pad = " ".repeat(usize::from(self.indent));
+        let inner = content.saturating_sub(self.indent);
+        let name = cells::clip(field.label, usize::from(inner));
+        let named = self.indent + u16::try_from(cells::cell_width(&name)).unwrap_or(inner);
+        let name = Line::from(Span::styled(format!("{pad}{name}"), theme.base));
         let name = match (self.focused, self.editing) {
             (true, false) => selection_band(name, content, theme),
             (true, true) => selection_band(name, named, theme),
             (false, _) => name,
         };
         let below = Self {
-            value: content,
+            value: inner,
             ..*self
         };
         let values = below.values(&field.value, theme).into_iter().map(|value| {
-            let value = Line::from(own_spans(value));
+            let mut spans = Vec::new();
+            if !pad.is_empty() {
+                spans.push(Span::raw(pad.clone()));
+            }
+            spans.extend(own_spans(value));
+            let value = Line::from(spans);
             if self.focused && !self.editing {
                 selection_band(value, content, theme)
             } else {
@@ -527,7 +571,7 @@ impl Rows {
                 }
             })
             .collect();
-        self.notes(field, 1, content, theme, &mut lines);
+        self.notes(field, 1 + pad.len(), inner, theme, &mut lines);
         lines
     }
 
@@ -1055,6 +1099,59 @@ mod tests {
         assert_eq!(laid(3).offset(4), 2);
         assert_eq!(laid(3).offset(2), 3, "taller than the view: its first line");
         assert_eq!(Form::new().layout(20, accent(), &theme).offset(4), 0);
+    }
+
+    /// RV2 L4: under `indent_under_headings`, the fields after a heading sit two cells in from
+    /// it, their help and errors with them, so two groups with the same labels read as two
+    /// lists; fields before the first heading, and a form without the option, stay put.
+    #[test]
+    fn fields_under_a_heading_are_indented_under_it() {
+        let theme = Theme::default();
+        let form = Form::new()
+            .label_width(6)
+            .field(Field::new("top", Value::Toggle(true)))
+            .heading("group one")
+            .field(Field::new("cap", Value::Toggle(true)).help("help"))
+            .heading("group two")
+            .field(Field::new("cap", Value::Toggle(false)).error("bad"))
+            .focus(2);
+        let plain = texts(&form.lines(30, accent(), &theme));
+        assert_eq!(plain[2], "\u{258c}cap     \u{25cf} on", "{plain:?}");
+        let nested = form.clone().indent_under_headings(2);
+        let lines = texts(&nested.lines(30, accent(), &theme));
+        assert_eq!(
+            lines,
+            [
+                " top     \u{25cf} on",
+                " group one",
+                "\u{258c}  cap     \u{25cf} on",
+                "           help",
+                " group two",
+                "   cap     \u{25cb} off",
+                "           bad",
+            ],
+            "{lines:?}"
+        );
+        assert_eq!(nested.focus_lines(30), Some(2..4));
+        assert_eq!(
+            nested.layout(30, accent(), &theme).focus,
+            nested.focus_lines(30)
+        );
+        // The indent is inside the band, as a list row's own leading blanks are.
+        let buffer = draw(&nested, 30, 7, 0, &theme);
+        let band = theme.selected.bg.expect("a band colour");
+        assert!(
+            (1..30).all(|x| buffer[(x, 2)].bg == band),
+            "{}",
+            row(&buffer, 2)
+        );
+        assert_ne!(buffer[(0, 2)].bg, band, "the gutter stays out of it");
+        // The rows stay inside the width: the value column gives the indent up.
+        let narrow = texts(&nested.lines(14, accent(), &theme));
+        assert!(
+            narrow.iter().all(|line| cells::cell_width(line) <= 14),
+            "{narrow:?}"
+        );
     }
 
     /// RV1, for Requirements' text areas (RV3 M2): a stacked field has its label on a row of

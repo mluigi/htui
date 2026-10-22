@@ -3,15 +3,15 @@ source: crates/htui/tests/queue_settings.rs
 expression: frame
 ---
  project vulkan-tutorials
- run cap         unbounded
-▌batch cap       1.2345678
-                 USD · now unbounded
+   run cap         unbounded
+▌  batch cap       1.2345678
+                   USD · now unbounded
  all boxes
- min budget      none
- max concurrent  2 (default)
- window          not set · stored, not enforced
+   min budget      none
+   max concurrent  2 (default)
+   window          not set · stored, not enforced
  this box (DESKTOP-HTUI)
- max concurrent  2
+   max concurrent  2
 
 
 
