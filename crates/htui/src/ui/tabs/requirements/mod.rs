@@ -3058,6 +3058,40 @@ mod tests {
         assert!(gutter.add_modifier.contains(Modifier::BOLD), "{gutter:?}");
     }
 
+    /// MOD-115 M3 RV3 (review M2): the body and the rationale are text areas across the form's
+    /// width, each under its label on a row of its own, not squeezed into the value column
+    /// beside the labels: R-ENT-1's 49-cell body is one row in a 53-cell form.
+    #[tokio::test]
+    async fn the_text_areas_take_the_form_s_width_under_their_label() {
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let mut tab = tab_on(snapshot);
+        bench.key(&mut tab, KeyCode::Char('e'));
+        let (_, rows) = drawn(&tab, &bench.ctx(), 100, 30);
+        let (x, y) = find(&rows, "\u{258c}body").expect("the focused body label");
+        let y = usize::from(y);
+        assert!(
+            !rows[y].contains("Every item"),
+            "the label is a row of its own: {rows:#?}"
+        );
+        assert!(
+            rows[y + 1].contains("Every item has a stable key of the form PREFIX-N."),
+            "the body is whole under it: {rows:#?}"
+        );
+        let (body_x, _) = find(&rows, "Every item").expect("the body");
+        assert_eq!(body_x, x + 1, "past the gutter, under the label: {rows:#?}");
+        let (_, label) = find(&rows, " rationale").expect("the rationale label");
+        let label = usize::from(label);
+        assert!(
+            !rows[label].contains("Keys are"),
+            "the label is a row of its own: {rows:#?}"
+        );
+        assert!(
+            rows[label + 1].contains("Keys are what people type."),
+            "the rationale under it: {rows:#?}"
+        );
+    }
+
     /// MOD-115 M3 D3: the area code's rule is help under the code field, and the withdraw's
     /// sentence help under its field: on the line under the field they are about.
     #[tokio::test]

@@ -392,8 +392,9 @@ impl RequirementForm {
         self.deciding.text().unwrap_or_default().trim().to_owned()
     }
 
-    /// Draws the form into the pane's inner `area`: the body and the rationale (`TextArea`s, two
-    /// thirds and a third of the rows the one-line fields leave), the priority as a choice and,
+    /// Draws the form into the pane's inner `area`: the body and the rationale (stacked
+    /// `TextArea`s, each label over its text across the form's width, two thirds and a third of
+    /// the rows the one-line fields leave), the priority as a choice and,
     /// for an amend, the deciding item; `accent` marks the focused field (`ctx.accent()`). Only
     /// the priority is not typed into, so it alone is banded whole (the kit's browsing marker).
     pub(super) fn render(&self, frame: &mut Frame<'_>, area: Rect, accent: Style, theme: &Theme) {
@@ -406,21 +407,24 @@ impl RequirementForm {
         ])
         .areas(area);
         let shared = form();
-        let value = shared.value_width(area.width);
+        // MOD-115 M3 RV3 (review M2): the text areas are stacked, the label on a row of its own
+        // and the text across the form's width under it, the label's row out of their rows.
+        let width = shared.content_width(area.width);
         let text = |field: &TextArea, rows: u16, focus: FormFocus| {
-            let mut lines = field.lines(value, rows, self.focus == focus, theme);
-            lines.resize(usize::from(rows).max(1), Line::default());
+            let rows = rows.saturating_sub(1).max(1);
+            let mut lines = field.lines(width, rows, self.focus == focus, theme);
+            lines.resize(usize::from(rows), Line::default());
             Value::Lines(lines)
         };
         let mut form = shared
-            .field(Field::new(
-                "body",
-                text(&self.body, body.height, FormFocus::Body),
-            ))
-            .field(Field::new(
-                "rationale",
-                text(&self.rationale, rationale.height, FormFocus::Rationale),
-            ))
+            .field(Field::new("body", text(&self.body, body.height, FormFocus::Body)).stacked())
+            .field(
+                Field::new(
+                    "rationale",
+                    text(&self.rationale, rationale.height, FormFocus::Rationale),
+                )
+                .stacked(),
+            )
             .field(Field::new(
                 "priority",
                 Value::Choice(label::priority(self.priority)),
