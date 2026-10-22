@@ -1114,6 +1114,51 @@ async fn the_amend_form() {
     insta::assert_snapshot!("requirements_amend_form", frame);
 }
 
+/// MOD-115 M3 RV3 repair (review M2): the stacked text areas' label rows are reserved before
+/// the rows are split, so at a short height the amend form still fits its pane: the deciding
+/// item, focused and typed into, is on screen.
+#[tokio::test]
+async fn the_amend_form_fits_a_short_pane() {
+    let mut harness = open_platform_in(Harness::over(MemStore::demo()).size(100, 10)).await;
+    harness.key("e");
+    for _ in 0..3 {
+        harness.key("tab");
+    }
+    type_text(&mut harness, "ANA-9");
+    let frame = harness.render();
+    assert!(
+        frame.contains("deciding item") && frame.contains("ANA-9"),
+        "the focused field and what is typed into it:\n{frame}"
+    );
+    assert!(
+        frame.contains("body") && frame.contains("rationale") && frame.contains(MUST),
+        "every field still fits:\n{frame}"
+    );
+}
+
+/// MOD-115 M3 RV3 repair (review M2): a pane shorter than the form's least rows scrolls the
+/// focused field into view, so what is typed is on screen.
+#[tokio::test]
+async fn the_amend_form_scrolls_its_focus_into_a_shorter_pane() {
+    let mut harness = open_platform_in(Harness::over(MemStore::demo()).size(100, 8)).await;
+    harness.key("e");
+    for _ in 0..3 {
+        harness.key("tab");
+    }
+    type_text(&mut harness, "ANA-9");
+    let frame = harness.render();
+    assert!(
+        frame.contains("deciding item") && frame.contains("ANA-9"),
+        "the focused field and what is typed into it:\n{frame}"
+    );
+    harness.key("tab");
+    let frame = harness.render();
+    assert!(
+        frame.contains("body"),
+        "back on the body, the form scrolls back to the top:\n{frame}"
+    );
+}
+
 /// Whether `hints` start on the detail's stretch of the bottom border in `frame`: past the tree's
 /// bottom-right corner.
 fn hints_on_the_detail(frame: &str, hints: &str) -> bool {

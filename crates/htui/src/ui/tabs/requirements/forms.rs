@@ -399,19 +399,23 @@ impl RequirementForm {
     /// the priority is not typed into, so it alone is banded whole (the kit's browsing marker).
     pub(super) fn render(&self, frame: &mut Frame<'_>, area: Rect, accent: Style, theme: &Theme) {
         let deciding = u16::from(self.amends());
-        let [body, rationale, _, _] = Layout::vertical([
+        // MOD-115 M3 RV3 (review M2): the text areas are stacked, the label on a row of its own
+        // and the text across the form's width under it. Repair: the two label rows are taken
+        // out with the one-line fields' before the text rows are split, so a short pane still
+        // fits every field rather than pushing the last one off.
+        let labels = 2;
+        let [body, rationale, _, _, _] = Layout::vertical([
             Constraint::Fill(2),
             Constraint::Fill(1),
+            Constraint::Length(labels),
             Constraint::Length(1),
             Constraint::Length(deciding),
         ])
         .areas(area);
         let shared = form();
-        // MOD-115 M3 RV3 (review M2): the text areas are stacked, the label on a row of its own
-        // and the text across the form's width under it, the label's row out of their rows.
         let width = shared.content_width(area.width);
         let text = |field: &TextArea, rows: u16, focus: FormFocus| {
-            let rows = rows.saturating_sub(1).max(1);
+            let rows = rows.max(1);
             let mut lines = field.lines(width, rows, self.focus == focus, theme);
             lines.resize(usize::from(rows), Line::default());
             Value::Lines(lines)
@@ -437,9 +441,12 @@ impl RequirementForm {
             .iter()
             .position(|focus| *focus == self.focus)
             .unwrap_or(0);
-        form.focus(focus)
+        // Shorter still than one row per text area, the focused field is scrolled into view.
+        let laid = form
+            .focus(focus)
             .editing(self.focus != FormFocus::Priority)
-            .render(frame, area, 0, accent, theme);
+            .layout(area.width, accent, theme);
+        laid.render(frame, area, laid.offset(area.height));
     }
 }
 
