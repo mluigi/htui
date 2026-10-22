@@ -6623,11 +6623,11 @@ async fn a_manual_row_that_needs_login_keeps_its_star() {
     assert!(bordered.contains("* manual path"), "{bordered}");
 }
 
-/// RV2 repair 1: the icon alone (`⚠*`) is drawn only while the note says its word in full. A
-/// notice that holds the note line, or a line too narrow for the word, leaves the cell its cut
-/// word (`⚠ needs log…*`), so the status word is never off the screen.
+/// RV4 (the maintainer's answer, "just use the icon"): a manual verdict that does not fit beside
+/// its `*` is its icon alone (`⚠*`) in every state and at every width, never a cut word. The word
+/// stays where it already is: the idle note, while it has room, and the help.
 #[tokio::test]
-async fn a_manual_verdict_keeps_its_word_when_the_note_cannot_say_it() {
+async fn a_manual_verdict_is_its_icon_alone_whatever_the_note_holds() {
     let bench = SectionBench::new().await;
     let manual = paths_row_with(
         "m-auth",
@@ -6638,7 +6638,7 @@ async fn a_manual_verdict_keeps_its_word_when_the_note_cannot_say_it() {
     );
     let mut section = section_over(&bench, vec![manual]);
 
-    // The idle note at 60 cells is cut before the word it would add.
+    // At 60 cells the idle note is cut before the word: the cell is still the icon.
     let narrow = render_section_at(&section, &bench.ctx(), 60);
     // `name` is cut to `m…` here, so the row is found by the cursor's gutter.
     let line = narrow
@@ -6647,16 +6647,16 @@ async fn a_manual_verdict_keeps_its_word_when_the_note_cannot_say_it() {
         .unwrap_or_else(|| panic!("the cursor's row is drawn: {narrow}"))
         .trim_end();
     assert!(
-        line.ends_with(" \u{26a0} needs log\u{2026}*"),
-        "the note cannot say the word, so the cell keeps it, cut: {narrow}"
+        line.ends_with(" \u{26a0}*"),
+        "at 60 columns: the icon and the `*`: {narrow}"
+    );
+    assert!(
+        !narrow.contains("needs log\u{2026}"),
+        "no word is cut: {narrow}"
     );
     assert!(narrow.contains("* manual path"), "{narrow}");
-    assert!(
-        !narrow.contains("manual path \u{b7}"),
-        "and the note names no icon the table does not draw: {narrow}"
-    );
 
-    // A notice holds the note line: the word is the cell's.
+    // A notice holds the note line: the cell is still the icon.
     bench.reply(
         &mut section,
         &StoreReply::Failed {
@@ -6668,10 +6668,13 @@ async fn a_manual_verdict_keeps_its_word_when_the_note_cannot_say_it() {
     assert!(bordered.contains("the store refused"), "{bordered}");
     let line = row_line(&bordered, "m-auth").trim_end();
     assert!(
-        line.ends_with(" \u{26a0} needs log\u{2026}*"),
-        "a notice up: the cut word and the `*`: {bordered}"
+        line.ends_with(" \u{26a0}*"),
+        "a notice up: the icon and the `*`: {bordered}"
     );
-    assert!(!line.ends_with("\u{26a0}*"), "{bordered}");
+    assert!(
+        !bordered.contains("needs log\u{2026}"),
+        "no word is cut: {bordered}"
+    );
 }
 
 /// MOD-81: at the harness's 100 columns every column is drawn and `name` has its 10 cells,
