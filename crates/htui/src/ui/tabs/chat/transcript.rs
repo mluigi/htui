@@ -526,9 +526,11 @@ impl Transcript {
     pub fn on_act(&mut self, act: Act) -> Handled {
         match act {
             Act::ListDown => {
+                // MOD-115 M3 RV3 (review L1): a step that reaches the last page is the tail
+                // again, so the view follows what streams in from there; never past it.
                 self.scroll = match self.scroll {
-                    Scroll::Tail => Scroll::Tail,
-                    Scroll::At(line) => Scroll::At(line + 1),
+                    Scroll::At(line) if line + 1 < self.last_page() => Scroll::At(line + 1),
+                    Scroll::Tail | Scroll::At(_) => Scroll::Tail,
                 };
                 Handled::Consumed
             }
@@ -536,13 +538,8 @@ impl Transcript {
                 self.scroll = match self.scroll {
                     // The tail shows the last `height` lines, so stepping back from it means the
                     // line just above that window — not `rows.len()`, which counts rows.
-                    Scroll::Tail => Scroll::At(
-                        self.rendered
-                            .get()
-                            .saturating_sub(self.height.get())
-                            .saturating_sub(1),
-                    ),
-                    Scroll::At(line) => Scroll::At(line.saturating_sub(1)),
+                    Scroll::Tail => Scroll::At(self.last_page().saturating_sub(1)),
+                    Scroll::At(line) => Scroll::At(line.min(self.last_page()).saturating_sub(1)),
                 };
                 Handled::Consumed
             }
@@ -560,6 +557,11 @@ impl Transcript {
             }
             _ => Handled::Pass,
         }
+    }
+
+    /// The first line of the last page as of the last render: where the tail starts.
+    fn last_page(&self) -> usize {
+        self.rendered.get().saturating_sub(self.height.get())
     }
 
     /// The last `resume_failed` row's lines, or none: what a chat whose handoff start failed too
@@ -585,9 +587,11 @@ impl Transcript {
         }
         self.rendered.set(lines.len());
         self.height.set(height);
+        // MOD-115 M3 RV3 (review L1): a view parked past the last page (thoughts folded again)
+        // shows the last page.
         let first = match self.scroll {
             Scroll::Tail => lines.len().saturating_sub(height),
-            Scroll::At(line) => line.min(lines.len().saturating_sub(1)),
+            Scroll::At(line) => line.min(lines.len().saturating_sub(height)),
         };
         self.first.set(first);
         lines.into_iter().skip(first).take(height).collect()
@@ -1177,6 +1181,73 @@ mod tests {
             "\u{2014} turn ended \u{2014}",
             "`g` goes to the first line"
         );
+    }
+
+    /// MOD-115 M3 RV3 (review L1): scrolling down stops at the last page, never past it, and
+    /// reaching it sticks the view to the tail again, so a line streamed afterwards is on screen
+    /// without a keystroke.
+    #[test]
+    fn scrolling_down_stops_at_the_tail_and_sticks_to_it() {
+        let mut transcript = Transcript::new();
+        for n in 0..10 {
+            transcript.apply(&chunk(&format!("line {n}"), &format!("m{n}")));
+        }
+        let theme = Theme::default();
+        transcript.lines(3, &theme, Some("t"));
+        transcript.on_act(Act::ChatTop);
+        transcript.lines(3, &theme, Some("t"));
+        assert_eq!(transcript.scroll_position(), (10, 0));
+        for _ in 0..20 {
+            transcript.on_act(Act::ListDown);
+        }
+        let shown = transcript.lines(3, &theme, Some("t"));
+        assert_eq!(
+            transcript.scroll_position(),
+            (10, 7),
+            "the last page, not past the end"
+        );
+        assert_eq!(shown.len(), 3, "a full page");
+
+        transcript.apply(&chunk("streamed", "m10"));
+        let shown = transcript.lines(3, &theme, Some("t"));
+        assert_eq!(transcript.scroll_position(), (11, 8), "the tail again");
+        assert_eq!(shown[2].to_string(), "streamed");
+
+        // One step back from the tail, and one down is the tail again.
+        transcript.on_act(Act::ListUp);
+        transcript.lines(3, &theme, Some("t"));
+        assert_eq!(transcript.scroll_position(), (11, 7));
+        transcript.on_act(Act::ListDown);
+        transcript.apply(&chunk("more", "m11"));
+        transcript.lines(3, &theme, Some("t"));
+        assert_eq!(transcript.scroll_position(), (12, 9), "it follows the tail");
+    }
+
+    /// MOD-115 M3 RV3 (review L1): a view parked past what the rows now render to (thoughts
+    /// folded again) shows the last page, not a lone last line.
+    #[test]
+    fn a_view_parked_past_the_end_shows_the_last_page() {
+        let mut transcript = Transcript::new();
+        transcript.apply(&envelope(DriverEvent::ThoughtChunk(TextChunk {
+            text: (0..10)
+                .map(|n| format!("t{n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            message_id: None,
+        })));
+        transcript.apply(&chunk("after", "m1"));
+        transcript.apply(&chunk("last", "m2"));
+        let theme = Theme::default();
+        transcript.on_act(Act::ChatThoughts);
+        transcript.lines(3, &theme, Some("t"));
+        assert_eq!(transcript.scroll_position(), (12, 9), "unfolded");
+        transcript.on_act(Act::ListUp);
+        transcript.lines(3, &theme, Some("t"));
+        assert_eq!(transcript.scroll_position(), (12, 8), "parked");
+        transcript.on_act(Act::ChatThoughts);
+        let shown = transcript.lines(3, &theme, Some("t"));
+        assert_eq!(transcript.scroll_position(), (3, 0), "folded: the one page");
+        assert_eq!(shown.len(), 3, "{shown:?}");
     }
 
     /// The lines `row` renders to, as text.
