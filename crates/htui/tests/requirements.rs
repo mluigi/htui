@@ -881,6 +881,83 @@ async fn the_tree_is_drawn_above_the_filter_opened_with_the_activity_zoomed() {
     );
 }
 
+/// The panes after `keys`, a frame drawn before the first and after each as the app draws one,
+/// so the shell's focus cycle reads the panes on screen.
+async fn after(harness: &mut Harness, keys: &[&str]) -> String {
+    harness.render();
+    for key in keys {
+        harness.key(key);
+        harness.settle().await;
+        harness.render();
+    }
+    harness.render()
+}
+
+/// Opens the filter with `/` and types `STO` into it: the frame drawn then.
+async fn filtered_by_sto(harness: &mut Harness) -> String {
+    harness.key("/");
+    type_text(harness, "STO");
+    harness.settle().await;
+    harness.render()
+}
+
+/// MOD-115 M3 RV3 (review M1): with the detail zoomed, `/` draws the tree over the zoomed detail
+/// with its band, so the filter typed is on screen and the tree follows it; leaving the filter
+/// gives the detail its zoom back.
+#[tokio::test]
+async fn a_filter_typed_with_the_detail_zoomed_is_on_screen() {
+    let mut harness = open().await;
+    let zoomed = after(&mut harness, &["tab", "z"]).await;
+    assert!(
+        !zoomed.contains(&titled("Requirements (3)")) && zoomed.contains(&titled("R-ENT-1")),
+        "the detail is zoomed:\n{zoomed}"
+    );
+    let frame = filtered_by_sto(&mut harness).await;
+    assert!(
+        band(&frame).contains("/ STO"),
+        "the band shows the filter typed:\n{frame}"
+    );
+    assert!(
+        frame.contains("R-STO-1") && !frame.contains("R-ENT-2"),
+        "the tree follows it:\n{frame}"
+    );
+    assert!(
+        hint(&frame).contains("apply"),
+        "the filter's hints:\n{frame}"
+    );
+    let frame = after(&mut harness, &["esc"]).await;
+    assert!(
+        !frame.contains(&titled("Requirements (3)")) && frame.contains(&titled("R-ENT-1")),
+        "the detail is zoomed again:\n{frame}"
+    );
+}
+
+/// MOD-115 M3 RV3 (review M1): with the tree hidden, `/` draws it back over the content while
+/// the filter is typed, the band and the tree on screen; applied, the tree is hidden again.
+#[tokio::test]
+async fn a_filter_typed_with_the_tree_hidden_is_on_screen() {
+    let mut harness = open().await;
+    let hidden = after(&mut harness, &["f2"]).await;
+    assert!(
+        !hidden.contains(&titled("Requirements (3)")),
+        "the tree is hidden:\n{hidden}"
+    );
+    let frame = filtered_by_sto(&mut harness).await;
+    assert!(
+        band(&frame).contains("/ STO"),
+        "the band shows the filter typed:\n{frame}"
+    );
+    assert!(
+        frame.contains("R-STO-1") && !frame.contains("R-ENT-2"),
+        "the tree follows it:\n{frame}"
+    );
+    let frame = after(&mut harness, &["enter"]).await;
+    assert!(
+        !frame.contains(&titled("Requirements (1)")),
+        "applied, the tree is hidden again:\n{frame}"
+    );
+}
+
 // ---- MOD-115 M3 L-req: the tab on the kit ---------------------------------------------------
 
 /// MOD-81: the tab at 80 columns, the tree and the detail side by side with their hints cut
