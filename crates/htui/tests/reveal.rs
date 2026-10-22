@@ -5,7 +5,8 @@
 //! Platform's `htui`, so each case moves there first (the `tests/requirements.rs` walk). The agent
 //! runtime is installed because a Backlog selection sends a `PromptPreview`, which `settle` would
 //! answer `Failed` onto the status line. A selection is read from the detail pane's title,
-//! `┌ KEY `. `R-STO-1`, not `R-ENT-1`, which the Requirements tab lands on by itself.
+//! `┌ KEY ` on the Backlog and `╭─ KEY ` on the Requirements tab, which draws kit panes since
+//! MOD-115 M3. `R-STO-1`, not `R-ENT-1`, which the Requirements tab lands on by itself.
 #![cfg(feature = "testkit")]
 
 use htui::agent_worker::AgentRuntime;
@@ -63,9 +64,13 @@ fn r_sto_1() -> RevealTarget {
     }
 }
 
-/// The detail pane's title for `key`.
-fn titled(key: &str) -> String {
-    format!("\u{250c} {key} ")
+/// Whether `frame` (or a row of it) shows a detail pane titled `key`: the Backlog's self-drawn
+/// `┌ KEY `, or a kit pane's `╭─ KEY ` (MOD-115 M3: Requirements; the Backlog in M4).
+fn titled(frame: &str, key: &str) -> bool {
+    // MOD-115 M3 RV3 (review L5): the kit's title at its corner, so a rule (`─ KEY `) elsewhere
+    // in the frame does not pass for one.
+    frame.contains(&format!("\u{250c} {key} "))
+        || frame.contains(&format!("\u{256d}\u{2500} {key} "))
 }
 
 /// The Requirements tab's notice: the rows under the content's bottom border, joined (the
@@ -103,7 +108,7 @@ async fn revealing_a_loaded_item_focuses_the_backlog_and_selects_it() {
     reveal(&mut harness, tool_1()).await;
     assert_eq!(harness.app().tabs.active_id(), Some(BacklogTab::ID));
     let frame = harness.render();
-    assert!(frame.contains(&titled("TOOL-1")), "{frame}");
+    assert!(titled(&frame, "TOOL-1"), "{frame}");
     assert!(
         frame.contains("\u{2502}CI matrix for the three OSes"),
         "the Body pane shows TOOL-1: {frame}"
@@ -124,7 +129,7 @@ async fn revealing_an_item_under_a_folded_project_unfolds_it() {
     reveal(&mut harness, tool_1()).await;
     let frame = harness.render();
     assert!(frame.contains("\u{25be} htui"), "{frame}");
-    assert!(frame.contains(&titled("TOOL-1")), "{frame}");
+    assert!(titled(&frame, "TOOL-1"), "{frame}");
 }
 
 #[tokio::test]
@@ -133,7 +138,7 @@ async fn revealing_before_the_backlog_has_loaded_selects_on_arrival() {
     reveal(&mut harness, tool_1()).await;
     assert_eq!(harness.app().top_bar.workspace, "Platform");
     let frame = harness.render();
-    assert!(frame.contains(&titled("TOOL-1")), "{frame}");
+    assert!(titled(&frame, "TOOL-1"), "{frame}");
     assert_eq!(harness.app().status, None);
 }
 
@@ -142,7 +147,7 @@ async fn revealing_an_unknown_item_says_so_and_keeps_the_cursor() {
     let mut harness = platform().await;
     let before = harness.render();
     let title_row = |frame: &str| frame.lines().nth(1).unwrap_or_default().to_owned();
-    assert!(title_row(&before).contains(&titled("ANA-1")), "{before}");
+    assert!(titled(&title_row(&before), "ANA-1"), "{before}");
 
     reveal(
         &mut harness,
@@ -163,7 +168,7 @@ async fn revealing_a_requirement_focuses_the_requirements_tab_and_opens_it() {
     reveal(&mut harness, r_sto_1()).await;
     assert_eq!(harness.app().tabs.active_id(), Some(RequirementsTab::ID));
     let frame = harness.render();
-    assert!(frame.contains(&titled("R-STO-1")), "{frame}");
+    assert!(titled(&frame, "R-STO-1"), "{frame}");
     assert!(
         frame.contains("Postgres is the source of truth;"),
         "the detail body, not the truncated tree row: {frame}"
@@ -181,18 +186,16 @@ async fn revealing_a_requirement_the_filter_hides_clears_the_filter() {
     harness.key("enter");
     harness.drive_to_end().await;
     let filtered = harness.render();
-    assert!(filtered.contains("\u{b7} /priority"), "{filtered}");
+    // MOD-115 M3 D6: the applied filter is the tree's band, ` / priority  1 of 3`.
+    assert!(filtered.contains(" / priority "), "{filtered}");
     assert!(!filtered.contains("R-STO-1"), "{filtered}");
 
     reveal(&mut harness, r_sto_1()).await;
     let frame = harness.render();
     assert!(frame.contains(" Requirements (3) \u{2500}"), "{frame}");
-    // The tree title's `· /priority`; the hint row has its own `· / filter` (MOD-67 M4).
-    assert!(
-        !frame.contains("\u{b7} /priority"),
-        "the filter is gone: {frame}"
-    );
-    assert!(frame.contains(&titled("R-STO-1")), "{frame}");
+    // The band's ` / priority`; the hints have their own `/ filter` (MOD-67 M4).
+    assert!(!frame.contains("/ priority"), "the filter is gone: {frame}");
+    assert!(titled(&frame, "R-STO-1"), "{frame}");
 }
 
 #[tokio::test]
@@ -214,10 +217,7 @@ async fn revealing_an_unknown_requirement_says_so_on_the_tab() {
         notice(&frame).contains(&not_in_these_requirements("R-NOPE-1")),
         "{frame}"
     );
-    assert!(
-        frame.contains(&titled("R-ENT-1")),
-        "the cursor stays: {frame}"
-    );
+    assert!(titled(&frame, "R-ENT-1"), "the cursor stays: {frame}");
 }
 
 #[tokio::test]
@@ -293,7 +293,7 @@ async fn revealing_a_step_lands_on_the_runs_pane_with_that_step_selected() {
     reveal(&mut harness, feat_1_at(ids::STEP_REVIEW)).await;
     assert_eq!(harness.app().tabs.active_id(), Some(BacklogTab::ID));
     let frame = harness.render();
-    assert!(frame.contains(&titled("FEAT-1")), "{frame}");
+    assert!(titled(&frame, "FEAT-1"), "{frame}");
     assert!(shows_runs(&frame), "the Runs sub-tab is open: {frame}");
     let line = cursor_line(&frame);
     assert!(line.contains("review"), "{line}\n{frame}");
@@ -320,7 +320,7 @@ async fn revealing_a_step_of_the_already_selected_item_moves_the_cursor() {
 
     reveal(&mut harness, feat_1_at(ids::STEP_IMPL)).await;
     let frame = harness.render();
-    assert!(frame.contains(&titled("FEAT-1")), "{frame}");
+    assert!(titled(&frame, "FEAT-1"), "{frame}");
     assert!(shows_runs(&frame), "{frame}");
     let line = cursor_line(&frame);
     assert!(line.contains("implement"), "{line}\n{frame}");
@@ -333,7 +333,7 @@ async fn revealing_a_step_before_the_list_lands_selects_it_on_arrival() {
     reveal(&mut harness, feat_1_at(ids::STEP_REVIEW)).await;
     assert_eq!(harness.app().top_bar.workspace, "Platform");
     let frame = harness.render();
-    assert!(frame.contains(&titled("FEAT-1")), "{frame}");
+    assert!(titled(&frame, "FEAT-1"), "{frame}");
     assert!(shows_runs(&frame), "{frame}");
     let line = cursor_line(&frame);
     assert!(line.contains("review"), "{line}\n{frame}");

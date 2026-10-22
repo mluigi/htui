@@ -3,9 +3,9 @@ source: crates/htui/tests/box_settings.rs
 expression: frame
 ---
 no workspace        boxes: store unreachable: this box browses its read-only cache and starts no run
-┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
-│ Boxes                                                                                            │
+╭─ Boxes ─────────────────────────────────────────────────────────────────────────────────── Boxes ╮
 │boxes unavailable: store unreachable: this box browses its read-only cache and starts no run      │
+│r asks again once the store answers                                                               │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -31,4 +31,4 @@ no workspace        boxes: store unreachable: this box browses its read-only cac
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-└─r reload─────────────────────────────────────────────────────────────────────────────────────────┘
+╰─r reload─────────────────────────────────────────────────────────────────────────────────────────╯

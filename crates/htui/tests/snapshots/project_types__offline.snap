@@ -3,8 +3,7 @@ source: crates/htui/tests/project_types.rs
 expression: frame
 ---
 no workspace   ¹Settings        0 working · 0 waiting · offline · 0s · no box ·  F9  about   ?  keys
-┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
-│ Project types                                                                                    │
+╭─ Project types ─────────────────────────────────────────────────────────────────── Project types ╮
 │project types unavailable: store unreachable: this box browses its read-only cache and starts no  │
 │run                                                                                               │
 │                                                                                                  │
@@ -31,4 +30,5 @@ no workspace   ¹Settings        0 working · 0 waiting · offline · 0s · no b
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

@@ -62,8 +62,8 @@ use crate::requirements::{
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells;
+use crate::ui::kit::modal::modal_rest;
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Scroll, message};
-use crate::ui::tabs::settings::modal_rest;
 use crossterm::event::KeyEvent;
 
 /// What `r` says on a citation stamped at the requirement's current version.

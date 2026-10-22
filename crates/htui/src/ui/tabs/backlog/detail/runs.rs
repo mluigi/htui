@@ -82,9 +82,9 @@ use crate::run_worker::{Enabled, FrameKind, ItemActions, ORCH_NAMES, OrchReply, 
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width};
+use crate::ui::kit::{chips::key_line, modal::modal_rest};
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, message};
 use crate::ui::tabs::chat::permission::PermissionStrip;
-use crate::ui::tabs::settings::{key_line, modal_rest};
 use crate::ui::text_field::{FieldOutcome, TextField};
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 
@@ -5575,7 +5575,7 @@ mod tests {
         }
     }
 
-    /// `[1] Allow once  [2] Reject once`.
+    /// ` 1  Allow once   2  Reject once` (MOD-115 M3 D5: the keys are chips).
     fn two_options() -> Vec<RelayOption> {
         vec![
             option("allow", "Allow once", RelayOptionKind::AllowOnce),
@@ -5669,10 +5669,10 @@ mod tests {
         let [_, options] = permission_lines(&pending, &shell.keys, &Theme::default());
         let options = text(&options);
         assert!(
-            options.contains("[1] Allow once") && options.contains("[F8] Reject once"),
+            options.contains(" 1  Allow once") && options.contains(" F8  Reject once"),
             "{options:?}"
         );
-        assert!(!options.contains("[2]"), "{options:?}");
+        assert!(!options.contains(" 2 "), "{options:?}");
         assert_eq!(
             pane.on_key(key(KeyCode::Char('2')), &mut shell.ctx()),
             Handled::Pass
@@ -5992,7 +5992,7 @@ mod tests {
                     .starts_with(&format!("asks: {}", &shown[..shown.len().min(10)])),
                 "{asks:?}"
             );
-            assert!(text(&strip).contains("[1] "), "{:?}", text(&strip));
+            assert!(text(&strip).contains(" 1  "), "{:?}", text(&strip));
         }
 
         let shell = Shell::new();
@@ -6007,7 +6007,7 @@ mod tests {
             "the summary is right under the step's second line: {drawn:#?}"
         );
         assert!(
-            drawn[at + 3].contains("[1] Allow once  [2] Reject once"),
+            drawn[at + 3].contains(" 1  Allow once   2  Reject once"),
             "and the strip under it: {drawn:#?}"
         );
         assert!(

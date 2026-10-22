@@ -10,25 +10,43 @@
 //! MOD-67 M4: a form's text fields see only plain keys, and only the keys its focused widget uses
 //! are the form's: the field moves and the save are acts the tab resolves on a
 //! [`FormOutcome::Pass`]. MOD-115 M2 D7: the priority resolves its keys through the keymap.
+//!
+//! MOD-115 M3 D6: the forms draw through `kit::form`, one label column for every field, the
+//! focused one marked by the kit's gutter in the tab's accent (MOD-85: no label in
+//! `theme.accent`), the priority a choice (`‹ must ›`), and each form's rule the help under the
+//! field it is about.
 
 use htui_core::model::{Priority, ProjectId, RequirementAreaId, RequirementId};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::keys::translate::FieldEvent;
 use crate::keys::{Act, KeyChord, Keys, is_plain, views};
-use crate::ui::cells;
+use crate::ui::kit::form::{Field, Form, Value};
+use crate::ui::kit::label;
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme};
 use crossterm::event::KeyEvent;
 
 /// How many rows `PageUp`/`PageDown` move the body or the rationale.
 const PAGE: u16 = 5;
 
-/// The label column of the one-line fields.
-const LABEL: usize = 15;
+/// The label column every form shares (the kit caps it at a third of the pane).
+const LABEL: u16 = 15;
+
+/// The area code's rule, the help under the code field.
+const CODE_RULE: &str = "A code is a capital letter, then 1 to 15 capitals or digits.";
+
+/// What a withdraw does, the help under the withdraw's field.
+const WITHDRAWN_STAYS: &str =
+    "A withdrawn requirement stays listed, dimmed, and takes no new citation.";
+
+/// A form with the shared label column.
+fn form<'a>() -> Form<'a> {
+    Form::new().label_width(LABEL)
+}
 
 /// What one key did to a form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,31 +139,19 @@ impl AreaForm {
         self.title.text().unwrap_or_default().trim().to_owned()
     }
 
-    /// Draws the form into the pane's inner `area`.
-    pub(super) fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
-        let width = area.width;
-        let lines = vec![
-            field_line(
-                "code",
-                &self.code,
-                width,
-                self.focus == AreaFocus::Code,
-                theme,
-            ),
-            field_line(
-                "title",
-                &self.title,
-                width,
-                self.focus == AreaFocus::Title,
-                theme,
-            ),
-            Line::default(),
-            Line::styled(
-                "A code is a capital letter, then 1 to 15 capitals or digits.",
-                theme.dim,
-            ),
-        ];
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    /// Draws the form into the pane's inner `area`: the code with its rule as help, and the
+    /// title; `accent` marks the focused field (`ctx.accent()`).
+    pub(super) fn render(&self, frame: &mut Frame<'_>, area: Rect, accent: Style, theme: &Theme) {
+        let focus = match self.focus {
+            AreaFocus::Code => 0,
+            AreaFocus::Title => 1,
+        };
+        form()
+            .field(Field::new("code", Value::Text(&self.code)).help(CODE_RULE))
+            .field(Field::new("title", Value::Text(&self.title)))
+            .focus(focus)
+            .editing(true)
+            .render(frame, area, 0, accent, theme);
     }
 }
 
@@ -386,82 +392,61 @@ impl RequirementForm {
         self.deciding.text().unwrap_or_default().trim().to_owned()
     }
 
-    /// Draws the form into the pane's inner `area`.
-    pub(super) fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
+    /// Draws the form into the pane's inner `area`: the body and the rationale (stacked
+    /// `TextArea`s, each label over its text across the form's width, two thirds and a third of
+    /// the rows the one-line fields leave), the priority as a choice and,
+    /// for an amend, the deciding item; `accent` marks the focused field (`ctx.accent()`). Only
+    /// the priority is not typed into, so it alone is banded whole (the kit's browsing marker).
+    pub(super) fn render(&self, frame: &mut Frame<'_>, area: Rect, accent: Style, theme: &Theme) {
         let deciding = u16::from(self.amends());
-        let [
-            body_label,
-            body,
-            rationale_label,
-            rationale,
-            priority,
-            deciding_row,
-        ] = Layout::vertical([
-            Constraint::Length(1),
+        // MOD-115 M3 RV3 (review M2): the text areas are stacked, the label on a row of its own
+        // and the text across the form's width under it. Repair: the two label rows are taken
+        // out with the one-line fields' before the text rows are split, so a short pane still
+        // fits every field rather than pushing the last one off.
+        let labels = 2;
+        let [body, rationale, _, _, _] = Layout::vertical([
             Constraint::Fill(2),
-            Constraint::Length(1),
             Constraint::Fill(1),
+            Constraint::Length(labels),
             Constraint::Length(1),
             Constraint::Length(deciding),
         ])
         .areas(area);
-        let label = |text: &str, focus: FormFocus| {
-            Paragraph::new(Line::styled(
-                text.to_owned(),
-                label_style(self.focus == focus, theme),
-            ))
+        let shared = form();
+        let width = shared.content_width(area.width);
+        let text = |field: &TextArea, rows: u16, focus: FormFocus| {
+            let rows = rows.max(1);
+            let mut lines = field.lines(width, rows, self.focus == focus, theme);
+            lines.resize(usize::from(rows), Line::default());
+            Value::Lines(lines)
         };
-        frame.render_widget(label("body", FormFocus::Body), body_label);
-        frame.render_widget(
-            Paragraph::new(self.body.lines(
-                body.width,
-                body.height,
-                self.focus == FormFocus::Body,
-                theme,
-            )),
-            body,
-        );
-        frame.render_widget(label("rationale", FormFocus::Rationale), rationale_label);
-        frame.render_widget(
-            Paragraph::new(self.rationale.lines(
-                rationale.width,
-                rationale.height,
-                self.focus == FormFocus::Rationale,
-                theme,
-            )),
-            rationale,
-        );
-        let choice = |value: Priority| {
-            if self.priority == value {
-                Span::styled(format!("[{value}]"), theme.accent)
-            } else {
-                Span::styled(format!(" {value} "), theme.dim)
-            }
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    cells::pad("priority", LABEL),
-                    label_style(self.focus == FormFocus::Priority, theme),
-                ),
-                choice(Priority::Must),
-                Span::raw(" "),
-                choice(Priority::Later),
-            ])),
-            priority,
-        );
+        let mut form = shared
+            .field(Field::new("body", text(&self.body, body.height, FormFocus::Body)).stacked())
+            .field(
+                Field::new(
+                    "rationale",
+                    text(&self.rationale, rationale.height, FormFocus::Rationale),
+                )
+                .stacked(),
+            )
+            .field(Field::new(
+                "priority",
+                Value::Choice(label::priority(self.priority)),
+            ));
         if self.amends() {
-            frame.render_widget(
-                Paragraph::new(field_line(
-                    "deciding item",
-                    &self.deciding,
-                    deciding_row.width,
-                    self.focus == FormFocus::Deciding,
-                    theme,
-                )),
-                deciding_row,
-            );
+            form = form.field(Field::new("deciding item", Value::Text(&self.deciding)));
         }
+        let focus = self
+            .order()
+            .iter()
+            .position(|focus| *focus == self.focus)
+            .unwrap_or(0);
+        // Shorter still than one row per text area, the focused field is scrolled into view.
+        let laid = form
+            .focus(focus)
+            .editing(self.focus != FormFocus::Priority)
+            .layout(area.width, accent, theme);
+        laid.render(frame, area, laid.offset(area.height));
     }
 }
 
@@ -553,40 +538,40 @@ impl WithdrawForm {
     }
 
     /// Draws the form into the pane's inner `area`; `body` is the requirement's, as the snapshot
-    /// shows it, one hard line at a time (a `Line` drops the `\n` of a `TextArea` body).
-    pub(super) fn render(&self, frame: &mut Frame<'_>, area: Rect, body: &str, theme: &Theme) {
-        let width = area.width;
+    /// shows it, one hard line at a time (a `Line` drops the `\n` of a `TextArea` body). Under it
+    /// the stage's form: the deciding item with what a withdraw does as its help, then the key
+    /// typed back with what to type; `accent` marks the focused field (`ctx.accent()`).
+    pub(super) fn render(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        body: &str,
+        accent: Style,
+        theme: &Theme,
+    ) {
         let mut lines = body_lines(body, theme);
-        lines.extend([
-            Line::default(),
-            Line::styled(
-                "A withdrawn requirement stays listed, dimmed, and takes no new citation.",
-                theme.dim,
-            ),
-            Line::default(),
-        ]);
-        match self {
-            Self::Deciding { field, .. } => {
-                lines.push(field_line("deciding item", field, width, true, theme));
-            }
+        lines.push(Line::default());
+        let stage = match self {
+            Self::Deciding { field, .. } => form()
+                .field(Field::new("deciding item", Value::Text(field)).help(WITHDRAWN_STAYS))
+                .focus(0),
             Self::Typed {
                 key,
                 deciding,
                 field,
                 ..
-            } => {
-                lines.push(Line::from(vec![
-                    Span::styled(cells::pad("deciding item", LABEL), theme.dim),
-                    Span::styled(deciding.clone(), theme.base),
-                ]));
-                lines.push(Line::default());
-                lines.push(Line::styled(
-                    format!("type {key} to withdraw it"),
-                    theme.base,
-                ));
-                lines.push(field_line("key", field, width, true, theme));
-            }
-        }
+            } => form()
+                .field(Field::new(
+                    "deciding item",
+                    Value::ReadOnly(deciding.as_str().into()),
+                ))
+                .field(
+                    Field::new("key", Value::Text(field))
+                        .help(format!("type {key} to withdraw it. {WITHDRAWN_STAYS}")),
+                )
+                .focus(1),
+        };
+        lines.extend(stage.editing(true).lines(area.width, accent, theme));
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 }
@@ -596,28 +581,6 @@ fn body_lines(body: &str, theme: &Theme) -> Vec<Line<'static>> {
     body.lines()
         .map(|line| Line::styled(line.to_owned(), theme.base))
         .collect()
-}
-
-/// `theme.accent` on the field with the keys, `theme.dim` otherwise.
-fn label_style(focused: bool, theme: &Theme) -> Style {
-    if focused { theme.accent } else { theme.dim }
-}
-
-/// `label` in its column, then the field.
-fn field_line(
-    label: &str,
-    field: &TextField,
-    width: u16,
-    focused: bool,
-    theme: &Theme,
-) -> Line<'static> {
-    let room = width.saturating_sub(u16::try_from(LABEL).unwrap_or(u16::MAX));
-    let mut spans = vec![Span::styled(
-        cells::pad(label, LABEL),
-        label_style(focused, theme),
-    )];
-    spans.extend(field.line(room, focused, theme).spans);
-    Line::from(spans)
 }
 
 #[cfg(test)]

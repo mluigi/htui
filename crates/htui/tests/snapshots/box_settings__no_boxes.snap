@@ -3,5 +3,6 @@ source: crates/htui/tests/box_settings.rs
 expression: frame
 ---
 no box is registered for this user yet
+a box is listed once htui connects from it
 
 probe spec: seed · <digest>

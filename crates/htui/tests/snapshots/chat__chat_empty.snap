@@ -1,11 +1,23 @@
 ---
 source: crates/htui/tests/chat.rs
-expression: harness.render()
+expression: frame
 ---
 Graphics   ¹Chat                0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
-┌ Chat ────────────────────────────────────────────────────────────────────────────────────────────┐
-│scripted · sonnet · Vulkan Tutorials · session —                                                  │
-│type a prompt to start a chat                                                                     │
+╭─ scripted · sonnet · Vulkan Tutorials · session — ───────────────────────────────────────────────╮
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                   type a prompt to start a chat                                  │
+│                                    i composes the first prompt                                   │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -19,16 +31,4 @@ Graphics   ¹Chat                0 working · 0 waiting · memory · DESKTOP-HTU
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-└─i compose the first prompt · a next agent────────────────────────────────────────────────────────┘
+╰─i compose the first prompt · a next agent────────────────────────────────────────────────────────╯

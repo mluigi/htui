@@ -22,11 +22,19 @@
 //! the hint row, and the delete question's own keys, are rendered from the same stack. A
 //! capturing or confirming mode swallows what it does not bind, except the chords its modal global
 //! layer admits (`CONTROL`, `ALT`, a function key), so `ctrl-c` quits and `F1` opens help.
+//!
+//! It draws through the kit (MOD-115 M3 L-kinds): the tree is a [`list`] with the project as a
+//! group row and the read-only detail as note rows, an editor is a [`Form`] whose focused row
+//! carries the marker, the outcome is a [`notice`] line and an empty tree is a [`empty`] state
+//! with a next step. The editor's own keys and every sentence that names a key read the key from
+//! the stack in force (MD-A), and the acts resolve from [`Ctx::pressed`].
+
+use core::cell::Cell;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
@@ -39,12 +47,17 @@ use crate::catalogue::{
     CatalogueSnapshot, GraphEntry, PersonaSummary, ProjectCatalogue, REQUEST_NAMES,
 };
 use crate::hierarchy::MirrorAfterDelete;
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
-use crate::ui::cells::{self, cell_width};
+use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::form::{self, Form, Value};
+use crate::ui::kit::label;
+use crate::ui::kit::list::{self, RowKind};
+use crate::ui::kit::pane::ScrollSpan;
+use crate::ui::kit::text::{Tone, notice, wrapped};
+use crate::ui::kit::{chips::key_line, modal::modal_rest};
 use crate::ui::tabs::settings::{
-    CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
-    message, modal_rest, wrapped,
+    CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection, changed_elsewhere,
 };
 use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::KeyEvent;
@@ -54,6 +67,9 @@ const NO_WORKSPACE: &str = "no workspace: nothing to list";
 
 /// What the rows pane says when the read answered with no project at all.
 const NO_PROJECT: &str = "no project in scope";
+
+/// The next step of [`NO_PROJECT`]: projects are the hierarchy section's (B-13).
+const NO_PROJECT_NEXT: &str = "Settings \u{203a} Hierarchy adds a project";
 
 /// What the rows pane says when the read itself was refused.
 const UNAVAILABLE: &str = "catalogue unavailable";
@@ -79,11 +95,13 @@ const HINT_NO_WORKSPACE: HintSpec = &[Hint::One(Act::Reload, "reload")];
 /// answer.
 const HINT_UNAVAILABLE: HintSpec = &[Hint::One(Act::Reload, "reload")];
 
-/// An open editor's keys: the form's own, then the field's fixed `Enter` and `Esc` (D13).
+/// An open editor's keys: the form's own, then the field's submit and cancel through the
+/// editor's `[field]` layer (D13; MOD-115 M3 MD-A, C6), `Enter save · Esc cancel` with the
+/// compiled keys.
 const HINT_EDITING: HintSpec = &[
     Hint::Pair(Act::FormNextField, Act::FormPrevField, "field"),
-    Hint::Text("Enter save"),
-    Hint::Text("Esc cancel"),
+    Hint::One(Act::FieldSubmit, "save"),
+    Hint::One(Act::FieldCancel, "cancel"),
 ];
 
 /// The prefix warning's keys (D10).
@@ -106,10 +124,10 @@ const POSITION_IS_A_NUMBER: &str = "`position` is a whole number";
 ///
 /// The only bound this section checks: every other one — the range, the column's width — is the
 /// store's, and it answers with its own sentence (M1 D7).
-const BUDGET_IS_A_NUMBER: &str = "`token_budget` is a whole number or empty";
+const BUDGET_IS_A_NUMBER: &str = "`token budget` is a whole number or empty";
 
 /// What the phase editor says when `gate_hard` is neither `y` nor `n` (B-10).
-const GATE_IS_Y_OR_N: &str = "`gate_hard (y/n)` is y or n";
+const GATE_IS_Y_OR_N: &str = "`hard gate (y/n)` is y or n";
 
 /// The delete confirmation's keys (D11), on the hint row and at the end of the question.
 const HINT_DELETING: HintSpec = &[
@@ -401,6 +419,10 @@ pub struct KindsSection {
     busy: Option<&'static str>,
     /// The last outcome, on the notice row under the pane.
     notice: Option<Notice>,
+    /// The tree's lines, first line drawn and rows as of the last render, for the Settings
+    /// pane's scrollbar (MOD-115 M3 D-11), measured against the rows the tree is drawn into
+    /// (RV1 M2). `None` while no tree is drawn.
+    scroll: Cell<Option<ScrollSpan>>,
 }
 
 impl KindsSection {
@@ -730,7 +752,7 @@ impl KindsSection {
     /// D5). Both stages answer through `views::KINDS_CONFIRM`; in flight an answer is a no-op.
     fn on_deleting_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let stack = views::KINDS_CONFIRM;
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         let answer = ctx.keys().actions(stack, chord).first().copied();
         let Mode::Deleting { id, stage, .. } = &mut self.mode else {
             return Handled::Pass;
@@ -796,7 +818,9 @@ impl KindsSection {
                 Handled::Consumed
             }
             FieldOutcome::Pass => {
-                let chord = KeyChord::from_event(key);
+                // The chord the user pressed (MOD-115 M3 MD-A): a `[field]` chord the field
+                // passed is that row's, never re-read as another act of its canonical key.
+                let chord = ctx.pressed(&key);
                 let Mode::Editing(editor) = &mut self.mode else {
                     return Handled::Pass;
                 };
@@ -875,7 +899,7 @@ impl KindsSection {
     /// `views::KINDS_CONFIRM`.
     fn on_confirm_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let stack = views::KINDS_CONFIRM;
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         match ctx.keys().actions(stack, chord).first() {
             Some(Act::ConfirmYes) => {
                 let Mode::ConfirmPrefix { editor, .. } = core::mem::take(&mut self.mode) else {
@@ -1157,8 +1181,10 @@ impl KindsSection {
     }
 
     /// A compare-and-set miss (D8): the tree is replaced, the editor keeps its text and takes the
-    /// current row's token, and the retry is a second `Enter` rather than an automatic write.
-    fn on_stale(&mut self, snapshot: &CatalogueSnapshot) {
+    /// current row's token, and the retry is a second `Enter` rather than an automatic write. The
+    /// sentence names that key as `keys` binds it through the editor's stack (MOD-115 M3 D-5).
+    fn on_stale(&mut self, snapshot: &CatalogueSnapshot, keys: &Keys) {
+        let retry = changed_elsewhere(keys.label(views::KINDS_EDITOR, Act::FieldSubmit).as_deref());
         self.busy = None;
         // A warning collapses back to the editor it was raised from: the prefix it compared
         // against may be the very thing that moved, so the question is asked again against the row
@@ -1178,7 +1204,7 @@ impl KindsSection {
             // Nothing is open to press `Enter` on, so the sentence has to carry what the editor
             // would otherwise stand for: the write did not apply, and the way back is to reopen.
             None => self.say(CHANGED_ELSEWHERE_CLOSED),
-            Some(Reload::Keep) => self.say(CHANGED_ELSEWHERE),
+            Some(Reload::Keep) => self.say(&retry),
             Some(Reload::Gone) => {
                 self.mode = Mode::Browse;
                 self.say(DELETED_ELSEWHERE);
@@ -1203,7 +1229,7 @@ impl KindsSection {
                     // opened — what this user found there — so only a user who typed in the column
                     // writes it.
                 }
-                self.say(CHANGED_ELSEWHERE);
+                self.say(&retry);
             }
         }
     }
@@ -1219,90 +1245,89 @@ impl KindsSection {
         self.locate_kind(id).map(|(_, kind)| kind.prefix.clone())
     }
 
-    /// One line per row, in [`rows`](KindsSection::rows) order, plus the read-only detail of the
-    /// selected phase (D15, B-11).
+    /// One list row per tree row, in [`rows`](KindsSection::rows) order, plus the read-only
+    /// detail of the selected phase as note rows (D15, B-11): the lines, the cursor's own line
+    /// and the selection's last line, so the detail scrolls into view with its phase.
     ///
-    /// The detail is not a row: the cursor never lands on it, so a row's index is its line's index
-    /// up to and including the selection.
-    fn lines(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    /// The cursor's line is answered, not taken for the cursor's row index (RV2 L2): the list
+    /// is handed the line it bands. Every row is one line, a blank one should a lookup miss,
+    /// so a row never shifts the lines under it. `width` is the list's, the gutter included.
+    fn list_rows(&self, width: u16, theme: &Theme) -> Listed {
+        let item = |line: Line<'static>| list::Row {
+            line,
+            kind: RowKind::Item,
+        };
         let mut lines = Vec::new();
+        let mut at = None;
+        let mut end = 0;
         for (index, row) in self.rows().into_iter().enumerate() {
             let selected = index == self.cursor;
-            // MOD-80 review L1: the cursor row in `selected`, as Connection's and Boxes' are.
-            let style = if selected { theme.selected } else { theme.base };
-            match row {
-                Row::Project { p } => {
-                    if let Some(entry) = self.project(p) {
-                        lines.push(Line::styled(
-                            format!("{}  {}", entry.project.slug, entry.project.name),
-                            style,
-                        ));
-                    }
-                }
-                Row::Kind { p, k } => {
-                    let Some(project) = self.project(p) else {
-                        continue;
-                    };
-                    let Some(kind) = project.kinds.get(k) else {
-                        continue;
-                    };
-                    let head = format!("  {}  {} \u{b7} ", kind.prefix, kind.name);
-                    match project.graph(kind.default_graph_id) {
-                        Some(entry) => lines.push(Line::styled(
-                            format!("{head}graph {}", entry.graph.name),
-                            style,
-                        )),
-                        // The tail is the one thing on this line the user has to act on, so it is
-                        // the one thing in `theme.error`.
-                        None => {
-                            let line = Line::from(vec![
-                                Span::styled(head, style),
-                                Span::styled(GRAPH_MISSING.to_owned(), theme.error),
-                            ]);
-                            lines.push(if selected { theme.select(line) } else { line });
-                        }
-                    }
-                }
-                Row::Graph { p, g } => {
-                    if let Some(entry) = self.graph_at(p, g) {
-                        let style = if selected { theme.selected } else { theme.dim };
-                        lines.push(Line::styled(
-                            format!("  {} \u{b7} graph, no kind", entry.graph.name),
-                            style,
-                        ));
-                    }
-                }
-                Row::Phase { p, g, i } => {
-                    let Some(phase) = self.phase_at(p, g, i) else {
-                        continue;
-                    };
-                    lines.push(Line::styled(phase_line(phase, self.personas()), style));
-                    if selected {
-                        lines.extend(detail_lines(phase, width, theme));
-                    }
-                }
+            if selected {
+                at = Some(lines.len());
+            }
+            let line = match row {
+                // A project heads its kinds and graphs: the kit's group row, never folded.
+                Row::Project { p } => self.project(p).map(|entry| list::Row {
+                    line: Line::styled(
+                        format!("{}  {}", entry.project.slug, entry.project.name),
+                        theme.title,
+                    ),
+                    kind: RowKind::Group { folded: false },
+                }),
+                Row::Kind { p, k } => self.kind_line(p, k, theme).map(item),
+                Row::Graph { p, g } => self.graph_at(p, g).map(|entry| {
+                    item(Line::styled(
+                        format!("  {} \u{b7} graph, no kind", entry.graph.name),
+                        theme.dim,
+                    ))
+                }),
+                Row::Phase { p, g, i } => self.phase_at(p, g, i).map(|phase| {
+                    item(Line::styled(phase_line(phase, self.personas()), theme.base))
+                }),
+            };
+            lines.push(line.unwrap_or_else(|| item(Line::default())));
+            if selected
+                && let Row::Phase { p, g, i } = row
+                && let Some(phase) = self.phase_at(p, g, i)
+            {
+                lines.extend(detail_lines(phase, width.saturating_sub(1), theme));
+            }
+            if selected {
+                end = lines.len().saturating_sub(1);
             }
         }
-        lines
+        Listed { lines, at, end }
     }
 
-    /// The one line under the pane: the last outcome, in `theme.error` when it is one to act on
-    /// rather than read (a compare-and-set miss). The keys this mode binds moved to the shell's
-    /// hint row (MOD-67 M6 T2, [`SettingsSection::key_hint`]), so the outcome has the line to
-    /// itself; blank without one.
-    /// Any mode: an editor's outcome is drawn here too.
+    /// A kind's line: its prefix and name, then its graph, or the missing graph in
+    /// `theme.error`; `None` should the snapshot not hold it.
+    fn kind_line(&self, p: usize, k: usize, theme: &Theme) -> Option<Line<'static>> {
+        let project = self.project(p)?;
+        let kind = project.kinds.get(k)?;
+        let head = format!("  {}  {} \u{b7} ", kind.prefix, kind.name);
+        // The tail is the one thing on this line the user has to act on, so it is
+        // the one thing in `theme.error` (the band covers it on the cursor row).
+        let tail = match project.graph(kind.default_graph_id) {
+            Some(entry) => Span::styled(format!("graph {}", entry.graph.name), theme.base),
+            None => Span::styled(GRAPH_MISSING.to_owned(), theme.error),
+        };
+        Some(Line::from(vec![Span::styled(head, theme.base), tail]))
+    }
+
+    /// The one line under the pane: the last outcome as a kit notice, in `theme.error` when it is
+    /// one to act on rather than read (a compare-and-set miss). The keys this mode binds are the
+    /// Settings pane's hints ([`SettingsSection::key_hint`]), so the outcome has the line to
+    /// itself; blank without one. Any mode: an editor's outcome is drawn here too.
     fn notice_line(&self, theme: &Theme) -> Line<'static> {
         let Some(notice) = &self.notice else {
             return Line::default();
         };
-        Line::styled(
-            notice.text().to_owned(),
-            if notice.is_error() {
-                theme.error
-            } else {
-                theme.dim
-            },
-        )
+        let tone = if notice.is_error() {
+            Tone::Error
+        } else {
+            Tone::Info
+        };
+        self::notice(notice.text(), tone, theme)
     }
 
     /// The mode's keys for the shell's hint row, plus what a write in flight adds to them.
@@ -1331,7 +1356,7 @@ impl KindsSection {
             // Only in Browse: an editor's own hint says what `Enter` is for, and a write in flight
             // is why `Enter` is not answering.
             Some(busy) if matches!(self.mode, Mode::Browse) && self.notice.is_none() => {
-                format!("{keys} \u{b7} {busy} in flight")
+                format!("{keys} \u{b7} {}\u{2026}", doing(busy))
             }
             _ => keys,
         }
@@ -1352,7 +1377,7 @@ impl KindsSection {
     /// `settings.kinds.graph`, never `list.top` (D2). The tab took `settings.*` before offering
     /// the key; a global act, or one this state declines, is the shell's (`Pass`).
     fn on_browse_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         for act in ctx.keys().actions(views::KINDS_BROWSE, chord) {
             match act {
                 Act::New => {
@@ -1409,15 +1434,22 @@ impl KindsSection {
         Handled::Pass
     }
 
-    /// The pane under the rows: the open editor, the question being answered, or nothing at all in
-    /// Browse.
+    /// The pane under the rows: the open editor as a kit form, the question being answered, or
+    /// nothing at all in Browse.
     ///
     /// Takes the width because both questions are sentences rather than rows and have to wrap
     /// inside the pane they are measured for — the layout needs the height first.
-    fn pane(&self, width: u16, theme: &Theme, keys: &Keys) -> Vec<Line<'static>> {
+    fn pane(&self, width: u16, ctx: &Ctx<'_>) -> Vec<Line<'static>> {
+        let theme = ctx.theme;
+        let warning = |text: &str| -> Vec<Line<'static>> {
+            wrapped(text, usize::from(width).max(1))
+                .into_iter()
+                .map(|line| notice(&line, Tone::Error, theme))
+                .collect()
+        };
         match &self.mode {
             Mode::Browse => Vec::new(),
-            Mode::Editing(editor) => editor.lines(width, theme),
+            Mode::Editing(editor) => editor.form().lines(width, ctx.accent(), theme),
             // The question, and while the delete is out, what it is waiting for.
             Mode::Deleting {
                 name,
@@ -1425,27 +1457,17 @@ impl KindsSection {
                 stage,
                 ..
             } => {
-                let answers = keys.hint(views::KINDS_CONFIRM, HINT_DELETING);
-                let mut lines: Vec<Line<'static>> = wrapped(
-                    &delete_question(name, prefix, &answers),
-                    usize::from(width).max(1),
-                )
-                .into_iter()
-                .map(|line| Line::styled(line, theme.error))
-                .collect();
+                let answers = ctx.keys().hint(views::KINDS_CONFIRM, HINT_DELETING);
+                let mut lines = warning(&delete_question(name, prefix, &answers));
                 if matches!(stage, DeleteStage::InFlight) {
-                    lines.push(Line::styled("delete_kind in flight".to_owned(), theme.dim));
+                    let waiting = format!("{}\u{2026}", doing(REQUEST_NAMES[3]));
+                    lines.push(notice(&waiting, Tone::Info, theme));
                 }
                 lines
             }
             // The warning and nothing else: what is being answered is the sentence, and the fields
             // behind it are one `n` away.
-            Mode::ConfirmPrefix { old, new, .. } => {
-                wrapped(&prefix_warning(old, new), usize::from(width).max(1))
-                    .into_iter()
-                    .map(|line| Line::styled(line, theme.error))
-                    .collect()
-            }
+            Mode::ConfirmPrefix { old, new, .. } => warning(&prefix_warning(old, new)),
         }
     }
 
@@ -1558,7 +1580,7 @@ impl SettingsSection for KindsSection {
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         match reply {
             StoreReply::Catalogue(snapshot) => self.on_catalogue(snapshot, ctx),
-            StoreReply::CatalogueStale(snapshot) => self.on_stale(snapshot),
+            StoreReply::CatalogueStale(snapshot) => self.on_stale(snapshot, ctx.keys()),
             StoreReply::KindDeleted { mirror, catalogue } => self.on_deleted(mirror, catalogue),
             // The read itself was refused: saying so beats an empty tree that reads as "nothing
             // here yet" (the agent section's rule, one section across).
@@ -1575,7 +1597,7 @@ impl SettingsSection for KindsSection {
                 self.busy = None;
                 // The editor stays open over its text: a refused write is retried by fixing what
                 // was refused and pressing `Enter` again. A refused **delete** is not: the seam
-                // answered the question the confirmation asked, so leaving `delete_kind in flight`
+                // answered the question the confirmation asked, so leaving `deleting the kind…`
                 // on screen would be waiting for something that already came back.
                 if matches!(self.mode, Mode::Deleting { .. }) {
                     self.mode = Mode::Browse;
@@ -1587,11 +1609,16 @@ impl SettingsSection for KindsSection {
     }
 
     fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
-        super::key_line(self.hint_text(keys), theme)
+        key_line(self.hint_text(keys), theme)
+    }
+
+    fn scroll(&self) -> Option<ScrollSpan> {
+        self.scroll.get()
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let pane = self.pane(area.width, ctx.theme, ctx.keys());
+        let theme = ctx.theme;
+        let pane = self.pane(area.width, ctx);
         let [rows, pane_area, hint] = Layout::vertical([
             Constraint::Min(3),
             Constraint::Length(u16::try_from(pane.len()).unwrap_or(u16::MAX)),
@@ -1599,39 +1626,64 @@ impl SettingsSection for KindsSection {
         ])
         .areas(area);
 
+        self.scroll.set(None);
+        let reload = ctx.keys().label(views::KINDS_BROWSE, Act::Reload);
         match (&self.unavailable, &self.snapshot) {
             // The refusal wins the pane even with a tree behind it: what is on screen would
             // otherwise be a catalogue nothing has confirmed since the outage started (H-17).
-            (Some(why), _) => frame.render_widget(
-                Paragraph::new(Line::styled(
-                    format!("{UNAVAILABLE}: {why}"),
-                    ctx.theme.error,
-                ))
-                .wrap(Wrap { trim: true }),
+            (Some(why), _) => {
+                let mut lines: Vec<Line<'static>> = wrapped(
+                    &format!("{UNAVAILABLE}: {why}"),
+                    usize::from(rows.width).max(1),
+                )
+                .into_iter()
+                .map(|line| notice(&line, Tone::Error, theme))
+                .collect();
+                // The next step in the empty state's own role.
+                let next = asks_again(reload.as_deref());
+                lines.extend(empty::lines("", NextStep(&next), theme).pop());
+                frame.render_widget(Paragraph::new(lines), rows);
+            }
+            (None, None) => empty::render(
+                frame,
                 rows,
+                NO_WORKSPACE,
+                NextStep(&reads_again(reload.as_deref())),
+                theme,
             ),
-            (None, None) => message(frame, rows, NO_WORKSPACE, ctx.theme),
             (None, Some(snapshot)) if snapshot.projects.is_empty() => {
-                message(frame, rows, NO_PROJECT, ctx.theme);
+                empty::render(frame, rows, NO_PROJECT, NextStep(NO_PROJECT_NEXT), theme);
             }
             (None, Some(_)) => {
-                // Scrolled so the cursor is on screen: the tree of a scope with several projects
-                // is longer than the pane, and a selection nobody can see is a cursor that acts
-                // blind.
-                let height = usize::from(rows.height);
-                let offset = self.cursor.saturating_sub(height.saturating_sub(1));
-                frame.render_widget(
-                    Paragraph::new(self.lines(area.width, ctx.theme))
-                        .scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0)),
-                    rows,
-                );
+                // Scrolled so the cursor is on screen, its detail with it when it fits: the tree
+                // of a scope with several projects is longer than the pane, and a selection
+                // nobody can see is a cursor that acts blind.
+                let Listed { lines, at, end } = self.list_rows(rows.width, theme);
+                let total = lines.len();
+                let offset = list::scroll_into_view(end, 0, usize::from(rows.height), total)
+                    .min(at.unwrap_or(0));
+                list::render(frame, rows, &lines, at, offset, ctx.accent(), theme);
+                // The pane's bar is measured against the rows the tree is drawn into and sits
+                // beside them (RV1 M2), so the rows under the tree need no padding.
+                self.scroll
+                    .set(Some(ScrollSpan::new(total, offset).rows(rows)));
             }
         }
         if !pane.is_empty() {
             frame.render_widget(Paragraph::new(pane), pane_area);
         }
-        frame.render_widget(Paragraph::new(self.notice_line(ctx.theme)), hint);
+        frame.render_widget(Paragraph::new(self.notice_line(theme)), hint);
     }
+}
+
+/// The tree as [`KindsSection::list_rows`] lists it (RV2 L2).
+struct Listed {
+    /// One line per tree row, the selected phase's detail under it.
+    lines: Vec<list::Row<'static>>,
+    /// The cursor's line, the one the list bands; `None` with no row under the cursor.
+    at: Option<usize>,
+    /// The selection's last line, its detail's when it has one.
+    end: usize,
 }
 
 impl Field {
@@ -1668,32 +1720,16 @@ impl Editor {
             .map_or_else(String::new, |field| field.text().to_owned())
     }
 
-    /// One line per field, the focused label accented and the focused field carrying the cursor.
-    fn lines(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
-        let label_width = self
-            .fields
-            .iter()
-            .map(|field| cell_width(field.label))
-            .max()
-            .unwrap_or(0);
+    /// The fields as a kit form (MOD-115 M3 D3): one row per field in tab order, the focused one
+    /// carrying the marker and the cursor, the labels in one shared column.
+    fn form(&self) -> Form<'_> {
         self.fields
             .iter()
-            .enumerate()
-            .map(|(index, field)| {
-                let focused = index == self.focus;
-                let style = if focused { theme.accent } else { theme.dim };
-                let label = cells::pad(field.label, label_width);
-                let mut spans = vec![Span::styled(format!("{label}: "), style)];
-                let room = usize::from(width).saturating_sub(label_width + 2);
-                spans.extend(
-                    field
-                        .input
-                        .line(u16::try_from(room).unwrap_or(u16::MAX), focused, theme)
-                        .spans,
-                );
-                Line::from(spans)
+            .fold(Form::new(), |form, field| {
+                form.field(form::Field::new(field.label, Value::Text(&field.input)))
             })
-            .collect()
+            .focus(self.focus)
+            .editing(true)
     }
 }
 
@@ -1757,9 +1793,9 @@ fn new_phase_fields(entry: &GraphEntry) -> Vec<Field> {
             "position",
             &next_position(entry.nodes.iter().map(|node| node.phase.position)),
         ),
-        Field::required("template_name", ""),
-        Field::required("gate_hard (y/n)", "n"),
-        Field::optional("input_kinds", ""),
+        Field::required("template", ""),
+        Field::required("hard gate (y/n)", "n"),
+        Field::optional("inputs", ""),
     ]
 }
 
@@ -1768,10 +1804,10 @@ fn edit_phase_fields(phase: &StepGraphPhase, personas: &[PersonaSummary]) -> Vec
     vec![
         Field::required("name", &phase.name),
         Field::required("position", &phase.position.to_string()),
-        Field::required("template_name", &phase.template_name),
-        Field::required("gate_hard (y/n)", if phase.gate_hard { "y" } else { "n" }),
-        Field::optional("input_kinds", &phase.input_kinds.join(",")),
-        Field::optional("token_budget", &budget_text(phase.token_budget)),
+        Field::required("template", &phase.template_name),
+        Field::required("hard gate (y/n)", if phase.gate_hard { "y" } else { "n" }),
+        Field::optional("inputs", &phase.input_kinds.join(",")),
+        Field::optional("token budget", &budget_text(phase.token_budget)),
         Field::optional("persona", &persona_text(phase.persona_id, personas)),
     ]
 }
@@ -1967,7 +2003,26 @@ fn deleted_notice(prefix: Option<&str>, mirror: &MirrorAfterDelete) -> String {
 
 /// What a second write of the same kind is told while the first is still out.
 fn in_flight(busy: &str) -> String {
-    format!("`{busy}` is still in flight")
+    format!("still {} \u{2014} wait for the store's answer", doing(busy))
+}
+
+/// A write in flight in words (MOD-115 M3: no request name on screen), by
+/// [`StoreRequest::name`].
+fn doing(busy: &str) -> &'static str {
+    match busy {
+        "catalogue" => "reading the catalogue",
+        "create_kind" => "adding the kind",
+        "update_kind" => "saving the kind",
+        "delete_kind" => "deleting the kind",
+        "create_graph" => "adding the graph",
+        "update_graph" => "saving the graph",
+        "create_phase" => "adding the phase",
+        "update_phase" => "saving the phase",
+        "set_phase_budget" => "saving the budget",
+        "replace_graph" => "replacing the graph",
+        "delete_phase" => "deleting the phase",
+        _ => "writing",
+    }
 }
 
 /// What an empty required field is told, before the store is asked anything.
@@ -1976,19 +2031,24 @@ fn required(label: &str) -> String {
 }
 
 /// One phase row: the six columns this section edits, in editor order (D2's six, minus the ones
-/// the row cannot show), then the bound persona's name — only when one is bound, so an unbound
-/// phase's line is exactly what it was before MOD-26 M2 (D23, I-12).
+/// the row cannot show), read as words (MOD-83: `soft gate`, `no inputs`, `budget inherited`),
+/// then the bound persona's name — only when one is bound, so an unbound phase's line says
+/// nothing of personas (D23, I-12).
 fn phase_line(phase: &StepGraphPhase, personas: &[PersonaSummary]) -> String {
+    let inputs = if phase.input_kinds.is_empty() {
+        "no inputs".to_owned()
+    } else {
+        format!("inputs {}", phase.input_kinds.join(", "))
+    };
     let mut line = format!(
-        "    {}. {} \u{b7} template {} \u{b7} gate {} \u{b7} in {} \u{b7} budget {}",
+        "    {}. {} \u{b7} template {} \u{b7} {} \u{b7} {inputs} \u{b7} {}",
         phase.position,
         phase.name,
         phase.template_name,
-        if phase.gate_hard { "hard" } else { "soft" },
-        if phase.input_kinds.is_empty() {
-            "none".to_owned()
+        if phase.gate_hard {
+            "hard gate"
         } else {
-            phase.input_kinds.join(",")
+            "soft gate"
         },
         budget_label(phase.token_budget),
     );
@@ -2001,36 +2061,66 @@ fn phase_line(phase: &StepGraphPhase, personas: &[PersonaSummary]) -> String {
 
 /// `token_budget` as the tree prints it: an empty column inherits from the project or the app rung
 /// rather than holding a number nobody wrote (D16).
+///
+/// The inherited case reads `budget inherited`, not blueprint §5.4's `inherits the budget`: the
+/// same meaning three cells shorter, so a bound research row (`kinds__phase_persona`: `... ·
+/// budget inherited · persona reviewer`, 98 cells) still fits a 100-column pane; the blueprint's
+/// wording takes it to 101 and clips the persona's name. Keeping `budget` first also lines it up with `budget {n}
+/// tokens`. Pinned by `a_phase_row_reads_its_gate_inputs_and_budget_in_words`.
 fn budget_label(budget: Option<i32>) -> String {
-    budget.map_or_else(|| "inherit".to_owned(), |n| n.to_string())
+    budget.map_or_else(
+        || "budget inherited".to_owned(),
+        |n| format!("budget {n} tokens"),
+    )
 }
 
-/// MOD-4's eight columns under the selected phase, dimmed and unselectable (D15).
+/// MOD-4's eight columns under the selected phase, dimmed and unselectable (D15), each named in
+/// words and its enums through `kit::label` (MOD-83): `fan-out 1 · gate: never · isolation: none
+/// (local tree) · commands: not queued · …`.
 ///
 /// Wrapped here rather than clipped: the last words are the ones that say why nothing on the line
-/// can be typed into, and a detail line cut off at `verify_command` would read as a row of the tree
-/// that someone forgot to finish.
-fn detail_lines(phase: &StepGraphPhase, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+/// can be typed into, and a detail line cut off at the verify command would read as a row of the
+/// tree that someone forgot to finish. `width` is the row's, after the gutter.
+fn detail_lines(phase: &StepGraphPhase, width: u16, theme: &Theme) -> Vec<list::Row<'static>> {
     let text = format!(
-        "fan_out {} \u{b7} gate {} \u{b7} isolation {} \u{b7} command_queue {} \u{b7} verify_command {} \u{b7} retry_limit {} \u{b7} output_kind {} \u{b7} template_version {} \u{2014} {MOD_4_OWNS}",
+        "fan-out {} \u{b7} gate: {} \u{b7} isolation: {} \u{b7} commands: {} \u{b7} verify: {} \u{b7} retries {} \u{b7} output: {} \u{b7} template: {} \u{2014} {MOD_4_OWNS}",
         phase.fan_out,
-        phase.gate.as_str(),
-        phase
-            .isolation
-            .map_or("none", htui_core::model::Isolation::as_str),
-        phase.command_queue.as_str(),
+        label::gate(phase.gate),
+        // `None` is the project's default (`step_graph_phase.isolation`).
+        phase.isolation.map_or("project default", label::isolation),
+        label::command_queue(phase.command_queue),
         phase.verify_command.as_deref().unwrap_or("none"),
         phase.retry_limit,
         phase.output_kind,
+        // `None` follows the latest version.
         phase
             .template_version
-            .map_or_else(|| "none".to_owned(), |n| n.to_string()),
+            .map_or_else(|| "latest".to_owned(), |n| format!("v{n}")),
     );
     let room = usize::from(width).saturating_sub(6).max(1);
     wrapped(&text, room)
         .into_iter()
-        .map(|line| Line::styled(format!("      {line}"), theme.dim))
+        .map(|line| list::Row {
+            line: Line::styled(format!("      {line}"), theme.dim),
+            kind: RowKind::Note,
+        })
         .collect()
+}
+
+/// The next step of [`NO_WORKSPACE`]: the reload key in force (MD-A), or what happens without one.
+fn reads_again(reload: Option<&str>) -> String {
+    reload.map_or_else(
+        || "the catalogue is read again when the section opens".to_owned(),
+        |key| format!("{key} reads the catalogue again"),
+    )
+}
+
+/// The next step of [`UNAVAILABLE`]: the reload key in force (MD-A), or what happens without one.
+fn asks_again(reload: Option<&str>) -> String {
+    reload.map_or_else(
+        || "it is asked again when the section opens".to_owned(),
+        |key| format!("{key} asks again once the store answers"),
+    )
 }
 
 #[cfg(test)]
@@ -2092,5 +2182,67 @@ mod tests {
             .key_hint(Keys::compiled(), &theme)
             .expect("the defaults bind the keys");
         assert_eq!(keys.to_string(), section.hint_text(Keys::compiled()));
+    }
+
+    /// MOD-115 M3: a write in flight reads in words. Every request name has its own phrase, and
+    /// neither the refusal nor the Browse hint prints the name itself.
+    #[test]
+    fn a_write_in_flight_reads_in_words() {
+        for name in REQUEST_NAMES {
+            assert_ne!(doing(name), doing("unknown"), "`{name}` has its own phrase");
+            assert!(!in_flight(name).contains('_'), "{}", in_flight(name));
+        }
+        let section = KindsSection {
+            busy: Some(REQUEST_NAMES[8]),
+            ..KindsSection::new()
+        };
+        let hint = section.hint_text(Keys::compiled());
+        assert!(
+            hint.ends_with(" \u{b7} saving the budget\u{2026}"),
+            "{hint}"
+        );
+    }
+
+    /// MOD-115 M3 RV2 L2: the list is handed the cursor's own line, which `list_rows` answers,
+    /// not the cursor's row index: over the whole demo tree the line it names is the cursor
+    /// row's, and the selection's last line closes the detail drawn under it.
+    #[tokio::test]
+    async fn list_rows_answer_the_cursors_line() {
+        use htui_core::store::MemStore;
+        let store = MemStore::demo();
+        let workspaces = store
+            .workspaces()
+            .await
+            .expect("the memory store never fails");
+        let scope = Scope::from_workspace(workspaces.first().expect("a workspace"));
+        let snapshot = crate::catalogue::snapshot(&store, &scope)
+            .await
+            .expect("the demo catalogue");
+        let theme = Theme::default();
+        let mut section = KindsSection {
+            snapshot: Some(snapshot),
+            ..KindsSection::new()
+        };
+        let rows = section.rows().len();
+        assert!(rows > 3, "a tree to walk");
+        let mut details = 0;
+        for cursor in 0..rows {
+            section.cursor = cursor;
+            let listed = section.list_rows(100, &theme);
+            let at = listed.at.expect("the cursor's row is listed");
+            assert!(
+                matches!(listed.lines[at].kind, RowKind::Item | RowKind::Group { .. }),
+                "{cursor}: the cursor's line is a row, not a note"
+            );
+            assert!(listed.end >= at, "{cursor}");
+            assert!(
+                listed.lines[at + 1..=listed.end]
+                    .iter()
+                    .all(|line| matches!(line.kind, RowKind::Note)),
+                "{cursor}: the lines after it, through `end`, are its detail"
+            );
+            details += listed.end - at;
+        }
+        assert!(details > 0, "a phase with its detail was walked");
     }
 }

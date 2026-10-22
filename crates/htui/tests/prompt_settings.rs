@@ -869,15 +869,78 @@ fn body(frame: &str) -> Vec<&str> {
         .collect()
 }
 
-/// The value rows of the frame: every line that starts with two spaces and then a registry key.
+/// The kit form's gutter on the focused row (MOD-115 M3 D3).
+const GUTTER: char = '\u{258c}';
+
+/// A form row's text after its one-cell gutter (blank, or `▌` on the focused row) and, for a
+/// group's row, the two cells it sits in from its heading (RV2 L4); `None` for a line that is not
+/// a row: the help and error lines under a row are indented to its value column.
+fn row_text(line: &str) -> Option<&str> {
+    let rest = line
+        .strip_prefix(GUTTER)
+        .or_else(|| line.strip_prefix(' '))?;
+    let rest = ungrouped(rest);
+    (!rest.is_empty() && !rest.starts_with(' ')).then_some(rest)
+}
+
+/// The cells a group's rows sit in from its heading (RV2 L4).
+const GROUP_INDENT: &str = "  ";
+
+/// `rest` without a group row's indent, when it has one.
+fn ungrouped(rest: &str) -> &str {
+    rest.strip_prefix(GROUP_INDENT)
+        .filter(|row| !row.starts_with(' '))
+        .unwrap_or(rest)
+}
+
+/// The value rows of the frame: every form row whose label is a registry key.
 fn value_rows(frame: &str) -> Vec<&str> {
     body(frame)
         .into_iter()
-        .filter(|line| {
-            line.starts_with("  ")
-                && SettingKey::from_key(line.split_whitespace().next().unwrap_or("")).is_some()
-        })
+        .filter_map(row_text)
+        .filter(|line| SettingKey::from_key(line.split_whitespace().next().unwrap_or("")).is_some())
         .collect()
+}
+
+/// Whether the frame heads a group `name` (the kit form's heading row).
+fn has_heading(frame: &str, name: &str) -> bool {
+    body(frame)
+        .into_iter()
+        .filter_map(row_text)
+        .any(|line| line.trim_end() == name)
+}
+
+/// The text of the open editor's row for `key`: the focused row, its label the key, its value the
+/// field (MOD-115 M3: the field is on the row it edits, not in a pane under the tree).
+#[track_caller]
+fn field_of(frame: &str, key: SettingKey) -> String {
+    body(frame)
+        .into_iter()
+        .filter_map(|line| line.strip_prefix(GUTTER))
+        .find_map(|line| ungrouped(line).strip_prefix(key.key()))
+        .map(|rest| rest.trim().to_owned())
+        .unwrap_or_else(|| panic!("no open field for `{key}`: {frame}"))
+}
+
+/// The frame as one line of words: a help line wraps under its row, so a sentence is asserted
+/// across the wrap.
+fn flat(frame: &str) -> String {
+    body(frame)
+        .into_iter()
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The body lines from the focused row on: the row, then what the form put under it.
+#[track_caller]
+fn from_focus(frame: &str) -> Vec<&str> {
+    let lines = body(frame);
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with(GUTTER))
+        .unwrap_or_else(|| panic!("no focused row: {frame}"));
+    lines[at..].to_vec()
 }
 
 /// The row of one key, or a panic naming the frame that has none.
@@ -907,7 +970,7 @@ async fn the_demo_snapshot_renders_the_tree() {
         "the strip carries the fourth section: {frame}"
     );
     assert!(
-        body(&frame).iter().any(|line| line.trim_end() == "app"),
+        has_heading(&frame, "app"),
         "the `App` group is headed: {frame}"
     );
     assert!(
@@ -922,19 +985,24 @@ async fn the_demo_snapshot_renders_the_tree() {
             "`{key}` holds nothing on a fresh MemStore: {row}"
         );
         assert!(
-            row.contains("(app_setting_default)"),
-            "so the compiled table answers for it: {row}"
+            row.contains("(default)"),
+            "so the compiled table answers for it, named in words (MOD-83): {row}"
         );
         let expected = DEFAULTS.value_of(key).to_string();
+        // The reserve reads in percent with its fraction beside it (MOD-83).
         assert!(
-            row.contains(&format!("| {expected}")),
+            row.contains(&format!("| {expected}")) || row.contains(&format!("% ({expected})")),
             "`{key}` shows the number the reader would use ({expected}): {row}"
         );
     }
 
     assert!(
-        row_of(&frame, SettingKey::UpstreamHops, 1).contains("unset | 2 (app_setting_default)"),
+        row_of(&frame, SettingKey::UpstreamHops, 1).contains("unset | 2 (default)"),
         "the project's hops are genuinely unset: {frame}"
+    );
+    assert!(
+        !frame.contains("app_setting"),
+        "no rung is named by its enum value (MOD-83): {frame}"
     );
     assert!(
         row_of(&frame, SettingKey::TokenBudget, 1).contains("120000 | 120000 (project)"),
@@ -959,10 +1027,7 @@ async fn no_workspace_lists_the_app_group_alone() {
     let mut harness = prompt_over(MemStore::new()).await;
     let frame = harness.render();
 
-    assert!(
-        body(&frame).iter().any(|line| line.trim_end() == "app"),
-        "{frame}"
-    );
+    assert!(has_heading(&frame, "app"), "{frame}");
     assert!(
         !frame.contains("project "),
         "no project rung is listed: {frame}"
@@ -1012,6 +1077,10 @@ async fn offline_is_unavailable_with_the_worker_sentence() {
         "a refused read says what is missing: {frame}"
     );
     assert!(frame.contains(DATABASE_UNREACHABLE), "{frame}");
+    assert!(
+        frame.contains("r asks again once the store answers"),
+        "the refusal has a next step, through the reload key (MOD-83): {frame}"
+    );
 
     insta::assert_snapshot!("offline", frame);
 }
@@ -1365,7 +1434,15 @@ async fn a_stale_reply_keeps_the_text_and_retakes_the_token() {
 
     assert!(section.captures_input(), "the editor is still open");
     let frame = bench.render_section(&section, 100);
-    assert!(frame.contains("7000"), "the typed text survives: {frame}");
+    assert_eq!(
+        field_of(&frame, SettingKey::TokenBudget),
+        "7000",
+        "the typed text survives, on the row it edits: {frame}"
+    );
+    assert!(
+        flat(&frame).contains("now 6000 | 6000 (app setting) tokens"),
+        "and what the reload brought is under it: {frame}"
+    );
     assert!(
         frame.contains("changed elsewhere since you opened it"),
         "{frame}"
@@ -1543,8 +1620,9 @@ async fn the_seams_sentence_reaches_the_screen_with_nobody_writing_it_down() {
         "the section's own hint carries the store's range refusal, in the error colour: \
          {inside:?}\n{frame}"
     );
-    assert!(
-        frame.contains("token_budget: 0"),
+    assert_eq!(
+        field_of(&frame, SettingKey::TokenBudget),
+        "0",
         "the editor is still open over the text that was refused: {frame}"
     );
 }
@@ -1566,8 +1644,9 @@ async fn a_second_write_while_one_is_in_flight_is_refused() {
     assert!(
         errors
             .iter()
-            .any(|line| line.contains("`set_setting` is still in flight")),
-        "{errors:?}"
+            .any(|line| line
+                .contains("still saving the setting \u{2014} wait for the store's answer")),
+        "the write is named in words, not by its request name (MOD-83): {errors:?}"
     );
 }
 
@@ -1586,7 +1665,7 @@ async fn a_project_row_flips_to_project_and_back() {
             SettingKey::UpstreamHops,
             1
         )
-        .contains("unset | 2 (app_setting_default)")
+        .contains("unset | 2 (default)")
     );
 
     let seeded = applied(
@@ -1618,7 +1697,7 @@ async fn a_project_row_flips_to_project_and_back() {
             SettingKey::UpstreamHops,
             1
         )
-        .contains("unset | 2 (app_setting_default)"),
+        .contains("unset | 2 (default)"),
         "cleared, the rung below answers again"
     );
 
@@ -1635,7 +1714,7 @@ async fn a_project_row_flips_to_project_and_back() {
             SettingKey::TokenBudget,
             1
         )
-        .contains("unset | 120000 (app_setting_default)"),
+        .contains("unset | 120000 (default)"),
         "{}",
         bench.render_section(&section, 100)
     );
@@ -1682,7 +1761,7 @@ async fn a_head_above_the_cap_renders_the_clamp_line() {
 
     let frame = bench.render_section(&section, 100);
     assert!(
-        row_of(&frame, SettingKey::ExcerptHeadLines, 0).contains("50 | 10 (app_setting)"),
+        row_of(&frame, SettingKey::ExcerptHeadLines, 0).contains("50 | 10 (app setting)"),
         "{frame}"
     );
     assert!(
@@ -1721,15 +1800,23 @@ async fn the_fraction_row_renders_both_units_and_round_trips() {
     let frame = bench.render_section(&section, 100);
     assert!(
         row_of(&frame, SettingKey::PromptReserveFraction, 0)
-            .contains("0.1 | 0.1 (1000 bp) (app_setting)"),
+            .contains("0.1 | 10% (0.1) (app setting) fraction"),
+        "{frame}"
+    );
+
+    // Browsing, the focused row's help writes the range in percent and keeps the basis points
+    // the store's refusals are phrased in (maintainer answer 2026-10-21, item 2).
+    assert!(
+        flat(&frame).contains("range 0\u{2013}50% (0..=5000 bp) \u{b7} typed as a fraction"),
         "{frame}"
     );
 
     bench.key(&mut section, "e");
     let frame = bench.render_section(&section, 100);
-    assert!(
-        frame.contains("prompt_reserve_fraction: 0.1"),
-        "the field opens on the stored text: {frame}"
+    assert_eq!(
+        field_of(&frame, SettingKey::PromptReserveFraction),
+        "0.1",
+        "the field opens on the stored text, on its own row: {frame}"
     );
     insta::assert_snapshot!("editor_fraction", frame);
 
@@ -1756,15 +1843,35 @@ async fn the_pane_prints_doc_range_and_rungs() {
 
     let frame = bench.render_section(&section, 100);
     let spec = SettingKey::TokenBudget.spec();
+    let doc = spec.doc.split(';').next().unwrap_or(spec.doc);
+    assert!(frame.contains(doc), "the registry's doc line: {frame}");
+    let flat = flat(&frame);
     assert!(
-        frame.contains(spec.doc.split(';').next().unwrap_or(spec.doc)),
-        "the registry's doc line: {frame}"
-    );
-    assert!(
-        frame.contains("range 1..=9223372036854775807 tokens"),
+        flat.contains("range 1..=9223372036854775807 tokens"),
         "{frame}"
     );
-    assert!(frame.contains("rungs app|project|phase"), "{frame}");
+    assert!(flat.contains("rungs app|project|phase"), "{frame}");
+    // RV2 L7 (the maintainer's answer): the phase rung's cap in plain words, never the column
+    // type or a Rust constant.
+    assert!(
+        flat.contains("the phase rung holds up to 2147483647"),
+        "{frame}"
+    );
+    assert!(
+        !flat.contains("INTEGER") && !flat.contains("i32::MAX"),
+        "{frame}"
+    );
+
+    // MOD-115 M3 D3: the help is on the line under the row it is about, not under the tree.
+    let under = from_focus(&frame);
+    assert!(
+        under[0].starts_with(&format!(
+            "{GUTTER}{GROUP_INDENT}{}",
+            SettingKey::TokenBudget.key()
+        )),
+        "{frame}"
+    );
+    assert!(under[1].trim_start().starts_with(doc), "{frame}");
 }
 
 /// D276: a switch has no numeric range to print, so its pane says what it takes and where.
@@ -1774,7 +1881,10 @@ async fn the_switch_pane_says_on_or_off_and_the_project_rung() {
     move_to(&bench, &mut section, project_row(SettingKey::BoxHostname));
 
     let frame = bench.render_section(&section, 100);
-    assert!(frame.contains("on or off \u{b7} rungs project"), "{frame}");
+    assert!(
+        flat(&frame).contains("on or off \u{b7} rungs project"),
+        "{frame}"
+    );
     assert!(!frame.contains("range "), "no numeric range: {frame}");
     assert!(!frame.contains("clamped to"), "no clamp line: {frame}");
 }
@@ -1792,8 +1902,9 @@ async fn l_is_a_letter_while_editing() {
 
     assert_eq!(bench.key(&mut section, "l"), Handled::Consumed);
     let frame = bench.render_section(&section, 100);
-    assert!(
-        frame.contains("token_budget: l"),
+    assert_eq!(
+        field_of(&frame, SettingKey::TokenBudget),
+        "l",
         "`l` went into the field, not to the strip: {frame}"
     );
     assert!(bench.drained().is_empty(), "typing asks the store nothing");
@@ -1948,4 +2059,363 @@ async fn q_quits_from_browse() {
         harness.app().should_quit,
         "Browse binds no `q`, so the global binding takes it"
     );
+}
+
+// -------------------------------------------------------------------------------------------
+// MOD-115 M3 (lane L-prompt): the section on the kit. The tree is a `kit::form` of read-only
+// rows under group headings, the open editor is the row it edits with the registry's help under
+// it, the notices are `kit::text` lines and the refusals `kit::empty` next steps; every hint and
+// every sentence that names a key reads it from the keys in force.
+// -------------------------------------------------------------------------------------------
+
+/// `field.submit` and `field.cancel` moved (MOD-115 M3 C6): the editor's `Enter` and `Esc`.
+const FIELD_REBOUND: &str = "version = 2\n[field]\nsubmit = [\"ctrl-t\"]\ncancel = [\"ctrl-o\"]\n";
+
+/// `keys` loaded, or a panic naming the file.
+fn rebound(file: &str) -> htui::keys::Keys {
+    htui::keys::load_str(file).expect("the key file loads")
+}
+
+/// The editor's hint names the field's own keys through the editor's stack (MD-A, C6): `Enter
+/// save · Esc cancel` under the compiled keys, the rebound chords once `[field]` moves them.
+#[tokio::test]
+async fn the_editor_hint_names_the_field_keys_in_force() {
+    let (bench, mut section, _) = bench_with(&demo()).await;
+    move_to(&bench, &mut section, app_row(SettingKey::TokenBudget));
+    bench.key(&mut section, "e");
+    assert_eq!(
+        bench.key_hint(&section),
+        "Enter save \u{b7} Esc cancel \u{b7} empty clears"
+    );
+
+    let bench = bench.with_keys(rebound(FIELD_REBOUND));
+    let hint = bench.key_hint(&section);
+    assert_eq!(hint, "Ctrl+t save \u{b7} Ctrl+o cancel \u{b7} empty clears");
+}
+
+/// A compare-and-set miss under an open editor names the key that retries as the editor's stack
+/// binds it (MD-A, D-5): `Enter` under the compiled keys, the rebound chord otherwise.
+#[tokio::test]
+async fn a_stale_reply_names_the_retry_key_in_force() {
+    let (bench, mut section, snapshot) = bench_with(&demo()).await;
+    let bench = bench.with_keys(rebound(FIELD_REBOUND));
+    move_to(&bench, &mut section, app_row(SettingKey::TokenBudget));
+    bench.key(&mut section, "e");
+    type_at(&bench, &mut section, "4000");
+    let _ = bench.drained();
+
+    bench.reply(
+        &mut section,
+        &StoreReply::PromptSettingsStale(Box::new(snapshot)),
+    );
+
+    let flagged = error_text(&bench, &section, 100);
+    assert!(
+        flagged.iter().any(|line| line
+            == "changed elsewhere since you opened it \u{2014} reloaded; Ctrl+t retries against \
+                the current row"),
+        "{flagged:?}"
+    );
+}
+
+/// MOD-115 M3 D3 (MOD-85): the focused row is the form's marker, a gutter in the tab's accent and
+/// a band, never a whole row in `theme.selected`; an open editor bands its label alone, so the
+/// field's cursor stays visible.
+#[tokio::test]
+async fn the_cursor_row_is_the_forms_marker() {
+    let (bench, mut section, _) = bench_with(&demo()).await;
+    move_to(&bench, &mut section, app_row(SettingKey::TokenBudget));
+    let frame = bench.render_section(&section, 100);
+    let focused: Vec<&str> = body(&frame)
+        .into_iter()
+        .filter(|line| line.starts_with(GUTTER))
+        .collect();
+    assert_eq!(focused.len(), 1, "one marked row: {frame}");
+    assert!(
+        focused[0].starts_with(&format!(
+            "{GUTTER}{GROUP_INDENT}{}",
+            SettingKey::TokenBudget.key()
+        )),
+        "{frame}"
+    );
+
+    let buffer = drawn(&bench, &section, 100);
+    let y = (0..buffer.area.height)
+        .find(|y| buffer[(0, *y)].symbol() == GUTTER.to_string())
+        .expect("the marked row");
+    let accent = bench.ctx().accent();
+    assert_eq!(buffer[(0, y)].fg, accent.fg.unwrap_or(Color::Reset));
+    let selected = bench.ctx().theme.selected.bg;
+    assert_ne!(
+        Some(buffer[(0, y)].bg),
+        selected,
+        "the gutter is not banded"
+    );
+    assert!(
+        (1..buffer.area.width).all(|x| Some(buffer[(x, y)].bg) == selected),
+        "the band runs the rest of the row"
+    );
+}
+
+/// MOD-85, while editing: the gutter keeps the tab's accent and only the label column is banded,
+/// so the field's cursor is not lost in the band.
+#[tokio::test]
+async fn an_open_editor_bands_its_label_alone() {
+    let (bench, mut section, _) = bench_with(&demo()).await;
+    move_to(&bench, &mut section, app_row(SettingKey::TokenBudget));
+    bench.key(&mut section, "e");
+    clear_field(&bench, &mut section);
+    type_at(&bench, &mut section, "4000");
+
+    let buffer = drawn(&bench, &section, 100);
+    let rows: Vec<u16> = (0..buffer.area.height)
+        .filter(|y| buffer[(0, *y)].symbol() == GUTTER.to_string())
+        .collect();
+    let [y] = rows.as_slice() else {
+        panic!("one marked row, got {rows:?}");
+    };
+    let text: String = (1..buffer.area.width)
+        .map(|x| buffer[(x, *y)].symbol())
+        .collect();
+    let key = SettingKey::TokenBudget.key();
+    assert!(ungrouped(&text).starts_with(key), "{text}");
+    let accent = bench.ctx().accent();
+    assert_eq!(buffer[(0, *y)].fg, accent.fg.unwrap_or(Color::Reset));
+    let selected = bench.ctx().theme.selected.bg;
+    let banded = |x: u16| Some(buffer[(x, *y)].bg) == selected;
+    // The group's indent is the label's (RV2 L4): banded with it.
+    let label = u16::try_from(GROUP_INDENT.len() + key.len()).expect("fits");
+    assert!((1..=label).all(banded), "the label is banded: {text}");
+    let value = u16::try_from(text.find("4000").expect("the typed value")).expect("fits") + 1;
+    assert!(
+        (value..value + 4).all(|x| !banded(x)),
+        "the typed value is not: {text}"
+    );
+    assert!(!banded(buffer.area.width - 1));
+}
+
+/// MOD-83: the fraction key reads in percent with the fraction it is typed as beside it, its
+/// unit column says `fraction`, and no row anywhere says `bp` (the help keeps the basis points the
+/// store's refusals are phrased in).
+#[tokio::test]
+async fn the_reserve_reads_in_percent_and_is_typed_as_a_fraction() {
+    let (bench, section, _) = bench_with(&demo()).await;
+    let frame = bench.render_section(&section, 100);
+    let row = row_of(&frame, SettingKey::PromptReserveFraction, 0);
+    assert!(
+        row.trim_end()
+            .ends_with("unset | 10% (0.1) (default) fraction"),
+        "{row}"
+    );
+    assert!(
+        value_rows(&frame).iter().all(|row| !row.contains(" bp")),
+        "{frame}"
+    );
+}
+
+/// D13 under the kit: the clamp is an error under the row it concerns, so it stays on screen
+/// whatever the cursor is on.
+#[tokio::test]
+async fn a_clamp_stays_under_its_row_whatever_has_focus() {
+    let backend = demo();
+    let _ = applied(
+        &backend,
+        set_app(SettingKey::ExcerptHeadLines, json!(50), None),
+    )
+    .await;
+    let seeded = applied(
+        &backend,
+        set_app(SettingKey::ExcerptFileLineCap, json!(10), None),
+    )
+    .await;
+    let (bench, section) = bench_from(&seeded).await;
+
+    let frame = bench.render_section(&section, 100);
+    let lines = body(&frame);
+    let at = lines
+        .iter()
+        .position(|line| row_text(line).is_some_and(|row| row.starts_with("excerpt_head_lines")))
+        .expect("the head row");
+    assert!(
+        lines[at + 1]
+            .trim()
+            .starts_with("clamped to excerpt_file_line_cap = 10"),
+        "{frame}"
+    );
+    assert!(
+        error_text(&bench, &section, 100)
+            .iter()
+            .any(|line| line.contains("clamped to excerpt_file_line_cap = 10")),
+        "still something to act on"
+    );
+}
+
+/// A write in flight reads in words on the hint row as well (MOD-83: no request name on screen).
+#[tokio::test]
+async fn a_write_in_flight_is_named_in_words_on_the_hint() {
+    let (bench, mut section, _) = bench_with(&demo()).await;
+    move_to(&bench, &mut section, app_row(SettingKey::TokenBudget));
+    bench.key(&mut section, "e");
+    type_at(&bench, &mut section, "4000");
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+    bench.key(&mut section, "esc");
+
+    let hint = bench.key_hint(&section);
+    assert_eq!(
+        hint,
+        "j/k \u{b7} e edit \u{b7} r reload \u{b7} saving the setting\u{2026}"
+    );
+}
+
+/// Nothing read yet is an empty state with its next step (MOD-83), through the reload key.
+#[tokio::test]
+async fn nothing_read_yet_says_how_to_read() {
+    let bench = SectionBench::new().await;
+    let section = PromptSection::new();
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("settings not read yet"), "{frame}");
+    assert!(frame.contains("r reads the settings again"), "{frame}");
+}
+
+/// MOD-115 M3 D-11, RV1 M2: the section reports its scroll against the rows the tree is drawn
+/// into, and keeps the cursor and its help on screen in a short pane.
+#[tokio::test]
+async fn the_section_scrolls_its_cursor_and_help_into_view() {
+    let (bench, mut section, _) = bench_with(&demo()).await;
+    let rows = SettingKey::app_keys().count() + project_keys().count() + 2;
+    let _ = drawn(&bench, &section, 100);
+    let (total, offset) = section
+        .scroll()
+        .map(|span| (span.total, span.offset))
+        .expect("a tree scrolls");
+    assert_eq!(offset, 0);
+    assert_eq!(
+        total, rows,
+        "the tree alone: the notice line under it is not padded in"
+    );
+    let tree = section
+        .scroll()
+        .and_then(|span| span.rows)
+        .expect("the tree's rows");
+    assert!(tree.height > 0, "{tree:?}");
+
+    move_to(&bench, &mut section, rows - 1);
+    let area = Rect::new(0, 0, 100, 8);
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(100, 8),
+        TerminalOptions {
+            viewport: Viewport::Fixed(area),
+        },
+    )
+    .expect("a test terminal");
+    let ctx = bench.ctx();
+    terminal
+        .draw(|frame| section.render(frame, frame.area(), &ctx))
+        .expect("the section draws");
+    let buffer = terminal.backend().buffer().clone();
+    let text: Vec<String> = (0..8)
+        .map(|y| (0..100).map(|x| buffer[(x, y)].symbol()).collect())
+        .collect();
+    let at = text
+        .iter()
+        .position(|line| line.starts_with(GUTTER))
+        .unwrap_or_else(|| panic!("the cursor is on screen: {text:#?}"));
+    assert!(
+        text[at].contains(SettingKey::TokenBudget.key()),
+        "{text:#?}"
+    );
+    assert!(at + 1 < 7, "its help is on screen too: {text:#?}");
+    let (_, offset) = section
+        .scroll()
+        .map(|span| (span.total, span.offset))
+        .expect("a tree scrolls");
+    assert!(offset > 0, "scrolled: {text:#?}");
+}
+
+/// MOD-81: the section at 80 columns, through the shell. The value rows fit the pane instead of
+/// being cut at its right edge, so every row ends with its unit.
+#[tokio::test]
+async fn the_section_at_80_columns() {
+    let mut harness = Harness::over(MemStore::demo())
+        .size(80, 24)
+        .with_tab(Box::new(SettingsTab::with_sections(vec![
+            Box::new(AgentsSection::new()),
+            Box::new(HierarchySection::new()),
+            Box::new(KindsSection::new()),
+            Box::new(PromptSection::new()),
+        ])));
+    harness.settle().await;
+    harness.key("l");
+    harness.key("l");
+    harness.key("l");
+    harness.settle().await;
+    let frame = harness.render();
+
+    let units = [
+        "lines", "bytes", "files", "ms", "tokens", "fraction", "hops", "on/off",
+    ];
+    let rows: Vec<&str> = body(&frame)
+        .into_iter()
+        .filter_map(row_text)
+        .filter(|row| row.contains(" | "))
+        .collect();
+    assert_eq!(
+        rows.len(),
+        SettingKey::app_keys().count() + project_keys().count(),
+        "{frame}"
+    );
+    for row in rows {
+        assert!(
+            units.iter().any(|unit| row.trim_end().ends_with(unit)),
+            "the row reaches its unit: {row}\n{frame}"
+        );
+    }
+    insta::assert_snapshot!("demo_80", frame);
+
+    // A key wider than the label column (a third of the width) is cut there, and named whole in
+    // the help under it once it is focused.
+    let key = SettingKey::ExcerptProviderDeadlineMs;
+    assert!(!frame.contains(key.key()), "cut at 80 columns: {frame}");
+    for _ in 0..app_row(key) {
+        harness.key("j");
+    }
+    let frame = harness.render();
+    assert!(
+        from_focus(&frame)[1].trim_start().starts_with(key.key()),
+        "{frame}"
+    );
+}
+
+/// MOD-115 M3 RV2 L4: each group's rows sit two cells in from its heading, so the two
+/// `token_budget` rows read as the app's and the project's rather than one list's.
+#[tokio::test]
+async fn the_rows_are_indented_under_their_group() {
+    let (bench, section, _) = bench_with(&demo()).await;
+    let frame = bench.render_section(&section, 100);
+    let lines: Vec<&str> = frame.lines().map(after_gutter).collect();
+    let at = |prefix: &str| {
+        lines
+            .iter()
+            .position(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("a line at `{prefix}`: {frame}"))
+    };
+    assert!(lines[at("app") + 1].starts_with("  excerpt_"), "{frame}");
+    assert!(lines[at("project ") + 1].starts_with("  "), "{frame}");
+    let budgets: Vec<&&str> = lines
+        .iter()
+        .filter(|line| line.trim_start().starts_with("token_budget"))
+        .collect();
+    assert_eq!(budgets.len(), 2, "{frame}");
+    assert!(
+        budgets
+            .iter()
+            .all(|line| line.starts_with("  token_budget")),
+        "{frame}"
+    );
+}
+
+/// `line` past its first cell, the form's gutter.
+fn after_gutter(line: &str) -> &str {
+    line.char_indices().nth(1).map_or("", |(at, _)| &line[at..])
 }

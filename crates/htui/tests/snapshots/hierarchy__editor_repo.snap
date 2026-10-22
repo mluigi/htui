@@ -3,10 +3,9 @@ source: crates/htui/tests/hierarchy.rs
 expression: frame
 ---
 Graphics   ¹Settings           0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
-┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
-│ Agents  Hierarchy                                                                                │
-│Graphics (graphics) — root on this box: unset                                                     │
-│  vulkan-tutorials  Vulkan Tutorials                                                              │
+╭─ Hierarchy ─────────────────────────────────────────────────────────────────── Agents  Hierarchy ╮
+│ Graphics (graphics) — root on this box: unset                                                    │
+│▌  vulkan-tutorials  Vulkan Tutorials                                                             │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -26,9 +25,10 @@ Graphics   ¹Settings           0 working · 0 waiting · memory · DESKTOP-HTUI
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-│name          : l                                                                                 │
-│remote_url    :                                                                                   │
-│default_branch: main                                                                              │
-│primary (y/n) : y                                                                                 │
 │                                                                                                  │
-└─Tab/Shift+Tab field · Enter save · Esc cancel────────────────────────────────────────────────────┘
+│▌name             l                                                                               │
+│ remote url                                                                                       │
+│ default branch   main                                                                            │
+│ primary (y/n)    y                                                                               │
+│                                                                                                  │
+╰─Tab/Shift+Tab field · Enter save · Esc cancel────────────────────────────────────────────────────╯

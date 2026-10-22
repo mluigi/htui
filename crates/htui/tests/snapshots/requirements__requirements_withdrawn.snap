@@ -3,15 +3,15 @@ source: crates/htui/tests/requirements.rs
 expression: frame
 ---
 Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       1 waiting ·  F9  about   ?  keys
-┌ Requirements (3) ─────────────────────────┐┌ R-ENT-2 ────────────────────────────────────────────┐
-│▾ htui (3)                                 ││An item may carry a free-form priority.              │
-│  ▾ ENT Entity model (2)                   ││                                                     │
-│    R-ENT-1  must   Every item has a stabl…││later · withdrawn · v2                               │
-│  ✕ R-ENT-2  later  An item may carry a fr…││                                                     │
-│  ▾ STO Storage (1)                        ││Coverage                                             │
-│    R-STO-1  must   Postgres is the source…││ANA-2  withdraws v2  open  —                         │
-│▾ agy (0)                                  ││                                                     │
-│  no areas                                 ││Revisions                                            │
+╭─ Requirements (3) ────────────────────────╮╭─ R-ENT-2 ───────────────────────────────────────────╮
+│ ▾ htui (3)                                ││An item may carry a free-form priority.              │
+│   ▾ ENT Entity model (2)                  ││                                                     │
+│     R-ENT-1  must   Every item has a stab…││later · ✕ withdrawn · v2                             │
+│▌  ✕ R-ENT-2  later  An item may carry a f…││                                                     │
+│   ▾ STO Storage (1)                       ││Coverage                                             │
+│     R-STO-1  must   Postgres is the sourc…││ANA-2  withdraws v2  ○ open  —                       │
+│ ▾ agy (0)                                 ││                                                     │
+│   no areas                                ││Revisions                                            │
 │                                           ││v1   created                MM-DD hh:mm              │
 │                                           ││v2   withdrawn by ANA-2     MM-DD hh:mm              │
 │                                           ││                                                     │
@@ -29,5 +29,6 @@ Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       1 wai
 │                                           ││                                                     │
 │                                           ││                                                     │
 │                                           ││                                                     │
-└─j/k move · Enter fold · / filter · a area · n new · e amend · W withdraw · r reload──────────────┘
+│                                           ││                                                     │
+╰─a area · n new · e amend · W withdraw · …─╯╰─────────────────────────────────────────────────────╯
  withdrew R-ENT-2

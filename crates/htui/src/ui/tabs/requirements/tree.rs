@@ -5,6 +5,10 @@
 //! snapshot, the scope's projects, the folded set and the filter every time it is needed, so a
 //! reply, a fold or a keystroke in the filter can never leave a stale index behind. The cursor is a
 //! [`Row`] (an id), not an index.
+//!
+//! MOD-115 M3 D6: the tree draws through `kit::list`. A project header and an area header are
+//! group rows (their own lines, since `list::group_row`'s fixed format has no indent or tail), a
+//! requirement is an item and `no areas` a note; the kit puts the gutter, the band and the `…`.
 
 use htui_core::model::{
     ProjectId, ProjectRef, Requirement, RequirementArea, RequirementAreaId, RequirementId,
@@ -16,6 +20,8 @@ use ratatui::text::{Line, Span};
 use crate::requirements::{ProjectRequirements, RequirementsSnapshot, matches_filter};
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width};
+use crate::ui::kit::label;
+use crate::ui::kit::list::{self, RowKind};
 
 /// Two spaces between the columns of a requirement row.
 const GAP: usize = 2;
@@ -180,13 +186,14 @@ pub(super) fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or_default()
 }
 
-/// One line per visible row, `width` columns wide, and the index of the cursor's line. A project
-/// with no area draws a dim `no areas` line that is not a row.
+/// One `kit::list` row per visible row, at most `width` cells (the list's content, the gutter
+/// not counted), and the index of the cursor's row. A project with no area draws a dim
+/// `no areas` note that is not a row.
 pub(super) fn lines(
     view: &TreeView<'_>,
     width: usize,
     theme: &Theme,
-) -> (Vec<Line<'static>>, Option<usize>) {
+) -> (Vec<list::Row<'static>>, Option<usize>) {
     let groups = groups(view.snapshot, view.projects, view.filter);
     let key_width = groups
         .iter()
@@ -200,30 +207,29 @@ pub(super) fn lines(
 
     let mut out = Vec::new();
     let mut cursor = None;
-    let mut push = |line: Line<'static>, row: Row, out: &mut Vec<Line<'static>>| {
-        let selected = view.selected == Some(row);
-        if selected {
-            cursor = Some(out.len());
-        }
-        out.push(pad(line, width, selected, theme));
-    };
+    let mut push =
+        |line: Line<'static>, row: Row, kind: RowKind, out: &mut Vec<list::Row<'static>>| {
+            if view.selected == Some(row) {
+                cursor = Some(out.len());
+            }
+            out.push(fit(line, width, kind));
+        };
     for group in &groups {
         let id = group.project.project_id;
         let folded = view.folded.contains(&Fold::Project(id));
         push(
             project_header(group, folded, width, theme),
             Row::Project(id),
+            RowKind::Group { folded },
             &mut out,
         );
         if folded {
             continue;
         }
         if group.areas.is_empty() {
-            // Not a row, so `pad` never sees it: cut here (MOD-60 B4).
-            out.push(Line::styled(
-                cells::clip(&format!("{}no areas", " ".repeat(AREA_INDENT)), width),
-                theme.dim,
-            ));
+            // Not a row: a note the cursor never lands on (MOD-60 B4).
+            let line = Line::styled(format!("{}no areas", " ".repeat(AREA_INDENT)), theme.dim);
+            out.push(fit(line, width, RowKind::Note));
             continue;
         }
         for (area, requirements) in &group.areas {
@@ -239,6 +245,7 @@ pub(super) fn lines(
             push(
                 Line::from(Span::styled(text, theme.title)),
                 Row::Area(area.id),
+                RowKind::Group { folded },
                 &mut out,
             );
             if folded {
@@ -246,7 +253,12 @@ pub(super) fn lines(
             }
             for requirement in requirements {
                 let line = requirement_line(requirement, key_width, body_width, theme);
-                push(line, Row::Requirement(requirement.id), &mut out);
+                push(
+                    line,
+                    Row::Requirement(requirement.id),
+                    RowKind::Item,
+                    &mut out,
+                );
             }
         }
     }
@@ -256,7 +268,7 @@ pub(super) fn lines(
 /// `▾ htui (3) · read-only`, the name cut so the rest fits `width` cells (MOD-60 D7): the marker,
 /// the count and the tail are the information, the name is what gives way. When fewer than
 /// [`NAME_MIN`] cells of name would be left, the tail goes first; narrower still, the whole header
-/// is handed to [`pad`], which cuts it from the end.
+/// is handed to [`fit`], which cuts it from the end.
 fn project_header(group: &Group<'_>, folded: bool, width: usize, theme: &Theme) -> Line<'static> {
     let head = format!("{} ", marker(folded));
     let count = format!(" ({})", group.count());
@@ -313,7 +325,7 @@ fn requirement_line(
         Span::styled(cells::pad(&requirement.key, key_width), key_style),
         Span::styled(" ".repeat(GAP), style),
         Span::styled(
-            cells::pad(requirement.priority.as_str(), PRIORITY_WIDTH),
+            cells::pad(label::priority(requirement.priority), PRIORITY_WIDTH),
             style,
         ),
         Span::styled(" ".repeat(GAP), style),
@@ -329,14 +341,13 @@ const fn marker(folded: bool) -> char {
     if folded { '\u{25b8}' } else { '\u{25be}' }
 }
 
-/// The line cut to `width` cells (MOD-60 D7: `cells::clip_spans`, so a body row cuts its body),
-/// padded out to it so the selection covers the whole row.
-fn pad(line: Line<'static>, width: usize, selected: bool, theme: &Theme) -> Line<'static> {
-    let mut spans = cells::clip_spans(&line.spans, width);
-    let used: usize = spans.iter().map(|span| cell_width(&span.content)).sum();
-    spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
-    let line = Line::from(spans);
-    if selected { theme.select(line) } else { line }
+/// `line` as a `kit::list` row of `kind`, cut to `width` cells with `…` (MOD-60 D7, the kit's
+/// `ellipsize`, so a body row cuts its body). The kit pads the selected row into its band.
+fn fit(line: Line<'static>, width: usize, kind: RowKind) -> list::Row<'static> {
+    list::Row {
+        line: list::ellipsize(line, u16::try_from(width).unwrap_or(u16::MAX)),
+        kind,
+    }
 }
 
 #[cfg(test)]
@@ -345,14 +356,14 @@ mod tests {
     use crate::requirements::RequirementsSnapshot;
     use crate::ui::Theme;
     use crate::ui::cells::cell_width;
+    use crate::ui::kit::list::{self, RowKind};
     use crate::ui::tabs::requirements::tests::platform;
     use htui_core::fixtures::ids;
     use htui_core::model::{ProjectRef, RequirementAreaId, RequirementState};
-    use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use ratatui::style::Color;
     use ratatui::text::Line;
-    use ratatui::widgets::{Paragraph, Widget as _};
     use uuid::Uuid;
 
     /// A line's text, span after span.
@@ -405,7 +416,11 @@ mod tests {
             filter: "",
             selected: None,
         };
-        lines(&view, width, &Theme::default()).0
+        lines(&view, width, &Theme::default())
+            .0
+            .into_iter()
+            .map(|row| row.line)
+            .collect()
     }
 
     /// MOD-60 D7: the marker, the count and ` · read-only` are the information; the name is what
@@ -453,8 +468,8 @@ mod tests {
         );
         assert_eq!(
             line_text(&tree_lines(&snapshot, &projects, 20)[0]),
-            format!("\u{25be} {}\u{2026} (3) ", "\u{6f22}\u{5b57}".repeat(3)),
-            "19 cells of header, padded to the pane"
+            format!("\u{25be} {}\u{2026} (3)", "\u{6f22}\u{5b57}".repeat(3)),
+            "19 cells of header; the kit's band pads a selected row (MOD-115 M3)"
         );
     }
 
@@ -465,7 +480,7 @@ mod tests {
         set_maintainer(&mut snapshot, true);
         let lines = tree_lines(&snapshot, &projects, 20);
         let header = line_text(&lines[0]);
-        assert_eq!(cell_width(&header), 20, "{header:?}");
+        assert!(cell_width(&header) <= 20, "{header:?}");
         assert!(header.contains(" (3)"), "{header:?}");
         assert!(header.contains('\u{2026}'), "{header:?}");
         assert!(header.starts_with("\u{25be} "), "{header:?}");
@@ -614,7 +629,7 @@ mod tests {
 
     /// MOD-80 D2: a selected requirement row is one even block. The row is a withdrawn one, every
     /// span `dim` and so coloured, so a `Line::style` alone (which leaves a span's own `fg`
-    /// showing) fails here.
+    /// showing) fails here. MOD-115 M3 D6: the band and the gutter are `kit::list`'s.
     #[tokio::test]
     async fn a_selected_requirement_row_is_one_even_block() {
         let (mut snapshot, projects, _) = platform().await;
@@ -632,22 +647,63 @@ mod tests {
             filter: "",
             selected: Some(Row::Requirement(ids::REQ_ENT_2)),
         };
-        let (lines, cursor) = lines(&view, 45, &Theme::default());
+        let theme = Theme::default();
+        let (rows, cursor) = lines(&view, 45, &theme);
         let y = cursor.expect("R-ENT-2 is drawn");
         assert!(
-            line_text(&lines[y]).starts_with("  \u{2715} R-ENT-2"),
-            "the withdrawn row: {lines:#?}"
+            line_text(&rows[y].line).starts_with("  \u{2715} R-ENT-2"),
+            "the withdrawn row: {rows:#?}"
         );
-        let height = u16::try_from(lines.len()).expect("a short tree");
-        let area = Rect::new(0, 0, 45, height);
-        let mut buffer = Buffer::empty(area);
-        Paragraph::new(lines).render(area, &mut buffer);
+        assert_eq!(rows[y].kind, RowKind::Item);
+        let height = u16::try_from(rows.len()).expect("a short tree");
+        let mut terminal = Terminal::new(TestBackend::new(46, height)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                list::render(frame, frame.area(), &rows, cursor, 0, theme.accent, &theme);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
         let y = u16::try_from(y).expect("a short tree");
-        for x in 0..45 {
+        assert_eq!(buffer[(0, y)].symbol(), list::GUTTER);
+        for x in 1..46 {
             let cell = &buffer[(x, y)];
             assert_eq!(cell.fg, Color::Black, "x = {x}: {cell:?}");
             assert_eq!(cell.bg, Color::Cyan, "x = {x}: {cell:?}");
         }
+    }
+
+    /// MOD-115 M3 D6: the headers are `kit::list` group rows, folded or open, a requirement an
+    /// item, and `no areas` a note the cursor never lands on.
+    #[tokio::test]
+    async fn the_tree_is_kit_list_rows() {
+        let (snapshot, projects, _) = platform().await;
+        let view = TreeView {
+            snapshot: &snapshot,
+            projects: &projects,
+            folded: &[Fold::Area(ids::AREA_STO)],
+            filter: "",
+            selected: None,
+        };
+        let kinds: Vec<(String, RowKind)> = lines(&view, 45, &Theme::default())
+            .0
+            .into_iter()
+            .map(|row| (line_text(&row.line), row.kind))
+            .collect();
+        let kind_of = |needle: &str| {
+            kinds
+                .iter()
+                .find(|(text, _)| text.contains(needle))
+                .map(|(_, kind)| *kind)
+                .unwrap_or_else(|| panic!("{needle:?} is drawn: {kinds:#?}"))
+        };
+        assert_eq!(kind_of("htui (3)"), RowKind::Group { folded: false });
+        assert_eq!(
+            kind_of("ENT Entity model"),
+            RowKind::Group { folded: false }
+        );
+        assert_eq!(kind_of("STO Storage"), RowKind::Group { folded: true });
+        assert_eq!(kind_of("R-ENT-1"), RowKind::Item);
+        assert_eq!(kind_of("no areas"), RowKind::Note);
     }
 
     #[tokio::test]
@@ -668,7 +724,11 @@ mod tests {
             filter: "",
             selected: None,
         };
-        let (lines, _) = lines(&view, 45, &theme);
+        let lines: Vec<Line<'static>> = lines(&view, 45, &theme)
+            .0
+            .into_iter()
+            .map(|row| row.line)
+            .collect();
         let text = |line: &Line<'_>| {
             line.spans
                 .iter()

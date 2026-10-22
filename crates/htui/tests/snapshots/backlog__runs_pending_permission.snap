@@ -12,7 +12,7 @@ Platform   ¹Backlog    0 working · 2 waiting · memory · DESKTOP-HTUI ·  F9 
 │  FEAT-2   blocked            Agent driver and chat …││▸ 0.1   pending    prd              —     —│
 │  FEAT-3   in_progress        Postgres store and cac…││        —          claude/sonnet           │
 │  FIX-1    closed             Terminal left raw afte…││        asks: execute: cargo test          │
-│  TOOL-1   awaiting_approval  CI matrix for the thre…││answer  [1] Allow once  [2] Reject once    │
+│  TOOL-1   awaiting_approval  CI matrix for the thre…││answer   1  Allow once   2  Reject once    │
 │▾ agy (3)                                            ││                                           │
 │  ANA-1    done               Prompt assembly survey ││                                           │
 │  FEAT-1   open               ACP transport upgrade  ││                                           │

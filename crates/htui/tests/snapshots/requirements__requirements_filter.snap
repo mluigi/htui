@@ -3,15 +3,15 @@ source: crates/htui/tests/requirements.rs
 expression: frame
 ---
 Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       1 waiting ·  F9  about   ?  keys
-┌ Requirements (1) · /STO ──────────────────┐┌ R-STO-1 ────────────────────────────────────────────┐
-│▾ htui (1)                                 ││Postgres is the source of truth; the cache is a      │
-│  ▾ STO Storage (1)                        ││read-only mirror.                                    │
-│    R-STO-1  must   Postgres is the source…││                                                     │
-│                                           ││must · active · v1                                   │
+╭─ Requirements (1) ────────────────────────╮╭─ R-STO-1 ───────────────────────────────────────────╮
+│ / STO                               1 of 3││Postgres is the source of truth; the cache is a      │
+│ ▾ htui (1)                                ││read-only mirror.                                    │
+│   ▾ STO Storage (1)                       ││                                                     │
+│▌    R-STO-1  must   Postgres is the sourc…││must · ● active · v1                                 │
 │                                           ││                                                     │
 │                                           ││Coverage                                             │
-│                                           ││FEAT-1  addresses v1  in_progress  —                 │
-│                                           ││FIX-1   addresses v1  closed       done              │
+│                                           ││FEAT-1  addresses v1  ◐ running  —                   │
+│                                           ││FIX-1   addresses v1  ✓ closed   done                │
 │                                           ││                                                     │
 │                                           ││Revisions                                            │
 │                                           ││v1   created                09-03 12:00              │
@@ -29,4 +29,5 @@ Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       1 wai
 │                                           ││                                                     │
 │                                           ││                                                     │
 │                                           ││                                                     │
-└─j/k move · Enter fold · / filter · a area · n new · e amend · W withdraw · r reload──────────────┘
+│                                           ││                                                     │
+╰─a area · n new · e amend · W withdraw · …─╯╰─────────────────────────────────────────────────────╯

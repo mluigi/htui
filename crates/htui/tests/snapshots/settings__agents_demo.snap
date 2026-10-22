@@ -3,12 +3,11 @@ source: crates/htui/tests/settings.rs
 expression: frame
 ---
 Graphics   ¹Settings            0 working · 0 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
-┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
-│ Agents                                                                                           │
-│name       transport billing      models default               enabled quota         on this box  │
-│agy        acp       subscription 11     gemini-3.7-flash-high yes     —             not probed   │
-│claude     acp       subscription 0      —                     yes     —             not probed   │
-│claude-cli cli       subscription 0      —                     yes     —             not probed   │
+╭─ Agents ───────────────────────────────────────────────────────────────────────────────── Agents ╮
+│ name       transport billing      models default              enabled quota         on this box  │
+│▌agy        ACP       subscription 11     gemini-3.7-flash-high ● on   —             not probed   │
+│ claude     ACP       subscription 0      —                     ● on   —             not probed   │
+│ claude-cli CLI       subscription 0      —                     ● on   —             not probed   │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -30,5 +29,6 @@ Graphics   ¹Settings            0 working · 0 waiting · memory · DESKTOP-HTU
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-│quota latches per chat, r cannot refresh it                                                       │
-└─j/k select · n new · e edit · m paths · t this box · r probe · i install · a authenticate────────┘
+│                                                                                                  │
+│ quota latches per chat, r cannot refresh it                                                      │
+╰─j/k select · n new · e edit · m paths · t this box · r probe · i install · a authenticate────────╯

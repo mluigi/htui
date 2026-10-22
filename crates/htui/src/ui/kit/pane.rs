@@ -3,8 +3,14 @@
 //! A focused pane's border takes the tab accent, any other the faint border role. The title sits
 //! on the top border after the corner, the sub-tab chips flush with the right corner, the hints
 //! on the bottom border two cells in; none of them ever overwrites a corner. When the pane is
-//! narrow the title is clipped first, then whole chips are dropped from the right, then the hints
-//! are clipped (always with an ellipsis, via `cells::clip_line`).
+//! narrow the title is clipped first, and gives way entirely once any chip is cut off (MOD-115
+//! M3 D-10). The strip then keeps the active chip and marks the chips cut off with `‹`/`›`
+//! ([`chip_strip`]), and the hints are clipped (always with an ellipsis, via
+//! `cells::clip_line`).
+//!
+//! A view that needs a number only its content knows (a scrollbar's total) draws its content
+//! into [`Pane::inner`] first and the pane after it: the frame touches border cells only
+//! (MOD-115 M3 C3). [`Pane::scrollbar_span`] keeps the scrollbar beside some rows only.
 //!
 //! Every style is a [`Theme`] role, so the monochrome theme keeps focus visible: a focused border
 //! is bold, an unfocused one dim.
@@ -43,13 +49,14 @@ pub enum Focus {
 #[derive(Debug, Clone)]
 pub struct Pane<'a> {
     title: &'a str,
-    sub_tabs: Vec<&'a str>,
+    sub_tabs: &'a [&'a str],
     active: usize,
     hints: Option<Line<'a>>,
     note: Option<Line<'a>>,
     focus: Focus,
     accent: Option<Style>,
     scrollbar: Option<(usize, usize)>,
+    span: Option<Rect>,
 }
 
 impl<'a> Pane<'a> {
@@ -58,20 +65,21 @@ impl<'a> Pane<'a> {
     pub fn new(title: &'a str) -> Self {
         Self {
             title,
-            sub_tabs: Vec::new(),
+            sub_tabs: &[],
             active: 0,
             hints: None,
             note: None,
             focus: Focus::Unfocused,
             accent: None,
             scrollbar: None,
+            span: None,
         }
     }
 
     /// Sub-tab chips on the top border, `active` being the current one.
     #[must_use]
-    pub fn sub_tabs(mut self, titles: &[&'a str], active: usize) -> Self {
-        self.sub_tabs = titles.to_vec();
+    pub fn sub_tabs(mut self, titles: &'a [&'a str], active: usize) -> Self {
+        self.sub_tabs = titles;
         self.active = active;
         self
     }
@@ -113,8 +121,37 @@ impl<'a> Pane<'a> {
         self
     }
 
+    /// Keeps the scrollbar beside the rows of `rows` only (Chat's transcript, between its banner
+    /// and its composer), measured against their height. `rows` is an absolute rect, the one the
+    /// scrolled content was drawn into; it is cut to the inner rect, so a rect past it loses the
+    /// rows it does not share. The default is the whole inner rect.
+    #[must_use]
+    pub fn scrollbar_span(mut self, rows: Rect) -> Self {
+        self.span = Some(rows);
+        self
+    }
+
+    /// [`scrollbar`](Self::scrollbar) and, when the span names its rows,
+    /// [`scrollbar_span`](Self::scrollbar_span), from one [`ScrollSpan`].
+    #[must_use]
+    pub fn scroll(self, span: ScrollSpan) -> Self {
+        let pane = self.scrollbar(span.total, span.offset);
+        match span.rows {
+            Some(rows) => pane.scrollbar_span(rows),
+            None => pane,
+        }
+    }
+
+    /// The inner rect a pane drawn into `area` gives its content, without drawing it: what
+    /// [`Pane::render`] returns. Content drawn there before the pane survives it (MOD-115 M3 C3).
+    #[must_use]
+    pub fn inner(area: Rect) -> Rect {
+        Block::bordered().inner(area)
+    }
+
     /// Draws the pane into `area` and returns the inner rect for its content. The scrollbar, if
-    /// any, is measured against that rect's height and replaces part of the right border.
+    /// any, is measured against that rect's height (or its [`span`](Self::scrollbar_span)) and
+    /// replaces part of the right border.
     pub fn render(self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) -> Rect {
         let focused = self.focus == Focus::Focused;
         let border = if focused {
@@ -125,16 +162,27 @@ impl<'a> Pane<'a> {
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(border);
-        let inner = block.inner(area);
+        let inner = Self::inner(area);
         frame.render_widget(block, area);
-        if area.width < 2 || area.height == 0 {
+        let buf = frame.buffer_mut();
+        // The border rows and the right edge are written cell by cell below: a pane whose rect
+        // runs past the buffer draws only what lies on it (RV1 L4).
+        let top_on = area.y < buf.area.bottom() && area.y >= buf.area.y;
+        if area.width < 2 || area.height == 0 || area.intersection(buf.area).is_empty() {
             return inner;
         }
-        let buf = frame.buffer_mut();
 
-        let chips = sub_tab_rects(area, &self.sub_tabs);
+        // The chips and marks are patched over the border, bold when focused in monochrome: the
+        // border's bold is taken off all but the active chip, so only it reads bold (MOD-80 D5).
+        let faint = theme.dim.remove_modifier(Modifier::BOLD);
+        let strip = chip_strip(area, self.sub_tabs, self.active);
         let mut limit = area.right() - 1;
-        for (index, (rect, title)) in chips.iter().zip(&self.sub_tabs).enumerate() {
+        let mut cut = false;
+        for (index, (rect, title)) in strip.chips.iter().zip(self.sub_tabs).enumerate() {
+            let wanted = cells::cell_width(title) + 2;
+            if usize::from(rect.width) < wanted {
+                cut = true;
+            }
             if rect.width == 0 {
                 continue;
             }
@@ -142,39 +190,69 @@ impl<'a> Pane<'a> {
             let label_style = if index == self.active {
                 theme.active_tab
             } else {
-                theme.dim
+                faint
             };
-            let chip = Line::from(vec![
-                Span::raw(" "),
-                Span::styled((*title).to_owned(), label_style),
-                Span::raw(" "),
-            ]);
-            buf.set_line(rect.x, rect.y, &chip, rect.width);
+            if !top_on {
+                continue;
+            }
+            // A chip that fits is drawn from the borrowed title; only a clipped one is built.
+            if usize::from(rect.width) >= wanted && plain(title) {
+                put(buf, rect.x, rect.y, " ", rect.width, Style::new());
+                put(buf, rect.x + 1, rect.y, title, rect.width - 1, label_style);
+                put(buf, rect.right() - 1, rect.y, " ", 1, Style::new());
+            } else {
+                let chip = Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(*title, label_style),
+                    Span::raw(" "),
+                ]);
+                let chip = cells::clip_line(chip, rect.width);
+                set_line(buf, rect.x, rect.y, &chip, rect.width);
+            }
+        }
+        for (mark, glyph) in [(strip.before, BEFORE), (strip.after, AFTER)] {
+            if let Some(rect) = mark {
+                limit = limit.min(rect.x);
+                if top_on {
+                    put(buf, rect.x, rect.y, glyph, 1, faint);
+                }
+            }
         }
 
-        if !self.title.is_empty() {
+        // The title gives way before any chip does (MOD-115 M3 D-10): once one is cut off, the
+        // active chip carries the name and the title is not drawn at all.
+        if !self.title.is_empty() && !cut && top_on {
             let start = area.x + 2;
-            let room = usize::from(limit.saturating_sub(1).saturating_sub(start));
+            let room = limit.saturating_sub(1).saturating_sub(start);
             if room > 2 {
-                let text = cells::clip(&format!(" {} ", self.title), room);
                 let style = if focused {
                     border.add_modifier(Modifier::BOLD)
                 } else {
                     theme.dim
                 };
-                buf.set_stringn(start, area.y, text, room, style);
+                // ` title `, built only when it has to be clipped.
+                let width = cells::cell_width(self.title) + 2;
+                if width <= usize::from(room) && plain(self.title) {
+                    put(buf, start, area.y, " ", 1, style);
+                    put(buf, start + 1, area.y, self.title, room - 1, style);
+                    let end = start + u16::try_from(width).unwrap_or(room) - 1;
+                    put(buf, end, area.y, " ", 1, style);
+                } else {
+                    let text = cells::clip(&format!(" {} ", self.title), usize::from(room));
+                    put(buf, start, area.y, &text, room, style);
+                }
             }
         }
 
+        // The hints are painted over the rule cells they take and no other: a hint line's own
+        // style (`chips::key_line`'s `theme.dim`) must not restyle the rest of the bottom rule,
+        // nor stack on the border's bold in monochrome (RV1 H1).
         if focused
             && let Some(hints) = self.hints
             && area.height >= 2
         {
-            let width = area.width.saturating_sub(4);
-            if width > 0 {
-                let line = cells::clip_line(hints, width);
-                line.render(Rect::new(area.x + 2, area.bottom() - 1, width, 1), buf);
-            }
+            let row = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+            paint_bottom_hints(buf, row, hints, Style::new());
         }
 
         if let Some(note) = self.note
@@ -185,22 +263,55 @@ impl<'a> Pane<'a> {
         }
 
         if let Some((total, offset)) = self.scrollbar {
-            paint_scrollbar(buf, area, inner, total, offset, border);
+            let rows = self.span.map_or(inner, |rows| rows.intersection(inner));
+            paint_scrollbar(buf, area, rows, total, offset, border);
         }
         inner
     }
 }
 
-/// The thumb on the right border for `total` rows scrolled to `offset`; nothing when they all fit.
+/// What scrolls in a view, for its pane's scrollbar (MOD-115 M3 RV1 M2): `total` rows scrolled
+/// to `offset`, beside `rows` (absolute, as drawn) or, when `None`, the whole inner rect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollSpan {
+    /// The rows in all.
+    pub total: usize,
+    /// The first row shown.
+    pub offset: usize,
+    /// The rect the rows are drawn into; `None` is the pane's whole inner rect.
+    pub rows: Option<Rect>,
+}
+
+impl ScrollSpan {
+    /// `total` rows scrolled to `offset`, beside the whole inner rect.
+    #[must_use]
+    pub const fn new(total: usize, offset: usize) -> Self {
+        Self {
+            total,
+            offset,
+            rows: None,
+        }
+    }
+
+    /// Beside `rows` only: the rect the scrolled rows are drawn into.
+    #[must_use]
+    pub const fn rows(mut self, rows: Rect) -> Self {
+        self.rows = Some(rows);
+        self
+    }
+}
+
+/// The thumb on the right border beside `rows` for `total` rows scrolled to `offset`; nothing
+/// when they all fit.
 fn paint_scrollbar(
     buf: &mut Buffer,
     area: Rect,
-    inner: Rect,
+    rows: Rect,
     total: usize,
     offset: usize,
     style: Style,
 ) {
-    let viewport = usize::from(inner.height);
+    let viewport = usize::from(rows.height);
     if viewport == 0 || total <= viewport || area.width < 2 {
         return;
     }
@@ -211,43 +322,144 @@ fn paint_scrollbar(
     let top = (offset * travel + max / 2) / max;
     let x = area.right() - 1;
     for row in top..top + length {
-        let y = inner.y + u16::try_from(row).unwrap_or(u16::MAX);
-        buf[(x, y)].set_symbol(THUMB).set_style(style);
+        let y = rows
+            .y
+            .saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
+        if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+            cell.set_symbol(THUMB).set_style(style);
+        }
     }
 }
 
-/// Where each sub-tab chip sits on the top border of a pane drawn into `area`, one rect per title.
-/// A chip is ` title ` (two cells wider than the title); chips are adjacent and end flush with the
-/// right corner, so the block starts at `area.right() - 1 - width`. A chip that does not fit
-/// between the corners is dropped whole, from the right, and gets a zero-width rect no click hits.
+/// Whether `text` holds no control character, so it draws as it is, without
+/// `cells::clip`'s flattening (a control character is one blank cell there).
+fn plain(text: &str) -> bool {
+    !text.chars().any(char::is_control)
+}
+
+/// `text` at `(x, y)`, at most `width` cells, when that cell is on `buf`; else nothing.
+fn put(buf: &mut Buffer, x: u16, y: u16, text: &str, width: u16, style: Style) {
+    if buf.area.contains(Position::new(x, y)) {
+        buf.set_stringn(x, y, text, usize::from(width), style);
+    }
+}
+
+/// [`Buffer::set_line`] when `(x, y)` is on `buf`; else nothing.
+fn set_line(buf: &mut Buffer, x: u16, y: u16, line: &Line<'_>, width: u16) {
+    if buf.area.contains(Position::new(x, y)) {
+        buf.set_line(x, y, line, width);
+    }
+}
+
+/// Where each sub-tab chip sits on the top border of a pane drawn into `area`, one rect per title,
+/// `active` being the current one: [`chip_strip`]'s chips. A chip cut off gets a zero-width rect
+/// no click hits.
 #[must_use]
-pub fn sub_tab_rects(area: Rect, titles: &[&str]) -> Vec<Rect> {
-    let widths: Vec<u16> = titles
+pub fn sub_tab_rects(area: Rect, titles: &[&str], active: usize) -> Vec<Rect> {
+    chip_strip(area, titles, active).chips
+}
+
+/// The mark in front of a strip that has chips cut off on its left.
+const BEFORE: &str = "\u{2039}";
+
+/// The mark behind a strip that has chips cut off on its right.
+const AFTER: &str = "\u{203a}";
+
+/// Where the sub-tab strip sits on a pane drawn into `area` (MOD-115 M3 D3): what
+/// [`Pane::render`] draws and what a click is hit-tested against, from one computation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChipStrip {
+    /// One rect per title; width 0 = cut off (no click hits it).
+    pub chips: Vec<Rect>,
+    /// The `‹` mark, when chips are cut off on the left.
+    pub before: Option<Rect>,
+    /// The `›` mark, when chips are cut off on the right.
+    pub after: Option<Rect>,
+}
+
+/// The sub-tab strip of a pane drawn into `area`, `active` being the current chip.
+///
+/// A chip is ` title ` (two cells wider than the title). The strip sits between the corners and
+/// ends flush with the right one:
+/// - when every chip fits, every chip is shown;
+/// - otherwise a window starts at the `active` chip and grows one chip at a time, right then
+///   left, alternately, while the chip and the marks it then needs fit; `‹` and `›` (one cell
+///   each) stand for the chips cut off on either side;
+/// - when the active chip and its marks do not fit, the marks go first; when the active chip
+///   alone does not fit, it is drawn clipped with `…`; with fewer than 3 cells, nothing is.
+#[must_use]
+pub fn chip_strip(area: Rect, titles: &[&str], active: usize) -> ChipStrip {
+    let count = titles.len();
+    let corner = area.right().saturating_sub(1);
+    let mut strip = ChipStrip {
+        chips: vec![Rect::new(corner, area.y, 0, 1); count],
+        before: None,
+        after: None,
+    };
+    if count == 0 {
+        return strip;
+    }
+    let widths: Vec<u32> = titles
         .iter()
-        .map(|title| u16::try_from(cells::cell_width(title) + 2).unwrap_or(u16::MAX))
+        .map(|title| {
+            u32::try_from(cells::cell_width(title))
+                .unwrap_or(u32::MAX)
+                .saturating_add(2)
+        })
         .collect();
     let avail = u32::from(area.width.saturating_sub(2));
-    let mut shown = widths.len();
-    let mut total: u32 = widths.iter().map(|w| u32::from(*w)).sum();
-    while shown > 0 && total > avail {
-        shown -= 1;
-        total -= u32::from(widths[shown]);
-    }
-    let corner = area.right().saturating_sub(1);
-    let gone = Rect::new(corner, area.y, 0, 1);
-    let mut x = corner.saturating_sub(u16::try_from(total).unwrap_or(0));
-    widths
+    let last = count - 1;
+    // The cells the marks of a window `lo..=hi` take.
+    let marks = |lo: usize, hi: usize| u32::from(lo > 0) + u32::from(hi < last);
+    let total = widths
         .iter()
-        .enumerate()
-        .map(|(index, width)| {
-            if index >= shown {
-                return gone;
+        .fold(0u32, |sum, width| sum.saturating_add(*width));
+    let (lo, hi, marked) = if total <= avail {
+        (0, last, false)
+    } else if avail < 3 {
+        return strip;
+    } else {
+        let active = active.min(last);
+        let (mut lo, mut hi) = (active, active);
+        let mut used = widths[active];
+        loop {
+            let mut grew = false;
+            if hi < last && used.saturating_add(widths[hi + 1]) + marks(lo, hi + 1) <= avail {
+                hi += 1;
+                used += widths[hi];
+                grew = true;
             }
-            let rect = Rect::new(x, area.y, *width, 1);
-            x += width;
-            rect
-        })
-        .collect()
+            if lo > 0 && used.saturating_add(widths[lo - 1]) + marks(lo - 1, hi) <= avail {
+                lo -= 1;
+                used += widths[lo];
+                grew = true;
+            }
+            if !grew {
+                break;
+            }
+        }
+        (lo, hi, used.saturating_add(marks(lo, hi)) <= avail)
+    };
+    // Every width below is at most `avail`, which is a `u16`.
+    let cells = |width: u32| u16::try_from(width.min(avail)).unwrap_or(0);
+    let mark_cells = if marked { marks(lo, hi) } else { 0 };
+    let span = widths[lo..=hi]
+        .iter()
+        .fold(mark_cells, |sum, width| sum.saturating_add(*width));
+    let mut x = corner.saturating_sub(cells(span));
+    if marked && lo > 0 {
+        strip.before = Some(Rect::new(x, area.y, 1, 1));
+        x += 1;
+    }
+    for (rect, width) in strip.chips[lo..=hi].iter_mut().zip(&widths[lo..=hi]) {
+        let width = cells(*width);
+        *rect = Rect::new(x, area.y, width, 1);
+        x += width;
+    }
+    if marked && hi < last {
+        strip.after = Some(Rect::new(x, area.y, 1, 1));
+    }
+    strip
 }
 
 /// Draws `hints` over the horizontal border glyphs of `row`, the last row of a body a tab has
@@ -424,7 +636,7 @@ mod tests {
     #[test]
     fn sub_tab_chips_end_flush_with_the_right_corner() {
         let area = Rect::new(2, 1, 30, 5);
-        let rects = sub_tab_rects(area, &["Body", "Notes"]);
+        let rects = sub_tab_rects(area, &["Body", "Notes"], 0);
         // " Body " is 6 cells, " Notes " is 7: together 13, starting at right - 1 - 13.
         assert_eq!(area.right() - 1 - 13, 18);
         assert_eq!(rects, vec![Rect::new(18, 1, 6, 1), Rect::new(24, 1, 7, 1)]);
@@ -441,7 +653,7 @@ mod tests {
             &theme,
             Pane::new("Item").sub_tabs(&titles, 1).focus(Focus::Focused),
         );
-        let rects = sub_tab_rects(Rect::new(0, 0, 30, 4), &titles);
+        let rects = sub_tab_rects(Rect::new(0, 0, 30, 4), &titles, 1);
         let text = |rect: Rect| -> String {
             (rect.x..rect.right())
                 .map(|x| buffer[(x, 0)].symbol())
@@ -477,13 +689,16 @@ mod tests {
     }
 
     #[test]
-    fn chips_that_do_not_fit_are_dropped_whole_from_the_right() {
+    fn chips_that_do_not_fit_keep_the_active_one_and_mark_the_rest_at_a_narrow_width() {
         let area = Rect::new(0, 0, 14, 3);
-        let rects = sub_tab_rects(area, &["Body", "Notes", "Graph"]);
-        // 12 cells between the corners: " Body " (6) fits, " Notes " (7) does not.
-        assert_eq!(rects[0], Rect::new(7, 0, 6, 1));
-        assert_eq!(rects[1].width, 0);
-        assert_eq!(rects[2].width, 0);
+        let strip = chip_strip(area, &["Body", "Notes", "Graph"], 0);
+        // 12 cells between the corners: " Body " (6) and the `›` mark (1) fit, " Notes " (7)
+        // does not, so the strip is `[ Body ][›]`, ending flush with the right corner.
+        assert_eq!(strip.chips[0], Rect::new(6, 0, 6, 1));
+        assert_eq!(strip.chips[1].width, 0);
+        assert_eq!(strip.chips[2].width, 0);
+        assert_eq!(strip.before, None, "nothing is cut on the left");
+        assert_eq!(strip.after, Some(Rect::new(12, 0, 1, 1)));
         let (buffer, _) = draw(
             14,
             3,
@@ -495,11 +710,310 @@ mod tests {
             top.contains("Body") && !top.contains("Notes") && !top.contains("Graph"),
             "{top}"
         );
-        assert!(top.ends_with('╮'), "{top}");
+        assert!(top.ends_with(" Body ›╮"), "{top}");
         assert!(
-            sub_tab_rects(Rect::new(0, 0, 2, 3), &["Body"])[0].width == 0,
+            sub_tab_rects(Rect::new(0, 0, 2, 3), &["Body"], 0)[0].width == 0,
             "no room at all"
         );
+    }
+
+    /// The ten Settings sections: 87 cells of chips, more than an 80-column pane holds.
+    const SECTIONS: [&str; 10] = [
+        "Agents",
+        "Hierarchy",
+        "Kinds",
+        "Personas",
+        "Boxes",
+        "Prompt",
+        "Queue",
+        "Connection",
+        "Qdrant",
+        "Secrets",
+    ];
+
+    #[test]
+    fn chips_that_do_not_fit_keep_the_active_one_and_mark_the_rest() {
+        let area = Rect::new(0, 0, 80, 3);
+        for active in [0, 4, 9] {
+            let strip = chip_strip(area, &SECTIONS, active);
+            assert!(strip.chips[active].width > 0, "active {active}: {strip:?}");
+            assert_eq!(
+                strip.before.is_some(),
+                strip.chips[0].width == 0,
+                "`‹` only when something is cut on the left (active {active})"
+            );
+            assert_eq!(
+                strip.after.is_some(),
+                strip.chips[9].width == 0,
+                "`›` only when something is cut on the right (active {active})"
+            );
+            let (buffer, _) = draw(
+                80,
+                3,
+                &Theme::default(),
+                Pane::new("").sub_tabs(&SECTIONS, active),
+            );
+            let top = row(&buffer, 0);
+            assert!(
+                top.contains(&format!(" {} ", SECTIONS[active])),
+                "active {active}: {top}"
+            );
+            assert_eq!(top.contains('‹'), strip.before.is_some(), "{top}");
+            assert_eq!(top.contains('›'), strip.after.is_some(), "{top}");
+            assert!(top.ends_with('╮'), "{top}");
+        }
+        let first = chip_strip(area, &SECTIONS, 0);
+        assert!(first.before.is_none() && first.after.is_some(), "{first:?}");
+        let last = chip_strip(area, &SECTIONS, 9);
+        assert!(last.before.is_some() && last.after.is_none(), "{last:?}");
+        let middle = chip_strip(area, &SECTIONS, 4);
+        assert!(
+            middle.before.is_some() && middle.after.is_some(),
+            "{middle:?}"
+        );
+    }
+
+    #[test]
+    fn the_rects_agree_with_what_is_drawn() {
+        let theme = Theme::default();
+        for width in 20..=120u16 {
+            for active in 0..SECTIONS.len() {
+                let area = Rect::new(0, 0, width, 3);
+                let strip = chip_strip(area, &SECTIONS, active);
+                let (buffer, _) = draw(width, 3, &theme, Pane::new("").sub_tabs(&SECTIONS, active));
+                let text = |rect: Rect| -> String {
+                    (rect.x..rect.right())
+                        .map(|x| buffer[(x, 0)].symbol())
+                        .collect()
+                };
+                let shown: Vec<usize> = (0..SECTIONS.len())
+                    .filter(|&i| strip.chips[i].width > 0)
+                    .collect();
+                assert!(shown.contains(&active), "{width}/{active}: {strip:?}");
+                for &i in &shown {
+                    assert_eq!(
+                        text(strip.chips[i]),
+                        format!(" {} ", SECTIONS[i]),
+                        "{width}/{active}: chip {i}"
+                    );
+                }
+                // The shown chips are one contiguous run, the marks at its ends, and the
+                // whole strip ends flush with the right corner.
+                let (lo, hi) = (shown[0], shown[shown.len() - 1]);
+                assert_eq!(shown.len(), hi - lo + 1, "{width}/{active}");
+                for pair in shown.windows(2) {
+                    assert_eq!(strip.chips[pair[0]].right(), strip.chips[pair[1]].x);
+                }
+                assert_eq!(strip.before.is_some(), lo > 0, "{width}/{active}");
+                assert_eq!(strip.after.is_some(), hi < SECTIONS.len() - 1);
+                if let Some(before) = strip.before {
+                    assert_eq!(text(before), "‹", "{width}/{active}");
+                    assert_eq!(before.right(), strip.chips[lo].x);
+                }
+                let end = strip.after.map_or(strip.chips[hi].right(), |after| {
+                    assert_eq!(text(after), "›", "{width}/{active}");
+                    assert_eq!(after.x, strip.chips[hi].right());
+                    after.right()
+                });
+                assert_eq!(end, width - 1, "{width}/{active}");
+                assert_eq!(row(&buffer, 0).chars().last(), Some('╮'));
+            }
+        }
+    }
+
+    #[test]
+    fn a_strip_that_fits_is_today_s_strip() {
+        let area = Rect::new(2, 1, 30, 5);
+        for active in 0..2 {
+            let strip = chip_strip(area, &["Body", "Notes"], active);
+            assert_eq!(
+                strip.chips,
+                vec![Rect::new(18, 1, 6, 1), Rect::new(24, 1, 7, 1)]
+            );
+            assert_eq!((strip.before, strip.after), (None, None));
+        }
+    }
+
+    #[test]
+    fn a_strip_with_no_room_for_the_marks_drops_them_then_clips_the_active_chip() {
+        // " Connection " is 12 cells; 12 between the corners leaves no room for its `‹`.
+        let strip = chip_strip(Rect::new(0, 0, 14, 3), &["Agents", "Connection"], 1);
+        assert_eq!(strip.chips[1], Rect::new(1, 0, 12, 1));
+        assert_eq!((strip.before, strip.after), (None, None));
+        assert_eq!(strip.chips[0].width, 0);
+        // 8 between the corners: the active chip alone, clipped with an ellipsis.
+        let strip = chip_strip(Rect::new(0, 0, 10, 3), &["Agents", "Connection"], 1);
+        assert_eq!(strip.chips[1], Rect::new(1, 0, 8, 1));
+        let (buffer, _) = draw(
+            10,
+            3,
+            &Theme::default(),
+            Pane::new("").sub_tabs(&["Agents", "Connection"], 1),
+        );
+        assert_eq!(row(&buffer, 0), "╭ Connec…╮");
+        // Fewer than 3 cells: nothing at all.
+        let strip = chip_strip(Rect::new(0, 0, 4, 3), &["Agents", "Connection"], 1);
+        assert!(strip.chips.iter().all(|rect| rect.width == 0));
+        assert_eq!((strip.before, strip.after), (None, None));
+        assert!(chip_strip(Rect::new(0, 0, 40, 3), &[], 0).chips.is_empty());
+    }
+
+    #[test]
+    fn the_title_gives_way_before_a_chip() {
+        let (buffer, _) = draw(
+            80,
+            3,
+            &Theme::default(),
+            Pane::new("Agents")
+                .sub_tabs(&SECTIONS, 0)
+                .focus(Focus::Focused),
+        );
+        let top = row(&buffer, 0);
+        assert_eq!(
+            top.matches("Agents").count(),
+            1,
+            "the active chip carries the name, the title is not drawn: {top}"
+        );
+        assert!(top.starts_with("╭──"), "{top}");
+        assert!(!top.contains('…'), "no clipped title either: {top}");
+    }
+
+    /// MOD-80 D5 (MOD-115 M3 §4.1): on a focused pane's border, bold in monochrome, only the
+    /// active chip is bold; the other chips and the marks are dim, never bold.
+    #[test]
+    fn on_a_focused_border_only_the_active_chip_is_bold_without_colour() {
+        let theme = Theme::monochrome();
+        let area = Rect::new(0, 0, 80, 3);
+        let strip = chip_strip(area, &SECTIONS, 4);
+        let pane = Pane::new("")
+            .sub_tabs(&SECTIONS, 4)
+            .focus(Focus::Focused)
+            .accent(theme.tab_accent("settings"));
+        let (buffer, _) = draw(80, 3, &theme, pane);
+        for (index, chip) in strip.chips.iter().enumerate() {
+            if chip.width < 2 {
+                continue;
+            }
+            let label = &buffer[(chip.x + 1, 0)];
+            if index == 4 {
+                assert!(
+                    label.modifier.contains(Modifier::BOLD),
+                    "{index}: {label:?}"
+                );
+                assert!(
+                    !label.modifier.contains(Modifier::DIM),
+                    "{index}: {label:?}"
+                );
+            } else {
+                assert!(
+                    !label.modifier.contains(Modifier::BOLD),
+                    "{index}: {label:?}"
+                );
+                assert!(label.modifier.contains(Modifier::DIM), "{index}: {label:?}");
+            }
+        }
+        for mark in [strip.before, strip.after] {
+            let mark = mark.expect("both marks at active 4");
+            let cell = &buffer[(mark.x, 0)];
+            assert!(!cell.modifier.contains(Modifier::BOLD), "{mark:?}");
+            assert!(cell.modifier.contains(Modifier::DIM), "{mark:?}");
+        }
+    }
+
+    #[test]
+    fn the_marks_are_dim_without_colour() {
+        let theme = Theme::monochrome();
+        let area = Rect::new(0, 0, 80, 3);
+        let strip = chip_strip(area, &SECTIONS, 4);
+        let (buffer, _) = draw(80, 3, &theme, Pane::new("").sub_tabs(&SECTIONS, 4));
+        for mark in [strip.before, strip.after] {
+            let mark = mark.expect("both marks at active 4");
+            let cell = &buffer[(mark.x, 0)];
+            assert!(cell.modifier.contains(Modifier::DIM), "{mark:?}");
+            assert_eq!((cell.fg, cell.bg), (Color::Reset, Color::Reset));
+        }
+        let (coloured, _) = draw(
+            80,
+            3,
+            &Theme::default(),
+            Pane::new("").sub_tabs(&SECTIONS, 4),
+        );
+        let mark = strip.before.expect("a left mark");
+        assert_eq!(
+            coloured[(mark.x, 0)].style().fg,
+            Theme::default().dim.fg,
+            "the dim role"
+        );
+    }
+
+    #[test]
+    fn content_drawn_before_the_frame_survives_it() {
+        let theme = Theme::default();
+        let mut terminal = Terminal::new(TestBackend::new(20, 5)).expect("a test terminal");
+        let mut drawn = Rect::default();
+        let mut measured = Rect::default();
+        terminal
+            .draw(|frame| {
+                measured = Pane::inner(frame.area());
+                frame.buffer_mut().set_string(
+                    measured.x,
+                    measured.y,
+                    "hello",
+                    Style::new().fg(Color::Yellow),
+                );
+                drawn = Pane::new("T")
+                    .focus(Focus::Focused)
+                    .accent(accent())
+                    .scrollbar(10, 0)
+                    .render(frame, frame.area(), &theme);
+            })
+            .expect("draw");
+        assert_eq!(measured, drawn, "`inner` is the rect `render` returns");
+        assert_eq!(measured, Rect::new(1, 1, 18, 3));
+        let buffer = terminal.backend().buffer();
+        assert_eq!(row(buffer, 1), "│hello             ┃");
+        assert_eq!(buffer[(1, 1)].fg, Color::Yellow, "its style survives too");
+        assert_eq!(buffer[(0, 0)].fg, Color::Magenta, "and the frame is drawn");
+    }
+
+    #[test]
+    fn the_scrollbar_stays_inside_its_span() {
+        // A 10 by 10 pane: inner rows 1..=8; the span is inner rows 2..6, terminal rows 3..=6.
+        let thumb = |offset: usize, span: (u16, u16)| -> Vec<u16> {
+            let (buffer, _) = draw(
+                10,
+                10,
+                &Theme::default(),
+                Pane::new("")
+                    .scrollbar(20, offset)
+                    .scrollbar_span(Rect::new(1, 1 + span.0, 8, span.1)),
+            );
+            (0..10)
+                .filter(|&y| buffer[(9, y)].symbol() == THUMB)
+                .collect()
+        };
+        assert_eq!(thumb(0, (2, 4)), vec![3], "at the top of the span");
+        assert_eq!(thumb(16, (2, 4)), vec![6], "the end of the span");
+        assert_eq!(thumb(99, (2, 4)), vec![6]);
+        for offset in 0..20 {
+            assert!(
+                thumb(offset, (2, 4)).iter().all(|y| (3..=6).contains(y)),
+                "{offset}"
+            );
+        }
+        // A span past the inner rect is cut to it.
+        assert!(thumb(99, (6, 10)).iter().all(|y| (7..=8).contains(y)));
+        assert_eq!(thumb(99, (6, 10)), vec![8]);
+        // A span that holds every row draws no thumb.
+        let (buffer, _) = draw(
+            10,
+            10,
+            &Theme::default(),
+            Pane::new("")
+                .scrollbar(3, 0)
+                .scrollbar_span(Rect::new(1, 1, 8, 4)),
+        );
+        assert!((0..10).all(|y| buffer[(9, y)].symbol() != THUMB));
     }
 
     #[test]
@@ -998,6 +1512,133 @@ mod tests {
             row(&tight, 3),
             "╰─enter open─z unzo…─╯",
             "the note never runs into the hints"
+        );
+    }
+
+    /// RV1 H1: a hint line with a style of its own (`chips::key_line`'s `theme.dim`) styles its
+    /// own cells only; the rule past it keeps the focused border's accent, and in monochrome the
+    /// rule stays bold, not dim, while the hint cells are dim, not bold.
+    #[test]
+    fn a_styled_hint_line_restyles_only_its_own_cells() {
+        let theme = Theme::default();
+        let pane = Pane::new("T")
+            .hints(Line::styled("enter open", theme.dim))
+            .focus(Focus::Focused)
+            .accent(accent());
+        let (buffer, _) = draw(24, 4, &theme, pane);
+        assert_eq!(row(&buffer, 3), format!("╰─enter open{}╯", "─".repeat(11)));
+        for x in [0, 1, 12, 17, 22, 23] {
+            assert_eq!(buffer[(x, 3)].fg, Color::Magenta, "rule cell {x}");
+        }
+        for x in 2..12 {
+            assert_eq!(Some(buffer[(x, 3)].fg), theme.dim.fg, "hint cell {x}");
+        }
+
+        let mono = Theme::monochrome();
+        let pane = Pane::new("T")
+            .hints(Line::styled("enter open", mono.dim))
+            .focus(Focus::Focused)
+            .accent(mono.tab_accent("settings"));
+        let (buffer, _) = draw(24, 4, &mono, pane);
+        for x in [1, 12, 17, 22] {
+            let cell = &buffer[(x, 3)];
+            assert!(
+                cell.modifier.contains(Modifier::BOLD),
+                "rule cell {x}: {cell:?}"
+            );
+            assert!(
+                !cell.modifier.contains(Modifier::DIM),
+                "rule cell {x}: {cell:?}"
+            );
+        }
+        for x in 2..12 {
+            let cell = &buffer[(x, 3)];
+            assert!(
+                cell.modifier.contains(Modifier::DIM),
+                "hint cell {x}: {cell:?}"
+            );
+            assert!(
+                !cell.modifier.contains(Modifier::BOLD),
+                "hint cell {x}: {cell:?}"
+            );
+        }
+    }
+
+    /// RV1 L4: a pane drawn into a rect that runs past the buffer draws what fits and never
+    /// indexes a cell outside it (the scrollbar did).
+    #[test]
+    fn a_pane_past_the_buffer_draws_what_fits() {
+        let theme = Theme::default();
+        let mut terminal = Terminal::new(TestBackend::new(12, 6)).expect("a test terminal");
+        terminal
+            .draw(|frame| {
+                for area in [
+                    Rect::new(0, 0, 16, 10),
+                    Rect::new(4, 3, 20, 20),
+                    Rect::new(30, 30, 6, 6),
+                ] {
+                    let _ = Pane::new("Title")
+                        .sub_tabs(&["Ab", "Cd"], 0)
+                        .hints(Line::from("x y"))
+                        .note(Line::from("n"))
+                        .focus(Focus::Focused)
+                        .scrollbar(40, 20)
+                        .render(frame, area, &theme);
+                }
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].symbol(), "╭");
+        assert_eq!(buffer[(4, 3)].symbol(), "╭");
+    }
+
+    /// RV1 L6: the scrollbar's span is an absolute rect, cut to the inner rect.
+    #[test]
+    fn the_scrollbar_span_is_an_absolute_rect_cut_to_the_inner_one() {
+        let thumb = |rows: Rect| -> Vec<u16> {
+            let (buffer, _) = draw(
+                10,
+                10,
+                &Theme::default(),
+                Pane::new("").scrollbar(20, 99).scrollbar_span(rows),
+            );
+            (0..10)
+                .filter(|&y| buffer[(9, y)].symbol() == THUMB)
+                .collect()
+        };
+        // Terminal rows 3..=6: the thumb ends on row 6.
+        assert_eq!(thumb(Rect::new(1, 3, 8, 4)), vec![6]);
+        // A rect past the inner one (rows 1..=8) is cut to it, above and below.
+        assert_eq!(thumb(Rect::new(0, 7, 10, 10)), vec![8]);
+        assert!(
+            thumb(Rect::new(0, 0, 10, 3))
+                .iter()
+                .all(|y| (1..=2).contains(y))
+        );
+        // A rect clear of the inner one draws no thumb.
+        assert!(thumb(Rect::new(0, 20, 10, 4)).is_empty());
+    }
+
+    /// RV1 M2: a [`ScrollSpan`] carries its rows to the pane in one call.
+    #[test]
+    fn a_scroll_span_sets_the_total_the_offset_and_the_rows() {
+        let span = ScrollSpan::new(20, 99).rows(Rect::new(1, 3, 8, 4));
+        assert_eq!((span.total, span.offset), (20, 99));
+        let (buffer, _) = draw(10, 10, &Theme::default(), Pane::new("").scroll(span));
+        let rows: Vec<u16> = (0..10)
+            .filter(|&y| buffer[(9, y)].symbol() == THUMB)
+            .collect();
+        assert_eq!(rows, vec![6]);
+        let (whole, _) = draw(
+            10,
+            10,
+            &Theme::default(),
+            Pane::new("").scroll(ScrollSpan::new(20, 99)),
+        );
+        assert_eq!(
+            whole[(9, 8)].symbol(),
+            THUMB,
+            "no rows: the whole inner rect"
         );
     }
 }

@@ -2,9 +2,9 @@
 source: crates/htui/tests/settings.rs
 expression: rendered
 ---
-name         transport billing      models default               enabled quota         on this box
-alpha        acp       subscription 0      —                     yes     —             not probed
-beta         acp       subscription 0      —                     yes     —             not probed
+ name         transport billing      models default              enabled quota         on this box
+▌alpha        ACP       subscription 0      —                     ● on   —             not probed
+ beta         ACP       subscription 0      —                     ● on   —             not probed
 
 
 
@@ -21,13 +21,13 @@ beta         acp       subscription 0      —                     yes     —  
 
 
 
-new agent · settings from alpha
-name         : gamma
-transport    : acp
-command      :
-args         :
-models       :
-default model:
-billing      : subscription
-enabled (y/n): y
-mods (y/n)   : n
+ new agent · settings from alpha
+▌name            gamma
+ transport       acp
+ command
+ args
+ models
+ default model
+ billing         subscription
+ enabled (y/n)   y
+ mods (y/n)      n

@@ -4,10 +4,10 @@ expression: frame
 ---
 edit persona `architect`
 
-name              : architect
-description       : …lt, studying the existing code and writing a blueprint, without editing files.
-tools             :
-disallowed-tools  :
-deny-kinds        : edit, delete, move
-command-run (y/n) : y
-permission-default:
+▌name                 architect
+ description          …, studying the existing code and writing a blueprint, without editing files.
+ tools
+ disallowed-tools
+ deny-kinds           edit, delete, move
+ command-run (y/n)    y
+ permission-default

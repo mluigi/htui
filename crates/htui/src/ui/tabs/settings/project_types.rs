@@ -18,7 +18,9 @@ use crate::app::{Ctx, Handled};
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
-use crate::ui::tabs::settings::{SectionId, SettingsSection, wrapped};
+use crate::ui::kit::chips::key_line;
+use crate::ui::kit::text::wrapped;
+use crate::ui::tabs::settings::{SectionId, SettingsSection};
 use crossterm::event::KeyEvent;
 
 /// The keys over a readable registry: `j/k select` with the default keys.
@@ -196,7 +198,7 @@ impl SettingsSection for ProjectTypesSection {
     }
 
     fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
-        super::key_line(
+        key_line(
             keys.hint(views::PROJECT_TYPES_BROWSE, self.hint_spec()),
             theme,
         )

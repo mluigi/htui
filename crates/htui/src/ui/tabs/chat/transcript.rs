@@ -16,6 +16,7 @@ use crate::app::Handled;
 use crate::keys::Act;
 use crate::ui::Theme;
 use crate::ui::diff::diff_style;
+use crate::ui::kit::label::{self, Mark, Tone, plural};
 
 /// Where a tool call stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +30,68 @@ pub enum CallStatus {
         /// Set only on a row `htui` synthesized (`docs/ANA-4.md` §4.3).
         reason: Option<TerminalReason>,
     },
+}
+
+impl CallStatus {
+    /// How the call stands as shown (MOD-115 M3 D-16): a glyph and a word. `CallStatus` is the
+    /// Chat's own, so its mark is built here rather than in `kit::label`, which never imports a
+    /// tab; the glyphs are the kit's run-status ones.
+    #[must_use]
+    pub const fn mark(&self) -> Mark {
+        match self {
+            Self::Running => Mark {
+                glyph: "\u{25d0}",
+                word: "running",
+                tone: Tone::Running,
+            },
+            Self::Completed => Mark {
+                glyph: "\u{25cf}",
+                word: "done",
+                tone: Tone::Done,
+            },
+            Self::Failed { reason: None } => Mark {
+                glyph: "\u{2717}",
+                word: "failed",
+                tone: Tone::Failed,
+            },
+            Self::Failed {
+                reason: Some(TerminalReason::Rejected),
+            } => Mark {
+                glyph: "\u{2717}",
+                word: "rejected",
+                tone: Tone::Failed,
+            },
+            Self::Failed {
+                reason: Some(TerminalReason::Cancelled),
+            } => Mark {
+                glyph: "\u{2298}",
+                word: "cancelled",
+                tone: Tone::Dim,
+            },
+        }
+    }
+}
+
+/// How an edit proposal stands (MOD-115 M3 MOD-83): `true` allowed, `false` rejected, `None` while
+/// its request is parked.
+const fn proposal_mark(accepted: Option<bool>) -> Mark {
+    match accepted {
+        Some(true) => Mark {
+            glyph: "\u{25cf}",
+            word: "accepted",
+            tone: Tone::Done,
+        },
+        Some(false) => Mark {
+            glyph: "\u{2717}",
+            word: "rejected",
+            tone: Tone::Failed,
+        },
+        None => Mark {
+            glyph: "\u{26a0}",
+            word: "waiting on you",
+            tone: Tone::NeedsYou,
+        },
+    }
 }
 
 /// How a permission request was answered.
@@ -156,8 +219,69 @@ pub struct Transcript {
     rendered: std::cell::Cell<usize>,
     /// Height the last render was given, for the same reason.
     height: std::cell::Cell<usize>,
+    /// Each row's lines as last rendered (MOD-115 M3 RV3 L4): a frame renders only the rows
+    /// that changed since the last one.
+    cache: std::cell::RefCell<LineCache>,
+    /// How many rows the cache has rendered, for the tests that pin what it re-renders.
+    #[cfg(test)]
+    renders: std::cell::Cell<usize>,
     /// The agent-side session id, taken from the banner rather than rendered as a row.
     session_ref: Option<AgentSessionRef>,
+}
+
+/// What [`Transcript::lines`] drew: the window's lines and the scrollbar's numbers (MOD-115 M3
+/// D5), every line the rows render to and the first one drawn.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Shown {
+    /// The lines in view, at most the height asked for.
+    pub lines: Vec<Line<'static>>,
+    /// Every line the rows render to.
+    pub total: usize,
+    /// The first line drawn.
+    pub first: usize,
+}
+
+/// Each row's lines as last rendered, beside the row they were rendered from, and what every
+/// row was rendered with (MOD-115 M3 RV3 L4). A row that differs from its copy (a streamed
+/// chunk, a call's result, a proposal's answer) is rendered again; another theme, another
+/// unfold key or the thoughts folded the other way render every row again.
+#[derive(Debug, Default)]
+struct LineCache {
+    theme: Option<Theme>,
+    unfold: Option<String>,
+    fold_thoughts: bool,
+    rows: Vec<(TranscriptRow, Vec<Line<'static>>)>,
+}
+
+impl LineCache {
+    /// Brings the cache up to `rows`, rendering through `render` each row it does not hold as
+    /// is.
+    fn refresh(
+        &mut self,
+        rows: &[TranscriptRow],
+        fold_thoughts: bool,
+        theme: &Theme,
+        unfold: Option<&str>,
+        render: impl Fn(&TranscriptRow) -> Vec<Line<'static>>,
+    ) {
+        if self.theme.as_ref() != Some(theme)
+            || self.unfold.as_deref() != unfold
+            || self.fold_thoughts != fold_thoughts
+        {
+            self.rows.clear();
+            self.theme = Some(*theme);
+            self.unfold = unfold.map(str::to_owned);
+            self.fold_thoughts = fold_thoughts;
+        }
+        self.rows.truncate(rows.len());
+        for (index, row) in rows.iter().enumerate() {
+            match self.rows.get_mut(index) {
+                Some((cached, _)) if cached == row => {}
+                Some(slot) => *slot = (row.clone(), render(row)),
+                None => self.rows.push((row.clone(), render(row))),
+            }
+        }
+    }
 }
 
 /// Where the view is.
@@ -461,23 +585,23 @@ impl Transcript {
     pub fn on_act(&mut self, act: Act) -> Handled {
         match act {
             Act::ListDown => {
+                // MOD-115 M3 RV3 (review L1): a step that reaches the last page is the tail
+                // again, so the view follows what streams in from there; never past it.
                 self.scroll = match self.scroll {
-                    Scroll::Tail => Scroll::Tail,
-                    Scroll::At(line) => Scroll::At(line + 1),
+                    Scroll::At(line) if line + 1 < self.last_page() => Scroll::At(line + 1),
+                    Scroll::Tail | Scroll::At(_) => Scroll::Tail,
                 };
                 Handled::Consumed
             }
             Act::ListUp => {
                 self.scroll = match self.scroll {
                     // The tail shows the last `height` lines, so stepping back from it means the
-                    // line just above that window — not `rows.len()`, which counts rows.
-                    Scroll::Tail => Scroll::At(
-                        self.rendered
-                            .get()
-                            .saturating_sub(self.height.get())
-                            .saturating_sub(1),
-                    ),
-                    Scroll::At(line) => Scroll::At(line.saturating_sub(1)),
+                    // line just above that window — not `rows.len()`, which counts rows. A chat
+                    // that fits one page has no such line, so it stays the tail and keeps
+                    // following what streams in (MOD-115 M3 RV4).
+                    Scroll::Tail if self.last_page() == 0 => Scroll::Tail,
+                    Scroll::Tail => Scroll::At(self.last_page().saturating_sub(1)),
+                    Scroll::At(line) => Scroll::At(line.min(self.last_page()).saturating_sub(1)),
                 };
                 Handled::Consumed
             }
@@ -497,6 +621,11 @@ impl Transcript {
         }
     }
 
+    /// The first line of the last page as of the last render: where the tail starts.
+    fn last_page(&self) -> usize {
+        self.rendered.get().saturating_sub(self.height.get())
+    }
+
     /// The last `resume_failed` row's lines, or none: what a chat whose handoff start failed too
     /// shows above its refusal (MOD-37 review L-6). `unfold` as [`Transcript::lines`] takes it.
     #[must_use]
@@ -512,19 +641,38 @@ impl Transcript {
     /// The transcript as lines, tail-first when nothing has been scrolled. `unfold` is the
     /// thoughts key a folded thought names, `ChatThoughts`'s label through the stack the
     /// transcript is read in (MOD-67 M6 D4); with none bound a folded thought names no key.
+    /// The window comes with the scrollbar's numbers ([`Shown`]), and only the rows that changed
+    /// since the last call are rendered again (MOD-115 M3 RV3 L4).
     #[must_use]
-    pub fn lines(&self, height: usize, theme: &Theme, unfold: Option<&str>) -> Vec<Line<'static>> {
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        for row in &self.rows {
-            lines.extend(self.render_row(row, theme, unfold));
-        }
-        self.rendered.set(lines.len());
+    pub fn lines(&self, height: usize, theme: &Theme, unfold: Option<&str>) -> Shown {
+        let mut cache = self.cache.borrow_mut();
+        cache.refresh(&self.rows, self.fold_thoughts, theme, unfold, |row| {
+            #[cfg(test)]
+            self.renders.set(self.renders.get() + 1);
+            self.render_row(row, theme, unfold)
+        });
+        let total = cache.rows.iter().map(|(_, lines)| lines.len()).sum();
+        self.rendered.set(total);
         self.height.set(height);
+        // MOD-115 M3 RV3 (review L1): a view parked past the last page (thoughts folded again)
+        // shows the last page.
         let first = match self.scroll {
-            Scroll::Tail => lines.len().saturating_sub(height),
-            Scroll::At(line) => line.min(lines.len().saturating_sub(1)),
+            Scroll::Tail => total.saturating_sub(height),
+            Scroll::At(line) => line.min(total.saturating_sub(height)),
         };
-        lines.into_iter().skip(first).take(height).collect()
+        let lines = cache
+            .rows
+            .iter()
+            .flat_map(|(_, lines)| lines)
+            .skip(first)
+            .take(height)
+            .cloned()
+            .collect();
+        Shown {
+            lines,
+            total,
+            first,
+        }
     }
 
     /// One row's lines; a folded thought names `unfold` ([`Transcript::lines`]).
@@ -535,9 +683,10 @@ impl Transcript {
         unfold: Option<&str>,
     ) -> Vec<Line<'static>> {
         match row {
+            // MOD-115 M3 MOD-85: `you` is a speaker label (the title role), not focus.
             TranscriptRow::Prompt { text } | TranscriptRow::FollowUp { text } => {
                 vec![Line::from(vec![
-                    Span::styled("you  ", theme.accent),
+                    Span::styled("you  ", theme.title),
                     Span::styled(text.clone(), theme.base),
                 ])]
             }
@@ -565,25 +714,13 @@ impl Transcript {
                 status,
                 ..
             } => {
-                let mark = match status {
-                    CallStatus::Running => "…",
-                    CallStatus::Completed => "ok",
-                    CallStatus::Failed { reason: None } => "failed",
-                    CallStatus::Failed {
-                        reason: Some(TerminalReason::Rejected),
-                    } => "rejected",
-                    CallStatus::Failed {
-                        reason: Some(TerminalReason::Cancelled),
-                    } => "cancelled",
-                };
-                let style = match status {
-                    CallStatus::Failed { .. } => theme.error,
-                    _ => theme.dim,
-                };
-                vec![Line::from(vec![
-                    Span::styled(format!("{} {title}", kind.as_str()), theme.base),
-                    Span::styled(format!("  [{mark}]"), style),
-                ])]
+                // MOD-115 M3 MOD-83: the kind in words, how it stands as a mark (D-16).
+                let mut spans = vec![Span::styled(
+                    format!("{} {title}  ", label::tool_kind(*kind)),
+                    theme.base,
+                )];
+                spans.extend(label::spans(status.mark(), theme));
+                vec![Line::from(spans)]
             }
             TranscriptRow::EditProposal {
                 path,
@@ -591,15 +728,9 @@ impl Transcript {
                 accepted,
                 ..
             } => {
-                let state = match accepted {
-                    Some(true) => "accepted",
-                    Some(false) => "rejected",
-                    None => "waiting",
-                };
-                let mut lines = vec![Line::styled(
-                    format!("edit  {path}  [{state}]"),
-                    theme.title,
-                )];
+                let mut head = vec![Span::styled(format!("edit  {path}  "), theme.title)];
+                head.extend(label::spans(proposal_mark(*accepted), theme));
+                let mut lines = vec![Line::from(head)];
                 lines.extend(diff.lines().map(|line| {
                     let style = diff_style(line, theme);
                     Line::styled(line.to_owned(), style)
@@ -618,29 +749,39 @@ impl Transcript {
                         // `denied` before the absent option: both a refusal and a cancellation
                         // carry `option_id: None`, and reporting a policy refusal as "cancelled"
                         // would tell the user they stopped their own tool call.
+                        // MOD-115 M3 MOD-83: the chosen option by its label, not the agent's
+                        // id (`allow_always`); an id no option carries is shown as is.
                         let chosen = match (denied, option_id.as_deref()) {
                             (true, _) => "denied",
-                            (false, Some(option)) => option,
+                            (false, Some(option)) => options
+                                .iter()
+                                .find(|candidate| candidate.id == option)
+                                .map_or(option, |candidate| candidate.label.as_str()),
                             (false, None) => "cancelled",
                         };
                         format!("permission  {chosen} (by {by})")
                     }
-                    None => format!("permission  waiting on you ({} options)", options.len()),
+                    None => format!(
+                        "permission  waiting on you ({})",
+                        plural(options.len(), "option", "options")
+                    ),
                 };
+                // MOD-115 M3 MOD-85: an unanswered request needs a person (MOD-80 D1).
                 let style = if resolved.is_some() {
                     theme.dim
                 } else {
-                    theme.accent
+                    theme.warning
                 };
                 vec![Line::styled(text, style)]
             }
             TranscriptRow::Plan { entries } => {
                 let mut lines = vec![Line::styled("plan".to_owned(), theme.title)];
+                // MOD-115 M3 MOD-83: each entry's state as a mark, never `[in_progress]`.
                 lines.extend(entries.iter().map(|entry| {
-                    Line::styled(
-                        format!("  [{}] {}", entry.status.as_str(), entry.content),
-                        theme.dim,
-                    )
+                    let mut spans = vec![Span::raw("  ")];
+                    spans.extend(label::spans(label::plan_entry(entry.status), theme));
+                    spans.push(Span::styled(format!("  {}", entry.content), theme.dim));
+                    Line::from(spans)
                 }));
                 lines
             }
@@ -649,22 +790,63 @@ impl Transcript {
                 format!("error  {code}: {message}"),
                 theme.error,
             )],
-            TranscriptRow::Done { stop_reason } => vec![Line::styled(
-                format!("— turn ended ({}) —", stop_reason.as_str()),
-                theme.dim,
-            )],
+            // MOD-115 M3 MOD-83: an ordinary end says no more; any other reason is named.
+            TranscriptRow::Done { stop_reason } => {
+                let text = match stop_reason {
+                    StopReason::EndTurn => "\u{2014} turn ended \u{2014}".to_owned(),
+                    reason => format!(
+                        "\u{2014} turn ended: {} \u{2014}",
+                        label::stop_reason(*reason)
+                    ),
+                };
+                vec![Line::styled(text, theme.dim)]
+            }
             TranscriptRow::ResumeFailed { reason, note } => {
                 let mut reason = reason.lines();
                 let first = reason.next().unwrap_or_default();
                 let mut lines = vec![Line::styled(format!("resume failed  {first}"), theme.error)];
                 lines.extend(reason.map(|line| Line::styled(format!("  {line}"), theme.dim)));
-                lines.push(Line::styled(note.clone(), theme.accent));
+                // MOD-115 M3 MOD-85: what the chat opened with is the reader's to know.
+                lines.push(Line::styled(note.clone(), theme.warning));
                 lines
             }
             TranscriptRow::Other { update } => {
-                vec![Line::styled(format!("· {update}"), theme.dim)]
+                vec![Line::styled(
+                    format!("· {}", other_label(update)),
+                    theme.dim,
+                )]
             }
         }
+    }
+}
+
+/// An uninterpreted update named in words (MOD-115 M3 MOD-83): the names the agents are known to
+/// send read as a phrase, and any other wire name is spelled out with its `_`, `/` and `<>`
+/// punctuation turned into spaces, so the datum stays on screen without a snake_case value.
+fn other_label(update: &str) -> String {
+    let known = match update {
+        "available_commands_update" => Some("agent commands updated"),
+        "config_option_update" => Some("agent settings updated"),
+        "current_mode_update" => Some("agent mode changed"),
+        "session_info_update" => Some("session info updated"),
+        htui_agent::acp::MODEL_UNAVAILABLE => Some("model unavailable"),
+        "unhandled_request" => Some("unhandled agent request"),
+        "unknown_session_message" => Some("unrecognised agent message"),
+        htui_agent::cli::UNPARSED => Some("unparsed agent output"),
+        _ => None,
+    };
+    if let Some(known) = known {
+        return known.to_owned();
+    }
+    let words = update
+        .split(['_', '/', '<', '>'])
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if words.is_empty() {
+        "agent update".to_owned()
+    } else {
+        words
     }
 }
 
@@ -694,6 +876,7 @@ mod tests {
         PermissionRequestEvent, TextChunk, ToolCallEvent, ToolResultEvent, ToolResultStatus,
     };
     use htui_agent::record::AnsweredBy;
+    use ratatui::style::Modifier;
     use serde_json::json;
 
     fn envelope(event: DriverEvent) -> DriverEnvelope {
@@ -904,7 +1087,10 @@ mod tests {
         );
         assert_eq!(lines[0].style, theme.error, "the failure");
         assert_eq!(lines[1].style, theme.dim, "the rest of the reason");
-        assert_eq!(lines[2].style, theme.accent, "what the chat opened with");
+        assert_eq!(
+            lines[2].style, theme.warning,
+            "what the chat opened with, which a person has to know (MOD-85)"
+        );
 
         let persisted = SessionEvent {
             run_step_id: ids::STEP_PLAN,
@@ -965,14 +1151,22 @@ mod tests {
             message_id: None,
         })));
         let theme = Theme::default();
-        assert_eq!(transcript.lines(20, &theme, Some("t")).len(), 1, "folded");
+        assert_eq!(
+            transcript.lines(20, &theme, Some("t")).lines.len(),
+            1,
+            "folded"
+        );
         // MOD-67 M6 D4: the folded row names the thoughts key in force, and none unbound.
-        let named = |unfold| transcript.lines(20, &theme, unfold)[0].to_string();
+        let named = |unfold| transcript.lines(20, &theme, unfold).lines[0].to_string();
         assert_eq!(named(Some("T")), "thought  first (T to unfold)");
         assert_eq!(named(None), "thought  first");
 
         transcript.on_act(Act::ChatThoughts);
-        assert_eq!(transcript.lines(20, &theme, Some("t")).len(), 3, "unfolded");
+        assert_eq!(
+            transcript.lines(20, &theme, Some("t")).lines.len(),
+            3,
+            "unfolded"
+        );
     }
 
     /// The fixture's `plan` step is eight persisted rows and seven rendered ones: the
@@ -1047,19 +1241,469 @@ mod tests {
         }
         let theme = Theme::default();
         let tail = transcript.lines(3, &theme, Some("t"));
-        assert_eq!(tail.len(), 3);
+        assert_eq!(tail.lines.len(), 3);
         assert!(
-            tail[2].to_string().contains("cancelled"),
+            tail.lines[2].to_string().contains("cancelled"),
             "the newest line is visible: {:?}",
-            tail[2].to_string()
+            tail.lines[2].to_string()
         );
+
+        // MOD-115 M3 D5: the scrollbar's numbers are the last render's, every line and the first
+        // one drawn.
+        assert_eq!((tail.total, tail.first), (10, 7));
 
         transcript.on_act(Act::ChatTop);
         let top = transcript.lines(3, &theme, Some("t"));
-        assert!(
-            top[0].to_string().contains("end_turn"),
-            "`g` goes to the first line: {:?}",
-            top[0].to_string()
+        assert_eq!((top.total, top.first), (10, 0));
+        assert_eq!(
+            top.lines[0].to_string(),
+            "\u{2014} turn ended \u{2014}",
+            "`g` goes to the first line"
         );
+    }
+
+    /// MOD-115 M3 RV3 (review L1): scrolling down stops at the last page, never past it, and
+    /// reaching it sticks the view to the tail again, so a line streamed afterwards is on screen
+    /// without a keystroke.
+    #[test]
+    fn scrolling_down_stops_at_the_tail_and_sticks_to_it() {
+        let mut transcript = Transcript::new();
+        for n in 0..10 {
+            transcript.apply(&chunk(&format!("line {n}"), &format!("m{n}")));
+        }
+        let theme = Theme::default();
+        let _ = transcript.lines(3, &theme, Some("t"));
+        transcript.on_act(Act::ChatTop);
+        let shown = transcript.lines(3, &theme, Some("t"));
+        assert_eq!((shown.total, shown.first), (10, 0));
+        for _ in 0..20 {
+            transcript.on_act(Act::ListDown);
+        }
+        let shown = transcript.lines(3, &theme, Some("t"));
+        assert_eq!(
+            (shown.total, shown.first),
+            (10, 7),
+            "the last page, not past the end"
+        );
+        assert_eq!(shown.lines.len(), 3, "a full page");
+
+        transcript.apply(&chunk("streamed", "m10"));
+        let shown = transcript.lines(3, &theme, Some("t"));
+        assert_eq!((shown.total, shown.first), (11, 8), "the tail again");
+        assert_eq!(shown.lines[2].to_string(), "streamed");
+
+        // One step back from the tail, and one down is the tail again.
+        transcript.on_act(Act::ListUp);
+        let shown = transcript.lines(3, &theme, Some("t"));
+        assert_eq!((shown.total, shown.first), (11, 7));
+        transcript.on_act(Act::ListDown);
+        transcript.apply(&chunk("more", "m11"));
+        let shown = transcript.lines(3, &theme, Some("t"));
+        assert_eq!((shown.total, shown.first), (12, 9), "it follows the tail");
+    }
+
+    /// MOD-115 M3 RV3 (review L1): a view parked past what the rows now render to (thoughts
+    /// folded again) shows the last page, not a lone last line.
+    #[test]
+    fn a_view_parked_past_the_end_shows_the_last_page() {
+        let mut transcript = Transcript::new();
+        transcript.apply(&envelope(DriverEvent::ThoughtChunk(TextChunk {
+            text: (0..10)
+                .map(|n| format!("t{n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            message_id: None,
+        })));
+        transcript.apply(&chunk("after", "m1"));
+        transcript.apply(&chunk("last", "m2"));
+        let theme = Theme::default();
+        transcript.on_act(Act::ChatThoughts);
+        let shown = transcript.lines(3, &theme, Some("t"));
+        assert_eq!((shown.total, shown.first), (12, 9), "unfolded");
+        transcript.on_act(Act::ListUp);
+        let shown = transcript.lines(3, &theme, Some("t"));
+        assert_eq!((shown.total, shown.first), (12, 8), "parked");
+        transcript.on_act(Act::ChatThoughts);
+        let shown = transcript.lines(3, &theme, Some("t"));
+        assert_eq!((shown.total, shown.first), (3, 0), "folded: the one page");
+        assert_eq!(shown.lines.len(), 3, "{shown:?}");
+    }
+
+    /// MOD-115 M3 RV4: on a chat that fits one page there is no line above the window, so a
+    /// step up stays on the tail; the lines streamed after it are followed, not left below.
+    #[test]
+    fn a_step_up_on_a_one_page_chat_keeps_the_tail() {
+        let mut transcript = Transcript::new();
+        let theme = Theme::default();
+        transcript.apply(&chunk("first", "m0"));
+        let shown = transcript.lines(5, &theme, Some("t"));
+        assert_eq!((shown.total, shown.first), (1, 0), "one page");
+        transcript.on_act(Act::ListUp);
+        for n in 1..12 {
+            transcript.apply(&chunk(&format!("line {n}"), &format!("m{n}")));
+        }
+        let shown = transcript.lines(5, &theme, Some("t"));
+        assert_eq!((shown.total, shown.first), (12, 7), "still the tail");
+        assert_eq!(
+            texts(&shown),
+            ["line 7", "line 8", "line 9", "line 10", "line 11"],
+            "the last five lines"
+        );
+    }
+
+    /// The lines in view, as text.
+    fn texts(shown: &Shown) -> Vec<String> {
+        shown.lines.iter().map(ToString::to_string).collect()
+    }
+
+    /// MOD-115 M3 RV3 (review L4): a frame renders only the rows that changed since the last
+    /// one. A streamed chunk re-renders its own row, with the new text on screen; a call's result
+    /// re-renders the call's row above it; nothing changed renders nothing.
+    #[test]
+    fn a_frame_renders_only_the_rows_that_changed() {
+        let mut transcript = Transcript::new();
+        transcript.apply(&envelope(DriverEvent::ToolCall(ToolCallEvent {
+            tool_call_id: "call-1".to_owned(),
+            title: "Read main.rs".to_owned(),
+            tool_kind: ToolKind::Read,
+            input: json!({}),
+            locations: Vec::new(),
+        })));
+        for n in 0..4 {
+            transcript.apply(&chunk(&format!("line {n}"), &format!("m{n}")));
+        }
+        let theme = Theme::default();
+        let first = transcript.lines(10, &theme, Some("t"));
+        assert_eq!(transcript.renders.get(), 5, "every row once");
+        assert_eq!(
+            transcript.lines(10, &theme, Some("t")),
+            first,
+            "the same lines"
+        );
+        assert_eq!(transcript.renders.get(), 5, "and none rendered again");
+
+        transcript.apply(&chunk(" and more", "m3"));
+        let shown = transcript.lines(10, &theme, Some("t"));
+        assert_eq!(transcript.renders.get(), 6, "the streamed row alone");
+        assert_eq!(texts(&shown)[4], "line 3 and more", "{shown:?}");
+        assert_eq!(shown.total, 5);
+
+        transcript.apply(&envelope(DriverEvent::ToolResult(ToolResultEvent {
+            tool_call_id: "call-1".to_owned(),
+            status: ToolResultStatus::Completed,
+            output: None,
+            locations: Vec::new(),
+            terminal_reason: None,
+        })));
+        let shown = transcript.lines(10, &theme, Some("t"));
+        assert_eq!(transcript.renders.get(), 7, "the call's row alone");
+        assert!(texts(&shown)[0].contains("done"), "{shown:?}");
+        assert!(!texts(&shown)[0].contains("running"), "{shown:?}");
+
+        transcript.apply(&chunk("new row", "m4"));
+        let shown = transcript.lines(10, &theme, Some("t"));
+        assert_eq!(transcript.renders.get(), 8, "the new row alone");
+        assert_eq!((shown.total, texts(&shown)[5].as_str()), (6, "new row"));
+    }
+
+    /// MOD-115 M3 RV3 (review L4): the cached lines follow what they were rendered with: the
+    /// thoughts unfolded and folded again, another unfold key, another theme.
+    #[test]
+    fn the_cached_lines_follow_the_fold_the_unfold_key_and_the_theme() {
+        let mut transcript = Transcript::new();
+        transcript.apply(&envelope(DriverEvent::ThoughtChunk(TextChunk {
+            text: "first\nsecond".to_owned(),
+            message_id: None,
+        })));
+        transcript.apply(&chunk("said", "m1"));
+        let theme = Theme::default();
+        let folded = transcript.lines(10, &theme, Some("t"));
+        assert_eq!(
+            texts(&folded),
+            ["thought  first (t to unfold)", "said"],
+            "folded"
+        );
+
+        transcript.on_act(Act::ChatThoughts);
+        let unfolded = transcript.lines(10, &theme, Some("t"));
+        assert_eq!(
+            texts(&unfolded),
+            ["thought  first", "thought  second", "said"],
+            "unfolded"
+        );
+        transcript.on_act(Act::ChatThoughts);
+        assert_eq!(
+            transcript.lines(10, &theme, Some("t")),
+            folded,
+            "folded again"
+        );
+
+        let rebound = transcript.lines(10, &theme, Some("T"));
+        assert_eq!(texts(&rebound)[0], "thought  first (T to unfold)");
+        let unbound = transcript.lines(10, &theme, None);
+        assert_eq!(texts(&unbound)[0], "thought  first");
+
+        let mono = Theme::monochrome();
+        assert_ne!(mono.dim, theme.dim, "two themes to tell apart");
+        let shown = transcript.lines(10, &mono, Some("t"));
+        assert_eq!(shown.lines[0].style, mono.dim, "the new theme's");
+        let shown = transcript.lines(10, &theme, Some("t"));
+        assert_eq!(shown.lines[0].style, theme.dim, "and back");
+    }
+
+    /// The lines `row` renders to, as text.
+    fn shown(row: &TranscriptRow) -> Vec<String> {
+        Transcript::new()
+            .render_row(row, &Theme::default(), Some("t"))
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    /// MOD-115 M3 MOD-83, D-16: a tool call names its kind in words (`execute` reads `run`) and
+    /// how it stands as a glyph and a word, never `[ok]` or `[\u{2026}]`.
+    #[test]
+    fn a_tool_call_names_its_kind_and_its_state_as_a_mark() {
+        let theme = Theme::default();
+        let call = |kind: ToolKind, status: CallStatus| TranscriptRow::ToolCall {
+            id: "call-1".to_owned(),
+            title: "rm -rf build".to_owned(),
+            kind,
+            status,
+        };
+        for (status, text) in [
+            (CallStatus::Running, "run rm -rf build  \u{25d0} running"),
+            (CallStatus::Completed, "run rm -rf build  \u{25cf} done"),
+            (
+                CallStatus::Failed { reason: None },
+                "run rm -rf build  \u{2717} failed",
+            ),
+            (
+                CallStatus::Failed {
+                    reason: Some(TerminalReason::Rejected),
+                },
+                "run rm -rf build  \u{2717} rejected",
+            ),
+            (
+                CallStatus::Failed {
+                    reason: Some(TerminalReason::Cancelled),
+                },
+                "run rm -rf build  \u{2298} cancelled",
+            ),
+        ] {
+            assert_eq!(shown(&call(ToolKind::Execute, status)), [text]);
+        }
+        assert_eq!(
+            shown(&call(ToolKind::SwitchMode, CallStatus::Completed)),
+            ["switch mode rm -rf build  \u{25cf} done"],
+            "no snake_case kind"
+        );
+        let lines = Transcript::new().render_row(
+            &call(ToolKind::Read, CallStatus::Failed { reason: None }),
+            &theme,
+            None,
+        );
+        let mark = lines[0].spans.last().expect("the mark's word");
+        assert_eq!(mark.style, theme.error, "a failed call reads as one");
+    }
+
+    /// MOD-115 M3 MOD-83: a plan entry's state is a glyph and a word, never `[in_progress]`.
+    #[test]
+    fn a_plan_entry_shows_its_state_as_a_mark() {
+        use htui_agent::event::{PlanEntryPriority, PlanEntryStatus};
+        let entry = |content: &str, status| PlanEntry {
+            content: content.to_owned(),
+            status,
+            priority: PlanEntryPriority::High,
+        };
+        let plan = TranscriptRow::Plan {
+            entries: vec![
+                entry("read", PlanEntryStatus::Completed),
+                entry("fix", PlanEntryStatus::InProgress),
+                entry("test", PlanEntryStatus::Pending),
+            ],
+        };
+        assert_eq!(
+            shown(&plan),
+            [
+                "plan",
+                "  \u{25cf} done  read",
+                "  \u{25d0} in progress  fix",
+                "  \u{25cb} pending  test",
+            ]
+        );
+    }
+
+    /// MOD-115 M3 MOD-83: a turn ends in words: an ordinary end says nothing more, any other
+    /// reason is named, and no stop reason prints its snake_case value.
+    #[test]
+    fn a_turn_ends_in_words() {
+        let done = |stop_reason| TranscriptRow::Done { stop_reason };
+        assert_eq!(
+            shown(&done(StopReason::EndTurn)),
+            ["\u{2014} turn ended \u{2014}"]
+        );
+        assert_eq!(
+            shown(&done(StopReason::MaxTokens)),
+            ["\u{2014} turn ended: token limit reached \u{2014}"]
+        );
+        for reason in StopReason::ALL.iter() {
+            let text = shown(&done(*reason)).concat();
+            assert!(!text.contains('_'), "{text:?}");
+        }
+    }
+
+    /// MOD-115 M3 MOD-83: a parked request counts its options in words (`1 option`, never
+    /// `1 options`).
+    #[test]
+    fn a_parked_request_counts_its_options_in_words() {
+        let option = |id: &str| PermissionOption {
+            id: id.to_owned(),
+            label: id.to_owned(),
+            kind: PermissionOptionKind::AllowOnce,
+        };
+        let parked = |options: Vec<PermissionOption>| TranscriptRow::Permission {
+            request_id: PermissionRequestId::new("req-1"),
+            tool_call_id: None,
+            options,
+            resolved: None,
+        };
+        assert_eq!(
+            shown(&parked(vec![option("allow")])),
+            ["permission  waiting on you (1 option)"]
+        );
+        assert_eq!(
+            shown(&parked(vec![option("allow"), option("reject")])),
+            ["permission  waiting on you (2 options)"]
+        );
+    }
+
+    /// MOD-115 M3 MOD-83: an answered request names the chosen option by its label, never by
+    /// the agent's own id (`allow_always`); an id no option carries is still shown as is.
+    #[test]
+    fn an_answered_request_names_the_option_by_its_label() {
+        let answered = |option_id: &str| TranscriptRow::Permission {
+            request_id: PermissionRequestId::new("req-1"),
+            tool_call_id: None,
+            options: vec![PermissionOption {
+                id: "allow_always".to_owned(),
+                label: "Always Allow".to_owned(),
+                kind: PermissionOptionKind::AllowAlways,
+            }],
+            resolved: Some(Resolution {
+                option_id: Some(option_id.to_owned()),
+                by: "user".to_owned(),
+                denied: false,
+            }),
+        };
+        assert_eq!(
+            shown(&answered("allow_always")),
+            ["permission  Always Allow (by user)"]
+        );
+        assert_eq!(
+            shown(&answered("unknown")),
+            ["permission  unknown (by user)"]
+        );
+    }
+
+    /// MOD-115 M3 MOD-83: a row the tab does not interpret is named in words, never by the
+    /// transport's own wire name (`available_commands_update`, `<unparsed>`, `system/init`).
+    #[test]
+    fn an_uninterpreted_update_is_named_in_words() {
+        let other = |update: &str| TranscriptRow::Other {
+            update: update.to_owned(),
+        };
+        assert_eq!(
+            shown(&other("available_commands_update")),
+            ["\u{b7} agent commands updated"]
+        );
+        assert_eq!(
+            shown(&other(htui_agent::cli::UNPARSED)),
+            ["\u{b7} unparsed agent output"]
+        );
+        assert_eq!(shown(&other("system/init")), ["\u{b7} system init"]);
+        for update in [
+            "available_commands_update",
+            "config_option_update",
+            "current_mode_update",
+            "session_info_update",
+            htui_agent::acp::MODEL_UNAVAILABLE,
+            "unhandled_request",
+            "unknown_session_message",
+            htui_agent::cli::UNPARSED,
+            "system/init",
+            "_vendor.dev/some_ext",
+            "",
+        ] {
+            let text = shown(&other(update)).concat();
+            assert!(
+                !text.contains(['_', '/', '<', '>']),
+                "{update:?} rendered as {text:?}"
+            );
+            assert!(text.len() > "\u{b7} ".len(), "{update:?} rendered empty");
+        }
+    }
+
+    /// MOD-115 M3 MOD-83: an edit proposal's state is a glyph and a word, never `[accepted]`.
+    #[test]
+    fn an_edit_proposal_shows_its_state_as_a_mark() {
+        let proposal = |accepted| TranscriptRow::EditProposal {
+            id: None,
+            path: "src/a.rs".to_owned(),
+            diff: String::new(),
+            accepted,
+        };
+        assert_eq!(
+            shown(&proposal(Some(true))),
+            ["edit  src/a.rs  \u{25cf} accepted"]
+        );
+        assert_eq!(
+            shown(&proposal(Some(false))),
+            ["edit  src/a.rs  \u{2717} rejected"]
+        );
+        assert_eq!(
+            shown(&proposal(None)),
+            ["edit  src/a.rs  \u{26a0} waiting on you"]
+        );
+    }
+
+    /// MOD-115 M3 MOD-85: the speaker label `you` is a title, not focus; a request nobody has
+    /// answered needs a person (the warning role); an answered one is history (dim). Without
+    /// colour the speaker and the warning are still bold.
+    #[test]
+    fn the_speaker_and_a_waiting_request_take_their_roles() {
+        let permission = |resolved| TranscriptRow::Permission {
+            request_id: PermissionRequestId::new("req-1"),
+            tool_call_id: None,
+            options: Vec::new(),
+            resolved,
+        };
+        for theme in [Theme::default(), Theme::monochrome()] {
+            let transcript = Transcript::new();
+            let you = transcript.render_row(
+                &TranscriptRow::Prompt {
+                    text: "hello".to_owned(),
+                },
+                &theme,
+                None,
+            );
+            assert_eq!(you[0].spans[0].content, "you  ");
+            assert_eq!(you[0].spans[0].style, theme.title);
+            let waiting = transcript.render_row(&permission(None), &theme, None);
+            assert_eq!(waiting[0].style, theme.warning);
+            let answered = transcript.render_row(
+                &permission(Some(Resolution {
+                    option_id: Some("allow".to_owned()),
+                    by: "user".to_owned(),
+                    denied: false,
+                })),
+                &theme,
+                None,
+            );
+            assert_eq!(answered[0].style, theme.dim);
+        }
+        let mono = Theme::monochrome();
+        assert!(mono.title.add_modifier.contains(Modifier::BOLD));
+        assert_eq!((mono.warning.fg, mono.title.fg), (None, None));
     }
 }

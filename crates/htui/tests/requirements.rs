@@ -30,6 +30,12 @@ use ratatui::style::Style;
 /// The detail pane's `%m-%d %H:%M` stamps: a revision written by a case carries today's.
 const STAMP_FILTER: (&str, &str) = (r"\d{2}-\d{2} \d{2}:\d{2}", "MM-DD hh:mm");
 
+/// The priority field set to must, as `kit::form` draws a choice (MOD-115 M3 D6).
+const MUST: &str = "\u{2039} must \u{203a}";
+
+/// The priority field set to later.
+const LATER: &str = "\u{2039} later \u{203a}";
+
 /// The shell over `store` in the Platform workspace (`htui`, `agy`), on the Requirements tab.
 async fn open_platform_over(store: MemStore) -> Harness {
     open_platform_in(Harness::over(store)).await
@@ -81,11 +87,16 @@ fn type_text(harness: &mut Harness, text: &str) {
     }
 }
 
+/// A kit pane's title on its top border (MOD-115 M3): `╭─ KEY `.
+fn titled(key: &str) -> String {
+    format!("\u{256d}\u{2500} {key} ")
+}
+
 /// Moves the tree's cursor onto the requirement `key`: to the top, then down until the detail pane
 /// is titled with it.
 fn select(harness: &mut Harness, key: &str) {
     harness.key("g");
-    let title = format!("\u{250c} {key} ");
+    let title = titled(key);
     for _ in 0..20 {
         if harness.render().contains(&title) {
             return;
@@ -111,13 +122,12 @@ fn bottom_border(frame: &str) -> usize {
         .unwrap_or_else(|| panic!("no bottom border:\n{frame}"))
 }
 
-/// The notice: the rows between the content's bottom border and the tab's filter row (the frame's
-/// last line), joined (it wraps).
+/// The notice: the rows under the content's bottom border, joined (it wraps). MOD-115 M3: the
+/// filter is a band in the tree, so no filter row follows them.
 fn notice(frame: &str) -> String {
     let lines: Vec<&str> = frame.lines().collect();
-    let filter = lines.len() - 1;
     let bottom = bottom_border(frame);
-    lines[bottom + 1..filter]
+    lines[bottom + 1..]
         .iter()
         .map(|line| line.trim())
         .collect::<Vec<_>>()
@@ -149,7 +159,7 @@ async fn the_tab_shows_the_tree_and_r_ent_1_detail() {
     let mut harness = open().await;
     let frame = harness.render();
     assert!(
-        frame.contains("\u{250c} R-ENT-1 "),
+        frame.contains(&titled("R-ENT-1")),
         "R-ENT-1 is selected: {frame}"
     );
     assert!(frame.contains("ANA-1"), "coverage lists ANA-1: {frame}");
@@ -191,8 +201,12 @@ async fn slash_filters_over_key_and_body() {
         "R-ENT-2 matches neither key nor body: {frame}"
     );
     assert!(
-        frame.contains("\u{250c} R-STO-1 "),
+        frame.contains(&titled("R-STO-1")),
         "Enter re-selects onto a visible row: {frame}"
+    );
+    assert!(
+        band(&frame).starts_with("\u{2502} / STO "),
+        "the applied filter's band: {frame}"
     );
     insta::assert_snapshot!("requirements_filter", frame);
 }
@@ -215,7 +229,7 @@ async fn n_mints_the_next_key_in_the_area() {
     let frame = harness.render();
     assert!(notice(&frame).contains("minted R-ENT-3"), "{frame}");
     assert!(
-        frame.contains("\u{250c} R-ENT-3 "),
+        frame.contains(&titled("R-ENT-3")),
         "the minted row is selected: {frame}"
     );
     let minted = htui_requirements(&store)
@@ -251,7 +265,10 @@ async fn e_amends_with_a_deciding_item() {
     harness.settle().await;
     let frame = harness.render();
     assert!(notice(&frame).contains("amended R-ENT-1 to v3"), "{frame}");
-    assert!(frame.contains("must \u{b7} active \u{b7} v3"), "{frame}");
+    assert!(
+        frame.contains("must \u{b7} \u{25cf} active \u{b7} v3"),
+        "{frame}"
+    );
     assert!(frame.contains("! suspect"), "ANA-1 stays suspect: {frame}");
     let amended = store
         .requirement(ids::REQ_ENT_1)
@@ -296,7 +313,7 @@ async fn shift_w_withdraws_after_the_key_is_typed_back() {
         "a withdrawn row stays listed: {frame}"
     );
     assert!(
-        frame.contains("later \u{b7} withdrawn \u{b7} v2"),
+        frame.contains("later \u{b7} \u{2715} withdrawn \u{b7} v2"),
         "{frame}"
     );
     let withdrawn = store
@@ -424,9 +441,10 @@ fn hint(frame: &str) -> String {
     .to_owned()
 }
 
-/// The tab's own last row, the frame's last line: the filter's input while it is open.
-fn filter_row(frame: &str) -> String {
-    frame.lines().last().unwrap_or_default().to_owned()
+/// The tree pane's first inner row, under the header and the panes' top border: the filter band
+/// while a filter is typed or applied (MOD-115 M3 D6).
+fn band(frame: &str) -> String {
+    frame.lines().nth(2).unwrap_or_default().to_owned()
 }
 
 /// The demo on the Requirements tab with `file` as the keys file (MOD-67 M4).
@@ -468,26 +486,27 @@ async fn the_priority_field_keeps_its_value_keys_and_ignores_chords() {
     harness.key("tab");
     harness.key("tab");
     let frame = harness.render();
-    assert!(frame.contains("[must]"), "{frame}");
-    assert!(hint(&frame).ends_with(" \u{b7} m/l priority"), "{frame}");
+    assert!(frame.contains(MUST), "{frame}");
+    // MOD-115 M3: the priority's own keys lead the hint, so the pane's cut never drops them.
+    assert!(hint(&frame).starts_with("m/l priority \u{b7} "), "{frame}");
     harness.key("l");
-    assert!(harness.render().contains("[later]"), "`l` is later");
+    assert!(harness.render().contains(LATER), "`l` is later");
     harness.key("m");
-    assert!(harness.render().contains("[must]"), "`m` is must");
+    assert!(harness.render().contains(MUST), "`m` is must");
     harness.key("space");
-    assert!(harness.render().contains("[later]"), "`space` toggles");
+    assert!(harness.render().contains(LATER), "`space` toggles");
     harness.key("left");
-    assert!(harness.render().contains("[must]"), "`left` toggles");
+    assert!(harness.render().contains(MUST), "`left` toggles");
     harness.key("right");
-    assert!(harness.render().contains("[later]"), "`right` toggles");
+    assert!(harness.render().contains(LATER), "`right` toggles");
     harness.key("right");
-    assert!(harness.render().contains("[must]"), "`right` toggles back");
+    assert!(harness.render().contains(MUST), "`right` toggles back");
     harness.key("ctrl-l");
-    assert!(harness.render().contains("[must]"), "`ctrl-l` is not `l`");
+    assert!(harness.render().contains(MUST), "`ctrl-l` is not `l`");
     harness.key("l");
     harness.key("alt-m");
     let frame = harness.render();
-    assert!(frame.contains("[later]"), "`alt-m` is not `m`: {frame}");
+    assert!(frame.contains(LATER), "`alt-m` is not `m`: {frame}");
     assert!(
         frame.contains(" New requirement in ENT "),
         "the form is still open: {frame}"
@@ -553,7 +572,7 @@ async fn tab_and_down_move_the_form_focus() {
     type_text(&mut harness, "r");
     harness.key("tab");
     harness.key("l");
-    assert!(harness.render().contains("[later]"), "on Priority");
+    assert!(harness.render().contains(LATER), "on Priority");
     harness.key("down");
     type_text(&mut harness, "x");
     // The body's `TextArea` keeps `Up` (a line up); `Shift+Tab` wraps back to Priority.
@@ -566,7 +585,7 @@ async fn tab_and_down_move_the_form_focus() {
         "`down` on Priority moved to the body: {frame}"
     );
     assert!(
-        frame.contains("[must]"),
+        frame.contains(MUST),
         "`backtab` on the body moved to Priority: {frame}"
     );
     harness.key("esc");
@@ -585,7 +604,7 @@ async fn tab_and_down_move_the_form_focus() {
         "the deciding item took it: {frame}"
     );
     assert!(
-        frame.contains("[later]"),
+        frame.contains(LATER),
         "`up` moved back to Priority: {frame}"
     );
 }
@@ -648,10 +667,11 @@ async fn the_requirements_tree_status_line_and_help_box() {
          \u{b7} Tab next pane \u{b7} Shift+Tab previous pane"
     );
     let frame = harness.render();
+    // MOD-115 M3 D-14 (maintainer, 2026-10-21): the tree's own hints, the write keys first, cut
+    // to the 45-cell tree; the unit tests pin the whole line.
     assert_eq!(
         hint(&frame),
-        "j/k move \u{b7} Enter fold \u{b7} / filter \u{b7} a area \u{b7} n new \u{b7} e amend \
-         \u{b7} W withdraw \u{b7} r reload",
+        "a area \u{b7} n new \u{b7} e amend \u{b7} W withdraw \u{b7} \u{2026}",
         "{frame}"
     );
     harness.key("?");
@@ -684,8 +704,11 @@ async fn ctrl_s_on_the_filter_saves_nothing_and_types_nothing() {
     harness.key("ctrl-s");
     assert_eq!(harness.queued(), 0, "nothing was sent");
     let frame = harness.render();
-    assert!(filter_row(&frame).starts_with(" /ST"), "{frame}");
-    assert!(!filter_row(&frame).starts_with(" /STs"), "{frame}");
+    assert!(band(&frame).starts_with("\u{2502}\u{258c}/ ST"), "{frame}");
+    assert!(
+        !band(&frame).starts_with("\u{2502}\u{258c}/ STs"),
+        "{frame}"
+    );
     assert_eq!(hint(&frame), "Enter apply \u{b7} Esc clear", "{frame}");
 }
 
@@ -723,23 +746,25 @@ fn style_at(buffer: &Buffer, y: u16, text: &str) -> Style {
 fn border_y(buffer: &Buffer) -> u16 {
     (0..buffer.area.height)
         .rev()
-        .find(|y| buffer[(0, *y)].symbol() == "\u{2514}")
+        .find(|y| matches!(buffer[(0, *y)].symbol(), "\u{2514}" | "\u{2570}"))
         .expect("a bottom border")
 }
 
 /// MOD-67 M6 T2 (PRD D1 "mirrored in the view as greyed keys"): in the hints on the bottom border
 /// the write keys are drawn dim, as an idle tab chip in the header is, where a write would be
-/// refused, and in the move keys' style where one would be sent.
+/// refused, and in the move keys' style where one would be sent. 200 columns, so the tree's hints
+/// are drawn whole (MOD-115 M3 D-14).
 #[tokio::test]
 async fn the_hint_row_greys_the_write_keys_where_a_write_is_refused() {
-    let mut harness = open_platform_over(stranger_first()).await;
+    let wide = |store: MemStore| Harness::over(store).size(200, 30);
+    let mut harness = open_platform_in(wide(stranger_first())).await;
     let buffer = harness.render_buffer();
     let dim = style_at(&buffer, 0, "\u{b2}Skills");
     let y = border_y(&buffer);
     assert_eq!(style_at(&buffer, y, "a area"), dim, "not the maintainer");
     assert_ne!(style_at(&buffer, y, "j/k move"), dim);
 
-    let mut harness = open().await;
+    let mut harness = open_platform_in(wide(MemStore::demo())).await;
     let buffer = harness.render_buffer();
     let y = border_y(&buffer);
     assert_eq!(
@@ -762,7 +787,7 @@ async fn the_detail_takes_motion_and_back_returns_to_the_row_left() {
     harness.settle().await;
     let frame = harness.render();
     assert!(
-        frame.contains("\u{250c} R-ENT-2 "),
+        frame.contains(&titled("R-ENT-2")),
         "the cursor stayed:\n{frame}"
     );
 
@@ -773,7 +798,7 @@ async fn the_detail_takes_motion_and_back_returns_to_the_row_left() {
     harness.settle().await;
     let frame = harness.render();
     assert!(
-        frame.contains("\u{250c} R-ENT-2 "),
+        frame.contains(&titled("R-ENT-2")),
         "back on R-ENT-2:\n{frame}"
     );
 }
@@ -794,7 +819,7 @@ async fn a_form_opened_with_the_tree_zoomed_is_on_screen() {
     harness.settle().await;
     let frame = harness.render();
     assert!(
-        frame.contains("\u{250c} New area in htui "),
+        frame.contains(&titled("New area in htui")),
         "the form is drawn:\n{frame}"
     );
 }
@@ -820,7 +845,7 @@ async fn a_form_opened_with_the_activity_zoomed_is_on_screen() {
     harness.settle().await;
     let frame = harness.render();
     assert!(
-        frame.contains("\u{250c} New area in htui "),
+        frame.contains(&titled("New area in htui")),
         "the form is drawn:\n{frame}"
     );
 }
@@ -853,5 +878,382 @@ async fn the_tree_is_drawn_above_the_filter_opened_with_the_activity_zoomed() {
     assert!(
         frame.contains("R-STO-1") && !frame.contains("R-ENT-2"),
         "and it follows the filter typed:\n{frame}"
+    );
+}
+
+/// The panes after `keys`, a frame drawn before the first and after each as the app draws one,
+/// so the shell's focus cycle reads the panes on screen.
+async fn after(harness: &mut Harness, keys: &[&str]) -> String {
+    harness.render();
+    for key in keys {
+        harness.key(key);
+        harness.settle().await;
+        harness.render();
+    }
+    harness.render()
+}
+
+/// Opens the filter with `/` and types `STO` into it: the frame drawn then.
+async fn filtered_by_sto(harness: &mut Harness) -> String {
+    harness.key("/");
+    type_text(harness, "STO");
+    harness.settle().await;
+    harness.render()
+}
+
+/// MOD-115 M3 RV3 (review M1): with the detail zoomed, `/` draws the tree over the zoomed detail
+/// with its band, so the filter typed is on screen and the tree follows it; leaving the filter
+/// gives the detail its zoom back.
+#[tokio::test]
+async fn a_filter_typed_with_the_detail_zoomed_is_on_screen() {
+    let mut harness = open().await;
+    let zoomed = after(&mut harness, &["tab", "z"]).await;
+    assert!(
+        !zoomed.contains(&titled("Requirements (3)")) && zoomed.contains(&titled("R-ENT-1")),
+        "the detail is zoomed:\n{zoomed}"
+    );
+    let frame = filtered_by_sto(&mut harness).await;
+    assert!(
+        band(&frame).contains("/ STO"),
+        "the band shows the filter typed:\n{frame}"
+    );
+    assert!(
+        frame.contains("R-STO-1") && !frame.contains("R-ENT-2"),
+        "the tree follows it:\n{frame}"
+    );
+    assert!(
+        hint(&frame).contains("apply"),
+        "the filter's hints:\n{frame}"
+    );
+    let frame = after(&mut harness, &["esc"]).await;
+    assert!(
+        !frame.contains(&titled("Requirements (3)")) && frame.contains(&titled("R-ENT-1")),
+        "the detail is zoomed again:\n{frame}"
+    );
+}
+
+/// MOD-115 M3 RV3 (review M1): with the tree hidden, `/` draws it back over the content while
+/// the filter is typed, the band and the tree on screen; applied, the tree is hidden again.
+#[tokio::test]
+async fn a_filter_typed_with_the_tree_hidden_is_on_screen() {
+    let mut harness = open().await;
+    let hidden = after(&mut harness, &["f2"]).await;
+    assert!(
+        !hidden.contains(&titled("Requirements (3)")),
+        "the tree is hidden:\n{hidden}"
+    );
+    let frame = filtered_by_sto(&mut harness).await;
+    assert!(
+        band(&frame).contains("/ STO"),
+        "the band shows the filter typed:\n{frame}"
+    );
+    assert!(
+        frame.contains("R-STO-1") && !frame.contains("R-ENT-2"),
+        "the tree follows it:\n{frame}"
+    );
+    let frame = after(&mut harness, &["enter"]).await;
+    assert!(
+        !frame.contains(&titled("Requirements (1)")),
+        "applied, the tree is hidden again:\n{frame}"
+    );
+}
+
+/// MOD-115 M3 RV3 repair (review M1, activity presets): with the tree hidden beside a shown
+/// activity pane, `/` draws the tree over the detail's rect only, so the shell's Activity
+/// placeholder neither cuts the tree's bottom border (where the filter's hints are) nor takes
+/// the tree's rows into its own pane. `presets` is how many `p` reach the preset.
+async fn filter_with_the_tree_hidden_beside_the_activity(presets: usize) -> String {
+    let mut harness = open().await;
+    let mut keys = vec!["p"; presets];
+    keys.push("f2");
+    let hidden = after(&mut harness, &keys).await;
+    assert!(
+        hidden.contains(&titled("Activity")) && !hidden.contains(&titled("Requirements (3)")),
+        "the activity pane is shown, the tree hidden:\n{hidden}"
+    );
+    let frame = filtered_by_sto(&mut harness).await;
+    assert!(
+        frame.contains(&titled("Activity")),
+        "the activity pane stays:\n{frame}"
+    );
+    assert!(
+        frame.contains("Enter apply \u{b7} Esc clear"),
+        "the filter's hints are on the tree's border:\n{frame}"
+    );
+    frame
+}
+
+#[tokio::test]
+async fn a_filter_typed_with_the_tree_hidden_keeps_ide_activity_s_panes_whole() {
+    let frame = filter_with_the_tree_hidden_beside_the_activity(1).await;
+    let tree = frame
+        .lines()
+        .position(|line| line.contains(&titled("Requirements (1)")))
+        .unwrap_or_else(|| panic!("the tree:\n{frame}"));
+    let activity = frame
+        .lines()
+        .position(|line| line.contains(&titled("Activity")))
+        .unwrap_or_else(|| panic!("the activity:\n{frame}"));
+    assert!(
+        activity > tree,
+        "the activity pane under the tree:\n{frame}"
+    );
+    let bottom = frame.lines().nth(activity - 1).unwrap_or_default();
+    assert!(
+        bottom.starts_with('\u{2570}') && bottom.contains("apply"),
+        "the tree's bottom border, its hints on it, right above the activity:\n{frame}"
+    );
+}
+
+#[tokio::test]
+async fn a_filter_typed_with_the_tree_hidden_keeps_columns_panes_whole() {
+    let frame = filter_with_the_tree_hidden_beside_the_activity(2).await;
+    let top = frame
+        .lines()
+        .find(|line| line.contains(&titled("Activity")))
+        .unwrap_or_else(|| panic!("the activity:\n{frame}"));
+    assert!(
+        top.contains(&titled("Requirements (1)")),
+        "side by side:\n{frame}"
+    );
+    // The Activity pane's left column: where its top-left corner is, in cells.
+    let column = top
+        .chars()
+        .skip(1)
+        .position(|c| c == '\u{256d}')
+        .map(|at| at + 1)
+        .expect("the activity's corner");
+    assert_eq!(
+        top.chars().nth(column - 1),
+        Some('\u{256e}'),
+        "the tree's top-right corner stands before the Activity pane:\n{frame}"
+    );
+    let band = band(&frame);
+    assert!(
+        band.chars()
+            .take(column)
+            .collect::<String>()
+            .ends_with("1 of 3\u{2502}"),
+        "the band ends at the tree's own right border:\n{frame}"
+    );
+    assert!(
+        !frame.lines().any(|line| line
+            .chars()
+            .skip(column)
+            .collect::<String>()
+            .contains("mirror")),
+        "no tree row in the Activity pane:\n{frame}"
+    );
+}
+
+/// MOD-115 M3 RV3 (carried L-req), MD-A end to end: the `[field]` translation in the filter.
+/// With `field.line_down` moved to `ctrl-n`, the shell hands the filter's field the canonical
+/// `Down`, which a one-line field passes on; `ctrl-n` is that row's alone, so the filter typed,
+/// the tree and the hints stay as they were, and the filter still takes what is typed next.
+/// Whether the filter resolves what its field passes from the chord pressed (`Ctx::pressed`)
+/// shows on no frame (the shell has nothing for the canonical `Down` either way): the
+/// requirements tab's unit test
+/// `the_filter_resolves_what_its_field_passes_from_the_chord_pressed` pins it (RV3 repair).
+#[tokio::test]
+async fn a_rebound_field_chord_in_the_filter_is_only_that_row_s() {
+    let mut harness = open_with_keys("version = 2\n[field]\nline_down = [\"ctrl-n\"]\n").await;
+    let typed = filtered_by_sto(&mut harness).await;
+    assert!(
+        band(&typed).contains("/ STO"),
+        "the filter is typed: {typed}"
+    );
+    harness.key("ctrl-n");
+    harness.settle().await;
+    assert_eq!(
+        harness.render(),
+        typed,
+        "`ctrl-n` is `field.line_down`'s alone: nothing else moved"
+    );
+    harness.key("1");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        band(&frame).contains("/ STO1"),
+        "the filter is still open to type into: {frame}"
+    );
+}
+
+// ---- MOD-115 M3 L-req: the tab on the kit ---------------------------------------------------
+
+/// MOD-81: the tab at 80 columns, the tree and the detail side by side with their hints cut
+/// inside the tree.
+#[tokio::test]
+async fn the_tab_at_80_columns() {
+    let mut harness = open_platform_in(Harness::over(MemStore::demo()).size(80, 24)).await;
+    let frame = harness.render();
+    assert!(frame.contains(&titled("R-ENT-1")), "{frame}");
+    assert!(frame.contains("! suspect"), "{frame}");
+    insta::assert_snapshot!("requirements_tree_80", frame);
+}
+
+/// MOD-115 M3 D3, D6: the filter band while the query is typed, the tree under it.
+#[tokio::test]
+async fn the_filter_band_while_typing() {
+    let mut harness = open().await;
+    harness.key("/");
+    type_text(&mut harness, "STO");
+    let frame = harness.render();
+    assert!(band(&frame).starts_with("\u{2502}\u{258c}/ STO"), "{frame}");
+    assert!(band(&frame).contains("1 of 3"), "{frame}");
+    assert_eq!(hint(&frame), "Enter apply \u{b7} Esc clear", "{frame}");
+    insta::assert_snapshot!("requirements_filter_typing", frame);
+}
+
+/// MOD-115 M3 D6: the amend form on `kit::form`: one label column, the focused field marked, the
+/// priority a choice and the deciding item on its own row.
+#[tokio::test]
+async fn the_amend_form() {
+    let mut harness = open().await;
+    harness.key("e");
+    let frame = harness.render();
+    assert!(frame.contains(&titled("Amend R-ENT-1 (v2)")), "{frame}");
+    assert!(frame.contains(MUST), "{frame}");
+    assert!(frame.contains("deciding item"), "{frame}");
+    insta::assert_snapshot!("requirements_amend_form", frame);
+}
+
+/// MOD-115 M3 RV3 repair (review M2): the stacked text areas' label rows are reserved before
+/// the rows are split, so at a short height the amend form still fits its pane: the deciding
+/// item, focused and typed into, is on screen.
+#[tokio::test]
+async fn the_amend_form_fits_a_short_pane() {
+    let mut harness = open_platform_in(Harness::over(MemStore::demo()).size(100, 10)).await;
+    harness.key("e");
+    for _ in 0..3 {
+        harness.key("tab");
+    }
+    type_text(&mut harness, "ANA-9");
+    let frame = harness.render();
+    assert!(
+        frame.contains("deciding item") && frame.contains("ANA-9"),
+        "the focused field and what is typed into it:\n{frame}"
+    );
+    assert!(
+        frame.contains("body") && frame.contains("rationale") && frame.contains(MUST),
+        "every field still fits:\n{frame}"
+    );
+}
+
+/// MOD-115 M3 RV3 repair (review M2): a pane shorter than the form's least rows scrolls the
+/// focused field into view, so what is typed is on screen.
+#[tokio::test]
+async fn the_amend_form_scrolls_its_focus_into_a_shorter_pane() {
+    let mut harness = open_platform_in(Harness::over(MemStore::demo()).size(100, 8)).await;
+    harness.key("e");
+    for _ in 0..3 {
+        harness.key("tab");
+    }
+    type_text(&mut harness, "ANA-9");
+    let frame = harness.render();
+    assert!(
+        frame.contains("deciding item") && frame.contains("ANA-9"),
+        "the focused field and what is typed into it:\n{frame}"
+    );
+    harness.key("tab");
+    let frame = harness.render();
+    assert!(
+        frame.contains("body"),
+        "back on the body, the form scrolls back to the top:\n{frame}"
+    );
+}
+
+/// Whether `hints` start on the detail's stretch of the bottom border in `frame`: past the tree's
+/// bottom-right corner.
+fn hints_on_the_detail(frame: &str, hints: &str) -> bool {
+    let line = frame.lines().nth(bottom_border(frame)).unwrap_or_default();
+    matches!(
+        (line.find('\u{256f}'), line.find(hints)),
+        (Some(corner), Some(at)) if at > corner
+    )
+}
+
+/// The style of the bottom-left corner of the pane starting at column `x` on row `y`.
+fn corner_at(buffer: &Buffer, x: u16, y: u16) -> Style {
+    assert_eq!(buffer[(x, y)].symbol(), "\u{2570}", "a corner at {x}");
+    buffer[(x, y)].style()
+}
+
+/// The column of the detail's bottom-left corner on row `y`: the second pane's.
+fn detail_x(buffer: &Buffer, y: u16) -> u16 {
+    (1..buffer.area.width)
+        .find(|x| buffer[(*x, y)].symbol() == "\u{2570}")
+        .expect("the detail's corner")
+}
+
+/// L-req repair 1: a form holds every key, so the detail it is drawn in is the focused pane, not
+/// the tree the shell's focus stayed on; its hints go on the detail's wider border, the priority
+/// field's whole row at 100 columns.
+#[tokio::test]
+async fn a_form_draws_its_hints_on_the_detail_that_holds_it() {
+    let mut harness = open().await;
+    let buffer = harness.render_buffer();
+    let y = border_y(&buffer);
+    let focused = corner_at(&buffer, 0, y);
+    harness.key("e");
+    harness.key("tab");
+    harness.key("tab");
+    let frame = harness.render();
+    assert!(frame.contains(MUST), "on the priority: {frame}");
+    let row = "m/l priority \u{b7} Tab field \u{b7} Ctrl+s save \u{b7} Esc cancel";
+    assert_eq!(hint(&frame), row, "{frame}");
+    assert!(hints_on_the_detail(&frame, row), "{frame}");
+    let buffer = harness.render_buffer();
+    let y = border_y(&buffer);
+    assert_eq!(corner_at(&buffer, detail_x(&buffer, y), y), focused);
+    assert_ne!(corner_at(&buffer, 0, y), focused, "the tree is not focused");
+}
+
+/// L-req repair 1: at 80 columns every form's hints are on the detail that holds it, and a body
+/// field's are whole there.
+#[tokio::test]
+async fn every_form_draws_its_hints_on_the_detail_at_80_columns() {
+    for key in ["a", "n", "e", "W"] {
+        let mut harness = open_platform_in(Harness::over(MemStore::demo()).size(80, 24)).await;
+        harness.key(key);
+        let frame = harness.render();
+        let hints = hint(&frame);
+        assert!(!hints.is_empty(), "`{key}`: {frame}");
+        assert!(hints_on_the_detail(&frame, &hints), "`{key}`: {frame}");
+        assert!(hints.ends_with("cancel"), "`{key}`, whole: {frame}");
+    }
+}
+
+/// L-req repair 2: the filter is typed in the tree's band, so with the detail focused `/` hands
+/// the tree the focus and the filter's hints, as an open form hands them to the detail: the
+/// capturing field and its keys are in one pane.
+#[tokio::test]
+async fn a_filter_typed_from_the_detail_focuses_the_tree_that_holds_it() {
+    let mut harness = open().await;
+    let buffer = harness.render_buffer();
+    let y = border_y(&buffer);
+    let focused = corner_at(&buffer, 0, y);
+    harness.key("tab");
+    let buffer = harness.render_buffer();
+    assert_eq!(
+        corner_at(&buffer, detail_x(&buffer, y), y),
+        focused,
+        "the detail is focused before the filter opens"
+    );
+    harness.key("/");
+    type_text(&mut harness, "STO");
+    let frame = harness.render();
+    assert!(
+        band(&frame).contains("STO"),
+        "the band is in the tree: {frame}"
+    );
+    let hints = hint(&frame);
+    assert!(hints.contains("apply"), "the filter's hints: {frame}");
+    assert!(!hints_on_the_detail(&frame, &hints), "on the tree: {frame}");
+    let buffer = harness.render_buffer();
+    assert_eq!(corner_at(&buffer, 0, y), focused, "the tree is focused");
+    assert_ne!(
+        corner_at(&buffer, detail_x(&buffer, y), y),
+        focused,
+        "the detail is not"
     );
 }

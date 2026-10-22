@@ -22,9 +22,9 @@ use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::StoreReply;
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width, graphemes};
+use crate::ui::kit::chips::key_line;
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, PAGE, message};
 use crate::ui::tabs::backlog::list;
-use crate::ui::tabs::settings::key_line;
 use crossterm::event::KeyEvent;
 
 /// The footer's key half (MOD-67 M5): `+/- depth · Enter re-root` with the defaults, read

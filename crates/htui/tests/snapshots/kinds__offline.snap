@@ -3,9 +3,9 @@ source: crates/htui/tests/kinds.rs
 expression: frame
 ---
 no workspace   ¹Settings        0 working · 0 waiting · offline · 0s · no box ·  F9  about   ?  keys
-┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
-│ Agents  Hierarchy  Kinds                                                                         │
+╭─ Kinds ──────────────────────────────────────────────────────────────── Agents  Hierarchy  Kinds ╮
 │catalogue unavailable: store unreachable: this box browses its read-only cache and starts no run  │
+│r asks again once the store answers                                                               │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -31,4 +31,4 @@ no workspace   ¹Settings        0 working · 0 waiting · offline · 0s · no b
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-└─r reload─────────────────────────────────────────────────────────────────────────────────────────┘
+╰─r reload─────────────────────────────────────────────────────────────────────────────────────────╯

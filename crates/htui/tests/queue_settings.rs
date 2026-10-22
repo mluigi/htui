@@ -16,15 +16,20 @@ use chrono::Utc;
 use htui::app::{Action, Handled};
 use htui::queue_settings::{self, QueueSettingsSnapshot, REQUEST_NAMES};
 use htui::store_worker::{StoreReply, StoreRequest, serve};
-use htui::testkit::SectionBench;
-use htui::ui::tabs::settings::SettingsSection;
+use htui::testkit::{Harness, SectionBench};
 use htui::ui::tabs::settings::queue::{NOTHING_SET, QueueSection, UNKNOWN_COST};
+use htui::ui::tabs::settings::{SettingsSection, SettingsTab};
 use htui_core::fixtures::ids;
 use htui_core::model::{
     DEFAULT_MAX_CONCURRENT_ITEMS, QueueSetting, Scope, USD_TOO_PRECISE, WorkspaceId,
 };
 use htui_core::store::{MemStore, QueueTarget, QueueToken, StoreError};
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
+use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::Color;
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use serde_json::{Value, json};
 
 /// The demo world behind a memory backend.
@@ -493,12 +498,57 @@ fn only_request(bench: &SectionBench) -> StoreRequest {
     }
 }
 
-/// The frame line that starts with `label` after its indent, or a panic naming the frame.
+/// The kit form's gutter on the focused row (MOD-115 M3 D3).
+const GUTTER: char = '\u{258c}';
+
+/// The section drawn into a `width`x30 buffer: [`SectionBench::render_section`] answers text, and
+/// the MOD-85 accent is a style.
+fn drawn(bench: &SectionBench, section: &dyn SettingsSection, width: u16) -> Buffer {
+    let area = Rect::new(0, 0, width, 30);
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(width, 30),
+        TerminalOptions {
+            viewport: Viewport::Fixed(area),
+        },
+    )
+    .expect("a test terminal");
+    let ctx = bench.ctx();
+    terminal
+        .draw(|frame| section.render(frame, frame.area(), &ctx))
+        .expect("the section draws");
+    terminal.backend().buffer().clone()
+}
+
+/// The one buffer row whose first cell is the gutter, and the cells after it as text.
+#[track_caller]
+fn marked_row(buffer: &Buffer) -> (u16, String) {
+    let rows: Vec<u16> = (0..buffer.area.height)
+        .filter(|y| buffer[(0, *y)].symbol() == GUTTER.to_string())
+        .collect();
+    let [y] = rows.as_slice() else {
+        panic!("one marked row, got {rows:?}");
+    };
+    let text = (1..buffer.area.width)
+        .map(|x| buffer[(x, *y)].symbol())
+        .collect();
+    (*y, text)
+}
+
+/// Whether cell `x` of row `y` is in the bench theme's selection band.
+fn banded(bench: &SectionBench, buffer: &Buffer, x: u16, y: u16) -> bool {
+    Some(buffer[(x, y)].bg) == bench.ctx().theme.selected.bg
+}
+
+/// The frame line that starts with `label` after its gutter, or a panic naming the frame.
 #[track_caller]
 fn line_of<'a>(frame: &'a str, label: &str, nth: usize) -> &'a str {
     frame
         .lines()
-        .filter(|line| line.trim_start().starts_with(label))
+        .filter(|line| {
+            line.trim_start_matches(GUTTER)
+                .trim_start()
+                .starts_with(label)
+        })
         .nth(nth)
         .unwrap_or_else(|| panic!("no line {nth} for `{label}`: {frame}"))
 }
@@ -755,6 +805,10 @@ async fn offline_the_section_says_the_server_is_needed() {
     let frame = bench.render_section(&section, 100);
     assert!(frame.contains(DATABASE_UNREACHABLE), "{frame}");
     assert!(!frame.contains("all boxes"), "{frame}");
+    assert!(
+        frame.contains("r asks again once the store answers"),
+        "the refusal has a next step, through the reload key (MOD-83): {frame}"
+    );
     insta::assert_snapshot!("offline", frame);
 }
 
@@ -908,4 +962,248 @@ async fn enter_edits_and_modifier_chords_are_not_their_letters_in_queue() {
         "the tab stays"
     );
     assert!(section.captures_input(), "the editor is still open");
+}
+
+// -------------------------------------------------------------------------------------------
+// MOD-115 M3 (lane L-prompt): the section on the kit. The rows are a `kit::form` of read-only
+// values under group headings, the open editor is the row it edits with its unit under it, the
+// notices are `kit::text` lines and the refusals `kit::empty` next steps; every hint and every
+// sentence that names a key reads it from the keys in force.
+// -------------------------------------------------------------------------------------------
+
+/// `field.submit` and `field.cancel` moved (MOD-115 M3 C6): the editor's `Enter` and `Esc`.
+const FIELD_REBOUND: &str = "version = 2\n[field]\nsubmit = [\"ctrl-t\"]\ncancel = [\"ctrl-o\"]\n";
+
+/// `keys` loaded, or a panic naming the file.
+fn rebound(file: &str) -> htui::keys::Keys {
+    htui::keys::load_str(file).expect("the key file loads")
+}
+
+/// The editor's hint names the field's own keys through the editor's stack (MD-A, C6): `Enter
+/// save · Esc cancel` under the compiled keys, the rebound chords once `[field]` moves them.
+#[tokio::test]
+async fn the_editor_hint_names_the_field_keys_in_force() {
+    let snapshot = bench_settings(&demo()).await;
+    let (bench, mut section) = bench_from(&snapshot).await;
+    move_to(&bench, &mut section, row::BATCH_CAP);
+    bench.key(&mut section, "e");
+    assert_eq!(
+        bench.key_hint(&section),
+        "Enter save \u{b7} Esc cancel \u{b7} empty clears"
+    );
+
+    let bench = bench.with_keys(rebound(FIELD_REBOUND));
+    assert_eq!(
+        bench.key_hint(&section),
+        "Ctrl+t save \u{b7} Ctrl+o cancel \u{b7} empty clears"
+    );
+}
+
+/// A compare-and-set miss under an open editor names the key that retries as the editor's stack
+/// binds it (MD-A, D-5): the rebound chord, never a literal `Enter`.
+#[tokio::test]
+async fn a_stale_reply_names_the_retry_key_in_force() {
+    let snapshot = bench_settings(&demo()).await;
+    let (bench, mut section) = bench_from(&snapshot).await;
+    let bench = bench.with_keys(rebound(FIELD_REBOUND));
+    edit(&bench, &mut section, row::BOX_LIMIT, "4");
+
+    bench.reply(
+        &mut section,
+        &StoreReply::QueueSettingsStale(Box::new(snapshot)),
+    );
+
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains(
+            "changed elsewhere since you opened it \u{2014} reloaded; Ctrl+t retries against the \
+             current row"
+        ),
+        "{frame}"
+    );
+}
+
+/// MOD-115 M3 D3: the open editor is the row it edits, its label banded and its unit (and what
+/// the row held) on the line under it, rather than a `label (unit): ` pane under the rows.
+#[tokio::test]
+async fn the_editor_is_the_row_it_edits() {
+    let snapshot = bench_settings(&demo()).await;
+    let (bench, mut section) = bench_from(&snapshot).await;
+    edit(&bench, &mut section, row::BATCH_CAP, "1.5");
+
+    let frame = bench.render_section(&section, 100);
+    let lines: Vec<&str> = frame.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with(GUTTER))
+        .unwrap_or_else(|| panic!("the focused row: {frame}"));
+    // A group's row sits two cells in from its heading (RV2 L4).
+    let row = lines[at].trim_start_matches(GUTTER).trim_start();
+    assert!(row.starts_with("batch cap"), "{frame}");
+    assert_eq!(row["batch cap".len()..].trim(), "1.5", "{frame}");
+    assert_eq!(lines[at + 1].trim(), "USD \u{b7} now unbounded", "{frame}");
+    assert!(!frame.contains("(USD): "), "no separate pane: {frame}");
+}
+
+/// MOD-85: the focused row is marked by the form's gutter in the tab's accent, never a whole row
+/// in `theme.selected`: the gutter stays out of the band, which runs the rest of the row.
+#[tokio::test]
+async fn the_cursor_row_is_the_forms_marker() {
+    let snapshot = bench_settings(&demo()).await;
+    let (bench, mut section) = bench_from(&snapshot).await;
+    move_to(&bench, &mut section, row::MIN_BUDGET);
+    let frame = bench.render_section(&section, 100);
+    let marked: Vec<&str> = frame
+        .lines()
+        .filter(|line| line.starts_with(GUTTER))
+        .collect();
+    assert_eq!(marked.len(), 1, "{frame}");
+    assert!(marked[0].contains("min budget"), "{frame}");
+
+    let buffer = drawn(&bench, &section, 100);
+    let (y, text) = marked_row(&buffer);
+    assert!(
+        text.starts_with("  min budget"),
+        "two cells in, banded with it: {text}"
+    );
+    let accent = bench.ctx().accent();
+    assert_eq!(buffer[(0, y)].fg, accent.fg.unwrap_or(Color::Reset));
+    assert!(!banded(&bench, &buffer, 0, y), "the gutter is not banded");
+    assert!(
+        (1..buffer.area.width).all(|x| banded(&bench, &buffer, x, y)),
+        "the band runs the rest of the row"
+    );
+}
+
+/// MOD-85, while editing: the gutter keeps the tab's accent and only the label column is banded,
+/// so the field's cursor is not lost in the band.
+#[tokio::test]
+async fn an_open_editor_bands_its_label_alone() {
+    let snapshot = bench_settings(&demo()).await;
+    let (bench, mut section) = bench_from(&snapshot).await;
+    edit(&bench, &mut section, row::BATCH_CAP, "1.5");
+
+    let buffer = drawn(&bench, &section, 100);
+    let (y, text) = marked_row(&buffer);
+    assert!(text.starts_with("  batch cap"), "{text}");
+    let accent = bench.ctx().accent();
+    assert_eq!(buffer[(0, y)].fg, accent.fg.unwrap_or(Color::Reset));
+    let value = u16::try_from(text.find("1.5").expect("the typed value")).expect("fits") + 1;
+    // The group's indent is the label's (RV2 L4): banded with it.
+    let label = u16::try_from("  batch cap".len()).expect("fits");
+    assert!(
+        (1..=label).all(|x| banded(&bench, &buffer, x, y)),
+        "the label is banded: {text}"
+    );
+    assert!(
+        (value..value + 3).all(|x| !banded(&bench, &buffer, x, y)),
+        "the typed value is not: {text}"
+    );
+    assert!(!banded(&bench, &buffer, buffer.area.width - 1, y));
+}
+
+/// A write in flight is named in words (MOD-83: no request name on screen), on the refusal and on
+/// the hint row.
+#[tokio::test]
+async fn a_write_in_flight_is_named_in_words() {
+    let snapshot = bench_settings(&demo()).await;
+    let (bench, mut section) = bench_from(&snapshot).await;
+    edit(&bench, &mut section, row::BATCH_CAP, "1.5");
+    bench.key(&mut section, "enter");
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("still saving the setting \u{2014} wait for the store's answer"),
+        "{frame}"
+    );
+
+    bench.key(&mut section, "esc");
+    bench.key(&mut section, "esc");
+    assert_eq!(
+        bench.key_hint(&section),
+        "j/k \u{b7} e edit \u{b7} r reload \u{b7} saving the setting\u{2026}"
+    );
+}
+
+/// Nothing read yet is an empty state with its next step (MOD-83), through the reload key.
+#[tokio::test]
+async fn nothing_read_yet_says_how_to_read() {
+    let bench = SectionBench::new().await;
+    let section = QueueSection::new();
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("queue settings not read yet"), "{frame}");
+    assert!(
+        frame.contains("r reads the queue settings again"),
+        "{frame}"
+    );
+}
+
+/// MOD-115 M3 D-11, RV2 (RV1 M2's span): the section reports its own rows' scroll, beside the
+/// rect they were drawn into; the help and notice lines under them are not padded in.
+#[tokio::test]
+async fn the_section_reports_its_scroll() {
+    let snapshot = bench_settings(&demo()).await;
+    let (bench, section) = bench_from(&snapshot).await;
+    let _ = bench.render_section(&section, 100);
+    let span = section.scroll().expect("the rows scroll");
+    assert_eq!(span.offset, 0);
+    assert_eq!(span.total, row::BOX_LIMIT + 1, "nine rows");
+    let rows = span.rows.expect("the rect the rows were drawn into");
+    assert_eq!(
+        (rows.y, rows.height),
+        (0, 28),
+        "above the help and notice: {rows:?}"
+    );
+}
+
+/// MOD-81: the section at 80 columns, through the shell.
+#[tokio::test]
+async fn the_section_at_80_columns() {
+    let mut harness = Harness::over(MemStore::demo())
+        .size(80, 24)
+        .with_tab(Box::new(SettingsTab::with_sections(vec![Box::new(
+            QueueSection::new(),
+        )])));
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(frame.contains("project vulkan-tutorials"), "{frame}");
+    assert!(
+        frame.contains("not set \u{b7} stored, not enforced"),
+        "{frame}"
+    );
+    insta::assert_snapshot!("demo_80", frame);
+}
+
+/// MOD-115 M3 RV2 L4: each group's rows sit two cells in from its heading, so the two
+/// `max concurrent` rows read as two groups' rather than one list's.
+#[tokio::test]
+async fn the_rows_are_indented_under_their_group() {
+    let snapshot = bench_settings(&demo()).await;
+    let (bench, section) = bench_from(&snapshot).await;
+    let frame = bench.render_section(&section, 100);
+    let lines: Vec<&str> = frame.lines().map(after_gutter).collect();
+    let at = |prefix: &str| {
+        lines
+            .iter()
+            .position(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("a line at `{prefix}`: {frame}"))
+    };
+    assert!(
+        lines[at("project ") + 1].starts_with("  run cap"),
+        "{frame}"
+    );
+    assert!(
+        lines[at("all boxes") + 1].starts_with("  min budget"),
+        "{frame}"
+    );
+    assert!(
+        lines[at("this box (") + 1].starts_with("  max concurrent"),
+        "{frame}"
+    );
+}
+
+/// `line` past its first cell, the form's gutter.
+fn after_gutter(line: &str) -> &str {
+    line.char_indices().nth(1).map_or("", |(at, _)| &line[at..])
 }

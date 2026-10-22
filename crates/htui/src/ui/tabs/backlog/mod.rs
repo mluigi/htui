@@ -48,6 +48,7 @@ use crate::item_writes::{self, ItemDivergence, ItemFormContext, ItemWrite};
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{QUEUE_REQUEST_NAMES, QueueView, QueueWrite, StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
+use crate::ui::kit::{chips::key_line, modal::modal_rest};
 use crate::ui::shell::{ListSize, PaneAreas, PaneId, Panes, TabLayout, TabLoc};
 use crate::ui::tabs::backlog::detail::{
     BodyTab, DetailId, DetailRegistry, DocumentsTab, GraphTab, NotesTab, PromptTab, ReqsTab,
@@ -59,7 +60,6 @@ use crate::ui::tabs::backlog::item_form::{
 };
 use crate::ui::tabs::backlog::list::{ListView, Selection};
 use crate::ui::tabs::registry::{CLOSE_THE_FIELD_FIRST, Tab, TabId};
-use crate::ui::tabs::settings::{key_line, modal_rest};
 use crossterm::event::{KeyEvent, MouseEvent};
 
 /// The Backlog's default layout (MOD-115 M2 D2): the list beside the detail, 55% of the body.

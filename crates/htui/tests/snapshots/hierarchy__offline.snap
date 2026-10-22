@@ -3,9 +3,9 @@ source: crates/htui/tests/hierarchy.rs
 expression: frame
 ---
 no workspace   ¹Settings        0 working · 0 waiting · offline · 0s · no box ·  F9  about   ?  keys
-┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
-│ Agents  Hierarchy                                                                                │
+╭─ Hierarchy ─────────────────────────────────────────────────────────────────── Agents  Hierarchy ╮
 │hierarchy needs Postgres                                                                          │
+│Settings › Connection stores a DSN · r asks again once the store answers                          │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -31,4 +31,4 @@ no workspace   ¹Settings        0 working · 0 waiting · offline · 0s · no b
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-└─r reload─────────────────────────────────────────────────────────────────────────────────────────┘
+╰─r reload─────────────────────────────────────────────────────────────────────────────────────────╯

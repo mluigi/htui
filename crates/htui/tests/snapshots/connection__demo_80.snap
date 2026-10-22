@@ -1,0 +1,28 @@
+---
+source: crates/htui/tests/connection.rs
+expression: frame
+---
+Graphics   ¹Settings       0 working · 0 waiting · memory ·  F9  about   ?  keys
+╭─ Connection ───────────────────────────────────────────────────── Connection ╮
+│▌Status          memory · no dial yet this session                            │
+│ DSN             n/a in a demo session                                        │
+│ Mirror          n/a in a demo session                                        │
+│ Rebuild cache   press Enter or R                                             │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+╰─e edit DSN · c clear DSN · R rebuild cache · r reload · j/k rows─────────────╯

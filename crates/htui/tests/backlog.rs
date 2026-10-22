@@ -1957,7 +1957,7 @@ async fn runs_pane_shows_a_pending_permission() {
         "the summary is shown:\n{frame}"
     );
     assert!(
-        pane.contains("[1] Allow once  [2] Reject once"),
+        pane.contains(" 1  Allow once   2  Reject once"),
         "and the strip:\n{frame}"
     );
     assert_eq!(harness.app().status, None);
@@ -1969,7 +1969,7 @@ async fn runs_pane_shows_a_pending_permission() {
 async fn a_digit_on_the_runs_pane_answers_through_the_store() {
     let (store, id) = relayed_store(uuid::Uuid::new_v4()).await;
     let mut harness = on_feat_3_runs(store.clone()).await;
-    assert!(harness.render().contains("[1] Allow once"));
+    assert!(harness.render().contains(" 1  Allow once"));
 
     harness.key("1");
     harness.drive().await;
@@ -1983,7 +1983,7 @@ async fn a_digit_on_the_runs_pane_answers_through_the_store() {
     assert_eq!(harness.app().status, None, "nothing failed");
     let frame = harness.render();
     assert!(
-        !frame.contains("[1] Allow once") && !frame.contains("asks:"),
+        !frame.contains(" 1  Allow once") && !frame.contains("asks:"),
         "the re-read dropped the strip:\n{frame}"
     );
 }
@@ -1995,7 +1995,7 @@ async fn a_refused_answer_lands_on_the_status_line() {
     let (store, _) = relayed_store(owner).await;
     let mut harness = on_feat_3_runs(store.clone()).await;
     assert!(
-        harness.render().contains("[1] Allow once"),
+        harness.render().contains(" 1  Allow once"),
         "the strip is up"
     );
 

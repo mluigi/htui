@@ -34,7 +34,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::item_writes::{ItemDivergence, ItemFormContext};
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, views};
 use crate::ui::cells;
-use crate::ui::tabs::settings::wrapped;
+use crate::ui::kit::text::wrapped;
 use crate::ui::{Theme, diff};
 
 /// The hint's pick part while a field conflicts (D4), through [`views::ITEM_DIVERGENCE`].

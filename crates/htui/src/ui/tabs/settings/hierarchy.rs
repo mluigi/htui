@@ -17,7 +17,14 @@
 //!
 //! Every mode resolves its keys through its own stack in [`views`] (MOD-67 M3), so a chord
 //! matches with its modifiers (`ctrl-d` is not `d`) and a rebound key acts under its new chord;
-//! the hint row is rendered from the same stack.
+//! the hint row is rendered from the same stack. Acts resolve from [`Ctx::pressed`], the chord the
+//! user pressed (MOD-115 M3 MD-A).
+//!
+//! It draws through the kit (MOD-115 M3): the tree is a `kit::list` (gutter, band), an editor is a
+//! `kit::form`, the notice a `kit::text` notice line and the empty states `kit::empty` with a next
+//! step; the picker is a `kit::modal` ([`PathPicker`]).
+
+use std::cell::Cell;
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
@@ -35,28 +42,58 @@ use crate::hierarchy::{
     HierarchySnapshot, InferOutcome, InferReport, MirrorAfterDelete, ProjectEntry, REQUEST_NAMES,
     RepoEntry, reach_parts, reach_totals,
 };
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::store_worker::{LIST_DIR, StoreReply, StoreRequest};
-use crate::ui::cells::{self, cell_width};
+use crate::ui::cells::cell_width;
+use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::form::{self, Form, Value};
+use crate::ui::kit::label::plural;
+use crate::ui::kit::list::{self, RowKind};
+use crate::ui::kit::pane::ScrollSpan;
+use crate::ui::kit::text::{Tone, notice, wrapped};
+use crate::ui::kit::{chips::key_line, modal::modal_rest};
 use crate::ui::path_picker::{PathPicker, PickerOutcome, start_dir};
-use crate::ui::tabs::settings::{SectionId, SettingsSection, message, modal_rest, wrapped};
+use crate::ui::tabs::settings::{SectionId, SettingsSection, changed_elsewhere};
 use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::KeyEvent;
 
 /// What the rows pane says when the scope is a workspace that does not exist — the nil startup
-/// scope, or the last workspace after it was deleted (D9's "stranded shell" row). `new` is the
-/// label of `settings.hierarchy.new_workspace` (MOD-67 M6 D4): `` no workspace — `N` creates
-/// one`` under the defaults, and no key named when it is unbound.
+/// scope, or the last workspace after it was deleted (D9's "stranded shell" row). The empty
+/// state's first line; [`creates_one`] is its next step (MOD-115 M3).
+const NO_WORKSPACE: &str = "no workspace";
+
+/// The next step of [`NO_WORKSPACE`]. `new` is the label of `settings.hierarchy.new_workspace`
+/// (MOD-67 M6 D4): `` `N` creates one`` under the defaults; unbound, no key is named and the
+/// step is the one left, a workspace made elsewhere.
+fn creates_one(new: Option<&str>) -> String {
+    match new {
+        Some(new) => format!("`{new}` creates one"),
+        None => "a workspace created elsewhere shows up here".to_owned(),
+    }
+}
+
+/// The refusal a key gets with no workspace: `` no workspace — `N` creates one`` under the
+/// defaults, and no key named when it is unbound.
 fn no_workspace(new: Option<&str>) -> String {
     match new {
-        Some(new) => format!("no workspace \u{2014} `{new}` creates one"),
-        None => "no workspace".to_owned(),
+        Some(_) => format!("{NO_WORKSPACE} \u{2014} {}", creates_one(new)),
+        None => NO_WORKSPACE.to_owned(),
     }
 }
 
 /// What the rows pane says when the read itself was refused: the tree is one `ReadStore` call and
 /// an offline box has no mirror of it.
 const UNAVAILABLE: &str = "hierarchy needs Postgres";
+
+/// The next step of [`UNAVAILABLE`] (MOD-83's example): where a DSN is stored, then `reload`, the
+/// label of `common.reload` through the browse stack, asking again; unbound, the first half alone.
+fn unavailable_next(reload: Option<&str>) -> String {
+    const CONNECTION: &str = "Settings \u{203a} Connection stores a DSN";
+    match reload {
+        Some(reload) => format!("{CONNECTION} \u{b7} {reload} asks again once the store answers"),
+        None => CONNECTION.to_owned(),
+    }
+}
 
 /// Browse's keys.
 const HINT_BROWSE: HintSpec = &[
@@ -81,11 +118,12 @@ const HINT_NO_WORKSPACE: HintSpec = &[
 /// answer, so the only offer is to ask again.
 const HINT_UNAVAILABLE: HintSpec = &[Hint::One(Act::Reload, "reload")];
 
-/// An open editor's keys: the form's own, then the field's fixed `Enter` and `Esc` (D13).
+/// An open editor's keys: the form's own, then the field's `field.submit` and `field.cancel`
+/// through the editor's stack (D13; MOD-115 M3 C6), `Enter save · Esc cancel` by default.
 const HINT_EDITING: HintSpec = &[
     Hint::Pair(Act::FormNextField, Act::FormPrevField, "field"),
-    Hint::Text("Enter save"),
-    Hint::Text("Esc cancel"),
+    Hint::One(Act::FieldSubmit, "save"),
+    Hint::One(Act::FieldCancel, "cancel"),
 ];
 
 /// The picker's section hint (MOD-49 blueprint D17): the popup carries the full key list; the
@@ -95,11 +133,6 @@ const HINT_PICKING: HintSpec = &[
     Hint::Text("choosing a directory"),
     Hint::One(Act::Back, "cancel"),
 ];
-
-/// What a CAS miss says while an editor is open (D7, PRD D8): the text is kept, the token is not,
-/// and the retry is the user's.
-const CHANGED_ELSEWHERE: &str =
-    "changed elsewhere since you opened it — reloaded; Enter retries against the current row";
 
 /// What a CAS miss says when the row the editor opened on is gone from the reloaded tree.
 const DELETED_ELSEWHERE: &str = "deleted elsewhere while you were editing";
@@ -127,8 +160,12 @@ const HINT_WARN: HintSpec = &[
     Hint::All(Act::ConfirmNo, "stop"),
 ];
 
-/// The hint line of the second, typed confirmation: the field's own keys (D13).
-const HINT_TYPED: HintSpec = &[Hint::Text("Enter confirm"), Hint::Text("Esc stop")];
+/// The hint line of the second, typed confirmation: the field's own keys through
+/// [`views::CAPTURE`] (D13; MOD-115 M3 C6), `Enter confirm · Esc stop` by default.
+const HINT_TYPED: HintSpec = &[
+    Hint::One(Act::FieldSubmit, "confirm"),
+    Hint::One(Act::FieldCancel, "stop"),
+];
 
 /// The hint line while the delete is in flight.
 const HINT_DELETING: HintSpec = &[Hint::Text("deleting\u{2026}")];
@@ -143,6 +180,9 @@ const WRONG_SLUG: &str = "that is not the slug; nothing was deleted";
 
 /// How many repo names one list of an inference notice shows before `+N more` (blueprint D137).
 const NAMES_SHOWN: usize = 3;
+
+/// What follows the primary repo's name on its row (MOD-83: a word, where a bare `*` stood).
+const PRIMARY: &str = " \u{b7} primary";
 
 /// One row of the flat list the section draws and the cursor indexes.
 ///
@@ -319,6 +359,11 @@ pub struct HierarchySection {
     /// `$HOME`, read once by [`new`](HierarchySection::new) (MOD-49 blueprint D9): the picker's
     /// last start directory before `/` (P7).
     home: Option<String>,
+    /// The tree's `(lines, first line drawn)` as of the last render, for the Settings pane's
+    /// scrollbar (MOD-115 M3 D-11), in the pane's terms: the rows under the tree (an open editor
+    /// or warning, the notice line) count as lines, since the pane measures the bar against its
+    /// whole inner rect. `None` while no tree is drawn.
+    scroll: Cell<Option<ScrollSpan>>,
 }
 
 impl HierarchySection {
@@ -390,67 +435,74 @@ impl HierarchySection {
         self.cursor = self.cursor.min(self.rows().len().saturating_sub(1));
     }
 
-    /// One line per row, in [`rows`](HierarchySection::rows) order (D13).
-    fn lines(&self, theme: &Theme) -> Vec<Line<'static>> {
+    /// One list row per tree row, in [`rows`](HierarchySection::rows) order (D13): the workspace
+    /// and its projects head their rows as the kit's group rows, the repos are items (MOD-115 M3).
+    /// The primary repo says so in a word after its name (MOD-83), never a bare `*`.
+    fn list_rows(&self, theme: &Theme) -> Vec<list::Row<'static>> {
         let Some(snapshot) = &self.snapshot else {
             return Vec::new();
         };
+        let group = |text: String| list::Row {
+            line: Line::styled(text, theme.title),
+            kind: RowKind::Group { folded: false },
+        };
         self.rows()
             .into_iter()
-            .enumerate()
-            .map(|(index, row)| {
-                let text = match row {
-                    Row::Workspace => format!(
-                        "{} ({}) — root on this box: {}",
-                        snapshot.workspace.name,
-                        snapshot.workspace.slug,
-                        snapshot
-                            .root_path
-                            .as_ref()
-                            .map_or("unset", |path| path.root_path.as_str())
-                    ),
-                    Row::Project { index } => snapshot
+            .map(|row| match row {
+                Row::Workspace => group(format!(
+                    "{} ({}) \u{2014} root on this box: {}",
+                    snapshot.workspace.name,
+                    snapshot.workspace.slug,
+                    snapshot
+                        .root_path
+                        .as_ref()
+                        .map_or("unset", |path| path.root_path.as_str())
+                )),
+                Row::Project { index } => group(
+                    snapshot
                         .projects
                         .get(index)
                         .map_or_else(String::new, |entry| {
                             format!("  {}  {}", entry.project.slug, entry.project.name)
                         }),
-                    Row::Repo { project, index } => snapshot
-                        .projects
-                        .get(project)
-                        .and_then(|entry| entry.repos.get(index))
-                        .map_or_else(String::new, |entry| {
-                            format!(
-                                "    {}{}  {}  {}  {}",
-                                if entry.repo.is_primary { "*" } else { " " },
-                                entry.repo.name,
-                                entry.repo.default_branch,
-                                entry.repo.remote_url.as_deref().unwrap_or("—"),
-                                entry
-                                    .local_path
-                                    .as_ref()
-                                    .map_or("unset", |path| path.local_path.as_str())
-                            )
-                        }),
-                };
-                let style = if index == self.cursor {
-                    theme.selected
-                } else {
-                    theme.base
-                };
-                Line::styled(text, style)
+                ),
+                Row::Repo { project, index } => list::Row {
+                    line: Line::styled(
+                        snapshot
+                            .projects
+                            .get(project)
+                            .and_then(|entry| entry.repos.get(index))
+                            .map_or_else(String::new, |entry| {
+                                format!(
+                                    "    {}{}  {}  {}  {}",
+                                    entry.repo.name,
+                                    if entry.repo.is_primary { PRIMARY } else { "" },
+                                    entry.repo.default_branch,
+                                    entry.repo.remote_url.as_deref().unwrap_or("\u{2014}"),
+                                    entry
+                                        .local_path
+                                        .as_ref()
+                                        .map_or("unset", |path| path.local_path.as_str())
+                                )
+                            }),
+                        theme.base,
+                    ),
+                    kind: RowKind::Item,
+                },
             })
             .collect()
     }
 
-    /// The pane under the rows: the open editor, or nothing at all in Browse.
+    /// The pane under the rows: the open editor as a kit form, the delete's warning, or nothing at
+    /// all in Browse.
     ///
     /// Takes the width because the delete warning is a sentence rather than a row and has to wrap
     /// inside the pane it is measured for (the layout below needs the height first).
-    fn pane(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    fn pane(&self, width: u16, ctx: &Ctx<'_>) -> Vec<Line<'static>> {
+        let theme = ctx.theme;
         match &self.mode {
             Mode::Browse => Vec::new(),
-            Mode::Editing(editor) => editor.lines(width, theme),
+            Mode::Editing(editor) => editor.form().lines(width, ctx.accent(), theme),
             // MOD-49 P2: the popup draws over the section in `render`, so the pane stays empty.
             Mode::Picking { .. } => Vec::new(),
             Mode::Deleting {
@@ -461,23 +513,21 @@ impl HierarchySection {
         }
     }
 
-    /// The one line under the pane: the last outcome, in `theme.error` when it is one to act on
-    /// rather than read (a compare-and-set miss). The keys this mode binds moved to the shell's
-    /// hint row (MOD-67 M6 T2, [`SettingsSection::key_hint`]), so the outcome has the line to
-    /// itself; blank without one.
+    /// The one line under the pane: the last outcome as a kit notice, an error when it is one to
+    /// act on rather than read (a compare-and-set miss). The keys this mode binds are on the
+    /// Settings pane's bottom border (MOD-67 M6 T2, [`SettingsSection::key_hint`]), so the outcome
+    /// has the line to itself; blank without one.
     /// Any mode: an editor's outcome is drawn here too.
     fn notice_line(&self, theme: &Theme) -> Line<'static> {
-        let Some(notice) = &self.notice else {
+        let Some(text) = &self.notice else {
             return Line::default();
         };
-        Line::styled(
-            notice.clone(),
-            if super::is_error(notice) {
-                theme.error
-            } else {
-                theme.dim
-            },
-        )
+        let tone = if super::is_error(text) {
+            Tone::Error
+        } else {
+            Tone::Info
+        };
+        notice(text, tone, theme)
     }
 
     /// The mode's keys for the shell's hint row, plus what a write in flight adds to them.
@@ -507,7 +557,7 @@ impl HierarchySection {
             // Only in Browse: an editor's own hint says what `Enter` is for, and a write in flight
             // is why `Enter` is not answering.
             Some(busy) if matches!(self.mode, Mode::Browse) && self.notice.is_none() => {
-                format!("{keys} \u{b7} {busy} in flight")
+                format!("{keys} \u{b7} {}\u{2026}", doing(busy))
             }
             _ => keys,
         }
@@ -532,11 +582,12 @@ impl HierarchySection {
         }
     }
 
-    /// One key in Browse, through `views::HIERARCHY_BROWSE` (MOD-67 M3). A chord matches with its
+    /// One key in Browse, through `views::HIERARCHY_BROWSE` (MOD-67 M3), resolved from the chord the
+    /// user pressed ([`Ctx::pressed`], MOD-115 M3 MD-A). A chord matches with its
     /// modifiers, so `ctrl-d` is not `d` (ANA-26 §2.6 defect 1). The tab took `settings.*` before
     /// offering the key; a global act, or one this state declines, is the shell's (`Pass`).
     fn on_browse_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         for act in ctx.keys().actions(views::HIERARCHY_BROWSE, chord) {
             match act {
                 Act::ListDown => self.move_cursor(true),
@@ -649,7 +700,7 @@ impl HierarchySection {
         let Some(busy) = self.busy else {
             return false;
         };
-        self.notice = Some(format!("`{busy}` is still in flight"));
+        self.notice = Some(in_flight(busy));
         true
     }
 
@@ -688,8 +739,8 @@ impl HierarchySection {
                     EditorKind::NewRepo(project),
                     vec![
                         Field::required("name", ""),
-                        Field::optional("remote_url", ""),
-                        Field::required("default_branch", "main"),
+                        Field::optional("remote url", ""),
+                        Field::required("default branch", "main"),
                         Field::required("primary (y/n)", primary),
                     ],
                     None,
@@ -744,8 +795,8 @@ impl HierarchySection {
                 let (owner, repo) = entry;
                 let fields = vec![
                     Field::required("name", &repo.repo.name),
-                    Field::optional("remote_url", repo.repo.remote_url.as_deref().unwrap_or("")),
-                    Field::required("default_branch", &repo.repo.default_branch),
+                    Field::optional("remote url", repo.repo.remote_url.as_deref().unwrap_or("")),
+                    Field::required("default branch", &repo.repo.default_branch),
                 ];
                 self.open(
                     EditorKind::EditRepo {
@@ -910,7 +961,7 @@ impl HierarchySection {
     /// the warning); the typed slug is its field's, which sees every key first (D13).
     fn on_deleting_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let stack = self.stack();
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         let answer = ctx.keys().actions(stack, chord).first().copied();
         let Mode::Deleting {
             target,
@@ -977,8 +1028,10 @@ impl HierarchySection {
             MirrorAfterDelete::NotNeeded => "no rebuild needed".to_owned(),
             MirrorAfterDelete::Failed(err) => format!("mirror not rebuilt: {err}"),
         };
+        let rows = plural(usize::try_from(rows).unwrap_or(usize::MAX), "row", "rows");
+        let tables = plural(tables, "table", "tables");
         self.notice = Some(format!(
-            "deleted `{slug}`: {rows} rows across {tables} tables; {mirror}"
+            "deleted `{slug}`: {rows} across {tables}; {mirror}"
         ));
         self.mode = Mode::Browse;
         self.busy = None;
@@ -1026,7 +1079,7 @@ impl HierarchySection {
                 Handled::Consumed
             }
             FieldOutcome::Pass => {
-                let chord = KeyChord::from_event(key);
+                let chord = ctx.pressed(&key);
                 let Mode::Editing(editor) = &mut self.mode else {
                     return Handled::Pass;
                 };
@@ -1056,14 +1109,14 @@ impl HierarchySection {
     /// flight, and the picker stays open until its reply (D8).
     fn on_picker_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let stack = self.stack();
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         let Mode::Picking { picker, .. } = &mut self.mode else {
             return Handled::Pass;
         };
         if picker.goto_open() && stack.passes(chord) {
             return Handled::Pass;
         }
-        let Some(outcome) = picker.on_key(key, ctx.keys(), stack) else {
+        let Some(outcome) = picker.on_key(key, chord, ctx.keys(), stack) else {
             return modal_rest(stack, chord);
         };
         match outcome {
@@ -1286,8 +1339,14 @@ impl HierarchySection {
 
     /// A CAS miss (D7): the tree is replaced, the editor keeps its text and takes the current row's
     /// token, and the retry is a second `Enter` rather than an automatic write. `keys` name the
-    /// key a `p` retries on (MOD-67 M6 D4).
+    /// key a `p` retries on (MOD-67 M6 D4), and the key an editor retries on: `field.submit`
+    /// through the editor's stack (MOD-115 M3 D-5), or the picker's `choose`.
     fn on_stale(&mut self, snapshot: &HierarchySnapshot, keys: &Keys) {
+        let retry = match &self.mode {
+            Mode::Picking { .. } => keys.label(views::HIERARCHY_PICKER, Act::PickerChoose),
+            _ => keys.label(views::HIERARCHY_EDITOR, Act::FieldSubmit),
+        };
+        let retry = changed_elsewhere(retry.as_deref());
         self.busy = None;
         let refreshed = match &self.mode {
             Mode::Editing(editor) => Some(reload(snapshot, editor.kind)),
@@ -1313,9 +1372,9 @@ impl HierarchySection {
                 if let Mode::Editing(editor) = &mut self.mode {
                     editor.expected = Some(token);
                 }
-                self.notice = Some(CHANGED_ELSEWHERE.to_owned());
+                self.notice = Some(retry);
             }
-            Some(Reload::Keep) => self.notice = Some(CHANGED_ELSEWHERE.to_owned()),
+            Some(Reload::Keep) => self.notice = Some(retry),
         }
     }
 }
@@ -1527,11 +1586,16 @@ impl SettingsSection for HierarchySection {
     }
 
     fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
-        super::key_line(self.hint_text(keys), theme)
+        key_line(self.hint_text(keys), theme)
+    }
+
+    fn scroll(&self) -> Option<ScrollSpan> {
+        self.scroll.get()
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let pane = self.pane(area.width, ctx.theme);
+        let theme = ctx.theme;
+        let pane = self.pane(area.width, ctx);
         let [rows, pane_area, hint] = Layout::vertical([
             Constraint::Min(3),
             Constraint::Length(u16::try_from(pane.len()).unwrap_or(u16::MAX)),
@@ -1539,24 +1603,57 @@ impl SettingsSection for HierarchySection {
         ])
         .areas(area);
 
+        self.scroll.set(None);
         if self.unavailable.is_some() {
-            message(frame, rows, UNAVAILABLE, ctx.theme);
+            // The refusal in the error role, then its next step in the empty state's own.
+            let reload = ctx.keys().label(views::HIERARCHY_BROWSE, Act::Reload);
+            let next = unavailable_next(reload.as_deref());
+            let mut lines: Vec<Line<'static>> =
+                wrapped(UNAVAILABLE, usize::from(rows.width).max(1))
+                    .into_iter()
+                    .map(|line| notice(&line, Tone::Error, theme))
+                    .collect();
+            lines.extend(empty::lines("", NextStep(&next), theme).pop());
+            frame.render_widget(Paragraph::new(lines), rows);
         } else if self.snapshot.is_none() {
             let new = ctx
                 .keys()
                 .label(views::HIERARCHY_BROWSE, Act::HierarchyNewWorkspace);
-            message(frame, rows, &no_workspace(new.as_deref()), ctx.theme);
+            empty::render(
+                frame,
+                rows,
+                NO_WORKSPACE,
+                NextStep(&creates_one(new.as_deref())),
+                theme,
+            );
         } else {
-            frame.render_widget(Paragraph::new(self.lines(ctx.theme)), rows);
+            // Scrolled so the cursor is on screen: a workspace with several projects and their
+            // repos is longer than the pane, and a selection nobody can see acts blind.
+            let lines = self.list_rows(theme);
+            let total = lines.len();
+            let offset = list::scroll_into_view(self.cursor, 0, usize::from(rows.height), total);
+            list::render(
+                frame,
+                rows,
+                &lines,
+                Some(self.cursor),
+                offset,
+                ctx.accent(),
+                theme,
+            );
+            // The pane's bar is measured against the rows the tree was drawn into and sits
+            // beside them (RV1 M2's span): the rows under the tree do not scroll.
+            self.scroll
+                .set(Some(ScrollSpan::new(total, offset).rows(rows)));
         }
         if !pane.is_empty() {
             frame.render_widget(Paragraph::new(pane), pane_area);
         }
-        frame.render_widget(Paragraph::new(self.notice_line(ctx.theme)), hint);
+        frame.render_widget(Paragraph::new(self.notice_line(theme)), hint);
         // MOD-49 P2: the popup draws over the whole section, not in the pane.
         if let Mode::Picking { picker, .. } = &self.mode {
             // Always the browse stack: the popup's hint stays while the go-to field is open.
-            picker.render(frame, area, ctx.theme, ctx.keys(), views::HIERARCHY_PICKER);
+            picker.render(frame, area, theme, ctx.keys(), views::HIERARCHY_PICKER);
         }
     }
 }
@@ -1595,32 +1692,16 @@ impl Editor {
             .map_or_else(String::new, |field| field.text().to_owned())
     }
 
-    /// One line per field, the focused label accented and the focused field carrying the cursor.
-    fn lines(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
-        let label_width = self
-            .fields
-            .iter()
-            .map(|field| cell_width(field.label))
-            .max()
-            .unwrap_or(0);
+    /// The fields as a kit form (MOD-115 M3 D3): one row per field in tab order, the focused one
+    /// carrying the marker and the cursor, the labels in one shared column.
+    fn form(&self) -> Form<'_> {
         self.fields
             .iter()
-            .enumerate()
-            .map(|(index, field)| {
-                let focused = index == self.focus;
-                let style = if focused { theme.accent } else { theme.dim };
-                let label = cells::pad(field.label, label_width);
-                let mut spans = vec![Span::styled(format!("{label}: "), style)];
-                let room = usize::from(width).saturating_sub(label_width + 2);
-                spans.extend(
-                    field
-                        .input
-                        .line(u16::try_from(room).unwrap_or(u16::MAX), focused, theme)
-                        .spans,
-                );
-                Line::from(spans)
+            .fold(Form::new(), |form, field| {
+                form.field(form::Field::new(field.label, Value::Text(&field.input)))
             })
-            .collect()
+            .focus(self.focus)
+            .editing(true)
     }
 }
 
@@ -1755,6 +1836,32 @@ fn capped(names: &[String]) -> String {
     }
 }
 
+/// What a second write is told while the first is still out (D6).
+fn in_flight(busy: &str) -> String {
+    format!("still {} \u{2014} wait for the store's answer", doing(busy))
+}
+
+/// A request in flight in words (MOD-115 M3: no request name on screen), by
+/// [`StoreRequest::name`] ([`REQUEST_NAMES`]).
+fn doing(busy: &str) -> &'static str {
+    match busy {
+        "hierarchy" => "reading the tree",
+        "create_workspace" => "adding the workspace",
+        "update_workspace" => "saving the workspace",
+        "set_workspace_root" => "saving the root",
+        "create_project" => "adding the project",
+        "update_project" => "saving the project",
+        "create_repo" => "adding the repo",
+        "update_repo" => "saving the repo",
+        "set_repo_path" => "saving the checkout",
+        "delete_reach" => "counting rows",
+        "delete_workspace" => "deleting the workspace",
+        "delete_project" => "deleting the project",
+        "infer_repo_paths" => "inferring the repo paths",
+        _ => "writing",
+    }
+}
+
 /// The repo at `index` of a project entry, with the project it belongs to.
 fn repo_at(owner: &ProjectEntry, index: usize) -> Option<(ProjectId, &RepoEntry)> {
     owner.repos.get(index).map(|repo| (owner.project.id, repo))
@@ -1773,12 +1880,13 @@ fn delete_pane(
 ) -> Vec<Line<'static>> {
     let reach = match stage {
         DeleteStage::Counting => {
-            return vec![Line::styled("counting rows\u{2026}".to_owned(), theme.dim)];
+            return vec![notice("counting rows\u{2026}", Tone::Info, theme)];
         }
         DeleteStage::InFlight(_) => {
-            return vec![Line::styled(
-                format!("deleting `{slug}`\u{2026}"),
-                theme.dim,
+            return vec![notice(
+                &format!("deleting `{slug}`\u{2026}"),
+                Tone::Info,
+                theme,
             )];
         }
         DeleteStage::Warn(reach) | DeleteStage::Typed { reach, .. } => reach,
@@ -1795,8 +1903,17 @@ fn delete_pane(
             format!("This deletes project `{slug}` and its entire history. Gone for good: {taken}.")
         }
         DeleteTarget::Workspace(_) => format!(
-            "This deletes workspace `{slug}`: {} project links and {} box root paths. Its projects survive and stay reachable from other workspaces.",
-            reach.workspace_links, reach.workspace_box_paths
+            "This deletes workspace `{slug}`: {} and {}. Its projects survive and stay reachable from other workspaces.",
+            plural(
+                usize::try_from(reach.workspace_links).unwrap_or(usize::MAX),
+                "project link",
+                "project links"
+            ),
+            plural(
+                usize::try_from(reach.workspace_box_paths).unwrap_or(usize::MAX),
+                "box root path",
+                "box root paths"
+            ),
         ),
     };
 
@@ -1804,7 +1921,7 @@ fn delete_pane(
     let mut lines: Vec<Line<'static>> = wrapped(&headline, room)
         .into_iter()
         .chain(wrapped(NOT_UNDONE, room))
-        .map(|line| Line::styled(line, theme.error))
+        .map(|line| notice(&line, Tone::Error, theme))
         .collect();
     if let DeleteStage::Typed { field, .. } = stage {
         let prompt = format!("Type `{slug}` to confirm: ");
@@ -1863,7 +1980,7 @@ mod tests {
     /// section's [`SettingsSection::key_hint`], the shell's row.
     #[test]
     fn the_notice_row_carries_the_notice_alone() {
-        let notice = super::super::CHANGED_ELSEWHERE.to_owned();
+        let notice = changed_elsewhere(Some("Enter"));
         let section = HierarchySection {
             notice: Some(notice.clone()),
             ..HierarchySection::new()
@@ -1901,6 +2018,38 @@ mod tests {
         assert_eq!(section.key_stack(), Some(views::CAPTURE));
     }
 
+    /// MOD-115 M3: a write in flight reads in words. Every request name has its own phrase, and
+    /// neither the refusal nor the Browse hint prints the name itself.
+    #[test]
+    fn a_write_in_flight_reads_in_words() {
+        for name in REQUEST_NAMES {
+            assert_ne!(doing(name), doing("unknown"), "`{name}` has its own phrase");
+            assert!(!in_flight(name).contains('_'), "{}", in_flight(name));
+        }
+        let section = HierarchySection {
+            busy: Some(REQUEST_NAMES[7]),
+            ..HierarchySection::new()
+        };
+        let hint = section.hint_text(Keys::compiled());
+        assert!(hint.ends_with(" \u{b7} saving the repo\u{2026}"), "{hint}");
+    }
+
+    /// MOD-115 M3 C6: the typed confirmation's keys are the field's through `views::CAPTURE`,
+    /// so a rebound `field.submit` is the one it names.
+    #[test]
+    fn the_typed_hint_names_the_field_keys() {
+        let keys = crate::keys::load_str("version = 2\n[field]\nsubmit = [\"ctrl-t\"]\n")
+            .expect("the key file loads");
+        assert_eq!(
+            Keys::compiled().hint(views::CAPTURE, HINT_TYPED),
+            "Enter confirm \u{b7} Esc stop"
+        );
+        assert_eq!(
+            keys.hint(views::CAPTURE, HINT_TYPED),
+            "Ctrl+t confirm \u{b7} Esc stop"
+        );
+    }
+
     /// MOD-67 M6 D4: each key-naming sentence names the label it is handed, and none when the
     /// act is unbound.
     #[test]
@@ -1910,6 +2059,19 @@ mod tests {
             "no workspace \u{2014} `W` creates one"
         );
         assert_eq!(no_workspace(None), "no workspace");
+        assert_eq!(creates_one(Some("W")), "`W` creates one");
+        assert_eq!(
+            creates_one(None),
+            "a workspace created elsewhere shows up here"
+        );
+        assert_eq!(
+            unavailable_next(Some("R")),
+            "Settings \u{203a} Connection stores a DSN \u{b7} R asks again once the store answers"
+        );
+        assert_eq!(
+            unavailable_next(None),
+            "Settings \u{203a} Connection stores a DSN"
+        );
         assert_eq!(reloaded(Some("P")), "reloaded; press P again");
         assert_eq!(reloaded(None), "reloaded");
 

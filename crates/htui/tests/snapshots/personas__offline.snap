@@ -3,9 +3,9 @@ source: crates/htui/tests/personas.rs
 expression: frame
 ---
 no workspace     personas: store unreachable: this box browses its read-only cache and starts no run
-┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
-│ Personas                                                                                         │
+╭─ Personas ───────────────────────────────────────────────────────────────────────────── Personas ╮
 │personas unavailable: store unreachable: this box browses its read-only cache and starts no run   │
+│personas are not mirrored: they return once the store answers                                     │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -31,4 +31,4 @@ no workspace     personas: store unreachable: this box browses its read-only cac
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

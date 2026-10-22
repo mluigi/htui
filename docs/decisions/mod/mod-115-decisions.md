@@ -1,4 +1,4 @@
-# MOD-115 - TUI shell: the decisions so far, milestones 1 and 2 (in progress, 2026-10-19)
+# MOD-115 - TUI shell: the decisions so far, milestones 1 to 3 (in progress, 2026-10-22)
 
 **Requirements:** `R-TUI-1`, `R-TUI-10`, `R-TUI-12`, `R-TUI-13`, `R-TUI-18`.
 **Origin:** the UI redesign review (`docs/ui-redesign-findings-2026-10-15.md` §3, §9), filed
@@ -180,6 +180,59 @@ hidden. The `HANDOFF.md` phase 1 note summarises the milestone.
   and, since review RV4, the `?` box: it lists only what acts, so under that file the warning's
   box reads `Space yes` and no longer also `Space toggle`.
 
+## Milestone 3: group A on the kit (2026-10-20..22)
+
+Plan `.claude/plans/mod-115-tui-shell-m3.plan.md` (fact-checked, confirmed 2026-10-20) and blueprint
+`.claude/plans/mod-115-tui-shell-m3.blueprint.md` (C1-C7, PLAN DEVIATIONS D-1..D-18). Settings (all
+ten sections), Requirements and Chat draw only through `ui/kit`; Backlog, Skills, the overlays, the
+in-pane editor and the `?` box are group B (M4).
+
+- **Grouping (maintainer, 2026-10-20).** Group A by size and snapshots: Settings, Requirements, Chat
+  (~20.5k production lines, ~91 snapshots); group B the rest (~20.9k, ~85). Backlog goes last with
+  its split, since every shell and overlay snapshot draws over it. The `settings/agents.rs` split
+  moved from M4 to M3 (`settings/agents/{mod,table,form,flows}.rs`, `951b8495`, a pure move).
+- **D1 - a ported tab draws its own panes.** `Tab::draws_chrome` (default `false`): the shell skips
+  the list/detail focus restyle and the M1 hint adapter for it, keeps the hidden-pane note and the
+  activity placeholder (C2). `Ctx::pane_focus` and `Ctx::accent` give a ported pane its focus and
+  the tab's accent. M4 deletes the flag with the adapter.
+- **D2 - neutral homes.** `wrapped` → `kit::text`, `key_line` → `kit::chips`, `modal_rest` →
+  `kit::modal`; every importer updated in T0 with no snapshot moving.
+- **D3 - kit additions.** `kit::form` (one label column, value kinds, gutter and band, help under
+  the focused row, errors under their row, stacked fields for text areas, `value_width`,
+  `focus_lines`, heading indent), `kit::filter` (the band with `n of m`, cut with `…` rather than
+  to a wrong number), chip overflow with `‹`/`›` and click rects from the same computation,
+  `Pane::inner` and scroll spans that name the rows they measure, `kit::label` (a glyph and a word
+  for every enum group A shows, `plural`).
+- **D4 - Settings is one pane with its sections as chips**, the section's name carried by the active
+  chip when the strip overflows (D-10). Still `Panes::Single`; list + detail is MOD-123's call.
+- **D5 - Chat is one pane titled by the session**; permission keys stay digits (`a`/`A`/`r` is
+  MOD-121); plan entries, stop reasons and tool kinds read as words.
+- **D6 - Requirements** draws its tree and detail as kit panes, the filter as the tree's band, its
+  forms through `kit::form`. Maintainer D-14: the tree's hint lists the write keys first
+  (`a area · n new · e amend · W withdraw · / filter …`).
+- **MD-A - D-13 closes on every group-A screen.** Forms resolve their acts from `Ctx::pressed`;
+  every hint and every sentence that names a key builds it from `Keys` (C5, C6). Confirms the RV4
+  deferral: group B's literal `Enter …` hints close with M4.
+- **Copy (maintainer, 2026-10-21).** Prompt's reserve reads `10% (0.1)` with the bp range in the
+  help; the Agents table drops `models`, then `billing`, then `transport` below 98 cells so the name
+  keeps 10; a missing login reads `⚠ needs login`, and a manually set verdict shows the icon only
+  (`⚠*`, review answer 2026-10-21). Settings › Prompt keeps its registry keys as labels (they are
+  the names users write); only type jargon became plain words. Writes in flight read in words in
+  every section, never a request name.
+- **D-15 calls (maintainer, 2026-10-20):** shift arrows stay listed after `h`/`l`; `MODAL` keeps
+  the tab keys out of forms.
+- **C7 - under an overlay a ported pane drops focus; an unported one keeps the shell accent**
+  (review L2, recorded, no code change). A ported tab answers `Unfocused` through
+  `Ctx::pane_focus` while an overlay covers it, so its border goes faint and its hints go; group B
+  is still restyled by the shell's `paint_focus` until M4 ports it. The ported behaviour is the
+  target.
+- **Guard.** `crates/htui/tests/kit_chrome.rs` fails on any `Block::`/`Borders::` (aliases
+  included) outside test code in group A, and on any file outside the kit and group A that its
+  group-B list does not name; `every_m4_entry_still_frames_itself` is how M4 shrinks the list.
+  The scanner is shared with `no_hardcoded_keys.rs` (`tests/token_scan/mod.rs`).
+- **Chat's unbound-compose line** ("bind [chat] compose to write the first prompt") names
+  `keys.toml`; MOD-109 moves keys into Settings and repoints it.
+
 ## Commits
 
 - Plan and blueprint: `b0701b9e` (plan, fact-checked and confirmed), `71397d69` (blueprint),
@@ -192,12 +245,23 @@ hidden. The `HANDOFF.md` phase 1 note summarises the milestone.
   `4082bb55`, `29d20855`.
 - T6 shell wiring (panes, layout, history, persistence, leave dialog, header chips, default
   flips, mouse): `38209991`..`e4f048c3`.
+- M3 plan and blueprint: `c93584ec` (plan), `d9d32aa7` (blueprint), `aede0a2d` (maintainer
+  answers).
+- M3 T0 seam, helper homes, stubs: `893851bd`..`5986a5eb`. T1 kit form, filter, chip overflow:
+  `e1259651`..`ed1a27a9`. T2 labels: `32d82afc`..`b932f4e2`. T3 Settings frame:
+  `e13353df`..`58fa9460`.
+- M3 lanes, merged one at a time with the gate on each merged tree: wave A L-chat `6e0fdfb4`,
+  L-kinds `8c00937c`, L-agents `19777380` (split `951b8495`), L-req `c5325278`; wave B L-prompt
+  `2c93e071`, L-sec `041d6f86`, L-hier `8e4568ba`.
+- M3 T4 guard and transitional deletions: `7ba6de1c`..`76778523`. Review (rust-reviewer, three
+  areas): fixes RV1-RV3 merged at `d2188c87`, RV4 `8f7124ed`..`848ce83e`.
 
 ## Open at this record
 
-- Task 7 (the list + detail tabs adopt the layout and route motion by focus) and Task 9 (snapshots
-  and the full gate) had not landed on `e4f048c3`, the base of this record.
-- D-15's two maintainer calls: the shift-arrow order and the tab keys left out of `MODAL`.
-- D-13's field-key limit and the literal `Enter ..` hints outside RV1's sites, until M3/M4; the
-  deferral of the literal hints awaits the maintainer's confirmation.
-- `R-TUI-18`: MOD-116/MOD-125. `R-TUI-10`'s Postgres-stored overrides: MOD-109.
+- M4 (group B): Backlog with the `backlog/mod.rs` split, Skills, the overlays, the in-pane editor
+  and the `?` box onto the kit; then the M1 hint adapter (`paint_shell_hints`, `join_panes_under`)
+  and `Tab::draws_chrome` go, `kit_chrome`'s group-B list empties, and MOD-81/82/83/85 close. D-13's
+  field-key limit and the literal `Enter …` hints remain on group-B screens until then.
+- Group B's own copy (link kinds, gate labels, Backlog statuses) gets its labels with its port.
+- `R-TUI-18`: MOD-116/MOD-125. `R-TUI-10`'s Postgres-stored overrides: MOD-109 (which also repoints
+  text naming `keys.toml`, e.g. Chat's unbound-compose line).

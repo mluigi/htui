@@ -5,6 +5,8 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear};
 
+use crate::app::Handled;
+use crate::keys::{KeyChord, Stack};
 use crate::ui::Theme;
 use crate::ui::layout::centered;
 
@@ -118,6 +120,21 @@ impl<'a> Modal<'a> {
             box_area.width.saturating_sub(CHROME),
             box_area.height.saturating_sub(CHROME_ROWS),
         )
+    }
+}
+
+/// What a modal mode answers for a `chord` none of its own acts took (MOD-67 M3 PA-5): `Pass`
+/// for the chords `stack`'s global layer lets through (CONTROL, ALT, function keys), so `ctrl-c`
+/// quits and `F1` opens help; `Consumed` for every other, so a `q` or a `Tab` goes nowhere.
+///
+/// One copy for every modal mode, so the pass rule cannot drift between them. Moved from the
+/// Settings tab (MOD-115 M3 D2), whose sections and every other tab's modes share it.
+#[must_use]
+pub fn modal_rest(stack: Stack<'_>, chord: KeyChord) -> Handled {
+    if stack.passes(chord) {
+        Handled::Pass
+    } else {
+        Handled::Consumed
     }
 }
 
@@ -300,5 +317,33 @@ mod tests {
             }
         }
         assert!(buffer[(outer.x, outer.y)].modifier.contains(Modifier::BOLD));
+    }
+
+    /// MOD-67 M3 PA-5: a modal mode passes on what its global layer lets through, so `ctrl-c`
+    /// quits and `F1` opens help, and swallows every other chord none of its acts took.
+    #[test]
+    fn a_modal_rests_on_what_its_global_layer_passes() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        use crate::keys::views;
+
+        let stack = views::CONNECTION_CONFIRM;
+        let chord = |code, mods| KeyChord::new(code, mods);
+        assert_eq!(
+            modal_rest(stack, chord(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Handled::Pass
+        );
+        assert_eq!(
+            modal_rest(stack, chord(KeyCode::F(1), KeyModifiers::NONE)),
+            Handled::Pass
+        );
+        assert_eq!(
+            modal_rest(stack, chord(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Handled::Consumed
+        );
+        assert_eq!(
+            modal_rest(stack, chord(KeyCode::Tab, KeyModifiers::NONE)),
+            Handled::Consumed
+        );
     }
 }

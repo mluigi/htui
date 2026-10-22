@@ -2,8 +2,8 @@
 source: crates/htui/tests/hierarchy.rs
 expression: frame
 ---
-Graphics (graphics) — root on this box: /srv/graphics
-  vulkan-tutorials  Vulkan Tutorials
+▌Graphics (graphics) — root on this box: /srv/graphics
+   vulkan-tutorials  Vulkan Tutorials
      core  main  https://example.com/o/core.git  /srv/graphics/core
      docs  main  —  unset
 

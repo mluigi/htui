@@ -22,9 +22,9 @@ use crate::app::{Ctx, Handled};
 use crate::editor::ExternalEditOutcome;
 use crate::keys::{Act, KeyChord, Stack};
 use crate::store_worker::{StoreReply, StoreRequest};
+use crate::ui::kit::chips::key_line;
 use crate::ui::shell::{Panes, TabLoc};
 use crate::ui::tabs::registry::{Tab, TabId};
-use crate::ui::tabs::settings::key_line;
 use crossterm::event::KeyEvent;
 
 use library::LibraryView;

@@ -828,7 +828,9 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   Five settled changes, landable as separate milestones:
   - **Key bindings in Postgres.** Edited in Settings and stored per user, shared by every `htui` on
     the store, cached for offline. `keys.toml` goes away. This reverses MOD-67's file (ANA-26), and
-    MOD-67's catalogue, validation and `--default-keys` stay.
+    MOD-67's catalogue, validation and `--default-keys` stay. Text that points users at
+    `keys.toml` moves with it, e.g. Chat's empty state "bind [chat] compose to write the first
+    prompt" (MOD-115 M3) names the Settings surface instead.
   - **Agent rows from Settings.** A user adds a registry row, beyond MOD-23's edit form. A row's
     isolation opt-out (`settings.user_extensions`, `R-ID-5`) is shown and editable.
   - **`command_run` controls.** A phase's exposure and the per-box command-class limits become
@@ -997,6 +999,15 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   `docs/decisions/mod/mod-115-decisions.md`; plan/blueprint `.claude/plans/mod-115-tui-shell-m2.*`.
   Left for M3/M4: literal `Enter …` hints outside the former fixed sites (e.g. Settings › Agents)
   and other forms reading a translated field key (blueprint D-13).
+  **Phase 3 landed (hr/MOD-115 `848ce83e`, 2026-10-22):** group A on the kit. Settings (one pane, its ten
+  sections as chips; `settings/agents.rs` split into `settings/agents/`), Requirements and Chat
+  draw only through `ui/kit`. The kit gained form rows with inline help, the filter band, chip
+  overflow (`‹`/`›`), scroll spans and display labels for every status shown (MOD-83's copy for
+  these tabs). Every hint and key-naming sentence comes from `Keys`, forms act on the chord
+  pressed (D-13 closed for group A), and `tests/kit_chrome.rs` holds the rule. M4 (group B):
+  Backlog with the `backlog/mod.rs` split, Skills, the overlays, the in-pane editor and the `?`
+  box, then the hint adapter and `draws_chrome` go and MOD-81/82/83/85 close. Record:
+  `docs/decisions/mod/mod-115-decisions.md`; plan/blueprint `.claude/plans/mod-115-tui-shell-m3.*`.
 - [ ] **MOD-116 - Workspaces tab and workspace lifecycle** (from the UI redesign review,
   `docs/ui-redesign-findings-2026-10-15.md` §4.1). `R-TUI-14`, `R-ENT-2`, `R-ORCH-16`, `R-TUI-18`. A new tab listing every saved
   workspace with its state (open, background with runs going, stopping, stopped), an overview and

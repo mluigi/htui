@@ -1,0 +1,28 @@
+---
+source: crates/htui/tests/qdrant_settings.rs
+expression: frame
+---
+Graphics   ¹Settings       0 working · 0 waiting · memory ·  F9  about   ?  keys
+╭─ Qdrant ───────────────────────────────────────────────────────────── Qdrant ╮
+│▌URL       n/a in a demo session                                              │
+│ API key   n/a in a demo session                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+╰─e edit · c clear all · r reload · j/k rows───────────────────────────────────╯

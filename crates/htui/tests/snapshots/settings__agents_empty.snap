@@ -3,9 +3,7 @@ source: crates/htui/tests/settings.rs
 expression: frame
 ---
 no workspace   ¹Settings              0 working · 0 waiting · memory · no box ·  F9  about   ?  keys
-┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
-│ Agents                                                                                           │
-│no agents registered                                                                              │
+╭─ Agents ───────────────────────────────────────────────────────────────────────────────── Agents ╮
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -18,6 +16,8 @@ no workspace   ¹Settings              0 working · 0 waiting · memory · no bo
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
+│                                       no agents registered                                       │
+│                                            n adds one                                            │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -30,5 +30,5 @@ no workspace   ¹Settings              0 working · 0 waiting · memory · no bo
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-│quota latches per chat, r cannot refresh it                                                       │
-└─j/k select · n new · e edit · m paths · t this box · r probe · i install · a authenticate────────┘
+│ quota latches per chat, r cannot refresh it                                                      │
+╰─j/k select · n new · e edit · m paths · t this box · r probe · i install · a authenticate────────╯

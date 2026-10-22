@@ -11,26 +11,37 @@
 //! ([`QueueSetting::validate`](htui_core::model::QueueSetting::validate)), checked here before a request is sent and again by the store, and
 //! its sentence is shown verbatim. Empty clears: a cap becomes unbounded, the box limit inherits
 //! the app default.
+//!
+//! On the kit (MOD-115 M3 L-prompt): the rows are one `kit::form` of read-only values under the
+//! `project …`, `all boxes` and `this box (…)` headings, the focused row marked by the form's
+//! gutter in the tab's accent; an open editor is the row it edits, with its unit and what the row
+//! holds now on the line under it. Every key a hint or a sentence names is the key in force,
+//! resolved from `Ctx::pressed` (MD-A).
 
 use htui_core::model::{
     BoxId, DEFAULT_MAX_CONCURRENT_ITEMS, ProjectId, QueueSetting, Scope, format_usd, format_window,
     parse_usd, parse_window,
 };
 use htui_core::store::{QueueTarget, QueueToken};
+use std::cell::Cell;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::text::Line;
+use ratatui::widgets::Paragraph;
 use serde_json::{Value, json};
 
 use crate::app::{Ctx, Handled};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::queue_settings::{QueueProjectEntry, QueueSettingsSnapshot, READ_NAME, REQUEST_NAMES};
 use crate::store_worker::{StoreReply, StoreRequest};
-use crate::ui::cells::cell_width;
+use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::form::{self, Field, Form};
+use crate::ui::kit::pane::ScrollSpan;
+use crate::ui::kit::text::{Tone, notice, wrapped};
+use crate::ui::kit::{chips::key_line, modal::modal_rest};
 use crate::ui::tabs::settings::{
-    CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
-    message, modal_rest, wrapped,
+    CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection, changed_elsewhere,
 };
 use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::KeyEvent;
@@ -50,10 +61,11 @@ pub const HINT_BROWSE: HintSpec = &[
 /// Browse's keys with nothing read, or the read refused.
 const HINT_NO_SNAPSHOT: HintSpec = &[Hint::One(Act::Reload, "reload")];
 
-/// An open editor's keys: the field's own (MOD-67 D13).
+/// An open editor's keys: the field's own submit and cancel through `CAPTURE`'s `[field]` layer
+/// (MOD-67 D13; MOD-115 M3 MD-A, C6), `Enter save · Esc cancel` with the compiled keys.
 pub const HINT_EDITING: HintSpec = &[
-    Hint::Text("Enter save"),
-    Hint::Text("Esc cancel"),
+    Hint::One(Act::FieldSubmit, "save"),
+    Hint::One(Act::FieldCancel, "cancel"),
     Hint::Text("empty clears"),
 ];
 
@@ -62,6 +74,25 @@ pub const NOT_READ: &str = "queue settings not read yet";
 
 /// What the rows pane says when the read itself was refused, before the refusal's sentence.
 pub const UNAVAILABLE: &str = "queue settings unavailable";
+
+/// The next step of [`NOT_READ`]: the reload key in force, or what reads the settings without one.
+fn reads_again(reload: Option<&str>) -> String {
+    reload.map_or_else(
+        || "the queue settings are read again when the section opens".to_owned(),
+        |key| format!("{key} reads the queue settings again"),
+    )
+}
+
+/// The next step of [`UNAVAILABLE`]: the reload key in force, or when the read is asked again.
+fn asks_again(reload: Option<&str>) -> String {
+    reload.map_or_else(
+        || "they are asked for again when the section opens".to_owned(),
+        |key| format!("{key} asks again once the store answers"),
+    )
+}
+
+/// The label column: today's, the widest label (`max concurrent`) wide.
+const LABEL_WIDTH: u16 = 14;
 
 /// What `e` says on a group header. `edit` is `Edit`'s first label through `QUEUE_BROWSE`
 /// (MOD-67 M6 D4); with none bound the sentence names no key.
@@ -237,6 +268,41 @@ pub struct QueueSection {
     busy: Option<&'static str>,
     /// The last outcome, on the notice row under the pane.
     notice: Option<Notice>,
+    /// `(total rows, offset)` as of the last render, for the Settings pane's scrollbar (MOD-115
+    /// M3 D-11); `None` while nothing scrolls.
+    scroll: Cell<Option<ScrollSpan>>,
+}
+
+/// One item of the rows' form, in [`rows`](QueueSection::rows) order: built once per frame and
+/// folded into one [`Form`] (RV2 L3).
+#[derive(Clone)]
+enum Entry<'a> {
+    /// A group line (`project …`, `all boxes`, `this box (…)`).
+    Heading(String),
+    /// A value row, or the open editor's field.
+    Field(Field<'a>),
+    /// A row the snapshot no longer has: kept, so an item's index is still its row's.
+    Blank,
+}
+
+/// The cells a group's rows sit in from its heading (MOD-115 M3 RV2 L4): rows that share a
+/// label across groups (`max concurrent`, `token_budget`) read as each group's own.
+const GROUP_INDENT: u16 = 2;
+
+/// `entries` as one form, `focus` focused, on today's label column.
+fn form_of<'a>(entries: Vec<Entry<'a>>, focus: usize, editing: bool) -> Form<'a> {
+    entries.into_iter().fold(
+        Form::new()
+            .label_width(LABEL_WIDTH)
+            .indent_under_headings(GROUP_INDENT)
+            .focus(focus)
+            .editing(editing),
+        |form, entry| match entry {
+            Entry::Heading(text) => form.heading(text),
+            Entry::Field(field) => form.field(field),
+            Entry::Blank => form.blank(),
+        },
+    )
 }
 
 impl QueueSection {
@@ -394,7 +460,9 @@ impl QueueSection {
                 self.notice = None;
                 Handled::Consumed
             }
-            FieldOutcome::Pass => modal_rest(views::CAPTURE, KeyChord::from_event(key)),
+            // The chord the user pressed (MD-A): a `[field]` chord the field passed is that row's,
+            // never re-read as another act of its canonical key.
+            FieldOutcome::Pass => modal_rest(views::CAPTURE, ctx.pressed(&key)),
         }
     }
 
@@ -459,6 +527,7 @@ impl QueueSection {
         self.unavailable = None;
         self.snapshot = Some(snapshot.clone());
         self.clamp_cursor();
+        self.follow_editor();
         if write.is_some() {
             self.notice = None;
             self.mode = Mode::Browse;
@@ -467,7 +536,8 @@ impl QueueSection {
 
     /// A compare-and-set miss: adopt the reload, keep the editor's text, retake its token, and
     /// leave the retry to the next `Enter`.
-    fn on_stale(&mut self, snapshot: &QueueSettingsSnapshot) {
+    /// The sentence names the retry key as the editor's stack binds it (MD-A, D-5).
+    fn on_stale(&mut self, snapshot: &QueueSettingsSnapshot, keys: &Keys) {
         self.busy = None;
         self.unavailable = None;
         let reloaded = match &self.mode {
@@ -476,6 +546,7 @@ impl QueueSection {
         };
         self.snapshot = Some(snapshot.clone());
         self.clamp_cursor();
+        self.follow_editor();
         match reloaded {
             None => self.say(CHANGED_ELSEWHERE_CLOSED),
             Some(Reload::Gone) => {
@@ -486,79 +557,96 @@ impl QueueSection {
                 if let Mode::Editing(editor) = &mut self.mode {
                     editor.expected = token;
                 }
-                self.say(CHANGED_ELSEWHERE);
+                let retry = keys.label(views::CAPTURE, Act::FieldSubmit);
+                self.say(&changed_elsewhere(retry.as_deref()));
             }
         }
     }
 
-    /// One line per row, in [`rows`](QueueSection::rows) order.
-    fn lines(&self, theme: &Theme) -> Vec<Line<'static>> {
-        let Some(snapshot) = &self.snapshot else {
-            return Vec::new();
+    /// The open editor's row in [`rows`](QueueSection::rows), or `None` with no editor or with
+    /// its row gone from the snapshot.
+    fn editing_row(&self) -> Option<usize> {
+        let Mode::Editing(editor) = &self.mode else {
+            return None;
         };
-        let mut lines = Vec::new();
-        for (index, row) in self.rows().into_iter().enumerate() {
-            let style = if index == self.cursor {
-                theme.selected
-            } else {
-                theme.base
-            };
-            let text = match row {
-                Row::ProjectHeader { p } => self
-                    .project(p)
-                    .map(|entry| format!("project {}", entry.project.slug)),
-                Row::AppHeader => Some(APP_HEADER.to_owned()),
-                Row::BoxHeader => snapshot
-                    .this_box
-                    .as_ref()
-                    .map(|entry| format!("this box ({})", entry.hostname)),
+        self.rows().into_iter().position(|row| {
+            self.opening(row)
+                .is_some_and(|(target, _, _)| target == editor.target)
+        })
+    }
+
+    /// Puts the cursor on the open editor's row after a reload moved the rows under it, so the
+    /// row being typed into is the one marked.
+    fn follow_editor(&mut self) {
+        if let Some(row) = self.editing_row() {
+            self.cursor = row;
+        }
+    }
+
+    /// The rows as form items, in [`rows`](QueueSection::rows) order, and the item focused (§2.2's
+    /// mapping): each value read-only under its label, the open editor on the row it edits with
+    /// its unit and what the row holds now as its help. When that row is gone from the snapshot
+    /// the field is drawn after the last row, so nobody types into a field they cannot see.
+    fn entries(&self, snapshot: &QueueSettingsSnapshot) -> (Vec<Entry<'_>>, usize) {
+        let editor = match &self.mode {
+            Mode::Editing(editor) => Some(editor),
+            Mode::Browse => None,
+        };
+        let rows = self.rows();
+        let editing = self.editing_row();
+        let focus = match editor {
+            Some(_) => editing.unwrap_or(rows.len()),
+            None => self.cursor,
+        };
+        let mut entries: Vec<Entry<'_>> = rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| match *row {
+                Row::ProjectHeader { p } => self.project(p).map_or(Entry::Blank, |entry| {
+                    Entry::Heading(format!("project {}", entry.project.slug))
+                }),
+                Row::AppHeader => Entry::Heading(APP_HEADER.to_owned()),
+                Row::BoxHeader => snapshot.this_box.as_ref().map_or(Entry::Blank, |entry| {
+                    Entry::Heading(format!("this box ({})", entry.hostname))
+                }),
                 Row::Project { .. } | Row::App { .. } | Row::Box => {
-                    self.opening(row).map(|(target, stored, _)| {
-                        value_line(label(target.key()), &shown(target, stored, snapshot))
+                    let Some((target, stored, _)) = self.opening(*row) else {
+                        return Entry::Blank;
+                    };
+                    let key = target.key();
+                    let shown = shown(target, stored, snapshot);
+                    Entry::Field(match editor.filter(|_| editing == Some(index)) {
+                        Some(editor) => Field::new(label(key), form::Value::Text(&editor.input))
+                            .help(format!("{} \u{b7} now {shown}", unit(key))),
+                        None => Field::new(label(key), form::Value::ReadOnly(shown.into())),
                     })
                 }
-            };
-            if let Some(text) = text {
-                lines.push(Line::styled(text, style));
-            }
+            })
+            .collect();
+        if let Some(editor) = editor
+            && editing.is_none()
+        {
+            let key = editor.target.key();
+            entries.push(Entry::Field(
+                Field::new(label(key), form::Value::Text(&editor.input)).help(unit(key)),
+            ));
         }
-        lines
+        (entries, focus)
     }
 
-    /// The open editor's field, one line; nothing in Browse.
-    fn pane(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
-        let Mode::Editing(editor) = &self.mode else {
-            return Vec::new();
-        };
-        let key = editor.target.key();
-        let label = format!("{} ({}): ", label(key), unit(key));
-        let room = usize::from(width).saturating_sub(cell_width(&label));
-        let mut spans = vec![Span::styled(label, theme.accent)];
-        spans.extend(
-            editor
-                .input
-                .line(u16::try_from(room).unwrap_or(u16::MAX), true, theme)
-                .spans,
-        );
-        vec![Line::from(spans)]
-    }
-
-    /// The one line under the pane: the last outcome, in `theme.error` when it is one to act on
-    /// rather than read (a compare-and-set miss). The keys this mode binds moved to the shell's
-    /// hint row (MOD-67 M6 T2, [`SettingsSection::key_hint`]), so the outcome has the line to
-    /// itself; blank without one.
-    /// Any mode: an editor's outcome is drawn here too.
+    /// The one line under the rows: the last outcome as a kit notice, in `theme.error` when it is
+    /// one to act on (a compare-and-set miss, a refusal). The keys this mode binds are the
+    /// Settings pane's hints ([`SettingsSection::key_hint`]); blank without one. Any mode: an
+    /// editor's outcome is drawn here too.
     fn notice_line(&self, theme: &Theme) -> Line<'static> {
         let Some(notice) = &self.notice else {
             return Line::default();
         };
-        Line::styled(
-            notice.text().to_owned(),
-            match notice {
-                Notice::Error(_) => theme.error,
-                Notice::Info(_) => theme.dim,
-            },
-        )
+        let tone = match notice {
+            Notice::Error(_) => Tone::Error,
+            Notice::Info(_) => Tone::Info,
+        };
+        self::notice(notice.text(), tone, theme)
     }
 
     /// The stack of the current mode (MOD-67 D3, D4): the one place a mode maps to its keys, read
@@ -583,7 +671,7 @@ impl QueueSection {
         let keys = bound.hint(self.stack(), spec);
         match self.busy {
             Some(busy) if matches!(self.mode, Mode::Browse) && self.notice.is_none() => {
-                format!("{keys} \u{b7} {busy} in flight")
+                format!("{keys} \u{b7} {}\u{2026}", doing(busy))
             }
             _ => keys,
         }
@@ -645,7 +733,7 @@ impl SettingsSection for QueueSection {
         // Browse (MOD-67 D6, skeleton (c)): the first candidate this state accepts. `edit` is `e`
         // and `Enter` here (the queue's view default, D12); a global act or a declined one is the
         // shell's.
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         for act in ctx.keys().actions(views::QUEUE_BROWSE, chord) {
             match act {
                 Act::Edit => {
@@ -674,10 +762,10 @@ impl SettingsSection for QueueSection {
         Some(self.stack())
     }
 
-    fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
+    fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         match reply {
             StoreReply::QueueSettings(snapshot) => self.on_settings(snapshot),
-            StoreReply::QueueSettingsStale(snapshot) => self.on_stale(snapshot),
+            StoreReply::QueueSettingsStale(snapshot) => self.on_stale(snapshot, ctx.keys()),
             StoreReply::Failed { request, message } if *request == READ_NAME => {
                 self.unavailable = Some(message.clone());
             }
@@ -691,56 +779,72 @@ impl SettingsSection for QueueSection {
     }
 
     fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
-        super::key_line(self.hint_text(keys), theme)
+        key_line(self.hint_text(keys), theme)
+    }
+
+    fn scroll(&self) -> Option<ScrollSpan> {
+        self.scroll.get()
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
+        let theme = ctx.theme;
         let showing = self.unavailable.is_none() && self.snapshot.is_some();
         let help = if showing {
             wrapped(UNKNOWN_COST, usize::from(area.width).max(1))
         } else {
             Vec::new()
         };
-        let pane = self.pane(area.width, ctx.theme);
-        let [rows, help_area, pane_area, hint] = Layout::vertical([
-            Constraint::Min(3),
+        let [rows, help_area, hint] = Layout::vertical([
+            Constraint::Min(1),
             Constraint::Length(u16::try_from(help.len()).unwrap_or(u16::MAX)),
-            Constraint::Length(u16::try_from(pane.len()).unwrap_or(u16::MAX)),
             Constraint::Length(1),
         ])
         .areas(area);
-
+        self.scroll.set(None);
+        let reload = ctx.keys().label(views::QUEUE_BROWSE, Act::Reload);
         match (&self.unavailable, &self.snapshot) {
-            (Some(why), _) => frame.render_widget(
-                Paragraph::new(Line::styled(
-                    format!("{UNAVAILABLE}: {why}"),
-                    ctx.theme.error,
-                ))
-                .wrap(Wrap { trim: true }),
+            (Some(why), _) => {
+                let mut lines: Vec<Line<'static>> = wrapped(
+                    &format!("{UNAVAILABLE}: {why}"),
+                    usize::from(rows.width).max(1),
+                )
+                .into_iter()
+                .map(|line| notice(&line, Tone::Error, theme))
+                .collect();
+                // The next step in the empty state's own role (MOD-83).
+                let next = asks_again(reload.as_deref());
+                lines.extend(empty::lines("", NextStep(&next), theme).pop());
+                frame.render_widget(Paragraph::new(lines), rows);
+            }
+            (None, None) => empty::render(
+                frame,
                 rows,
+                NOT_READ,
+                NextStep(&reads_again(reload.as_deref())),
+                theme,
             ),
-            (None, None) => message(frame, rows, NOT_READ, ctx.theme),
-            (None, Some(_)) => {
-                let height = usize::from(rows.height);
-                let offset = self.cursor.saturating_sub(height.saturating_sub(1));
-                frame.render_widget(
-                    Paragraph::new(self.lines(ctx.theme))
-                        .scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0)),
-                    rows,
-                );
+            (None, Some(snapshot)) => {
+                let width = rows.width;
+                let (entries, focus) = self.entries(snapshot);
+                let editing = matches!(self.mode, Mode::Editing(_));
+                // One layout per frame (RV2 L3), scrolled by the form's own measure of the focused
+                // row and its help (RV2 M1): the row itself first when both do not fit.
+                let laid = form_of(entries, focus, editing).layout(width, ctx.accent(), theme);
+                let offset = laid.offset(rows.height);
+                laid.render(frame, rows, offset);
+                // Beside the rows (RV1 M2): the help and notice lines under them do not scroll.
+                self.scroll
+                    .set(Some(ScrollSpan::new(laid.lines.len(), offset).rows(rows)));
             }
         }
         if !help.is_empty() {
             let help: Vec<Line<'static>> = help
                 .into_iter()
-                .map(|line| Line::styled(line, ctx.theme.dim))
+                .map(|line| Line::styled(line, theme.dim))
                 .collect();
             frame.render_widget(Paragraph::new(help), help_area);
         }
-        if !pane.is_empty() {
-            frame.render_widget(Paragraph::new(pane), pane_area);
-        }
-        frame.render_widget(Paragraph::new(self.notice_line(ctx.theme)), hint);
+        frame.render_widget(Paragraph::new(self.notice_line(theme)), hint);
     }
 }
 
@@ -764,11 +868,6 @@ const fn unit(key: QueueSetting) -> &'static str {
         QueueSetting::MaxConcurrentItems => "runs",
         QueueSetting::SchedulerWindow => "HH:MM-HH:MM",
     }
-}
-
-/// One value row: the label, padded so the values line up, then the value.
-fn value_line(label: &str, value: &str) -> String {
-    format!("  {label:<14}  {value}")
 }
 
 /// What a value row shows (D8).
@@ -833,7 +932,18 @@ fn parse(key: QueueSetting, text: &str) -> Result<Value, String> {
 
 /// What a second write is told while the first is still out.
 fn in_flight(busy: &str) -> String {
-    format!("`{busy}` is still in flight")
+    format!("still {} \u{2014} wait for the store's answer", doing(busy))
+}
+
+/// What a write in flight is doing, in words (MOD-83): never its request name.
+fn doing(busy: &str) -> &'static str {
+    if busy == REQUEST_NAMES[1] {
+        "saving the setting"
+    } else if busy == REQUEST_NAMES[2] {
+        "clearing the setting"
+    } else {
+        "writing"
+    }
 }
 
 /// The token an open editor retries against after a reload.

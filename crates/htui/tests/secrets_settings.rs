@@ -1470,7 +1470,7 @@ async fn esc_drops_the_identity_form() {
     assert!(!section.captures_input());
     assert!(bench.drained().is_empty());
     let shown = frame(&bench, &section);
-    assert!(!shown.contains("client secret:"), "{shown}");
+    assert!(!shown.contains("client secret"), "{shown}");
     // Reopening starts empty.
     bench.key(&mut section, "e");
     let shown = frame(&bench, &section);
@@ -1615,7 +1615,7 @@ async fn one_write_in_flight_refuses_e_and_c_but_not_r_or_t() {
         assert!(bench.drained().is_empty(), "`{key}` sends nothing");
         let shown = frame(&bench, &section);
         assert!(
-            shown.contains("`clear_infisical_url` is still in flight"),
+            shown.contains("still clearing the Infisical URL \u{2014} wait for the store's answer"),
             "{shown}"
         );
     }
@@ -2154,7 +2154,7 @@ async fn e_on_a_project_opens_the_scope_form_prefilled() {
     bench.key(&mut section, "e");
     assert!(section.captures_input());
     let shown = frame(&bench, &section);
-    for expected in ["project ID: p-graphics", "environment: dev", "path: /app"] {
+    for expected in ["project ID p-graphics", "environment dev", "path /app"] {
         let flat = shown.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(flat.contains(expected), "`{expected}` in {shown}");
     }
@@ -2587,14 +2587,15 @@ async fn a_read_sent_before_a_write_is_not_its_answer() {
     assert!(
         bench
             .key_hint(&section)
-            .contains("set_machine_identity in flight"),
+            .contains("\u{b7} storing the machine identity\u{2026}"),
         "{shown}"
     );
     assert!(shown.contains(latch), "nothing was rebuilt yet: {shown}");
     bench.key(&mut section, "e");
     assert!(!section.captures_input(), "the write is still in flight");
     assert!(
-        frame(&bench, &section).contains("`set_machine_identity` is still in flight"),
+        frame(&bench, &section)
+            .contains("still storing the machine identity \u{2014} wait for the store's answer"),
         "{}",
         frame(&bench, &section)
     );
@@ -2638,7 +2639,7 @@ async fn a_refused_read_does_not_free_a_write_in_flight() {
         assert!(bench.drained().is_empty(), "`{key}` sends nothing");
         let shown = frame(&bench, &section);
         assert!(
-            shown.contains("`clear_infisical_url` is still in flight"),
+            shown.contains("still clearing the Infisical URL \u{2014} wait for the store's answer"),
             "{shown}"
         );
     }
@@ -3125,4 +3126,338 @@ async fn a_rebound_check_key_is_named_on_health() {
         refused.contains("nothing to edit on this row; T checks the provider"),
         "{refused}"
     );
+}
+
+// ---- MOD-115 M3 (lane L-sec): the section on the kit ----------------------------------------------
+
+/// `field.submit` and `field.cancel` moved (MOD-115 M3 C6): every field's `Enter` and `Esc`.
+const FIELD_REBOUND: &str = "version = 2\n[field]\nsubmit = [\"ctrl-t\"]\ncancel = [\"ctrl-o\"]\n";
+
+/// The frame as one line, so a sentence is found wherever it wrapped.
+fn flat(frame: &str) -> String {
+    frame.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// One section drawn into a 100x30 buffer: a marker's colour is a style, not text.
+fn drawn(bench: &SectionBench, section: &SecretsSection) -> ratatui::buffer::Buffer {
+    let area = ratatui::layout::Rect::new(0, 0, 100, 30);
+    let mut terminal = ratatui::Terminal::with_options(
+        ratatui::backend::TestBackend::new(100, 30),
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(area),
+        },
+    )
+    .expect("a test terminal");
+    let ctx = bench.ctx();
+    terminal
+        .draw(|frame| section.render(frame, frame.area(), &ctx))
+        .expect("the section draws");
+    terminal.backend().buffer().clone()
+}
+
+/// Every form's hint reads as before under the compiled keys and names the rebound chords once
+/// `[field]` moves them (MD-A, C6): the URL field, the identity form and the scope form.
+#[tokio::test]
+async fn every_field_hint_names_the_field_keys_in_force() {
+    let (bench, mut section) = loaded_with_keys(FIELD_REBOUND, configured()).await;
+    let compiled = SectionBench::new().await;
+
+    go_to(&bench, &mut section, ROW_URL);
+    bench.key(&mut section, "e");
+    assert_eq!(compiled.key_hint(&section), "Enter store \u{b7} Esc cancel");
+    assert_eq!(
+        bench.key_hint(&section),
+        "Ctrl+t store \u{b7} Ctrl+o cancel"
+    );
+    bench.key(&mut section, "esc");
+
+    go_to(&bench, &mut section, ROW_IDENTITY);
+    bench.key(&mut section, "e");
+    assert_eq!(
+        compiled.key_hint(&section),
+        "Tab next field \u{b7} Enter store \u{b7} Esc cancel \u{b7} the secret is never shown"
+    );
+    assert_eq!(
+        bench.key_hint(&section),
+        "Tab next field \u{b7} Ctrl+t store \u{b7} Ctrl+o cancel \u{b7} the secret is never shown"
+    );
+    bench.key(&mut section, "esc");
+
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    bench.key(&mut section, "e");
+    assert_eq!(
+        compiled.key_hint(&section),
+        "Tab next field \u{b7} Enter save \u{b7} Esc cancel"
+    );
+    assert_eq!(
+        bench.key_hint(&section),
+        "Tab next field \u{b7} Ctrl+t save \u{b7} Ctrl+o cancel"
+    );
+}
+
+/// D-5: a stale scope write names the retry key in force.
+#[tokio::test]
+async fn a_stale_scope_write_names_the_retry_key_in_force() {
+    let keys = htui::keys::load_str(FIELD_REBOUND).expect("the key file loads");
+    let store = MemStore::demo();
+    let bench = SectionBench::new().await.with_keys(keys);
+    let mut section = SecretsSection::new();
+    let tree = graphics(&store).await;
+    bench.reply(&mut section, &configured());
+    bench.reply(&mut section, &tree_reply(&tree));
+    let _ = bench.drained();
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, "p-graphics");
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, "dev");
+    bench.key(&mut section, "Enter");
+    let _ = requests(&bench);
+    bench.reply(
+        &mut section,
+        &scope_written(ids::PROJECT_VULKAN, &tree, ScopeWrite::Stale),
+    );
+    let shown = flat(&frame(&bench, &section));
+    assert!(
+        shown.contains("changed elsewhere since you opened it \u{2014} reloaded; Ctrl+t retries against the current row"),
+        "{shown}"
+    );
+}
+
+/// The identity form opens under the Identity row (D3, audit item 3), one row per field in the
+/// form's shared label column, and no label is drawn in the accent: only the focused row's gutter
+/// carries the tab's (MOD-85).
+#[tokio::test]
+async fn the_identity_form_opens_under_its_row() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_IDENTITY);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, CLIENT_ID);
+    let shown = frame(&bench, &section);
+    let lines: Vec<&str> = shown.lines().collect();
+    let identity = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("Identity"))
+        .expect("the Identity row");
+    assert!(
+        lines[identity + 1].starts_with("\u{258c}client ID")
+            && lines[identity + 1].contains(CLIENT_ID),
+        "{shown}"
+    );
+    assert!(lines[identity + 2].contains("client secret"), "{shown}");
+    assert!(!shown.contains("client ID: "), "{shown}");
+
+    let buffer = drawn(&bench, &section);
+    let theme = htui::ui::Theme::default();
+    let accent = theme.tab_accent("settings");
+    let y = u16::try_from(identity + 1).expect("a row");
+    assert_eq!(
+        buffer[(0, y)].fg,
+        accent.fg.unwrap_or(ratatui::style::Color::Reset)
+    );
+    for y in 0..buffer.area.height {
+        for x in 1..buffer.area.width {
+            assert_ne!(
+                buffer[(x, y)].style().fg,
+                theme.accent.fg,
+                "no label in the accent at ({x}, {y})"
+            );
+        }
+    }
+}
+
+/// A stored identity reads as a secret value: dots and a word.
+#[tokio::test]
+async fn a_stored_identity_reads_as_a_secret() {
+    let (bench, section, _) = loaded(configured()).await;
+    let shown = frame(&bench, &section);
+    assert!(
+        shown.contains("\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022} stored"),
+        "{shown}"
+    );
+}
+
+/// MOD-83: a refused keyring read names what brings the rows back.
+#[tokio::test]
+async fn a_refused_read_names_the_next_step() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "secrets_info",
+            message: "keyring task failed: boom".to_owned(),
+        },
+    );
+    let shown = flat(&frame(&bench, &section));
+    assert!(
+        shown.contains("secret settings are unavailable: keyring task failed: boom"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("r asks again once the store answers"),
+        "{shown}"
+    );
+}
+
+/// Each question is the error line of the row it is about.
+#[tokio::test]
+async fn each_question_sits_under_its_row() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_URL);
+    bench.key(&mut section, "c");
+    let shown = frame(&bench, &section);
+    let lines: Vec<&str> = shown.lines().collect();
+    let url = lines
+        .iter()
+        .position(|line| line.starts_with("\u{258c}URL"))
+        .expect("the URL row is focused");
+    assert!(
+        lines[url + 1].contains("Remove the Infisical URL from the keyring?"),
+        "{shown}"
+    );
+}
+
+/// A write in flight reads in words, never as a store request's name.
+#[tokio::test]
+async fn a_write_in_flight_reads_in_words() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_URL);
+    bench.key(&mut section, "c");
+    bench.key(&mut section, "y");
+    let _ = requests(&bench);
+    let hint = bench.key_hint(&section);
+    assert!(
+        hint.ends_with("\u{b7} clearing the Infisical URL\u{2026}"),
+        "{hint}"
+    );
+    bench.key(&mut section, "e");
+    let shown = flat(&frame(&bench, &section));
+    assert!(
+        shown.contains("still clearing the Infisical URL \u{2014} wait for the store's answer"),
+        "{shown}"
+    );
+}
+
+/// MOD-81: the section at 80 columns, through the shell (`--demo`: no keyring is read).
+#[tokio::test]
+async fn the_section_at_80_columns() {
+    let mut harness = Harness::demo().size(80, 24).with_tab(Box::new(
+        htui::ui::tabs::settings::SettingsTab::with_sections(vec![Box::new(SecretsSection::new())]),
+    ));
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(frame.contains("n/a in a demo session"), "{frame}");
+    insta::assert_snapshot!("demo_80", frame);
+}
+
+/// With no tree to list, the note sits one blank row under the fixed rows, as before the port.
+#[tokio::test]
+async fn no_workspace_is_one_blank_under_the_rows() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    bench.reply(&mut section, &StoreReply::SecretsTree(None));
+    let shown = frame(&bench, &section);
+    let lines: Vec<&str> = shown.lines().collect();
+    let health = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("Health"))
+        .expect("the Health row");
+    assert_eq!(lines[health + 1].trim(), "", "{shown}");
+    assert!(
+        lines[health + 2].contains("no workspace: project scopes need one"),
+        "{shown}"
+    );
+}
+
+/// Content parity (L-sec repair): a project slug wider than the form's label column is shown
+/// whole, not cut with `…`, so two projects that share a long prefix stay apart by name.
+#[tokio::test]
+async fn a_long_project_slug_is_shown_whole_at_80_columns() {
+    let (bench, mut section, tree) = loaded(configured()).await;
+    let slug = "graphics-vulkan-tutorials-for-the-long-slug-case";
+    let mut long = tree.clone();
+    long.projects[0].project.slug = slug.to_owned();
+    bench.reply(&mut section, &tree_reply(&long));
+    let shown = bench.render_section(&section, 78);
+    assert!(shown.contains(slug), "the whole slug: {shown}");
+    assert!(!shown.contains('\u{2026}'), "nothing is cut: {shown}");
+    assert!(
+        flat(&shown).contains(&format!("{slug} \u{b7} no secret provider")),
+        "the row's scope follows it: {shown}"
+    );
+}
+
+/// Content parity (L-sec repair): the latched-login note stays on screen while the question
+/// about the same Identity row is open.
+#[tokio::test]
+async fn the_latch_stays_while_the_identity_question_is_open() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    bench.reply(
+        &mut section,
+        &StoreReply::SecretCheck(SecretCheck::Provider {
+            at: at(14, 2, 11),
+            generation: 0,
+            outcome: Err(SecretError::BadCredentials),
+        }),
+    );
+    go_to(&bench, &mut section, ROW_IDENTITY);
+    bench.key(&mut section, "c");
+    let shown = flat(&frame(&bench, &section));
+    assert!(shown.contains("Remove the machine identity"), "{shown}");
+    assert!(shown.contains("the last login was refused"), "{shown}");
+}
+
+/// MOD-115 M3 RV2 M1: the section scrolls by the form's own measure of the focused row
+/// (`Form::focus_lines`), not by guessing from the lines' first cells. A long slug's row has an
+/// empty label, so it starts as a continuation line does: a guess counted every such row under
+/// the cursor as its own, and scrolled the first project to the top though the page held it.
+#[tokio::test]
+async fn long_slug_rows_under_the_cursor_do_not_scroll_the_form() {
+    let (bench, mut section, tree) = loaded(configured()).await;
+    let mut long = tree.clone();
+    let first = long.projects[0].clone();
+    long.projects = (0..40)
+        .map(|index| {
+            let mut entry = first.clone();
+            entry.project.id = ProjectId::new();
+            entry.project.slug =
+                format!("graphics-vulkan-tutorials-for-the-long-slug-case-{index:02}");
+            entry
+        })
+        .collect();
+    bench.reply(&mut section, &tree_reply(&long));
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    let shown = frame(&bench, &section);
+    let span = section.scroll().expect("forty projects do not fit 30 rows");
+    assert_eq!(
+        span.offset, 0,
+        "the first project fits the first page: {shown}"
+    );
+    assert!(shown.contains("-00 \u{b7} "), "{shown}");
+    assert!(
+        shown
+            .lines()
+            .any(|line| line.trim_start().starts_with("URL")),
+        "the rows above it stay: {shown}"
+    );
+
+    // The cursor past the page still brings its row into view, at the page's foot.
+    for _ in 0..30 {
+        bench.key(&mut section, "j");
+    }
+    let shown = frame(&bench, &section);
+    assert!(shown.contains("-30 \u{b7} "), "the cursor's row: {shown}");
+    let span = section.scroll().expect("the form scrolls");
+    assert!(span.offset > 0, "{shown}");
+}
+
+/// MOD-115 M3 RV2 (RV1 M2's span): the bar is measured against the form's rows, the notice
+/// under them is not padded into the total.
+#[tokio::test]
+async fn the_scroll_names_the_form_rows_it_measures() {
+    let (bench, section, _) = loaded(configured()).await;
+    let _ = frame(&bench, &section);
+    let span = section.scroll().expect("the form reports its scroll");
+    let rows = span.rows.expect("the rect the form was drawn into");
+    assert_eq!((rows.y, rows.width), (0, 100), "{rows:?}");
+    assert!(span.total <= 30, "the form's own lines, unpadded: {span:?}");
 }

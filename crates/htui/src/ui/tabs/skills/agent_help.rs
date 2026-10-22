@@ -29,8 +29,8 @@ use crate::app::{Ctx, Handled};
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{ChatFrame, EDIT_HELP, StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
+use crate::ui::kit::modal::modal_rest;
 use crate::ui::tabs::backlog::detail::Scroll;
-use crate::ui::tabs::settings::modal_rest;
 use crate::ui::{FieldOutcome, TextField, Theme, diff};
 
 /// `StoreRequest::ChatCancel`'s request name: its `Failed` (the chat ended before the cancel

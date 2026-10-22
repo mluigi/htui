@@ -22,14 +22,22 @@
 //! the phase narrowing — belongs to
 //! [`validate`](htui_core::prompt::validate), and its sentence is shown verbatim. A range checked
 //! twice is a range that can disagree with itself.
+//!
+//! On the kit (MOD-115 M3 L-prompt): the tree is one `kit::form` of read-only rows under group
+//! headings, the focused row marked by the form's gutter in the tab's accent; the registry's doc,
+//! range and rungs are the focused row's help on the line under it, and a clamp is an error under
+//! the row it concerns. An open editor is the row it edits. The source column reads in words
+//! (`kit::label::setting_source`), the reserve in percent beside the fraction it is typed as, and
+//! every key a hint or a sentence names is the key in force, resolved from `Ctx::pressed` (MD-A).
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::text::Line;
+use ratatui::widgets::Paragraph;
 
 use htui_core::model::Scope;
 use htui_core::prompt::settings::{
@@ -41,13 +49,18 @@ use htui_core::store::SettingRung;
 use serde_json::Value;
 
 use crate::app::{Ctx, Handled};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::prompt_settings::{AppEntry, ProjectEntry, READ_NAME, REQUEST_NAMES, SettingsSnapshot};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
+use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::form::{self, Field, Form};
+use crate::ui::kit::label;
+use crate::ui::kit::pane::ScrollSpan;
+use crate::ui::kit::text::{Tone, notice, wrapped};
+use crate::ui::kit::{chips::key_line, modal::modal_rest};
 use crate::ui::tabs::settings::{
-    CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
-    message, modal_rest, wrapped,
+    CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection, changed_elsewhere,
 };
 use crate::ui::{FieldOutcome, TextField, Theme};
 use chrono::{DateTime, Utc};
@@ -58,6 +71,22 @@ const NOT_READ: &str = "settings not read yet";
 
 /// What the rows pane says when the read itself was refused.
 const UNAVAILABLE: &str = "settings unavailable";
+
+/// The next step of [`NOT_READ`]: the reload key in force, or what reads the settings without one.
+fn reads_again(reload: Option<&str>) -> String {
+    reload.map_or_else(
+        || "the settings are read again when the section opens".to_owned(),
+        |key| format!("{key} reads the settings again"),
+    )
+}
+
+/// The next step of [`UNAVAILABLE`]: the reload key in force, or when the read is asked again.
+fn asks_again(reload: Option<&str>) -> String {
+    reload.map_or_else(
+        || "they are asked for again when the section opens".to_owned(),
+        |key| format!("{key} asks again once the store answers"),
+    )
+}
 
 /// What a rung that holds no value of its own shows.
 ///
@@ -75,10 +104,12 @@ const HINT_BROWSE: HintSpec = &[
 /// Browse's keys with nothing read, or the read refused: the only offer is to ask again.
 const HINT_NO_SNAPSHOT: HintSpec = &[Hint::One(Act::Reload, "reload")];
 
-/// An open editor's keys: the field's own (MOD-67 D13). One field, so there is no `Tab`.
+/// An open editor's keys: the field's own submit and cancel through `CAPTURE`'s `[field]` layer
+/// (MOD-67 D13; MOD-115 M3 MD-A, C6), `Enter save · Esc cancel` with the compiled keys. One
+/// field, so there is no `Tab`.
 const HINT_EDITING: HintSpec = &[
-    Hint::Text("Enter save"),
-    Hint::Text("Esc cancel"),
+    Hint::One(Act::FieldSubmit, "save"),
+    Hint::One(Act::FieldCancel, "cancel"),
     Hint::Text("empty clears"),
 ];
 
@@ -101,15 +132,15 @@ const APP_HEADER: &str = "app";
 /// The prefix of a project group's line (B-1).
 const PROJECT_HEADER: &str = "project";
 
-/// What the source column says for a project-only key nothing stores: no `app_setting` row can
-/// exist for it, so `app_setting_default` would name a rung it does not have (MOD-33 D276).
-const COMPILED_DEFAULT: &str = "default";
-
 /// What a [`SettingKind::Boolean`] row's effective column says when the switch is on.
 const SWITCH_ON: &str = "on";
 
 /// …and when it is off.
 const SWITCH_OFF: &str = "off";
+
+/// The unit column of a [`SettingKind::Fraction`] key: what it is typed as (MOD-83). The registry
+/// counts its range in basis points, which the help line keeps.
+const FRACTION_UNIT: &str = "fraction";
 
 /// What a [`SettingKind::Boolean`] row's pane says in place of a numeric range.
 const SWITCH_RANGE: &str = "on or off";
@@ -258,12 +289,12 @@ struct Opening<'a> {
 /// The reader's answer for one row: what it would use, from which rung, and any note it made.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Effective {
-    /// As the row prints it (`5000`, `0.1 (1000 bp)`).
+    /// As the row prints it (`5000`, `10% (0.1)`).
     text: String,
     /// The same as a number, for D13's comparison; `None` for the one fraction key, whose stored
     /// unit and resolved unit are not the same thing.
     number: Option<i64>,
-    /// Which rung answered, as the row prints it.
+    /// Which rung answered, in words ([`label::setting_source`]: `default`, `app setting`).
     source: &'static str,
     /// [`resolve_hops`]'s clamp note, when it made one (blueprint flag B).
     notes: Vec<String>,
@@ -286,6 +317,42 @@ pub struct PromptSection {
     busy: Option<&'static str>,
     /// The last outcome, on the notice row under the pane.
     notice: Option<Notice>,
+    /// The form's lines, first line drawn and rows as of the last render, for the Settings
+    /// pane's scrollbar (MOD-115 M3 D-11, RV1 M2); `None` while nothing scrolls.
+    scroll: Cell<Option<ScrollSpan>>,
+}
+
+/// One item of the tree's form, in [`rows`](PromptSection::rows) order: built once per frame
+/// and folded into one [`Form`] (RV2 L3).
+#[derive(Clone)]
+enum Entry<'a> {
+    /// A group line (`app`, `project {name}`).
+    Heading(String),
+    /// A value row, or the open editor's field.
+    Field(Field<'a>),
+    /// A row the snapshot no longer has: kept, so an item's index is still its row's.
+    Blank,
+}
+
+/// The cells a group's rows sit in from its heading (MOD-115 M3 RV2 L4): rows that share a
+/// label across groups (`max concurrent`, `token_budget`) read as each group's own.
+const GROUP_INDENT: u16 = 2;
+
+/// `entries` as one form, `focus` focused, the label column the registry's widest key wide.
+fn form_of<'a>(entries: Vec<Entry<'a>>, focus: usize, editing: bool) -> Form<'a> {
+    let width = u16::try_from(*KEY_WIDTH + 1).unwrap_or(u16::MAX);
+    entries.into_iter().fold(
+        Form::new()
+            .label_width(width)
+            .indent_under_headings(GROUP_INDENT)
+            .focus(focus)
+            .editing(editing),
+        |form, entry| match entry {
+            Entry::Heading(text) => form.heading(text),
+            Entry::Field(field) => form.field(field),
+            Entry::Blank => form.blank(),
+        },
+    )
 }
 
 impl PromptSection {
@@ -512,7 +579,9 @@ impl PromptSection {
                 self.notice = None;
                 Handled::Consumed
             }
-            FieldOutcome::Pass => modal_rest(views::CAPTURE, KeyChord::from_event(key)),
+            // The chord the user pressed (MD-A): a `[field]` chord the field passed is that row's,
+            // never re-read as another act of its canonical key.
+            FieldOutcome::Pass => modal_rest(views::CAPTURE, ctx.pressed(&key)),
         }
     }
 
@@ -602,8 +671,8 @@ impl PromptSection {
 
     /// A compare-and-set miss (D14, PRD D8): the tree is replaced, the editor keeps its text and
     /// takes the current row's token, and the retry is a second `Enter` rather than an automatic
-    /// write.
-    fn on_stale(&mut self, snapshot: &SettingsSnapshot) {
+    /// write. The sentence names the retry key as the editor's stack binds it (MD-A, D-5).
+    fn on_stale(&mut self, snapshot: &SettingsSnapshot, keys: &Keys) {
         self.busy = None;
         let reloaded = match &self.mode {
             Mode::Editing(editor) => Some(reload(snapshot, editor.target)),
@@ -611,6 +680,7 @@ impl PromptSection {
         };
         self.snapshot = Some(snapshot.clone());
         self.clamp_cursor();
+        self.follow_editor();
         match reloaded {
             // Nothing is open to press `Enter` on, so the sentence has to carry what the editor
             // would otherwise stand for: the write did not apply, and the way back is to reopen.
@@ -626,126 +696,120 @@ impl PromptSection {
                         Reload::Gone | Reload::NoRow => None,
                     };
                 }
-                self.say(CHANGED_ELSEWHERE);
+                let retry = keys.label(views::CAPTURE, Act::FieldSubmit);
+                self.say(&changed_elsewhere(retry.as_deref()));
             }
         }
     }
 
-    /// One line per row, in [`rows`](PromptSection::rows) order (D9).
-    fn lines(&self, theme: &Theme) -> Vec<Line<'static>> {
-        let Some(snapshot) = &self.snapshot else {
-            return Vec::new();
+    /// The open editor's row in [`rows`](PromptSection::rows), or `None` with no editor or with
+    /// its row gone from the tree.
+    fn editing_row(&self) -> Option<usize> {
+        let Mode::Editing(editor) = &self.mode else {
+            return None;
+        };
+        self.rows().into_iter().position(|row| {
+            self.target_of(row)
+                .is_some_and(|opening| opening.target == editor.target)
+        })
+    }
+
+    /// Puts the cursor on the open editor's row after a reload moved the rows under it, so the
+    /// row being typed into is the one marked and the one `Esc` leaves the cursor on.
+    fn follow_editor(&mut self) {
+        if let Some(row) = self.editing_row() {
+            self.cursor = row;
+        }
+    }
+
+    /// The tree as form items, in [`rows`](PromptSection::rows) order (D9), and the item focused.
+    ///
+    /// Every value row is read-only and wraps under its column (MOD-81). The focused one carries
+    /// the registry's own lines as its help (B-6): the doc, the range in its unit and the rungs
+    /// the key accepts; a clamp or a resolver's note is an error under the row it concerns, shown
+    /// whatever has focus (D13). An open editor is the row it edits, with what the row holds now
+    /// in its help, so a reload under it stays on screen; when that row is gone from the tree the
+    /// field is drawn after the last row, so nobody types into a field they cannot see.
+    ///
+    /// `width` is the form's: a key wider than the label column there (a third of the width,
+    /// MOD-60) is cut with `…`, so the focused row's help names it whole.
+    fn entries(&self, snapshot: &SettingsSnapshot, width: u16) -> (Vec<Entry<'_>>, usize) {
+        let column = usize::from(form_of(Vec::new(), 0, false).label_column(width));
+        let help = |key: SettingKey, now: Option<&str>| {
+            let cut = cell_width(key.key()) > column;
+            help_text(key, now, cut)
         };
         // Ten entries, rebuilt per frame rather than cached: the snapshot is replaced whole on
         // every reply, and a cache beside it would be the second source of truth D3 refuses.
         let app = snapshot.app_map();
-        let mut lines = Vec::new();
-        for (index, row) in self.rows().into_iter().enumerate() {
-            let style = if index == self.cursor {
-                theme.selected
-            } else {
-                theme.base
-            };
-            match row {
-                // `&'static str` rather than an owned copy: `Line<'static>` borrows a constant
-                // happily, and the group header is drawn on every frame.
-                Row::AppHeader => lines.push(Line::styled(APP_HEADER, style)),
-                Row::ProjectHeader { p } => {
-                    if let Some(entry) = self.project(p) {
-                        lines.push(Line::styled(
-                            format!("{PROJECT_HEADER} {}", entry.project.name),
-                            style,
-                        ));
-                    }
-                }
+        let editor = match &self.mode {
+            Mode::Editing(editor) => Some(editor),
+            Mode::Browse => None,
+        };
+        let rows = self.rows();
+        let editing = self.editing_row();
+        let focus = match editor {
+            Some(_) => editing.unwrap_or(rows.len()),
+            None => self.cursor,
+        };
+        let mut entries: Vec<Entry<'_>> = rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| match *row {
+                Row::AppHeader => Entry::Heading(APP_HEADER.to_owned()),
+                Row::ProjectHeader { p } => self.project(p).map_or(Entry::Blank, |entry| {
+                    Entry::Heading(format!("{PROJECT_HEADER} {}", entry.project.name))
+                }),
                 Row::App { .. } | Row::Project { .. } => {
-                    if let Some((key, stored, effective)) = self.value_at(row, &app) {
-                        lines.push(Line::styled(value_line(key, stored, &effective), style));
+                    let Some((key, stored, effective)) = self.value_at(*row, &app) else {
+                        return Entry::Blank;
+                    };
+                    let shown = value_text(key, stored, &effective);
+                    let open = editor.filter(|_| editing == Some(index));
+                    let mut field = match open {
+                        Some(editor) => Field::new(key.key(), form::Value::Text(&editor.input))
+                            .help(help(key, Some(&shown))),
+                        None => {
+                            let field = Field::new(key.key(), form::Value::ReadOnly(shown.into()));
+                            if index == focus {
+                                field.help(help(key, None))
+                            } else {
+                                field
+                            }
+                        }
+                    };
+                    if let Some(error) = row_error(key, stored, &effective) {
+                        field = field.error(error);
                     }
+                    Entry::Field(field)
                 }
-            }
-        }
-        lines
-    }
-
-    /// The pane under the rows: the registry's own row for the selected key (B-6).
-    ///
-    /// The kinds section's Browse pane is empty because it has nothing row-specific to say; this
-    /// one does — the doc line, the range in its unit, the rungs the key accepts, and the two
-    /// things the reader would do to the stored number that the row alone cannot show.
-    fn pane(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        // A header selected has nothing row-specific to say, so the pane is the field alone — and
-        // in Browse, nothing at all.
-        if let Some(snapshot) = &self.snapshot
-            && let Some(row) = self.selected()
-            && let Some((key, stored, effective)) = self.value_at(row, &snapshot.app_map())
+            })
+            .collect();
+        if let Some(editor) = editor
+            && editing.is_none()
         {
-            let spec = key.spec();
-            let room = usize::from(width).max(1);
-            lines.extend(
-                wrapped(spec.doc, room)
-                    .into_iter()
-                    .map(|line| Line::styled(line, theme.dim)),
-            );
-            let range = match spec.kind {
-                // `min` 0 and `max` 1 are nominal for a switch; the range it takes is two words.
-                SettingKind::Boolean => format!("{SWITCH_RANGE} \u{b7} rungs {}", spec.rungs),
-                SettingKind::Integer | SettingKind::Fraction => format!(
-                    "range {}..={} {} \u{b7} rungs {}",
-                    spec.min, spec.max, spec.unit, spec.rungs
-                ),
-            };
-            lines.push(Line::styled(range, theme.dim));
-            // D13: the `not_above` rule is one-directional by decision, so a peer lowered under
-            // this row's stored value leaves the row describing a number the reader will not use.
-            // Derived from the spec and the resolver's own answer, so no key is named here.
-            if let Some(peer) = spec.not_above
-                && let Some(held) = stored.and_then(Value::as_i64)
-                && let Some(used) = effective.number
-                && used < held
-            {
-                lines.push(Line::styled(clamp_line(peer, used), theme.error));
-            }
-            for note in &effective.notes {
-                lines.push(Line::styled(note.clone(), theme.error));
-            }
+            let key = editor.target.key;
+            entries.push(Entry::Field(
+                Field::new(key.key(), form::Value::Text(&editor.input)).help(help(key, None)),
+            ));
         }
-        // The field goes under the registry's own lines, not over them: what the range and the
-        // rungs say is what an `Enter` will be judged against. Drawn whatever the cursor is on, so
-        // a reload that moved it can never leave someone typing into a field they cannot see.
-        if let Mode::Editing(editor) = &self.mode {
-            let label = format!("{}: ", editor.target.key);
-            let room = usize::from(width).saturating_sub(cell_width(&label));
-            let mut spans = vec![Span::styled(label, theme.accent)];
-            spans.extend(
-                editor
-                    .input
-                    .line(u16::try_from(room).unwrap_or(u16::MAX), true, theme)
-                    .spans,
-            );
-            lines.push(Line::from(spans));
-        }
-        lines
+        (entries, focus)
     }
 
-    /// The one line under the pane: the last outcome, in `theme.error` when it is one to act on
-    /// rather than read (a compare-and-set miss). The keys this mode binds moved to the shell's
-    /// hint row (MOD-67 M6 T2, [`SettingsSection::key_hint`]), so the outcome has the line to
-    /// itself; blank without one.
-    /// Any mode: an editor's outcome is drawn here too.
+    /// The one line under the tree: the last outcome as a kit notice, in `theme.error` when it is
+    /// one to act on rather than read (a compare-and-set miss). The keys this mode binds are the
+    /// Settings pane's hints ([`SettingsSection::key_hint`]), so the outcome has the line to
+    /// itself; blank without one. Any mode: an editor's outcome is drawn here too.
     fn notice_line(&self, theme: &Theme) -> Line<'static> {
         let Some(notice) = &self.notice else {
             return Line::default();
         };
-        Line::styled(
-            notice.text().to_owned(),
-            if notice.is_error() {
-                theme.error
-            } else {
-                theme.dim
-            },
-        )
+        let tone = if notice.is_error() {
+            Tone::Error
+        } else {
+            Tone::Info
+        };
+        self::notice(notice.text(), tone, theme)
     }
 
     /// The stack of the current mode (MOD-67 D3, D4): the one place a mode maps to its keys, read
@@ -775,7 +839,7 @@ impl PromptSection {
             // Only in Browse: an editor's own hint says what `Enter` is for, and a write in flight
             // is why `Enter` is not answering.
             Some(busy) if matches!(self.mode, Mode::Browse) && self.notice.is_none() => {
-                format!("{keys} \u{b7} {busy} in flight")
+                format!("{keys} \u{b7} {}\u{2026}", doing(busy))
             }
             _ => keys,
         }
@@ -819,6 +883,7 @@ impl PromptSection {
             self.notice = None;
             self.mode = Mode::Browse;
         }
+        self.follow_editor();
     }
 }
 
@@ -864,7 +929,7 @@ impl SettingsSection for PromptSection {
         // Browse (MOD-67 D6, skeleton (c)): the first candidate this state accepts. Section
         // cycling never reaches here (the tab takes `settings.*` first), and a global act or a
         // declined one is the shell's.
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         for act in ctx.keys().actions(views::PROMPT_BROWSE, chord) {
             match act {
                 Act::Edit => {
@@ -895,10 +960,10 @@ impl SettingsSection for PromptSection {
         Some(self.stack())
     }
 
-    fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
+    fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         match reply {
             StoreReply::PromptSettings(snapshot) => self.on_settings(snapshot),
-            StoreReply::PromptSettingsStale(snapshot) => self.on_stale(snapshot),
+            StoreReply::PromptSettingsStale(snapshot) => self.on_stale(snapshot, ctx.keys()),
             // The read itself was refused: saying so beats an empty tree that reads as "nothing
             // here yet" (the agent section's rule, one section across).
             StoreReply::Failed { request, message } if *request == READ_NAME => {
@@ -918,45 +983,60 @@ impl SettingsSection for PromptSection {
     }
 
     fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
-        super::key_line(self.hint_text(keys), theme)
+        key_line(self.hint_text(keys), theme)
+    }
+
+    fn scroll(&self) -> Option<ScrollSpan> {
+        self.scroll.get()
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let pane = self.pane(area.width, ctx.theme);
-        let [rows, pane_area, hint] = Layout::vertical([
-            Constraint::Min(3),
-            Constraint::Length(u16::try_from(pane.len()).unwrap_or(u16::MAX)),
-            Constraint::Length(1),
-        ])
-        .areas(area);
-
+        let theme = ctx.theme;
+        let [rows, hint] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+        self.scroll.set(None);
+        let reload = ctx.keys().label(views::PROMPT_BROWSE, Act::Reload);
         match (&self.unavailable, &self.snapshot) {
             // The refusal wins the pane even with a tree behind it: what is on screen would
             // otherwise be settings nothing has confirmed since the outage started.
-            (Some(why), _) => frame.render_widget(
-                Paragraph::new(Line::styled(
-                    format!("{UNAVAILABLE}: {why}"),
-                    ctx.theme.error,
-                ))
-                .wrap(Wrap { trim: true }),
+            (Some(why), _) => {
+                let mut lines: Vec<Line<'static>> = wrapped(
+                    &format!("{UNAVAILABLE}: {why}"),
+                    usize::from(rows.width).max(1),
+                )
+                .into_iter()
+                .map(|line| notice(&line, Tone::Error, theme))
+                .collect();
+                // The next step in the empty state's own role (MOD-83).
+                let next = asks_again(reload.as_deref());
+                lines.extend(empty::lines("", NextStep(&next), theme).pop());
+                frame.render_widget(Paragraph::new(lines), rows);
+            }
+            (None, None) => empty::render(
+                frame,
                 rows,
+                NOT_READ,
+                NextStep(&reads_again(reload.as_deref())),
+                theme,
             ),
-            (None, None) => message(frame, rows, NOT_READ, ctx.theme),
             // There is no empty case below this one: the `App` group is always the registry's ten.
-            (None, Some(_)) => {
-                let height = usize::from(rows.height);
-                let offset = self.cursor.saturating_sub(height.saturating_sub(1));
-                frame.render_widget(
-                    Paragraph::new(self.lines(ctx.theme))
-                        .scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0)),
-                    rows,
-                );
+            (None, Some(snapshot)) => {
+                let width = rows.width;
+                let (entries, focus) = self.entries(snapshot, width);
+                let editing = matches!(self.mode, Mode::Editing(_));
+                // One layout per frame (RV2 L3), scrolled by the form's own measure of the focused
+                // row and what it put under it (RV2 M1): the row itself first when both do not
+                // fit, because a cursor nobody can see acts blind.
+                let laid = form_of(entries, focus, editing).layout(width, ctx.accent(), theme);
+                let offset = laid.offset(rows.height);
+                laid.render(frame, rows, offset);
+                // The pane's bar is measured against the rows the tree is drawn into and sits
+                // beside them (RV1 M2), so the rows under the tree need no padding.
+                self.scroll
+                    .set(Some(ScrollSpan::new(laid.lines.len(), offset).rows(rows)));
             }
         }
-        if !pane.is_empty() {
-            frame.render_widget(Paragraph::new(pane), pane_area);
-        }
-        frame.render_widget(Paragraph::new(self.notice_line(ctx.theme)), hint);
+        frame.render_widget(Paragraph::new(self.notice_line(theme)), hint);
     }
 }
 
@@ -983,10 +1063,11 @@ fn present_source(project_value: Option<&Value>, app_holds: bool) -> BudgetSourc
 /// the default, so labelling it `project` would name a rung that answered nothing (MOD-33 review L5).
 fn switch(on: bool, project_value: Option<&Value>) -> (String, Option<i64>, &'static str) {
     let source = if project_value.and_then(Value::as_bool).is_some() {
-        BudgetSource::Project.as_str()
+        BudgetSource::Project
     } else {
-        COMPILED_DEFAULT
+        BudgetSource::AppSettingDefault
     };
+    let source = label::setting_source(source);
     let text = if on { SWITCH_ON } else { SWITCH_OFF };
     (text.to_owned(), None, source)
 }
@@ -1007,7 +1088,7 @@ fn effective(
     project_value: Option<&Value>,
     app: &BTreeMap<String, Value>,
 ) -> Effective {
-    let present = present_source(project_value, app.contains_key(key.key())).as_str();
+    let present = label::setting_source(present_source(project_value, app.contains_key(key.key())));
     let mut notes = Vec::new();
     let (text, number, source) = match key {
         // The two project-only switches (MOD-89 D4, MOD-33 D267): one row shape, each its own
@@ -1020,7 +1101,7 @@ fn effective(
             (
                 budget.tokens.to_string(),
                 Some(budget.tokens),
-                budget.source.as_str(),
+                label::setting_source(budget.source),
             )
         }
         SettingKey::UpstreamHops => {
@@ -1086,29 +1167,110 @@ static KEY_WIDTH: LazyLock<usize> = LazyLock::new(|| {
         .unwrap_or(0)
 });
 
-/// One value row: the key, what the rung stores, what the reader would use, which rung answered,
-/// and the unit the registry counts in (D9).
-fn value_line(key: SettingKey, stored: Option<&Value>, effective: &Effective) -> String {
+/// One value row's value column: what the rung stores, what the reader would use, which rung
+/// answered in words, and the unit (D9). The key is the row's label. One space before the unit:
+/// the form wraps the value under its column, and wrapping collapses runs of blanks.
+fn value_text(key: SettingKey, stored: Option<&Value>, effective: &Effective) -> String {
     let held = stored.map_or_else(|| UNSET.to_owned(), Value::to_string);
-    // `key.key()` rather than `key`: [`SettingKey`]'s own `Display` writes the string straight out
-    // and so ignores the formatter's width, where a `&str` honours it.
     format!(
-        "  {:<width$}  {held} | {} ({})   {}",
-        key.key(),
+        "{held} | {} ({}) {}",
         effective.text,
         effective.source,
-        key.spec().unit,
-        width = *KEY_WIDTH,
+        unit(key)
     )
 }
 
-/// The reserve as what it is and what it means (D12): the fraction the reader resolved, and the
-/// basis points its range is written in.
+/// The unit column: the registry's own, except a fraction, which is typed as one (MOD-83).
+fn unit(key: SettingKey) -> &'static str {
+    let spec = key.spec();
+    match spec.kind {
+        SettingKind::Fraction => FRACTION_UNIT,
+        SettingKind::Integer | SettingKind::Boolean => spec.unit,
+    }
+}
+
+/// The registry's range and rungs for `key` (B-6): two words for a switch, the range in its unit
+/// for a number, and for a fraction the range in percent with the basis points the store's
+/// refusals are phrased in (D12, maintainer answer 2026-10-21 item 2).
+fn range_text(key: SettingKey) -> String {
+    let spec = key.spec();
+    match spec.kind {
+        // `min` 0 and `max` 1 are nominal for a switch; the range it takes is two words.
+        SettingKind::Boolean => format!("{SWITCH_RANGE} \u{b7} rungs {}", spec.rungs),
+        SettingKind::Integer => format!(
+            "range {}..={} {} \u{b7} rungs {}",
+            spec.min, spec.max, spec.unit, spec.rungs
+        ),
+        SettingKind::Fraction => format!(
+            "range {}\u{2013}{}% ({}..={} {}) \u{b7} typed as a fraction \u{b7} rungs {}",
+            percent(spec.min),
+            percent(spec.max),
+            spec.min,
+            spec.max,
+            spec.unit,
+            spec.rungs
+        ),
+    }
+}
+
+/// The focused row's help: the key whole when its label is cut (`named`), what the row holds now
+/// while its editor is open, then the registry's doc line and [`range_text`].
+fn help_text(key: SettingKey, now: Option<&str>, named: bool) -> String {
+    let doc = key.spec().doc.trim_end_matches('.');
+    named
+        .then(|| key.key().to_owned())
+        .into_iter()
+        .chain(now.map(|now| format!("now {now}")))
+        .chain((!doc.is_empty()).then(|| doc.to_owned()))
+        .chain([range_text(key)])
+        .collect::<Vec<_>>()
+        .join(" \u{b7} ")
+}
+
+/// What the reader does to the stored number that the row alone cannot show (D13 and blueprint
+/// flag B): the `not_above` clamp and the resolver's own notes, `None` when there are none.
 ///
-/// Showing only the float hides the unit the refusal is written in; showing only the basis points
-/// would invite typing `1000`, which rounds to 10 000 000 bp and is refused.
+/// D13: the `not_above` rule is one-directional by decision, so a peer lowered under this row's
+/// stored value leaves the row describing a number the reader will not use. Derived from the spec
+/// and the resolver's own answer, so no key is named here.
+fn row_error(key: SettingKey, stored: Option<&Value>, effective: &Effective) -> Option<String> {
+    let clamp = key.spec().not_above.and_then(|peer| {
+        let held = stored.and_then(Value::as_i64)?;
+        let used = effective.number?;
+        (used < held).then(|| clamp_line(peer, used))
+    });
+    let lines: Vec<String> = clamp
+        .into_iter()
+        .chain(effective.notes.iter().cloned())
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("; "))
+}
+
+/// Basis points as a percentage, `1000` → `10`, `1250` → `12.5`, `5` → `0.05`: exact, so the
+/// help never rounds the bound the store will hold the value to.
+fn percent(bp: i64) -> String {
+    let sign = if bp < 0 { "-" } else { "" };
+    let bp = bp.unsigned_abs();
+    let (whole, cents) = (bp / 100, bp % 100);
+    match cents {
+        0 => format!("{sign}{whole}"),
+        _ if cents % 10 == 0 => format!("{sign}{whole}.{}", cents / 10),
+        _ => format!("{sign}{whole}.{cents:02}"),
+    }
+}
+
+/// The reserve as what it means and what it is typed as (D12, MOD-83): the percentage of the
+/// budget held back, then the fraction the reader resolved, `10% (0.1)`.
+///
+/// Showing only the float hides what it means; showing only the basis points would invite typing
+/// `1000`, which rounds to 10 000 000 bp and is refused. The basis points the refusal is written
+/// in are on the help line ([`range_text`]).
 fn fraction_text(budget: &Budget) -> String {
-    format!("{} ({} bp)", budget.reserve(), budget.reserve_bp)
+    format!(
+        "{}% ({})",
+        percent(i64::from(budget.reserve_bp)),
+        budget.reserve()
+    )
 }
 
 /// D11's sentence for an integer key: shape, and never a bound.
@@ -1137,9 +1299,20 @@ fn switch_sentence(key: SettingKey) -> String {
     format!("`{key}` is on or off, or empty to clear")
 }
 
+/// What a write in flight is doing, in words (MOD-83): never its request name.
+fn doing(busy: &str) -> &'static str {
+    if busy == REQUEST_NAMES[1] {
+        "saving the setting"
+    } else if busy == REQUEST_NAMES[2] {
+        "clearing the setting"
+    } else {
+        "writing"
+    }
+}
+
 /// What a second write is told while the first is still out.
 fn in_flight(busy: &str) -> String {
-    format!("`{busy}` is still in flight")
+    format!("still {} \u{2014} wait for the store's answer", doing(busy))
 }
 
 /// The token an open editor retries against after a reload (D14, B-5).
@@ -1171,6 +1344,66 @@ fn clamp_line(peer: SettingKey, used: i64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The source column's words for the two rungs a switch can name (MOD-83).
+    const PROJECT: &str = label::setting_source(BudgetSource::Project);
+    const DEFAULT: &str = label::setting_source(BudgetSource::AppSettingDefault);
+
+    /// MOD-83: no source the column prints is an enum value.
+    #[test]
+    fn the_source_column_reads_in_words() {
+        assert_eq!(PROJECT, "project");
+        assert_eq!(DEFAULT, "default");
+        assert_eq!(
+            label::setting_source(BudgetSource::AppSetting),
+            "app setting"
+        );
+    }
+
+    /// Basis points as an exact percentage, never rounded.
+    #[test]
+    fn basis_points_read_as_an_exact_percentage() {
+        for (bp, shown) in [
+            (0, "0"),
+            (5, "0.05"),
+            (1_000, "10"),
+            (1_250, "12.5"),
+            (5_000, "50"),
+            (-30, "-0.3"),
+        ] {
+            assert_eq!(percent(bp), shown, "{bp} bp");
+        }
+    }
+
+    /// Maintainer answer 2026-10-21, item 2: `0.1 (1000 bp)` reads `10% (0.1)`, and the help line
+    /// carries the range in percent with the basis points the store's refusals are phrased in.
+    #[test]
+    fn the_reserve_reads_in_percent_with_the_bp_range_on_the_help_line() {
+        let budget = Budget {
+            reserve_bp: 1_000,
+            ..resolve_budget(None, None, &BTreeMap::new())
+        };
+        assert_eq!(fraction_text(&budget), "10% (0.1)");
+        let key = SettingKey::PromptReserveFraction;
+        assert_eq!(unit(key), "fraction");
+        let spec = key.spec();
+        assert_eq!(
+            range_text(key),
+            format!(
+                "range 0\u{2013}50% ({}..={} bp) \u{b7} typed as a fraction \u{b7} rungs {}",
+                spec.min, spec.max, spec.rungs
+            )
+        );
+        assert!(help_text(key, None, false).ends_with(&range_text(key)));
+        assert!(
+            help_text(key, None, true).starts_with("prompt_reserve_fraction \u{b7} Share"),
+            "a cut label is named whole"
+        );
+        assert!(
+            help_text(key, Some("0.1 | 10% (0.1) (app setting) fraction"), false)
+                .starts_with("now 0.1 | 10% (0.1) (app setting) fraction \u{b7} ")
+        );
+    }
 
     /// MOD-67 M6 D4: the header refusal names the edit key, and none unbound.
     #[test]
@@ -1271,16 +1504,12 @@ mod tests {
         let key = SettingKey::BoxHostname;
         let app = BTreeMap::new();
         for (stored, text, source) in [
-            (Some(json!(true)), SWITCH_ON, BudgetSource::Project.as_str()),
-            (
-                Some(json!(false)),
-                SWITCH_OFF,
-                BudgetSource::Project.as_str(),
-            ),
-            (Some(json!("off")), SWITCH_ON, COMPILED_DEFAULT),
-            (Some(json!(1)), SWITCH_ON, COMPILED_DEFAULT),
-            (Some(Value::Null), SWITCH_ON, COMPILED_DEFAULT),
-            (None, SWITCH_ON, COMPILED_DEFAULT),
+            (Some(json!(true)), SWITCH_ON, PROJECT),
+            (Some(json!(false)), SWITCH_OFF, PROJECT),
+            (Some(json!("off")), SWITCH_ON, DEFAULT),
+            (Some(json!(1)), SWITCH_ON, DEFAULT),
+            (Some(Value::Null), SWITCH_ON, DEFAULT),
+            (None, SWITCH_ON, DEFAULT),
         ] {
             let project = stored.as_ref().map_or_else(
                 || Value::Object(serde_json::Map::new()),
@@ -1300,16 +1529,12 @@ mod tests {
         let key = SettingKey::AllowEnvFiles;
         let app = BTreeMap::new();
         for (stored, text, source) in [
-            (Some(json!(true)), SWITCH_ON, BudgetSource::Project.as_str()),
-            (
-                Some(json!(false)),
-                SWITCH_OFF,
-                BudgetSource::Project.as_str(),
-            ),
-            (Some(json!("on")), SWITCH_OFF, COMPILED_DEFAULT),
-            (Some(json!(1)), SWITCH_OFF, COMPILED_DEFAULT),
-            (Some(Value::Null), SWITCH_OFF, COMPILED_DEFAULT),
-            (None, SWITCH_OFF, COMPILED_DEFAULT),
+            (Some(json!(true)), SWITCH_ON, PROJECT),
+            (Some(json!(false)), SWITCH_OFF, PROJECT),
+            (Some(json!("on")), SWITCH_OFF, DEFAULT),
+            (Some(json!(1)), SWITCH_OFF, DEFAULT),
+            (Some(Value::Null), SWITCH_OFF, DEFAULT),
+            (None, SWITCH_OFF, DEFAULT),
         ] {
             let project = stored.as_ref().map_or_else(
                 || Value::Object(serde_json::Map::new()),
