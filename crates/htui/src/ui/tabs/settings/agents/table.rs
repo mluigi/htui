@@ -45,14 +45,17 @@ pub(super) const SWITCHED_OFF: &str = "switched off";
 /// What the `on this box` cell appends when `probe.source` is `manual` (MOD-66 D10, the
 /// maintainer's answer to blueprint F-3). One character, so the 13-wide column keeps it beside
 /// every verdict but `⚠ needs login`, which fills that column: then the column takes a cell from
-/// `name` while `name` has one past [`NAME_MIN`], and where it has none the verdict gives up a
-/// letter rather than the mark (`⚠ needs log…*`, [`fit_on_box`]), so the idle note's
-/// [`MANUAL_NOTE`] never names a mark the table does not draw (repair 2, D-18).
+/// `name` while `name` has one past [`NAME_MIN`], and where it has none the verdict is drawn as
+/// its icon and the mark (`⚠*`, RV2 L5) while the idle note has room to say its word, else it
+/// gives up its last letters rather than the mark (`⚠ needs log…*`); a version gives up its
+/// last cells ([`fit_on_box`]). Either way the idle note's [`MANUAL_NOTE`] never names a mark the
+/// table does not draw (repair 2, D-18).
 pub(super) const MANUAL_SUFFIX: &str = "*";
 
 /// What the idle note adds while any row's `probe.source` is `manual`: the key to
-/// [`MANUAL_SUFFIX`] (MOD-66, the amendment to blueprint §5). 60 of the 97 cells with
-/// [`quota_note`](super::quota_note).
+/// [`MANUAL_SUFFIX`] (MOD-66, the amendment to blueprint §5). 59 cells with
+/// [`quota_note`](super::quota_note) and the default probe key, 75 with the [`note_word`] of a
+/// `⚠*` cell after it.
 pub(super) const MANUAL_NOTE: &str = " \u{b7} * manual path";
 
 /// The `enabled` cell of a row the registry switches on, and of one it switches off: the form
@@ -228,10 +231,11 @@ pub(super) struct OnBox {
 /// An `on this box` cell fitted to its `width`, and whether it was drawn as its icon alone. A
 /// `starred` (manual) verdict keeps its [`MANUAL_SUFFIX`], since the idle note's [`MANUAL_NOTE`]
 /// promises the mark: a status verdict that does not fit beside it is its icon alone (`⚠*`, the
-/// maintainer's answer, MOD-115 M3 RV2 L5), whose word the idle note then says; a version gives
-/// up its last cells. Every other cell is `table_line`'s to fit.
+/// maintainer's answer, MOD-115 M3 RV2 L5) when `icon` says the idle note has room for its word,
+/// else it gives up its last letters (`⚠ needs log…*`, RV2 repair 1), so the word is never off
+/// the screen; a version gives up its last cells. Every other cell is `table_line`'s to fit.
 #[must_use]
-fn fit_on_box(cell: &OnBox, width: u16) -> (String, bool) {
+fn fit_on_box(cell: &OnBox, width: u16, icon: bool) -> (String, bool) {
     if !cell.starred {
         return (cell.text.clone(), false);
     }
@@ -240,7 +244,7 @@ fn fit_on_box(cell: &OnBox, width: u16) -> (String, bool) {
     if cells::cell_width(&cell.text) + star <= width || width <= star {
         return (format!("{}{MANUAL_SUFFIX}", cell.text), false);
     }
-    if let Some(status) = cell.status {
+    if icon && let Some(status) = cell.status {
         let glyph = label::probe(status).glyph;
         if cells::cell_width(glyph) + star <= width {
             return (format!("{glyph}{MANUAL_SUFFIX}"), true);
@@ -268,6 +272,13 @@ fn table_line(cells: impl IntoIterator<Item = (String, u16, Style)>) -> Line<'st
 pub(super) fn verdict(status: ProbeStatus) -> String {
     let mark = label::probe(status);
     format!("{} {}", mark.glyph, mark.word)
+}
+
+/// What the idle note adds for a verdict the table drew as its icon alone (RV2 L5): ` · ` and
+/// its [`verdict`].
+#[must_use]
+pub(super) fn note_word(status: ProbeStatus) -> String {
+    format!(" \u{b7} {}", verdict(status))
 }
 
 impl AgentsSection {
@@ -403,14 +414,14 @@ impl AgentsSection {
     /// One agent's row: its cells in `columns`' order, `name` in the base role (dim for a row
     /// the registry switches off) and the rest dim, but for the verdict's own tone.
     /// `on_box` is the row's [`on_box_parts`](Self::on_box_parts), worked out once per row
-    /// ([`render_table`](Self::render_table), RV2 L3); `icons` collects the verdicts drawn as
-    /// their icon alone ([`fit_on_box`]).
+    /// ([`render_table`](Self::render_table), RV2 L3); `icon` says whether a verdict that does not
+    /// fit may be drawn as its icon alone ([`fit_on_box`]).
     fn row(
         summary: &AgentSummary,
         on_box: &OnBox,
         columns: &[(Column, u16)],
         theme: &Theme,
-        icons: &mut Vec<ProbeStatus>,
+        icon: bool,
     ) -> Line<'static> {
         let agent = &summary.agent;
         let style = if agent.enabled { theme.base } else { theme.dim };
@@ -435,16 +446,7 @@ impl AgentsSection {
                     }
                 }
                 Column::Quota => (quota_cell(summary), theme.dim),
-                Column::OnBox => {
-                    let (cell, icon) = fit_on_box(on_box, width);
-                    if icon
-                        && let Some(status) = on_box.status
-                        && !icons.contains(&status)
-                    {
-                        icons.push(status);
-                    }
-                    (cell, on_box.style)
-                }
+                Column::OnBox => (fit_on_box(on_box, width, icon).0, on_box.style),
             };
             (text, width, style)
         }))
@@ -456,8 +458,19 @@ impl AgentsSection {
     /// computed from 0 each time, as the `TableState` clone it replaces did, so the frame never
     /// depends on how often it was drawn.
     ///
+    /// A manual verdict that does not fit is drawn as its icon alone (`⚠*`) only while the
+    /// [`note_word`]s of all such verdicts fit in `room`, the cells the idle note leaves (0 while a
+    /// notice holds the line or the section is not idle): else every one keeps its cut word
+    /// (RV2 repair 1).
+    ///
     /// Answers what it drew ([`Drawn`]), for the pane's scrollbar and the idle note.
-    pub(super) fn render_table(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) -> Drawn {
+    pub(super) fn render_table(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        ctx: &Ctx<'_>,
+        room: usize,
+    ) -> Drawn {
         let theme = ctx.theme;
         if area.width < 2 || area.height == 0 {
             return Drawn {
@@ -495,12 +508,33 @@ impl AgentsSection {
             ..area
         };
         let mut icons = Vec::new();
+        if let Some(width) = columns
+            .iter()
+            .find_map(|&(column, width)| (column == Column::OnBox).then_some(width))
+        {
+            for cell in &on_box {
+                if let Some(status) = cell.status
+                    && fit_on_box(cell, width, true).1
+                    && !icons.contains(&status)
+                {
+                    icons.push(status);
+                }
+            }
+        }
+        let said: usize = icons
+            .iter()
+            .map(|status| cells::cell_width(&note_word(*status)))
+            .sum();
+        let icon = said <= room;
+        if !icon {
+            icons.clear();
+        }
         let rows: Vec<Row<'static>> = self
             .agents
             .iter()
             .zip(&on_box)
             .map(|(summary, on_box)| Row {
-                line: Self::row(summary, on_box, &columns, theme, &mut icons),
+                line: Self::row(summary, on_box, &columns, theme, icon),
                 kind: RowKind::Item,
             })
             .collect();
@@ -758,10 +792,15 @@ mod tests {
         };
         let login = status(ProbeStatus::Unauthenticated);
         assert_eq!(
-            fit_on_box(&login, 14),
+            fit_on_box(&login, 14, true),
             ("\u{26a0} needs login*".to_owned(), false)
         );
-        assert_eq!(fit_on_box(&login, 13), ("\u{26a0}*".to_owned(), true));
+        assert_eq!(fit_on_box(&login, 13, true), ("\u{26a0}*".to_owned(), true));
+        // RV2 repair 1: with no room in the note for its word, the cell keeps the word, cut.
+        assert_eq!(
+            fit_on_box(&login, 13, false),
+            ("\u{26a0} needs log\u{2026}*".to_owned(), false)
+        );
         let version = |text: &str| OnBox {
             text: text.to_owned(),
             style: Style::new(),
@@ -769,18 +808,21 @@ mod tests {
             status: None,
         };
         assert_eq!(
-            fit_on_box(&version("0.48.0"), 13),
+            fit_on_box(&version("0.48.0"), 13, true),
             ("0.48.0*".to_owned(), false)
         );
         assert_eq!(
-            fit_on_box(&version("0.48.0-nightly-2026"), 13),
+            fit_on_box(&version("0.48.0-nightly-2026"), 13, true),
             ("0.48.0-nigh\u{2026}*".to_owned(), false)
         );
         let unmarked = OnBox {
             starred: false,
             ..login
         };
-        assert_eq!(fit_on_box(&unmarked, 13), (unmarked.text.clone(), false));
+        assert_eq!(
+            fit_on_box(&unmarked, 13, true),
+            (unmarked.text.clone(), false)
+        );
     }
 
     /// Repair 2 (finding 4): `enabled` starts in the gap before its column, taking the cell the

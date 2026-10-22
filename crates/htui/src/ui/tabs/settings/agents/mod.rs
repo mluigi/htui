@@ -88,7 +88,7 @@ use crate::ui::tabs::settings::{
     is_error,
 };
 use crate::ui::text_field::PASTE_DOES_NOT_FIT;
-use crate::ui::{FieldOutcome, TextField, Theme};
+use crate::ui::{FieldOutcome, TextField, Theme, cells};
 use crossterm::event::KeyEvent;
 
 use flows::{AuthState, InstallState, quota_note, reprobes};
@@ -283,28 +283,39 @@ impl AgentsSection {
     /// section is idle. A `None` note still takes its line, so the layout never changes height with
     /// it. While a `manual` row is listed, the idle note ends in [`MANUAL_NOTE`], the key to the
     /// cell's `*` (MOD-66), then the word of each verdict the table drew as its icon alone
-    /// (`icons`, `⚠*`: RV2 L5). The keys that shared the pane with it moved to the shell's hint
-    /// row (MOD-67 M6 T2).
+    /// (`icons`, `⚠*`: RV2 L5), which the table draws only while [`idle_note`](Self::idle_note)
+    /// leaves room for them (RV2 repair 1). The keys that shared the pane with it moved to the
+    /// shell's hint row (MOD-67 M6 T2).
     fn note(&self, keys: &Keys, icons: &[ProbeStatus]) -> Option<String> {
-        let idle = matches!(self.mode, Mode::Browse)
+        self.notice.clone().or_else(|| {
+            self.idle_note(keys).map(|note| {
+                let words: String = icons
+                    .iter()
+                    .map(|status| table::note_word(*status))
+                    .collect();
+                format!("{note}{words}")
+            })
+        })
+    }
+
+    /// The idle note before any verdict's word: [`quota_note`], then [`MANUAL_NOTE`] while a
+    /// `manual` row is listed. `None` while a notice holds the line or the section is not idle,
+    /// so no word of a `⚠*` cell would be on screen (RV2 repair 1).
+    fn idle_note(&self, keys: &Keys) -> Option<String> {
+        let idle = self.notice.is_none()
+            && matches!(self.mode, Mode::Browse)
             && matches!(self.install, InstallState::Idle)
             && matches!(self.auth, AuthState::Idle);
-        self.notice.clone().or_else(|| {
-            idle.then(|| {
-                let note = quota_note(
-                    keys.label(views::AGENTS_BROWSE, Act::AgentsProbe)
-                        .as_deref(),
-                );
-                if self.lists_a_manual_row() {
-                    let words: String = icons
-                        .iter()
-                        .map(|status| format!(" \u{b7} {}", table::verdict(*status)))
-                        .collect();
-                    format!("{note}{MANUAL_NOTE}{words}")
-                } else {
-                    note
-                }
-            })
+        idle.then(|| {
+            let note = quota_note(
+                keys.label(views::AGENTS_BROWSE, Act::AgentsProbe)
+                    .as_deref(),
+            );
+            if self.lists_a_manual_row() {
+                format!("{note}{MANUAL_NOTE}")
+            } else {
+                note
+            }
         })
     }
 
@@ -1108,7 +1119,13 @@ impl SettingsSection for AgentsSection {
             let next = no_agents_next(ctx.keys());
             empty::render(frame, rows, NO_AGENTS, NextStep(&next), ctx.theme);
         } else {
-            let drawn = self.render_table(frame, rows, ctx);
+            // The cells the idle note leaves for the words of `⚠*` cells (RV2 repair 1): the note
+            // is drawn behind the gutter, in `note_area.width - 1` cells.
+            let room = self.idle_note(ctx.keys()).map_or(0, |note| {
+                usize::from(note_area.width.saturating_sub(1))
+                    .saturating_sub(cells::cell_width(&note))
+            });
+            let drawn = self.render_table(frame, rows, ctx, room);
             if drawn.total > usize::from(drawn.body.height) {
                 // The table's rows, beside the rect they were drawn into (RV1 M2's span): the
                 // header over them and the pane and note under them do not scroll.

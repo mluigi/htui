@@ -6623,6 +6623,57 @@ async fn a_manual_row_that_needs_login_keeps_its_star() {
     assert!(bordered.contains("* manual path"), "{bordered}");
 }
 
+/// RV2 repair 1: the icon alone (`⚠*`) is drawn only while the note says its word in full. A
+/// notice that holds the note line, or a line too narrow for the word, leaves the cell its cut
+/// word (`⚠ needs log…*`), so the status word is never off the screen.
+#[tokio::test]
+async fn a_manual_verdict_keeps_its_word_when_the_note_cannot_say_it() {
+    let bench = SectionBench::new().await;
+    let manual = paths_row_with(
+        "m-auth",
+        &["alpha_tool"],
+        &[("alpha_tool", tool_path("htui-mod66-alpha").as_str())],
+        ProbeSource::Manual,
+        ProbeStatus::Unauthenticated,
+    );
+    let mut section = section_over(&bench, vec![manual]);
+
+    // The idle note at 60 cells is cut before the word it would add.
+    let narrow = render_section_at(&section, &bench.ctx(), 60);
+    // `name` is cut to `m…` here, so the row is found by the cursor's gutter.
+    let line = narrow
+        .lines()
+        .find(|line| line.starts_with('\u{258c}'))
+        .unwrap_or_else(|| panic!("the cursor's row is drawn: {narrow}"))
+        .trim_end();
+    assert!(
+        line.ends_with(" \u{26a0} needs log\u{2026}*"),
+        "the note cannot say the word, so the cell keeps it, cut: {narrow}"
+    );
+    assert!(narrow.contains("* manual path"), "{narrow}");
+    assert!(
+        !narrow.contains("manual path \u{b7}"),
+        "and the note names no icon the table does not draw: {narrow}"
+    );
+
+    // A notice holds the note line: the word is the cell's.
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "edit_agent",
+            message: "the store refused".to_owned(),
+        },
+    );
+    let bordered = render_section_at(&section, &bench.ctx(), SECTION_BORDERED);
+    assert!(bordered.contains("the store refused"), "{bordered}");
+    let line = row_line(&bordered, "m-auth").trim_end();
+    assert!(
+        line.ends_with(" \u{26a0} needs log\u{2026}*"),
+        "a notice up: the cut word and the `*`: {bordered}"
+    );
+    assert!(!line.ends_with("\u{26a0}*"), "{bordered}");
+}
+
 /// MOD-81: at the harness's 100 columns every column is drawn and `name` has its 10 cells,
 /// though `kit::list`'s gutter costs one.
 #[tokio::test]
