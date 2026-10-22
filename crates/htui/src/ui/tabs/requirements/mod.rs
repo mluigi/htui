@@ -2740,6 +2740,8 @@ mod tests {
     /// `ctrl-n` is a chord the stack passes on (`ctrl-c`, `F1`), a pressed `Down` is swallowed.
     /// Resolving the delivered `Down` would swallow both; no frame tells them apart, the shell
     /// having nothing for the canonical `Down` it is handed back.
+    /// Driven through `on_key` with the chord the shell reports (`Ctx::with_pressed`), so the
+    /// `Ctx::pressed` call in `on_key` is what is pinned (RV3 repair 2).
     #[tokio::test]
     async fn the_filter_resolves_what_its_field_passes_from_the_chord_pressed() {
         use crate::keys::KeyChord;
@@ -2752,13 +2754,13 @@ mod tests {
         let chord = |spec: &str| KeyChord::parse_strict(spec).expect("a valid spec");
         let down = KeyEvent::from(KeyCode::Down);
         assert_eq!(
-            tab.on_filter_pressed(down, chord("ctrl-n"), &bench.ctx()),
+            tab.on_key(down, &mut bench.ctx().with_pressed(down, chord("ctrl-n"))),
             Handled::Pass,
             "a pressed `ctrl-n` delivered as `Down` passes"
         );
         assert!(matches!(tab.mode, Mode::Filter { .. }), "the filter stays");
         assert_eq!(
-            tab.on_filter_pressed(down, chord("down"), &bench.ctx()),
+            tab.on_key(down, &mut bench.ctx().with_pressed(down, chord("down"))),
             Handled::Consumed,
             "a pressed `Down` is swallowed"
         );

@@ -228,6 +228,16 @@ impl<'a> Ctx<'a> {
         self.pressed = Some((delivered, pressed));
     }
 
+    /// [`set_pressed`](Self::set_pressed) for a view's own unit tests (MOD-115 M3 RV3): a tab's
+    /// test drives its `on_key` with the chord the shell would report, so the call that resolves
+    /// it through [`pressed`](Self::pressed) is pinned, not only the function it feeds.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn with_pressed(mut self, delivered: KeyEvent, pressed: KeyChord) -> Self {
+        self.set_pressed(delivered, pressed);
+        self
+    }
+
     /// The chord the user pressed for `key` (MOD-115 M2 RV1 M): the one before the shell's
     /// `[field]` translation when `key` is the event the shell delivered, else `key`'s own. A
     /// view resolves its own acts from it, after a widget had the canonical event: so a chord
