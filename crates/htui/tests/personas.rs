@@ -1932,6 +1932,13 @@ async fn the_section_reports_its_scroll_for_the_pane() {
         section.scroll().map(|span| (span.total, span.offset)),
         Some((3, 0))
     );
+    // RV2 (RV1 M2's span): beside the rows the list was drawn into, the notice under them not
+    // padded in.
+    let rows = section
+        .scroll()
+        .and_then(|span| span.rows)
+        .expect("the rect the list was drawn into");
+    assert_eq!((rows.y, rows.width), (0, 100), "{rows:?}");
 }
 
 /// One section drawn inside a kit pane as the Settings tab draws it (MOD-115 M3 C3, D-11): the
@@ -1952,8 +1959,8 @@ fn framed_at(bench: &SectionBench, section: &dyn SettingsSection, height: u16) -
             let area = frame.area();
             section.render(frame, Pane::inner(area), &ctx);
             let mut pane = Pane::new(section.title());
-            if let Some((total, offset)) = section.scroll().map(|span| (span.total, span.offset)) {
-                pane = pane.scrollbar(total, offset);
+            if let Some(span) = section.scroll() {
+                pane = pane.scroll(span);
             }
             let _ = pane.render(frame, area, &theme);
         })

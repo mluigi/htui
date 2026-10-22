@@ -1641,11 +1641,10 @@ impl SettingsSection for HierarchySection {
                 ctx.accent(),
                 theme,
             );
-            // The pane's bar is measured against the whole inner rect (D-11): the rows under the
-            // tree are added, so it shows exactly when a tree line is hidden.
-            let below = usize::from(area.height.saturating_sub(rows.height));
+            // The pane's bar is measured against the rows the tree was drawn into and sits
+            // beside them (RV1 M2's span): the rows under the tree do not scroll.
             self.scroll
-                .set(Some(ScrollSpan::new(total + below, offset)));
+                .set(Some(ScrollSpan::new(total, offset).rows(rows)));
         }
         if !pane.is_empty() {
             frame.render_widget(Paragraph::new(pane), pane_area);

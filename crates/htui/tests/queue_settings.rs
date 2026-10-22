@@ -1134,22 +1134,21 @@ async fn nothing_read_yet_says_how_to_read() {
     );
 }
 
-/// MOD-115 M3 D-11: the section reports its scroll in the pane's terms: the rows, then the help
-/// line and the notice line under them.
+/// MOD-115 M3 D-11, RV2 (RV1 M2's span): the section reports its own rows' scroll, beside the
+/// rect they were drawn into; the help and notice lines under them are not padded in.
 #[tokio::test]
 async fn the_section_reports_its_scroll() {
     let snapshot = bench_settings(&demo()).await;
     let (bench, section) = bench_from(&snapshot).await;
     let _ = bench.render_section(&section, 100);
-    let (total, offset) = section
-        .scroll()
-        .map(|span| (span.total, span.offset))
-        .expect("the rows scroll");
-    assert_eq!(offset, 0);
+    let span = section.scroll().expect("the rows scroll");
+    assert_eq!(span.offset, 0);
+    assert_eq!(span.total, row::BOX_LIMIT + 1, "nine rows");
+    let rows = span.rows.expect("the rect the rows were drawn into");
     assert_eq!(
-        total,
-        row::BOX_LIMIT + 1 + 2,
-        "nine rows, the help, the notice"
+        (rows.y, rows.height),
+        (0, 28),
+        "above the help and notice: {rows:?}"
     );
 }
 

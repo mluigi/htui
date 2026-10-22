@@ -3756,9 +3756,9 @@ async fn the_primary_repo_reads_as_a_word() {
     assert!(!frame.contains('*'), "{frame}");
 }
 
-/// The section reports its scroll for the Settings pane's scrollbar (MOD-115 M3 D-11), in the
-/// pane's terms: the tree's rows plus the rows under it, and the first one drawn, the cursor kept
-/// on screen.
+/// The section reports its scroll for the Settings pane's scrollbar (MOD-115 M3 D-11): the tree's
+/// rows beside the rect they were drawn into (RV2, RV1 M2's span), the rows under it not padded
+/// in, and the first one drawn, the cursor kept on screen.
 #[tokio::test]
 async fn the_section_reports_its_scroll_for_the_pane() {
     let bench = SectionBench::new().await;
@@ -3774,7 +3774,16 @@ async fn the_section_reports_its_scroll_for_the_pane() {
     let _ = drawn_at(&bench, &section, 100, 4);
     assert_eq!(
         section.scroll().map(|span| (span.total, span.offset)),
-        Some((5, 0))
+        Some((4, 0))
+    );
+    let tree = section
+        .scroll()
+        .and_then(|span| span.rows)
+        .expect("the tree's rows");
+    assert_eq!(
+        (tree.y, tree.height),
+        (0, 3),
+        "above the notice line: {tree:?}"
     );
 
     for _ in 0..3 {
@@ -3783,7 +3792,7 @@ async fn the_section_reports_its_scroll_for_the_pane() {
     let buffer = drawn_at(&bench, &section, 100, 4);
     assert_eq!(
         section.scroll().map(|span| (span.total, span.offset)),
-        Some((5, 1))
+        Some((4, 1))
     );
     let last = row_text(&buffer, 2);
     assert!(

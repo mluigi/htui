@@ -2104,12 +2104,10 @@ impl SettingsSection for PersonasSection {
                 (*top).min(max_top.get()),
             )));
         }
-        // The pane's bar is measured against the whole inner rect (D-11): the notice rows under
-        // the list are added, so it shows exactly when a line is hidden.
-        if let Some(ScrollSpan { total, offset, .. }) = self.scroll.get() {
-            let below = usize::from(area.height.saturating_sub(pane.height));
-            self.scroll
-                .set(Some(ScrollSpan::new(total + below, offset)));
+        // The pane's bar is measured against the rows the list or report was drawn into and
+        // sits beside them (RV1 M2's span): the notice rows under them do not scroll.
+        if let Some(span) = self.scroll.get() {
+            self.scroll.set(Some(span.rows(pane)));
         }
         if !notice.is_empty() {
             frame.render_widget(Paragraph::new(notice), notice_area);

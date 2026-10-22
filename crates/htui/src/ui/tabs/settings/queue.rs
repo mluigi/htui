@@ -37,7 +37,6 @@ use crate::queue_settings::{QueueProjectEntry, QueueSettingsSnapshot, READ_NAME,
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::form::{self, Field, Form};
-use crate::ui::kit::list;
 use crate::ui::kit::pane::ScrollSpan;
 use crate::ui::kit::text::{Tone, notice, wrapped};
 use crate::ui::kit::{chips::key_line, modal::modal_rest};
@@ -275,7 +274,7 @@ pub struct QueueSection {
 }
 
 /// One item of the rows' form, in [`rows`](QueueSection::rows) order: built once per frame and
-/// folded into a [`Form`] as often as the scroll needs to measure it.
+/// folded into one [`Form`] (RV2 L3).
 #[derive(Clone)]
 enum Entry<'a> {
     /// A group line (`project …`, `all boxes`, `this box (…)`).
@@ -287,15 +286,15 @@ enum Entry<'a> {
 }
 
 /// `entries` as one form, `focus` focused, on today's label column.
-fn form_of<'a>(entries: &[Entry<'a>], focus: usize, editing: bool) -> Form<'a> {
-    entries.iter().fold(
+fn form_of<'a>(entries: Vec<Entry<'a>>, focus: usize, editing: bool) -> Form<'a> {
+    entries.into_iter().fold(
         Form::new()
             .label_width(LABEL_WIDTH)
             .focus(focus)
             .editing(editing),
         |form, entry| match entry {
-            Entry::Heading(text) => form.heading(text.clone()),
-            Entry::Field(field) => form.field(field.clone()),
+            Entry::Heading(text) => form.heading(text),
+            Entry::Field(field) => form.field(field),
             Entry::Blank => form.blank(),
         },
     )
@@ -823,24 +822,14 @@ impl SettingsSection for QueueSection {
                 let width = rows.width;
                 let (entries, focus) = self.entries(snapshot);
                 let editing = matches!(self.mode, Mode::Editing(_));
-                let form = form_of(&entries, focus, editing);
-                let total = form.lines(width, ctx.accent(), theme).len();
-                // Scrolled so the focused row and its help are on screen, the row itself first
-                // when both do not fit.
-                let start = form.focus_line(width).unwrap_or(0);
-                let through = entries.get(..=focus).unwrap_or(&entries);
-                let end = form_of(through, focus, editing)
-                    .lines(width, ctx.accent(), theme)
-                    .len()
-                    .saturating_sub(1);
-                let offset =
-                    list::scroll_into_view(end, 0, usize::from(rows.height), total).min(start);
-                form.render(frame, rows, offset, ctx.accent(), theme);
-                // The pane's bar is measured against the whole inner rect (D-11): the help and
-                // notice lines under the rows are added, so it shows exactly when a row is hidden.
-                let below = usize::from(area.height.saturating_sub(rows.height));
+                // One layout per frame (RV2 L3), scrolled by the form's own measure of the focused
+                // row and its help (RV2 M1): the row itself first when both do not fit.
+                let laid = form_of(entries, focus, editing).layout(width, ctx.accent(), theme);
+                let offset = laid.offset(rows.height);
+                laid.render(frame, rows, offset);
+                // Beside the rows (RV1 M2): the help and notice lines under them do not scroll.
                 self.scroll
-                    .set(Some(ScrollSpan::new(total + below, offset)));
+                    .set(Some(ScrollSpan::new(laid.lines.len(), offset).rows(rows)));
             }
         }
         if !help.is_empty() {

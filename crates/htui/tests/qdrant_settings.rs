@@ -474,3 +474,16 @@ async fn the_clear_question_sits_under_its_row() {
         row(&buffer, url + 1)
     );
 }
+
+/// MOD-115 M3 RV2 (RV1 M2's span): the scroll names the rows the form was drawn into, so the
+/// pane's bar is measured against them; the total is the form's own lines, unpadded.
+#[tokio::test]
+async fn the_scroll_names_the_form_rows_it_measures() {
+    let (bench, section) = bench_with(stored()).await;
+    let _ = drawn(&bench, &section);
+    let span = section.scroll().expect("the form reports its scroll");
+    let rows = span.rows.expect("the rect the form was drawn into");
+    assert_eq!((rows.x, rows.y, rows.width), (0, 0, 100), "{rows:?}");
+    assert!(span.total < 30, "the form's own lines, unpadded: {span:?}");
+    assert_eq!(span.offset, 0, "{span:?}");
+}

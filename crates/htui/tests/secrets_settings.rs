@@ -3405,3 +3405,59 @@ async fn the_latch_stays_while_the_identity_question_is_open() {
     assert!(shown.contains("Remove the machine identity"), "{shown}");
     assert!(shown.contains("the last login was refused"), "{shown}");
 }
+
+/// MOD-115 M3 RV2 M1: the section scrolls by the form's own measure of the focused row
+/// (`Form::focus_lines`), not by guessing from the lines' first cells. A long slug's row has an
+/// empty label, so it starts as a continuation line does: a guess counted every such row under
+/// the cursor as its own, and scrolled the first project to the top though the page held it.
+#[tokio::test]
+async fn long_slug_rows_under_the_cursor_do_not_scroll_the_form() {
+    let (bench, mut section, tree) = loaded(configured()).await;
+    let mut long = tree.clone();
+    let first = long.projects[0].clone();
+    long.projects = (0..40)
+        .map(|index| {
+            let mut entry = first.clone();
+            entry.project.id = ProjectId::new();
+            entry.project.slug =
+                format!("graphics-vulkan-tutorials-for-the-long-slug-case-{index:02}");
+            entry
+        })
+        .collect();
+    bench.reply(&mut section, &tree_reply(&long));
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    let shown = frame(&bench, &section);
+    let span = section.scroll().expect("forty projects do not fit 30 rows");
+    assert_eq!(
+        span.offset, 0,
+        "the first project fits the first page: {shown}"
+    );
+    assert!(shown.contains("-00 \u{b7} "), "{shown}");
+    assert!(
+        shown
+            .lines()
+            .any(|line| line.trim_start().starts_with("URL")),
+        "the rows above it stay: {shown}"
+    );
+
+    // The cursor past the page still brings its row into view, at the page's foot.
+    for _ in 0..30 {
+        bench.key(&mut section, "j");
+    }
+    let shown = frame(&bench, &section);
+    assert!(shown.contains("-30 \u{b7} "), "the cursor's row: {shown}");
+    let span = section.scroll().expect("the form scrolls");
+    assert!(span.offset > 0, "{shown}");
+}
+
+/// MOD-115 M3 RV2 (RV1 M2's span): the bar is measured against the form's rows, the notice
+/// under them is not padded into the total.
+#[tokio::test]
+async fn the_scroll_names_the_form_rows_it_measures() {
+    let (bench, section, _) = loaded(configured()).await;
+    let _ = frame(&bench, &section);
+    let span = section.scroll().expect("the form reports its scroll");
+    let rows = span.rows.expect("the rect the form was drawn into");
+    assert_eq!((rows.y, rows.width), (0, 100), "{rows:?}");
+    assert!(span.total <= 30, "the form's own lines, unpadded: {span:?}");
+}

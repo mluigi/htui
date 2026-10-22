@@ -55,7 +55,6 @@ use crate::ui::kit::chips::key_line;
 use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::form::{self, Form, Value};
 use crate::ui::kit::label::plural;
-use crate::ui::kit::list::{self, GUTTER};
 use crate::ui::kit::pane::ScrollSpan;
 use crate::ui::kit::text::{Tone, notice, wrapped};
 use crate::ui::tabs::settings::{
@@ -1671,45 +1670,31 @@ impl SettingsSection for SecretsSection {
             }
             None => {
                 let form = self.form(rows.width, ctx.keys());
-                let mut lines = form.lines(rows.width, ctx.accent(), theme);
+                let mut laid = form.layout(rows.width, ctx.accent(), theme);
                 let notes = self.notes(rows.width, theme);
                 if !notes.is_empty() {
                     // One blank between the form and its notes: the form may end on its own.
-                    if lines.last().is_some_and(|line| line.width() > 0) {
-                        lines.push(Line::default());
+                    if laid.lines.last().is_some_and(|line| line.width() > 0) {
+                        laid.lines.push(Line::default());
                     }
-                    lines.extend(notes);
+                    laid.lines.extend(notes);
                 }
-                let offset = in_view(&lines, form.focus_line(rows.width), rows.height);
-                let total = lines.len();
-                frame.render_widget(Paragraph::new(lines[offset..].to_vec()), rows);
-                // The pane's bar is measured against the whole inner rect (D-11).
-                let below = usize::from(area.height.saturating_sub(rows.height));
+                // The form's own measure of the focused row (RV2 M1), not a guess from the
+                // lines' first cells: a long slug's row has no label and reads as a continuation.
+                let offset = laid.offset(rows.height);
+                let total = laid.lines.len();
+                let shown: Vec<Line<'static>> = laid.lines.drain(offset.min(total)..).collect();
+                frame.render_widget(Paragraph::new(shown), rows);
+                // Beside the rows the form was drawn into (RV1 M2): the notice under them does
+                // not scroll.
                 self.scroll
-                    .set(Some(ScrollSpan::new(total + below, offset)));
+                    .set(Some(ScrollSpan::new(total, offset).rows(rows)));
             }
         }
         if !said.is_empty() {
             frame.render_widget(Paragraph::new(said), notice_area);
         }
     }
-}
-
-/// The first line to draw so the focused row is on screen: its first line to the last of its
-/// value rows (each behind the marker) and its help and error (indented past the label column),
-/// or its first line alone when the block is taller than `height`.
-fn in_view(lines: &[Line<'_>], start: Option<usize>, height: u16) -> usize {
-    let Some(start) = start.filter(|start| *start < lines.len()) else {
-        return 0;
-    };
-    let rest = lines[start + 1..]
-        .iter()
-        .take_while(|line| {
-            let text = line.to_string();
-            text.starts_with(GUTTER) || text.starts_with("  ")
-        })
-        .count();
-    list::scroll_into_view(start + rest, 0, usize::from(height), lines.len()).min(start)
 }
 
 /// What a second write is told while the first is still out, in words (no request name).

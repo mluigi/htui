@@ -24,7 +24,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use crate::ui::kit::list::{GUTTER, ellipsize, selection_band};
+use crate::ui::kit::list::{self, GUTTER, ellipsize, selection_band};
 use crate::ui::kit::text::wrapped;
 use crate::ui::text_field::TextField;
 use crate::ui::{Theme, cells};
@@ -346,6 +346,24 @@ pub struct FormLines {
 }
 
 impl FormLines {
+    /// The first line to draw in `height` rows so the focused item is on screen (MOD-115 M3 RV2
+    /// M1): the least scroll from the top that shows its last line, never past its first, so an
+    /// item taller than the view shows its first line; 0 when nothing is focused. The form never
+    /// scrolls past its end ([`list::scroll_into_view`]): lines pushed after the form's (a
+    /// section's notes) count toward that end.
+    #[must_use]
+    pub fn offset(&self, height: u16) -> usize {
+        self.focus.as_ref().map_or(0, |focus| {
+            list::scroll_into_view(
+                focus.end.saturating_sub(1),
+                0,
+                usize::from(height),
+                self.lines.len(),
+            )
+            .min(focus.start)
+        })
+    }
+
     /// Draws the lines from `offset` into `area`, one per row, as [`Form::render`] does. The
     /// lines are drawn as laid out: lay the form out at `area.width`.
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect, offset: usize) {
@@ -1010,6 +1028,33 @@ mod tests {
             .expect("draw");
         let drawn = terminal.backend().buffer().clone();
         assert_eq!(drawn, draw(&form, 20, 3, 3, &theme));
+    }
+
+    /// RV2 M1: the offset that brings the focused item into a viewport, by the form's own
+    /// measure of it: its last line in view from the top, its first never scrolled past.
+    #[test]
+    fn offset_brings_the_whole_focused_item_into_view() {
+        let theme = Theme::default();
+        let form = Form::new()
+            .field(Field::new("a", Value::Toggle(true)))
+            .field(Field::new("", Value::ReadOnly("no label".into())))
+            .field(Field::new("", Value::ReadOnly("no label".into())))
+            .field(
+                Field::new("b", Value::Toggle(true))
+                    .help("help one")
+                    .error("bad"),
+            );
+        let laid = |focus: usize| form.clone().focus(focus).layout(20, accent(), &theme);
+        assert_eq!(laid(0).offset(2), 0, "the first row fits");
+        assert_eq!(
+            laid(1).offset(2),
+            0,
+            "an unlabelled row under the cursor is not the cursor's"
+        );
+        // `b`, its help and its error: lines 3..6, the last at the foot of four rows.
+        assert_eq!(laid(3).offset(4), 2);
+        assert_eq!(laid(3).offset(2), 3, "taller than the view: its first line");
+        assert_eq!(Form::new().layout(20, accent(), &theme).offset(4), 0);
     }
 
     /// RV1, for Requirements' text areas (RV3 M2): a stacked field has its label on a row of
