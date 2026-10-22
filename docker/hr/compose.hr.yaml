@@ -36,8 +36,14 @@ services:
     image: qdrant/qdrant:v1.19.1
     network_mode: service:postgres
     depends_on: [postgres]
+    # Storage is a bind into the run dir (HDD unless --ssd), not a named volume: named volumes live
+    # in /var/lib/docker on the system disk. Non-root so the files it writes stay removable by
+    # `down --purge`; snapshots go under the storage mount because /qdrant/snapshots is root-owned.
+    user: "${HR_UID:?}:${HR_GID:?}"
+    environment:
+      QDRANT__STORAGE__SNAPSHOTS_PATH: /qdrant/storage/snapshots
     volumes:
-      - {type: volume, source: qdrant, target: /qdrant/storage}
+      - {type: bind, source: "${HR_QDRANT:?}", target: /qdrant/storage, bind: {create_host_path: false}}
 
   dev:
     image: ${HR_IMAGE:-htui-hr-dev}
@@ -86,6 +92,9 @@ services:
       TERM: ${TERM:-xterm-256color}
       COLORTERM: ${COLORTERM:-truecolor}
     volumes:
+      # /tmp is where run builds put their cargo target dirs (tens of GB each): on the container's
+      # writable layer that is /var/lib/docker, i.e. the system disk. Bind it into the run dir.
+      - {type: bind, source: "${HR_TMP:?}",                  target: /tmp,                                  bind: {create_host_path: false}}
       - {type: bind, source: "${HR_SRC:?}",                  target: "${HR_HOST_REPO:?}",                   bind: {create_host_path: false}}
       - {type: bind, source: "${HR_HOST_REPO:?}",            target: /host/htui, read_only: true,           bind: {create_host_path: false}}
       - {type: bind, source: "${HR_HOST_REPO:?}/.remember",  target: "${HR_HOST_REPO:?}/.remember",         bind: {create_host_path: false}}
@@ -172,7 +181,6 @@ services:
 
 volumes:
   pgdata:
-  qdrant:
   gortex:
   cargo-src:       # per run, so `down -v` removes it
   cargo:
