@@ -907,11 +907,10 @@ impl Tab for ChatTab {
         if let Some(row) = parked {
             PermissionStrip::render(frame, strip, row, ctx.keys(), views::CHAT_LIVE, ctx.theme);
         }
-        // Not under a replay: the composer belongs to the live view, and a replay must not show
-        // an input line for a step that can take no input.
-        // MOD-115 M3 RV3 (review L2): the tab accent marks the focused pane alone, so an
-        // unfocused pane's composer is dim.
         let focus = ctx.pane_focus(PaneId::Detail);
+        // Not under a replay: the composer belongs to the live view, and a replay must not show
+        // an input line for a step that can take no input. MOD-115 M3 RV3 (review L2): the tab
+        // accent marks the focused pane alone, so an unfocused pane's composer is dim.
         if replay.is_none() {
             let accent = match focus {
                 Focus::Focused => ctx.accent(),
