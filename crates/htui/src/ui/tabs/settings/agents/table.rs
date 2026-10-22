@@ -47,8 +47,8 @@ pub(super) const SWITCHED_OFF: &str = "switched off";
 /// every verdict but `⚠ needs login`, which fills that column: then the column takes a cell from
 /// `name` while `name` has one past [`NAME_MIN`], and where it has none the verdict is drawn as
 /// its icon and the mark (`⚠*`, RV2 L5), whatever the note line holds (RV4); a version gives up
-/// its last cells ([`fit_on_box`]). Either way the idle note's [`MANUAL_NOTE`] never names a mark the
-/// table does not draw (repair 2, D-18).
+/// its last cells ([`fit_on_box`]). Either way the idle note's [`MANUAL_NOTE`] never names a mark
+/// the table does not draw (repair 2, D-18).
 pub(super) const MANUAL_SUFFIX: &str = "*";
 
 /// What the idle note adds while any row's `probe.source` is `manual`: the key to
