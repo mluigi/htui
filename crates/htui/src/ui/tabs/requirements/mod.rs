@@ -1077,7 +1077,9 @@ impl RequirementsTab {
             .map(|row| Line::styled(row, theme.error))
             .collect();
         if let Some(reload) = ctx.keys().label(views::REQUIREMENTS_BROWSE, Act::Reload) {
-            lines.push(Line::styled(format!("{reload} reads again"), ctx.accent()));
+            // MOD-115 M3 RV3 (review L3): a next step, in `kit::empty`'s next-step role; the
+            // tab's accent marks the focused pane alone.
+            lines.push(Line::styled(format!("{reload} reads again"), theme.accent));
         }
         frame.render_widget(Paragraph::new(lines), area);
     }
@@ -3115,6 +3117,28 @@ mod tests {
             rows[usize::from(field) + 1].contains("A withdrawn requirement"),
             "{rows:#?}"
         );
+    }
+
+    /// MOD-115 M3 RV3 (review L3): the key that reads again after a refused read is a next step,
+    /// drawn as `kit::empty` draws one (the theme's focus role), not in the tab's accent, which
+    /// marks the focused pane alone.
+    #[tokio::test]
+    async fn the_reload_next_step_is_an_empty_state_s_not_the_tab_accent() {
+        let (_, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let refused = RequirementsTab {
+            unavailable: Some(DATABASE_UNREACHABLE.to_owned()),
+            ..RequirementsTab::default()
+        };
+        let ctx = bench.ctx();
+        let (buffer, rows) = drawn(&refused, &ctx, 100, 30);
+        let style = style_of(&buffer, &rows, "r reads again");
+        assert_ne!(
+            bench.theme.accent.fg,
+            ctx.accent().fg,
+            "two accents to tell apart"
+        );
+        assert_eq!(style.fg, bench.theme.accent.fg, "the next step's role");
     }
 
     /// MOD-115 M3, MOD-83 (audit item 2): every empty state says what to do next.
