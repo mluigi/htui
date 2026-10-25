@@ -1070,7 +1070,7 @@ recipe_prompt() {
 }
 
 # Files that configure or run tools on the host once merged (collect --merge shows and confirms them).
-CONFIG_PATHS=(.claude scripts docker CLAUDE.md AGENTS.md .mcp.json .cargo rust-toolchain.toml)
+CONFIG_PATHS=(.claude .clinerules scripts docker CLAUDE.md AGENTS.md .mcp.json .cargo rust-toolchain.toml)
 
 # collect's temporaries. Globals, not locals: the EXIT trap runs after cmd_collect has returned,
 # when its locals are gone (re-review L4).

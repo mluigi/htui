@@ -10,8 +10,8 @@
 - **Session start:** read this file first. Pick the next open item.
 - **On completion:** delete the checklist line, write `docs/decisions/<prefix>/<prefix>-N.md`,
   prepend the index line to `DECISIONS.md`, update the summary table (per
-  `.claude/rules/workflow-docs.md`; this repo is outside the `sync-workflow-surface` default
-  target list, pass `-Targets` explicitly to receive the surface).
+  `.claude/rules/workflow-docs.md`, with its Cline copy in `.clinerules/`; this repo is the source of
+  truth for its workflow skills and rules, `AGENTS.md` "Rules").
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
 **Current status (2026-10-21):** **MOD-137 is done** (`docs/decisions/mod/mod-137.md`): step graphs

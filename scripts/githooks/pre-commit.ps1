@@ -3,7 +3,7 @@
 $ErrorActionPreference = 'Stop'
 
 $staged = @(git diff --cached --name-only)
-$docsPattern = '^HANDOFF\.md$|^DECISIONS\.md$|^docs/decisions/.+\.md$|^docs/ANA-[^/]+\.md$'
+$docsPattern = '^HANDOFF\.md$|^DECISIONS\.md$|^docs/decisions/.+\.md$|^docs/ANA-[^/]+\.md$|^\.claude/rules/(workflow|concept)-docs\.md$|^\.clinerules/(workflow|concept)-docs\.md$'
 
 if ($staged.Count -gt 0 -and $env:WORKFLOW_SKIP_HOOK -ne '1' -and ($staged -match $docsPattern)) {
     & pwsh -NoProfile -File '.claude/skills/handoff-run/scripts/validate-workflow-docs.ps1' -ScopePaths ($staged -join "`n")

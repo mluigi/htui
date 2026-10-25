@@ -1,6 +1,6 @@
 #!/bin/sh
 # post-commit (TOOL-9): core.hooksPath replaces .git/hooks, so run the clone's own post-commit
-# (the workflow-surface sync block the installer writes lives there). Nothing of its own.
+# (a foreign block such as graphify's lives there). Nothing of its own.
 
 WF_OWN="$(git rev-parse --git-common-dir)/hooks/post-commit"
 if [ -x "$WF_OWN" ]; then

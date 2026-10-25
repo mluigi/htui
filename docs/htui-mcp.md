@@ -420,7 +420,8 @@ The plugin and `.mcp.json` findings were observed on `claude-cli`. An ACP sessio
 - the MCP servers you added to `~/.claude.json` yourself, and the prompts they offer as commands:
   htui does nothing to stop them, but whether they still load with no settings file read has not
   been verified;
-- the repository's `CLAUDE.md`;
+- the repository's `CLAUDE.md`, or its `AGENTS.md` when it has no `CLAUDE.md` (Claude Code
+  2.1.277 or later; observed under these levers on 2.1.310);
 - managed (policy) settings, which htui cannot turn off;
 - Claude Code's built-in mods, which it loads whatever the settings say;
 - htui's own `htui` server and its `permission_prompt` tool.

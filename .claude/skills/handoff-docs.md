@@ -5,9 +5,9 @@ boundaries are. This file **explains**; it never legislates. The law lives in
 `.claude/rules/workflow-docs.md` (item prefixes, file roles, lifecycle rules) and in each skill's own
 `SKILL.md`. On any conflict, those win.
 
-Same surface in every repo. This file, `.claude/rules/workflow-docs.md`, and the two skill
-directories are copied from the **dingine workspace** by `sync-workflow-surface.sh`/`.ps1` — edit the
-workspace copy, never a sub-repo copy (see *Distribution* below).
+This repo is the source of truth for this file, `.claude/rules/workflow-docs.md`,
+`.claude/rules/concept-docs.md` and the two skill directories: edit them here. The two rule files
+have Cline copies under `.clinerules/` (see *Enforcement* below).
 
 ## The two commands
 
@@ -74,8 +74,7 @@ One command per item lifecycle. Five things about it matter in daily use:
 3. **The gates never disappear.** Selection confirm (`next` only), route confirm, `plan` CONFIRM, PRD open
    questions, and deliberate push are maintainer decisions in every run.
 4. **The reviewer gate always runs last**, over the changes, resolved from the repo's
-   `.claude/workflow-config.json` key `reviewer`. That file is per-repo and deliberately outside the
-   synced surface — the sync script never owns or overwrites it.
+   `.claude/workflow-config.json` key `reviewer`.
 5. **Close-out is bookkeeping, then proof.** Phase note for a milestone of multi-phase work, full
    close-out (HANDOFF line deleted, write-up file + index line, summary recount) when the item is done, then
    `validate-workflow-docs.sh`/`.ps1`. A red validator blocks the done-report.
@@ -97,25 +96,22 @@ to see how an item will be treated before committing to it.
 Per-repo IDs: `MOD-1` here and `MOD-1` in another repo are unrelated items. Always name the repo when
 referring to an ID outside its own `HANDOFF.md` ("engine MOD-7", "workspace MOD-5").
 
-## Enforcement and distribution
+## Enforcement
 
 - **Validator** — `handoff-run/scripts/validate-workflow-docs.sh`/`.ps1` checks the structural rules
-  (sections, ID reuse, summary counts, cross-links, status-line cap, index/write-up-file agreement).
-  Run it any time; it is cheap.
-- **Commit hooks** — installed by `handoff-run/scripts/install-workflow-hooks.sh`/`.ps1`. `pre-commit`
-  validates the whole repo when `HANDOFF.md`/`DECISIONS.md`/`docs/decisions/**`/`docs/ANA-*` is staged, but
-  blocks only on errors in the **staged** files (`--scope-paths`): a pre-existing finding in a file this
-  commit does not touch prints as `[WARNING] ... (pre-existing ...)` and still fails a direct validator run.
-  Human hatch: `WORKFLOW_SKIP_HOOK=1` (not `--no-verify` — a separate PreToolUse hook hard-blocks that flag
-  for agent sessions). In sub-repos it additionally blocks staged
-  surface files that differ from the workspace source — committing sync results passes, local
-  divergence blocks.
-- **Sync** — `handoff-run/scripts/sync-workflow-surface.sh`/`.ps1` mirrors the surface from the workspace
-  into the sub-repos; `-Check` reports drift without writing. The workspace `post-commit` hook runs it
-  automatically when a commit touches surface source. `.workflow_version` marks the surface revision.
-
-**So: to change how any of this behaves, edit the workspace copy and sync.** A sub-repo edit will be
-overwritten by the next sync and blocked by that repo's pre-commit guard in the meantime.
+  (sections, ID reuse, summary counts, cross-links, status-line cap, index/write-up-file agreement)
+  and that each rule's Cline copy matches its Claude Code copy (`rule-copy`). Run it any time; it is
+  cheap.
+- **Commit hooks** — committed under `scripts/githooks/`; `handoff-run/scripts/install-workflow-hooks.sh`/
+  `.ps1` points `core.hooksPath` at them. `pre-commit` validates the whole repo when
+  `HANDOFF.md`/`DECISIONS.md`/`docs/decisions/**`/`docs/ANA-*` or a rule file is staged, but blocks only
+  on errors in the **staged** files (`--scope-paths`): a pre-existing finding in a file this commit does
+  not touch prints as `[WARNING] ... (pre-existing ...)` and still fails a direct validator run. Human
+  hatch: `WORKFLOW_SKIP_HOOK=1` (not `--no-verify` — a separate PreToolUse hook hard-blocks that flag for
+  agent sessions).
+- **Rule copies** — `.claude/rules/<name>.md` is what Claude Code loads and `.clinerules/<name>.md` is
+  what Cline loads; each agent reads only its own directory, so the two are byte-identical copies.
+  Edit both in one commit; the `rule-copy` check blocks a commit that stages one of them out of step.
 
 ## Choosing, in one paragraph
 

@@ -24,7 +24,8 @@
 #           ID disagreeing with its path (decision-id-path), legacy `## PREFIX-N`
 #           write-up section still present (decision-legacy), open checklist line meant as
 #           an item but failing the strict pattern (checklist-unparseable, mirrors
-#           next-item-id.sh).
+#           next-item-id.sh), a rule's Cline copy differing from or missing beside its
+#           Claude Code copy (rule-copy; RULE_COPY_PAIRS).
 # Warnings: status-line recap over cap (~3), broken cross-link paths, unparseable summary
 #           rows, undated archive entries.
 
@@ -57,6 +58,13 @@ DATE_PATTERN='([0-9]{4}-[0-9]{2}-[0-9]{2})'
 # Summary-table row: literal "PREFIX-N" placeholder text, not an actual ID.
 # BASH_REMATCH: 1=prefix 2=cell
 SUMMARY_ROW_PATTERN="^\\|[[:space:]]*(${PREFIX_ALT})-N[[:space:]]*\\|[[:space:]]*([^|]*)"
+
+# Rules each agent loads from its own directory only: Claude Code from .claude/rules/, Cline
+# from .clinerules/. Each pair is "source copy" — kept byte-identical (rule-copy).
+RULE_COPY_PAIRS=(
+    '.claude/rules/workflow-docs.md .clinerules/workflow-docs.md'
+    '.claude/rules/concept-docs.md .clinerules/concept-docs.md'
+)
 
 STATUS_LINE_START_PATTERN='^\*\*Current status'
 COMPLETION_PATTERN="(${PREFIX_ALT})-[0-9]+[[:space:]]+(\\*\\*)?(done|closed|concluded|complete)"
@@ -452,6 +460,23 @@ test_status_line_cap() {
     fi
 }
 
+test_rule_copies() {
+    # $1=root. A pair whose source is absent is skipped: the rule is not in this repo. The
+    # finding names both paths, so staging either copy makes it blocking.
+    local root="$1" pair src copy
+    for pair in "${RULE_COPY_PAIRS[@]}"; do
+        src="${pair%% *}"; copy="${pair#* }"
+        [[ -f "$root/$src" ]] || continue
+        if [[ ! -f "$root/$copy" ]]; then
+            add_finding Error rule-copy "${copy} missing: Cline reads rules only from .clinerules/, so copy ${src} there." \
+                "$src $copy"
+        elif ! cmp -s "$root/$src" "$root/$copy"; then
+            add_finding Error rule-copy "${copy} differs from ${src}: edit both copies together (cp ${src} ${copy})." \
+                "$src $copy"
+        fi
+    done
+}
+
 CL_LINES=()
 
 test_cross_links() {
@@ -518,6 +543,7 @@ invoke_workflow_docs_checks() {
     test_reverse_chronology
     test_decision_index "$root"
     test_status_line_cap
+    test_rule_copies "$root"
     CL_LINES=("${HANDOFF_LINES[@]}"); test_cross_links "$root" "" "HANDOFF.md"
     CL_LINES=("${DECISIONS_LINES[@]}"); test_cross_links "$root" "" "DECISIONS.md"
 
@@ -892,10 +918,36 @@ EOF
         failures+=("compound: expected MOD-18, MOD-19, MOD-20 from compound header, got:${cmp_ids}")
     fi
 
+    # Case 20: rule copies. Identical -> clean; a differing or missing Cline copy -> rule-copy
+    # error attributed to both paths (blocking when either copy is staged, demoted otherwise);
+    # a repo without the source rule -> nothing.
+    dir="$tmp/rulecopy"
+    mkfixture "$dir" "$empty_handoff" '# DECISIONS'
+    mkfile "$dir/.claude/rules/workflow-docs.md" '# rule'
+    mkfile "$dir/.clinerules/workflow-docs.md" '# rule'
+    invoke_workflow_docs_checks "$dir"
+    [[ "$(count_findings Error rule-copy)" -ne 0 ]] && failures+=('rulecopy: identical copies reported')
+    mkfile "$dir/.clinerules/workflow-docs.md" '# rule, edited on one side'
+    invoke_workflow_docs_checks "$dir"
+    [[ "$(count_findings Error rule-copy)" -ne 1 ]] && failures+=('rulecopy: a differing copy was not reported once')
+    reset_scope; add_scope_paths ".clinerules/workflow-docs.md"; classify_findings
+    [[ "$BLOCKING_ERRORS" -lt 1 ]] && failures+=('rulecopy: staging the Cline copy did not block')
+    reset_scope; add_scope_paths ".claude/rules/workflow-docs.md"; classify_findings
+    [[ "$BLOCKING_ERRORS" -lt 1 ]] && failures+=('rulecopy: staging the Claude Code copy did not block')
+    reset_scope; add_scope_paths "HANDOFF.md"; classify_findings
+    [[ "$BLOCKING_ERRORS" -ne 0 ]] && failures+=('rulecopy: an unrelated staged file was blocked')
+    reset_scope
+    rm "$dir/.clinerules/workflow-docs.md"
+    invoke_workflow_docs_checks "$dir"
+    [[ "$(count_findings Error rule-copy)" -ne 1 ]] && failures+=('rulecopy: a missing copy was not reported')
+    rm "$dir/.claude/rules/workflow-docs.md"
+    invoke_workflow_docs_checks "$dir"
+    [[ "$(count_findings Error rule-copy)" -ne 0 ]] && failures+=('rulecopy: a repo without the rule was reported')
+
     rm -rf "$tmp"
 
     if [[ ${#failures[@]} -eq 0 ]]; then
-        echo 'Self-test: 19/19 cases PASS.'
+        echo 'Self-test: 20/20 cases PASS.'
         return 0
     fi
     echo "Self-test FAIL (${#failures[@]}):"

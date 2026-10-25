@@ -1564,8 +1564,8 @@ EOF
     mk_run MOD-5
     local src p
     src="$(src_of MOD-5)"
-    local -a paths=(.claude/settings.json scripts/tool.sh docker/x/Dockerfile CLAUDE.md AGENTS.md .mcp.json
-        .cargo/config.toml rust-toolchain.toml)
+    local -a paths=(.claude/settings.json .clinerules/rule.md scripts/tool.sh docker/x/Dockerfile CLAUDE.md
+        AGENTS.md .mcp.json .cargo/config.toml rust-toolchain.toml)
     for p in "${paths[@]}"; do
         mkdir -p "$src/$(dirname "$p")"
         printf 'from the run\n' >"$src/$p"

@@ -21,7 +21,8 @@
 #           ID disagreeing with its path (decision-id-path), legacy `## PREFIX-N`
 #           write-up section still present (decision-legacy), open checklist line meant as
 #           an item but failing the strict pattern (checklist-unparseable, mirrors
-#           next-item-id.ps1).
+#           next-item-id.ps1), a rule's Cline copy differing from or missing beside its
+#           Claude Code copy (rule-copy; $RuleCopyPairs).
 # Warnings: status-line recap over cap (~3), broken cross-link paths, unparseable summary
 #           rows, undated archive entries.
 
@@ -41,6 +42,12 @@ $ErrorActionPreference = 'Stop'
 
 . (Join-Path $PSScriptRoot 'workflow-patterns.ps1')
 
+# Rules each agent loads from its own directory only: Claude Code from .claude/rules/, Cline
+# from .clinerules/. Each pair is source, copy - kept byte-identical (rule-copy).
+$RuleCopyPairs = @(
+    @('.claude/rules/workflow-docs.md', '.clinerules/workflow-docs.md'),
+    @('.claude/rules/concept-docs.md', '.clinerules/concept-docs.md')
+)
 
 function New-Finding {
     # $Files: the repo-relative path(s) the finding is about. Drives -ScopePaths only; an
@@ -388,6 +395,28 @@ function Test-StatusLineCap {
     return $findings
 }
 
+function Test-RuleCopies {
+    # A pair whose source is absent is skipped: the rule is not in this repo. The finding names
+    # both paths, so staging either copy makes it blocking.
+    param([string]$Root)
+    $findings = @()
+    foreach ($pair in $RuleCopyPairs) {
+        $src = $pair[0]; $copy = $pair[1]
+        $srcFull = Join-Path $Root $src
+        $copyFull = Join-Path $Root $copy
+        if (-not (Test-Path -LiteralPath $srcFull -PathType Leaf)) { continue }
+        if (-not (Test-Path -LiteralPath $copyFull -PathType Leaf)) {
+            $findings += New-Finding 'Error' 'rule-copy' `
+                "$copy missing: Cline reads rules only from .clinerules/, so copy $src there." @($src, $copy)
+        } elseif ((Get-FileHash -LiteralPath $srcFull -Algorithm SHA256).Hash -ne
+                  (Get-FileHash -LiteralPath $copyFull -Algorithm SHA256).Hash) {
+            $findings += New-Finding 'Error' 'rule-copy' `
+                "$copy differs from ${src}: edit both copies together (cp $src $copy)." @($src, $copy)
+        }
+    }
+    return $findings
+}
+
 function Test-CrossLinks {
     # A backticked `*.md` mention resolves against the containing file's directory OR the
     # repo root — this corpus writes both: true relative links ("../HANDOFF.md") and
@@ -451,6 +480,7 @@ function Invoke-WorkflowDocsChecks {
     $findings += Test-DecisionIndex -Root $Root -DecisionsLines $decisionsLines `
         -IndexEntries $indexEntries -DecisionFiles $decisionFiles -DecisionHeaders $headers
     $findings += Test-StatusLineCap -HandoffLines $handoffLines
+    $findings += Test-RuleCopies -Root $Root
     $findings += Test-CrossLinks -FileDir $Root -Lines $handoffLines -FileLabel 'HANDOFF.md'
     $findings += Test-CrossLinks -FileDir $Root -Lines $decisionsLines -FileLabel 'DECISIONS.md'
     # Each item file's relative links resolve against its own directory, not the repo root.
@@ -796,12 +826,38 @@ Write-up body.
         if ($cmpIds -notcontains 'MOD-18' -or $cmpIds -notcontains 'MOD-19' -or $cmpIds -notcontains 'MOD-20') {
             $failures += "compound: expected MOD-18, MOD-19, MOD-20 from compound header, got: $($cmpIds -join ',')"
         }
+
+        # Case 20: rule copies. Identical -> clean; a differing or missing Cline copy -> rule-copy
+        # error attributed to both paths (blocking when either copy is staged, demoted otherwise);
+        # a repo without the source rule -> nothing.
+        $rc = Join-Path $tmp 'rulecopy'
+        New-DecisionFixture -Dir $rc -HandoffContent $emptyHandoff -DecisionsContent '# DECISIONS' -Files @{
+            '.claude/rules/workflow-docs.md' = '# rule'
+            '.clinerules/workflow-docs.md'   = '# rule'
+        }
+        # @(& ...) at every call site: a scriptblock's output unrolls, so one finding would come
+        # back as a bare object with no .Count under StrictMode.
+        $ruleCopy = { Invoke-WorkflowDocsChecks -Root $rc | Where-Object { $_.Check -eq 'rule-copy' } }
+        if (@(& $ruleCopy).Count -ne 0) { $failures += 'rulecopy: identical copies reported' }
+        Set-Content -Path (Join-Path $rc '.clinerules/workflow-docs.md') -Value '# rule, edited on one side' -Encoding UTF8
+        $rcFindings = @(& $ruleCopy)
+        if ($rcFindings.Count -ne 1) { $failures += 'rulecopy: a differing copy was not reported once' }
+        foreach ($staged in @('.clinerules/workflow-docs.md', '.claude/rules/workflow-docs.md')) {
+            $r = Get-FindingReport -Findings $rcFindings -ScopeSet (Get-ScopeSet -Raw @($staged)) -ScopeActive $true
+            if ($r.BlockingErrors -lt 1) { $failures += "rulecopy: staging $staged did not block" }
+        }
+        $r = Get-FindingReport -Findings $rcFindings -ScopeSet (Get-ScopeSet -Raw @('HANDOFF.md')) -ScopeActive $true
+        if ($r.BlockingErrors -ne 0) { $failures += 'rulecopy: an unrelated staged file was blocked' }
+        Remove-Item -LiteralPath (Join-Path $rc '.clinerules/workflow-docs.md')
+        if (@(& $ruleCopy).Count -ne 1) { $failures += 'rulecopy: a missing copy was not reported' }
+        Remove-Item -LiteralPath (Join-Path $rc '.claude/rules/workflow-docs.md')
+        if (@(& $ruleCopy).Count -ne 0) { $failures += 'rulecopy: a repo without the rule was reported' }
     } finally {
         if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
     }
 
     if ($failures.Count -eq 0) {
-        Write-Host 'Self-test: 19/19 cases PASS.'
+        Write-Host 'Self-test: 20/20 cases PASS.'
         return 0
     }
     Write-Host "Self-test FAIL ($($failures.Count)):"

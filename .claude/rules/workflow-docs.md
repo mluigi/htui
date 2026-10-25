@@ -7,12 +7,18 @@ paths:
   - "**/docs/ANA-*.md"
   - "docs/decisions/**/*.md"
   - "**/docs/decisions/**/*.md"
+  - ".claude/rules/workflow-docs.md"
+  - ".clinerules/workflow-docs.md"
 ---
 
 # Workflow Docs Rule
 
 Governs `HANDOFF.md`, `DECISIONS.md`, `docs/decisions/**`, and `docs/ANA-*.md` in this repo. Read
 this before touching any of them.
+
+Two identical copies of this rule exist: `.claude/rules/workflow-docs.md` (Claude Code) and
+`.clinerules/workflow-docs.md` (Cline), because neither agent reads the other's rules directory.
+Edit both in the same commit; `validate-workflow-docs`'s `rule-copy` check fails when they differ.
 
 ## Files
 

@@ -40,9 +40,9 @@ bash-installed `pre-commit` hook, and **1.3 s** after re-running
 hooks with the `.ps1`, and when a commit hangs, check `.git/hooks/pre-commit` for a `bash` call
 before suspecting anything else.
 
-**Enforced since MOD-43 M3, not merely documented.** All five `.sh` entry points
-(`install-workflow-hooks`, `sync-workflow-surface`, `validate-workflow-docs`, `next-item`,
-`next-item-id`) detect a Windows shell — `uname -s` reporting `MINGW*`/`MSYS*`/`CYGWIN*` — and
+**Enforced since MOD-43 M3, not merely documented.** All four `.sh` entry points
+(`install-workflow-hooks`, `validate-workflow-docs`, `next-item`, `next-item-id`) detect a Windows
+shell — `uname -s` reporting `MINGW*`/`MSYS*`/`CYGWIN*` — and
 **exit 2 naming the `.ps1` to run instead**. The installer is the one that matters most: the hooks
 *it* generates call `bash …/*.sh`, so a single Windows run of the `.sh` variant would replace every
 `pwsh` call site with a bash one and make every later commit pay the difference. Override only for a
@@ -136,12 +136,10 @@ routing trigger needed).
    review authority and nothing replaces it. Resolve it from the
    repo's `.claude/workflow-config.json`, key `reviewer` (agent name, e.g. `"cpp-reviewer"`). File or key missing →
    propose a reviewer from the repo's dominant language, confirm with the maintainer, write the file, then run it.
-   `workflow-config.json` is per-repo and deliberately **outside** the synced workflow surface —
-   `sync-workflow-surface.sh`/`.ps1` never owns or overwrites it. Findings applied (or explicitly deferred with the
-   maintainer) before close-out. Ultracode does not replace this gate. Verdict recommended the **review** phase
-   (maintainer accepted) → after the configured reviewer runs, fan its findings through a Workflow-tool
-   adversarial-verify pass (one verifier per finding) before applying/deferring them — the verify pass only checks
-   findings, never substitutes for the reviewer.
+   Findings applied (or explicitly deferred with the maintainer) before close-out. Ultracode does not replace
+   this gate. Verdict recommended the **review** phase (maintainer accepted) → after the configured reviewer
+   runs, fan its findings through a Workflow-tool adversarial-verify pass (one verifier per finding) before
+   applying/deferring them — the verify pass only checks findings, never substitutes for the reviewer.
 
 ### 5. Close-out
 
@@ -153,12 +151,10 @@ routing trigger needed).
    done-report. The same validator also runs at commit time (`pre-commit` hook, `scripts/install-workflow-hooks.sh`/
    `.ps1`, M3), but there it blocks on errors in the **staged** files only — a pre-existing finding elsewhere prints
    as `[WARNING] ... (pre-existing ...)` and does not block an unrelated commit. Human escape hatch:
-   `WORKFLOW_SKIP_HOOK=1`. Sub-repo hooks additionally block staged surface files that differ from the workspace
-   source (drift-aware: committing sync results passes; local divergence blocks — edit the workspace source and sync
-   instead).
+   `WORKFLOW_SKIP_HOOK=1`.
 3. Update PRD milestone row / plan artifact status where they exist.
 4. Report: what shipped, commits, validator result. Push only when agreed (the repo's
-   `CLAUDE.md` push policy; workspace-level where the repo is a submodule).
+   `AGENTS.md` push policy).
 
 ## Sandbox mode (`HR_SANDBOX=1`)
 

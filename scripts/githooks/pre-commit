@@ -17,7 +17,9 @@ case "$(uname -s 2>/dev/null || echo unknown)" in
         ;;
     *)
         WF_STAGED=$(git diff --cached --name-only)
-        WF_DOCS_PATTERN='^HANDOFF\.md$|^DECISIONS\.md$|^docs/decisions/.+\.md$|^docs/ANA-[^/]+\.md$'
+        # The workflow docs, plus both copies of each rule (the validator's rule-copy check).
+        # Kept identical to DOCS_PATTERN in install-workflow-hooks.sh (its self-test case 11).
+        WF_DOCS_PATTERN='^HANDOFF\.md$|^DECISIONS\.md$|^docs/decisions/.+\.md$|^docs/ANA-[^/]+\.md$|^\.claude/rules/(workflow|concept)-docs\.md$|^\.clinerules/(workflow|concept)-docs\.md$'
 
         # Fast path: the validator only spawns when a watched path is staged.
         if [ -n "$WF_STAGED" ] && [ "${WORKFLOW_SKIP_HOOK:-0}" != "1" ] \

@@ -328,7 +328,7 @@ tools on the host — after the merge, your next `claude` session, `scripts/hr` 
 uses them:
 
 ```
-git diff --stat HEAD...hr/ITEM -- .claude scripts docker CLAUDE.md AGENTS.md .mcp.json .cargo rust-toolchain.toml
+git diff --stat HEAD...hr/ITEM -- .claude .clinerules scripts docker CLAUDE.md AGENTS.md .mcp.json .cargo rust-toolchain.toml
 ```
 
 When that is not empty it always asks: in a terminal with a `gum confirm`, `--yes` or not; without

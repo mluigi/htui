@@ -3,6 +3,7 @@ paths:
   - "CONCEPTS.md"
   - "**/CONCEPTS.md"
   - ".claude/rules/concept-docs.md"
+  - ".clinerules/concept-docs.md"
 ---
 
 # Concept Docs Rule
@@ -18,7 +19,7 @@ right now and stay true between commits.
 
 It exists because nothing else can hold them. graphify's `graph.json` has no prose field at all — it
 indexes files, symbols, edges and communities, so *why the RHI seam exists* is unanswerable there by
-construction, not by omission. `README.md` says what a thing does; `CLAUDE.md` tells the agent what
+construction, not by omission. `README.md` says what a thing does; `AGENTS.md` tells the agent what
 to do; `docs/ANA-*.md` argues a question once and freezes at its verdict. The standing conclusion
 had no home before this file.
 
@@ -43,8 +44,8 @@ conclusion; it never re-argues it.
 | Symbol tables, API signatures, call edges | same — and they are stale within a week |
 | Target-dependency tables | the CMake target graph is extracted, not written |
 | Live values — versions, baselines, port REFs, pinned hashes | those belong in `HANDOFF.md` (workflow-docs rule 6). State the *protocol* here, keep the *current numbers* there |
-| Build/run instructions | `CLAUDE.md` (agent-facing) or `README.md` (human-facing) |
-| Anything already stated in this repo's `README.md` / `CLAUDE.md` | **link it instead.** Two copies of one fact is how this file rots — the failure is documented (go-github#397) and it is the single most likely way this layer dies |
+| Build/run instructions | `AGENTS.md` (agent-facing) or `README.md` (human-facing) |
+| Anything already stated in this repo's `README.md` / `AGENTS.md` | **link it instead.** Two copies of one fact is how this file rots — the failure is documented (go-github#397) and it is the single most likely way this layer dies |
 
 Mechanically: a markdown table whose header row carries `file`, `symbol`, `target` or `depends` is a
 violation.
@@ -102,9 +103,10 @@ is the rot this rule exists to prevent.
 
 ## Distribution
 
-- **`CONCEPTS.md` never joins any sync list.** Each one is repo-specific by definition, and the
-  sync's mirror semantics would overwrite every sub-repo's concepts with the workspace's.
-- **This rule file does sync**, like `workflow-docs.md`, so every repo carries the same law.
+- **`CONCEPTS.md` is never copied between repos.** Each one is repo-specific by definition.
+- **This rule has two identical copies**, like `workflow-docs.md`: `.claude/rules/concept-docs.md`
+  for Claude Code and `.clinerules/concept-docs.md` for Cline, since neither agent reads the other's
+  directory. Edit both together; `validate-workflow-docs`'s `rule-copy` check fails when they differ.
 
 ## Enforcement status
 

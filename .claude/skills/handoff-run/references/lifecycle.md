@@ -117,6 +117,5 @@ Ordered; do not interleave:
 ## Commit & push
 
 Bookkeeping edits ride with the work's commit(s) where possible, message per repo
-convention. Push stays deliberate (the repo's `CLAUDE.md` push policy — workspace-level
-where the repo is a submodule): push when the work was agreed/asked, never as an
-automatic router side effect.
+convention. Push stays deliberate (the repo's `AGENTS.md` push policy): push when the
+work was agreed/asked, never as an automatic router side effect.
