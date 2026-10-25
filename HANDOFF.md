@@ -45,13 +45,19 @@ TOOL-8's `dev-health` docker path against the real `htui-postgres` (`docs/htui-d
 install and `tsc` on the mod; TOOL-10's real `scripts/hr up` and Docker bats case; ANA-30's checks of
 which credit the $100 is (Console) and of stored ACP `session_info_update` titles (`docs/ANA-30.md` §8
 calls 2, 6).
-Live coordinates after MOD-96: migrations run through `0018_seed_permission_mode` (MOD-96: data only, pins
-`acp.permission_mode` on the seeded `claude` row), before it `0017_follow_up` (`run_command.run_step_id`,
-`text`; `follow_up_window`; MOD-12's `0016_auto_queue`: `queue_entry`, `queue_batch`, `run.batch_id`), so **the next
-migration is `0019`** (cache: through `0005_run_step_opening`, next `0006`). MOD-37's `0014_run_step_opening` and MOD-11's queue migration both landed as
-`0014`; MOD-11's was renumbered at the merge, and MOD-70's `0016` became `0017` at the merge with MOD-12. Pins: store
-conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
-`htui-orch` `CASES` 109 (`htui-orch/tests/fake_conformance.rs`); Postgres tables 45.
+Live coordinates after MOD-163 M1 (checked against the tree 2026-10-25): migrations run through `0022_memory`
+(MOD-163 M1: `memory_entry`, `memory_entry_revision`; not mirrored), before it `0021_project_type` (MOD-146:
+`project_type`, `project.type`), `0020_step_graph_v2` (MOD-137: `step_graph_edge`, `phase_part`, owner scope,
+`revision`) and `0019_stop_runs` (MOD-125 M1: `stopped` status, `run.workspace_id`, `queue_entry.workspace_id`,
+`workspace_stop`), so **the next migration is `0023`** (cache: through `0007_project_type`, next `0008`;
+`0006_run_workspace` mirrors `run.workspace_id`). Cache `schema_version` is `PgStore::schema_version()`, the highest
+migration number, so any new migration forces one mirror rebuild per box. Numbers collide when branches run in parallel:
+MOD-146's and MOD-163's both landed as `0020` and were renumbered `0021` and `0022` at their merges (as MOD-11's and
+MOD-70's were before), so a branch adding a migration renumbers at merge time and repins
+`htui-store/tests/migrations.rs`. Items that still owe one include MOD-139 (and its cache mirror), MOD-143, MOD-144,
+MOD-147 and MOD-159. Pins: store conformance `CASES` 206 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
+`htui-orch` `CASES` 109 (`htui-orch/tests/fake_conformance.rs`); Postgres tables 51
+(`htui-store/tests/migrations.rs` `TABLES`).
 ---
 
 ## Open items
@@ -526,7 +532,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   amended (2026-10-20). Not blocked for project scope; "must". PRD
   `.claude/prds/mod-163-memory-entry-store.prd.md` (Q1 dedicated table, Q2 interim pane in Settings, Q3
   switch here, Q4 left-out line is a count only). **Phase M1 landed (`hr/MOD-163`, 2026-10-21):** entry
-  store: `memory_entry` and its revisions (migration 0020), `MemorySubject`/`MemoryBody` scrubbed and
+  store: `memory_entry` and its revisions (migration `0022_memory`, written as 0020 and renumbered at the
+  merge after MOD-137's and MOD-146's), `MemorySubject`/`MemoryBody` scrubbed and
   capped at construction, create/amend/retire/supersede/list on MemStore and PgStore (the cache answers
   none); a subject clash is refused naming the live entry, and M3 asks edit or replace. M2 (prompt
   section) and M3 (TUI pane, switch) open; review deferrals in the M1 plan.
@@ -757,6 +764,16 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   prompt disagree. No decision records the departure. Record the workspace on the run when it is
   queued (a run started with no workspace keeps project scope, `R-ENT-2`) and pass it to the engine;
   pin preview/engine equality with a test. Not blocked.
+  **Narrowed by MOD-125 M1 (note 2026-10-25, checked against the tree):** the recording half is done.
+  `0019_stop_runs` added `run.workspace_id` (cache `0006_run_workspace`), `Run.workspace_id` carries it
+  (`htui-core/src/model/run.rs`), and the Backlog's run start (`Some(ctx.scope.workspace_id)`) and the queue
+  runner (`queue_entry.workspace_id` → `enqueue_in_batch`) both record it. What remains: in `phase_spec`
+  (`engine.rs` ~5990) build `PromptScope { workspace: run.workspace_id, project }` instead of
+  `PromptScope::project_only`, since `run` is already a parameter there; add the preview/engine equality test;
+  check whether the TUI's nil startup scope (`WorkspaceId::default()`, `app/update.rs` `has_scope`) can reach
+  `StartRun`/`QueueItem` as `Some(nil)`; and record that this changes `prompt_digest` for a run whose
+  upstream items sit in other projects of its workspace. Small; touches `engine.rs`, so merge it before
+  MOD-138's rebase.
 - [ ] **MOD-103 - Chat tab per session, and a project choice for a free-standing chat** (from the
   2026-10-14 requirements audit). `R-TUI-1`, `R-TUI-6`. `register_all` registers one `ChatTab`
   (`crates/htui/src/app/mod.rs:84`) holding one `session: Option<ChatSessionState>`
@@ -1165,7 +1182,8 @@ conformance `CASES` 164 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
   rule), with `template_name` resolved in the run's project. Not blocked.
 - [ ] **MOD-139 - Divided fan-out runtime: planner, parts, integrate** (from ANA-33, `docs/ANA-33.md` §7.4, §7.5,
   §7.7, §7.8, §7.11, §10). `R-ORCH-7`, `R-ORCH-8`, `R-ORCH-11`, `R-MCP-3`. Migration: `run_step.role`,
-  `parent_step_id` and `node_key`; `run_plan` (append-only); cache mirror `0006` for both. Planner expansion and the
+  `parent_step_id` and `node_key`; `run_plan` (append-only); a cache mirror migration for both (the next free
+  cache number; `0006` and `0007` are taken by MOD-125 and MOD-146). Planner expansion and the
   one-transaction admission (`base_refs`, part rows `pending`), default-parts revision 0; parts branch from
   `base_refs` with their own `{{part}}` prompt and agent; part documents excluded from generic `input_kinds` (ANA-2
   invariant 8 extended) and shown to integrate through `{{parts}}`; per-part retry, and the whole step fails on an
