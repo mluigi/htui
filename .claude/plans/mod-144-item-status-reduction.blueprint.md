@@ -1,5 +1,14 @@
 # Blueprint: MOD-144 — item status reduced to open, blocked, closed
 
+> **Maintainer override (2026-10-27, PD18) — wins over every line below that disagrees.** The close-out
+> law refuses `done` and `concluded` on a `blocked` item: `closes_from(self, status, finished)` is
+> `Done | Concluded => status == Open && finished`, the other four `=> matches!(status, Open | Blocked)`.
+> `default_for` for a `blocked` item returns `Withdrawn` (finished or not). Consequently:
+> `close_out_law_reads_the_latest_graph_run` asserts *blocked + finished → `done` refused* (not allowed);
+> `a_blocked_finished_preview_offers_all_six` becomes `a_blocked_finished_preview_offers_the_four_non_done`;
+> any B2/T3.3/T5 sentence saying a blocked finished item may close `done` is void. The person unblocks
+> (`blocked → open`) and then closes as `done`.
+
 **Plan**: `.claude/plans/mod-144-item-status-reduction.plan.md` (CONFIRMED 2026-10-27; Decisions A, B, C
 as recommended). **Design**: `docs/ANA-35.md` §6, §7.1, §7.10.
 No source file is written by this blueprint. Line anchors are from `hr/MOD-144` at `d273067f`.
@@ -28,7 +37,7 @@ Tasks: T1 (htui-core) → {T2 (htui-store) ∥ T3 (htui-orch)} → {T3b (htui-wo
 | PD15 | T6: CONCEPTS "if it states the eight statuses" | `CONCEPTS.md:51-52` and `docs/REQUIREMENTS.md:272-283` (R-ENT-8, amended 2026-10-18) already state the three-status model | T6 edits README and HANDOFF only |
 | PD16 | T5: Body renders the `ItemState` | Body gets `StoreReply::Item` (`Item`, no run fact; `body.rs:99-103`) | Body also keeps the `Runs` reply and derives the state with the core helper (B4) |
 | PD17 | — | `htui/src/store_worker.rs::ready_here` is a readiness consumer in the binary (tests `:3973-4067`) | Follows `ItemFilter`; only test literals move (T5) |
-| PD18 | Close-out law: "`rejected`/… close `open` or `blocked`"; `done`/`concluded` "need a finished item" | Silent on blocked + finished | Architect's reading (B2): all six need `open \| blocked`; `done`/`concluded` additionally need `finished`. A blocked finished item may close `done`. Pinned by `close_out_law_reads_the_latest_graph_run` and `a_blocked_finished_preview_offers_all_six` |
+| PD18 | Close-out law: "`rejected`/… close `open` or `blocked`"; `done`/`concluded` "need finished item" | Silent on blocked + finished | **Maintainer decision 2026-10-27: refuse (ANA-35 §6 reading).** `done`/`concluded` need `status = open` AND finished; the four others need `open | blocked`. A blocked finished item is unblocked first, then closed. `default_for` on a `blocked` item is `withdrawn`. Supersedes B2, the tests named below are rewritten accordingly (see the override note at the top) |
 
 ## Blueprint decisions (on top of the plan's rules)
 
