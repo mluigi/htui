@@ -111,11 +111,13 @@ refusal when the readiness walker lands; MOD-139 and MOD-140 lift the other two.
   do the following in the same write: **if** the graph's edges equal `default_edges` of its phases
   *before* the write, they are replaced with `default_edges` of the phases *after* it. A graph whose edges
   were authored (not default) keeps them untouched; its new phase is an unlinked root, which the
-  validator accepts. Seeders, which write edges themselves, do not go through this path. The rule lives in
+  validator accepts. Palette phases are left out of the rule (blueprint A5: a palette node has no edges).
+  Seeders, which write edges themselves, do not go through this path. The rule lives in
   `graph_rules.rs` beside MOD-137's pure rules, so the two stores share one function.
 - **D8 — Migration `0023_default_edges_repair.sql`.** For every graph with no `if`, `asks_you` or `fails`
   edge, delete its `next` and `changes_requested` edges and re-insert `0020`'s backfill: the same SQL rule,
-  with `loop_limit` from the target's current `retry_limit`. Forward-only, idempotent. It adds no table or
+  with `loop_limit` from the target's current `retry_limit`, and (blueprint A5) palette phases left out, as
+  D7's rule leaves them out. Forward-only, idempotent. It adds no table or
   column, but `tests/migrations.rs`' count pins move (see the "new migration moves count pins" memory).
   There is no cache migration, because `step_graph_edge` is not mirrored. Renumber at merge if another
   branch takes `0023`.

@@ -6,7 +6,8 @@
 > §7.7, §10. Tree read at `4cd56ee0` (branch `hr/MOD-138`). The plan stays the spec. §0 lists where
 > the tree disagrees with it or where it is silent; rows marked **adopted** are implementation
 > detail or a corrected plan claim. Four rows need the maintainer: they are collected, with the
-> smallest amendment each, in **"Plan amendments needed"** at the end (A1–A4). Every SQL statement
+> smallest amendment each, in **"Plan amendments needed"** at the end (A1–A4; A5 was added during
+> T3, when the default-edge rule had to leave palette phases out). Every SQL statement
 > below was probed on the sandbox Postgres 16.15 (`localhost:5439`, scratch DB `bp138` built from
 > `0001`..`0022`, since dropped); §T3.2 and §T6.3 give the results.
 
@@ -380,6 +381,10 @@ pass: their only loop is `review → implement|fix` over the `next` chain.
 /// `None`: authored edges (left alone; a new phase is an unlinked root, which D9 accepts), or
 /// nothing moved. A cascade (`delete_phase`) needs no special case: an edge on the deleted phase is
 /// in `before_edges` but cannot be in `default_edges(after)`, so the shapes differ.
+/// (A5, adopted in T3:) palette phases are left out of both sides (`graph_rules::linear`): a
+/// palette node has no edges (MOD-137 rule e), so `default_edges` here always reads the
+/// non-palette phases; creating or deleting a palette phase moves no edge, and the chain runs
+/// past one.
 #[must_use]
 pub fn default_edges_follow(
     before_phases: &[StepGraphPhase],
@@ -618,8 +623,13 @@ async fn replace_edges(conn: &mut PgConnection, graph: StepGraphId, edges: &[Ste
 to prove it. The trait docs of `create_phase` / `update_phase` / `delete_phase`
 (`traits.rs:946-963`, `:977-990`, `:1049-1055`) each gain one sentence: "MOD-138 D7: on a
 default-edged graph the edges are re-derived in the same write; authored edges are left alone."
+`create_phase`'s doc also says a `palette` phase is left unlinked, so creating one moves no edge (A5).
 
 ### T3.2 Migration `crates/htui-store/migrations/0023_default_edges_repair.sql` (probed verbatim)
+
+The file as shipped (A5: the `NOT p.palette`, `NOT c.palette` and `NOT rv.palette` filters were
+added in T3; the probe below predates them and its eight graphs carry no palette phase, so its
+rows are unchanged by them):
 
 ```sql
 -- 0023_default_edges_repair.sql - MOD-138 milestone 1 (plan D7, D8). Forward-only (R-STO-5).
@@ -636,10 +646,12 @@ default-edged graph the edges are re-derived in the same write; authored edges a
 -- 'changes_requested' edges are deleted and 0020's backfill is applied again: a 'next' edge
 -- between each pair of phases adjacent in position order, and for each phase named 'review' a
 -- 'changes_requested' edge to the greatest earlier phase named 'implement', else to the phase just
--- before it in position order, with loop_limit = the target's retry_limit. seed::default_edges is
--- the same rule in Rust, pinned equal by a migration test. A graph that carries an authored edge
--- is left exactly as it is. revision is not bumped (0020 did not either): nothing holds a
--- replace_graph token across a migration.
+-- before it in position order, with loop_limit = the target's retry_limit. A palette phase is
+-- left out of both (a palette node has no edges, MOD-137's store rule): the chain runs past it and
+-- no loop starts or ends on it. seed::default_edges over the non-palette phases is the same rule
+-- in Rust (htui_core::store::default_edges_follow), pinned equal by a migration test. A graph that
+-- carries an authored edge is left exactly as it is. revision is not bumped (0020 did not
+-- either): nothing holds a replace_graph token across a migration.
 --
 -- Idempotent: a second application deletes and re-inserts the same (from, to, kind, loop_limit)
 -- rows. No table or column changes, step_graph_edge is not mirrored, so there is no cache
@@ -660,7 +672,8 @@ SELECT ordered.graph_id, ordered.id, ordered.next_id, 'next'
   FROM (SELECT p.graph_id, p.id,
                LEAD(p.id) OVER (PARTITION BY p.graph_id ORDER BY p.position) AS next_id
           FROM step_graph_phase p
-          JOIN mod138_repaired r ON r.graph_id = p.graph_id) ordered
+          JOIN mod138_repaired r ON r.graph_id = p.graph_id
+         WHERE NOT p.palette) ordered
  WHERE ordered.next_id IS NOT NULL;
 
 INSERT INTO step_graph_edge (graph_id, from_phase_id, to_phase_id, kind, loop_limit)
@@ -671,9 +684,11 @@ SELECT rv.graph_id, rv.id, t.id, 'changes_requested', t.retry_limit
                        FROM step_graph_phase c
                       WHERE c.graph_id = rv.graph_id
                         AND c.position < rv.position
+                        AND NOT c.palette
                       ORDER BY (c.name = 'implement') DESC, c.position DESC
                       LIMIT 1) t
- WHERE rv.name = 'review';
+ WHERE rv.name = 'review'
+   AND NOT rv.palette;
 ```
 
 The temporary table relies on sqlx running each migration in one transaction, which is its
@@ -719,6 +734,11 @@ After applying the file (`-1`):
 A second application gave the same 18 rows (`diff` empty). Every `revision` stayed 0. `solo` and
 `empty` have no edges.
 
+T3 added two palette probe graphs to the migration test (A5): `palette` (`plan`, palette `spare`,
+`review`) gets `plan → review` `next` and `review → plan` `changes_requested` (the chain runs past
+`spare`, the fallback loop skips it); `palette-review` (`implement`, palette `review`) gets no
+edge. The pinned table is the 18 rows above plus those 2: 20 rows.
+
 ### T3.3 Pins that move (`0023`; the "new migration moves count pins" memory)
 
 - `tests/connect.rs:140`, `:242`: `Pending(22)` → `Pending(23)`. The prose at `:141-142`,
@@ -738,15 +758,16 @@ A second application gave the same 18 rows (`diff` empty). Every `revision` stay
 
 | Test | Asserts |
 |---|---|
-| `migrations.rs` `migration_0023_repairs_drifted_graphs_and_leaves_authored_ones` | `run_to(22)`; raw-seed the eight probe graphs (with `insert_graph` / `insert_phase`, `:2003-2030`, and a raw edge helper like `try_edge`); `run`; `edge_names(pool)` equals the table above; `authored` and `asks` keep their **edge ids**; `revision` all 0 |
-| `migrations.rs` `migration_0023_equals_default_edges` | per repaired graph, the stored `(from, to, kind, loop_limit)` set equals `seed::default_edges(rows)` (the `migration_0020_backfill_equals_default_edges` shape, `:2271-2370`) |
+| `migrations.rs` `migration_0023_repairs_drifted_graphs_and_leaves_authored_ones` | `run_to(22)`; raw-seed the eight probe graphs, plus `palette` and `palette-review` (A5) (with `insert_graph` / `insert_phase`, `:2003-2030`, and a raw edge helper like `try_edge`); `run`; `edge_names(pool)` equals the table above; `authored` and `asks` keep their **edge ids**; `revision` all 0 |
+| `migrations.rs` `migration_0023_equals_default_edges` | per repaired graph, the stored `(from, to, kind, loop_limit)` set equals `seed::default_edges(rows)` over the non-palette rows (A5) (the `migration_0020_backfill_equals_default_edges` shape, `:2271-2370`) |
 | conformance `create_phase_keeps_a_default_graph_default_edged` | scratch `plan, implement, review` (now default by induction) → `edge_shape` = default; append `docs@3` → still default; revision +1 per write |
 | conformance `update_phase_keeps_a_default_graph_default_edged` | move `review` to position 9 → default; rename `implement` → `build` (the loop now targets the previous phase, the same id: shape unchanged); rename `review` → `check` → the loop edge goes; one bump each |
 | conformance `delete_phase_keeps_a_default_graph_default_edged` | delete the middle phase → `next` re-chains around it, the loop re-targets |
 | conformance `per_row_writers_leave_authored_edges_alone` | `replace_graph` adds `review → plan` `asks_you`; then create, move, rename and delete → the edges are exactly the authored set minus the cascade |
+| conformance `create_phase_leaves_a_palette_phase_unlinked` (A5) | creating a `palette` phase on a default-edged graph moves no edge; the graph's read-back body saves through `replace_graph` unchanged |
 
-`CASES` 210 → **214** (both pins, prose "…, and four for the per-row writers' default edges (plan
-D7)"). Re-run every MOD-137 case (F17).
+`CASES` 210 → **215** (both pins, prose "…, and five for the per-row writers' default edges (plan
+D7)"; the fifth is A5's palette case). Re-run every MOD-137 case (F17).
 
 ### T3 commits
 
@@ -829,7 +850,8 @@ so **no `.sqlx` change**. `sqlx::raw_sql` matches `graph_body`'s use.
    - (a) the first node, in position order, whose role is not `step` →
      `NotYetRunnable { node: <the divide phase's name>, reason: NotRunnable::Divide }`;
    - (b) the first `palette` node → `NotRunnable::Palette`;
-   - (c) `resolved.edges` versus `seed::default_edges(&rows, EdgeId::new)` as multisets of
+   - (c) `resolved.edges` versus `seed::default_edges` of the non-palette rows (A5: the rule D7
+     and `0023` keep; moot in M1 while (b) refuses any palette node first) as multisets of
      `(from id, to id, kind, loop_limit, predicate none)`. On a difference, `node` is the `from`
      name of the first stored edge (stored order) absent from the defaults, else the `from` name of
      the first default edge absent from the store → `NotRunnable::NonDefaultEdges`.
@@ -1169,7 +1191,7 @@ Implementors:
 | `graph.rs` `an_items_run_resolves_a_library_graph_with_the_projects_templates` | kind default = a library graph with a `review` phase; resolve → `graph.scope == Some(Library)`, template version from the item's project |
 | `graph.rs` `an_override_of_a_library_graph_clones_into_the_project` | `override_graph` → the clone's scope is `Project(item.project_id)`, edges copied; a re-override re-clones from the library graph |
 
-Store `CASES` 214 → **217** (both pins; prose "…, and three for D12's usable graphs (plan D12)").
+Store `CASES` 215 → **218** (both pins; prose "…, and three for D12's usable graphs (plan D12)").
 `READ_CASES` stays 15 (`usable_graphs` is on `WriteStore`).
 
 ### T6 commits
@@ -1188,7 +1210,7 @@ Store `CASES` 214 → **217** (both pins; prose "…, and three for D12's usable
 |---|---|
 | T1 | `htui-core`: `model/run.rs`, `model/mod.rs`, `seed.rs`, `fixtures.rs`, `store/mem.rs` (literal `:13436`, `set_run_snapshot`), `store/conformance.rs` (literal `:5173`). `htui-orch`: `command.rs`, `graph.rs` (literals), `engine.rs` (literals), `tests/fixtures.rs`. Plus `htui-agent/tests/relay.rs`, `htui-mcp/tests/tools_backlog.rs`, `htui-store/tests/{cache,pg_criteria}.rs`, `htui/tests/backlog.rs` |
 | T2 | `htui-core`: `store/graph_rules.rs`, `store/traits.rs`, `store/mod.rs`, `store/mem.rs` (`replace_graph`), `store/conformance.rs`, `tests/mem_store.rs`. `htui-store`: `pg/write.rs` (`replace_graph`), `tests/pg_conformance.rs`. `htui-orch/src/graph.rs` (`override_graph` pre-check) |
-| T3 | `store/mem.rs` (3 writers + helper), `store/traits.rs` (docs), `store/conformance.rs`, `tests/mem_store.rs`; `pg/write.rs` (3 writers + helpers), `migrations/0023_default_edges_repair.sql`, `tests/{migrations,connect,pg_conformance}.rs` |
+| T3 | `store/mem.rs` (3 writers + helper), `store/traits.rs` (docs), `store/graph_rules.rs` (`linear` and its test, A5), `store/conformance.rs`, `tests/mem_store.rs`; `pg/write.rs` (3 writers + helpers), `migrations/0023_default_edges_repair.sql`, `tests/{migrations,connect,pg_conformance}.rs` |
 | T4 | `model/kind.rs`, `store/mem.rs` (`resolve_graph` + test), `pg/read.rs`, `htui-store/tests/pg_criteria.rs`, `htui-orch/src/graph.rs`, `htui-orch/tests/fixtures.rs`, `tests/fixtures/feature.v2.snapshot.json` |
 | T5 | `htui-orch/src/{engine.rs,conformance.rs,fake.rs}`, `htui-orch/tests/fake_conformance.rs`, `htui-worker/src/runtime.rs` |
 | T6 | `store/{graph_rules,traits,mod,mem,conformance}.rs`, `model/item_spec.rs`, `tests/mem_store.rs`; `pg/{read,write}.rs`, `writer.rs`, `tests/pg_conformance.rs`, `.sqlx/`; `htui-agent/src/conformance.rs`, `htui-agent/tests/recorder.rs`; `htui/src/{item_writes,catalogue}.rs`, `htui/src/ui/tabs/settings/kinds.rs`, `htui/src/ui/tabs/backlog/item_form.rs`, `htui/tests/kinds.rs`; `htui-orch/src/graph.rs` (tests, docs) |
@@ -1299,3 +1321,15 @@ psql -h localhost -p 5439 -U postgres -c "CREATE DATABASE prep138"; \
   library, by name. It has five implementors (MemStore, PgStore, `Writer`, and the two
   `htui-agent` spies) and one new `query_as!`, so `cargo sqlx prepare` is needed. T6's file set
   grows by `writer.rs`, the two spy files and `.sqlx/`.
+- **A5 — the default-edge rule leaves palette phases out (found in T3).** D7 and D8 as written
+  apply `seed::default_edges` to every phase. A palette node may carry no edge (MOD-137 rule e), so
+  `create_phase` of a palette row on a default-edged graph would chain a `next` onto it, and
+  `replace_graph` would then refuse the graph's own read-back body. **Adopted amendment:** the rule
+  reads only the non-palette phases. `default_edges_follow` filters both sides through
+  `graph_rules::linear` (an edit to T2's `graph_rules.rs`, outside T3's file set), and `0023` adds
+  `NOT p.palette` / `NOT c.palette` / `NOT rv.palette` (§T3.2 shows the shipped file). The chain
+  runs past a palette phase and no loop starts or ends on one. One more store-conformance case,
+  `create_phase_leaves_a_palette_phase_unlinked`, moves `CASES` to 215 at T3 and T6's pin to
+  215 → 218. Downstream: D6(c) compares against the same palette-excluding rule (moot in M1, since
+  (b) refuses a palette node first); the v1 lift (`default_snapshot_edges`) is unaffected, as
+  every v1 phase has `palette = false`.
