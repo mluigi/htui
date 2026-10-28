@@ -307,8 +307,10 @@ impl Cli {
 
     /// The one place a `git` child's environment and stdio are shaped.
     ///
-    /// `SCRUBBED_ENV` is removed; `LC_ALL=C` pins the English the classifier and the conflict
-    /// branch match; `GIT_TERMINAL_PROMPT=0` keeps a verb from blocking on a tty;
+    /// `SCRUBBED_ENV` is removed, and so is `HTUI_OWN_ENV` (MOD-158 D5, `R-SEC-2`: a verb runs
+    /// the managed repository's hooks, which are repository code); `LC_ALL=C` pins the English
+    /// the classifier and the conflict branch match; `GIT_TERMINAL_PROMPT=0` keeps a verb from
+    /// blocking on a tty;
     /// `GIT_OPTIONAL_LOCKS=0` stops `git` refreshing the index opportunistically and taking
     /// `index.lock` under a concurrent `gix` read; `GIT_ADVICE=0` suppresses the `hint:` lines
     /// 2.42+ would otherwise print after the `fatal:` one. The last two are simply ignored by a
@@ -317,6 +319,9 @@ impl Cli {
         let mut command = tokio::process::Command::new(&self.binary);
         command.current_dir(cwd);
         for key in SCRUBBED_ENV {
+            command.env_remove(key);
+        }
+        for key in htui_core::secret::HTUI_OWN_ENV {
             command.env_remove(key);
         }
         command
@@ -3004,9 +3009,25 @@ mod tests {
         }
         assert_eq!(
             envs.len(),
-            SCRUBBED_ENV.len() + 4,
+            SCRUBBED_ENV.len() + htui_core::secret::HTUI_OWN_ENV.len() + 4,
             "the child environment is shaped in exactly one place: {envs:?}"
         );
+    }
+
+    /// MOD-158 D5 (`R-SEC-2`), blueprint P-9a: a `git` verb runs the managed repository's hooks,
+    /// which are repository code, so htui's own secret variables are removed from it.
+    #[cfg(unix)]
+    #[test]
+    fn the_git_command_removes_htui_own_env() {
+        let cli = usable_or_fake(&tempfile::tempdir().expect("a temporary directory"));
+        let command = cli.command(std::path::Path::new("."));
+        let envs: Vec<_> = command.as_std().get_envs().collect();
+        for key in htui_core::secret::HTUI_OWN_ENV {
+            assert!(
+                envs.contains(&(OsStr::new(key), None)),
+                "{key} is not removed from the git child: {envs:?}"
+            );
+        }
     }
 
     /// A verb that outlives its budget is killed with its whole process group, and says so.

@@ -739,10 +739,20 @@ const PATIENCE: Duration = Duration::from_secs(10);
 /// streaming case sidesteps it is to have no file at all (`tests/probe.rs:1042`).
 #[cfg(unix)]
 async fn spawn_sh(script: &str, cwd: &std::path::Path) -> Spawned {
+    spawn_sh_with_env(script, BTreeMap::new(), cwd).await
+}
+
+/// [`spawn_sh`] with a launch environment, as a resolved `agent.launch` row carries one.
+#[cfg(unix)]
+async fn spawn_sh_with_env(
+    script: &str,
+    env: BTreeMap<String, String>,
+    cwd: &std::path::Path,
+) -> Spawned {
     let launch = ResolvedLaunch {
         command: "/bin/sh".to_owned(),
         args: vec!["-c".to_owned(), script.to_owned()],
-        env: BTreeMap::new(),
+        env,
     };
     htui_agent::launch::spawn(&launch, cwd)
         .await
@@ -1106,5 +1116,95 @@ async fn a_signal_reaches_the_whole_process_group() {
     assert!(
         gone(&helper).await,
         "the helper the fixture spawned was never named by this test, and died with its group"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// htui's own secret variables never reach an agent (MOD-158 D5, `R-SEC-2`)
+// ---------------------------------------------------------------------------------------------
+
+/// The value the D5 cases plant. Never a real key.
+#[cfg(unix)]
+const QDRANT_KEY_SENTINEL: &str = "SENTINEL-QK";
+
+/// The script both D5 cases run: the key's `printenv` status, then a plain variable that must
+/// still arrive.
+#[cfg(unix)]
+const PRINT_THE_KEY: &str = "printenv HTUI_QDRANT_API_KEY; echo \"rc=$?\"; printenv PLAIN";
+
+/// Runs [`PRINT_THE_KEY`] under [`htui_agent::launch::spawn`] and answers its stdout.
+#[cfg(unix)]
+async fn print_the_key(env: BTreeMap<String, String>) -> String {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut spawned = spawn_sh_with_env(PRINT_THE_KEY, env, dir.path()).await;
+    let stdout = spawned.read_stdout_to_end().await.expect("stdout reads");
+    spawned.wait().await.expect("the child exits");
+    stdout
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_launch_env_cannot_hand_an_agent_htui_qdrant_api_key() {
+    let env = BTreeMap::from([
+        (
+            htui_core::secret::QDRANT_KEY_ENV.to_owned(),
+            QDRANT_KEY_SENTINEL.to_owned(),
+        ),
+        ("PLAIN".to_owned(), "kept".to_owned()),
+    ]);
+    let stdout = print_the_key(env).await;
+    assert!(
+        stdout.contains("rc=1"),
+        "printenv finds no key, got {stdout:?}"
+    );
+    assert!(
+        stdout.contains("kept"),
+        "a plain launch variable still arrives, got {stdout:?}"
+    );
+    assert!(
+        !stdout.contains(QDRANT_KEY_SENTINEL),
+        "the key reached the agent: {stdout:?}"
+    );
+}
+
+/// The inherited half: a test cannot plant the variable in its own process (`set_var` is
+/// `unsafe`, `unsafe_code = "forbid"`), so it re-runs itself, alone, as a child test binary that
+/// inherits it, and the child spawns the agent and asserts (`htui/src/editor.rs`'s pattern).
+#[cfg(unix)]
+#[tokio::test]
+async fn an_inherited_htui_qdrant_api_key_never_reaches_an_agent() {
+    const CHILD: &str = "HTUI_AGENT_LAUNCH_TEST_ENV_CHILD";
+    const NAME: &str = "an_inherited_htui_qdrant_api_key_never_reaches_an_agent";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([NAME, "--exact", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env(htui_core::secret::QDRANT_KEY_ENV, QDRANT_KEY_SENTINEL)
+            .output()
+            .expect("re-run the test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A filter that matched nothing would also succeed.
+        assert!(stdout.contains("1 passed"), "child ran no test:\n{stdout}");
+        return;
+    }
+    // The child: the key is inherited, so without the strip the agent would see it.
+    assert_eq!(
+        std::env::var(htui_core::secret::QDRANT_KEY_ENV).as_deref(),
+        Ok(QDRANT_KEY_SENTINEL)
+    );
+    let stdout = print_the_key(BTreeMap::from([("PLAIN".to_owned(), "kept".to_owned())])).await;
+    assert!(
+        stdout.contains("rc=1"),
+        "printenv finds no key, got {stdout:?}"
+    );
+    assert!(stdout.contains("kept"), "got {stdout:?}");
+    assert!(
+        !stdout.contains(QDRANT_KEY_SENTINEL),
+        "the inherited key reached the agent: {stdout:?}"
     );
 }
