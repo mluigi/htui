@@ -13,7 +13,7 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 
-use htui_core::model::{Item, ItemId, ItemState, RunSummary, latest_graph_run};
+use htui_core::model::{Item, ItemId, ItemState, RunStatus, Status, latest_graph_run};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span, Text};
@@ -32,16 +32,15 @@ const HEAD: u16 = 4;
 
 /// Title, key, kind, state, tags, priority, version, and the body reflowed and wrapped at the
 /// pane's width (see the module doc). The state is the item's derived
-/// [`ItemState`](htui_core::model::ItemState) mark (MOD-144), so the pane keeps the `Runs` reply
-/// beside the `Item` one.
+/// [`ItemState`](htui_core::model::ItemState) mark (MOD-144), so the pane keeps the latest graph
+/// run of the `Runs` reply beside the `Item` one.
 #[derive(Debug, Default)]
 pub struct BodyTab {
-    /// The selected item, from the last `on_item_change`.
-    selected: Option<ItemId>,
     /// The `Item` reply for the selected item.
     item: Option<Item>,
-    /// MOD-144: the selected item's runs (`Runs` reply), for its display state.
-    runs: Option<Vec<RunSummary>>,
+    /// MOD-144: the status of the selected item's latest graph run, read once from the `Runs`
+    /// reply: `None` until one lands, `Some(None)` for an item with no such run.
+    latest: Option<Option<RunStatus>>,
     /// Scroll of the body paragraph, not of the head block.
     scroll: Scroll,
     /// The body area's width at the last render, for the scroll clamp (MOD-84 D7); 0 before the
@@ -67,15 +66,15 @@ impl BodyTab {
             .map_or(0, |item| markdown::row_count(&item.body, self.drawn.get()))
     }
 
-    /// The item's derived state: its stored status over its latest graph run, `open` until the
-    /// `Runs` reply lands.
-    fn state(&self, item: &Item) -> ItemState {
-        let latest = self
-            .runs
-            .as_deref()
-            .and_then(latest_graph_run)
-            .map(|run| run.status);
-        ItemState::of(item.status, latest)
+    /// The item's derived state: its stored status over its latest graph run. `None` for an `open`
+    /// item until the `Runs` reply lands (or when the read failed): its runs decide between
+    /// `open`, `running`, `needs you` and the rest, so the pane must not guess `open`. A `blocked`
+    /// or `closed` item reads its status at once, whatever its runs.
+    fn state(&self, item: &Item) -> Option<ItemState> {
+        match (item.status, self.latest) {
+            (Status::Open, None) => None,
+            (status, latest) => Some(ItemState::of(status, latest.flatten())),
+        }
     }
 }
 
@@ -88,10 +87,9 @@ impl DetailTab for BodyTab {
         "Body"
     }
 
-    fn on_item_change(&mut self, item: Option<ItemId>) {
-        self.selected = item;
+    fn on_item_change(&mut self, _item: Option<ItemId>) {
         self.item = None;
-        self.runs = None;
+        self.latest = None;
         self.scroll.reset();
     }
 
@@ -122,9 +120,12 @@ impl DetailTab for BodyTab {
                 self.item = (**item).clone();
                 self.scroll.reset();
             }
-            // A reply for another item (a late one after a move) is not this item's.
-            StoreReply::Runs(runs) if runs.iter().all(|run| run.item_id == self.selected) => {
-                self.runs = Some(runs.clone());
+            // The reply carries no item id; the shell's staleness gate keeps it this item's
+            // (`App::on_reply`): every `Runs` read the Backlog tab sends is for its selection, and
+            // a move sends a new one, so a late reply for the item left behind is dropped before
+            // it reaches a sub-tab. An empty reply is an item with no run.
+            StoreReply::Runs(runs) => {
+                self.latest = Some(latest_graph_run(runs).map(|run| run.status));
             }
             _ => {}
         }
@@ -147,7 +148,11 @@ impl DetailTab for BodyTab {
             Span::styled(item.key_prefix.as_str(), ctx.theme.dim),
             Span::raw("  "),
         ];
-        key_line.extend(status::spans(self.state(item), ctx.theme));
+        match self.state(item) {
+            Some(state) => key_line.extend(status::spans(state, ctx.theme)),
+            // Not the `open` mark: the runs have not been read, so the state is not known yet.
+            None => key_line.push(Span::styled("...", ctx.theme.dim)),
+        }
         let head = Text::from(vec![
             Line::styled(item.title.as_str(), ctx.theme.title),
             Line::from(key_line),
@@ -268,9 +273,10 @@ mod tests {
         assert!(!rows.iter().any(|row| row.contains('`')), "{rows:#?}");
     }
 
-    /// MOD-144 (PD16): the key line shows the derived state. Until the `Runs` reply lands it is
-    /// the stored status over no run (`open`); another item's late `Runs` reply is not this
-    /// item's; a move to another item forgets the runs.
+    /// MOD-144 (PD16, R1 M3): the key line shows the derived state. Until the `Runs` reply lands
+    /// an `open` item shows a dim placeholder, never the `open` mark its runs may contradict; the
+    /// reply's latest graph run decides it, an empty reply reading `open` (no run); a move to
+    /// another item forgets it. A `blocked` item reads `blocked` at once.
     #[tokio::test]
     async fn the_key_line_reads_the_latest_graph_run() {
         let shell = Shell::new();
@@ -281,32 +287,48 @@ mod tests {
         pane.on_reply(&StoreReply::Item(Box::new(item.clone())), &mut shell.ctx());
         assert_eq!(
             rows(&pane, &shell, 43, 30)[1],
-            "FEAT-1  FEAT  \u{25cb} open"
-        );
-
-        let other = store.runs(ids::HTUI_CLEAN_1).await.expect("CLEAN-1's runs");
-        assert!(!other.is_empty(), "CLEAN-1 has a failed run");
-        pane.on_reply(&StoreReply::Runs(other), &mut shell.ctx());
-        assert_eq!(
-            rows(&pane, &shell, 43, 30)[1],
-            "FEAT-1  FEAT  \u{25cb} open",
-            "CLEAN-1's runs are not FEAT-1's"
+            "FEAT-1  FEAT  ...",
+            "no runs read yet: not `open`"
         );
 
         let runs = store.runs(ids::HTUI_FEAT_1).await.expect("FEAT-1's runs");
-        pane.on_reply(&StoreReply::Runs(runs), &mut shell.ctx());
+        pane.on_reply(&StoreReply::Runs(runs.clone()), &mut shell.ctx());
         assert_eq!(
             rows(&pane, &shell, 43, 30)[1],
             "FEAT-1  FEAT  \u{25d0} running",
             "the rework run RUN_4 is the latest"
         );
 
-        pane.on_item_change(Some(ids::HTUI_FEAT_1));
-        pane.on_reply(&StoreReply::Item(Box::new(item)), &mut shell.ctx());
+        pane.on_reply(&StoreReply::Runs(Vec::new()), &mut shell.ctx());
         assert_eq!(
             rows(&pane, &shell, 43, 30)[1],
             "FEAT-1  FEAT  \u{25cb} open",
+            "an empty reply is an item with no run"
+        );
+        pane.on_reply(&StoreReply::Runs(runs), &mut shell.ctx());
+        assert_eq!(
+            rows(&pane, &shell, 43, 30)[1],
+            "FEAT-1  FEAT  \u{25d0} running",
+            "each reply replaces the last"
+        );
+
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.on_reply(&StoreReply::Item(Box::new(item.clone())), &mut shell.ctx());
+        assert_eq!(
+            rows(&pane, &shell, 43, 30)[1],
+            "FEAT-1  FEAT  ...",
             "a move forgets the runs"
+        );
+
+        let blocked = item.map(|item| Item {
+            status: Status::Blocked,
+            ..item
+        });
+        pane.on_reply(&StoreReply::Item(Box::new(blocked)), &mut shell.ctx());
+        assert_eq!(
+            rows(&pane, &shell, 43, 30)[1],
+            "FEAT-1  FEAT  \u{2298} blocked",
+            "a blocked item needs no runs to read `blocked`"
         );
     }
 
