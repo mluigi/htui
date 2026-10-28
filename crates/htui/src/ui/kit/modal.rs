@@ -1,4 +1,9 @@
-//! The modal frame over [`layout::centered`](crate::ui::layout::centered) (MOD-115).
+//! The modal frame over [`layout::centered`](crate::ui::layout::centered) (MOD-115), the one
+//! overlay rule (MOD-115 M4 C3: what a modal leaves visible is faded with
+//! [`Theme::backdrop`](crate::ui::Theme::backdrop)), and the two kinds of box built on it: a
+//! question ([`Ask`], C7) and the help box ([`help`]).
+
+use std::borrow::Cow;
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -8,8 +13,10 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear};
 
 use crate::app::Handled;
 use crate::keys::{KeyChord, Stack};
-use crate::ui::Theme;
+use crate::ui::kit::text::wrapped;
 use crate::ui::layout::centered;
+use crate::ui::text_field::TextField;
+use crate::ui::{Theme, cells};
 
 /// Columns a modal's chrome takes around its content: the left border, the right border and one
 /// column of right padding.
@@ -139,6 +146,227 @@ fn backdrop(buffer: &mut Buffer, area: Rect, box_area: Rect, theme: &Theme) {
             }
         }
     }
+}
+
+/// The content width an [`Ask`] grows to unless told otherwise.
+const ASK_WIDTH: u16 = 60;
+
+/// A question in a modal (MOD-115 M4 E3): what is asked, optionally a typed answer, the keys on
+/// the bottom border.
+///
+/// The box fits its content (`ModalSize::Fit`, so it keeps the margin and fades the rest): as
+/// wide as its widest line, its input, its title and its hint (and one rule cell) ask for, at
+/// most [`Ask::width`]; as tall as the question wrapped to that width, then, with an input, one
+/// blank row, the input row and the error under it.
+#[derive(Debug, Clone)]
+pub struct Ask<'a> {
+    title: &'a str,
+    lines: Vec<Line<'a>>,
+    input: Option<(&'a str, &'a TextField)>,
+    error: Option<Cow<'a, str>>,
+    hint: Option<&'a str>,
+    width: u16,
+}
+
+impl<'a> Ask<'a> {
+    /// A question titled `title`, with no lines yet; its content grows to 60 cells.
+    #[must_use]
+    pub fn new(title: &'a str) -> Self {
+        Self {
+            title,
+            lines: Vec::new(),
+            input: None,
+            error: None,
+            hint: None,
+            width: ASK_WIDTH,
+        }
+    }
+
+    /// A line of the question, wrapped to the content width. A line that fits is drawn as
+    /// given; a wrapped one keeps its line style (patched with its first span's), since its
+    /// words move between rows.
+    #[must_use]
+    pub fn line(mut self, line: impl Into<Line<'a>>) -> Self {
+        self.lines.push(line.into());
+        self
+    }
+
+    /// A typed answer: `prompt` in the title role, then the field's own line with its cursor.
+    #[must_use]
+    pub fn input(mut self, prompt: &'a str, field: &'a TextField) -> Self {
+        self.input = Some((prompt, field));
+        self
+    }
+
+    /// What is wrong with the answer, in the error role, wrapped, under the input.
+    #[must_use]
+    pub fn error(mut self, text: impl Into<Cow<'a, str>>) -> Self {
+        self.error = Some(text.into());
+        self
+    }
+
+    /// The keys, on the bottom border.
+    #[must_use]
+    pub fn hint(mut self, hint: &'a str) -> Self {
+        self.hint = Some(hint);
+        self
+    }
+
+    /// The widest the content grows, in cells.
+    #[must_use]
+    pub fn width(mut self, content: u16) -> Self {
+        self.width = content;
+        self
+    }
+
+    /// The rows the content needs at `content_width`: the question wrapped, then, with an
+    /// input, a blank row and the input row; the error's rows last.
+    #[must_use]
+    pub fn rows(&self, content_width: u16) -> u16 {
+        let question: usize = self
+            .lines
+            .iter()
+            .map(|line| wrap_line(line, content_width).len())
+            .sum();
+        let input = match self.input {
+            Some(_) if question > 0 => 2,
+            Some(_) => 1,
+            None => 0,
+        };
+        let error = self
+            .error
+            .as_deref()
+            .map_or(0, |error| wrapped(error, usize::from(content_width)).len());
+        u16::try_from(question + input + error).unwrap_or(u16::MAX)
+    }
+
+    /// The content width the box asks for: the widest of its lines, its input (prompt, text and
+    /// the cursor cell), its title and its hint, each with a rule cell to spare on the border,
+    /// at most [`Ask::width`].
+    fn wanted_width(&self) -> u16 {
+        let widest = self
+            .lines
+            .iter()
+            .map(|line| line_width(line))
+            .chain(self.input.map(|(prompt, field)| {
+                cells::cell_width(prompt) + cells::cell_width(field.text().unwrap_or("")) + 1
+            }))
+            .chain(self.error.as_deref().map(cells::cell_width))
+            .chain([cells::cell_width(self.title) + 1])
+            .chain(self.hint.map(|hint| cells::cell_width(hint) + 1))
+            .max()
+            .unwrap_or(1);
+        u16::try_from(widest)
+            .unwrap_or(u16::MAX)
+            .min(self.width)
+            .max(1)
+    }
+
+    /// Draws the question centred over `area` (fading the rest), returning the content rect.
+    pub fn render(self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) -> Rect {
+        // What the screen leaves the content: the `Fit` clamp, so the rows are counted at the
+        // width they are drawn at.
+        let room = area
+            .width
+            .saturating_sub(MARGIN_COLS)
+            .saturating_sub(CHROME);
+        let content_w = self.wanted_width().min(room);
+        let content_h = self.rows(content_w);
+        let mut modal = Modal::new(self.title).size(ModalSize::Fit {
+            content_w,
+            content_h,
+        });
+        if let Some(hint) = self.hint {
+            modal = modal.hint(hint);
+        }
+        let content = modal.render(frame, area, theme);
+
+        let mut rows: Vec<Line<'_>> = Vec::new();
+        for line in &self.lines {
+            rows.extend(wrap_line(line, content.width));
+        }
+        if let Some((prompt, field)) = self.input {
+            if !rows.is_empty() {
+                rows.push(Line::default());
+            }
+            let prompt_w = u16::try_from(cells::cell_width(prompt)).unwrap_or(u16::MAX);
+            let mut spans = vec![Span::styled(prompt, theme.title)];
+            spans.extend(
+                field
+                    .line(content.width.saturating_sub(prompt_w), true, theme)
+                    .spans,
+            );
+            rows.push(Line::from(spans));
+        }
+        if let Some(error) = self.error.as_deref() {
+            rows.extend(
+                wrapped(error, usize::from(content.width))
+                    .into_iter()
+                    .map(|row| Line::styled(row, theme.error)),
+            );
+        }
+        let buffer = frame.buffer_mut();
+        for (line, y) in rows.iter().zip(content.y..content.bottom()) {
+            buffer.set_line(content.x, y, line, content.width);
+        }
+        content
+    }
+}
+
+/// The cells `line` takes, measured as `ratatui` draws them.
+fn line_width(line: &Line<'_>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| cells::cell_width(&span.content))
+        .sum()
+}
+
+/// `line` as rows of at most `width` cells: itself when it fits, else its text wrapped
+/// ([`wrapped`]) in its line style patched with its first span's.
+fn wrap_line<'l>(line: &Line<'l>, width: u16) -> Vec<Line<'l>> {
+    if line_width(line) <= usize::from(width) {
+        return vec![line.clone()];
+    }
+    let style = line
+        .spans
+        .first()
+        .map_or(line.style, |span| line.style.patch(span.style));
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    wrapped(&text, usize::from(width))
+        .into_iter()
+        .map(|row| Line::styled(row, style))
+        .collect()
+}
+
+/// The help box (MOD-115 M4 E3, E7): a `Fixed` modal of `content_w` plus the chrome by the rows
+/// plus the borders, clamped to `area`, titled `title`, with `rows` drawn as given from the
+/// content's top. Returns the content rect.
+pub fn help(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    rows: &[Line<'_>],
+    content_w: u16,
+    theme: &Theme,
+) -> Rect {
+    let h = u16::try_from(rows.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(CHROME_ROWS);
+    let content = Modal::new(title)
+        .size(ModalSize::Fixed {
+            w: content_w.saturating_add(CHROME),
+            h,
+        })
+        .render(frame, area, theme);
+    let buffer = frame.buffer_mut();
+    for (line, y) in rows.iter().zip(content.y..content.bottom()) {
+        buffer.set_line(content.x, y, line, content.width);
+    }
+    content
 }
 
 /// What a modal mode answers for a `chord` none of its own acts took (MOD-67 M3 PA-5): `Pass`
@@ -437,6 +665,212 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The text of `rect`'s row `y` in `buffer`.
+    fn text_in(buffer: &Buffer, rect: Rect, y: u16) -> String {
+        (rect.x..rect.right())
+            .map(|x| buffer[(x, y)].symbol().to_owned())
+            .collect()
+    }
+
+    /// Draws `ask` over the whole of a `width` x `height` screen pre-filled with `#`; returns
+    /// the content rect and the buffer.
+    fn draw_ask(ask: Ask<'_>, width: u16, height: u16, theme: &Theme) -> (Rect, Buffer) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        let mut content = Rect::default();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                for y in 0..area.height {
+                    for x in 0..area.width {
+                        frame.buffer_mut()[(x, y)].set_symbol("#");
+                    }
+                }
+                content = ask.render(frame, area, theme);
+            })
+            .expect("draw");
+        (content, terminal.backend().buffer().clone())
+    }
+
+    #[test]
+    fn an_ask_draws_its_lines_then_the_input_and_the_hint_on_the_border() {
+        let theme = Theme::default();
+        let field = TextField::with_text("FEAT-1");
+        let ask = Ask::new("Close out")
+            .line("Type the item's key to close it.")
+            .input("key ", &field)
+            .hint("enter close  esc keep");
+        let (content, buffer) = draw_ask(ask, 80, 24, &theme);
+        let outer = box_of(&buffer);
+        assert!(row(&buffer, outer.y).contains(" Close out "));
+        assert_eq!(
+            text_in(&buffer, content, content.y).trim_end(),
+            "Type the item's key to close it."
+        );
+        assert_eq!(
+            text_in(&buffer, content, content.y + 1).trim(),
+            "",
+            "one blank row before the input"
+        );
+        let input = text_in(&buffer, content, content.y + 2);
+        assert!(input.starts_with("key FEAT-1"), "{input:?}");
+        assert!(
+            buffer[(content.x, content.y + 2)]
+                .modifier
+                .contains(Modifier::BOLD),
+            "the prompt is in the title role"
+        );
+        assert_eq!(content.height, 3, "the question, the blank, the input");
+        assert!(row(&buffer, outer.bottom() - 1).contains(" enter close  esc keep "));
+    }
+
+    #[test]
+    fn an_ask_without_an_input_has_no_blank_row() {
+        let ask = Ask::new("Cancel")
+            .line("Cancel the run?")
+            .line("Its steps stop.");
+        assert_eq!(ask.rows(40), 2);
+        let field = TextField::new();
+        let typed = Ask::new("Cancel")
+            .line("Cancel the run?")
+            .input("> ", &field);
+        assert_eq!(typed.rows(40), 3);
+    }
+
+    #[test]
+    fn the_input_row_keeps_the_cursor_visible() {
+        let theme = Theme::monochrome();
+        let field = TextField::with_text(&"x".repeat(200));
+        let ask = Ask::new("Type")
+            .line("A long answer.")
+            .input("answer ", &field);
+        let (content, buffer) = draw_ask(ask, 50, 12, &theme);
+        let y = content.y + 2;
+        let cursor = (content.x..content.right())
+            .filter(|&x| buffer[(x, y)].modifier.contains(Modifier::REVERSED))
+            .count();
+        assert_eq!(cursor, 1, "{:?}", text_in(&buffer, content, y));
+    }
+
+    #[test]
+    fn an_error_goes_under_the_input_in_the_error_role() {
+        let theme = Theme::default();
+        let field = TextField::with_text("FEAT-2");
+        let ask = Ask::new("Close out")
+            .line("Type the item's key.")
+            .input("key ", &field)
+            .error("That is not this item's key.");
+        let (content, buffer) = draw_ask(ask, 80, 24, &theme);
+        let y = content.y + 3;
+        assert_eq!(
+            text_in(&buffer, content, y).trim_end(),
+            "That is not this item's key."
+        );
+        assert_eq!(
+            buffer[(content.x, y)].fg,
+            theme.error.fg.unwrap_or_default()
+        );
+        assert_eq!(content.height, 4);
+    }
+
+    #[test]
+    fn a_long_question_wraps_and_the_box_grows() {
+        let theme = Theme::default();
+        let question = "word ".repeat(30);
+        let ask = Ask::new("Long").line(question.trim_end()).width(40);
+        assert_eq!(ask.rows(40), 4, "149 cells in rows of 40");
+        let (content, buffer) = draw_ask(ask, 80, 24, &theme);
+        assert_eq!(content.width, 40);
+        assert_eq!(content.height, 4);
+        let outer = box_of(&buffer);
+        assert_eq!(outer.height, 4 + 2);
+        let shown: String = (content.y..content.bottom())
+            .map(|y| text_in(&buffer, content, y).trim_end().to_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(shown, question.trim_end(), "no word is lost");
+    }
+
+    #[test]
+    fn an_ask_fits_its_content_and_keeps_the_margin() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 80, 24);
+        let ask = Ask::new("Abort").line("Abort the edit?").hint("y abort");
+        let (_, buffer) = draw_ask(ask, 80, 24, &theme);
+        // "Abort the edit?" is 15 cells, wider than the hint (7 + 1) and the title.
+        assert_eq!(box_of(&buffer), centered(area, 15 + CHROME, 1 + 2));
+        let ask = Ask::new("Abort")
+            .line("Abort?")
+            .hint("y abort  any other key keeps it");
+        let (content, _) = draw_ask(ask, 80, 24, &theme);
+        assert_eq!(content.width, 31 + 1, "the hint and a cell of rule fit");
+        // A screen too small for the question: the box keeps the margin and the text wraps.
+        let ask = Ask::new("Abort").line("word ".repeat(40).trim_end().to_owned());
+        let (content, buffer) = draw_ask(ask, 30, 10, &theme);
+        let outer = box_of(&buffer);
+        assert!(outer.x >= 2 && outer.right() <= 28, "{outer:?}");
+        assert!(outer.y >= 1 && outer.bottom() <= 9, "{outer:?}");
+        assert_eq!(content.width, 30 - 4 - CHROME);
+    }
+
+    #[test]
+    fn an_ask_under_monochrome_names_no_colour() {
+        let theme = Theme::monochrome();
+        let field = TextField::with_text("x");
+        let ask = Ask::new("Mono")
+            .line("Sure?")
+            .input("> ", &field)
+            .error("no")
+            .hint("y yes");
+        let (_, buffer) = draw_ask(ask, 40, 12, &theme);
+        let outer = box_of(&buffer);
+        for y in outer.y..outer.bottom() {
+            for x in outer.x..outer.right() {
+                let cell = &buffer[(x, y)];
+                assert_eq!(cell.fg, ratatui::style::Color::Reset, "({x},{y})");
+                assert_eq!(cell.bg, ratatui::style::Color::Reset, "({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn the_help_box_is_as_tall_as_its_rows_and_titled() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 80, 24);
+        let rows = [
+            Line::raw("? help"),
+            Line::raw("q quit"),
+            Line::raw("tab next"),
+        ];
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        let mut content = Rect::default();
+        terminal
+            .draw(|frame| content = help(frame, frame.area(), "Keys", &rows, 30, &theme))
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let outer = centered(area, 30 + CHROME, 3 + 2);
+        assert!(row(&buffer, outer.y).contains(" Keys "));
+        assert_eq!(content, Rect::new(outer.x + 1, outer.y + 1, 30, 3));
+        for (i, line) in ["? help", "q quit", "tab next"].iter().enumerate() {
+            let y = content.y + u16::try_from(i).expect("small");
+            assert_eq!(text_in(&buffer, content, y).trim_end(), *line);
+        }
+    }
+
+    #[test]
+    fn a_help_box_taller_than_the_screen_clamps() {
+        let theme = Theme::default();
+        let rows: Vec<Line<'_>> = (0..40).map(|i| Line::raw(format!("row {i}"))).collect();
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("terminal");
+        let mut content = Rect::default();
+        terminal
+            .draw(|frame| content = help(frame, frame.area(), "Keys", &rows, 200, &theme))
+            .expect("draw");
+        assert_eq!(content, Rect::new(1, 1, 60 - CHROME, 12 - 2));
+        let buffer = terminal.backend().buffer().clone();
+        assert_eq!(text_in(&buffer, content, 1).trim_end(), "row 0");
+        assert_eq!(text_in(&buffer, content, 10).trim_end(), "row 9");
     }
 
     /// MOD-67 M3 PA-5: a modal mode passes on what its global layer lets through, so `ctrl-c`
