@@ -17,8 +17,8 @@ use htui::ui::kit::pane::chip_strip;
 use htui::ui::kit::text::{Tone, notice};
 use htui::ui::tabs::settings::{
     AgentsSection, BoxesSection, ConnectionSection, HierarchySection, KindsSection,
-    PersonasSection, ProjectTypesSection, PromptSection, QdrantSection, QueueSection, SecretsSection, SectionId,
-    SettingsSection, SettingsTab,
+    PersonasSection, ProjectTypesSection, PromptSection, QdrantSection, QueueSection,
+    SecretsSection, SectionId, SettingsSection, SettingsTab,
 };
 use htui::ui::text_field::PASTE_DOES_NOT_FIT;
 use htui_agent::acp::Handshake;

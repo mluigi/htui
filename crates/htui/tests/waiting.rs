@@ -229,7 +229,9 @@ async fn the_top_bar_counts_working_and_waiting() {
     assert_eq!(top_bar(&mut harness), GRAPHICS);
 
     let mut harness = platform(&store).await;
-    assert_eq!(top_bar(&mut harness), "1 working · 1 waiting · memory");
+    // MOD-144's demo: RUN_2 (FEAT-3) and RUN_4 (FEAT-1) work; FEAT-2 (blocked) and TOOL-1 (its
+    // parked RUN_5) wait.
+    assert_eq!(top_bar(&mut harness), "2 working · 2 waiting · memory");
 }
 
 /// Plan D5: the parked run moves from working to waiting, and the list grows by its gate row.
@@ -239,7 +241,7 @@ async fn a_park_shows_on_the_next_refresh_tick() {
     let mut harness = platform(&store).await;
     park_ana_2(&store).await;
     refresh(&mut harness).await;
-    assert_eq!(top_bar(&mut harness), "1 working · 2 waiting · memory");
+    assert_eq!(top_bar(&mut harness), "2 working · 3 waiting · memory");
     assert_eq!(harness.app().status, None);
 }
 

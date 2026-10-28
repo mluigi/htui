@@ -79,6 +79,10 @@ async fn the_runs_pane_status_line_and_box_list_every_layer() {
     }
     harness.key("l");
     harness.drive().await;
+    // MOD-144: the pane opens on the demo's stepless rework run `RUN_4`; `J` steps to `RUN_1`'s
+    // `prd`.
+    harness.key("J");
+    harness.drive().await;
     let frame = harness.render();
     assert!(
         frame.contains("┌ FEAT-1") && frame.contains("▸ 0.1"),

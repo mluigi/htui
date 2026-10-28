@@ -52,7 +52,8 @@ async fn workspace(slug: &str) -> WorkspaceSummary {
         .unwrap_or_else(|| panic!("the demo fixture holds the `{slug}` workspace"))
 }
 
-/// A settled Backlog tab scoped to `Platform`: two projects, eleven items, all eight statuses.
+/// A settled Backlog tab scoped to `Platform`: two projects, eleven items, all three statuses and
+/// (MOD-144) every derived state but `stopped`.
 ///
 /// `Harness::demo()` starts in `Graphics` (workspaces are ordered by name), so the scope is moved
 /// the only way it ever moves: an `Action::SetScope` (plan D10).
@@ -86,6 +87,13 @@ fn sub_tab(harness: &mut Harness, n: usize) {
     }
 }
 
+/// MOD-144: `FEAT-1`'s Runs pane opens on its newest run, the stepless rework `RUN_4` (the demo's
+/// `running` state for `FEAT-1`); one `J` steps past it to `RUN_1`'s `prd`, the walk these cases
+/// drive.
+fn past_the_rework_run(harness: &mut Harness) {
+    harness.key("J");
+}
+
 /// Rows down from the arrival row to htui `FEAT-1`, the item every sub-tab has data for.
 ///
 /// The list is `htui` (header), `ANA-1`, `ANA-2`, `CLEAN-1`, `FEAT-1`, ... and the cursor arrives
@@ -103,8 +111,8 @@ async fn the_list_groups_the_two_project_workspace_by_project() {
     assert!(frame.contains("htui"), "the first project header");
     assert!(frame.contains("agy"), "the second project header");
     assert!(
-        frame.contains("awaiting_approval"),
-        "every status renders in full"
+        frame.contains("\u{26a0} needs you") && !frame.contains("awaiting_approval"),
+        "every state renders as its mark, never its raw name (MOD-144)"
     );
     insta::assert_snapshot!("list_grouped", frame);
 }
@@ -746,6 +754,7 @@ async fn the_runs_pane_greys_a_key_with_the_guard_s_sentence() {
     let mut harness = backlog().await;
     down(&mut harness, TO_FEAT_1).await;
     sub_tab(&mut harness, 1);
+    past_the_rework_run(&mut harness);
 
     let verdicts = run_worker::actions(
         &Backend::memory(MemStore::demo()),
@@ -1011,6 +1020,7 @@ async fn an_action_key_in_flow_answers_as_in_the_list() {
     let mut harness = backlog().await;
     down(&mut harness, TO_FEAT_1).await;
     sub_tab(&mut harness, 1);
+    past_the_rework_run(&mut harness);
 
     let verdicts = run_worker::actions(
         &Backend::memory(MemStore::demo()),
@@ -1037,6 +1047,7 @@ async fn the_flow_draws_the_plan_step_s_tool_call_as_a_chip() {
     let mut harness = backlog().await;
     down(&mut harness, TO_FEAT_1).await;
     sub_tab(&mut harness, 1);
+    past_the_rework_run(&mut harness);
     harness.key("v");
     harness.drive_to_end().await;
     let frame = harness.render();
@@ -1381,7 +1392,7 @@ async fn enter_on_the_graph_root_row_is_consumed_under_the_real_registration() {
     harness.key("m");
     let frame = harness.render();
     assert!(
-        frame.contains("┌ FEAT-1") && frame.contains("▸ FEAT-1 in_progress"),
+        frame.contains("┌ FEAT-1") && frame.contains("▸ FEAT-1 ◐ running"),
         "the Graph, its cursor on the root row:\n{frame}"
     );
     assert_eq!(harness.app().status, None);
@@ -1493,7 +1504,7 @@ async fn tick(harness: &mut Harness, n: usize) {
 const DETAIL_INSIDE: usize = 56;
 
 /// The detail pane's half of a frame: every row from inside the pane's left border, so the list's
-/// item statuses (`awaiting_approval` is one of them) are not read as a run's.
+/// item states (`needs you` is one of them) are not read as a run's.
 fn detail_pane(frame: &str) -> String {
     frame
         .lines()
@@ -1576,25 +1587,26 @@ async fn the_runs_pane_rereads_an_active_run_every_poll() {
 }
 
 /// D16: an item whose every run is terminal is not polled. A step written behind the pane's back
-/// stays unseen through two poll periods, and a re-selection (which does read) shows it.
+/// stays unseen through two poll periods, and a re-selection (which does read) shows it. MOD-144:
+/// `ANA-1` (the cursor's first item), whose only run `RUN_3` is done; `FEAT-1` now has a live
+/// rework run.
 #[tokio::test]
 async fn the_runs_pane_does_not_poll_a_finished_item() {
     let store = MemStore::demo();
     let mut harness = polled(store.clone()).await;
-    down(&mut harness, TO_FEAT_1).await;
     sub_tab(&mut harness, 1);
     let frame = harness.render();
     assert_eq!(
         run_status(&frame).as_deref(),
         Some("done"),
-        "FEAT-1's only run is done:\n{frame}"
+        "ANA-1's only run is done:\n{frame}"
     );
 
     store
         .create_step(NewRunStep {
             id: StepId::new(),
-            run_id: ids::RUN_1,
-            position: 4,
+            run_id: ids::RUN_3,
+            position: 1,
             attempt: 1,
             fanout_index: 0,
             phase_name: "unpolled".to_owned(),
@@ -1703,8 +1715,9 @@ async fn keys(harness: &mut Harness, keys: &[&str]) {
     harness.drive_to_end().await;
 }
 
-/// `f`, then `l` five times to `done` on the Status row, ticked with `space`.
-const TICK_DONE: [&str; 7] = ["f", "l", "l", "l", "l", "l", "space"];
+/// `f`, then `l` seven times to `done` on the Status row (`ItemState::ALL`'s attention order,
+/// MOD-144), ticked with `space`.
+const TICK_DONE: [&str; 9] = ["f", "l", "l", "l", "l", "l", "l", "l", "space"];
 
 /// From the Status row, down to Tags and type `rust`.
 const TYPE_RUST: [&str; 6] = ["down", "down", "r", "u", "s", "t"];
@@ -3548,7 +3561,7 @@ async fn back_returns_to_the_sub_tab_and_the_item_left() {
     let body = harness.render();
     assert!(body.contains("┌ FEAT-1"), "back on FEAT-1:\n{body}");
     assert!(
-        body.contains("FEAT-1  FEAT  in_progress"),
+        body.contains("FEAT-1  FEAT  ◐ running"),
         "on its Body:\n{body}"
     );
 
@@ -3560,7 +3573,7 @@ async fn back_returns_to_the_sub_tab_and_the_item_left() {
         "forward to the item left:\n{forward}"
     );
     assert!(
-        !forward.contains("FEAT-1  FEAT  in_progress"),
+        !forward.contains("FEAT-1  FEAT  ◐ running"),
         "and off the Body:\n{forward}"
     );
 }

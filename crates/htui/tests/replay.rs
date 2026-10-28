@@ -73,7 +73,9 @@ async fn workspace(slug: &str) -> WorkspaceSummary {
 /// Rows down from the arrival row to htui `FEAT-1`, the only item with a recorded step.
 const TO_FEAT_1: usize = 3;
 
-/// Moves a settled harness onto `FEAT-1` and opens the Runs pane on it.
+/// Moves a settled harness onto `FEAT-1`, opens the Runs pane on it and puts the cursor on
+/// `RUN_1`'s first step: MOD-144's demo lists the stepless rework run `RUN_4` first, and one `J`
+/// steps past it.
 async fn on_the_runs_pane(harness: &mut Harness) {
     harness.settle().await;
     harness.app().update(Action::SetScope {
@@ -85,6 +87,8 @@ async fn on_the_runs_pane(harness: &mut Harness) {
         harness.settle().await;
     }
     harness.key("l");
+    harness.settle().await;
+    harness.key("J");
     harness.settle().await;
 }
 

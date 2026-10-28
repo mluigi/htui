@@ -153,7 +153,8 @@ async fn enter_switches_the_scope_and_the_top_bar_follows() {
     let header = wide_header(&mut harness);
     let frame = harness.render();
     assert!(
-        header.starts_with("Platform") && header.contains("1 working · 1 waiting · memory"),
+        // MOD-144's demo: RUN_2 and RUN_4 work; FEAT-2 (blocked) and TOOL-1 (parked RUN_5) wait.
+        header.starts_with("Platform") && header.contains("2 working · 2 waiting · memory"),
         "the header reads the new workspace and its active-run count: {header}"
     );
     insta::assert_snapshot!("after_switch", frame);

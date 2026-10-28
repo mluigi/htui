@@ -314,6 +314,10 @@ async fn revealing_a_step_of_the_already_selected_item_moves_the_cursor() {
     .await;
     harness.key("l");
     harness.drive_to_end().await;
+    // MOD-144: the pane opens on the demo's stepless rework run `RUN_4`; `J` steps to `RUN_1`'s
+    // `prd`.
+    harness.key("J");
+    harness.drive_to_end().await;
     let before = harness.render();
     assert!(shows_runs(&before), "l lands on Runs: {before}");
     assert!(cursor_line(&before).contains("prd"), "{before}");

@@ -1,6 +1,6 @@
 //! MOD-4 milestone 6 against live Postgres (plan Task 9, blueprint §11): ANA-2 §12 criteria 17
-//! and 20, ANA-5 criterion 18's persistence half, and plan D161's `blocked -> awaiting_approval`
-//! edge, each driven through the production `run_worker::RunRuntime` over a `Backend::Online`.
+//! and 20, ANA-5 criterion 18's persistence half, and plan D161's unblock edge (MOD-144:
+//! `blocked -> open`, the item following its parked run), each driven through the production `run_worker::RunRuntime` over a `Backend::Online`.
 //!
 //! The fakes suite (`htui-orch`'s conformance over `MemStore`) and the harness suites
 //! (`tests/chat.rs`, `tests/backlog.rs`) prove the same criteria against a memory store. What only
@@ -758,9 +758,9 @@ fn compose(harness: &mut Harness, text: &str) {
     harness.key("enter");
 }
 
-/// `ids::HTUI_FEAT_3` is seeded `queued` under a live `RUN_2`, and `create_run` moves an item
-/// `open | failed -> queued` only; cancelling `RUN_2` moves it back to `open` (the conformance
-/// suite's `free_feat_3`).
+/// `ids::HTUI_FEAT_3` is seeded `open` under a live `RUN_2` (state `queued`), and `create_run`
+/// refuses an item with a live graph run (MOD-144); cancelling `RUN_2` leaves it `open` with no
+/// live run (the conformance suite's `free_feat_3`).
 async fn free_feat_3(store: &PgStore) {
     store
         .finish_run(ids::RUN_2, RunStatus::Cancelled, None, Utc::now())
@@ -1091,7 +1091,8 @@ async fn close_out_is_one_transaction_on_postgres() {
         "a refused close-out writes no document"
     );
     let held = stack.item(item).await;
-    assert_eq!(held.status, Status::AwaitingApproval, "and moves nothing");
+    assert_eq!(held.status, Status::Open, "and moves nothing");
+    assert_eq!(stack.run(run).await.status, RunStatus::AwaitingApproval);
     assert!(held.closed_at.is_none());
 
     // The server's own check, past the engine's guard: the live run is refused inside the
@@ -1111,7 +1112,8 @@ async fn close_out_is_one_transaction_on_postgres() {
         "the server's refusal writes no document"
     );
     let held = stack.item(item).await;
-    assert_eq!(held.status, Status::AwaitingApproval, "and moves nothing");
+    assert_eq!(held.status, Status::Open, "and moves nothing");
+    assert_eq!(stack.run(run).await.status, RunStatus::AwaitingApproval);
     assert!(held.closed_at.is_none());
 
     for _ in 0..4 {
@@ -1122,7 +1124,11 @@ async fn close_out_is_one_transaction_on_postgres() {
         RunStatus::Done,
         "four gates approved"
     );
-    assert_eq!(stack.item(item).await.status, Status::Done);
+    assert_eq!(
+        stack.item(item).await.status,
+        Status::Open,
+        "MOD-144: the item stays open; its finished run makes it `done`"
+    );
 
     // One write or none: a commit row naming no repo fails its insert after the summary's
     // `document` insert has run, and the transaction takes the document back with it.
@@ -1156,8 +1162,12 @@ async fn close_out_is_one_transaction_on_postgres() {
     let held = stack.item(item).await;
     assert_eq!(
         (held.status, held.closed_at),
-        (Status::Done, done.closed_at),
+        (Status::Open, None),
         "and did not close the item"
+    );
+    assert_eq!(
+        done.closed_at, None,
+        "MOD-144: only the close-out stamps `closed_at`"
     );
 
     let documents_before = documents_before.len();
@@ -1236,12 +1246,12 @@ async fn close_out_is_one_transaction_on_postgres() {
     assert_eq!(
         closed.resolution,
         Some(Resolution::Done),
-        "a `done` item closes as done (MOD-38 PRD D2)"
+        "a finished item closes as done (MOD-38 PRD D2, MOD-144)"
     );
     assert!(closed.closed_at.is_some(), "`closed_at` is set");
     assert_ne!(
         closed.closed_at, done.closed_at,
-        "by the close-out's own write, not left from `done`"
+        "set by the close-out, never before"
     );
 
     stack.finish().await;
@@ -1300,8 +1310,8 @@ async fn closes_open_ana_2_as(resolution: Resolution) {
 // ---------------------------------------------------------------------------------------------
 
 /// Plan D161 case 2 on Postgres: the review loop escalates — the item `blocked`, the run parked —
-/// and `Unblock` lets the item follow its run to `awaiting_approval`, T1's new item-law edge. The
-/// run's own verbs then reach it again: the review is promoted.
+/// and `Unblock` lets the item follow its run: `blocked -> open` (MOD-144), so it reads `needs you`
+/// over its parked run. The run's own verbs then reach it again: the review is promoted.
 #[tokio::test(flavor = "multi_thread")]
 async fn unblock_follows_an_escalated_run_on_postgres() {
     let Some(mut stack) = Stack::new(None).await else {
@@ -1362,8 +1372,8 @@ async fn unblock_follows_an_escalated_run_on_postgres() {
     assert_eq!(stack.take_status(), None, "the unblock was accepted");
     assert_eq!(
         stack.item(item).await.status,
-        Status::AwaitingApproval,
-        "plan D161's `blocked -> awaiting_approval` edge, accepted by the server"
+        Status::Open,
+        "MOD-144's `blocked -> open` edge, accepted by the server"
     );
     assert_eq!(
         stack.run(run).await.status,
@@ -1518,7 +1528,11 @@ async fn a_claim_time_refusal_is_not_requeued_on_postgres() {
     assert_eq!(created.len(), 1, "one run created: {created:?}");
     let refused = created[0];
     assert_eq!(stack.run(refused).await.status, RunStatus::Queued);
-    assert_eq!(stack.item(item).await.status, Status::Queued);
+    assert_eq!(
+        stack.item(item).await.status,
+        Status::Open,
+        "MOD-144: the item row stays open; its queued run makes it `queued`"
+    );
 
     // The re-probe: the box no longer declares `gpu`.
     declare_tags(&stack.db.store, 0, &[]).await;
