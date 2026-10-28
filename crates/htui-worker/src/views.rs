@@ -329,13 +329,15 @@ fn verdicts(
     live: &LiveChats,
 ) -> ItemActions {
     let sentence = |err: EngineError| err.to_string();
-    let rows: Vec<Run> = runs.iter().map(|(run, _)| run.clone()).collect();
+    let rows = || runs.iter().map(|(run, _)| run);
     let mut actions = ItemActions {
         item: item.id,
         key: item.key.clone(),
-        run: start_enabled(item, &rows).map_err(sentence),
+        run: start_enabled(item, rows()).map_err(sentence),
         unblock: Ok(()),
-        close_out: close_out_enabled(item, &rows).map(|_| ()).map_err(sentence),
+        close_out: close_out_enabled(item, rows())
+            .map(|_| ())
+            .map_err(sentence),
         runs: BTreeMap::new(),
         steps: BTreeMap::new(),
     };
@@ -1019,7 +1021,7 @@ mod tests {
         ProjectId, RelaySessionId, Run, RunId, RunMode, RunStatus, RunStep, Scope, Status, StepId,
         StepPermission, StepStatus, WaitingCandidate, WaitingPermission, latest_graph_run,
     };
-    use htui_core::store::{MemStore, ReadStore as _, StoreError, WriteStore as _, illegal_move};
+    use htui_core::store::{MemStore, ReadStore as _, StoreError, WriteStore as _};
     use htui_orch::conformance::Orchestrate as _;
     use htui_orch::fake::{FakeOrchestrator, ScriptedStep};
     use htui_orch::{Clock as _, Command, CommandOutcome, EngineError, GateAnswer, UnblockCase};
@@ -2388,10 +2390,12 @@ mod tests {
     #[test]
     fn start_is_refused_over_a_live_run_and_admitted_over_a_finished_one() {
         let refusal = |state: ItemState| {
-            Err(EngineError::Store(StoreError::Constraint(illegal_move(
-                "item", state, "queued",
-            )))
-            .to_string())
+            Err(
+                EngineError::Store(StoreError::Constraint(htui_core::store::not_startable(
+                    "FEAT-1", state,
+                )))
+                .to_string(),
+            )
         };
         let start = |item: &Item, statuses: &[RunStatus]| {
             let runs: Vec<(Run, Vec<RunStep>)> = statuses

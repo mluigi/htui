@@ -1313,8 +1313,8 @@ async fn a_rested_walk_wakes_the_sweep() {
 }
 
 /// (l) Review H1: a cancelled auto run sticks for the rest of its batch. The cancel leaves the
-/// item `open` with no other run, so ready again, and its entry stays, but the queue runner does not admit it again under
-/// the batch that ran it; a pause and a resume (a new batch) do.
+/// item `open` with no other run, so ready again, and its entry stays, but the queue runner does
+/// not admit it again under the batch that ran it; a pause and a resume (a new batch) do.
 #[tokio::test]
 async fn a_cancelled_auto_run_is_not_readmitted_in_its_batch() {
     let h = Harness::open().await;
@@ -1778,9 +1778,13 @@ async fn a_parked_auto_run_keeps_a_stalled_batch_open() {
     h.sweep(&mut runtime).await;
     let run = h.only_run(a).await;
     assert_eq!(run.status, RunStatus::AwaitingApproval, "parked at verdict");
+    let runs = h.runs(a).await;
     assert_eq!(
-        h.status(a).await,
-        Status::Open,
+        htui_core::model::ItemState::of(
+            h.status(a).await,
+            htui_core::model::latest_graph_run(&runs).map(|run| run.status)
+        ),
+        htui_core::model::ItemState::NeedsYou,
         "its run parks it (*needs you*), so not ready"
     );
 
