@@ -21,6 +21,7 @@
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, TimeDelta, Utc};
+use htui_core::model::ItemState;
 use htui_core::model::link::{ItemLink, LinkKind, ProposeLink, WithdrawLink};
 use htui_core::model::{
     Activation, Agent, AgentBox, AgentId, AnswerOutcome, BOX_PROBE_SPEC_KEY, BatchClose, BatchId,
@@ -64,15 +65,15 @@ use htui_core::store::{
     QueueToken, ReadStore as _, Result, SettingRung, StepFence, StoreError, StoredSetting,
     TransitionLaw, UpdateOutcome, WriteStore, already_exists, chat_step_status, check_attachment,
     citation_key, close_out_needs_a_summary, expected_on_row, failure_disagrees_with_status,
-    finish_run_item_mirror, finish_run_needs_a_terminal_status, graph_not_in_project, illegal_move,
-    invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project,
-    lease_ttl_micros, legal_move, new_persona_refusal, new_skill_refusal, not_a_fanout_candidate,
+    finish_run_needs_a_terminal_status, graph_not_in_project, illegal_move, invalid_area_code,
+    invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project, lease_ttl_micros,
+    legal_move, new_persona_refusal, new_skill_refusal, not_a_fanout_candidate,
     not_a_terminal_status, persona_is_bound, persona_patch_refusal, prompt_template_key,
     prompt_template_refusal, queue_target_refusal, queue_token_refusal, references_no_row,
     requirement_withdrawn, reserved_phase_name, resolution_not_closable, row_names_another_phase,
     row_names_another_step, run_is_terminal, skill_body_refusal, skill_patch_refusal,
-    skill_version_key, step_is_not_promotable, summary_names_another_item, winner_is_not_settled,
-    withdrawn_requirement_cited,
+    skill_version_key, startable, step_is_not_promotable, summary_names_another_item,
+    winner_is_not_settled, withdrawn_requirement_cited,
 };
 use htui_core::store::{
     body_agent_refs, body_persona_refs, edge_predicate, graph_body_shape_refusal,
@@ -1578,9 +1579,9 @@ async fn skill_version_miss(
 }
 
 /// [`WriteStore::finish_run`]'s whole body on `conn`, inside the caller's transaction: the run's
-/// terminal move and the item's mirror ([`finish_run_item_mirror`]), with the run then the item
-/// taken `FOR UPDATE`. `finish_run` wraps it in a transaction of its own; MOD-12's
-/// [`close_batch`](PgStore::close_batch) runs it for each run of the batch still `queued`, in the
+/// terminal move, the run taken `FOR UPDATE`. The item is not written (MOD-144): its progress is
+/// the latest graph run's. `finish_run` wraps it in a transaction of its own; MOD-12's
+/// [`close_batch`](PgStore::close_batch) runs it for each still-`queued` run of the batch, in the
 /// close's transaction (review H2).
 async fn finish_run_on(
     conn: &mut PgConnection,
@@ -1589,15 +1590,8 @@ async fn finish_run_on(
     failure: Option<&str>,
     at: DateTime<Utc>,
 ) -> Result<()> {
-    // The raw SQL keeps the indentation it had inside `finish_run`, so its `.sqlx` entry stands.
-    let Some(row) = sqlx::query!(
-        r#"
-            SELECT status  AS "status: RunStatus",
-                   item_id AS "item_id: ItemId"
-              FROM run
-             WHERE id = $1
-               FOR UPDATE
-            "#,
+    let Some(status) = sqlx::query_scalar!(
+        r#"SELECT status AS "status: RunStatus" FROM run WHERE id = $1 FOR UPDATE"#,
         run.as_uuid(),
     )
     .fetch_optional(&mut *conn)
@@ -1624,7 +1618,7 @@ async fn finish_run_on(
     }
     // A terminal row reaches nothing, so `legal_move` is the whole refusal: `run_is_terminal`
     // would only say the same thing in a second sentence.
-    legal_move(row.status, to)?;
+    legal_move(status, to)?;
 
     sqlx::query!(
         "UPDATE run \
@@ -1640,51 +1634,6 @@ async fn finish_run_on(
     .execute(&mut *conn)
     .await
     .map_err(map_sqlx)?;
-
-    if let Some(item) = row.item_id {
-        let Some(current) = sqlx::query_scalar!(
-            r#"SELECT status AS "status: Status" FROM item WHERE id = $1 FOR UPDATE"#,
-            item.as_uuid(),
-        )
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(map_sqlx)?
-        else {
-            // The foreign key makes this unreachable; it is an early return rather than a
-            // panic because a missing parent is the database's fault, not the caller's.
-            return Ok(());
-        };
-
-        let live = sqlx::query_scalar!(
-            "SELECT count(*) FROM run \
-              WHERE item_id = $1 AND id <> $2 \
-                AND status IN ('queued','running','awaiting_approval','stopped')",
-            item.as_uuid(),
-            run.as_uuid(),
-        )
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(map_sqlx)?
-        .unwrap_or_default();
-
-        if live == 0
-            && let Some(target) = finish_run_item_mirror(to, current)
-        {
-            sqlx::query!(
-                "UPDATE item \
-                    SET status    = $3, \
-                        closed_at = CASE WHEN $4 THEN clock_timestamp() ELSE NULL END \
-                  WHERE id = $1 AND status = $2",
-                item.as_uuid(),
-                current.as_str(),
-                target.as_str(),
-                target.is_terminal(),
-            )
-            .execute(&mut *conn)
-            .await
-            .map_err(map_sqlx)?;
-        }
-    }
 
     Ok(())
 }
@@ -1890,13 +1839,9 @@ impl WriteStore for PgStore {
         Ok(UpdateOutcome::Diverged { head, ancestor })
     }
 
-    /// The status compare-and-set of ANA-9 §4.2: never bumps `version`, never writes a revision.
-    ///
-    /// `closed_at` follows the *current* status in both directions - set on a move to a terminal
-    /// status, cleared on a move back to a live one (blueprint H.12), which is the MOD-1 errata
-    /// rule `closed_at = to.is_terminal().then_some(now)` written in SQL. [`legal_move`] refuses
-    /// every move to `closed` (MOD-38 PRD D1; close-out is the only way in), so the one terminal
-    /// status this `UPDATE` can reach is `done`.
+    /// The status compare-and-set of ANA-9 §4.2: never bumps `version`, never writes a revision,
+    /// never touches `closed_at` (MOD-144: only `close_out` stamps it). [`legal_move`] admits
+    /// `open ↔ blocked` only; `closed` is close-out's (MOD-38 PRD D1).
     ///
     /// # Errors
     ///
@@ -1918,10 +1863,7 @@ impl WriteStore for PgStore {
         }
 
         let moved = sqlx::query!(
-            "UPDATE item \
-                SET status    = $3, \
-                    closed_at = CASE WHEN $3 = 'done' THEN clock_timestamp() ELSE NULL END \
-              WHERE id = $1 AND status = $2",
+            "UPDATE item SET status = $3 WHERE id = $1 AND status = $2",
             id.as_uuid(),
             from.as_str(),
             to.as_str(),
@@ -5811,12 +5753,15 @@ impl WriteStore for PgStore {
     // `EXPECTED_CASES` still saying 36 records.
     // -------------------------------------------------------------------------------------------
 
-    /// The `run` row and the item's move to `queued`, together or not at all (plan D6, ANA-2 §5.1).
+    /// The `run` row, refused while the item is not `open` or has a live graph run
+    /// ([`startable`], MOD-144; plan D6, ANA-2 §5.1). The item is not written: its `queued` is
+    /// the run's.
     ///
-    /// The item is locked `FOR UPDATE` before the law is consulted, so the status the refusal
-    /// names and the status the `UPDATE` matches on are the same one: between them nothing else
-    /// can move the row. That lock is also what makes the "impossible" zero-row branch below
-    /// impossible rather than merely unlikely.
+    /// The item is locked `FOR UPDATE` before the live-run read and the law, so no other
+    /// `create_run` (nor `close_out`) can slip a run in between: "one live graph run per item" is
+    /// this check, backed by `uq_run_item_live` (0023). A racing insert that slipped the lock
+    /// would be that index's `23505`, a [`StoreError::Constraint`] through [`map_sqlx`]
+    /// (unreachable under the lock).
     ///
     /// Every other rule is the schema's: `project_id`, `target_box_id`, `started_by` and each
     /// `repo_scope` entry are foreign keys, a repeated `id` is the primary key, and a `graph` run
@@ -5827,10 +5772,11 @@ impl WriteStore for PgStore {
     /// # Errors
     ///
     /// [`StoreError::NotFound`] `{ entity: "item" }` for an unknown item;
-    /// [`StoreError::Constraint`] when the item cannot reach `queued`, when the item is not in
-    /// `new.project_id`, when the id is taken, or on any of the keys above. Nothing is written on
-    /// any of them. `NotFound { entity: "queue_batch" }` / `Constraint` for an unknown or closed
-    /// `new.batch_id` (MOD-12 D7).
+    /// [`StoreError::Constraint`] with [`startable`]'s sentence when the item is not `open` or
+    /// already has a live graph run (`` item.status `running` cannot move to `queued` ``), when
+    /// the item is not in `new.project_id`, when the id is taken, or on any of the keys above.
+    /// Nothing is written on any of them. `NotFound { entity: "queue_batch" }` / `Constraint` for
+    /// an unknown or closed `new.batch_id` (MOD-12 D7).
     async fn create_run(&self, new: NewRun) -> Result<Run> {
         let snapshot = serde_json::to_value(&new.graph_snapshot).map_err(|error| {
             StoreError::Constraint(format!("run.graph_snapshot does not serialise: {error}"))
@@ -5857,8 +5803,22 @@ impl WriteStore for PgStore {
             entity: "item",
             id: new.item_id.to_string(),
         })?;
-        let status = item.status;
-        legal_move(status, Status::Queued)?;
+        // MOD-144: "one live graph run per item" is this check under the item's FOR UPDATE, backed
+        // by `uq_run_item_live` (0023). The newest live run is named, so the refusal says what
+        // holds it.
+        let live = sqlx::query_scalar!(
+            r#"SELECT status AS "status: RunStatus"
+                 FROM run
+                WHERE item_id = $1 AND kind = 'graph'
+                  AND status IN ('queued','running','awaiting_approval','stopped')
+                ORDER BY queued_at DESC, id DESC
+                LIMIT 1"#,
+            new.item_id.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        startable(item.status, live)?;
         // `run.project_id` and `item.project_id` are independent foreign keys, so the schema
         // cannot refuse a run filed under project A for project B's item - and `delete_project`,
         // which counts by `run.project_id`, would then take it with the wrong project. The row is
@@ -5898,9 +5858,8 @@ impl WriteStore for PgStore {
         // MOD-12 D7, H-6: a run joins only an open batch. `FOR SHARE` conflicts with
         // `close_batch`'s UPDATE, so a pause and an admission serialise on the batch row and a run
         // never joins a batch that has already closed. The lock order here is item, then batch;
-        // `close_batch` locks batch, then run, then item, but only the items of the batch's
-        // `queued` runs, which are `queued` themselves - and this item is `open` or `failed`, or
-        // `legal_move` above refused it before the batch lock - so the two never wait on one item.
+        // `close_batch` locks batch, then the batch's `queued` runs, and no item since MOD-144, so
+        // the two never wait on each other in opposite orders.
         if let Some(batch) = new.batch_id {
             let open = sqlx::query_scalar!(
                 r#"SELECT closed_at IS NULL AS "open!" FROM queue_batch WHERE id = $1 FOR SHARE"#,
@@ -5960,31 +5919,6 @@ impl WriteStore for PgStore {
         .fetch_one(&mut *tx)
         .await
         .map_err(map_sqlx)?;
-
-        // `closed_at` follows the *current* status, exactly as `transition` writes it: `queued` is
-        // not terminal, so a retry out of `failed` clears the stamp the failure left.
-        let moved = sqlx::query!(
-            "UPDATE item SET status = 'queued', closed_at = NULL WHERE id = $1 AND status = $2",
-            new.item_id.as_uuid(),
-            status.as_str(),
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(map_sqlx)?
-        .rows_affected();
-        if moved != 1 {
-            // The item has been locked `FOR UPDATE` since before the law was consulted, so the
-            // status this `UPDATE` matches on is the status the refusal above was decided against
-            // and no other transaction can have moved it. Reported as a backend fault rather than
-            // dressed up as a caller's constraint, which is `update_item`'s precedent: the
-            // alternative sentence - a lost race between attempts - is one this writer has no
-            // attempts to lose.
-            return Err(StoreError::Backend(format!(
-                "item `{}` did not move `{status}` -> `queued` under the row lock this \
-                 transaction holds: no rule of ANA-2 §4.3 can produce this",
-                new.item_id,
-            )));
-        }
 
         tx.commit().await.map_err(map_sqlx)?;
         Ok(run)
@@ -6134,11 +6068,11 @@ impl WriteStore for PgStore {
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx)?;
-            // A stale item status is not a refusal: zero rows here means someone else already
-            // moved the item on (the admitted branch's rule).
+            // A stale item status is not a refusal: an item no longer `open` (blocked by hand) is
+            // left as it is (MOD-144: `open → blocked`, the run's `failed` is its own).
             sqlx::query!(
                 "UPDATE item SET status = 'blocked' \
-                  WHERE id = (SELECT item_id FROM run WHERE id = $1) AND status = 'queued'",
+                  WHERE id = (SELECT item_id FROM run WHERE id = $1) AND status = 'open'",
                 run.as_uuid(),
             )
             .execute(&mut *tx)
@@ -6233,17 +6167,7 @@ impl WriteStore for PgStore {
         .await
         .map_err(map_sqlx)?;
 
-        // A stale item status is not a refusal: the run is what is being claimed, and zero rows
-        // here means someone else already moved the item on.
-        sqlx::query!(
-            "UPDATE item SET status = 'in_progress', closed_at = NULL \
-              WHERE id = (SELECT item_id FROM run WHERE id = $1) AND status = 'queued'",
-            run.as_uuid(),
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(map_sqlx)?;
-
+        // MOD-144: the item is not written; its `running` is the run's.
         tx.commit().await.map_err(map_sqlx)?;
         Ok(Claim::Admitted)
     }
@@ -7648,8 +7572,9 @@ impl WriteStore for PgStore {
         Ok(written)
     }
 
-    /// §4.8's promotion, one transaction (plan D6): the step, its run and its item are lifted to
-    /// `awaiting_approval` together, so no reader sees a gated step under a running item.
+    /// §4.8's promotion, one transaction (plan D6): the step and its run are lifted to
+    /// `awaiting_approval` together, so no reader sees a gated step under a running run; the
+    /// item's `needs you` is derived from the run (MOD-144).
     ///
     /// The refusal is **this writer's own rule, not §4.3's table**: `running -> awaiting_approval`
     /// is a legal step move, but a step still running has produced nothing to promote. Only `failed`
@@ -7657,11 +7582,10 @@ impl WriteStore for PgStore {
     /// second is idempotence for a second click. [`step_is_not_promotable`] is the sentence, which
     /// is why [`legal_move`] is not called here.
     ///
-    /// The run and the item are moved by compare-and-set rather than unconditionally: a run already
-    /// at `awaiting_approval` (a second promotion in the same gate) matches nothing and is left
-    /// alone, which is the same zero-rows-tolerated shape [`claim_run`](WriteStore::claim_run) uses
-    /// for its item. The item's `closed_at` is cleared alongside, because
-    /// [`transition`](WriteStore::transition) - the statement `MemStore` routes this through - does.
+    /// The run is moved by compare-and-set rather than unconditionally: a run already at
+    /// `awaiting_approval` (a second promotion in the same gate) matches nothing and is left
+    /// alone, the same zero-rows-tolerated shape [`claim_run`](WriteStore::claim_run) uses for its
+    /// item.
     ///
     /// # Errors
     ///
@@ -7675,8 +7599,7 @@ impl WriteStore for PgStore {
             r#"
             SELECT s.status  AS "step_status: StepStatus",
                    r.id      AS "run_id: RunId",
-                   r.status  AS "run_status: RunStatus",
-                   r.item_id AS "item_id: ItemId"
+                   r.status  AS "run_status: RunStatus"
               FROM run_step s JOIN run r ON r.id = s.run_id
              WHERE s.id = $1
                FOR UPDATE OF s, r
@@ -7725,17 +7648,6 @@ impl WriteStore for PgStore {
         .execute(&mut *tx)
         .await
         .map_err(map_sqlx)?;
-
-        if let Some(item) = row.item_id {
-            sqlx::query!(
-                "UPDATE item SET status = 'awaiting_approval', closed_at = NULL \
-                  WHERE id = $1 AND status = 'in_progress'",
-                item.as_uuid(),
-            )
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx)?;
-        }
 
         tx.commit().await.map_err(map_sqlx)
     }
@@ -7809,8 +7721,8 @@ impl WriteStore for PgStore {
 
     /// MOD-37 R-5: the gate's park, one transaction in `promote_step`'s shape. The step and its
     /// run are read under `FOR UPDATE`, and every refusal is decided before the first `UPDATE`,
-    /// so a refused park rolls back having written nothing. The run and item statements are
-    /// `promote_step`'s.
+    /// so a refused park rolls back having written nothing. The run statement is
+    /// `promote_step`'s; the item is not written (MOD-144: its `needs you` is the run's).
     ///
     /// # Errors
     ///
@@ -7823,7 +7735,6 @@ impl WriteStore for PgStore {
             SELECT s.status      AS "step_status: StepStatus",
                    r.id          AS "run_id: RunId",
                    r.status      AS "run_status: RunStatus",
-                   r.item_id     AS "item_id: ItemId",
                    r.lease_owner AS "lease_owner?"
               FROM run_step s JOIN run r ON r.id = s.run_id
              WHERE s.id = $1
@@ -7866,17 +7777,6 @@ impl WriteStore for PgStore {
         .execute(&mut *tx)
         .await
         .map_err(map_sqlx)?;
-
-        if let Some(item) = row.item_id {
-            sqlx::query!(
-                "UPDATE item SET status = 'awaiting_approval', closed_at = NULL \
-                  WHERE id = $1 AND status = 'in_progress'",
-                item.as_uuid(),
-            )
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx)?;
-        }
 
         tx.commit().await.map_err(map_sqlx)?;
         Ok(ParkOutcome::Parked)
@@ -7937,24 +7837,11 @@ impl WriteStore for PgStore {
         }
     }
 
-    /// Plan M2 D7: the run's terminal move and the item's mirror, one transaction.
+    /// Plan M2 D7: the run's terminal move, one transaction ([`finish_run_on`]).
     ///
-    /// [`promote_step`](WriteStore::promote_step) is the template — the rows are taken
-    /// `FOR UPDATE` and every refusal is decided under the locks and before the first `UPDATE` —
-    /// with one addition that is the whole point of the writer. The item's row is locked
-    /// **before** its sibling runs are counted, so two runs of one item finishing at the same
-    /// instant serialise on it: without that lock each would see the other still live in its own
-    /// snapshot, both would decline to move the item, and the item would be stranded
-    /// `in_progress` with no live run left to move it.
-    ///
-    /// The lock order is `run` then `item`, which is `promote_step`'s, so the two cannot deadlock
-    /// against each other.
-    ///
-    /// The item's target is derived in Rust rather than in SQL, from the same `match` `MemStore`
-    /// runs, so ANA-2 §4.3's mapping is written once per rule and not once per backend; and
-    /// `closed_at` is `to.is_terminal()` in SQL exactly as
-    /// [`transition`](WriteStore::transition) writes it (`:603-611`). Zero rows affected by the
-    /// final `UPDATE` is not an error: the item moved under us, which plan D17 says to leave alone.
+    /// [`promote_step`](WriteStore::promote_step) is the template: the run is taken `FOR UPDATE`
+    /// and every refusal is decided under the lock and before the `UPDATE`. The item is not
+    /// written (MOD-144): its progress is derived from its latest graph run.
     ///
     /// # Errors
     ///
@@ -7980,9 +7867,9 @@ impl WriteStore for PgStore {
     /// The item's row is taken `FOR UPDATE` first and held to the commit, which is what makes the
     /// three effects one act rather than three: it is the lock
     /// [`write_document`](WriteStore::write_document) needs to allocate the summary's version, and
-    /// it is also what stops a [`claim_run`](WriteStore::claim_run) from admitting a run of this
-    /// item between the live-run probe and the `UPDATE` - `claim_run` moves the item to
-    /// `in_progress` and so contends on the same row.
+    /// it is also what stops a [`create_run`](WriteStore::create_run) from starting a run of this
+    /// item between the live-run probe and the `UPDATE` (MOD-144: `create_run` takes the same
+    /// lock), so the latest graph run the law reads cannot move under it either.
     ///
     /// The live-run probe orders by `(queued_at, id)` rather than taking any row, so the run the
     /// sentence names is the same one [`MemStore`](htui_core::store::MemStore) names: with two
@@ -8003,9 +7890,11 @@ impl WriteStore for PgStore {
     ///
     /// [`StoreError::NotFound`] `{ entity: "item" }`, or `{ entity: "run_step" }` for a commit row
     /// naming a step that does not exist; [`StoreError::Constraint`] when a run of the item is
-    /// live (`queued | running | awaiting_approval | stopped`), when `summary.kind` is not `summary`, when
-    /// `summary.item_id` is not `item`, when `resolution` does not close the item's status under
-    /// ANA-11 §4.2 ([`resolution_not_closable`]), when a commit row names an unknown repo, or when
+    /// live (`queued | running | awaiting_approval | stopped`), when `summary.kind` is not
+    /// `summary`, when `summary.item_id` is not `item`, when `resolution` does not close the item
+    /// under ANA-35 §7.1's law ([`Resolution::closes_from`]: `done`/`concluded` need an `open`
+    /// item whose latest graph run is `done`; [`resolution_not_closable`] names its
+    /// [`ItemState`]), when a commit row names an unknown repo, or when
     /// the summary duplicates a document id or names an unknown `created_by` /
     /// `produced_by_step_id`. No refusal writes anything.
     async fn close_out(
@@ -8064,12 +7953,28 @@ impl WriteStore for PgStore {
                 summary.item_id,
             )));
         }
-        // ANA-11 §4.2's law, not §4.3's table: close-out is the only way into `closed` (MOD-38
+        // MOD-144: `done`/`concluded` need a finished item: its latest graph run, `cancelled`
+        // skipped, is `done`. Read under the item lock; no run can go live meanwhile (`create_run`
+        // takes the same lock).
+        let latest = sqlx::query_scalar!(
+            r#"SELECT status AS "status: RunStatus"
+                 FROM run
+                WHERE item_id = $1 AND kind = 'graph' AND status <> 'cancelled'
+                ORDER BY queued_at DESC, id DESC
+                LIMIT 1"#,
+            item.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        // ANA-35 §7.1's law, not §4.3's table: close-out is the only way into `closed` (MOD-38
         // PRD D1). `chk_item_resolution_iff_closed` would refuse a missing resolution; this refuses
         // a wrong one, before the first write.
-        if !resolution.closes_from(status) {
+        if !resolution.closes_from(status, latest == Some(RunStatus::Done)) {
             return Err(StoreError::Constraint(resolution_not_closable(
-                item, status, resolution,
+                item,
+                ItemState::of(status, latest),
+                resolution,
             )));
         }
 
@@ -8113,9 +8018,8 @@ impl WriteStore for PgStore {
         .rows_affected();
 
         if closed != 1 {
-            // Impossible for `create_run`'s reason: the item has been locked `FOR UPDATE` since
-            // this transaction's first statement, so the status the close-out was decided against
-            // is still the row's.
+            // Impossible: the item has been locked `FOR UPDATE` since this transaction's first
+            // statement, so the status the close-out was decided against is still the row's.
             return Err(StoreError::Backend(format!(
                 "item `{item}` did not move `{status}` -> `closed` under the row lock this \
                  transaction holds: no rule of ANA-2 §4.3 can produce this"
@@ -10008,9 +9912,10 @@ impl PgStore {
     /// serialise (H-6).
     ///
     /// In the same transaction, every run of the batch still `queued` is cancelled through
-    /// `finish_run_on`, so its item goes back to `open` by `finish_run`'s mirror and its queue
-    /// entry stays (review H2): a pause stops the runs no process has claimed yet, not only the
-    /// admissions. The runs are locked `FOR UPDATE` after the batch row, so a racing `claim_run`
+    /// `finish_run_on`; its item is not written (a cancelled run is skipped by the latest-run
+    /// rule, MOD-144, so the item reads as it did before the run) and its queue entry stays
+    /// (review H2): a pause stops the runs no process has claimed yet, not only the admissions.
+    /// The lock order is batch row, then run rows, so a racing `claim_run`
     /// (which locks the run row first) either claims the run before this reads it - the run is
     /// `running` and left alone - or finds it `cancelled` and answers `NotClaimable`. A `drained`
     /// close finds no such run: the drain closes only a batch whose runs are all terminal.
@@ -10135,7 +10040,8 @@ impl PgStore {
         Ok(closed)
     }
 
-    /// MOD-12 D3: drop `box_id`'s entries whose item is `done` or `closed`; how many went.
+    /// MOD-12 D3: drop `box_id`'s entries whose item is `closed` or finished (MOD-144: its latest
+    /// graph run, `cancelled` skipped, is `done`); how many went.
     ///
     /// The rows are locked in `item_id` order first (review R1 L1), the order
     /// [`move_queue_entry`](PgStore::move_queue_entry) locks in, so the runner's prune and a
@@ -10151,7 +10057,12 @@ impl PgStore {
             WITH doomed AS (
                 SELECT e.item_id
                   FROM queue_entry e JOIN item i ON i.id = e.item_id
-                 WHERE e.box_id = $1 AND i.status IN ('done', 'closed')
+                 WHERE e.box_id = $1
+                   AND (i.status = 'closed'
+                        OR (SELECT r.status FROM run r
+                             WHERE r.item_id = i.id AND r.kind = 'graph' AND r.status <> 'cancelled'
+                             ORDER BY r.queued_at DESC, r.id DESC
+                             LIMIT 1) = 'done')
                  ORDER BY e.item_id
                    FOR UPDATE OF e)
             DELETE FROM queue_entry e
