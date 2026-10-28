@@ -190,6 +190,9 @@ impl htui_core::store::WorkerStore for PgStore {
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool> {
         WriteStore::transition(self, id, from, to).await
     }
+    async fn block_if_idle(&self, note: NewNote) -> Result<bool> {
+        WriteStore::block_if_idle(self, note).await
+    }
     async fn set_step_prompt(
         &self,
         fence: StepFence,
@@ -576,6 +579,9 @@ impl htui_core::store::WorkerStore for Writer {
     }
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool> {
         WriteStore::transition(self, id, from, to).await
+    }
+    async fn block_if_idle(&self, note: NewNote) -> Result<bool> {
+        WriteStore::block_if_idle(self, note).await
     }
     async fn set_step_prompt(
         &self,

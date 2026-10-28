@@ -1893,6 +1893,76 @@ impl WriteStore for PgStore {
         }
     }
 
+    /// MOD-144 R1: the engine's rung-4 and missing-tags refusal, one transaction that locks the
+    /// item first (`FOR UPDATE`, `close_out`'s statement) and only then reads its live graph
+    /// runs, as `create_run` does. A `create_run` holding the lock makes this wait, and the read
+    /// after the wait sees its run: `Ok(false)`, nothing written (D98). A single
+    /// `UPDATE ... WHERE NOT EXISTS (live run)` would not do: Postgres re-checks only the updated
+    /// row after a row-lock wait, never the subquery (the R1 probe). Otherwise the note lands and
+    /// `open -> blocked`; a `blocked` or `closed` item keeps its status and still gets the note
+    /// (invariant 7).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for an unknown item; `add_note`'s [`StoreError::Constraint`]s
+    /// (a dangling author, box or step, a repeated id), the transaction then rolled back.
+    async fn block_if_idle(&self, note: NewNote) -> Result<bool> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let status = sqlx::query_scalar!(
+            r#"SELECT status AS "status: Status" FROM item WHERE id = $1 FOR UPDATE"#,
+            note.item_id.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "item",
+            id: note.item_id.to_string(),
+        })?;
+        // `create_run`'s live-run read, byte for byte, as its own statement after the lock.
+        let live = sqlx::query_scalar!(
+            r#"SELECT status AS "status: RunStatus"
+                 FROM run
+                WHERE item_id = $1 AND kind = 'graph'
+                  AND status IN ('queued','running','awaiting_approval','stopped')
+                ORDER BY queued_at DESC, id DESC
+                LIMIT 1"#,
+            note.item_id.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if live.is_some() {
+            return Ok(false);
+        }
+        sqlx::query!(
+            "INSERT INTO item_note \
+                    (id, item_id, body, created_by, box_id, via_step_id, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            note.id.as_uuid(),
+            note.item_id.as_uuid(),
+            note.body,
+            note.created_by.as_uuid(),
+            note.box_id.map(BoxId::as_uuid),
+            note.via_step_id.map(StepId::as_uuid),
+            note.created_at,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if status == Status::Open {
+            sqlx::query!(
+                "UPDATE item SET status = 'blocked' WHERE id = $1 AND status = 'open'",
+                note.item_id.as_uuid(),
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(true)
+    }
+
     /// Appends session events in one statement under `fence`, skipping the `(run_step_id, seq)`
     /// pairs already stored (ANA-9 §4.3, plan D3; MOD-40 plan D1).
     ///
@@ -5773,7 +5843,7 @@ impl WriteStore for PgStore {
     ///
     /// [`StoreError::NotFound`] `{ entity: "item" }` for an unknown item;
     /// [`StoreError::Constraint`] with [`startable`]'s sentence when the item is not `open` or
-    /// already has a live graph run (`` item.status `running` cannot move to `queued` ``), when
+    /// already has a live graph run (`` item HTUI-1 is `running`: a live run holds it ``), when
     /// the item is not in `new.project_id`, when the id is taken, or on any of the keys above.
     /// Nothing is written on any of them. `NotFound { entity: "queue_batch" }` / `Constraint` for
     /// an unknown or closed `new.batch_id` (MOD-12 D7).
@@ -5792,7 +5862,8 @@ impl WriteStore for PgStore {
 
         let item = sqlx::query!(
             r#"SELECT status     AS "status: Status",
-                      project_id AS "project_id: ProjectId"
+                      project_id AS "project_id: ProjectId",
+                      key        AS "key!"
                  FROM item WHERE id = $1 FOR UPDATE"#,
             new.item_id.as_uuid(),
         )
@@ -5818,7 +5889,7 @@ impl WriteStore for PgStore {
         .fetch_optional(&mut *tx)
         .await
         .map_err(map_sqlx)?;
-        startable(item.status, live)?;
+        startable(&item.key, item.status, live)?;
         // `run.project_id` and `item.project_id` are independent foreign keys, so the schema
         // cannot refuse a run filed under project A for project B's item - and `delete_project`,
         // which counts by `run.project_id`, would then take it with the wrong project. The row is
@@ -7584,8 +7655,9 @@ impl WriteStore for PgStore {
     ///
     /// The run is moved by compare-and-set rather than unconditionally: a run already at
     /// `awaiting_approval` (a second promotion in the same gate) matches nothing and is left
-    /// alone, the same zero-rows-tolerated shape [`claim_run`](WriteStore::claim_run) uses for its
-    /// item.
+    /// alone, the same zero-rows-tolerated shape as the `open -> blocked` of
+    /// [`claim_run`](WriteStore::claim_run)'s missing-tags branch, the one item write `claim_run`
+    /// has left since MOD-144.
     ///
     /// # Errors
     ///

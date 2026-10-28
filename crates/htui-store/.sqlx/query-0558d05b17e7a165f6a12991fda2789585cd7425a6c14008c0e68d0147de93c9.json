@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT status     AS \"status: Status\",\n                      project_id AS \"project_id: ProjectId\"\n                 FROM item WHERE id = $1 FOR UPDATE",
+  "query": "SELECT status     AS \"status: Status\",\n                      project_id AS \"project_id: ProjectId\",\n                      key        AS \"key!\"\n                 FROM item WHERE id = $1 FOR UPDATE",
   "describe": {
     "columns": [
       {
@@ -24,6 +24,17 @@
             "name": "project_id"
           }
         }
+      },
+      {
+        "ordinal": 2,
+        "name": "key!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "key"
+          }
+        }
       }
     ],
     "parameters": {
@@ -33,8 +44,9 @@
     },
     "nullable": [
       false,
-      false
+      false,
+      true
     ]
   },
-  "hash": "90b7cd1ea3606715c016db26516de6105fd9fba5011eb815976722dceba58629"
+  "hash": "0558d05b17e7a165f6a12991fda2789585cd7425a6c14008c0e68d0147de93c9"
 }

@@ -742,6 +742,112 @@ async fn admission_is_serialised_by_the_box_row_lock() {
     db.drop_db().await;
 }
 
+/// MOD-144 R1 (M1): `block_if_idle` takes the item lock before it reads the live runs, so it
+/// cannot block an item whose run another box is creating. Session A plays `create_run`'s
+/// transaction (the item's `FOR UPDATE`, then the `run` insert) and holds it open; session B's
+/// `block_if_idle`, on its own pool, must wait on that lock, and once A commits it must read A's
+/// run and answer `false` with nothing written. A single
+/// `UPDATE item ... WHERE status = 'open' AND NOT EXISTS (live run)` fails this: Postgres
+/// re-checks only the row after the wait, not the subquery, and blocks the item.
+#[tokio::test(flavor = "multi_thread")]
+async fn block_if_idle_waits_for_a_create_run_and_then_blocks_nothing() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let item = ids::HTUI_ANA_2;
+
+    let mut a = db.pool.begin().await.expect("session A");
+    sqlx::query("SELECT status FROM item WHERE id = $1 FOR UPDATE")
+        .bind(item.as_uuid())
+        .execute(&mut *a)
+        .await
+        .expect("A locks the item, as create_run does first");
+    let run = RunId::new();
+    sqlx::query(
+        "INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id, \
+         graph_snapshot, started_by, queued_at, repo_scope) \
+         SELECT $1, project_id, $2, 'graph', 'manual', 'queued', target_box_id, graph_snapshot, \
+                started_by, clock_timestamp(), '{}'::uuid[] \
+           FROM run WHERE id = $3",
+    )
+    .bind(run.as_uuid())
+    .bind(item.as_uuid())
+    .bind(ids::RUN_1.as_uuid())
+    .execute(&mut *a)
+    .await
+    .expect("A inserts its queued graph run");
+
+    let other = PgStore::connect(&db.url, &db.identity)
+        .await
+        .expect("second pool")
+        .store;
+    let note = htui_core::model::NewNote {
+        id: htui_core::model::NoteId::new(),
+        item_id: item,
+        body: "no_candidate_agent: phase `implement`".to_owned(),
+        created_by: ids::USER,
+        box_id: Some(ids::BOX),
+        via_step_id: None,
+        created_at: Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS),
+    };
+    let note_id = note.id;
+    let b = tokio::spawn(async move { other.block_if_idle(note).await });
+
+    // B is parked on A's row lock, not merely slow: wait until Postgres says so.
+    let mut waited = false;
+    for _ in 0..200 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+              WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting > 0 {
+            waited = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        waited,
+        "block_if_idle must wait on the item lock create_run holds"
+    );
+    assert!(!b.is_finished(), "and must not answer while A holds it");
+
+    a.commit().await.expect("A commits its run");
+    let blocked = b
+        .await
+        .expect("B's task")
+        .expect("block_if_idle must not fail");
+    assert!(
+        !blocked,
+        "after the wait B reads A's live run and blocks nothing"
+    );
+    let row = db
+        .store
+        .item(item)
+        .await
+        .expect("read the item")
+        .expect("the item exists");
+    assert_eq!(
+        row.status,
+        Status::Open,
+        "the item stays open under its queued run"
+    );
+    assert!(
+        db.store
+            .notes(item)
+            .await
+            .expect("read the notes")
+            .iter()
+            .all(|n| n.id != note_id),
+        "and no note is written over a live run (D98)"
+    );
+
+    db.drop_db().await;
+}
+
 /// ANA-2 §4.9's sweep, raced: two processes sweeping one box at once adopt every expired run
 /// exactly once between them.
 ///
