@@ -37,7 +37,9 @@ pub mod list;
 
 use std::cell::Cell;
 
-use htui_core::model::{ItemId, ItemKindId, ItemSummary, ProjectId, RunId, Scope, Status, StepId};
+use htui_core::model::{
+    ItemId, ItemKindId, ItemState, ItemSummary, ProjectId, RunId, Scope, StepId,
+};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -65,7 +67,7 @@ use crossterm::event::{KeyEvent, MouseEvent};
 /// The Backlog's default layout (MOD-115 M2 D2): the list beside the detail, 55% of the body.
 ///
 /// The list gets the larger half: it carries the longest strings (`KEY  status  title`, with
-/// `awaiting_approval` in it) and it is the pane a reader navigates from. The shell's layout
+/// `⚠ needs you` in it) and it is the pane a reader navigates from. The shell's layout
 /// engine splits it as `Layout::horizontal([Percentage(55), Percentage(45)])` did, cell for cell.
 pub const BACKLOG_LAYOUT: TabLayout = TabLayout {
     list: ListSize::Percent(55),
@@ -534,17 +536,20 @@ impl BacklogTab {
         });
     }
 
-    /// MOD-12 D9: `Q`. A finished item is refused here and nothing is sent; any other reads the
-    /// queue first, and the reply decides between queue and dequeue.
+    /// MOD-12 D9: `Q`. A finished item (MOD-144: state `done` or `closed`) is refused here and
+    /// nothing is sent; any other reads the queue first, and the reply decides between queue and
+    /// dequeue.
     fn toggle_queued(&mut self, ctx: &Ctx<'_>) {
         let Some(item) = self.item() else {
             ctx.emit(Action::Error(NO_ITEM_TO_QUEUE.to_owned()));
             return;
         };
-        if matches!(item.status, Status::Done | Status::Closed) {
+        let state = item.state();
+        if matches!(state, ItemState::Done | ItemState::Closed) {
             ctx.emit(Action::Error(format!(
                 "{} is {}: nothing to queue",
-                item.key, item.status
+                item.key,
+                state.word()
             )));
             return;
         }
@@ -2236,7 +2241,7 @@ mod tests {
 
     fn done_only() -> BacklogFilter {
         BacklogFilter {
-            statuses: vec![Status::Done],
+            states: vec![ItemState::Done],
             ..BacklogFilter::default()
         }
     }
@@ -2439,7 +2444,7 @@ mod tests {
         let bench = Bench::new().await;
         let mut tab = bench.tab();
         press(&mut tab, &bench, KeyCode::Char('f'));
-        for _ in 0..5 {
+        for _ in 0..7 {
             press(&mut tab, &bench, KeyCode::Char('l'));
         }
         press(&mut tab, &bench, KeyCode::Char(' '));
@@ -2451,7 +2456,7 @@ mod tests {
             items_reads(&actions),
             [(
                 ItemFilter {
-                    statuses: Some(vec![Status::Done]),
+                    states: Some(vec![ItemState::Done]),
                     ..ItemFilter::default()
                 },
                 false
@@ -2564,7 +2569,7 @@ mod tests {
         let done: Vec<ItemSummary> = bench
             .items
             .iter()
-            .filter(|item| item.status == Status::Done)
+            .filter(|item| item.state() == ItemState::Done)
             .cloned()
             .collect();
         assert!(
@@ -2883,7 +2888,7 @@ mod tests {
         press(&mut tab, &bench, KeyCode::Char('f'));
         tab.on_scope_change(&htui_only);
         assert_eq!(tab.filter.projects, [PROJECT_HTUI]);
-        assert_eq!(tab.filter.statuses, done_only().statuses, "status is kept");
+        assert_eq!(tab.filter.states, done_only().states, "the state is kept");
         assert!(tab.form.is_none(), "the form closed");
 
         let mut agy = BacklogTab {
@@ -3095,12 +3100,12 @@ mod tests {
         assert!(row.starts_with("src/**"), "{row:?} at {claim:?}");
     }
 
-    /// The rows of `bench` with `status`.
-    fn with_status(bench: &Bench, status: Status) -> Vec<ItemSummary> {
+    /// The rows of `bench` whose derived state is `state`.
+    fn with_state(bench: &Bench, state: ItemState) -> Vec<ItemSummary> {
         bench
             .items
             .iter()
-            .filter(|item| item.status == status)
+            .filter(|item| item.state() == state)
             .cloned()
             .collect()
     }
@@ -3142,7 +3147,7 @@ mod tests {
         let mut tab = bench.tab();
         tab.apply(done_only(), &bench.ctx());
         tab.on_reply(
-            &StoreReply::Items(with_status(&bench, Status::Done)),
+            &StoreReply::Items(with_state(&bench, ItemState::Done)),
             &mut bench.ctx(),
         );
         assert_eq!(tab.shown, done_only());

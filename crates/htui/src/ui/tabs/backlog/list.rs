@@ -13,8 +13,10 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width};
+use crate::ui::kit::status;
 
 /// Two spaces between the columns of an item row, as in the blueprint's `KEY  status  title`.
+/// The status column is the item's [`ItemState`](htui_core::model::ItemState) mark (MOD-144).
 const GAP: usize = 2;
 
 /// How far an item row is indented under its project header.
@@ -172,12 +174,11 @@ fn lines(view: &ListView<'_>, theme: &Theme, width: usize) -> Vec<Line<'static>>
         .map(|item| cell_width(&item.key))
         .max()
         .unwrap_or(0);
-    let status_width = view
-        .items
-        .iter()
-        .map(|item| cell_width(item.status.as_str()))
-        .max()
-        .unwrap_or(0);
+    let mark_width = |item: &ItemSummary| {
+        let mark = status::mark(item.state());
+        cell_width(mark.glyph) + 1 + cell_width(mark.word)
+    };
+    let status_width = view.items.iter().map(mark_width).max().unwrap_or(0);
     let title_width = width
         .saturating_sub(INDENT + key_width + GAP + status_width + GAP)
         .max(1);
@@ -201,22 +202,20 @@ fn lines(view: &ListView<'_>, theme: &Theme, width: usize) -> Vec<Line<'static>>
         }
         for item in group {
             let selected = view.selected == Some(Selection::Item(item.id));
-            out.push(row(
-                vec![
-                    Span::raw(" ".repeat(INDENT)),
-                    Span::styled(cells::pad(&item.key, key_width), theme.key),
-                    Span::raw(" ".repeat(GAP)),
-                    Span::styled(
-                        cells::pad(item.status.as_str(), status_width),
-                        theme.status_style(item.status),
-                    ),
-                    Span::raw(" ".repeat(GAP)),
-                    Span::styled(cells::clip(&item.title, title_width), theme.base),
-                ],
-                width,
-                selected,
-                theme,
+            let mut spans = vec![
+                Span::raw(" ".repeat(INDENT)),
+                Span::styled(cells::pad(&item.key, key_width), theme.key),
+                Span::raw(" ".repeat(GAP)),
+            ];
+            spans.extend(status::spans(item.state(), theme));
+            spans.push(Span::raw(
+                " ".repeat(status_width.saturating_sub(mark_width(item)) + GAP),
             ));
+            spans.push(Span::styled(
+                cells::clip(&item.title, title_width),
+                theme.base,
+            ));
+            out.push(row(spans, width, selected, theme));
         }
     }
     out
@@ -252,7 +251,7 @@ pub fn window(cursor: usize, len: usize, height: usize) -> usize {
 mod tests {
     use super::*;
     use htui_core::fixtures::ids;
-    use htui_core::model::Status;
+    use htui_core::model::{RunStatus, Status};
     use ratatui::buffer::Buffer;
     use ratatui::style::{Color, Modifier};
     use ratatui::widgets::Widget as _;
@@ -269,7 +268,13 @@ mod tests {
         assert_eq!(title(2, Some("status:done")), " Backlog (2) · status:done ");
     }
 
-    fn summary(key: &str, number: i32, title: &str, status: Status) -> ItemSummary {
+    fn summary(
+        key: &str,
+        number: i32,
+        title: &str,
+        status: Status,
+        latest: Option<RunStatus>,
+    ) -> ItemSummary {
         ItemSummary {
             id: ItemId::new(),
             project_id: ids::PROJECT_HTUI,
@@ -283,6 +288,7 @@ mod tests {
             required_tags: Vec::new(),
             updated_at: htui_core::fixtures::demo_at(0, 0),
             touched_paths: Vec::new(),
+            latest_run_status: latest,
         }
     }
 
@@ -291,12 +297,13 @@ mod tests {
     #[test]
     fn a_wide_key_and_title_keep_every_row_the_pane_width() {
         let items = vec![
-            summary("FEAT-12", 12, "short", Status::Open),
+            summary("FEAT-12", 12, "short", Status::Open, None),
             summary(
                 "\u{6f22}\u{5b57}-1",
                 1,
                 &"\u{6587}".repeat(40),
-                Status::InProgress,
+                Status::Open,
+                Some(RunStatus::Running),
             ),
         ];
         let projects = vec![ProjectRef {
@@ -334,11 +341,17 @@ mod tests {
         assert_eq!(status_at[0], status_at[1], "{lines:?}");
     }
 
-    /// The `htui` project with `FEAT-12` (in progress) and `FEAT-13` (open), as a 50-wide list.
+    /// The `htui` project with `FEAT-12` (running) and `FEAT-13` (open), as a 50-wide list.
     fn two_items() -> (Vec<ItemSummary>, Vec<ProjectRef>) {
         let items = vec![
-            summary("FEAT-12", 12, "short", Status::InProgress),
-            summary("FEAT-13", 13, "other", Status::Open),
+            summary(
+                "FEAT-12",
+                12,
+                "short",
+                Status::Open,
+                Some(RunStatus::Running),
+            ),
+            summary("FEAT-13", 13, "other", Status::Open, None),
         ];
         let projects = vec![ProjectRef {
             project_id: ids::PROJECT_HTUI,
@@ -417,10 +430,10 @@ mod tests {
         }
     }
 
-    /// MOD-80 D1: a key is bold in the terminal's own colour, not cyan, and `in_progress` is
-    /// drawn `running`.
+    /// MOD-80 D1: a key is bold in the terminal's own colour, not cyan, and a running item
+    /// (MOD-144: open over a running latest graph run) is drawn `running`, glyph and word.
     #[test]
-    fn an_item_key_is_bold_and_in_progress_is_running() {
+    fn an_item_key_is_bold_and_a_running_item_is_running() {
         let (items, projects) = two_items();
         let view = ListView {
             items: &items,
@@ -437,7 +450,10 @@ mod tests {
         assert_eq!(key.fg, Color::Reset, "a key is not cyan: {key:?}");
         let status_x = INDENT + cell_width("FEAT-12") + GAP;
         let status = &buffer[(u16::try_from(status_x).expect("small"), 1)];
-        assert_eq!(status.symbol(), "i", "in_progress starts here");
+        assert_eq!(status.symbol(), "\u{25d0}", "the running glyph starts here");
+        let word = &buffer[(u16::try_from(status_x + 2).expect("small"), 1)];
+        assert_eq!(word.symbol(), "r", "then `running`");
+        assert_eq!(word.fg, Color::Blue, "{word:?}");
         assert_eq!(
             status.fg,
             theme.running.fg.expect("running has a colour"),

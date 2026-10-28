@@ -13,7 +13,7 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 
-use htui_core::model::{Item, ItemId};
+use htui_core::model::{Item, ItemId, ItemState, RunSummary, latest_graph_run};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span, Text};
@@ -22,6 +22,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use crate::app::{Ctx, Handled};
 use crate::keys::{Act, KeyChord};
 use crate::store_worker::StoreReply;
+use crate::ui::kit::status;
 use crate::ui::markdown;
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Scroll, Step, message};
 use crossterm::event::KeyEvent;
@@ -29,12 +30,18 @@ use crossterm::event::KeyEvent;
 /// How many lines the head block takes: title, key line, meta line, blank.
 const HEAD: u16 = 4;
 
-/// Title, key, kind, status, tags, priority, version, and the body reflowed and wrapped at the
-/// pane's width (see the module doc).
+/// Title, key, kind, state, tags, priority, version, and the body reflowed and wrapped at the
+/// pane's width (see the module doc). The state is the item's derived
+/// [`ItemState`](htui_core::model::ItemState) mark (MOD-144), so the pane keeps the `Runs` reply
+/// beside the `Item` one.
 #[derive(Debug, Default)]
 pub struct BodyTab {
+    /// The selected item, from the last `on_item_change`.
+    selected: Option<ItemId>,
     /// The `Item` reply for the selected item.
     item: Option<Item>,
+    /// MOD-144: the selected item's runs (`Runs` reply), for its display state.
+    runs: Option<Vec<RunSummary>>,
     /// Scroll of the body paragraph, not of the head block.
     scroll: Scroll,
     /// The body area's width at the last render, for the scroll clamp (MOD-84 D7); 0 before the
@@ -59,6 +66,17 @@ impl BodyTab {
             .as_ref()
             .map_or(0, |item| markdown::row_count(&item.body, self.drawn.get()))
     }
+
+    /// The item's derived state: its stored status over its latest graph run, `open` until the
+    /// `Runs` reply lands.
+    fn state(&self, item: &Item) -> ItemState {
+        let latest = self
+            .runs
+            .as_deref()
+            .and_then(|runs| latest_graph_run(runs))
+            .map(|run| run.status);
+        ItemState::of(item.status, latest)
+    }
 }
 
 impl DetailTab for BodyTab {
@@ -70,8 +88,10 @@ impl DetailTab for BodyTab {
         "Body"
     }
 
-    fn on_item_change(&mut self, _item: Option<ItemId>) {
+    fn on_item_change(&mut self, item: Option<ItemId>) {
+        self.selected = item;
         self.item = None;
+        self.runs = None;
         self.scroll.reset();
     }
 
@@ -97,9 +117,16 @@ impl DetailTab for BodyTab {
     }
 
     fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
-        if let StoreReply::Item(item) = reply {
-            self.item = (**item).clone();
-            self.scroll.reset();
+        match reply {
+            StoreReply::Item(item) => {
+                self.item = (**item).clone();
+                self.scroll.reset();
+            }
+            // A reply for another item (a late one after a move) is not this item's.
+            StoreReply::Runs(runs) if runs.iter().all(|run| run.item_id == self.selected) => {
+                self.runs = Some(runs.clone());
+            }
+            _ => {}
         }
     }
 
@@ -114,15 +141,16 @@ impl DetailTab for BodyTab {
         } else {
             Cow::Owned(item.required_tags.join(", "))
         };
+        let mut key_line = vec![
+            Span::styled(item.key.as_str(), ctx.theme.key),
+            Span::raw("  "),
+            Span::styled(item.key_prefix.as_str(), ctx.theme.dim),
+            Span::raw("  "),
+        ];
+        key_line.extend(status::spans(self.state(item), ctx.theme));
         let head = Text::from(vec![
             Line::styled(item.title.as_str(), ctx.theme.title),
-            Line::from(vec![
-                Span::styled(item.key.as_str(), ctx.theme.key),
-                Span::raw("  "),
-                Span::styled(item.key_prefix.as_str(), ctx.theme.dim),
-                Span::raw("  "),
-                Span::styled(item.status.as_str(), ctx.theme.status_style(item.status)),
-            ]),
+            Line::from(key_line),
             Line::styled(
                 format!(
                     "{tags} \u{b7} priority {} \u{b7} version {}",
@@ -161,15 +189,15 @@ mod tests {
     use super::*;
     use crate::ui::tabs::backlog::detail::compose::bench::{Shell, drawn, key};
 
-    /// A pane on FEAT-1 that has landed the item.
+    /// A pane on FEAT-1 that has landed the item and its runs.
     async fn pane(shell: &Shell) -> BodyTab {
         let mut pane = BodyTab::new();
         pane.on_item_change(Some(ids::HTUI_FEAT_1));
-        let item = MemStore::demo()
-            .item(ids::HTUI_FEAT_1)
-            .await
-            .expect("the item");
+        let store = MemStore::demo();
+        let item = store.item(ids::HTUI_FEAT_1).await.expect("the item");
+        let runs = store.runs(ids::HTUI_FEAT_1).await.expect("the runs");
         pane.on_reply(&StoreReply::Item(Box::new(item)), &mut shell.ctx());
+        pane.on_reply(&StoreReply::Runs(runs), &mut shell.ctx());
         pane
     }
 
@@ -194,7 +222,7 @@ mod tests {
             rows[..4],
             [
                 "TUI scaffold",
-                "FEAT-1  FEAT  in_progress",
+                "FEAT-1  FEAT  \u{25d0} running",
                 "rust \u{b7} priority 2 \u{b7} version 1",
                 "",
             ],
@@ -238,6 +266,48 @@ mod tests {
             "{rows:#?}"
         );
         assert!(!rows.iter().any(|row| row.contains('`')), "{rows:#?}");
+    }
+
+    /// MOD-144 (PD16): the key line shows the derived state. Until the `Runs` reply lands it is
+    /// the stored status over no run (`open`); another item's late `Runs` reply is not this
+    /// item's; a move to another item forgets the runs.
+    #[tokio::test]
+    async fn the_key_line_reads_the_latest_graph_run() {
+        let shell = Shell::new();
+        let store = MemStore::demo();
+        let mut pane = BodyTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        let item = store.item(ids::HTUI_FEAT_1).await.expect("the item");
+        pane.on_reply(&StoreReply::Item(Box::new(item.clone())), &mut shell.ctx());
+        assert_eq!(
+            rows(&pane, &shell, 43, 30)[1],
+            "FEAT-1  FEAT  \u{25cb} open"
+        );
+
+        let other = store.runs(ids::HTUI_CLEAN_1).await.expect("CLEAN-1's runs");
+        assert!(!other.is_empty(), "CLEAN-1 has a failed run");
+        pane.on_reply(&StoreReply::Runs(other), &mut shell.ctx());
+        assert_eq!(
+            rows(&pane, &shell, 43, 30)[1],
+            "FEAT-1  FEAT  \u{25cb} open",
+            "CLEAN-1's runs are not FEAT-1's"
+        );
+
+        let runs = store.runs(ids::HTUI_FEAT_1).await.expect("FEAT-1's runs");
+        pane.on_reply(&StoreReply::Runs(runs), &mut shell.ctx());
+        assert_eq!(
+            rows(&pane, &shell, 43, 30)[1],
+            "FEAT-1  FEAT  \u{25d0} running",
+            "the rework run RUN_4 is the latest"
+        );
+
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.on_reply(&StoreReply::Item(Box::new(item)), &mut shell.ctx());
+        assert_eq!(
+            rows(&pane, &shell, 43, 30)[1],
+            "FEAT-1  FEAT  \u{25cb} open",
+            "a move forgets the runs"
+        );
     }
 
     /// MOD-84 D7, as the Notes pane's review L1: the clamp counts the rows on screen at the last

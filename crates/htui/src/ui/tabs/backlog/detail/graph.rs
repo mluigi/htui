@@ -23,6 +23,7 @@ use crate::store_worker::StoreReply;
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width, graphemes};
 use crate::ui::kit::chips::key_line;
+use crate::ui::kit::status::mark as state_mark;
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, PAGE, message};
 use crate::ui::tabs::backlog::list;
 use crossterm::event::KeyEvent;
@@ -532,7 +533,14 @@ fn lead_cells(row: &GraphRow<'_>, link: Link) -> usize {
 /// the status, the status and the repeat mark.
 fn fixed_cells(row: &GraphRow<'_>, link: Link) -> usize {
     let repeat = if link.repeat { cell_width(REPEAT) } else { 0 };
-    lead_cells(row, link) + 1 + cell_width(row.node.status.as_str()) + repeat
+    lead_cells(row, link) + 1 + cell_width(&status_text(row.node)) + repeat
+}
+
+/// A node's status as drawn: its derived [`ItemState`](htui_core::model::ItemState) mark,
+/// glyph, space, word, as one string so [`cut`] sees one span (MOD-144).
+fn status_text(node: &LinkNode) -> String {
+    let mark = state_mark(node.state());
+    format!("{} {}", mark.glyph, mark.word)
 }
 
 /// Cells of `node`'s whole `[slug:]KEY` label.
@@ -554,11 +562,11 @@ fn line(
     let node = row.node;
     // D7: a node outside the workspace is drawn, but dim, so it does not read as reachable.
     let (label_style, status_style, title_style) = if in_workspace {
-        (theme.key, theme.status_style(node.status), theme.base)
+        (theme.key, theme.status_style(node.state()), theme.base)
     } else {
         (theme.dim, theme.dim, theme.dim)
     };
-    let status = node.status.as_str();
+    let status = status_text(node);
     let mut spans = vec![
         Span::styled(if on_cursor { CURSOR } else { " " }, theme.accent),
         Span::raw(" "),
@@ -935,6 +943,7 @@ mod tests {
             title: format!("{key} title"),
             status: Status::Open,
             depth,
+            latest_run_status: None,
         }
     }
 
@@ -1245,7 +1254,7 @@ mod tests {
             ..root
         };
         let drawn = line(&row, false, node.project_id, true, false, 43, &shell.theme);
-        assert_eq!(text(&drawn), "  FEAT 1 in_progress TUI scaffold");
+        assert_eq!(text(&drawn), "  FEAT 1 ◐ running TUI scaffold");
     }
 
     #[tokio::test]
@@ -1472,12 +1481,12 @@ mod tests {
         assert_eq!(
             drawn,
             [
-                "▸ FIX-1 open Session leak on cancel",
-                "  → blocked_by ANA-1 done Prompt assembly …",
-                "    → blocked_by htui:ANA-1 done Data mode…",
-                "  → origin vulkan-tutor…:FEAT-1 in_progress",
-                "  → origin htui:TOOL-1 awaiting_approval",
-                "    → blocked_by htui:ANA-1 done (*)",
+                "▸ FIX-1 ○ open Session leak on cancel",
+                "  → blocked_by ANA-1 ● done Prompt assembl…",
+                "    → blocked_by htui:ANA-1 ● done Data mo…",
+                "  → origin vulkan-tutoria…:FEAT-1 ■ stopped",
+                "  → origin htui:TOOL-1 ⚠ needs you CI matr…",
+                "    → blocked_by htui:ANA-1 ● done (*)",
             ]
         );
     }
@@ -1493,14 +1502,14 @@ mod tests {
         assert_eq!(
             drawn,
             [
-                "▸ FEAT-1 in_progress TUI scaffold",
-                "  → origin     ANA-1 done Data model, box …",
-                "    ← blocked_by agy:ANA-1 done Prompt ass…",
-                "    ← origin     FEAT-3 queued (*)",
-                "    ← blocked_by TOOL-1 awaiting_approval",
-                "  ← blocked_by FEAT-2 blocked Agent driver…",
-                "    ← relates    agy:FEAT-1 open ACP trans…",
-                "  ← relates    FEAT-3 queued Postgres stor…",
+                "▸ FEAT-1 ◐ running TUI scaffold",
+                "  → origin     ANA-1 ● done Data model, bo…",
+                "    ← blocked_by agy:ANA-1 ● done Prompt a…",
+                "    ← origin     FEAT-3 ◌ queued (*)",
+                "    ← blocked_by TOOL-1 ⚠ needs you",
+                "  ← blocked_by FEAT-2 ⊘ blocked Agent driv…",
+                "    ← relates    agy:FEAT-1 ○ open ACP tra…",
+                "  ← relates    FEAT-3 ◌ queued Postgres st…",
             ]
         );
     }
@@ -1579,11 +1588,13 @@ mod tests {
             assert!(drawn.width() <= width, "{:?} at {width}", text(&drawn));
             text(&drawn)
         };
-        // 17 fixed cells and `origin` leave 8 for the label: one for the slug, so it goes whole.
-        assert_eq!(at(31), "  → origin FEAT-1 in_progress");
+        // 15 fixed cells (the `■ stopped` mark, MOD-144) and `origin` leave 8 for the label: one
+        // for the slug, so it goes whole; two more and the slug shows clipped.
+        assert_eq!(at(29), "  → origin FEAT-1 ■ stopped");
+        assert_eq!(at(31), "  → origin vu…:FEAT-1 ■ stopped");
         // Then the status gives way, cut at the pane edge, and the key goes last.
-        assert_eq!(at(25), "  → origin FEAT-1 in_prog");
-        assert_eq!(at(23), "  → origin FEAT-1 in_pr");
+        assert_eq!(at(25), "  → origin FEAT-1 ■ stopp");
+        assert_eq!(at(23), "  → origin FEAT-1 ■ sto");
         assert_eq!(at(17), "  → origin FEAT-1");
         assert_eq!(at(16), "  → origin FEAT…");
 
@@ -1599,11 +1610,11 @@ mod tests {
             18,
             &shell.theme,
         );
-        assert_eq!(text(&drawn), "  → origin ANA-1 d");
+        assert_eq!(text(&drawn), "  → origin ANA-1 ●");
 
         // An 80-column terminal's pane: the widest status gives way before the key does.
         let tool_1 = |width| text(&lines(&feat_1, 0, &shell.projects, width, &shell.theme)[4]);
-        assert_eq!(tool_1(34), "    ← blocked_by TOOL-1 awaiting_a");
+        assert_eq!(tool_1(30), "    ← blocked_by TOOL-1 ⚠ need");
         assert_eq!(tool_1(23), "    ← blocked_by TOOL-1");
         assert_eq!(tool_1(22), "    ← blocked_by TOOL…");
     }
@@ -1619,7 +1630,7 @@ mod tests {
         tab.on_reply(&StoreReply::Links(demo(ids::HTUI_FEAT_1).await), &mut ctx);
         assert_eq!(
             draw(&tab, &shell, 43, 6)[0],
-            "▸ FEAT-1 in_progress TUI scaffold"
+            "▸ FEAT-1 ◐ running TUI scaffold"
         );
     }
 
@@ -1702,8 +1713,8 @@ mod tests {
         assert_eq!(
             drawn,
             [
-                "▸ R open 图形视图图形视图图形视图图形视图…",
-                "  → relates    项目:键-1 open 宽字符标题宽…",
+                "▸ R ○ open 图形视图图形视图图形视图图形视…",
+                "  → relates    项目:键-1 ○ open 宽字符标题…",
             ]
         );
     }
@@ -1776,20 +1787,20 @@ mod tests {
                 .map(text)
                 .collect()
         };
-        // `long-project:Y` fits 34 columns padded, so both rows are.
+        // `long-project:Y` fits 36 columns padded (the `○ open` mark, MOD-144), so both rows are.
+        assert_eq!(
+            at(36)[1..],
+            [
+                "  → relates    X ○ open X title",
+                "  → origin     long-project:Y ○ open",
+            ]
+        );
+        // At 34 it fits only unpadded, so neither row is, though `X` alone would be.
         assert_eq!(
             at(34)[1..],
             [
-                "  → relates    X open X title",
-                "  → origin     long-project:Y open",
-            ]
-        );
-        // At 32 it fits only unpadded, so neither row is, though `X` alone would be.
-        assert_eq!(
-            at(32)[1..],
-            [
-                "  → relates X open X title",
-                "  → origin long-project:Y open",
+                "  → relates X ○ open X title",
+                "  → origin long-project:Y ○ open",
             ]
         );
     }
@@ -1808,9 +1819,9 @@ mod tests {
         assert_eq!(
             draw(&tab, &shell, 43, 4),
             [
-                "    ← origin     FEAT-3 queued (*)",
-                "▸   ← blocked_by TOOL-1 awaiting_approval",
-                "  ← blocked_by FEAT-2 blocked Agent driver…",
+                "    ← origin     FEAT-3 ◌ queued (*)",
+                "▸   ← blocked_by TOOL-1 ⚠ needs you",
+                "  ← blocked_by FEAT-2 ⊘ blocked Agent driv…",
                 "depth 2/3",
             ]
         );
@@ -1820,9 +1831,9 @@ mod tests {
         assert_eq!(
             draw(&tab, &shell, 43, 4),
             [
-                "  ← blocked_by FEAT-2 blocked Agent driver…",
-                "    ← relates    agy:FEAT-1 open ACP trans…",
-                "▸ ← relates    FEAT-3 queued Postgres stor…",
+                "  ← blocked_by FEAT-2 ⊘ blocked Agent driv…",
+                "    ← relates    agy:FEAT-1 ○ open ACP tra…",
+                "▸ ← relates    FEAT-3 ◌ queued Postgres st…",
                 "depth 2/3",
             ],
             "the last row is the window's last"
