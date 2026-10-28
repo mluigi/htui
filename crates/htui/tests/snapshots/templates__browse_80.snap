@@ -24,4 +24,4 @@ Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings      0 waiting ·  ?
 │                              ││diff and its verification output first and fix│
 │                              ││the                                           │
 │                              ││cause rather than the symptom. Write a        │
-╰─h/l view · n new · r reload──╯╰──────────────────────────────────────────────╯
+╰─j/k · n new · r reload───────╯╰──────────────────────────────────────────────╯

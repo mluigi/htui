@@ -26,7 +26,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::app::{Ctx, Handled};
 use crate::editor::ExternalEditOutcome;
-use crate::keys::{Act, Hint, KeyChord, Stack};
+use crate::keys::{Act, KeyChord, Stack};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::kit::chips::key_line;
@@ -88,11 +88,6 @@ impl View {
 
 /// The two views' chips, in switch order (MOD-115 M4 E5).
 pub(super) const VIEWS: &[&str] = &["Skills", "Templates"];
-
-/// The view switch as the Skills list's hint names it (MOD-115 M4 E5): `skills.switch_view` is
-/// this file's act, the delegate the Library's browse stacks name for it (`keys/views.rs`), so the
-/// Library's list reaches it through here.
-pub(super) const SWITCH_HINT: Hint = Hint::Two(Act::SkillsSwitchView, "view");
 
 /// `pane` with the view chips on its top border, `view` (an index into [`VIEWS`]) the active one:
 /// the pane that leads the shown view carries them, its title kept first (M4 C5).

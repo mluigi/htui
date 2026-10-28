@@ -115,10 +115,11 @@ const BROWSE_HINT: HintSpec = &[
     Hint::Two(Act::SkillsSwitchView, "view"),
 ];
 
-/// The tree pane's keys while browsing (MOD-115 M4 E5, Q2: a pane shows its own keys): the view
-/// its chips name, a new template and a reload, in its 28 cells.
+/// The tree pane's keys while browsing (MOD-115 M4 E5, Q2: a pane shows its own keys): the
+/// tree's motion, as every list's hint leads with it, then a new template and a reload, 22 of
+/// its 28 cells. The view switch is the chips' (L-skills repair 1).
 const LIST_HINT: HintSpec = &[
-    Hint::Two(Act::SkillsSwitchView, "view"),
+    Hint::Pair(Act::ListDown, Act::ListUp, ""),
     Hint::One(Act::New, "new"),
     Hint::One(Act::Reload, "reload"),
 ];
@@ -2846,5 +2847,81 @@ mod tests {
             "{narrow:?}"
         );
         assert!(narrow.ends_with(" \u{b7}\u{2026}"), "{narrow:?}");
+    }
+
+    /// MOD-115 M4 E5, MOD-85: the body's and the draft's titles are the kit pane's title role,
+    /// the tab's accent in bold while the pane is focused and dim while it is not. In colour and
+    /// in monochrome.
+    #[tokio::test]
+    async fn the_body_and_draft_titles_are_the_pane_title_role() {
+        use ratatui::style::{Modifier, Style};
+        let in_style = |cell: &ratatui::buffer::Cell, style: Style| {
+            style.fg.is_none_or(|fg| cell.fg == fg)
+                && style.bg.is_none_or(|bg| cell.bg == bg)
+                && cell.modifier.contains(style.add_modifier)
+        };
+        let column_of = |row: &str, text: &str| {
+            let at = row
+                .find(text)
+                .unwrap_or_else(|| panic!("{text:?} is not on {row:?}"));
+            u16::try_from(row[..at].chars().count()).expect("a short row")
+        };
+        for theme in [Theme::default(), Theme::monochrome()] {
+            let bench = Bench {
+                theme,
+                ..Bench::new()
+            };
+            let focused = bench
+                .theme
+                .tab_accent(SkillsTab::ID.0)
+                .add_modifier(Modifier::BOLD);
+            let mut view = browsing(&bench).await;
+            view.on_key(key('j'), &mut bench.ctx());
+            let ctx = bench.ctx().with_focus(PaneId::Detail);
+            let (buffer, rows) = frame_of(&view, &ctx, 100, 12);
+            // The body's title follows the list's corner and its own: `╮╭─ {name} v1 (head v1)`.
+            let x = column_of(&rows[0], "\u{256e}\u{256d}\u{2500} ") + 4;
+            assert!(rows[0].contains(" v1 (head v1)"), "{rows:#?}");
+            assert!(in_style(&buffer[(x, 0)], focused), "focused: {rows:#?}");
+            let (buffer, rows) = frame_of(&view, &bench.ctx(), 100, 12);
+            let title = &buffer[(x, 0)];
+            assert!(in_style(title, bench.theme.dim), "unfocused: {rows:#?}");
+            assert!(!title.modifier.contains(Modifier::BOLD), "{rows:#?}");
+
+            let view = TemplatesView {
+                mode: Mode::Editing(Editor::new(
+                    ids::PROJECT_VULKAN,
+                    "implement".to_owned(),
+                    Some(1),
+                    Some(1),
+                    "body\n",
+                )),
+                ..TemplatesView::default()
+            };
+            let (buffer, rows) = frame_of(&view, &bench.ctx(), 100, 12);
+            let x = column_of(&rows[0], "implement \u{b7} editing");
+            assert!(in_style(&buffer[(x, 0)], focused), "the draft: {rows:#?}");
+        }
+    }
+
+    /// MOD-115 M4 L-skills repair 1 (Q2): the focused list shows its own keys whole in its 28
+    /// cells: its motion first, as every list's hint does, then a new template and the view's own
+    /// act, the keys the Browse row showed before the port; the row's keys are the body's.
+    #[tokio::test]
+    async fn the_list_hint_leads_with_its_motion() {
+        let bench = Bench::new();
+        let mut view = browsing(&bench).await;
+        view.on_key(key('j'), &mut bench.ctx());
+        let (_, rows) = frame_of(&view, &bench.ctx(), 100, 12);
+        let bottom = rows
+            .iter()
+            .rposition(|row| row.starts_with('\u{2570}'))
+            .expect("the list's bottom border");
+        let list: String = rows[bottom].chars().take(32).collect();
+        assert_eq!(
+            list.trim_matches(['\u{2570}', '\u{256f}', '\u{2500}']),
+            "j/k \u{b7} n new \u{b7} r reload",
+            "{rows:#?}"
+        );
     }
 }
