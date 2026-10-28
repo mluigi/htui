@@ -26,6 +26,13 @@
 //! replaces so another htui process sees the write (MOD-90 D1). A half-stored identity is an
 //! error, not `None`, and [`set_machine_identity`] never leaves one behind. The `test-support`
 //! fake honours its `refuse_store` switch for these entries only.
+//!
+//! The Qdrant API key (MOD-158 D4) is read through [`qdrant_api_key`]: `HTUI_QDRANT_API_KEY` when
+//! set (development/CI; [`QdrantEnv`], removed from every agent and shell spawn, `R-SEC-2`), else
+//! the keyring entry `qdrant-key`, else, for `htui worker`, its `--qdrant-key-stdin` line or the
+//! credential `htui-qdrant-key` ([`QDRANT_KEY_CREDENTIAL`]). Unlike the DSN, no key anywhere is
+//! not an error. The keyring `qdrant-url` entry is retired: it is read only to offer it once as the
+//! database-wide setting (D10).
 
 use htui_core::secret::MachineIdentity;
 use htui_core::store::{Result, StoreError};
@@ -298,6 +305,196 @@ pub fn headless_dsn(
         }
     }
     Err(DsnSourceError::NoSource { keyring })
+}
+
+/// MOD-158 D4, D11: the systemd credential name of the Qdrant API key
+/// (`LoadCredentialEncrypted=htui-qdrant-key:…`), read by `htui worker` beside [`CREDENTIAL_NAME`].
+pub const QDRANT_KEY_CREDENTIAL: &str = "htui-qdrant-key";
+
+/// MOD-158 D3, D4: the two development/CI variables, `HTUI_QDRANT_URL` and `HTUI_QDRANT_API_KEY`
+/// ([`htui_core::secret::QDRANT_URL_ENV`], [`htui_core::secret::QDRANT_KEY_ENV`]), as this process
+/// read them. Blank reads as unset; a value is trimmed. `Debug` never prints the key.
+///
+/// [`from_process`](Self::from_process) is for production entry points only: a test builds this
+/// with [`new`](Self::new) or as a literal, because a sandbox's environment may carry
+/// `HTUI_QDRANT_URL` and a test must behave the same there and on the host (blueprint P-13).
+#[derive(Clone, Default)]
+pub struct QdrantEnv {
+    /// `HTUI_QDRANT_URL`, unvalidated (the resolver parses it, and an invalid one is an error).
+    pub url: Option<String>,
+    /// `HTUI_QDRANT_API_KEY`, in memory wiped when dropped.
+    pub api_key: Option<Zeroizing<String>>,
+}
+
+impl QdrantEnv {
+    /// The two values as given; blank is unset and a value is trimmed.
+    #[must_use]
+    pub fn new(url: Option<String>, api_key: Option<String>) -> Self {
+        // Wrapped at once, so the untrimmed copy is wiped too.
+        let api_key = api_key.map(Zeroizing::new);
+        Self {
+            url: url.and_then(|url| non_blank(&url).map(str::to_owned)),
+            api_key: api_key
+                .as_deref()
+                .and_then(|key| non_blank(key))
+                .map(|key| Zeroizing::new(key.to_owned())),
+        }
+    }
+
+    /// Reads `HTUI_QDRANT_URL` and `HTUI_QDRANT_API_KEY` from this process's environment
+    /// (`std::env::var`, no `unsafe`; a value that is not UTF-8 is unset). Production entry points
+    /// only (blueprint P-13).
+    #[must_use]
+    pub fn from_process() -> Self {
+        Self::new(
+            std::env::var(htui_core::secret::QDRANT_URL_ENV).ok(),
+            std::env::var(htui_core::secret::QDRANT_KEY_ENV).ok(),
+        )
+    }
+}
+
+impl core::fmt::Debug for QdrantEnv {
+    /// The URL (no secret) and whether a key is set, never the key.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("QdrantEnv")
+            .field("url", &self.url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// `text` trimmed, or `None` when that leaves nothing.
+fn non_blank(text: &str) -> Option<&str> {
+    let text = text.trim();
+    (!text.is_empty()).then_some(text)
+}
+
+/// MOD-158 D4: which process asks for the Qdrant API key, which decides the sources after the
+/// environment variable.
+#[derive(Clone, Copy)]
+pub enum KeyHost<'a> {
+    /// The TUI and the CLI verbs: this box's keyring, read per request, so a key stored in
+    /// Settings applies to the next search; a keyring failure is an error.
+    Interactive,
+    /// `htui worker`: its `--qdrant-key-stdin` line and nothing else when given (a blank line is
+    /// no key, never a fall-through); else the keyring (a failure is "no keyring"); else, on
+    /// Linux, `credentials_dir/htui-qdrant-key` ([`QDRANT_KEY_CREDENTIAL`]).
+    Headless {
+        /// `Some` exactly when `--qdrant-key-stdin` was given: the line read at worker start.
+        stdin: Option<&'a str>,
+        /// `$CREDENTIALS_DIRECTORY` as the caller read it (a directory, not the secret; passed in
+        /// so tests need no `set_var`). Read on Linux only.
+        credentials_dir: Option<&'a std::path::Path>,
+    },
+}
+
+impl core::fmt::Debug for KeyHost<'_> {
+    /// Whether stdin is a source, never what it holds.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Interactive => f.write_str("Interactive"),
+            Self::Headless {
+                stdin,
+                credentials_dir,
+            } => f
+                .debug_struct("Headless")
+                .field("stdin", &stdin.is_some())
+                .field("credentials_dir", credentials_dir)
+                .finish(),
+        }
+    }
+}
+
+/// Why no Qdrant API key could be read. No variant carries the key.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum QdrantKeyError {
+    /// [`KeyHost::Interactive`]'s keyring failed.
+    #[error("the Qdrant API key could not be read from the OS keyring: {0}")]
+    Keyring(String),
+    /// The credential exists and could not be read.
+    #[error("the systemd credential {path} could not be read: {why}")]
+    Credential {
+        /// Its path.
+        path: String,
+        /// The OS error.
+        why: String,
+    },
+}
+
+/// MOD-158 D4: the Qdrant API key. `env` (`HTUI_QDRANT_API_KEY`, when non-blank) first, then
+/// `host`'s sources. `keyring` is [`get_qdrant_api_key`] in production; a test passes a closure,
+/// so no case reads a keyring. Never Postgres, `argv` or a plaintext file.
+///
+/// No key anywhere is `Ok(None)`, not a refusal as [`headless_dsn`]'s is: a Qdrant without a key
+/// is allowed (`docs/ANA-37.md` §8 Q2).
+///
+/// # Errors
+///
+/// [`QdrantKeyError`]; never the key.
+pub fn qdrant_api_key(
+    env: Option<&str>,
+    host: KeyHost<'_>,
+    keyring: &dyn Fn() -> Result<Option<String>>,
+) -> core::result::Result<Option<Zeroizing<String>>, QdrantKeyError> {
+    let owned = |key: &str| Zeroizing::new(key.to_owned());
+    if let Some(key) = env.and_then(non_blank) {
+        return Ok(Some(owned(key)));
+    }
+    match host {
+        KeyHost::Interactive => {
+            // The keyring answers a plain `String`: wrapped at once.
+            let key = keyring()
+                .map_err(|err| QdrantKeyError::Keyring(err.to_string()))?
+                .map(Zeroizing::new);
+            Ok(key.as_deref().and_then(|key| non_blank(key)).map(owned))
+        }
+        KeyHost::Headless {
+            stdin: Some(line), ..
+        } => Ok(non_blank(line).map(owned)),
+        KeyHost::Headless {
+            stdin: None,
+            credentials_dir,
+        } => {
+            if let Ok(Some(key)) = keyring() {
+                let key = Zeroizing::new(key);
+                if let Some(key) = non_blank(&key) {
+                    return Ok(Some(owned(key)));
+                }
+            }
+            headless_key_credential(credentials_dir)
+        }
+    }
+}
+
+/// The last headless source: `credentials_dir/htui-qdrant-key`, trimmed, on Linux; a missing or
+/// blank file is no key.
+#[cfg(target_os = "linux")]
+fn headless_key_credential(
+    credentials_dir: Option<&std::path::Path>,
+) -> core::result::Result<Option<Zeroizing<String>>, QdrantKeyError> {
+    let Some(dir) = credentials_dir else {
+        return Ok(None);
+    };
+    let path = dir.join(QDRANT_KEY_CREDENTIAL);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let text = Zeroizing::new(text);
+            Ok(non_blank(&text).map(|key| Zeroizing::new(key.to_owned())))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(QdrantKeyError::Credential {
+            path: path.display().to_string(),
+            why: err.to_string(),
+        }),
+    }
+}
+
+/// Off Linux there is no systemd credential: no key.
+#[cfg(not(target_os = "linux"))]
+fn headless_key_credential(
+    _credentials_dir: Option<&std::path::Path>,
+) -> core::result::Result<Option<Zeroizing<String>>, QdrantKeyError> {
+    Ok(None)
 }
 
 /// Retrieves the stored Qdrant URL, if any.
@@ -929,6 +1126,310 @@ mod headless_dsn_tests {
             matches!(err, DsnSourceError::NoSource { .. }),
             "got {err:?}"
         );
+    }
+}
+
+/// MOD-158 D4: the Qdrant API key's sources. Every keyring answer is a closure, so no case reads
+/// the developer's keyring or the process-wide fake (blueprint R-6), and no case reads the
+/// process environment (P-13).
+#[cfg(test)]
+mod qdrant_key_tests {
+    #[cfg(target_os = "linux")]
+    use std::cell::Cell;
+
+    use htui_core::store::{Result, StoreError};
+
+    use super::{KeyHost, QDRANT_KEY_CREDENTIAL, QdrantEnv, QdrantKeyError, qdrant_api_key};
+
+    /// Distinct values, so an answer names its source.
+    const ENV_KEY: &str = "env-key-1";
+    const STDIN_KEY: &str = "stdin-key-2";
+    const KEYRING_KEY: &str = "keyring-key-3";
+    #[cfg(target_os = "linux")]
+    const CREDENTIAL_KEY: &str = "credential-key-4";
+
+    /// A keyring that must not be read.
+    fn unread() -> Result<Option<String>> {
+        panic!("the keyring is not read")
+    }
+
+    /// A keyring holding [`KEYRING_KEY`].
+    fn holding() -> Result<Option<String>> {
+        Ok(Some(KEYRING_KEY.to_owned()))
+    }
+
+    /// A keyring holding nothing.
+    fn empty() -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// A keyring that cannot be opened.
+    fn broken() -> Result<Option<String>> {
+        Err(StoreError::Backend("no secret service".to_owned()))
+    }
+
+    /// A credentials directory holding `htui-qdrant-key` with `text` in it.
+    #[cfg(target_os = "linux")]
+    fn credentials(text: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("a credentials directory");
+        std::fs::write(dir.path().join(QDRANT_KEY_CREDENTIAL), text).expect("write the credential");
+        dir
+    }
+
+    fn key(
+        answer: core::result::Result<Option<zeroize::Zeroizing<String>>, QdrantKeyError>,
+    ) -> Option<String> {
+        answer
+            .expect("a key source answers")
+            .map(|key| key.as_str().to_owned())
+    }
+
+    #[test]
+    fn the_env_key_wins_and_the_keyring_is_not_read() {
+        assert_eq!(
+            key(qdrant_api_key(Some(ENV_KEY), KeyHost::Interactive, &unread)),
+            Some(ENV_KEY.to_owned())
+        );
+        assert_eq!(
+            key(qdrant_api_key(
+                Some(ENV_KEY),
+                KeyHost::Headless {
+                    stdin: Some(STDIN_KEY),
+                    credentials_dir: None,
+                },
+                &unread,
+            )),
+            Some(ENV_KEY.to_owned()),
+            "HTUI_QDRANT_API_KEY comes before every other source (D4)"
+        );
+    }
+
+    #[test]
+    fn a_blank_env_key_is_unset() {
+        assert_eq!(
+            key(qdrant_api_key(Some("  \t"), KeyHost::Interactive, &holding)),
+            Some(KEYRING_KEY.to_owned())
+        );
+        assert_eq!(
+            key(qdrant_api_key(Some(""), KeyHost::Interactive, &holding)),
+            Some(KEYRING_KEY.to_owned())
+        );
+        let env = QdrantEnv::new(Some(" ".to_owned()), Some("\n".to_owned()));
+        assert!(env.url.is_none(), "a blank HTUI_QDRANT_URL is unset");
+        assert!(
+            env.api_key.is_none(),
+            "a blank HTUI_QDRANT_API_KEY is unset"
+        );
+        let env = QdrantEnv::new(
+            Some(" http://q:6334 ".to_owned()),
+            Some(format!(" {ENV_KEY}\n")),
+        );
+        assert_eq!(env.url.as_deref(), Some("http://q:6334"));
+        assert_eq!(env.api_key.as_deref().map(String::as_str), Some(ENV_KEY));
+    }
+
+    #[test]
+    fn interactive_reads_the_keyring_and_a_failure_is_an_error() {
+        assert_eq!(
+            key(qdrant_api_key(None, KeyHost::Interactive, &holding)),
+            Some(KEYRING_KEY.to_owned())
+        );
+        assert_eq!(
+            key(qdrant_api_key(None, KeyHost::Interactive, &empty)),
+            None
+        );
+        let err = qdrant_api_key(None, KeyHost::Interactive, &broken)
+            .expect_err("an interactive keyring failure is not 'no key'");
+        assert!(matches!(err, QdrantKeyError::Keyring(_)), "got {err:?}");
+        let text = err.to_string();
+        assert!(text.contains("OS keyring"), "{text}");
+        assert!(text.contains("no secret service"), "{text}");
+    }
+
+    #[test]
+    fn a_headless_stdin_key_wins_and_nothing_else_is_read() {
+        let headless = |stdin| KeyHost::Headless {
+            stdin,
+            credentials_dir: None,
+        };
+        assert_eq!(
+            key(qdrant_api_key(None, headless(Some(STDIN_KEY)), &unread)),
+            Some(STDIN_KEY.to_owned())
+        );
+        assert_eq!(
+            key(qdrant_api_key(None, headless(Some(" \n")), &unread)),
+            None,
+            "explicit wins: a blank --qdrant-key-stdin line never falls through to the keyring"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let dir = credentials(CREDENTIAL_KEY);
+            assert_eq!(
+                key(qdrant_api_key(
+                    None,
+                    KeyHost::Headless {
+                        stdin: Some(STDIN_KEY),
+                        credentials_dir: Some(dir.path()),
+                    },
+                    &unread,
+                )),
+                Some(STDIN_KEY.to_owned()),
+                "the credential is not read either"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn headless_reads_the_keyring_before_the_credential() {
+        let dir = credentials(CREDENTIAL_KEY);
+        let reads = Cell::new(0);
+        let counting = || {
+            reads.set(reads.get() + 1);
+            holding()
+        };
+        assert_eq!(
+            key(qdrant_api_key(
+                None,
+                KeyHost::Headless {
+                    stdin: None,
+                    credentials_dir: Some(dir.path()),
+                },
+                &counting,
+            )),
+            Some(KEYRING_KEY.to_owned())
+        );
+        assert_eq!(reads.get(), 1);
+        assert_eq!(
+            key(qdrant_api_key(
+                None,
+                KeyHost::Headless {
+                    stdin: None,
+                    credentials_dir: Some(dir.path()),
+                },
+                &empty,
+            )),
+            Some(CREDENTIAL_KEY.to_owned()),
+            "an empty keyring falls back to the credential"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_headless_keyring_failure_falls_back_to_the_credential() {
+        let dir = credentials(&format!("{CREDENTIAL_KEY}\n"));
+        assert_eq!(
+            key(qdrant_api_key(
+                None,
+                KeyHost::Headless {
+                    stdin: None,
+                    credentials_dir: Some(dir.path()),
+                },
+                &broken,
+            )),
+            Some(CREDENTIAL_KEY.to_owned()),
+            "a headless keyring error is no keyring; the credential is trimmed"
+        );
+    }
+
+    #[test]
+    fn no_key_anywhere_is_none_not_an_error() {
+        let empty_dir = tempfile::tempdir().expect("an empty credentials directory");
+        for keyring in [&empty as &dyn Fn() -> Result<Option<String>>, &broken] {
+            assert_eq!(
+                key(qdrant_api_key(
+                    None,
+                    KeyHost::Headless {
+                        stdin: None,
+                        credentials_dir: Some(empty_dir.path()),
+                    },
+                    keyring,
+                )),
+                None,
+                "a Qdrant without a key is allowed (ANA-37 §8 Q2)"
+            );
+            assert_eq!(
+                key(qdrant_api_key(
+                    None,
+                    KeyHost::Headless {
+                        stdin: None,
+                        credentials_dir: None,
+                    },
+                    keyring,
+                )),
+                None
+            );
+        }
+        assert_eq!(
+            key(qdrant_api_key(None, KeyHost::Interactive, &empty)),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unreadable_credential_names_its_path_and_never_the_key() {
+        let dir = tempfile::tempdir().expect("a credentials directory");
+        let path = dir.path().join(QDRANT_KEY_CREDENTIAL);
+        std::fs::create_dir(&path).expect("a directory where the credential should be");
+        let err = qdrant_api_key(
+            None,
+            KeyHost::Headless {
+                stdin: None,
+                credentials_dir: Some(dir.path()),
+            },
+            &broken,
+        )
+        .expect_err("a credential that exists and cannot be read is a failure");
+        let QdrantKeyError::Credential { path: named, .. } = &err else {
+            panic!("expected Credential, got {err:?}");
+        };
+        assert_eq!(named, &path.display().to_string());
+        let text = err.to_string();
+        assert!(text.contains(QDRANT_KEY_CREDENTIAL), "{text}");
+        for value in [ENV_KEY, STDIN_KEY, KEYRING_KEY, CREDENTIAL_KEY] {
+            assert!(!text.contains(value), "{text}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_blank_credential_is_no_key() {
+        let dir = credentials(" \n\t\n");
+        assert_eq!(
+            key(qdrant_api_key(
+                None,
+                KeyHost::Headless {
+                    stdin: None,
+                    credentials_dir: Some(dir.path()),
+                },
+                &empty,
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn the_key_credential_is_named_htui_qdrant_key() {
+        assert_eq!(QDRANT_KEY_CREDENTIAL, "htui-qdrant-key");
+        assert_ne!(QDRANT_KEY_CREDENTIAL, super::CREDENTIAL_NAME);
+    }
+
+    #[test]
+    fn qdrant_env_debug_never_prints_the_key() {
+        let env = QdrantEnv::new(Some("http://q:6334".to_owned()), Some(ENV_KEY.to_owned()));
+        let shown = format!("{env:?}");
+        assert!(!shown.contains(ENV_KEY), "{shown}");
+        assert!(
+            shown.contains("http://q:6334"),
+            "the URL is no secret: {shown}"
+        );
+        let host = KeyHost::Headless {
+            stdin: Some(STDIN_KEY),
+            credentials_dir: None,
+        };
+        let shown = format!("{host:?}");
+        assert!(!shown.contains(STDIN_KEY), "{shown}");
     }
 }
 
