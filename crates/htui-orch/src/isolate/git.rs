@@ -212,7 +212,7 @@ impl Cli {
     /// The `git --version` command the probe runs. The binary is configurable (a wrapper script is
     /// code htui does not own), so `HTUI_OWN_ENV` is removed beside `SCRUBBED_ENV` (MOD-158 D5,
     /// `R-SEC-2`).
-    fn probe_command(binary: &std::path::Path) -> std::process::Command {
+    fn probe_command(binary: &Path) -> std::process::Command {
         let mut probe = std::process::Command::new(binary);
         probe
             .arg("--version")
