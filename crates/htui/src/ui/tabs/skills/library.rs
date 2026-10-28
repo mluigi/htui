@@ -4194,4 +4194,71 @@ mod tests {
             "{rows:#?}"
         );
     }
+
+    /// MOD-115 M4 L-skills repair 2: every empty state of the pane says what is missing and the
+    /// next step (`kit::empty`), and a refused read names where it is fixed: before the first
+    /// reply, on a refused read, on an empty library and on a skill with no version yet.
+    #[tokio::test]
+    async fn every_empty_pane_names_its_next_step() {
+        let bench = Bench::new();
+        let shows = |view: &LibraryView, bench: &Bench, texts: &[&str]| {
+            let (_, rows) = frame_of(view, &bench.ctx(), 100, 12);
+            for text in texts {
+                assert!(
+                    rows.iter().any(|row| row.contains(text)),
+                    "{text:?}: {rows:#?}"
+                );
+            }
+        };
+        shows(
+            &LibraryView::default(),
+            &bench,
+            &["skills not read yet", "they appear once the store answers"],
+        );
+        let refused = LibraryView {
+            unavailable: Some("store unreachable: gone".to_owned()),
+            ..LibraryView::default()
+        };
+        shows(
+            &refused,
+            &bench,
+            &[
+                "skills unavailable: store unreachable: gone",
+                "Settings \u{203a} Connection stores a DSN",
+            ],
+        );
+        let empty = LibraryView {
+            snapshot: Some(SkillsSnapshot {
+                skills: Vec::new(),
+                global: Vec::new(),
+                projects: Vec::new(),
+            }),
+            ..LibraryView::default()
+        };
+        shows(
+            &empty,
+            &bench,
+            &["select a skill", "n creates one \u{b7} I imports some"],
+        );
+        let mut unversioned = browsing(&bench).await;
+        if let Some(snapshot) = unversioned.snapshot.as_mut() {
+            snapshot.skills[0].versions.clear();
+        }
+        shows(
+            &unversioned,
+            &bench,
+            &["select a skill", "e writes its first version"],
+        );
+
+        // With every key of a next step unbound, the step is said in words, never left blank.
+        let unbound = Bench {
+            keys: crate::keys::load_str(
+                "version = 2\n[common]\nnew = []\nedit = []\n[skills.library]\nimport = []\n",
+            )
+            .expect("the key file loads"),
+            ..Bench::new()
+        };
+        shows(&empty, &unbound, &["a new or imported skill shows here"]);
+        shows(&unversioned, &unbound, &["its first version shows here"]);
+    }
 }

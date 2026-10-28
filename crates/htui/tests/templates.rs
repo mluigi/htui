@@ -1218,7 +1218,7 @@ async fn tab_leaves_the_name_prompt_and_the_agent_help_with_the_draft() {
     assert_eq!(harness.app().tabs.active_id(), Some(SkillsTab::ID));
     let frame = harness.render();
     assert!(
-        titled(&frame, "new template ") && frame.contains("vulkan-tutorials"),
+        titled(&frame, "new template ") && line_has(&frame, &["project", "vulkan-tutorials"]),
         "the prompt is open: {frame}"
     );
     assert!(frame.contains("tri"), "with its text: {frame}");

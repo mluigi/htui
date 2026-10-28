@@ -2924,4 +2924,57 @@ mod tests {
             "{rows:#?}"
         );
     }
+
+    /// MOD-115 M4 L-skills repair 2: every empty state of the pane says what is missing and the
+    /// next step (`kit::empty`), and a refused read names where it is fixed: before the first
+    /// reply, on a refused read, and with the cursor on a project's row; with the keys of the
+    /// next step unbound, it is said in words.
+    #[tokio::test]
+    async fn every_empty_pane_names_its_next_step() {
+        let bench = Bench::new();
+        let shows = |view: &TemplatesView, bench: &Bench, texts: &[&str]| {
+            let (_, rows) = frame_of(view, &bench.ctx(), 100, 12);
+            for text in texts {
+                assert!(
+                    rows.iter().any(|row| row.contains(text)),
+                    "{text:?}: {rows:#?}"
+                );
+            }
+        };
+        shows(
+            &TemplatesView::default(),
+            &bench,
+            &[
+                "templates not read yet",
+                "they appear once the store answers",
+            ],
+        );
+        let refused = TemplatesView {
+            unavailable: Some("store unreachable: gone".to_owned()),
+            ..TemplatesView::default()
+        };
+        shows(
+            &refused,
+            &bench,
+            &[
+                "templates unavailable: store unreachable: gone",
+                "Settings \u{203a} Connection stores a DSN",
+            ],
+        );
+        // The cursor starts on the project's row.
+        let view = browsing(&bench).await;
+        shows(
+            &view,
+            &bench,
+            &["select a template", "j/k chooses one \u{b7} n creates one"],
+        );
+        let unbound = Bench {
+            keys: crate::keys::load_str(
+                "version = 2\n[list]\ndown = []\nup = []\n[common]\nnew = []\n",
+            )
+            .expect("the key file loads"),
+            ..Bench::new()
+        };
+        shows(&view, &unbound, &["a template row shows its body here"]);
+    }
 }
