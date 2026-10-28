@@ -22,8 +22,9 @@ use ratatui::widgets::{Paragraph, Wrap};
 use crate::app::{Ctx, Handled};
 use crate::keys::{Act, KeyChord};
 use crate::store_worker::StoreReply;
+use crate::ui::kit::scroll::{Scroll, Step};
 use crate::ui::markdown;
-use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Scroll, Step, message};
+use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, message};
 use crossterm::event::KeyEvent;
 
 /// How many lines the head block takes: title, key line, meta line, blank.

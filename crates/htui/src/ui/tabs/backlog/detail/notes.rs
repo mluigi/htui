@@ -47,11 +47,13 @@ use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells;
+use crate::ui::kit::scroll::{Scroll, Step};
+use crate::ui::kit::text::STAMP;
 use crate::ui::kit::{chips::key_line, text::wrapped};
 use crate::ui::tabs::backlog::detail::compose::{
     self, Compose, ComposeOutcome, could_not_check, may_have_landed, not_written,
 };
-use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, message};
+use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, message};
 use crossterm::event::KeyEvent;
 
 /// The browse hint on the pane's last row (D11), through [`views::BACKLOG_NOTES`].
@@ -329,7 +331,7 @@ impl DetailTab for NotesTab {
 
     /// MOD-115 M2 §7: the list's motion scrolls the thread while the detail is focused, over
     /// the rows as wrapped at the last render (review L1, as `J`/`K`).
-    fn step(&mut self, step: super::Step, _ctx: &Ctx<'_>) -> Handled {
+    fn step(&mut self, step: Step, _ctx: &Ctx<'_>) -> Handled {
         let (width, _) = self.drawn.get();
         self.scroll.follow(step, self.row_count(width))
     }
@@ -487,7 +489,7 @@ mod tests {
     use crate::editor::{ExternalEdit, ExternalEditOutcome, edited};
     use crate::hand_written::{ADD_NOTE_NAME, NOTE_FORM_NAME};
     use crate::store_worker::StoreRequest;
-    use crate::ui::tabs::backlog::detail::Step;
+    use crate::ui::kit::scroll::Step;
     use crate::ui::tabs::backlog::detail::compose::bench::{Shell, ctrl, drawn, key, row_from};
     use crate::ui::tabs::backlog::detail::compose::{
         could_not_check, may_have_landed, not_written,

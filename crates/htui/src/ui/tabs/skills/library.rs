@@ -46,9 +46,10 @@ use crate::skills::{READ_NAME, REQUEST_NAMES, SkillEntry, SkillWrite, SkillsSnap
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::TemplateBody;
 use crate::ui::cells::{self, cell_width};
+use crate::ui::kit::pane::capture_area;
+use crate::ui::kit::scroll::{Scroll, Step};
 use crate::ui::kit::{modal::modal_rest, text::wrapped};
 use crate::ui::shell::{ListSize, TabLayout};
-use crate::ui::tabs::backlog::detail::{Scroll, Step, capture_area};
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme, diff};
 use crossterm::event::KeyEvent;
 

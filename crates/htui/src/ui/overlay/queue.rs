@@ -24,7 +24,7 @@ use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width};
 use crate::ui::layout::centered;
 use crate::ui::overlay::registry::{Overlay, OverlayId};
-use crate::ui::tabs::backlog::queue_sentence;
+use crate::ui::queue_status::{DEMO_NOTHING_ADMITTED, queue_sentence};
 use crossterm::event::KeyEvent;
 
 /// Marker in front of the row the cursor is on (the waiting list's): a snapshot records symbols
@@ -63,10 +63,6 @@ const EMPTY: &str = "the queue is empty";
 
 /// In front of a failed read's message, on the row line.
 const UNAVAILABLE: &str = "the queue is unavailable: ";
-
-/// The memory backend's header tail: its runtime never admits (M1 review L3). The text of the
-/// Backlog's own `DEMO_NOTHING_ADMITTED`, copied so the two views stay independent.
-const DEMO_NOTHING_ADMITTED: &str = "demo: nothing is admitted";
 
 /// [`StoreRequest::name`] of [`StoreRequest::QueueOverview`]: its `Failed` is shown, not re-read.
 const OVERVIEW: &str = QUEUE_REQUEST_NAMES[5];

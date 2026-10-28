@@ -48,13 +48,12 @@ use crate::item_writes::{self, ItemDivergence, ItemFormContext, ItemWrite};
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{QUEUE_REQUEST_NAMES, QueueView, QueueWrite, StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
-use crate::ui::kit::{chips::key_line, modal::modal_rest};
-// MOD-115 M4 T0: moved to `ui::queue_status`; this path goes with the importers.
-pub(crate) use crate::ui::queue_status::queue_sentence;
+use crate::ui::kit::{chips::key_line, modal::modal_rest, pane::capture_area, scroll::Step};
+use crate::ui::queue_status::queue_sentence;
 use crate::ui::shell::{ListSize, PaneAreas, PaneId, Panes, TabLayout, TabLoc};
 use crate::ui::tabs::backlog::detail::{
     BodyTab, DetailId, DetailRegistry, DocumentsTab, GraphTab, NotesTab, PromptTab, ReqsTab,
-    RunsTab, Step, capture_area,
+    RunsTab,
 };
 use crate::ui::tabs::backlog::filter::{BacklogFilter, FilterForm, FormOutcome};
 use crate::ui::tabs::backlog::item_form::{
@@ -1294,9 +1293,10 @@ mod tests {
     use crate::store_worker::Origin;
     use crate::testkit::DEFAULT_SIZE;
     use crate::ui::Theme;
+    use crate::ui::kit::scroll::Step;
     use crate::ui::layout::chrome;
     use crate::ui::shell::{ListSize, PaneId, Preset};
-    use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Step};
+    use crate::ui::tabs::backlog::detail::{DetailId, DetailTab};
     use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
     use htui_core::model::ItemFilter;
     use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};

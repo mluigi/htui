@@ -63,7 +63,8 @@ use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells;
 use crate::ui::kit::modal::modal_rest;
-use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Scroll, message};
+use crate::ui::kit::scroll::{Scroll, Step};
+use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, message};
 use crossterm::event::KeyEvent;
 
 /// What `r` says on a citation stamped at the requirement's current version.
@@ -567,7 +568,7 @@ impl DetailTab for ReqsTab {
 
     /// MOD-115 M2 §7: the list's motion moves the citation cursor while the detail is focused,
     /// as its own `J`/`K` (`Act::ReqsNextRow`/`ReqsPrevRow`) do.
-    fn step(&mut self, step: super::Step, _ctx: &Ctx<'_>) -> Handled {
+    fn step(&mut self, step: Step, _ctx: &Ctx<'_>) -> Handled {
         self.move_cursor(step.delta());
         Handled::Consumed
     }
@@ -1210,7 +1211,7 @@ mod tests {
     /// as `J` and `K` do, or to either end; nothing is asked of the store.
     #[tokio::test]
     async fn a_step_moves_the_citation_cursor_as_j_and_k_do() {
-        use crate::ui::tabs::backlog::detail::Step;
+        use crate::ui::kit::scroll::Step;
 
         let shell = Shell::new();
         // FEAT-1 cites one requirement; three rows give the cursor somewhere to go.

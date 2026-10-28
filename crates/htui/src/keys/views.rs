@@ -1134,11 +1134,12 @@ mod tests {
     ];
 
     /// Act sites beside [`VIEWS`] (MOD-67 M6 D7): files that handle a view stack's acts without
-    /// naming a stack (`ChatTop`/`ChatBottom` are named only in the transcript), and the
-    /// directory picker, whose host names its stack.
+    /// naming a stack (`ChatTop`/`ChatBottom` are named only in the transcript), the directory
+    /// picker, whose host names its stack, and the kit's pane scroll (MOD-115 M4 T0).
     const ACT_SITES: &[(&str, &str)] = &[
         source!("ui/tabs/chat/transcript.rs"),
         source!("ui/path_picker.rs"),
+        source!("ui/kit/scroll.rs"),
     ];
 
     /// The Settings tab: it switches sections for every section's browse stack.
@@ -1152,6 +1153,9 @@ mod tests {
     const TRANSCRIPT_RS: &str = "ui/tabs/chat/transcript.rs";
     /// The directory picker: it handles the picker acts of the Hierarchy stack that hosts it.
     const PATH_PICKER_RS: &str = "ui/path_picker.rs";
+    /// The kit's pane scroll (MOD-115 M4 T0): `Scroll::apply` handles the `pane` scroll acts of
+    /// the Body sub-tab, which hands them over without naming them.
+    const SCROLL_RS: &str = "ui/kit/scroll.rs";
 
     /// MOD-115 M2 Task 0: acts a view stack offers whose sites a later task writes: the leave
     /// dialog's (Task 4), the choice, answer and Requirements priority keys (Task 5, the former
@@ -1285,7 +1289,7 @@ mod tests {
         ("LIBRARY_BROWSE", &[SKILLS_TAB_RS]),
         ("LIBRARY_REPORT", &[SKILLS_TAB_RS]),
         ("ATTACH_BROWSE", &[SKILLS_TAB_RS]),
-        ("BACKLOG_BODY", &[BACKLOG_TAB_RS]),
+        ("BACKLOG_BODY", &[BACKLOG_TAB_RS, SCROLL_RS]),
         ("BACKLOG_GRAPH", &[BACKLOG_TAB_RS]),
         ("BACKLOG_DOCS", &[BACKLOG_TAB_RS]),
         ("BACKLOG_NOTES", &[BACKLOG_TAB_RS]),

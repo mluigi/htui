@@ -13,8 +13,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width};
-// MOD-115 M4 T0: moved to the kit; this path goes with the importers.
-pub use crate::ui::kit::scroll::window;
+use crate::ui::kit::scroll::window;
 
 /// Two spaces between the columns of an item row, as in the blueprint's `KEY  status  title`.
 const GAP: usize = 2;

@@ -23,8 +23,8 @@ use crate::store_worker::StoreReply;
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width, graphemes};
 use crate::ui::kit::chips::key_line;
-use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, PAGE, message};
-use crate::ui::tabs::backlog::list;
+use crate::ui::kit::scroll::{PAGE, Step, window};
+use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, message};
 use crossterm::event::KeyEvent;
 
 /// The footer's key half (MOD-67 M5): `+/- depth · Enter re-root` with the defaults, read
@@ -693,7 +693,7 @@ impl DetailTab for GraphTab {
 
     /// MOD-115 M2 §7: the list's motion moves the row cursor while the detail is focused, as
     /// its own `J`/`K` (`Act::GraphNextRow`/`GraphPrevRow`) do.
-    fn step(&mut self, step: super::Step, _ctx: &Ctx<'_>) -> Handled {
+    fn step(&mut self, step: Step, _ctx: &Ctx<'_>) -> Handled {
         self.move_cursor(step.delta());
         Handled::Consumed
     }
@@ -776,7 +776,7 @@ impl DetailTab for GraphTab {
             usize::from(tree.width),
             ctx.theme,
         );
-        let offset = list::window(cursor, lines.len(), usize::from(tree.height));
+        let offset = window(cursor, lines.len(), usize::from(tree.height));
         // No `Wrap`: a wrapped row would break the row-to-cursor mapping.
         frame.render_widget(
             Paragraph::new(lines.split_off(offset.min(lines.len()))),
@@ -1322,7 +1322,7 @@ mod tests {
     /// `J` and `K` do, or to either end.
     #[tokio::test]
     async fn a_step_moves_the_row_cursor_as_j_and_k_do() {
-        use crate::ui::tabs::backlog::detail::Step;
+        use crate::ui::kit::scroll::Step;
 
         let shell = Shell::platform().await;
         let ctx = shell.ctx();

@@ -21,7 +21,8 @@ use crate::keys::{Act, KeyChord, Keys, Stack, views};
 use crate::preview::PromptPreview;
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells;
-use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Scroll, Step, message};
+use crate::ui::kit::scroll::{Scroll, Step};
+use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, message};
 use crossterm::event::KeyEvent;
 
 /// How wide the label gutter is: every header line is `label` then the value.

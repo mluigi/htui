@@ -82,8 +82,10 @@ use crate::run_worker::{Enabled, FrameKind, ItemActions, ORCH_NAMES, OrchReply, 
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width};
+use crate::ui::kit::scroll::{Scroll, Step};
+use crate::ui::kit::text::STAMP;
 use crate::ui::kit::{chips::key_line, modal::modal_rest};
-use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, message};
+use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, message};
 use crate::ui::tabs::chat::permission::PermissionStrip;
 use crate::ui::text_field::{FieldOutcome, TextField};
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -1768,7 +1770,7 @@ impl DetailTab for RunsTab {
 
     /// MOD-115 M2 §7: the list's motion moves the step cursor while the detail is focused, as
     /// its own `J`/`K` (`Act::RunsNextStep`/`RunsPrevStep`) do; the flow follows it.
-    fn step(&mut self, step: super::Step, ctx: &Ctx<'_>) -> Handled {
+    fn step(&mut self, step: Step, ctx: &Ctx<'_>) -> Handled {
         self.move_cursor(step.delta());
         self.sync_graph(ctx.theme);
         Handled::Consumed
@@ -2288,7 +2290,7 @@ mod tests {
     /// `J` and `K` do, or to either end; nothing is asked of the store.
     #[tokio::test]
     async fn a_step_moves_the_step_cursor_as_j_and_k_do() {
-        use crate::ui::tabs::backlog::detail::Step;
+        use crate::ui::kit::scroll::Step;
 
         let shell = Shell::new();
         let mut pane = pane(&shell).await;

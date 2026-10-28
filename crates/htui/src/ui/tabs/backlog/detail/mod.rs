@@ -1,5 +1,6 @@
-//! The detail pane: the [`DetailTab`] contract, the registry that holds the seven sub-tabs, and
-//! the scroll state they share.
+//! The detail pane: the [`DetailTab`] contract and the registry that holds the seven sub-tabs.
+//! The scroll state they share is the kit's ([`Scroll`](crate::ui::kit::scroll::Scroll), MOD-115
+//! M4 T0).
 //!
 //! Sub-tabs are a registry for the same reason tabs are (plan D5): MOD-4's approve/reject and
 //! MOD-2's "promote to chat" are `DetailTab::on_key` bodies inside their own file plus one
@@ -31,6 +32,7 @@ use crate::editor::ExternalEditOutcome;
 use crate::keys::{Keys, Stack, views};
 use crate::store_worker::StoreReply;
 use crate::ui::Theme;
+use crate::ui::kit::scroll::Step;
 use crossterm::event::{KeyEvent, MouseEvent};
 
 pub use body::BodyTab;
@@ -40,12 +42,6 @@ pub use notes::NotesTab;
 pub use prompt::PromptTab;
 pub use requirements::ReqsTab;
 pub use runs::RunsTab;
-
-// MOD-115 M4 T0: moved to the kit; these paths go with the importers.
-pub use crate::ui::kit::pane::capture_area;
-use crate::ui::kit::scroll::PAGE;
-pub use crate::ui::kit::scroll::{Scroll, Step};
-pub use crate::ui::kit::text::STAMP;
 
 /// Stable identity of a detail sub-tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

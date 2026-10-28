@@ -33,8 +33,9 @@ use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::{READ_NAME, REQUEST_NAMES, TemplateBody, TemplatesSnapshot};
 use crate::ui::cells::{self, cell_width};
+use crate::ui::kit::pane::capture_area;
+use crate::ui::kit::scroll::{Scroll, Step};
 use crate::ui::kit::{modal::modal_rest, text::wrapped};
-use crate::ui::tabs::backlog::detail::{Scroll, Step, capture_area};
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme, diff};
 use crossterm::event::KeyEvent;
 

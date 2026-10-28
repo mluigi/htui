@@ -55,11 +55,12 @@ use crate::hand_written::{DOCUMENT_FORM_NAME, HandText, WRITE_DOCUMENT_NAME, wri
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
+use crate::ui::kit::scroll::{Scroll, Step};
 use crate::ui::kit::{chips::key_line, text::wrapped};
 use crate::ui::tabs::backlog::detail::compose::{
     self, Compose, ComposeOutcome, could_not_check, may_have_landed, not_written,
 };
-use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Scroll, message};
+use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, message};
 use crossterm::event::KeyEvent;
 
 /// Written by a run step.
@@ -490,7 +491,7 @@ impl DetailTab for DocumentsTab {
 
     /// MOD-115 M2 §7: the list's motion moves the row cursor while the detail is focused, as
     /// its own `J`/`K` (`Act::DocsNextRow`/`DocsPrevRow`) do.
-    fn step(&mut self, step: super::Step, _ctx: &Ctx<'_>) -> Handled {
+    fn step(&mut self, step: Step, _ctx: &Ctx<'_>) -> Handled {
         self.move_cursor(step.delta());
         Handled::Consumed
     }
@@ -833,7 +834,7 @@ mod tests {
     /// `J` and `K` do, or to either end; nothing is asked of the store.
     #[tokio::test]
     async fn a_step_moves_the_row_cursor_as_j_and_k_do() {
-        use crate::ui::tabs::backlog::detail::Step;
+        use crate::ui::kit::scroll::Step;
 
         let shell = Shell::new();
         let (store, _) = demo();
