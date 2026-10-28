@@ -29,7 +29,8 @@ struct StatusArgs {
     resolution: Option<Resolution>,
 }
 
-/// `{"type": "string", "enum": [<every status>]}`.
+/// `{"type": "string", "enum": [<every status>]}`: `open`, `blocked`, `closed` (MOD-144; progress is
+/// the latest run's, never a status to ask for).
 fn status_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     let names: Vec<&str> = Status::ALL.iter().map(|status| status.as_str()).collect();
     schemars::json_schema!({"type": "string", "enum": names})
@@ -49,8 +50,8 @@ fn resolution_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
 /// Advertised when the scope has an item.
 pub(crate) const DEF: ToolDef = ToolDef {
     name: "item_status",
-    description: "Asks a human to move this step's item to a status; writes a note, never the \
-                  status itself.",
+    description: "Asks a human to set this step's item to open, blocked or closed; writes a note, \
+                  never the status itself.",
     schema: schema_of::<StatusArgs>,
     advertised: |scope, _| scope.item_id.is_some(),
 };

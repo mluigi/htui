@@ -359,6 +359,59 @@ async fn search_concepts_is_not_advertised_without_a_search_handle() {
     }
 }
 
+/// MOD-144: an item stores `open`, `blocked` or `closed` only; progress is the latest run's. Both
+/// `item_status` and `search_concepts` offer exactly those three, in that order.
+#[tokio::test]
+async fn item_status_offers_exactly_the_three_statuses() {
+    let host = host(Some(Recording::empty()));
+    let (_lease, mut client) = open(&host, phase_scope(ids::PROJECT_HTUI)).await;
+
+    let listed = client
+        .request("tools/list", json!({}))
+        .await
+        .expect("tools/list");
+    let schema = |name: &str| {
+        listed["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is offered"))["inputSchema"]
+            .clone()
+    };
+    let item_status = listed["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .find(|tool| tool["name"] == "item_status")
+        .expect("item_status is offered")
+        .clone();
+    assert_eq!(
+        item_status["description"],
+        "Asks a human to set this step's item to open, blocked or closed; writes a note, never the \
+         status itself."
+    );
+    let three = json!(["open", "blocked", "closed"]);
+    assert_eq!(schema("item_status")["properties"]["status"]["enum"], three);
+    assert_eq!(
+        schema("search_concepts")["properties"]["statuses"]["items"]["enum"],
+        three
+    );
+
+    let answer = client
+        .call(
+            "search_concepts",
+            json!({"query": "anything", "statuses": ["done"]}),
+        )
+        .await
+        .expect("a call");
+    assert!(
+        refused(&answer).starts_with("invalid arguments: unknown variant `done`"),
+        "{}",
+        answer.text
+    );
+}
+
 /// OQ-8: a fresh chat (`item_id NULL`, unleased) on a host with a concept index sees
 /// `box_profile` and `search_concepts`, and nothing else; the `tools/list` entry is pinned.
 #[tokio::test]
