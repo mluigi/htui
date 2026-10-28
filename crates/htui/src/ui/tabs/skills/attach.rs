@@ -1416,6 +1416,27 @@ mod tests {
     /// The pane over an empty scope (only the `global` row), its form open on `form`, drawn at
     /// 100 x 20 in `theme`, as the buffer and its rows.
     fn drawn_form(form: Form, theme: &crate::ui::Theme) -> (ratatui::buffer::Buffer, Vec<String>) {
+        let skill = form.key.skill;
+        drawn(AttachMode::Form(form), skill, &no_projects(), theme)
+    }
+
+    /// A snapshot with an empty library and no project: the pane shows only the `global` row.
+    fn no_projects() -> SkillsSnapshot {
+        SkillsSnapshot {
+            skills: Vec::new(),
+            global: Vec::new(),
+            projects: Vec::new(),
+        }
+    }
+
+    /// The pane for `skill` in `mode` over `snapshot` and the Graphics workspace, drawn at
+    /// 100 x 20 in `theme`, as the buffer and its rows.
+    fn drawn(
+        mode: AttachMode,
+        skill: SkillId,
+        snapshot: &SkillsSnapshot,
+        theme: &crate::ui::Theme,
+    ) -> (ratatui::buffer::Buffer, Vec<String>) {
         use crate::app::{Emit, TopBarState};
         use crate::store_worker::Origin;
         use crate::ui::tabs::SkillsTab;
@@ -1423,7 +1444,11 @@ mod tests {
         use htui_core::model::Scope;
         let scope = Scope {
             workspace_id: ids::WORKSPACE_GRAPHICS,
-            project_ids: Vec::new(),
+            project_ids: snapshot
+                .projects
+                .iter()
+                .map(|entry| entry.project)
+                .collect(),
         };
         let (top_bar, emit) = (TopBarState::default(), Emit::default());
         let ctx = Ctx::new(
@@ -1435,20 +1460,15 @@ mod tests {
             Origin::Tab(SkillsTab::ID),
             &emit,
         );
-        let snapshot = SkillsSnapshot {
-            skills: Vec::new(),
-            global: Vec::new(),
-            projects: Vec::new(),
-        };
         let pane = AttachPane {
-            skill: form.key.skill,
+            skill,
             cursor: 0,
-            mode: AttachMode::Form(form),
+            mode,
         };
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).expect("terminal");
         terminal
-            .draw(|frame| pane.render(frame, frame.area(), &snapshot, &ctx))
+            .draw(|frame| pane.render(frame, frame.area(), snapshot, &ctx))
             .expect("the frame draws");
         let buffer = terminal.backend().buffer().clone();
         let rows = (0..20)
@@ -1457,43 +1477,125 @@ mod tests {
         (buffer, rows)
     }
 
-    /// MOD-115 M4 E5, MOD-85: the focused activation is marked by the form's gutter and band
-    /// (legible without colour), not by `selected` on its word; the word is `kit::label`'s and
-    /// the key that cycles it stays beside it.
-    #[test]
-    fn the_activation_is_marked_by_the_form_gutter_and_band() {
-        use ratatui::style::Modifier;
-        let theme = crate::ui::Theme::monochrome();
-        let (buffer, rows) = drawn_form(activation_form(Activation::Glob), &theme);
+    /// Whether `cell` is in the selection band of `theme` (MOD-85): `selected`'s colours and
+    /// modifiers, which neither theme leaves empty.
+    fn banded(cell: &ratatui::buffer::Cell, theme: &crate::ui::Theme) -> bool {
+        let band = theme.selected;
+        assert_ne!(band, ratatui::style::Style::new(), "a band that shows");
+        band.fg.is_none_or(|fg| cell.fg == fg)
+            && band.bg.is_none_or(|bg| cell.bg == bg)
+            && cell.modifier.contains(band.add_modifier)
+    }
+
+    /// Both themes the MOD-85 decisions are pinned in: colour and monochrome.
+    fn both_themes() -> [crate::ui::Theme; 2] {
+        [crate::ui::Theme::default(), crate::ui::Theme::monochrome()]
+    }
+
+    /// The first row of `rows` holding `text`, as a buffer row.
+    fn row_of(rows: &[String], text: &str) -> u16 {
         let y = rows
             .iter()
-            .position(|row| row.contains("activation"))
-            .expect("the activation row");
-        let y = u16::try_from(y).expect("a short frame");
-        assert_eq!(buffer[(1, y)].symbol(), list::GUTTER, "{rows:#?}");
-        assert!(
-            buffer[(2, y)].modifier.contains(Modifier::REVERSED),
-            "the label is banded too: {rows:#?}"
-        );
-        let row = &rows[usize::from(y)];
-        assert!(
-            row.contains("\u{2039} by glob \u{203a}  (Space cycles)"),
-            "{row}"
-        );
-        let pin = rows
-            .iter()
-            .position(|row| row.contains("pin"))
-            .expect("the pin row");
-        let pin = u16::try_from(pin).expect("a short frame");
-        assert_eq!(
-            buffer[(1, pin)].symbol(),
-            " ",
-            "only the focused row is marked"
-        );
-        assert!(
-            rows.iter().any(|row| row.contains(GLOB_HELP)),
-            "the any-repo rule: {rows:#?}"
-        );
+            .position(|row| row.contains(text))
+            .unwrap_or_else(|| panic!("no row holds {text:?}: {rows:#?}"));
+        u16::try_from(y).expect("a short frame")
+    }
+
+    /// MOD-115 M4 E5, MOD-85: the focused activation is marked by the form's gutter and band
+    /// (legible without colour), not by `selected` on its word alone; the word is `kit::label`'s
+    /// and the key that cycles it stays beside it. In colour and in monochrome.
+    #[test]
+    fn the_activation_is_marked_by_the_form_gutter_and_band() {
+        for theme in both_themes() {
+            let (buffer, rows) = drawn_form(activation_form(Activation::Glob), &theme);
+            let y = row_of(&rows, "activation");
+            assert_eq!(buffer[(1, y)].symbol(), list::GUTTER, "{rows:#?}");
+            assert!(
+                banded(&buffer[(2, y)], &theme),
+                "the label is banded too: {rows:#?}"
+            );
+            assert!(banded(&buffer[(60, y)], &theme), "the band runs on");
+            let row = &rows[usize::from(y)];
+            assert!(
+                row.contains("\u{2039} by glob \u{203a}  (Space cycles)"),
+                "{row}"
+            );
+            let pin = row_of(&rows, "pin ");
+            assert_eq!(
+                buffer[(1, pin)].symbol(),
+                " ",
+                "only the focused row is marked"
+            );
+            assert!(!banded(&buffer[(2, pin)], &theme), "nor banded");
+            assert!(
+                rows.iter().any(|row| row.contains(GLOB_HELP)),
+                "the any-repo rule: {rows:#?}"
+            );
+        }
+    }
+
+    /// MOD-115 M4 E5, MOD-85: the attachment rows' cursor is `kit::list`'s gutter and a band
+    /// across the row, not `selected` on its text alone; the other rows carry neither. In colour
+    /// and in monochrome.
+    #[test]
+    fn the_attachment_cursor_is_the_gutter_and_band() {
+        let project = htui_core::fixtures::ids::PROJECT_VULKAN;
+        let snapshot = SkillsSnapshot {
+            projects: vec![ProjectSkills {
+                project,
+                bindings: Vec::new(),
+                graphs: Vec::new(),
+                repos: vec!["app".to_owned()],
+                unrooted: Vec::new(),
+            }],
+            ..no_projects()
+        };
+        for theme in both_themes() {
+            let (buffer, rows) = drawn(AttachMode::Browse, SkillId::new(), &snapshot, &theme);
+            let global = row_of(&rows, "global");
+            assert_eq!(buffer[(1, global)].symbol(), list::GUTTER, "{rows:#?}");
+            for x in [2, 10, 60, 97] {
+                assert!(banded(&buffer[(x, global)], &theme), "x {x}: {rows:#?}");
+            }
+            let below = global + 1;
+            assert_eq!(buffer[(1, below)].symbol(), " ", "{rows:#?}");
+            assert!(!banded(&buffer[(10, below)], &theme), "{rows:#?}");
+        }
+    }
+
+    /// MOD-115 M4 E5, MOD-85: the repo picker's cursor is `kit::list`'s gutter and band, and the
+    /// picker is the focused pane under the rows. In colour and in monochrome.
+    #[test]
+    fn the_repo_picker_cursor_is_the_gutter_and_band() {
+        let project = htui_core::fixtures::ids::PROJECT_VULKAN;
+        let snapshot = SkillsSnapshot {
+            projects: vec![ProjectSkills {
+                project,
+                bindings: Vec::new(),
+                graphs: Vec::new(),
+                repos: vec!["app".to_owned(), "core".to_owned()],
+                unrooted: Vec::new(),
+            }],
+            ..no_projects()
+        };
+        for theme in both_themes() {
+            let mut form = activation_form(Activation::Glob);
+            form.key.project = Some(project);
+            let skill = form.key.skill;
+            let mode = AttachMode::Picker { form, cursor: 1 };
+            let (buffer, rows) = drawn(mode, skill, &snapshot, &theme);
+            let top = row_of(&rows, "repos of ");
+            let core = row_of(&rows, "\u{2502}\u{258c}core");
+            assert!(core > top, "the picker's rows: {rows:#?}");
+            assert_eq!(buffer[(1, core)].symbol(), list::GUTTER, "{rows:#?}");
+            for x in [2, 10, 60] {
+                assert!(banded(&buffer[(x, core)], &theme), "x {x}: {rows:#?}");
+            }
+            let app = core - 1;
+            assert!(rows[usize::from(app)].contains("app"), "{rows:#?}");
+            assert_eq!(buffer[(1, app)].symbol(), " ", "{rows:#?}");
+            assert!(!banded(&buffer[(2, app)], &theme), "{rows:#?}");
+        }
     }
 
     /// MOD-115 M4 C4: with the form open it holds the keyboard: it is the focused pane, with the
