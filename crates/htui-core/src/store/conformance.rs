@@ -22390,8 +22390,9 @@ async fn replace_graph_refusal_order<S: WriteStore>(store: &S) {
     let taken = GraphScope::Project(ids::PROJECT_HTUI);
 
     // Review R1 B-M1: the body breaks every step at once, D10's steps 3 (shape), 4 (the graph's
-    // name), 5 (a phase id, then an edge id, another graph holds), 6 (personas, then agents) and
-    // 7 (topology), so each mend proves the next sentence outranks everything after it.
+    // name), 5 (a phase id, then an edge id, another graph holds), 6 (personas, then agents),
+    // 7 (topology) and 8 (MOD-138 D9's walk), so each mend proves the next sentence outranks
+    // everything after it.
     let mut body = before.clone();
     body.graph.name = "analysis".to_owned();
     body.nodes.push(bare_node(StepGraphPhase {
