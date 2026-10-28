@@ -15,11 +15,11 @@ Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat          0 
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
-│                        ┌ Schema ─────────────────────────────────────────┐                       │
+│                                                     ││                                           │
+│                        ╭ Schema ─────────────────────────────────────────╮                       │
 │                        │3 schema migrations are pending. Apply them now? │                       │
-│                        │                                                 │                       │
-│                        │y apply · n/Esc stay offline                     │                       │
-│                        └─────────────────────────────────────────────────┘                       │
+│                        ╰ y apply · n/Esc stay offline ───────────────────╯                       │
+│                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
