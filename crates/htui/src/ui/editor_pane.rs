@@ -201,7 +201,7 @@ mod tests {
             draw(&mut editor, area, parser.screen(), title, focused);
             let mut kit = Terminal::new(TestBackend::new(width, 4)).expect("a test backend");
             kit.draw(|frame| {
-                let under = crate::ui::kit::rule::render(frame, area, title, focused, &theme);
+                let under = rule::render(frame, area, title, focused, &theme);
                 assert_eq!(under, Rect::new(0, 1, width, 3), "the rows under the rule");
             })
             .expect("the rule draws");
