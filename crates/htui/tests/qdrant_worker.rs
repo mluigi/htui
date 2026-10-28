@@ -162,7 +162,9 @@ async fn the_worker_job_follows_the_url_row() {
     };
     let mut mismatch = false;
 
-    let pause = htui::concepts::job_cycle(&db.store, &source, &open, &mut mismatch).await;
+    // Nothing cached here to forget (MOD-158 R1, B-L1).
+    let forget = |_: Option<&Arc<QdrantStore<HashEmbedder>>>| {};
+    let pause = htui::concepts::job_cycle(&db.store, &source, &open, &forget, &mut mismatch).await;
     assert_eq!(pause, Duration::from_secs(15 * 60));
     assert!(
         urls.lock().expect("not poisoned").is_empty(),
@@ -174,7 +176,7 @@ async fn the_worker_job_follows_the_url_row() {
         .set_qdrant_url(&row, None)
         .await
         .expect("set the row");
-    htui::concepts::job_cycle(&db.store, &source, &open, &mut mismatch).await;
+    htui::concepts::job_cycle(&db.store, &source, &open, &forget, &mut mismatch).await;
     assert_eq!(
         *urls.lock().expect("not poisoned"),
         [row.as_str()],

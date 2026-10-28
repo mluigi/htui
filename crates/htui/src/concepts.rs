@@ -294,15 +294,36 @@ impl IndexSource for MemStore {
 /// answers how long to sleep before the next. A failure is a `warn` and never an `Err`: the next
 /// cycle is the retry (MOD-41 plan D19).
 pub async fn index_cycle(source: &impl IndexSource, vectors: &impl VectorStore) -> Duration {
-    match source.index_scopes().await {
+    index_cycle_reporting(source, vectors).await.0
+}
+
+/// [`index_cycle`], and whether the sync reached the vector store and failed there (the scopes
+/// read is Postgres's): [`job_cycle`] then forgets the connection (MOD-158 R1, B-L1).
+async fn index_cycle_reporting(
+    source: &impl IndexSource,
+    vectors: &impl VectorStore,
+) -> (Duration, bool) {
+    let sync_failed = match source.index_scopes().await {
         Ok(scopes) => match sync_all(source, &scopes, vectors).await {
-            Ok(report) => tracing::info!(?report, "concepts index synced"),
-            Err(err) => tracing::warn!(%err, "concepts index sync failed; next cycle"),
+            Ok(report) => {
+                tracing::info!(?report, "concepts index synced");
+                false
+            }
+            Err(err) => {
+                tracing::warn!(%err, "concepts index sync failed; next cycle");
+                true
+            }
         },
         Err(err) => {
-            tracing::warn!(err = %format!("{err:#}"), "concepts index scopes failed; next cycle")
+            tracing::warn!(err = %format!("{err:#}"), "concepts index scopes failed; next cycle");
+            false
         }
-    }
+    };
+    (interval_after(source).await, sync_failed)
+}
+
+/// The interval [`index_cycle`] sleeps: `concepts_sync_minutes`, read now, logged when unread.
+async fn interval_after(source: &impl IndexSource) -> Duration {
     let app = match source.index_settings().await {
         Ok(app) => app,
         Err(err) => {
@@ -329,13 +350,18 @@ pub async fn index_loop(source: &impl IndexSource, vectors: &impl VectorStore) -
 /// interval; any other unresolved setting and a failed open are [`open_failure_level`]'s line and
 /// the interval. Answers how long to sleep before the next cycle.
 ///
+/// `forget` keeps the cached connection honest, as a failed search does (MOD-158 R1, B-L1):
+/// `Some(store)` after a sync on `store` failed, so the next cycle reconnects; `None` when the
+/// settings do not resolve, so no connection, and no key it was made with, outlives them.
+///
 /// An embedder mismatch is an `error` once, then `debug` (review L3), and is still re-checked
 /// every interval rather than ending the job: its remedy (delete the collection, run `htui
 /// --index-items`) happens outside this process. `mismatch` carries that across cycles.
-pub async fn job_cycle<S, V, F, Fut>(
+pub async fn job_cycle<S, V, F, Fut, G>(
     source: &S,
     settings: &concepts_worker::QdrantSource,
     open: &F,
+    forget: &G,
     mismatch: &mut bool,
 ) -> Duration
 where
@@ -343,8 +369,13 @@ where
     V: VectorStore,
     F: Fn(QdrantSettings) -> Fut,
     Fut: Future<Output = Result<Arc<V>, String>>,
+    G: Fn(Option<&Arc<V>>),
 {
-    let (err, mismatched) = match settings.settings().await {
+    let resolved = settings.settings().await;
+    if resolved.is_err() {
+        forget(None);
+    }
+    let (err, mismatched) = match resolved {
         Err(concepts_worker::Unresolved::NoUrl) => {
             tracing::info!("concepts index not synced: {NO_QDRANT_URL}; next cycle");
             return interval_of(source).await;
@@ -353,7 +384,11 @@ where
         Ok(resolved) => match open(resolved).await {
             Ok(store) => {
                 *mismatch = false;
-                return index_cycle(source, &*store).await;
+                let (pause, sync_failed) = index_cycle_reporting(source, &*store).await;
+                if sync_failed {
+                    forget(Some(&store));
+                }
+                return pause;
             }
             Err(err) => {
                 let mismatched = names_a_mismatch(&err);
@@ -387,20 +422,22 @@ async fn interval_of(source: &impl IndexSource) -> Duration {
 
 /// The worker's index job: [`job_cycle`] at start, then again after each interval, forever. It
 /// never touches the run runtime, and the worker aborts it on shutdown (MOD-41 plan D19).
-pub async fn index_job<S, V, F, Fut>(
+pub async fn index_job<S, V, F, Fut, G>(
     source: &S,
     settings: &concepts_worker::QdrantSource,
     open: F,
+    forget: G,
 ) -> !
 where
     S: IndexSource,
     V: VectorStore,
     F: Fn(QdrantSettings) -> Fut,
     Fut: Future<Output = Result<Arc<V>, String>>,
+    G: Fn(Option<&Arc<V>>),
 {
     let mut mismatch = false;
     loop {
-        let pause = job_cycle(source, settings, &open, &mut mismatch).await;
+        let pause = job_cycle(source, settings, &open, &forget, &mut mismatch).await;
         tokio::time::sleep(pause).await;
     }
 }
@@ -425,7 +462,8 @@ pub(crate) fn spawn_index_job_over(
             let models = Arc::clone(&models);
             async move { models.connect(resolved).await }
         };
-        match index_job(&pg, &settings, open).await {}
+        let forget = |store: Option<&Arc<_>>| models.forget(store);
+        match index_job(&pg, &settings, open, forget).await {}
     })
 }
 
@@ -1256,12 +1294,15 @@ mod tests {
                 .expect("the memory store never fails");
         }
 
-        /// `open` for the job: records the URL of every open, and fails the first `fail` of them.
+        /// `open` for the job: records the URL of every open, and fails the first `fail` of them;
+        /// and `forget`: records each call, `true` for a store whose sync failed (it must be the
+        /// one opened), `false` for "drop every cached connection".
         #[derive(Default)]
         struct Opens {
             urls: std::sync::Mutex<Vec<String>>,
             fail: AtomicUsize,
             vectors: Arc<Counting>,
+            forgotten: std::sync::Mutex<Vec<bool>>,
         }
 
         impl Opens {
@@ -1270,6 +1311,28 @@ mod tests {
                     fail: AtomicUsize::new(1),
                     ..Self::default()
                 }
+            }
+
+            /// Opens that succeed, over a store whose first upsert fails.
+            fn syncing_badly_once() -> Self {
+                Self {
+                    vectors: Arc::new(Counting::failing_once()),
+                    ..Self::default()
+                }
+            }
+
+            fn forget(&self, store: Option<&Arc<Counting>>) {
+                if let Some(store) = store {
+                    assert!(Arc::ptr_eq(store, &self.vectors), "the store it opened");
+                }
+                self.forgotten
+                    .lock()
+                    .expect("not poisoned")
+                    .push(store.is_some());
+            }
+
+            fn forgotten(&self) -> Vec<bool> {
+                self.forgotten.lock().expect("not poisoned").clone()
             }
 
             fn open(
@@ -1306,7 +1369,9 @@ mod tests {
             tokio::select! {
                 biased;
                 () = checks => {}
-                never = index_job(read, settings, |s| opens.open(s)) => match never {},
+                never = index_job(read, settings, |s| opens.open(s), |s| opens.forget(s)) => {
+                    match never {}
+                }
             }
         }
 
@@ -1318,10 +1383,43 @@ mod tests {
             let settings = settings_over(&read);
             let opens = Opens::default();
             let mut mismatch = false;
-            let pause = job_cycle(&read, &settings, &|s| opens.open(s), &mut mismatch).await;
+            let pause = job_cycle(
+                &read,
+                &settings,
+                &|s| opens.open(s),
+                &|s| opens.forget(s),
+                &mut mismatch,
+            )
+            .await;
             assert_eq!(pause, 15 * MINUTE);
             assert!(opens.urls().is_empty(), "never opened without a URL");
             assert_eq!(opens.vectors.reads(), 0);
+            assert_eq!(
+                opens.forgotten(),
+                [false],
+                "MOD-158 R1 (B-L1): settings that stop resolving drop the cached connection"
+            );
+        }
+
+        /// MOD-158 R1 (B-L1): a sync that fails forgets the connection it used, so the next cycle
+        /// reconnects, as a failed search already does; a sync that succeeds forgets nothing.
+        #[tokio::test(start_paused = true)]
+        async fn a_failed_sync_forgets_its_connection() {
+            let read = MemStore::demo();
+            set_row(&read, "http://qdrant:6334").await;
+            let settings = settings_over(&read);
+            let opens = Opens::syncing_badly_once();
+            let mut mismatch = false;
+            let (open, forget) = (
+                |s| opens.open(s),
+                |s: Option<&Arc<Counting>>| opens.forget(s),
+            );
+            job_cycle(&read, &settings, &open, &forget, &mut mismatch).await;
+            assert!(opens.vectors.inner.points().is_empty(), "the sync failed");
+            assert_eq!(opens.forgotten(), [true], "the failed sync's store");
+            job_cycle(&read, &settings, &open, &forget, &mut mismatch).await;
+            assert!(!opens.vectors.inner.points().is_empty(), "the next synced");
+            assert_eq!(opens.forgotten(), [true], "a good sync forgets nothing");
         }
 
         /// MOD-158 D7: a URL set while the job runs is used by its next cycle, no restart.
@@ -1367,28 +1465,60 @@ mod tests {
             let settings = settings_over(&read);
             let opens = Opens::failing_once();
             let mut mismatch = false;
-            let open = |s| opens.open(s);
-            let pause = job_cycle(&read, &settings, &open, &mut mismatch).await;
+            let (open, forget) = (
+                |s| opens.open(s),
+                |s: Option<&Arc<Counting>>| opens.forget(s),
+            );
+            let pause = job_cycle(&read, &settings, &open, &forget, &mut mismatch).await;
             assert_eq!(pause, 15 * MINUTE);
             assert_eq!(
                 opens.vectors.reads(),
                 0,
                 "nothing synced after a failed open"
             );
-            job_cycle(&read, &settings, &open, &mut mismatch).await;
+            job_cycle(&read, &settings, &open, &forget, &mut mismatch).await;
             assert_eq!(opens.urls().len(), 2, "opened again");
             assert_eq!(opens.vectors.syncs(), 1);
         }
 
-        /// MOD-158 D7: the job starts whatever the setting says (here: nothing published, so
-        /// offline), and runs until it is aborted.
+        /// MOD-158 D7: the job starts whatever the setting says, and runs until it is aborted.
+        /// MOD-158 R1 (B-L8): its first cycle really ran: the published row, which says there is
+        /// no URL, was read through the index's settings source.
         #[tokio::test]
         async fn the_job_starts_whatever_the_setting_says() {
-            let index = Arc::new(QdrantIndex::with_loader(
-                || Box::pin(std::future::pending()),
-            ));
+            /// A row that is not there, counting its reads.
+            #[derive(Default)]
+            struct NoRow(AtomicUsize);
+            impl concepts_worker::UrlRow for NoRow {
+                fn qdrant_url(
+                    &self,
+                ) -> futures::future::BoxFuture<
+                    '_,
+                    Result<Option<htui_core::qdrant::StoredQdrantUrl>, StoreError>,
+                > {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { Ok(None) })
+                }
+            }
+
+            let source =
+                concepts_worker::QdrantSource::new(QdrantEnv::default(), KeySource::Interactive)
+                    .with_keyring(|| Ok(None));
+            let row = Arc::new(NoRow::default());
+            source.publish(Some(Arc::clone(&row) as Arc<dyn concepts_worker::UrlRow>));
+            let index = Arc::new(
+                QdrantIndex::with_loader(|| Box::pin(std::future::pending()))
+                    .with_source(Arc::new(source)),
+            );
             let job = spawn_index_job_over(unreachable_store(), index);
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while row.0.load(Ordering::SeqCst) == 0 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the job's first cycle never read the setting"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             assert!(!job.is_finished(), "the job runs until it is aborted");
             job.abort();
             assert!(job.await.expect_err("aborted").is_cancelled());

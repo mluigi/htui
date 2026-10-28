@@ -1318,8 +1318,9 @@ async fn replace_credential_re_encrypts_the_key_too() {
     .await;
     assert_eq!(plain.outcome(), &Outcome::AlreadyProvisioned);
     assert!(
-        String::from_utf8_lossy(&plain.err)
-            .contains("note: the Qdrant API key was not sent; pass --replace-credential to add it"),
+        String::from_utf8_lossy(&plain.err).contains(
+            "note: the Qdrant API key was not sent; pass --replace-credential to add or replace it"
+        ),
         "{}",
         String::from_utf8_lossy(&plain.err)
     );

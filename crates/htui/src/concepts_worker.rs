@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::mem::Discriminant;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
 use futures::FutureExt as _;
@@ -268,7 +268,8 @@ impl core::fmt::Debug for QdrantSource {
 
 impl QdrantSource {
     /// A source over `env` and `key`, nothing published, reading the keyring through
-    /// [`secret::get_qdrant_api_key`]. An override in force is logged once, here, at `info` (D3).
+    /// [`secret::get_qdrant_api_key`]. An override in force is logged once, here, at `info` (D3);
+    /// an unusable one at `warn`, without its value.
     #[must_use]
     pub fn new(env: QdrantEnv, key: KeySource) -> Self {
         if let Some(text) = &env.url {
@@ -279,7 +280,8 @@ impl QdrantSource {
                     "{} overrides the qdrant_url setting in this process",
                     htui_core::secret::QDRANT_URL_ENV
                 ),
-                Err(why) => tracing::info!("{}", env_url_unusable(why)),
+                // A `warn`: every search and sync will refuse until it is fixed (MOD-158 R1).
+                Err(why) => tracing::warn!("{}", env_url_unusable(why)),
             }
         }
         Self {
@@ -419,6 +421,23 @@ impl<T> Connections<T> {
         *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = Some((settings, connection));
     }
 
+    /// The settings stopped resolving (no URL, offline, an unusable setting): no connection, and
+    /// no key it was made with, is kept for them (MOD-158 R1, B-L1).
+    fn clear(&self) {
+        *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// [`QdrantSource::settings`]' answer, the cache cleared when it is not settings.
+    fn resolved(
+        &self,
+        settings: Result<QdrantSettings, Unresolved>,
+    ) -> Result<QdrantSettings, Unresolved> {
+        if settings.is_err() {
+            self.clear();
+        }
+        settings
+    }
+
     /// A call on `connection` failed: the next request reconnects. A connection another request
     /// has cached since is left alone.
     fn forget(&self, connection: &Arc<T>) {
@@ -528,6 +547,22 @@ impl QdrantIndex {
         self.connections.put(settings, Arc::clone(&store));
         Ok(store)
     }
+
+    /// The worker's index job's `forget` (MOD-158 R1, B-L1): `Some(store)` after a failed sync on
+    /// it, `None` when the settings did not resolve.
+    pub(crate) fn forget(&self, store: Option<&Arc<QdrantStore<RtenEmbedder>>>) {
+        match store {
+            Some(store) => self.connections.forget(store),
+            None => self.connections.clear(),
+        }
+    }
+
+    /// The settings, read now; a cached connection is dropped when they do not resolve.
+    async fn settings(&self) -> Result<QdrantSettings, String> {
+        self.connections
+            .resolved(self.source.settings().await)
+            .map_err(|why| why.sentence())
+    }
 }
 
 // Settings before the model, in both: a box with no URL fails in microseconds without downloading
@@ -537,7 +572,7 @@ impl QdrantIndex {
 impl ConceptIndex for QdrantIndex {
     fn search(&self, query: SearchQuery) -> BoxFuture<'_, Result<Vec<Hit>, String>> {
         Box::pin(async move {
-            let settings = self.source.settings().await.map_err(|why| why.sentence())?;
+            let settings = self.settings().await?;
             let store = self.connect(settings).await?;
             store.search(&query).await.map_err(|e| {
                 self.connections.forget(&store);
@@ -548,7 +583,7 @@ impl ConceptIndex for QdrantIndex {
 
     fn sync(&self, backend: Backend, scope: Scope) -> BoxFuture<'_, Result<SyncReport, String>> {
         Box::pin(async move {
-            let settings = self.source.settings().await.map_err(|why| why.sentence())?;
+            let settings = self.settings().await?;
             let store = self.connect(settings).await?;
             Indexer::sync(&backend, &scope, &*store).await.map_err(|e| {
                 self.connections.forget(&store);
@@ -566,6 +601,11 @@ impl ConceptIndex for QdrantIndex {
 /// `mcp_search::production` both search it, so the TUI's concepts search and the MCP tool
 /// `search_concepts` share one embedding model (133 MB, MOD-68) and one cached Qdrant connection.
 /// Built on first use; building it loads nothing.
+///
+/// Production only: its settings come from this process's environment (`HTUI_QDRANT_*`,
+/// [`QdrantSource::from_process`]), which an hr sandbox sets and a host does not, so no test may
+/// search or sync through it (blueprint P-13, MOD-158 R1 B-L7). Tests build a [`QdrantIndex`] with
+/// [`QdrantIndex::with_source`] over a `QdrantEnv` literal, or a `MemIndex`.
 #[must_use]
 pub fn shared_index() -> Arc<dyn ConceptIndex> {
     shared_qdrant()
@@ -680,6 +720,45 @@ pub struct ConceptsRuntime {
     index: Arc<dyn ConceptIndex>,
     /// The task of each `(origin, request kind)`, keyed as `App::latest` is.
     tasks: HashMap<(Origin, Discriminant<StoreRequest>), JoinHandle<()>>,
+    /// What [`Self::publish`] last handed the index (MOD-158 R1, B-L2).
+    published: Published,
+}
+
+/// What [`ConceptsRuntime::publish`] last handed the index, so an unchanged backend is not handed
+/// over again on every iteration of the store loop.
+enum Published {
+    /// Nothing yet: the first publish always goes through.
+    Never,
+    /// No writable store (offline, the mirror, memory).
+    Nothing,
+    /// The store over this pool, known by its connect options' allocation. Weak, so a pool that is
+    /// gone is not kept, nor its password; and while the weak lives the address is not reused, so a
+    /// new pool never passes for the old one.
+    Pool(Weak<dyn std::any::Any + Send + Sync>),
+}
+
+impl Published {
+    /// What publishing `store` now would hand over.
+    fn of(store: Option<&PgStore>) -> Self {
+        store.map_or(Self::Nothing, |pg| {
+            Self::Pool(Self::weak(pg.pool().connect_options()))
+        })
+    }
+
+    /// The options' allocation, typed away (htui names no `sqlx` type outside its tests).
+    fn weak<T: Send + Sync + 'static>(options: Arc<T>) -> Weak<dyn std::any::Any + Send + Sync> {
+        let options: Arc<dyn std::any::Any + Send + Sync> = options;
+        Arc::downgrade(&options)
+    }
+
+    /// Whether `self` and `other` hand the index the same thing.
+    fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Nothing, Self::Nothing) => true,
+            (Self::Pool(a), Self::Pool(b)) => Weak::ptr_eq(a, b),
+            _ => false,
+        }
+    }
 }
 
 impl core::fmt::Debug for ConceptsRuntime {
@@ -697,10 +776,16 @@ impl ConceptsRuntime {
         Self {
             index,
             tasks: HashMap::new(),
+            published: Published::Never,
         }
     }
 
     /// Over [`shared_index`]: what `store_worker::spawn_with_runtimes` builds (D231).
+    ///
+    /// Production only: the shared index resolves its settings over this process's environment
+    /// (`HTUI_QDRANT_*`), so a test that searched through it would behave differently in an hr
+    /// sandbox, which exports `HTUI_QDRANT_URL`, than on the host. Tests build
+    /// [`Self::new`] over an index of their own (blueprint P-13, MOD-158 R1 B-L7).
     #[must_use]
     pub fn production() -> Self {
         Self::new(shared_index())
@@ -708,13 +793,18 @@ impl ConceptsRuntime {
 
     /// MOD-158 D6: `backend`'s writable store, or `None`, becomes what the index reads the
     /// `qdrant_url` row through. The store worker calls it at the top of every iteration, so every
-    /// swap (connect, `SetDsn`, a lost server) reaches the index (blueprint P-2). Awaits nothing.
-    pub fn publish(&self, backend: &Backend) {
-        self.index.publish(
-            backend
-                .writable()
-                .map(|pg| Arc::new(pg.clone()) as Arc<dyn UrlRow>),
-        );
+    /// swap (connect, `SetDsn`, a lost server) reaches the index (blueprint P-2). Only a change is
+    /// handed over: the same pool, or still no store, is skipped (MOD-158 R1, B-L2). Awaits
+    /// nothing.
+    pub fn publish(&mut self, backend: &Backend) {
+        let store = backend.writable();
+        let now = Published::of(store);
+        if now.same(&self.published) {
+            return;
+        }
+        self.published = now;
+        self.index
+            .publish(store.map(|pg| Arc::new(pg.clone()) as Arc<dyn UrlRow>));
     }
 
     /// Spawns the request's task and answers `Deferred`, or answers now. Awaits nothing.
@@ -1391,7 +1481,7 @@ mod tests {
     #[tokio::test]
     async fn the_runtime_publishes_the_writable_store_only() {
         let index = Arc::new(Recording::default());
-        let runtime = ConceptsRuntime::new(index.clone());
+        let mut runtime = ConceptsRuntime::new(index.clone());
         runtime.publish(&Backend::memory(MemStore::demo()));
 
         let identity = htui_store::Identity {
@@ -1418,6 +1508,81 @@ mod tests {
         assert_eq!(
             *index.0.lock().unwrap_or_else(PoisonError::into_inner),
             [false, true, false]
+        );
+        cache.close().await;
+    }
+
+    /// MOD-158 R1 (B-L2): the store loop publishes at the top of every iteration, but the index
+    /// is handed a store only when the backend's writable store changed: a repeat is skipped, while
+    /// a lost server, a reconnect and another server (a new pool, as `SetDsn` then `go_online`
+    /// make) are each published.
+    #[tokio::test]
+    async fn the_runtime_publishes_only_a_changed_store() {
+        let index = Arc::new(Recording::default());
+        let mut runtime = ConceptsRuntime::new(index.clone());
+        let published = || {
+            index
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        };
+        let memory = Backend::memory(MemStore::demo());
+        runtime.publish(&memory);
+        runtime.publish(&memory);
+        assert_eq!(published(), [false], "the first publish, then nothing new");
+
+        let identity = htui_store::Identity {
+            box_id: htui_core::model::BoxId::new(),
+            hostname: "HTUI-TEST".to_owned(),
+        };
+        let lazy = || {
+            PgStore::lazy(
+                "postgres://nobody:nothing@127.0.0.1:1/none",
+                &identity,
+                Duration::from_millis(250),
+            )
+            .expect("a lazy pool opens no socket")
+        };
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = htui_store::CacheStore::open(root.path(), "concepts-publish-once", 1)
+            .await
+            .expect("open a throwaway mirror");
+        let mut backend = Backend::Online {
+            pg: lazy(),
+            cache: cache.clone(),
+        };
+        runtime.publish(&backend);
+        runtime.publish(&backend);
+        assert_eq!(published(), [false, true], "online once");
+        assert!(backend.went_offline());
+        runtime.publish(&backend);
+        runtime.publish(&backend);
+        assert_eq!(published(), [false, true, false], "offline once");
+
+        let first = lazy();
+        let online = Backend::Online {
+            pg: first.clone(),
+            cache: cache.clone(),
+        };
+        runtime.publish(&online);
+        runtime.publish(&Backend::Online {
+            pg: first,
+            cache: cache.clone(),
+        });
+        assert_eq!(
+            published(),
+            [false, true, false, true],
+            "a clone of the same pool is the same store"
+        );
+        runtime.publish(&Backend::Online {
+            pg: lazy(),
+            cache: cache.clone(),
+        });
+        assert_eq!(
+            published(),
+            [false, true, false, true, true],
+            "another pool is published"
         );
         cache.close().await;
     }
@@ -1539,6 +1704,76 @@ mod tests {
             connections.get(&made_for).is_none(),
             "after an error the next request reconnects"
         );
+    }
+
+    /// MOD-158 R1 (B-L6): an unusable `HTUI_QDRANT_URL` is a `warn` line, never its value; a
+    /// usable one stays the `info` line D3 asks for.
+    #[test]
+    fn an_unusable_env_url_is_a_warning_without_its_value() {
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logged = |url: &str| {
+            let buffer = Buffer::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer({
+                    let buffer = buffer.clone();
+                    move || buffer.clone()
+                })
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                drop(QdrantSource::new(
+                    QdrantEnv::new(Some(url.to_owned()), None),
+                    KeySource::Interactive,
+                ));
+            });
+            let bytes = buffer
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            String::from_utf8(bytes).expect("utf-8 logs")
+        };
+        let bad = logged("http://u:SENTINEL@q:6334");
+        assert!(bad.contains(" WARN "), "{bad}");
+        assert!(!bad.contains("SENTINEL"), "{bad}");
+        let good = logged("http://q:6334");
+        assert!(good.contains(" INFO "), "{good}");
+    }
+
+    /// MOD-158 R1 (B-L1): settings that stop resolving drop the cached connection, and the key it
+    /// was made with; settings that resolve keep it.
+    #[test]
+    fn unresolved_settings_drop_the_cached_connection() {
+        let connections = Connections::<u32>::default();
+        let made_for = settings("http://qdrant:6334", Some("key"));
+        connections.put(made_for.clone(), Arc::new(1));
+        assert!(connections.resolved(Ok(made_for.clone())).is_ok());
+        assert!(connections.get(&made_for).is_some(), "resolving keeps it");
+        for why in [Unresolved::NoUrl, Unresolved::Offline] {
+            connections.put(made_for.clone(), Arc::new(2));
+            assert!(connections.resolved(Err(why)).is_err());
+            assert!(
+                connections
+                    .slot
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_none(),
+                "nothing cached once the settings stop resolving"
+            );
+        }
     }
 
     /// Review 2: every search that overlaps a load waits on that one load, superseded ones

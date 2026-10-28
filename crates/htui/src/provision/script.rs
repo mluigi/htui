@@ -141,14 +141,19 @@ exit "$rc"
 "#;
 
 /// Runs as root under `sudo -n` (D303; E-7). `$1` root, `$2` user, `$3` home, `$4` replace, `$5`
-/// qkey (MOD-158 D11). Stdin: with `qkey=1`, the Qdrant API key line, held in a shell variable
-/// only and handed to `systemd-creds` through the `printf` builtin (PREFLIGHT checks it is one);
-/// then the DSN line. Each is encrypted when its credential is absent or `replace=1`, otherwise
-/// discarded. With the key the unit loads both credentials. Without it, a key credential already
-/// on the host keeps its unit line, unless `replace=1` drops it (the key was removed; the file
-/// stays, R-11); with no such credential the unit is the one written before D11, byte for byte.
-/// Credentials, then unit, then start. Its first line of output
-/// is the marker `htui.root=start`.
+/// qkey (MOD-158 D11). Stdin: with `qkey=1`, the Qdrant API key line, held in a shell variable only
+/// and handed to `systemd-creds` through the `printf` builtin; then the DSN line. Each is encrypted
+/// when its credential is absent or `replace=1`, otherwise discarded. With the key the unit loads
+/// both credentials. Without it, a key credential already on the host keeps its unit line, unless
+/// `replace=1` drops it (the key was removed; the file stays, R-11); with no such credential the
+/// unit is the one written before D11, byte for byte. Credentials, then unit, then start. Its first
+/// line of output is the marker `htui.root=start`.
+///
+/// PREFLIGHT checks `printf` is a builtin of the **login user's** `sh`, while this script runs in
+/// **root's** `sh` (`sudo -n sh -c`). The check stands for both on the assumption that `sh`
+/// resolves to the same shell for root and for the user: the system `sh`, found through `sudo`'s
+/// `secure_path` and through the login `PATH` alike on a usual host. A host where root's `sh` is
+/// another shell is not probed (MOD-158 R1, B-L3).
 pub const INSTALL_ROOT: &str = r#"set -eu
 root=$1
 user=$2

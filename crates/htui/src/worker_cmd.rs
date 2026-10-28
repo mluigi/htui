@@ -17,8 +17,9 @@ use crate::cli::WorkerArgs;
 use crate::concepts;
 use crate::concepts_worker::{self, KeySource, Unresolved};
 
-/// MOD-158 D4: `--qdrant-key-stdin` was given and its line was blank, or missing.
-const NO_KEY_ON_STDIN: &str = "no Qdrant API key on stdin; nothing was read";
+/// MOD-158 D4: `--qdrant-key-stdin` was given and its line was blank, or missing. Not "nothing was
+/// read": with `--dsn-stdin` the DSN line before it was (MOD-158 R1, B-L5).
+const NO_KEY_ON_STDIN: &str = "no Qdrant API key on stdin: the key line was blank or missing";
 
 /// The DSN and, with `--qdrant-key-stdin`, the key line, both wiped when dropped.
 type StartupSecrets = (Zeroizing<String>, Option<Zeroizing<String>>);
@@ -402,7 +403,7 @@ mod tests {
             assert!(matches!(refused, WorkerExit::Refused(_)), "{refused:?}");
             assert_eq!(
                 refused.to_string(),
-                "no Qdrant API key on stdin; nothing was read"
+                "no Qdrant API key on stdin: the key line was blank or missing"
             );
         }
     }

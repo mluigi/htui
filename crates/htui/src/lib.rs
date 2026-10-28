@@ -77,15 +77,14 @@ use crate::ui::state_file::UiStore;
 /// **before** any terminal work, so the DSN is typed into a normal shell and never into a raw-mode
 /// terminal — then the four Qdrant flags (MOD-158 D8: the URL setting and this box's API key),
 /// which act the same way, then the two concepts-index flags (MOD-34), which also print to the
-/// shell and exit,
-/// then the key file (MOD-67), which `--print-keys` prints and exits on, then the backend
-/// (`--demo`'s included), then the worker, then the shell, then the terminal. `htui provision`
-/// (MOD-45) comes right after logging, before the keyring flags; it prints to the shell and exits.
-/// `htui status` and `htui waiting` (MOD-92) come right after it: they read only, print one answer
-/// and exit, and `--search-items` (read-only too since MOD-92) keeps its place after the keyring
-/// flags; all three run before the key file is read. `htui claude emit` (MOD-93) comes right after
-/// the state verbs: it writes only its plugin directory, prints and exits.
-/// With `--dsn-stdin`, the session's DSN is read from stdin before the backend starts.
+/// shell and exit, then the key file (MOD-67), which `--print-keys` prints and exits on, then the
+/// backend (`--demo`'s included), then the worker, then the shell, then the terminal. `htui
+/// provision` (MOD-45) comes right after logging, before the keyring flags; it prints to the shell
+/// and exits. `htui status` and `htui waiting` (MOD-92) come right after it: they read only, print
+/// one answer and exit, and `--search-items` (read-only too since MOD-92) keeps its place after the
+/// keyring flags; all three run before the key file is read. `htui claude emit` (MOD-93) comes
+/// right after the state verbs: it writes only its plugin directory, prints and exits. With
+/// `--dsn-stdin`, the session's DSN is read from stdin before the backend starts.
 ///
 /// The backend is always available immediately: `connect::start` opens the local mirror and hands
 /// back an offline backend, and the connection runs on its own task (ANA-9 §4.4). A missing DSN, an

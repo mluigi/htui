@@ -702,7 +702,8 @@ impl<R: Remote> Finish<'_, '_, R> {
         if qdrant_key && facts.printf_builtin {
             let _ = writeln!(
                 err,
-                "note: the Qdrant API key was not sent; pass --replace-credential to add it"
+                "note: the Qdrant API key was not sent; pass --replace-credential to add or \
+                 replace it"
             );
         } else if qdrant_key {
             // `decide` refuses `--replace-credential` with a key when there is no printf builtin.
@@ -1712,7 +1713,7 @@ mod tests {
         assert!(remote.calls().iter().all(|(_, stdin)| stdin.is_empty()));
         assert!(
             ran.err.contains(
-                "note: the Qdrant API key was not sent; pass --replace-credential to add it\n"
+                "note: the Qdrant API key was not sent; pass --replace-credential to add or replace it\n"
             ),
             "{}",
             ran.err
@@ -1754,7 +1755,8 @@ mod tests {
             ran.err
         );
         assert!(
-            !ran.err.contains("pass --replace-credential to add it"),
+            !ran.err
+                .contains("pass --replace-credential to add or replace it"),
             "{}",
             ran.err
         );
