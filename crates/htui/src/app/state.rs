@@ -2186,7 +2186,14 @@ mod tests {
     /// The rows the `?` box of a bare shell holds at `width` columns: the global keys packed
     /// to today's content width (`width - 12`, at least 18), then the closer.
     fn help_rows(app: &App, width: u16) -> Vec<String> {
-        let inner = usize::from(width.saturating_sub(10).max(20).saturating_sub(2));
+        packed_help_rows(
+            app,
+            usize::from(width.saturating_sub(10).max(20).saturating_sub(2)),
+        )
+    }
+
+    /// The rows the `?` box of a bare shell holds packed to `inner` columns, then the closer.
+    fn packed_help_rows(app: &App, inner: usize) -> Vec<String> {
         let mut rows: Vec<String> = app
             .keys
             .help_line(Context::Global, |act| app.offers(act))
@@ -2245,6 +2252,27 @@ mod tests {
                 "\u{2570}",
                 "{width}: the box is exactly as tall as its rows"
             );
+        }
+    }
+
+    /// A screen of 20 columns or fewer clamps the box below the width its rows are packed to
+    /// (the kit box is one column wider than the old one). Each row there holds one entry, so
+    /// it reads as that width's packing cut at the box's edge: no row breaks somewhere else.
+    #[test]
+    fn a_narrow_screen_cuts_each_help_row_at_the_box_edge() {
+        for width in [14_u16, 16, 18, 20] {
+            let mut app = bare_app(true);
+            let buf = super::shell_tests::draw(&mut app, width, 80);
+            let (x, y) = box_corner(&buf, "Keys").expect("a rounded box titled Keys");
+            let content = width - crate::ui::kit::modal::CHROME;
+            let rows = packed_help_rows(&app, usize::from(content));
+            let keys = &rows[..rows.len() - 1];
+            for (i, expected) in keys.iter().enumerate() {
+                let at = y + 1 + u16::try_from(i).expect("rows fit");
+                let drawn = cells_at(&buf, x + 1, at, content);
+                let fits: String = expected.chars().take(usize::from(content)).collect();
+                assert_eq!(drawn.trim_end(), fits.trim_end(), "{width}: row {i}");
+            }
         }
     }
 
