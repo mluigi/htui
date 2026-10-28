@@ -3599,7 +3599,7 @@ fn spawn_refresher(
 mod tests {
     use super::*;
     use htui_core::fixtures::{DemoData, demo_data, ids};
-    use htui_core::model::{BoxId, NewItem, OsFamily, Status};
+    use htui_core::model::{BoxId, ItemState, NewItem, OsFamily, Status};
     use htui_core::store::MemStore;
     use htui_store::{CacheStore, Identity};
     use htui_worker::{WaitingReason, WaitingRow};
@@ -3831,10 +3831,10 @@ mod tests {
         );
     }
 
-    /// MOD-69 plan D6, blueprint H-5: over the demo's Platform scope, `RUN_2` is the only active
-    /// run and owns no row, `htui` FEAT-2 (blocked, no run) is the one Reopen row, and TOOL-1
-    /// (awaiting approval, no run) is a candidate with no row. The Reopen row is since FEAT-2's
-    /// last change (MOD-92 D5).
+    /// MOD-69 plan D6, blueprint H-5, MOD-144: over the demo's Platform scope three runs are
+    /// active: `RUN_2` (FEAT-3, queued) and `RUN_4` (FEAT-1, running) own no row, and `RUN_5`
+    /// (TOOL-1, needs you, parked with no step) owns TOOL-1's resume row. `htui` FEAT-2 (blocked,
+    /// no run) is the Reopen row. Each row is since its item's or run's last change (MOD-92 D5).
     #[tokio::test]
     async fn serve_waiting_reads_the_demo_platform() {
         let feat_2 = demo_data()
@@ -3842,6 +3842,11 @@ mod tests {
             .into_iter()
             .find(|item| item.id == ids::HTUI_FEAT_2)
             .expect("the demo holds FEAT-2");
+        let tool_1_run = demo_data()
+            .runs
+            .into_iter()
+            .find(|run| run.id == ids::RUN_5)
+            .expect("the demo holds RUN_5");
         let backend = demo();
         let scope = platform_scope(&backend).await;
         assert_eq!(
@@ -3863,21 +3868,33 @@ mod tests {
             answered, asked,
             "the reply names the scope it read (review M1)"
         );
-        assert_eq!(view.working, 1, "RUN_2 is the fixture's only active run");
+        assert_eq!(view.working, 2, "RUN_2 and RUN_4 are active and own no row");
         assert!(view.permissions_known, "a Memory backend has a writer");
         assert!(!view.offline, "a Memory backend is not offline");
         assert_eq!(
             view.rows,
-            vec![WaitingRow {
-                item: ids::HTUI_FEAT_2,
-                item_key: "FEAT-2".into(),
-                run: None,
-                step: None,
-                step_label: String::new(),
-                reason: WaitingReason::Unblock,
-                text: "blocked, no active run: u reopens it".into(),
-                since: feat_2.updated_at,
-            }]
+            vec![
+                WaitingRow {
+                    item: ids::HTUI_FEAT_2,
+                    item_key: "FEAT-2".into(),
+                    run: None,
+                    step: None,
+                    step_label: String::new(),
+                    reason: WaitingReason::Unblock,
+                    text: "blocked, no active run: u reopens it".into(),
+                    since: feat_2.updated_at,
+                },
+                WaitingRow {
+                    item: ids::HTUI_TOOL_1,
+                    item_key: "TOOL-1".into(),
+                    run: Some(ids::RUN_5),
+                    step: None,
+                    step_label: String::new(),
+                    reason: WaitingReason::Unblock,
+                    text: "parked by an interrupted command: u resumes it".into(),
+                    since: tool_1_run.updated_at,
+                }
+            ]
         );
     }
 
@@ -4065,7 +4082,7 @@ mod tests {
             &backend,
             &scope,
             ItemFilter {
-                statuses: Some(vec![Status::Done]),
+                states: Some(vec![ItemState::Done]),
                 ..ItemFilter::default()
             },
             true,
@@ -4147,6 +4164,7 @@ mod tests {
             required_tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
             updated_at: Utc::now(),
             touched_paths: Vec::new(),
+            latest_run_status: None,
         };
         let rows = vec![
             row("C", &["gpu"]),
@@ -4228,8 +4246,12 @@ mod tests {
         else {
             panic!("wrong reply variant")
         };
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].steps.len(), 4);
+        // Newest first (MOD-144): the stepless rework `RUN_4`, then the walked `RUN_1`.
+        assert_eq!(
+            runs.iter().map(|run| run.id).collect::<Vec<_>>(),
+            [ids::RUN_4, ids::RUN_1]
+        );
+        assert_eq!(runs[1].steps.len(), 4);
     }
 
     /// The read behind replay (MOD-2 D38): the `plan` step's eight fixture rows, in `seq` order.

@@ -708,6 +708,7 @@ mod tests {
             key_number: 1,
             title: "t".to_owned(),
             status: Status::Open,
+            latest_run_status: None,
             priority: 0,
             required_tags: Vec::new(),
             updated_at: htui_core::fixtures::demo_at(0, 0),

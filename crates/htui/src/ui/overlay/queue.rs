@@ -605,8 +605,9 @@ mod tests {
     use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
     use htui_core::model::{
-        BatchFigures, BatchId, BatchStop, CapError, Escalation, Hold, PER_TOKEN_CAP_BATCH,
-        ProjectId, ProjectRef, QueueEntry, RunId, RunStatus, Status, StepId, Wait, WorkspaceId,
+        BatchFigures, BatchId, BatchStop, CapError, Escalation, Hold, ItemState,
+        PER_TOKEN_CAP_BATCH, ProjectId, ProjectRef, QueueEntry, RunId, RunStatus, Status, StepId,
+        Wait, WorkspaceId,
     };
     use htui_core::store::StoreError;
     use htui_store::DATABASE_UNREACHABLE;
@@ -733,6 +734,7 @@ mod tests {
             latest_run: None,
             latest_note: None,
             open_blockers: Vec::new(),
+            latest_run_status: None,
         }
     }
 
@@ -828,7 +830,7 @@ mod tests {
             ])),
             EntryState::Waiting(Wait::CancelledInBatch),
             EntryState::Waiting(Wait::Paused),
-            EntryState::Waiting(Wait::NotReady(Status::InProgress)),
+            EntryState::Waiting(Wait::NotReady(ItemState::Done)),
             EntryState::Escalated(Escalation::HardGateParked { run, step }),
             EntryState::Escalated(Escalation::JudgeUndecided {
                 run,
