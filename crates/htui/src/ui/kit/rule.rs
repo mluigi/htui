@@ -5,10 +5,10 @@
 //! The row reads `title` flush left (clipped with `…`), then `─` to the edge: the row a
 //! `Block` with only its top border and a title drew, cell for cell. Focused, the title and the
 //! rule take `theme.title`; otherwise `theme.dim`. The row is cleared first, so nothing the host
-//! drew there shows through.
+//! drew there shows through. A rect that runs past the buffer draws only what lies on it.
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::widgets::Clear;
 
 use crate::ui::{Theme, cells};
@@ -35,9 +35,12 @@ pub fn render(
     let title = cells::clip(title, width);
     let used = cells::cell_width(&title);
     let text = format!("{title}{}", RULE.repeat(width.saturating_sub(used)));
-    frame
-        .buffer_mut()
-        .set_stringn(area.x, area.y, text, width, style);
+    // A rule whose rect runs past the buffer draws only what lies on it (RV1 L4): the row's
+    // start must be on the buffer, `set_stringn` stops at its right edge.
+    let buffer = frame.buffer_mut();
+    if buffer.area.contains(Position::new(area.x, area.y)) {
+        buffer.set_stringn(area.x, area.y, text, width, style);
+    }
     Rect {
         y: area.y.saturating_add(1),
         height: area.height - 1,
@@ -146,6 +149,19 @@ mod tests {
         }
         assert_eq!(buffer[(1, 1)].symbol(), "#", "only the area's row");
         assert_eq!(buffer[(2, 2)].symbol(), "#", "only its first row");
+    }
+
+    /// Like `Pane::render_into` (RV1 L4): a rule whose rect runs past the buffer draws what
+    /// lies on it and never panics, as the top-bordered `Block` it replaced did.
+    #[test]
+    fn a_rule_past_the_buffer_draws_what_fits() {
+        let theme = Theme::default();
+        let (under, _) = draw((10, 4), Rect::new(0, 6, 10, 2), "t", true, &theme);
+        assert_eq!(under, Rect::new(0, 7, 10, 1));
+        let (_, buffer) = draw((10, 4), Rect::new(4, 1, 20, 2), "title", true, &theme);
+        assert_eq!(row(&buffer, 1), format!("####title{}", "─"));
+        let (_, buffer) = draw((10, 4), Rect::new(12, 1, 5, 2), "t", true, &theme);
+        assert_eq!(row(&buffer, 1), "#".repeat(10), "off to the right: nothing");
     }
 
     #[test]
