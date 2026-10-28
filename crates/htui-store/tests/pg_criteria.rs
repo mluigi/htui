@@ -794,25 +794,7 @@ async fn block_if_idle_waits_for_a_create_run_and_then_blocks_nothing() {
     let b = tokio::spawn(async move { other.block_if_idle(note).await });
 
     // B is parked on A's row lock, not merely slow: wait until Postgres says so.
-    let mut waited = false;
-    for _ in 0..200 {
-        let waiting: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity \
-              WHERE datname = current_database() AND wait_event_type = 'Lock'",
-        )
-        .fetch_one(&db.pool)
-        .await
-        .expect("read pg_stat_activity");
-        if waiting > 0 {
-            waited = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    assert!(
-        waited,
-        "block_if_idle must wait on the item lock create_run holds"
-    );
+    lock_waiters(&db.pool, 1).await;
     assert!(!b.is_finished(), "and must not answer while A holds it");
 
     a.commit().await.expect("A commits its run");
@@ -5152,8 +5134,8 @@ async fn two_creates_racing_on_one_item_admit_one() {
     match second {
         Err(htui_core::store::StoreError::Constraint(text)) => assert_eq!(
             text,
-            htui_core::store::illegal_move("item", ItemState::Queued, "queued"),
-            "the second create names the run the first one queued"
+            htui_core::store::not_startable("ANA-2", ItemState::Queued),
+            "the second create names the item and the run the first one queued"
         ),
         other => panic!("the second create is refused by the live-run check, got {other:?}"),
     }
