@@ -191,7 +191,7 @@ pub use run::{
     NewRunStep, Run, RunFacts, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary,
     RunStepTree, RunSummary, SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPhase,
     SnapshotSettings, SnapshotTemplate, StepOpening, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS,
-    ToolCallCount, VerifyOutcome, latest_graph_run, prompt_summary,
+    ToolCallCount, VerifyOutcome, latest_graph_run, latest_live_graph_run, prompt_summary,
 };
 pub use scope::{PromptScope, Scope};
 pub use skill::{

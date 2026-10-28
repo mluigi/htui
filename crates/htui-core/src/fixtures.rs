@@ -247,7 +247,7 @@ pub mod ids {
         HTUI_FEAT_3: ItemId = (class::ITEM, 4),
         /// `htui` `FIX-1`, closed.
         HTUI_FIX_1: ItemId = (class::ITEM, 5),
-        /// `htui` `TOOL-1`, open over a judge-parked run ([`RUN_5`]): state `needs you`.
+        /// `htui` `TOOL-1`, open over an `awaiting_approval` run ([`RUN_5`]): state `needs you`.
         HTUI_TOOL_1: ItemId = (class::ITEM, 6),
         /// `htui` `CLEAN-1`, open over a `failed` run ([`RUN_6`]): state `failed`.
         HTUI_CLEAN_1: ItemId = (class::ITEM, 7),
@@ -314,7 +314,8 @@ pub mod ids {
         /// MOD-144: the `running` rework run on `htui` `FEAT-1`, after [`RUN_1`]; it holds
         /// `FEAT-2` (a rework un-releases its dependents). Not executing anywhere, no lease.
         RUN_4: RunId = (class::RUN, 3),
-        /// MOD-144: the judge-parked (`awaiting_approval`, no step) run on `htui` `TOOL-1`.
+        /// MOD-144: the `awaiting_approval` run on `htui` `TOOL-1`, so the item reads `needs you`.
+        /// It has no step, so it is not a judge park: a resume walks it as an interrupted run.
         RUN_5: RunId = (class::RUN, 4),
         /// MOD-144: the `failed` run on `htui` `CLEAN-1`.
         RUN_6: RunId = (class::RUN, 5),
@@ -1472,11 +1473,11 @@ fn demo_graph_snapshot() -> Value {
 
 /// `run` (§5.8): one finished graph run on `FEAT-1`, one still-queued run on `FEAT-3` and one
 /// finished fan-out run on `ANA-1` (blueprint F-P); MOD-144 adds the runs every progress state of
-/// [`ItemState`](crate::model::ItemState) reads from: a `running` rework run on `FEAT-1`, a
-/// judge-parked run on `TOOL-1`, a `failed` run on `CLEAN-1`, a `done` run on `agy` `ANA-1` and a
-/// `stopped` run on `vulkan-tutorials` `FEAT-1`. Every new live run executes nowhere and holds no
-/// lease, so no box's slot or overlap set and no startup sweep sees it (PD11). Every one carries
-/// the `R-ORCH-11` snapshot [`demo_graph_snapshot`] builds.
+/// [`ItemState`](crate::model::ItemState) reads from: a `running` rework run on `FEAT-1`, an
+/// `awaiting_approval` run with no step on `TOOL-1`, a `failed` run on `CLEAN-1`, a `done` run on
+/// `agy` `ANA-1` and a `stopped` run on `vulkan-tutorials` `FEAT-1`. Every new live run executes
+/// nowhere and holds no lease, so no box's slot or overlap set and no startup sweep sees it (PD11).
+/// Every one carries the `R-ORCH-11` snapshot [`demo_graph_snapshot`] builds.
 fn runs() -> Vec<Run> {
     let graph_run = |id, workspace, project, item, status, queued: (i64, i64)| Run {
         workspace_id: Some(workspace),

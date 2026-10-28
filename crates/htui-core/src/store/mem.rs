@@ -54,7 +54,7 @@ use crate::model::{
     moved_order, overlaps, prompt_summary, scope_of,
 };
 use crate::model::{EdgeId, GraphBody, GraphScope, NodeBody, PhasePart, StepGraphEdge};
-use crate::model::{ItemState, latest_graph_run};
+use crate::model::{ItemState, latest_graph_run, latest_live_graph_run};
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
 use crate::prompt::template::TemplateRole;
@@ -142,8 +142,6 @@ pub enum MemFault {
     RefreshLease,
     /// [`WriteStore::release_lease`].
     ReleaseLease,
-    /// [`WriteStore::transition`], the item compare-and-set.
-    ItemTransition,
     /// [`WriteStore::record_opening`] (MOD-37 review N-4).
     RecordOpening,
     /// [`WriteStore::lease_holds`] (MOD-78 D5): a read, so `command_run` can tell a store blip
@@ -5550,12 +5548,31 @@ impl State {
     /// MOD-144 Δ2: the newest live graph run (stopped included), the one `uq_run_item_live`
     /// allows.
     fn live_graph_run(&self, item: ItemId) -> Option<&Run> {
-        self.runs
-            .values()
-            .filter(|run| {
-                run.item_id == Some(item) && run.kind == RunKind::Graph && run.status.is_active()
-            })
-            .max_by_key(|run| (run.queued_at, run.id))
+        latest_live_graph_run(self.runs.values().filter(|run| run.item_id == Some(item)))
+    }
+
+    /// MOD-144 R1 ([`WriteStore::block_if_idle`]): the store-side guard of a refusal at
+    /// `StartRun`, under this one write lock as `PgStore` holds the item's `FOR UPDATE`. A live
+    /// graph run holds `note.item_id` → `Ok(false)` and nothing written; else the note, then
+    /// `open -> blocked` (another status is left as it is), `Ok(true)`.
+    fn block_if_idle(&mut self, note: NewNote, now: DateTime<Utc>) -> Result<bool> {
+        let item = note.item_id;
+        self.require_item(item)?;
+        if self.live_graph_run(item).is_some() {
+            return Ok(false);
+        }
+        // `add_note` checks every key before it pushes, so a refused note leaves the item as it
+        // was, as Pg's transaction rolls both back.
+        self.add_note(note)?;
+        let row = self
+            .items
+            .get_mut(&item)
+            .expect("require_item found it above");
+        if row.status == Status::Open {
+            row.status = Status::Blocked;
+            row.updated_at = now;
+        }
+        Ok(true)
     }
 
     /// Released (ANA-35 §7.1): `closed`, or latest graph run `done`. A `blocked_by` edge to a
@@ -5805,9 +5822,10 @@ impl State {
         // item. `PgStore` cannot order this any other way — its `SELECT ... FOR UPDATE` on `item`
         // is the transaction's first statement — so the emulation follows it.
         let item = self.require_item(new.item_id)?;
-        let (status, holder) = (item.status, item.project_id);
+        let holder = item.project_id;
         startable(
-            status,
+            &item.key,
+            item.status,
             self.live_graph_run(new.item_id).map(|run| run.status),
         )?;
         // Nothing in the schema ties `run.project_id` to `item.project_id`, so without this a run
@@ -9193,10 +9211,13 @@ impl WriteStore for MemStore {
     }
 
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool> {
-        #[cfg(feature = "test-support")]
-        self.check_fault(MemFault::ItemTransition)?;
         let now = self.now();
         self.write(|state| state.transition(id, from, to, now))
+    }
+
+    async fn block_if_idle(&self, note: NewNote) -> Result<bool> {
+        let now = self.now();
+        self.write(|state| state.block_if_idle(note, now))
     }
 
     async fn append_events(&self, fence: StepFence, events: &[SessionEvent]) -> Result<usize> {
@@ -13529,7 +13550,7 @@ mod tests {
     /// `create_run` is one transaction (plan D6): the `run` row lands and the item is not written
     /// (MOD-144), and an item [`startable`] refuses leaves no run row behind.
     #[tokio::test]
-    async fn create_run_moves_the_item_and_writes_nothing_when_the_law_refuses() {
+    async fn create_run_writes_only_the_run_and_nothing_when_the_law_refuses() {
         let store = MemStore::demo();
         let new = graph_run(ids::HTUI_ANA_2, ids::PROJECT_HTUI, Vec::new());
         let id = new.id;
@@ -13570,8 +13591,8 @@ mod tests {
         let blocked_id = blocked.id;
         match store.create_run(blocked).await {
             Err(StoreError::Constraint(sentence)) => assert_eq!(
-                sentence, "item.status `running` cannot move to `queued` (ANA-2 §4.3)",
-                "startable's sentence names the derived state"
+                sentence, "item FEAT-1 is `running`: a live run holds it",
+                "startable's sentence names the item and its derived state"
             ),
             other => panic!("a live graph run refuses a second: {other:?}"),
         }
@@ -14564,7 +14585,7 @@ mod tests {
     /// `R-ORCH-2`'s four answers and §4.8's promotion, which lifts the step and its run in one
     /// transaction; the item is not written (MOD-144: it reads `needs you` from the run).
     #[tokio::test]
-    async fn gate_answers_write_their_outcome_and_promotion_lifts_the_run_and_the_item() {
+    async fn gate_answers_write_their_outcome_and_promotion_lifts_the_step_and_its_run() {
         let store = MemStore::demo();
         let at = Utc::now();
         let approved = gated_step(&store, new_step(ids::RUN_2, 1, 1, 0)).await;

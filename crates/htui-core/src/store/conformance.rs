@@ -293,6 +293,8 @@ pub const CASES: &[&str] = &[
     "a_finished_snapshot_defaults_a_verdict_to_concluded",
     "item_state_is_derived_from_the_latest_graph_run",
     "transition_never_touches_closed_at",
+    // MOD-144 R1 (M1): the engine's StartRun refusals block only an item no live run holds
+    "block_if_idle_writes_nothing_over_a_live_run",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -947,6 +949,9 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "transition_never_touches_closed_at" => {
             Box::pin(transition_never_touches_closed_at(store)).await
+        }
+        "block_if_idle_writes_nothing_over_a_live_run" => {
+            Box::pin(block_if_idle_writes_nothing_over_a_live_run(store)).await
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -5392,9 +5397,15 @@ async fn state_of<S: ReadStore>(case: &str, store: &S, item: ItemId) -> ItemStat
     ItemState::of(row.status, latest_graph_run(&runs).map(|run| run.status))
 }
 
-/// MOD-144: `startable`'s refusal sentence for an item at `state`, the one `create_run` answers.
-fn not_startable(state: ItemState) -> String {
-    illegal_move("item", state, "queued")
+/// MOD-144: `startable`'s refusal sentence for `item` at `state`, the one `create_run` answers
+/// (it names the item by its key).
+async fn not_startable<S: ReadStore>(
+    case: &str,
+    store: &S,
+    item: ItemId,
+    state: ItemState,
+) -> String {
+    crate::store::not_startable(item_row(case, store, item).await.key, state)
 }
 
 /// The item row, or a panic naming the case.
@@ -5460,7 +5471,7 @@ async fn create_run_records_its_workspace<S: WriteStore>(store: &S) {
 
 /// Plan D6, MOD-144: the `run` row lands and the item row is not written (it reads `queued` from
 /// the run); a refusal writes no run (ANA-2 §4.3, §5.1, ANA-35 §7.1). The `MemStore` twin is
-/// `mem.rs::create_run_moves_the_item_and_writes_nothing_when_the_law_refuses`; on Postgres the
+/// `mem.rs::create_run_writes_only_the_run_and_nothing_when_the_law_refuses`; on Postgres the
 /// snapshot column's own guard is `pg_criteria.rs::ck_run_graph_snapshot_is_not_valid_for_old_rows_and_checked_for_new`.
 async fn run_create_moves_the_item<S: WriteStore>(store: &S) {
     const CASE: &str = "run_create_moves_the_item";
@@ -5599,9 +5610,9 @@ async fn run_create_moves_the_item<S: WriteStore>(store: &S) {
     let live = new_run(ids::PROJECT_HTUI, ids::HTUI_FEAT_1, Vec::new());
     let live_id = live.id;
     let refused = store.create_run(live).await;
+    let expected = not_startable(CASE, store, ids::HTUI_FEAT_1, ItemState::Running).await;
     assert!(
-        matches!(&refused, Err(StoreError::Constraint(sentence))
-            if *sentence == not_startable(ItemState::Running)),
+        matches!(&refused, Err(StoreError::Constraint(sentence)) if *sentence == expected),
         "{CASE}: a live graph run refuses a second (MOD-144 Δ8), got {refused:?}"
     );
     assert_eq!(
@@ -12101,9 +12112,10 @@ async fn finish_step_records_the_settle<S: WriteStore>(store: &S) {
     );
 }
 
-/// `R-ORCH-2`'s four answers, §4.8's promotion — which lifts the step, its run and its item in one
-/// transaction — and the refusal note of ANA-2 invariant 7. The `MemStore` twins are
-/// `mem.rs::gate_answers_write_their_outcome_and_promotion_lifts_the_run_and_the_item` and
+/// `R-ORCH-2`'s four answers, §4.8's promotion — which lifts the step and its run in one
+/// transaction (MOD-144: not the item) — and the refusal note of ANA-2 invariant 7. The
+/// `MemStore` twins are
+/// `mem.rs::gate_answers_write_their_outcome_and_promotion_lifts_the_step_and_its_run` and
 /// `mem.rs::add_note_writes_the_row_and_refuses_every_dangling_reference`.
 async fn gate_answers_write_their_outcome<S: WriteStore>(store: &S) {
     const CASE: &str = "gate_answers_write_their_outcome";
@@ -13732,9 +13744,9 @@ async fn create_run_refuses_a_second_live_graph_run<S: WriteStore>(store: &S) {
         let refused = store
             .create_run(new_run(ids::PROJECT_HTUI, item, Vec::new()))
             .await;
+        let expected = not_startable(CASE, store, item, state).await;
         assert!(
-            matches!(&refused, Err(StoreError::Constraint(sentence))
-                if *sentence == not_startable(state)),
+            matches!(&refused, Err(StoreError::Constraint(sentence)) if *sentence == expected),
             "{CASE}: a `{state}` run refuses a second, got {refused:?}"
         );
         assert_eq!(
@@ -13802,12 +13814,106 @@ async fn create_run_refuses_a_second_live_graph_run<S: WriteStore>(store: &S) {
         let refused = store
             .create_run(new_run(ids::PROJECT_HTUI, other, Vec::new()))
             .await;
+        let expected = not_startable(CASE, store, other, ItemState::Blocked).await;
         assert!(
-            matches!(&refused, Err(StoreError::Constraint(sentence))
-                if *sentence == not_startable(ItemState::Blocked)),
+            matches!(&refused, Err(StoreError::Constraint(sentence)) if *sentence == expected),
             "{CASE}: a blocked item does not start, got {refused:?}"
         );
     }
+}
+
+/// MOD-144 R1 (M1): `block_if_idle` is the engine's rung-4 and missing-tags write. Over a live
+/// graph run (`create_run` landed between the engine's lock-free `startable` read and the
+/// refusal) it answers `false` and writes nothing, `stopped` included; with no live run it
+/// writes the note and moves `open -> blocked`; an item already `blocked` keeps its status and
+/// still gets the note (invariant 7); an unknown item is `NotFound`.
+async fn block_if_idle_writes_nothing_over_a_live_run<S: WriteStore>(store: &S) {
+    const CASE: &str = "block_if_idle_writes_nothing_over_a_live_run";
+    let at = seam_clock();
+    let item = minted(CASE, store, "started elsewhere").await;
+    let run = run_at(CASE, store, item, at, 0, RunStatus::Queued).await;
+    let before = item_row(CASE, store, item).await;
+    for (from, to) in [
+        (None, RunStatus::Queued),
+        (Some(RunStatus::Queued), RunStatus::Running),
+        (Some(RunStatus::Running), RunStatus::Stopped),
+    ] {
+        if let Some(from) = from {
+            assert!(
+                store.transition_run(run, from, to, at).await.expect(CASE),
+                "{CASE}: run {from} -> {to}"
+            );
+        }
+        let note = new_note(item, ids::USER, None);
+        let note_id = note.id;
+        assert!(
+            !store.block_if_idle(note).await.expect(CASE),
+            "{CASE}: a `{to}` run holds the item, so nothing is blocked"
+        );
+        assert_eq!(
+            item_row(CASE, store, item).await,
+            before,
+            "{CASE}: the item stays `open` under its `{to}` run"
+        );
+        assert!(
+            store
+                .notes(item)
+                .await
+                .expect(CASE)
+                .iter()
+                .all(|row| row.id != note_id),
+            "{CASE}: and no note is written over a `{to}` run (D98)"
+        );
+    }
+
+    // The run ends: the item is idle again, and the refusal lands.
+    assert!(
+        store
+            .transition_run(run, RunStatus::Stopped, RunStatus::Running, at)
+            .await
+            .expect(CASE),
+        "{CASE}: run stopped -> running"
+    );
+    store
+        .finish_run(run, RunStatus::Failed, Some("boom"), at)
+        .await
+        .expect(CASE);
+    let note = new_note(item, ids::USER, None);
+    let note_id = note.id;
+    assert!(store.block_if_idle(note).await.expect(CASE));
+    assert_eq!(item_row(CASE, store, item).await.status, Status::Blocked);
+    assert!(
+        store
+            .notes(item)
+            .await
+            .expect(CASE)
+            .iter()
+            .any(|row| row.id == note_id),
+        "{CASE}: the refusal is written with its note"
+    );
+
+    // Already blocked by another writer: the status stays, the note is still written.
+    let note = new_note(item, ids::USER, None);
+    let note_id = note.id;
+    assert!(store.block_if_idle(note).await.expect(CASE));
+    assert_eq!(item_row(CASE, store, item).await.status, Status::Blocked);
+    assert!(
+        store
+            .notes(item)
+            .await
+            .expect(CASE)
+            .iter()
+            .any(|row| row.id == note_id),
+        "{CASE}: a refusal on a blocked item still leaves its note (invariant 7)"
+    );
+
+    let unknown = store
+        .block_if_idle(new_note(ItemId::new(), ids::USER, None))
+        .await;
+    assert!(
+        matches!(unknown, Err(StoreError::NotFound { entity: "item", .. })),
+        "{CASE}: an unknown item is NotFound, got {unknown:?}"
+    );
 }
 
 /// MOD-144 (plan "Ready"): an `open` item with only cancelled graph runs is ready; one whose
@@ -15569,9 +15675,9 @@ async fn finish_run_moves_run_and_item_together<S: WriteStore>(store: &S) {
     let second = new_run(ids::PROJECT_AGY, held, Vec::new());
     let second_id = second.id;
     let refused = store.create_run(second).await;
+    let expected = not_startable(CASE, store, held, ItemState::Running).await;
     assert!(
-        matches!(&refused, Err(StoreError::Constraint(sentence))
-            if *sentence == not_startable(ItemState::Running)),
+        matches!(&refused, Err(StoreError::Constraint(sentence)) if *sentence == expected),
         "{CASE}: a running run refuses a second, got {refused:?}"
     );
     assert!(
@@ -15584,9 +15690,9 @@ async fn finish_run_moves_run_and_item_together<S: WriteStore>(store: &S) {
     let refused = store
         .create_run(new_run(ids::PROJECT_AGY, held, Vec::new()))
         .await;
+    let expected = not_startable(CASE, store, held, ItemState::Stopped).await;
     assert!(
-        matches!(&refused, Err(StoreError::Constraint(sentence))
-            if *sentence == not_startable(ItemState::Stopped)),
+        matches!(&refused, Err(StoreError::Constraint(sentence)) if *sentence == expected),
         "{CASE}: a stopped run is live and refuses a second too, got {refused:?}"
     );
     assert_eq!(

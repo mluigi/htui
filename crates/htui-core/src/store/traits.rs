@@ -374,6 +374,26 @@ pub trait WriteStore: ReadStore {
     /// refused from every status (MOD-38 PRD D1); use [`close_out`](WriteStore::close_out).
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool>;
 
+    /// A refusal at `StartRun` written to an item no run holds (MOD-144 R1, MOD-7 D98): under the
+    /// lock of `note.item_id` (`FOR UPDATE` on Pg, the write lock on Mem), the item's live graph
+    /// runs are read **after** the lock is taken. A live graph run → `Ok(false)` and nothing
+    /// written (D98: a refused item writes no note; the run holds it). Otherwise the note is
+    /// written and an `open` item moves to `blocked`, `Ok(true)`; an item another writer already
+    /// moved (`blocked`, `closed`) keeps its status and still gets the note (invariant 7).
+    ///
+    /// The engine's rung 4 and missing-tags refusals use it instead of
+    /// [`transition`](Self::transition) and [`add_note`](Self::add_note): their `startable` read
+    /// takes no lock, and `create_run` no longer writes the item, so a plain compare-and-set could
+    /// block an item whose run another box created in between. A single `UPDATE ... WHERE NOT
+    /// EXISTS (live run)` is not enough on Postgres (no re-check after the row-lock wait); the lock
+    /// comes first.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown item;
+    /// [`add_note`](Self::add_note)'s
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint)s, with nothing written.
+    async fn block_if_idle(&self, note: NewNote) -> Result<bool>;
+
     /// Appends session events under `fence`, skipping any `(run_step_id, seq)` already stored, and
     /// answers how many rows were actually inserted (`docs/ANA-4.md` §4.1, `docs/ANA-9.md` §4.3,
     /// MOD-40 plan D1).
@@ -2531,22 +2551,36 @@ pub const LIVE_RUN_STATUSES: [RunStatus; 4] = [
 ];
 
 /// MOD-144 Δ8: `create_run`'s check under the item lock, shared with `start_enabled` and
-/// `enqueue_with`: an `open` item with no live graph run. `live` is the newest live graph run's
-/// status.
+/// `enqueue_with`: an `open` item with no live graph run. `item` names the item in the refusal
+/// (its key); `live` is the newest live graph run's status.
 ///
 /// # Errors
-/// [`StoreError::Constraint`](crate::store::StoreError::Constraint) with
-/// [`illegal_move`]`("item", ItemState::of(status, live), "queued")`: today's sentence shape, e.g.
-/// `` item.status `running` cannot move to `queued` (ANA-2 §4.3) ``.
-pub fn startable(status: Status, live: Option<RunStatus>) -> Result<()> {
+/// [`StoreError::Constraint`](crate::store::StoreError::Constraint) with [`not_startable`]'s
+/// sentence over `ItemState::of(status, live)`, e.g. `` item HTUI-1 is `running`: a live run
+/// holds it ``.
+pub fn startable(
+    item: impl std::fmt::Display,
+    status: Status,
+    live: Option<RunStatus>,
+) -> Result<()> {
     if matches!(status, Status::Open) && live.is_none() {
         return Ok(());
     }
-    Err(crate::store::StoreError::Constraint(illegal_move(
-        "item",
+    Err(crate::store::StoreError::Constraint(not_startable(
+        item,
         ItemState::of(status, live),
-        "queued",
     )))
+}
+
+/// MOD-144: [`startable`]'s refusal, naming the item's derived state by its word (the item's
+/// stored status is only `open`, `blocked` or `closed`; the state is the run's).
+#[must_use]
+pub fn not_startable(item: impl std::fmt::Display, state: ItemState) -> String {
+    match state {
+        ItemState::Closed => format!("item {item} is `closed`"),
+        ItemState::Blocked => format!("item {item} is `blocked`: unblock it first"),
+        state => format!("item {item} is `{}`: a live run holds it", state.word()),
+    }
 }
 
 /// The refusal text of an illegal move, one sentence for the three tables.
@@ -3692,15 +3726,15 @@ pub fn queue_token_refusal(
 
 #[cfg(test)]
 mod tests {
-    use super::{LIVE_RUN_STATUSES, illegal_move, startable};
+    use super::{LIVE_RUN_STATUSES, not_startable, startable};
     use crate::model::{ItemState, RunStatus, Status};
     use crate::store::StoreError;
 
     /// MOD-144 Δ8: only an `open` item with no live graph run may start; every refusal names the
-    /// item's derived state in `illegal_move`'s sentence.
+    /// item and its derived state by its word, never a stored `item.status`.
     #[test]
     fn startable_admits_only_an_open_item_with_no_live_run() {
-        assert!(startable(Status::Open, None).is_ok());
+        assert!(startable("HTUI-1", Status::Open, None).is_ok());
         assert_eq!(
             LIVE_RUN_STATUSES.to_vec(),
             RunStatus::ALL
@@ -3710,27 +3744,33 @@ mod tests {
                 .collect::<Vec<_>>(),
             "the live set is `is_active`"
         );
-        let refusal = |status: Status, live: Option<RunStatus>| match startable(status, live) {
-            Err(StoreError::Constraint(sentence)) => sentence,
-            other => panic!("({status}, {live:?}) must be refused as Constraint, got {other:?}"),
-        };
+        let refusal =
+            |status: Status, live: Option<RunStatus>| match startable("HTUI-1", status, live) {
+                Err(StoreError::Constraint(sentence)) => sentence,
+                other => {
+                    panic!("({status}, {live:?}) must be refused as Constraint, got {other:?}")
+                }
+            };
         for live in LIVE_RUN_STATUSES {
             assert_eq!(
                 refusal(Status::Open, Some(live)),
-                illegal_move("item", ItemState::of(Status::Open, Some(live)), "queued")
+                not_startable("HTUI-1", ItemState::of(Status::Open, Some(live)))
             );
         }
         assert_eq!(
             refusal(Status::Open, Some(RunStatus::Running)),
-            "item.status `running` cannot move to `queued` (ANA-2 §4.3)"
+            "item HTUI-1 is `running`: a live run holds it"
         );
-        for status in [Status::Blocked, Status::Closed] {
-            for live in core::iter::once(None).chain(LIVE_RUN_STATUSES.map(Some)) {
-                assert_eq!(
-                    refusal(status, live),
-                    illegal_move("item", ItemState::of(status, live), "queued")
-                );
-            }
+        assert_eq!(
+            refusal(Status::Open, Some(RunStatus::AwaitingApproval)),
+            "item HTUI-1 is `needs you`: a live run holds it"
+        );
+        for live in core::iter::once(None).chain(LIVE_RUN_STATUSES.map(Some)) {
+            assert_eq!(
+                refusal(Status::Blocked, live),
+                "item HTUI-1 is `blocked`: unblock it first"
+            );
+            assert_eq!(refusal(Status::Closed, live), "item HTUI-1 is `closed`");
         }
     }
 }

@@ -144,6 +144,17 @@ pub fn latest_graph_run<'a, R: RunFacts + 'a>(
         .max_by_key(|run| run.run_order())
 }
 
+/// MOD-144 Δ2: the item's newest **live** graph run (`RunStatus::is_active`, `stopped`
+/// included) by `(queued_at, id)`, the one `uq_run_item_live` allows and `create_run`'s
+/// [`startable`](crate::store::startable) check names. The caller passes the runs of one item.
+pub fn latest_live_graph_run<'a, R: RunFacts + 'a>(
+    runs: impl IntoIterator<Item = &'a R>,
+) -> Option<&'a R> {
+    runs.into_iter()
+        .filter(|run| run.run_kind() == RunKind::Graph && run.run_status().is_active())
+        .max_by_key(|run| run.run_order())
+}
+
 str_enum!(
     /// `run_step.status` (§5.8).
     StepStatus {
@@ -1260,6 +1271,62 @@ mod tests {
             })
             .collect();
         assert_eq!(latest_graph_run(&summaries).map(|r| r.id), Some(id(3)));
+    }
+
+    /// MOD-144 Δ2: the latest **live** graph run reads every live status (`stopped` included),
+    /// skips finished and chat runs, and breaks a `queued_at` tie on the id.
+    #[test]
+    fn latest_live_graph_run_reads_only_live_graph_runs() {
+        use super::{Run, RunId, RunKind, RunMode, latest_live_graph_run};
+        use crate::model::ids::{BoxId, ProjectId, UserId};
+        use chrono::{TimeZone as _, Utc};
+
+        let at = |minute: u32| Utc.with_ymd_and_hms(2026, 10, 27, 9, minute, 0).unwrap();
+        let id = |n: u128| RunId::from_uuid(Uuid::from_u128(n));
+        let run = |n: u128, minute: u32, kind: RunKind, status: RunStatus| Run {
+            id: id(n),
+            project_id: ProjectId::from_uuid(Uuid::from_u128(1)),
+            item_id: None,
+            workspace_id: None,
+            kind,
+            mode: RunMode::Manual,
+            status,
+            target_box_id: BoxId::from_uuid(Uuid::from_u128(1)),
+            executing_box_id: None,
+            graph_snapshot: None,
+            started_by: UserId::from_uuid(Uuid::from_u128(1)),
+            queued_at: at(minute),
+            started_at: None,
+            finished_at: None,
+            failure: None,
+            repo_scope: Vec::new(),
+            lease_box_id: None,
+            lease_expires_at: None,
+            updated_at: at(minute),
+        };
+        for live in RunStatus::ALL.iter().copied().filter(|s| s.is_active()) {
+            let runs = vec![
+                run(1, 1, RunKind::Graph, live),
+                run(2, 2, RunKind::Graph, RunStatus::Done),
+                run(3, 3, RunKind::Chat, RunStatus::Running),
+            ];
+            assert_eq!(
+                latest_live_graph_run(&runs).map(|r| (r.id, r.status)),
+                Some((id(1), live)),
+                "`{live}` is live"
+            );
+        }
+        let tie = vec![
+            run(1, 1, RunKind::Graph, RunStatus::Stopped),
+            run(2, 1, RunKind::Graph, RunStatus::Queued),
+        ];
+        assert_eq!(latest_live_graph_run(&tie).map(|r| r.id), Some(id(2)));
+        let finished = vec![
+            run(1, 1, RunKind::Graph, RunStatus::Done),
+            run(2, 2, RunKind::Graph, RunStatus::Failed),
+            run(3, 3, RunKind::Graph, RunStatus::Cancelled),
+        ];
+        assert!(latest_live_graph_run(&finished).is_none());
     }
 
     /// `failed` is the one step status the two notions disagree about: it is not terminal,
