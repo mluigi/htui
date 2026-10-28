@@ -30,7 +30,10 @@ use crossterm::event::KeyEvent;
 
 /// Marker in front of the row the cursor is on, beside the kit's gutter and band. The band is
 /// what marks the row on screen (MOD-85); the marker stays because `tests/shell.rs` (not this
-/// lane's to edit, MOD-115 M4) finds the cursor row by `> {name}`.
+/// lane's to edit, MOD-115 M4) finds the cursor row by `> {name}`. Follow-up for whoever owns
+/// `tests/shell.rs` (the merge or B1): find the row by the gutter instead, then drop `CURSOR`
+/// and `NO_CURSOR` and re-accept `shell__switcher_open`, `overlays__switcher_80` and the testkit
+/// `shell_empty` snapshot.
 const CURSOR: &str = "> ";
 
 /// The marker's width, in front of every other row, so names stay in one column.
@@ -56,9 +59,18 @@ const READING_NEXT: &str = "the list appears once the store answers";
 /// What a reply with no workspace says.
 const EMPTY: &str = "no workspaces";
 
-/// Columns a `Fit` modal leaves free on the screen: `kit::modal`'s margin, which the border's
-/// hint is measured against.
+/// Columns a `Fit` modal leaves free on the screen: a copy of `kit::modal`'s private margin,
+/// which the border's hint is measured against. The kit does not cut a border hint itself nor
+/// export its margin (a kit gap, reported for a serial kit fix, MOD-115 M4); until it does,
+/// `tests::border_hint_measures_the_box_the_modal_draws` pins this copy to what `Modal` draws.
 const MARGIN_COLS: u16 = 4;
+
+/// The width of the box a `Fit` modal of `content_w` draws over `area`.
+fn fit_width(content_w: u16, area: Rect) -> u16 {
+    content_w
+        .saturating_add(CHROME)
+        .min(area.width.saturating_sub(MARGIN_COLS))
+}
 
 /// `hint` as the bottom border of a `Fit` modal of `content_w` over `area` holds it: whole when
 /// it fits, else cut with an ellipsis (MOD-115 M4 E6). The border keeps a rule cell and the
@@ -66,9 +78,7 @@ const MARGIN_COLS: u16 = 4;
 /// overlays (the queue and the concepts search too).
 #[must_use]
 pub(super) fn border_hint(hint: &str, content_w: u16, area: Rect) -> String {
-    let box_w = content_w
-        .saturating_add(CHROME)
-        .min(area.width.saturating_sub(MARGIN_COLS));
+    let box_w = fit_width(content_w, area);
     // The corners, then the title's blank either side.
     let room = box_w.saturating_sub(4);
     list::ellipsize(Line::raw(hint.to_owned()), room).to_string()
@@ -591,5 +601,33 @@ mod tests {
         // The whole row is drawn: its count is not cut at the box's edge.
         let buffer = drawn(&switcher, Keys::compiled(), &Theme::default(), (100, 30));
         find(&buffer, "  no projects");
+    }
+
+    /// `border_hint` measures the box `kit::modal` draws (MOD-115 M4 E6): `fit_width` copies the
+    /// kit's private margin, so this pins the copy to what `Modal` really draws and a change to
+    /// the kit's margin fails here instead of cutting the hint at the wrong width.
+    #[test]
+    fn border_hint_measures_the_box_the_modal_draws() {
+        for width in [10, 30, 80, 200] {
+            for content_w in [1, 20, 60, 150] {
+                let mut term = Terminal::new(TestBackend::new(width, 12)).expect("a test backend");
+                let mut content = Rect::default();
+                term.draw(|frame| {
+                    content = Modal::new("t")
+                        .size(ModalSize::Fit {
+                            content_w,
+                            content_h: 1,
+                        })
+                        .render(frame, frame.area(), &Theme::default());
+                })
+                .expect("the modal draws");
+                let area = Rect::new(0, 0, width, 12);
+                assert_eq!(
+                    fit_width(content_w, area),
+                    content.width + CHROME,
+                    "content {content_w} over {width} columns"
+                );
+            }
+        }
     }
 }
