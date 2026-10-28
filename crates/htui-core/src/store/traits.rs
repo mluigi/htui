@@ -3111,6 +3111,33 @@ pub fn parts_off_divide(phase: &str, split: Split) -> String {
     format!("phase `{phase}` is split `{split}`; only a `divide` phase has parts")
 }
 
+// ---- MOD-138: the snapshot v2 walk refusals (plan D9; blueprint §1.6) ----
+
+/// MOD-138 D9 (W1/W2): the forward edges (`next`, `if` and every `asks_you` that is not a back
+/// edge) hold a cycle; `path` is the cycle by phase name, its first name repeated at the end.
+#[must_use]
+pub fn forward_edges_form_a_cycle(path: &[&str], graph: StepGraphId) -> String {
+    let path = path
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(" → ");
+    format!(
+        "phases {path} form a cycle of forward edges in graph `{graph}`; only a \
+         `changes_requested`, `fails` or back `asks_you` edge may close a loop"
+    )
+}
+
+/// MOD-138 D9 (W3): a `changes_requested` or `fails` edge whose target does not reach its
+/// source over the forward edges.
+#[must_use]
+pub fn loop_edge_runs_forward(kind: EdgeKind, from: &str, to: &str, graph: StepGraphId) -> String {
+    format!(
+        "the `{kind}` edge from `{from}` to `{to}` in graph `{graph}` runs forward: `{to}` does \
+         not reach `{from}` over forward edges, and a `{kind}` edge always loops back"
+    )
+}
+
 // ---- MOD-38: ANA-11's refusals ----
 
 /// ANA-11 §4.2: the close-out law refuses this pair (T3).

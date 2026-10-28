@@ -2,19 +2,21 @@
 //! decide before any write, so they refuse the same input with the same sentence (F6). The seed of
 //! MOD-138's shared graph validator.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::model::{
-    AgentId, EdgePredicate, GraphBody, PersonaId, Split, StepGraphEdge, StepGraphId, StepGraphPhase,
+    AgentId, EdgeId, EdgeKind, EdgePredicate, GraphBody, PersonaId, PhaseId, Split, StepGraphEdge,
+    StepGraphId, StepGraphPhase,
 };
 use crate::prompt::template::TemplateRole;
+use crate::seed::{default_edge_plan, default_edges};
 use crate::store::traits::{
     already_exists, divide_columns_off_divide, edge_endpoint_outside_graph, edge_is_taken,
     edge_loop_limit_negative, edge_loops_to_itself, edge_needs_loop_limit, edge_predicate_mismatch,
-    fan_out_below_one, max_parts_below_one, palette_phase_has_edges, parts_off_divide,
-    phase_name_is_taken, phase_part_key_is_taken, phase_position_is_taken,
-    phase_token_budget_refusal, reserved_phase_name, retry_limit_negative, row_names_another_graph,
-    row_names_another_phase, split_fan_out_mismatch,
+    fan_out_below_one, forward_edges_form_a_cycle, loop_edge_runs_forward, max_parts_below_one,
+    palette_phase_has_edges, parts_off_divide, phase_name_is_taken, phase_part_key_is_taken,
+    phase_position_is_taken, phase_token_budget_refusal, reserved_phase_name, retry_limit_negative,
+    row_names_another_graph, row_names_another_phase, split_fan_out_mismatch,
 };
 
 /// D7's node CHECKs on one row: `ck_phase_split_fan_out`, then `ck_phase_divide_columns`, then
@@ -299,19 +301,270 @@ pub fn body_agent_refs(body: &GraphBody) -> Vec<(&'static str, AgentId)> {
     refs
 }
 
+// ---- MOD-138 D9: the walk validator (blueprint §1.4) ----
+
+/// One node the walk validator sees (MOD-138 D9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalkNode<'a> {
+    /// The phase name, or the snapshot node key; the refusals name it.
+    pub name: &'a str,
+    /// A palette node is not counted (D9).
+    pub palette: bool,
+}
+
+/// One edge the walk validator sees, by index into the node slice (MOD-138 D9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalkEdge {
+    /// Index of the source node.
+    pub from: usize,
+    /// Index of the target node.
+    pub to: usize,
+    /// The edge kind; it decides forward or back.
+    pub kind: EdgeKind,
+}
+
+/// MOD-138 D9: the first refusal, in this order, else `None`:
+///
+/// - W1/W2: let N = the `next` and `if` edges. An `asks_you` edge is a **back** edge iff its
+///   target reaches its source over N (blueprint F18), else forward. The forward edges (N plus
+///   the forward `asks_you`) must be acyclic: [`forward_edges_form_a_cycle`] naming the cycle
+///   (a depth-first walk from nodes in slice order, edges in slice order; the path from the
+///   re-entered node round to it again).
+/// - W3: per edge in slice order, a `changes_requested` or `fails` edge must be a back edge: its
+///   target reaches its source over the forward edges, else [`loop_edge_runs_forward`].
+///
+/// "Every cycle is closed by a `changes_requested`, `fails` or `asks_you` edge" is a
+/// consequence: with the forward edges acyclic, every cycle holds a non-forward edge, and the
+/// non-forward edges are exactly those kinds. Palette nodes, and every edge touching one, are
+/// left out of the walk. MOD-137's rule (e) already refuses any edge on a palette node, so that is
+/// a no-op kept for M2's reachability. An edge naming an index outside `nodes` is skipped.
+#[must_use]
+pub fn walk_refusal(
+    graph: StepGraphId,
+    nodes: &[WalkNode<'_>],
+    edges: &[WalkEdge],
+) -> Option<String> {
+    let counted = |end: usize| nodes.get(end).is_some_and(|node| !node.palette);
+    let edges: Vec<&WalkEdge> = edges
+        .iter()
+        .filter(|edge| counted(edge.from) && counted(edge.to))
+        .collect();
+    let guided = adjacency(
+        nodes.len(),
+        edges
+            .iter()
+            .filter(|edge| matches!(edge.kind, EdgeKind::Next | EdgeKind::If)),
+    );
+    let forward = adjacency(
+        nodes.len(),
+        edges.iter().filter(|edge| match edge.kind {
+            EdgeKind::Next | EdgeKind::If => true,
+            EdgeKind::AsksYou => !reaches(&guided, edge.to, edge.from),
+            EdgeKind::ChangesRequested | EdgeKind::Fails => false,
+        }),
+    );
+    if let Some(cycle) = first_cycle(&forward) {
+        let path: Vec<&str> = cycle.into_iter().map(|index| nodes[index].name).collect();
+        return Some(forward_edges_form_a_cycle(&path, graph));
+    }
+    edges
+        .iter()
+        .filter(|edge| matches!(edge.kind, EdgeKind::ChangesRequested | EdgeKind::Fails))
+        .find(|edge| !reaches(&forward, edge.to, edge.from))
+        .map(|edge| {
+            loop_edge_runs_forward(edge.kind, nodes[edge.from].name, nodes[edge.to].name, graph)
+        })
+}
+
+/// Successor lists over `len` nodes, each in edge slice order.
+fn adjacency<'e>(len: usize, edges: impl Iterator<Item = &'e &'e WalkEdge>) -> Vec<Vec<usize>> {
+    let mut next = vec![Vec::new(); len];
+    for edge in edges {
+        next[edge.from].push(edge.to);
+    }
+    next
+}
+
+/// Whether `to` is reachable from `from` (itself included) over `next`.
+fn reaches(next: &[Vec<usize>], from: usize, to: usize) -> bool {
+    let mut seen = vec![false; next.len()];
+    let mut queue = vec![from];
+    seen[from] = true;
+    while let Some(at) = queue.pop() {
+        if at == to {
+            return true;
+        }
+        for &successor in &next[at] {
+            if !seen[successor] {
+                seen[successor] = true;
+                queue.push(successor);
+            }
+        }
+    }
+    false
+}
+
+/// The first cycle a depth-first walk meets, roots in node order and successors in list order:
+/// the path from the re-entered node round to it again (its first index repeated last).
+/// Iterative, so a long chain cannot exhaust the stack.
+fn first_cycle(next: &[Vec<usize>]) -> Option<Vec<usize>> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Mark {
+        Unseen,
+        OnPath,
+        Done,
+    }
+    let mut mark = vec![Mark::Unseen; next.len()];
+    for root in 0..next.len() {
+        if mark[root] != Mark::Unseen {
+            continue;
+        }
+        mark[root] = Mark::OnPath;
+        let mut path: Vec<(usize, usize)> = vec![(root, 0)];
+        while let Some(&mut (at, ref mut child)) = path.last_mut() {
+            let Some(&successor) = next[at].get(*child) else {
+                mark[at] = Mark::Done;
+                path.pop();
+                continue;
+            };
+            *child += 1;
+            match mark[successor] {
+                Mark::OnPath => {
+                    let start = path
+                        .iter()
+                        .position(|&(node, _)| node == successor)
+                        .unwrap_or_default();
+                    let mut cycle: Vec<usize> =
+                        path[start..].iter().map(|&(node, _)| node).collect();
+                    cycle.push(successor);
+                    return Some(cycle);
+                }
+                Mark::Unseen => {
+                    mark[successor] = Mark::OnPath;
+                    path.push((successor, 0));
+                }
+                Mark::Done => {}
+            }
+        }
+    }
+    None
+}
+
+/// MOD-138 D9 over a body: nodes in body order, edges in body order, by phase name; an edge
+/// naming a phase the body lacks is skipped (rule (a) of [`graph_body_topology_refusal`] refuses
+/// it first). Both stores' `replace_graph` call it straight after the topology rules, and
+/// `htui_orch::graph::override_graph` pre-checks a clone with it.
+#[must_use]
+pub fn graph_body_walk_refusal(graph: StepGraphId, body: &GraphBody) -> Option<String> {
+    let index: HashMap<PhaseId, usize> = body
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.phase.id, index))
+        .collect();
+    let nodes: Vec<WalkNode<'_>> = body
+        .nodes
+        .iter()
+        .map(|node| WalkNode {
+            name: &node.phase.name,
+            palette: node.phase.palette,
+        })
+        .collect();
+    let edges: Vec<WalkEdge> = body
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            Some(WalkEdge {
+                from: *index.get(&edge.from)?,
+                to: *index.get(&edge.to)?,
+                kind: edge.kind,
+            })
+        })
+        .collect();
+    walk_refusal(graph, &nodes, &edges)
+}
+
+// ---- MOD-138 D7: the default-edge rule (blueprint §1.5) ----
+
+/// MOD-138 D7: after a per-row write, the edges the graph must now hold. Its callers are both
+/// stores' `create_phase`, `update_phase` and `delete_phase`, inside the same write.
+///
+/// `Some(edges)` exactly when the graph was default-edged before the write (`before_edges` equal
+/// [`default_edges`] of `before_phases` as a multiset of `(from, to, kind, loop_limit, predicate
+/// is none)`) **and** `default_edges(after_phases)` differs from `before_edges` by that shape. The
+/// new edges are minted by `mint` in `default_edges` order. `None`: authored edges (left alone; a
+/// new phase is an unlinked root, which D9 accepts), or nothing moved (blueprint F12). A cascade
+/// (`delete_phase`) needs no special case: an edge on the deleted phase is in `before_edges` but
+/// cannot be in `default_edges(after)`, so the shapes differ.
+///
+/// `after_phases` is computed purely from `before_phases` plus the writer's own result (the
+/// inserted row, the returned updated row, or `before` minus the deleted id), never re-read.
+#[must_use]
+pub fn default_edges_follow(
+    before_phases: &[StepGraphPhase],
+    before_edges: &[StepGraphEdge],
+    after_phases: &[StepGraphPhase],
+    mint: impl FnMut() -> EdgeId,
+) -> Option<Vec<StepGraphEdge>> {
+    let stored = edge_shapes(before_edges.iter().map(|edge| {
+        (
+            edge.from,
+            edge.to,
+            edge.kind,
+            edge.loop_limit,
+            edge_predicate(edge).is_none(),
+        )
+    }));
+    if stored != default_shapes(before_phases) || stored == default_shapes(after_phases) {
+        return None;
+    }
+    Some(default_edges(after_phases, mint))
+}
+
+/// D7's edge shape: `(from, to, kind, loop_limit, predicate is none)`.
+type EdgeShape = (PhaseId, PhaseId, EdgeKind, Option<i32>, bool);
+
+/// A multiset of edge shapes, as counts.
+fn edge_shapes(shapes: impl Iterator<Item = EdgeShape>) -> HashMap<EdgeShape, usize> {
+    let mut counts = HashMap::new();
+    for shape in shapes {
+        *counts.entry(shape).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// [`default_edges`]' shapes over `phases`, without minting ids.
+fn default_shapes(phases: &[StepGraphPhase]) -> HashMap<EdgeShape, usize> {
+    let projection: Vec<(i32, &str, i32)> = phases
+        .iter()
+        .map(|phase| (phase.position, phase.name.as_str(), phase.retry_limit))
+        .collect();
+    edge_shapes(default_edge_plan(&projection).into_iter().map(|edge| {
+        (
+            phases[edge.from].id,
+            phases[edge.to].id,
+            edge.kind,
+            edge.loop_limit,
+            true,
+        )
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
 
     use super::{
-        body_agent_refs, body_persona_refs, edge_predicate, graph_body_shape_refusal,
-        graph_body_topology_refusal, phase_row_refusal,
+        WalkEdge, WalkNode, body_agent_refs, body_persona_refs, default_edges_follow,
+        edge_predicate, graph_body_shape_refusal, graph_body_topology_refusal,
+        graph_body_walk_refusal, phase_row_refusal, walk_refusal,
     };
     use crate::model::{
         AgentId, CommandQueue, EdgeId, EdgeKind, EdgePredicate, Gate, GraphBody, GraphScope,
         NodeBody, PersonaId, PhaseAgent, PhaseId, PhasePart, ProjectId, Split, StepGraph,
         StepGraphEdge, StepGraphId, StepGraphPhase,
     };
+    use crate::seed::{self, default_edges};
     use crate::store::traits::{
         already_exists, divide_columns_off_divide, edge_endpoint_outside_graph, edge_is_taken,
         edge_loop_limit_negative, edge_loops_to_itself, edge_needs_loop_limit,
@@ -320,7 +573,8 @@ mod tests {
         row_names_another_graph, row_names_another_phase, split_fan_out_mismatch,
     };
     use crate::store::traits::{
-        fan_out_below_one, phase_token_budget_refusal, retry_limit_negative,
+        fan_out_below_one, forward_edges_form_a_cycle, loop_edge_runs_forward,
+        phase_token_budget_refusal, retry_limit_negative,
     };
 
     fn phase(split: Split, fan_out: i32) -> StepGraphPhase {
@@ -1055,6 +1309,347 @@ mod tests {
                 ("phase_part.agent_id", agents[3]),
                 ("phase_agent.agent_id", implement_agent),
             ]
+        );
+    }
+
+    // ---- MOD-138 D9: the walk validator (blueprint §1.4) ----
+
+    /// A body of `names` at positions 0.., no edges, over `body()`'s graph row.
+    fn bare(names: &[&str]) -> (StepGraphId, GraphBody) {
+        let (graph, mut body) = body();
+        body.nodes = names
+            .iter()
+            .zip(0..)
+            .map(|(name, position)| node(graph, position, name))
+            .collect();
+        body.edges = Vec::new();
+        (graph, body)
+    }
+
+    fn id_of(body: &GraphBody, name: &str) -> PhaseId {
+        body.nodes
+            .iter()
+            .find(|node| node.phase.name == name)
+            .expect("a node of the body")
+            .phase
+            .id
+    }
+
+    /// `body()` passes, and so does every seeded graph under its default edges.
+    #[test]
+    fn walk_the_valid_body_passes() {
+        let (graph, body) = body();
+        assert_eq!(graph_body_walk_refusal(graph, &body), None);
+        for kind in &seed::KINDS {
+            let (graph, mut seeded) = bare(&[]);
+            seeded.nodes = kind
+                .phases
+                .iter()
+                .zip(0..)
+                .map(|(phase, position)| NodeBody {
+                    phase: seed::phase_row(PhaseId::new(), graph, position, phase, Utc::now()),
+                    agents: Vec::new(),
+                    parts: Vec::new(),
+                })
+                .collect();
+            let phases: Vec<StepGraphPhase> =
+                seeded.nodes.iter().map(|node| node.phase.clone()).collect();
+            seeded.edges = default_edges(&phases, EdgeId::new);
+            assert_eq!(
+                graph_body_topology_refusal(graph, &seeded),
+                None,
+                "{}",
+                kind.name
+            );
+            assert_eq!(
+                graph_body_walk_refusal(graph, &seeded),
+                None,
+                "{}",
+                kind.name
+            );
+        }
+    }
+
+    /// W1: a `next` or an `if` edge closing the chain is a forward cycle, named from the node
+    /// the walk re-enters.
+    #[test]
+    fn walk_a_forward_next_or_if_cycle_is_refused() {
+        let (graph, mut body) = body();
+        let (plan, review) = (id_of(&body, "plan"), id_of(&body, "review"));
+        let cycle = forward_edges_form_a_cycle(&["plan", "implement", "review", "plan"], graph);
+        body.edges.push(edge(graph, review, plan, EdgeKind::Next));
+        assert_eq!(graph_body_walk_refusal(graph, &body), Some(cycle.clone()));
+        body.edges.pop();
+        let mut guarded = edge(graph, review, plan, EdgeKind::If);
+        guarded.predicate = Some(EdgePredicate(serde_json::json!({"verdict": "approve"})));
+        body.edges.push(guarded);
+        assert_eq!(graph_body_topology_refusal(graph, &body), None);
+        assert_eq!(graph_body_walk_refusal(graph, &body), Some(cycle));
+    }
+
+    /// W2: an `asks_you` edge whose target reaches its source over `next` is a back edge.
+    #[test]
+    fn walk_an_asks_you_back_edge_is_accepted() {
+        let (graph, mut body) = body();
+        let (plan, review) = (id_of(&body, "plan"), id_of(&body, "review"));
+        body.edges
+            .push(edge(graph, review, plan, EdgeKind::AsksYou));
+        assert_eq!(graph_body_walk_refusal(graph, &body), None);
+    }
+
+    /// F18: with no `next` or `if` path back, both `asks_you` edges are forward, and they
+    /// close a forward cycle.
+    #[test]
+    fn walk_an_asks_you_with_no_next_path_back_is_forward() {
+        let (graph, mut body) = bare(&["a", "b"]);
+        let (a, b) = (id_of(&body, "a"), id_of(&body, "b"));
+        body.edges = vec![
+            edge(graph, a, b, EdgeKind::AsksYou),
+            edge(graph, b, a, EdgeKind::AsksYou),
+        ];
+        assert_eq!(
+            graph_body_walk_refusal(graph, &body),
+            Some(forward_edges_form_a_cycle(&["a", "b", "a"], graph))
+        );
+    }
+
+    /// W3: a `changes_requested` edge whose target does not reach its source runs forward.
+    #[test]
+    fn walk_changes_requested_must_loop_back() {
+        let (graph, mut body) = body();
+        let (plan, review) = (id_of(&body, "plan"), id_of(&body, "review"));
+        body.edges
+            .push(edge(graph, plan, review, EdgeKind::ChangesRequested));
+        assert_eq!(
+            graph_body_walk_refusal(graph, &body),
+            Some(loop_edge_runs_forward(
+                EdgeKind::ChangesRequested,
+                "plan",
+                "review",
+                graph
+            ))
+        );
+    }
+
+    /// W3: the same for `fails`.
+    #[test]
+    fn walk_fails_must_loop_back() {
+        let (graph, mut body) = body();
+        let (plan, review) = (id_of(&body, "plan"), id_of(&body, "review"));
+        body.edges.push(edge(graph, plan, review, EdgeKind::Fails));
+        assert_eq!(
+            graph_body_walk_refusal(graph, &body),
+            Some(loop_edge_runs_forward(
+                EdgeKind::Fails,
+                "plan",
+                "review",
+                graph
+            ))
+        );
+    }
+
+    /// W3 reaches over the forward edges, a forward `asks_you` included.
+    #[test]
+    fn walk_a_back_edge_may_close_over_a_forward_asks_you() {
+        let (graph, mut body) = bare(&["a", "b"]);
+        let (a, b) = (id_of(&body, "a"), id_of(&body, "b"));
+        body.edges = vec![
+            edge(graph, a, b, EdgeKind::AsksYou),
+            edge(graph, b, a, EdgeKind::ChangesRequested),
+        ];
+        assert_eq!(graph_body_walk_refusal(graph, &body), None);
+    }
+
+    /// A palette node and every edge on it are left out; so is an edge naming no node of the
+    /// body (index form: past the slice).
+    #[test]
+    fn walk_skips_palette_nodes_and_stray_edges() {
+        let graph = StepGraphId::new();
+        let nodes = [
+            WalkNode {
+                name: "a",
+                palette: false,
+            },
+            WalkNode {
+                name: "b",
+                palette: true,
+            },
+        ];
+        let edges = [
+            WalkEdge {
+                from: 0,
+                to: 1,
+                kind: EdgeKind::Next,
+            },
+            WalkEdge {
+                from: 1,
+                to: 0,
+                kind: EdgeKind::Next,
+            },
+            WalkEdge {
+                from: 0,
+                to: 7,
+                kind: EdgeKind::Fails,
+            },
+        ];
+        assert_eq!(walk_refusal(graph, &nodes, &edges), None);
+        let (graph, mut body) = body();
+        let review = id_of(&body, "review");
+        body.edges
+            .push(edge(graph, review, PhaseId::new(), EdgeKind::Fails));
+        assert_eq!(graph_body_walk_refusal(graph, &body), None);
+    }
+
+    /// One body with a forward cycle and a forward `fails`: the cycle first.
+    #[test]
+    fn the_walk_rules_fire_in_order() {
+        let (graph, mut body) = body();
+        let (plan, review) = (id_of(&body, "plan"), id_of(&body, "review"));
+        body.edges.push(edge(graph, review, plan, EdgeKind::Next));
+        body.edges.push(edge(graph, plan, review, EdgeKind::Fails));
+        assert_eq!(
+            graph_body_walk_refusal(graph, &body),
+            Some(forward_edges_form_a_cycle(
+                &["plan", "implement", "review", "plan"],
+                graph
+            ))
+        );
+        body.edges.remove(3);
+        assert_eq!(
+            graph_body_walk_refusal(graph, &body),
+            Some(loop_edge_runs_forward(
+                EdgeKind::Fails,
+                "plan",
+                "review",
+                graph
+            ))
+        );
+        body.edges.pop();
+        assert_eq!(graph_body_walk_refusal(graph, &body), None);
+    }
+
+    // ---- MOD-138 D7: default_edges_follow (blueprint §1.5) ----
+
+    type Shape = (PhaseId, PhaseId, EdgeKind, Option<i32>, bool);
+
+    fn shapes(edges: &[StepGraphEdge]) -> Vec<Shape> {
+        edges
+            .iter()
+            .map(|edge| {
+                (
+                    edge.from,
+                    edge.to,
+                    edge.kind,
+                    edge.loop_limit,
+                    edge.predicate.is_none(),
+                )
+            })
+            .collect()
+    }
+
+    /// `body()`'s phases (`plan@0`, `implement@1`, `review@2`) under their default edges.
+    fn defaulted() -> (Vec<StepGraphPhase>, Vec<StepGraphEdge>) {
+        let (_, body) = body();
+        let phases: Vec<StepGraphPhase> = body.nodes.into_iter().map(|node| node.phase).collect();
+        let edges = default_edges(&phases, EdgeId::new);
+        (phases, edges)
+    }
+
+    /// The writes a per-row writer makes, each as its `after_phases`: append `docs@3`, move
+    /// `plan` to 5, rename `review`, delete `implement`, and change `implement`'s retry limit.
+    fn writes(before: &[StepGraphPhase]) -> Vec<(&'static str, Vec<StepGraphPhase>)> {
+        let mut append = before.to_vec();
+        let mut docs = before[0].clone();
+        docs.id = PhaseId::new();
+        docs.position = 3;
+        docs.name = "docs".to_owned();
+        append.push(docs);
+        let mut moved = before.to_vec();
+        moved[0].position = 5;
+        let mut renamed = before.to_vec();
+        renamed[2].name = "check".to_owned();
+        let deleted: Vec<StepGraphPhase> = before
+            .iter()
+            .filter(|phase| phase.name != "implement")
+            .cloned()
+            .collect();
+        let mut retried = before.to_vec();
+        retried[1].retry_limit = 4;
+        vec![
+            ("append", append),
+            ("move", moved),
+            ("rename review", renamed),
+            ("delete implement", deleted),
+            ("retry limit", retried),
+        ]
+    }
+
+    /// A default-edged graph is default-edged after each write, under fresh ids.
+    #[test]
+    fn follow_rederives_a_default_graph() {
+        let (before, edges) = defaulted();
+        for (write, after) in writes(&before) {
+            let followed = default_edges_follow(&before, &edges, &after, EdgeId::new).expect(write);
+            assert_eq!(
+                shapes(&followed),
+                shapes(&default_edges(&after, EdgeId::new)),
+                "{write}"
+            );
+            assert!(
+                followed
+                    .iter()
+                    .all(|edge| edges.iter().all(|old| old.id != edge.id)),
+                "{write}: minted"
+            );
+        }
+    }
+
+    /// Authored edges (the default ones plus an `asks_you`) are left alone on every write.
+    #[test]
+    fn follow_leaves_an_authored_graph_alone() {
+        let (before, mut edges) = defaulted();
+        let graph = before[0].graph_id;
+        edges.push(edge(graph, before[2].id, before[0].id, EdgeKind::AsksYou));
+        for (write, after) in writes(&before) {
+            assert_eq!(
+                default_edges_follow(&before, &edges, &after, EdgeId::new),
+                None,
+                "{write}"
+            );
+        }
+        let mut limited = defaulted();
+        limited.1[2].loop_limit = Some(9);
+        assert_eq!(
+            default_edges_follow(&limited.0, &limited.1, &limited.0, EdgeId::new),
+            None,
+            "a hand-set loop limit is authored"
+        );
+    }
+
+    /// F12: a write that moves no default edge (renaming `implement` while `review` still loops
+    /// to that phase id; a column the rule does not read) answers `None`.
+    #[test]
+    fn follow_is_none_when_nothing_moves() {
+        let (before, edges) = defaulted();
+        let mut renamed = before.clone();
+        renamed[1].name = "build".to_owned();
+        assert_eq!(
+            default_edges_follow(&before, &edges, &renamed, EdgeId::new),
+            None
+        );
+        let mut widened = before.clone();
+        widened[1].fan_out = 3;
+        widened[1].split = Split::Compete;
+        assert_eq!(
+            default_edges_follow(&before, &edges, &widened, EdgeId::new),
+            None
+        );
+        let mut reordered = edges.clone();
+        reordered.reverse();
+        assert_eq!(
+            default_edges_follow(&before, &reordered, &renamed, EdgeId::new),
+            None,
+            "a multiset: the stored order is not the rule's"
         );
     }
 }
