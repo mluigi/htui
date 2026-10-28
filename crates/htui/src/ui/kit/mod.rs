@@ -6,7 +6,8 @@
 //!
 //! Task 0 of M1 declares the surface; each submodule's body is filled in by its own task. M3's
 //! Task 0 adds `form`, `filter` and `label` (filled by M3 Tasks 1 and 2) and `text`. M4's
-//! Task 0 adds `scroll`, the scroll state and list window the Backlog lent other tabs.
+//! Task 0 adds `scroll`, the scroll state and list window the Backlog lent other tabs; Task 2
+//! adds `rule`, the titled rule a part drawn inside a pane opens with.
 
 pub mod chips;
 pub mod empty;
@@ -16,6 +17,7 @@ pub mod label;
 pub mod list;
 pub mod modal;
 pub mod pane;
+pub mod rule;
 pub mod scroll;
 pub mod status;
 pub mod text;
