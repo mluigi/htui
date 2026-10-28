@@ -46,6 +46,7 @@ use crate::model::{
     EdgeId, EdgeKind, EdgePredicate, GraphBody, GraphScope, NodeBody, PhasePart, PlanScope,
     SkillBinding, Split, StepGraphEdge,
 };
+use crate::model::{ItemState, latest_graph_run};
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
 use crate::scrub::MinimalScrubber;
@@ -1524,10 +1525,10 @@ async fn status_cas_keeps_version<S: WriteStore>(store: &S) {
     );
 
     let moved = store
-        .transition(before.id, Status::Open, Status::Queued)
+        .transition(before.id, Status::Open, Status::Blocked)
         .await
         .expect("status_cas_keeps_version: transition must not fail");
-    assert!(moved, "status_cas_keeps_version: open -> queued matches");
+    assert!(moved, "status_cas_keeps_version: open -> blocked matches");
 
     let after = store
         .item(before.id)
@@ -1536,7 +1537,7 @@ async fn status_cas_keeps_version<S: WriteStore>(store: &S) {
         .expect("status_cas_keeps_version: the item still exists");
     assert_eq!(
         after.status,
-        Status::Queued,
+        Status::Blocked,
         "status_cas_keeps_version: status moved"
     );
     assert_eq!(
@@ -1544,18 +1545,11 @@ async fn status_cas_keeps_version<S: WriteStore>(store: &S) {
         "status_cas_keeps_version: version unchanged"
     );
 
-    // Move the row on, so the next call's `from` is stale while its `(from, to)` pair is still a
-    // sanctioned one (ANA-2 §4.3). The staleness is what this leg tests, so the pair must be
-    // legal or the §4.3 guard would pre-empt the compare-and-set with `Constraint` (plan D4).
-    assert!(
-        store
-            .transition(before.id, Status::Queued, Status::InProgress)
-            .await
-            .expect("status_cas_keeps_version: transition must not fail"),
-        "status_cas_keeps_version: queued -> in_progress matches"
-    );
+    // The same sanctioned pair again: the row has moved on, so `from` is stale while `(from, to)`
+    // is still legal (MOD-144: `open <-> blocked`). The staleness is what this leg tests, so the
+    // pair must be legal or the guard would pre-empt the compare-and-set with `Constraint`.
     let stale = store
-        .transition(before.id, Status::Queued, Status::InProgress)
+        .transition(before.id, Status::Open, Status::Blocked)
         .await
         .expect("status_cas_keeps_version: transition must not fail");
     assert!(
@@ -1569,34 +1563,20 @@ async fn status_cas_keeps_version<S: WriteStore>(store: &S) {
         .expect("status_cas_keeps_version: the item still exists");
     assert_eq!(
         unmoved.status,
-        Status::InProgress,
+        Status::Blocked,
         "status_cas_keeps_version: a refused move is a no-op"
     );
+    assert_eq!(
+        unmoved.closed_at, None,
+        "status_cas_keeps_version: transition never touches closed_at (MOD-144)"
+    );
 
-    // `closed_at` tracks the current status, not the history: a move to a terminal status sets
-    // it, a move back to a live one clears it (§4.2; blueprint Errata).
     assert!(
         store
-            .transition(before.id, Status::InProgress, Status::Done)
+            .transition(before.id, Status::Blocked, Status::Open)
             .await
             .expect("status_cas_keeps_version: transition must not fail"),
-        "status_cas_keeps_version: in_progress -> done matches"
-    );
-    let done = store
-        .item(before.id)
-        .await
-        .expect("status_cas_keeps_version: read must not fail")
-        .expect("status_cas_keeps_version: the item still exists");
-    assert!(
-        done.closed_at.is_some(),
-        "status_cas_keeps_version: a terminal move sets closed_at"
-    );
-    assert!(
-        store
-            .transition(before.id, Status::Done, Status::Open)
-            .await
-            .expect("status_cas_keeps_version: transition must not fail"),
-        "status_cas_keeps_version: done -> open matches"
+        "status_cas_keeps_version: blocked -> open matches"
     );
     let reopened = store
         .item(before.id)
@@ -1605,7 +1585,7 @@ async fn status_cas_keeps_version<S: WriteStore>(store: &S) {
         .expect("status_cas_keeps_version: the item still exists");
     assert_eq!(
         reopened.closed_at, None,
-        "status_cas_keeps_version: a reopen clears closed_at"
+        "status_cas_keeps_version: closed_at stays unset"
     );
     assert_eq!(
         reopened.version, before.version,
@@ -1811,8 +1791,60 @@ async fn filter_status_project_tags_ready<S: WriteStore>(store: &S) {
         .expect("filter_status_project_tags_ready: list must not fail");
     assert_eq!(
         row_ids(&by_status),
+        vec![
+            ids::HTUI_ANA_1,
+            ids::HTUI_ANA_2,
+            ids::HTUI_CLEAN_1,
+            ids::HTUI_FEAT_1,
+            ids::HTUI_FEAT_3,
+            ids::HTUI_TOOL_1,
+            ids::AGY_ANA_1,
+            ids::AGY_FEAT_1,
+            ids::AGY_FIX_1,
+        ],
+        "filter_status_project_tags_ready: statuses (the stored value, MOD-144: every `open` item \
+         whatever its runs did), ordered by scope position then key"
+    );
+
+    // MOD-144: `states` filters on the derived state, the latest graph run's.
+    let by_state = store
+        .items(
+            &scope,
+            &ItemFilter {
+                states: Some(vec![ItemState::Open]),
+                ..ItemFilter::default()
+            },
+        )
+        .await
+        .expect("filter_status_project_tags_ready: list must not fail");
+    assert_eq!(
+        row_ids(&by_state),
         vec![ids::HTUI_ANA_2, ids::AGY_FEAT_1, ids::AGY_FIX_1],
-        "filter_status_project_tags_ready: statuses, ordered by scope position then key"
+        "filter_status_project_tags_ready: states [open] keeps the items with no run"
+    );
+    let by_states = store
+        .items(
+            &scope,
+            &ItemFilter {
+                states: Some(vec![
+                    ItemState::Done,
+                    ItemState::NeedsYou,
+                    ItemState::Blocked,
+                ]),
+                ..ItemFilter::default()
+            },
+        )
+        .await
+        .expect("filter_status_project_tags_ready: list must not fail");
+    assert_eq!(
+        row_ids(&by_states),
+        vec![
+            ids::HTUI_ANA_1,
+            ids::HTUI_FEAT_2,
+            ids::HTUI_TOOL_1,
+            ids::AGY_ANA_1
+        ],
+        "filter_status_project_tags_ready: states is a set, rows in the list's own order"
     );
 
     let by_project = store
@@ -1869,11 +1901,11 @@ async fn filter_status_project_tags_ready<S: WriteStore>(store: &S) {
     );
     assert!(
         !row_ids(&ready).contains(&ids::HTUI_FEAT_2),
-        "filter_status_project_tags_ready: FEAT-2 is blocked by the non-terminal FEAT-1"
+        "filter_status_project_tags_ready: FEAT-2 is blocked, and by the running FEAT-1"
     );
 
     // The blocked_by half of §7.4 on its own: open FEAT-2 up and it is still not ready, because
-    // FEAT-1 is in_progress.
+    // FEAT-1's latest graph run (the rework RUN_4) is running, so FEAT-1 is not released.
     let opened = store
         .transition(ids::HTUI_FEAT_2, Status::Blocked, Status::Open)
         .await
@@ -1894,7 +1926,7 @@ async fn filter_status_project_tags_ready<S: WriteStore>(store: &S) {
         .expect("filter_status_project_tags_ready: list must not fail");
     assert!(
         !row_ids(&ready_again).contains(&ids::HTUI_FEAT_2),
-        "filter_status_project_tags_ready: a live blocked_by to a non-terminal item blocks (§7.4)"
+        "filter_status_project_tags_ready: a live blocked_by to an unreleased item blocks (§7.4)"
     );
 }
 
@@ -5312,6 +5344,22 @@ pub fn assert_leased_for(case: &str, run: &Run, ttl: TimeDelta, what: &str) {
 }
 
 /// The item row, or a panic naming the case.
+/// MOD-144: the item's derived display state, read the way a client reads it: the stored status
+/// over the latest non-cancelled graph run of `runs(item)`.
+async fn state_of<S: ReadStore>(case: &str, store: &S, item: ItemId) -> ItemState {
+    let row = item_row(case, store, item).await;
+    let runs = store
+        .runs(item)
+        .await
+        .unwrap_or_else(|error| panic!("{case}: runs of {item} must read: {error}"));
+    ItemState::of(row.status, latest_graph_run(&runs).map(|run| run.status))
+}
+
+/// MOD-144: `startable`'s refusal sentence for an item at `state`, the one `create_run` answers.
+fn not_startable(state: ItemState) -> String {
+    illegal_move("item", state, "queued")
+}
+
 async fn item_row<S: ReadStore>(case: &str, store: &S, item: ItemId) -> Item {
     store
         .item(item)
@@ -5372,8 +5420,8 @@ async fn create_run_records_its_workspace<S: WriteStore>(store: &S) {
     );
 }
 
-/// Plan D6: the `run` row and the item's move to `queued` land together or not at all (ANA-2 §4.3,
-/// §5.1). The `MemStore` twin is
+/// Plan D6, MOD-144: the `run` row lands and the item row is not written (it reads `queued` from
+/// the run); a refusal writes no run (ANA-2 §4.3, §5.1, ANA-35 §7.1). The `MemStore` twin is
 /// `mem.rs::create_run_moves_the_item_and_writes_nothing_when_the_law_refuses`; on Postgres the
 /// snapshot column's own guard is `pg_criteria.rs::ck_run_graph_snapshot_is_not_valid_for_old_rows_and_checked_for_new`.
 async fn run_create_moves_the_item<S: WriteStore>(store: &S) {
@@ -5428,13 +5476,13 @@ async fn run_create_moves_the_item<S: WriteStore>(store: &S) {
 
     let after = item_row(CASE, store, ids::HTUI_ANA_2).await;
     assert_eq!(
-        after.status,
-        Status::Queued,
-        "{CASE}: the item moved with the run"
+        after, before,
+        "{CASE}: MOD-144: create_run writes nothing to the item, updated_at included"
     );
     assert_eq!(
-        after.version, before.version,
-        "{CASE}: a transition writes no revision, so the version stands"
+        state_of(CASE, store, ids::HTUI_ANA_2).await,
+        ItemState::Queued,
+        "{CASE}: the item reads `queued` from its run"
     );
     assert_eq!(
         run_row(CASE, store, id).await,
@@ -5509,12 +5557,14 @@ async fn run_create_moves_the_item<S: WriteStore>(store: &S) {
         "{CASE}: and that refusal left the item where it was too"
     );
 
+    // FEAT-1's rework run RUN_4 is live: startable refuses naming the derived state.
     let live = new_run(ids::PROJECT_HTUI, ids::HTUI_FEAT_1, Vec::new());
     let live_id = live.id;
     let refused = store.create_run(live).await;
     assert!(
-        matches!(refused, Err(StoreError::Constraint(_))),
-        "{CASE}: in_progress does not reach queued (ANA-2 §4.3), got {refused:?}"
+        matches!(&refused, Err(StoreError::Constraint(sentence))
+            if *sentence == not_startable(ItemState::Running)),
+        "{CASE}: a live graph run refuses a second (MOD-144 Δ8), got {refused:?}"
     );
     assert_eq!(
         store.run(live_id).await.expect(CASE),
@@ -5529,12 +5579,17 @@ async fn run_create_moves_the_item<S: WriteStore>(store: &S) {
     assert_eq!(
         retry.status,
         RunStatus::Queued,
-        "{CASE}: a failed item may be re-run"
+        "{CASE}: an item whose latest run failed may be re-run"
     );
     assert_eq!(
         item_row(CASE, store, ids::HTUI_CLEAN_1).await.status,
-        Status::Queued,
-        "{CASE}: failed -> queued is the retry row of §4.3"
+        Status::Open,
+        "{CASE}: the retry leaves the item row `open`"
+    );
+    assert_eq!(
+        state_of(CASE, store, ids::HTUI_CLEAN_1).await,
+        ItemState::Queued,
+        "{CASE}: and it reads `queued` from the new run"
     );
 }
 
@@ -5621,9 +5676,9 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
         "the lease runs its TTL from the store's clock",
     );
     assert_eq!(
-        item_row(CASE, store, ids::HTUI_ANA_2).await.status,
-        Status::InProgress,
-        "{CASE}: the item moved queued -> in_progress with the claim"
+        state_of(CASE, store, ids::HTUI_ANA_2).await,
+        ItemState::Running,
+        "{CASE}: the item reads `running` from the claimed run (MOD-144: not written)"
     );
 
     assert_eq!(
@@ -5643,8 +5698,8 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
         "{CASE}: a refused claim writes nothing to the run"
     );
     assert_eq!(
-        item_row(CASE, store, second_item).await.status,
-        Status::Queued,
+        state_of(CASE, store, second_item).await,
+        ItemState::Queued,
         "{CASE}: nor to its item"
     );
 
@@ -5870,8 +5925,8 @@ async fn claim_run_applies_the_isolation_and_path_rules<S: WriteStore>(store: &S
         "{CASE}: a refused claim writes nothing to the run"
     );
     assert_eq!(
-        item_row(CASE, store, c_item).await.status,
-        Status::Queued,
+        state_of(CASE, store, c_item).await,
+        ItemState::Queued,
         "{CASE}: nor to its item"
     );
     assert_eq!(
@@ -6313,10 +6368,10 @@ async fn pass_step_writes_done_and_skipped_under_the_fence<S: WriteStore>(store:
     );
 }
 
-/// MOD-37 R-5: [`WriteStore::park_step`] moves the step, its run and its item to
-/// `awaiting_approval` in one transaction, or writes nothing. The run moved first is
-/// [`ParkOutcome::RunMoved`], the step moved first [`ParkOutcome::StepMoved`]; an item another
-/// writer moved first is left where it is and the park still lands (plan D17).
+/// MOD-37 R-5: [`WriteStore::park_step`] moves the step and its run to `awaiting_approval` in one
+/// transaction, or writes nothing. The run moved first is [`ParkOutcome::RunMoved`], the step
+/// moved first [`ParkOutcome::StepMoved`]. MOD-144: the item row is never written; it reads
+/// `needs you` from the parked run, and a `blocked` item stays `blocked`.
 async fn park_step_moves_step_run_and_item_or_nothing<S: WriteStore>(store: &S) {
     const CASE: &str = "park_step_moves_step_run_and_item_or_nothing";
     let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
@@ -6338,26 +6393,18 @@ async fn park_step_moves_step_run_and_item_or_nothing<S: WriteStore>(store: &S) 
         );
         id
     };
-    let item_status = || async {
-        store
-            .item(item)
-            .await
-            .expect(CASE)
-            .unwrap_or_else(|| panic!("{CASE}: the item exists"))
-            .status
-    };
     let rows = |step: StepId| async move {
         (
             step_row(CASE, store, run, step).await.status,
             run_row(CASE, store, run).await.status,
-            item_status().await,
+            state_of(CASE, store, item).await,
         )
     };
     let live = running(1).await;
     assert_eq!(
         rows(live).await,
-        (StepStatus::Running, RunStatus::Running, Status::InProgress),
-        "{CASE}: the claim put the item in progress"
+        (StepStatus::Running, RunStatus::Running, ItemState::Running),
+        "{CASE}: the claimed run reads the item `running`"
     );
 
     let unknown = StepId::new();
@@ -6381,7 +6428,7 @@ async fn park_step_moves_step_run_and_item_or_nothing<S: WriteStore>(store: &S) 
     }
     assert_eq!(
         rows(live).await,
-        (StepStatus::Running, RunStatus::Running, Status::InProgress),
+        (StepStatus::Running, RunStatus::Running, ItemState::Running),
         "{CASE}: the fenced parks wrote nothing"
     );
     // Review L3: the fence is checked before the step's status, so a stale lease is `Fenced`
@@ -6393,7 +6440,7 @@ async fn park_step_moves_step_run_and_item_or_nothing<S: WriteStore>(store: &S) 
     );
     assert_eq!(
         rows(pending).await,
-        (StepStatus::Pending, RunStatus::Running, Status::InProgress),
+        (StepStatus::Pending, RunStatus::Running, ItemState::Running),
         "{CASE}: the fenced park of a `pending` step wrote nothing"
     );
 
@@ -6407,7 +6454,7 @@ async fn park_step_moves_step_run_and_item_or_nothing<S: WriteStore>(store: &S) 
     );
     assert_eq!(
         rows(pending).await,
-        (StepStatus::Pending, RunStatus::Running, Status::InProgress),
+        (StepStatus::Pending, RunStatus::Running, ItemState::Running),
         "{CASE}: the refused park wrote nothing"
     );
 
@@ -6431,9 +6478,9 @@ async fn park_step_moves_step_run_and_item_or_nothing<S: WriteStore>(store: &S) 
         (
             StepStatus::Running,
             RunStatus::AwaitingApproval,
-            Status::InProgress
+            ItemState::NeedsYou
         ),
-        "{CASE}: the step stays running and the item in progress"
+        "{CASE}: the step stays running; the item reads the run's park"
     );
     assert!(
         store
@@ -6456,12 +6503,17 @@ async fn park_step_moves_step_run_and_item_or_nothing<S: WriteStore>(store: &S) 
         (
             StepStatus::AwaitingApproval,
             RunStatus::AwaitingApproval,
-            Status::AwaitingApproval,
+            ItemState::NeedsYou,
         ),
-        "{CASE}: the step, the run and the item move together"
+        "{CASE}: the step and the run move together; the item reads `needs you`"
+    );
+    assert_eq!(
+        item_row(CASE, store, item).await.status,
+        Status::Open,
+        "{CASE}: MOD-144: the park writes nothing to the item"
     );
 
-    // The item moved first: D17's "already moved", the park lands and the item stays.
+    // A blocked item: the park lands and the item stays `blocked`.
     assert!(
         store
             .transition_run(run, RunStatus::AwaitingApproval, RunStatus::Running, at)
@@ -6469,15 +6521,13 @@ async fn park_step_moves_step_run_and_item_or_nothing<S: WriteStore>(store: &S) 
             .expect(CASE),
         "{CASE}: the run resumes again"
     );
-    for (from, to) in [
-        (Status::AwaitingApproval, Status::InProgress),
-        (Status::InProgress, Status::Blocked),
-    ] {
-        assert!(
-            store.transition(item, from, to).await.expect(CASE),
-            "{CASE}: the item moves {from} -> {to}"
-        );
-    }
+    assert!(
+        store
+            .transition(item, Status::Open, Status::Blocked)
+            .await
+            .expect(CASE),
+        "{CASE}: the item moves open -> blocked"
+    );
     let next = running(2).await;
     assert_eq!(
         store
@@ -6492,9 +6542,9 @@ async fn park_step_moves_step_run_and_item_or_nothing<S: WriteStore>(store: &S) 
         (
             StepStatus::AwaitingApproval,
             RunStatus::AwaitingApproval,
-            Status::Blocked,
+            ItemState::Blocked,
         ),
-        "{CASE}: the item is left where the other writer put it"
+        "{CASE}: the blocked item is left where it is"
     );
 }
 
@@ -6573,9 +6623,9 @@ async fn claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks<S: WriteStor
         .expect(CASE)
         .id;
     assert_eq!(
-        item_row(CASE, store, item).await.status,
-        Status::Queued,
-        "{CASE}: create_run queued the tagged item"
+        state_of(CASE, store, item).await,
+        ItemState::Queued,
+        "{CASE}: the tagged item reads `queued` from its run"
     );
 
     let missing = tags(&["docker", "vulkan"]);
@@ -6623,7 +6673,7 @@ async fn claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks<S: WriteStor
     assert_eq!(
         item_row(CASE, store, item).await.status,
         Status::Blocked,
-        "{CASE}: the item moved queued -> blocked in the same transaction"
+        "{CASE}: MOD-144: the item moved open -> blocked in the same transaction"
     );
 
     assert_eq!(
@@ -6698,9 +6748,9 @@ async fn claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks<S: WriteStor
         "{CASE}: with the tags declared the item's fresh run is admitted"
     );
     assert_eq!(
-        item_row(CASE, store, item).await.status,
-        Status::InProgress,
-        "{CASE}: and its item is in progress"
+        state_of(CASE, store, item).await,
+        ItemState::Running,
+        "{CASE}: and its item reads `running`"
     );
 }
 
@@ -7545,9 +7595,14 @@ async fn stop_run_is_a_fenced_cas_on_running<S: WriteStore>(store: &S) {
         assert_eq!(&row, old, "{CASE}: the {what} step is untouched");
     }
     assert_eq!(
+        state_of(CASE, store, ids::HTUI_ANA_2).await,
+        ItemState::Stopped,
+        "{CASE}: the item reads `stopped` from its run (MOD-144)"
+    );
+    assert_eq!(
         item_row(CASE, store, ids::HTUI_ANA_2).await.status,
-        Status::InProgress,
-        "{CASE}: the item stays in progress"
+        Status::Open,
+        "{CASE}: and its row stays `open`"
     );
 
     assert!(
@@ -7749,8 +7804,8 @@ async fn claim_run_refuses_a_stopped_workspace_and_writes_nothing<S: WriteStore>
         "{CASE}: the run is still queued, unclaimed and unleased"
     );
     assert_eq!(
-        item_row(CASE, store, ids::HTUI_ANA_2).await.status,
-        Status::Queued,
+        state_of(CASE, store, ids::HTUI_ANA_2).await,
+        ItemState::Queued,
         "{CASE}: nor to its item"
     );
 
@@ -7801,8 +7856,8 @@ async fn claim_run_checks_the_stop_before_tags<S: WriteStore>(store: &S) {
         "{CASE}: the run is not failed for its tags"
     );
     assert_eq!(
-        item_row(CASE, store, item).await.status,
-        Status::Queued,
+        state_of(CASE, store, item).await,
+        ItemState::Queued,
         "{CASE}: and its item is not blocked"
     );
 
@@ -7824,7 +7879,7 @@ async fn claim_run_checks_the_stop_before_tags<S: WriteStore>(store: &S) {
 
 /// MOD-125 D5: the refusal is transient. Once the workspace resumes, the same queued run is
 /// admitted as `claim_run_admits_one_and_refuses_the_second` admits one: running on the box, the
-/// lease the store's clock plus the TTL, and the item in progress.
+/// lease the store's clock plus the TTL, and the item reading `running`.
 async fn claim_run_admits_after_resume<S: WriteStore>(store: &S) {
     const CASE: &str = "claim_run_admits_after_resume";
     let owner = Uuid::now_v7();
@@ -7872,9 +7927,9 @@ async fn claim_run_admits_after_resume<S: WriteStore>(store: &S) {
         "{CASE}: the lease is the claimant's"
     );
     assert_eq!(
-        item_row(CASE, store, ids::HTUI_ANA_2).await.status,
-        Status::InProgress,
-        "{CASE}: the item moved queued -> in_progress with the claim"
+        state_of(CASE, store, ids::HTUI_ANA_2).await,
+        ItemState::Running,
+        "{CASE}: the item reads `running` from the claimed run (MOD-144: not written)"
     );
 }
 
@@ -8015,9 +8070,9 @@ async fn adopt_runs_settles_a_stopped_workspaces_abandoned_run_as_stopped<S: Wri
         "{CASE}: its done step is untouched"
     );
     assert_eq!(
-        item_row(CASE, store, ids::HTUI_ANA_2).await.status,
-        Status::InProgress,
-        "{CASE}: the item stays in progress"
+        state_of(CASE, store, ids::HTUI_ANA_2).await,
+        ItemState::Stopped,
+        "{CASE}: the item reads `stopped` from its settled run (MOD-144)"
     );
     assert!(
         store.refresh_lease(b, y, LEASE).await.expect(CASE),
@@ -8199,14 +8254,15 @@ async fn minted<S: WriteStore>(case: &str, store: &S, title: &str) -> ItemId {
         .id
 }
 
-/// MOD-69: parks `run` without a step (`park_selection`'s and `escalate`'s run move), and moves
-/// its item `in_progress -> to`.
+/// MOD-69: parks `run` without a step (`park_selection`'s and `escalate`'s run move). MOD-144:
+/// `to = None` parks only the run (the item reads `needs you`); `Some(to)` also moves the item
+/// `open -> to` (`escalate`'s `open -> blocked`).
 async fn parked_run<S: WriteStore>(
     case: &str,
     store: &S,
     run: RunId,
     item: ItemId,
-    to: Status,
+    to: Option<Status>,
     at: DateTime<Utc>,
 ) {
     assert!(
@@ -8216,13 +8272,12 @@ async fn parked_run<S: WriteStore>(
             .expect(case),
         "{case}: the run parks"
     );
-    assert!(
-        store
-            .transition(item, Status::InProgress, to)
-            .await
-            .expect(case),
-        "{case}: the item moves in_progress -> {to}"
-    );
+    if let Some(to) = to {
+        assert!(
+            store.transition(item, Status::Open, to).await.expect(case),
+            "{case}: the item moves open -> {to}"
+        );
+    }
 }
 
 /// MOD-69: `(item, item status, [(run, run status, [(step, step status)])])`, what a
@@ -11876,9 +11931,9 @@ async fn step_create_and_transition_law<S: WriteStore>(store: &S) {
 
     assert_eq!(
         item_row(CASE, store, ids::HTUI_FEAT_3).await.status,
-        Status::Queued,
-        "{CASE}: no run or step move touches the item — only claim_run, promote_step, create_run \
-         and close_out do"
+        Status::Open,
+        "{CASE}: no run or step move touches the item row — MOD-144: only close-out, the \
+         MissingTags claim and `transition` do"
     );
 }
 
@@ -12108,13 +12163,6 @@ async fn gate_answers_write_their_outcome<S: WriteStore>(store: &S) {
             .expect(CASE),
         "{CASE}: the run starts"
     );
-    assert!(
-        store
-            .transition(ids::HTUI_FEAT_3, Status::Queued, Status::InProgress)
-            .await
-            .expect(CASE),
-        "{CASE}: and so does its item"
-    );
     store.promote_step(rejected, at).await.expect(CASE);
     let promoted = step_row(CASE, store, ids::RUN_2, rejected).await;
     assert_eq!(
@@ -12133,9 +12181,14 @@ async fn gate_answers_write_their_outcome<S: WriteStore>(store: &S) {
         "{CASE}: the run is lifted with the step"
     );
     assert_eq!(
+        state_of(CASE, store, ids::HTUI_FEAT_3).await,
+        ItemState::NeedsYou,
+        "{CASE}: and the item reads `needs you` from it (MOD-144: the row is not written)"
+    );
+    assert_eq!(
         item_row(CASE, store, ids::HTUI_FEAT_3).await.status,
-        Status::AwaitingApproval,
-        "{CASE}: and so is the item, in the same transaction"
+        Status::Open,
+        "{CASE}: the item row stays `open`"
     );
     let settled = store.promote_step(approved, at).await;
     assert!(
@@ -12911,13 +12964,11 @@ async fn write_document_allocates_its_version<S: WriteStore>(store: &S) {
         .await
         .expect(CASE)
         .id;
-    assert!(
-        store
-            .transition(ids::HTUI_ANA_2, Status::Queued, Status::Open)
-            .await
-            .expect(CASE),
-        "{CASE}: queued -> open frees the item for a second run"
-    );
+    // MOD-144: one live graph run per item, so the second run ends before the third starts.
+    store
+        .finish_run(second_run, RunStatus::Cancelled, None, seam_clock())
+        .await
+        .expect(CASE);
     let third_run = store
         .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
         .await
@@ -13065,37 +13116,16 @@ async fn close_out_refuses_a_live_run<S: WriteStore>(store: &S) {
         "{CASE}: the refusal wrote no summary"
     );
     assert_eq!(
-        item_row(CASE, store, ids::HTUI_FEAT_3).await.status,
-        Status::Queued,
+        state_of(CASE, store, ids::HTUI_FEAT_3).await,
+        ItemState::Queued,
         "{CASE}: nor moved the item"
     );
-
-    // MOD-38's open -> closed edge: `queued -> open` leaves RUN_2 queued, and the law alone
-    // would close the now-`open` item as `withdrawn`; the live run still refuses it.
-    assert!(
-        store
-            .transition(ids::HTUI_FEAT_3, Status::Queued, Status::Open)
-            .await
-            .expect(CASE),
-        "{CASE}: FEAT-3 is un-queued, RUN_2 still live"
-    );
-    let reopened = store
-        .close_out(
-            ids::HTUI_FEAT_3,
-            Resolution::Withdrawn,
-            new_document(ids::HTUI_FEAT_3, "summary", None),
-            &[],
-        )
-        .await;
-    assert!(
-        matches!(&reopened, Err(StoreError::Constraint(sentence))
-            if sentence.contains(&ids::RUN_2.to_string())),
-        "{CASE}: an `open` item with a live run is not closed out either, got {reopened:?}"
-    );
+    // MOD-144: FEAT-3's row is `open`, so the law alone would close it as `withdrawn`; the live
+    // run refuses it first.
     assert_eq!(
         item_row(CASE, store, ids::HTUI_FEAT_3).await.status,
         Status::Open,
-        "{CASE}: and stays open"
+        "{CASE}: the item row is `open` under its live run"
     );
 
     // MOD-125 D2: a stopped run is live, it keeps its trees and branch, so it refuses too.
@@ -13139,6 +13169,12 @@ async fn close_out_refuses_a_live_run<S: WriteStore>(store: &S) {
         "{CASE}: a stopped run fails, stamped from the caller's clock"
     );
 
+    // MOD-144: FEAT-1's rework run RUN_4 is live too; cancelling it leaves RUN_1 `done` latest,
+    // so the guards below are the ones asked and FEAT-1 is finished.
+    store
+        .finish_run(ids::RUN_4, RunStatus::Cancelled, None, at)
+        .await
+        .expect(CASE);
     for (item, resolution, summary, why) in [
         (
             ids::HTUI_ANA_2,
@@ -13183,12 +13219,10 @@ async fn close_out_refuses_a_live_run<S: WriteStore>(store: &S) {
         "{CASE}: no refusal wrote a document"
     );
 
-    assert!(
-        store
-            .transition(ids::HTUI_FEAT_1, Status::InProgress, Status::Done)
-            .await
-            .expect(CASE),
-        "{CASE}: the item finishes before it is closed"
+    assert_eq!(
+        state_of(CASE, store, ids::HTUI_FEAT_1).await,
+        ItemState::Done,
+        "{CASE}: FEAT-1 is finished before it is closed"
     );
     let written = store
         .close_out(
@@ -13209,7 +13243,7 @@ async fn close_out_refuses_a_live_run<S: WriteStore>(store: &S) {
     );
     assert!(
         closed.closed_at.is_some(),
-        "{CASE}: closed_at tracks the current status"
+        "{CASE}: close-out stamps closed_at"
     );
     assert_eq!(
         store
@@ -13231,14 +13265,11 @@ async fn close_out_refuses_a_live_run<S: WriteStore>(store: &S) {
 async fn illegal_transitions_are_constraint<S: WriteStore>(store: &S) {
     const CASE: &str = "illegal_transitions_are_constraint";
 
+    // MOD-144: `open <-> blocked` is the whole item table; the second pair makes `blocked` a
+    // `from` too, so every refused target of both is asked (`closed` among them, MOD-38 PRD D1).
     for (from, to) in [
-        (Status::Open, Status::Queued),
-        (Status::Queued, Status::InProgress),
-        (Status::InProgress, Status::Done),
-        // The fourth pair is what makes `done` a `from` rather than only the row the loop stops
-        // on: `done` reaches `open` and nothing else, so seven of its eight targets are refusals
-        // this leg would otherwise never ask for (`closed` among them since MOD-38 PRD D1).
-        (Status::Done, Status::Open),
+        (Status::Open, Status::Blocked),
+        (Status::Blocked, Status::Open),
     ] {
         let before = item_row(CASE, store, ids::HTUI_ANA_2).await;
         assert_eq!(before.status, from, "{CASE}: the item is driven to {from}");
@@ -13331,7 +13362,7 @@ async fn illegal_transitions_are_constraint<S: WriteStore>(store: &S) {
     }
 
     let item = store
-        .transition(ItemId::new(), Status::Queued, Status::Done)
+        .transition(ItemId::new(), Status::Open, Status::Closed)
         .await;
     assert!(
         matches!(item, Err(StoreError::NotFound { entity: "item", .. })),
@@ -13389,9 +13420,10 @@ async fn illegal_transitions_are_constraint<S: WriteStore>(store: &S) {
     );
 }
 
-/// The HTUI project's fixture items, which between them hold every [`Status`] once (a test in
-/// `fixtures.rs` pins that): the two MOD-38 cases sweep the laws over them rather than over a
-/// list of their own.
+/// The HTUI project's fixture items, which between them hold every [`Status`] and, with their
+/// runs, the item states `open`, `blocked`, `failed`, `done` and `closed` without a live run (a
+/// test in `fixtures.rs` pins the demo): the two MOD-38 cases sweep the laws over them rather
+/// than over a list of their own.
 fn htui_fixture_items() -> Vec<ItemId> {
     crate::fixtures::demo_data()
         .items
@@ -13401,10 +13433,12 @@ fn htui_fixture_items() -> Vec<ItemId> {
         .collect()
 }
 
-/// MOD-38 plan D4: close-out's law is ANA-11 §4.2's [`Resolution::closes_from`], not ANA-2
-/// §4.3's transition table. Every pair the law refuses is exactly [`resolution_not_closable`]'s
-/// sentence with nothing written; an `open` item closes as a non-success resolution and reads it
-/// back; a `closed` item closes as nothing.
+/// MOD-38 plan D4 under MOD-144 (ANA-35 §7.1, PD18): close-out's law is
+/// [`Resolution::closes_from`]`(status, finished)`, not the transition table; `finished` is the
+/// latest non-cancelled graph run being `done`. Every pair the law refuses is exactly
+/// [`resolution_not_closable`]'s sentence, naming the item's [`ItemState`], with nothing written;
+/// an `open` item closes as a non-success resolution and reads it back; a `closed` item closes
+/// as nothing.
 async fn close_out_resolution_law<S: WriteStore>(store: &S) {
     const CASE: &str = "close_out_resolution_law";
 
@@ -13422,49 +13456,48 @@ async fn close_out_resolution_law<S: WriteStore>(store: &S) {
             continue;
         }
         let before = item_row(CASE, store, item).await;
+        let state = state_of(CASE, store, item).await;
         let documents = store.documents(item).await.expect(CASE);
         for resolution in Resolution::ALL.iter().copied() {
-            if resolution.closes_from(before.status) {
+            if resolution.closes_from(before.status, state.is_finished()) {
                 continue;
             }
             let refused = store
                 .close_out(item, resolution, new_document(item, "summary", None), &[])
                 .await;
             let StoreError::Constraint(sentence) = refused.expect_err(&format!(
-                "{CASE}: `{}` does not close as `{resolution}`",
-                before.status
+                "{CASE}: `{state}` does not close as `{resolution}`"
             )) else {
                 panic!("{CASE}: a refused pair is Constraint, not NotFound")
             };
             assert_eq!(
                 sentence,
-                resolution_not_closable(item, before.status, resolution),
+                resolution_not_closable(item, state, resolution),
                 "{CASE}: the refusal is the close-out law's sentence"
             );
         }
         assert_eq!(
             item_row(CASE, store, item).await,
             before,
-            "{CASE}: every refused pair left the `{}` row byte-identical",
-            before.status
+            "{CASE}: every refused pair left the `{state}` row byte-identical"
         );
         assert_eq!(
             store.documents(item).await.expect(CASE),
             documents,
             "{CASE}: and wrote no summary"
         );
-        swept.push(before.status);
+        swept.push(state);
     }
-    for status in [
-        Status::Open,
-        Status::Blocked,
-        Status::Failed,
-        Status::Done,
-        Status::Closed,
+    for state in [
+        ItemState::Open,
+        ItemState::Blocked,
+        ItemState::Failed,
+        ItemState::Done,
+        ItemState::Closed,
     ] {
         assert!(
-            swept.contains(&status),
-            "{CASE}: the sweep reached a `{status}` item (fixture precondition)"
+            swept.contains(&state),
+            "{CASE}: the sweep reached a `{state}` item (fixture precondition)"
         );
     }
 
@@ -13480,7 +13513,7 @@ async fn close_out_resolution_law<S: WriteStore>(store: &S) {
         .await;
     assert!(
         matches!(&refused, Err(StoreError::Constraint(sentence))
-            if *sentence == resolution_not_closable(ids::HTUI_ANA_2, Status::Open, Resolution::Done)),
+            if *sentence == resolution_not_closable(ids::HTUI_ANA_2, ItemState::Open, Resolution::Done)),
         "{CASE}: an open item does not close as done, got {refused:?}"
     );
     let written = store
@@ -13501,7 +13534,7 @@ async fn close_out_resolution_law<S: WriteStore>(store: &S) {
     );
     assert!(
         closed.closed_at.is_some(),
-        "{CASE}: closed_at tracks the current status"
+        "{CASE}: close-out stamps closed_at"
     );
 
     for item in [ids::HTUI_FIX_1, ids::HTUI_ANA_2] {
@@ -13512,7 +13545,7 @@ async fn close_out_resolution_law<S: WriteStore>(store: &S) {
                 .await;
             assert!(
                 matches!(&refused, Err(StoreError::Constraint(sentence))
-                    if *sentence == resolution_not_closable(item, Status::Closed, resolution)),
+                    if *sentence == resolution_not_closable(item, ItemState::Closed, resolution)),
                 "{CASE}: a closed item does not close again as `{resolution}`, got {refused:?}"
             );
         }
@@ -13553,7 +13586,7 @@ async fn transition_never_reaches_closed<S: WriteStore>(store: &S) {
     }
 
     let unknown = store
-        .transition(ItemId::new(), Status::Done, Status::Closed)
+        .transition(ItemId::new(), Status::Open, Status::Closed)
         .await;
     assert!(
         matches!(unknown, Err(StoreError::NotFound { entity: "item", .. })),
@@ -14490,7 +14523,7 @@ async fn coverage_lists_citing_items_with_resolution<S: WriteStore>(store: &S) {
             .map(|row| (
                 row.item.id,
                 row.item.key.as_str(),
-                row.item.status,
+                row.item.state(),
                 row.resolution,
                 row.kind,
                 row.requirement_version,
@@ -14501,7 +14534,7 @@ async fn coverage_lists_citing_items_with_resolution<S: WriteStore>(store: &S) {
             (
                 ids::HTUI_ANA_2,
                 "ANA-2",
-                Status::Closed,
+                ItemState::Closed,
                 Some(Resolution::Withdrawn),
                 CitationKind::Addresses,
                 1,
@@ -14510,7 +14543,7 @@ async fn coverage_lists_citing_items_with_resolution<S: WriteStore>(store: &S) {
             (
                 ids::HTUI_FEAT_1,
                 "FEAT-1",
-                Status::InProgress,
+                ItemState::Running,
                 None,
                 CitationKind::Addresses,
                 1,
@@ -14519,7 +14552,7 @@ async fn coverage_lists_citing_items_with_resolution<S: WriteStore>(store: &S) {
             (
                 ids::HTUI_FIX_1,
                 "FIX-1",
-                Status::Closed,
+                ItemState::Closed,
                 Some(Resolution::Done),
                 CitationKind::Addresses,
                 1,
@@ -14706,26 +14739,21 @@ async fn project_delete_counts_requirements<S: WriteStore>(store: &S) {
     );
 }
 
-/// MOD-4 milestone 2, plan D7: the run's terminal move and the item's mirror are one act
-/// (ANA-2 §4.3's verdict table and the propagation rule at `:660-664`).
+/// MOD-4 milestone 2, plan D7, under MOD-144 (ANA-35 §7.1): `finish_run` ends the run and never
+/// writes the item; the item's state derives from its latest graph run.
 ///
-/// Six legs, in the order the writer's own checks run. The one the plan's Risks row names is the
-/// second: an item whose *other* run is still live stays where it is, so a store that derived the
-/// item from the finishing run alone would lose the second run. Getting two live graph runs onto
-/// one item takes a detour, because `create_run` admits only `open | failed` items and its own
-/// move leaves the item at `queued` — so the item is walked back `queued -> open` between the two
-/// creates, which is a sanctioned pair (`item.rs:46-60`) and the only way through the seam as
-/// milestone 1 shipped it.
+/// Seven legs, in the order the writer's own checks run. Leg 2 (PD10) replaces the old
+/// "held while another run is live" leg: one live graph run per item is now `create_run`'s rule
+/// (`startable`, `uq_run_item_live`), stopped included, so a second live run cannot be made.
 ///
-/// The Postgres twin is `pg_criteria.rs::finish_run_holds_the_item_while_another_run_is_live`,
-/// which repeats that leg against a real server and adds the `closed_at` column this seam sets
-/// but does not project.
+/// The Postgres twin of leg 1's `closed_at` is `pg_criteria.rs`.
 async fn finish_run_moves_run_and_item_together<S: WriteStore>(store: &S) {
     const CASE: &str = "finish_run_moves_run_and_item_together";
     let owner = Uuid::now_v7();
     let at = seam_clock();
 
-    // Leg 1: `done` reaches the item, and the finish stamps the caller's instant.
+    // Leg 1: `done` ends the run at the caller's instant; the item row is untouched and reads
+    // `done` from it.
     let before = item_row(CASE, store, ids::HTUI_ANA_2).await;
     let first = store
         .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
@@ -14738,7 +14766,7 @@ async fn finish_run_moves_run_and_item_together<S: WriteStore>(store: &S) {
             .await
             .expect(CASE),
         Claim::Admitted,
-        "{CASE}: the run is admitted, so the item is in_progress"
+        "{CASE}: the run is admitted, so the item reads `running`"
     );
     store
         .finish_run(first, RunStatus::Done, None, at)
@@ -14757,87 +14785,87 @@ async fn finish_run_moves_run_and_item_together<S: WriteStore>(store: &S) {
     );
     let item = item_row(CASE, store, ids::HTUI_ANA_2).await;
     assert_eq!(
-        item.status,
-        Status::Done,
-        "{CASE}: the item moved with the run"
+        item, before,
+        "{CASE}: MOD-144: the item row is not written (status, closed_at, version, updated_at)"
     );
-    assert!(
-        item.closed_at.is_some(),
-        "{CASE}: `done` is terminal, so `closed_at` follows"
+    assert_eq!(item.status, Status::Open, "{CASE}: the item stays `open`");
+    assert_eq!(
+        item.closed_at, None,
+        "{CASE}: only close-out stamps closed_at"
     );
     assert_eq!(
-        item.version, before.version,
-        "{CASE}: a transition writes no revision, so the version stands"
+        state_of(CASE, store, ids::HTUI_ANA_2).await,
+        ItemState::Done,
+        "{CASE}: the item reads `done` from its finished run"
     );
 
-    // Leg 2: the item is held while another run of it is still live (the plan's Risks row).
+    // Leg 2 (PD10): a second `create_run` on an item with a live graph run is refused, a
+    // `stopped` one included (MOD-125 D2), with nothing written.
     let held = ids::AGY_FEAT_1;
     let left = store
         .create_run(new_run(ids::PROJECT_AGY, held, Vec::new()))
         .await
         .expect(CASE)
         .id;
-    assert!(
-        store
-            .transition(held, Status::Queued, Status::Open)
-            .await
-            .expect(CASE),
-        "{CASE}: the item is walked back so a second run can be queued on it"
-    );
-    let right = store
-        .create_run(new_run(ids::PROJECT_AGY, held, Vec::new()))
-        .await
-        .expect(CASE)
-        .id;
-    for run in [left, right] {
-        assert_eq!(
-            store
-                .claim_run(run, ids::BOX, owner, at, LEASE)
-                .await
-                .expect(CASE),
-            Claim::Admitted,
-            "{CASE}: both runs fit the box's two slots"
-        );
-    }
     assert_eq!(
-        item_row(CASE, store, held).await.status,
-        Status::InProgress,
-        "{CASE}: the first claim took the item to in_progress"
+        store
+            .claim_run(left, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: the first run is admitted"
+    );
+    let second = new_run(ids::PROJECT_AGY, held, Vec::new());
+    let second_id = second.id;
+    let refused = store.create_run(second).await;
+    assert!(
+        matches!(&refused, Err(StoreError::Constraint(sentence))
+            if *sentence == not_startable(ItemState::Running)),
+        "{CASE}: a running run refuses a second, got {refused:?}"
     );
     assert!(
         store
-            .transition_run(right, RunStatus::Running, RunStatus::Stopped, at)
+            .transition_run(left, RunStatus::Running, RunStatus::Stopped, at)
             .await
             .expect(CASE),
-        "{CASE}: the other run is stopped (MOD-125 D1)"
+        "{CASE}: the run is stopped (MOD-125 D1)"
+    );
+    let refused = store
+        .create_run(new_run(ids::PROJECT_AGY, held, Vec::new()))
+        .await;
+    assert!(
+        matches!(&refused, Err(StoreError::Constraint(sentence))
+            if *sentence == not_startable(ItemState::Stopped)),
+        "{CASE}: a stopped run is live and refuses a second too, got {refused:?}"
+    );
+    assert_eq!(
+        store.run(second_id).await.expect(CASE),
+        None,
+        "{CASE}: the refusals wrote no run row"
+    );
+    assert!(
+        store
+            .transition_run(left, RunStatus::Stopped, RunStatus::Running, at)
+            .await
+            .expect(CASE),
+        "{CASE}: stopped -> running is the resume (MOD-125 D1)"
     );
     store
         .finish_run(left, RunStatus::Done, None, at)
         .await
         .expect(CASE);
     assert_eq!(
-        item_row(CASE, store, held).await.status,
-        Status::InProgress,
-        "{CASE}: the item is held while its other run is still live, stopped included (MOD-125 D2)"
+        state_of(CASE, store, held).await,
+        ItemState::Done,
+        "{CASE}: the item reads `done` from its run"
     );
-    assert!(
-        store
-            .transition_run(right, RunStatus::Stopped, RunStatus::Running, at)
-            .await
-            .expect(CASE),
-        "{CASE}: stopped -> running is the resume (MOD-125 D1)"
-    );
-    store
-        .finish_run(right, RunStatus::Done, None, at)
-        .await
-        .expect(CASE);
     assert_eq!(
         item_row(CASE, store, held).await.status,
-        Status::Done,
-        "{CASE}: the last run out moves the item"
+        Status::Open,
+        "{CASE}: and its row is still `open`"
     );
 
-    // Leg 3: `failed` carries its reason onto the run and its verdict onto the item.
+    // Leg 3: `failed` carries its reason onto the run; the item reads its verdict.
     let failing = store
         .create_run(new_run(ids::PROJECT_AGY, ids::AGY_FIX_1, Vec::new()))
         .await
@@ -14865,16 +14893,21 @@ async fn finish_run_moves_run_and_item_together<S: WriteStore>(store: &S) {
     let failed_item = item_row(CASE, store, ids::AGY_FIX_1).await;
     assert_eq!(
         failed_item.status,
-        Status::Failed,
-        "{CASE}: in_progress -> failed mirrors the run"
+        Status::Open,
+        "{CASE}: MOD-144: the item row stays `open`"
+    );
+    assert_eq!(
+        state_of(CASE, store, ids::AGY_FIX_1).await,
+        ItemState::Failed,
+        "{CASE}: and reads `failed` from its run"
     );
     assert_eq!(
         failed_item.closed_at, None,
-        "{CASE}: `failed` is not terminal for an item, so `closed_at` stays clear"
+        "{CASE}: `closed_at` stays clear"
     );
 
-    // Leg 4: a `cancelled` run releases its item rather than ending it, from `queued` and with no
-    // claim in between — the only row of the table whose `from` is `queued`.
+    // Leg 4: a `cancelled` run is skipped by the latest-run rule, so the item reads what it read
+    // before the run: `open` (from `queued`, with no claim in between).
     let cancelled = store
         .create_run(new_run(ids::PROJECT_VULKAN, ids::VULKAN_TOOL_1, Vec::new()))
         .await
@@ -14892,6 +14925,11 @@ async fn finish_run_moves_run_and_item_together<S: WriteStore>(store: &S) {
     assert_eq!(
         item_row(CASE, store, ids::VULKAN_TOOL_1).await.status,
         Status::Open,
+        "{CASE}: the item row is untouched"
+    );
+    assert_eq!(
+        state_of(CASE, store, ids::VULKAN_TOOL_1).await,
+        ItemState::Open,
         "{CASE}: a cancelled run hands the item back to the backlog"
     );
 
@@ -14921,8 +14959,8 @@ async fn finish_run_moves_run_and_item_together<S: WriteStore>(store: &S) {
         "{CASE}: a refused finish writes nothing to the run"
     );
     assert_eq!(
-        item_row(CASE, store, ids::HTUI_CLEAN_1).await.status,
-        Status::Queued,
+        state_of(CASE, store, ids::HTUI_CLEAN_1).await,
+        ItemState::Queued,
         "{CASE}: nor to its item"
     );
 
@@ -15215,9 +15253,10 @@ async fn upstream_in_scope_no_summary<S: ReadStore>(store: &S) {
         .await
         .expect("upstream_in_scope_no_summary: the walk must not fail");
 
-    for (item, key, status) in [
-        (ids::AGY_ANA_1, "agy:ANA-1", Status::Done),
-        (ids::HTUI_TOOL_1, "htui:TOOL-1", Status::AwaitingApproval),
+    // MOD-144: the entries carry the latest graph run, so the state is the derived one.
+    for (item, key, state) in [
+        (ids::AGY_ANA_1, "agy:ANA-1", ItemState::Done),
+        (ids::HTUI_TOOL_1, "htui:TOOL-1", ItemState::NeedsYou),
     ] {
         let entry = entries
             .iter()
@@ -15229,9 +15268,9 @@ async fn upstream_in_scope_no_summary<S: ReadStore>(store: &S) {
                 entry.depth,
                 entry.in_scope,
                 entry.summary.is_none(),
-                entry.status,
+                entry.state(),
             ),
-            (key, 1, true, true, status),
+            (key, 1, true, true, state),
             "upstream_in_scope_no_summary: {key} renders as `no summary yet`"
         );
         assert!(
@@ -15827,8 +15866,8 @@ async fn item_citations_derive_suspect<S: ReadStore>(store: &S) {
     );
 }
 
-/// ANA-11 §4.3's coverage on the fixture: each citing item's status and resolution, suspect
-/// derived, in item key order; the tombstone is absent.
+/// ANA-11 §4.3's coverage on the fixture: each citing item's state (MOD-144: derived from its
+/// latest graph run) and resolution, suspect derived, in item key order; the tombstone is absent.
 async fn coverage_carries_status_and_resolution<S: ReadStore>(store: &S) {
     const CASE: &str = "coverage_carries_status_and_resolution";
     let view = |rows: Vec<CoverageRow>| {
@@ -15836,7 +15875,7 @@ async fn coverage_carries_status_and_resolution<S: ReadStore>(store: &S) {
             .map(|row| {
                 (
                     row.item.id,
-                    row.item.status,
+                    row.item.state(),
                     row.resolution,
                     row.kind,
                     row.requirement_version,
@@ -15856,7 +15895,7 @@ async fn coverage_carries_status_and_resolution<S: ReadStore>(store: &S) {
         vec![
             (
                 ids::HTUI_ANA_1,
-                Status::Done,
+                ItemState::Done,
                 None,
                 CitationKind::Addresses,
                 1,
@@ -15864,7 +15903,7 @@ async fn coverage_carries_status_and_resolution<S: ReadStore>(store: &S) {
             ),
             (
                 ids::HTUI_ANA_2,
-                Status::Open,
+                ItemState::Open,
                 None,
                 CitationKind::Amends,
                 2,
@@ -15883,7 +15922,7 @@ async fn coverage_carries_status_and_resolution<S: ReadStore>(store: &S) {
         vec![
             (
                 ids::HTUI_FEAT_1,
-                Status::InProgress,
+                ItemState::Running,
                 None,
                 CitationKind::Addresses,
                 1,
@@ -15891,7 +15930,7 @@ async fn coverage_carries_status_and_resolution<S: ReadStore>(store: &S) {
             ),
             (
                 ids::HTUI_FIX_1,
-                Status::Closed,
+                ItemState::Closed,
                 Some(Resolution::Done),
                 CitationKind::Addresses,
                 1,
@@ -17005,9 +17044,9 @@ async fn relay_view_lists_live_pending_requests_and_pending_cancels<S: WriteStor
     );
 }
 
-/// MOD-69 plan D2: `waiting_candidates` lists every item of the scope that is `blocked` or
-/// `awaiting_approval`, or that owns a parked run, with its active runs (queued, running, parked
-/// and, since MOD-125 D2, stopped) and their steps, in canonical order. A walking item, a finished run, another
+/// MOD-69 plan D2, MOD-144: `waiting_candidates` lists every item of the scope that is `blocked`,
+/// or that owns a parked run, with its active runs (queued, running, parked and, since MOD-125
+/// D2, stopped) and their steps, in canonical order. A walking item, a finished run, another
 /// workspace's item and a chat run are absent; an empty scope answers nothing.
 async fn waiting_candidates_hold_every_park_and_nothing_else<S: WriteStore>(store: &S) {
     const CASE: &str = "waiting_candidates_hold_every_park_and_nothing_else";
@@ -17041,15 +17080,7 @@ async fn waiting_candidates_hold_every_park_and_nothing_else<S: WriteStore>(stor
     let selection_run = claimed(CASE, store, selection, owner, at).await;
     let selection_a = done_step(CASE, store, selection_run, (0, 1, 0), at).await;
     let selection_b = done_step(CASE, store, selection_run, (0, 1, 1), at).await;
-    parked_run(
-        CASE,
-        store,
-        selection_run,
-        selection,
-        Status::AwaitingApproval,
-        at,
-    )
-    .await;
+    parked_run(CASE, store, selection_run, selection, None, at).await;
 
     // A failed judge: the selection's shape plus the judge, rejected.
     let judge = minted(CASE, store, "judge").await;
@@ -17081,15 +17112,24 @@ async fn waiting_candidates_hold_every_park_and_nothing_else<S: WriteStore>(stor
             .expect(CASE),
         "{CASE}: the judge fails"
     );
-    parked_run(CASE, store, judge_run, judge, Status::AwaitingApproval, at).await;
+    parked_run(CASE, store, judge_run, judge, None, at).await;
 
     // An escalation: the run parked, the item blocked, no step parked.
     let escalation = minted(CASE, store, "escalation").await;
     let escalation_run = claimed(CASE, store, escalation, owner, at).await;
     let escalation_step = done_step(CASE, store, escalation_run, (0, 1, 0), at).await;
-    parked_run(CASE, store, escalation_run, escalation, Status::Blocked, at).await;
+    parked_run(
+        CASE,
+        store,
+        escalation_run,
+        escalation,
+        Some(Status::Blocked),
+        at,
+    )
+    .await;
 
-    // A gate park whose item was moved back to open: the run still anchors it.
+    // A second gate park on an `open` item: the run anchors it (MOD-144: the park never moves the
+    // item, so every park but an escalation is this shape).
     let reopened = minted(CASE, store, "open under park").await;
     let reopened_run = claimed(CASE, store, reopened, owner, at).await;
     let reopened_step = running_step(CASE, store, reopened_run, (0, 1, 0), at).await;
@@ -17100,13 +17140,6 @@ async fn waiting_candidates_hold_every_park_and_nothing_else<S: WriteStore>(stor
             .expect(CASE),
         ParkOutcome::Parked,
         "{CASE}: the second gate parks"
-    );
-    assert!(
-        store
-            .transition(reopened, Status::AwaitingApproval, Status::Open)
-            .await
-            .expect(CASE),
-        "{CASE}: awaiting_approval -> open is legal"
     );
 
     // A blocked item whose run a workspace stop interrupted: a stopped run is live (MOD-125 D2),
@@ -17131,10 +17164,10 @@ async fn waiting_candidates_hold_every_park_and_nothing_else<S: WriteStore>(stor
     );
     assert!(
         store
-            .transition(stopped, Status::InProgress, Status::Blocked)
+            .transition(stopped, Status::Open, Status::Blocked)
             .await
             .expect(CASE),
-        "{CASE}: in_progress -> blocked is legal"
+        "{CASE}: open -> blocked is legal"
     );
 
     // The negative: a walking run, claimed last (H-6).
@@ -17153,20 +17186,20 @@ async fn waiting_candidates_hold_every_park_and_nothing_else<S: WriteStore>(stor
         .id;
     assert!(
         store
-            .transition(queued, Status::Queued, Status::Blocked)
+            .transition(queued, Status::Open, Status::Blocked)
             .await
             .expect(CASE),
-        "{CASE}: queued -> blocked is legal (create_run queued the item)"
+        "{CASE}: open -> blocked is legal (create_run left the item open)"
     );
     let mid_walk = minted(CASE, store, "blocked mid-walk").await;
     let mid_walk_run = claimed(CASE, store, mid_walk, owner, at).await;
     let mid_walk_step = running_step(CASE, store, mid_walk_run, (0, 1, 0), at).await;
     assert!(
         store
-            .transition(mid_walk, Status::InProgress, Status::Blocked)
+            .transition(mid_walk, Status::Open, Status::Blocked)
             .await
             .expect(CASE),
-        "{CASE}: in_progress -> blocked is legal"
+        "{CASE}: open -> blocked is legal"
     );
 
     // Another workspace's item, and a chat run in scope.
@@ -17194,7 +17227,7 @@ async fn waiting_candidates_hold_every_park_and_nothing_else<S: WriteStore>(stor
         (ids::HTUI_FEAT_2, Status::Blocked, vec![]),
         (
             gate,
-            Status::AwaitingApproval,
+            Status::Open,
             vec![(
                 gate_run,
                 RunStatus::AwaitingApproval,
@@ -17203,7 +17236,7 @@ async fn waiting_candidates_hold_every_park_and_nothing_else<S: WriteStore>(stor
         ),
         (
             selection,
-            Status::AwaitingApproval,
+            Status::Open,
             vec![(
                 selection_run,
                 RunStatus::AwaitingApproval,
@@ -17215,7 +17248,7 @@ async fn waiting_candidates_hold_every_park_and_nothing_else<S: WriteStore>(stor
         ),
         (
             judge,
-            Status::AwaitingApproval,
+            Status::Open,
             vec![(
                 judge_run,
                 RunStatus::AwaitingApproval,
@@ -17267,7 +17300,11 @@ async fn waiting_candidates_hold_every_park_and_nothing_else<S: WriteStore>(stor
                 vec![(mid_walk_step, StepStatus::Running)],
             )],
         ),
-        (ids::HTUI_TOOL_1, Status::AwaitingApproval, vec![]),
+        (
+            ids::HTUI_TOOL_1,
+            Status::Open,
+            vec![(ids::RUN_5, RunStatus::AwaitingApproval, vec![])],
+        ),
     ];
     assert_eq!(
         shape_of(&rows),
@@ -20194,13 +20231,11 @@ async fn withdraw_link_only_what_this_run_proposed<S: WriteStore>(store: &S) {
         step: earlier,
     };
     store.propose_link(fence, theirs).await.expect(CASE);
-    assert!(
-        store
-            .transition(item, Status::Queued, Status::Open)
-            .await
-            .expect(CASE),
-        "{CASE}: queued -> open frees the item for a second run"
-    );
+    // MOD-144: one live graph run per item, so the earlier run ends before the second starts.
+    store
+        .finish_run(earlier_run, RunStatus::Cancelled, None, seam_clock())
+        .await
+        .expect(CASE);
     let (_run, step) = agent_step(CASE, store, ids::PROJECT_AGY, item, None).await;
     let ours = ProposeLink {
         from: item,

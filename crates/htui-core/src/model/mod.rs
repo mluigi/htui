@@ -131,7 +131,7 @@ pub use ids::{
     StepId, UserId, WorkspaceId,
 };
 pub use item::{
-    Item, ItemFilter, ItemPatch, ItemRevision, ItemSummary, NewItem, Resolution, Status,
+    Item, ItemFilter, ItemPatch, ItemRevision, ItemState, ItemSummary, NewItem, Resolution, Status,
 };
 pub use item_merge::{FieldState, Side, SpecField, SpecMerge};
 pub use item_spec::{EditReason, ItemSpec, SpecChanges, SpecContext, SpecError};
@@ -188,10 +188,10 @@ pub use requirement::{
 };
 pub use run::{
     ChatRunSpec, CommandRun, CommandRunStatus, GateOutcome, GraphSnapshot, NewCommandRun, NewRun,
-    NewRunStep, Run, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary,
+    NewRunStep, Run, RunFacts, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary,
     RunStepTree, RunSummary, SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPhase,
     SnapshotSettings, SnapshotTemplate, StepOpening, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS,
-    ToolCallCount, VerifyOutcome, prompt_summary,
+    ToolCallCount, VerifyOutcome, latest_graph_run, prompt_summary,
 };
 pub use scope::{PromptScope, Scope};
 pub use skill::{
@@ -277,18 +277,27 @@ mod tests {
         );
     }
 
+    /// `0023_item_status.sql`'s `chk_item_status` (MOD-144).
     #[test]
     fn status_matches_check_list() {
+        check_enum(Status::ALL, &["open", "blocked", "closed"]);
+    }
+
+    /// No CHECK: `ItemState` is derived (MOD-144). Its texts are pinned the same way so the
+    /// SQL `CASE` that derives it and `as_str` cannot drift.
+    #[test]
+    fn item_state_texts_round_trip() {
         check_enum(
-            Status::ALL,
+            ItemState::ALL,
             &[
-                "open",
-                "queued",
-                "in_progress",
-                "awaiting_approval",
-                "blocked",
-                "done",
+                "needs_you",
                 "failed",
+                "running",
+                "stopped",
+                "blocked",
+                "queued",
+                "open",
+                "done",
                 "closed",
             ],
         );
@@ -459,17 +468,6 @@ mod tests {
         );
         assert_eq!(err.to_string(), "`archived` is not a valid Status");
         assert!(RunKind::from_str("").is_err());
-    }
-
-    #[test]
-    fn status_terminality_matches_readiness_rule() {
-        for status in Status::ALL {
-            assert_eq!(
-                status.is_terminal(),
-                matches!(status, Status::Done | Status::Closed),
-                "{status} terminality"
-            );
-        }
     }
 
     /// MOD-125 D2: `is_active` is the live set, `on_top_bar` the top bar's count (the live set

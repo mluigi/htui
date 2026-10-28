@@ -16,6 +16,7 @@ use crate::model::box_::BoxProfile;
 use crate::model::ids::{ItemId, SkillId, StepId};
 use crate::model::item::Status;
 use crate::model::link::UpstreamEntry;
+use crate::model::run::RunStatus;
 use crate::model::skill::{Activation, BoundSkill, SkillLevel, StepFiles};
 use crate::model::{EventKind, EventRole, OsFamily, SessionEvent};
 use crate::prompt::excerpt::{
@@ -66,7 +67,7 @@ fn upstream_entry(
     id: u128,
     key: &str,
     title: &str,
-    status: Status,
+    (status, latest): (Status, Option<RunStatus>),
     depth: u8,
     in_scope: bool,
     summary: Option<&str>,
@@ -79,6 +80,7 @@ fn upstream_entry(
         depth,
         in_scope,
         summary: summary.map(str::to_owned),
+        latest_run_status: latest,
     }
 }
 
@@ -193,7 +195,7 @@ pub fn phase_implement_attempt2() -> PromptSpec {
                 0x9,
                 "htui:ANA-9",
                 "Postgres schema",
-                Status::Closed,
+                (Status::Closed, None),
                 1,
                 true,
                 Some("The schema is one database, six domains, and no soft deletes outside `item`.\n"),
@@ -202,7 +204,7 @@ pub fn phase_implement_attempt2() -> PromptSpec {
                 0x7,
                 "htui:MOD-7",
                 "Box registry and capabilities",
-                Status::InProgress,
+                (Status::Open, Some(RunStatus::Running)),
                 1,
                 true,
                 None,
@@ -211,7 +213,7 @@ pub fn phase_implement_attempt2() -> PromptSpec {
                 0x1,
                 "auth-service:MOD-1",
                 "Token rotation",
-                Status::Done,
+                (Status::Open, Some(RunStatus::Done)),
                 2,
                 false,
                 None,
@@ -640,7 +642,7 @@ pub fn phase_oversize() -> PromptSpec {
             0x9,
             "htui:ANA-9",
             "Postgres schema",
-            Status::Closed,
+            (Status::Closed, None),
             1,
             true,
             Some(&prose_block("ana-9 summary", 60)),
@@ -649,7 +651,7 @@ pub fn phase_oversize() -> PromptSpec {
             0x7,
             "htui:MOD-7",
             "Box registry and capabilities",
-            Status::InProgress,
+            (Status::Open, Some(RunStatus::Running)),
             1,
             true,
             Some(&prose_block("mod-7 summary", 40)),
@@ -658,7 +660,7 @@ pub fn phase_oversize() -> PromptSpec {
             0x4,
             "htui:MOD-4",
             "Orchestrator",
-            Status::Queued,
+            (Status::Open, Some(RunStatus::Queued)),
             2,
             true,
             Some(&prose_block("mod-4 summary", 40)),
@@ -667,7 +669,7 @@ pub fn phase_oversize() -> PromptSpec {
             0x1,
             "auth-service:MOD-1",
             "Token rotation",
-            Status::Done,
+            (Status::Open, Some(RunStatus::Done)),
             2,
             false,
             None,

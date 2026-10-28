@@ -54,6 +54,7 @@ use crate::model::{
     moved_order, overlaps, prompt_summary, scope_of,
 };
 use crate::model::{EdgeId, GraphBody, GraphScope, NodeBody, PhasePart, StepGraphEdge};
+use crate::model::{ItemState, latest_graph_run};
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
 use crate::prompt::template::TemplateRole;
@@ -70,18 +71,18 @@ use crate::store::traits::{
     SettingRung, StepFence, StoredSetting, UpdateOutcome, WriteStore, already_exists,
     batch_is_closed, chat_step_status, check_attachment, citation_key, close_out_needs_a_summary,
     command_finish_status, command_not_claimable, command_not_queued, document_needs_a_step,
-    expected_on_row, failure_disagrees_with_status, finish_run_item_mirror,
-    finish_run_needs_a_terminal_status, graph_not_in_project, invalid_area_code, invalid_prefix,
-    item_has_a_live_run, item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move,
-    link_key, link_not_proposed_by_run, link_outside_project, memory_entry_closed,
-    memory_subject_taken, new_persona_refusal, new_skill_refusal, not_a_fanout_candidate,
-    not_a_terminal_status, note_needs_a_step, persona_is_bound, persona_patch_refusal,
-    project_settings_not_an_object, prompt_template_key, prompt_template_refusal,
-    queue_target_refusal, queue_token_refusal, reaped_note, references_no_row,
-    requirement_withdrawn, reserved_phase_name, resolution_not_closable, row_names_another_phase,
-    row_names_another_step, run_is_terminal, self_link, skill_body_refusal, skill_patch_refusal,
-    skill_version_key, step_document_refusal, step_is_not_promotable, step_note_refusal,
-    step_slot_is_taken, step_writes_own_item, summary_names_another_item, winner_is_not_settled,
+    expected_on_row, failure_disagrees_with_status, finish_run_needs_a_terminal_status,
+    graph_not_in_project, invalid_area_code, invalid_prefix, item_has_a_live_run,
+    item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move, link_key,
+    link_not_proposed_by_run, link_outside_project, memory_entry_closed, memory_subject_taken,
+    new_persona_refusal, new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status,
+    note_needs_a_step, persona_is_bound, persona_patch_refusal, project_settings_not_an_object,
+    prompt_template_key, prompt_template_refusal, queue_target_refusal, queue_token_refusal,
+    reaped_note, references_no_row, requirement_withdrawn, reserved_phase_name,
+    resolution_not_closable, row_names_another_phase, row_names_another_step, run_is_terminal,
+    self_link, skill_body_refusal, skill_patch_refusal, skill_version_key, startable,
+    step_document_refusal, step_is_not_promotable, step_note_refusal, step_slot_is_taken,
+    step_writes_own_item, summary_names_another_item, winner_is_not_settled,
     withdrawn_requirement_cited,
 };
 use crate::store::traits::{
@@ -1098,6 +1099,7 @@ impl MemStore {
                             .max_by_key(|note| (note.created_at, note.id))
                             .map(|note| note.body.clone()),
                         open_blockers: state.open_blocker_keys(item.id),
+                        latest_run_status: state.latest_run_status(item.id),
                         entry,
                     })
                 })
@@ -1170,8 +1172,8 @@ impl MemStore {
     /// MOD-12 D2, D3: close `box_id`'s open batch with `reason`; `None` when none was open.
     ///
     /// In the same closure every run of the batch still `queued` is cancelled through
-    /// `State::finish_run`, so its item goes back to `open` and its queue entry stays (review
-    /// H2): a pause stops the runs nobody has claimed yet. A `drained` close finds none.
+    /// `State::finish_run`, so the item's state falls back to its previous run (MOD-144) and its
+    /// queue entry stays (review H2): a pause stops the runs nobody has claimed yet. A `drained` close finds none.
     ///
     /// # Errors
     /// Never in practice: a `queued` run always cancels. The signature matches `PgStore`'s so
@@ -1251,20 +1253,28 @@ impl MemStore {
         }))
     }
 
-    /// MOD-12 D3: drop `box_id`'s entries whose item is `done` or `closed`; how many went.
+    /// MOD-12 D3, MOD-144: drop `box_id`'s entries whose item is closed or finished (latest
+    /// graph run `done`); how many went.
     ///
     /// # Errors
     /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
     pub async fn prune_finished_entries(&self, box_id: BoxId) -> Result<u64> {
         Ok(self.write(|state| {
-            let items = &state.items;
+            let finished: BTreeSet<ItemId> = state
+                .queue_entries
+                .iter()
+                .filter(|(_, entry)| entry.box_id == box_id)
+                .filter_map(|(item, _)| state.items.get(item))
+                .filter(|row| {
+                    row.status == Status::Closed
+                        || state.latest_run_status(row.id) == Some(RunStatus::Done)
+                })
+                .map(|row| row.id)
+                .collect();
             let before = state.queue_entries.len();
-            state.queue_entries.retain(|item, entry| {
-                entry.box_id != box_id
-                    || !items
-                        .get(item)
-                        .is_some_and(|row| matches!(row.status, Status::Done | Status::Closed))
-            });
+            state
+                .queue_entries
+                .retain(|item, entry| entry.box_id != box_id || !finished.contains(item));
             rows(before - state.queue_entries.len())
         }))
     }
@@ -1587,10 +1597,12 @@ impl State {
             .collect()
     }
 
-    /// Whether the item is ready in the store-side half of §7.4: open, and no live `blocked_by`
-    /// edge to an item that is not terminal. The capability half is the caller's `tags` filter.
+    /// Whether the item is ready in the store-side half of §7.4 (MOD-144): `open`, no
+    /// non-cancelled graph run, and no live `blocked_by` edge to an item that is not released.
+    /// The capability half is the caller's `tags` filter.
     fn is_ready(&self, item: &Item) -> bool {
         item.status == Status::Open
+            && self.latest_graph_run_of(item.id).is_none()
             && !self.links.iter().any(|link| {
                 link.deleted_at.is_none()
                     && link.kind == LinkKind::BlockedBy
@@ -1598,7 +1610,7 @@ impl State {
                     && self
                         .items
                         .get(&link.to_item_id)
-                        .is_some_and(|target| !target.status.is_terminal())
+                        .is_some_and(|target| !self.is_released(target))
             })
     }
 
@@ -1616,6 +1628,11 @@ impl State {
             .as_ref()
             .is_some_and(|statuses| !statuses.contains(&item.status))
         {
+            return false;
+        }
+        if filter.states.as_ref().is_some_and(|states| {
+            !states.contains(&ItemState::of(item.status, self.latest_run_status(item.id)))
+        }) {
             return false;
         }
         if filter
@@ -1659,7 +1676,9 @@ impl State {
                 .then_with(|| left.key_prefix.cmp(&right.key_prefix))
                 .then_with(|| left.key_number.cmp(&right.key_number))
         });
-        rows.into_iter().map(|(_, item)| item.summary()).collect()
+        rows.into_iter()
+            .map(|(_, item)| self.summary_of(item))
+            .collect()
     }
 
     /// One traversal node.
@@ -1672,6 +1691,7 @@ impl State {
             title: item.title.clone(),
             status: item.status,
             depth,
+            latest_run_status: self.latest_run_status(item.id),
         }
     }
 
@@ -1814,6 +1834,7 @@ impl State {
                         .map(|d| d.body.clone())
                 })
                 .flatten(),
+            latest_run_status: self.latest_run_status(item.id),
         }
     }
 
@@ -2021,7 +2042,8 @@ impl State {
         rows
     }
 
-    /// MOD-69 plan D2: the scope's candidates, grouped and sorted by `WaitingCandidate::assemble`.
+    /// MOD-69 plan D2: the scope's candidates, grouped and sorted by `WaitingCandidate::assemble`:
+    /// an item that is `blocked`, or that owns a run at `awaiting_approval` (MOD-144).
     fn waiting_candidates(&self, scope: &Scope) -> Vec<WaitingCandidate> {
         let parked: BTreeSet<ItemId> = self
             .runs
@@ -2033,10 +2055,7 @@ impl State {
             .items
             .values()
             .filter(|item| scope.contains(item.project_id))
-            .filter(|item| {
-                matches!(item.status, Status::Blocked | Status::AwaitingApproval)
-                    || parked.contains(&item.id)
-            })
+            .filter(|item| item.status == Status::Blocked || parked.contains(&item.id))
             .cloned()
             .collect();
         let wanted: BTreeSet<ItemId> = items.iter().map(|item| item.id).collect();
@@ -2210,10 +2229,8 @@ impl State {
         Ok(UpdateOutcome::Updated(head))
     }
 
-    /// Compare-and-set on `status` alone: never bumps `version`, never writes a revision (§4.2).
-    ///
-    /// `closed_at` tracks the current status, not the history: it is set on a move to a terminal
-    /// status and cleared on a move back to a live one (blueprint Errata).
+    /// Compare-and-set on `status` alone: never bumps `version`, never writes a revision (§4.2),
+    /// never touches `closed_at` (MOD-144: only close-out sets it).
     ///
     /// The order of MOD-4 plan D14 / D15: the row is looked up first, so a missing row is
     /// `NotFound` even when the pair is also illegal; then the ANA-2 §4.3 table refuses an illegal
@@ -2239,9 +2256,6 @@ impl State {
         }
         item.status = to;
         item.updated_at = now;
-        // `legal_move` refuses every move to `closed` (MOD-38 PRD D1), so of the two terminal
-        // statuses only `done` gets here; the Postgres twin's `CASE` names just that one.
-        item.closed_at = to.is_terminal().then_some(now);
         Ok(true)
     }
 
@@ -5522,8 +5536,45 @@ impl State {
         rows
     }
 
-    /// MOD-12 M3 D6: `item`'s latest `kind = 'graph'` run by `(queued_at, id)`, with its target
-    /// box's hostname and its first `awaiting_approval` step by `(position, attempt,
+    /// MOD-144 (B4): `item`'s latest graph run, newest `kind = 'graph'` and not `cancelled` by
+    /// `(queued_at, id)`: what the item's state derives from.
+    fn latest_graph_run_of(&self, item: ItemId) -> Option<&Run> {
+        latest_graph_run(self.runs.values().filter(|run| run.item_id == Some(item)))
+    }
+
+    /// MOD-144: the status of [`State::latest_graph_run_of`].
+    fn latest_run_status(&self, item: ItemId) -> Option<RunStatus> {
+        self.latest_graph_run_of(item).map(|run| run.status)
+    }
+
+    /// MOD-144 Δ2: the newest live graph run (stopped included), the one `uq_run_item_live`
+    /// allows.
+    fn live_graph_run(&self, item: ItemId) -> Option<&Run> {
+        self.runs
+            .values()
+            .filter(|run| {
+                run.item_id == Some(item) && run.kind == RunKind::Graph && run.status.is_active()
+            })
+            .max_by_key(|run| (run.queued_at, run.id))
+    }
+
+    /// Released (ANA-35 §7.1): `closed`, or latest graph run `done`. A `blocked_by` edge to a
+    /// released target no longer holds its source.
+    fn is_released(&self, target: &Item) -> bool {
+        target.status == Status::Closed
+            || self.latest_run_status(target.id) == Some(RunStatus::Done)
+    }
+
+    /// The list projection of `item` with its latest graph run's status filled (MOD-144).
+    fn summary_of(&self, item: &Item) -> ItemSummary {
+        ItemSummary {
+            latest_run_status: self.latest_run_status(item.id),
+            ..item.summary()
+        }
+    }
+
+    /// MOD-12 M3 D6: `item`'s latest `kind = 'graph'` run by `(queued_at, id)`, **cancelled
+    /// included** (PD6), with its target box's hostname and its first `awaiting_approval` step by `(position, attempt,
     /// fanout_index)`.
     fn latest_queue_run(&self, item: ItemId) -> Option<QueueRunFact> {
         let run = self
@@ -5550,8 +5601,9 @@ impl State {
         })
     }
 
-    /// MOD-12 M3 D6: the keys of `item`'s live `blocked_by` targets that are not terminal, in
-    /// byte order, once each: [`State::is_ready`]'s blocker rule, named.
+    /// MOD-12 M3 D6: the keys of `item`'s live `blocked_by` targets that are not released
+    /// (MOD-144: closed, or latest graph run `done`), in byte order, once each:
+    /// [`State::is_ready`]'s blocker rule, named.
     fn open_blocker_keys(&self, item: ItemId) -> Vec<String> {
         let keys: BTreeSet<String> = self
             .links
@@ -5562,7 +5614,7 @@ impl State {
                     && link.from_item_id == item
             })
             .filter_map(|link| self.items.get(&link.to_item_id))
-            .filter(|target| !target.status.is_terminal())
+            .filter(|target| !self.is_released(target))
             .map(|target| target.key.clone())
             .collect();
         keys.into_iter().collect()
@@ -5744,7 +5796,9 @@ impl State {
             .collect()
     }
 
-    /// The `run` row and the item's move to `queued`, together or not at all (plan D6).
+    /// The `run` row alone; the item is not written (MOD-144: it reads `queued` from the run).
+    /// Refused unless the item is `open` with no live graph run ([`startable`], Δ8), checked in
+    /// the same lock as the insert, as `PgStore` checks it under the item's `FOR UPDATE`.
     fn create_run(&mut self, new: NewRun, now: DateTime<Utc>) -> Result<Run> {
         // Plan D14, before anything else: the row is looked up first and legality second, so a
         // request that gets the item wrong *and* something else wrong answers `NotFound` for the
@@ -5752,7 +5806,10 @@ impl State {
         // is the transaction's first statement — so the emulation follows it.
         let item = self.require_item(new.item_id)?;
         let (status, holder) = (item.status, item.project_id);
-        legal_move(status, Status::Queued)?;
+        startable(
+            status,
+            self.live_graph_run(new.item_id).map(|run| run.status),
+        )?;
         // Nothing in the schema ties `run.project_id` to `item.project_id`, so without this a run
         // lands under project A for project B's item — where `delete_project`, which counts by
         // `run.project_id`, would take it with the wrong project.
@@ -5845,7 +5902,6 @@ impl State {
         if let Some(batch) = new.batch_id {
             self.run_batches.insert(row.id, batch);
         }
-        self.transition(new.item_id, status, Status::Queued, now)?;
         Ok(row)
     }
 
@@ -5899,10 +5955,10 @@ impl State {
                 && self
                     .items
                     .get(&item)
-                    .is_some_and(|row| row.status == Status::Queued)
+                    .is_some_and(|row| row.status == Status::Open)
             {
-                // A stale item status is not a refusal, as in the admitted branch below.
-                self.transition(item, Status::Queued, Status::Blocked, now)?;
+                // MOD-144: `open -> blocked`; an item already blocked (or closed) is left alone.
+                self.transition(item, Status::Open, Status::Blocked, now)?;
             }
             return Ok(Claim::MissingTags { missing });
         }
@@ -5969,15 +6025,7 @@ impl State {
             row.updated_at = now;
         }
         self.lease_owners.insert(run, owner);
-        if let Some(item) = claimed.item_id
-            && self
-                .items
-                .get(&item)
-                .is_some_and(|row| row.status == Status::Queued)
-        {
-            // A stale item status is not a refusal: the run is what is being claimed.
-            self.transition(item, Status::Queued, Status::InProgress, now)?;
-        }
+        // MOD-144: the item is not written; it reads `running` from the run.
         Ok(Claim::Admitted)
     }
 
@@ -6941,7 +6989,8 @@ impl State {
         Ok(())
     }
 
-    /// §4.8's promotion: the step, its run and its item, in one closure (plan D6).
+    /// §4.8's promotion: the step and its run, in one closure (plan D6). The item is not written
+    /// (MOD-144).
     fn promote_step(&mut self, step: StepId, at: DateTime<Utc>, now: DateTime<Utc>) -> Result<()> {
         let row = self.require_step(step)?;
         if !matches!(
@@ -6958,7 +7007,6 @@ impl State {
             return Err(StoreError::Constraint(run_is_terminal(run_id, run.status)));
         }
         let run_status = run.status;
-        let item_id = run.item_id;
 
         if let Some(row) = self.steps.get_mut(&step) {
             row.status = StepStatus::AwaitingApproval;
@@ -6971,25 +7019,14 @@ impl State {
             row.status = RunStatus::AwaitingApproval;
             row.updated_at = now;
         }
-        if let Some(item) = item_id
-            && self
-                .items
-                .get(&item)
-                .is_some_and(|row| row.status == Status::InProgress)
-        {
-            self.transition(item, Status::InProgress, Status::AwaitingApproval, now)?;
-        }
         Ok(())
     }
 
     /// MOD-37 R-5: the gate's park, `promote_step`'s shape. Every check runs before the first
     /// write, so the park is all-or-nothing by construction, as Postgres's rollback makes it
     /// (review N1). The step, the fence, the step's status and the run's status run in
-    /// Postgres's order. The item check after them is Mem-only: Postgres's item `UPDATE` is
-    /// guarded by `status = 'in_progress'` and checks nothing, and `run.item_id`'s FK cascade
-    /// guarantees the row Mem checks for. The item must exist and its
-    /// `in_progress -> awaiting_approval` be legal; an item another writer moved is left where it
-    /// is (plan D17's "already moved").
+    /// Postgres's order; then the step and the run move. The item is not written (MOD-144: it
+    /// reads `needs you` from the run).
     fn park_step(
         &mut self,
         fence: StepFence,
@@ -7006,20 +7043,8 @@ impl State {
         if run.status != RunStatus::Running {
             return Ok(ParkOutcome::RunMoved);
         }
-        let move_item = match run.item_id {
-            // A chat run has no item to move.
-            None => None,
-            Some(item) => {
-                let row = self.items.get(&item).ok_or_else(|| StoreError::NotFound {
-                    entity: "item",
-                    id: item.to_string(),
-                })?;
-                legal_move(Status::InProgress, Status::AwaitingApproval)?;
-                (row.status == Status::InProgress).then_some(item)
-            }
-        };
 
-        // Every check passed: the three moves below cannot fail.
+        // Every check passed: the two moves below cannot fail.
         if let Some(row) = self.steps.get_mut(&step) {
             row.status = StepStatus::AwaitingApproval;
             row.updated_at = now;
@@ -7027,12 +7052,6 @@ impl State {
         if let Some(row) = self.runs.get_mut(&run_id) {
             row.status = RunStatus::AwaitingApproval;
             row.updated_at = now;
-        }
-        if let Some(row) = move_item.and_then(|item| self.items.get_mut(&item)) {
-            // `transition`'s write: `awaiting_approval` is live, so `closed_at` clears.
-            row.status = Status::AwaitingApproval;
-            row.updated_at = now;
-            row.closed_at = None;
         }
         Ok(ParkOutcome::Parked)
     }
@@ -7060,13 +7079,8 @@ impl State {
         Ok(())
     }
 
-    /// Plan M2 D7: the run's terminal move and the item's mirror, one closure.
-    ///
-    /// The item half is [`State::promote_step`]'s shape — derive the target, then route it through
-    /// [`State::transition`] so `closed_at` and `updated_at` follow one rule — and the run half is
-    /// [`State::transition_run`]'s. What is new is the guard between them: the mirror is written
-    /// only when no *other* run of the item is still active, so a second live run holds the item
-    /// where it is rather than being lost.
+    /// Plan M2 D7: the run's terminal move, [`State::transition_run`]'s shape with the two rules
+    /// this writer owns. The item is not written (MOD-144: its state derives from the run).
     fn finish_run(
         &mut self,
         run: RunId,
@@ -7077,8 +7091,7 @@ impl State {
     ) -> Result<()> {
         // Plan D14's order, and every refusal is decided before the first write: lookup, then the
         // two rules this writer owns, then the law.
-        let row = self.require_run(run)?;
-        let (from, item_id) = (row.status, row.item_id);
+        let from = self.require_run(run)?.status;
         if !to.is_terminal() {
             return Err(StoreError::Constraint(finish_run_needs_a_terminal_status(
                 run, to,
@@ -7103,27 +7116,8 @@ impl State {
             row.finished_at = row.finished_at.or(Some(at));
             row.updated_at = now;
         }
-
-        let Some(item) = item_id else {
-            // A chat run has no item to mirror (§5.8: `item_id` is nullable for `kind = 'chat'`).
-            return Ok(());
-        };
-        if self
-            .runs
-            .values()
-            .any(|other| other.item_id == Some(item) && other.id != run && other.status.is_active())
-        {
-            return Ok(());
-        }
-        let Some(status) = self.items.get(&item).map(|row| row.status) else {
-            return Ok(());
-        };
-        // §4.3's verdict table lives in `traits.rs` so `PgStore` binds the same answer this
-        // matches on; `None` is plan D17's "leave an unexpected item alone".
-        let Some(target) = finish_run_item_mirror(to, status) else {
-            return Ok(());
-        };
-        self.transition(item, status, target, now)?;
+        // MOD-144: no item write. A chat run never had one (§5.8: `item_id` is nullable for
+        // `kind = 'chat'`), and a graph run's item reads its state from this run.
         Ok(())
     }
 
@@ -7160,11 +7154,15 @@ impl State {
                 summary.item_id,
             )));
         }
-        // ANA-11 §4.2's law, not §4.3's table: close-out is the only way into `closed` (MOD-38
-        // PRD D1), so `legal_move` would refuse every status.
-        if !resolution.closes_from(status) {
+        // ANA-35 §7.1's law (PD18), not §4.3's table: close-out is the only way into `closed`
+        // (MOD-38 PRD D1), so `legal_move` would refuse every status. `finished` is the latest
+        // non-cancelled graph run being `done`.
+        let latest = self.latest_run_status(item);
+        if !resolution.closes_from(status, latest == Some(RunStatus::Done)) {
             return Err(StoreError::Constraint(resolution_not_closable(
-                item, status, resolution,
+                item,
+                ItemState::of(status, latest),
+                resolution,
             )));
         }
         for row in commits {
@@ -7446,7 +7444,7 @@ impl State {
                 Some((
                     item,
                     CoverageRow {
-                        item: item.summary(),
+                        item: self.summary_of(item),
                         kind: row.kind,
                         resolution: item.resolution,
                         requirement_version: row.requirement_version,
@@ -13528,8 +13526,8 @@ mod tests {
         id
     }
 
-    /// `create_run` is one transaction (plan D6): the `run` row and the item's move to `queued`
-    /// land together, and an item the §4.3 law cannot move leaves no run row behind.
+    /// `create_run` is one transaction (plan D6): the `run` row lands and the item is not written
+    /// (MOD-144), and an item [`startable`] refuses leaves no run row behind.
     #[tokio::test]
     async fn create_run_moves_the_item_and_writes_nothing_when_the_law_refuses() {
         let store = MemStore::demo();
@@ -13561,17 +13559,22 @@ mod tests {
             .await
             .expect("the item reads back")
             .expect("the fixture item");
-        assert_eq!(item.status, Status::Queued, "the item moved with the run");
+        assert_eq!(
+            item.status,
+            Status::Open,
+            "MOD-144: the item is not written"
+        );
 
+        // FEAT-1's rework run RUN_4 is live: the item reads `running`.
         let blocked = graph_run(ids::HTUI_FEAT_1, ids::PROJECT_HTUI, Vec::new());
         let blocked_id = blocked.id;
-        assert!(
-            matches!(
-                store.create_run(blocked).await,
-                Err(StoreError::Constraint(_))
+        match store.create_run(blocked).await {
+            Err(StoreError::Constraint(sentence)) => assert_eq!(
+                sentence, "item.status `running` cannot move to `queued` (ANA-2 §4.3)",
+                "startable's sentence names the derived state"
             ),
-            "in_progress cannot move to queued (ANA-2 §4.3)"
-        );
+            other => panic!("a live graph run refuses a second: {other:?}"),
+        }
         assert_eq!(
             store.run(blocked_id).await.expect("the read is total"),
             None,
@@ -13878,8 +13881,8 @@ mod tests {
                 .expect("the item reads back")
                 .expect("it exists")
                 .status,
-            Status::InProgress,
-            "the item moved queued -> in_progress with the claim"
+            Status::Open,
+            "MOD-144: the claim does not write the item"
         );
 
         assert_eq!(
@@ -14050,7 +14053,7 @@ mod tests {
                 .expect("the item reads back")
                 .expect("it exists")
                 .status,
-            Status::Queued,
+            Status::Open,
             "the refusal wrote nothing to the item either: it is not blocked"
         );
     }
@@ -14431,7 +14434,7 @@ mod tests {
                 .expect("the item reads back")
                 .expect("it exists")
                 .status,
-            Status::Queued,
+            Status::Open,
             "no run or step move touches the item"
         );
     }
@@ -14558,8 +14561,8 @@ mod tests {
         ));
     }
 
-    /// `R-ORCH-2`'s four answers and §4.8's promotion, which lifts the step, its run and its item
-    /// in one transaction.
+    /// `R-ORCH-2`'s four answers and §4.8's promotion, which lifts the step and its run in one
+    /// transaction; the item is not written (MOD-144: it reads `needs you` from the run).
     #[tokio::test]
     async fn gate_answers_write_their_outcome_and_promotion_lifts_the_run_and_the_item() {
         let store = MemStore::demo();
@@ -14618,10 +14621,6 @@ mod tests {
             .await
             .expect("the run starts");
         store
-            .transition(ids::HTUI_FEAT_3, Status::Queued, Status::InProgress)
-            .await
-            .expect("the item starts");
-        store
             .promote_step(rejected, at)
             .await
             .expect("a failed step under a live run can be promoted");
@@ -14643,7 +14642,8 @@ mod tests {
                 .expect("the item reads back")
                 .expect("it exists")
                 .status,
-            Status::AwaitingApproval
+            Status::Open,
+            "MOD-144: the promotion leaves the item row alone"
         );
         assert!(
             matches!(
@@ -15056,6 +15056,12 @@ mod tests {
             ),
             "RUN_2 is queued, so FEAT-3 cannot be closed out"
         );
+        // MOD-144: FEAT-1's rework run RUN_4 is live; cancelling it leaves RUN_1 `done` as the
+        // latest graph run, so FEAT-1 reads finished and the guards below are the ones asked.
+        store
+            .finish_run(ids::RUN_4, RunStatus::Cancelled, None, Utc::now())
+            .await
+            .expect("the rework run cancels");
         assert!(
             matches!(
                 store
@@ -15119,10 +15125,6 @@ mod tests {
             "no refusal wrote a document"
         );
 
-        store
-            .transition(ids::HTUI_FEAT_1, Status::InProgress, Status::Done)
-            .await
-            .expect("the item finishes");
         let written = store
             .close_out(
                 ids::HTUI_FEAT_1,
@@ -15140,7 +15142,7 @@ mod tests {
             .expect("it exists");
         assert_eq!(item.status, Status::Closed);
         assert_eq!(item.resolution, Some(Resolution::Done), "and says why");
-        assert!(item.closed_at.is_some(), "closed_at tracks the status");
+        assert!(item.closed_at.is_some(), "only close-out stamps closed_at");
         assert_eq!(
             store
                 .step_commits(ids::STEP_IMPL)
@@ -15191,10 +15193,11 @@ mod tests {
             "the fenced writer is refused on a run whose lease names an owner"
         );
 
+        // MOD-144: cancel the rework run; RUN_1 `done` is then the latest, so FEAT-1 is finished.
         store
-            .transition(ids::HTUI_FEAT_1, Status::InProgress, Status::Done)
+            .finish_run(ids::RUN_4, RunStatus::Cancelled, None, Utc::now())
             .await
-            .expect("the item finishes");
+            .expect("the rework run cancels");
         store
             .close_out(
                 ids::HTUI_FEAT_1,
@@ -15986,8 +15989,8 @@ mod tests {
         );
     }
 
-    /// Review H2: a close cancels the batch's runs still `queued` (their items back to `open`,
-    /// their entries kept) and leaves its claimed runs and every run outside it alone.
+    /// Review H2: a close cancels the batch's runs still `queued` (their items' states fall back
+    /// to their previous runs, MOD-144; their entries kept) and leaves its claimed runs and every run outside it alone.
     #[tokio::test]
     async fn close_batch_cancels_only_the_batch_runs_still_queued() {
         let store = MemStore::demo();
@@ -16043,7 +16046,12 @@ mod tests {
                 .expect("read")
                 .map(|item| item.status),
             Some(Status::Open),
-            "finish_run's mirror: a cancelled queued run reopens its item"
+            "MOD-144: the item row is never written"
+        );
+        assert_eq!(
+            store.read(|state| state.latest_run_status(ids::HTUI_ANA_2)),
+            None,
+            "a cancelled run is skipped: ANA-2 reads `open` again"
         );
         assert_eq!(
             store
@@ -16252,12 +16260,20 @@ mod tests {
         );
     }
 
-    /// MOD-12 D3: only `done` and `closed` items leave the queue.
+    /// MOD-12 D3, MOD-144 (PD5): only closed and finished (latest graph run `done`) items leave
+    /// the queue. A rework run un-finishes an item; a failed latest run is not finished.
     #[tokio::test]
-    async fn prune_finished_entries_drops_done_and_closed_items_only() {
+    async fn prune_drops_closed_and_finished_entries_only() {
         let store = MemStore::demo();
         let at = Utc::now();
-        for item in [ids::HTUI_ANA_1, ids::HTUI_ANA_2] {
+        for item in [
+            ids::HTUI_ANA_1,
+            ids::HTUI_ANA_2,
+            ids::HTUI_FIX_1,
+            ids::HTUI_FEAT_1,
+            ids::HTUI_CLEAN_1,
+            ids::HTUI_FEAT_2,
+        ] {
             store
                 .queue_item(item, ids::BOX, None, ids::USER, at)
                 .await
@@ -16268,17 +16284,42 @@ mod tests {
                 .prune_finished_entries(ids::BOX)
                 .await
                 .expect("the prune is answered"),
-            1,
-            "ANA-1 is done"
+            2,
+            "ANA-1 is finished (RUN_3 done), FIX-1 is closed"
         );
-        let left: Vec<ItemId> = store
+        let mut left: Vec<ItemId> = store
             .queue_entries(ids::BOX)
             .await
             .expect("the read is total")
             .into_iter()
             .map(|entry| entry.item_id)
             .collect();
-        assert_eq!(left, [ids::HTUI_ANA_2]);
+        left.sort();
+        let mut expected = vec![
+            ids::HTUI_ANA_2,
+            ids::HTUI_FEAT_1,
+            ids::HTUI_CLEAN_1,
+            ids::HTUI_FEAT_2,
+        ];
+        expected.sort();
+        assert_eq!(
+            left, expected,
+            "open, a running rework over a done run, failed and blocked all stay"
+        );
+
+        // Cancel FEAT-1's rework run: RUN_1 `done` is its latest again, so it is finished.
+        store
+            .finish_run(ids::RUN_4, RunStatus::Cancelled, None, at)
+            .await
+            .expect("the rework run cancels");
+        assert_eq!(
+            store
+                .prune_finished_entries(ids::BOX)
+                .await
+                .expect("the prune is answered"),
+            1,
+            "FEAT-1 is finished once its rework is cancelled"
+        );
         assert_eq!(
             store
                 .prune_finished_entries(ids::BOX)
@@ -16286,6 +16327,151 @@ mod tests {
                 .expect("the prune is answered"),
             0
         );
+    }
+
+    /// MOD-144 (PD5): readiness is `open` with **no** non-cancelled graph run at all, every live
+    /// `blocked_by` target released. A cancelled run alone leaves an item ready; a `done` or a
+    /// `failed` one does not.
+    #[tokio::test]
+    async fn ready_items_skip_an_item_with_any_non_cancelled_run() {
+        let store = MemStore::demo();
+        let scope = Scope {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            project_ids: vec![ids::PROJECT_HTUI, ids::PROJECT_AGY],
+        };
+        let ready = |store: &MemStore| {
+            let store = store.clone();
+            let scope = scope.clone();
+            async move {
+                store
+                    .ready_items(&scope, ids::BOX)
+                    .await
+                    .expect("read")
+                    .into_iter()
+                    .map(|item| item.id)
+                    .collect::<Vec<ItemId>>()
+            }
+        };
+        // The ready set is the fixture's: ANA-2, AGY FEAT-1 and AGY FIX-1 (VULKAN TOOL-1 is out of
+        // this scope). FEAT-3 (queued), CLEAN-1 (failed), ANA-1 and AGY ANA-1 (done), TOOL-1
+        // (needs you) and FEAT-1 (running) are not.
+        let mut before = ready(&store).await;
+        before.sort();
+        let mut expected = vec![ids::HTUI_ANA_2, ids::AGY_FEAT_1, ids::AGY_FIX_1];
+        expected.sort();
+        assert_eq!(before, expected);
+
+        let run = store
+            .create_run(graph_run(ids::HTUI_ANA_2, ids::PROJECT_HTUI, Vec::new()))
+            .await
+            .expect("ANA-2 starts")
+            .id;
+        assert!(
+            !ready(&store).await.contains(&ids::HTUI_ANA_2),
+            "a queued run makes it not ready"
+        );
+        store
+            .finish_run(run, RunStatus::Cancelled, None, Utc::now())
+            .await
+            .expect("cancel");
+        assert!(
+            ready(&store).await.contains(&ids::HTUI_ANA_2),
+            "a cancelled run is skipped: ready again"
+        );
+        let run = store
+            .create_run(graph_run(ids::HTUI_ANA_2, ids::PROJECT_HTUI, Vec::new()))
+            .await
+            .expect("ANA-2 starts again")
+            .id;
+        store
+            .finish_run(run, RunStatus::Failed, Some("boom"), Utc::now())
+            .await
+            .expect("fail");
+        assert!(
+            !ready(&store).await.contains(&ids::HTUI_ANA_2),
+            "a failed latest run is not ready"
+        );
+    }
+
+    /// MOD-144 (PD5, PD6): `latest_run` keeps a cancelled run (rules 1-2 and `Enter` read it)
+    /// while `latest_run_status` skips it (the state derives from it).
+    #[tokio::test]
+    async fn queue_rows_latest_run_keeps_cancelled_but_latest_run_status_skips_it() {
+        let store = MemStore::demo();
+        let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+        let run = store
+            .create_run(NewRun {
+                queued_at: at + TimeDelta::days(30),
+                ..graph_run(ids::HTUI_CLEAN_1, ids::PROJECT_HTUI, Vec::new())
+            })
+            .await
+            .expect("CLEAN-1 starts again after its failure")
+            .id;
+        store
+            .finish_run(run, RunStatus::Cancelled, None, at)
+            .await
+            .expect("cancel");
+        store
+            .queue_item(ids::HTUI_CLEAN_1, ids::BOX, None, ids::USER, at)
+            .await
+            .expect("queue");
+        let rows = store.queue_rows(ids::BOX).await.expect("read");
+        let row = &rows[0];
+        assert_eq!(
+            row.latest_run.as_ref().map(|r| (r.id, r.status)),
+            Some((run, RunStatus::Cancelled)),
+            "the cancelled run is the latest, cancelled included"
+        );
+        assert_eq!(
+            row.latest_run_status,
+            Some(RunStatus::Failed),
+            "RUN_6 is the latest non-cancelled"
+        );
+        assert_eq!(row.state(), crate::model::ItemState::Failed);
+    }
+
+    /// MOD-144 (PD5): a `blocked_by` target is released when it is closed **or** its latest
+    /// graph run is `done`, whatever its stored status; a rework run un-releases it.
+    #[tokio::test]
+    async fn open_blockers_drop_a_target_whose_latest_run_is_done() {
+        let (store, _) = queue_rows_store();
+        let at = Utc::now();
+        store
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, None, ids::USER, at)
+            .await
+            .expect("queue");
+        let blockers = |store: &MemStore| {
+            let store = store.clone();
+            async move {
+                store.queue_rows(ids::BOX).await.expect("read")[0]
+                    .open_blockers
+                    .clone()
+            }
+        };
+        assert_eq!(blockers(&store).await, ["FEAT-1", "TOOL-1"]);
+
+        // FEAT-1: cancel the rework, RUN_1 `done` is latest again: released, still `open`.
+        store
+            .finish_run(ids::RUN_4, RunStatus::Cancelled, None, at)
+            .await
+            .expect("cancel the rework");
+        assert_eq!(blockers(&store).await, ["TOOL-1"]);
+        assert_eq!(
+            store
+                .item(ids::HTUI_FEAT_1)
+                .await
+                .expect("read")
+                .expect("FEAT-1")
+                .status,
+            Status::Open
+        );
+
+        // A new rework run on FEAT-1 holds ANA-2 again.
+        store
+            .create_run(graph_run(ids::HTUI_FEAT_1, ids::PROJECT_HTUI, Vec::new()))
+            .await
+            .expect("a rework run");
+        assert_eq!(blockers(&store).await, ["FEAT-1", "TOOL-1"]);
     }
 
     /// MOD-12 D7, H-6: a run records its batch, and a closed or unknown batch refuses the run with
@@ -16630,9 +16816,9 @@ mod tests {
     }
 
     /// The demo store plus a second box, `LAPTOP-B`, and five edges out of `HTUI_ANA_2` (which has
-    /// none in the fixture): `blocked_by` to `TOOL-1` (awaiting approval) and `FEAT-1` (in
-    /// progress), the two open blockers; `blocked_by` to `ANA-1` (done) and, tombstoned, to
-    /// `FEAT-3` (queued); `relates` to `FEAT-2` (blocked).
+    /// none in the fixture): `blocked_by` to `TOOL-1` (needs you) and `FEAT-1` (running), the two
+    /// open blockers; `blocked_by` to `ANA-1` (done: released) and, tombstoned, to `FEAT-3`
+    /// (queued); `relates` to `FEAT-2` (blocked).
     fn queue_rows_store() -> (MemStore, BoxId) {
         let mut data = crate::fixtures::demo_data();
         let mut laptop = data
@@ -16750,9 +16936,9 @@ mod tests {
     }
 
     /// MOD-12 M3 D6: a row carries the item's latest **graph** run by `queued_at` (a chat run of
-    /// the item queued later is not the queue's run), its latest note, and the keys of its live
-    /// `blocked_by` targets that are not `done`/`closed`, in byte order. An entry with none of
-    /// them carries none.
+    /// the item queued later is not the queue's run), its latest note, the keys of its live
+    /// `blocked_by` targets that are not released (MOD-144), in byte order, and its latest
+    /// non-cancelled graph run's status. An entry with no note and no blocker carries none.
     #[tokio::test]
     async fn queue_rows_carry_the_latest_graph_run_note_and_open_blockers() {
         let (store, _) = queue_rows_store();
@@ -16809,9 +16995,16 @@ mod tests {
         );
         let ana = &rows[0];
         assert_eq!(
-            (ana.key.as_str(), ana.status, ana.priority, ana.entry.box_id),
-            ("ANA-2", Status::Queued, 0, ids::BOX)
+            (
+                ana.key.as_str(),
+                ana.status,
+                ana.priority,
+                ana.entry.box_id,
+                ana.latest_run_status
+            ),
+            ("ANA-2", Status::Open, 0, ids::BOX, Some(RunStatus::Queued))
         );
+        assert_eq!(ana.state(), crate::model::ItemState::Queued);
         assert_eq!(
             ana.latest_run,
             Some(crate::model::QueueRunFact {
@@ -16837,12 +17030,21 @@ mod tests {
             (
                 clean.key.as_str(),
                 clean.status,
-                &clean.latest_run,
+                clean.latest_run.as_ref().map(|run| (run.id, run.status)),
+                clean.latest_run_status,
                 &clean.latest_note,
                 clean.open_blockers.is_empty()
             ),
-            ("CLEAN-1", Status::Failed, &None, &None, true)
+            (
+                "CLEAN-1",
+                Status::Open,
+                Some((ids::RUN_6, RunStatus::Failed)),
+                Some(RunStatus::Failed),
+                &None,
+                true
+            )
         );
+        assert_eq!(clean.state(), crate::model::ItemState::Failed);
     }
 
     /// MOD-12 M3 D6: the latest run names its first parked step by `(position, attempt,

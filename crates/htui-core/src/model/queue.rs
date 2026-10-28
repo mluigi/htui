@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::model::box_::{BoxSettings, DEFAULT_MAX_CONCURRENT_ITEMS};
 use crate::model::ids::{BatchId, BoxId, ItemId, ProjectId, RunId, StepId, UserId, WorkspaceId};
-use crate::model::item::{ItemSummary, Status};
+use crate::model::item::{ItemState, ItemSummary, Status};
 use crate::model::quota::CapError;
 use crate::model::run::{RunMode, RunStatus};
 
@@ -240,12 +240,26 @@ pub struct QueueRow {
     pub priority: i16,
     /// `item.created_at` (D2's second tie-break).
     pub created_at: DateTime<Utc>,
-    /// The item's latest `kind = 'graph'` run by `(queued_at, id)`.
+    /// The item's latest `kind = 'graph'` run by `(queued_at, id)`, **cancelled included**: a
+    /// cancelled run settles a live one ([`classify_entry`]'s rules 1-2) and is what `Enter`
+    /// reveals. Not the run the item's state derives from; that is `latest_run_status`'s.
     pub latest_run: Option<QueueRunFact>,
     /// The body of the item's latest note by `(created_at, id)`, verbatim.
     pub latest_note: Option<String>,
-    /// The keys of its live `blocked_by` targets that are not `done`/`closed`, in byte order.
+    /// The keys of its live `blocked_by` targets that are not released (closed, or latest graph
+    /// run `done`; MOD-144), in byte order.
     pub open_blockers: Vec<String>,
+    /// MOD-144: the status of the item's latest **non-cancelled** graph run, the one
+    /// [`QueueRow::state`] derives from.
+    pub latest_run_status: Option<RunStatus>,
+}
+
+impl QueueRow {
+    /// The item's derived display state (MOD-144).
+    #[must_use]
+    pub const fn state(&self) -> ItemState {
+        ItemState::of(self.status, self.latest_run_status)
+    }
 }
 
 /// MOD-12 M3 D5: why a ready entry is not admitted this batch: the runner's own three refusals
@@ -269,8 +283,8 @@ pub enum Wait {
     CancelledInBatch,
     /// No batch is open.
     Paused,
-    /// Not ready for a reason the list above does not name: the item's status.
-    NotReady(Status),
+    /// Not ready for a reason the list above does not name: the item's derived state (MOD-144).
+    NotReady(ItemState),
 }
 
 /// MOD-12 M3 D5 (PRD hypothesis): why an entry needs a person.
@@ -304,9 +318,9 @@ pub enum Escalation {
         /// The item's latest note.
         note: Option<String>,
     },
-    /// The item is `failed`.
+    /// The item's state is `failed`: its latest graph run failed.
     Failed {
-        /// Its latest run, if any (for `Enter`).
+        /// That failed run, when it is also the latest run cancelled included (for `Enter`).
         run: Option<RunId>,
         /// That run's `failure`.
         failure: Option<String>,
@@ -431,15 +445,17 @@ pub struct QueueOverview {
 ///
 /// 1. a `queued`/`running` latest run targeted here is [`EntryState::Running`], 2. one targeted
 ///    elsewhere is [`EntryState::Elsewhere`]; a live run beats everything below;
-/// 3. a `failed` item is [`Escalation::Failed`];
+/// 3. an item whose state is `failed` (MOD-144: latest graph run `failed`) is
+///    [`Escalation::Failed`];
 /// 4. a `blocked` item whose latest run is parked is [`Escalation::ReviewLoopExhausted`],
 /// 5. any other `blocked` item is [`Escalation::Blocked`];
-/// 6. an `awaiting_approval` item whose parked run parked a step is
+/// 6. an `open` item whose latest run is parked (`needs you`) and parked a step is
 ///    [`Escalation::HardGateParked`], 7. one that parked no step is [`Escalation::JudgeUndecided`];
 /// 8. tags this box lacks are [`Escalation::MissingTags`];
 /// 9. open blockers are [`Wait::BlockedBy`];
 /// 10. a run cancelled in the open batch is [`Wait::CancelledInBatch`];
-/// 11. an item `ready_items` does not hold is [`Wait::NotReady`];
+/// 11. an item `ready_items` does not hold is [`Wait::NotReady`], carrying its [`ItemState`] (a
+///     `stopped` latest run lands here);
 /// 12. a closed batch is [`Wait::Paused`];
 /// 13. a [`Hold`] on the item's project is [`EntryState::Held`];
 /// 14. otherwise [`EntryState::Next`].
@@ -468,20 +484,26 @@ pub fn classify_entry(row: &QueueRow, here: BoxId, live: &LiveFacts) -> EntrySta
     }
     let parked = latest.filter(|run| run.status == RunStatus::AwaitingApproval);
     let note = || row.latest_note.clone();
-    let escalation = match (row.status, parked) {
-        (Status::Failed, _) => Some(Escalation::Failed {
-            run: latest.map(|run| run.id),
-            failure: latest.and_then(|run| run.failure.clone()),
-        }),
-        (Status::Blocked, Some(run)) => Some(Escalation::ReviewLoopExhausted {
+    let state = row.state();
+    let escalation = match (row.status, state, parked) {
+        (_, ItemState::Failed, _) => {
+            // PD6: `latest_run` keeps cancelled runs; it names the failure only when it is the
+            // failed run itself.
+            let failed = latest.filter(|run| run.status == RunStatus::Failed);
+            Some(Escalation::Failed {
+                run: failed.map(|run| run.id),
+                failure: failed.and_then(|run| run.failure.clone()),
+            })
+        }
+        (Status::Blocked, _, Some(run)) => Some(Escalation::ReviewLoopExhausted {
             run: run.id,
             note: note(),
         }),
-        (Status::Blocked, None) => Some(Escalation::Blocked {
+        (Status::Blocked, _, None) => Some(Escalation::Blocked {
             run: latest.map(|run| run.id),
             note: note(),
         }),
-        (Status::AwaitingApproval, Some(run)) => Some(match run.parked_step {
+        (Status::Open, ItemState::NeedsYou, Some(run)) => Some(match run.parked_step {
             Some(step) => Escalation::HardGateParked { run: run.id, step },
             None => Escalation::JudgeUndecided {
                 run: run.id,
@@ -504,7 +526,7 @@ pub fn classify_entry(row: &QueueRow, here: BoxId, live: &LiveFacts) -> EntrySta
         return EntryState::Waiting(Wait::CancelledInBatch);
     }
     if !live.ready.contains(&item) {
-        return EntryState::Waiting(Wait::NotReady(row.status));
+        return EntryState::Waiting(Wait::NotReady(state));
     }
     if live.paused {
         return EntryState::Waiting(Wait::Paused);
@@ -550,7 +572,7 @@ impl core::fmt::Display for Wait {
                 f.write_str("cancelled in this batch; the next batch runs it")
             }
             Self::Paused => f.write_str("queue paused"),
-            Self::NotReady(status) => write!(f, "not ready: item is {}", status.as_str()),
+            Self::NotReady(state) => write!(f, "not ready: item is {}", state.word()),
         }
     }
 }
@@ -634,6 +656,7 @@ mod tests {
             required_tags: Vec::new(),
             updated_at: DateTime::UNIX_EPOCH,
             touched_paths: Vec::new(),
+            latest_run_status: None,
         }
     }
 
@@ -796,7 +819,7 @@ mod tests {
         BoxId::from_uuid(uuid::Uuid::from_u128(2))
     }
 
-    fn row(status: Status) -> QueueRow {
+    fn row(status: Status, latest_run_status: Option<RunStatus>) -> QueueRow {
         QueueRow {
             entry: entry(ItemId::new(), None),
             key: "FIX-1".to_owned(),
@@ -807,6 +830,7 @@ mod tests {
             latest_run: None,
             latest_note: None,
             open_blockers: Vec::new(),
+            latest_run_status,
         }
     }
 
@@ -873,7 +897,7 @@ mod tests {
 
     #[test]
     fn a_live_run_here_reads_running_and_a_queued_one_admitted() {
-        let mut item = row(Status::InProgress);
+        let mut item = row(Status::Open, Some(RunStatus::Running));
         let running = run(RunStatus::Running, here());
         item.latest_run = Some(running.clone());
         let state = classify_entry(&item, here(), &facts(&item));
@@ -887,7 +911,7 @@ mod tests {
         assert_eq!(state.to_string(), "running here");
 
         let queued = run(RunStatus::Queued, here());
-        item.status = Status::Queued;
+        item.latest_run_status = Some(RunStatus::Queued);
         item.latest_run = Some(queued.clone());
         let state = classify_entry(&item, here(), &facts(&item));
         assert_eq!(
@@ -902,7 +926,9 @@ mod tests {
 
     #[test]
     fn a_live_run_elsewhere_beats_everything() {
-        let mut item = row(Status::Failed);
+        // The latest non-cancelled run says `failed`, yet a live run elsewhere still wins: the
+        // cancelled-included latest run is what rules 1-2 read.
+        let mut item = row(Status::Open, Some(RunStatus::Failed));
         item.open_blockers = vec!["FEAT-1".to_owned()];
         let mut live = facts(&item);
         live.missing_tags
@@ -947,7 +973,7 @@ mod tests {
 
     #[test]
     fn a_failed_item_reads_failed_even_with_an_open_blocker() {
-        let mut item = row(Status::Failed);
+        let mut item = row(Status::Open, Some(RunStatus::Failed));
         item.open_blockers = vec!["FEAT-1".to_owned()];
         let mut failed = run(RunStatus::Failed, here());
         failed.failure = Some("boom\nat line 3".to_owned());
@@ -975,9 +1001,26 @@ mod tests {
         assert_eq!(state.to_string(), "failed");
     }
 
+    /// PD6: a cancel after a failure leaves the state `failed` (cancelled runs are skipped), but
+    /// the cancelled-included latest run is not the failed one, so no run is named.
+    #[test]
+    fn a_cancel_after_a_failure_still_reads_failed_without_a_run() {
+        let mut item = row(Status::Open, Some(RunStatus::Failed));
+        item.latest_run = Some(run(RunStatus::Cancelled, here()));
+        let state = classify_entry(&item, here(), &facts(&item));
+        assert_eq!(
+            state,
+            EntryState::Escalated(Escalation::Failed {
+                run: None,
+                failure: None
+            })
+        );
+        assert_eq!(state.to_string(), "failed");
+    }
+
     #[test]
     fn a_blocked_item_with_a_parked_run_reads_review_loop_exhausted() {
-        let mut item = row(Status::Blocked);
+        let mut item = row(Status::Blocked, Some(RunStatus::AwaitingApproval));
         let parked = run(RunStatus::AwaitingApproval, here());
         item.latest_run = Some(parked.clone());
         item.latest_note = Some("review loop exhausted after 3 attempts".to_owned());
@@ -1003,7 +1046,7 @@ mod tests {
 
     #[test]
     fn a_blocked_item_without_a_parked_run_reads_blocked() {
-        let mut item = row(Status::Blocked);
+        let mut item = row(Status::Blocked, None);
         let state = classify_entry(&item, here(), &facts(&item));
         assert_eq!(
             state,
@@ -1016,6 +1059,7 @@ mod tests {
 
         let done = run(RunStatus::Done, here());
         item.latest_run = Some(done.clone());
+        item.latest_run_status = Some(RunStatus::Done);
         item.latest_note = Some("no_candidate_agent: phase `research`".to_owned());
         let state = classify_entry(&item, here(), &facts(&item));
         assert_eq!(
@@ -1033,7 +1077,7 @@ mod tests {
 
     #[test]
     fn awaiting_approval_with_a_parked_step_reads_hard_gate_parked() {
-        let mut item = row(Status::AwaitingApproval);
+        let mut item = row(Status::Open, Some(RunStatus::AwaitingApproval));
         let mut parked = run(RunStatus::AwaitingApproval, here());
         let step = StepId::new();
         parked.parked_step = Some(step);
@@ -1052,7 +1096,7 @@ mod tests {
 
     #[test]
     fn awaiting_approval_without_a_parked_step_reads_judge_undecided() {
-        let mut item = row(Status::AwaitingApproval);
+        let mut item = row(Status::Open, Some(RunStatus::AwaitingApproval));
         let parked = run(RunStatus::AwaitingApproval, here());
         item.latest_run = Some(parked.clone());
         let note = "fan-out `p` attempt 2 awaits selection: 3 candidates";
@@ -1078,16 +1122,13 @@ mod tests {
     }
 
     #[test]
-    fn awaiting_approval_without_a_parked_run_is_not_ready() {
-        let mut item = row(Status::AwaitingApproval);
+    fn a_done_item_is_not_ready() {
+        let mut item = row(Status::Open, Some(RunStatus::Done));
         item.latest_run = Some(run(RunStatus::Done, here()));
         let state = classify_entry(&item, here(), &LiveFacts::default());
-        assert_eq!(
-            state,
-            EntryState::Waiting(Wait::NotReady(Status::AwaitingApproval))
-        );
+        assert_eq!(state, EntryState::Waiting(Wait::NotReady(ItemState::Done)));
         assert!(!state.is_escalated());
-        assert_eq!(state.to_string(), "not ready: item is awaiting_approval");
+        assert_eq!(state.to_string(), "not ready: item is done");
     }
 
     #[test]
@@ -1099,27 +1140,27 @@ mod tests {
             live
         };
 
-        let mut failed = row(Status::Failed);
+        let mut failed = row(Status::Open, Some(RunStatus::Failed));
         failed.latest_run = Some(run(RunStatus::Failed, here()));
         assert!(matches!(
             classify_entry(&failed, here(), &tagged(&failed)),
             EntryState::Escalated(Escalation::Failed { .. })
         ));
 
-        let mut exhausted = row(Status::Blocked);
+        let mut exhausted = row(Status::Blocked, Some(RunStatus::AwaitingApproval));
         exhausted.latest_run = Some(run(RunStatus::AwaitingApproval, here()));
         assert!(matches!(
             classify_entry(&exhausted, here(), &tagged(&exhausted)),
             EntryState::Escalated(Escalation::ReviewLoopExhausted { .. })
         ));
 
-        let blocked = row(Status::Blocked);
+        let blocked = row(Status::Blocked, None);
         assert!(matches!(
             classify_entry(&blocked, here(), &tagged(&blocked)),
             EntryState::Escalated(Escalation::Blocked { .. })
         ));
 
-        let mut gate = row(Status::AwaitingApproval);
+        let mut gate = row(Status::Open, Some(RunStatus::AwaitingApproval));
         let mut parked = run(RunStatus::AwaitingApproval, here());
         parked.parked_step = Some(StepId::new());
         gate.latest_run = Some(parked);
@@ -1128,7 +1169,7 @@ mod tests {
             EntryState::Escalated(Escalation::HardGateParked { .. })
         ));
 
-        let mut judge = row(Status::AwaitingApproval);
+        let mut judge = row(Status::Open, Some(RunStatus::AwaitingApproval));
         judge.latest_run = Some(run(RunStatus::AwaitingApproval, here()));
         assert!(matches!(
             classify_entry(&judge, here(), &tagged(&judge)),
@@ -1138,7 +1179,7 @@ mod tests {
 
     #[test]
     fn missing_tags_beat_an_open_blocker() {
-        let mut item = row(Status::Open);
+        let mut item = row(Status::Open, None);
         item.open_blockers = vec!["FEAT-1".to_owned()];
         let mut live = LiveFacts::default();
         live.missing_tags.insert(
@@ -1165,7 +1206,7 @@ mod tests {
 
     #[test]
     fn an_open_blocker_reads_waiting_on_its_keys() {
-        let mut item = row(Status::Open);
+        let mut item = row(Status::Open, None);
         item.open_blockers = vec!["FEAT-1".to_owned(), "FEAT-2".to_owned()];
         let state = classify_entry(&item, here(), &facts(&item));
         assert_eq!(
@@ -1180,7 +1221,7 @@ mod tests {
 
     #[test]
     fn cancelled_in_batch_reads_waiting() {
-        let item = row(Status::Open);
+        let item = row(Status::Open, None);
         let mut live = facts(&item);
         live.cancelled.insert(item.entry.item_id);
         live.holds.insert(item.entry.project_id, budget_hold());
@@ -1194,7 +1235,7 @@ mod tests {
 
     #[test]
     fn a_paused_queue_reads_paused_for_ready_entries_only() {
-        let item = row(Status::Open);
+        let item = row(Status::Open, None);
         let mut live = facts(&item);
         live.paused = true;
         let state = classify_entry(&item, here(), &live);
@@ -1204,13 +1245,13 @@ mod tests {
         live.ready.clear();
         assert_eq!(
             classify_entry(&item, here(), &live),
-            EntryState::Waiting(Wait::NotReady(Status::Open))
+            EntryState::Waiting(Wait::NotReady(ItemState::Open))
         );
     }
 
     #[test]
     fn held_only_for_ready_entries_of_an_open_batch() {
-        let item = row(Status::Open);
+        let item = row(Status::Open, None);
         let mut live = facts(&item);
         live.holds.insert(item.entry.project_id, budget_hold());
         let state = classify_entry(&item, here(), &live);
@@ -1234,7 +1275,7 @@ mod tests {
         not_ready.ready.clear();
         assert_eq!(
             classify_entry(&item, here(), &not_ready),
-            EntryState::Waiting(Wait::NotReady(Status::Open))
+            EntryState::Waiting(Wait::NotReady(ItemState::Open))
         );
 
         live.holds
@@ -1260,7 +1301,7 @@ mod tests {
 
     #[test]
     fn a_ready_admissible_entry_reads_next() {
-        let item = row(Status::Open);
+        let item = row(Status::Open, None);
         let state = classify_entry(&item, here(), &facts(&item));
         assert_eq!(state, EntryState::Next);
         assert!(!state.is_escalated());
@@ -1269,7 +1310,7 @@ mod tests {
 
     #[test]
     fn a_settled_live_run_does_not_shadow_the_item() {
-        let mut item = row(Status::Open);
+        let mut item = row(Status::Open, None);
         item.latest_run = Some(run(RunStatus::Cancelled, there()));
         assert_eq!(
             classify_entry(&item, here(), &facts(&item)),
@@ -1277,16 +1318,19 @@ mod tests {
             "a cancelled run elsewhere is not live"
         );
 
-        item.status = Status::InProgress;
+        // A stopped latest run is live but neither queued nor running: rules 1-2 pass it by,
+        // and the item waits as `stopped`.
+        item.latest_run = Some(run(RunStatus::Stopped, there()));
+        item.latest_run_status = Some(RunStatus::Stopped);
         assert_eq!(
             classify_entry(&item, here(), &LiveFacts::default()).to_string(),
-            "not ready: item is in_progress"
+            "not ready: item is stopped"
         );
     }
 
     #[test]
     fn a_multi_line_note_shows_its_first_line() {
-        let mut item = row(Status::Blocked);
+        let mut item = row(Status::Blocked, None);
         item.latest_note = Some("first\nsecond".to_owned());
         assert_eq!(
             classify_entry(&item, here(), &facts(&item)).to_string(),
