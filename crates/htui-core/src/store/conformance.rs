@@ -5381,7 +5381,6 @@ pub fn assert_leased_for(case: &str, run: &Run, ttl: TimeDelta, what: &str) {
     );
 }
 
-/// The item row, or a panic naming the case.
 /// MOD-144: the item's derived display state, read the way a client reads it: the stored status
 /// over the latest non-cancelled graph run of `runs(item)`.
 async fn state_of<S: ReadStore>(case: &str, store: &S, item: ItemId) -> ItemState {
@@ -5398,6 +5397,7 @@ fn not_startable(state: ItemState) -> String {
     illegal_move("item", state, "queued")
 }
 
+/// The item row, or a panic naming the case.
 async fn item_row<S: ReadStore>(case: &str, store: &S, item: ItemId) -> Item {
     store
         .item(item)
