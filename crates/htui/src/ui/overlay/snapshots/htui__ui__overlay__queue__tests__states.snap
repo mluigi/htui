@@ -20,7 +20,7 @@ expression: bench.render(&overlay)
   │  QX-10  entry 10  waiting on FEAT-1, FEAT-2                                                  │
   │  QX-11  entry 11  cancelled in this batch; the next batch runs it                            │
   │  QX-12  entry 12  queue paused                                                               │
-  │  QX-13  entry 13  not ready: item is in_progress                                             │
+  │  QX-13  entry 13  not ready: item is done                                                    │
   │  QX-14  entry 14  hard gate parked                                                           │
   │  QX-15  entry 15  judge undecided (last note: pick a branch)                                 │
   │  QX-16  entry 16  review loop exhausted                                                      │

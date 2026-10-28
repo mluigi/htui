@@ -2,21 +2,21 @@
 source: crates/htui/tests/backlog.rs
 expression: frame
 ---
-Platform   ¹Backlog            1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
+Platform   ¹Backlog            2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
 ┌ Backlog (11) ───────────────────────────────────────┐┌ New item · htui ──────────────────────────┐
 │▾ htui (8)                                           ││  project  ‹htui›                          │
-│  ANA-1    done               Data model, box regist…││  kind     ‹ANA analysis›                  │
-│  ANA-2    open               Orchestrator step grap…││> title    Fresh item                      │
-│  CLEAN-1  failed             Drop the legacy markdo…││  priority 0                               │
-│  FEAT-1   in_progress        TUI scaffold           ││  tags                                     │
-│  FEAT-2   blocked            Agent driver and chat …││  graph    ‹kind default›                  │
-│  FEAT-3   queued             Postgres store and cac…││  paths (one per line)                     │
-│  FIX-1    closed             Terminal left raw afte…││                                           │
-│  TOOL-1   awaiting_approval  CI matrix for the thre…││                                           │
+│  ANA-1    ● done       Data model, box registry and…││  kind     ‹ANA analysis›                  │
+│  ANA-2    ○ open       Orchestrator step graphs and…││> title    Fresh item                      │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││  priority 0                               │
+│  FEAT-1   ◐ running    TUI scaffold                 ││  tags                                     │
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││  graph    ‹kind default›                  │
+│  FEAT-3   ◌ queued     Postgres store and cache     ││  paths (one per line)                     │
+│  FIX-1    ✓ closed     Terminal left raw after panic││                                           │
+│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││                                           │
 │▾ agy (3)                                            ││                                           │
-│  ANA-1    done               Prompt assembly survey ││  body                                     │
-│  FEAT-1   open               ACP transport upgrade  ││                                           │
-│  FIX-1    open               Session leak on cancel ││                                           │
+│  ANA-1    ● done       Prompt assembly survey       ││  body                                     │
+│  FEAT-1   ○ open       ACP transport upgrade        ││                                           │
+│  FIX-1    ○ open       Session leak on cancel       ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │

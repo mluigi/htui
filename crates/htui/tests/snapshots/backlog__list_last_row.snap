@@ -2,21 +2,21 @@
 source: crates/htui/tests/backlog.rs
 expression: last
 ---
-Platform   ¹Backlog             1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
+Platform   ¹Backlog             2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
 ┌ Backlog (11) ───────────────────────────────────────┐┌ FIX-1 ────────────────────────────────────┐
 │▾ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │
-│  ANA-1    done               Data model, box regist…││Session leak on cancel                     │
-│  ANA-2    open               Orchestrator step grap…││FIX-1  FIX  open                           │
-│  CLEAN-1  failed             Drop the legacy markdo…││no tags · priority 0 · version 1           │
-│  FEAT-1   in_progress        TUI scaffold           ││                                           │
-│  FEAT-2   blocked            Agent driver and chat …││No body for this item.                     │
-│  FEAT-3   queued             Postgres store and cac…││                                           │
-│  FIX-1    closed             Terminal left raw afte…││                                           │
-│  TOOL-1   awaiting_approval  CI matrix for the thre…││                                           │
+│  ANA-1    ● done       Data model, box registry and…││Session leak on cancel                     │
+│  ANA-2    ○ open       Orchestrator step graphs and…││FIX-1  FIX  ○ open                         │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││no tags · priority 0 · version 1           │
+│  FEAT-1   ◐ running    TUI scaffold                 ││                                           │
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││No body for this item.                     │
+│  FEAT-3   ◌ queued     Postgres store and cache     ││                                           │
+│  FIX-1    ✓ closed     Terminal left raw after panic││                                           │
+│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││                                           │
 │▾ agy (3)                                            ││                                           │
-│  ANA-1    done               Prompt assembly survey ││                                           │
-│  FEAT-1   open               ACP transport upgrade  ││                                           │
-│  FIX-1    open               Session leak on cancel ││                                           │
+│  ANA-1    ● done       Prompt assembly survey       ││                                           │
+│  FEAT-1   ○ open       ACP transport upgrade        ││                                           │
+│  FIX-1    ○ open       Session leak on cancel       ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │

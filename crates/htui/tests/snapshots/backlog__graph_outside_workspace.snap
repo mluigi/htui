@@ -5,18 +5,18 @@ expression: frame
 Platform   ¹Backlog                                vulkan-tutorials:FEAT-1 is outside this workspace
 ┌ Backlog (11) ───────────────────────────────────────┐┌ FIX-1 ────────────────────────────────────┐
 │▾ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │
-│  ANA-1    done               Data model, box regist…││  FIX-1 open Session leak on cancel        │
-│  ANA-2    open               Orchestrator step grap…││  → blocked_by ANA-1 done Prompt assembly …│
-│  CLEAN-1  failed             Drop the legacy markdo…││    → blocked_by htui:ANA-1 done Data mode…│
-│  FEAT-1   in_progress        TUI scaffold           ││▸ → origin vulkan-tutor…:FEAT-1 in_progress│
-│  FEAT-2   blocked            Agent driver and chat …││  → origin htui:TOOL-1 awaiting_approval   │
-│  FEAT-3   queued             Postgres store and cac…││    → blocked_by htui:ANA-1 done (*)       │
-│  FIX-1    closed             Terminal left raw afte…││                                           │
-│  TOOL-1   awaiting_approval  CI matrix for the thre…││                                           │
+│  ANA-1    ● done       Data model, box registry and…││  FIX-1 ○ open Session leak on cancel      │
+│  ANA-2    ○ open       Orchestrator step graphs and…││  → blocked_by ANA-1 ● done Prompt assembl…│
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││    → blocked_by htui:ANA-1 ● done Data mo…│
+│  FEAT-1   ◐ running    TUI scaffold                 ││▸ → origin vulkan-tutoria…:FEAT-1 ■ stopped│
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││  → origin htui:TOOL-1 ⚠ needs you CI matr…│
+│  FEAT-3   ◌ queued     Postgres store and cache     ││    → blocked_by htui:ANA-1 ● done (*)     │
+│  FIX-1    ✓ closed     Terminal left raw after panic││                                           │
+│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││                                           │
 │▾ agy (3)                                            ││                                           │
-│  ANA-1    done               Prompt assembly survey ││                                           │
-│  FEAT-1   open               ACP transport upgrade  ││                                           │
-│  FIX-1    open               Session leak on cancel ││                                           │
+│  ANA-1    ● done       Prompt assembly survey       ││                                           │
+│  FEAT-1   ○ open       ACP transport upgrade        ││                                           │
+│  FIX-1    ○ open       Session leak on cancel       ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │

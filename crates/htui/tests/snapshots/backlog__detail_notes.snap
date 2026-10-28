@@ -2,21 +2,21 @@
 source: crates/htui/tests/backlog.rs
 expression: harness.render()
 ---
-Platform   ¹Backlog    1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys · ⌫ back
+Platform   ¹Backlog    2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys · ⌫ back
 ┌ Backlog (11) ───────────────────────────────────────┐┌ FEAT-1 ───────────────────────────────────┐
 │▾ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │
-│  ANA-1    done               Data model, box regist…││09-02 09:00                                │
-│  ANA-2    open               Orchestrator step grap…││Skeleton only — filters, actions and       │
-│  CLEAN-1  failed             Drop the legacy markdo…││editing are MOD-13.                        │
-│  FEAT-1   in_progress        TUI scaffold           ││                                           │
-│  FEAT-2   blocked            Agent driver and chat …││09-02 14:00                                │
-│  FEAT-3   queued             Postgres store and cac…││Snapshot sizes fixed at 100x30.            │
-│  FIX-1    closed             Terminal left raw afte…││                                           │
-│  TOOL-1   awaiting_approval  CI matrix for the thre…││                                           │
+│  ANA-1    ● done       Data model, box registry and…││09-02 09:00                                │
+│  ANA-2    ○ open       Orchestrator step graphs and…││Skeleton only — filters, actions and       │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││editing are MOD-13.                        │
+│  FEAT-1   ◐ running    TUI scaffold                 ││                                           │
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││09-02 14:00                                │
+│  FEAT-3   ◌ queued     Postgres store and cache     ││Snapshot sizes fixed at 100x30.            │
+│  FIX-1    ✓ closed     Terminal left raw after panic││                                           │
+│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││                                           │
 │▾ agy (3)                                            ││                                           │
-│  ANA-1    done               Prompt assembly survey ││                                           │
-│  FEAT-1   open               ACP transport upgrade  ││                                           │
-│  FIX-1    open               Session leak on cancel ││                                           │
+│  ANA-1    ● done       Prompt assembly survey       ││                                           │
+│  FEAT-1   ○ open       ACP transport upgrade        ││                                           │
+│  FIX-1    ○ open       Session leak on cancel       ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
