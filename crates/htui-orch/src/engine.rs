@@ -37,9 +37,9 @@ use htui_core::model::{
     Document, DocumentId, EventKind, FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED, Gate,
     GateOutcome, GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote, NewRun,
     NewRunStep, NoteId, Project, ProjectId, ProjectSettings, PromptScope, RelaySessionId, Repo,
-    RepoId, Resolution, Run, RunId, RunKind, RunStatus, RunStep, RunStepCommit, RunStepTree,
-    RunSummary, SessionEvent, SnapshotCandidate, SnapshotPersona, SnapshotPhase, SnapshotTemplate,
-    Status, StepFiles, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UserId,
+    RepoId, Resolution, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary,
+    SessionEvent, SnapshotCandidate, SnapshotPersona, SnapshotPhase, SnapshotTemplate, Status,
+    StepFiles, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UserId,
     VerifyOutcome, WorkspaceId, min_budget_micros, missing_tags_failure,
 };
 use htui_core::prompt::excerpt::{
@@ -720,18 +720,9 @@ where
         // MOD-144 (PD1): `create_run`'s own law first (`startable`: `open` and no live graph run),
         // so neither the tag check nor rung 4 writes a note on, or blocks, an item some live run
         // already holds, and a refused item writes no note (D98). `create_run` re-checks it under
-        // the item lock and stays the authority (MOD-7 D98). This read takes no lock, so a run
-        // another box creates after it can still be blocked over: see `refuse_rung_four`.
-        let live = self
-            .parts
-            .store
-            .runs(item.id)
-            .await?
-            .into_iter()
-            .filter(|run| run.kind == RunKind::Graph && run.status.is_active())
-            .max_by_key(|run| (run.queued_at, run.id))
-            .map(|run| run.status);
-        htui_core::store::startable(item.status, live)?;
+        // the item lock and stays the authority (MOD-7 D98). This read takes no lock; a run
+        // another box creates after it is caught by the refusals' own `block_if_idle`.
+        crate::command::start_enabled(&item, &self.parts.store.runs(item.id).await?)?;
         // R-ORCH-10 at queue time (MOD-7 milestone 3, D79): before resolution, so an item that
         // lacks tags *and* has no candidate is refused for the tags, the cheaper box-level fact.
         let missing = self
@@ -863,55 +854,37 @@ where
     }
 
     /// Plan D62's rung 4 at `StartRun`: no run row exists, so the refusal is written to the item —
-    /// `open -> blocked`, then ``no_candidate_agent: phase `<p>` `` as a note — and handed back for
-    /// the caller to raise. Only an item `startable` admitted reaches here (PD1), so the move
-    /// normally lands; `Ok(false)` means another writer moved the item's status since (a close,
-    /// a block), and the note is still written: a refusal nobody can read is what invariant 7
-    /// forbids.
-    ///
-    /// Known race (MOD-144): `startable` was read without the item lock, and `create_run` no
-    /// longer writes the item row, so a live run another box creates between that read and this
-    /// compare-and-set does not make it return `Ok(false)`. The item is then `blocked` over a
-    /// walking run: `Unblock` refuses with `run_is_walking` and retry/promote with `ItemBlocked`
-    /// until the run parks (`Unblock`'s `FollowRun` then moves it `blocked -> open`) or ends
-    /// (`Reopen`). It needs two boxes to start the same item at once, one of them refusing.
-    /// Closing it needs a store-side guard (the move conditional on no live graph run), which is
-    /// the store's scope, not the engine's.
+    /// ``no_candidate_agent: phase `<p>` `` as a note and `open -> blocked` — and handed back for
+    /// the caller to raise. One [`block_if_idle`](htui_core::store::WriteStore::block_if_idle)
+    /// call (MOD-144 R1): it takes the item's lock before it reads the item's runs, so a live run
+    /// another box created since `startable`'s lock-free read (`create_run` no longer writes the
+    /// item) makes it write nothing (D98: the run holds the item), and the refusal is still
+    /// raised here. An item another writer moved since (a close, a block) keeps its status and
+    /// still gets the note: a refusal nobody can read is what invariant 7 forbids.
     async fn refuse_rung_four(
         &self,
         item: &Item,
         phase: String,
     ) -> Result<ResolveError, EngineError> {
-        self.parts
-            .store
-            .transition(item.id, Status::Open, Status::Blocked)
-            .await?;
         let failure = RunFailure::NoCandidateAgent {
             phase: phase.clone(),
             detail: String::new(),
         };
-        self.note(item.id, failure.to_string(), None, self.now())
-            .await?;
+        self.block_if_idle(item.id, failure.to_string()).await?;
         Ok(ResolveError::NoCandidate { phase })
     }
 
     /// `R-ORCH-10` at `StartRun` (MOD-7 milestone 3, D79, D82): no run row exists, so the refusal
-    /// is written to the item, `open -> blocked` and then `missing tags: a, b` as a note on this
-    /// box, and handed back. Only an item `startable` admitted reaches here (PD1), so the move
-    /// normally lands; `Ok(false)` means another writer moved the item's status since, and the
-    /// note is still written (rung 4's rule; invariant 7). The same known race as
-    /// [`Self::refuse_rung_four`]'s applies: a live run created by another box after the
-    /// `startable` read does not stop the move.
+    /// is written to the item, `missing tags: a, b` as a note on this box and `open -> blocked`,
+    /// and handed back. The write is [`Self::refuse_rung_four`]'s one `block_if_idle` call, with
+    /// its rules: nothing over a live run another box created since `startable`'s read (D98), the
+    /// note on an item another writer moved (invariant 7).
     async fn refuse_missing_tags(
         &self,
         item: &Item,
         missing: Vec<String>,
     ) -> Result<EngineError, EngineError> {
-        self.parts
-            .store
-            .transition(item.id, Status::Open, Status::Blocked)
-            .await?;
-        self.note(item.id, missing_tags_failure(&missing), None, self.now())
+        self.block_if_idle(item.id, missing_tags_failure(&missing))
             .await?;
         Ok(EngineError::MissingTags {
             item: item.id,
@@ -3536,6 +3509,26 @@ where
             phase.name, chosen.agent_name, chosen.model
         );
         self.note(item, body, None, self.now()).await
+    }
+
+    /// A `StartRun` refusal written by [`WorkerStore::block_if_idle`]: `body` as an `item_note` by
+    /// this engine's user on this engine's box and `open -> blocked`, unless a live graph run
+    /// holds the item by the time the store has its lock, which writes nothing (MOD-144 R1, D98).
+    /// `Ok(false)` is that case; the callers raise their refusal either way.
+    async fn block_if_idle(&self, item: ItemId, body: String) -> Result<bool, EngineError> {
+        Ok(self
+            .parts
+            .store
+            .block_if_idle(NewNote {
+                id: NoteId::new(),
+                item_id: item,
+                body,
+                created_by: self.parts.user,
+                box_id: Some(self.parts.box_id),
+                via_step_id: None,
+                created_at: self.now(),
+            })
+            .await?)
     }
 
     /// One `item_note` by this engine's user on this engine's box.
@@ -14791,6 +14784,66 @@ mod tests {
         );
     }
 
+    /// MOD-144 R1 (M1): rung 4's and the tag check's refusals write through `block_if_idle`, so a
+    /// live run that holds the item by the time of the write (another box's `create_run` landing
+    /// after `startable`'s lock-free read) leaves it `open` with no note, and the refusal is
+    /// still answered. `FEAT-3`'s seeded `queued` `RUN_2` stands in for that run: `enqueue`'s own
+    /// `startable` read would refuse first, so the two refusals are called directly. A plain
+    /// `transition(open -> blocked)` would block it.
+    #[tokio::test]
+    async fn a_startrun_refusal_writes_nothing_over_a_live_run() {
+        let harness = Harness::new().await;
+        let item = harness.orch.item(ids::HTUI_FEAT_3).await;
+        assert_eq!(
+            harness.orch.state(ids::HTUI_FEAT_3).await,
+            ItemState::Queued,
+            "control: a live run holds FEAT-3"
+        );
+        let notes_before = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .len();
+        harness_engine!(harness.orch, engine);
+
+        let rung_four = engine
+            .refuse_rung_four(&item, "implement".to_owned())
+            .await
+            .expect("the refusal is answered");
+        assert!(
+            matches!(&rung_four,
+                crate::graph::ResolveError::NoCandidate { phase } if phase == "implement"),
+            "{rung_four:?}"
+        );
+        let tags = engine
+            .refuse_missing_tags(&item, vec!["vulkan".to_owned()])
+            .await
+            .expect("the refusal is answered");
+        assert!(
+            matches!(&tags, EngineError::MissingTags { run: None, .. }),
+            "{tags:?}"
+        );
+
+        assert_eq!(
+            harness.orch.item(ids::HTUI_FEAT_3).await.status,
+            Status::Open,
+            "an item a live run holds is never blocked"
+        );
+        assert_eq!(
+            harness
+                .orch
+                .store
+                .notes(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .len(),
+            notes_before,
+            "and gets no note (D98)"
+        );
+    }
+
     /// MOD-7 milestone 3 D98 (blueprint H-7), MOD-144 PD1: only an item `create_run` would accept
     /// is checked. `FEAT-3` seeded `open` under a live `queued` `RUN_2` meets `startable`'s own
     /// refusal, with no note, and is **not** blocked: its run is walking.
@@ -14813,7 +14866,7 @@ mod tests {
             .expect_err("a queued item admits no second run");
         assert!(
             matches!(&refused, EngineError::Store(htui_core::store::StoreError::Constraint(sentence))
-                if *sentence == htui_core::store::illegal_move("item", ItemState::Queued, "queued")),
+                if *sentence == htui_core::store::not_startable("FEAT-3", ItemState::Queued)),
             "`startable`'s refusal, not the tags: {refused:?}"
         );
         assert_eq!(

@@ -27,8 +27,8 @@ use std::path::PathBuf;
 use htui_agent::driver::AgentSessionRef;
 use htui_core::model::{
     AgentId, Claim, DocumentId, GraphSnapshot, Item, ItemId, ItemState, RepoId, Resolution, Run,
-    RunId, RunKind, RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId, StepStatus,
-    WorkspaceId, latest_graph_run,
+    RunFacts, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId, StepStatus,
+    WorkspaceId, latest_graph_run, latest_live_graph_run,
 };
 use htui_core::prompt::AssembleError;
 use htui_core::store::StoreError;
@@ -1307,15 +1307,17 @@ pub fn cleanup_enabled(run: &Run) -> Result<(), EngineError> {
 /// **The engine does not call it** for the decision: `create_run` refuses under the item lock and
 /// stays the authority. `start_enabled_is_the_law` pins the two together.
 ///
+/// Generic over [`RunFacts`], so the engine's `enqueue_with` passes the `RunSummary` rows it reads
+/// and the worker's views the `Run` rows they hold, neither copied.
+///
 /// # Errors
 /// [`EngineError::Store`] carrying `startable`'s own refusal.
-pub fn start_enabled(item: &Item, runs: &[Run]) -> Result<(), EngineError> {
-    let live = runs
-        .iter()
-        .filter(|run| run.kind == RunKind::Graph && run.status.is_active())
-        .max_by_key(|run| (run.queued_at, run.id))
-        .map(|run| run.status);
-    htui_core::store::startable(item.status, live).map_err(EngineError::Store)
+pub fn start_enabled<'a, R: RunFacts + 'a>(
+    item: &Item,
+    runs: impl IntoIterator<Item = &'a R>,
+) -> Result<(), EngineError> {
+    let live = latest_live_graph_run(runs).map(RunFacts::run_status);
+    htui_core::store::startable(&item.key, item.status, live).map_err(EngineError::Store)
 }
 
 #[cfg(test)]
@@ -1325,7 +1327,7 @@ mod tests {
         Claim, GateOutcome, GraphSnapshot, Item, ItemState, OverlapRule, Resolution, Run, RunKind,
         RunStatus, RunStep, SnapshotPhase, Status, StepStatus,
     };
-    use htui_core::store::{StoreError, illegal_move};
+    use htui_core::store::{StoreError, not_startable};
 
     use htui_core::model::StepId;
 
@@ -2510,12 +2512,13 @@ mod tests {
                 );
                 assert_eq!(
                     admitted.is_ok(),
-                    htui_core::store::startable(status, live).is_ok()
+                    htui_core::store::startable(&item.key, status, live).is_ok()
                 );
                 if let Err(refused) = admitted {
+                    let expected = not_startable(&item.key, ItemState::of(status, live));
                     assert!(
                         matches!(&refused, EngineError::Store(StoreError::Constraint(sentence))
-                            if *sentence == illegal_move("item", ItemState::of(status, live), "queued")),
+                            if *sentence == expected),
                         "startable's own refusal: {refused}"
                     );
                 }
@@ -2534,5 +2537,28 @@ mod tests {
         let mut chat = newer(RunStatus::Running, 0);
         chat.kind = RunKind::Chat;
         assert!(start_enabled(&item, &[chat]).is_ok(), "a live chat run");
+
+        // The engine's `enqueue_with` passes the store's summaries: the same law over `RunSummary`.
+        let summary = |status: RunStatus| {
+            let run = newer(status, 0);
+            htui_core::model::RunSummary {
+                id: run.id,
+                item_id: run.item_id,
+                project_id: run.project_id,
+                kind: run.kind,
+                mode: run.mode,
+                status,
+                target_box_id: run.target_box_id,
+                executing_box_id: None,
+                box_hostname: String::new(),
+                queued_at: run.queued_at,
+                started_at: None,
+                finished_at: None,
+                failure: None,
+                steps: Vec::new(),
+            }
+        };
+        assert!(start_enabled(&item, &[summary(RunStatus::Done)]).is_ok());
+        assert!(start_enabled(&item, &[summary(RunStatus::Stopped)]).is_err());
     }
 }

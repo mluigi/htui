@@ -38,7 +38,7 @@ use htui_core::model::{
 };
 use htui_core::prompt::DiffBlock;
 use htui_core::store::{
-    CasOutcome, MemStore, ReadStore as _, StepFence, StoreError, WriteStore as _, illegal_move,
+    CasOutcome, MemStore, ReadStore as _, StepFence, StoreError, WriteStore as _,
 };
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -1212,7 +1212,7 @@ async fn a_stopped_run_holds_its_item<H: CaseHarness>(harness: &H) {
         .expect_err("a stopped run is live");
     assert!(
         matches!(&refused, EngineError::Store(StoreError::Constraint(sentence))
-            if *sentence == illegal_move("item", ItemState::Stopped, "queued")),
+            if *sentence == htui_core::store::not_startable("FEAT-3", ItemState::Stopped)),
         "{refused}"
     );
 
