@@ -106,10 +106,20 @@ impl SshRemote {
 
 impl Remote for SshRemote {
     async fn run(&self, command: &str, stdin: &[u8]) -> std::io::Result<RemoteOutput> {
-        let mut ssh = tokio::process::Command::new("ssh");
-        ssh.args(ssh_argv(&self.destination, command));
-        run_piped(ssh, stdin).await
+        run_piped(ssh_command(&self.destination, command), stdin).await
     }
+}
+
+/// The `ssh` process of one session: [`ssh_argv`], without htui's own secret variables
+/// (`HTUI_OWN_ENV`, MOD-158 R1 H1). `ssh` forwards only what `SendEnv` names, but a `ProxyCommand`
+/// or `LocalCommand` from the user's config runs with `ssh`'s environment.
+fn ssh_command(destination: &str, command: &str) -> tokio::process::Command {
+    let mut ssh = tokio::process::Command::new("ssh");
+    ssh.args(ssh_argv(destination, command));
+    for key in htui_core::secret::HTUI_OWN_ENV {
+        ssh.env_remove(key);
+    }
+    ssh
 }
 
 /// `-T -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -- <destination>
@@ -266,6 +276,24 @@ mod tests {
             .map(OsString::from)
             .to_vec()
         );
+    }
+
+    /// MOD-158 R1 (H1, `R-SEC-2`): `ssh` forwards only what `SendEnv` names, but a `ProxyCommand`
+    /// or `LocalCommand` from the user's config is a shell htui does not own, so the session's
+    /// command loses htui's own secret variables, and carries the session's argv.
+    #[test]
+    fn the_ssh_command_removes_htui_own_env() {
+        let ssh = ssh_command("u@box1", "sh -c true");
+        let ssh = ssh.as_std();
+        assert_eq!(ssh.get_program(), "ssh");
+        assert!(ssh.get_args().eq(ssh_argv("u@box1", "sh -c true")));
+        let envs: Vec<_> = ssh.get_envs().collect();
+        for key in htui_core::secret::HTUI_OWN_ENV {
+            assert!(
+                envs.contains(&(std::ffi::OsStr::new(key), None)),
+                "ssh keeps {key}: {envs:?}"
+            );
+        }
     }
 
     // Review finding 8: the sentinel check over `ssh_argv` runs a whole `run_with` now, in

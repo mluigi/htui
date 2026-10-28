@@ -146,6 +146,7 @@ impl EditorCommand {
                 .arg(format!("exec {} \"$1\"", self.value))
                 .arg("htui-editor")
                 .arg(file);
+            strip_own_env(&mut command);
             command
         }
         #[cfg(windows)]
@@ -153,6 +154,7 @@ impl EditorCommand {
             use std::os::windows::process::CommandExt as _;
             let mut command = std::process::Command::new("cmd");
             command.raw_arg(format!("/S /C \"{} \"{}\"\"", self.value, file.display()));
+            strip_own_env(&mut command);
             command
         }
     }
@@ -164,7 +166,9 @@ impl EditorCommand {
     /// (portable-pty `setsid` + `TIOCSCTTY`), so `ctrl-c` reaches only it; no `Interrupts` are
     /// needed. `TERM` is `xterm-256color`, what the pane's VT parser speaks. The cwd is htui's
     /// own, as the suspended handoff inherits it (portable-pty would default to `$HOME`), and
-    /// `LINES`/`COLUMNS` are removed so a stale value cannot override the PTY's size.
+    /// `LINES`/`COLUMNS` are removed so a stale value cannot override the PTY's size, and htui's
+    /// own secret variables (`HTUI_OWN_ENV`) are removed on both platforms, as in
+    /// [`command`](Self::command).
     ///
     /// Windows: `cmd /S /C "<value> <file name>"` with the cwd set to the file's directory.
     /// portable-pty quotes every argument and has no `raw_arg`, so the file is named bare; the
@@ -184,6 +188,9 @@ impl EditorCommand {
             command.env("TERM", "xterm-256color");
             command.env_remove("LINES");
             command.env_remove("COLUMNS");
+            for key in htui_core::secret::HTUI_OWN_ENV {
+                command.env_remove(key);
+            }
             if let Ok(dir) = std::env::current_dir() {
                 command.cwd(dir);
             }
@@ -203,8 +210,19 @@ impl EditorCommand {
                 command.cwd(dir);
             }
             command.env("TERM", "xterm-256color");
+            for key in htui_core::secret::HTUI_OWN_ENV {
+                command.env_remove(key);
+            }
             command
         }
+    }
+}
+
+/// MOD-158 R1 (H1, `R-SEC-2`): `$EDITOR` is code htui does not own, so htui's own secret variables
+/// (`HTUI_QDRANT_API_KEY`) are removed from it, as from agents, step shells and git.
+fn strip_own_env(command: &mut std::process::Command) {
+    for key in htui_core::secret::HTUI_OWN_ENV {
+        command.env_remove(key);
     }
 }
 
@@ -1108,6 +1126,54 @@ mod tests {
         let command = cmd.pty_command(Path::new("/tmp/htui-implement-x.md"));
         assert_eq!(command.get_env("LINES"), None);
         assert_eq!(command.get_env("COLUMNS"), None);
+    }
+
+    /// MOD-158 R1 (H1, `R-SEC-2`): `$EDITOR` is code htui does not own, so neither runner hands it
+    /// htui's own secret variables. The suspended runner's removal is visible on the builder; the
+    /// PTY builder snapshots the environment, so its half re-runs this test as a child that really
+    /// inherits `HTUI_QDRANT_API_KEY` (as `pty_command_drops_inherited_lines_and_columns` does).
+    #[cfg(unix)]
+    #[test]
+    fn the_editor_never_sees_htui_own_env() {
+        const CHILD: &str = "HTUI_EDITOR_TEST_OWN_ENV_CHILD";
+        const NAME: &str = "editor::tests::the_editor_never_sees_htui_own_env";
+        let cmd = EditorCommand {
+            value: "vi".to_owned(),
+            fallback: false,
+        };
+        let file = Path::new("/tmp/htui-implement-x.md");
+        if std::env::var_os(CHILD).is_none() {
+            let suspended = cmd.command(file);
+            let envs: Vec<_> = suspended.get_envs().collect();
+            for key in htui_core::secret::HTUI_OWN_ENV {
+                assert!(
+                    envs.contains(&(std::ffi::OsStr::new(key), None)),
+                    "the suspended editor keeps {key}: {envs:?}"
+                );
+            }
+            let mut rerun =
+                std::process::Command::new(std::env::current_exe().expect("test binary"));
+            rerun
+                .args([NAME, "--exact", "--test-threads=1"])
+                .env(CHILD, "1");
+            for key in htui_core::secret::HTUI_OWN_ENV {
+                rerun.env(key, "SENTINEL-OWN-ENV");
+            }
+            let output = rerun.output().expect("re-run the test binary");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "child failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(stdout.contains("1 passed"), "child ran no test:\n{stdout}");
+            return;
+        }
+        let command = cmd.pty_command(file);
+        for key in htui_core::secret::HTUI_OWN_ENV {
+            assert!(std::env::var_os(key).is_some(), "the child inherits {key}");
+            assert_eq!(command.get_env(key), None, "the PTY editor keeps {key}");
+        }
     }
 
     #[cfg(windows)]

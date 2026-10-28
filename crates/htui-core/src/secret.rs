@@ -460,8 +460,10 @@ pub const QDRANT_URL_ENV: &str = "HTUI_QDRANT_URL";
 pub const QDRANT_KEY_ENV: &str = "HTUI_QDRANT_API_KEY";
 
 /// MOD-158 D5 (`R-SEC-2`): htui's own variables that carry a secret. Every agent, step-shell, git
-/// and opener spawn removes them, **after** the launch's own env, so nothing can re-add them.
-/// `unsafe_code = "forbid"` rules out `remove_var`, so the strip happens at each spawn.
+/// (verbs and the `--version` probe), opener, `$EDITOR` and provision `ssh` spawn removes them,
+/// **after** the launch's own env, so nothing can re-add them. `unsafe_code = "forbid"` rules out
+/// `remove_var`, so the strip happens at each spawn. (MOD-158 R1 H1 added `$EDITOR` and `ssh`,
+/// which the blueprint's R-7 had left out by D5's scope.)
 pub const HTUI_OWN_ENV: [&str; 1] = [QDRANT_KEY_ENV];
 
 /// [`project_scope`]'s [`SecretError::Config`] sentence for a project that names a provider and
