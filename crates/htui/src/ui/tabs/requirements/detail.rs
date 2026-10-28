@@ -6,9 +6,9 @@
 //! the mirror holds no revisions, and the pane says so in one line rather than showing an empty
 //! trail (PRD "Offline", blueprint F-14).
 //!
-//! MOD-115 M3 (MOD-83): every value is shown by its label, never its internal name: the state as
-//! a `kit::label` mark, a citing item's state (MOD-144: derived) as `kit::status`'s, the citation kind and the
-//! resolution as `kit::label`'s words, the counts through `kit::label::plural`.
+//! MOD-115 M3 (MOD-83): every value is shown by its label, never its internal name: the state as a
+//! `kit::label` mark, a citing item's state (MOD-144: derived) as `kit::status`'s, the citation
+//! kind and the resolution as `kit::label`'s words, the counts through `kit::label::plural`.
 
 use htui_core::model::{CoverageRow, ProjectRef, RequirementArea, RequirementState};
 use ratatui::text::{Line, Span};

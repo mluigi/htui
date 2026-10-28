@@ -89,9 +89,27 @@ fn sub_tab(harness: &mut Harness, n: usize) {
 
 /// MOD-144: `FEAT-1`'s Runs pane opens on its newest run, the stepless rework `RUN_4` (the demo's
 /// `running` state for `FEAT-1`); one `J` steps past it to `RUN_1`'s `prd`, the walk these cases
-/// drive.
+/// drive. It checks it landed there, so a demo that lists another run first fails here, not in
+/// the case.
 fn past_the_rework_run(harness: &mut Harness) {
     harness.key("J");
+    let frame = harness.render();
+    assert!(
+        runs_cursor_row(&frame).contains("prd"),
+        "`J` steps past RUN_4 onto RUN_1's `prd`:\n{frame}"
+    );
+}
+
+/// The Runs pane's row the step cursor (`▸`) is on: the pane right of the list's `││`.
+fn runs_cursor_row(frame: &str) -> String {
+    frame
+        .lines()
+        .filter_map(|row| row.rsplit_once("││").map(|(_, pane)| pane))
+        .find(|pane| pane.contains('▸'))
+        .unwrap_or_else(|| panic!("the Runs pane has a step cursor:\n{frame}"))
+        .trim_end_matches('│')
+        .trim_end()
+        .to_owned()
 }
 
 /// Rows down from the arrival row to htui `FEAT-1`, the item every sub-tab has data for.

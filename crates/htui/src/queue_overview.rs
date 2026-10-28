@@ -14,11 +14,12 @@ use htui_store::Backend;
 /// [`StoreRequest::QueueOverview`](crate::store_worker::StoreRequest::QueueOverview)'s answer.
 ///
 /// The reads follow `admit` (`htui-worker`'s runtime): the ready set is `ready_items` over the
-/// rows' projects less the batch's cancelled items, and a ready row's project is held when its
-/// caps read absent, do not parse, or `batch_budget` refuses the batch's spend. The rows in state
-/// `open` (MOD-144: open, no graph run) that are not ready have their missing tags read in one `missing_tags_of` (M3 review R1 M2; D6's
-/// N+1 was one `missing_tags` per row): an item deleted since `queue_rows` is absent from its
-/// answer, and a `NotFound` (the box gone) reads as no tags, both as the per-row read did.
+/// rows' projects less the batch's cancelled items, and a ready row's project is held when its caps
+/// read absent, do not parse, or `batch_budget` refuses the batch's spend. The rows in state `open`
+/// (MOD-144: open, no graph run) that are not ready have their missing tags read in one
+/// `missing_tags_of` (M3 review R1 M2; D6's N+1 was one `missing_tags` per row): an item deleted
+/// since `queue_rows` is absent from its answer, and a `NotFound` (the box gone) reads as no tags,
+/// both as the per-row read did.
 ///
 /// With no batch open, `last_closed_batch` says how the last one closed (M3 review R1 L4).
 ///

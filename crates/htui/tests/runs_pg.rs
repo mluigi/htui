@@ -1,6 +1,7 @@
-//! MOD-4 milestone 6 against live Postgres (plan Task 9, blueprint §11): ANA-2 §12 criteria 17
-//! and 20, ANA-5 criterion 18's persistence half, and plan D161's unblock edge (MOD-144:
-//! `blocked -> open`, the item following its parked run), each driven through the production `run_worker::RunRuntime` over a `Backend::Online`.
+//! MOD-4 milestone 6 against live Postgres (plan Task 9, blueprint §11): ANA-2 §12 criteria 17 and
+//! 20, ANA-5 criterion 18's persistence half, and plan D161's unblock edge (MOD-144: `blocked ->
+//! open`, the item following its parked run), each driven through the production
+//! `run_worker::RunRuntime` over a `Backend::Online`.
 //!
 //! The fakes suite (`htui-orch`'s conformance over `MemStore`) and the harness suites
 //! (`tests/chat.rs`, `tests/backlog.rs`) prove the same criteria against a memory store. What only

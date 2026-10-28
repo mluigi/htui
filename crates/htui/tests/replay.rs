@@ -75,7 +75,7 @@ const TO_FEAT_1: usize = 3;
 
 /// Moves a settled harness onto `FEAT-1`, opens the Runs pane on it and puts the cursor on
 /// `RUN_1`'s first step: MOD-144's demo lists the stepless rework run `RUN_4` first, and one `J`
-/// steps past it.
+/// steps past it, onto `prd` (checked).
 async fn on_the_runs_pane(harness: &mut Harness) {
     harness.settle().await;
     harness.app().update(Action::SetScope {
@@ -90,6 +90,23 @@ async fn on_the_runs_pane(harness: &mut Harness) {
     harness.settle().await;
     harness.key("J");
     harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        runs_cursor_row(&frame).contains("prd"),
+        "`J` steps past RUN_4 onto RUN_1's `prd`:\n{frame}"
+    );
+}
+
+/// The Runs pane's row the step cursor (`▸`) is on: the pane right of the list's `││`.
+fn runs_cursor_row(frame: &str) -> String {
+    frame
+        .lines()
+        .filter_map(|row| row.rsplit_once("││").map(|(_, pane)| pane))
+        .find(|pane| pane.contains('▸'))
+        .unwrap_or_else(|| panic!("the Runs pane has a step cursor:\n{frame}"))
+        .trim_end_matches('│')
+        .trim_end()
+        .to_owned()
 }
 
 /// The Backlog tab beside a tab that only records what it is sent, named as the replay tab.
