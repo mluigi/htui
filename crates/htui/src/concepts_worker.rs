@@ -882,7 +882,10 @@ mod tests {
     }
 
     fn settings(url: &str, key: Option<&str>) -> QdrantSettings {
-        QdrantSettings::new(url.to_owned(), key.map(str::to_owned)).expect("a valid URL")
+        QdrantSettings::new(
+            htui_core::qdrant::QdrantUrl::parse(url).expect("a valid URL"),
+            key.map(str::to_owned),
+        )
     }
 
     /// Review 3: a connection is reused for the URL and key it was made with, and only for them.

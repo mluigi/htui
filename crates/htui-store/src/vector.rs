@@ -912,7 +912,7 @@ impl<E: DenseEmbedder> QdrantStore<E> {
 fn client(settings: &QdrantSettings) -> Result<Qdrant, StoreError> {
     // No compatibility check: it prints to stdout (which `--search-items` owns) and blocks on its
     // own health probe; the first call fails fast on a bad server anyway.
-    let mut builder = Qdrant::from_url(&settings.url).skip_compatibility_check();
+    let mut builder = Qdrant::from_url(settings.url.as_str()).skip_compatibility_check();
     if let Some(key) = &settings.api_key {
         builder = builder.api_key(key.as_str());
     }
@@ -1664,8 +1664,10 @@ mod tests {
     /// apart from Qdrant's; the search fails before any call to Qdrant (nothing listens on port 1).
     #[tokio::test]
     async fn a_query_the_embedder_fails_is_a_query_embed_failure() {
-        let settings =
-            QdrantSettings::new("http://127.0.0.1:1".to_owned(), None).expect("a valid URL");
+        let settings = QdrantSettings::new(
+            htui_core::qdrant::QdrantUrl::parse("http://127.0.0.1:1").expect("a valid URL"),
+            None,
+        );
         let store = QdrantStore::new(&settings, Broken, C).expect("no call yet");
         let err = store
             .search(&scoped("anything"))

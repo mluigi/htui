@@ -108,7 +108,10 @@ pub fn settings_from(
     let Some(url) = url else {
         bail!("{NO_QDRANT_URL}");
     };
-    Ok(QdrantSettings::new(url, api_key)?)
+    Ok(QdrantSettings::new(
+        htui_core::qdrant::QdrantUrl::parse(&url)?,
+        api_key,
+    ))
 }
 
 /// The sentence every verb that needs the keyring's DSN refuses with when none is stored.
@@ -366,8 +369,9 @@ fn keyring_settings() -> Result<QdrantSettings, String> {
     };
     let api_key = secret::get_qdrant_api_key()
         .map_err(|err| format!("the Qdrant API key could not be read: {err}"))?;
-    QdrantSettings::new(url, api_key)
-        .map_err(|err| format!("the stored Qdrant URL is not usable: {err}"))
+    let url = htui_core::qdrant::QdrantUrl::parse(&url)
+        .map_err(|err| format!("the stored Qdrant URL is not usable: {err}"))?;
+    Ok(QdrantSettings::new(url, api_key))
 }
 
 /// The model, then the collection; a failure is logged and another attempt follows after the
@@ -747,7 +751,7 @@ mod tests {
     #[test]
     fn a_stored_url_and_key_become_settings() {
         let s = settings_from(Some("http://localhost:6334".into()), Some("k".into())).unwrap();
-        assert_eq!(s.url, "http://localhost:6334");
+        assert_eq!(s.url.as_str(), "http://localhost:6334");
         assert!(s.api_key.is_some());
         assert!(settings_from(Some("localhost:6334".into()), None).is_err());
     }

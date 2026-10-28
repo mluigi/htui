@@ -533,7 +533,10 @@ async fn searched(
 }
 
 fn qdrant(url: &str) -> QdrantSettings {
-    QdrantSettings::new(url.to_owned(), None).expect("a valid URL")
+    QdrantSettings::new(
+        htui_core::qdrant::QdrantUrl::parse(url).expect("a valid URL"),
+        None,
+    )
 }
 
 /// The test Qdrant's URL, or the skip line.

@@ -24,7 +24,10 @@ async fn throwaway() -> Option<QdrantStore<HashEmbedder>> {
         eprintln!("skipped: {ENV_URL} not set");
         return None;
     };
-    let settings = QdrantSettings::new(url, None).expect("valid URL");
+    let settings = QdrantSettings::new(
+        htui_core::qdrant::QdrantUrl::parse(&url).expect("valid URL"),
+        None,
+    );
     let name = format!("htui_test_{}", uuid::Uuid::now_v7().simple());
     Some(
         QdrantStore::connect_to(&settings, HashEmbedder::new(DENSE_DIM), &name)

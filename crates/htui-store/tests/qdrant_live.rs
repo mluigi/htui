@@ -47,7 +47,10 @@ async fn connect<E: DenseEmbedder>(
     embedder: E,
     name: &str,
 ) -> Result<QdrantStore<E>, StoreError> {
-    let settings = QdrantSettings::new(url.to_owned(), None).expect("valid URL");
+    let settings = QdrantSettings::new(
+        htui_core::qdrant::QdrantUrl::parse(url).expect("valid URL"),
+        None,
+    );
     QdrantStore::connect_to(&settings, embedder, name).await
 }
 
@@ -527,7 +530,10 @@ async fn open_existing<E: DenseEmbedder>(
     embedder: E,
     name: &str,
 ) -> Result<Option<QdrantStore<E>>, StoreError> {
-    let settings = QdrantSettings::new(url.to_owned(), None).expect("valid URL");
+    let settings = QdrantSettings::new(
+        htui_core::qdrant::QdrantUrl::parse(url).expect("valid URL"),
+        None,
+    );
     QdrantStore::open_existing_to(&settings, embedder, name).await
 }
 
@@ -634,7 +640,10 @@ async fn an_existing_collection_is_found_before_the_embedder_and_checked_after()
     let Some(url) = qdrant_url() else {
         return;
     };
-    let settings = QdrantSettings::new(url.clone(), None).expect("valid URL");
+    let settings = QdrantSettings::new(
+        htui_core::qdrant::QdrantUrl::parse(&url).expect("valid URL"),
+        None,
+    );
     let missing = ExistingCollection::find_in(&settings, &fresh_name())
         .await
         .expect("Qdrant answers");

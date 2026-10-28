@@ -1,12 +1,13 @@
-use htui_core::store::StoreError;
-/// Settings for connecting to a Qdrant vector database.
+//! Settings for connecting to a Qdrant vector database.
+
+use htui_core::qdrant::QdrantUrl;
 use zeroize::Zeroizing;
 
 /// Settings for connecting to a Qdrant vector database.
 #[derive(Clone)]
 pub struct QdrantSettings {
-    /// The base URL of the Qdrant server.
-    pub url: String,
+    /// The base URL of the Qdrant server, checked by [`QdrantUrl::parse`] (MOD-158 D2).
+    pub url: QdrantUrl,
     /// An optional API key for authentication.
     pub api_key: Option<Zeroizing<String>>,
 }
@@ -21,14 +22,40 @@ impl std::fmt::Debug for QdrantSettings {
 }
 
 impl QdrantSettings {
-    /// Creates a new `QdrantSettings` instance, validating the URL.
-    pub fn new(url: String, api_key: Option<String>) -> Result<Self, StoreError> {
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            return Err(StoreError::Backend(
-                "Qdrant URL must start with http:// or https://".to_owned(),
-            ));
-        }
-        let key = api_key.filter(|k| !k.trim().is_empty()).map(Zeroizing::new);
-        Ok(Self { url, api_key: key })
+    /// MOD-158 D2: only a checked URL reaches the client. A blank key is no key.
+    #[must_use]
+    pub fn new(url: QdrantUrl, api_key: Option<String>) -> Self {
+        let api_key = api_key.filter(|k| !k.trim().is_empty()).map(Zeroizing::new);
+        Self { url, api_key }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn url() -> QdrantUrl {
+        QdrantUrl::parse("http://localhost:6334").expect("a valid URL")
+    }
+
+    #[test]
+    fn a_blank_key_is_no_key() {
+        assert!(QdrantSettings::new(url(), None).api_key.is_none());
+        assert!(
+            QdrantSettings::new(url(), Some(" \t".into()))
+                .api_key
+                .is_none()
+        );
+        let settings = QdrantSettings::new(url(), Some("k".into()));
+        assert_eq!(settings.api_key.as_deref().map(String::as_str), Some("k"));
+        assert_eq!(settings.url.as_str(), "http://localhost:6334");
+    }
+
+    #[test]
+    fn debug_never_prints_the_key() {
+        let text = format!("{:?}", QdrantSettings::new(url(), Some("SENTINEL".into())));
+        assert!(!text.contains("SENTINEL"), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+        assert!(text.contains("http://localhost:6334"), "{text}");
     }
 }
