@@ -167,7 +167,7 @@ const BROWSE_HINT: HintSpec = &[
 /// The list pane's keys while browsing (MOD-115 M4 E5, Q2: a pane shows its own keys): what
 /// the list is about, the view its chips name, a new skill and the import, in its 28 cells.
 const LIST_HINT: HintSpec = &[
-    Hint::Two(Act::SkillsSwitchView, "view"),
+    super::SWITCH_HINT,
     Hint::One(Act::New, "new"),
     Hint::One(Act::LibraryImport, "import"),
 ];
