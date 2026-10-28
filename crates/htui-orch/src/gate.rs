@@ -338,9 +338,9 @@ impl<S: htui_core::store::WorkerStore, C: Clock + ?Sized> GateContext<'_, S, C> 
 
     /// One item compare-and-set, with a stale `from` treated as "already moved" (plan D17).
     ///
-    /// Every pair passed to this is checked against `Status::can_move_to`
-    /// (`crates/htui-core/src/model/item.rs:46-60`) at its call site, because an illegal pair is a
-    /// `Constraint` and not an `Ok(false)` (blueprint H-1).
+    /// Every pair passed to this is checked against `Status::can_move_to` (`open ↔ blocked`,
+    /// MOD-144) at its call site, because an illegal pair is a `Constraint` and not an `Ok(false)`
+    /// (blueprint H-1).
     async fn move_item(&self, from: Status, to: Status) -> Result<bool, EngineError> {
         let Some(item) = self.item() else {
             return Ok(false);
@@ -379,14 +379,15 @@ pub enum Landing {
 /// Three rows of the table and their writes:
 ///
 /// - **park** — `park_step`, under the walk's fence: the step and the run `running ->
-///   awaiting_approval` and the item `in_progress -> awaiting_approval`, one transaction (MOD-37
-///   R-5, which closes blueprint F-K and H-10). A refused park writes nothing. A park written
-///   before R-5 could stop between its three moves, which is what recovery's D96 branch repairs.
+///   awaiting_approval`, one transaction (MOD-37 R-5, which closes blueprint F-K and H-10);
+///   `park_step` writes no item (MOD-144: the parked run is what reads *needs you*). A refused
+///   park writes nothing. A park written before R-5 could stop between its moves, which is what
+///   recovery's D96 branch repairs.
 /// - **done + skipped** — `pass_step`, under the walk's fence: `running -> done` with
 ///   `gate_outcome = 'skipped'` and the settle's note as `gate_note` (MOD-37 R-5, which closes
 ///   blueprint H-9).
-/// - **fail run** — `transition_step(Running -> Failed)` then `finish_run(run, Failed, …)`, which
-///   mirrors the item in the same transaction (plan D7).
+/// - **fail run** — `transition_step(Running -> Failed)` then `finish_run(run, Failed, …)` (plan
+///   D7), which writes no item (MOD-144).
 ///
 /// Every step and run compare-and-set honours `Ok(false)` (plan D125): the row was moved by
 /// another writer, so the answer is [`EngineError::StaleWrite`] and nothing after the refused move
@@ -710,8 +711,8 @@ pub enum LoopOutcome {
 /// `R-ORCH-3`'s loop, one routine for both of plan D4's entry points (`docs/ANA-2.md:712-753`).
 ///
 /// The caller has already left `review` at `failed` with `gate_outcome = 'rejected'` and its
-/// `gate_note`, and has already moved the run to `running` and the item to `in_progress` if they
-/// were parked (blueprint A-5) — so the human path and the automatic path arrive here with
+/// `gate_note`, and has already moved the run to `running` if it was parked (blueprint A-5) — so
+/// the human path and the automatic path arrive here with
 /// identical rows and this function never asks which one it was.
 ///
 /// **Retiring is status by status** (plan D5, fact-check F14b/F15): `pending`,
@@ -1060,7 +1061,9 @@ async fn escalate<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     // Plan D125: a run another writer moved first stops the escalation, with no item move and no
     // note after the refused move.
     move_run(ctx, RunStatus::Running, RunStatus::AwaitingApproval, now).await?;
-    ctx.move_item(Status::InProgress, Status::Blocked).await?;
+    // MOD-144: blocking writes are `open -> blocked`; D17's `Ok(false)` still reads "already
+    // moved".
+    ctx.move_item(Status::Open, Status::Blocked).await?;
     if let Some(item) = ctx.item() {
         ctx.store
             .add_note(NewNote {

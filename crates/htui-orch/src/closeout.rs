@@ -21,10 +21,13 @@ pub struct Preview {
     pub key: String,
     /// `item.title`.
     pub title: String,
-    /// `item.status` now.
+    /// `item.status` now: `open` or `blocked`.
     pub status: Status,
+    /// Whether the item's latest graph run finished `done` (MOD-144): the second input of
+    /// `Resolution::closes_from`.
+    pub finished: bool,
     /// The resolution the confirmation starts on: `close_out_enabled`'s answer. The Runs pane
-    /// may send another that `closes_from(status)` (MOD-39 plan P13).
+    /// may send another that `closes_from(status, finished)` (MOD-39 plan P13).
     pub resolution: Resolution,
     /// Runs of the item the summary lists.
     pub runs: usize,
@@ -36,12 +39,13 @@ pub struct Preview {
 
 /// The first confirmation's figures, counted over exactly what [`summary`] would write.
 ///
-/// `version` reads only `heads` of this item whose kind is `summary`; `resolution` is the
-/// caller's, carried through so the confirmation and the command name the same one.
+/// `version` reads only `heads` of this item whose kind is `summary`; `resolution` and `finished`
+/// are the caller's, carried through so the confirmation and the command name the same one.
 #[must_use]
 pub fn preview(
     item: &Item,
     resolution: Resolution,
+    finished: bool,
     runs: &[RunSummary],
     commits: &[(StepId, Vec<RunStepCommit>)],
     heads: &[DocumentHead],
@@ -56,6 +60,7 @@ pub fn preview(
         key: item.key.clone(),
         title: item.title.clone(),
         status: item.status,
+        finished,
         resolution,
         runs: runs.len(),
         rows: rows(runs, commits, &[]).len(),
@@ -236,7 +241,7 @@ mod tests {
             key: "FEAT-1".to_owned(),
             title: "Close me".to_owned(),
             body: String::new(),
-            status: Status::Done,
+            status: Status::Open,
             priority: 0,
             required_tags: Vec::new(),
             touched_paths: Vec::new(),
@@ -596,13 +601,14 @@ mod tests {
         let repos = [repo(1, "htui"), repo(2, "docs")];
         let doc = write(&runs, &commits, &repos);
 
-        let first = preview(&item(), Resolution::Done, &runs, &commits, &[]);
+        let first = preview(&item(), Resolution::Done, true, &runs, &commits, &[]);
         assert_eq!(
             first,
             Preview {
                 key: "FEAT-1".to_owned(),
                 title: "Close me".to_owned(),
-                status: Status::Done,
+                status: Status::Open,
+                finished: true,
                 resolution: Resolution::Done,
                 runs: 1,
                 rows: table_rows(&doc.body).len(),
@@ -614,7 +620,7 @@ mod tests {
         // Another kind's versions are not the summary's.
         let heads = [head(1, "summary"), head(2, "summary"), head(7, "plan")];
         assert_eq!(
-            preview(&item(), Resolution::Done, &runs, &commits, &heads).version,
+            preview(&item(), Resolution::Done, true, &runs, &commits, &heads).version,
             3
         );
     }
