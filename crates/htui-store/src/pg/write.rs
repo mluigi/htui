@@ -50,6 +50,7 @@ use htui_core::model::{
 use htui_core::model::{EdgeId, GraphBody, GraphScope, PhasePart, PlanScope, Split, StepGraphEdge};
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
+use htui_core::qdrant::{QDRANT_URL_KEY, QdrantUrl, StoredQdrantUrl};
 use htui_core::seed;
 use htui_core::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
@@ -9582,6 +9583,89 @@ fn concurrent_write(entity: &str, id: impl core::fmt::Display, what: &str) -> St
         "{entity} {id} is being written to: {DELETE_ATTEMPTS} attempts each found {what} committed \
          after the count, and the delete took nothing"
     )
+}
+
+/// MOD-158 D1: the database-wide Qdrant URL's writes, inherent like [`PgStore::app_settings`] and
+/// not trait verbs. The three statements are `set_queue_setting`'s and `clear_queue_setting`'s `App`
+/// arm byte for byte, indentation included, so they reuse those offline entries (MOD-51 F-9: the
+/// cache keys a statement by the SHA-256 of its text): they look mis-indented here on purpose.
+impl PgStore {
+    /// The URL's compare-and-set. `expected: None` means "I expect no row". Answers
+    /// `Applied(Some(row))`, or, on a miss, `Stale(current)` re-read, where `current` is `None`
+    /// when the row is gone (blueprint P-4); never `NotFound`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn set_qdrant_url(
+        &self,
+        url: &QdrantUrl,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<Option<StoredQdrantUrl>>> {
+        let value = url.to_value();
+        let landed = match expected {
+            // "I expect no row": a conflict means somebody is there, and that is `Stale`.
+            None => sqlx::query_scalar!(
+                r#"
+                        INSERT INTO app_setting (key, value) VALUES ($1, $2)
+                        ON CONFLICT (key) DO NOTHING
+                        RETURNING updated_at AS "updated_at!"
+                        "#,
+                QDRANT_URL_KEY,
+                &value,
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?,
+            Some(token) => sqlx::query_scalar!(
+                r#"
+                        UPDATE app_setting SET value = $2
+                         WHERE key = $1 AND updated_at = $3
+                        RETURNING updated_at AS "updated_at!"
+                        "#,
+                QDRANT_URL_KEY,
+                &value,
+                token,
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?,
+        };
+        match landed {
+            Some(token) => Ok(CasOutcome::Applied(Some(StoredQdrantUrl {
+                url: Ok(url.clone()),
+                token,
+            }))),
+            None => Ok(CasOutcome::Stale(self.qdrant_url().await?)),
+        }
+    }
+
+    /// Removes the URL row whose token is `expected`: `Applied(None)`, or, on a miss,
+    /// `Stale(current)` re-read (blueprint P-4).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn clear_qdrant_url(
+        &self,
+        expected: DateTime<Utc>,
+    ) -> Result<CasOutcome<Option<StoredQdrantUrl>>> {
+        let landed = sqlx::query_scalar!(
+            r#"
+                    DELETE FROM app_setting WHERE key = $1 AND updated_at = $2
+                    RETURNING updated_at AS "updated_at!"
+                    "#,
+            QDRANT_URL_KEY,
+            expected,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        match landed {
+            Some(_) => Ok(CasOutcome::Applied(None)),
+            None => Ok(CasOutcome::Stale(self.qdrant_url().await?)),
+        }
+    }
 }
 
 /// MOD-12 M2 D9: the reads behind [`WriteStore::queue_setting`] and the queue writes' misses.

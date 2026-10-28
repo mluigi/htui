@@ -35,6 +35,7 @@ use htui_core::model::{
     StepGraphEdge,
 };
 use htui_core::prompt::settings::SettingKey;
+use htui_core::qdrant::{QDRANT_URL_KEY, StoredQdrantUrl};
 use htui_core::store::{ReadStore, Result, SettingRung, StoreError, StoredSetting};
 use serde_json::Value;
 use sqlx::types::Json;
@@ -1843,6 +1844,26 @@ impl PgStore {
             .await
             .map_err(map_sqlx)?;
         Ok(rows.into_iter().map(|row| (row.key, row.value)).collect())
+    }
+
+    /// MOD-158 D1: the `qdrant_url` row, malformed or not (blueprint P-3); `None` when there is
+    /// none.
+    ///
+    /// The statement is `stored_queue_setting`'s `App` read byte for byte, so it reuses that
+    /// offline entry (no `.sqlx` file of its own).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn qdrant_url(&self) -> Result<Option<StoredQdrantUrl>> {
+        let row = sqlx::query!(
+            "SELECT value, updated_at FROM app_setting WHERE key = $1",
+            QDRANT_URL_KEY,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(row.map(|row| StoredQdrantUrl::from_row(&row.value, row.updated_at)))
     }
 
     /// One `item_kind` row, or `None` when no row has that id.

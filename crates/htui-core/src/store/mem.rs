@@ -57,6 +57,7 @@ use crate::model::{EdgeId, GraphBody, GraphScope, NodeBody, PhasePart, StepGraph
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
 use crate::prompt::template::TemplateRole;
+use crate::qdrant::{QDRANT_URL_KEY, QdrantUrl, StoredQdrantUrl};
 use crate::seed;
 use crate::store::error::{Result, StoreError};
 use crate::store::graph_rules::{
@@ -684,6 +685,64 @@ impl MemStore {
     pub fn set_app_setting(&self, key: &str, value: Value) {
         let now = self.now();
         self.write(|state| state.app_settings.insert(key.to_owned(), (value, now)));
+    }
+
+    /// MOD-158 D1: the `qdrant_url` row, malformed or not (blueprint P-3); `None` when there is
+    /// none.
+    ///
+    /// # Errors
+    ///
+    /// Never; the signature matches `PgStore`'s.
+    pub async fn qdrant_url(&self) -> Result<Option<StoredQdrantUrl>> {
+        Ok(self.read(State::qdrant_url))
+    }
+
+    /// MOD-158 D1: the URL's compare-and-set. `expected: None` means "I expect no row". Answers
+    /// `Applied(Some(row))`, or `Stale(current)`, where `current` is `None` when the row is gone
+    /// (blueprint P-4); never `NotFound`.
+    ///
+    /// # Errors
+    ///
+    /// Never; the signature matches `PgStore`'s.
+    pub async fn set_qdrant_url(
+        &self,
+        url: &QdrantUrl,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<Option<StoredQdrantUrl>>> {
+        let now = self.now();
+        Ok(self.write(|state| {
+            let current = state.qdrant_url();
+            if current.as_ref().map(|row| row.token) != expected {
+                return CasOutcome::Stale(current);
+            }
+            state
+                .app_settings
+                .insert(QDRANT_URL_KEY.to_owned(), (url.to_value(), now));
+            CasOutcome::Applied(Some(StoredQdrantUrl {
+                url: Ok(url.clone()),
+                token: now,
+            }))
+        }))
+    }
+
+    /// MOD-158 D1: removes the `qdrant_url` row whose token is `expected`: `Applied(None)`, or
+    /// `Stale(current)` (blueprint P-4).
+    ///
+    /// # Errors
+    ///
+    /// Never; the signature matches `PgStore`'s.
+    pub async fn clear_qdrant_url(
+        &self,
+        expected: DateTime<Utc>,
+    ) -> Result<CasOutcome<Option<StoredQdrantUrl>>> {
+        Ok(self.write(|state| {
+            let current = state.qdrant_url();
+            if current.as_ref().map(|row| row.token) != Some(expected) {
+                return CasOutcome::Stale(current);
+            }
+            state.app_settings.remove(QDRANT_URL_KEY);
+            CasOutcome::Applied(None)
+        }))
     }
 
     /// Replaces one project's `settings` blob without validation. **Tests only** — same reason as
@@ -4831,6 +4890,13 @@ impl State {
     /// Writes (`Some`) or clears (`None`) one queue key (MOD-12 M2 D9): the target and token
     /// refusals, the validator on a set, then the row as `set_setting`'s `App` and `Project` rungs
     /// and `edit_box`'s lookup and guards do. `now` stands in for Postgres's trigger.
+    /// MOD-158 D1: the `qdrant_url` row as [`StoredQdrantUrl`] reads it.
+    fn qdrant_url(&self) -> Option<StoredQdrantUrl> {
+        self.app_settings
+            .get(QDRANT_URL_KEY)
+            .map(|(value, token)| StoredQdrantUrl::from_row(value, *token))
+    }
+
     fn write_queue_setting(
         &mut self,
         user: Option<UserId>,
