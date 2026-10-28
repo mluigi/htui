@@ -283,6 +283,16 @@ pub const CASES: &[&str] = &[
     "memory_supersede_refuses_stale_closed_and_clashing",
     "memory_unknown_rows_and_authors_are_refused",
     "project_delete_counts_memory",
+    // MOD-144: the item status reduction (ANA-35 §7.1, plan "The rules")
+    "create_run_refuses_a_second_live_graph_run",
+    "readiness_skips_cancelled_runs",
+    "a_done_run_releases_its_dependents",
+    "a_rework_run_holds_dependents_until_cancelled",
+    "waiting_candidates_follow_blocked_items_and_parked_runs",
+    "close_out_law_reads_the_latest_graph_run",
+    "a_finished_snapshot_defaults_a_verdict_to_concluded",
+    "item_state_is_derived_from_the_latest_graph_run",
+    "transition_never_touches_closed_at",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -910,6 +920,34 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
             memory_unknown_rows_and_authors_are_refused(store).await
         }
         "project_delete_counts_memory" => project_delete_counts_memory(store).await,
+        "create_run_refuses_a_second_live_graph_run" => {
+            Box::pin(create_run_refuses_a_second_live_graph_run(store)).await
+        }
+        "readiness_skips_cancelled_runs" => Box::pin(readiness_skips_cancelled_runs(store)).await,
+        "a_done_run_releases_its_dependents" => {
+            Box::pin(a_done_run_releases_its_dependents(store)).await
+        }
+        "a_rework_run_holds_dependents_until_cancelled" => {
+            Box::pin(a_rework_run_holds_dependents_until_cancelled(store)).await
+        }
+        "waiting_candidates_follow_blocked_items_and_parked_runs" => {
+            Box::pin(waiting_candidates_follow_blocked_items_and_parked_runs(
+                store,
+            ))
+            .await
+        }
+        "close_out_law_reads_the_latest_graph_run" => {
+            Box::pin(close_out_law_reads_the_latest_graph_run(store)).await
+        }
+        "a_finished_snapshot_defaults_a_verdict_to_concluded" => {
+            Box::pin(a_finished_snapshot_defaults_a_verdict_to_concluded(store)).await
+        }
+        "item_state_is_derived_from_the_latest_graph_run" => {
+            Box::pin(item_state_is_derived_from_the_latest_graph_run(store)).await
+        }
+        "transition_never_touches_closed_at" => {
+            Box::pin(transition_never_touches_closed_at(store)).await
+        }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -13592,6 +13630,719 @@ async fn transition_never_reaches_closed<S: WriteStore>(store: &S) {
         matches!(unknown, Err(StoreError::NotFound { entity: "item", .. })),
         "{CASE}: plan D14 — an unknown item is NotFound even though the pair is illegal, got \
          {unknown:?}"
+    );
+}
+
+// ---- MOD-144: the item status reduction (ANA-35 §7.1; plan "The rules") --------------------
+//
+// `item.status` is `open | blocked | closed`; progress is the latest non-cancelled graph run's.
+// Every case reads the state the way a client does (`state_of`, or the projections' own
+// `latest_run_status`), so Mem and Pg are held to one derivation.
+
+/// MOD-144: a graph run of `item` queued `seconds` after `base` and driven to `to` through the
+/// law (no claim: `transition_run` and `finish_run` only), so a case can plant any latest run.
+async fn run_at<S: WriteStore>(
+    case: &str,
+    store: &S,
+    item: ItemId,
+    base: DateTime<Utc>,
+    seconds: i64,
+    to: RunStatus,
+) -> RunId {
+    let run = store
+        .create_run(NewRun {
+            queued_at: base + TimeDelta::seconds(seconds),
+            ..new_run(ids::PROJECT_HTUI, item, Vec::new())
+        })
+        .await
+        .unwrap_or_else(|error| panic!("{case}: the run of {item} is created: {error}"))
+        .id;
+    let at = base + TimeDelta::seconds(seconds);
+    let walk: &[(RunStatus, RunStatus)] = match to {
+        RunStatus::Queued | RunStatus::Done | RunStatus::Failed | RunStatus::Cancelled => &[],
+        RunStatus::Running => &[(RunStatus::Queued, RunStatus::Running)],
+        RunStatus::AwaitingApproval => &[
+            (RunStatus::Queued, RunStatus::Running),
+            (RunStatus::Running, RunStatus::AwaitingApproval),
+        ],
+        RunStatus::Stopped => &[
+            (RunStatus::Queued, RunStatus::Running),
+            (RunStatus::Running, RunStatus::Stopped),
+        ],
+    };
+    for &(from, next) in walk {
+        assert!(
+            store.transition_run(run, from, next, at).await.expect(case),
+            "{case}: run {from} -> {next}"
+        );
+    }
+    match to {
+        RunStatus::Done => {
+            assert!(
+                store
+                    .transition_run(run, RunStatus::Queued, RunStatus::Running, at)
+                    .await
+                    .expect(case),
+                "{case}: run queued -> running"
+            );
+            store
+                .finish_run(run, RunStatus::Done, None, at)
+                .await
+                .expect(case);
+        }
+        RunStatus::Failed => store
+            .finish_run(run, RunStatus::Failed, Some("boom"), at)
+            .await
+            .expect(case),
+        RunStatus::Cancelled => store
+            .finish_run(run, RunStatus::Cancelled, None, at)
+            .await
+            .expect(case),
+        _ => {}
+    }
+    run
+}
+
+/// The ids `items(ready)` answers over the `Platform` scope.
+async fn ready_ids<S: ReadStore>(case: &str, store: &S) -> Vec<ItemId> {
+    row_ids(
+        &store
+            .items(
+                &platform_scope(),
+                &ItemFilter {
+                    ready: Some(true),
+                    ..ItemFilter::default()
+                },
+            )
+            .await
+            .expect(case),
+    )
+}
+
+/// MOD-144 Δ2, Δ8: `create_run` refuses a second graph run while one is live — `queued`,
+/// `running`, `awaiting_approval` and `stopped` alike — with `startable`'s sentence naming the
+/// derived state and nothing written; once the run is `done` or `failed`, a new one is admitted.
+async fn create_run_refuses_a_second_live_graph_run<S: WriteStore>(store: &S) {
+    const CASE: &str = "create_run_refuses_a_second_live_graph_run";
+    let at = seam_clock();
+    let item = minted(CASE, store, "one live run").await;
+    let before = &item_row(CASE, store, item).await;
+    let run = run_at(CASE, store, item, at, 0, RunStatus::Queued).await;
+    let refuse = |state: ItemState| async move {
+        let refused = store
+            .create_run(new_run(ids::PROJECT_HTUI, item, Vec::new()))
+            .await;
+        assert!(
+            matches!(&refused, Err(StoreError::Constraint(sentence))
+                if *sentence == not_startable(state)),
+            "{CASE}: a `{state}` run refuses a second, got {refused:?}"
+        );
+        assert_eq!(
+            store.runs(item).await.expect(CASE).len(),
+            1,
+            "{CASE}: the refusal at `{state}` wrote no run"
+        );
+        assert_eq!(
+            &item_row(CASE, store, item).await,
+            before,
+            "{CASE}: nor anything to the item"
+        );
+    };
+    refuse(ItemState::Queued).await;
+    for (from, to, state) in [
+        (RunStatus::Queued, RunStatus::Running, ItemState::Running),
+        (
+            RunStatus::Running,
+            RunStatus::AwaitingApproval,
+            ItemState::NeedsYou,
+        ),
+        (
+            RunStatus::AwaitingApproval,
+            RunStatus::Running,
+            ItemState::Running,
+        ),
+        (RunStatus::Running, RunStatus::Stopped, ItemState::Stopped),
+        (RunStatus::Stopped, RunStatus::Running, ItemState::Running),
+    ] {
+        assert!(
+            store.transition_run(run, from, to, at).await.expect(CASE),
+            "{CASE}: run {from} -> {to}"
+        );
+        refuse(state).await;
+    }
+    store
+        .finish_run(run, RunStatus::Done, None, at)
+        .await
+        .expect(CASE);
+    let after_done = run_at(CASE, store, item, at, 1, RunStatus::Queued).await;
+    assert_eq!(
+        state_of(CASE, store, item).await,
+        ItemState::Queued,
+        "{CASE}: after `done` a new run is admitted"
+    );
+    store
+        .finish_run(after_done, RunStatus::Failed, Some("boom"), at)
+        .await
+        .expect(CASE);
+    run_at(CASE, store, item, at, 2, RunStatus::Queued).await;
+    assert_eq!(
+        store.runs(item).await.expect(CASE).len(),
+        3,
+        "{CASE}: after `failed` a new run is admitted too"
+    );
+    for status in [Status::Blocked] {
+        let other = minted(CASE, store, "blocked").await;
+        assert!(
+            store
+                .transition(other, Status::Open, status)
+                .await
+                .expect(CASE),
+            "{CASE}: open -> {status}"
+        );
+        let refused = store
+            .create_run(new_run(ids::PROJECT_HTUI, other, Vec::new()))
+            .await;
+        assert!(
+            matches!(&refused, Err(StoreError::Constraint(sentence))
+                if *sentence == not_startable(ItemState::Blocked)),
+            "{CASE}: a blocked item does not start, got {refused:?}"
+        );
+    }
+}
+
+/// MOD-144 (plan "Ready"): an `open` item with only cancelled graph runs is ready; one whose
+/// latest graph run is `done` or `failed` is not (nor, by `startable`, one with a live run).
+async fn readiness_skips_cancelled_runs<S: WriteStore>(store: &S) {
+    const CASE: &str = "readiness_skips_cancelled_runs";
+    let at = seam_clock();
+    let cancelled = minted(CASE, store, "only cancelled").await;
+    let done = minted(CASE, store, "done").await;
+    let failed = minted(CASE, store, "failed").await;
+    let queued = minted(CASE, store, "queued").await;
+    for item in [cancelled, done, failed, queued] {
+        assert!(
+            ready_ids(CASE, store).await.contains(&item),
+            "{CASE}: a fresh open item is ready"
+        );
+    }
+    run_at(CASE, store, cancelled, at, 0, RunStatus::Cancelled).await;
+    run_at(CASE, store, cancelled, at, 1, RunStatus::Cancelled).await;
+    run_at(CASE, store, done, at, 0, RunStatus::Done).await;
+    run_at(CASE, store, failed, at, 0, RunStatus::Failed).await;
+    run_at(CASE, store, queued, at, 0, RunStatus::Queued).await;
+    let ready = ready_ids(CASE, store).await;
+    assert!(
+        ready.contains(&cancelled),
+        "{CASE}: cancelled runs are skipped, so the item is still ready"
+    );
+    for (item, why) in [
+        (done, "a done run"),
+        (failed, "a failed run"),
+        (queued, "a live run"),
+    ] {
+        assert!(!ready.contains(&item), "{CASE}: {why} makes it not ready");
+    }
+    // A cancel after a `done` run does not make the item ready again: `done` is still latest.
+    run_at(CASE, store, done, at, 1, RunStatus::Cancelled).await;
+    assert!(
+        !ready_ids(CASE, store).await.contains(&done),
+        "{CASE}: a cancel after `done` leaves it finished, not ready"
+    );
+}
+
+/// MOD-144 (plan "Released"): a `blocked_by` target is released by its latest graph run being
+/// `done`, while the target itself is still `open`. The fixture's FEAT-2 is blocked by FEAT-1,
+/// whose rework run RUN_4 is live; cancelling RUN_4 leaves RUN_1 `done` latest.
+async fn a_done_run_releases_its_dependents<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_done_run_releases_its_dependents";
+    assert!(
+        store
+            .transition(ids::HTUI_FEAT_2, Status::Blocked, Status::Open)
+            .await
+            .expect(CASE),
+        "{CASE}: FEAT-2 is unblocked, so only its blocker decides"
+    );
+    assert!(
+        !ready_ids(CASE, store).await.contains(&ids::HTUI_FEAT_2),
+        "{CASE}: FEAT-1 is running, so FEAT-2 waits"
+    );
+    store
+        .finish_run(ids::RUN_4, RunStatus::Cancelled, None, seam_clock())
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (
+            item_row(CASE, store, ids::HTUI_FEAT_1).await.status,
+            state_of(CASE, store, ids::HTUI_FEAT_1).await
+        ),
+        (Status::Open, ItemState::Done),
+        "{CASE}: FEAT-1 is `open` and finished"
+    );
+    assert!(
+        ready_ids(CASE, store).await.contains(&ids::HTUI_FEAT_2),
+        "{CASE}: a `done` latest run releases FEAT-2 though FEAT-1 is not closed"
+    );
+}
+
+/// MOD-144 (plan "Released"): a rework run on a finished target un-releases it, and cancelling
+/// the rework releases it again.
+async fn a_rework_run_holds_dependents_until_cancelled<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_rework_run_holds_dependents_until_cancelled";
+    assert!(
+        store
+            .transition(ids::HTUI_FEAT_2, Status::Blocked, Status::Open)
+            .await
+            .expect(CASE),
+        "{CASE}: FEAT-2 is unblocked"
+    );
+    store
+        .finish_run(ids::RUN_4, RunStatus::Cancelled, None, seam_clock())
+        .await
+        .expect(CASE);
+    assert!(
+        ready_ids(CASE, store).await.contains(&ids::HTUI_FEAT_2),
+        "{CASE}: FEAT-1 finished, FEAT-2 ready"
+    );
+    let rework = run_at(
+        CASE,
+        store,
+        ids::HTUI_FEAT_1,
+        seam_clock(),
+        60,
+        RunStatus::Queued,
+    )
+    .await;
+    assert!(
+        !ready_ids(CASE, store).await.contains(&ids::HTUI_FEAT_2),
+        "{CASE}: a rework run on FEAT-1 holds FEAT-2 again"
+    );
+    store
+        .finish_run(rework, RunStatus::Cancelled, None, seam_clock())
+        .await
+        .expect(CASE);
+    assert!(
+        ready_ids(CASE, store).await.contains(&ids::HTUI_FEAT_2),
+        "{CASE}: its cancel releases FEAT-2"
+    );
+}
+
+/// MOD-144 (plan "Waiting-on-you"): a candidate is `blocked`, or owns a run at
+/// `awaiting_approval`; an `open` item over a finished run is not one, nor is a resumed park.
+async fn waiting_candidates_follow_blocked_items_and_parked_runs<S: WriteStore>(store: &S) {
+    const CASE: &str = "waiting_candidates_follow_blocked_items_and_parked_runs";
+    let at = seam_clock();
+    let parked = minted(CASE, store, "parked").await;
+    let parked_run = run_at(CASE, store, parked, at, 0, RunStatus::AwaitingApproval).await;
+    let finished = minted(CASE, store, "finished").await;
+    run_at(CASE, store, finished, at, 0, RunStatus::Done).await;
+    let blocked = minted(CASE, store, "blocked").await;
+    assert!(
+        store
+            .transition(blocked, Status::Open, Status::Blocked)
+            .await
+            .expect(CASE),
+        "{CASE}: open -> blocked"
+    );
+    let listed = |rows: Vec<WaitingCandidate>| -> Vec<ItemId> {
+        rows.into_iter().map(|row| row.item.id).collect()
+    };
+    let rows = listed(
+        store
+            .waiting_candidates(&platform_scope())
+            .await
+            .expect(CASE),
+    );
+    assert!(
+        rows.contains(&parked),
+        "{CASE}: an open item over a park is listed"
+    );
+    assert!(
+        rows.contains(&blocked),
+        "{CASE}: a blocked item without a run is listed"
+    );
+    assert!(
+        !rows.contains(&finished),
+        "{CASE}: an open item over a finished run is not"
+    );
+
+    assert!(
+        store
+            .transition_run(
+                parked_run,
+                RunStatus::AwaitingApproval,
+                RunStatus::Running,
+                at
+            )
+            .await
+            .expect(CASE),
+        "{CASE}: the park is answered"
+    );
+    assert!(
+        store
+            .transition(blocked, Status::Blocked, Status::Open)
+            .await
+            .expect(CASE),
+        "{CASE}: the blocked item is cleared"
+    );
+    let rows = listed(
+        store
+            .waiting_candidates(&platform_scope())
+            .await
+            .expect(CASE),
+    );
+    for gone in [parked, blocked] {
+        assert!(!rows.contains(&gone), "{CASE}: {gone} waits on no one now");
+    }
+}
+
+/// MOD-144 (ANA-35 §7.1, PD18): `done` closes an `open` item whose latest graph run is `done` —
+/// a newer cancelled run changes nothing — and nothing else; a `blocked` finished item is refused
+/// `done`; a newer failed run makes it unfinished again. Each refusal names the item's state.
+async fn close_out_law_reads_the_latest_graph_run<S: WriteStore>(store: &S) {
+    const CASE: &str = "close_out_law_reads_the_latest_graph_run";
+    let at = seam_clock();
+    let close = |item: ItemId, resolution: Resolution| async move {
+        store
+            .close_out(item, resolution, new_document(item, "summary", None), &[])
+            .await
+    };
+    let refused_as = |result: Result<Document, StoreError>, item, state, resolution| {
+        assert!(
+            matches!(&result, Err(StoreError::Constraint(sentence))
+                if *sentence == resolution_not_closable(item, state, resolution)),
+            "{CASE}: `{state}` does not close as `{resolution}`, got {result:?}"
+        );
+    };
+
+    // An open item that never finished: `done` is refused.
+    let finished = minted(CASE, store, "finished").await;
+    refused_as(
+        close(finished, Resolution::Done).await,
+        finished,
+        ItemState::Open,
+        Resolution::Done,
+    );
+    // Finished, then a cancelled run: still finished.
+    run_at(CASE, store, finished, at, 0, RunStatus::Done).await;
+    run_at(CASE, store, finished, at, 1, RunStatus::Cancelled).await;
+    assert_eq!(
+        state_of(CASE, store, finished).await,
+        ItemState::Done,
+        "{CASE}: a cancel after `done` leaves the item finished"
+    );
+
+    // Blocked and finished (PD18): `done` and `concluded` are refused, `withdrawn` closes.
+    let blocked = minted(CASE, store, "blocked finished").await;
+    run_at(CASE, store, blocked, at, 0, RunStatus::Done).await;
+    assert!(
+        store
+            .transition(blocked, Status::Open, Status::Blocked)
+            .await
+            .expect(CASE),
+        "{CASE}: open -> blocked"
+    );
+    for resolution in [Resolution::Done, Resolution::Concluded] {
+        refused_as(
+            close(blocked, resolution).await,
+            blocked,
+            ItemState::Blocked,
+            resolution,
+        );
+    }
+
+    // Done, then a newer failed run: the latest is `failed`, so `done` is refused.
+    let failed = minted(CASE, store, "failed after done").await;
+    run_at(CASE, store, failed, at, 0, RunStatus::Done).await;
+    run_at(CASE, store, failed, at, 1, RunStatus::Failed).await;
+    refused_as(
+        close(failed, Resolution::Done).await,
+        failed,
+        ItemState::Failed,
+        Resolution::Done,
+    );
+
+    // Nothing above wrote a summary or moved an item.
+    for item in [finished, blocked, failed] {
+        assert!(
+            store.documents(item).await.expect(CASE).is_empty(),
+            "{CASE}: no refusal wrote a summary"
+        );
+    }
+
+    close(finished, Resolution::Done)
+        .await
+        .unwrap_or_else(|error| panic!("{CASE}: a finished open item closes as done: {error}"));
+    close(blocked, Resolution::Withdrawn)
+        .await
+        .unwrap_or_else(|error| panic!("{CASE}: a blocked item closes as withdrawn: {error}"));
+    close(failed, Resolution::Withdrawn)
+        .await
+        .unwrap_or_else(|error| panic!("{CASE}: a failed item closes as withdrawn: {error}"));
+    for (item, resolution) in [
+        (finished, Resolution::Done),
+        (blocked, Resolution::Withdrawn),
+        (failed, Resolution::Withdrawn),
+    ] {
+        let row = item_row(CASE, store, item).await;
+        assert_eq!(
+            (row.status, row.resolution),
+            (Status::Closed, Some(resolution)),
+            "{CASE}: the item closed as `{resolution}`"
+        );
+    }
+}
+
+/// MOD-144 Δ9 (ANA-35 §7.1 `default_for`): a finished run whose snapshot's last phase outputs
+/// `verdict` reads back through `run` (Postgres: a JSONB round trip) with that kind, so the
+/// picker starts on `concluded`, which closes the item.
+async fn a_finished_snapshot_defaults_a_verdict_to_concluded<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_finished_snapshot_defaults_a_verdict_to_concluded";
+    let at = seam_clock();
+    let item = minted(CASE, store, "an analysis").await;
+    let phase = |position: i32, name: &str, output_kind: &str| crate::model::SnapshotPhase {
+        position,
+        name: name.to_owned(),
+        fan_out: 1,
+        gate: Gate::Never,
+        gate_effective: Gate::Never,
+        gate_hard: false,
+        retry_limit: 0,
+        input_kinds: Vec::new(),
+        output_kind: output_kind.to_owned(),
+        isolation: Isolation::Worktree,
+        command_queue: CommandQueue::Off,
+        verify_command: None,
+        deadline_seconds: None,
+        template: crate::model::SnapshotTemplate {
+            name: name.to_owned(),
+            version: 1,
+        },
+        token_budget: None,
+        candidates: Vec::new(),
+        judge: None,
+        persona: None,
+    };
+    let mut snapshot = run_snapshot();
+    snapshot.phases = vec![
+        phase(0, "research", "research"),
+        phase(1, "verdict", "verdict"),
+    ];
+    let run = store
+        .create_run(NewRun {
+            graph_snapshot: snapshot,
+            ..new_run(ids::PROJECT_HTUI, item, Vec::new())
+        })
+        .await
+        .expect(CASE)
+        .id;
+    assert!(
+        store
+            .transition_run(run, RunStatus::Queued, RunStatus::Running, at)
+            .await
+            .expect(CASE),
+        "{CASE}: the run starts"
+    );
+    store
+        .finish_run(run, RunStatus::Done, None, at)
+        .await
+        .expect(CASE);
+
+    let row = run_row(CASE, store, run).await;
+    let kind = row
+        .graph_snapshot
+        .as_ref()
+        .and_then(GraphSnapshot::last_output_kind);
+    assert_eq!(
+        kind.as_deref(),
+        Some("verdict"),
+        "{CASE}: the stored snapshot's last phase outputs a verdict"
+    );
+    assert_eq!(
+        state_of(CASE, store, item).await,
+        ItemState::Done,
+        "{CASE}: the item is finished"
+    );
+    let default = Resolution::default_for(Status::Open, kind.as_deref());
+    assert_eq!(
+        default,
+        Resolution::Concluded,
+        "{CASE}: a verdict starts the picker on concluded"
+    );
+    store
+        .close_out(item, default, new_document(item, "summary", None), &[])
+        .await
+        .unwrap_or_else(|error| panic!("{CASE}: the default closes the item: {error}"));
+    assert_eq!(
+        item_row(CASE, store, item).await.resolution,
+        Some(Resolution::Concluded),
+        "{CASE}: closed as concluded"
+    );
+}
+
+/// MOD-144 (ANA-35 §7.1's table, Decision A): one minted item per derivation row, each read back
+/// through `items()`, the `states` filter, `links()`'s node and `requirement_coverage` — every
+/// projection derives the same state from the stored status and the latest graph run.
+async fn item_state_is_derived_from_the_latest_graph_run<S: WriteStore>(store: &S) {
+    const CASE: &str = "item_state_is_derived_from_the_latest_graph_run";
+    let at = seam_clock();
+    let mut rows: Vec<(ItemId, ItemState)> = Vec::new();
+    for (title, runs, state) in [
+        ("no run", &[][..], ItemState::Open),
+        ("queued", &[RunStatus::Queued][..], ItemState::Queued),
+        ("running", &[RunStatus::Running][..], ItemState::Running),
+        (
+            "parked",
+            &[RunStatus::AwaitingApproval][..],
+            ItemState::NeedsYou,
+        ),
+        ("stopped", &[RunStatus::Stopped][..], ItemState::Stopped),
+        ("done", &[RunStatus::Done][..], ItemState::Done),
+        ("failed", &[RunStatus::Failed][..], ItemState::Failed),
+        (
+            "cancelled only",
+            &[RunStatus::Cancelled][..],
+            ItemState::Open,
+        ),
+        (
+            "failed then cancelled",
+            &[RunStatus::Failed, RunStatus::Cancelled][..],
+            ItemState::Failed,
+        ),
+        (
+            "done then failed",
+            &[RunStatus::Done, RunStatus::Failed][..],
+            ItemState::Failed,
+        ),
+    ] {
+        let item = minted(CASE, store, title).await;
+        for (seconds, &status) in (0_i64..).zip(runs) {
+            run_at(CASE, store, item, at, seconds, status).await;
+        }
+        rows.push((item, state));
+    }
+    let blocked = minted(CASE, store, "blocked over done").await;
+    run_at(CASE, store, blocked, at, 0, RunStatus::Done).await;
+    assert!(
+        store
+            .transition(blocked, Status::Open, Status::Blocked)
+            .await
+            .expect(CASE),
+        "{CASE}: open -> blocked"
+    );
+    rows.push((blocked, ItemState::Blocked));
+    let closed = minted(CASE, store, "closed over failed").await;
+    run_at(CASE, store, closed, at, 0, RunStatus::Failed).await;
+    store
+        .close_out(
+            closed,
+            Resolution::Withdrawn,
+            new_document(closed, "summary", None),
+            &[],
+        )
+        .await
+        .expect(CASE);
+    rows.push((closed, ItemState::Closed));
+
+    let listed = store
+        .items(&platform_scope(), &ItemFilter::default())
+        .await
+        .expect(CASE);
+    for &(item, state) in &rows {
+        assert_eq!(
+            state_of(CASE, store, item).await,
+            state,
+            "{CASE}: the client-side derivation"
+        );
+        let summary = listed
+            .iter()
+            .find(|row| row.id == item)
+            .unwrap_or_else(|| panic!("{CASE}: {item} is listed"));
+        assert_eq!(summary.state(), state, "{CASE}: `items` carries the state");
+        let filtered = store
+            .items(
+                &platform_scope(),
+                &ItemFilter {
+                    states: Some(vec![state]),
+                    ..ItemFilter::default()
+                },
+            )
+            .await
+            .expect(CASE);
+        assert!(
+            filtered.iter().any(|row| row.id == item),
+            "{CASE}: the `states` filter keeps a `{state}` item"
+        );
+        assert!(
+            filtered.iter().all(|row| row.state() == state),
+            "{CASE}: and only `{state}` items"
+        );
+        let graph = store.links(item, 0).await.expect(CASE);
+        assert_eq!(
+            graph.node(item).map(crate::model::LinkNode::state),
+            Some(state),
+            "{CASE}: the link graph's node carries the state"
+        );
+        store
+            .cite(item, ids::REQ_ENT_2, CitationKind::Addresses, None)
+            .await
+            .expect(CASE);
+    }
+    let coverage = store
+        .requirement_coverage(ids::REQ_ENT_2)
+        .await
+        .expect(CASE);
+    for &(item, state) in &rows {
+        let row = coverage
+            .iter()
+            .find(|row| row.item.id == item)
+            .unwrap_or_else(|| panic!("{CASE}: {item} covers R-ENT-2"));
+        assert_eq!(
+            row.item.state(),
+            state,
+            "{CASE}: coverage carries the state"
+        );
+    }
+}
+
+/// MOD-144 (B7): `transition` never touches `closed_at` or `version`; only close-out sets
+/// `closed_at`.
+async fn transition_never_touches_closed_at<S: WriteStore>(store: &S) {
+    const CASE: &str = "transition_never_touches_closed_at";
+    let item = minted(CASE, store, "closed_at").await;
+    let before = item_row(CASE, store, item).await;
+    assert_eq!(before.closed_at, None, "{CASE}: a fresh item is not closed");
+    for (from, to) in [
+        (Status::Open, Status::Blocked),
+        (Status::Blocked, Status::Open),
+    ] {
+        assert!(
+            store.transition(item, from, to).await.expect(CASE),
+            "{CASE}: {from} -> {to}"
+        );
+        let row = item_row(CASE, store, item).await;
+        assert_eq!(
+            (row.closed_at, row.version, row.resolution),
+            (None, before.version, None),
+            "{CASE}: {from} -> {to} leaves closed_at, version and resolution"
+        );
+    }
+    store
+        .close_out(
+            item,
+            Resolution::Withdrawn,
+            new_document(item, "summary", None),
+            &[],
+        )
+        .await
+        .expect(CASE);
+    let closed = item_row(CASE, store, item).await;
+    assert!(
+        closed.closed_at.is_some(),
+        "{CASE}: close-out is what stamps closed_at"
+    );
+    assert_eq!(
+        closed.version, before.version,
+        "{CASE}: close-out is not a spec edit either"
     );
 }
 
