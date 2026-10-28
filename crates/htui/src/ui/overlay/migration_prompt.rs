@@ -227,7 +227,7 @@ mod tests {
         );
     }
 
-    /// At 60 columns a long question wraps inside the box rather than losing its end.
+    /// At 40 columns a long question wraps inside the box rather than losing its end.
     #[test]
     fn a_narrow_screen_wraps_the_question() {
         let lines = drawn(Some(12), Keys::compiled(), (40, 12));
