@@ -612,7 +612,8 @@ second `LoadCredentialEncrypted=` line for it; the worker reads it as
 [its last source](#where-the-qdrant-api-key-comes-from). It travels like the DSN: one line on
 `ssh`'s standard input, after the sudo password and before the DSN, handed to `systemd-creds` by
 the remote `sh`'s `printf` builtin. With no key in the keyring nothing about a key is written, and
-the unit is exactly the [sample below](#running-it-as-a-systemd-service). A keyring that cannot be
+the unit is exactly the [sample below](#running-it-as-a-systemd-service), unless the host already
+holds the key's credential from an earlier run (see below). A keyring that cannot be
 read is a warning (`warning: the OS keyring could not be read for a Qdrant API key (…);
 provisioning <destination> without one`), and the run goes on without a key. A key that holds a
 line break is refused before anything is sent; store it again with `htui --set-qdrant-key`. The
@@ -624,10 +625,12 @@ A host already provisioned and running is not sent the key by a plain re-run, wh
 `--replace-credential` encrypts the key again together with the DSN. When the host's `sh` has no
 `printf` builtin (as in posh or mksh), sending the key is refused, so the note says to encrypt it
 on the host by hand instead: the credential and its `LoadCredentialEncrypted=` line in the unit,
-as in [Running it as a systemd service](#running-it-as-a-systemd-service). Re-provisioning with
-`--replace-credential` after the key was removed from this machine's keyring writes the unit
-without the key's line; the old `/etc/credstore.encrypted/htui-qdrant-key` stays on the host,
-unused, until you remove it (`sudo rm /etc/credstore.encrypted/htui-qdrant-key`).
+as in [Running it as a systemd service](#running-it-as-a-systemd-service). A re-run without a key
+(from another machine, or with a keyring that cannot be read) and without `--replace-credential`
+keeps a key credential already on the host, and the unit it writes again still loads it.
+Re-provisioning with `--replace-credential` after the key was removed from this machine's keyring
+writes the unit without the key's line; the old `/etc/credstore.encrypted/htui-qdrant-key` stays
+on the host, unused, until you remove it (`sudo rm /etc/credstore.encrypted/htui-qdrant-key`).
 
 **Do not provision through a sudo configured with `log_input`.** The DSN and the Qdrant API key
 reach `systemd-creds` on sudo's standard input, so such a sudo would record them in its I/O log

@@ -1377,6 +1377,47 @@ async fn replace_credential_re_encrypts_the_key_too() {
     sweep_run(&world, &shell, &dropped);
 }
 
+/// MOD-158 D11 (repair finding): a keyed host whose worker stopped, re-provisioned from a machine
+/// with no key and without `--replace-credential`, keeps its key credential and the unit's line
+/// for it; only `--replace-credential` drops the line (R-11).
+#[tokio::test]
+async fn a_rerun_without_a_key_keeps_the_hosts_key_line() {
+    let world = World::new("nopasswd");
+    let shell = LocalShell::new(&world);
+    let keyed = provision(
+        &world,
+        &shell,
+        Setup {
+            qdrant_key: Some(QDRANT_KEY),
+            ..Setup::default()
+        },
+    )
+    .await;
+    assert_eq!(keyed.outcome(), &provisioned());
+    assert_eq!(
+        std::fs::read_to_string(world.unit()).expect("the unit"),
+        world.expected_unit(true)
+    );
+    sweep_run(&world, &shell, &keyed);
+
+    // The worker has stopped: the unit is installed but not running, so it is written again.
+    world.state("active", "failed");
+    let keyless = provision(&world, &shell, Setup::default()).await;
+    assert_eq!(keyless.outcome(), &provisioned());
+    assert_eq!(
+        std::fs::read_to_string(world.unit()).expect("the unit"),
+        world.expected_unit(true),
+        "the unit still loads the key credential"
+    );
+    assert!(
+        std::fs::read(world.qdrant_credential()).expect("the key credential")
+            == format!("ENCRYPTED({QDRANT_KEY}\n)").as_bytes(),
+        "the key credential is kept"
+    );
+    assert_no_leftovers(&world);
+    sweep_run(&world, &shell, &keyless);
+}
+
 /// MOD-158 D11: the key is handed to `printf` as the password is, so a host whose `sh` has no
 /// `printf` builtin is refused before anything is written, even with NOPASSWD.
 #[tokio::test]

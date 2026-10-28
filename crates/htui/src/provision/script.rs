@@ -144,8 +144,10 @@ exit "$rc"
 /// qkey (MOD-158 D11). Stdin: with `qkey=1`, the Qdrant API key line, held in a shell variable
 /// only and handed to `systemd-creds` through the `printf` builtin (PREFLIGHT checks it is one);
 /// then the DSN line. Each is encrypted when its credential is absent or `replace=1`, otherwise
-/// discarded. With the key the unit loads both credentials; without it the unit is the one
-/// written before D11, byte for byte. Credentials, then unit, then start. Its first line of output
+/// discarded. With the key the unit loads both credentials. Without it, a key credential already
+/// on the host keeps its unit line, unless `replace=1` drops it (the key was removed; the file
+/// stays, R-11); with no such credential the unit is the one written before D11, byte for byte.
+/// Credentials, then unit, then start. Its first line of output
 /// is the marker `htui.root=start`.
 pub const INSTALL_ROOT: &str = r#"set -eu
 root=$1
@@ -178,6 +180,8 @@ if [ "$qkey" = 1 ]; then
     mv -f -- "$qcred.new" "$qcred"
   fi
   unset qk
+fi
+if [ -e "$qcred" ] && { [ "$qkey" = 1 ] || [ "$replace" != 1 ]; }; then
   cl="$cl${nl}LoadCredentialEncrypted=htui-qdrant-key:/etc/credstore.encrypted/htui-qdrant-key"
 fi
 if [ ! -e "$cred" ] || [ "$replace" = 1 ]; then
@@ -533,32 +537,30 @@ WantedBy=multi-user.target
         assert_eq!(unit, GUIDE_UNIT);
     }
 
-    /// `$cl`, as INSTALL_ROOT's own lines compute it, with `qkey` set to `qkey`: its `nl` and every
-    /// `cl=` assignment, the key's inside its `if`, run under `sh`.
-    fn credential_lines(qkey: &str) -> String {
+    /// `$cl`, as INSTALL_ROOT's own lines compute it, with `qkey` and `replace` set and the key's
+    /// credential file present on the host or not (`held`): its `nl`, the DSN's `cl=` and the
+    /// key's `cl=` inside its own `if`, run under `sh`.
+    fn credential_lines(qkey: &str, replace: &str, held: bool) -> String {
         let lines: Vec<&str> = INSTALL_ROOT.lines().collect();
         let nl = line_of(INSTALL_ROOT, "nl=\"");
         assert_eq!(lines[nl + 1], "\"", "nl is a literal newline");
-        let mut snippet = format!("qkey={qkey}\nnl=\"\n\"\n");
-        for line in lines.iter().map(|line| line.trim()) {
-            if line.starts_with("cl=") {
-                snippet.push_str(line);
-                snippet.push('\n');
-            }
-        }
-        let key_at = line_of(&snippet, "htui-qdrant-key");
-        let guarded: Vec<String> = snippet
-            .lines()
-            .enumerate()
-            .map(|(i, line)| {
-                if i == key_at {
-                    format!("if [ \"$qkey\" = 1 ]; then {line}; fi")
-                } else {
-                    line.to_owned()
-                }
-            })
-            .collect();
-        let script = format!("set -eu\n{}\nprintf \"%s\" \"$cl\"\n", guarded.join("\n"));
+        let dsn = line_of(INSTALL_ROOT, "cl=\"LoadCredentialEncrypted=htui-dsn");
+        let key = line_of(INSTALL_ROOT, "cl=\"$cl${nl}");
+        assert!(lines[key - 1].starts_with("if "), "{}", lines[key - 1]);
+        assert_eq!(lines[key + 1], "fi");
+        let qcred = if held {
+            "/"
+        } else {
+            "/htui-no-such-credential"
+        };
+        let script = format!(
+            "set -eu\nqkey={qkey}\nreplace={replace}\nqcred={qcred}\nnl=\"\n\"\n{}\n{}\n{}\n{}\n\
+             printf \"%s\" \"$cl\"\n",
+            lines[dsn],
+            lines[key - 1],
+            lines[key],
+            lines[key + 1]
+        );
         let out = std::process::Command::new("sh")
             .args(["-c", &script])
             .output()
@@ -571,8 +573,9 @@ WantedBy=multi-user.target
         String::from_utf8(out.stdout).expect("utf-8")
     }
 
-    /// MOD-158 D11: with the key, the unit names both credentials, the DSN's first; without it, the
-    /// unit is the guide's sample, byte for byte.
+    /// MOD-158 D11: with the key, the unit names both credentials, the DSN's first. Without it, a
+    /// key credential already on the host keeps its line unless `replace=1` (the key was removed,
+    /// R-11); with none, the unit is the guide's sample, byte for byte.
     #[test]
     fn the_unit_with_a_key_names_both_credentials() {
         let (body, _, _) = heredoc();
@@ -582,22 +585,28 @@ WantedBy=multi-user.target
             "the heredoc's credential line is $cl"
         );
         assert!(!body.contains("LoadCredentialEncrypted"), "{body}");
-        assert_eq!(credential_lines("0"), DSN_LINE);
-        assert_eq!(credential_lines("1"), format!("{DSN_LINE}\n{KEY_LINE}"));
+        let both = format!("{DSN_LINE}\n{KEY_LINE}");
+        for replace in ["0", "1"] {
+            assert_eq!(credential_lines("0", replace, false), DSN_LINE);
+            assert_eq!(credential_lines("1", replace, true), both);
+        }
+        assert_eq!(
+            credential_lines("0", "0", true),
+            both,
+            "a re-run without a key keeps the host's key line"
+        );
+        assert_eq!(
+            credential_lines("0", "1", true),
+            DSN_LINE,
+            "--replace-credential without a key drops it (R-11)"
+        );
 
+        // The guard comes after the key's credential is written.
         let key_line = line_of(INSTALL_ROOT, "cl=\"$cl${nl}");
-        let lines: Vec<&str> = INSTALL_ROOT.lines().collect();
-        let open = line_of(INSTALL_ROOT, "if [ \"$qkey\" = 1 ]; then");
-        let close = lines
-            .iter()
-            .enumerate()
-            .skip(open)
-            .find(|(_, line)| **line == "fi")
-            .map(|(i, _)| i)
-            .expect("the key's if is closed");
+        let written = line_of(INSTALL_ROOT, r#"mv -f -- "$qcred.new" "$qcred""#);
         assert!(
-            open < key_line && key_line < close,
-            "the second line only with qkey=1"
+            written < key_line - 1,
+            "the key's line is decided once it is written"
         );
     }
 
