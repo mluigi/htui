@@ -7,7 +7,12 @@
 **Complexity**: Large (a model change on the run's frozen record, read by every engine path; both stores'
 graph writers; a migration; resolve; resume). Every task leaves
 `cargo check --workspace --all-targets --all-features` green.
-**Status**: draft, awaiting CONFIRM.
+**Status**: CONFIRMED 2026-10-27; blueprint `.claude/plans/mod-138-m1-snapshot-v2.blueprint.md` (`c3daa9c5`).
+Blueprint amendments **A1-A4 accepted by the maintainer 2026-10-28** and binding over the text below:
+A1 `split` is a derived accessor, not a snapshot field; A2 T1→T2→T3→T4 serial on the primary tree (the lift and
+`snapshot_of`'s 1|2 read move to T1), then T5 ∥ T6 in worktrees; A3 `delete_workspace` refuses while a kind or
+item holds one of its graphs; A4 a new `WriteStore::usable_graphs(project)` read. Seven (not six) v1-resume tests
+move to v1 fixtures; the orch conformance suite is fake-only.
 
 ## Summary
 
