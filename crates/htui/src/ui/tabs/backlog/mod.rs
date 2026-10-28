@@ -35,31 +35,35 @@ pub mod filter;
 pub mod item_form;
 pub mod list;
 
+mod hints;
+mod navigation;
+mod queue;
+mod writes;
+
 use std::cell::Cell;
 
-use htui_core::model::{ItemId, ItemKindId, ItemSummary, ProjectId, RunId, Scope, Status, StepId};
+use htui_core::model::{ItemId, ItemKindId, ItemSummary, ProjectId, RunId, Scope, StepId};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 
 use crate::app::{Action, Ctx, Handled, RevealTarget};
 use crate::editor::ExternalEditOutcome;
-use crate::item_writes::{self, ItemDivergence, ItemFormContext, ItemWrite};
+use crate::item_writes;
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
-use crate::store_worker::{QUEUE_REQUEST_NAMES, QueueView, QueueWrite, StoreReply, StoreRequest};
+use crate::store_worker::{QUEUE_REQUEST_NAMES, StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
-use crate::ui::kit::{chips::key_line, modal::modal_rest, pane::capture_area, scroll::Step};
-use crate::ui::queue_status::queue_sentence;
+use crate::ui::kit::{chips::key_line, pane::capture_area, scroll::Step};
 use crate::ui::shell::{ListSize, PaneAreas, PaneId, Panes, TabLayout, TabLoc};
 use crate::ui::tabs::backlog::detail::{
     BodyTab, DetailId, DetailRegistry, DocumentsTab, GraphTab, NotesTab, PromptTab, ReqsTab,
     RunsTab,
 };
-use crate::ui::tabs::backlog::filter::{BacklogFilter, FilterForm, FormOutcome};
-use crate::ui::tabs::backlog::item_form::{
-    Busy, ItemForm, ItemFormOutcome, mint_may_have_landed, mint_may_have_landed_in_the_old_scope,
-};
+use crate::ui::tabs::backlog::filter::{BacklogFilter, FilterForm};
+use crate::ui::tabs::backlog::hints::{LIST_SEP, styled_spans};
+use crate::ui::tabs::backlog::item_form::ItemForm;
 use crate::ui::tabs::backlog::list::{ListView, Selection};
+use crate::ui::tabs::backlog::navigation::{ITEM_CURSOR, PROJECT_CURSOR, parse_cursor};
 use crate::ui::tabs::registry::{CLOSE_THE_FIELD_FIRST, Tab, TabId};
 use crossterm::event::{KeyEvent, MouseEvent};
 
@@ -73,54 +77,12 @@ pub const BACKLOG_LAYOUT: TabLayout = TabLayout {
     ..TabLayout::DEFAULT
 };
 
-/// How a [`Selection`] is written into a [`TabLoc`] cursor: `item:{id}:{key}` (the key names a
-/// miss, as a reveal's does) or `project:{id}` (MOD-115 M2 §8).
-const ITEM_CURSOR: &str = "item";
-
-/// The project-header half of the cursor format beside [`ITEM_CURSOR`].
-const PROJECT_CURSOR: &str = "project";
-
-/// How far the link traversal behind the Graph sub-tab reaches: its deepest view (MOD-14 D2).
-/// Fetched once per selection and filtered by `+`/`-` locally, so a depth change costs no read and
-/// each of the seven reads stays one reply per selection (blueprint C.2).
-const HOPS: u8 = GraphTab::MAX_HOPS;
-
 /// `StoreRequest::Items`' name: what a refused list read is answered `Failed` under.
 const ITEMS_READ: &str = "items";
 
 /// Refreshes between two `Runs` polls: five of the shell's one-second refreshes, so 5 s (MOD-41
 /// plan D16, OQ-3).
 const REFRESHES_PER_RUNS_POLL: u32 = 5;
-
-/// The Backlog's own keys under the list (MOD-67 M5 Q1 a, PA-5): `j/k move · h/l sub-tab ·
-/// f filter · N new · e edit` under the defaults, 50 cells of the list pane's 53 at 100 columns.
-/// The queue keys stay in the `?` box.
-const LIST_HINT: HintSpec = &[
-    Hint::Pair(Act::ListDown, Act::ListUp, "move"),
-    Hint::Pair(Act::PanePrevSubtab, Act::PaneNextSubtab, "sub-tab"),
-    Hint::One(Act::BacklogOpenFilter, "filter"),
-    Hint::One(Act::BacklogNewItem, "new"),
-    Hint::One(Act::Edit, "edit"),
-];
-
-/// What joins the focused pane's keys and [`LIST_HINT`] in the shell's hint row (MOD-67 M6 T2).
-const LIST_SEP: &str = " \u{b7} ";
-
-/// `line`'s spans, each with the line's own style under its own, so two lines join into one row
-/// without either losing its look (MOD-67 M6 T2).
-fn styled_spans(line: Line<'static>) -> Vec<Span<'static>> {
-    let base = line.style;
-    line.spans
-        .into_iter()
-        .map(|span| {
-            let style = base.patch(span.style);
-            span.style(style)
-        })
-        .collect()
-}
-
-/// MOD-12 D9: what `Q` says with the cursor on a project header.
-const NO_ITEM_TO_QUEUE: &str = "select an item to queue";
 
 /// MOD-12 D9: the toggle `Q` or `P` asked for, decided by the `QueueState` read it is waiting on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,17 +180,6 @@ impl BacklogTab {
     /// Identity of the Backlog tab.
     pub const ID: TabId = TabId("backlog");
 
-    /// The list's own keys (MOD-67 M5 Q1 a, the shell's hint row since M6 T2), read through the
-    /// active pane's stack; `None` while the filter form, the item form or a sub-tab captures,
-    /// since a hint for keys a field is typing would lie, and when no key of [`LIST_HINT`] is
-    /// bound.
-    fn list_hint(&self, keys: &Keys) -> Option<String> {
-        if self.form.is_some() || self.item_form.is_some() || self.detail.captures_input() {
-            return None;
-        }
-        Some(keys.hint(self.detail.key_stack(), LIST_HINT)).filter(|hint| !hint.is_empty())
-    }
-
     /// Where the list, the detail and the open filter form are drawn this frame, from the panes
     /// the shell's layout gave the tab (`areas`) over the tab's whole `area`.
     ///
@@ -318,465 +269,6 @@ impl BacklogTab {
     #[must_use]
     pub fn selected_item(&self) -> Option<ItemId> {
         self.item().map(|item| item.id)
-    }
-
-    /// Moves the cursor to a row and, when that is a different item, re-reads its detail.
-    ///
-    /// The seven reads go out together rather than per sub-tab, so switching sub-tabs costs
-    /// nothing and no sub-tab has to know when it became visible. They are seven distinct request
-    /// kinds, so the shell's staleness index keeps them apart and a reply to the previous
-    /// selection is dropped rather than shown under the new one (blueprint C.2).
-    ///
-    /// The sixth is MOD-2 milestone 9's preview (plan D102). It goes out with the others even
-    /// though it is the expensive one, for the same reason they do: the pane must be populated
-    /// before it is looked at, and the work happens on a task of its own either way (`R-NF-3`).
-    ///
-    /// The seventh is MOD-39 plan P12's: the item's requirement citations for the Reqs sub-tab.
-    fn go(&mut self, next: Option<Selection>, ctx: &Ctx<'_>) {
-        if next == self.selected {
-            return;
-        }
-        self.selected = next;
-        let item = match next {
-            Some(Selection::Item(id)) => Some(id),
-            _ => None,
-        };
-        self.detail.on_item_change(item);
-        let Some(id) = item else { return };
-        self.read_item(id, ctx);
-    }
-
-    /// The seven per-item reads [`go`](Self::go) sends, factored out so an applied edit can send
-    /// them for an unchanged selection (MOD-13 milestone 2 A5). It does not reset the sub-tabs:
-    /// they keep their state and take the fresh replies.
-    fn read_item(&self, id: ItemId, ctx: &Ctx<'_>) {
-        ctx.request(StoreRequest::Item(id));
-        ctx.request(StoreRequest::Runs(id));
-        ctx.request(StoreRequest::Links { id, hops: HOPS });
-        ctx.request(StoreRequest::Documents(id));
-        ctx.request(StoreRequest::Notes(id));
-        ctx.request(StoreRequest::PromptPreview {
-            item: id,
-            template_name: None,
-            scope: ctx.scope.clone(),
-        });
-        ctx.request(StoreRequest::ItemRequirements(id));
-    }
-
-    /// The rows the list pane draws, which are the only rows the cursor may reach: the one rule
-    /// [`list::visible`] gives both (MOD-13 review M2). "Filtered" is the title's own test, a
-    /// summary to show.
-    fn rows(&self, ctx: &Ctx<'_>) -> Vec<Selection> {
-        let filtered = self.shown.summary(ctx.projects).is_some();
-        list::visible(&self.items, ctx.projects, &self.folded, filtered)
-    }
-
-    /// Moves the cursor `delta` rows, clamped to the ends of the list.
-    fn step(&mut self, delta: isize, ctx: &Ctx<'_>) {
-        let rows = self.rows(ctx);
-        let Some(last) = rows.len().checked_sub(1) else {
-            return;
-        };
-        let current = self.index(&rows).unwrap_or(0);
-        let next = current.saturating_add_signed(delta).min(last);
-        self.go(rows.get(next).copied(), ctx);
-    }
-
-    /// Moves the cursor to the first or the last row (`g` / `G`).
-    fn jump(&mut self, to_end: bool, ctx: &Ctx<'_>) {
-        let rows = self.rows(ctx);
-        let target = if to_end { rows.last() } else { rows.first() };
-        self.go(target.copied(), ctx);
-    }
-
-    /// Where the cursor sits among the visible rows.
-    fn index(&self, rows: &[Selection]) -> Option<usize> {
-        rows.iter().position(|row| Some(*row) == self.selected)
-    }
-
-    /// Folds or unfolds the selected group. Only a project header row the pane draws folds.
-    fn fold(&mut self, ctx: &Ctx<'_>) -> Handled {
-        let Some(Selection::Project(id)) = self.selected else {
-            return Handled::Pass;
-        };
-        if self.index(&self.rows(ctx)).is_none() {
-            return Handled::Pass;
-        }
-        if let Some(at) = self.folded.iter().position(|folded| *folded == id) {
-            self.folded.remove(at);
-        } else {
-            self.folded.push(id);
-        }
-        Handled::Consumed
-    }
-
-    /// Keeps the cursor on a row that still exists after a new `Items` reply, preferring the
-    /// first item over the project header it sits under.
-    /// A filter nothing matches has no row, so the cursor goes to `None` and the detail resets
-    /// (MOD-13 review M2).
-    fn reselect(&mut self, ctx: &Ctx<'_>) {
-        let rows = self.rows(ctx);
-        if self.index(&rows).is_some() {
-            return;
-        }
-        let first_item = rows
-            .iter()
-            .find(|row| matches!(row, Selection::Item(_)))
-            .or_else(|| rows.first());
-        self.go(first_item.copied(), ctx);
-    }
-
-    /// Unfolds `project` and moves the cursor to `id`, reading its detail (MOD-64 D235).
-    fn select_item(&mut self, id: ItemId, project: ProjectId, ctx: &Ctx<'_>) {
-        self.folded.retain(|folded| *folded != project);
-        self.go(Some(Selection::Item(id)), ctx);
-    }
-
-    /// MOD-69 plan D8: opens the Runs sub-tab and hands it the reveal's run and step. The item is
-    /// already selected; `was_selected` says `go` short-circuited, so no `Runs` read went out and
-    /// one is asked here for the pane to apply the focus to (blueprint A-5).
-    fn focus_runs(
-        &mut self,
-        id: ItemId,
-        run: Option<RunId>,
-        step: Option<StepId>,
-        was_selected: bool,
-        ctx: &Ctx<'_>,
-    ) {
-        self.detail.select_id(RunsTab::ID);
-        if run.is_none() && step.is_none() {
-            return; // a Reopen row: the item and its Runs pane are the target
-        }
-        self.detail.focus(RunsTab::ID, run, step, ctx);
-        if was_selected {
-            ctx.request(StoreRequest::Runs(id));
-        }
-    }
-
-    /// A key while the filter form is open (MOD-13 D1).
-    ///
-    /// Every plain key the form does not use is consumed; CONTROL, ALT and function keys pass
-    /// (`BACKLOG_FILTER`'s modal layer, MOD-67 M5), so `ctrl-c` quits, `Ctrl+f` searches and `F1`
-    /// opens help.
-    fn on_form_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
-        let Some(form) = self.form.as_mut() else {
-            return Handled::Pass;
-        };
-        // MOD-115 M2 RV1 M: the form resolves its acts from the chord pressed (`Ctx::pressed`).
-        let pressed = ctx.pressed(&key);
-        match form.on_pressed(key, pressed, ctx.keys()) {
-            FormOutcome::Pass => {
-                return modal_rest(views::BACKLOG_FILTER, pressed);
-            }
-            FormOutcome::Stay => {}
-            FormOutcome::Cancel => self.form = None,
-            FormOutcome::Refused(sentence) => ctx.emit(Action::Error(sentence)),
-            FormOutcome::Apply(filter) => {
-                self.form = None;
-                self.apply(filter, ctx);
-            }
-        }
-        Handled::Consumed
-    }
-
-    /// Sets the filter and re-reads: one `Items`, the request kind the unfiltered list uses, so
-    /// the shell's staleness index supersedes an earlier read (MOD-13 D2). An unchanged filter
-    /// still reads.
-    fn apply(&mut self, filter: BacklogFilter, ctx: &Ctx<'_>) {
-        self.filter = filter;
-        // A filtered reply must not decide a reveal sent before it (D251): the item may be
-        // hidden. An unfiltered one may, and is the read a reveal miss waits for (review N5).
-        if !self.filter.is_empty() {
-            self.pending_reveal = None;
-        }
-        ctx.request(self.filter.to_request(ctx.scope));
-    }
-
-    /// MOD-13 milestone 2 D7: `N` reads the form's catalogue for the selected item's project, a
-    /// selected header's project, else the first scope project. The selected item's kind is the
-    /// hint (§9 decision 4).
-    fn open_new(&mut self, ctx: &Ctx<'_>) {
-        let target = match self.selected {
-            Some(Selection::Item(_)) => self
-                .item()
-                .map(|item| (item.project_id, Some(item.kind_id))),
-            Some(Selection::Project(project)) => Some((project, None)),
-            None => None,
-        }
-        .or_else(|| ctx.projects.first().map(|first| (first.project_id, None)));
-        let Some((project, kind)) = target else {
-            return;
-        };
-        self.opening = Some(Opening {
-            project,
-            item: None,
-            kind,
-        });
-        ctx.request(StoreRequest::ItemForm {
-            project,
-            item: None,
-        });
-    }
-
-    /// D7: `e` reads the selected item fresh with its project's catalogue; with no item
-    /// selected nothing is sent.
-    fn open_edit(&mut self, ctx: &Ctx<'_>) {
-        let Some((project, id)) = self.item().map(|item| (item.project_id, item.id)) else {
-            return;
-        };
-        self.opening = Some(Opening {
-            project,
-            item: Some(id),
-            kind: None,
-        });
-        ctx.request(StoreRequest::ItemForm {
-            project,
-            item: Some(id),
-        });
-    }
-
-    /// MOD-12 D9: `Q`. A finished item is refused here and nothing is sent; any other reads the
-    /// queue first, and the reply decides between queue and dequeue.
-    fn toggle_queued(&mut self, ctx: &Ctx<'_>) {
-        let Some(item) = self.item() else {
-            ctx.emit(Action::Error(NO_ITEM_TO_QUEUE.to_owned()));
-            return;
-        };
-        if matches!(item.status, Status::Done | Status::Closed) {
-            ctx.emit(Action::Error(format!(
-                "{} is {}: nothing to queue",
-                item.key, item.status
-            )));
-            return;
-        }
-        self.queue_intent = Some(QueueIntent::Item {
-            id: item.id,
-            key: item.key.clone(),
-        });
-        ctx.request(StoreRequest::QueueState);
-    }
-
-    /// MOD-12 D9: the queue as it is now decides the write the pending toggle sends, and spends
-    /// the toggle: one intent is at most one write (review NIT-intent). A read nobody here asked
-    /// for (no intent) is ignored.
-    fn on_queue(&mut self, view: &QueueView, ctx: &Ctx<'_>) {
-        let Some(intent) = self.queue_intent.take() else {
-            return;
-        };
-        let request = match intent {
-            QueueIntent::Item { id, key } => {
-                let request = if view.entries.contains(&id) {
-                    StoreRequest::DequeueItem { item: id }
-                } else {
-                    StoreRequest::QueueItem {
-                        item: id,
-                        workspace: ctx.scope.workspace_id,
-                    }
-                };
-                self.queue_writing = Some((id, key));
-                request
-            }
-            // M3 review R1 M1: the write carries the state this read saw, so a queue that
-            // changed between the read and the write refuses it rather than flipping the other way.
-            QueueIntent::Pause => match view.open_batch {
-                Some(batch) => StoreRequest::PauseQueue {
-                    expect: Some(batch),
-                },
-                None => StoreRequest::ResumeQueue {
-                    expect_paused: true,
-                },
-            },
-        };
-        ctx.request(request);
-    }
-
-    /// MOD-12 D9: a queue write landed; the status line says what it did. A toggle pressed since
-    /// is left for its own read (review NIT-intent).
-    fn on_queue_written(&mut self, write: &QueueWrite, view: &QueueView, ctx: &Ctx<'_>) {
-        let key = match write {
-            QueueWrite::Queued { item } | QueueWrite::Dequeued { item, .. } => {
-                match self.queue_writing.take_if(|(id, _)| id == item) {
-                    Some((_, key)) => key,
-                    None => self
-                        .items
-                        .iter()
-                        .find(|row| row.id == *item)
-                        .map_or_else(|| item.to_string(), |row| row.key.clone()),
-                }
-            }
-            QueueWrite::Resumed { .. }
-            | QueueWrite::Paused { .. }
-            | QueueWrite::Moved { .. }
-            | QueueWrite::Stale { .. } => String::new(),
-        };
-        let pause = ctx
-            .keys()
-            .label(self.detail.key_stack(), Act::BacklogPauseQueue);
-        ctx.emit(Action::Error(queue_sentence(
-            write,
-            &key,
-            view,
-            pause.as_deref(),
-        )));
-    }
-
-    /// A key while the item form is open (D8, A7).
-    ///
-    /// Every plain key is consumed, used by the form or not: a passed `q`, digit, `w`, `?` or
-    /// `Tab` would act globally (blueprint §8). The form already applied its stack's pass rule
-    /// (`ITEM_FORM`/`ITEM_DIVERGENCE`, MOD-67 M5): a `Pass` is a CONTROL, ALT or function key it
-    /// did not use.
-    fn on_item_form_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
-        let Some(form) = self.item_form.as_mut() else {
-            return Handled::Pass;
-        };
-        // MOD-115 M2 RV1 M: the form resolves its acts from the chord pressed (`Ctx::pressed`).
-        match form.on_pressed(key, ctx.pressed(&key), ctx.keys()) {
-            ItemFormOutcome::Pass => return Handled::Pass,
-            ItemFormOutcome::Stay => {}
-            ItemFormOutcome::Cancel => self.item_form = None,
-            ItemFormOutcome::Reload(project) => ctx.request(StoreRequest::ItemForm {
-                project,
-                item: None,
-            }),
-            ItemFormOutcome::Save(request) => ctx.request(request),
-            ItemFormOutcome::External(edit) => ctx.emit(Action::EditExternally(edit)),
-        }
-        Handled::Consumed
-    }
-
-    /// An `ItemForm` reply: a reloading form re-targets (E7); otherwise it opens a form only when
-    /// it answers the read `N`/`e` sent (E8) and nothing else captures meanwhile.
-    ///
-    /// Review M1: an edit opens only while its item is still the selected one. The cursor may
-    /// have moved while the read was out, and a form on the old item would sit under the new
-    /// selection's header.
-    fn on_item_form(&mut self, context: &ItemFormContext, ctx: &Ctx<'_>) {
-        if let Some(form) = self.item_form.as_mut() {
-            if form.busy() == Some(Busy::Reloading(context.project)) && context.item.is_none() {
-                form.retarget(context.clone());
-            }
-            return;
-        }
-        let Some(opening) = self.opening.take() else {
-            return;
-        };
-        let answers = opening.project == context.project
-            && opening.item == context.item.as_ref().map(|item| item.id);
-        let moved = opening.item.is_some() && opening.item != self.selected_item();
-        if !answers || moved || self.form.is_some() || self.detail.captures_input() {
-            return;
-        }
-        self.item_form = match opening.item {
-            None => Some(ItemForm::open_new(
-                context.clone(),
-                ctx.projects,
-                opening.kind,
-            )),
-            Some(_) => ItemForm::open_edit(context.clone()),
-        };
-    }
-
-    /// An applied write lands only on the write in flight (MOD-59's self-naming rule).
-    ///
-    /// An edit closes the form and re-reads the item and the list under the active filter (D9,
-    /// A5). The item's reads go out only while it is still selected (review M1): a list that
-    /// moved the cursor off it would otherwise put its fresh Body under another item's header,
-    /// and the list re-read alone carries the edit then. A mint closes it and reveals the new
-    /// item, whose miss branch clears the filter (A5).
-    fn on_item_written(&mut self, item: ItemId, outcome: &ItemWrite, ctx: &mut Ctx<'_>) {
-        let Some(form) = self.item_form.as_ref() else {
-            return;
-        };
-        match outcome {
-            ItemWrite::Edited { .. }
-                if form.busy() == Some(Busy::Editing) && form.item_id() == Some(item) =>
-            {
-                self.item_form = None;
-                if self.selected == Some(Selection::Item(item)) {
-                    self.read_item(item, ctx);
-                }
-                ctx.request(self.filter.to_request(ctx.scope));
-            }
-            ItemWrite::Minted { key } if form.busy() == Some(Busy::Minting) => {
-                self.item_form = None;
-                Tab::reveal(
-                    self,
-                    &RevealTarget::Item {
-                        id: item,
-                        key: key.clone(),
-                    },
-                    ctx,
-                );
-            }
-            ItemWrite::Edited { .. } | ItemWrite::Minted { .. } => {}
-        }
-    }
-
-    /// Milestone 3 D1, D3: a stale edit opens the three-way view, only on the form whose save it
-    /// answers: busy editing this item, and the reply's ancestor at this form's token. A late reply
-    /// from an earlier token (a resolution has since moved it) is dropped, as one for another item
-    /// is.
-    fn on_item_diverged(&mut self, divergence: &ItemDivergence) {
-        if let Some(form) = self.item_form.as_mut()
-            && form.busy() == Some(Busy::Editing)
-            && form.item_id() == Some(divergence.head.id)
-            && form.token() == Some(divergence.ancestor.version)
-        {
-            form.open_divergence(divergence);
-        }
-    }
-
-    /// An item request's `Failed`. `App::on_reply` already reports every `Failed` on the status
-    /// line (A8), so the tab adds no `Action::Error` of its own but in one case below.
-    ///
-    /// A refused form read opens nothing (D2). A mint that may have followed a COMMIT is hedged
-    /// and the whole list re-read, the filter cleared so it cannot hide the item (D11, §10.1,
-    /// §10.2); a refusal given before the insert is said plainly with nothing re-read.
-    ///
-    /// Review L4, the one case: such a mint `Failed` that finds no minting form (a scope change
-    /// dropped it, and a form opened since is not the mint's) has nowhere to show its hedge, so
-    /// the tab emits a status-line hedge as an `Action::Error`. It is drained after `App`'s plain
-    /// report, so the hedge is what the status line keeps. Nothing is re-read: the item would be
-    /// the old scope's, so the hedge promises no re-read and no Ctrl+S, and names that scope. A
-    /// refused mint stays silent there, `App`'s report says it all.
-    fn on_item_failed(&mut self, request: &str, message: &str, ctx: &Ctx<'_>) {
-        let busy = self.item_form.as_ref().and_then(ItemForm::busy);
-        match (request, busy) {
-            (item_writes::FORM_NAME, Some(Busy::Reloading(_))) => {
-                if let Some(form) = self.item_form.as_mut() {
-                    form.settle(Some(message.to_owned()));
-                }
-            }
-            (item_writes::FORM_NAME, _) => self.opening = None,
-            (item_writes::MINT_NAME, Some(Busy::Minting)) => {
-                let refused = item_writes::mint_refused(message);
-                if let Some(form) = self.item_form.as_mut() {
-                    form.settle(Some(if refused {
-                        message.to_owned()
-                    } else {
-                        mint_may_have_landed(
-                            message,
-                            ctx.keys().label(views::ITEM_FORM, Act::FormSave).as_deref(),
-                        )
-                    }));
-                }
-                if !refused {
-                    self.apply(BacklogFilter::default(), ctx);
-                }
-            }
-            (item_writes::MINT_NAME, _) if !item_writes::mint_refused(message) => {
-                ctx.emit(Action::Error(mint_may_have_landed_in_the_old_scope(
-                    message,
-                )));
-            }
-            (item_writes::EDIT_NAME, Some(Busy::Editing)) => {
-                if let Some(form) = self.item_form.as_mut() {
-                    form.settle(Some(message.to_owned()));
-                }
-            }
-            _ => {}
-        }
     }
 }
 
@@ -1249,20 +741,6 @@ fn replay_miss(keys: &Keys) -> String {
     match keys.hint(views::RUNS_BROWSE, STEP_KEYS) {
         moves if moves.is_empty() => "select a step in the Runs pane to replay it".to_owned(),
         moves => format!("select a step in the Runs pane ({moves}) to replay it"),
-    }
-}
-
-/// The [`Selection`] a [`TabLoc`] cursor written by [`BacklogTab`]'s `location` names, with an
-/// item's key (empty for a project header); `None` for any other string (MOD-115 M2 §8).
-fn parse_cursor(cursor: &str) -> Option<(Selection, String)> {
-    let mut parts = cursor.splitn(3, ':');
-    match (parts.next()?, parts.next()?) {
-        (ITEM_CURSOR, id) => Some((
-            Selection::Item(id.parse().ok()?),
-            parts.next().unwrap_or_default().to_owned(),
-        )),
-        (PROJECT_CURSOR, id) => Some((Selection::Project(id.parse().ok()?), String::new())),
-        _ => None,
     }
 }
 
