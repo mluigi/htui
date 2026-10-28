@@ -1491,6 +1491,20 @@ impl MemStore {
         })
     }
 
+    /// MOD-138 T5: replaces `run.graph_snapshot` as no writer does (a run's snapshot is frozen,
+    /// `R-ORCH-11`), on this store and every clone of it; `updated_at` does not move. The v1
+    /// resume fixtures rewrite a run's snapshot through it. Whether the run exists.
+    #[cfg(feature = "test-support")]
+    pub fn set_run_snapshot(&self, run: RunId, snapshot: Value) -> bool {
+        self.write(|state| {
+            state
+                .runs
+                .get_mut(&run)
+                .map(|row| row.graph_snapshot = Some(snapshot))
+                .is_some()
+        })
+    }
+
     /// This handle's "now": its injected clock, else `Utc::now()` untruncated (blueprint B21).
     fn now(&self) -> DateTime<Utc> {
         self.clock.now()
@@ -13534,6 +13548,37 @@ mod tests {
             .await
             .expect("running -> awaiting_approval is legal");
         id
+    }
+
+    /// MOD-138 T5's seam: the frozen blob is replaced on every clone, nothing else on the row
+    /// moves, and an unknown run answers `false`.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn set_run_snapshot_replaces_the_frozen_blob_and_nothing_else() {
+        let store = MemStore::demo();
+        let clone = store.clone();
+        let before = store
+            .run(ids::RUN_1)
+            .await
+            .expect("reads")
+            .expect("RUN_1 exists");
+        let blob = serde_json::json!({ "v": 1, "rewritten": true });
+        assert!(store.set_run_snapshot(ids::RUN_1, blob.clone()));
+        let after = clone
+            .run(ids::RUN_1)
+            .await
+            .expect("reads")
+            .expect("RUN_1 exists");
+        assert_eq!(after.graph_snapshot, Some(blob));
+        assert_eq!(
+            crate::model::Run {
+                graph_snapshot: before.graph_snapshot.clone(),
+                ..after
+            },
+            before,
+            "only the snapshot moved"
+        );
+        assert!(!store.set_run_snapshot(RunId::new(), serde_json::json!({})));
     }
 
     /// `create_run` is one transaction (plan D6): the `run` row and the item's move to `queued`
