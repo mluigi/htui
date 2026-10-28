@@ -204,7 +204,7 @@ async fn typed_letters_and_digits_are_query_text() {
 }
 
 #[tokio::test]
-async fn enter_searches_and_lists_hits_as_the_cli_prints_them() {
+async fn enter_searches_and_lists_hits_in_rank_order() {
     let index = seeded().await;
     let mut harness = open(Some(Arc::clone(&index))).await;
     search(&mut harness, MIXED).await;
