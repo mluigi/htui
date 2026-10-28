@@ -8,12 +8,12 @@ Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat         1 w
 │  ANA-1    done               Data model, box regist…││Data model, box registry and sync topology │
 │  ANA-2    open               Orchestrator step grap…││ANA-1  ANA  done                           │
 │  CLEAN-1  failed             Drop the legacy markdo…││no tags · priority 0 · version 1           │
-│ ┌ Search concepts ─────────────────────────────────────────────────────────────────────────────┐ │
+│  FEAT-1   in_progress        TUI scaffold           ││                                           │
+│ ╭ Search concepts ─────────────────────────────────────────────────────────────────────────────╮ │
 │ │scope htui · decisions on                                                                     │ │
 │ │query terminal raw panic                                                                      │ │
 │ │                                                                                              │ │
-│ │> FIX-1      item (done)                3.000  FIX-1 Terminal left raw after panic            │ │
-│▾│                                                                                              │a│
+│▾│▌FIX-1      item (done)                best   FIX-1 Terminal left raw after panic             │a│
 │ │                                                                                              │ │
 │ │                                                                                              │ │
 │ │                                                                                              │ │
@@ -22,10 +22,10 @@ Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat         1 w
 │ │                                                                                              │ │
 │ │                                                                                              │ │
 │ │                                                                                              │ │
-│ │1 hit(s)                                                                                      │ │
 │ │                                                                                              │ │
-│ │Enter search/open · Up/Down move · Ctrl+d decisions · Ctrl+p scope · Ctrl+r index · Esc close │ │
-│ └──────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│ │1 hit                                                                                         │ │
+│ │                                                                                              │ │
+│ ╰ Enter search/open · ↑/↓ move · Ctrl+d decisions · Ctrl+p scope · Ctrl+r index · Esc close ───╯ │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │

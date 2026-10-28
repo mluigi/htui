@@ -1,10 +1,16 @@
 //! The concepts search (MOD-64 D233, D234, D236): a modal overlay over the concepts index.
 //!
 //! A query field, a project scope (`Ctrl+P`: every project of the workspace, then each one), a
-//! decisions toggle (`Ctrl+D`) and the last hits, printed as `htui --search-items` prints them
-//! (`concepts::format_hit`, D239). `Enter` searches when the query or a toggle changed since the
-//! last search, and otherwise opens the highlighted hit through `Action::Reveal` (D234, D235).
-//! `Ctrl+R` re-indexes the current scope (D237).
+//! decisions toggle (`Ctrl+D`) and the last hits. `Enter` searches when the query or a toggle
+//! changed since the last search, and otherwise opens the highlighted hit through
+//! `Action::Reveal` (D234, D235). `Ctrl+R` re-indexes the current scope (D237).
+//!
+//! Drawn on the MOD-115 kit (M4 E6): [`Modal`] is the frame, `kit::list` the hits (the `▌` gutter
+//! and the selection band mark the cursor, MOD-85), and the keys sit on the modal's bottom
+//! border. The overlay builds its own rows and index line (M4 C9, D-19): a hit's score reads as a
+//! word relative to the best hit (Q4), counts go through `kit::label::plural`, while
+//! `concepts::format_hit` and `concepts::report_line` stay the CLI's (`htui --search-items`,
+//! `--index-items`).
 //!
 //! Like every view it holds no store handle and no channel: the search and the index run leave
 //! through `Ctx::request` as `StoreRequest::SearchConcepts` / `IndexConcepts`, which the worker
@@ -13,22 +19,26 @@
 //! in this box and nothing else.
 
 use crossterm::event::KeyEvent;
-use htui_core::model::{ProjectId, ProjectRef, Scope};
-use htui_store::vector::{Hit, Owner, SearchQuery};
+use htui_core::model::{ProjectId, ProjectRef, RequirementState, Scope};
+use htui_store::vector::{Hit, Owner, PointType, SearchQuery};
+use htui_store::vector_sync::SyncReport;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use crate::app::{Action, Ctx, Handled, OverlayAction, RevealTarget};
 use crate::concepts;
 use crate::concepts_worker::ConceptsReply;
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::{cell_width, graphemes};
-use crate::ui::layout::centered;
+use crate::ui::kit::label::{self, plural};
+use crate::ui::kit::list::{self, Row, RowKind};
+use crate::ui::kit::modal::{CHROME, Modal, ModalSize};
 use crate::ui::overlay::registry::{Overlay, OverlayId};
+use crate::ui::overlay::workspace_switcher::border_hint;
 use crate::ui::{FieldOutcome, TextField, Theme};
 
 /// The box's title.
@@ -37,20 +47,12 @@ const TITLE: &str = "Search concepts";
 /// In front of the query field.
 const QUERY_LABEL: &str = "query ";
 
-/// Marker in front of the highlighted hit (the switcher's).
-const CURSOR: &str = "> ";
-
-/// The marker's width, in front of every other hit.
-const NO_CURSOR: &str = "  ";
-
 /// Rows of hits: the CLI's default limit, so the box shows every hit a search asks for.
 const HIT_ROWS: u16 = 10;
 
-/// Two borders and the sixteen rows below them.
-const BOX_HEIGHT: u16 = 18;
-
-/// Columns left free around the box.
-const MARGIN: u16 = 4;
+/// The content's rows around the hits: the header, the query, a blank, then the status and the
+/// index rows under the hits.
+const OTHER_ROWS: u16 = 5;
 
 /// The widest the box grows on a wide terminal.
 const MAX_WIDTH: u16 = 120;
@@ -67,8 +69,16 @@ pub const SEARCHING: &str = "searching…";
 /// While a `Ctrl+R` run is going.
 pub const INDEXING: &str = "indexing…";
 
-/// Before the first search.
-pub const IDLE: &str = "type a query; Enter searches";
+/// Before the first search: the field's submit key in force names how to search (MOD-115 M4
+/// MD-A), `submit` being `FieldSubmit`'s label through `CONCEPTS_QUERY`; with none bound only the
+/// first half is said.
+#[must_use]
+pub fn idle(submit: Option<&str>) -> String {
+    match submit {
+        Some(submit) => format!("type a query; {submit} searches"),
+        None => "type a query".to_owned(),
+    }
+}
 
 /// A workspace with no project: nothing is sent (D233).
 pub const NO_PROJECTS: &str = "this workspace has no projects";
@@ -88,14 +98,25 @@ pub fn no_matches(reindex: Option<&str>) -> String {
     }
 }
 
-/// After the list, when the query or a toggle moved since it was searched.
-pub const CHANGED: &str = "changed — Enter searches again";
+/// After the list, when the query or a toggle moved since it was searched; `submit` as in
+/// [`idle`].
+#[must_use]
+pub fn changed(submit: Option<&str>) -> String {
+    match submit {
+        Some(submit) => format!("changed \u{2014} {submit} searches again"),
+        None => "changed".to_owned(),
+    }
+}
 
-/// The keys, under everything (MOD-67 D9). `Enter` is the field's own (D13); the short `scope`
-/// and `index` labels keep the row inside the box at 100 columns (L-E Q5, maintainer 2026-10-08).
+/// Where a missing or unreachable index is fixed (MOD-115 M4 E6, MOD-83).
+const QDRANT_PLACE: &str = "Settings \u{203a} Qdrant";
+
+/// The keys, on the bottom border (MOD-67 D9). `Enter` is the field's own submit (D13), named
+/// through `Keys` (MOD-115 M4 MD-A); the short `scope` and `index` labels and the arrows as the
+/// header writes them keep the row on the border at 100 columns (L-E Q5, maintainer 2026-10-08).
 const HINT: HintSpec = &[
-    Hint::Text("Enter search/open"),
-    Hint::Pair(Act::ConceptsUp, Act::ConceptsDown, "move"),
+    Hint::One(Act::FieldSubmit, "search/open"),
+    Hint::Glyphs(Act::ConceptsUp, Act::ConceptsDown, "move"),
     Hint::One(Act::ConceptsDecisions, "decisions"),
     Hint::One(Act::ConceptsProject, "scope"),
     Hint::One(Act::ConceptsReindex, "index"),
@@ -255,14 +276,15 @@ impl ConceptsSearch {
             return (notice.to_owned(), theme.dim);
         }
         if let Some(error) = &self.error {
-            return (error.clone(), theme.error);
+            return (with_place(error), theme.error);
         }
         if self.searching {
             let text = if self.answered { SEARCHING } else { LOADING };
             return (text.to_owned(), theme.dim);
         }
+        let submit = keys.label(views::CONCEPTS_QUERY, Act::FieldSubmit);
         if self.sent.is_none() {
-            return (IDLE.to_owned(), theme.dim);
+            return (idle(submit.as_deref()), theme.dim);
         }
         let mut text = if self.hits.is_empty() {
             no_matches(
@@ -270,11 +292,11 @@ impl ConceptsSearch {
                     .as_deref(),
             )
         } else {
-            format!("{} hit(s)", self.hits.len())
+            plural(self.hits.len(), "hit", "hits")
         };
         if self.changed(scope) {
             text.push_str(" · ");
-            text.push_str(CHANGED);
+            text.push_str(&changed(submit.as_deref()));
         }
         (text, theme.dim)
     }
@@ -285,7 +307,7 @@ impl ConceptsSearch {
             IndexLine::Idle => (String::new(), theme.dim),
             IndexLine::Running => (INDEXING.to_owned(), theme.dim),
             IndexLine::Done(line) => (line.clone(), theme.dim),
-            IndexLine::Failed(message) => (message.clone(), theme.error),
+            IndexLine::Failed(message) => (with_place(message), theme.error),
         }
     }
 }
@@ -331,7 +353,8 @@ impl Overlay for ConceptsSearch {
         // Only the first candidate counts: an own act acts; `overlay.close` and `global.help`
         // (`F1`) are the shell's, `Ctrl+C` too (D261); `Tab` and the rest are swallowed by
         // `is_modal`.
-        let chord = KeyChord::from_event(key);
+        // The chord as pressed, before the shell's `[field]` translation (MOD-115 M4 MD-A).
+        let chord = ctx.pressed(&key);
         match ctx.keys().actions(views::CONCEPTS_QUERY, chord).first() {
             Some(Act::ConceptsDecisions) => self.decisions = !self.decisions,
             Some(Act::ConceptsProject) => self.cycle_project(ctx.projects),
@@ -381,7 +404,7 @@ impl Overlay for ConceptsSearch {
                 }
             }
             ConceptsReply::Indexed(Ok(report)) => {
-                self.index = IndexLine::Done(concepts::report_line(report));
+                self.index = IndexLine::Done(index_report(report));
             }
             ConceptsReply::Indexed(Err(message)) => {
                 self.index = IndexLine::Failed(message.clone());
@@ -391,27 +414,36 @@ impl Overlay for ConceptsSearch {
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let theme = ctx.theme;
-        let width = area.width.saturating_sub(MARGIN).min(MAX_WIDTH);
-        let box_area = centered(area, width, BOX_HEIGHT);
-        let block = Block::new()
-            .borders(Borders::ALL)
-            .title(Span::styled(format!(" {TITLE} "), theme.title));
-        let inner = block.inner(box_area);
-        frame.render_widget(Clear, box_area);
-        frame.render_widget(block, box_area);
-
-        let [header, query, _blank, hits, status, index, hint] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(HIT_ROWS),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .areas(inner);
-        let cells = usize::from(inner.width);
-        let row = |text: &str, style: Style| Paragraph::new(Line::styled(clip(text, cells), style));
+        let content_w = MAX_WIDTH - CHROME;
+        let hint = border_hint(
+            &ctx.keys().hint(views::CONCEPTS_QUERY, HINT),
+            content_w,
+            area,
+        );
+        // `Fit` keeps the margin round the box, so the header row stays uncovered (MOD-82); on a
+        // screen too short for every hit row, the hit rows give way.
+        let content = Modal::new(TITLE)
+            .size(ModalSize::Fit {
+                content_w,
+                content_h: OTHER_ROWS + HIT_ROWS,
+            })
+            .hint(&hint)
+            .render(frame, area, theme);
+        let hit_rows = content.height.saturating_sub(OTHER_ROWS);
+        let row_at = |at: u16, height: u16| Rect {
+            y: content.y.saturating_add(at).min(content.bottom()),
+            height: height.min(content.height.saturating_sub(at)),
+            ..content
+        };
+        let (header, query) = (row_at(0, 1), row_at(1, 1));
+        let hits = row_at(3, hit_rows);
+        let (status, index) = (row_at(3 + hit_rows, 1), row_at(4 + hit_rows, 1));
+        let row = |text: &str, style: Style| {
+            Paragraph::new(list::ellipsize(
+                Line::styled(text.to_owned(), style),
+                content.width,
+            ))
+        };
 
         frame.render_widget(row(&self.header(ctx.projects), theme.dim), header);
 
@@ -419,33 +451,20 @@ impl Overlay for ConceptsSearch {
         let mut spans = vec![Span::styled(QUERY_LABEL, theme.dim)];
         spans.extend(
             self.field
-                .line(inner.width.saturating_sub(label), true, theme)
+                .line(content.width.saturating_sub(label), true, theme)
                 .spans,
         );
         frame.render_widget(Paragraph::new(Line::from(spans)), query);
 
-        let hit_cells = cells.saturating_sub(cell_width(CURSOR));
-        let mut lines: Vec<Line<'static>> = self
-            .hits
-            .iter()
-            .enumerate()
-            .map(|(at, hit)| {
-                let selected = at == self.cursor;
-                let marker = if selected { CURSOR } else { NO_CURSOR };
-                let style = if selected { theme.accent } else { theme.base };
-                Line::styled(
-                    format!("{marker}{}", clip(&concepts::format_hit(hit), hit_cells)),
-                    style,
-                )
-            })
-            .collect();
         let (mut status_text, status_style) = self.status(ctx.scope, theme, ctx.keys());
         let (mut index_text, index_style) = self.index_line(theme);
         if self.hits.is_empty() {
             // Review 8: an error too wide for its row is drawn whole in the empty hit rows, search
             // first, and its own row is left blank rather than repeating the start of it.
+            let cells = usize::from(content.width);
             let status_is_error = self.notice.is_none() && self.error.is_some();
             let index_is_error = matches!(self.index, IndexLine::Failed(_));
+            let mut lines: Vec<Line<'static>> = Vec::new();
             for (is_error, text, style) in [
                 (status_is_error, &mut status_text, status_style),
                 (index_is_error, &mut index_text, index_style),
@@ -459,13 +478,32 @@ impl Overlay for ConceptsSearch {
                     text.clear();
                 }
             }
+            frame.render_widget(Paragraph::new(lines), hits);
+        } else {
+            let best = best_score(&self.hits);
+            let rows: Vec<Row<'static>> = self
+                .hits
+                .iter()
+                .map(|hit| Row {
+                    line: Line::styled(hit_row(hit, best), theme.base),
+                    kind: RowKind::Item,
+                })
+                .collect();
+            let offset =
+                list::scroll_into_view(self.cursor, 0, usize::from(hits.height), rows.len());
+            list::render(
+                frame,
+                hits,
+                &rows,
+                Some(self.cursor),
+                offset,
+                theme.accent,
+                theme,
+            );
         }
-        frame.render_widget(Paragraph::new(lines), hits);
 
         frame.render_widget(row(&status_text, status_style), status);
         frame.render_widget(row(&index_text, index_style), index);
-        let keys = ctx.keys().hint(views::CONCEPTS_QUERY, HINT);
-        frame.render_widget(row(&keys, theme.dim), hint);
     }
 }
 
@@ -484,24 +522,85 @@ fn target(hit: &Hit) -> RevealTarget {
     }
 }
 
-/// `text` cut to at most `cells` display cells, at a grapheme boundary (MOD-54's measure): a wide
-/// glyph that would pass the edge is left out whole, never split.
-fn clip(text: &str, cells: usize) -> String {
-    let mut out = String::new();
-    let mut used = 0;
-    for grapheme in graphemes(text) {
-        let width = cell_width(grapheme);
-        if used + width > cells {
-            break;
-        }
-        used += width;
-        out.push_str(grapheme);
+/// The best score among `hits`, what each hit's word is relative to.
+fn best_score(hits: &[Hit]) -> f32 {
+    hits.iter().map(|hit| hit.score).fold(0.0, f32::max)
+}
+
+/// A hit's score as a word relative to `best`, the top score of its search (MOD-115 M4 Q4): a
+/// fused rank score is comparable only within one search, so the number itself says nothing on
+/// screen. `best` within 0.1% of the top, then `strong` from 66% of it, `fair` from 33%, else
+/// `weak`; a search whose top score is not positive scored every hit alike, so each is `best`.
+#[must_use]
+pub fn score_word(score: f32, best: f32) -> &'static str {
+    if best <= 0.0 || score >= best * 0.999 {
+        return "best";
     }
-    out
+    let ratio = score / best;
+    if ratio >= 0.66 {
+        "strong"
+    } else if ratio >= 0.33 {
+        "fair"
+    } else {
+        "weak"
+    }
+}
+
+/// One hit as the overlay lists it (MOD-115 M4 D-19): the key, where it matched (a closed item's
+/// resolution and a withdrawn requirement named, MOD-50 D227), the score as a word against
+/// `best` ([`score_word`]), then the snippet. The CLI's `concepts::format_hit` prints the number.
+#[must_use]
+pub fn hit_row(hit: &Hit, best: f32) -> String {
+    let place = match (&hit.point_type, &hit.document) {
+        (PointType::Document, Some((_, kind))) => format!("{kind} document"),
+        (PointType::Requirement, _) => "requirement".to_owned(),
+        _ => "item".to_owned(),
+    };
+    let place = match (hit.resolution, hit.state) {
+        (Some(resolution), _) => format!("{place} ({})", label::resolution(resolution)),
+        (None, Some(RequirementState::Withdrawn)) => format!("{place} (withdrawn)"),
+        _ => place,
+    };
+    // The snippet is already stripped of control characters (`vector::snippet`); the key and the
+    // document kind are stripped here, so nothing stored can drive the terminal it is drawn on.
+    let clean = |s: &str| s.chars().filter(|c| !c.is_control()).collect::<String>();
+    format!(
+        "{:<10} {:<26} {:<6} {}",
+        clean(&hit.key),
+        clean(&place),
+        score_word(hit.score, best),
+        hit.snippet
+    )
+}
+
+/// What one index run did, as the overlay says it (MOD-115 M4 D-19): `concepts::report_line`'s
+/// figures, each count with its noun through `kit::label::plural`.
+#[must_use]
+pub fn index_report(report: &SyncReport) -> String {
+    format!(
+        "indexed: {} rebuilt, {} unchanged; {} rebuilt, {} unchanged; {} written, {} removed",
+        plural(report.items_rebuilt, "item", "items"),
+        report.items_unchanged,
+        plural(report.requirements_rebuilt, "requirement", "requirements"),
+        report.requirements_unchanged,
+        plural(report.points_upserted, "point", "points"),
+        report.points_deleted
+    )
+}
+
+/// `error` with where it is fixed (MOD-115 M4 E6, MOD-83): `… — Settings › Qdrant`, unless it
+/// already names a Settings place (`set one in Settings > Qdrant`).
+#[must_use]
+pub fn with_place(error: &str) -> String {
+    if error.contains("Settings") {
+        error.to_owned()
+    } else {
+        format!("{error} \u{2014} {QDRANT_PLACE}")
+    }
 }
 
 /// `text` broken into rows of at most `cells` display cells, at grapheme boundaries (MOD-54's
-/// measure, [`clip`]'s rule): a wide glyph that would pass the edge starts the next row whole,
+/// measure): a wide glyph that would pass the edge starts the next row whole,
 /// never split. A cluster wider than a whole row gets a row to itself rather than being lost.
 fn wrap(text: &str, cells: usize) -> Vec<String> {
     let mut rows = Vec::new();
@@ -531,12 +630,15 @@ mod tests {
     use crate::store_worker::Origin;
     use crate::ui::Theme;
     use crate::ui::cells::cell_width;
+    use crate::ui::kit::list::GUTTER;
     use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
     use htui_core::model::{ProjectRef, WorkspaceId};
     use htui_store::vector::{Owner, PointType};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::style::{Color, Modifier};
 
     /// Everything a `Ctx` borrows, and the `Emit` that makes "nothing was sent" an assertion.
     struct Bench {
@@ -614,12 +716,22 @@ mod tests {
             search.on_reply(&StoreReply::Concepts(Box::new(reply)), &mut self.ctx());
         }
 
+        /// The overlay drawn over a `width`×`height` frame whose first row reads `HEADER`.
+        fn buffer(&self, search: &ConceptsSearch, width: u16, height: u16) -> Buffer {
+            let mut term = Terminal::new(TestBackend::new(width, height)).expect("a test backend");
+            term.draw(|frame| {
+                for x in 0..width {
+                    frame.buffer_mut()[(x, 0)].set_symbol("H");
+                }
+                search.render(frame, frame.area(), &self.ctx());
+            })
+            .expect("the overlay draws");
+            term.backend().buffer().clone()
+        }
+
         /// The overlay drawn over a blank 100×30 frame, one line per row.
         fn render(&self, search: &ConceptsSearch) -> String {
-            let mut term = Terminal::new(TestBackend::new(100, 30)).expect("a test backend");
-            term.draw(|frame| search.render(frame, frame.area(), &self.ctx()))
-                .expect("the overlay draws");
-            let buffer = term.backend().buffer();
+            let buffer = &self.buffer(search, 100, 30);
             let mut out = String::new();
             for y in 0..buffer.area.height {
                 let mut line = String::new();
@@ -810,8 +922,8 @@ mod tests {
         assert_eq!(search.cursor, 1, "clamped at the bottom");
         let frame = bench.render(&search);
         assert!(
-            frame.contains(&format!("{CURSOR}{}", concepts::format_hit(&item_hit()))),
-            "{frame}"
+            frame.contains(&format!("{GUTTER}{}", hit_row(&item_hit(), 2.0))),
+            "the cursor row leads with the kit's gutter: {frame}"
         );
     }
 
@@ -820,10 +932,12 @@ mod tests {
         let bench = Bench::platform();
         let mut search = ConceptsSearch::new();
         searched(&bench, &mut search, "tui", vec![item_hit()]);
-        assert!(!bench.render(&search).contains(CHANGED));
+        let stale = changed(Some("Enter"));
+        assert_eq!(stale, "changed \u{2014} Enter searches again");
+        assert!(!bench.render(&search).contains(&stale));
 
         assert_eq!(bench.ctrl(&mut search, 'd'), Handled::Consumed);
-        assert!(bench.render(&search).contains(CHANGED), "the list is stale");
+        assert!(bench.render(&search).contains(&stale), "the list is stale");
         bench.code(&mut search, KeyCode::Enter);
         let sent = searches(&bench);
         assert_eq!(sent.len(), 1, "Enter searched rather than opened");
@@ -932,7 +1046,9 @@ mod tests {
     fn the_first_search_says_it_loads_the_model_later_ones_say_searching() {
         let bench = Bench::platform();
         let mut search = ConceptsSearch::new();
-        assert!(bench.render(&search).contains(IDLE));
+        assert_eq!(idle(Some("Enter")), "type a query; Enter searches");
+        assert_eq!(idle(None), "type a query");
+        assert!(bench.render(&search).contains(&idle(Some("Enter"))));
         bench.typed(&mut search, "tui");
         bench.code(&mut search, KeyCode::Enter);
         assert!(bench.render(&search).contains(LOADING));
@@ -972,13 +1088,13 @@ mod tests {
         );
         assert!(bench.render(&search).contains(INDEXING));
 
-        let report = htui_store::vector_sync::SyncReport {
+        let report = SyncReport {
             items_rebuilt: 3,
             ..Default::default()
         };
         bench.reply(&mut search, ConceptsReply::Indexed(Ok(report)));
-        // Wider than the box, which clips it like every other row.
-        let line = clip(&concepts::report_line(&report), 94);
+        // Wider than the box, which cuts it like every other row.
+        let line: String = index_report(&report).chars().take(92).collect();
         assert!(bench.render(&search).contains(&line), "{line}");
 
         bench.reply(
@@ -1011,20 +1127,15 @@ mod tests {
         };
         searched(&bench, &mut search, "tui", vec![long.clone()]);
         let frame = bench.render(&search);
-        let expected = clip(&concepts::format_hit(&long), 92);
+        let expected = list::ellipsize(Line::raw(hit_row(&long, 2.0)), 92).to_string();
         assert!(frame.contains(&expected), "{frame}");
-        // 45 cells of key, place and score, then 23 wide glyphs: a 24th would pass the 92nd cell.
-        assert_eq!(
-            cell_width(&expected),
-            91,
-            "whole wide glyphs, none split at the edge"
+        assert!(
+            expected.ends_with('\u{2026}'),
+            "the cut is marked: {expected}"
         );
-        assert_eq!(clip("abc", 2), "ab");
-        assert_eq!(
-            clip("a一b", 2),
-            "a",
-            "a wide glyph that would pass the edge stops the line"
-        );
+        // 45 cells of key, place and score word, then 23 wide glyphs and the ellipsis: a 24th
+        // glyph would pass the 91st cell, so it is left out whole, never split.
+        assert_eq!(cell_width(&expected), 92, "{expected}");
     }
 
     /// Review 8: with no hits to draw, an error wider than its row is drawn whole, wrapped across
@@ -1119,5 +1230,229 @@ mod tests {
     #[test]
     fn hit_rows_is_the_cli_default_limit() {
         assert_eq!(u64::from(HIT_ROWS), concepts::DEFAULT_LIMIT);
+    }
+
+    /// MOD-115 M4 E6 (Q4): a score reads as a word relative to the best hit of its search:
+    /// `best` within 0.1% of it, then `strong` from 0.66, `fair` from 0.33, else `weak`.
+    #[test]
+    fn a_score_reads_as_a_word_relative_to_the_best_hit() {
+        assert_eq!(score_word(3.0, 3.0), "best");
+        assert_eq!(score_word(2.998, 3.0), "best");
+        assert_eq!(score_word(2.0, 3.0), "strong");
+        assert_eq!(score_word(0.66 * 3.0, 3.0), "strong");
+        assert_eq!(score_word(1.0, 3.0), "fair");
+        assert_eq!(score_word(0.33 * 3.0, 3.0), "fair");
+        assert_eq!(score_word(0.9, 3.0), "weak");
+        assert_eq!(score_word(0.0, 0.0), "best", "a search scored all alike");
+    }
+
+    /// MOD-115 M4 E6 (MOD-83, D-19): the overlay builds its own rows: no raw score and no `(s)`
+    /// on screen, the CLI's `format_hit` left as it prints.
+    #[test]
+    fn hits_read_their_scores_in_words_and_count_in_words() {
+        let bench = Bench::platform();
+        let mut search = ConceptsSearch::new();
+        let scored = |key: &str, score: f32| Hit {
+            key: key.to_owned(),
+            score,
+            ..item_hit()
+        };
+        searched(
+            &bench,
+            &mut search,
+            "tui",
+            vec![
+                scored("A-1", 4.0),
+                scored("B-2", 3.0),
+                scored("C-3", 2.0),
+                scored("D-4", 1.0),
+            ],
+        );
+        let frame = bench.render(&search);
+        for (key, word) in [
+            ("A-1", "best"),
+            ("B-2", "strong"),
+            ("C-3", "fair"),
+            ("D-4", "weak"),
+        ] {
+            let line = frame
+                .lines()
+                .find(|line| line.contains(&format!("{key} ")))
+                .unwrap_or_else(|| panic!("{key}: {frame}"));
+            assert!(line.contains(&format!(" {word} ")), "{key} {word}: {line}");
+        }
+        for raw in ["4.000", "3.000", "2.000", "1.000", "hit(s)"] {
+            assert!(!frame.contains(raw), "`{raw}` on screen: {frame}");
+        }
+        assert!(frame.contains("4 hits"), "{frame}");
+        assert!(
+            concepts::format_hit(&item_hit()).contains("2.000"),
+            "the CLI's is kept"
+        );
+
+        let mut search = ConceptsSearch::new();
+        searched(&bench, &mut search, "tui", vec![item_hit()]);
+        assert!(bench.render(&search).contains("1 hit"));
+    }
+
+    /// The row: key, where it matched (a closed item's resolution through `kit::label`), the
+    /// score word, then the snippet.
+    #[test]
+    fn a_hit_row_names_where_it_matched() {
+        let closed = Hit {
+            resolution: Some(htui_core::model::Resolution::Rejected),
+            ..item_hit()
+        };
+        assert_eq!(
+            hit_row(&closed, 2.0),
+            format!(
+                "{:<10} {:<26} {:<6} {}",
+                "FEAT-1", "item (rejected)", "best", "FEAT-1 TUI scaffold"
+            )
+        );
+        let document = Hit {
+            point_type: PointType::Document,
+            document: Some((
+                htui_core::model::DocumentId::default(),
+                "verdict".to_owned(),
+            )),
+            score: 1.0,
+            ..item_hit()
+        };
+        assert!(hit_row(&document, 2.0).starts_with("FEAT-1     verdict document"));
+        assert!(hit_row(&document, 2.0).contains(" fair "));
+    }
+
+    /// MOD-115 M4 E6 (MOD-83): the index run's report counts in words.
+    #[test]
+    fn the_index_report_counts_in_words() {
+        let report = SyncReport {
+            items_rebuilt: 1,
+            items_unchanged: 2,
+            requirements_rebuilt: 3,
+            requirements_unchanged: 4,
+            points_upserted: 5,
+            points_deleted: 6,
+        };
+        assert_eq!(
+            index_report(&report),
+            "indexed: 1 item rebuilt, 2 unchanged; 3 requirements rebuilt, 4 unchanged; \
+             5 points written, 6 removed"
+        );
+    }
+
+    /// MOD-115 M4 E6 (MOD-83): an error names where it is fixed, once.
+    #[test]
+    fn an_error_names_where_to_fix_it() {
+        assert_eq!(
+            with_place("cannot reach Qdrant: refused"),
+            "cannot reach Qdrant: refused \u{2014} Settings \u{203a} Qdrant"
+        );
+        let named = "no Qdrant URL stored; set one in Settings > Qdrant";
+        assert_eq!(with_place(named), named, "already named");
+
+        let bench = Bench::platform();
+        let mut search = ConceptsSearch::new();
+        bench.typed(&mut search, "tui");
+        bench.code(&mut search, KeyCode::Enter);
+        let sent = searches(&bench);
+        bench.reply(
+            &mut search,
+            ConceptsReply::Hits {
+                query: sent[0].clone(),
+                outcome: Err("cannot reach Qdrant: refused".to_owned()),
+            },
+        );
+        assert!(
+            bench
+                .render(&search)
+                .contains("cannot reach Qdrant: refused \u{2014} Settings \u{203a} Qdrant")
+        );
+        bench.reply(
+            &mut search,
+            ConceptsReply::Indexed(Err("qdrant: upsert: refused".to_owned())),
+        );
+        assert!(
+            bench
+                .render(&search)
+                .contains("qdrant: upsert: refused \u{2014} Settings \u{203a} Qdrant")
+        );
+    }
+
+    /// MOD-115 M4 E6 (MD-A): the field's submit key is named through `Keys`, on the border and
+    /// in the idle and stale lines, so a rebound `[field] submit` shows its own chord.
+    #[test]
+    fn a_rebound_submit_is_named_by_the_hint_and_the_lines() {
+        let mut bench = Bench::platform();
+        bench.keys = crate::keys::load_str("version = 1\n[field]\nsubmit = \"ctrl-t\"\n")
+            .expect("the keys load");
+        let search = ConceptsSearch::new();
+        let frame = bench.render(&search);
+        assert!(frame.contains("Ctrl+t search/open"), "{frame}");
+        assert!(frame.contains(&idle(Some("Ctrl+t"))), "{frame}");
+        assert!(!frame.contains("Enter"), "{frame}");
+        assert_eq!(changed(None), "changed");
+    }
+
+    /// MOD-115 M4 E6 (MOD-85): the cursor hit is the kit's gutter and band, legible under
+    /// `NO_COLOR`; the other hits have neither.
+    #[test]
+    fn the_cursor_hit_is_the_band_and_reads_without_colour() {
+        let mut bench = Bench::platform();
+        bench.theme = Theme::monochrome();
+        let mut search = ConceptsSearch::new();
+        let second = Hit {
+            key: "FEAT-2".to_owned(),
+            ..item_hit()
+        };
+        searched(&bench, &mut search, "tui", vec![item_hit(), second]);
+        bench.code(&mut search, KeyCode::Down);
+        let buffer = bench.buffer(&search, 100, 30);
+        let at = |key: &str| {
+            (0..buffer.area.height)
+                .find_map(|y| {
+                    let line: String = (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol().to_owned())
+                        .collect();
+                    line.find(&format!("{key} ")).map(|byte| {
+                        let x = u16::try_from(line[..byte].chars().count()).expect("narrow");
+                        (x, y, line)
+                    })
+                })
+                .unwrap_or_else(|| panic!("{key} is not drawn"))
+        };
+        let (x, y, line) = at("FEAT-2");
+        assert!(line.contains(GUTTER), "{line}");
+        assert!(buffer[(x, y)].modifier.contains(Modifier::REVERSED));
+        let (x, y, line) = at("FEAT-1");
+        assert!(!line.contains(GUTTER), "{line}");
+        assert!(!buffer[(x, y)].modifier.contains(Modifier::REVERSED));
+        for cell in &buffer.content {
+            assert_eq!((cell.fg, cell.bg), (Color::Reset, Color::Reset));
+        }
+    }
+
+    /// MOD-115 M4 E6 (MOD-82): the box keeps the margin, so the header row stays uncovered at 60
+    /// columns, on a tall screen and on a short one; the keys ride its bottom border.
+    #[test]
+    fn the_box_leaves_the_header_row_and_puts_its_keys_on_the_border() {
+        let bench = Bench::platform();
+        let search = ConceptsSearch::new();
+        for (width, height) in [(60, 20), (60, 16), (100, 30)] {
+            let buffer = bench.buffer(&search, width, height);
+            for x in 0..width {
+                assert_eq!(buffer[(x, 0)].symbol(), "H", "{width}x{height}: ({x}, 0)");
+            }
+        }
+        let frame = bench.render(&search);
+        let bottom = frame
+            .lines()
+            .find(|line| line.contains('\u{2570}'))
+            .expect("a rounded box");
+        assert!(bottom.contains("Esc close"), "{frame}");
+        assert!(
+            frame.contains("\u{256d} Search concepts "),
+            "the kit's modal: {frame}"
+        );
     }
 }
