@@ -10,8 +10,9 @@ use crate::store::{Result, StoreError};
 pub const QDRANT_URL_KEY: &str = "qdrant_url";
 
 /// A Qdrant base URL that passed D2: trimmed; `http://` or `https://` (ASCII case-insensitive,
-/// stored lowercase); a non-empty host (a bracketed IPv6 literal allowed); an optional port
-/// 1..=65535; an optional path; no userinfo, query, fragment, whitespace or control character.
+/// stored lowercase); a non-empty host (a bracketed IPv6 literal allowed, with an optional `%25`
+/// zone id); an optional port 1..=65535; an optional path; no userinfo, query, fragment, and no
+/// character outside printable ASCII (whitespace, control and format characters included).
 /// Not secret: `Debug`/`Display` print it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct QdrantUrl(String);
@@ -27,7 +28,9 @@ impl QdrantUrl {
         if text.is_empty() {
             return Err(QdrantUrlError::Empty);
         }
-        if text.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        // Printable ASCII only: `is_control` is just Cc, so a zero-width space or a bidi override
+        // (Cf) would draw a URL on the terminal unlike the one the gRPC client is handed.
+        if !text.chars().all(|c| c.is_ascii_graphic()) {
             return Err(QdrantUrlError::Space);
         }
         let Some((scheme, rest)) = text.split_once("://") else {
@@ -95,6 +98,9 @@ fn check_authority(authority: &str) -> core::result::Result<(), QdrantUrlError> 
             "" => None,
             after => Some(after.strip_prefix(':').ok_or(QdrantUrlError::Port)?),
         };
+        if !is_ipv6_literal(literal) {
+            return Err(QdrantUrlError::NoHost);
+        }
         (literal, port)
     } else {
         match authority.rsplit_once(':') {
@@ -116,14 +122,25 @@ fn check_authority(authority: &str) -> core::result::Result<(), QdrantUrlError> 
     Ok(())
 }
 
+/// An IPv6 address, optionally followed by a non-empty `%25` zone id (RFC 6874).
+fn is_ipv6_literal(literal: &str) -> bool {
+    let (address, zone) = match literal.split_once("%25") {
+        Some((address, zone)) => (address, Some(zone)),
+        None => (literal, None),
+    };
+    zone.is_none_or(|zone| !zone.is_empty()) && address.parse::<core::net::Ipv6Addr>().is_ok()
+}
+
 /// Why a text is not a Qdrant URL. No variant carries the text: a refused URL may hold a password.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum QdrantUrlError {
     /// Nothing but whitespace.
     #[error("the Qdrant URL is empty")]
     Empty,
-    /// Whitespace or a control character inside.
-    #[error("a Qdrant URL may not contain spaces or control characters")]
+    /// A character outside printable ASCII inside: whitespace, a control or a format character.
+    #[error(
+        "a Qdrant URL may only contain printable ASCII characters (no spaces or control characters)"
+    )]
     Space,
     /// Not `http://` or `https://`.
     #[error("a Qdrant URL starts with http:// or https://")]
@@ -284,6 +301,16 @@ mod tests {
         assert_eq!(refused("http://h 1"), QdrantUrlError::Space);
         assert_eq!(refused("http://h\u{1b}[2J"), QdrantUrlError::Space);
         assert_eq!(refused("http://h\t:6334"), QdrantUrlError::Space);
+        // Format characters (Cf) are not `is_control`, yet draw a URL unlike what it is.
+        for text in [
+            "http://h\u{200B}:6334",
+            "http://h\u{202E}x",
+            "http://u\u{FF20}h",
+            "http://h\u{00A0}:6334",
+            "http://h\u{FEFF}",
+        ] {
+            assert_eq!(refused(text), QdrantUrlError::Space, "{text:?}");
+        }
         assert_eq!(refused(""), QdrantUrlError::Empty);
         assert_eq!(refused(" \n "), QdrantUrlError::Empty);
     }
@@ -294,6 +321,15 @@ mod tests {
         assert_eq!(url.as_str(), "http://[::1]:6334");
         assert!(QdrantUrl::parse("https://[2001:db8::1]/q").is_ok());
         assert_eq!(refused("http://[::1"), QdrantUrlError::NoHost);
+        assert!(QdrantUrl::parse("http://[fe80::1%25eth0]:6334").is_ok());
+        for text in [
+            "http://[u:pw]:6334",
+            "http://[h]",
+            "http://[1.2.3.4]:6334",
+            "http://[::1%25]",
+        ] {
+            assert_eq!(refused(text), QdrantUrlError::NoHost, "{text}");
+        }
     }
 
     #[test]
