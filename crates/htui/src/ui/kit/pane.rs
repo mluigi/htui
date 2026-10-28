@@ -6,7 +6,11 @@
 //! narrow the title is clipped first, and gives way entirely once any chip is cut off (MOD-115
 //! M3 D-10). The strip then keeps the active chip and marks the chips cut off with `‹`/`›`
 //! ([`chip_strip`]), and the hints are clipped (always with an ellipsis, via
-//! `cells::clip_line`).
+//! `cells::clip_line`). A pane that asks for its title first ([`Pane::title_first`], M4 C5)
+//! keeps the title and windows the chips in what is left ([`chip_strip_after`]).
+//!
+//! [`Pane::border`] fixes the border's style whatever the focus, and [`Pane::render_into`] draws
+//! on a bare buffer, for a pane drawn inside another widget (MOD-115 M4 D-16).
 //!
 //! A view that needs a number only its content knows (a scrollbar's total) draws its content
 //! into [`Pane::inner`] first and the pane after it: the frame touches border cells only
@@ -58,6 +62,8 @@ pub struct Pane<'a> {
     accent: Option<Style>,
     scrollbar: Option<(usize, usize)>,
     span: Option<Rect>,
+    title_first: bool,
+    border: Option<Style>,
 }
 
 impl<'a> Pane<'a> {
@@ -74,7 +80,27 @@ impl<'a> Pane<'a> {
             accent: None,
             scrollbar: None,
             span: None,
+            title_first: false,
+            border: None,
         }
+    }
+
+    /// The title keeps its room before the chips do (MOD-115 M4 C5, D-4): it is drawn whole
+    /// when it leaves the active chip and its marks room, and clipped with `…` to what they
+    /// leave otherwise; the chips window around the active one in the rest
+    /// ([`chip_strip_after`]). Without it the title gives way first (M3 D-10).
+    #[must_use]
+    pub fn title_first(mut self) -> Self {
+        self.title_first = true;
+        self
+    }
+
+    /// The border's style whatever the focus (a Runs flow node coloured by its status): it
+    /// replaces both the accent and the faint role.
+    #[must_use]
+    pub fn border(mut self, style: Style) -> Self {
+        self.border = Some(style);
+        self
     }
 
     /// Sub-tab chips on the top border, `active` being the current one.
@@ -154,18 +180,23 @@ impl<'a> Pane<'a> {
     /// any, is measured against that rect's height (or its [`span`](Self::scrollbar_span)) and
     /// replaces part of the right border.
     pub fn render(self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) -> Rect {
+        self.render_into(frame.buffer_mut(), area, theme)
+    }
+
+    /// [`Pane::render`] on a bare buffer (MOD-115 M4 D-16): what a widget drawn inside another
+    /// widget's `render` (a Runs flow node) has.
+    pub fn render_into(self, buf: &mut Buffer, area: Rect, theme: &Theme) -> Rect {
         let focused = self.focus == Focus::Focused;
-        let border = if focused {
-            self.accent.unwrap_or(theme.accent)
-        } else {
-            theme.border_faint
+        let border = match (self.border, focused) {
+            (Some(border), _) => border,
+            (None, true) => self.accent.unwrap_or(theme.accent),
+            (None, false) => theme.border_faint,
         };
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(border);
         let inner = Self::inner(area);
-        frame.render_widget(block, area);
-        let buf = frame.buffer_mut();
+        block.render(area, buf);
         // The border rows and the right edge are written cell by cell below: a pane whose rect
         // runs past the buffer draws only what lies on it (RV1 L4).
         let top_on = area.y < buf.area.bottom() && area.y >= buf.area.y;
@@ -176,7 +207,11 @@ impl<'a> Pane<'a> {
         // The chips and marks are patched over the border, bold when focused in monochrome: the
         // border's bold is taken off all but the active chip, so only it reads bold (MOD-80 D5).
         let faint = theme.dim.remove_modifier(Modifier::BOLD);
-        let strip = chip_strip(area, self.sub_tabs, self.active);
+        let strip = if self.title_first {
+            chip_strip_after(area, self.title, self.sub_tabs, self.active)
+        } else {
+            chip_strip(area, self.sub_tabs, self.active)
+        };
         let mut limit = area.right() - 1;
         let mut cut = false;
         for (index, (rect, title)) in strip.chips.iter().zip(self.sub_tabs).enumerate() {
@@ -221,10 +256,16 @@ impl<'a> Pane<'a> {
         }
 
         // The title gives way before any chip does (MOD-115 M3 D-10): once one is cut off, the
-        // active chip carries the name and the title is not drawn at all.
-        if !self.title.is_empty() && !cut && top_on {
+        // active chip carries the name and the title is not drawn at all. Asked first (M4 C5),
+        // it keeps the cells `chip_strip_after` left it, whatever was cut.
+        if !self.title.is_empty() && (self.title_first || !cut) && top_on {
             let start = area.x + 2;
-            let room = limit.saturating_sub(1).saturating_sub(start);
+            let room = if self.title_first {
+                title_cells(area, self.title, self.sub_tabs, self.active)
+                    .min(limit.saturating_sub(start))
+            } else {
+                limit.saturating_sub(1).saturating_sub(start)
+            };
             if room > 2 {
                 let style = if focused {
                     border.add_modifier(Modifier::BOLD)
@@ -371,6 +412,44 @@ fn set_line(buf: &mut Buffer, x: u16, y: u16, line: &Line<'_>, width: u16) {
 #[must_use]
 pub fn sub_tab_rects(area: Rect, titles: &[&str], active: usize) -> Vec<Rect> {
     chip_strip(area, titles, active).chips
+}
+
+/// The cells a title asked first takes on the top border of a pane drawn into `area` (MOD-115 M4
+/// C5): ` title ` whole, or what the active chip and the marks it alone needs leave, less the
+/// rule cell after the corner. An empty title takes none.
+fn title_cells(area: Rect, title: &str, titles: &[&str], active: usize) -> u16 {
+    if title.is_empty() {
+        return 0;
+    }
+    let avail = area.width.saturating_sub(2);
+    let reserve = match titles.len() {
+        0 => 0,
+        count => {
+            let active = active.min(count - 1);
+            let chip = cells::cell_width(titles[active]).saturating_add(2);
+            let marks = usize::from(active > 0) + usize::from(active < count - 1);
+            u16::try_from(chip + marks).unwrap_or(u16::MAX)
+        }
+    };
+    let wanted = u16::try_from(cells::cell_width(title).saturating_add(2)).unwrap_or(u16::MAX);
+    wanted.min(avail.saturating_sub(reserve).saturating_sub(1))
+}
+
+/// The sub-tab strip of a pane drawn into `area` whose `title` is asked first
+/// ([`Pane::title_first`], MOD-115 M4 C5): [`chip_strip`]'s window, grown right then left from
+/// `active`, in the cells right of the title. What [`Pane::render`] draws then, for a future hit
+/// test. With no title, or no room for one, it is [`chip_strip`].
+#[must_use]
+pub fn chip_strip_after(area: Rect, title: &str, titles: &[&str], active: usize) -> ChipStrip {
+    let cells = title_cells(area, title, titles, active);
+    if cells == 0 {
+        return chip_strip(area, titles, active);
+    }
+    // The strip's own left "corner" is the title's last cell, so its cells between the corners
+    // are the pane's less the rule cell after the corner and the title.
+    let left = area.x.saturating_add(1).saturating_add(cells);
+    let rest = Rect::new(left, area.y, area.right().saturating_sub(left), area.height);
+    chip_strip(rest, titles, active)
 }
 
 /// The mark in front of a strip that has chips cut off on its left.
@@ -1654,6 +1733,126 @@ mod tests {
             THUMB,
             "no rows: the whole inner rect"
         );
+    }
+
+    /// The Backlog detail's seven sub-tabs (MOD-115 M4 D-4): 46 cells of chips.
+    const DETAIL: [&str; 7] = ["Body", "Runs", "Graph", "Docs", "Notes", "Prompt", "Reqs"];
+
+    /// D-4, C5: at the default 100 columns the detail pane is 45 wide; asked first, the title
+    /// keeps its room and the chips window around the active one in what is left.
+    #[test]
+    fn the_title_keeps_its_room_when_asked_first() {
+        let pane = Pane::new("FEAT-1 · TUI scaffold")
+            .sub_tabs(&DETAIL, 0)
+            .focus(Focus::Focused)
+            .title_first();
+        let (buffer, _) = draw(45, 4, &Theme::default(), pane);
+        let top = row(&buffer, 0);
+        assert_eq!(
+            top,
+            format!("╭─ FEAT-1 · TUI scaffold {} Body  Runs ›╮", "─".repeat(6)),
+            "{top}"
+        );
+        let strip = chip_strip_after(Rect::new(0, 0, 45, 4), "FEAT-1 · TUI scaffold", &DETAIL, 0);
+        assert_eq!(strip.chips[0], Rect::new(31, 0, 6, 1));
+        assert_eq!(strip.chips[1], Rect::new(37, 0, 6, 1));
+        assert!(strip.chips[2..].iter().all(|chip| chip.width == 0));
+        assert_eq!(strip.after, Some(Rect::new(43, 0, 1, 1)));
+        assert_eq!(strip.before, None);
+    }
+
+    #[test]
+    fn a_long_title_first_still_leaves_the_active_chip_and_its_marks() {
+        let title = "FEAT-1 · a title far too long for any detail pane to hold whole";
+        let pane = Pane::new(title).sub_tabs(&DETAIL, 3).title_first();
+        let (buffer, _) = draw(45, 4, &Theme::default(), pane);
+        let top = row(&buffer, 0);
+        assert!(top.starts_with("╭─ FEAT-1 · a title"), "{top}");
+        assert!(top.ends_with("…‹ Docs ›╮"), "{top}");
+        let strip = chip_strip_after(Rect::new(0, 0, 45, 4), title, &DETAIL, 3);
+        assert_eq!(strip.chips[3].width, 6, "the active chip is whole");
+        assert!(strip.before.is_some() && strip.after.is_some(), "{strip:?}");
+        assert_eq!(
+            (0..DETAIL.len())
+                .filter(|&i| strip.chips[i].width > 0)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn title_first_with_room_for_every_chip_is_the_default_layout() {
+        let theme = Theme::default();
+        for active in 0..DETAIL.len() {
+            let pane = || {
+                Pane::new("FEAT-1 · TUI scaffold")
+                    .sub_tabs(&DETAIL, active)
+                    .focus(Focus::Focused)
+            };
+            let (plain, _) = draw(100, 4, &theme, pane());
+            let (first, _) = draw(100, 4, &theme, pane().title_first());
+            assert_eq!(plain, first, "active {active}");
+            assert_eq!(
+                chip_strip_after(
+                    Rect::new(0, 0, 100, 4),
+                    "FEAT-1 · TUI scaffold",
+                    &DETAIL,
+                    active
+                ),
+                chip_strip(Rect::new(0, 0, 100, 4), &DETAIL, active)
+            );
+        }
+        assert_eq!(
+            chip_strip_after(Rect::new(0, 0, 45, 4), "", &DETAIL, 2),
+            chip_strip(Rect::new(0, 0, 45, 4), &DETAIL, 2),
+            "no title, the whole strip"
+        );
+    }
+
+    /// M3 D-10 still holds for a pane that does not ask for its title first (Settings).
+    #[test]
+    fn the_default_precedence_is_unchanged() {
+        let pane = Pane::new("FEAT-1 · TUI scaffold").sub_tabs(&DETAIL, 0);
+        let (buffer, _) = draw(45, 4, &Theme::default(), pane);
+        let top = row(&buffer, 0);
+        assert!(!top.contains("FEAT-1"), "the title gives way: {top}");
+        assert!(top.contains(" Body "), "{top}");
+    }
+
+    #[test]
+    fn a_border_style_overrides_the_focus() {
+        let theme = Theme::default();
+        let status = Style::new().fg(Color::Red);
+        for focus in [Focus::Focused, Focus::Unfocused] {
+            let pane = Pane::new("node")
+                .focus(focus)
+                .accent(accent())
+                .border(status);
+            let (buffer, _) = draw(20, 4, &theme, pane);
+            for (x, y) in [(0, 0), (19, 0), (0, 3), (19, 3), (5, 3), (0, 1)] {
+                assert_eq!(buffer[(x, y)].fg, Color::Red, "{focus:?} ({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn render_into_draws_what_render_draws() {
+        let theme = Theme::default();
+        let pane = || {
+            Pane::new("Runs")
+                .sub_tabs(&DETAIL, 1)
+                .hints(Line::raw("j/k move"))
+                .note(Line::raw("hidden"))
+                .scrollbar(40, 3)
+                .focus(Focus::Focused)
+                .accent(accent())
+        };
+        let (drawn, inner) = draw(50, 8, &theme, pane());
+        let area = Rect::new(0, 0, 50, 8);
+        let mut buffer = Buffer::empty(area);
+        let into = pane().render_into(&mut buffer, area, &theme);
+        assert_eq!(into, inner);
+        assert_eq!(buffer, drawn);
     }
 
     /// MOD-115 M2 §7 (RV3): a detail that takes every key gets the whole area only while another
