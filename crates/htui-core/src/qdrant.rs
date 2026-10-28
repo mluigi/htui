@@ -10,8 +10,8 @@ use crate::store::{Result, StoreError};
 pub const QDRANT_URL_KEY: &str = "qdrant_url";
 
 /// A Qdrant base URL that passed D2: trimmed; `http://` or `https://` (ASCII case-insensitive,
-/// stored lowercase); a non-empty host (a bracketed IPv6 literal allowed, with an optional `%25`
-/// zone id); an optional port 1..=65535; an optional path; no userinfo, query, fragment, and no
+/// stored lowercase); a non-empty host, either a name of letters, digits, `-._~` and `%XX` escapes
+/// or a bracketed IPv6 literal (with an optional `%25` zone id); an optional port 1..=65535; an optional path; no userinfo, query, fragment, and no
 /// character outside printable ASCII (whitespace, control and format characters included).
 /// Not secret: `Debug`/`Display` print it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -19,7 +19,7 @@ pub struct QdrantUrl(String);
 
 impl QdrantUrl {
     /// Checks `text` against D2, in a fixed order so the refusal is deterministic: empty, space,
-    /// scheme, query, fragment, credentials, host, port.
+    /// scheme, query, fragment, credentials, host (present, then its characters), port.
     ///
     /// # Errors
     /// [`QdrantUrlError`]; never echoes `text`.
@@ -111,6 +111,9 @@ fn check_authority(authority: &str) -> core::result::Result<(), QdrantUrlError> 
     if host.is_empty() || (!authority.starts_with('[') && host.contains(':')) {
         return Err(QdrantUrlError::NoHost);
     }
+    if !authority.starts_with('[') && !is_reg_name(host) {
+        return Err(QdrantUrlError::Host);
+    }
     if let Some(port) = port {
         let valid = !port.is_empty()
             && port.bytes().all(|b| b.is_ascii_digit())
@@ -120,6 +123,29 @@ fn check_authority(authority: &str) -> core::result::Result<(), QdrantUrlError> 
         }
     }
     Ok(())
+}
+
+/// A host name as RFC 3986's reg-name, without its sub-delims (MOD-158 R1, H2): letters, digits,
+/// `-._~` and `%XX` escapes. Sub-delims (`!$&'()*+,;=`) are legal in a URI's reg-name but in no
+/// host a Qdrant client resolves (a DNS name or an IPv4 literal), so they are refused with the
+/// characters no URI allows there (`"`, `\`, `[`, `]`, `<>`, `^`, `` ` ``, `{|}`).
+fn is_reg_name(host: &str) -> bool {
+    let bytes = host.as_bytes();
+    let mut at = 0;
+    while let Some(&byte) = bytes.get(at) {
+        if byte == b'%' {
+            let escape = bytes.get(at + 1..at + 3);
+            if !escape.is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit)) {
+                return false;
+            }
+            at += 3;
+        } else if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            at += 1;
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 /// An IPv6 address, optionally followed by a non-empty `%25` zone id (RFC 6874).
@@ -148,6 +174,12 @@ pub enum QdrantUrlError {
     /// No host after the scheme.
     #[error("a Qdrant URL needs a host")]
     NoHost,
+    /// A host name holding a character outside letters, digits, `-._~` and `%XX` (MOD-158 R1).
+    #[error(
+        "the host of a Qdrant URL may only contain letters, digits, `-`, `.`, `_`, `~` and `%XX` \
+         escapes, or be an IPv6 address in brackets"
+    )]
+    Host,
     /// A port that is not 1..=65535.
     #[error("the port of a Qdrant URL is a number from 1 to 65535")]
     Port,
@@ -329,6 +361,72 @@ mod tests {
             "http://[::1%25]",
         ] {
             assert_eq!(refused(text), QdrantUrlError::NoHost, "{text}");
+        }
+    }
+
+    /// MOD-158 R1 (H2): a host that is not a bracketed IPv6 literal is an RFC 3986 reg-name
+    /// without sub-delims: letters, digits, `-._~` and `%XX` escapes. Each refused class is `Host`,
+    /// whose sentence never echoes the text.
+    #[test]
+    fn a_host_outside_the_name_characters_is_refused() {
+        for text in [
+            "http://h\"x:6334",
+            "http://h\\x",
+            "http://h]:6334",
+            "http://h[:6334",
+            "http://[::1]x]",
+            "http://h<x>",
+            "http://h^x",
+            "http://h`x",
+            "http://h{x}",
+            "http://h|x",
+            "http://h%",
+            "http://h%2",
+            "http://h%zz",
+            "http://h!x",
+            "http://h$x",
+            "http://h&x",
+            "http://h'x",
+            "http://h(x)",
+            "http://h*x",
+            "http://h+x",
+            "http://h,x",
+            "http://h;x",
+            "http://h=x:6334",
+        ] {
+            let err = refused(text);
+            if text == "http://[::1]x]" {
+                assert_eq!(err, QdrantUrlError::Port, "{text}");
+                continue;
+            }
+            assert_eq!(err, QdrantUrlError::Host, "{text}");
+            let sentence = err.to_string();
+            assert!(
+                !sentence.contains("h\"x") && !sentence.contains("h=x"),
+                "{sentence}"
+            );
+        }
+        assert_eq!(
+            QdrantUrlError::Host.to_string(),
+            "the host of a Qdrant URL may only contain letters, digits, `-`, `.`, `_`, `~` and \
+             `%XX` escapes, or be an IPv6 address in brackets"
+        );
+    }
+
+    #[test]
+    fn plain_names_ipv4_and_ipv6_hosts_still_parse() {
+        for text in [
+            "http://localhost:6334",
+            "http://qdrant-1.internal_net.example~x:6334/p",
+            "http://127.0.0.1:6334",
+            "https://10.0.0.7",
+            "http://my%2Dhost:6334",
+            "http://[::1]:6334",
+            "https://[2001:db8::1]/q",
+            "http://[fe80::1%25eth0]:6334",
+            "http://h/a\"b",
+        ] {
+            assert!(QdrantUrl::parse(text).is_ok(), "{text}");
         }
     }
 

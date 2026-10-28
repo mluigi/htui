@@ -96,6 +96,8 @@ async fn a_url_with_credentials_is_refused_and_writes_nothing() {
         ),
         ("qdrant.lan:6334", QdrantUrlError::Scheme),
         ("   ", QdrantUrlError::Empty),
+        // MOD-158 R1 (H2): a host outside the name characters.
+        ("http://qdrant\"SENTINEL-PW:6334", QdrantUrlError::Host),
     ] {
         let sentence = refused(qdrant_cmd::set_url_on(&db.store, text, None).await);
         assert_eq!(

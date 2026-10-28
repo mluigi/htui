@@ -384,6 +384,23 @@ async fn the_field_refuses_a_url_with_credentials_before_sending() {
     );
 }
 
+/// MOD-158 R1 (H2): a host outside the name characters is refused in the field with
+/// `QdrantUrlError::Host`'s own sentence (blueprint P-20), before anything is sent.
+#[tokio::test]
+async fn the_field_refuses_a_host_with_odd_characters_before_sending() {
+    let (bench, mut section) = bench_with(stored()).await;
+    bench.key(&mut section, "e");
+    typed(&bench, &mut section, "http://q.example{x}:6334");
+    assert_eq!(bench.key(&mut section, "Enter"), Handled::Consumed);
+    assert!(requests_of(&bench).is_empty(), "nothing is sent");
+    assert!(section.captures_input(), "the field stays open");
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(
+        frame.contains(&flattened(&QdrantUrlError::Host.to_string())),
+        "{frame}"
+    );
+}
+
 /// R-3: a stale reply says the row changed elsewhere, shows the row now, and the next write
 /// presents the fresh token.
 #[tokio::test]

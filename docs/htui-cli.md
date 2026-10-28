@@ -450,7 +450,9 @@ database, the next time each searches or indexes. The API key stays in each box'
 - **The URL** starts with `http://` or `https://` and names a host, with an optional port and
   path, such as `http://qdrant.lan:6334`. A URL with a user name or password, a query (`?...`) or a
   fragment (`#...`) is refused, and so is any space or character outside printable ASCII: the API
-  key goes in the keyring, never in the URL. The URL is not a secret, so it may be an argument.
+  key goes in the keyring, never in the URL. The host is a name of letters, digits, `-`, `.`, `_`,
+  `~` and `%XX` escapes, or an IPv6 address in brackets (`http://[::1]:6334`). The URL is not a
+  secret, so it may be an argument.
 - **The key** is never an argument: it would end up in your shell history and in the process
   list. Pipe it in (`printf '%s\n' "$KEY" | htui --set-qdrant-key`) or paste it at the prompt.
 - **The URL flags connect to Postgres** with the DSN stored in the OS keyring, as
