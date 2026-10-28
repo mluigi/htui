@@ -281,6 +281,7 @@ pub const CASES: &[&str] = &[
     "update_phase_keeps_a_default_graph_default_edged",
     "delete_phase_keeps_a_default_graph_default_edged",
     "per_row_writers_leave_authored_edges_alone",
+    "create_phase_leaves_a_palette_phase_unlinked",
     "project_types_are_the_six_builtins",
     "a_new_project_is_software",
     "memory_create_writes_the_row_and_revision_1",
@@ -913,6 +914,9 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "per_row_writers_leave_authored_edges_alone" => {
             Box::pin(per_row_writers_leave_authored_edges_alone(store)).await;
+        }
+        "create_phase_leaves_a_palette_phase_unlinked" => {
+            Box::pin(create_phase_leaves_a_palette_phase_unlinked(store)).await;
         }
         "project_types_are_the_six_builtins" => {
             project_types_are_the_six_builtins(store).await;
@@ -22686,15 +22690,17 @@ async fn revision_now<S: WriteStore>(case: &str, store: &S, graph: StepGraphId) 
     body_now(case, store, graph).await.graph.revision
 }
 
-/// MOD-138 D7: `graph`'s stored edges are exactly `seed::default_edges` of its stored phases;
-/// the edges, for the caller's further checks.
+/// MOD-138 D7: `graph`'s stored edges are exactly `seed::default_edges` of its stored phases,
+/// palette phases left out (a palette node has no edges); the edges, for the caller's further
+/// checks.
 async fn assert_default_edged<S: WriteStore>(
     case: &str,
     store: &S,
     graph: StepGraphId,
     after: &str,
 ) -> Vec<StepGraphEdge> {
-    let phases = store.phases(graph).await.expect(case);
+    let mut phases = store.phases(graph).await.expect(case);
+    phases.retain(|phase| !phase.palette);
     let edges = store.graph_edges(graph).await.expect(case);
     assert_eq!(
         edge_set(&edges),
@@ -22969,6 +22975,50 @@ async fn per_row_writers_leave_authored_edges_alone<S: WriteStore>(store: &S) {
                 .collect()
         ),
         "{CASE}: a delete takes its own edges and re-derives nothing"
+    );
+}
+
+/// MOD-138 D7: a palette node has no edges (MOD-137 rule e), so the default-edge rule leaves it
+/// out. Creating one on a default-edged graph links nothing to it, a phase created after it
+/// chains past it, and the read-back body saves unchanged.
+async fn create_phase_leaves_a_palette_phase_unlinked<S: WriteStore>(store: &S) {
+    const CASE: &str = "create_phase_leaves_a_palette_phase_unlinked";
+    let (graph, phases) = scratch_graph(CASE, store, "palette-row", &["plan", "implement"]).await;
+    let implement = phases[1].id;
+    let chained = assert_default_edged(CASE, store, graph, "two creates").await;
+    let mut row = new_phase(graph, 2, "spare");
+    row.palette = true;
+    let spare = store.create_phase(&row).await.expect(CASE);
+    assert!(spare.palette, "{CASE}: the palette flag is stored");
+    assert_eq!(
+        edge_set(&store.graph_edges(graph).await.expect(CASE)),
+        edge_set(&chained),
+        "{CASE}: creating a palette phase moves no edge"
+    );
+    let docs = store
+        .create_phase(&new_phase(graph, 3, "docs"))
+        .await
+        .expect(CASE);
+    let edges = assert_default_edged(CASE, store, graph, "appending `docs` past `spare`").await;
+    assert!(
+        edges
+            .iter()
+            .any(|edge| (edge.from, edge.to, edge.kind) == (implement, docs.id, EdgeKind::Next)),
+        "{CASE}: `implement → docs` chains past the palette phase"
+    );
+    assert!(
+        edges
+            .iter()
+            .all(|edge| edge.from != spare.id && edge.to != spare.id),
+        "{CASE}: no edge on the palette phase"
+    );
+    let body = body_now(CASE, store, graph).await;
+    applied(
+        CASE,
+        store
+            .replace_graph(graph, body.graph.revision, body)
+            .await
+            .expect(CASE),
     );
 }
 

@@ -949,7 +949,8 @@ pub trait WriteStore: ReadStore {
     ///
     /// A successful insert bumps the graph's `revision` (MOD-137 D5). MOD-138 D7: on a
     /// default-edged graph the edges are re-derived in the same write; authored edges are left
-    /// alone ([`default_edges_follow`](crate::store::default_edges_follow)).
+    /// alone ([`default_edges_follow`](crate::store::default_edges_follow)). A `palette` phase is
+    /// left unlinked, so creating one moves no edge (a palette node has no edges).
     ///
     /// # Errors
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint), in MOD-137 blueprint

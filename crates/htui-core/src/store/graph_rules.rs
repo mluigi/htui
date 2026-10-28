@@ -495,7 +495,8 @@ pub fn graph_body_walk_refusal(graph: StepGraphId, body: &GraphBody) -> Option<S
 /// new edges are minted by `mint` in `default_edges` order. `None`: authored edges (left alone; a
 /// new phase is an unlinked root, which D9 accepts), or nothing moved (blueprint F12). A cascade
 /// (`delete_phase`) needs no special case: an edge on the deleted phase is in `before_edges` but
-/// cannot be in `default_edges(after)`, so the shapes differ.
+/// cannot be in `default_edges(after)`, so the shapes differ. Palette phases are left out of both
+/// sides ([`linear`]): a palette node has no edges, so creating or deleting one moves nothing.
 ///
 /// `after_phases` is computed purely from `before_phases` plus the writer's own result (the
 /// inserted row, the returned updated row, or `before` minus the deleted id), never re-read.
@@ -515,10 +516,23 @@ pub fn default_edges_follow(
             edge_predicate(edge).is_none(),
         )
     }));
-    if stored != default_shapes(before_phases) || stored == default_shapes(after_phases) {
+    let (before_phases, after_phases) = (linear(before_phases), linear(after_phases));
+    if stored != default_shapes(&before_phases) || stored == default_shapes(&after_phases) {
         return None;
     }
-    Some(default_edges(after_phases, mint))
+    Some(default_edges(&after_phases, mint))
+}
+
+/// The phases [`default_edges_follow`]' rule reads: every one but the palette nodes. A palette
+/// node has no edges (MOD-137 rule e, [`palette_phase_has_edges`]), so the default chain runs past
+/// it and no `changes_requested` loop names it; `seed::default_edges` over the full list would
+/// link it, and `replace_graph` would then refuse the graph's own read-back body.
+fn linear(phases: &[StepGraphPhase]) -> Vec<StepGraphPhase> {
+    phases
+        .iter()
+        .filter(|phase| !phase.palette)
+        .cloned()
+        .collect()
 }
 
 /// D7's edge shape: `(from, to, kind, loop_limit, predicate is none)`.
@@ -1650,6 +1664,55 @@ mod tests {
             default_edges_follow(&before, &reordered, &renamed, EdgeId::new),
             None,
             "a multiset: the stored order is not the rule's"
+        );
+    }
+
+    /// A palette node has no edges (MOD-137 rule e), so the rule leaves it out: appending one
+    /// moves nothing, a graph holding one is still default-edged, and a phase after it chains
+    /// past it.
+    #[test]
+    fn follow_leaves_palette_phases_out() {
+        let (before, edges) = defaulted();
+        let phase_at = |position: i32, name: &str| {
+            let mut phase = before[0].clone();
+            phase.id = PhaseId::new();
+            phase.position = position;
+            phase.name = name.to_owned();
+            phase
+        };
+        let mut spare = phase_at(3, "spare");
+        spare.palette = true;
+        let mut with_spare = before.clone();
+        with_spare.push(spare.clone());
+        assert_eq!(
+            default_edges_follow(&before, &edges, &with_spare, EdgeId::new),
+            None,
+            "appending a palette phase moves no edge"
+        );
+        let docs = phase_at(4, "docs");
+        let mut with_docs = with_spare.clone();
+        with_docs.push(docs.clone());
+        let followed = default_edges_follow(&with_spare, &edges, &with_docs, EdgeId::new)
+            .expect("a graph holding a palette phase is still default-edged");
+        let mut linear = before.clone();
+        linear.push(docs.clone());
+        assert_eq!(
+            shapes(&followed),
+            shapes(&default_edges(&linear, EdgeId::new)),
+            "`review → docs` chains past `spare`"
+        );
+        assert!(
+            followed
+                .iter()
+                .all(|edge| edge.from != spare.id && edge.to != spare.id),
+            "no edge on the palette phase"
+        );
+        let mut flipped = with_spare.clone();
+        flipped[3].palette = false;
+        assert_eq!(
+            default_edges_follow(&with_spare, &edges, &flipped, EdgeId::new).map(|e| shapes(&e)),
+            Some(shapes(&default_edges(&flipped, EdgeId::new))),
+            "a phase leaving the palette is chained in"
         );
     }
 }
