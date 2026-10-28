@@ -699,10 +699,19 @@ impl<R: Remote> Finish<'_, '_, R> {
             err,
             "(--replace-credential re-encrypts the DSN and restarts the service)"
         );
-        if qdrant_key {
+        if qdrant_key && facts.printf_builtin {
             let _ = writeln!(
                 err,
                 "note: the Qdrant API key was not sent; pass --replace-credential to add it"
+            );
+        } else if qdrant_key {
+            // `decide` refuses `--replace-credential` with a key when there is no printf builtin.
+            let _ = writeln!(
+                err,
+                "note: the Qdrant API key was not sent, and the remote sh has no printf builtin \
+                 to send it; encrypt it on the host by hand (`sudo systemd-creds encrypt \
+                 --name=htui-qdrant-key - /etc/credstore.encrypted/htui-qdrant-key`) and add its \
+                 LoadCredentialEncrypted= line to the unit"
             );
         }
         let identity = match verify_session(remote, dest, root, &facts.home, timings).await {
@@ -1719,6 +1728,37 @@ mod tests {
         ]);
         let ran = drive(DEST, DSN, false, &remote, &prompt, &verifier).await;
         assert!(!ran.err.contains("Qdrant"), "no key, no note: {}", ran.err);
+
+        // Repair finding: with no printf builtin `--replace-credential` is refused for the key,
+        // so the note points at encrypting it by hand instead.
+        let remote = ScriptedRemote::new(vec![
+            preflight(&[
+                ("bin_sha", sha.as_str()),
+                ("unit", "yes"),
+                ("active", "active"),
+                ("printf", "external"),
+            ]),
+            verified(),
+        ]);
+        let ran = drive_keyed(QDRANT_KEY, false, &remote, &prompt, &verifier).await;
+        assert_eq!(ran.result.expect("ok"), Outcome::AlreadyProvisioned);
+        assert!(remote.calls().iter().all(|(_, stdin)| stdin.is_empty()));
+        assert!(
+            ran.err.contains(
+                "note: the Qdrant API key was not sent, and the remote sh has no printf builtin \
+                 to send it; encrypt it on the host by hand (`sudo systemd-creds encrypt \
+                 --name=htui-qdrant-key - /etc/credstore.encrypted/htui-qdrant-key`) and add \
+                 its LoadCredentialEncrypted= line to the unit\n"
+            ),
+            "{}",
+            ran.err
+        );
+        assert!(
+            !ran.err.contains("pass --replace-credential to add it"),
+            "{}",
+            ran.err
+        );
+        assert!(!ran.err.contains(QDRANT_KEY), "{}", ran.err);
     }
 
     #[tokio::test]

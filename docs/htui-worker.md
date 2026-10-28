@@ -621,7 +621,10 @@ Qdrant URL is not provisioned: it is one setting for the whole database (see
 
 A host already provisioned and running is not sent the key by a plain re-run, which says so:
 `note: the Qdrant API key was not sent; pass --replace-credential to add it`.
-`--replace-credential` encrypts the key again together with the DSN. Re-provisioning with
+`--replace-credential` encrypts the key again together with the DSN. When the host's `sh` has no
+`printf` builtin (as in posh or mksh), sending the key is refused, so the note says to encrypt it
+on the host by hand instead: the credential and its `LoadCredentialEncrypted=` line in the unit,
+as in [Running it as a systemd service](#running-it-as-a-systemd-service). Re-provisioning with
 `--replace-credential` after the key was removed from this machine's keyring writes the unit
 without the key's line; the old `/etc/credstore.encrypted/htui-qdrant-key` stays on the host,
 unused, until you remove it (`sudo rm /etc/credstore.encrypted/htui-qdrant-key`).

@@ -131,7 +131,7 @@ pub fn decide(facts: &Facts, local: &LocalFacts, replace_credential: bool) -> De
         return refuse(
             "the remote sh has no printf builtin (as in posh or mksh), so sending the Qdrant API \
              key would put it in a process's arguments; remove this box's key (`htui \
-             --clear-qdrant-key`), provision, then encrypt it on the host by hand"
+             --clear-qdrant-key`) or encrypt it on the host by hand"
                 .to_owned(),
         );
     }
@@ -230,8 +230,8 @@ mod tests {
     /// MOD-158 T6: the Qdrant API key is handed to `printf` too.
     const PRINTF_KEY: &str = "the remote sh has no printf builtin (as in posh or mksh), so sending \
                               the Qdrant API key would put it in a process's arguments; remove \
-                              this box's key (`htui --clear-qdrant-key`), provision, then encrypt \
-                              it on the host by hand";
+                              this box's key (`htui --clear-qdrant-key`) or encrypt it on the \
+                              host by hand";
 
     /// Review finding 11, verify round 1.
     const NO_SHA256SUM: &str = "the remote host has no sha256sum on its PATH (coreutils); \
