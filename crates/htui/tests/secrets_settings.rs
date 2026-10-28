@@ -195,9 +195,15 @@ impl SecretProvider for RefusingHealth {
 /// A Qdrant snapshot with the URL stored and no key.
 fn qdrant_stored() -> QdrantSnapshot {
     QdrantSnapshot {
-        url_state: QdrantState::Stored,
+        url: htui::qdrant_settings_info::UrlRowState::Set {
+            url: htui_core::qdrant::QdrantUrl::parse("https://qdrant.example:6334")
+                .expect("a valid URL"),
+            token: chrono::DateTime::<Utc>::UNIX_EPOCH,
+        },
+        url_override: None,
         key_state: QdrantState::NotStored,
-        url_summary: Some("https://qdrant.example:6334".to_owned()),
+        key_override: false,
+        old_url: None,
     }
 }
 

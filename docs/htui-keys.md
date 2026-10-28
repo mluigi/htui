@@ -131,6 +131,9 @@ prev_field = ["backtab", "up"]  # previous field
 rebuild  = ["R"]      # rebuild cache
 activate = ["enter"]  # run row
 
+[settings.qdrant]
+adopt = ["u"]  # use old URL
+
 [settings.boxes]
 edit_tags   = ["t"]  # edit tags
 edit_quirks = ["e"]  # edit quirks

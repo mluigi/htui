@@ -837,6 +837,7 @@ impl QdrantSection {
             items += 1;
         }
         form = form.field(key);
+        items += 1;
         if let Mode::EditingKey(editor) = &self.mode {
             form = form.field(self.field_row(NEW_KEY_LABEL, &editor.input, KEY_GUIDE.to_owned()));
             focus = Some(items);
@@ -943,9 +944,12 @@ impl QdrantSection {
             self.say(said);
         }
 
+        // Not over an override (this process does not use the row) nor an old keyring URL (the
+        // offer row is the shorter way to a URL).
         if write.is_none()
             && snapshot.url == UrlRowState::NotSet
             && snapshot.url_override.is_none()
+            && snapshot.old_url.is_none()
             && !self.opened_for_empty
             && matches!(self.mode, Mode::Browse)
         {

@@ -6,7 +6,7 @@
 
 use htui::agent_settings::{self, AgentDraft, AgentWrite};
 use htui::app::{Action, Ctx, Handled};
-use htui::qdrant_settings_info::{QdrantSnapshot, QdrantState};
+use htui::qdrant_settings_info::{QdrantSnapshot, QdrantState, UrlRowState};
 use htui::secrets_settings::{DEMO_SESSION, Redacted};
 use htui::store_worker::{
     AuthFrame, InstallFrame, Origin, RequestEnvelope, StoreReply, StoreRequest,
@@ -5731,9 +5731,15 @@ async fn the_tool_paths_form_renders_under_the_table() {
 /// A Qdrant snapshot with the URL stored and no key.
 fn qdrant_stored() -> QdrantSnapshot {
     QdrantSnapshot {
-        url_state: QdrantState::Stored,
+        url: UrlRowState::Set {
+            url: htui_core::qdrant::QdrantUrl::parse("https://qdrant.example:6334")
+                .expect("a valid URL"),
+            token: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+        },
+        url_override: None,
         key_state: QdrantState::NotStored,
-        url_summary: Some("https://qdrant.example:6334".to_owned()),
+        key_override: false,
+        old_url: None,
     }
 }
 
@@ -5804,7 +5810,7 @@ async fn a_qdrant_write_says_what_it_did_or_why_it_failed() {
     assert!(
         matches!(
             requests_of(&bench).as_slice(),
-            [StoreRequest::ClearQdrantSettings]
+            [StoreRequest::ClearQdrantUrl { .. }]
         ),
         "y sends the clear"
     );
@@ -5812,20 +5818,19 @@ async fn a_qdrant_write_says_what_it_did_or_why_it_failed() {
     assert!(
         bench
             .key_hint(&section)
-            .contains("\u{b7} clearing the Qdrant settings\u{2026}"),
+            .contains("\u{b7} clearing the Qdrant URL for every box\u{2026}"),
         "{rendered}"
     );
     bench.reply(
         &mut section,
         &StoreReply::Qdrant(QdrantSnapshot {
-            url_state: QdrantState::NotStored,
-            key_state: QdrantState::NotStored,
-            url_summary: None,
+            url: UrlRowState::NotSet,
+            ..qdrant_stored()
         }),
     );
     let rendered = render_section(&section, &bench.ctx());
     assert!(
-        rendered.contains("the Qdrant settings are gone from the keyring"),
+        rendered.contains("the Qdrant URL is cleared for every box"),
         "{rendered}"
     );
 
@@ -5837,7 +5842,7 @@ async fn a_qdrant_write_says_what_it_did_or_why_it_failed() {
     bench.reply(
         &mut section,
         &StoreReply::Failed {
-            request: "clear_qdrant_settings",
+            request: "clear_qdrant_url",
             message: "the keyring refused the delete".to_owned(),
         },
     );
@@ -5847,9 +5852,7 @@ async fn a_qdrant_write_says_what_it_did_or_why_it_failed() {
         "{rendered}"
     );
     assert!(
-        !bench
-            .key_hint(&section)
-            .contains("clearing the Qdrant settings"),
+        !bench.key_hint(&section).contains("clearing the Qdrant URL"),
         "{rendered}"
     );
 }
@@ -5872,7 +5875,7 @@ async fn a_qdrant_write_in_flight_refuses_e_and_c_but_not_r() {
         let rendered = render_section(&section, &bench.ctx());
         assert!(
             rendered.contains(
-                "still clearing the Qdrant settings \u{2014} wait for the store's answer"
+                "still clearing the Qdrant URL for every box \u{2014} wait for the store's answer"
             ),
             "`{chord}` is refused by name: {rendered}"
         );
@@ -5928,7 +5931,10 @@ async fn a_qdrant_reload_just_before_a_write_is_not_taken_as_its_answer() {
     assert!(
         matches!(
             requests_of(&bench).as_slice(),
-            [StoreRequest::QdrantInfo, StoreRequest::ClearQdrantSettings]
+            [
+                StoreRequest::QdrantInfo,
+                StoreRequest::ClearQdrantUrl { .. }
+            ]
         ),
         "the read, then the clear"
     );
@@ -5937,20 +5943,20 @@ async fn a_qdrant_reload_just_before_a_write_is_not_taken_as_its_answer() {
     bench.reply(&mut section, &StoreReply::Qdrant(qdrant_stored()));
     let rendered = render_section(&section, &bench.ctx());
     assert!(
-        !rendered.contains("the Qdrant settings are gone from the keyring"),
+        !rendered.contains("the Qdrant URL is cleared for every box"),
         "the read is not the clear's answer: {rendered}"
     );
     assert!(
         bench
             .key_hint(&section)
-            .contains("\u{b7} clearing the Qdrant settings\u{2026}"),
+            .contains("\u{b7} clearing the Qdrant URL for every box\u{2026}"),
         "the clear is still out: {rendered}"
     );
 
     bench.reply(
         &mut section,
         &StoreReply::Failed {
-            request: "clear_qdrant_settings",
+            request: "clear_qdrant_url",
             message: "the keyring refused the delete".to_owned(),
         },
     );
@@ -5960,7 +5966,7 @@ async fn a_qdrant_reload_just_before_a_write_is_not_taken_as_its_answer() {
         "the refusal lands on the section: {rendered}"
     );
     assert!(
-        !rendered.contains("the Qdrant settings are gone from the keyring"),
+        !rendered.contains("the Qdrant URL is cleared for every box"),
         "{rendered}"
     );
 }
@@ -5970,14 +5976,16 @@ fn qdrant_demo() -> Backend {
     Backend::memory(MemStore::demo())
 }
 
-/// The demo answer to a Qdrant read: both rows `NotApplicable` and no URL summary.
+/// The demo answer to a Qdrant read: every row `NotApplicable`, no override and no old URL.
 #[track_caller]
 fn assert_qdrant_not_applicable(reply: StoreReply, path: &str) {
     match reply {
         StoreReply::Qdrant(snapshot) => {
-            assert_eq!(snapshot.url_state, QdrantState::NotApplicable, "{path}");
+            assert_eq!(snapshot.url, UrlRowState::NotApplicable, "{path}");
             assert_eq!(snapshot.key_state, QdrantState::NotApplicable, "{path}");
-            assert_eq!(snapshot.url_summary, None, "{path}");
+            assert_eq!(snapshot.url_override, None, "{path}");
+            assert!(!snapshot.key_override, "{path}");
+            assert_eq!(snapshot.old_url, None, "{path}");
         }
         other => panic!("{path}: expected a not-applicable Qdrant snapshot, got {other:?}"),
     }
@@ -6035,16 +6043,26 @@ async fn qdrant_demo_reads_no_keyring() {
     );
 }
 
-/// CLEAN-8 #9: a demo session refuses every Qdrant keyring write before the keyring is reached,
-/// with the Secrets section's sentence. Under a broken fake keyring, as above: a regression that
-/// reaches it is refused with the keyring's sentence, not the demo one.
+/// CLEAN-8 #9, MOD-158 D9: a demo session refuses every Qdrant write, the URL row's, the key's
+/// and the old URL's, before a keyring or a store is reached, with the Secrets section's sentence.
+/// Under a broken fake keyring, as above: a regression that reaches it is refused with the
+/// keyring's sentence, not the demo one.
 #[tokio::test]
-async fn qdrant_demo_refuses_every_keyring_write() {
+async fn qdrant_demo_refuses_every_write() {
     let _keyring = htui_store::testkit::mock_keyring_broken().await;
+    let url = htui_core::qdrant::QdrantUrl::parse("https://q.example:6334").expect("valid");
     for request in [
-        StoreRequest::SetQdrantUrl("https://q.example:6334".to_owned()),
+        StoreRequest::SetQdrantUrl {
+            url,
+            expected: None,
+        },
+        StoreRequest::ClearQdrantUrl {
+            expected: chrono::Utc::now(),
+        },
         StoreRequest::SetQdrantApiKey(Redacted::new("qk-typed-123".to_owned())),
-        StoreRequest::ClearQdrantSettings,
+        StoreRequest::ClearQdrantApiKey,
+        StoreRequest::AdoptOldQdrantUrl,
+        StoreRequest::DiscardOldQdrantUrl,
     ] {
         let name = request.name();
         assert_qdrant_demo_refusal(
@@ -6054,8 +6072,8 @@ async fn qdrant_demo_refuses_every_keyring_write() {
         );
     }
     assert_qdrant_demo_refusal(
-        through_the_demo_loop(StoreRequest::ClearQdrantSettings).await,
-        "clear_qdrant_settings",
+        through_the_demo_loop(StoreRequest::ClearQdrantApiKey).await,
+        "clear_qdrant_api_key",
         "the spawned loop",
     );
 }
@@ -6068,11 +6086,7 @@ async fn qdrant_demo_section_offers_no_edit() {
     let mut section = QdrantSection::new();
     bench.reply(
         &mut section,
-        &StoreReply::Qdrant(QdrantSnapshot {
-            url_state: QdrantState::NotApplicable,
-            key_state: QdrantState::NotApplicable,
-            url_summary: None,
-        }),
+        &StoreReply::Qdrant(QdrantSnapshot::not_applicable()),
     );
     let _ = bench.drained();
     assert!(!section.captures_input(), "a demo snapshot opens no editor");
@@ -6138,9 +6152,9 @@ async fn the_qdrant_editors_keep_tab_and_pass_only_ctrl_alt_and_function_keys() 
     }
 }
 
-/// D14 pin, App level: `Tab` and `Shift+Tab` in the Qdrant URL editor keep the Settings tab and
-/// the open field (today the field passed them, and the shell switched tabs). An offline backend
-/// over the fake keyring answers `NotStored`, which opens the URL editor by itself.
+/// D14 pin, App level: `Tab` and `Shift+Tab` in a Qdrant editor keep the Settings tab and the open
+/// field (today the field passed them, and the shell switched tabs). Offline the URL row cannot be
+/// read (MOD-158 D9), so the case opens the key editor, which works offline (blueprint P-18).
 #[tokio::test]
 async fn tab_in_the_qdrant_editor_keeps_the_settings_tab() {
     let _keyring = htui_store::testkit::mock_keyring().await;
@@ -6164,8 +6178,16 @@ async fn tab_in_the_qdrant_editor_keeps_the_settings_tab() {
     assert_eq!(harness.app().tabs.active_id(), Some(SettingsTab::ID));
     let frame = harness.render();
     assert!(
-        editing_the_qdrant_url(&frame),
-        "the editor is open: {frame}"
+        frame.contains("cannot be read while Postgres is offline"),
+        "the URL row offline opens nothing: {frame}"
+    );
+    harness.key("j");
+    harness.key("e");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(
+        editing_the_qdrant_key(&frame),
+        "the key editor is open: {frame}"
     );
 
     for chord in ["tab", "backtab"] {
@@ -6178,7 +6200,7 @@ async fn tab_in_the_qdrant_editor_keeps_the_settings_tab() {
         );
         let frame = harness.render();
         assert!(
-            editing_the_qdrant_url(&frame),
+            editing_the_qdrant_key(&frame),
             "`{chord}` keeps the editor: {frame}"
         );
     }
@@ -6213,6 +6235,11 @@ async fn ctrl_e_and_ctrl_r_in_qdrant_browse_do_nothing() {
 /// alone also matches the guides and refusals (`no Qdrant URL is stored`), editor or not.
 fn editing_the_qdrant_url(frame: &str) -> bool {
     frame.contains("\u{258c}new URL")
+}
+
+/// Whether `frame` shows the Qdrant key editor: its focused `new key` row.
+fn editing_the_qdrant_key(frame: &str) -> bool {
+    frame.contains("\u{258c}new key")
 }
 
 /// The clear question answers `y` and `n`/`Esc`, swallows the rest, and passes what the modal
@@ -6252,7 +6279,7 @@ async fn the_qdrant_clear_question_answers_y_and_n_and_passes_ctrl() {
     assert!(
         matches!(
             requests_of(&bench).as_slice(),
-            [StoreRequest::ClearQdrantSettings]
+            [StoreRequest::ClearQdrantUrl { .. }]
         ),
         "`y` clears"
     );

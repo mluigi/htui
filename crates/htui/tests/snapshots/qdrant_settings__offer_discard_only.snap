@@ -1,0 +1,9 @@
+---
+source: crates/htui/tests/qdrant_settings.rs
+expression: "frame_of(&bench, &section)"
+---
+▌URL       not set · for every box
+ old URL   this box's keyring holds an old Qdrant URL that is not usable (a Qdrant URL may not carry
+           a user name or password; store the API key in Settings > Qdrant or with `htui
+           --set-qdrant-key`): c discards it
+ API key   not stored
