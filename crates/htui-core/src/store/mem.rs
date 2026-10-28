@@ -4887,9 +4887,6 @@ impl State {
         }
     }
 
-    /// Writes (`Some`) or clears (`None`) one queue key (MOD-12 M2 D9): the target and token
-    /// refusals, the validator on a set, then the row as `set_setting`'s `App` and `Project` rungs
-    /// and `edit_box`'s lookup and guards do. `now` stands in for Postgres's trigger.
     /// MOD-158 D1: the `qdrant_url` row as [`StoredQdrantUrl`] reads it.
     fn qdrant_url(&self) -> Option<StoredQdrantUrl> {
         self.app_settings
@@ -4897,6 +4894,9 @@ impl State {
             .map(|(value, token)| StoredQdrantUrl::from_row(value, *token))
     }
 
+    /// Writes (`Some`) or clears (`None`) one queue key (MOD-12 M2 D9): the target and token
+    /// refusals, the validator on a set, then the row as `set_setting`'s `App` and `Project` rungs
+    /// and `edit_box`'s lookup and guards do. `now` stands in for Postgres's trigger.
     fn write_queue_setting(
         &mut self,
         user: Option<UserId>,
