@@ -28,6 +28,7 @@ machine. See [No writes](#no-writes).
 - [When there is no document](#when-there-is-no-document)
 - [Versioning](#versioning)
 - [No writes](#no-writes)
+- [Setting the Qdrant URL and API key](#setting-the-qdrant-url-and-api-key)
 - [Credentials and crash reports](#credentials-and-crash-reports)
 - [Text output](#text-output)
 
@@ -303,7 +304,7 @@ off by the difference; an age that would be negative is reported as `0`.
 | `hits[].snippet` | string | The start of the indexed text, whitespace folded and control characters removed. |
 | `error` | object | Present for `offline`, `refused` and `error` only: `code` and `message`, as in [Failure documents](#failure-documents). |
 
-A failure before Postgres answered (no Qdrant URL, no DSN, Postgres unreachable, an unknown
+A failure before the index is asked (no DSN, Postgres unreachable, no Qdrant URL, an unknown
 project) is a [failure document](#failure-documents) with `"kind": "search"`, and has no `index`,
 `query` or `decisions`.
 
@@ -330,7 +331,7 @@ Every `error.code`, with the `store` it comes with and the exit code:
 |---|---|---|---|---|
 | `unreachable` | `offline` | 3 | all | Postgres did not answer: at the connect, or during a later read. |
 | `no_dsn` | `refused` | 2 | all | No Postgres DSN is stored in the OS keyring. Run `htui --set-dsn`. |
-| `keyring_unreadable` | `refused` | 2 | all | The OS keyring could not be read. |
+| `keyring_unreadable` | `refused` | 2 | all | The OS keyring could not be read: for the DSN, or (search) for the Qdrant API key. |
 | `box_identity` | `refused` | 2 | all (search only with `--cwd`) | `box.toml` exists but cannot be read or parsed. `status` and `waiting` always read it (for `box`), so a malformed `box.toml` refuses them even without `--cwd`, just as the TUI will not start with one. Fix or delete the file. |
 | `migrations_pending` | `refused` | 2 | all | The database has migrations this build has not applied. Start the TUI once to apply them. |
 | `below_target` | `refused` | 2 | all | The database's target version is newer than this build. Update htui. |
@@ -341,8 +342,8 @@ Every `error.code`, with the `store` it comes with and the exit code:
 | `cwd_unmatched` | `refused` | 2 | all | `--cwd`'s path is in no repository registered on this box. |
 | `cwd_ambiguous` | `refused` | 2 | all | `--cwd`'s deepest checkout is registered for two or more projects. |
 | `read_failed` | `error` | 1 | all | A read failed after the connect, with something other than an unreachable store. |
-| `no_qdrant_url` | `refused` | 2 | search | No Qdrant URL is stored. Set one in **Settings › Qdrant**. |
-| `qdrant_url_unusable` | `refused` | 2 | search | The stored Qdrant URL cannot be used. |
+| `no_qdrant_url` | `refused` | 2 | search | No Qdrant URL is set: no `HTUI_QDRANT_URL` in the environment and no `qdrant_url` setting in Postgres. Set one in **Settings › Qdrant** or with `htui --set-qdrant-url`. |
+| `qdrant_url_unusable` | `refused` | 2 | search | The Qdrant URL cannot be used: `HTUI_QDRANT_URL` is not a valid Qdrant URL, or the `qdrant_url` setting in Postgres is not one. Set it again in **Settings › Qdrant** or with `htui --set-qdrant-url`. |
 | `qdrant_unreachable` | `online` | 3 | search | Inside a search document: Qdrant did not answer (`index: "offline"`). |
 | `embedder_mismatch` | `online` | 2 | search | Inside a search document: the index holds another model's vectors (`index: "refused"`). |
 | `qdrant_refused` | `online` | 2 | search | Inside a search document: Qdrant refused the API key (`index: "refused"`). |
@@ -351,11 +352,14 @@ Every `error.code`, with the `store` it comes with and the exit code:
 The checks run in this order, and the first one that fails decides the document:
 
 - `status` and `waiting`: the DSN, `box.toml`, the connect, the scope, then the reads.
-- `--search-items`: the Qdrant URL, the DSN, `box.toml` (only with `--cwd`), the connect, the
-  scope, the index (whether Qdrant answers and the collection exists), the embedding model, then
-  the search. The Qdrant URL is checked first, so a box without one is refused before Postgres is
-  contacted; and the model is loaded only when there is a collection to search, so a Qdrant that
-  does not answer, refuses the API key or holds no index is answered without it.
+- `--search-items`: the DSN, `box.toml` (only with `--cwd`), the connect, the Qdrant URL and
+  API key, the scope, the index (whether Qdrant answers and the collection exists), the embedding
+  model, then the search. The Qdrant URL is a setting in Postgres, so it is read after the connect:
+  a box with no DSN or an unreachable Postgres is refused with `no_dsn` or `unreachable` before
+  `no_qdrant_url`. Before MOD-158 the URL was checked first; a script that told "no URL" from "no
+  Postgres" by the order should read `error.code`. The model is loaded only when there is a
+  collection to search, so a Qdrant that does not answer, refuses the API key or holds no index is
+  answered without it.
 
 ## Exit codes
 
@@ -426,11 +430,64 @@ with `"store": "refused"`, `error.code` `store_refused` and exit 2, never `offli
 answered, and retrying does not help. Connect these commands to Postgres directly, not through
 the pooler.
 
+## Setting the Qdrant URL and API key
+
+Four flags change what `--search-items`, `--index-items`, the TUI and `htui worker` use to reach
+Qdrant. Unlike the three commands above, they write. Each acts, prints one line on standard error
+and exits; none starts the TUI.
+
+**The URL is one setting for every box; the key is this box's.** The URL lives in Postgres (the
+`app_setting` row `qdrant_url`), so setting it on one box changes it for every box on the same
+database, the next time each searches or indexes. The API key stays in each box's OS keyring.
+
+| Flag | What it does |
+|---|---|
+| `htui --set-qdrant-url <URL>` | Sets the URL every box uses. |
+| `htui --clear-qdrant-url` | Removes the URL every box uses. |
+| `htui --set-qdrant-key` | Reads one line from standard input and stores it as this box's Qdrant API key in the OS keyring. On a terminal it prompts first; the key is visible as you type it. |
+| `htui --clear-qdrant-key` | Removes this box's Qdrant API key from the OS keyring. |
+
+- **The URL** starts with `http://` or `https://` and names a host, with an optional port and
+  path, such as `http://qdrant.lan:6334`. A URL with a user name or password, a query (`?...`) or a
+  fragment (`#...`) is refused, and so is any space or character outside printable ASCII: the API
+  key goes in the keyring, never in the URL. The URL is not a secret, so it may be an argument.
+- **The key** is never an argument: it would end up in your shell history and in the process
+  list. Pipe it in (`printf '%s\n' "$KEY" | htui --set-qdrant-key`) or paste it at the prompt.
+- **The URL flags connect to Postgres** with the DSN stored in the OS keyring, as
+  `--index-items` does: run `htui --set-dsn` first. A pending migration or a database newer than
+  this build is refused, never migrated. The write is a compare-and-set: when another box changes
+  the URL between the read and the write, nothing is written and you are told to run the command
+  again.
+- **`HTUI_QDRANT_URL`** overrides the setting in every process that has it in its environment.
+  `--set-qdrant-url` still writes the setting, and says so when the variable is set where you ran
+  it.
+- These flags stand alone: none of them may be combined with another of them, with `--set-dsn`,
+  `--clear-dsn`, `--dsn-stdin`, `--demo`, `--offline`, `--index-items`, `--search-items`, the key
+  file flags or a subcommand.
+
+| Ending | Standard error | Exit |
+|---|---|---|
+| The URL was set | `Qdrant URL set for every box: <URL>.`, plus `HTUI_QDRANT_URL overrides it in processes that have it.` when that variable is set | 0 |
+| The URL was cleared | `Qdrant URL cleared for every box.`, or `no Qdrant URL is set; nothing was cleared` | 0 |
+| The key was stored or removed | `Qdrant API key stored in this box's OS keyring.` / `Qdrant API key removed from this box's OS keyring.` | 0 |
+| The URL is refused | `not setting the Qdrant URL: <why>` (the URL itself is never repeated) | 2 |
+| Another box changed the URL meanwhile | `the Qdrant URL changed while it was being set; nothing was written — run the command again` (or `cleared`) | 2 |
+| No DSN, the OS keyring, `box.toml`, the schema | the same sentences as [Failure documents](#failure-documents) | 2 |
+| A blank key line | `no Qdrant API key on stdin; nothing was stored` | 2 |
+| Postgres did not answer | `cannot reach Postgres: ...` | 3 |
+| Anything else | the error | 1 |
+
+Each line on standard error starts with `htui: ` when the flag fails. Exits 2 and 3 are never sent
+to htui's crash reporter.
+
 ## Credentials and crash reports
 
 - **The DSN comes from the OS keyring only**, as for every htui command (`R-STO-1`). It is never
-  read from the command line or the environment. Store it with `htui --set-dsn`. The Qdrant URL and
-  API key also come from the keyring.
+  read from the command line or the environment. Store it with `htui --set-dsn`.
+- **The Qdrant URL** comes from `HTUI_QDRANT_URL` when it is set (for development and CI), else
+  from the `qdrant_url` setting in Postgres, which every box shares. **The Qdrant API key** comes
+  from `HTUI_QDRANT_API_KEY` when it is set, else from this box's OS keyring. See
+  [Setting the Qdrant URL and API key](#setting-the-qdrant-url-and-api-key).
 - **Crash reports.** Exit 2 and exit 3 are never sent to htui's crash reporter: an unreachable
   store and a refusal are states, not crashes. Exit 1 is reported.
 
