@@ -825,7 +825,7 @@ impl AttachPane {
     }
 
     /// The pane's keys in its mode, through [`key_stack`](Self::key_stack): the Skills tab's part
-    /// of the shell's hint row (MOD-67 M6 T2).
+    /// of the hints, drawn on the pane that holds the keyboard (MOD-115 M4 C4).
     pub(super) fn hint(&self, keys: &Keys) -> String {
         let spec = match &self.mode {
             AttachMode::Form(_) => FORM_HINT,

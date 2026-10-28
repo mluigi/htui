@@ -848,7 +848,8 @@ impl LibraryView {
         );
     }
 
-    /// The keys of the shown mode for the shell's hint row (MOD-67 M6 T2), through
+    /// The keys of the shown mode (MOD-67 M6 T2), drawn on the pane that holds the keyboard and,
+    /// for Browse, on the shell's activity pane (MOD-115 M4 C4, C8), through
     /// [`key_stack`](Self::key_stack): the attachments pane's while it is open, an open agent
     /// help's, the editor's after the cursor's `L:C`, else the mode's.
     pub(super) fn key_hint(&self, keys: &Keys) -> String {

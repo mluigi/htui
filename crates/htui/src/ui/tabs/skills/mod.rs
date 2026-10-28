@@ -50,7 +50,7 @@ pub struct SkillsTab {
     library: LibraryView,
 }
 
-/// The two views of the switch line.
+/// The two views, the chips the leading pane carries (MOD-115 M4 E5).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum View {
     /// The skill library and its attachments (milestone 3). The tab opens here (D34).
@@ -61,7 +61,7 @@ enum View {
 }
 
 impl View {
-    /// Both views, in switch-line order.
+    /// Both views, in chip order.
     const ALL: [Self; 2] = [Self::Skills, Self::Templates];
 
     /// The view's id in a history location (MOD-115 M2 §8).
