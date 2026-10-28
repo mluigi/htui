@@ -1,6 +1,5 @@
 ---
 source: crates/htui/src/app/pane.rs
-assertion_line: 2065
 expression: frame
 ---
 no workspace   ¹asker  ²other               the editor is open: close this first

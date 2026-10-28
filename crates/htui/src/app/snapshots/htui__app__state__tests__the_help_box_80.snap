@@ -1,6 +1,5 @@
 ---
 source: crates/htui/src/app/state.rs
-assertion_line: 2286
 expression: frame
 ---
 no workspace               0 working · 0 waiting · no box ·  F9  about   ?  keys

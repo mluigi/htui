@@ -1,6 +1,5 @@
 ---
 source: crates/htui/src/app/pane.rs
-assertion_line: 1785
 expression: frame
 ---
 no workspa…  Ctrl+4 to the editor · Ctrl+x abort · Ctrl+PgDn/Ctrl+PgUp switch tabs · q quit · ? help
