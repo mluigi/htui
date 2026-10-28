@@ -5,12 +5,13 @@
 //! - typing: [`GUTTER`] in the caller's accent (the keys go to the field), `/ ` in `theme.key`,
 //!   then the field's own line with its cursor;
 //! - applied: ` / ` dim, then the query in `theme.base`;
-//! - either way `{shown} of {total}` in `theme.dim`, against the right edge.
+//! - either way `{shown} of {total}` in `theme.dim`, against the right edge;
+//! - a summary (M4 D-13): applied, with the caller's own count words in the count's place.
 //!
 //! The count gives way last: the field first, then the slash, and only a count wider than the
 //! whole row is cut, ending with `…` so it never reads as another number (`3 of 1` for
-//! `3 of 12`). An applied query that is empty is no band at all, and the caller does not reserve
-//! its row.
+//! `3 of 12`). An applied (or summary) query that is empty is no band at all, and the caller
+//! does not reserve its row.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -45,6 +46,15 @@ pub enum Filter<'a> {
         /// The rows in all.
         total: usize,
     },
+    /// A query is applied to a list the caller reads already filtered, so it has no total
+    /// (MOD-115 M4 D-13): drawn as [`Filter::Applied`], with the caller's own `count` words
+    /// (`11 items`) where `n of m` would be.
+    Summary {
+        /// The query as applied.
+        query: &'a str,
+        /// The caller's count, as it reads.
+        count: &'a str,
+    },
 }
 
 /// The band as one line of exactly `width` cells, the count cut with `…` when it alone is wider;
@@ -52,14 +62,17 @@ pub enum Filter<'a> {
 /// (`ctx.accent()`).
 #[must_use]
 pub fn line(filter: &Filter<'_>, width: u16, accent: Style, theme: &Theme) -> Line<'static> {
-    let (shown, total) = match *filter {
-        Filter::Applied { query: "", .. } => return Line::default(),
-        Filter::Typing { shown, total, .. } | Filter::Applied { shown, total, .. } => {
-            (shown, total)
+    let count = match *filter {
+        Filter::Applied { query: "", .. } | Filter::Summary { query: "", .. } => {
+            return Line::default();
         }
+        Filter::Typing { shown, total, .. } | Filter::Applied { shown, total, .. } => {
+            format!("{shown} of {total}")
+        }
+        Filter::Summary { count, .. } => count.to_owned(),
     };
     let width = usize::from(width);
-    let count = cells::clip(&format!("{shown} of {total}"), width);
+    let count = cells::clip(&count, width);
     let count_width = cells::cell_width(&count);
     let mut spans: Vec<Span<'static>> = Vec::new();
     // The prefix, one blank before the count, and the count: what is left is the query's.
@@ -74,7 +87,7 @@ pub fn line(filter: &Filter<'_>, width: u16, accent: Style, theme: &Theme) -> Li
                     spans.extend(field.line(room, true, theme).spans);
                 }
             }
-            Filter::Applied { query, .. } => {
+            Filter::Applied { query, .. } | Filter::Summary { query, .. } => {
                 spans.push(Span::styled(" / ", theme.dim));
                 spans.push(Span::styled(cells::clip(query, room), theme.base));
             }
@@ -202,7 +215,7 @@ mod tests {
                 text(&band).trim_start_matches('▌'),
                 match filter {
                     Filter::Typing { .. } => "/  3 of 12",
-                    Filter::Applied { .. } => " /  3 of 12",
+                    Filter::Applied { .. } | Filter::Summary { .. } => " /  3 of 12",
                 }
             );
             // No room for the slash either: the count alone, against the right edge.
@@ -264,6 +277,56 @@ mod tests {
             text(&line(&typing, 30, accent(), &theme)).starts_with("▌/ "),
             "an empty field being typed into is still a band"
         );
+    }
+
+    /// D-13: a list that reads its rows already filtered has no total; the band carries the
+    /// caller's own count, dim, against the right edge.
+    #[test]
+    fn a_summary_band_shows_the_query_and_the_callers_count() {
+        let theme = Theme::default();
+        let summary = Filter::Summary {
+            query: "bug",
+            count: "11 items",
+        };
+        let band = line(&summary, 30, accent(), &theme);
+        assert_eq!(text(&band), format!(" / bug{}11 items", " ".repeat(16)));
+        assert_eq!(band.width(), 30);
+        assert!(
+            !text(&band).contains('▌'),
+            "a summary is applied, not typed"
+        );
+        assert!(!text(&band).contains(" of "), "no `n of m`");
+        assert_eq!(style_of(&band, "/"), theme.dim);
+        assert_eq!(style_of(&band, "bug"), theme.base);
+        assert_eq!(style_of(&band, "11 items"), theme.dim);
+    }
+
+    #[test]
+    fn the_count_is_kept_at_narrow_widths() {
+        let theme = Theme::default();
+        let summary = Filter::Summary {
+            query: "a long query text",
+            count: "11 items",
+        };
+        assert_eq!(
+            text(&line(&summary, 20, accent(), &theme)),
+            " / a long … 11 items"
+        );
+        assert_eq!(text(&line(&summary, 12, accent(), &theme)), " /  11 items");
+        assert_eq!(text(&line(&summary, 10, accent(), &theme)), "  11 items");
+        assert_eq!(text(&line(&summary, 8, accent(), &theme)), "11 items");
+        let cut = text(&line(&summary, 5, accent(), &theme));
+        assert_eq!(cut, "11 i…", "a count wider than the row ends with `…`");
+    }
+
+    #[test]
+    fn an_empty_summary_query_is_no_band() {
+        let theme = Theme::default();
+        let empty = Filter::Summary {
+            query: "",
+            count: "11 items",
+        };
+        assert_eq!(line(&empty, 30, accent(), &theme).width(), 0);
     }
 
     #[test]
