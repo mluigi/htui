@@ -2079,6 +2079,32 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> StoreReply {
     }
 }
 
+/// [`serve`], with the seven `Settings > Qdrant` requests answered under `env` instead of this
+/// process's `HTUI_QDRANT_*` (blueprint P-13): the test harness's entry, so a test over a real
+/// backend reads no override it was not handed, in a sandbox that sets them or on the host.
+#[cfg(any(test, feature = "testkit"))]
+pub async fn serve_with_qdrant_env(
+    backend: &Backend,
+    request: &StoreRequest,
+    env: &htui_store::secret::QdrantEnv,
+) -> StoreReply {
+    match request {
+        StoreRequest::QdrantInfo
+        | StoreRequest::SetQdrantUrl { .. }
+        | StoreRequest::ClearQdrantUrl { .. }
+        | StoreRequest::SetQdrantApiKey(_)
+        | StoreRequest::ClearQdrantApiKey
+        | StoreRequest::AdoptOldQdrantUrl
+        | StoreRequest::DiscardOldQdrantUrl => {
+            match crate::qdrant_settings_info::serve_with(backend, request, env).await {
+                Ok(reply) => reply,
+                Err(err) => failed(request.name(), &err),
+            }
+        }
+        _ => serve(backend, request).await,
+    }
+}
+
 /// MOD-69 review L4: the open permissions, or `None` (unknown, as offline) when their read fails
 /// for any reason but [`StoreError::Unreachable`], which propagates so `go_offline` still fires.
 /// A broken permission read then costs the list its permission rows, not the whole reply. This is

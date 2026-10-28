@@ -6181,6 +6181,12 @@ async fn tab_in_the_qdrant_editor_keeps_the_settings_tab() {
         frame.contains("cannot be read while Postgres is offline"),
         "the URL row offline opens nothing: {frame}"
     );
+    // Blueprint P-13: the harness reads no `HTUI_QDRANT_*` from this process, so the frame is
+    // the same in a sandbox that sets them and on the host.
+    assert!(
+        !frame.contains("HTUI_QDRANT_URL") && !frame.contains("HTUI_QDRANT_API_KEY"),
+        "no override from the test process: {frame}"
+    );
     harness.key("j");
     harness.key("e");
     harness.drive_to_end().await;
@@ -6204,6 +6210,52 @@ async fn tab_in_the_qdrant_editor_keeps_the_settings_tab() {
             "`{chord}` keeps the editor: {frame}"
         );
     }
+
+    cache.close().await;
+    drop(root);
+}
+
+/// Blueprint P-13: a harness over a real backend serves the Qdrant read under the overrides it
+/// was handed, never this process's, so a test that needs an override says so.
+#[tokio::test]
+async fn an_offline_harness_shows_the_overrides_it_was_handed() {
+    let _keyring = htui_store::testkit::mock_keyring().await;
+    let root = tempfile::tempdir().expect("a throwaway config root");
+    let cache = htui_store::CacheStore::open(
+        root.path(),
+        "qdrant-env",
+        htui_store::PgStore::schema_version(),
+    )
+    .await
+    .expect("a fresh mirror");
+    let mut harness = Harness::over_backend(Backend::Offline {
+        cache: cache.clone(),
+        since: Some(chrono::Utc::now()),
+    })
+    .with_qdrant_env(htui_store::secret::QdrantEnv::new(
+        Some("http://env.example:6334".to_owned()),
+        Some("KEY-SENTINEL".to_owned()),
+    ))
+    .with_tab(Box::new(SettingsTab::with_sections(vec![Box::new(
+        QdrantSection::new(),
+    )])));
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("HTUI_QDRANT_URL=http://env.example:6334"),
+        "the URL override handed in: {frame}"
+    );
+    harness.key("j");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("HTUI_QDRANT_API_KEY is in force"),
+        "the key override handed in: {frame}"
+    );
+    assert!(
+        !frame.contains("KEY-SENTINEL"),
+        "the key is never shown: {frame}"
+    );
 
     cache.close().await;
     drop(root);

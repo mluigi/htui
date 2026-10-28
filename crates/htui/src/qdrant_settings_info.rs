@@ -218,8 +218,10 @@ async fn cas<T>(backend: &Backend, env: &QdrantEnv, outcome: &CasOutcome<T>) -> 
 }
 
 /// CLEAN-8 #9, MOD-158 D9: the seven Settings > Qdrant requests, for `try_serve` (the loop's
-/// `other` arm, the harness and `--demo` alike), with this process's overrides. On
-/// [`Backend::Memory`] no environment is read (see [`serve_with`]).
+/// `other` arm and `--demo`), with this process's overrides. On [`Backend::Memory`] no
+/// environment is read (see [`serve_with`]). The test harness goes around this to
+/// [`serve_with`] with the overrides a test hands it (`store_worker::serve_with_qdrant_env`), so
+/// no test reads `HTUI_QDRANT_*` from its process (blueprint P-13).
 ///
 /// # Errors
 ///
