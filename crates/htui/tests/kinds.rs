@@ -18,9 +18,9 @@ use htui::ui::tabs::settings::{
 };
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    EdgeId, EdgeKind, GraphBody, GraphScope, Isolation, ItemKind, ItemKindId, ItemKindPatch, NewProject,
-    PersonaId, PhaseAgent, PhaseId, PhasePart, PhasePatch, ProjectId, Scope, Split, StepGraph,
-    StepGraphEdge, StepGraphId, StepGraphPatch, StepGraphPhase, WorkspaceId,
+    EdgeId, EdgeKind, GraphBody, GraphScope, Isolation, ItemKind, ItemKindId, ItemKindPatch,
+    NewProject, PersonaId, PhaseAgent, PhaseId, PhasePart, PhasePatch, ProjectId, Scope, Split,
+    StepGraph, StepGraphEdge, StepGraphId, StepGraphPatch, StepGraphPhase, WorkspaceId,
 };
 use htui_core::seed::{PHASES_PER_PROJECT, PhaseSeed, phase_row};
 use htui_core::store::{
