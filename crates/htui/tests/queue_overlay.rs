@@ -13,6 +13,7 @@ use htui::agent_worker::AgentRuntime;
 use htui::app::{Action, register_all};
 use htui::keys::{Keys, load_str};
 use htui::testkit::Harness;
+use htui::ui::kit::list::GUTTER;
 use htui::ui::overlay::QueueOverlay;
 use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::ids;
@@ -66,25 +67,36 @@ async fn open(mut harness: Harness) -> Harness {
     harness
 }
 
-/// The lines inside the overlay's box: from its title row to its bottom border, cut at the box's
-/// edges, so the Backlog drawn around it is not read.
+/// The lines of the overlay's box: from its title row to its bottom border, which carries the
+/// keys (MOD-115 M4 E6), cut at the box's edges, so the Backlog drawn around it is not read.
 fn queue_box(frame: &str) -> Vec<String> {
     let lines: Vec<&str> = frame.lines().collect();
     let (top, column, width) = lines
         .iter()
         .enumerate()
         .find_map(|(index, line)| {
-            let byte = line.find("┌ Queue ")?;
+            let byte = line.find("\u{256d} Queue ")?;
             let column = line[..byte].chars().count();
-            let width = line[byte..].chars().position(|c| c == '┐')? + 1;
+            let width = line[byte..].chars().position(|c| c == '\u{256e}')? + 1;
             Some((index, column, width))
         })
         .expect("the queue box is drawn");
-    lines[top..]
+    let cut: Vec<String> = lines[top..]
         .iter()
         .map(|line| line.chars().skip(column).take(width).collect::<String>())
-        .take_while(|line| !line.starts_with('└'))
-        .collect()
+        .collect();
+    let bottom = cut
+        .iter()
+        .position(|line| line.starts_with('\u{2570}'))
+        .expect("the box's bottom border");
+    cut[..=bottom].to_vec()
+}
+
+/// A box row's cells after its left border and the list's gutter (`▌` on the cursor row).
+fn row_cells(line: &str) -> &str {
+    line.trim_start_matches('\u{2502}')
+        .trim_start_matches(GUTTER)
+        .trim_start()
 }
 
 /// The overlay's item keys, top to bottom, among `keys`.
@@ -92,9 +104,9 @@ fn row_order(harness: &mut Harness, keys: &[&str]) -> Vec<String> {
     queue_box(&harness.render())
         .iter()
         .filter_map(|line| {
-            let cells = line.trim_start_matches('│').trim_start_matches("> ");
+            let cells = row_cells(line);
             keys.iter()
-                .find(|key| cells.trim_start().starts_with(&format!("{key} ")))
+                .find(|key| cells.starts_with(&format!("{key} ")))
                 .map(|key| (*key).to_owned())
         })
         .collect()
@@ -103,7 +115,10 @@ fn row_order(harness: &mut Harness, keys: &[&str]) -> Vec<String> {
 /// The key of the row the cursor is on, among `keys`.
 fn cursor_row(harness: &mut Harness, keys: &[&str]) -> Option<String> {
     queue_box(&harness.render()).iter().find_map(|line| {
-        let cells = line.trim_start_matches('│').strip_prefix("> ")?;
+        let cells = line
+            .trim_start_matches('\u{2502}')
+            .strip_prefix(GUTTER)?
+            .trim_start();
         keys.iter()
             .find(|key| cells.starts_with(&format!("{key} ")))
             .map(|key| (*key).to_owned())
@@ -132,6 +147,16 @@ async fn ctrl_q_opens_the_queue_overlay_over_the_memory_backend() {
     assert!(inside.contains("demo: nothing is admitted"), "{frame}");
     assert!(inside.contains("Esc close"), "{frame}");
     insta::assert_snapshot!("opened", inside);
+
+    // MOD-115 M4 E6: at 80 columns the box keeps every row and its keys.
+    harness.resize(80, 30);
+    let frame = harness.render();
+    let inside = queue_box(&frame).join("\n");
+    for text in ["ANA-2 ", "FEAT-2 ", "demo: nothing is admitted", "j/k move"] {
+        assert!(inside.contains(text), "{text}: {frame}");
+    }
+    insta::assert_snapshot!("opened_80", inside);
+    harness.resize(100, 30);
 
     // A lower-case `q` is swallowed by the modal overlay: it never quits from inside it.
     harness.key("q");
@@ -172,7 +197,7 @@ async fn a_reorder_round_trips_through_the_store() {
     assert!(
         queue_box(&frame)
             .iter()
-            .any(|line| line.starts_with(&format!("│> {} ", shown[1]))),
+            .any(|line| line.starts_with(&format!("\u{2502}{GUTTER} {} ", shown[1]))),
         "the cursor stayed on the moved item: {frame}"
     );
 }

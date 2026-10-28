@@ -5,10 +5,11 @@ expression: bench.render(&overlay)
 
 
 
-  ┌ Queue ───────────────────────────────────────────────────────────────────────────────────────┐
+
+  ╭ Queue ───────────────────────────────────────────────────────────────────────────────────────╮
   │  queue: running · batch since 14:02 · $1.20 spent · 1/2 slots                                │
   │                                                                                              │
-  │> QX-1   entry 1   running here                                                               │
+  │▌ QX-1   entry 1   running here                                                               │
   │  QX-2   entry 2   admitted, waiting to be claimed                                            │
   │  QX-3   entry 3   running on LAPTOP-B                                                        │
   │  QX-4   entry 4   queued for another box                                                     │
@@ -27,6 +28,4 @@ expression: bench.render(&overlay)
   │  QX-17  entry 17  blocked (last note: pick a branch)                                         │
   │  QX-18  entry 18  failed: exit 1                                                             │
   │  QX-19  entry 19  missing tags: gpu                                                          │
-  │                                                                                              │
-  │  j/k move · J/K reorder · P pause/resume · Q dequeue · Enter open · Esc close                │
-  └──────────────────────────────────────────────────────────────────────────────────────────────┘
+  ╰ j/k move · J/K reorder · P pause/resume · Q dequeue · Enter open · Esc close ────────────────╯
