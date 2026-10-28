@@ -3,8 +3,10 @@
 //! MOD-115 M4 E5: the tab draws its own kit panes (`draws_chrome`). The switch is no line of
 //! its own any more: the pane that leads the shown view (the list while browsing, else what
 //! covers the content) carries `Skills` and `Templates` as chips on its top border, the
-//! active one naming the view ([`view_chips`]). The pane that holds the keyboard is the
-//! focused one ([`holder`], M4 C4), and the hints are drawn on it alone (Q2).
+//! active one naming the view ([`view_chips`]); a pane that holds the keyboard carries them
+//! only while its whole title fits beside them ([`view_chips_if_room`]). The pane that holds
+//! the keyboard is the focused one ([`holder`], M4 C4), and the hints are drawn on it alone
+//! (Q2).
 //!
 //! The Skills view (`library`, with its attachments pane in `attach`) is MOD-9 milestone 3: the
 //! skill library, any version's body, a line diff between two versions, an editor with a token
@@ -28,12 +30,12 @@ use crate::app::{Ctx, Handled};
 use crate::editor::ExternalEditOutcome;
 use crate::keys::{Act, KeyChord, Stack};
 use crate::store_worker::{StoreReply, StoreRequest};
-use crate::ui::Theme;
 use crate::ui::kit::chips::key_line;
 use crate::ui::kit::pane::{Focus, Pane};
 use crate::ui::kit::text::wrapped;
 use crate::ui::shell::{PaneId, Panes, TabLoc};
 use crate::ui::tabs::registry::{Tab, TabId};
+use crate::ui::{Theme, cells};
 use crossterm::event::KeyEvent;
 
 use library::LibraryView;
@@ -93,6 +95,30 @@ pub(super) const VIEWS: &[&str] = &["Skills", "Templates"];
 /// the pane that leads the shown view carries them, its title kept first (M4 C5).
 pub(super) fn view_chips(pane: Pane<'_>, view: usize) -> Pane<'_> {
     pane.title_first().sub_tabs(VIEWS, view)
+}
+
+/// [`view_chips`] on a pane that holds the keyboard (a draft, a proposal, an answer), titled
+/// `title` and `width` cells wide (MOD-115 M4 L-skills repair 2). There the chips do nothing (a
+/// capturing mode takes the view switch's key as a letter) and the title says what a save writes,
+/// so the chips are drawn only when the whole title fits beside the active chip and its mark
+/// (the room `title_first` leaves it); otherwise the pane keeps its title whole and no chips.
+pub(super) fn view_chips_if_room<'a>(
+    pane: Pane<'a>,
+    title: &str,
+    view: usize,
+    width: u16,
+) -> Pane<'a> {
+    let chip = VIEWS
+        .get(view)
+        .map_or(0, |name| cells::cell_width(name) + 2);
+    let marks = usize::from(view > 0) + usize::from(view + 1 < VIEWS.len());
+    // The corners, the rule cell after the left one, the active chip and its mark.
+    let room = usize::from(width).saturating_sub(3 + chip + marks);
+    if cells::cell_width(title) + 2 <= room {
+        view_chips(pane, view)
+    } else {
+        pane.title_first()
+    }
 }
 
 /// MOD-115 M4 C4: how the pane that holds the keyboard (a prompt, a form, an editor, a pane drawn

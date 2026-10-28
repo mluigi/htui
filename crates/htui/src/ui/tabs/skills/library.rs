@@ -37,7 +37,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use super::agent_help::{AgentHelp, HelpOutcome, Report, accepted};
 use super::attach::{AttachOutcome, AttachPane};
-use super::{framed, hint_line, holder, joined, unavailable, view_chips};
+use super::{framed, hint_line, holder, joined, unavailable, view_chips, view_chips_if_room};
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::{ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, edited};
 use crate::keys::translate::FieldEvent;
@@ -2124,10 +2124,11 @@ impl LibraryView {
         }
     }
 
-    /// The draft's pane: the name, the versions and the estimate as its title, the view chips,
-    /// and the text with its cursor (dim under an open help, which has the keys and the focus).
-    /// The text's rect is claimed for an in-pane editor (MOD-57 P2), inside the pane, so the
-    /// name and versions stay visible beside it.
+    /// The draft's pane: the name, the versions and the estimate as its title, the view chips while
+    /// the whole title fits beside them (`view_chips_if_room`), and the text with its cursor (dim
+    /// under an open help, which has the keys and the focus). The text's rect is claimed for an
+    /// in-pane editor (MOD-57 P2), inside the pane, so the name and versions stay visible beside
+    /// it.
     fn render_draft(&self, frame: &mut Frame<'_>, area: Rect, editor: &Editor, ctx: &Ctx<'_>) {
         let name = editor.target.name();
         let tokens = estimate(name, editor.saves(), editor.area.text());
@@ -2162,7 +2163,7 @@ impl LibraryView {
         } else {
             Focus::Unfocused
         };
-        let mut pane = view_chips(KitPane::new(&title), 0)
+        let mut pane = view_chips_if_room(KitPane::new(&title), &title, 0, area.width)
             .focus(focus)
             .accent(ctx.accent());
         if let Some(hints) = hint_line(self.key_hint(ctx.keys()), ctx) {
@@ -4260,5 +4261,32 @@ mod tests {
         };
         shows(&empty, &unbound, &["a new or imported skill shows here"]);
         shows(&unversioned, &unbound, &["its first version shows here"]);
+    }
+
+    /// MOD-115 M4 L-skills repair 2: the draft's title (the versions and the token estimate,
+    /// D82) stays whole in a pane just wide enough for it: the view chips, which do nothing while
+    /// the draft has the keys, are drawn only when the whole title fits beside them.
+    #[test]
+    fn the_draft_title_stays_whole_where_the_chips_would_cut_it() {
+        let bench = Bench::new();
+        let body = "First line.\n";
+        let target = Target::New {
+            name: "docs-style".to_owned(),
+            description: String::new(),
+        };
+        let view = LibraryView {
+            mode: Mode::Editing(Editor::new(target, 0, None, body)),
+            ..LibraryView::default()
+        };
+        let title = format!(
+            "docs-style \u{b7} new, saves v1 \u{b7} ~{} tokens",
+            estimate("docs-style", 1, body)
+        );
+        let width = u16::try_from(cell_width(&title)).expect("a short title") + 6;
+        let (_, rows) = frame_of(&view, &bench.ctx(), width, 8);
+        assert!(rows[0].contains(&format!(" {title} ")), "{rows:#?}");
+        let (_, rows) = frame_of(&view, &bench.ctx(), 100, 8);
+        assert!(rows[0].contains(&format!(" {title} ")), "{rows:#?}");
+        assert!(rows[0].contains(" Skills "), "the view chips: {rows:#?}");
     }
 }

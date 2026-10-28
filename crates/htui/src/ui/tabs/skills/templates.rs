@@ -27,7 +27,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Wrap};
 
 use super::agent_help::{AgentHelp, HelpOutcome, Report, accepted};
-use super::{framed, hint_line, holder, joined, unavailable, view_chips};
+use super::{framed, hint_line, holder, joined, unavailable, view_chips, view_chips_if_room};
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::{ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, edited};
 use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
@@ -1500,10 +1500,10 @@ impl TemplatesView {
         self.render_placeholders(frame, right, editor, ctx);
     }
 
-    /// The draft's pane: the name and the versions as its title, the view chips, and the text with
-    /// its cursor (dim under an open help, which has the keys and the focus). The text's rect is
-    /// claimed for an in-pane editor (MOD-57 P2), inside the pane, so the name and versions stay
-    /// visible beside it.
+    /// The draft's pane: the name and the versions as its title, the view chips while the whole
+    /// title fits beside them (`view_chips_if_room`), and the text with its cursor (dim under an
+    /// open help, which has the keys and the focus). The text's rect is claimed for an in-pane
+    /// editor (MOD-57 P2), inside the pane, so the name and versions stay visible beside it.
     fn render_draft(&self, frame: &mut Frame<'_>, left: Rect, editor: &Editor, ctx: &Ctx<'_>) {
         let title = match (editor.token, editor.from) {
             (Some(token), from) => format!(
@@ -1532,8 +1532,13 @@ impl TemplatesView {
             Focus::Unfocused
         };
         let hints = hint_line(self.draft_hint(editor, ctx.keys(), left.width), ctx);
-        framed(view_chips(KitPane::new(&title), 1), focus, hints, ctx)
-            .render(frame, left, ctx.theme);
+        framed(
+            view_chips_if_room(KitPane::new(&title), &title, 1, left.width),
+            focus,
+            hints,
+            ctx,
+        )
+        .render(frame, left, ctx.theme);
     }
 
     /// The role's placeholders and, for the judge and `review`, the wire contract: a kit pane
@@ -2976,5 +2981,35 @@ mod tests {
             ..Bench::new()
         };
         shows(&view, &unbound, &["a template row shows its body here"]);
+    }
+
+    /// MOD-115 M4 L-skills repair 2: beside the placeholders, an 80-column draft is 42 cells
+    /// wide. Its title, the version a save writes, stays whole there: the view chips, which do
+    /// nothing while the draft has the keys, are drawn only when the whole title fits beside
+    /// them, as it does at 100 columns.
+    #[test]
+    fn the_draft_title_stays_whole_beside_the_placeholders_at_80_columns() {
+        let bench = Bench::new();
+        let view = TemplatesView {
+            mode: Mode::Editing(Editor::new(
+                ids::PROJECT_VULKAN,
+                "handoff".to_owned(),
+                Some(1),
+                Some(1),
+                "body\n",
+            )),
+            ..TemplatesView::default()
+        };
+        let (_, rows) = frame_of(&view, &bench.ctx(), 80, 12);
+        assert!(
+            rows[0].contains(" handoff \u{b7} editing from v1, saves v2 "),
+            "{rows:#?}"
+        );
+        let (_, rows) = frame_of(&view, &bench.ctx(), 100, 12);
+        assert!(
+            rows[0].contains(" handoff \u{b7} editing from v1, saves v2 "),
+            "{rows:#?}"
+        );
+        assert!(rows[0].contains(" Templates "), "the view chips: {rows:#?}");
     }
 }

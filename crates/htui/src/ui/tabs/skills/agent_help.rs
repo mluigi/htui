@@ -25,7 +25,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Wrap};
 
-use super::{framed, hint_line, holder, view_chips};
+use super::{framed, hint_line, holder, view_chips_if_room};
 use crate::app::{Ctx, Handled};
 use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::store_worker::{ChatFrame, EDIT_HELP, StoreReply, StoreRequest};
@@ -645,7 +645,8 @@ impl AgentHelp {
     /// Draws into `area` (B-2); returns the rect left for the locked draft, `None` when the help
     /// takes it all. MOD-115 M4 E5: kit panes; the help holds the keyboard, so its pane is the
     /// focused one (C4) and carries the help's hints. A proposal or an answer takes the whole
-    /// area, so it leads the view and carries the view chips, `view` the active one.
+    /// area, so it leads the view and carries the view chips, `view` the active one, while its
+    /// whole title fits beside them (`view_chips_if_room`).
     pub(super) fn render(
         &self,
         frame: &mut Frame<'_>,
@@ -681,7 +682,12 @@ impl AgentHelp {
                     let style = if *masked { theme.error } else { theme.warning };
                     Line::styled(format!("the proposal {}", flags.join(" \u{b7} ")), style)
                 });
-                let pane = framed(view_chips(Pane::new(&title), view), focus, hints, ctx);
+                let pane = framed(
+                    view_chips_if_room(Pane::new(&title), &title, view, area.width),
+                    focus,
+                    hints,
+                    ctx,
+                );
                 self.render_pane(frame, area, pane, lead, diff::lines(unified, theme), theme);
                 None
             }
@@ -696,7 +702,12 @@ impl AgentHelp {
                     .map(|line| Line::styled(line.to_owned(), theme.base))
                     .collect();
                 let title = format!("{agent} replied \u{b7} {why}");
-                let pane = framed(view_chips(Pane::new(&title), view), focus, hints, ctx);
+                let pane = framed(
+                    view_chips_if_room(Pane::new(&title), &title, view, area.width),
+                    focus,
+                    hints,
+                    ctx,
+                );
                 self.render_pane(frame, area, pane, None, lines, theme);
                 None
             }
@@ -1874,5 +1885,29 @@ mod tests {
         let text = buffer_text(buffer);
         let bottom = text.lines().last().expect("a bottom row");
         assert!(bottom.contains("Enter ask"), "{text}");
+    }
+
+    /// MOD-115 M4 L-skills repair 2: a proposal over an 80-column Templates draft is 42 cells
+    /// wide; its title stays whole there. The view chips, which do nothing while the help has the
+    /// keys, are drawn only when the whole title fits beside them.
+    #[test]
+    fn the_proposal_title_stays_whole_where_the_chips_would_cut_it() {
+        let bench = Bench::new();
+        let help = answered(&bench, "key: abc\n", "```\nkey: def\n```");
+        let drawn = |width: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(width, 8)).expect("a test terminal");
+            terminal
+                .draw(|frame| {
+                    help.render(frame, frame.area(), &bench.ctx(), 1);
+                })
+                .expect("draws");
+            buffer_text(terminal.backend().buffer())
+        };
+        let title = " proposal from c \u{b7} sent \u{2192} proposed ";
+        let text = drawn(42);
+        assert!(text.contains(title), "{text}");
+        let text = drawn(60);
+        assert!(text.contains(title), "{text}");
+        assert!(text.contains(" Templates "), "the view chips: {text}");
     }
 }
