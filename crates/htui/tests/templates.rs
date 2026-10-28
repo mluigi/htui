@@ -473,7 +473,7 @@ async fn a_refused_save_sends_no_request() {
     );
     assert!(
         hint(&frame)
-            .starts_with("L1:C1 \u{b7} Ctrl+s save \u{b7} Ctrl+g ask agent \u{b7} Ctrl+e $EDITOR"),
+            .starts_with("L1:C1 \u{b7} Ctrl+s save \u{b7} Esc cancel \u{b7} Ctrl+g ask agent"),
         "the editor is still open, the cursor on the `{{`: {frame}"
     );
 }

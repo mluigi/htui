@@ -149,14 +149,21 @@ const NAMING_HINT: HintSpec = &[
     Hint::Text("Esc cancel"),
 ];
 
-/// The hint row in the editor, through [`views::TEMPLATES_EDITOR`], before the cursor's
-/// `L{line}:C{col}` (D20). `skills.ask_agent` is MOD-55's `Ctrl+G` (MOD-67 M4 D9).
+/// The hint row in the editor, through [`views::TEMPLATES_EDITOR`], after the cursor's
+/// `L{line}:C{col}` (D20). `skills.ask_agent` is MOD-55's `Ctrl+G` (MOD-67 M4 D9). Save and the
+/// way out lead: the draft pane beside the placeholders holds only some of the keys at 100
+/// columns, and [`draft_hint`](TemplatesView::draft_hint) drops them from the end (MOD-115 M4
+/// L-skills repair 1).
 const EDIT_HINT: HintSpec = &[
     Hint::One(Act::FormSave, "save"),
+    Hint::Text("Esc cancel"),
     Hint::One(Act::SkillsAskAgent, "ask agent"),
     Hint::One(Act::FormExternalEditor, "$EDITOR"),
-    Hint::Text("Esc cancel"),
 ];
+
+/// The cells of a kit pane's width its bottom border keeps for hints: they start two cells in
+/// and stop one rule cell short of the corner (`kit::pane`).
+const HINT_MARGIN: u16 = 4;
 
 /// The hint row while a `Ctrl+E` handoff holds the draft: `$EDITOR` has the keys.
 const HANDED_OFF_HINT: HintSpec = &[Hint::Text("the draft is in $EDITOR")];
@@ -657,6 +664,29 @@ impl TemplatesView {
             (Mode::Naming { .. }, _) => keys.hint(self.key_stack(), NAMING_HINT),
             (Mode::Browse, None) => keys.hint(self.key_stack(), BROWSE_HINT),
         }
+    }
+
+    /// The editor's keys fitted to the draft pane `width` cells wide (MOD-115 M4 L-skills repair
+    /// 1): [`key_hint`](Self::key_hint)'s whole row when it fits or an agent help has the keys,
+    /// else the cursor's `L:C` and as many of [`EDIT_HINT`]'s keys, in order and whole, as the
+    /// bottom border holds; the first that does not fit goes with every one after it, and ` ·…`
+    /// says so. Never half a key.
+    fn draft_hint(&self, editor: &Editor, keys: &Keys, width: u16) -> String {
+        let full = self.key_hint(keys);
+        let room = usize::from(width.saturating_sub(HINT_MARGIN));
+        if editor.help.is_some() || cells::cell_width(&full) <= room {
+            return full;
+        }
+        let (line, col) = editor.area.cursor_line_col();
+        let at = format!("L{}:C{}", line + 1, col + 1);
+        (0..EDIT_HINT.len())
+            .rev()
+            .map(|kept| {
+                let fit = joined(&[at.clone(), keys.hint(self.key_stack(), &EDIT_HINT[..kept])]);
+                format!("{fit} \u{b7}\u{2026}")
+            })
+            .find(|cut| cells::cell_width(cut) <= room)
+            .unwrap_or(full)
     }
 
     // --- keys ----------------------------------------------------------------------------------
@@ -1500,7 +1530,7 @@ impl TemplatesView {
         } else {
             Focus::Unfocused
         };
-        let hints = hint_line(self.key_hint(ctx.keys()), ctx);
+        let hints = hint_line(self.draft_hint(editor, ctx.keys(), left.width), ctx);
         framed(view_chips(KitPane::new(&title), 1), focus, hints, ctx)
             .render(frame, left, ctx.theme);
     }
@@ -2772,5 +2802,49 @@ mod tests {
         assert!(rows[0].contains(" Templates "), "the view chips: {rows:#?}");
         assert!(rows[0].contains("phase placeholders"), "{rows:#?}");
         assert!(rows[18].contains("Ctrl+s save"), "{rows:#?}");
+    }
+
+    /// MOD-115 M4 L-skills repair 1: the draft pane is narrower than the row the editor's keys
+    /// had, so they are fitted to it whole: the cursor's `L:C`, then save and the way out, then
+    /// the rest while they fit; a key that does not fit goes with those after it, and `…` says
+    /// so. Never half a key; at a width that holds them all, all of them.
+    #[test]
+    fn the_draft_hint_keeps_the_way_out_and_never_cuts_a_key() {
+        let bench = Bench::new();
+        let view = TemplatesView {
+            mode: Mode::Editing(Editor::new(
+                ids::PROJECT_VULKAN,
+                "implement".to_owned(),
+                Some(1),
+                Some(1),
+                "body\n",
+            )),
+            ..TemplatesView::default()
+        };
+        let bottom = |width: u16| {
+            let (_, rows) = frame_of(&view, &bench.ctx(), width, 20);
+            let draft = usize::from(width - HELP_WIDTH);
+            let border = rows
+                .iter()
+                .rposition(|row| row.starts_with('\u{2570}'))
+                .expect("the draft's bottom border");
+            let row: String = rows[border].chars().take(draft).collect();
+            row.trim_matches(['\u{2570}', '\u{256f}', '\u{2500}'])
+                .to_owned()
+        };
+        assert_eq!(
+            bottom(100),
+            "L1:C1 \u{b7} Ctrl+s save \u{b7} Esc cancel \u{b7} Ctrl+g ask agent \u{b7}\u{2026}"
+        );
+        assert_eq!(
+            bottom(120),
+            "L1:C1 \u{b7} Ctrl+s save \u{b7} Esc cancel \u{b7} Ctrl+g ask agent \u{b7} Ctrl+e $EDITOR"
+        );
+        let narrow = bottom(80);
+        assert!(
+            narrow.starts_with("L1:C1 \u{b7} Ctrl+s save \u{b7} Esc cancel"),
+            "{narrow:?}"
+        );
+        assert!(narrow.ends_with(" \u{b7}\u{2026}"), "{narrow:?}");
     }
 }
