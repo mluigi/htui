@@ -48,9 +48,6 @@ const KIT: &str = "ui/kit/";
 /// `src` outside group A and the kit, less the [`OWN_BLOCK`] name collisions (all of them under
 /// `src/ui` and `src/app`, which RV1 L7 checked when it widened the scan to the whole of `src`).
 const GROUP_B: &[(&str, &str)] = &[
-    ("app/state.rs", "the `?` box and the no-tab body"),
-    ("ui/editor_pane.rs", "the in-pane editor"),
-    ("ui/overlay/abort_confirm.rs", "overlay"),
     ("ui/overlay/concepts_search.rs", "overlay"),
     ("ui/overlay/migration_prompt.rs", "overlay"),
     ("ui/overlay/queue.rs", "overlay"),

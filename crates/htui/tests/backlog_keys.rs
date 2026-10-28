@@ -27,7 +27,8 @@ fn status_line(harness: &mut Harness) -> String {
 }
 
 /// The `?` box's lines, one per layer: the rows between its borders, each continuation row
-/// (indented two cells) joined onto the line it wraps.
+/// (indented two cells) joined onto the line it wraps. The box is found by its titled top-left
+/// corner, square or the kit's rounded one (MOD-115 M4 D-12).
 fn help_box(frame: &str) -> Vec<String> {
     let rows: Vec<Vec<char>> = frame.lines().map(|row| row.chars().collect()).collect();
     let (top, left) = rows
@@ -35,13 +36,13 @@ fn help_box(frame: &str) -> Vec<String> {
         .enumerate()
         .find_map(|(at, row)| {
             let text: String = row.iter().collect();
-            let byte = text.find("┌ Keys")?;
+            let byte = text.find("┌ Keys").or_else(|| text.find("╭ Keys"))?;
             Some((at, text[..byte].chars().count()))
         })
         .unwrap_or_else(|| panic!("the `?` box is open:\n{frame}"));
     let mut lines: Vec<String> = Vec::new();
     for row in &rows[top + 1..] {
-        if row.get(left) == Some(&'└') {
+        if matches!(row.get(left), Some('└' | '╰')) {
             break;
         }
         let inner: String = row[left + 1..].iter().take_while(|&&c| c != '│').collect();

@@ -492,7 +492,10 @@ impl App {
                 }
             }
             StoreReply::MigrationsApplied { applied } => {
-                self.status = Some(format!("applied {applied} migration(s)"));
+                self.status = Some(format!(
+                    "applied {}",
+                    crate::ui::kit::label::plural(*applied, "migration", "migrations")
+                ));
             }
             // MOD-7 D13, blueprint D25: the registration probe answers at `UNSOLICITED`, which the
             // freshness gate drops, so its report is rendered here, above the gate.
@@ -1174,7 +1177,19 @@ mod tests {
             origin: Origin::App,
             reply: StoreReply::MigrationsApplied { applied: 2 },
         }));
-        assert_eq!(app.status.as_deref(), Some("applied 2 migration(s)"));
+        assert_eq!(app.status.as_deref(), Some("applied 2 migrations"));
+    }
+
+    /// MOD-115 M4 D-2: the count reads as a word, never `(s)`.
+    #[test]
+    fn one_applied_migration_is_one_migration() {
+        let (mut app, _rx, _seen) = shell();
+        app.update(Action::Reply(ReplyEnvelope {
+            seq: 0,
+            origin: Origin::App,
+            reply: StoreReply::MigrationsApplied { applied: 1 },
+        }));
+        assert_eq!(app.status.as_deref(), Some("applied 1 migration"));
     }
 
     /// What an [`Asker`] was handed back by the editor.

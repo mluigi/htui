@@ -2038,6 +2038,33 @@ mod tests {
         assert!(!app.editor_open(), "the rebound key aborts");
     }
 
+    /// MOD-115 M4 E7: the abort question is a kit question: a rounded box titled `Abort` with
+    /// the question inside and its keys on the bottom border, at 80 columns as at 100.
+    #[test]
+    fn the_abort_question_carries_its_keys_on_its_bottom_border() {
+        let (mut app, _benches, _log) = unfocused_two();
+        abortable(&mut app);
+        app.on_key(ctrl('x'));
+        let term = draw(&mut app, 80, 24);
+        let frame = text(term.backend().buffer());
+        let rows: Vec<&str> = frame.lines().collect();
+        let question = rows
+            .iter()
+            .position(|row| row.contains("Abort the edit and lose it?"))
+            .expect("the question is drawn");
+        assert!(
+            rows[question - 1].contains("\u{256d} Abort \u{2500}"),
+            "a rounded box titled Abort right above it: {frame}"
+        );
+        let bottom = rows[question + 1];
+        assert!(
+            bottom.contains('\u{2570}')
+                && bottom.contains("Ctrl+x again aborts \u{b7} any other key keeps editing"),
+            "the keys are on the bottom border, right under the question: {frame}"
+        );
+        insta::assert_snapshot!("the_abort_question_80", frame);
+    }
+
     #[test]
     fn abort_answers_failed_to_the_asking_tab_only() {
         let (mut app, benches) = shell(&[ASKER, OTHER]);
