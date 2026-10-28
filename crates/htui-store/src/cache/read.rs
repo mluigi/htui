@@ -198,6 +198,7 @@ fn item_summary_of(row: &SqliteRow) -> Result<ItemSummary> {
         required_tags: strings_col("item.required_tags", &text(row, "required_tags")?)?,
         updated_at: ts_col("item.updated_at", get(row, "updated_at")?)?,
         touched_paths: strings_col("item.touched_paths", &text(row, "touched_paths")?)?,
+        latest_run_status: get::<Option<RunStatus>>(row, "latest_run_status")?,
     })
 }
 
@@ -224,6 +225,40 @@ fn document_of(row: &SqliteRow) -> Result<Document> {
 const ITEM_SELECT: &str = "i.id, i.project_id, i.kind_id, i.key_prefix, i.key_number, i.key, \
      i.title, i.body, i.status, i.priority, i.required_tags, i.touched_paths, i.step_graph_id, \
      i.version, i.created_by, i.created_at, i.updated_at, i.closed_at, i.resolution";
+
+/// MOD-144: the latest graph run's status of the item aliased `i`, `cancelled` skipped, `NULL`
+/// when none: `pg/read.rs`' `lr` LATERAL as a correlated subquery (SQLite has no LATERAL). The
+/// mirror's `queued_at` is INTEGER and `id` lowercase UUID text, so the order is Postgres'
+/// `(queued_at, id)`.
+const LATEST_OF_I: &str = "(SELECT r.status FROM run r WHERE r.item_id = i.id AND r.kind = 'graph' \
+     AND r.status <> 'cancelled' ORDER BY r.queued_at DESC, r.id DESC LIMIT 1)";
+
+/// [`LATEST_OF_I`] for a `blocked_by` target aliased `t`.
+const LATEST_OF_T: &str = "(SELECT tr.status FROM run tr WHERE tr.item_id = t.id \
+     AND tr.kind = 'graph' AND tr.status <> 'cancelled' \
+     ORDER BY tr.queued_at DESC, tr.id DESC LIMIT 1)";
+
+/// MOD-144's readiness of the item aliased `i`, as `1`/`0`: `open`, no non-cancelled graph run,
+/// and every `blocked_by` target released (`closed`, or its latest graph run `done`). No
+/// `deleted_at`: a tombstone is already gone from the mirror; `IS NOT` is SQLite's null-safe `<>`.
+fn ready_case() -> String {
+    format!(
+        "CASE WHEN i.status = 'open' AND {LATEST_OF_I} IS NULL AND NOT EXISTS (\
+         SELECT 1 FROM item_link l JOIN item t ON t.id = l.to_item_id \
+         WHERE l.from_item_id = i.id AND l.kind = 'blocked_by' \
+         AND t.status <> 'closed' AND {LATEST_OF_T} IS NOT 'done') THEN 1 ELSE 0 END"
+    )
+}
+
+/// MOD-144's [`ItemState`](htui_core::model::ItemState) text of the item aliased `i`: `items`'
+/// `CASE` in `pg/read.rs`, over [`LATEST_OF_I`].
+fn state_case() -> String {
+    format!(
+        "CASE WHEN i.status = 'closed' THEN 'closed' WHEN i.status = 'blocked' THEN 'blocked' \
+         ELSE COALESCE(CASE {LATEST_OF_I} WHEN 'awaiting_approval' THEN 'needs_you' \
+         ELSE {LATEST_OF_I} END, 'open') END"
+    )
+}
 
 /// Every mirrored `run` column, in [`run_of`]'s names. `lease_owner` is absent from the mirror by
 /// design (plan D7) and absent from `Run` for the same reason: another process's liveness token
@@ -364,10 +399,11 @@ impl ReadStore for CacheStore {
             return Ok(Vec::new());
         }
 
-        let mut sql = String::from(
+        let mut sql = format!(
             "SELECT i.id, i.project_id, i.kind_id, i.key, i.key_prefix, i.key_number, i.title, \
-             i.status, i.priority, i.required_tags, i.updated_at, i.touched_paths \
-             FROM item i WHERE i.project_id IN (",
+             i.status, i.priority, i.required_tags, i.updated_at, i.touched_paths, \
+             {LATEST_OF_I} AS latest_run_status \
+             FROM item i WHERE i.project_id IN ("
         );
         sql.push_str(&placeholders(scope.project_ids.len()));
         sql.push(')');
@@ -381,6 +417,13 @@ impl ReadStore for CacheStore {
         if let Some(statuses) = &filter.statuses {
             sql.push_str(" AND i.status IN (");
             sql.push_str(&placeholders(statuses.len()));
+            sql.push(')');
+        }
+        if let Some(states) = &filter.states {
+            sql.push_str(" AND (");
+            sql.push_str(&state_case());
+            sql.push_str(") IN (");
+            sql.push_str(&placeholders(states.len()));
             sql.push(')');
         }
         if let Some(tags) = &filter.tags {
@@ -398,14 +441,10 @@ impl ReadStore for CacheStore {
             );
         }
         if filter.ready.is_some() {
-            // ANA-9 §7.4's store-side half: open, and no live `blocked_by` edge to a non-terminal
-            // item. `deleted_at` is absent because a tombstone is already gone from the mirror.
-            sql.push_str(
-                " AND ? = (CASE WHEN i.status = 'open' AND NOT EXISTS (\
-                 SELECT 1 FROM item_link l JOIN item t ON t.id = l.to_item_id \
-                 WHERE l.from_item_id = i.id AND l.kind = 'blocked_by' \
-                 AND t.status NOT IN ('done','closed')) THEN 1 ELSE 0 END)",
-            );
+            // ANA-9 §7.4's store-side half as MOD-144 has it ([`ready_case`]).
+            sql.push_str(" AND ? = (");
+            sql.push_str(&ready_case());
+            sql.push(')');
         }
 
         // `array_position($1, i.project_id)`, spelled out: the scope order is the Backlog order.
@@ -427,6 +466,11 @@ impl ReadStore for CacheStore {
         if let Some(statuses) = &filter.statuses {
             for status in statuses {
                 query = query.bind(status.as_str());
+            }
+        }
+        if let Some(states) = &filter.states {
+            for state in states {
+                query = query.bind(state.as_str());
             }
         }
         if let Some(tags) = &filter.tags {
@@ -465,7 +509,7 @@ impl ReadStore for CacheStore {
     async fn links(&self, id: ItemId, hops: u8) -> Result<LinkGraph> {
         // `UNION` (not `UNION ALL`) plus the `depth < ?` guard is what terminates the walk on a
         // cycle; `MIN(depth)` per node is the breadth-first depth `MemStore` produces.
-        let nodes = sqlx::query(
+        let nodes = sqlx::query(AssertSqlSafe(format!(
             "WITH RECURSIVE walk(item_id, depth) AS ( \
                  SELECT ?, 0 \
                UNION \
@@ -477,12 +521,12 @@ impl ReadStore for CacheStore {
              ), \
              node AS (SELECT item_id, MIN(depth) AS depth FROM walk GROUP BY item_id) \
              SELECT n.item_id, i.project_id, p.slug AS project_slug, i.key, i.title, i.status, \
-                    n.depth \
+                    n.depth, {LATEST_OF_I} AS latest_run_status \
                FROM node n \
                JOIN item i    ON i.id = n.item_id \
                JOIN project p ON p.id = i.project_id \
               ORDER BY n.depth, i.key",
-        )
+        )))
         .bind(id.to_string())
         .bind(i64::from(hops))
         .fetch_all(&self.pool)
@@ -511,6 +555,7 @@ impl ReadStore for CacheStore {
                 title: text(row, "title")?,
                 status: get::<Status>(row, "status")?,
                 depth: u8::try_from(get::<i64>(row, "depth")?).unwrap_or(u8::MAX),
+                latest_run_status: get::<Option<RunStatus>>(row, "latest_run_status")?,
             });
         }
 
@@ -839,7 +884,7 @@ impl ReadStore for CacheStore {
         }
         let workspace = scope.workspace.map(|id| id.to_string());
 
-        let rows = sqlx::query(
+        let rows = sqlx::query(AssertSqlSafe(format!(
             "WITH RECURSIVE up(item_id, depth) AS ( \
                      SELECT to_item_id, 1 FROM item_link \
                       WHERE from_item_id = ? AND kind IN ('blocked_by','origin') \
@@ -859,14 +904,15 @@ impl ReadStore for CacheStore {
                     (s.project_id IS NOT NULL) AS in_scope, \
                     CASE WHEN s.project_id IS NOT NULL THEN \
                          (SELECT body FROM document d WHERE d.item_id = i.id AND d.kind = 'summary' \
-                           ORDER BY d.version DESC LIMIT 1) END AS summary \
+                           ORDER BY d.version DESC LIMIT 1) END AS summary, \
+                    {LATEST_OF_I} AS latest_run_status \
                FROM best \
                JOIN item i    ON i.id = best.item_id \
                JOIN project p ON p.id = i.project_id \
                LEFT JOIN scope s ON s.project_id = i.project_id \
               WHERE best.item_id <> ? \
               ORDER BY best.depth, qualified_key, i.id",
-        )
+        )))
         .bind(id.to_string())
         .bind(i64::from(hops))
         .bind(workspace.clone())
@@ -887,6 +933,7 @@ impl ReadStore for CacheStore {
                 depth: u8::try_from(get::<i64>(row, "depth")?).unwrap_or(u8::MAX),
                 in_scope: bool_col(get::<i64>(row, "in_scope")?),
                 summary: opt_text(row, "summary")?,
+                latest_run_status: get::<Option<RunStatus>>(row, "latest_run_status")?,
             });
         }
         // The mirror's `ORDER BY` is byte order and Postgres's is collation order, so neither is
@@ -1268,17 +1315,19 @@ impl ReadStore for CacheStore {
     }
 
     async fn requirement_coverage(&self, requirement: RequirementId) -> Result<Vec<CoverageRow>> {
-        let rows = sqlx::query(
+        // `LATEST_OF_I`'s own `run r` shadows the requirement's `r` inside its subquery only.
+        let rows = sqlx::query(AssertSqlSafe(format!(
             "SELECT i.id, i.project_id, i.kind_id, i.key, i.key_prefix, i.key_number, i.title, \
                     i.status, i.priority, i.required_tags, i.updated_at, i.touched_paths, \
                     i.resolution, ir.kind, ir.requirement_version, \
-                    (r.version > ir.requirement_version) AS suspect \
+                    (r.version > ir.requirement_version) AS suspect, \
+                    {LATEST_OF_I} AS latest_run_status \
                FROM item_requirement ir \
                JOIN item i        ON i.id = ir.item_id \
                JOIN requirement r ON r.id = ir.requirement_id \
               WHERE ir.requirement_id = ? \
               ORDER BY i.key_prefix, i.key_number, i.id, ir.kind",
-        )
+        )))
         .bind(requirement.to_string())
         .fetch_all(&self.pool)
         .await
@@ -1340,7 +1389,7 @@ impl ReadStore for CacheStore {
         }
         let sql = format!(
             "SELECT {ITEM_SELECT} FROM item i WHERE i.project_id IN ({}) \
-               AND (i.status IN ('blocked', 'awaiting_approval') \
+               AND (i.status = 'blocked' \
                     OR EXISTS (SELECT 1 FROM run r \
                                 WHERE r.item_id = i.id AND r.status = 'awaiting_approval'))",
             placeholders(scope.project_ids.len()),
