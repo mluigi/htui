@@ -30,6 +30,7 @@ use crate::app::{Ctx, Handled};
 use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::store_worker::{ChatFrame, EDIT_HELP, StoreReply, StoreRequest};
 use crate::ui::kit::form::{Field, Form, Value};
+use crate::ui::kit::list;
 use crate::ui::kit::modal::modal_rest;
 use crate::ui::kit::pane::Pane;
 use crate::ui::kit::scroll::Scroll;
@@ -664,10 +665,11 @@ impl AgentHelp {
                 ..
             } => {
                 let title = format!("proposal from {agent} \u{b7} sent \u{2192} proposed");
-                // What the proposal warns of leads its lines, in the role it is read in (MOD-115
-                // M4 E5: a kit title has one style): a mask marker first (P9), then, MOD-55
-                // review L2, that the last of several blocks is proposed, which may be a
-                // trailing example rather than the body.
+                // What the proposal warns of leads the pane on a row of its own that never
+                // scrolls, in the role it is read in (MOD-115 M4 E5: a kit title has one style;
+                // L-skills repair 1: the title it was on never scrolled either): a mask marker
+                // first (P9), then, MOD-55 review L2, that the last of several blocks is
+                // proposed, which may be a trailing example rather than the body.
                 let mut flags = Vec::new();
                 if *masked {
                     flags.push("holds [REDACTED]".to_owned());
@@ -675,17 +677,12 @@ impl AgentHelp {
                 if *blocks > 1 {
                     flags.push(format!("last of {blocks} blocks"));
                 }
-                let mut lines = Vec::new();
-                if !flags.is_empty() {
+                let lead = (!flags.is_empty()).then(|| {
                     let style = if *masked { theme.error } else { theme.warning };
-                    lines.push(Line::styled(
-                        format!("the proposal {}", flags.join(" \u{b7} ")),
-                        style,
-                    ));
-                }
-                lines.extend(diff::lines(unified, theme));
+                    Line::styled(format!("the proposal {}", flags.join(" \u{b7} ")), style)
+                });
                 let pane = framed(view_chips(Pane::new(&title), view), focus, hints, ctx);
-                self.render_pane(frame, area, pane, lines, theme);
+                self.render_pane(frame, area, pane, lead, diff::lines(unified, theme), theme);
                 None
             }
             State::Answered { agent, text, same } => {
@@ -700,7 +697,7 @@ impl AgentHelp {
                     .collect();
                 let title = format!("{agent} replied \u{b7} {why}");
                 let pane = framed(view_chips(Pane::new(&title), view), focus, hints, ctx);
-                self.render_pane(frame, area, pane, lines, theme);
+                self.render_pane(frame, area, pane, None, lines, theme);
                 None
             }
             State::Asking
@@ -763,18 +760,33 @@ impl AgentHelp {
         pane.render(frame, area, theme);
     }
 
-    /// The Proposal/Answered pane: wrapped and scrolled with a scrollbar, its row count kept for
-    /// the clamp (the Templates view's `render_browse` rule).
+    /// The Proposal/Answered pane: `lead` on its first row, cut with `…` and never scrolled (what
+    /// a proposal warns of), then `lines` wrapped and scrolled under it with a scrollbar beside
+    /// them, their row count kept for the clamp (the Templates view's `render_browse` rule).
     fn render_pane(
         &self,
         frame: &mut Frame<'_>,
         area: Rect,
         pane: Pane<'_>,
+        lead: Option<Line<'static>>,
         lines: Vec<Line<'static>>,
         theme: &Theme,
     ) {
         let inner = Pane::inner(area);
-        let width = usize::from(inner.width).max(1);
+        let body = match lead {
+            Some(lead) if inner.height > 1 => {
+                let [top, body] =
+                    Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+                frame.render_widget(Paragraph::new(list::ellipsize(lead, top.width)), top);
+                body
+            }
+            Some(lead) => {
+                frame.render_widget(Paragraph::new(list::ellipsize(lead, inner.width)), inner);
+                Rect::new(inner.x, inner.bottom(), inner.width, 0)
+            }
+            None => inner,
+        };
+        let width = usize::from(body.width).max(1);
         let rows: usize = lines
             .iter()
             .map(|line| line.width().div_ceil(width).max(1))
@@ -784,9 +796,10 @@ impl AgentHelp {
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
                 .scroll((self.scroll.offset(), 0)),
-            inner,
+            body,
         );
         pane.scrollbar(rows, self.scroll.skip())
+            .scrollbar_span(body)
             .render(frame, area, theme);
     }
 }
@@ -1610,6 +1623,51 @@ mod tests {
             .expect("draws");
         let text = buffer_text(terminal.backend().buffer());
         assert!(!text.contains("blocks"), "{text}");
+    }
+
+    /// MOD-115 M4 L-skills repair 1 (P9, MOD-55 review L2): what a proposal warns of stays on
+    /// its pane's first row while the diff under it scrolls, so `accept` is never offered with
+    /// the warning scrolled away; the warning keeps its role (a mask in the error role).
+    #[test]
+    fn the_proposal_warning_stays_put_while_the_diff_scrolls() {
+        let bench = Bench::new();
+        let body: String = (0..30).map(|n| format!("line {n}\n")).collect();
+        let reply = format!("Run it:\n```sh\ncargo test\n```\n```\nkey: [REDACTED]\n{body}```\n");
+        let mut help = answered(&bench, "key: abc\n", &reply);
+        assert!(
+            matches!(
+                &help.state,
+                State::Proposal {
+                    masked: true,
+                    blocks: 2,
+                    ..
+                }
+            ),
+            "{help:?}"
+        );
+        help.scroll = Scroll::at(12);
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("a test terminal");
+        terminal
+            .draw(|frame| {
+                help.render(frame, frame.area(), &bench.ctx(), 0);
+            })
+            .expect("draws");
+        let buffer = terminal.backend().buffer();
+        let text = buffer_text(buffer);
+        let rows: Vec<&str> = text.lines().collect();
+        assert!(
+            rows[1].contains("the proposal holds [REDACTED] \u{b7} last of 2 blocks"),
+            "the warning leads the scrolled pane: {text}"
+        );
+        assert_eq!(Some(buffer[(1, 1)].fg), bench.theme.error.fg, "{text}");
+        assert!(
+            !rows[2].contains("the proposal"),
+            "the diff scrolled under it: {text}"
+        );
+        assert!(
+            !text.contains("key: abc"),
+            "the diff's top scrolled away: {text}"
+        );
     }
 
     /// The buffer's symbols, one line per row.
