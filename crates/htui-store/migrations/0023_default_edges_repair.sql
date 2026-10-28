@@ -12,10 +12,12 @@
 -- 'changes_requested' edges are deleted and 0020's backfill is applied again: a 'next' edge
 -- between each pair of phases adjacent in position order, and for each phase named 'review' a
 -- 'changes_requested' edge to the greatest earlier phase named 'implement', else to the phase just
--- before it in position order, with loop_limit = the target's retry_limit. seed::default_edges is
--- the same rule in Rust, pinned equal by a migration test. A graph that carries an authored edge
--- is left exactly as it is. revision is not bumped (0020 did not either): nothing holds a
--- replace_graph token across a migration.
+-- before it in position order, with loop_limit = the target's retry_limit. A palette phase is
+-- left out of both (a palette node has no edges, MOD-137's store rule): the chain runs past it and
+-- no loop starts or ends on it. seed::default_edges over the non-palette phases is the same rule
+-- in Rust (htui_core::store::default_edges_follow), pinned equal by a migration test. A graph that
+-- carries an authored edge is left exactly as it is. revision is not bumped (0020 did not
+-- either): nothing holds a replace_graph token across a migration.
 --
 -- Idempotent: a second application deletes and re-inserts the same (from, to, kind, loop_limit)
 -- rows. No table or column changes, step_graph_edge is not mirrored, so there is no cache
@@ -36,7 +38,8 @@ SELECT ordered.graph_id, ordered.id, ordered.next_id, 'next'
   FROM (SELECT p.graph_id, p.id,
                LEAD(p.id) OVER (PARTITION BY p.graph_id ORDER BY p.position) AS next_id
           FROM step_graph_phase p
-          JOIN mod138_repaired r ON r.graph_id = p.graph_id) ordered
+          JOIN mod138_repaired r ON r.graph_id = p.graph_id
+         WHERE NOT p.palette) ordered
  WHERE ordered.next_id IS NOT NULL;
 
 INSERT INTO step_graph_edge (graph_id, from_phase_id, to_phase_id, kind, loop_limit)
@@ -47,6 +50,8 @@ SELECT rv.graph_id, rv.id, t.id, 'changes_requested', t.retry_limit
                        FROM step_graph_phase c
                       WHERE c.graph_id = rv.graph_id
                         AND c.position < rv.position
+                        AND NOT c.palette
                       ORDER BY (c.name = 'implement') DESC, c.position DESC
                       LIMIT 1) t
- WHERE rv.name = 'review';
+ WHERE rv.name = 'review'
+   AND NOT rv.palette;

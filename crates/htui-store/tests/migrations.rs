@@ -2371,11 +2371,12 @@ async fn migration_0020_backfill_equals_default_edges() {
     db.drop_db().await;
 }
 
-/// MOD-138's eight probe graphs (blueprint §T3.2), raw-seeded at v22 under `project`; answers
+/// MOD-138's ten probe graphs (blueprint §T3.2), raw-seeded at v22 under `project`; answers
 /// the graph ids by name. `feature` is already default-edged; `appended` gained `docs` with no
 /// edge; `renamed` loops `review → plan` where the rule says `review → implement`; `gappy` has
 /// positions 0/5/9 and no edges; `authored` carries an odd `next`, an `if` and a `fails`; `asks`
-/// an `asks_you`; `solo` is one `review`; `empty` has no phases.
+/// an `asks_you`; `solo` is one `review`; `empty` has no phases; `palette` has a palette phase
+/// between `plan` and `review`, and `palette-review`'s `review` is a palette phase.
 async fn seed_0023_probe_graphs(
     pool: &sqlx::PgPool,
     project: uuid::Uuid,
@@ -2470,6 +2471,23 @@ async fn seed_0023_probe_graphs(
     insert_phase(pool, solo, 0, "review", 1, 1).await;
     graphs.insert("solo", solo);
 
+    // A palette node has no edges (MOD-137 rule e): the chain runs past `spare`, and `review`'s
+    // fallback loop skips it for `plan`. In `palette-review` the palette node is the review.
+    let palette = insert_graph(pool, project, "palette").await;
+    insert_phase(pool, palette, 0, "plan", 1, 2).await;
+    let spare = insert_phase(pool, palette, 1, "spare", 1, 1).await;
+    insert_phase(pool, palette, 2, "review", 1, 1).await;
+    graphs.insert("palette", palette);
+    let palette_review = insert_graph(pool, project, "palette-review").await;
+    insert_phase(pool, palette_review, 0, "implement", 1, 1).await;
+    let parked = insert_phase(pool, palette_review, 1, "review", 1, 1).await;
+    graphs.insert("palette-review", palette_review);
+    sqlx::query("UPDATE step_graph_phase SET palette = true WHERE id = ANY($1)")
+        .bind(vec![spare, parked])
+        .execute(pool)
+        .await
+        .expect("mark the palette phases");
+
     graphs.insert("empty", insert_graph(pool, project, "empty").await);
     graphs
 }
@@ -2491,8 +2509,9 @@ async fn edge_rows(
 
 /// MOD-138 plan D8 (blueprint §T3.2): `0023_default_edges_repair.sql` re-derives every graph
 /// without an `if`, `asks_you` or `fails` edge and leaves an authored graph exactly as it is,
-/// edge ids included; no revision moves. Staged at v22 with the eight probe graphs; the plain
-/// `run` then applies 0023. The expected rows are the blueprint's probe, verbatim.
+/// edge ids included; no revision moves. Staged at v22 with the ten probe graphs; the plain
+/// `run` then applies 0023. The expected rows are the blueprint's probe, verbatim, plus the two
+/// palette graphs (a palette node has no edges, MOD-137 rule e).
 #[tokio::test]
 async fn migration_0023_repairs_drifted_graphs_and_leaves_authored_ones() {
     let Some(db) = common::bare_db().await else {
@@ -2539,12 +2558,14 @@ async fn migration_0023_repairs_drifted_graphs_and_leaves_authored_ones() {
             edge("gappy", "implement", "docs", next, None),
             edge("gappy", "docs", "review", next, None),
             edge("gappy", "review", "implement", loops, Some(4)),
+            edge("palette", "plan", "review", next, None),
+            edge("palette", "review", "plan", loops, Some(2)),
             edge("renamed", "plan", "implement", next, None),
             edge("renamed", "implement", "review", next, None),
             edge("renamed", "review", "implement", loops, Some(2)),
         ],
-        "the probe's 18 rows: drifted graphs re-derived, authored ones untouched, solo and \
-         empty without edges"
+        "the probe's 20 rows: drifted graphs re-derived, authored ones untouched, no edge on a \
+         palette node, solo, palette-review and empty without edges"
     );
     assert_eq!(
         edge_rows(pool, graphs["authored"]).await,
@@ -2580,7 +2601,8 @@ async fn migration_0023_repairs_drifted_graphs_and_leaves_authored_ones() {
 /// MOD-138 plan D8 (blueprint §T3.2): the 0023 repair and [`htui_core::seed::default_edges`] are
 /// one rule in two places, pinned equal, the `migration_0020_backfill_equals_default_edges`
 /// shape. Per repaired probe graph, the stored `(from, to, kind, loop_limit)` set equals what
-/// `default_edges` derives from the same phase rows. Then the file runs a second time, raw in
+/// `default_edges` derives from the same phase rows, palette phases left out (as
+/// `default_edges_follow` leaves them out). Then the file runs a second time, raw in
 /// one transaction as sqlx runs it: the same rows (idempotent).
 #[tokio::test]
 async fn migration_0023_equals_default_edges() {
@@ -2599,10 +2621,20 @@ async fn migration_0023_equals_default_edges() {
     MIGRATOR.run(pool).await.expect("apply 0023");
 
     let mut total = 0;
-    for name in ["feature", "appended", "renamed", "gappy", "solo", "empty"] {
+    for name in [
+        "feature",
+        "appended",
+        "renamed",
+        "gappy",
+        "solo",
+        "empty",
+        "palette",
+        "palette-review",
+    ] {
         let graph = graphs[name];
         let rows: Vec<(uuid::Uuid, i32, String, i32)> = sqlx::query_as(
-            "SELECT id, position, name, retry_limit FROM step_graph_phase WHERE graph_id = $1",
+            "SELECT id, position, name, retry_limit FROM step_graph_phase \
+             WHERE graph_id = $1 AND NOT palette",
         )
         .bind(graph)
         .fetch_all(pool)
@@ -2654,7 +2686,10 @@ async fn migration_0023_equals_default_edges() {
         );
         total += derived.len();
     }
-    assert_eq!(total, 13, "4 feature + 3 appended + 3 renamed + 3 gappy");
+    assert_eq!(
+        total, 15,
+        "4 feature + 3 appended + 3 renamed + 3 gappy + 2 palette"
+    );
 
     let once = edge_names(pool).await;
     let mut tx = pool.begin().await.expect("begin the second application");
