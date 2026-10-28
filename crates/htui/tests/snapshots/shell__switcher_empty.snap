@@ -15,11 +15,11 @@ no workspace   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
-│                   ┌ Workspaces ──────────────────────────────────────────────┐                   │
-│                   │  no workspaces — `N` in Settings > Hierarchy creates one │                   │
-│                   │                                                          │                   │
-│                   │  j/k move · Enter switch · Esc close                     │                   │
-│                   └──────────────────────────────────────────────────────────┘                   │
+│                            ╭ Workspaces ────────────────────────────╮                            │
+│                            │             no workspaces              │                            │
+│                            │`N` in Settings › Hierarchy creates one │                            │
+│                            ╰ j/k move · Enter switch · Esc close ───╯                            │
+│                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
