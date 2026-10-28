@@ -2149,7 +2149,8 @@ async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<
 
 /// MOD-12 D3, D5, D6: the queue runner, once per sweep of the box's executing process (I-1 is
 /// `sweep_once`'s early return). Nothing without an open batch (D2). First the D3 prune: entries
-/// whose item is `done` or `closed` go, and a batch left with no entry and no live run of its own
+/// whose item is closed or finished (latest graph run `done`, MOD-144) go, and a batch left with
+/// no entry and no live run of its own
 /// closes `drained`. Then `ready_items` over the entries' projects (D5; the scope's
 /// `workspace_id` is a placeholder neither store reads, blueprint H-4), kept to the queued ones in
 /// queue order (D4, [`admission_order`]), and up to [`free_slots`] of them enqueued `auto` under
@@ -2223,9 +2224,10 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
             return;
         }
     };
-    // Review H1: a cancel sticks for the rest of its batch. The cancel moved the item back to
-    // `open` with its entry kept (D9: membership is the user's call), so without this the next
-    // sweep would admit it again; a pause and a resume open a new batch, which does.
+    // Review H1: a cancel sticks for the rest of its batch. A cancel ends the run with the entry
+    // kept (D9: membership is the user's call); the item reads as its last real run left it
+    // (MOD-144), so without this the next sweep would admit it again; a pause and a resume open a
+    // new batch, which does.
     let cancelled = match host.batch_cancelled_items(batch.id).await {
         Ok(cancelled) => cancelled,
         Err(err) => {

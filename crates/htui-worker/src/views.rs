@@ -329,17 +329,13 @@ fn verdicts(
     live: &LiveChats,
 ) -> ItemActions {
     let sentence = |err: EngineError| err.to_string();
+    let rows: Vec<Run> = runs.iter().map(|(run, _)| run.clone()).collect();
     let mut actions = ItemActions {
         item: item.id,
         key: item.key.clone(),
-        run: start_enabled(item).map_err(sentence),
+        run: start_enabled(item, &rows).map_err(sentence),
         unblock: Ok(()),
-        close_out: close_out_enabled(
-            item,
-            &runs.iter().map(|(run, _)| run.clone()).collect::<Vec<_>>(),
-        )
-        .map(|_| ())
-        .map_err(sentence),
+        close_out: close_out_enabled(item, &rows).map(|_| ()).map_err(sentence),
         runs: BTreeMap::new(),
         steps: BTreeMap::new(),
     };
@@ -465,18 +461,22 @@ fn selectable_slots(run: &Run, steps: &[RunStep]) -> BTreeSet<(i32, i32)> {
 /// whether, or how, an item is unblocked.
 ///
 /// Every active run must decode its snapshot; the first that does not refuses with its sentence,
-/// as [`verdicts`] always has. `runs` is in `ReadStore::runs` order (newest first), which
-/// `unblock_enabled` is sensitive to (blueprint H-1).
+/// as [`verdicts`] always has. `runs` is every run of the item in `ReadStore::runs` order (newest
+/// first), which `unblock_enabled` is sensitive to (blueprint H-1): a finished run goes in as not
+/// resumable, so the refusal names the state its latest graph run gives the item (MOD-144 PD9).
+/// The waiting list passes a candidate's live runs only and discards the refusal.
 fn unblock_case(item: &Item, runs: &[(Run, Vec<RunStep>)]) -> Result<UnblockCase, String> {
-    let mut active = Vec::new();
+    let mut all = Vec::with_capacity(runs.len());
     for (run, steps) in runs {
-        if !run.status.is_active() {
-            continue;
-        }
-        let snapshot = snapshot_of(run).map_err(|err| err.to_string())?;
-        active.push((run.clone(), resumable(&cursor(&snapshot, steps), steps)));
+        let resumable = if run.status.is_active() {
+            let snapshot = snapshot_of(run).map_err(|err| err.to_string())?;
+            resumable(&cursor(&snapshot, steps), steps)
+        } else {
+            false
+        };
+        all.push((run.clone(), resumable));
     }
-    unblock_enabled(item, &active).map_err(|err| err.to_string())
+    unblock_enabled(item, &all).map_err(|err| err.to_string())
 }
 
 /// Why a row of the waiting-on-you list waits on a person (MOD-69 plan D3). Declaration order is
@@ -1015,14 +1015,14 @@ mod tests {
     use chrono::{DateTime, Duration, Utc};
     use htui_core::fixtures::{demo_at, demo_data, ids};
     use htui_core::model::{
-        GateOutcome, GraphSnapshot, Item, ItemId, PermissionId, PermissionStatus, ProjectId,
-        RelaySessionId, Run, RunId, RunMode, RunStatus, RunStep, Scope, Status, StepId,
-        StepPermission, StepStatus, WaitingCandidate, WaitingPermission,
+        GateOutcome, GraphSnapshot, Item, ItemId, ItemState, PermissionId, PermissionStatus,
+        ProjectId, RelaySessionId, Run, RunId, RunMode, RunStatus, RunStep, Scope, Status, StepId,
+        StepPermission, StepStatus, WaitingCandidate, WaitingPermission, latest_graph_run,
     };
-    use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
+    use htui_core::store::{MemStore, ReadStore as _, StoreError, WriteStore as _, illegal_move};
     use htui_orch::conformance::Orchestrate as _;
     use htui_orch::fake::{FakeOrchestrator, ScriptedStep};
-    use htui_orch::{Clock as _, Command, CommandOutcome, GateAnswer, UnblockCase};
+    use htui_orch::{Clock as _, Command, CommandOutcome, EngineError, GateAnswer, UnblockCase};
 
     use serde_json::{Value, json};
     use uuid::Uuid;
@@ -1156,7 +1156,7 @@ mod tests {
             .after_done(ids::HTUI_FEAT_3, &prd, &phase, &key, &done)
             .await;
         assert!(
-            matches!(stranger, Err(htui_core::store::StoreError::Fenced { .. })),
+            matches!(stranger, Err(StoreError::Fenced { .. })),
             "{stranger:?}"
         );
         assert_eq!(count().await, before, "nothing written");
@@ -1280,7 +1280,20 @@ mod tests {
             ),
             "{followed:?}"
         );
-        assert_eq!(item().await, Status::AwaitingApproval);
+        assert_eq!(item().await, Status::Open, "`FollowRun` reopens the item");
+        let runs = orch
+            .store()
+            .runs(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore reads");
+        assert_eq!(
+            ItemState::of(
+                item().await,
+                latest_graph_run(&runs).map(|summary| summary.status)
+            ),
+            ItemState::NeedsYou,
+            "its parked run is the item's state"
+        );
         assert_eq!(
             unblock_verdict(orch.store(), ids::HTUI_FEAT_3).await,
             Ok(()),
@@ -1517,10 +1530,10 @@ mod tests {
         candidate(&item, vec![(run, steps)])
     }
 
-    /// A rejection a crash left parked: the item and run `awaiting_approval` over `failed` +
-    /// `rejected`.
+    /// A rejection a crash left parked: the item `open`, its run `awaiting_approval` over
+    /// `failed` + `rejected`.
     fn crashed_rejection() -> WaitingCandidate {
-        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::AwaitingApproval);
+        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::Open);
         let run = parked(1, &item, 1, 1);
         let steps = vec![rejected(step(1, &run, (0, 1, 0), StepStatus::Failed))];
         candidate(&item, vec![(run, steps)])
@@ -1545,7 +1558,7 @@ mod tests {
     /// A parked fan-out slot at `prd`: two `done` candidates and, when given, a `failed` judge
     /// with that outcome and note.
     fn slot(judge: Option<(Option<GateOutcome>, &str)>) -> WaitingCandidate {
-        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::AwaitingApproval);
+        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::Open);
         let run = parked(1, &item, 2, 1);
         let mut steps = vec![
             step(1, &run, (0, 1, 0), StepStatus::Done),
@@ -1561,10 +1574,10 @@ mod tests {
     }
 
     /// A run the engine's `park_interrupted` left (engine.rs `settle_failed`/`reset_interrupted`):
-    /// the item and run `awaiting_approval`, `prd` done at position 0, `plan` at position 1
-    /// `failed` with no gate outcome and the note `note`.
+    /// the item `open`, its run `awaiting_approval`, `prd` done at position 0, `plan` at
+    /// position 1 `failed` with no gate outcome and the note `note`.
     fn interrupted_park(note: Option<&str>) -> WaitingCandidate {
-        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::AwaitingApproval);
+        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::Open);
         let run = parked(1, &item, 1, 1);
         let mut plan = step(2, &run, (1, 1, 0), StepStatus::Failed);
         plan.gate_note = note.map(str::to_owned);
@@ -1589,7 +1602,7 @@ mod tests {
     /// A decided slot at `prd` (winner and loser) under a parked run, with `plan`'s gate parked
     /// after it when `gate`.
     fn resolved_selection(gate: bool) -> WaitingCandidate {
-        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::AwaitingApproval);
+        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::Open);
         let run = parked(1, &item, 2, 1);
         let mut winner = step(1, &run, (0, 1, 0), StepStatus::Done);
         winner.selected = Some(true);
@@ -1612,7 +1625,7 @@ mod tests {
 
     #[test]
     fn a_parked_gate_without_output_is_one_gate_row() {
-        let gate = over_a_gate(Status::AwaitingApproval);
+        let gate = over_a_gate(Status::Open);
         let step = step_of(&gate, 0);
 
         let view = one(&gate);
@@ -1932,7 +1945,7 @@ mod tests {
 
     #[test]
     fn a_gate_row_is_since_its_steps_last_change() {
-        let gate = stamped(over_a_gate(Status::AwaitingApproval));
+        let gate = stamped(over_a_gate(Status::Open));
 
         assert_eq!(
             sinces(&gate),
@@ -2038,7 +2051,7 @@ mod tests {
 
     #[test]
     fn a_permission_row_is_since_the_request_was_opened() {
-        let mut item = item("FEAT", 1, ids::PROJECT_HTUI, Status::InProgress);
+        let mut item = item("FEAT", 1, ids::PROJECT_HTUI, Status::Open);
         item.updated_at = demo_at(1, 0);
         let mut run = run(1, &item, RunStatus::Running, Some(snapshot(1)), 1);
         run.updated_at = demo_at(2, 5);
@@ -2057,16 +2070,14 @@ mod tests {
     /// `awaiting_approval` always owns at least one row, so the top bar never counts it working.
     #[test]
     fn every_parked_run_owns_a_row() {
-        let mut promoted = over_a_gate(Status::AwaitingApproval);
+        let mut promoted = over_a_gate(Status::Open);
         promoted.runs[0].1[0].promoted_at = Some(demo_at(2, 3));
         let fixtures = [
             escalation(),
             crashed_rejection(),
             reopen(),
-            over_a_gate(Status::AwaitingApproval),
             over_a_gate(Status::Blocked),
             over_a_gate(Status::Open),
-            over_a_gate(Status::InProgress),
             slot(None),
             slot(Some((Some(GateOutcome::Rejected), "judge: tie"))),
             slot(Some((None, "interrupted"))),
@@ -2104,7 +2115,7 @@ mod tests {
 
     #[test]
     fn a_promoted_step_without_a_note_reads_promoted_to_chat() {
-        let mut promoted = over_a_gate(Status::AwaitingApproval);
+        let mut promoted = over_a_gate(Status::Open);
         promoted.runs[0].1[0].promoted_at = Some(demo_at(2, 3));
 
         assert_eq!(one(&promoted).rows[0].text, super::PROMOTED_TEXT);
@@ -2115,7 +2126,7 @@ mod tests {
 
     #[test]
     fn permissions_are_rows_online_and_unknown_offline() {
-        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::InProgress);
+        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::Open);
         let run = run(1, &item, RunStatus::Running, Some(snapshot(1)), 1);
         let live = step(1, &run, (0, 1, 0), StepStatus::Running);
         let perms = [
@@ -2155,7 +2166,7 @@ mod tests {
     /// permission row; an unfanned step stays bare.
     #[test]
     fn a_permission_on_candidate_zero_of_a_fanned_slot_reads_its_index() {
-        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::InProgress);
+        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::Open);
         let run = run(1, &item, RunStatus::Running, Some(snapshot(2)), 1);
         let first = step(1, &run, (0, 1, 0), StepStatus::Running);
         let mut fanned = permission(&item, &run, &first, None, 0);
@@ -2175,7 +2186,7 @@ mod tests {
     fn counts_split_working_from_waiting_and_never_count_a_run_twice() {
         let reopen = reopen();
         let blocked = over_a_gate(Status::Blocked);
-        let busy = item("FIX", 1, ids::PROJECT_HTUI, Status::InProgress);
+        let busy = item("FIX", 1, ids::PROJECT_HTUI, Status::Open);
         let r2 = run(2, &busy, RunStatus::Running, Some(snapshot(1)), 2);
         let live = step(2, &r2, (0, 1, 0), StepStatus::Running);
         let perms = [permission(&busy, &r2, &live, Some("bash: ls"), 0)];
@@ -2196,13 +2207,13 @@ mod tests {
 
     #[test]
     fn rows_sort_by_project_key_run_step_then_reason() {
-        let agy = item("FEAT", 1, ids::PROJECT_AGY, Status::AwaitingApproval);
+        let agy = item("FEAT", 1, ids::PROJECT_AGY, Status::Open);
         let agy_run = parked(30, &agy, 1, 1);
         let agy_gate = step(30, &agy_run, (0, 1, 0), StepStatus::AwaitingApproval);
 
         let feat_10 = item("FEAT", 10, ids::PROJECT_HTUI, Status::Blocked);
 
-        let feat_2 = item("FEAT", 2, ids::PROJECT_HTUI, Status::AwaitingApproval);
+        let feat_2 = item("FEAT", 2, ids::PROJECT_HTUI, Status::Open);
         // The older run takes the higher id, so a sort by run id alone fails.
         let old = parked(21, &feat_2, 1, 1);
         let old_steps = vec![
@@ -2212,7 +2223,7 @@ mod tests {
         let new = parked(20, &feat_2, 1, 2);
         let new_gate = step(22, &new, (0, 1, 0), StepStatus::AwaitingApproval);
 
-        let ana = item("ANA", 1, ids::PROJECT_HTUI, Status::InProgress);
+        let ana = item("ANA", 1, ids::PROJECT_HTUI, Status::Open);
         let ana_run = run(10, &ana, RunStatus::Running, Some(snapshot(1)), 3);
         let ana_step = step(10, &ana_run, (0, 1, 0), StepStatus::Running);
 
@@ -2315,7 +2326,7 @@ mod tests {
         let fixtures = [
             escalation(),
             crashed_rejection(),
-            over_a_gate(Status::AwaitingApproval),
+            over_a_gate(Status::Open),
             slot(None),
             slot(Some((Some(GateOutcome::Rejected), "judge: tie"))),
             slot(Some((None, "interrupted"))),
@@ -2368,5 +2379,78 @@ mod tests {
             Ok(UnblockCase::Reopen)
         );
         assert!(unblock_case(&open.item, &open.runs).is_err());
+    }
+
+    /// MOD-144: `R` greys by `start_enabled` over the item's runs, `create_run`'s own law: an
+    /// `open` item over a live graph run (a `stopped` one included) is refused with the sentence
+    /// `create_run` answers, naming the item's derived state; one over a finished, failed or
+    /// cancelled run, or none, is admitted; `blocked` and `closed` are refused whatever the runs.
+    #[test]
+    fn start_is_refused_over_a_live_run_and_admitted_over_a_finished_one() {
+        let refusal = |state: ItemState| {
+            Err(EngineError::Store(StoreError::Constraint(illegal_move(
+                "item", state, "queued",
+            )))
+            .to_string())
+        };
+        let start = |item: &Item, statuses: &[RunStatus]| {
+            let runs: Vec<(Run, Vec<RunStep>)> = statuses
+                .iter()
+                .zip(1..)
+                .map(|(status, n)| {
+                    let hour = i64::try_from(n).expect("a few runs");
+                    (run(n, item, *status, Some(snapshot(1)), hour), Vec::new())
+                })
+                .collect();
+            verdicts(item, &runs, &[], &LiveChats::default()).run
+        };
+        let open = item("FEAT", 1, ids::PROJECT_HTUI, Status::Open);
+
+        for (live, state) in [
+            (RunStatus::Queued, ItemState::Queued),
+            (RunStatus::Running, ItemState::Running),
+            (RunStatus::AwaitingApproval, ItemState::NeedsYou),
+            (RunStatus::Stopped, ItemState::Stopped),
+        ] {
+            assert_eq!(start(&open, &[live]), refusal(state), "over a {live} run");
+            assert_eq!(
+                start(&open, &[RunStatus::Done, live]),
+                refusal(state),
+                "a finished run before a {live} one does not free the item"
+            );
+        }
+        for settled in [RunStatus::Done, RunStatus::Failed, RunStatus::Cancelled] {
+            assert_eq!(start(&open, &[settled]), Ok(()), "over a {settled} run");
+        }
+        assert_eq!(start(&open, &[]), Ok(()), "with no run");
+
+        let blocked = item("FEAT", 1, ids::PROJECT_HTUI, Status::Blocked);
+        assert_eq!(start(&blocked, &[]), refusal(ItemState::Blocked));
+        let closed = item("FEAT", 1, ids::PROJECT_HTUI, Status::Closed);
+        assert_eq!(
+            start(&closed, &[RunStatus::Done]),
+            refusal(ItemState::Closed)
+        );
+    }
+
+    /// MOD-144 PD9: `u`'s refusal names the state the item's latest graph run gives it, so
+    /// `unblock_case` reads every run, a finished one too, not the live ones alone.
+    #[test]
+    fn unblock_names_the_state_a_finished_run_leaves() {
+        let open = item("FEAT", 1, ids::PROJECT_HTUI, Status::Open);
+        for (settled, word) in [(RunStatus::Done, "done"), (RunStatus::Failed, "failed")] {
+            let candidate = candidate(
+                &open,
+                vec![(run(1, &open, settled, Some(snapshot(1)), 1), Vec::new())],
+            );
+            assert_eq!(
+                unblock_case(&candidate.item, &candidate.runs),
+                Err(format!("item {} is `{word}`; nothing is blocked", open.id))
+            );
+            assert_eq!(
+                verdict(&candidate).unblock,
+                unblock_case(&candidate.item, &candidate.runs).map(drop)
+            );
+        }
     }
 }
