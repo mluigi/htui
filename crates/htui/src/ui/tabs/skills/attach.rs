@@ -1138,6 +1138,16 @@ fn activation_label(keys: &Keys) -> String {
 /// `kit::form`, the focused one in the form's gutter and band (MOD-85: the activation is no
 /// longer marked by `selected`), then the help line — or, in its place, the sentence the store
 /// would refuse a qualifier with.
+///
+/// Lane deviation (L-skills repair 2) from blueprint §4.1, which asked for the activation as a
+/// `Value::Choice` with its key as `.help`, `effective:` as `Value::ReadOnly`, and the refusal and
+/// [`GLOB_HELP`] as the globs row's `.error` and `.help`. A kit `.help` shows only under the
+/// focused row, so the glob help and the any-repo rule would leave the screen whenever the globs
+/// row is not focused (content parity, the Definition of ported item 7), and `FORM_HEIGHT`'s
+/// seven inner rows hold no help and error both: they stay one always-shown last row. The
+/// activation stays an inline `Value::Lines` choice so the key that cycles it stays beside it
+/// whatever is focused, and `effective:` stays `Value::Lines` so a refused qualifier keeps the
+/// error role on it.
 fn render_form(
     frame: &mut Frame<'_>,
     area: Rect,
