@@ -37,7 +37,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use super::agent_help::{AgentHelp, HelpOutcome, Report, accepted};
 use super::attach::{AttachOutcome, AttachPane};
-use super::{hint_line, holder, joined, unavailable, view_chips};
+use super::{framed, hint_line, holder, joined, unavailable, view_chips};
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::{ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, edited};
 use crate::keys::translate::FieldEvent;
@@ -146,7 +146,9 @@ fn binding_changed_elsewhere(save: Option<&str>) -> String {
 const DETACH_CHANGED_ELSEWHERE: &str = "this attachment changed elsewhere \u{2014} nothing was \
                                         detached; its row shows it as it is now";
 
-/// The hint row in Browse (96 cells with the defaults: `j/k` carries no word, and `r reload` is
+/// Every Browse key, the shell's activity pane's hint ([`key_hint`](LibraryView::key_hint), M4
+/// C8); the list and the body show their own ([`LIST_HINT`], [`DETAIL_HINT`]). 96 cells with the
+/// defaults: `j/k` carries no word, and `r reload` is
 /// left out, so the row fits 100 columns with its ` \u{b7} ` separators; MOD-67 M4). `I import`
 /// took the room `h/l view` had: the view chips name both views (MOD-115 M4 E5).
 const BROWSE_HINT: HintSpec = &[
@@ -160,6 +162,26 @@ const BROWSE_HINT: HintSpec = &[
     Hint::One(Act::LibraryImport, "import"),
     Hint::One(Act::LibraryInfo, "info"),
     Hint::One(Act::LibraryAttach, "attach"),
+];
+
+/// The list pane's keys while browsing (MOD-115 M4 E5, Q2: a pane shows its own keys): what
+/// the list is about, the view its chips name, a new skill and the import, in its 28 cells.
+const LIST_HINT: HintSpec = &[
+    Hint::Two(Act::SkillsSwitchView, "view"),
+    Hint::One(Act::New, "new"),
+    Hint::One(Act::LibraryImport, "import"),
+];
+
+/// The body pane's keys while browsing (MOD-115 M4 E5): the shown skill's, the version and the
+/// diff first; [`BROWSE_HINT`] is all of them, on the shell's activity pane.
+const DETAIL_HINT: HintSpec = &[
+    Hint::Pair(Act::SkillsPrevVersion, Act::SkillsNextVersion, "version"),
+    Hint::One(Act::SkillsBase, "base"),
+    Hint::One(Act::SkillsDiff, "diff"),
+    Hint::One(Act::Edit, "edit"),
+    Hint::One(Act::LibraryInfo, "info"),
+    Hint::One(Act::LibraryAttach, "attach"),
+    Hint::One(Act::SkillsEditExternally, "$EDITOR"),
 ];
 
 /// The pane's keys while its lines overflow it, through `LIBRARY_BROWSE` whatever the mode:
@@ -828,20 +850,20 @@ impl LibraryView {
 
     /// The keys of the shown mode for the shell's hint row (MOD-67 M6 T2), through
     /// [`key_stack`](Self::key_stack): the attachments pane's while it is open, an open agent
-    /// help's, the editor's with the cursor's `L:C`, else the mode's.
+    /// help's, the editor's after the cursor's `L:C`, else the mode's.
     pub(super) fn key_hint(&self, keys: &Keys) -> String {
         match (&self.attach, &self.snapshot, &self.mode, self.handed_off()) {
             (Some(pane), Some(_), _, _) => pane.hint(keys),
             (_, _, Mode::Editing(editor), _) => match &editor.help {
                 Some(help) => help.hint(keys),
                 None => {
+                    // MOD-115 M4 E5: the cursor's `L:C` leads, so a pane narrower than the row
+                    // was (the Templates draft beside its placeholders) still shows it.
                     let (line, col) = editor.area.cursor_line_col();
-                    format!(
-                        "{} \u{b7} L{}:C{}",
+                    joined(&[
+                        format!("L{}:C{}", line + 1, col + 1),
                         keys.hint(self.key_stack(), EDIT_HINT),
-                        line + 1,
-                        col + 1
-                    )
+                    ])
                 }
             },
             (_, _, Mode::Browse, Some(_)) => keys.hint(self.key_stack(), HANDED_OFF_HINT),
@@ -1845,14 +1867,10 @@ impl LibraryView {
         let selected = (!rows.is_empty()).then_some(self.cursor);
         let offset = list::scroll_into_view(self.cursor, 0, usize::from(inner.height), rows.len());
         list::render(frame, inner, &rows, selected, offset, ctx.accent(), theme);
-        let mut pane = view_chips(KitPane::new(""), 0)
-            .focus(focus)
-            .accent(ctx.accent())
-            .scrollbar(rows.len(), offset);
-        if let Some(hints) = hint_line(self.key_hint(ctx.keys()), ctx) {
-            pane = pane.hints(hints);
-        }
-        pane.render(frame, area, theme);
+        let hints = hint_line(ctx.keys().hint(views::LIBRARY_BROWSE, LIST_HINT), ctx);
+        framed(view_chips(KitPane::new(""), 0), focus, hints, ctx)
+            .scrollbar(rows.len(), offset)
+            .render(frame, area, theme);
     }
 
     /// The right-hand pane: a prompt's form, an empty state, a refused read, or the shown body or
@@ -1896,13 +1914,15 @@ impl LibraryView {
             }
         }
         let keys = ctx.keys();
-        let hint = if !prompt && overflow {
-            joined(&[
-                keys.hint(views::LIBRARY_BROWSE, SCROLL_HINT),
-                self.key_hint(keys),
-            ])
-        } else {
+        let hint = if prompt {
             self.key_hint(keys)
+        } else {
+            let scroll = if overflow {
+                keys.hint(views::LIBRARY_BROWSE, SCROLL_HINT)
+            } else {
+                String::new()
+            };
+            joined(&[scroll, keys.hint(views::LIBRARY_BROWSE, DETAIL_HINT)])
         };
         if let Some(hints) = hint_line(hint, ctx) {
             pane = pane.hints(hints);

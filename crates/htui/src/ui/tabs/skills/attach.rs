@@ -53,6 +53,10 @@ use crossterm::event::KeyEvent;
 /// on the row and in one column.
 const LABEL_WIDTH: usize = 28;
 
+/// The form's label column, in cells: `activation` and `effective:`, the widest labels, so a
+/// value starts two cells after them, as before the kit (MOD-115 M4 E5).
+const FORM_LABEL: u16 = 10;
+
 /// The form panel's height, borders included: seven lines (the five inputs, `effective:`, and
 /// the help or refusal line).
 const FORM_HEIGHT: u16 = 9;
@@ -1171,7 +1175,8 @@ fn render_form(
         .field(Field::new("globs", Value::Text(&form.globs)))
         .field(Field::new("effective:", Value::Lines(vec![shown])))
         .focus(focus)
-        .editing(form.focus != FormField::Activation);
+        .editing(form.focus != FormField::Activation)
+        .label_width(FORM_LABEL);
     let inner = Pane::inner(area);
     let mut lines = rows.lines(inner.width, ctx.accent(), theme);
     let last = match repo_refusal(form, effective.as_deref().unwrap_or(&[]), snapshot, ctx) {

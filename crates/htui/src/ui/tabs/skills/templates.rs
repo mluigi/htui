@@ -97,7 +97,9 @@ const UNSAVED: &str = "unsaved changes \u{2014} Esc again discards";
 /// A save went out.
 const SAVING: &str = "saving\u{2026}";
 
-/// The hint row in Browse (plan D13; MOD-67 M4 D9), through [`views::TEMPLATES_BROWSE`]. `move`
+/// Every Browse key (plan D13; MOD-67 M4 D9), through [`views::TEMPLATES_BROWSE`]: the shell's
+/// activity pane's hint (M4 C8); the tree and the body show their own ([`LIST_HINT`],
+/// [`DETAIL_HINT`]). `move`
 /// after `j/k` is dropped: the row would be 104 cells with ` · ` separators (blueprint §1 item 1).
 /// The view switch shows its first two chords, `h/l view` (MOD-67 M4 R1 L2): 99 cells.
 const BROWSE_HINT: HintSpec = &[
@@ -111,6 +113,25 @@ const BROWSE_HINT: HintSpec = &[
     Hint::One(Act::New, "new"),
     Hint::One(Act::Reload, "reload"),
     Hint::Two(Act::SkillsSwitchView, "view"),
+];
+
+/// The tree pane's keys while browsing (MOD-115 M4 E5, Q2: a pane shows its own keys): the view
+/// its chips name, a new template and a reload, in its 28 cells.
+const LIST_HINT: HintSpec = &[
+    Hint::Two(Act::SkillsSwitchView, "view"),
+    Hint::One(Act::New, "new"),
+    Hint::One(Act::Reload, "reload"),
+];
+
+/// The body pane's keys while browsing (MOD-115 M4 E5): the shown template's; [`BROWSE_HINT`] is
+/// all of them, on the shell's activity pane.
+const DETAIL_HINT: HintSpec = &[
+    Hint::Pair(Act::SkillsPrevVersion, Act::SkillsNextVersion, "version"),
+    Hint::One(Act::SkillsBase, "base"),
+    Hint::One(Act::SkillsDiff, "diff"),
+    Hint::One(Act::TemplatesDiffDefault, "default"),
+    Hint::One(Act::Edit, "edit"),
+    Hint::One(Act::SkillsEditExternally, "$EDITOR"),
 ];
 
 /// The pane's keys while its lines overflow it, through [`views::TEMPLATES_BROWSE`]: they lead
@@ -616,19 +637,19 @@ impl TemplatesView {
 
     /// The keys of the shown mode for the shell's hint row (MOD-67 M6 T2), through
     /// [`key_stack`](Self::key_stack): an open agent help's, the editor's with the cursor's
-    /// `L:C`, else the mode's.
+    /// `L:C` first, else the mode's.
     pub(super) fn key_hint(&self, keys: &Keys) -> String {
         match (&self.mode, self.handed_off()) {
             (Mode::Editing(editor), _) => match &editor.help {
                 Some(help) => help.hint(keys),
                 None => {
+                    // MOD-115 M4 E5: the cursor's `L:C` leads, so a pane narrower than the row
+                    // was (the Templates draft beside its placeholders) still shows it.
                     let (line, col) = editor.area.cursor_line_col();
-                    format!(
-                        "{} \u{b7} L{}:C{}",
+                    joined(&[
+                        format!("L{}:C{}", line + 1, col + 1),
                         keys.hint(self.key_stack(), EDIT_HINT),
-                        line + 1,
-                        col + 1
-                    )
+                    ])
                 }
             },
             (Mode::Browse, Some(_)) => keys.hint(self.key_stack(), HANDED_OFF_HINT),
@@ -1282,7 +1303,7 @@ impl TemplatesView {
         let selected = (!rows.is_empty()).then_some(self.cursor);
         let offset = list::scroll_into_view(self.cursor, 0, usize::from(inner.height), rows.len());
         list::render(frame, inner, &rows, selected, offset, ctx.accent(), theme);
-        let hints = hint_line(self.key_hint(ctx.keys()), ctx);
+        let hints = hint_line(ctx.keys().hint(views::TEMPLATES_BROWSE, LIST_HINT), ctx);
         framed(view_chips(KitPane::new(""), 1), focus, hints, ctx)
             .scrollbar(rows.len(), offset)
             .render(frame, area, theme);
@@ -1331,13 +1352,15 @@ impl TemplatesView {
             }
         }
         let keys = ctx.keys();
-        let hint = if !prompt && overflow {
-            joined(&[
-                keys.hint(views::TEMPLATES_BROWSE, SCROLL_HINT),
-                self.key_hint(keys),
-            ])
-        } else {
+        let hint = if prompt {
             self.key_hint(keys)
+        } else {
+            let scroll = if overflow {
+                keys.hint(views::TEMPLATES_BROWSE, SCROLL_HINT)
+            } else {
+                String::new()
+            };
+            joined(&[scroll, keys.hint(views::TEMPLATES_BROWSE, DETAIL_HINT)])
         };
         framed(pane, focus, hint_line(hint, ctx), ctx).render(frame, area, theme);
     }
