@@ -474,6 +474,7 @@ database, the next time each searches or indexes. The API key stays in each box'
 | The URL is refused | `not setting the Qdrant URL: <why>` (the URL itself is never repeated) | 2 |
 | Another box changed the URL meanwhile | `the Qdrant URL changed while it was being set; nothing was written — run the command again`, or `the Qdrant URL changed while it was being cleared; nothing was removed — run the command again` | 2 |
 | The OS keyring could not be read for the DSN (URL flags) | `the OS keyring could not be read: <the keyring's error>` | 2 |
+| The OS keyring refused the key (key flags) | `the Qdrant API key could not be stored in the OS keyring: <the keyring's error>`, or `the Qdrant API key could not be removed from the OS keyring: <the keyring's error>` | 2 |
 | No DSN, `box.toml`, the schema | the same sentences as [Failure documents](#failure-documents) | 2 |
 | A blank key line | `no Qdrant API key on stdin; nothing was stored` | 2 |
 | Postgres did not answer | `cannot reach Postgres: ...` | 3 |
