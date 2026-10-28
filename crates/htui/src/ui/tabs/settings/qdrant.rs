@@ -27,7 +27,7 @@ use ratatui::widgets::Paragraph;
 use crate::app::{Ctx, Handled};
 use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::qdrant_settings_info::{
-    OldUrl, QdrantSnapshot, QdrantState, URL_WRITE_OFFLINE, UrlRowState,
+    NO_OLD_URL, OldUrl, QdrantSnapshot, QdrantState, URL_WRITE_OFFLINE, UrlRowState,
 };
 use crate::secrets_settings::{DEMO_SESSION, Redacted};
 use crate::store_worker::{StoreReply, StoreRequest};
@@ -85,6 +85,15 @@ const DISCARDED: &str = "the old Qdrant URL is gone from this box's keyring";
 const CONFIRM_CLEAR_URL: &str = "Remove the Qdrant URL for every box?";
 const CONFIRM_CLEAR_KEY: &str = "Remove this box's Qdrant API key from the keyring?";
 const CONFIRM_DISCARD: &str = "Discard the old Qdrant URL from this box's keyring?";
+/// The adopt's question when the old URL can no longer be named (MOD-158 R1, C-L1): never the
+/// discard's, since `confirm.yes` here sends the adopt.
+const CONFIRM_ADOPT_OLD: &str = "Use the old Qdrant URL for every box?";
+/// A miss on a URL write no editor was open for (the clear, the adopt; MOD-158 R1, C-L4):
+/// [`CHANGED_ELSEWHERE_CLOSED`] would send the user to an editor that never was.
+const URL_CHANGED_ELSEWHERE: &str =
+    "changed elsewhere; nothing was written \u{2014} the URL row shows the Qdrant URL now";
+/// What the URL row's refusal says when its read failed.
+const URL_NOT_READ: &str = "the Qdrant URL could not be read";
 
 /// What the open URL field says when no URL is set. `submit` is `field.submit`'s label through
 /// `CAPTURE` (MD-A, C5); with none bound the sentence says what to do without a key.
@@ -131,6 +140,12 @@ fn unreadable_refusal(what: &str, why: &str, reload: Option<&str>) -> String {
         Some(key) => format!("{what}: {why}; {key} reads it again"),
         None => format!("{what}: {why}"),
     }
+}
+
+/// The URL row's refusal when its read failed: its own words and the key that reads it again.
+fn url_not_read(why: &str, keys: &Keys) -> String {
+    let reload = keys.label(views::QDRANT_BROWSE, Act::Reload);
+    unreadable_refusal(URL_NOT_READ, why, reload.as_deref())
 }
 
 /// The URL row's words when its read failed (MOD-158 D9).
@@ -282,6 +297,17 @@ enum Question {
     Adopt,
 }
 
+impl Question {
+    /// The row the question is asked on, and stays on while a snapshot moves the rows (C-L2).
+    const fn row(self) -> Row {
+        match self {
+            Self::ClearUrl => Row::Url,
+            Self::ClearKey => Row::Key,
+            Self::Discard | Self::Adopt => Row::Offer,
+        }
+    }
+}
+
 #[derive(Default)]
 enum Mode {
     #[default]
@@ -375,13 +401,12 @@ impl QdrantSection {
     }
 
     /// The rows in order (MOD-158 D10): the old URL only while this box's keyring holds one.
-    fn rows(&self) -> Vec<Row> {
-        let mut rows = vec![Row::Url];
+    fn rows(&self) -> &'static [Row] {
         if self.old_url().is_some() {
-            rows.push(Row::Offer);
+            &[Row::Url, Row::Offer, Row::Key]
+        } else {
+            &[Row::Url, Row::Key]
         }
-        rows.push(Row::Key);
-        rows
     }
 
     fn row(&self) -> Row {
@@ -435,14 +460,7 @@ impl QdrantSection {
     fn url_refusal(&self, keys: &Keys) -> Option<String> {
         match self.url_row()? {
             UrlRowState::Offline => Some(URL_WRITE_OFFLINE.to_owned()),
-            UrlRowState::Unreadable(why) => {
-                let reload = keys.label(views::QDRANT_BROWSE, Act::Reload);
-                Some(unreadable_refusal(
-                    "the Qdrant URL could not be read",
-                    why,
-                    reload.as_deref(),
-                ))
-            }
+            UrlRowState::Unreadable(why) => Some(url_not_read(why, keys)),
             UrlRowState::NotApplicable => Some(DEMO_SESSION.to_owned()),
             UrlRowState::Set { .. } | UrlRowState::Unusable { .. } | UrlRowState::NotSet => None,
         }
@@ -485,12 +503,17 @@ impl QdrantSection {
         let edit = keys.label(views::QDRANT_BROWSE, Act::Edit);
         let reload = keys.label(views::QDRANT_BROWSE, Act::Reload);
         let question = match row {
+            // Every state its own arm (C-L6): a new one cannot fall through to an empty refusal.
             Row::Url => match self.url_row() {
                 Some(UrlRowState::Set { .. } | UrlRowState::Unusable { .. }) => {
                     Ok(Question::ClearUrl)
                 }
                 Some(UrlRowState::NotSet) => Err(nothing_to_clear(row, edit.as_deref())),
-                _ => Err(self.url_refusal(keys).unwrap_or_default()),
+                Some(UrlRowState::Offline) => Err(URL_WRITE_OFFLINE.to_owned()),
+                Some(UrlRowState::Unreadable(why)) => Err(url_not_read(why, keys)),
+                Some(UrlRowState::NotApplicable) => Err(DEMO_SESSION.to_owned()),
+                // Nothing read yet: `blocked` stops every key that gets here first.
+                None => return,
             },
             Row::Key => match self.key_state() {
                 Some(QdrantState::Stored) => Ok(Question::ClearKey),
@@ -514,21 +537,32 @@ impl QdrantSection {
 
     /// `u` on the old URL row (MOD-158 D10): the question, or why the old URL cannot be used.
     fn on_adopt(&mut self, keys: &Keys) {
-        if self.adoptable().is_some() {
-            self.notice = None;
-            self.mode = Mode::Confirm(Question::Adopt);
-            return;
-        }
         let clear = keys.label(views::QDRANT_BROWSE, Act::Clear);
         let discards = clear.map_or_else(String::new, |key| format!("; {key} discards it"));
+        // Every pair its own arm (C-L6): a new state cannot fall through to an empty refusal.
         let why = match (self.old_url(), self.url_row()) {
+            (Some(OldUrl::Usable(_)), Some(UrlRowState::NotSet)) => {
+                self.notice = None;
+                self.mode = Mode::Confirm(Question::Adopt);
+                return;
+            }
             (Some(OldUrl::Unusable(why)), _) => {
                 format!("the old Qdrant URL is not usable ({why}){discards}")
             }
-            (_, Some(UrlRowState::Set { .. } | UrlRowState::Unusable { .. })) => {
+            (None, _) => NO_OLD_URL.to_owned(),
+            (
+                Some(OldUrl::Usable(_)),
+                Some(UrlRowState::Set { .. } | UrlRowState::Unusable { .. }),
+            ) => {
                 format!("a Qdrant URL is already set for every box{discards}")
             }
-            _ => self.url_refusal(keys).unwrap_or_default(),
+            (Some(OldUrl::Usable(_)), Some(UrlRowState::Offline)) => URL_WRITE_OFFLINE.to_owned(),
+            (Some(OldUrl::Usable(_)), Some(UrlRowState::Unreadable(why))) => {
+                url_not_read(why, keys)
+            }
+            (Some(OldUrl::Usable(_)), Some(UrlRowState::NotApplicable)) => DEMO_SESSION.to_owned(),
+            // Nothing read yet: `blocked` stops every key that gets here first.
+            (Some(OldUrl::Usable(_)), None) => return,
         };
         self.refuse(why);
     }
@@ -631,9 +665,10 @@ impl QdrantSection {
                     Question::ClearUrl => {
                         match self.url_row().and_then(UrlRowState::token) {
                             Some(expected) => StoreRequest::ClearQdrantUrl { expected },
-                            // The row went while the question was up: nothing to clear.
+                            // The row went while the question was up: nothing to clear, and no
+                            // editor to reopen (C-L4).
                             None => {
-                                self.refuse(CHANGED_ELSEWHERE_CLOSED.to_owned());
+                                self.refuse(URL_CHANGED_ELSEWHERE.to_owned());
                                 return Handled::Consumed;
                             }
                         }
@@ -784,7 +819,7 @@ impl QdrantSection {
             Question::Discard => CONFIRM_DISCARD.to_owned(),
             Question::Adopt => match self.old_url() {
                 Some(OldUrl::Usable(url)) => confirm_adopt(url),
-                _ => CONFIRM_DISCARD.to_owned(),
+                Some(OldUrl::Unusable(_)) | None => CONFIRM_ADOPT_OLD.to_owned(),
             },
         };
         asked(&text, &answers(keys, views::QDRANT_CONFIRM))
@@ -818,7 +853,7 @@ impl QdrantSection {
         });
         if let Mode::Confirm(question) = self.mode {
             let asked = self.question_text(question, keys);
-            match self.row() {
+            match question.row() {
                 Row::Url => url = url.error(asked),
                 Row::Key => key = key.error(asked),
                 Row::Offer => offer = offer.map(|field| field.error(asked)),
@@ -909,11 +944,25 @@ impl QdrantSection {
         self.notice = Some(Notice::Error(text));
     }
 
-    /// Takes `snapshot` as what is there now: the cursor clamped to its rows, the outage over.
+    /// Takes `snapshot` as what is there now, the outage over. The cursor stays on the row it was
+    /// on, found again by what it is, since the old URL's row comes and goes above the key's
+    /// (C-L2); a question whose row is gone closes with it.
     fn take(&mut self, snapshot: &QdrantSnapshot) {
+        let focused = match self.mode {
+            Mode::Confirm(question) => question.row(),
+            _ => self.row(),
+        };
         self.unavailable = None;
         self.snapshot = Some(snapshot.clone());
-        self.cursor = self.cursor.min(self.rows().len() - 1);
+        match self.index_of(focused) {
+            Some(at) => self.cursor = at,
+            None => {
+                self.cursor = self.cursor.min(self.rows().len() - 1);
+                if matches!(self.mode, Mode::Confirm(_)) {
+                    self.mode = Mode::Browse;
+                }
+            }
+        }
     }
 
     /// A fresh snapshot, and the write that asked for it, if any, says what it did.
@@ -962,11 +1011,33 @@ impl QdrantSection {
 
     /// A compare-and-set miss (MOD-158 D9, blueprint R-3): the row moved under the write, which
     /// did not apply. The fresh snapshot carries the token the next write presents.
+    ///
+    /// Only the URL's set was typed into an editor, so only its miss says to reopen one; the clear
+    /// and the adopt say the row shows the URL now (C-L4).
     fn on_stale(&mut self, snapshot: &QdrantSnapshot) {
-        self.busy = None;
+        let write = self.busy.take();
         self.take(snapshot);
         self.mode = Mode::Browse;
-        self.say(CHANGED_ELSEWHERE_CLOSED);
+        self.say(match write {
+            Some("set_qdrant_url") => CHANGED_ELSEWHERE_CLOSED,
+            _ => URL_CHANGED_ELSEWHERE,
+        });
+    }
+
+    /// A refused request. A refused write may have landed part-way (the adopt's row set, its
+    /// keyring entry kept) or have landed with its follow-up read failing, so the section reads
+    /// itself again rather than keep a view nothing has confirmed (MOD-158 R1, C-M1); the
+    /// refusal's sentence stays. A refused read is the outage.
+    fn on_failed(&mut self, request: &str, message: &str, ctx: &Ctx<'_>) {
+        if self.busy == Some(request) {
+            self.busy = None;
+            self.refuse(message.to_owned());
+            self.read_out = true;
+            ctx.request(StoreRequest::QdrantInfo);
+        } else if request == "qdrant_info" {
+            self.read_out = false;
+            self.unavailable = Some(message.to_owned());
+        }
     }
 }
 
@@ -985,6 +1056,7 @@ fn doing(busy: &str) -> &'static str {
         "adopt_old_qdrant_url" => "using the old Qdrant URL for every box",
         "discard_old_qdrant_url" => "discarding the old Qdrant URL",
         "qdrant_info" => "reading the Qdrant settings",
+        "qdrant_old_url_check" => "looking for the old Qdrant URL",
         _ => "writing",
     }
 }
@@ -1038,19 +1110,12 @@ impl SettingsSection for QdrantSection {
         }
     }
 
-    fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
-        if let StoreReply::Qdrant(snapshot) = reply {
-            self.on_snapshot(snapshot);
-        } else if let StoreReply::QdrantStale(snapshot) = reply {
-            self.on_stale(snapshot);
-        } else if let StoreReply::Failed { request, message } = reply {
-            if self.busy == Some(*request) {
-                self.busy = None;
-                self.refuse(message.clone());
-            } else if *request == "qdrant_info" {
-                self.read_out = false;
-                self.unavailable = Some(message.clone());
-            }
+    fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
+        match reply {
+            StoreReply::Qdrant(snapshot) => self.on_snapshot(snapshot),
+            StoreReply::QdrantStale(snapshot) => self.on_stale(snapshot),
+            StoreReply::Failed { request, message } => self.on_failed(request, message, ctx),
+            _ => {}
         }
     }
 

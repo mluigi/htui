@@ -940,6 +940,10 @@ pub enum StoreRequest {
     AdoptOldQdrantUrl,
     /// MOD-158 D10: removes this box's old keyring URL, and nothing else.
     DiscardOldQdrantUrl,
+    /// MOD-158 R1 (C-M2): whether this box's keyring still holds the old Qdrant URL, read for the
+    /// launch's status-line notice and nothing else: no row, no key. Answered with
+    /// [`StoreReply::QdrantOldUrl`].
+    QdrantOldUrlCheck,
     // MOD-10 milestone 4: Settings > Secrets.
     /// The keyring rows of `Settings > Secrets` (D2). Answered with [`StoreReply::Secrets`].
     SecretsInfo,
@@ -1221,6 +1225,15 @@ pub enum StoreRequest {
 }
 
 impl StoreRequest {
+    /// Whether this is one of the `Settings > Qdrant` requests
+    /// ([`REQUEST_NAMES`](crate::qdrant_settings_info::REQUEST_NAMES)), the ones served by
+    /// `qdrant_settings_info` under a [`QdrantEnv`](htui_store::secret::QdrantEnv): the one list
+    /// every route reads (MOD-158 R1, C-L5), pinned to the variants by its test.
+    #[must_use]
+    pub fn is_qdrant(&self) -> bool {
+        crate::qdrant_settings_info::REQUEST_NAMES.contains(&self.name())
+    }
+
     /// Stable name of the request, used in [`StoreReply::Failed`] and in logs.
     #[must_use]
     pub const fn name(&self) -> &'static str {
@@ -1329,7 +1342,7 @@ impl StoreRequest {
             Self::SetDsn(_) => "set_dsn",
             Self::ClearDsn => "clear_dsn",
             Self::RebuildCache => "rebuild_cache",
-            // The seven of `qdrant_settings_info::REQUEST_NAMES`, in that order (MOD-158 D9).
+            // The eight of `qdrant_settings_info::REQUEST_NAMES`, in that order (MOD-158 D9, R1).
             Self::QdrantInfo => "qdrant_info",
             Self::SetQdrantUrl { .. } => "set_qdrant_url",
             Self::ClearQdrantUrl { .. } => "clear_qdrant_url",
@@ -1337,6 +1350,7 @@ impl StoreRequest {
             Self::ClearQdrantApiKey => "clear_qdrant_api_key",
             Self::AdoptOldQdrantUrl => "adopt_old_qdrant_url",
             Self::DiscardOldQdrantUrl => "discard_old_qdrant_url",
+            Self::QdrantOldUrlCheck => "qdrant_old_url_check",
             // The five of `secrets_settings::REQUEST_NAMES`, in that order, then the checks and
             // the scope write (MOD-10 M4).
             Self::SecretsInfo => "secrets_info",
@@ -1610,6 +1624,9 @@ pub enum StoreReply {
     /// A URL compare-and-set (or the adopt's insert) found the row changed: the snapshot now, so
     /// the section takes the new token from it (MOD-158 D9, blueprint R-3, R-4).
     QdrantStale(Box<crate::qdrant_settings_info::QdrantSnapshot>),
+    /// The answer to [`StoreRequest::QdrantOldUrlCheck`]: whether this box's keyring holds the
+    /// retired Qdrant URL (MOD-158 R1, C-M2).
+    QdrantOldUrl(bool),
     /// Answer to [`StoreRequest::SearchConcepts`] and [`StoreRequest::IndexConcepts`] (MOD-64 D232):
     /// the outcome carries its own error, so a Qdrant failure stays in the search overlay and never
     /// reaches the status line the way a [`StoreReply::Failed`] does.
@@ -2079,29 +2096,23 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> StoreReply {
     }
 }
 
-/// [`serve`], with the seven `Settings > Qdrant` requests answered under `env` instead of this
+/// [`serve`], with the `Settings > Qdrant` requests answered under `env` instead of this
 /// process's `HTUI_QDRANT_*` (blueprint P-13): the test harness's entry, so a test over a real
 /// backend reads no override it was not handed, in a sandbox that sets them or on the host.
+/// [`StoreRequest::is_qdrant`] picks them (MOD-158 R1, C-L5), so a new one cannot fall back to
+/// the process's environment here.
 #[cfg(any(test, feature = "testkit"))]
 pub async fn serve_with_qdrant_env(
     backend: &Backend,
     request: &StoreRequest,
     env: &htui_store::secret::QdrantEnv,
 ) -> StoreReply {
-    match request {
-        StoreRequest::QdrantInfo
-        | StoreRequest::SetQdrantUrl { .. }
-        | StoreRequest::ClearQdrantUrl { .. }
-        | StoreRequest::SetQdrantApiKey(_)
-        | StoreRequest::ClearQdrantApiKey
-        | StoreRequest::AdoptOldQdrantUrl
-        | StoreRequest::DiscardOldQdrantUrl => {
-            match crate::qdrant_settings_info::serve_with(backend, request, env).await {
-                Ok(reply) => reply,
-                Err(err) => failed(request.name(), &err),
-            }
-        }
-        _ => serve(backend, request).await,
+    if !request.is_qdrant() {
+        return serve(backend, request).await;
+    }
+    match crate::qdrant_settings_info::serve_with(backend, request, env).await {
+        Ok(reply) => reply,
+        Err(err) => failed(request.name(), &err),
     }
 }
 
@@ -2357,16 +2368,19 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         // spawned loop answers it from its own task before reaching here (review M-1); this arm
         // is `serve`'s, for the harness and `--demo`.
         StoreRequest::ListDir { path, show_hidden } => list_dir(path, *show_hidden).await?,
-        // The seven `Settings > Qdrant` requests, or-ed for the reason the arms above are (MOD-15
-        // M3 plan F-12). They need no loop state, so the loop, the harness and `--demo` all serve
-        // these here (CLEAN-8 #9), and a `Memory` backend reads and writes no keyring (MOD-158 D9).
+        // The `Settings > Qdrant` requests ([`StoreRequest::is_qdrant`]), or-ed for the reason the
+        // arms above are (MOD-15 M3 plan F-12); the match is exhaustive, so a new one must be
+        // routed somewhere. They need no loop state, so the loop, the harness and `--demo` all
+        // serve these here (CLEAN-8 #9), and a `Memory` backend reads and writes no keyring
+        // (MOD-158 D9).
         StoreRequest::QdrantInfo
         | StoreRequest::SetQdrantUrl { .. }
         | StoreRequest::ClearQdrantUrl { .. }
         | StoreRequest::SetQdrantApiKey(_)
         | StoreRequest::ClearQdrantApiKey
         | StoreRequest::AdoptOldQdrantUrl
-        | StoreRequest::DiscardOldQdrantUrl => {
+        | StoreRequest::DiscardOldQdrantUrl
+        | StoreRequest::QdrantOldUrlCheck => {
             crate::qdrant_settings_info::serve(backend, request).await?
         }
         // The five keyring requests of `Settings > Secrets`, or-ed for the reason the arms above

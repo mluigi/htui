@@ -444,12 +444,19 @@ impl App {
 
     /// Whether the tab a refused `request` was issued from draws it itself
     /// ([`Tab::absorbs_failure`]). The shell's and an overlay's refusals are always the line's.
+    ///
+    /// One shell request is not the line's either: the launch's old-URL check (MOD-158 R1, C-L7),
+    /// which the user never asked for. Its refusal is logged at `debug` instead.
     fn absorbed(&mut self, origin: &Origin, request: &str) -> bool {
         match origin {
             Origin::Tab(id) => self
                 .tabs
                 .by_id_mut(*id)
                 .is_some_and(|tab| tab.absorbs_failure(request)),
+            Origin::App if request == StoreRequest::QdrantOldUrlCheck.name() => {
+                tracing::debug!("the launch's old Qdrant URL check was refused; nothing is said");
+                true
+            }
             Origin::App | Origin::Overlay(_) => false,
         }
     }
@@ -603,8 +610,7 @@ impl App {
         // for `below_target_shown`'s reason; the offer itself is the section's row. It never
         // displaces a notice already on the line (the below-target warning, the ui-state load
         // notice: each said once): it waits, and `on_tick` says it once the line is clear.
-        if let StoreReply::Qdrant(snapshot) = reply
-            && snapshot.old_url.is_some()
+        if let StoreReply::QdrantOldUrl(true) = reply
             && !self.qdrant_offer_noted
         {
             self.qdrant_offer_noted = true;
@@ -614,9 +620,10 @@ impl App {
     }
 }
 
-/// The status line's old-URL sentence (MOD-158 D10).
-pub(crate) const QDRANT_OFFER_NOTICE: &str = "this box's keyring holds an old Qdrant URL; Settings > \
-                                              Qdrant offers to use it for every box or discard it";
+/// The status line's old-URL sentence (MOD-158 D10). It promises no action (R1, C-L3): the old URL
+/// can be used for every box only while no URL is set and it parses; otherwise only discarded.
+pub(crate) const QDRANT_OFFER_NOTICE: &str =
+    "this box's keyring holds an old Qdrant URL that is no longer read; see Settings > Qdrant";
 
 /// The status line's below-the-target sentence (MOD-40 plan D9).
 fn below_target_notice(target: &str) -> String {
@@ -1149,11 +1156,16 @@ mod tests {
         );
     }
 
-    /// The `QdrantInfo` request `start` sent, if any: its `seq`.
+    /// The old-URL check `start` sent, if any: its `seq`. Never the whole `QdrantInfo`
+    /// (MOD-158 R1, C-M2): the launch reads the retired keyring entry and nothing else.
     fn qdrant_info_seq(rx: &mut UnboundedReceiver<RequestEnvelope>) -> Option<u64> {
         let mut found = None;
         while let Ok(envelope) = rx.try_recv() {
-            if matches!(envelope.request, StoreRequest::QdrantInfo) {
+            assert!(
+                !matches!(envelope.request, StoreRequest::QdrantInfo),
+                "start never reads the whole Qdrant snapshot"
+            );
+            if matches!(envelope.request, StoreRequest::QdrantOldUrlCheck) {
                 assert_eq!(envelope.origin, Origin::App, "the shell's own read");
                 found = Some(envelope.seq);
             }
@@ -1161,20 +1173,47 @@ mod tests {
         found
     }
 
-    /// A Qdrant snapshot addressed to the shell, with or without an old keyring URL.
+    /// The old-URL check's answer addressed to the shell, with or without an old keyring URL.
     fn qdrant_reply(seq: u64, old_url: bool) -> ReplyEnvelope {
-        let mut snapshot = crate::qdrant_settings_info::QdrantSnapshot::not_applicable();
-        snapshot.url = crate::qdrant_settings_info::UrlRowState::NotSet;
-        if old_url {
-            snapshot.old_url = Some(crate::qdrant_settings_info::OldUrl::Usable(
-                htui_core::qdrant::QdrantUrl::parse("http://old.example:6334").expect("valid"),
-            ));
-        }
         ReplyEnvelope {
             seq,
             origin: Origin::App,
-            reply: StoreReply::Qdrant(snapshot),
+            reply: StoreReply::QdrantOldUrl(old_url),
         }
+    }
+
+    /// MOD-158 R1 (C-L7): the launch's check is one the user never asked for, so its refusal (a
+    /// keyring task that failed to join) is logged, never put on the status line.
+    #[test]
+    fn a_failed_launch_check_stays_off_the_status_line() {
+        let (mut app, mut rx, _seen) = shell();
+        app.qdrant_offer_check = true;
+        app.start();
+        let seq = qdrant_info_seq(&mut rx).expect("start asked");
+        app.update(Action::Reply(ReplyEnvelope {
+            seq,
+            origin: Origin::App,
+            reply: StoreReply::Failed {
+                request: "qdrant_old_url_check",
+                message: "keyring task failed: panicked".to_owned(),
+            },
+        }));
+        assert_eq!(app.status, None, "{:?}", app.status);
+    }
+
+    /// MOD-158 R1 (C-L3): the notice is true whether the old URL can be used for every box or
+    /// only discarded: it names the section, not an action it may not offer.
+    #[test]
+    fn the_offer_notice_promises_no_action() {
+        assert!(QDRANT_OFFER_NOTICE.contains("Settings > Qdrant"));
+        assert!(
+            !QDRANT_OFFER_NOTICE.contains("use it"),
+            "{QDRANT_OFFER_NOTICE}"
+        );
+        assert!(
+            !QDRANT_OFFER_NOTICE.contains("for every box"),
+            "{QDRANT_OFFER_NOTICE}"
+        );
     }
 
     /// MOD-158 D10, blueprint P-6: `start` asks for the Qdrant snapshot only once `register_all`

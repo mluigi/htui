@@ -125,9 +125,16 @@ impl QdrantSnapshot {
             return Ok(Self::not_applicable());
         }
         let url = url_row(backend).await?;
-        let key_state = match blocking_keyring(htui_store::secret::get_qdrant_api_key).await {
-            Ok(Some(_)) => QdrantState::Stored,
-            Ok(None) => QdrantState::NotStored,
+        // Only the key's presence leaves the blocking thread: the key itself is wiped there, so no
+        // unzeroized copy reaches this task (MOD-158 R1, C-M2).
+        let key_state = match blocking_keyring(|| {
+            htui_store::secret::get_qdrant_api_key()
+                .map(|key| key.map(zeroize::Zeroizing::new).is_some())
+        })
+        .await
+        {
+            Ok(true) => QdrantState::Stored,
+            Ok(false) => QdrantState::NotStored,
             Err(e) => QdrantState::Unreadable(e.to_string()),
         };
         let old_url = match blocking_keyring(htui_store::secret::get_qdrant_url).await {
@@ -171,8 +178,9 @@ async fn url_row(backend: &Backend) -> Result<UrlRowState> {
     })
 }
 
-/// The seven Settings > Qdrant request names, in [`StoreRequest`] order (MOD-158 D9, D10).
-pub const REQUEST_NAMES: [&str; 7] = [
+/// The Settings > Qdrant request names, in [`StoreRequest`] order (MOD-158 D9, D10), and the
+/// launch's old-URL check (R1, C-M2): every request [`StoreRequest::is_qdrant`] routes here.
+pub const REQUEST_NAMES: [&str; 8] = [
     "qdrant_info",
     "set_qdrant_url",
     "clear_qdrant_url",
@@ -180,7 +188,28 @@ pub const REQUEST_NAMES: [&str; 7] = [
     "clear_qdrant_api_key",
     "adopt_old_qdrant_url",
     "discard_old_qdrant_url",
+    "qdrant_old_url_check",
 ];
+
+/// This box's retired keyring `qdrant-url` entry as the adopt, the discard and the launch's check
+/// read and remove it (MOD-158 D10): the keyring's own calls in production ([`Self::KEYRING`]); a
+/// test's, to fail the removal after the adopt's row landed (R1, C-M1), which no keyring fake
+/// does alone.
+#[derive(Debug, Clone, Copy)]
+pub struct OldEntry {
+    /// Reads the entry.
+    pub read: fn() -> Result<Option<String>>,
+    /// Removes it.
+    pub remove: fn() -> Result<()>,
+}
+
+impl OldEntry {
+    /// This box's keyring.
+    pub const KEYRING: Self = Self {
+        read: htui_store::secret::get_qdrant_url,
+        remove: htui_store::secret::clear_qdrant_url,
+    };
+}
 
 /// What a URL write (and the adopt, which is one) answers on `Backend::Offline`.
 pub const URL_WRITE_OFFLINE: &str = "the Qdrant URL cannot be changed while Postgres is offline";
@@ -217,7 +246,7 @@ async fn cas<T>(backend: &Backend, env: &QdrantEnv, outcome: &CasOutcome<T>) -> 
     })
 }
 
-/// CLEAN-8 #9, MOD-158 D9: the seven Settings > Qdrant requests, for `try_serve` (the loop's
+/// CLEAN-8 #9, MOD-158 D9: the Settings > Qdrant requests, for `try_serve` (the loop's
 /// `other` arm and `--demo`), with this process's overrides. On [`Backend::Memory`] no
 /// environment is read (see [`serve_with`]). The test harness goes around this to
 /// [`serve_with`] with the overrides a test hands it (`store_worker::serve_with_qdrant_env`), so
@@ -236,7 +265,8 @@ pub(crate) async fn serve(backend: &Backend, request: &StoreRequest) -> Result<S
     serve_with(backend, request, &env).await
 }
 
-/// The seven requests over `backend` with the overrides `env` (a test's literal, blueprint P-13).
+/// The Qdrant requests over `backend` with the overrides `env` (a test's literal, blueprint P-13)
+/// and this box's keyring.
 ///
 /// On [`Backend::Memory`] the read is [`QdrantSnapshot::not_applicable`] and every write is
 /// refused with [`DEMO_SESSION`] before a keyring or a store is reached. On [`Backend::Offline`]
@@ -247,21 +277,32 @@ pub(crate) async fn serve(backend: &Backend, request: &StoreRequest) -> Result<S
 ///
 /// A keyring call's or the row's [`StoreError`], which the caller renders under the request's
 /// name ([`StoreError::Unreachable`] drops the loop offline); a failed join; and
-/// [`StoreError::Backend`] for a request that is not one of the seven.
+/// [`StoreError::Backend`] for a request that is not one of them.
 pub async fn serve_with(
     backend: &Backend,
     request: &StoreRequest,
     env: &QdrantEnv,
 ) -> Result<StoreReply> {
+    serve_with_entry(backend, request, env, OldEntry::KEYRING).await
+}
+
+/// [`serve_with`], the old keyring entry read and removed through `old` (R1, C-M1's seam).
+///
+/// # Errors
+///
+/// As [`serve_with`].
+pub async fn serve_with_entry(
+    backend: &Backend,
+    request: &StoreRequest,
+    env: &QdrantEnv,
+    old: OldEntry,
+) -> Result<StoreReply> {
     if matches!(backend, Backend::Memory(_)) {
+        // Every write refused by [`StoreRequest::is_qdrant`], so a new one cannot slip by (C-L5).
         return Ok(match request {
             StoreRequest::QdrantInfo => StoreReply::Qdrant(QdrantSnapshot::not_applicable()),
-            StoreRequest::SetQdrantUrl { .. }
-            | StoreRequest::ClearQdrantUrl { .. }
-            | StoreRequest::SetQdrantApiKey(_)
-            | StoreRequest::ClearQdrantApiKey
-            | StoreRequest::AdoptOldQdrantUrl
-            | StoreRequest::DiscardOldQdrantUrl => failed(request, DEMO_SESSION),
+            StoreRequest::QdrantOldUrlCheck => StoreReply::QdrantOldUrl(false),
+            other if other.is_qdrant() => failed(request, DEMO_SESSION),
             other => return Err(not_ours(other)),
         });
     }
@@ -304,7 +345,7 @@ pub async fn serve_with(
                 return Ok(failed(request, URL_WRITE_OFFLINE));
             };
             // The worker re-reads the entry rather than trusting a snapshot's copy of it.
-            let Some(text) = blocking_keyring(htui_store::secret::get_qdrant_url).await? else {
+            let Some(text) = blocking_keyring(old.read).await? else {
                 return Ok(failed(request, NO_OLD_URL));
             };
             let url = match QdrantUrl::parse(&text) {
@@ -318,7 +359,9 @@ pub async fn serve_with(
                     StoreReply::QdrantStale(Box::new(QdrantSnapshot::fetch(backend, env).await?))
                 }
                 CasOutcome::Applied(_) => {
-                    if let Err(err) = blocking_keyring(htui_store::secret::clear_qdrant_url).await {
+                    // The row landed: a removal that fails is said by name, and the section reads
+                    // itself again on any failed write (R1, C-M1), so it shows the row now.
+                    if let Err(err) = blocking_keyring(old.remove).await {
                         return Ok(failed(request, old_entry_kept(&err)));
                     }
                     StoreReply::Qdrant(QdrantSnapshot::fetch(backend, env).await?)
@@ -326,8 +369,25 @@ pub async fn serve_with(
             }
         }
         StoreRequest::DiscardOldQdrantUrl => {
-            blocking_keyring(htui_store::secret::clear_qdrant_url).await?;
+            blocking_keyring(old.remove).await?;
             StoreReply::Qdrant(QdrantSnapshot::fetch(backend, env).await?)
+        }
+        // R1 (C-M2): the entry's presence alone, read off the loop; the URL itself is dropped on
+        // the blocking thread. A keyring that cannot be read holds nothing to offer here.
+        StoreRequest::QdrantOldUrlCheck => {
+            let read = old.read;
+            StoreReply::QdrantOldUrl(
+                match blocking_keyring(move || read().map(|url| url.is_some())).await {
+                    Ok(present) => present,
+                    Err(err) => {
+                        tracing::debug!(
+                            %err,
+                            "the old Qdrant URL could not be read for the launch's check"
+                        );
+                        false
+                    }
+                },
+            )
         }
         other => return Err(not_ours(other)),
     })
@@ -356,7 +416,7 @@ mod tests {
         assert_eq!(blocking_keyring(|| Ok(7)).await.expect("joins"), 7);
     }
 
-    /// The seven names are the `name()` arms, in [`StoreRequest`] order (`connection.rs`'s rule).
+    /// The names are the `name()` arms, in [`StoreRequest`] order (`connection.rs`'s rule).
     #[test]
     fn request_names_match_the_name_arms() {
         let url = QdrantUrl::parse("http://q.example:6334").expect("a valid URL");
@@ -372,7 +432,10 @@ mod tests {
             StoreRequest::ClearQdrantApiKey,
             StoreRequest::AdoptOldQdrantUrl,
             StoreRequest::DiscardOldQdrantUrl,
+            StoreRequest::QdrantOldUrlCheck,
         ];
+        assert!(requests.iter().all(StoreRequest::is_qdrant));
+        assert!(!StoreRequest::SecretsInfo.is_qdrant());
         let names: Vec<&str> = requests.iter().map(StoreRequest::name).collect();
         assert_eq!(names, REQUEST_NAMES);
     }

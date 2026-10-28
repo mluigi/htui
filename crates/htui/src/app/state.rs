@@ -873,8 +873,9 @@ impl App {
         self.dispatch(Origin::App, StoreRequest::ConnectionInfo);
         // MOD-158 D10: whether this box's keyring still holds the old Qdrant URL, said once on the
         // status line (`on_app_reply`). Asked only once `register_all` has run (blueprint P-6).
+        // The narrow check, not `QdrantInfo` (R1, C-M2): the retired entry alone, no row, no key.
         if self.qdrant_offer_check {
-            self.dispatch(Origin::App, StoreRequest::QdrantInfo);
+            self.dispatch(Origin::App, StoreRequest::QdrantOldUrlCheck);
         }
     }
 

@@ -14,13 +14,14 @@
 use chrono::{DateTime, Utc};
 use htui::app::{Action, Handled};
 use htui::qdrant_settings_info::{
-    OldUrl, QdrantSnapshot, QdrantState, URL_WRITE_OFFLINE, UrlRowState,
+    OldUrl, QdrantSnapshot, QdrantState, URL_WRITE_OFFLINE, UrlRowState, old_entry_kept,
 };
 use htui::store_worker::{StoreReply, StoreRequest};
 use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
 use htui::ui::tabs::settings::{QdrantSection, SettingsSection, SettingsTab};
 use htui_core::qdrant::{QdrantUrl, QdrantUrlError};
+use htui_core::store::StoreError;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
@@ -728,6 +729,223 @@ async fn an_unusable_old_url_can_only_be_discarded() {
         frame.contains("a Qdrant URL is already set for every box; c discards it"),
         "{frame}"
     );
+}
+
+/// The old URL offered over no row, the key stored.
+fn offered_with_key() -> QdrantSnapshot {
+    QdrantSnapshot {
+        key_state: QdrantState::Stored,
+        ..offer(OldUrl::Usable(url(OLD)))
+    }
+}
+
+/// The y of the first drawn line holding `text`.
+fn line_of(buffer: &Buffer, text: &str) -> u16 {
+    (0..buffer.area.height)
+        .find(|y| row(buffer, *y).contains(text))
+        .unwrap_or_else(|| panic!("{text:?} is drawn"))
+}
+
+/// MOD-158 R1 (C-M1, C-L8): a write that fails part-way (the adopt's row landed, the old keyring
+/// entry stayed) leaves no stale view: the section reads itself again, keeps the failure's
+/// sentence, and then draws what is there now, so a second `u` is told the row is set.
+#[tokio::test]
+async fn a_failed_write_reads_the_section_again() {
+    let (bench, mut section) = bench_with(offer(OldUrl::Usable(url(OLD)))).await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "u");
+    bench.key(&mut section, "y");
+    assert!(
+        matches!(
+            requests_of(&bench).as_slice(),
+            [StoreRequest::AdoptOldQdrantUrl]
+        ),
+        "the adopt"
+    );
+    let kept = old_entry_kept(&StoreError::Backend("the collection is locked".to_owned()));
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "adopt_old_qdrant_url",
+            message: kept.clone(),
+        },
+    );
+    assert!(
+        matches!(requests_of(&bench).as_slice(), [StoreRequest::QdrantInfo]),
+        "a failed write reads the section again"
+    );
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(frame.contains(&flattened(&kept)), "{frame}");
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Qdrant(QdrantSnapshot {
+            old_url: Some(OldUrl::Usable(url(OLD))),
+            ..snapshot(
+                UrlRowState::Set {
+                    url: url(OLD),
+                    token: token(),
+                },
+                QdrantState::NotStored,
+            )
+        }),
+    );
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(
+        frame.contains(&format!("{OLD} \u{b7} for every box")),
+        "the row as it is now: {frame}"
+    );
+    assert!(frame.contains("from before, no longer used"), "{frame}");
+    assert!(
+        frame.contains(&flattened(&kept)),
+        "the failure's sentence stays: {frame}"
+    );
+    assert!(!section.captures_input(), "nothing opened by the re-read");
+
+    bench.key(&mut section, "u");
+    assert!(requests_of(&bench).is_empty(), "nothing is adopted twice");
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(
+        frame.contains("a Qdrant URL is already set for every box"),
+        "{frame}"
+    );
+    assert!(!frame.contains("changed elsewhere"), "{frame}");
+}
+
+/// MOD-158 R1 (C-L4, C-L8): a stale reply to the adopt says the URL changed elsewhere in words
+/// that name no editor (none was open), and draws the row now.
+#[tokio::test]
+async fn a_stale_adopt_says_so_without_an_editor() {
+    let (bench, mut section) = bench_with(offer(OldUrl::Usable(url(OLD)))).await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "u");
+    bench.key(&mut section, "y");
+    let _ = requests_of(&bench);
+    bench.reply(
+        &mut section,
+        &StoreReply::QdrantStale(Box::new(QdrantSnapshot {
+            old_url: Some(OldUrl::Usable(url(OLD))),
+            ..snapshot(
+                UrlRowState::Set {
+                    url: url(OTHER),
+                    token: later(),
+                },
+                QdrantState::NotStored,
+            )
+        })),
+    );
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(
+        frame.contains(&format!("{OTHER} \u{b7} for every box")),
+        "{frame}"
+    );
+    assert!(
+        frame.contains(
+            "changed elsewhere; nothing was written \u{2014} the URL row shows the Qdrant URL now"
+        ),
+        "{frame}"
+    );
+    assert!(!frame.contains("reopen the editor"), "{frame}");
+    assert!(requests_of(&bench).is_empty(), "a stale reply is the read");
+}
+
+/// MOD-158 R1 (C-L1): the adopt's question, asked while the old URL could be used, never turns
+/// into the discard's when a snapshot says it no longer can: it asks about the old URL generically.
+#[tokio::test]
+async fn the_adopt_question_never_reads_as_the_discard() {
+    let (bench, mut section) = bench_with(offer(OldUrl::Usable(url(OLD)))).await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "u");
+    bench.reply(
+        &mut section,
+        &StoreReply::Qdrant(offer(OldUrl::Unusable(QdrantUrlError::Credentials))),
+    );
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(
+        frame.contains("Use the old Qdrant URL for every box? y / n"),
+        "{frame}"
+    );
+    assert!(!frame.contains("Discard the old Qdrant URL"), "{frame}");
+}
+
+/// MOD-158 R1 (C-L2): a question stays on the row it was asked on when a snapshot adds the old
+/// URL's row above it, and the cursor follows that row; a question whose row is gone closes.
+#[tokio::test]
+async fn a_question_stays_on_its_row_when_the_rows_move() {
+    let (bench, mut section) = bench_with(stored()).await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "c");
+    bench.reply(
+        &mut section,
+        &StoreReply::Qdrant(QdrantSnapshot {
+            old_url: Some(OldUrl::Usable(url(OLD))),
+            ..stored()
+        }),
+    );
+    let buffer = drawn(&bench, &section);
+    let (offer_at, key_at, asked_at) = (
+        line_of(&buffer, "old URL"),
+        line_of(&buffer, "API key"),
+        line_of(&buffer, "Remove this box's Qdrant API key"),
+    );
+    assert!(
+        offer_at < key_at && key_at < asked_at,
+        "the question under the key row: {offer_at} {key_at} {asked_at}"
+    );
+    bench.key(&mut section, "y");
+    assert!(
+        matches!(
+            requests_of(&bench).as_slice(),
+            [StoreRequest::ClearQdrantApiKey]
+        ),
+        "the key's clear"
+    );
+    let hint = bench.key_hint(&section);
+    assert!(
+        hint.starts_with("e edit \u{b7} c clear \u{b7} r reload \u{b7} j/k rows"),
+        "the cursor followed the key row, not the old URL's: {hint}"
+    );
+
+    // The old URL's row goes while its question is up: the question goes with it.
+    let (bench, mut section) = bench_with(offered_with_key()).await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "c");
+    assert!(section.captures_input(), "the discard's question");
+    bench.reply(&mut section, &StoreReply::Qdrant(stored()));
+    assert!(
+        !section.captures_input(),
+        "its row is gone, so is the question"
+    );
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(!frame.contains("Discard the old"), "{frame}");
+    assert!(requests_of(&bench).is_empty());
+}
+
+/// MOD-158 R1 (C-L8): at 80 columns, the old URL's row wraps under its label, and each override
+/// is drawn under its row while that row is focused: the URL's first, then the key's.
+#[tokio::test]
+async fn the_offer_and_overrides_at_80_columns() {
+    let (bench, mut section) = bench_with(QdrantSnapshot {
+        url_override: Some(Ok(url(OTHER))),
+        key_override: true,
+        ..offered_with_key()
+    })
+    .await;
+    let frame = bench.render_section(&section, 80);
+    let flat = flattened(&frame);
+    assert!(
+        flat.contains(&format!("this box's keyring holds {OLD} from before")),
+        "{flat}"
+    );
+    assert!(flat.contains(&format!("HTUI_QDRANT_URL={OTHER}")), "{flat}");
+    insta::assert_snapshot!("offer_url_override_80", frame);
+
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "j");
+    let frame = bench.render_section(&section, 80);
+    let flat = flattened(&frame);
+    assert!(flat.contains("HTUI_QDRANT_API_KEY is in force"), "{flat}");
+    insta::assert_snapshot!("offer_key_override_80", frame);
 }
 
 /// MOD-81: the section at 80 columns, through the shell (`--demo`: no keyring is read).
