@@ -6974,6 +6974,91 @@ async fn resolve_graph_carries_the_bound_persona_as_mem_store_does() {
     db.drop_db().await;
 }
 
+/// MOD-138 D10, F7: PgStore's `resolve_graph` carries the graph's edges in `graph_edges` order,
+/// the same rows `MemStore::demo()` answers, and each phase's `phase_part` rows, all read in one
+/// `REPEATABLE READ` transaction.
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_graph_carries_edges_and_parts_as_mem_store_does() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let mem = htui_core::store::MemStore::demo();
+
+    let resolved = db
+        .store
+        .resolve_graph(ids::HTUI_FEAT_3)
+        .await
+        .expect("resolve_graph must not fail")
+        .expect("FEAT-3's kind has a default graph");
+    let reference = mem
+        .resolve_graph(ids::HTUI_FEAT_3)
+        .await
+        .expect("MemStore::resolve_graph")
+        .expect("FEAT-3's kind has a default graph");
+    let body = db
+        .store
+        .graph_body(resolved.graph.id)
+        .await
+        .expect("graph_body must not fail")
+        .expect("the graph exists");
+    assert!(!resolved.edges.is_empty(), "the seeded graph has edges");
+    assert_eq!(
+        resolved.edges, body.edges,
+        "the edges as `graph_edges` reads them"
+    );
+    assert_eq!(
+        resolved.edges, reference.edges,
+        "PgStore and MemStore carry the same edges"
+    );
+    assert!(
+        resolved.phases.iter().all(|row| row.parts.is_empty()),
+        "no seeded phase divides"
+    );
+
+    // A part planted on one phase is carried on that phase alone.
+    let phase = resolved.phases[1].phase.id;
+    sqlx::query(
+        "INSERT INTO phase_part (phase_id, position, key, title, owned_paths) \
+         VALUES ($1, 0, 'api', 'The API', '{src/api}')",
+    )
+    .bind(phase.as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("plant a phase_part");
+    let resolved = db
+        .store
+        .resolve_graph(ids::HTUI_FEAT_3)
+        .await
+        .expect("resolve_graph must not fail")
+        .expect("FEAT-3's kind has a default graph");
+    assert_eq!(
+        resolved.phases[1].parts,
+        vec![htui_core::model::PhasePart {
+            phase_id: phase,
+            position: 0,
+            key: "api".to_owned(),
+            title: "The API".to_owned(),
+            brief: String::new(),
+            owned_paths: vec!["src/api".to_owned()],
+            acceptance: None,
+            agent_id: None,
+            model: None,
+            persona_id: None,
+        }],
+        "the planted part"
+    );
+    assert!(
+        resolved
+            .phases
+            .iter()
+            .enumerate()
+            .all(|(at, row)| at == 1 || row.parts.is_empty()),
+        "every other phase carries none"
+    );
+
+    db.drop_db().await;
+}
+
 /// MOD-26 plan D1, D5: `fk_step_graph_phase_persona` is `ON DELETE RESTRICT`, so a persona a
 /// phase is bound to cannot vanish under the graph (milestone 1 has no delete; this is the raw
 /// statement M2's delete will meet).

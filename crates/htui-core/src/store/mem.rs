@@ -7360,7 +7360,8 @@ impl State {
         self.add_note(note)
     }
 
-    /// `step_graph_id` of the item, else its kind's default (ANA-2 §8's `resolve_graph`).
+    /// `step_graph_id` of the item, else its kind's default (ANA-2 §8's `resolve_graph`), with
+    /// its phases, candidates, parts and edges read under one lock (MOD-138 D10).
     fn resolve_graph(&self, item: ItemId) -> Option<ResolvedGraph> {
         let row = self.items.get(&item)?;
         let graph_id = row.step_graph_id.or_else(|| {
@@ -7386,8 +7387,11 @@ impl State {
                     persona: phase
                         .persona_id
                         .and_then(|id| self.personas.get(&id).cloned()),
+                    // MOD-138 D10: the node's default parts, under the same lock.
+                    parts: self.phase_parts_of(phase.id),
                 })
                 .collect(),
+            edges: self.graph_edge_rows(graph_id),
         })
     }
 
@@ -15791,6 +15795,62 @@ mod tests {
         );
         assert!(
             resolved.phases[1..].iter().all(|row| row.persona.is_none()),
+            "every other phase carries none"
+        );
+    }
+
+    /// MOD-138 D10: `resolve_graph` carries the graph's edges in `graph_edges` order and each
+    /// phase's `phase_part` rows, read under the same lock as the phases.
+    #[tokio::test]
+    async fn resolve_graph_carries_edges_and_parts() {
+        let store = MemStore::demo();
+        let resolved = store
+            .resolve_graph(ids::HTUI_FEAT_3)
+            .await
+            .expect("the graph resolves")
+            .expect("FEAT items have a default graph");
+        let body = store
+            .graph_body(resolved.graph.id)
+            .await
+            .expect("the body reads")
+            .expect("the graph exists");
+        assert!(!resolved.edges.is_empty(), "the seeded graph has edges");
+        assert_eq!(
+            resolved.edges, body.edges,
+            "the edges as `graph_edges` reads them"
+        );
+        assert!(
+            resolved.phases.iter().all(|row| row.parts.is_empty()),
+            "no seeded phase divides"
+        );
+
+        // A part planted on a phase is carried on that phase alone.
+        let phase = resolved.phases[1].phase.id;
+        let part = PhasePart {
+            phase_id: phase,
+            position: 0,
+            key: "api".to_owned(),
+            title: "The API".to_owned(),
+            brief: String::new(),
+            owned_paths: vec!["src/api".to_owned()],
+            acceptance: None,
+            agent_id: None,
+            model: None,
+            persona_id: None,
+        };
+        store.write(|state| state.phase_parts.insert((phase, 0), part.clone()));
+        let resolved = store
+            .resolve_graph(ids::HTUI_FEAT_3)
+            .await
+            .expect("the graph resolves")
+            .expect("FEAT items have a default graph");
+        assert_eq!(resolved.phases[1].parts, vec![part], "the planted part");
+        assert!(
+            resolved
+                .phases
+                .iter()
+                .enumerate()
+                .all(|(at, row)| at == 1 || row.parts.is_empty()),
             "every other phase carries none"
         );
     }
