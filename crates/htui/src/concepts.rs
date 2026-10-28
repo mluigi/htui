@@ -93,8 +93,10 @@ pub fn query(text: &str, projects: Vec<ProjectId>, decisions: bool, limit: u64) 
     }
 }
 
-/// The sentence a search or an index run refuses with when the keyring holds no Qdrant URL.
-const NO_QDRANT_URL: &str = "no Qdrant URL is stored; set one in Settings > Qdrant";
+/// The sentence a search or an index run refuses with when no Qdrant URL is set (MOD-158 D3: no
+/// `HTUI_QDRANT_URL` override and no `qdrant_url` row).
+pub(crate) const NO_QDRANT_URL: &str =
+    "no Qdrant URL is set; set one in Settings > Qdrant or with `htui --set-qdrant-url`";
 
 /// Builds the Qdrant settings from what the keyring holds.
 ///
@@ -1229,14 +1231,22 @@ mod tests {
             let _keyring = htui_store::testkit::mock_keyring().await;
             secret::set_qdrant_url("http://127.0.0.1:1").expect("the fake keyring stores");
             let loads = Arc::new(AtomicUsize::new(0));
-            let index = Arc::new(QdrantIndex::with_loader({
-                let loads = Arc::clone(&loads);
-                move || {
-                    loads.fetch_add(1, Ordering::SeqCst);
-                    // A load still in flight: everyone who wants the model waits on this one.
-                    Box::pin(std::future::pending())
-                }
-            }));
+            let settings = concepts_worker::QdrantSource::new(
+                secret::QdrantEnv::new(Some("http://127.0.0.1:1".to_owned()), None),
+                concepts_worker::KeySource::Interactive,
+            )
+            .with_keyring(|| Ok(None));
+            let index = Arc::new(
+                QdrantIndex::with_loader({
+                    let loads = Arc::clone(&loads);
+                    move || {
+                        loads.fetch_add(1, Ordering::SeqCst);
+                        // A load still in flight: everyone who wants the model waits on this one.
+                        Box::pin(std::future::pending())
+                    }
+                })
+                .with_source(Arc::new(settings)),
+            );
 
             let job = spawn_index_job_over(unreachable_store(), Arc::clone(&index))
                 .await
