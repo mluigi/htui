@@ -122,11 +122,7 @@ async fn serve(args: WorkerArgs) -> Result<(), WorkerExit> {
     };
     // MOD-158 D7: the job starts whatever the setting says and resolves it every cycle; it shares
     // the pool, never the runtime.
-    let index_job = tokio::select! {
-        biased;
-        () = &mut shutdown => return stopped_before_ready(),
-        job = concepts::spawn_index_job(pg.clone()) => job,
-    };
+    let index_job = concepts::spawn_index_job(pg.clone());
     // MOD-11 D11: a worker that cannot host tools would fail every document phase, so it is
     // refused before it claims anything.
     let tools = htui_mcp::McpHost::new(pg.clone())
@@ -142,9 +138,7 @@ async fn serve(args: WorkerArgs) -> Result<(), WorkerExit> {
         .with_secret_source(Arc::new(crate::secrets::KeyringInfisical::new()));
     tracing::info!(box_id = %pg.this_box(), pool = pool.get(), "htui worker ready");
     htui_worker::worker::run(pg, runtime, WorkerConfig::PRODUCTION, shutdown).await;
-    if let Some(job) = index_job {
-        job.abort();
-    }
+    index_job.abort();
     tracing::info!("htui worker stopped");
     Ok(())
 }

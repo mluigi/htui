@@ -14,9 +14,9 @@
 //! answers through `state_cmd` with exit 3 when Postgres or Qdrant does not answer, 2 on a refusal
 //! and 1 on a failure, as lines or (`--json`) one document.
 //!
-//! The worker's background sync (MOD-41 plan D19) lives here too: [`spawn_index_job`] reads the
-//! keyring once at `htui worker` start and, when it holds a Qdrant URL, spawns [`index_loop`],
-//! which re-syncs every project at start and then every [`sync_interval`].
+//! The worker's background sync (MOD-41 plan D19, MOD-158 D7) lives here too: [`spawn_index_job`]
+//! spawns [`index_job`] at `htui worker` start, which resolves the Qdrant settings every cycle and
+//! re-syncs every project at start and then every [`sync_interval`].
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,16 +30,17 @@ use htui_store::embed::RtenEmbedder;
 use htui_store::model;
 use htui_store::pg::{CONNECT_TIMEOUT, PoolSize};
 use htui_store::qdrant_settings::QdrantSettings;
+use htui_store::secret::QdrantEnv;
 use htui_store::vector::{
-    COLLECTION, ExistingCollection, Hit, PointType, QdrantStore, SearchQuery, VectorStore,
-    is_embedder_mismatch, is_qdrant_refused, is_query_embed_failure,
+    COLLECTION, EMBEDDER_MISMATCH, ExistingCollection, Hit, PointType, QdrantStore, SearchQuery,
+    VectorStore, is_embedder_mismatch, is_qdrant_refused, is_query_embed_failure,
 };
 use htui_store::vector_sync::{Indexer, SyncReport};
 use htui_store::{HeadlessError, Identity, PgStore, identity, secret};
 use serde_json::Value;
 use zeroize::Zeroizing;
 
-use crate::concepts_worker::{self, QdrantIndex};
+use crate::concepts_worker::{self, KeySource, QdrantIndex};
 use crate::state_cmd::{
     self, Answer, ErrorCode, Failure, IndexAnswer, Kind, Outcome, SearchAnswer, StateExit,
 };
@@ -98,31 +99,13 @@ pub fn query(text: &str, projects: Vec<ProjectId>, decisions: bool, limit: u64) 
 pub(crate) const NO_QDRANT_URL: &str =
     "no Qdrant URL is set; set one in Settings > Qdrant or with `htui --set-qdrant-url`";
 
-/// Builds the Qdrant settings from what the keyring holds.
-///
-/// # Errors
-///
-/// When no URL is stored, naming where to set one.
-pub fn settings_from(
-    url: Option<String>,
-    api_key: Option<String>,
-) -> anyhow::Result<QdrantSettings> {
-    let Some(url) = url else {
-        bail!("{NO_QDRANT_URL}");
-    };
-    Ok(QdrantSettings::new(
-        htui_core::qdrant::QdrantUrl::parse(&url)?,
-        api_key,
-    ))
-}
-
 /// The sentence every verb that needs the keyring's DSN refuses with when none is stored.
 pub(crate) const NO_DSN: &str = "no Postgres DSN is stored; run `htui --set-dsn` first";
 
 /// `--index-items`' connect: headless, and the collection created on first use, because it writes
-/// the index by design. `--search-items` does not come here (MOD-92: it reads only).
+/// the index by design. `--search-items` does not come here (MOD-92: it reads only). MOD-158 D8's
+/// order: the DSN, the connect, the Qdrant URL (the override or the row) and key, the model, Qdrant.
 async fn open() -> anyhow::Result<(PgStore, QdrantStore<RtenEmbedder>)> {
-    let settings = settings_from(secret::get_qdrant_url()?, secret::get_qdrant_api_key()?)?;
     let Some(dsn) = secret::get_dsn()? else {
         bail!("{NO_DSN}");
     };
@@ -130,6 +113,14 @@ async fn open() -> anyhow::Result<(PgStore, QdrantStore<RtenEmbedder>)> {
     let pg = PgStore::connect_headless(&dsn, &identity, CONNECT_TIMEOUT, PoolSize::TUI)
         .await
         .map_err(headless_refusal)?;
+    let settings = concepts_worker::resolve_settings(
+        &QdrantEnv::from_process(),
+        Some(&pg),
+        &KeySource::Interactive,
+        secret::get_qdrant_api_key,
+    )
+    .await
+    .map_err(|why| anyhow::anyhow!("{why}"))?;
     let embedder = load_embedder().await?;
     let store = QdrantStore::connect(&settings, embedder)
         .await
@@ -331,93 +322,114 @@ pub async fn index_loop(source: &impl IndexSource, vectors: &impl VectorStore) -
     }
 }
 
-/// The worker's index job over `pg`, when the keyring holds a Qdrant URL: read once, here, at
-/// `htui worker` start (MOD-41 PRD D6, plan D19). `None`, with an `info` line saying why, when it
-/// holds none or cannot be read, which on a keyring-less host is always.
-pub async fn spawn_index_job(pg: PgStore) -> Option<tokio::task::JoinHandle<()>> {
-    spawn_index_job_over(pg, concepts_worker::shared_qdrant()).await
-}
-
-/// [`spawn_index_job`], its model taken from `models` (MOD-11 H-26): in production the process-wide
-/// index `search_concepts` searches, so a worker that indexes and serves the tool loads one model.
-pub(crate) async fn spawn_index_job_over(
-    pg: PgStore,
-    models: Arc<QdrantIndex>,
-) -> Option<tokio::task::JoinHandle<()>> {
-    let settings = match apart("htui-index-keyring", keyring_settings).await {
-        Some(Ok(settings)) => settings,
-        Some(Err(why)) => {
-            tracing::info!("no concepts index job: {why}");
-            return None;
-        }
-        None => {
-            tracing::info!("no concepts index job: the keyring read stopped");
-            return None;
-        }
-    };
-    Some(tokio::spawn(async move {
-        let store = open_index(&pg, &settings, &models).await;
-        index_loop(&pg, &store).await;
-    }))
-}
-
-/// The Qdrant settings the keyring holds, or why the worker has no index job (plan D19: `None`
-/// and `Err` alike mean no job).
-fn keyring_settings() -> Result<QdrantSettings, String> {
-    let url = match secret::get_qdrant_url() {
-        Ok(Some(url)) => url,
-        Ok(None) => return Err("no Qdrant URL is stored in the keyring".to_owned()),
-        Err(err) => return Err(format!("the keyring could not be read: {err}")),
-    };
-    let api_key = secret::get_qdrant_api_key()
-        .map_err(|err| format!("the Qdrant API key could not be read: {err}"))?;
-    let url = htui_core::qdrant::QdrantUrl::parse(&url)
-        .map_err(|err| format!("the stored Qdrant URL is not usable: {err}"))?;
-    Ok(QdrantSettings::new(url, api_key))
-}
-
-/// The model, then the collection; a failure is logged and another attempt follows after the
-/// interval, forever (plan D19). The model is `models`' (MOD-11 H-26): the one `search_concepts`
-/// shares, loaded once, on a thread of its own, and kept, so a retry after an unreachable Qdrant
-/// reuses it (MOD-68 A-4); a failed load is retried by the next attempt.
+/// One cycle of the worker's index job (MOD-158 D7): the settings, resolved now through
+/// `settings` (the override or the `qdrant_url` row, and the key); then the store, through `open`
+/// (in production the index's cached connection, so the model loads only once a URL resolves and
+/// a changed URL or key reconnects); then [`index_cycle`]. No URL is one `info` line and the
+/// interval; any other unresolved setting and a failed open are [`open_failure_level`]'s line and
+/// the interval. Answers how long to sleep before the next cycle.
 ///
 /// An embedder mismatch is an `error` once, then `debug` (review L3), and is still re-checked
 /// every interval rather than ending the job: its remedy (delete the collection, run `htui
-/// --index-items`) happens outside this process, and a job that had ended would leave the worker
-/// never syncing again until restarted. A check is two Qdrant round trips per interval, not a
-/// hot loop.
-async fn open_index(
-    pg: &PgStore,
-    settings: &QdrantSettings,
-    models: &QdrantIndex,
-) -> QdrantStore<RtenEmbedder> {
-    let mut reported = false;
-    loop {
-        let (err, mismatch) = match models.embedder().await {
-            Ok(embedder) => match QdrantStore::connect(settings, embedder).await {
-                Ok(store) => return store,
-                Err(err) => {
-                    let mismatch = is_embedder_mismatch(&err);
-                    (format!("{:#}", qdrant_refusal(err)), mismatch)
-                }
-            },
-            Err(err) => (err, false),
-        };
-        match open_failure_level(mismatch, &mut reported) {
-            tracing::Level::ERROR => tracing::error!(
-                %err,
-                "concepts index refused by Qdrant; no sync until the collection is rebuilt (checked \
-                 again every interval, logged once)"
-            ),
-            tracing::Level::DEBUG => tracing::debug!(%err, "concepts index still refused"),
-            _ => tracing::warn!(%err, "concepts index not opened; next cycle"),
+/// --index-items`) happens outside this process. `mismatch` carries that across cycles.
+pub async fn job_cycle<S, V, F, Fut>(
+    source: &S,
+    settings: &concepts_worker::QdrantSource,
+    open: &F,
+    mismatch: &mut bool,
+) -> Duration
+where
+    S: IndexSource,
+    V: VectorStore,
+    F: Fn(QdrantSettings) -> Fut,
+    Fut: Future<Output = Result<Arc<V>, String>>,
+{
+    let (err, mismatched) = match settings.settings().await {
+        Err(concepts_worker::Unresolved::NoUrl) => {
+            tracing::info!("concepts index not synced: {NO_QDRANT_URL}; next cycle");
+            return interval_of(source).await;
         }
-        let app = pg.index_settings().await.unwrap_or_default();
-        tokio::time::sleep(sync_interval(&app)).await;
+        Err(why) => (why.sentence(), false),
+        Ok(resolved) => match open(resolved).await {
+            Ok(store) => {
+                *mismatch = false;
+                return index_cycle(source, &*store).await;
+            }
+            Err(err) => {
+                let mismatched = names_a_mismatch(&err);
+                (err, mismatched)
+            }
+        },
+    };
+    match open_failure_level(mismatched, mismatch) {
+        tracing::Level::ERROR => tracing::error!(
+            %err,
+            "concepts index refused by Qdrant; no sync until the collection is rebuilt (checked \
+             again every interval, logged once)"
+        ),
+        tracing::Level::DEBUG => tracing::debug!(%err, "concepts index still refused"),
+        _ => tracing::warn!(%err, "concepts index not opened; next cycle"),
+    }
+    interval_of(source).await
+}
+
+/// Whether a failed open's text (`QdrantIndex::connect`'s `{:#}` of [`qdrant_refusal`]) is
+/// [`is_embedder_mismatch`]'s refusal: the store error's display wraps its message, so the
+/// prefix is looked for inside it.
+fn names_a_mismatch(err: &str) -> bool {
+    err.contains(&format!("{EMBEDDER_MISMATCH}: "))
+}
+
+/// [`sync_interval`] of `source`'s settings, the default when they cannot be read.
+async fn interval_of(source: &impl IndexSource) -> Duration {
+    sync_interval(&source.index_settings().await.unwrap_or_default())
+}
+
+/// The worker's index job: [`job_cycle`] at start, then again after each interval, forever. It
+/// never touches the run runtime, and the worker aborts it on shutdown (MOD-41 plan D19).
+pub async fn index_job<S, V, F, Fut>(
+    source: &S,
+    settings: &concepts_worker::QdrantSource,
+    open: F,
+) -> !
+where
+    S: IndexSource,
+    V: VectorStore,
+    F: Fn(QdrantSettings) -> Fut,
+    Fut: Future<Output = Result<Arc<V>, String>>,
+{
+    let mut mismatch = false;
+    loop {
+        let pause = job_cycle(source, settings, &open, &mut mismatch).await;
+        tokio::time::sleep(pause).await;
     }
 }
 
-/// The level `open_index` logs one failed open at: an embedder mismatch is `ERROR` the first time
+/// The worker's index job over `pg` (MOD-158 D7): always spawned, whatever the setting says; each
+/// cycle resolves the URL and key again, so one set later is indexed into without a restart.
+#[must_use]
+pub fn spawn_index_job(pg: PgStore) -> tokio::task::JoinHandle<()> {
+    spawn_index_job_over(pg, concepts_worker::shared_qdrant())
+}
+
+/// [`spawn_index_job`] over `models` (MOD-11 H-26): its settings source and its cached connection,
+/// so a worker that indexes and serves `search_concepts` loads one model, and resolves both through
+/// the store and key source the worker published there.
+pub(crate) fn spawn_index_job_over(
+    pg: PgStore,
+    models: Arc<QdrantIndex>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let settings = Arc::clone(models.source());
+        let open = |resolved: QdrantSettings| {
+            let models = Arc::clone(&models);
+            async move { models.connect(resolved).await }
+        };
+        match index_job(&pg, &settings, open).await {}
+    })
+}
+
+/// The level [`job_cycle`] logs one failed open at: an embedder mismatch is `ERROR` the first time
 /// and `DEBUG` after, since it says the same until someone rebuilds the collection; anything else
 /// is `WARN` every time (review L3).
 fn open_failure_level(mismatch: bool, reported: &mut bool) -> tracing::Level {
@@ -453,17 +465,20 @@ pub(crate) async fn apart<T: Send + 'static>(
 /// (plan D8), and only when there is a collection to search; its notes go to stderr.
 ///
 /// # Errors
-/// [`StateExit`]: 3 when Postgres or Qdrant does not answer, 2 on a refusal (no URL, no DSN,
-/// schema, scope, embedder mismatch, a refused API key), 1 on a model or read failure.
+/// [`StateExit`]: 3 when Postgres or Qdrant does not answer, 2 on a refusal (no DSN, schema, no
+/// URL or an unusable one, an unreadable key, scope, embedder mismatch, a refused API key), 1 on a
+/// model or read failure.
 pub async fn search_items(options: &SearchOptions) -> Result<(), StateExit> {
     let answer = match search_inputs(options) {
         Err(failure) => Answer {
             kind: Kind::Search,
             outcome: Outcome::Failed(failure),
         },
-        Ok((settings, dsn, identity)) => {
+        Ok((dsn, identity)) => {
+            let env = QdrantEnv::from_process();
             let ctx = SearchContext {
-                settings: &settings,
+                env: &env,
+                keyring_key: secret::get_qdrant_api_key,
                 collection: COLLECTION,
                 dsn: &dsn,
                 identity: identity.as_ref(),
@@ -475,12 +490,16 @@ pub async fn search_items(options: &SearchOptions) -> Result<(), StateExit> {
     state_cmd::emit(&mut std::io::stdout().lock(), &answer, options.json)
 }
 
-/// What [`search_answer_with`] needs that [`search_items`] reads from the keyring and `box.toml`:
-/// the test seam (review R1 M4), as `state_cmd::Context` is for `status` and `waiting`.
+/// What [`search_answer_with`] needs that [`search_items`] reads from the process, the keyring
+/// and `box.toml`: the test seam (review R1 M4), as `state_cmd::Context` is for `status` and
+/// `waiting`. The Qdrant URL is not here: it is the `qdrant_url` row, read after the connect
+/// (MOD-158 D8), unless `env` overrides it.
 #[derive(Clone)]
 pub struct SearchContext<'a> {
-    /// The Qdrant URL and API key.
-    pub settings: &'a QdrantSettings,
+    /// `HTUI_QDRANT_URL` and `HTUI_QDRANT_API_KEY` (a test's literal, never the process's).
+    pub env: &'a QdrantEnv,
+    /// The keyring read of the Qdrant API key: `secret::get_qdrant_api_key`, or a test's closure.
+    pub keyring_key: concepts_worker::KeyringRead,
     /// The collection searched: [`COLLECTION`], or a test's throwaway one.
     pub collection: &'a str,
     /// The Postgres DSN.
@@ -495,7 +514,7 @@ impl core::fmt::Debug for SearchContext<'_> {
     /// Everything but the DSN and the API key, which are secrets.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SearchContext")
-            .field("qdrant", &self.settings.url)
+            .field("qdrant_url_override", &self.env.url)
             .field("collection", &self.collection)
             .field("dsn", &"<redacted>")
             .field("identity", &self.identity)
@@ -504,46 +523,39 @@ impl core::fmt::Debug for SearchContext<'_> {
     }
 }
 
-/// A-2's reads before the connect, in its order: the Qdrant settings (so a box without a URL is
-/// refused before Postgres is asked), the DSN, `box.toml` (for `--cwd` only).
+/// The reads before the connect: the DSN, then `box.toml` (for `--cwd` only). The Qdrant URL is
+/// read after the connect (MOD-158 D8: it is a row in the database).
 fn search_inputs(
     options: &SearchOptions,
-) -> Result<(QdrantSettings, Zeroizing<String>, Option<Identity>), Failure> {
-    let keyring = |err: StoreError| Failure::refused(ErrorCode::KeyringUnreadable, err.to_string());
-    let url = secret::get_qdrant_url().map_err(keyring)?;
-    let settings = match url {
-        None => qdrant_settings(None, None)?,
-        Some(url) => qdrant_settings(Some(url), secret::get_qdrant_api_key().map_err(keyring)?)?,
-    };
+) -> Result<(Zeroizing<String>, Option<Identity>), Failure> {
     let dsn = state_cmd::read_dsn()?;
     let identity = match options.cwd {
         Some(_) => state_cmd::read_identity()?,
         None => None,
     };
-    Ok((settings, dsn, identity))
+    Ok((dsn, identity))
 }
 
-/// The Qdrant settings from what the keyring holds, or the search's refusal (A-2), with
-/// `settings_from`'s sentences: `no_qdrant_url` without a URL, `qdrant_url_unusable` for one that
-/// cannot be used.
-///
-/// # Errors
-/// The refusal [`Failure`].
-pub fn qdrant_settings(
-    url: Option<String>,
-    api_key: Option<String>,
-) -> Result<QdrantSettings, Failure> {
-    if url.is_none() {
-        return Err(Failure::refused(ErrorCode::NoQdrantUrl, NO_QDRANT_URL));
+/// Why no Qdrant settings resolved, as the search's [`Failure`]: `no_qdrant_url`,
+/// `qdrant_url_unusable`, the row read's own failure, or `keyring_unreadable` for the key.
+fn unresolved_failure(why: concepts_worker::Unresolved) -> Failure {
+    use concepts_worker::Unresolved;
+    match why {
+        Unresolved::NoUrl => Failure::refused(ErrorCode::NoQdrantUrl, NO_QDRANT_URL),
+        Unresolved::Unusable(sentence) => Failure::refused(ErrorCode::QdrantUrlUnusable, sentence),
+        Unresolved::Read(err) => Failure::from_read(&err),
+        Unresolved::Key(err) => Failure::refused(ErrorCode::KeyringUnreadable, err.to_string()),
+        // A search reads through the store it connected, so it never lacks one.
+        Unresolved::Offline => Failure::from_read(&StoreError::Unreachable(
+            concepts_worker::URL_OFFLINE.to_owned(),
+        )),
     }
-    settings_from(url, api_key)
-        .map_err(|err| Failure::refused(ErrorCode::QdrantUrlUnusable, format!("{err:#}")))
 }
 
 /// `--search-items` over `ctx`, with the model from `load` (review R1 M4). Never fails: a failure
-/// is an [`Answer`] too. In A-2's order: the read-only connect, the scope (the pool is closed once
-/// it is read, review R1 L9), then the index (`search_index`: Qdrant first, the model only when
-/// there is a collection to search).
+/// is an [`Answer`] too. In MOD-158 D8's order: the read-only connect, the Qdrant URL (the override
+/// or the row) and key, the scope (the pool is closed once it is read, review R1 L9), then the
+/// index (`search_index`: Qdrant first, the model only when there is a collection to search).
 pub async fn search_answer_with<E, F, Fut>(
     ctx: &SearchContext<'_>,
     options: &SearchOptions,
@@ -582,13 +594,27 @@ where
     )
     .await
     .map_err(Failure::from_connect)?;
+    let settings = match concepts_worker::resolve_settings(
+        ctx.env,
+        Some(&pg),
+        &KeySource::Interactive,
+        ctx.keyring_key,
+    )
+    .await
+    {
+        Ok(settings) => settings,
+        Err(why) => {
+            pg.close().await;
+            return Err(unresolved_failure(why));
+        }
+    };
     let projects = search_projects(&pg, options, ctx.identity).await;
     pg.close().await;
     let query = query(&options.query, projects?, options.decisions, options.limit);
     Ok(SearchAnswer {
         query: options.query.clone(),
         decisions: options.decisions,
-        index: search_index(ctx.settings, ctx.collection, &query, load).await,
+        index: search_index(&settings, ctx.collection, &query, load).await,
     })
 }
 
@@ -745,20 +771,6 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_url_names_where_to_set_it() {
-        let err = settings_from(None, None).unwrap_err().to_string();
-        assert!(err.contains("Settings > Qdrant"), "{err}");
-    }
-
-    #[test]
-    fn a_stored_url_and_key_become_settings() {
-        let s = settings_from(Some("http://localhost:6334".into()), Some("k".into())).unwrap();
-        assert_eq!(s.url.as_str(), "http://localhost:6334");
-        assert!(s.api_key.is_some());
-        assert!(settings_from(Some("localhost:6334".into()), None).is_err());
-    }
-
-    #[test]
     fn only_an_unreachable_server_is_cannot_reach() {
         use htui_core::store::StoreError;
         assert_eq!(
@@ -782,8 +794,13 @@ mod tests {
         let text = format!("{:#}", qdrant_refusal(mismatch));
         assert!(text.contains(EMBEDDER_MISMATCH), "{text}");
         assert!(!text.contains("cannot reach"), "{text}");
+        assert!(
+            names_a_mismatch(&text),
+            "the job's open reads it as one: {text}"
+        );
         let down = StoreError::Backend("qdrant: collection exists: transport error".into());
         let text = format!("{:#}", qdrant_refusal(down));
+        assert!(!names_a_mismatch(&text), "{text}");
         assert!(text.starts_with("cannot reach Qdrant: "), "{text}");
         assert!(
             text.ends_with("qdrant: collection exists: transport error"),
@@ -1173,8 +1190,7 @@ mod tests {
             .await;
         }
 
-        /// A pool that has never connected: `spawn_index_job` must not query it when there is
-        /// no job to start.
+        /// A pool that has never connected: the job's start must not need it.
         fn unreachable_store() -> PgStore {
             let identity = Identity {
                 box_id: htui_core::model::BoxId::new(),
@@ -1188,35 +1204,164 @@ mod tests {
             .expect("a lazy pool opens no socket")
         }
 
-        #[tokio::test]
-        async fn no_qdrant_url_means_no_job() {
-            let _keyring = htui_store::testkit::mock_keyring().await;
-            assert!(
-                spawn_index_job(unreachable_store()).await.is_none(),
-                "an empty keyring starts no job"
-            );
-            secret::set_qdrant_api_key("a-key").expect("the fake keyring stores");
-            assert!(
-                spawn_index_job(unreachable_store()).await.is_none(),
-                "an API key without a URL starts no job"
-            );
+        /// The job's settings source over `store`, no override, a keyring holding no key.
+        fn settings_over(store: &MemStore) -> concepts_worker::QdrantSource {
+            let source =
+                concepts_worker::QdrantSource::new(QdrantEnv::default(), KeySource::Interactive)
+                    .with_keyring(|| Ok(None));
+            source.publish(Some(Arc::new(store.clone())));
+            source
         }
 
-        #[tokio::test]
-        async fn an_unreadable_keyring_means_no_job() {
-            let _keyring = htui_store::testkit::mock_keyring_broken().await;
-            assert!(spawn_index_job(unreachable_store()).await.is_none());
-        }
-
-        #[tokio::test]
-        async fn a_stored_qdrant_url_starts_the_job() {
-            let _keyring = htui_store::testkit::mock_keyring().await;
-            // Nothing listens on port 1: the job starts, then warns every cycle, which is its
-            // contract (plan D19); the case aborts it at once, before the model loads.
-            secret::set_qdrant_url("http://127.0.0.1:1").expect("the fake keyring stores");
-            let job = spawn_index_job(unreachable_store())
+        /// Sets `store`'s `qdrant_url` row to `text`, over whatever it holds.
+        async fn set_row(store: &MemStore, text: &str) {
+            let token = store
+                .qdrant_url()
                 .await
-                .expect("a stored URL starts the job");
+                .expect("the memory store never fails")
+                .map(|row| row.token);
+            store
+                .set_qdrant_url(
+                    &htui_core::qdrant::QdrantUrl::parse(text).expect("a valid URL"),
+                    token,
+                )
+                .await
+                .expect("the memory store never fails");
+        }
+
+        /// `open` for the job: records the URL of every open, and fails the first `fail` of them.
+        #[derive(Default)]
+        struct Opens {
+            urls: std::sync::Mutex<Vec<String>>,
+            fail: AtomicUsize,
+            vectors: Arc<Counting>,
+        }
+
+        impl Opens {
+            fn failing_once() -> Self {
+                Self {
+                    fail: AtomicUsize::new(1),
+                    ..Self::default()
+                }
+            }
+
+            fn open(
+                &self,
+                settings: QdrantSettings,
+            ) -> std::future::Ready<Result<Arc<Counting>, String>> {
+                self.urls
+                    .lock()
+                    .expect("not poisoned")
+                    .push(settings.url.to_string());
+                let failing = self
+                    .fail
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok();
+                std::future::ready(if failing {
+                    Err("cannot reach Qdrant: planted failure".to_owned())
+                } else {
+                    Ok(Arc::clone(&self.vectors))
+                })
+            }
+
+            fn urls(&self) -> Vec<String> {
+                self.urls.lock().expect("not poisoned").clone()
+            }
+        }
+
+        /// Runs `checks` beside `index_job(read, settings, opens)`, as `beside_the_loop`.
+        async fn beside_the_job(
+            read: &MemStore,
+            settings: &concepts_worker::QdrantSource,
+            opens: &Opens,
+            checks: impl Future<Output = ()>,
+        ) {
+            tokio::select! {
+                biased;
+                () = checks => {}
+                never = index_job(read, settings, |s| opens.open(s)) => match never {},
+            }
+        }
+
+        /// MOD-158 D7: no URL is one `info` line and the interval; nothing is opened, nothing
+        /// loaded.
+        #[tokio::test(start_paused = true)]
+        async fn no_url_is_one_info_line_then_the_interval() {
+            let read = MemStore::demo();
+            let settings = settings_over(&read);
+            let opens = Opens::default();
+            let mut mismatch = false;
+            let pause = job_cycle(&read, &settings, &|s| opens.open(s), &mut mismatch).await;
+            assert_eq!(pause, 15 * MINUTE);
+            assert!(opens.urls().is_empty(), "never opened without a URL");
+            assert_eq!(opens.vectors.reads(), 0);
+        }
+
+        /// MOD-158 D7: a URL set while the job runs is used by its next cycle, no restart.
+        #[tokio::test(start_paused = true)]
+        async fn a_url_set_after_the_job_starts_is_used_by_the_next_cycle() {
+            let read = MemStore::demo();
+            let settings = settings_over(&read);
+            let opens = Opens::default();
+            beside_the_job(&read, &settings, &opens, async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                assert!(opens.urls().is_empty(), "no URL at start");
+                set_row(&read, "http://qdrant:6334").await;
+                tokio::time::sleep(15 * MINUTE).await;
+                assert_eq!(opens.urls(), ["http://qdrant:6334"]);
+                assert_eq!(opens.vectors.syncs(), 1, "the next cycle synced");
+            })
+            .await;
+        }
+
+        /// MOD-158 D7: a changed URL is what the next cycle opens.
+        #[tokio::test(start_paused = true)]
+        async fn a_changed_url_is_opened_on_the_next_cycle() {
+            let read = MemStore::demo();
+            set_row(&read, "http://first:6334").await;
+            let settings = settings_over(&read);
+            let opens = Opens::default();
+            beside_the_job(&read, &settings, &opens, async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                assert_eq!(opens.urls(), ["http://first:6334"]);
+                set_row(&read, "http://second:6334").await;
+                tokio::time::sleep(15 * MINUTE).await;
+                assert_eq!(opens.urls(), ["http://first:6334", "http://second:6334"]);
+                assert_eq!(opens.vectors.syncs(), 2);
+            })
+            .await;
+        }
+
+        /// MOD-158 D7: a failed open is a log line and the interval; the next cycle opens again.
+        #[tokio::test(start_paused = true)]
+        async fn a_failed_open_is_retried_next_cycle() {
+            let read = MemStore::demo();
+            set_row(&read, "http://qdrant:6334").await;
+            let settings = settings_over(&read);
+            let opens = Opens::failing_once();
+            let mut mismatch = false;
+            let open = |s| opens.open(s);
+            let pause = job_cycle(&read, &settings, &open, &mut mismatch).await;
+            assert_eq!(pause, 15 * MINUTE);
+            assert_eq!(
+                opens.vectors.reads(),
+                0,
+                "nothing synced after a failed open"
+            );
+            job_cycle(&read, &settings, &open, &mut mismatch).await;
+            assert_eq!(opens.urls().len(), 2, "opened again");
+            assert_eq!(opens.vectors.syncs(), 1);
+        }
+
+        /// MOD-158 D7: the job starts whatever the setting says (here: nothing published, so
+        /// offline), and runs until it is aborted.
+        #[tokio::test]
+        async fn the_job_starts_whatever_the_setting_says() {
+            let index = Arc::new(QdrantIndex::with_loader(
+                || Box::pin(std::future::pending()),
+            ));
+            let job = spawn_index_job_over(unreachable_store(), index);
+            tokio::time::sleep(Duration::from_millis(50)).await;
             assert!(!job.is_finished(), "the job runs until it is aborted");
             job.abort();
             assert!(job.await.expect_err("aborted").is_cancelled());
@@ -1228,12 +1373,10 @@ mod tests {
         async fn the_index_job_and_the_search_share_one_model_load() {
             use crate::concepts_worker::ConceptIndex as _;
 
-            let _keyring = htui_store::testkit::mock_keyring().await;
-            secret::set_qdrant_url("http://127.0.0.1:1").expect("the fake keyring stores");
             let loads = Arc::new(AtomicUsize::new(0));
             let settings = concepts_worker::QdrantSource::new(
-                secret::QdrantEnv::new(Some("http://127.0.0.1:1".to_owned()), None),
-                concepts_worker::KeySource::Interactive,
+                QdrantEnv::new(Some("http://127.0.0.1:1".to_owned()), None),
+                KeySource::Interactive,
             )
             .with_keyring(|| Ok(None));
             let index = Arc::new(
@@ -1248,9 +1391,7 @@ mod tests {
                 .with_source(Arc::new(settings)),
             );
 
-            let job = spawn_index_job_over(unreachable_store(), Arc::clone(&index))
-                .await
-                .expect("a stored URL starts the job");
+            let job = spawn_index_job_over(unreachable_store(), Arc::clone(&index));
             tokio::time::timeout(Duration::from_secs(10), async {
                 while loads.load(Ordering::SeqCst) == 0 {
                     tokio::time::sleep(Duration::from_millis(10)).await;

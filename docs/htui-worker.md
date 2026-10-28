@@ -6,7 +6,7 @@ the TUI session that started it. It is part of `htui`, started by you and talkin
 Postgres; it is not a hosted service (`docs/REQUIREMENTS.md` R-ID-2, R-ORCH-12).
 
 ```
-htui worker [--pool-size N] [--dsn-stdin] [--log PATH]
+htui worker [--pool-size N] [--dsn-stdin] [--qdrant-key-stdin] [--log PATH]
 ```
 
 - [What it does, and what it does not do yet](#what-it-does-and-what-it-does-not-do-yet)
@@ -18,7 +18,9 @@ htui worker [--pool-size N] [--dsn-stdin] [--log PATH]
 - [Follow-ups on worker steps](#follow-ups-on-worker-steps)
 - [Upgrading: migrate from a TUI first](#upgrading-migrate-from-a-tui-first)
 - [Where the DSN comes from](#where-the-dsn-comes-from)
+- [Where the Qdrant API key comes from](#where-the-qdrant-api-key-comes-from)
 - [Pool size](#pool-size)
+- [The concepts index](#the-concepts-index)
 - [Logs](#logs)
 - [Exit codes](#exit-codes)
 - [A run whose resume keeps failing](#a-run-whose-resume-keeps-failing)
@@ -237,8 +239,10 @@ in [`docs/htui-mcp.md`](htui-mcp.md).
   cannot be created or is not private leaves the worker running and fails each step with
   `agent spawn failed: htui's MCP listener could not start: …`. Under the systemd unit, check that
   `/tmp` is writable.
-- **`search_concepts`** is offered only when the keyring held a Qdrant URL at start (see
-  [The concepts index](#the-concepts-index)), so a provisioned worker never offers it.
+- **`search_concepts`** is offered only when a Qdrant URL was set when the worker started: the
+  database-wide setting (**Settings › Qdrant** or `htui --set-qdrant-url`), or `HTUI_QDRANT_URL`
+  (see [The concepts index](#the-concepts-index)). A URL set later is indexed into at the next
+  sync, but the tool is offered from the worker's next start.
 - **`command_run`** runs on this box, as the worker's user and with the worker's environment, in
   the box's command queue, which the worker shares with a TUI on the same box. A worker killed
   mid-command holds its slot until the next command of that class asks, 30 seconds later at the
@@ -397,6 +401,32 @@ from `argv`, from any other environment variable or from a plain file, and it is
 log or an error report. The copy htui reads is wiped once the connection is open; the Postgres
 driver keeps the password in memory for the life of the process so it can reconnect.
 
+## Where the Qdrant API key comes from
+
+The Qdrant URL is not a secret and is not read here: it is one setting for the whole database (see
+[The concepts index](#the-concepts-index)). The API key, which a Qdrant may not need, is read from
+the first of these that holds one:
+
+1. **`HTUI_QDRANT_API_KEY`**, when set and not blank: for development and CI. htui removes it from
+   the environment of every agent, step command, git command and opener it starts, so no agent sees
+   it.
+2. **`--qdrant-key-stdin`:** one line from standard input, read at start after the DSN line when
+   `--dsn-stdin` is given too, or as the only line without it; and no other source after it. A
+   blank line or end of input is a refusal (exit 2, "no Qdrant API key on stdin; nothing was
+   read"), never a fall-through. When standard input is a terminal, a prompt goes to standard
+   error; the pasted text is visible.
+3. **Otherwise the OS keyring entry the TUI uses**, the one **Settings › Qdrant** and
+   `htui --set-qdrant-key` write. A keyring that cannot be reached counts as "no keyring", as for the
+   DSN.
+4. **Otherwise, on Linux, the systemd credential `htui-qdrant-key`:** the file
+   `$CREDENTIALS_DIRECTORY/htui-qdrant-key`.
+
+With none of them the worker talks to Qdrant without a key, which is right for a Qdrant that needs
+none; a Qdrant that needs one refuses, and the log says so. The key is read again for every sync
+and every search, so a key stored in the keyring or the credential while the worker runs applies to
+the next one; a `--qdrant-key-stdin` line is the key for the life of the process. The key is
+**never** read from `argv`, Postgres or a plain file, and never written to a log.
+
 ## Pool size
 
 `--pool-size N` sets how many Postgres connections the worker may hold. The default is 4; any value
@@ -406,16 +436,24 @@ running `htui` process below your server's `max_connections`.
 
 ## The concepts index
 
-When the OS keyring holds a Qdrant URL (set in Settings > Qdrant, as for `htui --index-items`), the
-worker keeps the concepts index in step with every project: once at start, then every
+The worker keeps the concepts index in step with every project: once at start, then every
 `concepts_sync_minutes` minutes. That is an `app_setting` key holding a positive whole number,
 read again after every sync; without it, or with any other value, the interval is 15 minutes.
 
-- The keyring is read **once**, at start. Without a URL there, or with a keyring that cannot be
-  read, the worker logs one `info` line saying why and never indexes; a URL stored later is
-  picked up at the next start. A host without a keyring, which is the systemd case, never indexes.
-- The embedding model loads in the background, downloaded on first use exactly as for
-  `--index-items`; runs never wait for it.
+- **The Qdrant URL is one setting for the whole database**, the `app_setting` `qdrant_url` that
+  **Settings › Qdrant** and `htui --set-qdrant-url` write, so every box indexes into the same Qdrant.
+  `HTUI_QDRANT_URL`, when set and not blank, overrides it for this process (development and CI); a
+  value that is not a Qdrant URL is an error, never a fall-back to the setting. The API key comes
+  from [these sources](#where-the-qdrant-api-key-comes-from).
+- **The URL is read again at every sync.** Without one, the worker logs one `info` line ("no Qdrant
+  URL is set; …") and tries again after the interval; a URL set later is indexed into at the next
+  sync, with no restart, and a changed URL or key reconnects. A setting that is not a usable URL is
+  a `warn` line naming it, every interval.
+- **An old Qdrant URL in this box's keyring is no longer read.** Earlier versions kept the URL
+  there; if the worker finds one at start it says so once, at `info`, so you can make it the setting
+  for every box in **Settings › Qdrant** or with `htui --set-qdrant-url`.
+- The embedding model loads in the background, only once a URL is set, downloaded on first use
+  exactly as for `--index-items`; runs never wait for it.
 - A Qdrant that does not answer, a model that does not load or a sync that fails is a `warn` line,
   and the next interval tries again. None of it touches runs.
 - The sync shares the worker's pool, one query at a time, and is stopped on shutdown.
