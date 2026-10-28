@@ -259,6 +259,9 @@ struct State {
     /// [`WriteStore::setting`] with a token at all. Empty unless something wrote it: no fixture
     /// loads it.
     app_settings: BTreeMap<String, (Value, DateTime<Utc>)>,
+    /// The last token [`MemStore::set_qdrant_url`] handed out (MOD-158 R1), kept across a clear so
+    /// an insert after one still moves past every spent token under a clock that does not move.
+    qdrant_url_last_token: Option<DateTime<Utc>>,
     /// `agent`, read by the inherent [`MemStore::agents`] (MOD-2 plan D3).
     agents: HashMap<AgentId, Agent>,
     /// `agent_box`, keyed as its composite primary key is. Empty until something probes a box:
@@ -416,6 +419,7 @@ impl MemStore {
             box_tools: data.box_tools,
             box_probe_digests: HashMap::new(),
             app_settings: BTreeMap::new(),
+            qdrant_url_last_token: None,
             agents: data.agents.into_iter().map(|row| (row.id, row)).collect(),
             agent_boxes: HashMap::new(),
             agent_boxes_off: HashSet::new(),
@@ -715,13 +719,16 @@ impl MemStore {
             if current.as_ref().map(|row| row.token) != expected {
                 return CasOutcome::Stale(current);
             }
-            // The token moves on every write, even under a clock that does not (a test's), so a
-            // spent token never matches the row again (MOD-158 R1). One microsecond is
-            // `timestamptz`'s resolution, the same as Postgres's `updated_at`.
-            let now = match expected {
+            // The token moves past every one handed out before, the row's and a cleared row's
+            // alike, even under a clock that does not move (a test's), so a spent token never
+            // matches the row again (MOD-158 R1). One microsecond is `timestamptz`'s resolution,
+            // the same as Postgres's `updated_at`.
+            let floor = expected.max(state.qdrant_url_last_token);
+            let now = match floor {
                 Some(old) if now <= old => old + TimeDelta::microseconds(1),
                 _ => now,
             };
+            state.qdrant_url_last_token = Some(now);
             state
                 .app_settings
                 .insert(QDRANT_URL_KEY.to_owned(), (url.to_value(), now));
@@ -10417,6 +10424,34 @@ mod tests {
             CasOutcome::Stale(Some(row)) => assert_eq!(row, second),
             other => panic!("a spent token clears nothing: {other:?}"),
         }
+        // A clear forgets the row, not its token: the next insert's token is past every spent one,
+        // so a stale clear holding the cleared row's token cannot remove the new URL.
+        match store.clear_qdrant_url(second.token).await.expect("clear") {
+            CasOutcome::Applied(None) => {}
+            other => panic!("a clear by the current token: {other:?}"),
+        }
+        let fourth = match store
+            .set_qdrant_url(&url("http://fourth:6334"), None)
+            .await
+            .expect("insert after a clear")
+        {
+            CasOutcome::Applied(Some(row)) => row,
+            other => panic!("insert after a clear: {other:?}"),
+        };
+        assert!(fourth.token > second.token, "{fourth:?} after {second:?}");
+        match store
+            .clear_qdrant_url(second.token)
+            .await
+            .expect("stale clear")
+        {
+            CasOutcome::Stale(Some(row)) => assert_eq!(row, fourth),
+            other => panic!("the cleared row's token clears nothing: {other:?}"),
+        }
+        assert_eq!(
+            store.qdrant_url().await.expect("read"),
+            Some(fourth),
+            "the new URL survives the stale clear"
+        );
     }
 
     /// MOD-76 D4 (R-55): `set_box_setting` writes the key on every clone's row, leaves the

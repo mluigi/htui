@@ -11,8 +11,9 @@ pub const QDRANT_URL_KEY: &str = "qdrant_url";
 
 /// A Qdrant base URL that passed D2: trimmed; `http://` or `https://` (ASCII case-insensitive,
 /// stored lowercase); a non-empty host, either a name of letters, digits, `-._~` and `%XX` escapes
-/// or a bracketed IPv6 literal (with an optional `%25` zone id); an optional port 1..=65535; an optional path; no userinfo, query, fragment, and no
-/// character outside printable ASCII (whitespace, control and format characters included).
+/// or a bracketed IPv6 literal (with an optional `%25` zone id); an optional port 1..=65535; an
+/// optional path; no userinfo, query, fragment, and no character outside printable ASCII
+/// (whitespace, control and format characters included).
 /// Not secret: `Debug`/`Display` print it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct QdrantUrl(String);
