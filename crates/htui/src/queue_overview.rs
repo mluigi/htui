@@ -413,7 +413,7 @@ mod tests {
         // Fixture items (MOD-144: their states come from the demo's runs): FEAT-1 (priority 2,
         // running its rework RUN_4 here), FEAT-3 (priority 1, RUN_2 queued here), ANA-1 (done,
         // RUN_3), ANA-2 (open, ready), FEAT-2 (blocked, no run), TOOL-1 (needs you, the
-        // judge-parked RUN_5), CLEAN-1 (failed, RUN_6).
+        // stepless awaiting_approval RUN_5), CLEAN-1 (failed, RUN_6).
         let tool_run = ids::RUN_5;
         push_note(
             &mut data,
