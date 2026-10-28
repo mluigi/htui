@@ -281,14 +281,14 @@ impl<'a> Ask<'a> {
         }
         let content = modal.render(frame, area, theme);
 
-        let mut rows: Vec<Line<'_>> = Vec::new();
+        let mut question: Vec<Line<'_>> = Vec::new();
         for line in &self.lines {
-            rows.extend(wrap_line(line, content.width));
+            question.extend(wrap_line(line, content.width));
         }
+        // The input row, then the error's rows: what the question gives way to on a screen too
+        // short for all of them.
+        let mut tail: Vec<Line<'_>> = Vec::new();
         if let Some((prompt, field)) = self.input {
-            if !rows.is_empty() {
-                rows.push(Line::default());
-            }
             let prompt_w = u16::try_from(cells::cell_width(prompt)).unwrap_or(u16::MAX);
             let mut spans = vec![Span::styled(prompt, theme.title)];
             spans.extend(
@@ -296,21 +296,72 @@ impl<'a> Ask<'a> {
                     .line(content.width.saturating_sub(prompt_w), true, theme)
                     .spans,
             );
-            rows.push(Line::from(spans));
+            tail.push(Line::from(spans));
         }
         if let Some(error) = self.error.as_deref() {
-            rows.extend(
+            tail.extend(
                 wrapped(error, usize::from(content.width))
                     .into_iter()
                     .map(|row| Line::styled(row, theme.error)),
             );
         }
+        let gap = self.input.is_some() && !question.is_empty();
+        let rows = fit_rows(question, gap, tail, content);
         let buffer = frame.buffer_mut();
         for (line, y) in rows.iter().zip(content.y..content.bottom()) {
             buffer.set_line(content.x, y, line, content.width);
         }
         content
     }
+}
+
+/// The rows an [`Ask`] draws in `content`: the `question`, a blank row when `gap`, then the
+/// `tail` (the input row and the error). When they do not all fit, the blank row goes first,
+/// then the question is cut, its last row shown ending in `…`; on a screen with room for less
+/// than the tail, the tail's first rows (the input first) are what stays.
+fn fit_rows<'l>(
+    mut question: Vec<Line<'l>>,
+    gap: bool,
+    mut tail: Vec<Line<'l>>,
+    content: Rect,
+) -> Vec<Line<'l>> {
+    let height = usize::from(content.height);
+    let mut rows = Vec::with_capacity(height);
+    if question.len() + usize::from(gap) + tail.len() <= height {
+        rows.append(&mut question);
+        if gap {
+            rows.push(Line::default());
+        }
+        rows.append(&mut tail);
+        return rows;
+    }
+    tail.truncate(height);
+    let room = height - tail.len();
+    if question.len() > room {
+        question.truncate(room);
+        if let Some(last) = question.last_mut() {
+            *last = ellipsised(last, content.width);
+        }
+    }
+    rows.append(&mut question);
+    rows.append(&mut tail);
+    rows
+}
+
+/// `line` as one row of at most `width` cells ending in `…`: the mark that the rows after it
+/// were cut. Drawn in its line style patched with its first span's, like a wrapped row.
+fn ellipsised<'l>(line: &Line<'l>, width: u16) -> Line<'l> {
+    let style = line
+        .spans
+        .first()
+        .map_or(line.style, |span| line.style.patch(span.style));
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    let text = format!("{}\u{2026}", text.trim_end());
+    Line::styled(cells::clip(&text, usize::from(width)), style)
 }
 
 /// The cells `line` takes, measured as `ratatui` draws them.
@@ -812,6 +863,56 @@ mod tests {
         assert!(outer.x >= 2 && outer.right() <= 28, "{outer:?}");
         assert!(outer.y >= 1 && outer.bottom() <= 9, "{outer:?}");
         assert_eq!(content.width, 30 - 4 - CHROME);
+    }
+
+    /// On a screen too short for the whole question, the input and the error stay on screen:
+    /// the blank row goes first, then the question is cut, its last row ending in `…`.
+    #[test]
+    fn a_short_screen_cuts_the_question_and_keeps_the_input_and_the_error() {
+        let theme = Theme::default();
+        let field = TextField::with_text("FEAT-1");
+        let question = "word ".repeat(60);
+        let ask = Ask::new("Close out")
+            .line(question.trim_end().to_owned())
+            .input("key ", &field)
+            .error("That is not this item's key.");
+        let (content, buffer) = draw_ask(ask, 60, 8, &theme);
+        assert_eq!(content.height, 4);
+        let rows: Vec<String> = (content.y..content.bottom())
+            .map(|y| text_in(&buffer, content, y).trim_end().to_owned())
+            .collect();
+        assert!(rows[0].starts_with("word word"), "{rows:?}");
+        assert!(rows[1].ends_with('…'), "the cut is marked: {rows:?}");
+        assert!(rows[2].starts_with("key FEAT-1"), "{rows:?}");
+        assert_eq!(rows[3], "That is not this item's key.");
+        assert_eq!(
+            buffer[(content.x, content.bottom() - 1)].fg,
+            theme.error.fg.unwrap_or_default()
+        );
+        // Whole question and the input fit once the blank row goes: nothing is cut.
+        let field = TextField::with_text("x");
+        let ask = Ask::new("Q").line("one").line("two").input("> ", &field);
+        let (content, buffer) = draw_ask(ask, 40, 7, &theme);
+        assert_eq!(content.height, 3);
+        let rows: Vec<String> = (content.y..content.bottom())
+            .map(|y| text_in(&buffer, content, y).trim_end().to_owned())
+            .collect();
+        assert_eq!(rows[0], "one");
+        assert_eq!(rows[1], "two");
+        assert!(rows[2].starts_with("> x"), "{rows:?}");
+        // Room for the input alone: the input it is.
+        let field = TextField::with_text("FEAT-1");
+        let ask = Ask::new("Q")
+            .line("A question.")
+            .input("key ", &field)
+            .error("bad");
+        let (content, buffer) = draw_ask(ask, 40, 5, &theme);
+        assert_eq!(content.height, 1);
+        assert!(
+            text_in(&buffer, content, content.y).starts_with("key FEAT-1"),
+            "{:?}",
+            text_in(&buffer, content, content.y)
+        );
     }
 
     #[test]
