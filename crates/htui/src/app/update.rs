@@ -588,8 +588,22 @@ impl App {
                 ConnectionSection::ID,
             )));
         }
+
+        // MOD-158 D10: this box's keyring still holds the retired Qdrant URL. Said once per launch,
+        // for `below_target_shown`'s reason; the offer itself is the section's row.
+        if let StoreReply::Qdrant(snapshot) = reply
+            && snapshot.old_url.is_some()
+            && !self.qdrant_offer_noted
+        {
+            self.qdrant_offer_noted = true;
+            self.status = Some(QDRANT_OFFER_NOTICE.to_owned());
+        }
     }
 }
+
+/// The status line's old-URL sentence (MOD-158 D10).
+pub(crate) const QDRANT_OFFER_NOTICE: &str = "this box's keyring holds an old Qdrant URL; Settings > \
+                                              Qdrant offers to use it for every box or discard it";
 
 /// The status line's below-the-target sentence (MOD-40 plan D9).
 fn below_target_notice(target: &str) -> String {
@@ -1120,6 +1134,77 @@ mod tests {
             app.status, None,
             "said once per session, not every fourth tick"
         );
+    }
+
+    /// The `QdrantInfo` request `start` sent, if any: its `seq`.
+    fn qdrant_info_seq(rx: &mut UnboundedReceiver<RequestEnvelope>) -> Option<u64> {
+        let mut found = None;
+        while let Ok(envelope) = rx.try_recv() {
+            if matches!(envelope.request, StoreRequest::QdrantInfo) {
+                assert_eq!(envelope.origin, Origin::App, "the shell's own read");
+                found = Some(envelope.seq);
+            }
+        }
+        found
+    }
+
+    /// A Qdrant snapshot addressed to the shell, with or without an old keyring URL.
+    fn qdrant_reply(seq: u64, old_url: bool) -> ReplyEnvelope {
+        let mut snapshot = crate::qdrant_settings_info::QdrantSnapshot::not_applicable();
+        snapshot.url = crate::qdrant_settings_info::UrlRowState::NotSet;
+        if old_url {
+            snapshot.old_url = Some(crate::qdrant_settings_info::OldUrl::Usable(
+                htui_core::qdrant::QdrantUrl::parse("http://old.example:6334").expect("valid"),
+            ));
+        }
+        ReplyEnvelope {
+            seq,
+            origin: Origin::App,
+            reply: StoreReply::Qdrant(snapshot),
+        }
+    }
+
+    /// MOD-158 D10, blueprint P-6: `start` asks for the Qdrant snapshot only once `register_all`
+    /// has run, as the binary does; a bare shell (every test harness) never reads a keyring for it.
+    #[test]
+    fn start_asks_for_the_offer_only_after_register_all() {
+        let (mut app, mut rx, _seen) = shell();
+        app.start();
+        assert_eq!(qdrant_info_seq(&mut rx), None, "a bare shell asks nothing");
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        crate::app::register_all(&mut app);
+        app.start();
+        assert!(
+            qdrant_info_seq(&mut rx).is_some(),
+            "after register_all, start asks"
+        );
+    }
+
+    /// MOD-158 D10: an old keyring URL is said once per launch on the status line, and a snapshot
+    /// without one says nothing.
+    #[test]
+    fn the_qdrant_offer_is_said_once_per_launch() {
+        let (mut app, mut rx, _seen) = shell();
+        app.qdrant_offer_check = true;
+        app.start();
+        let seq = qdrant_info_seq(&mut rx).expect("start asked");
+
+        app.update(Action::Reply(qdrant_reply(seq, false)));
+        assert_eq!(app.status, None, "no old URL, no notice");
+
+        app.update(Action::Reply(qdrant_reply(seq, true)));
+        assert_eq!(app.status.as_deref(), Some(QDRANT_OFFER_NOTICE));
+        assert!(
+            QDRANT_OFFER_NOTICE.contains("Settings > Qdrant"),
+            "{QDRANT_OFFER_NOTICE}"
+        );
+
+        app.on_key(KeyEvent::from(KeyCode::Char('x')));
+        assert_eq!(app.status, None, "the next key clears it");
+        app.update(Action::Reply(qdrant_reply(seq, true)));
+        assert_eq!(app.status, None, "said once per launch");
     }
 
     /// MOD-4 plan D165: the promotion is asked for on the chat-driving tab's behalf, so its replies

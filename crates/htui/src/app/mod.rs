@@ -61,6 +61,8 @@ use crate::ui::tabs::{BacklogTab, ChatTab, RequirementsTab, SettingsTab, SkillsT
 /// 10. The leave dialog's factory goes in and it is named as the leave overlay (MOD-115 M2 D6,
 ///     `R-TUI-18`; it replaced MOD-57 M2 E4's quit question): `global.quit` (`q`, `ctrl-c`)
 ///     opens it on every screen, and its `leave.confirm` (`Enter`, a second `ctrl-c`) leaves.
+/// 11. `App::start` is told to ask for the Qdrant snapshot, so an old keyring Qdrant URL is said
+///     once on the status line (MOD-158 D10).
 ///
 /// Calling this twice would stack a second switcher; the shell calls it exactly once, between
 /// [`App::new`] and [`App::start`].
@@ -144,4 +146,7 @@ pub fn register_all(app: &mut App) {
         (RevealKind::Item, BacklogTab::ID),
         (RevealKind::Requirement, RequirementsTab::ID),
     ];
+    // MOD-158 D10 (blueprint P-6): `App::start` asks whether this box's keyring holds the old
+    // Qdrant URL, so the status line can say once that Settings > Qdrant offers it.
+    app.qdrant_offer_check = true;
 }
