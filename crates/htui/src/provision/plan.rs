@@ -19,6 +19,9 @@ pub struct LocalFacts {
     pub arch: String,
     /// Lowercase hex sha256 of the payload.
     pub sha: String,
+    /// This box's keyring holds a Qdrant API key, which INSTALL sends beside the DSN (MOD-158
+    /// D11).
+    pub qdrant_key: bool,
 }
 
 /// `decide`'s answer.
@@ -43,7 +46,8 @@ pub const MIN_SYSTEMD: u32 = 250;
 /// D300, in order: refusals (OS, architecture, systemd, `systemd-creds`, sudo), a running
 /// `htui-worker` from a unit htui did not write (review finding 6), the different-build refusal,
 /// already provisioned, no `sha256sum` to check the upload with (review finding 11), a password
-/// sudo whose `sh` has no `printf` builtin (review finding 5), else the steps.
+/// sudo whose `sh` has no `printf` builtin (review finding 5), then a Qdrant API key to send there
+/// (MOD-158 D11), else the steps.
 #[must_use]
 pub fn decide(facts: &Facts, local: &LocalFacts, replace_credential: bool) -> Decision {
     let refuse = Decision::Refuse;
@@ -120,6 +124,14 @@ pub fn decide(facts: &Facts, local: &LocalFacts, replace_credential: bool) -> De
             "the remote sh has no printf builtin (as in posh or mksh), so sending the sudo \
              password would put it in a process's arguments; configure NOPASSWD for this user \
              instead"
+                .to_owned(),
+        );
+    }
+    if local.qdrant_key && !facts.printf_builtin {
+        return refuse(
+            "the remote sh has no printf builtin (as in posh or mksh), so sending the Qdrant API \
+             key would put it in a process's arguments; remove this box's key (`htui \
+             --clear-qdrant-key`), provision, then encrypt it on the host by hand"
                 .to_owned(),
         );
     }
@@ -215,6 +227,12 @@ mod tests {
                                    sending the sudo password would put it in a process's \
                                    arguments; configure NOPASSWD for this user instead";
 
+    /// MOD-158 T6: the Qdrant API key is handed to `printf` too.
+    const PRINTF_KEY: &str = "the remote sh has no printf builtin (as in posh or mksh), so sending \
+                              the Qdrant API key would put it in a process's arguments; remove \
+                              this box's key (`htui --clear-qdrant-key`), provision, then encrypt \
+                              it on the host by hand";
+
     /// Review finding 11, verify round 1.
     const NO_SHA256SUM: &str = "the remote host has no sha256sum on its PATH (coreutils); \
                                 provisioning checks the upload with it";
@@ -252,6 +270,15 @@ mod tests {
         LocalFacts {
             arch: arch.into(),
             sha: SHA.into(),
+            qdrant_key: false,
+        }
+    }
+
+    /// This box's keyring holds a Qdrant API key (MOD-158 D11).
+    fn keyed() -> LocalFacts {
+        LocalFacts {
+            qdrant_key: true,
+            ..local("x86_64")
         }
     }
 
@@ -585,6 +612,71 @@ mod tests {
                 x86,
                 false,
                 steps(false, SudoMode::Password),
+            ),
+            (
+                "a key, builtin printf",
+                Facts {
+                    sudo: Some(SudoMode::NoPassword),
+                    ..fresh()
+                },
+                keyed(),
+                false,
+                steps(true, SudoMode::NoPassword),
+            ),
+            (
+                "a key, external printf, nopasswd",
+                Facts {
+                    printf_builtin: false,
+                    sudo: Some(SudoMode::NoPassword),
+                    ..fresh()
+                },
+                keyed(),
+                false,
+                refuse(PRINTF_KEY),
+            ),
+            (
+                "a key, external printf, password sudo: the password sentence",
+                Facts {
+                    printf_builtin: false,
+                    ..fresh()
+                },
+                keyed(),
+                false,
+                refuse(PRINTF_EXTERNAL),
+            ),
+            (
+                "a key, external printf, already provisioned",
+                Facts {
+                    printf_builtin: false,
+                    sudo: Some(SudoMode::NoPassword),
+                    ..provisioned()
+                },
+                keyed(),
+                false,
+                Decision::AlreadyProvisioned,
+            ),
+            (
+                "a key, external printf, replace credential",
+                Facts {
+                    printf_builtin: false,
+                    sudo: Some(SudoMode::NoPassword),
+                    ..provisioned()
+                },
+                keyed(),
+                true,
+                refuse(PRINTF_KEY),
+            ),
+            (
+                "a key, no sha256sum and external printf: sha256sum first",
+                Facts {
+                    sha256sum: false,
+                    printf_builtin: false,
+                    sudo: Some(SudoMode::NoPassword),
+                    ..fresh()
+                },
+                keyed(),
+                false,
+                refuse(NO_SHA256SUM),
             ),
         ];
         for (name, facts, local, replace, expected) in rows {
