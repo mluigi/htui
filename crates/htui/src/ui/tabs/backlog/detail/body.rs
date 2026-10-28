@@ -73,7 +73,7 @@ impl BodyTab {
         let latest = self
             .runs
             .as_deref()
-            .and_then(|runs| latest_graph_run(runs))
+            .and_then(latest_graph_run)
             .map(|run| run.status);
         ItemState::of(item.status, latest)
     }
