@@ -2176,6 +2176,142 @@ mod tests {
             );
         }
     }
+
+    /// A shell with no tab registered, about off, the `?` box up when `help`.
+    fn bare_app(help: bool) -> App {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        app.about_visible = false;
+        app.help_visible = help;
+        app
+    }
+
+    /// The rows the `?` box of a bare shell holds at `width` columns: the global keys packed
+    /// to today's content width (`width - 12`, at least 18), then the closer.
+    fn help_rows(app: &App, width: u16) -> Vec<String> {
+        let inner = usize::from(width.saturating_sub(10).max(20).saturating_sub(2));
+        let mut rows: Vec<String> = app
+            .keys
+            .help_line(Context::Global, |act| app.offers(act))
+            .iter()
+            .flat_map(|line| line.rows(inner))
+            .collect();
+        rows.extend(app.keys.help_closer(crate::keys::Stack::BASE));
+        rows
+    }
+
+    /// The top-left corner of the box titled `title` in `buf`: the `╭` a ` {title} ` follows.
+    fn box_corner(buf: &Buffer, title: &str) -> Option<(u16, u16)> {
+        let title = format!(" {title} ");
+        (0..buf.area.height).find_map(|y| {
+            let row: Vec<&str> = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            (0..row.len()).find_map(|x| {
+                let follows: String = row[x + 1..].concat();
+                (row[x] == "\u{256d}" && follows.starts_with(&title))
+                    .then(|| (u16::try_from(x).expect("x fits"), y))
+            })
+        })
+    }
+
+    /// The text of `buf` from `(x, y)`, `len` cells.
+    fn cells_at(buf: &Buffer, x: u16, y: u16, len: u16) -> String {
+        (x..x + len).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    /// MOD-115 M4 E7 (blueprint §3.3): the `?` box is the kit's help box, rounded and titled
+    /// `Keys`, and packs its rows as before: the content is `width - 12` wide (the box one
+    /// column wider than the old one, for the kit's padding), so a line that fitted still fits,
+    /// no row re-wraps and none is clipped, at every width.
+    #[test]
+    fn the_help_box_is_the_kit_help_box_and_packs_as_before() {
+        for width in [40_u16, 60, 80, 100, 140] {
+            let mut app = bare_app(true);
+            let buf = super::shell_tests::draw(&mut app, width, 30);
+            let (x, y) = box_corner(&buf, "Keys").expect("a rounded box titled Keys");
+            let content = width.saturating_sub(10).max(20).saturating_sub(2);
+            let right = x + content + 2;
+            assert_eq!(
+                buf[(right, y)].symbol(),
+                "\u{256e}",
+                "{width}: the box is the content and the kit's chrome wide"
+            );
+            let rows = help_rows(&app, width);
+            for (i, expected) in rows.iter().enumerate() {
+                let at = y + 1 + u16::try_from(i).expect("rows fit");
+                let drawn = cells_at(&buf, x + 1, at, content);
+                assert_eq!(drawn.trim_end(), expected, "{width}: row {i} as packed");
+                assert_eq!(buf[(right, at)].symbol(), "\u{2502}", "{width}: row {i}");
+            }
+            let bottom = y + 1 + u16::try_from(rows.len()).expect("rows fit");
+            assert_eq!(
+                buf[(x, bottom)].symbol(),
+                "\u{2570}",
+                "{width}: the box is exactly as tall as its rows"
+            );
+        }
+    }
+
+    /// The `?` box's closer stays dim, its key rows the base role (MOD-67 D8).
+    #[test]
+    fn the_help_box_closer_is_dim() {
+        let theme = crate::ui::Theme::default();
+        let mut app = bare_app(true);
+        let buf = super::shell_tests::draw(&mut app, 80, 24);
+        let (x, y) = box_corner(&buf, "Keys").expect("the box");
+        let rows = help_rows(&app, 80);
+        let closer = y + u16::try_from(rows.len()).expect("rows fit");
+        let mut dim = ratatui::buffer::Cell::EMPTY;
+        dim.set_style(theme.dim);
+        let cell = &buf[(x + 1, closer)];
+        assert_eq!(
+            (cell.fg, cell.modifier),
+            (dim.fg, dim.modifier),
+            "the closer"
+        );
+        let mut base = ratatui::buffer::Cell::EMPTY;
+        base.set_style(theme.base);
+        let cell = &buf[(x + 1, y + 1)];
+        assert_eq!(
+            (cell.fg, cell.modifier),
+            (base.fg, base.modifier),
+            "a key row"
+        );
+    }
+
+    /// MOD-115 M4 E7: the `?` box over a bare shell at 80 columns.
+    #[test]
+    fn the_help_box_at_80_columns() {
+        let mut app = bare_app(true);
+        let buf = super::shell_tests::draw(&mut app, 80, 24);
+        let frame: String = (0..buf.area.height)
+            .map(|y| super::shell_tests::row(&buf, y).trim_end().to_owned() + "\n")
+            .collect();
+        insta::assert_snapshot!("the_help_box_80", frame);
+    }
+
+    /// MOD-115 M4 E7: with no tab registered the body is a kit pane holding an empty state
+    /// that says what is missing and what brings it.
+    #[test]
+    fn the_no_tab_body_is_an_empty_state_with_a_next_step() {
+        let mut app = bare_app(false);
+        let buf = super::shell_tests::draw(&mut app, 80, 24);
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| super::shell_tests::row(&buf, y))
+            .collect();
+        let corner = rows
+            .iter()
+            .position(|row| row.starts_with('\u{256d}'))
+            .expect("the body is a rounded kit pane");
+        let what = rows
+            .iter()
+            .position(|row| row.contains("No tab is registered."))
+            .expect("what is missing");
+        assert!(what > corner, "inside the pane");
+        assert!(
+            rows[what + 1].contains("a tab registered at start shows here"),
+            "the next step under it: {rows:#?}"
+        );
+    }
 }
 
 /// MOD-115 M2 T6: the shell's panes (render), focus, layout, history and mouse, over a list +

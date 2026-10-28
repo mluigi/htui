@@ -192,6 +192,46 @@ mod tests {
         cell
     }
 
+    /// MOD-115 M4 E7 (C6, D-14): the editor's frame is the kit's titled rule, cell for cell and
+    /// style for style, focused or not, at a width that clips the title and one that does not;
+    /// the screen starts on the row under it.
+    #[test]
+    fn the_frame_is_the_kit_titled_rule() {
+        let parser = parser(3, 30, b"top");
+        let theme = Theme::default();
+        for (width, title, focused) in [
+            (30, FOCUSED, true),
+            (30, UNFOCUSED, false),
+            (10, FOCUSED, true),
+        ] {
+            let area = Rect::new(0, 0, width, 4);
+            let mut editor = Terminal::new(TestBackend::new(width, 4)).expect("a test backend");
+            draw(&mut editor, area, parser.screen(), title, focused);
+            let mut kit = Terminal::new(TestBackend::new(width, 4)).expect("a test backend");
+            kit.draw(|frame| {
+                let under = crate::ui::kit::rule::render(frame, area, title, focused, &theme);
+                assert_eq!(under, Rect::new(0, 1, width, 3), "the rows under the rule");
+            })
+            .expect("the rule draws");
+            for x in 0..width {
+                let (drawn, rule) = (
+                    &editor.backend().buffer()[(x, 0)],
+                    &kit.backend().buffer()[(x, 0)],
+                );
+                assert_eq!(
+                    (drawn.symbol(), drawn.fg, drawn.bg, drawn.modifier),
+                    (rule.symbol(), rule.fg, rule.bg, rule.modifier),
+                    "{width} columns, focused {focused}: column {x}"
+                );
+            }
+            assert_eq!(
+                editor.backend().buffer()[(0, 1)].symbol(),
+                "t",
+                "the screen under it"
+            );
+        }
+    }
+
     #[test]
     fn the_screen_is_copied_cell_by_cell() {
         let parser = parser(6, 20, MIXED);
