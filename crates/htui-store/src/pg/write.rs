@@ -76,8 +76,8 @@ use htui_core::store::{
 };
 use htui_core::store::{
     body_agent_refs, body_persona_refs, edge_predicate, graph_body_shape_refusal,
-    graph_body_topology_refusal, graph_name_is_taken, override_outside_project,
-    phase_name_is_taken, phase_position_is_taken, phase_row_refusal,
+    graph_body_topology_refusal, graph_body_walk_refusal, graph_name_is_taken,
+    override_outside_project, phase_name_is_taken, phase_position_is_taken, phase_row_refusal,
 };
 use serde_json::Value;
 use sqlx::types::Json;
@@ -4237,8 +4237,11 @@ impl WriteStore for PgStore {
             )));
         }
 
-        // 6. Topology and the node CHECKs.
+        // 6. Topology and the node CHECKs, then MOD-138 D9's shared walk validator.
         if let Some(refusal) = graph_body_topology_refusal(graph, &body) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        if let Some(refusal) = graph_body_walk_refusal(graph, &body) {
             return Err(StoreError::Constraint(refusal));
         }
 

@@ -61,7 +61,7 @@ use crate::seed;
 use crate::store::error::{Result, StoreError};
 use crate::store::graph_rules::{
     body_agent_refs, body_persona_refs, edge_predicate, graph_body_shape_refusal,
-    graph_body_topology_refusal, phase_row_refusal,
+    graph_body_topology_refusal, graph_body_walk_refusal, phase_row_refusal,
 };
 use crate::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
@@ -3978,6 +3978,10 @@ impl State {
             )));
         }
         if let Some(refusal) = graph_body_topology_refusal(graph, &body) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        // MOD-138 D9: the shared walk validator, straight after the topology rules.
+        if let Some(refusal) = graph_body_walk_refusal(graph, &body) {
             return Err(StoreError::Constraint(refusal));
         }
 

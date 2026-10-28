@@ -25,7 +25,8 @@ use htui_core::model::{
 use htui_core::model::{GraphScope, ItemFilter, Scope, WorkspaceId};
 use htui_core::store::{
     BindingFacts, CasOutcome, Result, StoreError, UpdateOutcome, WriteStore, check_attachment,
-    graph_body_shape_refusal, graph_body_topology_refusal, references_no_row,
+    graph_body_shape_refusal, graph_body_topology_refusal, graph_body_walk_refusal,
+    references_no_row,
 };
 use serde_json::Value;
 
@@ -465,8 +466,8 @@ fn frozen_persona(
 /// fresh edge ids (MOD-137 D13), so the clone is deep over `step_graph_phase`, `phase_agent`,
 /// `phase_part`, `step_graph_edge` and the phase attachments alike. All of it but the attachments
 /// is written by one [`WriteStore::replace_graph`] (revision 0 → 1 on a first override), whose
-/// pure refusals ([`graph_body_shape_refusal`], [`graph_body_topology_refusal`]) are decided before
-/// the graph row is created.
+/// pure refusals ([`graph_body_shape_refusal`], [`graph_body_topology_refusal`],
+/// [`graph_body_walk_refusal`]) are decided before the graph row is created.
 ///
 /// What a failure after that leaves: the `<key>-override` graph row, which no item names yet —
 /// empty when `replace_graph` refused it (a stale revision, a persona or agent row gone),
@@ -696,11 +697,12 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
     };
     body.graph.name.clone_from(&name);
     body.graph.description.clone_from(&description);
-    // `replace_graph`'s pure refusals (shape, then topology), decided on the body before the graph
-    // row is created, as D96 decides the attachments: a body the store would refuse leaves no
-    // orphan behind (review C-M1).
+    // `replace_graph`'s pure refusals (shape, then topology, then MOD-138 D9's walk), decided on
+    // the body before the graph row is created, as D96 decides the attachments: a body the store
+    // would refuse leaves no orphan behind (review C-M1).
     if let Some(sentence) = graph_body_shape_refusal(target_id, &body)
         .or_else(|| graph_body_topology_refusal(target_id, &body))
+        .or_else(|| graph_body_walk_refusal(target_id, &body))
     {
         return Err(ResolveError::Store(StoreError::Constraint(sentence)));
     }

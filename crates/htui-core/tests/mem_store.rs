@@ -34,7 +34,7 @@ async fn demo_store_loads_the_fixture() {
     );
     assert_eq!(
         conformance::CASES.len(),
-        206,
+        210,
         "B.9's fifteen cases, MOD-2's five store-seam cases (plan D3), milestone 7's two quota \
          cases (plans D67 and D74), milestone 9's `set_step_prompt`, MOD-15 milestone 1's \
          twelve, one per entity group (plan D12), milestone 2's seed case (plan D7), MOD-4 \
@@ -70,7 +70,8 @@ async fn demo_store_loads_the_fixture() {
          settlement (plan D6) and one for a deleted workspace (blueprint F16), and MOD-137's \
          eighteen for the graph v2 writers and reads (plan D3-D11) and its review round's one \
          for a kept node's candidate and part slots (plan D10), MOD-146's two project type \
-         cases (plan D7) and MOD-163 M1's ten memory cases (plan D4, D6, D8)"
+         cases (plan D7), MOD-163 M1's ten memory cases (plan D4, D6, D8) and MOD-138 M1's \
+         four for the walk validator (plan D9)"
     );
     assert_eq!(
         conformance::READ_CASES.len(),

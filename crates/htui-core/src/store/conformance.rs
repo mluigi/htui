@@ -71,6 +71,7 @@ use crate::store::traits::{
     parts_off_divide, persona_is_bound, phase_position_is_taken, phase_token_budget_refusal,
     reserved_phase_name, retry_limit_negative, split_fan_out_mismatch,
 };
+use crate::store::traits::{forward_edges_form_a_cycle, loop_edge_runs_forward};
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
 pub const CASES: &[&str] = &[
@@ -270,6 +271,11 @@ pub const CASES: &[&str] = &[
     "create_phase_keeps_split_in_step_with_fan_out",
     // MOD-137 review round 1 (B-L4)
     "replace_graph_replaces_candidates_and_parts_by_position",
+    // MOD-138 M1: the walk validator (plan D9, blueprint §T2)
+    "replace_graph_refuses_a_forward_cycle",
+    "replace_graph_refuses_a_forward_changes_requested",
+    "replace_graph_refuses_a_forward_fails",
+    "replace_graph_accepts_an_asks_you_back_edge",
     "project_types_are_the_six_builtins",
     "a_new_project_is_software",
     "memory_create_writes_the_row_and_revision_1",
@@ -878,6 +884,18 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
                 store,
             ))
             .await;
+        }
+        "replace_graph_refuses_a_forward_cycle" => {
+            Box::pin(replace_graph_refuses_a_forward_cycle(store)).await;
+        }
+        "replace_graph_refuses_a_forward_changes_requested" => {
+            Box::pin(replace_graph_refuses_a_forward_changes_requested(store)).await;
+        }
+        "replace_graph_refuses_a_forward_fails" => {
+            Box::pin(replace_graph_refuses_a_forward_fails(store)).await;
+        }
+        "replace_graph_accepts_an_asks_you_back_edge" => {
+            Box::pin(replace_graph_accepts_an_asks_you_back_edge(store)).await;
         }
         "project_types_are_the_six_builtins" => {
             project_types_are_the_six_builtins(store).await;
@@ -22348,9 +22366,9 @@ async fn replace_graph_refuses_parts_on_a_non_divide_node<S: WriteStore>(store: 
 
 /// MOD-137 D10: the refusal order, both stores, one sentence each (blueprint §T3.1, §T3.2). One
 /// body breaks every rule, the graph name and a foreign phase and edge id among them, so shape <
-/// name < foreign id < persona < agent < topology is pinned; each call mends one and expects
-/// exactly the next sentence. Then the node CHECKs a kept node trips alone. The revision never
-/// moves until the mended body is applied.
+/// name < foreign id < persona < agent < topology < walk (MOD-138 D9, blueprint §T2) is pinned;
+/// each call mends one and expects exactly the next sentence. Then the node CHECKs a kept node
+/// trips alone. The revision never moves until the mended body is applied.
 async fn replace_graph_refusal_order<S: WriteStore>(store: &S) {
     const CASE: &str = "replace_graph_refusal_order";
     let (graph, phases) = scratch_graph(CASE, store, "ordered", &["plan", "build", "review"]).await;
@@ -22392,6 +22410,12 @@ async fn replace_graph_refusal_order<S: WriteStore>(store: &S) {
             ..graph_edge(graph, build, plan, EdgeKind::AsksYou)
         },
     ];
+    // MOD-138 D9: a forward cycle (W1) and a forward `fails` (W3), after `into_palette` in body
+    // order, so the palette rule (topology e) still names `into_palette` first.
+    let cycle = graph_edge(graph, build, plan, EdgeKind::Next);
+    let forward_fails = graph_edge(graph, plan, phases[2].id, EdgeKind::Fails);
+    let (cycle_id, forward_fails_id) = (cycle.id, forward_fails.id);
+    body.edges.extend([cycle, forward_fails]);
     body.nodes[2].phase.fan_out = 2;
     body.nodes[2].phase.retry_limit = -1;
     body.nodes[1].phase.palette = true;
@@ -22452,6 +22476,14 @@ async fn replace_graph_refusal_order<S: WriteStore>(store: &S) {
             parts_off_divide("plan", Split::None),
             Box::new(|b: &mut GraphBody| b.nodes[0].parts.clear()),
         ),
+        (
+            forward_edges_form_a_cycle(&["plan", "build", "plan"], graph),
+            Box::new(move |b: &mut GraphBody| b.edges.retain(|edge| edge.id != cycle_id)),
+        ),
+        (
+            loop_edge_runs_forward(EdgeKind::Fails, "plan", "review", graph),
+            Box::new(move |b: &mut GraphBody| b.edges.retain(|edge| edge.id != forward_fails_id)),
+        ),
     ];
     for (sentence, mend) in steps {
         constraint_exactly(
@@ -22497,6 +22529,125 @@ async fn replace_graph_refusal_order<S: WriteStore>(store: &S) {
         answer.graph.revision,
         revision + 1,
         "{CASE}: the mended body was the last refusal"
+    );
+}
+
+/// MOD-138 D9 (W1): `next` edges closing `plan → build → review` back to `plan` are a forward
+/// cycle; nothing is written and the revision does not move.
+async fn replace_graph_refuses_a_forward_cycle<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_refuses_a_forward_cycle";
+    let (graph, phases) = scratch_graph(CASE, store, "cyclic", &["plan", "build", "review"]).await;
+    let before = body_now(CASE, store, graph).await;
+    let (plan, build, review) = (phases[0].id, phases[1].id, phases[2].id);
+    let mut written = before.clone();
+    written.edges = vec![
+        graph_edge(graph, plan, build, EdgeKind::Next),
+        graph_edge(graph, build, review, EdgeKind::Next),
+        graph_edge(graph, review, plan, EdgeKind::Next),
+    ];
+    constraint_exactly(
+        CASE,
+        store
+            .replace_graph(graph, before.graph.revision, written)
+            .await,
+        &forward_edges_form_a_cycle(&["plan", "build", "review", "plan"], graph),
+        "a cycle of `next` edges",
+    );
+    assert_eq!(
+        body_now(CASE, store, graph).await,
+        before,
+        "{CASE}: nothing written, the revision unchanged"
+    );
+}
+
+/// MOD-138 D9 (W3): a `kind` edge `plan → review` with no forward path from `review` back to
+/// `plan` runs forward; nothing is written.
+async fn refuse_a_forward_loop_edge<S: WriteStore>(case: &str, store: &S, kind: EdgeKind) {
+    let (graph, phases) = scratch_graph(case, store, "forward", &["plan", "build", "review"]).await;
+    let before = body_now(case, store, graph).await;
+    let (plan, build, review) = (phases[0].id, phases[1].id, phases[2].id);
+    let mut written = before.clone();
+    written.edges = vec![
+        graph_edge(graph, plan, build, EdgeKind::Next),
+        graph_edge(graph, build, review, EdgeKind::Next),
+        graph_edge(graph, plan, review, kind),
+    ];
+    constraint_exactly(
+        case,
+        store
+            .replace_graph(graph, before.graph.revision, written)
+            .await,
+        &loop_edge_runs_forward(kind, "plan", "review", graph),
+        "a loop edge that runs forward",
+    );
+    assert_eq!(
+        body_now(case, store, graph).await,
+        before,
+        "{case}: nothing written, the revision unchanged"
+    );
+}
+
+/// MOD-138 D9 (W3): a forward `changes_requested` edge.
+async fn replace_graph_refuses_a_forward_changes_requested<S: WriteStore>(store: &S) {
+    Box::pin(refuse_a_forward_loop_edge(
+        "replace_graph_refuses_a_forward_changes_requested",
+        store,
+        EdgeKind::ChangesRequested,
+    ))
+    .await;
+}
+
+/// MOD-138 D9 (W3): a forward `fails` edge.
+async fn replace_graph_refuses_a_forward_fails<S: WriteStore>(store: &S) {
+    Box::pin(refuse_a_forward_loop_edge(
+        "replace_graph_refuses_a_forward_fails",
+        store,
+        EdgeKind::Fails,
+    ))
+    .await;
+}
+
+/// MOD-138 D9 (W2, blueprint F18): `review → plan` `asks_you` is a back edge over the `next`
+/// chain, so the default edges plus it are applied and stored as given.
+async fn replace_graph_accepts_an_asks_you_back_edge<S: WriteStore>(store: &S) {
+    const CASE: &str = "replace_graph_accepts_an_asks_you_back_edge";
+    let (graph, phases) = scratch_graph(CASE, store, "asked", &["plan", "build", "review"]).await;
+    let before = body_now(CASE, store, graph).await;
+    let mut written = before.clone();
+    written.edges = seed::default_edges(&phases, EdgeId::new);
+    written.edges.push(graph_edge(
+        graph,
+        phases[2].id,
+        phases[0].id,
+        EdgeKind::AsksYou,
+    ));
+    let answer = applied(
+        CASE,
+        store
+            .replace_graph(graph, before.graph.revision, written.clone())
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        answer.graph.revision,
+        before.graph.revision + 1,
+        "{CASE}: applied"
+    );
+    assert_eq!(
+        answer.edges.len(),
+        written.edges.len(),
+        "{CASE}: every edge stored"
+    );
+    for edge in &written.edges {
+        assert!(
+            answer.edges.contains(edge),
+            "{CASE}: {edge:?} is stored as given"
+        );
+    }
+    assert_eq!(
+        store.graph_edges(graph).await.expect(CASE),
+        answer.edges,
+        "{CASE}: the read agrees with the answer"
     );
 }
 

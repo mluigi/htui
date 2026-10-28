@@ -1010,8 +1010,7 @@ pub trait WriteStore: ReadStore {
     /// edges by from position, to position and kind bytes; every `updated_at` the store's clock).
     /// The phase columns [`StepGraphPhase`] does not carry (`judge_agent_id`, `judge_model`,
     /// `deadline_seconds`, blueprint F14) keep their values on a kept node and are `NULL` on a
-    /// new one. Store-level checks only: acyclicity, back-edge kinds and reachability are
-    /// MOD-138's shared validator, which this writer will call once it exists.
+    /// new one.
     ///
     /// # Errors
     /// In this order, and nothing is written on any of them:
@@ -1030,7 +1029,10 @@ pub trait WriteStore: ReadStore {
     /// 7. `Constraint` with
     ///    [`graph_body_topology_refusal`](crate::store::graph_body_topology_refusal)'s sentence
     ///    (edge endpoints, edge CHECKs, duplicate edges, node CHECKs, palette edges, parts on a
-    ///    non-divide node).
+    ///    non-divide node);
+    /// 8. `Constraint` with
+    ///    [`graph_body_walk_refusal`](crate::store::graph_body_walk_refusal)'s sentence (MOD-138
+    ///    D9: forward cycles, a `changes_requested` or `fails` edge that does not loop back).
     async fn replace_graph(
         &self,
         graph: StepGraphId,
