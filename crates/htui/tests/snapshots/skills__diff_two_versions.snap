@@ -3,10 +3,9 @@ source: crates/htui/tests/skills.rs
 expression: frame
 ---
 Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       0 waiting ·  F9  about   ?  keys
- Skills │ Templates
-┌ Skills ──────────────────────┐┌ diff v1 → v2 ────────────────────────────────────────────────────┐
-│  rust-style             v2   ││--- rust-style v1                                                 │
-│  tests                  v1   ││+++ rust-style v2                                                 │
+╭─────────── Skills  Templates ╮╭─ diff v1 → v2 ───────────────────────────────────────────────────╮
+│▌  rust-style             v2  ││--- rust-style v1                                                 │
+│   tests                  v1  ││+++ rust-style v2                                                 │
 │                              ││@@ -1 +1 @@                                                       │
 │                              ││-Prefer `expect` with a reason.                                   │
 │                              ││\ No newline at end of file                                       │
@@ -30,4 +29,5 @@ Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       0 wai
 │                              ││                                                                  │
 │                              ││                                                                  │
 │                              ││                                                                  │
-└─j/k · ,/. version · b base · d diff · e edit · E $EDITOR · n new · I import · i info · a attach──┘
+│                              ││                                                                  │
+╰─h/l view · n new · I import──╯╰──────────────────────────────────────────────────────────────────╯

@@ -42,15 +42,23 @@ async fn open() -> Harness {
     harness
 }
 
+/// Whether `frame` shows a pane titled `title`: a self-drawn `┌ title`, or a kit pane's
+/// `╭─ title` (MOD-115 M4 L-skills, D-11: the body pane's title is a kit title; the
+/// `tests/reveal.rs` pattern, the corner included so a rule elsewhere does not pass for one).
+fn titled(frame: &str, title: &str) -> bool {
+    frame.contains(&format!("\u{250c} {title}"))
+        || frame.contains(&format!("\u{256d}\u{2500} {title}"))
+}
+
 /// Moves the tree's cursor onto `name`: to the top, then down until the body pane is titled with
 /// it.
 fn select(harness: &mut Harness, name: &str) {
     for _ in 0..20 {
         harness.key("k");
     }
-    let title = format!("\u{250c} {name} v");
+    let title = format!("{name} v");
     for _ in 0..20 {
-        if harness.render().contains(&title) {
+        if titled(&harness.render(), &title) {
             return;
         }
         harness.key("j");

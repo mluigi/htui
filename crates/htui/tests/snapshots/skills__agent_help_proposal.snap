@@ -3,8 +3,7 @@ source: crates/htui/tests/skills.rs
 expression: frame
 ---
 Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 waiting ·  F9  about   F1  keys
- Skills │ Templates
-┌ proposal from scripted · sent → proposed ────────────────────────────────────────────────────────┐
+╭─ proposal from scripted · sent → proposed ──────────────────────────────────── Skills  Templates ╮
 │--- sent                                                                                          │
 │+++ proposed                                                                                      │
 │@@ -1 +1 @@                                                                                       │
@@ -30,4 +29,5 @@ Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 wait
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-└─Enter accept · n/Esc discard · J/K scroll · PgUp/PgDn page───────────────────────────────────────┘
+│                                                                                                  │
+╰─Enter accept · n/Esc discard · J/K scroll · PgUp/PgDn page───────────────────────────────────────╯

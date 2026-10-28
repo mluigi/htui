@@ -1,0 +1,27 @@
+---
+source: crates/htui/tests/skills.rs
+expression: frame
+---
+Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings      0 waiting ·  ?  keys
+╭─────────── Skills  Templates ╮╭─ rust-style v2 (head v2) · ~42 tokens ───────╮
+│▌  rust-style             v2  ││House Rust conventions: no `unwrap` off the   │
+│   tests                  v1  ││test path, one error enum per crate           │
+│                              ││                                              │
+│                              ││Prefer `expect` with a reason. One error enum │
+│                              ││per crate.                                    │
+│                              ││                                              │
+│                              ││                                              │
+│                              ││                                              │
+│                              ││                                              │
+│                              ││                                              │
+│                              ││                                              │
+│                              ││                                              │
+│                              ││                                              │
+│                              ││                                              │
+│                              ││                                              │
+│                              ││                                              │
+│                              ││                                              │
+│                              ││                                              │
+│                              ││                                              │
+│                              ││                                              │
+╰─h/l view · n new · I import──╯╰──────────────────────────────────────────────╯

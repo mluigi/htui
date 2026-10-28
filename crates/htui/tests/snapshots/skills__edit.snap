@@ -3,8 +3,7 @@ source: crates/htui/tests/skills.rs
 expression: frame
 ---
 Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 waiting ·  F9  about   F1  keys
- Skills │ Templates
-┌ rust-style · editing from v2, saves v3 · ~42 tokens ─────────────────────────────────────────────┐
+╭─ rust-style · editing from v2, saves v3 · ~42 tokens ───────────────────────── Skills  Templates ╮
 │ZPrefer `expect` with a reason. One error enum per crate.                                         │
 │                                                                                                  │
 │                                                                                                  │
@@ -30,4 +29,5 @@ Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 wait
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-└─Ctrl+s save · Ctrl+g ask agent · Ctrl+e $EDITOR · Esc cancel · L1:C2─────────────────────────────┘
+│                                                                                                  │
+╰─L1:C2 · Ctrl+s save · Ctrl+g ask agent · Ctrl+e $EDITOR · Esc cancel─────────────────────────────╯
