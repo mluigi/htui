@@ -47,8 +47,8 @@ use Context::{
     BacklogPrompt, BacklogReqs, BacklogRuns, Chat, Choice, Common, Concepts, Confirm, Editor,
     Field, Form, Global, History, Layout, Leave, List, Overlay, Pane, Picker, Queue, Requirements,
     Settings, SettingsAgents, SettingsBoxes, SettingsConnection, SettingsHierarchy, SettingsKinds,
-    SettingsPersonas, SettingsSecrets, Skills, SkillsAttach, SkillsHelp, SkillsLibrary,
-    SkillsTemplates, Switcher, Waiting,
+    SettingsPersonas, SettingsQdrant, SettingsSecrets, Skills, SkillsAttach, SkillsHelp,
+    SkillsLibrary, SkillsTemplates, Switcher, Waiting,
 };
 
 /// A key context: a TOML table of `keys.toml` and a layer of a context stack (ANA-26 §7.2-§7.3).
@@ -828,6 +828,8 @@ pub enum Act {
     RequirementsPriorityMust,
     /// `requirements.priority_later`: set a requirement form's priority to later.
     RequirementsPriorityLater,
+    /// `settings.qdrant.adopt`: use the old keyring Qdrant URL for every box (MOD-158 D10).
+    QdrantAdopt,
 }
 
 impl Act {
@@ -1342,6 +1344,15 @@ pub static CATALOGUE: &[ActionSpec] = &[
         "activate",
         &["enter"],
         "run row",
+    ),
+    // [settings.qdrant]
+    // MOD-158 D10: qdrant.rs, the old URL row's offer; every other row passes it.
+    row(
+        Act::QdrantAdopt,
+        SettingsQdrant,
+        "adopt",
+        &["u"],
+        "use old URL",
     ),
     // [settings.boxes]
     // boxes.rs:703.
@@ -2644,6 +2655,7 @@ mod tests {
         Act::AnswerOption9,
         Act::RequirementsPriorityMust,
         Act::RequirementsPriorityLater,
+        Act::QdrantAdopt,
     ];
 
     /// `act`'s index in [`ALL`]. No wildcard arm: a new variant fails to compile here until it is
@@ -2862,6 +2874,7 @@ mod tests {
             Act::AnswerOption9 => 209,
             Act::RequirementsPriorityMust => 210,
             Act::RequirementsPriorityLater => 211,
+            Act::QdrantAdopt => 212,
         }
     }
 
@@ -2895,7 +2908,7 @@ mod tests {
 
     #[test]
     fn every_act_has_exactly_one_row() {
-        assert_eq!(CATALOGUE.len(), 212);
+        assert_eq!(CATALOGUE.len(), 213);
         let acts: HashSet<Act> = CATALOGUE.iter().map(|row| row.act).collect();
         assert_eq!(acts.len(), CATALOGUE.len(), "an act has two rows");
         for row in CATALOGUE {
@@ -2970,11 +2983,10 @@ mod tests {
             Act::PrevSection,
             Act::SkillsSwitchView,
         ];
-        let added = ALL
-            .iter()
-            .copied()
-            .skip_while(|act| *act != Act::NextPane)
-            .collect::<Vec<_>>();
+        // M2's block runs from `NextPane` to `RequirementsPriorityLater`; acts appended after it
+        // (MOD-158's `QdrantAdopt`) are not M2's.
+        let added =
+            ALL[position(Act::NextPane)..=position(Act::RequirementsPriorityLater)].to_vec();
         assert_eq!(added.len(), 41, "M2 appends 41 acts");
         for row in CATALOGUE {
             let m2 = changed.contains(&row.act) || added.contains(&row.act);

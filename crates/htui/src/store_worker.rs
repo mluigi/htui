@@ -914,15 +914,32 @@ pub enum StoreRequest {
     /// (`htui_store::cache::MIRRORED_TABLES`) and the cursor go, the file and its `cache_meta`
     /// stay (D14).
     RebuildCache,
-    /// Request to fetch Qdrant connection info.
+    /// Settings > Qdrant's read (MOD-158 D9): the `qdrant_url` row, the overrides in force and
+    /// this box's keyring entries. Answered with [`StoreReply::Qdrant`].
     QdrantInfo,
-    /// Request to set the Qdrant connection string.
-    SetQdrantUrl(String),
+    /// MOD-158 D1, D9: the database-wide URL, compare-and-set. `expected: None` means "I expect
+    /// no row". Answered with [`StoreReply::Qdrant`], or [`StoreReply::QdrantStale`] on a miss.
+    SetQdrantUrl {
+        /// The URL, already checked by D2.
+        url: htui_core::qdrant::QdrantUrl,
+        /// The row's token as the section read it, or `None` for no row.
+        expected: Option<DateTime<Utc>>,
+    },
+    /// MOD-158 D9: removes the URL row whose token is `expected`, for every box.
+    ClearQdrantUrl {
+        /// The row's token as the section read it.
+        expected: DateTime<Utc>,
+    },
     /// The API key, redacted in `Debug` (MOD-10 M4 D9); empty clears the stored key. The Settings
     /// field never sends an empty one (R1 L-5): clearing there is `c`, behind a question.
     SetQdrantApiKey(Redacted),
-    /// Request to clear the Qdrant connection string.
-    ClearQdrantSettings,
+    /// MOD-158 D9 (Q2): removes this box's API key from its keyring, and nothing else.
+    ClearQdrantApiKey,
+    /// MOD-158 D10: this box's old keyring URL becomes the row (inserted expecting none), then the
+    /// entry goes. The worker re-reads the entry itself.
+    AdoptOldQdrantUrl,
+    /// MOD-158 D10: removes this box's old keyring URL, and nothing else.
+    DiscardOldQdrantUrl,
     // MOD-10 milestone 4: Settings > Secrets.
     /// The keyring rows of `Settings > Secrets` (D2). Answered with [`StoreReply::Secrets`].
     SecretsInfo,
@@ -1312,10 +1329,14 @@ impl StoreRequest {
             Self::SetDsn(_) => "set_dsn",
             Self::ClearDsn => "clear_dsn",
             Self::RebuildCache => "rebuild_cache",
+            // The seven of `qdrant_settings_info::REQUEST_NAMES`, in that order (MOD-158 D9).
             Self::QdrantInfo => "qdrant_info",
-            Self::SetQdrantUrl(_) => "set_qdrant_url",
+            Self::SetQdrantUrl { .. } => "set_qdrant_url",
+            Self::ClearQdrantUrl { .. } => "clear_qdrant_url",
             Self::SetQdrantApiKey(_) => "set_qdrant_api_key",
-            Self::ClearQdrantSettings => "clear_qdrant_settings",
+            Self::ClearQdrantApiKey => "clear_qdrant_api_key",
+            Self::AdoptOldQdrantUrl => "adopt_old_qdrant_url",
+            Self::DiscardOldQdrantUrl => "discard_old_qdrant_url",
             // The five of `secrets_settings::REQUEST_NAMES`, in that order, then the checks and
             // the scope write (MOD-10 M4).
             Self::SecretsInfo => "secrets_info",
@@ -1584,8 +1605,11 @@ pub enum StoreReply {
     /// `ConnectionInfo`, and every connection writer's success (D4): the section re-renders from
     /// it and never patches a field of its own into what it already had.
     Connection(ConnectionSnapshot),
-    /// Reply to QdrantInfo, SetQdrantDsn, ClearQdrantSettings requests.
+    /// The answer to every Settings > Qdrant request that read or wrote (MOD-158 D9).
     Qdrant(crate::qdrant_settings_info::QdrantSnapshot),
+    /// A URL compare-and-set (or the adopt's insert) found the row changed: the snapshot now, so
+    /// the section takes the new token from it (MOD-158 D9, blueprint R-3, R-4).
+    QdrantStale(Box<crate::qdrant_settings_info::QdrantSnapshot>),
     /// Answer to [`StoreRequest::SearchConcepts`] and [`StoreRequest::IndexConcepts`] (MOD-64 D232):
     /// the outcome carries its own error, so a Qdrant failure stays in the search overlay and never
     /// reaches the status line the way a [`StoreReply::Failed`] does.
@@ -2307,13 +2331,16 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         // spawned loop answers it from its own task before reaching here (review M-1); this arm
         // is `serve`'s, for the harness and `--demo`.
         StoreRequest::ListDir { path, show_hidden } => list_dir(path, *show_hidden).await?,
-        // The four `Settings > Qdrant` requests, or-ed for the reason the arms above are (MOD-15 M3
-        // plan F-12). They need no loop state, so the loop, the harness and `--demo` all serve
-        // these here (CLEAN-8 #9), and a `Memory` backend reads and writes no keyring.
+        // The seven `Settings > Qdrant` requests, or-ed for the reason the arms above are (MOD-15
+        // M3 plan F-12). They need no loop state, so the loop, the harness and `--demo` all serve
+        // these here (CLEAN-8 #9), and a `Memory` backend reads and writes no keyring (MOD-158 D9).
         StoreRequest::QdrantInfo
-        | StoreRequest::SetQdrantUrl(_)
+        | StoreRequest::SetQdrantUrl { .. }
+        | StoreRequest::ClearQdrantUrl { .. }
         | StoreRequest::SetQdrantApiKey(_)
-        | StoreRequest::ClearQdrantSettings => {
+        | StoreRequest::ClearQdrantApiKey
+        | StoreRequest::AdoptOldQdrantUrl
+        | StoreRequest::DiscardOldQdrantUrl => {
             crate::qdrant_settings_info::serve(backend, request).await?
         }
         // The five keyring requests of `Settings > Secrets`, or-ed for the reason the arms above
