@@ -2926,6 +2926,9 @@ pub(crate) fn spawn_with_concepts(
             if let Some(host) = &tools {
                 host_the_backend(host, &backend);
             }
+            // MOD-158 D6 (blueprint P-2), the same rule: the concepts index reads the `qdrant_url`
+            // row through this iteration's writable store, or through none. A pointer swap.
+            concepts.publish(&backend);
             // The first sweep reads `lease_ttl_seconds`; the ticker follows it.
             if runs.sweep_every() != sweep_every {
                 sweep_every = runs.sweep_every();
@@ -3710,6 +3713,100 @@ mod tests {
         };
         assert_eq!(echoed, &query);
         assert_eq!(error, message);
+    }
+
+    /// An index that records whether each publish handed it a store (MOD-158 D6).
+    #[derive(Default)]
+    struct Publishes(std::sync::Mutex<Vec<bool>>);
+
+    impl Publishes {
+        fn seen(&self) -> Vec<bool> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl concepts_worker::ConceptIndex for Publishes {
+        fn search(
+            &self,
+            _: SearchQuery,
+        ) -> futures::future::BoxFuture<'_, Result<Vec<htui_store::vector::Hit>, String>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn sync(
+            &self,
+            _: Backend,
+            _: Scope,
+        ) -> futures::future::BoxFuture<'_, Result<htui_store::vector_sync::SyncReport, String>>
+        {
+            Box::pin(async { Ok(Default::default()) })
+        }
+        fn publish(&self, store: Option<Arc<dyn concepts_worker::UrlRow>>) {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(store.is_some());
+        }
+    }
+
+    /// MOD-158 D6, blueprint P-2: the loop publishes the store it serves at the top of every
+    /// iteration, so the concepts index reads the `qdrant_url` row through the server the loop is
+    /// on, and through none once that server is lost.
+    #[tokio::test]
+    async fn the_loop_publishes_its_writable_store_to_the_concepts_index() {
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "concepts-publish", 1)
+            .await
+            .expect("open a throwaway mirror");
+        let identity = Identity {
+            box_id: BoxId::new(),
+            hostname: "HTUI-TEST".to_owned(),
+        };
+        let pg = PgStore::lazy(
+            "postgres://nobody:nothing@127.0.0.1:1/none",
+            &identity,
+            std::time::Duration::from_millis(250),
+        )
+        .expect("a lazy pool opens no socket");
+        let index = Arc::new(Publishes::default());
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, mut rep_rx) = mpsc::unbounded_channel();
+        let mut started = Started::detached(Backend::Online {
+            pg,
+            cache: cache.clone(),
+        });
+        started.reconnect = None;
+        let worker = spawn_with_concepts(
+            started,
+            req_rx,
+            rep_tx,
+            AgentRuntime::production(),
+            RunRuntime::production(),
+            ConceptsRuntime::new(index.clone()),
+            None,
+        );
+
+        round_trip(&req_tx, &mut rep_rx, StoreRequest::StoreState).await;
+        assert_eq!(
+            index.seen().first(),
+            Some(&true),
+            "published before the first request"
+        );
+        // The read that notices the server is gone swaps the backend onto the mirror.
+        round_trip(&req_tx, &mut rep_rx, StoreRequest::Workspaces).await;
+        round_trip(&req_tx, &mut rep_rx, StoreRequest::StoreState).await;
+        assert_eq!(
+            index.seen().last(),
+            Some(&false),
+            "offline, nothing is published: {:?}",
+            index.seen()
+        );
+
+        drop(req_tx);
+        worker.await.expect("the worker stops with its channel");
+        cache.close().await;
     }
 
     /// MOD-49 review M-1: a listing that hangs (a dead mount) is answered as refused once its

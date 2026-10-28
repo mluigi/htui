@@ -169,6 +169,10 @@ pub struct WorkerArgs {
     /// Read the DSN from one line of stdin instead of the keyring or the credential.
     #[arg(long)]
     pub dsn_stdin: bool,
+    /// Read the Qdrant API key from one line of stdin, after the DSN line with `--dsn-stdin`,
+    /// instead of the keyring or the credential `htui-qdrant-key`.
+    #[arg(long)]
+    pub qdrant_key_stdin: bool,
 }
 
 /// `htui claude`'s verb (MOD-93). The verb is required: `htui claude` alone is a usage error.
@@ -283,16 +287,34 @@ mod tests {
         assert_eq!(args.log.as_deref(), Some(std::path::Path::new("htui.log")));
     }
 
-    /// MOD-41 plan D14: `htui worker` takes `--pool-size` (default 4) and `--dsn-stdin`.
+    /// MOD-41 plan D14, MOD-158 D4: `htui worker` takes `--pool-size` (default 4), `--dsn-stdin`
+    /// and `--qdrant-key-stdin`.
     #[test]
-    fn worker_parses_its_two_flags() {
-        let args = Args::try_parse_from(["htui", "worker", "--pool-size", "6", "--dsn-stdin"])
-            .expect("parse");
+    fn worker_parses_its_three_flags() {
+        let args = Args::try_parse_from([
+            "htui",
+            "worker",
+            "--pool-size",
+            "6",
+            "--dsn-stdin",
+            "--qdrant-key-stdin",
+        ])
+        .expect("parse");
         assert_eq!(
             args.command,
             Some(Command::Worker(WorkerArgs {
                 pool_size: 6,
                 dsn_stdin: true,
+                qdrant_key_stdin: true,
+            }))
+        );
+        let args = Args::try_parse_from(["htui", "worker", "--qdrant-key-stdin"]).expect("parse");
+        assert_eq!(
+            args.command,
+            Some(Command::Worker(WorkerArgs {
+                pool_size: 4,
+                dsn_stdin: false,
+                qdrant_key_stdin: true,
             }))
         );
         let args = Args::try_parse_from(["htui", "worker"]).expect("parse");
@@ -301,7 +323,12 @@ mod tests {
             Some(Command::Worker(WorkerArgs {
                 pool_size: 4,
                 dsn_stdin: false,
+                qdrant_key_stdin: false,
             }))
+        );
+        assert!(
+            Args::try_parse_from(["htui", "--qdrant-key-stdin"]).is_err(),
+            "a worker flag, not the TUI's"
         );
     }
 
