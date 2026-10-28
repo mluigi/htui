@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT status AS \"status: RunStatus\"\n                 FROM run\n                WHERE item_id = $1 AND kind = 'graph' AND status <> 'cancelled'\n                ORDER BY queued_at DESC, id DESC\n                LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "status: RunStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "status"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "bff40aef98a2616357186770da2e3ac7b2d36c086f0c7dcc02de146d8a5579f6"
+}

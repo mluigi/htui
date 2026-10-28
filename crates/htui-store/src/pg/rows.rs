@@ -193,6 +193,8 @@ pub(crate) struct LinkNodeRow {
     pub(crate) status: Status,
     /// Hops from the root, as `MIN(depth)` over the recursive walk.
     pub(crate) depth: i32,
+    /// MOD-144: the latest graph run's status, `cancelled` skipped (the `lr` LATERAL).
+    pub(crate) latest_run_status: Option<RunStatus>,
 }
 
 impl LinkNodeRow {
@@ -210,6 +212,7 @@ impl LinkNodeRow {
             title: self.title,
             status: self.status,
             depth: u8::try_from(self.depth).unwrap_or(u8::MAX),
+            latest_run_status: self.latest_run_status,
         }
     }
 }
@@ -235,6 +238,8 @@ pub(crate) struct UpstreamRow {
     pub(crate) in_scope: bool,
     /// The latest `document.kind = 'summary'` body, read only for an in-scope item.
     pub(crate) summary: Option<String>,
+    /// MOD-144: the latest graph run's status, `cancelled` skipped (the `lr` LATERAL).
+    pub(crate) latest_run_status: Option<RunStatus>,
 }
 
 impl UpstreamRow {
@@ -252,6 +257,7 @@ impl UpstreamRow {
             depth: u8::try_from(self.depth).unwrap_or(u8::MAX),
             in_scope: self.in_scope,
             summary: self.summary,
+            latest_run_status: self.latest_run_status,
         }
     }
 }

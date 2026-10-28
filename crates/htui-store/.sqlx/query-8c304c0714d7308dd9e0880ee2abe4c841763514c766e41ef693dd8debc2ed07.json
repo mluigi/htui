@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT s.status  AS \"step_status: StepStatus\",\n                   r.id      AS \"run_id: RunId\",\n                   r.status  AS \"run_status: RunStatus\",\n                   r.item_id AS \"item_id: ItemId\"\n              FROM run_step s JOIN run r ON r.id = s.run_id\n             WHERE s.id = $1\n               FOR UPDATE OF s, r\n            ",
+  "query": "\n            SELECT s.status  AS \"step_status: StepStatus\",\n                   r.id      AS \"run_id: RunId\",\n                   r.status  AS \"run_status: RunStatus\"\n              FROM run_step s JOIN run r ON r.id = s.run_id\n             WHERE s.id = $1\n               FOR UPDATE OF s, r\n            ",
   "describe": {
     "columns": [
       {
@@ -35,17 +35,6 @@
             "name": "status"
           }
         }
-      },
-      {
-        "ordinal": 3,
-        "name": "item_id: ItemId",
-        "type_info": "Uuid",
-        "origin": {
-          "Table": {
-            "table": "run",
-            "name": "item_id"
-          }
-        }
       }
     ],
     "parameters": {
@@ -56,9 +45,8 @@
     "nullable": [
       false,
       false,
-      false,
-      true
+      false
     ]
   },
-  "hash": "3d29521fc512e364b67ff6e661fd891d5e03ac13c9b972a3f9bf7fd76c6b079e"
+  "hash": "8c304c0714d7308dd9e0880ee2abe4c841763514c766e41ef693dd8debc2ed07"
 }

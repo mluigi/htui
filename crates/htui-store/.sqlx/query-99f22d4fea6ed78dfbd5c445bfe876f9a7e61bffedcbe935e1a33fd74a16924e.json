@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE item SET status = 'blocked' WHERE id = (SELECT item_id FROM run WHERE id = $1) AND status = 'open'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "99f22d4fea6ed78dfbd5c445bfe876f9a7e61bffedcbe935e1a33fd74a16924e"
+}

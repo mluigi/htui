@@ -46,8 +46,9 @@ use crate::pg::PgStore;
 use crate::pg::rows::{LinkNodeRow, PersonaRow, RunRow, SkillBindingRow, StepRow, UpstreamRow};
 use crate::{MAX_UPSTREAM_HOPS, order_documents};
 
-/// The `status IN (...)` list `waiting_candidates` spells out (the live runs, MOD-125 D2), because
-/// `query!` needs a literal and cannot read a Rust constant.
+/// The `status IN (...)` list of a live run (MOD-125 D2, MOD-144 Δ2) that `waiting_candidates`,
+/// `create_run`, `close_out` and 0023's `uq_run_item_live` spell out, because `query!` needs a
+/// literal and cannot read a Rust constant.
 ///
 /// Test-only: the query text is the real definition, and
 /// `live_runs_literal_matches_run_status` is what keeps it honest against
@@ -81,9 +82,17 @@ impl ReadStore for PgStore {
     /// Every [`ItemFilter`] field in SQL, ordered by scope position then `(key_prefix, key_number)`.
     ///
     /// The scope order is carried in as the same array the `WHERE` uses and recovered with
-    /// `array_position`, so the Backlog list renders the statement's order directly. The readiness
-    /// conjunct is ANA-9 §7.4's `NOT EXISTS` plus `status = 'open'`, compared against the wanted
-    /// boolean so `ready: Some(false)` selects the *not*-ready items.
+    /// `array_position`, so the Backlog list renders the statement's order directly.
+    ///
+    /// MOD-144: `lr` is the item's latest graph run (`kind = 'graph'`, `cancelled` skipped, by
+    /// `(queued_at, id)`), projected as `latest_run_status`. The readiness conjunct is `open`, no
+    /// non-cancelled graph run (`lr.status IS NULL`) and every live `blocked_by` target released
+    /// (`closed`, or its own latest graph run `done`), compared against the wanted boolean so
+    /// `ready: Some(false)` selects the *not*-ready items; every term is non-null, so the
+    /// comparison stays two-valued. `states` matches [`ItemState::of`] spelled as one `CASE`
+    /// (`ItemState::as_str` equals `RunStatus::as_str` where they share a word).
+    ///
+    /// [`ItemState::of`]: htui_core::model::ItemState::of
     async fn items(&self, scope: &Scope, filter: &ItemFilter) -> Result<Vec<ItemSummary>> {
         if scope.is_empty() {
             return Ok(Vec::new()); // `= ANY('{}')` is false for every row; skip the round trip.
@@ -91,6 +100,11 @@ impl ReadStore for PgStore {
         let projects = project_uuids(scope);
         let narrowed = filter_uuids(filter.project_ids.as_ref());
         let statuses = filter.statuses.as_ref().map(|list| {
+            list.iter()
+                .map(|s| s.as_str().to_owned())
+                .collect::<Vec<_>>()
+        });
+        let states = filter.states.as_ref().map(|list| {
             list.iter()
                 .map(|s| s.as_str().to_owned())
                 .collect::<Vec<_>>()
@@ -110,8 +124,15 @@ impl ReadStore for PgStore {
                    i.priority,
                    i.required_tags,
                    i.updated_at,
-                   i.touched_paths
+                   i.touched_paths,
+                   lr.status       AS "latest_run_status?: htui_core::model::RunStatus"
               FROM item i
+              LEFT JOIN LATERAL (
+                    SELECT r.status FROM run r
+                     WHERE r.item_id = i.id AND r.kind = 'graph' AND r.status <> 'cancelled'
+                     ORDER BY r.queued_at DESC, r.id DESC
+                     LIMIT 1
+                   ) lr ON true
              WHERE i.project_id = ANY($1)
                AND ($2::uuid[] IS NULL OR i.project_id = ANY($2))
                AND ($3::text[] IS NULL OR i.status = ANY($3))
@@ -124,10 +145,22 @@ impl ReadStore for PgStore {
                     OR position(lower($5::text) in lower(i.title)) > 0)
                AND ($6::bool IS NULL OR $6 = (
                         i.status = 'open'
+                    AND lr.status IS NULL
                     AND NOT EXISTS (
                         SELECT 1 FROM item_link l JOIN item t ON t.id = l.to_item_id
                          WHERE l.from_item_id = i.id AND l.kind = 'blocked_by'
-                           AND l.deleted_at IS NULL AND t.status NOT IN ('done','closed'))))
+                           AND l.deleted_at IS NULL AND t.status <> 'closed'
+                           AND (SELECT tr.status FROM run tr
+                                 WHERE tr.item_id = t.id AND tr.kind = 'graph'
+                                   AND tr.status <> 'cancelled'
+                                 ORDER BY tr.queued_at DESC, tr.id DESC
+                                 LIMIT 1) IS DISTINCT FROM 'done')))
+               AND ($7::text[] IS NULL OR (CASE
+                        WHEN i.status = 'closed'  THEN 'closed'
+                        WHEN i.status = 'blocked' THEN 'blocked'
+                        WHEN lr.status IS NULL    THEN 'open'
+                        WHEN lr.status = 'awaiting_approval' THEN 'needs_you'
+                        ELSE lr.status END) = ANY($7))
              ORDER BY array_position($1, i.project_id), i.key_prefix, i.key_number
             "#,
             &projects[..],
@@ -136,6 +169,7 @@ impl ReadStore for PgStore {
             filter.tags.as_deref(),
             filter.text.as_deref(),
             filter.ready,
+            states.as_deref(),
         )
         .fetch_all(&self.pool)
         .await
@@ -205,10 +239,17 @@ impl ReadStore for PgStore {
                    i.key         AS "key!",
                    i.title       AS "title!",
                    i.status      AS "status!: htui_core::model::Status",
-                   n.depth       AS "depth!"
+                   n.depth       AS "depth!",
+                   lr.status     AS "latest_run_status?: htui_core::model::RunStatus"
               FROM node n
               JOIN item i    ON i.id = n.item_id
               JOIN project p ON p.id = i.project_id
+              LEFT JOIN LATERAL (
+                    SELECT r.status FROM run r
+                     WHERE r.item_id = i.id AND r.kind = 'graph' AND r.status <> 'cancelled'
+                     ORDER BY r.queued_at DESC, r.id DESC
+                     LIMIT 1
+                   ) lr ON true
              ORDER BY n.depth, i.key
             "#,
             root,
@@ -553,6 +594,8 @@ impl ReadStore for PgStore {
     /// every column nullable" is true of the computed columns only; theirs are kept for the reason
     /// [`links`](ReadStore::links) keeps its whole set — the inference is the macro's, not the
     /// schema's, and a `!` on a column that is already non-null costs nothing.
+    /// `latest_run_status` (MOD-144, the `lr` LATERAL) carries a `?` instead: a `LEFT JOIN`
+    /// column is `NULL` for an item with no non-cancelled graph run.
     async fn upstream_summaries(
         &self,
         id: ItemId,
@@ -593,7 +636,8 @@ impl ReadStore for PgStore {
                    i.status                   AS "status!: htui_core::model::Status",
                    best.depth                 AS "depth!",
                    (s.project_id IS NOT NULL) AS "in_scope!",
-                   CASE WHEN s.project_id IS NOT NULL THEN d.body END AS "summary?"
+                   CASE WHEN s.project_id IS NOT NULL THEN d.body END AS "summary?",
+                   lr.status                  AS "latest_run_status?: htui_core::model::RunStatus"
               FROM best
               JOIN item i    ON i.id = best.item_id
               JOIN project p ON p.id = i.project_id
@@ -601,6 +645,12 @@ impl ReadStore for PgStore {
               LEFT JOIN LATERAL (SELECT body FROM document
                                   WHERE item_id = i.id AND kind = 'summary'
                                   ORDER BY version DESC LIMIT 1) d ON TRUE
+              LEFT JOIN LATERAL (
+                    SELECT r.status FROM run r
+                     WHERE r.item_id = i.id AND r.kind = 'graph' AND r.status <> 'cancelled'
+                     ORDER BY r.queued_at DESC, r.id DESC
+                     LIMIT 1
+                   ) lr ON true
              -- The root is the step's own item and is never an entry, and the walk can arrive back
              -- at it: the schema forbids a self-loop only, so `R blocked_by A, A blocked_by R` is
              -- storable and reaches `R` at depth 2. `MemStore` seeds `seen` with the root and so
@@ -1167,7 +1217,9 @@ impl ReadStore for PgStore {
     }
 
     /// The requirement's live citations, each joined to the citing item's summary and
-    /// resolution, in `(key_prefix, key_number, item id, kind)` order.
+    /// resolution, in `(key_prefix, key_number, item id, kind)` order. The summary's
+    /// `latest_run_status` is the item's latest graph run (MOD-144, the `lr` LATERAL; the run
+    /// alias is `gr` because `r` is the requirement).
     async fn requirement_coverage(&self, requirement: RequirementId) -> Result<Vec<CoverageRow>> {
         let rows = sqlx::query!(
             r#"
@@ -1186,10 +1238,17 @@ impl ReadStore for PgStore {
                    i.resolution           AS "resolution?: Resolution",
                    ir.kind                AS "kind!: CitationKind",
                    ir.requirement_version AS "requirement_version!",
-                   r.version > ir.requirement_version AS "suspect!"
+                   r.version > ir.requirement_version AS "suspect!",
+                   lr.status              AS "latest_run_status?: RunStatus"
               FROM item_requirement ir
               JOIN requirement r ON r.id = ir.requirement_id
               JOIN item i        ON i.id = ir.item_id
+              LEFT JOIN LATERAL (
+                    SELECT gr.status FROM run gr
+                     WHERE gr.item_id = i.id AND gr.kind = 'graph' AND gr.status <> 'cancelled'
+                     ORDER BY gr.queued_at DESC, gr.id DESC
+                     LIMIT 1
+                   ) lr ON true
              WHERE ir.requirement_id = $1 AND ir.deleted_at IS NULL
              ORDER BY i.key_prefix COLLATE "C", i.key_number, i.id, ir.kind COLLATE "C"
             "#,
@@ -1215,6 +1274,7 @@ impl ReadStore for PgStore {
                     required_tags: row.required_tags,
                     updated_at: row.updated_at,
                     touched_paths: row.touched_paths,
+                    latest_run_status: row.latest_run_status,
                 },
                 kind: row.kind,
                 resolution: row.resolution,
@@ -1292,7 +1352,7 @@ impl ReadStore for PgStore {
                    i.resolution    AS "resolution: htui_core::model::Resolution"
               FROM item i
              WHERE i.project_id = ANY($1)
-               AND (i.status IN ('blocked', 'awaiting_approval')
+               AND (i.status = 'blocked'
                     OR EXISTS (SELECT 1 FROM run r
                                 WHERE r.item_id = i.id AND r.status = 'awaiting_approval'))
             "#,
@@ -2139,7 +2199,9 @@ impl PgStore {
     /// The scope's ready items this box can actually take: §7.4's readiness, then `R-ORCH-10`'s
     /// capability half - `required_tags` a subset of the box's `probed_tags ∪ declared_tags`.
     ///
-    /// The readiness conjunct is [`items`](ReadStore::items)' own, copied rather than shared
+    /// The readiness conjunct is [`items`](ReadStore::items)' own (MOD-144: `open`, no
+    /// non-cancelled graph run, every live `blocked_by` target released), so every projected
+    /// `latest_run_status` is `None`; copied rather than shared
     /// because `ItemFilter` has no field for a box and this predicate is the machine's vocabulary,
     /// not the caller's; the ordering is the queue's (MOD-12 D4, ANA-2 criterion 22):
     /// `priority DESC, created_at`, the id breaking a tie, and **not** the Backlog's display order.
@@ -2177,14 +2239,27 @@ impl PgStore {
                    i.priority,
                    i.required_tags,
                    i.updated_at,
-                   i.touched_paths
+                   i.touched_paths,
+                   lr.status       AS "latest_run_status?: htui_core::model::RunStatus"
               FROM item i LEFT JOIN box b ON b.id = $2
+              LEFT JOIN LATERAL (
+                    SELECT r.status FROM run r
+                     WHERE r.item_id = i.id AND r.kind = 'graph' AND r.status <> 'cancelled'
+                     ORDER BY r.queued_at DESC, r.id DESC
+                     LIMIT 1
+                   ) lr ON true
              WHERE i.project_id = ANY($1)
                AND i.status = 'open'
+               AND lr.status IS NULL
                AND NOT EXISTS (
                         SELECT 1 FROM item_link l JOIN item t ON t.id = l.to_item_id
                          WHERE l.from_item_id = i.id AND l.kind = 'blocked_by'
-                           AND l.deleted_at IS NULL AND t.status NOT IN ('done','closed'))
+                           AND l.deleted_at IS NULL AND t.status <> 'closed'
+                           AND (SELECT tr.status FROM run tr
+                                 WHERE tr.item_id = t.id AND tr.kind = 'graph'
+                                   AND tr.status <> 'cancelled'
+                                 ORDER BY tr.queued_at DESC, tr.id DESC
+                                 LIMIT 1) IS DISTINCT FROM 'done')
                AND NOT EXISTS (
                         SELECT 1 FROM UNNEST(i.required_tags) t
                          WHERE t <> ALL (COALESCE(b.probed_tags, '{}')
@@ -2395,10 +2470,14 @@ impl PgStore {
     /// status, priority and `created_at`, its latest graph run (target hostname, parked step), its
     /// latest note and its open `blocked_by` keys. One statement.
     ///
-    /// The latest run is the latest `kind = 'graph'` run by `(queued_at, id)`; its parked step is
-    /// its first `awaiting_approval` step by `(position, attempt, fanout_index)`. The blocker
-    /// clause is [`ready_items`](PgStore::ready_items)' verbatim, so "open blocker" and "not ready
-    /// for a blocker" are one rule; `COLLATE "C"` is `MemStore`'s byte order. Keys are unique only
+    /// Two latest runs, told apart (MOD-144, PD6). `lr`, the latest `kind = 'graph'` run by
+    /// `(queued_at, id)` **cancelled included**, feeds [`QueueRunFact`] (what the queue overlay
+    /// shows of the last run, a cancel included); its parked step is its first
+    /// `awaiting_approval` step by `(position, attempt, fanout_index)`. `ls`, the same with
+    /// `cancelled` skipped, is `latest_run_status`, the run the item's state derives from. The
+    /// blocker clause is [`ready_items`](PgStore::ready_items)' release rule verbatim (a target
+    /// not `closed` whose latest graph run is not `done`), so "open blocker" and "not ready for a
+    /// blocker" are one rule; `COLLATE "C"` is `MemStore`'s byte order. Keys are unique only
     /// per project and a link may cross projects, so the keys are `DISTINCT`: two open blockers
     /// keyed `FEAT-1` list it once, as `MemStore`'s set does.
     ///
@@ -2428,7 +2507,8 @@ impl PgStore {
                    lr.failure        AS "run_failure?",
                    lr.parked_step    AS "run_parked_step?: StepId",
                    ln.body           AS "note?",
-                   COALESCE(ob.keys, '{}'::text[]) AS "blockers!"
+                   COALESCE(ob.keys, '{}'::text[]) AS "blockers!",
+                   ls.status         AS "latest_run_status?: RunStatus"
               FROM queue_entry e
               JOIN item i ON i.id = e.item_id
               LEFT JOIN LATERAL (
@@ -2444,6 +2524,12 @@ impl PgStore {
                      LIMIT 1
                    ) lr ON true
               LEFT JOIN LATERAL (
+                    SELECT r.status FROM run r
+                     WHERE r.item_id = i.id AND r.kind = 'graph' AND r.status <> 'cancelled'
+                     ORDER BY r.queued_at DESC, r.id DESC
+                     LIMIT 1
+                   ) ls ON true
+              LEFT JOIN LATERAL (
                     SELECT n.body FROM item_note n
                      WHERE n.item_id = i.id
                      ORDER BY n.created_at DESC, n.id DESC
@@ -2453,7 +2539,12 @@ impl PgStore {
                     SELECT array_agg(DISTINCT t.key COLLATE "C" ORDER BY t.key COLLATE "C") AS keys
                       FROM item_link l JOIN item t ON t.id = l.to_item_id
                      WHERE l.from_item_id = i.id AND l.kind = 'blocked_by'
-                       AND l.deleted_at IS NULL AND t.status NOT IN ('done','closed')
+                       AND l.deleted_at IS NULL AND t.status <> 'closed'
+                       AND (SELECT tr.status FROM run tr
+                             WHERE tr.item_id = t.id AND tr.kind = 'graph'
+                               AND tr.status <> 'cancelled'
+                             ORDER BY tr.queued_at DESC, tr.id DESC
+                             LIMIT 1) IS DISTINCT FROM 'done'
                    ) ob ON true
              WHERE e.box_id = $1
              ORDER BY e.position NULLS LAST, i.priority DESC, i.created_at, i.id
@@ -2498,6 +2589,7 @@ impl PgStore {
                     latest_run,
                     latest_note: row.note,
                     open_blockers: row.blockers,
+                    latest_run_status: row.latest_run_status,
                 }
             })
             .collect())
@@ -3662,6 +3754,48 @@ mod tests {
             from_model,
             TOP_BAR_RUN_STATUSES.to_vec(),
             "the `status IN (...)` literal of `active_runs` and `RunStatus::on_top_bar` must agree"
+        );
+    }
+
+    /// `items`' `states` `CASE` (MOD-144, B1), transcribed arm by arm: the stored status's text,
+    /// then the latest graph run's text (`NULL` → `open`, `awaiting_approval` → `needs_you`).
+    fn item_state_case(status: &str, latest: Option<&str>) -> String {
+        match (status, latest) {
+            ("closed", _) => "closed",
+            ("blocked", _) => "blocked",
+            (_, None) => "open",
+            (_, Some("awaiting_approval")) => "needs_you",
+            (_, Some(run)) => run,
+        }
+        .to_owned()
+    }
+
+    #[test]
+    fn item_state_case_matches_item_state_of() {
+        use htui_core::model::{ItemState, Status};
+
+        let latest = core::iter::once(None).chain(
+            RunStatus::ALL
+                .iter()
+                .copied()
+                .filter(|run| *run != RunStatus::Cancelled)
+                .map(Some),
+        );
+        let mut rows = 0;
+        for latest in latest {
+            for status in Status::ALL {
+                assert_eq!(
+                    item_state_case(status.as_str(), latest.map(RunStatus::as_str)),
+                    ItemState::of(*status, latest).as_str(),
+                    "the SQL state of a `{status}` item over a {latest:?} latest graph run"
+                );
+                rows += 1;
+            }
+        }
+        assert_eq!(
+            rows,
+            3 * 7,
+            "every status over no run and the six non-cancelled ones"
         );
     }
 }

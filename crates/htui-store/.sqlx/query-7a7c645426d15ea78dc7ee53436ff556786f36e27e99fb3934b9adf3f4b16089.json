@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT i.id            AS \"id: ItemId\",\n                   i.project_id    AS \"project_id: ProjectId\",\n                   i.kind_id       AS \"kind_id: htui_core::model::ItemKindId\",\n                   i.key_prefix,\n                   i.key_number,\n                   i.key           AS \"key!\",\n                   i.title,\n                   i.body,\n                   i.status        AS \"status: htui_core::model::Status\",\n                   i.priority,\n                   i.required_tags,\n                   i.touched_paths,\n                   i.step_graph_id AS \"step_graph_id: htui_core::model::StepGraphId\",\n                   i.version,\n                   i.created_by    AS \"created_by: htui_core::model::UserId\",\n                   i.created_at,\n                   i.updated_at,\n                   i.closed_at,\n                   i.resolution    AS \"resolution: htui_core::model::Resolution\"\n              FROM item i\n             WHERE i.project_id = ANY($1)\n               AND (i.status IN ('blocked', 'awaiting_approval')\n                    OR EXISTS (SELECT 1 FROM run r\n                                WHERE r.item_id = i.id AND r.status = 'awaiting_approval'))\n            ",
+  "query": "\n            SELECT i.id            AS \"id: ItemId\",\n                   i.project_id    AS \"project_id: ProjectId\",\n                   i.kind_id       AS \"kind_id: htui_core::model::ItemKindId\",\n                   i.key_prefix,\n                   i.key_number,\n                   i.key           AS \"key!\",\n                   i.title,\n                   i.body,\n                   i.status        AS \"status: htui_core::model::Status\",\n                   i.priority,\n                   i.required_tags,\n                   i.touched_paths,\n                   i.step_graph_id AS \"step_graph_id: htui_core::model::StepGraphId\",\n                   i.version,\n                   i.created_by    AS \"created_by: htui_core::model::UserId\",\n                   i.created_at,\n                   i.updated_at,\n                   i.closed_at,\n                   i.resolution    AS \"resolution: htui_core::model::Resolution\"\n              FROM item i\n             WHERE i.project_id = ANY($1)\n               AND (i.status = 'blocked'\n                    OR EXISTS (SELECT 1 FROM run r\n                                WHERE r.item_id = i.id AND r.status = 'awaiting_approval'))\n            ",
   "describe": {
     "columns": [
       {
@@ -240,5 +240,5 @@
       true
     ]
   },
-  "hash": "21ce59033e76656b96442e1931fe2c3bd5e87a435a625b19d5221de786706668"
+  "hash": "7a7c645426d15ea78dc7ee53436ff556786f36e27e99fb3934b9adf3f4b16089"
 }

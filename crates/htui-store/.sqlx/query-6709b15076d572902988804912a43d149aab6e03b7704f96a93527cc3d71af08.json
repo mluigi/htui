@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH doomed AS (\n                SELECT e.item_id\n                  FROM queue_entry e JOIN item i ON i.id = e.item_id\n                 WHERE e.box_id = $1\n                   AND (i.status = 'closed'\n                        OR (SELECT r.status FROM run r\n                             WHERE r.item_id = i.id AND r.kind = 'graph' AND r.status <> 'cancelled'\n                             ORDER BY r.queued_at DESC, r.id DESC\n                             LIMIT 1) = 'done')\n                 ORDER BY e.item_id\n                   FOR UPDATE OF e)\n            DELETE FROM queue_entry e\n             USING doomed d\n             WHERE e.item_id = d.item_id\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6709b15076d572902988804912a43d149aab6e03b7704f96a93527cc3d71af08"
+}
