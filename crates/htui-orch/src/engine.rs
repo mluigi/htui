@@ -720,7 +720,8 @@ where
         // MOD-144 (PD1): `create_run`'s own law first (`startable`: `open` and no live graph run),
         // so neither the tag check nor rung 4 writes a note on, or blocks, an item some live run
         // already holds, and a refused item writes no note (D98). `create_run` re-checks it under
-        // the item lock and stays the authority (MOD-7 D98).
+        // the item lock and stays the authority (MOD-7 D98). This read takes no lock, so a run
+        // another box creates after it can still be blocked over: see `refuse_rung_four`.
         let live = self
             .parts
             .store
@@ -864,8 +865,18 @@ where
     /// Plan D62's rung 4 at `StartRun`: no run row exists, so the refusal is written to the item —
     /// `open -> blocked`, then ``no_candidate_agent: phase `<p>` `` as a note — and handed back for
     /// the caller to raise. Only an item `startable` admitted reaches here (PD1), so the move
-    /// lands; `Ok(false)` means another writer moved it since, and the note is still written: a
-    /// refusal nobody can read is what invariant 7 forbids.
+    /// normally lands; `Ok(false)` means another writer moved the item's status since (a close,
+    /// a block), and the note is still written: a refusal nobody can read is what invariant 7
+    /// forbids.
+    ///
+    /// Known race (MOD-144): `startable` was read without the item lock, and `create_run` no
+    /// longer writes the item row, so a live run another box creates between that read and this
+    /// compare-and-set does not make it return `Ok(false)`. The item is then `blocked` over a
+    /// walking run: `Unblock` refuses with `run_is_walking` and retry/promote with `ItemBlocked`
+    /// until the run parks (`Unblock`'s `FollowRun` then moves it `blocked -> open`) or ends
+    /// (`Reopen`). It needs two boxes to start the same item at once, one of them refusing.
+    /// Closing it needs a store-side guard (the move conditional on no live graph run), which is
+    /// the store's scope, not the engine's.
     async fn refuse_rung_four(
         &self,
         item: &Item,
@@ -887,8 +898,10 @@ where
     /// `R-ORCH-10` at `StartRun` (MOD-7 milestone 3, D79, D82): no run row exists, so the refusal
     /// is written to the item, `open -> blocked` and then `missing tags: a, b` as a note on this
     /// box, and handed back. Only an item `startable` admitted reaches here (PD1), so the move
-    /// lands; `Ok(false)` means another writer moved it since, and the note is still written (rung
-    /// 4's rule; invariant 7).
+    /// normally lands; `Ok(false)` means another writer moved the item's status since, and the
+    /// note is still written (rung 4's rule; invariant 7). The same known race as
+    /// [`Self::refuse_rung_four`]'s applies: a live run created by another box after the
+    /// `startable` read does not stop the move.
     async fn refuse_missing_tags(
         &self,
         item: &Item,

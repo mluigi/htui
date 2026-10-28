@@ -370,14 +370,14 @@ pub fn resumable_park(cursor: &Cursor) -> bool {
 /// `answer_gate(Rejected)` wrote and whose unpark a crash cut off.
 ///
 /// `answer_gate` moves the step `awaiting_approval -> failed` and the unpark is the command's
-/// second write, so a crash between them leaves the run (and the item) `awaiting_approval` over a
-/// [`Cursor::Rest`] at `failed` whose `gate_outcome` is `rejected`. No gate waits on a human there:
+/// second write, so a crash between them leaves the run `awaiting_approval` (the item reads
+/// `needs you`) over a [`Cursor::Rest`] at `failed` whose `gate_outcome` is `rejected`. No gate waits on a human there:
 /// the rejection was answered, and only its tail (the end of the run, or the review loop) is owed.
 /// A `failed` step with no `gate_outcome` (a spent budget, an interrupt) is not one of these.
 ///
 /// A followed review-loop escalation looks exactly like this too (MOD-37 milestone 2 blueprint,
-/// claim 2): the run parked over its `failed` + `rejected` review, the item moved back to
-/// `awaiting_approval` by `Unblock`'s `FollowRun`. No row tells the two apart, so `Unblock` resumes
+/// claim 2): the run parked over its `failed` + `rejected` review, the item moved back to `open`
+/// by `Unblock`'s `FollowRun`. No row tells the two apart, so `Unblock` resumes
 /// that one as well and the loop, with nothing changed, escalates again.
 #[must_use]
 pub fn crashed_rejection<'s>(cursor: &Cursor, steps: &'s [RunStep]) -> Option<&'s RunStep> {
