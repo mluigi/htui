@@ -28,9 +28,8 @@ const WIDE: NonZeroU16 = NonZeroU16::new(2).unwrap();
 
 /// Draws an in-pane editor over `area`: the kit's rule titled `title` on the top row
 /// (`kit::rule`; focused: `theme.title`, else `theme.dim`), then the VT screen cell by cell in
-/// the rest. When `focused` and the child shows
-/// its cursor, the terminal's real cursor is placed on it (`Frame::set_cursor_position`), on the
-/// grid's last column while a wrap is pending.
+/// the rest. When `focused` and the child shows its cursor, the terminal's real cursor is placed
+/// on it (`Frame::set_cursor_position`), on the grid's last column while a wrap is pending.
 pub fn render(
     frame: &mut Frame<'_>,
     area: Rect,
