@@ -12,7 +12,7 @@
 
 use std::ffi::OsStr;
 
-use htui_core::model::Status;
+use htui_core::model::ItemState;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 
@@ -81,9 +81,9 @@ pub struct Theme {
     pub error: Style,
     /// Item and requirement keys, and the Graph sub-tab's node labels (D1).
     pub key: Style,
-    /// Something in progress: an `in_progress` item, a running run or step or graph node (D1).
+    /// Something in progress: a running item, a running run or step or graph node (D1).
     pub running: Style,
-    /// Something that needs a person: `awaiting_approval`, a degraded store, the waiting
+    /// Something that needs a person: an item that needs you, a degraded store, the waiting
     /// count (D1, D6); in the Runs pane a pending cancel, a parked step's reason, the `asks:`
     /// line and the waiting-for-the-walk line.
     pub warning: Style,
@@ -258,15 +258,16 @@ impl Theme {
         }
     }
 
-    /// The style an [`Status`] renders with, so every list agrees on what "blocked" looks like.
+    /// The style an [`ItemState`] renders with, so every list agrees on what "blocked" looks like.
+    /// `stopped` reads as plain text, as its run mark does (`kit::label`'s `Tone::Idle`).
     #[must_use]
-    pub fn status_style(&self, status: Status) -> Style {
-        match status {
-            Status::Open | Status::Queued => self.base,
-            Status::InProgress => self.running,
-            Status::AwaitingApproval => self.warning,
-            Status::Blocked | Status::Failed => self.error,
-            Status::Done | Status::Closed => self.dim,
+    pub fn status_style(&self, state: ItemState) -> Style {
+        match state {
+            ItemState::Open | ItemState::Queued | ItemState::Stopped => self.base,
+            ItemState::Running => self.running,
+            ItemState::NeedsYou => self.warning,
+            ItemState::Blocked | ItemState::Failed => self.error,
+            ItemState::Done | ItemState::Closed => self.dim,
         }
     }
 }
@@ -330,20 +331,22 @@ mod tests {
     }
 
     #[test]
-    fn in_progress_is_running_and_awaiting_is_a_warning() {
+    fn a_running_item_is_running_and_one_that_needs_you_is_a_warning() {
         let theme = Theme::default();
         let cases = [
-            (Status::Open, theme.base),
-            (Status::Queued, theme.base),
-            (Status::InProgress, theme.running),
-            (Status::AwaitingApproval, theme.warning),
-            (Status::Blocked, theme.error),
-            (Status::Failed, theme.error),
-            (Status::Done, theme.dim),
-            (Status::Closed, theme.dim),
+            (ItemState::NeedsYou, theme.warning),
+            (ItemState::Failed, theme.error),
+            (ItemState::Running, theme.running),
+            (ItemState::Stopped, theme.base),
+            (ItemState::Blocked, theme.error),
+            (ItemState::Queued, theme.base),
+            (ItemState::Open, theme.base),
+            (ItemState::Done, theme.dim),
+            (ItemState::Closed, theme.dim),
         ];
-        for (status, style) in cases {
-            assert_eq!(theme.status_style(status), style, "{status:?}");
+        assert_eq!(cases.len(), ItemState::ALL.len(), "one row per state");
+        for (state, style) in cases {
+            assert_eq!(theme.status_style(state), style, "{state:?}");
         }
     }
 

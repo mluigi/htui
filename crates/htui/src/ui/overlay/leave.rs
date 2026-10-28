@@ -16,7 +16,7 @@
 //! `register_all` registers it as `App::leave_overlay`.
 
 use crossterm::event::KeyEvent;
-use htui_core::model::{Scope, Status};
+use htui_core::model::{ItemState, Scope};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -136,8 +136,8 @@ impl LeaveDialog {
             Some((_, waiting)) if waiting > 0 => theme.warning,
             _ => theme.base,
         };
-        let working_glyph = mark(Status::InProgress).glyph;
-        let waiting_glyph = mark(Status::AwaitingApproval).glyph;
+        let working_glyph = mark(ItemState::Running).glyph;
+        let waiting_glyph = mark(ItemState::NeedsYou).glyph;
         let mut spans = vec![
             Span::styled(format!("{LEAD}{ROW}"), theme.base),
             Span::styled(format!("{working_glyph} {working} working"), theme.base),
