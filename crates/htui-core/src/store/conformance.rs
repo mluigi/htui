@@ -6623,7 +6623,7 @@ async fn mint_tagged<S: WriteStore>(
 /// `R-ORCH-10` at claim (ANA-2 §4.10, MOD-7 milestone 3 D80): a run whose item requires a tag the
 /// box has neither probed nor declared is refused by name, and that refusal is the one that
 /// writes. Inside the admission transaction the run moves `queued -> failed` with
-/// [`missing_tags_failure`]'s sentence and its item `queued -> blocked`; no slot is taken, the
+/// [`missing_tags_failure`]'s sentence and its item `open -> blocked`; no slot is taken, the
 /// verdict is not repeated, and once the box declares the tags the reopened item runs. The
 /// engine's half (the note, and the refusal that is not re-queued) is the `htui-orch` claim-time
 /// case.
@@ -7865,7 +7865,7 @@ async fn claim_run_refuses_a_stopped_workspace_and_writes_nothing<S: WriteStore>
 }
 
 /// MOD-125 D5: the workspace gate is decided before `R-ORCH-10`'s tags, so a stopped workspace
-/// never fails a run for its tags: the run stays `queued` and its item `queued` (no `MissingTags`
+/// never fails a run for its tags: the run stays `queued` and its item `open` (no `MissingTags`
 /// write). After the resume, the same claim meets the tags.
 async fn claim_run_checks_the_stop_before_tags<S: WriteStore>(store: &S) {
     const CASE: &str = "claim_run_checks_the_stop_before_tags";
@@ -8214,8 +8214,8 @@ async fn leased_step<S: WriteStore>(
     (run, step)
 }
 
-/// MOD-69: a run of `item` created and claimed by `owner` (the run `running`, the item
-/// `in_progress`). Blueprint H-6: a box runs at most two runs at once, so the waiting-list cases
+/// MOD-69: a run of `item` created and claimed by `owner` (the run `running`, the item reading
+/// `running`). Blueprint H-6: a box runs at most two runs at once, so the waiting-list cases
 /// park each run before claiming the next.
 async fn claimed<S: WriteStore>(
     case: &str,

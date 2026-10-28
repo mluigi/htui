@@ -144,7 +144,7 @@ pub enum Claim {
     /// `R-ORCH-10` at claim (MOD-7 milestone 3, D80, D81): the run's item requires tags the box
     /// has neither probed nor declared. **The one refusal that writes**: inside the admission
     /// transaction the run moved `queued -> failed` with [`missing_tags_failure`] as its
-    /// `failure`, and its item `queued -> blocked`. Decided after `NotClaimable` and before the
+    /// `failure`, and its item `open -> blocked`. Decided after `NotClaimable` and before the
     /// slot and the overlap, so a permanent refusal wins over a transient one.
     MissingTags {
         /// The missing tags: byte order, deduplicated, never empty.
