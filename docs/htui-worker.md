@@ -424,10 +424,10 @@ With none of them the worker talks to Qdrant without a key, which is right for a
 none; a Qdrant that needs one refuses, and the log says so. The key is read again for every sync and
 every search, so a key stored in the keyring while the worker runs applies to the next one. The
 credential is not: systemd decrypts `LoadCredentialEncrypted=` into `$CREDENTIALS_DIRECTORY` only
-when the unit starts, so a re-encrypted credential (`htui provision --replace-credential` included)
-needs `systemctl restart htui-worker`. A `--qdrant-key-stdin` line is the key for the life of the
-process. The key is **never** read from `argv`, Postgres or a plain file, and never written to a
-log.
+when the unit starts, so a credential re-encrypted by hand (`systemd-creds encrypt ...`) needs
+`systemctl restart htui-worker`; `htui provision --replace-credential` restarts the service itself.
+A `--qdrant-key-stdin` line is the key for the life of the process. The key is **never** read from
+`argv`, Postgres or a plain file, and never written to a log.
 
 ## Pool size
 
