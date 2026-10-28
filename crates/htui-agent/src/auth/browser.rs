@@ -138,17 +138,19 @@ fn scheme_of(url: &str) -> Option<String> {
         .map(|(scheme, _)| scheme.to_ascii_lowercase())
 }
 
-/// The command to spawn and the name to put in a spawn failure.
+/// The command to spawn and the name to put in a spawn failure. Every opener goes through here,
+/// so htui's own secret variables are removed once, whichever builder made the command.
 fn opener_command(url: &str, opener: &OpenerCommand) -> (String, Command) {
-    match opener {
+    let (program, mut command) = match opener {
         OpenerCommand::Platform => platform_command(url),
         OpenerCommand::Custom(program) => {
             let mut command = Command::new(program);
             command.arg(url);
-            strip_own_env(&mut command);
             (program.to_string_lossy().into_owned(), command)
         }
-    }
+    };
+    strip_own_env(&mut command);
+    (program, command)
 }
 
 /// MOD-158 D5 (`R-SEC-2`): removes htui's own secret variables from an opener, which hands the
@@ -165,7 +167,6 @@ fn platform_command(url: &str) -> (String, Command) {
     let program = "open";
     let mut command = Command::new(program);
     command.arg(url);
-    strip_own_env(&mut command);
     (program.to_owned(), command)
 }
 
@@ -175,7 +176,6 @@ fn platform_command(url: &str) -> (String, Command) {
     let program = "xdg-open";
     let mut command = Command::new(program);
     command.arg(url);
-    strip_own_env(&mut command);
     (program.to_owned(), command)
 }
 
@@ -194,7 +194,6 @@ fn platform_command(url: &str) -> (String, Command) {
         .arg(format!("Start-Process -FilePath $env:{OPEN_URL_VAR}"))
         .env(OPEN_URL_VAR, url)
         .creation_flags(crate::launch::CREATE_NO_WINDOW);
-    strip_own_env(&mut command);
     (program.to_owned(), command)
 }
 
@@ -211,7 +210,6 @@ mod tests {
     fn every_opener_removes_htui_own_env() {
         let url = "https://example.test/login";
         let openers = [
-            platform_command(url),
             opener_command(url, &OpenerCommand::Platform),
             opener_command(url, &OpenerCommand::Custom(PathBuf::from("my-opener"))),
         ];

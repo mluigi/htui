@@ -209,12 +209,11 @@ impl Cli {
         Self::probe_within(binary, PROBE_TIMEOUT)
     }
 
-    /// [`probe`](Cli::probe) under an explicit bound: a `git` that never answers `--version` is
-    /// killed and refused rather than hanging the synchronous `GixIsolator::new` with it.
-    fn probe_within(binary: PathBuf, bound: Duration) -> Result<Self, IsolateError> {
-        use std::io::Read as _;
-
-        let mut probe = std::process::Command::new(&binary);
+    /// The `git --version` command the probe runs. The binary is configurable (a wrapper script is
+    /// code htui does not own), so `HTUI_OWN_ENV` is removed beside `SCRUBBED_ENV` (MOD-158 D5,
+    /// `R-SEC-2`).
+    fn probe_command(binary: &std::path::Path) -> std::process::Command {
+        let mut probe = std::process::Command::new(binary);
         probe
             .arg("--version")
             .stdin(Stdio::null())
@@ -223,9 +222,19 @@ impl Cli {
         for key in SCRUBBED_ENV {
             probe.env_remove(key);
         }
+        for key in htui_core::secret::HTUI_OWN_ENV {
+            probe.env_remove(key);
+        }
         probe.env("LC_ALL", "C").env("GIT_TERMINAL_PROMPT", "0");
+        probe
+    }
 
-        let mut child = probe
+    /// [`probe`](Cli::probe) under an explicit bound: a `git` that never answers `--version` is
+    /// killed and refused rather than hanging the synchronous `GixIsolator::new` with it.
+    fn probe_within(binary: PathBuf, bound: Duration) -> Result<Self, IsolateError> {
+        use std::io::Read as _;
+
+        let mut child = Self::probe_command(&binary)
             .spawn()
             .map_err(|err| IsolateError::Refused(version_could_not_run(&err)))?;
         // The pipe is drained on its own thread, so neither a chatty binary nor a grandchild that
@@ -3028,6 +3037,28 @@ mod tests {
                 "{key} is not removed from the git child: {envs:?}"
             );
         }
+    }
+
+    /// MOD-158 R1 (A-L1): the `git --version` probe runs a configurable binary (a wrapper script is
+    /// code htui does not own), so it loses htui's own secret variables as the verbs do.
+    #[test]
+    fn the_version_probe_removes_htui_own_env() {
+        let command = Cli::probe_command(std::path::Path::new("git"));
+        let envs: Vec<_> = command.get_envs().collect();
+        for key in SCRUBBED_ENV
+            .iter()
+            .chain(htui_core::secret::HTUI_OWN_ENV.iter())
+        {
+            assert!(
+                envs.contains(&(OsStr::new(key), None)),
+                "{key} is not removed from the probe: {envs:?}"
+            );
+        }
+        assert_eq!(
+            envs.len(),
+            SCRUBBED_ENV.len() + htui_core::secret::HTUI_OWN_ENV.len() + 2,
+            "the probe environment is shaped in exactly one place: {envs:?}"
+        );
     }
 
     /// A verb that outlives its budget is killed with its whole process group, and says so.

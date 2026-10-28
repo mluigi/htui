@@ -63,6 +63,8 @@ tokio     = { workspace = true, features = ["test-util", "rt-multi-thread"] }
 tempfile  = "3"
 futures   = { workspace = true }
 rustls    = { workspace = true }
+# MOD-158 R1 (A-L3): a case reads what the headless key read logs.
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

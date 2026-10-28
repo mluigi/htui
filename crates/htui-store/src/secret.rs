@@ -45,8 +45,9 @@ pub const SERVICE: &str = "htui";
 /// Keyring user name of the DSN entry.
 pub const USER: &str = "postgres-dsn";
 
-/// Keyring user name of the Qdrant DSN entry.
-/// The OS keyring username used to store the Qdrant URL.
+/// Keyring user name of the **retired** per-box Qdrant URL (MOD-158 D10). The URL is the
+/// database-wide `qdrant_url` setting now; this entry is read only to offer it once as that setting,
+/// and removed when the offer is taken or discarded.
 pub const QDRANT_URL_USER: &str = "qdrant-url";
 /// The OS keyring username used to store the Qdrant API key.
 pub const QDRANT_KEY_USER: &str = "qdrant-key";
@@ -455,11 +456,21 @@ pub fn qdrant_api_key(
             stdin: None,
             credentials_dir,
         } => {
-            if let Ok(Some(key)) = keyring() {
-                let key = Zeroizing::new(key);
-                if let Some(key) = non_blank(&key) {
-                    return Ok(Some(owned(key)));
+            match keyring() {
+                Ok(Some(key)) => {
+                    let key = Zeroizing::new(key);
+                    if let Some(key) = non_blank(&key) {
+                        return Ok(Some(owned(key)));
+                    }
                 }
+                Ok(None) => {}
+                // A headless keyring that cannot be read is no keyring, but a locked keyring with
+                // no credential must not run keyless without a trace (MOD-158 R1). The error
+                // carries no key.
+                Err(err) => tracing::debug!(
+                    "the Qdrant API key could not be read from the OS keyring ({err}); \
+                     trying the systemd credential"
+                ),
             }
             headless_key_credential(credentials_dir)
         }
@@ -497,7 +508,8 @@ fn headless_key_credential(
     Ok(None)
 }
 
-/// Retrieves the stored Qdrant URL, if any.
+/// Retrieves the retired keyring Qdrant URL, if any. Read only for the once-only offer (MOD-158
+/// D10): nothing else may treat it as the URL.
 pub fn get_qdrant_url() -> Result<Option<String>> {
     #[cfg(feature = "test-support")]
     if let Some(fake) = &*fake() {
@@ -509,7 +521,9 @@ pub fn get_qdrant_url() -> Result<Option<String>> {
     Slot::open(SERVICE, QDRANT_URL_USER)?.get()
 }
 
-/// Stores the Qdrant URL in the keyring.
+/// Stores a Qdrant URL in the retired keyring entry. **Tests only** (MOD-158 D10): nothing in
+/// htui writes the entry any more, so a case plants the old entry the offer reads.
+#[cfg(feature = "test-support")]
 pub fn set_qdrant_url(url: &str) -> Result<()> {
     #[cfg(feature = "test-support")]
     if let Some(fake) = &mut *fake() {
@@ -524,7 +538,7 @@ pub fn set_qdrant_url(url: &str) -> Result<()> {
     Slot::open(SERVICE, QDRANT_URL_USER)?.set(url)
 }
 
-/// Removes the Qdrant URL from the keyring.
+/// Removes the retired keyring Qdrant URL: the offer's "use it" and "discard" (MOD-158 D10).
 pub fn clear_qdrant_url() -> Result<()> {
     #[cfg(feature = "test-support")]
     if let Some(fake) = &mut *fake() {
@@ -1329,6 +1343,72 @@ mod qdrant_key_tests {
             )),
             Some(CREDENTIAL_KEY.to_owned()),
             "a headless keyring error is no keyring; the credential is trimmed"
+        );
+    }
+
+    /// The log lines a closure writes at `debug` and above, captured by a scoped subscriber.
+    fn logged(run: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log buffer").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let buffer = buffer.clone();
+                move || buffer.clone()
+            })
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        let bytes = buffer.0.lock().expect("log buffer").clone();
+        String::from_utf8(bytes).expect("utf-8 logs")
+    }
+
+    /// MOD-158 R1 (A-L3): a headless keyring that cannot be read is no keyring, but it leaves a
+    /// trace, so a locked keyring with no credential does not run keyless silently. The line names
+    /// the keyring's error, never a key.
+    #[test]
+    fn a_headless_keyring_failure_is_logged_without_a_key() {
+        let logs = logged(|| {
+            assert_eq!(
+                key(qdrant_api_key(
+                    None,
+                    KeyHost::Headless {
+                        stdin: None,
+                        credentials_dir: None,
+                    },
+                    &broken,
+                )),
+                None
+            );
+        });
+        assert!(logs.contains(" DEBUG "), "{logs}");
+        assert!(logs.contains("no secret service"), "{logs}");
+        for value in [ENV_KEY, STDIN_KEY, KEYRING_KEY, CREDENTIAL_KEY] {
+            assert!(!logs.contains(value), "{logs}");
+        }
+        let quiet = logged(|| {
+            let _ = qdrant_api_key(
+                None,
+                KeyHost::Headless {
+                    stdin: None,
+                    credentials_dir: None,
+                },
+                &empty,
+            );
+        });
+        assert!(
+            quiet.is_empty(),
+            "an empty keyring is not a failure: {quiet}"
         );
     }
 

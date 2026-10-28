@@ -715,6 +715,13 @@ impl MemStore {
             if current.as_ref().map(|row| row.token) != expected {
                 return CasOutcome::Stale(current);
             }
+            // The token moves on every write, even under a clock that does not (a test's), so a
+            // spent token never matches the row again (MOD-158 R1). One microsecond is
+            // `timestamptz`'s resolution, the same as Postgres's `updated_at`.
+            let now = match expected {
+                Some(old) if now <= old => old + TimeDelta::microseconds(1),
+                _ => now,
+            };
             state
                 .app_settings
                 .insert(QDRANT_URL_KEY.to_owned(), (url.to_value(), now));
@@ -10367,6 +10374,50 @@ mod tests {
     use chrono::{SubsecRound as _, TimeDelta, Utc};
     use serde_json::{Value, json};
     use uuid::Uuid;
+
+    /// MOD-158 R1 (A-L6): under a clock that does not move, a write still moves the `qdrant_url`
+    /// token past the old one, so a spent token never matches the row again.
+    #[tokio::test]
+    async fn a_qdrant_url_write_moves_the_token_under_a_frozen_clock() {
+        use crate::qdrant::QdrantUrl;
+
+        let store = MemStore::default().with_clock(Arc::new(TestClock::new()));
+        let url = |text: &str| QdrantUrl::parse(text).expect("a valid URL");
+        let first = match store
+            .set_qdrant_url(&url("http://first:6334"), None)
+            .await
+            .expect("insert")
+        {
+            CasOutcome::Applied(Some(row)) => row,
+            other => panic!("insert expecting none: {other:?}"),
+        };
+        let second = match store
+            .set_qdrant_url(&url("http://second:6334"), Some(first.token))
+            .await
+            .expect("update")
+        {
+            CasOutcome::Applied(Some(row)) => row,
+            other => panic!("update by token: {other:?}"),
+        };
+        assert!(second.token > first.token, "{second:?} after {first:?}");
+        assert_eq!(
+            store.qdrant_url().await.expect("read").map(|row| row.token),
+            Some(second.token),
+            "the read answers the moved token"
+        );
+        match store
+            .set_qdrant_url(&url("http://third:6334"), Some(first.token))
+            .await
+            .expect("stale update")
+        {
+            CasOutcome::Stale(Some(row)) => assert_eq!(row, second),
+            other => panic!("a spent token is stale: {other:?}"),
+        }
+        match store.clear_qdrant_url(first.token).await.expect("clear") {
+            CasOutcome::Stale(Some(row)) => assert_eq!(row, second),
+            other => panic!("a spent token clears nothing: {other:?}"),
+        }
+    }
 
     /// MOD-76 D4 (R-55): `set_box_setting` writes the key on every clone's row, leaves the
     /// other keys and `edit_version` alone, and answers whether the row exists.

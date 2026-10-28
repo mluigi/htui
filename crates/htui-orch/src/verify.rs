@@ -765,9 +765,11 @@ mod shell_tests {
     }
 
     /// The value the MOD-158 D5 cases plant. Never a real key.
+    #[cfg(unix)]
     pub(super) const QDRANT_KEY_SENTINEL: &str = "SENTINEL-QK";
 
     /// The shell line the D5 cases run: the key if the shell sees it, `absent` if not.
+    #[cfg(unix)]
     pub(super) const PRINT_THE_KEY: &str = "printenv HTUI_QDRANT_API_KEY || echo absent";
 
     /// MOD-158 D5: a test cannot plant a variable in its own process (`set_var` is `unsafe`,
@@ -775,6 +777,7 @@ mod shell_tests {
     /// inherits `HTUI_QDRANT_API_KEY`, and the child does the spawn and asserts
     /// (`htui/src/editor.rs`'s pattern). Answers `true` in the parent, which must then return;
     /// `false` in the child, which must then run the case.
+    #[cfg(unix)]
     pub(super) fn reran_with_the_qdrant_key(name: &str) -> bool {
         const CHILD: &str = "HTUI_ORCH_VERIFY_TEST_ENV_CHILD";
         if std::env::var_os(CHILD).is_some() {
@@ -1059,6 +1062,7 @@ mod tests {
     use htui_core::model::{StepId, VerifyOutcome};
     use htui_core::scrub::MinimalScrubber;
 
+    #[cfg(unix)]
     use super::shell_tests::{PRINT_THE_KEY, QDRANT_KEY_SENTINEL, reran_with_the_qdrant_key};
     use super::{ShellVerifier, Verifier, VerifyRequest};
     use crate::isolate::SystemClock;

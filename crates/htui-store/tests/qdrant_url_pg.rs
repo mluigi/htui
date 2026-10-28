@@ -174,6 +174,21 @@ async fn cases(store: &impl UrlStore) {
     assert_eq!(current, Some(second.clone()));
     assert_eq!(store.stored_value().await, Some(json!("https://second/q")));
 
+    // 5b. Clear with the spent token while a different row exists: the row as it is, untouched.
+    let current = stale(
+        store
+            .clear_qdrant_url(first.token)
+            .await
+            .expect("stale clear"),
+        "clear with a spent token",
+    );
+    assert_eq!(current, Some(second.clone()), "Stale(Some(current))");
+    assert_eq!(
+        store.qdrant_url().await.expect("read"),
+        Some(second.clone()),
+        "the row is untouched"
+    );
+
     // 6. Clear by token, then again with the same token.
     let cleared = applied(
         store.clear_qdrant_url(second.token).await.expect("clear"),
@@ -224,9 +239,32 @@ async fn cases(store: &impl UrlStore) {
     assert_eq!(fixed.url, Ok(url("http://fixed:6334")));
     assert_eq!(
         store.qdrant_url().await.expect("read"),
-        Some(fixed),
+        Some(fixed.clone()),
         "fixed"
     );
+
+    // 8. A malformed row is cleared by its token too.
+    applied(
+        store.clear_qdrant_url(fixed.token).await.expect("clear"),
+        "clear of the fixed row",
+    );
+    store.plant_malformed().await;
+    let malformed = store
+        .qdrant_url()
+        .await
+        .expect("a malformed row still reads")
+        .expect("the row is there");
+    assert_eq!(malformed.url, Err(QdrantUrlError::NotAString));
+    let cleared = applied(
+        store
+            .clear_qdrant_url(malformed.token)
+            .await
+            .expect("clear the malformed row"),
+        "clear of a malformed row by its token",
+    );
+    assert_eq!(cleared, None);
+    assert_eq!(store.qdrant_url().await.expect("read"), None, "no row");
+    assert_eq!(store.stored_value().await, None, "nothing left");
 }
 
 #[tokio::test]
