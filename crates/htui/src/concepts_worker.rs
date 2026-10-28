@@ -76,6 +76,15 @@ pub(crate) fn env_url_unusable(why: QdrantUrlError) -> String {
     )
 }
 
+/// The `HTUI_QDRANT_URL` override as a `Debug` may show it: the parsed URL, or a placeholder for
+/// one that does not parse (a refused URL may hold a password, so its text is never shown).
+pub(crate) fn shown_env_url(env: &QdrantEnv) -> Option<String> {
+    env.url.as_deref().map(|text| {
+        QdrantUrl::parse(text)
+            .map_or_else(|_| "<not a usable URL>".to_owned(), |url| url.to_string())
+    })
+}
+
 /// The keyring read of the Qdrant API key: [`secret::get_qdrant_api_key`] in production, a
 /// closure in a test, so no case reads a keyring.
 pub type KeyringRead = fn() -> htui_core::store::Result<Option<String>>;
@@ -244,8 +253,10 @@ pub struct QdrantSource {
 
 impl core::fmt::Debug for QdrantSource {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Not `QdrantEnv`'s own `Debug`: that prints the override unvalidated.
         f.debug_struct("QdrantSource")
-            .field("env", &self.env)
+            .field("env_url", &shown_env_url(&self.env))
+            .field("env_key", &self.env.api_key.as_ref().map(|_| "<redacted>"))
             .field("published", &self.current().is_some())
             .field(
                 "key",
@@ -1234,6 +1245,26 @@ mod tests {
         assert!(!sentence.contains("SENTINEL"), "{sentence}");
         assert!(!sentence.contains("row"), "{sentence}");
         assert!(source.settings().await.is_err());
+    }
+
+    /// MOD-158 D3: `Debug` prints the override only once it parses; a refused one may hold a
+    /// password and is never echoed, and the key never is.
+    #[test]
+    fn the_debug_never_prints_an_unusable_override() {
+        let shown = format!(
+            "{:?}",
+            source(
+                Some("http://user:SENTINEL@env:6334"),
+                Some("KEY-SENTINEL"),
+                no_key
+            )
+        );
+        assert!(!shown.contains("SENTINEL"), "{shown}");
+        assert!(shown.contains("<not a usable URL>"), "{shown}");
+        let shown = format!("{:?}", source(Some(" http://env:6334 "), None, no_key));
+        assert!(shown.contains("http://env:6334"), "{shown}");
+        let shown = format!("{:?}", source(None, None, no_key));
+        assert!(!shown.contains("usable"), "{shown}");
     }
 
     /// MOD-158 D6: the row is read per call, so one set between two reads is read by the second.

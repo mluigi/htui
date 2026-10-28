@@ -514,7 +514,10 @@ impl core::fmt::Debug for SearchContext<'_> {
     /// Everything but the DSN and the API key, which are secrets.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SearchContext")
-            .field("qdrant_url_override", &self.env.url)
+            .field(
+                "qdrant_url_override",
+                &concepts_worker::shown_env_url(self.env),
+            )
             .field("collection", &self.collection)
             .field("dsn", &"<redacted>")
             .field("identity", &self.identity)
@@ -768,6 +771,30 @@ mod tests {
             score: 0.5,
             snippet: "a decision is a closed item".into(),
         }
+    }
+
+    /// MOD-158 T3: `HTUI_QDRANT_URL` is unvalidated, so `Debug` prints it only once it parses;
+    /// a refused override may hold a password and is never echoed (nor the key, nor the DSN).
+    #[test]
+    fn a_search_context_debug_never_prints_an_unusable_override() {
+        let shown = |url: &str| {
+            let env = QdrantEnv::new(Some(url.to_owned()), Some("KEY-SENTINEL".to_owned()));
+            let ctx = SearchContext {
+                env: &env,
+                keyring_key: || Ok(None),
+                collection: "c",
+                dsn: "postgres://u:DSN-SENTINEL@db/htui",
+                identity: None,
+                connect_timeout: Duration::from_secs(1),
+            };
+            format!("{ctx:?}")
+        };
+        let refused = shown("http://user:SENTINEL@env:6334");
+        assert!(!refused.contains("SENTINEL"), "{refused}");
+        assert!(refused.contains("<not a usable URL>"), "{refused}");
+        let shown = shown(" http://env:6334 ");
+        assert!(shown.contains("http://env:6334"), "{shown}");
+        assert!(!shown.contains("SENTINEL"), "{shown}");
     }
 
     #[test]
