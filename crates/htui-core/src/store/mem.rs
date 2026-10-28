@@ -60,8 +60,9 @@ use crate::prompt::template::TemplateRole;
 use crate::seed;
 use crate::store::error::{Result, StoreError};
 use crate::store::graph_rules::{
-    body_agent_refs, body_persona_refs, edge_predicate, graph_body_shape_refusal,
-    graph_body_topology_refusal, graph_body_walk_refusal, phase_row_refusal,
+    body_agent_refs, body_persona_refs, default_edges_follow, edge_predicate,
+    graph_body_shape_refusal, graph_body_topology_refusal, graph_body_walk_refusal,
+    phase_row_refusal,
 };
 use crate::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
@@ -3717,11 +3718,35 @@ impl State {
                 )));
             }
         }
+        let before = self.phase_rows(phase.graph_id);
+        let before_edges = self.graph_edge_rows(phase.graph_id);
         let mut row = phase.clone();
         row.updated_at = now;
         self.phases.push(row.clone());
         self.bump_graph(row.graph_id, now);
+        let mut after = before.clone();
+        after.push(row.clone());
+        after.sort_by_key(|phase| phase.position);
+        self.follow_default_edges(row.graph_id, &before, &before_edges, &after);
         Ok(row)
+    }
+
+    /// MOD-138 D7: [`default_edges_follow`] applied in place. `write()` has no rollback, so the
+    /// writers call it after their last refusal; it cannot fail.
+    fn follow_default_edges(
+        &mut self,
+        graph: StepGraphId,
+        before_phases: &[StepGraphPhase],
+        before_edges: &[StepGraphEdge],
+        after_phases: &[StepGraphPhase],
+    ) {
+        if let Some(edges) =
+            default_edges_follow(before_phases, before_edges, after_phases, EdgeId::new)
+        {
+            self.edges.retain(|_, edge| edge.graph_id != graph);
+            self.edges
+                .extend(edges.into_iter().map(|edge| (edge.id, edge)));
+        }
     }
 
     /// Inserts a phase's candidate rows, all or nothing (MOD-37 R-6): every refusal is decided
@@ -3819,6 +3844,14 @@ impl State {
         if let Some(Some(persona)) = patch.persona {
             self.require_persona(persona)?;
         }
+        // MOD-138 D7: only `name` and `position` are columns of `default_edges` a patch can set
+        // (`retry_limit` is `replace_graph`'s alone, blueprint F12).
+        let shape = (patch.name.is_some() || patch.position.is_some()).then(|| {
+            (
+                self.phase_rows(current.graph_id),
+                self.graph_edge_rows(current.graph_id),
+            )
+        });
         let row = self
             .phase_mut(id)
             .expect("the row was read a statement ago under the same lock");
@@ -3843,6 +3876,20 @@ impl State {
         row.updated_at = now;
         let row = row.clone();
         self.bump_graph(row.graph_id, now);
+        if let Some((before, before_edges)) = shape {
+            let mut after: Vec<StepGraphPhase> = before
+                .iter()
+                .map(|phase| {
+                    if phase.id == id {
+                        row.clone()
+                    } else {
+                        phase.clone()
+                    }
+                })
+                .collect();
+            after.sort_by_key(|phase| phase.position);
+            self.follow_default_edges(row.graph_id, &before, &before_edges, &after);
+        }
         Ok(CasOutcome::Applied(row))
     }
 
@@ -4046,6 +4093,8 @@ impl State {
                 entity: "step_graph_phase",
                 id: id.to_string(),
             })?;
+        let before = self.phase_rows(graph);
+        let before_edges = self.graph_edge_rows(graph);
         self.phases.retain(|row| row.id != id);
         self.phase_agents.retain(|(phase, _), _| *phase != id);
         self.phase_parts.retain(|(phase, _), _| *phase != id);
@@ -4053,6 +4102,12 @@ impl State {
             .retain(|_, edge| edge.from != id && edge.to != id);
         self.skill_bindings.retain(|row| row.phase_id != Some(id));
         self.bump_graph(graph, now);
+        let after: Vec<StepGraphPhase> = before
+            .iter()
+            .filter(|phase| phase.id != id)
+            .cloned()
+            .collect();
+        self.follow_default_edges(graph, &before, &before_edges, &after);
         Ok(())
     }
 

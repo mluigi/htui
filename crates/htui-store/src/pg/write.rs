@@ -75,9 +75,10 @@ use htui_core::store::{
     withdrawn_requirement_cited,
 };
 use htui_core::store::{
-    body_agent_refs, body_persona_refs, edge_predicate, graph_body_shape_refusal,
-    graph_body_topology_refusal, graph_body_walk_refusal, graph_name_is_taken,
-    override_outside_project, phase_name_is_taken, phase_position_is_taken, phase_row_refusal,
+    body_agent_refs, body_persona_refs, default_edges_follow, edge_predicate,
+    graph_body_shape_refusal, graph_body_topology_refusal, graph_body_walk_refusal,
+    graph_name_is_taken, override_outside_project, phase_name_is_taken, phase_position_is_taken,
+    phase_row_refusal,
 };
 use serde_json::Value;
 use sqlx::types::Json;
@@ -86,7 +87,7 @@ use uuid::Uuid;
 
 use crate::error::map_sqlx;
 use crate::pg::PgStore;
-use crate::pg::read::{StepGraphRow, graph_body_on, graph_edges_on, phase_parts_on};
+use crate::pg::read::{StepGraphRow, graph_body_on, graph_edges_on, phase_parts_on, phase_rows_on};
 use crate::pg::rows::PersonaRow;
 
 /// The refusal text for a kind that is unknown or belongs to another project.
@@ -1423,6 +1424,40 @@ pub(super) async fn insert_edge<'e, E: PgExecutor<'e>>(
     .execute(executor)
     .await
     .map_err(map_sqlx)?;
+    Ok(())
+}
+
+/// MOD-138 D7: `graph`'s phases and edges, read inside a per-row writer's transaction after its
+/// bump, so the graph row lock is held and every graph-content writer that committed before it
+/// is seen (READ COMMITTED: each statement takes a fresh snapshot). The readers' own literals,
+/// so no new `.sqlx` entry.
+async fn graph_shape_on(
+    conn: &mut PgConnection,
+    graph: StepGraphId,
+) -> Result<(Vec<StepGraphPhase>, Vec<StepGraphEdge>)> {
+    let phases = phase_rows_on(&mut *conn, graph).await?;
+    let edges = graph_edges_on(&mut *conn, graph).await?;
+    Ok((phases, edges))
+}
+
+/// Replaces `graph`'s edges whole: `replace_graph`'s step 11 and MOD-138 D7's re-derivation.
+/// The `DELETE` is the literal `replace_graph` always prepared (the offline hash is the literal),
+/// then the one shared [`insert_edge`] per edge.
+async fn replace_edges(
+    conn: &mut PgConnection,
+    graph: StepGraphId,
+    edges: &[StepGraphEdge],
+) -> Result<()> {
+    sqlx::query!(
+        "DELETE FROM step_graph_edge WHERE graph_id = $1",
+        graph.as_uuid()
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(map_sqlx)?;
+    for edge in edges {
+        Box::pin(insert_edge(&mut *conn, edge)).await?;
+    }
     Ok(())
 }
 
@@ -3824,9 +3859,17 @@ impl WriteStore for PgStore {
         if let Some(refusal) = phase_reference_refusal(&mut tx, phase).await? {
             return Err(StoreError::Constraint(refusal));
         }
+        // MOD-138 D7: the graph's shape under the bump's lock, then the edges follow the insert.
+        let (before, before_edges) = Box::pin(graph_shape_on(&mut tx, phase.graph_id)).await?;
         let row = insert_phase(&mut *tx, phase)
             .await
             .map_err(|err| phase_fk_refused(err, phase))?;
+        let mut after = before.clone();
+        after.push(row.clone());
+        after.sort_by_key(|phase| phase.position);
+        if let Some(edges) = default_edges_follow(&before, &before_edges, &after, EdgeId::new) {
+            Box::pin(replace_edges(&mut tx, phase.graph_id, &edges)).await?;
+        }
         tx.commit().await.map_err(map_sqlx)?;
         Ok(row)
     }
@@ -3984,6 +4027,15 @@ impl WriteStore for PgStore {
         {
             return Err(StoreError::Constraint(clash));
         }
+        // MOD-138 D7: only `name` and `position` are columns of `default_edges` a patch can set
+        // (`retry_limit` is `replace_graph`'s alone, blueprint F12). `current.graph_id`, read
+        // `FOR UPDATE` above, is the authoritative graph (review R1 A-M1).
+        let graph = current.graph_id;
+        let shape = if patch.name.is_some() || patch.position.is_some() {
+            Some(Box::pin(graph_shape_on(&mut tx, graph)).await?)
+        } else {
+            None
+        };
 
         // MOD-26 D5: `COALESCE` cannot clear, so the binding is a flag and a value; read before
         // the macro, which moves the patch's other fields.
@@ -4048,6 +4100,24 @@ impl WriteStore for PgStore {
 
         match updated {
             Some(row) => {
+                if let Some((before, before_edges)) = shape {
+                    let mut after: Vec<StepGraphPhase> = before
+                        .iter()
+                        .map(|phase| {
+                            if phase.id == id {
+                                row.clone()
+                            } else {
+                                phase.clone()
+                            }
+                        })
+                        .collect();
+                    after.sort_by_key(|phase| phase.position);
+                    if let Some(edges) =
+                        default_edges_follow(&before, &before_edges, &after, EdgeId::new)
+                    {
+                        Box::pin(replace_edges(&mut tx, graph, &edges)).await?;
+                    }
+                }
                 tx.commit().await.map_err(map_sqlx)?;
                 Ok(CasOutcome::Applied(row))
             }
@@ -4276,14 +4346,7 @@ impl WriteStore for PgStore {
         .map_err(map_sqlx)?;
         let kept_ids: Vec<Uuid> = kept.iter().map(|id| id.as_uuid()).collect();
 
-        // 9. Edges, candidates and parts are replaced wholesale.
-        sqlx::query!(
-            "DELETE FROM step_graph_edge WHERE graph_id = $1",
-            graph.as_uuid()
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(map_sqlx)?;
+        // 9. Candidates and parts are replaced wholesale (the edges in step 11, also whole).
         sqlx::query!(
             "DELETE FROM phase_agent WHERE phase_id = ANY($1)",
             &kept_ids
@@ -4311,7 +4374,8 @@ impl WriteStore for PgStore {
             }
         }
 
-        // 11. Candidates in one statement, then parts and edges row by row.
+        // 11. Candidates in one statement, then parts row by row, then the edges whole through
+        //     the shared `replace_edges` (MOD-138 D7's writers use it too).
         let agents: Vec<&PhaseAgent> = body.nodes.iter().flat_map(|node| &node.agents).collect();
         if !agents.is_empty() {
             let phases: Vec<Uuid> = agents.iter().map(|row| row.phase_id.as_uuid()).collect();
@@ -4337,9 +4401,7 @@ impl WriteStore for PgStore {
         for part in body.nodes.iter().flat_map(|node| &node.parts) {
             Box::pin(insert_part(&mut tx, part)).await?;
         }
-        for edge in &body.edges {
-            Box::pin(insert_edge(&mut *tx, edge)).await?;
-        }
+        Box::pin(replace_edges(&mut tx, graph, &body.edges)).await?;
 
         // 12. F6's backstop: a clash the pre-reads missed is a statement error here.
         sqlx::query!("SET CONSTRAINTS ALL IMMEDIATE")
@@ -4371,7 +4433,10 @@ impl WriteStore for PgStore {
     /// [`StoreError::NotFound`] `"step_graph_phase"` for an unknown id.
     async fn delete_phase(&self, id: PhaseId) -> Result<()> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
-        let deleted = if bump_graph_of_phase(&mut tx, id).await?.is_some() {
+        // MOD-138 D7: the graph's shape under the bump's lock, before the delete.
+        let mut shape = None;
+        let deleted = if let Some(graph) = bump_graph_of_phase(&mut tx, id).await? {
+            shape = Some((graph, Box::pin(graph_shape_on(&mut tx, graph)).await?));
             sqlx::query!("DELETE FROM step_graph_phase WHERE id = $1", id.as_uuid())
                 .execute(&mut *tx)
                 .await
@@ -4386,6 +4451,16 @@ impl WriteStore for PgStore {
                 entity: "step_graph_phase",
                 id: id.to_string(),
             });
+        }
+        if let Some((graph, (before, before_edges))) = shape {
+            let after: Vec<StepGraphPhase> = before
+                .iter()
+                .filter(|phase| phase.id != id)
+                .cloned()
+                .collect();
+            if let Some(edges) = default_edges_follow(&before, &before_edges, &after, EdgeId::new) {
+                Box::pin(replace_edges(&mut tx, graph, &edges)).await?;
+            }
         }
         tx.commit().await.map_err(map_sqlx)
     }

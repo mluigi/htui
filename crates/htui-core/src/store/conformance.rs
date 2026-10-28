@@ -276,6 +276,11 @@ pub const CASES: &[&str] = &[
     "replace_graph_refuses_a_forward_changes_requested",
     "replace_graph_refuses_a_forward_fails",
     "replace_graph_accepts_an_asks_you_back_edge",
+    // MOD-138 M1: the per-row writers keep default edges (plan D7, blueprint §T3)
+    "create_phase_keeps_a_default_graph_default_edged",
+    "update_phase_keeps_a_default_graph_default_edged",
+    "delete_phase_keeps_a_default_graph_default_edged",
+    "per_row_writers_leave_authored_edges_alone",
     "project_types_are_the_six_builtins",
     "a_new_project_is_software",
     "memory_create_writes_the_row_and_revision_1",
@@ -896,6 +901,18 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "replace_graph_accepts_an_asks_you_back_edge" => {
             Box::pin(replace_graph_accepts_an_asks_you_back_edge(store)).await;
+        }
+        "create_phase_keeps_a_default_graph_default_edged" => {
+            Box::pin(create_phase_keeps_a_default_graph_default_edged(store)).await;
+        }
+        "update_phase_keeps_a_default_graph_default_edged" => {
+            Box::pin(update_phase_keeps_a_default_graph_default_edged(store)).await;
+        }
+        "delete_phase_keeps_a_default_graph_default_edged" => {
+            Box::pin(delete_phase_keeps_a_default_graph_default_edged(store)).await;
+        }
+        "per_row_writers_leave_authored_edges_alone" => {
+            Box::pin(per_row_writers_leave_authored_edges_alone(store)).await;
         }
         "project_types_are_the_six_builtins" => {
             project_types_are_the_six_builtins(store).await;
@@ -22180,6 +22197,9 @@ async fn replace_graph_keeps_bindings_of_kept_phases<S: WriteStore>(store: &S) {
     let mut written = body_now(CASE, store, graph).await;
     written.nodes.retain(|node| node.phase.id == kept);
     written.nodes[0].phase.name = "kept".to_owned();
+    // MOD-138 D7 (blueprint F17): the scratch graph is default-edged now, and its `next` edge
+    // names the dropped phase; the body drops it with the node.
+    written.edges.clear();
     applied(
         CASE,
         store
@@ -22649,6 +22669,306 @@ async fn replace_graph_accepts_an_asks_you_back_edge<S: WriteStore>(store: &S) {
         store.graph_edges(graph).await.expect(CASE),
         answer.edges,
         "{CASE}: the read agrees with the answer"
+    );
+}
+
+// ---- MOD-138 M1: the per-row writers keep default edges (plan D7, blueprint §T3.1) ----------
+
+/// Edges without their ids, as an order-free multiset (D7 mints fresh ids, blueprint §4.5).
+fn edge_set(edges: &[StepGraphEdge]) -> Vec<EdgeShape> {
+    let mut shapes = edge_shape(edges);
+    shapes.sort_by_key(|shape| (shape.0, shape.1, shape.2.as_str(), shape.4));
+    shapes
+}
+
+/// `graph`'s revision now.
+async fn revision_now<S: WriteStore>(case: &str, store: &S, graph: StepGraphId) -> i64 {
+    body_now(case, store, graph).await.graph.revision
+}
+
+/// MOD-138 D7: `graph`'s stored edges are exactly `seed::default_edges` of its stored phases;
+/// the edges, for the caller's further checks.
+async fn assert_default_edged<S: WriteStore>(
+    case: &str,
+    store: &S,
+    graph: StepGraphId,
+    after: &str,
+) -> Vec<StepGraphEdge> {
+    let phases = store.phases(graph).await.expect(case);
+    let edges = store.graph_edges(graph).await.expect(case);
+    assert_eq!(
+        edge_set(&edges),
+        edge_set(&seed::default_edges(&phases, EdgeId::new)),
+        "{case}: after {after}, the graph is default-edged"
+    );
+    edges
+}
+
+/// MOD-138 D7: a graph built row by row is default-edged (the empty graph is, and each
+/// `create_phase` re-derives); appending a phase re-chains it in the same write, one bump each.
+async fn create_phase_keeps_a_default_graph_default_edged<S: WriteStore>(store: &S) {
+    const CASE: &str = "create_phase_keeps_a_default_graph_default_edged";
+    let (graph, phases) =
+        scratch_graph(CASE, store, "created", &["plan", "implement", "review"]).await;
+    let (plan, implement, review) = (phases[0].id, phases[1].id, phases[2].id);
+    let edges = assert_default_edged(CASE, store, graph, "three creates").await;
+    assert_eq!(
+        edge_set(&edges),
+        edge_set(&[
+            graph_edge(graph, plan, implement, EdgeKind::Next),
+            graph_edge(graph, implement, review, EdgeKind::Next),
+            StepGraphEdge {
+                loop_limit: Some(phases[1].retry_limit),
+                ..graph_edge(graph, review, implement, EdgeKind::ChangesRequested)
+            },
+        ]),
+        "{CASE}: the chain and the review loop, by phase id"
+    );
+    let revision = revision_now(CASE, store, graph).await;
+    let docs = store
+        .create_phase(&new_phase(graph, 3, "docs"))
+        .await
+        .expect(CASE);
+    let edges = assert_default_edged(CASE, store, graph, "appending `docs`").await;
+    assert!(
+        edges
+            .iter()
+            .any(|edge| (edge.from, edge.to, edge.kind) == (review, docs.id, EdgeKind::Next)),
+        "{CASE}: `review → docs` is chained in"
+    );
+    assert_eq!(
+        revision_now(CASE, store, graph).await,
+        revision + 1,
+        "{CASE}: the create and its edges are one write, one bump"
+    );
+}
+
+/// MOD-138 D7: moves and renames re-derive the edges in the same write; a rename the rule does
+/// not see (the loop keeps its target) leaves the edges as they are. One bump each.
+async fn update_phase_keeps_a_default_graph_default_edged<S: WriteStore>(store: &S) {
+    const CASE: &str = "update_phase_keeps_a_default_graph_default_edged";
+    let (graph, phases) =
+        scratch_graph(CASE, store, "updated", &["plan", "implement", "review"]).await;
+    let (plan, implement, review) = (&phases[0], &phases[1], &phases[2]);
+    let patch_of = |name: Option<&str>, position: Option<i32>| PhasePatch {
+        name: name.map(str::to_owned),
+        position,
+        ..PhasePatch::default()
+    };
+
+    // `review` to 9: the order is unchanged, and so are the edges.
+    let before = store.graph_edges(graph).await.expect(CASE);
+    let revision = revision_now(CASE, store, graph).await;
+    let review = applied(
+        CASE,
+        store
+            .update_phase(review.id, review.updated_at, patch_of(None, Some(9)))
+            .await
+            .expect(CASE),
+    );
+    let edges = assert_default_edged(CASE, store, graph, "moving `review` to 9").await;
+    assert_eq!(edges, before, "{CASE}: nothing moved, the edges are kept");
+    assert_eq!(
+        revision_now(CASE, store, graph).await,
+        revision + 1,
+        "{CASE}: one bump"
+    );
+
+    // `implement` → `build`: the loop now targets the phase before `review`, the same id.
+    let revision = revision_now(CASE, store, graph).await;
+    applied(
+        CASE,
+        store
+            .update_phase(
+                implement.id,
+                implement.updated_at,
+                patch_of(Some("build"), None),
+            )
+            .await
+            .expect(CASE),
+    );
+    let edges = assert_default_edged(CASE, store, graph, "renaming `implement`").await;
+    assert_eq!(
+        edge_set(&edges),
+        edge_set(&before),
+        "{CASE}: the loop's target is the same phase, so the shape is unchanged"
+    );
+    assert_eq!(
+        revision_now(CASE, store, graph).await,
+        revision + 1,
+        "{CASE}: one bump"
+    );
+
+    // `review` → `check`: no review, no loop.
+    let revision = revision_now(CASE, store, graph).await;
+    applied(
+        CASE,
+        store
+            .update_phase(review.id, review.updated_at, patch_of(Some("check"), None))
+            .await
+            .expect(CASE),
+    );
+    let edges = assert_default_edged(CASE, store, graph, "renaming `review`").await;
+    assert!(
+        edges
+            .iter()
+            .all(|edge| edge.kind != EdgeKind::ChangesRequested),
+        "{CASE}: the loop edge went with the name"
+    );
+    assert_eq!(edges.len(), 2, "{CASE}: the `next` chain alone");
+    assert_eq!(
+        revision_now(CASE, store, graph).await,
+        revision + 1,
+        "{CASE}: one bump"
+    );
+
+    // `plan` to 5: the order is now build, plan, check, and the chain follows it.
+    let revision = revision_now(CASE, store, graph).await;
+    applied(
+        CASE,
+        store
+            .update_phase(plan.id, plan.updated_at, patch_of(None, Some(5)))
+            .await
+            .expect(CASE),
+    );
+    let edges = assert_default_edged(CASE, store, graph, "moving `plan` to 5").await;
+    assert_eq!(
+        edge_set(&edges),
+        edge_set(&[
+            graph_edge(graph, implement.id, plan.id, EdgeKind::Next),
+            graph_edge(graph, plan.id, review.id, EdgeKind::Next),
+        ]),
+        "{CASE}: `build → plan → check`"
+    );
+    assert_eq!(
+        revision_now(CASE, store, graph).await,
+        revision + 1,
+        "{CASE}: one bump"
+    );
+}
+
+/// MOD-138 D7: deleting the middle phase re-chains `next` around it and re-targets the loop, in
+/// the same write.
+async fn delete_phase_keeps_a_default_graph_default_edged<S: WriteStore>(store: &S) {
+    const CASE: &str = "delete_phase_keeps_a_default_graph_default_edged";
+    let (graph, phases) =
+        scratch_graph(CASE, store, "deleted", &["plan", "implement", "review"]).await;
+    let (plan, implement, review) = (&phases[0], phases[1].id, phases[2].id);
+    let revision = revision_now(CASE, store, graph).await;
+    store.delete_phase(implement).await.expect(CASE);
+    let edges = assert_default_edged(CASE, store, graph, "deleting `implement`").await;
+    assert_eq!(
+        edge_set(&edges),
+        edge_set(&[
+            graph_edge(graph, plan.id, review, EdgeKind::Next),
+            StepGraphEdge {
+                loop_limit: Some(plan.retry_limit),
+                ..graph_edge(graph, review, plan.id, EdgeKind::ChangesRequested)
+            },
+        ]),
+        "{CASE}: `plan → review`, and the loop falls back to the phase before `review`"
+    );
+    assert_eq!(
+        revision_now(CASE, store, graph).await,
+        revision + 1,
+        "{CASE}: the delete and its edges are one write, one bump"
+    );
+}
+
+/// MOD-138 D7: a graph whose edges were authored keeps them through every per-row write; a new
+/// phase is an unlinked root, and a delete takes only its own edges (the cascade).
+async fn per_row_writers_leave_authored_edges_alone<S: WriteStore>(store: &S) {
+    const CASE: &str = "per_row_writers_leave_authored_edges_alone";
+    let (graph, phases) =
+        scratch_graph(CASE, store, "authored", &["plan", "implement", "review"]).await;
+    let (plan, review) = (phases[0].id, phases[2].id);
+    let mut body = body_now(CASE, store, graph).await;
+    body.edges = seed::default_edges(&phases, EdgeId::new);
+    body.edges
+        .push(graph_edge(graph, review, plan, EdgeKind::AsksYou));
+    let answer = applied(
+        CASE,
+        store
+            .replace_graph(graph, body.graph.revision, body)
+            .await
+            .expect(CASE),
+    );
+    // The replace restamps every kept row, so the rename's token is the answer's.
+    let implement = &answer.nodes[1].phase;
+    assert_eq!(
+        implement.id, phases[1].id,
+        "{CASE}: nodes in position order"
+    );
+    let authored = answer.edges.clone();
+    let by_id = |mut edges: Vec<StepGraphEdge>| {
+        edges.sort_by_key(|edge| edge.id);
+        edges
+    };
+    let stored = || async { by_id(store.graph_edges(graph).await.expect(CASE)) };
+
+    let docs = store
+        .create_phase(&new_phase(graph, 3, "docs"))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        stored().await,
+        by_id(authored.clone()),
+        "{CASE}: a create leaves authored edges alone"
+    );
+    let docs = applied(
+        CASE,
+        store
+            .update_phase(
+                docs.id,
+                docs.updated_at,
+                PhasePatch {
+                    position: Some(10),
+                    ..PhasePatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        stored().await,
+        by_id(authored.clone()),
+        "{CASE}: a move leaves authored edges alone"
+    );
+    applied(
+        CASE,
+        store
+            .update_phase(
+                implement.id,
+                implement.updated_at,
+                PhasePatch {
+                    name: Some("build".to_owned()),
+                    ..PhasePatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        stored().await,
+        by_id(authored.clone()),
+        "{CASE}: a rename leaves authored edges alone"
+    );
+    store.delete_phase(docs.id).await.expect(CASE);
+    assert_eq!(
+        stored().await,
+        by_id(authored.clone()),
+        "{CASE}: deleting an unlinked phase leaves authored edges alone"
+    );
+    store.delete_phase(implement.id).await.expect(CASE);
+    assert_eq!(
+        stored().await,
+        by_id(
+            authored
+                .into_iter()
+                .filter(|edge| edge.from != implement.id && edge.to != implement.id)
+                .collect()
+        ),
+        "{CASE}: a delete takes its own edges and re-derives nothing"
     );
 }
 

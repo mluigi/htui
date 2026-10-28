@@ -947,7 +947,9 @@ pub trait WriteStore: ReadStore {
     /// returned. `judge` and `handoff` are template roles, not phase names
     /// ([`TemplateRole::of_name`](crate::prompt::template::TemplateRole::of_name)).
     ///
-    /// A successful insert bumps the graph's `revision` (MOD-137 D5).
+    /// A successful insert bumps the graph's `revision` (MOD-137 D5). MOD-138 D7: on a
+    /// default-edged graph the edges are re-derived in the same write; authored edges are left
+    /// alone ([`default_edges_follow`](crate::store::default_edges_follow)).
     ///
     /// # Errors
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint), in MOD-137 blueprint
@@ -975,7 +977,9 @@ pub trait WriteStore: ReadStore {
     async fn create_phase_agents(&self, phase: PhaseId, agents: &[PhaseAgent]) -> Result<()>;
 
     /// Edits the six columns of [`PhasePatch`] under CAS; `token_budget` is
-    /// [`set_setting`](Self::set_setting)'s on the `Phase` rung and is not here (D8).
+    /// [`set_setting`](Self::set_setting)'s on the `Phase` rung and is not here (D8). MOD-138
+    /// D7: on a default-edged graph the edges are re-derived in the same write; authored edges
+    /// are left alone. Only a patch setting `name` or `position` can move them.
     ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id;
@@ -1041,7 +1045,8 @@ pub trait WriteStore: ReadStore {
     ) -> Result<CasOutcome<GraphBody>>;
 
     /// Deletes a phase with its candidates, parts, edges and phase bindings (MOD-137 D11); the
-    /// graph's last phase may go. `revision` + 1.
+    /// graph's last phase may go. `revision` + 1. MOD-138 D7: on a default-edged graph the edges
+    /// are re-derived in the same write; authored edges are left alone.
     ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `"step_graph_phase"` for an
