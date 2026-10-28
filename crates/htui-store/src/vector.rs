@@ -32,10 +32,10 @@ use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
 use uuid::Uuid;
 
-/// The collection name. Versioned: a change to the vector layout or the payload gets a new name
-/// rather than a migration, since the whole index can be rebuilt from Postgres. `v2` (MOD-50 D222)
-/// added `resolution` and requirement points: a `v1` point of an item closed before then would
-/// never have been rebuilt, since neither its `updated_at` nor its status moves again.
+/// The collection name. Not versioned by name (MOD-159): a payload change bumps
+/// [`PAYLOAD_SCHEMA`], and `connect` drops and recreates a collection stamped otherwise; the next
+/// sync refills it, since the whole index can be rebuilt from Postgres. `v2` is a historical
+/// suffix (MOD-50 D222 added `resolution` and requirement points under a new name).
 pub const COLLECTION: &str = "htui_concepts_v2";
 /// Name of the dense vector.
 pub const DENSE: &str = "dense";
@@ -43,6 +43,12 @@ pub const DENSE: &str = "dense";
 pub const SPARSE: &str = "sparse";
 /// The collection metadata key the embedder's identity is stored under (MOD-68 D8).
 pub const EMBEDDER_KEY: &str = "embedder";
+/// The collection metadata key the payload layout's version is stored under (MOD-144 Decision B).
+pub const PAYLOAD_SCHEMA_KEY: &str = "payload_schema";
+/// The payload layout this htui writes. 2: MOD-144's three-value `status`. Bump it with any change
+/// to what a point's payload means; a collection stamped otherwise is dropped, recreated and
+/// refilled by the next `Indexer::sync`.
+pub const PAYLOAD_SCHEMA: u64 = 2;
 /// How the message of every refusal of an existing collection begins, before `: ` and what is
 /// wrong with which collection and how to rebuild it (MOD-68 D8, review L3). The one spelling
 /// [`is_embedder_mismatch`] reads.
@@ -445,18 +451,31 @@ enum Existing {
     /// Its `dense` width and its recorded embedder are this one's.
     Matches,
     /// Its `dense` width is right and it records no embedder (every pre-MOD-68 index): record
-    /// this one. Safe because fastembed's vectors are the rten embedder's (`docs/ANA-23.md` §5.6).
+    /// this one, and the payload layout. Safe because fastembed's vectors are the rten embedder's
+    /// (`docs/ANA-23.md` §5.6). Never dropped (MOD-144 PD2): a Qdrant that keeps no metadata
+    /// would otherwise drop the index on every connect.
     Stamp,
+    /// Its embedder is this one's, and its payload stamp is missing or another version (MOD-144
+    /// Decision B): drop it, create it again, let the next sync refill it.
+    Rebuild,
 }
 
-/// Whether a collection holding `dense_size`-wide `dense` vectors and `stored` as its `embedder`
-/// metadata can be used by an embedder `mine` of width `dim` (MOD-68 D8). The width is checked
-/// first (A-10): a collection of the wrong width is refused even when it records nothing, so it
-/// is never stamped and then failed on every upsert.
+/// Whether `payload` (the collection's [`PAYLOAD_SCHEMA_KEY`] metadata) is this htui's
+/// [`PAYLOAD_SCHEMA`].
+fn payload_is_current(payload: Option<&serde_json::Value>) -> bool {
+    payload.and_then(serde_json::Value::as_u64) == Some(PAYLOAD_SCHEMA)
+}
+
+/// Whether a collection holding `dense_size`-wide `dense` vectors, `stored` as its `embedder`
+/// metadata and `payload` as its payload stamp can be used by an embedder `mine` of width `dim`
+/// (MOD-68 D8, MOD-144 Decision B). The width is checked first (A-10): a collection of the wrong
+/// width is refused even when it records nothing, so it is never stamped and then failed on every
+/// upsert. Only a collection recording **this** embedder is rebuilt for its payload stamp.
 fn check_existing(
     collection: &str,
     dense_size: Option<u64>,
     stored: Option<serde_json::Value>,
+    payload: Option<serde_json::Value>,
     mine: &EmbedderIdentity,
     dim: usize,
 ) -> Result<Existing, StoreError> {
@@ -479,7 +498,13 @@ fn check_existing(
         return Ok(Existing::Stamp);
     };
     let theirs = match EmbedderIdentity::deserialize(&stored) {
-        Ok(id) if id == *mine => return Ok(Existing::Matches),
+        Ok(id) if id == *mine => {
+            return Ok(if payload_is_current(payload.as_ref()) {
+                Existing::Matches
+            } else {
+                Existing::Rebuild
+            });
+        }
         Ok(id) => id.to_string(),
         Err(_) => stored.to_string(),
     };
@@ -712,7 +737,9 @@ impl<E: DenseEmbedder> QdrantStore<E> {
     /// # Errors
     /// [`StoreError::Backend`] when Qdrant cannot be reached, and `embedder mismatch` when the
     /// collection holds another width or another embedder's vectors (MOD-68 D8); one that records
-    /// no embedder is stamped with this one's [`identity`](DenseEmbedder::identity).
+    /// no embedder is stamped with this one's [`identity`](DenseEmbedder::identity) and
+    /// [`PAYLOAD_SCHEMA`]. One recording this embedder under another payload stamp (or none) is
+    /// dropped and recreated empty (MOD-144 Decision B); the next `Indexer::sync` refills it.
     pub async fn connect(settings: &QdrantSettings, embedder: E) -> Result<Self, StoreError> {
         Self::connect_to(settings, embedder, COLLECTION).await
     }
@@ -767,7 +794,7 @@ impl<E: DenseEmbedder> QdrantStore<E> {
         })
     }
 
-    /// Drops the collection. For tests and for a deliberate rebuild.
+    /// Drops the collection. For tests, and `check_collection`'s rebuild (MOD-144 Decision B).
     pub async fn drop_collection(&self) -> Result<(), StoreError> {
         self.client
             .delete_collection(&self.collection)
@@ -805,11 +832,34 @@ impl<E: DenseEmbedder> QdrantStore<E> {
         Ok(())
     }
 
-    /// Refuses an existing collection of another width or another embedder, and records this
-    /// embedder in one that records none (MOD-68 D8).
+    /// Refuses an existing collection of another width or another embedder, records this
+    /// embedder in one that records none (MOD-68 D8), and drops and recreates one whose payload
+    /// stamp is not [`PAYLOAD_SCHEMA`] (MOD-144 Decision B).
     async fn check_collection(&self) -> Result<(), StoreError> {
         match self.existing().await? {
             Existing::Matches => {}
+            Existing::Rebuild => {
+                tracing::info!(
+                    collection = %self.collection,
+                    payload_schema = PAYLOAD_SCHEMA,
+                    "payload schema changed: rebuilding the collection"
+                );
+                self.drop_collection().await?;
+                if let Err(error) = self.create_collection().await {
+                    // Another process dropped and recreated it first: accept theirs if it is
+                    // current now.
+                    if self
+                        .client
+                        .collection_exists(&self.collection)
+                        .await
+                        .unwrap_or(false)
+                        && self.existing().await? == Existing::Matches
+                    {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+            }
             Existing::Stamp => {
                 let mine = self.embedder.identity();
                 // Qdrant merges an update's metadata into the collection's: the stamp adds its key
@@ -857,10 +907,17 @@ impl<E: DenseEmbedder> QdrantStore<E> {
             .and_then(|c| c.metadata.get(EMBEDDER_KEY))
             .cloned()
             .map(serde_json::Value::from);
+        let payload = info
+            .config
+            .as_ref()
+            .and_then(|c| c.metadata.get(PAYLOAD_SCHEMA_KEY))
+            .cloned()
+            .map(serde_json::Value::from);
         check_existing(
             &self.collection,
             dense_size(&info),
             stored,
+            payload,
             &self.embedder.identity(),
             self.embedder.dim(),
         )
@@ -877,11 +934,18 @@ impl<E: DenseEmbedder> QdrantStore<E> {
             .is_some_and(|config| config.metadata.contains_key(EMBEDDER_KEY))
     }
 
-    /// `{EMBEDDER_KEY: identity}`, the collection metadata this embedder writes.
+    /// `{EMBEDDER_KEY: identity, PAYLOAD_SCHEMA_KEY: PAYLOAD_SCHEMA}`, the collection metadata this
+    /// embedder writes on a create and on a stamp.
     fn metadata(&self) -> Result<HashMap<String, serde_json::Value>, StoreError> {
         let identity = serde_json::to_value(self.embedder.identity())
             .map_err(|e| backend("embedder identity", e))?;
-        Ok(HashMap::from([(EMBEDDER_KEY.to_owned(), identity)]))
+        Ok(HashMap::from([
+            (EMBEDDER_KEY.to_owned(), identity),
+            (
+                PAYLOAD_SCHEMA_KEY.to_owned(),
+                serde_json::Value::from(PAYLOAD_SCHEMA),
+            ),
+        ]))
     }
 
     async fn create_collection(&self) -> Result<(), StoreError> {
@@ -965,8 +1029,8 @@ impl ExistingCollection {
     }
 
     /// The store over this collection once `embedder` passes `connect`'s width and embedder
-    /// check (MOD-68 D8). Stamps nothing: an unstamped collection of the right width is searched
-    /// as it is.
+    /// check (MOD-68 D8). Stamps nothing and drops nothing: an unstamped collection of the right
+    /// width, or one under an older payload stamp (MOD-144), is searched as it is.
     ///
     /// # Errors
     /// `embedder mismatch` ([`is_embedder_mismatch`]) for another width or another embedder's
@@ -977,7 +1041,7 @@ impl ExistingCollection {
             embedder,
             collection: self.collection,
         };
-        // `Matches` and `Stamp` both pass: only `check_collection` writes the stamp.
+        // `Matches`, `Stamp` and `Rebuild` all pass: only `check_collection` writes.
         store.existing().await?;
         Ok(store)
     }
@@ -1536,9 +1600,9 @@ mod tests {
     fn every_refusal_is_an_embedder_mismatch_and_nothing_else_is() {
         let hash = EmbedderIdentity::hash(384);
         for err in [
-            check_existing(C, Some(8), None, &bge(), 384).unwrap_err(),
-            check_existing(C, None, None, &bge(), 384).unwrap_err(),
-            check_existing(C, Some(384), stored(&hash), &bge(), 384).unwrap_err(),
+            check_existing(C, Some(8), None, None, &bge(), 384).unwrap_err(),
+            check_existing(C, None, None, None, &bge(), 384).unwrap_err(),
+            check_existing(C, Some(384), stored(&hash), None, &bge(), 384).unwrap_err(),
         ] {
             assert!(is_embedder_mismatch(&err), "{err}");
         }
@@ -1554,23 +1618,105 @@ mod tests {
     #[test]
     fn an_equal_identity_matches() {
         assert_eq!(
-            check_existing(C, Some(384), stored(&bge()), &bge(), 384).unwrap(),
+            check_existing(C, Some(384), stored(&bge()), current(), &bge(), 384).unwrap(),
             Existing::Matches
         );
+    }
+
+    /// [`PAYLOAD_SCHEMA`] as the collection's metadata records it.
+    fn current() -> Option<serde_json::Value> {
+        Some(serde_json::json!(PAYLOAD_SCHEMA))
     }
 
     #[test]
     fn a_collection_without_an_identity_is_stamped() {
         assert_eq!(
-            check_existing(C, Some(384), None, &bge(), 384).unwrap(),
+            check_existing(C, Some(384), None, None, &bge(), 384).unwrap(),
             Existing::Stamp
         );
+    }
+
+    /// MOD-144 Decision B: this embedder under this payload layout is used as it is.
+    #[test]
+    fn a_current_payload_stamp_matches() {
+        assert_eq!(
+            check_existing(C, Some(384), stored(&bge()), current(), &bge(), 384).unwrap(),
+            Existing::Matches
+        );
+    }
+
+    /// MOD-144 Decision B: this embedder under an older payload layout is rebuilt, whatever the
+    /// older value is.
+    #[test]
+    fn an_older_payload_stamp_is_rebuilt() {
+        for older in [
+            serde_json::json!(1),
+            serde_json::json!(PAYLOAD_SCHEMA + 1),
+            serde_json::json!("2"),
+        ] {
+            assert_eq!(
+                check_existing(
+                    C,
+                    Some(384),
+                    stored(&bge()),
+                    Some(older.clone()),
+                    &bge(),
+                    384
+                )
+                .unwrap(),
+                Existing::Rebuild,
+                "{older}"
+            );
+        }
+    }
+
+    /// MOD-144 Decision B: a collection that records this embedder and no payload layout was
+    /// filled before the stamp existed (the old eight-value `status`), so it is rebuilt.
+    #[test]
+    fn a_missing_payload_stamp_on_a_stamped_collection_is_rebuilt() {
+        assert_eq!(
+            check_existing(C, Some(384), stored(&bge()), None, &bge(), 384).unwrap(),
+            Existing::Rebuild
+        );
+    }
+
+    /// MOD-144 PD2: a collection that records no embedder is stamped, never dropped, whatever its
+    /// payload stamp says: a Qdrant that keeps no metadata would otherwise drop it on every
+    /// connect.
+    #[test]
+    fn a_collection_without_an_identity_is_stamped_not_rebuilt() {
+        for payload in [None, Some(serde_json::json!(1)), current()] {
+            assert_eq!(
+                check_existing(C, Some(384), None, payload.clone(), &bge(), 384).unwrap(),
+                Existing::Stamp,
+                "{payload:?}"
+            );
+        }
+    }
+
+    /// MOD-144 Decision B: a create and a stamp write both keys, the payload layout as a number
+    /// that reads back through Qdrant's metadata as [`PAYLOAD_SCHEMA`].
+    #[test]
+    fn the_metadata_records_the_payload_schema() {
+        let settings =
+            QdrantSettings::new("http://127.0.0.1:1".to_owned(), None).expect("a valid URL");
+        let store = QdrantStore::new(&settings, Broken, C).expect("no call yet");
+        let metadata = store.metadata().expect("the metadata");
+        assert_eq!(
+            metadata.get(EMBEDDER_KEY),
+            Some(&serde_json::to_value(EmbedderIdentity::hash(384)).unwrap())
+        );
+        let payload = metadata.get(PAYLOAD_SCHEMA_KEY).cloned();
+        assert_eq!(payload, current());
+        let back = payload.map(|value| serde_json::Value::from(Value::from(value)));
+        assert!(payload_is_current(back.as_ref()), "{back:?}");
+        assert_eq!(metadata.len(), 2, "{metadata:?}");
     }
 
     #[test]
     fn another_identity_is_refused_naming_both_and_the_remedy() {
         let hash = EmbedderIdentity::hash(384);
-        let err = check_existing(C, Some(384), stored(&hash), &bge(), 384)
+        let err = check_existing(C, Some(384), stored(&hash), None, &bge(), 384)
             .unwrap_err()
             .to_string();
         assert_names_the_remedy(&err);
@@ -1584,7 +1730,7 @@ mod tests {
     #[test]
     fn another_width_is_refused_before_any_stamp() {
         for stored_id in [None, stored(&bge())] {
-            let err = check_existing(C, Some(8), stored_id, &bge(), 384)
+            let err = check_existing(C, Some(8), stored_id, None, &bge(), 384)
                 .unwrap_err()
                 .to_string();
             assert_names_the_remedy(&err);
@@ -1597,7 +1743,7 @@ mod tests {
 
     #[test]
     fn a_collection_without_a_dense_vector_is_refused() {
-        let err = check_existing(C, None, None, &bge(), 384)
+        let err = check_existing(C, None, None, None, &bge(), 384)
             .unwrap_err()
             .to_string();
         assert_names_the_remedy(&err);
@@ -1610,6 +1756,7 @@ mod tests {
             C,
             Some(384),
             Some(serde_json::json!("garbage")),
+            current(),
             &bge(),
             384,
         )

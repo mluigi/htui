@@ -17,14 +17,14 @@ use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 use htui_store::embed::{DENSE_DIM, DenseEmbedder, EmbedderIdentity, HashEmbedder};
 use htui_store::qdrant_settings::QdrantSettings;
 use htui_store::vector::{
-    DENSE, EMBEDDER_KEY, ExistingCollection, Owner, PointType, QdrantStore, SPARSE, SearchQuery,
-    VectorStore as _, is_embedder_mismatch,
+    DENSE, EMBEDDER_KEY, ExistingCollection, Owner, PAYLOAD_SCHEMA, PAYLOAD_SCHEMA_KEY, PointType,
+    QdrantStore, SPARSE, SearchQuery, VectorStore as _, is_embedder_mismatch,
 };
 use htui_store::vector_sync::Indexer;
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
-    CreateCollectionBuilder, Distance, Modifier, SparseVectorParamsBuilder,
-    SparseVectorsConfigBuilder, VectorParamsBuilder, VectorsConfigBuilder,
+    CountPointsBuilder, CreateCollectionBuilder, Distance, Modifier, SparseVectorParamsBuilder,
+    SparseVectorsConfigBuilder, UpdateCollectionBuilder, VectorParamsBuilder, VectorsConfigBuilder,
 };
 
 const ENV_URL: &str = "HTUI_TEST_QDRANT_URL";
@@ -682,4 +682,156 @@ async fn open_existing_leaves_an_unstamped_collection_unstamped() {
     );
     assert_eq!(stored, None, "no stamp is written");
     assert_eq!(indexes, 0, "no payload index is created");
+}
+
+// MOD-144 Decision B: the payload layout's version in the collection's metadata.
+
+/// What the collection's `payload_schema` metadata says, if anything.
+async fn stored_payload_schema(client: &Qdrant, name: &str) -> Option<serde_json::Value> {
+    let info = client
+        .collection_info(name)
+        .await
+        .expect("collection info")
+        .result
+        .expect("a result");
+    info.config
+        .expect("a config")
+        .metadata
+        .remove(PAYLOAD_SCHEMA_KEY)
+        .map(serde_json::Value::from)
+}
+
+/// How many points the collection holds, counted exactly.
+async fn point_count(client: &Qdrant, name: &str) -> u64 {
+    client
+        .count(CountPointsBuilder::new(name).exact(true))
+        .await
+        .expect("count")
+        .result
+        .expect("a result")
+        .count
+}
+
+/// Records `payload_schema` as `version`, behind `QdrantStore`'s back: Qdrant merges it into the
+/// collection's metadata, so the embedder stays.
+async fn stamp_payload_schema(client: &Qdrant, name: &str, version: u64) {
+    client
+        .update_collection(UpdateCollectionBuilder::new(name).metadata(
+            std::collections::HashMap::from([(
+                PAYLOAD_SCHEMA_KEY.to_owned(),
+                serde_json::json!(version),
+            )]),
+        ))
+        .await
+        .expect("stamp an old payload schema");
+}
+
+#[tokio::test]
+async fn a_new_collection_records_the_payload_schema() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let name = fresh_name();
+    let store = connect(&url, HashEmbedder::new(DENSE_DIM), &name)
+        .await
+        .expect("Qdrant answers");
+    let client = raw(&url);
+    let payload = stored_payload_schema(&client, &name).await;
+    let identity = stored_identity(&client, &name).await;
+    store.drop_collection().await.expect("drop");
+    assert_eq!(payload, Some(serde_json::json!(PAYLOAD_SCHEMA)));
+    assert_eq!(identity, Some(EmbedderIdentity::hash(DENSE_DIM)));
+}
+
+/// A collection filled under an older payload layout (MOD-144: the eight-value `status`) is
+/// dropped and created again on `connect`, empty, stamped with this layout and this embedder;
+/// the next `Indexer::sync` refills it.
+#[tokio::test]
+async fn an_old_payload_schema_drops_and_recreates_the_collection() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let name = fresh_name();
+    let client = raw(&url);
+    let first = connect(&url, HashEmbedder::new(DENSE_DIM), &name)
+        .await
+        .expect("Qdrant answers");
+    let read = MemStore::demo();
+    Indexer::sync(&read, &scope(), &first).await.expect("sync");
+    let filled = point_count(&client, &name).await;
+    stamp_payload_schema(&client, &name, PAYLOAD_SCHEMA - 1).await;
+    let old = stored_payload_schema(&client, &name).await;
+
+    let second = connect(&url, HashEmbedder::new(DENSE_DIM), &name).await;
+    let emptied = point_count(&client, &name).await;
+    let payload = stored_payload_schema(&client, &name).await;
+    let identity = stored_identity(&client, &name).await;
+    let indexes = client
+        .collection_info(&name)
+        .await
+        .expect("collection info")
+        .result
+        .expect("a result")
+        .payload_schema
+        .len();
+    let refilled = match &second {
+        Ok(store) => Some(Indexer::sync(&read, &scope(), store).await),
+        Err(_) => None,
+    };
+    let after = point_count(&client, &name).await;
+    client.delete_collection(&name).await.expect("drop");
+
+    assert!(filled > 0, "control: the first sync wrote points");
+    assert_eq!(
+        old,
+        Some(serde_json::json!(PAYLOAD_SCHEMA - 1)),
+        "control: the old stamp is recorded"
+    );
+    second.expect("an old payload schema is rebuilt, not refused");
+    assert_eq!(emptied, 0, "the rebuilt collection starts empty");
+    assert_eq!(payload, Some(serde_json::json!(PAYLOAD_SCHEMA)));
+    assert_eq!(
+        identity,
+        Some(EmbedderIdentity::hash(DENSE_DIM)),
+        "the embedder is kept"
+    );
+    assert_eq!(indexes, 5, "the payload indexes are built again");
+    refilled.expect("connected").expect("sync");
+    assert_eq!(after, filled, "the next sync refills it");
+}
+
+/// The read-only open writes nothing: under an older payload layout it searches the collection
+/// as it is, and neither drops it nor stamps it.
+#[tokio::test]
+async fn open_existing_never_drops_an_old_payload_schema() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let name = fresh_name();
+    let client = raw(&url);
+    let built = connect(&url, HashEmbedder::new(DENSE_DIM), &name)
+        .await
+        .expect("Qdrant answers");
+    Indexer::sync(&MemStore::demo(), &scope(), &built)
+        .await
+        .expect("sync");
+    let filled = point_count(&client, &name).await;
+    stamp_payload_schema(&client, &name, PAYLOAD_SCHEMA - 1).await;
+
+    let opened = open_existing(&url, HashEmbedder::new(DENSE_DIM), &name).await;
+    let kept = point_count(&client, &name).await;
+    let payload = stored_payload_schema(&client, &name).await;
+    client.delete_collection(&name).await.expect("drop");
+
+    assert!(
+        opened.expect("Qdrant answers").is_some(),
+        "an old payload schema still opens"
+    );
+    assert!(filled > 0, "control: the sync wrote points");
+    assert_eq!(kept, filled, "nothing was dropped");
+    assert_eq!(
+        payload,
+        Some(serde_json::json!(PAYLOAD_SCHEMA - 1)),
+        "nothing was stamped"
+    );
 }
