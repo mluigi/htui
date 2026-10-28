@@ -1258,10 +1258,17 @@ pub fn unblock_enabled(item: &Item, runs: &[(Run, bool)]) -> Result<UnblockCase,
 /// The picker then offers every resolution that [`Resolution::closes_from`] the item's status and
 /// finish, and [`Command::CloseOut`] sends the one picked; the store stays the authority on it.
 ///
+/// Answers that resolution and whether the latest graph run finished `done`, the `finished` that
+/// [`closeout::preview`](crate::closeout::preview) and `closes_from` read, computed once here.
+///
 /// # Errors
 /// [`EngineError::RunStatus`] naming the first live run, then [`EngineError::NotClosable`] for a
 /// `closed` item.
-pub fn close_out_enabled(item: &Item, runs: &[Run]) -> Result<Resolution, EngineError> {
+pub fn close_out_enabled<'a>(
+    item: &Item,
+    runs: impl IntoIterator<Item = &'a Run>,
+) -> Result<(Resolution, bool), EngineError> {
+    let runs: Vec<&Run> = runs.into_iter().collect();
     if let Some(live) = runs.iter().find(|run| run.status.is_active()) {
         return Err(EngineError::RunStatus {
             run: live.id,
@@ -1275,14 +1282,18 @@ pub fn close_out_enabled(item: &Item, runs: &[Run]) -> Result<Resolution, Engine
             state: ItemState::Closed,
         });
     }
-    let finished = latest_graph_run(runs).filter(|run| run.status == RunStatus::Done);
+    let finished =
+        latest_graph_run(runs.iter().copied()).filter(|run| run.status == RunStatus::Done);
     let kind = finished.map(|run| {
         run.graph_snapshot
             .as_ref()
             .and_then(GraphSnapshot::last_output_kind)
             .unwrap_or_default()
     });
-    Ok(Resolution::default_for(item.status, kind.as_deref()))
+    Ok((
+        Resolution::default_for(item.status, kind.as_deref()),
+        finished.is_some(),
+    ))
 }
 
 /// MOD-4 plan D177 (R-25): a manual cleanup retry is for a run that has finished.
@@ -2425,8 +2436,8 @@ mod tests {
             let start = close_out_enabled(&item_at(status), &runs);
             assert_eq!(
                 start.ok(),
-                Some(resolution),
-                "`{status}` over {:?}",
+                Some((resolution, finished)),
+                "`{status}` over {:?}: the start and whether the latest graph run finished",
                 runs.iter().map(|run| run.status).collect::<Vec<_>>()
             );
             assert!(
@@ -2455,13 +2466,13 @@ mod tests {
         last["output_kind"] = serde_json::Value::from("verdict");
         assert_eq!(
             close_out_enabled(&item_at(Status::Open), std::slice::from_ref(&verdict)).ok(),
-            Some(Resolution::Concluded)
+            Some((Resolution::Concluded, true))
         );
 
         verdict.graph_snapshot = None;
         assert_eq!(
             close_out_enabled(&item_at(Status::Open), std::slice::from_ref(&verdict)).ok(),
-            Some(Resolution::Done)
+            Some((Resolution::Done, true))
         );
     }
 

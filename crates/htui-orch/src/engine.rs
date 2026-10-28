@@ -1324,11 +1324,11 @@ where
 
     /// §4.8's `promote to chat` (MOD-4 plan D163, blueprint D191, D192).
     ///
-    /// The guard ([`crate::command::promote_enabled`]) over the rows read, the lease, then in
-    /// its window: a `running` step (reached only after the worker preempted its walk) moves to
+    /// The guard ([`crate::command::promote_enabled`]) over the rows read, the lease, then in its
+    /// window: a `running` step (reached only after the worker preempted its walk) moves to
     /// `awaiting_approval`, `promote_step` stamps `promoted_at` and parks the run in one
-    /// transaction (MOD-144: no item write), and a note says so. The lease is given back — a parked run holds none
-    /// (plan D87) — and the answer says how the chat opens ([`Self::opening`]). No
+    /// transaction (MOD-144: no item write), and a note says so. The lease is given back — a parked
+    /// run holds none (plan D87) — and the answer says how the chat opens ([`Self::opening`]). No
     /// `run(kind = 'chat')` row is written, and the step's `prompt_digest` and `trim_record` are
     /// never touched.
     async fn promote(
@@ -1734,11 +1734,13 @@ where
                     .await?
                 {
                     // Another writer moved the item after it was read, so it is no longer
-                    // blocked: the refusal names where it is now.
+                    // blocked: the refusal names where it is now, its latest graph run included.
                     let row = self.item(item).await?;
+                    let runs = self.parts.store.runs(item).await?;
+                    let latest = htui_core::model::latest_graph_run(&runs).map(|run| run.status);
                     return Err(EngineError::NotBlocked {
                         item,
-                        state: htui_core::model::ItemState::of(row.status, None),
+                        state: htui_core::model::ItemState::of(row.status, latest),
                         why: crate::command::nothing_is_blocked(),
                     });
                 }
@@ -2517,9 +2519,7 @@ where
     /// [`EngineError::RunStatus`] or [`EngineError::NotClosable`], and the store's own.
     pub async fn close_out_preview(&self, item: ItemId) -> Result<closeout::Preview, EngineError> {
         let reads = self.close_out_reads(item).await?;
-        let resolution = crate::command::close_out_enabled(&reads.item, &reads.runs)?;
-        let finished = htui_core::model::latest_graph_run(&reads.runs)
-            .is_some_and(|run| run.status == RunStatus::Done);
+        let (resolution, finished) = crate::command::close_out_enabled(&reads.item, &reads.runs)?;
         let heads = self.parts.store.documents(item).await?;
         Ok(closeout::preview(
             &reads.item,
@@ -3290,11 +3290,11 @@ where
     /// rows: one per `fanout_index` of `0..fan_out` (plan D71), so a `fan_out = 1` phase is the
     /// case of a single index.
     ///
-    /// `Some(rest)` is the refusal: the walk left nothing the selector would take, the item goes
-    /// to `blocked` **before** the run is failed (blueprint H-16 — blocking first keeps the
-    /// refusal readable if a crash cuts the tail off: an open item over a failed run reads
-    /// `failed`, not `blocked`), and an `item_note` records the reason (plan D62). `None` means the `pending` rows exist and the walk may run
-    /// them.
+    /// `Some(rest)` is the refusal: the walk left nothing the selector would take, the item goes to
+    /// `blocked` **before** the run is failed (blueprint H-16 — blocking first keeps the refusal
+    /// readable if a crash cuts the tail off: an open item over a failed run reads `failed`, not
+    /// `blocked`), and an `item_note` records the reason (plan D62). `None` means the `pending`
+    /// rows exist and the walk may run them.
     async fn admit(
         &self,
         run: &Run,
@@ -10710,16 +10710,14 @@ mod tests {
         );
     }
 
-    /// Plan D149 (R-34): a command that raises between its lease take and its walk gives the
-    /// lease back. A gate answer's window — the answer, then the run's unpark — raises after the
-    /// run is already `running` again. Without the release, plan D88 would keep this process's
-    /// sweep off a run nothing walks.
-    ///
-    /// MOD-144: the unpark no longer writes the item, so `MemFault::ItemTransition` (plan D152)
-    /// no longer reaches the window's tail; the answer's own two writes are driven through
-    /// [`Engine::leased_window`] and a store outage after them is the window's `Err`.
+    /// Plan D149 (R-34): a window that raises between its lease take and its walk gives the lease
+    /// back. The window here writes what a gate answer's does — the step's answer, then the run's
+    /// unpark — through [`Engine::leased_window`] directly, not `AnswerGate`, and raises a store
+    /// outage after the run is already `running` again. Without the release, plan D88 would keep
+    /// this process's sweep off a run nothing walks. (MOD-144: the unpark no longer writes the
+    /// item, so plan D152's item-transition fault is gone.)
     #[tokio::test(start_paused = true)]
-    async fn a_gate_answer_whose_window_fails_is_adopted_by_the_same_process() {
+    async fn a_window_that_raises_releases_the_lease_for_the_sweep() {
         let harness = Harness::new().await;
         let (run, step) = started(&harness).await;
         let row = harness.orch.run(run).await;
