@@ -369,9 +369,10 @@ pub trait WriteStore: ReadStore {
     ///
     /// `open ↔ blocked` only (MOD-144, ANA-35 §7.1). An illegal `(from, to)` is
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) without an update
-    /// ([`legal_move`]); a missing row is [`StoreError::NotFound`](crate::store::StoreError::NotFound)
-    /// first (plan D14). A stale `from` on a legal pair is still `Ok(false)`. `to = closed` is
-    /// refused from every status (MOD-38 PRD D1); use [`close_out`](WriteStore::close_out).
+    /// ([`legal_move`]); a missing row is
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) first (plan D14). A stale
+    /// `from` on a legal pair is still `Ok(false)`. `to = closed` is refused from every status
+    /// (MOD-38 PRD D1); use [`close_out`](WriteStore::close_out).
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool>;
 
     /// A refusal at `StartRun` written to an item no run holds (MOD-144 R1, MOD-7 D98): under the

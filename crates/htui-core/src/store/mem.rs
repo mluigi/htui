@@ -1171,7 +1171,8 @@ impl MemStore {
     ///
     /// In the same closure every run of the batch still `queued` is cancelled through
     /// `State::finish_run`, so the item's state falls back to its previous run (MOD-144) and its
-    /// queue entry stays (review H2): a pause stops the runs nobody has claimed yet. A `drained` close finds none.
+    /// queue entry stays (review H2): a pause stops the runs nobody has claimed yet. A `drained`
+    /// close finds none.
     ///
     /// # Errors
     /// Never in practice: a `queued` run always cancels. The signature matches `PgStore`'s so
@@ -5591,8 +5592,8 @@ impl State {
     }
 
     /// MOD-12 M3 D6: `item`'s latest `kind = 'graph'` run by `(queued_at, id)`, **cancelled
-    /// included** (PD6), with its target box's hostname and its first `awaiting_approval` step by `(position, attempt,
-    /// fanout_index)`.
+    /// included** (PD6), with its target box's hostname and its first `awaiting_approval` step by
+    /// `(position, attempt, fanout_index)`.
     fn latest_queue_run(&self, item: ItemId) -> Option<QueueRunFact> {
         let run = self
             .runs
@@ -16011,7 +16012,8 @@ mod tests {
     }
 
     /// Review H2: a close cancels the batch's runs still `queued` (their items' states fall back
-    /// to their previous runs, MOD-144; their entries kept) and leaves its claimed runs and every run outside it alone.
+    /// to their previous runs, MOD-144; their entries kept) and leaves its claimed runs and every
+    /// run outside it alone.
     #[tokio::test]
     async fn close_batch_cancels_only_the_batch_runs_still_queued() {
         let store = MemStore::demo();
