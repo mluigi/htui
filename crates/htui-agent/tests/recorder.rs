@@ -468,6 +468,9 @@ impl WriteStore for SpyStore {
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> StoreResult<bool> {
         self.inner.transition(id, from, to).await
     }
+    async fn block_if_idle(&self, note: NewNote) -> StoreResult<bool> {
+        self.inner.block_if_idle(note).await
+    }
     async fn append_events(&self, fence: StepFence, events: &[SessionEvent]) -> StoreResult<usize> {
         // The guards are dropped before and taken after the await: none is held across one.
         if self.refuses_this_append() {
