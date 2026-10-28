@@ -5243,18 +5243,21 @@ async fn insert_item_run(
     Ok(id)
 }
 
-/// The note 0023 writes on a `done` item no finished run explains.
-const NOTE_0023_DONE: &str = "closed by the status migration: marked done with no finished run";
+/// The note 0023 writes on a `done` item no finished run explains (no run, or a latest run that
+/// did not finish `done`).
+const NOTE_0023_DONE: &str =
+    "closed by the status migration: marked done, but its latest run did not finish";
 /// The note 0023 writes on a `failed` item no failed run explains.
 const NOTE_0023_FAILED: &str =
     "failed outside a run before the status migration; clear to run it again";
 
-/// MOD-144 (ANA-35 §7.1, §7.10 row 1): `0023_item_status.sql` maps the five removed statuses.
-/// A value the item's latest graph run (`cancelled` skipped, chat runs ignored) explains becomes
+/// MOD-144 (ANA-35 §7.1, §7.10 row 1): `0023_item_status.sql` maps the five removed statuses. A
+/// value the item's latest graph run (`cancelled` skipped, chat runs ignored) explains becomes
 /// `open`; an unexplained `done` closes as `done` and an unexplained `failed` is `blocked`, each
-/// with a note written as the item's author. `open`, `blocked` and `closed` stay. `closed_at` is
-/// cleared on every row that is not closed, no `updated_at` moves (the trigger is off and on
-/// again), and the CHECK admits the three values only.
+/// with a note written as the item's author. A `done` or `failed` item whose latest graph run is
+/// live (R1) is `open`: the run holds it, and its state reads from that run. `open`, `blocked` and
+/// `closed` stay. `closed_at` is cleared on every row that is not closed, no `updated_at` moves
+/// (the trigger is off and on again), and the CHECK admits the three values only.
 ///
 /// Staged at v22 through [`MIGRATOR`] so the rows exist before 0023 runs, as on a real box.
 #[tokio::test]
@@ -5311,6 +5314,8 @@ async fn migration_0023_maps_every_removed_status() {
         (14, "open", None, &[]),
         (15, "blocked", Some(PLANTED_0023_AT), &[]),
         (16, "closed", Some(PLANTED_0023_AT), &[]),
+        (17, "done", None, &[("graph", "done"), ("graph", "running")]),
+        (18, "failed", None, &[("graph", "stopped")]),
     ];
     let mut second = 0;
     let mut planted = Vec::new();
@@ -5379,6 +5384,8 @@ async fn migration_0023_maps_every_removed_status() {
         (14, "open", None, Closed::Null, None),
         (15, "blocked", None, Closed::Null, None),
         (16, "closed", Some("withdrawn"), Closed::Planted, None),
+        (17, "open", None, Closed::Null, None),
+        (18, "open", None, Closed::Null, None),
     ];
     for ((number, status, resolution, closed, note), (planted_number, item)) in
         expected.iter().zip(&planted)

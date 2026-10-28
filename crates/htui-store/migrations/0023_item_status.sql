@@ -8,13 +8,13 @@
 -- Order: (1) refuse readably when an item already has two live graph runs, naming the items, so the
 -- unique index never fails with a bare 23505; (2) uq_run_item_live; (3) the §7.1 mapping, with the
 -- updated_at trigger off as 0006 does (the mirror rebuilds on schema_version 23 regardless): a done
--- or failed item whose latest graph run does not say so is "unexplained" -- done -> closed/done with
--- a note, failed -> blocked with a note; every other removed value -> open; closed_at is cleared on
--- every row that is not closed (only close_out stamps it from now on); (4) the CHECK swap.
--- Notes are written as the item's created_by (item_note.created_by is NOT NULL). No COMMENT ON (the
--- ANA column comment pins stay), no new table (TABLES stays 51), no cache migration (cache
--- item.status has no CHECK; the schema_version bump rebuilds every mirror). A headless worker never
--- migrates: migrate from a TUI first.
+-- or failed item whose latest graph run does not say so, and is not live, is "unexplained" -- done
+-- -> closed/done with a note, failed -> blocked with a note; every other removed value -> open;
+-- closed_at is cleared on every row that is not closed (only close_out stamps it from now on); (4)
+-- the CHECK swap. Notes are written as the item's created_by (item_note.created_by is NOT NULL). No
+-- COMMENT ON (the ANA column comment pins stay), no new table (TABLES stays 51), no cache migration
+-- (cache item.status has no CHECK; the schema_version bump rebuilds every mirror). A headless
+-- worker never migrates: migrate from a TUI first.
 
 -- --------------------------------------------------------------------------------------------
 -- 1. Pre-check: at most one live graph run per item
@@ -64,12 +64,15 @@ SELECT i.id, i.status, i.created_by
          LIMIT 1
        ) lr ON true
  WHERE i.status IN ('done','failed')
-   AND lr.status IS DISTINCT FROM i.status;
+   AND lr.status IS DISTINCT FROM i.status
+   -- a live latest run explains the item: it maps to open and reads its state from that run
+   AND (lr.status IS NULL OR lr.status NOT IN ('queued','running','awaiting_approval','stopped'));
 
 INSERT INTO item_note (item_id, body, created_by)
 SELECT u.id,
        CASE u.status
-           WHEN 'done' THEN 'closed by the status migration: marked done with no finished run'
+           WHEN 'done'
+               THEN 'closed by the status migration: marked done, but its latest run did not finish'
            ELSE 'failed outside a run before the status migration; clear to run it again'
        END,
        u.created_by
