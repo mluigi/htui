@@ -1,7 +1,8 @@
 //! The modal frame over [`layout::centered`](crate::ui::layout::centered) (MOD-115).
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear};
 
@@ -98,12 +99,15 @@ impl<'a> Modal<'a> {
         }
     }
 
-    /// Clears and draws the modal over `area`, returning the content rect: the box less its
-    /// borders and its right padding column. The content starts at the box's first inner
-    /// column, so a row that wants a left margin brings its own.
+    /// Fades `area` outside `box_area` with [`Theme::backdrop`] (MOD-115 M4 C3), and clears and
+    /// draws the modal over `area`, returning the content rect: the box less its borders and
+    /// its right padding column. The content starts at the box's first inner column, so a row
+    /// that wants a left margin brings its own. `area` is what the modal is centred over: the
+    /// whole frame for an overlay, a section's rect for the Hierarchy path picker.
     pub fn render(self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) -> Rect {
         let (width, height) = self.dimensions(area);
         let box_area = centered(area, width, height);
+        backdrop(frame.buffer_mut(), area, box_area, theme);
         frame.render_widget(Clear, box_area);
         let mut block = Block::new()
             .borders(Borders::ALL)
@@ -120,6 +124,20 @@ impl<'a> Modal<'a> {
             box_area.width.saturating_sub(CHROME),
             box_area.height.saturating_sub(CHROME_ROWS),
         )
+    }
+}
+
+/// Restyles every cell of `area` (within the buffer) outside `box_area` with the backdrop role:
+/// ratatui's `Cell::set_style` adds DIM and takes BOLD away, and leaves the cell's colours and
+/// text as they were.
+fn backdrop(buffer: &mut Buffer, area: Rect, box_area: Rect, theme: &Theme) {
+    let area = area.intersection(buffer.area);
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if !box_area.contains(Position::new(x, y)) {
+                buffer[(x, y)].set_style(theme.backdrop);
+            }
+        }
     }
 }
 
@@ -143,7 +161,6 @@ mod tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::buffer::Buffer;
     use ratatui::style::Modifier;
 
     /// Draws `modal` into a `width` x `height` screen pre-filled with `#`; returns the content
@@ -317,6 +334,109 @@ mod tests {
             }
         }
         assert!(buffer[(outer.x, outer.y)].modifier.contains(Modifier::BOLD));
+    }
+
+    /// Draws `modal` over `area` of a `width` x `height` screen pre-filled with a red, bold `#`,
+    /// so the backdrop's effect on a cell's own style shows.
+    fn draw_over_styled(
+        modal: Modal<'_>,
+        (width, height): (u16, u16),
+        area: Rect,
+        theme: &Theme,
+    ) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let screen = frame.area();
+                let page = ratatui::style::Style::new()
+                    .fg(ratatui::style::Color::Red)
+                    .add_modifier(Modifier::BOLD);
+                for y in 0..screen.height {
+                    for x in 0..screen.width {
+                        frame.buffer_mut()[(x, y)].set_symbol("#").set_style(page);
+                    }
+                }
+                modal.render(frame, area, theme);
+            })
+            .expect("draw");
+        terminal.backend().buffer().clone()
+    }
+
+    /// MOD-115 M4 C3: every cell a modal leaves visible in the area it is centred over fades:
+    /// DIM, never BOLD, its own colour kept; in both themes.
+    #[test]
+    fn the_backdrop_outside_the_box_is_dimmed_and_never_bold() {
+        for theme in [Theme::default(), Theme::monochrome()] {
+            let area = Rect::new(0, 0, 40, 12);
+            let modal = Modal::new("Dim").size(ModalSize::Fixed { w: 20, h: 5 });
+            let buffer = draw_over_styled(modal, (40, 12), area, &theme);
+            let outer = centered(area, 20, 5);
+            for y in 0..12 {
+                for x in 0..40 {
+                    if outer.contains(Position::new(x, y)) {
+                        continue;
+                    }
+                    let cell = &buffer[(x, y)];
+                    assert_eq!(cell.symbol(), "#", "({x},{y}) keeps the page's text");
+                    assert!(cell.modifier.contains(Modifier::DIM), "({x},{y}) {cell:?}");
+                    assert!(
+                        !cell.modifier.contains(Modifier::BOLD),
+                        "({x},{y}) {cell:?}"
+                    );
+                    assert_eq!(
+                        cell.fg,
+                        ratatui::style::Color::Red,
+                        "({x},{y}) keeps its colour"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_box_itself_is_not_dimmed() {
+        for theme in [Theme::default(), Theme::monochrome()] {
+            let area = Rect::new(0, 0, 40, 12);
+            let modal = Modal::new("Box").size(ModalSize::Fixed { w: 20, h: 5 });
+            let buffer = draw_over_styled(modal, (40, 12), area, &theme);
+            let outer = centered(area, 20, 5);
+            for y in outer.y..outer.bottom() {
+                for x in outer.x..outer.right() {
+                    let cell = &buffer[(x, y)];
+                    assert!(!cell.modifier.contains(Modifier::DIM), "({x},{y}) {cell:?}");
+                }
+            }
+        }
+    }
+
+    /// The Hierarchy path picker centres over a section, not the screen: only that section
+    /// fades, the rest of the screen is drawn as it was.
+    #[test]
+    fn a_modal_over_a_smaller_area_dims_only_that_area() {
+        let theme = Theme::default();
+        let area = Rect::new(10, 2, 30, 10);
+        let modal = Modal::new("Pick").size(ModalSize::Fixed { w: 12, h: 4 });
+        let buffer = draw_over_styled(modal, (60, 16), area, &theme);
+        let outer = centered(area, 12, 4);
+        for y in 0..16 {
+            for x in 0..60 {
+                let at = Position::new(x, y);
+                if outer.contains(at) {
+                    continue;
+                }
+                let cell = &buffer[(x, y)];
+                if area.contains(at) {
+                    assert!(cell.modifier.contains(Modifier::DIM), "({x},{y}) {cell:?}");
+                    assert!(
+                        !cell.modifier.contains(Modifier::BOLD),
+                        "({x},{y}) {cell:?}"
+                    );
+                } else {
+                    assert!(!cell.modifier.contains(Modifier::DIM), "({x},{y}) {cell:?}");
+                    assert!(cell.modifier.contains(Modifier::BOLD), "({x},{y}) {cell:?}");
+                }
+            }
+        }
     }
 
     /// MOD-67 M3 PA-5: a modal mode passes on what its global layer lets through, so `ctrl-c`
