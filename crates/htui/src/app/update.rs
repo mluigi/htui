@@ -264,6 +264,7 @@ impl App {
             self.status = Some(reason);
             self.dirty = true;
         }
+        self.say_qdrant_offer();
         if self.ticks.is_multiple_of(TICKS_PER_REFRESH) {
             self.dispatch(Origin::App, StoreRequest::StoreState);
             if !self.scope.is_empty() {
@@ -521,6 +522,15 @@ impl App {
         self.update(Action::Overlay(OverlayAction::Open(id)));
     }
 
+    /// Says the waiting old-URL offer (MOD-158 D10) once the status line is free.
+    fn say_qdrant_offer(&mut self) {
+        if self.qdrant_offer_pending && self.status.is_none() {
+            self.qdrant_offer_pending = false;
+            self.status = Some(QDRANT_OFFER_NOTICE.to_owned());
+            self.dirty = true;
+        }
+    }
+
     /// Says once per session that this build is below the database's target version (MOD-40
     /// plan D9, PRD D3): a TUI warns and runs, where a headless process refuses.
     fn note_below_target(&mut self, target: &str) {
@@ -590,13 +600,16 @@ impl App {
         }
 
         // MOD-158 D10: this box's keyring still holds the retired Qdrant URL. Said once per launch,
-        // for `below_target_shown`'s reason; the offer itself is the section's row.
+        // for `below_target_shown`'s reason; the offer itself is the section's row. It never
+        // displaces a notice already on the line (the below-target warning, the ui-state load
+        // notice: each said once): it waits, and `on_tick` says it once the line is clear.
         if let StoreReply::Qdrant(snapshot) = reply
             && snapshot.old_url.is_some()
             && !self.qdrant_offer_noted
         {
             self.qdrant_offer_noted = true;
-            self.status = Some(QDRANT_OFFER_NOTICE.to_owned());
+            self.qdrant_offer_pending = true;
+            self.say_qdrant_offer();
         }
     }
 }
@@ -1203,6 +1216,43 @@ mod tests {
 
         app.on_key(KeyEvent::from(KeyCode::Char('x')));
         assert_eq!(app.status, None, "the next key clears it");
+        app.update(Action::Reply(qdrant_reply(seq, true)));
+        assert_eq!(app.status, None, "said once per launch");
+    }
+
+    /// MOD-158 D10, repair 1: the offer never displaces a notice already on the line (the
+    /// below-target warning or the ui-state load notice, each said once per launch). It waits for
+    /// the line to clear and is said on the next tick after that, still once.
+    #[test]
+    fn the_qdrant_offer_waits_for_a_busy_status_line() {
+        let (mut app, mut rx, _seen) = shell();
+        app.qdrant_offer_check = true;
+        app.start();
+        let seq = qdrant_info_seq(&mut rx).expect("start asked");
+
+        app.note_below_target("9.9.9");
+        let below = app.status.clone().expect("the below-target warning");
+
+        app.update(Action::Reply(qdrant_reply(seq, true)));
+        assert_eq!(
+            app.status.as_deref(),
+            Some(below.as_str()),
+            "the warning stays"
+        );
+        app.update(Action::Tick);
+        assert_eq!(app.status.as_deref(), Some(below.as_str()), "still busy");
+
+        app.on_key(KeyEvent::from(KeyCode::Char('x')));
+        assert_eq!(app.status, None, "the key clears the warning");
+        app.update(Action::Tick);
+        assert_eq!(
+            app.status.as_deref(),
+            Some(QDRANT_OFFER_NOTICE),
+            "then the offer"
+        );
+
+        app.on_key(KeyEvent::from(KeyCode::Char('x')));
+        app.update(Action::Tick);
         app.update(Action::Reply(qdrant_reply(seq, true)));
         assert_eq!(app.status, None, "said once per launch");
     }

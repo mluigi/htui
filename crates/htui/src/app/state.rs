@@ -484,8 +484,11 @@ pub struct App {
     /// the binary runs that before `start`: a test harness, whose constructor runs `start` first,
     /// never reads a keyring for it.
     pub(super) qdrant_offer_check: bool,
-    /// Whether the old keyring URL's notice has been said this launch (MOD-158 D10).
+    /// Whether the old keyring URL's notice has been said, or queued, this launch (MOD-158 D10).
     pub(super) qdrant_offer_noted: bool,
+    /// Whether that notice is waiting for a clear status line: it never displaces another notice,
+    /// and the next tick with nothing on the line says it.
+    pub(super) qdrant_offer_pending: bool,
     /// Whether the no-DSN redirect has already fired this session (MOD-15 M6 D6).
     ///
     /// `ConnectionInfo` is re-issued whenever the shell asks again, so without this a box with an
@@ -590,6 +593,7 @@ impl App {
             below_target_shown: false,
             qdrant_offer_check: false,
             qdrant_offer_noted: false,
+            qdrant_offer_pending: false,
             connection_redirect_done: false,
             pending_edit: None,
             mouse: false,
