@@ -2,7 +2,8 @@
 //! backslash nor a single quote anywhere (E-3, E-5), so `shell_words::quote` wraps each in a plain
 //! `'…'` and the whole command line the remote login shell parses is backslash-free. Values arrive
 //! only as positional arguments, the root prefix always first (`""` in production; a temporary
-//! directory under test, D309). The DSN and the sudo password are never arguments.
+//! directory under test, D309). The DSN, the sudo password and the Qdrant API key are never
+//! arguments.
 //!
 //! Exit codes a script chooses: 3, the uploaded binary does not run (PREPARE); 4, sudo refused
 //! the password (INSTALL); 5, the service did not come up (VERIFY); 6, the upload's sha256 is not
@@ -115,8 +116,9 @@ fi
 
 /// Unprivileged wrapper around the privileged part (D301; E-3, E-4, E-7, E-8). `$1` root, `$2`
 /// user, `$3` home, `$4` replace (`0`|`1`), `$5` mode (`password`|`nopasswd`), `$6` the text of
-/// [`INSTALL_ROOT`]. Stdin: with `mode=password`, the password line, then the DSN line; otherwise
-/// the DSN line alone. Exit 4: sudo refused the password; the DSN was never read.
+/// [`INSTALL_ROOT`], `$7` qkey (`0`|`1`, MOD-158 D11), passed on as its `$5`. Stdin, in order: the
+/// password line with `mode=password`, the Qdrant API key line with `qkey=1`, then the DSN line.
+/// Exit 4: sudo refused the password; neither the key nor the DSN was read.
 pub const INSTALL: &str = r#"set -eu
 root=$1
 user=$2
@@ -124,6 +126,7 @@ home=$3
 replace=$4
 mode=$5
 installer=$6
+qkey=$7
 nl="
 "
 if [ "$mode" = password ]; then
@@ -133,31 +136,54 @@ if [ "$mode" = password ]; then
   unset pw
 fi
 rc=0
-sudo -n sh -c "$installer" htui-provision-root "$root" "$user" "$home" "$replace" || rc=$?
+sudo -n sh -c "$installer" htui-provision-root "$root" "$user" "$home" "$replace" "$qkey" || rc=$?
 exit "$rc"
 "#;
 
-/// Runs as root under `sudo -n` (D303; E-7). `$1` root, `$2` user, `$3` home, `$4` replace. Stdin:
-/// the DSN line, encrypted when the credential is absent or `replace=1`, otherwise discarded.
-/// Credential, then unit, then start. Its first line of output is the marker `htui.root=start`.
+/// Runs as root under `sudo -n` (D303; E-7). `$1` root, `$2` user, `$3` home, `$4` replace, `$5`
+/// qkey (MOD-158 D11). Stdin: with `qkey=1`, the Qdrant API key line, held in a shell variable
+/// only and handed to `systemd-creds` through the `printf` builtin (PREFLIGHT checks it is one);
+/// then the DSN line. Each is encrypted when its credential is absent or `replace=1`, otherwise
+/// discarded. With the key the unit loads both credentials. Without it, a key credential already
+/// on the host keeps its unit line, unless `replace=1` drops it (the key was removed; the file
+/// stays, R-11); with no such credential the unit is the one written before D11, byte for byte.
+/// Credentials, then unit, then start. Its first line of output
+/// is the marker `htui.root=start`.
 pub const INSTALL_ROOT: &str = r#"set -eu
 root=$1
 user=$2
 home=$3
 replace=$4
+qkey=$5
+nl="
+"
 echo htui.root=start
 umask 022
 creds="$root/etc/credstore.encrypted"
 cred="$creds/htui-dsn"
+qcred="$creds/htui-qdrant-key"
 units="$root/etc/systemd/system"
 unit="$units/htui-worker.service"
 tmp="$unit.htui-provision.$$"
 cleanup() {
-  rm -f -- "$tmp" "$cred.new"
+  rm -f -- "$tmp" "$cred.new" "$qcred.new"
 }
 trap cleanup EXIT
 trap "exit 1" HUP INT TERM
 install -d -m 0700 "$creds"
+cl="LoadCredentialEncrypted=htui-dsn:/etc/credstore.encrypted/htui-dsn"
+if [ "$qkey" = 1 ]; then
+  IFS= read -r qk || exit 1
+  if [ ! -e "$qcred" ] || [ "$replace" = 1 ]; then
+    rm -f -- "$qcred.new"
+    printf "%s%s" "$qk" "$nl" | systemd-creds encrypt --name=htui-qdrant-key - "$qcred.new"
+    mv -f -- "$qcred.new" "$qcred"
+  fi
+  unset qk
+fi
+if [ -e "$qcred" ] && { [ "$qkey" = 1 ] || [ "$replace" != 1 ]; }; then
+  cl="$cl${nl}LoadCredentialEncrypted=htui-qdrant-key:/etc/credstore.encrypted/htui-qdrant-key"
+fi
 if [ ! -e "$cred" ] || [ "$replace" = 1 ]; then
   rm -f -- "$cred.new"
   systemd-creds encrypt --name=htui-dsn - "$cred.new"
@@ -176,7 +202,7 @@ After=network-online.target
 Type=exec
 User=$user
 ExecStart=$home/.local/bin/htui worker --log $home/.local/state/htui/worker.log
-LoadCredentialEncrypted=htui-dsn:/etc/credstore.encrypted/htui-dsn
+$cl
 Restart=on-failure
 RestartSec=10s
 
@@ -267,6 +293,13 @@ RestartSec=10s
 [Install]
 WantedBy=multi-user.target
 ";
+
+    /// The unit's DSN credential line: INSTALL_ROOT's `$cl` without a key.
+    const DSN_LINE: &str = "LoadCredentialEncrypted=htui-dsn:/etc/credstore.encrypted/htui-dsn";
+
+    /// The second credential line `$cl` gains when the Qdrant API key is sent (MOD-158 D11).
+    const KEY_LINE: &str =
+        "LoadCredentialEncrypted=htui-qdrant-key:/etc/credstore.encrypted/htui-qdrant-key";
 
     /// The index of the one line of `script` containing `needle`.
     fn line_of(script: &str, needle: &str) -> usize {
@@ -367,7 +400,15 @@ WantedBy=multi-user.target
 
     #[test]
     fn remote_command_round_trips_through_shell_words() {
-        let args = ["", "alice", "/home/alice", "0", "password", INSTALL_ROOT];
+        let args = [
+            "",
+            "alice",
+            "/home/alice",
+            "0",
+            "password",
+            INSTALL_ROOT,
+            "1",
+        ];
         let command = remote_command(INSTALL, &args);
         let split = shell_words::split(&command).expect("the command splits");
         let mut expected = vec!["sh", "-c", INSTALL, ARG0];
@@ -383,7 +424,15 @@ WantedBy=multi-user.target
     fn remote_command_is_backslash_free() {
         let install = remote_command(
             INSTALL,
-            &["", "alice", "/home/alice", "0", "password", INSTALL_ROOT],
+            &[
+                "",
+                "alice",
+                "/home/alice",
+                "0",
+                "password",
+                INSTALL_ROOT,
+                "1",
+            ],
         );
         assert!(!install.contains('\\'));
         for (name, script) in ALL {
@@ -442,7 +491,7 @@ WantedBy=multi-user.target
     fn install_root_writes_the_credential_then_the_unit_then_starts() {
         let order = [
             "install -d -m 0700",
-            "systemd-creds encrypt",
+            "systemd-creds encrypt --name=htui-dsn",
             r#"cat > "$tmp" <<EOF"#,
             r#"mv -f -- "$tmp" "$unit""#,
             "systemctl daemon-reload",
@@ -481,8 +530,137 @@ WantedBy=multi-user.target
     #[test]
     fn the_unit_is_the_guides_sample() {
         let (body, _, _) = heredoc();
-        let unit = body.replace("$user", "you").replace("$home", "/home/you");
+        let unit = body
+            .replace("$user", "you")
+            .replace("$home", "/home/you")
+            .replace("$cl", DSN_LINE);
         assert_eq!(unit, GUIDE_UNIT);
+    }
+
+    /// `$cl`, as INSTALL_ROOT's own lines compute it, with `qkey` and `replace` set and the key's
+    /// credential file present on the host or not (`held`): its `nl`, the DSN's `cl=` and the
+    /// key's `cl=` inside its own `if`, run under `sh`.
+    fn credential_lines(qkey: &str, replace: &str, held: bool) -> String {
+        let lines: Vec<&str> = INSTALL_ROOT.lines().collect();
+        let nl = line_of(INSTALL_ROOT, "nl=\"");
+        assert_eq!(lines[nl + 1], "\"", "nl is a literal newline");
+        let dsn = line_of(INSTALL_ROOT, "cl=\"LoadCredentialEncrypted=htui-dsn");
+        let key = line_of(INSTALL_ROOT, "cl=\"$cl${nl}");
+        assert!(lines[key - 1].starts_with("if "), "{}", lines[key - 1]);
+        assert_eq!(lines[key + 1], "fi");
+        let qcred = if held {
+            "/"
+        } else {
+            "/htui-no-such-credential"
+        };
+        let script = format!(
+            "set -eu\nqkey={qkey}\nreplace={replace}\nqcred={qcred}\nnl=\"\n\"\n{}\n{}\n{}\n{}\n\
+             printf \"%s\" \"$cl\"\n",
+            lines[dsn],
+            lines[key - 1],
+            lines[key],
+            lines[key + 1]
+        );
+        let out = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .output()
+            .expect("sh runs");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).expect("utf-8")
+    }
+
+    /// MOD-158 D11: with the key, the unit names both credentials, the DSN's first. Without it, a
+    /// key credential already on the host keeps its line unless `replace=1` (the key was removed,
+    /// R-11); with none, the unit is the guide's sample, byte for byte.
+    #[test]
+    fn the_unit_with_a_key_names_both_credentials() {
+        let (body, _, _) = heredoc();
+        assert_eq!(
+            body.lines().filter(|line| *line == "$cl").count(),
+            1,
+            "the heredoc's credential line is $cl"
+        );
+        assert!(!body.contains("LoadCredentialEncrypted"), "{body}");
+        let both = format!("{DSN_LINE}\n{KEY_LINE}");
+        for replace in ["0", "1"] {
+            assert_eq!(credential_lines("0", replace, false), DSN_LINE);
+            assert_eq!(credential_lines("1", replace, true), both);
+        }
+        assert_eq!(
+            credential_lines("0", "0", true),
+            both,
+            "a re-run without a key keeps the host's key line"
+        );
+        assert_eq!(
+            credential_lines("0", "1", true),
+            DSN_LINE,
+            "--replace-credential without a key drops it (R-11)"
+        );
+
+        // The guard comes after the key's credential is written.
+        let key_line = line_of(INSTALL_ROOT, "cl=\"$cl${nl}");
+        let written = line_of(INSTALL_ROOT, r#"mv -f -- "$qcred.new" "$qcred""#);
+        assert!(
+            written < key_line - 1,
+            "the key's line is decided once it is written"
+        );
+    }
+
+    /// MOD-158 D11: INSTALL_ROOT reads the key line only with `qkey=1`, before the DSN line, and
+    /// names `qk` on no other line than its read, its `printf` into `systemd-creds` and its
+    /// `unset`; INSTALL passes `$7` on as `$5`.
+    #[test]
+    fn the_key_is_read_before_the_dsn_and_only_with_qkey() {
+        assert_eq!(line_of(INSTALL, "qkey=$7"), 7);
+        assert!(
+            INSTALL.contains(
+                r#"sudo -n sh -c "$installer" htui-provision-root "$root" "$user" "$home" "$replace" "$qkey" || rc=$?"#
+            ),
+            "{INSTALL}"
+        );
+        assert_eq!(line_of(INSTALL_ROOT, "qkey=$5"), 5);
+
+        let lines: Vec<&str> = INSTALL_ROOT
+            .lines()
+            .filter(|line| has_word(line, "qk"))
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "IFS= read -r qk || exit 1",
+                r#"printf "%s%s" "$qk" "$nl" | systemd-creds encrypt --name=htui-qdrant-key - "$qcred.new""#,
+                "unset qk",
+            ]
+        );
+        let all: Vec<&str> = INSTALL_ROOT.lines().collect();
+        let open = line_of(INSTALL_ROOT, "if [ \"$qkey\" = 1 ]; then");
+        let read = line_of(INSTALL_ROOT, "read -r qk");
+        let unset = line_of(INSTALL_ROOT, "unset qk");
+        let close = all
+            .iter()
+            .enumerate()
+            .skip(open)
+            .find(|(_, line)| **line == "fi")
+            .map(|(i, _)| i)
+            .expect("the key's if is closed");
+        assert!(open < read && read < unset && unset < close);
+        let dsn = line_of(INSTALL_ROOT, "systemd-creds encrypt --name=htui-dsn");
+        let discard = line_of(INSTALL_ROOT, "cat > /dev/null");
+        assert!(
+            close < dsn && close < discard,
+            "the key line comes before the DSN line"
+        );
+        assert!(
+            INSTALL_ROOT.contains(r#"rm -f -- "$tmp" "$cred.new" "$qcred.new""#),
+            "cleanup removes the key's temporary file"
+        );
+        assert!(INSTALL_ROOT.contains(r#"qcred="$creds/htui-qdrant-key""#));
+        assert!(INSTALL_ROOT.contains(r#"mv -f -- "$qcred.new" "$qcred""#));
     }
 
     #[test]

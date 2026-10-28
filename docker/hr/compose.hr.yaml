@@ -64,6 +64,9 @@ services:
       USERNAME: htui-ci
       HTUI_TEST_DATABASE_URL: postgres://postgres@localhost:5439/postgres
       HTUI_TEST_QDRANT_URL: http://localhost:6334
+      # MOD-158 D12: htui itself (a sandbox TUI or worker) uses the run's own Qdrant, never the
+      # database's qdrant_url row, which may name another. No HTUI_QDRANT_API_KEY: this one has none.
+      HTUI_QDRANT_URL: http://localhost:6334
       HR_ITEM: ${HR_ITEM:?}
       HR_SANDBOX: "1"
       # No headroom process in a run phones home: the upload beacon and usage telemetry off, and no

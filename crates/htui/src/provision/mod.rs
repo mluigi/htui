@@ -9,8 +9,9 @@
 //! session is bounded ([`Timings`]), and remote text is sanitised before it is printed.
 //!
 //! Every remote script is a constant in [`script`]. Values reach a script only as quoted
-//! positional arguments. The DSN and the sudo password travel only on the ssh child's stdin:
-//! never in an `argv`, the environment, a log or a file on either side.
+//! positional arguments. The DSN, the sudo password and this box's Qdrant API key (MOD-158 D11)
+//! travel only on the ssh child's stdin: never in an `argv`, the environment, a log or a file on
+//! either side but their encrypted credentials.
 //!
 //! A refusal (exit 2) is anything decided before the first remote write. A failure (exit 1) is
 //! anything after it. [`remote::SshRemote`] is the only place `htui` spawns `ssh`.
@@ -185,7 +186,8 @@ impl Timings {
     }
 }
 
-/// Everything `run_with` needs (D309). `Debug` redacts the DSN and summarises the payload.
+/// Everything `run_with` needs (D309). `Debug` redacts the DSN and the Qdrant API key and
+/// summarises the payload.
 pub struct Ctx<'a, R> {
     /// The ssh destination, as typed.
     pub destination: &'a str,
@@ -199,6 +201,9 @@ pub struct Ctx<'a, R> {
     pub payload: Payload,
     /// The DSN to encrypt on the host; the only copy `run_with` holds.
     pub dsn: Zeroizing<String>,
+    /// This box's keyring Qdrant API key, encrypted on the host as `htui-qdrant-key` beside the
+    /// DSN (MOD-158 D11); `None` leaves the unit as it was.
+    pub qdrant_key: Option<Zeroizing<String>>,
     /// Reads the sudo password with no echo (D302).
     pub prompter: &'a dyn PasswordPrompt,
     /// Baseline, `box_seen`, `set_executor` (D305, D313).
@@ -219,6 +224,10 @@ impl<R> core::fmt::Debug for Ctx<'_, R> {
             .field("replace_credential", &self.replace_credential)
             .field("payload", &self.payload)
             .field("dsn", &"<redacted>")
+            .field(
+                "qdrant_key",
+                &self.qdrant_key.as_ref().map(|_| "<redacted>"),
+            )
             .field("prompter", &self.prompter)
             .field("verifier", &self.verifier)
             .field("timings", &self.timings)
@@ -269,6 +278,7 @@ pub async fn run(args: ProvisionArgs) -> Result<(), ProvisionExit> {
     let stderr = std::io::stderr();
     let mut out = stdout.lock();
     let mut err = stderr.lock();
+    let qdrant_key = qdrant_key_from(dest, secret::get_qdrant_api_key(), &mut err);
     run_with(Ctx {
         destination: dest,
         root: "",
@@ -276,6 +286,7 @@ pub async fn run(args: ProvisionArgs) -> Result<(), ProvisionExit> {
         remote: &remote,
         payload,
         dsn,
+        qdrant_key,
         prompter: &secret_prompt::TtyPrompt,
         verifier: &verifier,
         timings: Timings::PRODUCTION,
@@ -299,6 +310,7 @@ pub async fn run_with<R: Remote>(ctx: Ctx<'_, R>) -> Result<Outcome, ProvisionEx
         remote,
         payload,
         dsn,
+        qdrant_key,
         prompter,
         verifier,
         timings,
@@ -309,6 +321,7 @@ pub async fn run_with<R: Remote>(ctx: Ctx<'_, R>) -> Result<Outcome, ProvisionEx
     // 1–2: local checks, no remote call.
     plan::validate_destination(dest).map_err(|sentence| refused(dest, &sentence))?;
     check_dsn(dest, &dsn)?;
+    check_qdrant_key(dest, qdrant_key.as_deref().map(String::as_str))?;
 
     // 3–4: the preflight.
     note(err, dest, "preflight");
@@ -348,6 +361,7 @@ pub async fn run_with<R: Remote>(ctx: Ctx<'_, R>) -> Result<Outcome, ProvisionEx
     let local = LocalFacts {
         arch: payload.arch().to_owned(),
         sha: payload.sha().to_owned(),
+        qdrant_key: qdrant_key.is_some(),
     };
     let (upload, sudo) = match plan::decide(&facts, &local, replace_credential) {
         Decision::Refuse(sentence) => return Err(refused(dest, &sentence)),
@@ -358,6 +372,7 @@ pub async fn run_with<R: Remote>(ctx: Ctx<'_, R>) -> Result<Outcome, ProvisionEx
                 remote,
                 verifier,
                 timings,
+                qdrant_key: qdrant_key.is_some(),
                 out,
                 err,
             };
@@ -462,8 +477,14 @@ pub async fn run_with<R: Remote>(ctx: Ctx<'_, R>) -> Result<Outcome, ProvisionEx
         SudoMode::NoPassword => "nopasswd",
     };
     let replace = if replace_credential { "1" } else { "0" };
-    let stdin = install_stdin(password.as_ref().map(|p| p.as_str()), &dsn);
+    let qkey = if qdrant_key.is_some() { "1" } else { "0" };
+    let stdin = install_stdin(
+        password.as_ref().map(|p| p.as_str()),
+        qdrant_key.as_ref().map(|k| k.as_str()),
+        &dsn,
+    );
     drop(password);
+    drop(qdrant_key);
     let installed = bounded(
         remote,
         &format!("installing the service on {dest}"),
@@ -477,6 +498,7 @@ pub async fn run_with<R: Remote>(ctx: Ctx<'_, R>) -> Result<Outcome, ProvisionEx
                 replace,
                 mode,
                 script::INSTALL_ROOT,
+                qkey,
             ],
         ),
         &stdin,
@@ -646,6 +668,8 @@ struct Finish<'a, 'w, R> {
     remote: &'a R,
     verifier: &'a dyn Verifier,
     timings: Timings,
+    /// This box's keyring holds a Qdrant API key, which a plain re-run does not send (MOD-158 D11).
+    qdrant_key: bool,
     out: &'w mut dyn Write,
     err: &'w mut dyn Write,
 }
@@ -662,6 +686,7 @@ impl<R: Remote> Finish<'_, '_, R> {
             remote,
             verifier,
             timings,
+            qdrant_key,
             out,
             err,
         } = self;
@@ -674,6 +699,21 @@ impl<R: Remote> Finish<'_, '_, R> {
             err,
             "(--replace-credential re-encrypts the DSN and restarts the service)"
         );
+        if qdrant_key && facts.printf_builtin {
+            let _ = writeln!(
+                err,
+                "note: the Qdrant API key was not sent; pass --replace-credential to add it"
+            );
+        } else if qdrant_key {
+            // `decide` refuses `--replace-credential` with a key when there is no printf builtin.
+            let _ = writeln!(
+                err,
+                "note: the Qdrant API key was not sent, and the remote sh has no printf builtin \
+                 to send it; encrypt it on the host by hand (`sudo systemd-creds encrypt \
+                 --name=htui-qdrant-key - /etc/credstore.encrypted/htui-qdrant-key`) and add its \
+                 LoadCredentialEncrypted= line to the unit"
+            );
+        }
         let identity = match verify_session(remote, dest, root, &facts.home, timings).await {
             Err(reason) => Err(reason),
             Ok(checked) if checked.code == Some(0) => read_box(&checked),
@@ -844,13 +884,57 @@ fn check_dsn(dest: &str, dsn: &str) -> Result<(), ProvisionExit> {
     }
 }
 
-/// INSTALL's stdin: the password line (when sudo wants one), then the DSN line. Sized up front, so
-/// no reallocation leaves a copy behind.
-fn install_stdin(password: Option<&str>, dsn: &str) -> Zeroizing<Vec<u8>> {
-    let size = password.map_or(0, |p| p.len() + 1) + dsn.len() + 1;
+/// MOD-158 D11: a key goes to INSTALL_ROOT as one line, so one holding a line break (or another
+/// control character) cannot be sent; the sentence never quotes it.
+fn check_qdrant_key(dest: &str, key: Option<&str>) -> Result<(), ProvisionExit> {
+    if key.is_some_and(|key| key.chars().any(char::is_control)) {
+        return Err(refused(
+            dest,
+            "the Qdrant API key in this box's keyring holds a line break or another control \
+             character; store it again with `htui --set-qdrant-key`",
+        ));
+    }
+    Ok(())
+}
+
+/// MOD-158 D11: the key `run` ships, from this box's keyring answer: trimmed and wrapped at once,
+/// a blank one being none. A keyring that cannot be read is a warning on `err`, and provisioning
+/// goes on without a key (a Qdrant may need none).
+fn qdrant_key_from<E: core::fmt::Display>(
+    dest: &str,
+    keyring: Result<Option<String>, E>,
+    err: &mut dyn Write,
+) -> Option<Zeroizing<String>> {
+    match keyring {
+        Ok(key) => {
+            let key = Zeroizing::new(key?);
+            let trimmed = key.trim();
+            (!trimmed.is_empty()).then(|| Zeroizing::new(trimmed.to_owned()))
+        }
+        Err(why) => {
+            let _ = writeln!(
+                err,
+                "warning: the OS keyring could not be read for a Qdrant API key ({why}); \
+                 provisioning {dest} without one"
+            );
+            None
+        }
+    }
+}
+
+/// INSTALL's stdin: the password line (when sudo wants one), the Qdrant API key line (when this
+/// box has one, MOD-158 D11), then the DSN line. Sized up front, so no reallocation leaves a copy
+/// behind.
+fn install_stdin(
+    password: Option<&str>,
+    qdrant_key: Option<&str>,
+    dsn: &str,
+) -> Zeroizing<Vec<u8>> {
+    let size =
+        password.map_or(0, |p| p.len() + 1) + qdrant_key.map_or(0, |k| k.len() + 1) + dsn.len() + 1;
     let mut stdin = Zeroizing::new(Vec::with_capacity(size));
-    if let Some(password) = password {
-        stdin.extend_from_slice(password.as_bytes());
+    for line in [password, qdrant_key].into_iter().flatten() {
+        stdin.extend_from_slice(line.as_bytes());
         stdin.push(b'\n');
     }
     stdin.extend_from_slice(dsn.as_bytes());
@@ -951,6 +1035,8 @@ mod tests {
 
     const DSN: &str = "postgres://u:SENTINEL-DSN-PW@db.example:5432/htui";
     const PASSWORD: &str = "SENTINEL-SUDO-PW";
+    /// This box's Qdrant API key (MOD-158 D11).
+    const QDRANT_KEY: &str = "SENTINEL-QDRANT-KEY";
     const DEST: &str = "alice@box1";
     const BOX: &str = "0190a5c4-1c3e-7000-8000-00000000b0c5";
     const HINT: &str = "to log an agent in on alice@box1: ssh -t alice@box1 '~/.local/bin/htui' \
@@ -1264,6 +1350,54 @@ mod tests {
         prompter: &FakePrompt,
         verifier: &FakeVerifier,
     ) -> Ran {
+        drive_full(
+            timings,
+            dest,
+            dsn,
+            None,
+            replace_credential,
+            remote,
+            prompter,
+            verifier,
+        )
+        .await
+    }
+
+    /// [`drive`] for a box whose keyring holds `key` (MOD-158 D11).
+    async fn drive_keyed(
+        key: &str,
+        replace_credential: bool,
+        remote: &ScriptedRemote,
+        prompter: &FakePrompt,
+        verifier: &FakeVerifier,
+    ) -> Ran {
+        drive_full(
+            TIMINGS,
+            DEST,
+            DSN,
+            Some(key),
+            replace_credential,
+            remote,
+            prompter,
+            verifier,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one test driver, every part injected"
+    )]
+    async fn drive_full(
+        timings: Timings,
+        dest: &str,
+        dsn: &str,
+        qdrant_key: Option<&str>,
+        replace_credential: bool,
+        remote: &ScriptedRemote,
+        prompter: &FakePrompt,
+        verifier: &FakeVerifier,
+    ) -> Ran {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let result = run_with(Ctx {
@@ -1273,6 +1407,7 @@ mod tests {
             remote,
             payload: payload(),
             dsn: Zeroizing::new(dsn.to_owned()),
+            qdrant_key: qdrant_key.map(|key| Zeroizing::new(key.to_owned())),
             prompter,
             verifier,
             timings,
@@ -1357,6 +1492,7 @@ mod tests {
             remote: &remote,
             payload: payload(),
             dsn: Zeroizing::new(DSN.to_owned()),
+            qdrant_key: Some(Zeroizing::new(QDRANT_KEY.to_owned())),
             prompter: &prompt,
             verifier: &verifier,
             timings: TIMINGS,
@@ -1368,16 +1504,61 @@ mod tests {
             !shown.contains("SENTINEL-DSN-PW"),
             "Ctx's Debug shows the DSN"
         );
-        assert!(shown.contains("<redacted>"));
+        assert!(!shown.contains(QDRANT_KEY), "Ctx's Debug shows the key");
+        assert!(shown.contains("dsn: \"<redacted>\""), "{shown}");
+        assert!(
+            shown.contains("qdrant_key: Some(\"<redacted>\")"),
+            "{shown}"
+        );
+    }
+
+    /// MOD-158 D11: the keyring's key, trimmed; a blank one is none; a keyring that cannot be read
+    /// is a warning, and provisioning goes on without a key.
+    #[test]
+    fn the_keyring_key_is_trimmed_and_an_unreadable_keyring_is_a_warning() {
+        let read = |answer: Result<Option<String>, &str>| {
+            let mut err = Vec::new();
+            let key = qdrant_key_from(DEST, answer, &mut err);
+            (
+                key.map(|key| key.as_str().to_owned()),
+                String::from_utf8(err).expect("utf-8"),
+            )
+        };
+        assert_eq!(
+            read(Ok(Some(format!("  {QDRANT_KEY}\n")))),
+            (Some(QDRANT_KEY.to_owned()), String::new())
+        );
+        assert_eq!(read(Ok(Some(" \n".to_owned()))), (None, String::new()));
+        assert_eq!(read(Ok(None)), (None, String::new()));
+        assert_eq!(
+            read(Err("no Secret Service")),
+            (
+                None,
+                "warning: the OS keyring could not be read for a Qdrant API key (no Secret \
+                 Service); provisioning alice@box1 without one\n"
+                    .to_owned()
+            )
+        );
     }
 
     #[test]
     fn install_stdin_and_box_text() {
         assert_eq!(
-            install_stdin(Some("pw"), "dsn").as_slice(),
+            install_stdin(Some("pw"), None, "dsn").as_slice(),
             b"pw\ndsn\n".as_slice()
         );
-        assert_eq!(install_stdin(None, "dsn").as_slice(), b"dsn\n".as_slice());
+        assert_eq!(
+            install_stdin(None, None, "dsn").as_slice(),
+            b"dsn\n".as_slice()
+        );
+        assert_eq!(
+            install_stdin(Some("pw"), Some("key"), "dsn").as_slice(),
+            b"pw\nkey\ndsn\n".as_slice()
+        );
+        assert_eq!(
+            install_stdin(None, Some("key"), "dsn").as_slice(),
+            b"key\ndsn\n".as_slice()
+        );
         assert_eq!(
             box_text("noise\r\nhtui.box.begin\r\na = 1\r\nhtui.box.end\r\n").as_deref(),
             Some("a = 1\n")
@@ -1429,6 +1610,7 @@ mod tests {
         let install = remote.command_of("INSTALL");
         assert!(install.contains(" password '"), "{install}");
         assert!(install.contains(script::INSTALL_ROOT));
+        assert!(install.ends_with("' 0"), "no key: qkey is 0: {install}");
         assert_eq!(ran.out, format!("box {BOX} (box1) provisioned on {DEST}\n"));
         assert_eq!(
             verifier.log(),
@@ -1452,6 +1634,131 @@ mod tests {
                 .contains("provisioning alice@box1: executor set to worker\n")
         );
         assert!(ran.err.ends_with(HINT), "{}", ran.err);
+    }
+
+    /// MOD-158 D11: with a key, INSTALL's stdin is the password line, the key line, then the DSN
+    /// line, and `qkey` is 1.
+    #[tokio::test]
+    async fn a_key_goes_between_the_password_and_the_dsn() {
+        let remote = ScriptedRemote::new(vec![
+            preflight(&[]),
+            ok(""),
+            ok("htui.root=start\n"),
+            verified(),
+        ]);
+        let prompt = FakePrompt::new(Ok(PASSWORD));
+        let verifier = FakeVerifier::new();
+        let ran = drive_keyed(QDRANT_KEY, false, &remote, &prompt, &verifier).await;
+        assert!(ran.result.is_ok(), "{:?}", ran.result);
+        assert_eq!(
+            remote.stdin_of("INSTALL"),
+            format!("{PASSWORD}\n{QDRANT_KEY}\n{DSN}\n").into_bytes()
+        );
+        let install = remote.command_of("INSTALL");
+        assert!(install.ends_with("' 1"), "qkey is 1: {install}");
+        for (name, _) in remote.calls() {
+            assert!(!name.contains(QDRANT_KEY));
+        }
+
+        let remote = fresh(true, vec![ok(""), ok("htui.root=start\n"), verified()]);
+        let ran = drive_keyed(QDRANT_KEY, false, &remote, &prompt, &verifier).await;
+        assert!(ran.result.is_ok(), "{:?}", ran.result);
+        assert_eq!(
+            remote.stdin_of("INSTALL"),
+            format!("{QDRANT_KEY}\n{DSN}\n").into_bytes()
+        );
+    }
+
+    /// MOD-158 D11: a key that is not one line cannot be sent as one, and is refused before any
+    /// remote call.
+    #[tokio::test]
+    async fn a_key_with_a_line_break_is_refused_before_any_remote_call() {
+        for key in [
+            "SENTINEL-QDRANT\nKEY",
+            "SENTINEL-QDRANT\rKEY",
+            "SENTINEL\u{1b}KEY",
+        ] {
+            let remote = ScriptedRemote::default();
+            let prompt = FakePrompt::new(Ok(PASSWORD));
+            let verifier = FakeVerifier::new();
+            let ran = drive_keyed(key, false, &remote, &prompt, &verifier).await;
+            assert_eq!(
+                expect_exit(&ran, 2),
+                "not provisioning alice@box1: the Qdrant API key in this box's keyring holds a \
+                 line break or another control character; store it again with `htui \
+                 --set-qdrant-key`"
+            );
+            assert!(remote.calls().is_empty());
+            assert_eq!(prompt.count(), 0);
+        }
+    }
+
+    /// MOD-158 D11: an already-provisioned host gets no key, and the run says how to add it.
+    #[tokio::test]
+    async fn already_provisioned_with_a_key_says_it_was_not_sent() {
+        let sha = payload().sha().to_owned();
+        let remote = ScriptedRemote::new(vec![
+            preflight(&[
+                ("bin_sha", sha.as_str()),
+                ("unit", "yes"),
+                ("active", "active"),
+            ]),
+            verified(),
+        ]);
+        let prompt = FakePrompt::new(Ok(PASSWORD));
+        let verifier = FakeVerifier::new();
+        let ran = drive_keyed(QDRANT_KEY, false, &remote, &prompt, &verifier).await;
+        assert_eq!(ran.result.expect("ok"), Outcome::AlreadyProvisioned);
+        assert!(remote.calls().iter().all(|(_, stdin)| stdin.is_empty()));
+        assert!(
+            ran.err.contains(
+                "note: the Qdrant API key was not sent; pass --replace-credential to add it\n"
+            ),
+            "{}",
+            ran.err
+        );
+
+        let remote = ScriptedRemote::new(vec![
+            preflight(&[
+                ("bin_sha", sha.as_str()),
+                ("unit", "yes"),
+                ("active", "active"),
+            ]),
+            verified(),
+        ]);
+        let ran = drive(DEST, DSN, false, &remote, &prompt, &verifier).await;
+        assert!(!ran.err.contains("Qdrant"), "no key, no note: {}", ran.err);
+
+        // Repair finding: with no printf builtin `--replace-credential` is refused for the key,
+        // so the note points at encrypting it by hand instead.
+        let remote = ScriptedRemote::new(vec![
+            preflight(&[
+                ("bin_sha", sha.as_str()),
+                ("unit", "yes"),
+                ("active", "active"),
+                ("printf", "external"),
+            ]),
+            verified(),
+        ]);
+        let ran = drive_keyed(QDRANT_KEY, false, &remote, &prompt, &verifier).await;
+        assert_eq!(ran.result.expect("ok"), Outcome::AlreadyProvisioned);
+        assert!(remote.calls().iter().all(|(_, stdin)| stdin.is_empty()));
+        assert!(
+            ran.err.contains(
+                "note: the Qdrant API key was not sent, and the remote sh has no printf builtin \
+                 to send it; encrypt it on the host by hand (`sudo systemd-creds encrypt \
+                 --name=htui-qdrant-key - /etc/credstore.encrypted/htui-qdrant-key`) and add \
+                 its LoadCredentialEncrypted= line to the unit\n"
+            ),
+            "{}",
+            ran.err
+        );
+        assert!(
+            !ran.err.contains("pass --replace-credential to add it"),
+            "{}",
+            ran.err
+        );
+        assert!(!ran.err.contains(QDRANT_KEY), "{}", ran.err);
     }
 
     #[tokio::test]
@@ -1657,6 +1964,7 @@ mod tests {
                 remote: &remote,
                 payload: payload(),
                 dsn: Zeroizing::new(dsn.to_owned()),
+                qdrant_key: None,
                 prompter: &prompt,
                 verifier: &verifier,
                 timings: TIMINGS,
@@ -1727,6 +2035,22 @@ mod tests {
         let verifier = FakeVerifier::new();
         let ran = drive(DEST, DSN, false, &remote, &prompt, &verifier).await;
         assert!(expect_exit(&ran, 2).contains("cannot run ssh: "));
+
+        // MOD-158 D11: a key on a NOPASSWD host whose sh has no printf builtin.
+        let remote = ScriptedRemote::new(vec![preflight(&[
+            ("sudo", "nopasswd"),
+            ("printf", "external"),
+        ])]);
+        let ran = drive_keyed(QDRANT_KEY, false, &remote, &prompt, &verifier).await;
+        let sentence = expect_exit(&ran, 2);
+        assert!(
+            sentence.contains(
+                "the remote sh has no printf builtin (as in posh or mksh), so sending the Qdrant \
+                 API key would put it in a process's arguments"
+            ),
+            "{sentence}"
+        );
+        assert_eq!(remote.calls().len(), 1, "the preflight only");
     }
 
     #[tokio::test]
@@ -1955,7 +2279,7 @@ mod tests {
         ]);
         let prompt = FakePrompt::new(Ok(PASSWORD));
         let verifier = FakeVerifier::new();
-        let ran = drive(DEST, DSN, true, &remote, &prompt, &verifier).await;
+        let ran = drive_keyed(QDRANT_KEY, true, &remote, &prompt, &verifier).await;
         assert!(ran.result.is_ok());
         for (command, _) in remote.calls() {
             assert!(!command.contains("SENTINEL"), "a command holds a sentinel");
@@ -1964,6 +2288,12 @@ mod tests {
         assert!(!ran.err.contains("SENTINEL"), "stderr holds a sentinel");
         let install = String::from_utf8(remote.stdin_of("INSTALL")).expect("utf-8");
         assert!(install.contains("SENTINEL-SUDO-PW") && install.contains("SENTINEL-DSN-PW"));
+        assert!(install.contains(QDRANT_KEY));
+        for (name, stdin) in remote.calls() {
+            if session(&name) != "INSTALL" {
+                assert!(!String::from_utf8_lossy(&stdin).contains("SENTINEL-QDRANT"));
+            }
+        }
         assert!(remote.command_of("INSTALL").contains(" 1 password '"));
     }
 
@@ -1979,7 +2309,7 @@ mod tests {
         ]);
         let prompt = FakePrompt::new(Ok(PASSWORD));
         let verifier = FakeVerifier::new();
-        let ran = drive(DEST, DSN, true, &remote, &prompt, &verifier).await;
+        let ran = drive_keyed(QDRANT_KEY, true, &remote, &prompt, &verifier).await;
         assert!(ran.result.is_ok());
         assert_eq!(
             remote.sessions(),
@@ -1997,7 +2327,7 @@ mod tests {
                     !arg.contains("SENTINEL"),
                     "an ssh argument holds a sentinel"
                 );
-                assert!(!arg.contains(DSN) && !arg.contains(PASSWORD));
+                assert!(!arg.contains(DSN) && !arg.contains(PASSWORD) && !arg.contains(QDRANT_KEY));
             }
         }
     }

@@ -216,6 +216,15 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     [[ "$(jq -r '.services.dev.command[2]' <<<"$cfg")" != *headroom* ]]
 }
 
+@test "3h2. compose: a run's htui uses the run's own Qdrant, never the database's qdrant_url (MOD-158 D12)" {
+    local cfg
+    cfg="$(compose_config)"
+    [[ "$(jq -r '.services.dev.environment.HTUI_QDRANT_URL' <<<"$cfg")" == http://localhost:6334 ]]
+    [[ "$(jq -r '.services.dev.environment.HTUI_TEST_QDRANT_URL' <<<"$cfg")" == http://localhost:6334 ]]
+    # The run's Qdrant has no key, and no key is ever handed to a run.
+    [[ "$(jq -r '.services.dev.environment.HTUI_QDRANT_API_KEY' <<<"$cfg")" == null ]]
+}
+
 @test "3i. attach: a headroom=0 run keeps the plain exec; a headroom=1 run goes through the guard (claude and --shell)" {
     mk_run MOD-5
     mk_run MOD-4 --headroom
