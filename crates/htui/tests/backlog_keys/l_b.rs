@@ -438,7 +438,15 @@ async fn enter_replays_the_step_and_misses_without_one() {
         harness.key("j");
         harness.settle().await;
     }
+    // MOD-144: the pane opens on the demo's stepless rework run `RUN_4`; `J` steps past it onto
+    // `RUN_1`'s `prd`.
     harness.key("J");
+    harness.drive().await;
+    let frame = harness.render();
+    assert!(
+        cursor_row(&frame).contains("prd"),
+        "`J` steps past the stepless RUN_4 onto FEAT-1's first step:\n{frame}"
+    );
     harness.key("enter");
     harness.drive().await;
     assert_eq!(
