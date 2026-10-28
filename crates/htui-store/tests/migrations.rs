@@ -5278,10 +5278,16 @@ async fn migration_0023_maps_every_removed_status() {
     let at = |second: u32| format!("2020-01-01T00:00:{second:02}Z");
 
     // (number, planted status, planted closed_at, runs as (kind, status) in queue order)
-    let rows: &[(i32, &str, Option<&str>, &[(&str, &str)])] = &[
+    type Planted<'a> = (i32, &'a str, Option<&'a str>, &'a [(&'a str, &'a str)]);
+    let rows: &[Planted<'_>] = &[
         (1, "queued", None, &[("graph", "queued")]),
         (2, "in_progress", None, &[("graph", "running")]),
-        (3, "awaiting_approval", None, &[("graph", "awaiting_approval")]),
+        (
+            3,
+            "awaiting_approval",
+            None,
+            &[("graph", "awaiting_approval")],
+        ),
         (4, "in_progress", None, &[("graph", "stopped")]),
         (5, "queued", None, &[]),
         (6, "failed", None, &[("graph", "failed")]),
@@ -5295,7 +5301,12 @@ async fn migration_0023_maps_every_removed_status() {
             Some(PLANTED_0023_AT),
             &[("graph", "done"), ("graph", "failed")],
         ),
-        (12, "done", None, &[("graph", "done"), ("graph", "cancelled")]),
+        (
+            12,
+            "done",
+            None,
+            &[("graph", "done"), ("graph", "cancelled")],
+        ),
         (13, "done", None, &[("chat", "done")]),
         (14, "open", None, &[]),
         (15, "blocked", Some(PLANTED_0023_AT), &[]),
@@ -5307,9 +5318,18 @@ async fn migration_0023_maps_every_removed_status() {
         let item = plant_item(pool, pk, *number, status, *closed_at, user).await;
         for (kind, run_status) in *runs {
             second += 1;
-            insert_item_run(pool, pk.0, item, kind, run_status, &at(second), box_id, user)
-                .await
-                .unwrap_or_else(|err| panic!("plant a {run_status} {kind} run: {err}"));
+            insert_item_run(
+                pool,
+                pk.0,
+                item,
+                kind,
+                run_status,
+                &at(second),
+                box_id,
+                user,
+            )
+            .await
+            .unwrap_or_else(|err| panic!("plant a {run_status} {kind} run: {err}"));
         }
         planted.push((*number, item));
     }
@@ -5323,7 +5343,8 @@ async fn migration_0023_maps_every_removed_status() {
         Planted,
         Stamped,
     }
-    let expected: &[(i32, &str, Option<&str>, Closed, Option<&str>)] = &[
+    type Mapped<'a> = (i32, &'a str, Option<&'a str>, Closed, Option<&'a str>);
+    let expected: &[Mapped<'_>] = &[
         (1, "open", None, Closed::Null, None),
         (2, "open", None, Closed::Null, None),
         (3, "open", None, Closed::Null, None),
@@ -5333,10 +5354,28 @@ async fn migration_0023_maps_every_removed_status() {
         (7, "blocked", None, Closed::Null, Some(NOTE_0023_FAILED)),
         (8, "blocked", None, Closed::Null, Some(NOTE_0023_FAILED)),
         (9, "open", None, Closed::Null, None),
-        (10, "closed", Some("done"), Closed::Stamped, Some(NOTE_0023_DONE)),
-        (11, "closed", Some("done"), Closed::Planted, Some(NOTE_0023_DONE)),
+        (
+            10,
+            "closed",
+            Some("done"),
+            Closed::Stamped,
+            Some(NOTE_0023_DONE),
+        ),
+        (
+            11,
+            "closed",
+            Some("done"),
+            Closed::Planted,
+            Some(NOTE_0023_DONE),
+        ),
         (12, "open", None, Closed::Null, None),
-        (13, "closed", Some("done"), Closed::Stamped, Some(NOTE_0023_DONE)),
+        (
+            13,
+            "closed",
+            Some("done"),
+            Closed::Stamped,
+            Some(NOTE_0023_DONE),
+        ),
         (14, "open", None, Closed::Null, None),
         (15, "blocked", None, Closed::Null, None),
         (16, "closed", Some("withdrawn"), Closed::Planted, None),
@@ -5449,10 +5488,24 @@ async fn migration_0023_refuses_two_live_graph_runs_naming_the_items() {
     let box_id = insert_box(pool, user).await;
     let pk = plant_project_kind(pool, user, "mod144").await;
 
-    let rows: &[(i32, &str, [(&str, &str); 2])] = &[
-        (1, "in_progress", [("graph", "running"), ("graph", "stopped")]),
-        (2, "queued", [("graph", "queued"), ("graph", "awaiting_approval")]),
-        (3, "in_progress", [("graph", "running"), ("chat", "running")]),
+    // (number, planted status, two runs as (kind, status) in queue order)
+    type Planted<'a> = (i32, &'a str, [(&'a str, &'a str); 2]);
+    let rows: &[Planted<'_>] = &[
+        (
+            1,
+            "in_progress",
+            [("graph", "running"), ("graph", "stopped")],
+        ),
+        (
+            2,
+            "queued",
+            [("graph", "queued"), ("graph", "awaiting_approval")],
+        ),
+        (
+            3,
+            "in_progress",
+            [("graph", "running"), ("chat", "running")],
+        ),
     ];
     let mut second = 0;
     let mut first = None;
@@ -5500,12 +5553,11 @@ async fn migration_0023_refuses_two_live_graph_runs_naming_the_items() {
         .await
         .expect("read RES-1");
     assert_eq!(status, "in_progress", "nothing of 0023 applied");
-    let indexes: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pg_indexes WHERE indexname = 'uq_run_item_live'",
-    )
-    .fetch_one(pool)
-    .await
-    .expect("read pg_indexes");
+    let indexes: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM pg_indexes WHERE indexname = 'uq_run_item_live'")
+            .fetch_one(pool)
+            .await
+            .expect("read pg_indexes");
     assert_eq!(indexes, 0, "uq_run_item_live was rolled back with the rest");
 
     db.drop_db().await;
