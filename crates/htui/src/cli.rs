@@ -41,7 +41,7 @@ pub struct Args {
         conflicts_with_all = [
             "clear_qdrant_url", "set_qdrant_key", "clear_qdrant_key", "set_dsn", "clear_dsn",
             "dsn_stdin", "demo", "offline", "index_items", "search_items", "keys", "default_keys",
-            "print_keys"
+            "print_keys", "project", "decisions", "limit", "json", "cwd"
         ]
     )]
     pub set_qdrant_url: Option<String>,
@@ -52,7 +52,7 @@ pub struct Args {
         conflicts_with_all = [
             "set_qdrant_url", "set_qdrant_key", "clear_qdrant_key", "set_dsn", "clear_dsn",
             "dsn_stdin", "demo", "offline", "index_items", "search_items", "keys", "default_keys",
-            "print_keys"
+            "print_keys", "project", "decisions", "limit", "json", "cwd"
         ]
     )]
     pub clear_qdrant_url: bool,
@@ -63,7 +63,7 @@ pub struct Args {
         conflicts_with_all = [
             "set_qdrant_url", "clear_qdrant_url", "clear_qdrant_key", "set_dsn", "clear_dsn",
             "dsn_stdin", "demo", "offline", "index_items", "search_items", "keys", "default_keys",
-            "print_keys"
+            "print_keys", "project", "decisions", "limit", "json", "cwd"
         ]
     )]
     pub set_qdrant_key: bool,
@@ -74,7 +74,7 @@ pub struct Args {
         conflicts_with_all = [
             "set_qdrant_url", "clear_qdrant_url", "set_qdrant_key", "set_dsn", "clear_dsn",
             "dsn_stdin", "demo", "offline", "index_items", "search_items", "keys", "default_keys",
-            "print_keys"
+            "print_keys", "project", "decisions", "limit", "json", "cwd"
         ]
     )]
     pub clear_qdrant_key: bool,
@@ -671,7 +671,7 @@ mod tests {
     /// subcommand.
     #[test]
     fn the_qdrant_flags_exclude_each_other_the_dsn_and_key_flags_and_tui_flags() {
-        let tail: [&[&str]; 10] = [
+        let tail: [&[&str]; 15] = [
             &["--set-dsn"],
             &["--clear-dsn"],
             &["--dsn-stdin"],
@@ -682,6 +682,13 @@ mod tests {
             &["--keys", "k.toml"],
             &["--default-keys"],
             &["--print-keys"],
+            // `--search-items`' own flags: their `requires` never fires beside a flag that
+            // conflicts with `--search-items`, so each needs its own conflict.
+            &["--project", "p"],
+            &["--decisions"],
+            &["--limit", "5"],
+            &["--json"],
+            &["--cwd", "/tmp"],
         ];
         let mut refused: Vec<Vec<&str>> = Vec::new();
         for (i, flag) in QDRANT_FLAGS.iter().enumerate() {
