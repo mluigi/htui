@@ -496,7 +496,7 @@ pub fn graph_body_walk_refusal(graph: StepGraphId, body: &GraphBody) -> Option<S
 /// new phase is an unlinked root, which D9 accepts), or nothing moved (blueprint F12). A cascade
 /// (`delete_phase`) needs no special case: an edge on the deleted phase is in `before_edges` but
 /// cannot be in `default_edges(after)`, so the shapes differ. Palette phases are left out of both
-/// sides ([`linear`]): a palette node has no edges, so creating or deleting one moves nothing.
+/// sides (`linear`): a palette node has no edges, so creating or deleting one moves nothing.
 ///
 /// `after_phases` is computed purely from `before_phases` plus the writer's own result (the
 /// inserted row, the returned updated row, or `before` minus the deleted id), never re-read.
