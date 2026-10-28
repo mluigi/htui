@@ -13,6 +13,8 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width};
+// MOD-115 M4 T0: moved to the kit; this path goes with the importers.
+pub use crate::ui::kit::scroll::window;
 
 /// Two spaces between the columns of an item row, as in the blueprint's `KEY  status  title`.
 const GAP: usize = 2;
@@ -233,19 +235,6 @@ fn row(
     spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
     let line = Line::from(spans);
     if selected { theme.select(line) } else { line }
-}
-
-/// First visible row: enough to keep `cursor` inside a `height`-tall viewport.
-///
-/// Stateless on purpose — it is a function of the cursor, so no scroll offset can survive a fold
-/// or a reply that shortens the list.
-pub fn window(cursor: usize, len: usize, height: usize) -> usize {
-    if height == 0 || len <= height {
-        return 0;
-    }
-    cursor
-        .saturating_sub(height / 2)
-        .min(len.saturating_sub(height))
 }
 
 #[cfg(test)]

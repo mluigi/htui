@@ -26,6 +26,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Widget};
 
+use crate::ui::shell::PaneAreas;
 use crate::ui::{Theme, cells};
 
 /// The scrollbar's thumb: heavy, so it reads over the light vertical border it replaces.
@@ -267,6 +268,19 @@ impl<'a> Pane<'a> {
             paint_scrollbar(buf, area, rows, total, offset, border);
         }
         inner
+    }
+}
+
+/// MOD-115 M2 §7 (T7 repair): where a list + detail tab draws its list and its detail. While
+/// what the detail shows takes every key (`capturing`: a form, a prompt, a compose area) and
+/// another pane is zoomed, so the detail's rect is empty, the detail takes the whole `area` and
+/// the list nothing: what is typed is on screen. Otherwise the panes the layout gave.
+#[must_use]
+pub fn capture_area(areas: &PaneAreas, area: Rect, capturing: bool) -> (Option<Rect>, Rect) {
+    if areas.detail.is_empty() && capturing {
+        (None, area)
+    } else {
+        (areas.list, areas.detail)
     }
 }
 
@@ -1640,5 +1654,33 @@ mod tests {
             THUMB,
             "no rows: the whole inner rect"
         );
+    }
+
+    /// MOD-115 M2 §7 (RV3): a detail that takes every key gets the whole area only while another
+    /// pane is zoomed; otherwise each pane keeps the rect the layout gave it.
+    #[test]
+    fn capture_area_gives_a_capturing_detail_the_area_only_when_zoomed_away() {
+        let area = Rect::new(0, 0, 100, 30);
+        let list = Rect::new(0, 0, 55, 30);
+        let detail = Rect::new(55, 0, 45, 30);
+        let shown = PaneAreas {
+            list: Some(list),
+            detail,
+            activity: None,
+            list_hidden: None,
+            activity_hidden: None,
+        };
+        assert_eq!(capture_area(&shown, area, true), (Some(list), detail));
+        assert_eq!(capture_area(&shown, area, false), (Some(list), detail));
+        let zoomed = PaneAreas {
+            list: Some(area),
+            detail: Rect::default(),
+            ..shown
+        };
+        assert_eq!(
+            capture_area(&zoomed, area, false),
+            (Some(area), Rect::default())
+        );
+        assert_eq!(capture_area(&zoomed, area, true), (None, area));
     }
 }

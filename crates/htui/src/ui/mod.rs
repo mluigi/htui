@@ -11,6 +11,7 @@ pub mod layout;
 mod markdown;
 pub mod overlay;
 pub mod path_picker;
+pub(crate) mod queue_status;
 pub mod shell;
 pub mod state_file;
 pub mod tabs;
