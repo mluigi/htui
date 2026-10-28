@@ -1003,6 +1003,11 @@ pub fn cancel_enabled(run: &Run) -> Result<(), EngineError> {
 ///
 /// Public since milestone 6 (blueprint D184): the Runs tab's greying read decodes the same way.
 ///
+/// MOD-138 D1, D4: reads `v` 1 and 2 ([`GraphSnapshot::V1`]`..=`[`GraphSnapshot::V`]) and lifts
+/// a v1 snapshot ([`GraphSnapshot::lift_v1`]): its edges become the default edges of its own
+/// phases, and it keeps `v == 1` so resume can tell a v1 run from a v2 one. This is the one
+/// decoder every typed reader goes through, so the lift has one home.
+///
 /// # Errors
 /// [`EngineError::Snapshot`] or [`EngineError::SnapshotVersion`].
 pub fn snapshot_of(run: &Run) -> Result<GraphSnapshot, EngineError> {
@@ -1014,17 +1019,18 @@ pub fn snapshot_of(run: &Run) -> Result<GraphSnapshot, EngineError> {
             reason: "the run carries no `graph_snapshot`; a graph run is created with one"
                 .to_owned(),
         })?;
-    let snapshot: GraphSnapshot =
+    let mut snapshot: GraphSnapshot =
         serde_json::from_value(value).map_err(|err| EngineError::Snapshot {
             run: run.id,
             reason: format!("`graph_snapshot` does not decode: {err}"),
         })?;
-    if snapshot.v != GraphSnapshot::V {
+    if !(GraphSnapshot::V1..=GraphSnapshot::V).contains(&snapshot.v) {
         return Err(EngineError::SnapshotVersion {
             run: run.id,
             v: snapshot.v,
         });
     }
+    snapshot.lift_v1();
     Ok(snapshot)
 }
 
@@ -1338,6 +1344,56 @@ mod tests {
             .find(|phase| phase.position == 3)
             .expect("the snapshot has a phase at position 3");
         (step, phase)
+    }
+
+    /// MOD-138 D1, D4 (A2): `snapshot_of` reads v1 and v2, lifts v1 to its default edges while
+    /// keeping `v == 1`, hands a v2 snapshot back as stored, and refuses any other `v`.
+    #[test]
+    fn snapshot_of_reads_v1_and_v2_and_refuses_v3() {
+        use htui_core::model::default_snapshot_edges;
+
+        let run = demo_data()
+            .runs
+            .into_iter()
+            .find(|row| row.id == ids::RUN_1)
+            .expect("the fixture holds RUN_1");
+        let mut stored: GraphSnapshot =
+            serde_json::from_value(run.graph_snapshot.clone().expect("RUN_1 carries one"))
+                .expect("the fixture snapshot decodes");
+        stored.edges.clear();
+        let with_v = |v: u32| Run {
+            graph_snapshot: Some(
+                serde_json::to_value(GraphSnapshot {
+                    v,
+                    ..stored.clone()
+                })
+                .expect("encodes"),
+            ),
+            ..run.clone()
+        };
+
+        let v1 = super::snapshot_of(&with_v(1)).expect("a v1 snapshot reads");
+        assert_eq!(v1.v, 1, "the lift keeps `v`, so resume can tell v1 from v2");
+        assert_eq!(v1.edges, default_snapshot_edges(&v1.phases));
+        assert_eq!(v1.edges.len(), 4, "three `next` edges and the review loop");
+
+        let v2 = super::snapshot_of(&with_v(2)).expect("a v2 snapshot reads");
+        assert_eq!(
+            v2,
+            GraphSnapshot {
+                v: 2,
+                ..stored.clone()
+            },
+            "a v2 snapshot is handed back as stored, its (empty) edges untouched"
+        );
+
+        for v in [0, 3] {
+            let refused = super::snapshot_of(&with_v(v)).expect_err("an unknown `v` is refused");
+            assert!(
+                matches!(refused, EngineError::SnapshotVersion { run: id, v: got } if id == ids::RUN_1 && got == v),
+                "{refused:?}"
+            );
+        }
     }
 
     /// ANA-2 §12 criterion 5 (`docs/ANA-2.md:2096`) is a rule about rows, so it is testable without

@@ -23,11 +23,11 @@ use uuid::Uuid;
 use crate::model::{
     Activation, Agent, AppUser, BoxRow, BoxTool, CitationKind, Document, EdgeId, EventKind,
     EventRole, GateOutcome, GraphSnapshot, Isolation, Item, ItemKind, ItemKindId, ItemLink,
-    ItemRequirement, ItemRevision, LinkKind, Note, NoteId, OsFamily, Persona, PhaseId, Priority,
-    Project, ProjectId, PromptTemplate, PromptTemplateId, Requirement, RequirementArea,
+    ItemRequirement, ItemRevision, LinkKind, NodeRole, Note, NoteId, OsFamily, Persona, PhaseId,
+    Priority, Project, ProjectId, PromptTemplate, PromptTemplateId, Requirement, RequirementArea,
     RequirementAreaId, RequirementId, RequirementRevision, RequirementSpec, RequirementState,
-    Resolution, Run, RunKind, RunMode, RunStatus, RunStep, SessionEvent, Skill, SkillBinding,
-    SkillVersion, SnapshotCandidate, SnapshotGraph, SnapshotPhase, SnapshotSettings,
+    Resolution, Run, RunKind, RunMode, RunStatus, RunStep, RuntimeChanges, SessionEvent, Skill,
+    SkillBinding, SkillVersion, SnapshotCandidate, SnapshotGraph, SnapshotPhase, SnapshotSettings,
     SnapshotTemplate, Status, StepGraph, StepGraphEdge, StepGraphId, StepGraphPhase, StepId,
     StepStatus, Workspace, WorkspaceProject,
 };
@@ -1430,26 +1430,41 @@ fn demo_graph_snapshot() -> Value {
                 }],
                 judge: None,
                 persona: None,
+                role: NodeRole::Step,
+                palette: false,
+                plan_scope: None,
+                divide: None,
             }
         })
         .collect();
 
     serde_json::to_value(GraphSnapshot {
-        v: GraphSnapshot::V,
+        // MOD-138 F4: the fixture's runs stand for runs written before MOD-138, so they are v1
+        // (`topology` is no digest at all, and a v2 resume would recompute it and park every
+        // one as tampered). Readers get them through `snapshot_of`'s lift.
+        v: GraphSnapshot::V1,
         graph: SnapshotGraph {
             id: graph.id,
             name: graph.name,
             is_override: graph.is_override,
+            scope: None,
+            revision: None,
         },
+        source: None,
         topology: "sha256:demo".to_owned(),
         mode: RunMode::Manual,
         phases,
+        edges: Vec::new(),
         settings: SnapshotSettings {
             default_isolation: Isolation::Worktree,
             per_token_cap_run: None,
             per_token_cap_batch: None,
             max_fan_out: 4,
             max_agents_per_run: 8,
+            max_parallel_sessions: SnapshotSettings::DEFAULT_MAX_PARALLEL_SESSIONS,
+            max_plan_revisions: SnapshotSettings::DEFAULT_MAX_PLAN_REVISIONS,
+            max_child_runs: SnapshotSettings::DEFAULT_MAX_CHILD_RUNS,
+            runtime_changes: RuntimeChanges::Ask,
         },
         scope: None,
         personas: Vec::new(),
@@ -2508,8 +2523,8 @@ mod tests {
             .expect("the fixture snapshot decodes as §5.1's type");
             assert_eq!(
                 snapshot.v,
-                crate::model::GraphSnapshot::V,
-                "run {}: the snapshot is at the version this crate writes",
+                crate::model::GraphSnapshot::V1,
+                "run {}: the fixture's runs predate MOD-138 (F4), so their snapshots are v1",
                 run.id
             );
             assert_eq!(

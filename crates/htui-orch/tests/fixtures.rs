@@ -1,6 +1,6 @@
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    GraphSnapshot, ItemPatch, NewStepGraph, PhaseId, RunMode, StepGraphId, StepGraphPhase,
+    GraphSnapshot, ItemPatch, NewStepGraph, NodeRole, PhaseId, RunMode, StepGraphId, StepGraphPhase,
 };
 use htui_core::store::{ReadStore, WriteStore};
 use htui_orch::fake::FakeOrchestrator;
@@ -30,7 +30,43 @@ async fn feature_snapshot_matches() {
     // were right and whose `graph`, `mode`, `v` or `settings` were not — `topology` is hashed over
     // `phases[]` and nothing else (plan D9) — and it would say "the digests differ" about any of
     // the seventeen `SnapshotPhase` fields rather than naming the one that moved.
-    assert_eq!(resolved.snapshot, expected);
+    //
+    // MOD-138 T1: the recorded fixture is a v1 blob (F15), and resolve now writes `v = 2`
+    // (with the bounds at their code defaults, which a v1 blob decodes to). Until T4 resolves
+    // the v2 fields and adds `feature.v2.snapshot.json`, the only difference is `v`.
+    assert_eq!(
+        resolved.snapshot,
+        GraphSnapshot {
+            v: GraphSnapshot::V,
+            ..expected
+        }
+    );
+}
+
+/// MOD-138 D1's byte-identity proof on a recorded v1 blob (F15): `feature.snapshot.json`, written
+/// before MOD-138, decodes with every v2 node field at its default, and its phases re-serialise
+/// to exactly the digest it stored, so no v1 digest moved and no in-flight v1 run parks.
+#[test]
+fn the_v1_fixture_decodes_and_its_phases_hash_to_its_own_digest() {
+    let text = std::fs::read_to_string("tests/fixtures/feature.snapshot.json").unwrap();
+    let decoded: GraphSnapshot = serde_json::from_str(&text).unwrap();
+    assert_eq!(decoded.v, GraphSnapshot::V1);
+    assert!(decoded.edges.is_empty() && decoded.source.is_none());
+    assert_eq!(decoded.phases.len(), 4);
+    for phase in &decoded.phases {
+        assert_eq!(phase.role, NodeRole::Step, "{}", phase.name);
+        assert!(!phase.palette, "{}", phase.name);
+        assert!(
+            phase.divide.is_none() && phase.plan_scope.is_none(),
+            "{}",
+            phase.name
+        );
+    }
+    assert_eq!(
+        htui_orch::graph::topology(&decoded.phases).unwrap(),
+        decoded.topology,
+        "the v1 digest of a recorded v1 blob is unchanged by the v2 fields"
+    );
 }
 
 #[tokio::test]

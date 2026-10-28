@@ -8034,6 +8034,10 @@ mod tests {
             candidates: Vec::new(),
             judge: None,
             persona: None,
+            role: htui_core::model::NodeRole::Step,
+            palette: false,
+            plan_scope: None,
+            divide: None,
         };
         let candidates = vec![
             SnapshotCandidate {
@@ -8962,6 +8966,10 @@ mod tests {
             candidates: Vec::new(),
             judge: None,
             persona: None,
+            role: htui_core::model::NodeRole::Step,
+            palette: false,
+            plan_scope: None,
+            divide: None,
         }
     }
 

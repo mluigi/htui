@@ -188,10 +188,12 @@ pub use requirement::{
 };
 pub use run::{
     ChatRunSpec, CommandRun, CommandRunStatus, GateOutcome, GraphSnapshot, NewCommandRun, NewRun,
-    NewRunStep, Run, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary,
-    RunStepTree, RunSummary, SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPhase,
-    SnapshotSettings, SnapshotTemplate, StepOpening, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS,
-    ToolCallCount, VerifyOutcome, prompt_summary,
+    NewRunStep, NodeRole, Run, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary,
+    RunStepTree, RunSummary, RuntimeChanges, SnapshotCandidate, SnapshotDivide, SnapshotEdge,
+    SnapshotGraph, SnapshotJudge, SnapshotPart, SnapshotPhase, SnapshotSeat, SnapshotSettings,
+    SnapshotSource, SnapshotTemplate, SourceHow, StepOpening, StepOutcome, StepStatus,
+    TIMESTAMPTZ_DIGITS, ToolCallCount, VerifyOutcome, default_snapshot_edges, edge_sort_key,
+    prompt_summary, sort_snapshot_edges,
 };
 pub use scope::{PromptScope, Scope};
 pub use skill::{
@@ -394,6 +396,16 @@ mod tests {
             EdgeKind::ALL,
             &["next", "if", "asks_you", "changes_requested", "fails"],
         );
+    }
+
+    /// MOD-138 D1: the snapshot v2 vocabularies (JSON only; no `CHECK` backs them).
+    #[test]
+    fn snapshot_v2_enums_round_trip() {
+        check_enum(NodeRole::ALL, &["step", "planner", "integrate"]);
+        check_enum(SourceHow::ALL, &["pin", "kind_default"]);
+        check_enum(RuntimeChanges::ALL, &["off", "ask", "automatic"]);
+        assert_eq!(NodeRole::default(), NodeRole::Step);
+        assert_eq!(RuntimeChanges::default(), RuntimeChanges::Ask);
     }
 
     /// `0019_stop_runs.sql`'s `chk_workspace_stop_mode` (MOD-125 plan D4).

@@ -383,6 +383,10 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
         max_fan_out: app_u32(app, "max_fan_out").unwrap_or(DEFAULT_MAX_FAN_OUT),
         max_agents_per_run: app_u32(app, "max_agents_per_run")
             .unwrap_or(DEFAULT_MAX_AGENTS_PER_RUN),
+        max_parallel_sessions: SnapshotSettings::DEFAULT_MAX_PARALLEL_SESSIONS,
+        max_plan_revisions: SnapshotSettings::DEFAULT_MAX_PLAN_REVISIONS,
+        max_child_runs: SnapshotSettings::DEFAULT_MAX_CHILD_RUNS,
+        runtime_changes: htui_core::model::RuntimeChanges::Ask,
     };
     check_fan_out_caps(&phases, &settings)?;
 
@@ -397,6 +401,8 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
             id: resolved.graph.id,
             name: resolved.graph.name,
             is_override: resolved.graph.is_override,
+            scope: None,
+            revision: None,
         },
         topology: topology(&phases)?,
         mode,
@@ -404,6 +410,8 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
         settings,
         scope: Some(scope),
         personas,
+        source: None,
+        edges: Vec::new(),
     };
 
     Ok(Resolved {
@@ -1064,6 +1072,10 @@ async fn snapshot_phase<G: GraphSource>(
         // MOD-26 D9 (B-18): `resolve` binds the persona after this call, where the snapshot's
         // persona list is built.
         persona: None,
+        role: htui_core::model::NodeRole::Step,
+        palette: false,
+        plan_scope: None,
+        divide: None,
     })
 }
 
@@ -1513,7 +1525,9 @@ question and not a test fix. Decide the version bump first, then paste the new d
             super::topology(&resolved.snapshot.phases).expect("`SnapshotPhase` serialises"),
             "the snapshot carries the digest of its own phases"
         );
-        assert_eq!(resolved.snapshot.v, 1, "{TOPOLOGY_MOVED}");
+        // MOD-138 D1: resolve writes `v = 2`. `topology` stays the v1 digest until T4 adds the
+        // v2 one (F14), and the v2 fields are skipped at their defaults, so the pin holds.
+        assert_eq!(resolved.snapshot.v, 2, "{TOPOLOGY_MOVED}");
     }
 
     /// `UNIQUE (graph_id, position)` permits gaps; the snapshot builder is what closes them

@@ -5176,6 +5176,8 @@ fn run_snapshot() -> GraphSnapshot {
             id: ids::GRAPH_HTUI_FEAT,
             name: "feature".to_owned(),
             is_override: false,
+            scope: None,
+            revision: None,
         },
         topology: "sha256:conformance".to_owned(),
         mode: RunMode::Manual,
@@ -5186,9 +5188,15 @@ fn run_snapshot() -> GraphSnapshot {
             per_token_cap_batch: None,
             max_fan_out: 4,
             max_agents_per_run: 8,
+            max_parallel_sessions: SnapshotSettings::DEFAULT_MAX_PARALLEL_SESSIONS,
+            max_plan_revisions: SnapshotSettings::DEFAULT_MAX_PLAN_REVISIONS,
+            max_child_runs: SnapshotSettings::DEFAULT_MAX_CHILD_RUNS,
+            runtime_changes: crate::model::RuntimeChanges::Ask,
         },
         scope: None,
         personas: Vec::new(),
+        source: None,
+        edges: Vec::new(),
     }
 }
 
@@ -15360,7 +15368,11 @@ async fn run_and_steps_round_trip<S: ReadStore>(store: &S) {
             .unwrap_or_else(|| panic!("{CASE}: a graph run carries its snapshot")),
     )
     .unwrap_or_else(|error| panic!("{CASE}: the snapshot decodes as §5.1's type, got {error}"));
-    assert_eq!(snapshot.v, 1, "{CASE}: at the version this crate writes");
+    assert_eq!(
+        snapshot.v,
+        GraphSnapshot::V1,
+        "{CASE}: the fixture's runs predate MOD-138 (F4), so their snapshots are v1"
+    );
     assert_eq!(
         snapshot.phases.len(),
         4,

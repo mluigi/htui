@@ -13439,6 +13439,8 @@ mod tests {
                 id: ids::GRAPH_HTUI_FEAT,
                 name: "FEAT".to_owned(),
                 is_override: false,
+                scope: None,
+                revision: None,
             },
             topology: "sha256:test".to_owned(),
             mode: RunMode::Manual,
@@ -13449,9 +13451,15 @@ mod tests {
                 per_token_cap_batch: None,
                 max_fan_out: 4,
                 max_agents_per_run: 6,
+                max_parallel_sessions: SnapshotSettings::DEFAULT_MAX_PARALLEL_SESSIONS,
+                max_plan_revisions: SnapshotSettings::DEFAULT_MAX_PLAN_REVISIONS,
+                max_child_runs: SnapshotSettings::DEFAULT_MAX_CHILD_RUNS,
+                runtime_changes: crate::model::RuntimeChanges::Ask,
             },
             scope: None,
             personas: Vec::new(),
+            source: None,
+            edges: Vec::new(),
         }
     }
 
