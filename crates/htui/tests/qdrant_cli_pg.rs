@@ -251,7 +251,12 @@ async fn the_url_flags_refuse_a_broken_keyring() {
         qdrant_cmd::clear_url().await.expect_err("refused"),
     ] {
         assert_eq!(err.code(), 2, "{err}");
-        assert!(err.to_string().contains(testkit::BROKEN_KEYRING), "{err}");
+        let sentence = err.to_string();
+        assert!(
+            sentence.starts_with("the OS keyring could not be read: "),
+            "{sentence}"
+        );
+        assert!(sentence.contains(testkit::BROKEN_KEYRING), "{sentence}");
     }
 }
 

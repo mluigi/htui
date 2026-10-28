@@ -462,8 +462,9 @@ database, the next time each searches or indexes. The API key stays in each box'
   `--set-qdrant-url` still writes the setting, and says so when the variable is set where you ran
   it.
 - These flags stand alone: none of them may be combined with another of them, with `--set-dsn`,
-  `--clear-dsn`, `--dsn-stdin`, `--demo`, `--offline`, `--index-items`, `--search-items`, the key
-  file flags or a subcommand.
+  `--clear-dsn`, `--dsn-stdin`, `--demo`, `--offline`, `--index-items`, `--search-items` or its
+  own flags (`--project`, `--decisions`, `--limit`, `--json`, `--cwd`), the key file flags or a
+  subcommand.
 
 | Ending | Standard error | Exit |
 |---|---|---|
@@ -471,8 +472,9 @@ database, the next time each searches or indexes. The API key stays in each box'
 | The URL was cleared | `Qdrant URL cleared for every box.`, or `no Qdrant URL is set; nothing was cleared` | 0 |
 | The key was stored or removed | `Qdrant API key stored in this box's OS keyring.` / `Qdrant API key removed from this box's OS keyring.` | 0 |
 | The URL is refused | `not setting the Qdrant URL: <why>` (the URL itself is never repeated) | 2 |
-| Another box changed the URL meanwhile | `the Qdrant URL changed while it was being set; nothing was written — run the command again` (or `cleared`) | 2 |
-| No DSN, the OS keyring, `box.toml`, the schema | the same sentences as [Failure documents](#failure-documents) | 2 |
+| Another box changed the URL meanwhile | `the Qdrant URL changed while it was being set; nothing was written — run the command again`, or `the Qdrant URL changed while it was being cleared; nothing was removed — run the command again` | 2 |
+| The OS keyring could not be read for the DSN (URL flags) | `the OS keyring could not be read: <the keyring's error>` | 2 |
+| No DSN, `box.toml`, the schema | the same sentences as [Failure documents](#failure-documents) | 2 |
 | A blank key line | `no Qdrant API key on stdin; nothing was stored` | 2 |
 | Postgres did not answer | `cannot reach Postgres: ...` | 3 |
 | Anything else | the error | 1 |

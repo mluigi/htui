@@ -17,7 +17,7 @@ use htui_store::pg::{CONNECT_TIMEOUT, PoolSize};
 use htui_store::secret::QdrantEnv;
 use htui_store::{PgStore, identity, secret};
 
-use crate::state_cmd::{self, Failure, StateExit, StoreState};
+use crate::state_cmd::{self, ErrorCode, Failure, StateExit, StoreState};
 
 /// What `--set-qdrant-key` says on a terminal before it reads the line.
 pub const KEY_PROMPT: &str = "paste the Qdrant API key and press Enter (it will be visible):";
@@ -32,6 +32,9 @@ pub const SET_STALE: &str = "the Qdrant URL changed while it was being set; noth
 /// A clear whose compare-and-set missed.
 pub const CLEAR_STALE: &str = "the Qdrant URL changed while it was being cleared; nothing was \
                                removed — run the command again";
+
+/// The URL flags' refusal when the OS keyring cannot be read for the DSN, before the error.
+pub const KEYRING_UNREADABLE: &str = "the OS keyring could not be read";
 
 /// `--clear-qdrant-url` with no row: not a failure.
 pub const NOTHING_TO_CLEAR: &str = "no Qdrant URL is set; nothing was cleared";
@@ -188,15 +191,27 @@ async fn stored(pg: &PgStore) -> Result<Option<StoredQdrantUrl>, StateExit> {
 
 /// The keyring's DSN, `box.toml` (minted on a first run, as `--index-items` does), then the
 /// headless connect: a pending schema or a build below the database's target is refused, never
-/// migrated. Every refusal is `state_cmd`'s sentence.
+/// migrated. Every refusal is `state_cmd`'s sentence, but an unreadable keyring says so first
+/// ([`KEYRING_UNREADABLE`]).
 async fn connect() -> Result<PgStore, StateExit> {
-    let dsn = state_cmd::read_dsn().map_err(failure_exit)?;
+    let dsn = state_cmd::read_dsn().map_err(dsn_exit)?;
     let identity = identity::config_root()
         .and_then(|root| identity::load_or_mint(&root))
         .map_err(|err| StateExit::Refused(err.to_string()))?;
     PgStore::connect_headless(&dsn, &identity, CONNECT_TIMEOUT, PoolSize::TUI)
         .await
         .map_err(|err| failure_exit(Failure::from_connect(err)))
+}
+
+/// [`state_cmd::read_dsn`]'s refusal as this command's ending: `NO_DSN` as it is, the keyring's
+/// own error after [`KEYRING_UNREADABLE`] (blueprint T5.2).
+fn dsn_exit(failure: Failure) -> StateExit {
+    match failure.error.code {
+        ErrorCode::KeyringUnreadable => {
+            StateExit::Refused(format!("{KEYRING_UNREADABLE}: {}", failure.error.message))
+        }
+        _ => failure_exit(failure),
+    }
 }
 
 /// A state verb's [`Failure`] as this command's ending: offline 3, refused 2, anything else 1.
