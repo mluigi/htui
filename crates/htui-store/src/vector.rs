@@ -33,8 +33,9 @@ use std::sync::atomic::AtomicBool;
 use uuid::Uuid;
 
 /// The collection name. Not versioned by name (MOD-159): a payload change bumps
-/// [`PAYLOAD_SCHEMA`], and `connect` drops and recreates a collection stamped otherwise; the next
-/// sync refills it, since the whole index can be rebuilt from Postgres. `v2` is a historical
+/// [`PAYLOAD_SCHEMA`], and `connect` drops and recreates a collection stamped with an older one
+/// (and refuses one a newer htui stamped); the next sync refills it, since the whole index can be
+/// rebuilt from Postgres. `v2` is a historical
 /// suffix (MOD-50 D222 added `resolution` and requirement points under a new name).
 pub const COLLECTION: &str = "htui_concepts_v2";
 /// Name of the dense vector.
@@ -46,8 +47,8 @@ pub const EMBEDDER_KEY: &str = "embedder";
 /// The collection metadata key the payload layout's version is stored under (MOD-144 Decision B).
 pub const PAYLOAD_SCHEMA_KEY: &str = "payload_schema";
 /// The payload layout this htui writes. 2: MOD-144's three-value `status`. Bump it with any change
-/// to what a point's payload means; a collection stamped otherwise is dropped, recreated and
-/// refilled by the next `Indexer::sync`.
+/// to what a point's payload means; a collection stamped with an older one (or none) is dropped,
+/// recreated and refilled by the next `Indexer::sync`; one stamped with a newer one is refused.
 pub const PAYLOAD_SCHEMA: u64 = 2;
 /// How the message of every refusal of an existing collection begins, before `: ` and what is
 /// wrong with which collection and how to rebuild it (MOD-68 D8, review L3). The one spelling
@@ -451,26 +452,24 @@ enum Existing {
     /// Its `dense` width and its recorded embedder are this one's.
     Matches,
     /// Its `dense` width is right and it records no embedder (every pre-MOD-68 index): record
-    /// this one, and the payload layout. Safe because fastembed's vectors are the rten embedder's
-    /// (`docs/ANA-23.md` §5.6). Never dropped (MOD-144 PD2): a Qdrant that keeps no metadata
-    /// would otherwise drop the index on every connect.
+    /// this one, and only this one (MOD-144 R1): its payload layout is unknown, so the next
+    /// connect finds it missing and rebuilds once. Safe because fastembed's vectors are the rten
+    /// embedder's (`docs/ANA-23.md` §5.6). Never dropped (MOD-144 PD2): a Qdrant that keeps no
+    /// metadata would otherwise drop the index on every connect.
     Stamp,
-    /// Its embedder is this one's, and its payload stamp is missing or another version (MOD-144
-    /// Decision B): drop it, create it again, let the next sync refill it.
+    /// Its embedder is this one's, and its payload stamp is missing, not a number or older than
+    /// [`PAYLOAD_SCHEMA`] (MOD-144 Decision B): drop it, create it again, let the next sync refill
+    /// it. A newer stamp is refused instead (R1): dropping it would throw a newer htui's index
+    /// away, and the two would drop each other's on every connect.
     Rebuild,
-}
-
-/// Whether `payload` (the collection's [`PAYLOAD_SCHEMA_KEY`] metadata) is this htui's
-/// [`PAYLOAD_SCHEMA`].
-fn payload_is_current(payload: Option<&serde_json::Value>) -> bool {
-    payload.and_then(serde_json::Value::as_u64) == Some(PAYLOAD_SCHEMA)
 }
 
 /// Whether a collection holding `dense_size`-wide `dense` vectors, `stored` as its `embedder`
 /// metadata and `payload` as its payload stamp can be used by an embedder `mine` of width `dim`
 /// (MOD-68 D8, MOD-144 Decision B). The width is checked first (A-10): a collection of the wrong
 /// width is refused even when it records nothing, so it is never stamped and then failed on every
-/// upsert. Only a collection recording **this** embedder is rebuilt for its payload stamp.
+/// upsert. Only a collection recording **this** embedder is rebuilt for its payload stamp, and
+/// only for an older or missing one: a newer one is refused (R1).
 fn check_existing(
     collection: &str,
     dense_size: Option<u64>,
@@ -499,11 +498,15 @@ fn check_existing(
     };
     let theirs = match EmbedderIdentity::deserialize(&stored) {
         Ok(id) if id == *mine => {
-            return Ok(if payload_is_current(payload.as_ref()) {
-                Existing::Matches
-            } else {
-                Existing::Rebuild
-            });
+            return match payload.as_ref().and_then(serde_json::Value::as_u64) {
+                Some(PAYLOAD_SCHEMA) => Ok(Existing::Matches),
+                Some(newer) if newer > PAYLOAD_SCHEMA => Err(StoreError::Backend(format!(
+                    "{EMBEDDER_MISMATCH}: collection `{collection}` is an index written by a \
+                     newer htui (payload schema {newer} > {PAYLOAD_SCHEMA}); upgrade htui or \
+                     delete collection `{collection}`"
+                ))),
+                _ => Ok(Existing::Rebuild),
+            };
         }
         Ok(id) => id.to_string(),
         Err(_) => stored.to_string(),
@@ -737,9 +740,10 @@ impl<E: DenseEmbedder> QdrantStore<E> {
     /// # Errors
     /// [`StoreError::Backend`] when Qdrant cannot be reached, and `embedder mismatch` when the
     /// collection holds another width or another embedder's vectors (MOD-68 D8); one that records
-    /// no embedder is stamped with this one's [`identity`](DenseEmbedder::identity) and
-    /// [`PAYLOAD_SCHEMA`]. One recording this embedder under another payload stamp (or none) is
-    /// dropped and recreated empty (MOD-144 Decision B); the next `Indexer::sync` refills it.
+    /// no embedder is stamped with this one's [`identity`](DenseEmbedder::identity) alone. One
+    /// recording this embedder under an older payload stamp (or none) is dropped and recreated
+    /// empty (MOD-144 Decision B); the next `Indexer::sync` refills it. A newer payload stamp is
+    /// `embedder mismatch` too (R1): a newer htui wrote it, and it is never dropped.
     pub async fn connect(settings: &QdrantSettings, embedder: E) -> Result<Self, StoreError> {
         Self::connect_to(settings, embedder, COLLECTION).await
     }
@@ -832,13 +836,20 @@ impl<E: DenseEmbedder> QdrantStore<E> {
         Ok(())
     }
 
-    /// Refuses an existing collection of another width or another embedder, records this
-    /// embedder in one that records none (MOD-68 D8), and drops and recreates one whose payload
-    /// stamp is not [`PAYLOAD_SCHEMA`] (MOD-144 Decision B).
+    /// Refuses an existing collection of another width or another embedder, or of a newer payload
+    /// layout, records this embedder in one that records none (MOD-68 D8), and drops and
+    /// recreates one whose payload stamp is older than [`PAYLOAD_SCHEMA`] or missing (MOD-144
+    /// Decision B).
     async fn check_collection(&self) -> Result<(), StoreError> {
         match self.existing().await? {
             Existing::Matches => {}
             Existing::Rebuild => {
+                // Read again right before the drop (R1): another process that rebuilt it since
+                // the read above has left it current, and dropping it now would throw its work
+                // away. It narrows the window; it cannot close it, as Qdrant has no lock.
+                if self.existing().await? == Existing::Matches {
+                    return Ok(());
+                }
                 tracing::info!(
                     collection = %self.collection,
                     payload_schema = PAYLOAD_SCHEMA,
@@ -868,7 +879,8 @@ impl<E: DenseEmbedder> QdrantStore<E> {
                 // write the same value.
                 self.client
                     .update_collection(
-                        UpdateCollectionBuilder::new(&self.collection).metadata(self.metadata()?),
+                        UpdateCollectionBuilder::new(&self.collection)
+                            .metadata(self.stamp_metadata()?),
                     )
                     .await
                     .map_err(|e| qdrant("stamp embedder", e))?;
@@ -935,17 +947,23 @@ impl<E: DenseEmbedder> QdrantStore<E> {
     }
 
     /// `{EMBEDDER_KEY: identity, PAYLOAD_SCHEMA_KEY: PAYLOAD_SCHEMA}`, the collection metadata this
-    /// embedder writes on a create and on a stamp.
+    /// embedder writes on a create.
     fn metadata(&self) -> Result<HashMap<String, serde_json::Value>, StoreError> {
+        let mut metadata = self.stamp_metadata()?;
+        metadata.insert(
+            PAYLOAD_SCHEMA_KEY.to_owned(),
+            serde_json::Value::from(PAYLOAD_SCHEMA),
+        );
+        Ok(metadata)
+    }
+
+    /// `{EMBEDDER_KEY: identity}`, what a stamp writes on a collection that records no embedder
+    /// (MOD-144 R1): not the payload layout, which an htui that recorded no embedder did not
+    /// write, so the next connect rebuilds the collection once under this one.
+    fn stamp_metadata(&self) -> Result<HashMap<String, serde_json::Value>, StoreError> {
         let identity = serde_json::to_value(self.embedder.identity())
             .map_err(|e| backend("embedder identity", e))?;
-        Ok(HashMap::from([
-            (EMBEDDER_KEY.to_owned(), identity),
-            (
-                PAYLOAD_SCHEMA_KEY.to_owned(),
-                serde_json::Value::from(PAYLOAD_SCHEMA),
-            ),
-        ]))
+        Ok(HashMap::from([(EMBEDDER_KEY.to_owned(), identity)]))
     }
 
     async fn create_collection(&self) -> Result<(), StoreError> {
@@ -1646,12 +1664,12 @@ mod tests {
     }
 
     /// MOD-144 Decision B: this embedder under an older payload layout is rebuilt, whatever the
-    /// older value is.
+    /// older value is; a stamp that is not a number is not this htui's and is rebuilt too.
     #[test]
     fn an_older_payload_stamp_is_rebuilt() {
         for older in [
-            serde_json::json!(1),
-            serde_json::json!(PAYLOAD_SCHEMA + 1),
+            serde_json::json!(PAYLOAD_SCHEMA - 1),
+            serde_json::json!(0),
             serde_json::json!("2"),
         ] {
             assert_eq!(
@@ -1668,6 +1686,33 @@ mod tests {
                 "{older}"
             );
         }
+    }
+
+    /// MOD-144 R1 (M2): a payload layout newer than this htui's was written by a newer htui. It is
+    /// refused, never rebuilt: dropping it would throw away a newer htui's index, and the two
+    /// would drop each other's on every connect. The refusal is an `embedder mismatch` (Qdrant
+    /// answered; retrying does not help) and names both versions and the remedy.
+    #[test]
+    fn a_newer_payload_stamp_is_refused_not_rebuilt() {
+        let newer = PAYLOAD_SCHEMA + 1;
+        let err = check_existing(
+            C,
+            Some(384),
+            stored(&bge()),
+            Some(serde_json::json!(newer)),
+            &bge(),
+            384,
+        )
+        .unwrap_err();
+        assert!(is_embedder_mismatch(&err), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!(
+                "collection `{C}` is an index written by a newer htui (payload schema {newer} > \
+                 {PAYLOAD_SCHEMA}); upgrade htui or delete collection `{C}`"
+            )),
+            "{text}"
+        );
     }
 
     /// MOD-144 Decision B: a collection that records this embedder and no payload layout was
@@ -1694,8 +1739,10 @@ mod tests {
         }
     }
 
-    /// MOD-144 Decision B: a create and a stamp write both keys, the payload layout as a number
-    /// that reads back through Qdrant's metadata as [`PAYLOAD_SCHEMA`].
+    /// MOD-144 Decision B: a create writes both keys, the payload layout as a number that reads
+    /// back through Qdrant's metadata as [`PAYLOAD_SCHEMA`]. A stamp (R1) writes the embedder
+    /// alone: the collection it lands on was filled by an htui that recorded no embedder, so its
+    /// payload is not known to be this layout's, and the next connect rebuilds it once.
     #[test]
     fn the_metadata_records_the_payload_schema() {
         let settings =
@@ -1709,8 +1756,19 @@ mod tests {
         let payload = metadata.get(PAYLOAD_SCHEMA_KEY).cloned();
         assert_eq!(payload, current());
         let back = payload.map(|value| serde_json::Value::from(Value::from(value)));
-        assert!(payload_is_current(back.as_ref()), "{back:?}");
+        assert_eq!(
+            back.as_ref().and_then(serde_json::Value::as_u64),
+            Some(PAYLOAD_SCHEMA),
+            "{back:?}"
+        );
         assert_eq!(metadata.len(), 2, "{metadata:?}");
+        let stamp = store.stamp_metadata().expect("the stamp");
+        assert_eq!(
+            stamp.keys().collect::<Vec<_>>(),
+            vec![EMBEDDER_KEY],
+            "a stamp records the embedder only: {stamp:?}"
+        );
+        assert_eq!(stamp.get(EMBEDDER_KEY), metadata.get(EMBEDDER_KEY));
     }
 
     #[test]

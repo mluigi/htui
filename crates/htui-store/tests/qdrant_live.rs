@@ -416,6 +416,9 @@ async fn a_new_collection_records_the_embedder() {
     assert_eq!(stored, Some(EmbedderIdentity::hash(DENSE_DIM)));
 }
 
+/// The stamp records the embedder only (MOD-144 R1): the collection was filled by an htui that
+/// recorded no embedder, so its payload layout is unknown, and the next connect rebuilds it once
+/// under this layout, keeping the embedder.
 #[tokio::test]
 async fn an_unrecorded_collection_is_stamped_once() {
     let Some(url) = qdrant_url() else {
@@ -426,13 +429,21 @@ async fn an_unrecorded_collection_is_stamped_once() {
     create_bare(&client, &name, DENSE_DIM as u64).await;
     let first = connect(&url, HashEmbedder::new(DENSE_DIM), &name).await;
     let stamped = stored_identity(&client, &name).await;
+    let stamped_payload = stored_payload_schema(&client, &name).await;
     let second = connect(&url, HashEmbedder::new(DENSE_DIM), &name).await;
     let after = stored_identity(&client, &name).await;
+    let after_payload = stored_payload_schema(&client, &name).await;
     client.delete_collection(&name).await.expect("drop");
     first.expect("an unrecorded collection is accepted");
     assert_eq!(stamped, Some(EmbedderIdentity::hash(DENSE_DIM)));
+    assert_eq!(stamped_payload, None, "the stamp records no payload layout");
     second.expect("a stamped collection is accepted");
     assert_eq!(after, stamped);
+    assert_eq!(
+        after_payload,
+        Some(serde_json::json!(PAYLOAD_SCHEMA)),
+        "the next connect rebuilt it under this payload layout"
+    );
 }
 
 /// Qdrant merges an update's metadata into the collection's (observed on 1.19.1, over gRPC here
@@ -798,6 +809,49 @@ async fn an_old_payload_schema_drops_and_recreates_the_collection() {
     assert_eq!(indexes, 5, "the payload indexes are built again");
     refilled.expect("connected").expect("sync");
     assert_eq!(after, filled, "the next sync refills it");
+}
+
+/// A payload layout newer than this htui's (MOD-144 R1, M2) was written by a newer htui: `connect`
+/// refuses it as an `embedder mismatch` naming both versions, and neither drops nor stamps it.
+#[tokio::test]
+async fn a_newer_payload_schema_is_refused_and_kept() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let name = fresh_name();
+    let client = raw(&url);
+    let built = connect(&url, HashEmbedder::new(DENSE_DIM), &name)
+        .await
+        .expect("Qdrant answers");
+    Indexer::sync(&MemStore::demo(), &scope(), &built)
+        .await
+        .expect("sync");
+    let filled = point_count(&client, &name).await;
+    stamp_payload_schema(&client, &name, PAYLOAD_SCHEMA + 1).await;
+
+    let refused = connect(&url, HashEmbedder::new(DENSE_DIM), &name).await;
+    let kept = point_count(&client, &name).await;
+    let payload = stored_payload_schema(&client, &name).await;
+    client.delete_collection(&name).await.expect("drop");
+
+    let Err(err) = refused else {
+        panic!("a newer payload schema is refused")
+    };
+    assert!(is_embedder_mismatch(&err), "{err}");
+    assert!(
+        err.to_string().contains(&format!(
+            "written by a newer htui (payload schema {} > {PAYLOAD_SCHEMA})",
+            PAYLOAD_SCHEMA + 1
+        )),
+        "{err}"
+    );
+    assert!(filled > 0, "control: the sync wrote points");
+    assert_eq!(kept, filled, "nothing was dropped");
+    assert_eq!(
+        payload,
+        Some(serde_json::json!(PAYLOAD_SCHEMA + 1)),
+        "nothing was stamped"
+    );
 }
 
 /// The read-only open writes nothing: under an older payload layout it searches the collection
