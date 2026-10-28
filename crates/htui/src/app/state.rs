@@ -8,8 +8,7 @@ use htui_worker::WaitingView;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
-use ratatui::text::{Line, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::text::Line;
 use std::cell::{Cell, RefCell};
 use tokio::sync::mpsc;
 
@@ -23,8 +22,9 @@ use crate::keys::{Act, Context, HelpLine, KeyChord, Keys, Stack};
 use crate::store_worker::{Origin, RequestEnvelope, Seq, StoreRequest};
 use crate::ui::cells::clip_line;
 use crate::ui::header::{self, Flash, ShellChips};
-use crate::ui::kit::empty::{NextStep, placeholder};
-use crate::ui::kit::pane::{Focus, paint_bottom_hints, paint_bottom_note, paint_focus};
+use crate::ui::kit::empty::{self, NextStep, placeholder};
+use crate::ui::kit::modal;
+use crate::ui::kit::pane::{Focus, Pane, paint_bottom_hints, paint_bottom_note, paint_focus};
 use crate::ui::overlay::{Overlay, OverlayRegistry, OverlayStack};
 use crate::ui::shell::history::{History, Loc};
 use crate::ui::shell::layout::{self as pane_layout, NoteLabels, Seam};
@@ -1628,10 +1628,15 @@ impl App {
                 tab.render(frame, chrome.body, &ctx);
             }
             None => {
-                frame.render_widget(
-                    Paragraph::new(Line::styled("No tab is registered.", self.theme.dim))
-                        .block(Block::new().borders(Borders::ALL)),
-                    chrome.body,
+                // MOD-115 M4 E7: a kit pane holding an empty state, what is missing and what
+                // brings it.
+                let inner = Pane::new("").render(frame, chrome.body, &self.theme);
+                empty::render(
+                    frame,
+                    inner,
+                    "No tab is registered.",
+                    NextStep("a tab registered at start shows here"),
+                    &self.theme,
                 );
             }
         }
@@ -1712,8 +1717,10 @@ impl App {
     /// Each logical line is packed into rows that fit the box ([`HelpLine::rows`]), so the box is
     /// exactly as tall as what it shows and no row is clipped.
     fn render_help(&self, frame: &mut Frame<'_>, area: Rect) {
-        let box_width = area.width.saturating_sub(10).max(20);
-        let inner = usize::from(box_width.saturating_sub(2));
+        // Today's packing width (the old box less its two borders), handed to the kit as the
+        // content width: the kit's box is one column wider, so no line re-wraps (blueprint §3.3).
+        let content_w = area.width.saturating_sub(10).max(20).saturating_sub(2);
+        let inner = usize::from(content_w);
         let offered = |act| self.offers(act);
         // MOD-57 M2 E7 (PD-M2-2): the editor keys that act where the user is.
         let uncovered = self.editor.is_some() && !self.editor_covered();
@@ -1752,17 +1759,7 @@ impl App {
         if let Some(closer) = closer {
             rows.push(Line::styled(closer, self.theme.dim));
         }
-        let height = u16::try_from(rows.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(2)
-            .min(area.height);
-        let box_area = layout::centered(area, box_width, height);
-        frame.render_widget(Clear, box_area);
-        frame.render_widget(
-            Paragraph::new(Text::from(rows))
-                .block(Block::new().borders(Borders::ALL).title(" Keys ")),
-            box_area,
-        );
+        modal::help(frame, area, "Keys", &rows, content_w, &self.theme);
     }
 }
 
