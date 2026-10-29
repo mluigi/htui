@@ -36,7 +36,7 @@ use htui_core::model::{
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use super::divergence::{Divergence, ViewOutcome, rebased_on, still_behind};
 use crate::editor::{
@@ -1055,20 +1055,23 @@ impl ItemForm {
     }
 }
 
-/// Draws the form into the detail pane's `area` (D8).
+/// The item form's pane title (MOD-115 M4 D-9): `Edit ANA-1 (v1)` for an edit, `New item ·
+/// {slug}` for a new item. The Backlog draws the pane it titles, in the detail's place.
+#[must_use]
+pub fn title(form: &ItemForm) -> String {
+    match &form.context.item {
+        Some(item) => format!("Edit {} (v{})", item.key, item.version),
+        None => format!("New item \u{b7} {}", form.slug(form.context.project)),
+    }
+}
+
+/// Draws the form's rows into `inner`, the inner rect of the pane the Backlog draws in the
+/// detail pane's place (D8; MOD-115 M4 D-9: the frame is a kit pane titled [`title`]).
 ///
 /// Returns the rect the pane claims for an in-pane editor (MOD-57 P2): the field handed to
 /// `$EDITOR`, else the focused one when it is Paths, else the body. The paths rect is
 /// `PATHS_HEIGHT` rows, under `MIN_PANE`, so a Paths edit gets the whole tab body (R0 F1).
-pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme) -> Rect {
-    let title = match &form.context.item {
-        Some(item) => format!(" Edit {} (v{}) ", item.key, item.version),
-        None => format!(" New item \u{b7} {} ", form.slug(form.context.project)),
-    };
-    let block = Block::new().borders(Borders::ALL).title(title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
+pub fn render(frame: &mut Frame<'_>, inner: Rect, form: &ItemForm, theme: &Theme) -> Rect {
     let rows: Vec<Field> = form
         .fields()
         .iter()
@@ -1187,6 +1190,7 @@ mod tests {
     use crate::item_writes;
     use crate::store_worker::StoreReply;
     use crate::testkit::DEFAULT_SIZE;
+    use crate::ui::kit::pane::Pane;
     use crate::ui::layout::chrome;
     use crate::ui::tabs::backlog::panes;
     use crossterm::event::{KeyCode, KeyModifiers};
@@ -1808,6 +1812,14 @@ mod tests {
         assert!(printed.contains("notice_len"), "{printed}");
     }
 
+    /// The form drawn as the Backlog draws it (MOD-115 M4 D-9): its rows inside a kit pane titled
+    /// [`title`] over `area`; the rect it claims.
+    fn framed(frame: &mut Frame<'_>, area: Rect, form: &ItemForm) -> Rect {
+        let theme = Theme::default();
+        let inner = Pane::new(&title(form)).render(frame, area, &theme);
+        render(frame, inner, form, &theme)
+    }
+
     /// The form drawn into the detail pane at the default size, one string per row.
     fn drawn(form: &ItemForm) -> Vec<String> {
         drawn_at(form, DEFAULT_SIZE)
@@ -1823,7 +1835,7 @@ mod tests {
         .expect("a test terminal");
         terminal
             .draw(|frame| {
-                render(frame, frame.area(), form, &Theme::default());
+                framed(frame, frame.area(), form);
             })
             .expect("the frame draws");
         let buffer = terminal.backend().buffer();
@@ -1853,7 +1865,7 @@ mod tests {
         let mut body = None;
         terminal
             .draw(|frame| {
-                body = Some(render(frame, frame.area(), &form, &Theme::default()));
+                body = Some(framed(frame, frame.area(), &form));
             })
             .expect("the frame draws");
         let body = body.expect("the frame drew");
@@ -1893,7 +1905,7 @@ mod tests {
             let mut rect = None;
             terminal
                 .draw(|frame| {
-                    rect = Some(render(frame, frame.area(), form, &Theme::default()));
+                    rect = Some(framed(frame, frame.area(), form));
                 })
                 .expect("the frame draws");
             let rect = rect.expect("the frame drew");

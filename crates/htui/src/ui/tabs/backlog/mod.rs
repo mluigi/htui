@@ -623,7 +623,17 @@ impl Tab for BacklogTab {
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         // MOD-13 milestone 3 D4: the divergence view takes the whole tab area, list pane included.
         if let Some(view) = self.item_form.as_ref().and_then(ItemForm::resolving) {
-            divergence::render(frame, area, view, ctx.theme);
+            // MOD-115 M4 D-9: one kit pane over the whole area, titled with the key and versions.
+            divergence::render(frame, Pane::inner(area), view, ctx.theme);
+            let title = divergence::title(view);
+            let chrome = Chrome {
+                focus: ctx.pane_focus(ctx.focus()),
+                accent: ctx.accent(),
+                hints: None,
+            };
+            chrome
+                .frame(Pane::new(&title))
+                .render(frame, area, ctx.theme);
             return;
         }
         // MOD-115 M2 B5: the panes the shell's layout gives the tab, claimed for the focus
@@ -665,7 +675,19 @@ impl Tab for BacklogTab {
         }
         match &self.item_form {
             Some(form) => {
-                ctx.claim_editor_area(item_form::render(frame, detail_area, form, ctx.theme));
+                // MOD-115 M4 D-9: the form's rows in a kit pane in the detail's place; the rect
+                // it claims is inside the pane's inner rect, as it was inside the block's.
+                let claim = item_form::render(frame, Pane::inner(detail_area), form, ctx.theme);
+                ctx.claim_editor_area(claim);
+                let title = item_form::title(form);
+                let chrome = Chrome {
+                    focus: ctx.pane_focus(PaneId::Detail),
+                    accent: ctx.accent(),
+                    hints: None,
+                };
+                chrome
+                    .frame(Pane::new(&title))
+                    .render(frame, detail_area, ctx.theme);
             }
             None if detail_area.is_empty() => {}
             None => {

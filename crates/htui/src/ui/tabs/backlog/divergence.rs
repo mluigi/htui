@@ -29,7 +29,7 @@ use htui_core::model::{Item, ItemKindId, ItemSpec, StepGraphId};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use crate::item_writes::{ItemDivergence, ItemFormContext};
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, views};
@@ -467,16 +467,17 @@ fn count(n: usize, noun: &str) -> String {
     }
 }
 
-/// D4: the view over the whole tab `area`. Its keys are [`Divergence::hint`], the shell's hint row
-/// since MOD-67 M6 T2.
-pub fn render(frame: &mut Frame<'_>, area: Rect, view: &Divergence, theme: &Theme) {
-    let title = header(&view.key, view.ancestor_version, view.head_version);
-    let block = Block::new()
-        .borders(Borders::ALL)
-        .title(format!(" {title} "));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+/// The divergence view's pane title (MOD-115 M4 D-9): the item's key and the versions it sits
+/// between, as [`header`] words them. The Backlog draws the pane it titles over the whole tab.
+#[must_use]
+pub fn title(view: &Divergence) -> String {
+    header(&view.key, view.ancestor_version, view.head_version)
+}
 
+/// D4: the view's rows in `inner`, the inner rect of the pane the Backlog draws over the whole
+/// tab area (MOD-115 M4 D-9: a kit pane titled [`title`]). Its keys are [`Divergence::hint`], that
+/// pane's hints.
+pub fn render(frame: &mut Frame<'_>, inner: Rect, view: &Divergence, theme: &Theme) {
     let width = usize::from(inner.width);
     let vw = width.saturating_sub(LABEL_WIDTH + STATE_WIDTH + 2) / 3;
     let headings = format!(
@@ -636,6 +637,7 @@ mod tests {
     use crate::item_writes;
     use crate::store_worker::{StoreReply, StoreRequest};
     use crate::ui::cells::cell_width;
+    use crate::ui::kit::pane::Pane;
     use crate::ui::layout::chrome;
     use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
@@ -709,6 +711,14 @@ mod tests {
         Divergence::open(&ancestor, &context, spec, &divergence)
     }
 
+    /// The view drawn as the Backlog draws it (MOD-115 M4 D-9): its rows inside a kit pane titled
+    /// [`title`] over `area`.
+    fn framed(frame: &mut Frame<'_>, area: Rect, view: &Divergence) {
+        let theme = Theme::default();
+        let inner = Pane::new(&title(view)).render(frame, area, &theme);
+        render(frame, inner, view, &theme);
+    }
+
     /// The view drawn at 100x30 into the tab area, one string per row of the whole frame.
     fn drawn(view: &Divergence) -> Vec<String> {
         drawn_at(view, 100, 30)
@@ -722,7 +732,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = chrome(frame.area()).body;
-                render(frame, area, view, &Theme::default());
+                framed(frame, area, view);
             })
             .expect("the frame draws");
         let buffer = terminal.backend().buffer();
@@ -1254,7 +1264,7 @@ mod tests {
             ] {
                 terminal
                     .draw(|frame| {
-                        render(frame, area(frame), &view, &Theme::default());
+                        framed(frame, area(frame), &view);
                     })
                     .unwrap_or_else(|err| panic!("{width}x{height}: {err}"));
                 for code in [KeyCode::PageDown, KeyCode::Char('j'), KeyCode::Tab] {
