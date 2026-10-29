@@ -89,8 +89,9 @@ fn border_holds(key: &str, title: &str, inner: u16) -> bool {
 }
 
 /// The meta line's rows at `width`: the status as its mark in its own style, then the tags, the
-/// priority and the version, dim. One row when it fits (the case at every width the detail pane
-/// takes); wrapped by `kit::text::wrapped` otherwise, the mark kept in its style on the first.
+/// priority and the version, dim. One row when it fits (the detail pane at 100 columns); wrapped
+/// by `kit::text::wrapped` otherwise (at 80 columns `version 1` takes a second row), the mark kept
+/// in its style on the first.
 fn meta_lines(item: &Item, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let tags: Cow<'_, str> = if item.required_tags.is_empty() {
         Cow::Borrowed("no tags")

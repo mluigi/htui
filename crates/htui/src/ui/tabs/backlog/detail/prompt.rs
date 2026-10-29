@@ -824,6 +824,23 @@ mod tests {
         assert_eq!(hint.as_deref(), Some("t/p template"));
     }
 
+    /// Plan DoD 2: a project with no template is `kit::empty`, naming where one is made, and the
+    /// pane hints no template key, there being none to cycle to.
+    #[test]
+    fn no_templates_names_where_one_is_made() {
+        let (tab, rows) = landed(previewed(&[]), 120);
+        let text = rows.join("\n");
+        assert!(text.contains(NO_TEMPLATES), "{rows:#?}");
+        assert!(
+            text.contains("Skills \u{203a} Templates creates one"),
+            "{rows:#?}"
+        );
+        assert!(
+            tab.key_hint(Keys::compiled(), &Theme::default()).is_none(),
+            "no template, nothing to cycle"
+        );
+    }
+
     /// MOD-81, D-24: a row wider than the pane is cut with `…`; one that fits is drawn whole.
     #[test]
     fn a_clipped_row_ends_in_an_ellipsis() {
