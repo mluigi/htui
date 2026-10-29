@@ -1771,6 +1771,101 @@ async fn an_untouched_kind_edit_keeps_a_shared_graph_the_project_shadows_by_name
     );
 }
 
+/// MOD-138 D12: a kind keeps its workspace graph after the project leaves that workspace, and the
+/// kind still resolves. `usable_graphs` no longer lists the graph, yet the catalogue carries its row
+/// in `kept`, so the kind's line names it with its scope rather than `graph missing`, and the edit
+/// form opens on that label. The untouched `Enter` sends the kept graph, which the store's guard
+/// then refuses: the project may no longer name it.
+#[tokio::test]
+async fn a_kept_workspace_graph_reads_with_its_scope_not_as_missing() {
+    let store = MemStore::demo();
+    let shared = store
+        .create_step_graph(htui_core::model::NewStepGraph {
+            id: StepGraphId::new(),
+            scope: GraphScope::Workspace(ids::WORKSPACE_GRAPHICS),
+            name: "wsflow".to_owned(),
+            description: String::new(),
+            is_override: false,
+        })
+        .await
+        .expect("a workspace graph");
+    store
+        .create_item_kind(htui_core::model::NewItemKind {
+            id: ItemKindId::new(),
+            project_id: ids::PROJECT_VULKAN,
+            prefix: "DOC".to_owned(),
+            name: "docs".to_owned(),
+            description: String::new(),
+            default_graph_id: shared.id,
+            position: 99,
+        })
+        .await
+        .expect("a kind on the workspace graph");
+    store
+        .remove_workspace_project(ids::WORKSPACE_GRAPHICS, ids::PROJECT_VULKAN)
+        .await
+        .expect("the project leaves the workspace");
+    let backend = Backend::memory(store);
+    let snapshot = demo_catalogue(&backend).await;
+    let project = &snapshot.projects[0];
+    assert!(
+        !project.shared.iter().any(|graph| graph.id == shared.id),
+        "the project may no longer pick it"
+    );
+    assert_eq!(
+        project
+            .kept
+            .iter()
+            .map(|graph| graph.id)
+            .collect::<Vec<_>>(),
+        vec![shared.id],
+        "the catalogue carries the graph its kind kept"
+    );
+
+    let bench = SectionBench::new().await;
+    let mut section = KindsSection::new();
+    bench.reply(&mut section, &StoreReply::Catalogue(Box::new(snapshot)));
+    let _ = bench.drained();
+    let frame = bench.render_section(&section, 100);
+    let row = frame
+        .lines()
+        .position(|line| line.trim() == "DOC  docs \u{b7} graph wsflow \u{b7} workspace")
+        .unwrap_or_else(|| panic!("the kind's line names the kept graph: {frame}"));
+    assert!(
+        !error_text(&bench, &section, 100).contains(&"graph missing".to_owned()),
+        "a kept graph is not missing: {frame}"
+    );
+
+    for _ in 0..row {
+        bench.key(&mut section, "j");
+    }
+    bench.key(&mut section, "e");
+    let open = bench.render_section(&section, 100);
+    assert!(
+        open.lines()
+            .any(|line| line.trim() == "graph         wsflow \u{b7} workspace"),
+        "the graph field names the kept graph: {open}"
+    );
+    bench.key(&mut section, "enter");
+    let asked = bench.drained();
+    let [Action::Store(request @ StoreRequest::UpdateKind { patch, .. })] = asked.as_slice() else {
+        panic!("`Enter` updates once: {asked:?}");
+    };
+    assert_eq!(
+        patch.default_graph_id,
+        Some(shared.id),
+        "an untouched field keeps the kept graph"
+    );
+    let (_, message) = refusal(serve(&backend, request).await);
+    assert!(
+        message.contains(&htui_core::store::graph_not_usable(
+            shared.id,
+            ids::PROJECT_VULKAN
+        )),
+        "the guard refuses the left workspace's graph: {message}"
+    );
+}
+
 /// `e` on a kind sends the whole patch against the row's token, changed columns or not (B-5): one
 /// habit across both sections, and compare-and-set is what makes it safe.
 #[tokio::test]

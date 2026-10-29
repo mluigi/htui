@@ -64,6 +64,12 @@ pub struct ProjectCatalogue {
     /// (each workspace's that holds the project, then the library's, by `name`). A kind may name
     /// one; the section edits none of them, so they carry no body.
     pub shared: Vec<StepGraph>,
+    /// MOD-138 D12: the row of each graph a kind of the project still names that neither
+    /// [`graphs`](Self::graphs) nor [`shared`](Self::shared) lists — a workspace graph kept after
+    /// the project left that workspace. The kind still resolves, so its line names the graph with
+    /// its scope rather than `graph missing`; no kind may newly take one (the store refuses it), so
+    /// [`graph_name`](Self::graph_name) finds these and a typed name does not. In kind order.
+    pub kept: Vec<StepGraph>,
 }
 
 /// One graph as the catalogue holds it: its whole [`GraphBody`] from one
@@ -89,12 +95,18 @@ impl ProjectCatalogue {
     }
 
     /// MOD-138 D12: the name and scope of any graph a kind of this project may name, its own
-    /// ([`Self::graph`]) or a [`shared`](Self::shared) one; `None` when the id names neither.
+    /// ([`Self::graph`]) or a [`shared`](Self::shared) one, or of one a kind
+    /// [`kept`](Self::kept); `None` when the id names none of them.
     #[must_use]
     pub fn graph_name(&self, id: StepGraphId) -> Option<(&str, GraphScope)> {
         self.graph(id)
             .map(|entry| &entry.graph)
-            .or_else(|| self.shared.iter().find(|graph| graph.id == id))
+            .or_else(|| {
+                self.shared
+                    .iter()
+                    .chain(&self.kept)
+                    .find(|graph| graph.id == id)
+            })
             .map(|graph| (graph.name.as_str(), graph.scope))
     }
 }
@@ -121,7 +133,9 @@ pub fn graph_label(name: &str, scope: GraphScope) -> String {
 /// read (MOD-138 D12): its project rows each get one `graph_body` read (MOD-137 R1b, review
 /// C-L5), not a `phases` and a `graph_edges` read, and its workspace and library rows go to
 /// [`ProjectCatalogue::shared`] as they are; a graph `usable_graphs` named and `graph_body` no
-/// longer finds is skipped, a torn read like a missing project.
+/// longer finds is skipped, a torn read like a missing project. A kind's graph neither list holds
+/// gets one more `graph_body` read for [`ProjectCatalogue::kept`]; one no read finds is left out,
+/// and the kind draws as `graph missing`.
 ///
 /// The bound is `ReadStore + WriteStore` rather than `ReadStore` alone because `item_kinds`,
 /// `usable_graphs` and `graph_body` live on [`WriteStore`] (which extends [`ReadStore`]); only
@@ -148,11 +162,21 @@ pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
                 graphs.push(body);
             }
         }
+        let mut kept: Vec<StepGraph> = Vec::new();
+        for kind in &kinds {
+            let id = kind.default_graph_id;
+            let listed = graphs.iter().any(|entry| entry.graph.id == id)
+                || shared.iter().chain(&kept).any(|graph| graph.id == id);
+            if !listed && let Some(body) = store.graph_body(id).await? {
+                kept.push(body.graph);
+            }
+        }
         projects.push(ProjectCatalogue {
             project,
             kinds,
             graphs,
             shared,
+            kept,
         });
     }
     let personas = store
