@@ -14,12 +14,12 @@ Platform   ¹Backlog            1 working · 1 waiting · memory · DESKTOP-HTUI
 │  FIX-1    ✓ closed     Terminal left raw after panic││    candidate 2 —          agy/default     │
 │  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││                                           │
 │ ▾ agy (3)                                           ││                                           │
-│  ANA-1    ● done       Prompt assembly survey       ││                                           │
-│  FEAT-1   ○ open       ACP transport upgrade        ││  ╭ Close out ──────────────────────────╮  │
-│  FIX-1    ○ open       Session leak on cancel       ││  │close ANA-1 as done · 1 run · 0      │  │
-│                                                     ││  │commit rows · summary v2             │  │
+│  ANA-1    ● done       Prompt assembly survey       ││  ╭ Close out ──────────────────────────╮  │
+│  FEAT-1   ○ open       ACP transport upgrade        ││  │close ANA-1 as done · 1 run · 0      │  │
+│  FIX-1    ○ open       Session leak on cancel       ││  │commit rows · summary v2             │  │
+│                                                     ││  │type ANA-1 to close it:              │  │
 │                                                     ││  │                                     │  │
-│                                                     ││  │type ANA-1 to close it: ANA          │  │
+│                                                     ││  │ANA                                  │  │
 │                                                     ││  ╰ Enter close · Esc cancel ───────────╯  │
 │                                                     ││                                           │
 │                                                     ││                                           │

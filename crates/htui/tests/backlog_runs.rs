@@ -47,12 +47,18 @@ async fn backlog_at(width: u16, height: u16) -> Harness {
 /// A settled Backlog tab as [`backlog_at`] makes, at the default 100x30, with a run runtime over
 /// fakes that answers the close-out's preview (no session runs: nothing is started).
 async fn driving() -> Harness {
+    driving_at(100, 30).await
+}
+
+/// [`driving`] on a `width` x `height` terminal.
+async fn driving_at(width: u16, height: u16) -> Harness {
     let runtime = RunRuntime::with_parts(
         Arc::new(FakeIsolator::new()),
         Arc::new(FakeVerifier::new()),
         DriverFactory::new(),
     );
     let mut harness = Harness::over(MemStore::demo())
+        .size(width, height)
         .with_tab(Box::new(BacklogTab::new()))
         .with_agent_runtime(AgentRuntime::new(DriverFactory::new()))
         .with_run_runtime(runtime);
@@ -150,4 +156,51 @@ async fn the_close_out_asks_inside_the_detail_pane() {
     harness.drive_to_end().await;
     let frame = harness.render();
     assert!(!frame.contains("Close out"), "`n` answered:\n{frame}");
+}
+
+/// C7 at 80 columns (MOD-81): the close-out's typed stage shows the key as it is typed, whole,
+/// on its own row under the question that names it; the question's prompt does not leave the
+/// field a few cells beside it.
+#[tokio::test]
+async fn the_typed_close_out_shows_the_key_typed_at_80_columns() {
+    let mut harness = driving_at(80, 24).await;
+    on_runs(&mut harness, 0).await;
+    for key in ["C", "y"] {
+        harness.key(key);
+        harness.drive_to_end().await;
+    }
+    for key in ["A", "N", "A", "-", "1"] {
+        harness.key(key);
+    }
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    let lines: Vec<&str> = frame.lines().collect();
+    let top = lines
+        .iter()
+        .position(|line| line.contains("\u{256d} Close out "))
+        .unwrap_or_else(|| panic!("the close-out question is drawn:\n{frame}"));
+    let left = lines[top]
+        .find("\u{256d} Close out ")
+        .map(|byte| lines[top][..byte].chars().count())
+        .expect("the corner is on the row");
+    // The modal's content, row by row, between its side borders.
+    let inside: Vec<String> = lines[top + 1..]
+        .iter()
+        .take_while(|line| !line.chars().nth(left).is_some_and(|c| c == '\u{2570}'))
+        .map(|line| {
+            line.chars()
+                .skip(left + 1)
+                .take_while(|c| *c != '\u{2502}')
+                .collect::<String>()
+        })
+        .collect();
+    assert!(
+        inside.iter().any(|row| row.contains("to close it")),
+        "the question names the key:\n{frame}"
+    );
+    assert!(
+        inside.iter().any(|row| row.trim() == "ANA-1"),
+        "the key typed is whole on its own row:\n{frame}"
+    );
+    insta::assert_snapshot!("closeout_typed_80", frame);
 }

@@ -719,7 +719,14 @@ async fn the_close_out_counts_then_asks_for_the_key() {
     type_text(&mut harness, "ANA");
     harness.drive().await;
     let typed = harness.render();
-    assert!(typed.contains("type ANA-1 to close it: ANA"), "{typed}");
+    assert!(typed.contains("type ANA-1 to close it:"), "{typed}");
+    // What is typed is on its own row in the question (MOD-115 M4 L-runs, MOD-81).
+    assert!(
+        typed
+            .lines()
+            .any(|row| row.split('\u{2502}').any(|cell| cell.trim() == "ANA")),
+        "{typed}"
+    );
     assert!(
         on_item(&typed, "ANA-1"),
         "`A`, `N` and `A` are typed, not bound"

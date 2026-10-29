@@ -89,6 +89,7 @@ use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width};
 use crate::ui::kit::chips::key_line;
+use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::label::{self, Mark, plural};
 use crate::ui::kit::modal::{Ask, modal_rest};
 use crate::ui::kit::scroll::{Scroll, Step};
@@ -141,6 +142,41 @@ const WAITING_LINE: &str = "waiting for the walk";
 
 /// MOD-28 D5: what the flow view says under a run with no step yet.
 const NO_STEPS_YET: &str = "No steps yet.";
+
+/// [`NO_STEPS_YET`]'s next step (MOD-115 M4 L-runs): nothing to press, the walk adds them.
+const NO_STEPS_NEXT: &str = "its steps show here as it takes them";
+
+/// The pane with no item under the list's cursor (a project header).
+const NO_ITEM: &str = "No item selected.";
+
+/// [`NO_ITEM`]'s next step: the list's motion, through the browse stack.
+const CHOOSE_AN_ITEM: HintSpec = &[Hint::Pair(Act::ListDown, Act::ListUp, "chooses one")];
+
+/// [`NO_ITEM`]'s next step while the list's motion is unbound.
+const CHOOSE_UNBOUND: &str = "a chosen item's runs show here";
+
+/// The item with no run.
+const NO_RUNS: &str = "No runs for this item.";
+
+/// [`NO_RUNS`]' next step (MOD-115 M4 L-runs, plan item 2): the start key through the browse
+/// stack, so a rebound one is the one named, or where to bind one.
+fn no_runs_next(keys: &Keys) -> String {
+    keys.label(views::RUNS_BROWSE, Act::RunsStartRun)
+        .map_or_else(
+            || "a key bound to start_run in keys.toml starts one".to_owned(),
+            |key| format!("{key} starts one"),
+        )
+}
+
+/// [`NO_ITEM`]'s next step: the list's motion, or [`CHOOSE_UNBOUND`].
+fn no_item_next(keys: &Keys) -> String {
+    let choose = keys.hint(views::RUNS_BROWSE, CHOOSE_AN_ITEM);
+    if choose.is_empty() {
+        CHOOSE_UNBOUND.to_owned()
+    } else {
+        choose
+    }
+}
 
 /// What a relayed request with no summary asks for (MOD-42 blueprint B-14: the transport named no
 /// call, or the scrubber refused it).
@@ -1232,8 +1268,9 @@ struct Question<'a> {
     title: &'static str,
     /// What is asked, one line each (wrapped by the modal).
     lines: Vec<String>,
-    /// The typed answer's prompt and field, for the close-out's typed stage.
-    input: Option<(String, &'a TextField)>,
+    /// The typed answer's field, for the close-out's typed stage: on its own row under the
+    /// lines, so a narrow modal keeps what is typed whole (MOD-81).
+    input: Option<&'a TextField>,
     /// The keys, on the modal's bottom border.
     hint: String,
 }
@@ -2096,7 +2133,8 @@ impl DetailTab for RunsTab {
         // MOD-71 D5: only a frame that draws the canvas records it (render_flow).
         self.canvas.set(None);
         if self.item.is_none() {
-            message(frame, area, "No item selected.", ctx.theme);
+            let next = no_item_next(ctx.keys());
+            empty::render(frame, area, NO_ITEM, NextStep(&next), ctx.theme);
             return;
         }
         self.render_content(frame, area, ctx);
@@ -2105,8 +2143,8 @@ impl DetailTab for RunsTab {
             for line in &question.lines {
                 ask = ask.line(Line::styled(line.as_str(), ctx.theme.base));
             }
-            if let Some((prompt, field)) = &question.input {
-                ask = ask.input(prompt, field);
+            if let Some(field) = question.input {
+                ask = ask.input("", field);
             }
             ask.render(frame, area, ctx.theme);
         }
@@ -2137,7 +2175,8 @@ impl RunsTab {
         .areas(area);
         frame.render_widget(Paragraph::new(footer).wrap(Wrap { trim: false }), prompt);
         if self.runs.is_empty() {
-            message(frame, list, "No runs for this item.", ctx.theme);
+            let next = no_runs_next(ctx.keys());
+            empty::render(frame, list, NO_RUNS, NextStep(&next), ctx.theme);
             return;
         }
         if self.view == View::Flow {
@@ -2182,7 +2221,7 @@ impl RunsTab {
         .areas(area);
         frame.render_widget(Paragraph::new(lines), head);
         if run.steps.is_empty() {
-            message(frame, canvas, NO_STEPS_YET, theme);
+            empty::render(frame, canvas, NO_STEPS_YET, NextStep(NO_STEPS_NEXT), theme);
             return;
         }
         // MOD-71 D5, blueprint B-7: the canvas a press is hit-tested against, only when
@@ -2308,8 +2347,11 @@ impl RunsTab {
             }
             Mode::CloseOut(CloseOutStage::Typed { preview, field }) => (
                 CLOSE_OUT_TITLE,
-                vec![close_out_summary(preview)],
-                Some((format!("type {} to close it: ", preview.key), field)),
+                vec![
+                    close_out_summary(preview),
+                    format!("type {} to close it:", preview.key),
+                ],
+                Some(field),
             ),
             _ => return None,
         };
@@ -3905,9 +3947,8 @@ mod tests {
         match pane.question(Keys::compiled()) {
             Some(question) => {
                 rows.extend(question.lines.iter().cloned());
-                if let Some((prompt, field)) = &question.input {
-                    let typed = format!("{prompt}{}", field.text().unwrap_or_default());
-                    rows.push(typed.trim_end().to_owned());
+                if let Some(field) = question.input {
+                    rows.push(field.text().unwrap_or_default().trim_end().to_owned());
                 }
                 rows.push(question.hint);
             }
@@ -4080,6 +4121,7 @@ mod tests {
             [
                 "close FEAT-1 as done · 1 run · 3 commit rows · summary v2",
                 "type FEAT-1 to close it:",
+                "",
                 "Enter close · Esc cancel"
             ]
         );
@@ -4337,11 +4379,7 @@ mod tests {
             matches!(emitted.as_slice(), [Action::Error(sentence)] if sentence == NOT_THE_KEY),
             "{emitted:?}"
         );
-        assert_eq!(
-            footer(&pane)[1],
-            "type FEAT-1 to close it:",
-            "the field is cleared"
-        );
+        assert_eq!(footer(&pane)[2], "", "the field is cleared");
 
         type_text(&mut pane, &shell, "FEAT-1");
         pane.on_key(key(KeyCode::Enter), &mut shell.ctx());
@@ -4909,7 +4947,49 @@ mod tests {
         pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
         let lines = lines(&pane, &shell);
         // Rows 0 and 1 are the run header (review L3).
-        assert_eq!(lines[2], NO_STEPS_YET, "{lines:#?}");
+        assert!(lines[0].starts_with("graph"), "{lines:#?}");
+        // MOD-115 M4 L-runs: the canvas under the head is an empty state, its next step under it.
+        let at = lines
+            .iter()
+            .position(|line| line.trim() == NO_STEPS_YET)
+            .unwrap_or_else(|| panic!("{lines:#?}"));
+        assert!(at >= 2, "under the head: {lines:#?}");
+        assert_eq!(lines[at + 1].trim(), NO_STEPS_NEXT, "{lines:#?}");
+    }
+
+    /// MOD-115 M4 L-runs (plan item 2): an item with no run is an empty state whose next step is
+    /// the start key in force, through the browse stack.
+    #[tokio::test]
+    async fn an_item_with_no_run_names_the_key_that_starts_one() {
+        let shell = Shell::new();
+        let mut pane = RunsTab::new();
+        pane.on_item_change(Some(ids::HTUI_ANA_2));
+        pane.on_reply(&StoreReply::Runs(Vec::new()), &mut shell.ctx());
+        let lines = lines(&pane, &shell);
+        let at = lines
+            .iter()
+            .position(|line| line.trim() == "No runs for this item.")
+            .unwrap_or_else(|| panic!("{lines:#?}"));
+        assert_eq!(lines[at + 1].trim(), "R starts one", "{lines:#?}");
+        assert_eq!(
+            no_runs_next(Keys::compiled()),
+            "R starts one",
+            "the label is the browse stack's"
+        );
+    }
+
+    /// MOD-115 M4 L-runs: with no item under the list's cursor the pane is an empty state, its next
+    /// step the list's motion.
+    #[tokio::test]
+    async fn no_item_is_an_empty_state_with_a_next_step() {
+        let shell = Shell::new();
+        let pane = RunsTab::new();
+        let lines = lines(&pane, &shell);
+        let at = lines
+            .iter()
+            .position(|line| line.trim() == "No item selected.")
+            .unwrap_or_else(|| panic!("{lines:#?}"));
+        assert_eq!(lines[at + 1].trim(), "j/k chooses one", "{lines:#?}");
     }
 
     /// MOD-28 review L3: the flow's head is the list's whole run header (the failure, a pending
@@ -5666,7 +5746,12 @@ mod tests {
         pane.on_key(shift('C'), &mut shell.ctx());
         assert!(pane.captures_input(), "the close-out is open");
         let drawn = lines(&pane, &shell);
-        assert_eq!(drawn[0], "No runs for this item.", "{drawn:#?}");
+        assert!(
+            drawn
+                .iter()
+                .any(|line| line.trim() == "No runs for this item."),
+            "{drawn:#?}"
+        );
         assert_eq!(
             pane.key_hint(Keys::compiled(), &Theme::default())
                 .map(|line| line.to_string())
@@ -7329,8 +7414,8 @@ mod tests {
         );
     }
 
-    /// C7: the typed stage asks for the key in the same box: the summary, then the prompt and
-    /// what is typed, `field.submit`'s keys on its border.
+    /// C7: the typed stage asks for the key in the same box: the summary, then the line naming the
+    /// key and what is typed on its own row, `field.submit`'s keys on its border.
     #[tokio::test]
     async fn the_typed_close_out_asks_for_the_key_in_the_modal() {
         let shell = Shell::new();
@@ -7340,8 +7425,11 @@ mod tests {
         let rows = drawn_at(&pane, &shell, PANE_WIDTH, 20);
         let (inside, border) = asked(&rows, "Close out");
         assert!(inside.contains("close FEAT-1 as done"), "{rows:#?}");
+        assert!(inside.contains("type FEAT-1 to close it:"), "{rows:#?}");
+        // What is typed is on its own row, the whole content width (MOD-81).
         assert!(
-            inside.contains("type FEAT-1 to close it: FEAT"),
+            rows.iter()
+                .any(|row| row.split('\u{2502}').any(|cell| cell.trim() == "FEAT")),
             "{rows:#?}"
         );
         assert!(
@@ -7425,6 +7513,38 @@ mod tests {
         let [off, _] = step_lines(&step, std::slice::from_ref(&step), false, accent, &theme);
         assert_eq!(off.spans[0].content, " ");
         assert_eq!(off.spans[2].style, theme.dim);
+    }
+
+    /// E9 (MOD-85) in monochrome: the step cursor still reads with no colour, the `▸` glyph and the
+    /// tab accent's modifier on the name, against the dim names of the other steps.
+    #[tokio::test]
+    async fn the_step_cursor_reads_without_colour() {
+        use ratatui::style::Modifier;
+
+        let theme = Theme::monochrome();
+        let accent = theme.tab_accent("backlog");
+        assert_eq!(
+            (accent.fg, accent.bg),
+            (None, None),
+            "no colour: {accent:?}"
+        );
+        let step = feat_1_runs().await[0].steps[0].clone();
+        let [on, _] = step_lines(&step, std::slice::from_ref(&step), true, accent, &theme);
+        assert_eq!(on.spans[0].content, CURSOR);
+        assert_eq!(on.spans[2].content.trim(), "prd");
+        assert_eq!(on.spans[2].style, accent);
+        assert!(
+            on.spans[2].style.add_modifier.contains(Modifier::BOLD),
+            "{:?}",
+            on.spans[2].style
+        );
+        let [off, _] = step_lines(&step, std::slice::from_ref(&step), false, accent, &theme);
+        assert_eq!(off.spans[0].content, " ");
+        assert_eq!(off.spans[2].style, theme.dim);
+        assert_ne!(
+            on.spans[2].style, off.spans[2].style,
+            "the cursor stands out"
+        );
     }
 
     /// MD-A: a field mode resolves what it passes from the chord pressed (`Ctx::pressed`): a
