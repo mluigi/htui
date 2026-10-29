@@ -959,7 +959,7 @@ impl KindsSection {
                         prefix: editor.text(0),
                         name: editor.text(1),
                         description: editor.text(2),
-                        graph: graph_named(owner, &editor.text(3))?,
+                        graph: graph_named(owner, &editor.text(3), None)?,
                         position: position(&editor.text(4))?,
                     },
                     None,
@@ -969,7 +969,7 @@ impl KindsSection {
                 let expected = editor
                     .expected
                     .ok_or_else(|| DELETED_ELSEWHERE.to_owned())?;
-                let (owner, _) = self
+                let (owner, kind) = self
                     .locate_kind(id)
                     .ok_or_else(|| DELETED_ELSEWHERE.to_owned())?;
                 Ok((
@@ -981,7 +981,11 @@ impl KindsSection {
                             prefix: Some(editor.text(0)),
                             name: Some(editor.text(1)),
                             description: Some(editor.text(2)),
-                            default_graph_id: Some(graph_named(owner, &editor.text(3))?),
+                            default_graph_id: Some(graph_named(
+                                owner,
+                                &editor.text(3),
+                                Some(kind.default_graph_id),
+                            )?),
                             position: Some(position(&editor.text(4))?),
                         },
                     },
@@ -1769,16 +1773,18 @@ fn new_kind_fields(project: &ProjectCatalogue) -> Vec<Field> {
     ]
 }
 
-/// The same five fields, prefilled from the row (B-5's whole patch goes out from them).
+/// The same five fields, prefilled from the row (B-5's whole patch goes out from them). The
+/// graph reads as its [`graph_label`] (MOD-138 D12), so a workspace or library graph keeps its
+/// scope on screen and [`graph_named`] does not mistake it for a project graph of that name.
 fn edit_kind_fields(project: &ProjectCatalogue, kind: &ItemKind) -> Vec<Field> {
     let graph = project
         .graph_name(kind.default_graph_id)
-        .map_or("", |(name, _)| name);
+        .map_or_else(String::new, |(name, scope)| graph_label(name, scope));
     vec![
         Field::required("prefix", &kind.prefix),
         Field::required("name", &kind.name),
         Field::optional("description", &kind.description),
-        Field::required("graph", graph),
+        Field::required("graph", &graph),
         Field::required("position", &kind.position.to_string()),
     ]
 }
@@ -1861,18 +1867,35 @@ fn next_position(positions: impl Iterator<Item = i32>) -> String {
         .to_string()
 }
 
-/// The graph that carries the typed name (B-7): the project's own first, then (MOD-138 D12) a
-/// workspace or library graph the project may use, in [`ProjectCatalogue::shared`]'s order.
+/// The graph the typed text names (B-7). A graph name is unique within one scope only (MOD-138
+/// D12), so the text is matched as a [`graph_label`]: the project's own graph by its bare name
+/// first, then a workspace or library graph the project may use as `name · workspace` /
+/// `name · library`, in [`ProjectCatalogue::shared`]'s order; a bare name no project graph has
+/// still finds a shared graph of that name. `current` is the edited kind's graph: text that still
+/// reads as its label keeps it, so an untouched field never moves the kind, not even between two
+/// workspaces' graphs that share a name and so a label.
 ///
 /// A name rather than an id because that is what is on screen; the store checks the rule again
 /// on the write, so this resolution is a convenience and not the guard.
-fn graph_named(project: &ProjectCatalogue, name: &str) -> Result<StepGraphId, String> {
+fn graph_named(
+    project: &ProjectCatalogue,
+    text: &str,
+    current: Option<StepGraphId>,
+) -> Result<StepGraphId, String> {
+    if let Some(id) = current.filter(|&id| {
+        project
+            .graph_name(id)
+            .is_some_and(|(name, scope)| graph_label(name, scope) == text)
+    }) {
+        return Ok(id);
+    }
     project
         .graphs
         .iter()
         .map(|entry| &entry.graph)
         .chain(&project.shared)
-        .find(|graph| graph.name == name)
+        .find(|graph| graph_label(&graph.name, graph.scope) == text)
+        .or_else(|| project.shared.iter().find(|graph| graph.name == text))
         .map(|graph| graph.id)
         .ok_or_else(|| NO_GRAPH_NAMED.to_owned())
 }
