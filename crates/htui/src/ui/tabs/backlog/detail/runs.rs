@@ -1489,12 +1489,12 @@ fn step_lines(
     accent: Style,
     theme: &Theme,
 ) -> [Line<'static>; 2] {
-    let label = if on_cursor { accent } else { theme.dim };
+    let name = if on_cursor { accent } else { theme.dim };
     let mark = if on_cursor { CURSOR } else { " " };
     let first = Line::from(vec![
-        Span::styled(mark, label),
+        Span::styled(mark, name),
         Span::raw(" "),
-        Span::styled(cells::fit(&step.phase_name, PHASE_WIDTH), label),
+        Span::styled(cells::fit(&step.phase_name, PHASE_WIDTH), name),
         Span::raw(" "),
         Span::styled(
             cells::fit(&mark_text(label::step_status(step.status)), STATUS_WIDTH),
