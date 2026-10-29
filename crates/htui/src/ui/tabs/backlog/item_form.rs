@@ -1057,7 +1057,8 @@ pub fn title(form: &ItemForm) -> String {
 /// The rows are `kit::form` rows (MOD-115 M4 L-forms): the one-line fields, then Paths and Body
 /// as their labels over their text, the focused field marked by the gutter in `accent`
 /// (`ctx.accent()`) and the band; a picker is banded whole, a field typed into only on its label,
-/// so its cursor shows. The notice is the form's last rows, after the gutter.
+/// so its cursor shows. The notice is the form's last rows, after the gutter. A pane too short
+/// for every row scrolls the focused field into view.
 ///
 /// Returns the rect the pane claims for an in-pane editor (MOD-57 P2): the field handed to
 /// `$EDITOR`, else the focused one when it is Paths, else the body, each the text under its
@@ -1126,20 +1127,25 @@ pub fn render(
         height: inner.height.saturating_sub(notice_height),
         ..inner
     };
-    laid.render(frame, above, 0);
-    // The text rows under a label, after the gutter, inside the pane.
-    let text_at = |y: u16, height: u16| {
+    // A pane too short for every row scrolls the focused field into view (the kit's
+    // `FormLines::offset`), down to Paths and Body.
+    let offset = u16::try_from(laid.offset(above.height)).unwrap_or(u16::MAX);
+    laid.render(frame, above, usize::from(offset));
+    // The text rows under a label, after the gutter, inside the pane: the form's lines `line`
+    // to `line + height`, less those scrolled off its top.
+    let text_at = |line: u16, height: u16| {
+        let shown = line.max(offset);
         Rect {
             x: inner.x.saturating_add(1),
-            y,
+            y: above.y.saturating_add(shown - offset),
             width,
-            height,
+            height: line.saturating_add(height).saturating_sub(shown),
         }
         .intersection(above)
     };
-    let paths_y = inner.y.saturating_add(one_line + 1);
-    let paths = text_at(paths_y, PATHS_HEIGHT);
-    let body = text_at(paths_y.saturating_add(PATHS_HEIGHT + 1), body_height);
+    let paths_line = one_line + 1;
+    let paths = text_at(paths_line, PATHS_HEIGHT);
+    let body = text_at(paths_line + PATHS_HEIGHT + 1, body_height);
     let notice = Rect {
         x: inner.x.saturating_add(1),
         y: above.bottom(),
@@ -1960,6 +1966,36 @@ mod tests {
                 "a picker is banded whole"
             );
         }
+    }
+
+    /// MOD-115 M4 L-forms (repair 1): a pane too short for every row scrolls the focused
+    /// field into view, and the rect it claims for an editor is the scrolled text's.
+    #[tokio::test]
+    async fn a_short_pane_scrolls_and_the_claim_follows() {
+        let mut form = new_form().await;
+        focus_on(&mut form, Field::Paths);
+        form.on_paste("src/**");
+        let (width, height) = (60, 8);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("a test terminal");
+        let mut claim = None;
+        terminal
+            .draw(|frame| claim = Some(framed(frame, frame.area(), &form)))
+            .expect("the frame draws");
+        let claim = claim.expect("the form claims a rect");
+        let buffer = terminal.backend().buffer().clone();
+        let inner = Pane::inner(Rect::new(0, 0, width, height));
+        let label = row_of(&buffer, inner, "paths (one per line)");
+        assert_eq!(buffer[(inner.x, label)].symbol(), GUTTER, "paths in view");
+        assert_eq!(claim.y, label + 1, "the claim is the scrolled text");
+        assert!(
+            inner_row(&buffer, inner, claim.y)
+                .chars()
+                .skip(1)
+                .collect::<String>()
+                .starts_with("src/**")
+        );
     }
 
     /// MOD-115 M4 L-forms: paths and body are their labels over their text across the form's

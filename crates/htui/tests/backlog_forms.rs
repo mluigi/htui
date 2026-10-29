@@ -234,3 +234,20 @@ async fn the_divergence_view_at_80_columns() {
     }
     insta::assert_snapshot!("divergence_80", frame);
 }
+
+/// MOD-115 M4 L-forms (repair 1): a pane too short for every row scrolls the form so the
+/// focused field stays on screen with its gutter, down to Paths and Body.
+#[tokio::test]
+async fn a_short_pane_scrolls_the_focused_field_into_view() {
+    for height in [10, 12] {
+        let mut harness = backlog(MemStore::demo(), 100, height, None).await;
+        keys(&mut harness, &["N"]).await;
+        let frame = harness.render();
+        assert!(focused(&frame, "title"), "{height} rows:\n{frame}");
+        for label in ["priority", "tags", "graph", "paths", "body"] {
+            keys(&mut harness, &["tab"]).await;
+            let frame = harness.render();
+            assert!(focused(&frame, label), "{label} at {height} rows:\n{frame}");
+        }
+    }
+}
