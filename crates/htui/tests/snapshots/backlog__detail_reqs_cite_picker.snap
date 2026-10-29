@@ -4,8 +4,8 @@ expression: picker
 ---
 Platform   ¹Backlog            1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ FEAT-1 · TUI scaffold ────‹ Prompt  Reqs ╮
-│ ▾ htui (8)                                          ││▸ R-STO-1 addresses v1                     │
-│  ANA-1    ● done       Data model, box registry and…││  Postgres is the source of truth; the cac…│
+│ ▾ htui (8)                                          ││▌ R-STO-1 addresses v1                     │
+│  ANA-1    ● done       Data model, box registry and…││▌ Postgres is the source of truth; the cac…│
 │  ANA-2    ○ open       Orchestrator step graphs and…││                                           │
 │  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││                                           │
 │▌ FEAT-1   ◐ running    TUI scaffold                 ││                                           │
@@ -30,5 +30,5 @@ Platform   ¹Backlog            1 working · 1 waiting · memory · DESKTOP-HTUI
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││  R-ENT-1 must Every item has a stable key…│
-│                                                     ││▸ R-ENT-2 later An item may carry a free-f…│
+│                                                     ││▌ R-ENT-2 later An item may carry a free-f…│
 ╰─────────────────────────────────────────────────────╯╰─j/k move · Enter pick · Esc back──────────╯

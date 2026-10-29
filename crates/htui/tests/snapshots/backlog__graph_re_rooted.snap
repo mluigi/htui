@@ -4,15 +4,15 @@ expression: frame
 ---
 Platform   ¹Backlog    1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys · ⌫ back
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ ANA-1 · Data model, box registr…‹ Graph ›╮
-│ ▾ htui (8)                                          ││▸ ANA-1 done Data model, box registry and …│
-│▌ ANA-1    ● done       Data model, box registry and…││  ← blocked_by agy:ANA-1 done Prompt assem…│
-│  ANA-2    ○ open       Orchestrator step graphs and…││    ← blocked_by agy:FIX-1 open Session le…│
-│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││  ← origin     FEAT-1 in_progress TUI scaf…│
-│  FEAT-1   ◐ running    TUI scaffold                 ││    ← blocked_by FEAT-2 blocked Agent driv…│
-│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││    ← relates    FEAT-3 queued (*)         │
-│  FEAT-3   ◌ queued     Postgres store and cache     ││  ← origin     FEAT-3 queued Postgres stor…│
-│  FIX-1    ✓ closed     Terminal left raw after panic││  ← blocked_by TOOL-1 awaiting_approval    │
-│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││    ← origin     agy:FIX-1 open (*)        │
+│ ▾ htui (8)                                          ││▌ ANA-1 ● done Data model, box registry an…│
+│▌ ANA-1    ● done       Data model, box registry and…││  ← blocked by agy:ANA-1 ● done Prompt ass…│
+│  ANA-2    ○ open       Orchestrator step graphs and…││    ← blocked by agy:FIX-1 ○ open Session …│
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││  ← origin     FEAT-1 ◐ running TUI scaffo…│
+│  FEAT-1   ◐ running    TUI scaffold                 ││    ← blocked by FEAT-2 ⊘ blocked Agent dr…│
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││    ← relates    FEAT-3 ◌ queued (*)       │
+│  FEAT-3   ◌ queued     Postgres store and cache     ││  ← origin     FEAT-3 ◌ queued Postgres st…│
+│  FIX-1    ✓ closed     Terminal left raw after panic││  ← blocked by TOOL-1 ⚠ needs you CI matri…│
+│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││    ← origin     agy:FIX-1 ○ open (*)      │
 │ ▾ agy (3)                                           ││                                           │
 │  ANA-1    ● done       Prompt assembly survey       ││                                           │
 │  FEAT-1   ○ open       ACP transport upgrade        ││                                           │

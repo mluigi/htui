@@ -5,10 +5,10 @@ expression: frame
 Platform   ¹Backlog             1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ ANA-2 · Orchestrator step graphs … Body ›╮
 │ ▾ htui (8)                                          ││Orchestrator step graphs and gates         │
-│  ANA-1    ● done       Data model, box registry and…││ANA-2  ANA  open                           │
-│▌ ANA-2    ○ open       Orchestrator step graphs and…││no tags · priority 0 · version 1           │
+│  ANA-1    ● done       Data model, box registry and…││○ open · no tags · priority 0 · version 1  │
+│▌ ANA-2    ○ open       Orchestrator step graphs and…││                                           │
 │  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││                                           │
-│  FEAT-1   ◐ running    TUI scaffold                 ││No body for this item.                     │
+│  FEAT-1   ◐ running    TUI scaffold                 ││                                           │
 │  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││                                           │
 │  FEAT-3   ◌ queued     Postgres store and cache     ││                                           │
 │  FIX-1    ✓ closed     Terminal left raw after panic││                                           │
@@ -18,8 +18,8 @@ Platform   ¹Backlog             1 working · 1 waiting · memory · DESKTOP-HTU
 │  FEAT-1   ○ open       ACP transport upgrade        ││                                           │
 │  FIX-1    ○ open       Session leak on cancel       ││                                           │
 │                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
+│                                                     ││          No body for this item.           │
+│                                                     ││               e writes one                │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │

@@ -1,0 +1,28 @@
+---
+source: crates/htui/tests/backlog_detail.rs
+expression: frame
+---
+Platform   ¹Backlog        1 working · 1 waiting · memory ·  F9  about   ?  keys
+╭─ Backlog (11) ───────────────────────────╮╭─ FEAT-1 · TUI scaffold ─‹ Graph ›╮
+│ ▾ htui (8)                               ││▌ FEAT-1 ◐ running TUI scaffold   │
+│  ANA-1    ● done       Data model, box r…││  → origin ANA-1 ● done Data mode…│
+│  ANA-2    ○ open       Orchestrator step…││    ← blocked by agy:ANA-1 ● done │
+│  CLEAN-1  ✗ failed     Drop the legacy m…││    ← origin FEAT-3 ◌ queued (*)  │
+│▌ FEAT-1   ◐ running    TUI scaffold      ││    ← blocked by TOOL-1 ⚠ needs yo│
+│  FEAT-2   ⊘ blocked    Agent driver and …││  ← blocked by FEAT-2 ⊘ blocked   │
+│  FEAT-3   ◌ queued     Postgres store an…││    ← relates agy:FEAT-1 ○ open   │
+│  FIX-1    ✓ closed     Terminal left raw…││  ← relates FEAT-3 ◌ queued       │
+│  TOOL-1   ⚠ needs you  CI matrix for the…││                                  │
+│ ▾ agy (3)                                ││                                  │
+│  ANA-1    ● done       Prompt assembly s…││                                  │
+│  FEAT-1   ○ open       ACP transport upg…││                                  │
+│  FIX-1    ○ open       Session leak on c…││                                  │
+│                                          ││                                  │
+│                                          ││                                  │
+│                                          ││                                  │
+│                                          ││                                  │
+│                                          ││                                  │
+│                                          ││                                  │
+│                                          ││                                  │
+│                                          ││depth 2/3                         │
+╰─j/k move · h/l sub-tab · f filter · N n…─╯╰──────────────────────────────────╯

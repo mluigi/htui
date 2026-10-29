@@ -5,14 +5,14 @@ expression: frame
 Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat         1 waiting · memory ·  F1  keys
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ ANA-1 · Data model, box registry … Body ›╮
 │ ▾ htui (8)                                          ││Data model, box registry and sync topology │
-│▌ ANA-1    ● done       Data model, box registry and…││ANA-1  ANA  done                           │
-│  ANA-2    ○ open       Orchestrator step graphs and…││no tags · priority 0 · version 1           │
-│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││                                           │
-│  FEAT-1   ◐ running    TUI scaffold                 ││The store seam is the one interface every  │
+│▌ ANA-1    ● done       Data model, box registry and…││● done · no tags · priority 0 · version 1  │
+│  ANA-2    ○ open       Orchestrator step graphs and…││                                           │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││The store seam is the one interface every  │
+│  FEAT-1   ◐ running    TUI scaffold                 ││other module reaches through, so it is     │
 │ ╭ Search concepts ─────────────────────────────────────────────────────────────────────────────╮ │
 │ │scope all projects · decisions off                                                            │ │
-│ │query                                                                                         │ │
-│ │                                                                                              │a│
+│ │query                                                                                         │a│
+│ │                                                                                              │ │
 │ │                                                                                              │ │
 │ │                                                                                              │ │
 │ │                                                                                              │ │

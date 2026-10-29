@@ -5,24 +5,24 @@ expression: frame
 Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       1 waiting ·  F9  about   ?  keys
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ ANA-1 · Data model, box registry … Body ›╮
 │ ▾ htui (8)                                          ││Data model, box registry and sync topology │
-│▌ ANA-1    ● done       Data model, box registry and…││ANA-1  ANA  done                           │
-│  ANA-2    ○ open       Orchestrator step graphs and…││no tags · priority 0 · version 1           │
-│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││                                           │
-│  FEAT-1   ◐ running    TUI scaffold                 ││The store seam is the one interface every  │
-│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││other module reaches through, so it is     │
-│  FEAT-3   ◌ queued     Postgres store and cache     ││settled first.                             │
-│  FIX-1    ✓ closed     Terminal left raw after panic││                                           │
-│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││Postgres holds the truth; every box keeps a│
-│ ▾ agy (3)                                           ││read-only cache it refreshes on connect.   │
-│  ANA-1    ● done       Prompt assembly survey       ││Writes are compare-and-set on a version    │
-│  FEAT-1   ○ open       ACP transport upgrade        ││column, so a losing edit is shown against  │
-│  FIX-1    ○ open       Session leak on cancel       ││its common ancestor rather than silently   │
-│                                                     ││dropped.                                   │
+│▌ ANA-1    ● done       Data model, box registry and…││● done · no tags · priority 0 · version 1  │
+│  ANA-2    ○ open       Orchestrator step graphs and…││                                           │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││The store seam is the one interface every  │
+│  FEAT-1   ◐ running    TUI scaffold                 ││other module reaches through, so it is     │
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││settled first.                             │
+│  FEAT-3   ◌ queued     Postgres store and cache     ││                                           │
+│  FIX-1    ✓ closed     Terminal left raw after panic││Postgres holds the truth; every box keeps a│
+│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││read-only cache it refreshes on connect.   │
+│ ▾ agy (3)                                           ││Writes are compare-and-set on a version    │
+│  ANA-1    ● done       Prompt assembly survey       ││column, so a losing edit is shown against  │
+│  FEAT-1   ○ open       ACP transport upgrade        ││its common ancestor rather than silently   │
+│  FIX-1    ○ open       Session leak on cancel       ││dropped.                                   │
 │                                                     ││                                           │
 │                                                     ││Item keys are minted from a per-project    │
 │                                                     ││counter table, which keeps numbers gapless │
 │                                                     ││and lets the legacy importer align the     │
 │                                                     ││counter above the numbers it brings in.    │
+│                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │

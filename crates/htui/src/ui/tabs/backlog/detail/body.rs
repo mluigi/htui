@@ -1,4 +1,10 @@
-//! The Body sub-tab: the item's head fields and its Markdown body.
+//! The Body sub-tab: the item's meta line and its Markdown body.
+//!
+//! MOD-115 M4 E4 (MOD-82): the key and the title are the detail pane's title (`KEY · title`, B1),
+//! so the head is one meta line, `{status mark} · {tags} · priority {p} · version {v}`, then a
+//! blank. The title keeps a line of its own above it only while the border cannot hold the whole
+//! `KEY · title`, so a long title is never on screen cut alone (acceptance 7); the key prefix the
+//! old key line showed is the key's own (`key = key_prefix || '-' || key_number`).
 //!
 //! The body is hard-wrapped Markdown, so it is reflowed before it is wrapped (MOD-84):
 //! `ui::markdown` classes its lines (fenced and indented code, blank lines, list items, headings,
@@ -17,21 +23,32 @@ use htui_core::model::{Item, ItemId};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 
 use crate::app::{Ctx, Handled};
-use crate::keys::{Act, KeyChord};
+use crate::keys::{Act, KeyChord, views};
 use crate::store_worker::StoreReply;
+use crate::ui::Theme;
+use crate::ui::cells::cell_width;
+use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::scroll::{Scroll, Step};
+use crate::ui::kit::status;
+use crate::ui::kit::text::wrapped;
 use crate::ui::markdown;
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, message};
 use crossterm::event::KeyEvent;
 
-/// How many lines the head block takes: title, key line, meta line, blank.
-const HEAD: u16 = 4;
+/// The sub-tab's chip, also what the border's title room is measured against.
+const TITLE: &str = "Body";
 
-/// Title, key, kind, status, tags, priority, version, and the body reflowed and wrapped at the
-/// pane's width (see the module doc).
+/// Between the meta line's parts.
+const SEP: &str = " \u{b7} ";
+
+/// What the empty body says.
+const NO_BODY: &str = "No body for this item.";
+
+/// Status, tags, priority, version, and the body reflowed and wrapped at the pane's width (see
+/// the module doc); the title too while the border cannot hold it.
 #[derive(Debug, Default)]
 pub struct BodyTab {
     /// The `Item` reply for the selected item.
@@ -62,13 +79,68 @@ impl BodyTab {
     }
 }
 
+/// Whether the detail pane's top border holds `key · title` whole while Body is its active chip,
+/// the pane's inner rect `inner` cells wide: the room `kit::pane` leaves a title asked first (M4
+/// C5) is the inner width less Body's chip (` Body `), the `›` mark for the six chips after it
+/// and the rule cell after the corner, and ` title ` takes two cells more than the title.
+fn border_holds(key: &str, title: &str, inner: u16) -> bool {
+    let room = usize::from(inner).saturating_sub(cell_width(TITLE) + 2 + 1 + 1);
+    cell_width(key) + cell_width(SEP) + cell_width(title) + 2 <= room
+}
+
+/// The meta line's rows at `width`: the status as its mark in its own style, then the tags, the
+/// priority and the version, dim. One row when it fits (the detail pane at 100 columns); wrapped
+/// by `kit::text::wrapped` otherwise (at 80 columns `version 1` takes a second row), the mark kept
+/// in its style on the first.
+fn meta_lines(item: &Item, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    let tags: Cow<'_, str> = if item.required_tags.is_empty() {
+        Cow::Borrowed("no tags")
+    } else {
+        Cow::Owned(item.required_tags.join(", "))
+    };
+    let mark = status::mark(item.status);
+    let mark = format!("{} {}", mark.glyph, mark.word);
+    let rest = format!(
+        "{SEP}{tags}{SEP}priority {}{SEP}version {}",
+        item.priority, item.version
+    );
+    let style = theme.status_style(item.status);
+    if cell_width(&mark) + cell_width(&rest) <= usize::from(width) {
+        let mut spans = status::spans(item.status, theme);
+        spans.push(Span::styled(rest, theme.dim));
+        return vec![Line::from(spans)];
+    }
+    wrapped(&format!("{mark}{rest}"), usize::from(width))
+        .into_iter()
+        .enumerate()
+        .map(|(row, text)| match text.strip_prefix(mark.as_str()) {
+            Some(after) if row == 0 => Line::from(vec![
+                Span::styled(mark.clone(), style),
+                Span::styled(after.to_owned(), theme.dim),
+            ]),
+            _ => Line::styled(text, theme.dim),
+        })
+        .collect()
+}
+
+/// The empty body's next step: the key that opens the item form (`common.edit` through
+/// `BACKLOG_BODY`), or the form itself while nothing binds it.
+fn writes_one(ctx: &Ctx<'_>) -> String {
+    ctx.keys()
+        .label(views::BACKLOG_BODY, Act::Edit)
+        .map_or_else(
+            || "the item form writes one".to_owned(),
+            |key| format!("{key} writes one"),
+        )
+}
+
 impl DetailTab for BodyTab {
     fn id(&self) -> DetailId {
         Self::ID
     }
 
     fn title(&self) -> &str {
-        "Body"
+        TITLE
     }
 
     fn on_item_change(&mut self, _item: Option<ItemId>) {
@@ -110,37 +182,26 @@ impl DetailTab for BodyTab {
             return;
         };
 
-        let tags: Cow<'_, str> = if item.required_tags.is_empty() {
-            Cow::Borrowed("no tags")
-        } else {
-            Cow::Owned(item.required_tags.join(", "))
-        };
-        let head = Text::from(vec![
-            Line::styled(item.title.as_str(), ctx.theme.title),
-            Line::from(vec![
-                Span::styled(item.key.as_str(), ctx.theme.key),
-                Span::raw("  "),
-                Span::styled(item.key_prefix.as_str(), ctx.theme.dim),
-                Span::raw("  "),
-                Span::styled(item.status.as_str(), ctx.theme.status_style(item.status)),
-            ]),
-            Line::styled(
-                format!(
-                    "{tags} \u{b7} priority {} \u{b7} version {}",
-                    item.priority, item.version
-                ),
-                ctx.theme.dim,
-            ),
-            Line::raw(""),
-        ]);
+        let mut head: Vec<Line<'static>> = Vec::new();
+        if !border_holds(&item.key, &item.title, area.width) {
+            head.extend(
+                wrapped(&item.title, usize::from(area.width))
+                    .into_iter()
+                    .map(|row| Line::styled(row, ctx.theme.title)),
+            );
+        }
+        head.extend(meta_lines(item, area.width, ctx.theme));
+        head.push(Line::raw(""));
+        let rows = u16::try_from(head.len()).unwrap_or(u16::MAX);
 
         let [head_area, body_area] =
-            Layout::vertical([Constraint::Length(HEAD), Constraint::Min(0)]).areas(area);
-        frame.render_widget(Paragraph::new(head).wrap(Wrap { trim: false }), head_area);
+            Layout::vertical([Constraint::Length(rows), Constraint::Min(0)]).areas(area);
+        frame.render_widget(Paragraph::new(Text::from(head)), head_area);
 
         self.drawn.set(body_area.width);
         if item.body.is_empty() {
-            message(frame, body_area, "No body for this item.", ctx.theme);
+            let next = writes_one(ctx);
+            empty::render(frame, body_area, NO_BODY, NextStep(&next), ctx.theme);
             return;
         }
         let lines = markdown::lines(&item.body, body_area.width, ctx.theme);
@@ -184,6 +245,9 @@ mod tests {
         .collect()
     }
 
+    /// The rows FEAT-1's head takes at the detail pane's width: the meta line and a blank.
+    const HEAD: usize = 2;
+
     /// MOD-84: at the detail pane's width the body reads as paragraphs and list items, with no
     /// ragged row where the source broke its lines (A-2) and no backtick of inline code.
     #[tokio::test]
@@ -192,17 +256,15 @@ mod tests {
         let pane = pane(&shell).await;
         let rows = rows(&pane, &shell, 43, 30);
         assert_eq!(
-            rows[..4],
+            rows[..2],
             [
-                "TUI scaffold",
-                "FEAT-1  FEAT  in_progress",
-                "rust \u{b7} priority 2 \u{b7} version 1",
-                "",
+                "\u{25d0} running \u{b7} rust \u{b7} priority 2 \u{b7} version 1",
+                ""
             ],
-            "{rows:#?}"
+            "the head is the meta line alone (MOD-115 M4 E4): {rows:#?}"
         );
         assert_eq!(
-            rows[4..],
+            rows[2..],
             [
                 "Stand up the terminal application: a",
                 "workspace-scoped shell with a tab strip, a",
@@ -230,6 +292,8 @@ mod tests {
                 "  body, runs, graph, documents, notes.",
                 "- A workspace switcher overlay, opened with",
                 "  w.",
+                "- The top bar reads workspace, box, store",
+                "  label and the active run count.",
             ],
             "{rows:#?}"
         );
@@ -266,7 +330,7 @@ mod tests {
             let _ = pane.on_key(key(KeyCode::PageDown), &mut shell.ctx());
         }
         let rows = rows(&pane, &shell, 43, 30);
-        assert_eq!(rows[4], "  loop.", "{rows:#?}");
+        assert_eq!(rows[HEAD], "  loop.", "{rows:#?}");
     }
 
     /// MOD-115 M2 §7: with the detail focused the list's motion scrolls the body, a row as `J`
@@ -301,6 +365,151 @@ mod tests {
             let _ = pane.on_key(key(KeyCode::PageDown), &mut shell.ctx());
         }
         let rows = rows(&pane, &shell, 43, 30);
-        assert_eq!(rows[4], "Scope", "{rows:#?}");
+        assert_eq!(rows[HEAD], "Scope", "{rows:#?}");
+    }
+
+    /// The detail pane's chips, in registration order (`backlog::BacklogTab::new`).
+    const CHIPS: [&str; 7] = ["Body", "Runs", "Graph", "Docs", "Notes", "Prompt", "Reqs"];
+
+    /// FEAT-1 with `edit` applied, landed in a fresh pane.
+    async fn landed(shell: &Shell, edit: impl FnOnce(&mut Item)) -> BodyTab {
+        let mut item = MemStore::demo()
+            .item(ids::HTUI_FEAT_1)
+            .await
+            .expect("the memory store never fails")
+            .expect("the demo item");
+        edit(&mut item);
+        let mut pane = BodyTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.on_reply(&StoreReply::Item(Box::new(Some(item))), &mut shell.ctx());
+        pane
+    }
+
+    /// E4: the status is its mark in the status role (`kit::status`), the rest of the meta line
+    /// dim; no raw `in_progress` and no key line.
+    #[tokio::test]
+    async fn the_status_is_its_mark_in_the_status_role() {
+        let shell = Shell::new();
+        let pane = pane(&shell).await;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(43, 6)).expect("a terminal");
+        terminal
+            .draw(|frame| pane.render(frame, frame.area(), &shell.ctx()))
+            .expect("the frame draws");
+        let buffer = terminal.backend().buffer();
+        let status = shell
+            .theme
+            .status_style(htui_core::model::Status::InProgress);
+        assert_eq!(buffer[(0, 0)].symbol(), "\u{25d0}");
+        assert_eq!(
+            buffer[(0, 0)].fg,
+            status.fg.unwrap_or_default(),
+            "the glyph"
+        );
+        assert_eq!(buffer[(2, 0)].fg, status.fg.unwrap_or_default(), "the word");
+        let dim = shell.theme.dim.fg.unwrap_or_default();
+        assert_eq!(buffer[(12, 0)].fg, dim, "the tags");
+        let text = rows(&pane, &shell, 43, 6).join("\n");
+        assert!(
+            !text.contains("in_progress") && !text.contains("FEAT  "),
+            "{text}"
+        );
+    }
+
+    /// The mirror of `kit::pane`'s title room is the kit's: for every width and title length
+    /// around the edge, the title line goes exactly when the border draws `KEY · title` whole.
+    #[test]
+    fn border_holds_says_what_the_kit_border_draws() {
+        use crate::ui::kit::pane::Pane;
+
+        for inner in 30u16..=60 {
+            for length in 10..=50 {
+                let title = "t".repeat(length);
+                let whole = format!("FEAT-1 \u{b7} {title}");
+                let drawn = drawn(inner + 2, 3, |frame, area| {
+                    Pane::new(&whole).title_first().sub_tabs(&CHIPS, 0).render(
+                        frame,
+                        area,
+                        &Theme::default(),
+                    );
+                });
+                let top = drawn.lines().next().unwrap_or_default().to_owned();
+                assert_eq!(
+                    border_holds("FEAT-1", &title, inner),
+                    top.contains(&format!(" {whole} ")),
+                    "{inner} cells, a {length}-cell title: {top}"
+                );
+            }
+        }
+    }
+
+    /// Acceptance 7: a title the border cuts keeps its line, wrapped, above the meta line.
+    #[tokio::test]
+    async fn a_title_the_border_cuts_keeps_its_line() {
+        let shell = Shell::new();
+        let title = "A title far too long for the detail border to hold whole";
+        let pane = landed(&shell, |item| title.clone_into(&mut item.title)).await;
+        let rows = rows(&pane, &shell, 43, 30);
+        assert_eq!(
+            rows[..4],
+            [
+                "A title far too long for the detail border",
+                "to hold whole",
+                "\u{25d0} running \u{b7} rust \u{b7} priority 2 \u{b7} version 1",
+                "",
+            ],
+            "{rows:#?}"
+        );
+        assert_eq!(rows[4], "Stand up the terminal application: a");
+    }
+
+    /// A meta line wider than the pane wraps rather than losing its tail; so narrow a border
+    /// cuts even `FEAT-1 · TUI scaffold`, so the title keeps its line above it.
+    #[tokio::test]
+    async fn a_narrow_pane_wraps_the_meta_line() {
+        let shell = Shell::new();
+        let pane = pane(&shell).await;
+        let rows = rows(&pane, &shell, 20, 12);
+        assert_eq!(
+            rows[..5],
+            [
+                "TUI scaffold",
+                "\u{25d0} running \u{b7} rust \u{b7}",
+                "priority 2 \u{b7} version",
+                "1",
+                "",
+            ],
+            "{rows:#?}"
+        );
+    }
+
+    /// No body: `kit::empty`, its next step the key the item form opens on, rebound or not.
+    #[tokio::test]
+    async fn an_empty_body_names_the_edit_key() {
+        let shell = Shell::new();
+        let pane = landed(&shell, |item| item.body.clear()).await;
+        let text = rows(&pane, &shell, 43, 12).join("\n");
+        assert!(text.contains("No body for this item."), "{text}");
+        assert!(text.contains("e writes one"), "{text}");
+
+        let keys = crate::keys::load_str("version = 1\n[common]\nedit = \"ctrl-y\"\n")
+            .expect("the keys load");
+        let scope = htui_core::model::Scope {
+            workspace_id: htui_core::model::WorkspaceId::default(),
+            project_ids: Vec::new(),
+        };
+        let top_bar = crate::app::TopBarState::default();
+        let emit = crate::app::Emit::default();
+        let ctx = Ctx::new(
+            &scope,
+            &[],
+            &top_bar,
+            &keys,
+            &shell.theme,
+            crate::store_worker::Origin::Tab(crate::ui::tabs::BacklogTab::ID),
+            &emit,
+        );
+        let text = drawn(43, 12, |frame, area| pane.render(frame, area, &ctx));
+        assert!(text.contains("Ctrl+y writes one"), "{text}");
     }
 }

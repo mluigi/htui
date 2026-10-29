@@ -4,21 +4,19 @@ expression: harness.render()
 ---
 Platform   ¹Backlog             1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ FEAT-1 · TUI scaffold ────── Body  Runs ›╮
-│ ▾ htui (8)                                          ││TUI scaffold                               │
-│  ANA-1    ● done       Data model, box registry and…││FEAT-1  FEAT  in_progress                  │
-│  ANA-2    ○ open       Orchestrator step graphs and…││rust · priority 2 · version 1              │
-│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││                                           │
-│▌ FEAT-1   ◐ running    TUI scaffold                 ││Stand up the terminal application: a       │
-│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││workspace-scoped shell with a tab strip, a │
-│  FEAT-3   ◌ queued     Postgres store and cache     ││top bar and a backlog tab, all reading     │
-│  FIX-1    ✓ closed     Terminal left raw after panic││through the store seam.                    │
-│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││                                           │
-│ ▾ agy (3)                                           ││Shape                                      │
-│  ANA-1    ● done       Prompt assembly survey       ││- Two crates: htui-core holds the domain   │
-│  FEAT-1   ○ open       ACP transport upgrade        ││  model and the store traits, htui holds   │
-│  FIX-1    ○ open       Session leak on cancel       ││  the terminal application. Nothing in the │
-│                                                     ││  view layer holds a store handle.         │
-│                                                     ││- A store worker task owns the backend. The│
+│ ▾ htui (8)                                          ││◐ running · rust · priority 2 · version 1  │
+│  ANA-1    ● done       Data model, box registry and…││                                           │
+│  ANA-2    ○ open       Orchestrator step graphs and…││Stand up the terminal application: a       │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││workspace-scoped shell with a tab strip, a │
+│▌ FEAT-1   ◐ running    TUI scaffold                 ││top bar and a backlog tab, all reading     │
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││through the store seam.                    │
+│  FEAT-3   ◌ queued     Postgres store and cache     ││                                           │
+│  FIX-1    ✓ closed     Terminal left raw after panic││Shape                                      │
+│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││- Two crates: htui-core holds the domain   │
+│ ▾ agy (3)                                           ││  model and the store traits, htui holds   │
+│  ANA-1    ● done       Prompt assembly survey       ││  the terminal application. Nothing in the │
+│  FEAT-1   ○ open       ACP transport upgrade        ││  view layer holds a store handle.         │
+│  FIX-1    ○ open       Session leak on cancel       ││- A store worker task owns the backend. The│
 │                                                     ││  UI sends a request, the worker replies,  │
 │                                                     ││  the event loop folds the reply into      │
 │                                                     ││  state. Three select arms: terminal       │
@@ -31,4 +29,6 @@ Platform   ¹Backlog             1 working · 1 waiting · memory · DESKTOP-HTU
 │                                                     ││Scope                                      │
 │                                                     ││- Backlog list grouped by project and key  │
 │                                                     ││  prefix, with the five detail sub-tabs:   │
+│                                                     ││  body, runs, graph, documents, notes.     │
+│                                                     ││- A workspace switcher overlay, opened with│
 ╰─j/k move · h/l sub-tab · f filter · N new · e edit──╯╰───────────────────────────────────────────╯

@@ -5,10 +5,10 @@ expression: frame
 Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings      0 waiting ·  ?  keys
 ╭─ Backlog (2) ────────────────────────────╮╭─ FEAT-1 · Chapter 12 pari… Body ›╮
 │ ▾ Vulkan Tutorials (2)                   ││Chapter 12 parity                 │
-│▌ FEAT-1  ◐ running  Chapter 12 parity    ││FEAT-1  FEAT  in_progress         │
-│  TOOL-1  ○ open     Shader build script  ││gpu, vulkan · priority 0 · version│
-│                                          ││1                                 │
-│                                          ││No body for this item.            │
+│▌ FEAT-1  ◐ running  Chapter 12 parity    ││◐ running · gpu, vulkan · priority│
+│  TOOL-1  ○ open     Shader build script  ││0 · version 1                     │
+│                                          ││                                  │
+│                                          ││                                  │
 │                                          ││                                  │
 │                                          ││                                  │
 │                                          ││                                  │
@@ -19,8 +19,8 @@ Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings      0 waiting ·  ?
 │              ╭ Schema ─────────────────────────────────────────╮             │
 │              │3 schema migrations are pending. Apply them now? │             │
 │              ╰ y apply · n/Esc stay offline ───────────────────╯             │
-│                                          ││                                  │
-│                                          ││                                  │
+│                                          ││      No body for this item.      │
+│                                          ││           e writes one           │
 │                                          ││                                  │
 │                                          ││                                  │
 │                                          ││                                  │
