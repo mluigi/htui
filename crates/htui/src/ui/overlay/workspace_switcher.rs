@@ -28,17 +28,6 @@ use crate::ui::kit::modal::{CHROME, Modal, ModalSize};
 use crate::ui::overlay::registry::{Overlay, OverlayId};
 use crossterm::event::KeyEvent;
 
-/// Marker in front of the row the cursor is on, beside the kit's gutter and band. The band is
-/// what marks the row on screen (MOD-85); the marker stays because `tests/shell.rs` (not this
-/// lane's to edit, MOD-115 M4) finds the cursor row by `> {name}`. Follow-up for whoever owns
-/// `tests/shell.rs` (the merge or B1): find the row by the gutter instead, then drop `CURSOR`
-/// and `NO_CURSOR` and re-accept `shell__switcher_open`, `overlays__switcher_80` and the testkit
-/// `shell_empty` snapshot.
-const CURSOR: &str = "> ";
-
-/// The marker's width, in front of every other row, so names stay in one column.
-const NO_CURSOR: &str = "  ";
-
 /// The keys on the bottom border (MOD-67 D9): `list.down`/`list.up` and `switcher.switch` are
 /// handled here, `overlay.close` by the shell.
 const HINT: HintSpec = &[
@@ -132,7 +121,8 @@ impl WorkspaceSwitcher {
         Handled::Consumed
     }
 
-    /// One kit row per workspace: `> Platform  2 projects`, the name padded to the widest one.
+    /// One kit row per workspace: `Platform  2 projects`, the name padded to the widest one; the
+    /// kit's gutter and band mark the cursor's.
     fn rows(&self, theme: &Theme) -> Vec<Row<'static>> {
         let column = self
             .workspaces
@@ -142,8 +132,7 @@ impl WorkspaceSwitcher {
             .unwrap_or(0);
         self.workspaces
             .iter()
-            .enumerate()
-            .map(|(index, workspace)| self.row(index, workspace, column, theme))
+            .map(|workspace| row(workspace, column, theme))
             .collect()
     }
 
@@ -161,30 +150,19 @@ impl WorkspaceSwitcher {
         };
         (EMPTY, next)
     }
+}
 
-    /// One workspace row: `> Platform  2 projects`, the name padded to `column`.
-    fn row(
-        &self,
-        index: usize,
-        workspace: &WorkspaceSummary,
-        column: usize,
-        theme: &Theme,
-    ) -> Row<'static> {
-        let marker = if index == self.selected {
-            CURSOR
-        } else {
-            NO_CURSOR
-        };
-        // `fit`, not `pad`: `column` is the widest name, so nothing is cut, but `fit` clips first
-        // and clipping flattens a control to the blank cell `cell_width` counted it as (D3).
-        let name = format!("{marker}{}{GAP}", cells::fit(&workspace.name, column));
-        Row {
-            line: Line::from(vec![
-                Span::styled(name, theme.base),
-                Span::styled(projects_label(workspace.projects.len()), theme.dim),
-            ]),
-            kind: RowKind::Item,
-        }
+/// One workspace row: `Platform  2 projects`, the name padded to `column`.
+fn row(workspace: &WorkspaceSummary, column: usize, theme: &Theme) -> Row<'static> {
+    // `fit`, not `pad`: `column` is the widest name, so nothing is cut, but `fit` clips first
+    // and clipping flattens a control to the blank cell `cell_width` counted it as (D3).
+    let name = format!("{}{GAP}", cells::fit(&workspace.name, column));
+    Row {
+        line: Line::from(vec![
+            Span::styled(name, theme.base),
+            Span::styled(projects_label(workspace.projects.len()), theme.dim),
+        ]),
+        kind: RowKind::Item,
     }
 }
 
@@ -496,7 +474,8 @@ mod tests {
         let buffer = drawn(&switcher, Keys::compiled(), &theme, (100, 30));
         let (x, y) = find(&buffer, "Platform");
         let row = lines(&buffer)[usize::from(y)].clone();
-        assert!(row.contains(GUTTER), "{row}");
+        // Finding F2: the gutter alone marks it, no `> ` text marker beside it.
+        assert!(row.contains(&format!("{GUTTER}Platform")), "{row}");
         assert!(
             buffer[(x, y)].modifier.contains(Modifier::REVERSED),
             "the band: {:?}",
@@ -593,10 +572,7 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
-        assert_eq!(
-            cell_width(&row),
-            2 + 40 + 2 + cell_width(&projects_label(0))
-        );
+        assert_eq!(cell_width(&row), 40 + 2 + cell_width(&projects_label(0)));
         assert_eq!(widest(&rows), cell_width(&row), "{row:?}");
         // The whole row is drawn: its count is not cut at the box's edge.
         let buffer = drawn(&switcher, Keys::compiled(), &Theme::default(), (100, 30));
