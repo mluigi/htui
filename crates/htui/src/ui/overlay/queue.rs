@@ -14,7 +14,8 @@
 //! the keys sit on the modal's bottom border.
 
 use htui_core::model::{
-    BatchClose, EntryState, ItemId, QueueMove, QueueOverview, QueueRow, Scope, format_usd,
+    BatchClose, BatchStop, CapError, EntryState, Escalation, Hold, ItemId, PER_TOKEN_CAP_BATCH,
+    PER_TOKEN_CAP_RUN, QueueMove, QueueOverview, QueueRow, RunStatus, Scope, Wait, format_usd,
 };
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -29,6 +30,7 @@ use crate::ui::cells::{self, cell_width};
 use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::list::{self, Row, RowKind};
 use crate::ui::kit::modal::{Modal, ModalSize};
+use crate::ui::kit::status;
 use crate::ui::overlay::registry::{Overlay, OverlayId};
 use crate::ui::overlay::workspace_switcher::border_hint;
 use crate::ui::queue_status::{DEMO_NOTHING_ADMITTED, queue_sentence};
@@ -170,7 +172,7 @@ impl QueueOverlay {
         self.sentences = overview
             .rows
             .iter()
-            .map(|(_, state)| state.to_string())
+            .map(|(_, state)| sentence(state))
             .collect();
         self.columns = Columns::of(&overview.rows, &self.sentences);
         self.overview = Some(overview.clone());
@@ -285,6 +287,112 @@ fn header(overview: &QueueOverview) -> String {
         }
         None => format!("queue: {state} · {slots}"),
     }
+}
+
+/// What one entry is doing, as the overlay says it (MOD-115 M4 E10, finding F1). htui-core's
+/// [`EntryState`] `Display` is the CLI's (`htui state`) and prints internal values: an item's
+/// status as its stored name and money in USD micros. Here a status reads through
+/// [`kit::status`](status) (glyph and word) and money through [`format_usd`], every figure kept.
+fn sentence(state: &EntryState) -> String {
+    match state {
+        EntryState::Running { status, .. } => if *status == RunStatus::Queued {
+            "admitted, waiting to be claimed"
+        } else {
+            "running here"
+        }
+        .to_owned(),
+        EntryState::Elsewhere {
+            hostname, status, ..
+        } => {
+            let host = hostname.as_deref().unwrap_or("another box");
+            if *status == RunStatus::Queued {
+                format!("queued for {host}")
+            } else {
+                format!("running on {host}")
+            }
+        }
+        EntryState::Next => "next to run".to_owned(),
+        EntryState::Held(hold) => format!("held: {}", hold_sentence(hold)),
+        EntryState::Waiting(wait) => wait_sentence(wait),
+        EntryState::Escalated(escalation) => escalation_sentence(escalation),
+    }
+}
+
+/// Why a ready entry is held, money in dollars.
+fn hold_sentence(hold: &Hold) -> String {
+    match hold {
+        Hold::Budget(BatchStop::CapReached { spent, cap }) => format!(
+            "batch cap reached ({} spent of {})",
+            format_usd(*spent),
+            format_usd(*cap)
+        ),
+        Hold::Budget(BatchStop::Budget { remaining, min }) => format!(
+            "batch budget has {} left, {} required",
+            format_usd(*remaining),
+            format_usd(*min)
+        ),
+        Hold::BadCap(error) => cap_sentence(error),
+        Hold::ProjectGone => "its project is gone".to_owned(),
+    }
+}
+
+/// A cap the project's settings hold that does not parse: the cap named as Settings names it,
+/// with what the operator wrote.
+fn cap_sentence(error: &CapError) -> String {
+    if error.is_document() {
+        return format!("the project's settings are unreadable: {}", error.found);
+    }
+    let cap = match error.key {
+        PER_TOKEN_CAP_RUN => "run cap",
+        PER_TOKEN_CAP_BATCH => "batch cap",
+        other => other,
+    };
+    format!("the project's {cap} is not a valid amount: {}", error.found)
+}
+
+/// Why an entry waits without needing a person; an item's status through `kit::status`.
+fn wait_sentence(wait: &Wait) -> String {
+    match wait {
+        Wait::BlockedBy(keys) => format!("waiting on {}", keys.join(", ")),
+        Wait::CancelledInBatch => "cancelled in this batch; the next batch runs it".to_owned(),
+        Wait::Paused => "queue paused".to_owned(),
+        Wait::NotReady(item) => {
+            let mark = status::mark(*item);
+            format!("not ready: item is {} {}", mark.glyph, mark.word)
+        }
+    }
+}
+
+/// Why an entry needs a person; a note or a failure shows its first line only (the Runs pane
+/// holds the whole text).
+fn escalation_sentence(escalation: &Escalation) -> String {
+    match escalation {
+        Escalation::HardGateParked { .. } => "hard gate parked".to_owned(),
+        Escalation::JudgeUndecided { note, .. } => with_note("judge undecided", note.as_deref()),
+        Escalation::ReviewLoopExhausted { note, .. } => {
+            with_note("review loop exhausted", note.as_deref())
+        }
+        Escalation::Blocked { note, .. } => with_note("blocked", note.as_deref()),
+        Escalation::Failed {
+            failure: Some(failure),
+            ..
+        } => format!("failed: {}", first_line(failure)),
+        Escalation::Failed { failure: None, .. } => "failed".to_owned(),
+        Escalation::MissingTags(tags) => format!("missing tags: {}", tags.join(", ")),
+    }
+}
+
+/// `head`, then ` (last note: …)` when there is a note.
+fn with_note(head: &str, note: Option<&str>) -> String {
+    note.map_or_else(
+        || head.to_owned(),
+        |note| format!("{head} (last note: {})", first_line(note)),
+    )
+}
+
+/// The first line of a note or a failure: the overlay draws one row per entry.
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or("")
 }
 
 /// The widths of a row's columns, in cells.
@@ -612,7 +720,8 @@ mod tests {
     use htui_core::fixtures::ids;
     use htui_core::model::{
         BatchFigures, BatchId, BatchStop, CapError, Escalation, Hold, PER_TOKEN_CAP_BATCH,
-        ProjectId, ProjectRef, QueueEntry, RunId, RunStatus, Status, StepId, Wait, WorkspaceId,
+        PER_TOKEN_CAP_RUN, ProjectId, ProjectRef, QueueEntry, RunId, RunStatus, Status, StepId,
+        Wait, WorkspaceId,
     };
     use htui_core::store::StoreError;
     use htui_store::DATABASE_UNREACHABLE;
@@ -880,16 +989,95 @@ mod tests {
         let mut overlay = QueueOverlay::new();
         bench.feed(&mut overlay, overview(every_state()));
         let texts = texts(&overlay.list_rows(&Theme::default()));
-        for (row, state) in every_state() {
-            let sentence = state.to_string();
+        // Finding F1: the overlay says each state itself, in words, money in dollars and an
+        // item's status through `kit::status`; htui-core's `Display` (the CLI's) is not shown.
+        let expected = [
+            "running here",
+            "admitted, waiting to be claimed",
+            "running on LAPTOP-B",
+            "queued for another box",
+            "next to run",
+            "held: batch cap reached ($0.0006 spent of $0.0005)",
+            "held: batch budget has $0.0001 left, $0.0002 required",
+            "held: the project's batch cap is not a valid amount: \"x\"",
+            "held: its project is gone",
+            "waiting on FEAT-1, FEAT-2",
+            "cancelled in this batch; the next batch runs it",
+            "queue paused",
+            "not ready: item is \u{25d0} running",
+            "hard gate parked",
+            "judge undecided (last note: pick a branch)",
+            "review loop exhausted",
+            "blocked (last note: pick a branch)",
+            "failed: exit 1",
+            "missing tags: gpu",
+        ];
+        let states = every_state();
+        assert_eq!(states.len(), expected.len());
+        for ((row, state), want) in states.iter().zip(expected) {
+            assert_eq!(sentence(state), want, "{state:?}");
             assert!(
                 texts
                     .iter()
-                    .any(|line| line.contains(&row.key) && line.ends_with(&sentence)),
-                "{sentence}: {texts:?}"
+                    .any(|line| line.contains(&row.key) && line.ends_with(want)),
+                "{want}: {texts:?}"
+            );
+        }
+        for raw in ["micros", "in_progress", "per_token_cap", "project.settings"] {
+            assert!(
+                texts.iter().all(|line| !line.contains(raw)),
+                "{raw} on screen: {texts:?}"
             );
         }
         insta::assert_snapshot!("states", bench.render(&overlay));
+    }
+
+    /// Finding F1: the cap refusals the fixture leaves out read in words too, and a note or a
+    /// failure shows only its first line.
+    #[test]
+    fn the_other_refusals_read_in_words() {
+        let run = RunId::new();
+        let cases = [
+            (
+                EntryState::Held(Hold::BadCap(CapError::at_key(
+                    PER_TOKEN_CAP_RUN,
+                    "-1".to_owned(),
+                ))),
+                "held: the project's run cap is not a valid amount: -1",
+            ),
+            (
+                EntryState::Held(Hold::BadCap(CapError::document("[]".to_owned()))),
+                "held: the project's settings are unreadable: []",
+            ),
+            (
+                EntryState::Escalated(Escalation::Failed {
+                    run: Some(run),
+                    failure: None,
+                }),
+                "failed",
+            ),
+            (
+                EntryState::Escalated(Escalation::Failed {
+                    run: None,
+                    failure: Some("exit 2\nstack".to_owned()),
+                }),
+                "failed: exit 2",
+            ),
+            (
+                EntryState::Escalated(Escalation::ReviewLoopExhausted {
+                    run,
+                    note: Some("round 3\nmore".to_owned()),
+                }),
+                "review loop exhausted (last note: round 3)",
+            ),
+            (
+                EntryState::Waiting(Wait::NotReady(Status::AwaitingApproval)),
+                "not ready: item is \u{26a0} needs you",
+            ),
+        ];
+        for (state, want) in cases {
+            assert_eq!(sentence(&state), want, "{state:?}");
+        }
     }
 
     /// M3 review R1 N1: each row's sentence is worked out once per reply that changed the queue,
@@ -903,7 +1091,7 @@ mod tests {
         let said: Vec<String> = first
             .rows
             .iter()
-            .map(|(_, state)| state.to_string())
+            .map(|(_, state)| sentence(state))
             .collect();
         assert_eq!(overlay.sentences, said);
 
