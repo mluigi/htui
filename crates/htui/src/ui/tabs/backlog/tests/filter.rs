@@ -258,7 +258,7 @@ async fn a_refused_filtered_read_keeps_the_title_and_rolls_the_filter_back() {
     tab.apply(done_only(), &bench.ctx());
     let pending = drawn(&tab, &bench);
     assert!(
-        pending.contains("Backlog (11) ") && !pending.contains("status:done"),
+        pending.contains("Backlog (11) ") && !pending.contains("status: done"),
         "the reply has not arrived, so the title is the whole list's:\n{pending}"
     );
 
@@ -271,14 +271,15 @@ async fn a_refused_filtered_read_keeps_the_title_and_rolls_the_filter_back() {
     );
     let refused = drawn(&tab, &bench);
     assert!(
-        refused.contains("Backlog (11) ") && !refused.contains("status:done"),
+        refused.contains("Backlog (11) ") && !refused.contains("status: done"),
         "{refused}"
     );
     assert_eq!(tab.filter, tab.shown, "the filter is what is shown");
     assert!(tab.filter.is_empty());
 }
 
-/// MOD-13 review M1: the reply to a filtered read brings its filter into the title.
+/// MOD-13 review M1: the reply to a filtered read brings its filter into the list (MOD-115 M4
+/// E4: the summary band).
 #[tokio::test]
 async fn a_filtered_reply_names_its_filter_in_the_title() {
     let bench = Bench::new().await;
@@ -290,5 +291,7 @@ async fn a_filtered_reply_names_its_filter_in_the_title() {
     );
     assert_eq!(tab.shown, done_only());
     let frame = drawn(&tab, &bench);
-    assert!(frame.contains("Backlog (2) · status:done "), "{frame}");
+    // MOD-115 M4 E4: the count in the title, the filter in the summary band under it.
+    assert!(frame.contains("Backlog (2) "), "{frame}");
+    assert!(frame.contains(" / status: done "), "{frame}");
 }

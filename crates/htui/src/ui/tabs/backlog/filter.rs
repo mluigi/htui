@@ -25,6 +25,7 @@ use crate::keys::translate::FieldEvent;
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, views};
 use crate::store_worker::StoreRequest;
 use crate::ui::cells::{self, cell_width};
+use crate::ui::kit::status as kit_status;
 use crate::ui::{FieldOutcome, TextField, Theme};
 
 /// Rows the form takes at the bottom of the list pane: two borders and four rows (its keys are
@@ -110,8 +111,9 @@ impl BacklogFilter {
         }
     }
 
-    /// What the list title appends while a filter is set (D5), e.g.
-    /// `status:open,done · project:htui · tags:gpu,rust · ready here`; `None` without one.
+    /// What the list's summary band reads while a filter is set (D5, MOD-115 M4 E4), e.g.
+    /// `status: open, done · project: htui · tags: gpu, rust · ready here`, each status by its
+    /// `kit::status` word (`running`, never `in_progress`); `None` without one.
     ///
     /// Project names come from `projects` (`ctx.projects`); an id it lacks is skipped, and so is
     /// the whole `project:` part when it names none (MOD-13 review N3). A filter with nothing to
@@ -123,8 +125,12 @@ impl BacklogFilter {
         }
         let mut parts = Vec::with_capacity(4);
         if !self.statuses.is_empty() {
-            let names: Vec<&str> = self.statuses.iter().map(|status| status.as_str()).collect();
-            parts.push(format!("status:{}", names.join(",")));
+            let names: Vec<&str> = self
+                .statuses
+                .iter()
+                .map(|status| kit_status::mark(*status).word)
+                .collect();
+            parts.push(format!("status: {}", names.join(", ")));
         }
         if !self.projects.is_empty() {
             let names: Vec<&str> = self
@@ -134,11 +140,11 @@ impl BacklogFilter {
                 .map(|project| project.name.as_str())
                 .collect();
             if !names.is_empty() {
-                parts.push(format!("project:{}", names.join(",")));
+                parts.push(format!("project: {}", names.join(", ")));
             }
         }
         if !self.tags.is_empty() {
-            parts.push(format!("tags:{}", self.tags.join(",")));
+            parts.push(format!("tags: {}", self.tags.join(", ")));
         }
         if self.ready_here {
             parts.push("ready here".to_owned());

@@ -45,6 +45,7 @@ use std::cell::Cell;
 use htui_core::model::{ItemId, ItemKindId, ItemSummary, ProjectId, RunId, Scope, StepId};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::app::{Action, Ctx, Handled, RevealTarget};
@@ -53,7 +54,8 @@ use crate::item_writes;
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{QUEUE_REQUEST_NAMES, StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
-use crate::ui::kit::{chips::key_line, pane::capture_area, scroll::Step};
+use crate::ui::kit::pane::{Focus, Pane, capture_area};
+use crate::ui::kit::{chips::key_line, scroll::Step};
 use crate::ui::shell::{ListSize, PaneAreas, PaneId, Panes, TabLayout, TabLoc};
 use crate::ui::tabs::backlog::detail::{
     BodyTab, DetailId, DetailRegistry, DocumentsTab, GraphTab, NotesTab, PromptTab, ReqsTab,
@@ -76,6 +78,30 @@ pub const BACKLOG_LAYOUT: TabLayout = TabLayout {
     list: ListSize::Percent(55),
     ..TabLayout::DEFAULT
 };
+
+/// How one Backlog pane is framed this frame (MOD-115 M4 C4, Q2): whether it holds the keyboard,
+/// the tab's accent, and the hints it carries on its bottom border while it does.
+#[derive(Debug, Clone)]
+pub struct Chrome<'a> {
+    /// The pane's focus.
+    pub focus: Focus,
+    /// The tab's accent (`ctx.accent()`), for the focused border and the cursor's gutter.
+    pub accent: Style,
+    /// The pane's own keys, drawn only while it is focused.
+    pub hints: Option<Line<'a>>,
+}
+
+impl<'a> Chrome<'a> {
+    /// `pane` with this focus, accent and hints.
+    #[must_use]
+    pub fn frame(self, pane: Pane<'a>) -> Pane<'a> {
+        let pane = pane.focus(self.focus).accent(self.accent);
+        match self.hints {
+            Some(hints) => pane.hints(hints),
+            None => pane,
+        }
+    }
+}
 
 /// `StoreRequest::Items`' name: what a refused list read is answered `Failed` under.
 const ITEMS_READ: &str = "items";
@@ -606,15 +632,28 @@ impl Tab for BacklogTab {
             self.body_areas(area, ctx.split(area, BACKLOG_LAYOUT));
         // MOD-13 review M1: the filter the rows were read under, not the one still in flight.
         let summary = self.shown.summary(ctx.projects);
+        let keys = ctx.keys();
+        let stack = self.detail.key_stack();
+        let (new_key, clear_key) = (
+            keys.label(stack, Act::BacklogNewItem),
+            keys.label(stack, Act::BacklogClearFilter),
+        );
         let view = ListView {
             items: &self.items,
             projects: ctx.projects,
             folded: &self.folded,
             selected: self.selected,
             filter: summary.as_deref(),
+            new_key: new_key.as_deref(),
+            clear_key: clear_key.as_deref(),
         };
         if let Some(list_area) = list_area {
-            list::render(frame, list_area, &view, ctx.theme);
+            let chrome = Chrome {
+                focus: ctx.pane_focus(PaneId::List),
+                accent: ctx.accent(),
+                hints: None,
+            };
+            list::render(frame, list_area, &view, chrome, ctx.theme);
         }
         if let (Some(form), Some(at)) = (&self.form, form_area) {
             filter::render(frame, at, form, ctx.theme);
