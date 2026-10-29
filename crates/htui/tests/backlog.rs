@@ -632,7 +632,7 @@ async fn parked() -> Harness {
     harness.drive().await;
     let frame = harness.render();
     assert!(
-        frame.contains("awaiting") && frame.contains("research"),
+        frame.contains("\u{26a0} needs you") && frame.contains("research"),
         "`R` started a run that parked at `research`:\n{frame}"
     );
     assert_eq!(harness.app().status, None, "and nothing failed");
@@ -957,8 +957,11 @@ async fn v_draws_the_fan_out_run_as_a_flow() {
     harness.drive_to_end().await;
     let frame = harness.render();
     assert!(
-        frame.contains("0.1/0 done \u{2713}") && frame.contains("0.1/1 superseded"),
-        "both candidates are drawn:\n{frame}"
+        frame.contains("candidate 1")
+            && frame.contains("\u{25cf} done \u{2713}")
+            && frame.contains("candidate 2")
+            && frame.contains("\u{21b7} superseded"),
+        "both candidates are drawn, each titled by its place:\n{frame}"
     );
     assert!(!frame.contains("kind   status"), "no list header:\n{frame}");
     insta::assert_snapshot!("runs_flow_fanout", frame);
@@ -1109,12 +1112,15 @@ fn cell_of(frame: &str, needle: &str) -> (u16, u16) {
         .unwrap_or_else(|| panic!("`{needle}` is drawn:\n{frame}"))
 }
 
-/// The list row of the slot `slot` in a frame: the line that names it.
-fn listed<'a>(frame: &'a str, slot: &str) -> &'a str {
-    frame
-        .lines()
-        .find(|line| line.contains(slot))
-        .unwrap_or_else(|| panic!("`{slot}` is listed:\n{frame}"))
+/// The first list line of the step whose place is `place` (`candidate 2`) in a frame: the line
+/// above the one that names it (MOD-115 M4 E10), where the cursor's `▸` is.
+fn listed<'a>(frame: &'a str, place: &str) -> &'a str {
+    let lines: Vec<&str> = frame.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.contains(place))
+        .unwrap_or_else(|| panic!("`{place}` is listed:\n{frame}"));
+    lines[at.saturating_sub(1)]
 }
 
 /// MOD-71 D1, D6, ANA-12 invariant 2: in the flow, a click on `ANA-1`'s losing candidate moves the
@@ -1129,7 +1135,7 @@ async fn a_click_in_the_flow_moves_the_cursor_an_action_key_reads() {
     harness.key("v");
     harness.drive_to_end().await;
     assert!(harness.app().wants_mouse(), "the flow wants the mouse");
-    let (column, row) = cell_of(&harness.render(), "0.1/1 superseded");
+    let (column, row) = cell_of(&harness.render(), "\u{21b7} superseded");
     harness.mouse(MouseEventKind::Down(MouseButton::Left), column, row);
     harness.mouse(MouseEventKind::Up(MouseButton::Left), column, row);
 
@@ -1153,7 +1159,7 @@ async fn a_click_in_the_flow_moves_the_cursor_an_action_key_reads() {
     assert!(harness.app().wants_mouse(), "still a list + detail tab");
     let frame = harness.render();
     assert!(
-        listed(&frame, "0.1/1").contains('\u{25b8}'),
+        listed(&frame, "candidate 2").contains('\u{25b8}'),
         "the list's cursor is on the clicked step:\n{frame}"
     );
 }
@@ -1167,7 +1173,7 @@ async fn a_drag_pans_and_the_wheel_zooms_the_flow() {
     harness.key("v");
     harness.drive_to_end().await;
     let frame = harness.render();
-    let (column, row) = cell_of(&frame, "0.1/0 done");
+    let (column, row) = cell_of(&frame, "\u{25cf} done \u{2713}");
     let below = frame
         .lines()
         .nth(usize::from(row + 8))
@@ -1179,7 +1185,7 @@ async fn a_drag_pans_and_the_wheel_zooms_the_flow() {
     harness.mouse(MouseEventKind::Up(MouseButton::Left), column + 2, row + 9);
     let panned = harness.render();
     assert_eq!(
-        cell_of(&panned, "0.1/0 done"),
+        cell_of(&panned, "\u{25cf} done \u{2713}"),
         (column + 2, row + 1),
         "the nodes moved by the drag:\n{panned}"
     );
@@ -1192,7 +1198,7 @@ async fn a_drag_pans_and_the_wheel_zooms_the_flow() {
     harness.drive_to_end().await;
     let frame = harness.render();
     assert!(
-        listed(&frame, "0.1/0").contains('\u{25b8}'),
+        listed(&frame, "candidate 1").contains('\u{25b8}'),
         "the cursor stayed on the first candidate:\n{frame}"
     );
 }
@@ -1208,7 +1214,7 @@ async fn a_lost_capture_ends_the_flow_s_pan_end_to_end() {
     harness.drive_to_end().await;
     assert!(harness.app().mouse_capture(), "the flow takes the mouse");
     let frame = harness.render();
-    let (column, row) = cell_of(&frame, "0.1/0 done");
+    let (column, row) = cell_of(&frame, "\u{25cf} done \u{2713}");
     let below = frame
         .lines()
         .nth(usize::from(row + 8))
@@ -1219,7 +1225,7 @@ async fn a_lost_capture_ends_the_flow_s_pan_end_to_end() {
     harness.mouse(MouseEventKind::Drag(MouseButton::Left), column + 2, row + 9);
     let panned = harness.render();
     assert_eq!(
-        cell_of(&panned, "0.1/0 done"),
+        cell_of(&panned, "\u{25cf} done \u{2713}"),
         (column + 2, row + 1),
         "the drag pans:\n{panned}"
     );
@@ -1242,7 +1248,7 @@ async fn a_lost_capture_ends_the_flow_s_pan_end_to_end() {
     );
     let after = harness.render();
     assert_eq!(
-        cell_of(&after, "0.1/0 done"),
+        cell_of(&after, "\u{25cf} done \u{2713}"),
         (column + 2, row + 1),
         "a bare drag pans nothing:\n{after}"
     );
@@ -1257,11 +1263,11 @@ async fn a_click_on_the_zoomed_list_misses_the_hidden_flow() {
     sub_tab(&mut harness, 1);
     harness.key("v");
     harness.drive_to_end().await;
-    let (column, row) = cell_of(&harness.render(), "0.1/1 superseded");
+    let (column, row) = cell_of(&harness.render(), "\u{21b7} superseded");
     harness.key("z");
     let zoomed = harness.render();
     assert!(
-        !zoomed.contains("0.1/1 superseded"),
+        !zoomed.contains("\u{21b7} superseded"),
         "the list is zoomed and the flow hidden:\n{zoomed}"
     );
     assert!(
@@ -1276,11 +1282,11 @@ async fn a_click_on_the_zoomed_list_misses_the_hidden_flow() {
     harness.drive_to_end().await;
     let frame = harness.render();
     assert!(
-        listed(&frame, "0.1/0").contains('\u{25b8}'),
+        listed(&frame, "candidate 1").contains('\u{25b8}'),
         "the cursor stayed on the first candidate:\n{frame}"
     );
     assert!(
-        !listed(&frame, "0.1/1").contains('\u{25b8}'),
+        !listed(&frame, "candidate 2").contains('\u{25b8}'),
         "the click reached no hidden step:\n{frame}"
     );
 }
@@ -1543,12 +1549,16 @@ fn detail_pane(frame: &str) -> String {
         .join("\n")
 }
 
-/// The run-grid status cell of the only `graph` run on the pane.
+/// The run-grid status cell of the only `graph` run on the pane: its mark's word (MOD-115 M4
+/// E10), the glyph before it dropped.
 fn run_status(frame: &str) -> Option<String> {
     detail_pane(frame).lines().find_map(|line| {
-        let mut cells = line.split_whitespace();
-        cells.position(|cell| cell == "graph")?;
-        cells.next().map(str::to_owned)
+        if !line.starts_with("graph ") {
+            return None;
+        }
+        let cell: String = line.chars().skip(7).take(11).collect();
+        let (_glyph, word) = cell.trim().split_once(' ')?;
+        Some(word.to_owned())
     })
 }
 
@@ -1610,7 +1620,7 @@ async fn the_runs_pane_rereads_an_active_run_every_poll() {
     let frame = harness.render();
     assert_eq!(
         run_status(&frame).as_deref(),
-        Some("awaiting"),
+        Some("needs you"),
         "the twentieth tick is the fifth refresh, and the poll shows the park:\n{frame}"
     );
     assert_eq!(harness.app().status, None, "and nothing failed");
