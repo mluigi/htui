@@ -13418,7 +13418,7 @@ mod tests {
 
     /// MOD-26 D9, I-3: rebinding a phase's persona under a parked **v1** run moves the topology,
     /// so a resume parks on it (MOD-138 D5: only a v1 run compares); editing the bound persona's
-    /// body does not.
+    /// body under a parked v1 run does not.
     #[tokio::test]
     async fn rebinding_a_phase_persona_parks_a_resumed_run() {
         let harness = Harness::new().await;
@@ -13453,6 +13453,8 @@ mod tests {
         )
         .await;
         let (run, _) = started(&harness).await;
+        // Only a v1 run reads the live graph (MOD-138 D5), so I-3 is checked on one.
+        crate::fake::rewrite_as_v1(&harness.orch.store, run).await;
         let reviewer = harness
             .orch
             .store
