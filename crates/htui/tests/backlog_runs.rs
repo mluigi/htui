@@ -13,7 +13,7 @@ use htui::testkit::Harness;
 use htui::ui::tabs::backlog::BacklogTab;
 use htui_agent::registry::DriverFactory;
 use htui_core::model::WorkspaceSummary;
-use htui_core::store::{MemStore, ReadStore as _};
+use htui_core::store::MemStore;
 use htui_orch::fake::{FakeIsolator, FakeVerifier};
 
 /// Rows down from the arrival row (`ANA-1`) to htui `FEAT-1`, whose one run has four steps.

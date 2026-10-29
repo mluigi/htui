@@ -160,8 +160,14 @@ pub(super) async fn parked(store: MemStore) -> Harness {
     harness.key("R");
     harness.drive().await;
     let frame = harness.render();
+    // The Runs pane's half only: the list's `TOOL-1` row reads `⚠ needs you` in every frame.
+    let pane: Vec<&str> = frame
+        .lines()
+        .filter_map(|row| row.rsplit_once("\u{2502}\u{2502}").map(|(_, pane)| pane))
+        .collect();
     assert!(
-        frame.contains("\u{26a0} needs you") && frame.contains("research"),
+        pane.iter().any(|row| row.contains("\u{26a0} needs you"))
+            && pane.iter().any(|row| row.contains("research")),
         "`R` started a run that parked at `research`:\n{frame}"
     );
     harness

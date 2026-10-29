@@ -631,8 +631,10 @@ async fn parked() -> Harness {
     harness.key("R");
     harness.drive().await;
     let frame = harness.render();
+    // The Runs pane's half only: the list's `TOOL-1` row reads `⚠ needs you` in every frame.
+    let pane = detail_pane(&frame);
     assert!(
-        frame.contains("\u{26a0} needs you") && frame.contains("research"),
+        pane.contains("\u{26a0} needs you") && pane.contains("research"),
         "`R` started a run that parked at `research`:\n{frame}"
     );
     assert_eq!(harness.app().status, None, "and nothing failed");
