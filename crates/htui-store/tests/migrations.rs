@@ -2376,7 +2376,9 @@ async fn migration_0020_backfill_equals_default_edges() {
 /// edge; `renamed` loops `review → plan` where the rule says `review → implement`; `gappy` has
 /// positions 0/5/9 and no edges; `authored` carries an odd `next`, an `if` and a `fails`; `asks`
 /// an `asks_you`; `solo` is one `review`; `empty` has no phases; `palette` has a palette phase
-/// between `plan` and `review`, and `palette-review`'s `review` is a palette phase.
+/// between `plan` and `review`, and `palette-review`'s `review` is a palette phase. Both palette
+/// graphs carry the drifted edges a pre-A5 writer left on them (into, out of and looping onto the
+/// palette phase), which 0023 must delete and link past.
 async fn seed_0023_probe_graphs(
     pool: &sqlx::PgPool,
     project: uuid::Uuid,
@@ -2473,14 +2475,20 @@ async fn seed_0023_probe_graphs(
 
     // A palette node has no edges (MOD-137 rule e): the chain runs past `spare`, and `review`'s
     // fallback loop skips it for `plan`. In `palette-review` the palette node is the review.
+    // Before A5 a phase flipped to palette kept its edges, so both graphs start drifted: edges
+    // into, out of and looping onto the palette phase, all of which 0023 deletes.
     let palette = insert_graph(pool, project, "palette").await;
-    insert_phase(pool, palette, 0, "plan", 1, 2).await;
+    let plan = insert_phase(pool, palette, 0, "plan", 1, 2).await;
     let spare = insert_phase(pool, palette, 1, "spare", 1, 1).await;
-    insert_phase(pool, palette, 2, "review", 1, 1).await;
+    let review = insert_phase(pool, palette, 2, "review", 1, 1).await;
+    edge(palette, plan, spare, "next", None, None).await;
+    edge(palette, spare, review, "next", None, None).await;
+    edge(palette, review, spare, "changes_requested", None, Some(1)).await;
     graphs.insert("palette", palette);
     let palette_review = insert_graph(pool, project, "palette-review").await;
-    insert_phase(pool, palette_review, 0, "implement", 1, 1).await;
+    let implement = insert_phase(pool, palette_review, 0, "implement", 1, 1).await;
     let parked = insert_phase(pool, palette_review, 1, "review", 1, 1).await;
+    edge(palette_review, implement, parked, "next", None, None).await;
     graphs.insert("palette-review", palette_review);
     sqlx::query("UPDATE step_graph_phase SET palette = true WHERE id = ANY($1)")
         .bind(vec![spare, parked])
