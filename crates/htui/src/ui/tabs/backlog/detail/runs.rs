@@ -251,15 +251,17 @@ const DURATION_WIDTH: usize = 5;
 
 /// The step grid's line 2 (D197, MOD-115 M4 E10): an indent under the phase, the step's place
 /// ([`place`]) in a column as wide as its run's widest, the gate, then a tail: `4 + place + 10 +
-/// 1 + tail` is exactly [`PANE`]. The reason, opening and request lines under a step start at
-/// the same indent.
+/// 1 + tail` is exactly [`PANE`]. A tail that does not fit whole beside a place wraps to a line
+/// of its own at the indent ([`tail_line`]). The reason, opening and request lines under a step
+/// start at the same indent.
 const INDENT: usize = 4;
 /// See [`INDENT`].
 const GATE_WIDTH: usize = 10;
 
-/// The widest a place column grows ([`place_width`]): what leaves the tail room for the widest
-/// indicator ([`INDICATOR_WIDTH`]), so a long place is cut before the prompt figure is.
-const PLACE_MAX: usize = PANE - INDENT - 1 - GATE_WIDTH - 1 - INDICATOR_WIDTH;
+/// The widest a place column grows ([`place_width`]): the whole of line 2 but the gate, so any
+/// place a real run has (`try 12 · candidate 3` is 20 cells) reads whole; the tail then wraps
+/// ([`tail_line`]). Only a place past 27 cells (a try or a candidate in the millions) is cut.
+const PLACE_MAX: usize = PANE - INDENT - 1 - GATE_WIDTH - 1;
 
 /// MOD-70 blueprint B-7: where a step's follow-up lines start. Two columns, not [`INDENT`]: PRD
 /// Q7's pending label is 40 columns and has to be read whole, so each line keeps 41 for its text.
@@ -282,9 +284,13 @@ const TRIMMED: &str = "!";
 /// Width of the phase column (D197): the step's name, which leads line 1 (MOD-115 M4 E10).
 const PHASE_WIDTH: usize = 15;
 
-/// The bound [`indicator`] has to fit in (hazard H-26), the narrowest line 2's tail gets: the
-/// widest figure, `~-2147.5M !` over `i32::MIN`, is exactly this wide.
+/// The bound [`indicator`] has to fit in (hazard H-26): the widest figure, `~-2147.5M !` over
+/// `i32::MIN`, is exactly this wide.
 const INDICATOR_WIDTH: usize = 11;
+
+// Hazard H-26: a tail that does not fit beside its place wraps to [`tail_line`]'s `PANE - INDENT`
+// cells, which hold the widest indicator and its space whole.
+const _: () = assert!(INDICATOR_WIDTH < PANE - INDENT);
 
 /// The `Runs` reply as a table of kind, mode, status, box, started and finished, with two lines
 /// per step under each run.
@@ -1394,24 +1400,34 @@ fn run_lines(run: &RunSummary, cancel_requested: bool, theme: &Theme) -> Vec<Lin
 /// and `judge` for its judge, the try first when there are both (`try 2 · candidate 1`); empty
 /// for a plain first try. Its position is the row order, so it is not repeated.
 ///
-/// `siblings` are the steps of its run: a fan-out slot is known by a sibling at the same
-/// `(position, attempt)` with a non-zero `fanout_index`.
+/// `siblings` are the steps of its run, which [`fanout_word`] reads.
 fn place(step: &RunStepSummary, siblings: &[RunStepSummary]) -> String {
+    match (try_word(step), fanout_word(step, siblings)) {
+        (Some(attempt), Some(candidate)) => format!("{attempt} \u{b7} {candidate}"),
+        (Some(place), None) | (None, Some(place)) => place,
+        (None, None) => String::new(),
+    }
+}
+
+/// The try half of a [`place`]: `try {attempt}` past the first attempt, `None` for a first try.
+pub(super) fn try_word(step: &RunStepSummary) -> Option<String> {
+    (step.attempt > 1).then(|| format!("try {}", step.attempt))
+}
+
+/// The fan-out half of a [`place`]: `candidate {n}` (counted from one) in a fan-out slot and
+/// `judge` for its judge, `None` for a step alone in its slot. `siblings` are the steps of its
+/// run: a fan-out slot is known by a sibling at the same `(position, attempt)` with a non-zero
+/// `fanout_index`.
+pub(super) fn fanout_word(step: &RunStepSummary, siblings: &[RunStepSummary]) -> Option<String> {
     let fanned = siblings.iter().any(|sibling| {
         sibling.position == step.position
             && sibling.attempt == step.attempt
             && sibling.fanout_index != 0
     });
-    let attempt = (step.attempt > 1).then(|| format!("try {}", step.attempt));
-    let candidate = match (fanned, step.fanout_index) {
+    match (fanned, step.fanout_index) {
         (false, _) => None,
         (true, index) if index < 0 => Some("judge".to_owned()),
         (true, index) => Some(format!("candidate {}", i64::from(index) + 1)),
-    };
-    match (attempt, candidate) {
-        (Some(attempt), Some(candidate)) => format!("{attempt} \u{b7} {candidate}"),
-        (Some(place), None) | (None, Some(place)) => place,
-        (None, None) => String::new(),
     }
 }
 
@@ -1477,8 +1493,9 @@ fn who(agent: Option<&str>, model: Option<&str>) -> String {
 }
 
 /// One step's two lines (D197, MOD-115 M4 E10): the phase (the step's name), its status mark, its
-/// usage and duration; then its [`place`] in the run's place column, its gate and the tail.
-/// `siblings` are the steps of its run, which the place and its column are read against.
+/// usage and duration; then its [`place`] in the run's place column, its gate and the tail, the
+/// tail left blank when it wraps to [`tail_line`]. `siblings` are the steps of its run, which the
+/// place and its column are read against.
 ///
 /// The cursor's `▸` and the phase take `accent` on the step under the cursor (the tab's accent,
 /// `Ctx::accent`: focus, MOD-85), dim elsewhere; the glyph carries the cursor without colour.
@@ -1520,13 +1537,46 @@ fn step_lines(
         ));
         second.push(Span::raw(" "));
     }
-    let tail_width = PANE - INDENT - GATE_WIDTH - 1 - if places > 0 { places + 1 } else { 0 };
+    let room = tail_room(places);
+    let tail = if wraps(step, places) {
+        String::new()
+    } else {
+        tail(step)
+    };
     second.extend([
         Span::styled(cells::fit(&gate(step), GATE_WIDTH), theme.dim),
         Span::raw(" "),
-        Span::styled(cells::fit(&tail(step), tail_width), theme.dim),
+        Span::styled(cells::fit(&tail, room), theme.dim),
     ]);
     [first, Line::from(second)]
+}
+
+/// The cells line 2 leaves its tail beside a place column `places` wide (`0`: none).
+fn tail_room(places: usize) -> usize {
+    let place = if places > 0 { places + 1 } else { 0 };
+    PANE - INDENT - GATE_WIDTH - 1 - place
+}
+
+/// Whether `step`'s tail wraps to [`tail_line`]: only beside a place, and only when it does not
+/// fit there whole (repair 1: a fan-out's `~36k ! claude/opus` kept the old fixed 24 cells whole,
+/// and a place must not cut it). A step with no place keeps one line and its tail is fitted.
+fn wraps(step: &RunStepSummary, places: usize) -> bool {
+    places > 0 && cell_width(&tail(step)) > tail_room(places)
+}
+
+/// A step's tail on a line of its own under its place, when it does not fit beside it
+/// ([`wraps`]): the indicator and agent/model at the indent, fitted to the pane's other cells.
+fn tail_line(
+    step: &RunStepSummary,
+    siblings: &[RunStepSummary],
+    theme: &Theme,
+) -> Option<Line<'static>> {
+    wraps(step, place_width(siblings)).then(|| {
+        Line::from(vec![
+            Span::raw(blank(INDENT)),
+            Span::styled(cells::fit(&tail(step), PANE - INDENT), theme.dim),
+        ])
+    })
 }
 
 /// A parked step's reason on a third line (R-3): `Some` only for an awaiting step with a
@@ -2205,6 +2255,7 @@ impl RunsTab {
             for step in &run.steps {
                 let on_cursor = step_cursor == Some(step.id);
                 lines.extend(step_lines(step, &run.steps, on_cursor, accent, theme));
+                lines.extend(tail_line(step, &run.steps, theme));
                 lines.extend(note_line(step, theme));
                 // MOD-37 M5 (ANA-27 T5): how the step's chat opened, after R-3's reason.
                 lines.extend(opening_lines(step, theme));
@@ -3005,7 +3056,8 @@ mod tests {
         for step in &steps {
             for on_cursor in [false, true] {
                 let [first, second] = step_lines(step, &steps, on_cursor, theme.accent, &theme);
-                for line in [&first, &second] {
+                let wrapped = tail_line(step, &steps, &theme);
+                for line in [&first, &second].into_iter().chain(wrapped.as_ref()) {
                     assert_eq!(
                         line.width(),
                         PANE,
@@ -3055,7 +3107,8 @@ mod tests {
             "promoted and selected both mark the gate: {:?}",
             text(&gate)
         );
-        let [_, long] = step_lines(&steps[6], &steps, false, theme.accent, &theme);
+        // Repair 1: beside the judge's 14-cell place the long tail wraps to its own line.
+        let long = tail_line(&steps[6], &steps, &theme).expect("a long tail beside a place wraps");
         assert!(
             text(&long).trim_end().ends_with('\u{2026}'),
             "a long agent/model is cut with `…`: {:?}",
@@ -6998,6 +7051,88 @@ mod tests {
             "{:?}",
             text(&second)
         );
+    }
+
+    /// `fanned_out(attempt)` with `who` as every step's agent/model and the `~36k !` indicator
+    /// when `figure`.
+    async fn fanned_out_by(attempt: i32, model: &str, figure: bool) -> Vec<RunStepSummary> {
+        let mut slot = fanned_out(attempt).await;
+        for step in &mut slot {
+            step.agent_name = Some("claude".to_owned());
+            step.model = Some(model.to_owned());
+            step.prompt_tokens = figure.then_some(35_988);
+            step.trimmed = figure;
+        }
+        slot
+    }
+
+    /// A step's lines as the list draws them: [`step_lines`], then the wrapped tail if any.
+    fn drawn(step: &RunStepSummary, slot: &[RunStepSummary], theme: &Theme) -> Vec<String> {
+        let [first, second] = step_lines(step, slot, false, theme.accent, theme);
+        let mut lines = vec![first, second];
+        lines.extend(tail_line(step, slot, theme));
+        for line in &lines {
+            assert_eq!(line.width(), PANE, "{:?} is not {PANE} wide", text(line));
+        }
+        lines.iter().map(text).collect()
+    }
+
+    /// Repair 1 (review): no slot shape cuts its place or its tail. A retried fan-out's place
+    /// (`try 2 \u{b7} candidate 1`, 19 cells) reads whole, so its candidates stay told apart; a
+    /// tail that does not fit whole beside the place and the gate (`~36k ! claude/opus`, whole
+    /// at the old fixed 24 cells) wraps to a line of its own under the place, whole.
+    #[tokio::test]
+    async fn a_fanout_keeps_its_place_and_its_tail_whole() {
+        let theme = Theme::default();
+        for attempt in [1, 2, 12] {
+            let slot = fanned_out_by(attempt, "claude-opus", true).await;
+            for step in &slot {
+                let lines = drawn(step, &slot, &theme);
+                let whole = place(step, &slot);
+                assert!(
+                    lines[1].starts_with(&format!("    {whole} ")),
+                    "the place whole: {lines:#?}"
+                );
+                assert_eq!(tail(step), "~36k ! claude/opus");
+                assert!(
+                    lines.iter().any(|line| line.contains("~36k ! claude/opus")),
+                    "the tail whole: {lines:#?}"
+                );
+                assert!(
+                    lines.iter().all(|line| !line.contains('\u{2026}')),
+                    "nothing is cut: {lines:#?}"
+                );
+            }
+        }
+    }
+
+    /// Repair 1: a tail that fits beside the place stays on the place's line (two lines, as
+    /// before the port), and a step with no place never wraps: its tail has the line's 28 cells.
+    #[tokio::test]
+    async fn a_tail_wraps_only_beside_a_place_it_does_not_fit() {
+        let theme = Theme::default();
+        let slot = fanned_out_by(1, "claude-opus", false).await;
+        let lines = drawn(&slot[0], &slot, &theme);
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        assert!(lines[1].contains("claude/opus"), "{lines:#?}");
+
+        let wide = fanned_out_by(1, "claude-opus", true).await;
+        let lines = drawn(&wide[0], &wide, &theme);
+        assert_eq!(lines.len(), 3, "{lines:#?}");
+        assert!(
+            lines[2].starts_with("    ~36k ! claude/opus"),
+            "under the place: {lines:#?}"
+        );
+        assert!(
+            !lines[1].contains("claude"),
+            "not twice, nor cut on the place's line: {lines:#?}"
+        );
+
+        let mut plain = at_slot(0, 1, 0).await;
+        plain.agent_name = Some(LONG_AGENT.to_owned());
+        plain.model = Some(LONG_MODEL.to_owned());
+        let lines = drawn(&plain, std::slice::from_ref(&plain), &theme);
+        assert_eq!(lines.len(), 2, "no place, no wrap: {lines:#?}");
     }
 
     /// D-18, E10: every step status reads its mark (glyph and word) whole in the status column,

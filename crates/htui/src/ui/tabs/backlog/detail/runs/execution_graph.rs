@@ -179,14 +179,21 @@ pub(super) fn project(run: &RunSummary) -> Projection {
 }
 
 /// Plan D10: one step's node. The flow draws no border (`rataflow` `content.rs:79`), so this does,
-/// as a kit pane (MOD-115 M4 D-16) titled by the step's place.
+/// as a kit pane (MOD-115 M4 D-16) titled by the step's fan-out word.
+///
+/// The list's [`place`](super::place) is split here (repair 1): the 20-cell node leaves its title
+/// 16 cells, where `try 2 · candidate 1` (19) lost the number that tells candidates apart, so the
+/// title is the fan-out half and the try reads after the phase on the first line.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct StepNode {
-    /// The top border's title: the list's place in words (`candidate 1`, `try 2`; MOD-115 M4
-    /// E10), empty for a plain first try.
+    /// The top border's title: the fan-out half of the list's place (`candidate 1`, `judge`;
+    /// MOD-115 M4 E10), empty for a step alone in its slot.
     place: String,
     /// Line 1: the phase name, the step's name.
     phase: String,
+    /// Line 1's end: the try half of the place (`try 2`), drawn whole after the phase, which is
+    /// cut first; `None` for a first try.
+    attempt: Option<String>,
     /// Line 2: the status mark, then `*`/`✓` (blueprint B-8).
     head: String,
     /// Line 3 (MOD-72 D5): this step's tool-call rows, fitted to the interior at draw time
@@ -222,8 +229,9 @@ impl StepNode {
             format!("{status} {marks}")
         };
         Self {
-            place: super::place(step, siblings),
+            place: super::fanout_word(step, siblings).unwrap_or_default(),
             phase: step.phase_name.clone(),
+            attempt: super::try_word(step),
             head,
             calls: calls.to_vec(),
             status: step.status,
@@ -242,6 +250,19 @@ impl StepNode {
             StepStatus::AwaitingApproval => self.theme.warning,
             StepStatus::Superseded | StepStatus::Cancelled | StepStatus::Stopped => self.theme.dim,
             StepStatus::Pending | StepStatus::Done => self.theme.base,
+        }
+    }
+
+    /// Line 1 in `width` cells: the phase, then ` · try {n}` past the first try, the phase cut
+    /// before the try is (the try is what tells a retried layer from the first).
+    fn phase_line(&self, width: usize) -> String {
+        let Some(attempt) = &self.attempt else {
+            return self.phase.clone();
+        };
+        let suffix = format!(" \u{b7} {attempt}");
+        match width.checked_sub(cells::cell_width(&suffix)) {
+            Some(room) if room > 0 => format!("{}{suffix}", cells::clip(&self.phase, room)),
+            _ => format!("{}{suffix}", self.phase),
         }
     }
 
@@ -276,8 +297,9 @@ impl NodeContent for StepNode {
         let width = usize::from(inner.width);
         // Blueprint E10: fitted to the interior drawn, so `+N` is honest at every zoom.
         let chips = chips(&self.calls, width);
+        let phase = self.phase_line(width);
         let lines = [
-            (self.phase.as_str(), self.text()),
+            (phase.as_str(), self.text()),
             (self.head.as_str(), self.text()),
             (chips.as_str(), self.theme.dim), // MOD-72 D6: secondary to the head and phase
         ];
@@ -2290,8 +2312,8 @@ mod tests {
         );
     }
 
-    /// E10: a plain first try has no place, so its node's border has no title; a retry reads
-    /// `try 2`.
+    /// E10: a plain first try has no place, so its node's border has no title; a retry's try
+    /// reads after its phase on the first line, and its border stays untitled (no fan-out).
     #[test]
     fn a_plain_node_has_no_title_and_a_retry_reads_its_try() {
         let run = run(
@@ -2315,7 +2337,53 @@ mod tests {
             .iter()
             .position(|row| row.contains("\u{25d0} running"))
             .unwrap_or_else(|| panic!("the running node: {rows:#?}"));
-        assert!(rows[running - 2].contains("\u{2500} try 2 "), "{rows:#?}");
+        assert!(
+            rows[running - 1].contains("\u{2502}build \u{b7} try 2"),
+            "the try after the phase: {rows:#?}"
+        );
+        assert!(
+            rows[running - 2].contains("\u{256d}\u{2500}\u{2500}\u{2500}"),
+            "no fan-out, no title: {rows:#?}"
+        );
+    }
+
+    /// Repair 1 (review): a retried fan-out's nodes stay told apart. The 20-cell node leaves its
+    /// title 16 cells, where `try 2 \u{b7} candidate 1` (19) lost its number, so the title is the
+    /// fan-out's word (`candidate 1`, `judge`) and the try reads after the phase, the phase cut
+    /// before the try is.
+    #[test]
+    fn a_retried_candidate_node_keeps_its_number_and_its_try() {
+        let long = "a-phase-name-too-long-for-a-node";
+        let run = run(
+            1,
+            vec![
+                phased(candidate(1, 0, 2, 0, Some(true)), "research"),
+                phased(candidate(2, 0, 2, 1, Some(false)), long),
+            ],
+        );
+        let mut graph = synced(&run, Some(id(1)));
+        let rows = rows(&draw(&mut graph));
+        let top = rows
+            .iter()
+            .position(|row| row.contains("\u{256d}\u{2500} candidate 1 "))
+            .unwrap_or_else(|| panic!("the first candidate's number: {rows:#?}"));
+        assert!(
+            rows[top].contains("\u{256d}\u{2500} candidate 2 "),
+            "the second candidate's number: {rows:#?}"
+        );
+        assert!(
+            rows[top + 1].contains("\u{2502}research \u{b7} try 2"),
+            "{rows:#?}"
+        );
+        assert!(
+            rows[top + 1].contains("\u{2026} \u{b7} try 2"),
+            "a long phase is cut, not the try: {rows:#?}"
+        );
+        assert!(
+            rows[top + 2].contains("\u{25cf} done \u{2713}")
+                && rows[top + 2].contains("\u{21b7} superseded"),
+            "{rows:#?}"
+        );
     }
 
     /// E9 (MOD-85): an edge's label is a word on a dim stroke, drawn in the base role, not the
