@@ -14,7 +14,13 @@ A1 `split` is a derived accessor, not a snapshot field; A2 T1→T2→T3→T4 ser
 item holds one of its graphs; A4 a new `WriteStore::usable_graphs(project)` read. Seven (not six) v1-resume tests
 move to v1 fixtures; the orch conformance suite is fake-only. **A5** (found by T3's adversarial verifier; accepted
 by the maintainer 2026-10-29): palette phases are left out of D7's default-edge rule and of `0023`'s repair, so a
-palette node never gains an edge (MOD-137 rule e).
+palette node never gains an edge (MOD-137 rule e). **A6** (found by T5's adversarial verifier; maintainer chose the
+recommended option 2026-10-29): D5's v1 bullet is amended. When the live resolve of a v1 run is refused as
+`NotYetRunnable` or `InvalidGraph`, the run is compared on the v1 phase-only digest (`graph::topology` of the live
+phases against the stored phases), as before MOD-138: equal walks on, different parks with the topology note. So a
+v1 run started before the upgrade on a graph with a palette phase or authored edges is not stranded, and edges added
+under a v1 run no longer park it (v1 runs always walked by position). The edge-aware v2-digest compare stays for every
+v1 run whose live graph resolves.
 
 ## Summary
 
