@@ -525,8 +525,10 @@ async fn a_rebound_new_version_key_opens_the_form_and_v_is_inert() {
     for _ in 0..TO_DOCS {
         press(&mut harness, "l").await;
     }
-    // MOD-115 M4 Q2: the Docs keys are the detail's hints, drawn while it is focused.
-    press(&mut harness, "tab").await;
+    // MOD-115 M4 Q2: the Docs keys are the detail's hints, drawn while it is focused. The pane
+    // key moves the focus among the panes the last frame drew, so a frame is drawn first.
+    harness.render();
+    press(&mut harness, "ctrl-right").await;
     let frame = harness.render();
     assert!(
         frame.contains("J/K move · a new · V new version"),

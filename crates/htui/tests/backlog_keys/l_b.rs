@@ -371,6 +371,8 @@ async fn the_runs_browse_hint_row() {
     let mut harness = driving(MemStore::demo(), &adapter).await;
     harness.key("l");
     harness.drive().await;
+    // The pane key moves the focus among the panes the last frame drew.
+    harness.render();
     harness.key("tab");
     harness.drive().await;
     let frame = harness.render();
@@ -491,8 +493,11 @@ async fn a_rebound_next_step_moves_the_cursor_and_j_capital_is_inert() {
     }
     harness.key("l");
     harness.drive().await;
-    // MOD-115 M4 Q2: the browse row is the focused detail's hints.
-    harness.key("tab");
+    // MOD-115 M4 Q2: the browse row is the focused detail's hints. Under a version-1 key file
+    // `tab` is `next_tab`, so the pane key is `ctrl-right`; it moves the focus among the panes
+    // the last frame drew.
+    harness.render();
+    harness.key("ctrl-right");
     harness.drive().await;
     let frame = harness.render();
     assert!(

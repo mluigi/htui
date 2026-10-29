@@ -129,7 +129,8 @@ async fn a_chord_does_not_scroll_the_body() {
 
 /// PA-2: on a Graph node `Enter` is `backlog.graph.reroot`, which shadows the Backlog's replay
 /// miss: it re-roots the list (the detail border reads the new root) and the status line never
-/// says "select a step in the Runs pane". On the new root's own row it is consumed too.
+/// says "select a step in the Runs pane". On the new root's own row it is consumed too. The
+/// detail is focused, so the Graph's keys are on its border (MOD-115 M4 Q2).
 #[tokio::test]
 async fn enter_re_roots_the_graph_and_never_says_the_miss() {
     let mut harness = backlog().await;
@@ -137,6 +138,10 @@ async fn enter_re_roots_the_graph_and_never_says_the_miss() {
     harness.app().reveal_tabs = vec![(RevealKind::Item, BacklogTab::ID)];
     down(&mut harness, TO_FEAT_1).await;
     sub_tab(&mut harness, TO_GRAPH);
+    // MOD-115 M4 Q2: the Graph's keys are the detail's hints, drawn while it is focused; the pane
+    // key moves the focus among the panes the last frame drew.
+    harness.render();
+    harness.key("tab");
     let frame = harness.render();
     assert!(
         on_item(&frame, "FEAT-1")
@@ -271,9 +276,13 @@ async fn a_rebound_cite_key_opens_the_picker_and_c_is_inert() {
         htui::keys::load_str("version = 1\n[backlog.reqs]\ncite = \"C\"\n").expect("the keys load");
     let mut harness = backlog_with(keys).await;
     on_feat_1_reqs(&mut harness).await;
+    // MOD-115 M4 Q2: the browse hint is the focused detail's. Under a version-1 key file `tab`
+    // is `next_tab`, so the pane key is `ctrl-right`.
+    harness.key("ctrl-right");
     let frame = harness.render();
+    // The detail's 41 hint cells cut the last key (D-20); the rebound one is whole.
     assert!(
-        frame.contains("J/K move · r reconfirm · C cite · u uncite"),
+        frame.contains("J/K move · r reconfirm · C cite · u unci\u{2026}"),
         "the browse hint names the rebound key:\n{frame}"
     );
 
