@@ -41,21 +41,22 @@ use htui_store::testkit as common;
 /// and MOD-146's two project type cases (plan D7) make it 196,
 /// and MOD-163 M1's ten memory cases (plan D4, D6, D8) make it 206,
 /// and MOD-138 M1's four walk-validator cases (plan D9) make it 210,
-/// and MOD-138 M1's five per-row default-edge cases (plan D7) make it 215.
-const EXPECTED_CASES: usize = 215;
+/// and MOD-138 M1's five per-row default-edge cases (plan D7) make it 215,
+/// and three for D12's usable graphs (plan D12, blueprint A3/A4) make it 218.
+const EXPECTED_CASES: usize = 218;
 
 #[test]
 fn case_list_matches_mem_store() {
     assert_eq!(
         htui_core::store::conformance::CASES.len(),
         EXPECTED_CASES,
-        "every conformance case must run against PgStore too (215 since MOD-78's `lease_holds` \
+        "every conformance case must run against PgStore too (218 since MOD-78's `lease_holds` \
          case, MOD-10 M4's secret-column case, MOD-12 M2's five queue-setting cases and \
          MOD-125 M1's run-workspace and four stop-verb and four claim-gate cases and its \
          settlement and deleted-workspace cases, MOD-137's eighteen graph v2 cases and its \
          review round's kept-node slot case, MOD-146's two project type cases, MOD-163 M1's \
          ten memory cases and MOD-138 M1's four walk-validator and five per-row default-edge \
-         cases)"
+         cases, and three for D12's usable graphs)"
     );
 }
 

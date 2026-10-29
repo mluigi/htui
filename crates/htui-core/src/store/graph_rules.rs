@@ -5,8 +5,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::model::{
-    AgentId, EdgeId, EdgeKind, EdgePredicate, GraphBody, PersonaId, PhaseId, Split, StepGraphEdge,
-    StepGraphId, StepGraphPhase,
+    AgentId, EdgeId, EdgeKind, EdgePredicate, GraphBody, GraphScope, PersonaId, PhaseId, ProjectId,
+    Split, StepGraphEdge, StepGraphId, StepGraphPhase, WorkspaceId,
 };
 use crate::prompt::template::TemplateRole;
 use crate::seed::{default_edge_plan, default_edges};
@@ -564,6 +564,27 @@ fn default_shapes(phases: &[StepGraphPhase]) -> HashMap<EdgeShape, usize> {
     }))
 }
 
+// ---- MOD-138 D12: who may name a graph (blueprint §T6.1) ----
+
+/// MOD-138 D12 (MOD-137 D4): may a kind or item of `project` name a graph of `scope`? Its
+/// project's (an override included: the item check refuses overrides itself), a workspace's that
+/// holds `project` (`workspaces` = the `workspace_id`s of its `workspace_project` rows), or the
+/// library's.
+///
+/// The rule is checked when a kind or item is **written**, never re-checked behind it: removing
+/// a project from a workspace (`remove_workspace_project`) is not refused, and a kind already on
+/// that workspace's graph keeps it and still resolves; its next edit is refused until it names a
+/// usable graph. Deleting the workspace is what is refused while a kind or item holds one of its
+/// graphs (blueprint A3).
+#[must_use]
+pub fn graph_usable_by(scope: GraphScope, project: ProjectId, workspaces: &[WorkspaceId]) -> bool {
+    match scope {
+        GraphScope::Project(owner) => owner == project,
+        GraphScope::Workspace(owner) => workspaces.contains(&owner),
+        GraphScope::Library => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
@@ -571,12 +592,12 @@ mod tests {
     use super::{
         WalkEdge, WalkNode, body_agent_refs, body_persona_refs, default_edges_follow,
         edge_predicate, graph_body_shape_refusal, graph_body_topology_refusal,
-        graph_body_walk_refusal, phase_row_refusal, walk_refusal,
+        graph_body_walk_refusal, graph_usable_by, phase_row_refusal, walk_refusal,
     };
     use crate::model::{
         AgentId, CommandQueue, EdgeId, EdgeKind, EdgePredicate, Gate, GraphBody, GraphScope,
         NodeBody, PersonaId, PhaseAgent, PhaseId, PhasePart, ProjectId, Split, StepGraph,
-        StepGraphEdge, StepGraphId, StepGraphPhase,
+        StepGraphEdge, StepGraphId, StepGraphPhase, WorkspaceId,
     };
     use crate::seed::{self, default_edges};
     use crate::store::traits::{
@@ -645,6 +666,44 @@ mod tests {
             )
         );
         assert!(phase_row_refusal(&phase(Split::Divide, 3)).is_some());
+    }
+
+    /// MOD-138 D12: a project in one workspace may use its own graphs (an override included),
+    /// that workspace's and the library's; never another project's or another workspace's.
+    #[test]
+    fn graph_usable_by_project_workspace_library() {
+        let project = ProjectId::new();
+        let held_by = WorkspaceId::new();
+        let workspaces = [held_by];
+        assert!(graph_usable_by(
+            GraphScope::Project(project),
+            project,
+            &workspaces
+        ));
+        assert!(graph_usable_by(
+            GraphScope::Workspace(held_by),
+            project,
+            &workspaces
+        ));
+        assert!(graph_usable_by(GraphScope::Library, project, &workspaces));
+        assert!(!graph_usable_by(
+            GraphScope::Project(ProjectId::new()),
+            project,
+            &workspaces
+        ));
+        assert!(!graph_usable_by(
+            GraphScope::Workspace(WorkspaceId::new()),
+            project,
+            &workspaces
+        ));
+        assert!(
+            !graph_usable_by(GraphScope::Workspace(held_by), project, &[]),
+            "a workspace that no longer holds the project lends it nothing"
+        );
+        // An override is a project graph: the scope rule passes it, and the item check (which
+        // filters `is_override`) is what refuses it as an item's choice.
+        let override_scope = GraphScope::Project(project);
+        assert!(graph_usable_by(override_scope, project, &[]));
     }
 
     /// `ck_phase_divide_columns`: each of the seven columns alone refuses off a `divide` node.

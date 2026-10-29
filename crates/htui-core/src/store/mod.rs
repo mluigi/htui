@@ -16,7 +16,7 @@ pub use error::{Result, StoreError};
 pub use graph_rules::{
     WalkEdge, WalkNode, body_agent_refs, body_persona_refs, default_edges_follow, edge_predicate,
     graph_body_shape_refusal, graph_body_topology_refusal, graph_body_walk_refusal,
-    phase_row_refusal, walk_refusal,
+    graph_usable_by, phase_row_refusal, walk_refusal,
 };
 pub use mem::MemStore;
 pub use traits::{
@@ -30,7 +30,7 @@ pub use traits::{
     edge_needs_loop_limit, edge_predicate_mismatch, expected_on_row, failure_disagrees_with_status,
     fan_out_below_one, finish_run_item_mirror, finish_run_needs_a_terminal_status,
     forward_edges_form_a_cycle, glob_names_unknown_repo, global_glob_names_a_repo,
-    graph_name_is_taken, graph_not_in_project, has_nul, illegal_move, invalid_area_code,
+    graph_name_is_taken, graph_not_usable, has_nul, illegal_move, invalid_area_code,
     invalid_persona_name, invalid_prefix, invalid_skill_name, invalid_template_name,
     item_has_a_live_run, item_kind_is_held, item_not_in_project, kind_not_narrowable,
     lease_ttl_micros, legal_move, loop_edge_runs_forward, max_parts_below_one, memory_entry_closed,
@@ -45,6 +45,6 @@ pub use traits::{
     row_names_another_phase, row_names_another_step, rule_kind_unknown, run_is_terminal,
     skill_body_refusal, skill_patch_refusal, skill_version_key, split_fan_out_mismatch,
     step_is_not_promotable, step_slot_is_taken, summary_names_another_item, winner_is_not_settled,
-    withdrawn_requirement_cited,
+    withdrawn_requirement_cited, workspace_graph_is_held,
 };
 pub use worker::{RecorderStore, RelayStore, WorkerHost, WorkerStore};
