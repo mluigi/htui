@@ -3,7 +3,7 @@
 **Source**: `HANDOFF.md` MOD-144; design `docs/ANA-35.md` §7.1 (verdict), §7.10 (migration order), §6
 (analysis). Routed as **plan** by maintainer override (2026-10-27; the verdict was PRD on 2 criteria).
 **Complexity**: Large (every crate but htui-agent; one migration; ~70 snapshots).
-**Status**: CONFIRMED 2026-10-27 (Decisions A, B, C as recommended; ultracode on for implement and review).
+**Status**: DONE 2026-10-29 (confirmed 2026-10-27, Decisions A, B, C as recommended; PD18 refuse; write-up `docs/decisions/mod/mod-144.md`).
 
 ## Summary
 

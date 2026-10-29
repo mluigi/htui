@@ -14,11 +14,13 @@
   truth for its workflow skills and rules, `AGENTS.md` "Rules").
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-21):** **MOD-137 is done** (`docs/decisions/mod/mod-137.md`): step graphs
-store their topology (`step_graph_edge`, backfilled from today's order and review loop), an owner scope
-(project, workspace or the global library) and a whole-graph `revision`; `replace_graph` edits a graph in
-one CAS'd write, with deleters, two catalogue verbs and the re-override. Nothing reads edges at run time
-until MOD-138, which is now unblocked. **MOD-146 is done** (`docs/decisions/mod/mod-146.md`): a
+**Current status (2026-10-29):** **MOD-144 is done** (`docs/decisions/mod/mod-144.md`): an item
+stores only `open`, `blocked` or `closed`; queued, running, needs you, stopped, failed and done are
+`ItemState`, derived from the item's latest graph run (cancelled skipped), and the store no longer
+mirrors run moves onto the item. One live graph run per item is `uq_run_item_live` plus `startable`;
+readiness, release, waiting and close-out read run facts (`done`/`concluded` close only an open
+finished item); migration `0023` mapped the old values; the search index drops and rebuilds on a
+payload-schema stamp. MOD-150 is unblocked. **MOD-146 is done** (`docs/decisions/mod/mod-146.md`): a
 `project_type` table with six built-in rows (software, research, docs, ops, general, workspace),
 `project.type` (existing projects `software`), the `coding` flag ANA-39 and MOD-128 read, and a
 read-only Settings › Project types section; the Settings strip now scrolls to its active section.
@@ -45,18 +47,18 @@ TOOL-8's `dev-health` docker path against the real `htui-postgres` (`docs/htui-d
 install and `tsc` on the mod; TOOL-10's real `scripts/hr up` and Docker bats case; ANA-30's checks of
 which credit the $100 is (Console) and of stored ACP `session_info_update` titles (`docs/ANA-30.md` §8
 calls 2, 6).
-Live coordinates after MOD-163 M1 (checked against the tree 2026-10-25): migrations run through `0022_memory`
-(MOD-163 M1: `memory_entry`, `memory_entry_revision`; not mirrored), before it `0021_project_type` (MOD-146:
+Live coordinates after MOD-144 (checked against the tree 2026-10-29): migrations run through `0023_item_status`
+(MOD-144: three-value `item.status`, `uq_run_item_live`; no new table), before it `0022_memory` (MOD-163 M1: `memory_entry`, `memory_entry_revision`; not mirrored), before it `0021_project_type` (MOD-146:
 `project_type`, `project.type`), `0020_step_graph_v2` (MOD-137: `step_graph_edge`, `phase_part`, owner scope,
 `revision`) and `0019_stop_runs` (MOD-125 M1: `stopped` status, `run.workspace_id`, `queue_entry.workspace_id`,
-`workspace_stop`), so **the next migration is `0023`** (cache: through `0007_project_type`, next `0008`;
+`workspace_stop`), so **the next migration is `0024`** (cache: through `0007_project_type`, next `0008`;
 `0006_run_workspace` mirrors `run.workspace_id`). Cache `schema_version` is `PgStore::schema_version()`, the highest
 migration number, so any new migration forces one mirror rebuild per box. Numbers collide when branches run in parallel:
 MOD-146's and MOD-163's both landed as `0020` and were renumbered `0021` and `0022` at their merges (as MOD-11's and
 MOD-70's were before), so a branch adding a migration renumbers at merge time and repins
-`htui-store/tests/migrations.rs`. Items that still owe one include MOD-139 (and its cache mirror), MOD-143, MOD-144,
-MOD-147 and MOD-159. Pins: store conformance `CASES` 206 (`htui-core/tests/mem_store.rs`), `READ_CASES` 15,
-`htui-orch` `CASES` 109 (`htui-orch/tests/fake_conformance.rs`); Postgres tables 51
+`htui-store/tests/migrations.rs`. Items that still owe one include MOD-139 (and its cache mirror), MOD-143, MOD-147
+and MOD-159. Pins: store conformance `CASES` 216 (`htui-core/tests/mem_store.rs`, `htui-store/tests/pg_conformance.rs`), `READ_CASES` 15,
+`htui-orch` `CASES` 112 (`htui-orch/tests/fake_conformance.rs`); Postgres tables 51
 (`htui-store/tests/migrations.rs` `TABLES`).
 ---
 
@@ -397,9 +399,10 @@ MOD-147 and MOD-159. Pins: store conformance `CASES` 206 (`htui-core/tests/mem_s
   a draft store for proposed items no reader consumes until accepted, shared with `R-MCP-2`'s
   `item_create`; one confirmation that closes, creates the accepted follow-ups and writes the accepted
   re-confirmations; `done` requires landed work; auto mode never closes an item. Builds on MOD-144's
-  close-out law (from ANA-35, `docs/ANA-35.md` §7.1) and adds finished-not-closed items as `CloseOut`
+  close-out law (done, `docs/decisions/mod/mod-144.md`: `Resolution::closes_from(status, finished)`,
+  `default_for` from the finished run's `graph_snapshot`) and adds finished-not-closed items as `CloseOut`
   candidates; a parent closed with open children is flagged on the checklist (MOD-150). Blocked on
-  MOD-133; lands after MOD-144 or with it.
+  MOD-133.
   ANA-36 §7.2 adds design input: MOD-154's typed status request is the checklist's proposed resolution;
   follow-ups come from `item_create` drafts.
   MOD-161 (from ANA-37) shows related items beside its follow-up drafts, a later consumer of the draft store.
@@ -416,17 +419,6 @@ MOD-147 and MOD-159. Pins: store conformance `CASES` 206 (`htui-core/tests/mem_s
   alone. Blocked on MOD-135, MOD-115 and MOD-147.
   ANA-36 §7.2 adds design input: share the read code with MOD-112's `item_read`; link requests go through
   MOD-155's pending state.
-- [ ] **MOD-144 - Item status reduced to open, blocked, closed** (from ANA-35, `docs/ANA-35.md` §7.1,
-  §7.10). `R-ENT-8`, `R-TUI-1`, `R-TUI-2`, `R-TUI-11`, `R-STO-8`, `R-ORCH-6`, `R-MCP-2`. A 3-value
-  `Status`; `ItemState`, the derived display state, and `latest_run_status` on `ItemSummary` (cancelled
-  runs skipped); readiness and the "released" rule as "latest graph run `done`" (MOD-133 adds landed);
-  `uq_run_item_live` and the `create_run` check; the new close-out law and `default_for` from the run's
-  `graph_snapshot`; the orchestrator's 7 mirror calls dropped; store (Pg, Mem, cache), waiting
-  candidates and queue classification; the Qdrant payload (no collection rename while htui is in
-  development: drop and reindex, MOD-159); MCP enums; the prompt's upstream
-  word; the TUI status table, Backlog facet and grouping; fixtures and snapshots. The pre-flight count
-  runs first, then §7.10 row 1's migration, unexplained `done`/`failed` rows included. Not blocked;
-  MOD-135 lands after it or with it.
 - [ ] **MOD-145 - Plain-folder repos and repo-less runs** (from ANA-35, `docs/ANA-35.md` §7.2).
   `R-ENT-3`, `R-ENT-4`, `R-BOX-4`, `R-ORCH-8`. `repo.vcs` (`git`, `folder`) with registration checks;
   `needs_repo` per phase and the snapshot refusals; isolation resolved per repo (`worktree` copies a
@@ -463,7 +455,7 @@ MOD-147 and MOD-159. Pins: store conformance `CASES` 206 (`htui-core/tests/mem_s
   (`parent`, `duplicates`, `implements`); single parent, cycle and depth checks; `parent` in the
   upstream prompt walk; close-out recording `duplicates`/`supersedes`; `item_artifact_link` with
   document version pinning (`to_attachment_id` without its FK, which MOD-114 (3) adds); MCP
-  `to_document` and qualified keys; Graph legend and nodes. Blocked on MOD-144.
+  `to_document` and qualified keys; Graph legend and nodes. Not blocked (MOD-144 is done).
 - [ ] **MOD-151 - Tell agents about htui's MCP tools (server instructions, prompt section, typed
   results)** (from ANA-36, `docs/ANA-36.md` §7.3, §7.4, §8 Q7). `R-MCP-2`, `R-MCP-4`, `R-PRM-1`,
   `R-PRM-3`. `initialize.instructions` naming each advertised tool and when to use it; a prompt section
@@ -910,7 +902,8 @@ MOD-147 and MOD-159. Pins: store conformance `CASES` 206 (`htui-core/tests/mem_s
   `R-STO-8`, `R-ENT-12`, `R-ENT-13`, `R-ENT-16`. In the one Qdrant (MOD-158): one collection per
   workspace, replacing `htui_concepts_v2`, and one global collection for global memory (MOD-168), never
   copied into a workspace's; collection names carry no version while htui is in development, so a
-  payload change (MOD-144, MOD-147, MOD-167) drops and reindexes instead of renaming (by maintainer
+  payload change (MOD-147, MOD-167) drops and reindexes instead of renaming (MOD-144's payload-schema
+  stamp in `vector.rs` already does it for the current collection) (by maintainer
   decision, 2026-10-20); an indexer lease row in Postgres per collection (holder, box, expiry; taken
   when free or expired, renewed each beat on the run lease's TTLs; renewed before each delete batch,
   orphans confirmed absent in the same pass; worker or TUI, one lease per collection a process serves);
@@ -973,7 +966,7 @@ MOD-147 and MOD-159. Pins: store conformance `CASES` 206 (`htui-core/tests/mem_s
   (3).
 - [ ] **MOD-8 - Legacy markdown import.** `R-LATER-3`. Map old prefixes to kinds per project,
   preserve keys, build links. **Promoted to must by the 2026-10-15 requirements review:** this
-  repository is its first user. ANA-9 §7.1 and ANA-11 §6 already cover its design. It follows MOD-144,
+  repository is its first user. ANA-9 §7.1 and ANA-11 §6 already cover its design. It follows MOD-144 (done),
   MOD-147 and MOD-150 (from ANA-35, `docs/ANA-35.md` §9), whose status, link and ownership model it
   imports into: `[ ]`/`[x]` map to `open`/`closed`, "Blocked on X" to `blocked_by`, "from X" to `origin`,
   "absorbs" to `parent`; it writes `closed` and the resolution through an importer-only store path, not
@@ -1068,8 +1061,9 @@ MOD-147 and MOD-159. Pins: store conformance `CASES` 206 (`htui-core/tests/mem_s
   (describe with the project preset from the item on screen, light-model rewrite, review, talk it
   through with a live draft, resizable and remembered; the chat becomes the item's first chat); a
   second status line ("runs on … · workflow …") and `t` "how it runs": target (inherit or one) and
-  workflow (auto or pinned). The status grouping, `h` and the state filter key on MOD-144's `ItemState`
-  (from ANA-35). Blocked on MOD-115; targets beyond this box need ANA-42, workflows need MOD-124 and
+  workflow (auto or pinned). The status grouping, `h` and the state filter key on MOD-144's
+  `htui_core::model::ItemState` (`ALL` is the attention order; `ItemFilter.states`); MOD-144 rekeyed the
+  facet, list, detail and graph marks, not grouping or `h`. Blocked on MOD-115; targets beyond this box need ANA-42, workflows need MOD-124 and
   MOD-126.
   ANA-36 §7.2 adds design input: `draft_update` as the new-item modal chat's tool, validated in the write
   tool.
@@ -1294,6 +1288,6 @@ MOD-147 and MOD-159. Pins: store conformance `CASES` 206 (`htui-core/tests/mem_s
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 6 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-39 mandatory context tools, ANA-41 project workflows, ANA-42 execution targets) |
-| MOD-N   | 89 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-144 item status reduction, MOD-145 folder repos and repo-less runs, MOD-147 workspace scope, MOD-148 per-type seeds, MOD-149 workspace requirement keys, MOD-150 link kinds, MOD-151 tool guidance, MOD-152 async commands and logs, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-158 Qdrant setting and key, MOD-159 knowledge indexer, MOD-160 knowledge search fail-open, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-163 memory entry store, MOD-164 automatic memory capture, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-115 TUI shell, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-138 snapshot v2 and walker, MOD-139 divided fan-out runtime, MOD-140 planner tools and run-time changes, MOD-141 step-graph editor, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
+| MOD-N   | 88 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-145 folder repos and repo-less runs, MOD-147 workspace scope, MOD-148 per-type seeds, MOD-149 workspace requirement keys, MOD-150 link kinds, MOD-151 tool guidance, MOD-152 async commands and logs, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-158 Qdrant setting and key, MOD-159 knowledge indexer, MOD-160 knowledge search fail-open, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-163 memory entry store, MOD-164 automatic memory capture, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-115 TUI shell, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-138 snapshot v2 and walker, MOD-139 divided fan-out runtime, MOD-140 planner tools and run-time changes, MOD-141 step-graph editor, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
 | CLEAN-N | 0 |
 | TOOL-N  | 2 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check) |

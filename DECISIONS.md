@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-144](docs/decisions/mod/mod-144.md)** - Item status reduced to open, blocked, closed (done, 2026-10-29)
 - **[MOD-137](docs/decisions/mod/mod-137.md)** - Step graph v2 storage: edges, owner scope, revision, atomic edits (done, 2026-10-21)
 - **[MOD-146](docs/decisions/mod/mod-146.md)** - Project type table (done, 2026-10-21)
 - **[ANA-38](docs/decisions/ana/ana-38.md)** - Project and workspace memory (concluded, 2026-10-20)
