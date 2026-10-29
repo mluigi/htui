@@ -1,7 +1,8 @@
 //! The Documents sub-tab: the item's documents, without their bodies, and `a`/`v` to write one
 //! by hand (MOD-13 milestone 5 D9).
 //!
-//! - **Keys**: `J`/`K` move a cursor over the rows, drawn by style only; `PgUp`/`PgDn` scroll.
+//! - **Keys**: `J`/`K` move a cursor over the rows, its row drawn as the kit list's gutter and
+//!   band (MOD-115 M4 L-docs); `PgUp`/`PgDn` scroll.
 //!   `a` sends `DocumentForm` with no kind (a new document: kind, title and body typed); `v`
 //!   sends it with the kind under the cursor (a new version: the kind fixed, title and body from
 //!   the version of that kind the next step reads, never a fan-out loser's (MOD-73 review M1), the
@@ -152,7 +153,8 @@ pub struct DocumentsTab {
     item: Option<ItemId>,
     /// The selected item's key, from `StoreReply::Item` (E2): the temp-file stem.
     key: Option<String>,
-    /// Index of the row under the cursor (D9; drawn by style only).
+    /// Index of the row under the cursor (D9; drawn as the kit list's gutter and band, MOD-115
+    /// M4 L-docs).
     cursor: usize,
     /// First visible document.
     scroll: Scroll,
