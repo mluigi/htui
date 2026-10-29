@@ -87,7 +87,7 @@ const BY_WIDTH: usize = 4;
 const NO_DOCUMENTS: &str = "No documents for this item.";
 
 /// [`NO_DOCUMENTS`]' next step while `backlog.docs.add` is unbound.
-const WRITE_UNBOUND: &str = "a document written by hand lists here";
+const WRITE_UNBOUND: &str = "hand-written documents list here";
 
 /// No item under the list's cursor (a project header).
 pub(super) const NO_ITEM: &str = "No item selected.";
@@ -96,7 +96,7 @@ pub(super) const NO_ITEM: &str = "No item selected.";
 pub(super) const CHOOSE: HintSpec = &[Hint::Pair(Act::ListDown, Act::ListUp, "chooses one")];
 
 /// [`NO_ITEM`]'s next step while the list's motion is unbound.
-pub(super) const CHOOSE_UNBOUND: &str = "an item chosen in the list shows here";
+pub(super) const CHOOSE_UNBOUND: &str = "a chosen item shows here";
 
 /// The browse hint on the pane's last row (D11), through [`views::BACKLOG_DOCS`].
 const HINT: HintSpec = &[
@@ -1863,6 +1863,27 @@ mod tests {
         let text = drawn(43, 9, |frame, rect| none.render(frame, rect, &shell.ctx()));
         assert!(text.contains("No item selected."), "{text}");
         assert!(text.contains("j/k chooses one"), "{text}");
+    }
+
+    /// MOD-115 M4 L-docs: `kit::empty` cuts a line to the pane, so each sentence standing in for
+    /// an unbound key fits whole in the detail pane at 80 columns (34 cells inside).
+    #[tokio::test]
+    async fn the_unbound_next_steps_fit_the_detail_pane_at_80_columns() {
+        let mut shell = Shell::new();
+        shell.keys =
+            crate::keys::load_str("version = 1\n[backlog.docs]\nadd = []\n").expect("loads");
+        let mut empty = DocumentsTab::new();
+        empty.on_item_change(Some(ITEM));
+        empty.on_reply(&StoreReply::Documents(Vec::new()), &mut shell.ctx());
+        let text = drawn(34, 9, |frame, rect| empty.render(frame, rect, &shell.ctx()));
+        assert!(text.contains(WRITE_UNBOUND), "{text}");
+
+        shell.keys =
+            crate::keys::load_str("version = 1\n[list]\ndown = []\nup = []\n").expect("loads");
+        let mut none = DocumentsTab::new();
+        none.on_item_change(None);
+        let text = drawn(34, 9, |frame, rect| none.render(frame, rect, &shell.ctx()));
+        assert!(text.contains(CHOOSE_UNBOUND), "{text}");
     }
 
     /// MOD-115 M4 L-docs: D5's sentence under the table is the kit's notice row, wrapped to the

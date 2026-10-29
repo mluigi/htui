@@ -1254,6 +1254,20 @@ mod tests {
         assert!(text.contains("j/k chooses one"), "{text}");
     }
 
+    /// MOD-115 M4 L-docs: `kit::empty` cuts a line to the pane, so the sentence standing in for an
+    /// unbound `backlog.notes.add` fits whole in the detail pane at 80 columns (34 cells inside).
+    #[tokio::test]
+    async fn the_unbound_next_step_fits_the_detail_pane_at_80_columns() {
+        let mut shell = Shell::new();
+        shell.keys =
+            crate::keys::load_str("version = 1\n[backlog.notes]\nadd = []\n").expect("loads");
+        let mut empty = NotesTab::new();
+        empty.on_item_change(Some(ITEM));
+        empty.on_reply(&StoreReply::Notes(Vec::new()), &mut shell.ctx());
+        let text = drawn(34, 9, |frame, area| empty.render(frame, area, &shell.ctx()));
+        assert!(text.contains(WRITE_UNBOUND), "{text}");
+    }
+
     /// MOD-115 M4 L-docs: review M1's sentence under the thread is the kit's notice row in the
     /// info role.
     #[tokio::test]
