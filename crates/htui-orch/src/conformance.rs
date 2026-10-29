@@ -707,12 +707,14 @@ pub const CASES: &[&str] = &[
     // MOD-12 M2 R1 (review M1): the session's run term is the snapshot's cap, as the walk's is.
     "a_lowered_live_run_cap_does_not_cut_a_snapshotted_run",
     // MOD-138 M1 (plan D5): a v2 run is pinned, so a live edit parks none of the three resume
-    // paths; a tampered v2 snapshot parks; a v1 run whose live graph M1 refuses parks.
+    // paths; a tampered v2 snapshot parks. A v1 run whose live graph M1 refuses is compared on
+    // its phases alone (blueprint A6): an added edge walks on, an edited phase parks.
     "a_v2_run_walks_on_after_a_live_edit",
     "a_running_v2_run_walks_on_after_a_live_edit",
     "a_handed_back_v2_run_on_a_changed_graph_walks_on",
     "a_tampered_v2_snapshot_parks_with_both_digests",
-    "a_v1_run_whose_live_graph_gained_a_non_default_edge_parks",
+    "a_v1_run_whose_live_graph_gained_a_non_default_edge_walks_on",
+    "a_v1_run_on_a_refused_graph_whose_phases_changed_parks",
 ];
 
 /// Run one case by name.
@@ -1143,8 +1145,11 @@ fn pinned_resume_case<'a, H: CaseHarness>(
         "a_tampered_v2_snapshot_parks_with_both_digests" => {
             Box::pin(a_tampered_v2_snapshot_parks_with_both_digests(harness))
         }
-        "a_v1_run_whose_live_graph_gained_a_non_default_edge_parks" => Box::pin(
-            a_v1_run_whose_live_graph_gained_a_non_default_edge_parks(harness),
+        "a_v1_run_whose_live_graph_gained_a_non_default_edge_walks_on" => {
+            Box::pin(a_v1_run_whose_live_graph_gained_a_non_default_edge_walks_on(harness))
+        }
+        "a_v1_run_on_a_refused_graph_whose_phases_changed_parks" => Box::pin(
+            a_v1_run_on_a_refused_graph_whose_phases_changed_parks(harness),
         ),
         _ => return None,
     })
@@ -8673,10 +8678,11 @@ async fn a_tampered_v2_snapshot_parks_with_both_digests<H: CaseHarness>(harness:
     );
 }
 
-/// MOD-138 D5: a v1 run whose live graph gained a non-default edge has a live graph M1 refuses
-/// (D6(c)). Its topology did change, so the run parks with the topology note, and `live` names
-/// the refusal.
-async fn a_v1_run_whose_live_graph_gained_a_non_default_edge_parks<H: CaseHarness>(harness: &H) {
+/// MOD-138 D5 as amended by blueprint A6: a v1 run whose live graph gained a non-default edge has
+/// a live graph M1 refuses (D6(c)). A v1 run always walked by position, so it is compared on the
+/// v1 phase-only digest instead; its phases did not change, so `resume` walks on to `plan`'s
+/// gate and writes no topology note.
+async fn a_v1_run_whose_live_graph_gained_a_non_default_edge_walks_on<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
     free_feat_3(&orch).await;
     let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
@@ -8684,6 +8690,50 @@ async fn a_v1_run_whose_live_graph_gained_a_non_default_edge_parks<H: CaseHarnes
     assert_eq!(stored_v(&orch, run).await, GraphSnapshot::V1);
     approve_without_walking(&orch, run, ids::HTUI_FEAT_3).await;
     add_asks_you(&orch, ids::HTUI_FEAT_3, "review", "plan").await;
+
+    let resumed = orch.resume(run).await.expect("the run is readable");
+    let Resume::Walked(rest) = resumed else {
+        panic!("a refused live graph whose phases did not move is walked: {resumed:?}");
+    };
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(1)),
+        "the walk ran position 1 and parked at its gate"
+    );
+    assert_eq!(
+        step_shape(&orch, run).await,
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::AwaitingApproval),
+        ],
+        "the walk advanced"
+    );
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+    assert!(
+        !notes
+            .iter()
+            .any(|body| body.starts_with("topology mismatch")
+                || body.starts_with("live graph not comparable")),
+        "{notes:?}"
+    );
+}
+
+/// MOD-138 D5 as amended by blueprint A6: a v1 run on a live graph M1 refuses (an added
+/// `asks_you` edge) whose phases also moved (`prd`'s `input_kinds`) parks with the topology
+/// note. Both digests are v1 phase-only ones: `snapshot` is the run's stored v1 `topology`, and
+/// `live` the live phases' digest, never a `not runnable` sentence.
+async fn a_v1_run_on_a_refused_graph_whose_phases_changed_parks<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    rewrite_as_v1(orch.store(), run).await;
+    let stored_topology = run_of(&orch, run).await.graph_snapshot.expect("a snapshot")["topology"]
+        .as_str()
+        .expect("a snapshot carries its topology")
+        .to_owned();
+    approve_without_walking(&orch, run, ids::HTUI_FEAT_3).await;
+    add_asks_you(&orch, ids::HTUI_FEAT_3, "review", "plan").await;
+    set_input_kinds(&orch, ids::HTUI_FEAT_3, 0, &["spec"]).await;
     let before = step_shape(&orch, run).await;
 
     let resumed = orch.resume(run).await.expect("the run is readable");
@@ -8693,10 +8743,17 @@ async fn a_v1_run_whose_live_graph_gained_a_non_default_edge_parks<H: CaseHarnes
         rest,
     } = resumed
     else {
-        panic!("a refused live graph is a changed one: {resumed:?}");
+        panic!("the live phases moved, so the v1 digests differ: {resumed:?}");
     };
-    assert!(snapshot.starts_with("sha256:"), "{snapshot}");
-    assert!(live.starts_with("not runnable: "), "{live}");
+    assert_eq!(
+        snapshot, stored_topology,
+        "the v1 digest of the run's own phases"
+    );
+    assert!(
+        live.starts_with("sha256:"),
+        "a digest, not a refusal: {live}"
+    );
+    assert_ne!(snapshot, live, "two digests, and they are not the same one");
     assert_eq!(
         (rest.run, rest.position),
         (RunStatus::AwaitingApproval, Some(1))
@@ -8714,7 +8771,9 @@ async fn a_v1_run_whose_live_graph_gained_a_non_default_edge_parks<H: CaseHarnes
     assert_eq!(
         notes
             .iter()
-            .filter(|body| body.starts_with("topology mismatch") && body.contains(&live))
+            .filter(|body| body.starts_with("topology mismatch")
+                && body.contains(&snapshot)
+                && body.contains(&live))
             .count(),
         1,
         "{notes:?}"
@@ -8745,8 +8804,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            114,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 5: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            115,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -8783,9 +8842,10 @@ mod tests {
              M1's three (criterion 23's two halves, criterion 24), and MOD-12 M2's five (the \
              batch walk refusal, the batch remainder, the manual run, the run cap across steps, \
              and review R1's snapshotted run cap against a lowered live one), and CLEAN-9 T2's one \
-             (a malformed cap key refused at start), and MOD-138 M1's five pinned-resume cases \
+             (a malformed cap key refused at start), and MOD-138 M1's six pinned-resume cases \
              (plan D5: a v2 run walking on after a live edit on the three resume paths, a \
-             tampered v2 snapshot parked, a v1 run on a refused live graph parked)"
+             tampered v2 snapshot parked; blueprint A6: a v1 run on a refused live graph \
+             walking on, and parked once its phases moved)"
         );
     }
 
