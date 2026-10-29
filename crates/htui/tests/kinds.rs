@@ -1573,8 +1573,98 @@ async fn an_unknown_graph_name_is_refused() {
     assert!(bench.drained().is_empty());
     assert!(
         error_text(&bench, &section, 100)
-            .contains(&"`graph` names no graph in this project".to_owned()),
+            .contains(&"`graph` names no graph this project can use".to_owned()),
         "the refusal says what could not be resolved"
+    );
+}
+
+/// MOD-138 D12: the kind editor's `graph` field resolves a library graph's name too (after the
+/// project's own), the store takes it, and the kind's line names it with its scope.
+#[tokio::test]
+async fn a_kind_can_take_a_library_graph() {
+    let store = MemStore::demo();
+    let library = store
+        .create_step_graph(htui_core::model::NewStepGraph {
+            id: StepGraphId::new(),
+            scope: GraphScope::Library,
+            name: "libflow".to_owned(),
+            description: String::new(),
+            is_override: false,
+        })
+        .await
+        .expect("a library graph");
+    let backend = Backend::memory(store);
+    let snapshot = demo_catalogue(&backend).await;
+    assert_eq!(
+        snapshot.projects[0]
+            .shared
+            .iter()
+            .map(|graph| graph.id)
+            .collect::<Vec<_>>(),
+        vec![library.id],
+        "the catalogue carries the graphs the project may use beside its own"
+    );
+
+    let bench = SectionBench::new().await;
+    let mut section = KindsSection::new();
+    bench.reply(
+        &mut section,
+        &StoreReply::Catalogue(Box::new(snapshot.clone())),
+    );
+    let _ = bench.drained();
+    bench.key(&mut section, "n");
+    type_at(&bench, &mut section, "DOC");
+    bench.key(&mut section, "tab");
+    type_at(&bench, &mut section, "docs");
+    bench.key(&mut section, "tab");
+    bench.key(&mut section, "tab");
+    for _ in 0.."analysis".len() {
+        bench.key(&mut section, "backspace");
+    }
+    type_at(&bench, &mut section, "libflow");
+    bench.key(&mut section, "enter");
+
+    let asked = bench.drained();
+    let [request @ Action::Store(StoreRequest::CreateKind { graph, .. })] = asked.as_slice() else {
+        panic!("`Enter` creates once: {asked:?}");
+    };
+    assert_eq!(*graph, library.id, "the library graph, by name");
+    let Action::Store(request) = request else {
+        unreachable!("matched above")
+    };
+    let reread = catalogue(serve(&backend, request).await);
+    let created = reread.projects[0]
+        .kinds
+        .iter()
+        .find(|kind| kind.prefix == "DOC")
+        .expect("the kind landed");
+    assert_eq!(created.default_graph_id, library.id);
+
+    bench.reply(&mut section, &StoreReply::Catalogue(Box::new(reread)));
+    let _ = bench.drained();
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame
+            .lines()
+            .any(|line| line.trim() == "DOC  docs \u{b7} graph libflow \u{b7} library"),
+        "the kind's line names the library graph: {frame}"
+    );
+
+    // `g` on that kind: the library graph is not this section's to edit, and is not "missing".
+    let row = frame
+        .lines()
+        .position(|line| line.trim().starts_with("DOC  docs"))
+        .expect("the kind's row");
+    for _ in 0..row {
+        bench.key(&mut section, "j");
+    }
+    bench.key(&mut section, "g");
+    assert!(bench.drained().is_empty(), "no editor, no request");
+    assert!(
+        error_text(&bench, &section, 100)
+            .contains(&"graph libflow \u{b7} library is not edited here".to_owned()),
+        "the refusal names the shared graph: {}",
+        bench.render_section(&section, 100)
     );
 }
 

@@ -350,6 +350,10 @@ pub fn topology(phases: &[SnapshotPhase]) -> std::result::Result<String, Resolve
 /// under the run's own mode (`engine.rs:3036-3044`), so the topology an auto run is compared
 /// against is downgraded the same way (H-3).
 ///
+/// The graph may be a workspace or library graph (MOD-138 D12): its scope is frozen in
+/// `graph.scope`, and its phases' templates and personas still resolve in the **item's** project
+/// (`prompt_template(project.id, ..)`), so one shared graph runs with each project's templates.
+///
 /// # Errors
 /// Any [`ResolveError`]; a missing `project` row is [`StoreError::NotFound`].
 pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
@@ -804,7 +808,10 @@ fn frozen_persona(
 /// Each source phase's `phase_agent` and `phase_part` rows are re-keyed to the cloned phase
 /// (MOD-37 R-6), and the source graph's edges are copied, remapped onto the cloned phases with
 /// fresh edge ids (MOD-137 D13), so the clone is deep over `step_graph_phase`, `phase_agent`,
-/// `phase_part`, `step_graph_edge` and the phase attachments alike. All of it but the attachments
+/// `phase_part`, `step_graph_edge` and the phase attachments alike. The source may be a graph of
+/// any scope the item may use (MOD-138 D12); the clone is always created in the item's project
+/// (an override stays project-only), and a workspace or library phase carries no phase
+/// attachment to copy. All of it but the attachments
 /// is written by one [`WriteStore::replace_graph`] (revision 0 → 1 on a first override), whose
 /// pure refusals ([`graph_body_shape_refusal`], [`graph_body_topology_refusal`],
 /// [`graph_body_walk_refusal`]) are decided before the graph row is created.
@@ -1165,7 +1172,8 @@ async fn orphaned_override<S: WriteStore>(
             "graph `{name}` already exists and is not an override; rename it and override again"
         ))));
     }
-    // Only an item of the graph's own project can name it (`check_graph`, MOD-137 D4), and
+    // Only an item of the graph's own project can name it: an override is always a project graph
+    // and `check_graph` never offers one (MOD-137 D4; MOD-138 D12 kept overrides so), and
     // `items` narrows by `project_ids` alone; no store reads the workspace, so the nil id stands
     // in for the one the project may not even have.
     let scope = Scope {
@@ -3973,6 +3981,194 @@ question and not a test fix. Decide the version bump first, then paste the new d
             .await
             .expect_err("the kind's default graph is gone");
         assert_eq!(error, ResolveError::NoGraph(ids::HTUI_FEAT_1));
+    }
+
+    /// MOD-138 D12: a library graph `libflow` holding a copy of `feature`'s `implement` and
+    /// `review` rows (built row by row, so D7 gives it default edges), made `FEAT`'s kind default
+    /// through `update_item_kind`, which takes a library graph since D12. Returns its id.
+    async fn feat_on_a_library_graph(store: &MemStore) -> StepGraphId {
+        let library = store
+            .create_step_graph(NewStepGraph {
+                id: StepGraphId::new(),
+                scope: GraphScope::Library,
+                name: "libflow".to_owned(),
+                description: String::new(),
+                is_override: false,
+            })
+            .await
+            .expect("a library graph");
+        let feature = store
+            .phases(ids::GRAPH_HTUI_FEAT)
+            .await
+            .expect("MemStore never fails a read");
+        for (position, name) in [(0, "implement"), (1, "review")] {
+            let row = feature
+                .iter()
+                .find(|row| row.name == name)
+                .expect("the feature graph has the phase");
+            store
+                .create_phase(&StepGraphPhase {
+                    id: PhaseId::new(),
+                    graph_id: library.id,
+                    position,
+                    ..row.clone()
+                })
+                .await
+                .expect("the phase lands");
+        }
+        let kind = store
+            .item_kinds(ids::PROJECT_HTUI)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .find(|kind| kind.id == ids::KIND_HTUI_FEAT)
+            .expect("the fixture's FEAT kind");
+        let outcome = store
+            .update_item_kind(
+                kind.id,
+                kind.updated_at,
+                htui_core::model::ItemKindPatch {
+                    default_graph_id: Some(library.id),
+                    ..htui_core::model::ItemKindPatch::default()
+                },
+            )
+            .await
+            .expect("a kind takes a library graph (D12)");
+        assert!(matches!(outcome, CasOutcome::Applied(_)), "{outcome:?}");
+        library.id
+    }
+
+    /// MOD-138 D12: an item whose kind defaults to a library graph runs it, frozen with the
+    /// library scope, and its templates resolve in the **item's** project: `htui`'s own newer
+    /// `review` template is the one pinned.
+    #[tokio::test]
+    async fn an_items_run_resolves_a_library_graph_with_the_projects_templates() {
+        let store = store_with(|data| {
+            let latest = data
+                .templates
+                .iter()
+                .filter(|row| row.project_id == ids::PROJECT_HTUI && row.name == "review")
+                .max_by_key(|row| row.version)
+                .cloned()
+                .expect("the fixture seeds a `review` template");
+            data.templates.push(PromptTemplate {
+                id: PromptTemplateId::new(),
+                version: latest.version + 1,
+                ..latest
+            });
+        });
+        let library = feat_on_a_library_graph(&store).await;
+        let newest = store
+            .prompt_template(ids::PROJECT_HTUI, "review", None)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("htui's review template")
+            .version;
+
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("a library graph resolves")
+            .snapshot;
+
+        assert_eq!(snapshot.graph.id, library);
+        assert_eq!(snapshot.graph.scope, Some(GraphScope::Library));
+        assert_eq!(
+            snapshot.source,
+            Some(SnapshotSource {
+                how: SourceHow::KindDefault
+            })
+        );
+        assert_eq!(
+            snapshot
+                .phases
+                .iter()
+                .map(|phase| phase.name.as_str())
+                .collect::<Vec<_>>(),
+            ["implement", "review"]
+        );
+        assert_eq!(
+            snapshot.phases[1].template,
+            SnapshotTemplate {
+                name: "review".to_owned(),
+                version: newest,
+            },
+            "the template is the item's project's latest"
+        );
+        assert_eq!(
+            snapshot.edges,
+            default_snapshot_edges(&snapshot.phases),
+            "built row by row, the library graph is default-edged"
+        );
+    }
+
+    /// MOD-138 D12: overriding an item whose graph is a library graph clones it into the item's
+    /// project, edges copied; a re-override re-clones from the library graph (the kind default).
+    #[tokio::test]
+    async fn an_override_of_a_library_graph_clones_into_the_project() {
+        let store = MemStore::demo();
+        let library = feat_on_a_library_graph(&store).await;
+        let source = TestSource::claude(&store);
+        let library_phases = store
+            .phases(library)
+            .await
+            .expect("MemStore never fails a read");
+        let library_edges = store
+            .graph_edges(library)
+            .await
+            .expect("MemStore never fails a read");
+        assert!(!library_edges.is_empty(), "the library graph has edges");
+
+        let clone = override_graph(&store, &source, &feat_1(&store).await)
+            .await
+            .expect("the item takes an override of the library graph");
+        assert_eq!(clone.scope, GraphScope::Project(ids::PROJECT_HTUI));
+        assert!(clone.is_override);
+        let phases = store
+            .phases(clone.id)
+            .await
+            .expect("MemStore never fails a read");
+        let edges = store
+            .graph_edges(clone.id)
+            .await
+            .expect("MemStore never fails a read");
+        assert_eq!(
+            named_edges(&phases, &edges),
+            named_edges(&library_phases, &library_edges),
+            "the library graph's edges, remapped onto the clone"
+        );
+        assert_edges_are_the_clones(&store, clone.id, &library_edges).await;
+
+        let pointed = feat_1(&store).await;
+        assert_eq!(pointed.step_graph_id, Some(clone.id));
+        let again = override_graph(&store, &source, &pointed)
+            .await
+            .expect("a second override re-clones");
+        assert_eq!(again.id, clone.id, "the same override graph");
+        assert_eq!(again.scope, GraphScope::Project(ids::PROJECT_HTUI));
+        let recloned = store
+            .phases(again.id)
+            .await
+            .expect("MemStore never fails a read");
+        assert_eq!(
+            recloned.iter().map(|row| &row.name).collect::<Vec<_>>(),
+            library_phases
+                .iter()
+                .map(|row| &row.name)
+                .collect::<Vec<_>>(),
+            "re-cloned from the library graph, the kind's default"
+        );
+        assert!(
+            recloned
+                .iter()
+                .all(|row| !phases.iter().any(|first| first.id == row.id)),
+            "with fresh phase ids"
+        );
+        let graph = store
+            .graph_body(library)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the library graph is untouched");
+        assert_eq!(graph.graph.scope, GraphScope::Library);
     }
 
     /// `feature`'s `phase` with `fan_out` set, and `htui`'s settings naming `agy` as the judge.

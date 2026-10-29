@@ -218,8 +218,9 @@ pub struct ItemKindPatch {
 
 /// Who owns a `step_graph` row (MOD-137 D3): a project, a workspace, or neither — the global
 /// workflow library. `ck_step_graph_owner` keeps at most one of the two columns set. Who may *use*
-/// a non-project graph is MOD-138's (plan D4): today a kind or item still names only its own
-/// project's graphs.
+/// a graph is MOD-138 D12's rule ([`graph_usable_by`](crate::store::graph_rules::graph_usable_by)):
+/// a kind or item names its project's graph, one of a workspace holding its project, or a library
+/// graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "owner", content = "id", rename_all = "snake_case")]
 pub enum GraphScope {

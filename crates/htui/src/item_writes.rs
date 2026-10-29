@@ -73,7 +73,8 @@ pub struct ItemFormContext {
     pub project: ProjectId,
     /// `item_kinds(project)`, store order (position, then prefix).
     pub kinds: Vec<ItemKind>,
-    /// `step_graphs(project)` minus `is_override` (A3).
+    /// `usable_graphs(project)` minus `is_override` (A3, MOD-138 D12): the project's graphs,
+    /// then each workspace's that holds it, then the library's.
     pub graphs: Vec<StepGraph>,
     /// `repos(project)`, name and `is_primary` included.
     pub repos: Vec<Repo>,
@@ -314,11 +315,12 @@ async fn existing(writer: &Writer, id: ItemId) -> Result<Item> {
     })
 }
 
-/// One project's catalogue, with no item: kinds, non-override graphs (A3), repos.
+/// One project's catalogue, with no item: kinds, the non-override graphs it may use (A3, MOD-138
+/// D12), repos.
 async fn catalogue(writer: &Writer, project: ProjectId) -> Result<ItemFormContext> {
     let kinds = writer.item_kinds(project).await?;
     let graphs = writer
-        .step_graphs(project)
+        .usable_graphs(project)
         .await?
         .into_iter()
         .filter(|graph| !graph.is_override)
@@ -343,8 +345,8 @@ mod tests {
     use htui_core::fixtures::ids;
     use htui_core::model::item_spec::NOTHING_TO_SAVE;
     use htui_core::model::{
-        EditReason, Item, ItemId, ItemPatch, ItemRevision, ItemSpec, NewRepo, NewStepGraph,
-        ProjectId, RepoId, SpecChanges, StepGraphId,
+        EditReason, GraphScope, Item, ItemId, ItemPatch, ItemRevision, ItemSpec, NewRepo,
+        NewStepGraph, ProjectId, RepoId, SpecChanges, StepGraphId,
     };
     use htui_core::store::{MemStore, ReadStore as _, StoreError, UpdateOutcome, WriteStore as _};
     use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE};
@@ -508,7 +510,7 @@ mod tests {
         let clone = store
             .create_step_graph(NewStepGraph {
                 id: StepGraphId::new(),
-                scope: htui_core::model::GraphScope::Project(ids::PROJECT_HTUI),
+                scope: GraphScope::Project(ids::PROJECT_HTUI),
                 name: "ANA-2 override".to_owned(),
                 description: String::new(),
                 is_override: true,
@@ -527,6 +529,70 @@ mod tests {
                 .any(|graph| graph.id == ids::GRAPH_HTUI_FEAT),
             "the project's own graphs stay"
         );
+    }
+
+    /// MOD-138 D12: the form offers every graph the project may use, its own first, then a
+    /// workspace's that holds it, then the library's; a mint naming the library graph lands.
+    #[tokio::test]
+    async fn the_form_offers_library_and_workspace_graphs() {
+        let (store, backend) = demo();
+        let shared = |scope, name: &str| NewStepGraph {
+            id: StepGraphId::new(),
+            scope,
+            name: name.to_owned(),
+            description: String::new(),
+            is_override: false,
+        };
+        let library = store
+            .create_step_graph(shared(GraphScope::Library, "libflow"))
+            .await
+            .expect("create a library graph");
+        let workspace = store
+            .create_step_graph(shared(
+                GraphScope::Workspace(ids::WORKSPACE_PLATFORM),
+                "wsflow",
+            ))
+            .await
+            .expect("create a workspace graph");
+        let elsewhere = store
+            .create_step_graph(shared(
+                GraphScope::Workspace(ids::WORKSPACE_GRAPHICS),
+                "otherws",
+            ))
+            .await
+            .expect("create another workspace's graph");
+
+        let context = form(&backend, ids::PROJECT_HTUI, None).await;
+
+        let mut expected: Vec<StepGraphId> = store
+            .step_graphs(ids::PROJECT_HTUI)
+            .await
+            .expect("graphs")
+            .iter()
+            .filter(|graph| !graph.is_override)
+            .map(|graph| graph.id)
+            .collect();
+        expected.extend([workspace.id, library.id]);
+        assert_eq!(
+            context.graphs.iter().map(|g| g.id).collect::<Vec<_>>(),
+            expected,
+            "the project's graphs, then the workspace's, then the library's"
+        );
+        assert!(context.graphs.iter().all(|g| g.id != elsewhere.id));
+
+        let answer = serve(
+            &backend,
+            &mint(ItemSpec {
+                step_graph_id: Some(library.id),
+                ..spec("On the library graph")
+            }),
+        )
+        .await
+        .expect("the mint applies");
+        let StoreReply::ItemWritten { item, .. } = answer else {
+            panic!("a mint answers ItemWritten, not {answer:?}")
+        };
+        assert_eq!(row(&store, item).await.step_graph_id, Some(library.id));
     }
 
     /// D3: an edit form carries the item fresh; its version is the token.
@@ -742,7 +808,7 @@ mod tests {
         let graph = store
             .create_step_graph(NewStepGraph {
                 id: StepGraphId::new(),
-                scope: htui_core::model::GraphScope::Project(ids::PROJECT_HTUI),
+                scope: GraphScope::Project(ids::PROJECT_HTUI),
                 name: "after the form".to_owned(),
                 description: String::new(),
                 is_override: false,
