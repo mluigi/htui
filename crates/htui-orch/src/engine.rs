@@ -547,19 +547,24 @@ where
 pub enum Resume {
     /// The snapshot was walked: a v2 run whose snapshot recomputes to its own `topology`
     /// (MOD-138 D5), or a v1 run whose live graph still hashes to the lifted snapshot's v2
-    /// digest. A v1 run whose live graph no longer resolves under a start-time rule (a fan-out or
-    /// agent cap, a review or local fan-out, no candidate) was not compared at all: the item's
-    /// `live graph not comparable` note says which rule refused it.
+    /// digest, or whose live graph M1 refuses (D6, D9) but whose live phases still hash to the
+    /// run's own v1 phase-only digest (blueprint A6). A v1 run whose live graph no longer
+    /// resolves under a start-time rule (a fan-out or agent cap, a review or local fan-out, no
+    /// candidate) was not compared at all: the item's `live graph not comparable` note says
+    /// which rule refused it.
     Walked(Rest),
     /// A v1 run's live graph moved (MOD-138 D5). **Nothing was advanced**: invariant 2 says a run
     /// walks its snapshot, and §4.9's resume says a mismatch is a human's decision, not the
     /// engine's.
     TopologyChanged {
         /// The lifted snapshot's v2 digest ([`graph::topology_v2`] over its phases and its
-        /// lifted edges), the graph this run walks.
+        /// lifted edges), the graph this run walks. When M1 refuses the live graph (D6, D9) once
+        /// its phases are built, the run's v1 phase-only digest ([`graph::topology`]) instead
+        /// (blueprint A6).
         snapshot: String,
-        /// The live graph's v2 digest, or `not runnable: <refusal>` when M1 refuses the live
-        /// graph (MOD-138 D6, D9): its topology did change.
+        /// The live graph's v2 digest; when M1 refuses the live graph once its phases are built,
+        /// the live phases' v1 digest (A6); when it refuses it before (D9's validator, with a
+        /// phase that then fails to build), `not runnable: <refusal>`.
         live: String,
         /// Where the run is, unchanged.
         rest: Rest,
@@ -574,6 +579,25 @@ pub enum Resume {
         /// Where the run is, unchanged.
         rest: Rest,
     },
+}
+
+/// MOD-138 blueprint A6: the v1 phase-only digest ([`graph::topology`]) of `phases` as a
+/// pre-MOD-138 binary froze them, without D1's four node fields (`role`, `palette`, `plan_scope`,
+/// `divide`), which it never recorded. So a v1 run frozen on a phase since marked palette, or
+/// given a plan scope, still hashes to the live graph's phases. A v1 snapshot's own phases carry
+/// those fields at their defaults already, so its digest is the one it stored.
+fn v1_topology(phases: &[SnapshotPhase]) -> Result<String, ResolveError> {
+    let phases: Vec<SnapshotPhase> = phases
+        .iter()
+        .map(|phase| SnapshotPhase {
+            role: htui_core::model::NodeRole::default(),
+            palette: false,
+            plan_scope: None,
+            divide: None,
+            ..phase.clone()
+        })
+        .collect();
+    graph::topology(&phases)
 }
 
 /// One run [`Engine::sweep`] adopted, and what it left the run owing (plan D98, D117).
@@ -3183,8 +3207,11 @@ where
     /// MOD-138 D5 splits on the snapshot's `v`. A **v2** run is pinned: its digest is recomputed
     /// from its own phases and edges ([`graph::topology_v2`]) and the live graph is never read.
     /// A **v1** run (lifted by [`Self::snapshot_of`]) keeps the live compare, edge-aware: the
-    /// live graph's v2 digest against the lifted snapshot's. A live graph M1 refuses as not yet
-    /// runnable or invalid (D6, D9) is a mismatch, since its topology did change.
+    /// live graph's v2 digest against the lifted snapshot's. Blueprint A6: a live graph M1
+    /// refuses as not yet runnable or invalid (D6, D9) is compared as before MOD-138, on the v1
+    /// phase-only digest of its live phases against the run's own ([`v1_topology`]), since a v1
+    /// run always walked by position: equal walks on, different parks with the topology note. A
+    /// refusal raised before any phase could be built has nothing to compare, and is a mismatch.
     async fn resume_window(&self, run: RunId) -> Result<Option<Resume>, EngineError> {
         let row = self.run(run).await?;
         let snapshot = Self::snapshot_of(&row)?;
@@ -3210,7 +3237,7 @@ where
 
         // D5 v1: the live compare, edge-aware.
         let lifted = graph::topology_v2(&snapshot.phases, &snapshot.edges)?;
-        let live = match graph::resolve(
+        let (walks, live) = match Box::pin(graph::resolve_or_refused(
             self.parts.store,
             self.parts.graphs,
             &item,
@@ -3218,16 +3245,19 @@ where
             &self.parts.app,
             Some(&row.repo_scope),
             self.parts.box_id,
-        )
+        ))
         .await
         {
-            Ok(live) => live.snapshot.topology,
-            // D5: a live graph M1 refuses did change its topology; it is compared, and differs.
+            Ok(graph::Resolution::Resolved(live)) => (lifted.clone(), live.snapshot.topology),
+            // Blueprint A6: a live graph M1 refuses (D6, D9) is compared on the v1 phase-only
+            // digest, as before MOD-138; its edges never moved a v1 walk.
+            Ok(graph::Resolution::Refused { phases, .. }) => {
+                (v1_topology(&snapshot.phases)?, v1_topology(&phases)?)
+            }
+            // A6: refused before a phase could be built, so nothing compares; it did change.
             Err(
                 err @ (ResolveError::NotYetRunnable { .. } | ResolveError::InvalidGraph { .. }),
-            ) => {
-                format!("not runnable: {err}")
-            }
+            ) => (lifted.clone(), format!("not runnable: {err}")),
             Err(err @ ResolveError::ProjectCaps { .. }) => {
                 // A malformed cap would otherwise add an item note on every resume; the run keeps
                 // walking its snapshot, and the cause is logged instead.
@@ -3257,14 +3287,14 @@ where
             Err(err) => return Err(err.into()),
         };
 
-        if live != lifted {
+        if live != walks {
             let body = format!(
-                "topology mismatch: run {run} walks `{lifted}`, the live graph is `{live}`; \
+                "topology mismatch: run {run} walks `{walks}`, the live graph is `{live}`; \
                  the walk is not advanced (ANA-2 §4.9, invariant 2)"
             );
             let rest = Box::pin(self.park_on_resume(row, item.id, body)).await?;
             return Ok(Some(Resume::TopologyChanged {
-                snapshot: lifted,
+                snapshot: walks,
                 live,
                 rest,
             }));
@@ -13169,6 +13199,127 @@ mod tests {
                 .any(|note| note.body.contains("topology mismatch")),
             "{notes:?}"
         );
+    }
+
+    /// Turns `FEAT-3`'s live `prd` phase into a palette phase through `replace_graph`, dropping
+    /// its edges (a palette node has none, MOD-137 rule e): a graph the store takes and M1's
+    /// resolve refuses as not yet runnable (MOD-138 D6(b)).
+    async fn plant_palette_prd(harness: &Harness) {
+        let graph = harness
+            .orch
+            .store
+            .resolve_graph(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("FEAT-3 resolves")
+            .graph
+            .id;
+        let mut body = harness
+            .orch
+            .store
+            .graph_body(graph)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("FEAT-3's graph is there");
+        let prd = body
+            .nodes
+            .iter()
+            .find(|node| node.phase.name == "prd")
+            .map(|node| node.phase.id)
+            .expect("the graph has a `prd` phase");
+        for node in &mut body.nodes {
+            if node.phase.id == prd {
+                node.phase.palette = true;
+            }
+        }
+        body.edges.retain(|edge| edge.from != prd && edge.to != prd);
+        let revision = body.graph.revision;
+        let outcome = harness
+            .orch
+            .store
+            .replace_graph(graph, revision, body)
+            .await
+            .expect("the store takes a palette node with no edges");
+        assert!(matches!(outcome, CasOutcome::Applied(_)), "{outcome:?}");
+    }
+
+    /// MOD-138 blueprint A6: a v1 run frozen before the upgrade on a graph that already had a
+    /// palette phase. A pre-MOD-138 snapshot never recorded `palette`, so the run's phases are
+    /// the live ones without it; the live graph M1 refuses (D6(b)) is compared on the v1
+    /// phase-only digest, which matches, and the run walks on twice with no topology note.
+    #[tokio::test]
+    async fn a_v1_run_on_a_graph_that_already_had_a_palette_phase_walks_on() {
+        let harness = Harness::new().await;
+        let (run, prd) = started(&harness).await;
+        crate::fake::rewrite_as_v1(&harness.orch.store, run).await;
+        plant_palette_prd(&harness).await;
+
+        let resumed = harness.resume(run).await.expect("the run is readable");
+        assert!(
+            matches!(
+                resumed,
+                Resume::Walked(crate::command::Rest {
+                    run: RunStatus::AwaitingApproval,
+                    position: Some(0),
+                    ..
+                })
+            ),
+            "a v1 run is not stranded by a palette phase it always walked by position: \
+             {resumed:?}"
+        );
+        harness
+            .dispatch(Command::AnswerGate {
+                run,
+                step: prd,
+                answer: GateAnswer::Approved,
+            })
+            .await
+            .expect("the artefact is there");
+        let resumed = harness.resume(run).await.expect("the run is readable");
+        assert!(
+            matches!(
+                resumed,
+                Resume::Walked(crate::command::Rest {
+                    run: RunStatus::AwaitingApproval,
+                    position: Some(1),
+                    ..
+                })
+            ),
+            "the v1 run walked its snapshot to `plan`'s gate: {resumed:?}"
+        );
+        let notes = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read");
+        assert!(
+            !notes.iter().any(|note| {
+                note.body.contains("topology mismatch")
+                    || note.body.contains("live graph not comparable")
+            }),
+            "{notes:?}"
+        );
+    }
+
+    /// MOD-138 blueprint A6, the other half: the same refused live graph with a phase field
+    /// edited too parks, and both digests are v1 phase-only ones.
+    #[tokio::test]
+    async fn a_v1_run_on_a_palette_graph_whose_phases_moved_parks() {
+        let harness = Harness::new().await;
+        let (run, _) = started(&harness).await;
+        crate::fake::rewrite_as_v1(&harness.orch.store, run).await;
+        let stored = snapshot_of(&harness, run).await.topology;
+        plant_palette_prd(&harness).await;
+        move_prd_input_kinds(&harness).await;
+
+        let resumed = harness.resume(run).await.expect("the run is readable");
+        let Resume::TopologyChanged { snapshot, live, .. } = resumed else {
+            panic!("the live phases moved: {resumed:?}");
+        };
+        assert_eq!(snapshot, stored, "the run's own v1 digest");
+        assert!(live.starts_with("sha256:"), "{live}");
+        assert_ne!(snapshot, live);
     }
 
     /// MOD-26 I-4 at stage 3 (B-4): a snapshot whose phase names a persona it does not carry is

@@ -361,6 +361,54 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
     requested_scope: Option<&[RepoId]>,
     box_id: BoxId,
 ) -> std::result::Result<Resolved, ResolveError> {
+    match Box::pin(resolve_or_refused(
+        store,
+        source,
+        item,
+        mode,
+        app,
+        requested_scope,
+        box_id,
+    ))
+    .await?
+    {
+        Resolution::Resolved(resolved) => Ok(*resolved),
+        Resolution::Refused { refusal, .. } => Err(refusal),
+    }
+}
+
+/// What [`resolve_or_refused`] found (MOD-138 blueprint A6).
+pub(crate) enum Resolution {
+    /// The graph resolved: what [`resolve`] returns.
+    Resolved(Box<Resolved>),
+    /// A D6 or D9 refusal raised once the phases were built: a [`ResolveError::NotYetRunnable`]
+    /// or a [`ResolveError::InvalidGraph`]. `phases` are the live phases in position order,
+    /// before any `divide` expansion (MOD-138 D11), which is the shape a v1 run is compared on.
+    Refused {
+        /// The live phases, as built.
+        phases: Vec<SnapshotPhase>,
+        /// The refusal [`resolve`] raises.
+        refusal: ResolveError,
+    },
+}
+
+/// [`resolve`], with its D6 and D9 refusals (blueprint A6) handed back beside the live phases
+/// built before them, so a v1 run's resume can compare those phases on the v1 digest. Every other
+/// error is [`resolve`]'s, in its order. The shared validator's refusal of the stored body comes
+/// before the phases are built, so it is held while they are; a phase that then fails to build
+/// raises the validator's refusal, as [`resolve`] always has, with no phases to compare.
+///
+/// # Errors
+/// As [`resolve`], less the refusals carried by [`Resolution::Refused`].
+pub(crate) async fn resolve_or_refused<S: htui_core::store::WorkerStore, G: GraphSource>(
+    store: &S,
+    source: &G,
+    item: &Item,
+    mode: RunMode,
+    app: &BTreeMap<String, Value>,
+    requested_scope: Option<&[RepoId]>,
+    box_id: BoxId,
+) -> std::result::Result<Resolution, ResolveError> {
     // Boxed: PgStore's read now holds a transaction, and the engine awaits this inside its own
     // futures (MOD-138 blueprint §4, the 2 MiB debug stack).
     let resolved = Box::pin(source.resolve_graph(item.id))
@@ -390,29 +438,43 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
         edges: stored,
     } = resolved;
     // MOD-138 D10, D9: the body the store would hold, judged by the shared validator before a
-    // phase is resolved.
-    live_graph_refusal(&graph, &rows, &stored)?;
+    // phase is resolved. Blueprint A6: its refusal is held until the phases are built.
+    let invalid = match live_graph_refusal(&graph, &rows, &stored) {
+        Ok(()) => None,
+        Err(refusal @ ResolveError::InvalidGraph { .. }) => Some(refusal),
+        Err(err) => return Err(err),
+    };
 
     // `UNIQUE (graph_id, position)` permits gaps, so the snapshot builder is what makes positions
     // dense `0..n-1` (`docs/ANA-2.md:269-272`). Sorting first means a gapped or out-of-order table
     // still yields the graph's own order rather than the store's.
     rows.sort_by_key(|row| row.phase.position);
 
-    let mut phases = Vec::with_capacity(rows.len());
-    // MOD-26 D9 (B-18): each bound persona frozen once, by name and content.
-    let mut personas: Vec<SnapshotPersona> = Vec::new();
-    for (dense, row) in rows.iter().enumerate() {
-        let position = i32::try_from(dense).map_err(|_| {
-            StoreError::Constraint(format!("graph {} has more phases than i32", graph.id))
-        })?;
-        let mut phase = snapshot_phase(
-            source, row, position, project.id, &settings, app, box_id, mode,
-        )
-        .await?;
-        phase.persona = frozen_persona(row, &mut personas)?;
-        phases.push(phase);
+    let built = async {
+        let mut phases = Vec::with_capacity(rows.len());
+        // MOD-26 D9 (B-18): each bound persona frozen once, by name and content.
+        let mut personas: Vec<SnapshotPersona> = Vec::new();
+        for (dense, row) in rows.iter().enumerate() {
+            let position = i32::try_from(dense).map_err(|_| {
+                StoreError::Constraint(format!("graph {} has more phases than i32", graph.id))
+            })?;
+            let mut phase = snapshot_phase(
+                source, row, position, project.id, &settings, app, box_id, mode,
+            )
+            .await?;
+            phase.persona = frozen_persona(row, &mut personas)?;
+            phases.push(phase);
+        }
+        personas.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+        Ok::<_, ResolveError>((phases, personas))
     }
-    personas.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+    .await;
+    let (phases, personas) = match (built, invalid) {
+        (Ok(built), None) => built,
+        (Ok((phases, _)), Some(refusal)) => return Ok(Resolution::Refused { phases, refusal }),
+        // `resolve`'s order: the validator's refusal is raised before any phase's.
+        (Err(_), Some(refusal)) | (Err(refusal), None) => return Err(refusal),
+    };
 
     // MOD-138 D2: the stored edges by node key, in the one snapshot order (F13). Every end names
     // a row of this read: `live_graph_refusal` refused the rest as a graph that moved.
@@ -435,15 +497,33 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
     sort_snapshot_edges(&mut edges, &phases);
 
     // MOD-138 D11, then PRD Q1: the expansion is frozen and the validator checks it, before D6
-    // refuses what this version cannot walk.
-    let (phases, edges) = expand_divide(&graph.name, phases, edges)?;
+    // refuses what this version cannot walk. Each refusal carries the unexpanded phases (A6).
+    let unexpanded = phases.clone();
+    let (phases, edges) = match expand_divide(&graph.name, phases, edges) {
+        Ok(expanded) => expanded,
+        Err(refusal @ ResolveError::InvalidGraph { .. }) => {
+            return Ok(Resolution::Refused {
+                phases: unexpanded,
+                refusal,
+            });
+        }
+        Err(err) => return Err(err),
+    };
     if let Some(reason) = snapshot_walk_refusal(graph.id, &phases, &edges) {
-        return Err(ResolveError::InvalidGraph {
-            graph: graph.name,
-            reason,
+        return Ok(Resolution::Refused {
+            phases: unexpanded,
+            refusal: ResolveError::InvalidGraph {
+                graph: graph.name,
+                reason,
+            },
         });
     }
-    not_yet_runnable(&phases, &rows, &stored)?;
+    if let Err(refusal) = not_yet_runnable(&phases, &rows, &stored) {
+        return Ok(Resolution::Refused {
+            phases: unexpanded,
+            refusal,
+        });
+    }
 
     let settings = SnapshotSettings {
         default_isolation: settings.default_isolation,
@@ -498,10 +578,10 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
         personas,
     };
 
-    Ok(Resolved {
+    Ok(Resolution::Resolved(Box::new(Resolved {
         snapshot,
         repo_scope,
-    })
+    })))
 }
 
 /// MOD-138 D10, D9: the live graph `resolve` read, judged before a phase is resolved.
@@ -4679,6 +4759,56 @@ question and not a test fix. Decide the version bump first, then paste the new d
                 node: "prd".to_owned(),
                 reason: NotRunnable::Palette,
             }
+        );
+    }
+
+    /// MOD-138 blueprint A6: `resolve_or_refused` hands D6's refusal back beside the live phases
+    /// it built first, in position order, which a v1 run's resume compares on its v1 digest.
+    #[tokio::test]
+    async fn a_refusal_carries_the_live_phases() {
+        let store = store_with(|data| {
+            let prd = feature_phase(data, "prd");
+            for phase in &mut data.phases {
+                if phase.id == prd {
+                    phase.palette = true;
+                }
+            }
+            data.edges.retain(|edge| edge.from != prd && edge.to != prd);
+        });
+        let item = feat_1(&store).await;
+        let resolution = super::resolve_or_refused(
+            &store,
+            &TestSource::claude(&store),
+            &item,
+            RunMode::Manual,
+            &BTreeMap::new(),
+            None,
+            ids::BOX,
+        )
+        .await
+        .expect("only D6 refuses the graph");
+        let super::Resolution::Refused { phases, refusal } = resolution else {
+            panic!("a palette node is refused");
+        };
+        assert_eq!(
+            refusal,
+            ResolveError::NotYetRunnable {
+                node: "prd".to_owned(),
+                reason: NotRunnable::Palette,
+            }
+        );
+        let names: Vec<(i32, &str, bool)> = phases
+            .iter()
+            .map(|phase| (phase.position, phase.name.as_str(), phase.palette))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                (0, "prd", true),
+                (1, "plan", false),
+                (2, "implement", false),
+                (3, "review", false),
+            ]
         );
     }
 
