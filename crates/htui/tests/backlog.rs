@@ -400,7 +400,7 @@ async fn c_cites_a_requirement_of_the_item_s_project() {
         "the list cursor stayed:\n{picker}"
     );
     assert!(
-        picker.contains("▸ R-ENT-2 later An item may carry"),
+        picker.contains("\u{258c} R-ENT-2 later An item may carry"),
         "the picker's cursor is on R-ENT-2:\n{picker}"
     );
     assert!(
@@ -415,7 +415,7 @@ async fn c_cites_a_requirement_of_the_item_s_project() {
     let frame = harness.render();
     assert_eq!(harness.app().status, None, "the cite applied");
     assert!(
-        frame.contains("▸ R-ENT-2 addresses v1"),
+        frame.contains("\u{258c} R-ENT-2 addresses v1"),
         "the new citation, under the cursor:\n{frame}"
     );
     assert!(
@@ -429,7 +429,7 @@ async fn c_cites_a_requirement_of_the_item_s_project() {
 async fn u_then_y_uncites() {
     let mut harness = cited_r_ent_2().await;
     assert!(
-        harness.render().contains("▸ R-ENT-2 addresses v1"),
+        harness.render().contains("\u{258c} R-ENT-2 addresses v1"),
         "the new citation is under the cursor"
     );
     harness.key("u");
@@ -1422,7 +1422,7 @@ async fn enter_on_the_graph_root_row_is_consumed_under_the_real_registration() {
     harness.key("m");
     let frame = harness.render();
     assert!(
-        on_item(&frame, "FEAT-1") && frame.contains("▸ FEAT-1 in_progress"),
+        on_item(&frame, "FEAT-1") && frame.contains("\u{258c} FEAT-1 \u{25d0} running"),
         "the Graph, its cursor on the root row:\n{frame}"
     );
     assert_eq!(harness.app().status, None);
@@ -3580,6 +3580,9 @@ async fn with_the_detail_focused_j_scrolls_the_body_and_the_list_stays() {
     );
 }
 
+/// FEAT-1's Body head, its meta line (MOD-115 M4 E4): what says the Body is FEAT-1's.
+const FEAT_1_META: &str = "\u{25d0} running \u{b7} rust \u{b7} priority 2 \u{b7} version 1";
+
 /// MOD-115 M2 D5 (T7): a sub-tab change is a place in the history; Back returns to the sub-tab
 /// left and the item the cursor was on then, and Forward to the one it moved to since.
 #[tokio::test]
@@ -3600,10 +3603,7 @@ async fn back_returns_to_the_sub_tab_and_the_item_left() {
     harness.drive_to_end().await;
     let body = harness.render();
     assert!(on_item(&body, "FEAT-1"), "back on FEAT-1:\n{body}");
-    assert!(
-        body.contains("FEAT-1  FEAT  in_progress"),
-        "on its Body:\n{body}"
-    );
+    assert!(body.contains(FEAT_1_META), "on its Body:\n{body}");
 
     harness.key("alt-right");
     harness.drive_to_end().await;
@@ -3613,7 +3613,7 @@ async fn back_returns_to_the_sub_tab_and_the_item_left() {
         "forward to the item left:\n{forward}"
     );
     assert!(
-        !forward.contains("FEAT-1  FEAT  in_progress"),
+        !forward.contains(FEAT_1_META),
         "and off the Body:\n{forward}"
     );
 }

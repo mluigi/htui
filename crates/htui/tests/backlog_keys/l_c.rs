@@ -85,7 +85,7 @@ async fn ctrl_n_does_not_cycle_the_prompt_template() {
     sub_tab(&mut harness, TO_PROMPT);
     let frame = harness.render();
     assert!(
-        frame.contains("n / p"),
+        frame.contains("8 templates"),
         "the Prompt, its preview landed:\n{frame}"
     );
     assert_eq!(harness.queued(), 0, "nothing in flight");
@@ -179,7 +179,7 @@ pub(super) async fn on_feat_1_reqs(harness: &mut Harness) {
     sub_tab(harness, TO_REQS);
     let frame = harness.render();
     assert!(
-        on_item(&frame, "FEAT-1") && frame.contains("▸ R-STO-1 addresses v1"),
+        on_item(&frame, "FEAT-1") && frame.contains("\u{258c} R-STO-1 addresses v1"),
         "the Reqs on FEAT-1, its citation under the cursor:\n{frame}"
     );
 }
@@ -223,7 +223,7 @@ async fn f1_opens_help_from_the_reqs_picker_and_it_stays() {
     harness.key("j");
     let frame = harness.render();
     assert!(
-        frame.contains("▸ R-ENT-2"),
+        frame.contains("\u{258c} R-ENT-2"),
         "the picker, its cursor on R-ENT-2:\n{frame}"
     );
 
@@ -233,7 +233,7 @@ async fn f1_opens_help_from_the_reqs_picker_and_it_stays() {
     assert!(!harness.app().help_visible, "`F1` closed it");
     let frame = harness.render();
     assert!(
-        frame.contains("▸ R-ENT-2") && frame.contains("Enter pick"),
+        frame.contains("\u{258c} R-ENT-2") && frame.contains("Enter pick"),
         "the picker is still open on R-ENT-2:\n{frame}"
     );
 }
@@ -248,20 +248,20 @@ async fn the_picker_moves_on_j_and_j_capital() {
     harness.drive_to_end().await;
     let frame = harness.render();
     assert!(
-        frame.contains("▸ R-ENT-1"),
+        frame.contains("\u{258c} R-ENT-1"),
         "the picker opens on its first candidate:\n{frame}"
     );
     for (down, up) in [("J", "K"), ("j", "k"), ("down", "up")] {
         harness.key(down);
         let frame = harness.render();
         assert!(
-            frame.contains("▸ R-ENT-2"),
+            frame.contains("\u{258c} R-ENT-2"),
             "`{down}` moved the picker down:\n{frame}"
         );
         harness.key(up);
         let frame = harness.render();
         assert!(
-            frame.contains("▸ R-ENT-1"),
+            frame.contains("\u{258c} R-ENT-1"),
             "`{up}` moved it back:\n{frame}"
         );
     }
@@ -290,7 +290,7 @@ async fn a_rebound_cite_key_opens_the_picker_and_c_is_inert() {
     harness.drive_to_end().await;
     let frame = harness.render();
     assert!(
-        !frame.contains("Enter pick") && !frame.contains("▸ R-ENT-1"),
+        !frame.contains("Enter pick") && !frame.contains("\u{258c} R-ENT-1"),
         "`c` opened nothing:\n{frame}"
     );
     assert_eq!(harness.app().status, None, "and said nothing");
@@ -299,7 +299,7 @@ async fn a_rebound_cite_key_opens_the_picker_and_c_is_inert() {
     harness.drive_to_end().await;
     let frame = harness.render();
     assert!(
-        frame.contains("▸ R-ENT-1") && frame.contains("j/k move · Enter pick · Esc back"),
+        frame.contains("\u{258c} R-ENT-1") && frame.contains("j/k move · Enter pick · Esc back"),
         "`C` opened the picker:\n{frame}"
     );
 }
