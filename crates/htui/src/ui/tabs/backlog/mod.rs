@@ -656,7 +656,12 @@ impl Tab for BacklogTab {
             list::render(frame, list_area, &view, chrome, ctx.theme);
         }
         if let (Some(form), Some(at)) = (&self.form, form_area) {
-            filter::render(frame, at, form, ctx.theme);
+            let chrome = Chrome {
+                focus: ctx.pane_focus(PaneId::List),
+                accent: ctx.accent(),
+                hints: None,
+            };
+            filter::render(frame, at, form, chrome, ctx.theme);
         }
         match &self.item_form {
             Some(form) => {
