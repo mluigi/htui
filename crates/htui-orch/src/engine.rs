@@ -13011,6 +13011,166 @@ mod tests {
         ));
     }
 
+    /// MOD-138 D5, the v2 twin of `a_topology_mismatch_parks_on_resume`: a v2 run is pinned, so
+    /// the same live edit is never read. `resume` walks, and no `topology mismatch` note is
+    /// written.
+    #[tokio::test]
+    async fn a_v2_run_on_a_moved_graph_walks_on() {
+        let harness = Harness::new().await;
+        let (run, _) = started(&harness).await;
+        assert_eq!(snapshot_of(&harness, run).await.v, GraphSnapshot::V);
+        move_prd_input_kinds(&harness).await;
+
+        let resumed = harness.resume(run).await.expect("the run is readable");
+        assert!(matches!(resumed, Resume::Walked(_)), "{resumed:?}");
+        let notes = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read");
+        assert!(
+            !notes
+                .iter()
+                .any(|note| note.body.contains("topology mismatch")),
+            "{notes:?}"
+        );
+    }
+
+    /// MOD-138 D5, the v2 twin of `rebinding_a_phase_persona_parks_a_resumed_run`'s first half:
+    /// a phase's persona rebound under a v2 run does not reach it, and it walks on.
+    #[tokio::test]
+    async fn rebinding_a_phase_persona_under_a_v2_run_walks_on() {
+        let harness = Harness::new().await;
+        bind_persona(
+            &harness.orch,
+            ids::HTUI_FEAT_3,
+            "plan",
+            ids::PERSONA_REVIEWER,
+        )
+        .await;
+        let (run, _) = started(&harness).await;
+        bind_persona(
+            &harness.orch,
+            ids::HTUI_FEAT_3,
+            "plan",
+            ids::PERSONA_ARCHITECT,
+        )
+        .await;
+        let resumed = harness.resume(run).await.expect("the run is readable");
+        assert!(
+            matches!(resumed, Resume::Walked(_)),
+            "a v2 run walks its own snapshot: {resumed:?}"
+        );
+        assert_eq!(
+            snapshot_of(&harness, run).await.phases[1]
+                .persona
+                .as_deref(),
+            Some("reviewer"),
+            "the frozen binding is the one the run walks"
+        );
+    }
+
+    /// MOD-138 D5, the v2 twin of `resume_walks_a_run_whose_touched_paths_name_an_unknown_repo`:
+    /// a v2 run never resolves the live graph, so the start-time rule is not met at all and no
+    /// `live graph not comparable` note is written.
+    #[tokio::test]
+    async fn a_v2_run_whose_touched_paths_name_an_unknown_repo_walks_without_a_note() {
+        let harness = Harness::new().await;
+        let (run, _) = started(&harness).await;
+        let item = harness.orch.item(ids::HTUI_FEAT_3).await;
+        harness
+            .orch
+            .store
+            .update_item(
+                item.id,
+                item.version,
+                ItemPatch {
+                    touched_paths: Some(vec!["web:src/**".to_owned()]),
+                    author_id: item.created_by,
+                    reason: "a qualifier no repo carries".to_owned(),
+                    ..ItemPatch::default()
+                },
+            )
+            .await
+            .expect("the item's version is current");
+
+        let resumed = harness.resume(run).await.expect("the run walks");
+        assert!(matches!(resumed, Resume::Walked(_)), "{resumed:?}");
+        let notes = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read");
+        assert!(
+            !notes
+                .iter()
+                .any(|note| note.body.contains("live graph not comparable")),
+            "{notes:?}"
+        );
+    }
+
+    /// MOD-138 D4, D5 (plan risk row 1): an unedited v1 run's lifted snapshot hashes to the live
+    /// graph's v2 digest, so it resumes `Walked`, is driven through its next gate, and resumes
+    /// `Walked` again, with no topology note anywhere.
+    #[tokio::test]
+    async fn a_v1_run_on_an_unchanged_graph_walks() {
+        let harness = Harness::new().await;
+        let (run, prd) = started(&harness).await;
+        crate::fake::rewrite_as_v1(&harness.orch.store, run).await;
+        let lifted = crate::command::snapshot_of(&harness.orch.run(run).await)
+            .expect("a v1 snapshot decodes, lifted");
+        assert_eq!(lifted.v, GraphSnapshot::V1);
+        assert!(!lifted.edges.is_empty(), "the lift gave it default edges");
+
+        let resumed = harness.resume(run).await.expect("the run is readable");
+        assert!(
+            matches!(
+                resumed,
+                Resume::Walked(crate::command::Rest {
+                    run: RunStatus::AwaitingApproval,
+                    position: Some(0),
+                    ..
+                })
+            ),
+            "{resumed:?}"
+        );
+        harness
+            .dispatch(Command::AnswerGate {
+                run,
+                step: prd,
+                answer: GateAnswer::Approved,
+            })
+            .await
+            .expect("the artefact is there");
+        let resumed = harness.resume(run).await.expect("the run is readable");
+        assert!(
+            matches!(
+                resumed,
+                Resume::Walked(crate::command::Rest {
+                    run: RunStatus::AwaitingApproval,
+                    position: Some(1),
+                    ..
+                })
+            ),
+            "the v1 run walked its snapshot to `plan`'s gate: {resumed:?}"
+        );
+        assert_eq!(snapshot_of(&harness, run).await.v, GraphSnapshot::V1);
+        let notes = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read");
+        assert!(
+            !notes
+                .iter()
+                .any(|note| note.body.contains("topology mismatch")),
+            "{notes:?}"
+        );
+    }
+
     /// MOD-26 I-4 at stage 3 (B-4): a snapshot whose phase names a persona it does not carry is
     /// `StageThree::NoPersona` carrying the typed refusal, whose `Display` is milestone 1's
     /// sentence byte for byte (MOD-26 M2 D16, B-15), never a prompt.
