@@ -5,19 +5,20 @@
 //! case moves there first (the `tests/reveal.rs` walk). The agent runtime is installed because a
 //! Backlog selection sends a `PromptPreview`, which `settle` would answer `Failed` onto the status
 //! line. Expected hit lines are computed from the fake index, never hard-coded: the prefix of
-//! `format_hit(hit)` that fits the box's 92 hit cells, in the order the index ranks them.
+//! the overlay's own row (`hit_row`, MOD-115 M4 D-19) that fits the box's hit cells, in the
+//! order the index ranks them.
 #![cfg(feature = "testkit")]
 
 use std::sync::Arc;
 
 use htui::agent_worker::AgentRuntime;
 use htui::app::register_all;
-use htui::concepts::{self, format_hit, report_line};
+use htui::concepts;
 use htui::concepts_worker::{ConceptsRuntime, MemIndex, NOT_AVAILABLE};
 use htui::store_worker::{self, StoreReply, StoreRequest};
 use htui::testkit::Harness;
 use htui::ui::overlay::ConceptsSearch;
-use htui::ui::overlay::concepts_search::{CHANGED, IDLE, INDEXING, LOADING};
+use htui::ui::overlay::concepts_search::{INDEXING, LOADING, changed, hit_row, idle, index_report};
 use htui::ui::tabs::{BacklogTab, ChatTab, RequirementsTab};
 use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::ids;
@@ -28,11 +29,13 @@ use htui_store::vector::{Hit, PointType};
 use unicode_segmentation::UnicodeSegmentation as _;
 use unicode_width::UnicodeWidthStr as _;
 
-/// Cells a hit line gets: the 94-cell inside of the box on a 100-column frame, less the cursor.
-const HIT_CELLS: usize = 92;
+/// Cells a hit line's text keeps on a 100-column frame: the box's 93-cell content less the
+/// list's gutter is 92, and a longer row ends in an ellipsis after its 91st.
+const HIT_CELLS: usize = 91;
 
-/// The inside of the box on a 100-column frame.
-const INNER_CELLS: usize = 94;
+/// Cells a one-row line keeps on a 100-column frame: the 93-cell content, a longer line ending in
+/// an ellipsis after its 92nd.
+const INNER_CELLS: usize = 92;
 
 /// A query whose hits are an item, a requirement and document sections of Platform's `htui`.
 const MIXED: &str = "postgres store cache";
@@ -141,6 +144,11 @@ fn clip(text: &str, cells: usize) -> String {
     out
 }
 
+/// The best score among `hits`: what each hit's score word is relative to.
+fn best(hits: &[Hit]) -> f32 {
+    hits.iter().map(|hit| hit.score).fold(0.0, f32::max)
+}
+
 /// Whether the search overlay is the top one.
 fn search_is_open(harness: &mut Harness) -> bool {
     harness.app().overlays.top().map(|top| top.id()) == Some(ConceptsSearch::ID)
@@ -196,7 +204,7 @@ async fn typed_letters_and_digits_are_query_text() {
 }
 
 #[tokio::test]
-async fn enter_searches_and_lists_hits_as_the_cli_prints_them() {
+async fn enter_searches_and_lists_hits_in_rank_order() {
     let index = seeded().await;
     let mut harness = open(Some(Arc::clone(&index))).await;
     search(&mut harness, MIXED).await;
@@ -208,14 +216,27 @@ async fn enter_searches_and_lists_hits_as_the_cli_prints_them() {
     }
     let frame = harness.render();
     let mut rest = frame.as_str();
+    let best = best(&hits);
     for hit in &hits {
-        let line = clip(&format_hit(hit), HIT_CELLS);
+        let line = clip(&hit_row(hit, best), HIT_CELLS);
         let at = rest
             .find(&line)
             .unwrap_or_else(|| panic!("`{line}` is not in the frame, in order:\n{frame}"));
         rest = &rest[at + line.len()..];
     }
     insta::assert_snapshot!("hits", frame);
+
+    // MOD-115 M4 E6: at 80 columns every hit is still listed, cut at the box's edge.
+    harness.resize(80, 30);
+    let frame = harness.render();
+    for hit in &hits {
+        assert!(
+            frame.contains(&clip(&hit_row(hit, best), 40)),
+            "{}: {frame}",
+            hit.key
+        );
+    }
+    insta::assert_snapshot!("hits_80", frame);
 }
 
 #[tokio::test]
@@ -288,7 +309,8 @@ async fn ctrl_d_and_ctrl_p_change_the_header_and_mark_the_list_stale() {
         frame.contains("scope all projects · decisions off"),
         "{frame}"
     );
-    assert!(!frame.contains(CHANGED), "{frame}");
+    let stale = changed(Some("Enter"));
+    assert!(!frame.contains(&stale), "{frame}");
 
     harness.key("ctrl-d");
     let frame = harness.render();
@@ -296,12 +318,12 @@ async fn ctrl_d_and_ctrl_p_change_the_header_and_mark_the_list_stale() {
         frame.contains("scope all projects · decisions on"),
         "{frame}"
     );
-    assert!(frame.contains(CHANGED), "{frame}");
+    assert!(frame.contains(&stale), "{frame}");
 
     harness.key("ctrl-p");
     let frame = harness.render();
     assert!(frame.contains("scope htui · decisions on"), "{frame}");
-    assert!(frame.contains(CHANGED), "{frame}");
+    assert!(frame.contains(&stale), "{frame}");
 }
 
 #[tokio::test]
@@ -320,9 +342,10 @@ async fn decisions_in_one_project_list_only_closed_items() {
     assert!(hits.iter().all(|hit| hit.resolution.is_some()), "{hits:?}");
     let frame = harness.render();
     assert!(frame.contains("scope htui · decisions on"), "{frame}");
+    let best = best(&hits);
     for hit in &hits {
         assert!(
-            frame.contains(&clip(&format_hit(hit), HIT_CELLS)),
+            frame.contains(&clip(&hit_row(hit, best), HIT_CELLS)),
             "{frame}"
         );
     }
@@ -356,7 +379,7 @@ async fn ctrl_r_reindexes_and_prints_the_report_line() {
     let frame = harness.render();
     // The line is wider than the box, which clips it like every other row.
     assert!(
-        frame.contains(&clip(&report_line(&report), INNER_CELLS)),
+        frame.contains(&clip(&index_report(&report), INNER_CELLS)),
         "{frame}"
     );
     assert_eq!(harness.app().status, None);
@@ -387,9 +410,9 @@ async fn a_reply_to_a_closed_search_is_not_shown_by_a_reopened_one() {
     let report = MemIndex::new().seed(&backend, &scope).await;
     let frame = harness.render();
     assert!(search_is_open(&mut harness));
-    assert!(frame.contains(IDLE), "{frame}");
+    assert!(frame.contains(&idle(Some("Enter"))), "{frame}");
     assert!(
-        !frame.contains(&clip(&report_line(&report), INNER_CELLS)),
+        !frame.contains(&clip(&index_report(&report), INNER_CELLS)),
         "the closed box's index report reached the reopened one:\n{frame}"
     );
     assert!(!frame.contains(INDEXING), "{frame}");
@@ -415,7 +438,7 @@ async fn the_empty_box() {
     let mut harness = open(Some(seeded().await)).await;
     harness.key("ctrl-f");
     let frame = harness.render();
-    assert!(frame.contains(IDLE), "{frame}");
+    assert!(frame.contains(&idle(Some("Enter"))), "{frame}");
     insta::assert_snapshot!("empty", frame);
 }
 
@@ -472,7 +495,7 @@ async fn a_rebound_reindex_acts_and_the_old_chord_is_inert() {
 
     let (backend, scope) = platform_scope().await;
     let report = clip(
-        &report_line(&MemIndex::new().seed(&backend, &scope).await),
+        &index_report(&MemIndex::new().seed(&backend, &scope).await),
         INNER_CELLS,
     );
 

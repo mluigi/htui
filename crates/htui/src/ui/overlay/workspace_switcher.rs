@@ -6,31 +6,30 @@
 //! handle and no channel: data arrives through `on_reply`, effects leave through `Ctx` (`R-NF-3`).
 //!
 //! Creating a workspace is MOD-15, so an empty store renders "no workspaces" rather than an editor.
+//!
+//! Drawn on the MOD-115 kit (M4 E6): [`Modal`] is the frame, `kit::list` the rows (the `▌` gutter
+//! and the selection band mark the cursor, MOD-85), `kit::empty` the reading and empty states, and
+//! the keys sit on the modal's bottom border.
 
 use htui_core::model::{Scope, WorkspaceSummary};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::text::{Line, Span};
 
 use crate::app::{Action, Ctx, Handled, OverlayAction};
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width};
-use crate::ui::layout::centered;
+use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::label::plural;
+use crate::ui::kit::list::{self, Row, RowKind};
+use crate::ui::kit::modal::{Modal, ModalSize};
 use crate::ui::overlay::registry::{Overlay, OverlayId};
 use crossterm::event::KeyEvent;
 
-/// Marker in front of the row the cursor is on. Selection is also styled, but the marker is what
-/// makes it visible in a snapshot, which records symbols and not styles.
-const CURSOR: &str = "> ";
-
-/// The marker's width, in front of every other row, so names stay in one column.
-const NO_CURSOR: &str = "  ";
-
-/// The line under the list (MOD-67 D9): `list.down`/`list.up` and `switcher.switch` are handled
-/// here, `overlay.close` by the shell.
+/// The keys on the bottom border (MOD-67 D9): `list.down`/`list.up` and `switcher.switch` are
+/// handled here, `overlay.close` by the shell.
 const HINT: HintSpec = &[
     Hint::Pair(Act::ListDown, Act::ListUp, "move"),
     Hint::One(Act::SwitcherSwitch, "switch"),
@@ -40,8 +39,14 @@ const HINT: HintSpec = &[
 /// Gap between a workspace's name and its project count.
 const GAP: &str = "  ";
 
-/// Left border, right border and one column of right padding.
-const CHROME: u16 = 3;
+/// What the box says before the first reply.
+const READING: &str = "reading the store";
+
+/// The reading state's next step.
+const READING_NEXT: &str = "the list appears once the store answers";
+
+/// What a reply with no workspace says.
+const EMPTY: &str = "no workspaces";
 
 /// Lists the workspaces and enters the selected one.
 #[derive(Debug, Default)]
@@ -91,65 +96,48 @@ impl WorkspaceSwitcher {
         Handled::Consumed
     }
 
-    /// The box's contents: one line per workspace, a blank line, then `hint` (the rendered
-    /// [`HINT`]).
-    fn lines(&self, hint: &str, keys: &Keys, theme: &Theme) -> Vec<Line<'static>> {
-        let mut lines = if self.workspaces.is_empty() {
-            vec![Line::styled(
-                format!("{NO_CURSOR}{}", self.empty_text(keys)),
-                theme.dim,
-            )]
-        } else {
-            let column = self
-                .workspaces
-                .iter()
-                .map(|w| cell_width(&w.name))
-                .max()
-                .unwrap_or(0);
-            self.workspaces
-                .iter()
-                .enumerate()
-                .map(|(index, workspace)| self.row(index, workspace, column, theme))
-                .collect()
-        };
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(format!("{NO_CURSOR}{hint}"), theme.dim));
-        lines
+    /// One kit row per workspace: `Platform  2 projects`, the name padded to the widest one; the
+    /// kit's gutter and band mark the cursor's.
+    fn rows(&self, theme: &Theme) -> Vec<Row<'static>> {
+        let column = self
+            .workspaces
+            .iter()
+            .map(|w| cell_width(&w.name))
+            .max()
+            .unwrap_or(0);
+        self.workspaces
+            .iter()
+            .map(|workspace| row(workspace, column, theme))
+            .collect()
     }
 
-    /// What an empty list says. Never a blank box (plan D11's rule, applied to an overlay). The
-    /// key that creates a workspace is the one `keys` binds where it acts, Settings > Hierarchy
-    /// (`HIERARCHY_BROWSE`, MOD-67 M6 D4); with none bound the sentence names only the place.
-    fn empty_text(&self, keys: &Keys) -> String {
+    /// What the box says with no row, and its next step. Never a blank box (plan D11's rule,
+    /// applied to an overlay). The key that creates a workspace is the one `keys` binds where it
+    /// acts, Settings › Hierarchy (`HIERARCHY_BROWSE`, MOD-67 M6 D4); with none bound the step
+    /// names only the place.
+    fn empty_state(&self, keys: &Keys) -> (&'static str, String) {
         if !self.loaded {
-            return "reading the store".to_owned();
+            return (READING, READING_NEXT.to_owned());
         }
-        match keys.label(views::HIERARCHY_BROWSE, Act::HierarchyNewWorkspace) {
-            Some(new) => {
-                format!("no workspaces \u{2014} `{new}` in Settings > Hierarchy creates one")
-            }
-            None => "no workspaces \u{2014} create one in Settings > Hierarchy".to_owned(),
-        }
+        let next = match keys.label(views::HIERARCHY_BROWSE, Act::HierarchyNewWorkspace) {
+            Some(new) => format!("`{new}` in Settings \u{203a} Hierarchy creates one"),
+            None => "create one in Settings \u{203a} Hierarchy".to_owned(),
+        };
+        (EMPTY, next)
     }
+}
 
-    /// One workspace row: `> Platform  2 projects`, the name padded to the widest one.
-    fn row(
-        &self,
-        index: usize,
-        workspace: &WorkspaceSummary,
-        column: usize,
-        theme: &Theme,
-    ) -> Line<'static> {
-        let selected = index == self.selected;
-        let marker = if selected { CURSOR } else { NO_CURSOR };
-        // `fit`, not `pad`: `column` is the widest name, so nothing is cut, but `fit` clips first
-        // and clipping flattens a control to the blank cell `cell_width` counted it as (D3).
-        let name = format!("{marker}{}{GAP}", cells::fit(&workspace.name, column));
-        let style = if selected { theme.accent } else { theme.base };
-        Line::from(vec![
-            Span::styled(name, style),
+/// One workspace row: `Platform  2 projects`, the name padded to `column`.
+fn row(workspace: &WorkspaceSummary, column: usize, theme: &Theme) -> Row<'static> {
+    // `fit`, not `pad`: `column` is the widest name, so nothing is cut, but `fit` clips first
+    // and clipping flattens a control to the blank cell `cell_width` counted it as (D3).
+    let name = format!("{}{GAP}", cells::fit(&workspace.name, column));
+    Row {
+        line: Line::from(vec![
+            Span::styled(name, theme.base),
             Span::styled(projects_label(workspace.projects.len()), theme.dim),
-        ])
+        ]),
+        kind: RowKind::Item,
     }
 }
 
@@ -211,28 +199,41 @@ impl Overlay for WorkspaceSwitcher {
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let lines = self.lines(
-            &ctx.keys().hint(views::SWITCHER, HINT),
-            ctx.keys(),
-            ctx.theme,
-        );
-        let widest = widest(&lines);
-        let width = u16::try_from(widest)
-            .unwrap_or(u16::MAX)
-            .saturating_add(CHROME);
-        let height = u16::try_from(lines.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(2);
-        let box_area = centered(area, width, height);
+        let theme = ctx.theme;
+        let hint = ctx.keys().hint(views::SWITCHER, HINT);
+        let rows = self.rows(theme);
+        let (what, next) = self.empty_state(ctx.keys());
 
-        frame.render_widget(Clear, box_area);
-        frame.render_widget(
-            Paragraph::new(Text::from(lines)).block(
-                Block::new()
-                    .borders(Borders::ALL)
-                    .title(Span::styled(format!(" {} ", self.title()), ctx.theme.title)),
-            ),
-            box_area,
+        // The natural size: every row whole (the gutter's cell and the row), or the two-line
+        // empty state; the hint whole on the border.
+        let (widest, height) = if rows.is_empty() {
+            (cell_width(what).max(cell_width(&next)), 2)
+        } else {
+            (1 + widest(&rows), rows.len())
+        };
+        let content_w = u16::try_from(widest.max(cell_width(&hint) + 1)).unwrap_or(u16::MAX);
+        let content = Modal::new(self.title())
+            .size(ModalSize::Fit {
+                content_w,
+                content_h: u16::try_from(height).unwrap_or(u16::MAX),
+            })
+            .hint(&hint)
+            .render(frame, area, theme);
+
+        if rows.is_empty() {
+            empty::render(frame, content, what, NextStep(&next), theme);
+            return;
+        }
+        let offset =
+            list::scroll_into_view(self.selected, 0, usize::from(content.height), rows.len());
+        list::render(
+            frame,
+            content,
+            &rows,
+            Some(self.selected),
+            offset,
+            theme.accent,
+            theme,
         );
     }
 }
@@ -241,19 +242,18 @@ impl Overlay for WorkspaceSwitcher {
 fn projects_label(count: usize) -> String {
     match count {
         0 => "no projects".to_owned(),
-        1 => "1 project".to_owned(),
-        n => format!("{n} projects"),
+        n => plural(n, "project", "projects"),
     }
 }
 
-/// The widest of `lines`, in cells. Measured as the rows were padded: `Line::width` skips the
+/// The widest of `rows`, in cells. Measured as the rows were padded: `Line::width` skips the
 /// halfwidth sound mark rule, so a name the column pads by cells would overrun a box sized by it
 /// (MOD-60 B3).
-fn widest(lines: &[Line<'_>]) -> usize {
-    lines
-        .iter()
-        .map(|line| {
-            line.spans
+fn widest(rows: &[Row<'_>]) -> usize {
+    rows.iter()
+        .map(|row| {
+            row.line
+                .spans
                 .iter()
                 .map(|span| cell_width(&span.content))
                 .sum::<usize>()
@@ -264,14 +264,16 @@ fn widest(lines: &[Line<'_>]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use htui_core::model::WorkspaceId;
+    use htui_core::model::{ProjectId, ProjectRef, WorkspaceId};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::style::Modifier;
 
     use super::*;
-
-    /// The hint rendered with the compiled keys.
-    fn hint() -> String {
-        Keys::compiled().hint(views::SWITCHER, HINT)
-    }
+    use crate::app::{Emit, TopBarState};
+    use crate::store_worker::Origin;
+    use crate::ui::kit::list::GUTTER;
 
     fn workspace(name: &str) -> WorkspaceSummary {
         WorkspaceSummary {
@@ -282,50 +284,235 @@ mod tests {
         }
     }
 
-    /// MOD-67 M6 D4: the empty list names the key that creates a workspace where it acts
-    /// (`HIERARCHY_BROWSE`), and only the place when it is unbound.
-    #[test]
-    fn the_empty_switcher_names_the_hierarchy_key() {
-        let switcher = WorkspaceSwitcher {
-            workspaces: Vec::new(),
+    /// A workspace named `name` holding `projects` projects.
+    fn holding(name: &str, projects: usize) -> WorkspaceSummary {
+        WorkspaceSummary {
+            projects: (0..projects)
+                .map(|position| ProjectRef {
+                    project_id: ProjectId::default(),
+                    slug: format!("p{position}"),
+                    name: format!("p{position}"),
+                    position: i32::try_from(position).expect("few"),
+                })
+                .collect(),
+            ..workspace(name)
+        }
+    }
+
+    /// A loaded switcher over `workspaces`, its cursor on the first.
+    fn loaded(workspaces: Vec<WorkspaceSummary>) -> WorkspaceSwitcher {
+        WorkspaceSwitcher {
+            workspaces,
             selected: 0,
             loaded: true,
+        }
+    }
+
+    /// `switcher` drawn over a blank `width`×`height` frame under `keys` and `theme`.
+    fn drawn(
+        switcher: &WorkspaceSwitcher,
+        keys: &Keys,
+        theme: &Theme,
+        (width, height): (u16, u16),
+    ) -> Buffer {
+        let scope = Scope {
+            workspace_id: WorkspaceId::default(),
+            project_ids: Vec::new(),
         };
+        let (top_bar, emit) = (TopBarState::default(), Emit::default());
+        let ctx = Ctx::new(
+            &scope,
+            &[],
+            &top_bar,
+            keys,
+            theme,
+            Origin::Overlay(WorkspaceSwitcher::ID),
+            &emit,
+        );
+        let mut term = Terminal::new(TestBackend::new(width, height)).expect("a test backend");
+        term.draw(|frame| switcher.render(frame, frame.area(), &ctx))
+            .expect("the switcher draws");
+        term.backend().buffer().clone()
+    }
+
+    /// The buffer's rows, trailing blanks cut.
+    fn lines(buffer: &Buffer) -> Vec<String> {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// The `(x, y)` where `text` starts in `buffer`.
+    fn find(buffer: &Buffer, text: &str) -> (u16, u16) {
+        for (y, line) in lines(buffer).iter().enumerate() {
+            if let Some(byte) = line.find(text) {
+                let x = line[..byte].chars().count();
+                return (
+                    u16::try_from(x).expect("narrow"),
+                    u16::try_from(y).expect("short"),
+                );
+            }
+        }
+        panic!("`{text}` is not drawn: {:#?}", lines(buffer));
+    }
+
+    /// MOD-67 M6 D4, MOD-115 M4 E6: the empty list says what is missing and names the key that
+    /// creates a workspace where it acts (`HIERARCHY_BROWSE`), only the place when it is unbound.
+    #[test]
+    fn the_empty_switcher_names_the_hierarchy_key() {
+        let switcher = loaded(Vec::new());
         assert_eq!(
-            switcher.empty_text(Keys::compiled()),
-            "no workspaces \u{2014} `N` in Settings > Hierarchy creates one"
+            switcher.empty_state(Keys::compiled()),
+            (
+                "no workspaces",
+                "`N` in Settings \u{203a} Hierarchy creates one".to_owned()
+            )
         );
         let keys =
             crate::keys::load_str("version = 1\n[settings.hierarchy]\nnew_workspace = \"W\"\n")
                 .expect("loads");
         assert_eq!(
-            switcher.empty_text(&keys),
-            "no workspaces \u{2014} `W` in Settings > Hierarchy creates one"
+            switcher.empty_state(&keys).1,
+            "`W` in Settings \u{203a} Hierarchy creates one"
         );
         let unbound =
             crate::keys::load_str("version = 1\n[settings.hierarchy]\nnew_workspace = []\n")
                 .expect("loads");
         assert_eq!(
-            switcher.empty_text(&unbound),
-            "no workspaces \u{2014} create one in Settings > Hierarchy"
+            switcher.empty_state(&unbound).1,
+            "create one in Settings \u{203a} Hierarchy"
         );
+        let reading = WorkspaceSwitcher::new();
+        assert_eq!(
+            reading.empty_state(Keys::compiled()),
+            (
+                "reading the store",
+                "the list appears once the store answers".to_owned()
+            )
+        );
+    }
+
+    /// The empty state is drawn through `kit::empty`: both lines, inside the box.
+    #[test]
+    fn the_empty_box_draws_what_is_missing_and_the_next_step() {
+        let buffer = drawn(
+            &loaded(Vec::new()),
+            Keys::compiled(),
+            &Theme::default(),
+            (100, 30),
+        );
+        let (_, what) = find(&buffer, "no workspaces");
+        let (_, next) = find(&buffer, "`N` in Settings \u{203a} Hierarchy creates one");
+        assert_eq!(next, what + 1, "{:#?}", lines(&buffer));
+        let buffer = drawn(
+            &WorkspaceSwitcher::new(),
+            Keys::compiled(),
+            &Theme::default(),
+            (100, 30),
+        );
+        find(&buffer, "reading the store");
+        find(&buffer, "the list appears once the store answers");
+    }
+
+    /// `no projects` / `1 project` / `n projects`, through `kit::label::plural`.
+    #[test]
+    fn a_row_counts_its_projects_in_words() {
+        assert_eq!(projects_label(0), "no projects");
+        assert_eq!(projects_label(1), "1 project");
+        assert_eq!(projects_label(3), "3 projects");
+        let buffer = drawn(
+            &loaded(vec![holding("Graphics", 1), holding("Platform", 2)]),
+            Keys::compiled(),
+            &Theme::default(),
+            (100, 30),
+        );
+        find(&buffer, "Graphics  1 project");
+        find(&buffer, "Platform  2 projects");
+    }
+
+    /// MOD-115 M4 E6 (MOD-85): the cursor row is the kit's gutter and band, so it reads under
+    /// `NO_COLOR` (the band is reversed); the other rows have neither.
+    #[test]
+    fn the_cursor_row_is_the_band_and_reads_without_colour() {
+        let theme = Theme::monochrome();
+        let switcher = WorkspaceSwitcher {
+            selected: 1,
+            ..loaded(vec![holding("Graphics", 1), holding("Platform", 2)])
+        };
+        let buffer = drawn(&switcher, Keys::compiled(), &theme, (100, 30));
+        let (x, y) = find(&buffer, "Platform");
+        let row = lines(&buffer)[usize::from(y)].clone();
+        // Finding F2: the gutter alone marks it, no `> ` text marker beside it.
+        assert!(row.contains(&format!("{GUTTER}Platform")), "{row}");
+        assert!(
+            buffer[(x, y)].modifier.contains(Modifier::REVERSED),
+            "the band: {:?}",
+            buffer[(x, y)]
+        );
+        let (x, y) = find(&buffer, "Graphics");
+        assert!(!lines(&buffer)[usize::from(y)].contains(GUTTER));
+        assert!(!buffer[(x, y)].modifier.contains(Modifier::REVERSED));
+        for cell in &buffer.content {
+            assert_eq!(
+                (cell.fg, cell.bg),
+                (ratatui::style::Color::Reset, ratatui::style::Color::Reset)
+            );
+        }
+    }
+
+    /// MOD-115 M4 E6: the keys ride the modal's bottom border, so the box holds only its rows.
+    #[test]
+    fn the_keys_ride_the_bottom_border() {
+        let buffer = drawn(
+            &loaded(vec![holding("Graphics", 1), holding("Platform", 2)]),
+            Keys::compiled(),
+            &Theme::default(),
+            (100, 30),
+        );
+        let (_, top) = find(&buffer, "\u{256d} Workspaces ");
+        let (_, first) = find(&buffer, "Graphics");
+        let (_, bottom) = find(&buffer, " j/k move \u{b7} Enter switch \u{b7} Esc close ");
+        assert_eq!(first, top + 1);
+        assert_eq!(
+            bottom,
+            top + 3,
+            "two rows, then the border: {:#?}",
+            lines(&buffer)
+        );
+        assert!(lines(&buffer)[usize::from(bottom)].contains('\u{2570}'));
+    }
+
+    /// On a screen narrower than the hint, the border's hint is cut with an ellipsis.
+    #[test]
+    fn a_hint_wider_than_the_box_is_cut_with_an_ellipsis() {
+        let buffer = drawn(
+            &loaded(vec![holding("Graphics", 1)]),
+            Keys::compiled(),
+            &Theme::default(),
+            (30, 10),
+        );
+        let (_, bottom) = find(&buffer, "j/k move");
+        let row = lines(&buffer)[usize::from(bottom)].clone();
+        assert!(row.contains('\u{2026}'), "{row}");
     }
 
     /// MOD-60: the name column is measured and padded in cells, so a CJK name's project count
     /// lines up with an ASCII one's.
     #[test]
     fn a_wide_workspace_name_keeps_the_counts_in_one_column() {
-        let switcher = WorkspaceSwitcher {
-            workspaces: vec![workspace("Platform"), workspace("\u{5e73}\u{53f0}")],
-            selected: 0,
-            loaded: true,
-        };
-        let lines = switcher.lines(&hint(), Keys::compiled(), &Theme::default());
-        let first: Vec<usize> = lines[..2]
+        let switcher = loaded(vec![workspace("Platform"), workspace("\u{5e73}\u{53f0}")]);
+        let rows = switcher.rows(&Theme::default());
+        let first: Vec<usize> = rows
             .iter()
-            .map(|line| cell_width(&line.spans[0].content))
+            .map(|row| cell_width(&row.line.spans[0].content))
             .collect();
-        assert_eq!(first[0], first[1], "{lines:?}");
+        assert_eq!(first[0], first[1], "{rows:?}");
     }
 
     /// MOD-60 D3: `cell_width` counts a control as one cell but ratatui draws nothing for it, so
@@ -333,21 +520,17 @@ mod tests {
     /// every row ends with the same label, so equal ends mean one count column.
     #[test]
     fn a_control_char_in_a_workspace_name_keeps_the_counts_in_one_column() {
-        let switcher = WorkspaceSwitcher {
-            workspaces: vec![
-                workspace("Platform"),
-                workspace("a\tb"),
-                workspace("a\u{1}b"),
-            ],
-            selected: 0,
-            loaded: true,
-        };
-        let lines = switcher.lines(&hint(), Keys::compiled(), &Theme::default());
-        let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 80, 3));
+        let switcher = loaded(vec![
+            workspace("Platform"),
+            workspace("a\tb"),
+            workspace("a\u{1}b"),
+        ]);
+        let rows = switcher.rows(&Theme::default());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 3));
         let ends: Vec<u16> = (0u16..3)
-            .map(|y| buffer.set_line(0, y, &lines[usize::from(y)], 80).0)
+            .map(|y| buffer.set_line(0, y, &rows[usize::from(y)].line, 80).0)
             .collect();
-        assert_eq!(ends, vec![ends[0]; 3], "{lines:?}");
+        assert_eq!(ends, vec![ends[0]; 3], "{rows:?}");
     }
 
     /// MOD-60 B3: the box is as wide as the widest row in cells. `ｶﾞ` is two cells and one to
@@ -355,21 +538,18 @@ mod tests {
     #[test]
     fn a_halfwidth_workspace_name_fits_inside_the_box() {
         let name = "\u{ff76}\u{ff9e}".repeat(20);
-        let switcher = WorkspaceSwitcher {
-            workspaces: vec![workspace(&name)],
-            selected: 0,
-            loaded: true,
-        };
-        let lines = switcher.lines(&hint(), Keys::compiled(), &Theme::default());
-        let row: String = lines[0]
+        let switcher = loaded(vec![workspace(&name)]);
+        let rows = switcher.rows(&Theme::default());
+        let row: String = rows[0]
+            .line
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
-        assert_eq!(
-            cell_width(&row),
-            2 + 40 + 2 + cell_width(&projects_label(0))
-        );
-        assert_eq!(widest(&lines), cell_width(&row), "{row:?}");
+        assert_eq!(cell_width(&row), 40 + 2 + cell_width(&projects_label(0)));
+        assert_eq!(widest(&rows), cell_width(&row), "{row:?}");
+        // The whole row is drawn: its count is not cut at the box's edge.
+        let buffer = drawn(&switcher, Keys::compiled(), &Theme::default(), (100, 30));
+        find(&buffer, "  no projects");
     }
 }

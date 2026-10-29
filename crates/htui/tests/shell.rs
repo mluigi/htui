@@ -87,7 +87,7 @@ async fn the_switcher_opens_on_the_workspace_the_shell_is_already_inside() {
         "startup entered the first workspace"
     );
     assert!(
-        frame.contains("> Graphics") && !frame.contains("> Platform"),
+        frame.contains("▌Graphics") && !frame.contains("▌Platform"),
         "the cursor starts on the scope's own workspace: {frame}"
     );
 }
@@ -99,7 +99,7 @@ async fn j_and_k_move_the_cursor_and_stop_at_the_ends() {
     harness.key("j");
     let down = harness.render();
     assert!(
-        down.contains("> Platform") && !down.contains("> Graphics"),
+        down.contains("▌Platform") && !down.contains("▌Graphics"),
         "`j` moves onto the second workspace: {down}"
     );
 
@@ -111,7 +111,7 @@ async fn j_and_k_move_the_cursor_and_stop_at_the_ends() {
     harness.key("k");
     let up = harness.render();
     assert!(
-        up.contains("> Graphics") && !up.contains("> Platform"),
+        up.contains("▌Graphics") && !up.contains("▌Platform"),
         "`k` walks back to the first workspace and stops there: {up}"
     );
 }
@@ -419,11 +419,11 @@ async fn ctrl_j_does_not_move_the_switcher() {
     harness.key("ctrl-j");
     let frame = harness.render();
     assert!(
-        frame.contains("> Graphics") && !frame.contains("> Platform"),
+        frame.contains("▌Graphics") && !frame.contains("▌Platform"),
         "`ctrl-j` left the cursor alone: {frame}"
     );
     harness.key("j");
-    assert!(harness.render().contains("> Platform"), "`j` still moves");
+    assert!(harness.render().contains("▌Platform"), "`j` still moves");
 }
 
 /// MOD-67 M3 (D7, D8): over the switcher the status line and the `?` box render the switcher's

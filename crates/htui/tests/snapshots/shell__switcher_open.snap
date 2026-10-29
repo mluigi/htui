@@ -14,12 +14,12 @@ Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat          0 
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
-│                             ┌ Workspaces ──────────────────────────┐                             │
-│                             │> Graphics  1 project                 │                             │
-│                             │  Platform  2 projects                │                             │
-│                             │                                      │                             │
-│                             │  j/k move · Enter switch · Esc close │                             │
-│                             └──────────────────────────────────────┘                             │
+│                                                     ││                                           │
+│                              ╭ Workspaces ─────────────────────────╮                             │
+│                              │▌Graphics  1 project                 │                             │
+│                              │ Platform  2 projects                │                             │
+│                              ╰ j/k move · Enter switch · Esc close ╯                             │
+│                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │

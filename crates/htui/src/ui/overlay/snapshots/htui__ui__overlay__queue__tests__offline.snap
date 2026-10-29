@@ -15,8 +15,7 @@ expression: rendered
 
 
 
-  ┌ Queue ───────────────────────────────────────────────────────────────────────────────────────┐
+  ╭ Queue ───────────────────────────────────────────────────────────────────────────────────────╮
   │  the queue is unavailable: store unreachable: this box browses its read-only cache and star… │
-  │                                                                                              │
-  │  j/k move · J/K reorder · P pause/resume · Q dequeue · Enter open · Esc close                │
-  └──────────────────────────────────────────────────────────────────────────────────────────────┘
+  │  Settings › Connection shows the store's connection                                          │
+  ╰ j/k move · J/K reorder · P pause/resume · Q dequeue · Enter open · Esc close ────────────────╯
