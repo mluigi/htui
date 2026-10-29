@@ -545,18 +545,32 @@ where
 /// go looking for. The note is still written — it is what an operator reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resume {
-    /// The snapshot was walked. Either the live graph still hashes to the run's own `topology`,
-    /// or the live graph no longer resolves under a start-time rule (a fan-out or agent cap, a
-    /// review or local fan-out, no candidate) and so was not compared at all: the item's
+    /// The snapshot was walked: a v2 run whose snapshot recomputes to its own `topology`
+    /// (MOD-138 D5), or a v1 run whose live graph still hashes to the lifted snapshot's v2
+    /// digest. A v1 run whose live graph no longer resolves under a start-time rule (a fan-out or
+    /// agent cap, a review or local fan-out, no candidate) was not compared at all: the item's
     /// `live graph not comparable` note says which rule refused it.
     Walked(Rest),
-    /// The live graph moved. **Nothing was advanced**: invariant 2 says a run walks its snapshot,
-    /// and §4.9's resume says a mismatch is a human's decision, not the engine's.
+    /// A v1 run's live graph moved (MOD-138 D5). **Nothing was advanced**: invariant 2 says a run
+    /// walks its snapshot, and §4.9's resume says a mismatch is a human's decision, not the
+    /// engine's.
     TopologyChanged {
-        /// `run.graph_snapshot.topology`, the digest this run walks.
+        /// The lifted snapshot's v2 digest ([`graph::topology_v2`] over its phases and its
+        /// lifted edges), the graph this run walks.
         snapshot: String,
-        /// What the live graph hashes to now.
+        /// The live graph's v2 digest, or `not runnable: <refusal>` when M1 refuses the live
+        /// graph (MOD-138 D6, D9): its topology did change.
         live: String,
+        /// Where the run is, unchanged.
+        rest: Rest,
+    },
+    /// MOD-138 D5: a v2 run whose snapshot no longer hashes to its own `topology`. Nothing
+    /// advanced; parked like [`Resume::TopologyChanged`], and the live graph was never read.
+    SnapshotTampered {
+        /// `run.graph_snapshot.topology`, as stored.
+        stored: String,
+        /// [`graph::topology_v2`] over the snapshot's own phases and edges.
+        recomputed: String,
         /// Where the run is, unchanged.
         rest: Rest,
     },
@@ -1781,7 +1795,9 @@ where
                     .await?;
                 Some(match self.parts.tails {
                     Tails::Walk => match self.resume(run).await? {
-                        Resume::Walked(rest) | Resume::TopologyChanged { rest, .. } => rest,
+                        Resume::Walked(rest)
+                        | Resume::TopologyChanged { rest, .. }
+                        | Resume::SnapshotTampered { rest, .. } => rest,
                     },
                     Tails::HandBack => self.hand_back_resume(run).await?,
                 })
@@ -3111,12 +3127,17 @@ where
     /// ANA-2 §12 criterion 3 (`docs/ANA-2.md:2090`): what §4.9's sweep does before it advances a
     /// run it did not start.
     ///
-    /// Re-resolves the item's **live** graph and compares its [`graph::topology`] with the digest
-    /// the run's own snapshot carries. On a mismatch the walk is not advanced and an `item_note`
-    /// records both digests; invariant 2 means the run *could* keep walking its snapshot, and §4.9
-    /// says the divergence is a human's decision rather than the engine's.
+    /// MOD-138 D5 splits on the snapshot's `v`. A **v2** run is pinned: its [`graph::topology_v2`]
+    /// is recomputed from the snapshot's own phases and edges, and the live graph is never read;
+    /// a recomputed digest that differs from the stored one is [`Resume::SnapshotTampered`].
     ///
-    /// A live graph that **refuses to resolve** for a reason that is a rule about starting a run —
+    /// A **v1** run re-resolves the item's **live** graph and compares its v2 digest with the
+    /// lifted snapshot's. On a mismatch the walk is not advanced and an `item_note` records both
+    /// digests; invariant 2 means the run *could* keep walking its snapshot, and §4.9 says the
+    /// divergence is a human's decision rather than the engine's. A live graph M1 refuses as not
+    /// yet runnable or invalid (D6, D9) is such a mismatch.
+    ///
+    /// A v1 run's live graph that **refuses to resolve** for a reason that is a rule about starting a run —
     /// a cap an app setting lowered since (plan D63), a phase fanned out where it may not (D64,
     /// ANA-2 §4.6), a phase left with no candidate (§4.1 rung 4), a `touched_paths` entry naming a
     /// repo the project does not carry (plan D81) — has no topology to compare.
@@ -3156,12 +3177,39 @@ where
         Ok(Resume::Walked(rest))
     }
 
-    /// [`Self::resume`] between its lease take and its walk: `None` walks the run, and
-    /// `Some(Resume::TopologyChanged)` is the mismatch, with its note written.
+    /// [`Self::resume`] between its lease take and its walk: `None` walks the run, and `Some` is
+    /// a [`Resume::TopologyChanged`] or [`Resume::SnapshotTampered`] park, with its note written.
+    ///
+    /// MOD-138 D5 splits on the snapshot's `v`. A **v2** run is pinned: its digest is recomputed
+    /// from its own phases and edges ([`graph::topology_v2`]) and the live graph is never read.
+    /// A **v1** run (lifted by [`Self::snapshot_of`]) keeps the live compare, edge-aware: the
+    /// live graph's v2 digest against the lifted snapshot's. A live graph M1 refuses as not yet
+    /// runnable or invalid (D6, D9) is a mismatch, since its topology did change.
     async fn resume_window(&self, run: RunId) -> Result<Option<Resume>, EngineError> {
         let row = self.run(run).await?;
         let snapshot = Self::snapshot_of(&row)?;
         let item = self.item(Self::item_of(&row)?).await?;
+        if snapshot.v >= GraphSnapshot::V {
+            // D5 v2: pinned; the live graph is never read.
+            let recomputed = graph::topology_v2(&snapshot.phases, &snapshot.edges)?;
+            if recomputed == snapshot.topology {
+                return Ok(None);
+            }
+            let body = format!(
+                "snapshot tampered: run {run} carries topology `{}`, but its own phases and edges \
+                 hash to `{recomputed}`; the walk is not advanced (ANA-33 §7.2, invariant 2)",
+                snapshot.topology
+            );
+            let rest = Box::pin(self.park_on_resume(row, item.id, body)).await?;
+            return Ok(Some(Resume::SnapshotTampered {
+                stored: snapshot.topology,
+                recomputed,
+                rest,
+            }));
+        }
+
+        // D5 v1: the live compare, edge-aware.
+        let lifted = graph::topology_v2(&snapshot.phases, &snapshot.edges)?;
         let live = match graph::resolve(
             self.parts.store,
             self.parts.graphs,
@@ -3173,7 +3221,13 @@ where
         )
         .await
         {
-            Ok(live) => live,
+            Ok(live) => live.snapshot.topology,
+            // D5: a live graph M1 refuses did change its topology; it is compared, and differs.
+            Err(
+                err @ (ResolveError::NotYetRunnable { .. } | ResolveError::InvalidGraph { .. }),
+            ) => {
+                format!("not runnable: {err}")
+            }
             Err(err @ ResolveError::ProjectCaps { .. }) => {
                 // A malformed cap would otherwise add an item note on every resume; the run keeps
                 // walking its snapshot, and the cause is logged instead.
@@ -3194,9 +3248,8 @@ where
                 | ResolveError::UnknownTouchedRepo { .. }),
             ) => {
                 let body = format!(
-                    "live graph not comparable: run {run} walks its snapshot `{}` \
-                     (invariant 2); the live graph does not resolve: {err}",
-                    snapshot.topology
+                    "live graph not comparable: run {run} walks its snapshot `{lifted}` \
+                     (invariant 2); the live graph does not resolve: {err}"
                 );
                 self.note(item.id, body, None, self.now()).await?;
                 return Ok(None);
@@ -3204,46 +3257,57 @@ where
             Err(err) => return Err(err.into()),
         };
 
-        if live.snapshot.topology != snapshot.topology {
-            let now = self.now();
-            self.parts
-                .store
-                .add_note(NewNote {
-                    id: NoteId::new(),
-                    item_id: item.id,
-                    body: format!(
-                        "topology mismatch: run {run} walks `{}`, the live graph is `{}`; \
-                         the walk is not advanced (ANA-2 §4.9, invariant 2)",
-                        snapshot.topology, live.snapshot.topology
-                    ),
-                    created_by: self.parts.user,
-                    box_id: Some(self.parts.box_id),
-                    via_step_id: None,
-                    created_at: now,
-                })
-                .await?;
-            // MOD-4 plan D159 (R-36, criterion 3): a `running` run parks for the human the
-            // mismatch is addressed to — run, then item — rather than being handed back to every
-            // sweep as a `running` run. A run already parked is left as it is.
-            let row = if row.status == RunStatus::Running {
-                self.move_run(run, RunStatus::Running, RunStatus::AwaitingApproval, now)
-                    .await?;
-                self.parts
-                    .store
-                    .transition(item.id, Status::InProgress, Status::AwaitingApproval)
-                    .await?;
-                self.run(run).await?
-            } else {
-                row
-            };
-            let rest = self.resting(&row).await?;
+        if live != lifted {
+            let body = format!(
+                "topology mismatch: run {run} walks `{lifted}`, the live graph is `{live}`; \
+                 the walk is not advanced (ANA-2 §4.9, invariant 2)"
+            );
+            let rest = Box::pin(self.park_on_resume(row, item.id, body)).await?;
             return Ok(Some(Resume::TopologyChanged {
-                snapshot: snapshot.topology,
-                live: live.snapshot.topology,
+                snapshot: lifted,
+                live,
                 rest,
             }));
         }
         Ok(None)
+    }
+
+    /// [`Self::resume_window`]'s park: the item note `body` first, then a `running` run moves to
+    /// `awaiting_approval`, run then item (MOD-4 plan D159); the rest is the run's as it now is.
+    async fn park_on_resume(
+        &self,
+        row: Run,
+        item: ItemId,
+        body: String,
+    ) -> Result<Rest, EngineError> {
+        let now = self.now();
+        self.parts
+            .store
+            .add_note(NewNote {
+                id: NoteId::new(),
+                item_id: item,
+                body,
+                created_by: self.parts.user,
+                box_id: Some(self.parts.box_id),
+                via_step_id: None,
+                created_at: now,
+            })
+            .await?;
+        // MOD-4 plan D159 (R-36, criterion 3): a `running` run parks for the human the mismatch
+        // is addressed to — run, then item — rather than being handed back to every sweep as a
+        // `running` run. A run already parked is left as it is.
+        let row = if row.status == RunStatus::Running {
+            self.move_run(row.id, RunStatus::Running, RunStatus::AwaitingApproval, now)
+                .await?;
+            self.parts
+                .store
+                .transition(item, Status::InProgress, Status::AwaitingApproval)
+                .await?;
+            self.run(row.id).await?
+        } else {
+            row
+        };
+        self.resting(&row).await
     }
 
     /// [`Self::resume`]'s walk. Plan D132 (review H3): an `awaiting_approval` run whose cursor
@@ -12227,11 +12291,13 @@ mod tests {
 
     /// Plan D81 on the resume path: `touched_paths` edited after `StartRun` to name a repo the
     /// project does not carry is a rule about starting a run, so the live graph is not
-    /// comparable and the run walks its snapshot, with the note that says so.
+    /// comparable and the **v1** run walks its snapshot, with the note that says so (MOD-138 D5:
+    /// only a v1 run resolves the live graph).
     #[tokio::test]
     async fn resume_walks_a_run_whose_touched_paths_name_an_unknown_repo() {
         let harness = Harness::new().await;
         let (run, _) = started(&harness).await;
+        crate::fake::rewrite_as_v1(&harness.orch.store, run).await;
         let item = harness.orch.item(ids::HTUI_FEAT_3).await;
         harness
             .orch
@@ -12852,10 +12918,18 @@ mod tests {
     }
 
     /// `FEAT-3` started and parked at `prd`, then `prd`'s `input_kinds` edited, so the live
-    /// graph's topology digest no longer matches the run's snapshot (ANA-2 §12 criterion 3).
+    /// graph's topology digest no longer matches the run's snapshot (ANA-2 §12 criterion 3). The
+    /// run is rewritten as **v1** first (MOD-138 D5): a v2 run never reads the live graph.
     async fn parked_run_with_a_moved_graph() -> (Harness, htui_core::model::RunId) {
         let harness = Harness::new().await;
         let (run, _) = started(&harness).await;
+        crate::fake::rewrite_as_v1(&harness.orch.store, run).await;
+        move_prd_input_kinds(&harness).await;
+        (harness, run)
+    }
+
+    /// Edits `FEAT-3`'s live `prd` phase's `input_kinds`, which moves both topology digests.
+    async fn move_prd_input_kinds(harness: &Harness) {
         // `input_kinds` is one of `PhasePatch`'s six, and it is a `SnapshotPhase` field, so
         // editing it moves the topology digest — which is the whole content of criterion 3.
         let graph = harness
@@ -12879,7 +12953,6 @@ mod tests {
             )
             .await
             .expect("the phase exists");
-        (harness, run)
     }
 
     /// ANA-2 §12 criterion 3 (`:2090`): the graph moved under a parked run.
@@ -12916,7 +12989,7 @@ mod tests {
             "{notes:?}"
         );
 
-        // An unedited run resumes into the walk instead.
+        // An unedited v1 run resumes into the walk instead.
         let harness = Harness::new().await;
         harness.free_feat_3().await;
         let CommandOutcome::Started { run, .. } = harness
@@ -12931,6 +13004,7 @@ mod tests {
         else {
             panic!("`StartRun` answers `Started`");
         };
+        crate::fake::rewrite_as_v1(&harness.orch.store, run).await;
         assert!(matches!(
             harness.resume(run).await.expect("the run is readable"),
             Resume::Walked(_)
@@ -13182,8 +13256,9 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0, "no driver was built");
     }
 
-    /// MOD-26 D9, I-3: rebinding a phase's persona under a parked run moves the topology, so a
-    /// resume parks on it; editing the bound persona's body does not.
+    /// MOD-26 D9, I-3: rebinding a phase's persona under a parked **v1** run moves the topology,
+    /// so a resume parks on it (MOD-138 D5: only a v1 run compares); editing the bound persona's
+    /// body does not.
     #[tokio::test]
     async fn rebinding_a_phase_persona_parks_a_resumed_run() {
         let harness = Harness::new().await;
@@ -13195,6 +13270,7 @@ mod tests {
         )
         .await;
         let (run, _) = started(&harness).await;
+        crate::fake::rewrite_as_v1(&harness.orch.store, run).await;
         bind_persona(
             &harness.orch,
             ids::HTUI_FEAT_3,
@@ -13250,7 +13326,8 @@ mod tests {
     /// MOD-12 review M3, blueprint H-3: a resume re-resolves the live graph under the run's own
     /// `mode` (the one read of `run.mode` after its insert), so a parked auto run whose snapshot
     /// downgraded its soft gates resumes `Walked`, not `TopologyChanged`; a parked manual run of
-    /// the same graph, which kept them, resumes `Walked` too.
+    /// the same graph, which kept them, resumes `Walked` too. Only a **v1** run re-resolves
+    /// (MOD-138 D5), so the runs are rewritten as v1 before the resume.
     #[tokio::test]
     async fn a_parked_run_resumes_under_its_own_mode() {
         for mode in [RunMode::Auto, RunMode::Manual] {
@@ -13297,6 +13374,7 @@ mod tests {
                 assert!(parked.gate_hard, "an auto run parks at its hard gate");
             }
 
+            crate::fake::rewrite_as_v1(&harness.orch.store, run).await;
             let resumed = Box::pin(harness.resume(run))
                 .await
                 .expect("the run is readable");

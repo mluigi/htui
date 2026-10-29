@@ -2626,7 +2626,11 @@ async fn resumed<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, 
             engine.abandoned(run).await;
             ctx.refuse(PREEMPTED.to_owned());
         }
-        Some(Ok(Resume::Walked(rest) | Resume::TopologyChanged { rest, .. })) => {
+        Some(Ok(
+            Resume::Walked(rest)
+            | Resume::TopologyChanged { rest, .. }
+            | Resume::SnapshotTampered { rest, .. },
+        )) => {
             ctx.shared.clear_backoff(run);
             ctx.publish(Some(run), FrameKind::Rested(rest));
         }
