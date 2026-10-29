@@ -11,7 +11,7 @@
 use chrono::Utc;
 use htui_core::model::{
     GraphBody, GraphScope, ItemKind, ItemKindId, NewItemKind, NewStepGraph, PersonaId, PhaseId,
-    Project, Scope, StepGraphId,
+    Project, Scope, StepGraph, StepGraphId,
 };
 use htui_core::prompt::SettingKey;
 use htui_core::seed;
@@ -58,8 +58,18 @@ pub struct ProjectCatalogue {
     pub project: Project,
     /// `item_kinds(project)`: by `position`, then `prefix`.
     pub kinds: Vec<ItemKind>,
-    /// `step_graphs(project)`: by `name`.
+    /// The project's own graphs (`usable_graphs(project)`'s project rows): by `name`.
     pub graphs: Vec<GraphEntry>,
+    /// MOD-138 D12: the workspace and library rows of `usable_graphs(project)`, in its order
+    /// (each workspace's that holds the project, then the library's, by `name`). A kind may name
+    /// one; the section edits none of them, so they carry no body.
+    pub shared: Vec<StepGraph>,
+    /// MOD-138 D12: the row of each graph a kind of the project still names that neither
+    /// [`graphs`](Self::graphs) nor [`shared`](Self::shared) lists — a workspace graph kept after
+    /// the project left that workspace. The kind still resolves, so its line names the graph with
+    /// its scope rather than `graph missing`; no kind may newly take one (the store refuses it), so
+    /// [`graph_name`](Self::graph_name) finds these and a typed name does not. In kind order.
+    pub kept: Vec<StepGraph>,
 }
 
 /// One graph as the catalogue holds it: its whole [`GraphBody`] from one
@@ -83,6 +93,34 @@ impl ProjectCatalogue {
     pub fn graph(&self, id: StepGraphId) -> Option<&GraphEntry> {
         self.graphs.iter().find(|entry| entry.graph.id == id)
     }
+
+    /// MOD-138 D12: the name and scope of any graph a kind of this project may name, its own
+    /// ([`Self::graph`]) or a [`shared`](Self::shared) one, or of one a kind
+    /// [`kept`](Self::kept); `None` when the id names none of them.
+    #[must_use]
+    pub fn graph_name(&self, id: StepGraphId) -> Option<(&str, GraphScope)> {
+        self.graph(id)
+            .map(|entry| &entry.graph)
+            .or_else(|| {
+                self.shared
+                    .iter()
+                    .chain(&self.kept)
+                    .find(|graph| graph.id == id)
+            })
+            .map(|graph| (graph.name.as_str(), graph.scope))
+    }
+}
+
+/// MOD-138 D12: how a list names a graph a kind or item may use: a project graph by its bare name,
+/// a workspace or library graph as `name · workspace` / `name · library`, so a shared graph never
+/// reads as one of the project's own.
+#[must_use]
+pub fn graph_label(name: &str, scope: GraphScope) -> String {
+    match scope {
+        GraphScope::Project(_) => name.to_owned(),
+        GraphScope::Workspace(_) => format!("{name} \u{b7} workspace"),
+        GraphScope::Library => format!("{name} \u{b7} library"),
+    }
 }
 
 /// One read of the whole scope: every project of `scope.project_ids` that still names a row, with
@@ -91,12 +129,16 @@ impl ProjectCatalogue {
 ///
 /// N+1 reads on purpose (D3, M3 D5's trade, same words): they happen per event — activation, a
 /// scope change, after a write — never per keystroke, and a joined reader would be a seam method
-/// six implementors would owe for a read nothing else wants. Each graph is one `graph_body` read
-/// (MOD-137 R1b, review C-L5), not a `phases` and a `graph_edges` read; a graph `step_graphs`
-/// named and `graph_body` no longer finds is skipped, a torn read like a missing project.
+/// six implementors would owe for a read nothing else wants. The graphs are one `usable_graphs`
+/// read (MOD-138 D12): its project rows each get one `graph_body` read (MOD-137 R1b, review
+/// C-L5), not a `phases` and a `graph_edges` read, and its workspace and library rows go to
+/// [`ProjectCatalogue::shared`] as they are; a graph `usable_graphs` named and `graph_body` no
+/// longer finds is skipped, a torn read like a missing project. A kind's graph neither list holds
+/// gets one more `graph_body` read for [`ProjectCatalogue::kept`]; one no read finds is left out,
+/// and the kind draws as `graph missing`.
 ///
 /// The bound is `ReadStore + WriteStore` rather than `ReadStore` alone because `item_kinds`,
-/// `step_graphs` and `graph_body` live on [`WriteStore`] (which extends [`ReadStore`]); only
+/// `usable_graphs` and `graph_body` live on [`WriteStore`] (which extends [`ReadStore`]); only
 /// `project` is on the read half. Same shape as [`crate::hierarchy::snapshot`]'s bound.
 ///
 /// # Errors
@@ -112,15 +154,29 @@ pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
         };
         let kinds = store.item_kinds(*id).await?;
         let mut graphs = Vec::new();
-        for graph in store.step_graphs(*id).await? {
-            if let Some(body) = store.graph_body(graph.id).await? {
+        let mut shared = Vec::new();
+        for graph in store.usable_graphs(*id).await? {
+            if graph.scope != GraphScope::Project(*id) {
+                shared.push(graph);
+            } else if let Some(body) = store.graph_body(graph.id).await? {
                 graphs.push(body);
+            }
+        }
+        let mut kept: Vec<StepGraph> = Vec::new();
+        for kind in &kinds {
+            let id = kind.default_graph_id;
+            let listed = graphs.iter().any(|entry| entry.graph.id == id)
+                || shared.iter().chain(&kept).any(|graph| graph.id == id);
+            if !listed && let Some(body) = store.graph_body(id).await? {
+                kept.push(body.graph);
             }
         }
         projects.push(ProjectCatalogue {
             project,
             kinds,
             graphs,
+            shared,
+            kept,
         });
     }
     let personas = store

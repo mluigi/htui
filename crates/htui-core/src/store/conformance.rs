@@ -71,7 +71,9 @@ use crate::store::traits::{
     parts_off_divide, persona_is_bound, phase_position_is_taken, phase_token_budget_refusal,
     reserved_phase_name, retry_limit_negative, split_fan_out_mismatch,
 };
-use crate::store::traits::{forward_edges_form_a_cycle, loop_edge_runs_forward};
+use crate::store::traits::{
+    forward_edges_form_a_cycle, graph_not_usable, loop_edge_runs_forward, workspace_graph_is_held,
+};
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
 pub const CASES: &[&str] = &[
@@ -282,6 +284,10 @@ pub const CASES: &[&str] = &[
     "delete_phase_keeps_a_default_graph_default_edged",
     "per_row_writers_leave_authored_edges_alone",
     "create_phase_leaves_a_palette_phase_unlinked",
+    // MOD-138 M1: workspace and library graphs for kinds and items (plan D12, blueprint §T6)
+    "item_kind_takes_usable_graphs_only",
+    "usable_graphs_lists_project_workspace_library",
+    "delete_workspace_refuses_a_held_graph",
     "project_types_are_the_six_builtins",
     "a_new_project_is_software",
     "memory_create_writes_the_row_and_revision_1",
@@ -917,6 +923,15 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "create_phase_leaves_a_palette_phase_unlinked" => {
             Box::pin(create_phase_leaves_a_palette_phase_unlinked(store)).await;
+        }
+        "item_kind_takes_usable_graphs_only" => {
+            Box::pin(item_kind_takes_usable_graphs_only(store)).await;
+        }
+        "usable_graphs_lists_project_workspace_library" => {
+            Box::pin(usable_graphs_lists_project_workspace_library(store)).await;
+        }
+        "delete_workspace_refuses_a_held_graph" => {
+            Box::pin(delete_workspace_refuses_a_held_graph(store)).await;
         }
         "project_types_are_the_six_builtins" => {
             project_types_are_the_six_builtins(store).await;
@@ -23546,6 +23561,402 @@ async fn delete_workspace_takes_its_graphs<S: WriteStore>(store: &S) {
         store.step_graphs(ids::PROJECT_HTUI).await.expect(CASE),
         project_graphs,
         "{CASE}: project graphs untouched"
+    );
+}
+
+/// MOD-138 D12: a fresh workspace linked to `project`, so its graphs are the project's to use.
+async fn linked_workspace<S: WriteStore>(
+    case: &str,
+    store: &S,
+    slug: &str,
+    project: ProjectId,
+) -> WorkspaceId {
+    let workspace = store
+        .create_workspace(new_workspace(slug))
+        .await
+        .expect(case);
+    store
+        .upsert_workspace_project(&WorkspaceProject {
+            workspace_id: workspace.id,
+            project_id: project,
+            position: 0,
+        })
+        .await
+        .expect(case);
+    workspace.id
+}
+
+/// MOD-138 D12: a kind takes its project's graph, a library graph, or a graph of a workspace that
+/// holds its project, on create and on update; another workspace's graph is refused with
+/// [`graph_not_usable`], and the refused update leaves the row as it was.
+async fn item_kind_takes_usable_graphs_only<S: WriteStore>(store: &S) {
+    const CASE: &str = "item_kind_takes_usable_graphs_only";
+    let ours = linked_workspace(CASE, store, "kinds-ours", ids::PROJECT_HTUI).await;
+    let theirs = linked_workspace(CASE, store, "kinds-theirs", ids::PROJECT_AGY).await;
+    let library = store
+        .create_step_graph(scoped_graph(GraphScope::Library, "libflow", false))
+        .await
+        .expect(CASE);
+    let shared = store
+        .create_step_graph(scoped_graph(GraphScope::Workspace(ours), "wsflow", false))
+        .await
+        .expect(CASE);
+    let foreign = store
+        .create_step_graph(scoped_graph(
+            GraphScope::Workspace(theirs),
+            "otherws",
+            false,
+        ))
+        .await
+        .expect(CASE);
+
+    for (prefix, graph) in [("LIBK", library.id), ("WSK", shared.id)] {
+        let kind = store
+            .create_item_kind(new_item_kind(
+                ids::PROJECT_HTUI,
+                prefix,
+                &format!("kind {prefix}"),
+                graph,
+            ))
+            .await
+            .unwrap_or_else(|err| panic!("{CASE}: a kind on {graph} is created: {err:?}"));
+        assert_eq!(kind.default_graph_id, graph, "{CASE}: {prefix}'s graph");
+    }
+    let refused = store
+        .create_item_kind(new_item_kind(
+            ids::PROJECT_HTUI,
+            "OTHK",
+            "other workspace",
+            foreign.id,
+        ))
+        .await;
+    assert_eq!(
+        refused,
+        Err(StoreError::Constraint(graph_not_usable(
+            foreign.id,
+            ids::PROJECT_HTUI
+        ))),
+        "{CASE}: another workspace's graph is not the project's to use"
+    );
+
+    let mut kind = store
+        .create_item_kind(new_item_kind(
+            ids::PROJECT_HTUI,
+            "MOVK",
+            "moving",
+            ids::GRAPH_HTUI_ANA,
+        ))
+        .await
+        .expect(CASE);
+    for graph in [library.id, shared.id, ids::GRAPH_HTUI_ANA] {
+        kind = applied(
+            CASE,
+            store
+                .update_item_kind(
+                    kind.id,
+                    kind.updated_at,
+                    ItemKindPatch {
+                        default_graph_id: Some(graph),
+                        ..ItemKindPatch::default()
+                    },
+                )
+                .await
+                .expect(CASE),
+        );
+        assert_eq!(
+            kind.default_graph_id, graph,
+            "{CASE}: the update to {graph}"
+        );
+    }
+    let refused = store
+        .update_item_kind(
+            kind.id,
+            kind.updated_at,
+            ItemKindPatch {
+                default_graph_id: Some(foreign.id),
+                ..ItemKindPatch::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            &refused,
+            Err(StoreError::Constraint(text))
+                if *text == graph_not_usable(foreign.id, ids::PROJECT_HTUI)
+        ),
+        "{CASE}: an update to another workspace's graph is refused, got {refused:?}"
+    );
+    let kept = store
+        .item_kinds(ids::PROJECT_HTUI)
+        .await
+        .expect(CASE)
+        .into_iter()
+        .find(|row| row.id == kind.id)
+        .unwrap_or_else(|| panic!("{CASE}: the kind is there"));
+    assert_eq!(kept, kind, "{CASE}: the refused update wrote nothing");
+}
+
+/// MOD-138 D12 (A4): `usable_graphs` lists the project's graphs (an override included), then the
+/// graphs of every workspace holding the project, then the library's, by name within each scope;
+/// a workspace that does not hold the project lends nothing, and unlinking it takes its graphs off
+/// the list.
+async fn usable_graphs_lists_project_workspace_library<S: WriteStore>(store: &S) {
+    const CASE: &str = "usable_graphs_lists_project_workspace_library";
+    let extra = linked_workspace(CASE, store, "usable-extra", ids::PROJECT_HTUI).await;
+    let graph = |scope: GraphScope, name: &'static str, is_override: bool| {
+        store.create_step_graph(scoped_graph(scope, name, is_override))
+    };
+    let clone = graph(
+        GraphScope::Project(ids::PROJECT_HTUI),
+        "HTUI-9-override",
+        true,
+    )
+    .await
+    .expect(CASE);
+    let b_flow = graph(
+        GraphScope::Workspace(ids::WORKSPACE_PLATFORM),
+        "b-flow",
+        false,
+    )
+    .await
+    .expect(CASE);
+    let a_flow = graph(GraphScope::Workspace(extra), "a-flow", false)
+        .await
+        .expect(CASE);
+    let elsewhere = graph(
+        GraphScope::Workspace(ids::WORKSPACE_GRAPHICS),
+        "c-flow",
+        false,
+    )
+    .await
+    .expect(CASE);
+    let lib_b = graph(GraphScope::Library, "lib-b", false)
+        .await
+        .expect(CASE);
+    let lib_a = graph(GraphScope::Library, "lib-a", false)
+        .await
+        .expect(CASE);
+
+    let project: Vec<StepGraphId> = store
+        .step_graphs(ids::PROJECT_HTUI)
+        .await
+        .expect(CASE)
+        .iter()
+        .map(|row| row.id)
+        .collect();
+    assert!(
+        project.contains(&clone.id) && project.contains(&ids::GRAPH_HTUI_FEAT),
+        "{CASE}: the project's own graphs, the override among them"
+    );
+    let mut expected = project.clone();
+    expected.extend([a_flow.id, b_flow.id, lib_a.id, lib_b.id]);
+    let listed = store.usable_graphs(ids::PROJECT_HTUI).await.expect(CASE);
+    assert_eq!(
+        listed.iter().map(|row| row.id).collect::<Vec<_>>(),
+        expected,
+        "{CASE}: project, then workspace, then library, by name within each"
+    );
+    assert!(
+        !listed.iter().any(|row| row.id == elsewhere.id),
+        "{CASE}: a workspace that does not hold the project lends nothing"
+    );
+    assert!(
+        !listed
+            .iter()
+            .any(|row| row.scope == GraphScope::Project(ids::PROJECT_AGY)),
+        "{CASE}: nor does another project"
+    );
+    let a_row = listed
+        .iter()
+        .find(|row| row.id == a_flow.id)
+        .unwrap_or_else(|| panic!("{CASE}: a-flow is listed"));
+    assert_eq!(a_row, &a_flow, "{CASE}: the row as created");
+
+    store
+        .remove_workspace_project(extra, ids::PROJECT_HTUI)
+        .await
+        .expect(CASE);
+    let mut expected = project;
+    expected.extend([b_flow.id, lib_a.id, lib_b.id]);
+    assert_eq!(
+        store
+            .usable_graphs(ids::PROJECT_HTUI)
+            .await
+            .expect(CASE)
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+        expected,
+        "{CASE}: unlinked, the workspace's graphs leave the list"
+    );
+}
+
+/// MOD-138 A3: `delete_workspace` refuses while a kind or an item names one of its graphs (neither
+/// reference cascades), naming the first holder in (graph, holder, project slug) order, and
+/// deletes nothing; once nothing holds the graph the delete applies.
+async fn delete_workspace_refuses_a_held_graph<S: WriteStore>(store: &S) {
+    const CASE: &str = "delete_workspace_refuses_a_held_graph";
+    let workspace = linked_workspace(CASE, store, "held-ws", ids::PROJECT_HTUI).await;
+    let graph = store
+        .create_step_graph(scoped_graph(
+            GraphScope::Workspace(workspace),
+            "held-flow",
+            false,
+        ))
+        .await
+        .expect(CASE);
+    store
+        .create_phase(&new_phase(graph.id, 0, "plan"))
+        .await
+        .expect(CASE);
+    let slug = store
+        .project(ids::PROJECT_HTUI)
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the fixture project"))
+        .slug;
+    let kind = store
+        .create_item_kind(new_item_kind(
+            ids::PROJECT_HTUI,
+            "WSK",
+            "workspace kind",
+            graph.id,
+        ))
+        .await
+        .expect(CASE);
+    let reach = store
+        .delete_reach(DeleteTarget::Workspace(workspace))
+        .await
+        .expect(CASE);
+
+    let refused = store.delete_workspace(workspace).await;
+    assert_eq!(
+        refused,
+        Err(StoreError::Constraint(workspace_graph_is_held(
+            "held-flow",
+            "item_kind WSK",
+            &slug
+        ))),
+        "{CASE}: a kind holds the graph"
+    );
+    assert_eq!(
+        store
+            .delete_reach(DeleteTarget::Workspace(workspace))
+            .await
+            .expect(CASE),
+        reach,
+        "{CASE}: nothing was deleted"
+    );
+    assert!(
+        store.graph_body(graph.id).await.expect(CASE).is_some(),
+        "{CASE}: the graph is still there"
+    );
+
+    // Prefixes are unique per project only, so a second project in the workspace can hold the
+    // graph under the same holder text; the project slug breaks that tie (`agy` before `htui`).
+    store
+        .upsert_workspace_project(&WorkspaceProject {
+            workspace_id: workspace,
+            project_id: ids::PROJECT_AGY,
+            position: 1,
+        })
+        .await
+        .expect(CASE);
+    let agy = store
+        .project(ids::PROJECT_AGY)
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the second fixture project"))
+        .slug;
+    let twin = store
+        .create_item_kind(new_item_kind(
+            ids::PROJECT_AGY,
+            "WSK",
+            "workspace kind",
+            graph.id,
+        ))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store.delete_workspace(workspace).await,
+        Err(StoreError::Constraint(workspace_graph_is_held(
+            "held-flow",
+            "item_kind WSK",
+            core::cmp::min(&agy, &slug)
+        ))),
+        "{CASE}: the project slug breaks a tie"
+    );
+
+    // An item on the graph holds it too, and `item KEY` sorts before `item_kind PREFIX`.
+    let mut item = new_item(
+        ids::PROJECT_HTUI,
+        ids::KIND_HTUI_ANA,
+        "on the workspace graph",
+    );
+    item.step_graph_id = Some(graph.id);
+    let item = store.mint_item(item).await.expect(CASE);
+    assert_eq!(
+        store.delete_workspace(workspace).await,
+        Err(StoreError::Constraint(workspace_graph_is_held(
+            "held-flow",
+            &format!("item {}", item.key),
+            &slug
+        ))),
+        "{CASE}: the item is named first"
+    );
+
+    applied(
+        CASE,
+        store
+            .update_item_kind(
+                kind.id,
+                kind.updated_at,
+                ItemKindPatch {
+                    default_graph_id: Some(ids::GRAPH_HTUI_ANA),
+                    ..ItemKindPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    applied(
+        CASE,
+        store
+            .update_item_kind(
+                twin.id,
+                twin.updated_at,
+                ItemKindPatch {
+                    default_graph_id: Some(ids::GRAPH_AGY_ANA),
+                    ..ItemKindPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    let repointed = store
+        .update_item(
+            item.id,
+            item.version,
+            ItemPatch {
+                step_graph_id: Some(None),
+                author_id: ids::USER,
+                box_id: Some(ids::BOX),
+                reason: "off the workspace graph".to_owned(),
+                ..ItemPatch::default()
+            },
+        )
+        .await
+        .expect(CASE);
+    assert!(
+        matches!(repointed, UpdateOutcome::Updated(_)),
+        "{CASE}: the item lets go, got {repointed:?}"
+    );
+    let done = store.delete_workspace(workspace).await.expect(CASE);
+    assert_eq!(done.step_graphs, 1, "{CASE}: the delete takes the graph");
+    assert_eq!(
+        store.graph_body(graph.id).await.expect(CASE),
+        None,
+        "{CASE}: the graph went with its workspace"
     );
 }
 

@@ -62,7 +62,7 @@ use crate::store::error::{Result, StoreError};
 use crate::store::graph_rules::{
     body_agent_refs, body_persona_refs, default_edges_follow, edge_predicate,
     graph_body_shape_refusal, graph_body_topology_refusal, graph_body_walk_refusal,
-    phase_row_refusal,
+    graph_usable_by, phase_row_refusal,
 };
 use crate::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
@@ -72,7 +72,7 @@ use crate::store::traits::{
     batch_is_closed, chat_step_status, check_attachment, citation_key, close_out_needs_a_summary,
     command_finish_status, command_not_claimable, command_not_queued, document_needs_a_step,
     expected_on_row, failure_disagrees_with_status, finish_run_item_mirror,
-    finish_run_needs_a_terminal_status, graph_not_in_project, invalid_area_code, invalid_prefix,
+    finish_run_needs_a_terminal_status, graph_not_usable, invalid_area_code, invalid_prefix,
     item_has_a_live_run, item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move,
     link_key, link_not_proposed_by_run, link_outside_project, memory_entry_closed,
     memory_subject_taken, new_persona_refusal, new_skill_refusal, not_a_fanout_candidate,
@@ -87,6 +87,7 @@ use crate::store::traits::{
 };
 use crate::store::traits::{
     graph_name_is_taken, override_outside_project, phase_name_is_taken, phase_position_is_taken,
+    workspace_graph_is_held,
 };
 use uuid::Uuid;
 
@@ -3360,8 +3361,9 @@ impl State {
     }
 
     /// The three `item_kind` rules the schema cannot express on its own (D11): the prefix CHECK in
-    /// words, `(project, prefix)` and `(project, name)` uniqueness, and a `default_graph_id` that
-    /// belongs to the kind's own project.
+    /// words, `(project, prefix)` and `(project, name)` uniqueness, and a `default_graph_id` the
+    /// kind's project may use (MOD-138 D12, [`graph_usable_by`]): its own, a workspace's that
+    /// holds it, or the library's.
     fn check_item_kind(
         &self,
         project: ProjectId,
@@ -3378,12 +3380,13 @@ impl State {
                 "item_kind.project_id `{project}` references no project"
             )));
         }
+        let workspaces = self.workspaces_of(project);
         if self
             .graphs
             .get(&graph)
-            .is_none_or(|row| row.scope != GraphScope::Project(project))
+            .is_none_or(|row| !graph_usable_by(row.scope, project, &workspaces))
         {
-            return Err(StoreError::Constraint(graph_not_in_project(graph, project)));
+            return Err(StoreError::Constraint(graph_not_usable(graph, project)));
         }
         let clashes = |taken: &dyn Fn(&ItemKind) -> bool| {
             self.kinds
@@ -3625,6 +3628,39 @@ impl State {
             .cloned()
             .collect();
         rows.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+        rows
+    }
+
+    /// MOD-138 D12: the `workspace_id` of every `workspace_project` row of `project`.
+    fn workspaces_of(&self, project: ProjectId) -> Vec<WorkspaceId> {
+        self.workspace_projects
+            .iter()
+            .filter(|row| row.project_id == project)
+            .map(|row| row.workspace_id)
+            .collect()
+    }
+
+    /// MOD-138 D12 (A4): every graph `project` may use ([`graph_usable_by`]), ordered by scope
+    /// (project, workspace, library), then `name` bytes, then id: `PgStore`'s `ORDER BY`.
+    fn usable_graph_rows(&self, project: ProjectId) -> Vec<StepGraph> {
+        let workspaces = self.workspaces_of(project);
+        let rank = |scope: GraphScope| match scope {
+            GraphScope::Project(_) => 0_u8,
+            GraphScope::Workspace(_) => 1,
+            GraphScope::Library => 2,
+        };
+        let mut rows: Vec<StepGraph> = self
+            .graphs
+            .values()
+            .filter(|row| graph_usable_by(row.scope, project, &workspaces))
+            .cloned()
+            .collect();
+        rows.sort_by(|left, right| {
+            rank(left.scope)
+                .cmp(&rank(right.scope))
+                .then_with(|| left.name.as_bytes().cmp(right.name.as_bytes()))
+                .then_with(|| left.id.cmp(&right.id))
+        });
         rows
     }
 
@@ -5105,6 +5141,46 @@ impl State {
         (graphs, phases)
     }
 
+    /// MOD-138 A3: the first kind or item naming one of `graphs`, in (graph name bytes, holder
+    /// bytes, project slug bytes) order (holder `item_kind PREFIX` or `item KEY`; the slug breaks
+    /// a tie between two projects of the workspace), as [`workspace_graph_is_held`]'s sentence;
+    /// `None` while nothing holds them. `PgStore`'s holder query has the same order.
+    fn workspace_graph_holder(&self, graphs: &HashSet<StepGraphId>) -> Option<String> {
+        let slug = |project: ProjectId| {
+            self.projects
+                .get(&project)
+                .map_or_else(|| project.to_string(), |row| row.slug.clone())
+        };
+        let name = |graph: StepGraphId| self.graphs.get(&graph).map(|row| row.name.clone());
+        let kinds = self.kinds.values().filter_map(|kind| {
+            graphs
+                .contains(&kind.default_graph_id)
+                .then(|| name(kind.default_graph_id))
+                .flatten()
+                .map(|graph| {
+                    (
+                        graph,
+                        format!("item_kind {}", kind.prefix),
+                        slug(kind.project_id),
+                    )
+                })
+        });
+        let items = self.items.values().filter_map(|item| {
+            let graph = item.step_graph_id.filter(|graph| graphs.contains(graph))?;
+            name(graph).map(|graph| (graph, format!("item {}", item.key), slug(item.project_id)))
+        });
+        kinds
+            .chain(items)
+            .min_by(|left, right| {
+                left.0
+                    .as_bytes()
+                    .cmp(right.0.as_bytes())
+                    .then_with(|| left.1.as_bytes().cmp(right.1.as_bytes()))
+                    .then_with(|| left.2.as_bytes().cmp(right.2.as_bytes()))
+            })
+            .map(|(graph, holder, project)| workspace_graph_is_held(&graph, &holder, &project))
+    }
+
     /// What a workspace delete reaches: its links and its box paths, and no project (D4); since
     /// MOD-137 D3 also its graphs, their phases and their candidates (no new `DeleteReach` field:
     /// blueprint §4 item 9).
@@ -5385,6 +5461,11 @@ impl State {
         }
         // MOD-137 D3: its graphs go, with everything that cascades from them.
         let (graphs, phases) = self.workspace_graphs(id);
+        // MOD-138 A3: but neither `item_kind.default_graph_id` nor `item.step_graph_id` cascades
+        // (Postgres answers `23503`), so a held graph refuses the delete before anything goes.
+        if let Some(held) = self.workspace_graph_holder(&graphs) {
+            return Err(StoreError::Constraint(held));
+        }
         let reach = self.workspace_reach_of(id, &graphs, &phases);
         self.phase_agents
             .retain(|(phase, _), _| !phases.contains(phase));
@@ -9525,6 +9606,10 @@ impl WriteStore for MemStore {
 
     async fn step_graphs(&self, project: ProjectId) -> Result<Vec<StepGraph>> {
         Ok(self.read(|state| state.step_graph_rows(project)))
+    }
+
+    async fn usable_graphs(&self, project: ProjectId) -> Result<Vec<StepGraph>> {
+        Ok(self.read(|state| state.usable_graph_rows(project)))
     }
 
     async fn create_phase(&self, phase: &StepGraphPhase) -> Result<StepGraphPhase> {

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE item_kind SET\n                prefix           = COALESCE($3, prefix),\n                name             = COALESCE($4, name),\n                description      = COALESCE($5, description),\n                default_graph_id = COALESCE($6, default_graph_id),\n                position         = COALESCE($7, position)\n             WHERE id = $1\n               AND updated_at = $2\n               AND EXISTS (SELECT 1 FROM step_graph g\n                            WHERE g.id = COALESCE($6, item_kind.default_graph_id)\n                              AND g.project_id = item_kind.project_id)\n            RETURNING id               AS \"id: ItemKindId\",\n                      project_id       AS \"project_id: ProjectId\",\n                      prefix,\n                      name,\n                      description,\n                      default_graph_id AS \"default_graph_id: StepGraphId\",\n                      position,\n                      updated_at\n            ",
+  "query": "\n            UPDATE item_kind SET\n                prefix           = COALESCE($3, prefix),\n                name             = COALESCE($4, name),\n                description      = COALESCE($5, description),\n                default_graph_id = COALESCE($6, default_graph_id),\n                position         = COALESCE($7, position)\n             WHERE id = $1\n               AND updated_at = $2\n               AND EXISTS (SELECT 1 FROM step_graph g\n                            WHERE g.id = COALESCE($6, item_kind.default_graph_id)\n                              AND (g.project_id = item_kind.project_id\n                                   OR (g.project_id IS NULL AND g.workspace_id IS NULL)\n                                   OR g.workspace_id IN (SELECT wp.workspace_id\n                                                           FROM workspace_project wp\n                                                          WHERE wp.project_id\n                                                                = item_kind.project_id)))\n            RETURNING id               AS \"id: ItemKindId\",\n                      project_id       AS \"project_id: ProjectId\",\n                      prefix,\n                      name,\n                      description,\n                      default_graph_id AS \"default_graph_id: StepGraphId\",\n                      position,\n                      updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -114,5 +114,5 @@
       false
     ]
   },
-  "hash": "7f40edc4425773b97278ef8f71b217b013205986699460eb1853efcf0d6407ab"
+  "hash": "f3b3588a87cf0fb2ffa22d79bbcd20a9349d368f85338824d107ab0e5cd5f26a"
 }

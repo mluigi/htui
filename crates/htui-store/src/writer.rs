@@ -722,6 +722,13 @@ impl WriteStore for Writer {
         }
     }
 
+    async fn usable_graphs(&self, project: ProjectId) -> Result<Vec<StepGraph>> {
+        match self {
+            Self::Memory(store) => store.usable_graphs(project).await,
+            Self::Online(pg) => pg.usable_graphs(project).await,
+        }
+    }
+
     async fn create_phase(&self, phase: &StepGraphPhase) -> Result<StepGraphPhase> {
         match self {
             Self::Memory(store) => store.create_phase(phase).await,

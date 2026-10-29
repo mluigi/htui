@@ -50,13 +50,14 @@ impl EditReason {
 /// D5: an edit whose every field equals the item's. Said by the form, refused by the worker.
 pub const NOTHING_TO_SAVE: &str = "nothing to save: no field differs from the item";
 
-/// What a spec is checked against: one project's kinds, step graphs and repos.
+/// What a spec is checked against: one project's kinds, the step graphs it may use, and its repos.
 #[derive(Debug, Clone, Copy)]
 pub struct SpecContext<'a> {
     /// The project's item kinds.
     pub kinds: &'a [ItemKind],
-    /// The project's graphs. `is_override` rows may be present (the worker passes
-    /// `step_graphs()` whole); the check never accepts one as a change (A3).
+    /// The graphs the project may use (MOD-138 D12): its own, each workspace's that holds it and
+    /// the library's (`usable_graphs()`). `is_override` rows may be present; the check never
+    /// accepts one as a change (A3), so an item never names another item's override.
     pub graphs: &'a [StepGraph],
     /// The project's repos, with their names and `is_primary`.
     pub repos: &'a [Repo],
@@ -150,7 +151,7 @@ pub enum SpecError {
     #[error("that kind is not one of this project's item kinds")]
     Kind(ItemKindId),
     /// The graph is not one of the context's non-override graphs.
-    #[error("that step graph is not one of this project's graphs")]
+    #[error("that step graph is not one this project can use")]
     Graph(StepGraphId),
     /// The title or the body holds U+0000, which Postgres `text` cannot store (`22021`). The
     /// column is named as `has_nul` names it, so both stores refuse it before any write.
@@ -316,8 +317,9 @@ fn check_tags(tags: &[String]) -> Result<Vec<String>, SpecError> {
     canonical_declared_tags(tags).map_err(SpecError::Tags)
 }
 
-/// `None` (the kind's default) or one of the context's graphs that is not an override (A3). An
-/// item's unchanged override graph is never in a [`SpecChanges`], so it never reaches here.
+/// `None` (the kind's default) or one of the context's graphs (the graphs the project may use,
+/// MOD-138 D12) that is not an override (A3). An item's unchanged override graph is never in a
+/// [`SpecChanges`], so it never reaches here.
 fn check_graph(
     id: Option<StepGraphId>,
     ctx: &SpecContext<'_>,
@@ -495,7 +497,7 @@ mod tests {
     use chrono::{DateTime, Utc};
 
     use super::*;
-    use crate::model::{GraphScope, RepoId, Status};
+    use crate::model::{GraphScope, RepoId, Status, WorkspaceId};
 
     const EPOCH: DateTime<Utc> = DateTime::UNIX_EPOCH;
 
@@ -872,6 +874,42 @@ mod tests {
             ..SpecChanges::default()
         };
         assert_eq!(check_changes(&clear, &context), Ok(clear.clone()));
+    }
+
+    /// MOD-138 D12: the context lists the graphs the project may use, so a workspace or library
+    /// graph in it is accepted like the project's own, on a mint and as a change.
+    #[test]
+    fn a_workspace_or_library_graph_in_the_context_is_accepted() {
+        let project = ProjectId::new();
+        let ours = kind(project);
+        let library = StepGraph {
+            scope: GraphScope::Library,
+            ..graph(project, false)
+        };
+        let shared = StepGraph {
+            scope: GraphScope::Workspace(WorkspaceId::new()),
+            ..graph(project, false)
+        };
+        let repos = [repo("htui", true)];
+        let graphs = [graph(project, false), shared.clone(), library.clone()];
+        let context = ctx(core::slice::from_ref(&ours), &graphs, &repos);
+
+        for chosen in [&library, &shared] {
+            let minted = ItemSpec {
+                step_graph_id: Some(chosen.id),
+                ..spec(&ours)
+            };
+            assert_eq!(check_spec(&minted, &context), Ok(minted.clone()));
+            let changes = SpecChanges {
+                step_graph_id: Some(Some(chosen.id)),
+                ..SpecChanges::default()
+            };
+            assert_eq!(check_changes(&changes, &context), Ok(changes.clone()));
+        }
+        assert_eq!(
+            SpecError::Graph(library.id).to_string(),
+            "that step graph is not one this project can use"
+        );
     }
 
     /// A3: an override graph is never accepted as a change, on a mint or an edit.

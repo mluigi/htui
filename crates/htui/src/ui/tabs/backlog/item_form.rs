@@ -39,6 +39,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::divergence::{Divergence, ViewOutcome, rebased_on, still_behind};
+use crate::catalogue::graph_label;
 use crate::editor::{
     ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, edited, strip_added_newline,
     without_controls,
@@ -109,7 +110,8 @@ pub enum Field {
     Priority,
     /// The required tags, a comma list.
     Tags,
-    /// The step-graph picker: the kind's default or one of the project's graphs.
+    /// The step-graph picker: the kind's default or one of the graphs the project may use (its
+    /// own, a workspace's that holds it, the library's; MOD-138 D12).
     Graph,
     /// The touched paths, one per line.
     Paths,
@@ -931,8 +933,9 @@ impl ItemForm {
         }
     }
 
-    /// The graph picker's options: the kind default, the project's graphs, then on an edit the
-    /// item's own graph when it is not among them (an override, A3).
+    /// The graph picker's options: the kind default, the graphs the project may use (its own, then
+    /// a workspace's, then the library's; MOD-138 D12), then on an edit the item's own graph when
+    /// it is not among them (an override, A3).
     fn graph_options(&self) -> Vec<Option<StepGraphId>> {
         let mut options = vec![None];
         options.extend(self.context.graphs.iter().map(|graph| Some(graph.id)));
@@ -986,10 +989,11 @@ impl ItemForm {
                     .context
                     .graphs
                     .iter()
-                    .find(|graph| graph.id == id)
+                    .chain(&self.context.item_graph)
+                    .find(|graph| graph.id == id && !graph.is_override)
                     .map_or_else(
                         || "override (this item's)".to_owned(),
-                        |graph| graph.name.clone(),
+                        |graph| graph_label(&graph.name, graph.scope),
                     ),
             },
             Field::Title | Field::Priority | Field::Tags | Field::Paths | Field::Body => {
@@ -1191,7 +1195,7 @@ mod tests {
     use crate::ui::tabs::backlog::panes;
     use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
-    use htui_core::model::{ItemPatch, NewItemKind, NewStepGraph};
+    use htui_core::model::{GraphScope, ItemPatch, NewItemKind, NewStepGraph};
     use htui_core::store::{MemStore, WriteStore as _};
     use htui_store::Backend;
 
@@ -1715,6 +1719,44 @@ mod tests {
         assert_eq!(form.body.text(), "one\ntwo");
     }
 
+    /// MOD-138 D12: a workspace or library graph is offered after the project's, and its label
+    /// says where it lives; a project graph's label is its bare name.
+    #[tokio::test]
+    async fn a_shared_graph_is_offered_with_its_scope_in_the_label() {
+        let store = MemStore::demo();
+        let mut ids_by_name = Vec::new();
+        for (scope, name) in [
+            (GraphScope::Workspace(ids::WORKSPACE_PLATFORM), "wsflow"),
+            (GraphScope::Library, "libflow"),
+        ] {
+            let graph = store
+                .create_step_graph(NewStepGraph {
+                    id: StepGraphId::new(),
+                    scope,
+                    name: name.to_owned(),
+                    description: String::new(),
+                    is_override: false,
+                })
+                .await
+                .expect("a shared graph");
+            ids_by_name.push((graph.id, name));
+        }
+        let htui = context(&store, ids::PROJECT_HTUI, None).await;
+        let mut form = ItemForm::open_new(htui.clone(), &projects(), None);
+        let options = form.graph_options();
+        assert_eq!(
+            &options[options.len() - 2..],
+            &[Some(ids_by_name[0].0), Some(ids_by_name[1].0)],
+            "after the project's graphs"
+        );
+        form.graph = Some(htui.graphs[0].id);
+        assert_eq!(form.picker_label(Field::Graph), htui.graphs[0].name);
+        form.graph = Some(ids_by_name[0].0);
+        assert_eq!(form.picker_label(Field::Graph), "wsflow \u{b7} workspace");
+        form.graph = Some(ids_by_name[1].0);
+        assert_eq!(form.picker_label(Field::Graph), "libflow \u{b7} library");
+    }
+
     #[tokio::test]
     async fn the_graph_picker_offers_kind_default_project_graphs_and_keeps_an_override() {
         let store = MemStore::demo();
@@ -1735,7 +1777,7 @@ mod tests {
         let clone = store
             .create_step_graph(NewStepGraph {
                 id: StepGraphId::new(),
-                scope: htui_core::model::GraphScope::Project(ids::PROJECT_HTUI),
+                scope: GraphScope::Project(ids::PROJECT_HTUI),
                 name: "ANA-1 override".to_owned(),
                 description: String::new(),
                 is_override: true,
@@ -1757,6 +1799,51 @@ mod tests {
         assert_eq!(edit.graph_options().last(), Some(&Some(clone.id)));
         assert_eq!(edit.graph_options().len(), expected.len() + 1);
         assert_eq!(edit.picker_label(Field::Graph), "override (this item's)");
+    }
+
+    /// MOD-138 D12: an item keeps its workspace graph after the project leaves that workspace,
+    /// and the picker still offers that graph at the end of the list, labelled with its scope
+    /// rather than as an override, which it is not.
+    #[tokio::test]
+    async fn a_left_workspace_graph_is_labelled_with_its_scope_not_as_an_override() {
+        let store = MemStore::demo();
+        let shared = store
+            .create_step_graph(NewStepGraph {
+                id: StepGraphId::new(),
+                scope: GraphScope::Workspace(ids::WORKSPACE_PLATFORM),
+                name: "wsflow".to_owned(),
+                description: String::new(),
+                is_override: false,
+            })
+            .await
+            .expect("a workspace graph");
+        store
+            .update_item(
+                ids::HTUI_ANA_1,
+                1,
+                ItemPatch {
+                    step_graph_id: Some(Some(shared.id)),
+                    ..patch()
+                },
+            )
+            .await
+            .expect("the item takes it");
+        store
+            .remove_workspace_project(ids::WORKSPACE_PLATFORM, ids::PROJECT_HTUI)
+            .await
+            .expect("the project leaves the workspace");
+
+        let edit = edit_form(&store, ids::HTUI_ANA_1).await;
+        assert!(
+            !edit
+                .context
+                .graphs
+                .iter()
+                .any(|graph| graph.id == shared.id),
+            "the project may no longer pick it"
+        );
+        assert_eq!(edit.graph_options().last(), Some(&Some(shared.id)));
+        assert_eq!(edit.picker_label(Field::Graph), "wsflow \u{b7} workspace");
     }
 
     #[test]
@@ -2335,7 +2422,7 @@ mod tests {
         let graph = store
             .create_step_graph(NewStepGraph {
                 id: StepGraphId::new(),
-                scope: htui_core::model::GraphScope::Project(ids::PROJECT_HTUI),
+                scope: GraphScope::Project(ids::PROJECT_HTUI),
                 name: "after the form".to_owned(),
                 description: String::new(),
                 is_override: false,

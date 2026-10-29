@@ -64,7 +64,7 @@ use htui_core::store::{
     QueueToken, ReadStore as _, Result, SettingRung, StepFence, StoreError, StoredSetting,
     TransitionLaw, UpdateOutcome, WriteStore, already_exists, chat_step_status, check_attachment,
     citation_key, close_out_needs_a_summary, expected_on_row, failure_disagrees_with_status,
-    finish_run_item_mirror, finish_run_needs_a_terminal_status, graph_not_in_project, illegal_move,
+    finish_run_item_mirror, finish_run_needs_a_terminal_status, graph_not_usable, illegal_move,
     invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project,
     lease_ttl_micros, legal_move, new_persona_refusal, new_skill_refusal, not_a_fanout_candidate,
     not_a_terminal_status, persona_is_bound, persona_patch_refusal, prompt_template_key,
@@ -78,7 +78,7 @@ use htui_core::store::{
     body_agent_refs, body_persona_refs, default_edges_follow, edge_predicate,
     graph_body_shape_refusal, graph_body_topology_refusal, graph_body_walk_refusal,
     graph_name_is_taken, override_outside_project, phase_name_is_taken, phase_position_is_taken,
-    phase_row_refusal,
+    phase_row_refusal, workspace_graph_is_held,
 };
 use serde_json::Value;
 use sqlx::types::Json;
@@ -3441,13 +3441,14 @@ impl WriteStore for PgStore {
     /// rather than `23514` and a constraint name; the `WHERE EXISTS` is the shape
     /// [`mint_item`](PgStore::mint_item)'s kind guard has, because `item_kind.default_graph_id`
     /// references `step_graph(id)` alone (`0001_init.sql:288`) and nothing below the seam checks
-    /// that the graph is the kind's own project's. Zero rows out is therefore exactly "the guard
-    /// fired", and one follow-up read names which of its two halves.
+    /// that the graph is one the kind's project may use (MOD-138 D12: its own, a workspace's that
+    /// holds it, or the library's). Zero rows out is therefore exactly "the guard fired", and one
+    /// follow-up read names which of its two halves.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Constraint`] for a bad prefix, an unknown project, a graph from another
-    /// project, or a taken `(project_id, prefix)` / `(project_id, name)` (`23505`).
+    /// [`StoreError::Constraint`] for a bad prefix, an unknown project, a graph the project may
+    /// not use, or a taken `(project_id, prefix)` / `(project_id, name)` (`23505`).
     async fn create_item_kind(&self, new: NewItemKind) -> Result<ItemKind> {
         if !ItemKind::prefix_is_valid(&new.prefix) {
             return Err(StoreError::Constraint(invalid_prefix(&new.prefix)));
@@ -3459,7 +3460,13 @@ impl WriteStore for PgStore {
             INSERT INTO item_kind (id, project_id, prefix, name, description, default_graph_id,
                                    position)
             SELECT $1, $2, $3, $4, $5, $6, $7
-             WHERE EXISTS (SELECT 1 FROM step_graph g WHERE g.id = $6 AND g.project_id = $2)
+             WHERE EXISTS (SELECT 1 FROM step_graph g
+                            WHERE g.id = $6
+                              AND (g.project_id = $2
+                                   OR (g.project_id IS NULL AND g.workspace_id IS NULL)
+                                   OR g.workspace_id IN (SELECT wp.workspace_id
+                                                           FROM workspace_project wp
+                                                          WHERE wp.project_id = $2)))
             RETURNING id               AS "id: ItemKindId",
                       project_id       AS "project_id: ProjectId",
                       prefix,
@@ -3545,7 +3552,12 @@ impl WriteStore for PgStore {
                AND updated_at = $2
                AND EXISTS (SELECT 1 FROM step_graph g
                             WHERE g.id = COALESCE($6, item_kind.default_graph_id)
-                              AND g.project_id = item_kind.project_id)
+                              AND (g.project_id = item_kind.project_id
+                                   OR (g.project_id IS NULL AND g.workspace_id IS NULL)
+                                   OR g.workspace_id IN (SELECT wp.workspace_id
+                                                           FROM workspace_project wp
+                                                          WHERE wp.project_id
+                                                                = item_kind.project_id)))
             RETURNING id               AS "id: ItemKindId",
                       project_id       AS "project_id: ProjectId",
                       prefix,
@@ -3583,7 +3595,7 @@ impl WriteStore for PgStore {
         // The compare-and-set matched, so the only other conjunct of the `WHERE` - the graph guard
         // - is what refused the row, and the project exists because the row does.
         let graph = patch.default_graph_id.unwrap_or(current.default_graph_id);
-        Err(StoreError::Constraint(graph_not_in_project(
+        Err(StoreError::Constraint(graph_not_usable(
             graph,
             current.project_id,
         )))
@@ -3802,6 +3814,10 @@ impl WriteStore for PgStore {
     /// Whatever the driver reports, through [`map_sqlx`].
     async fn step_graphs(&self, project: ProjectId) -> Result<Vec<StepGraph>> {
         self.step_graph_rows(project).await
+    }
+
+    async fn usable_graphs(&self, project: ProjectId) -> Result<Vec<StepGraph>> {
+        self.usable_graph_rows(project).await
     }
 
     /// The whole row (D10), minus `updated_at`: the column is left out of the insert so it takes
@@ -5837,7 +5853,8 @@ impl WriteStore for PgStore {
     /// # Errors
     ///
     /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Constraint`] when every attempt
-    /// lost the race, in which case nothing was deleted.
+    /// lost the race, in which case nothing was deleted, or (MOD-138 A3) while a kind or an item
+    /// names one of the workspace's graphs, checked in the same transaction before the delete.
     async fn delete_workspace(&self, id: WorkspaceId) -> Result<DeleteReach> {
         for _ in 0..DELETE_ATTEMPTS {
             if let Some(reach) = self.delete_workspace_once(id).await? {
@@ -9780,6 +9797,41 @@ impl PgStore {
                 id: id.to_string(),
             });
         };
+        // MOD-138 A3: the workspace's graphs cascade with it, but `item_kind.default_graph_id` and
+        // `item.step_graph_id` do not, so a held graph refuses the delete here, in `MemStore`'s
+        // sentence and order, rather than as a `23503` mid-cascade. The FK stays the backstop
+        // for a holder that commits after this read. A `UNION` sorts only by its own columns, so
+        // the `COLLATE "C"` order goes on a derived table; the project slug breaks a tie between
+        // two projects of the workspace holding the graph under the same prefix or key.
+        let held = sqlx::query!(
+            r#"
+            SELECT h.graph AS "graph!", h.project AS "project!", h.holder AS "holder!"
+              FROM (SELECT g.name AS graph, pr.slug AS project, 'item_kind ' || k.prefix AS holder
+                      FROM item_kind k
+                      JOIN step_graph g ON g.id = k.default_graph_id
+                      JOIN project pr ON pr.id = k.project_id
+                     WHERE g.workspace_id = $1
+                    UNION ALL
+                    SELECT g.name, pr.slug, 'item ' || i.key
+                      FROM item i
+                      JOIN step_graph g ON g.id = i.step_graph_id
+                      JOIN project pr ON pr.id = i.project_id
+                     WHERE g.workspace_id = $1) h
+             ORDER BY h.graph COLLATE "C", h.holder COLLATE "C", h.project COLLATE "C"
+             LIMIT 1
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if let Some(held) = held {
+            return Err(StoreError::Constraint(workspace_graph_is_held(
+                &held.graph,
+                &held.holder,
+                &held.project,
+            )));
+        }
         match sqlx::query!("DELETE FROM workspace WHERE id = $1", id.as_uuid())
             .execute(&mut *tx)
             .await
@@ -9825,12 +9877,12 @@ impl PgStore {
     /// Which half of the `item_kind` writers' folded `EXISTS` guard refused, in the sentence
     /// `MemStore` uses for it (D11).
     ///
-    /// The guard is one conjunct and covers two rules — an unknown project and a graph that is not
-    /// the project's — so the split is made here, on the failure path only, rather than by two
+    /// The guard is one conjunct and covers two rules — an unknown project and a graph the project
+    /// may not use (MOD-138 D12) — so the split is made here, on the failure path only, rather than by two
     /// statements on every create.
     async fn kind_guard_refusal(&self, project: ProjectId, graph: StepGraphId) -> StoreError {
         match self.project(project).await {
-            Ok(Some(_)) => StoreError::Constraint(graph_not_in_project(graph, project)),
+            Ok(Some(_)) => StoreError::Constraint(graph_not_usable(graph, project)),
             Ok(None) => StoreError::Constraint(format!(
                 "item_kind.project_id `{project}` references no project"
             )),

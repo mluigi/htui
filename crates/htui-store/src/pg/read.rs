@@ -2970,6 +2970,49 @@ impl PgStore {
         .collect()
     }
 
+    /// MOD-138 D12 (A4): every graph `project` may use: its own, each workspace's that holds it
+    /// (`workspace_project`), and the library's (neither owner column set); ordered by scope in
+    /// that order, then `name` bytes, then id, as `MemStore` orders them.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub(crate) async fn usable_graph_rows(&self, project: ProjectId) -> Result<Vec<StepGraph>> {
+        sqlx::query_as!(
+            StepGraphRow,
+            r#"
+            SELECT g.id           AS "id: StepGraphId",
+                   g.project_id   AS "project_id: ProjectId",
+                   g.workspace_id AS "workspace_id: WorkspaceId",
+                   g.name,
+                   g.description,
+                   -- `StepGraphRow`'s order: `query_as!` binds positionally (T1 audit A-4).
+                   g.is_override,
+                   g.revision,
+                   g.created_at,
+                   g.updated_at
+              FROM step_graph g
+             WHERE g.project_id = $1
+                OR (g.project_id IS NULL AND g.workspace_id IS NULL)
+                OR g.workspace_id IN (SELECT wp.workspace_id
+                                        FROM workspace_project wp
+                                       WHERE wp.project_id = $1)
+             ORDER BY CASE WHEN g.project_id IS NOT NULL THEN 0
+                           WHEN g.workspace_id IS NOT NULL THEN 1
+                           ELSE 2 END,
+                      g.name COLLATE "C",
+                      g.id
+            "#,
+            project.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .into_iter()
+        .map(StepGraph::try_from)
+        .collect()
+    }
+
     /// A graph's phases, ordered by `position`, which is unique per graph.
     ///
     /// # Errors
