@@ -196,7 +196,8 @@ impl DocumentsTab {
         let compose = self.compose.as_mut()?;
         // The maintainer answer to blueprint §6 Q1 (a `v` form saved untouched writes nothing) is
         // the area's own `form.save` rule now (MOD-67 M5).
-        Some(match compose.on_key(key, ctx.keys()) {
+        let pressed = ctx.pressed(&key);
+        Some(match compose.on_pressed(key, pressed, ctx.keys()) {
             ComposeOutcome::Stay => Handled::Consumed,
             ComposeOutcome::Pass => Handled::Pass,
             ComposeOutcome::Cancel => {
@@ -624,7 +625,7 @@ impl DetailTab for DocumentsTab {
         if let Some(compose) = &self.compose {
             let title = self.compose_title(compose);
             let kinds = self.kinds();
-            let body = compose::render(frame, area, compose, &title, Some(&kinds), ctx.theme);
+            let body = compose::render(frame, area, compose, &title, Some(&kinds), ctx);
             ctx.claim_editor_area(body);
             return;
         }
@@ -928,7 +929,7 @@ mod tests {
         assert_eq!(pane.opened, Some(2));
         let text = drawn(43, 23, |frame, rect| pane.render(frame, rect, &shell.ctx()));
         assert!(text.contains(" New version of plan (from v2) "), "{text}");
-        assert!(!text.contains("kinds:"), "{text}");
+        assert!(!text.contains("kinds "), "{text}");
     }
 
     /// MOD-57 P2 (PD-3): the open form claims its body for an in-pane editor, the rect under its
@@ -1540,7 +1541,7 @@ mod tests {
         assert_eq!(pane.kinds(), "plan, prd, summary");
         open(&shell, &backend, &mut pane, 'a').await;
         let text = drawn(43, 23, |frame, rect| pane.render(frame, rect, &shell.ctx()));
-        assert!(text.contains("kinds: plan, prd, summary"), "{text}");
+        assert!(text.contains("kinds   plan, prd, summary"), "{text}");
 
         let empty = pane_on(&shell, &store, ids::HTUI_ANA_2).await;
         assert_eq!(empty.kinds(), "summary");

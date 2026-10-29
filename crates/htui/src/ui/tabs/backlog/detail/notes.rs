@@ -183,7 +183,8 @@ impl NotesTab {
     /// A key while the area is open: its outcome, mapped for the Backlog.
     fn on_compose_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Option<Handled> {
         let compose = self.compose.as_mut()?;
-        Some(match compose.on_key(key, ctx.keys()) {
+        let pressed = ctx.pressed(&key);
+        Some(match compose.on_pressed(key, pressed, ctx.keys()) {
             ComposeOutcome::Stay => Handled::Consumed,
             ComposeOutcome::Pass => Handled::Pass,
             ComposeOutcome::Cancel => {
@@ -438,7 +439,7 @@ impl DetailTab for NotesTab {
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         if let Some(compose) = &self.compose {
-            let body = compose::render(frame, area, compose, " New note ", None, ctx.theme);
+            let body = compose::render(frame, area, compose, " New note ", None, ctx);
             ctx.claim_editor_area(body);
             return;
         }

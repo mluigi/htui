@@ -20,14 +20,17 @@
 //! - **Redaction**: `Compose`'s `Debug` prints lengths and the fixed kind, never the title or the
 //!   body.
 
+use std::borrow::Cow;
+
 use crossterm::event::KeyEvent;
 use htui_core::model::item_spec::NOTHING_TO_SAVE;
 use htui_core::model::{Document, ItemId, hand_written};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::text::Line;
+use ratatui::widgets::Paragraph;
 
+use crate::app::Ctx;
 use crate::editor::{
     ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, edited, strip_added_newline,
     without_controls,
@@ -35,13 +38,14 @@ use crate::editor::{
 use crate::hand_written::{ADD_NOTE_NAME, HandText, WRITE_DOCUMENT_NAME};
 use crate::keys::{Act, KeyChord, Keys, Stack, views};
 use crate::store_worker::StoreRequest;
-use crate::ui::cells::{self, cell_width};
-use crate::ui::kit::text::wrapped;
-use crate::ui::tabs::backlog::item_form::{HINT_AREA, HINT_TEXT, PAGE, marker};
+use crate::ui::kit::form::{Field, Form, Value};
+use crate::ui::kit::pane::Focus;
+use crate::ui::kit::rule;
+use crate::ui::kit::text::{Tone, notice, wrapped};
+use crate::ui::tabs::backlog::hints::holder;
+use crate::ui::tabs::backlog::item_form::{HINT_AREA, HINT_TEXT, PAGE};
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme};
 
-/// Width of a row's label, after the two-cell marker: `title` plus two.
-const LABEL: usize = 7;
 /// Rows the body keeps when a long notice grows (the item form's `BODY_MIN`).
 const BODY_MIN: u16 = 3;
 
@@ -328,10 +332,22 @@ impl Compose {
         }
     }
 
-    /// Feeds one key, resolved through [`stack`](Self::stack) (the module doc's order).
+    /// [`on_pressed`](Self::on_pressed) for a key the shell did not translate: the chord pressed
+    /// is the key's own.
+    #[cfg(test)]
     pub fn on_key(&mut self, key: KeyEvent, keys: &Keys) -> ComposeOutcome {
+        self.on_pressed(key, KeyChord::from_event(key), keys)
+    }
+
+    /// Feeds one key, resolved through [`stack`](Self::stack) (the module doc's order).
+    ///
+    /// MOD-115 M4 L-docs (MD-A): `key` is the event the widgets read (the shell's `[field]`
+    /// translation made a rebound editing chord canonical) and `pressed` the chord the user
+    /// pressed (`Ctx::pressed`): the area's own acts resolve from `pressed`, so
+    /// `field.line_down = ["ctrl-j"]` never moves the focus off a one-line field.
+    pub fn on_pressed(&mut self, key: KeyEvent, pressed: KeyChord, keys: &Keys) -> ComposeOutcome {
         let stack = self.stack();
-        let chord = KeyChord::from_event(key);
+        let chord = pressed;
         let acts = keys.actions(stack, chord);
         if self.busy.is_some() {
             let swallowed = acts
@@ -499,32 +515,61 @@ impl Compose {
         }
     }
 
-    /// One one-line row: the marker, the label, and the field (or a fixed kind, dim).
-    fn row_line(&self, part: Part, width: u16, theme: &Theme) -> Line<'static> {
-        let focused = self.focus == part;
-        let label = if part == Part::Kind { "kind" } else { "title" };
-        let head = format!("{}{label:<LABEL$}", marker(focused));
-        let head_style = if focused { theme.title } else { theme.dim };
-        let all = usize::from(width);
-        let room = all.saturating_sub(cell_width(&head));
-        let mut spans = vec![Span::styled(cells::clip(&head, all), head_style)];
-        let field = match part {
-            Part::Kind => match &self.kind {
-                Some(KindField::Typed(field)) => Some(field),
-                Some(KindField::Fixed(kind)) => {
-                    spans.push(Span::styled(cells::clip(kind, room), theme.dim));
-                    None
-                }
-                None => None,
-            },
-            Part::Title => self.title.as_ref(),
-            Part::Body => None,
+    /// A document's rows above its body as a kit form (MOD-115 M4 L-docs): the kind (typed, or
+    /// fixed and dim), the kinds `kinds` names under a typed kind (dim, read-only), the title,
+    /// and the body's heading, the focused one behind the gutter; `None` for a note, whose area
+    /// is its body alone. The kind or title is typed into while focused, so only its label is
+    /// banded and its field shows the cursor; the heading is banded whole while the body has
+    /// the focus.
+    fn form<'a>(&'a self, kinds: Option<&'a str>, theme: &Theme) -> Option<Form<'a>> {
+        let kind = self.kind.as_ref()?;
+        let mut form = Form::new();
+        let mut at = 0;
+        let mut focus = None;
+        let mut add = |form: Form<'a>, part: Option<Part>, field: Field<'a>| {
+            if part == Some(self.focus) {
+                focus = Some(at);
+            }
+            at += 1;
+            form.field(field)
         };
-        if let Some(field) = field {
-            let room = u16::try_from(room).unwrap_or(u16::MAX);
-            spans.extend(field.line(room, focused, theme).spans);
+        form = match kind {
+            KindField::Typed(field) => {
+                let form = add(
+                    form,
+                    Some(Part::Kind),
+                    Field::new("kind", Value::Text(field)),
+                );
+                match kinds {
+                    Some(kinds) => add(
+                        form,
+                        None,
+                        Field::new("kinds", Value::ReadOnly(Cow::Borrowed(kinds))).style(theme.dim),
+                    ),
+                    None => form,
+                }
+            }
+            KindField::Fixed(kind) => add(
+                form,
+                None,
+                Field::new("kind", Value::ReadOnly(Cow::Borrowed(kind))).style(theme.dim),
+            ),
+        };
+        if let Some(title) = &self.title {
+            form = add(
+                form,
+                Some(Part::Title),
+                Field::new("title", Value::Text(title)),
+            );
         }
-        Line::from(spans)
+        if self.focus == Part::Body {
+            focus = Some(at);
+        }
+        let form = form.heading("body").editing(self.focus != Part::Body);
+        Some(match focus {
+            Some(focus) => form.focus(focus),
+            None => form,
+        })
     }
 }
 
@@ -577,9 +622,15 @@ impl Compose {
     }
 }
 
-/// Draws the area over the sub-tab's whole content rect (D6): a top rule titled `title`, the
-/// one-line rows, the body and the notice. Its keys are [`Compose::key_hint`], the shell's hint
-/// row since MOD-67 M6 T2. `kinds` is the Docs pane's hint text, drawn under a typed kind only.
+/// Draws the area over the sub-tab's whole content rect (D6): a top rule titled `title`, a
+/// document's rows, the body and the notice. Its keys are [`Compose::key_hint`], drawn on the
+/// detail pane's border since MOD-115 M4 B1. `kinds` is the Docs pane's hint text, drawn under a
+/// typed kind only.
+///
+/// MOD-115 M4 L-docs: the rule is `kit::rule`'s (C6), in the title role while the area has the
+/// keys, which is while the detail holds the keyboard (C4: a capturing sub-tab's pane) and nothing
+/// covers the tab; a document's rows are a kit form ([`Compose::form`]), the focus its gutter in
+/// the tab's accent (`ctx.accent()`); the notice is the kit's notice row in the error role.
 ///
 /// Returns the body's rect, which the pane claims for an in-pane editor (MOD-57 P2).
 pub fn render(
@@ -588,42 +639,27 @@ pub fn render(
     compose: &Compose,
     title: &str,
     kinds: Option<&str>,
-    theme: &Theme,
+    ctx: &Ctx<'_>,
 ) -> Rect {
-    let block = Block::new()
-        .borders(Borders::TOP)
-        .title(cells::clip(title, usize::from(area.width)));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let theme = ctx.theme;
+    let focused = holder(ctx, false) == Focus::Focused;
+    let inner = rule::render(frame, area, title, focused, theme);
     let width = inner.width;
-    let all = usize::from(width);
 
-    // The one-line rows above the body, each with what it draws.
-    let mut rows: Vec<Line<'static>> = Vec::new();
-    if compose.kind.is_some() {
-        rows.push(compose.row_line(Part::Kind, width, theme));
-        if let (true, Some(kinds)) = (compose.kind_is_typed(), kinds) {
-            rows.push(Line::styled(
-                cells::clip(&format!("  kinds: {kinds}"), all),
-                theme.dim,
-            ));
-        }
-        rows.push(compose.row_line(Part::Title, width, theme));
-        let focused = compose.focus == Part::Body;
-        rows.push(Line::styled(
-            cells::clip(&format!("{}body", marker(focused)), all),
-            if focused { theme.title } else { theme.dim },
-        ));
-    }
+    // The rows above the body: a document's form, laid out at the area's width.
+    let rows = compose
+        .form(kinds, theme)
+        .map(|form| form.layout(width, ctx.accent(), theme))
+        .unwrap_or_default();
     // The item form's notice rule: wrapped here, so the layout sizes it from the same count;
     // it grows into the body's rows, and one longer than all of them loses its first rows (the
     // D10 hedge ends the sentence).
     let mut notice_lines = compose
         .notice
         .as_deref()
-        .map(|sentence| wrapped(sentence, all))
+        .map(|sentence| wrapped(sentence, usize::from(width)))
         .unwrap_or_default();
-    let fixed = u16::try_from(rows.len()).unwrap_or(u16::MAX);
+    let fixed = u16::try_from(rows.lines.len()).unwrap_or(u16::MAX);
     let room = inner.height.saturating_sub(fixed);
     let wanted = u16::try_from(notice_lines.len()).unwrap_or(u16::MAX);
     let notice_height = wanted.min(room);
@@ -631,14 +667,13 @@ pub fn render(
     if wanted > notice_height {
         notice_lines.drain(..usize::from(wanted - notice_height));
     }
-    let mut constraints: Vec<Constraint> = rows.iter().map(|_| Constraint::Length(1)).collect();
-    constraints.extend([Constraint::Min(body_min), Constraint::Length(notice_height)]);
-    let areas = Layout::vertical(constraints).split(inner);
-    let count = rows.len();
-    for (line, at) in rows.into_iter().zip(areas.iter()) {
-        frame.render_widget(Paragraph::new(line), *at);
-    }
-    let [body, notice] = [areas[count], areas[count + 1]];
+    let [form, body, below] = Layout::vertical([
+        Constraint::Length(fixed),
+        Constraint::Min(body_min),
+        Constraint::Length(notice_height),
+    ])
+    .areas(inner);
+    rows.render(frame, form, 0);
     frame.render_widget(
         Paragraph::new(compose.body.lines(
             body.width,
@@ -651,11 +686,11 @@ pub fn render(
     frame.render_widget(
         Paragraph::new(
             notice_lines
-                .into_iter()
-                .map(|line| Line::styled(line, theme.error))
-                .collect::<Vec<_>>(),
+                .iter()
+                .map(|line| notice(line, Tone::Error, theme))
+                .collect::<Vec<Line<'static>>>(),
         ),
-        notice,
+        below,
     );
     body
 }
@@ -681,7 +716,8 @@ pub(super) mod bench {
         scope: Scope,
         projects: Vec<ProjectRef>,
         top_bar: TopBarState,
-        keys: Keys,
+        /// The keys in force (the compiled defaults unless a test rebinds them).
+        pub keys: Keys,
         /// The palette, for the panes' `lines`.
         pub theme: Theme,
         emit: Emit,
@@ -781,9 +817,14 @@ mod tests {
     use htui_core::fixtures::ids;
     use htui_core::model::DocumentId;
 
-    use super::bench::{ctrl, drawn, key};
+    use ratatui::buffer::Buffer;
+    use ratatui::style::{Color, Modifier};
+
+    use super::bench::{Shell, ctrl, drawn, key};
     use super::*;
     use crate::keys::HintSpec;
+    use crate::ui::cells::cell_width;
+    use crate::ui::kit::list::GUTTER;
 
     /// `spec` through `compose`'s stack under the default keys.
     fn rendered(compose: &Compose, spec: HintSpec) -> String {
@@ -1160,11 +1201,38 @@ mod tests {
         assert!(shown.contains("plan"), "{shown}");
     }
 
+    /// `compose` drawn by [`render`] into a `width` x `height` test terminal through `ctx`, the
+    /// buffer and the body rect it returned.
+    fn painted(
+        compose: &Compose,
+        title: &str,
+        kinds: Option<&str>,
+        ctx: &Ctx<'_>,
+        (width, height): (u16, u16),
+    ) -> (Buffer, Rect) {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("a test terminal");
+        let mut body = Rect::default();
+        terminal
+            .draw(|frame| body = render(frame, frame.area(), compose, title, kinds, ctx))
+            .expect("the frame draws");
+        (terminal.backend().buffer().clone(), body)
+    }
+
+    /// Row `y` of `buffer` as text.
+    fn row_of(buffer: &Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
     #[test]
     fn the_area_s_keys_follow_its_focus_outside_the_pane() {
+        let shell = Shell::new();
         let compose = note();
         let text = drawn(43, 23, |frame, area| {
-            render(frame, area, &compose, " New note ", None, &Theme::default());
+            render(frame, area, &compose, " New note ", None, &shell.ctx());
         });
         assert!(text.contains(" New note "), "{text}");
         assert!(!text.contains(&rendered(&compose, HINT_AREA)), "{text}");
@@ -1181,18 +1249,20 @@ mod tests {
                 &compose,
                 " New document ",
                 Some("plan, prd, summary"),
-                &Theme::default(),
+                &shell.ctx(),
             );
         });
         assert_eq!(
             compose.key_hint(Keys::compiled()),
             rendered(&compose, HINT_TEXT)
         );
-        assert!(text.contains("kinds: plan"), "{text}");
-        assert!(text.contains("> kind"), "{text}");
-        assert!(text.contains("  title"), "{text}");
+        // MOD-115 M4 L-docs: the rows are a kit form, the focus the gutter, not a `> ` marker.
+        assert!(text.contains(" kinds   plan, prd, summary"), "{text}");
+        assert!(text.contains("\u{258c}kind "), "{text}");
+        assert!(text.contains(" title "), "{text}");
+        assert!(!text.contains("> "), "{text}");
 
-        // A fixed kind draws no kinds hint, and every row stays inside the pane.
+        // A fixed kind draws no kinds row, and every row stays inside the pane.
         let base = base();
         let fixed = Compose::document(ids::HTUI_FEAT_1, None, Some("plan".to_owned()), Some(&base));
         let text = drawn(43, 23, |frame, area| {
@@ -1202,16 +1272,141 @@ mod tests {
                 &fixed,
                 " New version of plan (from v2) ",
                 Some("plan, prd, summary"),
-                &Theme::default(),
+                &shell.ctx(),
             );
         });
-        assert!(!text.contains("kinds:"), "{text}");
-        assert!(text.contains("  kind   plan"), "{text}");
-        assert!(text.contains("  title  Plan"), "{text}");
-        assert!(text.contains("> body"), "{text}");
+        assert!(!text.contains("kinds"), "{text}");
+        assert!(text.contains(" kind    plan"), "{text}");
+        assert!(text.contains(" title   Plan"), "{text}");
+        assert!(text.contains("\u{258c}body"), "{text}");
         for row in text.lines() {
             assert!(cell_width(row) <= 43, "{row:?}");
         }
+    }
+
+    /// MOD-115 M4 L-docs (C6): the top rule is `kit::rule`'s, the title then `─` to the edge, in
+    /// the title role while the area has the keys and dim under an overlay, without colour too.
+    #[test]
+    fn the_top_rule_is_the_kit_rule_and_bold_while_the_area_has_the_keys() {
+        let mut shell = Shell::new();
+        shell.theme = Theme::monochrome();
+        let compose = note();
+        let (buffer, _) = painted(&compose, " New note ", None, &shell.ctx(), (30, 6));
+        assert_eq!(
+            row_of(&buffer, 0),
+            format!(" New note {}", "\u{2500}".repeat(20))
+        );
+        for x in [1, 9, 29] {
+            let cell = &buffer[(x, 0)];
+            assert!(cell.modifier.contains(Modifier::BOLD), "({x}) {cell:?}");
+            assert!(!cell.modifier.contains(Modifier::DIM), "({x}) {cell:?}");
+        }
+        let covered = shell.ctx().with_covered(true);
+        let (buffer, _) = painted(&compose, " New note ", None, &covered, (30, 6));
+        for x in [1, 9, 29] {
+            let cell = &buffer[(x, 0)];
+            assert!(cell.modifier.contains(Modifier::DIM), "({x}) {cell:?}");
+            assert!(!cell.modifier.contains(Modifier::BOLD), "({x}) {cell:?}");
+        }
+    }
+
+    /// MOD-115 M4 L-docs: the focused row of a document is the kit form's: the gutter in the
+    /// tab's accent, the label banded; the body's heading is banded whole while the body has the
+    /// focus; under monochrome the band is reversed and the other rows are not.
+    #[test]
+    fn the_focused_row_is_the_gutter_and_the_band() {
+        let shell = Shell::new();
+        let ctx = shell.ctx();
+        let compose = typed("FEAT-1");
+        let (buffer, _) = painted(&compose, " New document ", Some("plan"), &ctx, (43, 12));
+        // The rule, then kind, kinds, title and the body's heading.
+        assert_eq!(buffer[(0, 1)].symbol(), GUTTER);
+        assert_eq!(buffer[(0, 1)].fg, ctx.accent().fg.unwrap_or_default());
+        assert_eq!(
+            buffer[(1, 1)].bg,
+            shell.theme.selected.bg.unwrap_or_default()
+        );
+        for y in [2, 3, 4] {
+            assert_eq!(buffer[(0, y)].symbol(), " ", "row {y}");
+            assert_eq!(buffer[(1, y)].bg, Color::Reset, "row {y}");
+        }
+        assert!(row_of(&buffer, 4).starts_with(" body"), "{buffer:?}");
+
+        let mut body = typed("FEAT-1");
+        let _ = body.on_key(key(KeyCode::BackTab), Keys::compiled());
+        assert_eq!(body.focus(), Part::Body);
+        let mut mono = Shell::new();
+        mono.theme = Theme::monochrome();
+        let (buffer, _) = painted(&body, " New document ", Some("plan"), &mono.ctx(), (43, 12));
+        assert_eq!(buffer[(0, 4)].symbol(), GUTTER);
+        for x in 1..43 {
+            let cell = &buffer[(x, 4)];
+            assert!(cell.modifier.contains(Modifier::REVERSED), "({x}) {cell:?}");
+            assert_eq!((cell.fg, cell.bg), (Color::Reset, Color::Reset), "({x})");
+        }
+        for y in [1, 3] {
+            assert!(
+                !buffer[(1, y)].modifier.contains(Modifier::REVERSED),
+                "row {y}"
+            );
+        }
+    }
+
+    /// MOD-115 M4 L-docs: a fixed kind and the kinds row are read-only rows in the dim role,
+    /// their words kept; a typed kind's field shows its cursor while it is focused.
+    #[test]
+    fn a_fixed_kind_and_the_kinds_row_read_dim() {
+        let shell = Shell::new();
+        let base = base();
+        let fixed = Compose::document(ids::HTUI_FEAT_1, None, Some("plan".to_owned()), Some(&base));
+        let (buffer, _) = painted(&fixed, " v ", None, &shell.ctx(), (43, 8));
+        assert!(
+            row_of(&buffer, 1).starts_with(" kind    plan"),
+            "{buffer:?}"
+        );
+        assert_eq!(buffer[(9, 1)].fg, shell.theme.dim.fg.unwrap_or_default());
+
+        let typed = typed("FEAT-1");
+        let (buffer, _) = painted(&typed, " t ", Some("plan, prd"), &shell.ctx(), (43, 8));
+        assert!(
+            row_of(&buffer, 2).starts_with(" kinds   plan, prd"),
+            "{buffer:?}"
+        );
+        assert_eq!(buffer[(9, 2)].fg, shell.theme.dim.fg.unwrap_or_default());
+        assert!(
+            buffer[(9, 1)].modifier.contains(Modifier::REVERSED),
+            "the typed kind's cursor: {:?}",
+            buffer[(9, 1)]
+        );
+    }
+
+    /// MOD-115 M4 L-docs (MD-A): the area resolves its own acts from the chord pressed, not the
+    /// `[field]` translation's canonical event: with `field.line_down = ["ctrl-j"]`, `ctrl-j`
+    /// arrives as `Down` and never moves off the title, while a pressed `Down` still does.
+    #[test]
+    fn a_translated_field_chord_is_never_a_compose_act() {
+        let keys = crate::keys::load_str("version = 2\n[field]\nline_down = [\"ctrl-j\"]\n")
+            .expect("the keys load");
+        let chord = |spec: &str| KeyChord::parse_strict(spec).expect("a valid spec");
+        let mut compose = typed("FEAT-1");
+        let _ = compose.on_key(key(KeyCode::Tab), &keys);
+        assert_eq!(compose.focus(), Part::Title);
+        let _ = compose.on_pressed(key(KeyCode::Down), chord("ctrl-j"), &keys);
+        assert_eq!(compose.focus(), Part::Title, "`ctrl-j` is no field move");
+        let _ = compose.on_pressed(key(KeyCode::Down), chord("down"), &keys);
+        assert_eq!(compose.focus(), Part::Body, "a pressed `Down` moves on");
+    }
+
+    /// MOD-115 M4 L-docs: the notice is the kit's notice row in the error role, wrapped to the
+    /// area under the body.
+    #[test]
+    fn the_notice_is_the_kit_notice_under_the_body() {
+        let shell = Shell::new();
+        let mut compose = note();
+        compose.settle(Some("a note needs text".to_owned()));
+        let (buffer, _) = painted(&compose, " New note ", None, &shell.ctx(), (30, 6));
+        assert_eq!(row_of(&buffer, 5).trim_end(), "a note needs text");
+        assert_eq!(buffer[(0, 5)].fg, shell.theme.error.fg.unwrap_or_default());
     }
 
     /// MOD-57 P2 (PD-3): `render` returns the rect its body is drawn in, which the pane claims
@@ -1220,6 +1415,7 @@ mod tests {
     /// are the shell's hint row since MOD-67 M6 T2).
     #[test]
     fn render_returns_the_body_rect() {
+        let shell = Shell::new();
         let mut compose = note();
         compose.on_paste("First line.\nSecond.");
         let mut body = None;
@@ -1230,7 +1426,7 @@ mod tests {
                 &compose,
                 " New note ",
                 None,
-                &Theme::default(),
+                &shell.ctx(),
             ));
         });
         let body = body.expect("the frame drew");
@@ -1253,7 +1449,7 @@ mod tests {
                 &compose,
                 " New document ",
                 Some("plan, prd, summary"),
-                &Theme::default(),
+                &shell.ctx(),
             ));
         });
         let body = body.expect("the frame drew");
@@ -1267,7 +1463,7 @@ mod tests {
             ..body
         };
         assert!(
-            bench::row_from(&text, above).starts_with("> body"),
+            bench::row_from(&text, above).starts_with("\u{258c}body"),
             "{text}"
         );
     }
@@ -1275,13 +1471,14 @@ mod tests {
     /// A long notice keeps its end (the hedge); the keys are the shell's hint row (MOD-67 M6 T2).
     #[test]
     fn a_long_notice_keeps_its_last_rows() {
+        let shell = Shell::new();
         let mut compose = note();
         compose.settle(Some(may_have_landed(
             &"store backend error: connection reset ".repeat(8),
             "thread",
         )));
         let text = drawn(43, 8, |frame, area| {
-            render(frame, area, &compose, " New note ", None, &Theme::default());
+            render(frame, area, &compose, " New note ", None, &shell.ctx());
         });
         assert!(text.contains("re-read to check"), "{text}");
     }
@@ -1339,7 +1536,7 @@ mod tests {
     /// rest, and a take empties the sink.
     #[test]
     fn the_bench_keeps_store_requests_and_drops_the_rest() {
-        let shell = bench::Shell::new();
+        let shell = Shell::new();
         let ctx = shell.ctx();
         ctx.request(StoreRequest::Notes(ids::HTUI_FEAT_1));
         ctx.emit(crate::app::Action::Error("boom".to_owned()));
