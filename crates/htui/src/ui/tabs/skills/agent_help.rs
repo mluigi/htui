@@ -22,14 +22,17 @@ use htui_core::model::{AgentId, ProjectId, StepId};
 use htui_core::prompt::edit_help::{self, HelpPrompt, HelpTarget};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::text::Line;
+use ratatui::widgets::{Paragraph, Wrap};
 
+use super::{framed, hint_line, holder, view_chips_if_room};
 use crate::app::{Ctx, Handled};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::store_worker::{ChatFrame, EDIT_HELP, StoreReply, StoreRequest};
-use crate::ui::cells::cell_width;
+use crate::ui::kit::form::{Field, Form, Value};
+use crate::ui::kit::list;
 use crate::ui::kit::modal::modal_rest;
+use crate::ui::kit::pane::Pane;
 use crate::ui::kit::scroll::Scroll;
 use crate::ui::{FieldOutcome, TextField, Theme, diff};
 
@@ -82,9 +85,10 @@ pub(super) fn accepted(save: Option<&str>) -> String {
     }
 }
 
-/// The hint while the request is typed (MOD-67 M4 D9): `Enter` and `Esc` are the field's.
+/// The hint while the request is typed (MOD-67 M4 D9), through `HELP_ASKING`: `field.submit`
+/// in force (MOD-115 M4 MD-A); `Esc` is the field's, never rebound (M2 MD7).
 const ASKING_HINT: HintSpec = &[
-    Hint::Text("Enter ask"),
+    Hint::One(Act::FieldSubmit, "ask"),
     Hint::Pair(Act::SkillsHelpPrevAgent, Act::SkillsHelpNextAgent, "agent"),
     Hint::Text("Esc back"),
 ];
@@ -117,8 +121,11 @@ const ANSWERED_HINT: HintSpec = &[
 /// The panel's height under the draft, borders included: the request line and the agent line.
 const PANEL_HEIGHT: u16 = 4;
 
-/// The request line's label.
-const ASK_LABEL: &str = "ask: ";
+/// The request field's label (MOD-115 M4 E5: a one-row `kit::form`).
+const ASK_LABEL: &str = "ask";
+
+/// The agent row's label while asking.
+const AGENT_LABEL: &str = "agent";
 
 /// One line of report for the view's notice row (each view maps it onto its own `Notice`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -366,7 +373,7 @@ impl AgentHelp {
             }
         }
         let stack = self.key_stack();
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         let act = ctx.keys().actions(stack, chord).first().copied();
         if let Some(outcome) = act.and_then(|act| self.on_act(act, ctx)) {
             return outcome;
@@ -636,8 +643,20 @@ impl AgentHelp {
     }
 
     /// Draws into `area` (B-2); returns the rect left for the locked draft, `None` when the help
-    /// takes it all.
-    pub(super) fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) -> Option<Rect> {
+    /// takes it all. MOD-115 M4 E5: kit panes; the help holds the keyboard, so its pane is the
+    /// focused one (C4) and carries the help's hints. A proposal or an answer takes the whole
+    /// area, so it leads the view and carries the view chips, `view` the active one, while its
+    /// whole title fits beside them (`view_chips_if_room`).
+    pub(super) fn render(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        ctx: &Ctx<'_>,
+        view: usize,
+    ) -> Option<Rect> {
+        let theme = ctx.theme;
+        let focus = holder(ctx, false);
+        let hints = hint_line(self.hint(ctx.keys()), ctx);
         match &self.state {
             State::Proposal {
                 agent,
@@ -646,23 +665,30 @@ impl AgentHelp {
                 blocks,
                 ..
             } => {
-                let mut title = format!(" proposal from {agent} \u{b7} sent \u{2192} proposed ");
+                let title = format!("proposal from {agent} \u{b7} sent \u{2192} proposed");
+                // What the proposal warns of leads the pane on a row of its own that never
+                // scrolls, in the role it is read in (MOD-115 M4 E5: a kit title has one style;
+                // L-skills repair 1: the title it was on never scrolled either): a mask marker
+                // first (P9), then, MOD-55 review L2, that the last of several blocks is
+                // proposed, which may be a trailing example rather than the body.
+                let mut flags = Vec::new();
                 if *masked {
-                    title.push_str("\u{b7} holds [REDACTED] ");
+                    flags.push("holds [REDACTED]".to_owned());
                 }
-                // MOD-55 review L2: the last block is proposed; with several, it may be a
-                // trailing example rather than the body.
                 if *blocks > 1 {
-                    title.push_str(&format!("\u{b7} last of {blocks} blocks "));
+                    flags.push(format!("last of {blocks} blocks"));
                 }
-                let title = if *masked {
-                    Line::styled(title, theme.error)
-                } else if *blocks > 1 {
-                    Line::styled(title, theme.warning)
-                } else {
-                    Line::from(title)
-                };
-                self.render_pane(frame, area, title, diff::lines(unified, theme));
+                let lead = (!flags.is_empty()).then(|| {
+                    let style = if *masked { theme.error } else { theme.warning };
+                    Line::styled(format!("the proposal {}", flags.join(" \u{b7} ")), style)
+                });
+                let pane = framed(
+                    view_chips_if_room(Pane::new(&title), &title, view, area.width),
+                    focus,
+                    hints,
+                    ctx,
+                );
+                self.render_pane(frame, area, pane, lead, diff::lines(unified, theme), theme);
                 None
             }
             State::Answered { agent, text, same } => {
@@ -675,8 +701,14 @@ impl AgentHelp {
                     .lines()
                     .map(|line| Line::styled(line.to_owned(), theme.base))
                     .collect();
-                let title = Line::from(format!(" {agent} replied \u{b7} {why} "));
-                self.render_pane(frame, area, title, lines);
+                let title = format!("{agent} replied \u{b7} {why}");
+                let pane = framed(
+                    view_chips_if_room(Pane::new(&title), &title, view, area.width),
+                    focus,
+                    hints,
+                    ctx,
+                );
+                self.render_pane(frame, area, pane, None, lines, theme);
                 None
             }
             State::Asking
@@ -686,23 +718,23 @@ impl AgentHelp {
                 let [draft, panel] =
                     Layout::vertical([Constraint::Min(1), Constraint::Length(PANEL_HEIGHT)])
                         .areas(area);
-                self.render_panel(frame, panel, theme);
+                self.render_panel(
+                    frame,
+                    panel,
+                    framed(Pane::new("ask an agent"), focus, hints, ctx),
+                    ctx,
+                );
                 Some(draft)
             }
         }
     }
 
-    /// The panel under the draft: the request, then the agent or what the help is doing.
-    fn render_panel(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
-        let block = Block::new().borders(Borders::ALL).title(" ask an agent ");
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        let budget = inner
-            .width
-            .saturating_sub(u16::try_from(cell_width(ASK_LABEL)).unwrap_or(u16::MAX));
-        let asking = matches!(self.state, State::Asking);
-        let mut ask = vec![Span::styled(ASK_LABEL, theme.dim)];
-        ask.extend(self.request.line(budget, asking, theme).spans);
+    /// The panel under the draft: the request as a one-row `kit::form` (typed into while
+    /// asking), then the agent or what the help is doing.
+    fn render_panel(&self, frame: &mut Frame<'_>, area: Rect, pane: Pane<'_>, ctx: &Ctx<'_>) {
+        let theme = ctx.theme;
+        let inner = Pane::inner(area);
+        let mut form = Form::new().field(Field::new(ASK_LABEL, Value::Text(&self.request)));
         let status = match &self.state {
             State::Asking => {
                 let name = match &self.agents {
@@ -711,53 +743,75 @@ impl AgentHelp {
                         .get(self.agent)
                         .map_or("none enabled", |(_, name)| name.as_str()),
                 };
-                Line::from(vec![
-                    Span::styled("agent: ", theme.dim),
-                    Span::styled(name.to_owned(), theme.base),
-                ])
+                form = form
+                    .field(Field::new(AGENT_LABEL, Value::ReadOnly(name.into())))
+                    .focus(0)
+                    .editing(true);
+                None
             }
             State::Starting { cancel: true, .. } | State::Cancelling => {
-                Line::styled(CANCELLING, theme.dim)
+                Some(Line::styled(CANCELLING, theme.dim))
             }
-            State::Starting { agent, .. } => {
-                Line::styled(format!("{agent} is starting\u{2026}"), theme.dim)
-            }
-            State::Streaming { agent, reply, .. } => Line::styled(
+            State::Starting { agent, .. } => Some(Line::styled(
+                format!("{agent} is starting\u{2026}"),
+                theme.dim,
+            )),
+            State::Streaming { agent, reply, .. } => Some(Line::styled(
                 format!(
                     "{agent} is answering\u{2026} {} chars",
                     reply.chars().count()
                 ),
                 theme.dim,
-            ),
-            State::Proposal { .. } | State::Answered { .. } => Line::default(),
+            )),
+            State::Proposal { .. } | State::Answered { .. } => None,
         };
-        frame.render_widget(Paragraph::new(vec![Line::from(ask), status]), inner);
+        let mut lines = form.lines(inner.width, ctx.accent(), theme);
+        lines.extend(status);
+        frame.render_widget(Paragraph::new(lines), inner);
+        pane.render(frame, area, theme);
     }
 
-    /// The Proposal/Answered pane: wrapped and scrolled, its row count kept for the clamp (the
-    /// Templates view's `render_browse` rule).
+    /// The Proposal/Answered pane: `lead` on its first row, cut with `…` and never scrolled (what
+    /// a proposal warns of), then `lines` wrapped and scrolled under it with a scrollbar beside
+    /// them, their row count kept for the clamp (the Templates view's `render_browse` rule).
     fn render_pane(
         &self,
         frame: &mut Frame<'_>,
         area: Rect,
-        title: Line<'static>,
+        pane: Pane<'_>,
+        lead: Option<Line<'static>>,
         lines: Vec<Line<'static>>,
+        theme: &Theme,
     ) {
-        let width = area.width.saturating_sub(2);
+        let inner = Pane::inner(area);
+        let body = match lead {
+            Some(lead) if inner.height > 1 => {
+                let [top, body] =
+                    Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+                frame.render_widget(Paragraph::new(list::ellipsize(lead, top.width)), top);
+                body
+            }
+            Some(lead) => {
+                frame.render_widget(Paragraph::new(list::ellipsize(lead, inner.width)), inner);
+                Rect::new(inner.x, inner.bottom(), inner.width, 0)
+            }
+            None => inner,
+        };
+        let width = usize::from(body.width).max(1);
         let rows: usize = lines
             .iter()
-            .map(|line| line.width().div_ceil(usize::from(width).max(1)).max(1))
+            .map(|line| line.width().div_ceil(width).max(1))
             .sum();
         self.rows.set(rows);
-        let block = Block::new().borders(Borders::ALL).title(title);
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
                 .scroll((self.scroll.offset(), 0)),
-            inner,
+            body,
         );
+        pane.scrollbar(rows, self.scroll.skip())
+            .scrollbar_span(body)
+            .render(frame, area, theme);
     }
 }
 
@@ -1483,18 +1537,30 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("a test terminal");
         let mut left = None;
         terminal
-            .draw(|frame| left = help.render(frame, frame.area(), &bench.theme))
+            .draw(|frame| left = help.render(frame, frame.area(), &bench.ctx(), 0))
             .expect("draws");
         assert_eq!(left, Some(Rect::new(0, 0, 60, 8)));
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains(" ask an agent "), "{text}");
-        assert!(text.contains("ask: shorter"), "{text}");
-        assert!(text.contains("agent: c"), "{text}");
+        // MOD-115 M4 E5: the request is a one-row `kit::form`, the agent read-only under it.
+        let row = |label: &str, value: &str| {
+            text.lines().any(|line| {
+                line.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .any(|pair| {
+                        pair[0].trim_start_matches(['\u{2502}', '\u{258c}']) == label
+                            && pair[1] == value
+                    })
+            })
+        };
+        assert!(row("ask", "shorter"), "{text}");
+        assert!(row("agent", "c"), "{text}");
 
         let help = answered(&bench, "key: abc\n", "```\nkey: [REDACTED]\n```");
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("a test terminal");
         terminal
-            .draw(|frame| left = help.render(frame, frame.area(), &bench.theme))
+            .draw(|frame| left = help.render(frame, frame.area(), &bench.ctx(), 0))
             .expect("draws");
         assert_eq!(left, None);
         let text = buffer_text(terminal.backend().buffer());
@@ -1549,11 +1615,11 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("a test terminal");
         terminal
             .draw(|frame| {
-                help.render(frame, frame.area(), &bench.theme);
+                help.render(frame, frame.area(), &bench.ctx(), 0);
             })
             .expect("draws");
         let text = buffer_text(terminal.backend().buffer());
-        assert!(text.contains("\u{b7} last of 2 blocks"), "{text}");
+        assert!(text.contains("the proposal last of 2 blocks"), "{text}");
 
         let help = answered(&bench, "old\n", "```\nnew\n```");
         assert!(
@@ -1563,11 +1629,56 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("a test terminal");
         terminal
             .draw(|frame| {
-                help.render(frame, frame.area(), &bench.theme);
+                help.render(frame, frame.area(), &bench.ctx(), 0);
             })
             .expect("draws");
         let text = buffer_text(terminal.backend().buffer());
         assert!(!text.contains("blocks"), "{text}");
+    }
+
+    /// MOD-115 M4 L-skills repair 1 (P9, MOD-55 review L2): what a proposal warns of stays on
+    /// its pane's first row while the diff under it scrolls, so `accept` is never offered with
+    /// the warning scrolled away; the warning keeps its role (a mask in the error role).
+    #[test]
+    fn the_proposal_warning_stays_put_while_the_diff_scrolls() {
+        let bench = Bench::new();
+        let body: String = (0..30).map(|n| format!("line {n}\n")).collect();
+        let reply = format!("Run it:\n```sh\ncargo test\n```\n```\nkey: [REDACTED]\n{body}```\n");
+        let mut help = answered(&bench, "key: abc\n", &reply);
+        assert!(
+            matches!(
+                &help.state,
+                State::Proposal {
+                    masked: true,
+                    blocks: 2,
+                    ..
+                }
+            ),
+            "{help:?}"
+        );
+        help.scroll = Scroll::at(12);
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("a test terminal");
+        terminal
+            .draw(|frame| {
+                help.render(frame, frame.area(), &bench.ctx(), 0);
+            })
+            .expect("draws");
+        let buffer = terminal.backend().buffer();
+        let text = buffer_text(buffer);
+        let rows: Vec<&str> = text.lines().collect();
+        assert!(
+            rows[1].contains("the proposal holds [REDACTED] \u{b7} last of 2 blocks"),
+            "the warning leads the scrolled pane: {text}"
+        );
+        assert_eq!(Some(buffer[(1, 1)].fg), bench.theme.error.fg, "{text}");
+        assert!(
+            !rows[2].contains("the proposal"),
+            "the diff scrolled under it: {text}"
+        );
+        assert!(
+            !text.contains("key: abc"),
+            "the diff's top scrolled away: {text}"
+        );
     }
 
     /// The buffer's symbols, one line per row.
@@ -1714,5 +1825,89 @@ mod tests {
         assert_eq!(help.key_stack(), views::HELP_PROPOSAL);
         let help = answered(&bench, "old\n", "no block");
         assert_eq!(help.key_stack(), views::HELP_PROPOSAL);
+    }
+
+    /// MOD-115 M4 MD-A: the asking hint names `field.submit` through `HELP_ASKING`, so a
+    /// rebound one shows its chord; `Esc` stays the field's (M2 MD7).
+    #[test]
+    fn the_asking_hint_names_the_submit_key_in_force() {
+        let bench = Bench::new();
+        let help = asking(&bench, "old\n");
+        assert_eq!(
+            help.hint(Keys::compiled()),
+            "Enter ask \u{b7} Up/Down agent \u{b7} Esc back"
+        );
+        let rebound = load_str("version = 2\n[field]\nsubmit = \"ctrl-t\"\n").expect("loads");
+        assert_eq!(
+            help.hint(&rebound),
+            "Ctrl+t ask \u{b7} Up/Down agent \u{b7} Esc back"
+        );
+    }
+
+    /// MOD-115 M4 MD-A: the help resolves what its request field passes from the chord pressed
+    /// (`Ctx::pressed`): a pressed `ctrl-n` the shell delivered as `Down` passes, a pressed
+    /// `Down` is swallowed.
+    #[test]
+    fn the_help_resolves_what_its_field_passes_from_the_chord_pressed() {
+        let bench = Bench::new();
+        let mut help = asking(&bench, "old\n");
+        let chord = |spec: &str| crate::keys::KeyChord::parse_strict(spec).expect("a valid spec");
+        let down = plain(KeyCode::Down);
+        assert_eq!(
+            help.on_key(down, &bench.ctx().with_pressed(down, chord("ctrl-n"))),
+            HelpOutcome::Pass
+        );
+        assert_eq!(
+            help.on_key(down, &bench.ctx().with_pressed(down, chord("down"))),
+            HelpOutcome::Consumed
+        );
+    }
+
+    /// MOD-115 M4 C4: the help holds the keyboard, so its panel is the focused pane, with the
+    /// help's keys on its bottom border.
+    #[test]
+    fn the_help_panel_is_focused_and_carries_its_keys() {
+        let bench = Bench::new();
+        let help = asking(&bench, "old\n");
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("a test terminal");
+        terminal
+            .draw(|frame| {
+                help.render(frame, frame.area(), &bench.ctx(), 0);
+            })
+            .expect("draws");
+        let buffer = terminal.backend().buffer();
+        let accent = bench.theme.tab_accent(SkillsTab::ID.0);
+        assert_eq!(
+            Some(buffer[(0, 8)].fg),
+            accent.fg,
+            "the panel's top-left corner"
+        );
+        let text = buffer_text(buffer);
+        let bottom = text.lines().last().expect("a bottom row");
+        assert!(bottom.contains("Enter ask"), "{text}");
+    }
+
+    /// MOD-115 M4 L-skills repair 2: a proposal over an 80-column Templates draft is 42 cells
+    /// wide; its title stays whole there. The view chips, which do nothing while the help has the
+    /// keys, are drawn only when the whole title fits beside them.
+    #[test]
+    fn the_proposal_title_stays_whole_where_the_chips_would_cut_it() {
+        let bench = Bench::new();
+        let help = answered(&bench, "key: abc\n", "```\nkey: def\n```");
+        let drawn = |width: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(width, 8)).expect("a test terminal");
+            terminal
+                .draw(|frame| {
+                    help.render(frame, frame.area(), &bench.ctx(), 1);
+                })
+                .expect("draws");
+            buffer_text(terminal.backend().buffer())
+        };
+        let title = " proposal from c \u{b7} sent \u{2192} proposed ";
+        let text = drawn(42);
+        assert!(text.contains(title), "{text}");
+        let text = drawn(60);
+        assert!(text.contains(title), "{text}");
+        assert!(text.contains(" Templates "), "the view chips: {text}");
     }
 }

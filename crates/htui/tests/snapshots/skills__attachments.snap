@@ -3,31 +3,31 @@ source: crates/htui/tests/skills.rs
 expression: frame
 ---
 Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat       1 waiting ·  F9  about   ?  keys
- Skills │ Templates
-┌ attachments · rust-style ────────────────────────────────────────────────────────────────────────┐
-│  global                       —                                                                  │
-│* htui                         always · latest · pos 1                                            │
-│    analysis › research        —                                                                  │
-│    analysis › verdict         —                                                                  │
-│    bug › reproduce            —                                                                  │
-│    bug › fix                  —                                                                  │
-│    bug › review               —                                                                  │
-│    feature › prd              —                                                                  │
-│    feature › plan             —                                                                  │
-│*   feature › implement        always · v1 · pos 2                                                │
-│    feature › review           —                                                                  │
-│    refactor › plan            —                                                                  │
-│    refactor › implement       —                                                                  │
-│    refactor › review          —                                                                  │
-│    tooling › plan             —                                                                  │
-│    tooling › implement        —                                                                  │
-│    tooling › review           —                                                                  │
-│  agy                          —                                                                  │
-│    analysis › research        —                                                                  │
-│    analysis › verdict         —                                                                  │
-│    bug › reproduce            —                                                                  │
-│    bug › fix                  —                                                                  │
-│    bug › review               —                                                                  │
-│    feature › prd              —                                                                  │
-│    feature › plan             —                                                                  │
-└─j/k move · Enter edit · x detach · r reload · Esc back───────────────────────────────────────────┘
+╭─ attachments · rust-style ──────────────────────────────────────────────────── Skills  Templates ╮
+│▌  global                       —                                                                 ┃
+│ * htui                         always · latest · pos 1                                           ┃
+│     analysis › research        —                                                                 ┃
+│     analysis › verdict         —                                                                 ┃
+│     bug › reproduce            —                                                                 ┃
+│     bug › fix                  —                                                                 ┃
+│     bug › review               —                                                                 ┃
+│     feature › prd              —                                                                 ┃
+│     feature › plan             —                                                                 ┃
+│ *   feature › implement        always · v1 · pos 2                                               ┃
+│     feature › review           —                                                                 ┃
+│     refactor › plan            —                                                                 ┃
+│     refactor › implement       —                                                                 ┃
+│     refactor › review          —                                                                 ┃
+│     tooling › plan             —                                                                 ┃
+│     tooling › implement        —                                                                 ┃
+│     tooling › review           —                                                                 ┃
+│   agy                          —                                                                 ┃
+│     analysis › research        —                                                                 ┃
+│     analysis › verdict         —                                                                 ┃
+│     bug › reproduce            —                                                                 │
+│     bug › fix                  —                                                                 │
+│     bug › review               —                                                                 │
+│     feature › prd              —                                                                 │
+│     feature › plan             —                                                                 │
+│     feature › implement        —                                                                 │
+╰─j/k move · Enter edit · x detach · r reload · Esc back───────────────────────────────────────────╯

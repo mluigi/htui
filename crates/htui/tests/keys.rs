@@ -476,7 +476,8 @@ async fn ctrl_l_and_ctrl_h_do_not_switch_skills_views() {
         harness.drive_to_end().await;
         let frame = harness.render();
         assert!(!on_library(&frame), "`{forward}` showed Templates: {frame}");
-        assert!(frame.contains("default"), "the Templates hint: {frame}");
+        // MOD-115 M4 Q2: the tree shows its own keys; `D default` is the body's.
+        assert!(frame.contains("implement"), "the Templates tree: {frame}");
         harness.key(back);
         harness.drive_to_end().await;
         let frame = harness.render();
@@ -497,7 +498,7 @@ async fn a_capturing_skills_view_keeps_tab_and_offers_no_switch() {
         harness.key("k");
     }
     for _ in 0..20 {
-        if harness.render().contains("\u{250c} implement v") {
+        if titled(&harness.render(), "implement v") {
             break;
         }
         harness.key("j");
@@ -529,13 +530,13 @@ async fn a_capturing_skills_view_keeps_tab_and_offers_no_switch() {
     harness.key("l");
     let frame = harness.render();
     assert!(
-        frame.contains("ask: l"),
+        frame.contains("ask     l"),
         "`l` is typed into the request: {frame}"
     );
     skills_then_requirements(&mut harness);
     harness.drive_to_end().await;
     let frame = harness.render();
-    assert!(frame.contains("ask: l"), "the help survived: {frame}");
+    assert!(frame.contains("ask     l"), "the help survived: {frame}");
     assert!(frame.contains("lYou are running"), "and the draft: {frame}");
 }
 
@@ -679,15 +680,23 @@ impl TextAreaEditor {
     ];
 }
 
+/// Whether `frame` shows a pane titled `title`: a self-drawn `┌ title`, or a kit pane's
+/// `╭─ title` (MOD-115 M4 L-skills, D-11: the body pane's title is a kit title; the
+/// `tests/reveal.rs` pattern, the corner included so a rule elsewhere does not pass for one).
+fn titled(frame: &str, title: &str) -> bool {
+    frame.contains(&format!("\u{250c} {title}"))
+        || frame.contains(&format!("\u{256d}\u{2500} {title}"))
+}
+
 /// Moves a Skills view's tree onto `name`: to the top, then down until the body pane is titled
 /// with it (`tests/templates.rs`' `select`).
 fn select_skills_row(harness: &mut Harness, name: &str) {
     for _ in 0..20 {
         harness.key("k");
     }
-    let title = format!("\u{250c} {name} v");
+    let title = format!("{name} v");
     for _ in 0..20 {
-        if harness.render().contains(&title) {
+        if titled(&harness.render(), &title) {
             return;
         }
         harness.key("j");

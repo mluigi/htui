@@ -23,20 +23,26 @@ use htui_core::prompt::{TemplateError, TemplateRole, body_of, parse};
 use htui_core::store::invalid_template_name;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::text::Line;
+use ratatui::widgets::{Paragraph, Wrap};
 
 use super::agent_help::{AgentHelp, HelpOutcome, Report, accepted};
+use super::{framed, hint_line, holder, joined, unavailable, view_chips, view_chips_if_room};
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::{ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, edited};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::{READ_NAME, REQUEST_NAMES, TemplateBody, TemplatesSnapshot};
-use crate::ui::cells::{self, cell_width};
-use crate::ui::kit::pane::capture_area;
+use crate::ui::cells;
+use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::form::{Field, Form, Value};
+use crate::ui::kit::list::{self, Row as ListRow, RowKind};
+use crate::ui::kit::modal::modal_rest;
+use crate::ui::kit::pane::{Focus, Pane as KitPane, capture_area};
 use crate::ui::kit::scroll::{Scroll, Step};
-use crate::ui::kit::{modal::modal_rest, text::wrapped};
-use crate::ui::{FieldOutcome, TextArea, TextField, Theme, diff};
+use crate::ui::kit::text::{Tone, notice, wrapped};
+use crate::ui::shell::PaneId;
+use crate::ui::{FieldOutcome, TextArea, TextField, diff};
 use crossterm::event::KeyEvent;
 
 /// The save's `StoreRequest::name`, what `busy` holds while it is in flight.
@@ -56,11 +62,23 @@ const HELP_WIDTH: u16 = 38;
 /// The pane before the first reply.
 const NOT_READ: &str = "templates not read yet";
 
+/// [`NOT_READ`]'s next step (MOD-115 M4 E5).
+const NOT_READ_NEXT: &str = "they appear once the store answers";
+
 /// The pane after a refused read, before the message.
 const UNAVAILABLE: &str = "templates unavailable";
 
 /// A version key on a project header row.
 const SELECT_A_TEMPLATE: &str = "select a template";
+
+/// [`SELECT_A_TEMPLATE`]'s next step, through `TEMPLATES_BROWSE`.
+const SELECT_HINT: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, "chooses one"),
+    Hint::One(Act::New, "creates one"),
+];
+
+/// [`SELECT_HINT`] with every key unbound.
+const SELECT_NEXT: &str = "a template row shows its body here";
 
 /// `Ctrl+S` on a phase body that never places `{{item}}` (ANA-5 §4.1: warn, never refuse). `save`
 /// is `FormSave`'s label through `TEMPLATES_EDITOR` (MOD-67 M6 D4); with none bound the sentence
@@ -79,7 +97,9 @@ const UNSAVED: &str = "unsaved changes \u{2014} Esc again discards";
 /// A save went out.
 const SAVING: &str = "saving\u{2026}";
 
-/// The hint row in Browse (plan D13; MOD-67 M4 D9), through [`views::TEMPLATES_BROWSE`]. `move`
+/// Every Browse key (plan D13; MOD-67 M4 D9), through [`views::TEMPLATES_BROWSE`]: the shell's
+/// activity pane's hint (M4 C8); the tree and the body show their own ([`LIST_HINT`],
+/// [`DETAIL_HINT`]). `move`
 /// after `j/k` is dropped: the row would be 104 cells with ` · ` separators (blueprint §1 item 1).
 /// The view switch shows its first two chords, `h/l view` (MOD-67 M4 R1 L2): 99 cells.
 const BROWSE_HINT: HintSpec = &[
@@ -95,25 +115,56 @@ const BROWSE_HINT: HintSpec = &[
     Hint::Two(Act::SkillsSwitchView, "view"),
 ];
 
-/// The pane's bottom border while its lines overflow it, through [`views::TEMPLATES_BROWSE`],
-/// drawn ` {hint} `.
+/// The tree pane's keys while browsing (MOD-115 M4 E5, Q2: a pane shows its own keys): the
+/// tree's motion, as every list's hint leads with it, then a new template and a reload, 22 of
+/// its 28 cells. The view switch is the chips' (L-skills repair 1).
+const LIST_HINT: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, ""),
+    Hint::One(Act::New, "new"),
+    Hint::One(Act::Reload, "reload"),
+];
+
+/// The body pane's keys while browsing (MOD-115 M4 E5): the shown template's; [`BROWSE_HINT`] is
+/// all of them, on the shell's activity pane.
+const DETAIL_HINT: HintSpec = &[
+    Hint::Pair(Act::SkillsPrevVersion, Act::SkillsNextVersion, "version"),
+    Hint::One(Act::SkillsBase, "base"),
+    Hint::One(Act::SkillsDiff, "diff"),
+    Hint::One(Act::TemplatesDiffDefault, "default"),
+    Hint::One(Act::Edit, "edit"),
+    Hint::One(Act::SkillsEditExternally, "$EDITOR"),
+];
+
+/// The pane's keys while its lines overflow it, through [`views::TEMPLATES_BROWSE`]: they lead
+/// the detail pane's hints when it is focused (MOD-115 M4 E5; MOD-82 carried: no key literal in
+/// a title).
 const SCROLL_HINT: HintSpec = &[
     Hint::Pair(Act::PaneScrollDown, Act::PaneScrollUp, "scroll"),
     Hint::Pair(Act::PanePageUp, Act::PanePageDown, "page"),
 ];
 
-/// The hint row while naming a new template, through [`views::TEMPLATES_PROMPT`]: `Enter` and
-/// `Esc` are the field's own (MOD-67 M4 D10).
-const NAMING_HINT: HintSpec = &[Hint::Text("Enter create"), Hint::Text("Esc cancel")];
-
-/// The hint row in the editor, through [`views::TEMPLATES_EDITOR`], before the cursor's
-/// `L{line}:C{col}` (D20). `skills.ask_agent` is MOD-55's `Ctrl+G` (MOD-67 M4 D9).
-const EDIT_HINT: HintSpec = &[
-    Hint::One(Act::FormSave, "save"),
-    Hint::One(Act::SkillsAskAgent, "ask agent"),
-    Hint::One(Act::FormExternalEditor, "$EDITOR"),
+/// The hint row while naming a new template, through [`views::TEMPLATES_PROMPT`]: the field's
+/// `field.submit` in force (MOD-115 M4 MD-A) and its `Esc`, never rebound (M2 MD7).
+const NAMING_HINT: HintSpec = &[
+    Hint::One(Act::FieldSubmit, "create"),
     Hint::Text("Esc cancel"),
 ];
+
+/// The hint row in the editor, through [`views::TEMPLATES_EDITOR`], after the cursor's
+/// `L{line}:C{col}` (D20). `skills.ask_agent` is MOD-55's `Ctrl+G` (MOD-67 M4 D9). Save and the
+/// way out lead: the draft pane beside the placeholders holds only some of the keys at 100
+/// columns, and [`draft_hint`](TemplatesView::draft_hint) drops them from the end (MOD-115 M4
+/// L-skills repair 1).
+const EDIT_HINT: HintSpec = &[
+    Hint::One(Act::FormSave, "save"),
+    Hint::Text("Esc cancel"),
+    Hint::One(Act::SkillsAskAgent, "ask agent"),
+    Hint::One(Act::FormExternalEditor, "$EDITOR"),
+];
+
+/// The cells of a kit pane's width its bottom border keeps for hints: they start two cells in
+/// and stop one rule cell short of the corner (`kit::pane`).
+const HINT_MARGIN: u16 = 4;
 
 /// The hint row while a `Ctrl+E` handoff holds the draft: `$EDITOR` has the keys.
 const HANDED_OFF_HINT: HintSpec = &[Hint::Text("the draft is in $EDITOR")];
@@ -558,19 +609,22 @@ impl TemplatesView {
         }
     }
 
-    /// Draws the view below the switch line: the content and the notice row. Its keys are
-    /// [`key_hint`](Self::key_hint), the shell's hint row since MOD-67 M6 T2.
+    /// Draws the view over the tab's body: the content and the notice row. Its keys are
+    /// [`key_hint`](Self::key_hint), drawn on the pane that holds the keyboard (MOD-115 M4 C4).
     pub(super) fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         // The notice wraps rather than clips (at most `NOTICE_LINES`): the stale sentence ends on
         // the version the next `Ctrl+S` writes, which is the one part the user must not lose.
-        let (notice, style) = match &self.notice {
-            Some(Notice::Info(text)) => (text.as_str(), ctx.theme.dim),
-            Some(Notice::Error(text)) => (text.as_str(), ctx.theme.error),
-            None => ("", ctx.theme.dim),
+        let (notice_text, tone) = match &self.notice {
+            Some(Notice::Info(text)) => (text.as_str(), Tone::Info),
+            Some(Notice::Error(text)) => (text.as_str(), Tone::Error),
+            None => ("", Tone::Info),
         };
-        let mut notice = wrapped(notice, usize::from(area.width.saturating_sub(1)).max(1));
-        notice.truncate(NOTICE_LINES);
-        let notice_height = u16::try_from(notice.len().max(1)).unwrap_or(1);
+        let mut rows = wrapped(
+            notice_text,
+            usize::from(area.width.saturating_sub(1)).max(1),
+        );
+        rows.truncate(NOTICE_LINES);
+        let notice_height = u16::try_from(rows.len().max(1)).unwrap_or(1);
         let [content, notice_row] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(notice_height)]).areas(area);
         match (&self.mode, self.handed_off()) {
@@ -581,36 +635,59 @@ impl TemplatesView {
         }
         frame.render_widget(
             Paragraph::new(
-                notice
-                    .into_iter()
-                    .map(|line| Line::styled(format!(" {line}"), style))
+                rows.into_iter()
+                    .map(|line| notice(&format!(" {line}"), tone, ctx.theme))
                     .collect::<Vec<_>>(),
             ),
             notice_row,
         );
     }
 
-    /// The keys of the shown mode for the shell's hint row (MOD-67 M6 T2), through
+    /// The keys of the shown mode (MOD-67 M6 T2), drawn on the pane that holds the keyboard and,
+    /// for Browse, on the shell's activity pane (MOD-115 M4 C4, C8), through
     /// [`key_stack`](Self::key_stack): an open agent help's, the editor's with the cursor's
-    /// `L:C`, else the mode's.
+    /// `L:C` first, else the mode's.
     pub(super) fn key_hint(&self, keys: &Keys) -> String {
         match (&self.mode, self.handed_off()) {
             (Mode::Editing(editor), _) => match &editor.help {
                 Some(help) => help.hint(keys),
                 None => {
+                    // MOD-115 M4 E5: the cursor's `L:C` leads, so a pane narrower than the row
+                    // was (the Templates draft beside its placeholders) still shows it.
                     let (line, col) = editor.area.cursor_line_col();
-                    format!(
-                        "{} \u{b7} L{}:C{}",
+                    joined(&[
+                        format!("L{}:C{}", line + 1, col + 1),
                         keys.hint(self.key_stack(), EDIT_HINT),
-                        line + 1,
-                        col + 1
-                    )
+                    ])
                 }
             },
             (Mode::Browse, Some(_)) => keys.hint(self.key_stack(), HANDED_OFF_HINT),
             (Mode::Naming { .. }, _) => keys.hint(self.key_stack(), NAMING_HINT),
             (Mode::Browse, None) => keys.hint(self.key_stack(), BROWSE_HINT),
         }
+    }
+
+    /// The editor's keys fitted to the draft pane `width` cells wide (MOD-115 M4 L-skills repair
+    /// 1): [`key_hint`](Self::key_hint)'s whole row when it fits or an agent help has the keys,
+    /// else the cursor's `L:C` and as many of [`EDIT_HINT`]'s keys, in order and whole, as the
+    /// bottom border holds; the first that does not fit goes with every one after it, and ` ·…`
+    /// says so. Never half a key.
+    fn draft_hint(&self, editor: &Editor, keys: &Keys, width: u16) -> String {
+        let full = self.key_hint(keys);
+        let room = usize::from(width.saturating_sub(HINT_MARGIN));
+        if editor.help.is_some() || cells::cell_width(&full) <= room {
+            return full;
+        }
+        let (line, col) = editor.area.cursor_line_col();
+        let at = format!("L{}:C{}", line + 1, col + 1);
+        (0..EDIT_HINT.len())
+            .rev()
+            .map(|kept| {
+                let fit = joined(&[at.clone(), keys.hint(self.key_stack(), &EDIT_HINT[..kept])]);
+                format!("{fit} \u{b7}\u{2026}")
+            })
+            .find(|cut| cells::cell_width(cut) <= room)
+            .unwrap_or(full)
     }
 
     // --- keys ----------------------------------------------------------------------------------
@@ -628,7 +705,7 @@ impl TemplatesView {
         stack: Stack<'static>,
         ctx: &mut Ctx<'_>,
     ) -> Handled {
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         let (focus, rows) = (ctx.focus(), self.pane_rows.get());
         for act in ctx.keys().actions(stack, chord) {
             if Step::by_focus(act, focus, |step| self.scroll.follow(step, rows)) {
@@ -774,7 +851,7 @@ impl TemplatesView {
         match field.on_key(key) {
             FieldOutcome::Consumed => Handled::Consumed,
             FieldOutcome::Pass => {
-                let chord = KeyChord::from_event(key);
+                let chord = ctx.pressed(&key);
                 match ctx.keys().actions(stack, chord).first() {
                     Some(Act::NextTab | Act::PrevTab) => Handled::Pass,
                     _ => modal_rest(stack, chord),
@@ -872,7 +949,7 @@ impl TemplatesView {
             // `form.save` below saves.
             FieldOutcome::Submit | FieldOutcome::Pass => {}
         }
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         match ctx.keys().actions(stack, chord).first() {
             Some(Act::FormSave) => self.save(ctx),
             Some(Act::SkillsAskAgent) => self.open_help(ctx),
@@ -1198,28 +1275,47 @@ impl TemplatesView {
 
     // --- frames --------------------------------------------------------------------------------
 
-    /// Browse and Naming: the tree on the left, the pane on the right.
+    /// Browse and Naming: the tree on the left, the pane on the right, each a kit pane (MOD-115 M4
+    /// E5). The tree leads the view, so it carries the view chips. The name prompt holds the
+    /// keyboard, so the pane it is drawn in is the focused one (C4); otherwise the shell's focus
+    /// decides. Each pane draws its hints only while focused (Q2).
     fn render_browse(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let theme = ctx.theme;
-        // MOD-115 M2 B5: the panes the shell's layout gives the tab, claimed for the focus
-        // borders, the hints and the mouse; today's 32-cell list by default. A hidden pane is an
+        // MOD-115 M2 B5: the panes the shell's layout gives the tab, claimed for the focus, the
+        // hidden-pane note and the mouse; today's 32-cell list by default. A hidden pane is an
         // empty rect, which draws nothing.
         let areas = ctx.split(area, super::library::LAYOUT);
+        let prompt = !matches!(self.mode, Mode::Browse);
         // T7 repair: the name prompt takes every key, so with another pane zoomed the pane is
         // drawn over the zoomed one rather than into its own empty rect.
-        let (list_area, pane_area) = capture_area(&areas, area, !matches!(self.mode, Mode::Browse));
-        let list_area = list_area.unwrap_or_default();
+        let (list_area, pane_area) = capture_area(&areas, area, prompt);
+        // The shell's activity pane is on screen unless it is the zoomed pane drawn over.
+        let activity = areas.activity.is_some_and(|rect| !rect.is_empty())
+            && !(areas.list.is_none() && areas.detail.is_empty());
+        let (list_focus, pane_focus) = if prompt {
+            (Focus::Unfocused, holder(ctx, activity))
+        } else {
+            (ctx.pane_focus(PaneId::List), ctx.pane_focus(PaneId::Detail))
+        };
+        if let Some(list_area) = list_area.filter(|rect| !rect.is_empty()) {
+            self.render_tree(frame, list_area, list_focus, ctx);
+        }
+        if !pane_area.is_empty() {
+            self.render_pane(frame, pane_area, pane_focus, prompt, ctx);
+        }
+    }
 
-        let list = Block::new().borders(Borders::ALL).title(" Templates ");
-        let inner = list.inner(list_area);
-        frame.render_widget(list, list_area);
-        let lines: Vec<Line<'static>> = self
+    /// The tree as a kit list (MOD-115 M4 E5): the project rows in the title role, the template
+    /// rows after the gutter, the cursor the gutter and band (MOD-85), kept in view; the view
+    /// chips on the top border.
+    fn render_tree(&self, frame: &mut Frame<'_>, area: Rect, focus: Focus, ctx: &Ctx<'_>) {
+        let theme = ctx.theme;
+        let inner = KitPane::inner(area);
+        let rows: Vec<ListRow<'static>> = self
             .rows()
             .iter()
-            .enumerate()
-            .map(|(index, row)| {
-                let (text, style) = match row {
-                    Row::Project(project) => (slug(ctx, *project), theme.title),
+            .map(|row| {
+                let line = match row {
+                    Row::Project(project) => Line::styled(slug(ctx, *project), theme.title),
                     Row::Template { project, name } => {
                         let head = self
                             .snapshot
@@ -1227,91 +1323,135 @@ impl TemplatesView {
                             .and_then(|snapshot| snapshot.head(*project, name))
                             .map_or(0, |row| row.version);
                         let role = TemplateRole::of_name(name).as_str();
-                        (template_row(name, head, role), theme.base)
+                        Line::styled(template_row(name, head, role), theme.base)
                     }
                 };
-                let style = if index == self.cursor {
-                    theme.selected
-                } else {
-                    style
-                };
-                Line::styled(text, style)
+                ListRow {
+                    line,
+                    kind: RowKind::Item,
+                }
             })
             .collect();
-        let offset = self
-            .cursor
-            .saturating_sub(usize::from(inner.height).saturating_sub(1));
-        frame.render_widget(
-            Paragraph::new(lines).scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0)),
-            inner,
-        );
-
-        // The body and the diff wrap: a default body's lines run to 150-200 columns, and a change
-        // past the pane's edge would be off screen. The row count is a character wrap's, a lower
-        // bound on the word wrap's (`Scroll`'s rule), so the clamp never scrolls the pane blank.
-        let width = pane_area.width.saturating_sub(2);
-        let (title, lines) = self.pane(width, ctx);
-        let rows: usize = lines
-            .iter()
-            .map(|line| line.width().div_ceil(usize::from(width).max(1)).max(1))
-            .sum();
-        self.pane_rows.set(rows);
-        let mut block = Block::new().borders(Borders::ALL).title(title);
-        let visible = usize::from(pane_area.height.saturating_sub(2));
-        if rows > visible || self.scroll.offset() > 0 {
-            let hint = ctx.keys().hint(views::TEMPLATES_BROWSE, SCROLL_HINT);
-            block =
-                block.title_bottom(Line::styled(format!(" {hint} "), theme.dim).right_aligned());
-        }
-        let inner = block.inner(pane_area);
-        frame.render_widget(block, pane_area);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .scroll((self.scroll.offset(), 0)),
-            inner,
-        );
+        let selected = (!rows.is_empty()).then_some(self.cursor);
+        let offset = list::scroll_into_view(self.cursor, 0, usize::from(inner.height), rows.len());
+        list::render(frame, inner, &rows, selected, offset, ctx.accent(), theme);
+        let hints = hint_line(ctx.keys().hint(views::TEMPLATES_BROWSE, LIST_HINT), ctx);
+        framed(view_chips(KitPane::new(""), 1), focus, hints, ctx)
+            .scrollbar(rows.len(), offset)
+            .render(frame, area, theme);
     }
 
-    /// The right-hand pane's title and lines: the name prompt, a refusal, the empty states, the
-    /// shown body, or the diff. The caller wraps and scrolls them.
-    fn pane(&self, width: u16, ctx: &Ctx<'_>) -> (String, Vec<Line<'static>>) {
+    /// The right-hand pane: the name prompt's form, an empty state, a refused read, or the shown
+    /// body or diff, wrapped and scrolled with a scrollbar. Its title names no key (MOD-82
+    /// carried): the scroll keys lead its hints while its lines overflow it.
+    fn render_pane(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        focus: Focus,
+        prompt: bool,
+        ctx: &Ctx<'_>,
+    ) {
+        let theme = ctx.theme;
+        let inner = KitPane::inner(area);
+        let (title, detail) = self.detail(ctx);
+        let mut pane = KitPane::new(&title);
+        let mut overflow = false;
+        self.pane_rows.set(0);
+        match detail {
+            Detail::Form(form) => form.render(frame, inner, 0, ctx.accent(), theme),
+            Detail::Empty(what, next) => empty::render(frame, inner, what, NextStep(&next), theme),
+            Detail::Unavailable(sentence) => unavailable(frame, inner, &sentence, theme),
+            Detail::Lines(lines) => {
+                // The body and the diff wrap: a default body's lines run to 150-200 columns, and
+                // a change past the pane's edge would be off screen. The row count is a character
+                // wrap's, a lower bound on the word wrap's (`Scroll`'s rule), so the clamp never
+                // scrolls the pane blank.
+                let width = usize::from(inner.width).max(1);
+                let rows: usize = lines
+                    .iter()
+                    .map(|line| line.width().div_ceil(width).max(1))
+                    .sum();
+                self.pane_rows.set(rows);
+                overflow = rows > usize::from(inner.height) || self.scroll.offset() > 0;
+                frame.render_widget(
+                    Paragraph::new(lines)
+                        .wrap(Wrap { trim: false })
+                        .scroll((self.scroll.offset(), 0)),
+                    inner,
+                );
+                pane = pane.scrollbar(rows, self.scroll.skip());
+            }
+        }
+        let keys = ctx.keys();
+        let hint = if prompt {
+            self.key_hint(keys)
+        } else {
+            let scroll = if overflow {
+                keys.hint(views::TEMPLATES_BROWSE, SCROLL_HINT)
+            } else {
+                String::new()
+            };
+            joined(&[scroll, keys.hint(views::TEMPLATES_BROWSE, DETAIL_HINT)])
+        };
+        framed(pane, focus, hint_line(hint, ctx), ctx).render(frame, area, theme);
+    }
+
+    /// The right-hand pane's title and what it shows: the name prompt, a refusal, the empty
+    /// states, the shown body, or the diff.
+    fn detail(&self, ctx: &Ctx<'_>) -> (String, Detail<'_>) {
         let theme = ctx.theme;
         if let Mode::Naming { project, field } = &self.mode {
-            let prompt = format!("new template in {}: ", slug(ctx, *project));
-            let budget =
-                width.saturating_sub(u16::try_from(cell_width(&prompt)).unwrap_or(u16::MAX));
-            let mut spans = vec![Span::styled(prompt, theme.base)];
-            spans.extend(field.line(budget, true, theme).spans);
-            return (" new template ".to_owned(), vec![Line::from(spans)]);
+            let form = Form::new()
+                .field(Field::new(
+                    "project",
+                    Value::ReadOnly(slug(ctx, *project).into()),
+                ))
+                .field(Field::new("name", Value::Text(field)))
+                .focus(1)
+                .editing(true);
+            return ("new template".to_owned(), Detail::Form(form));
         }
-        let dim = |text: String| (String::new(), vec![Line::styled(text, theme.dim)]);
         if let Some(why) = &self.unavailable {
             return (
                 String::new(),
-                vec![Line::styled(format!("{UNAVAILABLE}: {why}"), theme.error)],
+                Detail::Unavailable(format!("{UNAVAILABLE}: {why}")),
             );
         }
         let Some(snapshot) = &self.snapshot else {
-            return dim(NOT_READ.to_owned());
+            return (
+                String::new(),
+                Detail::Empty(NOT_READ, NOT_READ_NEXT.to_owned()),
+            );
+        };
+        let select = || {
+            let next = ctx.keys().hint(views::TEMPLATES_BROWSE, SELECT_HINT);
+            let next = if next.is_empty() {
+                SELECT_NEXT.to_owned()
+            } else {
+                next
+            };
+            (String::new(), Detail::Empty(SELECT_A_TEMPLATE, next))
         };
         let Some((project, name)) = self.selected_template() else {
-            return dim(SELECT_A_TEMPLATE.to_owned());
+            return select();
         };
         let (Some(head), Some(shown)) = (
             snapshot.head(project, &name),
             self.shown_row(snapshot, project, &name),
         ) else {
-            return dim(SELECT_A_TEMPLATE.to_owned());
+            return select();
         };
         if self.pane == Pane::Body {
             return (
-                format!(" {name} v{} (head v{}) ", shown.version, head.version),
-                shown
-                    .body
-                    .lines()
-                    .map(|line| Line::styled(line.to_owned(), theme.base))
-                    .collect(),
+                format!("{name} v{} (head v{})", shown.version, head.version),
+                Detail::Lines(
+                    shown
+                        .body
+                        .lines()
+                        .map(|line| Line::styled(line.to_owned(), theme.base))
+                        .collect(),
+                ),
             );
         }
         let base = match self.base {
@@ -1325,11 +1465,11 @@ impl TemplatesView {
         };
         let Some((label, text)) = base else {
             return (
-                format!(" {name} v{} ", shown.version),
-                vec![Line::styled(
+                format!("{name} v{}", shown.version),
+                Detail::Lines(vec![Line::styled(
                     format!("v{} has no base to diff against", shown.version),
                     theme.dim,
-                )],
+                )]),
             );
         };
         let unified = diff::unified(
@@ -1339,8 +1479,8 @@ impl TemplatesView {
             &format!("{name} v{}", shown.version),
         );
         (
-            format!(" diff {label} \u{2192} v{} ", shown.version),
-            diff::lines(&unified, theme),
+            format!("diff {label} \u{2192} v{}", shown.version),
+            Detail::Lines(diff::lines(&unified, theme)),
         )
     }
 
@@ -1351,52 +1491,66 @@ impl TemplatesView {
         let [left, right] =
             Layout::horizontal([Constraint::Min(1), Constraint::Length(HELP_WIDTH)]).areas(area);
         let draft = match &editor.help {
-            Some(help) => help.render(frame, left, ctx.theme),
+            Some(help) => help.render(frame, left, ctx, 1),
             None => Some(left),
         };
         if let Some(draft) = draft {
             self.render_draft(frame, draft, editor, ctx);
         }
-        self.render_placeholders(frame, right, editor, ctx.theme);
+        self.render_placeholders(frame, right, editor, ctx);
     }
 
-    /// The draft's block: the name, the versions, and the text with its cursor (dim under an
-    /// open help, which has the keys). The text's rect is claimed for an in-pane editor (MOD-57
-    /// P2), inside the block, so the name and versions stay visible beside it.
+    /// The draft's pane: the name and the versions as its title, the view chips while the whole
+    /// title fits beside them (`view_chips_if_room`), and the text with its cursor (dim under an
+    /// open help, which has the keys and the focus). The text's rect is claimed for an in-pane
+    /// editor (MOD-57 P2), inside the pane, so the name and versions stay visible beside it.
     fn render_draft(&self, frame: &mut Frame<'_>, left: Rect, editor: &Editor, ctx: &Ctx<'_>) {
         let title = match (editor.token, editor.from) {
             (Some(token), from) => format!(
-                " {} \u{b7} editing from v{}, saves v{} ",
+                "{} \u{b7} editing from v{}, saves v{}",
                 editor.name,
                 from.unwrap_or(token),
                 token + 1
             ),
-            (None, _) => format!(" {} \u{b7} new, saves v1 ", editor.name),
+            (None, _) => format!("{} \u{b7} new, saves v1", editor.name),
         };
-        let block = Block::new().borders(Borders::ALL).title(title);
-        let inner = block.inner(left);
-        frame.render_widget(block, left);
+        let inner = KitPane::inner(left);
         self.page.set(inner.height);
+        let open = editor.help.is_none();
         frame.render_widget(
-            Paragraph::new(editor.area.lines(
-                inner.width,
-                inner.height,
-                editor.help.is_none(),
-                ctx.theme,
-            )),
+            Paragraph::new(
+                editor
+                    .area
+                    .lines(inner.width, inner.height, open, ctx.theme),
+            ),
             inner,
         );
         ctx.claim_editor_area(inner);
+        let focus = if open {
+            holder(ctx, false)
+        } else {
+            Focus::Unfocused
+        };
+        let hints = hint_line(self.draft_hint(editor, ctx.keys(), left.width), ctx);
+        framed(
+            view_chips_if_room(KitPane::new(&title), &title, 1, left.width),
+            focus,
+            hints,
+            ctx,
+        )
+        .render(frame, left, ctx.theme);
     }
 
-    /// The role's placeholders and, for the judge and `review`, the wire contract.
+    /// The role's placeholders and, for the judge and `review`, the wire contract: a kit pane
+    /// beside the draft, never focused (the draft or the help has the keys).
     fn render_placeholders(
         &self,
         frame: &mut Frame<'_>,
         right: Rect,
         editor: &Editor,
-        theme: &Theme,
+        ctx: &Ctx<'_>,
     ) {
+        let theme = ctx.theme;
         // One table for the column and the help prompt (MOD-55 §1.3).
         let role = TemplateRole::of_name(&editor.name);
         let mut lines: Vec<Line<'static>> = edit_help::placeholder_table(role)
@@ -1412,13 +1566,24 @@ impl TemplatesView {
             lines.push(Line::default());
             lines.push(Line::styled(wire, theme.dim));
         }
-        let block = Block::new()
-            .borders(Borders::ALL)
-            .title(format!(" {} placeholders ", role.as_str()));
-        let inner = block.inner(right);
-        frame.render_widget(block, right);
+        let inner = KitPane::inner(right);
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        KitPane::new(&format!("{} placeholders", role.as_str()))
+            .accent(ctx.accent())
+            .render(frame, right, theme);
     }
+}
+
+/// What the right-hand pane shows in Browse (MOD-115 M4 E5).
+enum Detail<'a> {
+    /// The name prompt, through `kit::form`.
+    Form(Form<'a>),
+    /// Nothing to show: what is missing and the next step (`kit::empty`).
+    Empty(&'static str, String),
+    /// A refused read: the store's sentence, and where to fix it.
+    Unavailable(String),
+    /// The shown body or the diff, wrapped and scrolled.
+    Lines(Vec<Line<'static>>),
 }
 
 /// Whether a snapshot answers the scope the view is in now: a save's reply that crossed a scope
@@ -1555,13 +1720,17 @@ mod tests {
             },
             ..TemplatesView::default()
         };
-        let (_, lines) = view.pane(40, &ctx);
-        let drawn: usize = lines[0]
-            .spans
-            .iter()
-            .map(|span| cell_width(&span.content))
-            .sum();
-        assert_eq!(drawn, 40, "{lines:?}");
+        // MOD-115 M4 E5: the prompt is a `kit::form`; no row of it runs past the pane.
+        let (_, detail) = view.detail(&ctx);
+        let Detail::Form(form) = detail else {
+            panic!("the prompt is a form");
+        };
+        let lines = form.lines(40, ctx.accent(), &theme);
+        assert!(lines.iter().all(|line| line.width() <= 40), "{lines:?}");
+        assert!(
+            lines.iter().any(|line| line.width() == 40),
+            "the field takes the value column: {lines:?}"
+        );
     }
 
     /// MOD-57 P2 (PD-3, F-12): an open draft claims the text rect inside its block, so the name
@@ -2506,5 +2675,341 @@ mod tests {
             !fresh.restore(&crate::ui::shell::TabLoc::default(), &mut bench.ctx()),
             "a location that names nothing restores nothing"
         );
+    }
+
+    // ---- MOD-115 M4 L-skills: the view on the kit ----------------------------------------------
+
+    /// `view` drawn at `width` x `height` through `ctx`, as the buffer and its rows.
+    fn frame_of(
+        view: &TemplatesView,
+        ctx: &Ctx<'_>,
+        width: u16,
+        height: u16,
+    ) -> (ratatui::buffer::Buffer, Vec<String>) {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("a test terminal");
+        terminal
+            .draw(|frame| view.render(frame, frame.area(), ctx))
+            .expect("the frame draws");
+        let buffer = terminal.backend().buffer().clone();
+        let rows = (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        (buffer, rows)
+    }
+
+    /// A view naming a new template in `vulkan-tutorials`.
+    fn naming() -> TemplatesView {
+        TemplatesView {
+            mode: Mode::Naming {
+                project: ids::PROJECT_VULKAN,
+                field: TextField::new(),
+            },
+            ..TemplatesView::default()
+        }
+    }
+
+    /// MOD-115 M4 MD-A: the name prompt's hint names `field.submit` through `TEMPLATES_PROMPT`,
+    /// so a rebound one shows its chord; `Esc` stays the field's (M2 MD7).
+    #[test]
+    fn the_name_prompt_hint_names_the_submit_key_in_force() {
+        let rebound = crate::keys::load_str("version = 2\n[field]\nsubmit = \"ctrl-t\"\n")
+            .expect("the key file loads");
+        assert_eq!(
+            naming().key_hint(Keys::compiled()),
+            "Enter create \u{b7} Esc cancel"
+        );
+        assert_eq!(
+            naming().key_hint(&rebound),
+            "Ctrl+t create \u{b7} Esc cancel"
+        );
+    }
+
+    /// MOD-115 M4 MD-A: what the name prompt's field passes resolves from the chord pressed
+    /// (`Ctx::pressed`): a pressed `ctrl-n` the shell delivered as `Down` passes, a pressed
+    /// `Down` is swallowed.
+    #[test]
+    fn the_name_prompt_resolves_what_its_field_passes_from_the_chord_pressed() {
+        let bench = Bench::new();
+        let chord = |spec: &str| crate::keys::KeyChord::parse_strict(spec).expect("a valid spec");
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let mut view = naming();
+        assert_eq!(
+            view.on_key(down, &mut bench.ctx().with_pressed(down, chord("ctrl-n"))),
+            Handled::Pass
+        );
+        assert_eq!(
+            view.on_key(down, &mut bench.ctx().with_pressed(down, chord("down"))),
+            Handled::Consumed
+        );
+        assert!(view.captures_input(), "the prompt stays");
+    }
+
+    /// MOD-115 M4 E5, MOD-85: the tree's cursor is the kit's gutter and band, legible without
+    /// colour; a project row keeps the title role and the template rows their columns.
+    #[tokio::test]
+    async fn the_tree_cursor_is_the_gutter_and_band() {
+        use ratatui::style::Modifier;
+        let bench = Bench::new();
+        let mut view = browsing(&bench).await;
+        view.on_key(key('j'), &mut bench.ctx());
+        let bench = Bench {
+            theme: Theme::monochrome(),
+            ..Bench::new()
+        };
+        let (buffer, rows) = frame_of(&view, &bench.ctx(), 100, 28);
+        assert!(rows[0].starts_with('\u{256d}'), "rounded: {rows:#?}");
+        assert_eq!(buffer[(1, 2)].symbol(), list::GUTTER, "{rows:#?}");
+        assert!(
+            buffer[(5, 2)].modifier.contains(Modifier::REVERSED),
+            "banded"
+        );
+        assert_eq!(
+            buffer[(1, 1)].symbol(),
+            " ",
+            "the project row is not the cursor"
+        );
+        assert!(
+            buffer[(2, 1)].modifier.contains(Modifier::BOLD),
+            "the title role"
+        );
+        assert!(rows[2].contains("  fix           v1   phase"), "{rows:#?}");
+    }
+
+    /// MOD-115 M4 C4: the editor's draft holds the keyboard, so it is the focused pane with the
+    /// editor's keys on its border and the view chips on its top; the placeholders beside it are
+    /// a pane that is never focused.
+    #[test]
+    fn the_draft_is_the_focused_pane_and_the_placeholders_are_not() {
+        let bench = Bench::new();
+        let view = TemplatesView {
+            mode: Mode::Editing(Editor::new(
+                ids::PROJECT_VULKAN,
+                "implement".to_owned(),
+                Some(1),
+                Some(1),
+                "body\n",
+            )),
+            ..TemplatesView::default()
+        };
+        let (buffer, rows) = frame_of(&view, &bench.ctx(), 100, 20);
+        let accent = bench.theme.tab_accent(SkillsTab::ID.0);
+        assert_eq!(Some(buffer[(0, 0)].fg), accent.fg, "the draft: {rows:#?}");
+        assert_eq!(
+            Some(buffer[(62, 0)].fg),
+            bench.theme.border_faint.fg,
+            "the placeholders"
+        );
+        assert!(
+            rows[0].contains("implement \u{b7} editing from v1, saves v2"),
+            "{rows:#?}"
+        );
+        assert!(rows[0].contains(" Templates "), "the view chips: {rows:#?}");
+        assert!(rows[0].contains("phase placeholders"), "{rows:#?}");
+        assert!(rows[18].contains("Ctrl+s save"), "{rows:#?}");
+    }
+
+    /// MOD-115 M4 L-skills repair 1: the draft pane is narrower than the row the editor's keys
+    /// had, so they are fitted to it whole: the cursor's `L:C`, then save and the way out, then
+    /// the rest while they fit; a key that does not fit goes with those after it, and `…` says
+    /// so. Never half a key; at a width that holds them all, all of them.
+    #[test]
+    fn the_draft_hint_keeps_the_way_out_and_never_cuts_a_key() {
+        let bench = Bench::new();
+        let view = TemplatesView {
+            mode: Mode::Editing(Editor::new(
+                ids::PROJECT_VULKAN,
+                "implement".to_owned(),
+                Some(1),
+                Some(1),
+                "body\n",
+            )),
+            ..TemplatesView::default()
+        };
+        let bottom = |width: u16| {
+            let (_, rows) = frame_of(&view, &bench.ctx(), width, 20);
+            let draft = usize::from(width - HELP_WIDTH);
+            let border = rows
+                .iter()
+                .rposition(|row| row.starts_with('\u{2570}'))
+                .expect("the draft's bottom border");
+            let row: String = rows[border].chars().take(draft).collect();
+            row.trim_matches(['\u{2570}', '\u{256f}', '\u{2500}'])
+                .to_owned()
+        };
+        assert_eq!(
+            bottom(100),
+            "L1:C1 \u{b7} Ctrl+s save \u{b7} Esc cancel \u{b7} Ctrl+g ask agent \u{b7}\u{2026}"
+        );
+        assert_eq!(
+            bottom(120),
+            "L1:C1 \u{b7} Ctrl+s save \u{b7} Esc cancel \u{b7} Ctrl+g ask agent \u{b7} Ctrl+e $EDITOR"
+        );
+        let narrow = bottom(80);
+        assert!(
+            narrow.starts_with("L1:C1 \u{b7} Ctrl+s save \u{b7} Esc cancel"),
+            "{narrow:?}"
+        );
+        assert!(narrow.ends_with(" \u{b7}\u{2026}"), "{narrow:?}");
+    }
+
+    /// MOD-115 M4 E5, MOD-85: the body's and the draft's titles are the kit pane's title role,
+    /// the tab's accent in bold while the pane is focused and dim while it is not. In colour and
+    /// in monochrome.
+    #[tokio::test]
+    async fn the_body_and_draft_titles_are_the_pane_title_role() {
+        use ratatui::style::{Modifier, Style};
+        let in_style = |cell: &ratatui::buffer::Cell, style: Style| {
+            style.fg.is_none_or(|fg| cell.fg == fg)
+                && style.bg.is_none_or(|bg| cell.bg == bg)
+                && cell.modifier.contains(style.add_modifier)
+        };
+        let column_of = |row: &str, text: &str| {
+            let at = row
+                .find(text)
+                .unwrap_or_else(|| panic!("{text:?} is not on {row:?}"));
+            u16::try_from(row[..at].chars().count()).expect("a short row")
+        };
+        for theme in [Theme::default(), Theme::monochrome()] {
+            let bench = Bench {
+                theme,
+                ..Bench::new()
+            };
+            let focused = bench
+                .theme
+                .tab_accent(SkillsTab::ID.0)
+                .add_modifier(Modifier::BOLD);
+            let mut view = browsing(&bench).await;
+            view.on_key(key('j'), &mut bench.ctx());
+            let ctx = bench.ctx().with_focus(PaneId::Detail);
+            let (buffer, rows) = frame_of(&view, &ctx, 100, 12);
+            // The body's title follows the list's corner and its own: `╮╭─ {name} v1 (head v1)`.
+            let x = column_of(&rows[0], "\u{256e}\u{256d}\u{2500} ") + 4;
+            assert!(rows[0].contains(" v1 (head v1)"), "{rows:#?}");
+            assert!(in_style(&buffer[(x, 0)], focused), "focused: {rows:#?}");
+            let (buffer, rows) = frame_of(&view, &bench.ctx(), 100, 12);
+            let title = &buffer[(x, 0)];
+            assert!(in_style(title, bench.theme.dim), "unfocused: {rows:#?}");
+            assert!(!title.modifier.contains(Modifier::BOLD), "{rows:#?}");
+
+            let view = TemplatesView {
+                mode: Mode::Editing(Editor::new(
+                    ids::PROJECT_VULKAN,
+                    "implement".to_owned(),
+                    Some(1),
+                    Some(1),
+                    "body\n",
+                )),
+                ..TemplatesView::default()
+            };
+            let (buffer, rows) = frame_of(&view, &bench.ctx(), 100, 12);
+            let x = column_of(&rows[0], "implement \u{b7} editing");
+            assert!(in_style(&buffer[(x, 0)], focused), "the draft: {rows:#?}");
+        }
+    }
+
+    /// MOD-115 M4 L-skills repair 1 (Q2): the focused list shows its own keys whole in its 28
+    /// cells: its motion first, as every list's hint does, then a new template and the view's own
+    /// act, the keys the Browse row showed before the port; the row's keys are the body's.
+    #[tokio::test]
+    async fn the_list_hint_leads_with_its_motion() {
+        let bench = Bench::new();
+        let mut view = browsing(&bench).await;
+        view.on_key(key('j'), &mut bench.ctx());
+        let (_, rows) = frame_of(&view, &bench.ctx(), 100, 12);
+        let bottom = rows
+            .iter()
+            .rposition(|row| row.starts_with('\u{2570}'))
+            .expect("the list's bottom border");
+        let list: String = rows[bottom].chars().take(32).collect();
+        assert_eq!(
+            list.trim_matches(['\u{2570}', '\u{256f}', '\u{2500}']),
+            "j/k \u{b7} n new \u{b7} r reload",
+            "{rows:#?}"
+        );
+    }
+
+    /// MOD-115 M4 L-skills repair 2: every empty state of the pane says what is missing and the
+    /// next step (`kit::empty`), and a refused read names where it is fixed: before the first
+    /// reply, on a refused read, and with the cursor on a project's row; with the keys of the
+    /// next step unbound, it is said in words.
+    #[tokio::test]
+    async fn every_empty_pane_names_its_next_step() {
+        let bench = Bench::new();
+        let shows = |view: &TemplatesView, bench: &Bench, texts: &[&str]| {
+            let (_, rows) = frame_of(view, &bench.ctx(), 100, 12);
+            for text in texts {
+                assert!(
+                    rows.iter().any(|row| row.contains(text)),
+                    "{text:?}: {rows:#?}"
+                );
+            }
+        };
+        shows(
+            &TemplatesView::default(),
+            &bench,
+            &[
+                "templates not read yet",
+                "they appear once the store answers",
+            ],
+        );
+        let refused = TemplatesView {
+            unavailable: Some("store unreachable: gone".to_owned()),
+            ..TemplatesView::default()
+        };
+        shows(
+            &refused,
+            &bench,
+            &[
+                "templates unavailable: store unreachable: gone",
+                "Settings \u{203a} Connection stores a DSN",
+            ],
+        );
+        // The cursor starts on the project's row.
+        let view = browsing(&bench).await;
+        shows(
+            &view,
+            &bench,
+            &["select a template", "j/k chooses one \u{b7} n creates one"],
+        );
+        let unbound = Bench {
+            keys: crate::keys::load_str(
+                "version = 2\n[list]\ndown = []\nup = []\n[common]\nnew = []\n",
+            )
+            .expect("the key file loads"),
+            ..Bench::new()
+        };
+        shows(&view, &unbound, &["a template row shows its body here"]);
+    }
+
+    /// MOD-115 M4 L-skills repair 2: beside the placeholders, an 80-column draft is 42 cells
+    /// wide. Its title, the version a save writes, stays whole there: the view chips, which do
+    /// nothing while the draft has the keys, are drawn only when the whole title fits beside
+    /// them, as it does at 100 columns.
+    #[test]
+    fn the_draft_title_stays_whole_beside_the_placeholders_at_80_columns() {
+        let bench = Bench::new();
+        let view = TemplatesView {
+            mode: Mode::Editing(Editor::new(
+                ids::PROJECT_VULKAN,
+                "handoff".to_owned(),
+                Some(1),
+                Some(1),
+                "body\n",
+            )),
+            ..TemplatesView::default()
+        };
+        let (_, rows) = frame_of(&view, &bench.ctx(), 80, 12);
+        assert!(
+            rows[0].contains(" handoff \u{b7} editing from v1, saves v2 "),
+            "{rows:#?}"
+        );
+        let (_, rows) = frame_of(&view, &bench.ctx(), 100, 12);
+        assert!(
+            rows[0].contains(" handoff \u{b7} editing from v1, saves v2 "),
+            "{rows:#?}"
+        );
+        assert!(rows[0].contains(" Templates "), "the view chips: {rows:#?}");
     }
 }

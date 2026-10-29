@@ -77,15 +77,38 @@ fn type_text(harness: &mut Harness, text: &str) {
     }
 }
 
+/// Whether one line of `frame` holds every word of `words`, in order: a `kit::form` row, its
+/// label and its value (MOD-115 M4 E5).
+fn line_has(frame: &str, words: &[&str]) -> bool {
+    frame.lines().any(|line| {
+        let mut rest = line;
+        words.iter().all(|word| match rest.find(word) {
+            Some(at) => {
+                rest = &rest[at + word.len()..];
+                true
+            }
+            None => false,
+        })
+    })
+}
+
+/// Whether `frame` shows a pane titled `title`: a self-drawn `┌ title`, or a kit pane's
+/// `╭─ title` (MOD-115 M4 L-skills, D-11: the body pane's title is a kit title; the
+/// `tests/reveal.rs` pattern, the corner included so a rule elsewhere does not pass for one).
+fn titled(frame: &str, title: &str) -> bool {
+    frame.contains(&format!("\u{250c} {title}"))
+        || frame.contains(&format!("\u{256d}\u{2500} {title}"))
+}
+
 /// Moves the tree's cursor onto `name`: to the top, then down until the body pane is titled with
 /// it.
 fn select(harness: &mut Harness, name: &str) {
     for _ in 0..20 {
         harness.key("k");
     }
-    let title = format!("\u{250c} {name} v");
+    let title = format!("{name} v");
     for _ in 0..20 {
-        if harness.render().contains(&title) {
+        if titled(&harness.render(), &title) {
             return;
         }
         harness.key("j");
@@ -179,7 +202,7 @@ async fn the_templates_view_lists_the_scope_s_templates() {
         "a template row names its head and its role: {frame}"
     );
     assert!(
-        frame.contains("\u{250c} implement v1 (head v1) "),
+        titled(&frame, "implement v1 (head v1) "),
         "the body pane: {frame}"
     );
     assert!(
@@ -187,6 +210,20 @@ async fn the_templates_view_lists_the_scope_s_templates() {
         "the body: {frame}"
     );
     insta::assert_snapshot!("browse", frame);
+    // MOD-115 M4 Q2: the tree shows its own keys; the shown template's are the body's, on its
+    // bottom border once it is focused.
+    harness.key("tab");
+    let body = hint(&harness.render());
+    for keys in [
+        ",/. version",
+        "b base",
+        "d diff",
+        "D default",
+        "e edit",
+        "E $EDITOR",
+    ] {
+        assert!(body.contains(keys), "`{keys}` on the body: {body}");
+    }
 }
 
 #[tokio::test]
@@ -217,7 +254,7 @@ async fn the_judge_editor_lists_its_placeholders_and_its_wire() {
         "candidates is required: {frame}"
     );
     assert!(frame.contains("```json"), "the judge wire note: {frame}");
-    assert!(hint(&frame).ends_with("L1:C1"), "{}", hint(&frame));
+    assert!(hint(&frame).starts_with("L1:C1 "), "{}", hint(&frame));
     insta::assert_snapshot!("edit_help", frame);
 }
 
@@ -230,7 +267,10 @@ async fn an_unknown_placeholder_puts_the_cursor_on_its_braces() {
     harness.key("down");
     harness.key("down");
     type_text(&mut harness, "{{itme}}");
-    assert!(hint(&harness.render()).ends_with("L3:C9"), "after typing");
+    assert!(
+        hint(&harness.render()).starts_with("L3:C9 "),
+        "after typing"
+    );
     harness.key("ctrl-s");
     harness.settle().await;
     let frame = harness.render();
@@ -239,7 +279,7 @@ async fn an_unknown_placeholder_puts_the_cursor_on_its_braces() {
         "{frame}"
     );
     assert!(
-        hint(&frame).ends_with("L3:C1"),
+        hint(&frame).starts_with("L3:C1 "),
         "the cursor is on the `{{`: {frame}"
     );
     assert_eq!(
@@ -348,13 +388,13 @@ async fn ctrl_s_with_missing_required_puts_the_cursor_at_the_end() {
     harness.key("up");
     harness.key("up");
     harness.key("home");
-    assert!(hint(&harness.render()).ends_with("L1:C1"));
+    assert!(hint(&harness.render()).starts_with("L1:C1 "));
     harness.key("ctrl-s");
     harness.settle().await;
     let frame = harness.render();
     assert!(notice(&frame).contains("must use candidates"), "{frame}");
     assert!(
-        hint(&frame).ends_with("L3:C1"),
+        hint(&frame).starts_with("L3:C1 "),
         "the end of the body: {frame}"
     );
     assert_eq!(head(&store, "judge").await.map(|row| row.version), Some(1));
@@ -433,7 +473,7 @@ async fn a_refused_save_sends_no_request() {
     );
     assert!(
         hint(&frame)
-            .ends_with("Ctrl+s save · Ctrl+g ask agent · Ctrl+e $EDITOR · Esc cancel · L1:C1"),
+            .starts_with("L1:C1 \u{b7} Ctrl+s save \u{b7} Esc cancel \u{b7} Ctrl+g ask agent"),
         "the editor is still open, the cursor on the `{{`: {frame}"
     );
 }
@@ -447,7 +487,10 @@ async fn a_wrong_role_placeholder_puts_the_cursor_on_its_braces() {
     harness.key("down");
     harness.key("down");
     type_text(&mut harness, "{{candidates}}");
-    assert!(hint(&harness.render()).ends_with("L3:C15"), "after typing");
+    assert!(
+        hint(&harness.render()).starts_with("L3:C15 "),
+        "after typing"
+    );
     harness.key("ctrl-s");
     harness.settle().await;
     let frame = harness.render();
@@ -456,7 +499,7 @@ async fn a_wrong_role_placeholder_puts_the_cursor_on_its_braces() {
         "{frame}"
     );
     assert!(
-        hint(&frame).ends_with("L3:C1"),
+        hint(&frame).starts_with("L3:C1 "),
         "the cursor is on the `{{`: {frame}"
     );
     assert_eq!(
@@ -474,7 +517,10 @@ async fn an_unterminated_opener_puts_the_cursor_on_its_braces() {
     // Line 2 is empty, so nothing after the opener on its line closes it.
     harness.key("down");
     type_text(&mut harness, "{{item");
-    assert!(hint(&harness.render()).ends_with("L2:C7"), "after typing");
+    assert!(
+        hint(&harness.render()).starts_with("L2:C7 "),
+        "after typing"
+    );
     harness.key("ctrl-s");
     harness.settle().await;
     let frame = harness.render();
@@ -483,7 +529,7 @@ async fn an_unterminated_opener_puts_the_cursor_on_its_braces() {
         "{frame}"
     );
     assert!(
-        hint(&frame).ends_with("L2:C1"),
+        hint(&frame).starts_with("L2:C1 "),
         "the cursor is on the `{{`: {frame}"
     );
     assert_eq!(
@@ -698,6 +744,8 @@ async fn scrolling_reveals_a_hunk_below_the_fold() {
     harness.key("r");
     harness.settle().await;
     select(&mut harness, "implement");
+    // MOD-115 M4 E5: the scroll keys lead the body pane's hints, shown while it is focused.
+    harness.key("tab");
     harness.key("d");
     let frame = harness.render();
     assert!(
@@ -713,6 +761,8 @@ async fn scrolling_reveals_a_hunk_below_the_fold() {
         frame.contains("J/K scroll · PgUp/PgDn page"),
         "the pane says it scrolls: {frame}"
     );
+    // Back to the tree: `j`/`k` below move its cursor.
+    harness.key("tab");
 
     let mut presses = 0;
     while !harness.render().contains("CHANGED60") {
@@ -788,11 +838,12 @@ async fn a_long_name_is_cut_so_the_version_and_role_stay() {
     harness.settle().await;
     let frame = harness.render();
     assert!(
-        frame.contains("\u{2502}  a-very-long-\u{2026} v1   phase    \u{2502}"),
+        // MOD-115 M4 E5: the row sits after the kit list's gutter.
+        frame.contains("\u{2502}   a-very-long-\u{2026} v1   phase   "),
         "the long name is cut to its field: {frame}"
     );
     assert!(
-        frame.contains("\u{2502}  thirteen-char v1   phase    \u{2502}"),
+        frame.contains("\u{2502}   thirteen-char v1   phase   "),
         "a name that fits is whole: {frame}"
     );
 }
@@ -829,7 +880,7 @@ async fn an_edited_external_result_opens_the_editor_validated() {
     harness.settle().await;
     let frame = harness.render();
     assert!(
-        hint(&frame).ends_with("L1:C3"),
+        hint(&frame).starts_with("L1:C3 "),
         "the cursor is on the error: {frame}"
     );
     assert!(
@@ -945,7 +996,9 @@ async fn tab_and_digits_while_editing() {
 #[tokio::test]
 async fn h_and_l_switch_from_templates_but_ctrl_h_does_not() {
     let mut harness = open().await;
-    let on_templates = |frame: &str| frame.contains("D default");
+    // MOD-115 M4 E5: the tree's hints are its own, so the views tell apart by their lists: only
+    // Templates lists the project's tree.
+    let on_templates = |frame: &str| frame.contains("vulkan-tutorials");
     let frame = harness.render();
     assert!(on_templates(&frame), "the Templates view: {frame}");
     for key in ["ctrl-h", "alt-h"] {
@@ -975,6 +1028,8 @@ async fn a_rebound_diff_default_diffs_and_capital_d_is_inert() {
     )
     .await;
     select(&mut harness, "implement");
+    // MOD-115 M4 Q2: the body's keys are on the body pane, shown while it is focused.
+    harness.key("tab");
     harness.key("D");
     let frame = harness.render();
     assert!(!frame.contains("diff default"), "`D` is inert: {frame}");
@@ -1008,7 +1063,7 @@ async fn a_templates_switch_view_rebind_is_templates_only() {
         !on_library(&frame),
         "the Library still switches on `l`: {frame}"
     );
-    assert!(hint(&frame).contains("default"), "on Templates: {frame}");
+    assert!(frame.contains("vulkan-tutorials"), "on Templates: {frame}");
 
     for key in ["h", "l"] {
         harness.key(key);
@@ -1043,6 +1098,8 @@ async fn a_templates_switch_view_rebind_is_templates_only() {
 async fn a_shared_skills_rebind_reaches_templates() {
     let mut harness = open_with_keys(MemStore::demo(), "[skills]\ndiff = \"f6\"\n").await;
     save_implement_v2(&mut harness, "MARKER").await;
+    // MOD-115 M4 Q2: the body's keys are on the body pane, shown while it is focused.
+    harness.key("tab");
     let frame = harness.render();
     assert!(hint(&frame).contains("F6 diff"), "{frame}");
     assert!(!hint(&frame).contains("d diff"), "{frame}");
@@ -1161,7 +1218,7 @@ async fn tab_leaves_the_name_prompt_and_the_agent_help_with_the_draft() {
     assert_eq!(harness.app().tabs.active_id(), Some(SkillsTab::ID));
     let frame = harness.render();
     assert!(
-        frame.contains("new template in"),
+        titled(&frame, "new template ") && line_has(&frame, &["project", "vulkan-tutorials"]),
         "the prompt is open: {frame}"
     );
     assert!(frame.contains("tri"), "with its text: {frame}");
@@ -1186,7 +1243,10 @@ async fn tab_leaves_the_name_prompt_and_the_agent_help_with_the_draft() {
         frame.contains(" ask an agent "),
         "the help is open: {frame}"
     );
-    assert!(frame.contains("ask: short"), "with its request: {frame}");
+    assert!(
+        line_has(&frame, &["ask", "short"]),
+        "with its request: {frame}"
+    );
 }
 
 #[tokio::test]
@@ -1379,8 +1439,9 @@ async fn the_asking_panel() {
     type_text(&mut harness, "shorter");
     let frame = harness.render();
     assert!(frame.contains(" ask an agent "), "{frame}");
-    assert!(frame.contains("ask: shorter"), "{frame}");
-    assert!(frame.contains("agent: scripted"), "{frame}");
+    // MOD-115 M4 E5: the request is a one-row `kit::form`, the agent read-only under it.
+    assert!(line_has(&frame, &["ask", "shorter"]), "{frame}");
+    assert!(line_has(&frame, &["agent", "scripted"]), "{frame}");
     assert!(frame.contains(" phase placeholders "), "{frame}");
     assert!(
         hint(&frame).ends_with("Enter ask · Up/Down agent · Esc back"),
@@ -1448,17 +1509,14 @@ async fn the_pane_takes_motion_and_back_returns_to_the_template_left() {
     harness.key("G");
     harness.settle().await;
     let frame = harness.render();
-    assert!(
-        frame.contains("\u{250c} implement v"),
-        "the cursor stayed:\n{frame}"
-    );
+    assert!(titled(&frame, "implement v"), "the cursor stayed:\n{frame}");
 
     harness.key("tab");
     harness.key("h");
     harness.settle().await;
     let frame = harness.render();
     assert!(
-        !frame.contains("\u{250c} implement v"),
+        !titled(&frame, "implement v"),
         "on the Skills view:\n{frame}"
     );
     // RV3 (review M1): back on the Templates view, its cursor moves off `implement`, so the
@@ -1468,21 +1526,21 @@ async fn the_pane_takes_motion_and_back_returns_to_the_template_left() {
     harness.settle().await;
     let frame = harness.render();
     assert!(
-        !frame.contains("\u{250c} implement v"),
+        !titled(&frame, "implement v"),
         "the cursor left `implement`:\n{frame}"
     );
     harness.key("backspace");
     harness.settle().await;
     let frame = harness.render();
     assert!(
-        !frame.contains("\u{250c} implement v"),
+        !titled(&frame, "implement v"),
         "back on the Skills view:\n{frame}"
     );
     harness.key("backspace");
     harness.settle().await;
     let frame = harness.render();
     assert!(
-        frame.contains("\u{250c} implement v"),
+        titled(&frame, "implement v"),
         "back on `implement`:\n{frame}"
     );
 }
@@ -1500,7 +1558,7 @@ async fn the_name_prompt_opened_with_the_tree_zoomed_is_on_screen() {
     harness.settle().await;
     let frame = harness.render();
     assert!(
-        frame.contains("\u{250c} new template ") && frame.contains(": qwe"),
+        titled(&frame, "new template ") && line_has(&frame, &["name", "qwe"]),
         "the prompt is drawn:\n{frame}"
     );
 }
@@ -1534,7 +1592,36 @@ async fn back_lands_on_the_template_left_after_a_create_moved_its_row() {
     harness.settle().await;
     let frame = harness.render();
     assert!(
-        frame.contains("\u{250c} implement v"),
+        titled(&frame, "implement v"),
         "back on `implement`:\n{frame}"
     );
+}
+
+// ---- MOD-115 M4 L-skills: the view on the kit --------------------------------------------------
+
+/// MOD-81, MOD-115 M4 E5: the Templates view at 80 columns: the tree with the view chips on its
+/// top border and its own keys on its bottom one, the body beside it.
+#[tokio::test]
+async fn the_templates_view_at_80_columns() {
+    let mut harness = Harness::over(MemStore::demo()).size(80, 24);
+    register_all(harness.app());
+    harness.settle().await;
+    harness.key("2");
+    harness.key("l");
+    harness.settle().await;
+    select(&mut harness, "implement");
+    let frame = harness.render();
+    assert!(
+        frame.contains(" Skills  Templates "),
+        "the view chips: {frame}"
+    );
+    assert!(
+        titled(&frame, "implement v1 (head v1)"),
+        "the body's title: {frame}"
+    );
+    assert!(
+        hint(&frame).contains("r reload"),
+        "the tree's keys: {frame}"
+    );
+    insta::assert_snapshot!("browse_80", frame);
 }

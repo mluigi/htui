@@ -3,31 +3,31 @@ source: crates/htui/tests/skills.rs
 expression: frame
 ---
 Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      1 waiting ·  F9  about   F1  keys
- Skills │ Templates
-┌ attachments · tests ─────────────────────────────────────────────────────────────────────────────┐
-│  global                       —                                                                  │
-│* htui                         always · latest · pos 0                                            │
-│    analysis › research        —                                                                  │
-│    analysis › verdict         —                                                                  │
-│    bug › reproduce            —                                                                  │
-│    bug › fix                  —                                                                  │
-│    bug › review               —                                                                  │
-│    feature › prd              —                                                                  │
-│    feature › plan             —                                                                  │
-│    feature › implement        —                                                                  │
-│    feature › review           —                                                                  │
-│    refactor › plan            —                                                                  │
-│    refactor › implement       —                                                                  │
-│    refactor › review          —                                                                  │
-│    tooling › plan             —                                                                  │
-│    tooling › implement        —                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ edit tests · htui ───────────────────────────────────────────────────────────────────────────────┐
-│activation  glob  (Space cycles)                                                                  │
-│pin         latest                                                                                │
-│position    0                                                                                     │
-│languages   rust                                                                                  │
-│globs       src/**                                                                                │
-│effective:  src/**, **/*.rs, **/Cargo.toml                                                        │
-│a bare glob matches in every repo of the project; <repo>:<glob> matches in that repo only         │
-└─Tab/Down field · Space activation · Ctrl+r repo · Ctrl+s save · Esc cancel───────────────────────┘
+╭─ attachments · tests ───────────────────────────────────────────────────────── Skills  Templates ╮
+│   global                       —                                                                 ┃
+│▌* htui                         always · latest · pos 0                                           ┃
+│     analysis › research        —                                                                 ┃
+│     analysis › verdict         —                                                                 ┃
+│     bug › reproduce            —                                                                 ┃
+│     bug › fix                  —                                                                 ┃
+│     bug › review               —                                                                 ┃
+│     feature › prd              —                                                                 ┃
+│     feature › plan             —                                                                 │
+│     feature › implement        —                                                                 │
+│     feature › review           —                                                                 │
+│     refactor › plan            —                                                                 │
+│     refactor › implement       —                                                                 │
+│     refactor › review          —                                                                 │
+│     tooling › plan             —                                                                 │
+│     tooling › implement        —                                                                 │
+│     tooling › review           —                                                                 │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ edit tests · htui ──────────────────────────────────────────────────────────────────────────────╮
+│ activation  ‹ by glob ›  (Space cycles)                                                          │
+│ pin         latest                                                                               │
+│ position    0                                                                                    │
+│ languages   rust                                                                                 │
+│▌globs       src/**                                                                               │
+│ effective:  src/**, **/*.rs, **/Cargo.toml                                                       │
+│ a bare glob matches in every repo of the project; <repo>:<glob> matches in that repo only        │
+╰─Tab/Down field · Space activation · Ctrl+r repo · Ctrl+s save · Esc cancel───────────────────────╯

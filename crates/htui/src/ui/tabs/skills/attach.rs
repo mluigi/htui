@@ -31,34 +31,41 @@ use htui_core::store::{glob_names_unknown_repo, global_glob_names_a_repo};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use super::library::{Notice, Sent};
+use super::{framed, hint_line, holder, view_chips};
 use crate::app::{Ctx, Handled};
 use crate::keys::translate::FieldEvent;
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::skills::{ProjectSkills, SkillsSnapshot};
 use crate::store_worker::StoreRequest;
 use crate::ui::cells;
+use crate::ui::kit::form::{Field, Form as FormRows, Value};
+use crate::ui::kit::label;
+use crate::ui::kit::list::{self, Row, RowKind};
 use crate::ui::kit::modal::modal_rest;
-use crate::ui::{FieldOutcome, TextField, Theme};
+use crate::ui::kit::pane::{Focus, Pane};
+use crate::ui::{FieldOutcome, TextField};
 use crossterm::event::KeyEvent;
 
 /// A row's label field, in cells: a label is fitted to it with `cells::fit`, so the summary stays
 /// on the row and in one column.
 const LABEL_WIDTH: usize = 28;
 
-/// The form's label column, in cells: the labels are static ASCII, so a char is a cell
-/// (`description` is the longest label, `effective:` is 10).
-const FORM_LABEL: usize = 12;
+/// The form's label column, in cells: `activation` and `effective:`, the widest labels, so a
+/// value starts two cells after them, as before the kit (MOD-115 M4 E5).
+const FORM_LABEL: u16 = 10;
 
-/// The form panel's height, borders included: seven lines.
+/// The form panel's height, borders included: seven lines (the five inputs, `effective:`, and
+/// the help or refusal line).
 const FORM_HEIGHT: u16 = 9;
 
 /// A row with no attachment.
 const NO_ROW: &str = "\u{2014}";
 
-/// The form's last line: the any-repo rule of a bare glob (R-30).
+/// The form's last line: the any-repo rule of a bare glob (R-30), unless the repo refusal takes
+/// its place.
 const GLOB_HELP: &str =
     "a bare glob matches in every repo of the project; <repo>:<glob> matches in that repo only";
 
@@ -404,7 +411,7 @@ impl AttachPane {
         ctx: &Ctx<'_>,
     ) -> AttachOutcome {
         let stack = self.key_stack();
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         match core::mem::take(&mut self.mode) {
             AttachMode::Browse => self.on_browse_key(stack, chord, snapshot, ctx),
             AttachMode::Form(form) => self.on_form_key(stack, form, key, snapshot, ctx),
@@ -579,7 +586,7 @@ impl AttachPane {
             // The mode was taken: leaving it so closes the form.
             FieldOutcome::Cancel => return AttachOutcome::Consumed,
             FieldOutcome::Pass => {
-                let chord = KeyChord::from_event(key);
+                let chord = ctx.pressed(&key);
                 match ctx.keys().actions(stack, chord).first() {
                     Some(Act::AttachRepo) => return self.open_picker(form, snapshot, ctx),
                     Some(Act::FormSave) => return self.save(form, ctx),
@@ -758,8 +765,9 @@ impl AttachPane {
 
     // --- frames --------------------------------------------------------------------------------
 
-    /// Draws the pane into `area`. Its keys are [`hint`](Self::hint), the shell's hint row since
-    /// MOD-67 M6 T2.
+    /// Draws the pane into `area` (MOD-115 M4 E5): the rows as a kit pane carrying the view chips
+    /// (it leads the view), and under it the form or the picker. Whichever holds the keyboard is
+    /// the focused pane and carries [`hint`](Self::hint) (C4, Q2).
     pub(super) fn render(
         &self,
         frame: &mut Frame<'_>,
@@ -776,20 +784,48 @@ impl AttachPane {
             }
             AttachMode::Browse | AttachMode::ConfirmDetach { .. } => (area, None),
         };
-        self.render_rows(frame, rows_area, snapshot, ctx);
+        let focus = holder(ctx, false);
+        let hints = hint_line(self.hint(ctx.keys()), ctx);
+        let (rows_focus, rows_hints) = match panel {
+            Some(_) => (Focus::Unfocused, None),
+            None => (focus, hints.clone()),
+        };
+        let title = format!("attachments \u{b7} {}", skill_name(snapshot, self.skill));
+        let pane = framed(
+            view_chips(Pane::new(&title), 0),
+            rows_focus,
+            rows_hints,
+            ctx,
+        );
+        self.render_rows(frame, rows_area, pane, snapshot, ctx);
         match (&self.mode, panel) {
             (AttachMode::Form(form), Some(panel)) => {
-                render_form(frame, panel, form, snapshot, self.skill, ctx);
+                let verb = if form.token.is_some() {
+                    "edit"
+                } else {
+                    "attach"
+                };
+                let title = format!(
+                    "{verb} {} \u{b7} {}",
+                    skill_name(snapshot, self.skill),
+                    form.target
+                );
+                let pane = framed(Pane::new(&title), focus, hints, ctx);
+                render_form(frame, panel, pane, form, snapshot, ctx);
             }
             (AttachMode::Picker { form, cursor }, Some(panel)) => {
-                render_picker(frame, panel, form, *cursor, snapshot, ctx);
+                if let Some(project) = form.key.project {
+                    let title = format!("repos of {}", slug(ctx, project));
+                    let pane = framed(Pane::new(&title), focus, hints, ctx);
+                    render_picker(frame, panel, pane, project, *cursor, snapshot, ctx);
+                }
             }
             _ => {}
         }
     }
 
     /// The pane's keys in its mode, through [`key_stack`](Self::key_stack): the Skills tab's part
-    /// of the shell's hint row (MOD-67 M6 T2).
+    /// of the hints, drawn on the pane that holds the keyboard (MOD-115 M4 C4).
     pub(super) fn hint(&self, keys: &Keys) -> String {
         let spec = match &self.mode {
             AttachMode::Form(_) => FORM_HINT,
@@ -800,46 +836,48 @@ impl AttachPane {
         keys.hint(self.key_stack(), spec)
     }
 
-    /// The rows, the cursor's highlighted and kept in view.
+    /// The rows through `kit::list` in `pane`: the cursor's in the gutter and band (MOD-85, not
+    /// `selected`), kept in view; the project and global rows in the title role.
     fn render_rows(
         &self,
         frame: &mut Frame<'_>,
         area: Rect,
+        pane: Pane<'_>,
         snapshot: &SkillsSnapshot,
         ctx: &Ctx<'_>,
     ) {
         let theme = ctx.theme;
-        let block = Block::new().borders(Borders::ALL).title(format!(
-            " attachments \u{b7} {} ",
-            skill_name(snapshot, self.skill)
-        ));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
+        let inner = Pane::inner(area);
         let winners = self.winners(snapshot);
-        let lines: Vec<Line<'static>> = rows(snapshot)
+        let rows: Vec<Row<'static>> = rows(snapshot)
             .into_iter()
-            .enumerate()
-            .map(|(index, row)| {
+            .map(|row| {
                 let star = if winners.contains(&row) { '*' } else { ' ' };
                 let label = label(row, snapshot, ctx);
                 let summary = self.summary(row, snapshot);
-                let style = if index == self.cursor {
-                    theme.selected
-                } else if matches!(row, ARow::Phase { .. }) {
+                let style = if matches!(row, ARow::Phase { .. }) {
                     theme.base
                 } else {
                     theme.title
                 };
-                Line::styled(row_text(star, &label, &summary), style)
+                Row {
+                    line: Line::styled(row_text(star, &label, &summary), style),
+                    kind: RowKind::Item,
+                }
             })
             .collect();
-        let offset = self
-            .cursor
-            .saturating_sub(usize::from(inner.height).saturating_sub(1));
-        frame.render_widget(
-            Paragraph::new(lines).scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0)),
+        let offset = list::scroll_into_view(self.cursor, 0, usize::from(inner.height), rows.len());
+        list::render(
+            frame,
             inner,
+            &rows,
+            Some(self.cursor),
+            offset,
+            ctx.accent(),
+            theme,
         );
+        pane.scrollbar(rows.len(), offset)
+            .render(frame, area, theme);
     }
 
     /// A row's summary: `—` with no attachment, else `<activation> · <v N | latest> · pos <p>`,
@@ -853,7 +891,7 @@ impl AttachPane {
             return NO_ROW.to_owned();
         };
         let mut parts = vec![
-            stored.activation.as_str().to_owned(),
+            label::activation(stored.activation).to_owned(),
             stored
                 .pinned_version
                 .map_or_else(|| "latest".to_owned(), |pin| format!("v{pin}")),
@@ -867,7 +905,10 @@ impl AttachPane {
             let stale =
                 stored.project_id.is_some() && first_unknown_repo(&stored.globs, repos).is_some();
             let mark = if stale { " ?" } else { "" };
-            parts.push(format!("{} globs{mark}", stored.globs.len()));
+            parts.push(format!(
+                "{}{mark}",
+                label::plural(stored.globs.len(), "glob", "globs")
+            ));
         }
         // MOD-9 D126: ANA-22 §9's "the editor warns when the scoped project has repos with no
         // path row" — a glob that can only reach such repos would record `no_path` here.
@@ -1082,9 +1123,7 @@ fn build(form: &Form) -> Result<Attachment, String> {
     })
 }
 
-/// The form panel: five inputs, the `effective:` line, and the help line — or, in its place, the
-/// sentence the store would refuse a qualifier with.
-/// The activation row's label: `choice.toggle` through the keys in force (MOD-115 M2 RV1 H2),
+/// The activation row's own help: `choice.toggle` through the keys in force (MOD-115 M2 RV1 H2),
 /// `  (Space cycles)` under the compiled keys; nothing while the toggle is unbound.
 fn activation_label(keys: &Keys) -> String {
     let hint = keys.hint(views::ATTACH_FORM, ACTIVATION_HINT);
@@ -1095,67 +1134,69 @@ fn activation_label(keys: &Keys) -> String {
     }
 }
 
+/// The form panel in `pane` (MOD-115 M4 E5): the five inputs and the `effective:` line through
+/// `kit::form`, the focused one in the form's gutter and band (MOD-85: the activation is no
+/// longer marked by `selected`), then the help line — or, in its place, the sentence the store
+/// would refuse a qualifier with.
+///
+/// Lane deviation (L-skills repair 2) from blueprint §4.1, which asked for the activation as a
+/// `Value::Choice` with its key as `.help`, `effective:` as `Value::ReadOnly`, and the refusal and
+/// [`GLOB_HELP`] as the globs row's `.error` and `.help`. A kit `.help` shows only under the
+/// focused row, so the glob help and the any-repo rule would leave the screen whenever the globs
+/// row is not focused (content parity, the Definition of ported item 7), and `FORM_HEIGHT`'s
+/// seven inner rows hold no help and error both: they stay one always-shown last row. The
+/// activation stays an inline `Value::Lines` choice so the key that cycles it stays beside it
+/// whatever is focused, and `effective:` stays `Value::Lines` so a refused qualifier keeps the
+/// error role on it.
 fn render_form(
     frame: &mut Frame<'_>,
     area: Rect,
+    pane: Pane<'_>,
     form: &Form,
     snapshot: &SkillsSnapshot,
-    skill: SkillId,
     ctx: &Ctx<'_>,
 ) {
     let theme = ctx.theme;
-    let verb = if form.token.is_some() {
-        "edit"
-    } else {
-        "attach"
-    };
-    let block = Block::new().borders(Borders::ALL).title(format!(
-        " {verb} {} \u{b7} {} ",
-        skill_name(snapshot, skill),
-        form.target
-    ));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let width = inner
-        .width
-        .saturating_sub(u16::try_from(FORM_LABEL).unwrap_or(0));
-    let field = |name: &'static str, input: &TextField, which: FormField| {
-        let mut spans = vec![Span::styled(format!("{name:<FORM_LABEL$}"), theme.base)];
-        spans.extend(input.line(width, form.focus == which, theme).spans);
-        Line::from(spans)
-    };
-    let activation_style = if form.focus == FormField::Activation {
-        theme.selected
-    } else {
-        theme.base
-    };
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(format!("{:<FORM_LABEL$}", "activation"), theme.base),
-            Span::styled(form.activation.as_str(), activation_style),
-            Span::styled(activation_label(ctx.keys()), theme.dim),
-        ]),
-        field("pin", &form.pin, FormField::Pin),
-        field("position", &form.position, FormField::Position),
-        field("languages", &form.languages, FormField::Languages),
-        field("globs", &form.globs, FormField::Globs),
-    ];
+    // The activation is a choice: its word through `kit::label`, and the key that cycles it
+    // beside it, on its one row.
+    let activation = Value::Lines(vec![Line::from(vec![
+        Span::styled("\u{2039} ", theme.dim),
+        Span::styled(label::activation(form.activation), theme.base),
+        Span::styled(" \u{203a}", theme.dim),
+        Span::styled(activation_label(ctx.keys()), theme.dim),
+    ])]);
     let typed = split_list(form.globs.text().unwrap_or_default());
     let languages = split_list(form.languages.text().unwrap_or_default());
-    let label = Span::styled(format!("{:<FORM_LABEL$}", "effective:"), theme.base);
     let effective = canonical_globs(&typed, &languages);
-    lines.push(match &effective {
-        Ok(globs) if globs.is_empty() => Line::from(vec![label, Span::styled("none", theme.dim)]),
-        Ok(globs) => Line::from(vec![label, Span::styled(globs.join(", "), theme.base)]),
-        Err(err) => Line::from(vec![label, Span::styled(err.to_string(), theme.error)]),
-    });
-    lines.push(
-        match repo_refusal(form, effective.as_deref().unwrap_or(&[]), snapshot, ctx) {
-            Some(sentence) => Line::styled(sentence, theme.error),
-            None => Line::styled(GLOB_HELP, theme.dim),
-        },
-    );
+    let shown = match &effective {
+        Ok(globs) if globs.is_empty() => Line::styled("none", theme.dim),
+        Ok(globs) => Line::styled(globs.join(", "), theme.base),
+        Err(err) => Line::styled(err.to_string(), theme.error),
+    };
+    let focus = FormField::ALL
+        .iter()
+        .position(|field| *field == form.focus)
+        .unwrap_or(0);
+    let rows = FormRows::new()
+        .field(Field::new("activation", activation))
+        .field(Field::new("pin", Value::Text(&form.pin)))
+        .field(Field::new("position", Value::Text(&form.position)))
+        .field(Field::new("languages", Value::Text(&form.languages)))
+        .field(Field::new("globs", Value::Text(&form.globs)))
+        .field(Field::new("effective:", Value::Lines(vec![shown])))
+        .focus(focus)
+        .editing(form.focus != FormField::Activation)
+        .label_width(FORM_LABEL);
+    let inner = Pane::inner(area);
+    let mut lines = rows.lines(inner.width, ctx.accent(), theme);
+    let last = match repo_refusal(form, effective.as_deref().unwrap_or(&[]), snapshot, ctx) {
+        Some(sentence) => Span::styled(sentence, theme.error),
+        None => Span::styled(GLOB_HELP, theme.dim),
+    };
+    // Under the labels, past the form's gutter.
+    lines.push(Line::from(vec![Span::raw(" "), last]));
     frame.render_widget(Paragraph::new(lines), inner);
+    pane.render(frame, area, theme);
 }
 
 /// The store's sentence for the first qualifier it would refuse (D78, D79): any qualifier on the
@@ -1178,44 +1219,40 @@ fn repo_refusal(
     }
 }
 
-/// The picker panel: the form's project's repos, one per line.
+/// The picker panel: `project`'s repos, one per row through `kit::list` (the cursor in the
+/// gutter and band, MOD-85), in `pane`, which holds the keyboard (MOD-115 M4 C4).
 fn render_picker(
     frame: &mut Frame<'_>,
     area: Rect,
-    form: &Form,
+    pane: Pane<'_>,
+    project: ProjectId,
     cursor: usize,
     snapshot: &SkillsSnapshot,
     ctx: &Ctx<'_>,
 ) {
-    let theme: &Theme = ctx.theme;
-    let Some(project) = form.key.project else {
-        return;
-    };
-    let block = Block::new()
-        .borders(Borders::ALL)
-        .title(format!(" repos of {} ", slug(ctx, project)));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let repos = snapshot
+    let theme = ctx.theme;
+    let inner = Pane::inner(area);
+    let rows: Vec<Row<'static>> = snapshot
         .project(project)
-        .map_or(&[][..], |entry| entry.repos.as_slice());
-    let lines: Vec<Line<'static>> = repos
+        .map_or(&[][..], |entry| entry.repos.as_slice())
         .iter()
-        .enumerate()
-        .map(|(index, repo)| {
-            let style = if index == cursor {
-                theme.selected
-            } else {
-                theme.base
-            };
-            Line::styled(repo.clone(), style)
+        .map(|repo| Row {
+            line: Line::styled(repo.clone(), theme.base),
+            kind: RowKind::Item,
         })
         .collect();
-    let offset = cursor.saturating_sub(usize::from(inner.height).saturating_sub(1));
-    frame.render_widget(
-        Paragraph::new(lines).scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0)),
+    let offset = list::scroll_into_view(cursor, 0, usize::from(inner.height), rows.len());
+    list::render(
+        frame,
         inner,
+        &rows,
+        Some(cursor),
+        offset,
+        ctx.accent(),
+        theme,
     );
+    pane.scrollbar(rows.len(), offset)
+        .render(frame, area, theme);
 }
 
 /// The detach question over `name` and `target`, its answer `yes` (`ConfirmYes`'s label through
@@ -1382,5 +1419,212 @@ mod tests {
                 "{row:?} for {label:?}"
             );
         }
+    }
+
+    // ---- MOD-115 M4 L-skills: the pane on the kit ----------------------------------------------
+
+    /// The pane over an empty scope (only the `global` row), its form open on `form`, drawn at
+    /// 100 x 20 in `theme`, as the buffer and its rows.
+    fn drawn_form(form: Form, theme: &crate::ui::Theme) -> (ratatui::buffer::Buffer, Vec<String>) {
+        let skill = form.key.skill;
+        drawn(AttachMode::Form(form), skill, &no_projects(), theme)
+    }
+
+    /// A snapshot with an empty library and no project: the pane shows only the `global` row.
+    fn no_projects() -> SkillsSnapshot {
+        SkillsSnapshot {
+            skills: Vec::new(),
+            global: Vec::new(),
+            projects: Vec::new(),
+        }
+    }
+
+    /// The pane for `skill` in `mode` over `snapshot` and the Graphics workspace, drawn at
+    /// 100 x 20 in `theme`, as the buffer and its rows.
+    fn drawn(
+        mode: AttachMode,
+        skill: SkillId,
+        snapshot: &SkillsSnapshot,
+        theme: &crate::ui::Theme,
+    ) -> (ratatui::buffer::Buffer, Vec<String>) {
+        use crate::app::{Emit, TopBarState};
+        use crate::store_worker::Origin;
+        use crate::ui::tabs::SkillsTab;
+        use htui_core::fixtures::ids;
+        use htui_core::model::Scope;
+        let scope = Scope {
+            workspace_id: ids::WORKSPACE_GRAPHICS,
+            project_ids: snapshot
+                .projects
+                .iter()
+                .map(|entry| entry.project)
+                .collect(),
+        };
+        let (top_bar, emit) = (TopBarState::default(), Emit::default());
+        let ctx = Ctx::new(
+            &scope,
+            &[],
+            &top_bar,
+            Keys::compiled(),
+            theme,
+            Origin::Tab(SkillsTab::ID),
+            &emit,
+        );
+        let pane = AttachPane {
+            skill,
+            cursor: 0,
+            mode,
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).expect("terminal");
+        terminal
+            .draw(|frame| pane.render(frame, frame.area(), snapshot, &ctx))
+            .expect("the frame draws");
+        let buffer = terminal.backend().buffer().clone();
+        let rows = (0..20)
+            .map(|y| (0..100).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        (buffer, rows)
+    }
+
+    /// Whether `cell` is in the selection band of `theme` (MOD-85): `selected`'s colours and
+    /// modifiers, which neither theme leaves empty.
+    fn banded(cell: &ratatui::buffer::Cell, theme: &crate::ui::Theme) -> bool {
+        let band = theme.selected;
+        assert_ne!(band, ratatui::style::Style::new(), "a band that shows");
+        band.fg.is_none_or(|fg| cell.fg == fg)
+            && band.bg.is_none_or(|bg| cell.bg == bg)
+            && cell.modifier.contains(band.add_modifier)
+    }
+
+    /// Both themes the MOD-85 decisions are pinned in: colour and monochrome.
+    fn both_themes() -> [crate::ui::Theme; 2] {
+        [crate::ui::Theme::default(), crate::ui::Theme::monochrome()]
+    }
+
+    /// The first row of `rows` holding `text`, as a buffer row.
+    fn row_of(rows: &[String], text: &str) -> u16 {
+        let y = rows
+            .iter()
+            .position(|row| row.contains(text))
+            .unwrap_or_else(|| panic!("no row holds {text:?}: {rows:#?}"));
+        u16::try_from(y).expect("a short frame")
+    }
+
+    /// MOD-115 M4 E5, MOD-85: the focused activation is marked by the form's gutter and band
+    /// (legible without colour), not by `selected` on its word alone; the word is `kit::label`'s
+    /// and the key that cycles it stays beside it. In colour and in monochrome.
+    #[test]
+    fn the_activation_is_marked_by_the_form_gutter_and_band() {
+        for theme in both_themes() {
+            let (buffer, rows) = drawn_form(activation_form(Activation::Glob), &theme);
+            let y = row_of(&rows, "activation");
+            assert_eq!(buffer[(1, y)].symbol(), list::GUTTER, "{rows:#?}");
+            assert!(
+                banded(&buffer[(2, y)], &theme),
+                "the label is banded too: {rows:#?}"
+            );
+            assert!(banded(&buffer[(60, y)], &theme), "the band runs on");
+            let row = &rows[usize::from(y)];
+            assert!(
+                row.contains("\u{2039} by glob \u{203a}  (Space cycles)"),
+                "{row}"
+            );
+            let pin = row_of(&rows, "pin ");
+            assert_eq!(
+                buffer[(1, pin)].symbol(),
+                " ",
+                "only the focused row is marked"
+            );
+            assert!(!banded(&buffer[(2, pin)], &theme), "nor banded");
+            assert!(
+                rows.iter().any(|row| row.contains(GLOB_HELP)),
+                "the any-repo rule: {rows:#?}"
+            );
+        }
+    }
+
+    /// MOD-115 M4 E5, MOD-85: the attachment rows' cursor is `kit::list`'s gutter and a band
+    /// across the row, not `selected` on its text alone; the other rows carry neither. In colour
+    /// and in monochrome.
+    #[test]
+    fn the_attachment_cursor_is_the_gutter_and_band() {
+        let project = htui_core::fixtures::ids::PROJECT_VULKAN;
+        let snapshot = SkillsSnapshot {
+            projects: vec![ProjectSkills {
+                project,
+                bindings: Vec::new(),
+                graphs: Vec::new(),
+                repos: vec!["app".to_owned()],
+                unrooted: Vec::new(),
+            }],
+            ..no_projects()
+        };
+        for theme in both_themes() {
+            let (buffer, rows) = drawn(AttachMode::Browse, SkillId::new(), &snapshot, &theme);
+            let global = row_of(&rows, "global");
+            assert_eq!(buffer[(1, global)].symbol(), list::GUTTER, "{rows:#?}");
+            for x in [2, 10, 60, 97] {
+                assert!(banded(&buffer[(x, global)], &theme), "x {x}: {rows:#?}");
+            }
+            let below = global + 1;
+            assert_eq!(buffer[(1, below)].symbol(), " ", "{rows:#?}");
+            assert!(!banded(&buffer[(10, below)], &theme), "{rows:#?}");
+        }
+    }
+
+    /// MOD-115 M4 E5, MOD-85: the repo picker's cursor is `kit::list`'s gutter and band, and the
+    /// picker is the focused pane under the rows. In colour and in monochrome.
+    #[test]
+    fn the_repo_picker_cursor_is_the_gutter_and_band() {
+        let project = htui_core::fixtures::ids::PROJECT_VULKAN;
+        let snapshot = SkillsSnapshot {
+            projects: vec![ProjectSkills {
+                project,
+                bindings: Vec::new(),
+                graphs: Vec::new(),
+                repos: vec!["app".to_owned(), "core".to_owned()],
+                unrooted: Vec::new(),
+            }],
+            ..no_projects()
+        };
+        for theme in both_themes() {
+            let mut form = activation_form(Activation::Glob);
+            form.key.project = Some(project);
+            let skill = form.key.skill;
+            let mode = AttachMode::Picker { form, cursor: 1 };
+            let (buffer, rows) = drawn(mode, skill, &snapshot, &theme);
+            let top = row_of(&rows, "repos of ");
+            let core = row_of(&rows, "\u{2502}\u{258c}core");
+            assert!(core > top, "the picker's rows: {rows:#?}");
+            assert_eq!(buffer[(1, core)].symbol(), list::GUTTER, "{rows:#?}");
+            for x in [2, 10, 60] {
+                assert!(banded(&buffer[(x, core)], &theme), "x {x}: {rows:#?}");
+            }
+            let app = core - 1;
+            assert!(rows[usize::from(app)].contains("app"), "{rows:#?}");
+            assert_eq!(buffer[(1, app)].symbol(), " ", "{rows:#?}");
+            assert!(!banded(&buffer[(2, app)], &theme), "{rows:#?}");
+        }
+    }
+
+    /// MOD-115 M4 C4: with the form open it holds the keyboard: it is the focused pane, with the
+    /// form's keys on its border; the rows above it are not, and carry the view chips.
+    #[test]
+    fn the_open_form_is_the_focused_pane() {
+        let theme = crate::ui::Theme::default();
+        let (buffer, rows) = drawn_form(activation_form(Activation::Always), &theme);
+        let form_top = rows
+            .iter()
+            .position(|row| row.contains("attach "))
+            .expect("the form's title");
+        let accent = theme.tab_accent("skills");
+        assert_eq!(
+            Some(buffer[(0, u16::try_from(form_top).expect("short"))].fg),
+            accent.fg
+        );
+        assert_eq!(Some(buffer[(0, 0)].fg), theme.border_faint.fg, "{rows:#?}");
+        assert!(rows[0].contains(" Skills "), "the view chips: {rows:#?}");
+        assert!(rows[19].contains("Ctrl+s save"), "{rows:#?}");
     }
 }

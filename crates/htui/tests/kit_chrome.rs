@@ -59,10 +59,6 @@ const GROUP_B: &[(&str, &str)] = &[
     ("ui/tabs/backlog/filter.rs", "Backlog"),
     ("ui/tabs/backlog/item_form.rs", "Backlog"),
     ("ui/tabs/backlog/list.rs", "Backlog"),
-    ("ui/tabs/skills/agent_help.rs", "Skills"),
-    ("ui/tabs/skills/attach.rs", "Skills"),
-    ("ui/tabs/skills/library.rs", "Skills"),
-    ("ui/tabs/skills/templates.rs", "Skills"),
 ];
 
 /// Whether `name` (relative to `src/`) is `prefix`, or under it when `prefix` ends in `/`.

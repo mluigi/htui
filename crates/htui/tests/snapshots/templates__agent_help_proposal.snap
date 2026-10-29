@@ -3,8 +3,7 @@ source: crates/htui/tests/templates.rs
 expression: frame
 ---
 Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 waiting ·  F9  about   F1  keys
- Skills │ Templates
-┌ proposal from scripted · sent → proposed ──────────────────┐┌ phase placeholders ────────────────┐
+╭─ proposal from scripted · sent → proposed ─────‹ Templates ╮╭─ phase placeholders ───────────────╮
 │--- sent                                                    ││{{item_key}} scalar                 │
 │+++ proposed                                                ││{{item_title}} scalar               │
 │@@ -1,16 +1,3 @@                                            ││{{item_kind}} scalar                │
@@ -30,4 +29,5 @@ Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 wait
 │-you verified it, one section per file group.               ││                                    │
 │+Do the item.                                               ││                                    │
 │                                                            ││                                    │
-└─Enter accept · n/Esc discard · J/K scroll · PgUp/PgDn page─┘└────────────────────────────────────┘
+│                                                            ││                                    │
+╰─Enter accept · n/Esc discard · J/K scroll · PgUp/PgDn page─╯╰────────────────────────────────────╯
