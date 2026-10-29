@@ -3363,13 +3363,15 @@ impl State {
     /// The three `item_kind` rules the schema cannot express on its own (D11): the prefix CHECK in
     /// words, `(project, prefix)` and `(project, name)` uniqueness, and a `default_graph_id` the
     /// kind's project may use (MOD-138 D12, [`graph_usable_by`]): its own, a workspace's that
-    /// holds it, or the library's.
+    /// holds it, or the library's. `graph` is `None` when an update leaves the graph as it is: an
+    /// unchanged graph is not re-checked, so a kind keeps a workspace graph its project has left
+    /// (A7), as an item does.
     fn check_item_kind(
         &self,
         project: ProjectId,
         prefix: &str,
         name: &str,
-        graph: StepGraphId,
+        graph: Option<StepGraphId>,
         except: Option<ItemKindId>,
     ) -> Result<()> {
         if !ItemKind::prefix_is_valid(prefix) {
@@ -3380,13 +3382,15 @@ impl State {
                 "item_kind.project_id `{project}` references no project"
             )));
         }
-        let workspaces = self.workspaces_of(project);
-        if self
-            .graphs
-            .get(&graph)
-            .is_none_or(|row| !graph_usable_by(row.scope, project, &workspaces))
-        {
-            return Err(StoreError::Constraint(graph_not_usable(graph, project)));
+        if let Some(graph) = graph {
+            let workspaces = self.workspaces_of(project);
+            if self
+                .graphs
+                .get(&graph)
+                .is_none_or(|row| !graph_usable_by(row.scope, project, &workspaces))
+            {
+                return Err(StoreError::Constraint(graph_not_usable(graph, project)));
+            }
         }
         let clashes = |taken: &dyn Fn(&ItemKind) -> bool| {
             self.kinds
@@ -3411,7 +3415,7 @@ impl State {
             new.project_id,
             &new.prefix,
             &new.name,
-            new.default_graph_id,
+            Some(new.default_graph_id),
             None,
         )?;
         if self.kinds.contains_key(&new.id) {
@@ -3459,7 +3463,9 @@ impl State {
             current.project_id,
             patch.prefix.as_deref().unwrap_or(&current.prefix),
             patch.name.as_deref().unwrap_or(&current.name),
-            patch.default_graph_id.unwrap_or(current.default_graph_id),
+            patch
+                .default_graph_id
+                .filter(|graph| *graph != current.default_graph_id),
             Some(id),
         )?;
         let row = self

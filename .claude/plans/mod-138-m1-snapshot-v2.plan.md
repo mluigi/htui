@@ -21,6 +21,7 @@ phases against the stored phases), as before MOD-138: equal walks on, different 
 v1 run started before the upgrade on a graph with a palette phase or authored edges is not stranded, and edges added
 under a v1 run no longer park it (v1 runs always walked by position). The edge-aware v2-digest compare stays for every
 v1 run whose live graph resolves.
+A7 (review R1, maintainer 2026-10-29): a kind's graph is checked against the usable-graphs rule only when an update changes it, in both stores, as items are.
 
 ## Summary
 

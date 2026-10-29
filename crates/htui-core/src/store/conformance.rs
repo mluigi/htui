@@ -288,6 +288,8 @@ pub const CASES: &[&str] = &[
     "item_kind_takes_usable_graphs_only",
     "usable_graphs_lists_project_workspace_library",
     "delete_workspace_refuses_a_held_graph",
+    // MOD-138 M1 review R1 (A7): a kind's graph is checked only when an update changes it
+    "item_kind_keeps_a_graph_its_project_left",
     "project_types_are_the_six_builtins",
     "a_new_project_is_software",
     "memory_create_writes_the_row_and_revision_1",
@@ -932,6 +934,9 @@ async fn run_case_inline<S: WriteStore>(name: &str, store: &S) {
         }
         "delete_workspace_refuses_a_held_graph" => {
             Box::pin(delete_workspace_refuses_a_held_graph(store)).await;
+        }
+        "item_kind_keeps_a_graph_its_project_left" => {
+            Box::pin(item_kind_keeps_a_graph_its_project_left(store)).await;
         }
         "project_types_are_the_six_builtins" => {
             project_types_are_the_six_builtins(store).await;
@@ -23694,6 +23699,114 @@ async fn item_kind_takes_usable_graphs_only<S: WriteStore>(store: &S) {
         .find(|row| row.id == kind.id)
         .unwrap_or_else(|| panic!("{CASE}: the kind is there"));
     assert_eq!(kept, kind, "{CASE}: the refused update wrote nothing");
+}
+
+/// MOD-138 A7 (review R1): a kind's graph is checked against the usable-graphs rule only when an
+/// update changes it, as an item's is. A kind kept on a workspace graph after its project left the
+/// workspace takes a rename that resends the graph unchanged, and one that leaves it out; an
+/// update that changes the graph to one the project may not use is still refused with
+/// [`graph_not_usable`], whether that graph is another workspace's or the one the project left.
+async fn item_kind_keeps_a_graph_its_project_left<S: WriteStore>(store: &S) {
+    const CASE: &str = "item_kind_keeps_a_graph_its_project_left";
+    let ours = linked_workspace(CASE, store, "kept-ours", ids::PROJECT_HTUI).await;
+    let theirs = linked_workspace(CASE, store, "kept-theirs", ids::PROJECT_AGY).await;
+    let shared = store
+        .create_step_graph(scoped_graph(GraphScope::Workspace(ours), "keptflow", false))
+        .await
+        .expect(CASE);
+    let foreign = store
+        .create_step_graph(scoped_graph(
+            GraphScope::Workspace(theirs),
+            "keptother",
+            false,
+        ))
+        .await
+        .expect(CASE);
+    let mut kind = store
+        .create_item_kind(new_item_kind(ids::PROJECT_HTUI, "KEPK", "kept", shared.id))
+        .await
+        .expect(CASE);
+    let mut moved = store
+        .create_item_kind(new_item_kind(
+            ids::PROJECT_HTUI,
+            "MOVEK",
+            "moved",
+            ids::GRAPH_HTUI_ANA,
+        ))
+        .await
+        .expect(CASE);
+    store
+        .remove_workspace_project(ours, ids::PROJECT_HTUI)
+        .await
+        .expect(CASE);
+
+    for (graph, name) in [(Some(shared.id), "kept again"), (None, "kept once more")] {
+        kind = applied(
+            CASE,
+            store
+                .update_item_kind(
+                    kind.id,
+                    kind.updated_at,
+                    ItemKindPatch {
+                        name: Some(name.to_owned()),
+                        default_graph_id: graph,
+                        ..ItemKindPatch::default()
+                    },
+                )
+                .await
+                .expect(CASE),
+        );
+        assert_eq!(
+            kind.name, name,
+            "{CASE}: the rename with graph {graph:?} lands"
+        );
+        assert_eq!(
+            kind.default_graph_id, shared.id,
+            "{CASE}: an unchanged graph is not re-checked, so the kind keeps it"
+        );
+    }
+
+    for (row, graph) in [(&kind, foreign.id), (&moved, shared.id)] {
+        let refused = store
+            .update_item_kind(
+                row.id,
+                row.updated_at,
+                ItemKindPatch {
+                    name: Some("renamed too".to_owned()),
+                    default_graph_id: Some(graph),
+                    ..ItemKindPatch::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                &refused,
+                Err(StoreError::Constraint(text))
+                    if *text == graph_not_usable(graph, ids::PROJECT_HTUI)
+            ),
+            "{CASE}: a change to {graph}, which the project may not use, is refused, got \
+             {refused:?}"
+        );
+    }
+    let rows = store.item_kinds(ids::PROJECT_HTUI).await.expect(CASE);
+    let reread = |id| {
+        rows.iter()
+            .find(|row| row.id == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("{CASE}: the kind is there"))
+    };
+    assert_eq!(
+        reread(kind.id),
+        kind,
+        "{CASE}: the refused change wrote nothing"
+    );
+    moved = reread(moved.id);
+    assert_eq!(
+        moved.default_graph_id,
+        ids::GRAPH_HTUI_ANA,
+        "{CASE}: the refused move wrote nothing"
+    );
+    assert_eq!(moved.name, "moved", "{CASE}: nor the rename beside it");
 }
 
 /// MOD-138 D12 (A4): `usable_graphs` lists the project's graphs (an override included), then the

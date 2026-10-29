@@ -3504,6 +3504,9 @@ impl WriteStore for PgStore {
     /// `(project, prefix)`, so old keys keep their text and the next mint under the kind starts the
     /// new prefix at 1 (PRD D12).
     ///
+    /// The graph guard checks `default_graph_id` against the usable-graphs rule only when the patch
+    /// changes it (A7), as an item's graph is: a kind keeps a workspace graph its project has left.
+    ///
     /// Zero rows means one of three things, split by one follow-up read the way
     /// [`update_item`](PgStore::update_item) splits its own: no such row, a spent token, or the
     /// graph guard — which can only have fired if the token still matches.
@@ -3550,14 +3553,16 @@ impl WriteStore for PgStore {
                 position         = COALESCE($7, position)
              WHERE id = $1
                AND updated_at = $2
-               AND EXISTS (SELECT 1 FROM step_graph g
-                            WHERE g.id = COALESCE($6, item_kind.default_graph_id)
-                              AND (g.project_id = item_kind.project_id
-                                   OR (g.project_id IS NULL AND g.workspace_id IS NULL)
-                                   OR g.workspace_id IN (SELECT wp.workspace_id
-                                                           FROM workspace_project wp
-                                                          WHERE wp.project_id
-                                                                = item_kind.project_id)))
+               AND ($6::uuid IS NULL
+                    OR $6 = item_kind.default_graph_id
+                    OR EXISTS (SELECT 1 FROM step_graph g
+                                WHERE g.id = $6
+                                  AND (g.project_id = item_kind.project_id
+                                       OR (g.project_id IS NULL AND g.workspace_id IS NULL)
+                                       OR g.workspace_id IN (SELECT wp.workspace_id
+                                                               FROM workspace_project wp
+                                                              WHERE wp.project_id
+                                                                    = item_kind.project_id))))
             RETURNING id               AS "id: ItemKindId",
                       project_id       AS "project_id: ProjectId",
                       prefix,
@@ -3593,7 +3598,8 @@ impl WriteStore for PgStore {
             return Ok(CasOutcome::Stale(current));
         }
         // The compare-and-set matched, so the only other conjunct of the `WHERE` - the graph guard
-        // - is what refused the row, and the project exists because the row does.
+        // - is what refused the row, and the project exists because the row does. The guard only
+        // refuses a graph the patch changes (A7), so the patch names it.
         let graph = patch.default_graph_id.unwrap_or(current.default_graph_id);
         Err(StoreError::Constraint(graph_not_usable(
             graph,

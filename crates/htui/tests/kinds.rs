@@ -1774,8 +1774,8 @@ async fn an_untouched_kind_edit_keeps_a_shared_graph_the_project_shadows_by_name
 /// MOD-138 D12: a kind keeps its workspace graph after the project leaves that workspace, and the
 /// kind still resolves. `usable_graphs` no longer lists the graph, yet the catalogue carries its row
 /// in `kept`, so the kind's line names it with its scope rather than `graph missing`, and the edit
-/// form opens on that label. The untouched `Enter` sends the kept graph, which the store's guard
-/// then refuses: the project may no longer name it.
+/// form opens on that label. A rename sends the kept graph untouched, and it lands: a kind's graph
+/// is checked against the usable-graphs rule only when an update changes it (A7).
 #[tokio::test]
 async fn a_kept_workspace_graph_reads_with_its_scope_not_as_missing() {
     let store = MemStore::demo();
@@ -1846,6 +1846,11 @@ async fn a_kept_workspace_graph_reads_with_its_scope_not_as_missing() {
             .any(|line| line.trim() == "graph         wsflow \u{b7} workspace"),
         "the graph field names the kept graph: {open}"
     );
+    bench.key(&mut section, "tab");
+    for _ in 0.."docs".len() {
+        bench.key(&mut section, "backspace");
+    }
+    type_at(&bench, &mut section, "guides");
     bench.key(&mut section, "enter");
     let asked = bench.drained();
     let [Action::Store(request @ StoreRequest::UpdateKind { patch, .. })] = asked.as_slice() else {
@@ -1856,13 +1861,17 @@ async fn a_kept_workspace_graph_reads_with_its_scope_not_as_missing() {
         Some(shared.id),
         "an untouched field keeps the kept graph"
     );
-    let (_, message) = refusal(serve(&backend, request).await);
-    assert!(
-        message.contains(&htui_core::store::graph_not_usable(
-            shared.id,
-            ids::PROJECT_VULKAN
-        )),
-        "the guard refuses the left workspace's graph: {message}"
+    assert_eq!(patch.name.as_deref(), Some("guides"), "the rename");
+    let reread = catalogue(serve(&backend, request).await);
+    let renamed = reread.projects[0]
+        .kinds
+        .iter()
+        .find(|kind| kind.prefix == "DOC")
+        .expect("the kind is still there");
+    assert_eq!(renamed.name, "guides", "the rename lands");
+    assert_eq!(
+        renamed.default_graph_id, shared.id,
+        "an unchanged graph is not re-checked, so the kind keeps it"
     );
 }
 
