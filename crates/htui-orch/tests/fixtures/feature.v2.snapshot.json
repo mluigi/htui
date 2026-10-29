@@ -1,0 +1,176 @@
+{
+  "v": 2,
+  "graph": {
+    "id": "01a06490-c789-7000-8000-000000000501",
+    "name": "feature",
+    "is_override": false,
+    "scope": {
+      "owner": "project",
+      "id": "01a06490-c3a0-7000-8000-000000000400"
+    },
+    "revision": 0
+  },
+  "source": {
+    "how": "kind_default"
+  },
+  "topology": "sha256:bdbf786844046bcf4101e4499f27230c2914ec8baa3611117af9cd2c1e076a5e",
+  "mode": "manual",
+  "phases": [
+    {
+      "position": 0,
+      "name": "prd",
+      "fan_out": 1,
+      "gate": "always",
+      "gate_effective": "always",
+      "gate_hard": true,
+      "retry_limit": 1,
+      "input_kinds": [],
+      "output_kind": "prd",
+      "isolation": "worktree",
+      "command_queue": "fan_out_only",
+      "verify_command": null,
+      "deadline_seconds": 7200,
+      "template": {
+        "name": "prd",
+        "version": 1
+      },
+      "token_budget": 120000,
+      "candidates": [
+        {
+          "agent_id": "01a06490-eab0-7000-8000-000000000e00",
+          "agent_name": "claude",
+          "model": "sonnet"
+        }
+      ],
+      "judge": null
+    },
+    {
+      "position": 1,
+      "name": "plan",
+      "fan_out": 1,
+      "gate": "always",
+      "gate_effective": "always",
+      "gate_hard": true,
+      "retry_limit": 1,
+      "input_kinds": [
+        "prd"
+      ],
+      "output_kind": "plan",
+      "isolation": "worktree",
+      "command_queue": "fan_out_only",
+      "verify_command": null,
+      "deadline_seconds": 7200,
+      "template": {
+        "name": "plan",
+        "version": 1
+      },
+      "token_budget": 120000,
+      "candidates": [
+        {
+          "agent_id": "01a06490-eab0-7000-8000-000000000e00",
+          "agent_name": "claude",
+          "model": "sonnet"
+        }
+      ],
+      "judge": null
+    },
+    {
+      "position": 2,
+      "name": "implement",
+      "fan_out": 1,
+      "gate": "always",
+      "gate_effective": "always",
+      "gate_hard": false,
+      "retry_limit": 1,
+      "input_kinds": [
+        "plan",
+        "review"
+      ],
+      "output_kind": "implement",
+      "isolation": "worktree",
+      "command_queue": "fan_out_only",
+      "verify_command": null,
+      "deadline_seconds": 7200,
+      "template": {
+        "name": "implement",
+        "version": 1
+      },
+      "token_budget": 120000,
+      "candidates": [
+        {
+          "agent_id": "01a06490-eab0-7000-8000-000000000e00",
+          "agent_name": "claude",
+          "model": "sonnet"
+        }
+      ],
+      "judge": null
+    },
+    {
+      "position": 3,
+      "name": "review",
+      "fan_out": 1,
+      "gate": "always",
+      "gate_effective": "always",
+      "gate_hard": false,
+      "retry_limit": 1,
+      "input_kinds": [
+        "implement"
+      ],
+      "output_kind": "review",
+      "isolation": "worktree",
+      "command_queue": "fan_out_only",
+      "verify_command": null,
+      "deadline_seconds": 7200,
+      "template": {
+        "name": "review",
+        "version": 1
+      },
+      "token_budget": 120000,
+      "candidates": [
+        {
+          "agent_id": "01a06490-eab0-7000-8000-000000000e00",
+          "agent_name": "claude",
+          "model": "sonnet"
+        }
+      ],
+      "judge": null
+    }
+  ],
+  "edges": [
+    {
+      "from": "prd",
+      "to": "plan",
+      "kind": "next"
+    },
+    {
+      "from": "plan",
+      "to": "implement",
+      "kind": "next"
+    },
+    {
+      "from": "implement",
+      "to": "review",
+      "kind": "next"
+    },
+    {
+      "from": "review",
+      "to": "implement",
+      "kind": "changes_requested",
+      "loop_limit": 1
+    }
+  ],
+  "settings": {
+    "default_isolation": "worktree",
+    "per_token_cap_run": null,
+    "per_token_cap_batch": null,
+    "max_fan_out": 4,
+    "max_agents_per_run": 8,
+    "max_parallel_sessions": 4,
+    "max_plan_revisions": 3,
+    "max_child_runs": 8,
+    "runtime_changes": "ask"
+  },
+  "scope": {
+    "repos": {}
+  }
+}

@@ -1054,6 +1054,8 @@ pub(crate) mod tests {
                 phase.gate = Gate::Never;
                 if phase.name == "research" {
                     phase.fan_out = 2;
+                    // MOD-138 T4: resolve validates the row (`ck_phase_split_fan_out`).
+                    phase.split = htui_core::model::Split::Compete;
                 }
             }
         }
