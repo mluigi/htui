@@ -989,7 +989,8 @@ impl ItemForm {
                     .context
                     .graphs
                     .iter()
-                    .find(|graph| graph.id == id)
+                    .chain(&self.context.item_graph)
+                    .find(|graph| graph.id == id && !graph.is_override)
                     .map_or_else(
                         || "override (this item's)".to_owned(),
                         |graph| graph_label(&graph.name, graph.scope),
@@ -1798,6 +1799,51 @@ mod tests {
         assert_eq!(edit.graph_options().last(), Some(&Some(clone.id)));
         assert_eq!(edit.graph_options().len(), expected.len() + 1);
         assert_eq!(edit.picker_label(Field::Graph), "override (this item's)");
+    }
+
+    /// MOD-138 D12: an item keeps its workspace graph after the project leaves that workspace,
+    /// and the picker still offers that graph at the end of the list, labelled with its scope
+    /// rather than as an override, which it is not.
+    #[tokio::test]
+    async fn a_left_workspace_graph_is_labelled_with_its_scope_not_as_an_override() {
+        let store = MemStore::demo();
+        let shared = store
+            .create_step_graph(NewStepGraph {
+                id: StepGraphId::new(),
+                scope: GraphScope::Workspace(ids::WORKSPACE_PLATFORM),
+                name: "wsflow".to_owned(),
+                description: String::new(),
+                is_override: false,
+            })
+            .await
+            .expect("a workspace graph");
+        store
+            .update_item(
+                ids::HTUI_ANA_1,
+                1,
+                ItemPatch {
+                    step_graph_id: Some(Some(shared.id)),
+                    ..patch()
+                },
+            )
+            .await
+            .expect("the item takes it");
+        store
+            .remove_workspace_project(ids::WORKSPACE_PLATFORM, ids::PROJECT_HTUI)
+            .await
+            .expect("the project leaves the workspace");
+
+        let edit = edit_form(&store, ids::HTUI_ANA_1).await;
+        assert!(
+            !edit
+                .context
+                .graphs
+                .iter()
+                .any(|graph| graph.id == shared.id),
+            "the project may no longer pick it"
+        );
+        assert_eq!(edit.graph_options().last(), Some(&Some(shared.id)));
+        assert_eq!(edit.picker_label(Field::Graph), "wsflow \u{b7} workspace");
     }
 
     #[test]

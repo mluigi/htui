@@ -80,6 +80,10 @@ pub struct ItemFormContext {
     pub repos: Vec<Repo>,
     /// The item, fresh, for an edit (its `version` is the compare-and-set token); `None` for new.
     pub item: Option<Item>,
+    /// The row of `item`'s own `step_graph_id` when `graphs` lacks it: its override (A3), or
+    /// (MOD-138 D12) a workspace graph it kept after the project left that workspace, which the
+    /// picker labels by scope rather than as an override. `None` otherwise, and for a new item.
+    pub item_graph: Option<StepGraph>,
 }
 
 impl ItemFormContext {
@@ -105,6 +109,10 @@ impl core::fmt::Debug for ItemFormContext {
             .field("graphs", &self.graphs.len())
             .field("repos", &self.repos.len())
             .field("item", &self.item.as_ref().map(ItemDigest))
+            .field(
+                "item_graph",
+                &self.item_graph.as_ref().map(|graph| graph.id),
+            )
             .finish()
     }
 }
@@ -224,6 +232,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 if row.project_id != *project {
                     return Err(StoreError::Constraint(item_not_in_project(&row.key)));
                 }
+                context.item_graph = item_graph(&writer, &context.graphs, &row).await?;
                 context.item = Some(row);
             }
             Ok(StoreReply::ItemForm(Box::new(context)))
@@ -276,6 +285,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 }),
                 UpdateOutcome::Diverged { head, ancestor } => {
                     // Milestone 3 D7: the catalogue just read, with the head as its item.
+                    context.item_graph = item_graph(&writer, &context.graphs, &head).await?;
                     context.item = Some(head.clone());
                     Ok(StoreReply::ItemDiverged(Box::new(ItemDivergence {
                         head,
@@ -332,7 +342,23 @@ async fn catalogue(writer: &Writer, project: ProjectId) -> Result<ItemFormContex
         graphs,
         repos,
         item: None,
+        item_graph: None,
     })
+}
+
+/// [`ItemFormContext::item_graph`]: `item`'s own graph row when `graphs` lacks it. A graph the
+/// read no longer finds is `None`, and the picker falls back to the override label.
+async fn item_graph(
+    writer: &Writer,
+    graphs: &[StepGraph],
+    item: &Item,
+) -> Result<Option<StepGraph>> {
+    match item.step_graph_id {
+        Some(id) if !graphs.iter().any(|graph| graph.id == id) => {
+            Ok(writer.graph_body(id).await?.map(|body| body.graph))
+        }
+        _ => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -1029,6 +1055,7 @@ mod tests {
             graphs: Vec::new(),
             repos: Vec::new(),
             item: Some(item.clone()),
+            item_graph: None,
         };
         let divergence = ItemDivergence {
             head: item.clone(),
