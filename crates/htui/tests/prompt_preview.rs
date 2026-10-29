@@ -29,6 +29,13 @@ use htui_core::prompt::excerpt::RootSource;
 use htui_core::store::{MemStore, ReadStore as _, UpdateOutcome, WriteStore as _};
 use htui_store::Backend;
 
+/// Whether the Backlog's detail pane is on `key` (MOD-115 M4 B1): its title on the rounded
+/// top border is `KEY · title` (`╭─ KEY ·`), or the bare `Detail` with no item selected.
+fn on_item(frame: &str, key: &str) -> bool {
+    frame.contains(&format!("\u{256d}\u{2500} {key} "))
+        || frame.contains(&format!("\u{2500} {key} \u{b7}"))
+}
+
 /// How far right the Prompt sub-tab sits: Body, Runs, Graph, Documents, Notes, **Prompt**.
 const TO_PROMPT: usize = 5;
 
@@ -112,7 +119,7 @@ async fn the_prompt_sub_tab_previews_feat_1() {
     sub_tab(&mut harness, TO_PROMPT);
     let frame = harness.render();
 
-    assert!(frame.contains("┌ FEAT-1"), "the preview is of htui FEAT-1");
+    assert!(on_item(&frame, "FEAT-1"), "the preview is of htui FEAT-1");
     assert!(frame.contains("digest"), "the digest line is rendered");
     assert!(
         frame.contains("section") && frame.contains("template"),
@@ -744,7 +751,7 @@ async fn an_item_with_nothing_attached_still_previews() {
     down(&mut harness, TO_ANA_2).await;
     sub_tab(&mut harness, TO_PROMPT);
     let frame = harness.render();
-    assert!(frame.contains("┌ ANA-2"));
+    assert!(on_item(&frame, "ANA-2"));
     // Two of criterion 4's three sections would have a row in the table if they had bytes; the
     // third is the excerpt section, whose absence is what the `roots` line accounts for.
     assert!(

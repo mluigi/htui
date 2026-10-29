@@ -29,6 +29,13 @@ use htui_store::vector::{Hit, PointType};
 use unicode_segmentation::UnicodeSegmentation as _;
 use unicode_width::UnicodeWidthStr as _;
 
+/// Whether the Backlog's detail pane is on `key` (MOD-115 M4 B1): its title on the rounded
+/// top border is `KEY · title` (`╭─ KEY ·`), or the bare `Detail` with no item selected.
+fn on_item(frame: &str, key: &str) -> bool {
+    frame.contains(&format!("\u{256d}\u{2500} {key} "))
+        || frame.contains(&format!("\u{2500} {key} \u{b7}"))
+}
+
 /// Cells a hit line's text keeps on a 100-column frame: the box's 93-cell content less the
 /// list's gutter is 92, and a longer row ends in an ellipsis after its 91st.
 const HIT_CELLS: usize = 91;
@@ -254,7 +261,7 @@ async fn enter_on_an_item_hit_reveals_it_in_the_backlog() {
     assert!(harness.app().overlays.is_empty());
     assert_eq!(harness.app().tabs.active_id(), Some(BacklogTab::ID));
     let frame = harness.render();
-    assert!(frame.contains(&format!("\u{250c} {} ", hit.key)), "{frame}");
+    assert!(on_item(&frame, &hit.key), "{frame}");
     assert_eq!(harness.app().status, None);
 }
 
@@ -274,7 +281,7 @@ async fn enter_on_a_document_hit_reveals_its_owner_item() {
     assert!(harness.app().overlays.is_empty());
     assert_eq!(harness.app().tabs.active_id(), Some(BacklogTab::ID));
     let frame = harness.render();
-    assert!(frame.contains("\u{250c} ANA-1 "), "{frame}");
+    assert!(on_item(&frame, "ANA-1"), "{frame}");
 }
 
 #[tokio::test]

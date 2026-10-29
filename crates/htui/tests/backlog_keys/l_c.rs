@@ -3,6 +3,7 @@
 //! `REQS_PICK`, `REQS_KIND`, `REQS_CONFIRM`): the D12 pins and the lane's rebinding test. Helpers
 //! stay in this file.
 
+use super::on_item;
 use htui::agent_worker::AgentRuntime;
 use htui::app::{Action, RevealKind};
 use htui::keys::Keys;
@@ -138,7 +139,7 @@ async fn enter_re_roots_the_graph_and_never_says_the_miss() {
     sub_tab(&mut harness, TO_GRAPH);
     let frame = harness.render();
     assert!(
-        frame.contains("┌ FEAT-1")
+        on_item(&frame, "FEAT-1")
             && frame.contains("depth 2/3")
             && frame.contains("+/- depth · Enter re-root"),
         "the Graph on FEAT-1, its keys label-built in the hint row:\n{frame}"
@@ -149,7 +150,7 @@ async fn enter_re_roots_the_graph_and_never_says_the_miss() {
     harness.key("enter");
     harness.drive_to_end().await;
     let frame = harness.render();
-    assert!(frame.contains("┌ ANA-1"), "re-rooted on ANA-1:\n{frame}");
+    assert!(on_item(&frame, "ANA-1"), "re-rooted on ANA-1:\n{frame}");
     assert!(
         frame.contains("depth 2/3"),
         "the Graph is still active:\n{frame}"
@@ -159,10 +160,7 @@ async fn enter_re_roots_the_graph_and_never_says_the_miss() {
     harness.key("enter");
     harness.drive_to_end().await;
     let frame = harness.render();
-    assert!(
-        frame.contains("┌ ANA-1"),
-        "the root row stays put:\n{frame}"
-    );
+    assert!(on_item(&frame, "ANA-1"), "the root row stays put:\n{frame}");
     assert_eq!(
         harness.app().status,
         None,
@@ -176,7 +174,7 @@ pub(super) async fn on_feat_1_reqs(harness: &mut Harness) {
     sub_tab(harness, TO_REQS);
     let frame = harness.render();
     assert!(
-        frame.contains("┌ FEAT-1") && frame.contains("▸ R-STO-1 addresses v1"),
+        on_item(&frame, "FEAT-1") && frame.contains("▸ R-STO-1 addresses v1"),
         "the Reqs on FEAT-1, its citation under the cursor:\n{frame}"
     );
 }

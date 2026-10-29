@@ -705,7 +705,7 @@ mod tests {
         assert_eq!(BacklogFilter::default().summary(&projects()), None);
     }
 
-    /// MOD-13 D5: the title's summary, facet by facet, in a fixed order.
+    /// MOD-13 D5, MOD-115 M4 E4: the summary band's words, facet by facet, in a fixed order.
     #[test]
     fn summary_names_statuses_projects_tags_and_readiness() {
         let filter = BacklogFilter {
@@ -716,13 +716,26 @@ mod tests {
         };
         assert_eq!(
             filter.summary(&projects()).as_deref(),
-            Some("status:open,done · project:htui · tags:gpu,rust · ready here")
+            Some("status: open, done · project: htui · tags: gpu, rust · ready here")
         );
         let ready = BacklogFilter {
             ready_here: true,
             ..BacklogFilter::default()
         };
         assert_eq!(ready.summary(&projects()).as_deref(), Some("ready here"));
+    }
+
+    /// MOD-115 M4 E4: a status reads as `kit::status`'s word, never its internal name.
+    #[test]
+    fn summary_names_each_status_by_its_word() {
+        let filter = BacklogFilter {
+            statuses: vec![Status::InProgress, Status::AwaitingApproval],
+            ..BacklogFilter::default()
+        };
+        assert_eq!(
+            filter.summary(&projects()).as_deref(),
+            Some("status: running, needs you")
+        );
     }
 
     /// MOD-13 D6: a project the new scope lacks leaves the filter; the rest stays.
@@ -1065,7 +1078,10 @@ mod tests {
             projects: vec![ProjectId::new()],
             ..BacklogFilter::default()
         };
-        assert_eq!(unknown.summary(&projects()).as_deref(), Some("status:done"));
+        assert_eq!(
+            unknown.summary(&projects()).as_deref(),
+            Some("status: done")
+        );
         let only = BacklogFilter {
             projects: vec![ProjectId::new()],
             ..BacklogFilter::default()

@@ -21,6 +21,13 @@ use htui::testkit::Harness;
 use htui_agent::fake::FakeAdapter;
 use htui_core::store::MemStore;
 
+/// Whether the Backlog's detail pane is on `key` (MOD-115 M4 B1): its title on the rounded
+/// top border is `KEY · title` (`╭─ KEY ·`), or the bare `Detail` with no item selected.
+fn on_item(frame: &str, key: &str) -> bool {
+    frame.contains(&format!("\u{256d}\u{2500} {key} "))
+        || frame.contains(&format!("\u{2500} {key} \u{b7}"))
+}
+
 /// The keys line the status row listed before MOD-115 (nothing draws it any more).
 fn status_line(harness: &mut Harness) -> String {
     harness.app().keys_line()
@@ -82,7 +89,7 @@ async fn the_runs_pane_status_line_and_box_list_every_layer() {
     harness.drive().await;
     let frame = harness.render();
     assert!(
-        frame.contains("┌ FEAT-1") && frame.contains("▸ 0.1"),
+        on_item(&frame, "FEAT-1") && frame.contains("▸ 0.1"),
         "FEAT-1's Runs pane, a step under the cursor:\n{frame}"
     );
     assert_eq!(status_line(&mut harness), BROWSE, "the browse status line");

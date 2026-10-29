@@ -1,13 +1,15 @@
 //! The Backlog's key hints: the list's keys after the focused pane's in the hint row.
 
+use super::render::{buffer_of, split, text};
 use super::*;
 
 // ---- MOD-67 M5 Q1 (a), PA-5: the list hint row --------------------------------------------
 
-/// Q1 (a), PA-5, MOD-67 M6 T2: the list keys are the shell's hint row: on the Body pane, which
-/// has none of its own, the row is the list's alone, and the list pane draws none of it.
+/// Q1 (a), PA-5, MOD-115 M4 Q2: the list keys are the focused list pane's own hints, on its
+/// bottom border; the detail, unfocused, draws none. `Tab::key_hint` keeps the shell's row for
+/// the activity pane (C8): on the Body pane, which has no keys of its own, the list's alone.
 #[tokio::test]
-async fn the_list_hint_is_the_hint_row_on_the_body_pane() {
+async fn the_list_hint_is_on_the_focused_list_panes_border() {
     let bench = Bench::new().await;
     let tab = bench.tab();
     let hint = tab.list_hint(Keys::compiled()).expect("nothing captures");
@@ -16,8 +18,66 @@ async fn the_list_hint_is_the_hint_row_on_the_body_pane() {
         row_at(&tab, &bench, 100).as_deref(),
         Some(DEFAULT_LIST_HINT)
     );
-    let frame = drawn(&tab, &bench);
-    assert!(!frame.contains(DEFAULT_LIST_HINT), "{frame}");
+    let buffer = buffer_of(&tab, &bench.ctx());
+    let [list, detail] = split();
+    let bottom = DEFAULT_SIZE.1 - 1;
+    assert_eq!(
+        text(&buffer, list.x, bottom, list.width),
+        format!("╰─{DEFAULT_LIST_HINT}──╯")
+    );
+    assert_eq!(
+        text(&buffer, detail.x, bottom, detail.width),
+        format!("╰{}╯", "─".repeat(usize::from(detail.width) - 2)),
+        "the unfocused detail draws no hint"
+    );
+}
+
+/// MOD-115 M4 Q2: with the detail focused its own keys go on its border, the list's after them
+/// only when both fit the pane (`Tab::key_hint`'s join at the detail's width); the list draws
+/// none.
+#[tokio::test]
+async fn the_focused_detail_carries_its_own_keys() {
+    let bench = Bench::new().await;
+    let Selection::Item(item) = bench.first else {
+        panic!("the first row is an item")
+    };
+    let mut tab = bench.tab();
+    tab.detail.on_item_change(Some(item));
+    assert!(tab.detail.select_id(RunsTab::ID));
+    let [list, detail] = split();
+    let room = detail.width - 4;
+    let wanted = row_at(&tab, &bench, room).expect("the Runs pane has keys");
+    assert!(
+        !wanted.contains(DEFAULT_LIST_HINT),
+        "{wanted}: too wide to join"
+    );
+    let buffer = buffer_of(&tab, &bench.ctx().with_focus(PaneId::Detail));
+    let bottom = DEFAULT_SIZE.1 - 1;
+    let row = text(&buffer, detail.x, bottom, detail.width);
+    assert!(
+        row.starts_with(&format!("╰─{wanted}")),
+        "{row} for {wanted}"
+    );
+    let row = text(&buffer, list.x, bottom, list.width);
+    assert!(!row.contains("move"), "the list draws no hint: {row}");
+}
+
+/// MOD-115 M4 Q2: the open filter form's keys go on the Filter pane's border, the bottom row
+/// of the list column; the detail draws none.
+#[tokio::test]
+async fn the_filter_forms_keys_are_on_its_pane() {
+    let bench = Bench::new().await;
+    let mut tab = bench.tab();
+    let form = FilterForm::open(&tab.filter, &bench.projects);
+    let keys = form.key_hint(Keys::compiled());
+    tab.form = Some(form);
+    let buffer = buffer_of(&tab, &bench.ctx());
+    let [list, detail] = split();
+    let bottom = DEFAULT_SIZE.1 - 1;
+    let row = text(&buffer, list.x, bottom, list.width);
+    assert!(row.starts_with(&format!("╰─{keys}")), "{row}");
+    let row = text(&buffer, detail.x, bottom, detail.width);
+    assert!(!row.contains("apply"), "{row}");
 }
 
 /// MOD-67 M6 T2: browsing a pane with keys of its own, the pane's lead and the list's follow

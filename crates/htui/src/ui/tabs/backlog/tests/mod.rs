@@ -13,7 +13,6 @@ use crate::store_worker::{Origin, QueueView, QueueWrite};
 use crate::testkit::DEFAULT_SIZE;
 use crate::ui::Theme;
 use crate::ui::kit::scroll::Step;
-use crate::ui::layout::chrome;
 use crate::ui::shell::{ListSize, PaneId, Preset};
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab};
 use crate::ui::tabs::backlog::item_form::{
