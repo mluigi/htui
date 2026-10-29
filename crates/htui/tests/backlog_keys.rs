@@ -89,7 +89,7 @@ async fn the_runs_pane_status_line_and_box_list_every_layer() {
     harness.drive().await;
     let frame = harness.render();
     assert!(
-        on_item(&frame, "FEAT-1") && frame.contains("▸ 0.1"),
+        on_item(&frame, "FEAT-1") && frame.contains("▸ prd"),
         "FEAT-1's Runs pane, a step under the cursor:\n{frame}"
     );
     assert_eq!(status_line(&mut harness), BROWSE, "the browse status line");

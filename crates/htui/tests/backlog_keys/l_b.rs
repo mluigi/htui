@@ -161,7 +161,7 @@ pub(super) async fn parked(store: MemStore) -> Harness {
     harness.drive().await;
     let frame = harness.render();
     assert!(
-        frame.contains("awaiting") && frame.contains("research"),
+        frame.contains("\u{26a0} needs you") && frame.contains("research"),
         "`R` started a run that parked at `research`:\n{frame}"
     );
     harness
