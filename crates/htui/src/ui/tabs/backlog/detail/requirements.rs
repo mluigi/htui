@@ -39,6 +39,11 @@
 //! on, or lands on the one a cite just made; an uncited row leaves it on the row that took its
 //! place. A reply also drops any `PgUp` / `PgDn` scroll, so a shorter list is never scrolled past.
 //!
+//! MOD-115 M4: the cursor, the list's and the picker's, is the kit's gutter and band (MOD-85),
+//! both rows of a citation under it; a citation kind and a priority read as `kit::label`'s
+//! words, and a withdrawn requirement's state as its mark (MOD-83). An item that cites nothing is
+//! a `kit::empty` that names the cite key.
+//!
 //! Known residue: a `Failed` names its request, not its item, so a write refused for the previous
 //! item frees a write of the same request in flight for the new one. It only loosens the
 //! one-at-a-time guard; the store is never asked anything it would not have been.
@@ -62,6 +67,9 @@ use crate::requirements::{
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells;
+use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::label;
+use crate::ui::kit::list::{GUTTER, ellipsize, selection_band};
 use crate::ui::kit::modal::modal_rest;
 use crate::ui::kit::scroll::{Scroll, Step};
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, message};
@@ -76,8 +84,8 @@ pub const NO_CITATION: &str = "no citation is under the cursor";
 /// What `c` says when the item's project has nothing left to cite.
 pub const NO_CANDIDATES: &str = "the project has no active requirement left to cite";
 
-/// Marks the row the cursor is on; the other rows carry a space of the same width.
-const CURSOR: &str = "\u{25b8}";
+/// What the pane says when the item cites nothing.
+const NO_CITATIONS: &str = "No requirements cited.";
 
 /// The browsing footer's words before the write keys (`J/K move` with the defaults); with
 /// [`WRITES`] and the separator, 42 columns, inside the 43 a detail pane has at 100x30.
@@ -396,10 +404,11 @@ impl ReqsTab {
         }
     }
 
-    /// The citation rows, two lines each, and the line index just past the cursor's pair.
+    /// The citation rows, two lines each, and the line index just past the cursor's pair: the
+    /// content of rows `width` cells wide, the gutter's cell before it left to [`gutter_row`].
     fn list_lines(&self, width: usize, theme: &Theme) -> (Vec<Line<'static>>, usize) {
         let mut lines = Vec::with_capacity(self.rows().len() * 2);
-        for (index, citation) in self.rows().iter().enumerate() {
+        for citation in self.rows() {
             let requirement = &citation.requirement;
             let withdrawn = requirement.state == RequirementState::Withdrawn;
             let (key_style, text_style): (Style, Style) = if withdrawn {
@@ -407,12 +416,15 @@ impl ReqsTab {
             } else {
                 (theme.key, theme.base)
             };
-            let marker = if index == self.cursor { CURSOR } else { " " };
             let mut head = vec![
-                Span::styled(format!("{marker} "), theme.base),
+                Span::styled(" ", theme.base),
                 Span::styled(requirement.key.clone(), key_style),
                 Span::styled(
-                    format!(" {} v{}", citation.kind, citation.requirement_version),
+                    format!(
+                        " {} v{}",
+                        label::citation(citation.kind),
+                        citation.requirement_version
+                    ),
                     text_style,
                 ),
             ];
@@ -420,10 +432,18 @@ impl ReqsTab {
                 head.push(Span::styled(" ! suspect", theme.error));
             }
             lines.push(Line::from(head));
+            // A withdrawn requirement's state leads its first line: dim alone is a colour.
+            let state = if withdrawn {
+                let mark = label::requirement_state(requirement.state);
+                format!("{} {} \u{b7} ", mark.glyph, mark.word)
+            } else {
+                String::new()
+            };
+            let room = width.saturating_sub(2 + cells::cell_width(&state));
             lines.push(Line::styled(
                 format!(
-                    "  {}",
-                    cells::clip(first_line(&requirement.body), width.saturating_sub(2))
+                    " {state}{}",
+                    cells::clip(first_line(&requirement.body), room)
                 ),
                 theme.dim,
             ));
@@ -432,10 +452,16 @@ impl ReqsTab {
     }
 
     /// The footer of the current mode, every line cut to `width`: the picker's candidates (at
-    /// most `room`, a window that keeps its cursor in view) or the question's title. The key
-    /// lines that ended it are the shell's hint row since MOD-67 M6 T2 ([`DetailTab::key_hint`]);
-    /// Browse has no footer.
-    fn footer(&self, width: usize, room: usize, theme: &Theme) -> Vec<Line<'static>> {
+    /// most `room`, a window that keeps its cursor in view, behind the kit's gutter) or the
+    /// question's title. The key lines that ended it are the shell's hint row since MOD-67 M6 T2
+    /// ([`DetailTab::key_hint`]); Browse has no footer.
+    fn footer(
+        &self,
+        width: usize,
+        room: usize,
+        accent: Style,
+        theme: &Theme,
+    ) -> Vec<Line<'static>> {
         let title = |text: String| Line::styled(cells::clip(&text, width), theme.title);
         match self.mode {
             Mode::Browse => Vec::new(),
@@ -448,14 +474,14 @@ impl ReqsTab {
                     .skip(skip)
                     .take(room)
                     .map(|(index, candidate)| {
-                        let marker = if index == cursor { CURSOR } else { " " };
                         let text = format!(
-                            "{marker} {} {} {}",
+                            " {} {} {}",
                             candidate.key,
-                            candidate.priority,
+                            label::priority(candidate.priority),
                             first_line(&candidate.body)
                         );
-                        Line::styled(cells::clip(&text, width), theme.base)
+                        let line = Line::styled(text, theme.base);
+                        gutter_row(line, index == cursor, width, accent, theme)
                     })
                     .collect()
             }
@@ -625,7 +651,8 @@ impl DetailTab for ReqsTab {
             return;
         }
         let width = usize::from(area.width);
-        let footer = self.footer(width, usize::from(area.height / 2), ctx.theme);
+        let accent = ctx.accent();
+        let footer = self.footer(width, usize::from(area.height / 2), accent, ctx.theme);
         let [list, prompt] = Layout::vertical([
             Constraint::Min(0),
             Constraint::Length(u16::try_from(footer.len()).unwrap_or(u16::MAX)),
@@ -644,7 +671,14 @@ impl DetailTab for ReqsTab {
             return;
         }
         if self.rows().is_empty() {
-            message(frame, list, "No requirements cited.", ctx.theme);
+            let next = ctx
+                .keys()
+                .label(views::BACKLOG_REQS, Act::ReqsCite)
+                .map_or_else(
+                    || "a bound cite key cites one".to_owned(),
+                    |key| format!("{key} cites one"),
+                );
+            empty::render(frame, list, NO_CITATIONS, NextStep(&next), ctx.theme);
             return;
         }
         let (lines, cursor_end) = self.list_lines(width, ctx.theme);
@@ -652,11 +686,49 @@ impl DetailTab for ReqsTab {
             .scroll
             .skip()
             .max(cursor_end.saturating_sub(usize::from(list.height)));
-        frame.render_widget(
-            Paragraph::new(lines).scroll((u16::try_from(skip).unwrap_or(u16::MAX), 0)),
-            list,
-        );
+        // Both rows of the citation under the cursor are banded, behind the gutter.
+        let rows: Vec<Line<'static>> = lines
+            .into_iter()
+            .enumerate()
+            .skip(skip)
+            .take(usize::from(list.height))
+            .map(|(at, line)| gutter_row(line, at / 2 == self.cursor, width, accent, ctx.theme))
+            .collect();
+        frame.render_widget(Paragraph::new(rows), list);
     }
+}
+
+/// `content` as a row `width` cells wide behind the kit's gutter (MOD-115 M4, MOD-85), as
+/// `kit::list` draws one: on the cursor, [`GUTTER`] in the pane's `accent` and the content in the
+/// selection band to the row's edge; else a blank and the content cut with `…`. The line's own
+/// style is carried onto its spans first, so the gutter never takes it.
+fn gutter_row(
+    content: Line<'static>,
+    on: bool,
+    width: usize,
+    accent: Style,
+    theme: &Theme,
+) -> Line<'static> {
+    let base = content.style;
+    let content = Line::from(
+        content
+            .spans
+            .into_iter()
+            .map(|span| Span::styled(span.content, base.patch(span.style)))
+            .collect::<Vec<_>>(),
+    );
+    let cells = u16::try_from(width.saturating_sub(1)).unwrap_or(u16::MAX);
+    let (gutter, content) = if on {
+        (
+            Span::styled(GUTTER, accent),
+            selection_band(content, cells, theme),
+        )
+    } else {
+        (Span::raw(" "), ellipsize(content, cells))
+    };
+    let mut spans = vec![gutter];
+    spans.extend(content.spans);
+    Line::from(spans)
 }
 
 /// The first line of `text`, the whole of it when it has no newline.
@@ -1011,7 +1083,7 @@ mod tests {
         assert!(text(head).contains("R-ENT-1 addresses v1 ! suspect"));
         for span in &head.spans {
             let expected = match span.content.trim() {
-                "" | CURSOR => theme.base,
+                "" => theme.base,
                 "! suspect" => theme.error,
                 _ => theme.dim,
             };
@@ -1194,15 +1266,15 @@ mod tests {
         assert_eq!(candidate_keys(&pane), ["R-ENT-1", "R-ENT-2", "R-STO-1"]);
         pane.on_key(key(KeyCode::Char('c')), &mut shell.ctx());
         let window = |pane: &ReqsTab| {
-            pane.footer(usize::from(PANE_WIDTH), 2, &theme)
+            pane.footer(usize::from(PANE_WIDTH), 2, theme.accent, &theme)
                 .iter()
                 .map(|line| text(line).chars().take(10).collect::<String>())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(window(&pane), ["▸ R-ENT-1 ", "  R-ENT-2 "]);
+        assert_eq!(window(&pane), ["\u{258c} R-ENT-1 ", "  R-ENT-2 "]);
         pane.on_key(key(KeyCode::Char('j')), &mut shell.ctx());
         pane.on_key(key(KeyCode::Char('j')), &mut shell.ctx());
-        assert_eq!(window(&pane), ["  R-ENT-2 ", "▸ R-STO-1 "]);
+        assert_eq!(window(&pane), ["  R-ENT-2 ", "\u{258c} R-STO-1 "]);
         pane.on_key(key(KeyCode::Char('j')), &mut shell.ctx());
         assert_eq!(pane.mode, Mode::Pick { cursor: 2 }, "the last stays last");
     }
@@ -1309,5 +1381,107 @@ mod tests {
         );
         pane.on_reply(&refused("reconfirm_citation"), &mut shell.ctx());
         assert_eq!(pane.busy, None, "its own");
+    }
+
+    /// The pane drawn at [`PANE_WIDTH`] x 12 under `theme`, its buffer.
+    fn buffer(pane: &ReqsTab, shell: &Shell) -> ratatui::buffer::Buffer {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(PANE_WIDTH, 12))
+            .expect("the test backend is constructible");
+        term.draw(|frame| pane.render(frame, frame.area(), &shell.ctx()))
+            .expect("the pane draws");
+        term.backend().buffer().clone()
+    }
+
+    /// MOD-85: the citation under the cursor is the kit's: the gutter in the pane's accent on both
+    /// of its rows, the rows in the selection band; the next citation is neither.
+    #[tokio::test]
+    async fn the_cursor_citation_is_the_kit_band() {
+        let shell = Shell::new();
+        let mut two = citations(ids::HTUI_FEAT_1).await;
+        let cited = two.citations[0].clone();
+        two.citations.push(cited);
+        let pane = pane(&shell, ids::HTUI_FEAT_1, two);
+        let accent = shell.ctx().accent().fg.unwrap_or_default();
+        let band = shell.theme.selected.bg.unwrap_or_default();
+        let buf = buffer(&pane, &shell);
+        for y in 0..2 {
+            assert_eq!(buf[(0, y)].symbol(), "\u{258c}", "row {y}");
+            assert_eq!(buf[(0, y)].fg, accent, "row {y}");
+            for x in 1..PANE_WIDTH {
+                assert_eq!(buf[(x, y)].bg, band, "column {x} of row {y}");
+            }
+        }
+        for y in 2..4 {
+            assert_eq!(buf[(0, y)].symbol(), " ", "row {y}");
+            assert_ne!(buf[(5, y)].bg, band, "row {y}");
+        }
+        let rows = drawn(&pane, &shell);
+        assert!(
+            rows[0].starts_with("\u{258c} R-STO-1 addresses v1"),
+            "{rows:#?}"
+        );
+        assert!(rows[2].starts_with("  R-STO-1 addresses v1"), "{rows:#?}");
+    }
+
+    /// MOD-85: the picker's cursor is the kit's gutter and band too.
+    #[tokio::test]
+    async fn the_picker_cursor_is_the_kit_band() {
+        let shell = Shell::new();
+        let mut pane = pane(
+            &shell,
+            ids::HTUI_CLEAN_1,
+            citations(ids::HTUI_CLEAN_1).await,
+        );
+        pane.on_key(key(KeyCode::Char('c')), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Char('j')), &mut shell.ctx());
+        let rows = drawn(&pane, &shell);
+        let at = rows
+            .iter()
+            .position(|row| row.starts_with("\u{258c} R-ENT-2 "))
+            .unwrap_or_else(|| panic!("the picker's cursor on R-ENT-2: {rows:#?}"));
+        assert!(rows[at - 1].starts_with("  R-ENT-1 "), "{rows:#?}");
+        let buf = buffer(&pane, &shell);
+        let y = u16::try_from(at).expect("a row");
+        let band = shell.theme.selected.bg.unwrap_or_default();
+        assert_eq!(
+            buf[(PANE_WIDTH - 1, y)].bg,
+            band,
+            "the band runs to the edge"
+        );
+    }
+
+    /// An item that cites nothing says so and names the key that cites one (`kit::empty`).
+    #[tokio::test]
+    async fn an_item_citing_nothing_names_the_cite_key() {
+        let shell = Shell::new();
+        let pane = pane(
+            &shell,
+            ids::HTUI_CLEAN_1,
+            citations(ids::HTUI_CLEAN_1).await,
+        );
+        let text = drawn(&pane, &shell).join("\n");
+        assert!(text.contains("No requirements cited."), "{text}");
+        assert!(text.contains("c cites one"), "{text}");
+    }
+
+    /// A withdrawn requirement's citation carries its state as a mark (`label::requirement_state`),
+    /// not only its dim style.
+    #[tokio::test]
+    async fn a_withdrawn_requirement_reads_its_state() {
+        let shell = Shell::new();
+        let pane = pane(
+            &shell,
+            ids::HTUI_ANA_1,
+            with_withdrawn(ids::HTUI_ANA_1, ids::REQ_ENT_1).await,
+        );
+        let rows = drawn(&pane, &shell);
+        assert!(
+            rows[0].contains("R-ENT-1 addresses v1 ! suspect"),
+            "{rows:#?}"
+        );
+        assert!(
+            rows[1].starts_with("\u{258c} \u{2715} withdrawn \u{b7} Every item has a stable ke"),
+            "the state leads the requirement's first line: {rows:#?}"
+        );
     }
 }
