@@ -1284,6 +1284,12 @@ psql -h localhost -p 5439 -U postgres -c "CREATE DATABASE prep138"; \
    - `HANDOFF.md` migration coordinates (`0023` taken);
    - `docs/decisions/mod/mod-138.md` M1 section;
    - the plan's Validation block (MOD-137 F3: run `sqlx prepare` from inside `crates/htui-store`).
+   - `docs/personas.md`, the "Rebinding a phase" and "Renaming a persona" bullets, and
+     `docs/htui-worker.md`, the "A graph changed mid-run" bullet (T5 repair 2). Both say a resumed
+     run parks on a topology mismatch after a graph or persona-name change. Since T5 only a v1 run
+     (started before MOD-138) still compares against the live graph. A v2 run walks its pinned
+     snapshot, or parks as "snapshot tampered" when its own phases and edges no longer hash to
+     its digest (`rebinding_a_phase_persona_under_a_v2_run_walks_on`).
 
 ---
 
