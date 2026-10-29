@@ -38,7 +38,6 @@ use crate::ui::kit::label::{self, plural};
 use crate::ui::kit::list::{self, Row, RowKind};
 use crate::ui::kit::modal::{CHROME, Modal, ModalSize};
 use crate::ui::overlay::registry::{Overlay, OverlayId};
-use crate::ui::overlay::workspace_switcher::border_hint;
 use crate::ui::{FieldOutcome, TextField, Theme};
 
 /// The box's title.
@@ -415,11 +414,7 @@ impl Overlay for ConceptsSearch {
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let theme = ctx.theme;
         let content_w = MAX_WIDTH - CHROME;
-        let hint = border_hint(
-            &ctx.keys().hint(views::CONCEPTS_QUERY, HINT),
-            content_w,
-            area,
-        );
+        let hint = ctx.keys().hint(views::CONCEPTS_QUERY, HINT);
         // `Fit` keeps the margin round the box, so the header row stays uncovered (MOD-82); on a
         // screen too short for every hit row, the hit rows give way.
         let content = Modal::new(TITLE)

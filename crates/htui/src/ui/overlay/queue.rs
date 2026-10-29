@@ -32,7 +32,6 @@ use crate::ui::kit::list::{self, Row, RowKind};
 use crate::ui::kit::modal::{Modal, ModalSize};
 use crate::ui::kit::status;
 use crate::ui::overlay::registry::{Overlay, OverlayId};
-use crate::ui::overlay::workspace_switcher::border_hint;
 use crate::ui::queue_status::{DEMO_NOTHING_ADMITTED, queue_sentence};
 use crossterm::event::KeyEvent;
 
@@ -649,7 +648,6 @@ impl Overlay for QueueOverlay {
         }
         .max(cell_width(&hint) + 1);
         let content_w = u16::try_from(widest).unwrap_or(u16::MAX);
-        let hint = border_hint(&hint, content_w, area);
         let content = Modal::new(self.title())
             .size(ModalSize::Fit {
                 content_w,

@@ -13,6 +13,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear};
 
 use crate::app::Handled;
 use crate::keys::{KeyChord, Stack};
+use crate::ui::kit::list::ellipsize;
 use crate::ui::kit::text::wrapped;
 use crate::ui::layout::centered;
 use crate::ui::text_field::TextField;
@@ -27,6 +28,9 @@ const CHROME_ROWS: u16 = 2;
 
 /// Columns a `Fit` modal leaves free on the screen (two each side).
 const MARGIN_COLS: u16 = 4;
+
+/// Columns of the bottom border a hint never takes: the two corners and the blank either side.
+const HINT_CHROME: u16 = 4;
 
 /// Rows a `Fit` modal leaves free on the screen (one each side).
 const MARGIN_ROWS: u16 = 2;
@@ -79,7 +83,7 @@ impl<'a> Modal<'a> {
         self
     }
 
-    /// A hint on the bottom border.
+    /// A hint on the bottom border: whole when the border holds it, else cut ending in `…`.
     #[must_use]
     pub fn hint(mut self, hint: &'a str) -> Self {
         self.hint = Some(hint);
@@ -122,6 +126,11 @@ impl<'a> Modal<'a> {
             .border_style(theme.accent)
             .title(Span::styled(format!(" {} ", self.title), theme.title));
         if let Some(hint) = self.hint {
+            // The one cut rule for every modal's border hint (MOD-115 M4 E6): whole when the
+            // border holds it between its corners with a blank either side, else cut there
+            // ending in `…`, so a narrow screen never cuts the keys mid-word with no mark.
+            let room = box_area.width.saturating_sub(HINT_CHROME);
+            let hint = ellipsize(Line::raw(hint), room);
             block = block.title_bottom(Line::styled(format!(" {hint} "), theme.dim));
         }
         frame.render_widget(block, box_area);
@@ -570,6 +579,41 @@ mod tests {
         let outer = box_of(&buffer);
         assert!(row(&buffer, outer.y).contains(" Quit? "));
         assert!(row(&buffer, outer.bottom() - 1).contains(" y yes  n no "));
+    }
+
+    /// MOD-115 M4 E6 (finding F3): every modal cuts its border hint by one rule. A hint the
+    /// box holds (between the corners, a blank either side) is drawn whole; a wider one is cut
+    /// at that width ending in `…`, never mid-word with no mark.
+    #[test]
+    fn a_hint_wider_than_the_box_is_cut_with_an_ellipsis() {
+        // A 20-cell box holds 16 cells of hint.
+        let fits = "abcdefghij klmnop";
+        let modal = Modal::new("T")
+            .size(ModalSize::Fixed { w: 20, h: 4 })
+            .hint(&fits[..16]);
+        let (_, buffer) = draw(modal, 40, 10, &Theme::default());
+        let bottom = row(&buffer, box_of(&buffer).bottom() - 1);
+        assert!(bottom.contains(" abcdefghij klmno "), "{bottom}");
+        assert!(!bottom.contains('\u{2026}'), "{bottom}");
+
+        let modal = Modal::new("T")
+            .size(ModalSize::Fixed { w: 20, h: 4 })
+            .hint(fits);
+        let (_, buffer) = draw(modal, 40, 10, &Theme::default());
+        let bottom = row(&buffer, box_of(&buffer).bottom() - 1);
+        assert!(bottom.contains(" abcdefghij klmn\u{2026} "), "{bottom}");
+
+        // An `Ask` shares the rule: its box is clamped to the screen, its hint cut to fit it.
+        let (_, buffer) = draw_ask(
+            Ask::new("T")
+                .line("q")
+                .hint("y apply \u{b7} n/Esc stay offline"),
+            20,
+            8,
+            &Theme::default(),
+        );
+        let bottom = row(&buffer, box_of(&buffer).bottom() - 1);
+        assert!(bottom.contains(" y apply \u{b7} n\u{2026} "), "{bottom}");
     }
 
     #[test]

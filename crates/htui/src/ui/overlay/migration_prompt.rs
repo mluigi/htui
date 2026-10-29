@@ -237,6 +237,20 @@ mod tests {
         assert!(text.contains("12 schema"), "{text}");
     }
 
+    /// Finding F3: on a screen narrower than the keys, the border's hint is cut with an
+    /// ellipsis, by the rule every modal's border hint follows (`kit::modal`), not mid-word.
+    #[test]
+    fn a_narrow_screen_cuts_the_keys_with_an_ellipsis() {
+        let lines = drawn(Some(3), Keys::compiled(), (30, 12));
+        let bottom = lines
+            .iter()
+            .find(|line| line.contains('\u{2570}'))
+            .unwrap_or_else(|| panic!("a bottom border: {lines:#?}"));
+        assert!(bottom.contains(" y apply"), "{lines:#?}");
+        assert!(bottom.contains('\u{2026}'), "{lines:#?}");
+        assert!(!bottom.contains("stay offline"), "{lines:#?}");
+    }
+
     #[test]
     fn the_question_is_never_blank_and_never_reads_one_migrations() {
         let mut prompt = MigrationPrompt::new();
