@@ -434,7 +434,7 @@ async fn a_hidden_list_gives_the_detail_the_whole_body() {
     let frame = drawn_through(&bench.tab(), &bench.ctx().with_layout(focus));
     let top = frame.lines().next().expect("a first row");
     assert!(
-        top.starts_with(&format!("\u{250c} {key} ")),
+        top.starts_with(&format!("\u{256d}\u{2500} {key} ")),
         "the detail starts at the left edge:\n{frame}"
     );
     let both = drawn_through(&bench.tab(), &bench.ctx());
@@ -443,7 +443,7 @@ async fn a_hidden_list_gives_the_detail_the_whole_body() {
             .lines()
             .next()
             .unwrap_or("")
-            .starts_with(&format!("\u{250c} {key} ")),
+            .starts_with(&format!("\u{256d}\u{2500} {key} ")),
         "the list is on the left by default:\n{both}"
     );
 }

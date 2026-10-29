@@ -668,13 +668,14 @@ impl Tab for BacklogTab {
                 ctx.claim_editor_area(item_form::render(frame, detail_area, form, ctx.theme));
             }
             None if detail_area.is_empty() => {}
-            None => detail::render(
-                frame,
-                detail_area,
-                &self.detail,
-                self.item().map(|item| item.key.as_str()),
-                ctx,
-            ),
+            None => {
+                let chrome = Chrome {
+                    focus: ctx.pane_focus(PaneId::Detail),
+                    accent: ctx.accent(),
+                    hints: None,
+                };
+                detail::render(frame, detail_area, &self.detail, self.item(), chrome, ctx);
+            }
         }
         self.detail_drawn
             .set(self.item_form.is_none() && !detail_area.is_empty());

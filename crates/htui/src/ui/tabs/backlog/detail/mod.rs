@@ -10,6 +10,9 @@
 //!
 //! MOD-13 milestone 5: Notes and Docs write, each through a [`compose`] area of its own (D6), and
 //! an `$EDITOR` outcome comes back to the active sub-tab (D7).
+//!
+//! MOD-115 M4 E4: the pane is a kit pane titled `KEY · title`, the sub-tabs its chips (MOD-81: no
+//! strip row clipping `Notes Prompt Reqs`); a sub-tab draws into the whole inner rect.
 
 pub mod body;
 pub mod compose;
@@ -20,19 +23,20 @@ pub mod prompt;
 pub mod requirements;
 pub mod runs;
 
-use htui_core::model::{ItemId, RunId, StepId};
+use htui_core::model::{ItemId, ItemSummary, RunId, StepId};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::layout::Rect;
+use ratatui::text::Line;
+use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::app::{Ctx, Handled};
 use crate::editor::ExternalEditOutcome;
 use crate::keys::{Keys, Stack, views};
 use crate::store_worker::StoreReply;
 use crate::ui::Theme;
+use crate::ui::kit::pane::Pane;
 use crate::ui::kit::scroll::Step;
+use crate::ui::tabs::backlog::Chrome;
 use crossterm::event::{KeyEvent, MouseEvent};
 
 pub use body::BodyTab;
@@ -91,7 +95,7 @@ pub trait DetailTab {
     }
     /// A reply addressed to the Backlog tab. Sub-tabs that do not care ignore it.
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>);
-    /// Draws into the detail pane, below the sub-tab strip.
+    /// Draws into the detail pane's inner rect (the chips are on its border, MOD-115 M4 E4).
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>);
     /// Whether this sub-tab shows a run that is still active (MOD-41 plan D16): what the Backlog
     /// tab's `Runs` poll asks before it re-reads. Only [`RunsTab`] shows runs.
@@ -198,6 +202,12 @@ impl DetailRegistry {
     #[must_use]
     pub fn active(&self) -> Option<&dyn DetailTab> {
         self.tabs.get(self.active).map(AsRef::as_ref)
+    }
+
+    /// Index of the active sub-tab in strip order: the active chip (MOD-115 M4 E4).
+    #[must_use]
+    pub const fn active_index(&self) -> usize {
+        self.active
     }
 
     /// Id of the active sub-tab, or `None` while the registry is empty.
@@ -376,66 +386,46 @@ impl DetailRegistry {
     }
 }
 
-/// Draws the detail pane: a border titled with the selected item's key, the sub-tab strip, and
-/// the active sub-tab below it.
+/// The detail pane's title (MOD-115 M4 E4, MOD-82): `KEY · title` of the selected item, or
+/// `Detail` while a project header is selected.
+#[must_use]
+pub fn title(item: Option<&ItemSummary>) -> String {
+    item.map_or_else(
+        || "Detail".to_owned(),
+        |item| format!("{} \u{b7} {}", item.key, item.title),
+    )
+}
+
+/// Draws the detail pane as a kit pane (MOD-115 M4 E4): titled [`title`], kept first (C5, Q1),
+/// the sub-tabs as chips on its top border windowed around the active one with `‹`/`›`, and the
+/// active sub-tab in the whole inner rect. The content is drawn before the frame, which touches
+/// border cells only (M3 C3).
 pub fn render(
     frame: &mut Frame<'_>,
     area: Rect,
     registry: &DetailRegistry,
-    key: Option<&str>,
+    item: Option<&ItemSummary>,
+    chrome: Chrome<'_>,
     ctx: &Ctx<'_>,
 ) {
-    let block = frame_block(key);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let [strip, content] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
-    render_strip(frame, strip, registry, ctx.theme);
+    let inner = Pane::inner(area);
     match registry.active() {
-        Some(tab) => tab.render(frame, content, ctx),
-        None => message(
-            frame,
-            content,
-            "No detail sub-tab is registered.",
-            ctx.theme,
-        ),
+        Some(tab) => tab.render(frame, inner, ctx),
+        None => message(frame, inner, "No detail sub-tab is registered.", ctx.theme),
     }
-}
-
-/// The detail pane's border, titled with the selected item's key. Shared with the strip-width pin
-/// in the Backlog tab's tests, so the pin measures the inner area [`render`] actually draws into.
-pub(crate) fn frame_block(key: Option<&str>) -> Block<'static> {
-    Block::new()
-        .borders(Borders::ALL)
-        .title(format!(" {} ", key.unwrap_or("Detail")))
-}
-
-/// Draws the sub-tab strip, the active one accented.
-pub fn render_strip(frame: &mut Frame<'_>, area: Rect, registry: &DetailRegistry, theme: &Theme) {
-    frame.render_widget(Paragraph::new(strip_line(registry, theme)), area);
-}
-
-/// The sub-tab strip as one line, so its width can be checked against the pane (MOD-30).
-///
-/// One leading space, one space between titles and one trailing space — a single space, not the
-/// two the Settings and top-level strips use, because the detail pane is the narrow one (MOD-30
-/// D1). `active_tab` covers the title only, never a separator. The Backlog tab's
-/// `the_detail_strip_fits_the_detail_pane` pins the width.
-#[must_use]
-pub(crate) fn strip_line<'a>(registry: &'a DetailRegistry, theme: &Theme) -> Line<'a> {
-    let active = registry.active_id();
-    let mut spans: Vec<Span<'a>> = vec![Span::raw(" ")];
-    for (id, title) in registry.titles() {
-        let style: Style = if Some(id) == active {
-            theme.active_tab
-        } else {
-            theme.dim
-        };
-        spans.push(Span::styled(title, style));
-        spans.push(Span::raw(" "));
-    }
-    Line::from(spans)
+    let title = title(item);
+    let titles: Vec<&str> = registry
+        .titles()
+        .into_iter()
+        .map(|(_, title)| title)
+        .collect();
+    chrome
+        .frame(
+            Pane::new(&title)
+                .title_first()
+                .sub_tabs(&titles, registry.active_index()),
+        )
+        .render(frame, area, ctx.theme);
 }
 
 /// The one line a sub-tab renders instead of a blank pane (plan D11).
