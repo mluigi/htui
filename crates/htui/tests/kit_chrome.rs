@@ -47,8 +47,7 @@ const KIT: &str = "ui/kit/";
 /// from a scan of the merged M3 tree (`8e4568ba`): every non-test `Block::`/`Borders::` site in
 /// `src` outside group A and the kit, less the [`OWN_BLOCK`] name collisions (all of them under
 /// `src/ui` and `src/app`, which RV1 L7 checked when it widened the scan to the whole of `src`).
-const GROUP_B: &[(&str, &str)] = &[
-];
+const GROUP_B: &[(&str, &str)] = &[];
 
 /// Whether `name` (relative to `src/`) is `prefix`, or under it when `prefix` ends in `/`.
 fn under(name: &str, prefix: &str) -> bool {
