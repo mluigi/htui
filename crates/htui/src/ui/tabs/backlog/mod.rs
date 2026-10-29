@@ -620,26 +620,39 @@ impl Tab for BacklogTab {
         }
     }
 
+    /// MOD-115 M4 E4: the Backlog draws its own kit panes (the list, the Filter pane, the
+    /// detail or what takes its place); the shell paints nothing over them.
+    fn draws_chrome(&self) -> bool {
+        true
+    }
+
+    /// MOD-115 M4 E4: the list, the open filter form and the detail as kit panes, the one that
+    /// holds the keyboard focused (C4) and carrying its own keys (Q2).
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        // MOD-13 milestone 3 D4: the divergence view takes the whole tab area, list pane included.
+        let theme = ctx.theme;
+        let accent = ctx.accent();
+        // MOD-13 milestone 3 D4: the divergence view takes the whole tab area, list pane included,
+        // as one kit pane (M4 D-9).
         if let Some(view) = self.item_form.as_ref().and_then(ItemForm::resolving) {
-            // MOD-115 M4 D-9: one kit pane over the whole area, titled with the key and versions.
-            divergence::render(frame, Pane::inner(area), view, ctx.theme);
+            divergence::render(frame, Pane::inner(area), view, theme);
             let title = divergence::title(view);
             let chrome = Chrome {
-                focus: ctx.pane_focus(ctx.focus()),
-                accent: ctx.accent(),
-                hints: None,
+                focus: hints::holder(ctx, false),
+                accent,
+                hints: self.detail_pane_hint(area.width, ctx),
             };
-            chrome
-                .frame(Pane::new(&title))
-                .render(frame, area, ctx.theme);
+            chrome.frame(Pane::new(&title)).render(frame, area, theme);
             return;
         }
-        // MOD-115 M2 B5: the panes the shell's layout gives the tab, claimed for the focus
-        // borders, the hints and the mouse; today's 55/45 split by default.
-        let (list_area, detail_area, form_area) =
-            self.body_areas(area, ctx.split(area, BACKLOG_LAYOUT));
+        // MOD-115 M2 B5: the panes the shell's layout gives the tab, claimed for the hidden-pane
+        // note, the activity placeholder and the mouse; today's 55/45 split by default.
+        let areas = ctx.split(area, BACKLOG_LAYOUT);
+        // The activity pane is on screen beside the tab's (not zoomed over them): with the focus
+        // there, no Backlog pane holds the keyboard (C4).
+        let activity = areas.activity.is_some_and(|rect| !rect.is_empty())
+            && !(areas.list.is_none() && areas.detail.is_empty());
+        let focus = self.focuses(ctx, activity);
+        let (list_area, detail_area, form_area) = self.body_areas(area, areas);
         // MOD-13 review M1: the filter the rows were read under, not the one still in flight.
         let summary = self.shown.summary(ctx.projects);
         let keys = ctx.keys();
@@ -659,45 +672,38 @@ impl Tab for BacklogTab {
         };
         if let Some(list_area) = list_area {
             let chrome = Chrome {
-                focus: ctx.pane_focus(PaneId::List),
-                accent: ctx.accent(),
-                hints: None,
+                focus: focus.list,
+                accent,
+                hints: self.list_pane_hint(ctx),
             };
-            list::render(frame, list_area, &view, chrome, ctx.theme);
+            list::render(frame, list_area, &view, chrome, theme);
         }
         if let (Some(form), Some(at)) = (&self.form, form_area) {
             let chrome = Chrome {
-                focus: ctx.pane_focus(PaneId::List),
-                accent: ctx.accent(),
-                hints: None,
+                focus: focus.filter,
+                accent,
+                hints: self.filter_pane_hint(ctx),
             };
-            filter::render(frame, at, form, chrome, ctx.theme);
+            filter::render(frame, at, form, chrome, theme);
         }
+        let chrome = Chrome {
+            focus: focus.detail,
+            accent,
+            hints: self.detail_pane_hint(detail_area.width, ctx),
+        };
         match &self.item_form {
             Some(form) => {
                 // MOD-115 M4 D-9: the form's rows in a kit pane in the detail's place; the rect
                 // it claims is inside the pane's inner rect, as it was inside the block's.
-                let claim = item_form::render(frame, Pane::inner(detail_area), form, ctx.theme);
+                let claim = item_form::render(frame, Pane::inner(detail_area), form, theme);
                 ctx.claim_editor_area(claim);
                 let title = item_form::title(form);
-                let chrome = Chrome {
-                    focus: ctx.pane_focus(PaneId::Detail),
-                    accent: ctx.accent(),
-                    hints: None,
-                };
                 chrome
                     .frame(Pane::new(&title))
-                    .render(frame, detail_area, ctx.theme);
+                    .render(frame, detail_area, theme);
             }
             None if detail_area.is_empty() => {}
-            None => {
-                let chrome = Chrome {
-                    focus: ctx.pane_focus(PaneId::Detail),
-                    accent: ctx.accent(),
-                    hints: None,
-                };
-                detail::render(frame, detail_area, &self.detail, self.item(), chrome, ctx);
-            }
+            None => detail::render(frame, detail_area, &self.detail, self.item(), chrome, ctx),
         }
         self.detail_drawn
             .set(self.item_form.is_none() && !detail_area.is_empty());

@@ -200,3 +200,45 @@ async fn the_list_hint_names_a_rebound_key() {
         Some("j/k move \u{b7} h/l sub-tab \u{b7} / filter \u{b7} N new \u{b7} e edit")
     );
 }
+
+/// MOD-115 M4 C4: what holds the keyboard, state by state: nothing while browsing, the Filter
+/// pane while the form is open, the detail while the item form is open or a sub-tab captures.
+#[tokio::test]
+async fn the_keyboard_pane_follows_what_takes_every_key() {
+    use crate::ui::tabs::backlog::hints::Holder;
+    let bench = Bench::new().await;
+    assert_eq!(bench.tab().keyboard_pane(), None, "browsing");
+
+    let mut tab = bench.tab();
+    tab.form = Some(FilterForm::open(&tab.filter, &bench.projects));
+    assert_eq!(tab.keyboard_pane(), Some(Holder::Filter), "the filter form");
+
+    let backend = htui_store::Backend::memory(MemStore::demo());
+    let request = StoreRequest::ItemForm {
+        project: htui_core::fixtures::ids::PROJECT_HTUI,
+        item: None,
+    };
+    let context = match item_writes::serve(&backend, &request).await {
+        Ok(StoreReply::ItemForm(context)) => *context,
+        other => panic!("the form read answered {other:?}"),
+    };
+    let mut tab = bench.tab();
+    tab.item_form = Some(ItemForm::open_new(context, &bench.projects, None));
+    assert_eq!(tab.keyboard_pane(), Some(Holder::Detail), "the item form");
+
+    let capturing = Rc::new(Cell::new(true));
+    let tab = BacklogTab {
+        detail: only(CapturingProbe {
+            capturing: Rc::clone(&capturing),
+            seen: Rc::default(),
+        }),
+        ..bench.tab()
+    };
+    assert_eq!(
+        tab.keyboard_pane(),
+        Some(Holder::Detail),
+        "a capturing pane"
+    );
+    capturing.set(false);
+    assert_eq!(tab.keyboard_pane(), None, "no longer capturing");
+}
