@@ -5142,8 +5142,9 @@ impl State {
     }
 
     /// MOD-138 A3: the first kind or item naming one of `graphs`, in (graph name bytes, holder
-    /// bytes) order (holder `item_kind PREFIX` or `item KEY`), as [`workspace_graph_is_held`]'s
-    /// sentence; `None` while nothing holds them. `PgStore`'s holder query has the same order.
+    /// bytes, project slug bytes) order (holder `item_kind PREFIX` or `item KEY`; the slug breaks
+    /// a tie between two projects of the workspace), as [`workspace_graph_is_held`]'s sentence;
+    /// `None` while nothing holds them. `PgStore`'s holder query has the same order.
     fn workspace_graph_holder(&self, graphs: &HashSet<StepGraphId>) -> Option<String> {
         let slug = |project: ProjectId| {
             self.projects
@@ -5175,6 +5176,7 @@ impl State {
                     .as_bytes()
                     .cmp(right.0.as_bytes())
                     .then_with(|| left.1.as_bytes().cmp(right.1.as_bytes()))
+                    .then_with(|| left.2.as_bytes().cmp(right.2.as_bytes()))
             })
             .map(|(graph, holder, project)| workspace_graph_is_held(&graph, &holder, &project))
     }

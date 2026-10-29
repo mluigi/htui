@@ -1387,7 +1387,7 @@ pub trait WriteStore: ReadStore {
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint)
     /// ([`workspace_graph_is_held`], MOD-138 A3) while a kind's `default_graph_id` or an item's
     /// `step_graph_id` names one of its graphs, naming the first holder in (graph name bytes,
-    /// holder bytes) order; nothing is deleted then.
+    /// holder bytes, project slug bytes) order; nothing is deleted then.
     async fn delete_workspace(&self, id: WorkspaceId) -> Result<DeleteReach>;
 
     /// Removes a project and everything PRD D13 lists, in one transaction, and returns the counts

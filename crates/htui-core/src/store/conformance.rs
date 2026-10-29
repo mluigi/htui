@@ -23792,8 +23792,8 @@ async fn usable_graphs_lists_project_workspace_library<S: WriteStore>(store: &S)
 }
 
 /// MOD-138 A3: `delete_workspace` refuses while a kind or an item names one of its graphs (neither
-/// reference cascades), naming the first holder, and deletes nothing; once nothing holds the graph
-/// the delete applies.
+/// reference cascades), naming the first holder in (graph, holder, project slug) order, and
+/// deletes nothing; once nothing holds the graph the delete applies.
 async fn delete_workspace_refuses_a_held_graph<S: WriteStore>(store: &S) {
     const CASE: &str = "delete_workspace_refuses_a_held_graph";
     let workspace = linked_workspace(CASE, store, "held-ws", ids::PROJECT_HTUI).await;
@@ -23852,6 +23852,41 @@ async fn delete_workspace_refuses_a_held_graph<S: WriteStore>(store: &S) {
         "{CASE}: the graph is still there"
     );
 
+    // Prefixes are unique per project only, so a second project in the workspace can hold the
+    // graph under the same holder text; the project slug breaks that tie (`agy` before `htui`).
+    store
+        .upsert_workspace_project(&WorkspaceProject {
+            workspace_id: workspace,
+            project_id: ids::PROJECT_AGY,
+            position: 1,
+        })
+        .await
+        .expect(CASE);
+    let agy = store
+        .project(ids::PROJECT_AGY)
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the second fixture project"))
+        .slug;
+    let twin = store
+        .create_item_kind(new_item_kind(
+            ids::PROJECT_AGY,
+            "WSK",
+            "workspace kind",
+            graph.id,
+        ))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store.delete_workspace(workspace).await,
+        Err(StoreError::Constraint(workspace_graph_is_held(
+            "held-flow",
+            "item_kind WSK",
+            core::cmp::min(&agy, &slug)
+        ))),
+        "{CASE}: the project slug breaks a tie"
+    );
+
     // An item on the graph holds it too, and `item KEY` sorts before `item_kind PREFIX`.
     let mut item = new_item(
         ids::PROJECT_HTUI,
@@ -23878,6 +23913,20 @@ async fn delete_workspace_refuses_a_held_graph<S: WriteStore>(store: &S) {
                 kind.updated_at,
                 ItemKindPatch {
                     default_graph_id: Some(ids::GRAPH_HTUI_ANA),
+                    ..ItemKindPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    applied(
+        CASE,
+        store
+            .update_item_kind(
+                twin.id,
+                twin.updated_at,
+                ItemKindPatch {
+                    default_graph_id: Some(ids::GRAPH_AGY_ANA),
                     ..ItemKindPatch::default()
                 },
             )

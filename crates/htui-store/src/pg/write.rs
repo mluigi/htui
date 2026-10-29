@@ -9801,7 +9801,8 @@ impl PgStore {
         // `item.step_graph_id` do not, so a held graph refuses the delete here, in `MemStore`'s
         // sentence and order, rather than as a `23503` mid-cascade. The FK stays the backstop
         // for a holder that commits after this read. A `UNION` sorts only by its own columns, so
-        // the `COLLATE "C"` order goes on a derived table.
+        // the `COLLATE "C"` order goes on a derived table; the project slug breaks a tie between
+        // two projects of the workspace holding the graph under the same prefix or key.
         let held = sqlx::query!(
             r#"
             SELECT h.graph AS "graph!", h.project AS "project!", h.holder AS "holder!"
@@ -9816,7 +9817,7 @@ impl PgStore {
                       JOIN step_graph g ON g.id = i.step_graph_id
                       JOIN project pr ON pr.id = i.project_id
                      WHERE g.workspace_id = $1) h
-             ORDER BY h.graph COLLATE "C", h.holder COLLATE "C"
+             ORDER BY h.graph COLLATE "C", h.holder COLLATE "C", h.project COLLATE "C"
              LIMIT 1
             "#,
             id.as_uuid(),
