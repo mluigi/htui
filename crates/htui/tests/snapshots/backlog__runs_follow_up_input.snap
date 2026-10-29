@@ -4,12 +4,12 @@ expression: frame
 ---
 Platform   ¹Backlog            1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ FEAT-3 · Postgres store and cach…‹ Runs ›╮
-│ ▾ htui (8)                                          ││kind   status    box          started      │
-│  ANA-1    ● done       Data model, box registry and…││mode                          finished     │
-│  ANA-2    ○ open       Orchestrator step graphs and…││graph  running   DESKTOP-HTUI 09-03 09:00  │
-│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││auto                          —            │
-│  FEAT-1   ◐ running    TUI scaffold                 ││▸ 0.1   running    prd              —     …│
-│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││        —          claude/sonnet           │
+│ ▾ htui (8)                                          ││kind   status      box          started    │
+│  ANA-1    ● done       Data model, box registry and…││mode                            finished   │
+│  ANA-2    ○ open       Orchestrator step graphs and…││graph  ◐ running   DESKTOP-HTUI 09-03 09:00│
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││automatic                       —          │
+│  FEAT-1   ◐ running    TUI scaffold                 ││▸ prd             ◐ running         —     …│
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││    —          claude/sonnet               │
 │▌ FEAT-3   ◐ running    Postgres store and cache     ││                                           │
 │  FIX-1    ✓ closed     Terminal left raw after panic││                                           │
 │  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││                                           │

@@ -4,30 +4,30 @@ expression: frame
 ---
 Platform   ¹Backlog    1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys · ⌫ back
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ FEAT-1 · TUI scaffold ────‹ Runs  Graph ›╮
-│ ▾ htui (8)                                          ││graph  done      DESKTOP-HTUI 09-02 08:00  │
-│  ANA-1    ● done       Data model, box registry and…││manual                        09-02 12:00  │
+│ ▾ htui (8)                                          ││graph  ● done      DESKTOP-HTUI 09-02 08:00│
+│  ANA-1    ● done       Data model, box registry and…││manual                          09-02 12:00│
 │  ANA-2    ○ open       Orchestrator step graphs and…││                                           │
-│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││           ┌──────────────────┐            │
-│▌ FEAT-1   ◐ running    TUI scaffold                 ││           │0.1 done          │            │
-│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││           │prd               │            │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││           ╭──────────────────╮            │
+│▌ FEAT-1   ◐ running    TUI scaffold                 ││           │prd               │            │
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││           │● done            │            │
 │  FEAT-3   ◌ queued     Postgres store and cache     ││           │                  │            │
-│  FIX-1    ✓ closed     Terminal left raw after panic││           └──────────────────┘            │
+│  FIX-1    ✓ closed     Terminal left raw after panic││           ╰──────────────────╯            │
 │  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││                     │                     │
 │ ▾ agy (3)                                           ││                     │                     │
 │  ANA-1    ● done       Prompt assembly survey       ││                     ▼                     │
-│  FEAT-1   ○ open       ACP transport upgrade        ││           ┌──────────────────┐            │
-│  FIX-1    ○ open       Session leak on cancel       ││           │1.1 done          │            │
-│                                                     ││           │plan              │            │
+│  FEAT-1   ○ open       ACP transport upgrade        ││           ╭──────────────────╮            │
+│  FIX-1    ○ open       Session leak on cancel       ││           │plan              │            │
+│                                                     ││           │● done            │            │
 │                                                     ││           │⚒ read×1          │            │
-│                                                     ││           └──────────────────┘            │
+│                                                     ││           ╰──────────────────╯            │
 │                                                     ││                     │                     │
 │                                                     ││                     │                     │
 │                                                     ││                     ▼                     │
-│                                                     ││           ┌──────────────────┐            │
-│                                                     ││           │2.1 done          │            │
+│                                                     ││           ╭──────────────────╮            │
 │                                                     ││           │implement         │            │
+│                                                     ││           │● done            │            │
 │                                                     ││           │                  │            │
-│                                                     ││           └──────────────────┘            │
+│                                                     ││           ╰──────────────────╯            │
 │                                                     ││                     │                     │
 │                                                     ││                     │                     │
 │                                                     ││                     ▼                     │

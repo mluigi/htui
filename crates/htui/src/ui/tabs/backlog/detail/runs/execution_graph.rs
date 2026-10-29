@@ -26,10 +26,12 @@ use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
-use ratatui::widgets::{Block, Widget as _};
+use ratatui::widgets::Widget as _;
 
 use crate::ui::Theme;
 use crate::ui::cells;
+use crate::ui::kit::label;
+use crate::ui::kit::pane::Pane;
 
 /// Plan D10: a node's width in cells at zoom 1. Two candidates and the gap are 41 columns, which a
 /// reveal's 1-cell margins keep inside the 43-column pane (fact-check R8; 21 cuts a border).
@@ -176,13 +178,24 @@ pub(super) fn project(run: &RunSummary) -> Projection {
     }
 }
 
-/// Plan D10: one step's node. The flow draws no border (`rataflow` `content.rs:79`), so this does.
+/// Plan D10: one step's node. The flow draws no border (`rataflow` `content.rs:79`), so this does,
+/// as a kit pane (MOD-115 M4 D-16) titled by the step's fan-out word.
+///
+/// The list's [`place`](super::place) is split here (repair 1): the 20-cell node leaves its title
+/// 16 cells, where `try 2 · candidate 1` (19) lost the number that tells candidates apart, so the
+/// title is the fan-out half and the try reads after the phase on the first line.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct StepNode {
-    /// Line 1: the list's slot, the status, then `*`/`✓` (blueprint B-8).
-    head: String,
-    /// Line 2: the phase name.
+    /// The top border's title: the fan-out half of the list's place (`candidate 1`, `judge`;
+    /// MOD-115 M4 E10), empty for a step alone in its slot.
+    place: String,
+    /// Line 1: the phase name, the step's name.
     phase: String,
+    /// Line 1's end: the try half of the place (`try 2`), drawn whole after the phase, which is
+    /// cut first; `None` for a first try.
+    attempt: Option<String>,
+    /// Line 2: the status mark, then `*`/`✓` (blueprint B-8).
+    head: String,
     /// Line 3 (MOD-72 D5): this step's tool-call rows, fitted to the interior at draw time
     /// (blueprint E10); none for a step that made no call.
     calls: Vec<ToolCallCount>,
@@ -193,8 +206,8 @@ pub(super) struct StepNode {
 }
 
 impl StepNode {
-    /// The node of `step`, one of `siblings` (its run's steps, for the slot's `/i` and `/j`),
-    /// and `calls`, its rows of the last `ToolCalls` reply.
+    /// The node of `step`, one of `siblings` (its run's steps, for its place), and `calls`, its
+    /// rows of the last `ToolCalls` reply.
     pub(super) fn new(
         step: &RunStepSummary,
         siblings: &[RunStepSummary],
@@ -209,16 +222,17 @@ impl StepNode {
         if step.selected == Some(true) {
             marks.push('\u{2713}');
         }
-        let status = super::step_status(step.status);
-        let slot = super::slot(step, siblings);
+        let status = super::mark_text(label::step_status(step.status));
         let head = if marks.is_empty() {
-            format!("{slot} {status}")
+            status
         } else {
-            format!("{slot} {status} {marks}")
+            format!("{status} {marks}")
         };
         Self {
-            head,
+            place: super::fanout_word(step, siblings).unwrap_or_default(),
             phase: step.phase_name.clone(),
+            attempt: super::try_word(step),
+            head,
             calls: calls.to_vec(),
             status: step.status,
             theme: *theme,
@@ -239,6 +253,19 @@ impl StepNode {
         }
     }
 
+    /// Line 1 in `width` cells: the phase, then ` · try {n}` past the first try, the phase cut
+    /// before the try is (the try is what tells a retried layer from the first).
+    fn phase_line(&self, width: usize) -> String {
+        let Some(attempt) = &self.attempt else {
+            return self.phase.clone();
+        };
+        let suffix = format!(" \u{b7} {attempt}");
+        match width.checked_sub(cells::cell_width(&suffix)) {
+            Some(room) if room > 0 => format!("{}{suffix}", cells::clip(&self.phase, room)),
+            _ => format!("{}{suffix}", self.phase),
+        }
+    }
+
     /// The text: `dim` for a node whose border is `dim` (a loser, a retried attempt), `base`
     /// otherwise.
     fn text(&self) -> Style {
@@ -254,13 +281,13 @@ impl StepNode {
 }
 
 impl NodeContent for StepNode {
-    /// The border, then the head and the phase inside it, then the chips, dim. `ctx.area` is the
-    /// node's full size at the current zoom; a node with under two interior rows (zoom 0.5) is a
-    /// bare box.
+    /// The border, a kit pane titled by the place (MOD-115 M4 D-16), then the phase and the head
+    /// inside it, then the chips, dim. `ctx.area` is the node's full size at the current zoom; a
+    /// node with under two interior rows (zoom 0.5) is a bare box.
     fn render(&self, ctx: &NodeRenderContext, buf: &mut Buffer) {
-        let block = Block::bordered().border_style(self.border(ctx.selected));
-        let inner = block.inner(ctx.area);
-        block.render(ctx.area, buf);
+        let inner = Pane::new(&self.place)
+            .border(self.border(ctx.selected))
+            .render_into(buf, ctx.area, &self.theme);
         // MOD-72 review L3: rataflow floors a node's top and bottom edges apart, so at zoom 0.5 a
         // 5-row node is 2 or 3 rows by pan offset. A 1-row interior would flicker a clipped head
         // while panning; it stays a bare box like the 0-row one (MOD-28's zoom 0.5).
@@ -270,9 +297,10 @@ impl NodeContent for StepNode {
         let width = usize::from(inner.width);
         // Blueprint E10: fitted to the interior drawn, so `+N` is honest at every zoom.
         let chips = chips(&self.calls, width);
+        let phase = self.phase_line(width);
         let lines = [
+            (phase.as_str(), self.text()),
             (self.head.as_str(), self.text()),
-            (self.phase.as_str(), self.text()),
             (chips.as_str(), self.theme.dim), // MOD-72 D6: secondary to the head and phase
         ];
         for (row, (line, style)) in (0u16..).zip(lines) {
@@ -371,7 +399,8 @@ fn edge(
     let content = StepEdge::default().with_style(
         EdgeStyle::default()
             .with_stroke_style(theme.dim)
-            .with_label_style(theme.accent),
+            // MOD-115 M4 E9 (MOD-85): a word on a dim stroke, not focus.
+            .with_label_style(theme.base),
     );
     let edge = Edge::new(
         format!("{source}>{target}"),
@@ -766,7 +795,8 @@ mod tests {
             position,
             attempt,
             fanout_index,
-            phase_name: "plan".to_owned(),
+            // The phase names the slot, so a test finds a node by its text.
+            phase_name: format!("step {position}.{attempt}"),
             agent_id: None,
             model: None,
             status: StepStatus::Done,
@@ -1124,17 +1154,15 @@ mod tests {
         run(1, steps)
     }
 
-    /// Every `┌` in `buf` heads a node: the cell under it is `│` and the next one holds the
-    /// slot's first digit. A corner left by an earlier pass heads nothing (blueprint B-2).
+    /// Every `╭` in `buf` heads a node: the cell under it is `│` and the next one holds the
+    /// phase's first character. A corner left by an earlier pass heads nothing (blueprint B-2).
     fn assert_no_ghost_corner(buf: &Buffer) {
         for y in buf.area.top()..buf.area.bottom().saturating_sub(1) {
             for x in buf.area.left()..buf.area.right().saturating_sub(1) {
-                if buf[(x, y)].symbol() == "\u{250c}" {
+                if buf[(x, y)].symbol() == "\u{256d}" {
                     assert_eq!(buf[(x, y + 1)].symbol(), "\u{2502}", "({x}, {y})");
                     assert!(
-                        buf[(x + 1, y + 1)]
-                            .symbol()
-                            .starts_with(|c: char| c.is_ascii_digit()),
+                        !buf[(x + 1, y + 1)].symbol().trim().is_empty(),
                         "a ghost corner at ({x}, {y}): {:#?}",
                         rows(buf)
                     );
@@ -1155,7 +1183,7 @@ mod tests {
             .collect()
     }
 
-    /// The `(x, y)` of the `┌` of the node whose text holds `needle` (an ASCII-only row).
+    /// The `(x, y)` of the `╭` of the node whose text holds `needle` (an ASCII-only row).
     fn corner_of(buf: &Buffer, needle: &str) -> (u16, u16) {
         let rows = rows(buf);
         let (y, x) = rows
@@ -1170,7 +1198,7 @@ mod tests {
         let y = u16::try_from(y).expect("the row fits");
         (0..y)
             .rev()
-            .find(|row| buf[(x, *row)].symbol() == "\u{250c}")
+            .find(|row| buf[(x, *row)].symbol() == "\u{256d}")
             .map(|row| (x, row))
             .expect("the node has a top-left corner above its text")
     }
@@ -1180,8 +1208,8 @@ mod tests {
         let run = run(1, vec![step(1, 0, 1, 0), step(2, 1, 1, 0)]);
         let mut graph = synced(&run, Some(id(2)));
         let buf = draw(&mut graph);
-        let cursor = corner_of(&buf, "1.1 done");
-        let other = corner_of(&buf, "0.1 done");
+        let cursor = corner_of(&buf, "step 1.1");
+        let other = corner_of(&buf, "step 0.1");
         assert!(buf[cursor].modifier.contains(Modifier::REVERSED));
         assert!(!buf[other].modifier.contains(Modifier::REVERSED));
     }
@@ -1197,7 +1225,7 @@ mod tests {
         );
         let mut graph = synced(&run, Some(id(1)));
         let buf = draw(&mut graph);
-        assert_eq!(buf[corner_of(&buf, "1.1 failed")].fg, Color::Red);
+        assert_eq!(buf[corner_of(&buf, "step 1.1")].fg, Color::Red);
     }
 
     #[test]
@@ -1213,14 +1241,15 @@ mod tests {
         let buf = draw(&mut graph);
         let rows = rows(&buf);
         assert!(
-            rows.iter().any(|row| row.contains("0.1/0 done \u{2713}")),
+            rows.iter()
+                .any(|row| row.contains("\u{25cf} done \u{2713}")),
             "{rows:#?}"
         );
         assert!(
-            rows.iter().any(|row| row.contains("0.1/1 superseded")),
+            rows.iter().any(|row| row.contains("\u{21b7} superseded")),
             "{rows:#?}"
         );
-        let (x, y) = corner_of(&buf, "0.1/1 superseded");
+        let (x, y) = corner_of(&buf, "\u{21b7} superseded");
         let dim = Theme::default().dim.fg.expect("dim has a colour");
         assert_eq!(buf[(x, y)].fg, dim);
         assert_eq!(buf[(x + 1, y + 1)].fg, dim);
@@ -1246,7 +1275,8 @@ mod tests {
         let mut graph = synced(&run(1, vec![promoted]), Some(id(1)));
         let rows = rows(&draw(&mut graph));
         assert!(
-            rows.iter().any(|row| row.contains("0.1 done *\u{2713}")),
+            rows.iter()
+                .any(|row| row.contains("\u{25cf} done *\u{2713}")),
             "{rows:#?}"
         );
     }
@@ -1261,9 +1291,9 @@ mod tests {
         let run = run(1, vec![phased(step(1, 0, 1, 0), wide)]);
         let mut graph = synced(&run, Some(id(1)));
         let buf = draw(&mut graph);
-        let (x, y) = corner_of(&buf, "0.1 done");
+        let (x, y) = corner_of(&buf, "\u{25cf} done");
         let right = (x..buf.area.right())
-            .find(|column| buf[(*column, y)].symbol() == "\u{2510}")
+            .find(|column| buf[(*column, y)].symbol() == "\u{256e}")
             .expect("the node has a top-right corner");
         for row in y + 1..y + 4 {
             assert_eq!(buf[(right, row)].symbol(), "\u{2502}", "row {row}");
@@ -1315,7 +1345,7 @@ mod tests {
     fn a_new_run_is_centred_at_zoom_one() {
         let mut one = synced(&run(1, vec![step(1, 0, 1, 0)]), Some(id(1)));
         let buf = draw(&mut one);
-        assert_eq!(corner_of(&buf, "0.1 done"), (11, 1));
+        assert_eq!(corner_of(&buf, "step 0.1"), (11, 1));
 
         let fanout = run(
             2,
@@ -1326,9 +1356,9 @@ mod tests {
         );
         let mut graph = synced(&fanout, Some(id(1)));
         let buf = draw(&mut graph);
-        assert_eq!(corner_of(&buf, "0.1/0 done"), (1, 1));
-        assert_eq!(corner_of(&buf, "0.1/1 superseded"), (22, 1));
-        assert_eq!(buf[(41, 1)].symbol(), "\u{2510}");
+        assert_eq!(corner_of(&buf, "\u{25cf} done \u{2713}"), (1, 1));
+        assert_eq!(corner_of(&buf, "\u{21b7} superseded"), (22, 1));
+        assert_eq!(buf[(41, 1)].symbol(), "\u{256e}");
     }
 
     #[test]
@@ -1338,7 +1368,7 @@ mod tests {
             .collect();
         let mut graph = synced(&run(1, steps), Some(id(7)));
         let rows = rows(&draw(&mut graph));
-        assert!(rows.iter().any(|row| row.contains("7.1 done")), "{rows:#?}");
+        assert!(rows.iter().any(|row| row.contains("step 7.1")), "{rows:#?}");
     }
 
     #[test]
@@ -1444,7 +1474,7 @@ mod tests {
         let mut graph = synced(&linear(8), Some(id(7)));
         draw_at(&mut graph, 1, 1);
         let rows = rows(&draw(&mut graph));
-        assert!(rows.iter().any(|row| row.contains("7.1 done")), "{rows:#?}");
+        assert!(rows.iter().any(|row| row.contains("step 7.1")), "{rows:#?}");
     }
 
     /// Review L2: a re-read whose new layer is wider than the run was moves the centring, and the
@@ -1454,7 +1484,7 @@ mod tests {
         let before = run(1, vec![step(1, 0, 1, 0)]);
         let mut graph = synced(&before, Some(id(1)));
         let buf = draw(&mut graph);
-        let column = corner_of(&buf, "0.1 done");
+        let column = corner_of(&buf, "step 0.1");
 
         let mut after = before.clone();
         after.steps.extend([
@@ -1469,7 +1499,7 @@ mod tests {
             &Theme::default(),
         );
         let buf = draw(&mut graph);
-        assert_eq!(corner_of(&buf, "0.1 done"), column, "{:#?}", rows(&buf));
+        assert_eq!(corner_of(&buf, "step 0.1"), column, "{:#?}", rows(&buf));
     }
 
     /// Review L5: a retry into a fan-out fed by every candidate labels one edge per target.
@@ -1533,11 +1563,11 @@ mod tests {
         let buf = draw(&mut graph);
         let theme = Theme::default();
         assert_eq!(
-            buf[corner_of(&buf, "1.1 running")].fg,
+            buf[corner_of(&buf, "step 1.1")].fg,
             theme.running.fg.expect("running has a colour")
         );
         assert_eq!(
-            buf[corner_of(&buf, "2.1 awaiting")].fg,
+            buf[corner_of(&buf, "step 2.1")].fg,
             theme.warning.fg.expect("warning has a colour")
         );
     }
@@ -1676,7 +1706,7 @@ mod tests {
         let mut graph = ExecutionGraph::default();
         graph.sync(Some(&run), Some(id(1)), &calls, &Theme::default());
         let buf = draw(&mut graph);
-        let (x, y) = corner_of(&buf, "0.1 done");
+        let (x, y) = corner_of(&buf, "step 0.1");
         let rows = rows(&buf);
         assert!(
             rows[usize::from(y + 3)].contains("\u{2692} read\u{d7}1"),
@@ -1684,19 +1714,19 @@ mod tests {
         );
         let dim = Theme::default().dim.fg.expect("dim has a colour");
         assert_eq!(buf[(x + 1, y + 3)].fg, dim);
-        assert_eq!(buf[(x, y + 4)].symbol(), "\u{2514}", "{rows:#?}");
+        assert_eq!(buf[(x, y + 4)].symbol(), "\u{2570}", "{rows:#?}");
     }
 
     #[test]
     fn a_node_without_calls_draws_a_blank_third_line() {
         let mut graph = synced(&run(1, vec![step(1, 0, 1, 0)]), Some(id(1)));
         let buf = draw(&mut graph);
-        let (x, y) = corner_of(&buf, "0.1 done");
+        let (x, y) = corner_of(&buf, "step 0.1");
         for column in x + 1..x + 19 {
             assert_eq!(buf[(column, y + 3)].symbol(), " ", "column {column}");
         }
         assert_eq!(buf[(x, y + 3)].symbol(), "\u{2502}");
-        assert_eq!(buf[(x, y + 4)].symbol(), "\u{2514}");
+        assert_eq!(buf[(x, y + 4)].symbol(), "\u{2570}");
     }
 
     /// `step(1, …)` drawn alone into a `height`-row node, the way rataflow hands it a scratch
@@ -1735,7 +1765,7 @@ mod tests {
         }
         assert_eq!(buf[(0, 1)].symbol(), "\u{2502}");
         let buf = render_node(4);
-        assert!(rows(&buf)[1].contains("0.1 done"), "{:#?}", rows(&buf));
+        assert!(rows(&buf)[1].contains("step 0.1"), "{:#?}", rows(&buf));
     }
 
     /// D7: new counts for the same run move no node, so the viewport stays (review L2).
@@ -1855,7 +1885,7 @@ mod tests {
     fn a_click_on_a_node_is_its_step() {
         let mut graph = synced(&linear(2), Some(id(0)));
         let buf = draw(&mut graph);
-        let (x, y) = corner_of(&buf, "1.1 done");
+        let (x, y) = corner_of(&buf, "step 1.1");
         assert_eq!(click(&mut graph, (x + 2, y + 2)), Some(id(1)));
         assert_eq!(graph.selected(), Some(id(0).to_string()));
     }
@@ -1866,7 +1896,7 @@ mod tests {
     fn a_press_on_a_node_keeps_the_cursor_selected() {
         let mut graph = synced(&linear(2), Some(id(0)));
         let buf = draw(&mut graph);
-        let (x, y) = corner_of(&buf, "1.1 done");
+        let (x, y) = corner_of(&buf, "step 1.1");
         assert_eq!(graph.on_mouse(mouse(DOWN, (x + 2, y + 2))), None);
         assert_eq!(graph.selected(), Some(id(0).to_string()));
         assert_eq!(selected_count(&graph), 1);
@@ -1891,7 +1921,7 @@ mod tests {
     fn a_node_press_dragged_away_is_still_a_click() {
         let mut graph = synced(&linear(2), Some(id(0)));
         let buf = draw(&mut graph);
-        let (x, y) = corner_of(&buf, "1.1 done");
+        let (x, y) = corner_of(&buf, "step 1.1");
         let before = graph.flow.viewport;
         let nodes = positions(&graph);
         assert_eq!(
@@ -1945,7 +1975,7 @@ mod tests {
     fn an_edge_press_pans() {
         let mut graph = synced(&linear(2), Some(id(0)));
         let buf = draw(&mut graph);
-        let (x, y) = corner_of(&buf, "0.1 done");
+        let (x, y) = corner_of(&buf, "step 0.1");
         let row = y + 6;
         let column = (buf.area.left()..buf.area.right())
             .find(|column| buf[(*column, row)].symbol() != " ")
@@ -1975,7 +2005,7 @@ mod tests {
         assert_eq!(drag(&mut graph, (2, 20), (2, 2)), None);
         let rows = rows(&draw(&mut graph));
         assert!(
-            !rows.iter().any(|row| row.contains("0.1 done")),
+            !rows.iter().any(|row| row.contains("step 0.1")),
             "the pan took the cursor node off screen: {rows:#?}"
         );
         graph
@@ -1997,7 +2027,7 @@ mod tests {
         let rows = rows(&draw(&mut graph));
         assert_eq!(graph.flow.viewport, before);
         assert!(
-            !rows.iter().any(|row| row.contains("0.1 done")),
+            !rows.iter().any(|row| row.contains("step 0.1")),
             "{rows:#?}"
         );
     }
@@ -2013,7 +2043,7 @@ mod tests {
             &Theme::default(),
         );
         let rows = rows(&draw(&mut graph));
-        assert!(rows.iter().any(|row| row.contains("1.1 done")), "{rows:#?}");
+        assert!(rows.iter().any(|row| row.contains("step 1.1")), "{rows:#?}");
     }
 
     /// D7, blueprint E5: a canvas of a new size reveals the cursor.
@@ -2021,7 +2051,7 @@ mod tests {
     fn a_resize_reveals_the_cursor() {
         let mut graph = panned();
         let rows = rows(&draw_at(&mut graph, 43, 20));
-        assert!(rows.iter().any(|row| row.contains("0.1 done")), "{rows:#?}");
+        assert!(rows.iter().any(|row| row.contains("step 0.1")), "{rows:#?}");
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -2051,7 +2081,7 @@ mod tests {
     fn ending_a_node_press_clicks_nothing() {
         let mut graph = synced(&linear(2), Some(id(0)));
         let buf = draw(&mut graph);
-        let (x, y) = corner_of(&buf, "1.1 done");
+        let (x, y) = corner_of(&buf, "step 1.1");
         let at = (x + 2, y + 2);
         assert_eq!(graph.on_mouse(mouse(DOWN, at)), None);
         graph.end_gesture();
@@ -2129,12 +2159,12 @@ mod tests {
             "the re-read shifted the viewport: {pre:?} -> {post:?}"
         );
         let buf = draw(&mut graph);
-        let (x0, y0) = corner_of(&buf, "0.1 done");
+        let (x0, y0) = corner_of(&buf, "step 0.1");
         assert_eq!(graph.on_mouse(mouse(DRAG, (7, 15))), None);
         let buf = draw(&mut graph);
         assert_near(graph.flow.viewport, (post.x + 2.0, post.y + 1.0, 1.0));
         assert_eq!(
-            corner_of(&buf, "0.1 done"),
+            corner_of(&buf, "step 0.1"),
             (x0 + 2, y0 + 1),
             "the node follows the pointer"
         );
@@ -2174,7 +2204,7 @@ mod tests {
     fn a_node_press_never_starts_a_pan() {
         let mut graph = synced(&linear(2), Some(id(0)));
         let buf = draw(&mut graph);
-        let (x, y) = corner_of(&buf, "1.1 done");
+        let (x, y) = corner_of(&buf, "step 1.1");
         let before = graph.flow.viewport;
         let nodes = positions(&graph);
         assert_eq!(graph.on_mouse(mouse(DOWN, (x + 2, y + 2))), None);
@@ -2195,7 +2225,7 @@ mod tests {
         let mut graph = synced(&linear(2), Some(id(0)));
         let buf = draw(&mut graph);
         assert_blank(&buf, (2, 12));
-        let (x, y) = corner_of(&buf, "1.1 done");
+        let (x, y) = corner_of(&buf, "step 1.1");
         assert_eq!(graph.on_mouse(mouse(DOWN, (2, 12))), None);
         assert_eq!(graph.on_mouse(mouse(DOWN, (x + 2, y + 2))), None);
         assert_eq!(graph.pan, None);
@@ -2222,7 +2252,7 @@ mod tests {
         assert_eq!(graph.on_mouse(mouse(DRAG, (9, 16))), None);
         assert_eq!(graph.flow.viewport, before);
         assert!(!graph.flow.locked);
-        let (x, y) = corner_of(&buf, "1.1 done");
+        let (x, y) = corner_of(&buf, "step 1.1");
         assert_eq!(click(&mut graph, (x + 2, y + 2)), Some(id(1)));
     }
 
@@ -2241,5 +2271,151 @@ mod tests {
         assert_eq!(graph.on_mouse(mouse(DRAG, (7, 15))), None);
         assert_near(graph.flow.viewport, (v1.x + 2.0, v1.y + 1.0, 1.0));
         assert!(!graph.flow.locked);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // MOD-115 M4 L-runs: the node on the kit (D-16), the step in words (E10), the edge (E9).
+    // ---------------------------------------------------------------------------------------------
+
+    /// D-16, E10: a node is a rounded kit pane whose top border names the step's place
+    /// (`candidate 1`, `judge`), its first line the phase and its second the status mark with
+    /// the `*`/`✓` marks; no slot id is drawn.
+    #[test]
+    fn a_node_is_a_rounded_pane_titled_by_its_place() {
+        let run = run(
+            1,
+            vec![
+                phased(candidate(1, 0, 1, 0, Some(true)), "research"),
+                phased(candidate(2, 0, 1, 1, Some(false)), "research"),
+            ],
+        );
+        let mut graph = synced(&run, Some(id(1)));
+        let rows = rows(&draw(&mut graph));
+        let top = rows
+            .iter()
+            .position(|row| row.contains("\u{256d}\u{2500} candidate 1 "))
+            .unwrap_or_else(|| panic!("the first candidate's title: {rows:#?}"));
+        assert!(
+            rows[top].contains("\u{256d}\u{2500} candidate 2 "),
+            "{rows:#?}"
+        );
+        assert!(rows[top + 1].contains("\u{2502}research"), "{rows:#?}");
+        assert!(
+            rows[top + 2].contains("\u{25cf} done \u{2713}"),
+            "{rows:#?}"
+        );
+        assert!(rows[top + 2].contains("\u{21b7} superseded"), "{rows:#?}");
+        assert!(rows[top + 4].contains('\u{2570}'), "rounded: {rows:#?}");
+        assert!(
+            rows.iter().all(|row| !row.contains("0.1")),
+            "no slot id: {rows:#?}"
+        );
+    }
+
+    /// E10: a plain first try has no place, so its node's border has no title; a retry's try
+    /// reads after its phase on the first line, and its border stays untitled (no fan-out).
+    #[test]
+    fn a_plain_node_has_no_title_and_a_retry_reads_its_try() {
+        let run = run(
+            1,
+            vec![
+                phased(with_status(step(1, 1, 1, 0), StepStatus::Failed), "build"),
+                phased(with_status(step(2, 1, 2, 0), StepStatus::Running), "build"),
+            ],
+        );
+        let mut graph = synced(&run, Some(id(2)));
+        let rows = rows(&draw(&mut graph));
+        let failed = rows
+            .iter()
+            .position(|row| row.contains("\u{2717} failed"))
+            .unwrap_or_else(|| panic!("the failed node: {rows:#?}"));
+        assert!(
+            rows[failed - 2].contains("\u{256d}\u{2500}\u{2500}\u{2500}"),
+            "an untitled border: {rows:#?}"
+        );
+        let running = rows
+            .iter()
+            .position(|row| row.contains("\u{25d0} running"))
+            .unwrap_or_else(|| panic!("the running node: {rows:#?}"));
+        assert!(
+            rows[running - 1].contains("\u{2502}build \u{b7} try 2"),
+            "the try after the phase: {rows:#?}"
+        );
+        assert!(
+            rows[running - 2].contains("\u{256d}\u{2500}\u{2500}\u{2500}"),
+            "no fan-out, no title: {rows:#?}"
+        );
+    }
+
+    /// Repair 1 (review): a retried fan-out's nodes stay told apart. The 20-cell node leaves its
+    /// title 16 cells, where `try 2 \u{b7} candidate 1` (19) lost its number, so the title is the
+    /// fan-out's word (`candidate 1`, `judge`) and the try reads after the phase, the phase cut
+    /// before the try is.
+    #[test]
+    fn a_retried_candidate_node_keeps_its_number_and_its_try() {
+        let long = "a-phase-name-too-long-for-a-node";
+        let run = run(
+            1,
+            vec![
+                phased(candidate(1, 0, 2, 0, Some(true)), "research"),
+                phased(candidate(2, 0, 2, 1, Some(false)), long),
+            ],
+        );
+        let mut graph = synced(&run, Some(id(1)));
+        let rows = rows(&draw(&mut graph));
+        let top = rows
+            .iter()
+            .position(|row| row.contains("\u{256d}\u{2500} candidate 1 "))
+            .unwrap_or_else(|| panic!("the first candidate's number: {rows:#?}"));
+        assert!(
+            rows[top].contains("\u{256d}\u{2500} candidate 2 "),
+            "the second candidate's number: {rows:#?}"
+        );
+        assert!(
+            rows[top + 1].contains("\u{2502}research \u{b7} try 2"),
+            "{rows:#?}"
+        );
+        assert!(
+            rows[top + 1].contains("\u{2026} \u{b7} try 2"),
+            "a long phase is cut, not the try: {rows:#?}"
+        );
+        assert!(
+            rows[top + 2].contains("\u{25cf} done \u{2713}")
+                && rows[top + 2].contains("\u{21b7} superseded"),
+            "{rows:#?}"
+        );
+    }
+
+    /// E9 (MOD-85): an edge's label is a word on a dim stroke, drawn in the base role, not the
+    /// focus accent: no colour of its own, and not bold without colour.
+    #[test]
+    fn an_edge_label_is_a_word_not_focus() {
+        let run = run(
+            1,
+            vec![
+                with_status(step(1, 1, 1, 0), StepStatus::Failed),
+                with_status(step(2, 1, 2, 0), StepStatus::Running),
+            ],
+        );
+        for theme in [Theme::default(), Theme::monochrome()] {
+            let mut graph = ExecutionGraph::default();
+            graph.sync(Some(&run), Some(id(2)), &BTreeMap::new(), &theme);
+            let buf = draw(&mut graph);
+            let rows = rows(&buf);
+            let y = rows
+                .iter()
+                .position(|row| row.contains(RETRY))
+                .unwrap_or_else(|| panic!("no retry label: {rows:#?}"));
+            let x = rows[y]
+                .find(RETRY)
+                .map(|byte| rows[y][..byte].chars().count())
+                .expect("the label is on its row");
+            let cell = &buf[(
+                u16::try_from(x).expect("fits"),
+                u16::try_from(y).expect("fits"),
+            )];
+            assert_ne!(cell.fg, Color::Cyan, "not the focus accent");
+            assert!(!cell.modifier.contains(Modifier::BOLD), "not bold");
+        }
     }
 }

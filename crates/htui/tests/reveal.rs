@@ -284,7 +284,7 @@ fn cursor_line(frame: &str) -> String {
 
 /// The Runs pane is the one drawn: its run grid's header.
 fn shows_runs(frame: &str) -> bool {
-    frame.contains("\u{2502}kind   status    box")
+    frame.contains("\u{2502}kind   status      box")
 }
 
 #[tokio::test]

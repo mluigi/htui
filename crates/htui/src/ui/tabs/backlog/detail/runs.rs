@@ -5,8 +5,14 @@
 //! it. The pane does not read the step's rows itself — it holds no store handle (`R-NF-3`) — and
 //! it does not know which tab will show them either; naming the step is its whole part.
 //!
-//! Every step is two lines at the pane's 43 columns (MOD-4 plan D169, blueprint D197): slot,
-//! status, phase, usage and duration, then the gate, the prompt figure and the agent/model.
+//! Every step is two lines at the pane's 43 columns (MOD-4 plan D169, blueprint D197): the phase
+//! (the step's name), its status mark, usage and duration, then its place in words (`try 2`,
+//! `candidate 1`, `judge`; MOD-115 M4 E10), the gate, the prompt figure and the agent/model.
+//! Statuses, kinds, modes and gate outcomes read through `kit::label`.
+//!
+//! The close-out's two stages and the cancel question are kit questions over the pane's content
+//! (`kit::modal::Ask`, MOD-115 M4 C7), their keys on the modal's border; the rejection note and
+//! the follow-up stay field rows under the list.
 //!
 //! The pane is also where a run is driven (MOD-4 plan D166-D168). Each action key reads its
 //! verdict from the `RunActions` answer, which the worker computes with the engine's own guards
@@ -77,14 +83,17 @@ use serde_json::Value;
 
 use self::execution_graph::{ExecutionGraph, by_step, drawable};
 use crate::app::{Action, Ctx, Handled};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::run_worker::{Enabled, FrameKind, ItemActions, ORCH_NAMES, OrchReply, OrchRequest};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width};
+use crate::ui::kit::chips::key_line;
+use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::label::{self, Mark, plural};
+use crate::ui::kit::modal::{Ask, modal_rest};
 use crate::ui::kit::scroll::{Scroll, Step};
 use crate::ui::kit::text::STAMP;
-use crate::ui::kit::{chips::key_line, modal::modal_rest};
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, message};
 use crate::ui::tabs::chat::permission::PermissionStrip;
 use crate::ui::text_field::{FieldOutcome, TextField};
@@ -134,9 +143,52 @@ const WAITING_LINE: &str = "waiting for the walk";
 /// MOD-28 D5: what the flow view says under a run with no step yet.
 const NO_STEPS_YET: &str = "No steps yet.";
 
+/// [`NO_STEPS_YET`]'s next step (MOD-115 M4 L-runs): nothing to press, the walk adds them.
+const NO_STEPS_NEXT: &str = "its steps show here as it takes them";
+
+/// The pane with no item under the list's cursor (a project header).
+const NO_ITEM: &str = "No item selected.";
+
+/// [`NO_ITEM`]'s next step: the list's motion, through the browse stack.
+const CHOOSE_AN_ITEM: HintSpec = &[Hint::Pair(Act::ListDown, Act::ListUp, "chooses one")];
+
+/// [`NO_ITEM`]'s next step while the list's motion is unbound.
+const CHOOSE_UNBOUND: &str = "a chosen item's runs show here";
+
+/// The item with no run.
+const NO_RUNS: &str = "No runs for this item.";
+
+/// [`NO_RUNS`]' next step (MOD-115 M4 L-runs, plan item 2): the start key through the browse
+/// stack, so a rebound one is the one named, or where to bind one.
+fn no_runs_next(keys: &Keys) -> String {
+    keys.label(views::RUNS_BROWSE, Act::RunsStartRun)
+        .map_or_else(
+            || "a key bound to start_run in keys.toml starts one".to_owned(),
+            |key| format!("{key} starts one"),
+        )
+}
+
+/// [`NO_ITEM`]'s next step: the list's motion, or [`CHOOSE_UNBOUND`].
+fn no_item_next(keys: &Keys) -> String {
+    let choose = keys.hint(views::RUNS_BROWSE, CHOOSE_AN_ITEM);
+    if choose.is_empty() {
+        CHOOSE_UNBOUND.to_owned()
+    } else {
+        choose
+    }
+}
+
 /// What a relayed request with no summary asks for (MOD-42 blueprint B-14: the transport named no
 /// call, or the scrubber refused it).
 const NO_SUMMARY: &str = "a permission";
+
+/// The close-out question's title (MOD-115 M4 C7), both stages.
+const CLOSE_OUT_TITLE: &str = "Close out";
+
+/// The cancel question's title and its question (MOD-115 M4 C7).
+const CANCEL_TITLE: &str = "Cancel run";
+/// See [`CANCEL_TITLE`].
+const CANCEL_QUESTION: &str = "cancel this run?";
 
 /// The cancel question's hint (MOD-67 M5): `y cancel it · n keep it` under the defaults.
 const CONFIRM_CANCEL_HINT: HintSpec = &[
@@ -148,11 +200,12 @@ const CONFIRM_CANCEL_HINT: HintSpec = &[
 const COUNTING_HINT: HintSpec = &[Hint::Text("counting what the close-out writes\u{2026}")];
 
 /// The close-out warning's hint: the resolution's `choice.prev`/`next`, then its answers
-/// (`←/→ resolution · y continue · n cancel` under the defaults; MOD-115 M2 RV1 H2: the keys
-/// in force).
+/// (`←/→ resolution · y next · n cancel` under the defaults; MOD-115 M2 RV1 H2: the keys in
+/// force). `next`, not `continue`: on the question's border at the pane's 43 columns the hint has
+/// 35 cells, and the typed stage is what `y` goes on to (MOD-115 M4 C7).
 const WARN_HINT: HintSpec = &[
     Hint::Glyphs(Act::ChoicePrev, Act::ChoiceNext, "resolution"),
-    Hint::One(Act::ConfirmYes, "continue"),
+    Hint::One(Act::ConfirmYes, "next"),
     Hint::One(Act::ConfirmNo, "cancel"),
 ];
 
@@ -213,28 +266,38 @@ const ARTIFACT_HINT: HintSpec = &[
 /// blueprint D197).
 const PANE: usize = 43;
 
-/// The run grid: `kind`, `status`, `box`, `started`, single-spaced (41 columns). Two lines per run:
+/// The run grid: `kind`, `status`, `box`, `started`, single-spaced (43 columns). Two lines per run:
 /// `kind` over `mode`, `started` over `finished`, because six columns do not fit the 43 a detail
-/// pane has at 100x30 and folding the pairs that belong together keeps every field visible.
-const RUN_GRID: [usize; 4] = [6, 9, 12, 11];
+/// pane has at 100x30 and folding the pairs that belong together keeps every field visible. The
+/// status is its mark (MOD-115 M4 E10: `⚠ needs you`, 11 cells), and the mode's word
+/// (`automatic`) runs under the kind and the status, [`MODE_WIDTH`].
+const RUN_GRID: [usize; 4] = [6, 11, 12, 11];
 
-/// The step grid's line 1 (D197): cursor, slot, status, phase, usage, duration, single-spaced.
-/// `1 + 5 + 10 + 11 + 6 + 5` plus five spaces is exactly [`PANE`].
-const SLOT_WIDTH: usize = 5;
-/// See [`SLOT_WIDTH`].
-const STATUS_WIDTH: usize = 10;
-/// See [`SLOT_WIDTH`].
+/// The run grid's line 2 under the kind and status columns: the mode's word.
+const MODE_WIDTH: usize = RUN_GRID[0] + 1 + RUN_GRID[1];
+
+/// The step grid's line 1 (D197, MOD-115 M4 E10): cursor, phase, status mark, usage, duration,
+/// single-spaced. `1 + 15 + 12 + 6 + 5` plus five spaces is exactly [`PANE`]; the phase, the
+/// step's name, leads, and the column is the widest step mark (`↷ superseded`).
+const STATUS_WIDTH: usize = 12;
+/// See [`STATUS_WIDTH`].
 const USAGE_WIDTH: usize = 6;
-/// See [`SLOT_WIDTH`].
+/// See [`STATUS_WIDTH`].
 const DURATION_WIDTH: usize = 5;
 
-/// The step grid's line 2 (D197): an indent to the status column, the gate, then a tail that
-/// starts in the phase column. `8 + 10 + 1 + 24` is exactly [`PANE`].
-const INDENT: usize = 8;
+/// The step grid's line 2 (D197, MOD-115 M4 E10): an indent under the phase, the step's place
+/// ([`place`]) in a column as wide as its run's widest, the gate, then a tail: `4 + place + 10 +
+/// 1 + tail` is exactly [`PANE`]. A tail that does not fit whole beside a place wraps to a line
+/// of its own at the indent ([`tail_line`]). The reason, opening and request lines under a step
+/// start at the same indent.
+const INDENT: usize = 4;
 /// See [`INDENT`].
 const GATE_WIDTH: usize = 10;
-/// See [`INDENT`].
-const TAIL_WIDTH: usize = 24;
+
+/// The widest a place column grows ([`place_width`]): the whole of line 2 but the gate, so any
+/// place a real run has (`try 12 · candidate 3` is 20 cells) reads whole; the tail then wraps
+/// ([`tail_line`]). Only a place past 27 cells (a try or a candidate in the millions) is cut.
+const PLACE_MAX: usize = PANE - INDENT - 1 - GATE_WIDTH - 1;
 
 /// MOD-70 blueprint B-7: where a step's follow-up lines start. Two columns, not [`INDENT`]: PRD
 /// Q7's pending label is 40 columns and has to be read whole, so each line keeps 41 for its text.
@@ -254,12 +317,16 @@ const CURSOR: &str = "\u{25b8}";
 /// the token figure; the record that says *what* was trimmed is the `Prompt` sub-tab's.
 const TRIMMED: &str = "!";
 
-/// Width of the phase column (D197), which is also where line 2's tail, D106's indicator first,
-/// starts (hazard H-26).
-///
-/// Named because it is the bound [`indicator`] has to fit in: the widest figure, `~-2147.5M !`
-/// over `i32::MIN`, is exactly this wide.
-const PHASE_WIDTH: usize = 11;
+/// Width of the phase column (D197): the step's name, which leads line 1 (MOD-115 M4 E10).
+const PHASE_WIDTH: usize = 15;
+
+/// The bound [`indicator`] has to fit in (hazard H-26): the widest figure, `~-2147.5M !` over
+/// `i32::MIN`, is exactly this wide.
+const INDICATOR_WIDTH: usize = 11;
+
+// Hazard H-26: a tail that does not fit beside its place wraps to [`tail_line`]'s `PANE - INDENT`
+// cells, which hold the widest indicator and its space whole.
+const _: () = assert!(INDICATOR_WIDTH < PANE - INDENT);
 
 /// The `Runs` reply as a table of kind, mode, status, box, started and finished, with two lines
 /// per step under each run.
@@ -724,7 +791,7 @@ impl RunsTab {
     /// `ctrl-c` still quits, `F1` opens help and `alt-y` answers no question (D7).
     fn modal_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let stack = self.stack();
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         let (mode, handled) = match core::mem::take(&mut self.mode) {
             Mode::Browse => (Mode::Browse, Handled::Pass),
             Mode::RejectNote { run, step, field } => reject_key(run, step, field, key, ctx),
@@ -1050,7 +1117,7 @@ fn reject_key(
         FieldOutcome::Consumed => (Mode::RejectNote { run, step, field }, Handled::Consumed),
         FieldOutcome::Pass => (
             Mode::RejectNote { run, step, field },
-            modal_rest(views::CAPTURE, KeyChord::from_event(key)),
+            modal_rest(views::CAPTURE, ctx.pressed(&key)),
         ),
     }
 }
@@ -1082,7 +1149,7 @@ fn follow_up_key(
         FieldOutcome::Consumed => (Mode::FollowUp { step, field }, Handled::Consumed),
         FieldOutcome::Pass => (
             Mode::FollowUp { step, field },
-            modal_rest(views::CAPTURE, KeyChord::from_event(key)),
+            modal_rest(views::CAPTURE, ctx.pressed(&key)),
         ),
     }
 }
@@ -1129,7 +1196,7 @@ fn close_out_key(
     stack: Stack<'_>,
     ctx: &Ctx<'_>,
 ) -> (Mode, Handled) {
-    let chord = KeyChord::from_event(key);
+    let chord = ctx.pressed(&key);
     let (stage, handled) = match stage {
         CloseOutStage::Counting => match ctx.keys().actions(stack, chord).first() {
             Some(Act::ConfirmNo) => return (Mode::Browse, Handled::Consumed),
@@ -1192,6 +1259,33 @@ fn allowed(verdict: &Enabled, ctx: &Ctx<'_>) -> bool {
 /// An `Orch` command, as the store request that carries it.
 fn command(command: Command) -> StoreRequest {
     StoreRequest::Orch(OrchRequest::Command(command))
+}
+
+/// A question the pane asks in a kit modal (MOD-115 M4 C7, [`RunsTab::question`]).
+#[derive(Debug)]
+struct Question<'a> {
+    /// The modal's title.
+    title: &'static str,
+    /// What is asked, one line each (wrapped by the modal).
+    lines: Vec<String>,
+    /// The typed answer's field, for the close-out's typed stage: on its own row under the
+    /// lines, so a narrow modal keeps what is typed whole (MOD-81).
+    input: Option<&'a TextField>,
+    /// The keys, on the modal's bottom border.
+    hint: String,
+}
+
+/// The close-out's summary (D167, MOD-115 M4 E10): the item, the resolution's word, the runs and
+/// commit rows counted with [`plural`], and the summary version it writes.
+fn close_out_summary(preview: &Preview) -> String {
+    format!(
+        "close {} as {} \u{b7} {} \u{b7} {} \u{b7} summary v{}",
+        preview.key,
+        label::resolution(preview.resolution),
+        plural(preview.runs, "run", "runs"),
+        plural(preview.rows, "commit row", "commit rows"),
+        preview.version
+    )
 }
 
 /// The style a run status renders with. `Theme::status_style` is about items, not runs.
@@ -1270,6 +1364,18 @@ fn run_grid(values: [(&str, Style); 4]) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The run grid's line 2: the mode's word under the kind and status columns ([`MODE_WIDTH`]),
+/// the box column blank, then `finished` under `started`.
+fn mode_line(mode: &str, finished: &str, style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(cells::fit(mode, MODE_WIDTH), style),
+        Span::raw(" "),
+        Span::styled(blank(RUN_GRID[2]), style),
+        Span::raw(" "),
+        Span::styled(cells::fit(finished, RUN_GRID[3]), style),
+    ])
+}
+
 /// The run grid's two header lines, `kind status box started` over `mode … finished`.
 fn header_lines(theme: &Theme) -> [Line<'static>; 2] {
     let title = theme.title;
@@ -1280,30 +1386,14 @@ fn header_lines(theme: &Theme) -> [Line<'static>; 2] {
             ("box", title),
             ("started", title),
         ]),
-        run_grid([
-            ("mode", title),
-            ("", title),
-            ("", title),
-            ("finished", title),
-        ]),
+        mode_line("mode", "finished", title),
     ]
 }
 
-/// `run.status` in the run grid's nine columns: `awaiting_approval` is the one that does not fit,
-/// and it reads `awaiting`, as a step's does (D197).
-const fn run_status(status: RunStatus) -> &'static str {
-    match status {
-        RunStatus::AwaitingApproval => "awaiting",
-        other => other.as_str(),
-    }
-}
-
-/// `run_step.status` in the step grid's ten columns (D197).
-const fn step_status(status: StepStatus) -> &'static str {
-    match status {
-        StepStatus::AwaitingApproval => "awaiting",
-        other => other.as_str(),
-    }
+/// A status mark as one cell's text: the glyph, a space, the word (`⚠ needs you`; MOD-115 M4
+/// E10). The cell's style stays the pane's ([`run_style`], [`step_style`]).
+fn mark_text(mark: Mark) -> String {
+    format!("{} {}", mark.glyph, mark.word)
 }
 
 /// A timestamp in the pane's [`STAMP`] format, or [`PENDING`].
@@ -1317,19 +1407,15 @@ fn stamp(at: Option<chrono::DateTime<chrono::Utc>>) -> String {
 fn run_lines(run: &RunSummary, cancel_requested: bool, theme: &Theme) -> Vec<Line<'static>> {
     let started = stamp(run.started_at);
     let finished = stamp(run.finished_at);
+    let status = mark_text(label::run_status(run.status));
     let mut lines = vec![
         run_grid([
-            (run.kind.as_str(), theme.base),
-            (run_status(run.status), run_style(theme, run.status)),
+            (label::run_kind(run.kind), theme.base),
+            (&status, run_style(theme, run.status)),
             (&run.box_hostname, theme.base),
             (&started, theme.base),
         ]),
-        run_grid([
-            (run.mode.as_str(), theme.dim),
-            ("", theme.dim),
-            ("", theme.dim),
-            (&finished, theme.dim),
-        ]),
+        mode_line(label::run_mode(run.mode), &finished, theme.dim),
     ];
     if cancel_requested {
         lines.push(Line::from(Span::styled(
@@ -1346,26 +1432,59 @@ fn run_lines(run: &RunSummary, cancel_requested: bool, theme: &Theme) -> Vec<Lin
     lines
 }
 
-/// The slot a step sits in: `p.a`, plus `/i` in a fan-out slot and `/j` for its judge.
-fn slot(step: &RunStepSummary, siblings: &[RunStepSummary]) -> String {
+/// Where a step sits in its phase, in words (MOD-115 M4 E10, which retired the `p.a/i` slot id):
+/// `try {attempt}` past the first attempt, `candidate {n}` (counted from one) in a fan-out slot
+/// and `judge` for its judge, the try first when there are both (`try 2 · candidate 1`); empty
+/// for a plain first try. Its position is the row order, so it is not repeated.
+///
+/// `siblings` are the steps of its run, which [`fanout_word`] reads.
+fn place(step: &RunStepSummary, siblings: &[RunStepSummary]) -> String {
+    match (try_word(step), fanout_word(step, siblings)) {
+        (Some(attempt), Some(candidate)) => format!("{attempt} \u{b7} {candidate}"),
+        (Some(place), None) | (None, Some(place)) => place,
+        (None, None) => String::new(),
+    }
+}
+
+/// The try half of a [`place`]: `try {attempt}` past the first attempt, `None` for a first try.
+pub(super) fn try_word(step: &RunStepSummary) -> Option<String> {
+    (step.attempt > 1).then(|| format!("try {}", step.attempt))
+}
+
+/// The fan-out half of a [`place`]: `candidate {n}` (counted from one) in a fan-out slot and
+/// `judge` for its judge, `None` for a step alone in its slot. `siblings` are the steps of its
+/// run: a fan-out slot is known by a sibling at the same `(position, attempt)` with a non-zero
+/// `fanout_index`.
+pub(super) fn fanout_word(step: &RunStepSummary, siblings: &[RunStepSummary]) -> Option<String> {
     let fanned = siblings.iter().any(|sibling| {
         sibling.position == step.position
             && sibling.attempt == step.attempt
             && sibling.fanout_index != 0
     });
-    let at = format!("{}.{}", step.position, step.attempt);
     match (fanned, step.fanout_index) {
-        (false, _) => at,
-        (true, -1) => format!("{at}/j"),
-        (true, index) => format!("{at}/{index}"),
+        (false, _) => None,
+        (true, index) if index < 0 => Some("judge".to_owned()),
+        (true, index) => Some(format!("candidate {}", i64::from(index) + 1)),
     }
 }
 
-/// The gate cell: the outcome or `—`, then `*` for a promoted step and `✓` for a selected one.
+/// The place column of a run's step lines: its widest [`place`], at most [`PLACE_MAX`]; `0` when
+/// no step of it has one.
+fn place_width(siblings: &[RunStepSummary]) -> usize {
+    siblings
+        .iter()
+        .map(|step| cell_width(&place(step, siblings)))
+        .max()
+        .unwrap_or(0)
+        .min(PLACE_MAX)
+}
+
+/// The gate cell: the outcome's word or `—`, then `*` for a promoted step and `✓` for a selected
+/// one.
 fn gate(step: &RunStepSummary) -> String {
     let mut gate = step
         .gate_outcome
-        .map_or(PENDING, |outcome| outcome.as_str())
+        .map_or(PENDING, label::gate_outcome)
         .to_owned();
     if step.promoted_at.is_some() {
         gate.push('*');
@@ -1410,27 +1529,31 @@ fn who(agent: Option<&str>, model: Option<&str>) -> String {
     format!("{agent}/{model}")
 }
 
-/// One step's two lines (D197). `siblings` are the steps of its run: a fan-out slot is known by a
-/// sibling at the same `(position, attempt)` with a non-zero `fanout_index`.
+/// One step's two lines (D197, MOD-115 M4 E10): the phase (the step's name), its status mark, its
+/// usage and duration; then its [`place`] in the run's place column, its gate and the tail, the
+/// tail left blank when it wraps to [`tail_line`]. `siblings` are the steps of its run, which the
+/// place and its column are read against.
+///
+/// The cursor's `▸` and the phase take `accent` on the step under the cursor (the tab's accent,
+/// `Ctx::accent`: focus, MOD-85), dim elsewhere; the glyph carries the cursor without colour.
 fn step_lines(
     step: &RunStepSummary,
     siblings: &[RunStepSummary],
     on_cursor: bool,
+    accent: Style,
     theme: &Theme,
 ) -> [Line<'static>; 2] {
-    let label = if on_cursor { theme.accent } else { theme.dim };
+    let name = if on_cursor { accent } else { theme.dim };
     let mark = if on_cursor { CURSOR } else { " " };
     let first = Line::from(vec![
-        Span::styled(mark, label),
+        Span::styled(mark, name),
         Span::raw(" "),
-        Span::styled(cells::fit(&slot(step, siblings), SLOT_WIDTH), label),
+        Span::styled(cells::fit(&step.phase_name, PHASE_WIDTH), name),
         Span::raw(" "),
         Span::styled(
-            cells::fit(step_status(step.status), STATUS_WIDTH),
+            cells::fit(&mark_text(label::step_status(step.status)), STATUS_WIDTH),
             step_style(theme, step.status),
         ),
-        Span::raw(" "),
-        Span::styled(cells::fit(&step.phase_name, PHASE_WIDTH), label),
         Span::raw(" "),
         Span::styled(
             cells::pad_left(&usage_cell(step.usage.as_ref()), USAGE_WIDTH),
@@ -1442,13 +1565,55 @@ fn step_lines(
             theme.dim,
         ),
     ]);
-    let second = Line::from(vec![
-        Span::raw(blank(INDENT)),
+    let mut second = vec![Span::raw(blank(INDENT))];
+    let places = place_width(siblings);
+    if places > 0 {
+        second.push(Span::styled(
+            cells::fit(&place(step, siblings), places),
+            theme.dim,
+        ));
+        second.push(Span::raw(" "));
+    }
+    let room = tail_room(places);
+    let tail = if wraps(step, places) {
+        String::new()
+    } else {
+        tail(step)
+    };
+    second.extend([
         Span::styled(cells::fit(&gate(step), GATE_WIDTH), theme.dim),
         Span::raw(" "),
-        Span::styled(cells::fit(&tail(step), TAIL_WIDTH), theme.dim),
+        Span::styled(cells::fit(&tail, room), theme.dim),
     ]);
-    [first, second]
+    [first, Line::from(second)]
+}
+
+/// The cells line 2 leaves its tail beside a place column `places` wide (`0`: none).
+fn tail_room(places: usize) -> usize {
+    let place = if places > 0 { places + 1 } else { 0 };
+    PANE - INDENT - GATE_WIDTH - 1 - place
+}
+
+/// Whether `step`'s tail wraps to [`tail_line`]: only beside a place, and only when it does not
+/// fit there whole (repair 1: a fan-out's `~36k ! claude/opus` kept the old fixed 24 cells whole,
+/// and a place must not cut it). A step with no place keeps one line and its tail is fitted.
+fn wraps(step: &RunStepSummary, places: usize) -> bool {
+    places > 0 && cell_width(&tail(step)) > tail_room(places)
+}
+
+/// A step's tail on a line of its own under its place, when it does not fit beside it
+/// ([`wraps`]): the indicator and agent/model at the indent, fitted to the pane's other cells.
+fn tail_line(
+    step: &RunStepSummary,
+    siblings: &[RunStepSummary],
+    theme: &Theme,
+) -> Option<Line<'static>> {
+    wraps(step, place_width(siblings)).then(|| {
+        Line::from(vec![
+            Span::raw(blank(INDENT)),
+            Span::styled(cells::fit(&tail(step), PANE - INDENT), theme.dim),
+        ])
+    })
 }
 
 /// A parked step's reason on a third line (R-3): `Some` only for an awaiting step with a
@@ -1680,7 +1845,7 @@ impl DetailTab for RunsTab {
         if !matches!(self.mode, Mode::Browse) {
             return self.modal_key(key, ctx);
         }
-        let chord = KeyChord::from_event(key);
+        let chord = ctx.pressed(&key);
         // MOD-42 D14: while the step under the cursor has a pending request, `answer.option_*`
         // (the digits) is this pane's, as the chat's parked strip takes it (`chat/mod.rs`);
         // otherwise the chord passes on, and a digit selects a tab (MOD-115 M2 D7: no fixed key).
@@ -1949,23 +2114,47 @@ impl DetailTab for RunsTab {
         }
     }
 
-    /// The mode's keys (MOD-67 M6 T2): `hint_spec` through the mode's stack;
-    /// nothing with no item selected.
+    /// The mode's keys (MOD-67 M6 T2): `hint_spec` through the mode's stack; nothing with no item
+    /// selected, nor while a question is up, whose modal carries its keys (MOD-115 M4 C7).
     fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
         self.item?;
+        if self.question(keys).is_some() {
+            return None;
+        }
         let hint = keys.hint(self.stack(), self.hint_spec());
         key_line(hint, theme)
     }
 
-    /// The footer a modal asks in is drawn whatever the list holds, so the close-out of an item
-    /// with no run is on screen too: `C` needs no run (`close_out_enabled`).
+    /// The list or the flow, then the field a mode types into under it, then a question's modal
+    /// over the whole content (MOD-115 M4 C7). The question is drawn whatever the list holds, so
+    /// the close-out of an item with no run is on screen too: `C` needs no run
+    /// (`close_out_enabled`).
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         // MOD-71 D5: only a frame that draws the canvas records it (render_flow).
         self.canvas.set(None);
         if self.item.is_none() {
-            message(frame, area, "No item selected.", ctx.theme);
+            let next = no_item_next(ctx.keys());
+            empty::render(frame, area, NO_ITEM, NextStep(&next), ctx.theme);
             return;
         }
+        self.render_content(frame, area, ctx);
+        if let Some(question) = self.question(ctx.keys()) {
+            let mut ask = Ask::new(question.title).hint(&question.hint);
+            for line in &question.lines {
+                ask = ask.line(Line::styled(line.as_str(), ctx.theme.base));
+            }
+            if let Some(field) = question.input {
+                ask = ask.input("", field);
+            }
+            ask.render(frame, area, ctx.theme);
+        }
+    }
+}
+
+impl RunsTab {
+    /// What [`DetailTab::render`] draws under a question: the artifact view, or the list or the
+    /// flow above the footer a field mode types into.
+    fn render_content(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         if let Mode::Artifact {
             doc, scroll, width, ..
         } = &self.mode
@@ -1986,7 +2175,8 @@ impl DetailTab for RunsTab {
         .areas(area);
         frame.render_widget(Paragraph::new(footer).wrap(Wrap { trim: false }), prompt);
         if self.runs.is_empty() {
-            message(frame, list, "No runs for this item.", ctx.theme);
+            let next = no_runs_next(ctx.keys());
+            empty::render(frame, list, NO_RUNS, NextStep(&next), ctx.theme);
             return;
         }
         if self.view == View::Flow {
@@ -2000,16 +2190,14 @@ impl DetailTab for RunsTab {
         let [head, body] =
             Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(list);
         frame.render_widget(Paragraph::new(Vec::from(header_lines(ctx.theme))), head);
-        let (lines, cursor_end) = self.list_lines(ctx.keys(), ctx.theme);
+        let (lines, cursor_end) = self.list_lines_in(ctx.keys(), ctx.theme, ctx.accent());
         let skip = cursor_end.saturating_sub(usize::from(body.height));
         frame.render_widget(
             Paragraph::new(lines).scroll((u16::try_from(skip).unwrap_or(u16::MAX), 0)),
             body,
         );
     }
-}
 
-impl RunsTab {
     /// MOD-28 D11: the flow branch of `render`. The head is what the list says about the cursor's
     /// run and step, and the rest is the canvas, or "No steps yet." under a run with none. `pane`
     /// is the whole pane, footer included, whose size alone decides a resize reveal (MOD-71 D7,
@@ -2033,7 +2221,7 @@ impl RunsTab {
         .areas(area);
         frame.render_widget(Paragraph::new(lines), head);
         if run.steps.is_empty() {
-            message(frame, canvas, NO_STEPS_YET, theme);
+            empty::render(frame, canvas, NO_STEPS_YET, NextStep(NO_STEPS_NEXT), theme);
             return;
         }
         // MOD-71 D5, blueprint B-7: the canvas a press is hit-tested against, only when
@@ -2069,7 +2257,21 @@ impl RunsTab {
 
     /// The runs from the first visible one, each with its steps, and the line index just past the
     /// cursor's entry (0 with no cursor): what the list has to show to keep the cursor in view.
+    /// The step cursor takes the theme's accent; [`list_lines_in`](Self::list_lines_in) takes
+    /// the tab's.
+    #[cfg(test)]
     fn list_lines(&self, keys: &Keys, theme: &Theme) -> (Vec<Line<'static>>, usize) {
+        self.list_lines_in(keys, theme, theme.accent)
+    }
+
+    /// [`list_lines`](Self::list_lines), the step under the cursor in `accent` (the tab's,
+    /// `Ctx::accent`; MOD-85).
+    fn list_lines_in(
+        &self,
+        keys: &Keys,
+        theme: &Theme,
+        accent: Style,
+    ) -> (Vec<Line<'static>>, usize) {
         let cursor = self.entry();
         let step_cursor = self.selected_step();
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -2081,16 +2283,18 @@ impl RunsTab {
             }
             if cursor == Some(Entry::Run { run: at }) {
                 // A run with no step is its own entry (D198); the run grid has no cursor column,
-                // so its kind cell takes the accent instead.
+                // so its kind cell is the selection band instead (MOD-115 M4 E9: legible
+                // without colour, where the accent alone was not).
                 if let Some(kind) = header.first_mut().and_then(|line| line.spans.first_mut()) {
-                    kind.style = theme.accent;
+                    kind.style = kind.style.patch(theme.selected);
                 }
                 cursor_end = lines.len() + header.len();
             }
             lines.extend(header);
             for step in &run.steps {
                 let on_cursor = step_cursor == Some(step.id);
-                lines.extend(step_lines(step, &run.steps, on_cursor, theme));
+                lines.extend(step_lines(step, &run.steps, on_cursor, accent, theme));
+                lines.extend(tail_line(step, &run.steps, theme));
                 lines.extend(note_line(step, theme));
                 // MOD-37 M5 (ANA-27 T5): how the step's chat opened, after R-3's reason.
                 lines.extend(opening_lines(step, theme));
@@ -2111,14 +2315,12 @@ impl RunsTab {
         (lines, cursor_end)
     }
 
-    /// What a capturing mode asks, drawn under the run list: its question and its field. The
-    /// keys that ended it, and the browse row (ANA-26 §8), are the shell's hint row since MOD-67
-    /// M6 T2 ([`hint_spec`](Self::hint_spec)).
+    /// What a field mode asks, drawn under the run list: its label and its field. The keys that
+    /// end it, and the browse row (ANA-26 §8), are the pane's hints since MOD-67 M6 T2
+    /// ([`hint_spec`](Self::hint_spec)). A question is a kit modal instead
+    /// ([`question`](Self::question)); the rejection note and the follow-up are not questions.
     fn footer(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
         match &self.mode {
-            Mode::Browse
-            | Mode::Artifact { .. }
-            | Mode::CloseOut(CloseOutStage::Counting | CloseOutStage::InFlight) => Vec::new(),
             Mode::RejectNote { field, .. } => vec![
                 Line::styled("reject with a note:", theme.title),
                 field.line(width, true, theme),
@@ -2127,23 +2329,38 @@ impl RunsTab {
                 Line::styled("follow-up for the running step:", theme.title),
                 field.line(width, true, theme),
             ],
-            Mode::ConfirmCancel { .. } => vec![Line::styled("cancel this run?", theme.title)],
-            Mode::CloseOut(CloseOutStage::Warn(preview)) => vec![Line::styled(
-                format!(
-                    "close {} as {} · {} runs · {} commit rows · summary v{}",
-                    preview.key, preview.resolution, preview.runs, preview.rows, preview.version
-                ),
-                theme.title,
-            )],
-            Mode::CloseOut(CloseOutStage::Typed { preview, field }) => {
-                let prompt = format!("type {} to close it: ", preview.key);
-                let room =
-                    width.saturating_sub(u16::try_from(cell_width(&prompt)).unwrap_or(u16::MAX));
-                let mut line = Line::from(Span::styled(prompt, theme.title));
-                line.spans.extend(field.line(room, true, theme).spans);
-                vec![line]
-            }
+            Mode::Browse
+            | Mode::Artifact { .. }
+            | Mode::ConfirmCancel { .. }
+            | Mode::CloseOut(_) => Vec::new(),
         }
+    }
+
+    /// What the pane asks in a kit modal (MOD-115 M4 C7): the close-out's warning and typed
+    /// stages, and the cancel question; `None` in every other mode. Its keys go on the modal's
+    /// border, through `keys` and the mode's stack, so the pane draws none while it is up.
+    fn question(&self, keys: &Keys) -> Option<Question<'_>> {
+        let (title, lines, input) = match &self.mode {
+            Mode::ConfirmCancel { .. } => (CANCEL_TITLE, vec![CANCEL_QUESTION.to_owned()], None),
+            Mode::CloseOut(CloseOutStage::Warn(preview)) => {
+                (CLOSE_OUT_TITLE, vec![close_out_summary(preview)], None)
+            }
+            Mode::CloseOut(CloseOutStage::Typed { preview, field }) => (
+                CLOSE_OUT_TITLE,
+                vec![
+                    close_out_summary(preview),
+                    format!("type {} to close it:", preview.key),
+                ],
+                Some(field),
+            ),
+            _ => return None,
+        };
+        Some(Question {
+            title,
+            lines,
+            input,
+            hint: keys.hint(self.stack(), self.hint_spec()),
+        })
     }
 
     /// The current mode's keys (ANA-26 §8, MOD-67 M5): browsing, the list's, the flow's, or an
@@ -2172,7 +2389,7 @@ impl RunsTab {
 mod tests {
     use super::*;
     use crate::app::{Action, Emit, TopBarState};
-    use crate::keys::Keys;
+    use crate::keys::{KeyChord, Keys};
     use crate::run_worker::{RunActions, RunFrame, StepActions};
     use crate::store_worker::Origin;
     use chrono::TimeDelta;
@@ -2376,7 +2593,7 @@ mod tests {
     }
 
     /// D106: the fixture's `implement` step is the one with a `trim_record`, and its figure leads
-    /// the tail of the step's second line, which starts in the phase column.
+    /// the tail of the step's second line, after the gate (the run has no place column).
     #[tokio::test]
     async fn a_step_with_a_trim_record_takes_two_lines() {
         let shell = Shell::new();
@@ -2395,8 +2612,8 @@ mod tests {
         );
         assert_eq!(
             column(second, "~36k"),
-            column(&lines[at], "implement"),
-            "and in the same column: the tail starts where the phase does"
+            Some(INDENT + GATE_WIDTH + 1),
+            "and after the gate: the tail leads with the figure"
         );
     }
 
@@ -2459,8 +2676,8 @@ mod tests {
             };
             let rendered = indicator(&step).expect("a step with a figure has a second line");
             assert!(
-                cell_width(&rendered) <= PHASE_WIDTH,
-                "`{rendered}` does not fit the phase cell"
+                cell_width(&rendered) <= INDICATOR_WIDTH,
+                "`{rendered}` does not fit the narrowest tail"
             );
         }
     }
@@ -2533,7 +2750,14 @@ mod tests {
             model: Some("claude-sonnet-4-5-20250929".to_owned()),
             ..feat_1_runs().await[0].steps[0].clone()
         };
-        let [_, second] = step_lines(&step, std::slice::from_ref(&step), false, &Theme::default());
+        let theme = Theme::default();
+        let [_, second] = step_lines(
+            &step,
+            std::slice::from_ref(&step),
+            false,
+            theme.accent,
+            &theme,
+        );
         assert_eq!(second.width(), PANE, "{:?}", text(&second));
         let rendered = text(&second);
         assert!(
@@ -2736,8 +2960,8 @@ mod tests {
             lines[at + 2].contains(NOTE),
             "R-3's reason comes first: {lines:#?}"
         );
-        assert_eq!(lines[at + 3], "        resume failed; context not carried;");
-        assert_eq!(lines[at + 4], "        handoff prompt only");
+        assert_eq!(lines[at + 3], "    resume failed; context not carried;");
+        assert_eq!(lines[at + 4], "    handoff prompt only");
         assert_eq!(
             lines.iter().filter(|line| !line.is_empty()).count(),
             2 + 2 + 4 * 2 + 1 + 2,
@@ -2754,8 +2978,8 @@ mod tests {
             .iter()
             .position(|line| line.contains("prd"))
             .expect("the `prd` step is listed");
-        assert_eq!(lines[at + 2], "        context not carried;");
-        assert_eq!(lines[at + 3], "        handoff prompt only");
+        assert_eq!(lines[at + 2], "    context not carried;");
+        assert_eq!(lines[at + 3], "    handoff prompt only");
         assert_eq!(lines.len(), 2 + 4 * 2 + 1 + 2 + 2, "{lines:#?}");
     }
 
@@ -2859,15 +3083,23 @@ mod tests {
     }
 
     /// D169, D197: every step line is exactly the pane's 43 columns, with each field in its own
-    /// column: status at 8, phase at 19, usage at 31 and duration at 38.
+    /// column (MOD-115 M4 E10): phase at 2, status mark at 18, usage at 31 and duration at 38;
+    /// the second line's place column as wide as the run's widest place.
     #[tokio::test]
     async fn every_step_row_fits_forty_three_columns() {
         let theme = Theme::default();
         let steps = extremes().await;
+        let places = place_width(&steps);
+        assert_eq!(
+            places,
+            cell_width("try 45 \u{b7} judge"),
+            "the judge's place is the widest"
+        );
         for step in &steps {
             for on_cursor in [false, true] {
-                let [first, second] = step_lines(step, &steps, on_cursor, &theme);
-                for line in [&first, &second] {
+                let [first, second] = step_lines(step, &steps, on_cursor, theme.accent, &theme);
+                let wrapped = tail_line(step, &steps, &theme);
+                for line in [&first, &second].into_iter().chain(wrapped.as_ref()) {
                     assert_eq!(
                         line.width(),
                         PANE,
@@ -2876,7 +3108,7 @@ mod tests {
                     );
                 }
                 let chars: Vec<char> = text(&first).chars().collect();
-                for gap in [1, 7, 18, 30, 37] {
+                for gap in [1, 17, 30, 37] {
                     assert_eq!(
                         chars[gap], ' ',
                         "column {gap} separates two cells: {chars:?}"
@@ -2885,16 +3117,15 @@ mod tests {
                 let cell = |from: usize, to: usize| -> String {
                     chars[from..to].iter().collect::<String>().trim().to_owned()
                 };
-                let status = if step.status == StepStatus::AwaitingApproval {
-                    "awaiting"
-                } else {
-                    step.status.as_str()
-                };
-                assert_eq!(cell(8, 18), status, "the status starts at column 8");
                 assert_eq!(
-                    cell(19, 30),
+                    cell(2, 17),
                     cells::fit(&step.phase_name, PHASE_WIDTH).trim(),
-                    "the phase starts at column 19"
+                    "the phase starts at column 2"
+                );
+                assert_eq!(
+                    cell(18, 30),
+                    mark_text(label::step_status(step.status)),
+                    "the status mark starts at column 18"
                 );
                 assert_eq!(cell(31, 37), usage_cell(step.usage.as_ref()), "usage at 31");
                 assert_eq!(cell(38, 43), duration_cell(step), "duration at 38");
@@ -2902,23 +3133,24 @@ mod tests {
 
                 let tail: Vec<char> = text(&second).chars().collect();
                 assert!(tail[..INDENT].iter().all(|c| *c == ' '), "{tail:?}");
-                assert_eq!(tail[INDENT + GATE_WIDTH], ' ', "{tail:?}");
+                assert_eq!(tail[INDENT + places], ' ', "{tail:?}");
+                assert_eq!(tail[INDENT + places + 1 + GATE_WIDTH], ' ', "{tail:?}");
             }
         }
 
-        let [judge, _] = step_lines(&steps[4], &steps, false, &theme);
         assert!(
-            text(&judge).starts_with("  123.\u{2026}"),
-            "a slot too wide for its cell is cut: {:?}",
-            text(&judge)
+            text(&judge_line(&steps, &theme)).starts_with("    try 45 \u{b7} judge"),
+            "the judge's place opens its second line: {:?}",
+            text(&judge_line(&steps, &theme))
         );
-        let [_, gate] = step_lines(&steps[5], &steps, false, &theme);
+        let [_, gate] = step_lines(&steps[5], &steps, false, theme.accent, &theme);
         assert!(
             text(&gate).contains("rejected*\u{2713}"),
             "promoted and selected both mark the gate: {:?}",
             text(&gate)
         );
-        let [_, long] = step_lines(&steps[6], &steps, false, &theme);
+        // Repair 1: beside the judge's 14-cell place the long tail wraps to its own line.
+        let long = tail_line(&steps[6], &steps, &theme).expect("a long tail beside a place wraps");
         assert!(
             text(&long).trim_end().ends_with('\u{2026}'),
             "a long agent/model is cut with `…`: {:?}",
@@ -2927,7 +3159,14 @@ mod tests {
         assert!(text(&long).contains("~-2147.5M !"), "{:?}", text(&long));
     }
 
-    /// The slot names the fan-out candidate, and the judge by `j`.
+    /// The second line of [`extremes`]'s judge.
+    fn judge_line(steps: &[RunStepSummary], theme: &Theme) -> Line<'static> {
+        let [_, second] = step_lines(&steps[4], steps, false, theme.accent, theme);
+        second
+    }
+
+    /// E10: the place names the fan-out candidates from one, and the judge by its word; a step
+    /// alone in its slot has none, and its line opens with the phase.
     #[tokio::test]
     async fn a_fanout_slot_names_its_candidates() {
         let base = feat_1_runs().await[0].steps[0].clone();
@@ -2941,24 +3180,37 @@ mod tests {
             })
             .collect();
         let theme = Theme::default();
-        let slots: Vec<String> = steps
+        let places: Vec<String> = steps
             .iter()
             .map(|step| {
-                let [first, _] = step_lines(step, &steps, false, &theme);
-                text(&first)
+                let [_, second] = step_lines(step, &steps, false, theme.accent, &theme);
+                text(&second)
                     .chars()
-                    .skip(2)
-                    .take(SLOT_WIDTH)
+                    .skip(INDENT)
+                    .take(place_width(&steps))
                     .collect::<String>()
+                    .trim_end()
+                    .to_owned()
             })
             .collect();
-        assert_eq!(slots, ["2.1/0", "2.1/1", "2.1/j"]);
+        assert_eq!(places, ["candidate 1", "candidate 2", "judge"]);
 
-        let [single, _] = step_lines(&base, std::slice::from_ref(&base), false, &theme);
+        let [single, second] = step_lines(
+            &base,
+            std::slice::from_ref(&base),
+            false,
+            theme.accent,
+            &theme,
+        );
         assert!(
-            text(&single).starts_with("  0.1   "),
-            "a step alone in its slot is `p.a`: {:?}",
+            text(&single).starts_with("  prd      "),
+            "a step alone in its slot leads with its phase: {:?}",
             text(&single)
+        );
+        assert!(
+            text(&second).starts_with("    approved"),
+            "and has no place: {:?}",
+            text(&second)
         );
     }
 
@@ -2992,29 +3244,30 @@ mod tests {
         assert!(third.ends_with('\u{2026}'), "{third:?}");
     }
 
-    /// The run grid is today's, byte for byte, and `awaiting_approval` reads `awaiting`.
+    /// The run grid (MOD-115 M4 E10): the status column holds the widest run mark, and the mode
+    /// runs under the kind and the status; `awaiting_approval` reads `⚠ needs you`.
     #[tokio::test]
     async fn the_run_lines_keep_the_run_grid() {
         let theme = Theme::default();
         let [kind, mode] = header_lines(&theme);
         assert_eq!(
             text(&kind).trim_end(),
-            "kind   status    box          started"
+            "kind   status      box          started"
         );
         assert_eq!(
             text(&mode).trim_end(),
-            "mode                          finished"
+            format!("mode{}finished", " ".repeat(28))
         );
 
         let run = feat_1_runs().await.remove(0);
         let lines = run_lines(&run, false, &theme);
         assert_eq!(
             text(&lines[0]).trim_end(),
-            "graph  done      DESKTOP-HTUI 09-02 08:00"
+            "graph  \u{25cf} done      DESKTOP-HTUI 09-02 08:00"
         );
         assert_eq!(
             text(&lines[1]).trim_end(),
-            "manual                        09-02 12:00"
+            format!("manual{}09-02 12:00", " ".repeat(26))
         );
 
         let parked = RunSummary {
@@ -3023,10 +3276,14 @@ mod tests {
             ..run
         };
         let lines = run_lines(&parked, false, &theme);
-        assert!(text(&lines[0]).starts_with("graph  awaiting  DESKTOP-HTUI"));
+        assert!(
+            text(&lines[0]).starts_with("graph  \u{26a0} needs you DESKTOP-HTUI"),
+            "{:?}",
+            text(&lines[0])
+        );
         assert_eq!(
             text(&lines[1]).trim_end(),
-            "manual                        \u{2014}"
+            format!("manual{}\u{2014}", " ".repeat(26))
         );
     }
 
@@ -3039,11 +3296,13 @@ mod tests {
             ..feat_1_runs().await[0].steps[0].clone()
         };
         assert_eq!(duration_cell(&running), "\u{2026}");
+        let theme = Theme::default();
         let [first, _] = step_lines(
             &running,
             std::slice::from_ref(&running),
             false,
-            &Theme::default(),
+            theme.accent,
+            &theme,
         );
         assert!(text(&first).ends_with("    \u{2026}"), "{:?}", text(&first));
 
@@ -3188,16 +3447,22 @@ mod tests {
             phase_name: "\u{5b9f}\u{88c5}".repeat(6),
             ..feat_1_runs().await[0].steps[0].clone()
         };
-        let [first, _] = step_lines(&step, std::slice::from_ref(&step), false, &theme);
+        let [first, _] = step_lines(
+            &step,
+            std::slice::from_ref(&step),
+            false,
+            theme.accent,
+            &theme,
+        );
         let widths: Vec<usize> = first
             .spans
             .iter()
             .map(|span| cell_width(&span.content))
             .collect();
         assert_eq!(widths.iter().sum::<usize>(), PANE, "{first:?}");
-        assert_eq!(widths[..8].iter().sum::<usize>(), 31, "{first:?}");
+        assert_eq!(widths[..6].iter().sum::<usize>(), 31, "{first:?}");
         assert_eq!(
-            first.spans[8].content.trim_start(),
+            first.spans[6].content.trim_start(),
             usage_cell(step.usage.as_ref())
         );
     }
@@ -3633,7 +3898,7 @@ mod tests {
         let _ = shell.emit.take();
 
         let drawn = lines(&pane, &shell);
-        for slot in ["1.1/0", "1.1/1", "1.1/j"] {
+        for slot in ["candidate 1", "candidate 2", "judge"] {
             assert!(
                 drawn.iter().any(|line| line.contains(slot)),
                 "`{slot}` is listed: {drawn:#?}"
@@ -3669,15 +3934,30 @@ mod tests {
         }
     }
 
-    /// The footer the pane draws under its list, then its keys (the shell's hint row since
-    /// MOD-67 M6 T2), as text: what the pane's last rows read before M6.
+    /// The footer the pane draws under its list, then its keys (the pane's hints since MOD-67 M6
+    /// T2), as text: what the pane's last rows read before M6. A question (MOD-115 M4 C7) reads
+    /// as its lines, its prompt and what is typed, then the keys on its modal's border.
     fn footer(pane: &RunsTab) -> Vec<String> {
         let theme = Theme::default();
-        pane.footer(43, &theme)
+        let mut rows: Vec<String> = pane
+            .footer(43, &theme)
             .iter()
-            .chain(pane.key_hint(Keys::compiled(), &theme).as_ref())
             .map(|line| text(line).trim_end().to_owned())
-            .collect()
+            .collect();
+        match pane.question(Keys::compiled()) {
+            Some(question) => {
+                rows.extend(question.lines.iter().cloned());
+                if let Some(field) = question.input {
+                    rows.push(field.text().unwrap_or_default().trim_end().to_owned());
+                }
+                rows.push(question.hint);
+            }
+            None => rows.extend(
+                pane.key_hint(Keys::compiled(), &theme)
+                    .map(|line| text(&line).trim_end().to_owned()),
+            ),
+        }
+        rows
     }
 
     #[tokio::test]
@@ -3831,14 +4111,19 @@ mod tests {
         assert_eq!(
             footer(&pane),
             [
-                "close FEAT-1 as done · 1 runs · 3 commit rows · summary v2",
-                "←/→ resolution · y continue · n cancel"
+                "close FEAT-1 as done · 1 run · 3 commit rows · summary v2",
+                "←/→ resolution · y next · n cancel"
             ]
         );
         pane.on_key(key(KeyCode::Char('y')), &mut shell.ctx());
         assert_eq!(
             footer(&pane),
-            ["type FEAT-1 to close it:", "Enter close · Esc cancel"]
+            [
+                "close FEAT-1 as done · 1 run · 3 commit rows · summary v2",
+                "type FEAT-1 to close it:",
+                "",
+                "Enter close · Esc cancel"
+            ]
         );
         assert!(
             shell.emit.is_empty(),
@@ -3881,7 +4166,7 @@ mod tests {
         let mut pane = warned_with(&shell, failed).await;
         assert_eq!(
             footer(&pane)[0],
-            "close FEAT-1 as withdrawn · 1 runs · 3 commit rows · summary v2"
+            "close FEAT-1 as withdrawn · 1 run · 3 commit rows · summary v2"
         );
 
         pane.on_key(key(KeyCode::Char('y')), &mut shell.ctx());
@@ -4063,8 +4348,8 @@ mod tests {
         assert_eq!(
             footer(&pane),
             [
-                "close FEAT-1 as rejected · 1 runs · 3 commit rows · summary v2",
-                "←/→ resolution · y continue · n cancel"
+                "close FEAT-1 as rejected · 1 run · 3 commit rows · summary v2",
+                "←/→ resolution · y next · n cancel"
             ]
         );
     }
@@ -4094,11 +4379,7 @@ mod tests {
             matches!(emitted.as_slice(), [Action::Error(sentence)] if sentence == NOT_THE_KEY),
             "{emitted:?}"
         );
-        assert_eq!(
-            footer(&pane)[0],
-            "type FEAT-1 to close it:",
-            "the field is cleared"
-        );
+        assert_eq!(footer(&pane)[2], "", "the field is cleared");
 
         type_text(&mut pane, &shell, "FEAT-1");
         pane.on_key(key(KeyCode::Enter), &mut shell.ctx());
@@ -4648,10 +4929,7 @@ mod tests {
         pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
         let lines = lines(&pane, &shell);
         assert!(lines[0].starts_with("graph"), "{lines:#?}");
-        assert!(
-            lines.iter().any(|line| line.contains("0.1 done")),
-            "{lines:#?}"
-        );
+        assert!(lines.iter().any(|line| line.contains("prd")), "{lines:#?}");
         assert!(
             !lines.iter().any(|line| line.contains("kind")),
             "no list header: {lines:#?}"
@@ -4669,7 +4947,49 @@ mod tests {
         pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
         let lines = lines(&pane, &shell);
         // Rows 0 and 1 are the run header (review L3).
-        assert_eq!(lines[2], NO_STEPS_YET, "{lines:#?}");
+        assert!(lines[0].starts_with("graph"), "{lines:#?}");
+        // MOD-115 M4 L-runs: the canvas under the head is an empty state, its next step under it.
+        let at = lines
+            .iter()
+            .position(|line| line.trim() == NO_STEPS_YET)
+            .unwrap_or_else(|| panic!("{lines:#?}"));
+        assert!(at >= 2, "under the head: {lines:#?}");
+        assert_eq!(lines[at + 1].trim(), NO_STEPS_NEXT, "{lines:#?}");
+    }
+
+    /// MOD-115 M4 L-runs (plan item 2): an item with no run is an empty state whose next step is
+    /// the start key in force, through the browse stack.
+    #[tokio::test]
+    async fn an_item_with_no_run_names_the_key_that_starts_one() {
+        let shell = Shell::new();
+        let mut pane = RunsTab::new();
+        pane.on_item_change(Some(ids::HTUI_ANA_2));
+        pane.on_reply(&StoreReply::Runs(Vec::new()), &mut shell.ctx());
+        let lines = lines(&pane, &shell);
+        let at = lines
+            .iter()
+            .position(|line| line.trim() == "No runs for this item.")
+            .unwrap_or_else(|| panic!("{lines:#?}"));
+        assert_eq!(lines[at + 1].trim(), "R starts one", "{lines:#?}");
+        assert_eq!(
+            no_runs_next(Keys::compiled()),
+            "R starts one",
+            "the label is the browse stack's"
+        );
+    }
+
+    /// MOD-115 M4 L-runs: with no item under the list's cursor the pane is an empty state, its next
+    /// step the list's motion.
+    #[tokio::test]
+    async fn no_item_is_an_empty_state_with_a_next_step() {
+        let shell = Shell::new();
+        let pane = RunsTab::new();
+        let lines = lines(&pane, &shell);
+        let at = lines
+            .iter()
+            .position(|line| line.trim() == "No item selected.")
+            .unwrap_or_else(|| panic!("{lines:#?}"));
+        assert_eq!(lines[at + 1].trim(), "j/k chooses one", "{lines:#?}");
     }
 
     /// MOD-28 review L3: the flow's head is the list's whole run header (the failure, a pending
@@ -4718,8 +5038,8 @@ mod tests {
         pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
         let lines = lines(&pane, &shell);
         assert!(lines[0].starts_with("graph"), "{lines:#?}");
-        assert_eq!(lines[2], "        context not carried;", "{lines:#?}");
-        assert_eq!(lines[3], "        handoff prompt only", "{lines:#?}");
+        assert_eq!(lines[2], "    context not carried;", "{lines:#?}");
+        assert_eq!(lines[3], "    handoff prompt only", "{lines:#?}");
 
         pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
         let run = pane.runs[0].clone();
@@ -4947,7 +5267,7 @@ mod tests {
 
     /// A blank canvas cell left of every node, on the `1.1` node's text row.
     fn blank_cell(lines: &[String]) -> (u16, u16) {
-        let (_, row) = cell(lines, "1.1 done");
+        let (_, row) = cell(lines, "plan");
         assert_eq!(
             lines[usize::from(row)].chars().nth(2),
             Some(' '),
@@ -5014,7 +5334,7 @@ mod tests {
     async fn a_click_on_a_node_moves_the_cursor() {
         let shell = Shell::new();
         let (mut pane, lines) = flowing(&shell).await;
-        let (column, row) = cell(&lines, "1.1 done");
+        let (column, row) = cell(&lines, "plan");
         assert_eq!(
             pane.on_mouse(
                 mouse(MouseEventKind::Down(MouseButton::Left), column, row),
@@ -5045,7 +5365,7 @@ mod tests {
     async fn a_press_outside_the_canvas_passes() {
         let shell = Shell::new();
         let (mut drawn, lines) = flowing(&shell).await;
-        let (column, row) = cell(&lines, "1.1 done");
+        let (column, row) = cell(&lines, "plan");
         let press = MouseEventKind::Down(MouseButton::Left);
         assert_eq!(
             drawn.on_mouse(mouse(press, 0, 0), &mut shell.ctx()),
@@ -5265,7 +5585,7 @@ mod tests {
     async fn right_and_middle_presses_pass() {
         let shell = Shell::new();
         let (mut pane, lines) = flowing(&shell).await;
-        let (column, row) = cell(&lines, "1.1 done");
+        let (column, row) = cell(&lines, "plan");
         for button in [MouseButton::Right, MouseButton::Middle] {
             assert_eq!(
                 pane.on_mouse(
@@ -5286,7 +5606,7 @@ mod tests {
     async fn an_event_that_changes_nothing_passes() {
         let shell = Shell::new();
         let (mut pane, lines) = flowing(&shell).await;
-        let (column, row) = cell(&lines, "1.1 done");
+        let (column, row) = cell(&lines, "plan");
         let wheel = mouse(MouseEventKind::ScrollUp, column, row);
         while pane.graph.borrow().zoom() < 2.0 - 1e-9 {
             assert_eq!(pane.on_mouse(wheel, &mut shell.ctx()), Handled::Consumed);
@@ -5298,7 +5618,7 @@ mod tests {
         );
 
         let (mut pane, lines) = flowing(&shell).await;
-        let (column, row) = cell(&lines, "1.1 done");
+        let (column, row) = cell(&lines, "plan");
         pane.on_mouse(
             mouse(MouseEventKind::Down(MouseButton::Left), column, row),
             &mut shell.ctx(),
@@ -5354,7 +5674,7 @@ mod tests {
         }
         let panned = lines(&pane, &shell);
         assert!(
-            !panned.iter().any(|line| line.contains("0.1 done")),
+            !panned.iter().any(|line| line.contains("prd")),
             "the pan took the cursor node off screen: {panned:#?}"
         );
 
@@ -5374,7 +5694,7 @@ mod tests {
             "{waiting:#?}"
         );
         assert!(
-            !waiting.iter().any(|line| line.contains("0.1 done")),
+            !waiting.iter().any(|line| line.contains("prd")),
             "the head line revealed the cursor: {waiting:#?}"
         );
     }
@@ -5384,7 +5704,7 @@ mod tests {
     async fn the_wheel_zooms_inside_the_canvas_only() {
         let shell = Shell::new();
         let (mut pane, lines) = flowing(&shell).await;
-        let (column, row) = cell(&lines, "1.1 done");
+        let (column, row) = cell(&lines, "plan");
         assert_eq!(
             pane.on_mouse(
                 mouse(MouseEventKind::ScrollUp, column, row),
@@ -5405,7 +5725,7 @@ mod tests {
     // -----------------------------------------------------------------------------------------
 
     /// `C` needs no run: an item that is done, failed or blocked with none closes out, and its
-    /// confirmation is drawn under the empty list rather than taking the keyboard unseen.
+    /// confirmation is drawn over the empty list rather than taking the keyboard unseen.
     #[tokio::test]
     async fn shift_c_on_an_item_with_no_run_shows_the_close_out() {
         let shell = Shell::new();
@@ -5426,7 +5746,12 @@ mod tests {
         pane.on_key(shift('C'), &mut shell.ctx());
         assert!(pane.captures_input(), "the close-out is open");
         let drawn = lines(&pane, &shell);
-        assert_eq!(drawn[0], "No runs for this item.", "{drawn:#?}");
+        assert!(
+            drawn
+                .iter()
+                .any(|line| line.trim() == "No runs for this item."),
+            "{drawn:#?}"
+        );
         assert_eq!(
             pane.key_hint(Keys::compiled(), &Theme::default())
                 .map(|line| line.to_string())
@@ -5443,15 +5768,15 @@ mod tests {
         assert!(
             drawn
                 .iter()
-                .any(|line| line.starts_with("close FEAT-1 as done \u{b7}")),
-            "the warning is on screen: {drawn:#?}"
+                .any(|line| line.contains("close FEAT-1 as done \u{b7}")),
+            "the warning is on screen, in its modal: {drawn:#?}"
         );
         pane.on_key(key(KeyCode::Char('y')), &mut shell.ctx());
         let drawn = lines(&pane, &shell);
         assert!(
             drawn
                 .iter()
-                .any(|line| line.starts_with("type FEAT-1 to close it:")),
+                .any(|line| line.contains("type FEAT-1 to close it:")),
             "the typed stage is on screen: {drawn:#?}"
         );
     }
@@ -5469,6 +5794,7 @@ mod tests {
                 position,
                 attempt: 1,
                 fanout_index: 0,
+                phase_name: format!("phase {position}"),
                 ..base.clone()
             })
             .collect();
@@ -5498,7 +5824,7 @@ mod tests {
         let drawn = lines(&pane, &shell);
         assert!(drawn[0].starts_with("kind"), "the header stays: {drawn:#?}");
         assert!(
-            cursor_row(&drawn).is_some_and(|line| line.contains("11.1")),
+            cursor_row(&drawn).is_some_and(|line| line.contains("phase 11")),
             "the last step is on screen with the cursor on it: {drawn:#?}"
         );
 
@@ -5509,7 +5835,7 @@ mod tests {
             "{drawn:#?}"
         );
         assert!(
-            cursor_row(&drawn).is_some_and(|line| line.contains("11.1")),
+            cursor_row(&drawn).is_some_and(|line| line.contains("phase 11")),
             "the note's footer does not cover the step it rejects: {drawn:#?}"
         );
         pane.on_key(key(KeyCode::Esc), &mut shell.ctx());
@@ -5519,7 +5845,7 @@ mod tests {
         }
         let drawn = lines(&pane, &shell);
         assert!(
-            cursor_row(&drawn).is_some_and(|line| line.contains("0.1")),
+            cursor_row(&drawn).is_some_and(|line| line.contains("phase 0 ")),
             "and back up to the first: {drawn:#?}"
         );
     }
@@ -5728,11 +6054,11 @@ mod tests {
         // RV1 H2: the warning's hint names the resolution keys in force.
         assert_eq!(
             shell.keys.hint(pane.stack(), pane.hint_spec()),
-            "\u{2190}/Ctrl+n resolution \u{b7} y continue \u{b7} n cancel"
+            "\u{2190}/Ctrl+n resolution \u{b7} y next \u{b7} n cancel"
         );
         assert_eq!(
             Keys::compiled().hint(pane.stack(), pane.hint_spec()),
-            "\u{2190}/\u{2192} resolution \u{b7} y continue \u{b7} n cancel"
+            "\u{2190}/\u{2192} resolution \u{b7} y next \u{b7} n cancel"
         );
         let before = footer(&pane);
         pane.on_key(key(KeyCode::Char('l')), &mut shell.ctx());
@@ -5759,7 +6085,7 @@ mod tests {
         let mut pane = warned(&shell).await;
         assert_eq!(
             shell.keys.hint(pane.stack(), pane.hint_spec()),
-            "\u{2190}/\u{2192} resolution \u{b7} Space continue \u{b7} n cancel"
+            "\u{2190}/\u{2192} resolution \u{b7} Space next \u{b7} n cancel"
         );
         let resolution = picked(&pane);
         assert_eq!(
@@ -5772,7 +6098,7 @@ mod tests {
                 Mode::CloseOut(CloseOutStage::Typed { preview, .. })
                     if preview.resolution == resolution
             ),
-            "Space continues: {:?}",
+            "Space nexts: {:?}",
             pane.mode
         );
     }
@@ -6712,5 +7038,565 @@ mod tests {
                 "{user_move}: the reply keeps the user's cursor"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // MOD-115 M4 L-runs: the step in words (E10), the marks in their columns (D-18), the
+    // questions as kit modals (C7), the accents (E9) and the chord pressed (MD-A).
+    // -----------------------------------------------------------------------------------------
+
+    /// The fixture's first step at `(position, attempt, fanout_index)`, with a fresh id.
+    async fn at_slot(position: i32, attempt: i32, fanout_index: i32) -> RunStepSummary {
+        RunStepSummary {
+            id: StepId::new(),
+            position,
+            attempt,
+            fanout_index,
+            ..feat_1_runs().await[0].steps[0].clone()
+        }
+    }
+
+    /// A fan-out slot at `(2, attempt)`: two candidates and their judge.
+    async fn fanned_out(attempt: i32) -> Vec<RunStepSummary> {
+        vec![
+            at_slot(2, attempt, 0).await,
+            at_slot(2, attempt, 1).await,
+            at_slot(2, attempt, -1).await,
+        ]
+    }
+
+    /// E10: a step's place reads in words for every slot shape: nothing for a plain first try,
+    /// `try n` past the first attempt, `candidate n` (counted from one) in a fan-out slot and
+    /// `judge` for its judge, the try first when there are both. Its position is the row order.
+    #[tokio::test]
+    async fn every_slot_shape_reads_its_place_in_words() {
+        let plain = at_slot(0, 1, 0).await;
+        assert_eq!(place(&plain, std::slice::from_ref(&plain)), "");
+        let retried = at_slot(0, 2, 0).await;
+        assert_eq!(place(&retried, std::slice::from_ref(&retried)), "try 2");
+
+        let slot = fanned_out(1).await;
+        let places: Vec<String> = slot.iter().map(|step| place(step, &slot)).collect();
+        assert_eq!(places, ["candidate 1", "candidate 2", "judge"]);
+
+        let again = fanned_out(3).await;
+        let places: Vec<String> = again.iter().map(|step| place(step, &again)).collect();
+        assert_eq!(
+            places,
+            [
+                "try 3 \u{b7} candidate 1",
+                "try 3 \u{b7} candidate 2",
+                "try 3 \u{b7} judge"
+            ]
+        );
+        assert!(
+            places.iter().all(|place| !place.contains('/')),
+            "no slot id is left: {places:?}"
+        );
+    }
+
+    /// E10: the step's name, its phase, leads its first line, and its second line opens with
+    /// its place in a column as wide as its run's widest place, so a fan-out's gates line up; a
+    /// run with no place opens the second line with the gate.
+    #[tokio::test]
+    async fn the_phase_leads_and_the_second_line_opens_with_the_place() {
+        let theme = Theme::default();
+        let slot = fanned_out(1).await;
+        let lines: Vec<[String; 2]> = slot
+            .iter()
+            .map(|step| step_lines(step, &slot, false, theme.accent, &theme).map(|l| text(&l)))
+            .collect();
+        assert!(lines[0][0].starts_with("  prd "), "{:?}", lines[0][0]);
+        assert!(
+            lines[0][1].starts_with("    candidate 1 approved"),
+            "{:?}",
+            lines[0][1]
+        );
+        assert!(
+            lines[2][1].starts_with("    judge       approved"),
+            "{:?}",
+            lines[2][1]
+        );
+        let gates: Vec<Option<usize>> = lines
+            .iter()
+            .map(|[_, second]| column(second, "approved"))
+            .collect();
+        assert!(gates.iter().all(|gate| *gate == gates[0]), "{gates:?}");
+
+        let plain = at_slot(0, 1, 0).await;
+        let [_, second] = step_lines(
+            &plain,
+            std::slice::from_ref(&plain),
+            false,
+            theme.accent,
+            &theme,
+        );
+        assert!(
+            text(&second).starts_with("    approved "),
+            "{:?}",
+            text(&second)
+        );
+    }
+
+    /// `fanned_out(attempt)` with `who` as every step's agent/model and the `~36k !` indicator
+    /// when `figure`.
+    async fn fanned_out_by(attempt: i32, model: &str, figure: bool) -> Vec<RunStepSummary> {
+        let mut slot = fanned_out(attempt).await;
+        for step in &mut slot {
+            step.agent_name = Some("claude".to_owned());
+            step.model = Some(model.to_owned());
+            step.prompt_tokens = figure.then_some(35_988);
+            step.trimmed = figure;
+        }
+        slot
+    }
+
+    /// A step's lines as the list draws them: [`step_lines`], then the wrapped tail if any.
+    fn drawn(step: &RunStepSummary, slot: &[RunStepSummary], theme: &Theme) -> Vec<String> {
+        let [first, second] = step_lines(step, slot, false, theme.accent, theme);
+        let mut lines = vec![first, second];
+        lines.extend(tail_line(step, slot, theme));
+        for line in &lines {
+            assert_eq!(line.width(), PANE, "{:?} is not {PANE} wide", text(line));
+        }
+        lines.iter().map(text).collect()
+    }
+
+    /// Repair 1 (review): no slot shape cuts its place or its tail. A retried fan-out's place
+    /// (`try 2 \u{b7} candidate 1`, 19 cells) reads whole, so its candidates stay told apart; a
+    /// tail that does not fit whole beside the place and the gate (`~36k ! claude/opus`, whole
+    /// at the old fixed 24 cells) wraps to a line of its own under the place, whole.
+    #[tokio::test]
+    async fn a_fanout_keeps_its_place_and_its_tail_whole() {
+        let theme = Theme::default();
+        for attempt in [1, 2, 12] {
+            let slot = fanned_out_by(attempt, "claude-opus", true).await;
+            for step in &slot {
+                let lines = drawn(step, &slot, &theme);
+                let whole = place(step, &slot);
+                assert!(
+                    lines[1].starts_with(&format!("    {whole} ")),
+                    "the place whole: {lines:#?}"
+                );
+                assert_eq!(tail(step), "~36k ! claude/opus");
+                assert!(
+                    lines.iter().any(|line| line.contains("~36k ! claude/opus")),
+                    "the tail whole: {lines:#?}"
+                );
+                assert!(
+                    lines.iter().all(|line| !line.contains('\u{2026}')),
+                    "nothing is cut: {lines:#?}"
+                );
+            }
+        }
+    }
+
+    /// Repair 1: a tail that fits beside the place stays on the place's line (two lines, as
+    /// before the port), and a step with no place never wraps: its tail has the line's 28 cells.
+    #[tokio::test]
+    async fn a_tail_wraps_only_beside_a_place_it_does_not_fit() {
+        let theme = Theme::default();
+        let slot = fanned_out_by(1, "claude-opus", false).await;
+        let lines = drawn(&slot[0], &slot, &theme);
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        assert!(lines[1].contains("claude/opus"), "{lines:#?}");
+
+        let wide = fanned_out_by(1, "claude-opus", true).await;
+        let lines = drawn(&wide[0], &wide, &theme);
+        assert_eq!(lines.len(), 3, "{lines:#?}");
+        assert!(
+            lines[2].starts_with("    ~36k ! claude/opus"),
+            "under the place: {lines:#?}"
+        );
+        assert!(
+            !lines[1].contains("claude"),
+            "not twice, nor cut on the place's line: {lines:#?}"
+        );
+
+        let mut plain = at_slot(0, 1, 0).await;
+        plain.agent_name = Some(LONG_AGENT.to_owned());
+        plain.model = Some(LONG_MODEL.to_owned());
+        let lines = drawn(&plain, std::slice::from_ref(&plain), &theme);
+        assert_eq!(lines.len(), 2, "no place, no wrap: {lines:#?}");
+    }
+
+    /// D-18, E10: every step status reads its mark (glyph and word) whole in the status column,
+    /// `↷ superseded` being the widest, and both of every step's lines stay the pane's 43 cells:
+    /// the phase at 2, the mark at 18, the usage at 31 and the duration at 38.
+    #[tokio::test]
+    async fn every_step_status_mark_fits_its_column() {
+        let theme = Theme::default();
+        let base = feat_1_runs().await[0].steps[0].clone();
+        let widest = StepStatus::ALL
+            .iter()
+            .map(|&status| {
+                let mark = label::step_status(status);
+                cell_width(mark.glyph) + 1 + cell_width(mark.word)
+            })
+            .max();
+        assert_eq!(widest, Some(STATUS_WIDTH), "the column is the widest mark");
+        for &status in StepStatus::ALL {
+            let mark = label::step_status(status);
+            let step = RunStepSummary {
+                status,
+                ..base.clone()
+            };
+            for on_cursor in [false, true] {
+                let lines = step_lines(
+                    &step,
+                    std::slice::from_ref(&step),
+                    on_cursor,
+                    theme.accent,
+                    &theme,
+                );
+                for line in &lines {
+                    assert_eq!(line.width(), PANE, "{status}: {:?}", text(line));
+                }
+                let chars: Vec<char> = text(&lines[0]).chars().collect();
+                let cell = |from: usize, to: usize| -> String {
+                    chars[from..to].iter().collect::<String>().trim().to_owned()
+                };
+                assert_eq!(cell(2, 17), "prd", "{status}");
+                assert_eq!(
+                    cell(18, 30),
+                    format!("{} {}", mark.glyph, mark.word),
+                    "{status}"
+                );
+                assert_eq!(cell(31, 37), usage_cell(step.usage.as_ref()), "{status}");
+                assert_eq!(cell(38, 43), duration_cell(&step), "{status}");
+                assert!(
+                    !text(&lines[0]).contains(status.as_str()) || status.as_str() == mark.word,
+                    "no raw status: {:?}",
+                    text(&lines[0])
+                );
+            }
+        }
+    }
+
+    /// E10: a run reads its status mark and its kind and mode as words, and its two grid lines
+    /// are the pane's 43 cells for every status, kind and mode (`⚠ needs you`, `automatic`).
+    #[tokio::test]
+    async fn every_run_status_kind_and_mode_reads_as_words() {
+        let theme = Theme::default();
+        let run = feat_1_runs().await.remove(0);
+        for &status in RunStatus::ALL {
+            for &kind in RunKind::ALL {
+                for &mode in RunMode::ALL {
+                    let lines = run_lines(
+                        &RunSummary {
+                            status,
+                            kind,
+                            mode,
+                            ..run.clone()
+                        },
+                        false,
+                        &theme,
+                    );
+                    let mark = label::run_status(status);
+                    for line in &lines[..2] {
+                        assert_eq!(line.width(), PANE, "{:?}", text(line));
+                    }
+                    let first = text(&lines[0]);
+                    assert!(first.starts_with(label::run_kind(kind)), "{first:?}");
+                    assert!(
+                        first.contains(&format!(" {} {} ", mark.glyph, mark.word)),
+                        "{first:?}"
+                    );
+                    assert!(
+                        text(&lines[1]).starts_with(label::run_mode(mode)),
+                        "{:?}",
+                        text(&lines[1])
+                    );
+                }
+            }
+        }
+    }
+
+    /// E10: the gate cell reads the outcome's word, then `*` for a promoted step and `✓` for a
+    /// selected one; no outcome yet is `—`.
+    #[tokio::test]
+    async fn the_gate_cell_reads_the_outcome_in_words() {
+        let base = feat_1_runs().await[0].steps[0].clone();
+        for &outcome in GateOutcome::ALL {
+            let step = RunStepSummary {
+                gate_outcome: Some(outcome),
+                promoted_at: Some(demo_at(1, 0)),
+                selected: Some(true),
+                ..base.clone()
+            };
+            assert_eq!(
+                gate(&step),
+                format!("{}*\u{2713}", label::gate_outcome(outcome))
+            );
+            assert!(cell_width(&gate(&step)) <= GATE_WIDTH);
+        }
+        let open = RunStepSummary {
+            gate_outcome: None,
+            ..base
+        };
+        assert_eq!(gate(&open), PENDING);
+    }
+
+    /// E10: the close-out's summary names the resolution's word and counts with `plural`: never
+    /// `1 runs` or `1 commit rows`.
+    #[test]
+    fn the_close_out_summary_counts_in_words() {
+        assert_eq!(
+            close_out_summary(&preview()),
+            "close FEAT-1 as done \u{b7} 1 run \u{b7} 3 commit rows \u{b7} summary v2"
+        );
+        let other = Preview {
+            resolution: Resolution::Duplicate,
+            runs: 2,
+            rows: 1,
+            ..preview()
+        };
+        assert_eq!(
+            close_out_summary(&other),
+            "close FEAT-1 as duplicate \u{b7} 2 runs \u{b7} 1 commit row \u{b7} summary v2"
+        );
+    }
+
+    /// The pane drawn at `width` x `height`, one `String` per row, trailing blanks trimmed.
+    fn drawn_at(pane: &RunsTab, shell: &Shell, width: u16, height: u16) -> Vec<String> {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+            .expect("the test backend is constructible");
+        term.draw(|frame| pane.render(frame, frame.area(), &shell.ctx()))
+            .expect("the pane draws");
+        let buffer = term.backend().buffer();
+        (buffer.area.top()..buffer.area.bottom())
+            .map(|y| {
+                let row: String = (buffer.area.left()..buffer.area.right())
+                    .map(|x| buffer[(x, y)].symbol().to_owned())
+                    .collect();
+                row.trim_end().to_owned()
+            })
+            .collect()
+    }
+
+    /// The question box titled `title` in `rows`: its rows inside the borders, joined, and its
+    /// bottom border.
+    fn asked(rows: &[String], title: &str) -> (String, String) {
+        let top = rows
+            .iter()
+            .position(|row| row.contains(&format!("\u{256d} {title} ")))
+            .unwrap_or_else(|| panic!("no `{title}` box: {rows:#?}"));
+        let bottom = top
+            + rows[top..]
+                .iter()
+                .position(|row| row.contains('\u{2570}'))
+                .unwrap_or_else(|| panic!("the `{title}` box is closed: {rows:#?}"));
+        (rows[top + 1..bottom].join(" "), rows[bottom].clone())
+    }
+
+    /// C7: the close-out's warning is a kit question over the Runs content: its summary inside
+    /// the box, its keys on the box's bottom border whole at the pane's 43 columns, and none on
+    /// the pane, nor a footer row under the list.
+    #[tokio::test]
+    async fn the_close_out_warning_asks_in_a_modal() {
+        let shell = Shell::new();
+        let pane = warned(&shell).await;
+        let rows = drawn_at(&pane, &shell, PANE_WIDTH, 20);
+        let (inside, border) = asked(&rows, "Close out");
+        assert!(
+            inside.contains("close FEAT-1 as done") && inside.contains("commit rows"),
+            "{rows:#?}"
+        );
+        assert!(
+            border.contains("\u{2190}/\u{2192} resolution \u{b7} y next \u{b7} n cancel"),
+            "the keys, whole, on the border: {border:?}"
+        );
+        assert!(pane.key_hint(Keys::compiled(), &shell.theme).is_none());
+        assert!(pane.footer(PANE_WIDTH, &shell.theme).is_empty());
+        assert!(
+            rows.iter().any(|row| row.contains("kind   status")),
+            "the list stays under it: {rows:#?}"
+        );
+    }
+
+    /// C7: the typed stage asks for the key in the same box: the summary, then the line naming the
+    /// key and what is typed on its own row, `field.submit`'s keys on its border.
+    #[tokio::test]
+    async fn the_typed_close_out_asks_for_the_key_in_the_modal() {
+        let shell = Shell::new();
+        let mut pane = warned(&shell).await;
+        pane.on_key(key(KeyCode::Char('y')), &mut shell.ctx());
+        type_text(&mut pane, &shell, "FEAT");
+        let rows = drawn_at(&pane, &shell, PANE_WIDTH, 20);
+        let (inside, border) = asked(&rows, "Close out");
+        assert!(inside.contains("close FEAT-1 as done"), "{rows:#?}");
+        assert!(inside.contains("type FEAT-1 to close it:"), "{rows:#?}");
+        // What is typed is on its own row, the whole content width (MOD-81).
+        assert!(
+            rows.iter()
+                .any(|row| row.split('\u{2502}').any(|cell| cell.trim() == "FEAT")),
+            "{rows:#?}"
+        );
+        assert!(
+            border.contains("Enter close \u{b7} Esc cancel"),
+            "{border:?}"
+        );
+        assert!(pane.key_hint(Keys::compiled(), &shell.theme).is_none());
+    }
+
+    /// C7: `c` asks whether to cancel the run in a kit question, its answers on the border.
+    #[tokio::test]
+    async fn the_cancel_question_is_a_modal() {
+        let shell = Shell::new();
+        let (mut pane, _) = driven(&shell, true).await;
+        pane.on_key(key(KeyCode::Char('c')), &mut shell.ctx());
+        let rows = drawn_at(&pane, &shell, PANE_WIDTH, 20);
+        let (inside, border) = asked(&rows, "Cancel run");
+        assert!(inside.contains("cancel this run?"), "{rows:#?}");
+        assert!(
+            border.contains("y cancel it \u{b7} n keep it"),
+            "{border:?}"
+        );
+        assert!(pane.key_hint(Keys::compiled(), &shell.theme).is_none());
+    }
+
+    /// The questions name their keys through the keys in force: a rebound `confirm.yes` is on
+    /// the border.
+    #[tokio::test]
+    async fn the_questions_name_a_rebound_answer() {
+        let shell = Shell::new();
+        let (mut pane, _) = driven(&shell, true).await;
+        pane.on_key(key(KeyCode::Char('c')), &mut shell.ctx());
+        let rebound =
+            crate::keys::load_str("version = 2\n[confirm]\nyes = \"Y\"\n").expect("loads");
+        let question = pane.question(&rebound).expect("the cancel question");
+        assert_eq!(question.hint, "Y cancel it \u{b7} n keep it");
+    }
+
+    /// E9 (MOD-85): the run entry under the cursor (a run with no step) is the selection band
+    /// on its kind cell, legible without colour; the other cells keep their roles.
+    #[tokio::test]
+    async fn the_run_entry_cursor_is_the_band_on_its_kind_cell() {
+        use ratatui::style::Modifier;
+
+        let shell = Shell::new();
+        let mut runs = feat_1_runs().await;
+        runs[0].steps.clear();
+        let mut pane = RunsTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.on_reply(&StoreReply::Runs(runs), &mut shell.ctx());
+        let _ = shell.emit.take();
+        let theme = Theme::monochrome();
+        let (lines, _) = pane.list_lines(Keys::compiled(), &theme);
+        let kind = &lines[0].spans[0];
+        assert_eq!(kind.content.trim(), "graph");
+        assert!(
+            kind.style.add_modifier.contains(Modifier::REVERSED),
+            "{kind:?}"
+        );
+        assert!(
+            !lines[0].spans[2]
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "only the kind cell"
+        );
+    }
+
+    /// E9 (MOD-85): the step under the cursor marks its `▸` and its name in the tab's accent
+    /// (focus), the glyph carrying it without colour; the other steps' names stay dim.
+    #[tokio::test]
+    async fn the_step_cursor_takes_the_tab_accent_beside_its_mark() {
+        let theme = Theme::default();
+        let accent = Style::new().fg(ratatui::style::Color::Magenta);
+        let step = feat_1_runs().await[0].steps[0].clone();
+        let [on, _] = step_lines(&step, std::slice::from_ref(&step), true, accent, &theme);
+        assert_eq!(on.spans[0].content, CURSOR);
+        assert_eq!(on.spans[0].style, accent);
+        assert_eq!(on.spans[2].content.trim(), "prd");
+        assert_eq!(on.spans[2].style, accent);
+        let [off, _] = step_lines(&step, std::slice::from_ref(&step), false, accent, &theme);
+        assert_eq!(off.spans[0].content, " ");
+        assert_eq!(off.spans[2].style, theme.dim);
+    }
+
+    /// E9 (MOD-85) in monochrome: the step cursor still reads with no colour, the `▸` glyph and the
+    /// tab accent's modifier on the name, against the dim names of the other steps.
+    #[tokio::test]
+    async fn the_step_cursor_reads_without_colour() {
+        use ratatui::style::Modifier;
+
+        let theme = Theme::monochrome();
+        let accent = theme.tab_accent("backlog");
+        assert_eq!(
+            (accent.fg, accent.bg),
+            (None, None),
+            "no colour: {accent:?}"
+        );
+        let step = feat_1_runs().await[0].steps[0].clone();
+        let [on, _] = step_lines(&step, std::slice::from_ref(&step), true, accent, &theme);
+        assert_eq!(on.spans[0].content, CURSOR);
+        assert_eq!(on.spans[2].content.trim(), "prd");
+        assert_eq!(on.spans[2].style, accent);
+        assert!(
+            on.spans[2].style.add_modifier.contains(Modifier::BOLD),
+            "{:?}",
+            on.spans[2].style
+        );
+        let [off, _] = step_lines(&step, std::slice::from_ref(&step), false, accent, &theme);
+        assert_eq!(off.spans[0].content, " ");
+        assert_eq!(off.spans[2].style, theme.dim);
+        assert_ne!(
+            on.spans[2].style, off.spans[2].style,
+            "the cursor stands out"
+        );
+    }
+
+    /// MD-A: a field mode resolves what it passes from the chord pressed (`Ctx::pressed`): a
+    /// pressed `ctrl-n` the shell delivered as `Down` passes, a pressed `Down` is swallowed; so
+    /// the warning reads its acts from the pressed chord (a pressed `ctrl-b` delivered as `Left`
+    /// picks no resolution).
+    #[tokio::test]
+    async fn the_modes_resolve_from_the_chord_pressed() {
+        let shell = Shell::new();
+        let chord = |spec: &str| KeyChord::parse_strict(spec).expect("a valid spec");
+        let down = key(KeyCode::Down);
+        for opener in [key(KeyCode::Char('x')), key(KeyCode::Char('i'))] {
+            let (mut pane, _) = driven(&shell, true).await;
+            if opener.code == KeyCode::Char('i') {
+                let mut runs = pane.runs.clone();
+                runs[0].steps[0].status = StepStatus::Running;
+                pane.on_reply(&StoreReply::Runs(runs), &mut shell.ctx());
+            }
+            pane.on_key(opener, &mut shell.ctx());
+            let _ = shell.emit.take();
+            assert!(pane.captures_input(), "{opener:?} opens a field");
+            assert_eq!(
+                pane.on_key(down, &mut shell.ctx().with_pressed(down, chord("ctrl-n"))),
+                Handled::Pass,
+                "{opener:?}"
+            );
+            assert_eq!(
+                pane.on_key(down, &mut shell.ctx().with_pressed(down, chord("down"))),
+                Handled::Consumed,
+                "{opener:?}"
+            );
+        }
+
+        let mut pane = warned(&shell).await;
+        pane.on_key(key(KeyCode::Char('y')), &mut shell.ctx());
+        assert_eq!(
+            pane.on_key(down, &mut shell.ctx().with_pressed(down, chord("ctrl-n"))),
+            Handled::Pass,
+            "the typed key's field"
+        );
+
+        let mut pane = warned(&shell).await;
+        let left = key(KeyCode::Left);
+        assert_eq!(
+            pane.on_key(left, &mut shell.ctx().with_pressed(left, chord("ctrl-b"))),
+            Handled::Pass
+        );
+        assert_eq!(picked(&pane), Resolution::Done, "no resolution was picked");
+        assert_eq!(
+            pane.on_key(left, &mut shell.ctx().with_pressed(left, chord("left"))),
+            Handled::Consumed
+        );
+        assert_eq!(picked(&pane), Resolution::Duplicate);
     }
 }

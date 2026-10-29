@@ -49,7 +49,6 @@ const KIT: &str = "ui/kit/";
 /// `src/ui` and `src/app`, which RV1 L7 checked when it widened the scan to the whole of `src`).
 const GROUP_B: &[(&str, &str)] = &[
     ("ui/tabs/backlog/detail/compose.rs", "Backlog"),
-    ("ui/tabs/backlog/detail/runs/execution_graph.rs", "Backlog"),
 ];
 
 /// Whether `name` (relative to `src/`) is `prefix`, or under it when `prefix` ends in `/`.
