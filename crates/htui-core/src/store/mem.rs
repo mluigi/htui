@@ -13593,7 +13593,7 @@ mod tests {
     // refusal and — for the five transactions of plan D6 — that a refusal leaves no half-written
     // row behind.
 
-    /// A snapshot with no phases: enough to prove the column is written and decodes at `v = 1`.
+    /// A snapshot with no phases: enough to prove the column is written and decodes at `GraphSnapshot::V`.
     fn test_snapshot() -> GraphSnapshot {
         GraphSnapshot {
             v: GraphSnapshot::V,

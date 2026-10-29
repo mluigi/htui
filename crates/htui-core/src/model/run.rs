@@ -995,8 +995,9 @@ pub fn sort_snapshot_edges(edges: &mut [SnapshotEdge], phases: &[SnapshotPhase])
 }
 
 /// MOD-138 D4: [`crate::seed::default_edge_plan`] over `(position, name, retry_limit)` of
-/// `phases`, by key, in [`sort_snapshot_edges`] order. The v1 lift and D6(c)'s "are these the
-/// default edges" both read it.
+/// `phases`, by key, in [`sort_snapshot_edges`] order. The v1 lift reads it. D6(c)
+/// (`htui_orch::graph::not_yet_runnable`) applies the same `default_edge_plan` rule through
+/// [`crate::seed::default_edges`] over the non-palette rows (A5).
 #[must_use]
 pub fn default_snapshot_edges(phases: &[SnapshotPhase]) -> Vec<SnapshotEdge> {
     let projection: Vec<(i32, &str, i32)> = phases

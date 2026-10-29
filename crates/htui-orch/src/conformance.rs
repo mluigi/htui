@@ -467,9 +467,10 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// starts no attempt, a batch run's session is cut at the batch's remainder, a manual run reads no
 /// batch figure, and the run cap spans steps.
 ///
-/// **Five for MOD-138 M1** (plan D5): a v2 run is pinned, so a live edit parks it on none of the
-/// three resume paths (mid-walk, adopted `running`, handed back); a v2 snapshot that no longer
-/// hashes to its own `topology` parks with both digests; and a v1 run whose live graph M1 refuses
+/// **Six for MOD-138 M1** (plan D5, blueprint A6): a v2 run is pinned, so a live edit parks it on
+/// none of the three resume paths (mid-walk, adopted `running`, handed back); a v2 snapshot that
+/// no longer hashes to its own `topology` parks with both digests; a v1 run whose live graph
+/// gained a non-default edge walks on; and a v1 run on a refused live graph whose phases changed
 /// parks with the topology note.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
@@ -1127,7 +1128,7 @@ fn spend_guard_case<'a, H: CaseHarness>(
     })
 }
 
-/// MOD-138 M1's five pinned-resume cases (plan D5), boxed for [`case`]'s reason.
+/// MOD-138 M1's six pinned-resume cases (plan D5), boxed for [`case`]'s reason.
 fn pinned_resume_case<'a, H: CaseHarness>(
     name: &str,
     harness: &'a H,

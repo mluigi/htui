@@ -3158,8 +3158,10 @@ where
     /// A **v1** run re-resolves the item's **live** graph and compares its v2 digest with the
     /// lifted snapshot's. On a mismatch the walk is not advanced and an `item_note` records both
     /// digests; invariant 2 means the run *could* keep walking its snapshot, and §4.9 says the
-    /// divergence is a human's decision rather than the engine's. A live graph M1 refuses as not
-    /// yet runnable or invalid (D6, D9) is such a mismatch.
+    /// divergence is a human's decision rather than the engine's. A live graph M1 refuses (D6, D9)
+    /// once its phases are built is compared on the v1 phase-only digest (blueprint A6): equal
+    /// walks on, different is such a mismatch. One refused before any phase could be built is a
+    /// mismatch.
     ///
     /// A v1 run's live graph that **refuses to resolve** for a reason that is a rule about starting a run —
     /// a cap an app setting lowered since (plan D63), a phase fanned out where it may not (D64,

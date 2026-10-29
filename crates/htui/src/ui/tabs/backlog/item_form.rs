@@ -935,7 +935,8 @@ impl ItemForm {
 
     /// The graph picker's options: the kind default, the graphs the project may use (its own, then
     /// a workspace's, then the library's; MOD-138 D12), then on an edit the item's own graph when
-    /// it is not among them (an override, A3).
+    /// it is not among them: an override (A3), or a workspace graph the item kept after its project
+    /// left the workspace.
     fn graph_options(&self) -> Vec<Option<StepGraphId>> {
         let mut options = vec![None];
         options.extend(self.context.graphs.iter().map(|graph| Some(graph.id)));
