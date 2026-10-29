@@ -2499,8 +2499,12 @@ async fn the_new_item_form_renders_in_the_detail_pane() {
     type_text(&mut harness, "Fresh item");
     let frame = harness.render();
     assert!(frame.contains(" New item \u{b7} htui "), "{frame}");
-    assert!(frame.contains("> title"), "the focus is on Title:\n{frame}");
-    assert!(frame.contains("\u{2039}ANA "), "the hinted kind:\n{frame}");
+    // MOD-115 M4 L-forms: the focused row carries the kit gutter (and band).
+    assert!(
+        frame.contains("\u{258c}title "),
+        "the focus is on Title:\n{frame}"
+    );
+    assert!(frame.contains("\u{2039} ANA "), "the hinted kind:\n{frame}");
     assert!(frame.contains("kind default"), "{frame}");
     insta::assert_snapshot!("item_form_new", frame);
 }
@@ -2513,7 +2517,7 @@ async fn the_edit_item_form_renders_in_the_detail_pane() {
     let frame = harness.render();
     assert!(frame.contains(" Edit ANA-1 (v1) "), "{frame}");
     assert!(
-        !frame.contains("project  \u{2039}"),
+        !frame.contains(" project    \u{2039}"),
         "an edit has no project row:\n{frame}"
     );
     insta::assert_snapshot!("item_form_edit", frame);

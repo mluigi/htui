@@ -4,24 +4,24 @@ expression: frame
 ---
 Platform   ¹Backlog            1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ Edit ANA-1 (v1) ─────────────────────────╮
-│ ▾ htui (8)                                          ││  kind     ‹ANA analysis›                  │
-│▌ ANA-1    ● done       Data model, box registry and…││> title    …box registry and sync topology │
-│  ANA-2    ○ open       Orchestrator step graphs and…││  priority 0                               │
-│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││  tags                                     │
-│  FEAT-1   ◐ running    TUI scaffold                 ││  graph    ‹kind default›                  │
-│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││  paths (one per line)                     │
+│ ▾ htui (8)                                          ││ kind       ‹ ANA analysis ›               │
+│▌ ANA-1    ● done       Data model, box registry and…││▌title      …ox registry and sync topology │
+│  ANA-2    ○ open       Orchestrator step graphs and…││ priority   0                              │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││ tags                                      │
+│  FEAT-1   ◐ running    TUI scaffold                 ││ graph      ‹ kind default ›               │
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││ paths (one per line)                      │
 │  FEAT-3   ◌ queued     Postgres store and cache     ││                                           │
 │  FIX-1    ✓ closed     Terminal left raw after panic││                                           │
 │  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││                                           │
-│ ▾ agy (3)                                           ││  body                                     │
-│  ANA-1    ● done       Prompt assembly survey       ││The store seam is the one interface every o│
+│ ▾ agy (3)                                           ││ body                                      │
+│  ANA-1    ● done       Prompt assembly survey       ││ The store seam is the one interface every │
 │  FEAT-1   ○ open       ACP transport upgrade        ││                                           │
-│  FIX-1    ○ open       Session leak on cancel       ││Postgres holds the truth; every box keeps a│
-│                                                     ││compare-and-set on a version column, so a l│
-│                                                     ││than silently dropped.                     │
+│  FIX-1    ○ open       Session leak on cancel       ││ Postgres holds the truth; every box keeps │
+│                                                     ││ compare-and-set on a version column, so a │
+│                                                     ││ than silently dropped.                    │
 │                                                     ││                                           │
-│                                                     ││Item keys are minted from a per-project cou│
-│                                                     ││legacy importer align the counter above the│
+│                                                     ││ Item keys are minted from a per-project co│
+│                                                     ││ legacy importer align the counter above th│
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
