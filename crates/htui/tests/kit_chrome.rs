@@ -48,7 +48,6 @@ const KIT: &str = "ui/kit/";
 /// `src` outside group A and the kit, less the [`OWN_BLOCK`] name collisions (all of them under
 /// `src/ui` and `src/app`, which RV1 L7 checked when it widened the scan to the whole of `src`).
 const GROUP_B: &[(&str, &str)] = &[
-    ("ui/tabs/backlog/detail/compose.rs", "Backlog"),
 ];
 
 /// Whether `name` (relative to `src/`) is `prefix`, or under it when `prefix` ends in `/`.

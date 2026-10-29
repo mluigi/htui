@@ -5,9 +5,9 @@ expression: frame
 Platform   ¹Backlog            1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ FEAT-1 · TUI scaffold ────‹ Docs  Notes ›╮
 │ ▾ htui (8)                                          ││ New version of plan (from v2) ────────────│
-│  ANA-1    ● done       Data model, box registry and…││  kind   plan                              │
-│  ANA-2    ○ open       Orchestrator step graphs and…││  title  Plan: TUI scaffold (revised)      │
-│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││> body                                     │
+│  ANA-1    ● done       Data model, box registry and…││ kind    plan                              │
+│  ANA-2    ○ open       Orchestrator step graphs and…││ title   Plan: TUI scaffold (revised)      │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││▌body                                      │
 │▌ FEAT-1   ◐ running    TUI scaffold                 ││# Plan: TUI scaffold (revised)             │
 │  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││                                           │
 │  FEAT-3   ◌ queued     Postgres store and cache     ││Demo body for the plan document, version 2.│

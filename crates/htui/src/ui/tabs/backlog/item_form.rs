@@ -1022,11 +1022,6 @@ impl ItemForm {
     }
 }
 
-/// The two-cell focus marker, so focus shows in a text snapshot.
-pub(super) const fn marker(focused: bool) -> &'static str {
-    if focused { "> " } else { "  " }
-}
-
 impl ItemForm {
     /// The focused field's keys for the shell's hint row (MOD-67 M5 D9, M6 T2), through
     /// [`views::ITEM_FORM`]: the pickers', the one-line fields' or the text areas'.
