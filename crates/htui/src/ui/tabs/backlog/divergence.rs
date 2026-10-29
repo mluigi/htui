@@ -22,7 +22,6 @@
 
 use core::cell::Cell;
 
-use crossterm::event::KeyEvent;
 use htui_core::model::item_merge::{self, FieldState, Side, SpecField, SpecMerge};
 use htui_core::model::item_spec;
 use htui_core::model::{Item, ItemKindId, ItemSpec, StepGraphId};
@@ -262,9 +261,11 @@ impl Divergence {
     /// `t`/`m` (or `T`/`M`) resolve, `Tab`/`BackTab` switch the diffs (when both texts differ),
     /// `j`/`k`/arrows/`PageDown`/`PageUp` scroll them. Anything else is swallowed, except what the
     /// modal layer passes (CONTROL, ALT, function keys), `Ctrl+S` included: nothing binds it here.
-    pub fn on_key(&mut self, key: KeyEvent, keys: &Keys) -> ViewOutcome {
+    ///
+    /// MOD-115 M4 MD-A: `chord` is the chord the user pressed (`Ctx::pressed`, through the item
+    /// form), so a key the shell translated for the widgets is never re-resolved here.
+    pub fn on_pressed(&mut self, chord: KeyChord, keys: &Keys) -> ViewOutcome {
         let stack = views::ITEM_DIVERGENCE;
-        let chord = KeyChord::from_event(key);
         for act in keys.actions(stack, chord) {
             match act {
                 Act::Back => return ViewOutcome::Back,
@@ -296,6 +297,13 @@ impl Divergence {
         } else {
             ViewOutcome::Stay
         }
+    }
+
+    /// [`on_pressed`](Self::on_pressed) for a key the shell did not translate: the chord pressed
+    /// is the key's own.
+    #[cfg(test)]
+    pub fn on_key(&mut self, key: crossterm::event::KeyEvent, keys: &Keys) -> ViewOutcome {
+        self.on_pressed(KeyChord::from_event(key), keys)
     }
 
     /// The listed fields.
@@ -603,9 +611,11 @@ fn diff_rows(unified: &str, width: u16) -> Vec<(&str, String)> {
 fn row_lines(row: &Row, vw: usize, theme: &Theme) -> Vec<Line<'static>> {
     let values = [&row.ancestor, &row.theirs, &row.mine].map(|value| wrapped(value, vw));
     let height = values.iter().map(Vec::len).max().unwrap_or(0).max(1);
+    // MOD-115 M4 E9 (MOD-85): `theirs`/`mine` name the side that moved, a word and not focus, so
+    // they are the base role; a conflict is an error, an unchanged field dim.
     let state_style = match row.state {
         FieldState::Conflict => theme.error,
-        FieldState::Theirs | FieldState::Mine => theme.accent,
+        FieldState::Theirs | FieldState::Mine => theme.base,
         FieldState::Same => theme.dim,
     };
     (0..height)
@@ -639,7 +649,7 @@ mod tests {
     use crate::ui::cells::cell_width;
     use crate::ui::kit::pane::Pane;
     use crate::ui::layout::chrome;
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use htui_core::fixtures::ids;
     use htui_core::model::{EditReason, ItemPatch, SpecChanges};
     use htui_core::store::{MemStore, WriteStore as _};
@@ -1321,6 +1331,67 @@ mod tests {
             view.on_key(key(KeyCode::Enter), Keys::compiled()),
             ViewOutcome::Stay
         );
+    }
+
+    /// MOD-115 M4 L-forms (MD-A): the view resolves its acts from the chord pressed, which the
+    /// item form hands it from `Ctx::pressed`, never from the event the widgets read.
+    #[tokio::test]
+    async fn the_view_resolves_the_chord_pressed() {
+        let mut view = view(
+            |_| ItemPatch {
+                title: Some("Theirs".to_owned()),
+                ..patch()
+            },
+            |spec| spec.title = "Mine".to_owned(),
+        )
+        .await;
+        let chord = |code| KeyChord::from_event(key(code));
+        assert_eq!(
+            view.on_pressed(chord(KeyCode::Char('t')), Keys::compiled()),
+            ViewOutcome::Resolve(Side::Theirs)
+        );
+        assert_eq!(
+            view.on_pressed(chord(KeyCode::Esc), Keys::compiled()),
+            ViewOutcome::Back
+        );
+        let rebound =
+            crate::keys::load_str("version = 1\n[backlog.item]\ntheirs = \"w\"\n").expect("loads");
+        assert_eq!(
+            view.on_pressed(chord(KeyCode::Char('w')), &rebound),
+            ViewOutcome::Resolve(Side::Theirs)
+        );
+        assert_eq!(
+            view.on_pressed(chord(KeyCode::Char('t')), &rebound),
+            ViewOutcome::Stay
+        );
+    }
+
+    /// MOD-115 M4 L-forms (E9, MOD-85): a `theirs` or `mine` state names the side that moved, a
+    /// word and not focus, so it is drawn in the base role; a conflict keeps the error role and
+    /// `same` the dim one. Both themes.
+    #[test]
+    fn the_state_column_names_the_side_in_the_base_role() {
+        for theme in [Theme::default(), Theme::monochrome()] {
+            for (state, style) in [
+                (FieldState::Theirs, theme.base),
+                (FieldState::Mine, theme.base),
+                (FieldState::Conflict, theme.error),
+                (FieldState::Same, theme.dim),
+            ] {
+                let row = Row {
+                    field: SpecField::Title,
+                    state,
+                    ancestor: "a".to_owned(),
+                    theirs: "b".to_owned(),
+                    mine: "c".to_owned(),
+                };
+                let lines = row_lines(&row, 10, &theme);
+                let cell = &lines[0].spans[1];
+                assert_eq!(cell.content.trim(), state.label(), "{state:?}");
+                assert_eq!(cell.style, style, "{state:?}");
+            }
+            assert_ne!(theme.base, theme.accent, "the test tells the two apart");
+        }
     }
 
     #[tokio::test]

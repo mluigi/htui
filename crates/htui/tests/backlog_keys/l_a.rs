@@ -182,7 +182,7 @@ async fn f1_opens_help_from_the_item_form_and_the_form_stays() {
         harness.key(c);
     }
     assert!(
-        harness.render().contains("> title    Fresh"),
+        harness.render().contains("\u{258c}title      Fresh"),
         "{}",
         harness.render()
     );
@@ -197,7 +197,7 @@ async fn f1_opens_help_from_the_item_form_and_the_form_stays() {
     assert!(!frame.contains("F1 closes this box"), "closed:\n{frame}");
     assert!(frame.contains(" New item "), "the form stays:\n{frame}");
     assert!(
-        frame.contains("> title    Fresh"),
+        frame.contains("\u{258c}title      Fresh"),
         "with its text:\n{frame}"
     );
 }

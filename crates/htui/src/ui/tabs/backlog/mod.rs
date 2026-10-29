@@ -695,7 +695,7 @@ impl Tab for BacklogTab {
             Some(form) => {
                 // MOD-115 M4 D-9: the form's rows in a kit pane in the detail's place; the rect
                 // it claims is inside the pane's inner rect, as it was inside the block's.
-                let claim = item_form::render(frame, Pane::inner(detail_area), form, theme);
+                let claim = item_form::render(frame, Pane::inner(detail_area), form, accent, theme);
                 ctx.claim_editor_area(claim);
                 let title = item_form::title(form);
                 chrome

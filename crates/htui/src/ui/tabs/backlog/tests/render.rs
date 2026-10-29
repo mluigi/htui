@@ -57,6 +57,7 @@ async fn the_item_form_claims_its_body_for_the_editor() {
                 frame,
                 Pane::inner(right),
                 tab.item_form.as_ref().expect("open"),
+                bench.ctx().accent(),
                 &Theme::default(),
             ));
         })
