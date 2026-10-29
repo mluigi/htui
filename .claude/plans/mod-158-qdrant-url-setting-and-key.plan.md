@@ -8,7 +8,8 @@ Qdrant for the whole database). Decision record: `docs/decisions/ana/ana-37.md`.
 **Requirements**: `R-STO-1`, `R-STO-8`, `R-SEC-2`, `R-TUI-8`, `R-NF-2` (texts already amended on
 ANA-37 and 2026-10-20; this item needs no requirement edit).
 **Complexity**: Large (store, secrets, agent spawn, orchestration shell, TUI section, CLI, worker).
-**Status**: confirmed 2026-10-27. Q1-Q3 answered at CONFIRM as recommended: provision includes the
+**Status**: complete 2026-10-29 (`docs/decisions/mod/mod-158.md`): T1-T6 and review-fix round R1 landed on
+`hr/MOD-158`; rust-reviewer (three areas) approve / approve with fixes, all findings applied. Confirmed 2026-10-27. Q1-Q3 answered at CONFIRM as recommended: provision includes the
 key credential (D11); `c` clears the focused row (D9); the worker's `search_concepts` gate is checked
 at worker start (D7).
 
