@@ -3,20 +3,20 @@ source: crates/htui/tests/backlog.rs
 expression: last
 ---
 Platform   ¹Backlog             1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
-┌ Backlog (11) ───────────────────────────────────────┐┌ FIX-1 ────────────────────────────────────┐
-│▾ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │
-│  ANA-1    done               Data model, box regist…││Session leak on cancel                     │
-│  ANA-2    open               Orchestrator step grap…││FIX-1  FIX  open                           │
-│  CLEAN-1  failed             Drop the legacy markdo…││no tags · priority 0 · version 1           │
-│  FEAT-1   in_progress        TUI scaffold           ││                                           │
-│  FEAT-2   blocked            Agent driver and chat …││No body for this item.                     │
-│  FEAT-3   queued             Postgres store and cac…││                                           │
-│  FIX-1    closed             Terminal left raw afte…││                                           │
-│  TOOL-1   awaiting_approval  CI matrix for the thre…││                                           │
-│▾ agy (3)                                            ││                                           │
-│  ANA-1    done               Prompt assembly survey ││                                           │
-│  FEAT-1   open               ACP transport upgrade  ││                                           │
-│  FIX-1    open               Session leak on cancel ││                                           │
+╭─ Backlog (11) ──────────────────────────────────────╮╭─ FIX-1 · Session leak on cancel ─── Body ›╮
+│ ▾ htui (8)                                          ││Session leak on cancel                     │
+│  ANA-1    ● done       Data model, box registry and…││FIX-1  FIX  open                           │
+│  ANA-2    ○ open       Orchestrator step graphs and…││no tags · priority 0 · version 1           │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││                                           │
+│  FEAT-1   ◐ running    TUI scaffold                 ││No body for this item.                     │
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││                                           │
+│  FEAT-3   ◌ queued     Postgres store and cache     ││                                           │
+│  FIX-1    ✓ closed     Terminal left raw after panic││                                           │
+│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││                                           │
+│ ▾ agy (3)                                           ││                                           │
+│  ANA-1    ● done       Prompt assembly survey       ││                                           │
+│  FEAT-1   ○ open       ACP transport upgrade        ││                                           │
+│▌ FIX-1    ○ open       Session leak on cancel       ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
@@ -31,4 +31,4 @@ Platform   ¹Backlog             1 working · 1 waiting · memory · DESKTOP-HTU
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
-└─j/k move · h/l sub-tab · f filter · N new · e edit──┘└───────────────────────────────────────────┘
+╰─j/k move · h/l sub-tab · f filter · N new · e edit──╯╰───────────────────────────────────────────╯

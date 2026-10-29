@@ -3,32 +3,32 @@ source: crates/htui/tests/concepts_search.rs
 expression: frame
 ---
 Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings     1 waiting ·  F1  keys
-┌ Backlog (11) ────────────────────────────┐┌ ANA-1 ───────────────────────────┐
-│▾ htui (8)                                ││ Body Runs Graph Docs Notes Prompt│
-│  ANA-1    done               Data model,…││Data model, box registry and sync │
-│  ANA-2    open               Orchestrato…││topology                          │
-│  CLEAN-1  failed             Drop the le…││ANA-1  ANA  done                  │
-│  FEAT-1   in_progress        TUI scaffold││no tags · priority 0 · version 1  │
+╭─ Backlog (11) ───────────────────────────╮╭─ ANA-1 · Data model, box … Body ›╮
+│ ▾ htui (8)                               ││Data model, box registry and sync │
+│▌ ANA-1    ● done       Data model, box r…││topology                          │
+│  ANA-2    ○ open       Orchestrator step…││ANA-1  ANA  done                  │
+│  CLEAN-1  ✗ failed     Drop the legacy m…││no tags · priority 0 · version 1  │
+│  FEAT-1   ◐ running    TUI scaffold      ││The store seam is the one         │
 │ ╭ Search concepts ─────────────────────────────────────────────────────────╮ │
 │ │scope all projects · decisions off                                        │ │
 │ │query postgres store cache                                                │ │
 │ │                                                                          │ │
-│▾│▌ANA-1      item                       best   ANA-1 Data model, box regi… │ │
+│ │▌ANA-1      item                       best   ANA-1 Data model, box regi… │ │
 │ │ FEAT-3     item                       best   FEAT-3 Postgres store and … │ │
 │ │ R-STO-1    requirement                strong R-STO-1 Postgres is the so… │ │
 │ │ ANA-1      verdict document           strong ANA-1 Verdict: Postgres wi… │ │
 │ │ FEAT-1     item                       fair   FEAT-1 TUI scaffold Stand … │ │
-│ │ ANA-1      research document          fair   ANA-1 Research: store topo… │ │
-│ │                                                                          │r│
+│ │ ANA-1      research document          fair   ANA-1 Research: store topo… │r│
 │ │                                                                          │ │
 │ │                                                                          │ │
 │ │                                                                          │ │
-│ │6 hits                                                                    │ │
-│ │                                                                          │e│
+│ │                                                                          │ │
+│ │6 hits                                                                    │e│
+│ │                                                                          │ │
 │ ╰ Enter search/open · ↑/↓ move · Ctrl+d decisions · Ctrl+p scope · Ctrl+r… ╯ │
-│                                          ││above the numbers it brings in.   │
 │                                          ││                                  │
 │                                          ││                                  │
 │                                          ││                                  │
 │                                          ││                                  │
-└──────────────────────────────────────────┘└──────────────────────────────────┘
+│                                          ││                                  │
+╰──────────────────────────────────────────╯╰──────────────────────────────────╯

@@ -3,12 +3,12 @@ source: crates/htui/tests/backlog.rs
 expression: folded
 ---
 Platform   ¹Backlog             1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
-┌ Backlog (11) ───────────────────────────────────────┐┌ Detail ───────────────────────────────────┐
-│▸ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │
-│▾ agy (3)                                            ││No item selected.                          │
-│  ANA-1    done               Prompt assembly survey ││                                           │
-│  FEAT-1   open               ACP transport upgrade  ││                                           │
-│  FIX-1    open               Session leak on cancel ││                                           │
+╭─ Backlog (11) ──────────────────────────────────────╮╭─ Detail ─ Body  Runs  Graph  Docs  Notes ›╮
+│▌▸ htui (8)                                          ││No item selected.                          │
+│ ▾ agy (3)                                           ││                                           │
+│  ANA-1    ● done       Prompt assembly survey       ││                                           │
+│  FEAT-1   ○ open       ACP transport upgrade        ││                                           │
+│  FIX-1    ○ open       Session leak on cancel       ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
@@ -31,4 +31,4 @@ Platform   ¹Backlog             1 working · 1 waiting · memory · DESKTOP-HTU
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
-└─j/k move · h/l sub-tab · f filter · N new · e edit──┘└───────────────────────────────────────────┘
+╰─j/k move · h/l sub-tab · f filter · N new · e edit──╯╰───────────────────────────────────────────╯

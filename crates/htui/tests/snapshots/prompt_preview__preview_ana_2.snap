@@ -3,21 +3,20 @@ source: crates/htui/tests/prompt_preview.rs
 expression: frame
 ---
 Platform   ¹Backlog    1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys · ⌫ back
-┌ Backlog (11) ───────────────────────────────────────┐┌ ANA-2 ────────────────────────────────────┐
-│▾ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │
-│  ANA-1    done               Data model, box regist…││template  prd v1                           │
-│  ANA-2    open               Orchestrator step grap…││picker    n / p · 8 template(s)            │
-│  CLEAN-1  failed             Drop the legacy markdo…││digest    50809e5bb4255344254f82140e84402b8│
-│  FEAT-1   in_progress        TUI scaffold           ││budget    120000 (project) · reserve 0.10 ·│
-│  FEAT-2   blocked            Agent driver and chat …││tokens    354 → 354 · chars-v2             │
-│  FEAT-3   queued             Postgres store and cac…││excerpts  builtin@1 · considered 0 · select│
-│  FIX-1    closed             Terminal left raw afte…││roots     none · this project has no repo  │
-│  TOOL-1   awaiting_approval  CI matrix for the thre…││                                           │
-│▾ agy (3)                                            ││section                   before   after  s│
-│  ANA-1    done               Prompt assembly survey ││template                     149     149  n│
-│  FEAT-1   open               ACP transport upgrade  ││item                          37      37  n│
-│  FIX-1    open               Session leak on cancel ││box                           80      80  n│
-│                                                     ││skills                        88      88  n│
+╭─ Backlog (11) ──────────────────────────────────────╮╭─ ANA-2 · Orchestrator step grap…‹ Prompt ›╮
+│ ▾ htui (8)                                          ││template  prd v1                           │
+│  ANA-1    ● done       Data model, box registry and…││picker    n / p · 8 template(s)            │
+│▌ ANA-2    ○ open       Orchestrator step graphs and…││digest    50809e5bb4255344254f82140e84402b8│
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││budget    120000 (project) · reserve 0.10 ·│
+│  FEAT-1   ◐ running    TUI scaffold                 ││tokens    354 → 354 · chars-v2             │
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││excerpts  builtin@1 · considered 0 · select│
+│  FEAT-3   ◌ queued     Postgres store and cache     ││roots     none · this project has no repo  │
+│  FIX-1    ✓ closed     Terminal left raw after panic││                                           │
+│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││section                   before   after  s│
+│ ▾ agy (3)                                           ││template                     149     149  n│
+│  ANA-1    ● done       Prompt assembly survey       ││item                          37      37  n│
+│  FEAT-1   ○ open       ACP transport upgrade        ││box                           80      80  n│
+│  FIX-1    ○ open       Session leak on cancel       ││skills                        88      88  n│
 │                                                     ││                                           │
 │                                                     ││skills    tests v1 · project · always → act│
 │                                                     ││          rust-style v2 · project · always │
@@ -31,4 +30,5 @@ Platform   ¹Backlog    1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9 
 │                                                     ││          preview: attempt 1, so verify_fai│
 │                                                     ││          preview: no run exists, so no run│
 │                                                     ││          preview: no phase of this item's │
-└─j/k move · h/l sub-tab · f filter · N new · e edit──┘└───────────────────────────────────────────┘
+│                                                     ││────────────────────────────────────────   │
+╰─j/k move · h/l sub-tab · f filter · N new · e edit──╯╰───────────────────────────────────────────╯

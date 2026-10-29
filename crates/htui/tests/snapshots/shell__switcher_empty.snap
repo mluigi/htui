@@ -3,9 +3,9 @@ source: crates/htui/tests/shell.rs
 expression: frame
 ---
 no workspace   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 waiting · memory ·  ?  keys
-┌ Backlog (0) ────────────────────────────────────────┐┌ Detail ───────────────────────────────────┐
-│No items in this workspace.                          ││ Body Runs Graph Docs Notes Prompt Reqs    │
+╭─ Backlog (0) ───────────────────────────────────────╮╭─ Detail ─ Body  Runs  Graph  Docs  Notes ›╮
 │                                                     ││No item selected.                          │
+│                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
@@ -17,8 +17,8 @@ no workspace   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 
 │                                                     ││                                           │
 │                            ╭ Workspaces ────────────────────────────╮                            │
 │                            │             no workspaces              │                            │
-│                            │`N` in Settings › Hierarchy creates one │                            │
-│                            ╰ j/k move · Enter switch · Esc close ───╯                            │
+│             No items in thi│`N` in Settings › Hierarchy creates one │                            │
+│         Settings › Hierarch╰ j/k move · Enter switch · Esc close ───╯                            │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
@@ -31,4 +31,4 @@ no workspace   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      0 
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
-└─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
+╰─────────────────────────────────────────────────────╯╰───────────────────────────────────────────╯

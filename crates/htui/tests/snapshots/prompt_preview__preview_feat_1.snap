@@ -3,21 +3,20 @@ source: crates/htui/tests/prompt_preview.rs
 expression: frame
 ---
 Platform   ¹Backlog                                                                1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys · ⌫ back to Backlog › Notes · list · list+detail
-┌ Backlog (11) ──────────────────────────────────────────────────────────────────────────────────────────────┐┌ FEAT-1 ────────────────────────────────────────────────────────────────────────────────┐
-│▾ htui (8)                                                                                                  ││ Body Runs Graph Docs Notes Prompt Reqs                                                 │
-│  ANA-1    done               Data model, box registry and sync topology                                    ││template  prd v1                                                                        │
-│  ANA-2    open               Orchestrator step graphs and gates                                            ││picker    n / p · 8 template(s)                                                         │
-│  CLEAN-1  failed             Drop the legacy markdown exporter                                             ││digest    a3cad86a286f7e936fb4b1457f8c92b71d4cbd684101a752aedab42e72c49abc              │
-│  FEAT-1   in_progress        TUI scaffold                                                                  ││budget    120000 (project) · reserve 0.10 · target 108000                               │
-│  FEAT-2   blocked            Agent driver and chat tab                                                     ││tokens    1067 → 1067 · chars-v2                                                        │
-│  FEAT-3   queued             Postgres store and cache                                                      ││excerpts  builtin@1 · considered 0 · selected 0                                         │
-│  FIX-1    closed             Terminal left raw after panic                                                 ││roots     none · this project has no repo                                               │
-│  TOOL-1   awaiting_approval  CI matrix for the three OSes                                                  ││                                                                                        │
-│▾ agy (3)                                                                                                   ││section                   before   after  strategy                                      │
-│  ANA-1    done               Prompt assembly survey                                                        ││template                     149     149  none                                          │
-│  FEAT-1   open               ACP transport upgrade                                                         ││item                         570     570  none                                          │
-│  FIX-1    open               Session leak on cancel                                                        ││documents:plan                57      57  none                                          │
-│                                                                                                            ││documents:prd                 52      52  none                                          │
+╭─ Backlog (11) ─────────────────────────────────────────────────────────────────────────────────────────────╮╭─ FEAT-1 · TUI scaffold ────────────────── Body  Runs  Graph  Docs  Notes  Prompt  Reqs ╮
+│ ▾ htui (8)                                                                                                 ││template  prd v1                                                                        │
+│  ANA-1    ● done       Data model, box registry and sync topology                                          ││picker    n / p · 8 template(s)                                                         │
+│  ANA-2    ○ open       Orchestrator step graphs and gates                                                  ││digest    a3cad86a286f7e936fb4b1457f8c92b71d4cbd684101a752aedab42e72c49abc              │
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exporter                                                   ││budget    120000 (project) · reserve 0.10 · target 108000                               │
+│▌ FEAT-1   ◐ running    TUI scaffold                                                                        ││tokens    1067 → 1067 · chars-v2                                                        │
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab                                                           ││excerpts  builtin@1 · considered 0 · selected 0                                         │
+│  FEAT-3   ◌ queued     Postgres store and cache                                                            ││roots     none · this project has no repo                                               │
+│  FIX-1    ✓ closed     Terminal left raw after panic                                                       ││                                                                                        │
+│  TOOL-1   ⚠ needs you  CI matrix for the three OSes                                                        ││section                   before   after  strategy                                      │
+│ ▾ agy (3)                                                                                                  ││template                     149     149  none                                          │
+│  ANA-1    ● done       Prompt assembly survey                                                              ││item                         570     570  none                                          │
+│  FEAT-1   ○ open       ACP transport upgrade                                                               ││documents:plan                57      57  none                                          │
+│  FIX-1    ○ open       Session leak on cancel                                                              ││documents:prd                 52      52  none                                          │
 │                                                                                                            ││upstream                      71      71  none                                          │
 │                                                                                                            ││box                           80      80  none                                          │
 │                                                                                                            ││skills                        88      88  none                                          │
@@ -61,4 +60,5 @@ Platform   ¹Backlog                                                            
 │                                                                                                            ││                                                                                        │
 │                                                                                                            ││Done when                                                                               │
 │                                                                                                            ││- `cargo run -- --demo` opens on the backlog of the Platform workspace.                 │
-└─j/k move · h/l sub-tab · f filter · N new · e edit─────────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────────────────────┘
+│                                                                                                            ││- The snapshot tests render at 100x30 and every sub-tab has an empty state.             │
+╰─j/k move · h/l sub-tab · f filter · N new · e edit─────────────────────────────────────────────────────────╯╰────────────────────────────────────────────────────────────────────────────────────────╯

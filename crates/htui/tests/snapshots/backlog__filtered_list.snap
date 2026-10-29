@@ -3,13 +3,12 @@ source: crates/htui/tests/backlog.rs
 expression: frame
 ---
 Platform   ¹Backlog             1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
-┌ Backlog (2) · status:done ──────────────────────────┐┌ ANA-1 ────────────────────────────────────┐
-│▾ htui (1)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │
-│  ANA-1  done  Data model, box registry and sync top…││Data model, box registry and sync topology │
-│▾ agy (1)                                            ││ANA-1  ANA  done                           │
-│  ANA-1  done  Prompt assembly survey                ││no tags · priority 0 · version 1           │
-│                                                     ││                                           │
-│                                                     ││The store seam is the one interface every  │
+╭─ Backlog (2) ───────────────────────────────────────╮╭─ ANA-1 · Data model, box registry … Body ›╮
+│ / status: done                               2 items││Data model, box registry and sync topology │
+│ ▾ htui (1)                                          ││ANA-1  ANA  done                           │
+│▌ ANA-1  ● done  Data model, box registry and sync t…││no tags · priority 0 · version 1           │
+│ ▾ agy (1)                                           ││                                           │
+│  ANA-1  ● done  Prompt assembly survey              ││The store seam is the one interface every  │
 │                                                     ││other module reaches through, so it is     │
 │                                                     ││settled first.                             │
 │                                                     ││                                           │
@@ -31,4 +30,5 @@ Platform   ¹Backlog             1 working · 1 waiting · memory · DESKTOP-HTU
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
-└─j/k move · h/l sub-tab · f filter · N new · e edit──┘└───────────────────────────────────────────┘
+│                                                     ││                                           │
+╰─j/k move · h/l sub-tab · f filter · N new · e edit──╯╰───────────────────────────────────────────╯

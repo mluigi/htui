@@ -3,13 +3,13 @@ source: crates/htui/tests/overlays.rs
 expression: frame
 ---
 Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings      0 waiting ·  ?  keys
-┌ Backlog (2) ─────────────────────────────┐┌ FEAT-1 ──────────────────────────┐
-│▾ Vulkan Tutorials (2)                    ││ Body Runs Graph Docs Notes Prompt│
-│  FEAT-1  in_progress  Chapter 12 parity  ││Chapter 12 parity                 │
-│  TOOL-1  open         Shader build script││FEAT-1  FEAT  in_progress         │
-│                                          ││gpu, vulkan · priority 0 · version│
+╭─ Backlog (2) ────────────────────────────╮╭─ FEAT-1 · Chapter 12 pari… Body ›╮
+│ ▾ Vulkan Tutorials (2)                   ││Chapter 12 parity                 │
+│▌ FEAT-1  ◐ running  Chapter 12 parity    ││FEAT-1  FEAT  in_progress         │
+│  TOOL-1  ○ open     Shader build script  ││gpu, vulkan · priority 0 · version│
 │                                          ││1                                 │
 │                                          ││No body for this item.            │
+│                                          ││                                  │
 │                                          ││                                  │
 │                                          ││                                  │
 │                                          ││                                  │
@@ -31,4 +31,4 @@ Graphics   ¹Backlog  ²Skills  ³Requirements  ⁴Settings      0 waiting ·  ?
 │                                          ││                                  │
 │                                          ││                                  │
 │                                          ││                                  │
-└──────────────────────────────────────────┘└──────────────────────────────────┘
+╰──────────────────────────────────────────╯╰──────────────────────────────────╯
