@@ -31,6 +31,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use crate::catalogue::graph_label;
 use crate::item_writes::{ItemDivergence, ItemFormContext};
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, views};
 use crate::ui::cells;
@@ -443,17 +444,26 @@ impl Labels<'_> {
             )
     }
 
-    /// The graph picker's words: `kind default`, a project graph's name, or an override.
+    /// The graph picker's words: `kind default`, a graph's [`graph_label`] (a project graph's
+    /// name, a workspace or library graph's `name · scope`, MOD-138 D12), or an override. Each
+    /// catalogue's `item_graph` counts too, so a workspace graph the item kept after its project
+    /// left that workspace reads with its scope, as the picker labels it.
     fn graph(&self, id: Option<StepGraphId>) -> String {
         let Some(id) = id else {
             return "kind default".to_owned();
         };
         [self.fresh, self.old]
             .iter()
-            .find_map(|context| context.graphs.iter().find(|graph| graph.id == id))
+            .find_map(|context| {
+                context
+                    .graphs
+                    .iter()
+                    .chain(&context.item_graph)
+                    .find(|graph| graph.id == id && !graph.is_override)
+            })
             .map_or_else(
                 || "override (this item's)".to_owned(),
-                |graph| graph.name.clone(),
+                |graph| graph_label(&graph.name, graph.scope),
             )
     }
 }
@@ -639,7 +649,7 @@ mod tests {
     use crate::ui::layout::chrome;
     use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
-    use htui_core::model::{EditReason, ItemPatch, SpecChanges};
+    use htui_core::model::{EditReason, GraphScope, ItemPatch, NewStepGraph, SpecChanges};
     use htui_core::store::{MemStore, WriteStore as _};
     use htui_store::Backend;
 
@@ -836,6 +846,117 @@ mod tests {
         assert_eq!(row(SpecField::Graph).ancestor, "kind default");
         assert_eq!(row(SpecField::Graph).mine, "kind default");
         assert_eq!(row(SpecField::Graph).theirs, graph.name);
+    }
+
+    /// A workspace graph `wsflow` of the demo's platform workspace, which holds htui.
+    async fn workspace_graph(store: &MemStore) -> StepGraphId {
+        store
+            .create_step_graph(NewStepGraph {
+                id: StepGraphId::new(),
+                scope: GraphScope::Workspace(ids::WORKSPACE_PLATFORM),
+                name: "wsflow".to_owned(),
+                description: String::new(),
+                is_override: false,
+            })
+            .await
+            .expect("a workspace graph")
+            .id
+    }
+
+    /// The `(ancestor, theirs, mine)` cells of `view`'s Graph row.
+    fn graph_cells(view: &Divergence) -> (String, String, String) {
+        view.rows()
+            .iter()
+            .find(|row| row.field == SpecField::Graph)
+            .map(|row| (row.ancestor.clone(), row.theirs.clone(), row.mine.clone()))
+            .expect("a Graph row")
+    }
+
+    /// MOD-138 D12: the Graph row labels a workspace graph as the item form's picker does, with
+    /// its scope, so it never reads as a project graph of the same name.
+    #[tokio::test]
+    async fn a_workspace_graph_reads_with_its_scope() {
+        let store = MemStore::demo();
+        let shared = workspace_graph(&store).await;
+        let (context, divergence) = diverged(&store, |_| ItemPatch {
+            step_graph_id: Some(Some(shared)),
+            ..patch()
+        })
+        .await;
+        let ancestor = context.item.clone().expect("an edit context");
+        let view = Divergence::open(&ancestor, &context, ItemSpec::of(&ancestor), &divergence);
+        assert_eq!(graph_cells(&view).1, "wsflow \u{b7} workspace");
+    }
+
+    /// MOD-138 D12: ANA-1 kept a workspace graph after htui left that workspace, so neither
+    /// catalogue's `graphs` lists it; the row still names it with its scope (through
+    /// `item_graph`, as the picker does) rather than as an override, which it is not.
+    #[tokio::test]
+    async fn a_kept_workspace_graph_reads_with_its_scope_not_as_an_override() {
+        let store = MemStore::demo();
+        let shared = workspace_graph(&store).await;
+        store
+            .update_item(
+                ids::HTUI_ANA_1,
+                1,
+                ItemPatch {
+                    step_graph_id: Some(Some(shared)),
+                    ..patch()
+                },
+            )
+            .await
+            .expect("the item takes it");
+        store
+            .remove_workspace_project(ids::WORKSPACE_PLATFORM, ids::PROJECT_HTUI)
+            .await
+            .expect("the project leaves the workspace");
+
+        let backend = Backend::memory(store.clone());
+        let read = StoreRequest::ItemForm {
+            project: ids::PROJECT_HTUI,
+            item: Some(ids::HTUI_ANA_1),
+        };
+        let context = match item_writes::serve(&backend, &read).await {
+            Ok(StoreReply::ItemForm(context)) => *context,
+            other => panic!("the form read answered {other:?}"),
+        };
+        assert!(
+            !context.graphs.iter().any(|graph| graph.id == shared),
+            "the project may no longer pick it"
+        );
+        store
+            .update_item(
+                ids::HTUI_ANA_1,
+                2,
+                ItemPatch {
+                    title: Some("Theirs".to_owned()),
+                    ..patch()
+                },
+            )
+            .await
+            .expect("their edit");
+        let stale = StoreRequest::EditItem {
+            id: ids::HTUI_ANA_1,
+            expected_version: 2,
+            changes: SpecChanges {
+                step_graph_id: Some(None),
+                ..SpecChanges::default()
+            },
+            reason: EditReason::Edited,
+        };
+        let divergence = match item_writes::serve(&backend, &stale).await {
+            Ok(StoreReply::ItemDiverged(divergence)) => *divergence,
+            other => panic!("the stale edit answered {other:?}"),
+        };
+        let ancestor = context.item.clone().expect("an edit context");
+        let mut mine = ItemSpec::of(&ancestor);
+        mine.step_graph_id = None;
+        let view = Divergence::open(&ancestor, &context, mine, &divergence);
+        let label = "wsflow \u{b7} workspace".to_owned();
+        assert_eq!(
+            graph_cells(&view),
+            (label.clone(), label, "kind default".to_owned())
+        );
     }
 
     #[tokio::test]
