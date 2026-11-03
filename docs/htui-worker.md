@@ -142,11 +142,14 @@ it again. A lock across processes is deferred.
 
 Two consequences of recovering "as after a crash":
 
-- **A graph changed mid-run.** The worker re-checks the item's **live** step graph before it walks
-  on. If the graph's shape was edited after the run started, the run parks with a
-  "topology mismatch" note instead of walking on its original snapshot, as the TUI would have done
-  in process. An approval or selection has already been merged by then. The park is sticky: `u`
-  goes through the same check. Cancel the run (`c`) and start a new one.
+- **A graph changed mid-run.** A run started since MOD-138 is pinned to its snapshot: the worker
+  walks it on whatever was edited in the live graph, and parks it with a "snapshot tampered" note
+  only if the run's own frozen phases and edges no longer match its digest. A run started before
+  MOD-138 is still checked against the item's **live** step graph: if the graph's shape was edited
+  after the run started, the run parks with a "topology mismatch" note instead of walking on its
+  original snapshot, as the TUI would have done in process. An approval or selection has already
+  been merged by then. Either park is sticky: `u` goes through the same check. Cancel the run (`c`)
+  and start a new one.
 - **A lost hand-back.** If giving the lease back fails (the database dropped at that moment), the
   worker cannot adopt the run until the lease lapses on its own, after the lease's full
   time-to-live instead of at its next poll. Nothing is lost; the run is just late.

@@ -134,27 +134,30 @@ Decisions taken at the PRD gate (maintainer, 2026-10-27):
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Snapshot v2, the validator and the lift | New runs freeze a v2 snapshot (nodes, edges, bounds; divide expansion frozen, divide and subgraph refused) and are pinned to it; v1 runs read through the lift and behave as today; one validator refuses bad graphs at save and at resolve; items and kinds may use workspace and library graphs. The walk itself still runs one node at a time in order | in-progress | `.claude/plans/mod-138-m1-snapshot-v2.plan.md` |
+| 1 | Snapshot v2, the validator and the lift | New runs freeze a v2 snapshot (nodes, edges, bounds; divide expansion frozen, divide and subgraph refused) and are pinned to it; v1 runs read through the lift and behave as today; one validator refuses bad graphs at save and at resolve; items and kinds may use workspace and library graphs. The walk itself still runs one node at a time in order | complete (2026-11-03, `d114f91f`; record `docs/decisions/mod/mod-138-decisions.md`) | `.claude/plans/mod-138-m1-snapshot-v2.plan.md` |
 | 2 | The readiness walker | `ready()` replaces `cursor`: joins, derived skips, `if` predicates, `asks_you` parks answered through the gate, per-edge loops with region retirement, limits and no-progress, graph-aware `required_inputs`; the `is_review` name rule is gone. Driven one ready node at a time | pending | — |
 | 3 | Concurrent nodes | Every ready node runs at once up to `max_parallel_sessions`, each per-node future boxed; landings into one repo serialised by a reconcile lock; `local` isolation on two nodes that can be live together refused at resolve; crash recovery finds the frontier among concurrent landings | pending | — |
 
 ## Open Questions
 
-- [ ] Recovery frontier: is an explicit `run_step.reconciled_at` (migration `0023`, and a cache mirror
+- [ ] Recovery frontier: is an explicit `run_step.reconciled_at` (migration `0024`, and a cache mirror
   if the column must be read offline) needed, or can the frontier be derived from existing rows once
   nodes land concurrently? ANA-33 §7.7 leaves this to the plan. TBD — settle in M3's `/plan`.
-- [ ] Where the new bounds live: `max_parallel_sessions` (default 4) and the other v2 bounds as
+- [x] Where the new bounds live: `max_parallel_sessions` (default 4) and the other v2 bounds as
   `app_setting` rows like `max_agents_per_run` (a seed or migration), or code defaults until a
-  Settings surface exists. TBD — `/plan` fact-check against the settings rung.
+  Settings surface exists. **Settled in M1 (D13):** read from `app_setting` like `max_fan_out`, code
+  defaults, no rows seeded; MOD-123's Settings surface may seed them.
 - [ ] `if` predicate inputs: where "the source step's changed paths" are read from (its tree's
   `base_ref`..`after_hash` diff per repo, or a recorded diffstat), and how a source with no tree
   (a check, a judge) answers path predicates. TBD — M2's `/plan`.
 - [ ] Gate interplay on `asks_you` (Q2): a source step that has its own `always` gate *and* an
   outgoing `asks_you` edge — one park or two in sequence. TBD — M2's `/plan`.
-- [ ] Which v1-pinned conformance expectations must change at the v1/v2 resume split (the
-  `TopologyChanged` cases), and whether they are kept on v1 fixtures instead. TBD — M1's `/plan`.
+- [x] Which v1-pinned conformance expectations must change at the v1/v2 resume split (the
+  `TopologyChanged` cases), and whether they are kept on v1 fixtures instead. **Settled in M1:** eight tests
+  moved to v1 fixtures (`fake::rewrite_as_v1`), each with a v2 twin.
 - [ ] The ANA-2 and `R-ORCH-1` text edits ANA-33 §10 lists for the graph-model phase (invariant 2's v2
-  pinning; `retries` as a self-loop). TBD — settle at close-out bookkeeping.
+  pinning; `retries` as a self-loop). Invariant 2 done at M1 close-out (`docs/ANA-2.md`). The `R-ORCH-1`
+  `retries` wording is a requirements edit, the maintainer's to apply (still open).
 
 ## Risks
 
