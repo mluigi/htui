@@ -31,9 +31,10 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::app::{Ctx, Handled};
 use crate::editor::ExternalEditOutcome;
-use crate::keys::{Keys, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::store_worker::StoreReply;
 use crate::ui::Theme;
+use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::pane::Pane;
 use crate::ui::kit::scroll::Step;
 use crate::ui::tabs::backlog::Chrome;
@@ -428,11 +429,87 @@ pub fn render(
         .render(frame, area, ctx.theme);
 }
 
-/// The one line a sub-tab renders instead of a blank pane (plan D11).
+/// The one line a sub-tab renders while a read is in flight (plan D11): `Loading links…`. An
+/// empty pane or a failed read is not one: it is [`empty_state`] or [`unavailable`], with a next
+/// step (MOD-115 M4 RV2-M1).
 pub fn message(frame: &mut Frame<'_>, area: Rect, text: &str, theme: &Theme) {
     frame.render_widget(
         Paragraph::new(Line::styled(text.to_owned(), theme.dim)).wrap(Wrap { trim: true }),
         area,
+    );
+}
+
+/// No item under the list's cursor (a project header): what every sub-tab says then.
+const NO_ITEM: &str = "No item selected.";
+
+/// [`NO_ITEM`]'s next step: the list's motion, through the pane's stack.
+const CHOOSE: HintSpec = &[Hint::Pair(Act::ListDown, Act::ListUp, "chooses one")];
+
+/// [`NO_ITEM`]'s next step while the list's motion is unbound, for a pane with no sentence of its
+/// own.
+const CHOOSE_UNBOUND: &str = "a chosen item shows here";
+
+/// A failed read's next step: the list's motion away and back issues the item's reads again.
+const RETRY: HintSpec = &[Hint::Pair(
+    Act::ListDown,
+    Act::ListUp,
+    "away and back retries",
+)];
+
+/// [`RETRY`]'s sentence while the list's motion is unbound.
+const RETRY_UNBOUND: &str = "choosing the item again retries";
+
+/// An empty pane: `what` and its next step through `kit::empty`, centred in `area`.
+fn empty_state(frame: &mut Frame<'_>, area: Rect, what: &str, next: &str, ctx: &Ctx<'_>) {
+    empty::render(frame, area, what, NextStep(next), ctx.theme);
+}
+
+/// `spec` through `stack` under `keys`, or `unbound` while none of its keys is bound.
+fn hint_or(stack: Stack<'_>, spec: HintSpec, unbound: &str, keys: &Keys) -> String {
+    let hint = keys.hint(stack, spec);
+    if hint.is_empty() {
+        unbound.to_owned()
+    } else {
+        hint
+    }
+}
+
+/// No item selected (MOD-115 M4 RV2-M1, RV2-L5), the one state every sub-tab draws alike:
+/// [`NO_ITEM`] as the kit's empty state, the list's motion through `stack` its next step, or
+/// `unbound` while the motion is unbound ([`CHOOSE_UNBOUND`] for a pane with nothing more to say).
+fn no_item(frame: &mut Frame<'_>, area: Rect, stack: Stack<'_>, unbound: &str, ctx: &Ctx<'_>) {
+    let next = hint_or(stack, CHOOSE, unbound, ctx.keys());
+    empty_state(frame, area, NO_ITEM, &next, ctx);
+}
+
+/// The next step of an empty list: `{key} writes one` with `act`'s label through `stack`, else
+/// `unbound`.
+fn writes_one(stack: Stack<'_>, act: Act, unbound: &str, keys: &Keys) -> String {
+    keys.label(stack, act)
+        .map_or_else(|| unbound.to_owned(), |key| format!("{key} writes one"))
+}
+
+/// A refused read (MOD-115 M4 RV2-M1): `what`, its whole sentence, as the kit's failed state,
+/// its next step the list's motion away and back through `stack`, which reads the item again.
+fn unavailable(frame: &mut Frame<'_>, area: Rect, what: &str, stack: Stack<'_>, ctx: &Ctx<'_>) {
+    let next = hint_or(stack, RETRY, RETRY_UNBOUND, ctx.keys());
+    empty::render_failed(frame, area, what, NextStep(&next), ctx.theme);
+}
+
+/// MOD-115 M4 RV2-M1: `text`, a drawn pane, shows `what` as the kit's empty state, off the top
+/// row (centred), with `next` on the row under it.
+#[cfg(test)]
+pub(super) fn assert_empty_state(text: &str, what: &str, next: &str) {
+    let rows: Vec<&str> = text.lines().collect();
+    let at = rows
+        .iter()
+        .position(|row| row.trim() == what)
+        .unwrap_or_else(|| panic!("no {what:?} row:\n{text}"));
+    assert!(at > 0, "{what:?} is centred, not on the top row:\n{text}");
+    assert_eq!(
+        rows.get(at + 1).map(|row| row.trim()),
+        Some(next),
+        "{what:?}'s next step:\n{text}"
     );
 }
 

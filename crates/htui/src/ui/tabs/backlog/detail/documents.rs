@@ -58,14 +58,15 @@ use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells;
 use crate::ui::kit::chips::key_line;
-use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::list::{self, Row, RowKind};
 use crate::ui::kit::scroll::{Scroll, Step};
 use crate::ui::kit::text::{Tone, notice, wrapped};
 use crate::ui::tabs::backlog::detail::compose::{
     self, Compose, ComposeOutcome, could_not_check, may_have_landed, not_written,
 };
-use crate::ui::tabs::backlog::detail::{DetailId, DetailTab};
+use crate::ui::tabs::backlog::detail::{
+    CHOOSE_UNBOUND, DetailId, DetailTab, empty_state, no_item, writes_one,
+};
 use crossterm::event::KeyEvent;
 
 /// Written by a run step.
@@ -88,15 +89,6 @@ const NO_DOCUMENTS: &str = "No documents for this item.";
 
 /// [`NO_DOCUMENTS`]' next step while `backlog.docs.add` is unbound.
 const WRITE_UNBOUND: &str = "hand-written documents list here";
-
-/// No item under the list's cursor (a project header).
-pub(super) const NO_ITEM: &str = "No item selected.";
-
-/// [`NO_ITEM`]'s next step: the list's motion, through the pane's stack.
-pub(super) const CHOOSE: HintSpec = &[Hint::Pair(Act::ListDown, Act::ListUp, "chooses one")];
-
-/// [`NO_ITEM`]'s next step while the list's motion is unbound.
-pub(super) const CHOOSE_UNBOUND: &str = "a chosen item shows here";
 
 /// The browse hint on the pane's last row (D11), through [`views::BACKLOG_DOCS`].
 const HINT: HintSpec = &[
@@ -419,36 +411,6 @@ impl DocumentsTab {
     }
 }
 
-/// An empty pane: `what` and its next step through `kit::empty`, centred in `area`.
-pub(super) fn empty_state(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    what: &str,
-    next: &str,
-    ctx: &Ctx<'_>,
-) {
-    empty::render(frame, area, what, NextStep(next), ctx.theme);
-}
-
-/// No item selected (MOD-115 M4 L-docs): [`NO_ITEM`], and the list's motion through `stack` as
-/// the next step, or [`CHOOSE_UNBOUND`] while it is unbound.
-pub(super) fn no_item(frame: &mut Frame<'_>, area: Rect, stack: Stack<'_>, ctx: &Ctx<'_>) {
-    let choose = ctx.keys().hint(stack, CHOOSE);
-    let next = if choose.is_empty() {
-        CHOOSE_UNBOUND
-    } else {
-        choose.as_str()
-    };
-    empty_state(frame, area, NO_ITEM, next, ctx);
-}
-
-/// The next step of an empty list: `{key} writes one` with `act`'s label through `stack`, else
-/// `unbound`.
-pub(super) fn writes_one(stack: Stack<'_>, act: Act, unbound: &str, keys: &Keys) -> String {
-    keys.label(stack, act)
-        .map_or_else(|| unbound.to_owned(), |key| format!("{key} writes one"))
-}
-
 /// Review M1, round 2: what the kind's checked version (`DocumentForm`'s base) says of `hedged`.
 /// Versions only grow, so this write, landed, is at or past the expected version; it is
 /// hand-written, so it is at or below the checked version, which is never below the latest
@@ -699,7 +661,7 @@ impl DetailTab for DocumentsTab {
             return;
         }
         if self.item.is_none() {
-            no_item(frame, area, views::BACKLOG_DOCS, ctx);
+            no_item(frame, area, views::BACKLOG_DOCS, CHOOSE_UNBOUND, ctx);
             return;
         }
         // D5's sentence under the table, the kit's notice row; with none the table keeps the

@@ -31,7 +31,9 @@ use crate::ui::kit::label;
 use crate::ui::kit::list::{self, Row, RowKind};
 use crate::ui::kit::scroll::{PAGE, Step, window};
 use crate::ui::kit::status;
-use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, message};
+use crate::ui::tabs::backlog::detail::{
+    CHOOSE_UNBOUND, DetailId, DetailTab, message, no_item, unavailable,
+};
 use crossterm::event::KeyEvent;
 
 /// The footer's key half (MOD-67 M5): `+/- depth · Enter re-root` with the defaults, read
@@ -766,15 +768,20 @@ impl DetailTab for GraphTab {
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         if self.item.is_none() {
-            message(frame, area, "No item selected.", ctx.theme);
+            no_item(frame, area, self.key_stack(), CHOOSE_UNBOUND, ctx);
             return;
         }
         if self.graph.is_none() {
-            let text = match self.failed.as_deref() {
-                Some(why) => format!("Links unavailable: {why}"),
-                None => "Loading links\u{2026}".to_owned(),
-            };
-            message(frame, area, &text, ctx.theme);
+            match self.failed.as_deref() {
+                Some(why) => unavailable(
+                    frame,
+                    area,
+                    &format!("Links unavailable: {why}"),
+                    self.key_stack(),
+                    ctx,
+                ),
+                None => message(frame, area, "Loading links\u{2026}", ctx.theme),
+            }
             return;
         }
         let rows = self.visible();
@@ -1651,6 +1658,18 @@ mod tests {
         );
     }
 
+    /// MOD-115 M4 RV2-M1: no item under the list's cursor is the kit's empty state, its next step
+    /// the list's motion through `BACKLOG_GRAPH`.
+    #[tokio::test]
+    async fn no_item_is_an_empty_state_with_a_next_step() {
+        let shell = Shell::platform().await;
+        crate::ui::tabs::backlog::detail::assert_empty_state(
+            &draw(&GraphTab::new(), &shell, 43, 6).join("\n"),
+            "No item selected.",
+            "j/k chooses one",
+        );
+    }
+
     /// L8: a refused `Links` read says so, and the next selection is pending again.
     #[tokio::test]
     async fn a_failed_links_read_says_so() {
@@ -1673,9 +1692,11 @@ mod tests {
             },
             &mut ctx,
         );
-        assert_eq!(
-            draw(&tab, &shell, 43, 6)[0],
-            "Links unavailable: connection refused"
+        // MOD-115 M4 RV2-M1: the failure is the kit's empty state, and its next step re-reads.
+        crate::ui::tabs::backlog::detail::assert_empty_state(
+            &draw(&tab, &shell, 43, 6).join("\n"),
+            "Links unavailable: connection refused",
+            "j/k away and back retries",
         );
         tab.on_item_change(Some(ids::HTUI_FEAT_2));
         assert_eq!(draw(&tab, &shell, 43, 6)[0], "Loading links\u{2026}");

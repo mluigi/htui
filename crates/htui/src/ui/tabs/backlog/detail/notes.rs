@@ -54,8 +54,9 @@ use crate::ui::kit::text::{Tone, notice, wrapped};
 use crate::ui::tabs::backlog::detail::compose::{
     self, Compose, ComposeOutcome, could_not_check, may_have_landed, not_written,
 };
-use crate::ui::tabs::backlog::detail::documents::{empty_state, no_item, writes_one};
-use crate::ui::tabs::backlog::detail::{DetailId, DetailTab};
+use crate::ui::tabs::backlog::detail::{
+    CHOOSE_UNBOUND, DetailId, DetailTab, empty_state, no_item, writes_one,
+};
 use crossterm::event::KeyEvent;
 
 /// The browse hint on the pane's last row (D11), through [`views::BACKLOG_NOTES`].
@@ -452,7 +453,7 @@ impl DetailTab for NotesTab {
             return;
         }
         if self.item.is_none() {
-            no_item(frame, area, views::BACKLOG_NOTES, ctx);
+            no_item(frame, area, views::BACKLOG_NOTES, CHOOSE_UNBOUND, ctx);
             return;
         }
         // Review M1's sentence under the thread, the kit's notice row (MOD-115 M4 L-docs); D11's

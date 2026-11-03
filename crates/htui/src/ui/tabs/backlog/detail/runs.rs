@@ -94,7 +94,7 @@ use crate::ui::kit::label::{self, Mark, plural};
 use crate::ui::kit::modal::{Ask, modal_rest};
 use crate::ui::kit::scroll::{Scroll, Step};
 use crate::ui::kit::text::STAMP;
-use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, message};
+use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, message, no_item};
 use crate::ui::tabs::chat::permission::PermissionStrip;
 use crate::ui::text_field::{FieldOutcome, TextField};
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -146,13 +146,7 @@ const NO_STEPS_YET: &str = "No steps yet.";
 /// [`NO_STEPS_YET`]'s next step (MOD-115 M4 L-runs): nothing to press, the walk adds them.
 const NO_STEPS_NEXT: &str = "its steps show here as it takes them";
 
-/// The pane with no item under the list's cursor (a project header).
-const NO_ITEM: &str = "No item selected.";
-
-/// [`NO_ITEM`]'s next step: the list's motion, through the browse stack.
-const CHOOSE_AN_ITEM: HintSpec = &[Hint::Pair(Act::ListDown, Act::ListUp, "chooses one")];
-
-/// [`NO_ITEM`]'s next step while the list's motion is unbound.
+/// The no-item state's next step while the list's motion is unbound (`detail::no_item`).
 const CHOOSE_UNBOUND: &str = "a chosen item's runs show here";
 
 /// The item with no run.
@@ -166,16 +160,6 @@ fn no_runs_next(keys: &Keys) -> String {
             || "a key bound to start_run in keys.toml starts one".to_owned(),
             |key| format!("{key} starts one"),
         )
-}
-
-/// [`NO_ITEM`]'s next step: the list's motion, or [`CHOOSE_UNBOUND`].
-fn no_item_next(keys: &Keys) -> String {
-    let choose = keys.hint(views::RUNS_BROWSE, CHOOSE_AN_ITEM);
-    if choose.is_empty() {
-        CHOOSE_UNBOUND.to_owned()
-    } else {
-        choose
-    }
 }
 
 /// What a relayed request with no summary asks for (MOD-42 blueprint B-14: the transport named no
@@ -2133,8 +2117,7 @@ impl DetailTab for RunsTab {
         // MOD-71 D5: only a frame that draws the canvas records it (render_flow).
         self.canvas.set(None);
         if self.item.is_none() {
-            let next = no_item_next(ctx.keys());
-            empty::render(frame, area, NO_ITEM, NextStep(&next), ctx.theme);
+            no_item(frame, area, views::RUNS_BROWSE, CHOOSE_UNBOUND, ctx);
             return;
         }
         self.render_content(frame, area, ctx);

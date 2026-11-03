@@ -30,7 +30,9 @@ use crate::ui::kit::chips::key_line;
 use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::label::{self, plural};
 use crate::ui::kit::scroll::{Scroll, Step};
-use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, message};
+use crate::ui::tabs::backlog::detail::{
+    CHOOSE_UNBOUND, DetailId, DetailTab, message, no_item, unavailable,
+};
 use crate::ui::{Theme, cells};
 use crossterm::event::KeyEvent;
 
@@ -415,15 +417,20 @@ impl DetailTab for PromptTab {
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         if self.item.is_none() {
-            message(frame, area, "No item selected.", ctx.theme);
+            no_item(frame, area, views::BACKLOG_PROMPT, CHOOSE_UNBOUND, ctx);
             return;
         }
         let Some(preview) = self.preview.as_ref() else {
-            let text = match self.failed.as_deref() {
-                Some(why) => format!("No preview: {why}"),
-                None => "Assembling the prompt\u{2026}".to_owned(),
-            };
-            message(frame, area, &text, ctx.theme);
+            match self.failed.as_deref() {
+                Some(why) => unavailable(
+                    frame,
+                    area,
+                    &format!("No preview: {why}"),
+                    views::BACKLOG_PROMPT,
+                    ctx,
+                ),
+                None => message(frame, area, "Assembling the prompt\u{2026}", ctx.theme),
+            }
             return;
         };
         if preview.available.is_empty() {
@@ -532,6 +539,35 @@ mod tests {
 
             assert_eq!(whole, only, "the two disagree at offset {offset}");
         }
+    }
+
+    /// MOD-115 M4 RV2-M1: no item under the list's cursor is the kit's empty state, its next step
+    /// the list's motion through `BACKLOG_PROMPT`; a refused preview is one too, its next step
+    /// the re-read.
+    #[test]
+    fn no_item_and_a_refused_preview_are_empty_states_with_a_next_step() {
+        use crate::ui::tabs::backlog::detail::assert_empty_state;
+        use crate::ui::tabs::backlog::detail::compose::bench::{Shell, drawn};
+
+        let shell = Shell::new();
+        let mut tab = PromptTab::new();
+        let text = drawn(43, 6, |frame, area| tab.render(frame, area, &shell.ctx()));
+        assert_empty_state(&text, "No item selected.", "j/k chooses one");
+
+        tab.on_item_change(Some(htui_core::fixtures::ids::HTUI_FEAT_1));
+        tab.on_reply(
+            &StoreReply::Failed {
+                request: crate::store_worker::PROMPT_PREVIEW,
+                message: "store unreachable".to_owned(),
+            },
+            &mut shell.ctx(),
+        );
+        let text = drawn(43, 6, |frame, area| tab.render(frame, area, &shell.ctx()));
+        assert_empty_state(
+            &text,
+            "No preview: store unreachable",
+            "j/k away and back retries",
+        );
     }
 
     /// MOD-115 M2 §7: with the detail focused the list's motion scrolls the prompt, a row as `J`

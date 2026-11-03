@@ -35,7 +35,8 @@ use crate::ui::kit::scroll::{Scroll, Step};
 use crate::ui::kit::status;
 use crate::ui::kit::text::wrapped;
 use crate::ui::markdown;
-use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, message};
+use crate::ui::tabs::backlog::detail;
+use crate::ui::tabs::backlog::detail::{CHOOSE_UNBOUND, DetailId, DetailTab, no_item};
 use crossterm::event::KeyEvent;
 
 /// The sub-tab's chip, also what the border's title room is measured against.
@@ -126,12 +127,12 @@ fn meta_lines(item: &Item, width: u16, theme: &Theme) -> Vec<Line<'static>> {
 /// The empty body's next step: the key that opens the item form (`common.edit` through
 /// `BACKLOG_BODY`), or the form itself while nothing binds it.
 fn writes_one(ctx: &Ctx<'_>) -> String {
-    ctx.keys()
-        .label(views::BACKLOG_BODY, Act::Edit)
-        .map_or_else(
-            || "the item form writes one".to_owned(),
-            |key| format!("{key} writes one"),
-        )
+    detail::writes_one(
+        views::BACKLOG_BODY,
+        Act::Edit,
+        "the item form writes one",
+        ctx.keys(),
+    )
 }
 
 impl DetailTab for BodyTab {
@@ -178,7 +179,7 @@ impl DetailTab for BodyTab {
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let Some(item) = self.item.as_ref() else {
-            message(frame, area, "No item selected.", ctx.theme);
+            no_item(frame, area, views::BACKLOG_BODY, CHOOSE_UNBOUND, ctx);
             return;
         };
 
@@ -481,6 +482,17 @@ mod tests {
             ],
             "{rows:#?}"
         );
+    }
+
+    /// MOD-115 M4 RV2-M1: no item under the list's cursor is the kit's empty state, its next step
+    /// the list's motion through `BACKLOG_BODY`, as every other sub-tab says it.
+    #[test]
+    fn no_item_is_an_empty_state_with_a_next_step() {
+        let shell = Shell::new();
+        let text = drawn(43, 6, |frame, area| {
+            BodyTab::new().render(frame, area, &shell.ctx());
+        });
+        detail::assert_empty_state(&text, "No item selected.", "j/k chooses one");
     }
 
     /// No body: `kit::empty`, its next step the key the item form opens on, rebound or not.

@@ -4,7 +4,7 @@ expression: frame
 ---
 Platform   ¹Backlog             1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
 ╭─ Backlog (0) ───────────────────────────────────────╮╭─ Detail ─ Body  Runs  Graph  Docs  Notes ›╮
-│ / status: done · tags: rust                  0 items││No item selected.                          │
+│ / status: done · tags: rust                  0 items││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
@@ -17,8 +17,8 @@ Platform   ¹Backlog             1 working · 1 waiting · memory · DESKTOP-HTU
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
-│             No items match the filter.              ││                                           │
-│                 F clears the filter                 ││                                           │
+│             No items match the filter.              ││             No item selected.             │
+│                 F clears the filter                 ││              j/k chooses one              │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │

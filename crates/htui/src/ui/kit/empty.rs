@@ -8,6 +8,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::ui::Theme;
 use crate::ui::cells::clip_line;
+use crate::ui::kit::text::wrapped;
 use crate::ui::layout::centered;
 
 /// The next step an empty state points at. Required, so no empty state is a dead end.
@@ -24,10 +25,44 @@ pub fn lines(what: &str, next: NextStep<'_>, theme: &Theme) -> Vec<Line<'static>
     ]
 }
 
+/// The lines of a failed read (MOD-115 M4 RV2-M1): the failure wrapped at `width` in the error
+/// role, so no part of its sentence is lost, then the next step in the focus role.
+#[must_use]
+pub fn failed_lines(
+    what: &str,
+    width: u16,
+    next: NextStep<'_>,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = wrapped(what, usize::from(width.max(1)))
+        .into_iter()
+        .map(|row| Line::styled(row, theme.error))
+        .collect();
+    lines.push(Line::styled(next.0.to_owned(), theme.accent));
+    lines
+}
+
 /// Draws an empty state centred in `area`. Each line is clipped to the width first, so a long
 /// sentence loses its tail and not its alignment.
 pub fn render(frame: &mut Frame<'_>, area: Rect, what: &str, next: NextStep<'_>, theme: &Theme) {
-    let lines: Vec<Line<'static>> = lines(what, next, theme)
+    centred(frame, area, lines(what, next, theme));
+}
+
+/// Draws a failed read centred in `area` as [`failed_lines`]: a pane whose read was refused is an
+/// empty state too, and its next step is never optional either.
+pub fn render_failed(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    what: &str,
+    next: NextStep<'_>,
+    theme: &Theme,
+) {
+    centred(frame, area, failed_lines(what, area.width, next, theme));
+}
+
+/// `lines`, each clipped to the width and centred, the block centred in `area`.
+fn centred(frame: &mut Frame<'_>, area: Rect, lines: Vec<Line<'static>>) {
+    let lines: Vec<Line<'static>> = lines
         .into_iter()
         .map(|line| clip_line(line, area.width).alignment(Alignment::Center))
         .collect();
@@ -131,6 +166,23 @@ mod tests {
             shown.iter().filter(|row| row.contains("indeed")).count() == 0,
             "the tail is clipped: {shown:?}"
         );
+    }
+
+    /// RV2-M1: a failed read keeps its whole sentence, wrapped in the error role, and its next
+    /// step under it in the focus role.
+    #[test]
+    fn a_failed_read_wraps_its_sentence_and_keeps_the_next_step() {
+        let theme = Theme::default();
+        let lines = failed_lines(
+            "Links unavailable: connection refused",
+            20,
+            NextStep("retry"),
+            &theme,
+        );
+        let text: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        assert_eq!(text, ["Links unavailable:", "connection refused", "retry"]);
+        assert_eq!(lines[0].style, theme.error);
+        assert_eq!(lines[2].style, theme.accent);
     }
 
     #[test]

@@ -57,7 +57,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 
 use crate::app::{Action, Ctx, Handled};
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
@@ -72,7 +72,7 @@ use crate::ui::kit::label;
 use crate::ui::kit::list::{GUTTER, ellipsize, selection_band};
 use crate::ui::kit::modal::modal_rest;
 use crate::ui::kit::scroll::{Scroll, Step};
-use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, message};
+use crate::ui::tabs::backlog::detail::{CHOOSE_UNBOUND, DetailId, DetailTab, no_item, unavailable};
 use crossterm::event::KeyEvent;
 
 /// What `r` says on a citation stamped at the requirement's current version.
@@ -647,7 +647,7 @@ impl DetailTab for ReqsTab {
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         if self.item.is_none() {
-            message(frame, area, "No item selected.", ctx.theme);
+            no_item(frame, area, views::BACKLOG_REQS, CHOOSE_UNBOUND, ctx);
             return;
         }
         let width = usize::from(area.width);
@@ -663,10 +663,12 @@ impl DetailTab for ReqsTab {
         if self.citations.is_none()
             && let Some(failed) = &self.failed
         {
-            frame.render_widget(
-                Paragraph::new(Line::styled(failed.clone(), ctx.theme.error))
-                    .wrap(Wrap { trim: true }),
+            unavailable(
+                frame,
                 list,
+                &format!("Citations unavailable: {failed}"),
+                views::BACKLOG_REQS,
+                ctx,
             );
             return;
         }
@@ -1142,6 +1144,18 @@ mod tests {
             .collect()
     }
 
+    /// MOD-115 M4 RV2-M1: no item under the list's cursor is the kit's empty state, its next step
+    /// the list's motion through `BACKLOG_REQS`.
+    #[test]
+    fn no_item_is_an_empty_state_with_a_next_step() {
+        let shell = Shell::new();
+        crate::ui::tabs::backlog::detail::assert_empty_state(
+            &drawn(&ReqsTab::new(), &shell).join("\n"),
+            "No item selected.",
+            "j/k chooses one",
+        );
+    }
+
     /// Blueprint §5.4: a refused read is drawn in the pane (its keys are the shell's hint row since
     /// MOD-67 M6 T2), and a later answer replaces it.
     #[tokio::test]
@@ -1157,7 +1171,12 @@ mod tests {
             &mut shell.ctx(),
         );
         let rows = drawn(&pane, &shell);
-        assert_eq!(rows[0], "the read was refused", "{rows:#?}");
+        // MOD-115 M4 RV2-M1: the kit's empty state, the failure in it whole, and the re-read.
+        crate::ui::tabs::backlog::detail::assert_empty_state(
+            &rows.join("\n"),
+            "Citations unavailable: the read was refused",
+            "j/k away and back retries",
+        );
         assert_eq!(
             pane.key_hint(Keys::compiled(), &Theme::default())
                 .map(|line| line.to_string())

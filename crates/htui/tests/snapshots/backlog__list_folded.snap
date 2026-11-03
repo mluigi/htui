@@ -4,7 +4,7 @@ expression: folded
 ---
 Platform   ¹Backlog             1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ Detail ─ Body  Runs  Graph  Docs  Notes ›╮
-│▌▸ htui (8)                                          ││No item selected.                          │
+│▌▸ htui (8)                                          ││                                           │
 │ ▾ agy (3)                                           ││                                           │
 │  ANA-1    ● done       Prompt assembly survey       ││                                           │
 │  FEAT-1   ○ open       ACP transport upgrade        ││                                           │
@@ -17,8 +17,8 @@ Platform   ¹Backlog             1 working · 1 waiting · memory · DESKTOP-HTU
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
-│                                                     ││                                           │
-│                                                     ││                                           │
+│                                                     ││             No item selected.             │
+│                                                     ││              j/k chooses one              │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
