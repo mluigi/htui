@@ -48,6 +48,7 @@ use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells;
 use crate::ui::kit::chips::key_line;
+use crate::ui::kit::pane::Focus;
 use crate::ui::kit::scroll::{Scroll, Step};
 use crate::ui::kit::text::STAMP;
 use crate::ui::kit::text::{Tone, notice, wrapped};
@@ -129,6 +130,9 @@ pub struct NotesTab {
     hedged: Option<Hedged>,
     /// Review M1: the hedge settled as written, under the thread until the next key.
     notice: Option<String>,
+    /// How the detail pane is drawn this frame (`DetailTab::frame_focus`, MOD-115 M4 RV2-L1): what
+    /// the compose rule is drawn as. `Cell` because `render` is `&self`.
+    pane_focus: Cell<Option<Focus>>,
 }
 
 impl NotesTab {
@@ -446,9 +450,21 @@ impl DetailTab for NotesTab {
         key_line(hint, theme)
     }
 
+    fn frame_focus(&self, focus: Focus) {
+        self.pane_focus.set(Some(focus));
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         if let Some(compose) = &self.compose {
-            let body = compose::render(frame, area, compose, " New note ", None, ctx);
+            let body = compose::render(
+                frame,
+                area,
+                compose,
+                " New note ",
+                None,
+                self.pane_focus.get(),
+                ctx,
+            );
             ctx.claim_editor_area(body);
             return;
         }

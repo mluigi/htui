@@ -35,7 +35,7 @@ use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::store_worker::StoreReply;
 use crate::ui::Theme;
 use crate::ui::kit::empty::{self, NextStep};
-use crate::ui::kit::pane::Pane;
+use crate::ui::kit::pane::{Focus, Pane};
 use crate::ui::kit::scroll::Step;
 use crate::ui::tabs::backlog::Chrome;
 use crossterm::event::{KeyEvent, MouseEvent};
@@ -98,6 +98,10 @@ pub trait DetailTab {
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>);
     /// Draws into the detail pane's inner rect (the chips are on its border, MOD-115 M4 E4).
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>);
+    /// How the detail pane is drawn this frame, told just before [`render`](DetailTab::render)
+    /// (MOD-115 M4 RV2-L1): what a part drawn as the pane is (a compose area's rule) takes, so it
+    /// never looks focused while its pane does not (C4). The default ignores it.
+    fn frame_focus(&self, _focus: Focus) {}
     /// Whether this sub-tab shows a run that is still active (MOD-41 plan D16): what the Backlog
     /// tab's `Runs` poll asks before it re-reads. Only [`RunsTab`] shows runs.
     fn has_active_run(&self) -> bool {
@@ -411,7 +415,10 @@ pub fn render(
 ) {
     let inner = Pane::inner(area);
     match registry.active() {
-        Some(tab) => tab.render(frame, inner, ctx),
+        Some(tab) => {
+            tab.frame_focus(chrome.focus);
+            tab.render(frame, inner, ctx);
+        }
         None => message(frame, inner, "No detail sub-tab is registered.", ctx.theme),
     }
     let title = title(item);

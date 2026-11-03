@@ -140,6 +140,38 @@ async fn the_empty_docs_and_notes_name_the_key_that_writes_one() {
     }
 }
 
+/// MOD-115 M4 RV2-L1: with the shell's activity pane holding the focus, the compose rule is drawn
+/// as its detail pane is, not focused: one pane holds the keyboard (C4), so its title is not bold.
+#[tokio::test]
+async fn the_compose_rule_follows_the_detail_pane_while_the_activity_pane_has_the_focus() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    let mut harness = on(100, 30, TO_FEAT_1, TO_DOCS).await;
+    keys(&mut harness, &["f3"]).await;
+    let _ = harness.render();
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), 50, 25);
+    harness.drive_to_end().await;
+    keys(&mut harness, &["a"]).await;
+    let frame = harness.render();
+    let rule = frame
+        .lines()
+        .position(|row| row.contains(" New document "))
+        .unwrap_or_else(|| panic!("the rule:\n{frame}"));
+    assert!(
+        frame.contains(" Activity "),
+        "the activity pane is shown:\n{frame}"
+    );
+    let buffer = harness.render_buffer();
+    let y = u16::try_from(rule).expect("on screen");
+    let x = (0..buffer.area.width)
+        .find(|x| buffer[(*x, y)].symbol() == "N")
+        .expect("the rule's title");
+    assert!(
+        !buffer[(x, y)].modifier.contains(Modifier::BOLD),
+        "the rule is drawn as its unfocused pane:\n{frame}"
+    );
+}
+
 /// MOD-115 M4 L-docs: `v` opens the compose area on the kit: its rule is the title then `─` to
 /// the pane's edge, bold while the detail holds the keyboard; the fixed kind and the title are
 /// form rows and the body's heading has the focus, behind the gutter, never a `> ` marker.

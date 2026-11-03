@@ -41,6 +41,7 @@
 //!   The read goes through the store's writer, as the form's does, so it is never the mirror's
 //!   (round 1): offline it fails, and a failed check says it could not check.
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
 
 use htui_core::model::hand_written::SUMMARY_KIND;
@@ -59,6 +60,7 @@ use crate::ui::Theme;
 use crate::ui::cells;
 use crate::ui::kit::chips::key_line;
 use crate::ui::kit::list::{self, Row, RowKind};
+use crate::ui::kit::pane::Focus;
 use crate::ui::kit::scroll::{Scroll, Step};
 use crate::ui::kit::text::{Tone, notice, wrapped};
 use crate::ui::tabs::backlog::detail::compose::{
@@ -164,6 +166,9 @@ pub struct DocumentsTab {
     compose: Option<Compose>,
     /// D5: the last save's sentence, under the table until the next key.
     notice: Option<String>,
+    /// How the detail pane is drawn this frame (`DetailTab::frame_focus`, MOD-115 M4 RV2-L1): what
+    /// the compose rule is drawn as. `Cell` because `render` is `&self`.
+    pane_focus: Cell<Option<Focus>>,
 }
 
 impl DocumentsTab {
@@ -652,11 +657,23 @@ impl DetailTab for DocumentsTab {
         key_line(hint, theme)
     }
 
+    fn frame_focus(&self, focus: Focus) {
+        self.pane_focus.set(Some(focus));
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         if let Some(compose) = &self.compose {
             let title = self.compose_title(compose);
             let kinds = self.kinds();
-            let body = compose::render(frame, area, compose, &title, Some(&kinds), ctx);
+            let body = compose::render(
+                frame,
+                area,
+                compose,
+                &title,
+                Some(&kinds),
+                self.pane_focus.get(),
+                ctx,
+            );
             ctx.claim_editor_area(body);
             return;
         }

@@ -632,6 +632,10 @@ impl Compose {
 /// covers the tab; a document's rows are a kit form ([`Compose::form`]), the focus its gutter in
 /// the tab's accent (`ctx.accent()`); the notice is the kit's notice row in the error role.
 ///
+/// `focus` is how the detail pane around the area is drawn this frame (`DetailTab::frame_focus`,
+/// MOD-115 M4 RV2-L1), so the rule and its pane agree; `None` (a pane drawn outside
+/// `detail::render`) is the keyboard holder's ([`holder`]).
+///
 /// Returns the body's rect, which the pane claims for an in-pane editor (MOD-57 P2).
 pub fn render(
     frame: &mut Frame<'_>,
@@ -639,10 +643,11 @@ pub fn render(
     compose: &Compose,
     title: &str,
     kinds: Option<&str>,
+    focus: Option<Focus>,
     ctx: &Ctx<'_>,
 ) -> Rect {
     let theme = ctx.theme;
-    let focused = holder(ctx, false) == Focus::Focused;
+    let focused = focus.unwrap_or_else(|| holder(ctx, false)) == Focus::Focused;
     let inner = rule::render(frame, area, title, focused, theme);
     let width = inner.width;
 
@@ -1215,7 +1220,7 @@ mod tests {
                 .expect("a test terminal");
         let mut body = Rect::default();
         terminal
-            .draw(|frame| body = render(frame, frame.area(), compose, title, kinds, ctx))
+            .draw(|frame| body = render(frame, frame.area(), compose, title, kinds, None, ctx))
             .expect("the frame draws");
         (terminal.backend().buffer().clone(), body)
     }
@@ -1232,7 +1237,15 @@ mod tests {
         let shell = Shell::new();
         let compose = note();
         let text = drawn(43, 23, |frame, area| {
-            render(frame, area, &compose, " New note ", None, &shell.ctx());
+            render(
+                frame,
+                area,
+                &compose,
+                " New note ",
+                None,
+                None,
+                &shell.ctx(),
+            );
         });
         assert!(text.contains(" New note "), "{text}");
         assert!(!text.contains(&rendered(&compose, HINT_AREA)), "{text}");
@@ -1249,6 +1262,7 @@ mod tests {
                 &compose,
                 " New document ",
                 Some("plan, prd, summary"),
+                None,
                 &shell.ctx(),
             );
         });
@@ -1272,6 +1286,7 @@ mod tests {
                 &fixed,
                 " New version of plan (from v2) ",
                 Some("plan, prd, summary"),
+                None,
                 &shell.ctx(),
             );
         });
@@ -1426,6 +1441,7 @@ mod tests {
                 &compose,
                 " New note ",
                 None,
+                None,
                 &shell.ctx(),
             ));
         });
@@ -1449,6 +1465,7 @@ mod tests {
                 &compose,
                 " New document ",
                 Some("plan, prd, summary"),
+                None,
                 &shell.ctx(),
             ));
         });
@@ -1478,7 +1495,15 @@ mod tests {
             "thread",
         )));
         let text = drawn(43, 8, |frame, area| {
-            render(frame, area, &compose, " New note ", None, &shell.ctx());
+            render(
+                frame,
+                area,
+                &compose,
+                " New note ",
+                None,
+                None,
+                &shell.ctx(),
+            );
         });
         assert!(text.contains("re-read to check"), "{text}");
     }
