@@ -1,7 +1,7 @@
 //! The Skills tab (MOD-9 PRD D1): a `Skills | Templates` switch.
 //!
-//! MOD-115 M4 E5: the tab draws its own kit panes (`draws_chrome`). The switch is no line of
-//! its own any more: the pane that leads the shown view (the list while browsing, else what
+//! MOD-115 M4 E5: the tab draws its own kit panes. The switch is no line of its own any
+//! more: the pane that leads the shown view (the list while browsing, else what
 //! covers the content) carries `Skills` and `Templates` as chips on its top border, the
 //! active one naming the view ([`view_chips`]); a pane that holds the keyboard carries them
 //! only while its whole title fits beside them ([`view_chips_if_room`]). The pane that holds
@@ -353,11 +353,6 @@ impl Tab for SkillsTab {
         target.is_some() || row
     }
 
-    /// MOD-115 M4 E5: the tab draws its own kit panes; the shell paints nothing over them.
-    fn draws_chrome(&self) -> bool {
-        true
-    }
-
     /// The shown view over the whole body (MOD-115 M4 E5: no switch line; the view chips are on
     /// the pane that leads it).
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
@@ -448,12 +443,6 @@ mod tests {
         buffer[(x, 0)]
             .modifier
             .contains(Modifier::BOLD | Modifier::UNDERLINED)
-    }
-
-    /// MOD-115 M4 E5: the tab draws its own kit panes, so the shell paints nothing over them.
-    #[test]
-    fn the_tab_draws_its_own_chrome() {
-        assert!(SkillsTab::new().draws_chrome());
     }
 
     /// MOD-115 M4 E5: no `Skills │ Templates` line: the list pane's top border, the first row,

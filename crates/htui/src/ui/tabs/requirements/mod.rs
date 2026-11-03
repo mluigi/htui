@@ -1436,11 +1436,6 @@ impl Tab for RequirementsTab {
         self.keys_line(ctx.keys(), ctx.theme)
     }
 
-    /// MOD-115 M3 D1, D6: the tree and the detail as kit panes, their hints on the focused one.
-    fn draws_chrome(&self) -> bool {
-        true
-    }
-
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let (notice, tone) = match &self.notice {
             Some(Notice::Info(text)) => (text.as_str(), Tone::Info),
@@ -2836,12 +2831,6 @@ mod tests {
     fn style_of(buffer: &ratatui::buffer::Buffer, rows: &[String], text: &str) -> Style {
         let (x, y) = find(rows, text).unwrap_or_else(|| panic!("`{text}` is drawn: {rows:#?}"));
         buffer[(x, y)].style()
-    }
-
-    /// MOD-115 M3 D1: the tab draws its own kit panes, so the shell paints nothing over them.
-    #[test]
-    fn the_tab_draws_its_own_chrome() {
-        assert!(RequirementsTab::new().draws_chrome());
     }
 
     /// MOD-115 M3 D6: the tree and the detail are rounded kit panes titled on their top border,

@@ -460,12 +460,6 @@ async fn under_an_overlay_no_pane_is_focused() {
     }
 }
 
-/// MOD-115 M4 E4: the Backlog draws its own kit panes; the shell paints nothing over them.
-#[test]
-fn the_backlog_draws_its_own_chrome() {
-    assert!(BacklogTab::new().draws_chrome());
-}
-
 /// The style of a cell, for the monochrome marker proof below.
 fn style_at(buffer: &Buffer, x: u16, y: u16) -> Style {
     buffer[(x, y)].style()

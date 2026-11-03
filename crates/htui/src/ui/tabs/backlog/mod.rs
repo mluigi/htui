@@ -620,12 +620,6 @@ impl Tab for BacklogTab {
         }
     }
 
-    /// MOD-115 M4 E4: the Backlog draws its own kit panes (the list, the Filter pane, the
-    /// detail or what takes its place); the shell paints nothing over them.
-    fn draws_chrome(&self) -> bool {
-        true
-    }
-
     /// MOD-115 M4 E4: the list, the open filter form and the detail as kit panes, the one that
     /// holds the keyboard focused (C4) and carrying its own keys (Q2).
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {

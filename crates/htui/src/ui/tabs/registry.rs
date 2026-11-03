@@ -91,10 +91,12 @@ pub trait Tab {
     fn browse_stack(&self) -> Stack<'static> {
         self.key_stack().unwrap_or(Stack::BASE)
     }
-    /// The keys of this tab's focused mode for the shell's hint row (MOD-67 M6 D10, design review
-    /// finding 3): the mode's hint spec rendered through its own stack, so a rebound key shows its
-    /// new chord. `width` is the row's; a tab that composes two hints keeps the second only when
-    /// both fit. `None`: no row (the test doubles; a tab with nothing to say). Defaulted.
+    /// The keys of this tab's focused mode (MOD-67 M6 D10, design review finding 3): the mode's
+    /// hint spec rendered through its own stack, so a rebound key shows its new chord. What the
+    /// shell draws on its activity pane's bottom border while that pane is focused (MOD-115 M3
+    /// C2, M4 C8); every other pane is the tab's own and carries its own hints. `width` is the
+    /// row's; a tab that composes two hints keeps the second only when both fit. `None`: no
+    /// hints (the test doubles; a tab with nothing to say). Defaulted.
     fn key_hint(&self, _width: u16, _ctx: &Ctx<'_>) -> Option<Line<'static>> {
         None
     }
@@ -158,14 +160,6 @@ pub trait Tab {
     /// the sub-tab and moves the cursor. `false` when nothing could be restored, which is what
     /// the default says.
     fn restore(&mut self, _loc: &TabLoc, _ctx: &mut Ctx<'_>) -> bool {
-        false
-    }
-
-    /// MOD-115 M3 D1: whether this tab draws its own kit panes (title, chips, focus border,
-    /// hints). The shell then neither restyles its list/detail borders nor paints the hint
-    /// adapter over them; the hidden-pane note and the activity placeholder stay the shell's.
-    /// Defaulted to `false`. M4's last task deletes it with the adapter.
-    fn draws_chrome(&self) -> bool {
         false
     }
 }

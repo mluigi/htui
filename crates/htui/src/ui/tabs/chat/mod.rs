@@ -578,12 +578,6 @@ impl Tab for ChatTab {
         key_line(hint, ctx.theme)
     }
 
-    /// MOD-115 M3 D5: the Chat draws its own kit pane, so the shell paints no focus or hints
-    /// over it.
-    fn draws_chrome(&self) -> bool {
-        true
-    }
-
     /// Each mode resolves through its stack (MOD-67 M5 D4, D5): the open composer reads its
     /// canonical events (the shell's `[field]` translation, MOD-115 M2 D7), a parked request
     /// answers on `answer.option_*` through `CHAT_LIVE`, and the replay's swallow takes what the
@@ -1276,13 +1270,6 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
-    }
-
-    /// MOD-115 M3 D5: the Chat draws its own kit pane, so the shell paints no focus or hints
-    /// over it.
-    #[test]
-    fn chat_draws_its_own_chrome() {
-        assert!(ChatTab::new().draws_chrome());
     }
 
     /// MOD-115 M3 D5: one rounded pane titled by the session; the `┌ Chat ─` box and the header
