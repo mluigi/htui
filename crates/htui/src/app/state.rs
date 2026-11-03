@@ -2466,7 +2466,9 @@ pub(crate) mod shell_tests {
     /// The bottom border of the pane drawn in `rect`, its own cells only.
     fn pane_bottom(buf: &Buffer, rect: Rect) -> String {
         let y = rect.bottom() - 1;
-        (rect.x..rect.right()).map(|x| buf[(x, y)].symbol()).collect()
+        (rect.x..rect.right())
+            .map(|x| buf[(x, y)].symbol())
+            .collect()
     }
 
     /// M3 D1, M4 E8: the shell does not restyle a tab's borders: the focused pane keeps the
@@ -2512,7 +2514,11 @@ pub(crate) mod shell_tests {
             let buf = draw(&mut app, 100, 30);
             let rows = rows_with(&buf, "j/k move");
             assert_eq!(rows.len(), 1, "{focus:?}");
-            assert_eq!(row(&buf, rows[0]).matches("j/k move").count(), 1, "{focus:?}");
+            assert_eq!(
+                row(&buf, rows[0]).matches("j/k move").count(),
+                1,
+                "{focus:?}"
+            );
         }
     }
 
@@ -2544,11 +2550,17 @@ pub(crate) mod shell_tests {
 
         let mut app = split_app();
         let buf = draw(&mut app, 100, 30);
-        assert!(pane_bottom(&buf, list).contains("j/k move"), "the focused list's");
+        assert!(
+            pane_bottom(&buf, list).contains("j/k move"),
+            "the focused list's"
+        );
         app.push_overlay(Box::new(WorkspaceSwitcher::new()));
         let buf = draw(&mut app, 100, 30);
         for pane in [list, areas.detail] {
-            assert!(!pane_bottom(&buf, pane).contains("j/k move"), "no hint under it");
+            assert!(
+                !pane_bottom(&buf, pane).contains("j/k move"),
+                "no hint under it"
+            );
         }
     }
 
@@ -3607,7 +3619,10 @@ pub(crate) mod shell_tests {
         /// render's `Ctx`, as every list + detail tab does (MOD-115 M4 E8).
         fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
             let areas = ctx.split(area, SPLIT_LAYOUT);
-            for (id, rect) in [(PaneId::List, areas.list), (PaneId::Detail, Some(areas.detail))] {
+            for (id, rect) in [
+                (PaneId::List, areas.list),
+                (PaneId::Detail, Some(areas.detail)),
+            ] {
                 let Some(rect) = rect.filter(|rect| !rect.is_empty()) else {
                     continue;
                 };
