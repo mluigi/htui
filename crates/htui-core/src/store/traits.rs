@@ -883,13 +883,16 @@ pub trait WriteStore: ReadStore {
     /// ([`graph_not_usable`]).
     async fn create_item_kind(&self, new: NewItemKind) -> Result<ItemKind>;
 
-    /// Edits under CAS with the same three rules as [`create_item_kind`](Self::create_item_kind).
+    /// Edits under CAS with the same three rules as [`create_item_kind`](Self::create_item_kind),
+    /// except that `default_graph_id` is checked against the usable-graphs rule only when the patch
+    /// changes it (A7), as an item's graph is: a kind keeps a workspace graph its project has left.
     /// Renaming the prefix leaves existing keys (`ANA-2`) and counters alone; the next mint under
     /// the kind starts a counter for the new prefix (PRD D12).
     ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id;
-    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) as for create.
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) as for create, the graph
+    /// only when the patch changes it.
     async fn update_item_kind(
         &self,
         id: ItemKindId,
