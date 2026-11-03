@@ -1516,13 +1516,14 @@ fn who(agent: Option<&str>, model: Option<&str>) -> String {
 /// One step's two lines (D197, MOD-115 M4 E10): the phase (the step's name), its status mark, its
 /// usage and duration; then its [`place`] in the run's place column, its gate and the tail, the
 /// tail left blank when it wraps to [`tail_line`]. `siblings` are the steps of its run, which the
-/// place and its column are read against.
+/// place is read against, and `places` their [`place_width`], computed once per run (RV2-L2).
 ///
 /// The cursor's `▸` and the phase take `accent` on the step under the cursor (the tab's accent,
 /// `Ctx::accent`: focus, MOD-85), dim elsewhere; the glyph carries the cursor without colour.
 fn step_lines(
     step: &RunStepSummary,
     siblings: &[RunStepSummary],
+    places: usize,
     on_cursor: bool,
     accent: Style,
     theme: &Theme,
@@ -1550,7 +1551,6 @@ fn step_lines(
         ),
     ]);
     let mut second = vec![Span::raw(blank(INDENT))];
-    let places = place_width(siblings);
     if places > 0 {
         second.push(Span::styled(
             cells::fit(&place(step, siblings), places),
@@ -1587,12 +1587,8 @@ fn wraps(step: &RunStepSummary, places: usize) -> bool {
 
 /// A step's tail on a line of its own under its place, when it does not fit beside it
 /// ([`wraps`]): the indicator and agent/model at the indent, fitted to the pane's other cells.
-fn tail_line(
-    step: &RunStepSummary,
-    siblings: &[RunStepSummary],
-    theme: &Theme,
-) -> Option<Line<'static>> {
-    wraps(step, place_width(siblings)).then(|| {
+fn tail_line(step: &RunStepSummary, places: usize, theme: &Theme) -> Option<Line<'static>> {
+    wraps(step, places).then(|| {
         Line::from(vec![
             Span::raw(blank(INDENT)),
             Span::styled(cells::fit(&tail(step), PANE - INDENT), theme.dim),
@@ -2274,10 +2270,14 @@ impl RunsTab {
                 cursor_end = lines.len() + header.len();
             }
             lines.extend(header);
+            // RV2-L2: the place column's width once per run, not once per step and line.
+            let places = place_width(&run.steps);
             for step in &run.steps {
                 let on_cursor = step_cursor == Some(step.id);
-                lines.extend(step_lines(step, &run.steps, on_cursor, accent, theme));
-                lines.extend(tail_line(step, &run.steps, theme));
+                lines.extend(step_lines(
+                    step, &run.steps, places, on_cursor, accent, theme,
+                ));
+                lines.extend(tail_line(step, places, theme));
                 lines.extend(note_line(step, theme));
                 // MOD-37 M5 (ANA-27 T5): how the step's chat opened, after R-3's reason.
                 lines.extend(opening_lines(step, theme));
@@ -2737,6 +2737,7 @@ mod tests {
         let [_, second] = step_lines(
             &step,
             std::slice::from_ref(&step),
+            place_width(std::slice::from_ref(&step)),
             false,
             theme.accent,
             &theme,
@@ -3080,8 +3081,15 @@ mod tests {
         );
         for step in &steps {
             for on_cursor in [false, true] {
-                let [first, second] = step_lines(step, &steps, on_cursor, theme.accent, &theme);
-                let wrapped = tail_line(step, &steps, &theme);
+                let [first, second] = step_lines(
+                    step,
+                    &steps,
+                    place_width(&steps),
+                    on_cursor,
+                    theme.accent,
+                    &theme,
+                );
+                let wrapped = tail_line(step, place_width(&steps), &theme);
                 for line in [&first, &second].into_iter().chain(wrapped.as_ref()) {
                     assert_eq!(
                         line.width(),
@@ -3126,14 +3134,22 @@ mod tests {
             "the judge's place opens its second line: {:?}",
             text(&judge_line(&steps, &theme))
         );
-        let [_, gate] = step_lines(&steps[5], &steps, false, theme.accent, &theme);
+        let [_, gate] = step_lines(
+            &steps[5],
+            &steps,
+            place_width(&steps),
+            false,
+            theme.accent,
+            &theme,
+        );
         assert!(
             text(&gate).contains("rejected*\u{2713}"),
             "promoted and selected both mark the gate: {:?}",
             text(&gate)
         );
         // Repair 1: beside the judge's 14-cell place the long tail wraps to its own line.
-        let long = tail_line(&steps[6], &steps, &theme).expect("a long tail beside a place wraps");
+        let long = tail_line(&steps[6], place_width(&steps), &theme)
+            .expect("a long tail beside a place wraps");
         assert!(
             text(&long).trim_end().ends_with('\u{2026}'),
             "a long agent/model is cut with `…`: {:?}",
@@ -3144,7 +3160,14 @@ mod tests {
 
     /// The second line of [`extremes`]'s judge.
     fn judge_line(steps: &[RunStepSummary], theme: &Theme) -> Line<'static> {
-        let [_, second] = step_lines(&steps[4], steps, false, theme.accent, theme);
+        let [_, second] = step_lines(
+            &steps[4],
+            steps,
+            place_width(steps),
+            false,
+            theme.accent,
+            theme,
+        );
         second
     }
 
@@ -3166,7 +3189,14 @@ mod tests {
         let places: Vec<String> = steps
             .iter()
             .map(|step| {
-                let [_, second] = step_lines(step, &steps, false, theme.accent, &theme);
+                let [_, second] = step_lines(
+                    step,
+                    &steps,
+                    place_width(&steps),
+                    false,
+                    theme.accent,
+                    &theme,
+                );
                 text(&second)
                     .chars()
                     .skip(INDENT)
@@ -3181,6 +3211,7 @@ mod tests {
         let [single, second] = step_lines(
             &base,
             std::slice::from_ref(&base),
+            place_width(std::slice::from_ref(&base)),
             false,
             theme.accent,
             &theme,
@@ -3283,6 +3314,7 @@ mod tests {
         let [first, _] = step_lines(
             &running,
             std::slice::from_ref(&running),
+            place_width(std::slice::from_ref(&running)),
             false,
             theme.accent,
             &theme,
@@ -3433,6 +3465,7 @@ mod tests {
         let [first, _] = step_lines(
             &step,
             std::slice::from_ref(&step),
+            place_width(std::slice::from_ref(&step)),
             false,
             theme.accent,
             &theme,
@@ -7087,7 +7120,10 @@ mod tests {
         let slot = fanned_out(1).await;
         let lines: Vec<[String; 2]> = slot
             .iter()
-            .map(|step| step_lines(step, &slot, false, theme.accent, &theme).map(|l| text(&l)))
+            .map(|step| {
+                step_lines(step, &slot, place_width(&slot), false, theme.accent, &theme)
+                    .map(|l| text(&l))
+            })
             .collect();
         assert!(lines[0][0].starts_with("  prd "), "{:?}", lines[0][0]);
         assert!(
@@ -7110,6 +7146,7 @@ mod tests {
         let [_, second] = step_lines(
             &plain,
             std::slice::from_ref(&plain),
+            place_width(std::slice::from_ref(&plain)),
             false,
             theme.accent,
             &theme,
@@ -7136,9 +7173,9 @@ mod tests {
 
     /// A step's lines as the list draws them: [`step_lines`], then the wrapped tail if any.
     fn drawn(step: &RunStepSummary, slot: &[RunStepSummary], theme: &Theme) -> Vec<String> {
-        let [first, second] = step_lines(step, slot, false, theme.accent, theme);
+        let [first, second] = step_lines(step, slot, place_width(slot), false, theme.accent, theme);
         let mut lines = vec![first, second];
-        lines.extend(tail_line(step, slot, theme));
+        lines.extend(tail_line(step, place_width(slot), theme));
         for line in &lines {
             assert_eq!(line.width(), PANE, "{:?} is not {PANE} wide", text(line));
         }
@@ -7228,6 +7265,7 @@ mod tests {
                 let lines = step_lines(
                     &step,
                     std::slice::from_ref(&step),
+                    place_width(std::slice::from_ref(&step)),
                     on_cursor,
                     theme.accent,
                     &theme,
@@ -7488,12 +7526,26 @@ mod tests {
         let theme = Theme::default();
         let accent = Style::new().fg(ratatui::style::Color::Magenta);
         let step = feat_1_runs().await[0].steps[0].clone();
-        let [on, _] = step_lines(&step, std::slice::from_ref(&step), true, accent, &theme);
+        let [on, _] = step_lines(
+            &step,
+            std::slice::from_ref(&step),
+            place_width(std::slice::from_ref(&step)),
+            true,
+            accent,
+            &theme,
+        );
         assert_eq!(on.spans[0].content, CURSOR);
         assert_eq!(on.spans[0].style, accent);
         assert_eq!(on.spans[2].content.trim(), "prd");
         assert_eq!(on.spans[2].style, accent);
-        let [off, _] = step_lines(&step, std::slice::from_ref(&step), false, accent, &theme);
+        let [off, _] = step_lines(
+            &step,
+            std::slice::from_ref(&step),
+            place_width(std::slice::from_ref(&step)),
+            false,
+            accent,
+            &theme,
+        );
         assert_eq!(off.spans[0].content, " ");
         assert_eq!(off.spans[2].style, theme.dim);
     }
@@ -7512,7 +7564,14 @@ mod tests {
             "no colour: {accent:?}"
         );
         let step = feat_1_runs().await[0].steps[0].clone();
-        let [on, _] = step_lines(&step, std::slice::from_ref(&step), true, accent, &theme);
+        let [on, _] = step_lines(
+            &step,
+            std::slice::from_ref(&step),
+            place_width(std::slice::from_ref(&step)),
+            true,
+            accent,
+            &theme,
+        );
         assert_eq!(on.spans[0].content, CURSOR);
         assert_eq!(on.spans[2].content.trim(), "prd");
         assert_eq!(on.spans[2].style, accent);
@@ -7521,7 +7580,14 @@ mod tests {
             "{:?}",
             on.spans[2].style
         );
-        let [off, _] = step_lines(&step, std::slice::from_ref(&step), false, accent, &theme);
+        let [off, _] = step_lines(
+            &step,
+            std::slice::from_ref(&step),
+            place_width(std::slice::from_ref(&step)),
+            false,
+            accent,
+            &theme,
+        );
         assert_eq!(off.spans[0].content, " ");
         assert_eq!(off.spans[2].style, theme.dim);
         assert_ne!(
