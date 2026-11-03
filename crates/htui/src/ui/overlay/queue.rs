@@ -480,8 +480,10 @@ impl Body<'_> {
     fn height(&self) -> usize {
         match self {
             Self::Unavailable(_) | Self::Reading => 2,
-            // The header and a blank, then the rows or the two-line empty state.
-            Self::Overview(overview) => 2 + overview.rows.len().max(2),
+            // The header and a blank, then the rows or the two-line empty state (RV1-L1: one
+            // row is one row, not the empty state's two).
+            Self::Overview(overview) if overview.rows.is_empty() => 2 + 2,
+            Self::Overview(overview) => 2 + overview.rows.len(),
         }
     }
 }
@@ -660,6 +662,8 @@ impl Overlay for QueueOverlay {
             Body::Unavailable(message) => {
                 let lines = [
                     Line::styled(format!("{NOTE_LEAD}{UNAVAILABLE}{message}"), theme.error),
+                    // The focus role, kit::empty's next-step role (MOD-115 M4 E9, RV1-L3): the
+                    // line says what to do, as an empty state's second line does.
                     Line::styled(format!("{NOTE_LEAD}{UNAVAILABLE_NEXT}"), theme.accent),
                 ];
                 cut_lines(frame, content, lines);
@@ -758,6 +762,12 @@ mod tests {
         /// rebinds.
         fn with_keys(mut self, keys: Keys) -> Self {
             self.keys = keys;
+            self
+        }
+
+        /// The bench with this palette (MOD-115 M4 RV1-L3: the monochrome one).
+        fn with_theme(mut self, theme: Theme) -> Self {
+            self.theme = theme;
             self
         }
 
@@ -2106,40 +2116,69 @@ mod tests {
         );
     }
 
-    /// The unavailable line is the error role, and its next step is drawn with it.
+    /// MOD-115 M4 RV1-L1: a one-entry queue's box ends under its row; the two rows kept for the
+    /// empty state are the empty state's alone.
     #[test]
-    fn the_unavailable_line_is_an_error_with_a_next_step() {
+    fn a_one_entry_queue_has_no_blank_row() {
         let bench = Bench::new();
         let mut overlay = QueueOverlay::new();
-        bench.reply(
+        bench.feed(
             &mut overlay,
-            &StoreReply::Failed {
-                request: OVERVIEW,
-                message: "boom".to_owned(),
-            },
+            overview(vec![(row("A-1", "t"), EntryState::Next)]),
         );
-        let mut term = Terminal::new(TestBackend::new(100, 30)).expect("a test backend");
-        term.draw(|frame| overlay.render(frame, frame.area(), &bench.ctx()))
-            .expect("the overlay draws");
-        let buffer = term.backend().buffer();
-        let theme = Theme::default();
-        let (x, y) = (0..buffer.area.height)
-            .find_map(|y| {
+        let rendered = bench.render(&overlay);
+        let lines: Vec<&str> = rendered.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.contains("A-1"))
+            .unwrap_or_else(|| panic!("{rendered}"));
+        assert!(
+            lines[at + 1].contains('\u{2570}'),
+            "the bottom border follows the row: {rendered}"
+        );
+    }
+
+    /// The unavailable line is the error role, and its next step is drawn with it, in the focus
+    /// role, kit::empty's next-step role (MOD-115 M4 RV1-L3, E9): under the monochrome theme too,
+    /// where the role is its modifier.
+    #[test]
+    fn the_unavailable_line_is_an_error_with_a_next_step() {
+        for theme in [Theme::default(), Theme::monochrome()] {
+            let bench = Bench::new().with_theme(theme.clone());
+            let mut overlay = QueueOverlay::new();
+            bench.reply(
+                &mut overlay,
+                &StoreReply::Failed {
+                    request: OVERVIEW,
+                    message: "boom".to_owned(),
+                },
+            );
+            let mut term = Terminal::new(TestBackend::new(100, 30)).expect("a test backend");
+            term.draw(|frame| overlay.render(frame, frame.area(), &bench.ctx()))
+                .expect("the overlay draws");
+            let buffer = term.backend().buffer();
+            let find = |y: u16, text: &str| {
                 let line: String = (0..buffer.area.width)
                     .map(|x| buffer[(x, y)].symbol().to_owned())
                     .collect();
-                line.find(UNAVAILABLE).map(|byte| {
-                    (
-                        u16::try_from(line[..byte].chars().count()).expect("narrow"),
-                        y,
-                    )
-                })
-            })
-            .expect("the unavailable line is drawn");
-        assert_eq!(buffer[(x, y)].fg, theme.error.fg.unwrap_or_default());
-        let next: String = (0..buffer.area.width)
-            .map(|x| buffer[(x, y + 1)].symbol().to_owned())
-            .collect();
-        assert!(next.contains(UNAVAILABLE_NEXT), "{next}");
+                line.find(text)
+                    .map(|byte| u16::try_from(line[..byte].chars().count()).expect("narrow"))
+            };
+            let (x, y) = (0..buffer.area.height)
+                .find_map(|y| find(y, UNAVAILABLE).map(|x| (x, y)))
+                .expect("the unavailable line is drawn");
+            assert_eq!(buffer[(x, y)].fg, theme.error.fg.unwrap_or_default());
+            let next = find(y + 1, UNAVAILABLE_NEXT).expect("the next step under it");
+            let cell = &buffer[(next, y + 1)];
+            assert_eq!(
+                cell.fg,
+                theme.accent.fg.unwrap_or_default(),
+                "the focus role"
+            );
+            assert!(
+                cell.modifier.contains(theme.accent.add_modifier),
+                "the focus role's modifier"
+            );
+        }
     }
 }
