@@ -33,11 +33,13 @@ use htui_core::store::{invalid_skill_name, skill_body_refusal};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 
 use super::agent_help::{AgentHelp, HelpOutcome, Report, accepted};
 use super::attach::{AttachOutcome, AttachPane};
-use super::{framed, hint_line, holder, joined, unavailable, view_chips, view_chips_if_room};
+use super::{
+    Detail, DetailPane, framed, holder, joined, render_detail, view_chips, view_chips_if_room,
+};
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::{ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, edited};
 use crate::keys::translate::FieldEvent;
@@ -47,7 +49,7 @@ use crate::skills::{READ_NAME, REQUEST_NAMES, SkillEntry, SkillWrite, SkillsSnap
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::TemplateBody;
 use crate::ui::cells;
-use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::chips::key_line;
 use crate::ui::kit::form::{Field, Form, Value};
 use crate::ui::kit::list::{self, GUTTER, Row, RowKind, ellipsize, selection_band};
 use crate::ui::kit::modal::modal_rest;
@@ -1837,11 +1839,14 @@ impl LibraryView {
         } else {
             (ctx.pane_focus(PaneId::List), ctx.pane_focus(PaneId::Detail))
         };
-        if let Some(list_area) = list_area.filter(|rect| !rect.is_empty()) {
+        let list_area = list_area.filter(|rect| !rect.is_empty());
+        if let Some(list_area) = list_area {
             self.render_list(frame, list_area, list_focus, ctx);
         }
         if !pane_area.is_empty() {
-            self.render_pane(frame, pane_area, pane_focus, prompt, ctx);
+            // RV3-M1: with the list off screen the pane leads the view, so it names it.
+            let leads = list_area.is_none();
+            self.render_pane(frame, pane_area, pane_focus, prompt, leads, ctx);
         }
     }
 
@@ -1870,67 +1875,38 @@ impl LibraryView {
         let selected = (!rows.is_empty()).then_some(self.cursor);
         let offset = list::scroll_into_view(self.cursor, 0, usize::from(inner.height), rows.len());
         list::render(frame, inner, &rows, selected, offset, ctx.accent(), theme);
-        let hints = hint_line(ctx.keys().hint(views::LIBRARY_BROWSE, LIST_HINT), ctx);
+        let hints = key_line(ctx.keys().hint(views::LIBRARY_BROWSE, LIST_HINT), ctx.theme);
         framed(view_chips(KitPane::new(""), 0), focus, hints, ctx)
             .scrollbar(rows.len(), offset)
             .render(frame, area, theme);
     }
 
-    /// The right-hand pane: a prompt's form, an empty state, a refused read, or the shown body or
-    /// diff, wrapped and scrolled with a scrollbar. Its title names no key (MOD-82 carried): the
-    /// scroll keys lead its hints while its lines overflow it.
+    /// The right-hand pane through the views' shared [`render_detail`] (MOD-115 M4 RV3-L4): the
+    /// Library's browse stack and hints, or an open prompt's keys. While the list is off screen
+    /// (`leads`: hidden or another pane zoomed) the pane leads the view, so it carries the view
+    /// chips, its title kept whole (RV3-M1).
     fn render_pane(
         &self,
         frame: &mut Frame<'_>,
         area: Rect,
         focus: Focus,
         prompt: bool,
+        leads: bool,
         ctx: &Ctx<'_>,
     ) {
-        let theme = ctx.theme;
-        let inner = KitPane::inner(area);
         let (title, detail) = self.detail(ctx);
-        let mut pane = KitPane::new(&title).focus(focus).accent(ctx.accent());
-        let mut overflow = false;
-        self.pane_rows.set(0);
-        match detail {
-            Detail::Form(form) => form.render(frame, inner, 0, ctx.accent(), theme),
-            Detail::Empty(what, next) => empty::render(frame, inner, what, NextStep(&next), theme),
-            Detail::Unavailable(sentence) => unavailable(frame, inner, &sentence, theme),
-            Detail::Lines(lines) => {
-                // The body and the diff wrap; the row count is a character wrap's, a lower bound
-                // on the word wrap's (`Scroll`'s rule), so the clamp never scrolls the pane blank.
-                let width = usize::from(inner.width).max(1);
-                let rows: usize = lines
-                    .iter()
-                    .map(|line| line.width().div_ceil(width).max(1))
-                    .sum();
-                self.pane_rows.set(rows);
-                overflow = rows > usize::from(inner.height) || self.scroll.offset() > 0;
-                frame.render_widget(
-                    Paragraph::new(lines)
-                        .wrap(Wrap { trim: false })
-                        .scroll((self.scroll.offset(), 0)),
-                    inner,
-                );
-                pane = pane.scrollbar(rows, self.scroll.skip());
-            }
-        }
-        let keys = ctx.keys();
-        let hint = if prompt {
-            self.key_hint(keys)
-        } else {
-            let scroll = if overflow {
-                keys.hint(views::LIBRARY_BROWSE, SCROLL_HINT)
-            } else {
-                String::new()
-            };
-            joined(&[keys.hint(views::LIBRARY_BROWSE, DETAIL_HINT), scroll])
+        let pane = DetailPane {
+            title: &title,
+            focus,
+            leads: leads.then_some(0),
+            scroll: &self.scroll,
+            rows: &self.pane_rows,
+            stack: views::LIBRARY_BROWSE,
+            detail_hint: DETAIL_HINT,
+            scroll_hint: SCROLL_HINT,
+            prompt_hint: prompt.then(|| self.key_hint(ctx.keys())),
         };
-        if let Some(hints) = hint_line(hint, ctx) {
-            pane = pane.hints(hints);
-        }
-        pane.render(frame, area, theme);
+        render_detail(frame, area, pane, detail, ctx);
     }
 
     /// The right-hand pane's title and what it shows: a prompt or the rename form, a refusal, the
@@ -2105,7 +2081,7 @@ impl LibraryView {
             .focus(holder(ctx, false))
             .accent(ctx.accent())
             .scrollbar(total, self.scroll.skip());
-        if let Some(hints) = hint_line(self.key_hint(ctx.keys()), ctx) {
+        if let Some(hints) = key_line(self.key_hint(ctx.keys()), ctx.theme) {
             pane = pane.hints(hints);
         }
         pane.render(frame, area, theme);
@@ -2166,23 +2142,11 @@ impl LibraryView {
         let mut pane = view_chips_if_room(KitPane::new(&title), &title, 0, area.width)
             .focus(focus)
             .accent(ctx.accent());
-        if let Some(hints) = hint_line(self.key_hint(ctx.keys()), ctx) {
+        if let Some(hints) = key_line(self.key_hint(ctx.keys()), ctx.theme) {
             pane = pane.hints(hints);
         }
         pane.render(frame, area, ctx.theme);
     }
-}
-
-/// What the right-hand pane shows in Browse (MOD-115 M4 E5).
-enum Detail<'a> {
-    /// A prompt or the rename form, through `kit::form`.
-    Form(Form<'a>),
-    /// Nothing to show: what is missing and the next step (`kit::empty`).
-    Empty(&'static str, String),
-    /// A refused read: the store's sentence, and where to fix it.
-    Unavailable(String),
-    /// The shown body or the diff, wrapped and scrolled.
-    Lines(Vec<Line<'static>>),
 }
 
 /// A skill's name in `snapshot`, else its id.

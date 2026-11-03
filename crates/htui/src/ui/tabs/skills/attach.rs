@@ -34,13 +34,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::library::{Notice, Sent};
-use super::{framed, hint_line, holder, view_chips};
+use super::{framed, holder, view_chips};
 use crate::app::{Ctx, Handled};
 use crate::keys::translate::FieldEvent;
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::skills::{ProjectSkills, SkillsSnapshot};
 use crate::store_worker::StoreRequest;
 use crate::ui::cells;
+use crate::ui::kit::chips::key_line;
 use crate::ui::kit::form::{Field, Form as FormRows, Value};
 use crate::ui::kit::label;
 use crate::ui::kit::list::{self, Row, RowKind};
@@ -785,7 +786,7 @@ impl AttachPane {
             AttachMode::Browse | AttachMode::ConfirmDetach { .. } => (area, None),
         };
         let focus = holder(ctx, false);
-        let hints = hint_line(self.hint(ctx.keys()), ctx);
+        let hints = key_line(self.hint(ctx.keys()), ctx.theme);
         let (rows_focus, rows_hints) = match panel {
             Some(_) => (Focus::Unfocused, None),
             None => (focus, hints.clone()),

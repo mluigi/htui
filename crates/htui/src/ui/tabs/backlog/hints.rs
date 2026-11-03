@@ -133,14 +133,6 @@ pub(super) struct Focuses {
     pub(super) detail: Focus,
 }
 
-/// How the pane that holds the keyboard is drawn (MOD-115 M4 C4): focused unless something
-/// covers the tab (`ctx.pane_focus`), or the shell's activity pane is on screen (`activity`) and
-/// has the focus.
-pub(super) fn holder(ctx: &Ctx<'_>, activity: bool) -> Focus {
-    let focus = ctx.focus();
-    if activity && focus == PaneId::Activity {
-        Focus::Unfocused
-    } else {
-        ctx.pane_focus(focus)
-    }
-}
+/// How the pane that holds the keyboard is drawn (MOD-115 M4 C4): the kit's one rule, the Skills
+/// tab's too (RV3-L4).
+pub(super) use crate::ui::kit::pane::holder;

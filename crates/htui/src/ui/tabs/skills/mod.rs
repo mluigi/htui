@@ -21,19 +21,24 @@ mod library;
 mod templates;
 
 use htui_core::model::Scope;
+use std::cell::Cell;
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::app::{Ctx, Handled};
 use crate::editor::ExternalEditOutcome;
-use crate::keys::{Act, KeyChord, Stack};
+use crate::keys::{Act, HintSpec, KeyChord, Stack};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::kit::chips::key_line;
+use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::form::Form;
 use crate::ui::kit::pane::{Focus, Pane};
+use crate::ui::kit::scroll::Scroll;
 use crate::ui::kit::text::wrapped;
-use crate::ui::shell::{PaneId, Panes, TabLoc};
+use crate::ui::shell::{Panes, TabLoc};
 use crate::ui::tabs::registry::{Tab, TabId};
 use crate::ui::{Theme, cells};
 use crossterm::event::KeyEvent;
@@ -122,16 +127,8 @@ pub(super) fn view_chips_if_room<'a>(
 }
 
 /// MOD-115 M4 C4: how the pane that holds the keyboard (a prompt, a form, an editor, a pane drawn
-/// over the content) is drawn: focused unless something covers the tab, or the shell's activity
-/// pane is on screen (`activity`) and has the focus.
-pub(super) fn holder(ctx: &Ctx<'_>, activity: bool) -> Focus {
-    let focus = ctx.focus();
-    if activity && focus == PaneId::Activity {
-        Focus::Unfocused
-    } else {
-        ctx.pane_focus(focus)
-    }
-}
+/// over the content) is drawn, the kit's one rule (RV3-L4: the Backlog asks the same).
+pub(super) use crate::ui::kit::pane::holder;
 
 /// `pane` drawn as `focus` says, in the tab's accent, with `hints` on its bottom border (drawn
 /// only while focused).
@@ -148,9 +145,97 @@ pub(super) fn framed<'a>(
     }
 }
 
-/// The shown view's keys as a pane's hint line, `None` when no key of it is bound.
-pub(super) fn hint_line(text: String, ctx: &Ctx<'_>) -> Option<Line<'static>> {
-    key_line(text, ctx.theme)
+/// What a view's right-hand pane shows in Browse (MOD-115 M4 E5), both views' (RV3-L4).
+pub(super) enum Detail<'a> {
+    /// A prompt or a form, through `kit::form`.
+    Form(Form<'a>),
+    /// Nothing to show: what is missing and the next step (`kit::empty`).
+    Empty(&'static str, String),
+    /// A refused read: the store's sentence, and where to fix it.
+    Unavailable(String),
+    /// The shown body or diff, wrapped and scrolled.
+    Lines(Vec<Line<'static>>),
+}
+
+/// How a view draws its right-hand pane (MOD-115 M4 RV3-L4): the two views differ in their
+/// browse stack and hint specs only.
+pub(super) struct DetailPane<'a> {
+    /// The pane's title (MOD-82 carried: it names no key).
+    pub(super) title: &'a str,
+    /// How the pane is drawn: the shell's focus, or the keyboard holder's under a prompt.
+    pub(super) focus: Focus,
+    /// The view's chip among [`VIEWS`] while the pane leads the view (the list off screen,
+    /// RV3-M1), so it carries the view chips while its whole title fits beside them.
+    pub(super) leads: Option<usize>,
+    /// The pane's scroll.
+    pub(super) scroll: &'a Scroll,
+    /// The rows drawn, for the scroll's clamp; `Cell` because a render is `&self`.
+    pub(super) rows: &'a Cell<usize>,
+    /// The browse stack the hints resolve through.
+    pub(super) stack: Stack<'static>,
+    /// The shown body's keys while browsing.
+    pub(super) detail_hint: HintSpec,
+    /// The scroll keys, after `detail_hint` while the lines overflow the pane.
+    pub(super) scroll_hint: HintSpec,
+    /// An open prompt's keys, which replace the browse hints.
+    pub(super) prompt_hint: Option<String>,
+}
+
+/// Draws a view's right-hand pane (MOD-115 M4 E5, RV3-L4): a prompt's form, an empty state, a
+/// refused read, or the shown body or diff, wrapped and scrolled with a scrollbar. The scroll keys
+/// close its hints while its lines overflow it, after the view's own, so they are the first the
+/// kit pane drops (T3).
+pub(super) fn render_detail(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    pane: DetailPane<'_>,
+    detail: Detail<'_>,
+    ctx: &Ctx<'_>,
+) {
+    let theme = ctx.theme;
+    let inner = Pane::inner(area);
+    let kit = Pane::new(pane.title);
+    let mut kit = match pane.leads {
+        Some(view) => view_chips_if_room(kit, pane.title, view, area.width),
+        None => kit,
+    };
+    let mut overflow = false;
+    pane.rows.set(0);
+    match detail {
+        Detail::Form(form) => form.render(frame, inner, 0, ctx.accent(), theme),
+        Detail::Empty(what, next) => empty::render(frame, inner, what, NextStep(&next), theme),
+        Detail::Unavailable(sentence) => unavailable(frame, inner, &sentence, theme),
+        Detail::Lines(lines) => {
+            // The body and the diff wrap: a default body's lines run to 150-200 columns, and a
+            // change past the pane's edge would be off screen. The row count is a character
+            // wrap's, a lower bound on the word wrap's (`Scroll`'s rule), so the clamp never
+            // scrolls the pane blank.
+            let width = usize::from(inner.width).max(1);
+            let rows: usize = lines
+                .iter()
+                .map(|line| line.width().div_ceil(width).max(1))
+                .sum();
+            pane.rows.set(rows);
+            overflow = rows > usize::from(inner.height) || pane.scroll.offset() > 0;
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .scroll((pane.scroll.offset(), 0)),
+                inner,
+            );
+            kit = kit.scrollbar(rows, pane.scroll.skip());
+        }
+    }
+    let keys = ctx.keys();
+    let hint = pane.prompt_hint.unwrap_or_else(|| {
+        let scroll = if overflow {
+            keys.hint(pane.stack, pane.scroll_hint)
+        } else {
+            String::new()
+        };
+        joined(&[keys.hint(pane.stack, pane.detail_hint), scroll])
+    });
+    framed(kit, pane.focus, key_line(hint, theme), ctx).render(frame, area, theme);
 }
 
 /// Hint texts joined by ` \u{b7} `, the empty ones (every key unbound) left out.
@@ -377,6 +462,7 @@ mod tests {
     use crate::keys::Keys;
     use crate::store_worker::Origin;
     use crate::ui::Theme;
+    use crate::ui::shell::PaneId;
 
     /// What a `Ctx` borrows, held by the test.
     struct Bench {
@@ -471,6 +557,42 @@ mod tests {
                     .all(|row| !row.contains("Skills \u{2502} Templates")),
                 "no switch line: {rows:#?}"
             );
+        }
+    }
+
+    /// MOD-115 M4 RV3-M1: with the list hidden or the detail zoomed the body pane leads the view,
+    /// so it carries the view chips, the shown view's active, in both views and without colour.
+    #[test]
+    fn the_view_chips_name_the_view_with_the_list_hidden_or_the_detail_zoomed() {
+        use crate::ui::shell::TabLayout;
+
+        let layouts = [
+            TabLayout {
+                list_on: false,
+                ..library::LAYOUT
+            },
+            TabLayout {
+                zoom: true,
+                ..library::LAYOUT
+            },
+        ];
+        for theme in [Theme::default(), Theme::monochrome()] {
+            let bench = Bench::new(theme);
+            for layout in layouts {
+                for view in View::ALL {
+                    let mut tab = SkillsTab::new();
+                    tab.view = view;
+                    let ctx = bench.ctx().with_layout(layout).with_focus(PaneId::Detail);
+                    let (buffer, rows) = drawn(&tab, &ctx);
+                    let shown = at(&rows[0], &format!(" {} ", view.title()))
+                        .unwrap_or_else(|| panic!("{view:?} under {layout:?}: {rows:#?}"));
+                    assert!(active(&buffer, shown + 1), "{view:?}: {rows:#?}");
+                    let other = View::ALL[1 - view.index()];
+                    let other = at(&rows[0], &format!(" {} ", other.title()))
+                        .unwrap_or_else(|| panic!("both chips: {rows:#?}"));
+                    assert!(!active(&buffer, other + 1), "{view:?}: {rows:#?}");
+                }
+            }
         }
     }
 

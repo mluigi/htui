@@ -31,7 +31,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Widget};
 
-use crate::ui::shell::PaneAreas;
+use crate::app::Ctx;
+use crate::ui::shell::{PaneAreas, PaneId};
 use crate::ui::{Theme, cells};
 
 /// The scrollbar's thumb: heavy, so it reads over the light vertical border it replaces.
@@ -307,6 +308,20 @@ impl<'a> Pane<'a> {
             paint_scrollbar(buf, area, rows, total, offset, border);
         }
         inner
+    }
+}
+
+/// How the pane that holds the keyboard (a prompt, a form, an editor, a compose area, a pane
+/// drawn over the content) is drawn (MOD-115 M4 C4): focused unless something covers the tab
+/// (`ctx.pane_focus`), or the shell's activity pane is on screen (`activity`) and has the focus.
+/// The Backlog's and the Skills tab's one rule (RV3-L4).
+#[must_use]
+pub fn holder(ctx: &Ctx<'_>, activity: bool) -> Focus {
+    let focus = ctx.focus();
+    if activity && focus == PaneId::Activity {
+        Focus::Unfocused
+    } else {
+        ctx.pane_focus(focus)
     }
 }
 
@@ -775,18 +790,6 @@ mod tests {
         Style::new().fg(Color::Magenta)
     }
 
-    #[test]
-    fn the_title_sits_on_the_top_border_after_the_corner() {
-        let (buffer, inner) = draw(20, 5, &Theme::default(), Pane::new("Items"));
-        assert_eq!(row(&buffer, 0), format!("╭─ Items {}╮", "─".repeat(10)));
-        assert_eq!(row(&buffer, 4), format!("╰{}╯", "─".repeat(18)));
-        assert_eq!(
-            inner,
-            Rect::new(1, 1, 18, 3),
-            "the content goes inside the border"
-        );
-    }
-
     /// MOD-115 M4 RV2-L7: `Pane::title_fits` is what `render` draws: for every width and title
     /// length around the edge, every active chip of a seven-chip strip and of a two-chip one, and
     /// no chips, it is true exactly when the top border carries ` title ` whole.
@@ -817,6 +820,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_title_sits_on_the_top_border_after_the_corner() {
+        let (buffer, inner) = draw(20, 5, &Theme::default(), Pane::new("Items"));
+        assert_eq!(row(&buffer, 0), format!("╭─ Items {}╮", "─".repeat(10)));
+        assert_eq!(row(&buffer, 4), format!("╰{}╯", "─".repeat(18)));
+        assert_eq!(
+            inner,
+            Rect::new(1, 1, 18, 3),
+            "the content goes inside the border"
+        );
     }
 
     #[test]

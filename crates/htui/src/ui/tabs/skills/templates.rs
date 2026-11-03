@@ -27,21 +27,23 @@ use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Wrap};
 
 use super::agent_help::{AgentHelp, HelpOutcome, Report, accepted};
-use super::{framed, hint_line, holder, joined, unavailable, view_chips, view_chips_if_room};
+use super::{
+    Detail, DetailPane, framed, holder, joined, render_detail, view_chips, view_chips_if_room,
+};
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::{ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, edited};
 use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::{READ_NAME, REQUEST_NAMES, TemplateBody, TemplatesSnapshot};
 use crate::ui::cells;
-use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::chips::key_line;
 use crate::ui::kit::form::{Field, Form, Value};
 use crate::ui::kit::list::{self, Row as ListRow, RowKind};
 use crate::ui::kit::modal::modal_rest;
 use crate::ui::kit::pane::{Focus, Pane as KitPane, capture_area};
 use crate::ui::kit::scroll::{Scroll, Step};
 use crate::ui::kit::text::{Tone, notice, wrapped};
-use crate::ui::shell::PaneId;
+use crate::ui::shell::{HiddenBy, PaneId};
 use crate::ui::{FieldOutcome, TextArea, TextField, diff};
 use crossterm::event::KeyEvent;
 
@@ -77,7 +79,62 @@ const SELECT_HINT: HintSpec = &[
     Hint::One(Act::New, "creates one"),
 ];
 
-/// [`SELECT_HINT`] with every key unbound.
+/// [`SELECT_A_TEMPLATE`]'s next step while the body pane holds the focus beside the tree (MOD-115
+/// M4 RV3-M1): the list's motion scrolls the pane there, so the step is the key that focuses the
+/// tree.
+const SELECT_FOCUS_HINT: HintSpec = &[
+    Hint::One(Act::PrevPane, "focuses the list"),
+    Hint::One(Act::New, "creates one"),
+];
+
+/// [`SELECT_FOCUS_HINT`] while the shell's activity pane holds the focus: the next pane after it
+/// is the tree.
+const SELECT_FROM_ACTIVITY_HINT: HintSpec = &[
+    Hint::One(Act::NextPane, "focuses the list"),
+    Hint::One(Act::New, "creates one"),
+];
+
+/// [`SELECT_A_TEMPLATE`]'s next step while `layout.toggle_list` hides the tree.
+const SELECT_SHOW_HINT: HintSpec = &[
+    Hint::One(Act::LayoutToggleList, "shows the list"),
+    Hint::One(Act::New, "creates one"),
+];
+
+/// [`SELECT_A_TEMPLATE`]'s next step while another pane is zoomed.
+const SELECT_UNZOOM_HINT: HintSpec = &[
+    Hint::One(Act::LayoutZoom, "shows the list"),
+    Hint::One(Act::New, "creates one"),
+];
+
+/// [`SELECT_A_TEMPLATE`]'s next step while the preset has no tree.
+const SELECT_PRESET_HINT: HintSpec = &[
+    Hint::One(Act::LayoutNextPreset, "changes the layout"),
+    Hint::One(Act::New, "creates one"),
+];
+
+/// Whether the tree is on screen beside the body pane, and why not (MOD-115 M4 RV3-M1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListShown {
+    /// It is: the tree leads the view.
+    On,
+    /// It is not, for the shell's reason: the body pane leads the view.
+    Off(Option<HiddenBy>),
+}
+
+/// [`SELECT_A_TEMPLATE`]'s next step for where the tree is and which pane holds the focus: the
+/// list's motion only while the tree has it (`Step::by_focus` scrolls the body otherwise).
+fn select_hint(list: ListShown, focus: PaneId) -> HintSpec {
+    match list {
+        ListShown::On if focus == PaneId::List => SELECT_HINT,
+        ListShown::On if focus == PaneId::Activity => SELECT_FROM_ACTIVITY_HINT,
+        ListShown::On => SELECT_FOCUS_HINT,
+        ListShown::Off(Some(HiddenBy::Zoom)) => SELECT_UNZOOM_HINT,
+        ListShown::Off(Some(HiddenBy::Preset)) => SELECT_PRESET_HINT,
+        ListShown::Off(Some(HiddenBy::Toggle) | None) => SELECT_SHOW_HINT,
+    }
+}
+
+/// [`SELECT_HINT`] (or the step that replaces it) with every key unbound.
 const SELECT_NEXT: &str = "a template row shows its body here";
 
 /// `Ctrl+S` on a phase body that never places `{{item}}` (ANA-5 §4.1: warn, never refuse). `save`
@@ -1269,11 +1326,18 @@ impl TemplatesView {
         } else {
             (ctx.pane_focus(PaneId::List), ctx.pane_focus(PaneId::Detail))
         };
-        if let Some(list_area) = list_area.filter(|rect| !rect.is_empty()) {
+        let list_area = list_area.filter(|rect| !rect.is_empty());
+        if let Some(list_area) = list_area {
             self.render_tree(frame, list_area, list_focus, ctx);
         }
         if !pane_area.is_empty() {
-            self.render_pane(frame, pane_area, pane_focus, prompt, ctx);
+            // RV3-M1: with the tree off screen the pane leads the view, so it names it, and the
+            // select step names how to bring the tree back.
+            let list = match (list_area, areas.list_hidden) {
+                (Some(_), _) => ListShown::On,
+                (None, hidden) => ListShown::Off(hidden),
+            };
+            self.render_pane(frame, pane_area, pane_focus, prompt, list, ctx);
         }
     }
 
@@ -1308,72 +1372,45 @@ impl TemplatesView {
         let selected = (!rows.is_empty()).then_some(self.cursor);
         let offset = list::scroll_into_view(self.cursor, 0, usize::from(inner.height), rows.len());
         list::render(frame, inner, &rows, selected, offset, ctx.accent(), theme);
-        let hints = hint_line(ctx.keys().hint(views::TEMPLATES_BROWSE, LIST_HINT), ctx);
+        let hints = key_line(
+            ctx.keys().hint(views::TEMPLATES_BROWSE, LIST_HINT),
+            ctx.theme,
+        );
         framed(view_chips(KitPane::new(""), 1), focus, hints, ctx)
             .scrollbar(rows.len(), offset)
             .render(frame, area, theme);
     }
 
-    /// The right-hand pane: the name prompt's form, an empty state, a refused read, or the shown
-    /// body or diff, wrapped and scrolled with a scrollbar. Its title names no key (MOD-82
-    /// carried): the scroll keys close its hints while its lines overflow it, after the view's
-    /// own, so they are the first the kit pane drops (MOD-115 M4 T3).
+    /// The right-hand pane through the views' shared [`render_detail`] (MOD-115 M4 RV3-L4): the
+    /// Templates view's browse stack and hints, or the name prompt's keys. While the tree is off
+    /// screen the pane leads the view, so it carries the view chips (RV3-M1).
     fn render_pane(
         &self,
         frame: &mut Frame<'_>,
         area: Rect,
         focus: Focus,
         prompt: bool,
+        list: ListShown,
         ctx: &Ctx<'_>,
     ) {
-        let theme = ctx.theme;
-        let inner = KitPane::inner(area);
-        let (title, detail) = self.detail(ctx);
-        let mut pane = KitPane::new(&title);
-        let mut overflow = false;
-        self.pane_rows.set(0);
-        match detail {
-            Detail::Form(form) => form.render(frame, inner, 0, ctx.accent(), theme),
-            Detail::Empty(what, next) => empty::render(frame, inner, what, NextStep(&next), theme),
-            Detail::Unavailable(sentence) => unavailable(frame, inner, &sentence, theme),
-            Detail::Lines(lines) => {
-                // The body and the diff wrap: a default body's lines run to 150-200 columns, and
-                // a change past the pane's edge would be off screen. The row count is a character
-                // wrap's, a lower bound on the word wrap's (`Scroll`'s rule), so the clamp never
-                // scrolls the pane blank.
-                let width = usize::from(inner.width).max(1);
-                let rows: usize = lines
-                    .iter()
-                    .map(|line| line.width().div_ceil(width).max(1))
-                    .sum();
-                self.pane_rows.set(rows);
-                overflow = rows > usize::from(inner.height) || self.scroll.offset() > 0;
-                frame.render_widget(
-                    Paragraph::new(lines)
-                        .wrap(Wrap { trim: false })
-                        .scroll((self.scroll.offset(), 0)),
-                    inner,
-                );
-                pane = pane.scrollbar(rows, self.scroll.skip());
-            }
-        }
-        let keys = ctx.keys();
-        let hint = if prompt {
-            self.key_hint(keys)
-        } else {
-            let scroll = if overflow {
-                keys.hint(views::TEMPLATES_BROWSE, SCROLL_HINT)
-            } else {
-                String::new()
-            };
-            joined(&[keys.hint(views::TEMPLATES_BROWSE, DETAIL_HINT), scroll])
+        let (title, detail) = self.detail(list, ctx);
+        let pane = DetailPane {
+            title: &title,
+            focus,
+            leads: matches!(list, ListShown::Off(_)).then_some(1),
+            scroll: &self.scroll,
+            rows: &self.pane_rows,
+            stack: views::TEMPLATES_BROWSE,
+            detail_hint: DETAIL_HINT,
+            scroll_hint: SCROLL_HINT,
+            prompt_hint: prompt.then(|| self.key_hint(ctx.keys())),
         };
-        framed(pane, focus, hint_line(hint, ctx), ctx).render(frame, area, theme);
+        render_detail(frame, area, pane, detail, ctx);
     }
 
     /// The right-hand pane's title and what it shows: the name prompt, a refusal, the empty
     /// states, the shown body, or the diff.
-    fn detail(&self, ctx: &Ctx<'_>) -> (String, Detail<'_>) {
+    fn detail(&self, list: ListShown, ctx: &Ctx<'_>) -> (String, Detail<'_>) {
         let theme = ctx.theme;
         if let Mode::Naming { project, field } = &self.mode {
             let form = Form::new()
@@ -1399,7 +1436,9 @@ impl TemplatesView {
             );
         };
         let select = || {
-            let next = ctx.keys().hint(views::TEMPLATES_BROWSE, SELECT_HINT);
+            let next = ctx
+                .keys()
+                .hint(views::TEMPLATES_BROWSE, select_hint(list, ctx.focus()));
             let next = if next.is_empty() {
                 SELECT_NEXT.to_owned()
             } else {
@@ -1505,7 +1544,7 @@ impl TemplatesView {
         } else {
             Focus::Unfocused
         };
-        let hints = hint_line(self.key_hint(ctx.keys()), ctx);
+        let hints = key_line(self.key_hint(ctx.keys()), ctx.theme);
         framed(
             view_chips_if_room(KitPane::new(&title), &title, 1, left.width),
             focus,
@@ -1546,18 +1585,6 @@ impl TemplatesView {
             .accent(ctx.accent())
             .render(frame, right, theme);
     }
-}
-
-/// What the right-hand pane shows in Browse (MOD-115 M4 E5).
-enum Detail<'a> {
-    /// The name prompt, through `kit::form`.
-    Form(Form<'a>),
-    /// Nothing to show: what is missing and the next step (`kit::empty`).
-    Empty(&'static str, String),
-    /// A refused read: the store's sentence, and where to fix it.
-    Unavailable(String),
-    /// The shown body or the diff, wrapped and scrolled.
-    Lines(Vec<Line<'static>>),
 }
 
 /// Whether a snapshot answers the scope the view is in now: a save's reply that crossed a scope
@@ -1695,7 +1722,7 @@ mod tests {
             ..TemplatesView::default()
         };
         // MOD-115 M4 E5: the prompt is a `kit::form`; no row of it runs past the pane.
-        let (_, detail) = view.detail(&ctx);
+        let (_, detail) = view.detail(ListShown::On, &ctx);
         let Detail::Form(form) = detail else {
             panic!("the prompt is a form");
         };
@@ -2955,6 +2982,55 @@ mod tests {
             ..Bench::new()
         };
         shows(&view, &unbound, &["a template row shows its body here"]);
+    }
+
+    /// MOD-115 M4 RV3-M1: the list's motion scrolls the body while the detail holds the focus,
+    /// so the select step names the key that brings the cursor back to the list instead: the
+    /// focus key with the list on screen, the key that shows it with the list hidden or the
+    /// detail zoomed.
+    #[tokio::test]
+    async fn the_select_step_names_no_list_motion_while_the_detail_holds_the_focus() {
+        use crate::ui::shell::TabLayout;
+
+        let bench = Bench::new();
+        let view = browsing(&bench).await;
+        let step = |layout: Option<TabLayout>| {
+            let ctx = bench.ctx().with_focus(PaneId::Detail);
+            let ctx = match layout {
+                Some(layout) => ctx.with_layout(layout),
+                None => ctx,
+            };
+            let (_, rows) = frame_of(&view, &ctx, 100, 12);
+            let at = rows
+                .iter()
+                .position(|row| row.contains(SELECT_A_TEMPLATE))
+                .unwrap_or_else(|| panic!("{rows:#?}"));
+            // The body pane's cells of the row under it: the same `│`-parted segment.
+            let segment = rows[at]
+                .split('\u{2502}')
+                .position(|part| part.contains(SELECT_A_TEMPLATE))
+                .expect("the row holds it");
+            rows[at + 1]
+                .split('\u{2502}')
+                .nth(segment)
+                .unwrap_or_default()
+                .trim()
+                .to_owned()
+        };
+        assert_eq!(
+            step(None),
+            "Shift+Tab focuses the list \u{b7} n creates one"
+        );
+        let hidden = TabLayout {
+            list_on: false,
+            ..super::super::library::LAYOUT
+        };
+        assert_eq!(step(Some(hidden)), "F2 shows the list \u{b7} n creates one");
+        let zoomed = TabLayout {
+            zoom: true,
+            ..super::super::library::LAYOUT
+        };
+        assert_eq!(step(Some(zoomed)), "z shows the list \u{b7} n creates one");
     }
 
     /// MOD-115 M4 L-skills repair 2: beside the placeholders, an 80-column draft is 42 cells

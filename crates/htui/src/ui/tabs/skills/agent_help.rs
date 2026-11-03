@@ -25,10 +25,11 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Wrap};
 
-use super::{framed, hint_line, holder, view_chips_if_room};
+use super::{framed, holder, view_chips_if_room};
 use crate::app::{Ctx, Handled};
 use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::store_worker::{ChatFrame, EDIT_HELP, StoreReply, StoreRequest};
+use crate::ui::kit::chips::key_line;
 use crate::ui::kit::form::{Field, Form, Value};
 use crate::ui::kit::list;
 use crate::ui::kit::modal::modal_rest;
@@ -656,7 +657,7 @@ impl AgentHelp {
     ) -> Option<Rect> {
         let theme = ctx.theme;
         let focus = holder(ctx, false);
-        let hints = hint_line(self.hint(ctx.keys()), ctx);
+        let hints = key_line(self.hint(ctx.keys()), ctx.theme);
         match &self.state {
             State::Proposal {
                 agent,
