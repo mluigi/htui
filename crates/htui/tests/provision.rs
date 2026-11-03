@@ -7,8 +7,8 @@
 //! `PATH`; everything else (`sh`, `install`, `mv`, `cat`, `sha256sum`, …) is the real tool. Every
 //! script gets a temporary root prefix as `$1`, so the "privileged" writes land under it.
 //!
-//! Every scenario ends with the D310 sweep: the DSN and the sudo password reach nothing but the
-//! remote stdin and the encrypted credential. Every directory lives under `CARGO_TARGET_TMPDIR`
+//! Every scenario ends with the D310 sweep: the DSN, the sudo password and the Qdrant API key
+//! reach nothing but the remote stdin and their encrypted credentials (MOD-158 D11). Every directory lives under `CARGO_TARGET_TMPDIR`
 //! (E-17), never under `/tmp` or `~/.config/htui`, and every spawned process is waited for.
 //!
 //! No Postgres is needed: the verifier and the password prompt are fakes. `provision_pg.rs` runs
@@ -38,8 +38,12 @@ const DSN: &str = "postgres://u:SENTINEL-DSN-PW@db.example:5432/htui";
 const DSN2: &str = "postgres://u:SENTINEL-DSN-PW@db2.example:5432/htui";
 /// The sudo password the stub `sudo` accepts (D310).
 const PASSWORD: &str = "SENTINEL-SUDO-PW";
-/// The two sentinels the sweep looks for. The wrong password of S6 contains the second.
-const SENTINELS: [&str; 2] = ["SENTINEL-DSN-PW", "SENTINEL-SUDO-PW"];
+/// This box's Qdrant API key (MOD-158 D11).
+const QDRANT_KEY: &str = "SENTINEL-QDRANT-KEY";
+/// A second key, for `--replace-credential`.
+const QDRANT_KEY2: &str = "SENTINEL-QDRANT-KEY-2";
+/// The sentinels the sweep looks for. The wrong password of S6 contains the second.
+const SENTINELS: [&str; 3] = ["SENTINEL-DSN-PW", "SENTINEL-SUDO-PW", "SENTINEL-QDRANT-KEY"];
 /// The ssh destination, as typed.
 const DEST: &str = "stub-dest";
 
@@ -146,14 +150,15 @@ case "${1:-}" in
 esac
 "##;
 
-/// MOD-45 T4 stub systemd-creds (blueprint §5.2).
+/// MOD-45 T4 stub systemd-creds (blueprint §5.2); MOD-158 D11 adds the key's name.
 const STUB_SYSTEMD_CREDS: &str = r##"#!/bin/sh
 # MOD-45 T4 stub systemd-creds: "encrypts" by wrapping stdin in a marker.
 set -u
 d=$STUB_DIR
 printf '%s\n' "systemd-creds $*" >> "$d/argv.log"
 env >> "$d/env.log"
-{ [ $# -eq 4 ] && [ "$1" = encrypt ] && [ "$2" = --name=htui-dsn ] && [ "$3" = - ]; } || exit 64
+{ [ $# -eq 4 ] && [ "$1" = encrypt ] && [ "$3" = - ]; } || exit 64
+case $2 in --name=htui-dsn|--name=htui-qdrant-key) ;; *) exit 64 ;; esac
 { printf 'ENCRYPTED('; cat; printf ')'; } > "$4"
 "##;
 
@@ -284,6 +289,11 @@ impl World {
         self.root.join("etc/credstore.encrypted/htui-dsn")
     }
 
+    /// MOD-158 D11: the Qdrant API key's credential.
+    fn qdrant_credential(&self) -> PathBuf {
+        self.root.join("etc/credstore.encrypted/htui-qdrant-key")
+    }
+
     fn unit(&self) -> PathBuf {
         self.root.join("etc/systemd/system/htui-worker.service")
     }
@@ -292,14 +302,20 @@ impl World {
         self.home.join(".config/htui/box.toml")
     }
 
-    /// The unit INSTALL_ROOT must write (D295) for `provtest` and this world's home.
-    fn expected_unit(&self) -> String {
+    /// The unit INSTALL_ROOT must write (D295) for `provtest` and this world's home; with `key`,
+    /// the Qdrant API key's credential line follows the DSN's (MOD-158 D11).
+    fn expected_unit(&self, key: bool) -> String {
         let home = self.home.display();
+        let key_line = if key {
+            "LoadCredentialEncrypted=htui-qdrant-key:/etc/credstore.encrypted/htui-qdrant-key\n"
+        } else {
+            ""
+        };
         format!(
             "[Unit]\nDescription=htui worker\nWants=network-online.target\n\
              After=network-online.target\n\n[Service]\nType=exec\nUser=provtest\n\
              ExecStart={home}/.local/bin/htui worker --log {home}/.local/state/htui/worker.log\n\
-             LoadCredentialEncrypted=htui-dsn:/etc/credstore.encrypted/htui-dsn\n\
+             LoadCredentialEncrypted=htui-dsn:/etc/credstore.encrypted/htui-dsn\n{key_line}\
              Restart=on-failure\nRestartSec=10s\n\n[Install]\nWantedBy=multi-user.target\n"
         )
     }
@@ -513,6 +529,8 @@ struct Setup<'a> {
     dsn: &'a str,
     password: Result<&'a str, PromptError>,
     replace_credential: bool,
+    /// This box's keyring Qdrant API key (MOD-158 D11).
+    qdrant_key: Option<&'a str>,
 }
 
 impl Default for Setup<'_> {
@@ -522,6 +540,7 @@ impl Default for Setup<'_> {
             dsn: DSN,
             password: Ok(PASSWORD),
             replace_credential: false,
+            qdrant_key: None,
         }
     }
 }
@@ -555,6 +574,7 @@ async fn provision_with(
         remote: shell,
         payload: Payload::new(setup.payload.as_bytes().to_vec(), std::env::consts::ARCH),
         dsn: Zeroizing::new(setup.dsn.to_owned()),
+        qdrant_key: setup.qdrant_key.map(|key| Zeroizing::new(key.to_owned())),
         prompter: &prompter,
         verifier: &verifier,
         timings,
@@ -614,7 +634,8 @@ fn script_args(command: &str) -> Vec<String> {
     shell_words::split(command).expect("the command splits")[4..].to_vec()
 }
 
-/// D310: the DSN and the password reach nothing but stdin and the encrypted credential.
+/// D310: the DSN, the password and the key reach nothing but stdin and their encrypted
+/// credentials.
 fn sweep(world: &World, shell: &LocalShell, out: &[u8], err: &[u8]) {
     for sentinel in SENTINELS {
         for (i, (command, _)) in shell.commands().iter().enumerate() {
@@ -635,6 +656,7 @@ fn sweep(world: &World, shell: &LocalShell, out: &[u8], err: &[u8]) {
         }
     }
     let credential = world.credential();
+    let qdrant_credential = world.qdrant_credential();
     for file in files_under(&world.root)
         .into_iter()
         .chain(files_under(&world.home))
@@ -649,6 +671,13 @@ fn sweep(world: &World, shell: &LocalShell, out: &[u8], err: &[u8]) {
             assert!(
                 !holds(&bytes, "SENTINEL-DSN-PW"),
                 "{} holds the DSN sentinel",
+                file.display()
+            );
+        }
+        if file != qdrant_credential {
+            assert!(
+                !holds(&bytes, "SENTINEL-QDRANT-KEY"),
+                "{} holds the key sentinel",
                 file.display()
             );
         }
@@ -671,8 +700,17 @@ fn provisioned() -> Outcome {
     }
 }
 
-/// S1 (a)–(f), shared by S2, S3 and S10.
+/// S1 (a)–(f), shared by S2, S3 and S10: no key, so no key credential and the unit unchanged.
 fn assert_fresh_install(world: &World, run: &Run) {
+    assert_install(world, run, None);
+    assert!(
+        !world.qdrant_credential().exists(),
+        "no key, no key credential"
+    );
+}
+
+/// [`assert_fresh_install`] for a box whose keyring held `key`.
+fn assert_install(world: &World, run: &Run, key: Option<&str>) {
     // (a), (b)
     assert_eq!(run.outcome(), &provisioned());
     assert_eq!(
@@ -694,9 +732,16 @@ fn assert_fresh_install(world: &World, run: &Run) {
         "the credential is not the DSN line, wrapped by the stub systemd-creds"
     );
     // (e)
+    if let Some(key) = key {
+        let credential = std::fs::read(world.qdrant_credential()).expect("the key credential");
+        assert!(
+            credential == format!("ENCRYPTED({key}\n)").as_bytes(),
+            "the key credential is not the key line, wrapped by the stub systemd-creds"
+        );
+    }
     assert_eq!(
         std::fs::read_to_string(world.unit()).expect("the unit"),
-        world.expected_unit()
+        world.expected_unit(key.is_some())
     );
     assert_eq!(mode(&world.unit()), 0o644);
     // (f)
@@ -1181,6 +1226,227 @@ async fn a_service_that_never_starts_times_out_with_its_journal() {
         sentence.contains("re-run with --replace-credential"),
         "{sentence}"
     );
+    sweep_run(&world, &shell, &run);
+}
+
+/// MOD-158 D11: a box whose keyring holds a Qdrant API key gets it encrypted beside the DSN, and
+/// the unit loads both.
+#[tokio::test]
+async fn a_box_with_a_qdrant_key_gets_both_credentials_and_both_unit_lines() {
+    let world = World::new("password");
+    let shell = LocalShell::new(&world);
+    let run = provision(
+        &world,
+        &shell,
+        Setup {
+            qdrant_key: Some(QDRANT_KEY),
+            ..Setup::default()
+        },
+    )
+    .await;
+    assert_install(&world, &run, Some(QDRANT_KEY));
+    assert_eq!(
+        world.sudo_reads(),
+        Some(1),
+        "sudo read the password line only"
+    );
+    let commands = shell.commands();
+    assert_eq!(
+        commands[2].1,
+        PASSWORD.len() + 1 + QDRANT_KEY.len() + 1 + DSN.len() + 1,
+        "INSTALL's stdin: the password, the key and the DSN lines"
+    );
+    assert_eq!(
+        script_args(&commands[2].0).last().map(String::as_str),
+        Some("1")
+    );
+    let encrypts: Vec<String> = world
+        .argv_log()
+        .into_iter()
+        .filter(|line| line.starts_with("systemd-creds "))
+        .collect();
+    assert_eq!(encrypts.len(), 2, "{encrypts:?}");
+    assert!(
+        encrypts[0].contains("--name=htui-qdrant-key"),
+        "{encrypts:?}"
+    );
+    assert!(encrypts[1].contains("--name=htui-dsn"), "{encrypts:?}");
+    assert_no_leftovers(&world);
+    sweep_run(&world, &shell, &run);
+}
+
+/// MOD-158 D11: with no key, the unit and the credentials are what they were before.
+#[tokio::test]
+async fn without_a_key_the_unit_is_unchanged() {
+    let world = World::new("nopasswd");
+    let shell = LocalShell::new(&world);
+    let run = provision(&world, &shell, Setup::default()).await;
+    assert_fresh_install(&world, &run);
+    assert_eq!(
+        script_args(&shell.commands()[2].0)
+            .last()
+            .map(String::as_str),
+        Some("0")
+    );
+    assert!(
+        !std::fs::read_to_string(world.unit())
+            .expect("the unit")
+            .contains("htui-qdrant-key")
+    );
+    sweep_run(&world, &shell, &run);
+}
+
+/// MOD-158 D11: a key added after the box was provisioned is not sent by a plain re-run, which
+/// says so; `--replace-credential` encrypts it and adds its unit line, and re-encrypts a changed
+/// key the same way.
+#[tokio::test]
+async fn replace_credential_re_encrypts_the_key_too() {
+    let world = World::new("nopasswd");
+    let shell = LocalShell::new(&world);
+    let first = provision(&world, &shell, Setup::default()).await;
+    assert_eq!(first.outcome(), &provisioned());
+    sweep_run(&world, &shell, &first);
+
+    let plain = provision(
+        &world,
+        &shell,
+        Setup {
+            qdrant_key: Some(QDRANT_KEY),
+            ..Setup::default()
+        },
+    )
+    .await;
+    assert_eq!(plain.outcome(), &Outcome::AlreadyProvisioned);
+    assert!(
+        String::from_utf8_lossy(&plain.err).contains(
+            "note: the Qdrant API key was not sent; pass --replace-credential to add or replace it"
+        ),
+        "{}",
+        String::from_utf8_lossy(&plain.err)
+    );
+    assert!(!world.qdrant_credential().exists());
+    assert_eq!(
+        std::fs::read_to_string(world.unit()).expect("the unit"),
+        world.expected_unit(false)
+    );
+    sweep_run(&world, &shell, &plain);
+
+    for key in [QDRANT_KEY, QDRANT_KEY2] {
+        let replaced = provision(
+            &world,
+            &shell,
+            Setup {
+                qdrant_key: Some(key),
+                replace_credential: true,
+                ..Setup::default()
+            },
+        )
+        .await;
+        assert_eq!(replaced.outcome(), &provisioned());
+        assert!(
+            std::fs::read(world.qdrant_credential()).expect("the key credential")
+                == format!("ENCRYPTED({key}\n)").as_bytes(),
+            "the key credential is the new key"
+        );
+        assert_eq!(
+            std::fs::read_to_string(world.unit()).expect("the unit"),
+            world.expected_unit(true)
+        );
+        assert_eq!(
+            world.systemctl_writes().last().map(String::as_str),
+            Some("systemctl restart htui-worker.service")
+        );
+        assert_no_leftovers(&world);
+        sweep_run(&world, &shell, &replaced);
+    }
+
+    // A box whose key is gone: the unit no longer names the credential (the file stays, R-11).
+    let dropped = provision(
+        &world,
+        &shell,
+        Setup {
+            replace_credential: true,
+            ..Setup::default()
+        },
+    )
+    .await;
+    assert_eq!(dropped.outcome(), &provisioned());
+    assert_eq!(
+        std::fs::read_to_string(world.unit()).expect("the unit"),
+        world.expected_unit(false)
+    );
+    sweep_run(&world, &shell, &dropped);
+}
+
+/// MOD-158 D11 (repair finding): a keyed host whose worker stopped, re-provisioned from a machine
+/// with no key and without `--replace-credential`, keeps its key credential and the unit's line
+/// for it; only `--replace-credential` drops the line (R-11).
+#[tokio::test]
+async fn a_rerun_without_a_key_keeps_the_hosts_key_line() {
+    let world = World::new("nopasswd");
+    let shell = LocalShell::new(&world);
+    let keyed = provision(
+        &world,
+        &shell,
+        Setup {
+            qdrant_key: Some(QDRANT_KEY),
+            ..Setup::default()
+        },
+    )
+    .await;
+    assert_eq!(keyed.outcome(), &provisioned());
+    assert_eq!(
+        std::fs::read_to_string(world.unit()).expect("the unit"),
+        world.expected_unit(true)
+    );
+    sweep_run(&world, &shell, &keyed);
+
+    // The worker has stopped: the unit is installed but not running, so it is written again.
+    world.state("active", "failed");
+    let keyless = provision(&world, &shell, Setup::default()).await;
+    assert_eq!(keyless.outcome(), &provisioned());
+    assert_eq!(
+        std::fs::read_to_string(world.unit()).expect("the unit"),
+        world.expected_unit(true),
+        "the unit still loads the key credential"
+    );
+    assert!(
+        std::fs::read(world.qdrant_credential()).expect("the key credential")
+            == format!("ENCRYPTED({QDRANT_KEY}\n)").as_bytes(),
+        "the key credential is kept"
+    );
+    assert_no_leftovers(&world);
+    sweep_run(&world, &shell, &keyless);
+}
+
+/// MOD-158 D11: the key is handed to `printf` as the password is, so a host whose `sh` has no
+/// `printf` builtin is refused before anything is written, even with NOPASSWD.
+#[tokio::test]
+async fn a_key_on_a_host_without_a_printf_builtin_is_refused_before_any_write() {
+    let Some(world) = world_without_printf_builtin("nopasswd") else {
+        println!("no bash or /usr/bin/printf; skipping the MOD-158 D11 printf scenario");
+        return;
+    };
+    let shell = LocalShell::new(&world);
+    let run = provision(
+        &world,
+        &shell,
+        Setup {
+            qdrant_key: Some(QDRANT_KEY),
+            ..Setup::default()
+        },
+    )
+    .await;
+    let (code, sentence) = run.exit();
+    assert!(matches!(run.result, Err(ProvisionExit::Refused(_))));
+    assert_eq!(code, 2, "{sentence}");
+    assert!(
+        sentence.contains("so sending the Qdrant API key would put it in a process's arguments"),
+        "{sentence}"
+    );
+    assert_eq!(shell.commands().len(), 1, "the preflight only");
+    assert!(!world.home.join(".local").exists());
+    assert!(!world.root.join("etc").exists());
     sweep_run(&world, &shell, &run);
 }
 

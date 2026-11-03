@@ -915,15 +915,36 @@ pub enum StoreRequest {
     /// (`htui_store::cache::MIRRORED_TABLES`) and the cursor go, the file and its `cache_meta`
     /// stay (D14).
     RebuildCache,
-    /// Request to fetch Qdrant connection info.
+    /// Settings > Qdrant's read (MOD-158 D9): the `qdrant_url` row, the overrides in force and
+    /// this box's keyring entries. Answered with [`StoreReply::Qdrant`].
     QdrantInfo,
-    /// Request to set the Qdrant connection string.
-    SetQdrantUrl(String),
+    /// MOD-158 D1, D9: the database-wide URL, compare-and-set. `expected: None` means "I expect
+    /// no row". Answered with [`StoreReply::Qdrant`], or [`StoreReply::QdrantStale`] on a miss.
+    SetQdrantUrl {
+        /// The URL, already checked by D2.
+        url: htui_core::qdrant::QdrantUrl,
+        /// The row's token as the section read it, or `None` for no row.
+        expected: Option<DateTime<Utc>>,
+    },
+    /// MOD-158 D9: removes the URL row whose token is `expected`, for every box.
+    ClearQdrantUrl {
+        /// The row's token as the section read it.
+        expected: DateTime<Utc>,
+    },
     /// The API key, redacted in `Debug` (MOD-10 M4 D9); empty clears the stored key. The Settings
     /// field never sends an empty one (R1 L-5): clearing there is `c`, behind a question.
     SetQdrantApiKey(Redacted),
-    /// Request to clear the Qdrant connection string.
-    ClearQdrantSettings,
+    /// MOD-158 D9 (Q2): removes this box's API key from its keyring, and nothing else.
+    ClearQdrantApiKey,
+    /// MOD-158 D10: this box's old keyring URL becomes the row (inserted expecting none), then the
+    /// entry goes. The worker re-reads the entry itself.
+    AdoptOldQdrantUrl,
+    /// MOD-158 D10: removes this box's old keyring URL, and nothing else.
+    DiscardOldQdrantUrl,
+    /// MOD-158 R1 (C-M2): whether this box's keyring still holds the old Qdrant URL, read for the
+    /// launch's status-line notice and nothing else: no row, no key. Answered with
+    /// [`StoreReply::QdrantOldUrl`].
+    QdrantOldUrlCheck,
     // MOD-10 milestone 4: Settings > Secrets.
     /// The keyring rows of `Settings > Secrets` (D2). Answered with [`StoreReply::Secrets`].
     SecretsInfo,
@@ -1205,6 +1226,15 @@ pub enum StoreRequest {
 }
 
 impl StoreRequest {
+    /// Whether this is one of the `Settings > Qdrant` requests
+    /// ([`REQUEST_NAMES`](crate::qdrant_settings_info::REQUEST_NAMES)), the ones served by
+    /// `qdrant_settings_info` under a [`QdrantEnv`](htui_store::secret::QdrantEnv): the one list
+    /// every route reads (MOD-158 R1, C-L5), pinned to the variants by its test.
+    #[must_use]
+    pub fn is_qdrant(&self) -> bool {
+        crate::qdrant_settings_info::REQUEST_NAMES.contains(&self.name())
+    }
+
     /// Stable name of the request, used in [`StoreReply::Failed`] and in logs.
     #[must_use]
     pub const fn name(&self) -> &'static str {
@@ -1313,10 +1343,15 @@ impl StoreRequest {
             Self::SetDsn(_) => "set_dsn",
             Self::ClearDsn => "clear_dsn",
             Self::RebuildCache => "rebuild_cache",
+            // The eight of `qdrant_settings_info::REQUEST_NAMES`, in that order (MOD-158 D9, R1).
             Self::QdrantInfo => "qdrant_info",
-            Self::SetQdrantUrl(_) => "set_qdrant_url",
+            Self::SetQdrantUrl { .. } => "set_qdrant_url",
+            Self::ClearQdrantUrl { .. } => "clear_qdrant_url",
             Self::SetQdrantApiKey(_) => "set_qdrant_api_key",
-            Self::ClearQdrantSettings => "clear_qdrant_settings",
+            Self::ClearQdrantApiKey => "clear_qdrant_api_key",
+            Self::AdoptOldQdrantUrl => "adopt_old_qdrant_url",
+            Self::DiscardOldQdrantUrl => "discard_old_qdrant_url",
+            Self::QdrantOldUrlCheck => "qdrant_old_url_check",
             // The five of `secrets_settings::REQUEST_NAMES`, in that order, then the checks and
             // the scope write (MOD-10 M4).
             Self::SecretsInfo => "secrets_info",
@@ -1585,8 +1620,14 @@ pub enum StoreReply {
     /// `ConnectionInfo`, and every connection writer's success (D4): the section re-renders from
     /// it and never patches a field of its own into what it already had.
     Connection(ConnectionSnapshot),
-    /// Reply to QdrantInfo, SetQdrantDsn, ClearQdrantSettings requests.
+    /// The answer to every Settings > Qdrant request that read or wrote (MOD-158 D9).
     Qdrant(crate::qdrant_settings_info::QdrantSnapshot),
+    /// A URL compare-and-set (or the adopt's insert) found the row changed: the snapshot now, so
+    /// the section takes the new token from it (MOD-158 D9, blueprint R-3, R-4).
+    QdrantStale(Box<crate::qdrant_settings_info::QdrantSnapshot>),
+    /// The answer to [`StoreRequest::QdrantOldUrlCheck`]: whether this box's keyring holds the
+    /// retired Qdrant URL (MOD-158 R1, C-M2).
+    QdrantOldUrl(bool),
     /// Answer to [`StoreRequest::SearchConcepts`] and [`StoreRequest::IndexConcepts`] (MOD-64 D232):
     /// the outcome carries its own error, so a Qdrant failure stays in the search overlay and never
     /// reaches the status line the way a [`StoreReply::Failed`] does.
@@ -2056,6 +2097,26 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> StoreReply {
     }
 }
 
+/// [`serve`], with the `Settings > Qdrant` requests answered under `env` instead of this
+/// process's `HTUI_QDRANT_*` (blueprint P-13): the test harness's entry, so a test over a real
+/// backend reads no override it was not handed, in a sandbox that sets them or on the host.
+/// [`StoreRequest::is_qdrant`] picks them (MOD-158 R1, C-L5), so a new one cannot fall back to
+/// the process's environment here.
+#[cfg(any(test, feature = "testkit"))]
+pub async fn serve_with_qdrant_env(
+    backend: &Backend,
+    request: &StoreRequest,
+    env: &htui_store::secret::QdrantEnv,
+) -> StoreReply {
+    if !request.is_qdrant() {
+        return serve(backend, request).await;
+    }
+    match crate::qdrant_settings_info::serve_with(backend, request, env).await {
+        Ok(reply) => reply,
+        Err(err) => failed(request.name(), &err),
+    }
+}
+
 /// MOD-69 review L4: the open permissions, or `None` (unknown, as offline) when their read fails
 /// for any reason but [`StoreError::Unreachable`], which propagates so `go_offline` still fires.
 /// A broken permission read then costs the list its permission rows, not the whole reply. This is
@@ -2308,13 +2369,19 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         // spawned loop answers it from its own task before reaching here (review M-1); this arm
         // is `serve`'s, for the harness and `--demo`.
         StoreRequest::ListDir { path, show_hidden } => list_dir(path, *show_hidden).await?,
-        // The four `Settings > Qdrant` requests, or-ed for the reason the arms above are (MOD-15 M3
-        // plan F-12). They need no loop state, so the loop, the harness and `--demo` all serve
-        // these here (CLEAN-8 #9), and a `Memory` backend reads and writes no keyring.
+        // The `Settings > Qdrant` requests ([`StoreRequest::is_qdrant`]), or-ed for the reason the
+        // arms above are (MOD-15 M3 plan F-12); the match is exhaustive, so a new one must be
+        // routed somewhere. They need no loop state, so the loop, the harness and `--demo` all
+        // serve these here (CLEAN-8 #9), and a `Memory` backend reads and writes no keyring
+        // (MOD-158 D9).
         StoreRequest::QdrantInfo
-        | StoreRequest::SetQdrantUrl(_)
+        | StoreRequest::SetQdrantUrl { .. }
+        | StoreRequest::ClearQdrantUrl { .. }
         | StoreRequest::SetQdrantApiKey(_)
-        | StoreRequest::ClearQdrantSettings => {
+        | StoreRequest::ClearQdrantApiKey
+        | StoreRequest::AdoptOldQdrantUrl
+        | StoreRequest::DiscardOldQdrantUrl
+        | StoreRequest::QdrantOldUrlCheck => {
             crate::qdrant_settings_info::serve(backend, request).await?
         }
         // The five keyring requests of `Settings > Secrets`, or-ed for the reason the arms above
@@ -2927,6 +2994,9 @@ pub(crate) fn spawn_with_concepts(
             if let Some(host) = &tools {
                 host_the_backend(host, &backend);
             }
+            // MOD-158 D6 (blueprint P-2), the same rule: the concepts index reads the `qdrant_url`
+            // row through this iteration's writable store, or through none. A pointer swap.
+            concepts.publish(&backend);
             // The first sweep reads `lease_ttl_seconds`; the ticker follows it.
             if runs.sweep_every() != sweep_every {
                 sweep_every = runs.sweep_every();
@@ -3711,6 +3781,100 @@ mod tests {
         };
         assert_eq!(echoed, &query);
         assert_eq!(error, message);
+    }
+
+    /// An index that records whether each publish handed it a store (MOD-158 D6).
+    #[derive(Default)]
+    struct Publishes(std::sync::Mutex<Vec<bool>>);
+
+    impl Publishes {
+        fn seen(&self) -> Vec<bool> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl concepts_worker::ConceptIndex for Publishes {
+        fn search(
+            &self,
+            _: SearchQuery,
+        ) -> futures::future::BoxFuture<'_, Result<Vec<htui_store::vector::Hit>, String>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn sync(
+            &self,
+            _: Backend,
+            _: Scope,
+        ) -> futures::future::BoxFuture<'_, Result<htui_store::vector_sync::SyncReport, String>>
+        {
+            Box::pin(async { Ok(Default::default()) })
+        }
+        fn publish(&self, store: Option<Arc<dyn concepts_worker::UrlRow>>) {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(store.is_some());
+        }
+    }
+
+    /// MOD-158 D6, blueprint P-2: the loop publishes the store it serves at the top of every
+    /// iteration, so the concepts index reads the `qdrant_url` row through the server the loop is
+    /// on, and through none once that server is lost.
+    #[tokio::test]
+    async fn the_loop_publishes_its_writable_store_to_the_concepts_index() {
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "concepts-publish", 1)
+            .await
+            .expect("open a throwaway mirror");
+        let identity = Identity {
+            box_id: BoxId::new(),
+            hostname: "HTUI-TEST".to_owned(),
+        };
+        let pg = PgStore::lazy(
+            "postgres://nobody:nothing@127.0.0.1:1/none",
+            &identity,
+            std::time::Duration::from_millis(250),
+        )
+        .expect("a lazy pool opens no socket");
+        let index = Arc::new(Publishes::default());
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, mut rep_rx) = mpsc::unbounded_channel();
+        let mut started = Started::detached(Backend::Online {
+            pg,
+            cache: cache.clone(),
+        });
+        started.reconnect = None;
+        let worker = spawn_with_concepts(
+            started,
+            req_rx,
+            rep_tx,
+            AgentRuntime::production(),
+            RunRuntime::production(),
+            ConceptsRuntime::new(index.clone()),
+            None,
+        );
+
+        round_trip(&req_tx, &mut rep_rx, StoreRequest::StoreState).await;
+        assert_eq!(
+            index.seen().first(),
+            Some(&true),
+            "published before the first request"
+        );
+        // The read that notices the server is gone swaps the backend onto the mirror.
+        round_trip(&req_tx, &mut rep_rx, StoreRequest::Workspaces).await;
+        round_trip(&req_tx, &mut rep_rx, StoreRequest::StoreState).await;
+        assert_eq!(
+            index.seen().last(),
+            Some(&false),
+            "offline, nothing is published: {:?}",
+            index.seen()
+        );
+
+        drop(req_tx);
+        worker.await.expect("the worker stops with its channel");
+        cache.close().await;
     }
 
     /// MOD-49 review M-1: a listing that hangs (a dead mount) is answered as refused once its

@@ -2,5 +2,5 @@
 source: crates/htui/tests/qdrant_settings.rs
 expression: frame
 ---
-▌URL       stored · https://qdrant.example:6334
+▌URL       https://qdrant.example:6334 · for every box
  API key   •••••••• stored

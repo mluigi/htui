@@ -24,12 +24,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use htui::cli::StateArgs;
 use htui::concepts::{self, SearchContext, SearchOptions};
-use htui::state_cmd::{self, Answer, Context, Kind, Outcome, StateExit, Verb};
+use htui::state_cmd::{self, Answer, Context, Outcome, StateExit, Verb};
 use htui_core::fixtures::ids;
 use htui_core::model::{BoxId, ItemFilter, NewRepo, RepoBoxPath, RepoId, Scope};
+use htui_core::qdrant::QdrantUrl;
 use htui_core::store::{ReadStore as _, WriteStore as _};
 use htui_store::embed::{DENSE_DIM, HashEmbedder};
 use htui_store::qdrant_settings::QdrantSettings;
+use htui_store::secret::QdrantEnv;
 use htui_store::vector::QdrantStore;
 use htui_store::{Identity, testkit};
 use serde_json::Value;
@@ -503,8 +505,9 @@ impl Loads {
 }
 
 /// `search_answer_with`, then `emit --json` into a buffer: what `search_items` writes to stdout.
+/// The keyring holds no Qdrant API key.
 async fn searched(
-    settings: &QdrantSettings,
+    env: &QdrantEnv,
     collection: &str,
     dsn: &str,
     identity: Option<&Identity>,
@@ -512,7 +515,8 @@ async fn searched(
     loads: &Loads,
 ) -> Ran {
     let ctx = SearchContext {
-        settings,
+        env,
+        keyring_key: || Ok(None),
         collection,
         dsn,
         identity,
@@ -532,8 +536,20 @@ async fn searched(
     }
 }
 
-fn qdrant(url: &str) -> QdrantSettings {
-    QdrantSettings::new(url.to_owned(), None).expect("a valid URL")
+/// `HTUI_QDRANT_URL` set to `url` for this search, no key: the test's literal, never the process's
+/// (blueprint P-13).
+fn qdrant(url: &str) -> QdrantEnv {
+    QdrantEnv::new(Some(url.to_owned()), None)
+}
+
+/// The `qdrant_url` row the test sets.
+fn qdrant_url(url: &str) -> QdrantUrl {
+    QdrantUrl::parse(url).expect("a valid URL")
+}
+
+/// The test Qdrant's settings, for the cases that build or inspect a collection directly.
+fn settings(url: &str) -> QdrantSettings {
+    QdrantSettings::new(qdrant_url(url), None)
 }
 
 /// The test Qdrant's URL, or the skip line.
@@ -549,22 +565,154 @@ fn fresh_collection() -> String {
     format!("htui_test_{}", uuid::Uuid::now_v7().simple())
 }
 
-/// Needs no database: never skips. A box with no Qdrant URL is refused before Postgres is asked.
+/// MOD-158 D8: no override and no `qdrant_url` row is `no_qdrant_url`, a refusal (exit 2), read
+/// after the connect, before the scope and the model.
 #[tokio::test]
 async fn a_search_without_a_qdrant_url_is_refused() {
-    let failure =
-        concepts::qdrant_settings(None, Some("a-key".into())).expect_err("no URL, no settings");
-    let answer = Answer {
-        kind: Kind::Search,
-        outcome: Outcome::Failed(failure),
+    let Some(db) = testkit::demo_db().await else {
+        return;
     };
-    assert_eq!(answer.exit_code(), 2);
-    let document = state_cmd::document(&answer);
-    assert_eq!(document["store"], "refused");
-    assert_eq!(document["error"]["code"], "no_qdrant_url");
-    let unusable = concepts::qdrant_settings(Some("localhost:6334".into()), None)
-        .expect_err("a URL without a scheme");
-    assert_eq!(unusable.error.code, state_cmd::ErrorCode::QdrantUrlUnusable);
+    let loads = Loads::default();
+    let run = searched(
+        &QdrantEnv::default(),
+        "c",
+        &db.url,
+        None,
+        &search_options("closed items"),
+        &loads,
+    )
+    .await;
+    assert_eq!(run.code(), 2, "{}", run.pretty());
+    assert_eq!(run.document["store"], "refused");
+    assert_eq!(run.error_code(), "no_qdrant_url");
+    let message = run.document["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(message.contains("htui --set-qdrant-url"), "{message}");
+    assert_eq!(loads.count(), 0);
+    db.drop_db().await;
+}
+
+/// Needs no database: never skips. MOD-158 D8: the URL is a row in the database, so a Postgres
+/// that does not answer is said first (`unreachable`, exit 3), not "no URL".
+#[tokio::test]
+async fn postgres_unreachable_comes_before_no_url() {
+    let loads = Loads::default();
+    let run = searched(
+        &QdrantEnv::default(),
+        "c",
+        UNREACHABLE,
+        None,
+        &search_options("closed items"),
+        &loads,
+    )
+    .await;
+    assert_eq!(run.code(), 3, "{}", run.pretty());
+    assert_eq!(run.error_code(), "unreachable");
+    assert_eq!(loads.count(), 0);
+}
+
+/// MOD-158 D8: with no override, the search reads the `qdrant_url` row: here a Qdrant that does
+/// not answer, so the index is `qdrant_unreachable`.
+#[tokio::test]
+async fn a_search_reads_the_url_row() {
+    let Some(db) = testkit::demo_db().await else {
+        return;
+    };
+    db.store
+        .set_qdrant_url(&qdrant_url(QDRANT_DOWN), None)
+        .await
+        .expect("set the row");
+    let loads = Loads::default();
+    let run = searched(
+        &QdrantEnv::default(),
+        "htui_concepts_v2",
+        &db.url,
+        None,
+        &search_options("closed items"),
+        &loads,
+    )
+    .await;
+    assert_eq!(run.code(), 3, "{}", run.pretty());
+    assert_eq!(run.document["store"], "online");
+    assert_eq!(run.error_code(), "qdrant_unreachable");
+    db.drop_db().await;
+}
+
+/// MOD-158 D3: `HTUI_QDRANT_URL` wins over the row. The row names a Qdrant that does not answer;
+/// the override names the test Qdrant, where the throwaway collection does not exist: `empty`.
+#[tokio::test]
+async fn the_env_url_wins_over_the_row() {
+    let Some(url) = test_qdrant() else {
+        return;
+    };
+    let Some(db) = testkit::demo_db().await else {
+        return;
+    };
+    db.store
+        .set_qdrant_url(&qdrant_url(QDRANT_DOWN), None)
+        .await
+        .expect("set the row");
+    let loads = Loads::default();
+    let run = searched(
+        &qdrant(&url),
+        &fresh_collection(),
+        &db.url,
+        None,
+        &search_options("closed items"),
+        &loads,
+    )
+    .await;
+    assert_eq!(run.code(), 0, "{}", run.pretty());
+    assert_eq!(run.document["index"], "empty");
+    db.drop_db().await;
+}
+
+/// MOD-158 D1, P-3: a malformed row is `qdrant_url_unusable` naming the key, never "no URL"; an
+/// invalid override is `qdrant_url_unusable` naming the variable.
+#[tokio::test]
+async fn a_malformed_row_is_qdrant_url_unusable() {
+    let Some(db) = testkit::demo_db().await else {
+        return;
+    };
+    // Unchecked on purpose: a `query!` here would need an offline entry of its own.
+    sqlx::query("INSERT INTO app_setting (key, value) VALUES ('qdrant_url', '42'::jsonb)")
+        .execute(db.store.pool())
+        .await
+        .expect("plant a malformed qdrant_url row");
+    let loads = Loads::default();
+    let run = searched(
+        &QdrantEnv::default(),
+        "c",
+        &db.url,
+        None,
+        &search_options("closed items"),
+        &loads,
+    )
+    .await;
+    assert_eq!(run.code(), 2, "{}", run.pretty());
+    assert_eq!(run.error_code(), "qdrant_url_unusable");
+    let message = run.document["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(message.contains("`qdrant_url`"), "{message}");
+
+    let run = searched(
+        &QdrantEnv::new(Some("localhost:6334".to_owned()), None),
+        "c",
+        &db.url,
+        None,
+        &search_options("closed items"),
+        &loads,
+    )
+    .await;
+    assert_eq!(run.error_code(), "qdrant_url_unusable");
+    let message = run.document["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(message.starts_with("HTUI_QDRANT_URL "), "{message}");
+    assert_eq!(loads.count(), 0);
+    db.drop_db().await;
 }
 
 /// Qdrant down: Postgres answered (`store` online), the index is `offline`/3, and the model was
@@ -663,10 +811,11 @@ async fn a_search_without_a_collection_is_empty_and_loads_no_model() {
     assert_eq!(run.document["index"], "empty");
     assert_eq!(run.document["hits"], serde_json::json!([]));
     assert_eq!(loads.count(), 0, "no model for a missing index");
-    let exists = QdrantStore::open_existing_to(&qdrant(&url), HashEmbedder::new(DENSE_DIM), &name)
-        .await
-        .expect("Qdrant answers")
-        .is_some();
+    let exists =
+        QdrantStore::open_existing_to(&settings(&url), HashEmbedder::new(DENSE_DIM), &name)
+            .await
+            .expect("Qdrant answers")
+            .is_some();
     assert!(!exists, "the search created no collection");
     db.drop_db().await;
 }
@@ -682,7 +831,7 @@ async fn a_search_over_an_index_answers_in_scope() {
         return;
     };
     let name = fresh_collection();
-    let index = QdrantStore::connect_to(&qdrant(&url), HashEmbedder::new(DENSE_DIM), &name)
+    let index = QdrantStore::connect_to(&settings(&url), HashEmbedder::new(DENSE_DIM), &name)
         .await
         .expect("Qdrant answers");
     concepts::index_cycle(&db.store, &index).await;
@@ -727,18 +876,10 @@ async fn a_search_over_an_index_answers_in_scope() {
             })
             .unwrap_or_default()
     };
-    let settings = qdrant(&url);
+    let env = qdrant(&url);
     let loads = Loads::default();
 
-    let everywhere = searched(
-        &settings,
-        &name,
-        &db.url,
-        None,
-        &search_options(&key),
-        &loads,
-    )
-    .await;
+    let everywhere = searched(&env, &name, &db.url, None, &search_options(&key), &loads).await;
     assert_eq!(everywhere.code(), 0, "{}", everywhere.pretty());
     assert_eq!(everywhere.document["index"], "online");
     assert!(keys(&everywhere).contains(&key), "{}", everywhere.pretty());
@@ -748,13 +889,13 @@ async fn a_search_over_an_index_answers_in_scope() {
         project: Some("htui".into()),
         ..search_options(&key)
     };
-    let run = searched(&settings, &name, &db.url, None, &htui, &loads).await;
+    let run = searched(&env, &name, &db.url, None, &htui, &loads).await;
     assert!(keys(&run).contains(&key), "{}", run.pretty());
     let agy = SearchOptions {
         project: Some("agy".into()),
         ..search_options(&key)
     };
-    let run = searched(&settings, &name, &db.url, None, &agy, &loads).await;
+    let run = searched(&env, &name, &db.url, None, &agy, &loads).await;
     assert_eq!(run.code(), 0, "{}", run.pretty());
     assert!(!keys(&run).contains(&key), "agy's scope: {}", run.pretty());
 
@@ -789,21 +930,14 @@ async fn a_search_over_an_index_answers_in_scope() {
         cwd: Some(checkout.path().to_path_buf()),
         ..search_options(&key)
     };
-    let run = searched(
-        &settings,
-        &name,
-        &db.url,
-        Some(&identity),
-        &in_checkout,
-        &loads,
-    )
-    .await;
+    let run = searched(&env, &name, &db.url, Some(&identity), &in_checkout, &loads).await;
     assert_eq!(run.code(), 0, "{}", run.pretty());
     assert!(keys(&run).contains(&key), "{}", run.pretty());
 
     // A model that cannot load, and one that fails on the query: the model's failure, not Qdrant's.
     let ctx = SearchContext {
-        settings: &settings,
+        env: &env,
+        keyring_key: || Ok(None),
         collection: &name,
         dsn: &db.url,
         identity: None,

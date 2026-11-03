@@ -11,6 +11,7 @@
 pub mod clock;
 pub mod model;
 pub mod prompt;
+pub mod qdrant;
 pub mod root_path;
 pub mod scrub;
 pub mod secret;

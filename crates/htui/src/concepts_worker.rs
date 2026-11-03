@@ -8,21 +8,25 @@
 
 use std::collections::HashMap;
 use std::mem::Discriminant;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
 use futures::FutureExt as _;
 use futures::future::{BoxFuture, Shared};
 use htui_core::model::Scope;
-use htui_core::store::StoreError;
+use htui_core::qdrant::{QdrantUrl, QdrantUrlError, StoredQdrantUrl};
+use htui_core::store::{MemStore, StoreError};
 use htui_store::embed::RtenEmbedder;
 use htui_store::model;
 use htui_store::qdrant_settings::QdrantSettings;
+use htui_store::secret::{KeyHost, QdrantEnv, QdrantKeyError};
 use htui_store::vector::{Hit, QdrantStore, SearchQuery, VectorStore as _};
 use htui_store::vector_sync::{Indexer, SyncReport};
-use htui_store::{Backend, secret};
+use htui_store::{Backend, PgStore, secret};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use zeroize::Zeroizing;
 
 use crate::store_worker::{Origin, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest};
 
@@ -55,6 +59,298 @@ pub trait ConceptIndex: Send + Sync {
     fn search(&self, query: SearchQuery) -> BoxFuture<'_, Result<Vec<Hit>, String>>;
     /// `Indexer::sync` of every project of `scope`, reading through `backend`.
     fn sync(&self, backend: Backend, scope: Scope) -> BoxFuture<'_, Result<SyncReport, String>>;
+    /// MOD-158 D6: the store the `qdrant_url` row is read through from now on (`None`: offline,
+    /// `--demo`, or not connected yet). An index that reads no settings ignores it.
+    fn publish(&self, _store: Option<Arc<dyn UrlRow>>) {}
+}
+
+/// "Postgres is not connected" for the Qdrant URL (MOD-158 D6): no store is published (offline,
+/// `--demo`, or before the first connect) and no `HTUI_QDRANT_URL` override is set.
+pub const URL_OFFLINE: &str = "the Qdrant URL cannot be read: Postgres is not connected";
+
+/// D3's sentence for an override that is not a Qdrant URL. Never the value: it may hold a password.
+pub(crate) fn env_url_unusable(why: QdrantUrlError) -> String {
+    format!(
+        "{} is not a usable Qdrant URL: {why}",
+        htui_core::secret::QDRANT_URL_ENV
+    )
+}
+
+/// The `HTUI_QDRANT_URL` override as a `Debug` may show it: the parsed URL, or a placeholder for
+/// one that does not parse (a refused URL may hold a password, so its text is never shown).
+pub(crate) fn shown_env_url(env: &QdrantEnv) -> Option<String> {
+    env.url.as_deref().map(|text| {
+        QdrantUrl::parse(text)
+            .map_or_else(|_| "<not a usable URL>".to_owned(), |url| url.to_string())
+    })
+}
+
+/// The keyring read of the Qdrant API key: [`secret::get_qdrant_api_key`] in production, a
+/// closure in a test, so no case reads a keyring.
+pub type KeyringRead = fn() -> htui_core::store::Result<Option<String>>;
+
+/// MOD-158 D6: what the `qdrant_url` row is read through: the store this process is connected to.
+pub trait UrlRow: Send + Sync {
+    /// The row, malformed or not; `None` when there is none.
+    fn qdrant_url(&self) -> BoxFuture<'_, Result<Option<StoredQdrantUrl>, StoreError>>;
+}
+
+impl UrlRow for PgStore {
+    fn qdrant_url(&self) -> BoxFuture<'_, Result<Option<StoredQdrantUrl>, StoreError>> {
+        Box::pin(Self::qdrant_url(self))
+    }
+}
+
+/// The tests' store, and `--demo`'s should it ever publish one.
+impl UrlRow for MemStore {
+    fn qdrant_url(&self) -> BoxFuture<'_, Result<Option<StoredQdrantUrl>, StoreError>> {
+        Box::pin(Self::qdrant_url(self))
+    }
+}
+
+/// MOD-158 D4 for this process, owned (the borrowed form is [`KeyHost`]).
+#[derive(Clone)]
+pub enum KeySource {
+    /// The TUI and the CLI verbs: this box's keyring, read per request.
+    Interactive,
+    /// `htui worker`: its `--qdrant-key-stdin` line when given, else the keyring, else the systemd
+    /// credential `htui-qdrant-key`.
+    Headless {
+        /// The line read at worker start, exactly when `--qdrant-key-stdin` was given.
+        stdin: Option<Zeroizing<String>>,
+        /// `$CREDENTIALS_DIRECTORY`, as the worker read it at start.
+        credentials_dir: Option<PathBuf>,
+    },
+}
+
+impl KeySource {
+    /// The borrowed form `secret::qdrant_api_key` takes.
+    fn host(&self) -> KeyHost<'_> {
+        match self {
+            Self::Interactive => KeyHost::Interactive,
+            Self::Headless {
+                stdin,
+                credentials_dir,
+            } => KeyHost::Headless {
+                stdin: stdin.as_deref().map(String::as_str),
+                credentials_dir: credentials_dir.as_deref(),
+            },
+        }
+    }
+}
+
+impl core::fmt::Debug for KeySource {
+    /// [`KeyHost`]'s: whether stdin is a source, never what it holds.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(&self.host(), f)
+    }
+}
+
+/// Why no Qdrant settings resolved (MOD-158 D3, D4). [`Self::sentence`] is what a search, an index
+/// run or a log line says.
+#[derive(Debug, Clone)]
+pub enum Unresolved {
+    /// No override and no row: [`crate::concepts::NO_QDRANT_URL`].
+    NoUrl,
+    /// No store published and no override: [`URL_OFFLINE`].
+    Offline,
+    /// The override or the row is not a usable URL: its sentence, which names where it came from.
+    Unusable(String),
+    /// The row could not be read.
+    Read(StoreError),
+    /// The key could not be read.
+    Key(QdrantKeyError),
+}
+
+impl Unresolved {
+    /// The sentence shown for it.
+    #[must_use]
+    pub fn sentence(&self) -> String {
+        match self {
+            Self::NoUrl => crate::concepts::NO_QDRANT_URL.to_owned(),
+            Self::Offline => URL_OFFLINE.to_owned(),
+            Self::Unusable(sentence) => sentence.clone(),
+            Self::Read(err) => format!("the Qdrant URL setting could not be read: {err}"),
+            Self::Key(err) => err.to_string(),
+        }
+    }
+}
+
+impl core::fmt::Display for Unresolved {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.sentence())
+    }
+}
+
+/// D3 alone: the override (an invalid one is an error, never a fallback); else the row, through
+/// [`StoredQdrantUrl::usable`] (a malformed row is never "no URL"); else [`Unresolved::NoUrl`].
+/// `row` is `None` when no store is published: [`Unresolved::Offline`], unless the override is set.
+async fn resolve_url(env: &QdrantEnv, row: Option<&dyn UrlRow>) -> Result<QdrantUrl, Unresolved> {
+    if let Some(text) = &env.url {
+        return QdrantUrl::parse(text).map_err(|why| Unresolved::Unusable(env_url_unusable(why)));
+    }
+    let Some(row) = row else {
+        return Err(Unresolved::Offline);
+    };
+    match row.qdrant_url().await {
+        Err(err) => Err(Unresolved::Read(err)),
+        Ok(None) => Err(Unresolved::NoUrl),
+        Ok(Some(stored)) => stored.usable().cloned().map_err(|err| match err {
+            StoreError::Backend(sentence) => Unresolved::Unusable(sentence),
+            other => Unresolved::Unusable(other.to_string()),
+        }),
+    }
+}
+
+/// D4: `HTUI_QDRANT_API_KEY`, then `key`'s sources. A source that may touch the keyring or a file
+/// is read on the blocking pool (`QdrantSnapshot::fetch`'s rule), never on an async worker.
+async fn resolve_key(
+    env: &QdrantEnv,
+    key: &KeySource,
+    keyring: KeyringRead,
+) -> Result<Option<Zeroizing<String>>, Unresolved> {
+    let env_key = env.api_key.clone();
+    let key = key.clone();
+    let read = move || {
+        secret::qdrant_api_key(env_key.as_deref().map(String::as_str), key.host(), &keyring)
+    };
+    tokio::task::spawn_blocking(read)
+        .await
+        .map_err(|err| {
+            Unresolved::Key(QdrantKeyError::Keyring(format!(
+                "the key read stopped: {err}"
+            )))
+        })?
+        .map_err(Unresolved::Key)
+}
+
+/// MOD-158 D3, D4, the one resolution every Qdrant user goes through (the TUI's index, the worker
+/// job, `--search-items`, `--index-items`): the URL first, so a box without one reads no key.
+pub(crate) async fn resolve_settings(
+    env: &QdrantEnv,
+    row: Option<&dyn UrlRow>,
+    key: &KeySource,
+    keyring: KeyringRead,
+) -> Result<QdrantSettings, Unresolved> {
+    let url = resolve_url(env, row).await?;
+    let api_key = resolve_key(env, key, keyring).await?;
+    Ok(QdrantSettings { url, api_key })
+}
+
+/// MOD-158 D6: one process's source of Qdrant settings. The slot holds the current store (`None`
+/// offline, under `--demo`, or before a connect); every read takes an `Arc` clone and drops the
+/// lock before any `.await`, and a publish is a pointer swap with no `.await` (`R-NF-3`).
+pub struct QdrantSource {
+    /// `HTUI_QDRANT_URL` and `HTUI_QDRANT_API_KEY`, as this process read them.
+    env: QdrantEnv,
+    /// The store the `qdrant_url` row is read through.
+    store: RwLock<Option<Arc<dyn UrlRow>>>,
+    /// Where the key comes from after the environment.
+    key: RwLock<KeySource>,
+    /// The keyring read of the key.
+    keyring: KeyringRead,
+}
+
+impl core::fmt::Debug for QdrantSource {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Not `QdrantEnv`'s own `Debug`: that prints the override unvalidated.
+        f.debug_struct("QdrantSource")
+            .field("env_url", &shown_env_url(&self.env))
+            .field("env_key", &self.env.api_key.as_ref().map(|_| "<redacted>"))
+            .field("published", &self.current().is_some())
+            .field(
+                "key",
+                &*self.key.read().unwrap_or_else(PoisonError::into_inner),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl QdrantSource {
+    /// A source over `env` and `key`, nothing published, reading the keyring through
+    /// [`secret::get_qdrant_api_key`]. An override in force is logged once, here, at `info` (D3);
+    /// an unusable one at `warn`, without its value.
+    #[must_use]
+    pub fn new(env: QdrantEnv, key: KeySource) -> Self {
+        if let Some(text) = &env.url {
+            // Never the text of an invalid one: a refused URL may hold a password.
+            match QdrantUrl::parse(text) {
+                Ok(url) => tracing::info!(
+                    %url,
+                    "{} overrides the qdrant_url setting in this process",
+                    htui_core::secret::QDRANT_URL_ENV
+                ),
+                // A `warn`: every search and sync will refuse until it is fixed (MOD-158 R1).
+                Err(why) => tracing::warn!("{}", env_url_unusable(why)),
+            }
+        }
+        Self {
+            env,
+            store: RwLock::new(None),
+            key: RwLock::new(key),
+            keyring: secret::get_qdrant_api_key,
+        }
+    }
+
+    /// The same source, reading the key's keyring through `keyring` (a test's closure).
+    #[must_use]
+    pub fn with_keyring(self, keyring: KeyringRead) -> Self {
+        Self { keyring, ..self }
+    }
+
+    /// This process's environment, the interactive key: what a production entry point builds
+    /// (blueprint P-13: never a test).
+    #[must_use]
+    pub fn from_process() -> Self {
+        Self::new(QdrantEnv::from_process(), KeySource::Interactive)
+    }
+
+    /// The environment this source was built over.
+    #[must_use]
+    pub const fn env(&self) -> &QdrantEnv {
+        &self.env
+    }
+
+    /// The store the row is read through from now on.
+    pub fn publish(&self, store: Option<Arc<dyn UrlRow>>) {
+        *self.store.write().unwrap_or_else(PoisonError::into_inner) = store;
+    }
+
+    /// Where the key comes from from now on (`htui worker`: [`KeySource::Headless`]).
+    pub fn set_key_source(&self, key: KeySource) {
+        *self.key.write().unwrap_or_else(PoisonError::into_inner) = key;
+    }
+
+    /// The published store, its lock already dropped.
+    fn current(&self) -> Option<Arc<dyn UrlRow>> {
+        self.store
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// D3 alone: the worker's `search_concepts` gate (D7, Q3).
+    ///
+    /// # Errors
+    /// [`Unresolved`]: no URL, offline, an unusable override or row, or an unreadable row.
+    pub async fn url(&self) -> Result<QdrantUrl, Unresolved> {
+        let store = self.current();
+        resolve_url(&self.env, store.as_deref()).await
+    }
+
+    /// D3 and D4, read now: a URL or key changed since the last call applies to this one.
+    ///
+    /// # Errors
+    /// [`Unresolved`].
+    pub async fn settings(&self) -> Result<QdrantSettings, Unresolved> {
+        let store = self.current();
+        let key = self
+            .key
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        resolve_settings(&self.env, store.as_deref(), &key, self.keyring).await
+    }
 }
 
 /// How the embedding model is loaded: [`load_model`] in production, a counter in a test.
@@ -73,10 +369,11 @@ fn load_model() -> BoxFuture<'static, Result<RtenEmbedder, String>> {
     })
 }
 
-/// The production index (D238, amended at review 3): settings re-read from the keyring per
-/// request, so a URL changed in Settings > Qdrant applies to the next search; the Qdrant connection
-/// reused while the URL and key stay the same; the embedding model loaded once, on the blocking
-/// pool, and shared.
+/// The production index (D238, amended at review 3 and by MOD-158 D6): settings resolved per
+/// request through its [`QdrantSource`] (the `qdrant_url` row of the published store, or the
+/// override, and the key), so a URL or key changed in Settings > Qdrant applies to the next search;
+/// the Qdrant connection reused while the URL and key stay the same; the embedding model loaded
+/// once, on the blocking pool, and shared.
 pub struct QdrantIndex {
     /// The model's load: in flight, done, or failed. One at a time (review 2): a failed one is
     /// replaced by the next search's, a done one answers every later search (D238).
@@ -85,6 +382,8 @@ pub struct QdrantIndex {
     loader: Loader,
     /// The last connection made, for the settings it was made with (review 3).
     connections: Connections<QdrantStore<RtenEmbedder>>,
+    /// Where the settings come from (MOD-158 D6).
+    source: Arc<QdrantSource>,
 }
 
 /// One cached connection, keyed by the URL and key it was made with (review 3).
@@ -122,6 +421,23 @@ impl<T> Connections<T> {
         *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = Some((settings, connection));
     }
 
+    /// The settings stopped resolving (no URL, offline, an unusable setting): no connection, and
+    /// no key it was made with, is kept for them (MOD-158 R1, B-L1).
+    fn clear(&self) {
+        *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// [`QdrantSource::settings`]' answer, the cache cleared when it is not settings.
+    fn resolved(
+        &self,
+        settings: Result<QdrantSettings, Unresolved>,
+    ) -> Result<QdrantSettings, Unresolved> {
+        if settings.is_err() {
+            self.clear();
+        }
+        settings
+    }
+
     /// A call on `connection` failed: the next request reconnects. A connection another request
     /// has cached since is left alone.
     fn forget(&self, connection: &Arc<T>) {
@@ -145,8 +461,9 @@ impl core::fmt::Debug for QdrantIndex {
 }
 
 impl Default for QdrantIndex {
+    /// Over this process's environment and the interactive key (a production entry point).
     fn default() -> Self {
-        Self::with_loader(load_model)
+        Self::with_loader(load_model).with_source(Arc::new(QdrantSource::from_process()))
     }
 }
 
@@ -158,6 +475,8 @@ impl QdrantIndex {
     }
 
     /// An index whose model comes from `loader` (review 2: the seam a test counts loads through).
+    /// Its source reads no environment (blueprint P-13): a test that needs one calls
+    /// [`Self::with_source`].
     pub(crate) fn with_loader(
         loader: impl Fn() -> BoxFuture<'static, Result<RtenEmbedder, String>> + Send + Sync + 'static,
     ) -> Self {
@@ -165,7 +484,23 @@ impl QdrantIndex {
             load: Mutex::new(None),
             loader: Arc::new(loader),
             connections: Connections::default(),
+            source: Arc::new(QdrantSource::new(
+                QdrantEnv::default(),
+                KeySource::Interactive,
+            )),
         }
+    }
+
+    /// The same index, its settings read through `source`.
+    #[must_use]
+    pub fn with_source(self, source: Arc<QdrantSource>) -> Self {
+        Self { source, ..self }
+    }
+
+    /// Where its settings come from: `htui worker` publishes its store and key source here.
+    #[must_use]
+    pub const fn source(&self) -> &Arc<QdrantSource> {
+        &self.source
     }
 
     /// The model, loading it on first use (F9, blueprint D245). `concepts::spawn_index_job` takes
@@ -195,8 +530,9 @@ impl QdrantIndex {
     }
 
     /// Qdrant at `settings`, over the shared model: the cached connection when it was made with
-    /// the same URL and key, else a new one, cached (review 3).
-    async fn connect(
+    /// the same URL and key, else a new one, cached (review 3). The worker's index job opens its
+    /// store here, so a changed URL or key reconnects it too (MOD-158 D7).
+    pub(crate) async fn connect(
         &self,
         settings: QdrantSettings,
     ) -> Result<Arc<QdrantStore<RtenEmbedder>>, String> {
@@ -211,18 +547,22 @@ impl QdrantIndex {
         self.connections.put(settings, Arc::clone(&store));
         Ok(store)
     }
-}
 
-/// The keyring's URL and key, read on the blocking pool (`QdrantSnapshot::fetch`'s rule), then
-/// `concepts::settings_from`.
-async fn qdrant_settings() -> Result<QdrantSettings, String> {
-    let (url, api_key) = tokio::task::spawn_blocking(|| {
-        Ok::<_, StoreError>((secret::get_qdrant_url()?, secret::get_qdrant_api_key()?))
-    })
-    .await
-    .map_err(|e| format!("the keyring read stopped: {e}"))?
-    .map_err(|e| e.to_string())?;
-    crate::concepts::settings_from(url, api_key).map_err(|e| format!("{e:#}"))
+    /// The worker's index job's `forget` (MOD-158 R1, B-L1): `Some(store)` after a failed sync on
+    /// it, `None` when the settings did not resolve.
+    pub(crate) fn forget(&self, store: Option<&Arc<QdrantStore<RtenEmbedder>>>) {
+        match store {
+            Some(store) => self.connections.forget(store),
+            None => self.connections.clear(),
+        }
+    }
+
+    /// The settings, read now; a cached connection is dropped when they do not resolve.
+    async fn settings(&self) -> Result<QdrantSettings, String> {
+        self.connections
+            .resolved(self.source.settings().await)
+            .map_err(|why| why.sentence())
+    }
 }
 
 // Settings before the model, in both: a box with no URL fails in microseconds without downloading
@@ -232,7 +572,7 @@ async fn qdrant_settings() -> Result<QdrantSettings, String> {
 impl ConceptIndex for QdrantIndex {
     fn search(&self, query: SearchQuery) -> BoxFuture<'_, Result<Vec<Hit>, String>> {
         Box::pin(async move {
-            let settings = qdrant_settings().await?;
+            let settings = self.settings().await?;
             let store = self.connect(settings).await?;
             store.search(&query).await.map_err(|e| {
                 self.connections.forget(&store);
@@ -243,7 +583,7 @@ impl ConceptIndex for QdrantIndex {
 
     fn sync(&self, backend: Backend, scope: Scope) -> BoxFuture<'_, Result<SyncReport, String>> {
         Box::pin(async move {
-            let settings = qdrant_settings().await?;
+            let settings = self.settings().await?;
             let store = self.connect(settings).await?;
             Indexer::sync(&backend, &scope, &*store).await.map_err(|e| {
                 self.connections.forget(&store);
@@ -251,12 +591,21 @@ impl ConceptIndex for QdrantIndex {
             })
         })
     }
+
+    fn publish(&self, store: Option<Arc<dyn UrlRow>>) {
+        self.source.publish(store);
+    }
 }
 
 /// The process's one production index (MOD-11 T7, H-26): [`ConceptsRuntime::production`] and
 /// `mcp_search::production` both search it, so the TUI's concepts search and the MCP tool
 /// `search_concepts` share one embedding model (133 MB, MOD-68) and one cached Qdrant connection.
 /// Built on first use; building it loads nothing.
+///
+/// Production only: its settings come from this process's environment (`HTUI_QDRANT_*`,
+/// [`QdrantSource::from_process`]), which an hr sandbox sets and a host does not, so no test may
+/// search or sync through it (blueprint P-13, MOD-158 R1 B-L7). Tests build a [`QdrantIndex`] with
+/// [`QdrantIndex::with_source`] over a `QdrantEnv` literal, or a `MemIndex`.
 #[must_use]
 pub fn shared_index() -> Arc<dyn ConceptIndex> {
     shared_qdrant()
@@ -371,6 +720,45 @@ pub struct ConceptsRuntime {
     index: Arc<dyn ConceptIndex>,
     /// The task of each `(origin, request kind)`, keyed as `App::latest` is.
     tasks: HashMap<(Origin, Discriminant<StoreRequest>), JoinHandle<()>>,
+    /// What [`Self::publish`] last handed the index (MOD-158 R1, B-L2).
+    published: Published,
+}
+
+/// What [`ConceptsRuntime::publish`] last handed the index, so an unchanged backend is not handed
+/// over again on every iteration of the store loop.
+enum Published {
+    /// Nothing yet: the first publish always goes through.
+    Never,
+    /// No writable store (offline, the mirror, memory).
+    Nothing,
+    /// The store over this pool, known by its connect options' allocation. Weak, so a pool that is
+    /// gone is not kept, nor its password; and while the weak lives the address is not reused, so a
+    /// new pool never passes for the old one.
+    Pool(Weak<dyn std::any::Any + Send + Sync>),
+}
+
+impl Published {
+    /// What publishing `store` now would hand over.
+    fn of(store: Option<&PgStore>) -> Self {
+        store.map_or(Self::Nothing, |pg| {
+            Self::Pool(Self::weak(pg.pool().connect_options()))
+        })
+    }
+
+    /// The options' allocation, typed away (htui names no `sqlx` type outside its tests).
+    fn weak<T: Send + Sync + 'static>(options: Arc<T>) -> Weak<dyn std::any::Any + Send + Sync> {
+        let options: Arc<dyn std::any::Any + Send + Sync> = options;
+        Arc::downgrade(&options)
+    }
+
+    /// Whether `self` and `other` hand the index the same thing.
+    fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Nothing, Self::Nothing) => true,
+            (Self::Pool(a), Self::Pool(b)) => Weak::ptr_eq(a, b),
+            _ => false,
+        }
+    }
 }
 
 impl core::fmt::Debug for ConceptsRuntime {
@@ -388,13 +776,35 @@ impl ConceptsRuntime {
         Self {
             index,
             tasks: HashMap::new(),
+            published: Published::Never,
         }
     }
 
     /// Over [`shared_index`]: what `store_worker::spawn_with_runtimes` builds (D231).
+    ///
+    /// Production only: the shared index resolves its settings over this process's environment
+    /// (`HTUI_QDRANT_*`), so a test that searched through it would behave differently in an hr
+    /// sandbox, which exports `HTUI_QDRANT_URL`, than on the host. Tests build
+    /// [`Self::new`] over an index of their own (blueprint P-13, MOD-158 R1 B-L7).
     #[must_use]
     pub fn production() -> Self {
         Self::new(shared_index())
+    }
+
+    /// MOD-158 D6: `backend`'s writable store, or `None`, becomes what the index reads the
+    /// `qdrant_url` row through. The store worker calls it at the top of every iteration, so every
+    /// swap (connect, `SetDsn`, a lost server) reaches the index (blueprint P-2). Only a change is
+    /// handed over: the same pool, or still no store, is skipped (MOD-158 R1, B-L2). Awaits
+    /// nothing.
+    pub fn publish(&mut self, backend: &Backend) {
+        let store = backend.writable();
+        let now = Published::of(store);
+        if now.same(&self.published) {
+            return;
+        }
+        self.published = now;
+        self.index
+            .publish(store.map(|pg| Arc::new(pg.clone()) as Arc<dyn UrlRow>));
     }
 
     /// Spawns the request's task and answers `Deferred`, or answers now. Awaits nothing.
@@ -834,32 +1244,402 @@ mod tests {
         );
     }
 
-    /// The keyring fake is one process-wide slot: run under `--test-threads=1`.
+    /// A source over `env_url` and `env_key`, its keyring answering `keyring`, nothing published.
+    fn source(env_url: Option<&str>, env_key: Option<&str>, keyring: KeyringRead) -> QdrantSource {
+        QdrantSource::new(
+            QdrantEnv::new(env_url.map(str::to_owned), env_key.map(str::to_owned)),
+            KeySource::Interactive,
+        )
+        .with_keyring(keyring)
+    }
+
+    /// A keyring holding no key.
+    fn no_key() -> htui_core::store::Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn url(text: &str) -> QdrantUrl {
+        QdrantUrl::parse(text).expect("a valid URL")
+    }
+
+    /// Sets the row of `store` to `text`, over whatever it holds.
+    async fn set_row(store: &MemStore, text: &str) {
+        let token = store
+            .qdrant_url()
+            .await
+            .expect("the memory store never fails")
+            .map(|row| row.token);
+        let outcome = store
+            .set_qdrant_url(&url(text), token)
+            .await
+            .expect("the memory store never fails");
+        assert!(
+            matches!(outcome, htui_core::store::CasOutcome::Applied(_)),
+            "{outcome:?}"
+        );
+    }
+
+    /// MOD-158 D6: no store published (offline, `--demo`, before a connect) and no override.
+    #[tokio::test]
+    async fn no_published_store_reads_as_postgres_not_connected() {
+        let source = source(None, None, no_key);
+        let why = source
+            .url()
+            .await
+            .expect_err("nothing to read the row through");
+        assert!(matches!(why, Unresolved::Offline), "{why:?}");
+        assert_eq!(why.sentence(), URL_OFFLINE);
+        let why = source.settings().await.expect_err("no URL, no settings");
+        assert_eq!(why.sentence(), URL_OFFLINE);
+
+        source.publish(Some(Arc::new(MemStore::new())));
+        source.publish(None);
+        assert!(
+            matches!(source.url().await, Err(Unresolved::Offline)),
+            "a withdrawn store is offline again"
+        );
+    }
+
+    /// MOD-158 D3: `HTUI_QDRANT_URL` needs no store, and wins over the row when there is one.
+    #[tokio::test]
+    async fn the_env_url_wins_and_needs_no_store() {
+        let source = source(Some(" http://env:6334 "), None, no_key);
+        assert_eq!(
+            source.url().await.expect("the override"),
+            url("http://env:6334")
+        );
+        let store = MemStore::new();
+        set_row(&store, "http://row:6334").await;
+        source.publish(Some(Arc::new(store)));
+        let settings = source.settings().await.expect("the override");
+        assert_eq!(settings.url, url("http://env:6334"));
+        assert!(settings.api_key.is_none());
+    }
+
+    /// MOD-158 D3: an override that is not a Qdrant URL is an error naming the variable, never a
+    /// fall-through to the row, and never echoes the value (it may hold a password).
+    #[tokio::test]
+    async fn an_invalid_env_url_is_an_error_never_a_fallback() {
+        let source = source(Some("http://user:SENTINEL@env:6334"), None, no_key);
+        let store = MemStore::new();
+        set_row(&store, "http://row:6334").await;
+        source.publish(Some(Arc::new(store)));
+        let why = source.url().await.expect_err("an invalid override");
+        let Unresolved::Unusable(sentence) = &why else {
+            panic!("{why:?}")
+        };
+        assert!(
+            sentence.starts_with("HTUI_QDRANT_URL is not a usable Qdrant URL: "),
+            "{sentence}"
+        );
+        assert!(!sentence.contains("SENTINEL"), "{sentence}");
+        assert!(!sentence.contains("row"), "{sentence}");
+        assert!(source.settings().await.is_err());
+    }
+
+    /// MOD-158 D3: `Debug` prints the override only once it parses; a refused one may hold a
+    /// password and is never echoed, and the key never is.
+    #[test]
+    fn the_debug_never_prints_an_unusable_override() {
+        let shown = format!(
+            "{:?}",
+            source(
+                Some("http://user:SENTINEL@env:6334"),
+                Some("KEY-SENTINEL"),
+                no_key
+            )
+        );
+        assert!(!shown.contains("SENTINEL"), "{shown}");
+        assert!(shown.contains("<not a usable URL>"), "{shown}");
+        let shown = format!("{:?}", source(Some(" http://env:6334 "), None, no_key));
+        assert!(shown.contains("http://env:6334"), "{shown}");
+        let shown = format!("{:?}", source(None, None, no_key));
+        assert!(!shown.contains("usable"), "{shown}");
+    }
+
+    /// MOD-158 D6: the row is read per call, so one set between two reads is read by the second.
+    #[tokio::test]
+    async fn a_row_set_between_two_reads_is_read_by_the_second() {
+        let source = source(None, None, no_key);
+        let store = MemStore::new();
+        source.publish(Some(Arc::new(store.clone())));
+        let why = source.url().await.expect_err("no row yet");
+        assert!(matches!(why, Unresolved::NoUrl), "{why:?}");
+        assert_eq!(why.sentence(), concepts::NO_QDRANT_URL);
+
+        set_row(&store, "http://first:6334").await;
+        assert_eq!(
+            source.url().await.expect("the row"),
+            url("http://first:6334")
+        );
+        set_row(&store, "http://second:6334").await;
+        let settings = source.settings().await.expect("the row");
+        assert_eq!(settings.url, url("http://second:6334"));
+    }
+
+    /// MOD-158 D1, P-3: a malformed row is an error naming the key, never "no URL".
+    #[tokio::test]
+    async fn a_malformed_row_is_an_error_naming_the_key_not_no_url() {
+        let source = source(None, None, no_key);
+        let store = MemStore::new();
+        store.set_app_setting(htui_core::qdrant::QDRANT_URL_KEY, serde_json::json!(42));
+        source.publish(Some(Arc::new(store)));
+        let why = source.url().await.expect_err("a malformed row");
+        let Unresolved::Unusable(sentence) = &why else {
+            panic!("{why:?}")
+        };
+        assert!(sentence.contains("`qdrant_url`"), "{sentence}");
+        assert!(sentence.contains("htui --set-qdrant-url"), "{sentence}");
+    }
+
+    /// A row that cannot be read is said as such, not as "no URL".
+    #[tokio::test]
+    async fn an_unreadable_row_is_a_read_error() {
+        struct Broken;
+        impl UrlRow for Broken {
+            fn qdrant_url(&self) -> BoxFuture<'_, Result<Option<StoredQdrantUrl>, StoreError>> {
+                Box::pin(async { Err(StoreError::Unreachable("refused".into())) })
+            }
+        }
+        let source = source(None, None, no_key);
+        source.publish(Some(Arc::new(Broken)));
+        let why = source.url().await.expect_err("an unreadable row");
+        assert!(matches!(why, Unresolved::Read(_)), "{why:?}");
+        assert!(why.sentence().contains("could not be read"), "{why}");
+    }
+
+    /// MOD-158 D4: `HTUI_QDRANT_API_KEY` wins over the keyring; without it the keyring's key is
+    /// read, and a keyring that fails is an error for an interactive process.
+    #[tokio::test]
+    async fn the_env_key_wins_over_the_keyring() {
+        fn ring() -> htui_core::store::Result<Option<String>> {
+            Ok(Some("ring-key".to_owned()))
+        }
+        fn broken() -> htui_core::store::Result<Option<String>> {
+            Err(StoreError::Backend("no Secret Service".into()))
+        }
+        let key = |settings: &QdrantSettings| settings.api_key.as_deref().cloned();
+
+        let env = source(Some("http://env:6334"), Some("env-key"), ring);
+        let settings = env.settings().await.expect("settings");
+        assert_eq!(key(&settings).as_deref(), Some("env-key"));
+        let env = source(Some("http://env:6334"), Some("env-key"), broken);
+        assert!(env.settings().await.is_ok(), "the keyring is not read");
+
+        let keyring = source(Some("http://env:6334"), None, ring);
+        let settings = keyring.settings().await.expect("settings");
+        assert_eq!(key(&settings).as_deref(), Some("ring-key"));
+        let broken = source(Some("http://env:6334"), None, broken);
+        let why = broken.settings().await.expect_err("an unreadable keyring");
+        assert!(matches!(why, Unresolved::Key(_)), "{why:?}");
+        assert!(
+            source(None, None, ring).settings().await.is_err(),
+            "no URL: the key alone is nothing"
+        );
+    }
+
+    /// MOD-158 D4: `htui worker`'s source: its stdin line, and nothing after it, when given.
+    #[tokio::test]
+    async fn a_headless_key_line_is_the_key() {
+        fn ring() -> htui_core::store::Result<Option<String>> {
+            Ok(Some("ring-key".to_owned()))
+        }
+        let source = source(Some("http://env:6334"), None, ring);
+        source.set_key_source(KeySource::Headless {
+            stdin: Some(Zeroizing::new("line-key".to_owned())),
+            credentials_dir: None,
+        });
+        let settings = source.settings().await.expect("settings");
+        assert_eq!(
+            settings.api_key.as_deref().map(String::as_str),
+            Some("line-key")
+        );
+        let shown = format!("{source:?}");
+        assert!(!shown.contains("line-key"), "{shown}");
+    }
+
+    /// An index that records what is published to it.
+    #[derive(Default)]
+    struct Recording(Mutex<Vec<bool>>);
+
+    impl ConceptIndex for Recording {
+        fn search(&self, _: SearchQuery) -> BoxFuture<'_, Result<Vec<Hit>, String>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn sync(&self, _: Backend, _: Scope) -> BoxFuture<'_, Result<SyncReport, String>> {
+            Box::pin(async { Ok(SyncReport::default()) })
+        }
+        fn publish(&self, store: Option<Arc<dyn UrlRow>>) {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(store.is_some());
+        }
+    }
+
+    /// MOD-158 D6: only a writable Postgres is published; memory and the mirror are `None`.
+    #[tokio::test]
+    async fn the_runtime_publishes_the_writable_store_only() {
+        let index = Arc::new(Recording::default());
+        let mut runtime = ConceptsRuntime::new(index.clone());
+        runtime.publish(&Backend::memory(MemStore::demo()));
+
+        let identity = htui_store::Identity {
+            box_id: htui_core::model::BoxId::new(),
+            hostname: "HTUI-TEST".to_owned(),
+        };
+        let pg = PgStore::lazy(
+            "postgres://nobody:nothing@127.0.0.1:1/none",
+            &identity,
+            Duration::from_millis(250),
+        )
+        .expect("a lazy pool opens no socket");
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = htui_store::CacheStore::open(root.path(), "concepts-publish", 1)
+            .await
+            .expect("open a throwaway mirror");
+        let mut backend = Backend::Online {
+            pg,
+            cache: cache.clone(),
+        };
+        runtime.publish(&backend);
+        assert!(backend.went_offline());
+        runtime.publish(&backend);
+        assert_eq!(
+            *index.0.lock().unwrap_or_else(PoisonError::into_inner),
+            [false, true, false]
+        );
+        cache.close().await;
+    }
+
+    /// MOD-158 R1 (B-L2): the store loop publishes at the top of every iteration, but the index
+    /// is handed a store only when the backend's writable store changed: a repeat is skipped, while
+    /// a lost server, a reconnect and another server (a new pool, as `SetDsn` then `go_online`
+    /// make) are each published.
+    #[tokio::test]
+    async fn the_runtime_publishes_only_a_changed_store() {
+        let index = Arc::new(Recording::default());
+        let mut runtime = ConceptsRuntime::new(index.clone());
+        let published = || {
+            index
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        };
+        let memory = Backend::memory(MemStore::demo());
+        runtime.publish(&memory);
+        runtime.publish(&memory);
+        assert_eq!(published(), [false], "the first publish, then nothing new");
+
+        let identity = htui_store::Identity {
+            box_id: htui_core::model::BoxId::new(),
+            hostname: "HTUI-TEST".to_owned(),
+        };
+        let lazy = || {
+            PgStore::lazy(
+                "postgres://nobody:nothing@127.0.0.1:1/none",
+                &identity,
+                Duration::from_millis(250),
+            )
+            .expect("a lazy pool opens no socket")
+        };
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = htui_store::CacheStore::open(root.path(), "concepts-publish-once", 1)
+            .await
+            .expect("open a throwaway mirror");
+        let mut backend = Backend::Online {
+            pg: lazy(),
+            cache: cache.clone(),
+        };
+        runtime.publish(&backend);
+        runtime.publish(&backend);
+        assert_eq!(published(), [false, true], "online once");
+        assert!(backend.went_offline());
+        runtime.publish(&backend);
+        runtime.publish(&backend);
+        assert_eq!(published(), [false, true, false], "offline once");
+
+        let first = lazy();
+        let online = Backend::Online {
+            pg: first.clone(),
+            cache: cache.clone(),
+        };
+        runtime.publish(&online);
+        runtime.publish(&Backend::Online {
+            pg: first,
+            cache: cache.clone(),
+        });
+        assert_eq!(
+            published(),
+            [false, true, false, true],
+            "a clone of the same pool is the same store"
+        );
+        runtime.publish(&Backend::Online {
+            pg: lazy(),
+            cache: cache.clone(),
+        });
+        assert_eq!(
+            published(),
+            [false, true, false, true, true],
+            "another pool is published"
+        );
+        cache.close().await;
+    }
+
+    /// MOD-158 D8: a published store without a row is "no URL", naming both places to set one,
+    /// read before the model and without any keyring.
     #[tokio::test]
     async fn qdrant_index_without_a_stored_url_names_where_to_set_it() {
-        let _keyring = htui_store::testkit::mock_keyring().await;
         let (backend, scope) = platform().await;
         let attempts = Arc::new(AtomicUsize::new(0));
+        let settings = Arc::new(source(None, None, no_key));
+        settings.publish(Some(Arc::new(MemStore::new())));
         let index = QdrantIndex::with_loader({
             let attempts = Arc::clone(&attempts);
             move || {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 load_model()
             }
-        });
+        })
+        .with_source(settings);
         let query = concepts::query("anything", scope.project_ids.clone(), false, 10);
 
         let searched = index.search(query).await.expect_err("no URL is stored");
-        assert!(searched.contains("Settings > Qdrant"), "{searched}");
+        for place in ["Settings > Qdrant", "htui --set-qdrant-url"] {
+            assert!(searched.contains(place), "{searched}");
+        }
         let synced = index
             .sync(backend, scope)
             .await
             .expect_err("no URL is stored");
-        assert!(synced.contains("Settings > Qdrant"), "{synced}");
+        assert_eq!(synced, searched);
         assert_eq!(
             attempts.load(Ordering::SeqCst),
             0,
             "the settings are read before the model: nothing was loaded"
+        );
+    }
+
+    /// MOD-158 D6: the index reads through what is published to it.
+    #[tokio::test]
+    async fn the_index_reads_the_store_published_to_it() {
+        let index = QdrantIndex::with_loader(|| Box::pin(std::future::pending()))
+            .with_source(Arc::new(source(None, None, no_key)));
+        let query = concepts::query(
+            "anything",
+            vec![htui_core::model::ProjectId::new()],
+            false,
+            1,
+        );
+        assert_eq!(
+            index.search(query.clone()).await.expect_err("offline"),
+            URL_OFFLINE
+        );
+        ConceptIndex::publish(&index, Some(Arc::new(MemStore::new())));
+        assert_eq!(
+            index.search(query).await.expect_err("no row"),
+            concepts::NO_QDRANT_URL
         );
     }
 
@@ -882,7 +1662,10 @@ mod tests {
     }
 
     fn settings(url: &str, key: Option<&str>) -> QdrantSettings {
-        QdrantSettings::new(url.to_owned(), key.map(str::to_owned)).expect("a valid URL")
+        QdrantSettings::new(
+            QdrantUrl::parse(url).expect("a valid URL"),
+            key.map(str::to_owned),
+        )
     }
 
     /// Review 3: a connection is reused for the URL and key it was made with, and only for them.
@@ -921,6 +1704,76 @@ mod tests {
             connections.get(&made_for).is_none(),
             "after an error the next request reconnects"
         );
+    }
+
+    /// MOD-158 R1 (B-L6): an unusable `HTUI_QDRANT_URL` is a `warn` line, never its value; a
+    /// usable one stays the `info` line D3 asks for.
+    #[test]
+    fn an_unusable_env_url_is_a_warning_without_its_value() {
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logged = |url: &str| {
+            let buffer = Buffer::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer({
+                    let buffer = buffer.clone();
+                    move || buffer.clone()
+                })
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                drop(QdrantSource::new(
+                    QdrantEnv::new(Some(url.to_owned()), None),
+                    KeySource::Interactive,
+                ));
+            });
+            let bytes = buffer
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            String::from_utf8(bytes).expect("utf-8 logs")
+        };
+        let bad = logged("http://u:SENTINEL@q:6334");
+        assert!(bad.contains(" WARN "), "{bad}");
+        assert!(!bad.contains("SENTINEL"), "{bad}");
+        let good = logged("http://q:6334");
+        assert!(good.contains(" INFO "), "{good}");
+    }
+
+    /// MOD-158 R1 (B-L1): settings that stop resolving drop the cached connection, and the key it
+    /// was made with; settings that resolve keep it.
+    #[test]
+    fn unresolved_settings_drop_the_cached_connection() {
+        let connections = Connections::<u32>::default();
+        let made_for = settings("http://qdrant:6334", Some("key"));
+        connections.put(made_for.clone(), Arc::new(1));
+        assert!(connections.resolved(Ok(made_for.clone())).is_ok());
+        assert!(connections.get(&made_for).is_some(), "resolving keeps it");
+        for why in [Unresolved::NoUrl, Unresolved::Offline] {
+            connections.put(made_for.clone(), Arc::new(2));
+            assert!(connections.resolved(Err(why)).is_err());
+            assert!(
+                connections
+                    .slot
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_none(),
+                "nothing cached once the settings stop resolving"
+            );
+        }
     }
 
     /// Review 2: every search that overlaps a load waits on that one load, superseded ones

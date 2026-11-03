@@ -2,7 +2,7 @@
 source: crates/htui/tests/qdrant_settings.rs
 expression: "frame_of(&bench, &section)"
 ---
- URL       not stored
+ URL       not set · for every box
 ▌new URL
-           no Qdrant URL is stored; type one and press Enter
+           no Qdrant URL is set; type one and press Enter
  API key   not stored

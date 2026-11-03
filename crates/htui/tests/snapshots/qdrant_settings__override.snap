@@ -1,0 +1,8 @@
+---
+source: crates/htui/tests/qdrant_settings.rs
+expression: "frame_of(&bench, &section)"
+---
+▌URL       not set · for every box
+           HTUI_QDRANT_URL=http://env.example:6334 is in force in this process, which does not use
+           this setting
+ API key   not stored

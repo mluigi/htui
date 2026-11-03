@@ -1,20 +1,24 @@
-//! The Qdrant section of the Settings tab: the Qdrant URL and API key this box keeps in its
-//! keyring, and the keys that change them (CLEAN-8, MOD-10 M4).
+//! The Qdrant section of the Settings tab: the database-wide Qdrant URL, this box's API key, and
+//! the old keyring URL offered once (CLEAN-8, MOD-10 M4, MOD-158 D9, D10).
 //!
 //! It holds no store handle (`R-NF-3`): it names one read ([`StoreRequest::QdrantInfo`]), is
 //! handed the [`QdrantSnapshot`] that comes back, and every write leaves through `ctx.request`.
-//! The key is typed into a masked field, read once by `take`, and travels [`Redacted`]; no
-//! `Debug` here prints a field or a notice.
+//! The URL row writes the `qdrant_url` row by compare-and-set, with the token the snapshot
+//! carried; a miss comes back as [`StoreReply::QdrantStale`] and the section takes the fresh
+//! token from it. The key is typed into a masked field, read once by `take`, and travels
+//! [`Redacted`]; no `Debug` here prints a field or a notice.
 //!
-//! The rows are one kit form (MOD-115 M3 D3): an open field is its own row right under the row it
-//! replaces, its guide or refusal under it; the clear question is the error line of the focused
-//! row; the last outcome is a kit notice line under the form. Every sentence that names a key
-//! reads it from the keys in force (MD-A, C5), and the acts resolve from [`Ctx::pressed`].
+//! The rows are one kit form (MOD-115 M3 D3): `[URL, old URL?, API key]`. An open field is its own
+//! row right under the row it replaces, its guide or refusal under it; a question is the error
+//! line of the focused row; the last outcome is a kit notice line under the form. Every sentence
+//! that names a key reads it from the keys in force (MD-A, C5), and the acts resolve from
+//! [`Ctx::pressed`].
 
 use std::borrow::Cow;
 use std::cell::Cell;
 
 use htui_core::model::Scope;
+use htui_core::qdrant::QdrantUrl;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::Line;
@@ -22,7 +26,9 @@ use ratatui::widgets::Paragraph;
 
 use crate::app::{Ctx, Handled};
 use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
-use crate::qdrant_settings_info::{QdrantSnapshot, QdrantState};
+use crate::qdrant_settings_info::{
+    NO_OLD_URL, OldUrl, QdrantSnapshot, QdrantState, URL_WRITE_OFFLINE, UrlRowState,
+};
 use crate::secrets_settings::{DEMO_SESSION, Redacted};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::kit::empty::{self, NextStep};
@@ -30,23 +36,27 @@ use crate::ui::kit::form::{self, Form, Value};
 use crate::ui::kit::pane::ScrollSpan;
 use crate::ui::kit::text::{Tone, notice, wrapped};
 use crate::ui::kit::{chips::key_line, modal::modal_rest};
-use crate::ui::tabs::settings::{SectionId, SettingsSection, answers, asked};
+use crate::ui::tabs::settings::{
+    CHANGED_ELSEWHERE_CLOSED, SectionId, SettingsSection, answers, asked,
+};
 use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::KeyEvent;
 
 const NOT_READ: &str = "not read yet";
 const STORED: &str = "stored";
-const CLEARED: &str = "the Qdrant settings are gone from the keyring";
 const EMPTY_KEY: &str = "nothing typed; the stored API key is unchanged";
-/// CLEAN-8 #9: both rows in a demo session, which has no keyring.
+const EMPTY_URL: &str = "nothing typed; the Qdrant URL is unchanged";
+/// CLEAN-8 #9: every row in a demo session, which has no keyring and no database.
 const DEMO_ROW: &str = "n/a in a demo session";
 const UNREADABLE: &str = "the keyring could not be read";
 /// The read itself was refused; the seam's sentence follows it.
 const UNAVAILABLE: &str = "Qdrant settings are unavailable";
 /// The key field's guide. Not "Enter API key": that named a verb with a key's name (C5, D-15).
 const KEY_GUIDE: &str = "type the API key, or leave it blank if there is none";
-/// The labels of the two rows and of the field that replaces each.
+/// The URL row's label.
 const URL_LABEL: &str = "URL";
+/// The old keyring URL's row (MOD-158 D10).
+const OFFER_LABEL: &str = "old URL";
 /// The key row's label.
 const KEY_LABEL: &str = "API key";
 /// The open URL field's label, under the URL row.
@@ -55,53 +65,92 @@ const NEW_URL_LABEL: &str = "new URL";
 const NEW_KEY_LABEL: &str = "new key";
 /// One label column for every row and field, so opening a field never moves the values.
 const LABEL_WIDTH: u16 = 8;
+/// What the URL row says it applies to (MOD-158 D9): one row for the whole database.
+const EVERY_BOX: &str = "for every box";
+/// The URL row offline (MOD-158 D9): the row lives in Postgres.
+const URL_OFFLINE_ROW: &str = "cannot be read while Postgres is offline";
+/// `HTUI_QDRANT_API_KEY` in force (MOD-158 D4).
+const KEY_OVERRIDE: &str = "HTUI_QDRANT_API_KEY is in force in this process";
 
-/// What the open URL field says when no URL is stored. `submit` is `field.submit`'s label through
+/// The notices after a write's reply (MOD-158 D9, D10).
+const URL_SET: &str = "the Qdrant URL is set for every box";
+const URL_CLEARED: &str = "the Qdrant URL is cleared for every box";
+const KEY_CLEARED: &str = "this box's API key is gone from the keyring";
+const ADOPTED: &str =
+    "the old URL is now the Qdrant URL for every box; this box's keyring entry is gone";
+const DISCARDED: &str = "the old Qdrant URL is gone from this box's keyring";
+
+/// The questions (MOD-158 D9, Q2): one per row, the answers appended as the keys bind them
+/// (MOD-67 M6 PA-6).
+const CONFIRM_CLEAR_URL: &str = "Remove the Qdrant URL for every box?";
+const CONFIRM_CLEAR_KEY: &str = "Remove this box's Qdrant API key from the keyring?";
+const CONFIRM_DISCARD: &str = "Discard the old Qdrant URL from this box's keyring?";
+/// The adopt's question when the old URL can no longer be named (MOD-158 R1, C-L1): never the
+/// discard's, since `confirm.yes` here sends the adopt.
+const CONFIRM_ADOPT_OLD: &str = "Use the old Qdrant URL for every box?";
+/// A miss on a URL write no editor was open for (the clear, the adopt; MOD-158 R1, C-L4):
+/// [`CHANGED_ELSEWHERE_CLOSED`] would send the user to an editor that never was.
+const URL_CHANGED_ELSEWHERE: &str =
+    "changed elsewhere; nothing was written \u{2014} the URL row shows the Qdrant URL now";
+/// What the URL row's refusal says when its read failed.
+const URL_NOT_READ: &str = "the Qdrant URL could not be read";
+
+/// What the open URL field says when no URL is set. `submit` is `field.submit`'s label through
 /// `CAPTURE` (MD-A, C5); with none bound the sentence says what to do without a key.
 fn no_url_yet(submit: Option<&str>) -> String {
     match submit {
-        Some(key) => format!("no Qdrant URL is stored; type one and press {key}"),
-        None => "no Qdrant URL is stored; type one to store it".to_owned(),
+        Some(key) => format!("no Qdrant URL is set; type one and press {key}"),
+        None => "no Qdrant URL is set; type one to set it".to_owned(),
     }
 }
 
-/// What the open URL field says over a stored one; `submit` as [`no_url_yet`]'s.
+/// What the open URL field says over a row that is there; `submit` as [`no_url_yet`]'s.
 fn replaces_url(submit: Option<&str>) -> String {
     match submit {
-        Some(key) => format!("{key} replaces the stored Qdrant URL"),
-        None => "storing replaces the stored Qdrant URL".to_owned(),
+        Some(key) => format!("{key} replaces the Qdrant URL for every box"),
+        None => "setting replaces the Qdrant URL for every box".to_owned(),
     }
 }
 
-/// What the open URL field says over a keyring that could not be read; `submit` as
-/// [`no_url_yet`]'s.
-fn unreadable_guide(submit: Option<&str>) -> String {
-    match submit {
-        Some(key) => {
-            format!("the keyring could not be read; {key} tries to store a Qdrant URL in it")
-        }
-        None => "the keyring could not be read; storing tries to put a Qdrant URL in it".to_owned(),
-    }
-}
-
-/// `c` with nothing stored (MOD-83): what is the case and the key that changes it, rather than a
-/// claim that the settings are unavailable. `edit` is `Edit`'s label through `QDRANT_BROWSE`.
-fn nothing_to_clear(edit: Option<&str>) -> String {
-    let said = "no Qdrant URL or API key is stored, so there is nothing to clear";
+/// `c` on a row with nothing in it (MOD-83): what is the case and the key that changes it, rather
+/// than a claim that the settings are unavailable. `edit` is `Edit`'s label through
+/// `QDRANT_BROWSE`.
+fn nothing_to_clear(row: Row, edit: Option<&str>) -> String {
+    let (said, verb) = match row {
+        Row::Url => (
+            "no Qdrant URL is set, so there is nothing to clear",
+            "sets one",
+        ),
+        Row::Key | Row::Offer => (
+            "no Qdrant API key is stored on this box, so there is nothing to clear",
+            "stores one",
+        ),
+    };
     match edit {
-        Some(key) => format!("{said}; {key} stores one"),
+        Some(key) => format!("{said}; {key} {verb}"),
         None => said.to_owned(),
     }
 }
 
 /// `c` over an unreadable row (MOD-83): the row's own words and the key that reads it again,
-/// never [`nothing_to_clear`], since nobody knows whether anything is stored. `reload` is
+/// never [`nothing_to_clear`], since nobody knows whether anything is there. `reload` is
 /// `Reload`'s label through `QDRANT_BROWSE`.
-fn unreadable_refusal(why: String, reload: Option<&str>) -> String {
+fn unreadable_refusal(what: &str, why: &str, reload: Option<&str>) -> String {
     match reload {
-        Some(key) => format!("{UNREADABLE}: {why}; {key} reads it again"),
-        None => format!("{UNREADABLE}: {why}"),
+        Some(key) => format!("{what}: {why}; {key} reads it again"),
+        None => format!("{what}: {why}"),
     }
+}
+
+/// The URL row's refusal when its read failed: its own words and the key that reads it again.
+fn url_not_read(why: &str, keys: &Keys) -> String {
+    let reload = keys.label(views::QDRANT_BROWSE, Act::Reload);
+    unreadable_refusal(URL_NOT_READ, why, reload.as_deref())
+}
+
+/// The URL row's words when its read failed (MOD-158 D9).
+fn url_unreadable(why: &str) -> String {
+    format!("could not be read: {why}")
 }
 
 /// The next step of [`UNAVAILABLE`] (MOD-83): the reload key in force, or what happens without
@@ -112,15 +161,96 @@ fn asks_again(reload: Option<&str>) -> String {
         |key| format!("{key} asks again once the store answers"),
     )
 }
-/// The clear question; the answers are appended as the keys bind them (MOD-67 M6 PA-6).
-const CONFIRM_CLEAR: &str = "Remove the Qdrant settings from the keyring?";
+
+/// `HTUI_QDRANT_URL` in force, under the URL row (MOD-158 D3, D9). `why` is the shipped
+/// [`QdrantUrlError`](htui_core::qdrant::QdrantUrlError) sentence (blueprint P-20).
+fn url_override(found: &Result<QdrantUrl, htui_core::qdrant::QdrantUrlError>) -> String {
+    match found {
+        Ok(url) => format!(
+            "HTUI_QDRANT_URL={url} is in force in this process, which does not use this setting"
+        ),
+        Err(why) => format!("HTUI_QDRANT_URL is not usable ({why}); this process cannot search"),
+    }
+}
+
+/// The old URL row (MOD-158 D10): what this box's keyring holds and the keys in force that use
+/// or discard it. `url_row` decides whether it can be used: only over no row.
+fn offer_text(
+    old: &OldUrl,
+    url_row: &UrlRowState,
+    adopt: Option<&str>,
+    clear: Option<&str>,
+) -> String {
+    let discards = clear.map(|key| format!("{key} discards it"));
+    let (said, verbs) = match old {
+        OldUrl::Unusable(why) => (
+            format!("this box's keyring holds an old Qdrant URL that is not usable ({why})"),
+            discards.into_iter().collect::<Vec<_>>(),
+        ),
+        OldUrl::Usable(url) => match url_row {
+            UrlRowState::NotSet => (
+                format!("this box's keyring holds {url} from before"),
+                adopt
+                    .map(|key| format!("{key} uses it for every box"))
+                    .into_iter()
+                    .chain(discards)
+                    .collect(),
+            ),
+            UrlRowState::Set { .. } | UrlRowState::Unusable { .. } => (
+                format!("this box's keyring holds {url} from before, no longer used"),
+                discards.into_iter().collect(),
+            ),
+            UrlRowState::Offline | UrlRowState::Unreadable(_) | UrlRowState::NotApplicable => (
+                format!("this box's keyring holds {url} from before"),
+                discards.into_iter().collect(),
+            ),
+        },
+    };
+    if verbs.is_empty() {
+        said
+    } else {
+        format!("{said}: {}", verbs.join(", "))
+    }
+}
+
+/// `e` on the old URL row: it is not edited, it is used or discarded.
+fn offer_is_not_edited(adopt: Option<&str>, clear: Option<&str>, adoptable: bool) -> String {
+    let uses = adopt
+        .filter(|_| adoptable)
+        .map(|key| format!("{key} uses the old URL"));
+    let discards = clear.map(|key| format!("{key} discards it"));
+    let verbs: Vec<String> = uses.into_iter().chain(discards).collect();
+    if verbs.is_empty() {
+        "the old URL is not edited here".to_owned()
+    } else {
+        verbs.join(", ")
+    }
+}
+
+/// The adopt's question (MOD-158 D10).
+fn confirm_adopt(url: &QdrantUrl) -> String {
+    format!("Use {url} for every box?")
+}
 
 // The hint rows (MOD-67 M3 D9): rendered through the mode's stack, so a rebound key shows its
 // new chord. The editors' keys are `field.submit` and `field.cancel` through `CAPTURE` (MOD-115
 // M3 C6): `Enter store \u{b7} Esc cancel` under the compiled keys.
 const HINT_BROWSE: HintSpec = &[
     Hint::One(Act::Edit, "edit"),
-    Hint::One(Act::Clear, "clear all"),
+    Hint::One(Act::Clear, "clear"),
+    Hint::One(Act::Reload, "reload"),
+    Hint::Pair(Act::ListDown, Act::ListUp, "rows"),
+];
+/// MOD-158 D10: on the old URL row, while it can be used for every box.
+const HINT_BROWSE_OFFER: HintSpec = &[
+    Hint::One(Act::QdrantAdopt, "use for every box"),
+    Hint::One(Act::Clear, "discard"),
+    Hint::One(Act::Reload, "reload"),
+    Hint::Pair(Act::ListDown, Act::ListUp, "rows"),
+];
+/// MOD-158 D10: on the old URL row, once it can only be discarded.
+const HINT_BROWSE_DISCARD: HintSpec = &[
+    Hint::One(Act::Clear, "discard"),
     Hint::One(Act::Reload, "reload"),
     Hint::Pair(Act::ListDown, Act::ListUp, "rows"),
 ];
@@ -142,23 +272,47 @@ const HINT_CONFIRM: HintSpec = &[
     Hint::All(Act::ConfirmNo, "cancel"),
 ];
 
+/// One row of the form, in order: the URL, the old URL while there is one, the key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Row {
     Url,
+    Offer,
     Key,
 }
-impl Row {
-    const ALL: [Self; 2] = [Self::Url, Self::Key];
-}
+
 struct Editor {
     input: TextField,
+}
+
+/// What a question asks (MOD-158 D9, D10): each row's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Question {
+    /// The URL row, for every box.
+    ClearUrl,
+    /// This box's key.
+    ClearKey,
+    /// The old keyring URL, discarded.
+    Discard,
+    /// The old keyring URL, used for every box.
+    Adopt,
+}
+
+impl Question {
+    /// The row the question is asked on, and stays on while a snapshot moves the rows (C-L2).
+    const fn row(self) -> Row {
+        match self {
+            Self::ClearUrl => Row::Url,
+            Self::ClearKey => Row::Key,
+            Self::Discard | Self::Adopt => Row::Offer,
+        }
+    }
 }
 
 #[derive(Default)]
 enum Mode {
     #[default]
     Browse,
-    ConfirmClear,
+    Confirm(Question),
     EditingUrl(Editor),
     EditingKey(Editor),
 }
@@ -229,17 +383,48 @@ impl QdrantSection {
         }
     }
 
-    fn state(&self) -> Option<&QdrantState> {
-        self.snapshot.as_ref().map(|s| &s.url_state)
+    fn url_row(&self) -> Option<&UrlRowState> {
+        self.snapshot.as_ref().map(|s| &s.url)
     }
 
-    /// CLEAN-8 #9: the snapshot is a demo session's, which has no keyring to edit.
+    fn key_state(&self) -> Option<&QdrantState> {
+        self.snapshot.as_ref().map(|s| &s.key_state)
+    }
+
+    fn old_url(&self) -> Option<&OldUrl> {
+        self.snapshot.as_ref().and_then(|s| s.old_url.as_ref())
+    }
+
+    /// CLEAN-8 #9: the snapshot is a demo session's, which has nothing to edit.
     fn demo(&self) -> bool {
-        self.state() == Some(&QdrantState::NotApplicable)
+        self.url_row() == Some(&UrlRowState::NotApplicable)
+    }
+
+    /// The rows in order (MOD-158 D10): the old URL only while this box's keyring holds one.
+    fn rows(&self) -> &'static [Row] {
+        if self.old_url().is_some() {
+            &[Row::Url, Row::Offer, Row::Key]
+        } else {
+            &[Row::Url, Row::Key]
+        }
     }
 
     fn row(&self) -> Row {
-        Row::ALL[self.cursor]
+        let rows = self.rows();
+        rows[self.cursor.min(rows.len() - 1)]
+    }
+
+    /// Where `row` is in the form, or `None` when it is not drawn.
+    fn index_of(&self, row: Row) -> Option<usize> {
+        self.rows().iter().position(|r| *r == row)
+    }
+
+    /// The old URL can be used for every box: it parses and no row is set (MOD-158 D10).
+    fn adoptable(&self) -> Option<&QdrantUrl> {
+        match (self.old_url(), self.url_row()) {
+            (Some(OldUrl::Usable(url)), Some(UrlRowState::NotSet)) => Some(url),
+            _ => None,
+        }
     }
 
     fn move_cursor(&mut self, down: bool) {
@@ -247,11 +432,13 @@ impl QdrantSection {
         if self.snapshot.is_none() || self.unavailable.is_some() {
             return;
         }
-        if down {
-            self.cursor = (self.cursor + 1) % Row::ALL.len();
+        let len = self.rows().len();
+        let at = self.cursor.min(len - 1);
+        self.cursor = if down {
+            (at + 1) % len
         } else {
-            self.cursor = (self.cursor + Row::ALL.len() - 1) % Row::ALL.len();
-        }
+            (at + len - 1) % len
+        };
     }
 
     /// Whether a key that opens an editor or a question is refused right now. A write in flight
@@ -269,19 +456,115 @@ impl QdrantSection {
         self.unavailable.is_some() || self.snapshot.is_none()
     }
 
-    fn open_edit(&mut self) {
+    /// Why the URL row refuses a write right now, or `None` when it takes one.
+    fn url_refusal(&self, keys: &Keys) -> Option<String> {
+        match self.url_row()? {
+            UrlRowState::Offline => Some(URL_WRITE_OFFLINE.to_owned()),
+            UrlRowState::Unreadable(why) => Some(url_not_read(why, keys)),
+            UrlRowState::NotApplicable => Some(DEMO_SESSION.to_owned()),
+            UrlRowState::Set { .. } | UrlRowState::Unusable { .. } | UrlRowState::NotSet => None,
+        }
+    }
+
+    fn open_url_editor(&mut self) {
+        self.mode = Mode::EditingUrl(Editor {
+            input: TextField::new(),
+        });
+    }
+
+    /// `e` on the focused row.
+    fn on_edit(&mut self, keys: &Keys) {
         match self.row() {
-            Row::Url => {
-                self.mode = Mode::EditingUrl(Editor {
-                    input: TextField::new(),
-                });
-            }
+            Row::Url => match self.url_refusal(keys) {
+                Some(why) => self.refuse(why),
+                None => self.open_url_editor(),
+            },
             Row::Key => {
                 self.mode = Mode::EditingKey(Editor {
                     input: TextField::masked(),
                 });
             }
+            Row::Offer => {
+                let adopt = keys.label(views::QDRANT_BROWSE, Act::QdrantAdopt);
+                let clear = keys.label(views::QDRANT_BROWSE, Act::Clear);
+                let adoptable = self.adoptable().is_some();
+                self.refuse(offer_is_not_edited(
+                    adopt.as_deref(),
+                    clear.as_deref(),
+                    adoptable,
+                ));
+            }
         }
+    }
+
+    /// `c` on the focused row (MOD-158 Q2): that row's question, or why there is none.
+    fn on_clear(&mut self, keys: &Keys) {
+        let row = self.row();
+        let edit = keys.label(views::QDRANT_BROWSE, Act::Edit);
+        let reload = keys.label(views::QDRANT_BROWSE, Act::Reload);
+        let question = match row {
+            // Every state its own arm (C-L6): a new one cannot fall through to an empty refusal.
+            Row::Url => match self.url_row() {
+                Some(UrlRowState::Set { .. } | UrlRowState::Unusable { .. }) => {
+                    Ok(Question::ClearUrl)
+                }
+                Some(UrlRowState::NotSet) => Err(nothing_to_clear(row, edit.as_deref())),
+                Some(UrlRowState::Offline) => Err(URL_WRITE_OFFLINE.to_owned()),
+                Some(UrlRowState::Unreadable(why)) => Err(url_not_read(why, keys)),
+                Some(UrlRowState::NotApplicable) => Err(DEMO_SESSION.to_owned()),
+                // Nothing read yet: `blocked` stops every key that gets here first.
+                None => return,
+            },
+            Row::Key => match self.key_state() {
+                Some(QdrantState::Stored) => Ok(Question::ClearKey),
+                // An unreadable row is not an empty one (Connection's rule): its own words,
+                // never a claim that nothing is stored.
+                Some(QdrantState::Unreadable(why)) => {
+                    Err(unreadable_refusal(UNREADABLE, why, reload.as_deref()))
+                }
+                _ => Err(nothing_to_clear(row, edit.as_deref())),
+            },
+            Row::Offer => Ok(Question::Discard),
+        };
+        match question {
+            Ok(question) => {
+                self.notice = None;
+                self.mode = Mode::Confirm(question);
+            }
+            Err(why) => self.refuse(why),
+        }
+    }
+
+    /// `u` on the old URL row (MOD-158 D10): the question, or why the old URL cannot be used.
+    fn on_adopt(&mut self, keys: &Keys) {
+        let clear = keys.label(views::QDRANT_BROWSE, Act::Clear);
+        let discards = clear.map_or_else(String::new, |key| format!("; {key} discards it"));
+        // Every pair its own arm (C-L6): a new state cannot fall through to an empty refusal.
+        let why = match (self.old_url(), self.url_row()) {
+            (Some(OldUrl::Usable(_)), Some(UrlRowState::NotSet)) => {
+                self.notice = None;
+                self.mode = Mode::Confirm(Question::Adopt);
+                return;
+            }
+            (Some(OldUrl::Unusable(why)), _) => {
+                format!("the old Qdrant URL is not usable ({why}){discards}")
+            }
+            (None, _) => NO_OLD_URL.to_owned(),
+            (
+                Some(OldUrl::Usable(_)),
+                Some(UrlRowState::Set { .. } | UrlRowState::Unusable { .. }),
+            ) => {
+                format!("a Qdrant URL is already set for every box{discards}")
+            }
+            (Some(OldUrl::Usable(_)), Some(UrlRowState::Offline)) => URL_WRITE_OFFLINE.to_owned(),
+            (Some(OldUrl::Usable(_)), Some(UrlRowState::Unreadable(why))) => {
+                url_not_read(why, keys)
+            }
+            (Some(OldUrl::Usable(_)), Some(UrlRowState::NotApplicable)) => DEMO_SESSION.to_owned(),
+            // Nothing read yet: `blocked` stops every key that gets here first.
+            (Some(OldUrl::Usable(_)), None) => return,
+        };
+        self.refuse(why);
     }
 
     fn on_editor_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
@@ -312,17 +595,12 @@ impl QdrantSection {
             FieldOutcome::Consumed => Handled::Consumed,
             FieldOutcome::Cancel => {
                 self.mode = Mode::Browse;
+                self.notice = None;
                 Handled::Consumed
             }
             FieldOutcome::Submit => {
                 if let Some(url) = url_to_submit {
-                    if url.is_empty() {
-                        self.mode = Mode::Browse;
-                        self.say("nothing typed; the stored URL is unchanged");
-                        return Handled::Consumed;
-                    }
-                    self.mode = Mode::Browse;
-                    self.send(StoreRequest::SetQdrantUrl(url), ctx);
+                    self.submit_url(&url, ctx);
                 }
                 if let Some(key_text) = key_to_submit {
                     self.mode = Mode::Browse;
@@ -345,16 +623,61 @@ impl QdrantSection {
         }
     }
 
-    /// The clear question (MOD-67 M3 §6.4): `confirm.yes` clears, `confirm.no` goes back, a chord
-    /// the modal global layer admits passes, and everything else is swallowed.
+    /// The URL field's submit (MOD-158 D2, D9): checked here first, so a URL D2 refuses never
+    /// leaves the field; its sentence stays under it.
+    fn submit_url(&mut self, text: &str, ctx: &Ctx<'_>) {
+        if text.is_empty() {
+            self.mode = Mode::Browse;
+            self.say(EMPTY_URL);
+            return;
+        }
+        let url = match QdrantUrl::parse(text) {
+            Ok(url) => url,
+            Err(why) => {
+                self.refuse(why.to_string());
+                return;
+            }
+        };
+        // The row may have moved while the field was open: the token of the snapshot now.
+        if let Some(why) = self.url_refusal(ctx.keys()) {
+            self.mode = Mode::Browse;
+            self.refuse(why);
+            return;
+        }
+        let expected = self.url_row().and_then(UrlRowState::token);
+        self.mode = Mode::Browse;
+        self.send(StoreRequest::SetQdrantUrl { url, expected }, ctx);
+    }
+
+    /// A question (MOD-67 M3 §6.4): `confirm.yes` answers it, `confirm.no` goes back, a chord the
+    /// modal global layer admits passes, and everything else is swallowed.
     fn on_confirm_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let stack = views::QDRANT_CONFIRM;
         let chord = ctx.pressed(&key);
+        let Mode::Confirm(question) = self.mode else {
+            return Handled::Pass;
+        };
         // The first candidate decides (MOD-67 M3 §6.4): a global act there is the pass rule's.
         match ctx.keys().actions(stack, chord).first() {
             Some(Act::ConfirmYes) => {
                 self.mode = Mode::Browse;
-                self.send(StoreRequest::ClearQdrantSettings, ctx);
+                let request = match question {
+                    Question::ClearUrl => {
+                        match self.url_row().and_then(UrlRowState::token) {
+                            Some(expected) => StoreRequest::ClearQdrantUrl { expected },
+                            // The row went while the question was up: nothing to clear, and no
+                            // editor to reopen (C-L4).
+                            None => {
+                                self.refuse(URL_CHANGED_ELSEWHERE.to_owned());
+                                return Handled::Consumed;
+                            }
+                        }
+                    }
+                    Question::ClearKey => StoreRequest::ClearQdrantApiKey,
+                    Question::Discard => StoreRequest::DiscardOldQdrantUrl,
+                    Question::Adopt => StoreRequest::AdoptOldQdrantUrl,
+                };
+                self.send(request, ctx);
                 return Handled::Consumed;
             }
             Some(Act::ConfirmNo) => {
@@ -371,7 +694,7 @@ impl QdrantSection {
     fn stack(&self) -> Stack<'static> {
         match self.mode {
             Mode::Browse => views::QDRANT_BROWSE,
-            Mode::ConfirmClear => views::QDRANT_CONFIRM,
+            Mode::Confirm(_) => views::QDRANT_CONFIRM,
             Mode::EditingUrl(_) | Mode::EditingKey(_) => views::CAPTURE,
         }
     }
@@ -384,29 +707,21 @@ impl QdrantSection {
             match act {
                 Act::Edit => {
                     if !self.blocked() {
-                        self.open_edit();
+                        self.on_edit(ctx.keys());
                     }
                     return Handled::Consumed;
                 }
                 Act::Clear => {
                     if !self.blocked() {
-                        if matches!(self.state(), Some(QdrantState::Stored))
-                            || matches!(
-                                self.snapshot.as_ref().map(|s| &s.key_state),
-                                Some(QdrantState::Stored)
-                            )
-                        {
-                            self.notice = None;
-                            self.mode = Mode::ConfirmClear;
-                        } else if let Some(why) = self.unreadable_why() {
-                            // An unreadable row is not an empty one (Connection's rule): its own
-                            // words, never a claim that nothing is stored.
-                            let reload = ctx.keys().label(views::QDRANT_BROWSE, Act::Reload);
-                            self.refuse(unreadable_refusal(why, reload.as_deref()));
-                        } else {
-                            let edit = ctx.keys().label(views::QDRANT_BROWSE, Act::Edit);
-                            self.refuse(nothing_to_clear(edit.as_deref()));
-                        }
+                        self.on_clear(ctx.keys());
+                    }
+                    return Handled::Consumed;
+                }
+                // MOD-158 D10: the old URL row's own key; on any other row it is not this
+                // section's, so it falls through to `Pass`.
+                Act::QdrantAdopt if self.snapshot.is_some() && self.row() == Row::Offer => {
+                    if !self.blocked() {
+                        self.on_adopt(ctx.keys());
                     }
                     return Handled::Consumed;
                 }
@@ -432,17 +747,6 @@ impl QdrantSection {
         Handled::Pass
     }
 
-    /// Why the first unreadable row, URL then key, could not be read: `None` when both are known.
-    fn unreadable_why(&self) -> Option<String> {
-        let snapshot = self.snapshot.as_ref()?;
-        [&snapshot.url_state, &snapshot.key_state]
-            .into_iter()
-            .find_map(|state| match state {
-                QdrantState::Unreadable(why) => Some(why.clone()),
-                _ => None,
-            })
-    }
-
     /// Sends one write and remembers its name until the reply, so `on_snapshot` can say what it
     /// did and a failure lands on this section (the Connection section's `send`).
     fn send(&mut self, request: StoreRequest, ctx: &Ctx<'_>) {
@@ -451,31 +755,29 @@ impl QdrantSection {
         ctx.request(request);
     }
 
-    /// The guide under the open URL field: what storing there does, named with the submit key in
+    /// The guide under the open URL field: what setting there does, named with the submit key in
     /// force (C5).
     fn url_guide(&self, keys: &Keys) -> String {
         let submit = keys.label(views::CAPTURE, Act::FieldSubmit);
-        match self.state() {
-            Some(QdrantState::Stored) => replaces_url(submit.as_deref()),
-            Some(QdrantState::Unreadable(_)) => unreadable_guide(submit.as_deref()),
+        match self.url_row() {
+            Some(UrlRowState::Set { .. } | UrlRowState::Unusable { .. }) => {
+                replaces_url(submit.as_deref())
+            }
             _ => no_url_yet(submit.as_deref()),
         }
     }
 
-    /// The URL row's value: the stored summary, or the state the keyring is in.
+    /// The URL row's value (MOD-158 D9): the database-wide row, said to apply to every box.
     fn url_value(&self) -> Value<'static> {
-        let text = match self.state() {
-            Some(QdrantState::Stored) => self
-                .snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.url_summary.as_ref())
-                .map_or_else(
-                    || STORED.to_owned(),
-                    |summary| format!("{STORED} \u{b7} {summary}"),
-                ),
-            Some(QdrantState::NotStored) => return Value::Secret(false),
-            Some(QdrantState::Unreadable(why)) => format!("{UNREADABLE}: {why}"),
-            Some(QdrantState::NotApplicable) => DEMO_ROW.to_owned(),
+        let text = match self.url_row() {
+            Some(UrlRowState::Set { url, .. }) => format!("{url} \u{b7} {EVERY_BOX}"),
+            Some(UrlRowState::Unusable { why, .. }) => {
+                format!("not usable: {why} \u{b7} {EVERY_BOX}")
+            }
+            Some(UrlRowState::NotSet) => format!("not set \u{b7} {EVERY_BOX}"),
+            Some(UrlRowState::Offline) => URL_OFFLINE_ROW.to_owned(),
+            Some(UrlRowState::Unreadable(why)) => url_unreadable(why),
+            Some(UrlRowState::NotApplicable) => DEMO_ROW.to_owned(),
             None => NOT_READ.to_owned(),
         };
         Value::ReadOnly(Cow::Owned(text))
@@ -483,7 +785,7 @@ impl QdrantSection {
 
     /// The key row's value: a secret, stored or not, and never a placeholder that reads as data.
     fn key_value(&self) -> Value<'static> {
-        match self.snapshot.as_ref().map(|snapshot| &snapshot.key_state) {
+        match self.key_state() {
             Some(QdrantState::Stored) => Value::Secret(true),
             Some(QdrantState::NotStored) => Value::Secret(false),
             Some(QdrantState::Unreadable(why)) => {
@@ -509,33 +811,75 @@ impl QdrantSection {
         }
     }
 
-    /// The two rows as one kit form (MOD-115 M3 D3): the cursor row focused while browsing; an
-    /// open field on its own row right under the row it replaces (so what is stored stays on
-    /// screen); the clear question under the focused row.
+    /// The question's sentence, its answers appended as the keys bind them.
+    fn question_text(&self, question: Question, keys: &Keys) -> String {
+        let text = match question {
+            Question::ClearUrl => CONFIRM_CLEAR_URL.to_owned(),
+            Question::ClearKey => CONFIRM_CLEAR_KEY.to_owned(),
+            Question::Discard => CONFIRM_DISCARD.to_owned(),
+            Question::Adopt => match self.old_url() {
+                Some(OldUrl::Usable(url)) => confirm_adopt(url),
+                Some(OldUrl::Unusable(_)) | None => CONFIRM_ADOPT_OLD.to_owned(),
+            },
+        };
+        asked(&text, &answers(keys, views::QDRANT_CONFIRM))
+    }
+
+    /// The rows as one kit form (MOD-115 M3 D3): the cursor row focused while browsing; an open
+    /// field on its own row right under the row it replaces (so what is set stays on screen); a
+    /// question under the focused row; the override in force as the URL and key rows' help.
     fn form(&self, keys: &Keys) -> Form<'_> {
+        let snapshot = self.snapshot.as_ref();
         let mut url = form::Field::new(URL_LABEL, self.url_value());
+        if let Some(found) = snapshot.and_then(|s| s.url_override.as_ref()) {
+            url = url.help(url_override(found));
+        }
         let mut key = form::Field::new(KEY_LABEL, self.key_value());
-        if matches!(self.mode, Mode::ConfirmClear) {
-            let question = asked(CONFIRM_CLEAR, &answers(keys, views::QDRANT_CONFIRM));
-            match self.row() {
-                Row::Url => url = url.error(question),
-                Row::Key => key = key.error(question),
+        if snapshot.is_some_and(|s| s.key_override) {
+            key = key.help(KEY_OVERRIDE);
+        }
+        let mut offer = snapshot.zip(self.old_url()).map(|(s, old)| {
+            let adopt = keys.label(views::QDRANT_BROWSE, Act::QdrantAdopt);
+            let clear = keys.label(views::QDRANT_BROWSE, Act::Clear);
+            form::Field::new(
+                OFFER_LABEL,
+                Value::ReadOnly(Cow::Owned(offer_text(
+                    old,
+                    &s.url,
+                    adopt.as_deref(),
+                    clear.as_deref(),
+                ))),
+            )
+        });
+        if let Mode::Confirm(question) = self.mode {
+            let asked = self.question_text(question, keys);
+            match question.row() {
+                Row::Url => url = url.error(asked),
+                Row::Key => key = key.error(asked),
+                Row::Offer => offer = offer.map(|field| field.error(asked)),
             }
         }
         let mut form = Form::new().label_width(LABEL_WIDTH).field(url);
-        let focus = match &self.mode {
-            Mode::EditingUrl(editor) => {
-                form =
-                    form.field(self.field_row(NEW_URL_LABEL, &editor.input, self.url_guide(keys)));
-                1
-            }
-            Mode::EditingKey(_) => 2,
-            Mode::Browse | Mode::ConfirmClear => self.cursor,
-        };
+        let mut items = 1;
+        let mut focus = None;
+        if let Mode::EditingUrl(editor) = &self.mode {
+            form = form.field(self.field_row(NEW_URL_LABEL, &editor.input, self.url_guide(keys)));
+            focus = Some(items);
+            items += 1;
+        }
+        if let Some(offer) = offer {
+            form = form.field(offer);
+            items += 1;
+        }
         form = form.field(key);
+        items += 1;
         if let Mode::EditingKey(editor) = &self.mode {
             form = form.field(self.field_row(NEW_KEY_LABEL, &editor.input, KEY_GUIDE.to_owned()));
+            focus = Some(items);
         }
+        // Browsing or asking, the cursor row: the URL row is first, so an open URL field never
+        // shifts it, and nothing is open under the others then.
+        let focus = focus.unwrap_or_else(|| self.index_of(self.row()).unwrap_or(0));
         form.focus(focus).editing(matches!(
             self.mode,
             Mode::EditingUrl(_) | Mode::EditingKey(_)
@@ -564,10 +908,16 @@ impl QdrantSection {
         let spec = match self.mode {
             Mode::EditingUrl(_) => HINT_EDITING,
             Mode::EditingKey(_) => HINT_EDITING_KEY,
-            Mode::ConfirmClear => HINT_CONFIRM,
+            Mode::Confirm(_) => HINT_CONFIRM,
             Mode::Browse => {
                 if self.unavailable.is_some() || self.snapshot.is_none() {
                     HINT_NO_SNAPSHOT
+                } else if self.row() == Row::Offer {
+                    if self.adoptable().is_some() {
+                        HINT_BROWSE_OFFER
+                    } else {
+                        HINT_BROWSE_DISCARD
+                    }
                 } else {
                     HINT_BROWSE
                 }
@@ -594,6 +944,27 @@ impl QdrantSection {
         self.notice = Some(Notice::Error(text));
     }
 
+    /// Takes `snapshot` as what is there now, the outage over. The cursor stays on the row it was
+    /// on, found again by what it is, since the old URL's row comes and goes above the key's
+    /// (C-L2); a question whose row is gone closes with it.
+    fn take(&mut self, snapshot: &QdrantSnapshot) {
+        let focused = match self.mode {
+            Mode::Confirm(question) => question.row(),
+            _ => self.row(),
+        };
+        self.unavailable = None;
+        self.snapshot = Some(snapshot.clone());
+        match self.index_of(focused) {
+            Some(at) => self.cursor = at,
+            None => {
+                self.cursor = self.cursor.min(self.rows().len() - 1);
+                if matches!(self.mode, Mode::Confirm(_)) {
+                    self.mode = Mode::Browse;
+                }
+            }
+        }
+    }
+
     /// A fresh snapshot, and the write that asked for it, if any, says what it did.
     ///
     /// A `Qdrant` reply names no request, so attribution is by order. A snapshot that lands while
@@ -606,29 +977,66 @@ impl QdrantSection {
         } else {
             self.busy.take()
         };
-        self.unavailable = None;
-        self.snapshot = Some(snapshot.clone());
+        self.take(snapshot);
 
-        match write {
-            Some("set_qdrant_url") | Some("set_qdrant_api_key") => {
-                self.mode = Mode::Browse;
-                self.say(STORED);
-            }
-            Some("clear_qdrant_settings") => {
-                self.mode = Mode::Browse;
-                self.say(CLEARED);
-            }
-            _ => {}
+        let said = match write {
+            Some("set_qdrant_url") => Some(URL_SET),
+            Some("clear_qdrant_url") => Some(URL_CLEARED),
+            Some("set_qdrant_api_key") => Some(STORED),
+            Some("clear_qdrant_api_key") => Some(KEY_CLEARED),
+            Some("adopt_old_qdrant_url") => Some(ADOPTED),
+            Some("discard_old_qdrant_url") => Some(DISCARDED),
+            _ => None,
+        };
+        if let Some(said) = said {
+            self.mode = Mode::Browse;
+            self.say(said);
         }
 
+        // Not over an override (this process does not use the row) nor an old keyring URL (the
+        // offer row is the shorter way to a URL).
         if write.is_none()
-            && snapshot.url_state == QdrantState::NotStored
+            && snapshot.url == UrlRowState::NotSet
+            && snapshot.url_override.is_none()
+            && snapshot.old_url.is_none()
             && !self.opened_for_empty
             && matches!(self.mode, Mode::Browse)
         {
             // No notice: the open field's own guide says there is no URL, with the key in force.
             self.opened_for_empty = true;
-            self.open_edit();
+            self.cursor = 0;
+            self.open_url_editor();
+        }
+    }
+
+    /// A compare-and-set miss (MOD-158 D9, blueprint R-3): the row moved under the write, which
+    /// did not apply. The fresh snapshot carries the token the next write presents.
+    ///
+    /// Only the URL's set was typed into an editor, so only its miss says to reopen one; the clear
+    /// and the adopt say the row shows the URL now (C-L4).
+    fn on_stale(&mut self, snapshot: &QdrantSnapshot) {
+        let write = self.busy.take();
+        self.take(snapshot);
+        self.mode = Mode::Browse;
+        self.say(match write {
+            Some("set_qdrant_url") => CHANGED_ELSEWHERE_CLOSED,
+            _ => URL_CHANGED_ELSEWHERE,
+        });
+    }
+
+    /// A refused request. A refused write may have landed part-way (the adopt's row set, its
+    /// keyring entry kept) or have landed with its follow-up read failing, so the section reads
+    /// itself again rather than keep a view nothing has confirmed (MOD-158 R1, C-M1); the
+    /// refusal's sentence stays. A refused read is the outage.
+    fn on_failed(&mut self, request: &str, message: &str, ctx: &Ctx<'_>) {
+        if self.busy == Some(request) {
+            self.busy = None;
+            self.refuse(message.to_owned());
+            self.read_out = true;
+            ctx.request(StoreRequest::QdrantInfo);
+        } else if request == "qdrant_info" {
+            self.read_out = false;
+            self.unavailable = Some(message.to_owned());
         }
     }
 }
@@ -641,10 +1049,14 @@ fn in_flight(busy: &str) -> String {
 /// What the request `busy` is doing, as the user reads it.
 fn doing(busy: &str) -> &'static str {
     match busy {
-        "set_qdrant_url" => "storing the Qdrant URL",
+        "set_qdrant_url" => "setting the Qdrant URL for every box",
+        "clear_qdrant_url" => "clearing the Qdrant URL for every box",
         "set_qdrant_api_key" => "storing the API key",
-        "clear_qdrant_settings" => "clearing the Qdrant settings",
+        "clear_qdrant_api_key" => "removing this box's API key",
+        "adopt_old_qdrant_url" => "using the old Qdrant URL for every box",
+        "discard_old_qdrant_url" => "discarding the old Qdrant URL",
         "qdrant_info" => "reading the Qdrant settings",
+        "qdrant_old_url_check" => "looking for the old Qdrant URL",
         _ => "writing",
     }
 }
@@ -693,22 +1105,17 @@ impl SettingsSection for QdrantSection {
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         match self.mode {
             Mode::EditingUrl(_) | Mode::EditingKey(_) => self.on_editor_key(key, ctx),
-            Mode::ConfirmClear => self.on_confirm_key(key, ctx),
+            Mode::Confirm(_) => self.on_confirm_key(key, ctx),
             Mode::Browse => self.on_browse_key(key, ctx),
         }
     }
 
-    fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
-        if let StoreReply::Qdrant(snapshot) = reply {
-            self.on_snapshot(snapshot);
-        } else if let StoreReply::Failed { request, message } = reply {
-            if self.busy == Some(*request) {
-                self.busy = None;
-                self.refuse(message.clone());
-            } else if *request == "qdrant_info" {
-                self.read_out = false;
-                self.unavailable = Some(message.clone());
-            }
+    fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
+        match reply {
+            StoreReply::Qdrant(snapshot) => self.on_snapshot(snapshot),
+            StoreReply::QdrantStale(snapshot) => self.on_stale(snapshot),
+            StoreReply::Failed { request, message } => self.on_failed(request, message, ctx),
+            _ => {}
         }
     }
 
@@ -799,24 +1206,31 @@ mod tests {
     fn the_qdrant_sentences_without_their_keys() {
         assert_eq!(
             no_url_yet(Some("Enter")),
-            "no Qdrant URL is stored; type one and press Enter"
+            "no Qdrant URL is set; type one and press Enter"
+        );
+        assert_eq!(no_url_yet(None), "no Qdrant URL is set; type one to set it");
+        assert_eq!(
+            replaces_url(None),
+            "setting replaces the Qdrant URL for every box"
         );
         assert_eq!(
-            no_url_yet(None),
-            "no Qdrant URL is stored; type one to store it"
+            nothing_to_clear(Row::Url, None),
+            "no Qdrant URL is set, so there is nothing to clear"
         );
-        assert_eq!(replaces_url(None), "storing replaces the stored Qdrant URL");
-        assert!(unreadable_guide(None).ends_with("storing tries to put a Qdrant URL in it"));
         assert_eq!(
-            nothing_to_clear(None),
-            "no Qdrant URL or API key is stored, so there is nothing to clear"
+            nothing_to_clear(Row::Key, None),
+            "no Qdrant API key is stored on this box, so there is nothing to clear"
         );
-        for name in [
-            "set_qdrant_url",
-            "set_qdrant_api_key",
-            "clear_qdrant_settings",
-            "qdrant_info",
-        ] {
+        let old = OldUrl::Usable(QdrantUrl::parse("http://old.example:6334").expect("valid"));
+        assert_eq!(
+            offer_text(&old, &UrlRowState::NotSet, None, None),
+            "this box's keyring holds http://old.example:6334 from before"
+        );
+        assert_eq!(
+            offer_is_not_edited(None, None, true),
+            "the old URL is not edited here"
+        );
+        for name in crate::qdrant_settings_info::REQUEST_NAMES {
             assert_ne!(doing(name), doing("unknown"), "`{name}` has its own phrase");
             assert!(!in_flight(name).contains('_'), "{}", in_flight(name));
         }

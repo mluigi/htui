@@ -6,7 +6,7 @@ the TUI session that started it. It is part of `htui`, started by you and talkin
 Postgres; it is not a hosted service (`docs/REQUIREMENTS.md` R-ID-2, R-ORCH-12).
 
 ```
-htui worker [--pool-size N] [--dsn-stdin] [--log PATH]
+htui worker [--pool-size N] [--dsn-stdin] [--qdrant-key-stdin] [--log PATH]
 ```
 
 - [What it does, and what it does not do yet](#what-it-does-and-what-it-does-not-do-yet)
@@ -18,7 +18,9 @@ htui worker [--pool-size N] [--dsn-stdin] [--log PATH]
 - [Follow-ups on worker steps](#follow-ups-on-worker-steps)
 - [Upgrading: migrate from a TUI first](#upgrading-migrate-from-a-tui-first)
 - [Where the DSN comes from](#where-the-dsn-comes-from)
+- [Where the Qdrant API key comes from](#where-the-qdrant-api-key-comes-from)
 - [Pool size](#pool-size)
+- [The concepts index](#the-concepts-index)
 - [Logs](#logs)
 - [Exit codes](#exit-codes)
 - [A run whose resume keeps failing](#a-run-whose-resume-keeps-failing)
@@ -240,8 +242,10 @@ in [`docs/htui-mcp.md`](htui-mcp.md).
   cannot be created or is not private leaves the worker running and fails each step with
   `agent spawn failed: htui's MCP listener could not start: …`. Under the systemd unit, check that
   `/tmp` is writable.
-- **`search_concepts`** is offered only when the keyring held a Qdrant URL at start (see
-  [The concepts index](#the-concepts-index)), so a provisioned worker never offers it.
+- **`search_concepts`** is offered only when a Qdrant URL was set when the worker started: the
+  database-wide setting (**Settings › Qdrant** or `htui --set-qdrant-url`), or `HTUI_QDRANT_URL`
+  (see [The concepts index](#the-concepts-index)). A URL set later is indexed into at the next
+  sync, but the tool is offered from the worker's next start.
 - **`command_run`** runs on this box, as the worker's user and with the worker's environment, in
   the box's command queue, which the worker shares with a TUI on the same box. A worker killed
   mid-command holds its slot until the next command of that class asks, 30 seconds later at the
@@ -400,6 +404,34 @@ from `argv`, from any other environment variable or from a plain file, and it is
 log or an error report. The copy htui reads is wiped once the connection is open; the Postgres
 driver keeps the password in memory for the life of the process so it can reconnect.
 
+## Where the Qdrant API key comes from
+
+The Qdrant URL is not a secret and is not read here: it is one setting for the whole database (see
+[The concepts index](#the-concepts-index)). The API key, which a Qdrant may not need, is read from
+the first of these that holds one:
+
+1. **`HTUI_QDRANT_API_KEY`**, when set and not blank: for development and CI. htui removes it from
+   the environment of every agent, step command, git command and opener it starts, so no agent sees
+   it.
+2. **`--qdrant-key-stdin`:** one line from standard input, read at start after the DSN line when
+   `--dsn-stdin` is given too, or as the only line without it; and no other source after it. A blank
+   line or end of input is a refusal (exit 2, "no Qdrant API key on stdin: the key line was blank or
+   missing"), never a fall-through. When standard input is a terminal, a prompt goes to standard
+   error; the pasted text is visible.
+3. **Otherwise the OS keyring entry the TUI uses**, the one **Settings › Qdrant** and `htui
+   --set-qdrant-key` write. A keyring that cannot be reached counts as "no keyring", as for the DSN.
+4. **Otherwise, on Linux, the systemd credential `htui-qdrant-key`:** the file
+   `$CREDENTIALS_DIRECTORY/htui-qdrant-key`.
+
+With none of them the worker talks to Qdrant without a key, which is right for a Qdrant that needs
+none; a Qdrant that needs one refuses, and the log says so. The key is read again for every sync and
+every search, so a key stored in the keyring while the worker runs applies to the next one. The
+credential is not: systemd decrypts `LoadCredentialEncrypted=` into `$CREDENTIALS_DIRECTORY` only
+when the unit starts, so a credential re-encrypted by hand (`systemd-creds encrypt ...`) needs
+`systemctl restart htui-worker`; `htui provision --replace-credential` restarts the service itself.
+A `--qdrant-key-stdin` line is the key for the life of the process. The key is **never** read from
+`argv`, Postgres or a plain file, and never written to a log.
+
 ## Pool size
 
 `--pool-size N` sets how many Postgres connections the worker may hold. The default is 4; any value
@@ -409,16 +441,24 @@ running `htui` process below your server's `max_connections`.
 
 ## The concepts index
 
-When the OS keyring holds a Qdrant URL (set in Settings > Qdrant, as for `htui --index-items`), the
-worker keeps the concepts index in step with every project: once at start, then every
+The worker keeps the concepts index in step with every project: once at start, then every
 `concepts_sync_minutes` minutes. That is an `app_setting` key holding a positive whole number,
 read again after every sync; without it, or with any other value, the interval is 15 minutes.
 
-- The keyring is read **once**, at start. Without a URL there, or with a keyring that cannot be
-  read, the worker logs one `info` line saying why and never indexes; a URL stored later is
-  picked up at the next start. A host without a keyring, which is the systemd case, never indexes.
-- The embedding model loads in the background, downloaded on first use exactly as for
-  `--index-items`; runs never wait for it.
+- **The Qdrant URL is one setting for the whole database**, the `app_setting` `qdrant_url` that
+  **Settings › Qdrant** and `htui --set-qdrant-url` write, so every box indexes into the same
+  Qdrant. `HTUI_QDRANT_URL`, when set and not blank, overrides it for this process (development and
+  CI); a value that is not a Qdrant URL is an error, never a fall-back to the setting. The API key
+  comes from [these sources](#where-the-qdrant-api-key-comes-from).
+- **The URL is read again at every sync.** Without one, the worker logs one `info` line ("no Qdrant
+  URL is set; …") and tries again after the interval; a URL set later is indexed into at the next
+  sync, with no restart, and a changed URL or key reconnects. A setting that is not a usable URL is
+  a `warn` line naming it, every interval.
+- **An old Qdrant URL in this box's keyring is no longer read.** Earlier versions kept the URL
+  there; if the worker finds one at start it says so once, at `info`, so you can make it the setting
+  for every box in **Settings › Qdrant** or with `htui --set-qdrant-url`.
+- The embedding model loads in the background, only once a URL is set, downloaded on first use
+  exactly as for `--index-items`; runs never wait for it.
 - A Qdrant that does not answer, a model that does not load or a sync that fails is a `warn` line,
   and the next interval tries again. None of it touches runs.
 - The sync shares the worker's pool, one query at a time, and is stopped on shutdown.
@@ -439,7 +479,7 @@ read again after every sync; without it, or with any other value, the interval i
 |---|---|
 | `0` | Clean shutdown on a signal. |
 | `1` | Reserved for a failure after the worker started. This build produces none: a store outage is logged, not an exit (below). |
-| `2` | A startup refusal: no DSN, a connection that could not be made, a schema or build the database refuses, a `--log` file that cannot be opened, a signal handler that cannot be installed, htui's MCP tools that cannot be hosted (off Linux only, when the worker's own binary has no absolute path), or a command line `htui` refuses (a usage error, such as `htui --log PATH worker`). A schema or build refusal writes nothing to the database. Other refusals may not be clean: a first start mints `box.toml` before it connects, and a refusal while seeding or registering this box comes after some of those rows are written, as the TUI's start would write them. |
+| `2` | A startup refusal: no DSN, a blank or missing `--qdrant-key-stdin` line, a connection that could not be made, a schema or build the database refuses, a `--log` file that cannot be opened, a signal handler that cannot be installed, htui's MCP tools that cannot be hosted (off Linux only, when the worker's own binary has no absolute path), or a command line `htui` refuses (a usage error, such as `htui --log PATH worker`). A schema or build refusal writes nothing to the database. Other refusals may not be clean: a first start mints `box.toml` before it connects, and a refusal while seeding or registering this box comes after some of those rows are written, as the TUI's start would write them. |
 | `101` | A panic that stops the process: a bug in `htui`. It is reported to GlitchTip (see [Error reports](#error-reports)). A panic inside a run's walk is reported too, but does not stop the worker: the run is adopted again, [backed off](#a-run-whose-resume-keeps-failing). |
 
 A store outage while running is not an exit: the worker logs it and carries on, and its walks fence
@@ -532,7 +572,9 @@ with its control characters escaped.
   off for that user instead (`Defaults:<user> !requiretty`).
 - With a password sudo, a remote `sh` with `printf` built in (dash, bash, busybox and ksh93 have
   it; posh and mksh do not). The password is handed to sudo through `printf`, and an external one
-  would show it in the process list, so such a host is refused: give that user NOPASSWD.
+  would show it in the process list, so such a host is refused: give that user NOPASSWD. The same
+  holds for the Qdrant API key (**The Qdrant API key** below), whatever sudo asks: a host
+  without the builtin is refused while this machine's keyring holds a key.
 - A POSIX login shell on the remote user (sh, bash, zsh, ksh); csh and tcsh are refused. fish is
   untested and likely works, since every command is a plain `sh -c '…'`.
 - No `htui-worker` service already running from a unit `htui` did not write (one that is not
@@ -550,17 +592,18 @@ with its control characters escaped.
 | Log | `~/.local/state/htui/worker.log` | you (the directory); the worker writes the file |
 | Unit | `/etc/systemd/system/htui-worker.service` | root, through sudo |
 | Credential | `/etc/credstore.encrypted/htui-dsn` | root, through sudo |
+| Qdrant API key credential, when this machine's keyring holds a Qdrant API key | `/etc/credstore.encrypted/htui-qdrant-key` | root, through sudo |
 
 The unit is the [sample below](#running-it-as-a-systemd-service) with that user's name and home
 filled in and the binary in `~/.local/bin`. The worker mints its `box.toml` in `~/.config/htui/` at
 its first start, so the new box belongs to that user. The DSN is encrypted by `systemd-creds` on
-that host and is never in a command line, the environment, a log or a plain file on either
-machine. The sudo password, likewise, travels only on `ssh`'s standard input. The notes under the
-sample apply to this unit too; to add an `Environment=` line (`PATH`, say), use a drop-in
+that host and is never in a command line, the environment, a log or a plain file on either machine.
+The sudo password and the Qdrant API key, likewise, travel only on `ssh`'s standard input. The notes
+under the sample apply to this unit too; to add an `Environment=` line (`PATH`, say), use a drop-in
 (`sudo systemctl edit htui-worker.service`), which a re-run leaves alone. Do not set
 `XDG_CONFIG_HOME` there: provisioning assumes `~/.config`, and a worker that reads another
-`box.toml` is another box, with its executor still `tui`, and a later re-run would wait on the
-wrong file.
+`box.toml` is another box, with its executor still `tui`, and a later re-run would wait on the wrong
+file.
 
 **The DSN.** From your OS keyring, or one line of stdin with `--dsn-stdin` when the remote host
 reaches Postgres at another address. A DSN whose host is `localhost`, a loopback address or a Unix
@@ -568,9 +611,35 @@ socket is refused, including through a `host=` or `hostaddr=` parameter: the rem
 reach itself, not your server. With `--dsn-stdin` on a terminal, `htui` asks for the line; the
 pasted text is visible.
 
-**Do not provision through a sudo configured with `log_input`.** The DSN reaches `systemd-creds` on
-sudo's standard input, so such a sudo would record it in its I/O log (`/var/log/sudo-io`). It is
-off by default; `sudo -l` and `/etc/sudoers` show it when it is set.
+**The Qdrant API key.** When this machine's OS keyring holds a Qdrant API key (the one **Settings ›
+Qdrant** and `htui --set-qdrant-key` write), provisioning encrypts it on the host too, as the
+credential `htui-qdrant-key`, and the unit gets a second `LoadCredentialEncrypted=` line for it; the
+worker reads it as [its last source](#where-the-qdrant-api-key-comes-from). It travels like the DSN:
+one line on `ssh`'s standard input, after the sudo password and before the DSN, handed to
+`systemd-creds` by the remote `sh`'s `printf` builtin. With no key in the keyring nothing about a
+key is written, and the unit is exactly the [sample below](#running-it-as-a-systemd-service), unless
+the host already holds the key's credential from an earlier run (see below). A keyring that cannot
+be read is a warning (`warning: the OS keyring could not be read for a Qdrant API key (…);
+provisioning <destination> without one`), and the run goes on without a key. A key that holds a line
+break is refused before anything is sent; store it again with `htui --set-qdrant-key`. The Qdrant
+URL is not provisioned: it is one setting for the whole database (see [The concepts
+index](#the-concepts-index)).
+
+A host already provisioned and running is not sent the key by a plain re-run, which says so:
+`note: the Qdrant API key was not sent; pass --replace-credential to add or replace it`.
+`--replace-credential` encrypts the key again together with the DSN. When the host's `sh` has no
+`printf` builtin (as in posh or mksh), sending the key is refused, so the note says to encrypt it
+on the host by hand instead: the credential and its `LoadCredentialEncrypted=` line in the unit,
+as in [Running it as a systemd service](#running-it-as-a-systemd-service). A re-run without a key
+(from another machine, or with a keyring that cannot be read) and without `--replace-credential`
+keeps a key credential already on the host, and the unit it writes again still loads it.
+Re-provisioning with `--replace-credential` after the key was removed from this machine's keyring
+writes the unit without the key's line; the old `/etc/credstore.encrypted/htui-qdrant-key` stays
+on the host, unused, until you remove it (`sudo rm /etc/credstore.encrypted/htui-qdrant-key`).
+
+**Do not provision through a sudo configured with `log_input`.** The DSN and the Qdrant API key
+reach `systemd-creds` on sudo's standard input, so such a sudo would record them in its I/O log
+(`/var/log/sudo-io`). It is off by default; `sudo -l` and `/etc/sudoers` show it when it is set.
 
 **Verification and the executor.** After the install, the service must be active with a
 `box.toml` within about a minute. The box is then checked in Postgres from this machine, which
@@ -612,8 +681,9 @@ unprivileged session), sets that box's executor to `worker` when it is not alrea
 `; executor set to worker` when it changed it. When the box cannot be read there, the line is
 `<destination> is already provisioned with this build; nothing was changed`; when this machine
 cannot use the DSN, or the write does not apply, the same warnings as above say so. The exit is 0
-either way. `--replace-credential` re-encrypts the DSN and restarts the service. A host with a
-different build, or one set up by hand, is refused: upgrading is not supported yet. The binary in
+either way. `--replace-credential` re-encrypts the DSN (and the Qdrant API key, when this machine
+has one) and restarts the service. A host with a different build, or one set up by hand, is
+refused: upgrading is not supported yet. The binary in
 `~/.local/bin/htui` is replaced on a host without the unit. A run that failed partway is completed
 by running it again: the binary is not sent twice, an existing credential is kept unless you pass
 `--replace-credential`, and a unit that is installed but not running is written again and started.
@@ -625,7 +695,7 @@ finds it already provisioned and sets the executor.
 | Code | Meaning |
 |---|---|
 | `0` | Provisioned, or already provisioned. A warning on standard error may still ask you to set the executor by hand. |
-| `2` | Refused; nothing was written on the remote host. The sentence starts `not provisioning <destination>:` and names the reason, among them: a destination that is empty, starts with `-` or contains whitespace, no DSN, a keyring that could not be read, a DSN the remote host cannot use, a local `htui` binary that cannot be read or is not a Linux build, `ssh` that could not be run (`cannot run ssh: …`) or could not connect (`ssh to <destination> failed (exit 255): …`), a preflight that did not finish (`the preflight on <destination> did not finish within 120 s; its ssh session was closed`), a login shell that did not run the preflight, the host's OS, architecture, systemd, `systemd-creds`, `sha256sum` or sudo, a password sudo whose `sh` has no `printf` builtin, an `htui-worker` already running from a unit `htui` did not write, a different build already installed, a user, group or home that cannot go into a unit file, or a cancelled password prompt. |
+| `2` | Refused; nothing was written on the remote host. The sentence starts `not provisioning <destination>:` and names the reason, among them: a destination that is empty, starts with `-` or contains whitespace, no DSN, a keyring that could not be read, a DSN the remote host cannot use, a local `htui` binary that cannot be read or is not a Linux build, `ssh` that could not be run (`cannot run ssh: …`) or could not connect (`ssh to <destination> failed (exit 255): …`), a preflight that did not finish (`the preflight on <destination> did not finish within 120 s; its ssh session was closed`), a login shell that did not run the preflight, the host's OS, architecture, systemd, `systemd-creds`, `sha256sum` or sudo, a password sudo, or a Qdrant API key to send, where the remote `sh` has no `printf` builtin, a Qdrant API key in this machine's keyring that holds a line break, an `htui-worker` already running from a unit `htui` did not write, a different build already installed, a user, group or home that cannot go into a unit file, or a cancelled password prompt. |
 | `1` | Failed after a remote write; re-running completes it, the executor included (see **Re-running**). The sentence starts `provisioning <destination> failed:`. |
 
 The failures:
@@ -638,7 +708,7 @@ The failures:
 - **sudo refused:** with a password, `sudo refused the password (or needs a tty or a second
   factor) on <destination> (<sudo's last line>); nothing privileged was written`; with NOPASSWD,
   `sudo refused to run the installer as root (or needs a tty) on <destination> (<sudo's last
-  line>); nothing privileged was written`. The DSN was not read.
+  line>); nothing privileged was written`. Neither the Qdrant API key nor the DSN was read.
 - **ssh dropped before the privileged part:** `the ssh session to <destination> dropped before the
   privileged part (exit <code>); nothing privileged was written: <its last line>`.
 - **The service did not start:** `the htui-worker service on <destination> did not start with a
@@ -670,9 +740,9 @@ have. `--dsn-stdin` cannot be combined with `--set-dsn`, `--clear-dsn`, `--demo`
 `--index-items` or `--search-items`.
 
 **Not done.** Upgrades (a host with a different build is refused), uninstalling
-(`sudo systemctl disable --now htui-worker.service`, then remove the four paths above by hand),
-non-Linux targets on either end, and user units. The concepts index is not built on the box: the
-service has no keyring, so no Qdrant URL (see [The concepts index](#the-concepts-index)).
+(`sudo systemctl disable --now htui-worker.service`, then remove the paths above by hand),
+non-Linux targets on either end, and user units. The worker on the box builds the concepts index
+once the database has a Qdrant URL (see [The concepts index](#the-concepts-index)).
 
 ## Running it as a systemd service
 
@@ -691,6 +761,12 @@ sudo systemd-creds encrypt --name=htui-dsn - /etc/credstore.encrypted/htui-dsn
 
 Paste the DSN, press `Enter`, then `Ctrl-D`. Reading it from standard input keeps it out of your
 shell history and the process list.
+
+When the Qdrant needs an API key, encrypt it the same way, as its own credential:
+
+```
+sudo systemd-creds encrypt --name=htui-qdrant-key - /etc/credstore.encrypted/htui-qdrant-key
+```
 
 **2. Create the log directory** as your user: `mkdir -p ~/.local/state/htui`.
 
@@ -712,6 +788,12 @@ RestartSec=10s
 
 [Install]
 WantedBy=multi-user.target
+```
+
+With the Qdrant API key credential, add its line right after the `htui-dsn` one:
+
+```ini
+LoadCredentialEncrypted=htui-qdrant-key:/etc/credstore.encrypted/htui-qdrant-key
 ```
 
 ```

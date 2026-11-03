@@ -7,13 +7,17 @@
 //! test cannot reach. The collection is a throwaway one and vectors come from `HashEmbedder`, so
 //! no model is downloaded and the user's `concepts` collection is never touched.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use htui::concepts_worker::{KeySource, QdrantSource};
 use htui_core::fixtures::ids;
 use htui_core::model::{ItemId, NewItem};
+use htui_core::qdrant::QdrantUrl;
 use htui_core::store::{ReadStore as _, WriteStore as _};
 use htui_store::embed::{DENSE_DIM, HashEmbedder};
 use htui_store::qdrant_settings::QdrantSettings;
+use htui_store::secret::QdrantEnv;
 use htui_store::testkit;
 use htui_store::vector::{QdrantStore, SearchQuery, VectorStore as _};
 
@@ -24,7 +28,7 @@ async fn throwaway() -> Option<QdrantStore<HashEmbedder>> {
         eprintln!("skipped: {ENV_URL} not set");
         return None;
     };
-    let settings = QdrantSettings::new(url, None).expect("valid URL");
+    let settings = QdrantSettings::new(QdrantUrl::parse(&url).expect("valid URL"), None);
     let name = format!("htui_test_{}", uuid::Uuid::now_v7().simple());
     Some(
         QdrantStore::connect_to(&settings, HashEmbedder::new(DENSE_DIM), &name)
@@ -118,5 +122,77 @@ async fn the_worker_job_indexes_a_new_item() {
     );
 
     store.drop_collection().await.expect("drop");
+    db.drop_db().await;
+}
+
+/// MOD-158 D6, D7: the job reads the `qdrant_url` row through the store published to its source,
+/// every cycle: with no row it opens nothing; once the row names the test Qdrant, the next cycle
+/// opens that Qdrant and indexes the demo into it. The `open` is the throwaway collection's.
+#[tokio::test]
+async fn the_worker_job_follows_the_url_row() {
+    let Ok(url) = std::env::var(ENV_URL) else {
+        eprintln!("skipped: {ENV_URL} not set");
+        return;
+    };
+    let Some(db) = testkit::demo_db().await else {
+        return;
+    };
+    // No override, no key: a literal, never the process's environment (blueprint P-13).
+    let source =
+        QdrantSource::new(QdrantEnv::default(), KeySource::Interactive).with_keyring(|| Ok(None));
+    source.publish(Some(Arc::new(db.store.clone())));
+    let name = format!("htui_test_{}", uuid::Uuid::now_v7().simple());
+    // Every open's URL, and what the last one answered.
+    let urls: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let last: Mutex<Option<Result<Arc<QdrantStore<HashEmbedder>>, String>>> = Mutex::new(None);
+    let open = |settings: QdrantSettings| {
+        let name = name.clone();
+        let (urls, last) = (&urls, &last);
+        async move {
+            urls.lock()
+                .expect("not poisoned")
+                .push(settings.url.to_string());
+            let store = QdrantStore::connect_to(&settings, HashEmbedder::new(DENSE_DIM), &name)
+                .await
+                .map(Arc::new)
+                .map_err(|err| err.to_string());
+            *last.lock().expect("not poisoned") = Some(store.clone());
+            store
+        }
+    };
+    let mut mismatch = false;
+
+    // Nothing cached here to forget (MOD-158 R1, B-L1).
+    let forget = |_: Option<&Arc<QdrantStore<HashEmbedder>>>| {};
+    let pause = htui::concepts::job_cycle(&db.store, &source, &open, &forget, &mut mismatch).await;
+    assert_eq!(pause, Duration::from_secs(15 * 60));
+    assert!(
+        urls.lock().expect("not poisoned").is_empty(),
+        "no row: nothing opened"
+    );
+
+    let row = QdrantUrl::parse(&url).expect("a valid URL");
+    db.store
+        .set_qdrant_url(&row, None)
+        .await
+        .expect("set the row");
+    htui::concepts::job_cycle(&db.store, &source, &open, &forget, &mut mismatch).await;
+    assert_eq!(
+        *urls.lock().expect("not poisoned"),
+        [row.as_str()],
+        "the next cycle opened the row's Qdrant"
+    );
+    let store = last
+        .lock()
+        .expect("not poisoned")
+        .take()
+        .expect("opened")
+        .expect("Qdrant answers");
+    let indexed = store.indexed(ids::PROJECT_HTUI).await.expect("indexed");
+    store.drop_collection().await.expect("drop");
+    assert!(
+        !indexed.is_empty(),
+        "the cycle indexed the demo's htui items"
+    );
     db.drop_db().await;
 }

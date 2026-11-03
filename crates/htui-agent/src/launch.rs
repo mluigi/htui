@@ -1197,6 +1197,11 @@ fn spawn_supervised(
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // MOD-158 D5 (`R-SEC-2`): htui's own secret variables never reach an agent, whether
+        // inherited or named by the launch row; removed after `.envs` so nothing re-adds them.
+        for key in htui_core::secret::HTUI_OWN_ENV {
+            command.env_remove(key);
+        }
         CommandWrap::from(command)
     };
 

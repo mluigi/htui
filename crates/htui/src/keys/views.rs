@@ -364,7 +364,7 @@ pub const CONNECTION_CONFIRM: Stack<'static> = Stack::new(&[
 
 /// Settings > Qdrant, browsing.
 pub const QDRANT_BROWSE: Stack<'static> = Stack::new(&[
-    Layer::view(Context::SettingsQdrant, &[]),
+    Layer::view(Context::SettingsQdrant, &[Act::QdrantAdopt]),
     SETTINGS,
     Layer::only(Context::Common, &[Act::Edit, Act::Clear, Act::Reload]),
     LIST,

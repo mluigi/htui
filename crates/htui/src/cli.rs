@@ -33,6 +33,52 @@ pub struct Args {
     #[arg(long, conflicts_with_all = ["set_dsn", "demo"])]
     pub clear_dsn: bool,
 
+    /// Set the Qdrant URL every box uses (one setting in Postgres) and exit. A URL with a user
+    /// name, password, query or fragment is refused (`R-STO-1`).
+    #[arg(
+        long,
+        value_name = "URL",
+        conflicts_with_all = [
+            "clear_qdrant_url", "set_qdrant_key", "clear_qdrant_key", "set_dsn", "clear_dsn",
+            "dsn_stdin", "demo", "offline", "index_items", "search_items", "keys", "default_keys",
+            "print_keys", "project", "decisions", "limit", "json", "cwd"
+        ]
+    )]
+    pub set_qdrant_url: Option<String>,
+
+    /// Remove the Qdrant URL every box uses and exit.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "set_qdrant_url", "set_qdrant_key", "clear_qdrant_key", "set_dsn", "clear_dsn",
+            "dsn_stdin", "demo", "offline", "index_items", "search_items", "keys", "default_keys",
+            "print_keys", "project", "decisions", "limit", "json", "cwd"
+        ]
+    )]
+    pub clear_qdrant_url: bool,
+
+    /// Read a Qdrant API key from stdin, store it in this box's OS keyring and exit.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "set_qdrant_url", "clear_qdrant_url", "clear_qdrant_key", "set_dsn", "clear_dsn",
+            "dsn_stdin", "demo", "offline", "index_items", "search_items", "keys", "default_keys",
+            "print_keys", "project", "decisions", "limit", "json", "cwd"
+        ]
+    )]
+    pub set_qdrant_key: bool,
+
+    /// Remove this box's Qdrant API key from the OS keyring and exit.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "set_qdrant_url", "clear_qdrant_url", "set_qdrant_key", "set_dsn", "clear_dsn",
+            "dsn_stdin", "demo", "offline", "index_items", "search_items", "keys", "default_keys",
+            "print_keys", "project", "decisions", "limit", "json", "cwd"
+        ]
+    )]
+    pub clear_qdrant_key: bool,
+
     /// Read a Postgres DSN for this session from one line of stdin, held in memory only and never
     /// stored (`R-STO-1`): for a TUI over `ssh -t` on a box with no keyring.
     #[arg(
@@ -169,6 +215,10 @@ pub struct WorkerArgs {
     /// Read the DSN from one line of stdin instead of the keyring or the credential.
     #[arg(long)]
     pub dsn_stdin: bool,
+    /// Read the Qdrant API key from one line of stdin, after the DSN line with `--dsn-stdin`,
+    /// instead of the keyring or the credential `htui-qdrant-key`.
+    #[arg(long)]
+    pub qdrant_key_stdin: bool,
 }
 
 /// `htui claude`'s verb (MOD-93). The verb is required: `htui claude` alone is a usage error.
@@ -283,16 +333,34 @@ mod tests {
         assert_eq!(args.log.as_deref(), Some(std::path::Path::new("htui.log")));
     }
 
-    /// MOD-41 plan D14: `htui worker` takes `--pool-size` (default 4) and `--dsn-stdin`.
+    /// MOD-41 plan D14, MOD-158 D4: `htui worker` takes `--pool-size` (default 4), `--dsn-stdin`
+    /// and `--qdrant-key-stdin`.
     #[test]
-    fn worker_parses_its_two_flags() {
-        let args = Args::try_parse_from(["htui", "worker", "--pool-size", "6", "--dsn-stdin"])
-            .expect("parse");
+    fn worker_parses_its_three_flags() {
+        let args = Args::try_parse_from([
+            "htui",
+            "worker",
+            "--pool-size",
+            "6",
+            "--dsn-stdin",
+            "--qdrant-key-stdin",
+        ])
+        .expect("parse");
         assert_eq!(
             args.command,
             Some(Command::Worker(WorkerArgs {
                 pool_size: 6,
                 dsn_stdin: true,
+                qdrant_key_stdin: true,
+            }))
+        );
+        let args = Args::try_parse_from(["htui", "worker", "--qdrant-key-stdin"]).expect("parse");
+        assert_eq!(
+            args.command,
+            Some(Command::Worker(WorkerArgs {
+                pool_size: 4,
+                dsn_stdin: false,
+                qdrant_key_stdin: true,
             }))
         );
         let args = Args::try_parse_from(["htui", "worker"]).expect("parse");
@@ -301,7 +369,12 @@ mod tests {
             Some(Command::Worker(WorkerArgs {
                 pool_size: 4,
                 dsn_stdin: false,
+                qdrant_key_stdin: false,
             }))
+        );
+        assert!(
+            Args::try_parse_from(["htui", "--qdrant-key-stdin"]).is_err(),
+            "a worker flag, not the TUI's"
         );
     }
 
@@ -544,6 +617,124 @@ mod tests {
                 "`htui --{}` must not read the environment",
                 arg.get_id()
             );
+        }
+    }
+
+    /// MOD-158 D8: the four Qdrant flags, each with one of its own.
+    const QDRANT_FLAGS: [&[&str]; 4] = [
+        &["--set-qdrant-url", "http://qdrant.lan:6334"],
+        &["--clear-qdrant-url"],
+        &["--set-qdrant-key"],
+        &["--clear-qdrant-key"],
+    ];
+
+    /// MOD-158 D8: each Qdrant flag parses alone and beside the global `--log`. A URL D2 refuses
+    /// still parses: `qdrant_cmd` refuses it with htui's sentence, not a clap usage error.
+    #[test]
+    fn the_qdrant_flags_parse_alone() {
+        let args = Args::try_parse_from(["htui", "--set-qdrant-url", "http://qdrant.lan:6334"])
+            .expect("parse");
+        assert_eq!(
+            args.set_qdrant_url.as_deref(),
+            Some("http://qdrant.lan:6334")
+        );
+        assert!(!args.clear_qdrant_url && !args.set_qdrant_key && !args.clear_qdrant_key);
+        assert_eq!(args.command, None);
+        let args = Args::try_parse_from(["htui", "--set-qdrant-url", "http://u:p@qdrant.lan"])
+            .expect("a refused URL is htui's refusal, not clap's");
+        assert_eq!(
+            args.set_qdrant_url.as_deref(),
+            Some("http://u:p@qdrant.lan")
+        );
+        let args = Args::try_parse_from(["htui", "--clear-qdrant-url"]).expect("parse");
+        assert!(args.clear_qdrant_url);
+        assert_eq!(args.set_qdrant_url, None);
+        let args = Args::try_parse_from(["htui", "--set-qdrant-key"]).expect("parse");
+        assert!(args.set_qdrant_key);
+        let args = Args::try_parse_from(["htui", "--clear-qdrant-key"]).expect("parse");
+        assert!(args.clear_qdrant_key);
+        for flag in QDRANT_FLAGS {
+            let mut argv = vec!["htui"];
+            argv.extend_from_slice(flag);
+            argv.extend_from_slice(&["--log", "x"]);
+            let args = Args::try_parse_from(&argv).unwrap_or_else(|err| panic!("{argv:?}: {err}"));
+            assert_eq!(args.log.as_deref(), Some(std::path::Path::new("x")));
+        }
+        assert!(
+            Args::try_parse_from(["htui", "--set-qdrant-url"]).is_err(),
+            "`--set-qdrant-url` needs its URL"
+        );
+    }
+
+    /// MOD-158 D8: one Qdrant flag at a time, none beside a DSN flag, a key-file flag or a flag
+    /// of the TUI or the concepts verbs (it would be silently ignored), and none beside a
+    /// subcommand.
+    #[test]
+    fn the_qdrant_flags_exclude_each_other_the_dsn_and_key_flags_and_tui_flags() {
+        let tail: [&[&str]; 15] = [
+            &["--set-dsn"],
+            &["--clear-dsn"],
+            &["--dsn-stdin"],
+            &["--demo"],
+            &["--offline"],
+            &["--index-items"],
+            &["--search-items", "q"],
+            &["--keys", "k.toml"],
+            &["--default-keys"],
+            &["--print-keys"],
+            // `--search-items`' own flags: their `requires` never fires beside a flag that
+            // conflicts with `--search-items`, so each needs its own conflict.
+            &["--project", "p"],
+            &["--decisions"],
+            &["--limit", "5"],
+            &["--json"],
+            &["--cwd", "/tmp"],
+        ];
+        let mut refused: Vec<Vec<&str>> = Vec::new();
+        for (i, flag) in QDRANT_FLAGS.iter().enumerate() {
+            for other in QDRANT_FLAGS.iter().skip(i + 1).chain(tail.iter()) {
+                refused.push([*flag, *other].concat());
+                refused.push([*other, *flag].concat());
+            }
+            refused.push([*flag, &["worker"]].concat());
+            refused.push([*flag, &["status"]].concat());
+        }
+        for flags in refused {
+            let mut argv = vec!["htui"];
+            argv.extend_from_slice(&flags);
+            assert!(
+                Args::try_parse_from(&argv).is_err(),
+                "{argv:?} must not parse"
+            );
+        }
+        for flag in QDRANT_FLAGS {
+            let mut argv = vec!["htui", "worker"];
+            argv.extend_from_slice(flag);
+            assert!(
+                Args::try_parse_from(&argv).is_err(),
+                "{argv:?}: a top-level flag, not the worker's"
+            );
+        }
+    }
+
+    /// `R-STO-1`, MOD-158 D8: no Qdrant flag reads the environment (the URL and the key come from
+    /// the command line and stdin only); `no_tui_argument_but_log_reads_the_environment` covers
+    /// them too, this names them.
+    #[test]
+    fn no_qdrant_flag_reads_the_environment() {
+        let mut command = Args::command();
+        command.build();
+        for id in [
+            "set_qdrant_url",
+            "clear_qdrant_url",
+            "set_qdrant_key",
+            "clear_qdrant_key",
+        ] {
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .unwrap_or_else(|| panic!("`{id}` is a top-level argument"));
+            assert_eq!(arg.get_env(), None, "`{id}` must not read the environment");
         }
     }
 

@@ -183,12 +183,20 @@ Claude's per-project memory and Gortex all line up.
 
 Postgres listens on `localhost:5439` (user `postgres`, no password) and Qdrant on
 `localhost:6333`/`6334`, exactly as the host's `compose.yaml` services do, but these are the run's
-own servers. The test variables are already set:
+own servers. The test variables are already set, and so is htui's own Qdrant URL:
 
 ```
 HTUI_TEST_DATABASE_URL=postgres://postgres@localhost:5439/postgres
 HTUI_TEST_QDRANT_URL=http://localhost:6334
+HTUI_QDRANT_URL=http://localhost:6334
 ```
+
+`HTUI_QDRANT_URL` overrides the database-wide Qdrant URL for every htui process in the run, so a
+sandbox TUI or worker never reads the database's `qdrant_url` setting and cannot index into or
+search another Qdrant; Settings › Qdrant shows the override. `HTUI_QDRANT_API_KEY` is not set: the
+run's Qdrant has no key. Every test process inherits `HTUI_QDRANT_URL` too, so a test must never
+read the Qdrant variables from its own environment (it would behave differently here than on the
+host): tests pass their Qdrant settings in.
 
 So the full suite runs as is:
 
@@ -476,7 +484,8 @@ and the MCP servers already disabled for this project. Commits carry
 your name and email from `git config user.*`, passed in as environment variables.
 
 Inside a run these are set: `HR_SANDBOX=1`, `HR_ITEM=<ITEM>`, `HR_STATE=/hr-state`,
-`USERNAME=htui-ci`, `HTUI_TEST_DATABASE_URL`, `HTUI_TEST_QDRANT_URL`, `UV_TOOL_DIR=/tmp/uv-tools`,
+`USERNAME=htui-ci`, `HTUI_TEST_DATABASE_URL`, `HTUI_TEST_QDRANT_URL`, `HTUI_QDRANT_URL`,
+`UV_TOOL_DIR=/tmp/uv-tools`,
 `CARGO_INSTALL_ROOT=/tmp/cargo-install`, the git identity, and a `PATH` with the mise tool
 directories ahead of `~/.local/bin`, no `~/.cargo/bin`, and `/tmp/cargo-install/bin` last — a
 `cargo install` stays in its container and cannot shadow the toolchain. `~/.cargo/bin` is also an

@@ -14,7 +14,14 @@
   truth for its workflow skills and rules, `AGENTS.md` "Rules").
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-11-03):** **MOD-115 is done** (`docs/decisions/mod/mod-115.md`): the TUI
+**Current status (2026-11-03):** **MOD-158 is done** (`docs/decisions/mod/mod-158.md`): the Qdrant URL is
+one database-wide `app_setting` row (`qdrant_url`, compare-and-set, credentials refused by `QdrantUrl`),
+set from Settings > Qdrant and `htui --set-qdrant-url`, overridable per process by `HTUI_QDRANT_URL`; the
+API key comes from `HTUI_QDRANT_API_KEY`, the keyring, or for a worker `--qdrant-key-stdin` and the
+`htui-qdrant-key` credential `htui provision` now encrypts; `HTUI_QDRANT_API_KEY` is removed from every
+process htui starts; settings resolve per search and per index cycle (`concepts_worker::resolve_settings`),
+so a change needs no restart; the old per-box keyring URL is offered once in Settings. MOD-159 is unblocked
+except its coverage parts; MOD-160 builds on it. **MOD-115 is done** (`docs/decisions/mod/mod-115.md`): the TUI
 shell and its widget kit. Every view draws only through `ui/kit` (a guard over all of `src` holds it):
 one-row header, rounded panes with sub-tab chips in the top border and the focused pane's hints in the
 bottom one, per-tab layouts saved per machine, history, the leave dialog, every key configurable, a
@@ -40,7 +47,9 @@ repo) owes key rotation and a history rewrite, after the live `hr` branches merg
 Postgres gates on the merged tree (TOOL-8's included); the Windows runs (TOOL-14's `gate.ps1
 -SelfTest`, TOOL-8's `claude -p "/gate fmt"` and `.ps1` commands, TOOL-9's `.ps1` gate files);
 TOOL-8's `dev-health` docker path against the real `htui-postgres` (`docs/htui-dev.md`); MOD-93's live
-install and `tsc` on the mod; TOOL-10's real `scripts/hr up` and Docker bats case; ANA-30's checks of
+install and `tsc` on the mod; TOOL-10's real `scripts/hr up` and Docker bats case; MOD-158's live-Qdrant suites (`qdrant_live`, `qdrant_worker`,
+`state_cli_pg`'s index case; the sandbox Qdrant times out creating collections), its bats `3h2` and a real
+`htui provision` with a key; ANA-30's checks of
 which credit the $100 is (Console) and of stored ACP `session_info_update` titles (`docs/ANA-30.md` §8
 calls 2, 6).
 Live coordinates after MOD-138 M1 (checked against the tree 2026-11-03): migrations run through
@@ -845,17 +854,10 @@ MOD-147 and MOD-159. Pins: store conformance `CASES` 218 (`htui-core/tests/mem_s
   notes and transcript snippets); it plugs into MOD-159's indexer and is blocked on MOD-159. Part (1)'s
   read tools carry a text filter over keys, titles and bodies that works without Qdrant, agents' fallback
   while knowledge search is unavailable (`R-MCP-2`).
-- [ ] **MOD-158 - Qdrant: URL setting and API key** (from ANA-37, `docs/ANA-37.md` §7.5, §8 Q1, Q2;
-  one Qdrant for the whole database by maintainer decision, 2026-10-20). `R-STO-1`, `R-STO-8`, `R-SEC-2`,
-  `R-TUI-8`, `R-NF-2`. The Qdrant URL as one database-wide setting in Postgres (`app_setting`, no
-  `workspace` migration), set from Settings > Qdrant, whose URL row moves to it, and from the CLI; a URL
-  carrying credentials refused; a development and CI override per process. One API key in the OS
-  keyring; for a headless worker (`R-ORCH-12`) a systemd credential or stdin; for development and CI an
-  environment variable removed from every agent subprocess. The per-box keyring `qdrant-url` offered once
-  as the setting, then retired; a setting changed after start picked up without a restart. Not blocked.
 - [ ] **MOD-159 - One knowledge indexer per collection: lease, freshness, coverage** (from ANA-37,
   `docs/ANA-37.md` §7.2, §7.3, §8 Q3-Q5; amended 2026-10-20, one Qdrant and a global collection).
-  `R-STO-8`, `R-ENT-12`, `R-ENT-13`, `R-ENT-16`. In the one Qdrant (MOD-158): one collection per
+  `R-STO-8`, `R-ENT-12`, `R-ENT-13`, `R-ENT-16`. In the one Qdrant (MOD-158, done: `docs/decisions/mod/mod-158.md`;
+  settings resolve through `concepts_worker::resolve_settings`/`QdrantSource`): one collection per
   workspace, replacing `htui_concepts_v2`, and one global collection for global memory (MOD-168), never
   copied into a workspace's; collection names carry no version while htui is in development, so a
   payload change (MOD-144, MOD-147, MOD-167) drops and reindexes instead of renaming (by maintainer
@@ -868,8 +870,8 @@ MOD-147 and MOD-159. Pins: store conformance `CASES` 218 (`htui-core/tests/mem_s
   `--search-items` over several workspaces names those unavailable; a workspace search also queries the
   global collection. Coverage beyond MOD-112 (4), which keeps notes, transcripts, workspace-owned items
   and agents' scope: documents owned by a project or the workspace and workspace requirements. Memory is
-  MOD-167's point type and near-duplicate check, plugged into this indexer as MOD-112 (4) is. Blocked on
-  MOD-158; the coverage parts on ANA-35 (MOD-147, MOD-149 on main).
+  MOD-167's point type and near-duplicate check, plugged into this indexer as MOD-112 (4) is. MOD-158 is
+  done, so only the coverage parts are blocked, on ANA-35 (MOD-147, MOD-149 on main).
 - [ ] **MOD-160 - Knowledge search fails open cheaply and says so** (from ANA-37, `docs/ANA-37.md`
   §7.1, §7.4, §8 Q6). `R-NF-2`, `R-NF-3`, `R-STO-8`, `R-MCP-2`, `R-TUI-8`. The TUI search checks Qdrant
   and the collection before loading the model and never creates a collection, as the CLI does; every
@@ -878,7 +880,8 @@ MOD-147 and MOD-159. Pins: store conformance `CASES` 218 (`htui-core/tests/mem_s
   advertised), answering the same words as a tool error during an outage; Settings, first run and
   worker start warn, never block, when no Qdrant is configured, when it is unreachable, and when
   this box lacks the key; CI runs `qdrant_live` and `qdrant_worker` against a Qdrant instead of
-  skipping. May fold into MOD-158. Not blocked.
+  skipping. Kept apart from MOD-158 (maintainer, 2026-10-27); builds on its `resolve_settings` and the
+  worker's start-time `search_concepts` gate (`docs/decisions/mod/mod-158.md`). Not blocked.
 - [ ] **MOD-161 - Related items at draft time** (from ANA-37, `docs/ANA-37.md` §7.4, §8 Q7).
   `R-STO-8`, `R-ID-6`, `R-ENT-9`, `R-MCP-2`. The top 5 nearest items across the workspace (open and
   closed, decisions included) beside item creation in the TUI, `item_create` drafts, the coordinator's
@@ -1218,6 +1221,6 @@ MOD-147 and MOD-159. Pins: store conformance `CASES` 218 (`htui-core/tests/mem_s
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 6 (ANA-25 learned weights, ANA-31 agy isolation, ANA-32 warm-start measurement, ANA-39 mandatory context tools, ANA-41 project workflows, ANA-42 execution targets) |
-| MOD-N   | 84 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-144 item status reduction, MOD-145 folder repos and repo-less runs, MOD-147 workspace scope, MOD-148 per-type seeds, MOD-149 workspace requirement keys, MOD-150 link kinds, MOD-151 tool guidance, MOD-152 async commands and logs, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-158 Qdrant setting and key, MOD-159 knowledge indexer, MOD-160 knowledge search fail-open, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-163 memory entry store, MOD-164 automatic memory capture, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-138 snapshot v2 and walker, MOD-139 divided fan-out runtime, MOD-140 planner tools and run-time changes, MOD-141 step-graph editor, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
+| MOD-N   | 83 (MOD-16 Windows verification, MOD-27 consult-mode spawn_subagent, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-130 target record and cascade, MOD-131 driven targets, MOD-132 target preparation and bundle collect, MOD-133 integration modes, MOD-134 forge adapter and credentials, MOD-135 close-out checklist, MOD-136 coordinator turns, MOD-144 item status reduction, MOD-145 folder repos and repo-less runs, MOD-147 workspace scope, MOD-148 per-type seeds, MOD-149 workspace requirement keys, MOD-150 link kinds, MOD-151 tool guidance, MOD-152 async commands and logs, MOD-153 test results and presets, MOD-154 status requests, MOD-155 pending links and citations, MOD-156 document_patch, MOD-157 attachment tools, MOD-159 knowledge indexer, MOD-160 knowledge search fail-open, MOD-161 related items at draft time, MOD-162 retrieval benchmark, MOD-163 memory entry store, MOD-164 automatic memory capture, MOD-165 lesson detector, MOD-166 memory freshness, MOD-167 memory in Qdrant, MOD-168 global memory scope, MOD-169 memory measurement, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-97 API-key env strip, MOD-98 summary phase, MOD-99 error-reporting endpoint, MOD-100 retention sweep, MOD-101 step exit code, MOD-102 workspace prompt scope, MOD-103 chat per session, MOD-104 identity bootstrap, MOD-105 claude login and install, MOD-106 primary repo, MOD-107 priority and labels, MOD-108 boxes and repos, MOD-109 settings surfaces, MOD-110 agents and quota, MOD-111 run control, MOD-112 agent context over MCP, MOD-113 prompt library, MOD-114 TUI notifications/coverage/attachments/editor, MOD-116 Workspaces tab, MOD-117 workspace components, MOD-118 requirements in Workspaces, MOD-119 Backlog redesign, MOD-120 graphs redesign, MOD-121 Chat groups and htui agent, MOD-122 activity and logs, MOD-123 Settings redesign, MOD-124 Toolbox and workflow editor, MOD-125 stopping and resuming runs, MOD-126 light model, MOD-127 generic binding and kinds, MOD-128 bundles, MOD-129 hooks/sub-agents/mods run resources, MOD-138 snapshot v2 and walker, MOD-139 divided fan-out runtime, MOD-140 planner tools and run-time changes, MOD-141 step-graph editor, MOD-142 runs pane for divided runs, MOD-143 subgraph nodes, MOD-8 import; deferred MOD-36 weighted assignment, MOD-3 diff, MOD-5 tracker) |
 | CLEAN-N | 0 |
 | TOOL-N  | 2 (TOOL-12 sandbox settings hardening, TOOL-13 requirement-citation check) |

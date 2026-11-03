@@ -32,6 +32,7 @@ pub mod persona_settings;
 pub mod preview;
 pub mod prompt_settings;
 pub mod provision;
+pub mod qdrant_cmd;
 /// State and summary of the Qdrant connection string.
 pub mod qdrant_settings_info;
 pub mod queue_overview;
@@ -74,15 +75,16 @@ use crate::ui::state_file::UiStore;
 ///
 /// Startup order (blueprint D.4), and it matters: logging, then the two keyring flags — which exit
 /// **before** any terminal work, so the DSN is typed into a normal shell and never into a raw-mode
-/// terminal — then the two concepts-index flags (MOD-34), which also print to the shell and exit,
-/// then the key file (MOD-67), which `--print-keys` prints and exits on, then the backend
-/// (`--demo`'s included), then the worker, then the shell, then the terminal. `htui provision`
-/// (MOD-45) comes right after logging, before the keyring flags; it prints to the shell and exits.
-/// `htui status` and `htui waiting` (MOD-92) come right after it: they read only, print one answer
-/// and exit, and `--search-items` (read-only too since MOD-92) keeps its place after the keyring
-/// flags; all three run before the key file is read. `htui claude emit` (MOD-93) comes right after
-/// the state verbs: it writes only its plugin directory, prints and exits.
-/// With `--dsn-stdin`, the session's DSN is read from stdin before the backend starts.
+/// terminal — then the four Qdrant flags (MOD-158 D8: the URL setting and this box's API key),
+/// which act the same way, then the two concepts-index flags (MOD-34), which also print to the
+/// shell and exit, then the key file (MOD-67), which `--print-keys` prints and exits on, then the
+/// backend (`--demo`'s included), then the worker, then the shell, then the terminal. `htui
+/// provision` (MOD-45) comes right after logging, before the keyring flags; it prints to the shell
+/// and exits. `htui status` and `htui waiting` (MOD-92) come right after it: they read only, print
+/// one answer and exit, and `--search-items` (read-only too since MOD-92) keeps its place after the
+/// keyring flags; all three run before the key file is read. `htui claude emit` (MOD-93) comes
+/// right after the state verbs: it writes only its plugin directory, prints and exits. With
+/// `--dsn-stdin`, the session's DSN is read from stdin before the backend starts.
 ///
 /// The backend is always available immediately: `connect::start` opens the local mirror and hands
 /// back an offline backend, and the connection runs on its own task (ANA-9 §4.4). A missing DSN, an
@@ -140,6 +142,25 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
     if args.clear_dsn {
         secret::clear_dsn()?;
         eprintln!("DSN removed from the OS keyring.");
+        return Ok(());
+    }
+    // MOD-158 D8: the Qdrant URL (one setting in Postgres) and this box's API key; each acts,
+    // prints one line on stderr and exits with `StateExit`'s code.
+    if let Some(url) = args.set_qdrant_url.as_deref() {
+        return qdrant_cmd::set_url(url).await.map_err(anyhow::Error::from);
+    }
+    if args.clear_qdrant_url {
+        return qdrant_cmd::clear_url().await.map_err(anyhow::Error::from);
+    }
+    if args.set_qdrant_key {
+        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            eprintln!("{}", qdrant_cmd::KEY_PROMPT);
+        }
+        eprintln!("{}", qdrant_cmd::set_key(&mut std::io::stdin().lock())?);
+        return Ok(());
+    }
+    if args.clear_qdrant_key {
+        eprintln!("{}", qdrant_cmd::clear_key()?);
         return Ok(());
     }
     if args.index_items {
@@ -435,6 +456,31 @@ mod tests {
         let text = format!("{err:#} {err:?}");
         assert!(text.contains("unrecognised parameter"), "{text}");
         assert!(!text.contains("SENTINEL"), "the error echoes the DSN");
+    }
+
+    /// MOD-158 D8: the four Qdrant flags exit after the DSN flags and before the concepts verbs,
+    /// the key file and the backend, so the key is typed into a cooked shell and nothing else of
+    /// htui starts.
+    #[test]
+    fn run_routes_the_qdrant_flags_before_the_key_file_and_the_backend() {
+        let file = include_str!("lib.rs");
+        let code = &file[..file.find("#[cfg(test)]").unwrap_or(file.len())];
+        let at = |needle: &str| {
+            code.find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` is routed"))
+        };
+        let clear_dsn = at("if args.clear_dsn {");
+        let routed = [
+            at("qdrant_cmd::set_url(url)"),
+            at("qdrant_cmd::clear_url()"),
+            at("qdrant_cmd::set_key(&mut std::io::stdin().lock())"),
+            at("qdrant_cmd::clear_key()"),
+        ];
+        let index_items = at("if args.index_items {");
+        for place in routed {
+            assert!(clear_dsn < place && place < index_items);
+        }
+        assert!(index_items < at("keys::resolve("));
     }
 
     /// MOD-115 M2 RV2 H1: `run` saves the UI state through the background writer, and once the

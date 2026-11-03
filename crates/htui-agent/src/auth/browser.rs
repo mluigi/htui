@@ -138,15 +138,26 @@ fn scheme_of(url: &str) -> Option<String> {
         .map(|(scheme, _)| scheme.to_ascii_lowercase())
 }
 
-/// The command to spawn and the name to put in a spawn failure.
+/// The command to spawn and the name to put in a spawn failure. Every opener goes through here,
+/// so htui's own secret variables are removed once, whichever builder made the command.
 fn opener_command(url: &str, opener: &OpenerCommand) -> (String, Command) {
-    match opener {
+    let (program, mut command) = match opener {
         OpenerCommand::Platform => platform_command(url),
         OpenerCommand::Custom(program) => {
             let mut command = Command::new(program);
             command.arg(url);
             (program.to_string_lossy().into_owned(), command)
         }
+    };
+    strip_own_env(&mut command);
+    (program, command)
+}
+
+/// MOD-158 D5 (`R-SEC-2`): removes htui's own secret variables from an opener, which hands the
+/// URL to code htui does not own (blueprint P-9b).
+fn strip_own_env(command: &mut Command) {
+    for key in htui_core::secret::HTUI_OWN_ENV {
+        command.env_remove(key);
     }
 }
 
@@ -184,4 +195,32 @@ fn platform_command(url: &str) -> (String, Command) {
         .env(OPEN_URL_VAR, url)
         .creation_flags(crate::launch::CREATE_NO_WINDOW);
     (program.to_owned(), command)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    /// MOD-158 D5 (`R-SEC-2`), P-9b: an opener hands the URL to whatever this box calls a
+    /// browser, which is no code htui owns, so htui's own secret variables are removed from it.
+    #[test]
+    fn every_opener_removes_htui_own_env() {
+        let url = "https://example.test/login";
+        let openers = [
+            opener_command(url, &OpenerCommand::Platform),
+            opener_command(url, &OpenerCommand::Custom(PathBuf::from("my-opener"))),
+        ];
+        for (program, command) in openers {
+            let envs: Vec<_> = command.as_std().get_envs().collect();
+            for key in htui_core::secret::HTUI_OWN_ENV {
+                assert!(
+                    envs.contains(&(OsStr::new(key), None)),
+                    "`{program}` does not remove {key}: {envs:?}"
+                );
+            }
+        }
+    }
 }

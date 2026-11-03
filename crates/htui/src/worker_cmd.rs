@@ -4,6 +4,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use htui_core::qdrant::QdrantUrl;
 use htui_mcp::search::ConceptSearch;
 use htui_store::pg::{CONNECT_TIMEOUT, PoolSize};
 use htui_store::secret::{self, DsnSources};
@@ -14,6 +15,14 @@ use zeroize::Zeroizing;
 
 use crate::cli::WorkerArgs;
 use crate::concepts;
+use crate::concepts_worker::{self, KeySource, Unresolved};
+
+/// MOD-158 D4: `--qdrant-key-stdin` was given and its line was blank, or missing. Not "nothing was
+/// read": with `--dsn-stdin` the DSN line before it was (MOD-158 R1, B-L5).
+const NO_KEY_ON_STDIN: &str = "no Qdrant API key on stdin: the key line was blank or missing";
+
+/// The DSN and, with `--qdrant-key-stdin`, the key line, both wiped when dropped.
+type StartupSecrets = (Zeroizing<String>, Option<Zeroizing<String>>);
 
 /// How `htui worker` ends (plan D14): `main` maps it to the exit code.
 #[derive(Debug)]
@@ -65,10 +74,11 @@ pub async fn run(args: WorkerArgs, log: Option<&Path>) -> Result<(), WorkerExit>
     ended
 }
 
-/// [`run`] once logging is up. The signal handlers go in first, and the startup (the DSN read,
-/// the keyring, the connect, the index job's keyring read) races them: installing a handler replaces the default termination,
-/// so a signal the startup did not watch would be swallowed until the loop began. A signal during
-/// the startup is a clean exit 0, with nothing written after it.
+/// [`run`] once logging is up. The signal handlers go in first, and the startup (the DSN and key
+/// reads, the keyring, the connect, the old keyring URL, the search gate's row read) races them:
+/// installing a handler replaces the default termination, so a signal the startup did not watch
+/// would be swallowed until the loop began. A signal during the startup is a clean exit 0, with
+/// nothing written after it.
 async fn serve(args: WorkerArgs) -> Result<(), WorkerExit> {
     let shutdown = shutdown_signal().map_err(|err| {
         WorkerExit::Refused(format!("the signal handlers could not be installed: {err}"))
@@ -76,10 +86,10 @@ async fn serve(args: WorkerArgs) -> Result<(), WorkerExit> {
     let mut shutdown = std::pin::pin!(shutdown);
     // Before any setting is read (PRD D7): the pool is the flag's, clamped.
     let pool = PoolSize::clamped(args.pool_size);
-    let dsn = tokio::select! {
+    let (dsn, key_line) = tokio::select! {
         biased;
         () = &mut shutdown => return stopped_before_ready(),
-        dsn = read_dsn_apart(args.dsn_stdin) => dsn?,
+        secrets = read_dsn_apart(args.dsn_stdin, args.qdrant_key_stdin) => secrets?,
     };
     let root = identity::config_root().map_err(|err| WorkerExit::Refused(err.to_string()))?;
     let pg = tokio::select! {
@@ -89,17 +99,36 @@ async fn serve(args: WorkerArgs) -> Result<(), WorkerExit> {
     };
     // Wiped here: nothing after the connect needs it.
     drop(dsn);
-    // Plan D19: the keyring's Qdrant URL, read once; the job shares the pool, never the runtime.
-    let index_job = tokio::select! {
+    // MOD-158 D4, D6: the process-wide index (the one `search_concepts` and the index job share)
+    // reads the `qdrant_url` row through this pool and the key through the headless sources.
+    let qdrant = concepts_worker::shared_qdrant();
+    qdrant.source().set_key_source(KeySource::Headless {
+        stdin: key_line,
+        credentials_dir: credentials_dir(),
+    });
+    qdrant.source().publish(Some(Arc::new(pg.clone())));
+    // MOD-158 D10: an old per-box keyring URL is said once; nothing reads it for anything else.
+    tokio::select! {
         biased;
         () = &mut shutdown => return stopped_before_ready(),
-        job = concepts::spawn_index_job(pg.clone()) => job,
+        old = concepts::apart("htui-worker-old-url", secret::get_qdrant_url) => {
+            log_old_keyring_url(old);
+        }
+    }
+    // MOD-158 D7 (Q3): `search_concepts` is offered when a URL resolves now, at start.
+    let gate = tokio::select! {
+        biased;
+        () = &mut shutdown => return stopped_before_ready(),
+        url = qdrant.source().url() => url,
     };
+    // MOD-158 D7: the job starts whatever the setting says and resolves it every cycle; it shares
+    // the pool, never the runtime.
+    let index_job = concepts::spawn_index_job(pg.clone());
     // MOD-11 D11: a worker that cannot host tools would fail every document phase, so it is
     // refused before it claims anything.
     let tools = htui_mcp::McpHost::new(pg.clone())
         .map_err(|err| WorkerExit::Refused(format!("htui's MCP tools cannot be hosted: {err}")))?;
-    let tools = match worker_search(index_job.is_some()) {
+    let tools = match worker_search(&gate) {
         Some(search) => tools.with_search(search),
         None => tools,
     };
@@ -110,25 +139,47 @@ async fn serve(args: WorkerArgs) -> Result<(), WorkerExit> {
         .with_secret_source(Arc::new(crate::secrets::KeyringInfisical::new()));
     tracing::info!(box_id = %pg.this_box(), pool = pool.get(), "htui worker ready");
     htui_worker::worker::run(pg, runtime, WorkerConfig::PRODUCTION, shutdown).await;
-    if let Some(job) = index_job {
-        job.abort();
-    }
+    index_job.abort();
     tracing::info!("htui worker stopped");
     Ok(())
 }
 
-/// The worker's `search_concepts` index (MOD-11 D12, blueprint B-14): `Some` exactly when the
-/// keyring holds the Qdrant URL `concepts::spawn_index_job` indexes into (`indexing`), so the
-/// sessions search what this worker keeps current; `None` leaves the tool unadvertised. The
-/// adapter reads that same keyring entry per search, as the TUI's does, and searches with the
-/// model the index job loaded: both take it from `concepts_worker::shared_qdrant` (H-26).
-fn worker_search(indexing: bool) -> Option<Arc<dyn ConceptSearch>> {
-    if indexing {
-        crate::mcp_search::production()
-    } else {
-        tracing::info!("search_concepts is not offered: no concepts index is configured");
-        None
+/// The worker's `search_concepts` index (MOD-11 D12, blueprint B-14, MOD-158 D7): `Some` exactly
+/// when a Qdrant URL resolved at worker start (`gate`, Q3), so the sessions search what this
+/// worker's index job keeps current; `None` leaves the tool unadvertised, with one `info` line
+/// saying why. The adapter resolves the URL and key per search, as the TUI's does, and searches
+/// with the model the index job loaded: both take it from `concepts_worker::shared_qdrant` (H-26).
+fn worker_search(gate: &Result<QdrantUrl, Unresolved>) -> Option<Arc<dyn ConceptSearch>> {
+    match gate {
+        Ok(_) => crate::mcp_search::production(),
+        Err(why) => {
+            tracing::info!("search_concepts is not offered: {why}");
+            None
+        }
     }
+}
+
+/// MOD-158 D10: the keyring's old `qdrant-url`, when there is one, is said once at `info`. A URL
+/// that is not a usable one is not printed: it may hold a password. A keyring that cannot be read
+/// (a service host has none) is no entry.
+fn log_old_keyring_url(old: Option<htui_core::store::Result<Option<String>>>) {
+    let Some(Ok(Some(old))) = old else {
+        return;
+    };
+    let shown = QdrantUrl::parse(&old).map_or_else(
+        |_| "a value that is not a usable URL".to_owned(),
+        |url| url.to_string(),
+    );
+    tracing::info!(
+        "this box's keyring holds an old Qdrant URL ({shown}) that htui no longer reads; use it \
+         for every box in Settings > Qdrant or with `htui --set-qdrant-url`"
+    );
+}
+
+/// `$CREDENTIALS_DIRECTORY`: the directory systemd decrypts the unit's credentials into, never a
+/// secret.
+fn credentials_dir() -> Option<PathBuf> {
+    std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from)
 }
 
 /// A signal won the race against the startup: a clean exit.
@@ -141,14 +192,15 @@ fn stopped_before_ready() -> Result<(), WorkerExit> {
     Ok(())
 }
 
-/// [`read_dsn`] on a thread of its own, so the startup can race it against a signal. Not
-/// `spawn_blocking`: the runtime waits for its blocking tasks when it is dropped, and a read of a
-/// stdin nobody closes never ends. The thread is left behind on a signal and dies with the process.
-async fn read_dsn_apart(dsn_stdin: bool) -> Result<Zeroizing<String>, WorkerExit> {
+/// [`read_startup_secrets`] on a thread of its own, so the startup can race it against a signal.
+/// Not `spawn_blocking`: the runtime waits for its blocking tasks when it is dropped, and a read
+/// of a stdin nobody closes never ends. The thread is left behind on a signal and dies with the
+/// process. The key line (MOD-158 D4) is read on the same thread, after the DSN.
+async fn read_dsn_apart(dsn_stdin: bool, key_stdin: bool) -> Result<StartupSecrets, WorkerExit> {
     let (answer, answered) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name("htui-worker-dsn".to_owned())
-        .spawn(move || drop(answer.send(read_dsn(dsn_stdin))))
+        .spawn(move || drop(answer.send(read_startup_secrets(dsn_stdin, key_stdin))))
         .map_err(|err| WorkerExit::Refused(format!("the DSN could not be read: {err}")))?;
     answered.await.unwrap_or_else(|_| {
         Err(WorkerExit::Refused(
@@ -157,19 +209,53 @@ async fn read_dsn_apart(dsn_stdin: bool) -> Result<Zeroizing<String>, WorkerExit
     })
 }
 
-/// PRD D3's sources, in order. The prompt goes to stderr, and only when stdin is a terminal.
-fn read_dsn(dsn_stdin: bool) -> Result<Zeroizing<String>, WorkerExit> {
-    let credentials = std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from);
+/// [`read_startup_secrets_from`] over this process's stdin. A prompt goes to stderr, and only when
+/// stdin is a terminal.
+fn read_startup_secrets(dsn_stdin: bool, key_stdin: bool) -> Result<StartupSecrets, WorkerExit> {
+    let credentials = credentials_dir();
     let stdin = std::io::stdin();
-    if dsn_stdin && std::io::IsTerminal::is_terminal(&stdin) {
-        eprintln!("paste the DSN and press Enter (it will be visible):");
-    }
+    let terminal = std::io::IsTerminal::is_terminal(&stdin);
     let mut lock = stdin.lock();
-    secret::headless_dsn(DsnSources {
-        stdin: dsn_stdin.then_some(&mut lock as &mut dyn std::io::BufRead),
-        credentials_dir: credentials.as_deref(),
+    read_startup_secrets_from(
+        &mut lock,
+        dsn_stdin,
+        key_stdin,
+        credentials.as_deref(),
+        &mut |what| {
+            if terminal {
+                eprintln!("paste the {what} and press Enter (it will be visible):");
+            }
+        },
+    )
+}
+
+/// PRD D3's DSN sources, in order, then (MOD-158 D4) with `key_stdin` the next line of `input` as
+/// the Qdrant API key: a blank line or end of input is a refusal, never a fall-through. `prompt`
+/// is told what is about to be read from `input`.
+fn read_startup_secrets_from(
+    input: &mut dyn std::io::BufRead,
+    dsn_stdin: bool,
+    key_stdin: bool,
+    credentials_dir: Option<&Path>,
+    prompt: &mut dyn FnMut(&str),
+) -> Result<StartupSecrets, WorkerExit> {
+    if dsn_stdin {
+        prompt("DSN");
+    }
+    let dsn = secret::headless_dsn(DsnSources {
+        stdin: dsn_stdin.then_some(&mut *input),
+        credentials_dir,
     })
-    .map_err(|err| WorkerExit::Refused(err.to_string()))
+    .map_err(|err| WorkerExit::Refused(err.to_string()))?;
+    if !key_stdin {
+        return Ok((dsn, None));
+    }
+    prompt("Qdrant API key");
+    // The DSN's reader: one line, trimmed, in a buffer wiped when dropped.
+    let key = secret::read_dsn_line(input)
+        .map_err(|err| WorkerExit::Refused(format!("stdin could not be read: {err}")))?
+        .ok_or_else(|| WorkerExit::Refused(NO_KEY_ON_STDIN.to_owned()))?;
+    Ok((dsn, Some(key)))
 }
 
 /// The headless connect and the registration write-back (plan D14): every refusal before any
@@ -257,7 +343,13 @@ fn shutdown_signal() -> std::io::Result<impl Future<Output = ()> + Send + 'stati
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkerExit, worker_search};
+    use std::io::Cursor;
+
+    use htui_core::qdrant::QdrantUrl;
+    use htui_store::secret;
+
+    use super::{WorkerExit, read_startup_secrets_from, worker_search};
+    use crate::concepts_worker::Unresolved;
 
     /// Plan D14: a startup refusal exits 2, a failure after start exits 1.
     #[test]
@@ -266,10 +358,64 @@ mod tests {
         assert_eq!(WorkerExit::Failed("lost".to_owned()).code(), 1);
     }
 
-    /// MOD-11 D12, B-14: the worker offers `search_concepts` only where it has a concepts index.
+    /// MOD-11 D12, B-14, MOD-158 D7 (Q3): the worker offers `search_concepts` only where a Qdrant
+    /// URL resolved at its start.
     #[test]
-    fn the_worker_searches_only_where_it_indexes() {
-        assert!(worker_search(true).is_some());
-        assert!(worker_search(false).is_none());
+    fn the_worker_offers_search_only_where_a_url_resolves_at_start() {
+        let url = QdrantUrl::parse("http://qdrant:6334").expect("a valid URL");
+        assert!(worker_search(&Ok(url)).is_some());
+        assert!(worker_search(&Err(Unresolved::NoUrl)).is_none());
+        assert!(worker_search(&Err(Unresolved::Offline)).is_none());
+    }
+
+    /// The secrets `--dsn-stdin` and `--qdrant-key-stdin` read, in that order, with no prompt.
+    fn read(
+        input: &str,
+        dsn_stdin: bool,
+        key_stdin: bool,
+    ) -> Result<(String, Option<String>), WorkerExit> {
+        let mut input = Cursor::new(input.as_bytes().to_vec());
+        read_startup_secrets_from(&mut input, dsn_stdin, key_stdin, None, &mut |_| {}).map(
+            |(dsn, key)| {
+                (
+                    dsn.as_str().to_owned(),
+                    key.map(|key| key.as_str().to_owned()),
+                )
+            },
+        )
+    }
+
+    /// MOD-158 D4: with both flags the DSN is the first line and the key the second, trimmed.
+    #[test]
+    fn the_key_line_is_read_after_the_dsn_line() {
+        let (dsn, key) = read("postgres://db/htui\n  the-key \nrest\n", true, true).expect("both");
+        assert_eq!(dsn, "postgres://db/htui");
+        assert_eq!(key.as_deref(), Some("the-key"));
+        let (_, key) = read("postgres://db/htui\n", true, false).expect("the DSN alone");
+        assert_eq!(key, None, "no flag, no key line read");
+    }
+
+    /// MOD-158 D4: a blank key line, or none, is a refusal, never a fall-through.
+    #[test]
+    fn a_blank_key_line_is_a_refusal() {
+        for input in ["postgres://db/htui\n \n", "postgres://db/htui\n"] {
+            let refused = read(input, true, true).expect_err("no key on stdin");
+            assert!(matches!(refused, WorkerExit::Refused(_)), "{refused:?}");
+            assert_eq!(
+                refused.to_string(),
+                "no Qdrant API key on stdin: the key line was blank or missing"
+            );
+        }
+    }
+
+    /// MOD-158 D4: `--qdrant-key-stdin` alone reads the key from the first line and leaves the DSN
+    /// to the keyring. The keyring fake is one process-wide slot: run under `--test-threads=1`.
+    #[tokio::test]
+    async fn the_key_line_alone_leaves_the_dsn_to_the_keyring() {
+        let _keyring = htui_store::testkit::mock_keyring().await;
+        secret::set_dsn("postgres://keyring/htui").expect("the fake keyring stores");
+        let (dsn, key) = read("the-key\n", false, true).expect("the keyring's DSN");
+        assert_eq!(dsn, "postgres://keyring/htui");
+        assert_eq!(key.as_deref(), Some("the-key"));
     }
 }

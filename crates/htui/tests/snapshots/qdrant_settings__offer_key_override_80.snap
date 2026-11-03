@@ -1,0 +1,9 @@
+---
+source: crates/htui/tests/qdrant_settings.rs
+expression: frame
+---
+ URL       not set · for every box
+ old URL   this box's keyring holds http://old.example:6334 from before: u uses
+           it for every box, c discards it
+▌API key   •••••••• stored
+           HTUI_QDRANT_API_KEY is in force in this process

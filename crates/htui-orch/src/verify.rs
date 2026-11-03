@@ -367,11 +367,13 @@ impl ShellVerifier {
         step: StepId,
     ) -> VerifyReport {
         let started_at = self.clock.now();
-        // The process environment is handed to the child unchanged (plan D30). ANA-2 `:493` asks
-        // for "the agent's environment minus the secrets", and that is what this is: a resolved
-        // secret reaches an agent only through `SessionSpec.env` (MOD-10 D12), never this process's
-        // own environment, which htui cannot change (`set_var` is `unsafe`, `unsafe_code` is
-        // forbidden; MOD-10 D19).
+        // The process environment is handed to the child minus htui's own secret variables
+        // (plan D30; MOD-158 D5, `R-SEC-2`). ANA-2 `:493` asks for "the agent's environment minus
+        // the secrets", and that is what this is: a resolved secret reaches an agent only through
+        // `SessionSpec.env` (MOD-10 D12), never this process's own environment, and the one
+        // secret htui itself may hold there (`HTUI_QDRANT_API_KEY`, `HTUI_OWN_ENV`) is removed at
+        // this spawn, because htui cannot remove it from its own environment (`set_var` and
+        // `remove_var` are `unsafe`, `unsafe_code` is forbidden; MOD-10 D19).
         let build = || {
             let mut shell = tokio::process::Command::new(&self.shell);
             shell
@@ -382,6 +384,9 @@ impl ShellVerifier {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
+            for key in htui_core::secret::HTUI_OWN_ENV {
+                shell.env_remove(key);
+            }
             shell
         };
 
@@ -535,12 +540,12 @@ pub struct ShellRun {
 }
 
 /// MOD-11 OQ-7 (blueprint B-15): runs `command` through the platform shell in `cwd` with the
-/// process environment unchanged, both pipes drained into one tail, until it exits, `budget`
-/// elapses, or `stop` resolves — each of the three kills the whole process group (job object on
-/// Windows), so a `cargo test`'s test binaries die with it, and a background child the shell left
-/// behind does not outlive the call (R1 M1: after an exit the pipes get `PIPE_GRACE`, then the
-/// output read so far is the answer). Infallible: a shell that cannot start is
-/// [`ShellEnd::SpawnFailed`].
+/// process environment minus htui's own secret variables (`HTUI_OWN_ENV`, MOD-158 D5), both
+/// pipes drained into one tail, until it exits, `budget` elapses, or `stop` resolves — each of
+/// the three kills the whole process group (job object on Windows), so a `cargo test`'s test
+/// binaries die with it, and a background child the shell left behind does not outlive the call
+/// (R1 M1: after an exit the pipes get `PIPE_GRACE`, then the output read so far is the answer).
+/// Infallible: a shell that cannot start is [`ShellEnd::SpawnFailed`].
 pub async fn run_shell(
     command: &str,
     cwd: &Path,
@@ -558,6 +563,9 @@ pub async fn run_shell(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        for key in htui_core::secret::HTUI_OWN_ENV {
+            child.env_remove(key);
+        }
         child
     };
     let mut child = match spawn_supervised(build) {
@@ -754,6 +762,68 @@ mod shell_tests {
     /// A `stop` that never fires.
     async fn never() {
         std::future::pending::<()>().await;
+    }
+
+    /// The value the MOD-158 D5 cases plant. Never a real key.
+    #[cfg(unix)]
+    pub(super) const QDRANT_KEY_SENTINEL: &str = "SENTINEL-QK";
+
+    /// The shell line the D5 cases run: the key if the shell sees it, `absent` if not.
+    #[cfg(unix)]
+    pub(super) const PRINT_THE_KEY: &str = "printenv HTUI_QDRANT_API_KEY || echo absent";
+
+    /// MOD-158 D5: a test cannot plant a variable in its own process (`set_var` is `unsafe`,
+    /// `unsafe_code = "forbid"`), so it re-runs itself, alone, as a child test binary that
+    /// inherits `HTUI_QDRANT_API_KEY`, and the child does the spawn and asserts
+    /// (`htui/src/editor.rs`'s pattern). Answers `true` in the parent, which must then return;
+    /// `false` in the child, which must then run the case.
+    #[cfg(unix)]
+    pub(super) fn reran_with_the_qdrant_key(name: &str) -> bool {
+        const CHILD: &str = "HTUI_ORCH_VERIFY_TEST_ENV_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert_eq!(
+                std::env::var(htui_core::secret::QDRANT_KEY_ENV).as_deref(),
+                Ok(QDRANT_KEY_SENTINEL),
+                "the child inherits the key, so without the strip the shell would see it"
+            );
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([name, "--exact", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env(htui_core::secret::QDRANT_KEY_ENV, QDRANT_KEY_SENTINEL)
+            .output()
+            .expect("re-run the test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A filter that matched nothing would also succeed.
+        assert!(stdout.contains("1 passed"), "child ran no test:\n{stdout}");
+        true
+    }
+
+    /// MOD-158 D5 (`R-SEC-2`): a step or tool shell never sees htui's own secret variables,
+    /// though it inherits the rest of the process environment.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_shell_hides_an_inherited_htui_qdrant_api_key() {
+        if reran_with_the_qdrant_key(
+            "verify::shell_tests::run_shell_hides_an_inherited_htui_qdrant_api_key",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("a scratch dir");
+        let ran = run_shell(PRINT_THE_KEY, dir.path(), Duration::from_secs(30), never()).await;
+        assert_eq!((ran.exit_code, ran.ended), (Some(0), ShellEnd::Exited));
+        assert!(ran.output.contains("absent"), "{:?}", ran.output);
+        assert!(
+            !ran.output.contains(QDRANT_KEY_SENTINEL),
+            "{:?}",
+            ran.output
+        );
     }
 
     /// MOD-11 OQ-7: an exit code and both pipes, merged, in `cwd`.
@@ -992,6 +1062,8 @@ mod tests {
     use htui_core::model::{StepId, VerifyOutcome};
     use htui_core::scrub::MinimalScrubber;
 
+    #[cfg(unix)]
+    use super::shell_tests::{PRINT_THE_KEY, QDRANT_KEY_SENTINEL, reran_with_the_qdrant_key};
     use super::{ShellVerifier, Verifier, VerifyRequest};
     use crate::isolate::SystemClock;
 
@@ -1039,6 +1111,30 @@ mod tests {
             })
             .await;
         assert_eq!(report, None, "a phase with no verify_command is not a run");
+    }
+
+    /// MOD-158 D5 (`R-SEC-2`): a phase's `verify_command` never sees htui's own secret
+    /// variables, though it inherits the rest of the process environment.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_verify_command_never_sees_htui_qdrant_api_key() {
+        if reran_with_the_qdrant_key(
+            "verify::tests::a_verify_command_never_sees_htui_qdrant_api_key",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let report = verifier()
+            .run(request(PRINT_THE_KEY, dir.path().to_path_buf()))
+            .await
+            .expect("a report");
+        assert_eq!(report.outcome, VerifyOutcome::Pass, "{report:?}");
+        assert!(report.output.contains("absent"), "{:?}", report.output);
+        assert!(
+            !report.output.contains(QDRANT_KEY_SENTINEL),
+            "{:?}",
+            report.output
+        );
     }
 
     /// `docs/ANA-2.md:512`: exit 0 is `pass`, and the code that says so is recorded.

@@ -15,6 +15,7 @@ use std::time::Duration;
 use htui_core::model::{ProjectRef, Scope, StepId};
 use htui_core::store::MemStore;
 use htui_store::Backend;
+use htui_store::secret::QdrantEnv;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -82,6 +83,9 @@ pub struct Harness {
     term: Terminal<TestBackend>,
     /// Overlays queued by [`Harness::with_overlay`], pushed once the startup scope is settled.
     pending: VecDeque<Box<dyn Overlay>>,
+    /// The `HTUI_QDRANT_*` overrides the Settings > Qdrant requests are served under: none unless
+    /// a test hands some in (blueprint P-13), never this process's.
+    qdrant_env: QdrantEnv,
 }
 
 impl core::fmt::Debug for Harness {
@@ -147,6 +151,7 @@ impl Harness {
             store_state: None,
             term: terminal(width, height),
             pending: VecDeque::new(),
+            qdrant_env: QdrantEnv::default(),
         }
     }
 
@@ -179,6 +184,14 @@ impl Harness {
     #[must_use]
     pub fn with_concepts_runtime(mut self, runtime: ConceptsRuntime) -> Self {
         self.concepts = Some(runtime);
+        self
+    }
+
+    /// Serves the Settings > Qdrant requests under `env`, the overrides a test hands in, rather
+    /// than none (blueprint P-13: no test reads `HTUI_QDRANT_*` from its process).
+    #[must_use]
+    pub fn with_qdrant_env(mut self, env: QdrantEnv) -> Self {
+        self.qdrant_env = env;
         self
     }
 
@@ -397,7 +410,10 @@ impl Harness {
                             None => store_worker::serve(&self.backend, &envelope.request).await,
                         }
                     }
-                    (request, _) => store_worker::serve(&self.backend, request).await,
+                    (request, _) => {
+                        store_worker::serve_with_qdrant_env(&self.backend, request, &self.qdrant_env)
+                            .await
+                    }
                 };
                 self.app.update(Action::Reply(ReplyEnvelope {
                     seq: envelope.seq,
@@ -590,7 +606,14 @@ impl Harness {
                             below_target: None,
                         }
                     }
-                    (request, _) => store_worker::serve(&self.backend, request).await,
+                    (request, _) => {
+                        store_worker::serve_with_qdrant_env(
+                            &self.backend,
+                            request,
+                            &self.qdrant_env,
+                        )
+                        .await
+                    }
                 };
                 self.app.update(Action::Reply(ReplyEnvelope {
                     seq: envelope.seq,

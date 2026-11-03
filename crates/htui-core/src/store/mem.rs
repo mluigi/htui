@@ -57,6 +57,7 @@ use crate::model::{EdgeId, GraphBody, GraphScope, NodeBody, PhasePart, StepGraph
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
 use crate::prompt::template::TemplateRole;
+use crate::qdrant::{QDRANT_URL_KEY, QdrantUrl, StoredQdrantUrl};
 use crate::seed;
 use crate::store::error::{Result, StoreError};
 use crate::store::graph_rules::{
@@ -260,6 +261,9 @@ struct State {
     /// [`WriteStore::setting`] with a token at all. Empty unless something wrote it: no fixture
     /// loads it.
     app_settings: BTreeMap<String, (Value, DateTime<Utc>)>,
+    /// The last token [`MemStore::set_qdrant_url`] handed out (MOD-158 R1), kept across a clear so
+    /// an insert after one still moves past every spent token under a clock that does not move.
+    qdrant_url_last_token: Option<DateTime<Utc>>,
     /// `agent`, read by the inherent [`MemStore::agents`] (MOD-2 plan D3).
     agents: HashMap<AgentId, Agent>,
     /// `agent_box`, keyed as its composite primary key is. Empty until something probes a box:
@@ -417,6 +421,7 @@ impl MemStore {
             box_tools: data.box_tools,
             box_probe_digests: HashMap::new(),
             app_settings: BTreeMap::new(),
+            qdrant_url_last_token: None,
             agents: data.agents.into_iter().map(|row| (row.id, row)).collect(),
             agent_boxes: HashMap::new(),
             agent_boxes_off: HashSet::new(),
@@ -686,6 +691,74 @@ impl MemStore {
     pub fn set_app_setting(&self, key: &str, value: Value) {
         let now = self.now();
         self.write(|state| state.app_settings.insert(key.to_owned(), (value, now)));
+    }
+
+    /// MOD-158 D1: the `qdrant_url` row, malformed or not (blueprint P-3); `None` when there is
+    /// none.
+    ///
+    /// # Errors
+    ///
+    /// Never; the signature matches `PgStore`'s.
+    pub async fn qdrant_url(&self) -> Result<Option<StoredQdrantUrl>> {
+        Ok(self.read(State::qdrant_url))
+    }
+
+    /// MOD-158 D1: the URL's compare-and-set. `expected: None` means "I expect no row". Answers
+    /// `Applied(Some(row))`, or `Stale(current)`, where `current` is `None` when the row is gone
+    /// (blueprint P-4); never `NotFound`.
+    ///
+    /// # Errors
+    ///
+    /// Never; the signature matches `PgStore`'s.
+    pub async fn set_qdrant_url(
+        &self,
+        url: &QdrantUrl,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<Option<StoredQdrantUrl>>> {
+        let now = self.now();
+        Ok(self.write(|state| {
+            let current = state.qdrant_url();
+            if current.as_ref().map(|row| row.token) != expected {
+                return CasOutcome::Stale(current);
+            }
+            // The token moves past every one handed out before, the row's and a cleared row's
+            // alike, even under a clock that does not move (a test's), so a spent token never
+            // matches the row again (MOD-158 R1). One microsecond is `timestamptz`'s resolution,
+            // the same as Postgres's `updated_at`.
+            let floor = expected.max(state.qdrant_url_last_token);
+            let now = match floor {
+                Some(old) if now <= old => old + TimeDelta::microseconds(1),
+                _ => now,
+            };
+            state.qdrant_url_last_token = Some(now);
+            state
+                .app_settings
+                .insert(QDRANT_URL_KEY.to_owned(), (url.to_value(), now));
+            CasOutcome::Applied(Some(StoredQdrantUrl {
+                url: Ok(url.clone()),
+                token: now,
+            }))
+        }))
+    }
+
+    /// MOD-158 D1: removes the `qdrant_url` row whose token is `expected`: `Applied(None)`, or
+    /// `Stale(current)` (blueprint P-4).
+    ///
+    /// # Errors
+    ///
+    /// Never; the signature matches `PgStore`'s.
+    pub async fn clear_qdrant_url(
+        &self,
+        expected: DateTime<Utc>,
+    ) -> Result<CasOutcome<Option<StoredQdrantUrl>>> {
+        Ok(self.write(|state| {
+            let current = state.qdrant_url();
+            if current.as_ref().map(|row| row.token) != Some(expected) {
+                return CasOutcome::Stale(current);
+            }
+            state.app_settings.remove(QDRANT_URL_KEY);
+            CasOutcome::Applied(None)
+        }))
     }
 
     /// Replaces one project's `settings` blob without validation. **Tests only** — same reason as
@@ -4941,6 +5014,13 @@ impl State {
                     token: QueueToken::EditVersion(row.edit_version),
                 }),
         }
+    }
+
+    /// MOD-158 D1: the `qdrant_url` row as [`StoredQdrantUrl`] reads it.
+    fn qdrant_url(&self) -> Option<StoredQdrantUrl> {
+        self.app_settings
+            .get(QDRANT_URL_KEY)
+            .map(|(value, token)| StoredQdrantUrl::from_row(value, *token))
     }
 
     /// Writes (`Some`) or clears (`None`) one queue key (MOD-12 M2 D9): the target and token
@@ -10469,6 +10549,78 @@ mod tests {
     use chrono::{SubsecRound as _, TimeDelta, Utc};
     use serde_json::{Value, json};
     use uuid::Uuid;
+
+    /// MOD-158 R1 (A-L6): under a clock that does not move, a write still moves the `qdrant_url`
+    /// token past the old one, so a spent token never matches the row again.
+    #[tokio::test]
+    async fn a_qdrant_url_write_moves_the_token_under_a_frozen_clock() {
+        use crate::qdrant::QdrantUrl;
+
+        let store = MemStore::default().with_clock(Arc::new(TestClock::new()));
+        let url = |text: &str| QdrantUrl::parse(text).expect("a valid URL");
+        let first = match store
+            .set_qdrant_url(&url("http://first:6334"), None)
+            .await
+            .expect("insert")
+        {
+            CasOutcome::Applied(Some(row)) => row,
+            other => panic!("insert expecting none: {other:?}"),
+        };
+        let second = match store
+            .set_qdrant_url(&url("http://second:6334"), Some(first.token))
+            .await
+            .expect("update")
+        {
+            CasOutcome::Applied(Some(row)) => row,
+            other => panic!("update by token: {other:?}"),
+        };
+        assert!(second.token > first.token, "{second:?} after {first:?}");
+        assert_eq!(
+            store.qdrant_url().await.expect("read").map(|row| row.token),
+            Some(second.token),
+            "the read answers the moved token"
+        );
+        match store
+            .set_qdrant_url(&url("http://third:6334"), Some(first.token))
+            .await
+            .expect("stale update")
+        {
+            CasOutcome::Stale(Some(row)) => assert_eq!(row, second),
+            other => panic!("a spent token is stale: {other:?}"),
+        }
+        match store.clear_qdrant_url(first.token).await.expect("clear") {
+            CasOutcome::Stale(Some(row)) => assert_eq!(row, second),
+            other => panic!("a spent token clears nothing: {other:?}"),
+        }
+        // A clear forgets the row, not its token: the next insert's token is past every spent one,
+        // so a stale clear holding the cleared row's token cannot remove the new URL.
+        match store.clear_qdrant_url(second.token).await.expect("clear") {
+            CasOutcome::Applied(None) => {}
+            other => panic!("a clear by the current token: {other:?}"),
+        }
+        let fourth = match store
+            .set_qdrant_url(&url("http://fourth:6334"), None)
+            .await
+            .expect("insert after a clear")
+        {
+            CasOutcome::Applied(Some(row)) => row,
+            other => panic!("insert after a clear: {other:?}"),
+        };
+        assert!(fourth.token > second.token, "{fourth:?} after {second:?}");
+        match store
+            .clear_qdrant_url(second.token)
+            .await
+            .expect("stale clear")
+        {
+            CasOutcome::Stale(Some(row)) => assert_eq!(row, fourth),
+            other => panic!("the cleared row's token clears nothing: {other:?}"),
+        }
+        assert_eq!(
+            store.qdrant_url().await.expect("read"),
+            Some(fourth),
+            "the new URL survives the stale clear"
+        );
+    }
 
     /// MOD-76 D4 (R-55): `set_box_setting` writes the key on every clone's row, leaves the
     /// other keys and `edit_version` alone, and answers whether the row exists.

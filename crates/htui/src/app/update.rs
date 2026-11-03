@@ -264,6 +264,7 @@ impl App {
             self.status = Some(reason);
             self.dirty = true;
         }
+        self.say_qdrant_offer();
         if self.ticks.is_multiple_of(TICKS_PER_REFRESH) {
             self.dispatch(Origin::App, StoreRequest::StoreState);
             if !self.scope.is_empty() {
@@ -443,12 +444,19 @@ impl App {
 
     /// Whether the tab a refused `request` was issued from draws it itself
     /// ([`Tab::absorbs_failure`]). The shell's and an overlay's refusals are always the line's.
+    ///
+    /// One shell request is not the line's either: the launch's old-URL check (MOD-158 R1, C-L7),
+    /// which the user never asked for. Its refusal is logged at `debug` instead.
     fn absorbed(&mut self, origin: &Origin, request: &str) -> bool {
         match origin {
             Origin::Tab(id) => self
                 .tabs
                 .by_id_mut(*id)
                 .is_some_and(|tab| tab.absorbs_failure(request)),
+            Origin::App if request == StoreRequest::QdrantOldUrlCheck.name() => {
+                tracing::debug!("the launch's old Qdrant URL check was refused; nothing is said");
+                true
+            }
             Origin::App | Origin::Overlay(_) => false,
         }
     }
@@ -524,6 +532,15 @@ impl App {
         self.update(Action::Overlay(OverlayAction::Open(id)));
     }
 
+    /// Says the waiting old-URL offer (MOD-158 D10) once the status line is free.
+    fn say_qdrant_offer(&mut self) {
+        if self.qdrant_offer_pending && self.status.is_none() {
+            self.qdrant_offer_pending = false;
+            self.status = Some(QDRANT_OFFER_NOTICE.to_owned());
+            self.dirty = true;
+        }
+    }
+
     /// Says once per session that this build is below the database's target version (MOD-40
     /// plan D9, PRD D3): a TUI warns and runs, where a headless process refuses.
     fn note_below_target(&mut self, target: &str) {
@@ -591,8 +608,25 @@ impl App {
                 ConnectionSection::ID,
             )));
         }
+
+        // MOD-158 D10: this box's keyring still holds the retired Qdrant URL. Said once per launch,
+        // for `below_target_shown`'s reason; the offer itself is the section's row. It never
+        // displaces a notice already on the line (the below-target warning, the ui-state load
+        // notice: each said once): it waits, and `on_tick` says it once the line is clear.
+        if let StoreReply::QdrantOldUrl(true) = reply
+            && !self.qdrant_offer_noted
+        {
+            self.qdrant_offer_noted = true;
+            self.qdrant_offer_pending = true;
+            self.say_qdrant_offer();
+        }
     }
 }
+
+/// The status line's old-URL sentence (MOD-158 D10). It promises no action (R1, C-L3): the old URL
+/// can be used for every box only while no URL is set and it parses; otherwise only discarded.
+pub(crate) const QDRANT_OFFER_NOTICE: &str =
+    "this box's keyring holds an old Qdrant URL that is no longer read; see Settings > Qdrant";
 
 /// The status line's below-the-target sentence (MOD-40 plan D9).
 fn below_target_notice(target: &str) -> String {
@@ -1123,6 +1157,146 @@ mod tests {
             app.status, None,
             "said once per session, not every fourth tick"
         );
+    }
+
+    /// The old-URL check `start` sent, if any: its `seq`. Never the whole `QdrantInfo`
+    /// (MOD-158 R1, C-M2): the launch reads the retired keyring entry and nothing else.
+    fn qdrant_info_seq(rx: &mut UnboundedReceiver<RequestEnvelope>) -> Option<u64> {
+        let mut found = None;
+        while let Ok(envelope) = rx.try_recv() {
+            assert!(
+                !matches!(envelope.request, StoreRequest::QdrantInfo),
+                "start never reads the whole Qdrant snapshot"
+            );
+            if matches!(envelope.request, StoreRequest::QdrantOldUrlCheck) {
+                assert_eq!(envelope.origin, Origin::App, "the shell's own read");
+                found = Some(envelope.seq);
+            }
+        }
+        found
+    }
+
+    /// The old-URL check's answer addressed to the shell, with or without an old keyring URL.
+    fn qdrant_reply(seq: u64, old_url: bool) -> ReplyEnvelope {
+        ReplyEnvelope {
+            seq,
+            origin: Origin::App,
+            reply: StoreReply::QdrantOldUrl(old_url),
+        }
+    }
+
+    /// MOD-158 R1 (C-L7): the launch's check is one the user never asked for, so its refusal (a
+    /// keyring task that failed to join) is logged, never put on the status line.
+    #[test]
+    fn a_failed_launch_check_stays_off_the_status_line() {
+        let (mut app, mut rx, _seen) = shell();
+        app.qdrant_offer_check = true;
+        app.start();
+        let seq = qdrant_info_seq(&mut rx).expect("start asked");
+        app.update(Action::Reply(ReplyEnvelope {
+            seq,
+            origin: Origin::App,
+            reply: StoreReply::Failed {
+                request: "qdrant_old_url_check",
+                message: "keyring task failed: panicked".to_owned(),
+            },
+        }));
+        assert_eq!(app.status, None, "{:?}", app.status);
+    }
+
+    /// MOD-158 R1 (C-L3): the notice is true whether the old URL can be used for every box or
+    /// only discarded: it names the section, not an action it may not offer.
+    #[test]
+    fn the_offer_notice_promises_no_action() {
+        assert!(QDRANT_OFFER_NOTICE.contains("Settings > Qdrant"));
+        assert!(
+            !QDRANT_OFFER_NOTICE.contains("use it"),
+            "{QDRANT_OFFER_NOTICE}"
+        );
+        assert!(
+            !QDRANT_OFFER_NOTICE.contains("for every box"),
+            "{QDRANT_OFFER_NOTICE}"
+        );
+    }
+
+    /// MOD-158 D10, blueprint P-6: `start` asks for the Qdrant snapshot only once `register_all`
+    /// has run, as the binary does; a bare shell (every test harness) never reads a keyring for it.
+    #[test]
+    fn start_asks_for_the_offer_only_after_register_all() {
+        let (mut app, mut rx, _seen) = shell();
+        app.start();
+        assert_eq!(qdrant_info_seq(&mut rx), None, "a bare shell asks nothing");
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx);
+        crate::app::register_all(&mut app);
+        app.start();
+        assert!(
+            qdrant_info_seq(&mut rx).is_some(),
+            "after register_all, start asks"
+        );
+    }
+
+    /// MOD-158 D10: an old keyring URL is said once per launch on the status line, and a snapshot
+    /// without one says nothing.
+    #[test]
+    fn the_qdrant_offer_is_said_once_per_launch() {
+        let (mut app, mut rx, _seen) = shell();
+        app.qdrant_offer_check = true;
+        app.start();
+        let seq = qdrant_info_seq(&mut rx).expect("start asked");
+
+        app.update(Action::Reply(qdrant_reply(seq, false)));
+        assert_eq!(app.status, None, "no old URL, no notice");
+
+        app.update(Action::Reply(qdrant_reply(seq, true)));
+        assert_eq!(app.status.as_deref(), Some(QDRANT_OFFER_NOTICE));
+        assert!(
+            QDRANT_OFFER_NOTICE.contains("Settings > Qdrant"),
+            "{QDRANT_OFFER_NOTICE}"
+        );
+
+        app.on_key(KeyEvent::from(KeyCode::Char('x')));
+        assert_eq!(app.status, None, "the next key clears it");
+        app.update(Action::Reply(qdrant_reply(seq, true)));
+        assert_eq!(app.status, None, "said once per launch");
+    }
+
+    /// MOD-158 D10, repair 1: the offer never displaces a notice already on the line (the
+    /// below-target warning or the ui-state load notice, each said once per launch). It waits for
+    /// the line to clear and is said on the next tick after that, still once.
+    #[test]
+    fn the_qdrant_offer_waits_for_a_busy_status_line() {
+        let (mut app, mut rx, _seen) = shell();
+        app.qdrant_offer_check = true;
+        app.start();
+        let seq = qdrant_info_seq(&mut rx).expect("start asked");
+
+        app.note_below_target("9.9.9");
+        let below = app.status.clone().expect("the below-target warning");
+
+        app.update(Action::Reply(qdrant_reply(seq, true)));
+        assert_eq!(
+            app.status.as_deref(),
+            Some(below.as_str()),
+            "the warning stays"
+        );
+        app.update(Action::Tick);
+        assert_eq!(app.status.as_deref(), Some(below.as_str()), "still busy");
+
+        app.on_key(KeyEvent::from(KeyCode::Char('x')));
+        assert_eq!(app.status, None, "the key clears the warning");
+        app.update(Action::Tick);
+        assert_eq!(
+            app.status.as_deref(),
+            Some(QDRANT_OFFER_NOTICE),
+            "then the offer"
+        );
+
+        app.on_key(KeyEvent::from(KeyCode::Char('x')));
+        app.update(Action::Tick);
+        app.update(Action::Reply(qdrant_reply(seq, true)));
+        assert_eq!(app.status, None, "said once per launch");
     }
 
     /// MOD-4 plan D165: the promotion is asked for on the chat-driving tab's behalf, so its replies
