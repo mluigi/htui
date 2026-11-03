@@ -2,7 +2,7 @@
 source: crates/htui/tests/backlog.rs
 expression: frame
 ---
-Platform   ¹Backlog        1 working · 1 waiting · memory ·  F9  about   ?  keys
+Platform   ¹Backlog        2 working · 2 waiting · memory ·  F9  about   ?  keys
 ╭─ Backlog (11) ───────────────────────────╮╭─ FEAT-1 · TUI scaffold ─── Body ›╮
 │ ▾ htui (8)                               ││◐ running · rust · priority 2     │
 │  ANA-1    ● done       Data model, box r…││version 1                         │

@@ -9,7 +9,7 @@
 //! the band, the `…` cut), each status `kit::status`'s glyph and word, the active filter the
 //! summary band (`kit::filter`), an empty list `kit::empty`'s with a next step.
 
-use htui_core::model::{ItemId, ItemSummary, ProjectId, ProjectRef, Status};
+use htui_core::model::{ItemId, ItemState, ItemSummary, ProjectId, ProjectRef};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -26,6 +26,7 @@ use crate::ui::kit::status;
 use crate::ui::tabs::backlog::Chrome;
 
 /// Two spaces between the columns of an item row, as in the blueprint's `KEY  status  title`.
+/// The status column is the item's [`ItemState`](htui_core::model::ItemState) mark (MOD-144).
 const GAP: usize = 2;
 
 /// The empty list without a filter.
@@ -223,9 +224,9 @@ fn empty_state(view: &ListView<'_>) -> (&'static str, String) {
     }
 }
 
-/// The cells `status`'s mark takes: its glyph, a blank and its word.
-fn mark_width(status: Status) -> usize {
-    let mark = status::mark(status);
+/// The cells `state`'s mark takes: its glyph, a blank and its word.
+fn mark_width(state: ItemState) -> usize {
+    let mark = status::mark(state);
     cell_width(mark.glyph) + 1 + cell_width(mark.word)
 }
 
@@ -243,7 +244,7 @@ fn list_rows(view: &ListView<'_>, theme: &Theme) -> Vec<Row<'static>> {
     let status_width = view
         .items
         .iter()
-        .map(|item| mark_width(item.status))
+        .map(|item| mark_width(item.state()))
         .max()
         .unwrap_or(0);
 
@@ -260,8 +261,8 @@ fn list_rows(view: &ListView<'_>, theme: &Theme) -> Vec<Row<'static>> {
                 Span::styled(cells::pad(&item.key, key_width), theme.key),
                 Span::raw(" ".repeat(GAP)),
             ];
-            spans.extend(status::spans(item.status, theme));
-            let pad = status_width.saturating_sub(mark_width(item.status)) + GAP;
+            spans.extend(status::spans(item.state(), theme));
+            let pad = status_width.saturating_sub(mark_width(item.state())) + GAP;
             spans.push(Span::raw(" ".repeat(pad)));
             spans.push(Span::styled(item.title.clone(), theme.base));
             out.push(Row {
@@ -278,6 +279,7 @@ mod tests {
     use super::*;
     use crate::ui::kit::pane::Focus;
     use htui_core::fixtures::ids;
+    use htui_core::model::{RunStatus, Status};
     use ratatui::buffer::Buffer;
     use ratatui::style::{Color, Modifier, Style};
 
@@ -287,7 +289,13 @@ mod tests {
         assert_eq!(title(11), "Backlog (11)");
     }
 
-    fn summary(key: &str, number: i32, title: &str, status: Status) -> ItemSummary {
+    fn summary(
+        key: &str,
+        number: i32,
+        title: &str,
+        status: Status,
+        latest: Option<RunStatus>,
+    ) -> ItemSummary {
         ItemSummary {
             id: ItemId::new(),
             project_id: ids::PROJECT_HTUI,
@@ -301,6 +309,7 @@ mod tests {
             required_tags: Vec::new(),
             updated_at: htui_core::fixtures::demo_at(0, 0),
             touched_paths: Vec::new(),
+            latest_run_status: latest,
         }
     }
 
@@ -314,11 +323,17 @@ mod tests {
         }]
     }
 
-    /// The `htui` project with `FEAT-12` (in progress) and `FEAT-13` (open).
+    /// The `htui` project with `FEAT-12` (running) and `FEAT-13` (open).
     fn two_items() -> (Vec<ItemSummary>, Vec<ProjectRef>) {
         let items = vec![
-            summary("FEAT-12", 12, "short", Status::InProgress),
-            summary("FEAT-13", 13, "other", Status::Open),
+            summary(
+                "FEAT-12",
+                12,
+                "short",
+                Status::Open,
+                Some(RunStatus::Running),
+            ),
+            summary("FEAT-13", 13, "other", Status::Open, None),
         ];
         (items, htui())
     }
@@ -368,12 +383,13 @@ mod tests {
     #[test]
     fn a_wide_key_and_title_keep_the_columns_and_the_pane() {
         let items = vec![
-            summary("FEAT-12", 12, "short", Status::Open),
+            summary("FEAT-12", 12, "short", Status::Open, None),
             summary(
                 "\u{6f22}\u{5b57}-1",
                 1,
                 &"\u{6587}".repeat(40),
-                Status::InProgress,
+                Status::Open,
+                Some(RunStatus::Running),
             ),
         ];
         let projects = htui();
@@ -443,10 +459,11 @@ mod tests {
         }
     }
 
-    /// MOD-80 D1, MOD-115 M4 E4: a key is bold in the terminal's own colour, and `in_progress`
-    /// is `kit::status`'s `◐ running`, glyph and word in the running colour.
+    /// MOD-80 D1, MOD-115 M4 E4: a key is bold in the terminal's own colour, and a running item
+    /// (MOD-144: open over a running latest graph run) is `kit::status`'s `◐ running`, glyph
+    /// and word in the running colour.
     #[test]
-    fn an_item_key_is_bold_and_in_progress_is_running() {
+    fn an_item_key_is_bold_and_a_running_item_is_running() {
         let (items, projects) = two_items();
         let theme = Theme::default();
         let buffer = drawn(&view(&items, &projects, None), &theme, 50, 5);

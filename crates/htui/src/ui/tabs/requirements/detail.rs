@@ -6,9 +6,9 @@
 //! the mirror holds no revisions, and the pane says so in one line rather than showing an empty
 //! trail (PRD "Offline", blueprint F-14).
 //!
-//! MOD-115 M3 (MOD-83): every value is shown by its label, never its internal name: the state as
-//! a `kit::label` mark, a citing item's status as `kit::status`'s, the citation kind and the
-//! resolution as `kit::label`'s words, the counts through `kit::label::plural`.
+//! MOD-115 M3 (MOD-83): every value is shown by its label, never its internal name: the state as a
+//! `kit::label` mark, a citing item's state (MOD-144: derived) as `kit::status`'s, the citation
+//! kind and the resolution as `kit::label`'s words, the counts through `kit::label::plural`.
 
 use htui_core::model::{CoverageRow, ProjectRef, RequirementArea, RequirementState};
 use ratatui::text::{Line, Span};
@@ -119,7 +119,7 @@ fn coverage(rows: &[CoverageRow], theme: &Theme) -> Vec<Line<'static>> {
         .max()
         .unwrap_or(0);
     let mark_width = |row: &CoverageRow| {
-        let mark = status::mark(row.item.status);
+        let mark = status::mark(row.item.state());
         cell_width(mark.glyph) + 1 + cell_width(mark.word)
     };
     let status_width = rows.iter().map(mark_width).max().unwrap_or(0);
@@ -150,7 +150,7 @@ fn coverage(rows: &[CoverageRow], theme: &Theme) -> Vec<Line<'static>> {
             } else if any_suspect {
                 spans.push(Span::raw(cells::pad("", cell_width(SUSPECT) + 2)));
             }
-            spans.extend(status::spans(row.item.status, theme));
+            spans.extend(status::spans(row.item.state(), theme));
             spans.push(Span::raw(" ".repeat(status_width - mark_width(row))));
             spans.push(Span::raw("  "));
             spans.push(Span::styled(resolution, theme.dim));
@@ -289,10 +289,10 @@ mod tests {
 
     /// The pane draws without wrapping, so a row is cut at its right edge. At 80x24 the detail
     /// pane is 42 columns inside its border: the suspect marker must fit in them, whatever the
-    /// citing item's status (`awaiting_approval` is the widest).
+    /// citing item's state (`needs you` is the widest).
     #[tokio::test]
     async fn the_suspect_marker_survives_an_80_column_terminal() {
-        use htui_core::model::Status;
+        use htui_core::model::{RunStatus, Status};
         use ratatui::buffer::Buffer;
         use ratatui::layout::Rect;
         use ratatui::widgets::{Paragraph, Widget as _};
@@ -300,7 +300,8 @@ mod tests {
         let theme = Theme::default();
         let mut detail = r_ent_1().await;
         for row in &mut detail.coverage {
-            row.item.status = Status::AwaitingApproval;
+            row.item.status = Status::Open;
+            row.item.latest_run_status = Some(RunStatus::AwaitingApproval);
         }
         let area = Rect::new(0, 0, 42, 40);
         let mut buffer = Buffer::empty(area);
@@ -388,12 +389,14 @@ mod tests {
     /// resolution `kit::label`'s words, and the counts pluralised.
     #[tokio::test]
     async fn the_detail_shows_labels_not_internal_values() {
-        use htui_core::model::{CitationKind, Resolution, Status};
+        use htui_core::model::{CitationKind, Resolution, RunStatus, Status};
         let theme = Theme::default();
         let mut detail = r_ent_1().await;
-        detail.coverage[0].item.status = Status::InProgress;
+        detail.coverage[0].item.status = Status::Open;
+        detail.coverage[0].item.latest_run_status = Some(RunStatus::Running);
         detail.coverage[0].kind = CitationKind::Amends;
-        detail.coverage[1].item.status = Status::AwaitingApproval;
+        detail.coverage[1].item.status = Status::Open;
+        detail.coverage[1].item.latest_run_status = Some(RunStatus::AwaitingApproval);
         detail.coverage[1].resolution = Some(Resolution::Superseded);
         detail.requirement.state = htui_core::model::RequirementState::Withdrawn;
         let drawn = text(&lines(&detail, 53, &theme));
@@ -404,7 +407,7 @@ mod tests {
         assert!(drawn.contains("\u{25d0} running"), "{drawn}");
         assert!(drawn.contains("\u{26a0} needs you"), "{drawn}");
         assert!(drawn.contains("superseded"), "{drawn}");
-        for raw in ["in_progress", "awaiting_approval"] {
+        for raw in ["in_progress", "awaiting_approval", "needs_you"] {
             assert!(!drawn.contains(raw), "`{raw}`: {drawn}");
         }
         let state = lines(&detail, 53, &theme)

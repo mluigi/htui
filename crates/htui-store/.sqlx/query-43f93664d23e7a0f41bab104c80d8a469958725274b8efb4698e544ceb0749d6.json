@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT e.item_id         AS \"item_id: ItemId\",\n                   i.project_id      AS \"project_id: ProjectId\",\n                   e.box_id          AS \"box_id: BoxId\",\n                   e.workspace_id    AS \"workspace_id: WorkspaceId\",\n                   e.position,\n                   e.queued_at,\n                   e.queued_by       AS \"queued_by: UserId\",\n                   i.key             AS \"key!\",\n                   i.title,\n                   i.status          AS \"status: Status\",\n                   i.priority,\n                   i.created_at,\n                   lr.id             AS \"run_id?: RunId\",\n                   lr.status         AS \"run_status?: RunStatus\",\n                   lr.mode           AS \"run_mode?: RunMode\",\n                   lr.target_box_id  AS \"run_target?: BoxId\",\n                   lr.hostname       AS \"run_hostname?\",\n                   lr.failure        AS \"run_failure?\",\n                   lr.parked_step    AS \"run_parked_step?: StepId\",\n                   ln.body           AS \"note?\",\n                   COALESCE(ob.keys, '{}'::text[]) AS \"blockers!\"\n              FROM queue_entry e\n              JOIN item i ON i.id = e.item_id\n              LEFT JOIN LATERAL (\n                    SELECT r.id, r.status, r.mode, r.target_box_id, tb.hostname, r.failure,\n                           (SELECT s.id FROM run_step s\n                             WHERE s.run_id = r.id AND s.status = 'awaiting_approval'\n                             ORDER BY s.position, s.attempt, s.fanout_index\n                             LIMIT 1) AS parked_step\n                      FROM run r\n                      LEFT JOIN box tb ON tb.id = r.target_box_id\n                     WHERE r.item_id = i.id AND r.kind = 'graph'\n                     ORDER BY r.queued_at DESC, r.id DESC\n                     LIMIT 1\n                   ) lr ON true\n              LEFT JOIN LATERAL (\n                    SELECT n.body FROM item_note n\n                     WHERE n.item_id = i.id\n                     ORDER BY n.created_at DESC, n.id DESC\n                     LIMIT 1\n                   ) ln ON true\n              LEFT JOIN LATERAL (\n                    SELECT array_agg(DISTINCT t.key COLLATE \"C\" ORDER BY t.key COLLATE \"C\") AS keys\n                      FROM item_link l JOIN item t ON t.id = l.to_item_id\n                     WHERE l.from_item_id = i.id AND l.kind = 'blocked_by'\n                       AND l.deleted_at IS NULL AND t.status NOT IN ('done','closed')\n                   ) ob ON true\n             WHERE e.box_id = $1\n             ORDER BY e.position NULLS LAST, i.priority DESC, i.created_at, i.id\n            ",
+  "query": "\n            SELECT e.item_id         AS \"item_id: ItemId\",\n                   i.project_id      AS \"project_id: ProjectId\",\n                   e.box_id          AS \"box_id: BoxId\",\n                   e.workspace_id    AS \"workspace_id: WorkspaceId\",\n                   e.position,\n                   e.queued_at,\n                   e.queued_by       AS \"queued_by: UserId\",\n                   i.key             AS \"key!\",\n                   i.title,\n                   i.status          AS \"status: Status\",\n                   i.priority,\n                   i.created_at,\n                   lr.id             AS \"run_id?: RunId\",\n                   lr.status         AS \"run_status?: RunStatus\",\n                   lr.mode           AS \"run_mode?: RunMode\",\n                   lr.target_box_id  AS \"run_target?: BoxId\",\n                   lr.hostname       AS \"run_hostname?\",\n                   lr.failure        AS \"run_failure?\",\n                   lr.parked_step    AS \"run_parked_step?: StepId\",\n                   ln.body           AS \"note?\",\n                   COALESCE(ob.keys, '{}'::text[]) AS \"blockers!\",\n                   ls.status         AS \"latest_run_status?: RunStatus\"\n              FROM queue_entry e\n              JOIN item i ON i.id = e.item_id\n              LEFT JOIN LATERAL (\n                    SELECT r.id, r.status, r.mode, r.target_box_id, tb.hostname, r.failure,\n                           (SELECT s.id FROM run_step s\n                             WHERE s.run_id = r.id AND s.status = 'awaiting_approval'\n                             ORDER BY s.position, s.attempt, s.fanout_index\n                             LIMIT 1) AS parked_step\n                      FROM run r\n                      LEFT JOIN box tb ON tb.id = r.target_box_id\n                     WHERE r.item_id = i.id AND r.kind = 'graph'\n                     ORDER BY r.queued_at DESC, r.id DESC\n                     LIMIT 1\n                   ) lr ON true\n              LEFT JOIN LATERAL (\n                    SELECT r.status FROM run r\n                     WHERE r.item_id = i.id AND r.kind = 'graph' AND r.status <> 'cancelled'\n                     ORDER BY r.queued_at DESC, r.id DESC\n                     LIMIT 1\n                   ) ls ON true\n              LEFT JOIN LATERAL (\n                    SELECT n.body FROM item_note n\n                     WHERE n.item_id = i.id\n                     ORDER BY n.created_at DESC, n.id DESC\n                     LIMIT 1\n                   ) ln ON true\n              LEFT JOIN LATERAL (\n                    SELECT array_agg(DISTINCT t.key COLLATE \"C\" ORDER BY t.key COLLATE \"C\") AS keys\n                      FROM item_link l JOIN item t ON t.id = l.to_item_id\n                     WHERE l.from_item_id = i.id AND l.kind = 'blocked_by'\n                       AND l.deleted_at IS NULL AND t.status <> 'closed'\n                       AND (SELECT tr.status FROM run tr\n                             WHERE tr.item_id = t.id AND tr.kind = 'graph'\n                               AND tr.status <> 'cancelled'\n                             ORDER BY tr.queued_at DESC, tr.id DESC\n                             LIMIT 1) IS DISTINCT FROM 'done'\n                   ) ob ON true\n             WHERE e.box_id = $1\n             ORDER BY e.position NULLS LAST, i.priority DESC, i.created_at, i.id\n            ",
   "describe": {
     "columns": [
       {
@@ -223,6 +223,17 @@
         "name": "blockers!",
         "type_info": "TextArray",
         "origin": "Expression"
+      },
+      {
+        "ordinal": 21,
+        "name": "latest_run_status?: RunStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "status"
+          }
+        }
       }
     ],
     "parameters": {
@@ -251,8 +262,9 @@
       true,
       null,
       false,
-      null
+      null,
+      false
     ]
   },
-  "hash": "961364947d3015dc9519e050aa0c5b7e2d730dc3852f36ce375ed8ac982e89a3"
+  "hash": "43f93664d23e7a0f41bab104c80d8a469958725274b8efb4698e544ceb0749d6"
 }

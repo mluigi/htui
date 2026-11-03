@@ -2,22 +2,22 @@
 source: crates/htui/tests/replay.rs
 expression: harness.render()
 ---
-Platform   ¹Backlog    1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys · ⌫ back
+Platform   ¹Backlog    2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys · ⌫ back
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ FEAT-1 · TUI scaffold ────‹ Runs  Graph ›╮
 │ ▾ htui (8)                                          ││kind   status      box          started    │
 │  ANA-1    ● done       Data model, box registry and…││mode                            finished   │
-│  ANA-2    ○ open       Orchestrator step graphs and…││graph  ● done      DESKTOP-HTUI 09-02 08:00│
-│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││manual                          09-02 12:00│
-│▌ FEAT-1   ◐ running    TUI scaffold                 ││  prd             ● done            —  1h00│
-│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││    approved   claude/sonnet               │
-│  FEAT-3   ◌ queued     Postgres store and cache     ││▸ plan            ● done          14k  1h00│
+│  ANA-2    ○ open       Orchestrator step graphs and…││graph  ◐ running   DESKTOP-HTUI 09-03 09:00│
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││manual                          —          │
+│▌ FEAT-1   ◐ running    TUI scaffold                 ││graph  ● done      DESKTOP-HTUI 09-02 08:00│
+│  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││manual                          09-02 12:00│
+│  FEAT-3   ◌ queued     Postgres store and cache     ││  prd             ● done            —  1h00│
 │  FIX-1    ✓ closed     Terminal left raw after panic││    approved   claude/sonnet               │
-│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││  implement       ● done            —  1h00│
-│ ▾ agy (3)                                           ││    approved   ~36k ! claude/opus          │
-│  ANA-1    ● done       Prompt assembly survey       ││  review          ● done            —  1h00│
-│  FEAT-1   ○ open       ACP transport upgrade        ││    approved   agy/default                 │
-│  FIX-1    ○ open       Session leak on cancel       ││                                           │
-│                                                     ││                                           │
+│  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││▸ plan            ● done          14k  1h00│
+│ ▾ agy (3)                                           ││    approved   claude/sonnet               │
+│  ANA-1    ● done       Prompt assembly survey       ││  implement       ● done            —  1h00│
+│  FEAT-1   ○ open       ACP transport upgrade        ││    approved   ~36k ! claude/opus          │
+│  FIX-1    ○ open       Session leak on cancel       ││  review          ● done            —  1h00│
+│                                                     ││    approved   agy/default                 │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │

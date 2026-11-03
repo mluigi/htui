@@ -2,7 +2,7 @@
 source: crates/htui/tests/skills.rs
 expression: frame
 ---
-Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      1 waiting ·  F9  about   F1  keys
+Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat      2 waiting ·  F9  about   F1  keys
 ╭─ attachments · tests ───────────────────────────────────────────────────────── Skills  Templates ╮
 │   global                       —                                                                 ┃
 │▌* htui                         always · latest · pos 0                                           ┃

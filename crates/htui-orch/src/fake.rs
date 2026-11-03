@@ -35,9 +35,9 @@ use htui_core::fixtures::ids;
 use htui_core::model::Transport;
 use htui_core::model::{
     Agent, AgentBox, AgentId, BatchId, BoundSkill, BoxId, Document, DocumentId, GraphSnapshot,
-    Isolation, Item, ItemId, NewDocument, PhaseAgent, PhaseId, ProjectId, PromptTemplate, RepoId,
-    ResolvedGraph, Run, RunId, RunStep, RunStepCommit, RunStepTree, SnapshotPhase, StepId, UserId,
-    VerifyOutcome,
+    Isolation, Item, ItemId, ItemState, NewDocument, PhaseAgent, PhaseId, ProjectId,
+    PromptTemplate, RepoId, ResolvedGraph, Run, RunId, RunStep, RunStepCommit, RunStepTree,
+    SnapshotPhase, StepId, UserId, VerifyOutcome, latest_graph_run,
 };
 use htui_core::prompt::DiffBlock;
 use htui_core::secret::SecretSource;
@@ -46,6 +46,21 @@ use tokio::sync::{Notify, watch};
 use uuid::Uuid;
 
 pub use htui_core::clock::TestClock;
+
+/// MOD-144: the item's derived display state, its stored status over its latest graph run
+/// ([`ItemState::of`], [`latest_graph_run`]).
+///
+/// # Panics
+/// When the item is not there; `MemStore` never fails a read.
+pub async fn state_in(store: &MemStore, id: ItemId) -> ItemState {
+    let item = store
+        .item(id)
+        .await
+        .expect("MemStore never fails a read")
+        .expect("the item exists");
+    let runs = store.runs(id).await.expect("MemStore never fails a read");
+    ItemState::of(item.status, latest_graph_run(&runs).map(|run| run.status))
+}
 
 use crate::command::{Command, CommandOutcome, EngineError};
 use crate::engine::{ControlFor, DeadWalks, PolicyFor, SessionKey, Tails};
@@ -2481,6 +2496,14 @@ impl FakeOrchestrator {
             .await
             .expect("MemStore never fails a read")
             .expect("the case names an item the fixture holds")
+    }
+
+    /// The item's derived display state (MOD-144): its stored status over its latest graph run.
+    ///
+    /// # Panics
+    /// When the item is not there, which in a case means the fixture moved.
+    pub async fn state(&self, id: ItemId) -> ItemState {
+        state_in(&self.store, id).await
     }
 
     /// One run row.

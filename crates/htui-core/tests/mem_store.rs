@@ -34,7 +34,7 @@ async fn demo_store_loads_the_fixture() {
     );
     assert_eq!(
         conformance::CASES.len(),
-        219,
+        229,
         "B.9's fifteen cases, MOD-2's five store-seam cases (plan D3), milestone 7's two quota \
          cases (plans D67 and D74), milestone 9's `set_step_prompt`, MOD-15 milestone 1's \
          twelve, one per entity group (plan D12), milestone 2's seed case (plan D7), MOD-4 \
@@ -73,7 +73,8 @@ async fn demo_store_loads_the_fixture() {
          cases (plan D7), MOD-163 M1's ten memory cases (plan D4, D6, D8), MOD-138 M1's \
          four for the walk validator (plan D9), five for the per-row writers' default \
          edges (plan D7), three for D12's usable graphs (plan D12) and its review round's one \
-         for a kind's kept graph (A7)"
+         for a kind's kept graph (A7), and MOD-144's nine for the item status reduction (ANA-35 §7.1) \
+         and its review round's one for `block_if_idle` (R1 M1)"
     );
     assert_eq!(
         conformance::READ_CASES.len(),

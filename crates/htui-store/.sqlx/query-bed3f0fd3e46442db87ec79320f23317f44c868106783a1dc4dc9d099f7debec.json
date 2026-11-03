@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT s.status      AS \"step_status: StepStatus\",\n                   r.id          AS \"run_id: RunId\",\n                   r.status      AS \"run_status: RunStatus\",\n                   r.item_id     AS \"item_id: ItemId\",\n                   r.lease_owner AS \"lease_owner?\"\n              FROM run_step s JOIN run r ON r.id = s.run_id\n             WHERE s.id = $1\n               FOR UPDATE OF s, r\n            ",
+  "query": "\n            SELECT s.status      AS \"step_status: StepStatus\",\n                   r.id          AS \"run_id: RunId\",\n                   r.status      AS \"run_status: RunStatus\",\n                   r.lease_owner AS \"lease_owner?\"\n              FROM run_step s JOIN run r ON r.id = s.run_id\n             WHERE s.id = $1\n               FOR UPDATE OF s, r\n            ",
   "describe": {
     "columns": [
       {
@@ -38,17 +38,6 @@
       },
       {
         "ordinal": 3,
-        "name": "item_id: ItemId",
-        "type_info": "Uuid",
-        "origin": {
-          "Table": {
-            "table": "run",
-            "name": "item_id"
-          }
-        }
-      },
-      {
-        "ordinal": 4,
         "name": "lease_owner?",
         "type_info": "Uuid",
         "origin": {
@@ -68,9 +57,8 @@
       false,
       false,
       false,
-      true,
       true
     ]
   },
-  "hash": "ed6bc4da4f4bfdb7036007e38ecc85dc02d8d3a1ec9246118bf9d1b9eaa6ffb0"
+  "hash": "bed3f0fd3e46442db87ec79320f23317f44c868106783a1dc4dc9d099f7debec"
 }

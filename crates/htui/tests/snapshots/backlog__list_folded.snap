@@ -2,7 +2,7 @@
 source: crates/htui/tests/backlog.rs
 expression: folded
 ---
-Platform   ¹Backlog             1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
+Platform   ¹Backlog             2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ Detail ─ Body  Runs  Graph  Docs  Notes ›╮
 │▌▸ htui (8)                                          ││                                           │
 │ ▾ agy (3)                                           ││                                           │

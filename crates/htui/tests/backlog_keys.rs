@@ -87,10 +87,21 @@ async fn the_runs_pane_status_line_and_box_list_every_layer() {
     }
     harness.key("l");
     harness.drive().await;
+    // MOD-144: the pane opens on the demo's stepless rework run `RUN_4`; `J` steps to `RUN_1`'s
+    // `prd`.
+    harness.key("J");
+    harness.drive().await;
     let frame = harness.render();
     assert!(
         on_item(&frame, "FEAT-1") && frame.contains("▸ prd"),
         "FEAT-1's Runs pane, a step under the cursor:\n{frame}"
+    );
+    assert!(
+        frame
+            .lines()
+            .filter_map(|row| row.rsplit_once("││").map(|(_, pane)| pane))
+            .any(|pane| pane.contains('▸') && pane.contains("prd")),
+        "`J` stepped past RUN_4 onto RUN_1's `prd`:\n{frame}"
     );
     assert_eq!(status_line(&mut harness), BROWSE, "the browse status line");
 

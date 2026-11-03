@@ -7,7 +7,7 @@ Platform   ¹Backlog                                vulkan-tutorials:FEAT-1 is o
 │ ▾ htui (8)                                          ││  FIX-1 ○ open Session leak on cancel      │
 │  ANA-1    ● done       Data model, box registry and…││  → blocked by ANA-1 ● done Prompt assembl…│
 │  ANA-2    ○ open       Orchestrator step graphs and…││    → blocked by htui:ANA-1 ● done Data mo…│
-│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││▌ → origin vulkan-tutoria…:FEAT-1 ◐ running│
+│  CLEAN-1  ✗ failed     Drop the legacy markdown exp…││▌ → origin vulkan-tutoria…:FEAT-1 ■ stopped│
 │  FEAT-1   ◐ running    TUI scaffold                 ││  → origin htui:TOOL-1 ⚠ needs you CI matr…│
 │  FEAT-2   ⊘ blocked    Agent driver and chat tab    ││    → blocked by htui:ANA-1 ● done (*)     │
 │  FEAT-3   ◌ queued     Postgres store and cache     ││                                           │

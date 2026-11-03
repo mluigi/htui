@@ -87,6 +87,10 @@ async fn on_runs(harness: &mut Harness, down: usize) {
 async fn the_runs_list_at_80_columns() {
     let mut harness = backlog_at(80, 24).await;
     on_runs(&mut harness, TO_FEAT_1).await;
+    // MOD-144: the pane opens on the demo's stepless rework run `RUN_4`; `J` steps to `RUN_1`'s
+    // `prd`.
+    harness.key("J");
+    harness.drive().await;
     let frame = harness.render();
     for phase in ["\u{25b8} prd", "  plan", "  implement", "  review"] {
         assert!(frame.contains(phase), "`{phase}` leads its step:\n{frame}");

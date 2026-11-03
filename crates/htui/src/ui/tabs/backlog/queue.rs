@@ -1,7 +1,7 @@
 //! The Backlog's queue toggles (MOD-115 M4 T1): `Q` and `P`, the `QueueState` read each waits
 //! on, and the status line a queue write's answer sets.
 
-use htui_core::model::Status;
+use htui_core::model::ItemState;
 
 use crate::app::{Action, Ctx};
 use crate::keys::Act;
@@ -13,17 +13,20 @@ use crate::ui::tabs::backlog::{BacklogTab, QueueIntent};
 pub(super) const NO_ITEM_TO_QUEUE: &str = "select an item to queue";
 
 impl BacklogTab {
-    /// MOD-12 D9: `Q`. A finished item is refused here and nothing is sent; any other reads the
-    /// queue first, and the reply decides between queue and dequeue.
+    /// MOD-12 D9: `Q`. A finished item (MOD-144: state `done` or `closed`) is refused here and
+    /// nothing is sent; any other reads the queue first, and the reply decides between queue and
+    /// dequeue.
     pub(super) fn toggle_queued(&mut self, ctx: &Ctx<'_>) {
         let Some(item) = self.item() else {
             ctx.emit(Action::Error(NO_ITEM_TO_QUEUE.to_owned()));
             return;
         };
-        if matches!(item.status, Status::Done | Status::Closed) {
+        let state = item.state();
+        if matches!(state, ItemState::Done | ItemState::Closed) {
             ctx.emit(Action::Error(format!(
                 "{} is {}: nothing to queue",
-                item.key, item.status
+                item.key,
+                state.word()
             )));
             return;
         }

@@ -2,7 +2,7 @@
 source: crates/htui/tests/backlog.rs
 expression: warn
 ---
-Platform   ¹Backlog            1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
+Platform   ¹Backlog            2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9  about   F1  keys
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ ANA-1 · Data model, box registry…‹ Runs ›╮
 │ ▾ htui (8)                                          ││kind   status      box          started    │
 │▌ ANA-1    ● done       Data model, box registry and…││mode                            finished   │

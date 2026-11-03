@@ -13,7 +13,7 @@
 use core::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-use htui_core::model::{ItemId, LinkGraph, LinkKind, LinkNode, ProjectId, ProjectRef, Status};
+use htui_core::model::{ItemId, ItemState, LinkGraph, LinkKind, LinkNode, ProjectId, ProjectRef};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -497,9 +497,10 @@ fn kind_width() -> usize {
         .unwrap_or(0)
 }
 
-/// A node's status as the pane shows it: its `kit::status` glyph and word, one span.
-fn status_text(status: Status) -> String {
-    let mark = status::mark(status);
+/// A node's state as the pane shows it: its `kit::status` glyph and word, one span (MOD-144: the
+/// derived [`ItemState`], not the stored status).
+fn status_text(state: ItemState) -> String {
+    let mark = status::mark(state);
     format!("{} {}", mark.glyph, mark.word)
 }
 
@@ -560,7 +561,7 @@ fn lead_cells(row: &GraphRow<'_>, link: Link) -> usize {
 /// the status, the status and the repeat mark.
 fn fixed_cells(row: &GraphRow<'_>, link: Link) -> usize {
     let repeat = if link.repeat { cell_width(REPEAT) } else { 0 };
-    lead_cells(row, link) + 1 + cell_width(&status_text(row.node.status)) + repeat
+    lead_cells(row, link) + 1 + cell_width(&status_text(row.node.state())) + repeat
 }
 
 /// Cells of `node`'s whole `[slug:]KEY` label.
@@ -581,11 +582,11 @@ fn line(
     let node = row.node;
     // D7: a node outside the workspace is drawn, but dim, so it does not read as reachable.
     let (label_style, status_style, title_style) = if in_workspace {
-        (theme.key, theme.status_style(node.status), theme.base)
+        (theme.key, theme.status_style(node.state()), theme.base)
     } else {
         (theme.dim, theme.dim, theme.dim)
     };
-    let status = status_text(node.status);
+    let status = status_text(node.state());
     let mut spans = vec![Span::raw(" ")];
 
     let Some(link) = row.link else {
@@ -987,6 +988,7 @@ mod tests {
             title: format!("{key} title"),
             status: Status::Open,
             depth,
+            latest_run_status: None,
         }
     }
 
@@ -1527,7 +1529,7 @@ mod tests {
                 " FIX-1 \u{25cb} open Session leak on cancel",
                 " \u{2192} blocked by ANA-1 \u{25cf} done Prompt assembl\u{2026}",
                 "   \u{2192} blocked by htui:ANA-1 \u{25cf} done Data mo\u{2026}",
-                " \u{2192} origin vulkan-tutoria\u{2026}:FEAT-1 \u{25d0} running",
+                " \u{2192} origin vulkan-tutoria\u{2026}:FEAT-1 \u{25a0} stopped",
                 " \u{2192} origin htui:TOOL-1 \u{26a0} needs you CI matr\u{2026}",
                 "   \u{2192} blocked by htui:ANA-1 \u{25cf} done (*)",
             ]
@@ -1632,10 +1634,10 @@ mod tests {
         };
         // 14 fixed cells and `origin` leave 8 of 28 for the label: one for the slug, so it goes
         // whole.
-        assert_eq!(at(28), " \u{2192} origin FEAT-1 \u{25d0} running");
+        assert_eq!(at(28), " \u{2192} origin FEAT-1 \u{25a0} stopped");
         // Then the status gives way, cut at the pane edge, and the key goes last.
-        assert_eq!(at(24), " \u{2192} origin FEAT-1 \u{25d0} runni");
-        assert_eq!(at(22), " \u{2192} origin FEAT-1 \u{25d0} run");
+        assert_eq!(at(24), " \u{2192} origin FEAT-1 \u{25a0} stopp");
+        assert_eq!(at(22), " \u{2192} origin FEAT-1 \u{25a0} sto");
         assert_eq!(at(16), " \u{2192} origin FEAT-1");
         assert_eq!(at(15), " \u{2192} origin FEAT\u{2026}");
 

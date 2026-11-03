@@ -458,17 +458,21 @@ async fn the_filter_form_keeps_its_value_keys_and_x_clears() {
     let mut harness = shell(None).await;
     press(&mut harness, "f").await;
     let status = |harness: &mut Harness| filter_rows(&harness.render())[0].clone();
-    assert_eq!(status(&mut harness), "\u{258c}status    ‹[ ] open›  any");
+    // MOD-144: the options are the item states in attention order, words not raw names.
+    assert_eq!(
+        status(&mut harness),
+        "\u{258c}status    ‹[ ] needs you›  any"
+    );
 
     press(&mut harness, "l").await;
-    let queued = status(&mut harness);
+    let failed = status(&mut harness);
     assert_eq!(
-        queued, "\u{258c}status    ‹[ ] queued›  any",
+        failed, "\u{258c}status    ‹[ ] failed›  any",
         "`l` moves the option"
     );
     press(&mut harness, "right").await;
     let third = status(&mut harness);
-    assert_ne!(third, queued, "`Right` moves it on");
+    assert_ne!(third, failed, "`Right` moves it on");
     for chord in ["alt-l", "alt-h", "alt-space"] {
         press(&mut harness, chord).await;
         assert_eq!(status(&mut harness), third, "`{chord}` changed nothing");

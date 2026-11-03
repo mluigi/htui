@@ -2,7 +2,7 @@
 source: crates/htui/tests/backlog.rs
 expression: frame
 ---
-Platform   ¹Backlog             1 working · 1 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
+Platform   ¹Backlog             2 working · 2 waiting · memory · DESKTOP-HTUI ·  F9  about   ?  keys
 ╭─ Backlog (2) ───────────────────────────────────────╮╭─ ANA-1 · Data model, box registry … Body ›╮
 │ / status: done                               2 items││Data model, box registry and sync topology │
 │ ▾ htui (1)                                          ││● done · no tags · priority 0 · version 1  │

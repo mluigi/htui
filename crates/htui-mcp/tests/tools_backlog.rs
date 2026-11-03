@@ -466,10 +466,10 @@ async fn item_status_writes_a_note_and_never_moves_the_status() {
     let host = fx.host();
     let (_lease, mut client) = open(&host, fx.scope()).await;
 
-    let done = ok(&client
+    let blocked = ok(&client
         .call(
             "item_status",
-            json!({"status": "done", "reason": "every test passes"}),
+            json!({"status": "blocked", "reason": "every test passes"}),
         )
         .await
         .expect("a call"));
@@ -483,7 +483,10 @@ async fn item_status_writes_a_note_and_never_moves_the_status() {
 
     let notes = fx.notes().await;
     for (answer, body) in [
-        (&done, "status request: done \u{2014} every test passes"),
+        (
+            &blocked,
+            "status request: blocked \u{2014} every test passes",
+        ),
         (
             &closed,
             "status request: closed (superseded) \u{2014} FEAT-1 covers it",
@@ -529,10 +532,20 @@ async fn item_status_rejects_an_unknown_status_and_a_stray_resolution() {
         "{}",
         unknown.text
     );
+    // MOD-144: `done` is a run's progress, never an item status an agent can ask for.
+    let progress = client
+        .call("item_status", json!({"status": "done", "reason": "it is"}))
+        .await
+        .expect("a call");
+    assert!(
+        refused(&progress).starts_with("invalid arguments: unknown variant `done`"),
+        "{}",
+        progress.text
+    );
     let stray = client
         .call(
             "item_status",
-            json!({"status": "done", "resolution": "done", "reason": "it is"}),
+            json!({"status": "open", "resolution": "done", "reason": "it is"}),
         )
         .await
         .expect("a call");
@@ -683,7 +696,7 @@ fn backlog_calls() -> [(&'static str, Value); 4] {
         ("note_add", json!({"body": "a note"})),
         (
             "item_status",
-            json!({"status": "done", "reason": "it works"}),
+            json!({"status": "blocked", "reason": "it works"}),
         ),
         (
             "item_link",

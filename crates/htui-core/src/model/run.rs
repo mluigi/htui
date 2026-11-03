@@ -43,7 +43,7 @@ str_enum!(
         AwaitingApproval => "awaiting_approval",
         /// Halted by a workspace stop (MOD-125 D1, `R-ORCH-16`): live and resumable. Holds no
         /// slot, still refuses an overlapping scope (it keeps its trees and branch), has no
-        /// `finished_at`, and its item stays `in_progress`.
+        /// `finished_at`, and its item reads `stopped` (MOD-144).
         Stopped => "stopped",
         /// Finished successfully.
         Done => "done",
@@ -99,6 +99,62 @@ impl RunStatus {
     pub const fn is_terminal(self) -> bool {
         !self.is_active()
     }
+}
+
+/// What [`latest_graph_run`] orders by; implemented by [`Run`] and [`RunSummary`].
+pub trait RunFacts {
+    /// `run.kind`.
+    fn run_kind(&self) -> RunKind;
+    /// `run.status`.
+    fn run_status(&self) -> RunStatus;
+    /// `(run.queued_at, run.id)`, the order every store's `ORDER BY` uses.
+    fn run_order(&self) -> (DateTime<Utc>, RunId);
+}
+
+impl RunFacts for Run {
+    fn run_kind(&self) -> RunKind {
+        self.kind
+    }
+    fn run_status(&self) -> RunStatus {
+        self.status
+    }
+    fn run_order(&self) -> (DateTime<Utc>, RunId) {
+        (self.queued_at, self.id)
+    }
+}
+
+impl RunFacts for RunSummary {
+    fn run_kind(&self) -> RunKind {
+        self.kind
+    }
+    fn run_status(&self) -> RunStatus {
+        self.status
+    }
+    fn run_order(&self) -> (DateTime<Utc>, RunId) {
+        (self.queued_at, self.id)
+    }
+}
+
+/// MOD-144: the item's latest graph run, newest `kind = 'graph'` and not `cancelled` by
+/// `(queued_at, id)` (ANA-35 §7.1). Every store's SQL repeats this rule; the caller passes the
+/// runs of one item.
+pub fn latest_graph_run<'a, R: RunFacts + 'a>(
+    runs: impl IntoIterator<Item = &'a R>,
+) -> Option<&'a R> {
+    runs.into_iter()
+        .filter(|run| run.run_kind() == RunKind::Graph && run.run_status() != RunStatus::Cancelled)
+        .max_by_key(|run| run.run_order())
+}
+
+/// MOD-144 Δ2: the item's newest **live** graph run (`RunStatus::is_active`, `stopped`
+/// included) by `(queued_at, id)`, the one `uq_run_item_live` allows and `create_run`'s
+/// [`startable`](crate::store::startable) check names. The caller passes the runs of one item.
+pub fn latest_live_graph_run<'a, R: RunFacts + 'a>(
+    runs: impl IntoIterator<Item = &'a R>,
+) -> Option<&'a R> {
+    runs.into_iter()
+        .filter(|run| run.run_kind() == RunKind::Graph && run.run_status().is_active())
+        .max_by_key(|run| run.run_order())
 }
 
 str_enum!(
@@ -410,7 +466,7 @@ impl ChatRunSpec {
 }
 
 /// Arguments of [`crate::store::WriteStore::create_run`]: a `kind = 'graph'` run inserted at
-/// `queued`, with the item moved to `queued` in the same transaction (ANA-2 §4.3, §5.1).
+/// `queued` (ANA-2 §4.3, §5.1); the item is not written (MOD-144: it reads `queued` from the run).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NewRun {
     /// `run.id`, minted by the caller so a retry is idempotent.
@@ -566,6 +622,25 @@ impl GraphSnapshot {
         if self.v == Self::V1 && self.edges.is_empty() {
             self.edges = default_snapshot_edges(&self.phases);
         }
+    }
+
+    /// MOD-144 (ANA-35 §7.1 `default_for`): the `output_kind` of the snapshot's highest-`position`
+    /// phase, read from `phases[]` alone so any `v` decodes; `None` without phases. A phase with
+    /// no readable `position` or `output_kind` is skipped.
+    #[must_use]
+    pub fn last_output_kind(snapshot: &Value) -> Option<String> {
+        snapshot
+            .get("phases")?
+            .as_array()?
+            .iter()
+            .filter_map(|phase| {
+                Some((
+                    phase.get("position")?.as_i64()?,
+                    phase.get("output_kind")?.as_str()?,
+                ))
+            })
+            .max_by_key(|(position, _)| *position)
+            .map(|(_, kind)| kind.to_owned())
     }
 
     /// MOD-26 D12, I-4: the frozen persona `phase` names. `Ok(None)` for a persona-less phase;
@@ -1435,6 +1510,158 @@ mod tests {
             !StepStatus::Stopped.is_terminal(),
             "a stopped step is not terminal"
         );
+    }
+
+    /// MOD-144 (ANA-35 §7.1 `default_for`): the highest `position` wins whatever the array
+    /// order; a phase without `output_kind` is skipped; no phases → `None`.
+    #[test]
+    fn last_output_kind_reads_the_highest_position() {
+        use super::GraphSnapshot;
+        let snapshot = json!({
+            "v": 1,
+            "phases": [
+                {"position": 2, "output_kind": "verdict"},
+                {"position": 0, "output_kind": "plan"},
+                {"position": 3},
+                {"position": 1, "output_kind": "code"},
+            ]
+        });
+        assert_eq!(
+            GraphSnapshot::last_output_kind(&snapshot).as_deref(),
+            Some("verdict")
+        );
+        assert_eq!(GraphSnapshot::last_output_kind(&json!(null)), None);
+        assert_eq!(GraphSnapshot::last_output_kind(&json!({"v": 1})), None);
+        assert_eq!(
+            GraphSnapshot::last_output_kind(&json!({"phases": []})),
+            None
+        );
+        assert_eq!(
+            GraphSnapshot::last_output_kind(&json!({"phases": [{"position": 0}]})),
+            None
+        );
+    }
+
+    /// MOD-144: the latest graph run skips `cancelled` and chat runs, orders by `queued_at`, and
+    /// breaks a `queued_at` tie on the id, over [`Run`](super::Run) and
+    /// [`RunSummary`](super::RunSummary) alike.
+    #[test]
+    fn latest_graph_run_skips_cancelled_and_chat_and_breaks_ties_on_id() {
+        use super::{Run, RunId, RunKind, RunMode, RunSummary, latest_graph_run};
+        use crate::model::ids::{BoxId, ProjectId, UserId};
+        use chrono::{TimeZone as _, Utc};
+
+        let at = |minute: u32| Utc.with_ymd_and_hms(2026, 10, 27, 9, minute, 0).unwrap();
+        let id = |n: u128| RunId::from_uuid(Uuid::from_u128(n));
+        let run = |n: u128, minute: u32, kind: RunKind, status: RunStatus| Run {
+            id: id(n),
+            project_id: ProjectId::from_uuid(Uuid::from_u128(1)),
+            item_id: None,
+            workspace_id: None,
+            kind,
+            mode: RunMode::Manual,
+            status,
+            target_box_id: BoxId::from_uuid(Uuid::from_u128(1)),
+            executing_box_id: None,
+            graph_snapshot: None,
+            started_by: UserId::from_uuid(Uuid::from_u128(1)),
+            queued_at: at(minute),
+            started_at: None,
+            finished_at: None,
+            failure: None,
+            repo_scope: Vec::new(),
+            lease_box_id: None,
+            lease_expires_at: None,
+            updated_at: at(minute),
+        };
+        let runs = vec![
+            run(1, 1, RunKind::Graph, RunStatus::Done),
+            run(2, 2, RunKind::Graph, RunStatus::Failed),
+            run(3, 2, RunKind::Graph, RunStatus::Failed),
+            run(4, 3, RunKind::Graph, RunStatus::Cancelled),
+            run(5, 4, RunKind::Chat, RunStatus::Running),
+        ];
+        assert_eq!(latest_graph_run(&runs).map(|r| r.id), Some(id(3)));
+        assert_eq!(latest_graph_run(&runs[..1]).map(|r| r.id), Some(id(1)));
+        assert!(latest_graph_run(&runs[3..]).is_none());
+        assert!(latest_graph_run(core::iter::empty::<&Run>()).is_none());
+
+        let summaries: Vec<RunSummary> = runs
+            .iter()
+            .map(|r| RunSummary {
+                id: r.id,
+                item_id: r.item_id,
+                project_id: r.project_id,
+                kind: r.kind,
+                mode: r.mode,
+                status: r.status,
+                target_box_id: r.target_box_id,
+                executing_box_id: None,
+                box_hostname: String::new(),
+                queued_at: r.queued_at,
+                started_at: None,
+                finished_at: None,
+                failure: None,
+                steps: Vec::new(),
+            })
+            .collect();
+        assert_eq!(latest_graph_run(&summaries).map(|r| r.id), Some(id(3)));
+    }
+
+    /// MOD-144 Δ2: the latest **live** graph run reads every live status (`stopped` included),
+    /// skips finished and chat runs, and breaks a `queued_at` tie on the id.
+    #[test]
+    fn latest_live_graph_run_reads_only_live_graph_runs() {
+        use super::{Run, RunId, RunKind, RunMode, latest_live_graph_run};
+        use crate::model::ids::{BoxId, ProjectId, UserId};
+        use chrono::{TimeZone as _, Utc};
+
+        let at = |minute: u32| Utc.with_ymd_and_hms(2026, 10, 27, 9, minute, 0).unwrap();
+        let id = |n: u128| RunId::from_uuid(Uuid::from_u128(n));
+        let run = |n: u128, minute: u32, kind: RunKind, status: RunStatus| Run {
+            id: id(n),
+            project_id: ProjectId::from_uuid(Uuid::from_u128(1)),
+            item_id: None,
+            workspace_id: None,
+            kind,
+            mode: RunMode::Manual,
+            status,
+            target_box_id: BoxId::from_uuid(Uuid::from_u128(1)),
+            executing_box_id: None,
+            graph_snapshot: None,
+            started_by: UserId::from_uuid(Uuid::from_u128(1)),
+            queued_at: at(minute),
+            started_at: None,
+            finished_at: None,
+            failure: None,
+            repo_scope: Vec::new(),
+            lease_box_id: None,
+            lease_expires_at: None,
+            updated_at: at(minute),
+        };
+        for live in RunStatus::ALL.iter().copied().filter(|s| s.is_active()) {
+            let runs = vec![
+                run(1, 1, RunKind::Graph, live),
+                run(2, 2, RunKind::Graph, RunStatus::Done),
+                run(3, 3, RunKind::Chat, RunStatus::Running),
+            ];
+            assert_eq!(
+                latest_live_graph_run(&runs).map(|r| (r.id, r.status)),
+                Some((id(1), live)),
+                "`{live}` is live"
+            );
+        }
+        let tie = vec![
+            run(1, 1, RunKind::Graph, RunStatus::Stopped),
+            run(2, 1, RunKind::Graph, RunStatus::Queued),
+        ];
+        assert_eq!(latest_live_graph_run(&tie).map(|r| r.id), Some(id(2)));
+        let finished = vec![
+            run(1, 1, RunKind::Graph, RunStatus::Done),
+            run(2, 2, RunKind::Graph, RunStatus::Failed),
+            run(3, 3, RunKind::Graph, RunStatus::Cancelled),
+        ];
+        assert!(latest_live_graph_run(&finished).is_none());
     }
 
     /// `failed` is the one step status the two notions disagree about: it is not terminal,

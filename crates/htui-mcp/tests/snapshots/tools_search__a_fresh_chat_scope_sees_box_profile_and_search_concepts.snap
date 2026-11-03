@@ -48,12 +48,7 @@ expression: "serde_json::to_string_pretty(&listed[\"result\"][\"tools\"]).expect
             "type": "string",
             "enum": [
               "open",
-              "queued",
-              "in_progress",
-              "awaiting_approval",
               "blocked",
-              "done",
-              "failed",
               "closed"
             ]
           },

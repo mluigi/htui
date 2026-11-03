@@ -19,7 +19,7 @@ use crate::ui::tabs::backlog::item_form::{
     Busy, ItemFormOutcome, mint_may_have_landed, mint_may_have_landed_in_the_old_scope,
 };
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
-use htui_core::model::{ItemFilter, Status};
+use htui_core::model::{ItemFilter, ItemState};
 use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 
 /// The queue requests among `actions`, by name; a `queue_item` names its item and the
@@ -171,7 +171,7 @@ fn press(tab: &mut BacklogTab, bench: &Bench, code: KeyCode) -> Handled {
 
 fn done_only() -> BacklogFilter {
     BacklogFilter {
-        statuses: vec![Status::Done],
+        states: vec![ItemState::Done],
         ..BacklogFilter::default()
     }
 }
@@ -284,12 +284,12 @@ fn drawn(tab: &BacklogTab, bench: &Bench) -> String {
         .join("\n")
 }
 
-/// The rows of `bench` with `status`.
-fn with_status(bench: &Bench, status: Status) -> Vec<ItemSummary> {
+/// The rows of `bench` whose derived state is `state`.
+fn with_state(bench: &Bench, state: ItemState) -> Vec<ItemSummary> {
     bench
         .items
         .iter()
-        .filter(|item| item.status == status)
+        .filter(|item| item.state() == state)
         .cloned()
         .collect()
 }

@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use htui_core::model::{
-    BatchFigures, Hold, ItemId, LiveFacts, ProjectCaps, ProjectId, QueueOverview, Scope, Status,
+    BatchFigures, Hold, ItemId, ItemState, LiveFacts, ProjectCaps, ProjectId, QueueOverview, Scope,
     WorkspaceId, admission_limit, batch_budget, classify_entry, min_budget_micros,
 };
 use htui_core::store::{Result, StoreError};
@@ -14,11 +14,12 @@ use htui_store::Backend;
 /// [`StoreRequest::QueueOverview`](crate::store_worker::StoreRequest::QueueOverview)'s answer.
 ///
 /// The reads follow `admit` (`htui-worker`'s runtime): the ready set is `ready_items` over the
-/// rows' projects less the batch's cancelled items, and a ready row's project is held when its
-/// caps read absent, do not parse, or `batch_budget` refuses the batch's spend. The `open` rows
-/// that are not ready have their missing tags read in one `missing_tags_of` (M3 review R1 M2; D6's
-/// N+1 was one `missing_tags` per row): an item deleted since `queue_rows` is absent from its
-/// answer, and a `NotFound` (the box gone) reads as no tags, both as the per-row read did.
+/// rows' projects less the batch's cancelled items, and a ready row's project is held when its caps
+/// read absent, do not parse, or `batch_budget` refuses the batch's spend. The rows in state `open`
+/// (MOD-144: open, no graph run) that are not ready have their missing tags read in one
+/// `missing_tags_of` (M3 review R1 M2; D6's N+1 was one `missing_tags` per row): an item deleted
+/// since `queue_rows` is absent from its answer, and a `NotFound` (the box gone) reads as no tags,
+/// both as the per-row read did.
 ///
 /// With no batch open, `last_closed_batch` says how the last one closed (M3 review R1 L4).
 ///
@@ -75,7 +76,7 @@ pub async fn overview(backend: &Backend) -> Result<QueueOverview> {
     // M3 review R1 M2: one read for every `open` row that is not ready, not one per row.
     let unready: Vec<ItemId> = rows
         .iter()
-        .filter(|row| row.status == Status::Open && !ready.contains(&row.entry.item_id))
+        .filter(|row| row.state() == ItemState::Open && !ready.contains(&row.entry.item_id))
         .map(|row| row.entry.item_id)
         .collect();
     let missing_tags: HashMap<ItemId, Vec<String>> = if unready.is_empty() {
@@ -162,9 +163,9 @@ mod tests {
     use htui_core::fixtures::{DemoData, demo_at, demo_data, ids};
     use htui_core::model::{
         BatchClose, BatchStop, BoxId, EntryState, Escalation, GraphSnapshot, Hold, ItemId,
-        ItemLink, LinkKind, NewRun, NewRunStep, Note, NoteId, PER_TOKEN_CAP_BATCH, ProjectId,
-        QueueMove, QueueOverview, RunId, RunMode, RunStatus, Scope, Status, StepId, StepStatus,
-        Wait, WorkspaceId, admission_order,
+        ItemLink, ItemState, LinkKind, NewRun, NewRunStep, Note, NoteId, PER_TOKEN_CAP_BATCH,
+        ProjectId, QueueMove, QueueOverview, RunId, RunMode, RunStatus, Scope, Status, StepId,
+        StepStatus, Wait, WorkspaceId, admission_order,
     };
     use htui_core::store::{MemStore, StepFence, WriteStore as _};
     use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE};
@@ -409,33 +410,22 @@ mod tests {
             .expect("the demo box")
             .settings = json!({ "max_concurrent_items": 5 });
 
-        // Fixture items: FEAT-1 (priority 2, in progress, its run done), FEAT-3 (priority 1,
-        // RUN_2 queued here), ANA-2 (open, ready), FEAT-2 (blocked, no run), TOOL-1 (awaiting
-        // approval), CLEAN-1 (failed).
-        let tool_run = push_run(
-            &mut data,
-            ids::HTUI_TOOL_1,
-            RunStatus::AwaitingApproval,
-            ids::BOX,
-            None,
-        );
+        // Fixture items (MOD-144: their states come from the demo's runs): FEAT-1 (priority 2,
+        // running its rework RUN_4 here), FEAT-3 (priority 1, RUN_2 queued here), ANA-1 (done,
+        // RUN_3), ANA-2 (open, ready), FEAT-2 (blocked, no run), TOOL-1 (needs you, the
+        // stepless awaiting_approval RUN_5), CLEAN-1 (failed, RUN_6).
+        let tool_run = ids::RUN_5;
         push_note(
             &mut data,
             ids::HTUI_TOOL_1,
             "pick a fan-out branch\nthe rest",
         );
-        let clean_run = push_run(
-            &mut data,
-            ids::HTUI_CLEAN_1,
-            RunStatus::Failed,
-            ids::BOX,
-            Some("exit 1"),
-        );
+        let clean_run = ids::RUN_6;
         push_note(&mut data, ids::HTUI_FEAT_2, "blocked by hand");
 
-        let running = push_item(&mut data, ids::HTUI_ANA_2, 20, Status::InProgress, &[]);
+        let running = push_item(&mut data, ids::HTUI_ANA_2, 20, Status::Open, &[]);
         let running_run = push_run(&mut data, running, RunStatus::Running, ids::BOX, None);
-        let elsewhere = push_item(&mut data, ids::HTUI_ANA_2, 21, Status::InProgress, &[]);
+        let elsewhere = push_item(&mut data, ids::HTUI_ANA_2, 21, Status::Open, &[]);
         let elsewhere_run = push_run(&mut data, elsewhere, RunStatus::Running, laptop_id, None);
         let waiting = push_item(&mut data, ids::HTUI_ANA_2, 22, Status::Open, &[]);
         data.links.push(ItemLink {
@@ -457,13 +447,7 @@ mod tests {
             None,
         );
         push_note(&mut data, exhausted, "review loop gave up after 3 rounds");
-        let gated = push_item(
-            &mut data,
-            ids::HTUI_ANA_2,
-            25,
-            Status::AwaitingApproval,
-            &[],
-        );
+        let gated = push_item(&mut data, ids::HTUI_ANA_2, 25, Status::Open, &[]);
         let gated_run = push_run(
             &mut data,
             gated,
@@ -489,6 +473,7 @@ mod tests {
                 ids::HTUI_TOOL_1,
                 ids::HTUI_FEAT_2,
                 ids::HTUI_ANA_2,
+                ids::HTUI_ANA_1,
                 ids::HTUI_FEAT_3,
                 ids::HTUI_FEAT_1,
             ],
@@ -498,7 +483,10 @@ mod tests {
         let expected = vec![
             (
                 ids::HTUI_FEAT_1,
-                EntryState::Waiting(Wait::NotReady(Status::InProgress)),
+                EntryState::Running {
+                    run: ids::RUN_4,
+                    status: RunStatus::Running,
+                },
             ),
             (
                 ids::HTUI_FEAT_3,
@@ -506,6 +494,10 @@ mod tests {
                     run: ids::RUN_2,
                     status: RunStatus::Queued,
                 },
+            ),
+            (
+                ids::HTUI_ANA_1,
+                EntryState::Waiting(Wait::NotReady(ItemState::Done)),
             ),
             (ids::HTUI_ANA_2, EntryState::Next),
             (
@@ -526,7 +518,7 @@ mod tests {
                 ids::HTUI_CLEAN_1,
                 EntryState::Escalated(Escalation::Failed {
                     run: Some(clean_run),
-                    failure: Some("exit 1".to_owned()),
+                    failure: Some("verify failed".to_owned()),
                 }),
             ),
             (
@@ -699,7 +691,7 @@ mod tests {
                 ids::HTUI_ANA_2,
                 ids::AGY_FIX_1,
                 agy_later,
-                ids::HTUI_FEAT_1,
+                ids::HTUI_ANA_1,
                 agy_open,
                 ids::AGY_FEAT_1,
             ],
@@ -760,8 +752,9 @@ mod tests {
             EntryState::Held(Hold::Budget(_))
         ));
         assert_eq!(
-            state_of(ids::HTUI_FEAT_1),
-            EntryState::Waiting(Wait::NotReady(Status::InProgress))
+            state_of(ids::HTUI_ANA_1),
+            EntryState::Waiting(Wait::NotReady(ItemState::Done)),
+            "a finished item is not ready (MOD-144)"
         );
     }
 

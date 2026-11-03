@@ -2,22 +2,22 @@
 source: crates/htui/tests/backlog_runs.rs
 expression: frame
 ---
-Platform   ¹Backlog        1 working · 1 waiting · memory ·  F9  about   ?  keys
+Platform   ¹Backlog        2 working · 2 waiting · memory ·  F9  about   ?  keys
 ╭─ Backlog (11) ───────────────────────────╮╭─ FEAT-1 · TUI scaffold ──‹ Runs ›╮
 │ ▾ htui (8)                               ││kind   status      box          st│
 │  ANA-1    ● done       Data model, box r…││mode                            fi│
-│  ANA-2    ○ open       Orchestrator step…││graph  ● done      DESKTOP-HTUI 09│
-│  CLEAN-1  ✗ failed     Drop the legacy m…││manual                          09│
-│▌ FEAT-1   ◐ running    TUI scaffold      ││▸ prd             ● done          │
-│  FEAT-2   ⊘ blocked    Agent driver and …││    approved   claude/sonnet      │
-│  FEAT-3   ◌ queued     Postgres store an…││  plan            ● done          │
+│  ANA-2    ○ open       Orchestrator step…││graph  ◐ running   DESKTOP-HTUI 09│
+│  CLEAN-1  ✗ failed     Drop the legacy m…││manual                          — │
+│▌ FEAT-1   ◐ running    TUI scaffold      ││graph  ● done      DESKTOP-HTUI 09│
+│  FEAT-2   ⊘ blocked    Agent driver and …││manual                          09│
+│  FEAT-3   ◌ queued     Postgres store an…││▸ prd             ● done          │
 │  FIX-1    ✓ closed     Terminal left raw…││    approved   claude/sonnet      │
-│  TOOL-1   ⚠ needs you  CI matrix for the…││  implement       ● done          │
-│ ▾ agy (3)                                ││    approved   ~36k ! claude/opus │
-│  ANA-1    ● done       Prompt assembly s…││  review          ● done          │
-│  FEAT-1   ○ open       ACP transport upg…││    approved   agy/default        │
-│  FIX-1    ○ open       Session leak on c…││                                  │
-│                                          ││                                  │
+│  TOOL-1   ⚠ needs you  CI matrix for the…││  plan            ● done          │
+│ ▾ agy (3)                                ││    approved   claude/sonnet      │
+│  ANA-1    ● done       Prompt assembly s…││  implement       ● done          │
+│  FEAT-1   ○ open       ACP transport upg…││    approved   ~36k ! claude/opus │
+│  FIX-1    ○ open       Session leak on c…││  review          ● done          │
+│                                          ││    approved   agy/default        │
 │                                          ││                                  │
 │                                          ││                                  │
 │                                          ││                                  │

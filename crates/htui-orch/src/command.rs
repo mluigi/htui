@@ -13,7 +13,8 @@
 //! [`promote_enabled`], [`accept_enabled`], [`unblock_enabled`], [`close_out_enabled`] and
 //! [`cleanup_enabled`] are what the engine calls after its reads and before its lease, and what
 //! `run_worker`'s greying read calls over the same rows. [`start_enabled`] mirrors `create_run`'s
-//! own compare-and-set and is the one the engine does not call.
+//! live-run check (`htui_core::store::startable`, MOD-144) and is the one the engine does not
+//! call.
 //!
 //! **[`Rest`] and [`EngineError`] live here rather than in `engine.rs`.** The blueprint's §5.1 puts
 //! them beside the `Engine`, but [`CommandOutcome`] carries the first and the two guards return the
@@ -25,8 +26,9 @@ use std::path::PathBuf;
 
 use htui_agent::driver::AgentSessionRef;
 use htui_core::model::{
-    AgentId, Claim, DocumentId, GraphSnapshot, Item, ItemId, RepoId, Resolution, Run, RunId,
-    RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId, StepStatus, WorkspaceId,
+    AgentId, Claim, DocumentId, GraphSnapshot, Item, ItemId, ItemState, RepoId, Resolution, Run,
+    RunFacts, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId, StepStatus,
+    WorkspaceId, latest_graph_run, latest_live_graph_run,
 };
 use htui_core::prompt::AssembleError;
 use htui_core::store::StoreError;
@@ -321,13 +323,14 @@ impl OpeningPath {
 /// Which of §4.3 verdict 1's three ways `Unblock` clears an item (MOD-4 plan D161).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnblockCase {
-    /// The item is `blocked` and no run of it is active: back to `open`, and a new run may start.
+    /// The item is `blocked` and no run of it is live: back to `open`, and a new run may start.
     Reopen,
     /// The item is `blocked` and this run is parked (an escalation, `gate.rs`'s `escalate`): the
-    /// item follows the run to `awaiting_approval`, so the run's gate verbs reach it (R-4).
+    /// item goes back to `open` (`blocked → open`); the parked run's `awaiting_approval` carries
+    /// *needs you*, so the run's gate verbs reach it (R-4, MOD-144).
     FollowRun(RunId),
-    /// The item is `awaiting_approval` over this run, parked where a crashed command or a
-    /// refused reconcile left it (R-7, plan D132): the run is resumed.
+    /// The item is `open` over this run, parked where a crashed command or a refused reconcile
+    /// left it (R-7, plan D132): the run is resumed.
     Resume(RunId),
 }
 
@@ -395,9 +398,8 @@ pub enum EngineError {
         /// `SnapshotPhase::retry_limit`, the number of *additional* attempts (`:485-487`).
         retry_limit: i32,
     },
-    /// Blueprint F-J / R-4: `Status::can_move_to` has no `blocked -> in_progress` edge
-    /// (`crates/htui-core/src/model/item.rs:46-60`), so a blocked item is not walked on until
-    /// [`Command::Unblock`] clears it (`docs/ANA-2.md:1568-1569`, MOD-4 plan D161).
+    /// Blueprint F-J / R-4: a `blocked` item is not walked until [`Command::Unblock`] clears it
+    /// (`docs/ANA-2.md:1568-1569`, MOD-4 plan D161).
     #[error("item {item} is blocked; `Unblock` (`u`) clears it (ANA-2 §4.3)")]
     ItemBlocked {
         /// The item holding the walk.
@@ -608,12 +610,12 @@ pub enum EngineError {
     Isolate(#[from] IsolateError),
     /// MOD-4 plan D161: `Unblock` found nothing it may clear. `why` names what holds the item —
     /// nothing, a walking run, or a gate a human answers instead.
-    #[error("item {item} is `{status}`; {why}")]
+    #[error("item {item} is `{}`; {why}", .state.word())]
     NotBlocked {
         /// The item named.
         item: ItemId,
-        /// Its status.
-        status: Status,
+        /// Its display state (MOD-144): the stored status over the latest graph run.
+        state: ItemState,
         /// What holds it, in a sentence ([`nothing_is_blocked`], [`run_is_walking`],
         /// [`run_waits_at_a_gate`]).
         why: String,
@@ -652,17 +654,16 @@ pub enum EngineError {
         /// The command's exit code, when it had one.
         exit_code: Option<i32>,
     },
-    /// Plan D167: close-out needs an item ANA-11 §4.2's law closes (`open`, `blocked`, `failed`
-    /// or `done`; MOD-39 plan P13 added `open` to the Runs pane).
+    /// Plan D167, ANA-35 §7.1: close-out needs an item that is not `closed`.
     #[error(
-        "item {item} is `{status}`; close-out needs `open`, `blocked`, `failed` or `done` \
-         (ANA-11 §4.2)"
+        "item {item} is `{}`; close-out needs an `open` or `blocked` item (ANA-11 §4.2)",
+        .state.word()
     )]
     NotClosable {
         /// The item named.
         item: ItemId,
-        /// Its status.
-        status: Status,
+        /// Its display state (MOD-144).
+        state: ItemState,
     },
     /// Plan D177 (R-25): a manual cleanup retry is for a run that has finished.
     #[error("run {run} is `{status}`; a cleanup retry is for a finished run (R-25)")]
@@ -1208,12 +1209,17 @@ pub fn accept_enabled(
     Ok(())
 }
 
-/// §4.3 verdict 1's `unblock` (MOD-4 plan D161): which of [`UnblockCase`]'s three cases the item
-/// is in, over the item's active runs, each paired with whether it is resumable.
+/// §4.3 verdict 1's `unblock` (MOD-4 plan D161, MOD-144): which of [`UnblockCase`]'s three cases
+/// the item is in. `runs` is every run of the item, each paired with whether it is resumable
+/// (`false` for a finished run). Only live runs decide the case; the latest graph run names the
+/// item's state in a refusal.
 ///
-/// 1. `blocked` and no run is active: [`UnblockCase::Reopen`].
-/// 2. `blocked` and an active run is parked: [`UnblockCase::FollowRun`].
-/// 3. `awaiting_approval` over a parked run that is resumable: [`UnblockCase::Resume`].
+/// 1. `blocked` and no run is live: [`UnblockCase::Reopen`].
+/// 2. `blocked` and a live run is parked: [`UnblockCase::FollowRun`].
+/// 3. `open` over a parked run that is resumable: [`UnblockCase::Resume`].
+///
+/// An `open` item over a parked run that is not resumable waits at a gate; one over a `queued`,
+/// `running` or `stopped` run is walking (a stopped run resumes through MOD-125's resume).
 ///
 /// The bool is [`crate::status::resumable`] over the run's cursor and its steps (blueprint D196,
 /// widened by MOD-37 R-31), and no other predicate computes it: a crashed rejection is told by the
@@ -1233,34 +1239,42 @@ pub fn unblock_enabled(item: &Item, runs: &[(Run, bool)]) -> Result<UnblockCase,
     let why = match (item.status, parked, active.first()) {
         (Status::Blocked, _, None) => return Ok(UnblockCase::Reopen),
         (Status::Blocked, Some((run, _)), _) => return Ok(UnblockCase::FollowRun(run.id)),
-        (Status::AwaitingApproval, Some((run, true)), _) => {
-            return Ok(UnblockCase::Resume(run.id));
-        }
-        (Status::AwaitingApproval, Some((run, _)), _) => run_waits_at_a_gate(run.id),
-        (Status::Blocked | Status::AwaitingApproval, None, Some((run, _))) => {
+        (Status::Open, Some((run, true)), _) => return Ok(UnblockCase::Resume(run.id)),
+        (Status::Open, Some((run, _)), _) => run_waits_at_a_gate(run.id),
+        (Status::Blocked | Status::Open, None, Some((run, _))) => {
             run_is_walking(run.id, run.status)
         }
         _ => nothing_is_blocked(),
     };
+    let latest = latest_graph_run(runs.iter().map(|(run, _)| run)).map(|run| run.status);
     Err(EngineError::NotBlocked {
         item: item.id,
-        status: item.status,
+        state: ItemState::of(item.status, latest),
         why,
     })
 }
 
-/// `R-TUI-9`'s close-out (MOD-4 plan D167, ANA-11 §4.2): no run of the item is active, and the
-/// item is `open`, `blocked`, `failed` or `done` — the refusals `WriteStore::close_out` re-checks
-/// inside its own transaction, stated here so the Runs tab greys the key by them — and the
-/// resolution the Runs pane's picker starts on ([`Resolution::default_for`], MOD-39 plan P13).
+/// `R-TUI-9`'s close-out (MOD-4 plan D167, ANA-35 §7.1's law): no run of the item is live and
+/// the item is not `closed` — the refusals `WriteStore::close_out` re-checks inside its own
+/// transaction, stated here so the Runs tab greys the key by them — and the resolution the Runs
+/// pane's picker starts on, [`Resolution::default_for`] the latest graph run (MOD-39 plan P13):
+/// `concluded` when it finished and its snapshot's last phase outputs `verdict`, `done` when it
+/// finished otherwise, `withdrawn` when nothing finished (and for a `blocked` item, PD18).
 ///
-/// The picker then offers every resolution that [`Resolution::closes_from`] the item's status,
-/// and [`Command::CloseOut`] sends the one picked; the store stays the authority on the pair.
+/// The picker then offers every resolution that [`Resolution::closes_from`] the item's status and
+/// finish, and [`Command::CloseOut`] sends the one picked; the store stays the authority on it.
+///
+/// Answers that resolution and whether the latest graph run finished `done`, the `finished` that
+/// [`closeout::preview`](crate::closeout::preview) and `closes_from` read, computed once here.
 ///
 /// # Errors
-/// [`EngineError::RunStatus`] naming the first live run, then [`EngineError::NotClosable`] when
-/// `default_for(item.status)` is `None`.
-pub fn close_out_enabled(item: &Item, runs: &[Run]) -> Result<Resolution, EngineError> {
+/// [`EngineError::RunStatus`] naming the first live run, then [`EngineError::NotClosable`] for a
+/// `closed` item.
+pub fn close_out_enabled<'a>(
+    item: &Item,
+    runs: impl IntoIterator<Item = &'a Run>,
+) -> Result<(Resolution, bool), EngineError> {
+    let runs: Vec<&Run> = runs.into_iter().collect();
     if let Some(live) = runs.iter().find(|run| run.status.is_active()) {
         return Err(EngineError::RunStatus {
             run: live.id,
@@ -1268,10 +1282,24 @@ pub fn close_out_enabled(item: &Item, runs: &[Run]) -> Result<Resolution, Engine
             expected: "done | failed | cancelled",
         });
     }
-    Resolution::default_for(item.status).ok_or(EngineError::NotClosable {
-        item: item.id,
-        status: item.status,
-    })
+    if item.status == Status::Closed {
+        return Err(EngineError::NotClosable {
+            item: item.id,
+            state: ItemState::Closed,
+        });
+    }
+    let finished =
+        latest_graph_run(runs.iter().copied()).filter(|run| run.status == RunStatus::Done);
+    let kind = finished.map(|run| {
+        run.graph_snapshot
+            .as_ref()
+            .and_then(GraphSnapshot::last_output_kind)
+            .unwrap_or_default()
+    });
+    Ok((
+        Resolution::default_for(item.status, kind.as_deref()),
+        finished.is_some(),
+    ))
 }
 
 /// MOD-4 plan D177 (R-25): a manual cleanup retry is for a run that has finished.
@@ -1289,27 +1317,34 @@ pub fn cleanup_enabled(run: &Run) -> Result<(), EngineError> {
     })
 }
 
-/// §6.2's `run`/`queue` over the item row: the mirror of `create_run`'s own compare-and-set,
-/// `open | failed -> queued` under the item law (`Status::can_move_to`).
+/// §6.2's `run`/`queue` over the item row and its runs: the mirror of `create_run`'s own check
+/// (MOD-144: `open` and no live graph run, [`htui_core::store::startable`]), so the Runs tab greys
+/// `R` by the same law.
 ///
-/// **The engine does not call it**: `create_run` refuses inside its transaction, and
-/// `legal_move` stays the authority. It exists so the Runs tab greys `R` by the same law, and
-/// `start_enabled_is_the_law` pins the two together.
+/// **The engine does not call it** for the decision: `create_run` refuses under the item lock and
+/// stays the authority. `start_enabled_is_the_law` pins the two together.
+///
+/// Generic over [`RunFacts`], so the engine's `enqueue_with` passes the `RunSummary` rows it reads
+/// and the worker's views the `Run` rows they hold, neither copied.
 ///
 /// # Errors
-/// [`EngineError::Store`] carrying `legal_move`'s own refusal.
-pub fn start_enabled(item: &Item) -> Result<(), EngineError> {
-    htui_core::store::legal_move(item.status, Status::Queued).map_err(EngineError::Store)
+/// [`EngineError::Store`] carrying `startable`'s own refusal.
+pub fn start_enabled<'a, R: RunFacts + 'a>(
+    item: &Item,
+    runs: impl IntoIterator<Item = &'a R>,
+) -> Result<(), EngineError> {
+    let live = latest_live_graph_run(runs).map(RunFacts::run_status);
+    htui_core::store::startable(&item.key, item.status, live).map_err(EngineError::Store)
 }
 
 #[cfg(test)]
 mod tests {
     use htui_core::fixtures::{demo_data, ids};
     use htui_core::model::{
-        Claim, GateOutcome, GraphSnapshot, Item, OverlapRule, Resolution, Run, RunStatus, RunStep,
-        SnapshotPhase, Status, StepStatus,
+        Claim, GateOutcome, GraphSnapshot, Item, ItemState, OverlapRule, Resolution, Run, RunKind,
+        RunStatus, RunStep, SnapshotPhase, Status, StepStatus,
     };
-    use htui_core::store::StoreError;
+    use htui_core::store::{StoreError, not_startable};
 
     use htui_core::model::StepId;
 
@@ -1919,7 +1954,7 @@ mod tests {
             (
                 EngineError::NotBlocked {
                     item,
-                    status: Status::Open,
+                    state: ItemState::Open,
                     why: nothing_is_blocked(),
                 },
                 format!("item {item} is `open`; nothing is blocked"),
@@ -1927,7 +1962,7 @@ mod tests {
             (
                 EngineError::NotBlocked {
                     item,
-                    status: Status::Blocked,
+                    state: ItemState::Blocked,
                     why: run_is_walking(run, RunStatus::Running),
                 },
                 format!("item {item} is `blocked`; run {run} is `running`"),
@@ -1935,12 +1970,10 @@ mod tests {
             (
                 EngineError::NotBlocked {
                     item,
-                    status: Status::AwaitingApproval,
+                    state: ItemState::NeedsYou,
                     why: run_waits_at_a_gate(run),
                 },
-                format!(
-                    "item {item} is `awaiting_approval`; run {run} is parked at a gate; answer it"
-                ),
+                format!("item {item} is `needs you`; run {run} is parked at a gate; answer it"),
             ),
             (
                 EngineError::NotPromoted { step },
@@ -1988,11 +2021,11 @@ mod tests {
             (
                 EngineError::NotClosable {
                     item,
-                    status: Status::Queued,
+                    state: ItemState::Closed,
                 },
                 format!(
-                    "item {item} is `queued`; close-out needs `open`, `blocked`, `failed` or \
-                     `done` (ANA-11 §4.2)"
+                    "item {item} is `closed`; close-out needs an `open` or `blocked` item \
+                     (ANA-11 §4.2)"
                 ),
             ),
             (
@@ -2040,7 +2073,7 @@ mod tests {
         step.attempt = 1;
         phase.retry_limit = 1;
         let steps = vec![step.clone()];
-        assert!(retry_admitted(&run, Status::AwaitingApproval, &steps, &step, &phase).is_ok());
+        assert!(retry_admitted(&run, Status::Open, &steps, &step, &phase).is_ok());
 
         let refused = retry_admitted(&run, Status::Blocked, &steps, &step, &phase)
             .expect_err("a blocked item is not walked on");
@@ -2070,12 +2103,12 @@ mod tests {
         phase.fan_out = 2;
         step.status = StepStatus::Done;
         let group = vec![step.clone()];
-        assert!(retry_admitted(&run, Status::AwaitingApproval, &group, &step, &phase).is_ok());
+        assert!(retry_admitted(&run, Status::Open, &group, &step, &phase).is_ok());
         let mut later = step.clone();
         later.id = StepId::new();
         later.attempt = 2;
         let group = vec![step.clone(), later.clone()];
-        let refused = retry_admitted(&run, Status::AwaitingApproval, &group, &step, &phase)
+        let refused = retry_admitted(&run, Status::Open, &group, &step, &phase)
             .expect_err("attempt 2 replaced attempt 1");
         assert!(
             matches!(
@@ -2088,7 +2121,7 @@ mod tests {
             ),
             "{refused}"
         );
-        let refused = retry_admitted(&run, Status::AwaitingApproval, &group, &later, &phase)
+        let refused = retry_admitted(&run, Status::Open, &group, &later, &phase)
             .expect_err("a third attempt is out of budget");
         assert!(
             matches!(refused, EngineError::RetryExhausted { attempt: 2, .. }),
@@ -2096,7 +2129,7 @@ mod tests {
         );
 
         phase.fan_out = 1;
-        let refused = retry_admitted(&run, Status::AwaitingApproval, &steps, &step, &phase)
+        let refused = retry_admitted(&run, Status::Open, &steps, &step, &phase)
             .expect_err("a single `done` step is not retryable");
         assert!(matches!(refused, EngineError::NotGated { .. }), "{refused}");
     }
@@ -2115,8 +2148,7 @@ mod tests {
         ] {
             step.status = status;
             assert!(
-                promote_enabled(&run, Status::AwaitingApproval, &steps, &step, &phase, false)
-                    .is_ok(),
+                promote_enabled(&run, Status::Open, &steps, &step, &phase, false).is_ok(),
                 "`{status}` is promotable"
             );
         }
@@ -2127,9 +2159,8 @@ mod tests {
             StepStatus::Cancelled,
         ] {
             step.status = status;
-            let refused =
-                promote_enabled(&run, Status::AwaitingApproval, &steps, &step, &phase, false)
-                    .expect_err("only a live step is promotable");
+            let refused = promote_enabled(&run, Status::Open, &steps, &step, &phase, false)
+                .expect_err("only a live step is promotable");
             assert!(
                 matches!(
                     refused,
@@ -2144,9 +2175,8 @@ mod tests {
 
         for status in [RunStatus::Done, RunStatus::Failed, RunStatus::Cancelled] {
             run.status = status;
-            let refused =
-                promote_enabled(&run, Status::AwaitingApproval, &steps, &step, &phase, false)
-                    .expect_err("a finished run has nothing to chat in");
+            let refused = promote_enabled(&run, Status::Open, &steps, &step, &phase, false)
+                .expect_err("a finished run has nothing to chat in");
             assert!(
                 matches!(refused, EngineError::RunStatus { status: got, .. } if got == status),
                 "the run is read first: {refused}"
@@ -2176,21 +2206,14 @@ mod tests {
 
         let mut fanned = phase.clone();
         fanned.fan_out = 3;
-        let refused = promote_enabled(
-            &run,
-            Status::AwaitingApproval,
-            &steps,
-            &step,
-            &fanned,
-            false,
-        )
-        .expect_err("a candidate is selected, not promoted");
+        let refused = promote_enabled(&run, Status::Open, &steps, &step, &fanned, false)
+            .expect_err("a candidate is selected, not promoted");
         assert!(
             matches!(refused, EngineError::PromoteCandidate { step: id } if id == step.id),
             "{refused}"
         );
 
-        let refused = promote_enabled(&run, Status::AwaitingApproval, &steps, &step, &phase, true)
+        let refused = promote_enabled(&run, Status::Open, &steps, &step, &phase, true)
             .expect_err("the Chat tab hosts one session");
         assert!(
             matches!(refused, EngineError::ChatLive { step: None }),
@@ -2253,7 +2276,7 @@ mod tests {
     }
 
     /// MOD-4 plan D161's three cases in order, and the sentence naming what holds the item
-    /// otherwise.
+    /// otherwise, by the item's derived state (MOD-144).
     #[test]
     fn unblock_names_its_three_cases_and_what_holds_the_item() {
         let parked = parked_run();
@@ -2261,6 +2284,8 @@ mod tests {
         finished.status = RunStatus::Failed;
         let mut running = parked.clone();
         running.status = RunStatus::Running;
+        let mut stopped = parked.clone();
+        stopped.status = RunStatus::Stopped;
         // `status::resumable` over a real gate, and over a crashed command's cursor.
         let gate = false;
         let crashed = true;
@@ -2291,7 +2316,8 @@ mod tests {
             )
         );
 
-        let waiting = item_at(Status::AwaitingApproval);
+        // MOD-144: an `open` item over a parked run reads `needs you`.
+        let waiting = item_at(Status::Open);
         assert!(matches!(
             unblock_enabled(&waiting, &[(parked.clone(), crashed)]),
             Ok(UnblockCase::Resume(run)) if run == parked.id
@@ -2301,19 +2327,46 @@ mod tests {
         assert_eq!(
             refused.to_string(),
             format!(
-                "item {} is `awaiting_approval`; run {} is parked at a gate; answer it",
+                "item {} is `needs you`; run {} is parked at a gate; answer it",
                 waiting.id, parked.id
             )
         );
 
-        for status in [Status::Open, Status::Done, Status::AwaitingApproval] {
-            let refused =
-                unblock_enabled(&item_at(status), &[]).expect_err("nothing holds the item");
+        // An `open` item over a walking run, `stopped` included (it resumes through MOD-125's
+        // resume, not through `Unblock`).
+        for (walking, state) in [
+            (&running, ItemState::Running),
+            (&stopped, ItemState::Stopped),
+        ] {
+            let refused = unblock_enabled(&waiting, &[(walking.clone(), crashed)])
+                .expect_err("a walking run holds the item");
             assert!(
-                matches!(&refused, EngineError::NotBlocked { status: got, why, .. } if *got == status && *why == nothing_is_blocked()),
+                matches!(&refused, EngineError::NotBlocked { state: got, why, .. }
+                    if *got == state && *why == run_is_walking(walking.id, walking.status)),
                 "{refused}"
             );
         }
+
+        for (status, state) in [
+            (Status::Open, ItemState::Open),
+            (Status::Closed, ItemState::Closed),
+        ] {
+            let refused =
+                unblock_enabled(&item_at(status), &[]).expect_err("nothing holds the item");
+            assert!(
+                matches!(&refused, EngineError::NotBlocked { state: got, why, .. } if *got == state && *why == nothing_is_blocked()),
+                "{refused}"
+            );
+        }
+
+        // A finished run is not live, but it names the state: `open` over `done` reads `done`.
+        let mut done = parked.clone();
+        done.status = RunStatus::Done;
+        let refused = unblock_enabled(&waiting, &[(done, gate)]).expect_err("nothing is blocked");
+        assert!(
+            matches!(&refused, EngineError::NotBlocked { state: ItemState::Done, why, .. } if *why == nothing_is_blocked()),
+            "{refused}"
+        );
     }
 
     /// MOD-37 R-31: a run parked over the `failed` + `rejected` step a crash left between the
@@ -2330,7 +2383,7 @@ mod tests {
             step: step.id,
             status: StepStatus::Failed,
         };
-        let waiting = item_at(Status::AwaitingApproval);
+        let waiting = item_at(Status::Open);
 
         let rejected = [step.clone()];
         assert!(matches!(
@@ -2348,28 +2401,23 @@ mod tests {
         );
     }
 
-    /// MOD-4 plan D167: close-out is refused while a run of the item is active, then for an item
-    /// ANA-11 §4.2 does not close; an item it closes answers the resolution the Runs pane's picker
-    /// starts on (MOD-39 plan P13: `done` -> `done`; `open`, `failed` and `blocked` ->
-    /// `withdrawn`).
+    /// `RUN_1` cloned as a newer run of the same item at `status`: a fresh id and a `queued_at`
+    /// `seconds` after `RUN_1`'s, so the latest-graph-run order sees it as newer.
+    fn newer(status: RunStatus, seconds: i64) -> Run {
+        let mut run = parked_run();
+        run.id = htui_core::model::RunId::new();
+        run.queued_at += chrono::TimeDelta::seconds(seconds);
+        run.status = status;
+        run
+    }
+
+    /// MOD-4 plan D167: close-out is refused while a run of the item is live, then for a `closed`
+    /// item (MOD-144: `NotClosable` names the derived state).
     #[test]
     fn close_out_needs_no_live_run_and_a_closable_item() {
         let parked = parked_run();
         let mut finished = parked.clone();
         finished.status = RunStatus::Done;
-        for (status, resolution) in [
-            (Status::Done, Resolution::Done),
-            (Status::Open, Resolution::Withdrawn),
-            (Status::Failed, Resolution::Withdrawn),
-            (Status::Blocked, Resolution::Withdrawn),
-        ] {
-            assert_eq!(
-                close_out_enabled(&item_at(status), std::slice::from_ref(&finished)).ok(),
-                Some(resolution),
-                "`{status}` closes as `{resolution}`"
-            );
-            assert_eq!(Resolution::default_for(status), Some(resolution));
-        }
         let refused =
             close_out_enabled(&item_at(Status::Open), &[finished.clone(), parked.clone()])
                 .expect_err("a live run");
@@ -2384,19 +2432,104 @@ mod tests {
             ),
             "the live run is named before the item: {refused}"
         );
-        for status in [
-            Status::Queued,
-            Status::InProgress,
-            Status::AwaitingApproval,
-            Status::Closed,
-        ] {
-            let refused =
-                close_out_enabled(&item_at(status), &[]).expect_err("not a finished item");
+        let refused = close_out_enabled(&item_at(Status::Closed), std::slice::from_ref(&finished))
+            .expect_err("a closed item");
+        assert!(
+            matches!(
+                refused,
+                EngineError::NotClosable {
+                    state: ItemState::Closed,
+                    ..
+                }
+            ),
+            "{refused}"
+        );
+        // A `stopped` run is live (MOD-125): close-out waits for it like any other.
+        let mut stopped = parked;
+        stopped.status = RunStatus::Stopped;
+        let refused = close_out_enabled(&item_at(Status::Open), std::slice::from_ref(&stopped))
+            .expect_err("a stopped run is live");
+        assert!(
+            matches!(
+                refused,
+                EngineError::RunStatus {
+                    status: RunStatus::Stopped,
+                    ..
+                }
+            ),
+            "{refused}"
+        );
+    }
+
+    /// MOD-144 (ANA-35 §7.1, PD18): the picker starts on `default_for` the latest graph run, and
+    /// every start it offers is one `closes_from` admits.
+    #[test]
+    fn close_out_defaults_from_the_latest_graph_run() {
+        let done = newer(RunStatus::Done, 0);
+        let cancelled = newer(RunStatus::Cancelled, 10);
+        let failed_after = newer(RunStatus::Failed, 10);
+        let failed = newer(RunStatus::Failed, 0);
+        let cases: [(Status, Vec<Run>, Resolution, bool); 6] = [
+            (Status::Open, vec![], Resolution::Withdrawn, false),
+            (Status::Open, vec![failed], Resolution::Withdrawn, false),
+            (Status::Open, vec![done.clone()], Resolution::Done, true),
+            (
+                Status::Open,
+                vec![done.clone(), cancelled],
+                Resolution::Done,
+                true,
+            ),
+            (
+                Status::Open,
+                vec![done.clone(), failed_after],
+                Resolution::Withdrawn,
+                false,
+            ),
+            // PD18: a blocked item never closes `done`; it is unblocked first.
+            (Status::Blocked, vec![done], Resolution::Withdrawn, true),
+        ];
+        for (status, runs, resolution, finished) in cases {
+            let start = close_out_enabled(&item_at(status), &runs);
+            assert_eq!(
+                start.ok(),
+                Some((resolution, finished)),
+                "`{status}` over {:?}: the start and whether the latest graph run finished",
+                runs.iter().map(|run| run.status).collect::<Vec<_>>()
+            );
             assert!(
-                matches!(refused, EngineError::NotClosable { status: got, .. } if got == status),
-                "{refused}"
+                resolution.closes_from(status, finished),
+                "`{resolution}` closes `{status}` (finished {finished})"
             );
         }
+    }
+
+    /// MOD-144: a finished run whose snapshot's last phase outputs `verdict` concludes; a finished
+    /// run with no readable snapshot is `done`.
+    #[test]
+    fn close_out_concludes_after_a_verdict_phase() {
+        let mut verdict = newer(RunStatus::Done, 0);
+        let snapshot = verdict
+            .graph_snapshot
+            .as_mut()
+            .expect("RUN_1 carries a snapshot");
+        let phases = snapshot["phases"]
+            .as_array_mut()
+            .expect("the snapshot has phases");
+        let last = phases
+            .iter_mut()
+            .max_by_key(|phase| phase["position"].as_i64())
+            .expect("at least one phase");
+        last["output_kind"] = serde_json::Value::from("verdict");
+        assert_eq!(
+            close_out_enabled(&item_at(Status::Open), std::slice::from_ref(&verdict)).ok(),
+            Some((Resolution::Concluded, true))
+        );
+
+        verdict.graph_snapshot = None;
+        assert_eq!(
+            close_out_enabled(&item_at(Status::Open), std::slice::from_ref(&verdict)).ok(),
+            Some((Resolution::Done, true))
+        );
     }
 
     /// MOD-4 plan D177: the manual cleanup retry is for exactly the three terminal statuses.
@@ -2422,24 +2555,77 @@ mod tests {
         }
     }
 
-    /// Blueprint D184: `start_enabled` is `create_run`'s item law, row for row.
+    /// Blueprint D184, MOD-144: `start_enabled` is `create_run`'s law, row for row: an `open`
+    /// item with no live graph run ([`htui_core::store::startable`]).
     #[test]
     fn start_enabled_is_the_law() {
         let mut item = item_at(Status::Open);
+        let live = [
+            None,
+            Some(RunStatus::Queued),
+            Some(RunStatus::Running),
+            Some(RunStatus::AwaitingApproval),
+            Some(RunStatus::Stopped),
+        ];
         for &status in Status::ALL {
             item.status = status;
-            let admitted = start_enabled(&item);
-            assert_eq!(
-                admitted.is_ok(),
-                status.can_move_to(Status::Queued),
-                "`{status}`"
-            );
-            if let Err(refused) = admitted {
-                assert!(
-                    matches!(refused, EngineError::Store(StoreError::Constraint(_))),
-                    "legal_move's own refusal: {refused}"
+            for live in live {
+                let runs: Vec<Run> = live.map(|at| newer(at, 0)).into_iter().collect();
+                let admitted = start_enabled(&item, &runs);
+                assert_eq!(
+                    admitted.is_ok(),
+                    status == Status::Open && live.is_none(),
+                    "`{status}` over {live:?}"
                 );
+                assert_eq!(
+                    admitted.is_ok(),
+                    htui_core::store::startable(&item.key, status, live).is_ok()
+                );
+                if let Err(refused) = admitted {
+                    let expected = not_startable(&item.key, ItemState::of(status, live));
+                    assert!(
+                        matches!(&refused, EngineError::Store(StoreError::Constraint(sentence))
+                            if *sentence == expected),
+                        "startable's own refusal: {refused}"
+                    );
+                }
             }
         }
+
+        // A finished or cancelled run holds nothing: a rework run starts.
+        for status in [RunStatus::Done, RunStatus::Failed, RunStatus::Cancelled] {
+            item.status = Status::Open;
+            assert!(
+                start_enabled(&item, &[newer(status, 0)]).is_ok(),
+                "`open` over `{status}`"
+            );
+        }
+        // A live chat run is not a graph run.
+        let mut chat = newer(RunStatus::Running, 0);
+        chat.kind = RunKind::Chat;
+        assert!(start_enabled(&item, &[chat]).is_ok(), "a live chat run");
+
+        // The engine's `enqueue_with` passes the store's summaries: the same law over `RunSummary`.
+        let summary = |status: RunStatus| {
+            let run = newer(status, 0);
+            htui_core::model::RunSummary {
+                id: run.id,
+                item_id: run.item_id,
+                project_id: run.project_id,
+                kind: run.kind,
+                mode: run.mode,
+                status,
+                target_box_id: run.target_box_id,
+                executing_box_id: None,
+                box_hostname: String::new(),
+                queued_at: run.queued_at,
+                started_at: None,
+                finished_at: None,
+                failure: None,
+                steps: Vec::new(),
+            }
+        };
+        assert!(start_enabled(&item, &[summary(RunStatus::Done)]).is_ok());
+        assert!(start_enabled(&item, &[summary(RunStatus::Stopped)]).is_err());
     }
 }

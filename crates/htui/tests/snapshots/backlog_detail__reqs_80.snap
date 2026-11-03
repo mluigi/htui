@@ -2,7 +2,7 @@
 source: crates/htui/tests/backlog_detail.rs
 expression: frame
 ---
-Platform   ¹Backlog        1 working · 1 waiting · memory ·  F9  about   ?  keys
+Platform   ¹Backlog        2 working · 2 waiting · memory ·  F9  about   ?  keys
 ╭─ Backlog (11) ───────────────────────────╮╭─ ANA-1 · Data model, box …‹ Reqs ╮
 │ ▾ htui (8)                               ││▌ R-ENT-1 addresses v1 ! suspect  │
 │▌ ANA-1    ● done       Data model, box r…││▌ Every item has a stable key of …│

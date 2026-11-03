@@ -444,8 +444,9 @@ async fn esc_esc_ends_the_chat_and_closes_its_run() {
     };
     assert_eq!(
         store.active_runs(&scope).await.expect("count"),
-        1,
-        "the chat's run is closed; only the fixture's own queued run is still active"
+        3,
+        "the chat's run is closed; only the fixture's own runs are still active (MOD-144: \
+         RUN_2 queued, RUN_4 running, RUN_5 parked)"
     );
 }
 

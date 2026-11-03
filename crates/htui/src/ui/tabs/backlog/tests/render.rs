@@ -307,7 +307,7 @@ async fn the_cursor_row_reads_without_colour() {
 async fn an_applied_filter_is_the_summary_band_over_the_rows() {
     let bench = Bench::new().await;
     let tab = BacklogTab {
-        items: with_status(&bench, Status::Done),
+        items: with_state(&bench, ItemState::Done),
         filter: done_only(),
         shown: done_only(),
         ..bench.tab()
@@ -477,8 +477,8 @@ async fn the_filter_forms_focused_row_reads_without_colour() {
     tab.form = Some(FilterForm::open(&tab.filter, &bench.projects));
     let buffer = buffer_of(&tab, &bench.ctx());
     let status = DEFAULT_SIZE.1 - crate::ui::tabs::backlog::filter::FORM_HEIGHT + 1;
-    let row = text(&buffer, 0, status, 30);
-    assert!(row.starts_with("│▌status    ‹[ ] open›  any"), "{row}");
+    let row = text(&buffer, 0, status, 40);
+    assert!(row.starts_with("│▌status    ‹[ ] needs you›  any"), "{row}");
     assert!(
         style_at(&buffer, 3, status)
             .add_modifier

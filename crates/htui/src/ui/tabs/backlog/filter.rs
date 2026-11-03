@@ -1,6 +1,7 @@
 //! The Backlog filter (MOD-13 milestone 1): what narrows the list, and the form that edits it.
 //!
-//! [`BacklogFilter`] is the tab's state (D1): statuses, projects, required tags and "ready here".
+//! [`BacklogFilter`] is the tab's state (D1): item states (MOD-144: the derived
+//! [`ItemState`], through `ItemFilter::states`), projects, required tags and "ready here".
 //! It leaves as one [`StoreRequest::Items`], so the shell's staleness index sees one request kind
 //! whether a filter is set or not (D2). The view never sets `ItemFilter::ready`; `ready_here` asks
 //! the worker to compose ANA-9 §7.4 for this box.
@@ -18,7 +19,9 @@
 //! and the band on the focused row, legible without colour), its keys the pane's own hints.
 
 use crossterm::event::KeyEvent;
-use htui_core::model::{ItemFilter, ProjectId, ProjectRef, Scope, Status, declared_tags_from_text};
+use htui_core::model::{
+    ItemFilter, ItemState, ProjectId, ProjectRef, Scope, declared_tags_from_text,
+};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
@@ -70,8 +73,8 @@ fn required_tag_refusal(sentence: String) -> String {
 /// What narrows the Backlog list. `default()` is the whole scope, and shows nothing (D5).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BacklogFilter {
-    /// Statuses to keep; empty = any. Kept in [`Status::ALL`] order.
-    pub statuses: Vec<Status>,
+    /// Item states to keep; empty = any. Kept in [`ItemState::ALL`] (attention) order.
+    pub states: Vec<ItemState>,
     /// Projects to keep; empty = every project of the scope. Kept in `ctx.projects` order.
     pub projects: Vec<ProjectId>,
     /// Required tags every kept item carries (D3), canonical through
@@ -97,11 +100,12 @@ impl BacklogFilter {
             (!values.is_empty()).then(|| values.to_vec())
         }
         ItemFilter {
-            statuses: facet(&self.statuses),
+            statuses: None,
             project_ids: facet(&self.projects),
             tags: facet(&self.tags),
             ready: None,
             text: None,
+            states: facet(&self.states),
         }
     }
 
@@ -128,11 +132,11 @@ impl BacklogFilter {
             return None;
         }
         let mut parts = Vec::with_capacity(4);
-        if !self.statuses.is_empty() {
+        if !self.states.is_empty() {
             let names: Vec<&str> = self
-                .statuses
+                .states
                 .iter()
-                .map(|status| kit_status::mark(*status).word)
+                .map(|state| kit_status::mark(*state).word)
                 .collect();
             parts.push(format!("status: {}", names.join(", ")));
         }
@@ -157,7 +161,7 @@ impl BacklogFilter {
     }
 
     /// Drops the projects `scope` lacks (D6), so a gone project cannot silently empty the list.
-    /// Status, tags and readiness are scope-independent and stay.
+    /// States, tags and readiness are scope-independent and stay.
     pub fn retain_projects(&mut self, scope: &Scope) {
         self.projects.retain(|project| scope.contains(*project));
     }
@@ -166,7 +170,7 @@ impl BacklogFilter {
 /// A row of the form, top to bottom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterRow {
-    /// The status options.
+    /// The item-state options.
     Status,
     /// The scope's projects.
     Project,
@@ -208,12 +212,12 @@ pub enum FormOutcome {
 /// change, so the snapshot never outlives its scope.
 #[derive(Debug)]
 pub struct FilterForm {
-    /// Statuses, projects and readiness being edited; `draft.tags` is replaced from `tags` on
+    /// States, projects and readiness being edited; `draft.tags` is replaced from `tags` on
     /// apply.
     draft: BacklogFilter,
     /// The focused row; the form opens on Status.
     row: FilterRow,
-    /// The status option under the cursor, an index into [`Status::ALL`].
+    /// The state option under the cursor, an index into [`ItemState::ALL`].
     status_at: usize,
     /// The project option under the cursor, an index into `projects`.
     project_at: usize,
@@ -330,7 +334,7 @@ impl FilterForm {
             }
         };
         match self.row {
-            FilterRow::Status => self.status_at = step(self.status_at, Status::ALL.len()),
+            FilterRow::Status => self.status_at = step(self.status_at, ItemState::ALL.len()),
             FilterRow::Project => self.project_at = step(self.project_at, self.projects.len()),
             FilterRow::Tags | FilterRow::Ready => {}
         }
@@ -341,11 +345,11 @@ impl FilterForm {
     fn toggle(&mut self) -> FormOutcome {
         match self.row {
             FilterRow::Status => {
-                let status = Status::ALL[self.status_at];
-                toggle(&mut self.draft.statuses, status);
+                let state = ItemState::ALL[self.status_at];
+                toggle(&mut self.draft.states, state);
                 self.draft
-                    .statuses
-                    .sort_by_key(|status| Status::ALL.iter().position(|all| all == status));
+                    .states
+                    .sort_by_key(|state| ItemState::ALL.iter().position(|all| all == state));
             }
             FilterRow::Project => {
                 let Some(project) = self.projects.get(self.project_at) else {
@@ -379,16 +383,16 @@ impl FilterForm {
     fn value(&self, row: FilterRow) -> String {
         match row {
             FilterRow::Status => {
-                let option = Status::ALL[self.status_at];
+                let option = ItemState::ALL[self.status_at];
                 let chosen: Vec<&str> = self
                     .draft
-                    .statuses
+                    .states
                     .iter()
-                    .map(|status| kit_status::mark(*status).word)
+                    .map(|state| kit_status::mark(*state).word)
                     .collect();
                 format!(
                     "‹{} {}›  {}",
-                    check(self.draft.statuses.contains(&option)),
+                    check(self.draft.states.contains(&option)),
                     kit_status::mark(option).word,
                     any(&chosen)
                 )
@@ -546,7 +550,7 @@ mod tests {
         let keys = crate::keys::load_str("[backlog.filter_form]\nclear = \"f2\"\n")
             .expect("the keys load");
         let filter = BacklogFilter {
-            statuses: vec![Status::Open],
+            states: vec![ItemState::Open],
             ..BacklogFilter::default()
         };
         let mut form = FilterForm::open(&filter, &projects());
@@ -588,7 +592,7 @@ mod tests {
         assert_eq!(
             form.on_key(key(KeyCode::Enter), &keys),
             FormOutcome::Apply(BacklogFilter {
-                statuses: vec![Status::ALL[1]],
+                states: vec![ItemState::ALL[1]],
                 ..BacklogFilter::default()
             })
         );
@@ -598,7 +602,7 @@ mod tests {
         assert_eq!(
             form.on_key(key(KeyCode::Enter), Keys::compiled()),
             FormOutcome::Apply(BacklogFilter {
-                statuses: vec![Status::ALL[1]],
+                states: vec![ItemState::ALL[1]],
                 ..BacklogFilter::default()
             })
         );
@@ -628,7 +632,7 @@ mod tests {
         );
         assert_eq!(
             form.status_at,
-            Status::ALL.len() - 1,
+            ItemState::ALL.len() - 1,
             "a pressed `Left` moves"
         );
     }
@@ -682,7 +686,7 @@ mod tests {
     #[test]
     fn to_request_maps_every_field() {
         let filter = BacklogFilter {
-            statuses: vec![Status::Open, Status::Done],
+            states: vec![ItemState::Open, ItemState::Done],
             projects: vec![ids::PROJECT_AGY],
             tags: vec!["gpu".to_owned(), "rust".to_owned()],
             ready_here: true,
@@ -702,11 +706,12 @@ mod tests {
         assert_eq!(
             item_filter,
             ItemFilter {
-                statuses: Some(vec![Status::Open, Status::Done]),
+                statuses: None,
                 project_ids: Some(vec![ids::PROJECT_AGY]),
                 tags: Some(vec!["gpu".to_owned(), "rust".to_owned()]),
                 ready: None,
                 text: None,
+                states: Some(vec![ItemState::Open, ItemState::Done]),
             },
             "the view never sets `ready`: the worker does (D2)"
         );
@@ -721,7 +726,7 @@ mod tests {
     #[test]
     fn summary_names_statuses_projects_tags_and_readiness() {
         let filter = BacklogFilter {
-            statuses: vec![Status::Open, Status::Done],
+            states: vec![ItemState::Open, ItemState::Done],
             projects: vec![ids::PROJECT_HTUI],
             tags: vec!["gpu".to_owned(), "rust".to_owned()],
             ready_here: true,
@@ -735,13 +740,22 @@ mod tests {
             ..BacklogFilter::default()
         };
         assert_eq!(ready.summary(&projects()).as_deref(), Some("ready here"));
+        // MOD-144: a state is named by its redesign word, never its raw `needs_you`.
+        let waiting = BacklogFilter {
+            states: vec![ItemState::NeedsYou, ItemState::Stopped],
+            ..BacklogFilter::default()
+        };
+        assert_eq!(
+            waiting.summary(&projects()).as_deref(),
+            Some("status: needs you, stopped")
+        );
     }
 
     /// MOD-115 M4 E4: a status reads as `kit::status`'s word, never its internal name.
     #[test]
     fn summary_names_each_status_by_its_word() {
         let filter = BacklogFilter {
-            statuses: vec![Status::InProgress, Status::AwaitingApproval],
+            states: vec![ItemState::Running, ItemState::NeedsYou],
             ..BacklogFilter::default()
         };
         assert_eq!(
@@ -754,13 +768,13 @@ mod tests {
     #[test]
     fn retain_projects_drops_what_the_scope_lacks() {
         let mut filter = BacklogFilter {
-            statuses: vec![Status::Done],
+            states: vec![ItemState::Done],
             projects: vec![ids::PROJECT_HTUI, ids::PROJECT_AGY],
             ..BacklogFilter::default()
         };
         filter.retain_projects(&scope(&[ids::PROJECT_HTUI]));
         assert_eq!(filter.projects, [ids::PROJECT_HTUI]);
-        assert_eq!(filter.statuses, [Status::Done], "status is scope-free");
+        assert_eq!(filter.states, [ItemState::Done], "the state is scope-free");
     }
 
     #[test]
@@ -812,16 +826,20 @@ mod tests {
     fn h_and_l_move_within_the_status_options_and_wrap() {
         let mut form = open();
         form.on_key(key(KeyCode::Char('l')), Keys::compiled());
-        assert_eq!(Status::ALL[form.status_at], Status::Queued);
+        assert_eq!(ItemState::ALL[form.status_at], ItemState::Failed);
         form.on_key(key(KeyCode::Left), Keys::compiled());
         form.on_key(key(KeyCode::Char('h')), Keys::compiled());
         assert_eq!(
-            Status::ALL[form.status_at],
-            Status::Closed,
+            ItemState::ALL[form.status_at],
+            ItemState::Closed,
             "`h` on the first wraps to the last"
         );
         form.on_key(key(KeyCode::Right), Keys::compiled());
-        assert_eq!(Status::ALL[form.status_at], Status::Open, "and back");
+        assert_eq!(
+            ItemState::ALL[form.status_at],
+            ItemState::NeedsYou,
+            "and back"
+        );
 
         form.on_key(key(KeyCode::Char('j')), Keys::compiled());
         form.on_key(key(KeyCode::Char('l')), Keys::compiled());
@@ -840,26 +858,24 @@ mod tests {
     }
 
     #[test]
-    fn space_toggles_a_status_in_all_order() {
+    fn space_toggles_a_state_in_all_order() {
         let mut form = open();
-        for _ in 0..5 {
+        for _ in 0..7 {
             form.on_key(key(KeyCode::Char('l')), Keys::compiled());
         }
         form.on_key(key(KeyCode::Char(' ')), Keys::compiled());
-        assert_eq!(form.draft.statuses, [Status::Done]);
-        for _ in 0..5 {
-            form.on_key(key(KeyCode::Char('h')), Keys::compiled());
-        }
+        assert_eq!(form.draft.states, [ItemState::Done]);
+        form.on_key(key(KeyCode::Char('h')), Keys::compiled());
         form.on_key(key(KeyCode::Char(' ')), Keys::compiled());
         assert_eq!(
-            form.draft.statuses,
-            [Status::Open, Status::Done],
-            "kept in `Status::ALL` order, not toggle order"
+            form.draft.states,
+            [ItemState::Open, ItemState::Done],
+            "kept in `ItemState::ALL` order, not toggle order"
         );
         form.on_key(key(KeyCode::Char(' ')), Keys::compiled());
         assert_eq!(
-            form.draft.statuses,
-            [Status::Done],
+            form.draft.states,
+            [ItemState::Done],
             "a second space unticks"
         );
     }
@@ -945,7 +961,8 @@ mod tests {
         assert_eq!(
             status.on_key(key(KeyCode::Enter), Keys::compiled()),
             FormOutcome::Apply(BacklogFilter {
-                statuses: vec![Status::Open],
+                // The first option in attention order (MOD-144).
+                states: vec![ItemState::NeedsYou],
                 ..BacklogFilter::default()
             }),
             "`Enter` applies from any row"
@@ -971,7 +988,7 @@ mod tests {
     #[test]
     fn x_clears_the_draft_without_applying() {
         let filter = BacklogFilter {
-            statuses: vec![Status::Done],
+            states: vec![ItemState::Done],
             projects: vec![ids::PROJECT_AGY],
             tags: vec!["rust".to_owned()],
             ready_here: true,
@@ -1015,7 +1032,7 @@ mod tests {
     #[test]
     fn the_form_opens_on_the_active_filter() {
         let filter = BacklogFilter {
-            statuses: vec![Status::Done],
+            states: vec![ItemState::Done],
             projects: vec![ids::PROJECT_AGY],
             tags: vec!["gpu".to_owned(), "rust".to_owned()],
             ready_here: true,
@@ -1037,7 +1054,7 @@ mod tests {
     #[test]
     fn a_chord_on_a_choice_row_changes_nothing() {
         let filter = BacklogFilter {
-            statuses: vec![Status::Done],
+            states: vec![ItemState::Done],
             ..BacklogFilter::default()
         };
         let mut form = FilterForm::open(&filter, &projects());
@@ -1086,7 +1103,7 @@ mod tests {
     #[test]
     fn summary_skips_a_project_it_cannot_name() {
         let unknown = BacklogFilter {
-            statuses: vec![Status::Done],
+            states: vec![ItemState::Done],
             projects: vec![ProjectId::new()],
             ..BacklogFilter::default()
         };

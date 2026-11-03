@@ -8,6 +8,7 @@
 - **[MOD-82](docs/decisions/mod/mod-82.md)** - Shared pane chrome: sub-tabs, detail header, overlays, Settings layouts (done, 2026-11-03)
 - **[MOD-81](docs/decisions/mod/mod-81.md)** - Narrow and wide terminal widths (done, 2026-11-03)
 - **[MOD-158](docs/decisions/mod/mod-158.md)** - Qdrant: URL setting and API key (done, 2026-10-29)
+- **[MOD-144](docs/decisions/mod/mod-144.md)** - Item status reduced to open, blocked, closed (done, 2026-10-29)
 - **[MOD-137](docs/decisions/mod/mod-137.md)** - Step graph v2 storage: edges, owner scope, revision, atomic edits (done, 2026-10-21)
 - **[MOD-146](docs/decisions/mod/mod-146.md)** - Project type table (done, 2026-10-21)
 - **[ANA-38](docs/decisions/ana/ana-38.md)** - Project and workspace memory (concluded, 2026-10-20)

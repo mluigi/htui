@@ -2,7 +2,7 @@
 source: crates/htui/tests/waiting.rs
 expression: frame
 ---
-Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat          3 waiting · memory ·  ?  keys
+Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat          4 waiting · memory ·  ?  keys
 ╭─ Backlog (11) ──────────────────────────────────────╮╭─ ANA-1 · Data model, box registry … Body ›╮
 │ ▾ htui (8)                                          ││Data model, box registry and sync topology │
 │▌ ANA-1    ● done       Data model, box registry and…││● done · no tags · priority 0 · version 1  │
@@ -14,12 +14,12 @@ Platform   ¹Backlog  ²Skills  ³Requirements  ⁴Settings  ⁵Chat          3 
 │  FIX-1    ✓ closed     Terminal left raw after panic││Postgres holds the truth; every box keeps a│
 │  TOOL-1   ⚠ needs you  CI matrix for the three OSes ││read-only cache it refreshes on connect.   │
 │ ▾ agy (3)                                           ││Writes are compare-and-set on a version    │
-│  ANA-1    ● done       Prompt assembly survey       ││column, so a losing edit is shown against  │
-│  FEAT-1   ○ o╭ Waiting on you ─────────────────────────────────────────────────────╮n silently   │
-│  FIX-1    ○ o│▌ ANA-2   plan 1.1  gate        gate                                 │             │
-│              │  ANA-2   plan 1.1  permission  edit: src/lib.rs                     │             │
-│              │  FEAT-2  —         unblock     blocked, no active run: u reopens it │r-project    │
-│              ╰ j/k move · Enter open · Esc close ──────────────────────────────────╯bers gapless │
+│  ANA-1  ╭ Waiting on you ───────────────────────────────────────────────────────────────╮gainst  │
+│  FEAT-1 │▌ ANA-2   plan 1.1  gate        gate                                           │ently   │
+│  FIX-1  │  ANA-2   plan 1.1  permission  edit: src/lib.rs                               │        │
+│         │  FEAT-2  —         unblock     blocked, no active run: u reopens it           │        │
+│         │  TOOL-1  —         unblock     parked by an interrupted command: u resumes it │ject    │
+│         ╰ j/k move · Enter open · Esc close ────────────────────────────────────────────╯gapless │
 │                                                     ││and lets the legacy importer align the     │
 │                                                     ││counter above the numbers it brings in.    │
 │                                                     ││                                           │

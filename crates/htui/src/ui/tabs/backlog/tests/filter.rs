@@ -42,7 +42,7 @@ async fn applying_the_form_sends_one_filtered_items_read() {
     let bench = Bench::new().await;
     let mut tab = bench.tab();
     press(&mut tab, &bench, KeyCode::Char('f'));
-    for _ in 0..5 {
+    for _ in 0..7 {
         press(&mut tab, &bench, KeyCode::Char('l'));
     }
     press(&mut tab, &bench, KeyCode::Char(' '));
@@ -54,7 +54,7 @@ async fn applying_the_form_sends_one_filtered_items_read() {
         items_reads(&actions),
         [(
             ItemFilter {
-                statuses: Some(vec![Status::Done]),
+                states: Some(vec![ItemState::Done]),
                 ..ItemFilter::default()
             },
             false
@@ -231,7 +231,7 @@ async fn a_scope_change_drops_the_projects_it_lacks_and_closes_the_form() {
     press(&mut tab, &bench, KeyCode::Char('f'));
     tab.on_scope_change(&htui_only);
     assert_eq!(tab.filter.projects, [PROJECT_HTUI]);
-    assert_eq!(tab.filter.statuses, done_only().statuses, "status is kept");
+    assert_eq!(tab.filter.states, done_only().states, "the state is kept");
     assert!(tab.form.is_none(), "the form closed");
 
     let mut agy = BacklogTab {
@@ -286,7 +286,7 @@ async fn a_filtered_reply_names_its_filter_in_the_title() {
     let mut tab = bench.tab();
     tab.apply(done_only(), &bench.ctx());
     tab.on_reply(
-        &StoreReply::Items(with_status(&bench, Status::Done)),
+        &StoreReply::Items(with_state(&bench, ItemState::Done)),
         &mut bench.ctx(),
     );
     assert_eq!(tab.shown, done_only());

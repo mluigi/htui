@@ -72,7 +72,7 @@ use crossterm::event::{KeyEvent, MouseEvent};
 /// The Backlog's default layout (MOD-115 M2 D2): the list beside the detail, 55% of the body.
 ///
 /// The list gets the larger half: it carries the longest strings (`KEY  status  title`, with
-/// `awaiting_approval` in it) and it is the pane a reader navigates from. The shell's layout
+/// `⚠ needs you` in it) and it is the pane a reader navigates from. The shell's layout
 /// engine splits it as `Layout::horizontal([Percentage(55), Percentage(45)])` did, cell for cell.
 pub const BACKLOG_LAYOUT: TabLayout = TabLayout {
     list: ListSize::Percent(55),

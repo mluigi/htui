@@ -15,7 +15,7 @@ impl CaseHarness for Demo {
 fn cases_len_is_pinned() {
     assert_eq!(
         CASES.len(),
-        115,
+        118,
         "73 before MOD-41; CLEAN-4 makes it 74, T1's fenced capture (plan D1) 75, T9's eleven hand-back \
          cases (plan D12, OQ-6) 86, MOD-37 review L1's crashed rejection handed back 87, MOD-26's \
          five persona cases (plan D9, D12, D13) 92, MOD-37 M4's R-49 admission pin 93, MOD-73's \
@@ -25,7 +25,8 @@ fn cases_len_is_pinned() {
          across steps, plan D5, D6) 107, and review R1's snapshotted run cap against a lowered live \
          one 108, and CLEAN-9 T2's malformed cap refused at start 109, and MOD-138 M1's five \
          pinned-resume cases (plan D5) 114, and blueprint A6's \
-         refused-v1 half split in two 115"
+         refused-v1 half split in two 115, and MOD-144's three (a queued cancel writing no item, a \
+         stopped run holding its item, a rework run on a finished item) 118"
     );
 }
 

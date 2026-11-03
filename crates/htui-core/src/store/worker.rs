@@ -15,7 +15,8 @@
 //! `WorkerStore` is 62 methods: 14 [`ReadStore`] reads, 7 [`WriteStore`] reads, 26 writes,
 //! `write_document`, MOD-42's three command methods, MOD-11's four agent writes and
 //! `item_by_key` (plan D13, B-4), its five command-queue methods (plan D14) and MOD-12 M2's
-//! `run_batch_spend`; MOD-125 M1 adds `workspace_stop` and `stop_run`; [`RelayStore`] is nine (MOD-42 plan D2, MOD-70 plan D4).
+//! `run_batch_spend`; MOD-125 M1 adds `workspace_stop` and `stop_run`; MOD-144 R1 adds the write
+//! `block_if_idle`; [`RelayStore`] is nine (MOD-42 plan D2, MOD-70 plan D4).
 //! `WorkerHost` is `writer` plus 20 reads (blueprint F-5); MOD-41 T7 adds the 22nd,
 //! `queued_runs_on_box`; MOD-12 M1 adds seven (plan D3, D5, D6), the 29th `close_drained_batch`;
 //! MOD-12 M2 adds two (`batch_spend`, `project_settings`), 31.
@@ -216,7 +217,7 @@ pub trait WorkerStore: RecorderStore + RelayStore {
         workspace: WorkspaceId,
     ) -> impl Future<Output = Result<Option<WorkspaceStop>>> + Send;
 
-    // -- 26 writes
+    // -- 26 writes (MOD-144 R1: `block_if_idle` besides)
     /// [`WriteStore::transition`].
     fn transition(
         &self,
@@ -224,6 +225,8 @@ pub trait WorkerStore: RecorderStore + RelayStore {
         from: Status,
         to: Status,
     ) -> impl Future<Output = Result<bool>> + Send;
+    /// [`WriteStore::block_if_idle`] (MOD-144 R1).
+    fn block_if_idle(&self, note: NewNote) -> impl Future<Output = Result<bool>> + Send;
     /// [`WriteStore::set_step_prompt`].
     fn set_step_prompt(
         &self,
@@ -764,6 +767,9 @@ impl WorkerStore for MemStore {
     }
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool> {
         WriteStore::transition(self, id, from, to).await
+    }
+    async fn block_if_idle(&self, note: NewNote) -> Result<bool> {
+        WriteStore::block_if_idle(self, note).await
     }
     async fn set_step_prompt(
         &self,

@@ -56,8 +56,8 @@
 //! and every modal leaves the terminal's own text selection alone.
 //!
 //! At the close-out's counts `←`/`→` (and `h`/`l`) pick the resolution among the legal ones for
-//! the item's status (`Resolution::closes_from`), starting on `Resolution::default_for` (MOD-39
-//! plan P13).
+//! the item's status and whether its latest graph run finished (`Resolution::closes_from`,
+//! MOD-144), starting on `Resolution::default_for` (MOD-39 plan P13).
 
 mod execution_graph;
 
@@ -69,8 +69,8 @@ use htui_core::model::{
     Document, DocumentId, FOLLOW_UP_CHAT_RUN, FOLLOW_UP_JUDGE, FOLLOW_UP_NOT_RUNNING,
     FOLLOW_UP_QUEUED, FOLLOW_UP_REFUSED, FOLLOW_UP_SENT, FollowUpText, FollowUpView, ItemId,
     PermissionId, RelayOption, RelayOptionKind, RelayView, Resolution, RunCommandStatus, RunId,
-    RunKind, RunMode, RunStatus, RunStepSummary, RunSummary, Status, StepId, StepOpening,
-    StepPermission, StepStatus, ToolCallCount, UsageTotals,
+    RunKind, RunMode, RunStatus, RunStepSummary, RunSummary, StepId, StepOpening, StepPermission,
+    StepStatus, ToolCallCount, UsageTotals,
 };
 use htui_orch::closeout::Preview;
 use htui_orch::{Command, CommandOutcome, GateAnswer};
@@ -1141,21 +1141,23 @@ fn follow_up_key(
     }
 }
 
-/// ANA-11 §4.2 through `Resolution::closes_from`: `Resolution::ALL` in declaration order,
-/// filtered (MOD-39 plan P13). The store stays the authority.
-fn resolutions(status: Status) -> Vec<Resolution> {
+/// ANA-11 §4.2 under MOD-144's law, through `Resolution::closes_from(status, finished)`:
+/// `Resolution::ALL` in declaration order, filtered by the preview's status and whether the item's
+/// latest graph run finished (MOD-39 plan P13). The store stays the authority.
+fn resolutions(preview: &Preview) -> Vec<Resolution> {
     Resolution::ALL
         .iter()
         .copied()
-        .filter(|resolution| resolution.closes_from(status))
+        .filter(|resolution| resolution.closes_from(preview.status, preview.finished))
         .collect()
 }
 
-/// The next (`forward`) or previous legal resolution after `current`, wrapping; the first legal
-/// one when `current` is not legal. `current` itself when nothing closes `status`, which the
-/// preview's guard has already refused.
-fn cycle(status: Status, current: Resolution, forward: bool) -> Resolution {
-    let legal = resolutions(status);
+/// The next (`forward`) or previous legal resolution after the preview's, wrapping; the first
+/// legal one when the preview's is not legal. The preview's own when nothing closes the item,
+/// which the preview's guard has already refused.
+fn cycle(preview: &Preview, forward: bool) -> Resolution {
+    let current = preview.resolution;
+    let legal = resolutions(preview);
     let Some(at) = legal.iter().position(|&resolution| resolution == current) else {
         return legal.first().copied().unwrap_or(current);
     };
@@ -1193,7 +1195,7 @@ fn close_out_key(
             // `choice.toggle` (Space) steps forward, as the `?` box's `Space toggle` says.
             Some(&act @ (Act::ChoiceNext | Act::ChoicePrev | Act::ChoiceToggle)) => {
                 let forward = act != Act::ChoicePrev;
-                preview.resolution = cycle(preview.status, preview.resolution, forward);
+                preview.resolution = cycle(&preview, forward);
                 (CloseOutStage::Warn(preview), Handled::Consumed)
             }
             Some(Act::ConfirmYes) => (
@@ -2392,6 +2394,7 @@ mod tests {
     use chrono::TimeDelta;
     use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use htui_core::fixtures::{demo_at, ids};
+    use htui_core::model::Status;
     use htui_core::model::{
         FOLLOW_UP_EMPTY, FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_CANCELLED,
         FOLLOW_UP_SESSION_ENDED, GateOutcome, PermissionStatus, ProjectRef, RelaySessionId,
@@ -2443,12 +2446,17 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    /// The fixture's `FEAT-1` runs: one run, four steps.
+    /// The fixture's finished `FEAT-1` walk: one run (`RUN_1`), four steps. MOD-144's demo also
+    /// gives `FEAT-1` the stepless rework run `RUN_4` (its state `running`); these cases draw the
+    /// walk, so it is left out.
     async fn feat_1_runs() -> Vec<RunSummary> {
         MemStore::demo()
             .runs(ids::HTUI_FEAT_1)
             .await
             .expect("the memory store never fails")
+            .into_iter()
+            .filter(|run| run.id == ids::RUN_1)
+            .collect()
     }
 
     /// A Runs pane holding the fixture's `FEAT-1` runs: one run, four steps. What the reply made
@@ -4089,12 +4097,14 @@ mod tests {
         assert_refused(key(KeyCode::Char('c')), "cancel").await;
     }
 
-    /// The first confirmation's figures for `FEAT-1`.
+    /// The first confirmation's figures for `FEAT-1`, an `open` item whose latest graph run
+    /// finished `done`.
     fn preview() -> Preview {
         Preview {
             key: "FEAT-1".to_owned(),
             title: "TUI scaffold".to_owned(),
-            status: Status::Done,
+            status: Status::Open,
+            finished: true,
             resolution: Resolution::Done,
             runs: 1,
             rows: 3,
@@ -4184,16 +4194,18 @@ mod tests {
     }
 
     /// MOD-38 PRD D2: the first confirmation names the resolution the item closes as, and the
-    /// typed key sends that resolution: a `failed` item closes as `withdrawn` (plan D6).
+    /// typed key sends that resolution: an `open` item with no finished run closes as
+    /// `withdrawn` (plan D6, MOD-144).
     #[tokio::test]
     async fn the_close_out_warn_names_the_resolution() {
         let shell = Shell::new();
-        let failed = Preview {
-            status: Status::Failed,
+        let unfinished = Preview {
+            status: Status::Open,
+            finished: false,
             resolution: Resolution::Withdrawn,
             ..preview()
         };
-        let mut pane = warned_with(&shell, failed).await;
+        let mut pane = warned_with(&shell, unfinished).await;
         assert_eq!(
             footer(&pane)[0],
             "close FEAT-1 as withdrawn · 1 run · 3 commit rows · summary v2"
@@ -4230,10 +4242,10 @@ mod tests {
             .collect()
     }
 
-    /// MOD-39 plan P13: `→` on a `done` item walks every resolution in declaration order and
-    /// wraps; nothing is sent while picking.
+    /// MOD-39 plan P13: `→` on a finished `open` item walks every resolution in declaration
+    /// order and wraps; nothing is sent while picking.
     #[tokio::test]
-    async fn right_on_a_done_preview_walks_all_six_resolutions() {
+    async fn right_on_a_finished_preview_walks_all_six_resolutions() {
         let shell = Shell::new();
         let mut pane = warned(&shell).await;
         assert_eq!(picked(&pane), Resolution::Done);
@@ -4278,10 +4290,11 @@ mod tests {
         let shell = Shell::new();
         let blocked = Preview {
             status: Status::Blocked,
+            finished: false,
             resolution: Resolution::Withdrawn,
             ..preview()
         };
-        let mut pane = warned_with(&shell, blocked).await;
+        let mut pane = warned_with(&shell, blocked.clone()).await;
         assert_eq!(
             walk(&mut pane, &shell, KeyCode::Char('l'), 4),
             [
@@ -4292,7 +4305,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            resolutions(Status::Blocked),
+            resolutions(&blocked),
             [
                 Resolution::Rejected,
                 Resolution::Withdrawn,
@@ -4302,32 +4315,82 @@ mod tests {
         );
     }
 
-    /// MOD-39 plan P13: an `open` item is closable now; its picker starts on `withdrawn` and
-    /// offers the same four as `blocked`. A resolution that is not legal steps to the first legal
-    /// one.
+    /// MOD-144 PD18: a `blocked` item whose latest graph run finished still cannot close as
+    /// `done` or `concluded` (it is unblocked first), so the picker offers the same four and
+    /// starts on `withdrawn`.
+    #[tokio::test]
+    async fn a_blocked_finished_preview_offers_the_four_non_done() {
+        let blocked = Preview {
+            status: Status::Blocked,
+            finished: true,
+            resolution: Resolution::default_for(Status::Blocked, Some("")),
+            ..preview()
+        };
+        assert_eq!(blocked.resolution, Resolution::Withdrawn);
+        let unfinished = Preview {
+            finished: false,
+            ..blocked.clone()
+        };
+        assert_eq!(resolutions(&blocked), resolutions(&unfinished));
+        assert!(
+            !resolutions(&blocked).contains(&Resolution::Done)
+                && !resolutions(&blocked).contains(&Resolution::Concluded),
+            "{:?}",
+            resolutions(&blocked)
+        );
+        let done = Preview {
+            resolution: Resolution::Done,
+            ..blocked.clone()
+        };
+        assert_eq!(cycle(&done, true), Resolution::Rejected);
+
+        let shell = Shell::new();
+        let mut pane = warned_with(&shell, blocked).await;
+        assert_eq!(picked(&pane), Resolution::Withdrawn);
+        assert_eq!(
+            walk(&mut pane, &shell, KeyCode::Char('l'), 4),
+            [
+                Resolution::Superseded,
+                Resolution::Duplicate,
+                Resolution::Rejected,
+                Resolution::Withdrawn,
+            ]
+        );
+    }
+
+    /// MOD-39 plan P13, MOD-144: an `open` item with no finished run is closable; its picker
+    /// starts on `withdrawn` and offers the same four as `blocked`. A `closed` item has none. A
+    /// resolution that is not legal steps to the first legal one.
     #[tokio::test]
     async fn an_open_preview_starts_on_withdrawn() {
         assert_eq!(
-            Resolution::default_for(Status::Open),
-            Some(Resolution::Withdrawn)
+            Resolution::default_for(Status::Open, None),
+            Resolution::Withdrawn
         );
-        assert_eq!(resolutions(Status::Open), resolutions(Status::Blocked));
-        assert!(resolutions(Status::Queued).is_empty());
-        assert_eq!(
-            cycle(Status::Open, Resolution::Done, true),
-            Resolution::Rejected
-        );
-        assert_eq!(
-            cycle(Status::Open, Resolution::Done, false),
-            Resolution::Rejected
-        );
-
-        let shell = Shell::new();
         let open = Preview {
             status: Status::Open,
+            finished: false,
             resolution: Resolution::Withdrawn,
             ..preview()
         };
+        let blocked = Preview {
+            status: Status::Blocked,
+            ..open.clone()
+        };
+        let closed = Preview {
+            status: Status::Closed,
+            ..open.clone()
+        };
+        assert_eq!(resolutions(&open), resolutions(&blocked));
+        assert!(resolutions(&closed).is_empty());
+        let done = Preview {
+            resolution: Resolution::Done,
+            ..open.clone()
+        };
+        assert_eq!(cycle(&done, true), Resolution::Rejected);
+        assert_eq!(cycle(&done, false), Resolution::Rejected);
+
+        let shell = Shell::new();
         let mut pane = warned_with(&shell, open).await;
         assert_eq!(picked(&pane), Resolution::Withdrawn);
         assert_eq!(

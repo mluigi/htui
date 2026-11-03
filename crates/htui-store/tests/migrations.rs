@@ -112,7 +112,7 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(
         applied,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
         ],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
@@ -123,8 +123,8 @@ async fn migrations_apply_on_a_clean_database() {
          0013_persona_phase_index.sql, MOD-37 milestone 5's 0014_run_step_opening.sql, \
          MOD-11's 0015_command_queue.sql, MOD-12's 0016_auto_queue.sql, MOD-70's 0017_follow_up.sql, \
          MOD-96's 0018_seed_permission_mode.sql, MOD-125's 0019_stop_runs.sql, MOD-137's \
-         0020_step_graph_v2.sql, MOD-146's 0021_project_type.sql, MOD-163's 0022_memory.sql \
-         and MOD-138's 0023_default_edges_repair.sql, in ordinal order"
+         0020_step_graph_v2.sql, MOD-146's 0021_project_type.sql, MOD-163's 0022_memory.sql, MOD-138's 0023_default_edges_repair.sql and \
+         MOD-144's 0024_item_status.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -3902,9 +3902,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(23),
-        "twenty-three embedded migrations, none applied (through MOD-138's \
-         0023_default_edges_repair.sql)"
+        MigrationState::Pending(24),
+        "twenty-four embedded migrations, none applied (through MOD-144's 0024_item_status.sql)"
     );
 
     db.drop_db().await;
@@ -4004,8 +4003,8 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(23),
-        "twenty-three embedded migrations, through MOD-138's 0023_default_edges_repair.sql"
+        MigrationState::Pending(24),
+        "twenty-four embedded migrations, through MOD-144's 0024_item_status.sql"
     );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
@@ -4013,9 +4012,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("a pending schema is refused");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(23),
-        "every one of the twenty-three, through MOD-138's 0023_default_edges_repair.sql, is \
-         pending"
+        HeadlessError::MigrationsPending(24),
+        "every one of the twenty-four, through MOD-144's 0024_item_status.sql, is pending"
     );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
@@ -4037,9 +4035,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("no migrations table is every migration pending");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(23),
-        "every one of the twenty-three, through MOD-138's 0023_default_edges_repair.sql, is \
-         pending"
+        HeadlessError::MigrationsPending(24),
+        "every one of the twenty-four, through MOD-144's 0024_item_status.sql, is pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
@@ -4190,9 +4187,9 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        23,
-        "the later applies migrate nothing: the twenty-three embedded migrations (through \
-         MOD-138's 0023_default_edges_repair.sql) are applied once"
+        24,
+        "the later applies migrate nothing: the twenty-four embedded migrations (through MOD-144's \
+         0024_item_status.sql) are applied once"
     );
 
     db.drop_db().await;
@@ -5511,6 +5508,545 @@ async fn a_run_names_only_an_existing_batch() {
         .expect("open a batch on the fixture box");
     let done = set(batch).await.expect("an existing batch id is admitted");
     assert_eq!(done.rows_affected(), 1, "RUN_2 records the batch");
+
+    db.drop_db().await;
+}
+
+/// MOD-144: the `updated_at` every row planted for 0024 carries. 0024 runs with
+/// `trg_item_updated_at` off, so not one of them may move.
+const PLANTED_0024_AT: &str = "2020-01-02T03:04:05Z";
+
+/// Inserts an item `RES-<number>` at `status` straight into `item` (a pre-0024 status is still
+/// admitted at v23), `updated_at` = [`PLANTED_0024_AT`]; a `closed` one closes `withdrawn`.
+/// Answers its id.
+async fn plant_item(
+    pool: &sqlx::PgPool,
+    (project, kind): (uuid::Uuid, uuid::Uuid),
+    number: i32,
+    status: &str,
+    closed_at: Option<&str>,
+    user: uuid::Uuid,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO item (id, project_id, kind_id, key_prefix, key_number, title, status, \
+                           resolution, closed_at, created_by, updated_at) \
+         VALUES ($1, $2, $3, 'RES', $4, 'r', $5, \
+                 CASE WHEN $5 = 'closed' THEN 'withdrawn' END, $6::timestamptz, $7, \
+                 $8::timestamptz)",
+    )
+    .bind(id)
+    .bind(project)
+    .bind(kind)
+    .bind(number)
+    .bind(status)
+    .bind(closed_at)
+    .bind(user)
+    .bind(PLANTED_0024_AT)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|err| panic!("plant RES-{number} at {status}: {err}"));
+    id
+}
+
+/// Inserts a manual `run` of `item`, `kind` and `status`, queued at `queued_at` (a terminal one
+/// finished then too), and answers its id. Graph runs carry an empty snapshot
+/// (`ck_run_graph_snapshot`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a test helper planting one row; a struct would only rename the columns"
+)]
+async fn insert_item_run(
+    pool: &sqlx::PgPool,
+    project: uuid::Uuid,
+    item: uuid::Uuid,
+    kind: &str,
+    status: &str,
+    queued_at: &str,
+    box_id: uuid::Uuid,
+    user: uuid::Uuid,
+) -> Result<uuid::Uuid, sqlx::Error> {
+    let id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id, \
+                          graph_snapshot, started_by, queued_at, finished_at) \
+         VALUES ($1, $2, $3, $4, 'manual', $5, $6, \
+                 CASE WHEN $4 = 'graph' THEN '{}'::jsonb END, $7, $8::timestamptz, \
+                 CASE WHEN $5 IN ('done','failed','cancelled') THEN $8::timestamptz END)",
+    )
+    .bind(id)
+    .bind(project)
+    .bind(item)
+    .bind(kind)
+    .bind(status)
+    .bind(box_id)
+    .bind(user)
+    .bind(queued_at)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// The note 0024 writes on a `done` item no finished run explains (no run, or a latest run that
+/// did not finish `done`).
+const NOTE_0024_DONE: &str =
+    "closed by the status migration: marked done, but its latest run did not finish";
+/// The note 0024 writes on a `failed` item no failed run explains.
+const NOTE_0024_FAILED: &str =
+    "failed outside a run before the status migration; clear to run it again";
+
+/// MOD-144 (ANA-35 §7.1, §7.10 row 1): `0024_item_status.sql` maps the five removed statuses. A
+/// value the item's latest graph run (`cancelled` skipped, chat runs ignored) explains becomes
+/// `open`; an unexplained `done` closes as `done` and an unexplained `failed` is `blocked`, each
+/// with a note written as the item's author. A `done` or `failed` item whose latest graph run is
+/// live (R1) is `open`: the run holds it, and its state reads from that run. `open`, `blocked` and
+/// `closed` stay. `closed_at` is cleared on every row that is not closed, no `updated_at` moves
+/// (the trigger is off and on again), and the CHECK admits the three values only.
+///
+/// Staged at v23 through [`MIGRATOR`] so the rows exist before 0024 runs, as on a real box.
+#[tokio::test]
+async fn migration_0024_maps_every_removed_status() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(23, &db.pool)
+        .await
+        .expect("apply 0001 through 0022");
+    let pool = &db.pool;
+    let user = uuid::Uuid::now_v7();
+    sqlx::query("INSERT INTO app_user (id, name) VALUES ($1, 'mod144')")
+        .bind(user)
+        .execute(pool)
+        .await
+        .expect("insert app_user");
+    let box_id = insert_box(pool, user).await;
+    let pk = plant_project_kind(pool, user, "mod144").await;
+    let at = |second: u32| format!("2020-01-01T00:00:{second:02}Z");
+
+    // (number, planted status, planted closed_at, runs as (kind, status) in queue order)
+    type Planted<'a> = (i32, &'a str, Option<&'a str>, &'a [(&'a str, &'a str)]);
+    let rows: &[Planted<'_>] = &[
+        (1, "queued", None, &[("graph", "queued")]),
+        (2, "in_progress", None, &[("graph", "running")]),
+        (
+            3,
+            "awaiting_approval",
+            None,
+            &[("graph", "awaiting_approval")],
+        ),
+        (4, "in_progress", None, &[("graph", "stopped")]),
+        (5, "queued", None, &[]),
+        (6, "failed", None, &[("graph", "failed")]),
+        (7, "failed", None, &[]),
+        (8, "failed", None, &[("graph", "cancelled")]),
+        (9, "done", Some(PLANTED_0024_AT), &[("graph", "done")]),
+        (10, "done", None, &[]),
+        (
+            11,
+            "done",
+            Some(PLANTED_0024_AT),
+            &[("graph", "done"), ("graph", "failed")],
+        ),
+        (
+            12,
+            "done",
+            None,
+            &[("graph", "done"), ("graph", "cancelled")],
+        ),
+        (13, "done", None, &[("chat", "done")]),
+        (14, "open", None, &[]),
+        (15, "blocked", Some(PLANTED_0024_AT), &[]),
+        (16, "closed", Some(PLANTED_0024_AT), &[]),
+        (17, "done", None, &[("graph", "done"), ("graph", "running")]),
+        (18, "failed", None, &[("graph", "stopped")]),
+    ];
+    let mut second = 0;
+    let mut planted = Vec::new();
+    for (number, status, closed_at, runs) in rows {
+        let item = plant_item(pool, pk, *number, status, *closed_at, user).await;
+        for (kind, run_status) in *runs {
+            second += 1;
+            insert_item_run(
+                pool,
+                pk.0,
+                item,
+                kind,
+                run_status,
+                &at(second),
+                box_id,
+                user,
+            )
+            .await
+            .unwrap_or_else(|err| panic!("plant a {run_status} {kind} run: {err}"));
+        }
+        planted.push((*number, item));
+    }
+
+    MIGRATOR.run_to(24, pool).await.expect("apply 0024");
+
+    // (number, status, resolution, closed_at kept as planted / NULL / set, note)
+    #[derive(Debug, PartialEq)]
+    enum Closed {
+        Null,
+        Planted,
+        Stamped,
+    }
+    type Mapped<'a> = (i32, &'a str, Option<&'a str>, Closed, Option<&'a str>);
+    let expected: &[Mapped<'_>] = &[
+        (1, "open", None, Closed::Null, None),
+        (2, "open", None, Closed::Null, None),
+        (3, "open", None, Closed::Null, None),
+        (4, "open", None, Closed::Null, None),
+        (5, "open", None, Closed::Null, None),
+        (6, "open", None, Closed::Null, None),
+        (7, "blocked", None, Closed::Null, Some(NOTE_0024_FAILED)),
+        (8, "blocked", None, Closed::Null, Some(NOTE_0024_FAILED)),
+        (9, "open", None, Closed::Null, None),
+        (
+            10,
+            "closed",
+            Some("done"),
+            Closed::Stamped,
+            Some(NOTE_0024_DONE),
+        ),
+        (
+            11,
+            "closed",
+            Some("done"),
+            Closed::Planted,
+            Some(NOTE_0024_DONE),
+        ),
+        (12, "open", None, Closed::Null, None),
+        (
+            13,
+            "closed",
+            Some("done"),
+            Closed::Stamped,
+            Some(NOTE_0024_DONE),
+        ),
+        (14, "open", None, Closed::Null, None),
+        (15, "blocked", None, Closed::Null, None),
+        (16, "closed", Some("withdrawn"), Closed::Planted, None),
+        (17, "open", None, Closed::Null, None),
+        (18, "open", None, Closed::Null, None),
+    ];
+    for ((number, status, resolution, closed, note), (planted_number, item)) in
+        expected.iter().zip(&planted)
+    {
+        assert_eq!(number, planted_number, "the tables line up");
+        let (got_status, got_resolution, closed_at_null, closed_at_kept, kept): (
+            String,
+            Option<String>,
+            bool,
+            bool,
+            bool,
+        ) = sqlx::query_as(
+            "SELECT status, resolution, closed_at IS NULL, \
+                    closed_at IS NOT DISTINCT FROM $2::timestamptz, \
+                    updated_at = $2::timestamptz \
+               FROM item WHERE id = $1",
+        )
+        .bind(item)
+        .bind(PLANTED_0024_AT)
+        .fetch_one(pool)
+        .await
+        .expect("read the migrated item");
+        assert_eq!(got_status, *status, "RES-{number}'s status");
+        assert_eq!(
+            got_resolution.as_deref(),
+            *resolution,
+            "RES-{number}'s resolution"
+        );
+        let got_closed = match (closed_at_null, closed_at_kept) {
+            (true, _) => Closed::Null,
+            (false, true) => Closed::Planted,
+            (false, false) => Closed::Stamped,
+        };
+        assert_eq!(got_closed, *closed, "RES-{number}'s closed_at");
+        assert!(
+            kept,
+            "RES-{number}'s updated_at stays {PLANTED_0024_AT}: 0024 runs with the trigger off"
+        );
+        let notes: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT n.body, n.created_by = i.created_by \
+               FROM item_note n JOIN item i ON i.id = n.item_id \
+              WHERE n.item_id = $1",
+        )
+        .bind(item)
+        .fetch_all(pool)
+        .await
+        .expect("read the item's notes");
+        match note {
+            None => assert!(notes.is_empty(), "RES-{number} gets no note, got {notes:?}"),
+            Some(body) => assert_eq!(
+                notes,
+                vec![((*body).to_owned(), true)],
+                "RES-{number} gets one note, verbatim, written as the item's author"
+            ),
+        }
+    }
+    assert_eq!(
+        common::count(pool, "item_note").await,
+        5,
+        "two unexplained `failed` items and three unexplained `done` ones get a note each"
+    );
+
+    let enabled: String = sqlx::query_scalar(
+        "SELECT tgenabled::text FROM pg_trigger \
+          WHERE tgrelid = 'item'::regclass AND tgname = 'trg_item_updated_at'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read trg_item_updated_at");
+    assert_eq!(enabled, "O", "0024 re-enables trg_item_updated_at");
+    let constraints: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT conname::text, convalidated FROM pg_constraint \
+          WHERE conrelid = 'item'::regclass \
+            AND conname IN ('item_status_check', 'chk_item_status')",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read item's status constraints");
+    assert_eq!(
+        constraints,
+        vec![("chk_item_status".to_owned(), true)],
+        "0001's item_status_check is gone and chk_item_status is validated"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-144: an item that already has two live graph runs (`stopped` is live, MOD-125) would make
+/// `uq_run_item_live` fail with a bare 23505, so 0024 refuses first, naming the items, and the
+/// transaction leaves the database at v23. A live chat run beside a live graph run is not two.
+#[tokio::test]
+async fn migration_0024_refuses_two_live_graph_runs_naming_the_items() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(23, &db.pool)
+        .await
+        .expect("apply 0001 through 0022");
+    let pool = &db.pool;
+    let user = uuid::Uuid::now_v7();
+    sqlx::query("INSERT INTO app_user (id, name) VALUES ($1, 'mod144')")
+        .bind(user)
+        .execute(pool)
+        .await
+        .expect("insert app_user");
+    let box_id = insert_box(pool, user).await;
+    let pk = plant_project_kind(pool, user, "mod144").await;
+
+    // (number, planted status, two runs as (kind, status) in queue order)
+    type Planted<'a> = (i32, &'a str, [(&'a str, &'a str); 2]);
+    let rows: &[Planted<'_>] = &[
+        (
+            1,
+            "in_progress",
+            [("graph", "running"), ("graph", "stopped")],
+        ),
+        (
+            2,
+            "queued",
+            [("graph", "queued"), ("graph", "awaiting_approval")],
+        ),
+        (
+            3,
+            "in_progress",
+            [("graph", "running"), ("chat", "running")],
+        ),
+    ];
+    let mut second = 0;
+    let mut first = None;
+    for (number, status, runs) in rows {
+        let item = plant_item(pool, pk, *number, status, None, user).await;
+        first.get_or_insert(item);
+        for (kind, run_status) in runs {
+            second += 1;
+            insert_item_run(
+                pool,
+                pk.0,
+                item,
+                kind,
+                run_status,
+                &format!("2020-01-01T00:00:{second:02}Z"),
+                box_id,
+                user,
+            )
+            .await
+            .expect("plant a live run");
+        }
+    }
+
+    let err = MIGRATOR
+        .run_to(24, pool)
+        .await
+        .expect_err("two live graph runs on one item refuse 0024");
+    let text = err.to_string();
+    assert!(
+        text.contains("mod144:RES-1") && text.contains("mod144:RES-2"),
+        "the refusal names both items, got {text}"
+    );
+    assert!(
+        !text.contains("RES-3"),
+        "a live chat run beside a live graph run is not two live graph runs, got {text}"
+    );
+    assert_eq!(
+        common::count(pool, "_sqlx_migrations").await,
+        23,
+        "the refused migration is not recorded"
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM item WHERE id = $1")
+        .bind(first.expect("RES-1 planted"))
+        .fetch_one(pool)
+        .await
+        .expect("read RES-1");
+    assert_eq!(status, "in_progress", "nothing of 0024 applied");
+    let indexes: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM pg_indexes WHERE indexname = 'uq_run_item_live'")
+            .fetch_one(pool)
+            .await
+            .expect("read pg_indexes");
+    assert_eq!(indexes, 0, "uq_run_item_live was rolled back with the rest");
+
+    db.drop_db().await;
+}
+
+/// MOD-144: after 0024 the database itself holds "one live graph run per item"
+/// (`uq_run_item_live`, every pair of live statuses including `stopped`), while a live chat run
+/// and any number of finished or cancelled graph runs sit beside the live one; and an item can
+/// no longer be stored at a removed status (`chk_item_status`).
+#[tokio::test]
+async fn migration_0024_backs_one_live_graph_run_per_item() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let pool = &db.pool;
+    let user = db.store.this_user().as_uuid();
+    let box_id = db.store.this_box().as_uuid();
+    let pk = plant_project_kind(pool, user, "mod144").await;
+    let live = ["queued", "running", "awaiting_approval", "stopped"];
+
+    let mut number = 0;
+    for first in live {
+        for second in live {
+            number += 1;
+            let item = plant_item(pool, pk, number, "open", None, user).await;
+            insert_item_run(
+                pool,
+                pk.0,
+                item,
+                "graph",
+                first,
+                "2020-01-01T00:00:01Z",
+                box_id,
+                user,
+            )
+            .await
+            .expect("the first live graph run is admitted");
+            let err = insert_item_run(
+                pool,
+                pk.0,
+                item,
+                "graph",
+                second,
+                "2020-01-01T00:00:02Z",
+                box_id,
+                user,
+            )
+            .await
+            .expect_err("a second live graph run is refused");
+            assert_eq!(
+                err.as_database_error().and_then(|e| e.code()).as_deref(),
+                Some("23505"),
+                "a {second} graph run beside a {first} one is a unique violation"
+            );
+            assert_refused_by(
+                err,
+                "uq_run_item_live",
+                &format!("a {second} graph run beside a {first} one"),
+            );
+        }
+    }
+
+    number += 1;
+    let item = plant_item(pool, pk, number, "open", None, user).await;
+    for (second, (kind, status)) in [
+        ("graph", "done"),
+        ("graph", "failed"),
+        ("graph", "cancelled"),
+        ("graph", "running"),
+        ("chat", "running"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        insert_item_run(
+            pool,
+            pk.0,
+            item,
+            kind,
+            status,
+            &format!("2020-01-01T00:00:{:02}Z", second + 1),
+            box_id,
+            user,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("a {status} {kind} run beside the others: {err}"));
+    }
+
+    number += 1;
+    let err = sqlx::query(
+        "INSERT INTO item (project_id, kind_id, key_prefix, key_number, title, status, \
+         created_by) VALUES ($1, $2, 'RES', $3, 'r', 'queued', $4)",
+    )
+    .bind(pk.0)
+    .bind(pk.1)
+    .bind(number)
+    .bind(user)
+    .execute(pool)
+    .await
+    .expect_err("a removed status is refused");
+    assert_eq!(
+        err.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("23514"),
+        "a removed status is a check violation"
+    );
+    assert_refused_by(err, "chk_item_status", "item.status = 'queued'");
+
+    db.drop_db().await;
+}
+
+/// MOD-144 Δ2: `uq_run_item_live` indexes exactly the live run statuses, `RunStatus::is_active`
+/// (`stopped` included), so the index, `create_run`'s check and the Rust law cannot drift apart.
+#[tokio::test]
+async fn uq_run_item_live_matches_run_status_is_active() {
+    use htui_core::model::RunStatus;
+
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let def: String = sqlx::query_scalar("SELECT pg_get_indexdef('uq_run_item_live'::regclass)")
+        .fetch_one(&db.pool)
+        .await
+        .expect("read uq_run_item_live");
+    assert!(
+        def.starts_with("CREATE UNIQUE INDEX uq_run_item_live ON public.run USING btree (item_id)"),
+        "one row per item, got {def}"
+    );
+    let quoted: BTreeSet<&str> = def.split('\'').skip(1).step_by(2).collect();
+    let expected: BTreeSet<&str> = RunStatus::ALL
+        .iter()
+        .filter(|s| s.is_active())
+        .map(|s| s.as_str())
+        .chain(["graph"])
+        .collect();
+    assert_eq!(
+        quoted, expected,
+        "the index covers graph runs at exactly the live statuses, got {def}"
+    );
 
     db.drop_db().await;
 }

@@ -1,7 +1,7 @@
 //! Display labels (MOD-115 M3 D3, MOD-83): a human word, plus a glyph where it is a status, for
 //! every enum a ported tab shows, so no internal snake_case value reaches the screen; and one
 //! pluralising helper (`1 option`, `3 options`, never `(s)`). [`kit::status`](super::status)
-//! keeps the item statuses.
+//! keeps the item states.
 //!
 //! Every function here is an exhaustive `match` with no wildcard arm, so a variant added to one
 //! of these enums stops the build instead of printing its raw name.
@@ -79,7 +79,7 @@ const fn mark(glyph: &'static str, word: &'static str, tone: Tone) -> Mark {
 const PENDING: Mark = mark("○", "pending", Tone::Idle);
 const RUNNING: Mark = mark("◐", "running", Tone::Running);
 const NEEDS_YOU: Mark = mark("⚠", "needs you", Tone::NeedsYou);
-const STOPPED: Mark = mark("⊘", "stopped", Tone::Idle);
+const STOPPED: Mark = mark("■", "stopped", Tone::Idle);
 const DONE: Mark = mark("●", "done", Tone::Done);
 const FAILED: Mark = mark("✗", "failed", Tone::Failed);
 const CANCELLED: Mark = mark("⊘", "cancelled", Tone::Dim);
@@ -123,7 +123,7 @@ pub const fn plan_entry(status: PlanEntryStatus) -> Mark {
     }
 }
 
-/// A run's status, in the item statuses' words ([`kit::status`](super::status)).
+/// A run's status, in the item states' words ([`kit::status`](super::status)).
 #[must_use]
 pub const fn run_status(status: RunStatus) -> Mark {
     match status {
@@ -623,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn a_run_status_matches_the_item_status_words() {
+    fn a_run_status_matches_the_item_state_words() {
         let table = marks(RunStatus::ALL, RunStatus::as_str, run_status);
         assert_eq!(
             shown(&table),
@@ -631,7 +631,7 @@ mod tests {
                 ("◌", "queued", Tone::Idle),
                 ("◐", "running", Tone::Running),
                 ("⚠", "needs you", Tone::NeedsYou),
-                ("⊘", "stopped", Tone::Idle),
+                ("■", "stopped", Tone::Idle),
                 ("●", "done", Tone::Done),
                 ("✗", "failed", Tone::Failed),
                 ("⊘", "cancelled", Tone::Dim),
@@ -648,7 +648,7 @@ mod tests {
                 ("○", "pending", Tone::Idle),
                 ("◐", "running", Tone::Running),
                 ("⚠", "needs you", Tone::NeedsYou),
-                ("⊘", "stopped", Tone::Idle),
+                ("■", "stopped", Tone::Idle),
                 ("●", "done", Tone::Done),
                 ("✗", "failed", Tone::Failed),
                 ("⊘", "cancelled", Tone::Dim),

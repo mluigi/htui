@@ -867,9 +867,21 @@ pub(crate) mod tests {
         assert_eq!(fixture.run(run).await.status, RunStatus::AwaitingApproval);
     }
 
-    /// The one run of `item`, which a test has just started.
+    /// The one run of `item` a test has just started: the demo's own runs left out (MOD-144's
+    /// demo gives `CLEAN-1` its failed `RUN_6`).
     pub(crate) async fn only_run(store: &MemStore, item: ItemId) -> RunId {
-        let runs = store.runs(item).await.expect("the read answers");
+        let seeded: Vec<RunId> = htui_core::fixtures::demo_data()
+            .runs
+            .iter()
+            .map(|run| run.id)
+            .collect();
+        let runs: Vec<_> = store
+            .runs(item)
+            .await
+            .expect("the read answers")
+            .into_iter()
+            .filter(|run| !seeded.contains(&run.id))
+            .collect();
         assert_eq!(runs.len(), 1, "one run of the item: {runs:?}");
         runs[0].id
     }
@@ -4741,14 +4753,17 @@ pub(crate) mod tests {
             matches!(&reply, StoreReply::Failed { request: "start_run", message } if *message == refusal),
             "{reply:?}"
         );
-        assert!(
+        assert_eq!(
             fixture
                 .store
                 .runs(ids::HTUI_CLEAN_1)
                 .await
                 .expect("the read answers")
-                .is_empty(),
-            "nothing was enqueued"
+                .iter()
+                .map(|run| run.id)
+                .collect::<Vec<_>>(),
+            [ids::RUN_6],
+            "nothing was enqueued beside the demo's failed run"
         );
         let reply = served(
             &mut runtime,
@@ -4832,7 +4847,24 @@ pub(crate) mod tests {
             .expect("the demo item");
         assert_eq!(
             item.status,
-            Status::Queued,
+            Status::Open,
+            "MOD-144: the item row stays open"
+        );
+        let scope = htui_core::model::Scope {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            project_ids: vec![ids::PROJECT_HTUI],
+        };
+        let shown = store
+            .items(&scope, &htui_core::model::ItemFilter::default())
+            .await
+            .expect("the read answers");
+        let feat_3 = shown
+            .iter()
+            .find(|row| row.id == ids::HTUI_FEAT_3)
+            .expect("FEAT-3 is listed");
+        assert_eq!(
+            feat_3.state(),
+            htui_core::model::ItemState::Queued,
             "its item still shows it queued"
         );
         assert!(

@@ -18,7 +18,7 @@ expression: run.pretty()
       "name": "htui"
     }
   ],
-  "working": 0,
+  "working": 1,
   "permissions_known": true,
   "rows": [
     {
@@ -40,6 +40,17 @@ expression: run.pretty()
       "step_id": "01a06490-e6cc-7000-8000-000000000d04",
       "step": "prd 0.1",
       "text": "gate",
+      "since": "[timestamp]",
+      "age_seconds": "[age]"
+    },
+    {
+      "reason": "unblock",
+      "item_key": "TOOL-1",
+      "item_id": "01a06490-d346-7000-8000-000000000806",
+      "run_id": "01a06490-e2e4-7000-8000-000000000c04",
+      "step_id": null,
+      "step": null,
+      "text": "parked by an interrupted command: u resumes it",
       "since": "[timestamp]",
       "age_seconds": "[age]"
     }

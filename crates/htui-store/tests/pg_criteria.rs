@@ -21,14 +21,15 @@ use htui_core::model::{
     Agent, AgentBox, AgentId, AnswerOutcome, AnswerRefusal, Billing, BoxId, CancelRequest,
     ChatRunSpec, Claim, CommandRunId, CommandRunStatus, EventKind, EventRole,
     FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest, FollowUpSettle, FollowUpText,
-    GraphSnapshot, Isolation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch, MemoryBody,
-    MemoryEntryId, MemoryKind, MemoryPatch, MemoryState, MemorySubject, MemorySupersede,
-    MemoryUpdate, NewCommandRun, NewFollowUp, NewItem, NewMemoryEntry, NewProject, NewRepo,
-    NewRequirement, NewRun, NewWorkspace, OpenPermission, PermissionId, PermissionStatus, Priority,
-    ProjectId, QueuedFollowUp, RelayOption, RelayOptionKind, RelaySessionId, RepoId, RequirementId,
-    RunCommandId, RunCommandStatus, RunId, RunMode, RunStatus, RunStepCommit, RunStepTree,
-    SessionEvent, SettleOutcome, SnapshotGraph, SnapshotSettings, Status, StepId, StepOutcome,
-    TIMESTAMPTZ_DIGITS, Transport, UserId, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    GraphSnapshot, Isolation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch, ItemState,
+    MemoryBody, MemoryEntryId, MemoryKind, MemoryPatch, MemoryState, MemorySubject,
+    MemorySupersede, MemoryUpdate, NewCommandRun, NewFollowUp, NewItem, NewMemoryEntry, NewProject,
+    NewRepo, NewRequirement, NewRun, NewWorkspace, OpenPermission, PermissionId, PermissionStatus,
+    Priority, ProjectId, QueuedFollowUp, RelayOption, RelayOptionKind, RelaySessionId, RepoId,
+    RequirementId, RunCommandId, RunCommandStatus, RunId, RunMode, RunStatus, RunStepCommit,
+    RunStepTree, SessionEvent, SettleOutcome, SnapshotGraph, SnapshotSettings, Status, StepId,
+    StepOutcome, TIMESTAMPTZ_DIGITS, Transport, UserId, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::prompt::{DEFAULT_TEMPLATES, body_of};
@@ -535,17 +536,13 @@ async fn a_diverged_edit_writes_no_revision() {
     db.drop_db().await;
 }
 
-/// The status compare-and-set never touches `version`, and `closed_at` follows the current status
-/// in both directions (§4.2, blueprint H.12).
+/// The status compare-and-set never touches `version` and, since MOD-144, never touches
+/// `closed_at` either (only `close_out` stamps it).
 ///
-/// Plan D4's fourth call site (blueprint §3.9(a)): `open -> done` is **not** in the ANA-2 §4.3
-/// table, so since MOD-4 T2 it is [`StoreError::Constraint`] rather than a landed move. The legs
-/// that follow need the row actually sitting at `done` with `closed_at` set, so the item is driven
-/// there along the sanctioned path `open -> queued -> in_progress -> done` — the same shape
-/// `conformance.rs::status_cas_keeps_version` now uses. The two legs after it stay exactly as they
-/// were: `done -> open` is a sanctioned reopen and `done -> closed` from a row that is at `open`
-/// is a *stale* `from` on a *legal* pair, which is the `Ok(false)` this case exists to tell apart
-/// from the new `Constraint`.
+/// MOD-144's table is `open ↔ blocked` only: `open -> closed` is [`StoreError::Constraint`] with
+/// no write. The item goes `open -> blocked -> open`; a stale `blocked -> open` from a row at
+/// `open` is a *stale* `from` on a *legal* pair, the `Ok(false)` this case tells apart from the
+/// `Constraint`; and an unknown id is `NotFound` even on an illegal pair (plan D14).
 #[tokio::test(flavor = "multi_thread")]
 async fn status_cas_never_bumps_version() {
     let Some(db) = common::demo_db().await else {
@@ -562,41 +559,43 @@ async fn status_cas_never_bumps_version() {
 
     let illegal = db
         .store
-        .transition(before.id, Status::Open, Status::Done)
+        .transition(before.id, Status::Open, Status::Closed)
         .await;
     assert!(
         matches!(illegal, Err(htui_core::store::StoreError::Constraint(_))),
-        "open -> done is outside §4.3 and is refused before the UPDATE, got {illegal:?}"
+        "open -> closed is close-out's and is refused before the UPDATE, got {illegal:?}"
     );
-    for (from, to) in [
-        (Status::Open, Status::Queued),
-        (Status::Queued, Status::InProgress),
-        (Status::InProgress, Status::Done),
-    ] {
-        assert!(
-            db.store
-                .transition(before.id, from, to)
-                .await
-                .expect("transition must not fail"),
-            "{from} -> {to} matches"
-        );
-    }
-    let done = db
+    let untouched = db
         .store
         .item(before.id)
         .await
         .expect("read must not fail")
         .expect("the item still exists");
-    assert_eq!(done.status, Status::Done, "the status moved");
-    assert_eq!(done.version, before.version, "version untouched");
-    assert!(done.closed_at.is_some(), "a terminal move sets closed_at");
+    assert_eq!(untouched, before, "a refused move writes nothing");
 
     assert!(
         db.store
-            .transition(before.id, Status::Done, Status::Open)
+            .transition(before.id, Status::Open, Status::Blocked)
             .await
             .expect("transition must not fail"),
-        "done -> open matches"
+        "open -> blocked matches"
+    );
+    let blocked = db
+        .store
+        .item(before.id)
+        .await
+        .expect("read must not fail")
+        .expect("the item still exists");
+    assert_eq!(blocked.status, Status::Blocked, "the status moved");
+    assert_eq!(blocked.version, before.version, "version untouched");
+    assert_eq!(blocked.closed_at, None, "transition never stamps closed_at");
+
+    assert!(
+        db.store
+            .transition(before.id, Status::Blocked, Status::Open)
+            .await
+            .expect("transition must not fail"),
+        "blocked -> open matches"
     );
     let reopened = db
         .store
@@ -604,7 +603,11 @@ async fn status_cas_never_bumps_version() {
         .await
         .expect("read must not fail")
         .expect("the item still exists");
-    assert_eq!(reopened.closed_at, None, "a reopen clears closed_at");
+    assert_eq!(reopened.status, Status::Open);
+    assert_eq!(
+        reopened.closed_at, None,
+        "transition never stamps closed_at"
+    );
     assert_eq!(
         reopened.version, before.version,
         "neither move bumped the version"
@@ -617,16 +620,16 @@ async fn status_cas_never_bumps_version() {
 
     assert!(
         !db.store
-            .transition(before.id, Status::Done, Status::Open)
+            .transition(before.id, Status::Blocked, Status::Open)
             .await
             .expect("transition must not fail"),
         "a stale `from` is refused rather than applied"
     );
-    // Plan D14's precedence, and the reason this leg keeps the pair the first one now refuses: the
-    // id names nothing, so the answer is `NotFound` **even though** `open -> done` is also illegal.
+    // Plan D14's precedence: the id names nothing, so the answer is `NotFound` **even though**
+    // `open -> closed` is also illegal.
     let missing = db
         .store
-        .transition(ItemId::new(), Status::Open, Status::Done)
+        .transition(ItemId::new(), Status::Open, Status::Closed)
         .await;
     assert!(
         matches!(missing, Err(htui_core::store::StoreError::NotFound { .. })),
@@ -734,6 +737,94 @@ async fn admission_is_serialised_by_the_box_row_lock() {
         ),
         (None, None, None),
         "and wrote neither the box, the start nor the lease"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-144 R1 (M1): `block_if_idle` takes the item lock before it reads the live runs, so it
+/// cannot block an item whose run another box is creating. Session A plays `create_run`'s
+/// transaction (the item's `FOR UPDATE`, then the `run` insert) and holds it open; session B's
+/// `block_if_idle`, on its own pool, must wait on that lock, and once A commits it must read A's
+/// run and answer `false` with nothing written. A single
+/// `UPDATE item ... WHERE status = 'open' AND NOT EXISTS (live run)` fails this: Postgres
+/// re-checks only the row after the wait, not the subquery, and blocks the item.
+#[tokio::test(flavor = "multi_thread")]
+async fn block_if_idle_waits_for_a_create_run_and_then_blocks_nothing() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let item = ids::HTUI_ANA_2;
+
+    let mut a = db.pool.begin().await.expect("session A");
+    sqlx::query("SELECT status FROM item WHERE id = $1 FOR UPDATE")
+        .bind(item.as_uuid())
+        .execute(&mut *a)
+        .await
+        .expect("A locks the item, as create_run does first");
+    let run = RunId::new();
+    sqlx::query(
+        "INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id, \
+         graph_snapshot, started_by, queued_at, repo_scope) \
+         SELECT $1, project_id, $2, 'graph', 'manual', 'queued', target_box_id, graph_snapshot, \
+                started_by, clock_timestamp(), '{}'::uuid[] \
+           FROM run WHERE id = $3",
+    )
+    .bind(run.as_uuid())
+    .bind(item.as_uuid())
+    .bind(ids::RUN_1.as_uuid())
+    .execute(&mut *a)
+    .await
+    .expect("A inserts its queued graph run");
+
+    let other = PgStore::connect(&db.url, &db.identity)
+        .await
+        .expect("second pool")
+        .store;
+    let note = htui_core::model::NewNote {
+        id: htui_core::model::NoteId::new(),
+        item_id: item,
+        body: "no_candidate_agent: phase `implement`".to_owned(),
+        created_by: ids::USER,
+        box_id: Some(ids::BOX),
+        via_step_id: None,
+        created_at: Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS),
+    };
+    let note_id = note.id;
+    let b = tokio::spawn(async move { other.block_if_idle(note).await });
+
+    // B is parked on A's row lock, not merely slow: wait until Postgres says so.
+    lock_waiters(&db.pool, 1).await;
+    assert!(!b.is_finished(), "and must not answer while A holds it");
+
+    a.commit().await.expect("A commits its run");
+    let blocked = b
+        .await
+        .expect("B's task")
+        .expect("block_if_idle must not fail");
+    assert!(
+        !blocked,
+        "after the wait B reads A's live run and blocks nothing"
+    );
+    let row = db
+        .store
+        .item(item)
+        .await
+        .expect("read the item")
+        .expect("the item exists");
+    assert_eq!(
+        row.status,
+        Status::Open,
+        "the item stays open under its queued run"
+    );
+    assert!(
+        db.store
+            .notes(item)
+            .await
+            .expect("read the notes")
+            .iter()
+            .all(|n| n.id != note_id),
+        "and no note is written over a live run (D98)"
     );
 
     db.drop_db().await;
@@ -1549,8 +1640,9 @@ async fn inherent_reads_answer_the_fixture() {
             .active_runs(&scope)
             .await
             .expect("active_runs must not fail"),
-        1,
-        "the fixture has exactly one active run"
+        3,
+        "the Platform fixture's runs on the top bar: RUN_2 queued and, since MOD-144's fixture, \
+         RUN_4 running and RUN_5 awaiting approval"
     );
 
     let info = db
@@ -5018,137 +5110,112 @@ async fn document_versions_do_not_collide_under_contention() {
     db.drop_db().await;
 }
 
-/// Plan M2 D7: `finish_run` derives the item from the item's *remaining* live runs, and on
-/// Postgres it does so under the item's row lock.
-///
-/// The conformance case `finish_run_moves_run_and_item_together` delegates the column half here:
-/// `item.closed_at` is not on [`htui_core::model::Item`]'s critical path for the `MemStore`
-/// assertions, and this is where the SQL that writes it can be read back directly. The two-run leg
-/// is repeated rather than referenced because it is the one the plan's Risks row names, and a
-/// `PgStore` that counted the item's runs *without* the `FOR UPDATE` would still pass it
-/// sequentially while stranding the item under concurrency.
-///
-/// Getting two live graph runs onto one item takes the same detour as the conformance case:
-/// `create_run` admits only `open | failed` items and leaves the item at `queued`, so the item is
-/// walked back `queued -> open` between the two creates.
+/// MOD-144 Δ8 (Postgres only): "one live graph run per item" is `create_run`'s check under the
+/// item's `FOR UPDATE`, backed by `uq_run_item_live`. Two creates for one item queued behind a
+/// held item lock serialise on it: the first in line admits, the second reads the first's run
+/// and is refused with `startable`'s sentence, and the item holds exactly one live graph run.
 #[tokio::test(flavor = "multi_thread")]
-async fn finish_run_holds_the_item_while_another_run_is_live() {
+async fn two_creates_racing_on_one_item_admit_one() {
     let Some(db) = common::demo_db().await else {
         return;
     };
-    let owner = uuid::Uuid::now_v7();
-    let at = Utc::now();
-
-    let closed_at = async |item: ItemId| {
-        sqlx::query_scalar!(
-            r#"SELECT closed_at FROM item WHERE id = $1"#,
-            item.as_uuid(),
-        )
-        .fetch_one(&db.pool)
+    let item = ids::HTUI_ANA_2;
+    let mut holder = db.pool.begin().await.expect("begin the item holder");
+    sqlx::query("SELECT 1 FROM item WHERE id = $1 FOR UPDATE")
+        .bind(item.as_uuid())
+        .execute(&mut *holder)
         .await
-        .expect("read the item's closed_at back")
+        .expect("lock the item row");
+    let spawn_create = || {
+        let store = db.store.clone();
+        tokio::spawn(async move { store.create_run(race_run(item)).await })
+    };
+    let first = spawn_create();
+    lock_waiters(&db.pool, 1).await;
+    let second = spawn_create();
+    lock_waiters(&db.pool, 2).await;
+    holder.rollback().await.expect("release the item row");
+
+    let first = first.await.expect("the first create task");
+    let second = second.await.expect("the second create task");
+    let admitted = first.expect("the first in line admits");
+    match second {
+        Err(htui_core::store::StoreError::Constraint(text)) => assert_eq!(
+            text,
+            htui_core::store::not_startable("ANA-2", ItemState::Queued),
+            "the second create names the item and the run the first one queued"
+        ),
+        other => panic!("the second create is refused by the live-run check, got {other:?}"),
+    }
+    let live: Vec<RunId> = sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT id FROM run WHERE item_id = $1 AND kind = 'graph' \
+            AND status IN ('queued','running','awaiting_approval','stopped')",
+    )
+    .bind(item.as_uuid())
+    .fetch_all(&db.pool)
+    .await
+    .expect("read the item's live graph runs")
+    .into_iter()
+    .map(RunId::from)
+    .collect();
+    assert_eq!(
+        live,
+        vec![admitted.id],
+        "one live graph run, the admitted one"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-144: `finish_run` moves the run only. Finishing `done`, `failed` or `cancelled` leaves
+/// the item row byte-identical: its status, its `updated_at` (no write fired the trigger) and its
+/// `closed_at` (only `close_out` stamps it). Read raw, so a store read cannot hide a write.
+#[tokio::test(flavor = "multi_thread")]
+async fn finishing_a_run_never_writes_its_item() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let item = ids::HTUI_ANA_2;
+    let owner = uuid::Uuid::now_v7();
+    let raw = async || -> (String, String, Option<String>) {
+        sqlx::query_as("SELECT status, updated_at::text, closed_at::text FROM item WHERE id = $1")
+            .bind(item.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("read the item row raw")
     };
 
-    let left = db
-        .store
-        .create_run(race_run(ids::HTUI_ANA_2))
-        .await
-        .expect("the first run is queued")
-        .id;
-    assert!(
-        db.store
-            .transition(ids::HTUI_ANA_2, Status::Queued, Status::Open)
+    for (to, failure) in [
+        (RunStatus::Done, None),
+        (RunStatus::Failed, Some("boom")),
+        (RunStatus::Cancelled, None),
+    ] {
+        let run = db
+            .store
+            .create_run(race_run(item))
             .await
-            .expect("the walk back must not fail"),
-        "queued -> open is sanctioned, and is the only way to queue a second run on one item"
-    );
-    let right = db
-        .store
-        .create_run(race_run(ids::HTUI_ANA_2))
-        .await
-        .expect("the second run is queued")
-        .id;
-    for run in [left, right] {
+            .expect("the item is open with no live run")
+            .id;
         assert_eq!(
             db.store
-                .claim_run(run, ids::BOX, owner, at, TimeDelta::minutes(5))
+                .claim_run(run, ids::BOX, owner, Utc::now(), TimeDelta::minutes(5))
                 .await
                 .expect("the claim must not fail"),
             Claim::Admitted,
-            "both runs fit the fixture box's two slots"
+            "the fixture box has a free slot"
         );
+        let before = raw().await;
+        db.store
+            .finish_run(run, to, failure, Utc::now())
+            .await
+            .expect("the finish must not fail");
+        assert_eq!(
+            raw().await,
+            before,
+            "finishing a run `{to}` writes nothing to its item"
+        );
+        assert_eq!(before.0, "open", "the item stays `open` throughout");
     }
-
-    db.store
-        .finish_run(left, RunStatus::Done, None, at)
-        .await
-        .expect("the first finish must not fail");
-    let held = db
-        .store
-        .item(ids::HTUI_ANA_2)
-        .await
-        .expect("read must not fail")
-        .expect("the fixture item exists");
-    assert_eq!(
-        held.status,
-        Status::InProgress,
-        "the item is held while its other run is still live"
-    );
-    assert_eq!(
-        closed_at(ids::HTUI_ANA_2).await,
-        None,
-        "and nothing was closed off"
-    );
-
-    db.store
-        .finish_run(right, RunStatus::Done, None, at)
-        .await
-        .expect("the second finish must not fail");
-    let moved = db
-        .store
-        .item(ids::HTUI_ANA_2)
-        .await
-        .expect("read must not fail")
-        .expect("the fixture item exists");
-    assert_eq!(
-        moved.status,
-        Status::Done,
-        "the last run out moves the item"
-    );
-    assert!(
-        closed_at(ids::HTUI_ANA_2).await.is_some(),
-        "`done` is terminal for an item, so the mirror sets `closed_at` - the same rule \
-         `transition` writes, not a second one"
-    );
-
-    // The other direction of that rule, on its own item: a `cancelled` run hands the item back to
-    // the backlog, and `open` is not terminal, so `closed_at` stays clear.
-    let cancelled = db
-        .store
-        .create_run(race_run(ids::HTUI_CLEAN_1))
-        .await
-        .expect("a failed item can be re-queued")
-        .id;
-    db.store
-        .finish_run(cancelled, RunStatus::Cancelled, None, at)
-        .await
-        .expect("the cancel must not fail");
-    let released = db
-        .store
-        .item(ids::HTUI_CLEAN_1)
-        .await
-        .expect("read must not fail")
-        .expect("the fixture item exists");
-    assert_eq!(
-        released.status,
-        Status::Open,
-        "queued -> open is the only row of the table whose `from` is `queued`"
-    );
-    assert_eq!(
-        closed_at(ids::HTUI_CLEAN_1).await,
-        None,
-        "and `open` is not terminal, so `closed_at` is cleared rather than stamped"
-    );
 
     db.drop_db().await;
 }
@@ -5242,7 +5309,7 @@ async fn a_missing_tags_run_aimed_at_another_box_is_not_claimable() {
             .expect("the item reads back")
             .expect("it exists")
             .status,
-        Status::Queued,
+        Status::Open,
         "the refusal wrote nothing to the item either: it is not blocked"
     );
 
@@ -7095,13 +7162,14 @@ async fn a_bound_persona_cannot_be_deleted() {
 /// MOD-11 plan D13, R-12: `write_step_document` and `park_step` take their locks in one order,
 /// step → run → item, so a step's document racing its own park never deadlocks (`40P01`).
 ///
-/// `park_step` locks the step and its run `FOR UPDATE`, then updates the item; the document write
-/// locks the step and its run `FOR SHARE`, locks the item `FOR UPDATE` and inserts a row whose
-/// foreign key takes `FOR KEY SHARE` on the step. Fifty rounds, each on a fresh running step of
+/// `park_step` locks the step and its run `FOR UPDATE` (and, since MOD-144, writes no item); the
+/// document write locks the step and its run `FOR SHARE`, locks the item `FOR UPDATE` and inserts
+/// a row whose foreign key takes `FOR KEY SHARE` on the step. Fifty rounds, each on a fresh
+/// running step of
 /// one leased run, with the two writes on two independent pools (`admission_is_serialised_by_the_box_row_lock`'s
 /// reason). Both always land — a park does not release the lease, so the fence still holds after
-/// it — and every round ends in the one state both orders reach: the step, the run and the item
-/// parked, and the document stored under the step.
+/// it — and every round ends in the one state both orders reach: the step and the run parked,
+/// the item left `open` (its `needs you` is the run's), and the document stored under the step.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_step_document_racing_a_park_never_deadlocks() {
     let Some(db) = common::demo_db().await else {
@@ -7232,12 +7300,12 @@ async fn a_step_document_racing_a_park_never_deadlocks() {
                 Some(Some(step)),
                 Some(htui_core::model::StepStatus::AwaitingApproval),
                 Some(RunStatus::AwaitingApproval),
-                Some(Status::AwaitingApproval),
+                Some(Status::Open),
             ),
             "round {round}: either order ends with the document stored and everything parked"
         );
 
-        // The next round races a running step of a running run on an in-progress item again.
+        // The next round races a running step of a running run again.
         assert!(
             db.store
                 .transition_run(
@@ -7249,13 +7317,6 @@ async fn a_step_document_racing_a_park_never_deadlocks() {
                 .await
                 .expect("resume the run"),
             "round {round}: the run resumes"
-        );
-        assert!(
-            db.store
-                .transition(item, Status::AwaitingApproval, Status::InProgress)
-                .await
-                .expect("resume the item"),
-            "round {round}: the item resumes"
         );
     }
 
@@ -9386,8 +9447,9 @@ async fn a_stopped_run_is_live_everywhere_but_the_top_bar_on_both_stores() {
             pg.active_runs(&scope).await.expect("read"),
             mem.active_runs(&scope).await.expect("read"),
         ),
-        (2, 2),
-        "the fixture's queued RUN_2 and the running run are on the top bar"
+        (4, 4),
+        "the fixture's queued RUN_2, running RUN_4 and parked RUN_5 and the running run are on \
+         the top bar"
     );
     for store_moved in [
         pg.transition_run(run, RunStatus::Running, RunStatus::Stopped, at)
@@ -9405,7 +9467,7 @@ async fn a_stopped_run_is_live_everywhere_but_the_top_bar_on_both_stores() {
             pg.active_runs(&scope).await.expect("read"),
             mem.active_runs(&scope).await.expect("read"),
         ),
-        (1, 1),
+        (3, 3),
         "a stopped run leaves the top bar (D2 exclusion), on both stores"
     );
     let overlapping =
@@ -9477,16 +9539,17 @@ async fn a_claim_racing_a_pause_admits_first_or_finds_the_run_cancelled() {
     let Some(db) = common::demo_db().await else {
         return;
     };
-    // The close first: the claim finds the run cancelled and the item open again, so the same
-    // item can be raced once more with the claim first.
+    // The close first: the claim finds the run cancelled, which leaves no live run, so the same
+    // item can be raced once more with the claim first. The item's state is derived (MOD-144):
+    // a cancelled run is skipped, so it reads `open`; an admitted one reads `running`.
     assert_eq!(
         claim_racing_a_pause(&db, false).await,
-        (Claim::NotClaimable, RunStatus::Cancelled, Status::Open),
+        (Claim::NotClaimable, RunStatus::Cancelled, ItemState::Open),
         "the close won: the claim found the run cancelled"
     );
     assert_eq!(
         claim_racing_a_pause(&db, true).await,
-        (Claim::Admitted, RunStatus::Running, Status::InProgress),
+        (Claim::Admitted, RunStatus::Running, ItemState::Running),
         "the claim won: the close found no queued run"
     );
 
@@ -9495,12 +9558,12 @@ async fn a_claim_racing_a_pause_admits_first_or_finds_the_run_cancelled() {
 
 /// One round of [`a_claim_racing_a_pause_admits_first_or_finds_the_run_cancelled`] on a fresh
 /// batch and run: the run row is held, the first of the two (the claim when `claim_first`)
-/// queues on it, then the other, then the row is released. Answers the claim and the run's and
-/// the item's statuses after both have ended.
+/// queues on it, then the other, then the row is released. Answers the claim, the run's status
+/// and the item's derived state after both have ended.
 async fn claim_racing_a_pause(
     db: &common::TestDb,
     claim_first: bool,
-) -> (Claim, RunStatus, Status) {
+) -> (Claim, RunStatus, ItemState) {
     use htui_core::model::BatchClose;
 
     let at = Utc::now();
@@ -9567,14 +9630,27 @@ async fn claim_racing_a_pause(
         .expect("read")
         .expect("the run")
         .status;
-    let item = db
-        .store
-        .item(ids::HTUI_ANA_2)
-        .await
-        .expect("read")
-        .expect("the item")
-        .status;
-    (claim, status, item)
+    (claim, status, item_state(&db.pool, ids::HTUI_ANA_2).await)
+}
+
+/// The item's [`ItemState`] read straight from the rows: its stored status over its latest graph
+/// run, `cancelled` skipped (MOD-144's rule, spelled out here rather than through a store read).
+async fn item_state(pool: &PgPool, item: ItemId) -> ItemState {
+    let (status, latest): (String, Option<String>) = sqlx::query_as(
+        "SELECT i.status, \
+                (SELECT r.status FROM run r \
+                  WHERE r.item_id = i.id AND r.kind = 'graph' AND r.status <> 'cancelled' \
+                  ORDER BY r.queued_at DESC, r.id DESC LIMIT 1) \
+           FROM item i WHERE i.id = $1",
+    )
+    .bind(item.as_uuid())
+    .fetch_one(pool)
+    .await
+    .expect("read the item and its latest graph run");
+    ItemState::of(
+        status.parse::<Status>().expect("a stored status"),
+        latest.map(|run| run.parse::<RunStatus>().expect("a stored run status")),
+    )
 }
 
 /// MOD-12 D2: two racing resumes on two handles open one batch, and both answer it.
@@ -10780,8 +10856,8 @@ const QUEUE_EDGES: [(ItemId, htui_core::model::LinkKind, bool); 6] = [
 
 /// `MemStore::demo()` plus `facts.laptop` (`LAPTOP-B`), [`QUEUE_EDGES`] and `facts.chat`: a chat
 /// run on `HTUI_ANA_2` queued after every graph run [`plant_queue_facts`] writes, which
-/// `queue_rows` must not take for the latest run. `NewRun` has no kind, so it is planted here,
-/// already `done`: an active run would hold the item `queued` and refuse the next `create_run`.
+/// `queue_rows` must take neither for the latest run nor for `latest_run_status` (MOD-144: both
+/// are graph runs only). `NewRun` has no kind, so it is planted here, already `done`.
 fn queue_facts_mem(facts: &QueueFacts) -> htui_core::store::MemStore {
     let mut data = htui_core::fixtures::demo_data();
     let mut laptop = data
@@ -11020,6 +11096,11 @@ async fn queue_rows_answer_alike_on_both_stores() {
         Some((facts.latest, RunStatus::Queued)),
         "the latest graph run, not the later chat run"
     );
+    assert_eq!(
+        ana.latest_run_status,
+        Some(RunStatus::Queued),
+        "MOD-144: the item's state derives from the same graph run here, the cancel being older"
+    );
     assert_eq!(ana.latest_note.as_deref(), Some("the later note"));
     assert_eq!(
         ana.open_blockers,
@@ -11046,6 +11127,299 @@ async fn queue_rows_answer_alike_on_both_stores() {
             .expect("an empty queue")
             .is_empty()
     );
+
+    db.drop_db().await;
+}
+
+// ---- MOD-144 PD5: the inherent queue reads and writes, Postgres against MemStore ----------------
+
+/// Runs one graph run of `item` (in `project`) to `to` through the trait, so both stores take the
+/// same id and instant. A `done` run is claimed first: only a running run finishes `done`.
+async fn run_item_to<S: htui_core::store::WriteStore>(
+    store: &S,
+    (project, item): (ProjectId, ItemId),
+    run: RunId,
+    to: RunStatus,
+    at: DateTime<Utc>,
+) {
+    store
+        .create_run(NewRun {
+            id: run,
+            project_id: project,
+            queued_at: at,
+            ..race_run(item)
+        })
+        .await
+        .expect("the run is created");
+    if to == RunStatus::Done {
+        assert_eq!(
+            store
+                .claim_run(
+                    run,
+                    ids::BOX,
+                    uuid::Uuid::now_v7(),
+                    at,
+                    TimeDelta::minutes(5)
+                )
+                .await
+                .expect("the claim is answered"),
+            Claim::Admitted,
+            "the fixture box has a free slot"
+        );
+    }
+    store
+        .finish_run(run, to, None, at)
+        .await
+        .expect("the run finishes");
+}
+
+/// The Platform workspace's two projects, `htui` and `agy`.
+fn platform_scope() -> htui_core::model::Scope {
+    htui_core::model::Scope {
+        workspace_id: ids::WORKSPACE_PLATFORM,
+        project_ids: vec![ids::PROJECT_HTUI, ids::PROJECT_AGY],
+    }
+}
+
+/// MOD-144 PD6: `queue_rows` keeps two latest runs apart. An item whose `done` run is followed
+/// by a cancelled one shows the cancel as its latest run (`QueueRunFact`, cancels included) and
+/// `done` as `latest_run_status` (the run its state derives from, cancels skipped), so it reads
+/// `done`; on both stores alike.
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_rows_keep_a_cancelled_latest_run_beside_the_latest_status() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let item = (ids::PROJECT_HTUI, ids::HTUI_ANA_2);
+    let (done, cancelled) = (RunId::new(), RunId::new());
+    for (run, to, queued) in [
+        (done, RunStatus::Done, at),
+        (cancelled, RunStatus::Cancelled, at + TimeDelta::seconds(1)),
+    ] {
+        run_item_to(pg, item, run, to, queued).await;
+        run_item_to(&mem, item, run, to, queued).await;
+    }
+    pg.queue_item(item.1, ids::BOX, None, ids::USER, at)
+        .await
+        .expect("queue on Postgres");
+    mem.queue_item(item.1, ids::BOX, None, ids::USER, at)
+        .await
+        .expect("queue on MemStore");
+
+    let rows = pg
+        .queue_rows(ids::BOX)
+        .await
+        .expect("queue_rows on Postgres");
+    assert_eq!(
+        rows,
+        mem.queue_rows(ids::BOX)
+            .await
+            .expect("queue_rows on MemStore"),
+        "one answer, both stores"
+    );
+    let row = rows
+        .iter()
+        .find(|row| row.entry.item_id == item.1)
+        .expect("ANA-2 is queued");
+    assert_eq!(
+        row.latest_run.as_ref().map(|run| (run.id, run.status)),
+        Some((cancelled, RunStatus::Cancelled)),
+        "the queue overlay's latest run keeps the cancel"
+    );
+    assert_eq!(
+        row.latest_run_status,
+        Some(RunStatus::Done),
+        "the state's latest run skips it"
+    );
+    assert_eq!(row.state(), ItemState::Done, "so the item reads finished");
+
+    db.drop_db().await;
+}
+
+/// MOD-144's readiness on both stores' `ready_items`: `open` with no non-cancelled graph run, and
+/// every `blocked_by` target released (closed, or its latest graph run `done`). A queued run
+/// holds an item, its cancel hands it back; a target whose rework run is running holds its
+/// dependent until that run finishes `done`; a target whose latest run failed holds it too.
+#[tokio::test(flavor = "multi_thread")]
+async fn ready_items_skip_cancelled_runs_and_wait_on_a_rework_run() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    // ANA-2 waits on FEAT-1 (`done` RUN_1, then the running rework RUN_4); agy FEAT-1 on CLEAN-1
+    // (latest `failed`). agy FIX-1 already waits on agy ANA-1 (latest `done`) in the fixture.
+    let edges = [
+        (ids::HTUI_ANA_2, ids::HTUI_FEAT_1),
+        (ids::AGY_FEAT_1, ids::HTUI_CLEAN_1),
+    ];
+    let mut data = htui_core::fixtures::demo_data();
+    for (from, to) in edges {
+        data.links.push(htui_core::model::ItemLink {
+            from_item_id: from,
+            to_item_id: to,
+            kind: htui_core::model::LinkKind::BlockedBy,
+            proposed_by_step_id: None,
+            created_at: at,
+            updated_at: at,
+            deleted_at: None,
+        });
+        sqlx::query(
+            "INSERT INTO item_link (from_item_id, to_item_id, kind, created_at, updated_at) \
+             VALUES ($1, $2, 'blocked_by', $3, $3)",
+        )
+        .bind(from.as_uuid())
+        .bind(to.as_uuid())
+        .bind(at)
+        .execute(&db.pool)
+        .await
+        .expect("plant an edge");
+    }
+    let mem = htui_core::store::MemStore::from_demo(data);
+    let pg = &db.store;
+    let scope = platform_scope();
+    let ready = async || -> Vec<ItemId> {
+        let on_pg: Vec<ItemId> = pg
+            .ready_items(&scope, ids::BOX)
+            .await
+            .expect("ready_items on Postgres")
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        let on_mem: Vec<ItemId> = mem
+            .ready_items(&scope, ids::BOX)
+            .await
+            .expect("ready_items on MemStore")
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(on_pg, on_mem, "one answer, both stores");
+        on_pg
+    };
+
+    assert_eq!(
+        ready().await,
+        [ids::AGY_FIX_1],
+        "agy FIX-1's target is finished; ANA-2's is reworking and agy FEAT-1's failed"
+    );
+
+    let queued = RunId::new();
+    let new = NewRun {
+        id: queued,
+        project_id: ids::PROJECT_AGY,
+        queued_at: at,
+        ..race_run(ids::AGY_FIX_1)
+    };
+    pg.create_run(new.clone()).await.expect("queue on Postgres");
+    mem.create_run(new).await.expect("queue on MemStore");
+    assert_eq!(ready().await, [], "a queued run holds its item");
+    pg.finish_run(queued, RunStatus::Cancelled, None, at)
+        .await
+        .expect("cancel on Postgres");
+    mem.finish_run(queued, RunStatus::Cancelled, None, at)
+        .await
+        .expect("cancel on MemStore");
+    assert_eq!(
+        ready().await,
+        [ids::AGY_FIX_1],
+        "its cancel hands the item back: the latest-run rule skips a cancelled run"
+    );
+
+    pg.finish_run(ids::RUN_4, RunStatus::Done, None, at)
+        .await
+        .expect("finish the rework on Postgres");
+    mem.finish_run(ids::RUN_4, RunStatus::Done, None, at)
+        .await
+        .expect("finish the rework on MemStore");
+    assert_eq!(
+        ready().await,
+        [ids::HTUI_ANA_2, ids::AGY_FIX_1],
+        "the rework run finishing `done` releases ANA-2"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-144: `prune_finished_entries` drops the entries of closed items and of finished ones
+/// (latest graph run `done`, a later cancel skipped), and keeps every other, alike on both
+/// stores.
+#[tokio::test(flavor = "multi_thread")]
+async fn prune_drops_finished_and_closed_entries_alike() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let ana_2 = (ids::PROJECT_HTUI, ids::HTUI_ANA_2);
+    let (done, cancelled) = (RunId::new(), RunId::new());
+    for (run, to, queued) in [
+        (done, RunStatus::Done, at),
+        (cancelled, RunStatus::Cancelled, at + TimeDelta::seconds(1)),
+    ] {
+        run_item_to(pg, ana_2, run, to, queued).await;
+        run_item_to(&mem, ana_2, run, to, queued).await;
+    }
+    let pruned = [
+        ids::HTUI_ANA_2, // `done`, then a cancel
+        ids::HTUI_ANA_1, // `done`
+        ids::AGY_ANA_1,  // `done`
+        ids::HTUI_FIX_1, // closed
+    ];
+    let kept = [
+        ids::HTUI_FEAT_1,  // `done`, then a running rework
+        ids::HTUI_FEAT_3,  // queued
+        ids::HTUI_CLEAN_1, // failed
+        ids::HTUI_TOOL_1,  // needs you
+        ids::HTUI_FEAT_2,  // blocked
+        ids::AGY_FIX_1,    // open, no run
+    ];
+    for item in pruned.iter().chain(&kept) {
+        pg.queue_item(*item, ids::BOX, None, ids::USER, at)
+            .await
+            .expect("queue on Postgres");
+        mem.queue_item(*item, ids::BOX, None, ids::USER, at)
+            .await
+            .expect("queue on MemStore");
+    }
+
+    let on_pg = pg
+        .prune_finished_entries(ids::BOX)
+        .await
+        .expect("prune on Postgres");
+    let on_mem = mem
+        .prune_finished_entries(ids::BOX)
+        .await
+        .expect("prune on MemStore");
+    assert_eq!(on_pg, on_mem, "both stores drop as many entries");
+    let left = |rows: Vec<htui_core::model::QueueRow>| -> std::collections::BTreeSet<ItemId> {
+        rows.into_iter().map(|row| row.entry.item_id).collect()
+    };
+    let left_pg = left(
+        pg.queue_rows(ids::BOX)
+            .await
+            .expect("queue_rows on Postgres"),
+    );
+    assert_eq!(
+        left_pg,
+        left(
+            mem.queue_rows(ids::BOX)
+                .await
+                .expect("queue_rows on MemStore")
+        ),
+        "and keep the same ones"
+    );
+    for item in pruned {
+        assert!(!left_pg.contains(&item), "{item} is closed or finished");
+    }
+    for item in kept {
+        assert!(
+            left_pg.contains(&item),
+            "{item} is neither closed nor finished"
+        );
+    }
 
     db.drop_db().await;
 }
@@ -11225,11 +11599,14 @@ async fn prune_finished_entries_locks_the_entries_in_item_id_order() {
         .await
         .expect("prune");
     let finished: Vec<uuid::Uuid> = items.iter().map(|item| item.as_uuid()).collect();
-    sqlx::query("UPDATE item SET status = 'done' WHERE id = ANY($1)")
-        .bind(&finished[..])
-        .execute(&db.pool)
-        .await
-        .expect("finish the three items");
+    sqlx::query(
+        "UPDATE item SET status = 'closed', resolution = 'done', closed_at = now() \
+          WHERE id = ANY($1)",
+    )
+    .bind(&finished[..])
+    .execute(&db.pool)
+    .await
+    .expect("close the three items");
     let holder = hold_entry(&db.pool, lowest).await;
     let pruner = tokio::spawn({
         let store = db.store.clone();
@@ -11269,22 +11646,28 @@ async fn concurrent_moves_and_prunes_never_deadlock() {
     }
     let finished: Vec<uuid::Uuid> = items.iter().step_by(2).map(|item| item.as_uuid()).collect();
     for round in 0..20 {
-        sqlx::query("UPDATE item SET status = 'open' WHERE id = ANY($1)")
-            .bind(&finished[..])
-            .execute(&db.pool)
-            .await
-            .expect("reopen the finished items");
+        sqlx::query(
+            "UPDATE item SET status = 'open', resolution = NULL, closed_at = NULL \
+              WHERE id = ANY($1)",
+        )
+        .bind(&finished[..])
+        .execute(&db.pool)
+        .await
+        .expect("reopen the closed items");
         for &item in items.iter().rev() {
             db.store
                 .queue_item(item, ids::BOX, None, ids::USER, Utc::now())
                 .await
                 .expect("the item queues");
         }
-        sqlx::query("UPDATE item SET status = 'done' WHERE id = ANY($1)")
-            .bind(&finished[..])
-            .execute(&db.pool)
-            .await
-            .expect("finish half the items");
+        sqlx::query(
+            "UPDATE item SET status = 'closed', resolution = 'done', closed_at = now() \
+              WHERE id = ANY($1)",
+        )
+        .bind(&finished[..])
+        .execute(&db.pool)
+        .await
+        .expect("close half the items");
         let moves = (0..4).map(|n| {
             let store = db.store.clone();
             let item = items[(round + n) % items.len()];

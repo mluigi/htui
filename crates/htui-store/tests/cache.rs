@@ -18,9 +18,9 @@ use htui_store::testkit as common;
 use chrono::{SubsecRound as _, TimeDelta, Utc};
 use htui_core::fixtures::{self, ids};
 use htui_core::model::{
-    CitationKind, DocumentId, EventKind, EventRole, ItemFilter, LinkGraph, MemoryEntryId,
-    NewDocument, ProjectId, PromptScope, Resolution, RunId, Scope, SessionEvent, Status, StepId,
-    StepOpening, UserId, WorkspaceSummary,
+    CitationKind, DocumentId, EventKind, EventRole, ItemFilter, ItemState, LinkGraph,
+    MemoryEntryId, NewDocument, ProjectId, PromptScope, Resolution, RunId, Scope, SessionEvent,
+    Status, StepId, StepOpening, UserId, WorkspaceSummary,
 };
 use htui_core::store::{MemStore, ReadStore as _, StepFence, StoreError, WriteStore as _};
 use htui_store::cache::refresh::{RefreshSettings, Refresher, run_pass};
@@ -365,7 +365,22 @@ async fn mirror_reads_equal_the_reference_store() {
             text: Some("%".to_owned()),
             ..ItemFilter::default()
         },
-    ] {
+        // MOD-144: the derived state and the not-ready half. `ItemSummary` equality covers
+        // `latest_run_status`, so these are the mirror-against-MemStore drift guard.
+        ItemFilter {
+            ready: Some(false),
+            ..ItemFilter::default()
+        },
+        ItemFilter {
+            states: Some(vec![ItemState::Running, ItemState::Failed]),
+            ..ItemFilter::default()
+        },
+    ]
+    .into_iter()
+    .chain(ItemState::ALL.iter().map(|state| ItemFilter {
+        states: Some(vec![*state]),
+        ..ItemFilter::default()
+    })) {
         assert_eq!(
             cache.items(&scope, &filter).await.expect("cache items"),
             mem.items(&scope, &filter).await.expect("mem items"),
@@ -787,12 +802,7 @@ async fn the_mirror_lists_waiting_candidates_like_postgres() {
             .await
             .expect("transition_run")
     );
-    assert!(
-        store
-            .transition(minted, Status::InProgress, Status::AwaitingApproval)
-            .await
-            .expect("transition")
-    );
+    // MOD-144: the item is not moved; its `needs you` is the run's `awaiting_approval`.
 
     // A blocked item whose run a workspace stop interrupted: a stopped run is live (MOD-125 D2),
     // so the mirror's run-status list names it as Postgres' does.
@@ -836,7 +846,7 @@ async fn the_mirror_lists_waiting_candidates_like_postgres() {
     );
     assert!(
         store
-            .transition(stopped, Status::InProgress, Status::Blocked)
+            .transition(stopped, Status::Open, Status::Blocked)
             .await
             .expect("transition")
     );
@@ -845,7 +855,7 @@ async fn the_mirror_lists_waiting_candidates_like_postgres() {
     // parked ones (T2's unblock reads the first active run, blueprint H-1).
     assert!(
         store
-            .transition(ids::HTUI_FEAT_3, Status::Queued, Status::Blocked)
+            .transition(ids::HTUI_FEAT_3, Status::Open, Status::Blocked)
             .await
             .expect("transition")
     );
@@ -940,6 +950,216 @@ async fn the_mirror_lists_waiting_candidates_like_postgres() {
             .collect::<Vec<_>>(),
         vec![(ids::RUN_2, RunStatus::Queued, 1)],
         "FEAT-3 carries its queued run and the run's pending step"
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
+/// MOD-144: the mirror derives an item's state as Postgres does: the latest graph run, `cancelled`
+/// skipped, by `(queued_at, id)` (SQLite's correlated subquery against Postgres' `LATERAL`), in
+/// `items` (`ready`, `states`), `links`, `upstream_summaries` and `requirement_coverage`. ANA-2
+/// gains a `done` run and then a later cancelled one, so a mirror that took the cancel for the
+/// latest run would read it `open` (and ready) where Postgres reads it `done`; agy FIX-1 is
+/// blocked by hand. With the three demo projects every [`ItemState`] is some item's.
+#[tokio::test]
+async fn the_mirror_derives_item_state_like_postgres() {
+    use htui_core::model::{
+        Claim, GraphSnapshot, Isolation, ItemId, NewRun, RunMode, RunStatus, SnapshotGraph,
+        SnapshotSettings,
+    };
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let store = &db.store;
+    let at = Utc::now().trunc_subsecs(6);
+    let new_run = |id: RunId, queued_at| NewRun {
+        workspace_id: None,
+        id,
+        project_id: ids::PROJECT_HTUI,
+        item_id: ids::HTUI_ANA_2,
+        mode: RunMode::Manual,
+        target_box_id: ids::BOX,
+        started_by: ids::USER,
+        graph_snapshot: GraphSnapshot {
+            v: GraphSnapshot::V,
+            graph: SnapshotGraph {
+                id: ids::GRAPH_HTUI_FEAT,
+                name: "feature".to_owned(),
+                is_override: false,
+                scope: None,
+                revision: None,
+            },
+            topology: "sha256:cache".to_owned(),
+            mode: RunMode::Manual,
+            phases: Vec::new(),
+            settings: SnapshotSettings {
+                default_isolation: Isolation::Worktree,
+                per_token_cap_run: None,
+                per_token_cap_batch: None,
+                max_fan_out: 4,
+                max_agents_per_run: 8,
+                max_parallel_sessions: SnapshotSettings::DEFAULT_MAX_PARALLEL_SESSIONS,
+                max_plan_revisions: SnapshotSettings::DEFAULT_MAX_PLAN_REVISIONS,
+                max_child_runs: SnapshotSettings::DEFAULT_MAX_CHILD_RUNS,
+                runtime_changes: htui_core::model::RuntimeChanges::Ask,
+            },
+            scope: None,
+            personas: Vec::new(),
+            edges: Vec::new(),
+            source: None,
+        },
+        repo_scope: Vec::new(),
+        queued_at,
+        batch_id: None,
+    };
+    let (done, cancelled) = (RunId::new(), RunId::new());
+    store
+        .create_run(new_run(done, at))
+        .await
+        .expect("create_run");
+    assert_eq!(
+        store
+            .claim_run(
+                done,
+                ids::BOX,
+                uuid::Uuid::now_v7(),
+                at,
+                TimeDelta::minutes(5)
+            )
+            .await
+            .expect("claim_run"),
+        Claim::Admitted
+    );
+    store
+        .finish_run(done, RunStatus::Done, None, at)
+        .await
+        .expect("finish_run");
+    store
+        .create_run(new_run(cancelled, at + TimeDelta::seconds(1)))
+        .await
+        .expect("create_run");
+    store
+        .finish_run(cancelled, RunStatus::Cancelled, None, at)
+        .await
+        .expect("finish_run");
+    assert!(
+        store
+            .transition(ids::AGY_FIX_1, Status::Open, Status::Blocked)
+            .await
+            .expect("transition")
+    );
+
+    let cache = open_cache(&db).await;
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("one pass");
+    let scope = Scope {
+        workspace_id: ids::WORKSPACE_PLATFORM,
+        project_ids: all_projects(),
+    };
+
+    let mut filters = vec![
+        ItemFilter::default(),
+        ItemFilter {
+            ready: Some(true),
+            ..ItemFilter::default()
+        },
+        ItemFilter {
+            ready: Some(false),
+            ..ItemFilter::default()
+        },
+        ItemFilter {
+            states: Some(vec![ItemState::NeedsYou, ItemState::Done]),
+            ..ItemFilter::default()
+        },
+        ItemFilter {
+            states: Some(vec![ItemState::Open]),
+            statuses: Some(vec![Status::Open]),
+            ready: Some(true),
+            ..ItemFilter::default()
+        },
+    ];
+    filters.extend(ItemState::ALL.iter().map(|state| ItemFilter {
+        states: Some(vec![*state]),
+        ..ItemFilter::default()
+    }));
+    for filter in &filters {
+        let mirrored = cache.items(&scope, filter).await.expect("cache items");
+        assert_eq!(
+            mirrored,
+            store.items(&scope, filter).await.expect("pg items"),
+            "items for {filter:?}"
+        );
+        if let Some([state]) = filter.states.as_deref() {
+            assert!(
+                !mirrored.is_empty(),
+                "the demo holds a `{}` item",
+                state.word()
+            );
+            assert!(
+                mirrored.iter().all(|row| row.state() == *state),
+                "every row of {filter:?} reads `{}`",
+                state.word()
+            );
+        }
+    }
+    let ana_2 = cache
+        .items(&scope, &ItemFilter::default())
+        .await
+        .expect("cache items")
+        .into_iter()
+        .find(|row| row.id == ids::HTUI_ANA_2)
+        .expect("ANA-2 is listed");
+    assert_eq!(
+        (ana_2.latest_run_status, ana_2.state()),
+        (Some(RunStatus::Done), ItemState::Done),
+        "the later cancel is skipped"
+    );
+
+    let items: [ItemId; 6] = [
+        ids::HTUI_ANA_2,
+        ids::HTUI_FEAT_1,
+        ids::HTUI_FEAT_2,
+        ids::HTUI_TOOL_1,
+        ids::AGY_FIX_1,
+        ids::VULKAN_FEAT_1,
+    ];
+    for item in items {
+        assert_eq!(
+            canonical(cache.links(item, 2).await.expect("cache links")),
+            canonical(store.links(item, 2).await.expect("pg links")),
+            "links of {item}"
+        );
+    }
+    for root in [ids::AGY_FIX_1, ids::HTUI_FEAT_2, ids::HTUI_ANA_2] {
+        for bound in [
+            PromptScope::project_only(ids::PROJECT_AGY),
+            PromptScope::project_only(ids::PROJECT_HTUI),
+        ] {
+            assert_eq!(
+                cache
+                    .upstream_summaries(root, 2, &bound)
+                    .await
+                    .expect("cache upstream_summaries"),
+                store
+                    .upstream_summaries(root, 2, &bound)
+                    .await
+                    .expect("pg upstream_summaries"),
+                "upstream_summaries({root}, 2, {bound:?})"
+            );
+        }
+    }
+    assert_eq!(
+        cache
+            .requirement_coverage(ids::REQ_STO_1)
+            .await
+            .expect("cache requirement_coverage"),
+        store
+            .requirement_coverage(ids::REQ_STO_1)
+            .await
+            .expect("pg requirement_coverage"),
+        "coverage rows, latest run status included"
     );
 
     teardown(db, &[&cache]).await;

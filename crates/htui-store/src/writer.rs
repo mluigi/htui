@@ -375,6 +375,13 @@ impl WriteStore for Writer {
         }
     }
 
+    async fn block_if_idle(&self, note: NewNote) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.block_if_idle(note).await,
+            Self::Online(pg) => pg.block_if_idle(note).await,
+        }
+    }
+
     async fn append_events(&self, fence: StepFence, events: &[SessionEvent]) -> Result<usize> {
         match self {
             Self::Memory(store) => store.append_events(fence, events).await,

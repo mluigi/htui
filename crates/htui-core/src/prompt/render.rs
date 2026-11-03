@@ -366,7 +366,7 @@ impl UpstreamEntry {
             "### {} - {} ({}, {} {})",
             self.qualified_key,
             one_line_title(&self.title),
-            self.status.as_str(),
+            self.state().word(),
             self.depth,
             plural,
         );
@@ -385,7 +385,7 @@ impl UpstreamEntry {
             "- {} - {} ({}){}",
             self.qualified_key,
             one_line_title(&self.title),
-            self.status.as_str(),
+            self.state().word(),
             suffix,
         )
     }
@@ -1043,6 +1043,7 @@ mod tests {
             depth,
             in_scope,
             summary: summary.map(str::to_owned),
+            latest_run_status: None,
         }
     }
 

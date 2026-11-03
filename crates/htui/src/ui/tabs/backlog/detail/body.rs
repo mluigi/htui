@@ -19,7 +19,7 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 
-use htui_core::model::{Item, ItemId};
+use htui_core::model::{Item, ItemId, ItemState, RunStatus, Status, latest_graph_run};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span, Text};
@@ -51,12 +51,17 @@ const SEP: &str = " \u{b7} ";
 /// What the empty body says.
 const NO_BODY: &str = "No body for this item.";
 
-/// Status, tags, priority, version, and the body reflowed and wrapped at the pane's width (see
-/// the module doc); the title too while the border cannot hold it.
+/// State, tags, priority, version, and the body reflowed and wrapped at the pane's width (see
+/// the module doc); the title too while the border cannot hold it. The state is the item's derived
+/// [`ItemState`] mark (MOD-144), so the pane keeps the latest graph run of the `Runs` reply beside
+/// the `Item` one.
 #[derive(Debug, Default)]
 pub struct BodyTab {
     /// The `Item` reply for the selected item.
     item: Option<Item>,
+    /// MOD-144: the status of the selected item's latest graph run, read once from the `Runs`
+    /// reply: `None` until one lands, `Some(None)` for an item with no such run.
+    latest: Option<Option<RunStatus>>,
     /// Scroll of the body paragraph, not of the head block.
     scroll: Scroll,
     /// The body area's width at the last render, for the scroll clamp (MOD-84 D7); 0 before the
@@ -84,6 +89,17 @@ impl BodyTab {
             .as_ref()
             .map_or(0, |item| markdown::row_count(&item.body, self.drawn.get()))
     }
+
+    /// The item's derived state: its stored status over its latest graph run. `None` for an `open`
+    /// item until the `Runs` reply lands (or when the read failed): its runs decide between
+    /// `open`, `running`, `needs you` and the rest, so the pane must not guess `open`. A `blocked`
+    /// or `closed` item reads its status at once, whatever its runs.
+    fn state(&self, item: &Item) -> Option<ItemState> {
+        match (item.status, self.latest) {
+            (Status::Open, None) => None,
+            (status, latest) => Some(ItemState::of(status, latest.flatten())),
+        }
+    }
 }
 
 /// Whether the detail pane's top border holds `key · title` whole while Body is its active chip,
@@ -98,30 +114,47 @@ fn border_holds(key: &str, title: &str, inner: u16) -> bool {
     Pane::title_fits(area, &format!("{key}{SEP}{title}"), &detail::CHIPS, active)
 }
 
-/// The meta line's rows at `width`: the status as its mark in its own style, then the tags, the
-/// priority and the version, dim. One row when it fits (the detail pane at 100 columns); else the
+/// The meta line's rows at `width`: the state as its mark in its own style (`...` in dim while it
+/// is not known, MOD-144), then the tags, the priority and the version, dim. One row when it fits (the detail pane at 100 columns); else the
 /// parts fill rows greedily (MOD-115 M4 RV2-L4): ` · ` joins two parts on a row and never ends or
 /// starts one, so at 80 columns `version 1` takes the second row alone, and a part wider than the
 /// pane wraps inside itself (`kit::text::wrapped`) on rows of its own, so no part is lost.
-fn meta_lines(item: &Item, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+fn meta_lines(
+    item: &Item,
+    state: Option<ItemState>,
+    width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     let tags: Cow<'_, str> = if item.required_tags.is_empty() {
         Cow::Borrowed("no tags")
     } else {
         Cow::Owned(item.required_tags.join(", "))
     };
-    let mark = status::mark(item.status);
-    let mark = format!("{} {}", mark.glyph, mark.word);
+    // Not the `open` mark while the runs are unread: the state is not known yet (MOD-144).
+    let (mark, mark_style) = match state {
+        Some(state) => {
+            let mark = status::mark(state);
+            (
+                format!("{} {}", mark.glyph, mark.word),
+                theme.status_style(state),
+            )
+        }
+        None => ("...".to_owned(), theme.dim),
+    };
     let rest = format!(
         "{SEP}{tags}{SEP}priority {}{SEP}version {}",
         item.priority, item.version
     );
     if cell_width(&mark) + cell_width(&rest) <= usize::from(width) {
-        let mut spans = status::spans(item.status, theme);
+        let mut spans = match state {
+            Some(state) => status::spans(state, theme),
+            None => vec![Span::styled(mark, mark_style)],
+        };
         spans.push(Span::styled(rest, theme.dim));
         return vec![Line::from(spans)];
     }
     let parts = [
-        (mark, theme.status_style(item.status)),
+        (mark, mark_style),
         (tags.into_owned(), theme.dim),
         (format!("priority {}", item.priority), theme.dim),
         (format!("version {}", item.version), theme.dim),
@@ -180,6 +213,7 @@ impl DetailTab for BodyTab {
 
     fn on_item_change(&mut self, _item: Option<ItemId>) {
         self.item = None;
+        self.latest = None;
         self.scroll.reset();
     }
 
@@ -205,9 +239,19 @@ impl DetailTab for BodyTab {
     }
 
     fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
-        if let StoreReply::Item(item) = reply {
-            self.item = (**item).clone();
-            self.scroll.reset();
+        match reply {
+            StoreReply::Item(item) => {
+                self.item = (**item).clone();
+                self.scroll.reset();
+            }
+            // The reply carries no item id; the shell's staleness gate keeps it this item's
+            // (`App::on_reply`): every `Runs` read the Backlog tab sends is for its selection, and
+            // a move sends a new one, so a late reply for the item left behind is dropped before
+            // it reaches a sub-tab. An empty reply is an item with no run.
+            StoreReply::Runs(runs) => {
+                self.latest = Some(latest_graph_run(runs).map(|run| run.status));
+            }
+            _ => {}
         }
     }
 
@@ -236,7 +280,7 @@ impl DetailTab for BodyTab {
                     .map(|row| Line::styled(row, ctx.theme.title)),
             );
         }
-        head.extend(meta_lines(item, area.width, ctx.theme));
+        head.extend(meta_lines(item, self.state(item), area.width, ctx.theme));
         head.push(Line::raw(""));
         let rows = u16::try_from(head.len()).unwrap_or(u16::MAX);
 
@@ -269,15 +313,15 @@ mod tests {
     use super::*;
     use crate::ui::tabs::backlog::detail::compose::bench::{Shell, drawn, key};
 
-    /// A pane on FEAT-1 that has landed the item.
+    /// A pane on FEAT-1 that has landed the item and its runs.
     async fn pane(shell: &Shell) -> BodyTab {
         let mut pane = BodyTab::new();
         pane.on_item_change(Some(ids::HTUI_FEAT_1));
-        let item = MemStore::demo()
-            .item(ids::HTUI_FEAT_1)
-            .await
-            .expect("the item");
+        let store = MemStore::demo();
+        let item = store.item(ids::HTUI_FEAT_1).await.expect("the item");
+        let runs = store.runs(ids::HTUI_FEAT_1).await.expect("the runs");
         pane.on_reply(&StoreReply::Item(Box::new(item)), &mut shell.ctx());
+        pane.on_reply(&StoreReply::Runs(runs), &mut shell.ctx());
         pane
     }
 
@@ -349,6 +393,65 @@ mod tests {
             "{rows:#?}"
         );
         assert!(!rows.iter().any(|row| row.contains('`')), "{rows:#?}");
+    }
+
+    /// MOD-144 (PD16, R1 M3): the meta line shows the derived state. Until the `Runs` reply lands
+    /// an `open` item shows a dim placeholder, never the `open` mark its runs may contradict; the
+    /// reply's latest graph run decides it, an empty reply reading `open` (no run); a move to
+    /// another item forgets it. A `blocked` item reads `blocked` at once.
+    #[tokio::test]
+    async fn the_meta_line_reads_the_latest_graph_run() {
+        let shell = Shell::new();
+        let store = MemStore::demo();
+        let mut pane = BodyTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        let item = store.item(ids::HTUI_FEAT_1).await.expect("the item");
+        pane.on_reply(&StoreReply::Item(Box::new(item.clone())), &mut shell.ctx());
+        assert_eq!(
+            rows(&pane, &shell, 43, 30)[0],
+            "... \u{b7} rust \u{b7} priority 2 \u{b7} version 1",
+            "no runs read yet: not `open`"
+        );
+
+        let runs = store.runs(ids::HTUI_FEAT_1).await.expect("FEAT-1's runs");
+        pane.on_reply(&StoreReply::Runs(runs.clone()), &mut shell.ctx());
+        assert_eq!(
+            rows(&pane, &shell, 43, 30)[0],
+            "\u{25d0} running \u{b7} rust \u{b7} priority 2 \u{b7} version 1",
+            "the rework run RUN_4 is the latest"
+        );
+
+        pane.on_reply(&StoreReply::Runs(Vec::new()), &mut shell.ctx());
+        assert_eq!(
+            rows(&pane, &shell, 43, 30)[0],
+            "\u{25cb} open \u{b7} rust \u{b7} priority 2 \u{b7} version 1",
+            "an empty reply is an item with no run"
+        );
+        pane.on_reply(&StoreReply::Runs(runs), &mut shell.ctx());
+        assert_eq!(
+            rows(&pane, &shell, 43, 30)[0],
+            "\u{25d0} running \u{b7} rust \u{b7} priority 2 \u{b7} version 1",
+            "each reply replaces the last"
+        );
+
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.on_reply(&StoreReply::Item(Box::new(item.clone())), &mut shell.ctx());
+        assert_eq!(
+            rows(&pane, &shell, 43, 30)[0],
+            "... \u{b7} rust \u{b7} priority 2 \u{b7} version 1",
+            "a move forgets the runs"
+        );
+
+        let blocked = item.map(|item| Item {
+            status: Status::Blocked,
+            ..item
+        });
+        pane.on_reply(&StoreReply::Item(Box::new(blocked)), &mut shell.ctx());
+        assert_eq!(
+            rows(&pane, &shell, 43, 30)[0],
+            "\u{2298} blocked \u{b7} rust \u{b7} priority 2 \u{b7} version 1",
+            "a blocked item needs no runs to read `blocked`"
+        );
     }
 
     /// MOD-84 D7, as the Notes pane's review L1: the clamp counts the rows on screen at the last
@@ -425,6 +528,11 @@ mod tests {
         let mut pane = BodyTab::new();
         pane.on_item_change(Some(ids::HTUI_FEAT_1));
         pane.on_reply(&StoreReply::Item(Box::new(Some(item))), &mut shell.ctx());
+        let runs = MemStore::demo()
+            .runs(ids::HTUI_FEAT_1)
+            .await
+            .expect("the memory store never fails");
+        pane.on_reply(&StoreReply::Runs(runs), &mut shell.ctx());
         pane
     }
 
@@ -440,9 +548,7 @@ mod tests {
             .draw(|frame| pane.render(frame, frame.area(), &shell.ctx()))
             .expect("the frame draws");
         let buffer = terminal.backend().buffer();
-        let status = shell
-            .theme
-            .status_style(htui_core::model::Status::InProgress);
+        let status = shell.theme.status_style(ItemState::Running);
         assert_eq!(buffer[(0, 0)].symbol(), "\u{25d0}");
         assert_eq!(
             buffer[(0, 0)].fg,
@@ -537,7 +643,7 @@ mod tests {
             panic!("the item landed");
         };
         for width in 8..=60 {
-            let lines = meta_lines(item, width, &shell.theme);
+            let lines = meta_lines(item, pane.state(item), width, &shell.theme);
             let text: Vec<String> = lines.iter().map(ToString::to_string).collect();
             for row in &text {
                 assert!(cell_width(row) <= usize::from(width), "{width}: {text:#?}");

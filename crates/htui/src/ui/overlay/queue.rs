@@ -721,9 +721,9 @@ mod tests {
     use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
     use htui_core::model::{
-        BatchFigures, BatchId, BatchStop, CapError, Escalation, Hold, PER_TOKEN_CAP_BATCH,
-        PER_TOKEN_CAP_RUN, ProjectId, ProjectRef, QueueEntry, RunId, RunStatus, Status, StepId,
-        Wait, WorkspaceId,
+        BatchFigures, BatchId, BatchStop, CapError, Escalation, Hold, ItemState,
+        PER_TOKEN_CAP_BATCH, PER_TOKEN_CAP_RUN, ProjectId, ProjectRef, QueueEntry, RunId,
+        RunStatus, Status, StepId, Wait, WorkspaceId,
     };
     use htui_core::store::StoreError;
     use htui_store::DATABASE_UNREACHABLE;
@@ -858,6 +858,7 @@ mod tests {
             latest_run: None,
             latest_note: None,
             open_blockers: Vec::new(),
+            latest_run_status: None,
         }
     }
 
@@ -953,7 +954,7 @@ mod tests {
             ])),
             EntryState::Waiting(Wait::CancelledInBatch),
             EntryState::Waiting(Wait::Paused),
-            EntryState::Waiting(Wait::NotReady(Status::InProgress)),
+            EntryState::Waiting(Wait::NotReady(ItemState::Done)),
             EntryState::Escalated(Escalation::HardGateParked { run, step }),
             EntryState::Escalated(Escalation::JudgeUndecided {
                 run,
@@ -1012,7 +1013,7 @@ mod tests {
             "waiting on FEAT-1, FEAT-2",
             "cancelled in this batch; the next batch runs it",
             "queue paused",
-            "not ready: item is \u{25d0} running",
+            "not ready: item is \u{25cf} done",
             "hard gate parked",
             "judge undecided (last note: pick a branch)",
             "review loop exhausted",
@@ -1079,7 +1080,7 @@ mod tests {
                 "review loop exhausted (last note: round 3)",
             ),
             (
-                EntryState::Waiting(Wait::NotReady(Status::AwaitingApproval)),
+                EntryState::Waiting(Wait::NotReady(ItemState::NeedsYou)),
                 "not ready: item is \u{26a0} needs you",
             ),
         ];

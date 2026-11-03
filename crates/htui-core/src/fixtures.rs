@@ -7,7 +7,8 @@
 //! row would show up in a rendered frame.
 //!
 //! The data set is the one `docs/ANA-9.md` §5.10 seeds, filled out with two workspaces, three
-//! projects and thirteen items covering all eight `Status` values. MOD-38 adds `htui`'s
+//! projects and thirteen items covering the three statuses and the nine item states (MOD-144:
+//! the progress states come from each item's latest graph run). MOD-38 adds `htui`'s
 //! requirement set (ANA-11 §5): a spec header, two areas, three requirements and five citations,
 //! one of them suspect and one a tombstone.
 //!
@@ -233,29 +234,30 @@ pub mod ids {
     );
 
     demo_ids!(
-        /// `htui` `ANA-1`, done.
+        /// `htui` `ANA-1`, open over a `done` run ([`RUN_3`]): state `done`.
         HTUI_ANA_1: ItemId = (class::ITEM, 0),
         /// `htui` `ANA-2`, open.
         HTUI_ANA_2: ItemId = (class::ITEM, 1),
-        /// `htui` `FEAT-1`, in progress: the item every detail sub-tab has data for.
+        /// `htui` `FEAT-1`, open over a `running` rework run ([`RUN_4`]) after a `done` one
+        /// ([`RUN_1`]): state `running`, and the item every detail sub-tab has data for.
         HTUI_FEAT_1: ItemId = (class::ITEM, 2),
         /// `htui` `FEAT-2`, blocked by `FEAT-1`.
         HTUI_FEAT_2: ItemId = (class::ITEM, 3),
-        /// `htui` `FEAT-3`, queued.
+        /// `htui` `FEAT-3`, open over a `queued` run ([`RUN_2`]): state `queued`.
         HTUI_FEAT_3: ItemId = (class::ITEM, 4),
         /// `htui` `FIX-1`, closed.
         HTUI_FIX_1: ItemId = (class::ITEM, 5),
-        /// `htui` `TOOL-1`, awaiting approval.
+        /// `htui` `TOOL-1`, open over an `awaiting_approval` run ([`RUN_5`]): state `needs you`.
         HTUI_TOOL_1: ItemId = (class::ITEM, 6),
-        /// `htui` `CLEAN-1`, failed.
+        /// `htui` `CLEAN-1`, open over a `failed` run ([`RUN_6`]): state `failed`.
         HTUI_CLEAN_1: ItemId = (class::ITEM, 7),
-        /// `agy` `ANA-1`, done.
+        /// `agy` `ANA-1`, open over a `done` run ([`RUN_7`]): state `done`.
         AGY_ANA_1: ItemId = (class::ITEM, 8),
         /// `agy` `FEAT-1`, open; links across projects to `htui` `FEAT-2`.
         AGY_FEAT_1: ItemId = (class::ITEM, 9),
         /// `agy` `FIX-1`, open.
         AGY_FIX_1: ItemId = (class::ITEM, 10),
-        /// `vulkan-tutorials` `FEAT-1`, in progress.
+        /// `vulkan-tutorials` `FEAT-1`, open over a `stopped` run ([`RUN_8`]): state `stopped`.
         VULKAN_FEAT_1: ItemId = (class::ITEM, 11),
         /// `vulkan-tutorials` `TOOL-1`, open.
         VULKAN_TOOL_1: ItemId = (class::ITEM, 12),
@@ -289,7 +291,7 @@ pub mod ids {
     demo_ids!(
         /// The finished graph run on `htui` `FEAT-1`.
         RUN_1: RunId = (class::RUN, 0),
-        /// The queued graph run on `htui` `FEAT-3`: the fixture's only active run.
+        /// The queued graph run on `htui` `FEAT-3`.
         RUN_2: RunId = (class::RUN, 1),
         /// `prd` step of [`RUN_1`].
         STEP_PRD: StepId = (class::RUN_STEP, 0),
@@ -309,6 +311,18 @@ pub mod ids {
         /// The losing `research` candidate of [`RUN_3`] (`fanout_index` 1): the fixture's only
         /// `selected = false` row.
         STEP_R3_RESEARCH_B: StepId = (class::RUN_STEP, 6),
+        /// MOD-144: the `running` rework run on `htui` `FEAT-1`, after [`RUN_1`]; it holds
+        /// `FEAT-2` (a rework un-releases its dependents). Not executing anywhere, no lease.
+        RUN_4: RunId = (class::RUN, 3),
+        /// MOD-144: the `awaiting_approval` run on `htui` `TOOL-1`, so the item reads `needs you`.
+        /// It has no step, so it is not a judge park: a resume walks it as an interrupted run.
+        RUN_5: RunId = (class::RUN, 4),
+        /// MOD-144: the `failed` run on `htui` `CLEAN-1`.
+        RUN_6: RunId = (class::RUN, 5),
+        /// MOD-144: the `done` run on `agy` `ANA-1`.
+        RUN_7: RunId = (class::RUN, 6),
+        /// MOD-144: the `stopped` run on `vulkan-tutorials` `FEAT-1` (MOD-125).
+        RUN_8: RunId = (class::RUN, 7),
     );
 
     demo_ids!(
@@ -951,7 +965,7 @@ const ITEM_SPECS: [ItemSpec; 13] = [
         prefix: "ANA",
         number: 1,
         title: "Data model, box registry and sync topology",
-        status: Status::Done,
+        status: Status::Open,
         priority: 0,
         tags: &[],
         body: ANA_1_BODY,
@@ -977,7 +991,7 @@ const ITEM_SPECS: [ItemSpec; 13] = [
         prefix: "FEAT",
         number: 1,
         title: "TUI scaffold",
-        status: Status::InProgress,
+        status: Status::Open,
         priority: 2,
         tags: &["rust"],
         body: FEAT_1_BODY,
@@ -1003,7 +1017,7 @@ const ITEM_SPECS: [ItemSpec; 13] = [
         prefix: "FEAT",
         number: 3,
         title: "Postgres store and cache",
-        status: Status::Queued,
+        status: Status::Open,
         priority: 1,
         tags: &["rust"],
         body: "",
@@ -1029,7 +1043,7 @@ const ITEM_SPECS: [ItemSpec; 13] = [
         prefix: "TOOL",
         number: 1,
         title: "CI matrix for the three OSes",
-        status: Status::AwaitingApproval,
+        status: Status::Open,
         priority: 0,
         tags: &["docker"],
         body: "",
@@ -1042,7 +1056,7 @@ const ITEM_SPECS: [ItemSpec; 13] = [
         prefix: "CLEAN",
         number: 1,
         title: "Drop the legacy markdown exporter",
-        status: Status::Failed,
+        status: Status::Open,
         priority: 0,
         tags: &[],
         body: "",
@@ -1055,7 +1069,7 @@ const ITEM_SPECS: [ItemSpec; 13] = [
         prefix: "ANA",
         number: 1,
         title: "Prompt assembly survey",
-        status: Status::Done,
+        status: Status::Open,
         priority: 0,
         tags: &[],
         body: "",
@@ -1094,7 +1108,7 @@ const ITEM_SPECS: [ItemSpec; 13] = [
         prefix: "FEAT",
         number: 1,
         title: "Chapter 12 parity",
-        status: Status::InProgress,
+        status: Status::Open,
         priority: 0,
         tags: &["gpu", "vulkan"],
         body: "",
@@ -1472,10 +1486,37 @@ fn demo_graph_snapshot() -> Value {
     .expect("a literal this module owns serialises")
 }
 
-/// `run` (§5.8): one finished graph run on `FEAT-1`, one still-queued run on `FEAT-3` — the
-/// fixture's only active one — and one finished fan-out run on `ANA-1` (blueprint F-P). Every one
-/// carries the `R-ORCH-11` snapshot [`demo_graph_snapshot`] builds.
+/// `run` (§5.8): one finished graph run on `FEAT-1`, one still-queued run on `FEAT-3` and one
+/// finished fan-out run on `ANA-1` (blueprint F-P); MOD-144 adds the runs every progress state of
+/// [`ItemState`](crate::model::ItemState) reads from: a `running` rework run on `FEAT-1`, an
+/// `awaiting_approval` run with no step on `TOOL-1`, a `failed` run on `CLEAN-1`, a `done` run on
+/// `agy` `ANA-1` and a `stopped` run on `vulkan-tutorials` `FEAT-1`. Every new live run executes
+/// nowhere and holds no lease, so no box's slot or overlap set and no startup sweep sees it (PD11).
+/// Every one carries the `R-ORCH-11` snapshot [`demo_graph_snapshot`] builds.
 fn runs() -> Vec<Run> {
+    let graph_run = |id, workspace, project, item, status, queued: (i64, i64)| Run {
+        workspace_id: Some(workspace),
+        id,
+        project_id: project,
+        item_id: Some(item),
+        kind: RunKind::Graph,
+        mode: RunMode::Manual,
+        status,
+        target_box_id: ids::BOX,
+        executing_box_id: None,
+        graph_snapshot: Some(demo_graph_snapshot()),
+        started_by: ids::USER,
+        queued_at: demo_at(queued.0, queued.1),
+        started_at: (status != RunStatus::Queued).then(|| demo_at(queued.0, queued.1)),
+        finished_at: status
+            .is_terminal()
+            .then(|| demo_at(queued.0, queued.1 + 1)),
+        failure: (status == RunStatus::Failed).then(|| "verify failed".to_owned()),
+        repo_scope: Vec::new(),
+        lease_box_id: None,
+        lease_expires_at: None,
+        updated_at: demo_at(queued.0, queued.1 + i64::from(status.is_terminal())),
+    };
     vec![
         Run {
             workspace_id: Some(ids::WORKSPACE_PLATFORM),
@@ -1540,6 +1581,46 @@ fn runs() -> Vec<Run> {
             lease_expires_at: None,
             updated_at: demo_at(1, 17),
         },
+        graph_run(
+            ids::RUN_4,
+            ids::WORKSPACE_PLATFORM,
+            ids::PROJECT_HTUI,
+            ids::HTUI_FEAT_1,
+            RunStatus::Running,
+            (2, 9),
+        ),
+        graph_run(
+            ids::RUN_5,
+            ids::WORKSPACE_PLATFORM,
+            ids::PROJECT_HTUI,
+            ids::HTUI_TOOL_1,
+            RunStatus::AwaitingApproval,
+            (2, 10),
+        ),
+        graph_run(
+            ids::RUN_6,
+            ids::WORKSPACE_PLATFORM,
+            ids::PROJECT_HTUI,
+            ids::HTUI_CLEAN_1,
+            RunStatus::Failed,
+            (1, 18),
+        ),
+        graph_run(
+            ids::RUN_7,
+            ids::WORKSPACE_PLATFORM,
+            ids::PROJECT_AGY,
+            ids::AGY_ANA_1,
+            RunStatus::Done,
+            (1, 20),
+        ),
+        graph_run(
+            ids::RUN_8,
+            ids::WORKSPACE_GRAPHICS,
+            ids::PROJECT_VULKAN,
+            ids::VULKAN_FEAT_1,
+            RunStatus::Stopped,
+            (2, 11),
+        ),
     ]
 }
 
@@ -1722,7 +1803,7 @@ const IMPL_TRIM_RECORD: &str = r#"{
   "reserve": 0.1,
   "target": 36000,
   "estimator": "chars-v2",
-  "estimated_before": 60406,
+  "estimated_before": 60404,
   "estimated_after": 35988,
   "sections": [
     { "name": "template",         "tokens_before": 156,   "tokens_after": 156,   "strategy": "none",      "trimmed": false },
@@ -1732,7 +1813,7 @@ const IMPL_TRIM_RECORD: &str = r#"{
     { "name": "documents:review", "tokens_before": 2357,  "tokens_after": 2357,  "strategy": "none",      "trimmed": false },
     { "name": "verify_failure",   "tokens_before": 428,   "tokens_after": 0,     "strategy": "dropped",   "trimmed": true },
     { "name": "previous_diff",    "tokens_before": 6425,  "tokens_after": 0,     "strategy": "dropped",   "trimmed": true },
-    { "name": "upstream",         "tokens_before": 5023,  "tokens_after": 0,     "strategy": "dropped",   "trimmed": true,
+    { "name": "upstream",         "tokens_before": 5021,  "tokens_after": 0,     "strategy": "dropped",   "trimmed": true,
       "stubbed": 3, "dropped": 2 },
     { "name": "box",              "tokens_before": 116,   "tokens_after": 116,   "strategy": "none",      "trimmed": false },
     { "name": "skills",           "tokens_before": 56,    "tokens_after": 56,    "strategy": "none",      "trimmed": false },
@@ -2331,16 +2412,75 @@ mod tests {
         assert_eq!(fix.resolution, Some(Resolution::Done));
     }
 
+    /// MOD-144 (PD11): every derived [`ItemState`](crate::model::ItemState) appears somewhere in
+    /// the demo, each item's state read from its status and its latest graph run.
     #[test]
-    fn every_status_appears_in_the_htui_project() {
+    fn every_item_state_appears_in_the_demo() {
+        use crate::model::{ItemState, latest_graph_run};
         let data = demo_data();
+        let state_of = |item: &crate::model::Item| {
+            let runs = data.runs.iter().filter(|run| run.item_id == Some(item.id));
+            ItemState::of(item.status, latest_graph_run(runs).map(|run| run.status))
+        };
+        for state in ItemState::ALL {
+            assert!(
+                data.items.iter().any(|item| state_of(item) == *state),
+                "the backlog renders every item state: {state} is missing"
+            );
+        }
         for status in Status::ALL {
             assert!(
                 data.items
                     .iter()
                     .any(|item| item.project_id == ids::PROJECT_HTUI && item.status == *status),
-                "the backlog snapshot renders every status: {status} is missing"
+                "the htui project carries every stored status: {status} is missing"
             );
+        }
+        let expected = [
+            (ids::HTUI_ANA_1, ItemState::Done),
+            (ids::HTUI_ANA_2, ItemState::Open),
+            (ids::HTUI_FEAT_1, ItemState::Running),
+            (ids::HTUI_FEAT_2, ItemState::Blocked),
+            (ids::HTUI_FEAT_3, ItemState::Queued),
+            (ids::HTUI_FIX_1, ItemState::Closed),
+            (ids::HTUI_TOOL_1, ItemState::NeedsYou),
+            (ids::HTUI_CLEAN_1, ItemState::Failed),
+            (ids::AGY_ANA_1, ItemState::Done),
+            (ids::AGY_FEAT_1, ItemState::Open),
+            (ids::AGY_FIX_1, ItemState::Open),
+            (ids::VULKAN_FEAT_1, ItemState::Stopped),
+            (ids::VULKAN_TOOL_1, ItemState::Open),
+        ];
+        let actual: Vec<_> = data
+            .items
+            .iter()
+            .map(|item| (item.id, state_of(item)))
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    /// PD11, `uq_run_item_live`: at most one live graph run per item, and every live run the
+    /// demo adds for MOD-144 executes nowhere and holds no lease.
+    #[test]
+    fn the_demo_holds_one_live_graph_run_per_item_at_most() {
+        let data = demo_data();
+        for item in &data.items {
+            let live = data
+                .runs
+                .iter()
+                .filter(|run| run.item_id == Some(item.id) && run.status.is_active())
+                .count();
+            assert!(live <= 1, "{} has {live} live graph runs", item.key);
+        }
+        for run in [ids::RUN_4, ids::RUN_5, ids::RUN_8] {
+            let row = data
+                .runs
+                .iter()
+                .find(|row| row.id == run)
+                .expect("a fixture run");
+            assert_eq!(row.executing_box_id, None);
+            assert_eq!(row.lease_box_id, None);
+            assert_eq!(row.lease_expires_at, None);
         }
     }
 

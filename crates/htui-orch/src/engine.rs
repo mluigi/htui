@@ -755,19 +755,21 @@ where
         workspace: Option<WorkspaceId>,
     ) -> Result<RunId, EngineError> {
         let item = self.item(item).await?;
+        // MOD-144 (PD1): `create_run`'s own law first (`startable`: `open` and no live graph run),
+        // so neither the tag check nor rung 4 writes a note on, or blocks, an item some live run
+        // already holds, and a refused item writes no note (D98). `create_run` re-checks it under
+        // the item lock and stays the authority (MOD-7 D98). This read takes no lock; a run
+        // another box creates after it is caught by the refusals' own `block_if_idle`.
+        crate::command::start_enabled(&item, &self.parts.store.runs(item.id).await?)?;
         // R-ORCH-10 at queue time (MOD-7 milestone 3, D79): before resolution, so an item that
         // lacks tags *and* has no candidate is refused for the tags, the cheaper box-level fact.
-        // Only an item `create_run` would accept (`open | failed`) is checked; any other status
-        // falls through to that refusal and writes no note (D98).
-        if matches!(item.status, Status::Open | Status::Failed) {
-            let missing = self
-                .parts
-                .graphs
-                .missing_tags(item.id, self.parts.box_id)
-                .await?;
-            if !missing.is_empty() {
-                return Err(self.refuse_missing_tags(&item, missing).await?);
-            }
+        let missing = self
+            .parts
+            .graphs
+            .missing_tags(item.id, self.parts.box_id)
+            .await?;
+        if !missing.is_empty() {
+            return Err(self.refuse_missing_tags(&item, missing).await?);
         }
         let resolved = match graph::resolve(
             self.parts.store,
@@ -789,9 +791,8 @@ where
 
         let now = self.now();
         let id = RunId::new();
-        // `create_run` moves the item `open | failed -> queued` inside its own transaction, so an
-        // item at any other status is refused here — `queued`, `in_progress` and `awaiting_approval`
-        // all mean some other run already owns it (`crates/htui-core/src/model/item.rs:46-60`).
+        // `create_run` refuses an item that is not `open` or has a live graph run, under its lock
+        // (MOD-144); the check above is its mirror.
         self.parts
             .store
             .create_run(NewRun {
@@ -891,43 +892,37 @@ where
     }
 
     /// Plan D62's rung 4 at `StartRun`: no run row exists, so the refusal is written to the item —
-    /// `open -> blocked`, then ``no_candidate_agent: phase `<p>` `` as a note — and handed back for
-    /// the caller to raise. A `failed` item has no `blocked` edge (`model/item.rs:56`) and the
-    /// compare-and-set answers `Ok(false)`, which leaves it where it is with the note still
-    /// written: a refusal nobody can read is what invariant 7 forbids.
+    /// ``no_candidate_agent: phase `<p>` `` as a note and `open -> blocked` — and handed back for
+    /// the caller to raise. One [`block_if_idle`](htui_core::store::WriteStore::block_if_idle)
+    /// call (MOD-144 R1): it takes the item's lock before it reads the item's runs, so a live run
+    /// another box created since `startable`'s lock-free read (`create_run` no longer writes the
+    /// item) makes it write nothing (D98: the run holds the item), and the refusal is still
+    /// raised here. An item another writer moved since (a close, a block) keeps its status and
+    /// still gets the note: a refusal nobody can read is what invariant 7 forbids.
     async fn refuse_rung_four(
         &self,
         item: &Item,
         phase: String,
     ) -> Result<ResolveError, EngineError> {
-        self.parts
-            .store
-            .transition(item.id, Status::Open, Status::Blocked)
-            .await?;
         let failure = RunFailure::NoCandidateAgent {
             phase: phase.clone(),
             detail: String::new(),
         };
-        self.note(item.id, failure.to_string(), None, self.now())
-            .await?;
+        self.block_if_idle(item.id, failure.to_string()).await?;
         Ok(ResolveError::NoCandidate { phase })
     }
 
     /// `R-ORCH-10` at `StartRun` (MOD-7 milestone 3, D79, D82): no run row exists, so the refusal
-    /// is written to the item, `open -> blocked` and then `missing tags: a, b` as a note on this
-    /// box, and handed back. A `failed` item has no `blocked` edge and the compare-and-set answers
-    /// `Ok(false)`, which leaves it `failed` with the note still written (rung 4's rule; invariant
-    /// 7).
+    /// is written to the item, `missing tags: a, b` as a note on this box and `open -> blocked`,
+    /// and handed back. The write is [`Self::refuse_rung_four`]'s one `block_if_idle` call, with
+    /// its rules: nothing over a live run another box created since `startable`'s read (D98), the
+    /// note on an item another writer moved (invariant 7).
     async fn refuse_missing_tags(
         &self,
         item: &Item,
         missing: Vec<String>,
     ) -> Result<EngineError, EngineError> {
-        self.parts
-            .store
-            .transition(item.id, Status::Open, Status::Blocked)
-            .await?;
-        self.note(item.id, missing_tags_failure(&missing), None, self.now())
+        self.block_if_idle(item.id, missing_tags_failure(&missing))
             .await?;
         Ok(EngineError::MissingTags {
             item: item.id,
@@ -997,10 +992,9 @@ where
                 ));
             }
 
-            // Both answers unpark the run and the item first. For a rejection that is blueprint
-            // A-5's order and it is not cosmetic: `awaiting_approval -> blocked` is **illegal**
-            // for an item (`model/item.rs:54`), so an escalation that did not pass through
-            // `in_progress` first would earn `StoreError::Constraint`.
+            // Both answers unpark the run first. For a rejection that is blueprint A-5's order
+            // and it is not cosmetic: the escalation's `move_run(Running -> AwaitingApproval)`
+            // (gate.rs `escalate`) needs the run `running`, so the unpark comes first.
             self.unpark(run, now).await?;
             Ok(())
         })
@@ -1368,11 +1362,11 @@ where
 
     /// §4.8's `promote to chat` (MOD-4 plan D163, blueprint D191, D192).
     ///
-    /// The guard ([`crate::command::promote_enabled`]) over the rows read, the lease, then in
-    /// its window: a `running` step (reached only after the worker preempted its walk) moves to
-    /// `awaiting_approval`, `promote_step` stamps `promoted_at` and parks the run and the item in
-    /// one transaction, and a note says so. The lease is given back — a parked run holds none
-    /// (plan D87) — and the answer says how the chat opens ([`Self::opening`]). No
+    /// The guard ([`crate::command::promote_enabled`]) over the rows read, the lease, then in its
+    /// window: a `running` step (reached only after the worker preempted its walk) moves to
+    /// `awaiting_approval`, `promote_step` stamps `promoted_at` and parks the run in one
+    /// transaction (MOD-144: no item write), and a note says so. The lease is given back — a parked
+    /// run holds none (plan D87) — and the answer says how the chat opens ([`Self::opening`]). No
     /// `run(kind = 'chat')` row is written, and the step's `prompt_digest` and `trim_record` are
     /// never touched.
     async fn promote(
@@ -1760,8 +1754,9 @@ where
     /// §4.3 verdict 1's `unblock` (MOD-4 plan D161): one human action clears a held item.
     ///
     /// [`Self::unblock_case`] decides, then: [`UnblockCase::Reopen`] moves the item
-    /// `blocked -> open`; [`UnblockCase::FollowRun`] moves it `blocked -> awaiting_approval`
-    /// beside its parked run, so the run's gate verbs reach it (R-4); [`UnblockCase::Resume`]
+    /// `blocked -> open`; [`UnblockCase::FollowRun`] moves it `blocked -> open` too, and its
+    /// parked run's `awaiting_approval` is what reads *needs you*, so the run's gate verbs reach
+    /// it (R-4, MOD-144); [`UnblockCase::Resume`]
     /// resumes the parked run through [`Self::resume`] under [`Tails::Walk`] (R-7), and on a
     /// worker box ([`Tails::HandBack`]) only unparks it through [`Self::hand_back_resume`] and
     /// hands it to the box's worker (MOD-41 plan D12). Each writes a note first.
@@ -1777,11 +1772,13 @@ where
                     .await?
                 {
                     // Another writer moved the item after it was read, so it is no longer
-                    // blocked: the refusal names where it is now.
+                    // blocked: the refusal names where it is now, its latest graph run included.
                     let row = self.item(item).await?;
+                    let runs = self.parts.store.runs(item).await?;
+                    let latest = htui_core::model::latest_graph_run(&runs).map(|run| run.status);
                     return Err(EngineError::NotBlocked {
                         item,
-                        status: row.status,
+                        state: htui_core::model::ItemState::of(row.status, latest),
                         why: crate::command::nothing_is_blocked(),
                     });
                 }
@@ -1790,19 +1787,19 @@ where
                 None
             }
             UnblockCase::FollowRun(run) => {
-                // Plan D161's one deviation from ANA-2's item table (`blocked ->
-                // awaiting_approval`, T1): the item follows its parked run back.
+                // MOD-144: the item goes back to `open`, and its parked run's
+                // `awaiting_approval` is what reads *needs you*.
                 if !self
                     .parts
                     .store
-                    .transition(item, Status::Blocked, Status::AwaitingApproval)
+                    .transition(item, Status::Blocked, Status::Open)
                     .await?
                 {
                     return Err(EngineError::StaleWrite {
                         run,
                         row: format!("item {item}"),
                         from: Status::Blocked.to_string(),
-                        to: Status::AwaitingApproval.to_string(),
+                        to: Status::Open.to_string(),
                     });
                 }
                 self.note(
@@ -1838,8 +1835,8 @@ where
     /// `closed` as `resolution`, in one transaction. No run lease is involved: the store re-checks
     /// a live run, the item's status and `Resolution::closes_from` inside that transaction, so a
     /// run started since is refused there with nothing written. The commit rows already exist, so
-    /// none are passed. The guard admits an `open` item too (`Resolution::default_for(Open)` is
-    /// `withdrawn`, MOD-39 plan P13); `resolution` is the one the Runs pane's picker sent.
+    /// none are passed. The guard admits an open or blocked item; `default_for` reads the latest
+    /// graph run (MOD-144); `resolution` is the one the Runs pane's picker sent.
     async fn close_out(
         &self,
         item: ItemId,
@@ -1914,13 +1911,10 @@ where
         self.cancel_leased(&row).await
     }
 
-    /// OQ-4, B-6: `queued → cancelled` as a compare-and-set, then the item `queued → open` that
-    /// `finish_run` would have mirrored, then plan D36's cleanup. `None` when the run left
-    /// `queued` first: another process claimed it, and nothing is written. A `queued` run was
-    /// never claimed, so it has no step and no lease to take.
-    ///
-    /// E-2 (accepted): the run's move and the item's are two statements, so a crash between them
-    /// leaves the item `queued` beside a cancelled run.
+    /// OQ-4, B-6: `queued → cancelled` as a compare-and-set, then plan D36's cleanup. The item is
+    /// not written (MOD-144): its state is derived from its runs, and the cancelled run is
+    /// skipped. `None` when the run left `queued` first: another process claimed it, and nothing
+    /// is written. A `queued` run was never claimed, so it has no step and no lease to take.
     async fn cancel_queued(&self, row: &Run) -> Result<Option<CommandOutcome>, EngineError> {
         let position = self.resting(row).await?.position;
         let now = self.now();
@@ -1931,13 +1925,6 @@ where
             .await?
         {
             return Ok(None);
-        }
-        if let Some(item) = row.item_id {
-            // `Ok(false)`: the item was moved by another writer; the run is cancelled either way.
-            self.parts
-                .store
-                .transition(item, Status::Queued, Status::Open)
-                .await?;
         }
         self.cleanup_run(row.id).await?;
         Ok(Some(CommandOutcome::Cancelled {
@@ -1969,9 +1956,8 @@ where
                     .transition_step(step.id, step.status, StepStatus::Cancelled, now)
                     .await?;
             }
-            // `finish_run` mirrors the item `queued | in_progress | awaiting_approval -> open`
-            // (`store/traits.rs`), which is what frees it for a second run; `failure` stays NULL
-            // because a cancel is a human's decision and not a failure.
+            // `finish_run` ends the live run, which frees the item for a second run; `failure`
+            // stays NULL because a cancel is a human's decision and not a failure.
             self.parts
                 .store
                 .finish_run(run, RunStatus::Cancelled, None, now)
@@ -2541,25 +2527,27 @@ where
     }
 
     /// MOD-4 plan D161: which of `Unblock`'s three cases `item` is in, read-only — the item, then
-    /// each of its active runs with whether it is [`resumable`] (over its cursor and its steps,
-    /// MOD-37 R-31), handed to [`crate::command::unblock_enabled`].
+    /// every run of it (MOD-144, PD9: a finished one names the item's state in a refusal), each
+    /// live one with whether it is [`resumable`] (over its cursor and its steps, MOD-37 R-31) and
+    /// each finished one `false`, handed to [`crate::command::unblock_enabled`].
     ///
     /// # Errors
     /// [`EngineError::NotBlocked`], and the store's and the snapshot's own.
     pub async fn unblock_case(&self, item: ItemId) -> Result<UnblockCase, EngineError> {
         let row = self.item(item).await?;
-        let mut active = Vec::new();
+        let mut runs = Vec::new();
         for summary in self.parts.store.runs(item).await? {
             let run = self.run(summary.id).await?;
-            if !run.status.is_active() {
-                continue;
-            }
-            let snapshot = Self::snapshot_of(&run)?;
-            let steps = self.parts.store.run_steps(run.id).await?;
-            let resumable = resumable(&cursor(&snapshot, &steps), &steps);
-            active.push((run, resumable));
+            let resumable = if run.status.is_active() {
+                let snapshot = Self::snapshot_of(&run)?;
+                let steps = self.parts.store.run_steps(run.id).await?;
+                resumable(&cursor(&snapshot, &steps), &steps)
+            } else {
+                false
+            };
+            runs.push((run, resumable));
         }
-        crate::command::unblock_enabled(&row, &active)
+        crate::command::unblock_enabled(&row, &runs)
     }
 
     /// MOD-4 plan D167's first confirmation, read-only: [`crate::command::close_out_enabled`],
@@ -2571,11 +2559,12 @@ where
     /// [`EngineError::RunStatus`] or [`EngineError::NotClosable`], and the store's own.
     pub async fn close_out_preview(&self, item: ItemId) -> Result<closeout::Preview, EngineError> {
         let reads = self.close_out_reads(item).await?;
-        let resolution = crate::command::close_out_enabled(&reads.item, &reads.runs)?;
+        let (resolution, finished) = crate::command::close_out_enabled(&reads.item, &reads.runs)?;
         let heads = self.parts.store.documents(item).await?;
         Ok(closeout::preview(
             &reads.item,
             resolution,
+            finished,
             &reads.summaries,
             &reads.commits,
             &heads,
@@ -2670,13 +2659,9 @@ where
                 .iter()
                 .any(|step| step.status == StepStatus::AwaitingApproval)
         {
-            // D96: `gate::park`'s run and item writes, the step's having landed before the crash.
+            // D96: `gate::park`'s run write, the step's having landed before the crash.
             let now = self.now();
             self.move_run(run.id, RunStatus::Running, RunStatus::AwaitingApproval, now)
-                .await?;
-            self.parts
-                .store
-                .transition(item, Status::InProgress, Status::AwaitingApproval)
                 .await?;
             let row = self.run(run.id).await?;
             return Ok(Next::Parked(self.resting(&row).await?));
@@ -3014,7 +2999,7 @@ where
     }
 
     /// Plan D94: park a run whose `step` the sweep already failed — `park_run`'s order: the run
-    /// `running -> awaiting_approval`, the item `in_progress -> awaiting_approval`, then the note.
+    /// `running -> awaiting_approval`, then the note (MOD-144: the item is not written).
     /// `run.failure` stays NULL (R-3); the typed reason is the [`Rest`]'s.
     async fn park_interrupted(
         &self,
@@ -3028,10 +3013,6 @@ where
         self.move_run(run.id, RunStatus::Running, RunStatus::AwaitingApproval, now)
             .await?;
         if let Some(item) = run.item_id {
-            self.parts
-                .store
-                .transition(item, Status::InProgress, Status::AwaitingApproval)
-                .await?;
             self.note(item, note, Some(step.id), now).await?;
         }
         Ok(Rest {
@@ -3326,14 +3307,11 @@ where
             })
             .await?;
         // MOD-4 plan D159 (R-36, criterion 3): a `running` run parks for the human the mismatch
-        // is addressed to — run, then item — rather than being handed back to every sweep as a
-        // `running` run. A run already parked is left as it is.
+        // is addressed to — the run — rather than being handed back to every sweep as a
+        // `running` run. A run already parked is left as it is. The item is not written
+        // (MOD-144): its state is derived from the run.
         let row = if row.status == RunStatus::Running {
             self.move_run(row.id, RunStatus::Running, RunStatus::AwaitingApproval, now)
-                .await?;
-            self.parts
-                .store
-                .transition(item, Status::InProgress, Status::AwaitingApproval)
                 .await?;
             self.run(row.id).await?
         } else {
@@ -3409,11 +3387,11 @@ where
     /// rows: one per `fanout_index` of `0..fan_out` (plan D71), so a `fan_out = 1` phase is the
     /// case of a single index.
     ///
-    /// `Some(rest)` is the refusal: the walk left nothing the selector would take, the item goes
-    /// to `blocked` **before** the run is failed (blueprint H-16 — the reverse order leaves the
-    /// item `failed`, because `finish_run` mirrors `in_progress -> failed`), and an `item_note`
-    /// records the reason (plan D62). `None` means the `pending` rows exist and the walk may run
-    /// them.
+    /// `Some(rest)` is the refusal: the walk left nothing the selector would take, the item goes to
+    /// `blocked` **before** the run is failed (blueprint H-16 — blocking first keeps the refusal
+    /// readable if a crash cuts the tail off: an open item over a failed run reads `failed`, not
+    /// `blocked`), and an `item_note` records the reason (plan D62). `None` means the `pending`
+    /// rows exist and the walk may run them.
     async fn admit(
         &self,
         run: &Run,
@@ -3543,8 +3521,8 @@ where
         }))
     }
 
-    /// Plan D62's stage-1 refusal, in blueprint H-16's order: the item `in_progress -> blocked`,
-    /// the note, then `finish_run(Failed)` and plan D36's cleanup.
+    /// Plan D62's stage-1 refusal, in blueprint H-16's order: the item `open -> blocked`, the
+    /// note, then `finish_run(Failed)` and plan D36's cleanup.
     ///
     /// Two sentences. A walk whose every skip was the inline-approval interlock keeps the shipped
     /// `missing_capability: inline_approval` (`docs/ANA-2.md:482`), noted with its phase exactly as
@@ -3577,12 +3555,12 @@ where
         if let Some(item) = run.item_id {
             self.parts
                 .store
-                .transition(item, Status::InProgress, Status::Blocked)
+                .transition(item, Status::Open, Status::Blocked)
                 .await?;
             self.note(item, note, None, now).await?;
         }
-        // The item is already `blocked`, so `finish_run`'s item mirror finds no legal move and
-        // leaves it — which is the `_ =>` arm of its own table, and the reason the order matters.
+        // `finish_run` no longer writes the item (MOD-144). The order (item, note, run) stays so
+        // a crash leaves the refusal readable first.
         self.parts
             .store
             .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
@@ -3628,6 +3606,26 @@ where
             phase.name, chosen.agent_name, chosen.model
         );
         self.note(item, body, None, self.now()).await
+    }
+
+    /// A `StartRun` refusal written by [`WorkerStore::block_if_idle`]: `body` as an `item_note` by
+    /// this engine's user on this engine's box and `open -> blocked`, unless a live graph run
+    /// holds the item by the time the store has its lock, which writes nothing (MOD-144 R1, D98).
+    /// `Ok(false)` is that case; the callers raise their refusal either way.
+    async fn block_if_idle(&self, item: ItemId, body: String) -> Result<bool, EngineError> {
+        Ok(self
+            .parts
+            .store
+            .block_if_idle(NewNote {
+                id: NoteId::new(),
+                item_id: item,
+                body,
+                created_by: self.parts.user,
+                box_id: Some(self.parts.box_id),
+                via_step_id: None,
+                created_at: self.now(),
+            })
+            .await?)
     }
 
     /// One `item_note` by this engine's user on this engine's box.
@@ -4181,7 +4179,7 @@ where
         };
         // MOD-10 D11, D13 (blueprint A-1, A-2): one resolution for the whole group, before its
         // prompt is masked; a refusal fails the group before a token and the run with it, with no
-        // retry (the item mirrors `failed`, as on the plain path).
+        // retry (the item reads its `failed` run, as on the plain path).
         if let Err(cause) = Box::pin(self.secrets_ready(run)).await? {
             return self
                 .fail_group_before_a_token(
@@ -4418,7 +4416,7 @@ where
 
     /// MOD-89 (blueprint F-1): every candidate of the group already failed with its note over
     /// the same env-file refusal; the run fails with `failure` and is cleaned up, as
-    /// `Route::GroupFailed`'s terminal arm does. The item mirrors `failed`, it is not blocked.
+    /// `Route::GroupFailed`'s terminal arm does. The item reads `failed`, it is not blocked.
     async fn fail_refused_group(
         &self,
         run: &Run,
@@ -4887,8 +4885,8 @@ where
     }
 
     /// Plan D50's one park shape for a human selection: every candidate as it settled, `selected`
-    /// NULL, the run `running -> awaiting_approval`, the item `in_progress -> awaiting_approval`,
-    /// and one `item_note` naming the phase, the attempt, each candidate and the reason.
+    /// NULL, the run `running -> awaiting_approval`, and one `item_note` naming the phase, the
+    /// attempt, each candidate and the reason.
     ///
     /// No step is parked — `park_run`'s deviation from §4.3's propagation rule, for the same
     /// reason — and `run.failure` stays NULL (R-3). A `shared_serialized` group's note says where
@@ -4906,10 +4904,6 @@ where
         self.move_run(run.id, RunStatus::Running, RunStatus::AwaitingApproval, now)
             .await?;
         if let Some(item) = run.item_id {
-            self.parts
-                .store
-                .transition(item, Status::InProgress, Status::AwaitingApproval)
-                .await?;
             let candidates = slot
                 .iter()
                 .map(|step| {
@@ -5720,11 +5714,10 @@ where
         }
     }
 
-    /// Parks a run whose step is already `done`: run, item, then the note.
+    /// Parks a run whose step is already `done`: run, then the note.
     ///
     /// Blueprint H-10's order with the step left alone — `gate::apply`'s park moves the step
-    /// first because it is the thing being waited on, and here there is nothing to move. The item
-    /// goes through `in_progress` on its own because that is where a running run's item is.
+    /// first because it is the thing being waited on, and here there is nothing to move.
     ///
     /// `run.failure` is **not** written: `finish_run` is the only writer of that column and the
     /// run is not finished. The reason is the `item_note`, which is where every other park's is
@@ -5734,10 +5727,6 @@ where
         self.move_run(run.id, RunStatus::Running, RunStatus::AwaitingApproval, now)
             .await?;
         if let Some(item) = run.item_id {
-            self.parts
-                .store
-                .transition(item, Status::InProgress, Status::AwaitingApproval)
-                .await?;
             self.parts
                 .store
                 .add_note(NewNote {
@@ -5866,8 +5855,8 @@ where
     }
 
     /// Plan D162's tail at both call sites, in `refuse_no_candidate`'s actual order (blueprint
-    /// F-J): the item `in_progress -> blocked`, the failure as its note, then `finish_run(Failed)`
-    /// — whose item mirror finds a `blocked` item and leaves it — and plan D36's cleanup.
+    /// F-J): the item `open -> blocked`, the failure as its note, then `finish_run(Failed)` (which
+    /// writes no item, MOD-144) and plan D36's cleanup.
     async fn block_and_fail(
         &self,
         run: &Run,
@@ -5878,7 +5867,7 @@ where
         if let Some(item) = run.item_id {
             self.parts
                 .store
-                .transition(item, Status::InProgress, Status::Blocked)
+                .transition(item, Status::Open, Status::Blocked)
                 .await?;
             self.note(item, failure.to_string(), via, now).await?;
         }
@@ -6897,22 +6886,15 @@ where
         }
     }
 
-    /// The run and the item back to `running` / `in_progress` after a gate answer. The answer is
-    /// the run's compare-and-set: `false` when the run was not `awaiting_approval`, which only a
-    /// caller whose unpark is its first write reads (plan D133).
+    /// The run back to `running` after a gate answer (MOD-144: the item is not written). The
+    /// answer is the run's compare-and-set: `false` when the run was not `awaiting_approval`,
+    /// which only a caller whose unpark is its first write reads (plan D133).
     async fn unpark(&self, run: &Run, now: DateTime<Utc>) -> Result<bool, EngineError> {
-        let unparked = self
+        Ok(self
             .parts
             .store
             .transition_run(run.id, RunStatus::AwaitingApproval, RunStatus::Running, now)
-            .await?;
-        if let Some(item) = run.item_id {
-            self.parts
-                .store
-                .transition(item, Status::AwaitingApproval, Status::InProgress)
-                .await?;
-        }
-        Ok(unparked)
+            .await?)
     }
 
     /// One step compare-and-set on the walk's path; `Ok(false)` is plan D125's
@@ -7888,8 +7870,8 @@ mod tests {
     use htui_agent::event::StopReason;
     use htui_core::fixtures::ids;
     use htui_core::model::{
-        BatchId, BoxEdit, Gate, GateOutcome, GraphSnapshot, ItemPatch, NewRepo, NewRunStep,
-        NewStepGraph, PhaseId, PhasePatch, RepoId, Resolution, RunMode, RunStatus,
+        BatchId, BoxEdit, Gate, GateOutcome, GraphSnapshot, ItemPatch, ItemState, NewRepo,
+        NewRunStep, NewStepGraph, PhaseId, PhasePatch, RepoId, Resolution, RunMode, RunStatus,
         SnapshotCandidate, SnapshotPhase, Status, StepGraphId, StepGraphPhase, StepId, StepStatus,
     };
     use htui_core::store::mem::MemFault;
@@ -8009,11 +7991,10 @@ mod tests {
                 .expect("the item's version is current");
         }
 
-        /// `ids::HTUI_FEAT_3` is seeded **`queued`** with a live `RUN_2` on it
-        /// (`crates/htui-core/src/fixtures.rs:899`, `:1377-1380`), and `create_run` moves an item
-        /// `open | failed -> queued` only — so `StartRun` on it is a `Constraint` until the seeded
-        /// run is ended. Cancelling `RUN_2` moves the item `queued -> open` in `finish_run`'s own
-        /// transaction, which is the one-line prologue every case that walks `FEAT-3` needs.
+        /// `ids::HTUI_FEAT_3` is seeded `open` with a live `queued` `RUN_2` on it, so `create_run`
+        /// refuses `StartRun` (MOD-144: `startable`, no live graph run) until `RUN_2` ends.
+        /// Cancelling it writes no item row, and is the one-line prologue every case that walks
+        /// `FEAT-3` needs.
         async fn free_feat_3(&self) {
             self.orch
                 .store
@@ -9104,8 +9085,8 @@ mod tests {
             "stage 3 wrote the digest and the recorder rewrote the same one (blueprint H-13)"
         );
         assert_eq!(
-            harness.orch.item(ids::HTUI_FEAT_3).await.status,
-            Status::AwaitingApproval
+            harness.orch.state(ids::HTUI_FEAT_3).await,
+            ItemState::NeedsYou
         );
 
         for position in 0..4 {
@@ -9128,13 +9109,17 @@ mod tests {
         let row = harness.orch.run(run).await;
         assert_eq!(row.status, RunStatus::Done);
         assert_eq!(row.finished_at, Some(harness.orch.clock.now()));
-        let item = harness.orch.item(ids::HTUI_FEAT_3).await;
         assert_eq!(
-            item.status,
-            Status::Done,
-            "plan D7: `finish_run` mirrors it"
+            harness.orch.state(ids::HTUI_FEAT_3).await,
+            ItemState::Done,
+            "MOD-144: the item reads its finished run"
         );
-        assert!(item.closed_at.is_some());
+        let item = harness.orch.item(ids::HTUI_FEAT_3).await;
+        assert_eq!(item.status, Status::Open, "`finish_run` writes no item");
+        assert!(
+            item.closed_at.is_none(),
+            "only close-out stamps `closed_at` (MOD-144 Δ10)"
+        );
 
         let steps = harness.orch.steps(run).await;
         assert_eq!(steps.len(), 4);
@@ -9255,8 +9240,8 @@ mod tests {
         let row = harness.orch.run(run).await;
         assert_eq!(row.failure.as_deref(), Some("missing input document: spec"));
         assert_eq!(
-            harness.orch.item(ids::HTUI_FEAT_3).await.status,
-            Status::Failed
+            harness.orch.state(ids::HTUI_FEAT_3).await,
+            ItemState::Failed
         );
         let steps = harness.orch.steps(run).await;
         assert_eq!(steps[0].status, StepStatus::Failed);
@@ -9993,9 +9978,9 @@ mod tests {
             "invariant 7: the reason a human reads is the error's own sentence"
         );
         assert_eq!(
-            harness.orch.item(ids::HTUI_FEAT_3).await.status,
-            Status::Failed,
-            "plan D7: `finish_run` mirrors the item"
+            harness.orch.state(ids::HTUI_FEAT_3).await,
+            ItemState::Failed,
+            "the item reads its `failed` run (MOD-144)"
         );
     }
 
@@ -10830,24 +10815,41 @@ mod tests {
         );
     }
 
-    /// Plan D149 (R-34): a command that raises between its lease take and its walk gives the
-    /// lease back. `unpark`'s item `transition` fails inside a gate answer, after the run is
-    /// already `running` again (`MemFault::ItemTransition`, plan D152). Without the release, plan
-    /// D88 would keep this process's sweep off a run nothing walks.
+    /// Plan D149 (R-34): a window that raises between its lease take and its walk gives the lease
+    /// back. The window here writes what a gate answer's does — the step's answer, then the run's
+    /// unpark — through [`Engine::leased_window`] directly, not `AnswerGate`, and raises a store
+    /// outage after the run is already `running` again. Without the release, plan D88 would keep
+    /// this process's sweep off a run nothing walks. (MOD-144: the unpark no longer writes the
+    /// item, so plan D152's item-transition fault is gone.)
     #[tokio::test(start_paused = true)]
-    async fn a_gate_answer_whose_unpark_fails_is_adopted_by_the_same_process() {
+    async fn a_window_that_raises_releases_the_lease_for_the_sweep() {
         let harness = Harness::new().await;
         let (run, step) = started(&harness).await;
-        harness.orch.store.set_fault(MemFault::ItemTransition, true);
+        let row = harness.orch.run(run).await;
+        harness_engine!(harness.orch, engine);
+        engine
+            .take_lease(run)
+            .await
+            .expect("a parked run holds no lease");
 
-        let refused = harness
-            .dispatch(Command::AnswerGate {
-                run,
-                step,
-                answer: GateAnswer::Approved,
+        let now = harness.orch.clock.now();
+        let refused = engine
+            .leased_window(run, async {
+                assert!(
+                    harness
+                        .orch
+                        .store
+                        .answer_gate(step, GateOutcome::Approved, None, now)
+                        .await?,
+                    "the step is parked"
+                );
+                assert!(engine.unpark(&row, now).await?, "the run is parked");
+                Err::<(), _>(EngineError::Store(
+                    htui_core::store::StoreError::Unreachable("a blip after the unpark".to_owned()),
+                ))
             })
             .await
-            .expect_err("the item's unpark could not be written");
+            .expect_err("the window raised");
         assert!(
             matches!(
                 refused,
@@ -10858,14 +10860,9 @@ mod tests {
         assert_eq!(
             harness.orch.run(run).await.status,
             RunStatus::Running,
-            "the run's unpark landed before the item's failed"
+            "the run's unpark landed before the window raised"
         );
 
-        harness
-            .orch
-            .store
-            .set_fault(MemFault::ItemTransition, false);
-        harness_engine!(harness.orch, engine);
         let swept = engine.sweep().await.expect("the sweep runs");
         assert_eq!(
             swept.iter().map(|adopted| adopted.run).collect::<Vec<_>>(),
@@ -11616,7 +11613,7 @@ mod tests {
 
     /// Plan D131's crash (review H2): `prd` answered and `plan` attempt `attempt` `failed` as
     /// `by` left it, then the process died before the write that follows a failure — `admit`, the
-    /// park or `finish_run` — so the run and its item are `running` / `in_progress` with nothing
+    /// park or `finish_run` — so the run is `running` (its item reads `running`) with nothing
     /// live. The park at `prd` released the lease, so a restarted process's sweep adopts the run.
     async fn failed_under_a_running_run(
         harness: &Harness,
@@ -11687,16 +11684,6 @@ mod tests {
                 .await
                 .expect("MemStore takes the move")
         );
-        assert!(
-            store
-                .transition(
-                    ids::HTUI_FEAT_3,
-                    Status::AwaitingApproval,
-                    Status::InProgress
-                )
-                .await
-                .expect("MemStore takes the move")
-        );
         (run, plan.id)
     }
 
@@ -11733,10 +11720,7 @@ mod tests {
         let row = other.orch.run(run).await;
         assert_eq!(row.status, RunStatus::Failed);
         assert_eq!(row.failure, Some(failure.to_string()));
-        assert_eq!(
-            other.orch.item(ids::HTUI_FEAT_3).await.status,
-            Status::Failed
-        );
+        assert_eq!(other.orch.state(ids::HTUI_FEAT_3).await, ItemState::Failed);
         assert_eq!(other.orch.isolator.cleanups(), 1, "plan D36's cleanup ran");
     }
 
@@ -11811,8 +11795,8 @@ mod tests {
                 RunStatus::AwaitingApproval
             );
             assert_eq!(
-                other.orch.item(ids::HTUI_FEAT_3).await.status,
-                Status::AwaitingApproval
+                other.orch.state(ids::HTUI_FEAT_3).await,
+                ItemState::NeedsYou
             );
             let notes = other
                 .orch
@@ -12315,9 +12299,9 @@ mod tests {
         );
         assert_eq!(harness.orch.run(*run).await.status, RunStatus::Queued);
         assert_eq!(
-            harness.orch.item(ids::HTUI_ANA_2).await.status,
-            Status::Queued,
-            "plan D84: a refused run and its item stay queued"
+            harness.orch.state(ids::HTUI_ANA_2).await,
+            ItemState::Queued,
+            "plan D84: a refused run stays queued, and the item reads it"
         );
     }
 
@@ -13828,8 +13812,9 @@ mod tests {
     /// Blueprint H-2: a `reconcile` error lands on a step that is already `done`, and `fail_hard`
     /// moves `running -> failed` only — `done -> failed` is illegal (`model/run.rs`).
     ///
-    /// So every `reconcile` failure parks the run instead: the step stays `done`, the run and the
-    /// item go to `awaiting_approval`, and the reason is an `item_note` a human reads (F-G, R-7).
+    /// So every `reconcile` failure parks the run instead: the step stays `done`, the run goes to
+    /// `awaiting_approval` (the item reads `needs you`), and the reason is an `item_note` a human
+    /// reads (F-G, R-7).
     /// The run is **not** terminal, so nothing is cleaned up.
     #[tokio::test]
     async fn a_reconcile_refusal_parks_the_run_with_the_step_done() {
@@ -13874,8 +13859,8 @@ mod tests {
             RunStatus::AwaitingApproval
         );
         assert_eq!(
-            harness.orch.item(ids::HTUI_FEAT_3).await.status,
-            Status::AwaitingApproval
+            harness.orch.state(ids::HTUI_FEAT_3).await,
+            ItemState::NeedsYou
         );
         let notes: Vec<String> = harness
             .orch
@@ -14638,10 +14623,11 @@ mod tests {
     }
 
     /// MOD-37 R-31: `answer_gate(Rejected)` landed and the process died before its unpark, so the
-    /// run and the item stay `awaiting_approval` over a `failed` + `rejected` step no gate verb
+    /// run stays `awaiting_approval` (the item reads `needs you`) over a `failed` + `rejected`
+    /// step no gate verb
     /// takes. Another process's `Unblock` resumes it, and the resumed walk runs the tail the
     /// rejection owed (plan D131's `settle_failed`): `prd` cannot loop, so the run fails
-    /// `Rejected`, and the item follows it (plan D7's mirror after the unpark).
+    /// `Rejected`, and the item reads it (MOD-144).
     #[tokio::test]
     async fn a_crash_between_a_rejection_and_the_unpark_is_resumed_by_unblock() {
         let harness = Harness::new().await;
@@ -14665,8 +14651,8 @@ mod tests {
             RunStatus::AwaitingApproval
         );
         assert_eq!(
-            harness.orch.item(ids::HTUI_FEAT_3).await.status,
-            Status::AwaitingApproval
+            harness.orch.state(ids::HTUI_FEAT_3).await,
+            ItemState::NeedsYou
         );
 
         let other = harness.orch.restarted();
@@ -14694,9 +14680,9 @@ mod tests {
         );
         assert_eq!(harness.orch.run(run).await.status, RunStatus::Failed);
         assert_eq!(
-            harness.orch.item(ids::HTUI_FEAT_3).await.status,
-            Status::Failed,
-            "plan D7: the item mirrors the run's `failed` after the unpark"
+            harness.orch.state(ids::HTUI_FEAT_3).await,
+            ItemState::Failed,
+            "the item reads the run's `failed` after the unpark (MOD-144)"
         );
         let steps = harness.orch.steps(run).await;
         assert_eq!(
@@ -14803,8 +14789,8 @@ mod tests {
             "{followed:?}"
         );
         assert_eq!(
-            harness.orch.item(ids::HTUI_FEAT_3).await.status,
-            Status::AwaitingApproval
+            harness.orch.state(ids::HTUI_FEAT_3).await,
+            ItemState::NeedsYou
         );
         let steps_before = harness.orch.steps(run).await;
 
@@ -14985,9 +14971,9 @@ mod tests {
             .expect("the graph resolves");
         assert_eq!(harness.orch.run(run).await.status, RunStatus::Queued);
         assert_eq!(
-            harness.orch.item(ids::HTUI_FEAT_3).await.status,
-            Status::Queued,
-            "`create_run` moved the item"
+            harness.orch.state(ids::HTUI_FEAT_3).await,
+            ItemState::Queued,
+            "the item reads its queued run"
         );
         assert!(harness.orch.steps(run).await.is_empty(), "nothing walked");
 
@@ -15111,23 +15097,15 @@ mod tests {
         );
     }
 
-    /// `R-ORCH-10` at queue time on a `failed` item (MOD-7 milestone 3, D82): `failed` has no
-    /// `blocked` edge, so the compare-and-set answers `false` and the item stays `failed`, while
-    /// the note is still written (rung 4's rule; invariant 7). No run row; the error is the tags.
+    /// `R-ORCH-10` at queue time on an item whose latest run `failed` (MOD-7 milestone 3, D82;
+    /// MOD-144 PD13): the item is stored `open`, so blocking writes `open -> blocked` and the item
+    /// is blocked, with the note written (rung 4's rule; invariant 7). No run row; the error is the
+    /// tags.
     #[tokio::test]
-    async fn enqueue_refuses_missing_tags_on_a_failed_item_and_leaves_it_failed() {
+    async fn enqueue_refuses_missing_tags_on_a_failed_item_and_blocks_it() {
         let harness = Harness::new().await;
-        // `FEAT-3` is seeded `queued` under `RUN_2`; move it `in_progress` as a claim would, then
-        // failing `RUN_2` mirrors it `in_progress -> failed` (plan D7).
-        assert!(
-            harness
-                .orch
-                .store
-                .transition(ids::HTUI_FEAT_3, Status::Queued, Status::InProgress)
-                .await
-                .expect("MemStore never fails a compare-and-set"),
-            "the seeded item is `queued`"
-        );
+        // `FEAT-3` is seeded `open` under a `queued` `RUN_2`; failing `RUN_2` makes it read
+        // `failed` (MOD-144: `finish_run` writes no item).
         harness
             .orch
             .store
@@ -15140,8 +15118,8 @@ mod tests {
             .await
             .expect("the seeded run is queued and can be failed");
         assert_eq!(
-            harness.orch.item(ids::HTUI_FEAT_3).await.status,
-            Status::Failed,
+            harness.orch.state(ids::HTUI_FEAT_3).await,
+            ItemState::Failed,
             "the precondition: the item is `failed`"
         );
         require_tags(&harness, ids::HTUI_FEAT_3, &["vulkan"]).await;
@@ -15175,17 +15153,8 @@ mod tests {
         );
         assert_eq!(
             harness.orch.item(ids::HTUI_FEAT_3).await.status,
-            Status::Failed,
-            "`transition(Open, Blocked)` answered false: the item stays `failed`"
-        );
-        assert!(
-            !harness
-                .orch
-                .store
-                .transition(ids::HTUI_FEAT_3, Status::Open, Status::Blocked)
-                .await
-                .expect("MemStore never fails a compare-and-set"),
-            "a `failed` item has no `open -> blocked` to take"
+            Status::Blocked,
+            "MOD-144: blocking writes `open -> blocked`, and a failed item is stored `open`"
         );
         assert_eq!(
             harness
@@ -15211,12 +15180,73 @@ mod tests {
         assert_eq!(
             added,
             vec!["missing tags: vulkan"],
-            "the note is written even though the item could not be blocked"
+            "the refusal is readable"
         );
     }
 
-    /// MOD-7 milestone 3 D98 (blueprint H-7): only an item `create_run` would accept is checked.
-    /// `FEAT-3` seeded `queued` under `RUN_2` meets `create_run`'s own refusal, with no note.
+    /// MOD-144 R1 (M1): rung 4's and the tag check's refusals write through `block_if_idle`, so a
+    /// live run that holds the item by the time of the write (another box's `create_run` landing
+    /// after `startable`'s lock-free read) leaves it `open` with no note, and the refusal is
+    /// still answered. `FEAT-3`'s seeded `queued` `RUN_2` stands in for that run: `enqueue`'s own
+    /// `startable` read would refuse first, so the two refusals are called directly. A plain
+    /// `transition(open -> blocked)` would block it.
+    #[tokio::test]
+    async fn a_startrun_refusal_writes_nothing_over_a_live_run() {
+        let harness = Harness::new().await;
+        let item = harness.orch.item(ids::HTUI_FEAT_3).await;
+        assert_eq!(
+            harness.orch.state(ids::HTUI_FEAT_3).await,
+            ItemState::Queued,
+            "control: a live run holds FEAT-3"
+        );
+        let notes_before = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .len();
+        harness_engine!(harness.orch, engine);
+
+        let rung_four = engine
+            .refuse_rung_four(&item, "implement".to_owned())
+            .await
+            .expect("the refusal is answered");
+        assert!(
+            matches!(&rung_four,
+                crate::graph::ResolveError::NoCandidate { phase } if phase == "implement"),
+            "{rung_four:?}"
+        );
+        let tags = engine
+            .refuse_missing_tags(&item, vec!["vulkan".to_owned()])
+            .await
+            .expect("the refusal is answered");
+        assert!(
+            matches!(&tags, EngineError::MissingTags { run: None, .. }),
+            "{tags:?}"
+        );
+
+        assert_eq!(
+            harness.orch.item(ids::HTUI_FEAT_3).await.status,
+            Status::Open,
+            "an item a live run holds is never blocked"
+        );
+        assert_eq!(
+            harness
+                .orch
+                .store
+                .notes(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .len(),
+            notes_before,
+            "and gets no note (D98)"
+        );
+    }
+
+    /// MOD-7 milestone 3 D98 (blueprint H-7), MOD-144 PD1: only an item `create_run` would accept
+    /// is checked. `FEAT-3` seeded `open` under a live `queued` `RUN_2` meets `startable`'s own
+    /// refusal, with no note, and is **not** blocked: its run is walking.
     #[tokio::test]
     async fn enqueue_checks_tags_only_where_create_run_would() {
         let harness = Harness::new().await;
@@ -15235,12 +15265,18 @@ mod tests {
             .await
             .expect_err("a queued item admits no second run");
         assert!(
-            matches!(refused, EngineError::Store(_)),
-            "`create_run`'s refusal, not the tags: {refused:?}"
+            matches!(&refused, EngineError::Store(htui_core::store::StoreError::Constraint(sentence))
+                if *sentence == htui_core::store::not_startable("FEAT-3", ItemState::Queued)),
+            "`startable`'s refusal, not the tags: {refused:?}"
+        );
+        assert_eq!(
+            harness.orch.state(ids::HTUI_FEAT_3).await,
+            ItemState::Queued
         );
         assert_eq!(
             harness.orch.item(ids::HTUI_FEAT_3).await.status,
-            Status::Queued
+            Status::Open,
+            "PD1: an item some live run holds is never blocked by the tag check"
         );
         assert_eq!(
             harness
@@ -15687,9 +15723,10 @@ mod tests {
         assert_send(&engine.sweep_fenced(&Held(Vec::new())));
     }
 
-    /// MOD-4 plan D161's read-only half: the item and its active runs, each with its cursor.
+    /// MOD-4 plan D161's read-only half: the item and its runs, each live one with its cursor
+    /// (MOD-144, PD9: a finished or cancelled one names the state).
     #[tokio::test]
-    async fn unblock_case_reads_the_item_and_its_active_runs() {
+    async fn unblock_case_reads_the_item_and_its_runs() {
         let harness = Harness::new().await;
         harness.free_feat_3().await;
         harness_engine!(harness.orch, engine);
@@ -15698,7 +15735,7 @@ mod tests {
             .await
             .expect_err("an open item");
         assert!(
-            matches!(&refused, EngineError::NotBlocked { status: Status::Open, why, .. } if *why == crate::command::nothing_is_blocked()),
+            matches!(&refused, EngineError::NotBlocked { state: ItemState::Open, why, .. } if *why == crate::command::nothing_is_blocked()),
             "{refused}"
         );
 
@@ -15765,14 +15802,15 @@ mod tests {
         assert_eq!(
             (
                 preview.status,
+                preview.finished,
                 preview.resolution,
                 preview.runs,
                 preview.rows,
                 preview.version
             ),
-            (Status::Done, Resolution::Done, 2, 4, 1),
-            "the seeded `RUN_2` and this one; one row per step, each committed to the primary; a \
-             `done` item closes as `done` (MOD-38 plan D6)"
+            (Status::Open, true, Resolution::Done, 2, 4, 1),
+            "the seeded `RUN_2` and this one; one row per step, each committed to the primary; an \
+             item whose latest graph run is `done` closes as `done` (MOD-38 plan D6, MOD-144)"
         );
     }
 
@@ -18828,7 +18866,7 @@ mod tests {
         }
 
         /// MOD-10 D5, plain-step path: a recorder whose `finish` refuses fails the run with the
-        /// typed scrub sentence, and the item mirrors `failed`, not `blocked` (MOD-32 D8).
+        /// typed scrub sentence, and the item reads `failed`, not `blocked` (MOD-32 D8).
         #[tokio::test(start_paused = true)]
         async fn a_recorder_refusal_fails_the_run_with_the_scrub_sentence() {
             let harness = Harness::new().await;
@@ -22214,7 +22252,9 @@ mod tests {
 mod queued_cancel {
     use chrono::TimeDelta;
     use htui_core::fixtures::ids;
-    use htui_core::model::{Claim, RunMode, RunStatus, SnapshotCandidate, Status, StopMode};
+    use htui_core::model::{
+        Claim, ItemState, RunMode, RunStatus, SnapshotCandidate, Status, StopMode,
+    };
     use htui_core::store::{ReadStore as _, WriteStore as _};
 
     use super::SessionKey;
@@ -22298,13 +22338,8 @@ mod queued_cancel {
         let row = orch.run(run).await;
         assert_eq!(row.status, RunStatus::Queued);
         assert_eq!(row.lease_expires_at, None, "never claimed: no lease");
-        let item = orch
-            .store
-            .item(ids::HTUI_FEAT_3)
-            .await
-            .expect("MemStore never fails a read")
-            .expect("the item exists");
-        assert_eq!(item.status, Status::Queued);
+        assert_eq!(orch.item(ids::HTUI_FEAT_3).await.status, Status::Open);
+        assert_eq!(orch.state(ids::HTUI_FEAT_3).await, ItemState::Queued);
         assert_eq!(
             orch.store
                 .notes(ids::HTUI_FEAT_3)
@@ -22419,21 +22454,13 @@ mod queued_cancel {
             steps,
             "no step was cancelled"
         );
-        assert_eq!(
-            orch.store
-                .item(ids::HTUI_FEAT_3)
-                .await
-                .expect("MemStore never fails a read")
-                .expect("the item is there")
-                .status,
-            Status::InProgress
-        );
+        assert_eq!(orch.state(ids::HTUI_FEAT_3).await, ItemState::Running);
     }
 
-    /// B-6: a queued cancel moves the run to `cancelled` and the item back to `open`, so a second
-    /// `StartRun` on the item is admitted.
+    /// B-6, MOD-144: a queued cancel moves the run to `cancelled` and writes no item row; the
+    /// cancelled run is skipped, so the item is free and a second `StartRun` on it is admitted.
     #[tokio::test]
-    async fn a_queued_cancel_moves_the_item_back_to_open() {
+    async fn a_queued_cancel_frees_the_item_and_writes_no_item_row() {
         let orch = harness().await;
         let graphs = orch.graphs();
         let driver =
@@ -22448,6 +22475,8 @@ mod queued_cancel {
             .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None, None)
             .await
             .expect("the item is open");
+        assert_eq!(orch.state(ids::HTUI_FEAT_3).await, ItemState::Queued);
+        let before = orch.item(ids::HTUI_FEAT_3).await;
 
         let outcome = engine
             .dispatch(Command::CancelRun { run })
@@ -22465,15 +22494,13 @@ mod queued_cancel {
             .expect("the run is there");
         assert_eq!(row.status, RunStatus::Cancelled);
         assert!(row.finished_at.is_some(), "a cancelled run is finished");
+        let after = orch.item(ids::HTUI_FEAT_3).await;
         assert_eq!(
-            orch.store
-                .item(ids::HTUI_FEAT_3)
-                .await
-                .expect("MemStore never fails a read")
-                .expect("the item is there")
-                .status,
-            Status::Open
+            (after.status, after.version, after.updated_at),
+            (before.status, before.version, before.updated_at),
+            "MOD-144: the cancel wrote no item row"
         );
+        assert_ne!(orch.state(ids::HTUI_FEAT_3).await, ItemState::Queued);
 
         let again = engine
             .dispatch(Command::StartRun {

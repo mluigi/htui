@@ -93,7 +93,7 @@ async fn a_reveal_of_a_hidden_item_clears_the_filter() {
     let done: Vec<ItemSummary> = bench
         .items
         .iter()
-        .filter(|item| item.status == Status::Done)
+        .filter(|item| item.state() == ItemState::Done)
         .cloned()
         .collect();
     assert!(

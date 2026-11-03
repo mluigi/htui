@@ -15,8 +15,9 @@ use crate::model::run::{Run, RunStep};
 use crate::model::scope::Scope;
 
 /// One item of [`crate::store::ReadStore::waiting_candidates`] (MOD-69 plan D2): an item in scope
-/// that is `blocked` or `awaiting_approval`, or that owns a run at `awaiting_approval`, with its
-/// **active** runs (`RunStatus::is_active`) and each such run's steps.
+/// that is `blocked`, or that owns a run at `awaiting_approval` (MOD-144), with its **active**
+/// runs (`RunStatus::is_active`: `queued | running | awaiting_approval | stopped`) and each such
+/// run's steps.
 ///
 /// Derives no `Eq`: `Item`, `Run` and `RunStep` derive none (they hold `serde_json::Value`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

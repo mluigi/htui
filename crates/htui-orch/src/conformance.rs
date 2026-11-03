@@ -8,8 +8,8 @@
 //!
 //! T3 landed the list, the harness traits and the case stubs; T5 replaced every stub body with the
 //! validation criterion it is named for. A case asserts the *shape* its criterion names — statuses
-//! per step, document kinds and their `produced_by_step_id`, the item's `closed_at`, the run's
-//! `finished_at` — and never merely that the walk did not error.
+//! per step, document kinds and their `produced_by_step_id`, the item's derived state and its
+//! `closed_at`, the run's `finished_at` — and never merely that the walk did not error.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -25,9 +25,10 @@ use htui_core::model::GraphScope;
 use htui_core::model::kind::HEAVY_COMMAND_PREFIXES;
 use htui_core::model::{
     AgentBox, AgentId, BatchId, Billing, CommandRun, CommandRunStatus, DocumentId, EdgeId,
-    EdgeKind, EventKind, Gate, GateOutcome, Isolation, Item, ItemId, ItemPatch, NewDocument,
-    NewRepo, NewStepGraph, PhaseId, PhasePatch, RepoId, Resolution, Run, RunId, RunMode, RunStatus,
-    RunStep, Status, StepGraphEdge, StepGraphId, StepGraphPhase, StepId, StepStatus, VerifyOutcome,
+    EdgeKind, EventKind, Gate, GateOutcome, Isolation, Item, ItemId, ItemPatch, ItemState,
+    NewDocument, NewRepo, NewStepGraph, PhaseId, PhasePatch, RepoId, Resolution, Run, RunId,
+    RunMode, RunStatus, RunStep, Status, StepGraphEdge, StepGraphId, StepGraphPhase, StepId,
+    StepStatus, VerifyOutcome,
 };
 use htui_core::model::{
     BoxEdit, Claim, NewItem, OverlapRule, Quota, QuotaSource, RunKind, Scope, Spend, WorkspaceId,
@@ -37,7 +38,9 @@ use htui_core::model::{
     PersonaTools, SnapshotPersona,
 };
 use htui_core::prompt::DiffBlock;
-use htui_core::store::{CasOutcome, MemStore, ReadStore as _, StepFence, WriteStore as _};
+use htui_core::store::{
+    CasOutcome, MemStore, ReadStore as _, StepFence, StoreError, WriteStore as _,
+};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
@@ -216,7 +219,7 @@ pub trait Orchestrate {
         step: &RunStep,
         kind: &str,
         body: &str,
-    ) -> Result<(), htui_core::store::StoreError>;
+    ) -> Result<(), StoreError>;
 
     /// MOD-11 D16, D17: the spec the session at `key` was started with — its exposure and its
     /// policy — or `None` before it started. Out of the blueprint's §4.5 list for the reason
@@ -341,7 +344,7 @@ impl Orchestrate for FakeOrchestrator {
         step: &RunStep,
         kind: &str,
         body: &str,
-    ) -> Result<(), htui_core::store::StoreError> {
+    ) -> Result<(), StoreError> {
         Self::author(self, item, step, kind, body).await.map(drop)
     }
 
@@ -498,7 +501,7 @@ pub const CASES: &[&str] = &[
     "cli_agent_is_refused_at_a_gated_phase",
     // `:439` and plan D8: a step that outlives its deadline settles `failed`.
     "step_deadline_settles_failed",
-    // Plan D7: the last write of a finished walk is `finish_run`, and the item mirrors it.
+    // Plan D7: the last write of a finished walk is `finish_run`, and the item reads it (MOD-144).
     "finish_run_is_the_last_write",
     // Plan D4's *other* entry point (`:450`, the `never` × `rejected` cell): the walk itself
     // rejects a review and runs the loop, with no human in it.
@@ -716,6 +719,12 @@ pub const CASES: &[&str] = &[
     "a_tampered_v2_snapshot_parks_with_both_digests",
     "a_v1_run_whose_live_graph_gained_a_non_default_edge_walks_on",
     "a_v1_run_on_a_refused_graph_whose_phases_changed_parks",
+    // MOD-144 (ANA-35 §7.1): the item's state is derived from its latest graph run. A queued
+    // cancel writes no item; a stopped run holds its item against every verb; a finished item
+    // admits a rework run, and cancelling it leaves the item finished.
+    "a_queued_cancel_writes_no_item",
+    "a_stopped_run_holds_its_item",
+    "a_rework_run_on_a_finished_item_is_admitted",
 ];
 
 /// Run one case by name.
@@ -746,6 +755,7 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         .or_else(|| auto_mode_case(name, harness))
         .or_else(|| spend_guard_case(name, harness))
         .or_else(|| pinned_resume_case(name, harness))
+        .or_else(|| item_state_case(name, harness))
         .unwrap_or_else(|| earlier_case(name, harness))
 }
 
@@ -1156,6 +1166,200 @@ fn pinned_resume_case<'a, H: CaseHarness>(
     })
 }
 
+/// MOD-144's three, boxed for [`case`]'s reason.
+fn item_state_case<'a, H: CaseHarness>(
+    name: &str,
+    harness: &'a H,
+) -> Option<Pin<Box<dyn Future<Output = ()> + 'a>>> {
+    Some(match name {
+        "a_queued_cancel_writes_no_item" => Box::pin(a_queued_cancel_writes_no_item(harness)),
+        "a_stopped_run_holds_its_item" => Box::pin(a_stopped_run_holds_its_item(harness)),
+        "a_rework_run_on_a_finished_item_is_admitted" => {
+            Box::pin(a_rework_run_on_a_finished_item_is_admitted(harness))
+        }
+        _ => return None,
+    })
+}
+
+/// MOD-144 (ANA-35 §7.1): cancelling the seeded `queued` `RUN_2` writes no item row. The item was
+/// stored `open` all along and read `queued` from its run; the cancelled run is skipped by the
+/// latest-run rule, so it reads `open` again and a new `StartRun` is admitted.
+async fn a_queued_cancel_writes_no_item<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    let before = item_of(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        before.status,
+        Status::Open,
+        "the fixture stores `FEAT-3` open"
+    );
+    assert_eq!(
+        state_of(&orch, ids::HTUI_FEAT_3).await,
+        ItemState::Queued,
+        "and it reads its queued `RUN_2`"
+    );
+
+    let outcome = orch
+        .dispatch(Command::CancelRun { run: ids::RUN_2 })
+        .await
+        .expect("a queued run is cancellable");
+    assert!(
+        matches!(outcome, CommandOutcome::Cancelled { ref rest } if rest.run == RunStatus::Cancelled),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        item_of(&orch, ids::HTUI_FEAT_3).await,
+        before,
+        "the cancel wrote no item row"
+    );
+    assert_eq!(
+        state_of(&orch, ids::HTUI_FEAT_3).await,
+        ItemState::Open,
+        "the cancelled run is skipped"
+    );
+
+    let (_, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::AwaitingApproval, "the item is free");
+    assert_eq!(state_of(&orch, ids::HTUI_FEAT_3).await, ItemState::NeedsYou);
+}
+
+/// MOD-144 (Δ1, Δ2; MOD-125): a `stopped` run is live. Its item reads `stopped`, and every verb
+/// that needs the item free refuses: `StartRun` with `startable`'s sentence and no note, `Unblock`
+/// naming the walking run, `CloseOut` naming the live run. Nothing blocks the item.
+async fn a_stopped_run_holds_its_item<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::AwaitingApproval);
+    // MOD-125's stop, by hand: the parked run back to `running`, then `stopped`.
+    let now = orch.clock().now();
+    for (from, to) in [
+        (RunStatus::AwaitingApproval, RunStatus::Running),
+        (RunStatus::Running, RunStatus::Stopped),
+    ] {
+        assert!(
+            orch.store()
+                .transition_run(run, from, to, now)
+                .await
+                .expect("MemStore takes the move"),
+            "the run was `{from}`"
+        );
+    }
+    assert_eq!(state_of(&orch, ids::HTUI_FEAT_3).await, ItemState::Stopped);
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await.len();
+
+    let refused = orch
+        .dispatch(Command::StartRun {
+            item: ids::HTUI_FEAT_3,
+            mode: RunMode::Manual,
+            repo_scope: None,
+            workspace: None,
+        })
+        .await
+        .expect_err("a stopped run is live");
+    assert!(
+        matches!(&refused, EngineError::Store(StoreError::Constraint(sentence))
+            if *sentence == htui_core::store::not_startable("FEAT-3", ItemState::Stopped)),
+        "{refused}"
+    );
+
+    let refused = orch
+        .dispatch(Command::Unblock {
+            item: ids::HTUI_FEAT_3,
+        })
+        .await
+        .expect_err("a stopped run is resumed, not unblocked");
+    assert!(
+        matches!(&refused, EngineError::NotBlocked { state: ItemState::Stopped, why, .. }
+            if *why == crate::command::run_is_walking(run, RunStatus::Stopped)),
+        "{refused}"
+    );
+
+    let refused = orch
+        .dispatch(Command::CloseOut {
+            item: ids::HTUI_FEAT_3,
+            resolution: Resolution::Withdrawn,
+        })
+        .await
+        .expect_err("a live run");
+    assert!(
+        matches!(
+            refused,
+            EngineError::RunStatus {
+                run: live,
+                status: RunStatus::Stopped,
+                ..
+            } if live == run
+        ),
+        "{refused}"
+    );
+
+    assert_eq!(
+        item_of(&orch, ids::HTUI_FEAT_3).await.status,
+        Status::Open,
+        "no refusal blocked the item"
+    );
+    assert_eq!(
+        notes_of(&orch, ids::HTUI_FEAT_3).await.len(),
+        notes,
+        "no refusal wrote a note (D98)"
+    );
+    assert_eq!(run_of(&orch, run).await.status, RunStatus::Stopped);
+}
+
+/// MOD-144 (ANA-35 §7.1): a finished item admits a rework run, which is then the latest graph run
+/// (`needs you` at its first gate). Cancelling it leaves the item finished — the cancelled run is
+/// skipped — and close-out takes `done`.
+async fn a_rework_run_on_a_finished_item_is_admitted<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    let (first, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    approve(&orch, first, 4).await;
+    assert_eq!(run_of(&orch, first).await.status, RunStatus::Done);
+    assert_eq!(state_of(&orch, ids::HTUI_FEAT_3).await, ItemState::Done);
+
+    orch.clock().advance(TimeDelta::seconds(1));
+    let (rework, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::AwaitingApproval);
+    assert_eq!(
+        state_of(&orch, ids::HTUI_FEAT_3).await,
+        ItemState::NeedsYou,
+        "the rework run is the latest graph run"
+    );
+
+    let outcome = orch
+        .dispatch(Command::CancelRun { run: rework })
+        .await
+        .expect("a parked run is cancellable");
+    assert!(
+        matches!(outcome, CommandOutcome::Cancelled { ref rest } if rest.run == RunStatus::Cancelled),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        state_of(&orch, ids::HTUI_FEAT_3).await,
+        ItemState::Done,
+        "the cancelled rework is skipped: the item reads its finished run"
+    );
+
+    let outcome = orch
+        .dispatch(Command::CloseOut {
+            item: ids::HTUI_FEAT_3,
+            resolution: Resolution::Done,
+        })
+        .await
+        .expect("a finished item closes `done`");
+    assert!(
+        matches!(outcome, CommandOutcome::ClosedOut { item, .. } if item == ids::HTUI_FEAT_3),
+        "{outcome:?}"
+    );
+    let item = item_of(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (item.status, item.resolution),
+        (Status::Closed, Some(Resolution::Done))
+    );
+    assert!(item.closed_at.is_some(), "close-out stamps `closed_at`");
+    assert_eq!(state_of(&orch, ids::HTUI_FEAT_3).await, ItemState::Closed);
+}
+
 // -- what every case needs, written once ---------------------------------------------------------
 
 /// The run's steps in `(position, attempt, fanout_index)` order.
@@ -1183,6 +1387,14 @@ async fn item_of<O: Orchestrate>(orch: &O, id: ItemId) -> Item {
         .await
         .expect("MemStore never fails a read")
         .expect("the case names an item the fixture holds")
+}
+
+/// The item's derived display state (MOD-144): its stored status over its latest graph run.
+///
+/// # Panics
+/// When the item is not there, which in a case means the fixture moved.
+async fn state_of<O: Orchestrate>(orch: &O, id: ItemId) -> ItemState {
+    crate::fake::state_in(orch.store(), id).await
 }
 
 /// One run row.
@@ -1217,11 +1429,9 @@ async fn notes_of<O: Orchestrate>(orch: &O, item: ItemId) -> Vec<String> {
         .collect()
 }
 
-/// `ids::HTUI_FEAT_3` is seeded **`queued`** with a live `RUN_2` on it
-/// (`crates/htui-core/src/fixtures.rs:899`, `:1374-1380`), and `create_run` moves an item
-/// `open | failed -> queued` only — so `StartRun` on it is a `Constraint` until the seeded run is
-/// ended. Cancelling `RUN_2` moves the item `queued -> open` inside `finish_run`'s own transaction,
-/// which is the one-line prologue every case that walks `FEAT-3` needs.
+/// `ids::HTUI_FEAT_3` is seeded `open` with a live `queued` `RUN_2` on it, so `create_run`
+/// refuses `StartRun` (MOD-144: `startable`, no live graph run) until `RUN_2` ends. Cancelling
+/// it writes no item row, and is the one-line prologue every case that walks `FEAT-3` needs.
 ///
 /// # Panics
 /// When `RUN_2` is not cancellable, which means the fixture moved.
@@ -1494,8 +1704,9 @@ async fn answer<O: Orchestrate>(orch: &O, run: RunId, answer: GateAnswer) -> (Ru
 /// Answers the run's one parked step `approved` and unparks the run **without walking it**, leaving
 /// the run `running` with its next position uncreated.
 ///
-/// The three writes are `Engine::answer_gate`'s own, minus its closing `run_to_rest`
-/// (`crates/htui-orch/src/engine.rs`): `answer_gate`, then the run, then the item, in that order.
+/// The two writes are `Engine::answer_gate`'s own, minus its closing `run_to_rest`
+/// (`crates/htui-orch/src/engine.rs`): `answer_gate`, then the run, in that order (MOD-144: the
+/// item is not written).
 ///
 /// It exists for criterion 3. `run_to_rest` returns at its `AwaitingApproval` arm before it reads a
 /// cursor, so "resume advanced nothing" asserted on a *parked* run holds however the resume behaves
@@ -1503,7 +1714,7 @@ async fn answer<O: Orchestrate>(orch: &O, run: RunId, answer: GateAnswer) -> (Ru
 /// the only state in which the assertion is about the guard.
 ///
 /// # Panics
-/// When no step is parked, or when any of the three writes is refused.
+/// When no step is parked, or when either write is refused.
 async fn approve_without_walking<O: Orchestrate>(orch: &O, run: RunId, item: ItemId) {
     let now = orch.clock().now();
     let steps = steps_of(orch, run).await;
@@ -1522,10 +1733,11 @@ async fn approve_without_walking<O: Orchestrate>(orch: &O, run: RunId, item: Ite
         .transition_run(run, RunStatus::AwaitingApproval, RunStatus::Running, now)
         .await
         .expect("the run is parked");
-    orch.store()
-        .transition(item, Status::AwaitingApproval, Status::InProgress)
-        .await
-        .expect("the item is parked");
+    assert_eq!(
+        state_of(orch, item).await,
+        ItemState::Running,
+        "the item reads its unparked run"
+    );
 }
 
 /// [`answer`] with `Approved`, `times` over, keeping the last walk's rest.
@@ -1568,7 +1780,7 @@ fn at(steps: &[RunStep], position: i32, attempt: i32) -> &RunStep {
 ///
 /// The shape asserted is blueprint §7's data-flow table read from the store: one step per position
 /// in `prd, plan, implement, review` order, every one `done`, one document per position carrying
-/// `produced_by_step_id` of the step that earned it, and the item mirroring the run at row 35.
+/// `produced_by_step_id` of the step that earned it, and the item reading the run (MOD-144).
 ///
 /// `prompt_digest` is asserted `Some` rather than re-hashed: stage 3's `set_step_prompt` and the
 /// recorder's `record_prompt_digesting` write the same digest by construction (blueprint H-13),
@@ -1600,9 +1812,9 @@ async fn feat_walks_end_to_end<H: CaseHarness>(harness: &H) {
         "stage 3 wrote the digest and the recorder rewrote the same one (blueprint H-13)"
     );
     assert_eq!(
-        item_of(&orch, ids::HTUI_FEAT_3).await.status,
-        Status::AwaitingApproval,
-        "the three-write park moves step, run and item (blueprint H-10)"
+        state_of(&orch, ids::HTUI_FEAT_3).await,
+        ItemState::NeedsYou,
+        "the park moves step and run; the parked run reads `needs you` (blueprint H-10, MOD-144)"
     );
 
     // Four approvals: positions 0, 1 and 2 each park the next, and the fourth finishes the run.
@@ -1619,15 +1831,16 @@ async fn feat_walks_end_to_end<H: CaseHarness>(harness: &H) {
     assert_eq!(row.finished_at, Some(orch.clock().now()));
     assert_eq!(row.failure, None);
 
-    let item = item_of(&orch, ids::HTUI_FEAT_3).await;
     assert_eq!(
-        item.status,
-        Status::Done,
-        "plan D7: `finish_run` mirrors it"
+        state_of(&orch, ids::HTUI_FEAT_3).await,
+        ItemState::Done,
+        "MOD-144: the item reads its finished run"
     );
+    let item = item_of(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(item.status, Status::Open, "`finish_run` writes no item");
     assert!(
-        item.closed_at.is_some(),
-        "a `done` item carries the instant it closed"
+        item.closed_at.is_none(),
+        "only close-out stamps `closed_at` (MOD-144 Δ10)"
     );
 
     let steps = steps_of(&orch, run).await;
@@ -1759,7 +1972,7 @@ async fn live_run_ignores_a_gate_edit<H: CaseHarness>(harness: &H) {
         "`never` passes a step `running -> done` with `gate_outcome = 'skipped'` (MOD-37 R-5, \
          ANA-2 §4.2)"
     );
-    assert_eq!(item_of(&orch, ids::HTUI_ANA_2).await.status, Status::Done);
+    assert_eq!(state_of(&orch, ids::HTUI_ANA_2).await, ItemState::Done);
 }
 
 /// ANA-2 §12 criterion 3 (`docs/ANA-2.md:2090`): the graph moved under a parked **v1** run.
@@ -1820,8 +2033,8 @@ async fn topology_mismatch_parks_on_resume<H: CaseHarness>(harness: &H) {
          decision, not the engine's (MOD-4 plan D159)"
     );
     assert_eq!(
-        item_of(&orch, ids::HTUI_FEAT_3).await.status,
-        Status::AwaitingApproval,
+        state_of(&orch, ids::HTUI_FEAT_3).await,
+        ItemState::NeedsYou,
         "the item follows its run to the gate"
     );
 
@@ -1920,10 +2133,7 @@ async fn approve_needs_the_output_document<H: CaseHarness>(harness: &H) {
         RunStatus::AwaitingApproval,
         "nor does it move the run"
     );
-    assert_eq!(
-        item_of(&orch, ids::HTUI_FEAT_3).await.status,
-        Status::AwaitingApproval
-    );
+    assert_eq!(state_of(&orch, ids::HTUI_FEAT_3).await, ItemState::NeedsYou);
     assert_eq!(
         orch.store()
             .documents(ids::HTUI_FEAT_3)
@@ -2339,10 +2549,7 @@ async fn missing_input_fails_before_a_token<H: CaseHarness>(harness: &H) {
     let row = run_of(&orch, run).await;
     assert_eq!(row.failure.as_deref(), Some("missing input document: spec"));
     assert!(row.finished_at.is_some(), "a failed run is a finished run");
-    assert_eq!(
-        item_of(&orch, ids::HTUI_FEAT_3).await.status,
-        Status::Failed
-    );
+    assert_eq!(state_of(&orch, ids::HTUI_FEAT_3).await, ItemState::Failed);
 
     let steps = steps_of(&orch, run).await;
     assert_eq!(steps.len(), 1, "stage 3 fails the one step it reached");
@@ -2380,10 +2587,7 @@ async fn missing_output_settles_failed<H: CaseHarness>(harness: &H) {
         run_of(&orch, run).await.failure.as_deref(),
         Some("missing_output")
     );
-    assert_eq!(
-        item_of(&orch, ids::HTUI_FEAT_3).await.status,
-        Status::Failed
-    );
+    assert_eq!(state_of(&orch, ids::HTUI_FEAT_3).await, ItemState::Failed);
 
     let steps = steps_of(&orch, run).await;
     assert_eq!(
@@ -2482,26 +2686,33 @@ async fn step_deadline_settles_failed<H: CaseHarness>(harness: &H) {
     );
 }
 
-/// Plan D7's composite writer, read from both ends of the walk.
+/// Plan D7's terminal writer, read from both ends of the walk (MOD-144: it writes no item).
 ///
-/// `finish_run` moves the run *and* its item in one transaction, and this case is the only one that
-/// asserts both of its directions. The prologue is the first: `finish_run(RUN_2, Cancelled)` is what
-/// frees `FEAT-3`, and the item it moves `queued -> open` is the proof the mirror is not
-/// terminal-only. Criterion 1's tail is the second: one `finish_run` at the last approve stamps
-/// `run.finished_at` and `item.closed_at` with the same instant, and no separate `transition_run`
-/// is needed to get there.
+/// The prologue is the first end: `finish_run(RUN_2, Cancelled)` is what frees `FEAT-3`, and it
+/// frees it without touching the item row — the cancelled run is skipped by the latest-run rule,
+/// so the item reads `open` again. Criterion 1's tail is the second: one `finish_run` at the last
+/// approve stamps `run.finished_at`, the item reads `done`, and no separate `transition_run` is
+/// needed to get there.
 async fn finish_run_is_the_last_write<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
+    let seeded = item_of(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(seeded.status, Status::Open);
     assert_eq!(
-        item_of(&orch, ids::HTUI_FEAT_3).await.status,
-        Status::Queued,
-        "the fixture seeds `FEAT-3` queued behind the live `RUN_2`"
+        state_of(&orch, ids::HTUI_FEAT_3).await,
+        ItemState::Queued,
+        "the fixture seeds `FEAT-3` open behind the live `RUN_2`"
     );
     free_feat_3(&orch).await;
     assert_eq!(
-        item_of(&orch, ids::HTUI_FEAT_3).await.status,
-        Status::Open,
-        "plan D7: cancelling the run moved the item with it, in `finish_run`'s own transaction"
+        state_of(&orch, ids::HTUI_FEAT_3).await,
+        ItemState::Open,
+        "the cancelled run is skipped: the item reads `open`"
+    );
+    let freed = item_of(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (freed.version, freed.updated_at),
+        (seeded.version, seeded.updated_at),
+        "MOD-144: cancelling the run wrote no item row"
     );
     assert_eq!(run_of(&orch, ids::RUN_2).await.status, RunStatus::Cancelled);
 
@@ -2518,13 +2729,17 @@ async fn finish_run_is_the_last_write<H: CaseHarness>(harness: &H) {
     );
     assert_eq!(row.failure, None, "a `done` run names no failure");
 
+    assert_eq!(
+        state_of(&orch, ids::HTUI_FEAT_3).await,
+        ItemState::Done,
+        "the item reads its finished run"
+    );
     let item = item_of(&orch, ids::HTUI_FEAT_3).await;
-    assert_eq!(item.status, Status::Done, "one write moved both rows");
-    assert!(item.closed_at.is_some(), "and the item closed with the run");
-    // `closed_at` is deliberately *not* asserted equal to `finished`: `finish_run` takes the run's
-    // instant as an argument and stamps the item's mirror from `Utc::now()`
-    // (`crates/htui-core/src/store/mem.rs:4466-4469`), so the two are one transaction but not one
-    // instant. Pinning them equal would be pinning the store's clock, not the walk's.
+    assert_eq!(item.status, Status::Open, "`finish_run` writes no item");
+    assert!(
+        item.closed_at.is_none(),
+        "only close-out stamps `closed_at` (MOD-144 Δ10)"
+    );
 }
 
 /// Plan D4's **automatic** entry point (`docs/ANA-2.md:450`, the `never` × `rejected` cell): the
@@ -2613,7 +2828,7 @@ async fn a_never_gate_rejection_loops_the_review<H: CaseHarness>(harness: &H) {
         Some(GateOutcome::Skipped),
         "`never` passes a step `running -> done` with `gate_outcome = 'skipped'` (MOD-37 R-5)"
     );
-    assert_eq!(item_of(&orch, ids::HTUI_FEAT_3).await.status, Status::Done);
+    assert_eq!(state_of(&orch, ids::HTUI_FEAT_3).await, ItemState::Done);
 }
 
 /// The automatic entry point out of budget: `docs/ANA-2.md:746`'s escalation, reached with no human
@@ -2772,10 +2987,7 @@ async fn on_failure_passes_ok_and_parks_failed<H: CaseHarness>(harness: &H) {
         RunStatus::AwaitingApproval,
         "the park moves step, run and item (blueprint H-10)"
     );
-    assert_eq!(
-        item_of(&orch, ids::HTUI_FEAT_3).await.status,
-        Status::AwaitingApproval
-    );
+    assert_eq!(state_of(&orch, ids::HTUI_FEAT_3).await, ItemState::NeedsYou);
     let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
     assert!(
         notes.iter().any(|body| body.contains("missing_output")),
@@ -2882,7 +3094,7 @@ async fn an_intermediate_position_is_retired_by_the_loop<H: CaseHarness>(harness
         "each re-run position takes its own `attempt + 1`, which is what keeps \
          `UNIQUE (run_id, position, attempt, fanout_index)` out of the way (plan D5)"
     );
-    assert_eq!(item_of(&orch, ids::HTUI_FEAT_3).await.status, Status::Done);
+    assert_eq!(state_of(&orch, ids::HTUI_FEAT_3).await, ItemState::Done);
 }
 
 /// ANA-2 `:437-443` through plan D30's verifier: a `verify_command` that exits non-zero settles
@@ -3027,7 +3239,7 @@ async fn cancel_cleans_up_once<H: CaseHarness>(harness: &H) {
     assert_eq!(
         item_of(&orch, ids::HTUI_FEAT_3).await.status,
         Status::Open,
-        "`finish_run` mirrors the item `awaiting_approval -> open` (plan D7)"
+        "`finish_run` writes no item; it stays `open` (plan D7, MOD-144)"
     );
     assert_eq!(
         harness_cleanups(&orch),
@@ -3884,10 +4096,7 @@ async fn judge_orderings_that_disagree_park_for_selection<H: CaseHarness>(harnes
         (row.status, row.failure),
         (RunStatus::AwaitingApproval, None)
     );
-    assert_eq!(
-        item_of(&orch, ids::HTUI_ANA_2).await.status,
-        Status::AwaitingApproval
-    );
+    assert_eq!(state_of(&orch, ids::HTUI_ANA_2).await, ItemState::NeedsYou);
     assert_eq!(
         selection_parks(&orch, ids::HTUI_ANA_2).await,
         [
@@ -3964,7 +4173,7 @@ async fn an_unparseable_verdict_parks_and_select_fanout_completes<H: CaseHarness
             .any(|body| body == "fan-out `research` attempt 1: candidate 2 selected by a human"),
         "the human's pick is a note (plan D77): {notes:?}"
     );
-    assert_eq!(item_of(&orch, ids::HTUI_ANA_2).await.status, Status::Done);
+    assert_eq!(state_of(&orch, ids::HTUI_ANA_2).await, ItemState::Done);
 }
 
 /// Plan D49(2): an `always` group goes straight to a human — no prefilter verdict, no judge row.
@@ -4489,8 +4698,8 @@ async fn overlapping_touched_paths_serialise<H: CaseHarness>(harness: &H) {
     );
     assert_eq!(run_of(&orch, second).await.status, RunStatus::Queued);
     assert_eq!(
-        item_of(&orch, ids::HTUI_ANA_2).await.status,
-        Status::Queued,
+        state_of(&orch, ids::HTUI_ANA_2).await,
+        ItemState::Queued,
         "plan D84: a refusal writes nothing"
     );
     assert!(
@@ -4564,7 +4773,7 @@ async fn an_undeclared_item_holds_its_whole_primary_repo<H: CaseHarness>(harness
 /// running A, and is refused for the slot, not for A.
 ///
 /// **A and B stand in for two live walks by hand** — both are started, park at their first gate,
-/// and are moved `awaiting_approval -> running` with the item mirrored. A walk that stays
+/// and their runs are moved `awaiting_approval -> running`. A walk that stays
 /// `running` across a `dispatch` does not exist in the fake (every script finishes before its
 /// first beat, plan D86), and a `queued` run with a resolved scope has no other constructor on
 /// the case's surface. The clock moves a second between starts so `queued_at` orders the runs
@@ -4605,13 +4814,6 @@ async fn a_third_run_waits_for_a_slot_and_a_parked_run_still_blocks_overlap<H: C
                 .await
                 .expect("MemStore takes the move"),
             "the run was parked"
-        );
-        assert!(
-            orch.store()
-                .transition(item, Status::AwaitingApproval, Status::InProgress)
-                .await
-                .expect("MemStore takes the move"),
-            "the item was parked"
         );
     }
 
@@ -4799,7 +5001,7 @@ async fn a_suspended_walk_cannot_write_after_adoption<H: CaseHarness>(harness: &
         .await;
     assert!(
         matches!(&refused, Err(htui_agent::record::RecordError::Store(
-            htui_core::store::StoreError::Fenced { step })) if *step == prd.id),
+            StoreError::Fenced { step })) if *step == prd.id),
         "{refused:?}"
     );
     assert_eq!(
@@ -5159,8 +5361,8 @@ async fn an_interrupted_step_out_of_budget_parks<H: CaseHarness>(harness: &H) {
         "R-3: parked, not failed"
     );
     assert_eq!(
-        item_of(&other, ids::HTUI_FEAT_3).await.status,
-        Status::AwaitingApproval
+        state_of(&other, ids::HTUI_FEAT_3).await,
+        ItemState::NeedsYou
     );
     let n3 = format!(
         "interrupted: retry budget spent: step {} (`prd` attempt 1); trees: {trees}; the run is \
@@ -5481,8 +5683,8 @@ async fn a_half_written_park_is_completed<H: CaseHarness>(harness: &H) {
         RunStatus::AwaitingApproval
     );
     assert_eq!(
-        item_of(&other, ids::HTUI_FEAT_3).await.status,
-        Status::AwaitingApproval
+        state_of(&other, ids::HTUI_FEAT_3).await,
+        ItemState::NeedsYou
     );
     assert_eq!(steps_of(&other, run).await, before, "no step moved");
 }
@@ -5536,7 +5738,7 @@ const REFUSED_PROMPT: &str = "unknown prompt placeholder: {{no_such_placeholder}
 
 /// ANA-5 criterion 3 (`docs/ANA-5.md:2271-2273`, MOD-4 plan D162) at `walk_step`: stage 3's
 /// assembler refuses `prd`'s own prompt. The step fails with no `gate_note`, the item is
-/// `blocked` — not `failed`: the block lands before `finish_run`, whose mirror then leaves it — the
+/// `blocked` — not `failed`: the block lands before `finish_run`, which writes no item — the
 /// run fails with the refusal, one note says so, and no session ever started.
 async fn a_prompt_refusal_blocks_the_item_and_starts_no_session<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
@@ -5700,8 +5902,8 @@ async fn a_topology_mismatch_parks_a_running_run<H: CaseHarness>(harness: &H) {
         "a parked run holds no lease"
     );
     assert_eq!(
-        item_of(&other, ids::HTUI_FEAT_3).await.status,
-        Status::AwaitingApproval
+        state_of(&other, ids::HTUI_FEAT_3).await,
+        ItemState::NeedsYou
     );
     assert!(
         notes_of(&other, ids::HTUI_FEAT_3)
@@ -5752,10 +5954,7 @@ async fn cancel_meets_a_live_lease_and_writes_nothing<H: CaseHarness>(harness: &
         before,
         "every step and the run are unchanged"
     );
-    assert_eq!(
-        item_of(&orch, ids::HTUI_FEAT_3).await.status,
-        Status::AwaitingApproval
-    );
+    assert_eq!(state_of(&orch, ids::HTUI_FEAT_3).await, ItemState::NeedsYou);
     assert_eq!(harness_cleanups(&other), 0, "nothing was cleaned up");
 }
 
@@ -5803,7 +6002,8 @@ async fn promote<O: Orchestrate>(
 
 /// ANA-2 §12 criterion 17, first half (`docs/ANA-2.md:2131-2134`, MOD-4 plan D163): `prd`
 /// parked at its gate is promoted. The step keeps its id and its `prompt_digest`, gains
-/// `promoted_at`, and waits `awaiting_approval` under a parked run and item. No chat run is
+/// `promoted_at`, and waits `awaiting_approval` under a parked run (the item reads `needs you`).
+/// No chat run is
 /// minted, and the opening is a handoff — the fake's `claude` row does not resume (blueprint
 /// D192) — in the step's own tree.
 async fn promote_keeps_the_step_and_writes_no_chat_run<H: CaseHarness>(harness: &H) {
@@ -5837,10 +6037,7 @@ async fn promote_keeps_the_step_and_writes_no_chat_run<H: CaseHarness>(harness: 
         "the step's own prompt is never rewritten"
     );
     assert_eq!(run_of(&orch, run).await.status, RunStatus::AwaitingApproval);
-    assert_eq!(
-        item_of(&orch, ids::HTUI_FEAT_3).await.status,
-        Status::AwaitingApproval
-    );
+    assert_eq!(state_of(&orch, ids::HTUI_FEAT_3).await, ItemState::NeedsYou);
     let runs = orch
         .store()
         .runs(ids::HTUI_FEAT_3)
@@ -6067,10 +6264,7 @@ async fn promote_moves_a_dropped_running_step_to_awaiting<H: CaseHarness>(harnes
     assert_eq!(after.status, StepStatus::AwaitingApproval);
     assert!(after.promoted_at.is_some());
     assert_eq!(run_of(&orch, run).await.status, RunStatus::AwaitingApproval);
-    assert_eq!(
-        item_of(&orch, ids::HTUI_FEAT_3).await.status,
-        Status::AwaitingApproval
-    );
+    assert_eq!(state_of(&orch, ids::HTUI_FEAT_3).await, ItemState::NeedsYou);
 }
 
 /// `AcceptArtifact` on `step`, from a chat that has ended.
@@ -6424,7 +6618,7 @@ async fn unblock_opens_a_blocked_item_with_no_run<H: CaseHarness>(harness: &H) {
         matches!(
             refused,
             EngineError::NotBlocked {
-                status: Status::Open,
+                state: ItemState::Open,
                 ..
             }
         ),
@@ -6442,8 +6636,8 @@ async fn unblock_opens_a_blocked_item_with_no_run<H: CaseHarness>(harness: &H) {
 
 /// R-4 (MOD-4 plan D161 case 2, `docs/ANA-2.md:551`): the review loop escalates — the item
 /// `blocked`, the run parked over the rejected review — and no gate verb reaches the run. `Unblock`
-/// lets the item follow its run to `awaiting_approval`; the review is then promoted and approved,
-/// and the run finishes.
+/// moves the item back to `open`, where its parked run reads `needs you` (MOD-144); the review is
+/// then promoted and approved, and the run finishes.
 async fn unblock_lets_an_escalated_run_be_promoted_and_approved<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
     free_feat_3(&orch).await;
@@ -6494,8 +6688,13 @@ async fn unblock_lets_an_escalated_run_be_promoted_and_approved<H: CaseHarness>(
     assert_eq!((case, rest), (UnblockCase::FollowRun(run), None));
     assert_eq!(
         item_of(&orch, ids::HTUI_FEAT_3).await.status,
-        Status::AwaitingApproval,
-        "plan D161's `blocked -> awaiting_approval` edge"
+        Status::Open,
+        "MOD-144: FollowRun moves the item `blocked -> open`"
+    );
+    assert_eq!(
+        state_of(&orch, ids::HTUI_FEAT_3).await,
+        ItemState::NeedsYou,
+        "its parked run reads `needs you`"
     );
 
     let (step, _, _) = promote(&orch, run, review.id).await;
@@ -6516,7 +6715,7 @@ async fn unblock_lets_an_escalated_run_be_promoted_and_approved<H: CaseHarness>(
         RunStatus::Done,
         "the review was the last position"
     );
-    assert_eq!(item_of(&orch, ids::HTUI_FEAT_3).await.status, Status::Done);
+    assert_eq!(state_of(&orch, ids::HTUI_FEAT_3).await, ItemState::Done);
 }
 
 /// R-7 (MOD-4 plan D161 case 3): a refused reconcile parks the run over a `done` step, which
@@ -6540,10 +6739,7 @@ async fn unblock_resumes_a_reconcile_refused_park<H: CaseHarness>(harness: &H) {
     );
     let prd = step_at(&orch, run, 0, 1).await;
     assert_eq!(prd.status, StepStatus::Done);
-    assert_eq!(
-        item_of(&orch, ids::HTUI_FEAT_3).await.status,
-        Status::AwaitingApproval
-    );
+    assert_eq!(state_of(&orch, ids::HTUI_FEAT_3).await, ItemState::NeedsYou);
 
     let (case, rest) = unblock(&orch, ids::HTUI_FEAT_3).await;
     assert_eq!(case, UnblockCase::Resume(run));
@@ -6677,10 +6873,7 @@ async fn close_out_is_refused_while_a_run_is_live<H: CaseHarness>(harness: &H) {
         "{refused}"
     );
     assert!(summaries_of(&orch, ids::HTUI_FEAT_3).await.is_empty());
-    assert_eq!(
-        item_of(&orch, ids::HTUI_FEAT_3).await.status,
-        Status::AwaitingApproval
-    );
+    assert_eq!(state_of(&orch, ids::HTUI_FEAT_3).await, ItemState::NeedsYou);
 }
 
 // -- MOD-41 T9: the hand-back (plan D12, OQ-1, OQ-6) ---------------------------------------------
@@ -7074,10 +7267,7 @@ async fn a_resume_handed_back_is_walked_by_the_adopter<H: CaseHarness>(harness: 
     let (control, a) = (harness.fresh(), harness.fresh());
     let c_run = parked_over_a_refused_reconcile(&control).await;
     let run = parked_over_a_refused_reconcile(&a).await;
-    assert_eq!(
-        item_of(&a, ids::HTUI_FEAT_3).await.status,
-        Status::AwaitingApproval
-    );
+    assert_eq!(state_of(&a, ids::HTUI_FEAT_3).await, ItemState::NeedsYou);
 
     let b = Box::pin(hand_back_matches(
         (&control, c_run),
@@ -7094,7 +7284,8 @@ async fn a_resume_handed_back_is_walked_by_the_adopter<H: CaseHarness>(harness: 
 }
 
 /// `FEAT-3` parked at `prd`'s gate and rejected by a process that crashed before its unpark
-/// (MOD-37 R-31): `prd` is `failed` + `rejected`, the run and the item still `awaiting_approval`.
+/// (MOD-37 R-31): `prd` is `failed` + `rejected`, the run still `awaiting_approval` (the item
+/// reads `needs you`).
 async fn parked_over_a_crashed_rejection<O: Orchestrate>(orch: &O) -> RunId {
     let run = parked_at_prd(orch).await;
     let prd = step_at(orch, run, 0, 1).await;
@@ -7111,10 +7302,7 @@ async fn parked_over_a_crashed_rejection<O: Orchestrate>(orch: &O) -> RunId {
         "the rejection's first write landed and its unpark did not"
     );
     assert_eq!(run_of(orch, run).await.status, RunStatus::AwaitingApproval);
-    assert_eq!(
-        item_of(orch, ids::HTUI_FEAT_3).await.status,
-        Status::AwaitingApproval
-    );
+    assert_eq!(state_of(orch, ids::HTUI_FEAT_3).await, ItemState::NeedsYou);
     run
 }
 
@@ -7159,9 +7347,9 @@ async fn a_crashed_rejection_handed_back_is_failed_by_the_adopter<H: CaseHarness
         "the crashed rejection's row is kept"
     );
     assert_eq!(
-        item_of(&b, ids::HTUI_FEAT_3).await.status,
-        Status::Failed,
-        "plan D7: the item mirrors the run's `failed` after the unpark"
+        state_of(&b, ids::HTUI_FEAT_3).await,
+        ItemState::Failed,
+        "the item reads the run's `failed` after the unpark (MOD-144)"
     );
 }
 
@@ -7347,10 +7535,7 @@ async fn a_handed_back_run_on_a_changed_graph_parks_with_the_topology_note<H: Ca
         "{resumed:?}"
     );
     assert_eq!(run_of(&b, run).await.status, RunStatus::AwaitingApproval);
-    assert_eq!(
-        item_of(&b, ids::HTUI_FEAT_3).await.status,
-        Status::AwaitingApproval
-    );
+    assert_eq!(state_of(&b, ids::HTUI_FEAT_3).await, ItemState::NeedsYou);
     let notes = notes_of(&b, ids::HTUI_FEAT_3).await;
     assert_eq!(
         notes
@@ -7968,7 +8153,7 @@ async fn auto_mode_skips_soft_gates<H: CaseHarness>(harness: &H) {
             .collect::<Vec<_>>(),
         "`never` passes each step `running -> done` with `gate_outcome = 'skipped'`"
     );
-    assert_eq!(item_of(&orch, ids::HTUI_FEAT_3).await.status, Status::Done);
+    assert_eq!(state_of(&orch, ids::HTUI_FEAT_3).await, ItemState::Done);
 }
 
 /// ANA-2 §12 criterion 23, second half (MOD-12 D10): an auto run still parks at every hard gate,
@@ -8649,8 +8834,9 @@ async fn a_tampered_v2_snapshot_parks_with_both_digests<H: CaseHarness>(harness:
         "the lease `resume` took is given back"
     );
     assert_eq!(
-        item_of(&orch, ids::HTUI_FEAT_3).await.status,
-        Status::AwaitingApproval
+        state_of(&orch, ids::HTUI_FEAT_3).await,
+        ItemState::NeedsYou,
+        "the item reads its parked run (MOD-144)"
     );
     assert_eq!(
         step_shape(&orch, run).await,
@@ -8760,8 +8946,9 @@ async fn a_v1_run_on_a_refused_graph_whose_phases_changed_parks<H: CaseHarness>(
         (RunStatus::AwaitingApproval, Some(1))
     );
     assert_eq!(
-        item_of(&orch, ids::HTUI_FEAT_3).await.status,
-        Status::AwaitingApproval
+        state_of(&orch, ids::HTUI_FEAT_3).await,
+        ItemState::NeedsYou,
+        "the item reads its parked run (MOD-144)"
     );
     assert_eq!(
         step_shape(&orch, run).await,
@@ -8805,8 +8992,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            115,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            118,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1 + 6 + 3: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -8846,7 +9033,8 @@ mod tests {
              (a malformed cap key refused at start), and MOD-138 M1's six pinned-resume cases \
              (plan D5: a v2 run walking on after a live edit on the three resume paths, a \
              tampered v2 snapshot parked; blueprint A6: a v1 run on a refused live graph \
-             walking on, and parked once its phases moved)"
+             walking on, and parked once its phases moved), and MOD-144's three (a queued cancel \
+             writing no item, a stopped run holding its item, a rework run on a finished item)"
         );
     }
 
@@ -8893,8 +9081,8 @@ mod fanout_paths {
     use crate::engine::Resume;
     use crate::isolate::Clock as _;
 
-    /// A crash's leftover run: `awaiting_approval -> running` and the item back to `in_progress`,
-    /// by hand, so `resume` walks rows no command answered.
+    /// A crash's leftover run: `awaiting_approval -> running`, by hand, so `resume` walks rows no
+    /// command answered.
     async fn unpark_by_hand(orch: &FakeOrchestrator, run: htui_core::model::RunId) {
         let now = orch.clock().now();
         assert!(
@@ -8903,17 +9091,6 @@ mod fanout_paths {
                 .await
                 .expect("MemStore takes the move"),
             "the run was parked"
-        );
-        let item = run_of(orch, run)
-            .await
-            .item_id
-            .expect("the run has an item");
-        assert!(
-            orch.store()
-                .transition(item, Status::AwaitingApproval, Status::InProgress)
-                .await
-                .expect("MemStore takes the move"),
-            "the item was parked"
         );
     }
 
@@ -9873,7 +10050,7 @@ mod fanout_paths {
         assert_ne!(
             item_of(&orch, ids::HTUI_ANA_2).await.status,
             Status::Blocked,
-            "`block = false`: the item mirrors `failed`"
+            "`block = false`: the item reads its `failed` run"
         );
     }
 

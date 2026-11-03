@@ -5,7 +5,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::model::ids::{ItemId, ProjectId, StepId};
-use crate::model::item::Status;
+use crate::model::item::{ItemState, Status};
+use crate::model::run::RunStatus;
 
 str_enum!(
     /// `item_link.kind` (§5.5): the edge is read `from --kind--> to`, so `blocked_by` means
@@ -84,6 +85,18 @@ pub struct LinkNode {
     pub status: Status,
     /// Hops from the root; the root itself is `0`.
     pub depth: u8,
+    /// MOD-144: the status of the item's latest non-cancelled graph run; `None` without one.
+    /// Appended, never inserted.
+    #[serde(default)]
+    pub latest_run_status: Option<RunStatus>,
+}
+
+impl LinkNode {
+    /// The item's derived display state (MOD-144).
+    #[must_use]
+    pub const fn state(&self) -> ItemState {
+        ItemState::of(self.status, self.latest_run_status)
+    }
 }
 
 /// One live edge inside a traversal. Not a table.
@@ -132,7 +145,7 @@ pub struct UpstreamEntry {
     pub qualified_key: String,
     /// `item.title`, raw; the render collapses its whitespace and truncates it.
     pub title: String,
-    /// `item.status`, one of the eight `R-ENT-8` strings.
+    /// `item.status`, the stored status (MOD-144: `open`, `blocked` or `closed`).
     pub status: Status,
     /// Hops from the step's item, `1` or `2`, minimised over every path (the diamond dedup).
     pub depth: u8,
@@ -140,9 +153,19 @@ pub struct UpstreamEntry {
     pub in_scope: bool,
     /// The latest `document.kind = 'summary'` body, `Some` only when the item is in scope.
     pub summary: Option<String>,
+    /// MOD-144: the status of the item's latest non-cancelled graph run; `None` without one.
+    /// Appended, never inserted.
+    #[serde(default)]
+    pub latest_run_status: Option<RunStatus>,
 }
 
 impl UpstreamEntry {
+    /// The item's derived display state (MOD-144): what the prompt's upstream section prints.
+    #[must_use]
+    pub const fn state(&self) -> ItemState {
+        ItemState::of(self.status, self.latest_run_status)
+    }
+
     /// `docs/ANA-5.md` §4.7 rule 2: sort by `(depth, qualified_key bytes, item_id)`.
     ///
     /// `str`'s `Ord` is byte order in Rust, which is the point: Postgres orders text by the
@@ -184,10 +207,11 @@ mod tests {
             item_id: ItemId::from_uuid(Uuid::from_u128(id)),
             qualified_key: key.to_owned(),
             title: format!("{key} title"),
-            status: Status::Done,
+            status: Status::Open,
             depth,
             in_scope: true,
             summary: Some(format!("{key} summary")),
+            latest_run_status: Some(RunStatus::Done),
         }
     }
 

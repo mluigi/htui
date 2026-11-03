@@ -50,6 +50,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::model::ItemState;
 use crate::model::link::{ItemLink, LinkKind, ProposeLink, WithdrawLink};
 use crate::model::skill::validate_name;
 use crate::model::skill_glob::{SkillGlob, canonical_globs};
@@ -303,9 +304,9 @@ pub trait ReadStore: Send + Sync {
     // ---- MOD-69: the waiting-on-you list (ANA-27 §5.1 T8) ------------------------------------
 
     /// The scope's candidates for the waiting-on-you list (MOD-69 plan D2): every item of a scope
-    /// project that is `blocked` or `awaiting_approval`, **or** owns a run at `awaiting_approval`
-    /// (parks move the item only from `in_progress`, so run status is the anchor), each with its
-    /// active runs (`queued | running | awaiting_approval`) and each such run's steps. A finished
+    /// project that is `blocked`, **or** owns a run at `awaiting_approval` (MOD-144: a park never
+    /// moves the item, so run status is the anchor), each with its live runs (`queued | running |
+    /// awaiting_approval | stopped`) and each such run's steps. A finished
     /// run of a candidate is not carried; a chat run (no item) never is. In
     /// [`WaitingCandidate::sort_canonical`](crate::model::WaitingCandidate::sort_canonical) order.
     /// Empty for an empty scope.
@@ -363,14 +364,36 @@ pub trait WriteStore: ReadStore {
         expected_version: i32,
         patch: ItemPatch,
     ) -> Result<UpdateOutcome>;
-    /// Compare-and-set status move; never bumps `version`, never writes a revision (§4.2).
+    /// Compare-and-set status move; never bumps `version`, never writes a revision (§4.2), never
+    /// touches `closed_at` (MOD-144: only close-out sets it).
     ///
-    /// An illegal `(from, to)` is [`StoreError::Constraint`](crate::store::StoreError::Constraint)
-    /// without an update ([`legal_move`], ANA-2 §4.3); a missing row is
+    /// `open ↔ blocked` only (MOD-144, ANA-35 §7.1). An illegal `(from, to)` is
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) without an update
+    /// ([`legal_move`]); a missing row is
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) first (plan D14). A stale
     /// `from` on a legal pair is still `Ok(false)`. `to = closed` is refused from every status
     /// (MOD-38 PRD D1); use [`close_out`](WriteStore::close_out).
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool>;
+
+    /// A refusal at `StartRun` written to an item no run holds (MOD-144 R1, MOD-7 D98): under the
+    /// lock of `note.item_id` (`FOR UPDATE` on Pg, the write lock on Mem), the item's live graph
+    /// runs are read **after** the lock is taken. A live graph run → `Ok(false)` and nothing
+    /// written (D98: a refused item writes no note; the run holds it). Otherwise the note is
+    /// written and an `open` item moves to `blocked`, `Ok(true)`; an item another writer already
+    /// moved (`blocked`, `closed`) keeps its status and still gets the note (invariant 7).
+    ///
+    /// The engine's rung 4 and missing-tags refusals use it instead of
+    /// [`transition`](Self::transition) and [`add_note`](Self::add_note): their `startable` read
+    /// takes no lock, and `create_run` no longer writes the item, so a plain compare-and-set could
+    /// block an item whose run another box created in between. A single `UPDATE ... WHERE NOT
+    /// EXISTS (live run)` is not enough on Postgres (no re-check after the row-lock wait); the lock
+    /// comes first.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown item;
+    /// [`add_note`](Self::add_note)'s
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint)s, with nothing written.
+    async fn block_if_idle(&self, note: NewNote) -> Result<bool>;
 
     /// Appends session events under `fence`, skipping any `(run_step_id, seq)` already stored, and
     /// answers how many rows were actually inserted (`docs/ANA-4.md` §4.1, `docs/ANA-9.md` §4.3,
@@ -1408,13 +1431,16 @@ pub trait WriteStore: ReadStore {
     // that stamps a clock takes the instant from the caller (blueprint F-S); `updated_at` stays
     // the trigger's and is never set by hand.
 
-    /// Inserts a `kind = 'graph'` run at `queued` with its snapshot and moves the item to
-    /// `queued` under the §4.3 law, in one transaction (plan D6).
+    /// Inserts a `kind = 'graph'` run at `queued` with its snapshot, in one transaction (plan
+    /// D6). **Writes nothing to the item** (MOD-144: it reads `queued` from the run). Refused
+    /// unless the item is `open` with no live graph run ([`startable`]), checked under the item
+    /// lock; `uq_run_item_live` backs it in Postgres.
     ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "item" }`;
-    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when the item's status
-    /// cannot move to `queued` (only `open` and `failed` can), when the item is not in
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when [`startable`]
+    /// refuses (the item is `blocked` or `closed`, or a graph run of it is `queued | running |
+    /// awaiting_approval | stopped`), when the item is not in
     /// `new.project_id` ([`item_not_in_project`] — the run is filed under that id and
     /// [`delete_project`](WriteStore::delete_project) counts by it), when `id` already exists, or
     /// on any foreign key. For `new.batch_id` (MOD-12 D7): `NotFound { entity: "queue_batch" }`
@@ -1446,10 +1472,11 @@ pub trait WriteStore: ReadStore {
     ///
     /// On [`Claim::Admitted`] the run moves `queued -> running` with `executing_box_id = box_id`,
     /// `started_at = at`, `lease_box_id = box_id`, `lease_owner = owner`, and `lease_expires_at`
-    /// the **store's** clock plus `ttl` (MOD-40 plan D10: Postgres's `clock_timestamp()`), and the
-    /// item `queued -> in_progress`. On [`Claim::MissingTags`] the run moves `queued -> failed`
+    /// the **store's** clock plus `ttl` (MOD-40 plan D10: Postgres's `clock_timestamp()`); the
+    /// item is not written (MOD-144). On [`Claim::MissingTags`] the run moves `queued -> failed`
     /// with `failure` = [`missing_tags_failure`](crate::model::missing_tags_failure) of the list
-    /// and `finished_at = at`, and its item `queued -> blocked`, in the same transaction;
+    /// and `finished_at = at`, and its item `open -> blocked` when it is `open`, in the same
+    /// transaction;
     /// `executing_box_id`, `started_at` and the lease stay unset, so no slot is taken. Every other
     /// answer writes nothing, [`Claim::WorkspaceStopped`] included.
     ///
@@ -1806,10 +1833,10 @@ pub trait WriteStore: ReadStore {
     /// unknown `produced_by_step_id` / `created_by`.
     async fn write_document(&self, new: NewDocument) -> Result<Document>;
 
-    /// §4.8's promotion, one transaction: the step
+    /// §4.8's promotion, one transaction over the step and its run: the step
     /// `failed | awaiting_approval -> awaiting_approval` with `promoted_at = at`; its run
-    /// `running -> awaiting_approval` (already `awaiting_approval` is fine); its item
-    /// `in_progress -> awaiting_approval` (already `awaiting_approval` is fine).
+    /// `running -> awaiting_approval` (already `awaiting_approval` is fine). The item is not
+    /// written (MOD-144: it reads `needs you` from the run).
     ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`;
@@ -1843,9 +1870,8 @@ pub trait WriteStore: ReadStore {
     ) -> Result<bool>;
 
     /// MOD-37 R-5, ANA-2 §4.2's park, one transaction and [`promote_step`](Self::promote_step)'s
-    /// shape: the step and its run `running -> awaiting_approval`, its item
-    /// `in_progress -> awaiting_approval`. An item at any other status is left alone and the answer
-    /// is still [`ParkOutcome::Parked`] (plan D17); a chat run has no item. No instant moves:
+    /// shape: the step and its run `running -> awaiting_approval`. The item is not written
+    /// (MOD-144: it reads `needs you` from the run, or stays `blocked`). No instant moves:
     /// `running -> awaiting_approval` stamps nothing, and `updated_at` is the store's.
     ///
     /// Decided before the first write, in this order: the step exists, its run carries `fence`'s
@@ -1866,23 +1892,12 @@ pub trait WriteStore: ReadStore {
     /// terminal.
     async fn fail_run(&self, run: RunId, failure: &str, at: DateTime<Utc>) -> Result<()>;
 
-    /// Ends a graph run and mirrors the item in the same transaction (ANA-2 §4.3 verdict 3 and
-    /// the propagation rule at `:660-664`; milestone 2 plan D7, blueprint R-1 option (b)).
+    /// Ends a graph run (ANA-2 §4.3 verdict 3; milestone 2 plan D7). The item is not written
+    /// (MOD-144: its state derives from the run, ANA-35 §7.1).
     ///
     /// `to` must be terminal (`done`, `failed`, `cancelled`). The run moves `<current> -> to`
     /// under [`legal_move`], `finished_at = COALESCE(finished_at, at)`, and `failure` is written
-    /// when `to = failed`. Then, **only when no other run of the item is non-terminal**, the item
-    /// moves:
-    ///
-    /// | `to`        | item, from -> to                                                 |
-    /// |-------------|------------------------------------------------------------------|
-    /// | `done`      | `in_progress -> done`                                            |
-    /// | `failed`    | `in_progress -> failed`, `awaiting_approval -> failed`            |
-    /// | `cancelled` | `queued -> open`, `in_progress -> open`, `awaiting_approval -> open` |
-    ///
-    /// An item at any other status is left alone (plan D17: the row may not have passed through
-    /// `can_move_to`), and an item that still has a live run is held where it is — the second leg
-    /// of the conformance case. A chat run (`item_id IS NULL`) moves only the run.
+    /// when `to = failed`.
     ///
     /// [`transition_run`](WriteStore::transition_run) and [`fail_run`](WriteStore::fail_run) are
     /// unchanged and remain the run-only writers the chat path uses.
@@ -1903,11 +1918,12 @@ pub trait WriteStore: ReadStore {
 
     /// `R-TUI-9`'s three effects, one transaction (plan D6): the summary document at its next
     /// version, the commits upserted, and the item set to `closed` with `resolution` and
-    /// `closed_at`. Close-out is the **only** way into `closed` (MOD-38 PRD D1; it amends ANA-2
-    /// §4.3); its law is [`Resolution::closes_from`], not [`legal_move`], so an `open` item closes
-    /// as one of the four non-success resolutions (ANA-11 §4.2). Refused while any run of the item
-    /// is active. Guard order: NotFound, live run, summary kind, summary item, `closes_from`,
-    /// commit steps.
+    /// `closed_at`. Close-out is the **only** way into `closed` and the only writer of
+    /// `closed_at` (MOD-38 PRD D1, MOD-144); its law is [`Resolution::closes_from`]`(status,
+    /// finished)`, not [`legal_move`]: `finished` is the item's latest non-cancelled graph run
+    /// being `done` (ANA-35 §7.1, PD18). Refused while any run of the item is `queued | running |
+    /// awaiting_approval | stopped`. Guard order: NotFound, live run, summary kind, summary item,
+    /// `closes_from`, commit steps.
     ///
     /// # Errors
     /// Its own refusals, plus - because it performs their work - every refusal of
@@ -1916,9 +1932,10 @@ pub trait WriteStore: ReadStore {
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "item" }`, or
     /// `{ entity: "run_step" }` for a commit row naming a step that does not exist;
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when a run of the item is
-    /// `queued | running | awaiting_approval`, when `summary.kind != "summary"`, when
-    /// `summary.item_id != item`, when `!resolution.closes_from(status)`
-    /// ([`resolution_not_closable`]), when a commit row names an unknown repo, or when the summary
+    /// `queued | running | awaiting_approval | stopped`, when `summary.kind != "summary"`, when
+    /// `summary.item_id != item`, when `!resolution.closes_from(status, finished)`
+    /// ([`resolution_not_closable`], naming the item's [`ItemState`]), when a commit row names an
+    /// unknown repo, or when the summary
     /// duplicates a document id or names an unknown `created_by` / `produced_by_step_id`. Any
     /// refusal writes nothing: every one of these is decided before the first write.
     async fn close_out(
@@ -2553,6 +2570,47 @@ pub fn legal_move<T: TransitionLaw>(from: T, to: T) -> Result<()> {
     }
 }
 
+/// MOD-144 Δ2: a live graph run (`RunStatus::is_active`), the set `uq_run_item_live` indexes.
+pub const LIVE_RUN_STATUSES: [RunStatus; 4] = [
+    RunStatus::Queued,
+    RunStatus::Running,
+    RunStatus::AwaitingApproval,
+    RunStatus::Stopped,
+];
+
+/// MOD-144 Δ8: `create_run`'s check under the item lock, shared with `start_enabled` and
+/// `enqueue_with`: an `open` item with no live graph run. `item` names the item in the refusal
+/// (its key); `live` is the newest live graph run's status.
+///
+/// # Errors
+/// [`StoreError::Constraint`](crate::store::StoreError::Constraint) with [`not_startable`]'s
+/// sentence over `ItemState::of(status, live)`, e.g. `` item HTUI-1 is `running`: a live run
+/// holds it ``.
+pub fn startable(
+    item: impl std::fmt::Display,
+    status: Status,
+    live: Option<RunStatus>,
+) -> Result<()> {
+    if matches!(status, Status::Open) && live.is_none() {
+        return Ok(());
+    }
+    Err(crate::store::StoreError::Constraint(not_startable(
+        item,
+        ItemState::of(status, live),
+    )))
+}
+
+/// MOD-144: [`startable`]'s refusal, naming the item's derived state by its word (the item's
+/// stored status is only `open`, `blocked` or `closed`; the state is the run's).
+#[must_use]
+pub fn not_startable(item: impl std::fmt::Display, state: ItemState) -> String {
+    match state {
+        ItemState::Closed => format!("item {item} is `closed`"),
+        ItemState::Blocked => format!("item {item} is `blocked`: unblock it first"),
+        state => format!("item {item} is `{}`: a live run holds it", state.word()),
+    }
+}
+
 /// The refusal text of an illegal move, one sentence for the three tables.
 #[must_use]
 pub fn illegal_move(
@@ -3184,10 +3242,14 @@ pub fn workspace_graph_is_held(graph: &str, holder: &str, project: &str) -> Stri
 
 // ---- MOD-38: ANA-11's refusals ----
 
-/// ANA-11 §4.2: the close-out law refuses this pair (T3).
+/// ANA-11 §4.2 under ANA-35 §7.1's law: close-out refuses this resolution for an item in this
+/// derived state (MOD-144 PD8: the state, not the stored status, says why).
 #[must_use]
-pub fn resolution_not_closable(item: ItemId, status: Status, resolution: Resolution) -> String {
-    format!("item {item} is `{status}`; it cannot close as `{resolution}` (ANA-11 §4.2)")
+pub fn resolution_not_closable(item: ItemId, state: ItemState, resolution: Resolution) -> String {
+    format!(
+        "item {item} is `{}`; it cannot close as `{resolution}` (ANA-11 §4.2)",
+        state.word()
+    )
 }
 
 /// Plan D10: a withdrawn requirement is not amended or withdrawn again (T6).
@@ -3364,29 +3426,6 @@ pub fn run_is_terminal(run: RunId, status: RunStatus) -> String {
     format!("run {run} is terminal (`{status}`)")
 }
 
-/// M2 D7: where [`finish_run`](WriteStore::finish_run) takes the item, or `None` to leave it.
-///
-/// ANA-2 §4.3's verdict table, as one function rather than one per backend: `MemStore` matches on
-/// it and `PgStore` binds its answer, so the mapping cannot be spelled two ways the way the refusal
-/// sentences could before they were named. `to` is the run's terminal status and `item` the item's
-/// *current* one; the caller has already established that no other run of the item is active.
-///
-/// `None` is "leave it alone", which is plan D17 rather than an omission: MOD-2's chat path, and
-/// before MOD-25 the offline upload path, insert `run` and `item` rows outside §4.3, so an item at
-/// a status this table does not list has not necessarily passed through [`Status::can_move_to`]
-/// and must not be forced through the law on its way out.
-#[must_use]
-pub const fn finish_run_item_mirror(to: RunStatus, item: Status) -> Option<Status> {
-    match (to, item) {
-        (RunStatus::Done, Status::InProgress) => Some(Status::Done),
-        (RunStatus::Failed, Status::InProgress | Status::AwaitingApproval) => Some(Status::Failed),
-        (RunStatus::Cancelled, Status::Queued | Status::InProgress | Status::AwaitingApproval) => {
-            Some(Status::Open)
-        }
-        _ => None,
-    }
-}
-
 /// M2 D7: [`finish_run`](WriteStore::finish_run) was asked to leave a run non-terminal.
 ///
 /// It is a separate sentence from [`illegal_move`] on purpose: `running -> awaiting_approval` is a
@@ -3508,7 +3547,7 @@ impl StepFence {
 /// What [`WriteStore::park_step`] found (MOD-37 R-5). A refusal writes nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParkOutcome {
-    /// The step and its run are `awaiting_approval`, and its item too when it was `in_progress`.
+    /// The step and its run are `awaiting_approval` (MOD-144: the item is not written).
     Parked,
     /// The step was not `running`: another writer moved it first.
     StepMoved,
@@ -3755,4 +3794,55 @@ pub fn queue_token_refusal(
         _ => return None,
     };
     Some(format!("`{key}` on {kind} needs {needs}: {why}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LIVE_RUN_STATUSES, not_startable, startable};
+    use crate::model::{ItemState, RunStatus, Status};
+    use crate::store::StoreError;
+
+    /// MOD-144 Δ8: only an `open` item with no live graph run may start; every refusal names the
+    /// item and its derived state by its word, never a stored `item.status`.
+    #[test]
+    fn startable_admits_only_an_open_item_with_no_live_run() {
+        assert!(startable("HTUI-1", Status::Open, None).is_ok());
+        assert_eq!(
+            LIVE_RUN_STATUSES.to_vec(),
+            RunStatus::ALL
+                .iter()
+                .copied()
+                .filter(|status| status.is_active())
+                .collect::<Vec<_>>(),
+            "the live set is `is_active`"
+        );
+        let refusal =
+            |status: Status, live: Option<RunStatus>| match startable("HTUI-1", status, live) {
+                Err(StoreError::Constraint(sentence)) => sentence,
+                other => {
+                    panic!("({status}, {live:?}) must be refused as Constraint, got {other:?}")
+                }
+            };
+        for live in LIVE_RUN_STATUSES {
+            assert_eq!(
+                refusal(Status::Open, Some(live)),
+                not_startable("HTUI-1", ItemState::of(Status::Open, Some(live)))
+            );
+        }
+        assert_eq!(
+            refusal(Status::Open, Some(RunStatus::Running)),
+            "item HTUI-1 is `running`: a live run holds it"
+        );
+        assert_eq!(
+            refusal(Status::Open, Some(RunStatus::AwaitingApproval)),
+            "item HTUI-1 is `needs you`: a live run holds it"
+        );
+        for live in core::iter::once(None).chain(LIVE_RUN_STATUSES.map(Some)) {
+            assert_eq!(
+                refusal(Status::Blocked, live),
+                "item HTUI-1 is `blocked`: unblock it first"
+            );
+            assert_eq!(refusal(Status::Closed, live), "item HTUI-1 is `closed`");
+        }
+    }
 }

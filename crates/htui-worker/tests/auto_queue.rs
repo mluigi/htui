@@ -959,7 +959,11 @@ async fn a_drained_batch_closes_drained() {
         .finish_run(run.id, RunStatus::Cancelled, None, Utc::now())
         .await
         .expect("a parked run cancels");
-    assert_eq!(h.status(item).await, Status::Open, "cancel moves it back");
+    assert_eq!(
+        h.status(item).await,
+        Status::Open,
+        "a run never moves the item"
+    );
     // VERIFY (blueprint §C.4 f): `transition(.., Closed)` is refused from every status (MOD-38
     // PRD D1); close-out is the only way in, and an `open` item closes `withdrawn`.
     h.store
@@ -1308,9 +1312,9 @@ async fn a_rested_walk_wakes_the_sweep() {
     );
 }
 
-/// (l) Review H1: a cancelled auto run sticks for the rest of its batch. The cancel moves the
-/// item back to `open` and its entry stays, but the queue runner does not admit it again under
-/// the batch that ran it; a pause and a resume (a new batch) do.
+/// (l) Review H1: a cancelled auto run sticks for the rest of its batch. The cancel leaves the
+/// item `open` with no other run, so ready again, and its entry stays, but the queue runner does
+/// not admit it again under the batch that ran it; a pause and a resume (a new batch) do.
 #[tokio::test]
 async fn a_cancelled_auto_run_is_not_readmitted_in_its_batch() {
     let h = Harness::open().await;
@@ -1338,7 +1342,11 @@ async fn a_cancelled_auto_run_is_not_readmitted_in_its_batch() {
         (run.id, RunStatus::Cancelled),
         "the cancel sticks: no second run under the batch"
     );
-    assert_eq!(h.status(item).await, Status::Open, "cancel moves it back");
+    assert_eq!(
+        h.status(item).await,
+        Status::Open,
+        "a run never moves the item"
+    );
     assert_eq!(
         h.store
             .queue_entries(ids::BOX)
@@ -1384,7 +1392,7 @@ async fn a_cancelled_auto_run_is_not_readmitted_in_its_batch() {
 
 /// (m) Review H2, criterion 27: a pause stops the closed batch's runs still waiting to be
 /// claimed. Two runs are admitted; the second overlaps the first and waits `queued`. The pause
-/// cancels it (its item back to `open`, its entry kept), so when the first run ends nothing of
+/// cancels it (its item still `open`, its entry kept), so when the first run ends nothing of
 /// the paused batch starts; a resume admits the item again.
 #[tokio::test]
 async fn pausing_cancels_the_batch_runs_still_waiting() {
@@ -1759,7 +1767,7 @@ async fn a_stalled_batch_closes_and_a_later_queue_waits_for_resume() {
 }
 
 /// M3 (b) D4: a parked auto run is live, so the batch it parks in stays open even though its
-/// item (`awaiting_approval`) is not ready and nothing else is queued.
+/// item (`open`, its run parks it at *needs you*) is not ready and nothing else is queued.
 #[tokio::test]
 async fn a_parked_auto_run_keeps_a_stalled_batch_open() {
     let h = Harness::open().await;
@@ -1770,7 +1778,15 @@ async fn a_parked_auto_run_keeps_a_stalled_batch_open() {
     h.sweep(&mut runtime).await;
     let run = h.only_run(a).await;
     assert_eq!(run.status, RunStatus::AwaitingApproval, "parked at verdict");
-    assert_eq!(h.status(a).await, Status::AwaitingApproval, "so not ready");
+    let runs = h.runs(a).await;
+    assert_eq!(
+        htui_core::model::ItemState::of(
+            h.status(a).await,
+            htui_core::model::latest_graph_run(&runs).map(|run| run.status)
+        ),
+        htui_core::model::ItemState::NeedsYou,
+        "its run parks it (*needs you*), so not ready"
+    );
 
     h.sweep(&mut runtime).await;
     assert_eq!(

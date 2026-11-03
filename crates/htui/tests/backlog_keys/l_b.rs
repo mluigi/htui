@@ -454,7 +454,15 @@ async fn enter_replays_the_step_and_misses_without_one() {
         harness.key("j");
         harness.settle().await;
     }
+    // MOD-144: the pane opens on the demo's stepless rework run `RUN_4`; `J` steps past it onto
+    // `RUN_1`'s `prd`.
     harness.key("J");
+    harness.drive().await;
+    let frame = harness.render();
+    assert!(
+        cursor_row(&frame).contains("prd"),
+        "`J` steps past the stepless RUN_4 onto FEAT-1's first step:\n{frame}"
+    );
     harness.key("enter");
     harness.drive().await;
     assert_eq!(
@@ -505,10 +513,14 @@ async fn a_rebound_next_step_moves_the_cursor_and_j_capital_is_inert() {
     harness.render();
     harness.key("ctrl-right");
     harness.drive().await;
+    // MOD-144: the pane opens on the demo's stepless rework run `RUN_4`; the rebound `n` steps to
+    // `RUN_1`'s `prd`.
+    harness.key("n");
+    harness.drive().await;
     let frame = harness.render();
     assert!(
         cursor_row(&frame).contains("prd"),
-        "the cursor starts on FEAT-1's first step:\n{frame}"
+        "`n` steps onto FEAT-1's walk, its first step:\n{frame}"
     );
     assert!(
         hint_row(&frame).starts_with("n/K step · Enter replay · v flow · ? keys"),
