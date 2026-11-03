@@ -41,7 +41,6 @@
 //!   The read goes through the store's writer, as the form's does, so it is never the mirror's
 //!   (round 1): offline it fails, and a failed check says it could not check.
 
-use std::cell::Cell;
 use std::collections::BTreeSet;
 
 use htui_core::model::hand_written::SUMMARY_KIND;
@@ -60,14 +59,13 @@ use crate::ui::Theme;
 use crate::ui::cells;
 use crate::ui::kit::chips::key_line;
 use crate::ui::kit::list::{self, Row, RowKind};
-use crate::ui::kit::pane::Focus;
 use crate::ui::kit::scroll::{Scroll, Step};
 use crate::ui::kit::text::{Tone, notice, wrapped};
 use crate::ui::tabs::backlog::detail::compose::{
     self, Compose, ComposeOutcome, could_not_check, may_have_landed, not_written,
 };
 use crate::ui::tabs::backlog::detail::{
-    CHOOSE_UNBOUND, DetailId, DetailTab, empty_state, no_item, writes_one,
+    CHOOSE_UNBOUND, DetailId, DetailTab, Framing, Told, empty_state, no_item, writes_one,
 };
 use crossterm::event::KeyEvent;
 
@@ -166,9 +164,10 @@ pub struct DocumentsTab {
     compose: Option<Compose>,
     /// D5: the last save's sentence, under the table until the next key.
     notice: Option<String>,
-    /// How the detail pane is drawn this frame (`DetailTab::frame_focus`, MOD-115 M4 RV2-L1): what
-    /// the compose rule is drawn as. `Cell` because `render` is `&self`.
-    pane_focus: Cell<Option<Focus>>,
+    /// How the detail pane and the list beside it are drawn this frame (`DetailTab::framing`,
+    /// MOD-115 M4 RV2-L1; RV, repair 2): what the no-item and failed-read steps read, and what
+    /// the compose rule is drawn as.
+    told: Told,
 }
 
 impl DocumentsTab {
@@ -657,8 +656,8 @@ impl DetailTab for DocumentsTab {
         key_line(hint, theme)
     }
 
-    fn frame_focus(&self, focus: Focus) {
-        self.pane_focus.set(Some(focus));
+    fn framing(&self, framing: Framing) {
+        self.told.set(framing);
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
@@ -671,14 +670,21 @@ impl DetailTab for DocumentsTab {
                 compose,
                 &title,
                 Some(&kinds),
-                self.pane_focus.get(),
+                self.told.focus(),
                 ctx,
             );
             ctx.claim_editor_area(body);
             return;
         }
         if self.item.is_none() {
-            no_item(frame, area, views::BACKLOG_DOCS, CHOOSE_UNBOUND, ctx);
+            no_item(
+                frame,
+                area,
+                views::BACKLOG_DOCS,
+                CHOOSE_UNBOUND,
+                self.told.list(),
+                ctx,
+            );
             return;
         }
         // D5's sentence under the table, the kit's notice row; with none the table keeps the

@@ -632,7 +632,7 @@ impl Compose {
 /// covers the tab; a document's rows are a kit form ([`Compose::form`]), the focus its gutter in
 /// the tab's accent (`ctx.accent()`); the notice is the kit's notice row in the error role.
 ///
-/// `focus` is how the detail pane around the area is drawn this frame (`DetailTab::frame_focus`,
+/// `focus` is how the detail pane around the area is drawn this frame (`DetailTab::framing`,
 /// MOD-115 M4 RV2-L1), so the rule and its pane agree; `None` (a pane drawn outside
 /// `detail::render`) is the keyboard holder's ([`holder`]).
 ///

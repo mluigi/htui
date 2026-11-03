@@ -1964,6 +1964,11 @@ async fn a_filter_nothing_matches_says_so() {
     keys(&mut harness, &["enter"]).await;
     let frame = harness.render();
     assert!(frame.contains("No items match the filter."), "{frame}");
+    // MOD-115 M4 RV, repair 2: no item row is there for the list's motion to choose, so the
+    // detail's no-item state names none; the list's own step clears the filter.
+    assert!(frame.contains("No item selected."), "{frame}");
+    assert!(frame.contains("a chosen item shows here"), "{frame}");
+    assert!(!frame.contains("chooses one"), "{frame}");
     insta::assert_snapshot!("filter_no_match", frame);
 }
 

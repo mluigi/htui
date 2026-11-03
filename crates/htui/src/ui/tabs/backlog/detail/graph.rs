@@ -32,7 +32,7 @@ use crate::ui::kit::list::{self, Row, RowKind};
 use crate::ui::kit::scroll::{PAGE, Step, window};
 use crate::ui::kit::status;
 use crate::ui::tabs::backlog::detail::{
-    CHOOSE_UNBOUND, DetailId, DetailTab, message, no_item, unavailable,
+    CHOOSE_UNBOUND, DetailId, DetailTab, Framing, Told, message, no_item, unavailable,
 };
 use crossterm::event::KeyEvent;
 
@@ -158,6 +158,9 @@ pub struct GraphTab {
     cursor: usize,
     /// View depth, `1..=MAX_HOPS`. A preference: survives `on_item_change` (D2).
     depth: u8,
+    /// How the detail pane and the list beside it are drawn this frame (`DetailTab::framing`,
+    /// MOD-115 M4 RV2-L1; RV, repair 2): what the no-item and failed-read steps read.
+    told: Told,
 }
 
 impl GraphTab {
@@ -177,6 +180,7 @@ impl GraphTab {
             failed: None,
             cursor: 0,
             depth: DEFAULT_DEPTH,
+            told: Told::new(),
         }
     }
 
@@ -766,9 +770,20 @@ impl DetailTab for GraphTab {
         }
     }
 
+    fn framing(&self, framing: Framing) {
+        self.told.set(framing);
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         if self.item.is_none() {
-            no_item(frame, area, self.key_stack(), CHOOSE_UNBOUND, ctx);
+            no_item(
+                frame,
+                area,
+                self.key_stack(),
+                CHOOSE_UNBOUND,
+                self.told.list(),
+                ctx,
+            );
             return;
         }
         if self.graph.is_none() {
@@ -778,6 +793,7 @@ impl DetailTab for GraphTab {
                     area,
                     &format!("Links unavailable: {why}"),
                     self.key_stack(),
+                    self.told.list(),
                     ctx,
                 ),
                 None => message(frame, area, "Loading links\u{2026}", ctx.theme),

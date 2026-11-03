@@ -175,6 +175,37 @@ async fn the_no_item_step_works_with_the_detail_focused() {
     );
 }
 
+/// MOD-115 M4 RV, repair 2: with the filter form open on a project header, `j`/`k` move the
+/// form's rows, not the list's cursor, so the no-item step names the form's way out first; once
+/// it is closed, `j/k` choose an item again.
+#[tokio::test]
+async fn the_no_item_step_closes_the_filter_first() {
+    let mut harness = backlog().await;
+    harness.key("k");
+    harness.key("k");
+    harness.drive_to_end().await;
+    harness.key("f");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(frame.contains("Filter"), "the form is open:\n{frame}");
+    assert!(frame.contains("No item selected."), "{frame}");
+    assert!(
+        frame.contains("Esc closes the filter"),
+        "the form's way out:\n{frame}"
+    );
+    assert!(
+        !frame.contains("j/k chooses one"),
+        "j/k move the form's rows:\n{frame}"
+    );
+    harness.key("esc");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("j/k chooses one"),
+        "the list takes j/k again:\n{frame}"
+    );
+}
+
 /// An item with no body says so and names the key that writes one (`kit::empty`).
 #[tokio::test]
 async fn an_empty_body_names_the_edit_key() {

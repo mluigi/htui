@@ -697,7 +697,19 @@ impl Tab for BacklogTab {
                     .render(frame, detail_area, theme);
             }
             None if detail_area.is_empty() => {}
-            None => detail::render(frame, detail_area, &self.detail, self.item(), chrome, ctx),
+            None => {
+                // MOD-115 M4 RV, repair 2: what the list is doing, for the detail's no-item and
+                // failed-read steps (`detail::list_step`).
+                let cue = detail::ListCue {
+                    filter_open: self.keyboard_pane() == Some(hints::Holder::Filter),
+                    no_items: !self
+                        .rows(ctx)
+                        .iter()
+                        .any(|row| matches!(row, Selection::Item(_))),
+                };
+                let item = self.item();
+                detail::render(frame, detail_area, &self.detail, item, chrome, cue, ctx);
+            }
         }
         self.detail_drawn
             .set(self.item_form.is_none() && !detail_area.is_empty());

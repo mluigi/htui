@@ -72,7 +72,9 @@ use crate::ui::kit::label;
 use crate::ui::kit::list::{GUTTER, ellipsize, selection_band};
 use crate::ui::kit::modal::modal_rest;
 use crate::ui::kit::scroll::{Scroll, Step};
-use crate::ui::tabs::backlog::detail::{CHOOSE_UNBOUND, DetailId, DetailTab, no_item, unavailable};
+use crate::ui::tabs::backlog::detail::{
+    CHOOSE_UNBOUND, DetailId, DetailTab, Framing, Told, no_item, unavailable,
+};
 use crossterm::event::KeyEvent;
 
 /// What `r` says on a citation stamped at the requirement's current version.
@@ -141,6 +143,9 @@ pub struct ReqsTab {
     follow: Option<(RequirementId, CitationKind)>,
     /// Lines scrolled past the cursor's (`PgUp` / `PgDn`); a cursor move snaps back.
     scroll: Scroll,
+    /// How the detail pane and the list beside it are drawn this frame (`DetailTab::framing`,
+    /// MOD-115 M4 RV2-L1; RV, repair 2): what the no-item and failed-read steps read.
+    told: Told,
 }
 
 /// The pane's modes. Every mode but [`Mode::Browse`] captures input.
@@ -645,9 +650,20 @@ impl DetailTab for ReqsTab {
         Some(self.keys_line(keys, theme)).filter(|line| line.width() > 0)
     }
 
+    fn framing(&self, framing: Framing) {
+        self.told.set(framing);
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         if self.item.is_none() {
-            no_item(frame, area, views::BACKLOG_REQS, CHOOSE_UNBOUND, ctx);
+            no_item(
+                frame,
+                area,
+                views::BACKLOG_REQS,
+                CHOOSE_UNBOUND,
+                self.told.list(),
+                ctx,
+            );
             return;
         }
         let width = usize::from(area.width);
@@ -668,6 +684,7 @@ impl DetailTab for ReqsTab {
                 list,
                 &format!("Citations unavailable: {failed}"),
                 views::BACKLOG_REQS,
+                self.told.list(),
                 ctx,
             );
             return;

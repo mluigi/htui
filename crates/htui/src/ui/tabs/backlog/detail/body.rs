@@ -37,7 +37,9 @@ use crate::ui::kit::status;
 use crate::ui::kit::text::wrapped;
 use crate::ui::markdown;
 use crate::ui::tabs::backlog::detail;
-use crate::ui::tabs::backlog::detail::{CHOOSE_UNBOUND, DetailId, DetailTab, no_item};
+use crate::ui::tabs::backlog::detail::{
+    CHOOSE_UNBOUND, DetailId, DetailTab, Framing, Told, no_item,
+};
 use crossterm::event::KeyEvent;
 
 /// The sub-tab's chip, also what the border's title room is measured against.
@@ -60,6 +62,9 @@ pub struct BodyTab {
     /// The body area's width at the last render, for the scroll clamp (MOD-84 D7); 0 before the
     /// first, which counts the body unwrapped. `Cell` because `render` is `&self`.
     drawn: Cell<u16>,
+    /// How the detail pane and the list beside it are drawn this frame (`DetailTab::framing`,
+    /// MOD-115 M4 RV2-L1; RV, repair 2): what the no-item and failed-read steps read.
+    told: Told,
 }
 
 impl BodyTab {
@@ -206,9 +211,20 @@ impl DetailTab for BodyTab {
         }
     }
 
+    fn framing(&self, framing: Framing) {
+        self.told.set(framing);
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let Some(item) = self.item.as_ref() else {
-            no_item(frame, area, views::BACKLOG_BODY, CHOOSE_UNBOUND, ctx);
+            no_item(
+                frame,
+                area,
+                views::BACKLOG_BODY,
+                CHOOSE_UNBOUND,
+                self.told.list(),
+                ctx,
+            );
             return;
         };
 

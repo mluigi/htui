@@ -31,7 +31,7 @@ use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::label::{self, plural};
 use crate::ui::kit::scroll::{Scroll, Step};
 use crate::ui::tabs::backlog::detail::{
-    CHOOSE_UNBOUND, DetailId, DetailTab, message, no_item, unavailable,
+    CHOOSE_UNBOUND, DetailId, DetailTab, Framing, Told, message, no_item, unavailable,
 };
 use crate::ui::{Theme, cells};
 use crossterm::event::KeyEvent;
@@ -77,6 +77,9 @@ pub struct PromptTab {
     /// The rendered rows, rebuilt on every reply. Held rather than recomputed per frame: the
     /// prompt text is up to the whole token budget, and a render runs on the UI task.
     lines: Vec<Row>,
+    /// How the detail pane and the list beside it are drawn this frame (`DetailTab::framing`,
+    /// MOD-115 M4 RV2-L1; RV, repair 2): what the no-item and failed-read steps read.
+    told: Told,
 }
 
 /// One rendered row of the pane: its text, and whether it is drawn in `Theme::dim` (MOD-9 D46).
@@ -415,9 +418,20 @@ impl DetailTab for PromptTab {
         self.scroll.reset();
     }
 
+    fn framing(&self, framing: Framing) {
+        self.told.set(framing);
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         if self.item.is_none() {
-            no_item(frame, area, views::BACKLOG_PROMPT, CHOOSE_UNBOUND, ctx);
+            no_item(
+                frame,
+                area,
+                views::BACKLOG_PROMPT,
+                CHOOSE_UNBOUND,
+                self.told.list(),
+                ctx,
+            );
             return;
         }
         let Some(preview) = self.preview.as_ref() else {
@@ -427,6 +441,7 @@ impl DetailTab for PromptTab {
                     area,
                     &format!("No preview: {why}"),
                     views::BACKLOG_PROMPT,
+                    self.told.list(),
                     ctx,
                 ),
                 None => message(frame, area, "Assembling the prompt\u{2026}", ctx.theme),

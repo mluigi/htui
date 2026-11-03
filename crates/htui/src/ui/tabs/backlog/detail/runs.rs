@@ -94,7 +94,7 @@ use crate::ui::kit::label::{self, Mark, plural};
 use crate::ui::kit::modal::{Ask, modal_rest};
 use crate::ui::kit::scroll::{Scroll, Step};
 use crate::ui::kit::text::STAMP;
-use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, message, no_item};
+use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Framing, Told, message, no_item};
 use crate::ui::tabs::chat::permission::PermissionStrip;
 use crate::ui::text_field::{FieldOutcome, TextField};
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -367,6 +367,9 @@ pub struct RunsTab {
     /// `focus` when the loaded rows hold it). An item change and a cursor move (`J`, `K`, a
     /// clicked node) disarm it.
     pending_focus: Option<(Option<RunId>, Option<StepId>)>,
+    /// How the detail pane and the list beside it are drawn this frame (`DetailTab::framing`,
+    /// MOD-115 M4 RV2-L1; RV, repair 2): what the no-item and failed-read steps read.
+    told: Told,
 }
 
 /// One place the cursor can be (blueprint D198): a step, or the header of a run with no step.
@@ -2109,11 +2112,22 @@ impl DetailTab for RunsTab {
     /// over the whole content (MOD-115 M4 C7). The question is drawn whatever the list holds, so
     /// the close-out of an item with no run is on screen too: `C` needs no run
     /// (`close_out_enabled`).
+    fn framing(&self, framing: Framing) {
+        self.told.set(framing);
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         // MOD-71 D5: only a frame that draws the canvas records it (render_flow).
         self.canvas.set(None);
         if self.item.is_none() {
-            no_item(frame, area, views::RUNS_BROWSE, CHOOSE_UNBOUND, ctx);
+            no_item(
+                frame,
+                area,
+                views::RUNS_BROWSE,
+                CHOOSE_UNBOUND,
+                self.told.list(),
+                ctx,
+            );
             return;
         }
         self.render_content(frame, area, ctx);

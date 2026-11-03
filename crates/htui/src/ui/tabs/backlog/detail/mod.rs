@@ -23,6 +23,8 @@ pub mod prompt;
 pub mod requirements;
 pub mod runs;
 
+use std::cell::Cell;
+
 use htui_core::model::{ItemId, ItemSummary, RunId, StepId};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -99,10 +101,12 @@ pub trait DetailTab {
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>);
     /// Draws into the detail pane's inner rect (the chips are on its border, MOD-115 M4 E4).
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>);
-    /// How the detail pane is drawn this frame, told just before [`render`](DetailTab::render)
-    /// (MOD-115 M4 RV2-L1): what a part drawn as the pane is (a compose area's rule) takes, so it
-    /// never looks focused while its pane does not (C4). The default ignores it.
-    fn frame_focus(&self, _focus: Focus) {}
+    /// How the detail pane and the list beside it are drawn this frame, told just before
+    /// [`render`](DetailTab::render) (MOD-115 M4 RV2-L1; RV, repair 2): the pane's focus, which a
+    /// part drawn as the pane (a compose area's rule) takes, so it never looks focused while its
+    /// pane does not (C4); and the [`ListCue`] the no-item and failed-read steps read. A sub-tab
+    /// keeps it in a [`Told`]; the default ignores it.
+    fn framing(&self, _framing: Framing) {}
     /// Whether this sub-tab shows a run that is still active (MOD-41 plan D16): what the Backlog
     /// tab's `Runs` poll asks before it re-reads. Only [`RunsTab`] shows runs.
     fn has_active_run(&self) -> bool {
@@ -392,6 +396,58 @@ impl DetailRegistry {
     }
 }
 
+/// What the list beside the detail is doing this frame (MOD-115 M4 RV, repair 2): the list's
+/// motion chooses an item only while the list takes it and draws an item to choose, so the
+/// detail's no-item and failed-read steps ([`no_item`], [`unavailable`]) read this beside
+/// where the list is and which pane holds the focus.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ListCue {
+    /// The filter form, at the foot of the list pane, holds the keyboard (C4): `j`/`k` move its
+    /// rows.
+    pub filter_open: bool,
+    /// The list draws no item row (an empty scope, a filter nothing matches, every group
+    /// folded): its motion has nothing to choose.
+    pub no_items: bool,
+}
+
+/// How the detail pane and the list beside it are drawn this frame ([`DetailTab::framing`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Framing {
+    /// The detail pane's focus.
+    pub focus: Focus,
+    /// The list's [`ListCue`].
+    pub list: ListCue,
+}
+
+/// The last [`Framing`] a sub-tab was told; nothing on a bench that renders a sub-tab alone.
+#[derive(Debug, Default)]
+pub struct Told(Cell<Option<Framing>>);
+
+impl Told {
+    /// Nothing told yet.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(Cell::new(None))
+    }
+
+    /// Keeps this frame's framing.
+    pub fn set(&self, framing: Framing) {
+        self.0.set(Some(framing));
+    }
+
+    /// The detail pane's focus, `None` until told.
+    #[must_use]
+    pub fn focus(&self) -> Option<Focus> {
+        self.0.get().map(|framing| framing.focus)
+    }
+
+    /// The list's cue; the default (the list takes its keys and has items) until told.
+    #[must_use]
+    pub fn list(&self) -> ListCue {
+        self.0.get().map(|framing| framing.list).unwrap_or_default()
+    }
+}
+
 /// The sub-tabs' chips, in registration order (`BacklogTab::new`): what a sub-tab measures the
 /// detail pane's top border against (MOD-115 M4 RV2-L7, `kit::pane::Pane::title_fits`).
 pub(super) const CHIPS: [&str; 7] = ["Body", "Runs", "Graph", "Docs", "Notes", "Prompt", "Reqs"];
@@ -408,20 +464,25 @@ pub fn title(item: Option<&ItemSummary>) -> String {
 
 /// Draws the detail pane as a kit pane (MOD-115 M4 E4): titled [`title`], kept first (C5, Q1),
 /// the sub-tabs as chips on its top border windowed around the active one with `‹`/`›`, and the
-/// active sub-tab in the whole inner rect. The content is drawn before the frame, which touches
-/// border cells only (M3 C3).
+/// active sub-tab in the whole inner rect, told the pane's focus and the list's `cue` first
+/// ([`DetailTab::framing`]). The content is drawn before the frame, which touches border cells
+/// only (M3 C3).
 pub fn render(
     frame: &mut Frame<'_>,
     area: Rect,
     registry: &DetailRegistry,
     item: Option<&ItemSummary>,
     chrome: Chrome<'_>,
+    cue: ListCue,
     ctx: &Ctx<'_>,
 ) {
     let inner = Pane::inner(area);
     match registry.active() {
         Some(tab) => {
-            tab.frame_focus(chrome.focus);
+            tab.framing(Framing {
+                focus: chrome.focus,
+                list: cue,
+            });
             tab.render(frame, inner, ctx);
         }
         None => message(frame, inner, "No detail sub-tab is registered.", ctx.theme),
@@ -487,21 +548,51 @@ const UNZOOM: HintSpec = &[Hint::One(Act::LayoutZoom, "shows the list")];
 /// The list's step while the layout preset has no list.
 const NEXT_PRESET: HintSpec = &[Hint::One(Act::LayoutNextPreset, "changes the layout")];
 
-/// A step that moves the list's cursor, `on_list`, for where the list is and which pane holds
-/// the focus (MOD-115 M4 RV, repair 1, as the Templates select step, RV3-M1): `on_list` only
-/// while the list holds the focus; beside it, the key that focuses it; off screen, the key that
-/// brings it back.
-fn list_step(on_list: HintSpec, ctx: &Ctx<'_>) -> HintSpec {
-    match ctx.list_hidden(super::BACKLOG_LAYOUT) {
+/// The list's step while the filter form holds the keyboard (MOD-115 M4 RV, repair 2): `j`/`k`
+/// move the form's rows there, so the step is the form's way out, through its own stack.
+const CLOSE_FILTER: HintSpec = &[Hint::One(Act::FieldCancel, "closes the filter")];
+
+/// A step that moves the list's cursor, `on_list` through `stack`, for what the list is doing,
+/// where it is and which pane holds the focus (MOD-115 M4 RV, repairs 1 and 2, as the Templates
+/// select step, RV3-M1): while the filter form holds the keyboard, its way out; off screen, the
+/// key that brings the list back; `None` while it draws no item row, so there is nothing to
+/// choose; `on_list` only while it holds the focus; beside it, the key that focuses it.
+fn list_step<'s>(
+    on_list: HintSpec,
+    stack: Stack<'s>,
+    list: ListCue,
+    ctx: &Ctx<'_>,
+) -> Option<(Stack<'s>, HintSpec)> {
+    if list.filter_open {
+        return Some((views::BACKLOG_FILTER, CLOSE_FILTER));
+    }
+    let spec = match ctx.list_hidden(super::BACKLOG_LAYOUT) {
         Some(HiddenBy::Zoom) => UNZOOM,
         Some(HiddenBy::Preset) => NEXT_PRESET,
         Some(HiddenBy::Toggle) => SHOW_LIST,
+        None if list.no_items => return None,
         None => match ctx.focus() {
             PaneId::List => on_list,
             PaneId::Activity => FOCUS_FROM_ACTIVITY,
             PaneId::Detail => FOCUS_FROM_DETAIL,
         },
-    }
+    };
+    Some((stack, spec))
+}
+
+/// [`list_step`] for `on_list` through `stack`, as words: `unbound` while there is no step or
+/// none of its keys is bound.
+fn list_step_text(
+    on_list: HintSpec,
+    stack: Stack<'_>,
+    unbound: &str,
+    list: ListCue,
+    ctx: &Ctx<'_>,
+) -> String {
+    list_step(on_list, stack, list, ctx).map_or_else(
+        || unbound.to_owned(),
+        |(stack, spec)| hint_or(stack, spec, unbound, ctx.keys()),
+    )
 }
 
 /// [`RETRY`]'s sentence while the list's motion is unbound.
@@ -524,10 +615,18 @@ fn hint_or(stack: Stack<'_>, spec: HintSpec, unbound: &str, keys: &Keys) -> Stri
 
 /// No item selected (MOD-115 M4 RV2-M1, RV2-L5), the one state every sub-tab draws alike:
 /// [`NO_ITEM`] as the kit's empty state, its next step [`CHOOSE`] through `stack` where the list
-/// is and holds the focus, else the key that gets it there ([`list_step`]), or `unbound` while
-/// that key is unbound ([`CHOOSE_UNBOUND`] for a pane with nothing more to say).
-fn no_item(frame: &mut Frame<'_>, area: Rect, stack: Stack<'_>, unbound: &str, ctx: &Ctx<'_>) {
-    let next = hint_or(stack, list_step(CHOOSE, ctx), unbound, ctx.keys());
+/// is and takes its keys, else the key that gets it there ([`list_step`]), or `unbound` while
+/// that key is unbound or the list draws no item to choose ([`CHOOSE_UNBOUND`] for a pane with
+/// nothing more to say). `list` is the sub-tab's [`Told::list`].
+fn no_item(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    stack: Stack<'_>,
+    unbound: &str,
+    list: ListCue,
+    ctx: &Ctx<'_>,
+) {
+    let next = list_step_text(CHOOSE, stack, unbound, list, ctx);
     empty_state(frame, area, NO_ITEM, &next, ctx);
 }
 
@@ -540,10 +639,17 @@ fn writes_one(stack: Stack<'_>, act: Act, unbound: &str, keys: &Keys) -> String 
 
 /// A refused read (MOD-115 M4 RV2-M1): `what`, its whole sentence, as the kit's failed state,
 /// its next step [`RETRY`] through `stack`, the list's motion away and back, which reads the
-/// item again, where the list is and holds the focus, else the key that gets it there
-/// ([`list_step`]).
-fn unavailable(frame: &mut Frame<'_>, area: Rect, what: &str, stack: Stack<'_>, ctx: &Ctx<'_>) {
-    let next = hint_or(stack, list_step(RETRY, ctx), RETRY_UNBOUND, ctx.keys());
+/// item again, where the list is and takes its keys, else the key that gets it there
+/// ([`list_step`]). `list` is the sub-tab's [`Told::list`].
+fn unavailable(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    what: &str,
+    stack: Stack<'_>,
+    list: ListCue,
+    ctx: &Ctx<'_>,
+) {
+    let next = list_step_text(RETRY, stack, RETRY_UNBOUND, list, ctx);
     empty::render_failed(frame, area, what, NextStep(&next), ctx.theme);
 }
 
@@ -781,6 +887,7 @@ mod tests {
                     area,
                     views::BACKLOG_BODY,
                     super::CHOOSE_UNBOUND,
+                    super::ListCue::default(),
                     &ctx,
                 );
             });
@@ -791,10 +898,142 @@ mod tests {
                     area,
                     "Links unavailable: boom",
                     views::BACKLOG_GRAPH,
+                    super::ListCue::default(),
                     &ctx,
                 );
             });
             super::assert_empty_state(&text, "Links unavailable: boom", retry);
         }
+    }
+
+    /// MOD-115 M4 RV, repair 2: while the filter form holds the keyboard, `j`/`k` move its rows,
+    /// so both steps name the form's way out, wherever the list is and whichever pane the shell
+    /// focuses; while the list draws no item row, the no-item step names no motion with nothing
+    /// to choose (the pane's own sentence), unless the list is off screen, where the key that
+    /// brings it back shows the list's own step.
+    #[test]
+    fn the_list_steps_close_the_filter_first_and_choose_nothing_from_an_empty_list() {
+        use crate::ui::shell::{PaneId, TabLayout};
+        use crate::ui::tabs::backlog::BACKLOG_LAYOUT;
+
+        let shell = super::compose::bench::Shell::new();
+        let hidden = TabLayout {
+            list_on: false,
+            ..BACKLOG_LAYOUT
+        };
+        let filter = super::ListCue {
+            filter_open: true,
+            no_items: false,
+        };
+        let empty = super::ListCue {
+            filter_open: false,
+            no_items: true,
+        };
+        let both = super::ListCue {
+            filter_open: true,
+            no_items: true,
+        };
+        let cases = [
+            (
+                filter,
+                PaneId::List,
+                None,
+                "Esc closes the filter",
+                "Esc closes the filter",
+            ),
+            (
+                filter,
+                PaneId::Detail,
+                None,
+                "Esc closes the filter",
+                "Esc closes the filter",
+            ),
+            (
+                filter,
+                PaneId::Detail,
+                Some(hidden),
+                "Esc closes the filter",
+                "Esc closes the filter",
+            ),
+            (
+                both,
+                PaneId::List,
+                None,
+                "Esc closes the filter",
+                "Esc closes the filter",
+            ),
+            (
+                empty,
+                PaneId::List,
+                None,
+                super::CHOOSE_UNBOUND,
+                super::RETRY_UNBOUND,
+            ),
+            (
+                empty,
+                PaneId::Detail,
+                None,
+                super::CHOOSE_UNBOUND,
+                super::RETRY_UNBOUND,
+            ),
+            (
+                empty,
+                PaneId::Detail,
+                Some(hidden),
+                "F2 shows the list",
+                "F2 shows the list",
+            ),
+        ];
+        for (cue, focus, layout, choose, retry) in cases {
+            let ctx = shell.ctx().with_focus(focus);
+            let ctx = match layout {
+                Some(layout) => ctx.with_layout(layout),
+                None => ctx,
+            };
+            let text = super::compose::bench::drawn(43, 6, |frame, area| {
+                super::no_item(
+                    frame,
+                    area,
+                    views::BACKLOG_BODY,
+                    super::CHOOSE_UNBOUND,
+                    cue,
+                    &ctx,
+                );
+            });
+            super::assert_empty_state(&text, super::NO_ITEM, choose);
+            let text = super::compose::bench::drawn(43, 6, |frame, area| {
+                super::unavailable(
+                    frame,
+                    area,
+                    "Links unavailable: boom",
+                    views::BACKLOG_GRAPH,
+                    cue,
+                    &ctx,
+                );
+            });
+            super::assert_empty_state(&text, "Links unavailable: boom", retry);
+        }
+    }
+
+    /// MOD-115 M4 RV, repair 2: a sub-tab keeps what it was told, and reads the default (the list
+    /// takes its keys and has items) before it is told anything.
+    #[test]
+    fn told_keeps_the_last_framing() {
+        use super::{Framing, ListCue, Told};
+        use crate::ui::kit::pane::Focus;
+
+        let told = Told::new();
+        assert_eq!(told.focus(), None);
+        assert_eq!(told.list(), ListCue::default());
+        let list = ListCue {
+            filter_open: true,
+            no_items: false,
+        };
+        told.set(Framing {
+            focus: Focus::Unfocused,
+            list,
+        });
+        assert_eq!(told.focus(), Some(Focus::Unfocused));
+        assert_eq!(told.list(), list);
     }
 }
