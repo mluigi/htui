@@ -2144,7 +2144,7 @@ mod tests {
     #[test]
     fn the_unavailable_line_is_an_error_with_a_next_step() {
         for theme in [Theme::default(), Theme::monochrome()] {
-            let bench = Bench::new().with_theme(theme.clone());
+            let bench = Bench::new().with_theme(theme);
             let mut overlay = QueueOverlay::new();
             bench.reply(
                 &mut overlay,
