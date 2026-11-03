@@ -213,7 +213,7 @@ impl<'a> Pane<'a> {
         } else {
             chip_strip(area, self.sub_tabs, self.active)
         };
-        let mut limit = area.right() - 1;
+        let limit = strip_limit(area, &strip);
         let mut cut = false;
         for (index, (rect, title)) in strip.chips.iter().zip(self.sub_tabs).enumerate() {
             let wanted = cells::cell_width(title) + 2;
@@ -223,7 +223,6 @@ impl<'a> Pane<'a> {
             if rect.width == 0 {
                 continue;
             }
-            limit = limit.min(rect.x);
             let label_style = if index == self.active {
                 theme.active_tab
             } else {
@@ -248,11 +247,10 @@ impl<'a> Pane<'a> {
             }
         }
         for (mark, glyph) in [(strip.before, BEFORE), (strip.after, AFTER)] {
-            if let Some(rect) = mark {
-                limit = limit.min(rect.x);
-                if top_on {
-                    put(buf, rect.x, rect.y, glyph, 1, faint);
-                }
+            if let Some(rect) = mark
+                && top_on
+            {
+                put(buf, rect.x, rect.y, glyph, 1, faint);
             }
         }
 
@@ -262,8 +260,7 @@ impl<'a> Pane<'a> {
         if !self.title.is_empty() && (self.title_first || !cut) && top_on {
             let start = area.x + 2;
             let room = if self.title_first {
-                title_cells(area, self.title, self.sub_tabs, self.active)
-                    .min(limit.saturating_sub(start))
+                first_title_room(area, self.title, self.sub_tabs, self.active, &strip)
             } else {
                 limit.saturating_sub(1).saturating_sub(start)
             };
@@ -413,6 +410,52 @@ fn set_line(buf: &mut Buffer, x: u16, y: u16, line: &Line<'_>, width: u16) {
 #[must_use]
 pub fn sub_tab_rects(area: Rect, titles: &[&str], active: usize) -> Vec<Rect> {
     chip_strip(area, titles, active).chips
+}
+
+/// The leftmost cell a drawn chip or mark of `strip` takes on the top border of a pane drawn into
+/// `area`, else the right corner: where a title must stop. A chip cut to nothing takes none.
+fn strip_limit(area: Rect, strip: &ChipStrip) -> u16 {
+    strip
+        .chips
+        .iter()
+        .filter(|rect| rect.width > 0)
+        .map(|rect| rect.x)
+        .chain(
+            [strip.before, strip.after]
+                .into_iter()
+                .flatten()
+                .map(|rect| rect.x),
+        )
+        .fold(area.right() - 1, u16::min)
+}
+
+/// The cells [`Pane::render`] gives a title asked first ([`Pane::title_first`]) beside `strip`,
+/// the strip [`chip_strip_after`] lays out for it.
+fn first_title_room(
+    area: Rect,
+    title: &str,
+    titles: &[&str],
+    active: usize,
+    strip: &ChipStrip,
+) -> u16 {
+    title_cells(area, title, titles, active)
+        .min(strip_limit(area, strip).saturating_sub(area.x + 2))
+}
+
+impl Pane<'_> {
+    /// Whether a pane drawn into `area`, `title` asked first ([`Pane::title_first`]) beside the
+    /// sub-tabs `titles` with `active` the current one, draws ` title ` whole on its top border
+    /// (MOD-115 M4 RV2-L7): what [`Pane::render`] decides, so a caller that keeps a cut title's
+    /// line of its own (the Backlog's Body) asks the kit rather than mirroring its arithmetic.
+    #[must_use]
+    pub fn title_fits(area: Rect, title: &str, titles: &[&str], active: usize) -> bool {
+        if title.is_empty() || area.width < 2 || area.height == 0 {
+            return false;
+        }
+        let strip = chip_strip_after(area, title, titles, active);
+        let room = first_title_room(area, title, titles, active, &strip);
+        room > 2 && cells::cell_width(title) + 2 <= usize::from(room)
+    }
 }
 
 /// The cells a title asked first takes on the top border of a pane drawn into `area` (MOD-115 M4
@@ -742,6 +785,38 @@ mod tests {
             Rect::new(1, 1, 18, 3),
             "the content goes inside the border"
         );
+    }
+
+    /// MOD-115 M4 RV2-L7: `Pane::title_fits` is what `render` draws: for every width and title
+    /// length around the edge, every active chip of a seven-chip strip and of a two-chip one, and
+    /// no chips, it is true exactly when the top border carries ` title ` whole.
+    #[test]
+    fn title_fits_says_what_the_border_draws() {
+        let seven = ["Body", "Runs", "Graph", "Docs", "Notes", "Prompt", "Reqs"];
+        let two = ["Skills", "Templates"];
+        let strips: [&[&str]; 3] = [&seven, &two, &[]];
+        for titles in strips {
+            for active in 0..titles.len().max(1) {
+                for width in 4u16..=62 {
+                    for length in 1..=50 {
+                        let title = "t".repeat(length);
+                        let area = Rect::new(0, 0, width, 3);
+                        let (buffer, _) = draw(
+                            width,
+                            3,
+                            &Theme::default(),
+                            Pane::new(&title).title_first().sub_tabs(titles, active),
+                        );
+                        let top = row(&buffer, 0);
+                        assert_eq!(
+                            Pane::title_fits(area, &title, titles, active),
+                            top.contains(&format!(" {title} ")),
+                            "{width} cells, {length}-cell title, chip {active} of {titles:?}: {top}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

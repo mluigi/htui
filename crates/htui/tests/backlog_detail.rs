@@ -235,9 +235,11 @@ async fn body_at_80_columns() {
     let mut harness = backlog_at(80, 24).await;
     down(&mut harness, TO_FEAT_1).await;
     let frame = harness.render();
-    // The 34 cells inside the detail wrap the meta line; every part of it stays.
+    // The 34 cells inside the detail wrap the meta line; every part of it stays, and a row ends
+    // on a part, never on its separator (MOD-115 M4 RV2-L4).
     assert!(
-        frame.contains("\u{2502}\u{25d0} running \u{b7} rust \u{b7} priority 2 \u{b7}")
+        frame.contains("\u{2502}\u{25d0} running \u{b7} rust \u{b7} priority 2 ")
+            && !frame.contains("priority 2 \u{b7}")
             && frame.contains("\u{2502}version 1 "),
         "{frame}"
     );

@@ -31,6 +31,7 @@ use crate::store_worker::StoreReply;
 use crate::ui::Theme;
 use crate::ui::cells::cell_width;
 use crate::ui::kit::empty::{self, NextStep};
+use crate::ui::kit::pane::Pane;
 use crate::ui::kit::scroll::{Scroll, Step};
 use crate::ui::kit::status;
 use crate::ui::kit::text::wrapped;
@@ -81,18 +82,22 @@ impl BodyTab {
 }
 
 /// Whether the detail pane's top border holds `key · title` whole while Body is its active chip,
-/// the pane's inner rect `inner` cells wide: the room `kit::pane` leaves a title asked first (M4
-/// C5) is the inner width less Body's chip (` Body `), the `›` mark for the six chips after it
-/// and the rule cell after the corner, and ` title ` takes two cells more than the title.
+/// the pane's inner rect `inner` cells wide: the kit's own answer (MOD-115 M4 RV2-L7), asked with
+/// the detail's chips ([`detail::CHIPS`]) and Body's place among them.
 fn border_holds(key: &str, title: &str, inner: u16) -> bool {
-    let room = usize::from(inner).saturating_sub(cell_width(TITLE) + 2 + 1 + 1);
-    cell_width(key) + cell_width(SEP) + cell_width(title) + 2 <= room
+    let area = Rect::new(0, 0, inner.saturating_add(2), 3);
+    let active = detail::CHIPS
+        .iter()
+        .position(|chip| *chip == TITLE)
+        .unwrap_or_default();
+    Pane::title_fits(area, &format!("{key}{SEP}{title}"), &detail::CHIPS, active)
 }
 
 /// The meta line's rows at `width`: the status as its mark in its own style, then the tags, the
-/// priority and the version, dim. One row when it fits (the detail pane at 100 columns); wrapped
-/// by `kit::text::wrapped` otherwise (at 80 columns `version 1` takes a second row), the mark kept
-/// in its style on the first.
+/// priority and the version, dim. One row when it fits (the detail pane at 100 columns); else the
+/// parts fill rows greedily (MOD-115 M4 RV2-L4): ` · ` joins two parts on a row and never ends or
+/// starts one, so at 80 columns `version 1` takes the second row alone, and a part wider than the
+/// pane wraps inside itself (`kit::text::wrapped`) on rows of its own, so no part is lost.
 fn meta_lines(item: &Item, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let tags: Cow<'_, str> = if item.required_tags.is_empty() {
         Cow::Borrowed("no tags")
@@ -105,23 +110,47 @@ fn meta_lines(item: &Item, width: u16, theme: &Theme) -> Vec<Line<'static>> {
         "{SEP}{tags}{SEP}priority {}{SEP}version {}",
         item.priority, item.version
     );
-    let style = theme.status_style(item.status);
     if cell_width(&mark) + cell_width(&rest) <= usize::from(width) {
         let mut spans = status::spans(item.status, theme);
         spans.push(Span::styled(rest, theme.dim));
         return vec![Line::from(spans)];
     }
-    wrapped(&format!("{mark}{rest}"), usize::from(width))
-        .into_iter()
-        .enumerate()
-        .map(|(row, text)| match text.strip_prefix(mark.as_str()) {
-            Some(after) if row == 0 => Line::from(vec![
-                Span::styled(mark.clone(), style),
-                Span::styled(after.to_owned(), theme.dim),
-            ]),
-            _ => Line::styled(text, theme.dim),
-        })
-        .collect()
+    let parts = [
+        (mark, theme.status_style(item.status)),
+        (tags.into_owned(), theme.dim),
+        (format!("priority {}", item.priority), theme.dim),
+        (format!("version {}", item.version), theme.dim),
+    ];
+    let width = usize::from(width.max(1));
+    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    // The cells the last row holds; `None` while that row must not take another part (none yet,
+    // or the last piece of a part wrapped inside itself, which a separator would read as a part).
+    let mut used: Option<usize> = None;
+    for (part, style) in parts {
+        let cells = cell_width(&part);
+        match used {
+            Some(held) if held + cell_width(SEP) + cells <= width => {
+                if let Some(row) = rows.last_mut() {
+                    row.push(Span::styled(SEP, theme.dim));
+                    row.push(Span::styled(part, style));
+                }
+                used = Some(held + cell_width(SEP) + cells);
+            }
+            _ if cells <= width => {
+                rows.push(vec![Span::styled(part, style)]);
+                used = Some(cells);
+            }
+            _ => {
+                rows.extend(
+                    wrapped(&part, width)
+                        .into_iter()
+                        .map(|piece| vec![Span::styled(piece, style)]),
+                );
+                used = None;
+            }
+        }
+    }
+    rows.into_iter().map(Line::from).collect()
 }
 
 /// The empty body's next step: the key that opens the item form (`common.edit` through
@@ -369,9 +398,6 @@ mod tests {
         assert_eq!(rows[HEAD], "Scope", "{rows:#?}");
     }
 
-    /// The detail pane's chips, in registration order (`backlog::BacklogTab::new`).
-    const CHIPS: [&str; 7] = ["Body", "Runs", "Graph", "Docs", "Notes", "Prompt", "Reqs"];
-
     /// FEAT-1 with `edit` applied, landed in a fresh pane.
     async fn landed(shell: &Shell, edit: impl FnOnce(&mut Item)) -> BodyTab {
         let mut item = MemStore::demo()
@@ -417,22 +443,19 @@ mod tests {
         );
     }
 
-    /// The mirror of `kit::pane`'s title room is the kit's: for every width and title length
-    /// around the edge, the title line goes exactly when the border draws `KEY · title` whole.
+    /// The title line goes exactly when the border draws `KEY · title` whole, for every width
+    /// and title length around the edge (`Pane::title_fits` is swept in `kit::pane` itself).
     #[test]
     fn border_holds_says_what_the_kit_border_draws() {
-        use crate::ui::kit::pane::Pane;
-
         for inner in 30u16..=60 {
             for length in 10..=50 {
                 let title = "t".repeat(length);
                 let whole = format!("FEAT-1 \u{b7} {title}");
                 let drawn = drawn(inner + 2, 3, |frame, area| {
-                    Pane::new(&whole).title_first().sub_tabs(&CHIPS, 0).render(
-                        frame,
-                        area,
-                        &Theme::default(),
-                    );
+                    Pane::new(&whole)
+                        .title_first()
+                        .sub_tabs(&detail::CHIPS, 0)
+                        .render(frame, area, &Theme::default());
                 });
                 let top = drawn.lines().next().unwrap_or_default().to_owned();
                 assert_eq!(
@@ -464,8 +487,9 @@ mod tests {
         assert_eq!(rows[4], "Stand up the terminal application: a");
     }
 
-    /// A meta line wider than the pane wraps rather than losing its tail; so narrow a border
-    /// cuts even `FEAT-1 · TUI scaffold`, so the title keeps its line above it.
+    /// A meta line wider than the pane wraps by part rather than losing its tail (RV2-L4: a row
+    /// ends on a part, never on its separator, and no part is split while it fits a row); so
+    /// narrow a border cuts even `FEAT-1 · TUI scaffold`, so the title keeps its line above it.
     #[tokio::test]
     async fn a_narrow_pane_wraps_the_meta_line() {
         let shell = Shell::new();
@@ -475,13 +499,48 @@ mod tests {
             rows[..5],
             [
                 "TUI scaffold",
-                "\u{25d0} running \u{b7} rust \u{b7}",
-                "priority 2 \u{b7} version",
-                "1",
+                "\u{25d0} running \u{b7} rust",
+                "priority 2",
+                "version 1",
                 "",
             ],
             "{rows:#?}"
         );
+    }
+
+    /// RV2-L4: at every width the meta line keeps all of its parts, in order, and no row starts
+    /// or ends on the separator; a part wider than the pane wraps inside itself, whole.
+    #[tokio::test]
+    async fn the_meta_line_never_leaves_a_dangling_separator() {
+        let shell = Shell::new();
+        let pane = landed(&shell, |item| {
+            item.required_tags = vec!["rust".to_owned(), "a-very-long-tag-name".to_owned()];
+        })
+        .await;
+        let Some(item) = pane.item.as_ref() else {
+            panic!("the item landed");
+        };
+        for width in 8..=60 {
+            let lines = meta_lines(item, width, &shell.theme);
+            let text: Vec<String> = lines.iter().map(ToString::to_string).collect();
+            for row in &text {
+                assert!(cell_width(row) <= usize::from(width), "{width}: {text:#?}");
+                assert!(
+                    !row.ends_with('\u{b7}') && !row.starts_with('\u{b7}'),
+                    "{width}: {text:#?}"
+                );
+            }
+            let joined: String = text.concat().split_whitespace().collect();
+            for part in [
+                "running",
+                "rust,",
+                "a-very-long-tag-name",
+                "priority2",
+                "version1",
+            ] {
+                assert!(joined.contains(part), "{width}: {part} in {text:#?}");
+            }
+        }
     }
 
     /// MOD-115 M4 RV2-M1: no item under the list's cursor is the kit's empty state, its next step

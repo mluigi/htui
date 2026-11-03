@@ -391,6 +391,10 @@ impl DetailRegistry {
     }
 }
 
+/// The sub-tabs' chips, in registration order (`BacklogTab::new`): what a sub-tab measures the
+/// detail pane's top border against (MOD-115 M4 RV2-L7, `kit::pane::Pane::title_fits`).
+pub(super) const CHIPS: [&str; 7] = ["Body", "Runs", "Graph", "Docs", "Notes", "Prompt", "Reqs"];
+
 /// The detail pane's title (MOD-115 M4 E4, MOD-82): `KEY · title` of the selected item, or
 /// `Detail` while a project header is selected.
 #[must_use]
@@ -598,6 +602,19 @@ mod tests {
             views::RUNS_BROWSE,
             "back on the override"
         );
+    }
+
+    /// RV2-L7: [`super::CHIPS`] are the Backlog's registered sub-tabs, in order.
+    #[test]
+    fn the_chips_are_the_registered_sub_tabs() {
+        let tab = crate::ui::tabs::BacklogTab::new();
+        let titles: Vec<&str> = tab
+            .detail
+            .titles()
+            .into_iter()
+            .map(|(_, title)| title)
+            .collect();
+        assert_eq!(titles, super::CHIPS);
     }
 
     /// A sub-tab that records the steps it is handed.
