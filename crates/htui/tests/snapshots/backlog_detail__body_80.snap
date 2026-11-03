@@ -25,4 +25,4 @@ Platform   ¹Backlog        1 working · 1 waiting · memory ·  F9  about   ?  
 │                                          ││  loop folds the reply into state.│
 │                                          ││  Three select arms: terminal     │
 │                                          ││  events, store replies, a tick.  │
-╰─j/k move · h/l sub-tab · f filter · N n…─╯╰──────────────────────────────────╯
+╰─j/k move · h/l sub-tab · f filter ·…─────╯╰──────────────────────────────────╯

@@ -668,10 +668,10 @@ async fn the_requirements_tree_status_line_and_help_box() {
     );
     let frame = harness.render();
     // MOD-115 M3 D-14 (maintainer, 2026-10-21): the tree's own hints, the write keys first, cut
-    // to the 45-cell tree; the unit tests pin the whole line.
+    // to the 45-cell tree by whole keys (M4 T3); the unit tests pin the whole line.
     assert_eq!(
         hint(&frame),
-        "a area \u{b7} n new \u{b7} e amend \u{b7} W withdraw \u{b7} \u{2026}",
+        "a area \u{b7} n new \u{b7} e amend \u{b7} W withdraw \u{b7}\u{2026}",
         "{frame}"
     );
     harness.key("?");

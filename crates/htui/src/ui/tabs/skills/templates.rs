@@ -135,9 +135,9 @@ const DETAIL_HINT: HintSpec = &[
     Hint::One(Act::SkillsEditExternally, "$EDITOR"),
 ];
 
-/// The pane's keys while its lines overflow it, through [`views::TEMPLATES_BROWSE`]: they lead
-/// the detail pane's hints when it is focused (MOD-115 M4 E5; MOD-82 carried: no key literal in
-/// a title).
+/// The pane's keys while its lines overflow it, through [`views::TEMPLATES_BROWSE`]: they close
+/// the detail pane's hints while it is focused, after [`DETAIL_HINT`], so a narrow pane drops
+/// them first (MOD-115 M4 E5, T3; MOD-82 carried: no key literal in the title).
 const SCROLL_HINT: HintSpec = &[
     Hint::Pair(Act::PaneScrollDown, Act::PaneScrollUp, "scroll"),
     Hint::Pair(Act::PanePageUp, Act::PanePageDown, "page"),
@@ -153,18 +153,14 @@ const NAMING_HINT: HintSpec = &[
 /// The hint row in the editor, through [`views::TEMPLATES_EDITOR`], after the cursor's
 /// `L{line}:C{col}` (D20). `skills.ask_agent` is MOD-55's `Ctrl+G` (MOD-67 M4 D9). Save and the
 /// way out lead: the draft pane beside the placeholders holds only some of the keys at 100
-/// columns, and [`draft_hint`](TemplatesView::draft_hint) drops them from the end (MOD-115 M4
-/// L-skills repair 1).
+/// columns, and the kit pane drops them whole from the end (`kit::pane::fit_hints`; MOD-115 M4
+/// L-skills repair 1, T3).
 const EDIT_HINT: HintSpec = &[
     Hint::One(Act::FormSave, "save"),
     Hint::Text("Esc cancel"),
     Hint::One(Act::SkillsAskAgent, "ask agent"),
     Hint::One(Act::FormExternalEditor, "$EDITOR"),
 ];
-
-/// The cells of a kit pane's width its bottom border keeps for hints: they start two cells in
-/// and stop one rule cell short of the corner (`kit::pane`).
-const HINT_MARGIN: u16 = 4;
 
 /// The hint row while a `Ctrl+E` handoff holds the draft: `$EDITOR` has the keys.
 const HANDED_OFF_HINT: HintSpec = &[Hint::Text("the draft is in $EDITOR")];
@@ -665,29 +661,6 @@ impl TemplatesView {
             (Mode::Naming { .. }, _) => keys.hint(self.key_stack(), NAMING_HINT),
             (Mode::Browse, None) => keys.hint(self.key_stack(), BROWSE_HINT),
         }
-    }
-
-    /// The editor's keys fitted to the draft pane `width` cells wide (MOD-115 M4 L-skills repair
-    /// 1): [`key_hint`](Self::key_hint)'s whole row when it fits or an agent help has the keys,
-    /// else the cursor's `L:C` and as many of [`EDIT_HINT`]'s keys, in order and whole, as the
-    /// bottom border holds; the first that does not fit goes with every one after it, and ` ·…`
-    /// says so. Never half a key.
-    fn draft_hint(&self, editor: &Editor, keys: &Keys, width: u16) -> String {
-        let full = self.key_hint(keys);
-        let room = usize::from(width.saturating_sub(HINT_MARGIN));
-        if editor.help.is_some() || cells::cell_width(&full) <= room {
-            return full;
-        }
-        let (line, col) = editor.area.cursor_line_col();
-        let at = format!("L{}:C{}", line + 1, col + 1);
-        (0..EDIT_HINT.len())
-            .rev()
-            .map(|kept| {
-                let fit = joined(&[at.clone(), keys.hint(self.key_stack(), &EDIT_HINT[..kept])]);
-                format!("{fit} \u{b7}\u{2026}")
-            })
-            .find(|cut| cells::cell_width(cut) <= room)
-            .unwrap_or(full)
     }
 
     // --- keys ----------------------------------------------------------------------------------
@@ -1343,7 +1316,8 @@ impl TemplatesView {
 
     /// The right-hand pane: the name prompt's form, an empty state, a refused read, or the shown
     /// body or diff, wrapped and scrolled with a scrollbar. Its title names no key (MOD-82
-    /// carried): the scroll keys lead its hints while its lines overflow it.
+    /// carried): the scroll keys close its hints while its lines overflow it, after the view's
+    /// own, so they are the first the kit pane drops (MOD-115 M4 T3).
     fn render_pane(
         &self,
         frame: &mut Frame<'_>,
@@ -1392,7 +1366,7 @@ impl TemplatesView {
             } else {
                 String::new()
             };
-            joined(&[scroll, keys.hint(views::TEMPLATES_BROWSE, DETAIL_HINT)])
+            joined(&[keys.hint(views::TEMPLATES_BROWSE, DETAIL_HINT), scroll])
         };
         framed(pane, focus, hint_line(hint, ctx), ctx).render(frame, area, theme);
     }
@@ -1531,7 +1505,7 @@ impl TemplatesView {
         } else {
             Focus::Unfocused
         };
-        let hints = hint_line(self.draft_hint(editor, ctx.keys(), left.width), ctx);
+        let hints = hint_line(self.key_hint(ctx.keys()), ctx);
         framed(
             view_chips_if_room(KitPane::new(&title), &title, 1, left.width),
             focus,

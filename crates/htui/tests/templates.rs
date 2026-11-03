@@ -744,7 +744,9 @@ async fn scrolling_reveals_a_hunk_below_the_fold() {
     harness.key("r");
     harness.settle().await;
     select(&mut harness, "implement");
-    // MOD-115 M4 E5: the scroll keys lead the body pane's hints, shown while it is focused.
+    // MOD-115 M4 E5, T3: the body pane's hints, shown while it is focused, lead with the view's
+    // own keys and close with the scroll keys, so a pane too narrow for them all drops those
+    // first, whole (the scrollbar still says it scrolls).
     harness.key("tab");
     harness.key("d");
     let frame = harness.render();
@@ -757,10 +759,34 @@ async fn scrolling_reveals_a_hunk_below_the_fold() {
         !frame.contains("CHANGED60"),
         "the last hunk is below the fold: {frame}"
     );
+    let body_hint = |frame: &str| -> String {
+        frame
+            .lines()
+            .find(|line| line.contains("b base"))
+            .unwrap_or_else(|| panic!("the body pane's hints: {frame}"))
+            .to_owned()
+    };
+    let narrow = body_hint(&frame);
     assert!(
-        frame.contains("J/K scroll · PgUp/PgDn page"),
-        "the pane says it scrolls: {frame}"
+        narrow.contains("version \u{b7} b base \u{b7} d diff")
+            && narrow.contains(" \u{b7}\u{2026}"),
+        "the view's keys lead, cut by whole keys: {narrow}"
     );
+    assert!(
+        !narrow.contains("J/K"),
+        "the scroll keys drop first: {narrow}"
+    );
+    harness.resize(160, 30);
+    let wide = body_hint(&harness.render());
+    let (view, scroll) = (
+        wide.find("b base"),
+        wide.find("J/K scroll \u{b7} PgUp/PgDn page"),
+    );
+    assert!(
+        view.zip(scroll).is_some_and(|(view, scroll)| view < scroll),
+        "wide enough, the scroll keys close the hints: {wide}"
+    );
+    harness.resize(100, 30);
     // Back to the tree: `j`/`k` below move its cursor.
     harness.key("tab");
 

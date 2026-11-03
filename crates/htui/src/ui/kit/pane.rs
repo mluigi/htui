@@ -5,9 +5,10 @@
 //! on the bottom border two cells in; none of them ever overwrites a corner. When the pane is
 //! narrow the title is clipped first, and gives way entirely once any chip is cut off (MOD-115
 //! M3 D-10). The strip then keeps the active chip and marks the chips cut off with `‹`/`›`
-//! ([`chip_strip`]), and the hints are clipped (always with an ellipsis, via
-//! `cells::clip_line`). A pane that asks for its title first ([`Pane::title_first`], M4 C5)
-//! keeps the title and windows the chips in what is left ([`chip_strip_after`]).
+//! ([`chip_strip`]), and the hints drop whole keys from their end, ending in ` ·…`
+//! ([`fit_hints`], MOD-115 M4 T3): never half a key. A pane that asks for its title first
+//! ([`Pane::title_first`], M4 C5) keeps the title and windows the chips in what is left
+//! ([`chip_strip_after`]).
 //!
 //! [`Pane::border`] fixes the border's style whatever the focus, and [`Pane::render_into`] draws
 //! on a bare buffer, for a pane drawn inside another widget (MOD-115 M4 D-16).
@@ -555,14 +556,13 @@ pub fn chip_strip(area: Rect, titles: &[&str], active: usize) -> ChipStrip {
     strip
 }
 
-/// Draws `hints` over the horizontal border glyphs of `row`, the last row of a body a tab has
-/// already framed (the M1 adapter until tabs hand their hints to [`Pane::hints`]). They start two
-/// cells in and are clipped to `row.width - 4`. The hint is drawn only over the run of plain
-/// horizontal rule that starts there: where the tab drew text of its own on the border (a scroll
-/// hint as a bottom title) or a corner stands, the hint ends with an ellipsis in the last rule
-/// cell before it, or whole if it fits in the run. A row whose first cell there is not a rule
-/// gets nothing, so a row that is not a border simply loses the hint. `style` is the hint
-/// line's base style.
+/// Draws `hints` over the horizontal border glyphs of `row`, a pane's bottom border (what
+/// [`Pane::hints`] puts there). They start two cells in and are fitted to `row.width - 4` by
+/// whole keys ([`fit_hints`]). The hint is drawn only over the run of plain horizontal rule that
+/// starts there: where text of the view's own stands on the border or a corner does, the hint
+/// is fitted to the rule cells before it, or whole if it fits in the run. A row whose first cell
+/// there is not a rule gets nothing, so a row that is not a border simply loses the hint.
+/// `style` is the hint line's base style.
 pub fn paint_bottom_hints(buf: &mut Buffer, row: Rect, hints: Line<'_>, style: Style) {
     let width = row.width.saturating_sub(4);
     let row = row.intersection(buf.area);
@@ -577,7 +577,7 @@ pub fn paint_bottom_hints(buf: &mut Buffer, row: Rect, hints: Line<'_>, style: S
     if room == 0 {
         return;
     }
-    let line = cells::clip_line(hints.patch_style(style), room);
+    let line = fit_hints(hints.patch_style(style), room);
     let shown = u16::try_from(line.width()).unwrap_or(room).min(room);
     let origin = Rect::new(start, row.y, shown, 1).intersection(buf.area);
     if origin.is_empty() {
@@ -588,6 +588,73 @@ pub fn paint_bottom_hints(buf: &mut Buffer, row: Rect, hints: Line<'_>, style: S
     for col in origin.x..origin.right() {
         buf[(col, origin.y)] = scratch[(col, origin.y)].clone();
     }
+}
+
+/// Between two keys of a hint row: [`Keys::hint`](crate::keys::Keys::hint)'s separator.
+const HINT_SEP: &str = " \u{b7} ";
+
+/// What a hint cut by whole keys ends in: the separator's dot, then `…` for the keys dropped.
+const HINT_CUT: &str = " \u{b7}\u{2026}";
+
+/// `hints` fitted to `room` cells by whole keys (MOD-115 M4 T3, carried): the one cut rule for
+/// every pane's hints. Whole when it fits; else the most leading keys (parted by ` · `) that
+/// leave room for ` ·…`, which says the rest was dropped; else `…` alone. Never half a key
+/// (`u unci…`), so a view lists its own keys first and the keys it can spare last. The spans
+/// kept keep their styles, the mark takes the style of the span its separator starts in, and
+/// the line keeps its own style.
+#[must_use]
+pub fn fit_hints(hints: Line<'_>, room: u16) -> Line<'static> {
+    let room = usize::from(room);
+    let text: String = hints
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if cells::cell_width(&text) <= room {
+        spans.extend(
+            hints
+                .spans
+                .iter()
+                .map(|span| Span::styled(span.content.clone().into_owned(), span.style)),
+        );
+    } else if room > 0 {
+        let cut = text
+            .rmatch_indices(HINT_SEP)
+            .map(|(at, _)| at)
+            .find(|&at| cells::cell_width(&text[..at]) + cells::cell_width(HINT_CUT) <= room);
+        match cut {
+            Some(at) => {
+                let mut start = 0;
+                let mut mark = Style::new();
+                for span in &hints.spans {
+                    let len = span.content.len();
+                    if at < start + len {
+                        let kept = &span.content[..at - start];
+                        if !kept.is_empty() {
+                            spans.push(Span::styled(kept.to_owned(), span.style));
+                        }
+                        mark = span.style;
+                        break;
+                    }
+                    spans.push(Span::styled(span.content.clone().into_owned(), span.style));
+                    start += len;
+                }
+                match spans.last_mut() {
+                    Some(last) if last.style == mark => last.content.to_mut().push_str(HINT_CUT),
+                    _ => spans.push(Span::styled(HINT_CUT, mark)),
+                }
+            }
+            None => {
+                let style = hints.spans.first().map_or(Style::new(), |span| span.style);
+                spans.push(Span::styled("\u{2026}", style));
+            }
+        }
+    }
+    let mut fitted = Line::from(spans);
+    fitted.style = hints.style;
+    fitted.alignment = hints.alignment;
+    fitted
 }
 
 /// Draws `note` over the horizontal border glyphs of `row`, right-aligned: the twin of
@@ -1286,6 +1353,79 @@ mod tests {
             "{text}"
         );
         assert_eq!(text.chars().count(), 12);
+    }
+
+    /// MOD-115 M4 T3 (carried): a hint too wide for its border drops whole keys from the end
+    /// and ends in ` ·…`, never half a key; what is kept keeps its styles. Not even the first key
+    /// fitting leaves the mark alone.
+    #[test]
+    fn a_cut_hint_drops_whole_keys_from_the_end_and_says_so() {
+        let bold = Style::new().add_modifier(Modifier::BOLD);
+        let dim = Style::new().fg(Color::DarkGray);
+        let line = || {
+            Line::from(vec![
+                Span::styled("j/k move", bold),
+                Span::styled(" \u{b7} e edit \u{b7} d delete", dim),
+            ])
+        };
+        assert_eq!(
+            fit_hints(line(), 28).spans,
+            line().spans,
+            "whole when it fits"
+        );
+        assert_eq!(
+            fit_hints(line(), 27).spans,
+            vec![
+                Span::styled("j/k move", bold),
+                Span::styled(" \u{b7} e edit \u{b7}\u{2026}", dim)
+            ]
+        );
+        assert_eq!(
+            fit_hints(line(), 20).to_string(),
+            "j/k move \u{b7} e edit \u{b7}\u{2026}"
+        );
+        for room in 11..20 {
+            assert_eq!(
+                fit_hints(line(), room).spans,
+                vec![
+                    Span::styled("j/k move", bold),
+                    Span::styled(" \u{b7}\u{2026}", dim)
+                ],
+                "{room}"
+            );
+        }
+        assert_eq!(fit_hints(line(), 10).to_string(), "\u{2026}");
+        assert_eq!(fit_hints(line(), 1).to_string(), "\u{2026}");
+        assert!(fit_hints(line(), 0).spans.is_empty());
+        let styled = Line::styled("a b \u{b7} c d", dim);
+        assert_eq!(
+            fit_hints(styled, 6).style,
+            dim,
+            "the line's own style stays"
+        );
+    }
+
+    /// MOD-115 M4 T3 (carried): at every width a pane's hint is whole, whole keys and ` ·…`, or
+    /// the mark alone: it never ends inside a key (`u unci…`, `N n…`), and never touches a corner.
+    #[test]
+    fn no_pane_hint_ends_inside_a_key_at_any_width() {
+        let full = "j/k move \u{b7} Enter open \u{b7} n new \u{b7} e edit \u{b7} f filter \u{b7} \
+                    / search \u{b7} N next match \u{b7} u uncite \u{b7} Ctrl+e $EDITOR \u{b7} ? keys";
+        for width in 20..=140 {
+            let pane = Pane::new("T").hints(Line::from(full)).focus(Focus::Focused);
+            let (buffer, _) = draw(width, 3, &Theme::default(), pane);
+            let bottom = row(&buffer, 2);
+            assert!(bottom.starts_with("\u{2570}\u{2500}"), "{width}: {bottom}");
+            assert!(bottom.ends_with("\u{2500}\u{256f}"), "{width}: {bottom}");
+            let shown = bottom.trim_matches(['\u{2570}', '\u{256f}', '\u{2500}']);
+            let whole_keys = shown
+                .strip_suffix(" \u{b7}\u{2026}")
+                .is_some_and(|kept| full.starts_with(&format!("{kept} \u{b7} ")));
+            assert!(
+                shown == full || shown == "\u{2026}" || whole_keys,
+                "{width}: a hint ends inside a key: {shown:?}"
+            );
+        }
     }
 
     #[test]
