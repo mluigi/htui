@@ -573,9 +573,10 @@ fn default_shapes(phases: &[StepGraphPhase]) -> HashMap<EdgeShape, usize> {
 ///
 /// The rule is checked when a kind or item is **written**, never re-checked behind it: removing
 /// a project from a workspace (`remove_workspace_project`) is not refused, and a kind already on
-/// that workspace's graph keeps it and still resolves; its next edit is refused until it names a
-/// usable graph. Deleting the workspace is what is refused while a kind or item holds one of its
-/// graphs (blueprint A3).
+/// that workspace's graph keeps it and still resolves. Its next edit that leaves the graph alone
+/// still lands (A7: an update checks the graph only when it changes it); an edit that changes the
+/// graph must name a usable one. Deleting the workspace is what is refused while a kind or item
+/// holds one of its graphs (blueprint A3).
 #[must_use]
 pub fn graph_usable_by(scope: GraphScope, project: ProjectId, workspaces: &[WorkspaceId]) -> bool {
     match scope {
