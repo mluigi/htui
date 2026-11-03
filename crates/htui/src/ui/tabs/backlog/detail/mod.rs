@@ -37,6 +37,7 @@ use crate::ui::Theme;
 use crate::ui::kit::empty::{self, NextStep};
 use crate::ui::kit::pane::{Focus, Pane};
 use crate::ui::kit::scroll::Step;
+use crate::ui::shell::{HiddenBy, PaneId};
 use crate::ui::tabs::backlog::Chrome;
 use crossterm::event::{KeyEvent, MouseEvent};
 
@@ -453,19 +454,55 @@ pub fn message(frame: &mut Frame<'_>, area: Rect, text: &str, theme: &Theme) {
 /// No item under the list's cursor (a project header): what every sub-tab says then.
 const NO_ITEM: &str = "No item selected.";
 
-/// [`NO_ITEM`]'s next step: the list's motion, through the pane's stack.
+/// [`NO_ITEM`]'s next step while the list holds the focus: its motion, through the pane's stack.
 const CHOOSE: HintSpec = &[Hint::Pair(Act::ListDown, Act::ListUp, "chooses one")];
 
 /// [`NO_ITEM`]'s next step while the list's motion is unbound, for a pane with no sentence of its
 /// own.
 const CHOOSE_UNBOUND: &str = "a chosen item shows here";
 
-/// A failed read's next step: the list's motion away and back issues the item's reads again.
+/// A failed read's next step while the list holds the focus: its motion away and back issues the
+/// item's reads again.
 const RETRY: HintSpec = &[Hint::Pair(
     Act::ListDown,
     Act::ListUp,
     "away and back retries",
 )];
+
+/// [`CHOOSE`] or [`RETRY`] while the detail holds the focus beside the list (MOD-115 M4 RV,
+/// repair 1): the list's motion scrolls the detail there (`Step::by_focus`), so the step is the
+/// key that focuses the list.
+const FOCUS_FROM_DETAIL: HintSpec = &[Hint::One(Act::PrevPane, "focuses the list")];
+
+/// [`FOCUS_FROM_DETAIL`] while the shell's activity pane holds the focus: the next pane after it
+/// is the list.
+const FOCUS_FROM_ACTIVITY: HintSpec = &[Hint::One(Act::NextPane, "focuses the list")];
+
+/// The list's step while `layout.toggle_list` hides it.
+const SHOW_LIST: HintSpec = &[Hint::One(Act::LayoutToggleList, "shows the list")];
+
+/// The list's step while another pane is zoomed.
+const UNZOOM: HintSpec = &[Hint::One(Act::LayoutZoom, "shows the list")];
+
+/// The list's step while the layout preset has no list.
+const NEXT_PRESET: HintSpec = &[Hint::One(Act::LayoutNextPreset, "changes the layout")];
+
+/// A step that moves the list's cursor, `on_list`, for where the list is and which pane holds
+/// the focus (MOD-115 M4 RV, repair 1, as the Templates select step, RV3-M1): `on_list` only
+/// while the list holds the focus; beside it, the key that focuses it; off screen, the key that
+/// brings it back.
+fn list_step(on_list: HintSpec, ctx: &Ctx<'_>) -> HintSpec {
+    match ctx.list_hidden(super::BACKLOG_LAYOUT) {
+        Some(HiddenBy::Zoom) => UNZOOM,
+        Some(HiddenBy::Preset) => NEXT_PRESET,
+        Some(HiddenBy::Toggle) => SHOW_LIST,
+        None => match ctx.focus() {
+            PaneId::List => on_list,
+            PaneId::Activity => FOCUS_FROM_ACTIVITY,
+            PaneId::Detail => FOCUS_FROM_DETAIL,
+        },
+    }
+}
 
 /// [`RETRY`]'s sentence while the list's motion is unbound.
 const RETRY_UNBOUND: &str = "choosing the item again retries";
@@ -486,10 +523,11 @@ fn hint_or(stack: Stack<'_>, spec: HintSpec, unbound: &str, keys: &Keys) -> Stri
 }
 
 /// No item selected (MOD-115 M4 RV2-M1, RV2-L5), the one state every sub-tab draws alike:
-/// [`NO_ITEM`] as the kit's empty state, the list's motion through `stack` its next step, or
-/// `unbound` while the motion is unbound ([`CHOOSE_UNBOUND`] for a pane with nothing more to say).
+/// [`NO_ITEM`] as the kit's empty state, its next step [`CHOOSE`] through `stack` where the list
+/// is and holds the focus, else the key that gets it there ([`list_step`]), or `unbound` while
+/// that key is unbound ([`CHOOSE_UNBOUND`] for a pane with nothing more to say).
 fn no_item(frame: &mut Frame<'_>, area: Rect, stack: Stack<'_>, unbound: &str, ctx: &Ctx<'_>) {
-    let next = hint_or(stack, CHOOSE, unbound, ctx.keys());
+    let next = hint_or(stack, list_step(CHOOSE, ctx), unbound, ctx.keys());
     empty_state(frame, area, NO_ITEM, &next, ctx);
 }
 
@@ -501,9 +539,11 @@ fn writes_one(stack: Stack<'_>, act: Act, unbound: &str, keys: &Keys) -> String 
 }
 
 /// A refused read (MOD-115 M4 RV2-M1): `what`, its whole sentence, as the kit's failed state,
-/// its next step the list's motion away and back through `stack`, which reads the item again.
+/// its next step [`RETRY`] through `stack`, the list's motion away and back, which reads the
+/// item again, where the list is and holds the focus, else the key that gets it there
+/// ([`list_step`]).
 fn unavailable(frame: &mut Frame<'_>, area: Rect, what: &str, stack: Stack<'_>, ctx: &Ctx<'_>) {
-    let next = hint_or(stack, RETRY, RETRY_UNBOUND, ctx.keys());
+    let next = hint_or(stack, list_step(RETRY, ctx), RETRY_UNBOUND, ctx.keys());
     empty::render_failed(frame, area, what, NextStep(&next), ctx.theme);
 }
 
@@ -661,5 +701,100 @@ mod tests {
         registry.cycle_next();
         assert_eq!(registry.step(Step::Bottom, &ctx), Handled::Consumed);
         assert_eq!(*seen.borrow(), [Step::Bottom]);
+    }
+
+    /// MOD-115 M4 RV repair 1: the no-item and failed-read steps name the list's motion only
+    /// while the list holds the focus (`Step::by_focus` hands it to the detail otherwise); with
+    /// another pane focused they name the key that focuses the list, and with the list off
+    /// screen the key that brings it back, as the Templates select step does (RV3-M1).
+    #[test]
+    fn the_list_steps_follow_the_focus_and_where_the_list_is() {
+        use crate::ui::shell::{PaneId, Preset, TabLayout};
+        use crate::ui::tabs::backlog::BACKLOG_LAYOUT;
+
+        let shell = super::compose::bench::Shell::new();
+        let hidden = TabLayout {
+            list_on: false,
+            ..BACKLOG_LAYOUT
+        };
+        let zoomed = TabLayout {
+            zoom: true,
+            ..BACKLOG_LAYOUT
+        };
+        let alone = TabLayout {
+            preset: Preset::Focus,
+            ..BACKLOG_LAYOUT
+        };
+        let cases = [
+            (
+                PaneId::List,
+                None,
+                "j/k chooses one",
+                "j/k away and back retries",
+            ),
+            (
+                PaneId::Detail,
+                None,
+                "Shift+Tab focuses the list",
+                "Shift+Tab focuses the list",
+            ),
+            (
+                PaneId::Activity,
+                None,
+                "Tab focuses the list",
+                "Tab focuses the list",
+            ),
+            (
+                PaneId::Detail,
+                Some(hidden),
+                "F2 shows the list",
+                "F2 shows the list",
+            ),
+            (
+                PaneId::List,
+                Some(hidden),
+                "F2 shows the list",
+                "F2 shows the list",
+            ),
+            (
+                PaneId::Detail,
+                Some(zoomed),
+                "z shows the list",
+                "z shows the list",
+            ),
+            (
+                PaneId::Detail,
+                Some(alone),
+                "p changes the layout",
+                "p changes the layout",
+            ),
+        ];
+        for (focus, layout, choose, retry) in cases {
+            let ctx = shell.ctx().with_focus(focus);
+            let ctx = match layout {
+                Some(layout) => ctx.with_layout(layout),
+                None => ctx,
+            };
+            let text = super::compose::bench::drawn(43, 6, |frame, area| {
+                super::no_item(
+                    frame,
+                    area,
+                    views::BACKLOG_BODY,
+                    super::CHOOSE_UNBOUND,
+                    &ctx,
+                );
+            });
+            super::assert_empty_state(&text, super::NO_ITEM, choose);
+            let text = super::compose::bench::drawn(43, 6, |frame, area| {
+                super::unavailable(
+                    frame,
+                    area,
+                    "Links unavailable: boom",
+                    views::BACKLOG_GRAPH,
+                    &ctx,
+                );
+            });
+            super::assert_empty_state(&text, "Links unavailable: boom", retry);
+        }
     }
 }

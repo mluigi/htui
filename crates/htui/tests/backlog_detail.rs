@@ -141,6 +141,40 @@ async fn a_title_the_border_cuts_keeps_its_line_in_the_body() {
     );
 }
 
+/// MOD-115 M4 RV, repair 1: on a project header with the detail focused, `j/k` scroll the
+/// detail, so the no-item step names the key that focuses the list instead, and that key, then
+/// `j`, does choose an item.
+#[tokio::test]
+async fn the_no_item_step_works_with_the_detail_focused() {
+    let mut harness = backlog().await;
+    harness.key("k");
+    harness.key("k");
+    harness.drive_to_end().await;
+    // The pane key moves the focus among the panes the last frame drew.
+    let frame = harness.render();
+    assert!(
+        frame.contains("j/k chooses one"),
+        "the list is focused:\n{frame}"
+    );
+    harness.key("tab");
+    let frame = harness.render();
+    assert!(frame.contains("No item selected."), "{frame}");
+    assert!(frame.contains("Shift+Tab focuses the list"), "{frame}");
+    assert!(!frame.contains("j/k chooses one"), "{frame}");
+    harness.key("backtab");
+    let frame = harness.render();
+    assert!(
+        frame.contains("j/k chooses one"),
+        "the list again:\n{frame}"
+    );
+    down(&mut harness, 1).await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("No item selected."),
+        "j chose one:\n{frame}"
+    );
+}
+
 /// An item with no body says so and names the key that writes one (`kit::empty`).
 #[tokio::test]
 async fn an_empty_body_names_the_edit_key() {

@@ -27,7 +27,7 @@ use crate::ui::kit::pane::{Focus, Pane, paint_bottom_note};
 use crate::ui::overlay::{Overlay, OverlayRegistry, OverlayStack};
 use crate::ui::shell::history::{History, Loc};
 use crate::ui::shell::layout::{self as pane_layout, NoteLabels, Seam};
-use crate::ui::shell::{PaneAreas, PaneId, Panes, TabLayout};
+use crate::ui::shell::{HiddenBy, PaneAreas, PaneId, Panes, TabLayout};
 use crate::ui::state_file::{UiState, UiStore};
 use crate::ui::tabs::{Tab, TabId, TabRegistry};
 use crate::ui::{Theme, about, layout};
@@ -279,6 +279,21 @@ impl<'a> Ctx<'a> {
             cell.set(Some((region, areas)));
         }
         areas
+    }
+
+    /// Why the list of a list + detail tab is off screen this frame, or `None` while it is drawn:
+    /// what [`split`](Self::split) reports as `list_hidden` under the same layout and focus
+    /// (it depends on no region), without recording a claim. A pane drawn beside the list reads
+    /// it to name a step that moves the list only while the list is there (MOD-115 M4 RV,
+    /// repair 1).
+    #[must_use]
+    pub fn list_hidden(&self, default: TabLayout) -> Option<HiddenBy> {
+        crate::ui::shell::layout::areas(
+            Rect::default(),
+            &self.layout.unwrap_or(default),
+            self.focus(),
+        )
+        .list_hidden
     }
 
     /// This context with the tab's focused pane (MOD-115 M2 D3). Only the shell calls it.
