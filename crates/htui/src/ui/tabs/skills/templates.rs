@@ -2814,7 +2814,7 @@ mod tests {
         };
         assert_eq!(
             bottom(100),
-            "L1:C1 \u{b7} Ctrl+s save \u{b7} Esc cancel \u{b7} Ctrl+g ask agent \u{b7}\u{2026}"
+            "L1:C1 \u{b7} Ctrl+s save \u{b7} Esc cancel \u{b7} Ctrl+g ask agent \u{2026}"
         );
         assert_eq!(
             bottom(120),
@@ -2825,7 +2825,7 @@ mod tests {
             narrow.starts_with("L1:C1 \u{b7} Ctrl+s save \u{b7} Esc cancel"),
             "{narrow:?}"
         );
-        assert!(narrow.ends_with(" \u{b7}\u{2026}"), "{narrow:?}");
+        assert!(narrow.ends_with(" \u{2026}"), "{narrow:?}");
     }
 
     /// MOD-115 M4 E5, MOD-85: the body's and the draft's titles are the kit pane's title role,

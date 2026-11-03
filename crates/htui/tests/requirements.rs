@@ -671,7 +671,7 @@ async fn the_requirements_tree_status_line_and_help_box() {
     // to the 45-cell tree by whole keys (M4 T3); the unit tests pin the whole line.
     assert_eq!(
         hint(&frame),
-        "a area \u{b7} n new \u{b7} e amend \u{b7} W withdraw \u{b7}\u{2026}",
+        "a area \u{b7} n new \u{b7} e amend \u{b7} W withdraw \u{2026}",
         "{frame}"
     );
     harness.key("?");

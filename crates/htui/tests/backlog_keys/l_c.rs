@@ -283,7 +283,7 @@ async fn a_rebound_cite_key_opens_the_picker_and_c_is_inert() {
     // The detail's 41 hint cells drop the keys past the rebound one whole (D-20, T3: never half a
     // key); the rebound one is whole.
     assert!(
-        frame.contains("J/K move · r reconfirm · C cite \u{b7}\u{2026}"),
+        frame.contains("J/K move · r reconfirm · C cite \u{2026}"),
         "the browse hint names the rebound key:\n{frame}"
     );
 

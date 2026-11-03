@@ -768,8 +768,7 @@ async fn scrolling_reveals_a_hunk_below_the_fold() {
     };
     let narrow = body_hint(&frame);
     assert!(
-        narrow.contains("version \u{b7} b base \u{b7} d diff")
-            && narrow.contains(" \u{b7}\u{2026}"),
+        narrow.contains("version \u{b7} b base \u{b7} d diff") && narrow.contains(" \u{2026}"),
         "the view's keys lead, cut by whole keys: {narrow}"
     );
     assert!(

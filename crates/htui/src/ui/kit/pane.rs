@@ -5,7 +5,7 @@
 //! on the bottom border two cells in; none of them ever overwrites a corner. When the pane is
 //! narrow the title is clipped first, and gives way entirely once any chip is cut off (MOD-115
 //! M3 D-10). The strip then keeps the active chip and marks the chips cut off with `‹`/`›`
-//! ([`chip_strip`]), and the hints drop whole keys from their end, ending in ` ·…`
+//! ([`chip_strip`]), and the hints drop whole keys from their end, ending in ` …`
 //! ([`fit_hints`], MOD-115 M4 T3): never half a key. A pane that asks for its title first
 //! ([`Pane::title_first`], M4 C5) keeps the title and windows the chips in what is left
 //! ([`chip_strip_after`]).
@@ -593,12 +593,13 @@ pub fn paint_bottom_hints(buf: &mut Buffer, row: Rect, hints: Line<'_>, style: S
 /// Between two keys of a hint row: [`Keys::hint`](crate::keys::Keys::hint)'s separator.
 const HINT_SEP: &str = " \u{b7} ";
 
-/// What a hint cut by whole keys ends in: the separator's dot, then `…` for the keys dropped.
-const HINT_CUT: &str = " \u{b7}\u{2026}";
+/// What a hint cut by whole keys ends in: a space, then `…` for the keys dropped. Two cells, not
+/// the separator's three, so no key that fits beside it is dropped for the mark's sake.
+const HINT_CUT: &str = " \u{2026}";
 
 /// `hints` fitted to `room` cells by whole keys (MOD-115 M4 T3, carried): the one cut rule for
 /// every pane's hints. Whole when it fits; else the most leading keys (parted by ` · `) that
-/// leave room for ` ·…`, which says the rest was dropped; else `…` alone. Never half a key
+/// leave room for ` …`, which says the rest was dropped; else `…` alone. Never half a key
 /// (`u unci…`), so a view lists its own keys first and the keys it can spare last. The spans
 /// kept keep their styles, the mark takes the style of the span its separator starts in, and
 /// the line keeps its own style.
@@ -1356,8 +1357,9 @@ mod tests {
     }
 
     /// MOD-115 M4 T3 (carried): a hint too wide for its border drops whole keys from the end
-    /// and ends in ` ·…`, never half a key; what is kept keeps its styles. Not even the first key
-    /// fitting leaves the mark alone.
+    /// and ends in ` …`, never half a key; what is kept keeps its styles. The mark takes two
+    /// cells, so a key that fits with it stays (Settings › Hierarchy's `i infer` at 80 columns).
+    /// Not even the first key fitting leaves the mark alone.
     #[test]
     fn a_cut_hint_drops_whole_keys_from_the_end_and_says_so() {
         let bold = Style::new().add_modifier(Modifier::BOLD);
@@ -1377,24 +1379,25 @@ mod tests {
             fit_hints(line(), 27).spans,
             vec![
                 Span::styled("j/k move", bold),
-                Span::styled(" \u{b7} e edit \u{b7}\u{2026}", dim)
+                Span::styled(" \u{b7} e edit \u{2026}", dim)
             ]
         );
         assert_eq!(
-            fit_hints(line(), 20).to_string(),
-            "j/k move \u{b7} e edit \u{b7}\u{2026}"
+            fit_hints(line(), 19).to_string(),
+            "j/k move \u{b7} e edit \u{2026}",
+            "the last key that fits with the mark stays"
         );
-        for room in 11..20 {
+        for room in 10..19 {
             assert_eq!(
                 fit_hints(line(), room).spans,
                 vec![
                     Span::styled("j/k move", bold),
-                    Span::styled(" \u{b7}\u{2026}", dim)
+                    Span::styled(" \u{2026}", dim)
                 ],
                 "{room}"
             );
         }
-        assert_eq!(fit_hints(line(), 10).to_string(), "\u{2026}");
+        assert_eq!(fit_hints(line(), 9).to_string(), "\u{2026}");
         assert_eq!(fit_hints(line(), 1).to_string(), "\u{2026}");
         assert!(fit_hints(line(), 0).spans.is_empty());
         let styled = Line::styled("a b \u{b7} c d", dim);
@@ -1405,7 +1408,7 @@ mod tests {
         );
     }
 
-    /// MOD-115 M4 T3 (carried): at every width a pane's hint is whole, whole keys and ` ·…`, or
+    /// MOD-115 M4 T3 (carried): at every width a pane's hint is whole, whole keys and ` …`, or
     /// the mark alone: it never ends inside a key (`u unci…`, `N n…`), and never touches a corner.
     #[test]
     fn no_pane_hint_ends_inside_a_key_at_any_width() {
@@ -1418,13 +1421,27 @@ mod tests {
             assert!(bottom.starts_with("\u{2570}\u{2500}"), "{width}: {bottom}");
             assert!(bottom.ends_with("\u{2500}\u{256f}"), "{width}: {bottom}");
             let shown = bottom.trim_matches(['\u{2570}', '\u{256f}', '\u{2500}']);
-            let whole_keys = shown
-                .strip_suffix(" \u{b7}\u{2026}")
-                .is_some_and(|kept| full.starts_with(&format!("{kept} \u{b7} ")));
+            let kept = shown.strip_suffix(" \u{2026}");
+            let whole_keys = kept.is_some_and(|kept| full.starts_with(&format!("{kept} \u{b7} ")));
             assert!(
                 shown == full || shown == "\u{2026}" || whole_keys,
                 "{width}: a hint ends inside a key: {shown:?}"
             );
+            // No key that would fit with the mark is dropped.
+            let room = usize::from(width - 4);
+            let kept = kept.map_or(0, str::len);
+            if shown != full {
+                let end = full[kept..]
+                    .match_indices(" \u{b7} ")
+                    .map(|(at, _)| kept + at)
+                    .find(|&at| at > kept)
+                    .unwrap_or(full.len());
+                let next = full[..end].chars().count();
+                assert!(
+                    next + " \u{2026}".chars().count() > room,
+                    "{width}: a key that fits was dropped: {shown:?}"
+                );
+            }
         }
     }
 
