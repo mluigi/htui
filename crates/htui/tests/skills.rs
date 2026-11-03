@@ -1678,7 +1678,8 @@ async fn a_proposal_accepted_saves_as_the_next_version() {
     );
     assert!(
         hint(&frame).contains(
-            "Ctrl+s save \u{b7} Ctrl+g ask agent \u{b7} Ctrl+e $EDITOR \u{b7} Esc cancel"
+            // MOD-115 M4 RV3-L3: save and the way out lead, as in the Templates editor.
+            "Ctrl+s save \u{b7} Esc cancel \u{b7} Ctrl+g ask agent \u{b7} Ctrl+e $EDITOR"
         ),
         "the editor is back: {frame}"
     );

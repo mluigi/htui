@@ -210,12 +210,14 @@ const INFO_HINT: HintSpec = &[
     Hint::Text("Esc cancel"),
 ];
 
-/// The hint row in the editor, before the cursor's `L{line}:C{col}` (`Esc` is the area's).
+/// The hint row in the editor, before the cursor's `L{line}:C{col}` (`Esc` is the area's). Save
+/// and the way out lead, as in the Templates editor (MOD-115 M4 RV3-L3): a narrow pane drops the
+/// keys whole from the end (`kit::pane::fit_hints`), so `Esc cancel` is the last it gives up.
 const EDIT_HINT: HintSpec = &[
     Hint::One(Act::FormSave, "save"),
+    Hint::Text("Esc cancel"),
     Hint::One(Act::SkillsAskAgent, "ask agent"),
     Hint::One(Act::FormExternalEditor, "$EDITOR"),
-    Hint::Text("Esc cancel"),
 ];
 
 /// The hint row while a `Ctrl+E` handoff holds the draft: `$EDITOR` has the keys.

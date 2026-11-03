@@ -31,10 +31,10 @@ use crate::keys::{Act, Hint, HintSpec, Keys, Stack, views};
 use crate::store_worker::{ChatFrame, EDIT_HELP, StoreReply, StoreRequest};
 use crate::ui::kit::chips::key_line;
 use crate::ui::kit::form::{Field, Form, Value};
-use crate::ui::kit::list;
 use crate::ui::kit::modal::modal_rest;
 use crate::ui::kit::pane::Pane;
 use crate::ui::kit::scroll::Scroll;
+use crate::ui::kit::{label, list};
 use crate::ui::{FieldOutcome, TextField, Theme, diff};
 
 /// `StoreRequest::ChatCancel`'s request name: its `Failed` (the chat ended before the cancel
@@ -759,8 +759,8 @@ impl AgentHelp {
             )),
             State::Streaming { agent, reply, .. } => Some(Line::styled(
                 format!(
-                    "{agent} is answering\u{2026} {} chars",
-                    reply.chars().count()
+                    "{agent} is answering\u{2026} {}",
+                    label::plural(reply.chars().count(), "char", "chars")
                 ),
                 theme.dim,
             )),
@@ -1016,6 +1016,37 @@ mod tests {
         );
         assert!(matches!(help.state, State::Streaming { .. }), "{help:?}");
         help
+    }
+
+    /// MOD-115 M4 RV3-L1: the streamed count reads as a count with its noun, `1 char`, never
+    /// `1 chars`.
+    #[test]
+    fn a_one_character_reply_counts_one_char() {
+        let bench = Bench::new();
+        let mut help = streaming(&bench, "old\n", StepId::new());
+        let shown = |help: &AgentHelp| {
+            let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("a test terminal");
+            terminal
+                .draw(|frame| {
+                    help.render(frame, frame.area(), &bench.ctx(), 0);
+                })
+                .expect("the frame draws");
+            let buffer = terminal.backend().buffer().clone();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        help.on_reply(&chunk("x"), &bench.ctx());
+        let text = shown(&help);
+        assert!(text.contains("is answering\u{2026} 1 char "), "{text}");
+        assert!(!text.contains("1 chars"), "{text}");
+        help.on_reply(&chunk("y"), &bench.ctx());
+        assert!(shown(&help).contains("is answering\u{2026} 2 chars"));
     }
 
     /// A help on `sent` whose reply was `reply`, ended `EndTurn`.
